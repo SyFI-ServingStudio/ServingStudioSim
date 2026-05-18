@@ -19,3 +19,8 @@ logs/
 .vscode/
 .idea/
 .DS_Store
+
+# Agent runtime state (per-machine; .claude/ and .codex/ skills symlinks
+# are tracked, local settings files are not)
+.claude/settings.local.json
+.codex/*.local.*

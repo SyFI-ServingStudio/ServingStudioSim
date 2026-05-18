@@ -17,4 +17,9 @@ serde_json = "1"
 anyhow = "1"
 thiserror = "2"
 
+# Arrow schema definitions. parquet writers + arrow-array land in Phase 3
+# when log/parquet.rs lands; for now only the Schema definitions need to
+# compile.
+arrow-schema = { version = "54", default-features = false }
+
 [workspace]
