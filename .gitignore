@@ -1,0 +1,21 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+
+# Data
+*.parquet
+*.pftrace
+profile.db-journal
+logs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
