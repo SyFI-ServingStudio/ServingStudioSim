@@ -1,0 +1,12 @@
+{
+  "name": "H100-SXM5-80GB",
+  "dollar_per_hour": 4.0,
+  "nvl_domain_size": 8,
+  "hbm_gb": 80,
+  "peak_tflops_bf16": 989,
+  "peak_tflops_fp16": 989,
+  "peak_tflops_fp8": 1979,
+  "mem_bandwidth_gbps": 3350,
+  "interconnect": "NVLink 4.0",
+  "interconnect_bandwidth_gbps": 900
+}
