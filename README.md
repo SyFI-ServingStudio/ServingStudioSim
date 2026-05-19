@@ -14,9 +14,22 @@ cargo run -- list-params         # CLI entry, prints stub
 cargo run -- run                 # main run path (stub)
 
 # Python side
-uv sync                          # install deps (currently none)
-ruff check .                     # lint
+uv sync                          # install default dev + profiling deps
+uv run ruff check .              # lint
+
+# Python profiling stack (Torch/Triton/NVML; needed for real CUDA profiling)
+uv run python -c "import torch, triton, pynvml; print(torch.__version__)"
+uv run python -m profiling list
+uv run python -m profiling count-missing single_gemm --backend torch --gpu-name H100 --spec '{"m":4096,"n":8192,"k":8192,"dtype":"bf16"}'
+uv run python -m profiling run single_gemm --backend torch --force --specs specs.json --db /tmp/profile.db
 ```
+
+`dev` and `profiling` are default uv groups for this repo, so use plain
+`uv run ...` for tests, lint, and profiler entry points. The execution backend
+selects `main/.venv/bin/python` but does not install missing packages at
+profile time. The initial lockfile tracks the reference CUDA 12.8-era stack
+(`torch 2.10.x`, `triton 3.6.x`) until the cluster driver/runtime target is
+validated for a newer stack.
 
 ## Layout
 

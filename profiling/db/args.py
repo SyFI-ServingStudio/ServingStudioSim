@@ -1,23 +1,76 @@
-"""KernelArgs — abstract base for per-kind args dataclasses.
+"""Typed argument records for L1 profile entries.
 
-Per L1 design.md §2.1: each ``(kernel_kind, backend)`` registry entry pairs a
-runner function with a ``KernelArgs`` subclass. Field names == runner kwargs ==
-DB key columns (strict three-way equality, enforced via framework reflection
-in Phase 1).
+Per L1 design.md §2.1 / §2.2, each ``KernelProfilerSpec`` points at one
+``KernelArgs`` subclass. Its field names are the shared contract between public
+spec dicts, runner keyword arguments, and DB key columns.
 
-This module ships only the **abstract contract** (the frozen-dataclass base
-class + field-name conventions). Concrete per-kind subclasses
-(``SingleGemmArgs`` / ``AttnPrefillArgs`` / ``AllReduceArgs`` / ...) are
-**payloads**, not infra, and land alongside their respective L1 runners — see
-``profiling/runners/{gemm,attention,comm,norm,...}/`` and the corresponding
-registry entries in Phase 1+. The ``KernelKind`` dispatch enum is likewise a
-Phase 1 concern: it gets authored with the variants the first runner needs
-and grown as more runners arrive.
+Agent note: add concrete ``KernelArgs`` subclasses here, not in runners or the
+registry. These classes are schema records only; sweep grids, cache policy,
+table names, and backend behavior belong to Rust kernels or L1b registry/table
+code.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any
+
+
+class DType(StrEnum):
+    """Canonical dtype strings used by profile DB rows and runner kwargs."""
+
+    FP16 = "fp16"
+    BF16 = "bf16"
+    FP32 = "fp32"
+    FP8_E4M3 = "fp8_e4m3"
+    FP8_E5M2 = "fp8_e5m2"
+    INT8 = "int8"
+    INT4 = "int4"
+
+    @classmethod
+    def from_value(cls, value: Any) -> DType:
+        if isinstance(value, cls):
+            return value
+        normalized = str(value).lower()
+        aliases = {
+            "float16": cls.FP16,
+            "torch.float16": cls.FP16,
+            "half": cls.FP16,
+            "bfloat16": cls.BF16,
+            "torch.bfloat16": cls.BF16,
+            "float32": cls.FP32,
+            "torch.float32": cls.FP32,
+        }
+        if normalized in aliases:
+            return aliases[normalized]
+        return cls(normalized)
+
+    def size_bytes(self) -> float:
+        return {
+            DType.FP16: 2,
+            DType.BF16: 2,
+            DType.FP32: 4,
+            DType.FP8_E4M3: 1,
+            DType.FP8_E5M2: 1,
+            DType.INT8: 1,
+            DType.INT4: 0.5,
+        }[self]
+
+    # Keep framework conversions lazy so importing DB schemas does not import
+    # heavyweight runner libraries.
+    def torch(self):
+        import torch
+
+        mapping = {
+            DType.FP16: torch.float16,
+            DType.BF16: torch.bfloat16,
+            DType.FP32: torch.float32,
+        }
+        try:
+            return mapping[self]
+        except KeyError as exc:
+            raise ValueError(f"{self.value} is not supported by the torch runner") from exc
 
 
 @dataclass(frozen=True)
@@ -29,5 +82,15 @@ class KernelArgs:
 
     - identical to runner kwargs and to DB key column names;
     - declaration order = DB column order;
-    - all fields frozen (the dataclass is hashable so it can key the cache).
+    - all fields frozen so args can be reused as immutable DB/query identities.
     """
+
+
+# Concrete args begin below. New classes should stay field-only and mirror the
+# runner kwargs exactly; registry rows only reference them.
+@dataclass(frozen=True)
+class SingleGemmArgs(KernelArgs):
+    m: int
+    n: int
+    k: int
+    dtype: DType

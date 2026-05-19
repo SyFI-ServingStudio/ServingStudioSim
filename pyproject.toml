@@ -2,15 +2,33 @@
 name = "mlsim"
 version = "0.1.0"
 description = "MLSim — discrete-event simulator for ML serving + training workloads"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.12,<3.13"
 dependencies = []
 
 [tool.uv]
 package = false
+# This repo's normal Python working env includes tests/lint plus L1 profiling
+# deps, so plain `uv run ...` matches the environment used by subprocess
+# profilers. Use `--no-default-groups` only for intentionally minimal checks.
+default-groups = ["dev", "profiling"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.0",
+    "ruff>=0.14.0",
+]
+profiling = [
+    "numpy>=2.0.0",
+    "nvidia-ml-py>=12.0.0",
+    # Keep the first L1 profiling env close to the known-good reference stack.
+    # Broaden these only after validating the cluster driver/runtime pair.
+    "torch>=2.10,<2.11",
+    "triton>=3.6,<3.7; sys_platform == 'linux'",
+]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
