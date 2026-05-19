@@ -1,26 +1,18 @@
-"""KernelKind — dispatch alphabet for the (kernel_kind, backend) registry.
+"""``KernelKind`` — the per-kind wire string used by DB rows, PyO3 marshal,
+and the Python facade stem (``get_{kind}_times`` / ``count_missing_{kind}``).
 
-Per L1 design.md §2.1: every runner is registered under a ``(KernelKind,
-backend)`` pair; the value of each variant is the snake_case wire string used
-in the ``profile.db`` ``kind`` column and in PyO3 marshaling to the Rust
-bridge.
+Per L1 design.md §2.1, every runner is registered under a
+``(KernelKind, backend)`` pair. Concrete values are declared in
+``profiling/kernels/<kind>.py`` as ``KIND`` constants and fed to
+``register(KernelProfilerSpec(kernel_kind=KIND, ...))``. There is no central
+enum to extend — enumerate registered kinds via
+``profiling.db.registry.iter_kernel_profiler_specs()``.
 
-The current implemented variant is ``GEMM_SINGLE = "gemm_single"``. Future
-variants land with their runner and ``KernelProfilerSpec`` entry.
+``KernelKind`` is a type alias for ``str`` rather than a ``StrEnum`` so that
+adding a kernel does not require editing this file (symmetric with the Rust
+``pub type KernelKind = &'static str;`` in ``simulator/src/timing/bridge``).
 """
 
 from __future__ import annotations
 
-from enum import StrEnum
-
-
-class KernelKind(StrEnum):
-    """str-valued enum. Variants are filled in by L1 runners as they land."""
-
-    GEMM_SINGLE = "gemm_single"
-
-    def __str__(self) -> str:
-        # Return the raw wire string ("gemm_single") rather than the default
-        # "KernelKind.GEMM_SINGLE" repr. Keeps DB writes, PyO3 marshal across
-        # Py↔Rust, and log lines using the canonical value.
-        return self.value
+KernelKind = str

@@ -13,13 +13,13 @@ from profiling import perf_api
 from profiling.db import (
     SCHEMA_HASH,
     SCHEMA_VERSION,
+    BatchOutlierPolicy,
     DType,
     KernelKind,
     KernelProfilerSpec,
     MetricFamily,
     ProfileRow,
     RunnerRef,
-    SingleGemmArgs,
     Table,
     find_kernel_profiler_spec,
     run_profile_batch,
@@ -36,6 +36,7 @@ from profiling.exec import (
     set_default_pool,
 )
 from profiling.exec.local import LocalGpuChunk, find_idle_gpus
+from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.comm._launcher import (
     MultiGpuLauncher,
     NvshmemLauncher,
@@ -47,7 +48,7 @@ from profiling.runners.metrics import CommMetrics, ComputeMetrics
 
 class SingleResultChunk(GpuChunk):
     def run(self, kernel_kind: KernelKind, specs: list[dict]) -> list[ChunkResult]:
-        assert kernel_kind == KernelKind.GEMM_SINGLE
+        assert kernel_kind == "single_gemm"
         assert specs == [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"}]
         return [
             ChunkResult(
@@ -82,7 +83,7 @@ class RecordingGpuChunk(GpuChunk):
         self.received_spec_batches: list[list[dict]] = []
 
     def run(self, kernel_kind: KernelKind, specs: list[dict]) -> list[ChunkResult]:
-        assert kernel_kind == KernelKind.GEMM_SINGLE
+        assert kernel_kind == "single_gemm"
         self.received_spec_batches.append(specs)
         return [
             ChunkResult(
@@ -519,7 +520,7 @@ def test_single_gemm_perf_api_query_path(tmp_path: Path, monkeypatch: pytest.Mon
     assert isinstance(missing, MissingEntry)
     assert perf_api.count_missing_single_gemm([spec], backend="torch", gpu_name="TestGPU") == 1
 
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, perf_api.DB_PATH)
     args = SingleGemmArgs(m=16, n=32, k=64, dtype=DType.FP16)
     table.insert(
@@ -554,9 +555,9 @@ def test_single_gemm_perf_api_query_path(tmp_path: Path, monkeypatch: pytest.Mon
     assert table_metadata.schema_hash == SCHEMA_HASH
     assert table_metadata.profiler_git_hashes
 
-    versions = perf_api.get_profiler_versions(["gemm_single"])
+    versions = perf_api.get_profiler_versions(["single_gemm"])
     assert versions
-    assert versions[0].op_family == "gemm_single"
+    assert versions[0].op_family == "single_gemm"
 
 
 def test_perf_api_force_refreshes_cached_rows_with_jit_disabled(
@@ -565,7 +566,7 @@ def test_perf_api_force_refreshes_cached_rows_with_jit_disabled(
 ):
     monkeypatch.setattr(perf_api, "DB_PATH", tmp_path / "profile.db")
     spec = {"m": 8, "n": 8, "k": 8, "dtype": "fp16"}
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, perf_api.DB_PATH)
     table.insert(
         [
@@ -605,13 +606,13 @@ def test_perf_api_force_refreshes_cached_rows_with_jit_disabled(
 def test_run_profile_batch_uses_gpu_pool_and_saves_table(tmp_path: Path):
     db_path = tmp_path / "profile.db"
     run_profile_batch(
-        KernelKind.GEMM_SINGLE,
+        "single_gemm",
         [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"}],
         pool=SingleResultPool(),
         db_path=db_path,
     )
 
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, db_path)
     saved = table.query(
         [SingleGemmArgs(m=8, n=8, k=8, dtype=DType.FP16)],
@@ -623,7 +624,7 @@ def test_run_profile_batch_uses_gpu_pool_and_saves_table(tmp_path: Path):
 
 
 def test_table_schema_uses_metric_family_columns(tmp_path: Path):
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, tmp_path / "profile.db")
     table.metadata()
 
@@ -671,7 +672,7 @@ def test_table_schema_drops_metric_columns_from_other_family(tmp_path: Path):
             """
         )
 
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, db_path)
     table.metadata()
 
@@ -687,9 +688,9 @@ def test_table_schema_drops_metric_columns_from_other_family(tmp_path: Path):
 def test_registry_rejects_table_metric_family_conflicts():
     from profiling.db.registry import _validate_registry
 
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     conflicting_spec = KernelProfilerSpec(
-        kernel_kind=KernelKind.GEMM_SINGLE,
+        kernel_kind="single_gemm",
         backend="other",
         runner_ref=RunnerRef("profiling.runners.gemm.torch", "profile_single_gemm"),
         table_name=profiler_spec.table_name,
@@ -702,8 +703,58 @@ def test_registry_rejects_table_metric_family_conflicts():
         _validate_registry((profiler_spec, conflicting_spec))
 
 
+def test_registry_rejects_table_kind_conflicts():
+    # Two different kinds sharing one table_name would silently break the
+    # facade builder (one stem -> one kind invariant in profiling/facade.py).
+    # The validator must catch this at registration time.
+    from profiling.db.registry import _validate_registry
+
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
+    conflicting_spec = KernelProfilerSpec(
+        kernel_kind="some_other_kind",
+        backend="torch",
+        runner_ref=RunnerRef("profiling.runners.gemm.torch", "profile_single_gemm"),
+        table_name=profiler_spec.table_name,
+        args_schema=profiler_spec.args_schema,
+        metric_family=profiler_spec.metric_family,
+        batch_outlier_policy=profiler_spec.batch_outlier_policy,
+    )
+
+    with pytest.raises(ValueError, match="conflicting table contract for single_gemm"):
+        _validate_registry((profiler_spec, conflicting_spec))
+
+
+def test_register_after_load_revalidates_and_rejects_duplicates(monkeypatch):
+    # After _ensure_loaded has run, a late `register(...)` must re-validate so
+    # a follow-up import cannot smuggle a duplicate (kind, backend) past the
+    # one-shot validation.
+    from profiling.db import registry as registry_module
+
+    # Touch the registry once to ensure it's loaded, then swap in a private
+    # copy so the test does not pollute the real module-level _REGISTRY.
+    list(registry_module.iter_kernel_profiler_specs())
+    monkeypatch.setattr(registry_module, "_REGISTRY", list(registry_module._REGISTRY))
+    monkeypatch.setattr(registry_module, "_loaded", True)
+
+    duplicate_spec = KernelProfilerSpec(
+        kernel_kind="single_gemm",
+        backend="torch",
+        runner_ref=RunnerRef("profiling.runners.gemm.torch", "profile_single_gemm"),
+        table_name="single_gemm",
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+    )
+
+    before = list(registry_module._REGISTRY)
+    with pytest.raises(ValueError, match="duplicate profiler spec for single_gemm:torch"):
+        registry_module.register(duplicate_spec)
+    # Failed register() must not leave the bad spec in the registry.
+    assert registry_module._REGISTRY == before
+
+
 def test_table_rejects_metrics_outside_registered_family(tmp_path: Path):
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, tmp_path / "profile.db")
     args = SingleGemmArgs(m=8, n=8, k=8, dtype=DType.FP16)
 
@@ -727,7 +778,7 @@ def test_table_rejects_metrics_outside_registered_family(tmp_path: Path):
 
 
 def test_table_replacement_policy_overwrites_same_profile_point(tmp_path: Path):
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, tmp_path / "profile.db")
     args = SingleGemmArgs(m=8, n=8, k=8, dtype=DType.FP16)
 
@@ -777,7 +828,7 @@ def test_run_profile_batch_balances_specs_across_chunks(tmp_path: Path):
     pool = RecordingPool(recording_chunks)
 
     results = run_profile_batch(
-        KernelKind.GEMM_SINGLE,
+        "single_gemm",
         specs,
         pool=pool,
         db_path=tmp_path / "profile.db",
@@ -800,7 +851,7 @@ def test_run_profile_batch_balances_specs_across_chunks(tmp_path: Path):
         5.0,
     ]
 
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, tmp_path / "profile.db")
     assert table.metadata().row_count == len(specs)
 
@@ -845,7 +896,7 @@ def test_find_idle_gpus_respects_parent_cuda_visible_devices(
 def test_run_profile_batch_validates_specs_before_gpu_work():
     with pytest.raises(ValueError, match="missing required spec field 'k'"):
         run_profile_batch(
-            KernelKind.GEMM_SINGLE,
+            "single_gemm",
             [{"m": 8, "n": 8, "dtype": "fp16", "backend": "torch"}],
             pool=ExplodingPool(),
         )
@@ -854,7 +905,7 @@ def test_run_profile_batch_validates_specs_before_gpu_work():
 def test_run_profile_batch_rejects_unknown_backend_before_gpu_work():
     with pytest.raises(ValueError, match="unknown backend 'missing'"):
         run_profile_batch(
-            KernelKind.GEMM_SINGLE,
+            "single_gemm",
             [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "missing"}],
             pool=ExplodingPool(),
         )
@@ -940,7 +991,7 @@ def test_single_gemm_perf_api_example_profile_cuda(
 def test_local_chunk_rejects_unknown_backend_before_subprocess():
     with pytest.raises(ValueError, match="unknown backend 'missing'"):
         LocalGpuChunk([0]).run(
-            KernelKind.GEMM_SINGLE,
+            "single_gemm",
             [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "missing"}],
         )
 
@@ -955,7 +1006,7 @@ def test_local_chunk_rejects_mixed_backends_before_subprocess(monkeypatch: pytes
     )
     with pytest.raises(ValueError, match="chunk specs must share one backend"):
         LocalGpuChunk([0]).run(
-            KernelKind.GEMM_SINGLE,
+            "single_gemm",
             [
                 {"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"},
                 {"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "other"},
@@ -972,11 +1023,11 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
     fake_python.write_text("#!/bin/sh\n", encoding="utf-8")
     fake_python.chmod(0o755)
 
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     external_profiler_spec = replace(profiler_spec, subprocess_env="external_env")
 
     def fake_find_kernel_profiler_spec(kernel_kind: KernelKind, backend: str):
-        assert kernel_kind == KernelKind.GEMM_SINGLE
+        assert kernel_kind == "single_gemm"
         assert backend == "torch"
         return external_profiler_spec
 
@@ -1009,7 +1060,7 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
     monkeypatch.setattr("profiling.exec.local.subprocess.run", fake_subprocess_run)
 
     results = LocalGpuChunk([2]).run(
-        KernelKind.GEMM_SINGLE,
+        "single_gemm",
         [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"}],
     )
 
@@ -1028,7 +1079,7 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
 def test_run_profile_batch_rejects_invalid_gpu_count():
     with pytest.raises(ValueError, match="gpu_count_fn must return >= 1"):
         run_profile_batch(
-            KernelKind.GEMM_SINGLE,
+            "single_gemm",
             [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"}],
             pool=ExplodingPool(),
             gpu_count_fn=lambda _: 0,
@@ -1067,12 +1118,12 @@ def test_single_gemm_exec_smoke_cuda(tmp_path: Path):
     db_path = tmp_path / "profile.db"
     gpu_name = torch.cuda.get_device_name(0)
     run_profile_batch(
-        KernelKind.GEMM_SINGLE,
+        "single_gemm",
         [{"m": 16, "n": 16, "k": 16, "dtype": "fp16", "backend": "torch"}],
         pool=LocalGpuPool(gpus=[0]),
         db_path=db_path,
     )
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, db_path)
     result = table.query(
         [SingleGemmArgs(m=16, n=16, k=16, dtype=DType.FP16)],

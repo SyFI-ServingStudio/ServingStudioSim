@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 
 from profiling import cli, perf_api
-from profiling.db import DType, KernelKind, ProfileRow, SingleGemmArgs, Table
+from profiling.db import DType, ProfileRow, Table
 from profiling.db.registry import find_kernel_profiler_spec
+from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.metrics import ComputeMetrics
 
 
@@ -24,7 +25,7 @@ def test_cli_list_json(capsys):
             "backend": "torch",
             "count_fn": "count_missing_single_gemm",
             "get_fn": "get_single_gemm_times",
-            "kernel_kind": "gemm_single",
+            "kernel_kind": "single_gemm",
             "metric_family": "compute",
             "subprocess_env": "default_env",
             "table": "single_gemm",
@@ -58,7 +59,7 @@ def test_cli_count_missing_json_uses_perf_api_read_only(tmp_path, capsys):
 
 def test_cli_query_json_reads_existing_row(tmp_path, capsys):
     db_path = tmp_path / "profile.db"
-    profiler_spec = find_kernel_profiler_spec(KernelKind.GEMM_SINGLE, "torch")
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     Table(profiler_spec, db_path).insert(
         [
             ProfileRow(

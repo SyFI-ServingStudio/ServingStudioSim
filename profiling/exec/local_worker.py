@@ -23,7 +23,7 @@ from profiling.exec.payload import metrics_to_payload, resolve_chunk_backend
 
 def _worker_main(input_path: Path, output_path: Path) -> None:
     worker_request = json.loads(input_path.read_text(encoding="utf-8"))
-    kernel_kind = KernelKind(worker_request["kernel_kind"])
+    kernel_kind: KernelKind = worker_request["kernel_kind"]
     chunk_specs = worker_request["specs"]
     backend = resolve_chunk_backend(kernel_kind, chunk_specs)
     profiler_spec = find_kernel_profiler_spec(kernel_kind, backend)

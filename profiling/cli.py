@@ -258,7 +258,7 @@ def _profiler_spec_summary(profiler_spec: KernelProfilerSpec) -> dict[str, str]:
     stem = profiler_spec.table_name
     return {
         "table": stem,
-        "kernel_kind": profiler_spec.kernel_kind.value,
+        "kernel_kind": profiler_spec.kernel_kind,
         "backend": profiler_spec.backend,
         "args": args_fields,
         "metric_family": profiler_spec.metric_family.value,
@@ -299,7 +299,7 @@ def _result_to_payload(index: int, result: Metrics | MissingEntry) -> dict[str, 
         return {
             "index": index,
             "status": "missing",
-            "kernel_kind": result.kernel_kind.value,
+            "kernel_kind": result.kernel_kind,
             "backend": result.backend,
             "gpu_name": result.gpu_name,
             "args": _jsonable(result.args),

@@ -123,7 +123,7 @@ def _make_get_times(
 
     wrapper.__name__ = public_name
     wrapper.__qualname__ = public_name
-    wrapper.__doc__ = f"Batch query facade for {kernel_kind.value}."
+    wrapper.__doc__ = f"Batch query facade for {kernel_kind}."
     return wrapper
 
 
@@ -149,7 +149,7 @@ def _make_count_missing(
 
     wrapper.__name__ = public_name
     wrapper.__qualname__ = public_name
-    wrapper.__doc__ = f"Dry-run missing-count facade for {kernel_kind.value}."
+    wrapper.__doc__ = f"Dry-run missing-count facade for {kernel_kind}."
     return wrapper
 
 

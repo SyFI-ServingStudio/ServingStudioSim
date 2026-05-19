@@ -10,7 +10,7 @@ Agent note:
   new symbol is part of the stable public DB package surface.
 """
 
-from profiling.db.args import DType, KernelArgs, SingleGemmArgs
+from profiling.db.args import DType, KernelArgs
 from profiling.db.batch import args_to_spec, coerce_args, run_profile_batch
 from profiling.db.kind import KernelKind
 from profiling.db.metadata import (
@@ -49,7 +49,6 @@ __all__ = [
     "RunnerRef",
     "SCHEMA_HASH",
     "SCHEMA_VERSION",
-    "SingleGemmArgs",
     "Table",
     "TableMetadata",
     "args_to_spec",

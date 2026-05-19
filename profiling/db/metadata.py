@@ -45,7 +45,7 @@ def get_profiler_versions(
     versions: set[tuple[str, str]] = set()
     with sqlite3.connect(db_path) as conn:
         for profiler_spec in iter_kernel_profiler_specs():
-            op_family = profiler_spec.kernel_kind.value
+            op_family = profiler_spec.kernel_kind
             if selected and op_family not in selected and profiler_spec.table_name not in selected:
                 continue
             if not _table_exists(conn, profiler_spec.table_name):

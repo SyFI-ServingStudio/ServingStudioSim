@@ -61,7 +61,7 @@ class LocalGpuChunk(GpuChunk):
             input_path.write_text(
                 json.dumps(
                     {
-                        "kernel_kind": kernel_kind.value,
+                        "kernel_kind": kernel_kind,
                         "specs": chunk_specs,
                     }
                 ),

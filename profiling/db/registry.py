@@ -1,4 +1,12 @@
-"""L1b registry: the authority for ``(KernelKind, backend)`` profiler specs."""
+"""L1b registry: the authority for ``(KernelKind, backend)`` profiler specs.
+
+Per-kernel modules under ``profiling/kernels/`` call ``register(...)`` at
+import time to add their ``KernelProfilerSpec`` rows. Lookup functions
+(``iter_kernel_profiler_specs``, ``find_kernel_profiler_spec``, ...) trigger
+``_ensure_loaded()`` on first access, which imports ``profiling.kernels`` to
+run those side effects exactly once, then runs ``_validate_registry`` once on
+the accumulated specs.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +16,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from profiling.db.args import KernelArgs, SingleGemmArgs
+from profiling.db.args import KernelArgs
 from profiling.db.kind import KernelKind
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.runners.metrics import Metrics
@@ -66,42 +74,69 @@ class KernelProfilerSpec:
 
 @dataclass(frozen=True)
 class _TableContract:
+    # kernel_kind is part of the contract because `profiling.facade` derives the
+    # public `get_<stem>_times` / `count_missing_<stem>` names from
+    # `table_name` and refuses to map one stem onto two kinds. Keeping the kind
+    # here lets the validator catch that conflict at registration time instead
+    # of at facade build time.
+    kernel_kind: KernelKind
     args_schema: type[KernelArgs]
     metric_family: MetricFamily
 
 
-REGISTRY: tuple[KernelProfilerSpec, ...] = (
-    KernelProfilerSpec(
-        kernel_kind=KernelKind.GEMM_SINGLE,
-        backend="torch",
-        runner_ref=RunnerRef(
-            module_name="profiling.runners.gemm.torch",
-            function_name="profile_single_gemm",
-        ),
-        table_name="single_gemm",
-        args_schema=SingleGemmArgs,
-        metric_family=MetricFamily.COMPUTE,
-        batch_outlier_policy=BatchOutlierPolicy(),
-    ),
-)
+_REGISTRY: list[KernelProfilerSpec] = []
+_loaded: bool = False
 
 
-def _validate_registry(registry: tuple[KernelProfilerSpec, ...]) -> None:
-    # Tables may be shared across backend variants, but their schema ownership
-    # must remain single-family so Table never creates a mixed compute/comm DB.
+def register(spec: KernelProfilerSpec) -> None:
+    """Append a profiler spec. Called by ``profiling/kernels/<kind>.py`` modules
+    at import time. During the initial barrel import, validation is deferred to
+    ``_ensure_loaded`` so per-kernel modules don't need to know about peers;
+    after the registry is loaded, late additions re-run validation against the
+    candidate registry first and only commit on success, so a conflicting row
+    cannot leave the registry in a poisoned state.
+    """
+    if _loaded:
+        _validate_registry(_REGISTRY + [spec])
+    _REGISTRY.append(spec)
+
+
+def _ensure_loaded() -> None:
+    """Trigger per-kernel module imports on first registry access. Imports
+    ``profiling.kernels`` exactly once; that package's ``__init__`` chains the
+    per-kernel modules whose ``register(...)`` calls populate ``_REGISTRY``.
+
+    ``_loaded`` flips only after both the import and the validation succeed,
+    so a failed first attempt does not leave the registry stuck in a
+    partially-loaded, never-revalidated state.
+    """
+    global _loaded
+    if _loaded:
+        return
+    importlib.import_module("profiling.kernels")
+    _validate_registry(_REGISTRY)
+    _loaded = True
+
+
+def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
+    # Tables may be shared across backend variants of the same kernel kind,
+    # but their schema/family/kind ownership must remain single-valued so
+    # Table never creates a mixed compute/comm DB and `facade.py` can keep
+    # using `table_name` as the public-function stem.
     table_contracts: dict[str, _TableContract] = {}
     registered_keys: set[tuple[KernelKind, str]] = set()
     for profiler_spec in registry:
         key = (profiler_spec.kernel_kind, profiler_spec.backend)
         if key in registered_keys:
             raise ValueError(
-                f"duplicate profiler spec for {profiler_spec.kernel_kind.value}:"
+                f"duplicate profiler spec for {profiler_spec.kernel_kind}:"
                 f"{profiler_spec.backend}"
             )
         registered_keys.add(key)
 
         expected_contract = table_contracts.get(profiler_spec.table_name)
         actual_contract = _TableContract(
+            kernel_kind=profiler_spec.kernel_kind,
             args_schema=profiler_spec.args_schema,
             metric_family=profiler_spec.metric_family,
         )
@@ -115,13 +150,11 @@ def _validate_registry(registry: tuple[KernelProfilerSpec, ...]) -> None:
             )
 
 
-_validate_registry(REGISTRY)
-
-
 def iter_kernel_profiler_specs(
     kernel_kind: KernelKind | None = None,
 ) -> Iterator[KernelProfilerSpec]:
-    for profiler_spec in REGISTRY:
+    _ensure_loaded()
+    for profiler_spec in _REGISTRY:
         if kernel_kind is None or profiler_spec.kernel_kind == kernel_kind:
             yield profiler_spec
 
@@ -136,12 +169,12 @@ def resolve_spec_backend(kernel_kind: KernelKind, spec: dict[str, Any]) -> str:
         backend = str(spec["backend"])
         if backend not in backends:
             raise ValueError(
-                f"unknown backend {backend!r} for {kernel_kind.value}; known backends: {backends}"
+                f"unknown backend {backend!r} for {kernel_kind}; known backends: {backends}"
             )
         return backend
     if len(backends) == 1:
         return backends[0]
-    raise ValueError(f"backend is required for {kernel_kind.value}; known backends: {backends}")
+    raise ValueError(f"backend is required for {kernel_kind}; known backends: {backends}")
 
 
 def find_kernel_profiler_spec(
@@ -151,7 +184,7 @@ def find_kernel_profiler_spec(
     for profiler_spec in iter_kernel_profiler_specs(kernel_kind):
         if profiler_spec.backend == backend:
             return profiler_spec
-    raise KeyError(f"no profiler spec registered for {kernel_kind.value}:{backend}")
+    raise KeyError(f"no profiler spec registered for {kernel_kind}:{backend}")
 
 
 def load_runner(kernel_kind: KernelKind, backend: str) -> ProfileFn:
