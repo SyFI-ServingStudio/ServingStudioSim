@@ -13,7 +13,7 @@ use crate::common::time::Time;
 use crate::timing::bridge::{ArgsPayload, KernelKind, PerfApiBridge};
 use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning};
 use crate::timing::sweep::{SweepCoords, SweepGrid};
-use crate::timing::{BuildError, DryRun, JitPlan, LookupResult, Probe};
+use crate::timing::{BuildError, Describe, DryRun, JitPlan, LookupResult, Probe};
 
 /// Per-kernel `*KernelConfig` contract: identity (`Hash + Eq`) + the required
 /// `backends: Vec<&'static str>` field exposed via `backends()`. The proc-macro
@@ -25,6 +25,14 @@ pub trait KernelConfig: std::hash::Hash + Eq + Clone + std::fmt::Debug + 'static
     /// Used in build-error messages, e.g. `"SingleGemmKernelConfig.backends"`.
     /// Auto-derived as `"{StructName}.backends"`.
     const BACKENDS_FIELD: &'static str;
+
+    /// One-line config summary for the `Describe` leaf line — the `<cfg>` after
+    /// `<name> (<KIND>)`. The default is the full `{self:?}`; `#[derive(KernelConfig)]`
+    /// overrides it with a tidy `field=value` list over every field (including
+    /// `backends`), dropping only the struct-name + braces wrapper.
+    fn describe_config(&self) -> String {
+        format!("{self:?}")
+    }
 }
 
 /// One impl per kernel kind. Declares the per-kernel types (Config / Input),
@@ -168,6 +176,24 @@ impl<S: KernelSpec> Probe for Kernel<S> {
     }
     fn lookup_time(&self, input: &Self::Input) -> Time {
         Self::lookup_time(self, input)
+    }
+}
+
+impl<S: KernelSpec> Describe for Kernel<S> {
+    /// Leaf line: `<name> (<KIND>) <cfg fields>`. One blanket impl covers every
+    /// kernel because all of them are `Kernel<S>` — no per-kernel macro. The cfg
+    /// fields come from `KernelConfig: Debug`.
+    fn describe(&self, depth: usize, out: &mut String) {
+        use std::fmt::Write;
+        writeln!(
+            out,
+            "{}{} ({}) {}",
+            "│  ".repeat(depth),
+            self.name,
+            S::KIND,
+            self.config.describe_config(),
+        )
+        .unwrap();
     }
 }
 

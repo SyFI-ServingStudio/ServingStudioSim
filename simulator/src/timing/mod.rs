@@ -11,7 +11,7 @@ pub mod sweep;
 pub use bridge::{BuildError, PerfApiBridge};
 pub use jit::{BackendJitPlan, DryRun, JitPlan};
 pub use kernels::engine::KernelConfig;
-pub use result::{CoverageKind, CoverageWarning, LookupResult, Probe};
+pub use result::{CoverageKind, CoverageWarning, Describe, LookupResult, Probe};
 pub use sweep::{Axis, Coords, SweepCoords, SweepGrid};
 // Re-export derive macros under the same names as their traits so users only
 // import `crate::timing::{SweepCoords, KernelConfig}` once for both `impl`

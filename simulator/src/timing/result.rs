@@ -193,6 +193,17 @@ pub trait Probe {
     }
 }
 
+/// Debug-only tree renderer, the third sibling of `Probe` (sim runtime) and
+/// `DryRun` (build period). Walks the same op tree those traits produce but
+/// emits a human-readable, depth-indented shape print — never called on the sim
+/// hot path. Each node writes its own header at `depth` (indent
+/// `"│  ".repeat(depth)`) then recurses into children at `depth + 1`: an L1
+/// kernel leaf prints `<name> (<KIND>) <cfg>`, an L2 `Op` prints `<name>` and
+/// delegates to its kernel. See L3 design §7.
+pub trait Describe {
+    fn describe(&self, depth: usize, out: &mut String);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CoverageKind, CoverageWarning, LookupResult};

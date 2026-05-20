@@ -67,17 +67,38 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
     let name = &input.ident;
     let backends_field_label = format!("{name}.backends");
 
-    if !matches!(
-        &input.data,
-        Data::Struct(s) if matches!(s.fields, Fields::Named(_))
-    ) {
-        return syn::Error::new_spanned(
-            name,
-            "KernelConfig can only be derived on structs with named fields",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let fields = match &input.data {
+        Data::Struct(s) => match &s.fields {
+            Fields::Named(named) => &named.named,
+            Fields::Unnamed(_) | Fields::Unit => {
+                return syn::Error::new_spanned(
+                    name,
+                    "KernelConfig can only be derived on structs with named fields",
+                )
+                .to_compile_error()
+                .into();
+            }
+        },
+        Data::Enum(_) | Data::Union(_) => {
+            return syn::Error::new_spanned(
+                name,
+                "KernelConfig can only be derived on structs with named fields",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    // `describe_config`: a tidy `field=value` line over every config field
+    // (`backends` included — it is a load-bearing part of the kernel's identity).
+    // Each field renders via `{:?}` so any field type works without a `Display`
+    // bound (e.g. `dtype` -> `Bf16`, `backends` -> `["torch"]`). This just drops
+    // the struct-name + braces wrapper that the full `{self:?}` would print.
+    let describe_pushes = fields.iter().map(|f| {
+        let field = f.ident.as_ref().expect("named fields enforced above");
+        let label = field.to_string();
+        quote! { parts.push(::std::format!("{}={:?}", #label, self.#field)); }
+    });
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
@@ -87,6 +108,12 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
                 &self.backends
             }
             const BACKENDS_FIELD: &'static str = #backends_field_label;
+
+            fn describe_config(&self) -> ::std::string::String {
+                let mut parts: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+                #( #describe_pushes )*
+                parts.join(" ")
+            }
         }
     };
 

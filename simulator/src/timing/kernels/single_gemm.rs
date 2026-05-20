@@ -63,7 +63,7 @@ pub type SingleGemmKernel = Kernel<SingleGemmSpec>;
 mod tests {
     use super::{SingleGemmKernelConfig, SingleGemmKernelInput, SingleGemmSpec};
     use crate::timing::bridge::DType;
-    use crate::timing::kernels::engine::KernelSpec;
+    use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::SweepCoords;
     use serde_json::Value;
 
@@ -79,6 +79,33 @@ mod tests {
         assert_eq!(cfg.n, 128);
         assert_eq!(cfg.k, 256);
         assert_eq!(cfg.dtype, DType::Fp16);
+    }
+
+    #[test]
+    fn describe_config_renders_tidy_field_list() {
+        let cfg = SingleGemmKernelConfig {
+            backends: vec!["torch"],
+            n: 8192,
+            k: 8192,
+            dtype: DType::Bf16,
+        };
+        // Every field in declaration order, no struct-name/braces wrapper.
+        assert_eq!(
+            cfg.describe_config(),
+            r#"backends=["torch"] n=8192 k=8192 dtype=Bf16"#
+        );
+
+        // A Vec field renders via `{:?}` — standard bracketed, comma-separated.
+        let multi = SingleGemmKernelConfig {
+            backends: vec!["torch", "triton"],
+            n: 8192,
+            k: 8192,
+            dtype: DType::Bf16,
+        };
+        assert_eq!(
+            multi.describe_config(),
+            r#"backends=["torch", "triton"] n=8192 k=8192 dtype=Bf16"#
+        );
     }
 
     #[test]
