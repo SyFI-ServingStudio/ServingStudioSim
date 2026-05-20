@@ -703,14 +703,16 @@ def test_registry_rejects_table_metric_family_conflicts():
         _validate_registry((profiler_spec, conflicting_spec))
 
 
-def test_registry_rejects_table_kind_conflicts():
-    # Two different kinds sharing one table_name would silently break the
-    # facade builder (one stem -> one kind invariant in profiling/facade.py).
-    # The validator must catch this at registration time.
+def test_registry_rejects_table_name_kind_mismatch():
+    # The Rust bridge calls get_{kernel_kind}_times while Python exposes
+    # get_{table_name}_times, so a spec whose table_name != kernel_kind would
+    # make the cross-language facade name fail to resolve. The validator must
+    # reject it at registration time. (This also subsumes the old "two kinds
+    # sharing one table_name" hazard: distinct kinds now own distinct stems.)
     from profiling.db.registry import _validate_registry
 
     profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
-    conflicting_spec = KernelProfilerSpec(
+    mismatched_spec = KernelProfilerSpec(
         kernel_kind="some_other_kind",
         backend="torch",
         runner_ref=RunnerRef("profiling.runners.gemm.torch", "profile_single_gemm"),
@@ -720,8 +722,28 @@ def test_registry_rejects_table_kind_conflicts():
         batch_outlier_policy=profiler_spec.batch_outlier_policy,
     )
 
-    with pytest.raises(ValueError, match="conflicting table contract for single_gemm"):
-        _validate_registry((profiler_spec, conflicting_spec))
+    with pytest.raises(ValueError, match="must equal kernel_kind"):
+        _validate_registry((profiler_spec, mismatched_spec))
+
+
+def test_every_registered_spec_has_resolvable_cross_language_facade():
+    # Cross-language drift guard: the Rust bridge calls get_{kernel_kind}_times /
+    # count_missing_{kernel_kind}. For every registered spec that name must (a)
+    # equal the table_name stem Python builds from, and (b) actually exist as a
+    # generated facade on profiling.perf_api. This catches a Rust KIND that has
+    # no Python counterpart before it fails at runtime as an AttributeError.
+    from profiling.db.registry import iter_kernel_profiler_specs
+
+    for spec in iter_kernel_profiler_specs():
+        assert spec.table_name == spec.kernel_kind, (
+            f"{spec.kernel_kind}:{spec.backend} has table_name {spec.table_name!r} "
+            f"!= kernel_kind {spec.kernel_kind!r}"
+        )
+        for name in (f"get_{spec.kernel_kind}_times", f"count_missing_{spec.kernel_kind}"):
+            assert hasattr(perf_api, name), (
+                f"Rust bridge would call perf_api.{name} for kernel_kind "
+                f"{spec.kernel_kind!r}, but no such facade is generated"
+            )
 
 
 def test_register_after_load_revalidates_and_rejects_duplicates(monkeypatch):

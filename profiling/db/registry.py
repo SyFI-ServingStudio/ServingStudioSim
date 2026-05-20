@@ -126,6 +126,20 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
     table_contracts: dict[str, _TableContract] = {}
     registered_keys: set[tuple[KernelKind, str]] = set()
     for profiler_spec in registry:
+        # The Rust bridge derives its perf_api call name as `get_{kernel_kind}_times`
+        # (format! over `KernelSpec::KIND`), while `facade.py` derives the Python
+        # function name from `table_name`. The cross-language call only resolves
+        # when the two strings are identical, so a per-kernel module must keep them
+        # equal. This also subsumes the "one table_name maps to two kinds" hazard:
+        # distinct kinds now necessarily own distinct table_names.
+        if profiler_spec.table_name != profiler_spec.kernel_kind:
+            raise ValueError(
+                f"table_name {profiler_spec.table_name!r} must equal kernel_kind "
+                f"{profiler_spec.kernel_kind!r}: the Rust bridge calls "
+                f"get_{{kernel_kind}}_times while Python exposes get_{{table_name}}_times, "
+                f"so the cross-language facade name resolves only when they match"
+            )
+
         key = (profiler_spec.kernel_kind, profiler_spec.backend)
         if key in registered_keys:
             raise ValueError(
