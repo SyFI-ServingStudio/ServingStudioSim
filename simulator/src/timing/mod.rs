@@ -1,1 +1,19 @@
-//! `timing` — stub; see docs/file_structure.md + docs/detailed_design/
+//! L1 Rust timing layer: Python bridge, cache fitting, and per-kind kernels.
+
+pub mod bridge;
+pub mod cache;
+pub mod jit;
+pub mod kernels;
+pub mod result;
+pub mod routing;
+pub mod sweep;
+
+pub use bridge::{BuildError, PerfApiBridge};
+pub use jit::{BackendJitPlan, DryRun, JitPlan};
+pub use kernels::engine::KernelConfig;
+pub use result::{CoverageKind, CoverageWarning, LookupResult, Probe};
+pub use sweep::{Axis, Coords, SweepCoords, SweepGrid};
+// Re-export derive macros under the same names as their traits so users only
+// import `crate::timing::{SweepCoords, KernelConfig}` once for both `impl`
+// and `#[derive(...)]`.
+pub use timing_kernel_derive::{KernelConfig, SweepCoords};

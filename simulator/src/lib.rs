@@ -1,3 +1,8 @@
+// Make `::simulator::...` resolve to this crate so in-tree proc-macros (e.g.
+// `#[derive(SweepCoords)]` in `timing-kernel-derive`) can emit absolute paths
+// that work both inside this crate and from downstream callers.
+extern crate self as simulator;
+
 pub mod arch;
 pub mod common;
 pub mod deployment;

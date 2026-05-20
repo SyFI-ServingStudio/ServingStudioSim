@@ -1,1 +1,9 @@
-//! `timing/bridge` — stub; see docs/file_structure.md + docs/detailed_design/
+//! Thin Rust/Python bridge for L1 perf_api.
+
+pub mod core;
+pub mod error;
+pub mod payload;
+
+pub use core::PerfApiBridge;
+pub use error::{BuildError, PerfApiError};
+pub use payload::{ArgsPayload, DType, DbMetadata, KernelKind, KernelMetrics, ProfilerVersion};

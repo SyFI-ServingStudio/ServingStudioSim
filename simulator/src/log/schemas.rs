@@ -20,34 +20,34 @@ use arrow_schema::{DataType, Field, Schema};
 /// `output_section` struct columns onto this base.
 pub fn cost_log_envelope_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("worker_id",     DataType::UInt16,  false),
-        Field::new("worker_kind",   DataType::Utf8,    false),
-        Field::new("batch_id",      DataType::UInt64,  false),
-        Field::new("call_seq",      DataType::UInt32,  false),
-        Field::new("layer",         DataType::Int16,   false),
-        Field::new("group_id",      DataType::Int16,   false),
+        Field::new("worker_id", DataType::UInt16, false),
+        Field::new("worker_kind", DataType::Utf8, false),
+        Field::new("batch_id", DataType::UInt64, false),
+        Field::new("call_seq", DataType::UInt32, false),
+        Field::new("layer", DataType::Int16, false),
+        Field::new("group_id", DataType::Int16, false),
         Field::new("wall_start_ms", DataType::Float64, false),
-        Field::new("wall_end_ms",   DataType::Float64, false),
+        Field::new("wall_end_ms", DataType::Float64, false),
         Field::new("total_time_ms", DataType::Float64, false),
-        Field::new("energy_j",      DataType::Float64, false),
+        Field::new("energy_j", DataType::Float64, false),
     ]))
 }
 
 /// `kv_snapshot` (§4) — sampled KV pool state per worker × group.
 pub fn kv_snapshot_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("worker_id",      DataType::UInt16,  false),
-        Field::new("group_id",       DataType::UInt8,   false),
-        Field::new("time_ms",        DataType::Float64, false),
-        Field::new("active_kv",      DataType::UInt64,  false),
-        Field::new("projected_peak", DataType::UInt64,  false),
-        Field::new("promised_kv",    DataType::UInt64,  false),
-        Field::new("suspended_kv",   DataType::UInt64,  false),
-        Field::new("capacity",       DataType::UInt64,  false),
-        Field::new("active_pct",     DataType::Float32, false),
-        Field::new("peak_pct",       DataType::Float32, false),
-        Field::new("promised_pct",   DataType::Float32, false),
-        Field::new("suspended_pct",  DataType::Float32, false),
+        Field::new("worker_id", DataType::UInt16, false),
+        Field::new("group_id", DataType::UInt8, false),
+        Field::new("time_ms", DataType::Float64, false),
+        Field::new("active_kv", DataType::UInt64, false),
+        Field::new("projected_peak", DataType::UInt64, false),
+        Field::new("promised_kv", DataType::UInt64, false),
+        Field::new("suspended_kv", DataType::UInt64, false),
+        Field::new("capacity", DataType::UInt64, false),
+        Field::new("active_pct", DataType::Float32, false),
+        Field::new("peak_pct", DataType::Float32, false),
+        Field::new("promised_pct", DataType::Float32, false),
+        Field::new("suspended_pct", DataType::Float32, false),
     ]))
 }
 
@@ -55,21 +55,21 @@ pub fn kv_snapshot_schema() -> Arc<Schema> {
 pub fn network_event_schema() -> Arc<Schema> {
     let request_ids_item = Arc::new(Field::new("item", DataType::UInt32, false));
     Arc::new(Schema::new(vec![
-        Field::new("src_worker_id",      DataType::UInt16,                false),
-        Field::new("src_kind",           DataType::Utf8,                  false),
-        Field::new("dst_worker_id",      DataType::UInt16,                false),
-        Field::new("dst_kind",           DataType::Utf8,                  false),
-        Field::new("request_count",      DataType::UInt32,                false),
-        Field::new("request_ids",        DataType::List(request_ids_item), false),
-        Field::new("bytes",              DataType::UInt64,                false),
-        Field::new("pull_request_ms",    DataType::Float64,               false),
-        Field::new("pull_ready_ms",      DataType::Float64,               false),
-        Field::new("net_first_start_ms", DataType::Float64,               false),
-        Field::new("net_last_start_ms",  DataType::Float64,               false),
-        Field::new("pull_complete_ms",   DataType::Float64,               false),
-        Field::new("bandwidth_gbps",     DataType::Float64,               false),
-        Field::new("flow_id_first",      DataType::UInt64,                false),
-        Field::new("flow_count",         DataType::UInt32,                false),
+        Field::new("src_worker_id", DataType::UInt16, false),
+        Field::new("src_kind", DataType::Utf8, false),
+        Field::new("dst_worker_id", DataType::UInt16, false),
+        Field::new("dst_kind", DataType::Utf8, false),
+        Field::new("request_count", DataType::UInt32, false),
+        Field::new("request_ids", DataType::List(request_ids_item), false),
+        Field::new("bytes", DataType::UInt64, false),
+        Field::new("pull_request_ms", DataType::Float64, false),
+        Field::new("pull_ready_ms", DataType::Float64, false),
+        Field::new("net_first_start_ms", DataType::Float64, false),
+        Field::new("net_last_start_ms", DataType::Float64, false),
+        Field::new("pull_complete_ms", DataType::Float64, false),
+        Field::new("bandwidth_gbps", DataType::Float64, false),
+        Field::new("flow_id_first", DataType::UInt64, false),
+        Field::new("flow_count", DataType::UInt32, false),
     ]))
 }
 
@@ -79,23 +79,23 @@ pub fn network_event_schema() -> Arc<Schema> {
 /// which the new doc takes verbatim).
 pub fn request_state_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("request_id",              DataType::UInt32,   false),
-        Field::new("logging_time",            DataType::Float64,  false),
-        Field::new("arrival_time_ms",         DataType::Float64,  false),
-        Field::new("first_token_time_ms",     DataType::Float64,  true),
-        Field::new("completion_time_ms",      DataType::Float64,  true),
-        Field::new("completed",               DataType::Boolean,  false),
-        Field::new("input_len",               DataType::UInt32,   false),
-        Field::new("output_len",              DataType::UInt32,   false),
-        Field::new("completed_input_len",     DataType::UInt32,   false),
-        Field::new("completed_output_len",    DataType::UInt32,   false),
-        Field::new("final_phase",             DataType::LargeUtf8, false),
-        Field::new("session_id",              DataType::UInt32,   false),
-        Field::new("round_idx",               DataType::UInt32,   false),
-        Field::new("total_rounds",            DataType::UInt32,   false),
-        Field::new("tool_wait_after_ms",      DataType::Float64,  false),
-        Field::new("session_arrival_time_ms", DataType::Float64,  false),
-        Field::new("preserved_prefix_kv",     DataType::UInt32,   false),
+        Field::new("request_id", DataType::UInt32, false),
+        Field::new("logging_time", DataType::Float64, false),
+        Field::new("arrival_time_ms", DataType::Float64, false),
+        Field::new("first_token_time_ms", DataType::Float64, true),
+        Field::new("completion_time_ms", DataType::Float64, true),
+        Field::new("completed", DataType::Boolean, false),
+        Field::new("input_len", DataType::UInt32, false),
+        Field::new("output_len", DataType::UInt32, false),
+        Field::new("completed_input_len", DataType::UInt32, false),
+        Field::new("completed_output_len", DataType::UInt32, false),
+        Field::new("final_phase", DataType::LargeUtf8, false),
+        Field::new("session_id", DataType::UInt32, false),
+        Field::new("round_idx", DataType::UInt32, false),
+        Field::new("total_rounds", DataType::UInt32, false),
+        Field::new("tool_wait_after_ms", DataType::Float64, false),
+        Field::new("session_arrival_time_ms", DataType::Float64, false),
+        Field::new("preserved_prefix_kv", DataType::UInt32, false),
     ]))
 }
 
@@ -107,17 +107,21 @@ pub fn request_state_schema() -> Arc<Schema> {
 pub fn request_slo_schema() -> Arc<Schema> {
     let token_times_item = Arc::new(Field::new("item", DataType::Float32, false));
     Arc::new(Schema::new(vec![
-        Field::new("request_id",         DataType::UInt32,                 false),
-        Field::new("logging_time",       DataType::Float64,                false),
-        Field::new("completed",          DataType::Boolean,                false),
-        Field::new("arrival_time_ms",    DataType::Float64,                false),
-        Field::new("output_token_times", DataType::List(token_times_item), false),
-        Field::new("num_output_tokens",  DataType::UInt32,                 false),
-        Field::new("ttft_ms",            DataType::Float32,                true),
-        Field::new("tpot_mean_ms",       DataType::Float32,                true),
-        Field::new("tpot_p50_ms",        DataType::Float32,                true),
-        Field::new("tpot_p99_ms",        DataType::Float32,                true),
-        Field::new("tpot_max_ms",        DataType::Float32,                true),
+        Field::new("request_id", DataType::UInt32, false),
+        Field::new("logging_time", DataType::Float64, false),
+        Field::new("completed", DataType::Boolean, false),
+        Field::new("arrival_time_ms", DataType::Float64, false),
+        Field::new(
+            "output_token_times",
+            DataType::List(token_times_item),
+            false,
+        ),
+        Field::new("num_output_tokens", DataType::UInt32, false),
+        Field::new("ttft_ms", DataType::Float32, true),
+        Field::new("tpot_mean_ms", DataType::Float32, true),
+        Field::new("tpot_p50_ms", DataType::Float32, true),
+        Field::new("tpot_p99_ms", DataType::Float32, true),
+        Field::new("tpot_max_ms", DataType::Float32, true),
     ]))
 }
 

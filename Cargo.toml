@@ -12,7 +12,9 @@ path = "simulator/src/lib.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
+# `rc` enables Serialize/Deserialize for the `Arc<str>` name on `LookupResult`
+# (cheap clone on the hot lookup path — see timing/result.rs).
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 anyhow = "1"
 thiserror = "2"
@@ -23,4 +25,9 @@ pyo3 = { version = "0.20", features = ["auto-initialize"] }
 # compile.
 arrow-schema = { version = "54", default-features = false }
 
+# In-tree proc-macro crate that powers `#[derive(SweepCoords)]` on per-kernel
+# Input structs (see simulator/src/timing/kernels/engine.rs).
+timing-kernel-derive = { path = "timing-kernel-derive" }
+
 [workspace]
+members = ["timing-kernel-derive"]
