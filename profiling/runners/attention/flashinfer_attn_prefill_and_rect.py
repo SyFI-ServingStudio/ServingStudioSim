@@ -1,16 +1,22 @@
 """FlashInfer ragged attention runner — prefill (causal) + rect (non-causal).
 
-These two kinds share one ragged-prefill caller (``_run_ragged_attention``) and
-differ only by ``causal``, so they live together here rather than duplicating the
-caller across two files. Each ``(kind, backend)`` registers its own thin entry
-function because the worker strips ``backend`` before calling the runner — it
-routes to the runner via the registry, so the runner is selected by backend, not
-told it (see ``profiling/exec/local_worker.py``).
+Both kinds drive the same ragged wrapper via one core caller (``_run_ragged``,
+keyed on ``q_len``/``kv_len`` + ``causal``); they differ only in how their wire
+schema maps to those kernel params, so they live together here rather than
+duplicating the wrapper/plan/run logic:
 
-Prefill is causal and *merges* the ref's pure-prefill + chunked ops (pure prefill
-= ``prefix_len == 0``); rect is the non-causal sibling. The cache-dim ->
-kernel-param mapping (``q_len = append_len``, ``kv_len = prefix_len + append_len``)
-lives in ``_run_ragged_attention`` — the ONE place it is documented.
+- **prefill** (causal) merges the ref's pure-prefill + chunked ops. Its wire
+  schema is ``(prefix_len, append_len)``; ``_run_prefill`` derives ``q_len =
+  append_len``, ``kv_len = prefix_len + append_len`` (the ONE place that mapping
+  lives). Pure prefill = ``prefix_len == 0``.
+- **rect** (non-causal) is parametrized by ``(q_len, kv_len)`` *directly* — for
+  non-causal there is no causal prefix/append split, only the two lengths, and
+  this also lets rect express ``q_len > kv_len`` (which the prefill encoding
+  cannot). rect entries pass ``q_len``/``kv_len`` straight to ``_run_ragged``.
+
+Each ``(kind, backend)`` registers its own thin entry function because the worker
+strips ``backend`` before calling the runner — it routes via the registry, so the
+runner is selected by backend, not told it (see ``profiling/exec/local_worker.py``).
 
 Shared op-agnostic mechanics (tensor/indptr/fp8 construction, dtype/backend
 helpers, do_bench + metrics) live in ``_common``. The heavy libs (``flashinfer`` /
@@ -76,12 +82,12 @@ def _run_cudnn_attention(
     return _common.measure(benchmark_fn, flops=flops, bytes_accessed=bytes_accessed)
 
 
-def _run_ragged_attention(
+def _run_ragged(
     *,
     backend: str,
     causal: bool,
-    prefix_len: int,
-    append_len: int,
+    q_len: int,
+    kv_len: int,
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
@@ -89,10 +95,11 @@ def _run_ragged_attention(
     kv_dtype: DType | str,
     o_dtype: DType | str,
 ) -> ComputeMetrics:
-    """Shared ragged-prefill caller for prefill (causal) and rect (non-causal).
+    """Core ragged caller keyed on (q_len, kv_len) + causal, shared by both kinds.
 
-    Cache dims -> kernel params (the ONE place this mapping lives):
-    ``q_len = append_len``, ``kv_len = prefix_len + append_len``.
+    Picks the wrapper, builds ``plan()`` kwargs + the ``run()`` closure, and
+    measures. The wire-schema -> (q_len, kv_len) mapping is the caller's job
+    (``_run_prefill`` for prefill; rect passes them directly).
     """
     if backend == "trt":
         # trtllm-gen has no variable-length/ragged prefill kernel, and on sm90
@@ -106,8 +113,8 @@ def _run_ragged_attention(
             "on B200 is not yet implemented"
         )
 
-    q_len = int(append_len)
-    kv_len = int(prefix_len) + int(append_len)
+    q_len = int(q_len)
+    kv_len = int(kv_len)
 
     try:
         import torch
@@ -176,39 +183,72 @@ def _run_ragged_attention(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
+def _run_prefill(
+    *,
+    backend: str,
+    prefix_len: int,
+    append_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    q_dtype: DType | str,
+    kv_dtype: DType | str,
+    o_dtype: DType | str,
+) -> ComputeMetrics:
+    """Prefill caller: maps the cache dims to kernel params, then runs causal.
+
+    Cache dims -> kernel params (the ONE place this mapping lives):
+    ``q_len = append_len``, ``kv_len = prefix_len + append_len``.
+    """
+    return _run_ragged(
+        backend=backend,
+        causal=True,
+        q_len=int(append_len),
+        kv_len=int(prefix_len) + int(append_len),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        o_dtype=o_dtype,
+    )
+
+
 # --- flashinfer_attn_prefill (causal) entry points, one per backend ----------
 
 
 def profile_flashinfer_attn_prefill_fa2(**kwargs) -> ComputeMetrics:
-    return _run_ragged_attention(backend="fa2", causal=True, **kwargs)
+    return _run_prefill(backend="fa2", **kwargs)
 
 
 def profile_flashinfer_attn_prefill_fa3(**kwargs) -> ComputeMetrics:
-    return _run_ragged_attention(backend="fa3", causal=True, **kwargs)
+    return _run_prefill(backend="fa3", **kwargs)
 
 
 def profile_flashinfer_attn_prefill_trt(**kwargs) -> ComputeMetrics:
-    return _run_ragged_attention(backend="trt", causal=True, **kwargs)
+    return _run_prefill(backend="trt", **kwargs)
 
 
 def profile_flashinfer_attn_prefill_cudnn(**kwargs) -> ComputeMetrics:
-    return _run_ragged_attention(backend="cudnn", causal=True, **kwargs)
+    return _run_prefill(backend="cudnn", **kwargs)
 
 
 # --- flashinfer_attn_rect (non-causal) entry points, one per backend ---------
+# rect is parametrized by (q_len, kv_len) directly, so kwargs already carry the
+# kernel params; pass them straight through with causal=False.
 
 
 def profile_flashinfer_attn_rect_fa2(**kwargs) -> ComputeMetrics:
-    return _run_ragged_attention(backend="fa2", causal=False, **kwargs)
+    return _run_ragged(backend="fa2", causal=False, **kwargs)
 
 
 def profile_flashinfer_attn_rect_fa3(**kwargs) -> ComputeMetrics:
-    return _run_ragged_attention(backend="fa3", causal=False, **kwargs)
+    return _run_ragged(backend="fa3", causal=False, **kwargs)
 
 
 def profile_flashinfer_attn_rect_trt(**kwargs) -> ComputeMetrics:
-    return _run_ragged_attention(backend="trt", causal=False, **kwargs)
+    return _run_ragged(backend="trt", causal=False, **kwargs)
 
 
 def profile_flashinfer_attn_rect_cudnn(**kwargs) -> ComputeMetrics:
-    return _run_ragged_attention(backend="cudnn", causal=False, **kwargs)
+    return _run_ragged(backend="cudnn", causal=False, **kwargs)
