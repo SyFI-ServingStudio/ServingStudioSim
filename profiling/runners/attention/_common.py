@@ -181,6 +181,90 @@ def build_ragged_inputs(
     return RaggedInputs(q, k, v, qo_indptr, kv_indptr, scales, bytes_accessed)
 
 
+@dataclass(frozen=True)
+class PagedDecodeInputs:
+    """Paged-KV tensors + CSR page tables for a batched single-token decode.
+
+    ``q`` is one query token per request: ``(batch_size, num_qo_heads, head_dim)``.
+    ``k_cache``/``v_cache`` are paged: ``(total_pages, page_size, num_kv_heads,
+    head_dim)``. ``scales`` is None for non-fp8; for fp8-KV it is the scalar
+    ``(k_scale, v_scale)`` (per-head mean) the caller forwards to ``wrapper.run``.
+    """
+
+    q: Any
+    k_cache: Any
+    v_cache: Any
+    kv_indptr: Any
+    kv_indices: Any
+    kv_last_page_len: Any
+    scales: tuple[float, float] | None
+    bytes_accessed: int
+
+
+def build_paged_decode_inputs(
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    q_dtype: DType | str,
+    kv_dtype: DType | str,
+    o_dtype: DType | str,
+    page_size: int = 16,
+) -> PagedDecodeInputs:
+    """Allocate paged KV + CSR page tables for ``batch_size`` decode requests.
+
+    Each request holds ``seq_len`` cached tokens (the per-request mean kv length)
+    and emits one query token. Mirrors the ref decode setup (``PAGE_SIZE=16``).
+    For fp8-KV the cache is generated in fp16 then per-head quantized; the caller
+    forwards the returned scalar scales to ``run`` and sets ``kv_data_type``.
+    """
+    import torch
+
+    uses_fp8 = is_fp8(kv_dtype)
+    if uses_fp8 and is_fp8(o_dtype):
+        raise ValueError("decode fp8 requires a non-fp8 o_dtype")
+
+    num_pages_per_seq = (seq_len + page_size - 1) // page_size
+    total_pages = batch_size * num_pages_per_seq
+    kv_base_dtype = torch.float16 if uses_fp8 else to_torch_dtype(kv_dtype)
+
+    k_base = torch.randn(
+        total_pages, page_size, num_kv_heads, head_dim, dtype=kv_base_dtype, device="cuda"
+    )
+    v_base = torch.randn(
+        total_pages, page_size, num_kv_heads, head_dim, dtype=kv_base_dtype, device="cuda"
+    )
+    q = randn(batch_size, num_qo_heads, head_dim, dtype=to_torch_dtype(q_dtype))
+
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda") * num_pages_per_seq
+    )
+    kv_indices = torch.arange(total_pages, dtype=torch.int32, device="cuda")
+    last_page_len = seq_len % page_size or page_size
+    kv_last_page_len = torch.full((batch_size,), last_page_len, dtype=torch.int32, device="cuda")
+
+    if uses_fp8:
+        k_cache, s_k = per_head_symmetric_quant(k_base)
+        v_cache, s_v = per_head_symmetric_quant(v_base)
+        scales: tuple[float, float] | None = (float(s_k.mean().item()), float(s_v.mean().item()))
+    else:
+        k_cache, v_cache = k_base, v_base
+        scales = None
+
+    o_elem = torch.tensor([], dtype=to_torch_dtype(o_dtype)).element_size()
+    bytes_accessed = int(
+        q.numel() * q.element_size()
+        + k_cache.numel() * k_cache.element_size()
+        + v_cache.numel() * v_cache.element_size()
+        + batch_size * num_qo_heads * head_dim * o_elem
+    )
+    return PagedDecodeInputs(
+        q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, scales, bytes_accessed
+    )
+
+
 def measure(
     benchmark_fn: Callable[[], object],
     *,

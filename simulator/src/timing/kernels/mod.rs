@@ -2,6 +2,7 @@
 
 pub mod elementwise;
 pub mod engine;
+pub mod flashinfer_attn_decode;
 pub mod flashinfer_attn_prefill;
 pub mod flashinfer_attn_rect;
 pub mod rms_norm;
@@ -11,6 +12,10 @@ pub use elementwise::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ElementwiseSpec,
 };
 pub use engine::{Kernel, KernelConfig, KernelSpec};
+pub use flashinfer_attn_decode::{
+    FlashinferAttnDecodeKernel, FlashinferAttnDecodeKernelConfig,
+    FlashinferAttnDecodeKernelInput, FlashinferAttnDecodeSpec,
+};
 pub use flashinfer_attn_prefill::{
     FlashinferAttnPrefillKernel, FlashinferAttnPrefillKernelConfig,
     FlashinferAttnPrefillKernelInput, FlashinferAttnPrefillSpec,
