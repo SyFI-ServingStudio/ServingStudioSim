@@ -10,4 +10,7 @@ Symmetric with Rust ``simulator/src/timing/kernels/<kind>.rs``: one file per
 kernel kind owns its Python wire format and registry presence.
 """
 
-from profiling.kernels import single_gemm  # noqa: F401
+from profiling.kernels import (
+    rms_norm,  # noqa: F401
+    single_gemm,  # noqa: F401
+)

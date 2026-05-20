@@ -24,6 +24,10 @@ profiling = [
     # Broaden these only after validating the cluster driver/runtime pair.
     "torch>=2.10,<2.11",
     "triton>=3.6,<3.7; sys_platform == 'linux'",
+    # flashinfer pip == default_env per L1 design §2.4 (flashinfer_pip_env is an
+    # alias to default_env). Pinned to the reference profiling stack (0.6.6).
+    "flashinfer-python>=0.6.4,<0.7; sys_platform == 'linux'",
+    "flashinfer-cubin>=0.6.4,<0.7; sys_platform == 'linux'",
 ]
 
 [tool.ruff]
