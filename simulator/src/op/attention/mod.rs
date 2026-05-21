@@ -1,1 +1,5 @@
-//! `op/attention` — stub; see docs/file_structure.md + docs/detailed_design/
+//! `op/attention` — compound attention ops. See docs/detailed_design/L2/ §3.
+
+pub mod flashinfer;
+
+pub use flashinfer::{FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp};
