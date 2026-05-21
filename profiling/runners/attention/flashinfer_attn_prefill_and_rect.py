@@ -18,6 +18,11 @@ Each ``(kind, backend)`` registers its own thin entry function because the worke
 strips ``backend`` before calling the runner — it routes via the registry, so the
 runner is selected by backend, not told it (see ``profiling/exec/local_worker.py``).
 
+The **fa2** path sweeps ``fixed_split_size`` internally (``_measure_best_split``)
+and records the fastest, because fa2's default KV-split is load-imbalanced for
+long-kv ragged calls; fa3 self-tunes and keeps the single default plan. The split
+set is internal to profiling, not a wire/cache axis.
+
 Shared op-agnostic mechanics (tensor/indptr/fp8 construction, dtype/backend
 helpers, do_bench + metrics) live in ``_common``. The heavy libs (``flashinfer`` /
 ``torch``) are imported lazily inside the functions; this module is only loaded
@@ -27,9 +32,18 @@ inside the profiling worker subprocess via ``RunnerRef``.
 from __future__ import annotations
 
 from profiling.db.args import DType
+from profiling.profilers.timer import Timer
 from profiling.runners.attention import _common
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
+
+# fa2's KV-split heuristic is load-imbalanced for long-kv ragged calls (the
+# default can inflate kernel time ~1.6x); the simulator prices each shape at its
+# best achievable split, so the fa2 profiler sweeps fixed_split_size internally
+# and keeps the fastest. Mirrors the validated best-split sweep (see
+# agent-trace/attention_cache_fidelity.md). fa3 self-tunes — it keeps the single
+# default plan. The split set is NOT a wire/cache axis; it stays internal here.
+_FA2_SPLIT_SIZES: tuple[int, ...] = (1024, 2048, 4096, 8192, 16384)
 
 
 def _run_cudnn_attention(
@@ -162,7 +176,8 @@ def _run_ragged(
             plan_kwargs["o_data_type"] = _common.to_torch_dtype(o_dtype)
         elif _common.to_torch_dtype(q_dtype) != _common.to_torch_dtype(o_dtype):
             plan_kwargs["o_data_type"] = _common.to_torch_dtype(o_dtype)
-        wrapper.plan(**plan_kwargs)
+        # plan() is deferred: fa2 sweeps fixed_split_size (re-plans per candidate),
+        # so we do not plan once up front. The run() closure is split-agnostic.
 
         if inp.scales is not None:
             s_q, s_k, s_v = inp.scales
@@ -178,9 +193,65 @@ def _run_ragged(
             q_len=q_len, kv_len=kv_len, num_qo_heads=num_qo_heads,
             head_dim=head_dim, causal=causal,
         )
+        if backend == "fa2":
+            return _measure_best_split(
+                wrapper=wrapper,
+                plan_kwargs=plan_kwargs,
+                benchmark_fn=benchmark_fn,
+                kv_len=kv_len,
+                flops=flops,
+                bytes_accessed=inp.bytes_accessed,
+            )
+        wrapper.plan(**plan_kwargs)
         return _common.measure(benchmark_fn, flops=flops, bytes_accessed=inp.bytes_accessed)
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc
+
+
+def _measure_best_split(
+    *,
+    wrapper,
+    plan_kwargs: dict,
+    benchmark_fn,
+    kv_len: int,
+    flops: int,
+    bytes_accessed: int,
+) -> ComputeMetrics:
+    """fa2 only: time the run under each candidate ``fixed_split_size`` (plus the
+    flashinfer default) and re-measure at the fastest.
+
+    The sweep uses cold-L2 kernel-only ``Timer.cupti`` (cheap, no energy); the
+    winning split is then re-planned and run through the full ``_common.measure``
+    (cupti + energy) once. Candidates ``>= kv_len`` are dropped (a split that
+    large means no split = the default). A fixed split that fails to plan/run is
+    skipped; the default (no ``fixed_split_size``) is always tried and its failure
+    surfaces (caught as ``KernelLaunchFailed`` by the caller).
+    """
+    candidates: list[int | None] = [None]
+    candidates += [s for s in _FA2_SPLIT_SIZES if s < kv_len]
+
+    best_time = float("inf")
+    best_split: int | None = None
+    for split in candidates:
+        kwargs = dict(plan_kwargs)
+        if split is not None:
+            kwargs["fixed_split_size"] = split
+        try:
+            wrapper.plan(**kwargs)
+            time_ms = Timer.cupti(benchmark_fn)
+        except Exception:  # noqa: BLE001 — a bad fixed split is skipped, not fatal
+            if split is None:
+                raise
+            continue
+        if time_ms < best_time:
+            best_time = time_ms
+            best_split = split
+
+    kwargs = dict(plan_kwargs)
+    if best_split is not None:
+        kwargs["fixed_split_size"] = best_split
+    wrapper.plan(**kwargs)
+    return _common.measure(benchmark_fn, flops=flops, bytes_accessed=bytes_accessed)
 
 
 def _run_prefill(
