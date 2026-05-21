@@ -489,9 +489,7 @@ def test_torch_single_gemm_passes_timer_result_to_energy(
 
     captured_energy_kwargs: dict[str, object] = {}
 
-    def fake_do_bench(fn, *, warmup: int, rep: int) -> float:
-        assert warmup == 10
-        assert rep == 1000
+    def fake_cupti(fn, **kwargs: object) -> float:
         fn()
         return 2.5
 
@@ -501,7 +499,7 @@ def test_torch_single_gemm_passes_timer_result_to_energy(
         return 0.25
 
     monkeypatch.setitem(sys.modules, "torch", FakeTorch)
-    monkeypatch.setattr(torch_gemm_runner.Timer, "do_bench", staticmethod(fake_do_bench))
+    monkeypatch.setattr(torch_gemm_runner.Timer, "cupti", staticmethod(fake_cupti))
     monkeypatch.setattr(torch_gemm_runner.Energy, "perf", staticmethod(fake_energy_perf))
 
     metrics = torch_gemm_runner.profile_single_gemm(2, 3, 4, DType.FP16)
@@ -509,7 +507,6 @@ def test_torch_single_gemm_passes_timer_result_to_energy(
     assert metrics.time_ms == 2.5
     assert metrics.energy_j == 0.25
     assert captured_energy_kwargs["per_iter_time_ms"] == 2.5
-    assert captured_energy_kwargs["min_duration_ms"] == 1000
 
 
 def test_single_gemm_perf_api_query_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

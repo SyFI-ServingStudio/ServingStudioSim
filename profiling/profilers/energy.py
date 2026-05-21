@@ -2,16 +2,27 @@
 
 The detailed design makes energy a first-class metric. This helper keeps that
 field wired without making NVML a hard dependency for development machines.
+
+Agent note: ``Energy.perf`` always sizes its NVML window from ``min_duration_ms``
+(a per-process timing estimate), so the iteration count is non-deterministic
+across ranks. Multi-GPU / collective runs must not rely on this path -- see
+``warn_if_multi_gpu_duration_mode``.
 """
 
 from __future__ import annotations
 
-import math
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+from profiling.profilers._duration import (
+    DEFAULT_MIN_DURATION_MS,
+    DEFAULT_MIN_REP,
+    iters_for_duration,
+    warn_if_multi_gpu_duration_mode,
+)
 
 _TOTAL_ENERGY_SUPPORTED_BY_GPU: dict[str | int, bool] = {}
 _MAX_CLEAN_RESTARTS = 3
@@ -31,9 +42,17 @@ class Energy:
         fn: Callable[[], object],
         *,
         warmup: int = 10,
-        min_duration_ms: int = 1000,
+        min_duration_ms: int | None = None,
+        min_rep: int | None = None,
         per_iter_time_ms: float | None = None,
     ) -> float:
+        # Time-centric like Timer: poll for at least min_duration_ms, but never
+        # fewer than min_rep iterations (the larger wins).
+        min_duration_ms = (
+            DEFAULT_MIN_DURATION_MS if min_duration_ms is None else min_duration_ms
+        )
+        min_rep = DEFAULT_MIN_REP if min_rep is None else min_rep
+        warn_if_multi_gpu_duration_mode("Energy.perf")
         for _ in range(warmup):
             fn()
 
@@ -60,7 +79,8 @@ class Energy:
                 synchronize=torch.cuda.synchronize,
             )
         else:
-            planned_iters = _iters_for_duration(min_duration_ms, per_iter_time_ms)
+            planned_iters = iters_for_duration(min_duration_ms, per_iter_time_ms)
+        planned_iters = max(planned_iters, min_rep)
         try:
             if _supports_total_energy(pynvml, handle, device_idx):
                 return _measure_by_total_energy_counter(
@@ -96,15 +116,7 @@ class Energy:
         if synchronize is not None:
             synchronize()
         elapsed_ms = max((time.perf_counter() - start_s) * 1000.0, 0.01)
-        return _iters_for_duration(min_duration_ms, elapsed_ms)
-
-
-def _iters_for_duration(min_duration_ms: int, per_iter_time_ms: float) -> int:
-    if not math.isfinite(per_iter_time_ms) or per_iter_time_ms <= 0:
-        raise ValueError("per_iter_time_ms must be finite and positive")
-    if min_duration_ms <= 0:
-        return 1
-    return max(math.ceil(float(min_duration_ms) / per_iter_time_ms), 1)
+        return iters_for_duration(min_duration_ms, elapsed_ms)
 
 
 def _supports_total_energy(pynvml: Any, handle: object, device_idx: int) -> bool:
@@ -190,7 +202,7 @@ def _measure_with_clean_restarts(
             0.001,
         )
         attempt_iters = max(
-            _iters_for_duration(min_duration_ms, observed_per_iter_ms),
+            iters_for_duration(min_duration_ms, observed_per_iter_ms),
             last_attempt.executed_iters + 1,
         )
 

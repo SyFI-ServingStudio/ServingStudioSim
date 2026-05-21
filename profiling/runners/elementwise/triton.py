@@ -138,12 +138,12 @@ def profile_elementwise(
                     FAN_IN=fan_in,
                 )
 
-        warmup = 100
-        time_ms = Timer.cupti(run_once, warmup=warmup, rep=1000, kernel_name=kernel_name)
+        # cupti samples adaptively until convergence with no warmup; energy keeps
+        # a light warmup before its NVML window.
+        time_ms = Timer.cupti(run_once, kernel_name=kernel_name)
         energy_j = Energy.perf(
             run_once,
-            warmup=min(warmup, 5),
-            min_duration_ms=1000,
+            warmup=5,
             per_iter_time_ms=time_ms,
         )
 

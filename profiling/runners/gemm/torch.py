@@ -38,12 +38,12 @@ def profile_single_gemm(
         def kernel():
             return torch.mm(a, b)
 
-        warmup = 10
-        time_ms = Timer.do_bench(kernel, warmup=warmup, rep=1000)
+        # cupti samples adaptively until convergence (kernel-only, cold L2),
+        # no warmup; kernel_name=None sums the GEMM kernel(s) in the window.
+        time_ms = Timer.cupti(kernel)
         energy_j = Energy.perf(
             kernel,
-            warmup=min(warmup, 5),
-            min_duration_ms=1000,
+            warmup=5,
             per_iter_time_ms=time_ms,
         )
 

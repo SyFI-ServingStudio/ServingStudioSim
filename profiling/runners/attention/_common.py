@@ -7,13 +7,14 @@ than buried here:
 
 - dtype / backend-name helpers (incl. fp8),
 - input construction (tensor alloc + CSR indptr + per-head fp8 quant),
-- ``measure(...)`` — the do_bench + energy + ComputeMetrics boilerplate.
+- ``measure(...)`` — the Timer.cupti + energy + ComputeMetrics boilerplate.
 
 prefill + rect share one caller in ``flashinfer_attn_prefill_and_rect.py`` (they differ only by
 ``causal``); decode keeps its own (different wrapper) in ``flashinfer_decode.py``.
-Mirrors the measurement of
-``ref/profile/attention/flashinfer_profiler.py`` (Timer.do_bench, FlashInfer-style
-``attention_flops``), minus all DB / sweep / CLI machinery (L1b owns those).
+FLOPs/byte accounting mirrors ``ref/profile/attention/flashinfer_profiler.py``
+(FlashInfer-style ``attention_flops``), minus all DB / sweep / CLI machinery (L1b
+owns those). NOTE: timing now uses Timer.cupti (cold-L2, kernel-only) rather than
+the ref's Timer.do_bench, so absolute times diverge from that reference.
 """
 
 from __future__ import annotations
@@ -270,18 +271,18 @@ def measure(
     *,
     flops: int,
     bytes_accessed: int,
-    warmup: int = 100,
-    rep: int = 1000,
 ) -> ComputeMetrics:
-    """do_bench the closure, sample energy, assemble ComputeMetrics.
+    """Time the closure with CUPTI, sample energy, assemble ComputeMetrics.
 
-    Timer.do_bench matches the ref's measurement for all attention paths.
+    Timer.cupti measures kernel-only time with cold L2, sampling adaptively until
+    the mean converges (no warmup). kernel_name=None sums every kernel the closure
+    launches in the window. NOTE: this diverges from the ref's do_bench (warm,
+    wall-clock) measurement -- the recorded numbers are cold-L2 kernel-only.
     """
-    time_ms = Timer.do_bench(benchmark_fn, warmup=warmup, rep=rep)
+    time_ms = Timer.cupti(benchmark_fn)
     energy_j = Energy.perf(
         benchmark_fn,
-        warmup=min(warmup, 5),
-        min_duration_ms=1000,
+        warmup=5,
         per_iter_time_ms=time_ms,
     )
     tflops = (flops / (time_ms / 1000.0)) / 1e12 if time_ms > 0 and flops > 0 else 0.0

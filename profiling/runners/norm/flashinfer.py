@@ -46,12 +46,12 @@ def profile_rms_norm(
         def kernel():
             return flashinfer.norm.rmsnorm(x, weight, eps=_EPS)
 
-        warmup = 100
-        time_ms = Timer.cupti(kernel, warmup=warmup, rep=1000, kernel_name=_KERNEL_NAME)
+        # cupti samples adaptively until convergence with no warmup; energy keeps
+        # a light warmup before its NVML window.
+        time_ms = Timer.cupti(kernel, kernel_name=_KERNEL_NAME)
         energy_j = Energy.perf(
             kernel,
-            warmup=min(warmup, 5),
-            min_duration_ms=1000,
+            warmup=5,
             per_iter_time_ms=time_ms,
         )
 
