@@ -87,7 +87,7 @@ fn bridge_round_trips_metadata_count_hit_and_missing() {
     let _ = std::fs::remove_file(&db_path);
     seed_db(&db_path_str);
 
-    let bridge = PerfApiBridge::with_gpu_name(GPU).expect("bridge construction (disable_jit)");
+    let bridge = PerfApiBridge::new().expect("bridge construction (disable_jit)");
 
     // 1. DbMetadata unmarshalling: migrate() ran during seeding, so a real
     //    schema_version comes back across the boundary.
@@ -102,7 +102,7 @@ fn bridge_round_trips_metadata_count_hit_and_missing() {
     // 2. count_missing: facade name `count_missing_single_gemm` + usize extract.
     //    m=16 is seeded (hit), m=999 is absent (miss) → exactly one missing.
     let missing = bridge
-        .count_missing(vec![payload(16), payload(999)], KIND, "torch")
+        .count_missing(vec![payload(16), payload(999)], KIND, "torch", GPU)
         .expect("count_missing");
     assert_eq!(missing, 1, "only m=999 should be missing");
 
@@ -110,7 +110,7 @@ fn bridge_round_trips_metadata_count_hit_and_missing() {
     //    unmarshalling (including the optional_f64 path for tflops/mem_bw, and
     //    the AttributeError-swallow for the absent comm-only fields).
     let hit = bridge
-        .get_times(vec![payload(16)], KIND)
+        .get_times(vec![payload(16)], KIND, GPU)
         .expect("get_times hit");
     assert_eq!(hit.len(), 1);
     assert_eq!(hit[0].time_ms, 2.5);
@@ -122,7 +122,7 @@ fn bridge_round_trips_metadata_count_hit_and_missing() {
 
     // 4. get_times miss: an absent spec must surface as a typed MissingEntry
     //    (JIT is disabled by construction), not a zeroed metric or a panic.
-    let miss = bridge.get_times(vec![payload(999)], KIND);
+    let miss = bridge.get_times(vec![payload(999)], KIND, GPU);
     match miss {
         Err(PerfApiError::MissingEntry { kind, backend, .. }) => {
             assert_eq!(kind, KIND);

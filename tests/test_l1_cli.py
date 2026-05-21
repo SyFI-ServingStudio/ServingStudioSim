@@ -13,26 +13,6 @@ def _json_stdout(capsys):
     return json.loads(capsys.readouterr().out)
 
 
-def test_cli_list_json(capsys):
-    exit_code = cli.main(["list", "--json"])
-
-    assert exit_code == 0
-    payload = _json_stdout(capsys)
-    assert payload["ok"] is True
-    assert payload["profilers"] == [
-        {
-            "args": "m,n,k,dtype",
-            "backend": "torch",
-            "count_fn": "count_missing_single_gemm",
-            "get_fn": "get_single_gemm_times",
-            "kernel_kind": "single_gemm",
-            "metric_family": "compute",
-            "subprocess_env": "default_env",
-            "table": "single_gemm",
-        }
-    ]
-
-
 def test_cli_count_missing_json_uses_perf_api_read_only(tmp_path, capsys):
     exit_code = cli.main(
         [

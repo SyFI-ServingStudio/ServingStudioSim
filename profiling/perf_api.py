@@ -27,6 +27,7 @@ from profiling.db.metadata import (
     get_profiler_versions as _get_profiler_versions,
 )
 from profiling.facade import build_kind_facades
+from profiling.facade import get_current_gpu_name as _get_current_gpu_name
 
 DB_PATH = Path(__file__).resolve().parent / "profile.db"
 
@@ -45,6 +46,10 @@ def disable_jit_profiling() -> None:
 
 def submit_remote(profile_request):
     raise NotImplementedError("RemoteGpuPool submission has not landed yet")
+
+
+def get_current_gpu_name() -> str:
+    return _get_current_gpu_name()
 
 
 def get_db_metadata() -> DbMetadata:

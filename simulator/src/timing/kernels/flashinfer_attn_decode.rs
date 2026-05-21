@@ -28,6 +28,7 @@ use crate::timing::{KernelConfig, SweepCoords};
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug)]
 pub struct FlashinferAttnDecodeKernelConfig {
     pub backends: Vec<&'static str>,
+    pub gpu_name: String,
     pub num_qo_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
@@ -97,6 +98,7 @@ mod tests {
     fn config() -> FlashinferAttnDecodeKernelConfig {
         FlashinferAttnDecodeKernelConfig {
             backends: vec!["fa2", "fa3", "trt", "cudnn"],
+            gpu_name: "H100".to_string(),
             num_qo_heads: 32,
             num_kv_heads: 8,
             head_dim: 128,
@@ -122,7 +124,7 @@ mod tests {
     fn describe_config_renders_tidy_field_list() {
         assert_eq!(
             config().describe_config(),
-            r#"backends=["fa2", "fa3", "trt", "cudnn"] num_qo_heads=32 num_kv_heads=8 head_dim=128 q_dtype=Bf16 kv_dtype=Bf16 o_dtype=Bf16"#
+            r#"backends=["fa2", "fa3", "trt", "cudnn"] gpu_name="H100" num_qo_heads=32 num_kv_heads=8 head_dim=128 q_dtype=Bf16 kv_dtype=Bf16 o_dtype=Bf16"#
         );
     }
 

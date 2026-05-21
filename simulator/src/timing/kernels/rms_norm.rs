@@ -18,6 +18,7 @@ use crate::timing::{KernelConfig, SweepCoords};
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug)]
 pub struct RmsNormKernelConfig {
     pub backends: Vec<&'static str>,
+    pub gpu_name: String,
     pub hidden: u32,
     pub dtype: DType,
 }
@@ -72,6 +73,7 @@ mod tests {
     fn config_identity_includes_backend_and_shape() {
         let cfg = RmsNormKernelConfig {
             backends: vec!["flashinfer"],
+            gpu_name: "H100".to_string(),
             hidden: 4096,
             dtype: DType::Fp16,
         };
@@ -84,21 +86,26 @@ mod tests {
     fn describe_config_renders_tidy_field_list() {
         let cfg = RmsNormKernelConfig {
             backends: vec!["flashinfer"],
+            gpu_name: "H100".to_string(),
             hidden: 8192,
             dtype: DType::Bf16,
         };
         // Every field in declaration order, no struct-name/braces wrapper.
-        assert_eq!(cfg.describe_config(), r#"backends=["flashinfer"] hidden=8192 dtype=Bf16"#);
+        assert_eq!(
+            cfg.describe_config(),
+            r#"backends=["flashinfer"] gpu_name="H100" hidden=8192 dtype=Bf16"#
+        );
 
         // A Vec field renders via `{:?}` — standard bracketed, comma-separated.
         let multi = RmsNormKernelConfig {
             backends: vec!["flashinfer", "triton"],
+            gpu_name: "H100".to_string(),
             hidden: 8192,
             dtype: DType::Bf16,
         };
         assert_eq!(
             multi.describe_config(),
-            r#"backends=["flashinfer", "triton"] hidden=8192 dtype=Bf16"#
+            r#"backends=["flashinfer", "triton"] gpu_name="H100" hidden=8192 dtype=Bf16"#
         );
     }
 
@@ -112,6 +119,7 @@ mod tests {
     fn enumerate_emits_payload_with_all_wire_fields() {
         let cfg = RmsNormKernelConfig {
             backends: vec!["flashinfer"],
+            gpu_name: "H100".to_string(),
             hidden: 4096,
             dtype: DType::Bf16,
         };

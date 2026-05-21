@@ -26,6 +26,11 @@ pub trait KernelConfig: std::hash::Hash + Eq + Clone + std::fmt::Debug + 'static
     /// Auto-derived as `"{StructName}.backends"`.
     const BACKENDS_FIELD: &'static str;
 
+    /// The GPU whose profiled rows this config caches. Part of the config
+    /// identity (`Hash + Eq`), so distinct GPUs are distinct kernels / caches;
+    /// passed to the bridge at `init` / `dry_run` as the DB `gpu_name` key.
+    fn gpu_name(&self) -> &str;
+
     /// One-line config summary for the `Describe` leaf line — the `<cfg>` after
     /// `<name> (<KIND>)`. The default is the full `{self:?}`; `#[derive(KernelConfig)]`
     /// overrides it with a tidy `field=value` list over every field (including
@@ -97,7 +102,7 @@ impl<S: KernelSpec> Kernel<S> {
         for &backend in backends {
             let specs = S::enumerate(&config, &sweep_grid, backend);
             let samples = bridge
-                .get_times(specs, S::KIND)
+                .get_times(specs, S::KIND, config.gpu_name())
                 .map_err(|err| BuildError::from_perf_api(S::KIND, backend, err))?;
             let (cache, warnings) = BackendCache::fit(
                 S::KIND,
@@ -155,7 +160,7 @@ impl<S: KernelSpec> Kernel<S> {
             let specs = S::enumerate(config, &sweep_grid, backend);
             let total = specs.len();
             let missing = bridge
-                .count_missing(specs, S::KIND, backend)
+                .count_missing(specs, S::KIND, backend, config.gpu_name())
                 .map_err(|err| BuildError::from_perf_api(S::KIND, backend, err))?;
             parts.push(JitPlan::from_missing_count(
                 S::KIND,

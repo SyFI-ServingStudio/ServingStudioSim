@@ -25,36 +25,32 @@ impl<T> PyErrExt<T> for Result<T, pyo3::PyErr> {
 
 /// Bridge to the Python `profiling.perf_api` facade.
 ///
-/// Construct via `new()` or `with_gpu_name()`; both call `disable_jit_profiling`
-/// as part of construction so a `PerfApiBridge` handle is always in the
-/// "sim-runtime-safe" state by default. Build-cache-only paths that need JIT
-/// re-enable it explicitly with `enable_jit_profiling`. There is intentionally
-/// no `Default` impl — handing out an unconstructed bridge would skip the
-/// `disable_jit_profiling` invariant (L1 design.md §5.1.4 / §1.2 invariant 4).
+/// Construct via `new()`, which calls `disable_jit_profiling` so a
+/// `PerfApiBridge` handle is always in the "sim-runtime-safe" state by default.
+/// Build-cache-only paths that need JIT re-enable it explicitly with
+/// `enable_jit_profiling`. There is intentionally no `Default` impl — handing
+/// out an unconstructed bridge would skip the `disable_jit_profiling` invariant
+/// (L1 design.md §5.1.4 / §1.2 invariant 4).
+///
+/// The bridge is GPU-agnostic: the DB `gpu_name` key travels per call from the
+/// kernel's `*KernelConfig` (`KernelConfig::gpu_name`), not from bridge state,
+/// so one bridge serves kernels modeling different GPUs.
 #[derive(Clone, Debug)]
 pub struct PerfApiBridge {
-    gpu_name: Option<String>,
+    _private: (),
 }
 
 impl PerfApiBridge {
     pub fn new() -> Result<Self, PerfApiError> {
-        let bridge = Self { gpu_name: None };
-        bridge.disable_jit_profiling()?;
-        Ok(bridge)
-    }
-
-    pub fn with_gpu_name(gpu_name: impl Into<String>) -> Result<Self, PerfApiError> {
-        let bridge = Self {
-            gpu_name: Some(gpu_name.into()),
-        };
+        let bridge = Self { _private: () };
         bridge.disable_jit_profiling()?;
         Ok(bridge)
     }
 
     /// Lock the perf_api into "sim-runtime-safe" mode: any spec that's not
     /// already cached in the profile DB will raise `MissingEntry` rather than
-    /// kicking off a JIT profile. Called from `new()` / `with_gpu_name()`; the
-    /// Python side is idempotent so repeated calls are safe.
+    /// kicking off a JIT profile. Called from `new()`; the Python side is
+    /// idempotent so repeated calls are safe.
     pub fn disable_jit_profiling(&self) -> Result<(), PerfApiError> {
         self.call_perf_api_void("disable_jit_profiling")
     }
@@ -90,6 +86,7 @@ impl PerfApiBridge {
         &self,
         payloads: Vec<ArgsPayload>,
         kind: KernelKind,
+        gpu_name: &str,
     ) -> Result<Vec<KernelMetrics>, PerfApiError> {
         if payloads.is_empty() {
             return Ok(Vec::new());
@@ -100,9 +97,7 @@ impl PerfApiBridge {
             let py_specs = payloads_to_py_list(py, &payloads)?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("backend", backend).py_err()?;
-            if let Some(gpu_name) = &self.gpu_name {
-                kwargs.set_item("gpu_name", gpu_name).py_err()?;
-            }
+            kwargs.set_item("gpu_name", gpu_name).py_err()?;
             let fn_name = format!("get_{kind}_times");
             let results = perf_api
                 .getattr(fn_name.as_str())
@@ -119,6 +114,7 @@ impl PerfApiBridge {
         payloads: Vec<ArgsPayload>,
         kind: KernelKind,
         backend: &str,
+        gpu_name: &str,
     ) -> Result<usize, PerfApiError> {
         if payloads.is_empty() {
             return Ok(0);
@@ -129,14 +125,27 @@ impl PerfApiBridge {
             let py_specs = payloads_to_py_list(py, &payloads)?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("backend", backend).py_err()?;
-            if let Some(gpu_name) = &self.gpu_name {
-                kwargs.set_item("gpu_name", gpu_name).py_err()?;
-            }
+            kwargs.set_item("gpu_name", gpu_name).py_err()?;
             let fn_name = format!("count_missing_{kind}");
             perf_api
                 .getattr(fn_name.as_str())
                 .and_then(|func| func.call((py_specs,), Some(kwargs)))
                 .and_then(|value| value.extract::<usize>())
+                .py_err()
+        })
+    }
+
+    /// Resolve the current CUDA device's DB `gpu_name` key via the Python
+    /// facade. Source of truth for the `gpu_name` threaded through worklet / op
+    /// / kernel inputs (L3 INV-13); callers targeting a non-current or remote
+    /// GPU should supply the name explicitly rather than calling this.
+    pub fn get_current_gpu_name(&self) -> Result<String, PerfApiError> {
+        Python::with_gil(|py| {
+            let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
+            perf_api
+                .getattr("get_current_gpu_name")
+                .and_then(|func| func.call0())
+                .and_then(|value| value.extract::<String>())
                 .py_err()
         })
     }

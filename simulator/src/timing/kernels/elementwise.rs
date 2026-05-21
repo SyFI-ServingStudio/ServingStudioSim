@@ -26,6 +26,7 @@ use crate::timing::{KernelConfig, SweepCoords};
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug)]
 pub struct ElementwiseKernelConfig {
     pub backends: Vec<&'static str>,
+    pub gpu_name: String,
     pub input_bytes_per_token: u32,
     pub output_bytes_per_token: u32,
 }
@@ -80,6 +81,7 @@ mod tests {
         // MoE-activation-style fan-in 2 (2N -> N): 8192 in / 4096 out per token.
         ElementwiseKernelConfig {
             backends: vec!["triton"],
+            gpu_name: "H100".to_string(),
             input_bytes_per_token: 8192,
             output_bytes_per_token: 4096,
         }
@@ -97,7 +99,7 @@ mod tests {
     fn describe_config_renders_tidy_field_list() {
         assert_eq!(
             config().describe_config(),
-            r#"backends=["triton"] input_bytes_per_token=8192 output_bytes_per_token=4096"#
+            r#"backends=["triton"] gpu_name="H100" input_bytes_per_token=8192 output_bytes_per_token=4096"#
         );
     }
 

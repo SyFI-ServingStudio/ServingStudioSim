@@ -243,3 +243,10 @@ def _resolve_gpu_name(gpu_name: str | None) -> str:
     except ImportError:
         pass
     raise ValueError("gpu_name is required when CUDA is unavailable")
+
+
+def get_current_gpu_name() -> str:
+    """Resolve the current CUDA device's DB gpu_name key. Raises when CUDA is
+    unavailable — callers targeting a non-current or remote GPU must supply the
+    gpu_name explicitly instead of relying on this."""
+    return _resolve_gpu_name(None)

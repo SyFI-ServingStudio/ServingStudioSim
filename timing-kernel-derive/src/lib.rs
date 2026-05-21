@@ -8,9 +8,11 @@
 //! `Config` instead.
 //!
 //! `#[derive(KernelConfig)]` generates the `KernelConfig` trait impl that
-//! exposes the required `backends: Vec<&'static str>` field. Structs that
-//! don't have a `backends` field fail at the generated `&self.backends`
-//! access; the proc-macro itself just plugs the field name through.
+//! exposes the required `backends: Vec<&'static str>` and `gpu_name: String`
+//! fields. Structs missing either field fail at the generated `&self.backends`
+//! / `&self.gpu_name` access; the proc-macro itself just plugs the field names
+//! through. `gpu_name` is part of the config identity (it selects which GPU's
+//! profiled rows the kernel caches), so distinct GPUs are distinct caches.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -108,6 +110,10 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
                 &self.backends
             }
             const BACKENDS_FIELD: &'static str = #backends_field_label;
+
+            fn gpu_name(&self) -> &str {
+                &self.gpu_name
+            }
 
             fn describe_config(&self) -> ::std::string::String {
                 let mut parts: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();

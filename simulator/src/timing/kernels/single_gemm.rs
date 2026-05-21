@@ -15,6 +15,7 @@ use crate::timing::{KernelConfig, SweepCoords};
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug)]
 pub struct SingleGemmKernelConfig {
     pub backends: Vec<&'static str>,
+    pub gpu_name: String,
     pub n: u32,
     pub k: u32,
     pub dtype: DType,
@@ -71,6 +72,7 @@ mod tests {
     fn config_identity_includes_backend_and_shape() {
         let cfg = SingleGemmKernelConfig {
             backends: vec!["torch"],
+            gpu_name: "H100".to_string(),
             n: 128,
             k: 256,
             dtype: DType::Fp16,
@@ -85,6 +87,7 @@ mod tests {
     fn describe_config_renders_tidy_field_list() {
         let cfg = SingleGemmKernelConfig {
             backends: vec!["torch"],
+            gpu_name: "H100".to_string(),
             n: 8192,
             k: 8192,
             dtype: DType::Bf16,
@@ -92,19 +95,20 @@ mod tests {
         // Every field in declaration order, no struct-name/braces wrapper.
         assert_eq!(
             cfg.describe_config(),
-            r#"backends=["torch"] n=8192 k=8192 dtype=Bf16"#
+            r#"backends=["torch"] gpu_name="H100" n=8192 k=8192 dtype=Bf16"#
         );
 
         // A Vec field renders via `{:?}` — standard bracketed, comma-separated.
         let multi = SingleGemmKernelConfig {
             backends: vec!["torch", "triton"],
+            gpu_name: "H100".to_string(),
             n: 8192,
             k: 8192,
             dtype: DType::Bf16,
         };
         assert_eq!(
             multi.describe_config(),
-            r#"backends=["torch", "triton"] n=8192 k=8192 dtype=Bf16"#
+            r#"backends=["torch", "triton"] gpu_name="H100" n=8192 k=8192 dtype=Bf16"#
         );
     }
 
@@ -118,6 +122,7 @@ mod tests {
     fn enumerate_emits_payload_with_all_wire_fields() {
         let cfg = SingleGemmKernelConfig {
             backends: vec!["torch"],
+            gpu_name: "H100".to_string(),
             n: 4096,
             k: 8192,
             dtype: DType::Bf16,

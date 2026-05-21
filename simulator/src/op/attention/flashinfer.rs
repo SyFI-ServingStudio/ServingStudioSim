@@ -34,6 +34,7 @@ use crate::timing::{BuildError, Describe, JitPlan, LookupResult, PerfApiBridge};
 #[derive(Clone, Debug)]
 pub struct FlashInferAttentionConfig {
     pub backends: Vec<&'static str>,
+    pub gpu_name: String,
     pub num_qo_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
@@ -136,6 +137,7 @@ impl Describe for FlashInferAttentionOp {
 fn prefill_config(cfg: &FlashInferAttentionConfig) -> FlashinferAttnPrefillKernelConfig {
     FlashinferAttnPrefillKernelConfig {
         backends: cfg.backends.clone(),
+        gpu_name: cfg.gpu_name.clone(),
         num_qo_heads: cfg.num_qo_heads,
         num_kv_heads: cfg.num_kv_heads,
         head_dim: cfg.head_dim,
@@ -148,6 +150,7 @@ fn prefill_config(cfg: &FlashInferAttentionConfig) -> FlashinferAttnPrefillKerne
 fn decode_config(cfg: &FlashInferAttentionConfig) -> FlashinferAttnDecodeKernelConfig {
     FlashinferAttnDecodeKernelConfig {
         backends: cfg.backends.clone(),
+        gpu_name: cfg.gpu_name.clone(),
         num_qo_heads: cfg.num_qo_heads,
         num_kv_heads: cfg.num_kv_heads,
         head_dim: cfg.head_dim,
