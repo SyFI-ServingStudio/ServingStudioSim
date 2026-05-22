@@ -1,15 +1,23 @@
-//! Cross-layer logging — Arrow schemas (Phase 0) + parquet writers + the
-//! `SimLogger` row buffer / flush / Drop lifecycle (Phase 3).
+//! Cross-layer logging — Arrow schemas (`schemas`), the streaming parquet writer
+//! (`parquet_writer`), per-table row types + Arrow conversions (`rows`), and the
+//! `LoggerSession` row-buffer / flush / Drop lifecycle (`session`).
 //!
-//! Phase 0 ships only the schemas (`schemas` submodule). The runtime pieces
-//! (`StreamingParquetWriter`, `SimLogger` with `STREAM_FLUSH_ROWS` row
-//! buffers + `maybe_flush_X` per stream + Drop-time final flush) follow the
-//! shape of `ref/moesim-rs/src/logging/{parquet_writer.rs,mod.rs}` and land
-//! in Phase 3 alongside the first L5 worker that writes to them.
+//! Shape follows `ref/moesim-rs/src/logging/{parquet_writer.rs,mod.rs}`: each
+//! stream buffers rows and flushes a `RecordBatch` once it reaches
+//! `STREAM_FLUSH_ROWS`; `flush_all` (also on `Drop`) force-flushes and closes.
+//! This batch wires only the two per-request tables (`request_state` /
+//! `request_slo`); the worker-internal streams (`cost_log` / `kv_snapshot` /
+//! `network_event`) land with L5 logging.
 
+pub mod parquet_writer;
+pub mod rows;
 pub mod schemas;
+pub mod session;
 
+pub use parquet_writer::StreamingParquetWriter;
+pub use rows::{RequestSloEntry, RequestStateEntry};
 pub use schemas::{
     cost_log_envelope_schema, kv_snapshot_schema, network_event_schema, request_slo_schema,
     request_state_schema, ALL_STREAMS,
 };
+pub use session::LoggerSession;
