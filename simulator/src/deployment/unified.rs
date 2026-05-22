@@ -5,10 +5,23 @@
 //! Shape per L7 design.md §1.8.3: `UnifiedParams` flattens the four pool
 //! fragments + unified-own fields; `PARAM_GROUPS` lists the matching `ParamDef`
 //! slices in the same order. The `clap` struct and the slices are kept in sync
-//! by `unified_clap_matches_paramdef` (design §1.8.4). `build()` is deferred
-//! until the L6 `Flow` / L7-β tick driver exist (see `deployment/mod.rs`).
+//! by `unified_clap_matches_paramdef` (design §1.8.4). `build()` runs the
+//! Llama3-dense L4 cascade and assembles a `simple_dp` `Flow`.
 
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::Context;
+
+use crate::arch::llama3_dense;
+use crate::arch::model_cfg::{ModelCfg, ParallelCfg};
+use crate::common::{PoolId, SharedRequests};
+use crate::orchestrator::{
+    DpPlacementPolicy, Flow, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
+};
 use crate::schema::common_pool::{IoCommon, ModelCommon, ParallelismCommon, WorkloadCommon};
+use crate::timing::PerfApiBridge;
+use crate::worker::WorkerConfig;
 
 use super::Deployment;
 
@@ -75,6 +88,51 @@ impl Deployment for UnifiedDeployment {
     type Args = UnifiedParams;
     // PARAM_GROUPS defaults to <UnifiedParams as ParamSchema>::PARAM_GROUPS,
     // composed by #[derive(DeploymentParams)] from the flattened fragments + own.
+
+    fn build(
+        args: &UnifiedParams,
+        bridge: &PerfApiBridge,
+        store: SharedRequests,
+    ) -> anyhow::Result<Box<dyn Flow>> {
+        // L4 numeric config from the HuggingFace config.json, with an optional
+        // `--sim-num-layers` truncation (cheaper sims at fixed per-layer cost).
+        let mut model_cfg = ModelCfg::from_json(Path::new(&args.model.model_config))?;
+        if let Some(n) = args.model.sim_num_layers.or(args.model.num_layers) {
+            model_cfg.num_layers = n;
+        }
+
+        // Dense local single GPU: tp/ep/hp = 1. The GPU name is whatever the
+        // perf_api is bound to (it keys every kernel lookup). NOTE: tp_size /
+        // ep_size args are not yet applied to this dense-local path.
+        let gpu_name = bridge
+            .get_current_gpu_name()
+            .context("querying current GPU name from perf_api")?;
+        let parallel = ParallelCfg::local(gpu_name);
+
+        // Run the L4 four-stage cascade (the heavy, profile.db-querying step).
+        let cfgs = llama3_dense::build_configs(&model_cfg, &parallel);
+        let resolved = llama3_dense::resolve_configs(&cfgs);
+        let model = Arc::new(
+            llama3_dense::build("unified".to_string(), resolved, bridge)
+                .context("building Llama3-dense model (often a missing profile.db row)")?,
+        );
+
+        // GPU memory allowance is a per-worker fact (L5), carried in WorkerConfig
+        // alongside the worker's other env; the worker sizes its own KvPool.
+        let worker_config = WorkerConfig {
+            attn_kv_bytes: (args.attn_gpu_memory_gb * 1e9) as u64,
+            ..WorkerConfig::default()
+        };
+        let factory = UnifiedWorkerFactory::new(model, store, worker_config);
+        let cfg = SimpleDpConfig {
+            dp_pool: SimpleDpPoolConfig {
+                pool: PoolId(0),
+                num_workers: 1,
+                placement: DpPlacementPolicy::LeastQueued,
+            },
+        };
+        Ok(Box::new(SimpleDpFlow::new(cfg, factory)))
+    }
 }
 
 #[cfg(test)]

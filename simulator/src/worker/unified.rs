@@ -62,6 +62,10 @@ pub struct WorkerStatus {
 pub struct WorkerConfig {
     pub admission: KvAdmission,
     pub balance: LoadBalance,
+    /// This worker's KV-cache memory allowance in bytes (its GPU's attention
+    /// budget). Same per-worker tier as `gpu_name`; the worker divides it by the
+    /// model's `kv_bytes_per_token` to size its `KvPool`.
+    pub attn_kv_bytes: u64,
 }
 
 impl Default for WorkerConfig {
@@ -69,6 +73,7 @@ impl Default for WorkerConfig {
         Self {
             admission: KvAdmission::Strict,
             balance: LoadBalance::Single,
+            attn_kv_bytes: 80_000_000_000, // 80 GB
         }
     }
 }
@@ -118,8 +123,10 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         model: Arc<M>,
         requests: SharedRequests,
         config: WorkerConfig,
-        kv_capacity: u64,
     ) -> Self {
+        // The worker sizes its own KvPool: memory allowance ÷ the model's
+        // per-token KV footprint (L5 owns the division; arch owns the footprint).
+        let kv_capacity = (config.attn_kv_bytes / model.kv_bytes_per_token().max(1)).max(1);
         Self {
             id,
             model,
@@ -415,6 +422,10 @@ mod tests {
         fn cost_whole_iter(&self, _batch: &UnifiedArchInput) -> LookupResult {
             LookupResult::leaf("fake", Time::from_ms(self.ms), 0, 0, 0.0, Vec::new())
         }
+        // 1 byte/token → KvPool capacity == config.attn_kv_bytes (easy to size).
+        fn kv_bytes_per_token(&self) -> u64 {
+            1
+        }
     }
 
     fn shared_with(reqs: &[(u32, u32, u32)]) -> crate::common::SharedRequests {
@@ -449,7 +460,6 @@ mod tests {
             model,
             Rc::clone(&store),
             WorkerConfig::default(),
-            1_000_000,
         );
         w.enqueue(WorkerMsg::Request(RequestId(1)));
 
@@ -476,7 +486,6 @@ mod tests {
             model,
             Rc::clone(&store),
             WorkerConfig::default(),
-            1_000_000,
         );
         for id in [1, 2, 3] {
             w.enqueue(WorkerMsg::Request(RequestId(id)));

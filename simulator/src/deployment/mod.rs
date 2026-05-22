@@ -24,10 +24,13 @@
 
 pub mod unified;
 
+use crate::common::SharedRequests;
+use crate::orchestrator::Flow;
 use crate::schema::{ParamDef, ParamSchema};
+use crate::timing::PerfApiBridge;
 
-/// One simulation topology's CLI + schema surface. See module docs for the
-/// `PARAM_GROUPS` rationale and the deferred `build()`.
+/// One simulation topology's CLI + schema surface plus the L6b `Flow` it builds.
+/// See module docs for the `PARAM_GROUPS` rationale.
 pub trait Deployment {
     /// CLI subcommand name + `list-params` JSON key (e.g. `"unified"`).
     const NAME: &'static str;
@@ -42,6 +45,16 @@ pub trait Deployment {
     /// clap-derived struct that parses this deployment's flags. Its arg ids
     /// must equal `flatten_params(PARAM_GROUPS)` names (pinned by a unit test).
     type Args: clap::Args + ParamSchema;
+
+    /// Run the L4 model cascade (via the `bridge`) and assemble the L6b `Flow`
+    /// the L7-β tick driver runs. `store` is the shared `RequestStore` injected
+    /// into every worker; the same handle is held by the driver for logging.
+    /// This is the heavy step (issues `profile.db` queries) — design §2.1 Phase B.
+    fn build(
+        args: &Self::Args,
+        bridge: &PerfApiBridge,
+        store: SharedRequests,
+    ) -> anyhow::Result<Box<dyn Flow>>;
 }
 
 /// Flatten a deployment's `PARAM_GROUPS` into one ordered list. Used by the

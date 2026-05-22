@@ -168,6 +168,9 @@ mod tests {
         fn cost_whole_iter(&self, _b: &UnifiedArchInput) -> LookupResult {
             LookupResult::leaf("fake", Time::from_ms(self.ms), 0, 0, 0.0, Vec::new())
         }
+        fn kv_bytes_per_token(&self) -> u64 {
+            1
+        }
     }
 
     fn build_flow(num_workers: u16, placement: DpPlacementPolicy) -> (SimpleDpFlow<FakeModel>, SharedRequests) {
@@ -176,7 +179,6 @@ mod tests {
             Arc::new(FakeModel { ms: 1.0 }),
             Rc::clone(&store),
             WorkerConfig::default(),
-            1_000_000,
         );
         let cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {

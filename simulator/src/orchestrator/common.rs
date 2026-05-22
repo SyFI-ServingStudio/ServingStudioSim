@@ -26,27 +26,21 @@ pub enum PoolEvent {
 }
 
 /// Builds identical unified workers for a DP pool, each sharing the one
-/// `SharedRequests` handle and an `Arc` of the model. (L7 will generalize this
-/// into a trait; for now a concrete generic struct is enough.)
+/// `SharedRequests` handle and an `Arc` of the model. The worker sizes its own
+/// `KvPool` from `worker_config.attn_kv_bytes`. (L7 will generalize this into a
+/// trait; for now a concrete generic struct is enough.)
 pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel> {
     pub model: Arc<M>,
     pub requests: SharedRequests,
     pub worker_config: WorkerConfig,
-    pub kv_capacity: u64,
 }
 
 impl<M: IterwiseUnifiedModel> UnifiedWorkerFactory<M> {
-    pub fn new(
-        model: Arc<M>,
-        requests: SharedRequests,
-        worker_config: WorkerConfig,
-        kv_capacity: u64,
-    ) -> Self {
+    pub fn new(model: Arc<M>, requests: SharedRequests, worker_config: WorkerConfig) -> Self {
         Self {
             model,
             requests,
             worker_config,
-            kv_capacity,
         }
     }
 
@@ -56,7 +50,6 @@ impl<M: IterwiseUnifiedModel> UnifiedWorkerFactory<M> {
             Arc::clone(&self.model),
             std::rc::Rc::clone(&self.requests),
             self.worker_config,
-            self.kv_capacity,
         )
     }
 }

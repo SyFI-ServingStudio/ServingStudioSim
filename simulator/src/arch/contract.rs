@@ -39,4 +39,9 @@ pub struct UnifiedArchInput {
 /// the signature (no `dyn`); L5 binds via `<M: IterwiseUnifiedModel>` generic.
 pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     fn cost_whole_iter(&self, batch: &UnifiedArchInput) -> LookupResult;
+
+    /// KV-cache bytes one token occupies across the whole model. The worker
+    /// divides its memory allowance by this to size its `KvPool` (L5 owns the
+    /// division; arch owns this footprint).
+    fn kv_bytes_per_token(&self) -> u64;
 }
