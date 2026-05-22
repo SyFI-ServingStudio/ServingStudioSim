@@ -16,8 +16,30 @@
 //!
 //! - `default` is a **bare** JSON scalar (int / float / bool / string),
 //!   *never* an enum envelope.
-//! - `required` is emitted as `true` exactly when the param has no default;
-//!   otherwise it is omitted (the presence of `default` implies not-required).
+//! - `choices` is an optional string array emitted for params whose legal values
+//!   are a closed set. The launcher validates presets against it generically;
+//!   do not mirror these choices in Python.
+//! - `required` is emitted as `true` when the param has no default and is not
+//!   `.optional()`; as `false` when it has no default but IS optional (an
+//!   omittable `Option<T>` clap flag like `max_batch_tokens`, where `None` is a
+//!   meaningful "unlimited" value); and omitted entirely when a `default` is
+//!   present (default ⇒ not required).
+//! - `.optional()` exists because a clap `Option<T>` field carries no default
+//!   yet must not force the launcher to demand a value. The two-state model
+//!   "has default / required" cannot represent an omittable-but-defaultless
+//!   flag, so design.md §1.8.3 adds the optional marker.
+//! - `.cache_key()` marks a param that changes **which kernel/comm configs
+//!   `profile.db` must contain** (model identity/dims, sharding, dtype, fabric).
+//!   The launcher groups sweep runs by the tuple of cache-key params and runs
+//!   one `build-cache-only` per unique group (design §1.2.2). This criterion is
+//!   genuinely L1/Rust knowledge — only Rust knows which params flow into
+//!   `*KernelInput` / profile.db lookup keys — so it is Rust-authoritative here
+//!   rather than a hardcoded list in Python (emitted as `"affects_cache": true`
+//!   and read by `launcher.cache_build`). **Safe direction: when unsure, tag
+//!   it.** Over-tagging only costs extra prebuild passes; under-tagging makes
+//!   the launcher treat two runs needing different kernels as one group, so the
+//!   second JIT-profiles on the GPU concurrently — the exact SQLite/contention
+//!   bug §1.2.2 prevents.
 //! - Round-trip is one-way (Rust → JSON → Python launcher); the Rust binary
 //!   never reads the JSON back, so no `Deserialize` impls live here.
 
@@ -82,13 +104,23 @@ pub enum ParamSection {
 /// Single CLI parameter declaration, immutable and `const`-constructible.
 ///
 /// Builder methods return `Self` so deployment files can write
-/// `ParamDef::int("foo").default_int(1).desc("...")` inside a `const`. There
-/// is no `.optional()` builder: a param is **required** iff it has no default.
+/// `ParamDef::int("foo").default_int(1).desc("...")` inside a `const`. A param
+/// is **required** iff it has neither a default nor `.optional()`; an
+/// `.optional()` param with no default serializes `"required": false`.
 #[derive(Clone, Copy, Debug)]
 pub struct ParamDef {
     pub name: &'static str,
     pub ty: ParamType,
     pub default: Option<DefaultValue>,
+    /// Marks an omittable clap `Option<T>` flag that carries no default.
+    /// Mutually meaningful only when `default` is `None`.
+    pub optional: bool,
+    /// Marks a param that determines which kernel/comm configs `profile.db`
+    /// needs — i.e. part of the launcher's cache-grouping key (design §1.2.2).
+    /// See module docs for the safe-direction rule.
+    pub affects_cache: bool,
+    /// Closed set of allowed string values. Empty means unrestricted.
+    pub choices: &'static [&'static str],
     pub description: &'static str,
 }
 
@@ -99,7 +131,13 @@ impl Serialize for ParamDef {
         m.serialize_entry("type", &self.ty)?;
         match self.default {
             Some(ref d) => m.serialize_entry("default", d)?,
-            None => m.serialize_entry("required", &true)?,
+            None => m.serialize_entry("required", &!self.optional)?,
+        }
+        if self.affects_cache {
+            m.serialize_entry("affects_cache", &true)?;
+        }
+        if !self.choices.is_empty() {
+            m.serialize_entry("choices", &self.choices)?;
         }
         m.serialize_entry("description", &self.description)?;
         m.end()
@@ -112,6 +150,9 @@ impl ParamDef {
             name,
             ty,
             default: None,
+            optional: false,
+            affects_cache: false,
+            choices: &[],
             description: "",
         }
     }
@@ -182,9 +223,42 @@ impl ParamDef {
         self
     }
 
-    /// Whether this param is required (i.e. has no default). Mirrors the
-    /// `"required": true` field on the JSON wire form.
-    pub const fn is_required(&self) -> bool {
-        self.default.is_none()
+    /// Mark a defaultless clap `Option<T>` flag as omittable. Has no effect when
+    /// a default is set (default already implies not-required).
+    pub const fn optional(mut self) -> Self {
+        self.optional = true;
+        self
     }
+
+    /// Mark this param as part of the launcher's `profile.db` cache-grouping key
+    /// (design §1.2.2). Tag a param when changing it changes which kernel/comm
+    /// configs must be profiled. See module docs for the safe-direction rule
+    /// (when unsure, tag it).
+    pub const fn cache_key(mut self) -> Self {
+        self.affects_cache = true;
+        self
+    }
+
+    /// Attach Rust-authoritative allowed values for a string-like param. The
+    /// launcher consumes this as generic schema metadata rather than carrying
+    /// deployment-specific enum tables in Python.
+    pub const fn choices(mut self, choices: &'static [&'static str]) -> Self {
+        self.choices = choices;
+        self
+    }
+
+    /// Whether this param is required: no default AND not `.optional()`.
+    /// Mirrors the `"required": true` field on the JSON wire form.
+    pub const fn is_required(&self) -> bool {
+        self.default.is_none() && !self.optional
+    }
+}
+
+/// Compile-time schema composition for a clap `Args` struct: the ordered
+/// `ParamDef` groups — each `#[command(flatten)]` fragment's `OWN_PARAMS`
+/// followed by the struct's own params — that `#[derive(DeploymentParams)]`
+/// assembles. A `Deployment`'s `PARAM_GROUPS` defaults to its `Args`' value
+/// here, so deployments never re-list their fragments by hand.
+pub trait ParamSchema {
+    const PARAM_GROUPS: &'static [&'static [ParamDef]];
 }

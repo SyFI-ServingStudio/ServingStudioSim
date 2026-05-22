@@ -10,12 +10,17 @@ package = false
 # This repo's normal Python working env includes tests/lint plus L1 profiling
 # deps, so plain `uv run ...` matches the environment used by subprocess
 # profilers. Use `--no-default-groups` only for intentionally minimal checks.
-default-groups = ["dev", "profiling"]
+default-groups = ["dev", "profiling", "launcher"]
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.0",
     "ruff>=0.14.0",
+]
+# L7-α launcher runtime deps. `asteval` evaluates `derived` / `constraints`
+# preset expressions in a sandboxed AST (no raw `eval`); see launcher/schema.
+launcher = [
+    "asteval>=1.0.0",
 ]
 profiling = [
     "numpy>=2.0.0",

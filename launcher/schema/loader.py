@@ -1,0 +1,125 @@
+"""Load the Rust-authoritative deployment schema.
+
+Per L7 design.md §1.2.7 / INV-7, per-param data lives in the Rust binary, not
+in Python. `cargo_build()` (see `launcher.exec`) runs `simulator list-params`
+after a successful compile and writes the JSON to
+`target/<build_type>/deployment_schema.json`. This module only *reads* that
+file; it never declares param data.
+
+Shape of the `deployment_schema.json` this module reads::
+
+    {
+      "deployment_schemas": {
+        "unified": [
+          {"name": "model_config", "type": "string", "required": true,
+           "affects_cache": true, "description": "Path to the model config JSON."},
+          {"name": "tp_size", "type": "int", "default": 4,
+           "affects_cache": true, "description": "Tensor parallelism size."}
+        ]
+      },
+      "pool_fragments": {
+        "ModelCommon": ["model_config", "num_layers", "fp8"],
+        "ParallelismCommon": ["tp_size", "ep_size", "head_parallel", "cp_plan"]
+      }
+    }
+
+`deployment_schemas` maps a deployment name to an ordered list of ParamDefs
+({name, type, default?, required?, choices?, affects_cache?, description}) —
+this is the authoritative param set. `pool_fragments` (fragment name -> the
+param names it contributes) is **display-only**: `list-params --human` uses it
+to group a deployment's params under their source fragment. No validation /
+expansion logic reads it, so it is not a second source of param truth (INV-7 /
+§1.8.3).
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+# launcher/schema/loader.py -> parents: [0]=schema, [1]=launcher, [2]=repo root.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Top-level preset keys that are launcher control blocks, not deployment params.
+CONTROL_KEYS = frozenset({"sweep_groups", "derived", "constraints"})
+
+
+class SchemaNotFound(FileNotFoundError):
+    """Raised when `deployment_schema.json` is absent — i.e. the binary has not
+    been built (or the build failed) since schema discovery is part of
+    `cargo_build()`. Carries build instructions, never a Python fallback."""
+
+
+def schema_path(build_type: str = "debug") -> Path:
+    return REPO_ROOT / "target" / build_type / "deployment_schema.json"
+
+
+@dataclass(frozen=True)
+class DeploymentSchema:
+    """One deployment's complete, flattened param set (design §1.8: each entry
+    is self-contained — no separate 'common' merge on the Python side)."""
+
+    name: str
+    # name -> raw ParamDef dict ({name, type, default?, required?, choices?,
+    # affects_cache?, description}), in CLI/declaration order.
+    params: dict[str, dict[str, Any]]
+
+    @property
+    def required_names(self) -> list[str]:
+        return [name for name, pdef in self.params.items() if pdef.get("required", False)]
+
+    @property
+    def cache_key_fields(self) -> tuple[str, ...]:
+        """Param names that determine which kernel/comm configs profile.db needs
+        — Rust-authoritative via the `affects_cache` flag (design §1.2.2). The
+        launcher groups sweep runs by the tuple of these params' values."""
+        return tuple(
+            name for name, pdef in self.params.items() if pdef.get("affects_cache", False)
+        )
+
+    @property
+    def defaults(self) -> dict[str, Any]:
+        return {name: pdef["default"] for name, pdef in self.params.items() if "default" in pdef}
+
+
+@dataclass(frozen=True)
+class Schema:
+    """Loaded `deployment_schema.json`: per-deployment schemas + a display-only
+    pool-fragment map."""
+
+    # deployment name -> its complete, flattened, authoritative schema.
+    deployment_schemas: dict[str, DeploymentSchema]
+    # pool-fragment name (ModelCommon, ...) -> the param names it contributes.
+    # Display-only: `list-params --human` groups params by fragment. No
+    # validation / expansion logic reads it (INV-7 — not a param-data source).
+    pool_fragments: dict[str, list[str]]
+
+
+def schema_from_dict(raw: dict[str, Any]) -> Schema:
+    """Build a `Schema` from an already-parsed `list-params` document. Exposed
+    so tests can inject a schema without a built binary on disk."""
+    deployment_schemas: dict[str, DeploymentSchema] = {}
+    for name, param_list in raw.get("deployment_schemas", {}).items():
+        ordered = {pdef["name"]: pdef for pdef in param_list}
+        deployment_schemas[name] = DeploymentSchema(name=name, params=ordered)
+    return Schema(
+        deployment_schemas=deployment_schemas,
+        pool_fragments=raw.get("pool_fragments", {}),
+    )
+
+
+def load_schema(build_type: str = "debug") -> Schema:
+    """Read `target/<build_type>/deployment_schema.json`. Raises `SchemaNotFound`
+    with build instructions if absent — there is no hand-maintained fallback."""
+    path = schema_path(build_type)
+    if not path.is_file():
+        raise SchemaNotFound(
+            f"deployment schema unavailable at {path}.\n"
+            "The schema is generated by `cargo build` + `simulator list-params` "
+            "(see launcher.exec.cargo_build). Build the simulator first, e.g.:\n"
+            f"  uv run cargo build && ./target/{build_type}/simulator list-params "
+            f"> {path}"
+        )
+    return schema_from_dict(json.loads(path.read_text()))
