@@ -45,6 +45,7 @@ macro_rules! define_id {
 
 define_id!(RequestId, u32);
 define_id!(WorkerId, u16);
+define_id!(PoolId, u16);
 define_id!(BatchId, u64);
 define_id!(GroupId, u8);
 define_id!(ExpertId, u16);
