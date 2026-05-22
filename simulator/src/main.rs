@@ -14,10 +14,19 @@
 //! driver that actually execute a sim are not implemented yet. `list-params`
 //! is fully functional today and is what the launcher depends on.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
-use simulator::deployment::unified::UnifiedParams;
+use simulator::common::{RequestStore, SharedRequests};
+use simulator::deployment::unified::{UnifiedDeployment, UnifiedParams};
+use simulator::deployment::Deployment;
+use simulator::log::LoggerSession;
 use simulator::schema::list_params;
+use simulator::sim::{run_sim, TickCfg, TraceFrontend};
+use simulator::timing::PerfApiBridge;
 
 #[derive(Parser)]
 #[command(
@@ -54,39 +63,70 @@ enum DeploymentSel {
     Unified(UnifiedParams),
 }
 
-impl DeploymentSel {
-    fn name(&self) -> &'static str {
-        match self {
-            DeploymentSel::Unified(_) => "unified",
-        }
-    }
-}
+fn main() -> anyhow::Result<()> {
+    // Timed/leveled logging (heartbeats, cache-build progress, run summary).
+    // `RUST_LOG` overrides the default `info` level; e.g. `RUST_LOG=debug`.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
 
-/// Exit code for "parsed fine, but the executing layer isn't built yet".
-const EXIT_PENDING_BETA: i32 = 2;
-
-fn main() {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Run(args) => pending_beta("run", args.deployment.name()),
-        Cmd::BuildCacheOnly(args) => pending_beta("build-cache-only", args.deployment.name()),
+        Cmd::Run(args) => cmd_run(args.deployment),
+        Cmd::BuildCacheOnly(args) => cmd_build_cache(args.deployment),
         Cmd::ListParams => {
             // serde_json::Value serializes infallibly; pretty for `list-params`.
             println!(
                 "{}",
                 serde_json::to_string_pretty(&list_params()).expect("list_params JSON")
             );
+            Ok(())
         }
     }
 }
 
-/// CLI parsed and routed to a real deployment, but the L7-β tick driver / L6
-/// Flow that would execute it do not exist yet. Report and exit non-zero so the
-/// launcher records a clear failure rather than a silent no-op.
-fn pending_beta(cmd: &str, deployment: &str) -> ! {
-    eprintln!(
-        "simulator {cmd} {deployment}: parsed OK, but the L7-β tick driver is not implemented yet \
-         (Flow / tick loop pending). Only `list-params` is functional today."
-    );
-    std::process::exit(EXIT_PENDING_BETA);
+/// `run` — strict bridge (JIT off → fail-fast on missing `profile.db` rows),
+/// build the deployment Flow, load the trace, drive the tick loop, log parquet.
+fn cmd_run(sel: DeploymentSel) -> anyhow::Result<()> {
+    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+    let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+    match sel {
+        DeploymentSel::Unified(p) => {
+            let mut flow = UnifiedDeployment::build(&p, &bridge, Rc::clone(&store))?;
+            let mut frontend = TraceFrontend::load(&p.workload.trace_files, p.workload.request_rate)?;
+            let mut logger = LoggerSession::open(&p.io.log_dir)?;
+            let cfg = TickCfg::new(p.workload.duration_ms, p.workload.run_to_end);
+            let cause = run_sim(flow.as_mut(), &store, &mut frontend, &mut logger, &cfg)?;
+            // run_sim emits the stats summary (completed/throughput/wall); here we
+            // just point at where the parquet logs landed.
+            tracing::info!(
+                deployment = "unified",
+                cause = ?cause,
+                log_dir = %p.io.log_dir.display(),
+                "run complete"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `build-cache-only` — enable JIT profiling, run the L4 cascade so missing
+/// kernels are profiled into `profile.db`, then exit before the tick loop.
+fn cmd_build_cache(sel: DeploymentSel) -> anyhow::Result<()> {
+    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+    bridge
+        .enable_jit_profiling()
+        .context("enabling JIT profiling for cache build")?;
+    let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+    match sel {
+        DeploymentSel::Unified(p) => {
+            let _flow = UnifiedDeployment::build(&p, &bridge, store)?;
+        }
+    }
+    tracing::info!("cache build complete: profile.db populated via JIT");
+    Ok(())
 }

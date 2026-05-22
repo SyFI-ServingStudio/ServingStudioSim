@@ -11,13 +11,13 @@
 //! Why total_tokens (not avg_len): feasibility is bounded by the PRODUCT
 //! batch_size * avg_len (= total kv tokens / memory / profiling cost), so making
 //! the product an axis lets a plain rectangular `total_tokens` cap keep every
-//! grid corner affordable (e.g. 1x128k and 256x512 both = 128k total), instead
-//! of a rectangular `(batch, avg_len)` grid whose `256 x 128k` corner is
+//! grid corner affordable (e.g. 1x4M and 256x16384 both = 4M total), instead
+//! of a rectangular `(batch, avg_len)` grid whose `256 x 4M` corner is
 //! unaffordable. Everything generic lives in `engine::Kernel<S>`; the Python
 //! `FlashinferAttnDecodeArgs` dataclass owns the matching schema.
 //!
-//! Axes: batch_size is pow2 (1..=256); total_tokens is pow2 (32..=131072, i.e.
-//! up to 128k). Two monotonic axes -> `Cache2DLinear` + `grid.expand_2d`.
+//! Axes: batch_size is pow2 (1..=256); total_tokens is pow2 (32..=4194304, i.e.
+//! up to 4M). Two monotonic axes -> `Cache2DLinear` + `grid.expand_2d`.
 
 use crate::timing::bridge::{ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -52,8 +52,8 @@ impl KernelSpec for FlashinferAttnDecodeSpec {
     const KIND: KernelKind = "flashinfer_attn_decode";
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        // batch_size: 1..=256 (pow2); total_tokens: 32..=131072 (pow2, up to
-        // 128k). A flat total_tokens cap keeps every corner feasible. Row-major.
+        // batch_size: 1..=256 (pow2); total_tokens: 32..=4194304 (pow2, up to
+        // 4M). A flat total_tokens cap keeps every corner feasible. Row-major.
         SweepGrid::new(vec![Axis::pow2(0, 8), Axis::pow2(5, 22)])
     }
 
@@ -146,14 +146,14 @@ mod tests {
     }
 
     #[test]
-    fn sweep_grid_batch_pow2_and_total_tokens_to_128k() {
+    fn sweep_grid_batch_pow2_and_total_tokens_to_4m() {
         let grid = FlashinferAttnDecodeSpec::sweep_grid(&config());
         assert_eq!(grid.axes().len(), 2);
-        // batch_size pow2 1..=256; total_tokens pow2 32..=131072 (128k).
+        // batch_size pow2 1..=256; total_tokens pow2 32..=4194304 (4M).
         assert_eq!(grid.axes()[0][0], 1.0);
         assert_eq!(*grid.axes()[0].last().unwrap(), 256.0);
         assert_eq!(grid.axes()[1][0], 32.0);
-        assert_eq!(*grid.axes()[1].last().unwrap(), 131072.0);
+        assert_eq!(*grid.axes()[1].last().unwrap(), 4194304.0);
     }
 
     #[test]

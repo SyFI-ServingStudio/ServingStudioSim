@@ -24,10 +24,19 @@ anyhow = "1"
 thiserror = "2"
 pyo3 = { version = "0.20", features = ["auto-initialize"] }
 
-# Arrow schema definitions. parquet writers + arrow-array land in Phase 3
-# when log/parquet.rs lands; for now only the Schema definitions need to
-# compile.
+# Arrow schemas + arrays + parquet writer for the L7 streaming parquet logs
+# (request_state / request_slo). ZSTD compression matches ref/moesim-rs.
 arrow-schema = { version = "54", default-features = false }
+arrow-array = { version = "54", default-features = false }
+parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
+
+# Single-round trace CSV parsing (L7-γ TraceFrontend).
+csv = "1"
+
+# Timed/leveled logging facade (matches ref/moesim-rs): sim-time heartbeats,
+# cache-build progress, end-of-run summary. `RUST_LOG` controls verbosity.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # In-tree proc-macro crate that powers `#[derive(SweepCoords)]` on per-kernel
 # Input structs (see simulator/src/timing/kernels/engine.rs).
@@ -37,6 +46,10 @@ timing-kernel-derive = { path = "simulator/timing-kernel-derive" }
 # a deployment's `ParamDef` schema slice from its clap `Args` struct so the CLI
 # surface and `list-params` schema cannot drift (design §1.8.3/§1.8.4).
 schema-derive = { path = "simulator/schema-derive" }
+
+[dev-dependencies]
+# Temp dirs/files for L7 frontend + tick-driver + parquet writer tests.
+tempfile = "3"
 
 [workspace]
 members = ["simulator/timing-kernel-derive", "simulator/schema-derive"]

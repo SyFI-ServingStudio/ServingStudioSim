@@ -114,7 +114,7 @@ impl<S: KernelSpec> Kernel<S> {
             backend_caches.push(cache);
             outlier_warnings.extend(warnings);
             // Per-backend progress: one line per profile.db query (the slow unit).
-            eprintln!(
+            tracing::info!(
                 "[build]   kernel {name} ({}) backend={backend} done ({} samples)",
                 S::KIND,
                 samples.len()
