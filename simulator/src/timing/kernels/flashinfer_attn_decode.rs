@@ -54,7 +54,7 @@ impl KernelSpec for FlashinferAttnDecodeSpec {
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
         // batch_size: 1..=256 (pow2); total_tokens: 32..=131072 (pow2, up to
         // 128k). A flat total_tokens cap keeps every corner feasible. Row-major.
-        SweepGrid::new(vec![Axis::pow2(0, 8), Axis::pow2(5, 17)])
+        SweepGrid::new(vec![Axis::pow2(0, 8), Axis::pow2(5, 22)])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {

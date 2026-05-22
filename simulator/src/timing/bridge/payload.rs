@@ -43,6 +43,17 @@ impl DType {
             DType::Int4 => "int4",
         }
     }
+
+    /// Bytes per element. Used by L3 worklets to size byte-keyed kernels (e.g.
+    /// the elementwise activation's per-token I/O footprint). Int4 is sub-byte;
+    /// it rounds up to 1 (no current model uses Int4 on a byte-keyed path).
+    pub fn size_bytes(self) -> u32 {
+        match self {
+            DType::Fp32 => 4,
+            DType::Fp16 | DType::Bf16 => 2,
+            DType::Fp8E4m3 | DType::Fp8E5m2 | DType::Int8 | DType::Int4 => 1,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

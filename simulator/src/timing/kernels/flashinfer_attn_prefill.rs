@@ -11,7 +11,7 @@
 //! `(prefix_len, append_len)`; the Python runner derives `q_len = append_len`,
 //! `kv_len = prefix_len + append_len`. Merging the ref's pure-prefill + chunked
 //! ops, pure prefill is just `prefix_len == 0` — so the `prefix_len` axis chains
-//! `[0]` ahead of the token curve. `rect` is the non-causal sibling and shares
+//! `[0]` ahead of a log2 token curve (128..32k). `rect` is the non-causal sibling and shares
 //! this exact shape (see `flashinfer_attn_rect.rs`), differing only by `causal`
 //! on the Python side.
 //!
@@ -51,12 +51,12 @@ impl KernelSpec for FlashinferAttnPrefillSpec {
     const KIND: KernelKind = "flashinfer_attn_prefill";
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        // prefix_len (existing context) must include 0 for pure prefill, then a
-        // token curve for chunked; append_len (new tokens) is a plain token
-        // curve. Row-major over (prefix_len, append_len).
+        // prefix_len (existing context): 0 for pure prefill, chained ahead of a
+        // log2 curve 128..32k; append_len (new tokens): the same log2 curve.
+        // Row-major over (prefix_len, append_len). pow2(7, 15) = 128..32768.
         SweepGrid::new(vec![
-            Axis::chain([Axis::values([0]), Axis::token_axis()]),
-            Axis::token_axis(),
+            Axis::chain([Axis::values([0]), Axis::pow2(7, 15)]),
+            Axis::pow2(7, 15),
         ])
     }
 
@@ -152,10 +152,14 @@ mod tests {
     fn sweep_grid_prefix_axis_includes_zero_for_pure_prefill() {
         let grid = FlashinferAttnPrefillSpec::sweep_grid(&config());
         assert_eq!(grid.axes().len(), 2);
-        // prefix_len axis chains [0] ahead of the token curve.
+        // prefix_len axis chains [0] ahead of the log2 curve (128 = 2^7).
         assert_eq!(grid.axes()[0][0], 0.0);
-        // append_len axis is a plain token curve (starts at 32).
-        assert_eq!(grid.axes()[1][0], 32.0);
+        assert_eq!(grid.axes()[0][1], 128.0);
+        assert_eq!(grid.axes()[0].len(), 10); // [0] + pow2(7..=15) = 1 + 9
+        // append_len axis is the log2 curve 128..32k (2^7..2^15).
+        assert_eq!(grid.axes()[1][0], 128.0);
+        assert_eq!(*grid.axes()[1].last().unwrap(), 32768.0);
+        assert_eq!(grid.axes()[1].len(), 9);
     }
 
     #[test]
