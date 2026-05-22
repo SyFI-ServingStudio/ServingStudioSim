@@ -38,8 +38,10 @@ def _build_subprocess_env() -> dict[str, str]:
     """Clean environment for the rust subprocess that embeds Python via PyO3.
 
     The embedded interpreter must find (a) libpython (LD_LIBRARY_PATH), (b) its
-    stdlib (PYTHONHOME = base prefix), and (c) the launcher's venv site-packages
-    (PYTHONPATH) so it imports the same torch / perf_api stack.
+    stdlib (PYTHONHOME = base prefix), and (c) on PYTHONPATH both the repo root
+    (so `import profiling...` resolves the repo-local perf_api package, which is
+    not installed into site-packages) and the venv site-packages (torch / the
+    profiler stack).
     """
     env = os.environ.copy()
     env["PYTHON"] = sys.executable
@@ -58,14 +60,17 @@ def _build_subprocess_env() -> dict[str, str]:
     if sys.base_prefix:
         env["PYTHONHOME"] = sys.base_prefix
 
+    # Repo root first (repo-local `profiling` package), then venv site-packages.
+    pythonpath_parts = [str(REPO_ROOT)]
     venv = os.environ.get("VIRTUAL_ENV")
     if not venv and sys.prefix != sys.base_prefix:
         venv = sys.prefix
     if venv and os.path.isdir(os.path.join(venv, "lib")):
         env["VIRTUAL_ENV"] = venv
-        site_packages = sysconfig.get_path("purelib")
-        if site_packages:
-            env["PYTHONPATH"] = site_packages
+    site_packages = sysconfig.get_path("purelib")
+    if site_packages:
+        pythonpath_parts.append(site_packages)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
     return env
 
 

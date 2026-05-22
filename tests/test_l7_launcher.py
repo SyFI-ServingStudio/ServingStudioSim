@@ -581,13 +581,14 @@ def test_simulation_runner_captures_stdout(tmp_path):
     binary = binary_path("debug")
     if not binary.is_file():
         pytest.skip("simulator not built")
-    # `run unified` parses then exits non-zero (L7-β stub); we just verify the
-    # subprocess wrapper spawns, captures stdout, and reports the failure.
+    # `run unified` with no trace fails fast (the L7-β driver / L4 build run, but
+    # there's no profile.db here); we just verify the subprocess wrapper spawns,
+    # captures stdout to stdout.log, and reports the non-zero exit.
     argv = [str(binary), "run", "unified", "--model-config", "model/config/llama3_8b.json"]
     runner = SimulationRunner(argv=argv, log_dir=tmp_path, env=_build_subprocess_env())
     ok = asyncio.run(runner.run())
-    assert ok is False  # stub exits 2
-    assert "parsed OK" in (tmp_path / "stdout.log").read_text()
+    assert ok is False
+    assert (tmp_path / "stdout.log").read_text().strip()  # captured the error output
 
 
 # ── resume / --refresh (.complete marker, INV-5) ────────────────────────────
