@@ -1,11 +1,17 @@
-//! `LoggerSession` — owns the per-table parquet writers + their row buffers,
-//! flushing a `RecordBatch` once a buffer reaches `STREAM_FLUSH_ROWS` and
-//! force-flushing + closing on `flush_all` (also called on `Drop`). Shape
-//! follows `ref/moesim-rs/src/logging/mod.rs`.
+//! `LoggerSession` — buffers rows on the sim thread and offloads the heavy
+//! parquet encode + ZSTD compression to a dedicated background writer thread.
+//! The sim thread only fills `Vec<…Entry>` row buffers and hands full chunks
+//! over a bounded channel; the writer thread owns the parquet writers and does
+//! `…_to_record_batch` + `ArrowWriter::write` (dictionary-intern, RLE, column
+//! stats, ZSTD-L3) off the critical path. The channel is bounded so a slow
+//! writer applies backpressure instead of growing memory without limit.
+//! Shape follows `ref/moesim-rs/src/logging/mod.rs`; the threading is ours.
 
 use std::path::Path;
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::thread::JoinHandle;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use crate::log::parquet_writer::StreamingParquetWriter;
 use crate::log::rows::{
@@ -13,81 +19,136 @@ use crate::log::rows::{
 };
 use crate::log::schemas::{request_slo_schema, request_state_schema};
 
-/// Buffered rows per stream before a `RecordBatch` flush (matches ref).
+/// Buffered rows per stream before a chunk is handed to the writer thread.
 const STREAM_FLUSH_ROWS: usize = 8_192;
 
-/// Owns the per-request parquet writers + their row buffers. Created once per
-/// run (`open`), fed one row at a time, force-flushed + closed by `flush_all`
-/// (also on `Drop`).
+/// In-flight chunks the channel holds before the sim thread blocks on `send`
+/// (backpressure). Sized so a dense `request_state` snapshot — which emits the
+/// whole live set in a single tick (tens of chunks at once) — queues without
+/// stalling the sim, then drains while the sim runs the next interval. At
+/// `STREAM_FLUSH_ROWS` rows/chunk this bounds buffered memory to ~tens of MB.
+const CHANNEL_CAP: usize = 64;
+
+/// A full row chunk handed to the writer thread (ownership transferred).
+enum LogMsg {
+    State(Vec<RequestStateEntry>),
+    Slo(Vec<RequestSloEntry>),
+}
+
+/// Sim-thread handle: owns the row buffers + the channel to the writer thread.
+/// Fed one row at a time; `flush_all` (also `Drop`) sends the tails, closes the
+/// channel, and joins the writer (propagating its first error).
 pub struct LoggerSession {
-    state_writer: StreamingParquetWriter,
-    slo_writer: StreamingParquetWriter,
+    tx: Option<SyncSender<LogMsg>>,
+    handle: Option<JoinHandle<Result<()>>>,
     state_buf: Vec<RequestStateEntry>,
     slo_buf: Vec<RequestSloEntry>,
     closed: bool,
 }
 
 impl LoggerSession {
-    /// Open writers under `<log_dir>/raw/{request_state,request_slo}.parquet`.
-    /// Files are created lazily on first row (so an empty stream writes nothing).
+    /// Open writers under `<log_dir>/raw/{request_state,request_slo}.parquet`
+    /// and spawn the background writer thread. Files are created lazily on the
+    /// first row (an empty stream writes nothing).
     pub fn open(log_dir: &Path) -> Result<Self> {
         let raw = log_dir.join("raw");
+        let mut state_writer =
+            StreamingParquetWriter::new(raw.join("request_state.parquet"), request_state_schema());
+        let mut slo_writer =
+            StreamingParquetWriter::new(raw.join("request_slo.parquet"), request_slo_schema());
+
+        let (tx, rx) = sync_channel::<LogMsg>(CHANNEL_CAP);
+        let handle = std::thread::Builder::new()
+            .name("mlsim-logger".to_string())
+            .spawn(move || -> Result<()> {
+                // Encode + compress + write each chunk off the sim thread. The
+                // loop ends when every `tx` is dropped (channel disconnected).
+                for msg in rx {
+                    match msg {
+                        LogMsg::State(buf) => state_writer.write(&state_to_record_batch(&buf)?)?,
+                        LogMsg::Slo(buf) => slo_writer.write(&slo_to_record_batch(&buf)?)?,
+                    };
+                }
+                state_writer.close()?;
+                slo_writer.close()?;
+                Ok(())
+            })?;
+
         Ok(Self {
-            state_writer: StreamingParquetWriter::new(
-                raw.join("request_state.parquet"),
-                request_state_schema(),
-            ),
-            slo_writer: StreamingParquetWriter::new(
-                raw.join("request_slo.parquet"),
-                request_slo_schema(),
-            ),
-            state_buf: Vec::new(),
-            slo_buf: Vec::new(),
+            tx: Some(tx),
+            handle: Some(handle),
+            state_buf: Vec::with_capacity(STREAM_FLUSH_ROWS),
+            slo_buf: Vec::with_capacity(STREAM_FLUSH_ROWS),
             closed: false,
         })
     }
 
     pub fn record_request_state(&mut self, entry: RequestStateEntry) -> Result<()> {
         self.state_buf.push(entry);
-        self.maybe_flush_state(false)
+        if self.state_buf.len() >= STREAM_FLUSH_ROWS {
+            self.send_state()?;
+        }
+        Ok(())
     }
 
     pub fn record_request_slo(&mut self, entry: RequestSloEntry) -> Result<()> {
         self.slo_buf.push(entry);
-        self.maybe_flush_slo(false)
-    }
-
-    fn maybe_flush_state(&mut self, force: bool) -> Result<()> {
-        if self.state_buf.is_empty() || (!force && self.state_buf.len() < STREAM_FLUSH_ROWS) {
-            return Ok(());
+        if self.slo_buf.len() >= STREAM_FLUSH_ROWS {
+            self.send_slo()?;
         }
-        let batch = state_to_record_batch(&self.state_buf)?;
-        self.state_writer.write(&batch)?;
-        self.state_buf.clear();
         Ok(())
     }
 
-    fn maybe_flush_slo(&mut self, force: bool) -> Result<()> {
-        if self.slo_buf.is_empty() || (!force && self.slo_buf.len() < STREAM_FLUSH_ROWS) {
+    fn send_state(&mut self) -> Result<()> {
+        if self.state_buf.is_empty() {
             return Ok(());
         }
-        let batch = slo_to_record_batch(&self.slo_buf)?;
-        self.slo_writer.write(&batch)?;
-        self.slo_buf.clear();
-        Ok(())
+        let buf = std::mem::replace(&mut self.state_buf, Vec::with_capacity(STREAM_FLUSH_ROWS));
+        self.send(LogMsg::State(buf))
     }
 
-    /// Force-flush both buffers and close the writers. Idempotent.
+    fn send_slo(&mut self) -> Result<()> {
+        if self.slo_buf.is_empty() {
+            return Ok(());
+        }
+        let buf = std::mem::replace(&mut self.slo_buf, Vec::with_capacity(STREAM_FLUSH_ROWS));
+        self.send(LogMsg::Slo(buf))
+    }
+
+    /// Hand a chunk to the writer thread. A send error means the writer died;
+    /// surface its real error by joining rather than the generic disconnect.
+    fn send(&mut self, msg: LogMsg) -> Result<()> {
+        match self.tx.as_ref().expect("tx present until flush_all").send(msg) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self
+                .join_writer()
+                .err()
+                .unwrap_or_else(|| anyhow!("logger writer thread disconnected"))),
+        }
+    }
+
+    /// Drop the sender (ends the writer's `recv` loop) and join, returning the
+    /// writer thread's result. Safe to call once; later calls are no-ops.
+    fn join_writer(&mut self) -> Result<()> {
+        drop(self.tx.take());
+        match self.handle.take() {
+            Some(h) => h
+                .join()
+                .map_err(|_| anyhow!("logger writer thread panicked"))?,
+            None => Ok(()),
+        }
+    }
+
+    /// Flush both buffer tails, close the channel, and join the writer thread,
+    /// propagating its first error. Idempotent.
     pub fn flush_all(&mut self) -> Result<()> {
         if self.closed {
             return Ok(());
         }
-        self.maybe_flush_state(true)?;
-        self.maybe_flush_slo(true)?;
-        self.state_writer.close()?;
-        self.slo_writer.close()?;
         self.closed = true;
-        Ok(())
+        self.send_state()?;
+        self.send_slo()?;
+        self.join_writer()
     }
 }
 
