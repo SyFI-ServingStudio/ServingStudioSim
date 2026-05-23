@@ -1,6 +1,6 @@
 //! `arch` (L4) — per-worker-type model_arch wire files + the L4↔L5 data
 //! contract. Each model_arch picks an L3 worklet set, forwards `ModelCfg` +
-//! `ParallelCfg` 1:1 into worklet configs, and assembles a build/dry-run/cost
+//! `ParallelCfg` 1:1 into worklet configs, and assembles a build/cost
 //! model. See docs/detailed_design/L4/design.md.
 
 pub mod contract;

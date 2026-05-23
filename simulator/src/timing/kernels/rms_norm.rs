@@ -1,6 +1,6 @@
 //! RMSNorm kernel: one cached perf model per `(hidden, dtype)` config.
 //!
-//! Everything generic (init / lookup / dry_run / Probe + DryRun trait impls /
+//! Everything generic (init / lookup_metrics / the `Probe` impl /
 //! for-backend loops) lives in `engine::Kernel<S>`. This file declares the
 //! RMSNorm-specific Config / Input, the `KIND` wire string, and the
 //! `enumerate` body that lifts (config, sweep coord, backend) to the on-wire

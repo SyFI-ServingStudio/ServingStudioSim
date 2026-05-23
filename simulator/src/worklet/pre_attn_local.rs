@@ -14,7 +14,7 @@ use crate::timing::kernels::{
     RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, JitPlan, LeafMetrics, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
 
 /// Raw global config (no partition: `Local` = 1 GPU). Backend strings pass
 /// straight through to L1 (config-level polymorphism, L3 §1.6).
@@ -30,8 +30,8 @@ pub struct PreAttnLocalWorkletConfig {
     pub gemm_backends: Vec<&'static str>,
 }
 
-/// Post-resolve: sub-kernel cfgs fully baked. Shared by `init_ops` /
-/// `dry_run_init_ops` / `describe`. `raw_cfg` kept for the partition pre-image.
+/// Post-resolve: sub-kernel cfgs fully baked. Consumed by `init_ops`.
+/// `raw_cfg` kept for the partition pre-image.
 #[derive(Clone, Debug)]
 pub struct PreAttnLocalWorkletResolved {
     pub raw_cfg: PreAttnLocalWorkletConfig,
@@ -101,26 +101,6 @@ impl PreAttnLocalWorklet {
         })
     }
 
-    pub fn dry_run_init_ops(
-        name: &str,
-        resolved: &PreAttnLocalWorkletResolved,
-        bridge: &PerfApiBridge,
-    ) -> Result<JitPlan, BuildError> {
-        let parts = vec![
-            Op::<RmsNormKernel>::dry_run_init(
-                format!("{name}.input_norm"),
-                &resolved.input_norm,
-                bridge,
-            )?,
-            Op::<SingleGemmKernel>::dry_run_init(
-                format!("{name}.qkv_proj"),
-                &resolved.qkv,
-                bridge,
-            )?,
-        ];
-        Ok(JitPlan::sum(name.to_string(), parts))
-    }
-
     /// CostTree compile: sum over the two atomic ops, wrapped in a `Labeled` node
     /// carrying the worklet identity + partition/shape annotation (the old
     /// `Describe` header lines).
@@ -140,15 +120,15 @@ impl PreAttnLocalWorklet {
 
     /// CostTree eval: fill the input_norm then qkv slots — same child order as
     /// `compile`/`lookup`, so `cursor` tracks the minted slot indices.
-    pub fn eval(&self, input: &PreAttnLocalWorkletInput, buf: &mut [LeafMetrics], cursor: &mut usize) {
+    pub fn eval(&self, input: &PreAttnLocalWorkletInput, ev: &mut Evaluator) {
         let norm_in = RmsNormKernelInput {
             m: input.batch_tokens,
         };
         let gemm_in = SingleGemmKernelInput {
             m: input.batch_tokens,
         };
-        self.input_norm.eval(&norm_in, buf, cursor);
-        self.qkv.eval(&gemm_in, buf, cursor);
+        self.input_norm.eval(&norm_in, ev);
+        self.qkv.eval(&gemm_in, ev);
     }
 }
 

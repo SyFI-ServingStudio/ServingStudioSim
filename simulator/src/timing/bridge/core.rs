@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use serde_json::Value;
@@ -5,6 +7,18 @@ use serde_json::Value;
 use crate::timing::bridge::{
     ArgsPayload, DbMetadata, KernelKind, KernelMetrics, PerfApiError, ProfilerVersion,
 };
+
+/// One kernel's profile-coverage line for the `dry-run` report: how many of its
+/// enumerated specs are missing from `profile.db` (i.e. would be JIT-profiled on a
+/// real build). `name` is the kernel's dotted path; counts are summed over its
+/// backends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelMissing {
+    pub name: String,
+    pub kind: KernelKind,
+    pub missing: usize,
+    pub total: usize,
+}
 
 /// Convert `Result<T, pyo3::PyErr>` to `Result<T, PerfApiError>` by flattening
 /// the PyO3 exception into `PerfApiError::Python(message)`. Defined as a
@@ -37,14 +51,52 @@ impl<T> PyErrExt<T> for Result<T, pyo3::PyErr> {
 /// so one bridge serves kernels modeling different GPUs.
 #[derive(Clone, Debug)]
 pub struct PerfApiBridge {
-    _private: (),
+    /// `Some(..)` puts the bridge in dry-run mode: `Kernel::init` counts missing
+    /// specs into this report instead of fitting caches (see `enable_dry_run`).
+    /// Interior-mutable because `init` borrows the bridge by `&` only.
+    dry_run: RefCell<Option<Vec<KernelMissing>>>,
 }
 
 impl PerfApiBridge {
     pub fn new() -> Result<Self, PerfApiError> {
-        let bridge = Self { _private: () };
+        let bridge = Self {
+            dry_run: RefCell::new(None),
+        };
         bridge.disable_jit_profiling()?;
         Ok(bridge)
+    }
+
+    /// Switch the bridge into dry-run mode: subsequent `Kernel::init` calls only
+    /// `count_missing` (no cache fit) and accumulate one [`KernelMissing`] per
+    /// kernel. Drain the result with [`take_dry_run_report`](Self::take_dry_run_report).
+    pub fn enable_dry_run(&self) {
+        *self.dry_run.borrow_mut() = Some(Vec::new());
+    }
+
+    /// Whether the bridge is in dry-run mode (set by [`enable_dry_run`](Self::enable_dry_run)).
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run.borrow().is_some()
+    }
+
+    /// Record one kernel's coverage line. No-op when not in dry-run mode.
+    pub fn record_missing(&self, name: String, kind: KernelKind, missing: usize, total: usize) {
+        if let Some(report) = self.dry_run.borrow_mut().as_mut() {
+            report.push(KernelMissing {
+                name,
+                kind,
+                missing,
+                total,
+            });
+        }
+    }
+
+    /// Take the accumulated dry-run report, leaving the bridge in dry-run mode
+    /// with an empty report. Empty `Vec` if dry-run was never enabled.
+    pub fn take_dry_run_report(&self) -> Vec<KernelMissing> {
+        match self.dry_run.borrow_mut().as_mut() {
+            Some(report) => std::mem::take(report),
+            None => Vec::new(),
+        }
     }
 
     /// Lock the perf_api into "sim-runtime-safe" mode: any spec that's not

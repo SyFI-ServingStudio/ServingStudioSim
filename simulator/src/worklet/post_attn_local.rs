@@ -20,7 +20,7 @@ use crate::timing::kernels::{
     RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, JitPlan, LeafMetrics, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
 
 #[derive(Clone, Debug)]
 pub struct PostAttnLocalWorkletConfig {
@@ -143,33 +143,6 @@ impl PostAttnLocalWorklet {
         })
     }
 
-    pub fn dry_run_init_ops(
-        name: &str,
-        resolved: &PostAttnLocalWorkletResolved,
-        bridge: &PerfApiBridge,
-    ) -> Result<JitPlan, BuildError> {
-        let parts = vec![
-            Op::<SingleGemmKernel>::dry_run_init(format!("{name}.o_proj"), &resolved.o_proj, bridge)?,
-            Op::<RmsNormKernel>::dry_run_init(
-                format!("{name}.post_norm"),
-                &resolved.post_norm,
-                bridge,
-            )?,
-            Op::<SingleGemmKernel>::dry_run_init(
-                format!("{name}.up_gate_proj"),
-                &resolved.up_gate,
-                bridge,
-            )?,
-            Op::<ElementwiseKernel>::dry_run_init(
-                format!("{name}.activation"),
-                &resolved.act,
-                bridge,
-            )?,
-            Op::<SingleGemmKernel>::dry_run_init(format!("{name}.down_proj"), &resolved.down, bridge)?,
-        ];
-        Ok(JitPlan::sum(name.to_string(), parts))
-    }
-
     /// CostTree compile: sum over the five atomic ops (o_proj, post_norm,
     /// up_gate, act, down), wrapped in a `Labeled` node with the worklet identity
     /// + partition/shape annotation (the old `Describe` header lines).
@@ -192,16 +165,16 @@ impl PostAttnLocalWorklet {
 
     /// CostTree eval: fill o_proj, post_norm, up_gate, act, down slots in that
     /// order — mirrors `compile`/`lookup` so `cursor` tracks the minted slots.
-    pub fn eval(&self, input: &PostAttnLocalWorkletInput, buf: &mut [LeafMetrics], cursor: &mut usize) {
+    pub fn eval(&self, input: &PostAttnLocalWorkletInput, ev: &mut Evaluator) {
         let m = input.batch_tokens;
         let gemm_in = SingleGemmKernelInput { m };
         let norm_in = RmsNormKernelInput { m };
         let act_in = ElementwiseKernelInput { num_tokens: m };
-        self.o_proj.eval(&gemm_in, buf, cursor);
-        self.post_norm.eval(&norm_in, buf, cursor);
-        self.up_gate.eval(&gemm_in, buf, cursor);
-        self.act.eval(&act_in, buf, cursor);
-        self.down.eval(&gemm_in, buf, cursor);
+        self.o_proj.eval(&gemm_in, ev);
+        self.post_norm.eval(&norm_in, ev);
+        self.up_gate.eval(&gemm_in, ev);
+        self.act.eval(&act_in, ev);
+        self.down.eval(&gemm_in, ev);
     }
 }
 

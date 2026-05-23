@@ -1,5 +1,5 @@
-//! L2 (Operation) — names one or more L1 kernels into an op with `lookup` /
-//! `dry_run_init` / `describe` entry points. See `docs/detailed_design/L2/`.
+//! L2 (Operation) — names one or more L1 kernels into an op with `compile` /
+//! `eval` entry points (CostTree). See `docs/detailed_design/L2/`.
 //!
 //! This module holds the generic single-kernel wrapper `Op<K>` (L2 design §2.2).
 //! Atomic ops (qkv / o_proj / gate_up / down / lm_head / rms_norm …) are all
@@ -14,9 +14,7 @@ pub mod ssm;
 
 use std::sync::Arc;
 
-use crate::timing::{
-    BuildError, CostNode, CostTreeBuilder, DryRun, JitPlan, LeafMetrics, PerfApiBridge, Probe,
-};
+use crate::timing::{CostNode, CostTreeBuilder, Evaluator, Probe};
 
 /// Generic single-kernel atomic op: names an L1 kernel and forwards its lookup.
 /// `name` is the owned dotted path injected at the L4/L3 wiring point; the same
@@ -43,26 +41,12 @@ impl<K: Probe> Op<K> {
         )
     }
 
-    /// CostTree eval: write this op's one leaf into `buf[*cursor]` and advance the
-    /// cursor — the inverse of `compile`'s single `leaf()`. Walking `eval` in the
-    /// same child order `compile` minted slots keeps `cursor` aligned with the
-    /// slot index (INV-2). The leaf metric is the kernel's best-of-N `Metrics4`.
-    pub fn eval(&self, input: &K::Input, buf: &mut [LeafMetrics], cursor: &mut usize) {
-        buf[*cursor] = self.kernel.lookup_metrics(input);
-        *cursor += 1;
-    }
-}
-
-impl<K: DryRun> Op<K> {
-    /// Build-time sibling of `new` (no `self`, constructs nothing): wrap the
-    /// kernel's dry-run plan as this op's single-child `JitPlan`.
-    pub fn dry_run_init(
-        name: String,
-        cfg: &K::Config,
-        bridge: &PerfApiBridge,
-    ) -> Result<JitPlan, BuildError> {
-        let inner = K::dry_run(&name, cfg, bridge)?;
-        Ok(JitPlan::sum(name, vec![inner]))
+    /// CostTree eval: push this op's one leaf into the [`Evaluator`] — the inverse
+    /// of `compile`'s single `leaf()`. Walking `eval` in the same child order
+    /// `compile` minted slots keeps the evaluator's cursor aligned with the slot
+    /// index (INV-2). The leaf metric is the kernel's best-of-N `Metrics4`.
+    pub fn eval(&self, input: &K::Input, ev: &mut Evaluator) {
+        ev.push(self.kernel.lookup_metrics(input));
     }
 }
 
@@ -70,7 +54,7 @@ impl<K: DryRun> Op<K> {
 mod tests {
     use super::Op;
     use crate::timing::cache::interp::{CoverageFlags, Metrics4};
-    use crate::timing::{CostNode, CostTree, CostTreeBuilder, LeafMetrics, Probe};
+    use crate::timing::{CostNode, CostTree, CostTreeBuilder, Evaluator, LeafMetrics, Probe};
     use std::sync::Arc;
 
     /// Mock `Probe` standing in for an L1 kernel, so the op-wrapping logic is
@@ -136,9 +120,9 @@ mod tests {
     fn op_eval_writes_one_leaf_metric() {
         let op = fake_op();
         let mut buf = vec![LeafMetrics::ZERO; 1];
-        let mut cursor = 0;
-        op.eval(&(), &mut buf, &mut cursor);
-        assert_eq!(cursor, 1);
+        let mut ev = Evaluator::new(&mut buf);
+        op.eval(&(), &mut ev);
+        assert_eq!(ev.filled(), 1);
         assert_eq!(buf[0].m.time_ms, 2.5);
         assert_eq!(buf[0].m.flops, 100.0);
     }
@@ -157,9 +141,9 @@ mod tests {
             CostNode::Sum(vec![self.gate_up.compile(b), self.down.compile(b)])
         }
 
-        fn eval(&self, buf: &mut [LeafMetrics], cursor: &mut usize) {
-            self.gate_up.eval(&(), buf, cursor);
-            self.down.eval(&(), buf, cursor);
+        fn eval(&self, ev: &mut Evaluator) {
+            self.gate_up.eval(&(), ev);
+            self.down.eval(&(), ev);
         }
     }
 
@@ -199,9 +183,10 @@ mod tests {
         let flat = tree.flatten();
 
         let mut buf = vec![LeafMetrics::ZERO; tree.n_slots()];
-        let mut cursor = 0;
-        ffn.eval(&mut buf, &mut cursor);
-        assert_eq!(cursor, tree.n_slots(), "eval must fill every slot");
+        let n = buf.len();
+        let mut ev = Evaluator::new(&mut buf);
+        ffn.eval(&mut ev);
+        assert_eq!(ev.filled(), n, "eval must fill every slot");
 
         let agg = CostTree::aggregate(&flat, &buf).m;
         // sum over the two ops: time 3.0 + 1.5, flops 10 + 5, bytes 20 + 8.

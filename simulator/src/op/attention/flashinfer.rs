@@ -27,7 +27,9 @@ use crate::timing::kernels::{
     FlashinferAttnPrefillKernel, FlashinferAttnPrefillKernelConfig,
     FlashinferAttnPrefillKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, JitPlan, LeafMetrics, PerfApiBridge, Probe};
+use crate::timing::{
+    BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge, Probe,
+};
 
 /// Single op-level config; expands into the two sub-kernel configs (their field
 /// sets are identical, so this is their shared union). L2 design §3.5-1.
@@ -112,7 +114,7 @@ impl FlashInferAttentionOp {
     /// (mirrors `lookup`'s per-request parts). The decode slot collapses all decode
     /// requests to one cell (zero metrics when none). Numerically equals the sum of
     /// `lookup`'s parts, so `aggregate(Sum[prefill, decode])` matches `lookup().time`.
-    pub fn eval(&self, input: &FlashInferAttentionInput, buf: &mut [LeafMetrics], cursor: &mut usize) {
+    pub fn eval(&self, input: &FlashInferAttentionInput, ev: &mut Evaluator) {
         let mut prefill = LeafMetrics::ZERO;
         for &(prefix_len, append_len) in &input.prefill_chunk_pairs {
             prefill.add(self.prefill.lookup_metrics(&FlashinferAttnPrefillKernelInput {
@@ -120,38 +122,14 @@ impl FlashInferAttentionOp {
                 append_len,
             }));
         }
-        buf[*cursor] = prefill;
-        *cursor += 1;
+        ev.push(prefill);
 
-        buf[*cursor] = match decode_input(&input.decode_kv_lens) {
+        ev.push(match decode_input(&input.decode_kv_lens) {
             Some(decode_input) => self.decode.lookup_metrics(&decode_input),
             None => LeafMetrics::ZERO,
-        };
-        *cursor += 1;
+        });
     }
 
-    /// Build-time sibling of `new`: borrows only, constructs nothing, returns the
-    /// `JitPlan` tree summed over both sub-kernels (L2 design §3.7). Sub-kernel
-    /// names share the `"{op}.{slot}"` formula used by `new`.
-    pub fn dry_run_init(
-        name: String,
-        cfg: &FlashInferAttentionConfig,
-        bridge: &PerfApiBridge,
-    ) -> Result<JitPlan, BuildError> {
-        let parts = vec![
-            FlashinferAttnPrefillKernel::dry_run(
-                &format!("{name}.prefill"),
-                &prefill_config(cfg),
-                bridge,
-            )?,
-            FlashinferAttnDecodeKernel::dry_run(
-                &format!("{name}.decode"),
-                &decode_config(cfg),
-                bridge,
-            )?,
-        ];
-        Ok(JitPlan::sum(name, parts))
-    }
 }
 
 // ─── internal helpers (pure; unit-tested without a bridge) ───────────────────

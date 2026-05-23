@@ -45,6 +45,9 @@ enum Cmd {
     Run(RunArgs),
     /// Prebuild the profile.db kernel cache, then exit without simulating.
     BuildCacheOnly(RunArgs),
+    /// Report how many kernel specs are missing from profile.db (the JIT work a
+    /// cache build would do), per kernel, then exit without building or running.
+    DryRun(RunArgs),
     /// Print the deployment schema JSON consumed by the launcher (§1.2.7).
     ListParams,
 }
@@ -78,6 +81,7 @@ fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Run(args) => cmd_run(args.deployment),
         Cmd::BuildCacheOnly(args) => cmd_build_cache(args.deployment),
+        Cmd::DryRun(args) => cmd_dry_run(args.deployment),
         Cmd::ListParams => {
             // serde_json::Value serializes infallibly; pretty for `list-params`.
             println!(
@@ -128,5 +132,37 @@ fn cmd_build_cache(sel: DeploymentSel) -> anyhow::Result<()> {
         }
     }
     tracing::info!("cache build complete: profile.db populated via JIT");
+    Ok(())
+}
+
+/// `dry-run` — put the bridge in dry-run mode, run the same build cascade (which
+/// then only `count_missing`s, never fits), and print one line per kernel showing
+/// how many of its specs are absent from `profile.db` (the JIT work a real cache
+/// build would do). Exits before the tick loop. JIT stays off so nothing is
+/// profiled — this is a read-only coverage probe.
+fn cmd_dry_run(sel: DeploymentSel) -> anyhow::Result<()> {
+    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+    bridge.enable_dry_run();
+    let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+    match sel {
+        DeploymentSel::Unified(p) => {
+            let _flow = UnifiedDeployment::build(&p, &bridge, store)?;
+        }
+    }
+
+    let report = bridge.take_dry_run_report();
+    let total_missing: usize = report.iter().map(|k| k.missing).sum();
+    let total_specs: usize = report.iter().map(|k| k.total).sum();
+    println!("dry run: {} kernels", report.len());
+    for k in &report {
+        println!(
+            "  {:<40} ({:<16}) {:>8} / {:<8} missing",
+            k.name, k.kind, k.missing, k.total
+        );
+    }
+    println!(
+        "total: {total_missing} / {total_specs} specs missing across {} kernels to JIT",
+        report.len()
+    );
     Ok(())
 }

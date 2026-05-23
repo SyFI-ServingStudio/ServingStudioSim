@@ -2,17 +2,16 @@
 //! `FlashInferAttentionOp`. `Local` group suffix (L3 §1.5): 1 GPU, no HP split,
 //! no collective.
 //!
-//! `FlashInferAttentionOp` predates the worklet three-method shape — it exposes
-//! `new` / `lookup` / `dry_run_init` (no `*Resolved`). So this worklet's
-//! `resolve_config` just bakes a `FlashInferAttentionConfig`; `init_ops` calls
-//! `FlashInferAttentionOp::new`, `dry_run_init_ops` calls `::dry_run_init`.
+//! `FlashInferAttentionOp` predates the worklet shape — it exposes `new` /
+//! `compile` / `eval` (no `*Resolved`). So this worklet's `resolve_config` just
+//! bakes a `FlashInferAttentionConfig`; `init_ops` calls `FlashInferAttentionOp::new`.
 //!
 //! `gpu_name` rides in the config (L3 §1.6 / `gpu_name in *KernelConfig`); the
 //! `*Input` is pure shape.
 
 use crate::op::attention::{FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp};
 use crate::timing::bridge::DType;
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, JitPlan, LeafMetrics, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
 
 /// Raw config; mirrors `FlashInferAttentionConfig` (no partition under `Local`).
 #[derive(Clone, Debug)]
@@ -77,19 +76,6 @@ impl AttnLocalWorklet {
         })
     }
 
-    pub fn dry_run_init_ops(
-        name: &str,
-        resolved: &AttnLocalWorkletResolved,
-        bridge: &PerfApiBridge,
-    ) -> Result<JitPlan, BuildError> {
-        let attn = FlashInferAttentionOp::dry_run_init(
-            format!("{name}.attn"),
-            &resolved.attn,
-            bridge,
-        )?;
-        Ok(JitPlan::sum(name.to_string(), vec![attn]))
-    }
-
     /// CostTree compile: the attention op's two fixed prefill/decode leaves,
     /// wrapped in a `Labeled` node carrying the worklet identity + partition/shape
     /// annotation (the old `Describe` header lines).
@@ -109,12 +95,12 @@ impl AttnLocalWorklet {
 
     /// CostTree eval: delegate to the attn op (its two prefill/decode slots),
     /// mapping the worklet input to the op input — mirrors `compile`/`lookup`.
-    pub fn eval(&self, input: &AttnLocalWorkletInput, buf: &mut [LeafMetrics], cursor: &mut usize) {
+    pub fn eval(&self, input: &AttnLocalWorkletInput, ev: &mut Evaluator) {
         let op_in = FlashInferAttentionInput {
             prefill_chunk_pairs: input.prefill_chunk_pairs.clone(),
             decode_kv_lens: input.decode_kv_lens.clone(),
         };
-        self.attn.eval(&op_in, buf, cursor);
+        self.attn.eval(&op_in, ev);
     }
 }
 

@@ -1,5 +1,5 @@
 //! Generic L1 kernel engine: per-kernel files implement `KernelSpec` once and
-//! `Kernel<S>` provides init/lookup/dry_run + Probe/DryRun blanket impls.
+//! `Kernel<S>` provides init/lookup_metrics + the `Probe` blanket impl.
 //!
 //! Engine knows nothing about specific kernel kinds: it only sees the sweep
 //! grid, the cache kind, the bridge args, and the sweep-coord projection of
@@ -13,7 +13,7 @@ use crate::timing::bridge::{ArgsPayload, KernelKind, PerfApiBridge};
 use crate::timing::cache::interp::LeafMetrics;
 use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning};
 use crate::timing::sweep::{SweepCoords, SweepGrid};
-use crate::timing::{BuildError, DryRun, JitPlan, Probe};
+use crate::timing::{BuildError, Probe};
 
 /// Per-kernel `*KernelConfig` contract: identity (`Hash + Eq`) + the required
 /// `backends: Vec<&'static str>` field exposed via `backends()`. The proc-macro
@@ -28,7 +28,8 @@ pub trait KernelConfig: std::hash::Hash + Eq + Clone + std::fmt::Debug + 'static
 
     /// The GPU whose profiled rows this config caches. Part of the config
     /// identity (`Hash + Eq`), so distinct GPUs are distinct kernels / caches;
-    /// passed to the bridge at `init` / `dry_run` as the DB `gpu_name` key.
+    /// passed to the bridge at `init` (`get_times` / `count_missing`) as the DB
+    /// `gpu_name` key.
     fn gpu_name(&self) -> &str;
 
     /// One-line config summary for the `Describe` leaf line — the `<cfg>` after
@@ -94,6 +95,30 @@ impl<S: KernelSpec> Kernel<S> {
         )?;
         let sweep_grid = S::sweep_grid(&config);
         let backends = config.backends();
+
+        // Dry-run mode: don't fit caches — just tally how many specs are missing
+        // from profile.db (the JIT work a real build would do) and report one line
+        // for this kernel. The returned `Kernel` has empty caches; dry-run exits
+        // before the tick loop so it's never looked up.
+        if bridge.is_dry_run() {
+            let mut missing = 0;
+            let mut total = 0;
+            for &backend in backends {
+                let specs = S::enumerate(&config, &sweep_grid, backend);
+                total += specs.len();
+                missing += bridge
+                    .count_missing(specs, S::KIND, backend, config.gpu_name())
+                    .map_err(|err| BuildError::from_perf_api(S::KIND, backend, err))?;
+            }
+            bridge.record_missing(name, S::KIND, missing, total);
+            return Ok(Self {
+                config,
+                outlier_warnings: Vec::new(),
+                backend_caches: Vec::new(),
+                _spec: PhantomData,
+            });
+        }
+
         let mut backend_caches = Vec::with_capacity(backends.len());
         let mut outlier_warnings = Vec::new();
         for &backend in backends {
@@ -138,35 +163,6 @@ impl<S: KernelSpec> Kernel<S> {
             .expect("kernel config validation must create at least one backend cache")
     }
 
-    pub fn dry_run(
-        name: &str,
-        config: &S::Config,
-        bridge: &PerfApiBridge,
-    ) -> Result<JitPlan, BuildError> {
-        ensure_has_backends(
-            S::KIND,
-            <S::Config as KernelConfig>::BACKENDS_FIELD,
-            config.backends(),
-        )?;
-        let sweep_grid = S::sweep_grid(config);
-        let backends = config.backends();
-        let mut parts = Vec::with_capacity(backends.len());
-        for &backend in backends {
-            let specs = S::enumerate(config, &sweep_grid, backend);
-            let total = specs.len();
-            let missing = bridge
-                .count_missing(specs, S::KIND, backend, config.gpu_name())
-                .map_err(|err| BuildError::from_perf_api(S::KIND, backend, err))?;
-            parts.push(JitPlan::from_missing_count(
-                S::KIND,
-                name,
-                backend,
-                total,
-                missing,
-            )?);
-        }
-        Ok(JitPlan::sum(name.to_string(), parts))
-    }
 }
 
 impl<S: KernelSpec> Probe for Kernel<S> {
@@ -182,17 +178,6 @@ impl<S: KernelSpec> Probe for Kernel<S> {
     }
     fn describe_config(&self) -> String {
         self.config.describe_config()
-    }
-}
-
-impl<S: KernelSpec> DryRun for Kernel<S> {
-    type Config = S::Config;
-    fn dry_run(
-        name: &str,
-        config: &Self::Config,
-        bridge: &PerfApiBridge,
-    ) -> Result<JitPlan, BuildError> {
-        Self::dry_run(name, config, bridge)
     }
 }
 

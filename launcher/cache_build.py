@@ -20,6 +20,7 @@ prebuild passes; under-tagging reintroduces the contention bug).
 
 from __future__ import annotations
 
+import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -32,6 +33,41 @@ def cache_key(params: dict, cache_fields: Iterable[str]) -> tuple:
     """The kernel-determining subset of `params`, hashable for de-duplication.
     `cache_fields` comes from `DeploymentSchema.cache_key_fields` (Rust-tagged)."""
     return tuple(params.get(field) for field in cache_fields)
+
+
+def _unique_by_cache_key(
+    param_sets: list[dict], schema: Schema
+) -> list[dict]:
+    """One representative param set per distinct cache key — the dedup shared by
+    the cache prebuild and the coverage report. Key fields are Rust-tagged
+    (`affects_cache`), so runs differing only in non-kernel params collapse."""
+    seen_keys: set[tuple] = set()
+    representatives: list[dict] = []
+    for params in param_sets:
+        cache_fields = schema.deployment_schemas[params["deployment"]].cache_key_fields
+        key = cache_key(params, cache_fields)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            representatives.append(params)
+    return representatives
+
+
+def report_cache_coverage(
+    param_sets: list[dict], schema: Schema, build_type: str = "debug"
+) -> int:
+    """Run the Rust `dry-run` subcommand once per unique cache key and stream its
+    per-kernel missing-spec report to the console (no caches built, no sim run).
+    Mirrors `prebuild_caches`'s cache-key dedup so a sweep reports each distinct
+    kernel set once. Returns a process exit code (0 iff every probe succeeded)."""
+    binary = binary_path(build_type)
+    env = _build_subprocess_env()
+    rc = 0
+    for params in _unique_by_cache_key(param_sets, schema):
+        argv = build_cli_command(params, binary, subcommand="dry-run")
+        result = subprocess.run(argv, env=env)
+        if result.returncode != 0:
+            rc = result.returncode
+    return rc
 
 
 def _prebuild_log_dir(base_dir: Path, params: dict) -> Path:
@@ -73,16 +109,7 @@ async def prebuild_caches(
     binary = binary_path(build_type)
     env = _build_subprocess_env()
 
-    seen_keys: set[tuple] = set()
-    representatives: list[tuple[dict, tuple]] = []
-    for params in param_sets:
-        cache_fields = schema.deployment_schemas[params["deployment"]].cache_key_fields
-        key = cache_key(params, cache_fields)
-        if key not in seen_keys:
-            seen_keys.add(key)
-            representatives.append((params, key))
-
-    for params, key in representatives:
+    for params in _unique_by_cache_key(param_sets, schema):
         argv = build_cli_command(params, binary, subcommand="build-cache-only")
         runner = SimulationRunner(
             argv=argv, log_dir=_prebuild_log_dir(base_dir, params), env=env

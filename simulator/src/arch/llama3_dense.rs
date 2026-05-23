@@ -2,8 +2,10 @@
 //!
 //! Wires the three `Local` worklets (pre-attn / attn / post-attn) per layer,
 //! plus an embedding placeholder + final-norm + lm_head, into an iter-wise
-//! unified model. Follows the L4 four-piece shape (`build_configs` /
-//! `resolve_configs` / `dry_run` / `build`) and exposes `IterwiseUnifiedModel`.
+//! unified model. Follows the L4 build shape (`build_configs` /
+//! `resolve_configs` / `build`) and exposes `IterwiseUnifiedModel`. Dry-run
+//! coverage is no longer a separate traversal: `build` against a dry-run
+//! [`PerfApiBridge`] tallies missing specs per kernel (see `Kernel::init`).
 //!
 //! Deviations from L4 design.md for this v1 dense vertical (see plan):
 //!   - all worklets are `Local` (tp/ep/hp = 1, no collective);
@@ -22,7 +24,7 @@ use crate::timing::kernels::{
     SingleGemmKernelInput,
 };
 use crate::timing::{
-    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, FlatCostNode, JitPlan,
+    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge,
 };
 use crate::worklet::{
@@ -165,48 +167,6 @@ pub fn resolve_configs(cfgs: &Llama3DenseConfigs) -> Llama3DenseResolved {
     }
 }
 
-pub fn dry_run(
-    model_name: &str,
-    resolved: &Llama3DenseResolved,
-    bridge: &PerfApiBridge,
-) -> Result<JitPlan, BuildError> {
-    Ok(JitPlan::sum(
-        model_name.to_string(),
-        vec![
-            Op::<ElementwiseKernel>::dry_run_init(
-                format!("{model_name}.embedding"),
-                &resolved.embed,
-                bridge,
-            )?,
-            PreAttnLocalWorklet::dry_run_init_ops(
-                &format!("{model_name}.pre_attn"),
-                &resolved.pre_attn,
-                bridge,
-            )?,
-            AttnLocalWorklet::dry_run_init_ops(
-                &format!("{model_name}.attn"),
-                &resolved.attn,
-                bridge,
-            )?,
-            PostAttnLocalWorklet::dry_run_init_ops(
-                &format!("{model_name}.post_attn"),
-                &resolved.post_attn,
-                bridge,
-            )?,
-            Op::<RmsNormKernel>::dry_run_init(
-                format!("{model_name}.final_norm"),
-                &resolved.final_norm,
-                bridge,
-            )?,
-            Op::<SingleGemmKernel>::dry_run_init(
-                format!("{model_name}.lm_head"),
-                &resolved.lm_head,
-                bridge,
-            )?,
-        ],
-    ))
-}
-
 pub fn build(
     model_name: String,
     resolved: Llama3DenseResolved,
@@ -315,26 +275,24 @@ impl Llama3DenseModel {
     fn eval_buf(&self, batch: &UnifiedArchInput, buf: &mut [LeafMetrics]) {
         let g = &batch.groups[0];
         let m = g.batch_tokens;
-        let mut cursor = 0;
+        let n = buf.len();
+        let mut ev = Evaluator::new(buf);
         self.embed
-            .eval(&ElementwiseKernelInput { num_tokens: m }, buf, &mut cursor);
+            .eval(&ElementwiseKernelInput { num_tokens: m }, &mut ev);
         self.pre_attn
-            .eval(&PreAttnLocalWorkletInput { batch_tokens: m }, buf, &mut cursor);
+            .eval(&PreAttnLocalWorkletInput { batch_tokens: m }, &mut ev);
         self.attn.eval(
             &AttnLocalWorkletInput {
                 prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
                 decode_kv_lens: g.decode_kv_lens.clone(),
             },
-            buf,
-            &mut cursor,
+            &mut ev,
         );
         self.post_attn
-            .eval(&PostAttnLocalWorkletInput { batch_tokens: m }, buf, &mut cursor);
-        self.final_norm
-            .eval(&RmsNormKernelInput { m }, buf, &mut cursor);
-        self.lm_head
-            .eval(&SingleGemmKernelInput { m }, buf, &mut cursor);
-        debug_assert_eq!(cursor, buf.len(), "eval cursor must fill every slot");
+            .eval(&PostAttnLocalWorkletInput { batch_tokens: m }, &mut ev);
+        self.final_norm.eval(&RmsNormKernelInput { m }, &mut ev);
+        self.lm_head.eval(&SingleGemmKernelInput { m }, &mut ev);
+        debug_assert_eq!(ev.filled(), n, "eval cursor must fill every slot");
     }
 }
 

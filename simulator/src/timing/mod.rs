@@ -3,16 +3,16 @@
 pub mod bridge;
 pub mod cache;
 pub mod cost_tree;
-pub mod jit;
 pub mod kernels;
 pub mod result;
 pub mod routing;
 pub mod sweep;
 
-pub use bridge::{BuildError, PerfApiBridge};
+pub use bridge::{BuildError, KernelMissing, PerfApiBridge};
 pub use cache::interp::{CoverageFlags, LeafMetrics, Metrics4};
-pub use cost_tree::{CostManifest, CostNode, CostTree, CostTreeBuilder, FlatCostNode, LeafDesc};
-pub use jit::{BackendJitPlan, DryRun, JitPlan};
+pub use cost_tree::{
+    CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode, LeafDesc,
+};
 pub use kernels::engine::KernelConfig;
 pub use result::Probe;
 pub use sweep::{Axis, Coords, SweepCoords, SweepGrid};

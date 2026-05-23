@@ -52,6 +52,13 @@ def _build_argparse():
         help="Validate + expand only; do not launch subprocesses.",
     )
     parser.add_argument(
+        "--cache-report",
+        action="store_true",
+        help="Report profile.db coverage — how many kernel specs are missing "
+        "(would be JIT-profiled) per kernel, for each unique cache key — then "
+        "exit without building caches or running.",
+    )
+    parser.add_argument(
         "--refresh",
         action="store_true",
         help="Re-run every run, ignoring `.complete` markers (default: resume — "
@@ -206,6 +213,11 @@ def main(argv: list[str] | None = None) -> int:
         for candidate in all_candidates:
             print(json.dumps({k: v for k, v in candidate.items() if not k.startswith("_")}))
         return 0
+
+    if args.cache_report:
+        from .cache_build import report_cache_coverage
+
+        return report_cache_coverage(all_candidates, schema, args.build_type)
 
     if args.profile:
         from .exec import perf_available

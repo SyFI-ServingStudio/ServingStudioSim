@@ -133,6 +133,35 @@ impl CostTreeBuilder {
     }
 }
 
+/// Fills the per-iter leaf buffer in visit order, the eval-time counterpart of
+/// [`CostTreeBuilder`]: where the builder mints slots as `compile` walks the
+/// children, the evaluator writes them as `eval` walks the same children in the
+/// same order (INV-2). Threading one `&mut Evaluator` down the eval recursion
+/// replaces the parallel `buf` + `cursor` pair (mirrors `compile`'s `&mut
+/// CostTreeBuilder`); `push` hides the slot-cursor bookkeeping.
+pub struct Evaluator<'a> {
+    buf: &'a mut [LeafMetrics],
+    cursor: usize,
+}
+
+impl<'a> Evaluator<'a> {
+    pub fn new(buf: &'a mut [LeafMetrics]) -> Self {
+        Self { buf, cursor: 0 }
+    }
+
+    /// Write the next leaf's metrics into its slot and advance. Slot index =
+    /// visit order, so `eval` must push in the order `compile` minted slots.
+    pub fn push(&mut self, metrics: LeafMetrics) {
+        self.buf[self.cursor] = metrics;
+        self.cursor += 1;
+    }
+
+    /// Slots filled so far — used to assert the eval walk covered every slot.
+    pub fn filled(&self) -> usize {
+        self.cursor
+    }
+}
+
 impl CostTree {
     /// Number of materialized leaf slots = the per-iter `buf` length. A folded
     /// (`Scale`) subtree is counted once, not `×n`.
