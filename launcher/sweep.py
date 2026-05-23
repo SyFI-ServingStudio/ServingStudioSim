@@ -19,7 +19,14 @@ from pathlib import Path
 
 from . import metadata
 from .cache_build import prebuild_caches
-from .exec import DEFAULT_PARALLELISM, SimulationRunner, _build_subprocess_env, binary_path
+from .exec import (
+    DEFAULT_PARALLELISM,
+    SimulationRunner,
+    _build_subprocess_env,
+    _profile_env,
+    binary_path,
+    wrap_with_perf,
+)
 from .schema import build_cli_command, validate_unique_log_dirs
 from .schema.loader import Schema
 
@@ -40,11 +47,21 @@ def _mark_complete(log_dir: Path) -> None:
     (log_dir / COMPLETE_MARKER).write_text(datetime.now(UTC).isoformat() + "\n")
 
 
-async def _launch_one(params: dict, build_type: str, refresh: bool = False) -> bool:
+async def _launch_one(
+    params: dict,
+    build_type: str,
+    refresh: bool = False,
+    profile: bool = False,
+    profile_freq: int = 499,
+) -> bool:
     """Metadata-then-spawn for a single (already normalized) param set. On resume
     (the default) a run whose log_dir already has a `.complete` marker is skipped;
     `refresh=True` forces a re-run. The marker is written only on a zero exit.
-    Shared by both the single-run and sweep flows."""
+    Shared by both the single-run and sweep flows.
+
+    `profile=True` wraps the run argv with `perf record` (output `<log_dir>/
+    perf.data`) under a single-threaded BLAS/OMP env — the launcher's wallclock
+    profiling mode (skill `profile-sim-speed`)."""
     log_dir = Path(str(params["log_dir"]))
 
     if not refresh and _is_complete(log_dir):
@@ -54,15 +71,28 @@ async def _launch_one(params: dict, build_type: str, refresh: bool = False) -> b
     binary = binary_path(build_type)
     argv = build_cli_command(params, binary, subcommand="run")
 
-    # INV-2: all metadata lands before the subprocess starts.
+    # INV-2: all metadata lands before the subprocess starts (record the bare run
+    # argv, before any perf wrapping, so metadata reflects the simulated run).
     metadata.write_run_metadata(log_dir, params, argv)
     # Clear any stale marker so a crash mid-run never leaves a false 'complete'.
     (log_dir / COMPLETE_MARKER).unlink(missing_ok=True)
 
-    runner = SimulationRunner(argv=argv, log_dir=log_dir, env=_build_subprocess_env())
+    env = _build_subprocess_env()
+    if profile:
+        # perf runs with cwd=REPO_ROOT, so write to an absolute path.
+        perf_data = log_dir.resolve() / "perf.data"
+        argv = wrap_with_perf(argv, perf_data, profile_freq)
+        env = _profile_env()
+
+    runner = SimulationRunner(argv=argv, log_dir=log_dir, env=env)
     ok = await runner.run()
     if ok:
         _mark_complete(log_dir)
+        if profile:
+            print(
+                f"[profile] wrote {log_dir.resolve() / 'perf.data'} — read with "
+                f"`perf report -i {log_dir.resolve() / 'perf.data'} --stdio` (not cat)"
+            )
     return ok
 
 
@@ -75,18 +105,29 @@ def run_single(
     schema: Schema,
     build_type: str = "debug",
     refresh: bool = False,
+    profile: bool = False,
+    profile_freq: int = 499,
 ) -> bool:
     """Prebuild → metadata → run, for one param set. Synchronous entry. The
     caller must pass the already-loaded Rust schema from `load_schema()`; the
     sweep layer never loads a schema implicitly. Resumes by default (skips a run
-    already marked `.complete`); `refresh=True` re-runs."""
+    already marked `.complete`); `refresh=True` re-runs. `profile=True` wraps the
+    run with `perf record` (skill `profile-sim-speed`)."""
     if schema is None:
         raise TypeError("run_single requires a loaded Schema; call load_schema() first")
-    return asyncio.run(_run_single_async(params, preset, schema, build_type, refresh))
+    return asyncio.run(
+        _run_single_async(params, preset, schema, build_type, refresh, profile, profile_freq)
+    )
 
 
 async def _run_single_async(
-    params: dict, preset: dict | None, schema: Schema, build_type: str, refresh: bool = False
+    params: dict,
+    preset: dict | None,
+    schema: Schema,
+    build_type: str,
+    refresh: bool = False,
+    profile: bool = False,
+    profile_freq: int = 499,
 ) -> bool:
     log_dir = Path(str(params["log_dir"]))
     if not refresh and _is_complete(log_dir):
@@ -95,7 +136,7 @@ async def _run_single_async(
     metadata.write_shared_metadata(log_dir, preset or params)
     if not await prebuild_caches([params], schema, build_type):
         return False
-    return await _launch_one(params, build_type, refresh)
+    return await _launch_one(params, build_type, refresh, profile, profile_freq)
 
 
 # ── sweep flow ─────────────────────────────────────────────────────────────

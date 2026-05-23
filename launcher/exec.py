@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -71,6 +72,45 @@ def _build_subprocess_env() -> dict[str, str]:
     if site_packages:
         pythonpath_parts.append(site_packages)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    return env
+
+
+# ── perf profiling (skill `profile-sim-speed`) ──────────────────────────────
+
+
+def perf_available() -> bool:
+    """Whether the `perf` CLI is on PATH (the wallclock profiler the launcher's
+    `--profile` mode wraps the run with)."""
+    return shutil.which("perf") is not None
+
+
+def wrap_with_perf(argv: list[str], perf_data: Path, freq: int = 499) -> list[str]:
+    """Wrap a run argv with `perf record`. `--call-graph dwarf` is required
+    because the release profile omits frame pointers; `-F` is the sampling Hz
+    (499/999 avoids lock-step with timers). Output is the binary `perf.data` at
+    `perf_data` — read it with `perf report`, never `cat`. See skill
+    `profile-sim-speed`."""
+    return [
+        "perf",
+        "record",
+        "-F",
+        str(freq),
+        "--call-graph",
+        "dwarf",
+        "-o",
+        str(perf_data),
+        "--",
+        *argv,
+    ]
+
+
+def _profile_env() -> dict[str, str]:
+    """`_build_subprocess_env` plus single-threaded BLAS/OMP so the one-time L4
+    model build's numpy/torch calls don't smear samples across worker threads
+    (skill `profile-sim-speed` Step 2)."""
+    env = _build_subprocess_env()
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["OMP_NUM_THREADS"] = "1"
     return env
 
 

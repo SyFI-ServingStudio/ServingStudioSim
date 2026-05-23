@@ -59,8 +59,21 @@ def _build_argparse():
     )
     parser.add_argument(
         "--build-type",
-        default="debug",
-        help="Cargo profile / target subdir for the schema + binary (default: debug).",
+        default="release",
+        help="Cargo profile / target subdir for the schema + binary (default: release).",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Wrap the run with `perf record` to profile simulator wallclock; writes "
+        "`<log_dir>/perf.data`. Requires exactly one run (skill profile-sim-speed).",
+    )
+    parser.add_argument(
+        "--profile-freq",
+        type=int,
+        default=499,
+        metavar="HZ",
+        help="perf sampling frequency for --profile (default: 499).",
     )
     return parser
 
@@ -129,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     # `list-params` subcommand short-circuits before any preset handling.
     if argv and argv[0] == "list-params":
         human = "--human" in argv[1:]
-        build_type = "debug"
+        build_type = "release"
         if "--build-type" in argv:
             build_type = argv[argv.index("--build-type") + 1]
         try:
@@ -181,17 +194,37 @@ def main(argv: list[str] | None = None) -> int:
     if not validate_unique_log_dirs(all_candidates):
         return 2
 
+    # --profile records one representative run; perf on a parallel sweep is
+    # meaningless. Enforce a single expanded candidate (skill profile-sim-speed).
+    if args.profile and len(all_candidates) != 1:
+        sys.exit(
+            f"--profile requires exactly one run, but the preset expands to "
+            f"{len(all_candidates)}; narrow it (e.g. via --override) to a single run"
+        )
+
     if args.dry_run:
         for candidate in all_candidates:
             print(json.dumps({k: v for k, v in candidate.items() if not k.startswith("_")}))
         return 0
+
+    if args.profile:
+        from .exec import perf_available
+
+        if not perf_available():
+            sys.exit("--profile needs the `perf` CLI on PATH (install linux-perf / perf)")
 
     # Defer importing sweep (and its asyncio/subprocess deps) until we launch.
     from .sweep import run_single, run_sweep
 
     if len(all_candidates) == 1:
         ok = run_single(
-            all_candidates[0], last_preset, schema, args.build_type, refresh=args.refresh
+            all_candidates[0],
+            last_preset,
+            schema,
+            args.build_type,
+            refresh=args.refresh,
+            profile=args.profile,
+            profile_freq=args.profile_freq,
         )
         return 0 if ok else 1
     return run_sweep(
