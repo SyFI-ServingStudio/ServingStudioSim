@@ -33,6 +33,26 @@ pub fn cost_log_envelope_schema() -> Arc<Schema> {
     ]))
 }
 
+/// `cost_log` (CostTree per-iter form) — the envelope scalars plus the compiled
+/// CostTree's per-slot breakdown as two parallel lists: `slot_time_ms`
+/// (`List<f32>`) and `slot_coverage` (`List<u8>`, the `CoverageFlags` bits).
+/// Slot *names* are NOT a column (INV-5 — names live at compile time only); they
+/// live once in the `cost_manifest.json` sidecar and label the list positions.
+pub fn cost_log_schema() -> Arc<Schema> {
+    let time_item = Arc::new(Field::new("item", DataType::Float32, false));
+    let cov_item = Arc::new(Field::new("item", DataType::UInt8, false));
+    Arc::new(Schema::new(vec![
+        Field::new("worker_id", DataType::UInt16, false),
+        Field::new("batch_id", DataType::UInt64, false),
+        Field::new("wall_start_ms", DataType::Float64, false),
+        Field::new("wall_end_ms", DataType::Float64, false),
+        Field::new("total_time_ms", DataType::Float64, false),
+        Field::new("energy_j", DataType::Float64, false),
+        Field::new("slot_time_ms", DataType::List(time_item), false),
+        Field::new("slot_coverage", DataType::List(cov_item), false),
+    ]))
+}
+
 /// `kv_snapshot` (§4) — sampled KV pool state per worker × group.
 pub fn kv_snapshot_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![

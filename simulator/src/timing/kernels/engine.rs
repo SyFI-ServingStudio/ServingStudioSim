@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::common::time::Time;
 use crate::timing::bridge::{ArgsPayload, KernelKind, PerfApiBridge};
+use crate::timing::cache::interp::LeafMetrics;
 use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning};
 use crate::timing::sweep::{SweepCoords, SweepGrid};
 use crate::timing::{BuildError, Describe, DryRun, JitPlan, LookupResult, Probe};
@@ -149,6 +150,19 @@ impl<S: KernelSpec> Kernel<S> {
             .expect("kernel config validation must create at least one backend cache")
     }
 
+    /// All-four-metrics best-of-N for the CostTree eval path: the `Metrics4` of
+    /// the backend with the smallest wallclock. Selection matches `lookup` /
+    /// `lookup_time` (argmin over `Time`), so the chosen backend is identical —
+    /// just without the `LookupResult` name/warning machinery.
+    pub fn lookup_metrics(&self, input: &S::Input) -> LeafMetrics {
+        let coords = input.coords();
+        self.backend_caches
+            .iter()
+            .map(|backend_cache| backend_cache.lookup_metrics(&coords))
+            .min_by_key(|leaf| Time::from_ms(leaf.m.time_ms.max(0.0) as f64))
+            .expect("kernel config validation must create at least one backend cache")
+    }
+
     pub fn dry_run(
         name: &str,
         config: &S::Config,
@@ -187,6 +201,9 @@ impl<S: KernelSpec> Probe for Kernel<S> {
     }
     fn lookup_time(&self, input: &Self::Input) -> Time {
         Self::lookup_time(self, input)
+    }
+    fn lookup_metrics(&self, input: &Self::Input) -> LeafMetrics {
+        Self::lookup_metrics(self, input)
     }
 }
 

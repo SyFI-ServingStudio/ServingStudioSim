@@ -5,13 +5,14 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use arrow_array::builder::{Float32Builder, ListBuilder};
+use arrow_array::builder::{Float32Builder, ListBuilder, UInt8Builder};
 use arrow_array::{
-    BooleanArray, Float32Array, Float64Array, LargeStringArray, RecordBatch, UInt32Array,
+    BooleanArray, Float32Array, Float64Array, LargeStringArray, RecordBatch, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field};
 
-use crate::log::schemas::{request_slo_schema, request_state_schema};
+use crate::log::schemas::{cost_log_schema, request_slo_schema, request_state_schema};
 
 /// A request's lifecycle phase at snapshot time. A small `#[repr(u8)]` code
 /// rather than a `String`: dense `request_state` emits one row per live request
@@ -78,6 +79,61 @@ pub struct RequestSloEntry {
     pub tpot_p50_ms: Option<f32>,
     pub tpot_p99_ms: Option<f32>,
     pub tpot_max_ms: Option<f32>,
+}
+
+/// One `cost_log` row — a whole-iteration cost query via the compiled CostTree.
+/// `slot_time_ms` / `slot_coverage` are the per-slot breakdown (positions named
+/// by the `cost_manifest.json` sidecar); the scalars are the rolled-up totals.
+#[derive(Clone, Debug)]
+pub struct CostLogEntry {
+    pub worker_id: u16,
+    pub batch_id: u64,
+    pub wall_start_ms: f64,
+    pub wall_end_ms: f64,
+    pub total_time_ms: f64,
+    pub energy_j: f64,
+    pub slot_time_ms: Vec<f32>,
+    pub slot_coverage: Vec<u8>,
+}
+
+pub(crate) fn cost_to_record_batch(entries: &[CostLogEntry]) -> Result<RecordBatch> {
+    let worker_id: Vec<u16> = entries.iter().map(|e| e.worker_id).collect();
+    let batch_id: Vec<u64> = entries.iter().map(|e| e.batch_id).collect();
+    let wall_start: Vec<f64> = entries.iter().map(|e| e.wall_start_ms).collect();
+    let wall_end: Vec<f64> = entries.iter().map(|e| e.wall_end_ms).collect();
+    let total_time: Vec<f64> = entries.iter().map(|e| e.total_time_ms).collect();
+    let energy: Vec<f64> = entries.iter().map(|e| e.energy_j).collect();
+
+    // Two parallel List columns, one (non-null, possibly empty) list per row.
+    // Non-nullable `item` to match the schema (ListBuilder defaults to nullable).
+    let mut time_builder = ListBuilder::new(Float32Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
+    let mut cov_builder = ListBuilder::new(UInt8Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::UInt8, false)));
+    for e in entries {
+        for &t in &e.slot_time_ms {
+            time_builder.values().append_value(t);
+        }
+        time_builder.append(true);
+        for &c in &e.slot_coverage {
+            cov_builder.values().append_value(c);
+        }
+        cov_builder.append(true);
+    }
+
+    Ok(RecordBatch::try_new(
+        cost_log_schema(),
+        vec![
+            Arc::new(UInt16Array::from(worker_id)),
+            Arc::new(UInt64Array::from(batch_id)),
+            Arc::new(Float64Array::from(wall_start)),
+            Arc::new(Float64Array::from(wall_end)),
+            Arc::new(Float64Array::from(total_time)),
+            Arc::new(Float64Array::from(energy)),
+            Arc::new(time_builder.finish()),
+            Arc::new(cov_builder.finish()),
+        ],
+    )?)
 }
 
 pub(crate) fn state_to_record_batch(entries: &[RequestStateEntry]) -> Result<RecordBatch> {
@@ -186,6 +242,42 @@ mod tests {
             tpot_p99_ms: Some(3.0),
             tpot_max_ms: Some(3.0),
         }
+    }
+
+    #[test]
+    fn cost_log_parallel_list_columns_round_trip() {
+        let entries = vec![
+            CostLogEntry {
+                worker_id: 0,
+                batch_id: 7,
+                wall_start_ms: 1.0,
+                wall_end_ms: 3.0,
+                total_time_ms: 2.0,
+                energy_j: 0.5,
+                slot_time_ms: vec![1.0, 0.5, 0.5],
+                slot_coverage: vec![0, 1, 0],
+            },
+            CostLogEntry {
+                worker_id: 0,
+                batch_id: 8,
+                wall_start_ms: 3.0,
+                wall_end_ms: 4.0,
+                total_time_ms: 1.0,
+                energy_j: 0.2,
+                slot_time_ms: vec![0.4, 0.6, 0.0],
+                slot_coverage: vec![0, 0, 0],
+            },
+        ];
+        let batch = cost_to_record_batch(&entries).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        // batch_id column (index 1) carries the iter counter.
+        let b = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(b.value(0), 7);
+        assert_eq!(b.value(1), 8);
     }
 
     #[test]

@@ -15,7 +15,10 @@ use crate::timing::kernels::{
     RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, Describe, JitPlan, LookupResult, PerfApiBridge};
+use crate::timing::{
+    BuildError, CostNode, CostTreeBuilder, Describe, JitPlan, LeafMetrics, LookupResult,
+    PerfApiBridge,
+};
 
 /// Raw global config (no partition: `Local` = 1 GPU). Backend strings pass
 /// straight through to L1 (config-level polymorphism, L3 §1.6).
@@ -144,6 +147,25 @@ impl PreAttnLocalWorklet {
             m: input.batch_tokens,
         };
         self.input_norm.lookup_time(&norm_in) + self.qkv.lookup_time(&gemm_in)
+    }
+
+    /// CostTree compile (M1): sum over the two atomic ops — mirrors `lookup`'s
+    /// child list, structure only (no per-iter shape).
+    pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        CostNode::Sum(vec![self.input_norm.compile(builder), self.qkv.compile(builder)])
+    }
+
+    /// CostTree eval: fill the input_norm then qkv slots — same child order as
+    /// `compile`/`lookup`, so `cursor` tracks the minted slot indices.
+    pub fn eval(&self, input: &PreAttnLocalWorkletInput, buf: &mut [LeafMetrics], cursor: &mut usize) {
+        let norm_in = RmsNormKernelInput {
+            m: input.batch_tokens,
+        };
+        let gemm_in = SingleGemmKernelInput {
+            m: input.batch_tokens,
+        };
+        self.input_norm.eval(&norm_in, buf, cursor);
+        self.qkv.eval(&gemm_in, buf, cursor);
     }
 }
 

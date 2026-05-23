@@ -28,7 +28,10 @@ use crate::timing::kernels::{
     FlashinferAttnPrefillKernel, FlashinferAttnPrefillKernelConfig,
     FlashinferAttnPrefillKernelInput,
 };
-use crate::timing::{BuildError, Describe, JitPlan, LookupResult, PerfApiBridge};
+use crate::timing::{
+    BuildError, CostNode, CostTreeBuilder, Describe, JitPlan, LeafMetrics, LookupResult,
+    PerfApiBridge,
+};
 
 /// Single op-level config; expands into the two sub-kernel configs (their field
 /// sets are identical, so this is their shared union). L2 design §3.5-1.
@@ -114,6 +117,43 @@ impl FlashInferAttentionOp {
             t = t + self.decode.lookup_time(&decode_input);
         }
         t
+    }
+
+    /// CostTree compile (M1): two fixed leaves — `prefill` and `decode` —
+    /// regardless of request count (INV-1: stable shape). The per-request prefill
+    /// fan-out is NOT one slot per request; at eval the `prefill` slot is bound to
+    /// an aggregating fn that sums `prefill.lookup_metrics(prefix_i, append_i)`
+    /// over `prefill_chunk_pairs` into that single slot (decode already collapses
+    /// to one cell). Names mirror `new`'s `"{op}.{prefill,decode}"`.
+    pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        CostNode::Sum(vec![
+            builder.leaf(format!("{}.prefill", self.name)),
+            builder.leaf(format!("{}.decode", self.name)),
+        ])
+    }
+
+    /// CostTree eval: fill the two fixed slots `compile` minted — `prefill` then
+    /// `decode`. The prefill slot is the INV-1 aggregating leaf: sum the per-request
+    /// `prefill.lookup_metrics` over `prefill_chunk_pairs` into the one slot
+    /// (mirrors `lookup`'s per-request parts). The decode slot collapses all decode
+    /// requests to one cell (zero metrics when none). Numerically equals the sum of
+    /// `lookup`'s parts, so `aggregate(Sum[prefill, decode])` matches `lookup().time`.
+    pub fn eval(&self, input: &FlashInferAttentionInput, buf: &mut [LeafMetrics], cursor: &mut usize) {
+        let mut prefill = LeafMetrics::ZERO;
+        for &(prefix_len, append_len) in &input.prefill_chunk_pairs {
+            prefill.add(self.prefill.lookup_metrics(&FlashinferAttnPrefillKernelInput {
+                prefix_len,
+                append_len,
+            }));
+        }
+        buf[*cursor] = prefill;
+        *cursor += 1;
+
+        buf[*cursor] = match decode_input(&input.decode_kv_lens) {
+            Some(decode_input) => self.decode.lookup_metrics(&decode_input),
+            None => LeafMetrics::ZERO,
+        };
+        *cursor += 1;
     }
 
     /// Build-time sibling of `new`: borrows only, constructs nothing, returns the

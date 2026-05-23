@@ -8,6 +8,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::common::time::Time;
+use crate::timing::{CoverageFlags, LeafMetrics, Metrics4};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LookupResult {
@@ -190,6 +191,27 @@ pub trait Probe {
     /// override this to skip the name clone and metric/warning machinery.
     fn lookup_time(&self, input: &Self::Input) -> Time {
         self.lookup(input).time
+    }
+
+    /// Metrics + coverage fast path for the CostTree eval walk (the per-leaf
+    /// `buf[slot]` value). The default builds a full `LookupResult` and narrows
+    /// it (warnings → `CoverageFlags`); `Kernel` overrides this with its
+    /// alloc-free best-of-N over the backend caches' `lookup_metrics`.
+    fn lookup_metrics(&self, input: &Self::Input) -> LeafMetrics {
+        let r = self.lookup(input);
+        let mut coverage = CoverageFlags::EMPTY;
+        for w in &r.warnings {
+            coverage |= CoverageFlags::from_kind(w.kind);
+        }
+        LeafMetrics {
+            m: Metrics4 {
+                time_ms: r.time.as_ms() as f32,
+                flops: r.flops as f32,
+                bytes: r.bytes as f32,
+                energy_j: r.energy_j as f32,
+            },
+            coverage,
+        }
     }
 }
 

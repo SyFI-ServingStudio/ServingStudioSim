@@ -179,6 +179,7 @@ mod tests {
             Arc::new(FakeModel { ms: 1.0 }),
             Rc::clone(&store),
             WorkerConfig::default(),
+            None,
         );
         let cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {

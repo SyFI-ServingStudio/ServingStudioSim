@@ -9,6 +9,7 @@
 //! and f64 cost the same on x86).
 
 use crate::timing::bridge::KernelMetrics;
+use crate::timing::CoverageKind;
 
 /// Max fractional time drop tolerated between adjacent (axis-sorted) profile
 /// points before a cache flags `OutlierKind::MonotonicityBreak`. 10% absorbs
@@ -18,8 +19,10 @@ pub(crate) const MONOTONICITY_TOLERANCE: f32 = 0.10;
 
 /// One profiled point's metrics in f32. The 1D cache stores a `Vec<Metrics4>`;
 /// the 2D cache a `Vec<Option<Metrics4>>` grid (`None` = dropped non-finite).
+/// Also the CostTree eval path's per-leaf / per-subtree unit (the `buf[slot]`
+/// values [`CostTree::aggregate`](crate::timing::CostTree) rolls up).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Metrics4 {
+pub struct Metrics4 {
     pub time_ms: f32,
     pub flops: f32,
     pub bytes: f32,
@@ -68,6 +71,102 @@ impl Metrics4 {
         self.flops *= factor;
         self.bytes *= factor;
         self.energy_j *= factor;
+    }
+
+    /// Field-wise `max(0)` copy. Mirrors the per-field `.max(0.0)` each cache
+    /// `lookup` applies before emitting a `LookupResult`, so the metrics fast
+    /// path (`Cache::lookup_metrics`) returns identical non-negative numbers.
+    pub fn clamped(self) -> Metrics4 {
+        Metrics4 {
+            time_ms: self.time_ms.max(0.0),
+            flops: self.flops.max(0.0),
+            bytes: self.bytes.max(0.0),
+            energy_j: self.energy_j.max(0.0),
+        }
+    }
+}
+
+/// The per-leaf coverage signal, packed into a `u8` — one bit per
+/// [`CoverageKind`]. This is the CostTree eval path's allocation-free analogue
+/// of the `LookupResult` `Vec<CoverageWarning>`: it keeps the analytically
+/// useful *kind* (did this leaf extrapolate off-grid? was it a JIT/no-coverage
+/// placeholder?) while dropping the per-call `detail: String` (reconstructable
+/// off the hot path from the slot name). `aggregate` ORs these up the tree, so a
+/// warning anywhere in a subtree surfaces at its root.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoverageFlags(u8);
+
+impl CoverageFlags {
+    pub const EMPTY: Self = Self(0);
+    pub const EXTRAPOLATED: Self = Self(1 << 0);
+    pub const JIT: Self = Self(1 << 1);
+    pub const NO_COVERAGE: Self = Self(1 << 2);
+
+    /// One-to-one with the runtime [`CoverageKind`] variants, for the
+    /// `lookup`-delegating defaults that narrow a `LookupResult`'s warnings.
+    pub fn from_kind(kind: CoverageKind) -> Self {
+        match kind {
+            CoverageKind::Extrapolated => Self::EXTRAPOLATED,
+            CoverageKind::Jit => Self::JIT,
+            CoverageKind::NoCoverage => Self::NO_COVERAGE,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Raw bits, for logging the per-slot coverage as a `u8` column.
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+}
+
+impl std::ops::BitOr for CoverageFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for CoverageFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+/// One cost *query* result: the numeric [`Metrics4`] plus the leaf's
+/// [`CoverageFlags`]. Distinct from the bare `Metrics4` stored/blended inside
+/// caches (kept lean for cache-line density) — this is what `lookup_metrics`,
+/// the CostTree eval buffer, and `aggregate` carry, so coverage rides alongside
+/// the numbers without bloating the profiled arrays.
+#[derive(Clone, Copy, Debug)]
+pub struct LeafMetrics {
+    pub m: Metrics4,
+    pub coverage: CoverageFlags,
+}
+
+impl LeafMetrics {
+    pub const ZERO: LeafMetrics = LeafMetrics {
+        m: Metrics4::ZERO,
+        coverage: CoverageFlags::EMPTY,
+    };
+
+    /// Serial composition (a `Sum` node, or the per-request prefill fan-in):
+    /// field-wise sum of metrics, union of coverage flags.
+    pub fn add(&mut self, other: LeafMetrics) {
+        self.m.add_scaled(other.m, 1.0);
+        self.coverage |= other.coverage;
+    }
+
+    /// Homogeneous-layer fold (`Scale{n}`): scale the metrics; coverage passes
+    /// through unchanged (the repeated layer has the same per-leaf coverage).
+    pub fn scale(&mut self, factor: f32) {
+        self.m.scale(factor);
     }
 }
 

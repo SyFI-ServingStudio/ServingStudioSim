@@ -22,7 +22,10 @@ use crate::timing::kernels::{
     RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, Describe, JitPlan, LookupResult, PerfApiBridge};
+use crate::timing::{
+    BuildError, CostNode, CostTree, CostTreeBuilder, Describe, FlatCostNode, JitPlan, LeafMetrics,
+    LookupResult, PerfApiBridge,
+};
 use crate::worklet::{
     AttnLocalWorklet, AttnLocalWorkletConfig, AttnLocalWorkletInput, AttnLocalWorkletResolved,
     PostAttnLocalWorklet, PostAttnLocalWorkletConfig, PostAttnLocalWorkletInput,
@@ -72,6 +75,11 @@ pub struct Llama3DenseModel {
     pub embed: Op<ElementwiseKernel>,
     pub final_norm: Op<RmsNormKernel>,
     pub lm_head: Op<SingleGemmKernel>,
+    /// CostTree structure compiled once at build (flattened form) + its slot
+    /// count, so the per-iter `cost_whole_iter_metrics` path only evals leaves +
+    /// aggregates — no per-tick recompile/`String` minting.
+    cost_flat: Vec<FlatCostNode>,
+    n_slots: usize,
 }
 
 pub fn build_configs(model: &ModelCfg, parallel: &ParallelCfg) -> Llama3DenseConfigs {
@@ -241,7 +249,7 @@ pub fn build(
         Arc::new(SingleGemmKernel::init(lm_head_name, resolved.lm_head, bridge)?),
     );
 
-    Ok(Llama3DenseModel {
+    let mut model = Llama3DenseModel {
         pre_attn,
         attn,
         post_attn,
@@ -251,7 +259,110 @@ pub fn build(
         name: model_name,
         num_layers,
         kv_bytes_per_token,
-    })
+        cost_flat: Vec::new(),
+        n_slots: 0,
+    };
+
+    // Compile the CostTree structure once and cache its flattened form on the
+    // model, so the per-iter metrics path skips recompiling / minting names.
+    let tree = model.cost_tree();
+    model.cost_flat = tree.flatten();
+    model.n_slots = tree.n_slots();
+
+    // Print the compiled cost-tree structure once after build (M1 deliverable).
+    tracing::info!(
+        "[build] cost tree ({} leaf slots):\n{}",
+        tree.n_slots(),
+        tree.describe()
+    );
+
+    // One-time CostTree parity self-check (M2): on a representative mixed batch
+    // (chunked + fresh prefill and a decode batch — exercises both attention
+    // leaves), the compiled eval+aggregate path must reproduce the trusted
+    // `cost_whole_iter_time` fold up to f32 rounding. Validated once at build,
+    // not per tick, since the structure is fixed thereafter.
+    model.assert_cost_tree_parity();
+
+    Ok(model)
+}
+
+impl Llama3DenseModel {
+    /// Compile the per-iteration cost *structure* once (CostTree, milestone 1):
+    /// `Sum( embed, Scale{num_layers}( Sum(pre_attn, attn, post_attn) ),
+    /// final_norm, lm_head )`. The `Scale` folds the homogeneous layers — the
+    /// per-layer leaves are minted once (not `×num_layers`), matching the
+    /// `cost_whole_iter_time` fold. Structure only; per-iter eval lands later.
+    pub fn cost_tree(&self) -> CostTree {
+        let mut b = CostTreeBuilder::new();
+        let embed = self.embed.compile(&mut b);
+        let layer = CostNode::Scale {
+            n: self.num_layers,
+            child: Box::new(CostNode::Sum(vec![
+                self.pre_attn.compile(&mut b),
+                self.attn.compile(&mut b),
+                self.post_attn.compile(&mut b),
+            ])),
+        };
+        let final_norm = self.final_norm.compile(&mut b);
+        let lm_head = self.lm_head.compile(&mut b);
+        b.finish(CostNode::Sum(vec![embed, layer, final_norm, lm_head]))
+    }
+
+    /// CostTree eval (milestone 2): stream this iteration's per-leaf [`Metrics4`]
+    /// into `buf` in the exact order [`cost_tree`](Self::cost_tree) minted slots
+    /// (embed, then ONE layer's pre/attn/post — the `Scale{num_layers}` fold
+    /// multiplies it, INV-3 — then final_norm, lm_head). The cursor must end at
+    /// `buf.len()`; otherwise the eval walk and the compiled slot list disagree.
+    fn eval_buf(&self, batch: &UnifiedArchInput, buf: &mut [LeafMetrics]) {
+        let g = &batch.groups[0];
+        let m = g.batch_tokens;
+        let mut cursor = 0;
+        self.embed
+            .eval(&ElementwiseKernelInput { num_tokens: m }, buf, &mut cursor);
+        self.pre_attn
+            .eval(&PreAttnLocalWorkletInput { batch_tokens: m }, buf, &mut cursor);
+        self.attn.eval(
+            &AttnLocalWorkletInput {
+                prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                decode_kv_lens: g.decode_kv_lens.clone(),
+            },
+            buf,
+            &mut cursor,
+        );
+        self.post_attn
+            .eval(&PostAttnLocalWorkletInput { batch_tokens: m }, buf, &mut cursor);
+        self.final_norm
+            .eval(&RmsNormKernelInput { m }, buf, &mut cursor);
+        self.lm_head
+            .eval(&SingleGemmKernelInput { m }, buf, &mut cursor);
+        debug_assert_eq!(cursor, buf.len(), "eval cursor must fill every slot");
+    }
+
+    /// Compare the compiled CostTree path against the trusted `cost_whole_iter_time`
+    /// fold on a representative batch; log OK or a drift warning. f32 metrics +
+    /// the `Scale` fold differ from the integer-ns fold only in low bits, so a
+    /// 0.1% relative band is the parity bar.
+    fn assert_cost_tree_parity(&self) {
+        let probe = UnifiedArchInput {
+            groups: vec![crate::arch::contract::ArchGroupInput {
+                batch_tokens: 194,
+                prefill_chunk_pairs: vec![(0, 128), (256, 64)],
+                decode_kv_lens: vec![4096, 8192],
+                ..Default::default()
+            }],
+            tokens_per_source_rank: Vec::new(),
+        };
+        let tree_ms = self.cost_whole_iter_metrics(&probe).m.time_ms as f64;
+        let fold_ms = self.cost_whole_iter_time(&probe).as_ms();
+        let rel = (tree_ms - fold_ms).abs() / fold_ms.max(1e-9);
+        if rel > 1e-3 {
+            tracing::warn!(
+                "[build] CostTree parity drift: tree={tree_ms:.6}ms vs fold={fold_ms:.6}ms (rel {rel:.2e})"
+            );
+        } else {
+            tracing::info!("[build] CostTree parity OK: {fold_ms:.4}ms (rel {rel:.2e})");
+        }
+    }
 }
 
 impl IterwiseUnifiedModel for Llama3DenseModel {
@@ -292,6 +403,50 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
             + Time::from_ns(per_layer.as_ns() * self.num_layers as u64)
             + final_norm
             + lm_head
+    }
+
+    /// Per-iter cost via the cached compiled CostTree: eval the leaves once into a
+    /// flat buffer, then roll up `cost_flat` (the `Scale` fold supplies the
+    /// `×num_layers`). Numerically the CostTree analogue of [`Self::cost_whole_iter`];
+    /// `.time_ms` matches [`Self::cost_whole_iter_time`] up to f32 fold rounding.
+    fn cost_whole_iter_metrics(&self, batch: &UnifiedArchInput) -> LeafMetrics {
+        assert_eq!(
+            batch.groups.len(),
+            1,
+            "Llama3 dense local has exactly one HP group"
+        );
+        let mut buf = vec![LeafMetrics::ZERO; self.n_slots];
+        self.eval_buf(batch, &mut buf);
+        CostTree::aggregate(&self.cost_flat, &buf)
+    }
+
+    /// Slot names in compile order = the `cost_tree()` manifest. Recompiled once
+    /// at logger setup (off the hot path); the names aren't stored on the model.
+    fn cost_log_manifest(&self) -> Vec<String> {
+        self.cost_tree()
+            .slots
+            .into_iter()
+            .map(|s| s.name)
+            .collect()
+    }
+
+    /// Fill `slots` with the per-leaf [`LeafMetrics`] for this iter (reusing the
+    /// caller's `Vec` capacity), then aggregate the cached structure — one eval
+    /// pass feeds both the `cost_log` row and the clock.
+    fn cost_whole_iter_with_slots(
+        &self,
+        batch: &UnifiedArchInput,
+        slots: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
+        assert_eq!(
+            batch.groups.len(),
+            1,
+            "Llama3 dense local has exactly one HP group"
+        );
+        slots.clear();
+        slots.resize(self.n_slots, LeafMetrics::ZERO);
+        self.eval_buf(batch, slots);
+        CostTree::aggregate(&self.cost_flat, slots)
     }
 
     fn cost_whole_iter(&self, batch: &UnifiedArchInput) -> LookupResult {

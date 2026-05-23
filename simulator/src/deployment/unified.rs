@@ -8,7 +8,7 @@
 //! by `unified_clap_matches_paramdef` (design §1.8.4). `build()` runs the
 //! Llama3-dense L4 cascade and assembles a `simple_dp` `Flow`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -53,6 +53,18 @@ pub struct UnifiedParams {
     /// Slower (per-iter tree allocation); off by default.
     #[arg(long, default_value_t = false)]
     pub cost_verbose: bool,
+
+    /// Use the compiled CostTree eval+aggregate path for the per-iter clock
+    /// (full per-slot metrics, flat O(slots) writes — no `LookupResult` tree).
+    /// Takes precedence over `--cost-verbose`; off by default.
+    #[arg(long, default_value_t = false)]
+    pub cost_tree: bool,
+
+    /// Emit a per-iteration `cost_log` parquet (the CostTree per-slot breakdown)
+    /// to `<log_dir>/raw/cost_log.parquet`, plus a `cost_manifest.json` sidecar
+    /// naming the slots. Implies the CostTree clock path. Off by default.
+    #[arg(long, default_value_t = false)]
+    pub cost_log: bool,
 
     /// Chunked-prefill cap: max tokens per batch (omit = unlimited).
     #[arg(long)]
@@ -128,9 +140,12 @@ impl Deployment for UnifiedDeployment {
         let worker_config = WorkerConfig {
             attn_kv_bytes: (args.attn_gpu_memory_gb * 1e9) as u64,
             cost_verbose: args.cost_verbose,
+            cost_tree: args.cost_tree,
+            cost_log: args.cost_log,
             ..WorkerConfig::default()
         };
-        let factory = UnifiedWorkerFactory::new(model, store, worker_config);
+        let log_dir: Option<PathBuf> = Some(args.io.log_dir.clone());
+        let factory = UnifiedWorkerFactory::new(model, store, worker_config, log_dir);
         let cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
                 pool: PoolId(0),

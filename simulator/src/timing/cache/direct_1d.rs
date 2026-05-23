@@ -2,7 +2,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::common::time::Time;
 use crate::timing::bridge::KernelMetrics;
-use crate::timing::cache::interp::{Metrics4, MONOTONICITY_TOLERANCE};
+use crate::timing::cache::interp::{CoverageFlags, LeafMetrics, Metrics4, MONOTONICITY_TOLERANCE};
 use crate::timing::cache::{Cache, OutlierKind, OutlierWarning};
 use crate::timing::sweep::SweepGrid;
 use crate::timing::{CoverageKind, CoverageWarning, LookupResult};
@@ -184,6 +184,39 @@ impl Cache for Cache1DDirect {
         match self.buckets[idx] {
             Some(m) => Time::from_ms((m.time_ms * scale).max(0.0) as f64),
             None => Time::ZERO,
+        }
+    }
+
+    fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
+        assert_eq!(
+            sweep.len(),
+            1,
+            "Cache1DDirect lookup requires one coordinate"
+        );
+        if sweep[0].is_nan() {
+            return LeafMetrics {
+                m: Metrics4::ZERO,
+                coverage: CoverageFlags::NO_COVERAGE,
+            };
+        }
+        let (idx, scale, outside) = self.index(sweep[0] as f32);
+        match self.buckets[idx] {
+            Some(mut m) => {
+                m.scale(scale);
+                LeafMetrics {
+                    m: m.clamped(),
+                    coverage: if outside {
+                        CoverageFlags::EXTRAPOLATED
+                    } else {
+                        CoverageFlags::EMPTY
+                    },
+                }
+            }
+            // Landed bucket's fit-time sample was dropped as non-finite.
+            None => LeafMetrics {
+                m: Metrics4::ZERO,
+                coverage: CoverageFlags::NO_COVERAGE,
+            },
         }
     }
 }

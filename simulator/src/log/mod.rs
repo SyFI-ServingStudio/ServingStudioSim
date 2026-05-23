@@ -9,15 +9,17 @@
 //! `request_slo`); the worker-internal streams (`cost_log` / `kv_snapshot` /
 //! `network_event`) land with L5 logging.
 
+pub mod cost_logger;
 pub mod parquet_writer;
 pub mod rows;
 pub mod schemas;
 pub mod session;
 
+pub use cost_logger::CostLogger;
 pub use parquet_writer::StreamingParquetWriter;
-pub use rows::{FinalPhase, RequestSloEntry, RequestStateEntry};
+pub use rows::{CostLogEntry, FinalPhase, RequestSloEntry, RequestStateEntry};
 pub use schemas::{
-    cost_log_envelope_schema, kv_snapshot_schema, network_event_schema, request_slo_schema,
-    request_state_schema, ALL_STREAMS,
+    cost_log_envelope_schema, cost_log_schema, kv_snapshot_schema, network_event_schema,
+    request_slo_schema, request_state_schema, ALL_STREAMS,
 };
 pub use session::LoggerSession;

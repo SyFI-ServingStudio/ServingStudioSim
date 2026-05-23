@@ -13,7 +13,10 @@
 use crate::common::Time;
 use crate::op::attention::{FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp};
 use crate::timing::bridge::DType;
-use crate::timing::{BuildError, Describe, JitPlan, LookupResult, PerfApiBridge};
+use crate::timing::{
+    BuildError, CostNode, CostTreeBuilder, Describe, JitPlan, LeafMetrics, LookupResult,
+    PerfApiBridge,
+};
 
 /// Raw config; mirrors `FlashInferAttentionConfig` (no partition under `Local`).
 #[derive(Clone, Debug)]
@@ -106,6 +109,23 @@ impl AttnLocalWorklet {
             decode_kv_lens: input.decode_kv_lens.clone(),
         };
         self.attn.lookup_time(&op_in)
+    }
+
+    /// CostTree compile (M1): delegate to the attention op (its two fixed
+    /// prefill/decode leaves). No extra wrapper node — composites are anonymous,
+    /// so a single-child sum would be noise.
+    pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        self.attn.compile(builder)
+    }
+
+    /// CostTree eval: delegate to the attn op (its two prefill/decode slots),
+    /// mapping the worklet input to the op input — mirrors `compile`/`lookup`.
+    pub fn eval(&self, input: &AttnLocalWorkletInput, buf: &mut [LeafMetrics], cursor: &mut usize) {
+        let op_in = FlashInferAttentionInput {
+            prefill_chunk_pairs: input.prefill_chunk_pairs.clone(),
+            decode_kv_lens: input.decode_kv_lens.clone(),
+        };
+        self.attn.eval(&op_in, buf, cursor);
     }
 }
 

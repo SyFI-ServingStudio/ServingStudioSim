@@ -11,10 +11,13 @@
 //!     `&mut RequestStore` parameter). Logger is deferred to L7.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{RequestId, SharedRequests, Time, WorkerId};
+use crate::log::{CostLogEntry, CostLogger};
+use crate::timing::LeafMetrics;
 use crate::worker::admission_helpers::{Batch, KvAdmission, LoadBalance};
 
 // ── FSM types ────────────────────────────────────────────────────────────────
@@ -71,6 +74,17 @@ pub struct WorkerConfig {
     /// tick-loop cost otherwise. `true`: build the full `LookupResult` tree
     /// (per-leaf breakdown for cost logging/inspection), at ~tree-allocation cost.
     pub cost_verbose: bool,
+    /// Use the compiled CostTree eval+aggregate path for the per-iter clock
+    /// (`cost_whole_iter_metrics`): full per-slot metrics with O(slots) flat
+    /// writes instead of the O(nodes) `LookupResult` tree. Takes precedence over
+    /// `cost_verbose` when set. Off by default (the time-only fold is fastest).
+    pub cost_tree: bool,
+    /// Emit a per-iteration `cost_log` row (CostTree per-slot breakdown) to
+    /// `<log_dir>/raw/cost_log.parquet`. Implies the CostTree clock path (the row
+    /// and the clock share one eval). The `<log_dir>` is supplied to the worker
+    /// separately (the factory carries it); this flag only gates the behavior so
+    /// `WorkerConfig` stays `Copy`.
+    pub cost_log: bool,
 }
 
 impl Default for WorkerConfig {
@@ -80,6 +94,8 @@ impl Default for WorkerConfig {
             balance: LoadBalance::Single,
             attn_kv_bytes: 80_000_000_000, // 80 GB
             cost_verbose: false,
+            cost_tree: false,
+            cost_log: false,
         }
     }
 }
@@ -121,6 +137,10 @@ pub struct BareboneWorker<M: IterwiseUnifiedModel> {
     runtime: WorkerRuntime,
     batches: Vec<Batch>, // length 1 in barebone
     events: Vec<WorkerEvent>,
+    /// Per-iteration `cost_log` writer (`Some` iff `config.cost_log` + a log_dir
+    /// was supplied). `cost_slots` is the reused per-slot eval buffer.
+    cost_logger: Option<CostLogger>,
+    cost_slots: Vec<LeafMetrics>,
 }
 
 impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
@@ -129,10 +149,23 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         model: Arc<M>,
         requests: SharedRequests,
         config: WorkerConfig,
+        cost_log_dir: Option<PathBuf>,
     ) -> Self {
         // The worker sizes its own KvPool: memory allowance ÷ the model's
         // per-token KV footprint (L5 owns the division; arch owns the footprint).
         let kv_capacity = (config.attn_kv_bytes / model.kv_bytes_per_token().max(1)).max(1);
+        // Open the cost_log writer (+ manifest sidecar) only when asked. A failure
+        // to open disables logging with a warning rather than aborting the sim.
+        let cost_logger = match (config.cost_log, cost_log_dir) {
+            (true, Some(dir)) => match CostLogger::open(&dir, &model.cost_log_manifest()) {
+                Ok(logger) => Some(logger),
+                Err(e) => {
+                    tracing::warn!("cost_log disabled: failed to open writer: {e}");
+                    None
+                }
+            },
+            _ => None,
+        };
         Self {
             id,
             model,
@@ -141,6 +174,8 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
             runtime: WorkerRuntime::new(),
             batches: vec![Batch::new(0, kv_capacity)],
             events: Vec::new(),
+            cost_logger,
+            cost_slots: Vec::new(),
         }
     }
 
@@ -251,7 +286,31 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         // The clock needs only the total time. Default (time-only) skips building
         // the per-iter `LookupResult` tree (the dominant tick-loop cost); verbose
         // builds the full tree for cost breakdown/logging.
-        let cost_time = if self.config.cost_verbose {
+        let cost_time = if self.cost_logger.is_some() {
+            // One CostTree eval pass feeds both the cost_log row and the clock.
+            let agg = self
+                .model
+                .cost_whole_iter_with_slots(&arch_input, &mut self.cost_slots);
+            let cost_time = Time::from_ms(agg.m.time_ms as f64);
+            let entry = CostLogEntry {
+                worker_id: self.id.0,
+                batch_id: self.runtime.iter_counter as u64,
+                wall_start_ms: now.as_ms(),
+                wall_end_ms: (now + cost_time).as_ms(),
+                total_time_ms: agg.m.time_ms as f64,
+                energy_j: agg.m.energy_j as f64,
+                slot_time_ms: self.cost_slots.iter().map(|l| l.m.time_ms).collect(),
+                slot_coverage: self.cost_slots.iter().map(|l| l.coverage.bits()).collect(),
+            };
+            if let Some(logger) = self.cost_logger.as_mut() {
+                if let Err(e) = logger.record(entry) {
+                    tracing::warn!("cost_log record failed: {e}");
+                }
+            }
+            cost_time
+        } else if self.config.cost_tree {
+            Time::from_ms(self.model.cost_whole_iter_metrics(&arch_input).m.time_ms as f64)
+        } else if self.config.cost_verbose {
             self.model.cost_whole_iter(&arch_input).time
         } else {
             self.model.cost_whole_iter_time(&arch_input)
@@ -477,6 +536,7 @@ mod tests {
             model,
             Rc::clone(&store),
             WorkerConfig::default(),
+            None,
         );
         w.enqueue(WorkerMsg::Request(RequestId(0)));
 
@@ -503,6 +563,7 @@ mod tests {
             model,
             Rc::clone(&store),
             WorkerConfig::default(),
+            None,
         );
         for id in [0, 1, 2] {
             w.enqueue(WorkerMsg::Request(RequestId(id)));

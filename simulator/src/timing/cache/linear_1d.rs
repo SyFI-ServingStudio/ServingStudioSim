@@ -2,7 +2,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::common::time::Time;
 use crate::timing::bridge::KernelMetrics;
-use crate::timing::cache::interp::{locate, Metrics4, MONOTONICITY_TOLERANCE};
+use crate::timing::cache::interp::{locate, CoverageFlags, LeafMetrics, Metrics4, MONOTONICITY_TOLERANCE};
 use crate::timing::cache::{Cache, OutlierKind, OutlierWarning};
 use crate::timing::sweep::SweepGrid;
 use crate::timing::{CoverageKind, CoverageWarning, LookupResult};
@@ -144,6 +144,32 @@ impl Cache for Cache1DLinear {
         }
         let (m, _) = self.interpolate(sweep[0] as f32);
         Time::from_ms(m.time_ms.max(0.0) as f64)
+    }
+
+    fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
+        assert_eq!(
+            sweep.len(),
+            1,
+            "Cache1DLinear lookup requires one coordinate"
+        );
+        let x = sweep[0];
+        if self.xs.is_empty() || x.is_nan() {
+            // Empty cache / NaN coord → zero placeholder, flagged NoCoverage
+            // (mirrors `lookup`'s `CoverageKind::NoCoverage` leaf).
+            return LeafMetrics {
+                m: Metrics4::ZERO,
+                coverage: CoverageFlags::NO_COVERAGE,
+            };
+        }
+        let (m, extrapolated) = self.interpolate(x as f32);
+        LeafMetrics {
+            m: m.clamped(),
+            coverage: if extrapolated {
+                CoverageFlags::EXTRAPOLATED
+            } else {
+                CoverageFlags::EMPTY
+            },
+        }
     }
 }
 

@@ -15,7 +15,10 @@ pub mod ssm;
 use std::sync::Arc;
 
 use crate::common::time::Time;
-use crate::timing::{BuildError, Describe, DryRun, JitPlan, LookupResult, PerfApiBridge, Probe};
+use crate::timing::{
+    BuildError, CostNode, CostTreeBuilder, Describe, DryRun, JitPlan, LeafMetrics, LookupResult,
+    PerfApiBridge, Probe,
+};
 
 /// Generic single-kernel atomic op: names an L1 kernel and forwards its lookup.
 /// `name` is the owned dotted path injected at the L4/L3 wiring point; the same
@@ -43,6 +46,22 @@ impl<K: Probe> Op<K> {
     /// with `lookup().time` (sum-of-one == the child's time).
     pub fn lookup_time(&self, input: &K::Input) -> Time {
         self.kernel.lookup_time(input)
+    }
+
+    /// CostTree compile (M1): an atomic op is one leaf, named by its dotted path.
+    /// The leaf's per-iter metrics + kernel `kind` bind in the eval milestone; the
+    /// structure here needs only the name (mirrors the single-child `lookup`).
+    pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        builder.leaf(self.name.clone())
+    }
+
+    /// CostTree eval: write this op's one leaf into `buf[*cursor]` and advance the
+    /// cursor — the inverse of `compile`'s single `leaf()`. Walking `eval` in the
+    /// same child order `compile` minted slots keeps `cursor` aligned with the
+    /// slot index (INV-2). The leaf metric is the kernel's best-of-N `Metrics4`.
+    pub fn eval(&self, input: &K::Input, buf: &mut [LeafMetrics], cursor: &mut usize) {
+        buf[*cursor] = self.kernel.lookup_metrics(input);
+        *cursor += 1;
     }
 }
 
@@ -72,7 +91,9 @@ impl<K: Describe> Describe for Op<K> {
 mod tests {
     use super::Op;
     use crate::common::time::Time;
-    use crate::timing::{Describe, LookupResult, Probe};
+    use crate::timing::{
+        CostNode, CostTree, CostTreeBuilder, Describe, LeafMetrics, LookupResult, Probe,
+    };
     use std::sync::Arc;
 
     /// Mock `Probe` + `Describe` standing in for an L1 kernel, so the op-wrapping
@@ -141,6 +162,18 @@ mod tests {
     }
 
     #[test]
+    fn op_compile_emits_one_leaf_named_by_path() {
+        use crate::timing::{CostNode, CostTreeBuilder};
+        let op = fake_op();
+        let mut b = CostTreeBuilder::new();
+        let node = op.compile(&mut b);
+        assert_eq!(node, CostNode::Leaf(0));
+        let tree = b.finish(node);
+        assert_eq!(tree.n_slots(), 1);
+        assert_eq!(tree.slots[0].name, "model.attn.o_proj");
+    }
+
+    #[test]
     fn op_describe_renders_two_level_tree() {
         let op = fake_op();
         let mut out = String::new();
@@ -169,6 +202,17 @@ mod tests {
                 self.name.clone(),
                 vec![self.gate_up.lookup(&()), self.down.lookup(&())],
             )
+        }
+    }
+
+    impl FakeFfn {
+        fn compile(&self, b: &mut CostTreeBuilder) -> CostNode {
+            CostNode::Sum(vec![self.gate_up.compile(b), self.down.compile(b)])
+        }
+
+        fn eval(&self, buf: &mut [LeafMetrics], cursor: &mut usize) {
+            self.gate_up.eval(&(), buf, cursor);
+            self.down.eval(&(), buf, cursor);
         }
     }
 
@@ -215,6 +259,28 @@ mod tests {
         assert_eq!(result.time.as_ms(), 4.5);
         assert_eq!(result.flops, 15);
         assert_eq!(result.bytes, 28);
+    }
+
+    #[test]
+    fn compound_op_eval_aggregate_matches_lookup() {
+        // The compile→eval→aggregate triangle must reproduce `lookup`'s totals
+        // with no bridge: cursor walks slots in `compile` order, `aggregate` sums.
+        let ffn = fake_ffn();
+        let mut b = CostTreeBuilder::new();
+        let root = ffn.compile(&mut b);
+        let tree = b.finish(root);
+        let flat = tree.flatten();
+
+        let mut buf = vec![LeafMetrics::ZERO; tree.n_slots()];
+        let mut cursor = 0;
+        ffn.eval(&mut buf, &mut cursor);
+        assert_eq!(cursor, tree.n_slots(), "eval must fill every slot");
+
+        let agg = CostTree::aggregate(&flat, &buf).m;
+        let want = ffn.lookup();
+        assert_eq!(agg.time_ms as f64, want.time.as_ms());
+        assert_eq!(agg.flops as u64, want.flops);
+        assert_eq!(agg.bytes as u64, want.bytes);
     }
 
     #[test]

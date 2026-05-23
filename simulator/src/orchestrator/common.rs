@@ -3,6 +3,7 @@
 //! the module root holds only the `Flow` contract and the module wiring. See L6
 //! design.md §Organization rule (`common.rs # optional shared vocabulary`).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::IterwiseUnifiedModel;
@@ -33,23 +34,38 @@ pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel> {
     pub model: Arc<M>,
     pub requests: SharedRequests,
     pub worker_config: WorkerConfig,
+    /// Run log dir, handed to each worker for its `cost_log` writer (only used
+    /// when `worker_config.cost_log` is set). `None` disables cost logging.
+    pub log_dir: Option<PathBuf>,
 }
 
 impl<M: IterwiseUnifiedModel> UnifiedWorkerFactory<M> {
-    pub fn new(model: Arc<M>, requests: SharedRequests, worker_config: WorkerConfig) -> Self {
+    pub fn new(
+        model: Arc<M>,
+        requests: SharedRequests,
+        worker_config: WorkerConfig,
+        log_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             model,
             requests,
             worker_config,
+            log_dir,
         }
     }
 
     pub fn build(&self, idx: u16) -> BareboneWorker<M> {
+        let cost_log_dir = if self.worker_config.cost_log {
+            self.log_dir.clone()
+        } else {
+            None
+        };
         BareboneWorker::new(
             WorkerId(idx),
             Arc::clone(&self.model),
             std::rc::Rc::clone(&self.requests),
             self.worker_config,
+            cost_log_dir,
         )
     }
 }

@@ -8,6 +8,7 @@
 
 use crate::common::time::Time;
 use crate::timing::bridge::{BuildError, KernelKind, KernelMetrics};
+use crate::timing::cache::interp::LeafMetrics;
 use crate::timing::cache::{build_cache, Cache, CacheKind, OutlierWarning};
 use crate::timing::sweep::SweepGrid;
 use crate::timing::LookupResult;
@@ -55,6 +56,13 @@ impl BackendCache {
     /// `Cache::lookup_time`.
     pub(crate) fn lookup_time(&self, sweep: &[f64]) -> Time {
         self.cache.lookup_time(sweep)
+    }
+
+    /// Metrics fast path for CostTree eval — no backend stamping, the caller
+    /// (`Kernel::lookup_metrics`) selects best-of-N itself. See
+    /// `Cache::lookup_metrics`.
+    pub(crate) fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
+        self.cache.lookup_metrics(sweep)
     }
 }
 

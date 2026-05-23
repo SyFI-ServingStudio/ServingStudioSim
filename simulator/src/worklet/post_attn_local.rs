@@ -21,7 +21,10 @@ use crate::timing::kernels::{
     RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, Describe, JitPlan, LookupResult, PerfApiBridge};
+use crate::timing::{
+    BuildError, CostNode, CostTreeBuilder, Describe, JitPlan, LeafMetrics, LookupResult,
+    PerfApiBridge,
+};
 
 #[derive(Clone, Debug)]
 pub struct PostAttnLocalWorkletConfig {
@@ -199,6 +202,32 @@ impl PostAttnLocalWorklet {
             + self.up_gate.lookup_time(&gemm_in)
             + self.act.lookup_time(&act_in)
             + self.down.lookup_time(&gemm_in)
+    }
+
+    /// CostTree compile (M1): sum over the five atomic ops (o_proj, post_norm,
+    /// up_gate, act, down) — mirrors `lookup`'s child list, structure only.
+    pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        CostNode::Sum(vec![
+            self.o_proj.compile(builder),
+            self.post_norm.compile(builder),
+            self.up_gate.compile(builder),
+            self.act.compile(builder),
+            self.down.compile(builder),
+        ])
+    }
+
+    /// CostTree eval: fill o_proj, post_norm, up_gate, act, down slots in that
+    /// order — mirrors `compile`/`lookup` so `cursor` tracks the minted slots.
+    pub fn eval(&self, input: &PostAttnLocalWorkletInput, buf: &mut [LeafMetrics], cursor: &mut usize) {
+        let m = input.batch_tokens;
+        let gemm_in = SingleGemmKernelInput { m };
+        let norm_in = RmsNormKernelInput { m };
+        let act_in = ElementwiseKernelInput { num_tokens: m };
+        self.o_proj.eval(&gemm_in, buf, cursor);
+        self.post_norm.eval(&norm_in, buf, cursor);
+        self.up_gate.eval(&gemm_in, buf, cursor);
+        self.act.eval(&act_in, buf, cursor);
+        self.down.eval(&gemm_in, buf, cursor);
     }
 }
 
