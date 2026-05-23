@@ -28,7 +28,7 @@ pub trait Cache: Send + Sync {
     /// path's per-leaf value (streamed into `buf[slot]`, then rolled up by
     /// [`CostTree::aggregate`](crate::timing::CostTree)). NaN/empty → zero, fields
     /// clamped non-negative; off-grid lookups set `EXTRAPOLATED`/`NO_COVERAGE`.
-    fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics;
+    fn eval(&self, sweep: &[f64]) -> LeafMetrics;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -166,7 +166,8 @@ mod tests {
         ms: f64,
     }
     impl IterwiseUnifiedModel for FakeModel {
-        fn cost_whole_iter_metrics(&self, _b: &UnifiedArchInput) -> LeafMetrics {
+        fn eval_iter(&self, _b: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+            slots.clear();
             LeafMetrics {
                 m: Metrics4 {
                     time_ms: self.ms as f32,

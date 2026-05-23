@@ -60,7 +60,7 @@ impl Cache for Cache1DLinear {
         (Self { xs, metrics }, warnings)
     }
 
-    fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
+    fn eval(&self, sweep: &[f64]) -> LeafMetrics {
         assert_eq!(
             sweep.len(),
             1,
@@ -144,11 +144,11 @@ mod tests {
         let (cache, warnings) = Cache1DLinear::from_samples(&grid, &samples);
         assert!(warnings.is_empty());
 
-        let inside = cache.lookup_metrics(&[1.5]);
+        let inside = cache.eval(&[1.5]);
         assert_eq!(inside.m.time_ms, 2.0);
         assert!(inside.coverage.is_empty());
 
-        let outside = cache.lookup_metrics(&[3.0]);
+        let outside = cache.eval(&[3.0]);
         assert_eq!(outside.m.time_ms, 5.0);
         assert!(outside.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
@@ -191,7 +191,7 @@ mod tests {
 
         // The dropped middle point still leaves a 2-point grid that interpolates
         // 1.0→3.0 linearly across x=1..3, so lookup(2.0) ≈ 2.0.
-        let mid = cache.lookup_metrics(&[2.0]);
+        let mid = cache.eval(&[2.0]);
         assert_eq!(mid.m.time_ms, 2.0);
     }
 
@@ -225,7 +225,7 @@ mod tests {
 
         // Lookup on the empty cache returns zero, loudly flagged NoCoverage
         // (not a silent valid-looking 0-time result).
-        let result = cache.lookup_metrics(&[1.5]);
+        let result = cache.eval(&[1.5]);
         assert_eq!(result.m.time_ms, 0.0);
         assert_eq!(result.m.flops, 0.0);
         assert!(result.coverage.contains(CoverageFlags::NO_COVERAGE));
@@ -245,12 +245,12 @@ mod tests {
     }
 
     #[test]
-    fn lookup_metrics_on_empty_cache_is_zero() {
+    fn eval_on_empty_cache_is_zero() {
         let grid = SweepGrid::new(vec![vec![1.0, 2.0]]);
         let mut nan = finite_sample(0.0);
         nan.time_ms = f64::NAN;
         let (cache, _) = Cache1DLinear::from_samples(&grid, &[nan.clone(), nan]);
-        let leaf = cache.lookup_metrics(&[1.5]);
+        let leaf = cache.eval(&[1.5]);
         assert_eq!(leaf.m.time_ms, 0.0);
         assert!(leaf.coverage.contains(CoverageFlags::NO_COVERAGE));
     }
@@ -261,7 +261,7 @@ mod tests {
         let (cache, _) =
             Cache1DLinear::from_samples(&grid, &[finite_sample(1.0), finite_sample(3.0)]);
 
-        let leaf = cache.lookup_metrics(&[f64::NAN]);
+        let leaf = cache.eval(&[f64::NAN]);
         assert_eq!(leaf.m.time_ms, 0.0);
         assert!(leaf.coverage.contains(CoverageFlags::NO_COVERAGE));
     }

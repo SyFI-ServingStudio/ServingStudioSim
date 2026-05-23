@@ -1,7 +1,7 @@
 //! `worklet` (L3) — model-module-level op compositions with a CostTree
 //! `compile` / `eval` pair. Each worklet is a hand-written struct of L2 op slots
 //! exposing (`*Config` / `*Resolved` / `*Input` / `Self` / `resolve_config` /
-//! `init_ops` / `compile` / `eval`).
+//! `build` / `compile` / `eval`).
 //! See docs/detailed_design/L3/design.md.
 //!
 //! Current set: the three `Local` worklets of a dense decoder layer

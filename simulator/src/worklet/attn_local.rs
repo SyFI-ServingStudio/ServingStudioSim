@@ -2,9 +2,9 @@
 //! `FlashInferAttentionOp`. `Local` group suffix (L3 §1.5): 1 GPU, no HP split,
 //! no collective.
 //!
-//! `FlashInferAttentionOp` predates the worklet shape — it exposes `new` /
+//! `FlashInferAttentionOp` predates the worklet shape — it exposes `build` /
 //! `compile` / `eval` (no `*Resolved`). So this worklet's `resolve_config` just
-//! bakes a `FlashInferAttentionConfig`; `init_ops` calls `FlashInferAttentionOp::new`.
+//! bakes a `FlashInferAttentionConfig`; `build` calls `FlashInferAttentionOp::build`.
 //!
 //! `gpu_name` rides in the config (L3 §1.6 / `gpu_name in *KernelConfig`); the
 //! `*Input` is pure shape.
@@ -63,12 +63,12 @@ impl AttnLocalWorklet {
         }
     }
 
-    pub fn init_ops(
+    pub fn build(
         name: String,
         resolved: AttnLocalWorkletResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
-        let attn = FlashInferAttentionOp::new(format!("{name}.attn"), resolved.attn.clone(), bridge)?;
+        let attn = FlashInferAttentionOp::build(format!("{name}.attn"), resolved.attn.clone(), bridge)?;
         Ok(Self {
             name,
             attn,

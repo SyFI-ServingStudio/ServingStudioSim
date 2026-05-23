@@ -1,6 +1,6 @@
 //! Single GEMM kernel: one cached perf model per `(n, k, dtype)` config.
 //!
-//! Everything generic (init / lookup_metrics / the `Probe` impl /
+//! Everything generic (build / eval / the `Probe` impl /
 //! for-backend loops) lives in `engine::Kernel<S>`. This file declares the
 //! GEMM-specific Config / Input, the `KIND` wire string, and the `enumerate`
 //! body that lifts (config, sweep coord, backend) to the on-wire

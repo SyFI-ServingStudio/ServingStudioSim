@@ -1,7 +1,7 @@
 //! Per-backend wrapper around a fitted `Box<dyn Cache>`.
 //!
 //! `*Kernel` holds a `Vec<BackendCache>` (one per entry in
-//! `*KernelConfig.backends`) and runs best-of-N over their `.lookup_metrics()`
+//! `*KernelConfig.backends`) and runs best-of-N over their `.eval()`
 //! results. Keeping this struct in its own file isolates the wrapping concern
 //! from the abstract `Cache` trait and its variants in `cache/mod.rs`.
 
@@ -11,7 +11,7 @@ use crate::timing::cache::{build_cache, Cache, CacheKind, OutlierWarning};
 use crate::timing::sweep::SweepGrid;
 
 /// Per-backend cache wrapper: a fitted `Box<dyn Cache>`. `*Kernel` runs
-/// best-of-N over a `Vec<BackendCache>` via `lookup_metrics`.
+/// best-of-N over a `Vec<BackendCache>` via `eval`.
 pub(crate) struct BackendCache {
     cache: Box<dyn Cache>,
 }
@@ -28,10 +28,10 @@ impl BackendCache {
         Ok((Self { cache }, warnings))
     }
 
-    /// Metrics fast path for CostTree eval — the caller (`Kernel::lookup_metrics`)
-    /// selects best-of-N itself. See `Cache::lookup_metrics`.
-    pub(crate) fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
-        self.cache.lookup_metrics(sweep)
+    /// Metrics fast path for CostTree eval — the caller (`Kernel::eval`)
+    /// selects best-of-N itself. See `Cache::eval`.
+    pub(crate) fn eval(&self, sweep: &[f64]) -> LeafMetrics {
+        self.cache.eval(sweep)
     }
 }
 
@@ -55,7 +55,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_cache_lookup_metrics_interpolates() {
+    fn backend_cache_eval_interpolates() {
         let grid = SweepGrid::new(vec![vec![1.0, 2.0]]);
         let (cache, _warnings) = BackendCache::fit(
             "single_gemm",
@@ -67,7 +67,7 @@ mod tests {
         .expect("fit must succeed for a finite 1D batch");
 
         // Midpoint between the two profiled times (1.0, 3.0) → 2.0 ms.
-        let leaf = cache.lookup_metrics(&[1.5]);
+        let leaf = cache.eval(&[1.5]);
         assert_eq!(leaf.m.time_ms, 2.0);
     }
 }

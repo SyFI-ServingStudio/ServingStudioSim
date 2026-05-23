@@ -102,7 +102,7 @@ impl Cache for Cache1DDirect {
         )
     }
 
-    fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
+    fn eval(&self, sweep: &[f64]) -> LeafMetrics {
         assert_eq!(
             sweep.len(),
             1,
@@ -212,7 +212,7 @@ mod tests {
 
         // Each layer adds exactly one component over the previous, isolating where
         // the ~12ns goes: arithmetic vs. the dependent heap load vs. the slice +
-        // LeafMetrics plumbing that `lookup_metrics` adds on top.
+        // LeafMetrics plumbing that `eval` adds on top.
         run("baseline (return x)", &|x| x);
         run("index() only (arith + clamp)", &|x| cache.index(x).0 as f32);
         run("index() + bucket load (Option match)", &|x| {
@@ -222,8 +222,8 @@ mod tests {
                 None => 0.0,
             }
         });
-        run("lookup_metrics (+ &[f64] slice + LeafMetrics)", &|x| {
-            cache.lookup_metrics(&[x as f64]).m.time_ms
+        run("eval (+ &[f64] slice + LeafMetrics)", &|x| {
+            cache.eval(&[x as f64]).m.time_ms
         });
     }
 
@@ -253,14 +253,14 @@ mod tests {
         assert!(warnings.is_empty());
 
         // Exact grid points return their bucket.
-        assert_eq!(cache.lookup_metrics(&[0.0]).m.time_ms, 1.0);
-        assert_eq!(cache.lookup_metrics(&[128.0]).m.time_ms, 3.0);
+        assert_eq!(cache.eval(&[0.0]).m.time_ms, 1.0);
+        assert_eq!(cache.eval(&[128.0]).m.time_ms, 3.0);
         // Between buckets: floor(x/64). 100→bucket1 (x=64)=2; 191→bucket2=3.
-        assert_eq!(cache.lookup_metrics(&[100.0]).m.time_ms, 2.0);
-        assert_eq!(cache.lookup_metrics(&[191.0]).m.time_ms, 3.0);
+        assert_eq!(cache.eval(&[100.0]).m.time_ms, 2.0);
+        assert_eq!(cache.eval(&[191.0]).m.time_ms, 3.0);
         // No interpolation: 192→bucket3=4 exactly.
-        assert_eq!(cache.lookup_metrics(&[192.0]).m.time_ms, 4.0);
-        assert!(cache.lookup_metrics(&[100.0]).coverage.is_empty());
+        assert_eq!(cache.eval(&[192.0]).m.time_ms, 4.0);
+        assert!(cache.eval(&[100.0]).coverage.is_empty());
     }
 
     #[test]
@@ -270,18 +270,18 @@ mod tests {
 
         // Right edge: x_right=256, rightmost time=5.0. Linear-through-origin:
         // 512 is 2× the max coordinate → 2× its value = 10.0.
-        let double = cache.lookup_metrics(&[512.0]);
+        let double = cache.eval(&[512.0]);
         assert_eq!(double.m.time_ms, 10.0);
         assert!(double.coverage.contains(CoverageFlags::EXTRAPOLATED));
 
         // Same scaling at an arbitrary far point: 9999/256 * 5.0.
-        let high = cache.lookup_metrics(&[9999.0]);
+        let high = cache.eval(&[9999.0]);
         assert!((high.m.time_ms - (9999.0 / 256.0 * 5.0)).abs() < 0.05);
         assert!(high.coverage.contains(CoverageFlags::EXTRAPOLATED));
 
         // Left edge still clamps to the first bucket (no slope through origin
         // below `start`).
-        let low = cache.lookup_metrics(&[-50.0]);
+        let low = cache.eval(&[-50.0]);
         assert_eq!(low.m.time_ms, 1.0);
         assert!(low.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
@@ -295,7 +295,7 @@ mod tests {
         // x_right=-64 and x=-32 is beyond the right edge. The documented
         // through-origin scale is x / x_right = 0.5, so the rightmost time 4.0
         // scales down to 2.0 instead of silently clamping at 4.0.
-        let result = cache.lookup_metrics(&[-32.0]);
+        let result = cache.eval(&[-32.0]);
         assert_eq!(result.m.time_ms, 2.0);
         assert!(result.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
@@ -305,7 +305,7 @@ mod tests {
         let (grid, samples) = grid_64();
         let (cache, _) = Cache1DDirect::from_samples(&grid, &samples);
 
-        let result = cache.lookup_metrics(&[f64::NAN]);
+        let result = cache.eval(&[f64::NAN]);
         assert_eq!(result.m.time_ms, 0.0);
         assert!(result.coverage.contains(CoverageFlags::NO_COVERAGE));
     }
@@ -326,11 +326,11 @@ mod tests {
         assert_eq!(warnings[0].kind, OutlierKind::NonFinite);
 
         // Landing on the dropped bucket (x=64) → NoCoverage, not a silent 0.
-        let dropped = cache.lookup_metrics(&[80.0]);
+        let dropped = cache.eval(&[80.0]);
         assert_eq!(dropped.m.time_ms, 0.0);
         assert!(dropped.coverage.contains(CoverageFlags::NO_COVERAGE));
         // Neighboring live buckets still resolve.
-        assert_eq!(cache.lookup_metrics(&[128.0]).m.time_ms, 3.0);
+        assert_eq!(cache.eval(&[128.0]).m.time_ms, 3.0);
     }
 
     #[test]

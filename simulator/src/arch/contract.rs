@@ -39,12 +39,17 @@ pub struct UnifiedArchInput {
 /// the signature (no `dyn`); L5 binds via `<M: IterwiseUnifiedModel>` generic.
 pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// Per-iter cost of the whole iteration (embedding → layers → lm_head) via the
-    /// compiled CostTree path: stream each leaf's [`LeafMetrics`] into a flat
-    /// buffer, then aggregate the cached structure (the homogeneous-layer fold
-    /// supplies `×num_layers`). `.m.time_ms` is the per-iter sim clock; the rest
-    /// is the rolled-up flops/bytes/energy + coverage. O(slots) flat writes, no
-    /// per-tick allocation.
-    fn cost_whole_iter_metrics(&self, batch: &UnifiedArchInput) -> LeafMetrics;
+    /// compiled CostTree path: stream each leaf's [`LeafMetrics`] into `slots`
+    /// (the caller's reused buffer — cleared + refilled to the manifest length),
+    /// then aggregate the cached structure (the homogeneous-layer fold supplies
+    /// `×num_layers`). Returns the aggregate: `.m.time_ms` is the per-iter sim
+    /// clock, the rest is rolled-up flops/bytes/energy + coverage. `slots` is left
+    /// holding the per-leaf breakdown so a `cost_log` row can carry it — callers
+    /// that only want the clock just ignore the buffer (filling it is free: the
+    /// eval pass materializes it either way). Models with no compiled CostTree
+    /// clear `slots` and return their fixed aggregate. O(slots) flat writes, no
+    /// per-tick allocation when the caller reuses the buffer.
+    fn eval_iter(&self, batch: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics;
 
     /// The `cost_log` manifest: the ordered slots plus the flattened aggregation
     /// nodes, so a consumer can reproduce `total_time_ms` from a row's per-slot
@@ -56,21 +61,6 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
             slots: Vec::new(),
             nodes: Vec::new(),
         }
-    }
-
-    /// Like [`Self::cost_whole_iter_metrics`], but also writes the per-slot
-    /// [`LeafMetrics`] into `slots` (cleared + refilled to the manifest length),
-    /// so a `cost_log` row can carry the breakdown. The default leaves `slots`
-    /// empty and just returns the aggregate; models with a compiled CostTree
-    /// override it to fill the per-leaf buffer in one eval pass.
-    #[allow(unused_variables)]
-    fn cost_whole_iter_with_slots(
-        &self,
-        batch: &UnifiedArchInput,
-        slots: &mut Vec<LeafMetrics>,
-    ) -> LeafMetrics {
-        slots.clear();
-        self.cost_whole_iter_metrics(batch)
     }
 
     /// KV-cache bytes one token occupies across the whole model. The worker

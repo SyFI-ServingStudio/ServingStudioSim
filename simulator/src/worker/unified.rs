@@ -265,15 +265,13 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     fn start_iter(&mut self, now: Time) -> Time {
         let arch_input = self.build_arch_input();
-        // The clock is the CostTree aggregate's time. When a cost_logger is
-        // present, the slot-filling variant emits the per-slot `cost_log` row and
-        // the clock from one eval pass; otherwise just the aggregate time.
-        let cost_time = if self.cost_logger.is_some() {
-            // One CostTree eval pass feeds both the cost_log row and the clock.
-            let agg = self
-                .model
-                .cost_whole_iter_with_slots(&arch_input, &mut self.cost_slots);
-            let cost_time = Time::from_ms(agg.m.time_ms as f64);
+        // One CostTree eval pass fills the per-slot buffer + returns the aggregate;
+        // `.m.time_ms` is the clock. Filling `cost_slots` is free (the eval pass
+        // materializes it either way), so we always pass it and only build the
+        // `cost_log` row from it when a logger is present.
+        let agg = self.model.eval_iter(&arch_input, &mut self.cost_slots);
+        let cost_time = Time::from_ms(agg.m.time_ms as f64);
+        if self.cost_logger.is_some() {
             let entry = CostLogEntry {
                 worker_id: self.id.0,
                 iter_id: self.runtime.iter_counter as u64,
@@ -292,10 +290,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                     tracing::warn!("cost_log record failed: {e}");
                 }
             }
-            cost_time
-        } else {
-            Time::from_ms(self.model.cost_whole_iter_metrics(&arch_input).m.time_ms as f64)
-        };
+        }
         self.runtime.iter_compute_start = now;
         now + cost_time
     }
@@ -477,7 +472,8 @@ mod tests {
         ms: f64,
     }
     impl IterwiseUnifiedModel for FakeModel {
-        fn cost_whole_iter_metrics(&self, _batch: &UnifiedArchInput) -> LeafMetrics {
+        fn eval_iter(&self, _batch: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+            slots.clear();
             LeafMetrics {
                 m: Metrics4 {
                     time_ms: self.ms as f32,

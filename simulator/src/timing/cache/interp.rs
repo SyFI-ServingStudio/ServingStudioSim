@@ -74,7 +74,7 @@ impl Metrics4 {
 
     /// Field-wise `max(0)` copy. Mirrors the per-field `.max(0.0)` each cache
     /// `lookup` applies before emitting a `LookupResult`, so the metrics fast
-    /// path (`Cache::lookup_metrics`) returns identical non-negative numbers.
+    /// path (`Cache::eval`) returns identical non-negative numbers.
     pub fn clamped(self) -> Metrics4 {
         Metrics4 {
             time_ms: self.time_ms.max(0.0),
@@ -128,7 +128,7 @@ impl std::ops::BitOrAssign for CoverageFlags {
 
 /// One cost *query* result: the numeric [`Metrics4`] plus the leaf's
 /// [`CoverageFlags`]. Distinct from the bare `Metrics4` stored/blended inside
-/// caches (kept lean for cache-line density) — this is what `lookup_metrics`,
+/// caches (kept lean for cache-line density) — this is what `eval`,
 /// the CostTree eval buffer, and `aggregate` carry, so coverage rides alongside
 /// the numbers without bloating the profiled arrays.
 #[derive(Clone, Copy, Debug)]

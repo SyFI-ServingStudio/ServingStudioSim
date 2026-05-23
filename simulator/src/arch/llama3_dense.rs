@@ -10,7 +10,7 @@
 //! Deviations from L4 design.md for this v1 dense vertical (see plan):
 //!   - all worklets are `Local` (tp/ep/hp = 1, no collective);
 //!   - one worklet instance per type, reused across `num_layers` in
-//!     `cost_whole_iter` with a per-layer `with_label` (not per-layer `init_ops`);
+//!     `eval_iter` with a per-layer `with_label` (not per-layer `build`);
 //!   - embedding modeled as an `ElementwiseKernel` gather placeholder.
 
 use std::sync::Arc;
@@ -77,7 +77,7 @@ pub struct Llama3DenseModel {
     pub final_norm: Op<RmsNormKernel>,
     pub lm_head: Op<SingleGemmKernel>,
     /// CostTree structure compiled once at build (flattened form) + its slot
-    /// count, so the per-iter `cost_whole_iter_metrics` path only evals leaves +
+    /// count, so the per-iter `eval_iter` path only evals leaves +
     /// aggregates — no per-tick recompile/`String` minting.
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
@@ -181,18 +181,18 @@ pub fn build(
 
     let embed = Op::new(
         embed_name.clone(),
-        Arc::new(ElementwiseKernel::init(embed_name, resolved.embed, bridge)?),
+        Arc::new(ElementwiseKernel::build(embed_name, resolved.embed, bridge)?),
     );
 
-    let pre_attn = PreAttnLocalWorklet::init_ops(
+    let pre_attn = PreAttnLocalWorklet::build(
         format!("{model_name}.pre_attn"),
         resolved.pre_attn,
         bridge,
     )?;
 
-    let attn = AttnLocalWorklet::init_ops(format!("{model_name}.attn"), resolved.attn, bridge)?;
+    let attn = AttnLocalWorklet::build(format!("{model_name}.attn"), resolved.attn, bridge)?;
 
-    let post_attn = PostAttnLocalWorklet::init_ops(
+    let post_attn = PostAttnLocalWorklet::build(
         format!("{model_name}.post_attn"),
         resolved.post_attn,
         bridge,
@@ -200,12 +200,12 @@ pub fn build(
 
     let final_norm = Op::new(
         final_norm_name.clone(),
-        Arc::new(RmsNormKernel::init(final_norm_name, resolved.final_norm, bridge)?),
+        Arc::new(RmsNormKernel::build(final_norm_name, resolved.final_norm, bridge)?),
     );
 
     let lm_head = Op::new(
         lm_head_name.clone(),
-        Arc::new(SingleGemmKernel::init(lm_head_name, resolved.lm_head, bridge)?),
+        Arc::new(SingleGemmKernel::build(lm_head_name, resolved.lm_head, bridge)?),
     );
 
     let mut model = Llama3DenseModel {
@@ -245,7 +245,7 @@ impl Llama3DenseModel {
     /// `Sum( embed, Scale{num_layers}( Sum(pre_attn, attn, post_attn) ),
     /// final_norm, lm_head )`. The `Scale` folds the homogeneous layers — the
     /// per-layer leaves are minted once (not `×num_layers`), matching the
-    /// `cost_whole_iter_time` fold. Structure only; per-iter eval lands later.
+    /// `eval_iter` fold. Structure only; per-iter eval lands later.
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let embed = self.embed.compile(&mut b);
@@ -301,21 +301,6 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
         self.kv_bytes_per_token
     }
 
-    /// Per-iter cost via the cached compiled CostTree: eval the leaves once into a
-    /// flat buffer, then roll up `cost_flat` (the `Scale` fold supplies the
-    /// `×num_layers`). Numerically the CostTree analogue of [`Self::cost_whole_iter`];
-    /// `.time_ms` matches [`Self::cost_whole_iter_time`] up to f32 fold rounding.
-    fn cost_whole_iter_metrics(&self, batch: &UnifiedArchInput) -> LeafMetrics {
-        assert_eq!(
-            batch.groups.len(),
-            1,
-            "Llama3 dense local has exactly one HP group"
-        );
-        let mut buf = vec![LeafMetrics::ZERO; self.n_slots];
-        self.eval_buf(batch, &mut buf);
-        CostTree::aggregate(&self.cost_flat, &buf)
-    }
-
     /// The compiled CostTree's serializable manifest (slots + flat aggregation
     /// nodes). Recompiled once at logger setup (off the hot path), so a consumer
     /// can reproduce `total_time_ms` from a `cost_log` row's per-slot breakdown.
@@ -323,14 +308,11 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
         self.cost_tree().manifest()
     }
 
-    /// Fill `slots` with the per-leaf [`LeafMetrics`] for this iter (reusing the
-    /// caller's `Vec` capacity), then aggregate the cached structure — one eval
-    /// pass feeds both the `cost_log` row and the clock.
-    fn cost_whole_iter_with_slots(
-        &self,
-        batch: &UnifiedArchInput,
-        slots: &mut Vec<LeafMetrics>,
-    ) -> LeafMetrics {
+    /// Per-iter cost via the cached compiled CostTree: fill `slots` with the
+    /// per-leaf [`LeafMetrics`] for this iter (reusing the caller's `Vec`
+    /// capacity), then roll up `cost_flat` (the `Scale` fold supplies the
+    /// `×num_layers`). One eval pass feeds both the `cost_log` row and the clock.
+    fn eval_iter(&self, batch: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
         assert_eq!(
             batch.groups.len(),
             1,

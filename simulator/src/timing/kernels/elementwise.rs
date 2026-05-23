@@ -2,7 +2,7 @@
 //! as one cached perf curve per `(input_bytes_per_token, output_bytes_per_token)`
 //! config, swept over `num_tokens`.
 //!
-//! Everything generic (init / lookup_metrics / the `Probe` impl /
+//! Everything generic (build / eval / the `Probe` impl /
 //! for-backend loops) lives in `engine::Kernel<S>`. This file declares the
 //! element-wise Config / Input, the `KIND` wire string, and the `enumerate`
 //! body that lifts (config, sweep coord, backend) to the on-wire `ArgsPayload`.

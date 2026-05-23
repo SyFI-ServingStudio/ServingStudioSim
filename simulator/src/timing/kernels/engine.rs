@@ -1,5 +1,5 @@
 //! Generic L1 kernel engine: per-kernel files implement `KernelSpec` once and
-//! `Kernel<S>` provides init/lookup_metrics + the `Probe` blanket impl.
+//! `Kernel<S>` provides build/eval + the `Probe` blanket impl.
 //!
 //! Engine knows nothing about specific kernel kinds: it only sees the sweep
 //! grid, the cache kind, the bridge args, and the sweep-coord projection of
@@ -28,7 +28,7 @@ pub trait KernelConfig: std::hash::Hash + Eq + Clone + std::fmt::Debug + 'static
 
     /// The GPU whose profiled rows this config caches. Part of the config
     /// identity (`Hash + Eq`), so distinct GPUs are distinct kernels / caches;
-    /// passed to the bridge at `init` (`get_times` / `count_missing`) as the DB
+    /// passed to the bridge at `build` (`get_times` / `count_missing`) as the DB
     /// `gpu_name` key.
     fn gpu_name(&self) -> &str;
 
@@ -83,7 +83,7 @@ pub struct Kernel<S: KernelSpec> {
 }
 
 impl<S: KernelSpec> Kernel<S> {
-    pub fn init(
+    pub fn build(
         name: String,
         config: S::Config,
         bridge: &PerfApiBridge,
@@ -154,11 +154,11 @@ impl<S: KernelSpec> Kernel<S> {
     /// the backend with the smallest wallclock. Selection matches `lookup` /
     /// `lookup_time` (argmin over `Time`), so the chosen backend is identical —
     /// just without the `LookupResult` name/warning machinery.
-    pub fn lookup_metrics(&self, input: &S::Input) -> LeafMetrics {
+    pub fn eval(&self, input: &S::Input) -> LeafMetrics {
         let coords = input.coords();
         self.backend_caches
             .iter()
-            .map(|backend_cache| backend_cache.lookup_metrics(&coords))
+            .map(|backend_cache| backend_cache.eval(&coords))
             .min_by_key(|leaf| Time::from_ms(leaf.m.time_ms.max(0.0) as f64))
             .expect("kernel config validation must create at least one backend cache")
     }
@@ -167,8 +167,8 @@ impl<S: KernelSpec> Kernel<S> {
 
 impl<S: KernelSpec> Probe for Kernel<S> {
     type Input = S::Input;
-    fn lookup_metrics(&self, input: &Self::Input) -> LeafMetrics {
-        Self::lookup_metrics(self, input)
+    fn eval(&self, input: &Self::Input) -> LeafMetrics {
+        Self::eval(self, input)
     }
     /// The KIND tag + one-line config summary the CostTree compile captures into
     /// the leaf's manifest entry (the old `Describe` leaf line). One blanket impl

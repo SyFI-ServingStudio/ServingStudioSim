@@ -16,9 +16,9 @@ use std::sync::Arc;
 
 use crate::timing::{CostNode, CostTreeBuilder, Evaluator, Probe};
 
-/// Generic single-kernel atomic op: names an L1 kernel and forwards its lookup.
+/// Generic single-kernel atomic op: names an L1 kernel and forwards its `eval`.
 /// `name` is the owned dotted path injected at the L4/L3 wiring point; the same
-/// path is given to the kernel's `init`, so the op node and its one child share
+/// path is given to the kernel's `build`, so the op node and its one child share
 /// it (L2 design §2.3).
 pub struct Op<K> {
     pub name: String,
@@ -46,7 +46,7 @@ impl<K: Probe> Op<K> {
     /// `compile` minted slots keeps the evaluator's cursor aligned with the slot
     /// index (INV-2). The leaf metric is the kernel's best-of-N `Metrics4`.
     pub fn eval(&self, input: &K::Input, ev: &mut Evaluator) {
-        ev.push(self.kernel.lookup_metrics(input));
+        ev.push(self.kernel.eval(input));
     }
 }
 
@@ -69,7 +69,7 @@ mod tests {
 
     impl Probe for FakeKernel {
         type Input = ();
-        fn lookup_metrics(&self, _input: &()) -> LeafMetrics {
+        fn eval(&self, _input: &()) -> LeafMetrics {
             LeafMetrics {
                 m: Metrics4 {
                     time_ms: self.time_ms,

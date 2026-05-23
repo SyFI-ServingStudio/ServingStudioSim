@@ -112,7 +112,7 @@ impl Cache for Cache2DLinear {
         (Self { xs0, xs1, cells }, warnings)
     }
 
-    fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
+    fn eval(&self, sweep: &[f64]) -> LeafMetrics {
         assert_eq!(
             sweep.len(),
             2,
@@ -296,8 +296,8 @@ mod tests {
         run("interpolate_cell (4 fields)", &|a, b| {
             cache.interpolate_cell(a, b).0.time_ms
         });
-        run("lookup_metrics", &|a, b| {
-            cache.lookup_metrics(&[a as f64, b as f64]).m.time_ms
+        run("eval", &|a, b| {
+            cache.eval(&[a as f64, b as f64]).m.time_ms
         });
     }
 
@@ -316,16 +316,16 @@ mod tests {
         assert!(warnings.is_empty());
 
         // Center (1.5, 15): bilinear of {1,2,3,4} = mean = 2.5.
-        let center = cache.lookup_metrics(&[1.5, 15.0]);
+        let center = cache.eval(&[1.5, 15.0]);
         assert_eq!(center.m.time_ms, 2.5);
         assert!(center.coverage.is_empty());
 
         // Corner reproduces the sampled value exactly.
-        let corner = cache.lookup_metrics(&[2.0, 20.0]);
+        let corner = cache.eval(&[2.0, 20.0]);
         assert_eq!(corner.m.time_ms, 4.0);
 
         // Edge midpoint along axis-1 at x0=1: between (1,10)=1 and (1,20)=2 → 1.5.
-        let edge = cache.lookup_metrics(&[1.0, 15.0]);
+        let edge = cache.eval(&[1.0, 15.0]);
         assert_eq!(edge.m.time_ms, 1.5);
     }
 
@@ -336,7 +336,7 @@ mod tests {
 
         // x0=3 is one full axis-0 step past the edge; along axis-1 at x1=10 the
         // gradient is (3-1)=2 per unit x0, so extrapolating to x0=3 gives 5.0.
-        let beyond = cache.lookup_metrics(&[3.0, 10.0]);
+        let beyond = cache.eval(&[3.0, 10.0]);
         assert_eq!(beyond.m.time_ms, 5.0);
         assert!(beyond.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
@@ -353,16 +353,16 @@ mod tests {
         // The three surviving corners still reproduce exactly at their points.
         // The dropped (2,20) corner carries zero bilinear weight at these
         // queries, so it is not coverage loss → no spurious Extrapolated flag.
-        let s10 = cache.lookup_metrics(&[1.0, 10.0]);
+        let s10 = cache.eval(&[1.0, 10.0]);
         assert_eq!(s10.m.time_ms, 1.0);
         assert!(s10.coverage.is_empty());
-        let s30 = cache.lookup_metrics(&[2.0, 10.0]);
+        let s30 = cache.eval(&[2.0, 10.0]);
         assert_eq!(s30.m.time_ms, 3.0);
         assert!(s30.coverage.is_empty());
 
         // A lookup leaning on the dropped corner blends the survivors and flags
         // coverage loss rather than emitting a silent value.
-        let leans = cache.lookup_metrics(&[2.0, 20.0]);
+        let leans = cache.eval(&[2.0, 20.0]);
         assert_eq!(leans.m.time_ms, 2.0);
         assert!(leans.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
@@ -377,7 +377,7 @@ mod tests {
         let samples = vec![sample(1.0), sample(2.0), sample(3.0), nan_sample()];
         let (cache, _) = Cache2DLinear::from_samples(&grid, &samples);
 
-        let beyond = cache.lookup_metrics(&[3.0, 10.0]);
+        let beyond = cache.eval(&[3.0, 10.0]);
         assert_eq!(beyond.m.time_ms, 5.0);
         assert!(beyond.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(warnings.len(), 4);
         assert!(warnings.iter().all(|w| w.kind == OutlierKind::NonFinite));
 
-        let result = cache.lookup_metrics(&[1.5, 15.0]);
+        let result = cache.eval(&[1.5, 15.0]);
         assert_eq!(result.m.time_ms, 0.0);
         assert_eq!(result.m.flops, 0.0);
         assert!(result.coverage.contains(CoverageFlags::NO_COVERAGE));
@@ -412,7 +412,7 @@ mod tests {
         let (grid, samples) = grid_2x2();
         let (cache, _) = Cache2DLinear::from_samples(&grid, &samples);
 
-        let result = cache.lookup_metrics(&[f64::NAN, 15.0]);
+        let result = cache.eval(&[f64::NAN, 15.0]);
         assert_eq!(result.m.time_ms, 0.0);
         assert!(result.coverage.contains(CoverageFlags::NO_COVERAGE));
     }
@@ -429,8 +429,8 @@ mod tests {
             .all(|w| w.kind != OutlierKind::MonotonicityBreak));
 
         // Same center as the sorted grid → 2.5.
-        assert_eq!(cache.lookup_metrics(&[1.5, 15.0]).m.time_ms, 2.5);
-        assert_eq!(cache.lookup_metrics(&[1.0, 10.0]).m.time_ms, 1.0);
-        assert_eq!(cache.lookup_metrics(&[2.0, 20.0]).m.time_ms, 4.0);
+        assert_eq!(cache.eval(&[1.5, 15.0]).m.time_ms, 2.5);
+        assert_eq!(cache.eval(&[1.0, 10.0]).m.time_ms, 1.0);
+        assert_eq!(cache.eval(&[2.0, 20.0]).m.time_ms, 4.0);
     }
 }

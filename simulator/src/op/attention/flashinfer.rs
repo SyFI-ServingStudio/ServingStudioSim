@@ -65,17 +65,17 @@ pub struct FlashInferAttentionOp {
 }
 
 impl FlashInferAttentionOp {
-    pub fn new(
+    pub fn build(
         name: String,
         cfg: FlashInferAttentionConfig,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
-        let prefill = Arc::new(FlashinferAttnPrefillKernel::init(
+        let prefill = Arc::new(FlashinferAttnPrefillKernel::build(
             format!("{name}.prefill"),
             prefill_config(&cfg),
             bridge,
         )?);
-        let decode = Arc::new(FlashinferAttnDecodeKernel::init(
+        let decode = Arc::new(FlashinferAttnDecodeKernel::build(
             format!("{name}.decode"),
             decode_config(&cfg),
             bridge,
@@ -90,7 +90,7 @@ impl FlashInferAttentionOp {
     /// CostTree compile: two fixed leaves — `prefill` and `decode` — regardless
     /// of request count (INV-1: stable shape). The per-request prefill fan-out is
     /// NOT one slot per request; at eval the `prefill` slot is the aggregating leaf
-    /// that sums `prefill.lookup_metrics(prefix_i, append_i)` over
+    /// that sums `prefill.eval(prefix_i, append_i)` over
     /// `prefill_chunk_pairs` into that single slot (decode already collapses to one
     /// cell). Each leaf carries its sub-kernel's `kind`/`config` for the render.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
@@ -110,14 +110,14 @@ impl FlashInferAttentionOp {
 
     /// CostTree eval: fill the two fixed slots `compile` minted — `prefill` then
     /// `decode`. The prefill slot is the INV-1 aggregating leaf: sum the per-request
-    /// `prefill.lookup_metrics` over `prefill_chunk_pairs` into the one slot
+    /// `prefill.eval` over `prefill_chunk_pairs` into the one slot
     /// (mirrors `lookup`'s per-request parts). The decode slot collapses all decode
     /// requests to one cell (zero metrics when none). Numerically equals the sum of
     /// `lookup`'s parts, so `aggregate(Sum[prefill, decode])` matches `lookup().time`.
     pub fn eval(&self, input: &FlashInferAttentionInput, ev: &mut Evaluator) {
         let mut prefill = LeafMetrics::ZERO;
         for &(prefix_len, append_len) in &input.prefill_chunk_pairs {
-            prefill.add(self.prefill.lookup_metrics(&FlashinferAttnPrefillKernelInput {
+            prefill.add(self.prefill.eval(&FlashinferAttnPrefillKernelInput {
                 prefix_len,
                 append_len,
             }));
@@ -125,7 +125,7 @@ impl FlashInferAttentionOp {
         ev.push(prefill);
 
         ev.push(match decode_input(&input.decode_kv_lens) {
-            Some(decode_input) => self.decode.lookup_metrics(&decode_input),
+            Some(decode_input) => self.decode.eval(&decode_input),
             None => LeafMetrics::ZERO,
         });
     }

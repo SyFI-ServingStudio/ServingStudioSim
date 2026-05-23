@@ -30,7 +30,7 @@ pub struct PreAttnLocalWorkletConfig {
     pub gemm_backends: Vec<&'static str>,
 }
 
-/// Post-resolve: sub-kernel cfgs fully baked. Consumed by `init_ops`.
+/// Post-resolve: sub-kernel cfgs fully baked. Consumed by `build`.
 /// `raw_cfg` kept for the partition pre-image.
 #[derive(Clone, Debug)]
 pub struct PreAttnLocalWorkletResolved {
@@ -74,7 +74,7 @@ impl PreAttnLocalWorklet {
         }
     }
 
-    pub fn init_ops(
+    pub fn build(
         name: String,
         resolved: PreAttnLocalWorkletResolved,
         bridge: &PerfApiBridge,
@@ -83,7 +83,7 @@ impl PreAttnLocalWorklet {
         let qkv_name = format!("{name}.qkv_proj");
         let input_norm = Op::new(
             norm_name.clone(),
-            Arc::new(RmsNormKernel::init(
+            Arc::new(RmsNormKernel::build(
                 norm_name,
                 resolved.input_norm.clone(),
                 bridge,
@@ -91,7 +91,7 @@ impl PreAttnLocalWorklet {
         );
         let qkv = Op::new(
             qkv_name.clone(),
-            Arc::new(SingleGemmKernel::init(qkv_name, resolved.qkv.clone(), bridge)?),
+            Arc::new(SingleGemmKernel::build(qkv_name, resolved.qkv.clone(), bridge)?),
         );
         Ok(Self {
             name,
