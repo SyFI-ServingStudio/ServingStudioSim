@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::model_cfg::{ModelCfg, ParallelCfg};
-use crate::common::Time;
 use crate::op::Op;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, RmsNormKernel,
@@ -23,8 +22,8 @@ use crate::timing::kernels::{
     SingleGemmKernelInput,
 };
 use crate::timing::{
-    BuildError, CostNode, CostTree, CostTreeBuilder, Describe, FlatCostNode, JitPlan, LeafMetrics,
-    LookupResult, PerfApiBridge,
+    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, FlatCostNode, JitPlan,
+    LeafMetrics, PerfApiBridge,
 };
 use crate::worklet::{
     AttnLocalWorklet, AttnLocalWorkletConfig, AttnLocalWorkletInput, AttnLocalWorkletResolved,
@@ -269,19 +268,14 @@ pub fn build(
     model.cost_flat = tree.flatten();
     model.n_slots = tree.n_slots();
 
-    // Print the compiled cost-tree structure once after build (M1 deliverable).
+    // Print the compiled cost-tree structure once after build: the per-slot
+    // manifest with each leaf's kernel kind + config + the worklet/partition
+    // labels (the shape render, folded in from the retired `Describe`).
     tracing::info!(
         "[build] cost tree ({} leaf slots):\n{}",
         tree.n_slots(),
         tree.describe()
     );
-
-    // One-time CostTree parity self-check (M2): on a representative mixed batch
-    // (chunked + fresh prefill and a decode batch — exercises both attention
-    // leaves), the compiled eval+aggregate path must reproduce the trusted
-    // `cost_whole_iter_time` fold up to f32 rounding. Validated once at build,
-    // not per tick, since the structure is fixed thereafter.
-    model.assert_cost_tree_parity();
 
     Ok(model)
 }
@@ -305,7 +299,12 @@ impl Llama3DenseModel {
         };
         let final_norm = self.final_norm.compile(&mut b);
         let lm_head = self.lm_head.compile(&mut b);
-        b.finish(CostNode::Sum(vec![embed, layer, final_norm, lm_head]))
+        // Root carries the model header (the old `Describe` top line).
+        let root = CostNode::Labeled {
+            label: format!("{} [dense local, {} layers]", self.name, self.num_layers),
+            child: Box::new(CostNode::Sum(vec![embed, layer, final_norm, lm_head])),
+        };
+        b.finish(root)
     }
 
     /// CostTree eval (milestone 2): stream this iteration's per-leaf [`Metrics4`]
@@ -337,72 +336,11 @@ impl Llama3DenseModel {
             .eval(&SingleGemmKernelInput { m }, buf, &mut cursor);
         debug_assert_eq!(cursor, buf.len(), "eval cursor must fill every slot");
     }
-
-    /// Compare the compiled CostTree path against the trusted `cost_whole_iter_time`
-    /// fold on a representative batch; log OK or a drift warning. f32 metrics +
-    /// the `Scale` fold differ from the integer-ns fold only in low bits, so a
-    /// 0.1% relative band is the parity bar.
-    fn assert_cost_tree_parity(&self) {
-        let probe = UnifiedArchInput {
-            groups: vec![crate::arch::contract::ArchGroupInput {
-                batch_tokens: 194,
-                prefill_chunk_pairs: vec![(0, 128), (256, 64)],
-                decode_kv_lens: vec![4096, 8192],
-                ..Default::default()
-            }],
-            tokens_per_source_rank: Vec::new(),
-        };
-        let tree_ms = self.cost_whole_iter_metrics(&probe).m.time_ms as f64;
-        let fold_ms = self.cost_whole_iter_time(&probe).as_ms();
-        let rel = (tree_ms - fold_ms).abs() / fold_ms.max(1e-9);
-        if rel > 1e-3 {
-            tracing::warn!(
-                "[build] CostTree parity drift: tree={tree_ms:.6}ms vs fold={fold_ms:.6}ms (rel {rel:.2e})"
-            );
-        } else {
-            tracing::info!("[build] CostTree parity OK: {fold_ms:.4}ms (rel {rel:.2e})");
-        }
-    }
 }
 
 impl IterwiseUnifiedModel for Llama3DenseModel {
     fn kv_bytes_per_token(&self) -> u64 {
         self.kv_bytes_per_token
-    }
-
-    /// Allocation-free wallclock for the sim clock. The dense stack is
-    /// homogeneous — every layer has identical cost for a given batch — so we
-    /// time one layer once and scale by `num_layers` (the cost_tree.md "fold"),
-    /// summing leaf `lookup_time`s with no `LookupResult` tree / `Vec` / `Arc`.
-    /// Numerically identical to `cost_whole_iter().time`.
-    fn cost_whole_iter_time(&self, batch: &UnifiedArchInput) -> Time {
-        assert_eq!(
-            batch.groups.len(),
-            1,
-            "Llama3 dense local has exactly one HP group"
-        );
-        let g = &batch.groups[0];
-        let m = g.batch_tokens;
-
-        let per_layer = self
-            .pre_attn
-            .lookup_time(&PreAttnLocalWorkletInput { batch_tokens: m })
-            + self.attn.lookup_time(&AttnLocalWorkletInput {
-                prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
-                decode_kv_lens: g.decode_kv_lens.clone(),
-            })
-            + self
-                .post_attn
-                .lookup_time(&PostAttnLocalWorkletInput { batch_tokens: m });
-
-        let embed = self.embed.lookup_time(&ElementwiseKernelInput { num_tokens: m });
-        let final_norm = self.final_norm.lookup_time(&RmsNormKernelInput { m });
-        let lm_head = self.lm_head.lookup_time(&SingleGemmKernelInput { m });
-
-        embed
-            + Time::from_ns(per_layer.as_ns() * self.num_layers as u64)
-            + final_norm
-            + lm_head
     }
 
     /// Per-iter cost via the cached compiled CostTree: eval the leaves once into a
@@ -420,14 +358,11 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
         CostTree::aggregate(&self.cost_flat, &buf)
     }
 
-    /// Slot names in compile order = the `cost_tree()` manifest. Recompiled once
-    /// at logger setup (off the hot path); the names aren't stored on the model.
-    fn cost_log_manifest(&self) -> Vec<String> {
-        self.cost_tree()
-            .slots
-            .into_iter()
-            .map(|s| s.name)
-            .collect()
+    /// The compiled CostTree's serializable manifest (slots + flat aggregation
+    /// nodes). Recompiled once at logger setup (off the hot path), so a consumer
+    /// can reproduce `total_time_ms` from a `cost_log` row's per-slot breakdown.
+    fn cost_log_manifest(&self) -> CostManifest {
+        self.cost_tree().manifest()
     }
 
     /// Fill `slots` with the per-leaf [`LeafMetrics`] for this iter (reusing the
@@ -447,63 +382,6 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
         slots.resize(self.n_slots, LeafMetrics::ZERO);
         self.eval_buf(batch, slots);
         CostTree::aggregate(&self.cost_flat, slots)
-    }
-
-    fn cost_whole_iter(&self, batch: &UnifiedArchInput) -> LookupResult {
-        assert_eq!(
-            batch.groups.len(),
-            1,
-            "Llama3 dense local has exactly one HP group"
-        );
-        let g = &batch.groups[0];
-        let m = g.batch_tokens;
-
-        let mut nodes = Vec::with_capacity(self.num_layers as usize + 3);
-        nodes.push(
-            self.embed
-                .lookup(&ElementwiseKernelInput { num_tokens: m })
-                .with_label("embedding"),
-        );
-
-        for i in 0..self.num_layers {
-            let pre = self.pre_attn.lookup(&PreAttnLocalWorkletInput { batch_tokens: m });
-            let attn = self.attn.lookup(&AttnLocalWorkletInput {
-                prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
-                decode_kv_lens: g.decode_kv_lens.clone(),
-            });
-            let post = self
-                .post_attn
-                .lookup(&PostAttnLocalWorkletInput { batch_tokens: m });
-            nodes.push(LookupResult::sum(
-                format!("{}.layer{:02}", self.name, i),
-                vec![pre, attn, post],
-            ));
-        }
-
-        nodes.push(self.final_norm.lookup(&RmsNormKernelInput { m }));
-        nodes.push(self.lm_head.lookup(&SingleGemmKernelInput { m }));
-
-        LookupResult::sum(format!("{}.whole_iter", self.name), nodes)
-    }
-}
-
-impl Describe for Llama3DenseModel {
-    fn describe(&self, depth: usize, out: &mut String) {
-        use std::fmt::Write;
-        let ind = "│  ".repeat(depth);
-        writeln!(
-            out,
-            "{}{} [dense local, {} layers]",
-            ind, self.name, self.num_layers
-        )
-        .unwrap();
-        self.embed.describe(depth + 1, out);
-        // Homogeneous layers share one worklet instance; describe once.
-        self.pre_attn.describe(depth + 1, out);
-        self.attn.describe(depth + 1, out);
-        self.post_attn.describe(depth + 1, out);
-        self.final_norm.describe(depth + 1, out);
-        self.lm_head.describe(depth + 1, out);
     }
 }
 

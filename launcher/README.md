@@ -80,18 +80,17 @@ labels (the list form labels by index: `0`, `1`, …). Use this when you want
 readable per-run output dirs, e.g. for an A/B over flags that span several params:
 
 ```jsonc
-"log_dir": "bench/cost_{cost}",
+"log_dir": "bench/rate_{rate}",
 "sweep_groups": {
-  "cost": {
-    "fold":    {},
-    "verbose": {"cost_verbose": true},
-    "tree":    {"cost_tree": true}
+  "rate": {
+    "low":  {"request_rate": 50.0},
+    "high": {"request_rate": 300.0}
   }
 }
 ```
-→ 3 runs into `bench/cost_fold`, `bench/cost_verbose`, `bench/cost_tree`. An empty
-entry (`{}`) is the all-defaults baseline. The zipped fields apply identically to
-the list form; only the label (and thus the `{cost}` log_dir placeholder) differs.
+→ 2 runs into `bench/rate_low`, `bench/rate_high`. An empty entry (`{}`) is the
+all-defaults baseline. The zipped fields apply identically to the list form; only
+the label (and thus the `{rate}` log_dir placeholder) differs.
 
 ### `derived` — computed assignments
 

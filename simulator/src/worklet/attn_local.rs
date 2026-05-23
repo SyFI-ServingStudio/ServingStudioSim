@@ -10,13 +10,9 @@
 //! `gpu_name` rides in the config (L3 §1.6 / `gpu_name in *KernelConfig`); the
 //! `*Input` is pure shape.
 
-use crate::common::Time;
 use crate::op::attention::{FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp};
 use crate::timing::bridge::DType;
-use crate::timing::{
-    BuildError, CostNode, CostTreeBuilder, Describe, JitPlan, LeafMetrics, LookupResult,
-    PerfApiBridge,
-};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, JitPlan, LeafMetrics, PerfApiBridge};
 
 /// Raw config; mirrors `FlashInferAttentionConfig` (no partition under `Local`).
 #[derive(Clone, Debug)]
@@ -94,28 +90,21 @@ impl AttnLocalWorklet {
         Ok(JitPlan::sum(name.to_string(), vec![attn]))
     }
 
-    pub fn lookup(&self, input: &AttnLocalWorkletInput) -> LookupResult {
-        let op_in = FlashInferAttentionInput {
-            prefill_chunk_pairs: input.prefill_chunk_pairs.clone(),
-            decode_kv_lens: input.decode_kv_lens.clone(),
-        };
-        LookupResult::sum(self.name.clone(), vec![self.attn.lookup(&op_in)])
-    }
-
-    /// Wallclock-only fast path — delegates to the attn op's `lookup_time`.
-    pub fn lookup_time(&self, input: &AttnLocalWorkletInput) -> Time {
-        let op_in = FlashInferAttentionInput {
-            prefill_chunk_pairs: input.prefill_chunk_pairs.clone(),
-            decode_kv_lens: input.decode_kv_lens.clone(),
-        };
-        self.attn.lookup_time(&op_in)
-    }
-
-    /// CostTree compile (M1): delegate to the attention op (its two fixed
-    /// prefill/decode leaves). No extra wrapper node — composites are anonymous,
-    /// so a single-child sum would be noise.
+    /// CostTree compile: the attention op's two fixed prefill/decode leaves,
+    /// wrapped in a `Labeled` node carrying the worklet identity + partition/shape
+    /// annotation (the old `Describe` header lines).
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        self.attn.compile(builder)
+        let label = format!(
+            "{} (AttnLocalWorklet) [local (1 GPU); qo={}, kv={}, head_dim={}]",
+            self.name,
+            self.resolved.raw_cfg.num_qo_heads,
+            self.resolved.raw_cfg.num_kv_heads,
+            self.resolved.raw_cfg.head_dim
+        );
+        CostNode::Labeled {
+            label,
+            child: Box::new(self.attn.compile(builder)),
+        }
     }
 
     /// CostTree eval: delegate to the attn op (its two prefill/decode slots),
@@ -126,24 +115,6 @@ impl AttnLocalWorklet {
             decode_kv_lens: input.decode_kv_lens.clone(),
         };
         self.attn.eval(&op_in, buf, cursor);
-    }
-}
-
-impl Describe for AttnLocalWorklet {
-    fn describe(&self, depth: usize, out: &mut String) {
-        use std::fmt::Write;
-        let ind = "│  ".repeat(depth);
-        writeln!(out, "{}{} (AttnLocalWorklet)", ind, self.name).unwrap();
-        writeln!(
-            out,
-            "{}├── partition: local (1 GPU); qo={}, kv={}, head_dim={}",
-            ind,
-            self.resolved.raw_cfg.num_qo_heads,
-            self.resolved.raw_cfg.num_kv_heads,
-            self.resolved.raw_cfg.head_dim
-        )
-        .unwrap();
-        self.attn.describe(depth + 1, out);
     }
 }
 

@@ -362,7 +362,8 @@ mod tests {
         DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
     };
     use crate::sim::frontend::TraceFrontend;
-    use crate::timing::LookupResult;
+    use crate::timing::cache::interp::{CoverageFlags, Metrics4};
+    use crate::timing::LeafMetrics;
     use crate::worker::WorkerConfig;
     use std::cell::RefCell;
     use std::io::Write;
@@ -374,8 +375,16 @@ mod tests {
         ms: f64,
     }
     impl IterwiseUnifiedModel for FakeModel {
-        fn cost_whole_iter(&self, _b: &UnifiedArchInput) -> LookupResult {
-            LookupResult::leaf("fake", Time::from_ms(self.ms), 0, 0, 0.0, Vec::new())
+        fn cost_whole_iter_metrics(&self, _b: &UnifiedArchInput) -> LeafMetrics {
+            LeafMetrics {
+                m: Metrics4 {
+                    time_ms: self.ms as f32,
+                    flops: 0.0,
+                    bytes: 0.0,
+                    energy_j: 0.0,
+                },
+                coverage: CoverageFlags::EMPTY,
+            }
         }
         fn kv_bytes_per_token(&self) -> u64 {
             1

@@ -11,10 +11,10 @@ pub mod sweep;
 
 pub use bridge::{BuildError, PerfApiBridge};
 pub use cache::interp::{CoverageFlags, LeafMetrics, Metrics4};
-pub use cost_tree::{CostNode, CostTree, CostTreeBuilder, FlatCostNode, LeafDesc};
+pub use cost_tree::{CostManifest, CostNode, CostTree, CostTreeBuilder, FlatCostNode, LeafDesc};
 pub use jit::{BackendJitPlan, DryRun, JitPlan};
 pub use kernels::engine::KernelConfig;
-pub use result::{CoverageKind, CoverageWarning, Describe, LookupResult, Probe};
+pub use result::Probe;
 pub use sweep::{Axis, Coords, SweepCoords, SweepGrid};
 // Re-export derive macros under the same names as their traits so users only
 // import `crate::timing::{SweepCoords, KernelConfig}` once for both `impl`

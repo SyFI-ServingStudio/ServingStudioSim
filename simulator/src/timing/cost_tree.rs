@@ -21,6 +21,8 @@ use std::collections::VecDeque;
 use std::fmt::Write;
 use std::ops::Range;
 
+use serde::{Deserialize, Serialize};
+
 use crate::timing::LeafMetrics;
 
 /// A node of the recursive cost structure (the build-time form). Composites are
@@ -38,6 +40,11 @@ pub enum CostNode {
     /// Fold: `n ×` an identical child subtree — the homogeneous-layer repeat,
     /// evaluated once and scaled, never materialized `n` times (INV-3).
     Scale { n: u32, child: Box<CostNode> },
+    /// Render-only wrapper: a composite identity line (worklet type + partition
+    /// annotation, the model header, …) attached to its child for [`CostTree::describe`].
+    /// Cost-transparent — [`CostTree::flatten`] unwraps it (the label never reaches
+    /// the flat array or the hot-path aggregate, honoring INV-5).
+    Labeled { label: String, child: Box<CostNode> },
 }
 
 /// Flat, topologically-laid-out form (the lowered product of [`CostTree::flatten`]).
@@ -45,7 +52,7 @@ pub enum CostNode {
 /// same `Vec<FlatCostNode>`; a parent's index always precedes its children's, so
 /// the future aggregate is a single bottom-up (reverse) pass with no recursion or
 /// allocation. Mirrors `docs/cost_tree.md` §4.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FlatCostNode {
     Leaf(usize),
     Sum { children: Range<usize> },
@@ -53,12 +60,28 @@ pub enum FlatCostNode {
     Scale { n: u32, children: Range<usize> },
 }
 
-/// Per-slot manifest entry. Milestone 1 carries the dotted name only; the leaf's
-/// kernel `kind` and its fitted-kernel binding (for per-iter eval) land with the
-/// eval/logging milestones.
-#[derive(Clone, Debug, PartialEq)]
+/// Per-slot manifest entry: the dotted leaf name plus the kernel identity folded
+/// in from the old `Describe` trait — `kind` is the kernel KIND tag and `config`
+/// the one-line shape/dtype summary (`KernelConfig::describe_config`). Captured at
+/// compile so [`CostTree::describe`] is the sole shape renderer.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LeafDesc {
     pub name: String,
+    pub kind: String,
+    pub config: String,
+}
+
+/// Serializable description of a compiled [`CostTree`] — the `cost_manifest.json`
+/// sidecar. Pairs the ordered leaf [`slots`](Self::slots) (the position→name/kind
+/// /config map for the parquet `slot_*` list columns) with the flattened
+/// aggregation [`nodes`](Self::nodes), so a consumer reading `cost_log.parquet`
+/// can re-run [`CostTree::aggregate`] over a row's `slot_time_ms` to reproduce
+/// `total_time_ms`: the `Scale{n}` fold, `Sum`, and `Max{overlap}` operators are
+/// all present (slot names alone can't reconstruct the total).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CostManifest {
+    pub slots: Vec<LeafDesc>,
+    pub nodes: Vec<FlatCostNode>,
 }
 
 /// Compiled-once structure: the recursive node tree plus the ordered leaf slots
@@ -84,9 +107,20 @@ impl CostTreeBuilder {
     }
 
     /// Allocate the next slot for a materialized leaf and return its [`CostNode`].
-    pub fn leaf(&mut self, name: impl Into<String>) -> CostNode {
+    /// `kind`/`config` carry the kernel identity for the shape render (the old
+    /// `Describe` leaf line).
+    pub fn leaf(
+        &mut self,
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        config: impl Into<String>,
+    ) -> CostNode {
         let slot = self.slots.len();
-        self.slots.push(LeafDesc { name: name.into() });
+        self.slots.push(LeafDesc {
+            name: name.into(),
+            kind: kind.into(),
+            config: config.into(),
+        });
         CostNode::Leaf(slot)
     }
 
@@ -104,6 +138,16 @@ impl CostTree {
     /// (`Scale`) subtree is counted once, not `×n`.
     pub fn n_slots(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Serializable manifest for the `cost_log` sidecar: the ordered slots plus
+    /// the flattened aggregation nodes. Lets a consumer reproduce `total_time_ms`
+    /// from a row's per-slot `slot_time_ms` by re-running [`Self::aggregate`].
+    pub fn manifest(&self) -> CostManifest {
+        CostManifest {
+            slots: self.slots.clone(),
+            nodes: self.flatten(),
+        }
     }
 
     /// Lower the recursive tree to the flat [`FlatCostNode`] array (doc §4). BFS
@@ -133,6 +177,11 @@ impl CostTree {
                         n: *n,
                         children: range,
                     }
+                }
+                // Render-only: splice the child into this slot, drop the label.
+                CostNode::Labeled { child, .. } => {
+                    queue.push_back((child, idx));
+                    continue;
                 }
             };
             out[idx] = Some(op);
@@ -219,7 +268,8 @@ impl CostTree {
         let ind = "│  ".repeat(depth);
         match node {
             CostNode::Leaf(slot) => {
-                writeln!(out, "{ind}Leaf#{slot} {}", self.slots[*slot].name).unwrap()
+                let d = &self.slots[*slot];
+                writeln!(out, "{ind}Leaf#{slot} {} ({}) {}", d.name, d.kind, d.config).unwrap()
             }
             CostNode::Sum(children) => {
                 writeln!(out, "{ind}Sum").unwrap();
@@ -237,6 +287,10 @@ impl CostTree {
                 writeln!(out, "{ind}Scale{{n={n}}}").unwrap();
                 self.write_node(child, depth + 1, out);
             }
+            CostNode::Labeled { label, child } => {
+                writeln!(out, "{ind}{label}").unwrap();
+                self.write_node(child, depth + 1, out);
+            }
         }
     }
 }
@@ -249,12 +303,15 @@ mod tests {
     /// the dense shape in miniature (a fold wrapping a 2-leaf subtree).
     fn sample() -> CostTree {
         let mut b = CostTreeBuilder::new();
-        let a = b.leaf("a");
+        let a = b.leaf("a", "ka", "x=1");
         let layer = CostNode::Scale {
             n: 3,
-            child: Box::new(CostNode::Sum(vec![b.leaf("b"), b.leaf("c")])),
+            child: Box::new(CostNode::Sum(vec![
+                b.leaf("b", "kb", "x=2"),
+                b.leaf("c", "kc", "x=3"),
+            ])),
         };
-        let d = b.leaf("d");
+        let d = b.leaf("d", "kd", "x=4");
         b.finish(CostNode::Sum(vec![a, layer, d]))
     }
 
@@ -271,14 +328,40 @@ mod tests {
     fn describe_renders_fold_and_leaves() {
         let expected = "\
 Sum
-│  Leaf#0 a
+│  Leaf#0 a (ka) x=1
 │  Scale{n=3}
 │  │  Sum
-│  │  │  Leaf#1 b
-│  │  │  Leaf#2 c
-│  Leaf#3 d
+│  │  │  Leaf#1 b (kb) x=2
+│  │  │  Leaf#2 c (kc) x=3
+│  Leaf#3 d (kd) x=4
 ";
         assert_eq!(sample().describe(), expected);
+    }
+
+    #[test]
+    fn describe_renders_labeled_header_then_child() {
+        // A `Labeled` wrapper prints its identity line (worklet header / partition
+        // annotation) above its child — the "no less than describe" guard: the
+        // leaf still carries its kernel kind + config.
+        let mut b = CostTreeBuilder::new();
+        let leaf = b.leaf("w.norm", "rms_norm", "hidden=4096, dtype=Bf16");
+        let tree = b.finish(CostNode::Labeled {
+            label: "w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]".to_string(),
+            child: Box::new(CostNode::Sum(vec![leaf])),
+        });
+        let expected = "\
+w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
+│  Sum
+│  │  Leaf#0 w.norm (rms_norm) hidden=4096, dtype=Bf16
+";
+        assert_eq!(tree.describe(), expected);
+        // Labeled is cost-transparent: flatten drops it, leaving Sum→Leaf only.
+        let flat = tree.flatten();
+        assert!(matches!(flat[0], FlatCostNode::Sum { .. }));
+        assert_eq!(
+            flat.iter().filter(|n| matches!(n, FlatCostNode::Leaf(_))).count(),
+            1
+        );
     }
 
     use crate::timing::{CoverageFlags, Metrics4};
@@ -293,6 +376,30 @@ Sum
             },
             coverage: CoverageFlags::EMPTY,
         }
+    }
+
+    #[test]
+    fn manifest_round_trips_and_reproduces_total() {
+        // The sidecar must let a consumer reproduce the aggregate from the per-slot
+        // buffer alone: serialize → deserialize the manifest, then re-run
+        // `aggregate` over the same slot buffer and check it matches the direct
+        // total (the `Scale{3}` fold is what slot names alone can't reconstruct).
+        let tree = sample();
+        let json = serde_json::to_string(&tree.manifest()).unwrap();
+        let back: CostManifest = serde_json::from_str(&json).unwrap();
+        let buf = [
+            leaf(1.0, 0.0, 0.0), // a
+            leaf(2.0, 0.0, 0.0), // b
+            leaf(3.0, 0.0, 0.0), // c
+            leaf(4.0, 0.0, 0.0), // d
+        ];
+        let from_manifest = CostTree::aggregate(&back.nodes, &buf).m.time_ms;
+        let direct = CostTree::aggregate(&tree.flatten(), &buf).m.time_ms;
+        assert_eq!(from_manifest, direct);
+        assert_eq!(from_manifest, 1.0 + 3.0 * (2.0 + 3.0) + 4.0);
+        // The manifest carries the fold + slot names (reproducibility, not just labels).
+        assert!(back.nodes.iter().any(|n| matches!(n, FlatCostNode::Scale { n: 3, .. })));
+        assert_eq!(back.slots.len(), 4);
     }
 
     #[test]
@@ -318,7 +425,7 @@ Sum
         let mut b = CostTreeBuilder::new();
         let root = CostNode::Max {
             overlap: 2.0,
-            children: vec![b.leaf("x"), b.leaf("y")],
+            children: vec![b.leaf("x", "kx", ""), b.leaf("y", "ky", "")],
         };
         let flat = b.finish(root).flatten();
         let buf = [leaf(4.0, 10.0, 100.0), leaf(6.0, 20.0, 200.0)];

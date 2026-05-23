@@ -13,7 +13,6 @@
 
 use std::sync::Arc;
 
-use crate::common::Time;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
@@ -21,10 +20,7 @@ use crate::timing::kernels::{
     RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput,
 };
-use crate::timing::{
-    BuildError, CostNode, CostTreeBuilder, Describe, JitPlan, LeafMetrics, LookupResult,
-    PerfApiBridge,
-};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, JitPlan, LeafMetrics, PerfApiBridge};
 
 #[derive(Clone, Debug)]
 pub struct PostAttnLocalWorkletConfig {
@@ -174,46 +170,24 @@ impl PostAttnLocalWorklet {
         Ok(JitPlan::sum(name.to_string(), parts))
     }
 
-    pub fn lookup(&self, input: &PostAttnLocalWorkletInput) -> LookupResult {
-        let m = input.batch_tokens;
-        let gemm_in = SingleGemmKernelInput { m };
-        let norm_in = RmsNormKernelInput { m };
-        let act_in = ElementwiseKernelInput { num_tokens: m };
-        LookupResult::sum(
-            self.name.clone(),
-            vec![
-                self.o_proj.lookup(&gemm_in),
-                self.post_norm.lookup(&norm_in),
-                self.up_gate.lookup(&gemm_in),
-                self.act.lookup(&act_in),
-                self.down.lookup(&gemm_in),
-            ],
-        )
-    }
-
-    /// Wallclock-only fast path — sums child `lookup_time`s, no tree/`Vec`.
-    pub fn lookup_time(&self, input: &PostAttnLocalWorkletInput) -> Time {
-        let m = input.batch_tokens;
-        let gemm_in = SingleGemmKernelInput { m };
-        let norm_in = RmsNormKernelInput { m };
-        let act_in = ElementwiseKernelInput { num_tokens: m };
-        self.o_proj.lookup_time(&gemm_in)
-            + self.post_norm.lookup_time(&norm_in)
-            + self.up_gate.lookup_time(&gemm_in)
-            + self.act.lookup_time(&act_in)
-            + self.down.lookup_time(&gemm_in)
-    }
-
-    /// CostTree compile (M1): sum over the five atomic ops (o_proj, post_norm,
-    /// up_gate, act, down) — mirrors `lookup`'s child list, structure only.
+    /// CostTree compile: sum over the five atomic ops (o_proj, post_norm,
+    /// up_gate, act, down), wrapped in a `Labeled` node with the worklet identity
+    /// + partition/shape annotation (the old `Describe` header lines).
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        CostNode::Sum(vec![
-            self.o_proj.compile(builder),
-            self.post_norm.compile(builder),
-            self.up_gate.compile(builder),
-            self.act.compile(builder),
-            self.down.compile(builder),
-        ])
+        let label = format!(
+            "{} (PostAttnLocalWorklet) [local (1 GPU); up_gate n={}, down k={}]",
+            self.name, self.resolved.up_gate.n, self.resolved.down.k
+        );
+        CostNode::Labeled {
+            label,
+            child: Box::new(CostNode::Sum(vec![
+                self.o_proj.compile(builder),
+                self.post_norm.compile(builder),
+                self.up_gate.compile(builder),
+                self.act.compile(builder),
+                self.down.compile(builder),
+            ])),
+        }
     }
 
     /// CostTree eval: fill o_proj, post_norm, up_gate, act, down slots in that
@@ -228,25 +202,6 @@ impl PostAttnLocalWorklet {
         self.up_gate.eval(&gemm_in, buf, cursor);
         self.act.eval(&act_in, buf, cursor);
         self.down.eval(&gemm_in, buf, cursor);
-    }
-}
-
-impl Describe for PostAttnLocalWorklet {
-    fn describe(&self, depth: usize, out: &mut String) {
-        use std::fmt::Write;
-        let ind = "│  ".repeat(depth);
-        writeln!(out, "{}{} (PostAttnLocalWorklet)", ind, self.name).unwrap();
-        writeln!(
-            out,
-            "{}├── partition: local (1 GPU); up_gate n={}, down k={}",
-            ind, self.resolved.up_gate.n, self.resolved.down.k
-        )
-        .unwrap();
-        self.o_proj.describe(depth + 1, out);
-        self.post_norm.describe(depth + 1, out);
-        self.up_gate.describe(depth + 1, out);
-        self.act.describe(depth + 1, out);
-        self.down.describe(depth + 1, out);
     }
 }
 

@@ -34,8 +34,8 @@ pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel> {
     pub model: Arc<M>,
     pub requests: SharedRequests,
     pub worker_config: WorkerConfig,
-    /// Run log dir, handed to each worker for its `cost_log` writer (only used
-    /// when `worker_config.cost_log` is set). `None` disables cost logging.
+    /// Run log dir, handed to each worker for its `cost_log` writer. `Some`
+    /// enables per-iteration cost logging; `None` disables it.
     pub log_dir: Option<PathBuf>,
 }
 
@@ -55,17 +55,12 @@ impl<M: IterwiseUnifiedModel> UnifiedWorkerFactory<M> {
     }
 
     pub fn build(&self, idx: u16) -> BareboneWorker<M> {
-        let cost_log_dir = if self.worker_config.cost_log {
-            self.log_dir.clone()
-        } else {
-            None
-        };
         BareboneWorker::new(
             WorkerId(idx),
             Arc::clone(&self.model),
             std::rc::Rc::clone(&self.requests),
             self.worker_config,
-            cost_log_dir,
+            self.log_dir.clone(),
         )
     }
 }

@@ -1,16 +1,7 @@
-use std::sync::{Arc, LazyLock};
-
-use crate::common::time::Time;
 use crate::timing::bridge::KernelMetrics;
 use crate::timing::cache::interp::{locate, CoverageFlags, LeafMetrics, Metrics4, MONOTONICITY_TOLERANCE};
 use crate::timing::cache::{Cache, OutlierKind, OutlierWarning};
 use crate::timing::sweep::SweepGrid;
-use crate::timing::{CoverageKind, CoverageWarning, LookupResult};
-
-/// Interned leaf name; see the matching note in `linear_1d.rs`. `Kernel::lookup`
-/// overwrites it, so this is just the fallback label for direct cache lookups,
-/// shared as an `Arc<str>` to keep the hot path allocation-free.
-static CACHE_NAME: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("cache_2d_linear"));
 
 /// Bilinear interpolation over a rectangular 2D profile grid. Both axes are
 /// expected monotonic-in-time (bigger coordinate ⇒ more work ⇒ more time), e.g.
@@ -119,86 +110,6 @@ impl Cache for Cache2DLinear {
         }
 
         (Self { xs0, xs1, cells }, warnings)
-    }
-
-    fn lookup(&self, sweep: &[f64]) -> LookupResult {
-        assert_eq!(
-            sweep.len(),
-            2,
-            "Cache2DLinear lookup requires two coordinates"
-        );
-        let (x0, x1) = (sweep[0], sweep[1]);
-
-        if x0.is_nan() || x1.is_nan() {
-            return LookupResult::leaf(
-                Arc::clone(&CACHE_NAME),
-                Time::ZERO,
-                0,
-                0,
-                0.0,
-                vec![CoverageWarning {
-                    kind: CoverageKind::NoCoverage,
-                    detail: format!(
-                        "x0={x0}, x1={x1}: coordinate is NaN; returning zero (not a real measurement)"
-                    ),
-                }],
-            );
-        }
-
-        if self.cells.iter().all(Option::is_none) {
-            // Every fit-time sample was dropped as non-finite (see `from_samples`).
-            // Return a zeroed leaf but flag `NoCoverage` so a 0-time result cannot
-            // pass silently as a real measurement downstream.
-            return LookupResult::leaf(
-                Arc::clone(&CACHE_NAME),
-                Time::ZERO,
-                0,
-                0,
-                0.0,
-                vec![CoverageWarning {
-                    kind: CoverageKind::NoCoverage,
-                    detail: format!(
-                        "x0={x0}, x1={x1}: cache has no finite samples; returning zero (not a real measurement)"
-                    ),
-                }],
-            );
-        }
-
-        let (cell, extrapolated) = self.interpolate_cell(x0 as f32, x1 as f32);
-        let warnings = if extrapolated {
-            vec![CoverageWarning {
-                kind: CoverageKind::Extrapolated,
-                detail: format!(
-                    "(x0={x0}, x1={x1}) outside 2D profile grid coverage, extrapolated"
-                ),
-            }]
-        } else {
-            Vec::new()
-        };
-        LookupResult::leaf(
-            Arc::clone(&CACHE_NAME),
-            Time::from_ms(cell.time_ms.max(0.0) as f64),
-            cell.flops.max(0.0) as u64,
-            cell.bytes.max(0.0) as u64,
-            cell.energy_j.max(0.0) as f64,
-            warnings,
-        )
-    }
-
-    fn lookup_time(&self, sweep: &[f64]) -> Time {
-        assert_eq!(
-            sweep.len(),
-            2,
-            "Cache2DLinear lookup requires two coordinates"
-        );
-        if self.cells.iter().all(Option::is_none) {
-            return Time::ZERO;
-        }
-        if sweep[0].is_nan() || sweep[1].is_nan() {
-            return Time::ZERO;
-        }
-        let (cell, _) = self.interpolate_cell(sweep[0] as f32, sweep[1] as f32);
-        Time::from_ms(cell.time_ms.max(0.0) as f64)
     }
 
     fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
@@ -311,9 +222,9 @@ impl Cache2DLinear {
 #[cfg(test)]
 mod tests {
     use crate::timing::bridge::KernelMetrics;
+    use crate::timing::cache::interp::CoverageFlags;
     use crate::timing::cache::{Cache, Cache2DLinear, OutlierKind};
     use crate::timing::sweep::SweepGrid;
-    use crate::timing::CoverageKind;
 
     fn sample(time_ms: f64) -> KernelMetrics {
         KernelMetrics {
@@ -385,11 +296,8 @@ mod tests {
         run("interpolate_cell (4 fields)", &|a, b| {
             cache.interpolate_cell(a, b).0.time_ms
         });
-        run("lookup_time", &|a, b| {
-            cache.lookup_time(&[a as f64, b as f64]).as_ms() as f32
-        });
-        run("lookup (full LookupResult)", &|a, b| {
-            cache.lookup(&[a as f64, b as f64]).time.as_ms() as f32
+        run("lookup_metrics", &|a, b| {
+            cache.lookup_metrics(&[a as f64, b as f64]).m.time_ms
         });
     }
 
@@ -408,18 +316,17 @@ mod tests {
         assert!(warnings.is_empty());
 
         // Center (1.5, 15): bilinear of {1,2,3,4} = mean = 2.5.
-        let center = cache.lookup(&[1.5, 15.0]);
-        assert_eq!(center.time.as_ms(), 2.5);
-        assert!(center.warnings.is_empty());
-        assert!(center.selected_backend.is_none());
+        let center = cache.lookup_metrics(&[1.5, 15.0]);
+        assert_eq!(center.m.time_ms, 2.5);
+        assert!(center.coverage.is_empty());
 
         // Corner reproduces the sampled value exactly.
-        let corner = cache.lookup(&[2.0, 20.0]);
-        assert_eq!(corner.time.as_ms(), 4.0);
+        let corner = cache.lookup_metrics(&[2.0, 20.0]);
+        assert_eq!(corner.m.time_ms, 4.0);
 
         // Edge midpoint along axis-1 at x0=1: between (1,10)=1 and (1,20)=2 → 1.5.
-        let edge = cache.lookup(&[1.0, 15.0]);
-        assert_eq!(edge.time.as_ms(), 1.5);
+        let edge = cache.lookup_metrics(&[1.0, 15.0]);
+        assert_eq!(edge.m.time_ms, 1.5);
     }
 
     #[test]
@@ -429,9 +336,9 @@ mod tests {
 
         // x0=3 is one full axis-0 step past the edge; along axis-1 at x1=10 the
         // gradient is (3-1)=2 per unit x0, so extrapolating to x0=3 gives 5.0.
-        let beyond = cache.lookup(&[3.0, 10.0]);
-        assert_eq!(beyond.time.as_ms(), 5.0);
-        assert_eq!(beyond.warnings[0].kind, CoverageKind::Extrapolated);
+        let beyond = cache.lookup_metrics(&[3.0, 10.0]);
+        assert_eq!(beyond.m.time_ms, 5.0);
+        assert!(beyond.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
 
     #[test]
@@ -446,18 +353,18 @@ mod tests {
         // The three surviving corners still reproduce exactly at their points.
         // The dropped (2,20) corner carries zero bilinear weight at these
         // queries, so it is not coverage loss → no spurious Extrapolated flag.
-        let s10 = cache.lookup(&[1.0, 10.0]);
-        assert_eq!(s10.time.as_ms(), 1.0);
-        assert!(s10.warnings.is_empty());
-        let s30 = cache.lookup(&[2.0, 10.0]);
-        assert_eq!(s30.time.as_ms(), 3.0);
-        assert!(s30.warnings.is_empty());
+        let s10 = cache.lookup_metrics(&[1.0, 10.0]);
+        assert_eq!(s10.m.time_ms, 1.0);
+        assert!(s10.coverage.is_empty());
+        let s30 = cache.lookup_metrics(&[2.0, 10.0]);
+        assert_eq!(s30.m.time_ms, 3.0);
+        assert!(s30.coverage.is_empty());
 
         // A lookup leaning on the dropped corner blends the survivors and flags
         // coverage loss rather than emitting a silent value.
-        let leans = cache.lookup(&[2.0, 20.0]);
-        assert_eq!(leans.time.as_ms(), 2.0);
-        assert_eq!(leans.warnings[0].kind, CoverageKind::Extrapolated);
+        let leans = cache.lookup_metrics(&[2.0, 20.0]);
+        assert_eq!(leans.m.time_ms, 2.0);
+        assert!(leans.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
 
     #[test]
@@ -470,9 +377,9 @@ mod tests {
         let samples = vec![sample(1.0), sample(2.0), sample(3.0), nan_sample()];
         let (cache, _) = Cache2DLinear::from_samples(&grid, &samples);
 
-        let beyond = cache.lookup(&[3.0, 10.0]);
-        assert_eq!(beyond.time.as_ms(), 5.0);
-        assert_eq!(beyond.warnings[0].kind, CoverageKind::Extrapolated);
+        let beyond = cache.lookup_metrics(&[3.0, 10.0]);
+        assert_eq!(beyond.m.time_ms, 5.0);
+        assert!(beyond.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
 
     #[test]
@@ -483,11 +390,10 @@ mod tests {
         assert_eq!(warnings.len(), 4);
         assert!(warnings.iter().all(|w| w.kind == OutlierKind::NonFinite));
 
-        let result = cache.lookup(&[1.5, 15.0]);
-        assert_eq!(result.time.as_ms(), 0.0);
-        assert_eq!(result.flops, 0);
-        assert_eq!(result.warnings.len(), 1);
-        assert_eq!(result.warnings[0].kind, CoverageKind::NoCoverage);
+        let result = cache.lookup_metrics(&[1.5, 15.0]);
+        assert_eq!(result.m.time_ms, 0.0);
+        assert_eq!(result.m.flops, 0.0);
+        assert!(result.coverage.contains(CoverageFlags::NO_COVERAGE));
     }
 
     #[test]
@@ -502,25 +408,13 @@ mod tests {
     }
 
     #[test]
-    fn lookup_time_matches_lookup_time_field() {
-        let (grid, samples) = grid_2x2();
-        let (cache, _) = Cache2DLinear::from_samples(&grid, &samples);
-        // Interior, corner, and extrapolation probes must agree with the full
-        // lookup's time so the fast path can never silently diverge.
-        for (x0, x1) in [(1.5, 15.0), (2.0, 20.0), (0.5, 5.0), (3.0, 10.0)] {
-            assert_eq!(cache.lookup_time(&[x0, x1]), cache.lookup(&[x0, x1]).time);
-        }
-    }
-
-    #[test]
     fn nan_coordinate_returns_no_coverage_zero() {
         let (grid, samples) = grid_2x2();
         let (cache, _) = Cache2DLinear::from_samples(&grid, &samples);
 
-        let result = cache.lookup(&[f64::NAN, 15.0]);
-        assert_eq!(result.time.as_ms(), 0.0);
-        assert_eq!(result.warnings[0].kind, CoverageKind::NoCoverage);
-        assert_eq!(cache.lookup_time(&[f64::NAN, 15.0]), result.time);
+        let result = cache.lookup_metrics(&[f64::NAN, 15.0]);
+        assert_eq!(result.m.time_ms, 0.0);
+        assert!(result.coverage.contains(CoverageFlags::NO_COVERAGE));
     }
 
     #[test]
@@ -535,8 +429,8 @@ mod tests {
             .all(|w| w.kind != OutlierKind::MonotonicityBreak));
 
         // Same center as the sorted grid → 2.5.
-        assert_eq!(cache.lookup(&[1.5, 15.0]).time.as_ms(), 2.5);
-        assert_eq!(cache.lookup(&[1.0, 10.0]).time.as_ms(), 1.0);
-        assert_eq!(cache.lookup(&[2.0, 20.0]).time.as_ms(), 4.0);
+        assert_eq!(cache.lookup_metrics(&[1.5, 15.0]).m.time_ms, 2.5);
+        assert_eq!(cache.lookup_metrics(&[1.0, 10.0]).m.time_ms, 1.0);
+        assert_eq!(cache.lookup_metrics(&[2.0, 20.0]).m.time_ms, 4.0);
     }
 }

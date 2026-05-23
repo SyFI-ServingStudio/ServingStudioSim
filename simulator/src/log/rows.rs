@@ -87,6 +87,10 @@ pub struct RequestSloEntry {
 #[derive(Clone, Debug)]
 pub struct CostLogEntry {
     pub worker_id: u16,
+    /// Per-worker iteration index (one forward-pass cycle).
+    pub iter_id: u64,
+    /// Batch index *within* the iteration. 0 today (one batch per iteration);
+    /// 0..k under AFD/TBO where a worker runs several batches in one iteration.
     pub batch_id: u64,
     pub wall_start_ms: f64,
     pub wall_end_ms: f64,
@@ -98,6 +102,7 @@ pub struct CostLogEntry {
 
 pub(crate) fn cost_to_record_batch(entries: &[CostLogEntry]) -> Result<RecordBatch> {
     let worker_id: Vec<u16> = entries.iter().map(|e| e.worker_id).collect();
+    let iter_id: Vec<u64> = entries.iter().map(|e| e.iter_id).collect();
     let batch_id: Vec<u64> = entries.iter().map(|e| e.batch_id).collect();
     let wall_start: Vec<f64> = entries.iter().map(|e| e.wall_start_ms).collect();
     let wall_end: Vec<f64> = entries.iter().map(|e| e.wall_end_ms).collect();
@@ -125,6 +130,7 @@ pub(crate) fn cost_to_record_batch(entries: &[CostLogEntry]) -> Result<RecordBat
         cost_log_schema(),
         vec![
             Arc::new(UInt16Array::from(worker_id)),
+            Arc::new(UInt64Array::from(iter_id)),
             Arc::new(UInt64Array::from(batch_id)),
             Arc::new(Float64Array::from(wall_start)),
             Arc::new(Float64Array::from(wall_end)),
@@ -249,7 +255,8 @@ mod tests {
         let entries = vec![
             CostLogEntry {
                 worker_id: 0,
-                batch_id: 7,
+                iter_id: 7,
+                batch_id: 0,
                 wall_start_ms: 1.0,
                 wall_end_ms: 3.0,
                 total_time_ms: 2.0,
@@ -259,7 +266,8 @@ mod tests {
             },
             CostLogEntry {
                 worker_id: 0,
-                batch_id: 8,
+                iter_id: 8,
+                batch_id: 0,
                 wall_start_ms: 3.0,
                 wall_end_ms: 4.0,
                 total_time_ms: 1.0,
@@ -270,14 +278,14 @@ mod tests {
         ];
         let batch = cost_to_record_batch(&entries).unwrap();
         assert_eq!(batch.num_rows(), 2);
-        // batch_id column (index 1) carries the iter counter.
-        let b = batch
+        // iter_id column (index 1) carries the per-worker iteration counter.
+        let it = batch
             .column(1)
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
-        assert_eq!(b.value(0), 7);
-        assert_eq!(b.value(1), 8);
+        assert_eq!(it.value(0), 7);
+        assert_eq!(it.value(1), 8);
     }
 
     #[test]

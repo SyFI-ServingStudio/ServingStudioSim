@@ -9,7 +9,6 @@
 //! and f64 cost the same on x86).
 
 use crate::timing::bridge::KernelMetrics;
-use crate::timing::CoverageKind;
 
 /// Max fractional time drop tolerated between adjacent (axis-sorted) profile
 /// points before a cache flags `OutlierKind::MonotonicityBreak`. 10% absorbs
@@ -86,13 +85,11 @@ impl Metrics4 {
     }
 }
 
-/// The per-leaf coverage signal, packed into a `u8` — one bit per
-/// [`CoverageKind`]. This is the CostTree eval path's allocation-free analogue
-/// of the `LookupResult` `Vec<CoverageWarning>`: it keeps the analytically
-/// useful *kind* (did this leaf extrapolate off-grid? was it a JIT/no-coverage
-/// placeholder?) while dropping the per-call `detail: String` (reconstructable
-/// off the hot path from the slot name). `aggregate` ORs these up the tree, so a
-/// warning anywhere in a subtree surfaces at its root.
+/// The per-leaf coverage signal, packed into a `u8` — one bit per coverage
+/// concern. The CostTree eval path's allocation-free coverage carrier: it keeps
+/// the analytically useful *kind* (did this leaf extrapolate off-grid? was it a
+/// JIT/no-coverage placeholder?) as a bitset. `aggregate` ORs these up the tree,
+/// so a warning anywhere in a subtree surfaces at its root.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoverageFlags(u8);
 
@@ -101,16 +98,6 @@ impl CoverageFlags {
     pub const EXTRAPOLATED: Self = Self(1 << 0);
     pub const JIT: Self = Self(1 << 1);
     pub const NO_COVERAGE: Self = Self(1 << 2);
-
-    /// One-to-one with the runtime [`CoverageKind`] variants, for the
-    /// `lookup`-delegating defaults that narrow a `LookupResult`'s warnings.
-    pub fn from_kind(kind: CoverageKind) -> Self {
-        match kind {
-            CoverageKind::Extrapolated => Self::EXTRAPOLATED,
-            CoverageKind::Jit => Self::JIT,
-            CoverageKind::NoCoverage => Self::NO_COVERAGE,
-        }
-    }
 
     pub fn is_empty(self) -> bool {
         self.0 == 0

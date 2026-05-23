@@ -1,5 +1,5 @@
-//! Hot-path microbenchmark for cache lookups — the dominant cost in
-//! `Kernel::lookup` (bilinear/linear interpolation + the `Arc<str>` name clone).
+//! Hot-path microbenchmark for cache lookups — the dominant cost in the CostTree
+//! eval path (`Cache::lookup_metrics`: bilinear/linear interpolation).
 //!
 //! Dependency-free (no criterion) and `#[ignore]`d so it never runs in the
 //! normal suite. It needs no Python, so plain cargo works:
@@ -34,7 +34,7 @@ fn compute_sample(time_ms: f64) -> KernelMetrics {
 /// `black_box` on both the coordinate and the result defeats hoisting/DCE so
 /// the loop measures real interpolation work.
 fn bench<F: Fn(f64, f64) -> f64>(label: &str, probes: &[(f64, f64)], lookup: F) {
-    // Warm up (also triggers the lazy CACHE_NAME init once, off the clock).
+    // Warm up off the clock.
     for &(a, b) in probes {
         black_box(lookup(black_box(a), black_box(b)));
     }
@@ -78,11 +78,8 @@ fn cache_lookup_throughput() {
     // Harness floor: a trivial closure measures loop + black_box + accumulate
     // overhead, so the cache numbers below can be read net of it.
     bench("baseline (a + b)", &probes_1d, |a, b| a + b);
-    bench("Cache1DLinear::lookup", &probes_1d, |x, _| {
-        cache_1d.lookup(&[x]).time.as_ms()
-    });
-    bench("Cache1DLinear::lookup_time", &probes_1d, |x, _| {
-        cache_1d.lookup_time(&[x]).as_ms()
+    bench("Cache1DLinear::lookup_metrics", &probes_1d, |x, _| {
+        cache_1d.lookup_metrics(&[x]).m.time_ms as f64
     });
 
     // 1D direct-indexed: 512 buckets, spacing 64, range [0, 32704] — the bounded
@@ -101,11 +98,8 @@ fn cache_lookup_throughput() {
         .into_iter()
         .map(|x| (x, 0.0))
         .collect();
-    bench("Cache1DDirect::lookup", &probes_direct, |x, _| {
-        cache_direct.lookup(&[x]).time.as_ms()
-    });
-    bench("Cache1DDirect::lookup_time", &probes_direct, |x, _| {
-        cache_direct.lookup_time(&[x]).as_ms()
+    bench("Cache1DDirect::lookup_metrics", &probes_direct, |x, _| {
+        cache_direct.lookup_metrics(&[x]).m.time_ms as f64
     });
 
     // 2D: a 16x16 monotonic grid (seq_len_q × kv_cache_len shape).
@@ -127,10 +121,7 @@ fn cache_lookup_throughput() {
         (64.0, 64.0),     // below both edges (extrapolate)
         (3000.0, 1000.0), // beyond axis-0
     ];
-    bench("Cache2DLinear::lookup", probes_2d, |x0, x1| {
-        cache_2d.lookup(&[x0, x1]).time.as_ms()
-    });
-    bench("Cache2DLinear::lookup_time", probes_2d, |x0, x1| {
-        cache_2d.lookup_time(&[x0, x1]).as_ms()
+    bench("Cache2DLinear::lookup_metrics", probes_2d, |x0, x1| {
+        cache_2d.lookup_metrics(&[x0, x1]).m.time_ms as f64
     });
 }

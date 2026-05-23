@@ -69,22 +69,6 @@ pub struct WorkerConfig {
     /// budget). Same per-worker tier as `gpu_name`; the worker divides it by the
     /// model's `kv_bytes_per_token` to size its `KvPool`.
     pub attn_kv_bytes: u64,
-    /// Cost-model detail per iteration. `false` (default): wallclock-only fast
-    /// path (`cost_whole_iter_time`, no `LookupResult` tree) — the dominant
-    /// tick-loop cost otherwise. `true`: build the full `LookupResult` tree
-    /// (per-leaf breakdown for cost logging/inspection), at ~tree-allocation cost.
-    pub cost_verbose: bool,
-    /// Use the compiled CostTree eval+aggregate path for the per-iter clock
-    /// (`cost_whole_iter_metrics`): full per-slot metrics with O(slots) flat
-    /// writes instead of the O(nodes) `LookupResult` tree. Takes precedence over
-    /// `cost_verbose` when set. Off by default (the time-only fold is fastest).
-    pub cost_tree: bool,
-    /// Emit a per-iteration `cost_log` row (CostTree per-slot breakdown) to
-    /// `<log_dir>/raw/cost_log.parquet`. Implies the CostTree clock path (the row
-    /// and the clock share one eval). The `<log_dir>` is supplied to the worker
-    /// separately (the factory carries it); this flag only gates the behavior so
-    /// `WorkerConfig` stays `Copy`.
-    pub cost_log: bool,
 }
 
 impl Default for WorkerConfig {
@@ -93,9 +77,6 @@ impl Default for WorkerConfig {
             admission: KvAdmission::Strict,
             balance: LoadBalance::Single,
             attn_kv_bytes: 80_000_000_000, // 80 GB
-            cost_verbose: false,
-            cost_tree: false,
-            cost_log: false,
         }
     }
 }
@@ -137,8 +118,8 @@ pub struct BareboneWorker<M: IterwiseUnifiedModel> {
     runtime: WorkerRuntime,
     batches: Vec<Batch>, // length 1 in barebone
     events: Vec<WorkerEvent>,
-    /// Per-iteration `cost_log` writer (`Some` iff `config.cost_log` + a log_dir
-    /// was supplied). `cost_slots` is the reused per-slot eval buffer.
+    /// Per-iteration `cost_log` writer (`Some` iff a log_dir was supplied).
+    /// `cost_slots` is the reused per-slot eval buffer.
     cost_logger: Option<CostLogger>,
     cost_slots: Vec<LeafMetrics>,
 }
@@ -154,17 +135,18 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         // The worker sizes its own KvPool: memory allowance ÷ the model's
         // per-token KV footprint (L5 owns the division; arch owns the footprint).
         let kv_capacity = (config.attn_kv_bytes / model.kv_bytes_per_token().max(1)).max(1);
-        // Open the cost_log writer (+ manifest sidecar) only when asked. A failure
-        // to open disables logging with a warning rather than aborting the sim.
-        let cost_logger = match (config.cost_log, cost_log_dir) {
-            (true, Some(dir)) => match CostLogger::open(&dir, &model.cost_log_manifest()) {
+        // Open the cost_log writer (+ manifest sidecar) whenever a log dir is
+        // available. A failure to open disables logging with a warning rather
+        // than aborting the sim.
+        let cost_logger = match cost_log_dir {
+            Some(dir) => match CostLogger::open(&dir, &model.cost_log_manifest()) {
                 Ok(logger) => Some(logger),
                 Err(e) => {
                     tracing::warn!("cost_log disabled: failed to open writer: {e}");
                     None
                 }
             },
-            _ => None,
+            None => None,
         };
         Self {
             id,
@@ -283,9 +265,9 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     fn start_iter(&mut self, now: Time) -> Time {
         let arch_input = self.build_arch_input();
-        // The clock needs only the total time. Default (time-only) skips building
-        // the per-iter `LookupResult` tree (the dominant tick-loop cost); verbose
-        // builds the full tree for cost breakdown/logging.
+        // The clock is the CostTree aggregate's time. When a cost_logger is
+        // present, the slot-filling variant emits the per-slot `cost_log` row and
+        // the clock from one eval pass; otherwise just the aggregate time.
         let cost_time = if self.cost_logger.is_some() {
             // One CostTree eval pass feeds both the cost_log row and the clock.
             let agg = self
@@ -294,7 +276,10 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
             let cost_time = Time::from_ms(agg.m.time_ms as f64);
             let entry = CostLogEntry {
                 worker_id: self.id.0,
-                batch_id: self.runtime.iter_counter as u64,
+                iter_id: self.runtime.iter_counter as u64,
+                // One batch per iteration in the barebone worker; AFD/TBO will
+                // emit several batches sharing this iter_id with distinct batch_id.
+                batch_id: 0,
                 wall_start_ms: now.as_ms(),
                 wall_end_ms: (now + cost_time).as_ms(),
                 total_time_ms: agg.m.time_ms as f64,
@@ -308,12 +293,8 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                 }
             }
             cost_time
-        } else if self.config.cost_tree {
-            Time::from_ms(self.model.cost_whole_iter_metrics(&arch_input).m.time_ms as f64)
-        } else if self.config.cost_verbose {
-            self.model.cost_whole_iter(&arch_input).time
         } else {
-            self.model.cost_whole_iter_time(&arch_input)
+            Time::from_ms(self.model.cost_whole_iter_metrics(&arch_input).m.time_ms as f64)
         };
         self.runtime.iter_compute_start = now;
         now + cost_time
@@ -486,7 +467,8 @@ mod tests {
     use super::*;
     use crate::common::time::Time;
     use crate::common::{Request, RequestStore};
-    use crate::timing::LookupResult;
+    use crate::timing::cache::interp::{CoverageFlags, Metrics4};
+    use crate::timing::LeafMetrics;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -495,8 +477,16 @@ mod tests {
         ms: f64,
     }
     impl IterwiseUnifiedModel for FakeModel {
-        fn cost_whole_iter(&self, _batch: &UnifiedArchInput) -> LookupResult {
-            LookupResult::leaf("fake", Time::from_ms(self.ms), 0, 0, 0.0, Vec::new())
+        fn cost_whole_iter_metrics(&self, _batch: &UnifiedArchInput) -> LeafMetrics {
+            LeafMetrics {
+                m: Metrics4 {
+                    time_ms: self.ms as f32,
+                    flops: 0.0,
+                    bytes: 0.0,
+                    energy_j: 0.0,
+                },
+                coverage: CoverageFlags::EMPTY,
+            }
         }
         // 1 byte/token → KvPool capacity == config.attn_kv_bytes (easy to size).
         fn kv_bytes_per_token(&self) -> u64 {

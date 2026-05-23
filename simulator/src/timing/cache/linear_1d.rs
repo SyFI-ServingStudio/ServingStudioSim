@@ -1,17 +1,7 @@
-use std::sync::{Arc, LazyLock};
-
-use crate::common::time::Time;
 use crate::timing::bridge::KernelMetrics;
 use crate::timing::cache::interp::{locate, CoverageFlags, LeafMetrics, Metrics4, MONOTONICITY_TOLERANCE};
 use crate::timing::cache::{Cache, OutlierKind, OutlierWarning};
 use crate::timing::sweep::SweepGrid;
-use crate::timing::{CoverageKind, CoverageWarning, LookupResult};
-
-/// Interned leaf name. `Kernel::lookup` overwrites it with the kernel's
-/// dotted-path name, so this is only the fallback label for direct cache
-/// lookups — interned as a shared `Arc<str>` so the hot path clones a refcount,
-/// not a fresh `String`, per call.
-static CACHE_NAME: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("cache_1d_linear"));
 
 /// Piecewise-linear interpolation over one monotonic axis. Stored struct-of-
 /// arrays: `xs` is the dense ascending search key (so the branchless `locate`
@@ -70,82 +60,6 @@ impl Cache for Cache1DLinear {
         (Self { xs, metrics }, warnings)
     }
 
-    fn lookup(&self, sweep: &[f64]) -> LookupResult {
-        assert_eq!(
-            sweep.len(),
-            1,
-            "Cache1DLinear lookup requires one coordinate"
-        );
-        let x = sweep[0];
-
-        if x.is_nan() {
-            return LookupResult::leaf(
-                Arc::clone(&CACHE_NAME),
-                Time::ZERO,
-                0,
-                0,
-                0.0,
-                vec![CoverageWarning {
-                    kind: CoverageKind::NoCoverage,
-                    detail: "x is NaN; returning zero (not a real measurement)".to_string(),
-                }],
-            );
-        }
-
-        if self.xs.is_empty() {
-            // All fit-time samples were dropped as non-finite (see `from_samples`).
-            // Return a zeroed leaf but flag `NoCoverage` so a 0-time result cannot
-            // pass silently as a real measurement downstream.
-            return LookupResult::leaf(
-                Arc::clone(&CACHE_NAME),
-                Time::ZERO,
-                0,
-                0,
-                0.0,
-                vec![CoverageWarning {
-                    kind: CoverageKind::NoCoverage,
-                    detail: format!(
-                        "x={x}: cache has no finite samples; returning zero (not a real measurement)"
-                    ),
-                }],
-            );
-        }
-
-        let (m, extrapolated) = self.interpolate(x as f32);
-        let warnings = if extrapolated {
-            vec![CoverageWarning {
-                kind: CoverageKind::Extrapolated,
-                detail: format!("x={x} outside 1D profile grid, extrapolated"),
-            }]
-        } else {
-            Vec::new()
-        };
-        LookupResult::leaf(
-            Arc::clone(&CACHE_NAME),
-            Time::from_ms(m.time_ms.max(0.0) as f64),
-            m.flops.max(0.0) as u64,
-            m.bytes.max(0.0) as u64,
-            m.energy_j.max(0.0) as f64,
-            warnings,
-        )
-    }
-
-    fn lookup_time(&self, sweep: &[f64]) -> Time {
-        assert_eq!(
-            sweep.len(),
-            1,
-            "Cache1DLinear lookup requires one coordinate"
-        );
-        if self.xs.is_empty() {
-            return Time::ZERO;
-        }
-        if sweep[0].is_nan() {
-            return Time::ZERO;
-        }
-        let (m, _) = self.interpolate(sweep[0] as f32);
-        Time::from_ms(m.time_ms.max(0.0) as f64)
-    }
-
     fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
         assert_eq!(
             sweep.len(),
@@ -154,8 +68,8 @@ impl Cache for Cache1DLinear {
         );
         let x = sweep[0];
         if self.xs.is_empty() || x.is_nan() {
-            // Empty cache / NaN coord → zero placeholder, flagged NoCoverage
-            // (mirrors `lookup`'s `CoverageKind::NoCoverage` leaf).
+            // Empty cache / NaN coord → zero placeholder, flagged NoCoverage so a
+            // 0-time result can't pass silently as a real measurement downstream.
             return LeafMetrics {
                 m: Metrics4::ZERO,
                 coverage: CoverageFlags::NO_COVERAGE,
@@ -188,9 +102,9 @@ impl Cache1DLinear {
 #[cfg(test)]
 mod tests {
     use crate::timing::bridge::KernelMetrics;
+    use crate::timing::cache::interp::CoverageFlags;
     use crate::timing::cache::{Cache, Cache1DLinear, OutlierKind};
     use crate::timing::sweep::SweepGrid;
-    use crate::timing::CoverageKind;
 
     fn finite_sample(time_ms: f64) -> KernelMetrics {
         KernelMetrics {
@@ -230,15 +144,13 @@ mod tests {
         let (cache, warnings) = Cache1DLinear::from_samples(&grid, &samples);
         assert!(warnings.is_empty());
 
-        let inside = cache.lookup(&[1.5]);
-        assert_eq!(inside.time.as_ms(), 2.0);
-        assert!(inside.warnings.is_empty());
-        // Cache1DLinear is backend-blind; only BackendCache fills this in.
-        assert!(inside.selected_backend.is_none());
+        let inside = cache.lookup_metrics(&[1.5]);
+        assert_eq!(inside.m.time_ms, 2.0);
+        assert!(inside.coverage.is_empty());
 
-        let outside = cache.lookup(&[3.0]);
-        assert_eq!(outside.time.as_ms(), 5.0);
-        assert_eq!(outside.warnings[0].kind, CoverageKind::Extrapolated);
+        let outside = cache.lookup_metrics(&[3.0]);
+        assert_eq!(outside.m.time_ms, 5.0);
+        assert!(outside.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
 
     #[test]
@@ -279,8 +191,8 @@ mod tests {
 
         // The dropped middle point still leaves a 2-point grid that interpolates
         // 1.0→3.0 linearly across x=1..3, so lookup(2.0) ≈ 2.0.
-        let mid = cache.lookup(&[2.0]);
-        assert_eq!(mid.time.as_ms(), 2.0);
+        let mid = cache.lookup_metrics(&[2.0]);
+        assert_eq!(mid.m.time_ms, 2.0);
     }
 
     #[test]
@@ -313,11 +225,10 @@ mod tests {
 
         // Lookup on the empty cache returns zero, loudly flagged NoCoverage
         // (not a silent valid-looking 0-time result).
-        let result = cache.lookup(&[1.5]);
-        assert_eq!(result.time.as_ms(), 0.0);
-        assert_eq!(result.flops, 0);
-        assert_eq!(result.warnings.len(), 1);
-        assert_eq!(result.warnings[0].kind, CoverageKind::NoCoverage);
+        let result = cache.lookup_metrics(&[1.5]);
+        assert_eq!(result.m.time_ms, 0.0);
+        assert_eq!(result.m.flops, 0.0);
+        assert!(result.coverage.contains(CoverageFlags::NO_COVERAGE));
     }
 
     #[test]
@@ -334,26 +245,14 @@ mod tests {
     }
 
     #[test]
-    fn lookup_time_matches_lookup_time_field() {
-        let grid = SweepGrid::new(vec![vec![1.0, 2.0, 3.0]]);
-        let (cache, _) = Cache1DLinear::from_samples(
-            &grid,
-            &[finite_sample(1.0), finite_sample(2.0), finite_sample(4.0)],
-        );
-        // Interior, on-grid, and both extrapolation edges must agree with the
-        // full-lookup time so the fast path can never silently diverge.
-        for x in [0.5, 1.0, 1.5, 2.7, 3.0, 5.0] {
-            assert_eq!(cache.lookup_time(&[x]), cache.lookup(&[x]).time);
-        }
-    }
-
-    #[test]
-    fn lookup_time_on_empty_cache_is_zero() {
+    fn lookup_metrics_on_empty_cache_is_zero() {
         let grid = SweepGrid::new(vec![vec![1.0, 2.0]]);
         let mut nan = finite_sample(0.0);
         nan.time_ms = f64::NAN;
         let (cache, _) = Cache1DLinear::from_samples(&grid, &[nan.clone(), nan]);
-        assert_eq!(cache.lookup_time(&[1.5]), cache.lookup(&[1.5]).time);
+        let leaf = cache.lookup_metrics(&[1.5]);
+        assert_eq!(leaf.m.time_ms, 0.0);
+        assert!(leaf.coverage.contains(CoverageFlags::NO_COVERAGE));
     }
 
     #[test]
@@ -362,10 +261,9 @@ mod tests {
         let (cache, _) =
             Cache1DLinear::from_samples(&grid, &[finite_sample(1.0), finite_sample(3.0)]);
 
-        let result = cache.lookup(&[f64::NAN]);
-        assert_eq!(result.time.as_ms(), 0.0);
-        assert_eq!(result.warnings[0].kind, CoverageKind::NoCoverage);
-        assert_eq!(cache.lookup_time(&[f64::NAN]), result.time);
+        let leaf = cache.lookup_metrics(&[f64::NAN]);
+        assert_eq!(leaf.m.time_ms, 0.0);
+        assert!(leaf.coverage.contains(CoverageFlags::NO_COVERAGE));
     }
 
     #[test]

@@ -7,14 +7,13 @@
 //! the same shape here — variations live in each per-kernel `KernelSpec`.
 
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use crate::common::time::Time;
 use crate::timing::bridge::{ArgsPayload, KernelKind, PerfApiBridge};
 use crate::timing::cache::interp::LeafMetrics;
 use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning};
 use crate::timing::sweep::{SweepCoords, SweepGrid};
-use crate::timing::{BuildError, Describe, DryRun, JitPlan, LookupResult, Probe};
+use crate::timing::{BuildError, DryRun, JitPlan, Probe};
 
 /// Per-kernel `*KernelConfig` contract: identity (`Hash + Eq`) + the required
 /// `backends: Vec<&'static str>` field exposed via `backends()`. The proc-macro
@@ -78,9 +77,6 @@ pub trait KernelSpec: 'static {
 pub struct Kernel<S: KernelSpec> {
     pub config: S::Config,
     pub outlier_warnings: Vec<OutlierWarning>,
-    /// `Arc<str>` so `lookup` stamps this onto each result with a refcount bump,
-    /// not a per-tick `String` clone (hot path — see `lookup`).
-    name: Arc<str>,
     backend_caches: Vec<BackendCache>,
     _spec: PhantomData<fn() -> S>,
 }
@@ -124,30 +120,9 @@ impl<S: KernelSpec> Kernel<S> {
         Ok(Self {
             config,
             outlier_warnings,
-            name: name.into(),
             backend_caches,
             _spec: PhantomData,
         })
-    }
-
-    pub fn lookup(&self, input: &S::Input) -> LookupResult {
-        let coords = input.coords();
-        let mut result = fastest_lookup(&self.backend_caches, &coords);
-        result.name = self.name.clone();
-        result
-    }
-
-    /// Time-only fast path: the minimum wallclock across backends, with none of
-    /// the `LookupResult` machinery (`Arc<str>` name clone, flops/bytes/energy,
-    /// warning/breakdown `Vec`s). For per-tick callers that only advance the
-    /// sim clock. Best-of-N still holds: it returns `min` over the backends.
-    pub fn lookup_time(&self, input: &S::Input) -> Time {
-        let coords = input.coords();
-        self.backend_caches
-            .iter()
-            .map(|backend_cache| backend_cache.lookup_time(&coords))
-            .min()
-            .expect("kernel config validation must create at least one backend cache")
     }
 
     /// All-four-metrics best-of-N for the CostTree eval path: the `Metrics4` of
@@ -196,32 +171,17 @@ impl<S: KernelSpec> Kernel<S> {
 
 impl<S: KernelSpec> Probe for Kernel<S> {
     type Input = S::Input;
-    fn lookup(&self, input: &Self::Input) -> LookupResult {
-        Self::lookup(self, input)
-    }
-    fn lookup_time(&self, input: &Self::Input) -> Time {
-        Self::lookup_time(self, input)
-    }
     fn lookup_metrics(&self, input: &Self::Input) -> LeafMetrics {
         Self::lookup_metrics(self, input)
     }
-}
-
-impl<S: KernelSpec> Describe for Kernel<S> {
-    /// Leaf line: `<name> (<KIND>) <cfg fields>`. One blanket impl covers every
-    /// kernel because all of them are `Kernel<S>` — no per-kernel macro. The cfg
-    /// fields come from `KernelConfig: Debug`.
-    fn describe(&self, depth: usize, out: &mut String) {
-        use std::fmt::Write;
-        writeln!(
-            out,
-            "{}{} ({}) {}",
-            "│  ".repeat(depth),
-            self.name,
-            S::KIND,
-            self.config.describe_config(),
-        )
-        .unwrap();
+    /// The KIND tag + one-line config summary the CostTree compile captures into
+    /// the leaf's manifest entry (the old `Describe` leaf line). One blanket impl
+    /// covers every kernel since all are `Kernel<S>`.
+    fn kind(&self) -> &'static str {
+        S::KIND
+    }
+    fn describe_config(&self) -> String {
+        self.config.describe_config()
     }
 }
 
@@ -250,17 +210,6 @@ fn ensure_has_backends(
         });
     }
     Ok(())
-}
-
-fn fastest_lookup<'a>(
-    backend_caches: impl IntoIterator<Item = &'a BackendCache>,
-    sweep: &[f64],
-) -> LookupResult {
-    backend_caches
-        .into_iter()
-        .map(|backend_cache| backend_cache.lookup(sweep))
-        .min_by_key(|result| result.time)
-        .expect("kernel config validation must create at least one backend cache")
 }
 
 #[cfg(test)]

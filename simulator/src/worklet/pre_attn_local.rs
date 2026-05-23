@@ -8,17 +8,13 @@
 
 use std::sync::Arc;
 
-use crate::common::Time;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::{
-    BuildError, CostNode, CostTreeBuilder, Describe, JitPlan, LeafMetrics, LookupResult,
-    PerfApiBridge,
-};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, JitPlan, LeafMetrics, PerfApiBridge};
 
 /// Raw global config (no partition: `Local` = 1 GPU). Backend strings pass
 /// straight through to L1 (config-level polymorphism, L3 §1.6).
@@ -125,34 +121,21 @@ impl PreAttnLocalWorklet {
         Ok(JitPlan::sum(name.to_string(), parts))
     }
 
-    pub fn lookup(&self, input: &PreAttnLocalWorkletInput) -> LookupResult {
-        let norm_in = RmsNormKernelInput {
-            m: input.batch_tokens,
-        };
-        let gemm_in = SingleGemmKernelInput {
-            m: input.batch_tokens,
-        };
-        LookupResult::sum(
-            self.name.clone(),
-            vec![self.input_norm.lookup(&norm_in), self.qkv.lookup(&gemm_in)],
-        )
-    }
-
-    /// Wallclock-only fast path — sums child `lookup_time`s, no tree/`Vec`.
-    pub fn lookup_time(&self, input: &PreAttnLocalWorkletInput) -> Time {
-        let norm_in = RmsNormKernelInput {
-            m: input.batch_tokens,
-        };
-        let gemm_in = SingleGemmKernelInput {
-            m: input.batch_tokens,
-        };
-        self.input_norm.lookup_time(&norm_in) + self.qkv.lookup_time(&gemm_in)
-    }
-
-    /// CostTree compile (M1): sum over the two atomic ops — mirrors `lookup`'s
-    /// child list, structure only (no per-iter shape).
+    /// CostTree compile: sum over the two atomic ops, wrapped in a `Labeled` node
+    /// carrying the worklet identity + partition/shape annotation (the old
+    /// `Describe` header lines).
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        CostNode::Sum(vec![self.input_norm.compile(builder), self.qkv.compile(builder)])
+        let label = format!(
+            "{} (PreAttnLocalWorklet) [local (1 GPU); qkv n={}, k={}]",
+            self.name, self.resolved.qkv.n, self.resolved.qkv.k
+        );
+        CostNode::Labeled {
+            label,
+            child: Box::new(CostNode::Sum(vec![
+                self.input_norm.compile(builder),
+                self.qkv.compile(builder),
+            ])),
+        }
     }
 
     /// CostTree eval: fill the input_norm then qkv slots — same child order as
@@ -166,22 +149,6 @@ impl PreAttnLocalWorklet {
         };
         self.input_norm.eval(&norm_in, buf, cursor);
         self.qkv.eval(&gemm_in, buf, cursor);
-    }
-}
-
-impl Describe for PreAttnLocalWorklet {
-    fn describe(&self, depth: usize, out: &mut String) {
-        use std::fmt::Write;
-        let ind = "│  ".repeat(depth);
-        writeln!(out, "{}{} (PreAttnLocalWorklet)", ind, self.name).unwrap();
-        writeln!(
-            out,
-            "{}├── partition: local (1 GPU); qkv n={}, k={}",
-            ind, self.resolved.qkv.n, self.resolved.qkv.k
-        )
-        .unwrap();
-        self.input_norm.describe(depth + 1, out);
-        self.qkv.describe(depth + 1, out);
     }
 }
 

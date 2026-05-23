@@ -1,66 +1,35 @@
 //! Per-backend wrapper around a fitted `Box<dyn Cache>`.
 //!
 //! `*Kernel` holds a `Vec<BackendCache>` (one per entry in
-//! `*KernelConfig.backends`) and runs best-of-N over their `.lookup()` results.
-//! Keeping this struct in its own file isolates the "wrap + annotate + rewrite
-//! warnings" concern from the abstract `Cache` trait and its variants in
-//! `cache/mod.rs`.
+//! `*KernelConfig.backends`) and runs best-of-N over their `.lookup_metrics()`
+//! results. Keeping this struct in its own file isolates the wrapping concern
+//! from the abstract `Cache` trait and its variants in `cache/mod.rs`.
 
-use crate::common::time::Time;
 use crate::timing::bridge::{BuildError, KernelKind, KernelMetrics};
 use crate::timing::cache::interp::LeafMetrics;
 use crate::timing::cache::{build_cache, Cache, CacheKind, OutlierWarning};
 use crate::timing::sweep::SweepGrid;
-use crate::timing::LookupResult;
 
-/// Per-backend cache wrapper: a `Box<dyn Cache>` annotated with the backend
-/// label and the `CacheKind` it was built as. `lookup` rewrites warning details
-/// with `"{backend}:{cache_kind}: ..."` so the final warning still identifies
-/// the source row after best-of-N selection.
+/// Per-backend cache wrapper: a fitted `Box<dyn Cache>`. `*Kernel` runs
+/// best-of-N over a `Vec<BackendCache>` via `lookup_metrics`.
 pub(crate) struct BackendCache {
-    backend: &'static str,
-    cache_kind: CacheKind,
     cache: Box<dyn Cache>,
 }
 
 impl BackendCache {
     pub(crate) fn fit(
         kernel_kind: KernelKind,
-        backend: &'static str,
+        _backend: &'static str,
         cache_kind: CacheKind,
         sweep_grid: &SweepGrid,
         samples: &[KernelMetrics],
     ) -> Result<(Self, Vec<OutlierWarning>), BuildError> {
         let (cache, warnings) = build_cache(kernel_kind, cache_kind, sweep_grid, samples)?;
-        Ok((
-            Self {
-                backend,
-                cache_kind,
-                cache,
-            },
-            warnings,
-        ))
+        Ok((Self { cache }, warnings))
     }
 
-    pub(crate) fn lookup(&self, sweep: &[f64]) -> LookupResult {
-        let mut result = self.cache.lookup(sweep);
-        result.selected_backend = Some(self.backend);
-        for warning in &mut result.warnings {
-            warning.detail = format!("{}:{:?}: {}", self.backend, self.cache_kind, warning.detail);
-        }
-        result
-    }
-
-    /// Time-only fast path — no backend stamping or warning rewrite needed, the
-    /// caller is comparing wallclocks for best-of-N selection. See
-    /// `Cache::lookup_time`.
-    pub(crate) fn lookup_time(&self, sweep: &[f64]) -> Time {
-        self.cache.lookup_time(sweep)
-    }
-
-    /// Metrics fast path for CostTree eval — no backend stamping, the caller
-    /// (`Kernel::lookup_metrics`) selects best-of-N itself. See
-    /// `Cache::lookup_metrics`.
+    /// Metrics fast path for CostTree eval — the caller (`Kernel::lookup_metrics`)
+    /// selects best-of-N itself. See `Cache::lookup_metrics`.
     pub(crate) fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
         self.cache.lookup_metrics(sweep)
     }
@@ -86,7 +55,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_cache_lookup_stamps_selected_backend_on_inner_leaf() {
+    fn backend_cache_lookup_metrics_interpolates() {
         let grid = SweepGrid::new(vec![vec![1.0, 2.0]]);
         let (cache, _warnings) = BackendCache::fit(
             "single_gemm",
@@ -97,7 +66,8 @@ mod tests {
         )
         .expect("fit must succeed for a finite 1D batch");
 
-        let result = cache.lookup(&[1.5]);
-        assert_eq!(result.selected_backend, Some("torch"));
+        // Midpoint between the two profiled times (1.0, 3.0) → 2.0 ms.
+        let leaf = cache.lookup_metrics(&[1.5]);
+        assert_eq!(leaf.m.time_ms, 2.0);
     }
 }

@@ -22,6 +22,9 @@ pub fn cost_log_envelope_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("worker_id", DataType::UInt16, false),
         Field::new("worker_kind", DataType::Utf8, false),
+        // Iteration index (one forward-pass cycle); shared by every batch a worker
+        // runs in that iteration. `batch_id` distinguishes those batches.
+        Field::new("iter_id", DataType::UInt64, false),
         Field::new("batch_id", DataType::UInt64, false),
         Field::new("call_seq", DataType::UInt32, false),
         Field::new("layer", DataType::Int16, false),
@@ -43,6 +46,12 @@ pub fn cost_log_schema() -> Arc<Schema> {
     let cov_item = Arc::new(Field::new("item", DataType::UInt8, false));
     Arc::new(Schema::new(vec![
         Field::new("worker_id", DataType::UInt16, false),
+        // `iter_id` is the per-worker iteration index (one forward-pass cycle);
+        // `batch_id` is the batch *within* that iteration. They coincide today
+        // (one batch per iteration) but diverge under AFD/TBO, where a worker runs
+        // several batches in one iteration — so the row key is (worker_id, iter_id,
+        // batch_id), not iter_id alone.
+        Field::new("iter_id", DataType::UInt64, false),
         Field::new("batch_id", DataType::UInt64, false),
         Field::new("wall_start_ms", DataType::Float64, false),
         Field::new("wall_end_ms", DataType::Float64, false),

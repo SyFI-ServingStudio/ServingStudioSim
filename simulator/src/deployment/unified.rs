@@ -48,24 +48,6 @@ pub struct UnifiedParams {
     #[arg(long, default_value_t = 80.0)]
     pub attn_gpu_memory_gb: f64,
 
-    /// Build the full per-iteration `LookupResult` cost tree (per-leaf breakdown
-    /// for cost logging/inspection) instead of the wallclock-only fast path.
-    /// Slower (per-iter tree allocation); off by default.
-    #[arg(long, default_value_t = false)]
-    pub cost_verbose: bool,
-
-    /// Use the compiled CostTree eval+aggregate path for the per-iter clock
-    /// (full per-slot metrics, flat O(slots) writes — no `LookupResult` tree).
-    /// Takes precedence over `--cost-verbose`; off by default.
-    #[arg(long, default_value_t = false)]
-    pub cost_tree: bool,
-
-    /// Emit a per-iteration `cost_log` parquet (the CostTree per-slot breakdown)
-    /// to `<log_dir>/raw/cost_log.parquet`, plus a `cost_manifest.json` sidecar
-    /// naming the slots. Implies the CostTree clock path. Off by default.
-    #[arg(long, default_value_t = false)]
-    pub cost_log: bool,
-
     /// Chunked-prefill cap: max tokens per batch (omit = unlimited).
     #[arg(long)]
     pub max_batch_tokens: Option<u32>,
@@ -139,9 +121,6 @@ impl Deployment for UnifiedDeployment {
         // alongside the worker's other env; the worker sizes its own KvPool.
         let worker_config = WorkerConfig {
             attn_kv_bytes: (args.attn_gpu_memory_gb * 1e9) as u64,
-            cost_verbose: args.cost_verbose,
-            cost_tree: args.cost_tree,
-            cost_log: args.cost_log,
             ..WorkerConfig::default()
         };
         let log_dir: Option<PathBuf> = Some(args.io.log_dir.clone());

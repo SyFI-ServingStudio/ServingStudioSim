@@ -32,7 +32,8 @@ def _group_entries(entries: Any) -> list[tuple[str, dict]]:
     Two authoring forms, same zipped semantics:
       - **list** → index labels (`"0"`, `"1"`, …) — the original form, unchanged;
       - **dict** → its keys as labels, for readable sweep dirs
-        (`{"fold": {}, "tree": {"cost_tree": true}}` → labels `fold`/`tree`).
+        (`{"low": {"request_rate": 50}, "high": {"request_rate": 300}}` → labels
+        `low`/`high`).
     The label only feeds `_sweep_labels` / `log_dir` templating; the partial dict
     of field assignments is applied to the candidate identically either way."""
     if isinstance(entries, dict):

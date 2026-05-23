@@ -21,17 +21,13 @@
 
 use std::sync::Arc;
 
-use crate::common::Time;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     FlashinferAttnDecodeKernel, FlashinferAttnDecodeKernelConfig, FlashinferAttnDecodeKernelInput,
     FlashinferAttnPrefillKernel, FlashinferAttnPrefillKernelConfig,
     FlashinferAttnPrefillKernelInput,
 };
-use crate::timing::{
-    BuildError, CostNode, CostTreeBuilder, Describe, JitPlan, LeafMetrics, LookupResult,
-    PerfApiBridge,
-};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, JitPlan, LeafMetrics, PerfApiBridge, Probe};
 
 /// Single op-level config; expands into the two sub-kernel configs (their field
 /// sets are identical, so this is their shared union). L2 design §3.5-1.
@@ -89,46 +85,24 @@ impl FlashInferAttentionOp {
         })
     }
 
-    pub fn lookup(&self, input: &FlashInferAttentionInput) -> LookupResult {
-        let mut parts = Vec::with_capacity(input.prefill_chunk_pairs.len() + 1);
-        for &(prefix_len, append_len) in &input.prefill_chunk_pairs {
-            parts.push(self.prefill.lookup(&FlashinferAttnPrefillKernelInput {
-                prefix_len,
-                append_len,
-            }));
-        }
-        if let Some(decode_input) = decode_input(&input.decode_kv_lens) {
-            parts.push(self.decode.lookup(&decode_input));
-        }
-        LookupResult::sum(self.name.clone(), parts)
-    }
-
-    /// Wallclock-only fast path (sums sub-kernel `lookup_time`s, no
-    /// `LookupResult` tree / `Vec` / name clone). For the per-iter clock.
-    pub fn lookup_time(&self, input: &FlashInferAttentionInput) -> Time {
-        let mut t = Time::ZERO;
-        for &(prefix_len, append_len) in &input.prefill_chunk_pairs {
-            t = t + self.prefill.lookup_time(&FlashinferAttnPrefillKernelInput {
-                prefix_len,
-                append_len,
-            });
-        }
-        if let Some(decode_input) = decode_input(&input.decode_kv_lens) {
-            t = t + self.decode.lookup_time(&decode_input);
-        }
-        t
-    }
-
-    /// CostTree compile (M1): two fixed leaves — `prefill` and `decode` —
-    /// regardless of request count (INV-1: stable shape). The per-request prefill
-    /// fan-out is NOT one slot per request; at eval the `prefill` slot is bound to
-    /// an aggregating fn that sums `prefill.lookup_metrics(prefix_i, append_i)`
-    /// over `prefill_chunk_pairs` into that single slot (decode already collapses
-    /// to one cell). Names mirror `new`'s `"{op}.{prefill,decode}"`.
+    /// CostTree compile: two fixed leaves — `prefill` and `decode` — regardless
+    /// of request count (INV-1: stable shape). The per-request prefill fan-out is
+    /// NOT one slot per request; at eval the `prefill` slot is the aggregating leaf
+    /// that sums `prefill.lookup_metrics(prefix_i, append_i)` over
+    /// `prefill_chunk_pairs` into that single slot (decode already collapses to one
+    /// cell). Each leaf carries its sub-kernel's `kind`/`config` for the render.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Sum(vec![
-            builder.leaf(format!("{}.prefill", self.name)),
-            builder.leaf(format!("{}.decode", self.name)),
+            builder.leaf(
+                format!("{}.prefill", self.name),
+                self.prefill.kind(),
+                self.prefill.describe_config(),
+            ),
+            builder.leaf(
+                format!("{}.decode", self.name),
+                self.decode.kind(),
+                self.decode.describe_config(),
+            ),
         ])
     }
 
@@ -177,15 +151,6 @@ impl FlashInferAttentionOp {
             )?,
         ];
         Ok(JitPlan::sum(name, parts))
-    }
-}
-
-impl Describe for FlashInferAttentionOp {
-    fn describe(&self, depth: usize, out: &mut String) {
-        use std::fmt::Write;
-        writeln!(out, "{}{}", "│  ".repeat(depth), self.name).unwrap();
-        self.prefill.describe(depth + 1, out);
-        self.decode.describe(depth + 1, out);
     }
 }
 

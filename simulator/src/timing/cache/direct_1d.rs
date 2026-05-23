@@ -1,14 +1,7 @@
-use std::sync::{Arc, LazyLock};
-
-use crate::common::time::Time;
 use crate::timing::bridge::KernelMetrics;
 use crate::timing::cache::interp::{CoverageFlags, LeafMetrics, Metrics4, MONOTONICITY_TOLERANCE};
 use crate::timing::cache::{Cache, OutlierKind, OutlierWarning};
 use crate::timing::sweep::SweepGrid;
-use crate::timing::{CoverageKind, CoverageWarning, LookupResult};
-
-/// Interned leaf name; `Kernel::lookup` overwrites it. See `linear_1d.rs`.
-static CACHE_NAME: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("cache_1d_direct"));
 
 /// Direct-indexed 1D cache for bounded-range, uniformly-sampled data — e.g. a
 /// batch / kv-length axis capped at ~32k with 64-wide spacing (512 buckets).
@@ -109,84 +102,6 @@ impl Cache for Cache1DDirect {
         )
     }
 
-    fn lookup(&self, sweep: &[f64]) -> LookupResult {
-        assert_eq!(
-            sweep.len(),
-            1,
-            "Cache1DDirect lookup requires one coordinate"
-        );
-        let x = sweep[0];
-        if x.is_nan() {
-            return LookupResult::leaf(
-                Arc::clone(&CACHE_NAME),
-                Time::ZERO,
-                0,
-                0,
-                0.0,
-                vec![CoverageWarning {
-                    kind: CoverageKind::NoCoverage,
-                    detail: "x is NaN; returning zero (not a real measurement)".to_string(),
-                }],
-            );
-        }
-        let (idx, scale, outside) = self.index(x as f32);
-        match self.buckets[idx] {
-            Some(m) => {
-                let warnings = if outside {
-                    let detail = if scale != 1.0 {
-                        format!("x={x} beyond right edge, linearly extrapolated from rightmost bucket")
-                    } else {
-                        format!("x={x} below 1D direct-cache range, clamped to first bucket")
-                    };
-                    vec![CoverageWarning {
-                        kind: CoverageKind::Extrapolated,
-                        detail,
-                    }]
-                } else {
-                    Vec::new()
-                };
-                LookupResult::leaf(
-                    Arc::clone(&CACHE_NAME),
-                    Time::from_ms((m.time_ms * scale).max(0.0) as f64),
-                    (m.flops * scale).max(0.0) as u64,
-                    (m.bytes * scale).max(0.0) as u64,
-                    (m.energy_j * scale).max(0.0) as f64,
-                    warnings,
-                )
-            }
-            // The landed bucket's fit-time sample was dropped as non-finite.
-            None => LookupResult::leaf(
-                Arc::clone(&CACHE_NAME),
-                Time::ZERO,
-                0,
-                0,
-                0.0,
-                vec![CoverageWarning {
-                    kind: CoverageKind::NoCoverage,
-                    detail: format!(
-                        "x={x}: direct-cache bucket has no finite sample; returning zero (not a real measurement)"
-                    ),
-                }],
-            ),
-        }
-    }
-
-    fn lookup_time(&self, sweep: &[f64]) -> Time {
-        assert_eq!(
-            sweep.len(),
-            1,
-            "Cache1DDirect lookup requires one coordinate"
-        );
-        if sweep[0].is_nan() {
-            return Time::ZERO;
-        }
-        let (idx, scale, _) = self.index(sweep[0] as f32);
-        match self.buckets[idx] {
-            Some(m) => Time::from_ms((m.time_ms * scale).max(0.0) as f64),
-            None => Time::ZERO,
-        }
-    }
-
     fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
         assert_eq!(
             sweep.len(),
@@ -256,9 +171,9 @@ impl Cache1DDirect {
 #[cfg(test)]
 mod tests {
     use crate::timing::bridge::KernelMetrics;
+    use crate::timing::cache::interp::CoverageFlags;
     use crate::timing::cache::{Cache, Cache1DDirect, OutlierKind};
     use crate::timing::sweep::{Axis, SweepGrid};
-    use crate::timing::CoverageKind;
 
     #[test]
     #[ignore = "internal microbench; run: cargo test --release --lib component_breakdown_1d_direct -- --ignored --nocapture"]
@@ -297,7 +212,7 @@ mod tests {
 
         // Each layer adds exactly one component over the previous, isolating where
         // the ~12ns goes: arithmetic vs. the dependent heap load vs. the slice +
-        // Time-newtype plumbing that `lookup_time` adds on top.
+        // LeafMetrics plumbing that `lookup_metrics` adds on top.
         run("baseline (return x)", &|x| x);
         run("index() only (arith + clamp)", &|x| cache.index(x).0 as f32);
         run("index() + bucket load (Option match)", &|x| {
@@ -307,11 +222,8 @@ mod tests {
                 None => 0.0,
             }
         });
-        run("lookup_time (+ &[f64] slice + Time)", &|x| {
-            cache.lookup_time(&[x as f64]).as_ms() as f32
-        });
-        run("lookup (+ full LookupResult + Arc)", &|x| {
-            cache.lookup(&[x as f64]).time.as_ms() as f32
+        run("lookup_metrics (+ &[f64] slice + LeafMetrics)", &|x| {
+            cache.lookup_metrics(&[x as f64]).m.time_ms
         });
     }
 
@@ -341,14 +253,14 @@ mod tests {
         assert!(warnings.is_empty());
 
         // Exact grid points return their bucket.
-        assert_eq!(cache.lookup(&[0.0]).time.as_ms(), 1.0);
-        assert_eq!(cache.lookup(&[128.0]).time.as_ms(), 3.0);
+        assert_eq!(cache.lookup_metrics(&[0.0]).m.time_ms, 1.0);
+        assert_eq!(cache.lookup_metrics(&[128.0]).m.time_ms, 3.0);
         // Between buckets: floor(x/64). 100→bucket1 (x=64)=2; 191→bucket2=3.
-        assert_eq!(cache.lookup(&[100.0]).time.as_ms(), 2.0);
-        assert_eq!(cache.lookup(&[191.0]).time.as_ms(), 3.0);
+        assert_eq!(cache.lookup_metrics(&[100.0]).m.time_ms, 2.0);
+        assert_eq!(cache.lookup_metrics(&[191.0]).m.time_ms, 3.0);
         // No interpolation: 192→bucket3=4 exactly.
-        assert_eq!(cache.lookup(&[192.0]).time.as_ms(), 4.0);
-        assert!(cache.lookup(&[100.0]).warnings.is_empty());
+        assert_eq!(cache.lookup_metrics(&[192.0]).m.time_ms, 4.0);
+        assert!(cache.lookup_metrics(&[100.0]).coverage.is_empty());
     }
 
     #[test]
@@ -358,20 +270,20 @@ mod tests {
 
         // Right edge: x_right=256, rightmost time=5.0. Linear-through-origin:
         // 512 is 2× the max coordinate → 2× its value = 10.0.
-        let double = cache.lookup(&[512.0]);
-        assert_eq!(double.time.as_ms(), 10.0);
-        assert_eq!(double.warnings[0].kind, CoverageKind::Extrapolated);
+        let double = cache.lookup_metrics(&[512.0]);
+        assert_eq!(double.m.time_ms, 10.0);
+        assert!(double.coverage.contains(CoverageFlags::EXTRAPOLATED));
 
         // Same scaling at an arbitrary far point: 9999/256 * 5.0.
-        let high = cache.lookup(&[9999.0]);
-        assert!((high.time.as_ms() - (9999.0 / 256.0 * 5.0)).abs() < 0.05);
-        assert_eq!(high.warnings[0].kind, CoverageKind::Extrapolated);
+        let high = cache.lookup_metrics(&[9999.0]);
+        assert!((high.m.time_ms - (9999.0 / 256.0 * 5.0)).abs() < 0.05);
+        assert!(high.coverage.contains(CoverageFlags::EXTRAPOLATED));
 
         // Left edge still clamps to the first bucket (no slope through origin
         // below `start`).
-        let low = cache.lookup(&[-50.0]);
-        assert_eq!(low.time.as_ms(), 1.0);
-        assert_eq!(low.warnings[0].kind, CoverageKind::Extrapolated);
+        let low = cache.lookup_metrics(&[-50.0]);
+        assert_eq!(low.m.time_ms, 1.0);
+        assert!(low.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
 
     #[test]
@@ -383,10 +295,9 @@ mod tests {
         // x_right=-64 and x=-32 is beyond the right edge. The documented
         // through-origin scale is x / x_right = 0.5, so the rightmost time 4.0
         // scales down to 2.0 instead of silently clamping at 4.0.
-        let result = cache.lookup(&[-32.0]);
-        assert_eq!(result.time.as_ms(), 2.0);
-        assert_eq!(cache.lookup_time(&[-32.0]), result.time);
-        assert_eq!(result.warnings[0].kind, CoverageKind::Extrapolated);
+        let result = cache.lookup_metrics(&[-32.0]);
+        assert_eq!(result.m.time_ms, 2.0);
+        assert!(result.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
 
     #[test]
@@ -394,10 +305,9 @@ mod tests {
         let (grid, samples) = grid_64();
         let (cache, _) = Cache1DDirect::from_samples(&grid, &samples);
 
-        let result = cache.lookup(&[f64::NAN]);
-        assert_eq!(result.time.as_ms(), 0.0);
-        assert_eq!(result.warnings[0].kind, CoverageKind::NoCoverage);
-        assert_eq!(cache.lookup_time(&[f64::NAN]), result.time);
+        let result = cache.lookup_metrics(&[f64::NAN]);
+        assert_eq!(result.m.time_ms, 0.0);
+        assert!(result.coverage.contains(CoverageFlags::NO_COVERAGE));
     }
 
     #[test]
@@ -416,11 +326,11 @@ mod tests {
         assert_eq!(warnings[0].kind, OutlierKind::NonFinite);
 
         // Landing on the dropped bucket (x=64) → NoCoverage, not a silent 0.
-        let dropped = cache.lookup(&[80.0]);
-        assert_eq!(dropped.time.as_ms(), 0.0);
-        assert_eq!(dropped.warnings[0].kind, CoverageKind::NoCoverage);
+        let dropped = cache.lookup_metrics(&[80.0]);
+        assert_eq!(dropped.m.time_ms, 0.0);
+        assert!(dropped.coverage.contains(CoverageFlags::NO_COVERAGE));
         // Neighboring live buckets still resolve.
-        assert_eq!(cache.lookup(&[128.0]).time.as_ms(), 3.0);
+        assert_eq!(cache.lookup_metrics(&[128.0]).m.time_ms, 3.0);
     }
 
     #[test]
@@ -433,14 +343,5 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|w| w.kind == OutlierKind::MonotonicityBreak));
-    }
-
-    #[test]
-    fn lookup_time_matches_lookup_time_field() {
-        let (grid, samples) = grid_64();
-        let (cache, _) = Cache1DDirect::from_samples(&grid, &samples);
-        for x in [0.0, 80.0, 128.0, 250.0, 9999.0, -10.0] {
-            assert_eq!(cache.lookup_time(&[x]), cache.lookup(&[x]).time);
-        }
     }
 }

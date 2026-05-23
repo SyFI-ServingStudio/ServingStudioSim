@@ -3,9 +3,9 @@
 //! Mirrors [`LoggerSession`](crate::log::session::LoggerSession)'s threading
 //! (sim thread buffers rows; a background thread encodes + ZSTD-compresses +
 //! writes the parquet), but stands alone so cost logging doesn't perturb the
-//! per-request streams or the run loop. The worker constructs one when
-//! `--cost-log` is set, writes the slot-name `cost_manifest.json` sidecar once,
-//! then pushes a `CostLogEntry` per iteration.
+//! per-request streams or the run loop. The worker constructs one when a log dir
+//! is available, writes the `cost_manifest.json` sidecar once (slots + aggregation
+//! structure, for reproducing the total), then pushes a `CostLogEntry` per iteration.
 
 use std::path::Path;
 use std::sync::mpsc::{sync_channel, SyncSender};
@@ -16,6 +16,7 @@ use anyhow::{anyhow, Result};
 use crate::log::parquet_writer::StreamingParquetWriter;
 use crate::log::rows::{cost_to_record_batch, CostLogEntry};
 use crate::log::schemas::cost_log_schema;
+use crate::timing::CostManifest;
 
 const STREAM_FLUSH_ROWS: usize = 8_192;
 const CHANNEL_CAP: usize = 64;
@@ -31,15 +32,16 @@ pub struct CostLogger {
 
 impl CostLogger {
     /// Open `<log_dir>/raw/cost_log.parquet` + spawn the writer thread, and write
-    /// the slot-name manifest to `<log_dir>/raw/cost_manifest.json` (positions in
-    /// the parquet's `slot_*` lists map to these names, in order).
-    pub fn open(log_dir: &Path, slot_names: &[String]) -> Result<Self> {
+    /// the [`CostManifest`] to `<log_dir>/raw/cost_manifest.json`. The manifest
+    /// carries the ordered slots (positions map to the parquet's `slot_*` lists)
+    /// *and* the flattened aggregation nodes, so a consumer can reproduce
+    /// `total_time_ms` from a row's per-slot breakdown.
+    pub fn open(log_dir: &Path, manifest: &CostManifest) -> Result<Self> {
         let raw = log_dir.join("raw");
         std::fs::create_dir_all(&raw)?;
-        let manifest = serde_json::json!({ "slots": slot_names });
         std::fs::write(
             raw.join("cost_manifest.json"),
-            serde_json::to_vec_pretty(&manifest)?,
+            serde_json::to_vec_pretty(manifest)?,
         )?;
 
         let mut writer =

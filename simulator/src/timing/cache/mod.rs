@@ -1,10 +1,8 @@
 //! Cache interpolation primitives for L1 kernels.
 
-use crate::common::time::Time;
 use crate::timing::bridge::{BuildError, KernelKind, KernelMetrics};
-use crate::timing::cache::interp::{CoverageFlags, LeafMetrics, Metrics4};
+use crate::timing::cache::interp::LeafMetrics;
 use crate::timing::sweep::SweepGrid;
-use crate::timing::LookupResult;
 
 pub mod backend;
 pub mod cliff_2d;
@@ -26,38 +24,11 @@ pub trait Cache: Send + Sync {
     where
         Self: Sized;
 
-    fn lookup(&self, sweep: &[f64]) -> LookupResult;
-
-    /// Hot-path fast path: interpolate only the wallclock time, skipping the
-    /// `Arc<str>` name, flops/bytes/energy, and the warning/breakdown `Vec`s
-    /// that `lookup` builds. Per-tick sim callers that only advance the clock
-    /// use this. Impls must keep it consistent with `lookup().time` by routing
-    /// both through the same interval-locate helper.
-    fn lookup_time(&self, sweep: &[f64]) -> Time;
-
     /// All four metrics + coverage flags, allocation-free — the CostTree eval
     /// path's per-leaf value (streamed into `buf[slot]`, then rolled up by
-    /// [`CostTree::aggregate`](crate::timing::CostTree)). Same numbers as
-    /// `lookup` (NaN/empty → zero, fields clamped non-negative) and the same
-    /// coverage *kinds*, but without the `Arc<str>` name or warning `Vec`/`String`
-    /// details. The default delegates to `lookup` and narrows; the interpolating
-    /// caches override it with their alloc-free `interpolate` path.
-    fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics {
-        let r = self.lookup(sweep);
-        let mut coverage = CoverageFlags::EMPTY;
-        for w in &r.warnings {
-            coverage |= CoverageFlags::from_kind(w.kind);
-        }
-        LeafMetrics {
-            m: Metrics4 {
-                time_ms: r.time.as_ms() as f32,
-                flops: r.flops as f32,
-                bytes: r.bytes as f32,
-                energy_j: r.energy_j as f32,
-            },
-            coverage,
-        }
-    }
+    /// [`CostTree::aggregate`](crate::timing::CostTree)). NaN/empty → zero, fields
+    /// clamped non-negative; off-grid lookups set `EXTRAPOLATED`/`NO_COVERAGE`.
+    fn lookup_metrics(&self, sweep: &[f64]) -> LeafMetrics;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
