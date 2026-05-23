@@ -51,5 +51,26 @@ schema-derive = { path = "simulator/schema-derive" }
 # Temp dirs/files for L7 frontend + tick-driver + parquet writer tests.
 tempfile = "3"
 
+# Build profiles mirror ref/moesim-rs. `release` is the everyday run profile:
+# thin LTO + baked-in debuginfo so `perf` resolves the heavily-inlined tick loop
+# directly (no separate profiling build). `maxperf` (fat LTO, codegen-units = 1)
+# is for benchmarks / long experiment runs: `cargo build --profile maxperf`.
+[profile.release]
+lto = "thin"
+codegen-units = 16
+debug = true
+split-debuginfo = "unpacked"
+
+[profile.maxperf]
+inherits = "release"
+lto = true
+codegen-units = 1
+split-debuginfo = "off"
+
+# Optimize dependencies even in dev/test builds so unoptimized deps don't
+# dominate the tick loop during `cargo test`.
+[profile.dev.package."*"]
+opt-level = 2
+
 [workspace]
 members = ["simulator/timing-kernel-derive", "simulator/schema-derive"]
