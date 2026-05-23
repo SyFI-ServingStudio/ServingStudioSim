@@ -6,7 +6,6 @@
 //! `preserved_prefix_kv`, ...) land alongside L7 lifecycle work.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ops::{Index, IndexMut};
 use std::rc::Rc;
 
@@ -113,7 +112,19 @@ impl RequestRecord {
 /// created by the owner and shared via [`SharedRequests`]. See plan decision 2.
 #[derive(Default, Debug)]
 pub struct RequestStore {
-    records: HashMap<RequestId, RequestRecord>,
+    /// Dense, id-indexed: `records[id.0]` is request `id`. The trace frontend
+    /// validates ids as sequential `0..N` and emits them in arrival order, so a
+    /// `Vec` replaces a per-tick hash lookup with a plain array index (the tick
+    /// loop indexes the store on every active request, every tick).
+    records: Vec<RequestRecord>,
+    /// Highest id ever admitted to a worker (i.e. that started prefill), or
+    /// `None` before the first admission. Because requests arrive id-dense in
+    /// arrival order and the milestone's single worker admits FIFO, the admitted
+    /// set is the prefix `records[0..=admitted_hi]`. Dense `request_state`
+    /// snapshots iterate only that prefix (`iter_admitted`) so the unserved
+    /// pending-queue tail — all-zero "queued" rows that contribute nothing to
+    /// the downstream snapshot-diff workload — is never logged.
+    admitted_hi: Option<u32>,
 }
 
 impl RequestStore {
@@ -122,21 +133,24 @@ impl RequestStore {
     }
 
     /// Insert a freshly arrived request's record (arrival facts; working fields
-    /// zeroed).
+    /// zeroed). Ids must arrive dense + in order so `records[id.0]` holds.
     pub fn insert(&mut self, req: &Request) {
-        self.records.insert(req.id, RequestRecord::from_request(req));
+        debug_assert_eq!(
+            req.id.0 as usize,
+            self.records.len(),
+            "RequestStore expects dense, in-order ids (got id={}, next slot={})",
+            req.id.0,
+            self.records.len(),
+        );
+        self.records.push(RequestRecord::from_request(req));
     }
 
     pub fn get(&self, id: RequestId) -> Option<&RequestRecord> {
-        self.records.get(&id)
+        self.records.get(id.0 as usize)
     }
 
     pub fn get_mut(&mut self, id: RequestId) -> Option<&mut RequestRecord> {
-        self.records.get_mut(&id)
-    }
-
-    pub fn remove(&mut self, id: RequestId) -> Option<RequestRecord> {
-        self.records.remove(&id)
+        self.records.get_mut(id.0 as usize)
     }
 
     pub fn len(&self) -> usize {
@@ -147,35 +161,59 @@ impl RequestStore {
         self.records.is_empty()
     }
 
-    /// Iterate `(id, record)` over every request seen so far. Used by the L7-γ
-    /// sim-end flush to write a `request_slo` row for each still-in-flight req.
+    /// Iterate `(id, record)` over every request seen so far (incl. the unserved
+    /// pending tail). Used by the end-of-run summary, which counts all arrivals.
     pub fn iter(&self) -> impl Iterator<Item = (RequestId, &RequestRecord)> {
-        self.records.iter().map(|(&id, r)| (id, r))
+        self.records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (RequestId(i as u32), r))
+    }
+
+    /// Record that `id` has been admitted to a worker (started prefill),
+    /// advancing the admitted-prefix watermark. Called once at admission
+    /// (`BareboneWorker::promise`). `max` keeps the watermark monotonic even if a
+    /// future non-FIFO placement admits ids out of order (it would then only
+    /// transiently over-include a zero-workload gap row, never drop a real one).
+    pub fn mark_admitted(&mut self, id: RequestId) {
+        self.admitted_hi = Some(self.admitted_hi.map_or(id.0, |hi| hi.max(id.0)));
+    }
+
+    /// Iterate `(id, record)` over admitted requests only — the prefix
+    /// `records[0..=admitted_hi]`. Empty until the first admission. Dense
+    /// `request_state` snapshots use this instead of `iter` so the never-admitted
+    /// pending tail is skipped (see `admitted_hi`).
+    pub fn iter_admitted(&self) -> impl Iterator<Item = (RequestId, &RequestRecord)> {
+        let upto = self.admitted_hi.map_or(0, |hi| hi as usize + 1);
+        self.records[..upto]
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (RequestId(i as u32), r))
     }
 
     /// Every inserted request has completed (drives `--run-to-end` termination).
+    /// O(n); not on the per-tick path — the tick loop tracks its own in-flight
+    /// count from arrival / completion events.
     pub fn all_complete(&self) -> bool {
-        self.records.values().all(|r| r.completed)
+        self.records.iter().all(|r| r.completed)
     }
 
-    /// Count of inserted-but-not-yet-completed requests.
+    /// Count of inserted-but-not-yet-completed requests. O(n); see `all_complete`.
     pub fn in_flight(&self) -> usize {
-        self.records.values().filter(|r| !r.completed).count()
+        self.records.iter().filter(|r| !r.completed).count()
     }
 }
 
 impl Index<RequestId> for RequestStore {
     type Output = RequestRecord;
     fn index(&self, id: RequestId) -> &RequestRecord {
-        &self.records[&id]
+        &self.records[id.0 as usize]
     }
 }
 
 impl IndexMut<RequestId> for RequestStore {
     fn index_mut(&mut self, id: RequestId) -> &mut RequestRecord {
-        self.records
-            .get_mut(&id)
-            .expect("RequestStore: indexed an absent request id")
+        &mut self.records[id.0 as usize]
     }
 }
 

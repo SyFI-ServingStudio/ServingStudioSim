@@ -5,6 +5,7 @@
 //! model per iteration). The AFD attn/ffn-split `AttnArchInput` / `FfnArchInput`
 //! and the layer-wise traits are deferred.
 
+use crate::common::Time;
 use crate::timing::LookupResult;
 
 /// One HP group's batch state. Under a `Local`/unified single-GPU deployment
@@ -39,6 +40,14 @@ pub struct UnifiedArchInput {
 /// the signature (no `dyn`); L5 binds via `<M: IterwiseUnifiedModel>` generic.
 pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     fn cost_whole_iter(&self, batch: &UnifiedArchInput) -> LookupResult;
+
+    /// Wallclock-only cost of the whole iteration, for the per-iter sim clock.
+    /// The default builds the full `LookupResult` and discards everything but
+    /// `time`; models with a homogeneous layer stack override this to skip the
+    /// per-iter tree/`Vec`/`Arc` allocation (the dominant tick-loop cost).
+    fn cost_whole_iter_time(&self, batch: &UnifiedArchInput) -> Time {
+        self.cost_whole_iter(batch).time
+    }
 
     /// KV-cache bytes one token occupies across the whole model. The worker
     /// divides its memory allowance by this to size its `KvPool` (L5 owns the

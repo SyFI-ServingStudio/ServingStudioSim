@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use crate::common::Time;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     FlashinferAttnDecodeKernel, FlashinferAttnDecodeKernelConfig, FlashinferAttnDecodeKernelInput,
@@ -97,6 +98,22 @@ impl FlashInferAttentionOp {
             parts.push(self.decode.lookup(&decode_input));
         }
         LookupResult::sum(self.name.clone(), parts)
+    }
+
+    /// Wallclock-only fast path (sums sub-kernel `lookup_time`s, no
+    /// `LookupResult` tree / `Vec` / name clone). For the per-iter clock.
+    pub fn lookup_time(&self, input: &FlashInferAttentionInput) -> Time {
+        let mut t = Time::ZERO;
+        for &(prefix_len, append_len) in &input.prefill_chunk_pairs {
+            t = t + self.prefill.lookup_time(&FlashinferAttnPrefillKernelInput {
+                prefix_len,
+                append_len,
+            });
+        }
+        if let Some(decode_input) = decode_input(&input.decode_kv_lens) {
+            t = t + self.decode.lookup_time(&decode_input);
+        }
+        t
     }
 
     /// Build-time sibling of `new`: borrows only, constructs nothing, returns the

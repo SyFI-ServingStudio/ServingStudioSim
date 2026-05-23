@@ -48,6 +48,12 @@ pub struct UnifiedParams {
     #[arg(long, default_value_t = 80.0)]
     pub attn_gpu_memory_gb: f64,
 
+    /// Build the full per-iteration `LookupResult` cost tree (per-leaf breakdown
+    /// for cost logging/inspection) instead of the wallclock-only fast path.
+    /// Slower (per-iter tree allocation); off by default.
+    #[arg(long, default_value_t = false)]
+    pub cost_verbose: bool,
+
     /// Chunked-prefill cap: max tokens per batch (omit = unlimited).
     #[arg(long)]
     pub max_batch_tokens: Option<u32>,
@@ -121,6 +127,7 @@ impl Deployment for UnifiedDeployment {
         // alongside the worker's other env; the worker sizes its own KvPool.
         let worker_config = WorkerConfig {
             attn_kv_bytes: (args.attn_gpu_memory_gb * 1e9) as u64,
+            cost_verbose: args.cost_verbose,
             ..WorkerConfig::default()
         };
         let factory = UnifiedWorkerFactory::new(model, store, worker_config);

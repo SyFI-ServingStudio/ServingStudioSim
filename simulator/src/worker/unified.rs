@@ -66,6 +66,11 @@ pub struct WorkerConfig {
     /// budget). Same per-worker tier as `gpu_name`; the worker divides it by the
     /// model's `kv_bytes_per_token` to size its `KvPool`.
     pub attn_kv_bytes: u64,
+    /// Cost-model detail per iteration. `false` (default): wallclock-only fast
+    /// path (`cost_whole_iter_time`, no `LookupResult` tree) — the dominant
+    /// tick-loop cost otherwise. `true`: build the full `LookupResult` tree
+    /// (per-leaf breakdown for cost logging/inspection), at ~tree-allocation cost.
+    pub cost_verbose: bool,
 }
 
 impl Default for WorkerConfig {
@@ -74,6 +79,7 @@ impl Default for WorkerConfig {
             admission: KvAdmission::Strict,
             balance: LoadBalance::Single,
             attn_kv_bytes: 80_000_000_000, // 80 GB
+            cost_verbose: false,
         }
     }
 }
@@ -242,9 +248,16 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     fn start_iter(&mut self, now: Time) -> Time {
         let arch_input = self.build_arch_input();
-        let cost = self.model.cost_whole_iter(&arch_input);
+        // The clock needs only the total time. Default (time-only) skips building
+        // the per-iter `LookupResult` tree (the dominant tick-loop cost); verbose
+        // builds the full tree for cost breakdown/logging.
+        let cost_time = if self.config.cost_verbose {
+            self.model.cost_whole_iter(&arch_input).time
+        } else {
+            self.model.cost_whole_iter_time(&arch_input)
+        };
         self.runtime.iter_compute_start = now;
-        now + cost.time
+        now + cost_time
     }
 
     // ── Stage 3: complete_iter (token bookkeeping + KV transitions) ────────────
@@ -352,6 +365,10 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
             .insert(rid, (gid, (p + prefix + d) as u64));
         self.runtime.request_to_group.insert(rid, gid);
         let mut store = self.requests.borrow_mut();
+        // Admission point: this request leaves the pending queue and starts
+        // prefill. Advance the store's admitted-prefix watermark so dense
+        // `request_state` snapshots log it (and skip the still-pending tail).
+        store.mark_admitted(rid);
         let r = &mut store[rid];
         r.active_chunk_len = p;
         r.prefix_kv = prefix;
@@ -453,7 +470,7 @@ mod tests {
 
     #[test]
     fn single_request_prefill_then_decode_completes() {
-        let store = shared_with(&[(1, 16, 3)]); // prompt 16, 3 decode tokens
+        let store = shared_with(&[(0, 16, 3)]); // prompt 16, 3 decode tokens
         let model = Arc::new(FakeModel { ms: 1.0 });
         let mut w = BareboneWorker::new(
             WorkerId(0),
@@ -461,17 +478,17 @@ mod tests {
             Rc::clone(&store),
             WorkerConfig::default(),
         );
-        w.enqueue(WorkerMsg::Request(RequestId(1)));
+        w.enqueue(WorkerMsg::Request(RequestId(0)));
 
         let events = run_to_quiescence(&mut w, 50);
         assert_eq!(
             events,
             vec![WorkerEvent::RequestComplete {
-                req: RequestId(1)
+                req: RequestId(0)
             }]
         );
         let s = store.borrow();
-        let r = &s[RequestId(1)];
+        let r = &s[RequestId(0)];
         assert!(r.completed);
         assert_eq!(r.tokens_emitted, 3); // first token + 2 decode tokens
         assert!(r.first_token_time.is_some());
@@ -479,7 +496,7 @@ mod tests {
 
     #[test]
     fn three_requests_all_complete() {
-        let store = shared_with(&[(1, 8, 2), (2, 8, 2), (3, 8, 2)]);
+        let store = shared_with(&[(0, 8, 2), (1, 8, 2), (2, 8, 2)]);
         let model = Arc::new(FakeModel { ms: 1.0 });
         let mut w = BareboneWorker::new(
             WorkerId(0),
@@ -487,14 +504,15 @@ mod tests {
             Rc::clone(&store),
             WorkerConfig::default(),
         );
-        for id in [1, 2, 3] {
+        for id in [0, 1, 2] {
             w.enqueue(WorkerMsg::Request(RequestId(id)));
         }
         let events = run_to_quiescence(&mut w, 200);
         assert_eq!(events.len(), 3);
         let s = store.borrow();
-        for id in [1, 2, 3] {
+        for id in [0, 1, 2] {
             assert!(s[RequestId(id)].completed, "req {id} should complete");
         }
+
     }
 }

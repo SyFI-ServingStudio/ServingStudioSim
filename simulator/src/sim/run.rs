@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use crate::common::{RequestId, RequestRecord, SharedRequests, Time};
-use crate::log::{LoggerSession, RequestSloEntry, RequestStateEntry};
+use crate::log::{FinalPhase, LoggerSession, RequestSloEntry, RequestStateEntry};
 use crate::orchestrator::{Flow, OrchAction};
 
 /// Sim-time between heartbeat log lines (matches ref/moesim-rs's 1 s).
@@ -71,10 +71,12 @@ pub struct TickCfg {
 
 impl TickCfg {
     pub fn new(duration_ms: f64, run_to_end: bool) -> Self {
-        // Ref/moesim-rs's unified loop ticks at 1 µs; we tick at 10 µs — 10x
-        // fewer iterations than ref, with 10 µs quantization on TTFT/TPOT
-        // (negligible against typical 10-50 ms TPOT).
-        let tick_dt = Time::from_us(10);
+        // Ref/moesim-rs's unified loop ticks at 1 µs; we tick at 100 µs — 100x
+        // fewer iterations than ref, with 100 µs quantization on TTFT/TPOT
+        // (~0.15% throughput bias vs 10 µs; coarser buys ~no speed since the
+        // per-iteration/token work is O(events), not O(ticks), and the bias
+        // grows — 1 ms costs ~1.4% for no gain).
+        let tick_dt = Time::from_us(100);
         Self {
             tick_dt,
             duration: Time::from_ms(duration_ms),
@@ -99,6 +101,11 @@ pub fn run_sim(
     let mut clock = Time::ZERO;
     let mut prev_progress = 0u64;
     let mut idle_for = Time::ZERO;
+    // In-flight is tracked from arrival / completion events, not by scanning the
+    // store every tick (that scan was ~90% of runtime on large backlogs).
+    // `arrived` counts drained requests; `completed` counts `Complete` actions.
+    let mut arrived = 0u64;
+    let mut completed = 0u64;
 
     // Every periodic step shares one iteration-count gate. With a fixed
     // `tick_dt`, "every K ticks" and "every K·tick_dt of sim-time" are the same,
@@ -112,47 +119,51 @@ pub fn run_sim(
     let cause = loop {
         // 1. Drain arrivals due by now → Flow inserts into the shared store.
         //    The frontend owns the drain loop, so the whole tick is emptied here.
-        frontend.drain_due(clock, |req| flow.on_arrival(req));
+        frontend.drain_due(clock, |req| {
+            arrived += 1;
+            flow.on_arrival(req);
+        });
 
         // 2. Advance one tick; each completion writes its terminal `request_slo`
         //    row. `request_state` is a periodic table (2b), not written here.
         for action in flow.tick(clock) {
             let OrchAction::Complete { req } = action;
+            completed += 1;
             let s = store.borrow();
             logger.record_request_slo(slo_entry(req, clock, &s[req]))?;
         }
 
-        // 2b. Periodic `request_state` snapshot — DENSE: every touched request is
-        //     logged each interval. In-flight reqs advance; completed reqs keep
-        //     re-emitting their frozen terminal values. This makes per-segment
-        //     workload a plain diff of consecutive snapshots' column sums (no
-        //     fill-forward over dropped-out requests needed).
+        // 2b. Periodic `request_state` snapshot — DENSE over the *admitted* set:
+        //     every request that has started prefill is logged each interval
+        //     (`iter_admitted`, the `records[0..=admitted_hi]` prefix). In-flight
+        //     reqs advance; completed reqs keep re-emitting their frozen terminal
+        //     values. This makes per-segment workload a plain diff of consecutive
+        //     snapshots' column sums (no fill-forward over dropped-out requests).
+        //     The never-admitted pending tail is skipped: it's all-zero "queued"
+        //     rows that contribute nothing to the diff, and on a saturated run
+        //     that tail is the bulk of the store.
         if snapshot.fire() {
             let s = store.borrow();
-            for (id, rec) in s.iter() {
+            for (id, rec) in s.iter_admitted() {
                 logger.record_request_state(state_entry(id, clock, rec))?;
             }
         }
 
-        // 2c. Periodic heartbeat (skip the stat scan unless INFO is enabled).
+        // 2c. Periodic heartbeat (no store scan — counters are maintained above).
         //     `fire()` runs first so the gate advances every tick regardless.
         if heartbeat.fire() && tracing::enabled!(tracing::Level::INFO) {
-            let s = store.borrow();
-            let completed = s.iter().filter(|(_, r)| r.completed).count();
             tracing::info!(
                 "t={:.0}ms: completed={} in_flight={}",
                 clock.as_ms(),
                 completed,
-                s.in_flight(),
+                arrived - completed,
             );
         }
 
-        // 3. Termination — drain-complete and duration are cheap (an in-flight
-        //    counter + a trace cursor), so check them on every tick.
-        let (in_flight, exhausted) = {
-            let s = store.borrow();
-            (s.in_flight(), frontend.exhausted())
-        };
+        // 3. Termination — both checks are O(1): in-flight is the maintained
+        //    arrival/completion delta, exhaustion is a trace cursor compare.
+        let in_flight = arrived - completed;
+        let exhausted = frontend.exhausted();
         if exhausted && in_flight == 0 {
             break TerminationCause::DrainComplete;
         }
@@ -195,42 +206,48 @@ pub fn run_sim(
         let prefill_tok: u64 = s.iter().map(|(_, r)| r.prefill_processed as u64).sum();
         let decode_tok: u64 = s.iter().map(|(_, r)| r.tokens_emitted as u64).sum();
         let all_tok = prefill_tok + decode_tok;
+        // Throughput is the *modeled* serving rate: tokens / requests per second
+        // of SIMULATED time (what the modeled cluster achieves), not per wall
+        // second (that would just be the simulator's speed, captured separately
+        // by the "x real-time" ratio below).
+        let sim_s = (clock.as_ms() / 1000.0).max(1e-9);
         tracing::info!("sim complete: cause={:?}", cause);
         tracing::info!("  requests: finished {}/{}", completed, total);
         tracing::info!(
             "  prefill:  {} tokens ({:.0} tok/s)",
             prefill_tok,
-            prefill_tok as f64 / safe_wall
+            prefill_tok as f64 / sim_s
         );
         tracing::info!(
             "  decode:   {} tokens ({:.0} tok/s)",
             decode_tok,
-            decode_tok as f64 / safe_wall
+            decode_tok as f64 / sim_s
         );
         tracing::info!(
             "  total:    {} tokens ({:.0} tok/s)",
             all_tok,
-            all_tok as f64 / safe_wall
+            all_tok as f64 / sim_s
         );
-        // Speedup = simulated wall-clock collapsed into real wall-clock: how many
-        // seconds of modeled time we cover per second of compute.
+        // Modeled completion rate (req per sim-second); then sim vs wall time and
+        // the speedup = how many seconds of modeled time we cover per real second.
         tracing::info!(
-            "  time:     sim {:.1}ms, wall {:.2}s ({:.0} req/s, {:.1}x real-time)",
+            "  time:     sim {:.1}ms, wall {:.2}s ({:.1} req/s, {:.1}x real-time)",
             clock.as_ms(),
             wall_s,
-            completed as f64 / safe_wall,
-            (clock.as_ms() / 1000.0) / safe_wall,
+            completed as f64 / sim_s,
+            sim_s / safe_wall,
         );
     }
     Ok(cause)
 }
 
-/// Sim-end flush: any request still in-flight gets a final (incomplete) state
-/// row + a partial slo row. Completed requests were already flushed at their
-/// completion tick.
+/// Sim-end flush: any *admitted* request still in-flight gets a final
+/// (incomplete) state row + a partial slo row. Completed requests were already
+/// flushed at their completion tick; the never-admitted pending tail is skipped
+/// (it never ran — same admitted-only scope as the periodic snapshot, 2b).
 fn finalize(store: &SharedRequests, logger: &mut LoggerSession, clock: Time) -> anyhow::Result<()> {
     let s = store.borrow();
-    for (id, rec) in s.iter() {
+    for (id, rec) in s.iter_admitted() {
         if !rec.completed {
             logger.record_request_state(state_entry(id, clock, rec))?;
             logger.record_request_slo(slo_entry(id, clock, rec))?;
@@ -253,15 +270,15 @@ fn progress_signature(store: &crate::common::RequestStore) -> u64 {
         .sum()
 }
 
-fn final_phase(rec: &RequestRecord) -> &'static str {
+fn final_phase(rec: &RequestRecord) -> FinalPhase {
     if rec.completed {
-        "complete"
+        FinalPhase::Complete
     } else if rec.first_token_time.is_some() {
-        "decode"
+        FinalPhase::Decode
     } else if rec.prefill_processed > 0 {
-        "prefill"
+        FinalPhase::Prefill
     } else {
-        "queued"
+        FinalPhase::Queued
     }
 }
 
@@ -282,7 +299,7 @@ fn state_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestStateEnt
         output_len: rec.decode_len,
         completed_input_len: rec.prefill_processed,
         completed_output_len: rec.tokens_emitted,
-        final_phase: final_phase(rec).to_string(),
+        final_phase: final_phase(rec),
         // single-round defaults
         session_id: id.0,
         round_idx: 0,

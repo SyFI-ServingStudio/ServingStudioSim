@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::model_cfg::{ModelCfg, ParallelCfg};
+use crate::common::Time;
 use crate::op::Op;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, RmsNormKernel,
@@ -256,6 +257,41 @@ pub fn build(
 impl IterwiseUnifiedModel for Llama3DenseModel {
     fn kv_bytes_per_token(&self) -> u64 {
         self.kv_bytes_per_token
+    }
+
+    /// Allocation-free wallclock for the sim clock. The dense stack is
+    /// homogeneous — every layer has identical cost for a given batch — so we
+    /// time one layer once and scale by `num_layers` (the cost_tree.md "fold"),
+    /// summing leaf `lookup_time`s with no `LookupResult` tree / `Vec` / `Arc`.
+    /// Numerically identical to `cost_whole_iter().time`.
+    fn cost_whole_iter_time(&self, batch: &UnifiedArchInput) -> Time {
+        assert_eq!(
+            batch.groups.len(),
+            1,
+            "Llama3 dense local has exactly one HP group"
+        );
+        let g = &batch.groups[0];
+        let m = g.batch_tokens;
+
+        let per_layer = self
+            .pre_attn
+            .lookup_time(&PreAttnLocalWorkletInput { batch_tokens: m })
+            + self.attn.lookup_time(&AttnLocalWorkletInput {
+                prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                decode_kv_lens: g.decode_kv_lens.clone(),
+            })
+            + self
+                .post_attn
+                .lookup_time(&PostAttnLocalWorkletInput { batch_tokens: m });
+
+        let embed = self.embed.lookup_time(&ElementwiseKernelInput { num_tokens: m });
+        let final_norm = self.final_norm.lookup_time(&RmsNormKernelInput { m });
+        let lm_head = self.lm_head.lookup_time(&SingleGemmKernelInput { m });
+
+        embed
+            + Time::from_ns(per_layer.as_ns() * self.num_layers as u64)
+            + final_norm
+            + lm_head
     }
 
     fn cost_whole_iter(&self, batch: &UnifiedArchInput) -> LookupResult {

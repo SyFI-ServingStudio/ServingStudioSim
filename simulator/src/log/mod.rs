@@ -15,7 +15,7 @@ pub mod schemas;
 pub mod session;
 
 pub use parquet_writer::StreamingParquetWriter;
-pub use rows::{RequestSloEntry, RequestStateEntry};
+pub use rows::{FinalPhase, RequestSloEntry, RequestStateEntry};
 pub use schemas::{
     cost_log_envelope_schema, kv_snapshot_schema, network_event_schema, request_slo_schema,
     request_state_schema, ALL_STREAMS,

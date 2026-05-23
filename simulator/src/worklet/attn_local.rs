@@ -10,6 +10,7 @@
 //! `gpu_name` rides in the config (L3 §1.6 / `gpu_name in *KernelConfig`); the
 //! `*Input` is pure shape.
 
+use crate::common::Time;
 use crate::op::attention::{FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp};
 use crate::timing::bridge::DType;
 use crate::timing::{BuildError, Describe, JitPlan, LookupResult, PerfApiBridge};
@@ -96,6 +97,15 @@ impl AttnLocalWorklet {
             decode_kv_lens: input.decode_kv_lens.clone(),
         };
         LookupResult::sum(self.name.clone(), vec![self.attn.lookup(&op_in)])
+    }
+
+    /// Wallclock-only fast path — delegates to the attn op's `lookup_time`.
+    pub fn lookup_time(&self, input: &AttnLocalWorkletInput) -> Time {
+        let op_in = FlashInferAttentionInput {
+            prefill_chunk_pairs: input.prefill_chunk_pairs.clone(),
+            decode_kv_lens: input.decode_kv_lens.clone(),
+        };
+        self.attn.lookup_time(&op_in)
     }
 }
 

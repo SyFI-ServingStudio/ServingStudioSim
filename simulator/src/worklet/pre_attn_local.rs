@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::common::Time;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
@@ -132,6 +133,17 @@ impl PreAttnLocalWorklet {
             self.name.clone(),
             vec![self.input_norm.lookup(&norm_in), self.qkv.lookup(&gemm_in)],
         )
+    }
+
+    /// Wallclock-only fast path — sums child `lookup_time`s, no tree/`Vec`.
+    pub fn lookup_time(&self, input: &PreAttnLocalWorkletInput) -> Time {
+        let norm_in = RmsNormKernelInput {
+            m: input.batch_tokens,
+        };
+        let gemm_in = SingleGemmKernelInput {
+            m: input.batch_tokens,
+        };
+        self.input_norm.lookup_time(&norm_in) + self.qkv.lookup_time(&gemm_in)
     }
 }
 

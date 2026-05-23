@@ -13,6 +13,31 @@ use arrow_schema::{DataType, Field};
 
 use crate::log::schemas::{request_slo_schema, request_state_schema};
 
+/// A request's lifecycle phase at snapshot time. A small `#[repr(u8)]` code
+/// rather than a `String`: dense `request_state` emits one row per live request
+/// per interval (tens of millions of rows on a long run), so a per-row `String`
+/// allocation here dominated both the sim thread (alloc) and the writer thread
+/// (dictionary intern). The parquet column is still `LargeUtf8` — `as_str()`
+/// hands back a `&'static str`, so the on-disk output is byte-identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalPhase {
+    Queued,
+    Prefill,
+    Decode,
+    Complete,
+}
+
+impl FinalPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FinalPhase::Queued => "queued",
+            FinalPhase::Prefill => "prefill",
+            FinalPhase::Decode => "decode",
+            FinalPhase::Complete => "complete",
+        }
+    }
+}
+
 /// One `request_state` row — a snapshot of a request at `logging_time_ms`.
 /// Single-round runs default the multi-round columns (`session_id = request_id`,
 /// `round_idx = 0`, `total_rounds = 1`, `tool_wait_after_ms = 0`,
@@ -29,7 +54,7 @@ pub struct RequestStateEntry {
     pub output_len: u32,
     pub completed_input_len: u32,
     pub completed_output_len: u32,
-    pub final_phase: String,
+    pub final_phase: FinalPhase,
     pub session_id: u32,
     pub round_idx: u32,
     pub total_rounds: u32,
