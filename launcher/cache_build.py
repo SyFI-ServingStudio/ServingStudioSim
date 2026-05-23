@@ -34,20 +34,42 @@ def cache_key(params: dict, cache_fields: Iterable[str]) -> tuple:
     return tuple(params.get(field) for field in cache_fields)
 
 
-def _prebuild_log_dir(params: dict, key: tuple) -> Path:
-    """Where a prebuild's stdout lands — a sibling of the run's log_dir so it
-    does not collide with the real run output."""
-    base = Path(str(params.get("log_dir", "logs")))
-    return base.parent / f".cache_build_{abs(hash(key))}"
+def _prebuild_log_dir(base_dir: Path, params: dict) -> Path:
+    """Where a prebuild's stdout lands — under a `.cache_build/` subdir of the
+    experiment's base logging directory (`base_dir`), named after the run's log
+    folder (its path relative to `base_dir`, with separators flattened) instead
+    of an opaque hash. This keeps prebuild output human-readable and grouped
+    under `base_dir` while staying unique per run (sweep log_dirs are unique by
+    INV) and not colliding with the real run output. `base_dir` is the run's
+    log_dir for a single run and the sweep's `_experiment_root` for a sweep."""
+    log_dir = Path(str(params.get("log_dir", "logs")))
+    try:
+        rel = log_dir.resolve().relative_to(base_dir.resolve())
+        label = "_".join(rel.parts)
+    except ValueError:
+        label = ""
+    label = label or log_dir.name or "run"
+    return base_dir / ".cache_build" / label
 
 
 async def prebuild_caches(
-    param_sets: list[dict], schema: Schema, build_type: str = "debug"
+    param_sets: list[dict],
+    schema: Schema,
+    build_type: str = "debug",
+    base_dir: Path | None = None,
 ) -> bool:
     """Run one `build-cache-only` per unique cache key, sequentially. Returns
     True iff every prebuild succeeded. The key fields come from the Rust schema
     (`affects_cache`), so two runs differing only in non-kernel params (rate,
-    server count, log_dir, ...) share a single prebuild."""
+    server count, log_dir, ...) share a single prebuild.
+
+    `base_dir` is the experiment's base logging directory under which prebuild
+    output subdirs are placed; the caller passes the single run's log_dir or the
+    sweep's `_experiment_root`. If omitted it falls back to the parent of the
+    first param set's log_dir."""
+    if base_dir is None:
+        first = Path(str(param_sets[0].get("log_dir", "logs"))) if param_sets else Path("logs")
+        base_dir = first.parent
     binary = binary_path(build_type)
     env = _build_subprocess_env()
 
@@ -63,7 +85,7 @@ async def prebuild_caches(
     for params, key in representatives:
         argv = build_cli_command(params, binary, subcommand="build-cache-only")
         runner = SimulationRunner(
-            argv=argv, log_dir=_prebuild_log_dir(params, key), env=env
+            argv=argv, log_dir=_prebuild_log_dir(base_dir, params), env=env
         )
         if not await runner.run():
             return False
