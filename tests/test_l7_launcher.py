@@ -250,6 +250,29 @@ def test_expand_sweep_groups_zip(schema):
     assert {(c["tp_size"], c["head_parallel"]) for c in cands} == {(1, 1), (2, 2)}
 
 
+def test_expand_sweep_groups_dict_named_labels(schema):
+    # Dict-form sweep_groups: keys are the labels (vs index labels for a list),
+    # so log_dir gets readable per-run dirs while the zipped fields apply the same.
+    preset = {
+        **_base(),
+        "log_dir": "logs/par_{parallelism}",
+        "sweep_groups": {
+            "parallelism": {
+                "single": {"tp_size": 1, "head_parallel": 1},
+                "tp2": {"tp_size": 2, "head_parallel": 2},
+            }
+        },
+    }
+    cands = expand_sweep_params(preset, schema)
+    # Same zipped field assignments as the list form…
+    assert {(c["tp_size"], c["head_parallel"]) for c in cands} == {(1, 1), (2, 2)}
+    # …but labels are the dict keys, and they template into log_dir.
+    by_label = {c["_sweep_labels"]["parallelism"]: c for c in cands}
+    assert set(by_label) == {"single", "tp2"}
+    assert _format_log_dir(by_label["single"])["log_dir"] == "logs/par_single"
+    assert _format_log_dir(by_label["tp2"])["log_dir"] == "logs/par_tp2"
+
+
 def test_expand_cartesian_product(schema):
     preset = {**_base(), "tp_size": [1, 2], "ep_size": [4, 8]}
     cands = expand_sweep_params(preset, schema)

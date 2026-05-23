@@ -9,7 +9,7 @@ metadata and are validated generically here.
 
 from __future__ import annotations
 
-from .expand import _classify_dimension
+from .expand import _classify_dimension, _group_entries
 from .expr import _check_expr_grammar, _expr_names
 from .loader import CONTROL_KEYS, Schema
 
@@ -26,7 +26,7 @@ def _preset_values(preset: dict, key: str) -> list:
         else:
             values.append(value)
     for entries in (preset.get("sweep_groups") or {}).values():
-        for partial in entries:
+        for _label, partial in _group_entries(entries):
             if key in partial:
                 values.append(partial[key])
     return values
@@ -43,8 +43,8 @@ def _defined_names(preset: dict, dep_schema) -> set[str]:
             continue
         if key in dep_schema.params:
             names.add(key)  # concrete, list_value, list_sweep, or dict_sweep
-    for entry in (preset.get("sweep_groups") or {}).values():
-        for partial in entry:
+    for entries in (preset.get("sweep_groups") or {}).values():
+        for _label, partial in _group_entries(entries):
             names.update(partial.keys())
     return names
 
@@ -83,7 +83,12 @@ def validate_params(preset: dict, schema: Schema) -> list[str]:
     sweep_groups = preset.get("sweep_groups", {}) or {}
 
     available = _defined_names(preset, dep_schema)
-    group_fields = {f for entry in sweep_groups.values() for p in entry for f in p}
+    group_fields = {
+        f
+        for entries in sweep_groups.values()
+        for _label, p in _group_entries(entries)
+        for f in p
+    }
 
     # V1: derived LHS must be a declared schema param.
     for lhs in derived:

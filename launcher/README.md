@@ -75,6 +75,24 @@ not product). Use when params must move in lockstep.
 ```
 → 3 runs (not 9). A group dim still multiplies against other independent dims.
 
+A group's entries may instead be a **dict**, whose keys become the dimension's
+labels (the list form labels by index: `0`, `1`, …). Use this when you want
+readable per-run output dirs, e.g. for an A/B over flags that span several params:
+
+```jsonc
+"log_dir": "bench/cost_{cost}",
+"sweep_groups": {
+  "cost": {
+    "fold":    {},
+    "verbose": {"cost_verbose": true},
+    "tree":    {"cost_tree": true}
+  }
+}
+```
+→ 3 runs into `bench/cost_fold`, `bench/cost_verbose`, `bench/cost_tree`. An empty
+entry (`{}`) is the all-defaults baseline. The zipped fields apply identically to
+the list form; only the label (and thus the `{cost}` log_dir placeholder) differs.
+
 ### `derived` — computed assignments
 
 Assign a param from an expression over other params. Evaluated **per candidate**,
@@ -188,10 +206,10 @@ the plan before dry-run output, resume filtering, cache prebuild, or launch.
 
 ## Worked example — every mechanism at once
 
-This preset exercises all of: `sweep_groups` (zipped), an independent
-`list_sweep`, a labeled `dict_sweep`, a collection-typed list-value (NOT swept),
-`derived` (function call + ternary), a `constraint` filter, and a templated
-`log_dir`.
+This preset exercises all of: `sweep_groups` (zipped, dict-labeled), an
+independent `list_sweep`, a labeled `dict_sweep`, a collection-typed list-value
+(NOT swept), `derived` (function call + ternary), a `constraint` filter, and a
+templated `log_dir`.
 
 ```jsonc
 {
@@ -201,10 +219,10 @@ This preset exercises all of: `sweep_groups` (zipped), an independent
   "ep_size": [4, 8],                            // list_sweep (independent dim)
   "request_rate": {"lo": 1.0, "hi": 100.0},     // dict_sweep (labeled dim)
   "sweep_groups": {
-    "par": [                                    // zipped dim: tp & hp move together
-      {"tp_size": 2, "head_parallel": 2},
-      {"tp_size": 4, "head_parallel": 1}
-    ]
+    "par": {                                    // zipped dim, dict-labeled: tp & hp move together
+      "tp2hp2": {"tp_size": 2, "head_parallel": 2},
+      "tp4hp1": {"tp_size": 4, "head_parallel": 1}
+    }
   },
   "derived": {
     "nvl_num_gpu": "max(tp_size, 2)",                       // allow-listed call
@@ -220,13 +238,13 @@ candidates (`trace_files` is a value, not a dim). The `constraint` drops the two
 `tp=4, ep=8` candidates (`32 > 16`), leaving **6 runs**:
 
 ```
- tp  hp  ep   rate  nvl  attn_gb  labels                                log_dir
-  2   2   4    1.0    2     80.0   {request_rate: lo, par: 0}  logs/llama3_8b/tp2_ep4_lo
-  4   1   4    1.0    4     80.0   {request_rate: lo, par: 1}  logs/llama3_8b/tp4_ep4_lo
-  2   2   4  100.0    2     80.0   {request_rate: hi, par: 0}  logs/llama3_8b/tp2_ep4_hi
-  4   1   4  100.0    4     80.0   {request_rate: hi, par: 1}  logs/llama3_8b/tp4_ep4_hi
-  2   2   8    1.0    2    160.0   {request_rate: lo, par: 0}  logs/llama3_8b/tp2_ep8_lo
-  2   2   8  100.0    2    160.0   {request_rate: hi, par: 0}  logs/llama3_8b/tp2_ep8_hi
+ tp  hp  ep   rate  nvl  attn_gb  labels                              log_dir
+  2   2   4    1.0    2     80.0   {request_rate: lo, par: tp2hp2}  logs/llama3_8b/tp2_ep4_lo
+  4   1   4    1.0    4     80.0   {request_rate: lo, par: tp4hp1}  logs/llama3_8b/tp4_ep4_lo
+  2   2   4  100.0    2     80.0   {request_rate: hi, par: tp2hp2}  logs/llama3_8b/tp2_ep4_hi
+  4   1   4  100.0    4     80.0   {request_rate: hi, par: tp4hp1}  logs/llama3_8b/tp4_ep4_hi
+  2   2   8    1.0    2    160.0   {request_rate: lo, par: tp2hp2}  logs/llama3_8b/tp2_ep8_lo
+  2   2   8  100.0    2    160.0   {request_rate: hi, par: tp2hp2}  logs/llama3_8b/tp2_ep8_hi
 ```
 
 How each column arises:

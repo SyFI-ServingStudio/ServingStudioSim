@@ -28,6 +28,7 @@ from .exec import (
     wrap_with_perf,
 )
 from .schema import build_cli_command, validate_unique_log_dirs
+from .schema.expand import _group_entries
 from .schema.loader import Schema
 
 # Resume marker (INV-5): the launcher writes this into a run's log_dir only
@@ -134,7 +135,7 @@ async def _run_single_async(
         print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
         return True
     metadata.write_shared_metadata(log_dir, preset or params)
-    if not await prebuild_caches([params], schema, build_type):
+    if not await prebuild_caches([params], schema, build_type, base_dir=log_dir):
         return False
     return await _launch_one(params, build_type, refresh, profile, profile_freq)
 
@@ -193,7 +194,7 @@ async def _run_sweep_async(
         )
 
     if pending:
-        if not await prebuild_caches(pending, schema, build_type):
+        if not await prebuild_caches(pending, schema, build_type, base_dir=base_dir):
             print("[error] cache prebuild failed; aborting sweep")
             return 1
 
@@ -260,7 +261,7 @@ def _group_map(original_preset: dict) -> dict[str, list[str]]:
     as a single composite axis instead of a mostly-empty grid."""
     groups: dict[str, list[str]] = {}
     for gname, entries in (original_preset.get("sweep_groups") or {}).items():
-        groups[gname] = sorted({f for entry in entries for f in entry})
+        groups[gname] = sorted({f for _label, partial in _group_entries(entries) for f in partial})
     return groups
 
 

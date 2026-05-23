@@ -26,6 +26,20 @@ from .loader import CONTROL_KEYS, Schema
 _SWEEP_LABELS_KEY = "_sweep_labels"
 _UNKNOWN_LOG_DIR_PLACEHOLDERS_KEY = "_unknown_log_dir_placeholders"
 
+def _group_entries(entries: Any) -> list[tuple[str, dict]]:
+    """Normalize one `sweep_groups` group's `entries` to `[(label, partial), …]`.
+
+    Two authoring forms, same zipped semantics:
+      - **list** → index labels (`"0"`, `"1"`, …) — the original form, unchanged;
+      - **dict** → its keys as labels, for readable sweep dirs
+        (`{"fold": {}, "tree": {"cost_tree": true}}` → labels `fold`/`tree`).
+    The label only feeds `_sweep_labels` / `log_dir` templating; the partial dict
+    of field assignments is applied to the candidate identically either way."""
+    if isinstance(entries, dict):
+        return [(str(label), partial) for label, partial in entries.items()]
+    return [(str(idx), partial) for idx, partial in enumerate(entries)]
+
+
 _SCALAR_TYPES = frozenset({"int", "float", "bool", "string", "path"})
 _LIST_TYPES = frozenset({"int_list", "float_list", "string_list", "path_list"})
 
@@ -118,7 +132,7 @@ def expand_sweep_params(preset: dict, schema: Schema) -> list[dict]:
     # sweep_groups: each group is one zipped dim (all fields of an entry together).
     for group_key, entries in (preset.get("sweep_groups") or {}).items():
         sweep_dims.append(
-            [(dict(partial), {group_key: str(idx)}) for idx, partial in enumerate(entries)]
+            [(dict(partial), {group_key: label}) for label, partial in _group_entries(entries)]
         )
 
     derived = preset.get("derived", {}) or {}
