@@ -36,13 +36,17 @@ def fmt_ms(value: float) -> str:
 def fmt_value(value: float, unit: str = "ms") -> str:
     """Format a metric value for a label, honoring its unit. The millisecond
     family (`ms`, `ms/token`) auto-scales µs/ms/s via `fmt_ms`; `%` prints a
-    percent; anything else prints the number with its unit verbatim. Use this for
-    any per-metric annotation so a non-latency CDF isn't mislabeled in ms."""
+    percent; rate units (`tok/s`, `tokens/s`) print a thousands-separated integer
+    (rates are large, decimals are noise); anything else prints the number with
+    its unit verbatim. Use this for any per-metric annotation so a non-latency
+    plot isn't mislabeled in ms."""
     if unit in ("ms", "ms/token"):
         scaled = fmt_ms(value)
         return f"{scaled}/token" if unit == "ms/token" else scaled
     if unit == "%":
         return f"{value:.1f}%"
+    if unit in ("tok/s", "tokens/s"):
+        return f"{fmt_count(value)} {unit}"
     return f"{value:.2f} {unit}"
 
 

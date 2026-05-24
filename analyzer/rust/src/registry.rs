@@ -12,6 +12,7 @@ use datafusion::prelude::SessionContext;
 use serde_json::Value;
 
 use crate::request;
+use crate::throughput;
 
 /// Analytical grain + source family a subject belongs to. A category is a *tag*
 /// (and a source folder) here, not a registration boundary — that's what lets
@@ -21,12 +22,15 @@ pub enum Category {
     /// Per-request (session = rollup) over the fixed-schema `request_slo` /
     /// `request_state` parquet. Tier-1, deployment-agnostic.
     Request,
+    /// System serving rate over time/iter windows. Tier-1, deployment-agnostic.
+    Throughput,
 }
 
 impl Category {
     fn label(self) -> &'static str {
         match self {
             Category::Request => "request",
+            Category::Throughput => "throughput",
         }
     }
 }
@@ -73,14 +77,24 @@ pub struct Subject {
 
 /// The whole catalog. Adding a metric = one row here + one arm in [`run_subject`]
 /// + the subject's module under `src/<category>/`.
-pub const SUBJECTS: &[Subject] = &[Subject {
-    name: "slo",
-    category: Category::Request,
-    description: "Request/session latency SLOs: TTFT / TPOT / ITL / E2E + session E2E CDFs.",
-    report_name: "slo_report.json",
-    payload_name: "slo_cdf.json",
-    applies: Applies::All,
-}];
+pub const SUBJECTS: &[Subject] = &[
+    Subject {
+        name: "slo",
+        category: Category::Request,
+        description: "Request/session latency SLOs: TTFT / TPOT / ITL / E2E + session E2E CDFs.",
+        report_name: "slo_report.json",
+        payload_name: "slo_cdf.json",
+        applies: Applies::All,
+    },
+    Subject {
+        name: "throughput",
+        category: Category::Throughput,
+        description: "Per-GPU prefill / decode / total tokens-per-second, per time segment.",
+        report_name: "throughput_report.json",
+        payload_name: "throughput_segments.json",
+        applies: Applies::All,
+    },
+];
 
 /// Human-readable catalog for `analyze list` — one aligned line per subject:
 /// `name  [category]  (applicability)  description`.
@@ -109,6 +123,7 @@ pub fn help() -> String {
 pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result<(Value, Value)> {
     match name {
         "slo" => request::slo::run_slo(ctx, dir).await,
+        "throughput" => throughput::segment::run_throughput(ctx, dir).await,
         other => bail!("unknown analyzer subject {other:?}"),
     }
 }

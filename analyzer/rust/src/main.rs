@@ -21,6 +21,7 @@ mod io;
 mod registry;
 mod request;
 mod session;
+mod throughput;
 
 use io::{payload_path, read_deployment, report_path, write_json, SCHEMA_VERSION};
 use session::build_session;

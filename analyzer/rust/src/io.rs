@@ -47,6 +47,25 @@ pub fn read_deployment(log_dir: &Path) -> Option<String> {
     json.get("deployment")?.as_str().map(str::to_owned)
 }
 
+/// The run's GPU facts from `run_meta.json` (sim-written, L7): `(num_gpus,
+/// gpu_name)`. Like [`read_deployment`], read as bare JSON (no `simulator` dep).
+/// `None` if absent/unparseable; the throughput subject then treats the run as
+/// single-GPU (the honest default for a run that predates the sidecar).
+pub fn read_run_meta(log_dir: &Path) -> Option<(usize, String)> {
+    let path = resolve_artifact_path(log_dir, "run_meta.json");
+    let text = fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let num_gpus = json.get("num_gpus")?.as_u64()? as usize;
+    let gpu_name = json
+        .get("gpus")
+        .and_then(|g| g.get(0))
+        .and_then(|g| g.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_owned();
+    Some((num_gpus, gpu_name))
+}
+
 pub fn report_path(log_dir: &Path, name: &str) -> PathBuf {
     log_dir.join(REPORTS_DIR).join(name)
 }

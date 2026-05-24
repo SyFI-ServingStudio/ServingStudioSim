@@ -21,6 +21,13 @@ pub fn build_session() -> SessionContext {
 }
 
 pub async fn register_if_exists(ctx: &SessionContext, name: &str, path: PathBuf) -> Result<bool> {
+    // Subjects share one `SessionContext` and each declares the streams it needs,
+    // so the same logical table (e.g. `state` = request_state.parquet) is often
+    // requested by several subjects in one `analyze run`. Register it once: a
+    // later request for an already-registered table just reuses it.
+    if ctx.table_exist(name)? {
+        return Ok(true);
+    }
     if !path.exists() {
         return Ok(false);
     }
