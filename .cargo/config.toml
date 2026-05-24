@@ -1,0 +1,7 @@
+[target.x86_64-unknown-linux-gnu]
+# Use the mold linker for ~5-10x faster linking than the default GNU ld. Frame
+# pointers and libpython rpath are intentionally NOT set here: profiling uses
+# DWARF unwinding (release keeps `debug = true`; perf runs `--call-graph dwarf`)
+# and the launcher injects LD_LIBRARY_PATH at runtime, so the binary stays
+# portable across Python installs.
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
