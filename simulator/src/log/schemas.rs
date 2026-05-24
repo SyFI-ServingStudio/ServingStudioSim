@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema};
 
 /// `cost_log` envelope (§3.1) — universal columns shared by every worker_kind
 /// partition. Per-worker_kind extensions append `input_section` /
@@ -36,14 +36,40 @@ pub fn cost_log_envelope_schema() -> Arc<Schema> {
     ]))
 }
 
-/// `cost_log` (CostTree per-iter form) — the envelope scalars plus the compiled
-/// CostTree's per-slot breakdown as two parallel lists: `slot_time_ms`
-/// (`List<f32>`) and `slot_coverage` (`List<u8>`, the `CoverageFlags` bits).
-/// Slot *names* are NOT a column (INV-5 — names live at compile time only); they
-/// live once in the `cost_manifest.json` sidecar and label the list positions.
+/// The per-group `input_section` struct (`docs/logging.md` §3.2): one struct per
+/// `ArchGroupInput` the worker fed to the model_arch this iteration. Prefill is
+/// kept at full per-request fidelity (the two parallel `prefill_*_lens` lists);
+/// decode is aggregated to two scalars (`decode_request_count` / `decode_kv_total`)
+/// — the per-decode-request KV-length list is the size driver (re-logged every
+/// step) and is intentionally dropped. `prefill_request_count` is the list length,
+/// so it is not a separate field.
+pub(crate) fn group_input_fields() -> Fields {
+    let u32_item = || Arc::new(Field::new("item", DataType::UInt32, false));
+    Fields::from(vec![
+        Field::new("batch_tokens", DataType::UInt32, false),
+        Field::new("prefill_tokens", DataType::UInt32, false),
+        Field::new("decode_request_count", DataType::UInt32, false),
+        Field::new("decode_kv_total", DataType::UInt32, false),
+        Field::new("prefill_prefix_lens", DataType::List(u32_item()), false),
+        Field::new("prefill_append_lens", DataType::List(u32_item()), false),
+    ])
+}
+
+/// `cost_log` (CostTree per-iter form) — the envelope scalars, the per-iteration
+/// `input_section` (`groups`: one struct per HP group, see [`group_input_fields`]),
+/// then the compiled CostTree's per-slot breakdown as two parallel lists:
+/// `slot_time_ms` (`List<f32>`) and `slot_coverage` (`List<u8>`, the
+/// `CoverageFlags` bits). Slot *names* are NOT a column (INV-5 — names live at
+/// compile time only); they live once in the `cost_manifest.json` sidecar and
+/// label the list positions.
 pub fn cost_log_schema() -> Arc<Schema> {
     let time_item = Arc::new(Field::new("item", DataType::Float32, false));
     let cov_item = Arc::new(Field::new("item", DataType::UInt8, false));
+    let group_item = Arc::new(Field::new(
+        "item",
+        DataType::Struct(group_input_fields()),
+        false,
+    ));
     Arc::new(Schema::new(vec![
         Field::new("worker_id", DataType::UInt16, false),
         // `iter_id` is the per-worker iteration index (one forward-pass cycle);
@@ -53,10 +79,13 @@ pub fn cost_log_schema() -> Arc<Schema> {
         // batch_id), not iter_id alone.
         Field::new("iter_id", DataType::UInt64, false),
         Field::new("batch_id", DataType::UInt64, false),
+        // `wall_end_ms` is intentionally NOT a column: it is exactly
+        // `wall_start_ms + total_time_ms`, so a consumer derives it. Dropping the
+        // redundant f64 (which barely compressed) was the single largest size win.
         Field::new("wall_start_ms", DataType::Float64, false),
-        Field::new("wall_end_ms", DataType::Float64, false),
         Field::new("total_time_ms", DataType::Float64, false),
         Field::new("energy_j", DataType::Float64, false),
+        Field::new("groups", DataType::List(group_item), false),
         Field::new("slot_time_ms", DataType::List(time_item), false),
         Field::new("slot_coverage", DataType::List(cov_item), false),
     ]))

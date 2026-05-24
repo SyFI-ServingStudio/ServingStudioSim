@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{RequestId, SharedRequests, Time, WorkerId};
-use crate::log::{CostLogEntry, CostLogger};
+use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
 use crate::timing::LeafMetrics;
 use crate::worker::admission_helpers::{Batch, KvAdmission, LoadBalance};
 
@@ -272,6 +272,21 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         let agg = self.model.eval_iter(&arch_input, &mut self.cost_slots);
         let cost_time = Time::from_ms(agg.m.time_ms as f64);
         if self.cost_logger.is_some() {
+            // Per-iteration input_section: log each group's context (prefill kept
+            // full as moved-over `(prefix, append)` pairs; decode aggregated to
+            // count + total KV — the per-decode KV list is dropped). `arch_input`
+            // is consumed by eval above by reference only, so we can move its Vecs.
+            let groups = arch_input
+                .groups
+                .into_iter()
+                .map(|g| GroupInputLog {
+                    batch_tokens: g.batch_tokens,
+                    prefill_tokens: g.prefill_tokens,
+                    decode_request_count: g.decode_tokens,
+                    decode_kv_total: g.total_kv_len,
+                    prefill_chunk_pairs: g.prefill_chunk_pairs,
+                })
+                .collect();
             let entry = CostLogEntry {
                 worker_id: self.id.0,
                 iter_id: self.runtime.iter_counter as u64,
@@ -279,9 +294,9 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                 // emit several batches sharing this iter_id with distinct batch_id.
                 batch_id: 0,
                 wall_start_ms: now.as_ms(),
-                wall_end_ms: (now + cost_time).as_ms(),
                 total_time_ms: agg.m.time_ms as f64,
                 energy_j: agg.m.energy_j as f64,
+                groups,
                 slot_time_ms: self.cost_slots.iter().map(|l| l.m.time_ms).collect(),
                 slot_coverage: self.cost_slots.iter().map(|l| l.coverage.bits()).collect(),
             };

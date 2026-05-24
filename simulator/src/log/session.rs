@@ -173,10 +173,6 @@ mod tests {
             arrival_time_ms: 0.0,
             output_token_times_ms: times,
             ttft_ms: Some(1.0),
-            tpot_mean_ms: Some(2.0),
-            tpot_p50_ms: Some(2.0),
-            tpot_p99_ms: Some(3.0),
-            tpot_max_ms: Some(3.0),
         }
     }
 

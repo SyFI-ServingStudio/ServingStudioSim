@@ -5,14 +5,18 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use arrow_array::builder::{Float32Builder, ListBuilder, UInt8Builder};
+use arrow_array::builder::{
+    Float32Builder, ListBuilder, StructBuilder, UInt32Builder, UInt8Builder,
+};
 use arrow_array::{
-    BooleanArray, Float32Array, Float64Array, LargeStringArray, RecordBatch, UInt16Array,
-    UInt32Array, UInt64Array,
+    BooleanArray, Float32Array, Float64Array, LargeStringArray, ListArray, RecordBatch,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field};
 
-use crate::log::schemas::{cost_log_schema, request_slo_schema, request_state_schema};
+use crate::log::schemas::{
+    cost_log_schema, group_input_fields, request_slo_schema, request_state_schema,
+};
 
 /// A request's lifecycle phase at snapshot time. A small `#[repr(u8)]` code
 /// rather than a `String`: dense `request_state` emits one row per live request
@@ -65,8 +69,12 @@ pub struct RequestStateEntry {
 }
 
 /// One `request_slo` row — terminal (or sim-end-flush) per-token timing for one
-/// request. `output_token_times_ms` holds absolute sim-time ms; the TPOT/TTFT
-/// scalars are `None` when there are no output tokens yet.
+/// request. `output_token_times_ms` holds absolute sim-time ms. The TPOT
+/// percentile scalars are NOT carried on the entry: they are derived from
+/// `output_token_times_ms` on the writer thread in [`slo_to_record_batch`]
+/// (see [`tpot_stats_ms`]), keeping the `O(n log n)` sort off the sim hot path.
+/// `ttft_ms` stays here — it is a cheap scalar (first-token minus arrival), not a
+/// sort, and needs `first_token_time` which only the sim side holds.
 #[derive(Clone, Debug)]
 pub struct RequestSloEntry {
     pub request_id: u32,
@@ -75,15 +83,52 @@ pub struct RequestSloEntry {
     pub arrival_time_ms: f64,
     pub output_token_times_ms: Vec<f32>,
     pub ttft_ms: Option<f32>,
-    pub tpot_mean_ms: Option<f32>,
-    pub tpot_p50_ms: Option<f32>,
-    pub tpot_p99_ms: Option<f32>,
-    pub tpot_max_ms: Option<f32>,
+}
+
+/// Inter-token gaps (ms) → `(mean, p50, p99, max)`, all `None` when fewer than
+/// two output tokens (no gap defined). Runs on the **writer thread** from the
+/// already-logged `output_token_times_ms`, so the percentile sort never touches
+/// the sim hot path. Numerically equivalent to the old sim-side `tpot_stats`
+/// (gaps from consecutive ms timestamps; the f32 vs f64 subtraction difference is
+/// negligible for a timing statistic).
+fn tpot_stats_ms(times_ms: &[f32]) -> (Option<f32>, Option<f32>, Option<f32>, Option<f32>) {
+    if times_ms.len() < 2 {
+        return (None, None, None, None);
+    }
+    let mut gaps: Vec<f32> = times_ms.windows(2).map(|w| w[1] - w[0]).collect();
+    let mean = gaps.iter().sum::<f32>() / gaps.len() as f32;
+    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pct = |p: f64| -> f32 {
+        let idx = ((p * (gaps.len() - 1) as f64).round() as usize).min(gaps.len() - 1);
+        gaps[idx]
+    };
+    (Some(mean), Some(pct(0.5)), Some(pct(0.99)), Some(*gaps.last().unwrap()))
+}
+
+/// One HP group's input context for a `cost_log` row — the per-iteration
+/// `input_section` (`docs/logging.md` §3.2), one per `ArchGroupInput` the worker
+/// fed the model_arch. Prefill is kept full (`prefill_chunk_pairs`, moved over
+/// un-split — the writer thread splits `(prefix, append)` into the two parallel
+/// list columns); decode is aggregated to `decode_request_count` /
+/// `decode_kv_total` (the per-decode KV-length list is the size driver and is
+/// dropped). `tokens_per_source_rank` (the ffn/EP routing view) is NOT logged —
+/// it is empty for the dense-local model and its layer ownership is unsettled.
+#[derive(Clone, Debug)]
+pub struct GroupInputLog {
+    pub batch_tokens: u32,
+    pub prefill_tokens: u32,
+    pub decode_request_count: u32,
+    pub decode_kv_total: u32,
+    /// Per prefill request `(prefix_len, append_len)`, moved from the
+    /// `ArchGroupInput`; split into two parallel list columns at serialization.
+    pub prefill_chunk_pairs: Vec<(u32, u32)>,
 }
 
 /// One `cost_log` row — a whole-iteration cost query via the compiled CostTree.
-/// `slot_time_ms` / `slot_coverage` are the per-slot breakdown (positions named
-/// by the `cost_manifest.json` sidecar); the scalars are the rolled-up totals.
+/// `groups` is the per-iteration input context (one entry per HP group);
+/// `slot_time_ms` / `slot_coverage` are the per-slot cost breakdown (positions
+/// named by the `cost_manifest.json` sidecar); the scalars are the rolled-up
+/// totals.
 #[derive(Clone, Debug)]
 pub struct CostLogEntry {
     pub worker_id: u16,
@@ -93,11 +138,78 @@ pub struct CostLogEntry {
     /// 0..k under AFD/TBO where a worker runs several batches in one iteration.
     pub batch_id: u64,
     pub wall_start_ms: f64,
-    pub wall_end_ms: f64,
+    /// `wall_end_ms` is deliberately not stored — it is derivable as
+    /// `wall_start_ms + total_time_ms`, so keeping it duplicated a high-entropy
+    /// f64 that barely compressed.
     pub total_time_ms: f64,
     pub energy_j: f64,
+    pub groups: Vec<GroupInputLog>,
     pub slot_time_ms: Vec<f32>,
     pub slot_coverage: Vec<u8>,
+}
+
+/// Build the nested `groups` `List<Struct>` column (the per-iteration
+/// `input_section`): one list per row holding that iteration's groups, each a
+/// struct of one [`GroupInputLog`]. The `(prefix, append)` prefill pairs are
+/// split into the two parallel `prefill_*_lens` lists *here*, on the writer
+/// thread (the worker hands the pairs over un-split). Item/list fields are
+/// non-nullable to match [`group_input_fields`] / `cost_log_schema`.
+fn build_groups_column(entries: &[CostLogEntry]) -> ListArray {
+    let fields = group_input_fields();
+    let u32_item = || Arc::new(Field::new("item", DataType::UInt32, false));
+    let new_struct_builder = || {
+        StructBuilder::new(
+            fields.clone(),
+            vec![
+                Box::new(UInt32Builder::new()),
+                Box::new(UInt32Builder::new()),
+                Box::new(UInt32Builder::new()),
+                Box::new(UInt32Builder::new()),
+                Box::new(ListBuilder::new(UInt32Builder::new()).with_field(u32_item())),
+                Box::new(ListBuilder::new(UInt32Builder::new()).with_field(u32_item())),
+            ],
+        )
+    };
+    let struct_field = Arc::new(Field::new(
+        "item",
+        DataType::Struct(fields.clone()),
+        false,
+    ));
+    let mut groups_builder = ListBuilder::new(new_struct_builder()).with_field(struct_field);
+    for e in entries {
+        let sb = groups_builder.values();
+        for g in &e.groups {
+            sb.field_builder::<UInt32Builder>(0)
+                .unwrap()
+                .append_value(g.batch_tokens);
+            sb.field_builder::<UInt32Builder>(1)
+                .unwrap()
+                .append_value(g.prefill_tokens);
+            sb.field_builder::<UInt32Builder>(2)
+                .unwrap()
+                .append_value(g.decode_request_count);
+            sb.field_builder::<UInt32Builder>(3)
+                .unwrap()
+                .append_value(g.decode_kv_total);
+            {
+                let prefix_b = sb.field_builder::<ListBuilder<UInt32Builder>>(4).unwrap();
+                for &(prefix, _) in &g.prefill_chunk_pairs {
+                    prefix_b.values().append_value(prefix);
+                }
+                prefix_b.append(true);
+            }
+            {
+                let append_b = sb.field_builder::<ListBuilder<UInt32Builder>>(5).unwrap();
+                for &(_, append) in &g.prefill_chunk_pairs {
+                    append_b.values().append_value(append);
+                }
+                append_b.append(true);
+            }
+            sb.append(true);
+        }
+        groups_builder.append(true);
+    }
+    groups_builder.finish()
 }
 
 pub(crate) fn cost_to_record_batch(entries: &[CostLogEntry]) -> Result<RecordBatch> {
@@ -105,9 +217,11 @@ pub(crate) fn cost_to_record_batch(entries: &[CostLogEntry]) -> Result<RecordBat
     let iter_id: Vec<u64> = entries.iter().map(|e| e.iter_id).collect();
     let batch_id: Vec<u64> = entries.iter().map(|e| e.batch_id).collect();
     let wall_start: Vec<f64> = entries.iter().map(|e| e.wall_start_ms).collect();
-    let wall_end: Vec<f64> = entries.iter().map(|e| e.wall_end_ms).collect();
     let total_time: Vec<f64> = entries.iter().map(|e| e.total_time_ms).collect();
     let energy: Vec<f64> = entries.iter().map(|e| e.energy_j).collect();
+
+    // Per-iteration input_section: one List<Struct> entry per row.
+    let groups = build_groups_column(entries);
 
     // Two parallel List columns, one (non-null, possibly empty) list per row.
     // Non-nullable `item` to match the schema (ListBuilder defaults to nullable).
@@ -133,9 +247,9 @@ pub(crate) fn cost_to_record_batch(entries: &[CostLogEntry]) -> Result<RecordBat
             Arc::new(UInt64Array::from(iter_id)),
             Arc::new(UInt64Array::from(batch_id)),
             Arc::new(Float64Array::from(wall_start)),
-            Arc::new(Float64Array::from(wall_end)),
             Arc::new(Float64Array::from(total_time)),
             Arc::new(Float64Array::from(energy)),
+            Arc::new(groups),
             Arc::new(time_builder.finish()),
             Arc::new(cov_builder.finish()),
         ],
@@ -195,10 +309,20 @@ pub(crate) fn slo_to_record_batch(entries: &[RequestSloEntry]) -> Result<RecordB
         .map(|e| e.output_token_times_ms.len() as u32)
         .collect();
     let ttft: Vec<Option<f32>> = entries.iter().map(|e| e.ttft_ms).collect();
-    let tpot_mean: Vec<Option<f32>> = entries.iter().map(|e| e.tpot_mean_ms).collect();
-    let tpot_p50: Vec<Option<f32>> = entries.iter().map(|e| e.tpot_p50_ms).collect();
-    let tpot_p99: Vec<Option<f32>> = entries.iter().map(|e| e.tpot_p99_ms).collect();
-    let tpot_max: Vec<Option<f32>> = entries.iter().map(|e| e.tpot_max_ms).collect();
+    // TPOT percentiles derived here on the writer thread from the per-row token
+    // times (the sort is off the sim hot path; the times list already crossed
+    // the channel, so this is zero extra data movement).
+    let mut tpot_mean: Vec<Option<f32>> = Vec::with_capacity(entries.len());
+    let mut tpot_p50: Vec<Option<f32>> = Vec::with_capacity(entries.len());
+    let mut tpot_p99: Vec<Option<f32>> = Vec::with_capacity(entries.len());
+    let mut tpot_max: Vec<Option<f32>> = Vec::with_capacity(entries.len());
+    for e in entries {
+        let (mean, p50, p99, max) = tpot_stats_ms(&e.output_token_times_ms);
+        tpot_mean.push(mean);
+        tpot_p50.push(p50);
+        tpot_p99.push(p99);
+        tpot_max.push(max);
+    }
 
     // List<f32> column: one non-null list per row (may be empty). The item
     // field must match the schema's non-nullable `item` (ListBuilder defaults to
@@ -234,6 +358,7 @@ pub(crate) fn slo_to_record_batch(entries: &[RequestSloEntry]) -> Result<RecordB
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{Array, StructArray};
 
     fn slo_entry(id: u32, times: Vec<f32>) -> RequestSloEntry {
         RequestSloEntry {
@@ -243,10 +368,6 @@ mod tests {
             arrival_time_ms: 0.0,
             output_token_times_ms: times,
             ttft_ms: Some(1.0),
-            tpot_mean_ms: Some(2.0),
-            tpot_p50_ms: Some(2.0),
-            tpot_p99_ms: Some(3.0),
-            tpot_max_ms: Some(3.0),
         }
     }
 
@@ -258,9 +379,26 @@ mod tests {
                 iter_id: 7,
                 batch_id: 0,
                 wall_start_ms: 1.0,
-                wall_end_ms: 3.0,
                 total_time_ms: 2.0,
                 energy_j: 0.5,
+                groups: vec![
+                    // group 0: two prefills + a decode aggregate.
+                    GroupInputLog {
+                        batch_tokens: 20,
+                        prefill_tokens: 18,
+                        decode_request_count: 2,
+                        decode_kv_total: 100,
+                        prefill_chunk_pairs: vec![(0, 8), (4, 10)],
+                    },
+                    // group 1: pure decode (no prefill pairs).
+                    GroupInputLog {
+                        batch_tokens: 3,
+                        prefill_tokens: 0,
+                        decode_request_count: 3,
+                        decode_kv_total: 60,
+                        prefill_chunk_pairs: vec![],
+                    },
+                ],
                 slot_time_ms: vec![1.0, 0.5, 0.5],
                 slot_coverage: vec![0, 1, 0],
             },
@@ -269,9 +407,15 @@ mod tests {
                 iter_id: 8,
                 batch_id: 0,
                 wall_start_ms: 3.0,
-                wall_end_ms: 4.0,
                 total_time_ms: 1.0,
                 energy_j: 0.2,
+                groups: vec![GroupInputLog {
+                    batch_tokens: 5,
+                    prefill_tokens: 5,
+                    decode_request_count: 0,
+                    decode_kv_total: 0,
+                    prefill_chunk_pairs: vec![(0, 5)],
+                }],
                 slot_time_ms: vec![0.4, 0.6, 0.0],
                 slot_coverage: vec![0, 0, 0],
             },
@@ -286,6 +430,46 @@ mod tests {
             .unwrap();
         assert_eq!(it.value(0), 7);
         assert_eq!(it.value(1), 8);
+
+        // groups column (index 6): List<Struct>. Row 0 has 2 groups, row 1 has 1.
+        let groups_col = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let row0 = groups_col.value(0);
+        let g0 = row0.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(g0.len(), 2);
+        let batch_tokens = g0
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(batch_tokens.value(0), 20);
+        assert_eq!(batch_tokens.value(1), 3);
+        // decode aggregates land in struct fields 2/3.
+        let dec_count = g0
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(dec_count.value(0), 2);
+        // prefill split: field 4 = prefix lens, field 5 = append lens.
+        let prefix_lists = g0.column(4).as_any().downcast_ref::<ListArray>().unwrap();
+        let append_lists = g0.column(5).as_any().downcast_ref::<ListArray>().unwrap();
+        let prefix0 = prefix_lists.value(0);
+        let append0 = append_lists.value(0);
+        let prefix0 = prefix0.as_any().downcast_ref::<UInt32Array>().unwrap();
+        let append0 = append0.as_any().downcast_ref::<UInt32Array>().unwrap();
+        assert_eq!(prefix0.len(), append0.len());
+        assert_eq!(prefix0.values(), &[0, 4]);
+        assert_eq!(append0.values(), &[8, 10]);
+        // group 1 of row 0 is pure decode: empty prefill lists.
+        assert_eq!(prefix_lists.value(1).len(), 0);
+
+        let row1 = groups_col.value(1);
+        let g1 = row1.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(g1.len(), 1);
     }
 
     #[test]
@@ -301,5 +485,21 @@ mod tests {
             .unwrap();
         assert_eq!(n.value(0), 3);
         assert_eq!(n.value(1), 1);
+        // TPOT is now derived on the writer thread from the token times. Row 0
+        // gaps = [2,2] → mean=p50=p99=max=2; row 1 has <2 tokens → null.
+        let mean = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(mean.value(0), 2.0);
+        assert!(mean.is_null(1));
+        let max = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(max.value(0), 2.0);
+        assert!(max.is_null(1));
     }
 }

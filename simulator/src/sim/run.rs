@@ -319,7 +319,8 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
     let ttft_ms = rec
         .first_token_time
         .map(|t| (t.as_ms() - rec.arrival_time.as_ms()) as f32);
-    let (tpot_mean, tpot_p50, tpot_p99, tpot_max) = tpot_stats(&rec.output_token_times);
+    // TPOT percentiles are derived on the writer thread from `output_token_times_ms`
+    // (see `log::rows::tpot_stats_ms`); the sort no longer runs on the sim hot path.
     RequestSloEntry {
         request_id: id.0,
         logging_time_ms: now.as_ms(),
@@ -327,30 +328,7 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         arrival_time_ms: rec.arrival_time.as_ms(),
         output_token_times_ms: times_ms,
         ttft_ms,
-        tpot_mean_ms: tpot_mean,
-        tpot_p50_ms: tpot_p50,
-        tpot_p99_ms: tpot_p99,
-        tpot_max_ms: tpot_max,
     }
-}
-
-/// Inter-token gaps (ms) → (mean, p50, p99, max). `None` for all when there are
-/// fewer than two output tokens (no gap defined).
-fn tpot_stats(times: &[Time]) -> (Option<f32>, Option<f32>, Option<f32>, Option<f32>) {
-    if times.len() < 2 {
-        return (None, None, None, None);
-    }
-    let mut gaps: Vec<f32> = times
-        .windows(2)
-        .map(|w| (w[1].as_ms() - w[0].as_ms()) as f32)
-        .collect();
-    let mean = gaps.iter().sum::<f32>() / gaps.len() as f32;
-    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let pct = |p: f64| -> f32 {
-        let idx = ((p * (gaps.len() - 1) as f64).round() as usize).min(gaps.len() - 1);
-        gaps[idx]
-    };
-    (Some(mean), Some(pct(0.5)), Some(pct(0.99)), Some(*gaps.last().unwrap()))
 }
 
 #[cfg(test)]
