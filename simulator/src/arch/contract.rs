@@ -60,6 +60,7 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
         CostManifest {
             slots: Vec::new(),
             nodes: Vec::new(),
+            node_labels: Vec::new(),
         }
     }
 

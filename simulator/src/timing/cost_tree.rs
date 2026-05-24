@@ -78,10 +78,20 @@ pub struct LeafDesc {
 /// can re-run [`CostTree::aggregate`] over a row's `slot_time_ms` to reproduce
 /// `total_time_ms`: the `Scale{n}` fold, `Sum`, and `Max{overlap}` operators are
 /// all present (slot names alone can't reconstruct the total).
+///
+/// [`node_labels`](Self::node_labels) recovers the composite identity that
+/// [`CostTree::flatten`] drops: it is index-aligned to [`nodes`](Self::nodes) —
+/// `node_labels[i]` is the [`CostNode::Labeled`] line (worklet kind + partition
+/// annotation) that wrapped the node now at flat index `i`, or `None`. This is
+/// what lets a downstream analyzer group slots into semantic subtrees (e.g.
+/// "the attention composite") *structurally*, without parsing dotted slot names.
+/// The label rides only this sidecar — never `FlatCostNode` or the hot-path
+/// aggregate (INV-5: names stay off the hot path).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CostManifest {
     pub slots: Vec<LeafDesc>,
     pub nodes: Vec<FlatCostNode>,
+    pub node_labels: Vec<Option<String>>,
 }
 
 /// Compiled-once structure: the recursive node tree plus the ordered leaf slots
@@ -173,61 +183,86 @@ impl CostTree {
     /// the flattened aggregation nodes. Lets a consumer reproduce `total_time_ms`
     /// from a row's per-slot `slot_time_ms` by re-running [`Self::aggregate`].
     pub fn manifest(&self) -> CostManifest {
+        let (nodes, node_labels) = self.flatten_labeled();
         CostManifest {
             slots: self.slots.clone(),
-            nodes: self.flatten(),
+            nodes,
+            node_labels,
         }
     }
 
     /// Lower the recursive tree to the flat [`FlatCostNode`] array (doc §4). BFS
     /// layout: each composite reserves a contiguous block for its direct children,
     /// so `children` is a valid `Range` and every parent index precedes its
-    /// children's — making the future aggregate a reverse linear pass.
+    /// children's — making the aggregate a reverse linear pass. Labels are dropped
+    /// (this is the form the hot-path aggregate consumes — no `String`, INV-5).
     pub fn flatten(&self) -> Vec<FlatCostNode> {
+        self.flatten_labeled().0
+    }
+
+    /// [`Self::flatten`] plus the composite labels it drops, recovered for the
+    /// off-hot-path manifest. One BFS produces both so the label vec can never
+    /// drift out of index-alignment with the flat `nodes`: `labels[i]` is the
+    /// [`CostNode::Labeled`] line wrapping the node now at flat index `i`, else
+    /// `None`. Only [`Self::manifest`] calls this; the runtime aggregate takes the
+    /// labelless `nodes` from [`Self::flatten`].
+    fn flatten_labeled(&self) -> (Vec<FlatCostNode>, Vec<Option<String>>) {
         let mut out: Vec<Option<FlatCostNode>> = vec![None]; // root at index 0
+        let mut labels: Vec<Option<String>> = vec![None];
         let mut queue: VecDeque<(&CostNode, usize)> = VecDeque::from([(&self.root, 0usize)]);
         while let Some((node, idx)) = queue.pop_front() {
             let op = match node {
                 CostNode::Leaf(slot) => FlatCostNode::Leaf(*slot),
                 CostNode::Sum(children) => {
-                    let range = Self::reserve(&mut out, &mut queue, children);
+                    let range = Self::reserve(&mut out, &mut labels, &mut queue, children);
                     FlatCostNode::Sum { children: range }
                 }
                 CostNode::Max { overlap, children } => {
-                    let range = Self::reserve(&mut out, &mut queue, children);
+                    let range = Self::reserve(&mut out, &mut labels, &mut queue, children);
                     FlatCostNode::Max {
                         overlap: *overlap,
                         children: range,
                     }
                 }
                 CostNode::Scale { n, child } => {
-                    let range = Self::reserve(&mut out, &mut queue, std::slice::from_ref(child));
+                    let range =
+                        Self::reserve(&mut out, &mut labels, &mut queue, std::slice::from_ref(child));
                     FlatCostNode::Scale {
                         n: *n,
                         children: range,
                     }
                 }
-                // Render-only: splice the child into this slot, drop the label.
-                CostNode::Labeled { child, .. } => {
+                // Render-only for the flat tree: splice the child into this slot.
+                // Keep the label on this index for the manifest; outermost wins if
+                // labels ever nest (set only when the index is still empty).
+                CostNode::Labeled { label, child } => {
+                    if labels[idx].is_none() {
+                        labels[idx] = Some(label.clone());
+                    }
                     queue.push_back((child, idx));
                     continue;
                 }
             };
             out[idx] = Some(op);
         }
-        out.into_iter()
+        let nodes = out
+            .into_iter()
             .map(|o| o.expect("every reserved flat node is filled"))
-            .collect()
+            .collect();
+        (nodes, labels)
     }
 
-    /// Reserve a contiguous block for `children` and enqueue each to be filled.
+    /// Reserve a contiguous block for `children` (growing `labels` in lockstep so
+    /// it stays index-aligned to `out`) and enqueue each child to be filled.
     fn reserve<'a>(
         out: &mut Vec<Option<FlatCostNode>>,
+        labels: &mut Vec<Option<String>>,
         queue: &mut VecDeque<(&'a CostNode, usize)>,
         children: &'a [CostNode],
     ) -> Range<usize> {
         let start = out.len();
         out.extend(children.iter().map(|_| None));
+        labels.resize(out.len(), None);
         for (i, child) in children.iter().enumerate() {
             queue.push_back((child, start + i));
         }
@@ -391,6 +426,46 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
             flat.iter().filter(|n| matches!(n, FlatCostNode::Leaf(_))).count(),
             1
         );
+        // …but the manifest recovers the label at the index the Labeled spliced
+        // into (the Sum took flat index 0), index-aligned to `nodes`.
+        let manifest = tree.manifest();
+        assert_eq!(manifest.node_labels.len(), manifest.nodes.len());
+        assert_eq!(
+            manifest.node_labels[0].as_deref(),
+            Some("w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]")
+        );
+    }
+
+    #[test]
+    fn manifest_labels_tag_composite_subtrees_not_leaves() {
+        // Mirror the real dense tree: a labeled "attn" composite wrapping its
+        // leaves, so the analyzer can find the attention subtree structurally.
+        let mut b = CostTreeBuilder::new();
+        let pre = CostNode::Labeled {
+            label: "m.pre_attn (PreAttnLocalWorklet)".to_string(),
+            child: Box::new(CostNode::Sum(vec![b.leaf("m.pre_attn.norm", "rms_norm", "")])),
+        };
+        let attn = CostNode::Labeled {
+            label: "m.attn (AttnLocalWorklet)".to_string(),
+            child: Box::new(CostNode::Sum(vec![
+                b.leaf("m.attn.prefill", "flashinfer_attn_prefill", ""),
+                b.leaf("m.attn.decode", "flashinfer_attn_decode", ""),
+            ])),
+        };
+        let tree = b.finish(CostNode::Sum(vec![pre, attn]));
+        let m = tree.manifest();
+        assert_eq!(m.node_labels.len(), m.nodes.len());
+        // The labels sit on the composite Sum nodes, never on leaves.
+        for (node, label) in m.nodes.iter().zip(&m.node_labels) {
+            if matches!(node, FlatCostNode::Leaf(_)) {
+                assert!(label.is_none(), "leaf nodes carry no composite label");
+            }
+        }
+        // Exactly the two worklet labels are present, somewhere on Sum nodes.
+        let labels: Vec<&str> = m.node_labels.iter().flatten().map(String::as_str).collect();
+        assert!(labels.contains(&"m.pre_attn (PreAttnLocalWorklet)"));
+        assert!(labels.contains(&"m.attn (AttnLocalWorklet)"));
+        assert_eq!(labels.len(), 2);
     }
 
     use crate::timing::{CoverageFlags, Metrics4};
