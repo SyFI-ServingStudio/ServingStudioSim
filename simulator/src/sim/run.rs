@@ -17,11 +17,12 @@ use crate::orchestrator::{Flow, OrchAction};
 /// Sim-time between heartbeat log lines (matches ref/moesim-rs's 1 s).
 const HEARTBEAT_INTERVAL_MS: f64 = 1000.0;
 
-/// Sim-time between stuck-watchdog samples. The watchdog's `progress_signature`
-/// scan is O(requests) and Stuck only fires during the post-exhaustion drain
-/// tail, so sampling at this cadence keeps the hot loop scan-free without
-/// meaningfully delaying stall detection. Ref/moesim-rs samples every 1 s.
-const WATCHDOG_SAMPLE_MS: f64 = 1000.0;
+/// Sim-time between stuck-watchdog samples. The watchdog is an O(1) liveness
+/// check (did `completed` or the admitted-id watermark advance since the last
+/// sample), so the cadence only bounds how fast a true stall is detected, not
+/// hot-loop cost. With `stuck_threshold` (60 s) below this interval, one sample
+/// window with no progress flags the deadlock.
+const WATCHDOG_SAMPLE_MS: f64 = 100_000.0;
 
 /// Iteration-count gate shared by every periodic step in the tick loop
 /// (`request_state` snapshot, heartbeat, stuck watchdog). `fire()` returns true
@@ -171,12 +172,14 @@ pub fn run_sim(
             break TerminationCause::DurationReached;
         }
 
-        // 3b. Stuck watchdog. `progress_signature` is the one O(requests) scan in
-        //     the loop and Stuck only matters once the trace is drained, so we
-        //     sample it every `WATCHDOG_SAMPLE_TICKS` ticks during the drain tail
-        //     rather than on every clock advance.
+        // 3b. Stuck watchdog — O(1), no store scan. Progress means a request
+        //     completed OR a new request was admitted (the highest-id admitted
+        //     watermark advanced) since the last sample. Both are monotonic, so
+        //     their sum advances iff one did. A full sample window with neither
+        //     advancing (trace already drained, work still in flight) is a
+        //     deadlock. Only checked post-exhaustion, where Stuck can occur.
         if exhausted && in_flight > 0 && watchdog.fire() {
-            let progress = progress_signature(&store.borrow());
+            let progress = completed + store.borrow().admitted_watermark();
             if progress > prev_progress {
                 prev_progress = progress;
                 idle_for = Time::ZERO;
@@ -254,20 +257,6 @@ fn finalize(store: &SharedRequests, logger: &mut LoggerSession, clock: Time) -> 
         }
     }
     Ok(())
-}
-
-/// Watchdog progress metric: Σ over all requests of (prefill tokens processed +
-/// decode tokens emitted). Mirrors the ref's progress signature in counting
-/// *both* phases — a request grinding through a long prefill (no decode yet)
-/// still advances this, so it isn't falsely flagged `Stuck`. Summed over all
-/// requests (not just in-flight) so it stays monotonic for the strict
-/// `progress > prev_progress` check: a completing request keeps its token
-/// counts in the total instead of dropping out and lowering the sum.
-fn progress_signature(store: &crate::common::RequestStore) -> u64 {
-    store
-        .iter()
-        .map(|(_, r)| r.prefill_processed as u64 + r.tokens_emitted as u64)
-        .sum()
 }
 
 fn final_phase(rec: &RequestRecord) -> FinalPhase {

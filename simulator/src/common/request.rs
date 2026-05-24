@@ -179,6 +179,14 @@ impl RequestStore {
         self.admitted_hi = Some(self.admitted_hi.map_or(id.0, |hi| hi.max(id.0)));
     }
 
+    /// Monotonic, O(1) admission watermark: `admitted_hi + 1`, or `0` before any
+    /// admission. Strictly increases whenever a new highest-id request starts
+    /// prefill, so the stuck-watchdog can detect "a new request was admitted"
+    /// without scanning the store.
+    pub fn admitted_watermark(&self) -> u64 {
+        self.admitted_hi.map_or(0, |hi| hi as u64 + 1)
+    }
+
     /// Iterate `(id, record)` over admitted requests only — the prefix
     /// `records[0..=admitted_hi]`. Empty until the first admission. Dense
     /// `request_state` snapshots use this instead of `iter` so the never-admitted
