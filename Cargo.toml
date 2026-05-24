@@ -50,6 +50,16 @@ schema-derive = { path = "simulator/schema-derive" }
 [dev-dependencies]
 # Temp dirs/files for L7 frontend + tick-driver + parquet writer tests.
 tempfile = "3"
+# Statistical microbenchmark harness for the cache-lookup hot path
+# (benches/cache_lookup.rs). `default-features = false` drops the plotters/rayon
+# pulls; we only need the sampling + confidence-interval estimates.
+criterion = { version = "0.5", default-features = false }
+
+# Hot-path cache-lookup microbenchmark (1D linear / 1D direct / 2D bilinear over
+# the real attention sweep grids). `harness = false` hands main() to criterion.
+[[bench]]
+name = "cache_lookup"
+harness = false
 
 # Build profiles mirror ref/moesim-rs. `release` is the everyday run profile:
 # thin LTO + baked-in debuginfo so `perf` resolves the heavily-inlined tick loop

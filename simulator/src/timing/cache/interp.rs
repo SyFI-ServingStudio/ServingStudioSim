@@ -17,10 +17,15 @@ use crate::timing::bridge::KernelMetrics;
 pub(crate) const MONOTONICITY_TOLERANCE: f32 = 0.10;
 
 /// One profiled point's metrics in f32. The 1D cache stores a `Vec<Metrics4>`;
-/// the 2D cache a `Vec<Option<Metrics4>>` grid (`None` = dropped non-finite).
-/// Also the CostTree eval path's per-leaf / per-subtree unit (the `buf[slot]`
-/// values [`CostTree::aggregate`](crate::timing::CostTree) rolls up).
+/// the 2D cache a dense `Vec<Metrics4>` grid. Also the CostTree eval path's
+/// per-leaf / per-subtree unit (the `buf[slot]` values
+/// [`CostTree::aggregate`](crate::timing::CostTree) rolls up).
+///
+/// `repr(C, align(16))` packs the four f32 into exactly one 16-byte SIMD lane so
+/// the field-wise `lerp` / `add_scaled` / `scale` blends below autovectorize to
+/// `mulps`/`addps` — the 2D bilinear hot path does four of these per lookup.
 #[derive(Clone, Copy, Debug)]
+#[repr(C, align(16))]
 pub struct Metrics4 {
     pub time_ms: f32,
     pub flops: f32,
@@ -167,6 +172,15 @@ impl LeafMetrics {
 /// its time recovering from mispredicts, which the cache benchmark showed
 /// dominated lookup latency (a single 63-element `partition_point`-based bracket
 /// cost ~24ns; branchless cut it to ~10ns).
+///
+/// This cmov binary search is the measured floor — three alternatives were
+/// benched against it on the real attention grids and all lost, so don't
+/// re-try them: (1) a branchless `count`-of-`<= x` scan (hoping to
+/// autovectorize) ran ~4× slower on the 63-point axis and +40% even on the
+/// 9–18-point axes; (2) an early-exit forward linear probe ran ~2× slower on
+/// 63 points and ~4% slower on the small axes (branch mispredicts); (3) an
+/// interleaved two-axis `locate2` (overlapping the two searches' load chains)
+/// was neutral-to-worse — the compiler already overlaps the two scalar calls.
 pub(crate) fn locate(xs: &[f32], x: f32) -> (usize, usize, f32, bool) {
     let n = xs.len();
     if n == 1 {

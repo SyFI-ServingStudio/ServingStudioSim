@@ -14,10 +14,21 @@ pub struct Cache2DLinear {
     xs0: Vec<f32>,
     /// Axis-1 coordinates, sorted ascending (len C).
     xs1: Vec<f32>,
-    /// R*C cells, row-major over `(xs0, xs1)`. `None` = the sample at that grid
-    /// point was dropped as non-finite (see `from_samples`); lookups that lean
-    /// on a dropped corner renormalize over the surviving corners.
-    cells: Vec<Option<Metrics4>>,
+    /// R*C cells, row-major over `(xs0, xs1)`, stored *dense* (16B each, no
+    /// `Option` discriminant) for cache density and a branch-free hot path. A
+    /// cell whose fit-time sample was non-finite holds `Metrics4::ZERO` and is
+    /// marked `false` in `valid`; lookups leaning on it renormalize over the
+    /// surviving corners.
+    cells: Vec<Metrics4>,
+    /// Per-cell finiteness, parallel to `cells`. Only consulted on the
+    /// dropped-corner slow path (`!all_finite`).
+    valid: Vec<bool>,
+    /// `valid.iter().all()` — true ⇒ every corner is present, so `interpolate_cell`
+    /// takes the branch-free four-load bilinear blend with no validity checks.
+    all_finite: bool,
+    /// `valid.iter().any()` — false ⇒ the whole grid was dropped, so `eval`
+    /// returns `NoCoverage` rather than a silent zero.
+    any_valid: bool,
 }
 
 impl Cache for Cache2DLinear {
@@ -45,7 +56,8 @@ impl Cache for Cache2DLinear {
         let xs0: Vec<f32> = order0.iter().map(|&i| axis0[i] as f32).collect();
         let xs1: Vec<f32> = order1.iter().map(|&j| axis1[j] as f32).collect();
 
-        let mut cells: Vec<Option<Metrics4>> = Vec::with_capacity(r * c);
+        let mut cells: Vec<Metrics4> = Vec::with_capacity(r * c);
+        let mut valid: Vec<bool> = Vec::with_capacity(r * c);
         for &i in &order0 {
             for &j in &order1 {
                 let sample = &samples[i * c + j];
@@ -57,12 +69,16 @@ impl Cache for Cache2DLinear {
                             axis0[i], axis1[j]
                         ),
                     });
-                    cells.push(None);
+                    cells.push(Metrics4::ZERO);
+                    valid.push(false);
                     continue;
                 }
-                cells.push(Some(Metrics4::from_sample(sample)));
+                cells.push(Metrics4::from_sample(sample));
+                valid.push(true);
             }
         }
+        let all_finite = valid.iter().all(|&v| v);
+        let any_valid = valid.iter().any(|&v| v);
 
         // Monotonicity scan along each axis: time should be non-decreasing as
         // either coordinate grows. Walk every row (axis-1 sweep at fixed axis-0)
@@ -71,7 +87,8 @@ impl Cache for Cache2DLinear {
         for i in 0..r {
             let mut prev: Option<(usize, f32)> = None;
             for j in 0..c {
-                if let Some(cell) = cells[i * c + j] {
+                if valid[i * c + j] {
+                    let cell = cells[i * c + j];
                     if let Some((pj, ptime)) = prev {
                         if cell.time_ms < ptime * (1.0 - MONOTONICITY_TOLERANCE) {
                             warnings.push(OutlierWarning {
@@ -91,7 +108,8 @@ impl Cache for Cache2DLinear {
         for j in 0..c {
             let mut prev: Option<(usize, f32)> = None;
             for i in 0..r {
-                if let Some(cell) = cells[i * c + j] {
+                if valid[i * c + j] {
+                    let cell = cells[i * c + j];
                     if let Some((pi, ptime)) = prev {
                         if cell.time_ms < ptime * (1.0 - MONOTONICITY_TOLERANCE) {
                             warnings.push(OutlierWarning {
@@ -109,7 +127,17 @@ impl Cache for Cache2DLinear {
             }
         }
 
-        (Self { xs0, xs1, cells }, warnings)
+        (
+            Self {
+                xs0,
+                xs1,
+                cells,
+                valid,
+                all_finite,
+                any_valid,
+            },
+            warnings,
+        )
     }
 
     fn eval(&self, sweep: &[f64]) -> LeafMetrics {
@@ -119,7 +147,7 @@ impl Cache for Cache2DLinear {
             "Cache2DLinear lookup requires two coordinates"
         );
         let (x0, x1) = (sweep[0], sweep[1]);
-        if x0.is_nan() || x1.is_nan() || self.cells.iter().all(Option::is_none) {
+        if x0.is_nan() || x1.is_nan() || !self.any_valid {
             return LeafMetrics {
                 m: Metrics4::ZERO,
                 coverage: CoverageFlags::NO_COVERAGE,
@@ -147,21 +175,45 @@ impl Cache2DLinear {
         let (i0, i1, t0, out0) = locate(&self.xs0, x0);
         let (j0, j1, t1, out1) = locate(&self.xs1, x1);
         let c = self.xs1.len();
-        let get = |i: usize, j: usize| self.cells[i * c + j];
+        let outside = out0 || out1;
 
         // Bilinear weights always sum to 1 regardless of t (including the
         // out-of-[0,1] t used for extrapolation), so a full set of finite
         // corners yields the exact bilinear value / linear extrapolation.
+        let (w00, w01, w10, w11) = (
+            (1.0 - t0) * (1.0 - t1),
+            (1.0 - t0) * t1,
+            t0 * (1.0 - t1),
+            t0 * t1,
+        );
+        let (idx00, idx01, idx10, idx11) =
+            (i0 * c + j0, i0 * c + j1, i1 * c + j0, i1 * c + j1);
+
+        // Hot path: the grid has no dropped cells, so blend all four corners
+        // unconditionally — four aligned `Metrics4` loads and a weighted sum the
+        // compiler vectorizes, with no `Option` discriminant or validity branch.
+        if self.all_finite {
+            let mut acc = Metrics4::ZERO;
+            acc.add_scaled(self.cells[idx00], w00);
+            acc.add_scaled(self.cells[idx01], w01);
+            acc.add_scaled(self.cells[idx10], w10);
+            acc.add_scaled(self.cells[idx11], w11);
+            return (acc, outside);
+        }
+
+        // Slow path: some cell was dropped non-finite. Re-derive per-corner
+        // presence from the validity mask.
+        let get = |idx: usize| self.valid[idx].then(|| self.cells[idx]);
         let corners = [
-            (i0, j0, get(i0, j0), (1.0 - t0) * (1.0 - t1)),
-            (i0, j1, get(i0, j1), (1.0 - t0) * t1),
-            (i1, j0, get(i1, j0), t0 * (1.0 - t1)),
-            (i1, j1, get(i1, j1), t0 * t1),
+            (i0, j0, get(idx00), w00),
+            (i0, j1, get(idx01), w01),
+            (i1, j0, get(idx10), w10),
+            (i1, j1, get(idx11), w11),
         ];
 
-        // Fast path: every corner that carries weight is present. A missing
-        // corner whose weight is ~0 — e.g. querying exactly on a surviving edge
-        // or grid point — contributes nothing and is not coverage loss.
+        // A missing corner whose weight is ~0 — e.g. querying exactly on a
+        // surviving edge or grid point — contributes nothing and is not coverage
+        // loss; only a *weighted* drop forces the renormalize path.
         let meaningful_drop = corners
             .iter()
             .any(|(_, _, cell, weight)| cell.is_none() && weight.abs() > f32::EPSILON);
@@ -172,7 +224,7 @@ impl Cache2DLinear {
                     acc.add_scaled(cell, weight);
                 }
             }
-            return (acc, out0 || out1);
+            return (acc, outside);
         }
 
         // A weighted corner was dropped as non-finite. Blend the surviving
@@ -242,6 +294,181 @@ mod tests {
         let mut m = sample(0.0);
         m.time_ms = f64::NAN;
         m
+    }
+
+    /// The exact pre-refactor `interpolate_cell` algorithm, operating on the
+    /// `Vec<Option<Metrics4>>` grid it used to store — kept verbatim as a
+    /// differential oracle. The dense-storage `interpolate_cell` must reproduce
+    /// its `(Metrics4, bool)` bit-for-bit on every probe and drop pattern.
+    fn interpolate_oracle(
+        xs0: &[f32],
+        xs1: &[f32],
+        cells: &[Option<super::Metrics4>],
+        x0: f32,
+        x1: f32,
+    ) -> (super::Metrics4, bool) {
+        use crate::timing::cache::interp::locate;
+        let (i0, i1, t0, out0) = locate(xs0, x0);
+        let (j0, j1, t1, out1) = locate(xs1, x1);
+        let c = xs1.len();
+        let get = |i: usize, j: usize| cells[i * c + j];
+        let corners = [
+            (i0, j0, get(i0, j0), (1.0 - t0) * (1.0 - t1)),
+            (i0, j1, get(i0, j1), (1.0 - t0) * t1),
+            (i1, j0, get(i1, j0), t0 * (1.0 - t1)),
+            (i1, j1, get(i1, j1), t0 * t1),
+        ];
+        let meaningful_drop = corners
+            .iter()
+            .any(|(_, _, cell, weight)| cell.is_none() && weight.abs() > f32::EPSILON);
+        if !meaningful_drop {
+            let mut acc = super::Metrics4::ZERO;
+            for &(_, _, cell, weight) in &corners {
+                if let Some(cell) = cell {
+                    acc.add_scaled(cell, weight);
+                }
+            }
+            return (acc, out0 || out1);
+        }
+        let mut acc = super::Metrics4::ZERO;
+        let mut weight_sum = 0.0;
+        for &(_, _, cell, weight) in &corners {
+            if let Some(cell) = cell {
+                let weight = weight.max(0.0);
+                acc.add_scaled(cell, weight);
+                weight_sum += weight;
+            }
+        }
+        if weight_sum > f32::EPSILON {
+            acc.scale(1.0 / weight_sum);
+            return (acc, true);
+        }
+        let normalized_distance = |axis: &[f32], lo: usize, hi: usize, x: f32, idx: usize| {
+            let width = (axis[hi] - axis[lo]).abs();
+            if width <= f32::EPSILON {
+                0.0
+            } else {
+                ((x - axis[idx]) / width).abs()
+            }
+        };
+        let nearest = corners
+            .iter()
+            .filter_map(|&(i, j, cell, _)| {
+                cell.map(|cell| {
+                    let d0 = normalized_distance(xs0, i0, i1, x0, i);
+                    let d1 = normalized_distance(xs1, j0, j1, x1, j);
+                    (cell, d0 * d0 + d1 * d1)
+                })
+            })
+            .min_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
+            .map(|(cell, _)| cell)
+            .unwrap_or(super::Metrics4::ZERO);
+        (nearest, true)
+    }
+
+    /// Build a `Cache2DLinear` and the parallel `Vec<Option<Metrics4>>` grid the
+    /// oracle reads, then assert `interpolate_cell` matches the oracle bit-for-bit
+    /// across a dense probe sweep. `drops` lists (axis0_idx, axis1_idx) cells
+    /// fed a non-finite sample (dropped).
+    fn assert_matches_oracle(axis0: Vec<f64>, axis1: Vec<f64>, drops: &[(usize, usize)]) {
+        let (r, c) = (axis0.len(), axis1.len());
+        let grid = SweepGrid::new(vec![axis0.clone(), axis1.clone()]);
+        let samples: Vec<KernelMetrics> = (0..r)
+            .flat_map(|i| (0..c).map(move |j| (i, j)))
+            .map(|(i, j)| {
+                if drops.contains(&(i, j)) {
+                    nan_sample()
+                } else {
+                    // A non-separable surface so bilinear weights actually matter.
+                    sample(1.0 + i as f64 * 2.0 + j as f64 * 3.0 + (i * j) as f64 * 0.1)
+                }
+            })
+            .collect();
+        let (cache, _warnings) = Cache2DLinear::from_samples(&grid, &samples);
+
+        // Reconstruct the Option grid in the cache's sorted axis order so the
+        // oracle sees the same layout `interpolate_cell` indexes into.
+        let opt_cells: Vec<Option<super::Metrics4>> = cache
+            .valid
+            .iter()
+            .zip(cache.cells.iter())
+            .map(|(&v, &m)| if v { Some(m) } else { None })
+            .collect();
+
+        // Probe sweep: every grid point, midpoints, and out-of-range on both
+        // axes (interior + extrapolation + on-dropped-corner cases).
+        let mut probes0 = vec![cache.xs0[0] - 50.0, cache.xs0[r - 1] + 50.0];
+        for w in cache.xs0.windows(2) {
+            probes0.push(w[0]);
+            probes0.push(0.5 * (w[0] + w[1]));
+        }
+        probes0.push(cache.xs0[r - 1]);
+        let mut probes1 = vec![cache.xs1[0] - 50.0, cache.xs1[c - 1] + 50.0];
+        for w in cache.xs1.windows(2) {
+            probes1.push(w[0]);
+            probes1.push(0.5 * (w[0] + w[1]));
+        }
+        probes1.push(cache.xs1[c - 1]);
+
+        for &x0 in &probes0 {
+            for &x1 in &probes1 {
+                let (got_m, got_ex) = cache.interpolate_cell(x0, x1);
+                let (want_m, want_ex) =
+                    interpolate_oracle(&cache.xs0, &cache.xs1, &opt_cells, x0, x1);
+                assert_eq!(
+                    got_ex, want_ex,
+                    "extrapolated flag diverges at ({x0},{x1}) drops={drops:?}"
+                );
+                // Bit-exact: the dense and Option paths do the same adds in the
+                // same order, so results must be identical, not merely close.
+                assert_eq!(
+                    got_m.time_ms, want_m.time_ms,
+                    "time diverges at ({x0},{x1}) drops={drops:?}: {got_m:?} vs {want_m:?}"
+                );
+                assert_eq!(got_m.flops, want_m.flops);
+                assert_eq!(got_m.bytes, want_m.bytes);
+                assert_eq!(got_m.energy_j, want_m.energy_j);
+            }
+        }
+    }
+
+    #[test]
+    fn dense_interpolate_matches_option_oracle_all_finite() {
+        use crate::timing::sweep::Axis;
+        // The three real attention grids + a couple of small shapes, no drops.
+        assert_matches_oracle(
+            Axis::chain([Axis::values([0]), Axis::pow2(7, 15)]),
+            Axis::pow2(7, 15),
+            &[],
+        );
+        assert_matches_oracle(Axis::pow2(0, 8), Axis::pow2(5, 22), &[]);
+        assert_matches_oracle(Axis::token_axis(), Axis::token_axis(), &[]);
+        assert_matches_oracle(vec![1.0, 2.0], vec![10.0, 20.0], &[]);
+        assert_matches_oracle(
+            Axis::arithmetic(0, 512, 128),
+            Axis::arithmetic(0, 384, 128),
+            &[],
+        );
+    }
+
+    #[test]
+    fn dense_interpolate_matches_option_oracle_with_drops() {
+        use crate::timing::sweep::Axis;
+        // Single interior drop, a corner drop, multiple drops, and a full row.
+        assert_matches_oracle(Axis::pow2(0, 4), Axis::pow2(0, 4), &[(2, 2)]);
+        assert_matches_oracle(Axis::pow2(0, 4), Axis::pow2(0, 4), &[(0, 0), (4, 4)]);
+        assert_matches_oracle(
+            Axis::arithmetic(0, 512, 128),
+            Axis::arithmetic(0, 384, 128),
+            &[(1, 1), (1, 2), (2, 1)],
+        );
+        // An entire axis-1 row dropped at i=1 (forces nearest-corner fallback for
+        // queries sitting on it).
+        assert_matches_oracle(
+            Axis::arithmetic(0, 384, 128),
+            Axis::arithmetic(0, 384, 128),
+            &[(1, 0), (1, 1), (1, 2), (1, 3)],
+        );
     }
 
     #[test]

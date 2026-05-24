@@ -102,26 +102,44 @@ fn cache_lookup_throughput() {
         cache_direct.eval(&[x]).m.time_ms as f64
     });
 
-    // 2D: a 16x16 monotonic grid (seq_len_q × kv_cache_len shape).
-    let axis0 = Axis::arithmetic(128, 2048, 128); // 16 points
-    let axis1 = Axis::arithmetic(128, 2048, 128); // 16 points
-    let (r, c) = (axis0.len(), axis1.len());
-    let grid_2d = SweepGrid::new(vec![axis0, axis1]);
-    let samples_2d: Vec<KernelMetrics> = (0..r)
-        .flat_map(|i| (0..c).map(move |j| (i, j)))
-        .map(|(i, j)| compute_sample(1.0 + i as f64 + j as f64))
-        .collect();
-    let (cache_2d, warnings) = Cache2DLinear::from_samples(&grid_2d, &samples_2d);
-    assert!(warnings.is_empty(), "2D fixture must fit cleanly");
+    // 2D: the three real attention grids, smallest-to-largest. The hot question
+    // is L1 residency — the all-finite hot path touches only `cells` at 16
+    // bytes/cell, so prefill (90 cells = 1.4KB) and decode (162 = 2.5KB) sit
+    // entirely in L1; rect (63² = 3969 = 62KB) spills to L2, so its 4-corner
+    // loads (two rows c apart) cost a line fill each.
+    let bench_2d = |label: &str, axis0: Vec<f64>, axis1: Vec<f64>, probes: &[(f64, f64)]| {
+        let (r, c) = (axis0.len(), axis1.len());
+        let grid = SweepGrid::new(vec![axis0, axis1]);
+        let samples: Vec<KernelMetrics> = (0..r)
+            .flat_map(|i| (0..c).map(move |j| (i, j)))
+            .map(|(i, j)| compute_sample(1.0 + i as f64 + j as f64))
+            .collect();
+        let (cache, warnings) = Cache2DLinear::from_samples(&grid, &samples);
+        assert!(warnings.is_empty(), "2D fixture {label} must fit cleanly");
+        bench(label, probes, move |x0, x1| {
+            cache.eval(&[x0, x1]).m.time_ms as f64
+        });
+    };
 
-    let probes_2d: &[(f64, f64)] = &[
-        (200.0, 200.0),   // interior
-        (1000.0, 1500.0), // interior
-        (2048.0, 2048.0), // corner
-        (64.0, 64.0),     // below both edges (extrapolate)
-        (3000.0, 1000.0), // beyond axis-0
-    ];
-    bench("Cache2DLinear::eval", probes_2d, |x0, x1| {
-        cache_2d.eval(&[x0, x1]).m.time_ms as f64
-    });
+    // prefill: prefix_len (chain [0] + pow2 7..15) × append_len (pow2 7..15).
+    bench_2d(
+        "Cache2DLinear prefill 10x9",
+        Axis::chain([Axis::values([0]), Axis::pow2(7, 15)]),
+        Axis::pow2(7, 15),
+        &[(0.0, 256.0), (4096.0, 8192.0), (32768.0, 32768.0), (1500.0, 700.0), (40000.0, 1000.0)],
+    );
+    // decode: batch_size (pow2 0..8) × total_tokens (pow2 5..22).
+    bench_2d(
+        "Cache2DLinear decode 9x18",
+        Axis::pow2(0, 8),
+        Axis::pow2(5, 22),
+        &[(4.0, 1024.0), (32.0, 65536.0), (256.0, 4194304.0), (3.0, 700.0), (500.0, 100.0)],
+    );
+    // rect: token_axis² (largest, L2-resident).
+    bench_2d(
+        "Cache2DLinear rect 63x63",
+        Axis::token_axis(),
+        Axis::token_axis(),
+        &[(200.0, 200.0), (4096.0, 8192.0), (65536.0, 65536.0), (64.0, 64.0), (40000.0, 1000.0)],
+    );
 }
