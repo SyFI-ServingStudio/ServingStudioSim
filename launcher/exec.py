@@ -31,6 +31,10 @@ def binary_path(build_type: str = "debug") -> Path:
     return REPO_ROOT / "target" / build_type / "simulator"
 
 
+def analyzer_binary_path(build_type: str = "debug") -> Path:
+    return REPO_ROOT / "target" / build_type / "analyze"
+
+
 def schema_json_path(build_type: str = "debug") -> Path:
     return REPO_ROOT / "target" / build_type / "deployment_schema.json"
 
@@ -137,7 +141,60 @@ def cargo_build(build_type: str = "debug") -> bool:
         sys.stderr.write(f"schema discovery failed:\n{result.stderr}")
         return False
     schema_json_path(build_type).write_text(result.stdout)
+
+    # The analyzer is a standalone workspace crate (not a sim dep), so the build
+    # above doesn't produce it — build it explicitly. Best-effort: a missing
+    # analyzer must not block runs (the post-run analysis step is also optional).
+    analyzer_cmd = ["cargo", "build", "-p", "analyzer"]
+    if build_type == "release":
+        analyzer_cmd.append("--release")
+    if subprocess.run(analyzer_cmd, cwd=REPO_ROOT).returncode != 0:
+        sys.stderr.write("[warn] analyzer build failed; runs will skip post-run analysis\n")
     return True
+
+
+async def _run_capture(argv: list[str]) -> tuple[int, str]:
+    """Spawn `argv` (cwd=REPO_ROOT), await it, return (returncode, combined
+    stdout+stderr). Async so the sweep's event loop keeps pumping other runs while
+    this one's analysis runs — unlike a blocking `subprocess.run`."""
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        cwd=REPO_ROOT,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode(errors="replace")
+
+
+async def run_analysis(
+    log_dir: Path, build_type: str = "debug", subjects: list[str] | None = None
+) -> None:
+    """Best-effort post-run analysis: Rust `analyze run` (parquet → report+payload
+    JSON) then the Python renderer (payload JSON → PNGs). Failures warn and return
+    — analysis must never fail an otherwise-successful run.
+
+    Async: across a sweep, many runs' analyze+render overlap under the existing
+    semaphore instead of serializing on a blocking call that stalls the event loop.
+
+    `subjects` is the *intent* layer: which subjects to run (e.g. `["slo"]`).
+    `None`/empty = all subjects applicable to the run's deployment (the analyzer
+    self-selects via its applicability gate — the launcher never decides what is
+    *applicable*, only what is *wanted*)."""
+    analyzer = analyzer_binary_path(build_type)
+    if not analyzer.exists():
+        print(f"[analyze] {analyzer} not built; skipping analysis for {log_dir}")
+        return
+    subjects = subjects or []
+    rc, out = await _run_capture([str(analyzer), "run", str(log_dir), *subjects])
+    if rc != 0:
+        print(f"[analyze] compute failed for {log_dir}:\n{out}")
+        return
+    rc, out = await _run_capture(
+        [sys.executable, str(REPO_ROOT / "analyzer" / "python"), "render", str(log_dir), *subjects]
+    )
+    if rc != 0:
+        print(f"[analyze] render failed for {log_dir}:\n{out}")
 
 
 @dataclass

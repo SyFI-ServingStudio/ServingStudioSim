@@ -82,6 +82,12 @@ def _build_argparse():
         metavar="HZ",
         help="perf sampling frequency for --profile (default: 499).",
     )
+    parser.add_argument(
+        "--no-analyze",
+        action="store_true",
+        help="Skip the per-run analyzer (Rust SLO compute + Python plots) that "
+        "otherwise runs after each successful run.",
+    )
     return parser
 
 
@@ -180,9 +186,16 @@ def main(argv: list[str] | None = None) -> int:
 
     all_candidates: list[dict] = []
     last_preset: dict = {}
+    analyze_subjects: list[str] | None = None
     for preset_path in args.presets:
         preset = json.loads(Path(preset_path).read_text())
         preset = _apply_overrides(preset, args.override)
+        # `analyze_subjects` is a launcher-only key (which post-run analyzer
+        # subjects to render). Pop it BEFORE schema validation / sweep expansion
+        # so it never reaches the simulator CLI; omit = all applicable subjects.
+        subjects = preset.pop("analyze_subjects", None)
+        if subjects is not None:
+            analyze_subjects = subjects
         last_preset = preset
 
         errors = validate_params(preset, schema)
@@ -237,10 +250,18 @@ def main(argv: list[str] | None = None) -> int:
             refresh=args.refresh,
             profile=args.profile,
             profile_freq=args.profile_freq,
+            analyze=not args.no_analyze,
+            analyze_subjects=analyze_subjects,
         )
         return 0 if ok else 1
     return run_sweep(
-        all_candidates, last_preset, schema, args.build_type, refresh=args.refresh
+        all_candidates,
+        last_preset,
+        schema,
+        args.build_type,
+        refresh=args.refresh,
+        analyze=not args.no_analyze,
+        analyze_subjects=analyze_subjects,
     )
 
 

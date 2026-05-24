@@ -25,6 +25,7 @@ from .exec import (
     _build_subprocess_env,
     _profile_env,
     binary_path,
+    run_analysis,
     wrap_with_perf,
 )
 from .schema import build_cli_command, validate_unique_log_dirs
@@ -54,6 +55,8 @@ async def _launch_one(
     refresh: bool = False,
     profile: bool = False,
     profile_freq: int = 499,
+    analyze: bool = True,
+    analyze_subjects: list[str] | None = None,
 ) -> bool:
     """Metadata-then-spawn for a single (already normalized) param set. On resume
     (the default) a run whose log_dir already has a `.complete` marker is skipped;
@@ -62,7 +65,11 @@ async def _launch_one(
 
     `profile=True` wraps the run argv with `perf record` (output `<log_dir>/
     perf.data`) under a single-threaded BLAS/OMP env — the launcher's wallclock
-    profiling mode (skill `profile-sim-speed`)."""
+    profiling mode (skill `profile-sim-speed`).
+
+    `analyze=True` runs the post-run analyzer (Rust compute → Python plots) after
+    a successful run; best-effort, so analysis failures never fail the run.
+    `analyze_subjects` narrows which subjects run (None/empty = all applicable)."""
     log_dir = Path(str(params["log_dir"]))
 
     if not refresh and _is_complete(log_dir):
@@ -94,6 +101,8 @@ async def _launch_one(
                 f"[profile] wrote {log_dir.resolve() / 'perf.data'} — read with "
                 f"`perf report -i {log_dir.resolve() / 'perf.data'} --stdio` (not cat)"
             )
+        if analyze:
+            await run_analysis(log_dir, build_type, analyze_subjects)
     return ok
 
 
@@ -108,16 +117,22 @@ def run_single(
     refresh: bool = False,
     profile: bool = False,
     profile_freq: int = 499,
+    analyze: bool = True,
+    analyze_subjects: list[str] | None = None,
 ) -> bool:
     """Prebuild → metadata → run, for one param set. Synchronous entry. The
     caller must pass the already-loaded Rust schema from `load_schema()`; the
     sweep layer never loads a schema implicitly. Resumes by default (skips a run
     already marked `.complete`); `refresh=True` re-runs. `profile=True` wraps the
-    run with `perf record` (skill `profile-sim-speed`)."""
+    run with `perf record` (skill `profile-sim-speed`). `analyze=True` runs the
+    post-run analyzer (best-effort); `analyze_subjects` narrows which subjects."""
     if schema is None:
         raise TypeError("run_single requires a loaded Schema; call load_schema() first")
     return asyncio.run(
-        _run_single_async(params, preset, schema, build_type, refresh, profile, profile_freq)
+        _run_single_async(
+            params, preset, schema, build_type, refresh, profile, profile_freq,
+            analyze, analyze_subjects,
+        )
     )
 
 
@@ -129,6 +144,8 @@ async def _run_single_async(
     refresh: bool = False,
     profile: bool = False,
     profile_freq: int = 499,
+    analyze: bool = True,
+    analyze_subjects: list[str] | None = None,
 ) -> bool:
     log_dir = Path(str(params["log_dir"]))
     if not refresh and _is_complete(log_dir):
@@ -137,7 +154,9 @@ async def _run_single_async(
     metadata.write_shared_metadata(log_dir, preset or params)
     if not await prebuild_caches([params], schema, build_type, base_dir=log_dir):
         return False
-    return await _launch_one(params, build_type, refresh, profile, profile_freq)
+    return await _launch_one(
+        params, build_type, refresh, profile, profile_freq, analyze, analyze_subjects
+    )
 
 
 # ── sweep flow ─────────────────────────────────────────────────────────────
@@ -150,15 +169,22 @@ def run_sweep(
     build_type: str = "debug",
     parallelism: int = DEFAULT_PARALLELISM,
     refresh: bool = False,
+    analyze: bool = True,
+    analyze_subjects: list[str] | None = None,
 ) -> int:
     """Expand-then-launch a full sweep. Returns a process exit code. The caller
     must pass the already-loaded Rust schema from `load_schema()`; the sweep
     layer never loads a schema implicitly. Resumes by default (skips runs marked
-    `.complete`); `refresh=True` re-runs all."""
+    `.complete`); `refresh=True` re-runs all. `analyze=True` runs the per-run
+    analyzer after each successful run (best-effort); `analyze_subjects` narrows
+    which subjects."""
     if schema is None:
         raise TypeError("run_sweep requires a loaded Schema; call load_schema() first")
     return asyncio.run(
-        _run_sweep_async(param_sets, original_preset, schema, build_type, parallelism, refresh)
+        _run_sweep_async(
+            param_sets, original_preset, schema, build_type, parallelism, refresh,
+            analyze, analyze_subjects,
+        )
     )
 
 
@@ -169,6 +195,8 @@ async def _run_sweep_async(
     build_type: str,
     parallelism: int,
     refresh: bool = False,
+    analyze: bool = True,
+    analyze_subjects: list[str] | None = None,
 ) -> int:
     if not validate_unique_log_dirs(param_sets):
         return 2
@@ -202,7 +230,10 @@ async def _run_sweep_async(
 
         async def _bounded(params: dict) -> bool:
             async with sem:
-                return await _launch_one(params, build_type, refresh)
+                return await _launch_one(
+                    params, build_type, refresh,
+                    analyze=analyze, analyze_subjects=analyze_subjects,
+                )
 
         results = await asyncio.gather(*(_bounded(p) for p in pending))
     else:
