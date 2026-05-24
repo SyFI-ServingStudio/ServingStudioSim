@@ -14,6 +14,7 @@ default-groups = ["dev", "profiling", "launcher", "analyze"]
 
 [dependency-groups]
 dev = [
+    "duckdb>=1.5.3",
     "pytest>=9.0.0",
     "ruff>=0.14.0",
 ]
