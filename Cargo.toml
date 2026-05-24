@@ -24,6 +24,11 @@ anyhow = "1"
 thiserror = "2"
 pyo3 = { version = "0.20", features = ["auto-initialize"] }
 
+# Heap profiler, opt-in via `--features dhat-heap`. Off by default (zero cost in
+# normal builds); when on it installs a global allocator that records every Rust
+# allocation's call stack to `dhat-heap.json`. See the profile-sim-speed skill.
+dhat = { version = "0.3", optional = true }
+
 # Arrow schemas + arrays + parquet writer for the L7 streaming parquet logs
 # (request_state / request_slo). ZSTD compression matches ref/moesim-rs.
 arrow-schema = { version = "54", default-features = false }
@@ -46,6 +51,10 @@ timing-kernel-derive = { path = "simulator/timing-kernel-derive" }
 # a deployment's `ParamDef` schema slice from its clap `Args` struct so the CLI
 # surface and `list-params` schema cannot drift (design §1.8.3/§1.8.4).
 schema-derive = { path = "simulator/schema-derive" }
+
+[features]
+# Turn on the dhat heap profiler (global allocator + JSON dump on exit).
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 # Temp dirs/files for L7 frontend + tick-driver + parquet writer tests.

@@ -28,6 +28,14 @@ use simulator::schema::list_params;
 use simulator::sim::{run_sim, TickCfg, TraceFrontend};
 use simulator::timing::PerfApiBridge;
 
+// Heap profiling (opt-in, `--features dhat-heap`): dhat's allocator only
+// intercepts Rust's `GlobalAlloc`, so Python/torch C-side allocations bypass it
+// — the dump is dominated by the sim's own Rust allocations, which is exactly
+// what we want to attribute. Writes `dhat-heap.json` when `_dhat` drops at exit.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 #[derive(Parser)]
 #[command(
     name = "simulator",
@@ -67,6 +75,11 @@ enum DeploymentSel {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Heap profiler guard (opt-in): starts recording allocations now, dumps
+    // `dhat-heap.json` when it drops at the end of main.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
+
     // Timed/leveled logging (heartbeats, cache-build progress, run summary).
     // `RUST_LOG` overrides the default `info` level; e.g. `RUST_LOG=debug`.
     tracing_subscriber::fmt()
