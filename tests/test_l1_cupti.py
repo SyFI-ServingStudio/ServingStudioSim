@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import pytest
 
+# Whole module is the `gpu` tier (conftest auto-skips when no CUDA device).
+pytestmark = pytest.mark.gpu
+
 
 def _require_cuda_cupti():
+    # CUDA presence is the `gpu` marker's job; here we only probe the CUPTI
+    # headers/libs, a *feature* the device may still lack (inner skip).
     torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is not available")
-
     from profiling.profilers import cupti_kernel_profiler
 
     try:

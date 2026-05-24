@@ -35,6 +35,21 @@ profiling = [
     "flashinfer-cubin>=0.6.4,<0.7; sys_platform == 'linux'",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Put tests/ on sys.path so test modules can import shared helpers like
+# `fixtures.gen_throughput_trace` (a committed deterministic trace generator).
+pythonpath = ["tests"]
+# Capability tiers (see tests/conftest.py for the auto-skip logic). Unmarked
+# tests are the default `cpu` tier (deterministic, no GPU/binary).
+markers = [
+    "gpu: requires a CUDA device",
+    "needs_binary: requires the built simulator binary (release)",
+    "needs_db: requires warm profile.db rows for the config under test",
+    "agent: Codex runner+judge tier (opt-in: --run-agent)",
+    "bench: perf/timing, non-deterministic (opt-in: -m bench)",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

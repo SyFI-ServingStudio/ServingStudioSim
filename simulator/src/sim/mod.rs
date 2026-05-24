@@ -7,4 +7,4 @@ pub mod repro;
 pub mod run;
 
 pub use frontend::{TraceEntry, TraceFrontend};
-pub use run::{run_sim, TerminationCause, TickCfg};
+pub use run::{run_sim, RunSummary, TerminationCause, TickCfg};

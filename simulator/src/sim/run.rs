@@ -10,6 +10,8 @@
 
 use std::time::Instant;
 
+use serde::Serialize;
+
 use crate::common::{RequestId, RequestRecord, SharedRequests, Time};
 use crate::log::{FinalPhase, LoggerSession, RequestSloEntry, RequestStateEntry};
 use crate::orchestrator::{Flow, OrchAction};
@@ -48,7 +50,7 @@ impl EveryN {
 }
 
 /// Why the run loop stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum TerminationCause {
     /// Every request completed (and, under `run_to_end`, the trace was drained).
     DrainComplete,
@@ -56,6 +58,41 @@ pub enum TerminationCause {
     DurationReached,
     /// Trace exhausted but in-flight work made no progress for `stuck_threshold`.
     Stuck,
+}
+
+/// Machine-readable end-of-run summary — the structured counterpart of the
+/// end-of-run `tracing::info!` lines, serialized to `<log_dir>/summary.json` so
+/// regression tests (and the future L7-β aggregator) read structured metrics
+/// instead of scraping logs.
+///
+/// Every field except `wall_s` / `realtime_x` is **deterministic** given a fixed
+/// trace + config + cost model (the modeled cluster's serving behavior in
+/// *simulated* time). `wall_s` / `realtime_x` are the simulator's own speed
+/// (host-load dependent) — useful for trend/bench, never for a tight assertion.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct RunSummary {
+    pub cause: TerminationCause,
+    pub requests_total: u64,
+    pub requests_finished: u64,
+    pub prefill_tokens: u64,
+    pub decode_tokens: u64,
+    pub total_tokens: u64,
+    pub prefill_tok_s: f64,
+    pub decode_tok_s: f64,
+    pub total_tok_s: f64,
+    pub completed_req_s: f64,
+    pub sim_ms: f64,
+    pub wall_s: f64,
+    pub realtime_x: f64,
+}
+
+impl RunSummary {
+    /// Write `<log_dir>/summary.json` (pretty-printed). Caller owns the path.
+    pub fn write_json(&self, log_dir: &std::path::Path) -> anyhow::Result<()> {
+        let path = log_dir.join("summary.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(self)?)?;
+        Ok(())
+    }
 }
 
 /// Tick-loop knobs. Defaults mirror ref/moesim-rs's unified loop: `tick_dt` 1 ms,
@@ -97,7 +134,7 @@ pub fn run_sim(
     frontend: &mut super::frontend::TraceFrontend,
     logger: &mut LoggerSession,
     cfg: &TickCfg,
-) -> anyhow::Result<TerminationCause> {
+) -> anyhow::Result<RunSummary> {
     let wall_start = Instant::now();
     let mut clock = Time::ZERO;
     let mut prev_progress = 0u64;
@@ -198,14 +235,16 @@ pub fn run_sim(
     finalize(store, logger, clock)?;
     logger.flush_all()?;
 
-    // End-of-run summary (multi-line): finished count, then prefill / decode /
-    // total token counts each with their own throughput, then sim + wall time.
+    // End-of-run summary: finished count, then prefill / decode / total token
+    // counts each with their own throughput, then sim + wall time. Built into a
+    // `RunSummary` (returned + serialized by the caller); the tracing lines below
+    // render from it so the log and `summary.json` can't diverge.
     let wall_s = wall_start.elapsed().as_secs_f64();
     let safe_wall = wall_s.max(1e-9);
-    {
+    let summary = {
         let s = store.borrow();
-        let total = s.iter().count();
-        let completed = s.iter().filter(|(_, r)| r.completed).count();
+        let total = s.iter().count() as u64;
+        let completed = s.iter().filter(|(_, r)| r.completed).count() as u64;
         let prefill_tok: u64 = s.iter().map(|(_, r)| r.prefill_processed as u64).sum();
         let decode_tok: u64 = s.iter().map(|(_, r)| r.tokens_emitted as u64).sum();
         let all_tok = prefill_tok + decode_tok;
@@ -214,34 +253,53 @@ pub fn run_sim(
         // second (that would just be the simulator's speed, captured separately
         // by the "x real-time" ratio below).
         let sim_s = (clock.as_ms() / 1000.0).max(1e-9);
-        tracing::info!("sim complete: cause={:?}", cause);
-        tracing::info!("  requests: finished {}/{}", completed, total);
-        tracing::info!(
-            "  prefill:  {} tokens ({:.0} tok/s)",
-            prefill_tok,
-            prefill_tok as f64 / sim_s
-        );
-        tracing::info!(
-            "  decode:   {} tokens ({:.0} tok/s)",
-            decode_tok,
-            decode_tok as f64 / sim_s
-        );
-        tracing::info!(
-            "  total:    {} tokens ({:.0} tok/s)",
-            all_tok,
-            all_tok as f64 / sim_s
-        );
-        // Modeled completion rate (req per sim-second); then sim vs wall time and
-        // the speedup = how many seconds of modeled time we cover per real second.
-        tracing::info!(
-            "  time:     sim {:.1}ms, wall {:.2}s ({:.1} req/s, {:.1}x real-time)",
-            clock.as_ms(),
+        RunSummary {
+            cause,
+            requests_total: total,
+            requests_finished: completed,
+            prefill_tokens: prefill_tok,
+            decode_tokens: decode_tok,
+            total_tokens: all_tok,
+            prefill_tok_s: prefill_tok as f64 / sim_s,
+            decode_tok_s: decode_tok as f64 / sim_s,
+            total_tok_s: all_tok as f64 / sim_s,
+            completed_req_s: completed as f64 / sim_s,
+            sim_ms: clock.as_ms(),
             wall_s,
-            completed as f64 / sim_s,
-            sim_s / safe_wall,
-        );
-    }
-    Ok(cause)
+            realtime_x: sim_s / safe_wall,
+        }
+    };
+    tracing::info!("sim complete: cause={:?}", summary.cause);
+    tracing::info!(
+        "  requests: finished {}/{}",
+        summary.requests_finished,
+        summary.requests_total
+    );
+    tracing::info!(
+        "  prefill:  {} tokens ({:.0} tok/s)",
+        summary.prefill_tokens,
+        summary.prefill_tok_s
+    );
+    tracing::info!(
+        "  decode:   {} tokens ({:.0} tok/s)",
+        summary.decode_tokens,
+        summary.decode_tok_s
+    );
+    tracing::info!(
+        "  total:    {} tokens ({:.0} tok/s)",
+        summary.total_tokens,
+        summary.total_tok_s
+    );
+    // Modeled completion rate (req per sim-second); then sim vs wall time and
+    // the speedup = how many seconds of modeled time we cover per real second.
+    tracing::info!(
+        "  time:     sim {:.1}ms, wall {:.2}s ({:.1} req/s, {:.1}x real-time)",
+        summary.sim_ms,
+        summary.wall_s,
+        summary.completed_req_s,
+        summary.realtime_x,
+    );
+    Ok(summary)
 }
 
 /// Sim-end flush: any *admitted* request still in-flight gets a final
@@ -400,7 +458,7 @@ mod tests {
         let mut frontend = TraceFrontend::load(&[trace], 1.0).unwrap();
         let mut logger = LoggerSession::open(dir.path()).unwrap();
 
-        let cause = run_sim(
+        let summary = run_sim(
             &mut flow,
             &store,
             &mut frontend,
@@ -408,7 +466,10 @@ mod tests {
             &TickCfg::new(5000.0, true),
         )
         .unwrap();
-        assert_eq!(cause, TerminationCause::DrainComplete);
+        assert_eq!(summary.cause, TerminationCause::DrainComplete);
+        assert_eq!(summary.requests_finished, 4);
+        assert_eq!(summary.decode_tokens, 12); // 4 requests × 3 output tokens
+        assert!(summary.total_tok_s > 0.0);
 
         // Every request finished: 3 output tokens each.
         let s = store.borrow();

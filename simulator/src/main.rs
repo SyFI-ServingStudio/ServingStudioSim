@@ -126,12 +126,14 @@ fn cmd_run(sel: DeploymentSel) -> anyhow::Result<()> {
             let mut frontend = TraceFrontend::load(&p.workload.trace_files, p.workload.request_rate)?;
             let mut logger = LoggerSession::open(&p.io.log_dir)?;
             let cfg = TickCfg::new(p.workload.duration_ms, p.workload.run_to_end);
-            let cause = run_sim(flow.as_mut(), &store, &mut frontend, &mut logger, &cfg)?;
-            // run_sim emits the stats summary (completed/throughput/wall); here we
-            // just point at where the parquet logs landed.
+            let summary = run_sim(flow.as_mut(), &store, &mut frontend, &mut logger, &cfg)?;
+            // run_sim emits the stats summary (completed/throughput/wall) to the
+            // log; persist the structured form as `<log_dir>/summary.json` for
+            // regression tests + the aggregator, then point at the parquet logs.
+            summary.write_json(&p.io.log_dir)?;
             tracing::info!(
                 deployment = "unified",
-                cause = ?cause,
+                cause = ?summary.cause,
                 log_dir = %p.io.log_dir.display(),
                 "run complete"
             );
