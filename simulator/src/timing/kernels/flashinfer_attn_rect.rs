@@ -12,14 +12,15 @@
 //!
 //! Both axes are independent token curves -> `Cache2DLinear` + `grid.expand_2d`.
 
-use crate::timing::bridge::{ArgsPayload, DType, KernelKind};
+use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
-use crate::timing::kernels::engine::{Kernel, KernelSpec};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
 pub struct FlashinferAttnRectKernelConfig {
+    #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
     pub num_qo_heads: u32,
@@ -30,7 +31,7 @@ pub struct FlashinferAttnRectKernelConfig {
     pub o_dtype: DType,
 }
 
-#[derive(SweepCoords)]
+#[derive(SweepCoords, serde::Deserialize)]
 pub struct FlashinferAttnRectKernelInput {
     pub q_len: u32,
     pub kv_len: u32,
@@ -74,7 +75,7 @@ impl KernelSpec for FlashinferAttnRectSpec {
     }
 }
 
-pub type FlashinferAttnRectKernel = Kernel<FlashinferAttnRectSpec>;
+register_kernel!(FlashinferAttnRectKernel, FlashinferAttnRectSpec);
 
 #[cfg(test)]
 mod tests {

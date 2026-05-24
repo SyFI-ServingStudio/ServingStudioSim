@@ -24,3 +24,33 @@ pub trait Probe {
     /// One-line shape/dtype config summary for the compiled leaf's manifest entry.
     fn describe_config(&self) -> String;
 }
+
+/// Object-safe sibling of [`Probe`] for cost-model *introspection* (the
+/// `kernel-query` subcommand): query a built kernel's cache by a **physical /
+/// natural** shape and read back the interpolated metrics per backend, plus the
+/// grid the cache was fitted on.
+///
+/// Unlike `Probe` (whose `eval` takes the typed `Self::Input`), this is `dyn`-able
+/// — `eval_json` takes the kernel's Input as JSON, **deserializes it straight into
+/// the kernel's existing `Self::Input` struct**, and calls the kernel's existing
+/// [`eval`](crate::timing::Probe::eval). So the real `coords()` projection and
+/// best-of-N run unchanged — the harness reuses the kernel, it doesn't reimplement
+/// anything. One blanket impl over `Kernel<S>` (where `S::Input: Deserialize`)
+/// covers every kernel; adding a kernel just needs `#[derive(Deserialize)]` on its
+/// Input.
+pub trait CacheProbe {
+    /// Kernel KIND tag (the profile.db table / Python facade stem).
+    fn kind(&self) -> &'static str;
+
+    /// One-line `field=value` config summary (same as [`Probe::describe_config`]).
+    fn describe_config(&self) -> String;
+
+    /// The sweep grid this cache was fitted on, in coords space: one ascending
+    /// `Vec<f64>` per axis (so a caller can place off-grid probes).
+    fn grid_axes(&self) -> Vec<Vec<f64>>;
+
+    /// Best-of-N interpolated metrics for an Input given as JSON (the kernel's
+    /// own fields, e.g. `{"prefix_len":0,"append_len":192}`). Errors if the JSON
+    /// doesn't match the kernel's Input schema.
+    fn eval_json(&self, input: &serde_json::Value) -> anyhow::Result<LeafMetrics>;
+}

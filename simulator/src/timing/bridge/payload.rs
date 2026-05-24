@@ -12,15 +12,14 @@ pub type KernelKind = &'static str;
 
 /// Floating-/integer-point precision tag carried on every kernel spec.
 ///
-/// **Wire form vs. serde form differ.** The on-wire string Python expects in
-/// `ArgsPayload` is the snake_case literal returned by [`DType::as_str`]
-/// (`"fp16"`, `"fp8_e4m3"`, ...). The derived `Serialize` / `Deserialize`
-/// impls emit the variant *identifier* (`"Fp16"`, `"Fp8E4m3"`, ...) and are
-/// intended only for internal Rust-to-Rust round-trips (e.g. cache identity
-/// hashing). When constructing an `ArgsPayload` field that will cross the
-/// PyO3 boundary, *always* go through `dtype.as_str()` — see
-/// `kernels/single_gemm.rs::enumerate` for the canonical pattern.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `Serialize`/`Deserialize` are hand-written so the wire form is single-sourced
+/// on [`DType::as_str`] / [`DType::from_wire`] (`"fp16"`, `"bf16"`, `"fp8_e4m3"`,
+/// ...) — NOT serde's `rename_all`, which would re-derive the mapping from the
+/// variant identifiers independently and could silently drift from `as_str`. A
+/// `KernelConfig` thus deserializes its dtype fields directly from the wire
+/// literal with no per-field helper. `as_str`/`from_wire` are kept in lockstep by
+/// `dtype_wire_roundtrips_for_every_variant` below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DType {
     Fp16,
     Bf16,
@@ -54,6 +53,55 @@ impl DType {
             DType::Fp8E4m3 | DType::Fp8E5m2 | DType::Int8 | DType::Int4 => 1,
         }
     }
+
+    /// Inverse of [`DType::as_str`]: parse the snake_case wire literal back to a
+    /// variant. The single source of the wire→variant mapping (paired with
+    /// `as_str` for variant→wire); used by the hand-written `Deserialize`.
+    pub fn from_wire(s: &str) -> Option<DType> {
+        Some(match s {
+            "fp16" => DType::Fp16,
+            "bf16" => DType::Bf16,
+            "fp32" => DType::Fp32,
+            "fp8_e4m3" => DType::Fp8E4m3,
+            "fp8_e5m2" => DType::Fp8E5m2,
+            "int8" => DType::Int8,
+            "int4" => DType::Int4,
+            _ => return None,
+        })
+    }
+}
+
+impl Serialize for DType {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DType {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        DType::from_wire(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown dtype {s:?} (expected fp16/bf16/fp32/fp8_e4m3/fp8_e5m2/int8/int4)"
+            ))
+        })
+    }
+}
+
+/// serde `deserialize_with` for a `KernelConfig`'s `backends: Vec<&'static str>`
+/// field, which is otherwise not `Deserialize` (a borrowed `'static` can't own
+/// JSON-provided strings). Reads `Vec<String>` and leaks each into a
+/// `&'static str`. Only invoked on the `kernel-query` path, which builds one
+/// kernel in a short-lived subprocess and exits — leaking a few backend strings
+/// is negligible and avoids maintaining a central known-backend registry.
+pub(crate) fn de_backends<'de, D>(d: D) -> Result<Vec<&'static str>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Vec::<String>::deserialize(d)?;
+    Ok(v.into_iter()
+        .map(|s| &*Box::leak(s.into_boxed_str()))
+        .collect())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -100,6 +148,24 @@ pub struct KernelMetrics {
 }
 
 impl KernelMetrics {
+    /// A non-finite sentinel for a grid cell that is physically infeasible (no
+    /// shape exists to profile). `Cache2DLinear::from_samples` treats this as a
+    /// dropped cell (`!is_finite()`), so lookups renormalize over the feasible
+    /// corners instead of trusting fabricated data. Used to slot placeholders
+    /// back into a sample vector after the infeasible cells were excluded from
+    /// profiling — see `KernelSpec::infeasible_mask`.
+    pub fn non_finite() -> Self {
+        Self {
+            time_ms: f64::NAN,
+            tflops: None,
+            memory_bandwidth_gbps: None,
+            algbw_gbps: None,
+            busbw_gbps: None,
+            message_size_bytes: None,
+            energy_j: f64::NAN,
+        }
+    }
+
     /// True iff `time_ms` and every populated optional rate field is a
     /// non-negative finite f64. Cache `from_samples` scans this to emit
     /// `OutlierKind::NonFinite` instead of swallowing NaN/Inf into 0 via the
@@ -174,6 +240,30 @@ pub struct ProfilerVersion {
 mod tests {
     use super::{ArgsPayload, DType, KernelMetrics};
     use serde_json::Value;
+
+    #[test]
+    fn dtype_wire_roundtrips_for_every_variant() {
+        // `as_str` and `from_wire` are the single source of the DType wire
+        // mapping (the hand-written serde impls defer to them). Assert they're
+        // mutual inverses for every variant, so neither can drift unnoticed.
+        for dt in [
+            DType::Fp16,
+            DType::Bf16,
+            DType::Fp32,
+            DType::Fp8E4m3,
+            DType::Fp8E5m2,
+            DType::Int8,
+            DType::Int4,
+        ] {
+            assert_eq!(DType::from_wire(dt.as_str()), Some(dt));
+            // serde goes through the same path: "bf16" not "Bf16".
+            assert_eq!(
+                serde_json::from_value::<DType>(Value::from(dt.as_str())).unwrap(),
+                dt
+            );
+        }
+        assert_eq!(DType::from_wire("Bf16"), None);
+    }
 
     #[test]
     fn args_payload_with_builds_in_one_expression() {

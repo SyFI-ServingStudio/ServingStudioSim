@@ -6,6 +6,7 @@ extern crate self as simulator;
 pub mod arch;
 pub mod common;
 pub mod deployment;
+pub mod introspect;
 pub mod log;
 pub mod op;
 pub mod orchestrator;

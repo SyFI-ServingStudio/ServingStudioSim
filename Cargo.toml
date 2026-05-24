@@ -24,6 +24,11 @@ anyhow = "1"
 thiserror = "2"
 pyo3 = { version = "0.20", features = ["auto-initialize"] }
 
+# Link-time distributed registry: each kernel registers a `KernelQueryEntry` so
+# the `kernel-query` subcommand maps a runtime `kind` -> builder with no central
+# match (see timing/kernels/engine.rs `register_kernel!`).
+inventory = "0.3"
+
 # Heap profiler, opt-in via `--features dhat-heap`. Off by default (zero cost in
 # normal builds); when on it installs a global allocator that records every Rust
 # allocation's call stack to `dhat-heap.json`. See the profile-sim-speed skill.

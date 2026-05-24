@@ -7,3 +7,4 @@ pub mod payload;
 pub use core::{KernelMissing, PerfApiBridge};
 pub use error::{BuildError, PerfApiError};
 pub use payload::{ArgsPayload, DType, DbMetadata, KernelKind, KernelMetrics, ProfilerVersion};
+pub(crate) use payload::de_backends;

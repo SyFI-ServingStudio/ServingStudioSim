@@ -58,6 +58,11 @@ enum Cmd {
     DryRun(RunArgs),
     /// Print the deployment schema JSON consumed by the launcher (§1.2.7).
     ListParams,
+    /// Probe a built kernel's cost cache (cost-model introspection for the
+    /// cache-fidelity harness). Reads a JSON request on stdin describing one
+    /// kernel by `{kind, config, query_points}`; writes the interpolated
+    /// best-of-N metrics per point + the fitted grid axes on stdout.
+    KernelQuery,
 }
 
 /// Shared payload for `run` / `build-cache-only`: pick a deployment, then its
@@ -82,12 +87,15 @@ fn main() -> anyhow::Result<()> {
 
     // Timed/leveled logging (heartbeats, cache-build progress, run summary).
     // `RUST_LOG` overrides the default `info` level; e.g. `RUST_LOG=debug`.
+    // Logs go to stderr so stdout stays pure data for the JSON-emitting
+    // subcommands (`kernel-query`, `list-params`).
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -103,6 +111,7 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Cmd::KernelQuery => simulator::introspect::run_kernel_query(),
     }
 }
 

@@ -17,21 +17,22 @@
 //! payload, so the Python runner side stays keyed by total bytes (matching the
 //! reference) while the Rust cache interpolates over tokens (`Cache1DLinear`).
 
-use crate::timing::bridge::{ArgsPayload, KernelKind};
+use crate::timing::bridge::{de_backends, ArgsPayload, KernelKind};
 use crate::timing::cache::CacheKind;
-use crate::timing::kernels::engine::{Kernel, KernelSpec};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
 pub struct ElementwiseKernelConfig {
+    #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
     pub input_bytes_per_token: u32,
     pub output_bytes_per_token: u32,
 }
 
-#[derive(SweepCoords)]
+#[derive(SweepCoords, serde::Deserialize)]
 pub struct ElementwiseKernelInput {
     pub num_tokens: u32,
 }
@@ -67,7 +68,7 @@ impl KernelSpec for ElementwiseSpec {
     }
 }
 
-pub type ElementwiseKernel = Kernel<ElementwiseSpec>;
+register_kernel!(ElementwiseKernel, ElementwiseSpec);
 
 #[cfg(test)]
 mod tests {

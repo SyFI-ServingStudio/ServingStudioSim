@@ -49,6 +49,11 @@ pub fn derive_sweep_coords(input: TokenStream) -> TokenStream {
         let field_name = f.ident.as_ref().expect("named fields enforced above");
         quote! { (self.#field_name) as f64 }
     });
+    // Same fields, same order, as string literals — so a `grid` response labels
+    // each axis with the input key it sweeps.
+    let field_names = fields.iter().map(|f| {
+        f.ident.as_ref().expect("named fields enforced above").to_string()
+    });
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
@@ -56,6 +61,9 @@ pub fn derive_sweep_coords(input: TokenStream) -> TokenStream {
         impl #impl_generics ::simulator::timing::SweepCoords for #name #ty_generics #where_clause {
             fn coords(&self) -> ::simulator::timing::Coords {
                 ::simulator::timing::Coords::new([ #( #coord_exprs ),* ])
+            }
+            fn coord_field_names() -> &'static [&'static str] {
+                &[ #( #field_names ),* ]
             }
         }
     };

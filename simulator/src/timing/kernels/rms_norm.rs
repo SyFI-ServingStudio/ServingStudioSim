@@ -9,21 +9,22 @@
 //! Shape split (L1 design §8.1): static config is `(hidden, dtype)`; the token
 //! count `m` is the runtime sweep axis (`Cache1DLinear`, single token axis).
 
-use crate::timing::bridge::{ArgsPayload, DType, KernelKind};
+use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
-use crate::timing::kernels::engine::{Kernel, KernelSpec};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
 pub struct RmsNormKernelConfig {
+    #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
     pub hidden: u32,
     pub dtype: DType,
 }
 
-#[derive(SweepCoords)]
+#[derive(SweepCoords, serde::Deserialize)]
 pub struct RmsNormKernelInput {
     pub m: u32,
 }
@@ -59,7 +60,7 @@ impl KernelSpec for RmsNormSpec {
     }
 }
 
-pub type RmsNormKernel = Kernel<RmsNormSpec>;
+register_kernel!(RmsNormKernel, RmsNormSpec);
 
 #[cfg(test)]
 mod tests {

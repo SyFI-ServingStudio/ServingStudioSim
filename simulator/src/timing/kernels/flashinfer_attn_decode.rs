@@ -19,14 +19,15 @@
 //! Axes: batch_size is pow2 (1..=256); total_tokens is pow2 (32..=4194304, i.e.
 //! up to 4M). Two monotonic axes -> `Cache2DLinear` + `grid.expand_2d`.
 
-use crate::timing::bridge::{ArgsPayload, DType, KernelKind};
+use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
-use crate::timing::kernels::engine::{Kernel, KernelSpec};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
 pub struct FlashinferAttnDecodeKernelConfig {
+    #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
     pub num_qo_heads: u32,
@@ -37,7 +38,7 @@ pub struct FlashinferAttnDecodeKernelConfig {
     pub o_dtype: DType,
 }
 
-#[derive(SweepCoords)]
+#[derive(SweepCoords, serde::Deserialize)]
 pub struct FlashinferAttnDecodeKernelInput {
     pub batch_size: u32,
     pub total_tokens: u32,
@@ -81,7 +82,7 @@ impl KernelSpec for FlashinferAttnDecodeSpec {
     }
 }
 
-pub type FlashinferAttnDecodeKernel = Kernel<FlashinferAttnDecodeSpec>;
+register_kernel!(FlashinferAttnDecodeKernel, FlashinferAttnDecodeSpec);
 
 #[cfg(test)]
 mod tests {
