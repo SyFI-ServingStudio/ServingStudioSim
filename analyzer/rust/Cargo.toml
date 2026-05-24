@@ -1,0 +1,23 @@
+[package]
+name = "analyzer"
+version = "0.1.0"
+edition = "2021"
+description = "MLSim post-sim analyzer — DataFusion parquet scan → report + plot-payload JSON"
+
+[[bin]]
+name = "analyze"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# DataFusion drives the parquet scan / filter / grouped aggregation. arrow-array
+# is pinned to the version DataFusion 45 re-exports so downcasts on its
+# RecordBatches resolve to the same arrow types (matches ref/moesim-rs analyze-rust).
+datafusion = { version = "45", default-features = false, features = ["parquet"] }
+arrow-array = { version = "54", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Build profiles (release / maxperf) come from the workspace root Cargo.toml and
+# apply to every member — defining them here would be ignored (cargo warns).

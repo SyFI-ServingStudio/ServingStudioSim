@@ -97,4 +97,4 @@ split-debuginfo = "off"
 opt-level = 2
 
 [workspace]
-members = ["simulator/timing-kernel-derive", "simulator/schema-derive"]
+members = ["simulator/timing-kernel-derive", "simulator/schema-derive", "analyzer/rust"]
