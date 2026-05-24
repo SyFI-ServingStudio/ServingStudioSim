@@ -301,6 +301,13 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
         self.kv_bytes_per_token
     }
 
+    /// Dense *local* arch: one replica runs the whole model on a single GPU (no
+    /// TP/EP/HP split). A sharded arch would compute its real GPU extent from the
+    /// resolved parallel layout here.
+    fn gpus_per_replica(&self) -> u16 {
+        1
+    }
+
     /// The compiled CostTree's serializable manifest (slots + flat aggregation
     /// nodes). Recompiled once at logger setup (off the hot path), so a consumer
     /// can reproduce `total_time_ms` from a `cost_log` row's per-slot breakdown.

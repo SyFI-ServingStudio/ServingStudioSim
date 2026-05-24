@@ -68,4 +68,11 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// divides its memory allowance by this to size its `KvPool` (L5 owns the
     /// division; arch owns this footprint).
     fn kv_bytes_per_token(&self) -> u64;
+
+    /// GPUs one replica of this model spans. The model_arch is the source of truth
+    /// for this: it resolved the parallel layout, so it knows the real extent — the
+    /// EP span with TP/HP groups nested inside it, *not* a `tp×ep×hp` product. L5/L6
+    /// only read it (to size the run's GPU inventory); they never derive it. A dense
+    /// local arch returns 1.
+    fn gpus_per_replica(&self) -> u16;
 }

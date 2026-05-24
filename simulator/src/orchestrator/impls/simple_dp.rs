@@ -6,7 +6,7 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time};
 use crate::worker::{BareboneWorker, WorkerEvent, WorkerMsg};
 
-use super::super::{Flow, OrchAction, PoolEvent, UnifiedWorkerFactory};
+use super::super::{Flow, GpuInventory, OrchAction, PoolEvent, UnifiedWorkerFactory};
 
 // ── Configs & policy (simple_dp-specific; L6 design.md §「simple DP」) ──────────
 
@@ -17,7 +17,9 @@ pub enum DpPlacementPolicy {
     RoundRobin,
 }
 
-/// Config for one DP pool.
+/// Config for one DP pool — pure orchestration (which workers, how to place).
+/// The GPU facts each worker spans (`gpu_name` / `gpus_per_worker`) live on the
+/// [`UnifiedWorkerFactory`], the worker-stamping infra, not here.
 pub struct SimpleDpPoolConfig {
     pub pool: PoolId,
     pub num_workers: u16,
@@ -40,10 +42,26 @@ pub struct SimpleDpPoolController<M: IterwiseUnifiedModel> {
 
 impl<M: IterwiseUnifiedModel> SimpleDpPoolController<M> {
     // ── Construction ──────────────────────────────────────────────────────────
-    pub fn new(cfg: &SimpleDpPoolConfig, factory: &UnifiedWorkerFactory<M>) -> Self {
+    /// Build the pool's workers and register their GPUs into the *run-level*
+    /// `inventory` (passed by `&mut`, not owned here). Allocating into a shared
+    /// inventory is what keeps GPU ids globally unique across pools — a future
+    /// multi-pool deployment threads the same inventory through each pool, so ids
+    /// continue (`allocate` appends from the current length) instead of every pool
+    /// restarting at 0.
+    pub fn new(
+        cfg: &SimpleDpPoolConfig,
+        factory: &UnifiedWorkerFactory<M>,
+        inventory: &mut GpuInventory,
+    ) -> Self {
         let workers: Vec<BareboneWorker<M>> =
             (0..cfg.num_workers).map(|i| factory.build(i)).collect();
         assert!(!workers.is_empty(), "simple_dp needs at least one worker");
+        // One block of `gpus_per_worker` contiguous ids per worker, in build order
+        // (ref's `allocate(n)` shape). The GPU facts come from the factory, which
+        // stamped these workers.
+        for w in &workers {
+            inventory.allocate(cfg.pool.0, w.id.0, factory.gpus_per_worker, &factory.gpu_name);
+        }
         Self {
             pool: cfg.pool,
             workers,
@@ -117,13 +135,21 @@ impl<M: IterwiseUnifiedModel> SimpleDpPoolController<M> {
 pub struct SimpleDpFlow<M: IterwiseUnifiedModel> {
     requests: SharedRequests,
     dp_pool: SimpleDpPoolController<M>,
+    /// Run-level GPU registry, aggregated across all pools as they are built. Lives
+    /// on the flow (not the pool) so a multi-pool deployment surfaces one combined
+    /// inventory with globally-unique ids.
+    inventory: GpuInventory,
 }
 
 impl<M: IterwiseUnifiedModel> SimpleDpFlow<M> {
     pub fn new(cfg: SimpleDpConfig, factory: UnifiedWorkerFactory<M>) -> Self {
         let requests = std::rc::Rc::clone(&factory.requests);
-        let dp_pool = SimpleDpPoolController::new(&cfg.dp_pool, &factory);
-        Self { requests, dp_pool }
+        // The run-level inventory is built here and threaded into each pool's
+        // construction; simple_dp has one pool today, but the ownership is what a
+        // multi-pool flow needs (allocate into the same inventory, ids continue).
+        let mut inventory = GpuInventory::default();
+        let dp_pool = SimpleDpPoolController::new(&cfg.dp_pool, &factory, &mut inventory);
+        Self { requests, dp_pool, inventory }
     }
 
     fn on_pool_event(&mut self, event: PoolEvent) -> Vec<OrchAction> {
@@ -147,6 +173,10 @@ impl<M: IterwiseUnifiedModel> Flow for SimpleDpFlow<M> {
             actions.extend(self.on_pool_event(event));
         }
         actions
+    }
+
+    fn inventory(&self) -> &GpuInventory {
+        &self.inventory
     }
 }
 
@@ -181,6 +211,9 @@ mod tests {
         fn kv_bytes_per_token(&self) -> u64 {
             1
         }
+        fn gpus_per_replica(&self) -> u16 {
+            1
+        }
     }
 
     fn build_flow(num_workers: u16, placement: DpPlacementPolicy) -> (SimpleDpFlow<FakeModel>, SharedRequests) {
@@ -190,6 +223,8 @@ mod tests {
             Rc::clone(&store),
             WorkerConfig::default(),
             None,
+            "test-gpu".to_string(),
+            1,
         );
         let cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {

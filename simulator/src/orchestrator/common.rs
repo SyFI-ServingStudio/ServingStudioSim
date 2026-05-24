@@ -6,6 +6,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::Serialize;
+
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, RequestId, SharedRequests, WorkerId};
 use crate::worker::{BareboneWorker, WorkerConfig};
@@ -26,6 +28,48 @@ pub enum PoolEvent {
     },
 }
 
+/// One physical GPU and who owns it. The run's GPU facts are a flat list of these
+/// (see [`GpuInventory`]); `pool` + `worker_id` make the worker→gpu and pool→gpu
+/// groupings derivable without a second table.
+#[derive(Clone, Debug, Serialize)]
+pub struct GpuInfo {
+    pub id: u16,
+    pub name: String,
+    pub pool: u16,
+    pub worker_id: u16,
+}
+
+/// The GPUs a run modeled — a *reporting* artifact (serialized to
+/// `raw/run_meta.json`), not yet a timing oracle like ref's stream-serialized
+/// `GpuCluster`. L6 assembles it as it builds workers ([`GpuInventory::allocate`],
+/// ref's `allocate(n)` shape); the GPU count per worker is the L4 parallel-dim
+/// product, threaded in by the deployment.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct GpuInventory {
+    pub gpus: Vec<GpuInfo>,
+}
+
+impl GpuInventory {
+    pub fn num_gpus(&self) -> usize {
+        self.gpus.len()
+    }
+
+    /// Register `n` contiguous-id GPUs to `(pool, worker)`, all sharing `name`.
+    /// Ids continue from the current length, so calling once per worker yields a
+    /// dense `0..total` id space.
+    pub fn allocate(&mut self, pool: u16, worker_id: u16, n: u16, name: &str) {
+        let base = self.gpus.len() as u16;
+        for offset in 0..n {
+            self.gpus.push(GpuInfo {
+                id: base + offset,
+                name: name.to_string(),
+                pool,
+                worker_id,
+            });
+        }
+    }
+}
+
 /// Builds identical unified workers for a DP pool, each sharing the one
 /// `SharedRequests` handle and an `Arc` of the model. The worker sizes its own
 /// `KvPool` from `worker_config.attn_kv_bytes`. (L7 will generalize this into a
@@ -37,6 +81,12 @@ pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel> {
     /// Run log dir, handed to each worker for its `cost_log` writer. `Some`
     /// enables per-iteration cost logging; `None` disables it.
     pub log_dir: Option<PathBuf>,
+    /// GPU facts threaded down from the deployment (which reads them off the L4
+    /// `ParallelCfg`): the GPU type every worker runs on, and how many GPUs one
+    /// worker (model replica) spans. The factory does not derive these — it only
+    /// carries them so L6 can assemble the run's [`GpuInventory`].
+    pub gpu_name: String,
+    pub gpus_per_worker: u16,
 }
 
 impl<M: IterwiseUnifiedModel> UnifiedWorkerFactory<M> {
@@ -45,12 +95,16 @@ impl<M: IterwiseUnifiedModel> UnifiedWorkerFactory<M> {
         requests: SharedRequests,
         worker_config: WorkerConfig,
         log_dir: Option<PathBuf>,
+        gpu_name: String,
+        gpus_per_worker: u16,
     ) -> Self {
         Self {
             model,
             requests,
             worker_config,
             log_dir,
+            gpu_name,
+            gpus_per_worker,
         }
     }
 

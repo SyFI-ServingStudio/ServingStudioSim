@@ -144,6 +144,10 @@ pub fn run_sim(
     // `arrived` counts drained requests; `completed` counts `Complete` actions.
     let mut arrived = 0u64;
     let mut completed = 0u64;
+    // Clock of the most recent periodic `request_state` census. `finalize` reads
+    // it to avoid re-writing the same census when the run ends on a snapshot tick
+    // (which would duplicate every `(request_id, logging_time)` row).
+    let mut last_state_clock: Option<Time> = None;
 
     // Every periodic step shares one iteration-count gate. With a fixed
     // `tick_dt`, "every K ticks" and "every K·tick_dt of sim-time" are the same,
@@ -185,6 +189,7 @@ pub fn run_sim(
             for (id, rec) in s.iter_admitted() {
                 logger.record_request_state(state_entry(id, clock, rec))?;
             }
+            last_state_clock = Some(clock);
         }
 
         // 2c. Periodic heartbeat (no store scan — counters are maintained above).
@@ -232,7 +237,7 @@ pub fn run_sim(
         clock = clock + cfg.tick_dt;
     };
 
-    finalize(store, logger, clock)?;
+    finalize(store, logger, clock, last_state_clock)?;
     logger.flush_all()?;
 
     // End-of-run summary: finished count, then prefill / decode / total token
@@ -302,15 +307,38 @@ pub fn run_sim(
     Ok(summary)
 }
 
-/// Sim-end flush: any *admitted* request still in-flight gets a final
-/// (incomplete) state row + a partial slo row. Completed requests were already
-/// flushed at their completion tick; the never-admitted pending tail is skipped
-/// (it never ran — same admitted-only scope as the periodic snapshot, 2b).
-fn finalize(store: &SharedRequests, logger: &mut LoggerSession, clock: Time) -> anyhow::Result<()> {
+/// Sim-end flush over the *admitted* set (the never-admitted pending tail never
+/// ran, so it is skipped — same scope as the periodic snapshot, 2b).
+///
+/// The two tables flush asymmetrically because they have different shapes:
+/// - `request_state` is a *snapshot* table, so every admitted request gets a
+///   terminal row (completed ones frozen at their terminal values). A completion
+///   never writes a state row — only the periodic snapshot does — so without this
+///   a request that completed between the last snapshot and sim-end (e.g. a run
+///   that ends within one snapshot interval) would have no terminal state row,
+///   and per-segment throughput would miss its work entirely.
+/// - `request_slo` is *terminal-per-request*: completed requests already wrote
+///   their row at their completion tick, so only the still-incomplete ones get a
+///   partial row here (writing completed again would duplicate).
+///
+/// The `request_state` census is skipped entirely when the periodic snapshot (2b)
+/// already wrote one at this exact `clock` (`last_state_clock == Some(clock)`,
+/// i.e. the run ended on a snapshot tick) — re-writing it would duplicate every
+/// `(request_id, logging_time)` row. `request_slo` is unaffected (the periodic
+/// snapshot never writes it).
+fn finalize(
+    store: &SharedRequests,
+    logger: &mut LoggerSession,
+    clock: Time,
+    last_state_clock: Option<Time>,
+) -> anyhow::Result<()> {
     let s = store.borrow();
+    let census_already_written = last_state_clock == Some(clock);
     for (id, rec) in s.iter_admitted() {
-        if !rec.completed {
+        if !census_already_written {
             logger.record_request_state(state_entry(id, clock, rec))?;
+        }
+        if !rec.completed {
             logger.record_request_slo(slo_entry(id, clock, rec))?;
         }
     }
@@ -415,6 +443,9 @@ mod tests {
         fn kv_bytes_per_token(&self) -> u64 {
             1
         }
+        fn gpus_per_replica(&self) -> u16 {
+            1
+        }
     }
 
     fn write_trace(dir: &std::path::Path, n: u32) -> PathBuf {
@@ -446,6 +477,8 @@ mod tests {
             Rc::clone(&store),
             WorkerConfig::default(),
             None,
+            "test-gpu".to_string(),
+            1,
         );
         let cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {

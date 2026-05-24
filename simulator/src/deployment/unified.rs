@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
+use crate::arch::contract::IterwiseUnifiedModel;
 use crate::arch::llama3_dense;
 use crate::arch::model_cfg::{ModelCfg, ParallelCfg};
 use crate::common::{PoolId, SharedRequests};
@@ -124,7 +125,12 @@ impl Deployment for UnifiedDeployment {
             ..WorkerConfig::default()
         };
         let log_dir: Option<PathBuf> = Some(args.io.log_dir.clone());
-        let factory = UnifiedWorkerFactory::new(model, store, worker_config, log_dir);
+        // Per-replica GPU count comes from L4 (the built model knows its real
+        // sharding extent); L5/L6 only read it. Dense local = 1.
+        let gpus_per_worker = model.gpus_per_replica();
+        let gpu_name = parallel.gpu_name.clone();
+        let factory =
+            UnifiedWorkerFactory::new(model, store, worker_config, log_dir, gpu_name, gpus_per_worker);
         let cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
                 pool: PoolId(0),

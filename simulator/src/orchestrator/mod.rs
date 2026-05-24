@@ -8,7 +8,7 @@
 pub mod common;
 pub mod impls;
 
-pub use self::common::{OrchAction, PoolEvent, UnifiedWorkerFactory};
+pub use self::common::{GpuInfo, GpuInventory, OrchAction, PoolEvent, UnifiedWorkerFactory};
 pub use impls::{
     DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, SimpleDpPoolController,
 };
@@ -21,4 +21,7 @@ use crate::common::{Request, Time};
 pub trait Flow {
     fn on_arrival(&mut self, req: Request);
     fn tick(&mut self, now: Time) -> Vec<OrchAction>;
+    /// The GPUs this flow's pools/workers occupy — L7 serializes it to
+    /// `raw/run_meta.json` so downstream (the analyzer) can normalize per-GPU.
+    fn inventory(&self) -> &GpuInventory;
 }

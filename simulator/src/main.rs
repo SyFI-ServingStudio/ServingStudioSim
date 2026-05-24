@@ -125,6 +125,9 @@ fn cmd_run(sel: DeploymentSel) -> anyhow::Result<()> {
             let mut flow = UnifiedDeployment::build(&p, &bridge, Rc::clone(&store))?;
             let mut frontend = TraceFrontend::load(&p.workload.trace_files, p.workload.request_rate)?;
             let mut logger = LoggerSession::open(&p.io.log_dir)?;
+            // Run-level GPU facts sidecar (L7): written before the tick loop so the
+            // analyzer can normalize per-GPU even if the run later fails.
+            simulator::log::write_run_meta(&p.io.log_dir, flow.inventory())?;
             let cfg = TickCfg::new(p.workload.duration_ms, p.workload.run_to_end);
             let summary = run_sim(flow.as_mut(), &store, &mut frontend, &mut logger, &cfg)?;
             // run_sim emits the stats summary (completed/throughput/wall) to the

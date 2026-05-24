@@ -503,6 +503,9 @@ mod tests {
         fn kv_bytes_per_token(&self) -> u64 {
             1
         }
+        fn gpus_per_replica(&self) -> u16 {
+            1
+        }
     }
 
     fn shared_with(reqs: &[(u32, u32, u32)]) -> crate::common::SharedRequests {
