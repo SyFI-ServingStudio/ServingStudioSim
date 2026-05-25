@@ -38,7 +38,7 @@ pub struct FlashinferAttnDecodeKernelConfig {
     pub o_dtype: DType,
 }
 
-#[derive(SweepCoords, serde::Deserialize)]
+#[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
 pub struct FlashinferAttnDecodeKernelInput {
     pub batch_size: u32,
     pub total_tokens: u32,

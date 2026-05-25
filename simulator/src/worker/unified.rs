@@ -119,9 +119,11 @@ pub struct BareboneWorker<M: IterwiseUnifiedModel> {
     batches: Vec<Batch>, // length 1 in barebone
     events: Vec<WorkerEvent>,
     /// Per-iteration `cost_log` writer (`Some` iff a log_dir was supplied).
-    /// `cost_slots` is the reused per-slot eval buffer.
+    /// `cost_slots` is the reused per-slot eval buffer; `cost_slot_inputs` is the
+    /// reused per-slot typed-input buffer, filled whenever `cost_log` is active.
     cost_logger: Option<CostLogger>,
     cost_slots: Vec<LeafMetrics>,
+    cost_slot_inputs: Vec<crate::timing::SlotInput>,
 }
 
 impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
@@ -158,6 +160,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
             events: Vec::new(),
             cost_logger,
             cost_slots: Vec::new(),
+            cost_slot_inputs: Vec::new(),
         }
     }
 
@@ -269,7 +272,19 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         // `.m.time_ms` is the clock. Filling `cost_slots` is free (the eval pass
         // materializes it either way), so we always pass it and only build the
         // `cost_log` row from it when a logger is present.
-        let agg = self.model.eval_iter(&arch_input, &mut self.cost_slots);
+        // Capture per-leaf inputs whenever cost logging is active: `slot_input`
+        // is part of the cost_log row contract. Without a logger, the plain
+        // `eval_iter` path runs and the input closures are not invoked.
+        let logging_cost = self.cost_logger.is_some();
+        let agg = if logging_cost {
+            self.model.eval_iter_with_inputs(
+                &arch_input,
+                &mut self.cost_slots,
+                &mut self.cost_slot_inputs,
+            )
+        } else {
+            self.model.eval_iter(&arch_input, &mut self.cost_slots)
+        };
         let cost_time = Time::from_ms(agg.m.time_ms as f64);
         if self.cost_logger.is_some() {
             // Per-iteration input_section: log each group's context (prefill kept
@@ -299,9 +314,13 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                 groups,
                 slot_time_ms: self.cost_slots.iter().map(|l| l.m.time_ms).collect(),
                 slot_coverage: self.cost_slots.iter().map(|l| l.coverage.bits()).collect(),
+                // Filled by `CostLogger::record` after it moves the captured
+                // inputs into the chunk-level flat buffer. `Vec::append` leaves
+                // `cost_slot_inputs` allocated for the next iteration.
+                slot_input_len: 0,
             };
             if let Some(logger) = self.cost_logger.as_mut() {
-                if let Err(e) = logger.record(entry) {
+                if let Err(e) = logger.record(entry, &mut self.cost_slot_inputs) {
                     tracing::warn!("cost_log record failed: {e}");
                 }
             }
@@ -314,8 +333,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     fn complete_iter(&mut self, now: Time) {
         let admits: Vec<RequestId> = self.batches[0].prefill_admits.clone();
-        let decode_ids: Vec<RequestId> =
-            self.batches[0].iter_decoding().map(|(r, _)| r).collect();
+        let decode_ids: Vec<RequestId> = self.batches[0].iter_decoding().map(|(r, _)| r).collect();
 
         let mut completed: Vec<RequestId> = Vec::new();
 
@@ -450,12 +468,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     /// External release (e.g. cancellation). Cleans up wherever the request sits.
     pub fn release_request(&mut self, rid: RequestId, current_kv: u64) -> Option<u16> {
-        if let Some(pos) = self
-            .runtime
-            .pending_prefills
-            .iter()
-            .position(|&x| x == rid)
-        {
+        if let Some(pos) = self.runtime.pending_prefills.iter().position(|&x| x == rid) {
             self.runtime.pending_prefills.remove(pos);
             return None;
         }
@@ -487,7 +500,11 @@ mod tests {
         ms: f64,
     }
     impl IterwiseUnifiedModel for FakeModel {
-        fn eval_iter(&self, _batch: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+        fn eval_iter(
+            &self,
+            _batch: &UnifiedArchInput,
+            slots: &mut Vec<LeafMetrics>,
+        ) -> LeafMetrics {
             slots.clear();
             LeafMetrics {
                 m: Metrics4 {
@@ -547,9 +564,7 @@ mod tests {
         let events = run_to_quiescence(&mut w, 50);
         assert_eq!(
             events,
-            vec![WorkerEvent::RequestComplete {
-                req: RequestId(0)
-            }]
+            vec![WorkerEvent::RequestComplete { req: RequestId(0) }]
         );
         let s = store.borrow();
         let r = &s[RequestId(0)];
@@ -578,6 +593,5 @@ mod tests {
         for id in [0, 1, 2] {
             assert!(s[RequestId(id)].completed, "req {id} should complete");
         }
-
     }
 }

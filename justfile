@@ -4,6 +4,7 @@
 #   just            # = test-cpu (the fast default gate)
 #   just test-gpu   # GPU tier (throughput regression etc.)
 #   just test-all   # cpu + gpu
+#   just test-bench # separate perf step; run after test-all for full validation
 
 # libpython dir — the Rust test binary embeds PyO3 and crashes on
 # `libpython3.12.so` without it on LD_LIBRARY_PATH (uv pins the 3.12 interp).
@@ -26,12 +27,12 @@ test-gpu:
 test-agent:
     uv run python tests/skill_tests/run_codex_skill_tests.py
 
-# bench tier — perf/sim-speed (warn-only) + Rust release microbenches (ignored).
+# bench tier — separate perf step: sim-speed (warn-only) + Rust release microbenches (ignored).
 test-bench:
     uv run pytest -m bench
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run cargo test -p simulator --release -- --ignored --nocapture
 
-# Everything a GPU box should gate on (cpu + gpu).
+# Main correctness gate (cpu + gpu). Full validation also runs `just test-bench`.
 test-all: test-cpu test-gpu
 
 # (Re)record per-GPU goldens for throughput + sim-speed on this device.

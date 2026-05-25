@@ -24,7 +24,7 @@ pub struct RmsNormKernelConfig {
     pub dtype: DType,
 }
 
-#[derive(SweepCoords, serde::Deserialize)]
+#[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
 pub struct RmsNormKernelInput {
     pub m: u32,
 }

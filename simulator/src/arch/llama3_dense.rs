@@ -25,7 +25,7 @@ use crate::timing::kernels::{
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
-    LeafMetrics, PerfApiBridge,
+    LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{
     AttnLocalWorklet, AttnLocalWorkletConfig, AttnLocalWorkletInput, AttnLocalWorkletResolved,
@@ -181,14 +181,15 @@ pub fn build(
 
     let embed = Op::new(
         embed_name.clone(),
-        Arc::new(ElementwiseKernel::build(embed_name, resolved.embed, bridge)?),
+        Arc::new(ElementwiseKernel::build(
+            embed_name,
+            resolved.embed,
+            bridge,
+        )?),
     );
 
-    let pre_attn = PreAttnLocalWorklet::build(
-        format!("{model_name}.pre_attn"),
-        resolved.pre_attn,
-        bridge,
-    )?;
+    let pre_attn =
+        PreAttnLocalWorklet::build(format!("{model_name}.pre_attn"), resolved.pre_attn, bridge)?;
 
     let attn = AttnLocalWorklet::build(format!("{model_name}.attn"), resolved.attn, bridge)?;
 
@@ -200,12 +201,20 @@ pub fn build(
 
     let final_norm = Op::new(
         final_norm_name.clone(),
-        Arc::new(RmsNormKernel::build(final_norm_name, resolved.final_norm, bridge)?),
+        Arc::new(RmsNormKernel::build(
+            final_norm_name,
+            resolved.final_norm,
+            bridge,
+        )?),
     );
 
     let lm_head = Op::new(
         lm_head_name.clone(),
-        Arc::new(SingleGemmKernel::build(lm_head_name, resolved.lm_head, bridge)?),
+        Arc::new(SingleGemmKernel::build(
+            lm_head_name,
+            resolved.lm_head,
+            bridge,
+        )?),
     );
 
     let mut model = Llama3DenseModel {
@@ -268,31 +277,30 @@ impl Llama3DenseModel {
     }
 
     /// CostTree eval (milestone 2): stream this iteration's per-leaf [`Metrics4`]
-    /// into `buf` in the exact order [`cost_tree`](Self::cost_tree) minted slots
+    /// through `ev` in the exact order [`cost_tree`](Self::cost_tree) minted slots
     /// (embed, then ONE layer's pre/attn/post — the `Scale{num_layers}` fold
-    /// multiplies it, INV-3 — then final_norm, lm_head). The cursor must end at
-    /// `buf.len()`; otherwise the eval walk and the compiled slot list disagree.
-    fn eval_buf(&self, batch: &UnifiedArchInput, buf: &mut [LeafMetrics]) {
+    /// multiplies it, INV-3 — then final_norm, lm_head). Takes a prepared
+    /// [`Evaluator`] so the caller picks plain ([`Evaluator::new`]) vs input-
+    /// capturing ([`Evaluator::with_inputs`]) — the one eval body backs both
+    /// `eval_iter` and `eval_iter_with_inputs`. The cursor must end at `n_slots`.
+    fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
         let g = &batch.groups[0];
         let m = g.batch_tokens;
-        let n = buf.len();
-        let mut ev = Evaluator::new(buf);
         self.embed
-            .eval(&ElementwiseKernelInput { num_tokens: m }, &mut ev);
+            .eval(&ElementwiseKernelInput { num_tokens: m }, ev);
         self.pre_attn
-            .eval(&PreAttnLocalWorkletInput { batch_tokens: m }, &mut ev);
+            .eval(&PreAttnLocalWorkletInput { batch_tokens: m }, ev);
         self.attn.eval(
             &AttnLocalWorkletInput {
                 prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
                 decode_kv_lens: g.decode_kv_lens.clone(),
             },
-            &mut ev,
+            ev,
         );
         self.post_attn
-            .eval(&PostAttnLocalWorkletInput { batch_tokens: m }, &mut ev);
-        self.final_norm.eval(&RmsNormKernelInput { m }, &mut ev);
-        self.lm_head.eval(&SingleGemmKernelInput { m }, &mut ev);
-        debug_assert_eq!(ev.filled(), n, "eval cursor must fill every slot");
+            .eval(&PostAttnLocalWorkletInput { batch_tokens: m }, ev);
+        self.final_norm.eval(&RmsNormKernelInput { m }, ev);
+        self.lm_head.eval(&SingleGemmKernelInput { m }, ev);
     }
 }
 
@@ -327,8 +335,42 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
         );
         slots.clear();
         slots.resize(self.n_slots, LeafMetrics::ZERO);
-        self.eval_buf(batch, slots);
+        let mut ev = Evaluator::new(slots);
+        self.eval_into(batch, &mut ev);
+        debug_assert_eq!(
+            ev.filled(),
+            self.n_slots,
+            "eval cursor must fill every slot"
+        );
         CostTree::aggregate(&self.cost_flat, slots)
+    }
+
+    /// Same eval body as [`Self::eval_iter`] via an input-capturing [`Evaluator`]:
+    /// each leaf's typed input lands in `inputs`, slot-aligned, for the `cost_log`
+    /// `slot_input` column. The per-leaf clone rides this path only.
+    fn eval_iter_with_inputs(
+        &self,
+        batch: &UnifiedArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        assert_eq!(
+            batch.groups.len(),
+            1,
+            "Llama3 dense local has exactly one HP group"
+        );
+        slots.clear();
+        slots.resize(self.n_slots, LeafMetrics::ZERO);
+        let mut ev = Evaluator::with_inputs(slots, inputs);
+        self.eval_into(batch, &mut ev);
+        debug_assert_eq!(
+            ev.filled(),
+            self.n_slots,
+            "eval cursor must fill every slot"
+        );
+        let agg = CostTree::aggregate(&self.cost_flat, slots);
+        debug_assert_eq!(inputs.len(), self.n_slots, "slot_input must align to slots");
+        agg
     }
 }
 

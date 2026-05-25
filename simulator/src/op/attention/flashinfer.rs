@@ -28,7 +28,8 @@ use crate::timing::kernels::{
     FlashinferAttnPrefillKernelInput,
 };
 use crate::timing::{
-    BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge, Probe,
+    AttnPrefillLog, BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge,
+    Probe,
 };
 
 /// Single op-level config; expands into the two sub-kernel configs (their field
@@ -122,14 +123,32 @@ impl FlashInferAttentionOp {
                 append_len,
             }));
         }
-        ev.push(prefill);
+        // The prefill slot is the INV-1 aggregating leaf: its faithful `slot_input`
+        // is the whole `(prefix, append)` fan-out it summed over (cloned only when
+        // recording — see `Evaluator::push`).
+        ev.push(prefill, || {
+            AttnPrefillLog {
+                prefill_chunk_pairs: input.prefill_chunk_pairs.clone(),
+            }
+            .into()
+        });
 
-        ev.push(match decode_input(&input.decode_kv_lens) {
-            Some(decode_input) => self.decode.eval(&decode_input),
+        // The decode slot's faithful input is the collapsed cell the kernel saw;
+        // reuse the real `FlashinferAttnDecodeKernelInput` (zeros when no decode).
+        let decode = decode_input(&input.decode_kv_lens);
+        let decode_metrics = match &decode {
+            Some(d) => self.decode.eval(d),
             None => LeafMetrics::ZERO,
+        };
+        ev.push(decode_metrics, || {
+            decode
+                .unwrap_or(FlashinferAttnDecodeKernelInput {
+                    batch_size: 0,
+                    total_tokens: 0,
+                })
+                .into()
         });
     }
-
 }
 
 // ─── internal helpers (pure; unit-tested without a bridge) ───────────────────

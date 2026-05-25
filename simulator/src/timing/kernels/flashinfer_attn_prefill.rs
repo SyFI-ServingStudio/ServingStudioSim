@@ -51,7 +51,7 @@ pub struct FlashinferAttnPrefillKernelConfig {
 
 /// External query schema is the physical history-append shape; a manual
 /// `SweepCoords` projects it to the `(A, B)` axes the cache is built on.
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct FlashinferAttnPrefillKernelInput {
     pub prefix_len: u32,
     pub append_len: u32,

@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use arrow_array::builder::{
-    Float32Builder, ListBuilder, StructBuilder, UInt32Builder, UInt8Builder,
+    Float32Builder, ListBuilder, StringBuilder, StructBuilder, UInt32Builder, UInt8Builder,
 };
 use arrow_array::{
     BooleanArray, Float32Array, Float64Array, LargeStringArray, ListArray, RecordBatch,
@@ -17,6 +17,7 @@ use arrow_schema::{DataType, Field};
 use crate::log::schemas::{
     cost_log_schema, group_input_fields, request_slo_schema, request_state_schema,
 };
+use crate::timing::SlotInput;
 
 /// A request's lifecycle phase at snapshot time. A small `#[repr(u8)]` code
 /// rather than a `String`: dense `request_state` emits one row per live request
@@ -102,7 +103,12 @@ fn tpot_stats_ms(times_ms: &[f32]) -> (Option<f32>, Option<f32>, Option<f32>, Op
         let idx = ((p * (gaps.len() - 1) as f64).round() as usize).min(gaps.len() - 1);
         gaps[idx]
     };
-    (Some(mean), Some(pct(0.5)), Some(pct(0.99)), Some(*gaps.last().unwrap()))
+    (
+        Some(mean),
+        Some(pct(0.5)),
+        Some(pct(0.99)),
+        Some(*gaps.last().unwrap()),
+    )
 }
 
 /// One HP group's input context for a `cost_log` row — the per-iteration
@@ -129,7 +135,12 @@ pub struct GroupInputLog {
 /// `slot_time_ms` / `slot_coverage` are the per-slot cost breakdown (positions
 /// named by the `cost_manifest.json` sidecar); the scalars are the rolled-up
 /// totals.
-#[derive(Clone, Debug)]
+///
+/// Not `Clone`/`Debug`: the row is only ever moved into the writer-thread
+/// channel, never cloned or formatted on the sim thread. Per-slot inputs are
+/// stored in [`CostLogChunk::slot_inputs`] as one flat chunk buffer; this row
+/// carries only its slice length so the worker's capture buffer can keep its
+/// allocation across iterations.
 pub struct CostLogEntry {
     pub worker_id: u16,
     /// Per-worker iteration index (one forward-pass cycle).
@@ -146,6 +157,34 @@ pub struct CostLogEntry {
     pub groups: Vec<GroupInputLog>,
     pub slot_time_ms: Vec<f32>,
     pub slot_coverage: Vec<u8>,
+    /// Number of entries in [`CostLogChunk::slot_inputs`] belonging to this row.
+    /// Zero only for models that do not expose a compiled CostTree.
+    pub slot_input_len: usize,
+}
+
+/// A cost-log transfer unit sent from the sim thread to the writer thread.
+/// `entries` stores row metadata; `slot_inputs` stores all captured per-slot
+/// inputs back-to-back, avoiding one owned `Vec<SlotInput>` allocation per row.
+pub struct CostLogChunk {
+    pub entries: Vec<CostLogEntry>,
+    pub slot_inputs: Vec<SlotInput>,
+}
+
+impl CostLogChunk {
+    pub fn with_capacity(row_capacity: usize, slot_input_capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(row_capacity),
+            slot_inputs: Vec::with_capacity(slot_input_capacity),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// Build the nested `groups` `List<Struct>` column (the per-iteration
@@ -170,11 +209,7 @@ fn build_groups_column(entries: &[CostLogEntry]) -> ListArray {
             ],
         )
     };
-    let struct_field = Arc::new(Field::new(
-        "item",
-        DataType::Struct(fields.clone()),
-        false,
-    ));
+    let struct_field = Arc::new(Field::new("item", DataType::Struct(fields.clone()), false));
     let mut groups_builder = ListBuilder::new(new_struct_builder()).with_field(struct_field);
     for e in entries {
         let sb = groups_builder.values();
@@ -212,7 +247,8 @@ fn build_groups_column(entries: &[CostLogEntry]) -> ListArray {
     groups_builder.finish()
 }
 
-pub(crate) fn cost_to_record_batch(entries: &[CostLogEntry]) -> Result<RecordBatch> {
+pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> {
+    let entries = &chunk.entries;
     let worker_id: Vec<u16> = entries.iter().map(|e| e.worker_id).collect();
     let iter_id: Vec<u64> = entries.iter().map(|e| e.iter_id).collect();
     let batch_id: Vec<u64> = entries.iter().map(|e| e.batch_id).collect();
@@ -227,8 +263,17 @@ pub(crate) fn cost_to_record_batch(entries: &[CostLogEntry]) -> Result<RecordBat
     // Non-nullable `item` to match the schema (ListBuilder defaults to nullable).
     let mut time_builder = ListBuilder::new(Float32Builder::new())
         .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
-    let mut cov_builder = ListBuilder::new(UInt8Builder::new())
-        .with_field(Arc::new(Field::new("item", DataType::UInt8, false)));
+    let mut cov_builder = ListBuilder::new(UInt8Builder::new()).with_field(Arc::new(Field::new(
+        "item",
+        DataType::UInt8,
+        false,
+    )));
+    // Per-slot input JSON, serialized HERE on the writer thread (the sim thread
+    // only handed over the inline `SlotInput` enums). One (possibly empty) list per row.
+    let mut input_builder = ListBuilder::new(StringBuilder::new())
+        .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
+    let mut slot_input_cursor = 0usize;
+    let mut json_buf = Vec::new();
     for e in entries {
         for &t in &e.slot_time_ms {
             time_builder.values().append_value(t);
@@ -238,7 +283,26 @@ pub(crate) fn cost_to_record_batch(entries: &[CostLogEntry]) -> Result<RecordBat
             cov_builder.values().append_value(c);
         }
         cov_builder.append(true);
+        let slot_input_end = slot_input_cursor + e.slot_input_len;
+        ensure!(
+            slot_input_end <= chunk.slot_inputs.len(),
+            "cost_log slot_input slice exceeds chunk buffer"
+        );
+        for slot in &chunk.slot_inputs[slot_input_cursor..slot_input_end] {
+            json_buf.clear();
+            let json = match serde_json::to_writer(&mut json_buf, slot) {
+                Ok(()) => std::str::from_utf8(&json_buf).unwrap_or("null"),
+                Err(_) => "null",
+            };
+            input_builder.values().append_value(json);
+        }
+        slot_input_cursor = slot_input_end;
+        input_builder.append(true);
     }
+    ensure!(
+        slot_input_cursor == chunk.slot_inputs.len(),
+        "cost_log chunk has unused slot_input values"
+    );
 
     Ok(RecordBatch::try_new(
         cost_log_schema(),
@@ -252,6 +316,7 @@ pub(crate) fn cost_to_record_batch(entries: &[CostLogEntry]) -> Result<RecordBat
             Arc::new(groups),
             Arc::new(time_builder.finish()),
             Arc::new(cov_builder.finish()),
+            Arc::new(input_builder.finish()),
         ],
     )?)
 }
@@ -401,6 +466,7 @@ mod tests {
                 ],
                 slot_time_ms: vec![1.0, 0.5, 0.5],
                 slot_coverage: vec![0, 1, 0],
+                slot_input_len: 0,
             },
             CostLogEntry {
                 worker_id: 0,
@@ -418,9 +484,14 @@ mod tests {
                 }],
                 slot_time_ms: vec![0.4, 0.6, 0.0],
                 slot_coverage: vec![0, 0, 0],
+                slot_input_len: 0,
             },
         ];
-        let batch = cost_to_record_batch(&entries).unwrap();
+        let batch = cost_to_record_batch(&CostLogChunk {
+            entries,
+            slot_inputs: vec![],
+        })
+        .unwrap();
         assert_eq!(batch.num_rows(), 2);
         // iter_id column (index 1) carries the per-worker iteration counter.
         let it = batch
@@ -440,19 +511,11 @@ mod tests {
         let row0 = groups_col.value(0);
         let g0 = row0.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(g0.len(), 2);
-        let batch_tokens = g0
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
+        let batch_tokens = g0.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
         assert_eq!(batch_tokens.value(0), 20);
         assert_eq!(batch_tokens.value(1), 3);
         // decode aggregates land in struct fields 2/3.
-        let dec_count = g0
-            .column(2)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
+        let dec_count = g0.column(2).as_any().downcast_ref::<UInt32Array>().unwrap();
         assert_eq!(dec_count.value(0), 2);
         // prefill split: field 4 = prefix lens, field 5 = append lens.
         let prefix_lists = g0.column(4).as_any().downcast_ref::<ListArray>().unwrap();

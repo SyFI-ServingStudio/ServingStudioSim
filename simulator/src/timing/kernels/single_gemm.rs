@@ -22,7 +22,7 @@ pub struct SingleGemmKernelConfig {
     pub dtype: DType,
 }
 
-#[derive(SweepCoords, serde::Deserialize)]
+#[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
 pub struct SingleGemmKernelInput {
     pub m: u32,
 }

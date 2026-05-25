@@ -38,9 +38,16 @@ just              # = test-cpu (the fast default gate)
 just test-cpu     # Rust --lib tests + mocked pytest (no GPU/binary)
 just test-gpu     # gpu tier (throughput regression, cupti, …) on a CUDA box
 just test-agent   # Codex skill-test harness (tests/skill_tests/*.md)
-just test-bench   # sim-speed (warn-only) + Rust release microbenches (--ignored)
 just test-all     # cpu + gpu
+just test-bench   # separate perf step: sim-speed (warn-only) + Rust release microbenches (--ignored)
 just update-golden # (re)record per-GPU goldens on THIS device
+```
+
+For a full GPU-box validation, run it as two explicit steps:
+
+```bash
+just test-all
+just test-bench
 ```
 
 Raw pytest equivalents (when you need `-k` / `-x`): `uv run pytest -m gpu`,
@@ -71,10 +78,11 @@ intended cost-model change surfaces a signal instead of breaking the run;
 re-record with `--update-golden` once confirmed. Modeled throughput is
 **bit-identical** across runs (a pure function of trace + config + cost model),
 so its warn bar is tight (±1% — trips on any cost-model change). Sim-speed
-(`realtime_x`) is host-load dependent, so the bench tier runs the sim several
-times and warns on >10% drift of the **median**. The golden key encodes the trace
-size `n`; changing `tests/fixtures/gen_throughput_trace.py` invalidates it
-(re-record). The worked example is `tests/test_throughput_regression.py`.
+(`realtime_x`) is host-load dependent, so `just test-bench` is a separate full-
+validation step: it runs the sim several times and warns on >10% drift of the
+**median**. The golden key encodes the trace size `n`; changing
+`tests/fixtures/gen_throughput_trace.py` invalidates it (re-record). The worked
+example is `tests/test_throughput_regression.py`.
 
 ## Adding a tiered test
 

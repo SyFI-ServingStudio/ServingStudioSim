@@ -14,9 +14,9 @@ use std::thread::JoinHandle;
 use anyhow::{anyhow, Result};
 
 use crate::log::parquet_writer::StreamingParquetWriter;
-use crate::log::rows::{cost_to_record_batch, CostLogEntry};
+use crate::log::rows::{cost_to_record_batch, CostLogChunk, CostLogEntry};
 use crate::log::schemas::cost_log_schema;
-use crate::timing::CostManifest;
+use crate::timing::{CostManifest, SlotInput};
 
 const STREAM_FLUSH_ROWS: usize = 8_192;
 const CHANNEL_CAP: usize = 64;
@@ -24,9 +24,10 @@ const CHANNEL_CAP: usize = 64;
 /// Sim-thread handle: buffers `CostLogEntry` rows and offloads encode/write to a
 /// background thread. `flush_all` (also `Drop`) sends the tail and joins.
 pub struct CostLogger {
-    tx: Option<SyncSender<Vec<CostLogEntry>>>,
+    tx: Option<SyncSender<CostLogChunk>>,
     handle: Option<JoinHandle<Result<()>>>,
-    buf: Vec<CostLogEntry>,
+    buf: CostLogChunk,
+    slot_inputs_per_row: usize,
     closed: bool,
 }
 
@@ -46,7 +47,7 @@ impl CostLogger {
 
         let mut writer =
             StreamingParquetWriter::new(raw.join("cost_log.parquet"), cost_log_schema());
-        let (tx, rx) = sync_channel::<Vec<CostLogEntry>>(CHANNEL_CAP);
+        let (tx, rx) = sync_channel::<CostLogChunk>(CHANNEL_CAP);
         let handle = std::thread::Builder::new()
             .name("mlsim-cost-logger".to_string())
             .spawn(move || -> Result<()> {
@@ -60,13 +61,34 @@ impl CostLogger {
         Ok(Self {
             tx: Some(tx),
             handle: Some(handle),
-            buf: Vec::with_capacity(STREAM_FLUSH_ROWS),
+            buf: CostLogChunk::with_capacity(STREAM_FLUSH_ROWS, 0),
+            slot_inputs_per_row: 0,
             closed: false,
         })
     }
 
-    pub fn record(&mut self, entry: CostLogEntry) -> Result<()> {
-        self.buf.push(entry);
+    pub fn record(
+        &mut self,
+        mut entry: CostLogEntry,
+        slot_inputs: &mut Vec<SlotInput>,
+    ) -> Result<()> {
+        let slot_input_len = slot_inputs.len();
+        if slot_input_len > 0 {
+            if self.slot_inputs_per_row == 0 {
+                self.slot_inputs_per_row = slot_input_len;
+                self.buf
+                    .slot_inputs
+                    .reserve_exact(STREAM_FLUSH_ROWS * slot_input_len);
+            } else {
+                debug_assert_eq!(
+                    slot_input_len, self.slot_inputs_per_row,
+                    "slot_input capture must stay slot-aligned"
+                );
+            }
+        }
+        entry.slot_input_len = slot_input_len;
+        self.buf.slot_inputs.append(slot_inputs);
+        self.buf.entries.push(entry);
         if self.buf.len() >= STREAM_FLUSH_ROWS {
             self.send()?;
         }
@@ -77,8 +99,17 @@ impl CostLogger {
         if self.buf.is_empty() {
             return Ok(());
         }
-        let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(STREAM_FLUSH_ROWS));
-        match self.tx.as_ref().expect("tx present until flush").send(chunk) {
+        let slot_input_capacity = STREAM_FLUSH_ROWS * self.slot_inputs_per_row;
+        let chunk = std::mem::replace(
+            &mut self.buf,
+            CostLogChunk::with_capacity(STREAM_FLUSH_ROWS, slot_input_capacity),
+        );
+        match self
+            .tx
+            .as_ref()
+            .expect("tx present until flush")
+            .send(chunk)
+        {
             Ok(()) => Ok(()),
             Err(_) => Err(self
                 .join_writer()

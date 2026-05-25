@@ -88,6 +88,13 @@ pub fn cost_log_schema() -> Arc<Schema> {
         Field::new("groups", DataType::List(group_item), false),
         Field::new("slot_time_ms", DataType::List(time_item), false),
         Field::new("slot_coverage", DataType::List(cov_item), false),
+        // Per-slot input JSON (one string per leaf, slot-aligned to slot_time_ms).
+        // Appended last: append-only, so old readers are unaffected.
+        Field::new(
+            "slot_input",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+            false,
+        ),
     ]))
 }
 

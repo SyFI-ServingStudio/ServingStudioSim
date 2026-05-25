@@ -37,7 +37,7 @@ pub struct AllReduceKernelConfig {
     pub dtype: DType,
 }
 
-#[derive(SweepCoords, serde::Deserialize)]
+#[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
 pub struct AllReduceKernelInput {
     /// Size of the FULL buffer each rank contributes to / receives from the
     /// collective — i.e. the whole tensor handed to `dist.all_reduce`, NOT a

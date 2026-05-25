@@ -31,7 +31,7 @@ pub struct FlashinferAttnRectKernelConfig {
     pub o_dtype: DType,
 }
 
-#[derive(SweepCoords, serde::Deserialize)]
+#[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
 pub struct FlashinferAttnRectKernelInput {
     pub q_len: u32,
     pub kv_len: u32,

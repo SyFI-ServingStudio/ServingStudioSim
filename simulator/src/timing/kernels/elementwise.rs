@@ -32,7 +32,7 @@ pub struct ElementwiseKernelConfig {
     pub output_bytes_per_token: u32,
 }
 
-#[derive(SweepCoords, serde::Deserialize)]
+#[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
 pub struct ElementwiseKernelInput {
     pub num_tokens: u32,
 }

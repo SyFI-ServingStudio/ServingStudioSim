@@ -23,6 +23,7 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
+use crate::timing::slot_input::SlotInput;
 use crate::timing::LeafMetrics;
 
 /// A node of the recursive cost structure (the build-time form). Composites are
@@ -36,7 +37,10 @@ pub enum CostNode {
     Sum(Vec<CostNode>),
     /// Fan-out: wallclock `= max(children)/overlap`. Unused by the dense vertical
     /// (no collective); present for future HP/EP fan-out (INV-3).
-    Max { overlap: f32, children: Vec<CostNode> },
+    Max {
+        overlap: f32,
+        children: Vec<CostNode>,
+    },
     /// Fold: `n ×` an identical child subtree — the homogeneous-layer repeat,
     /// evaluated once and scaled, never materialized `n` times (INV-3).
     Scale { n: u32, child: Box<CostNode> },
@@ -55,9 +59,17 @@ pub enum CostNode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FlatCostNode {
     Leaf(usize),
-    Sum { children: Range<usize> },
-    Max { overlap: f32, children: Range<usize> },
-    Scale { n: u32, children: Range<usize> },
+    Sum {
+        children: Range<usize>,
+    },
+    Max {
+        overlap: f32,
+        children: Range<usize>,
+    },
+    Scale {
+        n: u32,
+        children: Range<usize>,
+    },
 }
 
 /// Per-slot manifest entry: the dotted leaf name plus the kernel identity folded
@@ -152,17 +164,42 @@ impl CostTreeBuilder {
 pub struct Evaluator<'a> {
     buf: &'a mut [LeafMetrics],
     cursor: usize,
+    /// `Some` only on the input-capturing path ([`Self::with_inputs`]); each leaf's
+    /// input is pushed here in slot/visit order. `None` on the no-logger path, so
+    /// [`Self::push`] never invokes its closure → no clone.
+    inputs: Option<&'a mut Vec<SlotInput>>,
 }
 
 impl<'a> Evaluator<'a> {
     pub fn new(buf: &'a mut [LeafMetrics]) -> Self {
-        Self { buf, cursor: 0 }
+        Self {
+            buf,
+            cursor: 0,
+            inputs: None,
+        }
+    }
+
+    /// Input-capturing evaluator: like [`Self::new`] but also records each leaf's
+    /// typed input into `inputs` (cleared first), aligned to the slot buffer, for
+    /// the `cost_log` `slot_input` column.
+    pub fn with_inputs(buf: &'a mut [LeafMetrics], inputs: &'a mut Vec<SlotInput>) -> Self {
+        inputs.clear();
+        Self {
+            buf,
+            cursor: 0,
+            inputs: Some(inputs),
+        }
     }
 
     /// Write the next leaf's metrics into its slot and advance. Slot index =
     /// visit order, so `eval` must push in the order `compile` minted slots.
-    pub fn push(&mut self, metrics: LeafMetrics) {
+    /// Every leaf supplies its typed input here; `make_input` is invoked **only**
+    /// when recording, so the no-logger path (`inputs: None`) does not clone.
+    pub fn push(&mut self, metrics: LeafMetrics, make_input: impl FnOnce() -> SlotInput) {
         self.buf[self.cursor] = metrics;
+        if let Some(inputs) = self.inputs.as_deref_mut() {
+            inputs.push(make_input());
+        }
         self.cursor += 1;
     }
 
@@ -225,8 +262,12 @@ impl CostTree {
                     }
                 }
                 CostNode::Scale { n, child } => {
-                    let range =
-                        Self::reserve(&mut out, &mut labels, &mut queue, std::slice::from_ref(child));
+                    let range = Self::reserve(
+                        &mut out,
+                        &mut labels,
+                        &mut queue,
+                        std::slice::from_ref(child),
+                    );
                     FlatCostNode::Scale {
                         n: *n,
                         children: range,
@@ -423,7 +464,9 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
         let flat = tree.flatten();
         assert!(matches!(flat[0], FlatCostNode::Sum { .. }));
         assert_eq!(
-            flat.iter().filter(|n| matches!(n, FlatCostNode::Leaf(_))).count(),
+            flat.iter()
+                .filter(|n| matches!(n, FlatCostNode::Leaf(_)))
+                .count(),
             1
         );
         // …but the manifest recovers the label at the index the Labeled spliced
@@ -443,7 +486,11 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
         let mut b = CostTreeBuilder::new();
         let pre = CostNode::Labeled {
             label: "m.pre_attn (PreAttnLocalWorklet)".to_string(),
-            child: Box::new(CostNode::Sum(vec![b.leaf("m.pre_attn.norm", "rms_norm", "")])),
+            child: Box::new(CostNode::Sum(vec![b.leaf(
+                "m.pre_attn.norm",
+                "rms_norm",
+                "",
+            )])),
         };
         let attn = CostNode::Labeled {
             label: "m.attn (AttnLocalWorklet)".to_string(),
@@ -502,7 +549,10 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
         assert_eq!(from_manifest, direct);
         assert_eq!(from_manifest, 1.0 + 3.0 * (2.0 + 3.0) + 4.0);
         // The manifest carries the fold + slot names (reproducibility, not just labels).
-        assert!(back.nodes.iter().any(|n| matches!(n, FlatCostNode::Scale { n: 3, .. })));
+        assert!(back
+            .nodes
+            .iter()
+            .any(|n| matches!(n, FlatCostNode::Scale { n: 3, .. })));
         assert_eq!(back.slots.len(), 4);
     }
 
@@ -585,7 +635,10 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
                 | FlatCostNode::Scale { children, .. } => children.clone(),
                 FlatCostNode::Leaf(_) => continue,
             };
-            assert!(range.start > i, "parent {i} precedes its children {range:?}");
+            assert!(
+                range.start > i,
+                "parent {i} precedes its children {range:?}"
+            );
             assert!(range.end <= nodes.len(), "child range {range:?} in bounds");
         }
     }

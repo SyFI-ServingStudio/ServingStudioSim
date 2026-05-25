@@ -5,7 +5,7 @@
 //! model per iteration). The AFD attn/ffn-split `AttnArchInput` / `FfnArchInput`
 //! and the layer-wise traits are deferred.
 
-use crate::timing::{CostManifest, LeafMetrics};
+use crate::timing::{CostManifest, LeafMetrics, SlotInput};
 
 /// One HP group's batch state. Under a `Local`/unified single-GPU deployment
 /// there is exactly one group; the field set follows L4 §3.1 so the AFD/HP
@@ -50,6 +50,21 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// clear `slots` and return their fixed aggregate. O(slots) flat writes, no
     /// per-tick allocation when the caller reuses the buffer.
     fn eval_iter(&self, batch: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics;
+
+    /// Like [`Self::eval_iter`], but also captures each leaf's typed kernel input
+    /// into `inputs` (slot-aligned, in visit order) for the `cost_log`
+    /// `slot_input` column. The default clears `inputs` and falls back to the
+    /// non-capturing path — models with a compiled CostTree override it to record.
+    /// The clone per leaf is paid only on this path; `eval_iter` stays untouched.
+    fn eval_iter_with_inputs(
+        &self,
+        batch: &UnifiedArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        inputs.clear();
+        self.eval_iter(batch, slots)
+    }
 
     /// The `cost_log` manifest: the ordered slots plus the flattened aggregation
     /// nodes, so a consumer can reproduce `total_time_ms` from a row's per-slot
