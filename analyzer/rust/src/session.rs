@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-    ListArray, RecordBatch, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    ListArray, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 
@@ -127,4 +127,31 @@ pub fn value_f32_list(array: &ArrayRef, row: usize) -> Result<Vec<f64>> {
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| anyhow!("expected List<Float32> values"))?;
     Ok((0..floats.len()).map(|i| floats.value(i) as f64).collect())
+}
+
+/// One row of a `List<Utf8>` column as owned `Vec<String>` (e.g. `slot_input`).
+/// Null row → empty vec. A null *element* within the list → empty string, so the
+/// returned vec stays index-aligned to its sibling lists (e.g. `slot_time_ms`).
+pub fn value_str_list(array: &ArrayRef, row: usize) -> Result<Vec<String>> {
+    let list = array
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("expected List array"))?;
+    if list.is_null(row) {
+        return Ok(Vec::new());
+    }
+    let values = list.value(row);
+    let strs = values
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow!("expected List<Utf8> values"))?;
+    Ok((0..strs.len())
+        .map(|i| {
+            if strs.is_null(i) {
+                String::new()
+            } else {
+                strs.value(i).to_string()
+            }
+        })
+        .collect())
 }

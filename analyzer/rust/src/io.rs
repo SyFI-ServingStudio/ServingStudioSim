@@ -66,6 +66,23 @@ pub fn read_run_meta(log_dir: &Path) -> Option<(usize, String)> {
     Some((num_gpus, gpu_name))
 }
 
+/// Read + parse the sim's `cost_manifest.json` (the cost-tree slots + flattened
+/// aggregation nodes the trace builder lays out). Searches the same dirs as
+/// other artifacts. Errors (not `None`) when absent/unparseable — the trace verb
+/// cannot place slices without it, so failing loud is correct here.
+pub fn read_manifest(log_dir: &Path) -> Result<crate::trace::manifest::Manifest> {
+    use anyhow::Context;
+    let path = resolve_artifact_path(log_dir, "cost_manifest.json");
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("read cost_manifest.json at {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+}
+
+/// Output path for a Perfetto trace: `<log_dir>/traces/<prefix>.pftrace.gz`.
+pub fn trace_path(log_dir: &Path, prefix: &str) -> PathBuf {
+    log_dir.join("traces").join(format!("{prefix}.pftrace.gz"))
+}
+
 pub fn report_path(log_dir: &Path, name: &str) -> PathBuf {
     log_dir.join(REPORTS_DIR).join(name)
 }

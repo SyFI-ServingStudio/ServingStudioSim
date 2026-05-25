@@ -18,10 +18,12 @@ use serde_json::json;
 
 mod cdf;
 mod io;
+mod perfetto;
 mod registry;
 mod request;
 mod session;
 mod throughput;
+mod trace;
 
 use io::{payload_path, read_deployment, report_path, write_json, SCHEMA_VERSION};
 use session::build_session;
@@ -46,6 +48,23 @@ enum Command {
     },
     /// List the available analyzer subjects and what each produces.
     List,
+    /// Export a Perfetto per-kernel timeline (`traces/<prefix>.pftrace.gz`).
+    /// Samples `regions` evenly-spaced contiguous windows of `region_ms` each
+    /// across the run and concatenates them; open in ui.perfetto.dev. A separate
+    /// verb (not a subject) — the `analyze run` catalog is untouched.
+    Trace {
+        /// Run directory (holds `raw/cost_log.parquet` + `cost_manifest.json`).
+        log_dir: PathBuf,
+        /// Number of evenly-spaced sample windows.
+        #[arg(long, default_value_t = 16)]
+        regions: usize,
+        /// Duration (ms) of each sample window.
+        #[arg(long, default_value_t = 200.0)]
+        region_ms: f64,
+        /// Cap on total slice pairs (enforced at iteration granularity).
+        #[arg(long, default_value_t = 200_000)]
+        max_slices: usize,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -56,6 +75,15 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Run { log_dir, subjects } => run(log_dir, subjects).await,
+        Command::Trace {
+            log_dir,
+            regions,
+            region_ms,
+            max_slices,
+        } => {
+            let ctx = build_session();
+            trace::run(&ctx, &log_dir, regions, region_ms, max_slices).await
+        }
     }
 }
 

@@ -19,5 +19,14 @@ serde_json = "1.0"
 datafusion = { version = "45", default-features = false, features = ["parquet"] }
 arrow-array = { version = "54", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Perfetto trace export: prost encodes the generated proto types to protobuf;
+# flate2 gzips the result into a `.pftrace.gz`. The proto types are codegen'd at
+# build time from `proto/perfetto_trace.proto` by `build.rs` (prost-build).
+prost = "0.13"
+flate2 = "1"
+
+[build-dependencies]
+prost-build = "0.13"
+
 # Build profiles (release / maxperf) come from the workspace root Cargo.toml and
 # apply to every member — defining them here would be ignored (cargo warns).

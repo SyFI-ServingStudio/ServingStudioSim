@@ -212,6 +212,15 @@ async def run_analysis(
     if rc != 0:
         print(f"[analyze] render failed for {log_dir}:\n{out}")
 
+    # Always emit the per-kernel Perfetto timeline (traces/<prefix>.pftrace.gz).
+    # A standalone verb, not a subject (different output contract: a binary trace
+    # for ui.perfetto.dev, not report/payload JSON), so it runs here with CLI
+    # defaults rather than through the subject catalog. Best-effort like the rest.
+    rc, out = await _run_capture([str(analyzer), "trace", str(log_dir)])
+    _append("analyze trace", out)
+    if rc != 0:
+        print(f"[analyze] trace failed for {log_dir}:\n{out}")
+
 
 @dataclass
 class SimulationRunner:
