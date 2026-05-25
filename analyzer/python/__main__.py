@@ -14,10 +14,12 @@ from typing import Callable
 
 from request import slo_plot
 from throughput import segment_plot
+from utilization import util_plot
 
 RENDERERS = {
     "slo": slo_plot.render,
     "throughput": segment_plot.render,
+    "utilization": util_plot.render,
 }
 
 

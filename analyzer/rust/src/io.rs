@@ -66,6 +66,23 @@ pub fn read_run_meta(log_dir: &Path) -> Option<(usize, String)> {
     Some((num_gpus, gpu_name))
 }
 
+/// The run's `worker_id → pool` map from `run_meta.json`'s `workers[]` (sim-written,
+/// L7). Read as bare JSON (no `simulator` dep), like [`read_run_meta`]. `None` if
+/// absent/unparseable; the utilization subject then treats every `cost_log` worker
+/// as belonging to a single pool 0 (the honest default for a run pre-dating the
+/// sidecar, where the deployment is a single DP pool anyway).
+pub fn read_worker_pools(log_dir: &Path) -> Option<Vec<(u64, u64)>> {
+    let path = resolve_artifact_path(log_dir, "run_meta.json");
+    let text = fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let workers = json.get("workers")?.as_array()?;
+    let pairs: Vec<(u64, u64)> = workers
+        .iter()
+        .filter_map(|w| Some((w.get("worker_id")?.as_u64()?, w.get("pool")?.as_u64()?)))
+        .collect();
+    (!pairs.is_empty()).then_some(pairs)
+}
+
 pub fn report_path(log_dir: &Path, name: &str) -> PathBuf {
     log_dir.join(REPORTS_DIR).join(name)
 }

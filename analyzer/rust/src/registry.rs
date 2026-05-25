@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::request;
 use crate::throughput;
+use crate::utilization;
 
 /// Analytical grain + source family a subject belongs to. A category is a *tag*
 /// (and a source folder) here, not a registration boundary — that's what lets
@@ -24,6 +25,9 @@ pub enum Category {
     Request,
     /// System serving rate over time/iter windows. Tier-1, deployment-agnostic.
     Throughput,
+    /// A compute resource (pool of workers / GPUs) busy fraction over time, from
+    /// `cost_log`. Tier-1, deployment-agnostic.
+    Utilization,
 }
 
 impl Category {
@@ -31,6 +35,7 @@ impl Category {
         match self {
             Category::Request => "request",
             Category::Throughput => "throughput",
+            Category::Utilization => "utilization",
         }
     }
 }
@@ -94,6 +99,14 @@ pub const SUBJECTS: &[Subject] = &[
         payload_name: "throughput_segments.json",
         applies: Applies::All,
     },
+    Subject {
+        name: "utilization",
+        category: Category::Utilization,
+        description: "Per-pool GPU compute utilization (fraction of workers busy) over time.",
+        report_name: "utilization_report.json",
+        payload_name: "utilization_series.json",
+        applies: Applies::All,
+    },
 ];
 
 /// Human-readable catalog for `analyze list` — one aligned line per subject:
@@ -124,6 +137,7 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
     match name {
         "slo" => request::slo::run_slo(ctx, dir).await,
         "throughput" => throughput::segment::run_throughput(ctx, dir).await,
+        "utilization" => utilization::series::run_utilization(ctx, dir).await,
         other => bail!("unknown analyzer subject {other:?}"),
     }
 }
