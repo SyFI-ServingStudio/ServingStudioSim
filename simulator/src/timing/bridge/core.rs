@@ -335,7 +335,6 @@ fn py_results_to_metrics(
             memory_bandwidth_gbps: optional_f64(item, "memory_bandwidth_gbps")?,
             algbw_gbps: optional_f64(item, "algbw_gbps")?,
             busbw_gbps: optional_f64(item, "busbw_gbps")?,
-            message_size_bytes: optional_u64(item, "message_size_bytes")?,
             // `KernelMetrics::energy_j` is a required f64 (not `Option`);
             // profilers that don't measure energy report 0.0 via this default.
             // `is_finite` validates the resulting value, so a missing field is
@@ -405,7 +404,7 @@ fn extract_f64(item: &PyAny, field: &str) -> Result<f64, PerfApiError> {
 // `Ok(None)` into the same `Ok(None)` result. This is *not* leniency by
 // accident: Python `ComputeMetrics` and `CommMetrics` are separate dataclasses
 // with disjoint optional fields (`tflops` lives only on compute,
-// `algbw_gbps`/`busbw_gbps`/`message_size_bytes` only on comm). When this
+// `algbw_gbps`/`busbw_gbps` only on comm). When this
 // bridge reads a row from either family, the cross-family fields legitimately
 // don't exist on the Python object, and `AttributeError` is the expected
 // signal. The cost is that a future field rename on the Python side will
@@ -415,13 +414,6 @@ fn extract_f64(item: &PyAny, field: &str) -> Result<f64, PerfApiError> {
 fn optional_f64(item: &PyAny, field: &str) -> Result<Option<f64>, PerfApiError> {
     match item.getattr(field) {
         Ok(value) if !value.is_none() => value.extract::<f64>().map(Some).py_err(),
-        _ => Ok(None),
-    }
-}
-
-fn optional_u64(item: &PyAny, field: &str) -> Result<Option<u64>, PerfApiError> {
-    match item.getattr(field) {
-        Ok(value) if !value.is_none() => value.extract::<u64>().map(Some).py_err(),
         _ => Ok(None),
     }
 }

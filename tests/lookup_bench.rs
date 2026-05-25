@@ -25,7 +25,6 @@ fn compute_sample(time_ms: f64) -> KernelMetrics {
         memory_bandwidth_gbps: Some(2.0),
         algbw_gbps: None,
         busbw_gbps: None,
-        message_size_bytes: None,
         energy_j: time_ms * 0.1,
     }
 }

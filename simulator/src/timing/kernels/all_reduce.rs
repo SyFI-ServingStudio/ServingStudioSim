@@ -7,9 +7,11 @@
 //! (config, sweep coord, backend) to the on-wire `ArgsPayload`. The Python
 //! `AllReduceArgs` dataclass owns the schema.
 //!
-//! Comm vs the compute kernels: rows carry `algbw/busbw/message_size` (no
-//! `tflops`), so the cached metric reads `flops()==0` and `bytes()` falls back
-//! to `message_size_bytes` (see `bridge::payload`). The cost is still just
+//! Comm vs the compute kernels: rows carry `algbw/busbw` measured metrics (no
+//! `tflops`), so the cached metric reads `flops()==0` and `bytes()` derives from
+//! `busbw × time` — the real per-GPU fabric traffic (send/recv) — instead of a
+//! memory-bandwidth rate (see `bridge::payload`). `message_size_bytes` is an
+//! args/cache-key axis only, NOT a result column. The cost is still just
 //! `time_ms` interpolated over message size.
 //!
 //! Shape split (L1 design §8.2): static config is `(num_gpus, fabric, dtype)`;
@@ -37,6 +39,14 @@ pub struct AllReduceKernelConfig {
 
 #[derive(SweepCoords, serde::Deserialize)]
 pub struct AllReduceKernelInput {
+    /// Size of the FULL buffer each rank contributes to / receives from the
+    /// collective — i.e. the whole tensor handed to `dist.all_reduce`, NOT a
+    /// reduce-scatter shard (`÷ num_gpus`). The ring algorithm's 2(N-1)/N data
+    /// movement is already baked into the measured time, so callers pass the
+    /// complete output size. Example: a TP layer's row-parallel projection
+    /// produces a full `[tokens × hidden]` partial-sum on every rank, so the
+    /// caller passes `tokens × hidden × dtype_bytes` (full hidden, NOT
+    /// hidden/tp_size).
     pub message_size_bytes: u64,
 }
 

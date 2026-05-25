@@ -44,7 +44,6 @@ def profile_all_reduce(
         time_ms=float(payload["time_ms"]),
         algbw_gbps=float(payload["algbw_gbps"]),
         busbw_gbps=float(payload["busbw_gbps"]),
-        message_size_bytes=int(payload["message_size_bytes"]),
         energy_j=float(payload.get("energy_j", 0.0)),
     )
 
@@ -113,5 +112,4 @@ def _all_reduce_per_rank(
         "time_ms": time_ms,
         "algbw_gbps": algbw_gbps,
         "busbw_gbps": busbw_gbps,
-        "message_size_bytes": actual_bytes,
     }

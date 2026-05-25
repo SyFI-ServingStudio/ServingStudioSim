@@ -30,7 +30,10 @@ STANDARD_COLUMNS = [
     "verified",
 ]
 COMPUTE_METRIC_COLUMNS = ["time_ms", "tflops", "memory_bandwidth_gbps", "energy_j"]
-COMM_METRIC_COLUMNS = ["time_ms", "algbw_gbps", "busbw_gbps", "message_size_bytes", "energy_j"]
+# message_size for comm kernels is an args/cache-key column, NOT a measured
+# result — the simulator derives moved bytes from busbw × time. So it is not a
+# metric column here (it lives in the args region of the table).
+COMM_METRIC_COLUMNS = ["time_ms", "algbw_gbps", "busbw_gbps", "energy_j"]
 # Metric columns are a table-level contract, not inferred from each row. Keep
 # this in lockstep with KernelProfilerSpec.metric_family and L1 design §3.2.2.
 METRIC_COLUMNS_BY_FAMILY = {
@@ -43,7 +46,6 @@ ALL_METRIC_COLUMNS = [
     "memory_bandwidth_gbps",
     "algbw_gbps",
     "busbw_gbps",
-    "message_size_bytes",
     "energy_j",
 ]
 METRIC_CREATE_DEFS_BY_FAMILY = {
@@ -57,7 +59,6 @@ METRIC_CREATE_DEFS_BY_FAMILY = {
         "time_ms": "REAL NOT NULL",
         "algbw_gbps": "REAL NOT NULL",
         "busbw_gbps": "REAL NOT NULL",
-        "message_size_bytes": "INTEGER NOT NULL",
         "energy_j": "REAL NOT NULL DEFAULT 0.0",
     },
 }
@@ -72,7 +73,6 @@ METRIC_ALTER_DEFS_BY_FAMILY = {
         "time_ms": "REAL",
         "algbw_gbps": "REAL",
         "busbw_gbps": "REAL",
-        "message_size_bytes": "INTEGER",
         "energy_j": "REAL NOT NULL DEFAULT 0.0",
     },
 }
@@ -361,7 +361,6 @@ def _metrics_to_db(metrics: Metrics) -> dict[str, Any]:
             "time_ms": metrics.time_ms,
             "algbw_gbps": metrics.algbw_gbps,
             "busbw_gbps": metrics.busbw_gbps,
-            "message_size_bytes": metrics.message_size_bytes,
             "energy_j": metrics.energy_j,
         }
     raise TypeError(f"unsupported metrics type {type(metrics).__name__}")
@@ -379,7 +378,6 @@ def _metrics_from_row(row: sqlite3.Row, metric_family: MetricFamily) -> Metrics:
         time_ms=float(row["time_ms"]),
         algbw_gbps=float(row["algbw_gbps"]),
         busbw_gbps=float(row["busbw_gbps"]),
-        message_size_bytes=int(row["message_size_bytes"]),
         energy_j=float(row["energy_j"] or 0.0),
     )
 

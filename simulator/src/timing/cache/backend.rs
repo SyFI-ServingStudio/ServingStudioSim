@@ -49,7 +49,6 @@ mod tests {
             memory_bandwidth_gbps: Some(2.0),
             algbw_gbps: None,
             busbw_gbps: None,
-            message_size_bytes: None,
             energy_j: 1.0,
         }
     }

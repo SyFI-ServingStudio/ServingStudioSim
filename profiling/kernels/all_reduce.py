@@ -35,6 +35,9 @@ KIND: str = "all_reduce"
 @dataclass(frozen=True)
 class AllReduceArgs(KernelArgs):
     num_gpus: int
+    # FULL buffer each rank all-reduces (the whole tensor handed to
+    # dist.all_reduce), NOT a reduce-scatter shard. The ring 2(N-1)/N movement is
+    # captured in the measured time, so callers pass the complete output size.
     message_size_bytes: int
     dtype: DType
     # Network fabric token (matches Rust `Fabric` serde wire form, e.g.

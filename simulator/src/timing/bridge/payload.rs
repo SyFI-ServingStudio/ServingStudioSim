@@ -143,7 +143,6 @@ pub struct KernelMetrics {
     pub memory_bandwidth_gbps: Option<f64>,
     pub algbw_gbps: Option<f64>,
     pub busbw_gbps: Option<f64>,
-    pub message_size_bytes: Option<u64>,
     pub energy_j: f64,
 }
 
@@ -161,7 +160,6 @@ impl KernelMetrics {
             memory_bandwidth_gbps: None,
             algbw_gbps: None,
             busbw_gbps: None,
-            message_size_bytes: None,
             energy_j: f64::NAN,
         }
     }
@@ -206,6 +204,13 @@ impl KernelMetrics {
         value as u64
     }
 
+    /// Bytes this leaf moved. Compute rows derive it from the memory-bandwidth
+    /// rate (`bw × time`); comm rows derive it from `busbw × time`, the real
+    /// per-GPU traffic the collective pushes over the fabric (for ring
+    /// all-reduce, send == recv == 2(N-1)/N · message, which is exactly
+    /// `busbw × time` since `busbw = algbw · 2(N-1)/N`). So `bytes / time`
+    /// recovers the true link bandwidth either way. A row with neither rate
+    /// (e.g. a non-finite placeholder) yields 0.
     pub fn bytes(&self) -> u64 {
         if let Some(memory_bandwidth_gbps) = self.memory_bandwidth_gbps {
             let value = memory_bandwidth_gbps * (self.time_ms / 1000.0) * 1e9;
@@ -214,7 +219,14 @@ impl KernelMetrics {
             }
             return value as u64;
         }
-        self.message_size_bytes.unwrap_or(0)
+        if let Some(busbw_gbps) = self.busbw_gbps {
+            let value = busbw_gbps * (self.time_ms / 1000.0) * 1e9;
+            if !finite_non_negative(value) {
+                return 0;
+            }
+            return value as u64;
+        }
+        0
     }
 }
 
@@ -285,7 +297,6 @@ mod tests {
             memory_bandwidth_gbps: None,
             algbw_gbps: None,
             busbw_gbps: None,
-            message_size_bytes: None,
             energy_j: 0.0,
         }
     }
@@ -311,21 +322,29 @@ mod tests {
     }
 
     #[test]
-    fn bytes_falls_back_to_message_size_when_no_mem_bw() {
-        let mut m = metrics(1.0, None);
-        m.message_size_bytes = Some(4096);
-        assert_eq!(m.bytes(), 4096);
+    fn bytes_derives_from_busbw_on_comm_rows() {
+        // Comm rows carry no mem_bw rate; bytes = busbw × time = the real
+        // per-GPU fabric traffic. 50 GB/s * 2 ms = 50e9 * 2e-3 = 1e8 bytes.
+        let mut m = metrics(2.0, None);
+        m.busbw_gbps = Some(50.0);
+        assert_eq!(m.bytes(), 100_000_000);
     }
 
     #[test]
-    fn bytes_prefers_memory_bandwidth_when_both_fields_present() {
-        // Compute rows always carry mem_bw; comm rows always carry
-        // message_size_bytes. When both happen to be present, the rate-based
-        // path must win to stay consistent with the compute interpretation.
+    fn bytes_prefers_memory_bandwidth_when_both_rates_present() {
+        // Compute rows carry mem_bw; comm rows carry busbw. If both are present
+        // the rate-based mem_bw path must win to stay consistent with the
+        // compute interpretation.
         let mut m = metrics(2.0, None);
         m.memory_bandwidth_gbps = Some(100.0);
-        m.message_size_bytes = Some(4096);
+        m.busbw_gbps = Some(50.0);
         // 100 GB/s * 2 ms = 100e9 * 2e-3 = 2e8 bytes
         assert_eq!(m.bytes(), 200_000_000);
+    }
+
+    #[test]
+    fn bytes_is_zero_without_any_rate() {
+        // A row with neither mem_bw nor busbw (e.g. a placeholder) yields 0.
+        assert_eq!(metrics(1.0, None).bytes(), 0);
     }
 }
