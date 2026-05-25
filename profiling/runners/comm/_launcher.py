@@ -79,15 +79,58 @@ class TorchMpLauncher(MultiGpuLauncher):
 
 
 class NvshmemLauncher(MultiGpuLauncher):
-    """Placeholder boundary for NVSHMEM bootstrap runners."""
+    """torch.multiprocessing launcher for NVSHMEM (nvshmem4py) collectives.
 
-    def __init__(self, num_gpus: int, *, team: str = "WORLD"):
+    NVSHMEM is bootstrapped over a torch.distributed process group (NO MPI): each
+    spawned rank joins a `cpu:gloo,cuda:nccl` group, rank 0 mints the NVSHMEM
+    `UniqueID` and broadcasts it via `broadcast_object_list`, then every rank
+    calls `nvshmem.core.init(..., initializer_method="uid")`. `per_rank_fn` runs
+    inside that initialized session; teardown finalizes NVSHMEM and tears the
+    group down. Only rank 0's return value is propagated back.
+    """
+
+    def __init__(
+        self,
+        num_gpus: int,
+        *,
+        master_addr: str = "127.0.0.1",
+        master_port: int | None = None,
+    ):
         super().__init__(num_gpus)
-        self.team = team
+        self.master_addr = master_addr
+        self.master_port = master_port or _find_free_port()
 
     def run(self, per_rank_fn: Callable[..., Any], **kwargs) -> Any:
-        del per_rank_fn, kwargs
-        raise ProfilerNotImplemented("NvshmemLauncher bootstrap is not implemented yet")
+        try:
+            import torch.multiprocessing as mp
+        except ImportError as exc:
+            raise ProfilerNotImplemented("torch.multiprocessing is unavailable") from exc
+
+        ctx = mp.get_context("spawn")
+        result_queue = ctx.SimpleQueue()
+        try:
+            mp.spawn(
+                _nvshmem_mp_entry,
+                args=(
+                    self.num_gpus,
+                    self.master_addr,
+                    self.master_port,
+                    per_rank_fn,
+                    kwargs,
+                    result_queue,
+                ),
+                nprocs=self.num_gpus,
+                join=True,
+            )
+        except Exception as exc:
+            raise KernelLaunchFailed(str(exc)) from exc
+
+        if result_queue.empty():
+            return None
+        ok, payload = result_queue.get()
+        if not ok:
+            raise KernelLaunchFailed(str(payload))
+        return payload
 
 
 class VllmLauncher(MultiGpuLauncher):
@@ -126,6 +169,60 @@ def _torch_mp_entry(
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
         try:
             result = per_rank_fn(rank=rank, world_size=world_size, **fn_kwargs)
+        finally:
+            dist.destroy_process_group()
+    except Exception as exc:
+        if rank == 0:
+            result_queue.put((False, str(exc)))
+        raise
+    if rank == 0:
+        result_queue.put((True, result))
+
+
+def _nvshmem_mp_entry(
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+    per_rank_fn: Callable[..., Any],
+    fn_kwargs: dict[str, Any],
+    result_queue,
+) -> None:
+    os.environ.update(
+        {
+            "MASTER_ADDR": master_addr,
+            "MASTER_PORT": str(master_port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_RANK": str(rank),
+        }
+    )
+    try:
+        import nvshmem.core as nc
+        import torch
+        import torch.distributed as dist
+        from cuda.core import Device
+
+        torch.cuda.set_device(rank)
+        device = Device(rank)
+        device.set_current()
+        # gloo carries the CPU UniqueID broadcast; nccl is the CUDA collective backend.
+        dist.init_process_group(backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world_size)
+        try:
+            uid_box = [nc.get_unique_id() if rank == 0 else None]
+            dist.broadcast_object_list(uid_box, src=0)
+            dist.barrier()
+            nc.init(
+                device=device,
+                uid=uid_box[0],
+                rank=rank,
+                nranks=world_size,
+                initializer_method="uid",
+            )
+            try:
+                result = per_rank_fn(rank=rank, world_size=world_size, **fn_kwargs)
+            finally:
+                nc.finalize()
         finally:
             dist.destroy_process_group()
     except Exception as exc:

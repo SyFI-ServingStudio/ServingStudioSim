@@ -160,6 +160,7 @@ mod tests {
         assert_eq!(
             kinds,
             [
+                "all_reduce",
                 "elementwise",
                 "flashinfer_attn_decode",
                 "flashinfer_attn_prefill",

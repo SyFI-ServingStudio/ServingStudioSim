@@ -39,6 +39,7 @@ profiling = [
     # alias to default_env). Pinned to the reference profiling stack (0.6.6).
     "flashinfer-python>=0.6.4,<0.7; sys_platform == 'linux'",
     "flashinfer-cubin>=0.6.4,<0.7; sys_platform == 'linux'",
+    "nvshmem4py-cu12>=0.3.0",
 ]
 
 [tool.pytest.ini_options]
