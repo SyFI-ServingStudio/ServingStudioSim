@@ -180,19 +180,35 @@ async def run_analysis(
     `subjects` is the *intent* layer: which subjects to run (e.g. `["slo"]`).
     `None`/empty = all subjects applicable to the run's deployment (the analyzer
     self-selects via its applicability gate — the launcher never decides what is
-    *applicable*, only what is *wanted*)."""
+    *applicable*, only what is *wanted*).
+
+    Each step's combined stdout+stderr is appended to the run's `stdout.log` (the
+    sim run already closed it, so analysis output would otherwise be lost) under a
+    labeled section, keeping the full run record in one file."""
     analyzer = analyzer_binary_path(build_type)
+    stdout_log = log_dir / "stdout.log"
+
+    def _append(section: str, text: str) -> None:
+        if not text:
+            return
+        with stdout_log.open("a") as fh:
+            fh.write(f"\n=== {section} ===\n{text}")
+            if not text.endswith("\n"):
+                fh.write("\n")
+
     if not analyzer.exists():
         print(f"[analyze] {analyzer} not built; skipping analysis for {log_dir}")
         return
     subjects = subjects or []
     rc, out = await _run_capture([str(analyzer), "run", str(log_dir), *subjects])
+    _append("analyze compute", out)
     if rc != 0:
         print(f"[analyze] compute failed for {log_dir}:\n{out}")
         return
     rc, out = await _run_capture(
         [sys.executable, str(REPO_ROOT / "analyzer" / "python"), "render", str(log_dir), *subjects]
     )
+    _append("analyze render", out)
     if rc != 0:
         print(f"[analyze] render failed for {log_dir}:\n{out}")
 

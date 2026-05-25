@@ -43,4 +43,3 @@ plt.rcParams.update(
 def save_plot(fig, path, dpi: int = 300) -> None:
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
-    print(f"plot saved: {path}")
