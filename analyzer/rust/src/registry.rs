@@ -11,6 +11,7 @@ use anyhow::{bail, Result};
 use datafusion::prelude::SessionContext;
 use serde_json::Value;
 
+use crate::batch;
 use crate::request;
 use crate::throughput;
 use crate::utilization;
@@ -28,6 +29,9 @@ pub enum Category {
     /// A compute resource (pool of workers / GPUs) busy fraction over time, from
     /// `cost_log`. Tier-1, deployment-agnostic.
     Utilization,
+    /// Per-batch (per-iteration) composition over time, from `cost_log`. Tier-1,
+    /// deployment-agnostic.
+    Batch,
 }
 
 impl Category {
@@ -36,6 +40,7 @@ impl Category {
             Category::Request => "request",
             Category::Throughput => "throughput",
             Category::Utilization => "utilization",
+            Category::Batch => "batch",
         }
     }
 }
@@ -107,6 +112,14 @@ pub const SUBJECTS: &[Subject] = &[
         payload_name: "utilization_series.json",
         applies: Applies::All,
     },
+    Subject {
+        name: "batch",
+        category: Category::Batch,
+        description: "Per-batch composition (batch / prefill / decode token counts) over time + stats.",
+        report_name: "batch_report.json",
+        payload_name: "batch_scatter.json",
+        applies: Applies::All,
+    },
 ];
 
 /// Human-readable catalog for `analyze list` — one aligned line per subject:
@@ -138,6 +151,7 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
         "slo" => request::slo::run_slo(ctx, dir).await,
         "throughput" => throughput::segment::run_throughput(ctx, dir).await,
         "utilization" => utilization::series::run_utilization(ctx, dir).await,
+        "batch" => batch::composition::run_batch(ctx, dir).await,
         other => bail!("unknown analyzer subject {other:?}"),
     }
 }

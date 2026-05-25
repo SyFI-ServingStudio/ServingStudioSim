@@ -12,6 +12,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Callable
 
+from batch import scatter_plot
 from request import slo_plot
 from throughput import segment_plot
 from utilization import util_plot
@@ -20,6 +21,7 @@ RENDERERS = {
     "slo": slo_plot.render,
     "throughput": segment_plot.render,
     "utilization": util_plot.render,
+    "batch": scatter_plot.render,
 }
 
 

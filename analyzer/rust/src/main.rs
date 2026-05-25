@@ -16,6 +16,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+mod batch;
 mod cdf;
 mod io;
 mod registry;
