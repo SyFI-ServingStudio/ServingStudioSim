@@ -1,0 +1,81 @@
+// Trimmed subset of Perfetto's `perfetto_trace.proto` (TrackEvent model), just
+// enough to emit a nested-slice timeline. FIELD NUMBERS ARE COPIED VERBATIM
+// from upstream (protos/perfetto/trace/perfetto_trace.proto) — Perfetto matches
+// packets by field number, so any drift here silently fails to render in
+// ui.perfetto.dev. Verified against the `perfetto` pip package's descriptors.
+// Keep this file minimal but never renumber.
+//
+// proto2 semantics (upstream is proto2): every field is `optional`, which prost
+// lowers to `Option<T>`, so an unset field is simply omitted from the wire.
+syntax = "proto2";
+
+package perfetto.protos;
+
+// Root: a trace is a flat stream of packets.
+message Trace {
+  repeated TracePacket packet = 1;
+}
+
+message TracePacket {
+  optional uint64 timestamp = 8;
+
+  // Exactly one payload per packet in our usage.
+  optional TrackEvent track_event = 11;
+  optional TrackDescriptor track_descriptor = 60;
+
+  // Every packet carries this — one synthetic sequence id for the whole trace.
+  // track_event packets are dropped by the UI without it.
+  optional uint32 trusted_packet_sequence_id = 10;
+
+  // Set SEQ_INCREMENTAL_STATE_CLEARED on the first packet so the UI starts from
+  // a clean sequence state (we use no interning, but upstream tooling expects it).
+  optional uint32 sequence_flags = 13;
+}
+
+// Declares a track (a timeline lane). Process/thread tracks form the tree the
+// UI renders; child tracks (parent_uuid set, no process/thread) make sub-lanes.
+message TrackDescriptor {
+  optional uint64 uuid = 1;
+  optional uint64 parent_uuid = 5;
+  optional string name = 2;
+  optional ProcessDescriptor process = 3;
+  optional ThreadDescriptor thread = 4;
+}
+
+message ProcessDescriptor {
+  optional int32 pid = 1;
+  optional string process_name = 6;
+}
+
+message ThreadDescriptor {
+  optional int32 pid = 1;
+  optional int32 tid = 2;
+  optional string thread_name = 5;
+}
+
+message TrackEvent {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_SLICE_BEGIN = 1;
+    TYPE_SLICE_END = 2;
+    TYPE_INSTANT = 3;
+    TYPE_COUNTER = 4;
+  }
+
+  optional Type type = 9;
+  optional uint64 track_uuid = 11;
+  optional string name = 23;
+  repeated DebugAnnotation debug_annotations = 4;
+}
+
+// Key/value rider on a slice (shown in the UI's "Arguments" pane). We always
+// inline the name string (field 10), never the interned name_iid (field 1).
+message DebugAnnotation {
+  optional string name = 10;
+
+  optional bool bool_value = 2;
+  optional uint64 uint_value = 3;
+  optional int64 int_value = 4;
+  optional double double_value = 5;
+  optional string string_value = 6;
+}
