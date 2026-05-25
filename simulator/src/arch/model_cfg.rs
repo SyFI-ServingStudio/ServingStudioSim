@@ -93,14 +93,19 @@ pub struct ParallelCfg {
 }
 
 impl ParallelCfg {
-    /// Local single-GPU deployment: no TP/EP/HP split.
-    pub fn local(gpu_name: impl Into<String>) -> Self {
+    /// Resolved parallelism degrees from deployment params.
+    pub fn new(tp_size: u16, ep_size: u16, num_hp_groups: u16, gpu_name: impl Into<String>) -> Self {
         Self {
-            tp_size: 1,
-            ep_size: 1,
-            num_hp_groups: 1,
+            tp_size,
+            ep_size,
+            num_hp_groups,
             gpu_name: gpu_name.into(),
         }
+    }
+
+    /// Local single-GPU deployment: no TP/EP/HP split.
+    pub fn local(gpu_name: impl Into<String>) -> Self {
+        Self::new(1, 1, 1, gpu_name)
     }
 }
 
