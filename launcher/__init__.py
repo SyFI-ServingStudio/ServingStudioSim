@@ -14,11 +14,11 @@ from .schema import (
     normalize_params,
     validate_params,
 )
-from .schema.loader import Schema, SchemaNotFound, load_schema
+from .schema.loader import Registry, SchemaNotFound, load_schema
 from .sweep import run_single, run_sweep
 
 __all__ = [
-    "Schema",
+    "Registry",
     "SchemaNotFound",
     "load_schema",
     "validate_params",

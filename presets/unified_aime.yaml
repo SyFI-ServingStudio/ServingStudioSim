@@ -1,0 +1,22 @@
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/aime_long.csv
+  request_rate: 150.0
+  duration_ms: 1000000.0
+  run_to_end: false
+
+io:
+  log_dir: logs/unified_aime
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: llama3_dense
+          model_config: model/config/llama3_8b.json
+        worker:
+          type: barebone

@@ -1,30 +1,38 @@
-//! `#[derive(DeploymentParams)]` — single-source bridge from a clap `Args`
-//! struct to its `ParamDef` schema slice (design §1.8.3/§1.8.4).
+//! Derive the launcher `ParamDef` schema directly from the config types, so a
+//! field and its schema entry cannot drift (new-interface-design §11).
 //!
-//! The clap struct stays an ordinary `#[derive(clap::Args)]` with normal
-//! `#[arg(...)]` fields. This derive reads those same fields and emits two
-//! consts so the CLI surface and the `list-params` schema cannot drift:
-//!   - inherent `OWN_PARAMS: &[ParamDef]` — this struct's own (non-flatten)
-//!     params, used when the struct is flattened into another;
-//!   - `impl ParamSchema { PARAM_GROUPS: &[&[ParamDef]] }` — the full schema,
-//!     composing each `#[command(flatten)]` fragment's `OWN_PARAMS` (in field
-//!     order) followed by this struct's own group. A `Deployment` defaults its
-//!     `PARAM_GROUPS` to `Args::PARAM_GROUPS`, so it never re-lists fragments.
+//! Two derives, both emitting an inherent `const` that `schema::dump::list_params`
+//! aggregates:
+//!   - `#[derive(ParamStruct)]` on a plain struct → `pub const PARAMS: &[ParamDef]`
+//!     (one entry per non-skipped field). Used for the `*_COMMON` blocks
+//!     (`ModelSpec`, `GroupSpec`, `PoolSpec`, `WorkloadSpec`, `IoSpec`).
+//!   - `#[derive(ProviderSchema)]` on a `#[serde(tag = "type")]` enum →
+//!     `pub const SCHEMA: &[(&str, &[ParamDef])]`, one row per variant: the
+//!     serde-snake_case tag plus that variant's own (non-flatten) field params.
 //!
-//! Name / type / default / required are all inferred from the field's Rust type
-//! and its existing `#[arg(...)]`, so they are written exactly once. Metadata
-//! clap has no notion of rides on an inert `#[param(...)]` helper attribute:
-//!   - `#[param(cache_key)]`       → `ParamDef::cache_key()`
-//!   - `#[param(choices = CONST)]` → `ParamDef::choices(&CONST)`
+//! Name + wire type are inferred from the field's Rust type; the description is
+//! the field's `///` doc comment. Everything serde/clap cannot express rides on
+//! an inert `#[param(...)]` helper:
+//!   - `#[param(skip)]`             → field contributes no param (nested
+//!                                     sub-trees: `groups`, `arch`, `worker`).
+//!   - `#[param(default = LIT)]`    → `.default_<kind>(LIT)`.
+//!   - `#[param(cache_key)]`        → `.cache_key()`.
+//!   - `#[param(choices = CONST)]`  → `.choices(&CONST)`.
+//!   - `#[param(string)]`           → treat the field as a `string` param even
+//!                                     though its Rust type is a foreign enum
+//!                                     (`placement`, `log_level`, `batch_policy`).
 //!
-//! Adding a new field type is one arm in `scalar_kind` — additive, not the
-//! combinatorial arm growth a `macro_rules!` muncher would hit.
+//! `#[serde(flatten)]` fields are skipped automatically (the flattened struct
+//! contributes its own `PARAMS` block). A `bool` with no explicit default gets an
+//! implicit `false` (absent flag = off); an `Option<T>` with no default is marked
+//! `.optional()`. A `Vec<T>` is a list param that is still required unless given a
+//! default — it is NOT auto-optional.
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
+use quote::{quote, ToTokens};
 use syn::{
     parse_macro_input, punctuated::Punctuated, spanned::Spanned, Attribute, Data, DeriveInput,
-    Expr, ExprLit, Fields, GenericArgument, Lit, Meta, PathArguments, Token, Type,
+    Expr, ExprLit, Field, Fields, GenericArgument, Lit, Meta, PathArguments, Token, Type,
 };
 
 #[derive(Clone, Copy)]
@@ -36,115 +44,173 @@ enum Scalar {
     Path,
 }
 
-/// What a field maps to on the `ParamDef` side: which constructor, which
-/// `default_*` setter, whether it is omittable (`Option<T>` / `Vec<T>`), and
-/// whether it is a `bool` (clap flag → implicit `false` default).
+/// What a field maps to on the `ParamDef` side.
 struct Classified {
     ctor: &'static str,
+    /// `default_*` setter name, or "" for list params (no scalar default).
     default_method: &'static str,
     optional: bool,
     is_bool: bool,
 }
 
-#[proc_macro_derive(DeploymentParams, attributes(param))]
-pub fn derive_deployment_params(input: TokenStream) -> TokenStream {
+/// Parsed `#[param(...)]` helper attribute.
+#[derive(Default)]
+struct ParamAttr {
+    skip: bool,
+    force_string: bool,
+    cache_key: bool,
+    default: Option<Lit>,
+    choices: Option<Expr>,
+}
+
+// ── struct derive → `PARAMS` ────────────────────────────────────────────────
+
+#[proc_macro_derive(ParamStruct, attributes(param))]
+pub fn derive_param_struct(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
 
     let fields = match &input.data {
         Data::Struct(s) => match &s.fields {
             Fields::Named(named) => &named.named,
-            Fields::Unnamed(_) | Fields::Unit => {
-                return err(name, "DeploymentParams needs a struct with named fields");
-            }
+            _ => return err(name, "ParamStruct needs a struct with named fields"),
         },
-        Data::Enum(_) | Data::Union(_) => {
-            return err(name, "DeploymentParams can only be derived on structs");
-        }
+        _ => return err(name, "ParamStruct can only be derived on structs"),
     };
 
-    let mut defs = Vec::new();
-    let mut flatten_tys: Vec<&Type> = Vec::new();
-    let mut errors: Vec<syn::Error> = Vec::new();
+    let mut errors = Vec::new();
+    let defs = param_defs(fields.iter(), &mut errors);
+    if let Some(e) = combine(errors) {
+        return e.to_compile_error().into();
+    }
 
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    quote! {
+        impl #impl_generics #name #ty_generics #where_clause {
+            pub const PARAMS: &'static [::simulator::schema::ParamDef] = &[ #( #defs ),* ];
+        }
+    }
+    .into()
+}
+
+// ── enum derive → `SCHEMA` ──────────────────────────────────────────────────
+
+#[proc_macro_derive(ProviderSchema, attributes(param))]
+pub fn derive_provider_schema(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+
+    let variants = match &input.data {
+        Data::Enum(e) => &e.variants,
+        _ => return err(name, "ProviderSchema can only be derived on enums"),
+    };
+
+    let mut errors = Vec::new();
+    let mut rows = Vec::new();
+    for v in variants {
+        let tag = snake_case(&v.ident.to_string());
+        let fields = match &v.fields {
+            Fields::Named(named) => named.named.iter().collect::<Vec<_>>(),
+            Fields::Unit => Vec::new(),
+            Fields::Unnamed(_) => {
+                errors.push(syn::Error::new(
+                    v.span(),
+                    "ProviderSchema needs struct-like or unit variants",
+                ));
+                continue;
+            }
+        };
+        let defs = param_defs(fields.into_iter(), &mut errors);
+        rows.push(quote! { ( #tag, &[ #( #defs ),* ] ) });
+    }
+    if let Some(e) = combine(errors) {
+        return e.to_compile_error().into();
+    }
+
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    quote! {
+        impl #impl_generics #name #ty_generics #where_clause {
+            pub const SCHEMA: &'static [(&'static str, &'static [::simulator::schema::ParamDef])] =
+                &[ #( #rows ),* ];
+        }
+    }
+    .into()
+}
+
+// ── shared: one field → a `ParamDef` builder chain ──────────────────────────
+
+fn param_defs<'a>(
+    fields: impl Iterator<Item = &'a Field>,
+    errors: &mut Vec<syn::Error>,
+) -> Vec<proc_macro2::TokenStream> {
+    let mut defs = Vec::new();
     for f in fields {
-        if is_flatten(&f.attrs) {
-            flatten_tys.push(&f.ty);
+        if is_serde_flatten(&f.attrs) {
             continue;
         }
-        let field = f.ident.as_ref().expect("named fields enforced above");
-        let name_str = field.to_string();
-
-        let cls = match classify(&f.ty) {
-            Ok(c) => c,
+        let attr = match parse_param_attr(&f.attrs) {
+            Ok(a) => a,
             Err(e) => {
                 errors.push(e);
                 continue;
             }
         };
-        let desc = doc_string(&f.attrs);
-        let default = arg_default(&f.attrs);
-        let (cache_key, choices) = param_meta(&f.attrs);
+        if attr.skip {
+            continue;
+        }
+        let field = f.ident.as_ref().expect("named fields enforced by callers");
+        let name_str = field.to_string();
 
-        let ctor = format_ident!("{}", cls.ctor);
+        // `#[param(string)]` overrides type inference (the Rust field is a
+        // foreign enum but the schema treats it as a `string` with `choices`).
+        let cls = if attr.force_string {
+            Classified {
+                ctor: "string",
+                default_method: "default_string",
+                optional: false,
+                is_bool: false,
+            }
+        } else {
+            match classify(&f.ty) {
+                Ok(c) => c,
+                Err(e) => {
+                    errors.push(e);
+                    continue;
+                }
+            }
+        };
+
+        let ctor = syn::Ident::new(cls.ctor, f.span());
         let mut chain = quote! { ::simulator::schema::ParamDef::#ctor(#name_str) };
 
-        if let Some(lit) = default {
+        if let Some(lit) = attr.default {
             if cls.default_method.is_empty() {
                 errors.push(syn::Error::new(
                     f.ty.span(),
-                    "DeploymentParams: list params cannot carry a scalar default",
+                    "param: a list param cannot carry a scalar default",
                 ));
                 continue;
             }
-            let setter = format_ident!("{}", cls.default_method);
+            let setter = syn::Ident::new(cls.default_method, f.span());
             chain = quote! { #chain.#setter(#lit) };
-        } else if cls.is_bool && !cls.optional {
-            // A clap `bool` is a flag: present => true, absent => false. clap
-            // carries no `default_value_t`, so inject the implicit false here
-            // (otherwise a defaultless bool would wrongly serialize as required).
+        } else if cls.is_bool {
+            // A bare `bool` flag is off when absent; serde carries no default, so
+            // inject the implicit `false` (else it would serialize as required).
             chain = quote! { #chain.default_bool(false) };
         } else if cls.optional {
             chain = quote! { #chain.optional() };
         }
-        if let Some(choices) = choices {
+        if let Some(choices) = attr.choices {
             chain = quote! { #chain.choices(&#choices) };
         }
-        if cache_key {
+        if attr.cache_key {
             chain = quote! { #chain.cache_key() };
         }
+        let desc = doc_string(&f.attrs);
         chain = quote! { #chain.desc(#desc) };
         defs.push(chain);
     }
-
-    if let Some(combined) = combine(errors) {
-        return combined.to_compile_error().into();
-    }
-
-    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-
-    // Flattened fragments contribute their `OWN_PARAMS`; this struct's own
-    // params follow as the final group (mirrors clap field order). Composing
-    // here lets a `Deployment` default `PARAM_GROUPS` to `Args::PARAM_GROUPS`
-    // rather than re-listing the fragments by hand.
-    let flatten_groups = flatten_tys.iter().map(|ty| quote! { #ty::OWN_PARAMS, });
-    let own_group = if defs.is_empty() {
-        quote! {}
-    } else {
-        quote! { Self::OWN_PARAMS, }
-    };
-
-    quote! {
-        impl #impl_generics #name #ty_generics #where_clause {
-            pub const OWN_PARAMS: &'static [::simulator::schema::ParamDef] = &[ #( #defs ),* ];
-        }
-
-        impl #impl_generics ::simulator::schema::ParamSchema for #name #ty_generics #where_clause {
-            const PARAM_GROUPS: &'static [&'static [::simulator::schema::ParamDef]] =
-                &[ #( #flatten_groups )* #own_group ];
-        }
-    }
-    .into()
+    defs
 }
 
 /// Map a field type to its `ParamDef` shape, unwrapping `Option<T>` / `Vec<T>`.
@@ -158,7 +224,7 @@ fn classify(ty: &Type) -> syn::Result<Classified> {
         return Ok(Classified {
             ctor: list_ctor(scalar_kind(inner)?, inner)?,
             default_method: "",
-            optional: true,
+            optional: false,
             is_bool: false,
         });
     }
@@ -176,9 +242,7 @@ fn classify_scalar(ty: &Type) -> syn::Result<Classified> {
 }
 
 fn scalar_kind(ty: &Type) -> syn::Result<Scalar> {
-    let ident = last_ident(ty).ok_or_else(|| {
-        syn::Error::new(ty.span(), "DeploymentParams: unsupported field type")
-    })?;
+    let ident = last_ident(ty).ok_or_else(|| syn::Error::new(ty.span(), "param: unsupported field type"))?;
     match ident.as_str() {
         "f32" | "f64" => Ok(Scalar::Float),
         "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128"
@@ -188,7 +252,7 @@ fn scalar_kind(ty: &Type) -> syn::Result<Scalar> {
         "PathBuf" => Ok(Scalar::Path),
         other => Err(syn::Error::new(
             ty.span(),
-            format!("DeploymentParams: unsupported field type `{other}`"),
+            format!("param: unsupported field type `{other}` (add `#[param(string)]` or `#[param(skip)]`)"),
         )),
     }
 }
@@ -221,7 +285,7 @@ fn list_ctor(s: Scalar, ty: &Type) -> syn::Result<&'static str> {
         Scalar::Path => Ok("path_list"),
         Scalar::Bool => Err(syn::Error::new(
             ty.span(),
-            "DeploymentParams: no bool_list ParamType (Vec<bool> unsupported)",
+            "param: no bool_list ParamType (Vec<bool> unsupported)",
         )),
     }
 }
@@ -248,8 +312,21 @@ fn generic_inner<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type> {
     }
 }
 
-/// Join `///` doc lines (each trimmed) into the `ParamDef` description, matching
-/// how clap derives `--help` from the same comments.
+/// serde `RenameRule::SnakeCase` for a PascalCase variant ident — insert `_`
+/// before each non-leading uppercase, lowercase everything (matches the wire tag
+/// produced by `#[serde(rename_all = "snake_case")]`).
+fn snake_case(ident: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in ident.char_indices() {
+        if i > 0 && ch.is_uppercase() {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Join `///` doc lines (each trimmed) into the `ParamDef` description.
 fn doc_string(attrs: &[Attribute]) -> String {
     let mut parts = Vec::new();
     for a in attrs {
@@ -268,54 +345,37 @@ fn doc_string(attrs: &[Attribute]) -> String {
     parts.join(" ")
 }
 
-/// Pull a literal default out of the existing `#[arg(... default_value[_t] = LIT)]`
-/// so the default is declared once (on the clap side) and reused here.
-fn arg_default(attrs: &[Attribute]) -> Option<Lit> {
-    for a in attrs {
-        if !a.path().is_ident("arg") {
-            continue;
-        }
-        let Ok(nested) = a.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated) else {
-            continue;
-        };
-        for m in nested {
-            if let Meta::NameValue(nv) = m {
-                if nv.path.is_ident("default_value_t") || nv.path.is_ident("default_value") {
-                    if let Expr::Lit(ExprLit { lit, .. }) = nv.value {
-                        return Some(lit);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Read the inert `#[param(...)]` helper: `(cache_key, choices_const_expr)`.
-fn param_meta(attrs: &[Attribute]) -> (bool, Option<Expr>) {
-    let mut cache_key = false;
-    let mut choices = None;
+/// Parse the inert `#[param(...)]` helper attribute(s) on a field.
+fn parse_param_attr(attrs: &[Attribute]) -> syn::Result<ParamAttr> {
+    let mut out = ParamAttr::default();
     for a in attrs {
         if !a.path().is_ident("param") {
             continue;
         }
-        let Ok(nested) = a.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated) else {
-            continue;
-        };
+        let nested = a.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
         for m in nested {
             match m {
-                Meta::Path(p) if p.is_ident("cache_key") => cache_key = true,
-                Meta::NameValue(nv) if nv.path.is_ident("choices") => choices = Some(nv.value),
-                _ => {}
+                Meta::Path(p) if p.is_ident("skip") => out.skip = true,
+                Meta::Path(p) if p.is_ident("string") => out.force_string = true,
+                Meta::Path(p) if p.is_ident("cache_key") => out.cache_key = true,
+                Meta::NameValue(nv) if nv.path.is_ident("default") => {
+                    if let Expr::Lit(ExprLit { lit, .. }) = nv.value {
+                        out.default = Some(lit);
+                    } else {
+                        return Err(syn::Error::new(nv.value.span(), "param: default must be a literal"));
+                    }
+                }
+                Meta::NameValue(nv) if nv.path.is_ident("choices") => out.choices = Some(nv.value),
+                other => return Err(syn::Error::new(other.span(), "param: unknown key")),
             }
         }
     }
-    (cache_key, choices)
+    Ok(out)
 }
 
-fn is_flatten(attrs: &[Attribute]) -> bool {
+fn is_serde_flatten(attrs: &[Attribute]) -> bool {
     for a in attrs {
-        if !(a.path().is_ident("command") || a.path().is_ident("clap")) {
+        if !a.path().is_ident("serde") {
             continue;
         }
         if let Ok(nested) = a.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated) {
@@ -336,6 +396,6 @@ fn combine(errors: Vec<syn::Error>) -> Option<syn::Error> {
     Some(first)
 }
 
-fn err(tokens: &impl quote::ToTokens, msg: &str) -> TokenStream {
+fn err(tokens: &impl ToTokens, msg: &str) -> TokenStream {
     syn::Error::new_spanned(tokens, msg).to_compile_error().into()
 }

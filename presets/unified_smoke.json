@@ -1,7 +1,0 @@
-{
-  "deployment": "unified",
-  "model_config": "model/config/llama3_8b.json",
-  "trace_files": ["trace/smoke.csv"],
-  "run_to_end": true,
-  "log_dir": "logs/unified_smoke"
-}

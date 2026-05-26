@@ -7,11 +7,13 @@
 
 pub mod common;
 pub mod impls;
+pub mod config;
 
 pub use self::common::{GpuInfo, GpuInventory, OrchAction, PoolEvent, UnifiedWorkerFactory};
 pub use impls::{
     DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, SimpleDpPoolController,
 };
+pub use config::{GroupSpec, PlacementPolicy, PoolSpec};
 
 use crate::common::{Request, Time};
 

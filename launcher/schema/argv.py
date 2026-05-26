@@ -1,41 +1,44 @@
-"""Concrete params → Rust binary argv (design §1.8.2).
+"""Concrete config tree → Rust binary argv (new-interface-design §13.1).
 
-The one place a preset becomes a command line, so skills / CLI / tests share
-the exact flag spelling and bool/list conventions (INV-1) instead of each
-rolling their own argv.
+Each run-like subcommand (`run` / `build-cache-only` / `dry-run`) takes a path
+to ONE structured config file. This module strips the launcher-internal keys,
+writes the concrete tree to `config_path` as block-style YAML, and returns
+`[binary, subcommand, config_path]` — the single place a preset becomes a command
+line, so skills / CLI / tests share the exact spelling (INV-1).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from .loader import CONTROL_KEYS
+import yaml
 
 
-def _cli_flag(name: str) -> str:
-    return "--" + name.replace("_", "-")
+def strip_internal(config: dict) -> dict:
+    """Drop launcher-internal `_`-prefixed keys (e.g. `_sweep_labels`, `_env`)
+    so only the pure config tree the Rust binary parses is written."""
+    return {k: v for k, v in config.items() if not k.startswith("_")}
+
+
+def write_config(config: dict, config_path: str | Path) -> Path:
+    """Write the stripped config tree to `config_path` as block-style YAML — one
+    param per line, no inline `{...}` flow maps. The binary's `load_config` reads
+    `.yaml` via serde_yaml (YAML is a JSON superset, so nothing is lost). Returns
+    the path."""
+    path = Path(config_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(strip_internal(config), default_flow_style=False, sort_keys=False)
+    )
+    return path
 
 
 def build_cli_command(
-    params: dict, binary: str | Path, subcommand: str = "run"
+    config: dict, binary: str | Path, config_path: str | Path, subcommand: str = "run"
 ) -> list[str]:
-    """Emit `[binary, <subcommand>, <deployment>, *flags]`. `subcommand` is
-    `"run"` for a sim or `"build-cache-only"` for the cache prebuild (both take
-    the same deployment + flags). Only schema params present in `params` are
-    emitted; bools are presence flags; list params repeat."""
-    deployment = params["deployment"]
-    argv: list[str] = [str(binary), subcommand, deployment]
-    for key, value in params.items():
-        if key in CONTROL_KEYS or key.startswith("_") or key == "deployment":
-            continue
-        if value is None:
-            continue
-        if isinstance(value, bool):
-            if value:
-                argv.append(_cli_flag(key))
-        elif isinstance(value, (list, tuple)):
-            for elem in value:
-                argv.extend([_cli_flag(key), str(elem)])
-        else:
-            argv.extend([_cli_flag(key), str(value)])
-    return argv
+    """Write `config` to `config_path` (block-style YAML) and emit `[binary,
+    subcommand, path]`. `subcommand` is `run` (sim), `build-cache-only` (cache
+    prebuild), or `dry-run` (coverage probe) — all take the same one-config-file
+    surface."""
+    path = write_config(config, config_path)
+    return [str(binary), subcommand, str(path)]

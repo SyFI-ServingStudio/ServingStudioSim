@@ -28,9 +28,8 @@ from .exec import (
     run_analysis,
     wrap_with_perf,
 )
-from .schema import build_cli_command, validate_unique_log_dirs
-from .schema.expand import _group_entries
-from .schema.loader import Schema
+from .schema import build_cli_command, log_dir_of, validate_unique_log_dirs
+from .schema.loader import Registry
 
 # Resume marker (INV-5): the launcher writes this into a run's log_dir only
 # after a zero-exit run. On the default resume path a run whose log_dir already
@@ -70,14 +69,17 @@ async def _launch_one(
     `analyze=True` runs the post-run analyzer (Rust compute → Python plots) after
     a successful run; best-effort, so analysis failures never fail the run.
     `analyze_subjects` narrows which subjects run (None/empty = all applicable)."""
-    log_dir = Path(str(params["log_dir"]))
+    log_dir = Path(log_dir_of(params))
 
     if not refresh and _is_complete(log_dir):
         print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
         return True
 
     binary = binary_path(build_type)
-    argv = build_cli_command(params, binary, subcommand="run")
+    # The concrete config the binary reads lives alongside the run's metadata.
+    argv = build_cli_command(
+        params, binary, metadata.raw_dir(log_dir) / "run_config.yaml", subcommand="run"
+    )
 
     # INV-2: all metadata lands before the subprocess starts (record the bare run
     # argv, before any perf wrapping, so metadata reflects the simulated run).
@@ -112,7 +114,7 @@ async def _launch_one(
 def run_single(
     params: dict,
     preset: dict | None,
-    schema: Schema,
+    schema: Registry,
     build_type: str = "debug",
     refresh: bool = False,
     profile: bool = False,
@@ -139,7 +141,7 @@ def run_single(
 async def _run_single_async(
     params: dict,
     preset: dict | None,
-    schema: Schema,
+    schema: Registry,
     build_type: str,
     refresh: bool = False,
     profile: bool = False,
@@ -147,7 +149,7 @@ async def _run_single_async(
     analyze: bool = True,
     analyze_subjects: list[str] | None = None,
 ) -> bool:
-    log_dir = Path(str(params["log_dir"]))
+    log_dir = Path(log_dir_of(params))
     if not refresh and _is_complete(log_dir):
         print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
         return True
@@ -165,7 +167,7 @@ async def _run_single_async(
 def run_sweep(
     param_sets: list[dict],
     original_preset: dict,
-    schema: Schema,
+    schema: Registry,
     build_type: str = "debug",
     parallelism: int = DEFAULT_PARALLELISM,
     refresh: bool = False,
@@ -191,7 +193,7 @@ def run_sweep(
 async def _run_sweep_async(
     param_sets: list[dict],
     original_preset: dict,
-    schema: Schema,
+    schema: Registry,
     build_type: str,
     parallelism: int,
     refresh: bool = False,
@@ -212,7 +214,7 @@ async def _run_sweep_async(
         pending = param_sets
     else:
         pending = [
-            p for p in param_sets if not _is_complete(Path(str(p["log_dir"])))
+            p for p in param_sets if not _is_complete(Path(log_dir_of(p)))
         ]
     skipped = len(param_sets) - len(pending)
     if skipped:
@@ -246,7 +248,7 @@ async def _run_sweep_async(
 
 def _experiment_root(param_sets: list[dict]) -> Path:
     """Common parent of all run log_dirs — the sweep base_dir."""
-    dirs = [Path(str(p["log_dir"])).resolve() for p in param_sets]
+    dirs = [Path(log_dir_of(p)).resolve() for p in param_sets]
     if not dirs:
         return Path("logs").resolve()
     common = dirs[0].parent
@@ -257,7 +259,7 @@ def _experiment_root(param_sets: list[dict]) -> Path:
     return common
 
 
-# ── aggregator contract (sweep axes + group hint) ───────────────────────────
+# ── aggregator contract (sweep axes) ────────────────────────────────────────
 
 
 def _axis_value_key(value):
@@ -265,65 +267,41 @@ def _axis_value_key(value):
     return tuple(value) if isinstance(value, list) else value
 
 
-# Params that vary per-run by construction but are not sweep axes.
-_NON_AXIS_PARAMS = frozenset({"log_dir"})
-
-
 def _sweep_axes(param_sets: list[dict]) -> list[str]:
-    """Params that take more than one distinct value across the runs — the sweep
-    axes. Mechanism-agnostic: list/dict sweeps, sweep_groups fields, and varying
-    `derived` results all surface here, because the expansion has already been
-    'compiled away' into a flat product. Constant params (and `log_dir`, which is
-    per-run-unique output location, not an axis) are excluded."""
+    """Sweep/derived/compound-group names that take more than one distinct value
+    across the runs — the sweep axes. Read from each run's resolved `_env` (the
+    bindings stashed by expansion), so list / dict sweeps, varying `derived`, and
+    `compound` groups all surface uniformly. Constant bindings are excluded.
+
+    `compound` *members* are folded out: a group's members co-vary, so the group
+    name (also in `_env`, valued by the row label) is the single axis — listing the
+    members as independent axes would imply a cross-product that does not exist."""
+    members: set[str] = set()
+    for p in param_sets:
+        members |= set(p.get("_compound_members", ()))
     keys: set[str] = set()
     for p in param_sets:
-        keys |= {k for k in p if not k.startswith("_") and k != "deployment"}
-    keys -= _NON_AXIS_PARAMS
+        keys |= set(p.get("_env", {}))
     axes = []
-    for k in sorted(keys):
-        if len({_axis_value_key(p.get(k)) for p in param_sets}) > 1:
+    for k in sorted(keys - members):
+        if len({_axis_value_key(p.get("_env", {}).get(k)) for p in param_sets}) > 1:
             axes.append(k)
     return axes
-
-
-def _group_map(original_preset: dict) -> dict[str, list[str]]:
-    """sweep_groups name → its zipped field names. Lets the aggregator treat
-    correlated columns (e.g. tp_size + head_parallel that always move together)
-    as a single composite axis instead of a mostly-empty grid."""
-    groups: dict[str, list[str]] = {}
-    for gname, entries in (original_preset.get("sweep_groups") or {}).items():
-        groups[gname] = sorted({f for _label, partial in _group_entries(entries) for f in partial})
-    return groups
 
 
 def _aggregate(param_sets: list[dict], base_dir: Path, original_preset: dict) -> None:
     """Best-effort sweep aggregation. The aggregator is analyzer-owned and may
     not be present yet; skip silently if unavailable (design §1.2.5).
 
-    Example payload after expansion:
+    Example payload after expansion (sweep coords come from each run's `_env`):
         run_infos = [
-            {
-                "log_dir": "/abs/logs/ep32/par_0/rr_lo",
-                "sweep": {
-                    "ep_size": 32,
-                    "tp_size": 1,
-                    "head_parallel": 1,
-                    "request_rate": 1.0,
-                },
-                "labels": {"par": "0", "request_rate": "lo"},
-            },
-            {
-                "log_dir": "/abs/logs/ep32/par_1/rr_hi",
-                "sweep": {
-                    "ep_size": 32,
-                    "tp_size": 2,
-                    "head_parallel": 2,
-                    "request_rate": 100.0,
-                },
-                "labels": {"par": "1", "request_rate": "hi"},
-            },
+            {"log_dir": "/abs/logs/tp2", "sweep": {"ptp": 2}, "labels": {}},
+            {"log_dir": "/abs/logs/tp4", "sweep": {"ptp": 4}, "labels": {}},
         ]
-        groups = {"par": ["head_parallel", "tp_size"]}
+    Independent `sweep` dims form a cartesian grid; correlated columns come from a
+    `compound` group (one named axis whose members co-vary) or a `derived` name
+    moving with its inputs — both surface as ordinary `_env` axes, so no separate
+    group-zip hint is needed in the structured interface.
     """
     try:
         from analyze_aggregator.aggregator import aggregate_sweep
@@ -336,14 +314,13 @@ def _aggregate(param_sets: list[dict], base_dir: Path, original_preset: dict) ->
     axes = _sweep_axes(param_sets)
     run_infos = [
         {
-            "log_dir": str(Path(str(p["log_dir"])).resolve()),
-            "sweep": {k: p.get(k) for k in axes},
+            "log_dir": str(Path(log_dir_of(p)).resolve()),
+            "sweep": {k: p.get("_env", {}).get(k) for k in axes},
             "labels": p.get("_sweep_labels", {}),
         }
         for p in param_sets
     ]
-    groups = _group_map(original_preset)
     try:
-        aggregate_sweep(run_infos, base_dir, groups=groups)
+        aggregate_sweep(run_infos, base_dir, groups={})
     except Exception as exc:  # aggregation failure must not fail the sweep
         print(f"[aggregate] skipped: {exc}")

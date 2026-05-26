@@ -1,28 +1,24 @@
 //! `simulator` binary entry — clap top-level CLI and subcommand dispatch.
 //!
-//! Per L7 design.md §1.8.2 the surface is three subcommands:
-//!   - `run <deployment> <flags>`            — run one sim
-//!   - `build-cache-only <deployment> <flags>` — prebuild profile.db, no sim
-//!   - `list-params`                          — emit schema JSON (§1.2.7)
+//! Surface (new-interface-design §13.1): each run-like subcommand takes a path
+//! to ONE structured config file (YAML/JSON), which the launcher writes:
+//!   - `run <config>`              — run one sim
+//!   - `build-cache-only <config>` — prebuild profile.db, no sim
+//!   - `dry-run <config>`          — report missing profile.db rows, no sim
+//!   - `list-params`               — emit the param-schema registry JSON
 //!
-//! Deployment selection is a nested clap subcommand (`DeploymentSel`), so flags
-//! are statically routed: `run unified --model-config ...`. clap rejects flags
-//! that the chosen deployment does not declare.
-//!
-//! `run` / `build-cache-only` parse fully (proving routing + validation) but
-//! exit non-zero with a "pending L7-β" message: the L6 `Flow` / L7-β tick
-//! driver that actually execute a sim are not implemented yet. `list-params`
-//! is fully functional today and is what the launcher depends on.
+//! All three run-like subcommands share one parse (`load_config`) → `RunConfig`
+//! (a serde enum tagged by `deployment`) → `deployment::build_flow` dispatch.
 
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use anyhow::Context;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use simulator::common::{RequestStore, SharedRequests};
-use simulator::deployment::unified::{UnifiedDeployment, UnifiedParams};
-use simulator::deployment::Deployment;
+use simulator::deployment::{build_flow, RunConfig};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
 use simulator::sim::{run_sim, TickCfg, TraceFrontend};
@@ -65,18 +61,25 @@ enum Cmd {
     KernelQuery,
 }
 
-/// Shared payload for `run` / `build-cache-only`: pick a deployment, then its
-/// flags. Adding a deployment = one `DeploymentSel` variant + one dispatch arm.
+/// Shared payload for `run` / `build-cache-only` / `dry-run`: a path to one
+/// structured config file. The `deployment` tag inside it picks the topology.
 #[derive(Args)]
 struct RunArgs {
-    #[command(subcommand)]
-    deployment: DeploymentSel,
+    /// Path to the structured run config (`.yaml` / `.yml` / `.json`).
+    config: PathBuf,
 }
 
-#[derive(Subcommand)]
-enum DeploymentSel {
-    /// Co-located worker running the whole model per iteration.
-    Unified(UnifiedParams),
+/// Parse a structured config file. YAML is a JSON superset, so `.json` uses the
+/// JSON parser (clearer errors) and everything else uses the YAML parser.
+fn load_config(path: &Path) -> Result<RunConfig> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading run config {}", path.display()))?;
+    let cfg = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        serde_json::from_str(&text).with_context(|| format!("parsing JSON config {}", path.display()))?
+    } else {
+        serde_yaml::from_str(&text).with_context(|| format!("parsing YAML config {}", path.display()))?
+    };
+    Ok(cfg)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -100,9 +103,9 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Run(args) => cmd_run(args.deployment),
-        Cmd::BuildCacheOnly(args) => cmd_build_cache(args.deployment),
-        Cmd::DryRun(args) => cmd_dry_run(args.deployment),
+        Cmd::Run(args) => cmd_run(&args.config),
+        Cmd::BuildCacheOnly(args) => cmd_build_cache(&args.config),
+        Cmd::DryRun(args) => cmd_dry_run(&args.config),
         Cmd::ListParams => {
             // serde_json::Value serializes infallibly; pretty for `list-params`.
             println!(
@@ -117,47 +120,47 @@ fn main() -> anyhow::Result<()> {
 
 /// `run` — strict bridge (JIT off → fail-fast on missing `profile.db` rows),
 /// build the deployment Flow, load the trace, drive the tick loop, log parquet.
-fn cmd_run(sel: DeploymentSel) -> anyhow::Result<()> {
+fn cmd_run(config: &Path) -> anyhow::Result<()> {
+    let cfg = load_config(config)?;
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
-    match sel {
-        DeploymentSel::Unified(p) => {
-            let mut flow = UnifiedDeployment::build(&p, &bridge, Rc::clone(&store))?;
-            let mut frontend = TraceFrontend::load(&p.workload.trace_files, p.workload.request_rate)?;
-            let mut logger = LoggerSession::open(&p.io.log_dir)?;
-            // Run-level GPU facts sidecar (L7): written before the tick loop so the
-            // analyzer can normalize per-GPU even if the run later fails.
-            simulator::log::write_run_meta(&p.io.log_dir, flow.inventory())?;
-            let cfg = TickCfg::new(p.workload.duration_ms, p.workload.run_to_end);
-            let summary = run_sim(flow.as_mut(), &store, &mut frontend, &mut logger, &cfg)?;
-            // run_sim emits the stats summary (completed/throughput/wall) to the
-            // log; persist the structured form as `<log_dir>/summary.json` for
-            // regression tests + the aggregator, then point at the parquet logs.
-            summary.write_json(&p.io.log_dir)?;
-            tracing::info!(
-                deployment = "unified",
-                cause = ?summary.cause,
-                log_dir = %p.io.log_dir.display(),
-                "run complete"
-            );
-        }
-    }
+
+    // Cheap fail-fast: load the trace + tick config before the expensive L4
+    // build, so a bad trace path errors without first running the cascade.
+    let workload = cfg.workload();
+    let mut frontend = TraceFrontend::load(&workload.trace_files, workload.request_rate)?;
+    let tick_cfg = TickCfg::new(workload.duration_ms, workload.run_to_end);
+
+    let mut flow = build_flow(&cfg, &bridge, Rc::clone(&store))?;
+
+    let log_dir = &cfg.io().log_dir;
+    let mut logger = LoggerSession::open(log_dir)?;
+    // Run-level GPU facts sidecar (L7): written before the tick loop so the
+    // analyzer can normalize per-GPU even if the run later fails.
+    simulator::log::write_run_meta(log_dir, flow.inventory())?;
+    let summary = run_sim(flow.as_mut(), &store, &mut frontend, &mut logger, &tick_cfg)?;
+    // run_sim emits the stats summary (completed/throughput/wall) to the log;
+    // persist the structured form as `<log_dir>/summary.json` for regression
+    // tests + the aggregator, then point at the parquet logs.
+    summary.write_json(log_dir)?;
+    tracing::info!(
+        cause = ?summary.cause,
+        log_dir = %log_dir.display(),
+        "run complete"
+    );
     Ok(())
 }
 
 /// `build-cache-only` — enable JIT profiling, run the L4 cascade so missing
 /// kernels are profiled into `profile.db`, then exit before the tick loop.
-fn cmd_build_cache(sel: DeploymentSel) -> anyhow::Result<()> {
+fn cmd_build_cache(config: &Path) -> anyhow::Result<()> {
+    let cfg = load_config(config)?;
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     bridge
         .enable_jit_profiling()
         .context("enabling JIT profiling for cache build")?;
     let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
-    match sel {
-        DeploymentSel::Unified(p) => {
-            let _flow = UnifiedDeployment::build(&p, &bridge, store)?;
-        }
-    }
+    let _flow = build_flow(&cfg, &bridge, store)?;
     tracing::info!("cache build complete: profile.db populated via JIT");
     Ok(())
 }
@@ -167,15 +170,12 @@ fn cmd_build_cache(sel: DeploymentSel) -> anyhow::Result<()> {
 /// how many of its specs are absent from `profile.db` (the JIT work a real cache
 /// build would do). Exits before the tick loop. JIT stays off so nothing is
 /// profiled — this is a read-only coverage probe.
-fn cmd_dry_run(sel: DeploymentSel) -> anyhow::Result<()> {
+fn cmd_dry_run(config: &Path) -> anyhow::Result<()> {
+    let cfg = load_config(config)?;
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     bridge.enable_dry_run();
     let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
-    match sel {
-        DeploymentSel::Unified(p) => {
-            let _flow = UnifiedDeployment::build(&p, &bridge, store)?;
-        }
-    }
+    let _flow = build_flow(&cfg, &bridge, store)?;
 
     let report = bridge.take_dry_run_report();
     let total_missing: usize = report.iter().map(|k| k.missing).sum();

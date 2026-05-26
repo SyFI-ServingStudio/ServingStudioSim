@@ -20,6 +20,10 @@ serde = { version = "1", features = ["derive", "rc"] }
 # `pool_fragments` block in declaration order (Model→Parallelism→Workload→Io),
 # which `list-params --human` prints verbatim as its group headings.
 serde_json = { version = "1", features = ["preserve_order"] }
+# Structured run-config input (YAML is a JSON superset → one loader path). Note:
+# serde_yaml is archived upstream but stable; it is the JSON-superset parser the
+# launcher writes configs for (new-interface-design §12.5).
+serde_yaml = "0.9"
 anyhow = "1"
 thiserror = "2"
 pyo3 = { version = "0.20", features = ["auto-initialize"] }
@@ -52,9 +56,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Input structs (see simulator/src/timing/kernels/engine.rs).
 timing-kernel-derive = { path = "simulator/timing-kernel-derive" }
 
-# In-tree proc-macro crate that powers `#[derive(DeploymentParams)]`, generating
-# a deployment's `ParamDef` schema slice from its clap `Args` struct so the CLI
-# surface and `list-params` schema cannot drift (design §1.8.3/§1.8.4).
+# In-tree proc-macro crate powering `#[derive(ParamStruct)]` / `#[derive(
+# ProviderSchema)]`, which generate the launcher `ParamDef` schema directly from
+# the config types so a field and its schema entry cannot drift (§11).
 schema-derive = { path = "simulator/schema-derive" }
 
 [features]

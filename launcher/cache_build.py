@@ -11,8 +11,9 @@ no-op of one prebuild.
 **Which params form the key is Rust-authoritative.** The set of
 kernel-determining params is L1 knowledge (only Rust knows which params flow
 into `*KernelInput` / profile.db lookup keys), so it is NOT hardcoded here:
-`cache_key` takes the field names the Rust schema tags with `affects_cache`
-(`DeploymentSchema.cache_key_fields`). When Rust adds a kernel-shaping param it
+`cache_key` walks the config tree and collects every leaf whose ParamDef the
+Rust schema tags with `affects_cache` (keyed by dotted path). When Rust adds a
+kernel-shaping param it
 tags it, and the launcher picks it up with no Python edit. See `param_def.rs`
 for the safe-direction rule (when unsure, tag it — over-tagging only costs extra
 prebuild passes; under-tagging reintroduces the contention bug).
@@ -21,39 +22,44 @@ prebuild passes; under-tagging reintroduces the contention bug).
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Iterable
 from pathlib import Path
 
 from .exec import SimulationRunner, _build_subprocess_env, binary_path
-from .schema import build_cli_command
-from .schema.loader import Schema
+from .schema import build_cli_command, log_dir_of
+from .schema.loader import Registry, iter_slots
 
 
-def cache_key(params: dict, cache_fields: Iterable[str]) -> tuple:
-    """The kernel-determining subset of `params`, hashable for de-duplication.
-    `cache_fields` comes from `DeploymentSchema.cache_key_fields` (Rust-tagged)."""
-    return tuple(params.get(field) for field in cache_fields)
+def cache_key(config: dict, registry: Registry) -> tuple:
+    """The kernel-determining subset of a config tree, hashable for dedup. Walks
+    the tree and collects every leaf whose ParamDef is tagged `affects_cache`
+    (Rust-authoritative), keyed by its dotted path so two configs that differ
+    only in non-kernel params (rate, replicas, log_dir, ...) collapse."""
+    items: list[tuple[str, object]] = []
+    for slot in iter_slots(registry, config):
+        if slot.pdef.get("affects_cache") and slot.present:
+            value = slot.value
+            if isinstance(value, list):
+                value = tuple(value)
+            items.append((".".join(slot.path), value))
+    return tuple(sorted(items))
 
 
-def _unique_by_cache_key(
-    param_sets: list[dict], schema: Schema
-) -> list[dict]:
-    """One representative param set per distinct cache key — the dedup shared by
-    the cache prebuild and the coverage report. Key fields are Rust-tagged
+def _unique_by_cache_key(param_sets: list[dict], registry: Registry) -> list[dict]:
+    """One representative config per distinct cache key — the dedup shared by the
+    cache prebuild and the coverage report. Key leaves are Rust-tagged
     (`affects_cache`), so runs differing only in non-kernel params collapse."""
     seen_keys: set[tuple] = set()
     representatives: list[dict] = []
-    for params in param_sets:
-        cache_fields = schema.deployment_schemas[params["deployment"]].cache_key_fields
-        key = cache_key(params, cache_fields)
+    for config in param_sets:
+        key = cache_key(config, registry)
         if key not in seen_keys:
             seen_keys.add(key)
-            representatives.append(params)
+            representatives.append(config)
     return representatives
 
 
 def report_cache_coverage(
-    param_sets: list[dict], schema: Schema, build_type: str = "debug"
+    param_sets: list[dict], registry: Registry, build_type: str = "debug"
 ) -> int:
     """Run the Rust `dry-run` subcommand once per unique cache key and stream its
     per-kernel missing-spec report to the console (no caches built, no sim run).
@@ -62,12 +68,20 @@ def report_cache_coverage(
     binary = binary_path(build_type)
     env = _build_subprocess_env()
     rc = 0
-    for params in _unique_by_cache_key(param_sets, schema):
-        argv = build_cli_command(params, binary, subcommand="dry-run")
+    for config in _unique_by_cache_key(param_sets, registry):
+        cfg_dir = _prebuild_log_dir(_cache_report_base(param_sets), config)
+        argv = build_cli_command(
+            config, binary, cfg_dir / "run_config.yaml", subcommand="dry-run"
+        )
         result = subprocess.run(argv, env=env)
         if result.returncode != 0:
             rc = result.returncode
     return rc
+
+
+def _cache_report_base(param_sets: list[dict]) -> Path:
+    first = Path(log_dir_of(param_sets[0])) if param_sets else Path("logs")
+    return first.parent
 
 
 def _prebuild_log_dir(base_dir: Path, params: dict) -> Path:
@@ -78,7 +92,7 @@ def _prebuild_log_dir(base_dir: Path, params: dict) -> Path:
     under `base_dir` while staying unique per run (sweep log_dirs are unique by
     INV) and not colliding with the real run output. `base_dir` is the run's
     log_dir for a single run and the sweep's `_experiment_root` for a sweep."""
-    log_dir = Path(str(params.get("log_dir", "logs")))
+    log_dir = Path(log_dir_of(params))
     try:
         rel = log_dir.resolve().relative_to(base_dir.resolve())
         label = "_".join(rel.parts)
@@ -90,12 +104,12 @@ def _prebuild_log_dir(base_dir: Path, params: dict) -> Path:
 
 async def prebuild_caches(
     param_sets: list[dict],
-    schema: Schema,
+    registry: Registry,
     build_type: str = "debug",
     base_dir: Path | None = None,
 ) -> bool:
     """Run one `build-cache-only` per unique cache key, sequentially. Returns
-    True iff every prebuild succeeded. The key fields come from the Rust schema
+    True iff every prebuild succeeded. The key leaves come from the Rust schema
     (`affects_cache`), so two runs differing only in non-kernel params (rate,
     server count, log_dir, ...) share a single prebuild.
 
@@ -104,16 +118,17 @@ async def prebuild_caches(
     sweep's `_experiment_root`. If omitted it falls back to the parent of the
     first param set's log_dir."""
     if base_dir is None:
-        first = Path(str(param_sets[0].get("log_dir", "logs"))) if param_sets else Path("logs")
+        first = Path(log_dir_of(param_sets[0])) if param_sets else Path("logs")
         base_dir = first.parent
     binary = binary_path(build_type)
     env = _build_subprocess_env()
 
-    for params in _unique_by_cache_key(param_sets, schema):
-        argv = build_cli_command(params, binary, subcommand="build-cache-only")
-        runner = SimulationRunner(
-            argv=argv, log_dir=_prebuild_log_dir(base_dir, params), env=env
+    for config in _unique_by_cache_key(param_sets, registry):
+        cfg_dir = _prebuild_log_dir(base_dir, config)
+        argv = build_cli_command(
+            config, binary, cfg_dir / "run_config.yaml", subcommand="build-cache-only"
         )
+        runner = SimulationRunner(argv=argv, log_dir=cfg_dir, env=env)
         if not await runner.run():
             return False
     return True

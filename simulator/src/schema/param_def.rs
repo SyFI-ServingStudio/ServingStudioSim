@@ -87,20 +87,6 @@ impl Serialize for DefaultValue {
     }
 }
 
-/// Pool fragment that a `ParamDef` originated from. Code-organization tag
-/// only — not part of the launcher wire format, so it is `#[serde(skip)]`-able
-/// at the `ParamDef` level (no field added yet; introduced for downstream
-/// `list-params --human` grouping and validators).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ParamSection {
-    ModelCommon,
-    ParallelismCommon,
-    WorkloadCommon,
-    IoCommon,
-    DeploymentOwn,
-}
-
 /// Single CLI parameter declaration, immutable and `const`-constructible.
 ///
 /// Builder methods return `Self` so deployment files can write
@@ -252,13 +238,4 @@ impl ParamDef {
     pub const fn is_required(&self) -> bool {
         self.default.is_none() && !self.optional
     }
-}
-
-/// Compile-time schema composition for a clap `Args` struct: the ordered
-/// `ParamDef` groups — each `#[command(flatten)]` fragment's `OWN_PARAMS`
-/// followed by the struct's own params — that `#[derive(DeploymentParams)]`
-/// assembles. A `Deployment`'s `PARAM_GROUPS` defaults to its `Args`' value
-/// here, so deployments never re-list their fragments by hand.
-pub trait ParamSchema {
-    const PARAM_GROUPS: &'static [&'static [ParamDef]];
 }

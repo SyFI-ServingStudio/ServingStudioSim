@@ -10,6 +10,7 @@ passed. No `--web` / `--tui` / `--gui` (UI deleted per discussion.md).
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from pathlib import Path
@@ -18,10 +19,66 @@ from .schema import (
     _format_log_dir,
     expand_sweep_params,
     normalize_params,
+    strip_internal,
+    validate_distinct_configs,
+    validate_expanded,
     validate_params,
     validate_unique_log_dirs,
 )
-from .schema.loader import SchemaNotFound, load_schema
+from .schema.loader import Registry, SchemaNotFound, load_schema, schema_path
+
+
+class PresetError(ValueError):
+    """A preset file is malformed (bad root type, duplicate keys, parse error)."""
+
+
+def _reject_duplicate_pairs(pairs: list[tuple]) -> dict:
+    """`object_pairs_hook` / mapping builder that rejects duplicate keys instead of
+    silently keeping the last (both `json` and PyYAML default to last-wins)."""
+    out: dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise PresetError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
+def _load_preset(path: Path) -> dict:
+    """Read a preset file into a mapping. `.json` uses the JSON parser; everything
+    else (`.yaml` / `.yml`) uses YAML (a JSON superset), matching the Rust binary.
+    Strict: duplicate keys are rejected (not last-wins) and the root must be a
+    mapping. Raises `PresetError` on any of these."""
+    text = path.read_text()
+    if path.suffix == ".json":
+        try:
+            data = json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
+        except json.JSONDecodeError as exc:
+            raise PresetError(str(exc)) from exc
+    else:
+        import yaml
+
+        class _StrictLoader(yaml.SafeLoader):
+            pass
+
+        _StrictLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            lambda loader, node: _reject_duplicate_pairs(
+                [
+                    (loader.construct_object(k), loader.construct_object(v))
+                    for k, v in node.value
+                ]
+            ),
+        )
+        try:
+            data = yaml.load(text, Loader=_StrictLoader)
+        except yaml.YAMLError as exc:
+            raise PresetError(str(exc)) from exc
+
+    if not isinstance(data, dict):
+        raise PresetError(
+            f"top-level must be a mapping, got {type(data).__name__}"
+        )
+    return data
 
 
 def _build_argparse():
@@ -91,62 +148,213 @@ def _build_argparse():
     return parser
 
 
+def _set_path(tree: dict, dotted: str, value) -> None:
+    """Set `value` at a dotted path into the config tree, e.g.
+    `io.log_dir`, `pools.main.groups.0.arch.tp_size`. Integer segments index
+    into lists; everything else into dicts (auto-vivifying missing dicts)."""
+    parts = dotted.split(".")
+    node = tree
+    for part in parts[:-1]:
+        if isinstance(node, list):
+            node = node[int(part)]
+        else:
+            node = node.setdefault(part, {})
+    last = parts[-1]
+    if isinstance(node, list):
+        node[int(last)] = value
+    else:
+        node[last] = value
+
+
 def _apply_overrides(preset: dict, overrides: list[str]) -> dict:
-    """Apply `--override key=value`. Values are parsed as JSON when possible so
-    `tp_size=4`→int, `request_rate=2.5`→float, `fp8=true`/`false`→bool,
-    `null`→None, `[1,2]`→list; anything that is not valid JSON (e.g.
-    `cp_plan=ring`, `model_config=model/x.json`) stays a bare string."""
-    out = dict(preset)
+    """Apply `--override path=value` into the config tree. The path is dotted
+    (`io.log_dir`, `pools.main.groups.0.arch.tp_size`); values are parsed as JSON
+    when possible (`tp_size=4`→int, `fp8=true`→bool, `[1,2]`→list) and otherwise
+    kept as a bare string (`model_config=model/x.json`)."""
+    out = copy.deepcopy(preset)
     for item in overrides:
         if "=" not in item:
-            sys.exit(f"bad --override {item!r}; expected key=value")
+            sys.exit(f"bad --override {item!r}; expected path=value")
         key, _, raw = item.partition("=")
         try:
             value = json.loads(raw)
         except json.JSONDecodeError:
             value = raw  # bare string
-        out[key.strip()] = value
+        _set_path(out, key.strip(), value)
     return out
 
 
-def _format_param_row(param_name: str, pdef: dict) -> str:
+def _params_line(pdef: dict) -> str:
     tag = "required" if pdef.get("required") else f"default={pdef.get('default')!r}"
-    return f"    {param_name:<30} {pdef['type']:<10} {tag:<22} {pdef.get('description', '')}"
+    cache = " [cache-key]" if pdef.get("affects_cache") else ""
+    return f"{pdef['name']:<22} {pdef['type']:<10} {tag:<20}{cache}  {pdef.get('description', '')}"
 
 
-def _print_params_table(schema, human: bool) -> None:
+def _print_params_table(registry: Registry, human: bool, build_type: str) -> None:
     if not human:
-        # Raw JSON dump mirrors `simulator list-params`.
-        schema_doc = {
-            "deployment_schemas": {
-                name: list(dep_schema.params.values())
-                for name, dep_schema in schema.deployment_schemas.items()
-            },
-            "pool_fragments": schema.pool_fragments,
-        }
-        print(json.dumps(schema_doc, indent=2))
+        # Raw JSON dump mirrors `simulator list-params` (re-read the file the
+        # build wrote rather than reconstruct it from the parsed Registry).
+        print(schema_path(build_type).read_text().rstrip())
         return
 
-    # --human: group each deployment's params under their source pool fragment
-    # (declaration order from `schema.pool_fragments`), with deployment-own
-    # params last. pool_fragments is display-only (INV-7); the authoritative set
-    # is still `dep_schema.params`, so we only display names that appear there.
-    for name, dep_schema in schema.deployment_schemas.items():
-        print(f"\n== {name} ==")
-        grouped: set[str] = set()
-        for fragment_name, member_names in schema.pool_fragments.items():
-            rows = [pn for pn in member_names if pn in dep_schema.params]
-            if not rows:
-                continue
-            print(f"  [{fragment_name}]")
-            for param_name in rows:
-                print(_format_param_row(param_name, dep_schema.params[param_name]))
-                grouped.add(param_name)
-        own = [pn for pn in dep_schema.params if pn not in grouped]
-        if own:
-            print(f"  [{name}-own]")
-            for param_name in own:
-                print(_format_param_row(param_name, dep_schema.params[param_name]))
+    print("== deployments (role → contract class) ==")
+    for dep, body in registry.deployments.items():
+        roles = ", ".join(f"{r}→{c}" for r, c in body["pools"].items())
+        print(f"  {dep:<10} {roles}")
+
+    for kind, providers in (
+        ("arch", registry.arch_providers),
+        ("worker", registry.worker_providers),
+    ):
+        print(f"\n== {kind} providers ==")
+        for contract, tags in providers.items():
+            print(f"  [{contract}]")
+            for tag, body in tags.items():
+                params = body.get("params", [])
+                names = ", ".join(p["name"] for p in params) or "(no params)"
+                print(f"    {tag:<20} {names}")
+
+    for title, params in (
+        ("arch_common (carried by every arch tag)", registry.arch_common),
+        ("group_common (carried by every group)", registry.group_common),
+        ("pool_common (carried by every pool)", registry.pool_common),
+        ("common.workload", registry.workload_common),
+        ("common.io", registry.io_common),
+    ):
+        print(f"\n== {title} ==")
+        for pdef in params:
+            print(f"  {_params_line(pdef)}")
+
+
+def _expand_preset(
+    preset: dict,
+    schema: Registry,
+    source: str,
+    *,
+    axis: str | None = None,
+    label: str | None = None,
+) -> list[dict] | None:
+    """Validate + expand ONE config preset into normalized, log_dir-templated
+    candidates. Returns the candidate list, or `None` if the preset is invalid
+    (errors already printed). When `axis`/`label` are given (a `variants` manifest
+    branch), tag each run's `_env` with `{axis: label}` so the file becomes a named
+    aggregation axis, and prefix its `log_dir` with the label so cross-file runs
+    never collide."""
+    errors = validate_params(preset, schema)
+    if errors:
+        for error in errors:
+            print(f"[invalid] {source}: {error}", file=sys.stderr)
+        return None
+
+    candidates: list[dict] = []
+    for candidate in expand_sweep_params(preset, schema):
+        # Post-expansion gate: placeholders are now concrete, so the deferred
+        # type/choice checks run for real BEFORE normalize coerces.
+        post_errors = validate_expanded(candidate, schema)
+        if post_errors:
+            for error in post_errors:
+                print(f"[invalid] {source}: {error}", file=sys.stderr)
+            return None
+        if axis is not None:
+            env = candidate.setdefault("_env", {})
+            if axis in env:
+                # The manifest's file axis would overwrite an inner sweep/compound/
+                # derived binding of the same name, corrupting _env + log_dir.
+                print(
+                    f"[invalid] {source}: variants axis {axis!r} collides with a "
+                    "sweep/compound/derived name in this preset; rename the manifest "
+                    "axis so the file axis stays distinct",
+                    file=sys.stderr,
+                )
+                return None
+            env[axis] = label
+        cand = _format_log_dir(normalize_params(candidate, schema))
+        if axis is not None:
+            cand["io"]["log_dir"] = f"{label}/{cand['io']['log_dir']}"
+        candidates.append(cand)
+    return candidates
+
+
+def _expand_manifest(
+    manifest: dict, schema: Registry, source: str, overrides: list[str]
+) -> list[dict] | None:
+    """Expand a `variants` manifest (no `deployment:`, one named file axis) into
+    the union of its referenced presets' candidates. Strictly ONE axis; each label
+    maps to a complete standalone preset run with that label tagged on its file
+    axis. Returns the merged candidates or `None` if anything is invalid."""
+    # Strict parse: a manifest is `variants` plus launcher-only keys; reject extras
+    # so a typo (e.g. a stray `sweep:`) is an error, not a silent no-op.
+    extra = set(manifest) - {"variants", "analyze_subjects"}
+    if extra:
+        print(
+            f"[invalid] {source}: unknown manifest key(s) {sorted(extra)}; a "
+            "`variants` manifest allows only 'variants' (+ launcher-only "
+            "'analyze_subjects')",
+            file=sys.stderr,
+        )
+        return None
+    variants = manifest["variants"]
+    if not isinstance(variants, dict) or len(variants) != 1:
+        got = len(variants) if isinstance(variants, dict) else type(variants).__name__
+        print(
+            f"[invalid] {source}: `variants` must declare exactly one file axis "
+            f"(got {got}); split further structure into separate manifests",
+            file=sys.stderr,
+        )
+        return None
+    (axis, branches), = variants.items()
+    if not (isinstance(axis, str) and axis.isidentifier()):
+        print(
+            f"[invalid] {source}: variants axis name {axis!r} must be a string "
+            "identifier (it becomes an aggregation axis / `_env` key)",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(branches, dict) or not branches:
+        print(
+            f"[invalid] {source}: variants axis {axis!r} must be a non-empty mapping "
+            "of {label: preset_path}",
+            file=sys.stderr,
+        )
+        return None
+
+    merged: list[dict] = []
+    for label, ref_path in branches.items():
+        if not (isinstance(label, str) and label and "/" not in label
+                and label not in (".", "..")):
+            print(
+                f"[invalid] {source}: variants.{axis} label {label!r} must be a "
+                "non-empty path-safe string (it prefixes each run's log_dir)",
+                file=sys.stderr,
+            )
+            return None
+        if not isinstance(ref_path, str):
+            print(
+                f"[invalid] {source}: variants.{axis}.{label} must be a preset path "
+                f"string, got {type(ref_path).__name__}",
+                file=sys.stderr,
+            )
+            return None
+        path = Path(ref_path)
+        if not path.is_absolute():
+            path = Path(source).parent / path  # resolve relative to the manifest
+        if not path.is_file():
+            print(
+                f"[invalid] {source}: variants.{axis}.{label} -> {ref_path!r} not found",
+                file=sys.stderr,
+            )
+            return None
+        try:
+            ref = _apply_overrides(_load_preset(path), overrides)
+        except PresetError as exc:
+            print(f"[invalid] {source}: variants.{axis}.{label} -> {exc}", file=sys.stderr)
+            return None
+        ref.pop("analyze_subjects", None)  # manifest-level only; ref-level ignored
+        cands = _expand_preset(ref, schema, ref_path, axis=axis, label=str(label))
+        if cands is None:
+            return None
+        merged.extend(cands)
+    return merged
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -162,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
             schema = load_schema(build_type)
         except SchemaNotFound as exc:
             sys.exit(str(exc))
-        _print_params_table(schema, human)
+        _print_params_table(schema, human, build_type)
         return 0
 
     args = _build_argparse().parse_args(argv)
@@ -188,30 +396,46 @@ def main(argv: list[str] | None = None) -> int:
     last_preset: dict = {}
     analyze_subjects: list[str] | None = None
     for preset_path in args.presets:
-        preset = json.loads(Path(preset_path).read_text())
+        try:
+            preset = _load_preset(Path(preset_path))
+        except PresetError as exc:
+            print(f"[invalid] {preset_path}: {exc}", file=sys.stderr)
+            return 2
         preset = _apply_overrides(preset, args.override)
         # `analyze_subjects` is a launcher-only key (which post-run analyzer
         # subjects to render). Pop it BEFORE schema validation / sweep expansion
         # so it never reaches the simulator CLI; omit = all applicable subjects.
         subjects = preset.pop("analyze_subjects", None)
         if subjects is not None:
+            if not (isinstance(subjects, list) and all(isinstance(s, str) for s in subjects)):
+                print(
+                    f"[invalid] {preset_path}: analyze_subjects must be a list of "
+                    f"strings, got {subjects!r}",
+                    file=sys.stderr,
+                )
+                return 2
             analyze_subjects = subjects
         last_preset = preset
 
-        errors = validate_params(preset, schema)
-        if errors:
-            for error in errors:
-                print(f"[invalid] {preset_path}: {error}", file=sys.stderr)
+        # A `variants` manifest (no `deployment:`) selects among whole preset files
+        # along one named axis; otherwise it is an ordinary config preset.
+        if "variants" in preset and "deployment" not in preset:
+            cands = _expand_manifest(preset, schema, preset_path, args.override)
+        else:
+            cands = _expand_preset(preset, schema, preset_path)
+        if cands is None:
             return 2
-
-        candidates = [
-            _format_log_dir(normalize_params(candidate, schema))
-            for candidate in expand_sweep_params(preset, schema)
-        ]
-        all_candidates.extend(candidates)
+        all_candidates.extend(cands)
 
     print(f"[plan] {len(all_candidates)} run(s) across {len(args.presets)} preset(s)")
+    if not all_candidates:
+        sys.exit(
+            "no runs after expansion — an empty sweep dim or constraints that reject "
+            "every combination"
+        )
     if not validate_unique_log_dirs(all_candidates):
+        return 2
+    if not validate_distinct_configs(all_candidates):
         return 2
 
     # --profile records one representative run; perf on a parallel sweep is
@@ -224,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         for candidate in all_candidates:
-            print(json.dumps({k: v for k, v in candidate.items() if not k.startswith("_")}))
+            print(json.dumps(strip_internal(candidate), default=str))
         return 0
 
     if args.cache_report:

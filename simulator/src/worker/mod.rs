@@ -5,9 +5,11 @@
 //! admission primitives (§2).
 
 pub mod admission_helpers;
+pub mod config;
 pub mod unified;
 
 pub use admission_helpers::{Batch, DecodeReqState, KvAdmission, KvPool, LoadBalance};
+pub use config::{AttnWorkerSel, BatchPolicy, FfnWorkerSel, IterWorkerSel};
 pub use unified::{
     BareboneWorker, BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState,
     WorkerMsg, WorkerStatus,

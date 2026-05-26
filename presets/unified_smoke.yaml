@@ -1,0 +1,20 @@
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/smoke.csv
+  run_to_end: true
+
+io:
+  log_dir: logs/unified_smoke
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: llama3_dense
+          model_config: model/config/llama3_8b.json
+        worker:
+          type: barebone
