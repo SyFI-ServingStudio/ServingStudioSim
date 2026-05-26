@@ -95,7 +95,7 @@ impl RunSummary {
     }
 }
 
-/// Tick-loop knobs. Defaults mirror ref/moesim-rs's unified loop: `tick_dt` 1 ms,
+/// Tick-loop knobs. Defaults mirror ref/moesim-rs's unified loop: `tick_dt` 100 µs,
 /// `snapshot_dt` (the `request_state` cadence) 100 s, `stuck_threshold` 60 s of
 /// no progress. (Ref's tick_dt is 1 µs — see note in `new`.)
 #[derive(Clone, Copy, Debug)]
