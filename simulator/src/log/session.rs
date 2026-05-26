@@ -8,7 +8,7 @@
 //! Shape follows `ref/moesim-rs/src/logging/mod.rs`; the threading is ours.
 
 use std::path::Path;
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Result};
@@ -49,8 +49,10 @@ pub struct LoggerSession {
 impl LoggerSession {
     /// Open writers under `<log_dir>/raw/{request_state,request_slo}.parquet`
     /// and spawn the background writer thread. Files are created lazily on the
-    /// first row (an empty stream writes nothing).
-    pub fn open(log_dir: &Path) -> Result<Self> {
+    /// first row (an empty stream writes nothing). `log_token_times` controls
+    /// whether the per-token `output_token_times` array column is materialized
+    /// (the derived SLO scalars are written either way).
+    pub fn open(log_dir: &Path, log_token_times: bool) -> Result<Self> {
         let raw = log_dir.join("raw");
         let mut state_writer =
             StreamingParquetWriter::new(raw.join("request_state.parquet"), request_state_schema());
@@ -66,7 +68,9 @@ impl LoggerSession {
                 for msg in rx {
                     match msg {
                         LogMsg::State(buf) => state_writer.write(&state_to_record_batch(&buf)?)?,
-                        LogMsg::Slo(buf) => slo_writer.write(&slo_to_record_batch(&buf)?)?,
+                        LogMsg::Slo(buf) => {
+                            slo_writer.write(&slo_to_record_batch(&buf, log_token_times)?)?
+                        }
                     };
                 }
                 state_writer.close()?;
@@ -117,14 +121,34 @@ impl LoggerSession {
 
     /// Hand a chunk to the writer thread. A send error means the writer died;
     /// surface its real error by joining rather than the generic disconnect.
+    /// `try_send` first so a full channel (writer behind) warns about
+    /// backpressure before falling back to the blocking `send` that stalls the
+    /// sim thread until the writer drains a slot.
     fn send(&mut self, msg: LogMsg) -> Result<()> {
-        match self.tx.as_ref().expect("tx present until flush_all").send(msg) {
+        let tx = self.tx.as_ref().expect("tx present until flush_all");
+        let msg = match tx.try_send(msg) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(msg)) => {
+                tracing::warn!(
+                    "logger channel full ({CHANNEL_CAP} chunks in flight): sim thread \
+                     blocking on writer backpressure"
+                );
+                msg
+            }
+            Err(TrySendError::Disconnected(_)) => return Err(self.writer_died()),
+        };
+        match self.tx.as_ref().expect("tx present").send(msg) {
             Ok(()) => Ok(()),
-            Err(_) => Err(self
-                .join_writer()
-                .err()
-                .unwrap_or_else(|| anyhow!("logger writer thread disconnected"))),
+            Err(_) => Err(self.writer_died()),
         }
+    }
+
+    /// The writer thread dropped its `rx`: join to surface its real error
+    /// instead of the generic "disconnected".
+    fn writer_died(&mut self) -> anyhow::Error {
+        self.join_writer()
+            .err()
+            .unwrap_or_else(|| anyhow!("logger writer thread disconnected"))
     }
 
     /// Drop the sender (ends the writer's `recv` loop) and join, returning the
@@ -180,7 +204,7 @@ mod tests {
     fn logger_session_writes_both_parquets() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut log = LoggerSession::open(dir.path()).unwrap();
+            let mut log = LoggerSession::open(dir.path(), true).unwrap();
             log.record_request_slo(slo_entry(0, vec![1.0, 2.0])).unwrap();
             log.flush_all().unwrap();
         }

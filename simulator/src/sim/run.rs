@@ -33,19 +33,27 @@ const WATCHDOG_SAMPLE_MS: f64 = 100_000.0;
 /// Firing on the first call gives the dense snapshot a t=0 baseline row.
 struct EveryN {
     period: u64,
-    count: u64,
+    /// Ticks remaining until the next fire. Starts at 0 so the first call fires
+    /// (the t=0 baseline). A countdown decrement avoids the per-tick integer
+    /// `div` that `count % period` compiled to — at 100 µs ticks that modulo ran
+    /// hundreds of millions of times and dominated the loop's self-time.
+    countdown: u64,
 }
 
 impl EveryN {
     fn new(period: u64) -> Self {
         debug_assert!(period > 0, "EveryN period must be > 0");
-        Self { period, count: 0 }
+        Self { period, countdown: 0 }
     }
 
     fn fire(&mut self) -> bool {
-        let fires = self.count % self.period == 0;
-        self.count += 1;
-        fires
+        if self.countdown == 0 {
+            self.countdown = self.period - 1;
+            true
+        } else {
+            self.countdown -= 1;
+            false
+        }
     }
 }
 
@@ -80,6 +88,12 @@ pub struct RunSummary {
     pub prefill_tok_s: f64,
     pub decode_tok_s: f64,
     pub total_tok_s: f64,
+    /// Total GPUs the run modeled — the run inventory size: the sum over every
+    /// worker of its `gpus_per_worker` (i.e. replicas × the per-replica
+    /// parallel-dim product).
+    pub num_gpus: u64,
+    /// `total_tok_s / num_gpus` — the headline per-accelerator serving rate.
+    pub total_tok_s_per_gpu: f64,
     pub completed_req_s: f64,
     pub sim_ms: f64,
     pub wall_s: f64,
@@ -192,14 +206,20 @@ pub fn run_sim(
             last_state_clock = Some(clock);
         }
 
-        // 2c. Periodic heartbeat (no store scan — counters are maintained above).
-        //     `fire()` runs first so the gate advances every tick regardless.
+        // 2c. Periodic heartbeat. `fire()` runs first so the gate advances every
+        //     tick regardless. `submitted`/`completed` are maintained counters;
+        //     `admitted` (requests that have started prefill = "touched") is the
+        //     O(1) store watermark, read only on a heartbeat tick (no scan).
+        //     `processing` = admitted - completed (touched but not yet done).
         if heartbeat.fire() && tracing::enabled!(tracing::Level::INFO) {
+            let admitted = store.borrow().admitted_watermark();
             tracing::info!(
-                "t={:.0}ms: completed={} in_flight={}",
+                "t={:.0}ms: completed={} submitted={} admitted={} processing={}",
                 clock.as_ms(),
                 completed,
-                arrived - completed,
+                arrived,
+                admitted,
+                admitted - completed,
             );
         }
 
@@ -246,6 +266,7 @@ pub fn run_sim(
     // render from it so the log and `summary.json` can't diverge.
     let wall_s = wall_start.elapsed().as_secs_f64();
     let safe_wall = wall_s.max(1e-9);
+    let num_gpus = flow.inventory().num_gpus();
     let summary = {
         let s = store.borrow();
         let total = s.iter().count() as u64;
@@ -258,6 +279,7 @@ pub fn run_sim(
         // second (that would just be the simulator's speed, captured separately
         // by the "x real-time" ratio below).
         let sim_s = (clock.as_ms() / 1000.0).max(1e-9);
+        let total_tok_s = all_tok as f64 / sim_s;
         RunSummary {
             cause,
             requests_total: total,
@@ -267,7 +289,9 @@ pub fn run_sim(
             total_tokens: all_tok,
             prefill_tok_s: prefill_tok as f64 / sim_s,
             decode_tok_s: decode_tok as f64 / sim_s,
-            total_tok_s: all_tok as f64 / sim_s,
+            total_tok_s,
+            num_gpus: num_gpus as u64,
+            total_tok_s_per_gpu: total_tok_s / num_gpus.max(1) as f64,
             completed_req_s: completed as f64 / sim_s,
             sim_ms: clock.as_ms(),
             wall_s,
@@ -291,9 +315,11 @@ pub fn run_sim(
         summary.decode_tok_s
     );
     tracing::info!(
-        "  total:    {} tokens ({:.0} tok/s)",
+        "  total:    {} tokens ({:.0} tok/s, {:.0} tok/s/gpu over {} gpus)",
         summary.total_tokens,
-        summary.total_tok_s
+        summary.total_tok_s,
+        summary.total_tok_s_per_gpu,
+        summary.num_gpus,
     );
     // Modeled completion rate (req per sim-second); then sim vs wall time and
     // the speedup = how many seconds of modeled time we cover per real second.
@@ -489,7 +515,7 @@ mod tests {
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
         let mut frontend = TraceFrontend::load(&[trace], 1.0).unwrap();
-        let mut logger = LoggerSession::open(dir.path()).unwrap();
+        let mut logger = LoggerSession::open(dir.path(), true).unwrap();
 
         let summary = run_sim(
             &mut flow,
@@ -503,6 +529,9 @@ mod tests {
         assert_eq!(summary.requests_finished, 4);
         assert_eq!(summary.decode_tokens, 12); // 4 requests × 3 output tokens
         assert!(summary.total_tok_s > 0.0);
+        // 2 workers × 1 GPU each (UnifiedWorkerFactory above), so per-gpu = half.
+        assert_eq!(summary.num_gpus, 2);
+        assert_eq!(summary.total_tok_s_per_gpu, summary.total_tok_s / 2.0);
 
         // Every request finished: 3 output tokens each.
         let s = store.borrow();

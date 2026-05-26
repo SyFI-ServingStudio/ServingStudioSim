@@ -82,6 +82,21 @@ fn load_config(path: &Path) -> Result<RunConfig> {
     Ok(cfg)
 }
 
+/// Compact wall-clock log timestamp: `[MM:SS.mmm]` (UTC minute-of-hour). Drops
+/// the date/hour/微秒 noise from the default RFC3339 stamp so log lines read as
+/// `[17:06.300] INFO …`. Uses `SystemTime` directly to avoid a chrono/time dep.
+struct CompactTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for CompactTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = now.as_secs();
+        write!(w, "[{:02}:{:02}.{:03}]", (secs / 60) % 60, secs % 60, now.subsec_millis())
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // Heap profiler guard (opt-in): starts recording allocations now, dumps
     // `dhat-heap.json` when it drops at the end of main.
@@ -98,6 +113,11 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
+        // Compact `[MM:SS.mmm]` stamp + no ANSI: the launcher pipes stderr into
+        // `stdout.log` (a non-TTY), where the default RFC3339 stamp and color
+        // escapes (`\e[2m…\e[0m`) become unreadable noise.
+        .with_timer(CompactTime)
+        .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
 
@@ -134,7 +154,7 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     let mut flow = build_flow(&cfg, &bridge, Rc::clone(&store))?;
 
     let log_dir = &cfg.io().log_dir;
-    let mut logger = LoggerSession::open(log_dir)?;
+    let mut logger = LoggerSession::open(log_dir, cfg.io().log_token_times)?;
     // Run-level GPU facts sidecar (L7): written before the tick loop so the
     // analyzer can normalize per-GPU even if the run later fails.
     simulator::log::write_run_meta(log_dir, flow.inventory())?;

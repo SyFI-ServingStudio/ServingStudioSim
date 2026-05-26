@@ -166,9 +166,13 @@ pub fn request_state_schema() -> Arc<Schema> {
 
 /// `request_slo` (§7.2) — one row per request with full per-token timing.
 /// Column list / types / nullability match `docs/logging.md §7.2`.
-/// `output_token_times` is `List<f32>` (absolute sim-time ms). The five
-/// convenience scalars (`ttft_ms`, `tpot_*_ms`) are nullable: `null` when
-/// `num_output_tokens == 0` (e.g. sim-end-flush of a request still in prefill).
+/// `output_token_times` is `List<f32>` (absolute sim-time ms); it is empty
+/// unless `io.log_token_times` is on (the scalars below are always present).
+/// The convenience scalars (`ttft_ms`, `tpot_*_ms`, `last_token_time_ms`) are
+/// nullable: `null` when there are too few output tokens to define them (e.g. a
+/// sim-end-flush of a request still in prefill). `finish_decode_time_ms` is the
+/// absolute sim-time ms of the final decoded token; E2E = `finish_decode_time_ms
+/// - arrival_time_ms` (kept as a scalar so E2E survives with the array off).
 pub fn request_slo_schema() -> Arc<Schema> {
     let token_times_item = Arc::new(Field::new("item", DataType::Float32, false));
     Arc::new(Schema::new(vec![
@@ -187,6 +191,7 @@ pub fn request_slo_schema() -> Arc<Schema> {
         Field::new("tpot_p50_ms", DataType::Float32, true),
         Field::new("tpot_p99_ms", DataType::Float32, true),
         Field::new("tpot_max_ms", DataType::Float32, true),
+        Field::new("finish_decode_time_ms", DataType::Float32, true),
     ]))
 }
 

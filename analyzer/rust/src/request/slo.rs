@@ -24,6 +24,7 @@ const SLO_COLS: &[&str] = &[
     "arrival_time_ms",
     "ttft_ms",
     "tpot_mean_ms",
+    "finish_decode_time_ms",
     "output_token_times",
 ];
 /// request_state columns used for session-level rollup.
@@ -112,13 +113,15 @@ impl Samples {
     }
 }
 
-/// Per-request metrics from completed `request_slo` rows. TTFT/TPOT come from the
-/// pre-agg'd columns; E2E and ITL are derived from `output_token_times` (E2E =
-/// last token − arrival; ITL = consecutive token gaps, pooled across requests).
+/// Per-request metrics from completed `request_slo` rows. TTFT/TPOT/E2E come
+/// from pre-agg'd scalar columns (E2E = `finish_decode_time_ms − arrival`, which
+/// the sim always logs). ITL needs the per-token series, so it is only populated
+/// when `output_token_times` was logged (`io.log_token_times` on); with the
+/// array off, `itl` is simply empty.
 async fn collect_request_samples(ctx: &SessionContext, s: &mut Samples) -> Result<()> {
     let batches = collect(
         ctx,
-        "SELECT arrival_time_ms, ttft_ms, tpot_mean_ms, output_token_times \
+        "SELECT arrival_time_ms, ttft_ms, tpot_mean_ms, finish_decode_time_ms, output_token_times \
          FROM slo WHERE completed",
     )
     .await?;
@@ -126,6 +129,7 @@ async fn collect_request_samples(ctx: &SessionContext, s: &mut Samples) -> Resul
         let arrival = col(batch, "arrival_time_ms")?;
         let ttft = col(batch, "ttft_ms")?;
         let tpot = col(batch, "tpot_mean_ms")?;
+        let finish = col(batch, "finish_decode_time_ms")?;
         let times = col(batch, "output_token_times")?;
         for row in 0..batch.num_rows() {
             let t = value_f64(ttft, row)?;
@@ -136,10 +140,12 @@ async fn collect_request_samples(ctx: &SessionContext, s: &mut Samples) -> Resul
             if p.is_finite() {
                 s.tpot.push(p);
             }
-            let token_times = value_f32_list(times, row)?;
-            if let Some(&last) = token_times.last() {
-                s.e2e.push(last - value_f64(arrival, row)?);
+            let f = value_f64(finish, row)?;
+            if f.is_finite() {
+                s.e2e.push(f - value_f64(arrival, row)?);
             }
+            // ITL only when the per-token array was logged (empty otherwise).
+            let token_times = value_f32_list(times, row)?;
             for w in token_times.windows(2) {
                 s.itl.push(w[1] - w[0]);
             }
@@ -189,8 +195,9 @@ fn definitions() -> Value {
         "scope": "completed requests only",
         "ttft": "ttft_ms = first_token_time - arrival (pre-aggregated by the sim)",
         "tpot": "tpot_mean_ms = mean inter-token gap during decode (pre-aggregated)",
-        "e2e": "output_token_times[last] - arrival_time_ms",
-        "itl": "consecutive diffs of output_token_times, pooled across requests",
+        "e2e": "finish_decode_time_ms - arrival_time_ms (scalar; survives log_token_times off)",
+        "itl": "consecutive diffs of output_token_times, pooled across requests \
+                (empty unless io.log_token_times was on)",
         "session_e2e": "max(completion_time_ms) - session_arrival_time_ms per session_id, \
                         over completed request_state rows",
     })

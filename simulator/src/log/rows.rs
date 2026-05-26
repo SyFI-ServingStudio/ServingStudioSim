@@ -70,12 +70,13 @@ pub struct RequestStateEntry {
 }
 
 /// One `request_slo` row — terminal (or sim-end-flush) per-token timing for one
-/// request. `output_token_times_ms` holds absolute sim-time ms. The TPOT
-/// percentile scalars are NOT carried on the entry: they are derived from
-/// `output_token_times_ms` on the writer thread in [`slo_to_record_batch`]
-/// (see [`tpot_stats_ms`]), keeping the `O(n log n)` sort off the sim hot path.
-/// `ttft_ms` stays here — it is a cheap scalar (first-token minus arrival), not a
-/// sort, and needs `first_token_time` which only the sim side holds.
+/// request. The full `output_token_times_ms` (absolute sim-time ms) is always
+/// carried to the writer thread, which derives the scalar columns from it
+/// (`num_output_tokens`, the `tpot_*` percentiles, `finish_decode_time_ms`) in
+/// [`slo_to_record_batch`]. The *array column itself* is persisted only when
+/// `io.log_token_times` is on (it is the dominant size + encode cost); the
+/// derived scalars are always written, so dropping the array keeps E2E / TPOT.
+/// `ttft_ms` is computed sim-side here (needs `first_token_time`).
 #[derive(Clone, Debug)]
 pub struct RequestSloEntry {
     pub request_id: u32,
@@ -87,28 +88,27 @@ pub struct RequestSloEntry {
 }
 
 /// Inter-token gaps (ms) → `(mean, p50, p99, max)`, all `None` when fewer than
-/// two output tokens (no gap defined). Runs on the **writer thread** from the
-/// already-logged `output_token_times_ms`, so the percentile sort never touches
-/// the sim hot path. Numerically equivalent to the old sim-side `tpot_stats`
-/// (gaps from consecutive ms timestamps; the f32 vs f64 subtraction difference is
-/// negligible for a timing statistic).
+/// two output tokens (no gap defined). Selecting a percentile from unsorted data
+/// is `O(n)` (quickselect, `select_nth_unstable_by`) — a full `O(n log n)` sort
+/// is wasteful when only two order statistics are needed. `mean`/`max` are
+/// single passes. Each `select_nth` partially reorders `gaps`, but it operates
+/// on any order, so two successive selections are both correct (and still `O(n)`
+/// each). `f32::total_cmp` gives a total order without the `partial_cmp` unwrap.
 fn tpot_stats_ms(times_ms: &[f32]) -> (Option<f32>, Option<f32>, Option<f32>, Option<f32>) {
     if times_ms.len() < 2 {
         return (None, None, None, None);
     }
     let mut gaps: Vec<f32> = times_ms.windows(2).map(|w| w[1] - w[0]).collect();
-    let mean = gaps.iter().sum::<f32>() / gaps.len() as f32;
-    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let pct = |p: f64| -> f32 {
-        let idx = ((p * (gaps.len() - 1) as f64).round() as usize).min(gaps.len() - 1);
-        gaps[idx]
+    let n = gaps.len();
+    let mean = gaps.iter().sum::<f32>() / n as f32;
+    let max = gaps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let kth = |gaps: &mut [f32], p: f64| -> f32 {
+        let idx = ((p * (n - 1) as f64).round() as usize).min(n - 1);
+        *gaps.select_nth_unstable_by(idx, f32::total_cmp).1
     };
-    (
-        Some(mean),
-        Some(pct(0.5)),
-        Some(pct(0.99)),
-        Some(*gaps.last().unwrap()),
-    )
+    let p50 = kth(&mut gaps, 0.5);
+    let p99 = kth(&mut gaps, 0.99);
+    (Some(mean), Some(p50), Some(p99), Some(max))
 }
 
 /// One HP group's input context for a `cost_log` row — the per-iteration
@@ -364,7 +364,17 @@ pub(crate) fn state_to_record_batch(entries: &[RequestStateEntry]) -> Result<Rec
     )?)
 }
 
-pub(crate) fn slo_to_record_batch(entries: &[RequestSloEntry]) -> Result<RecordBatch> {
+/// Derive the scalar columns from each row's `output_token_times_ms` (num,
+/// `tpot_*` percentiles, `finish_decode_time_ms`) on the writer thread, then
+/// transpose into a `RecordBatch`. The per-token array *column* is only
+/// materialized when `log_token_times` is on — otherwise it is written as empty
+/// lists (the scalars, which is all the analyzer needs for E2E / TPOT, are
+/// always present). The array still crosses the channel either way; this only
+/// skips its (dominant) parquet encode + the on-disk bytes.
+pub(crate) fn slo_to_record_batch(
+    entries: &[RequestSloEntry],
+    log_token_times: bool,
+) -> Result<RecordBatch> {
     let request_id: Vec<u32> = entries.iter().map(|e| e.request_id).collect();
     let logging_time: Vec<f64> = entries.iter().map(|e| e.logging_time_ms).collect();
     let completed: Vec<bool> = entries.iter().map(|e| e.completed).collect();
@@ -374,9 +384,11 @@ pub(crate) fn slo_to_record_batch(entries: &[RequestSloEntry]) -> Result<RecordB
         .map(|e| e.output_token_times_ms.len() as u32)
         .collect();
     let ttft: Vec<Option<f32>> = entries.iter().map(|e| e.ttft_ms).collect();
-    // TPOT percentiles derived here on the writer thread from the per-row token
-    // times (the sort is off the sim hot path; the times list already crossed
-    // the channel, so this is zero extra data movement).
+    // Absolute sim-time ms of the final token → E2E = finish - arrival.
+    let finish_decode: Vec<Option<f32>> = entries
+        .iter()
+        .map(|e| e.output_token_times_ms.last().copied())
+        .collect();
     let mut tpot_mean: Vec<Option<f32>> = Vec::with_capacity(entries.len());
     let mut tpot_p50: Vec<Option<f32>> = Vec::with_capacity(entries.len());
     let mut tpot_p99: Vec<Option<f32>> = Vec::with_capacity(entries.len());
@@ -391,12 +403,16 @@ pub(crate) fn slo_to_record_batch(entries: &[RequestSloEntry]) -> Result<RecordB
 
     // List<f32> column: one non-null list per row (may be empty). The item
     // field must match the schema's non-nullable `item` (ListBuilder defaults to
-    // nullable items, which fails the RecordBatch schema check otherwise).
+    // nullable items, which fails the RecordBatch schema check otherwise). When
+    // `log_token_times` is off we still emit one (empty) list per row so the
+    // column stays non-null and row-aligned.
     let mut times_builder = ListBuilder::new(Float32Builder::new())
         .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
     for e in entries {
-        for &t in &e.output_token_times_ms {
-            times_builder.values().append_value(t);
+        if log_token_times {
+            for &t in &e.output_token_times_ms {
+                times_builder.values().append_value(t);
+            }
         }
         times_builder.append(true);
     }
@@ -416,6 +432,7 @@ pub(crate) fn slo_to_record_batch(entries: &[RequestSloEntry]) -> Result<RecordB
             Arc::new(Float32Array::from(tpot_p50)),
             Arc::new(Float32Array::from(tpot_p99)),
             Arc::new(Float32Array::from(tpot_max)),
+            Arc::new(Float32Array::from(finish_decode)),
         ],
     )?)
 }
@@ -538,7 +555,7 @@ mod tests {
     #[test]
     fn slo_list_column_round_trips() {
         let entries = vec![slo_entry(0, vec![1.0, 3.0, 5.0]), slo_entry(1, vec![2.0])];
-        let batch = slo_to_record_batch(&entries).unwrap();
+        let batch = slo_to_record_batch(&entries, true).unwrap();
         assert_eq!(batch.num_rows(), 2);
         // num_output_tokens column (index 5) reflects the list lengths.
         let n = batch
@@ -548,7 +565,7 @@ mod tests {
             .unwrap();
         assert_eq!(n.value(0), 3);
         assert_eq!(n.value(1), 1);
-        // TPOT is now derived on the writer thread from the token times. Row 0
+        // TPOT is derived on the writer thread from the token times. Row 0
         // gaps = [2,2] → mean=p50=p99=max=2; row 1 has <2 tokens → null.
         let mean = batch
             .column(7)
@@ -564,5 +581,46 @@ mod tests {
             .unwrap();
         assert_eq!(max.value(0), 2.0);
         assert!(max.is_null(1));
+        // finish_decode_time_ms (index 11) = last token time; null when no tokens.
+        let finish = batch
+            .column(11)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(finish.value(0), 5.0);
+        assert_eq!(finish.value(1), 2.0);
+        // List column carries the full per-token times when logging is on.
+        let times = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+        assert_eq!(times.value(0).len(), 3);
+    }
+
+    #[test]
+    fn slo_list_column_omitted_when_off() {
+        // log_token_times = false → the array column is empty, but the derived
+        // scalars (num, tpot, finish_decode) are still computed from the array.
+        let entries = vec![slo_entry(0, vec![1.0, 3.0, 5.0])];
+        let batch = slo_to_record_batch(&entries, false).unwrap();
+        let times = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+        assert_eq!(times.value(0).len(), 0, "array column must be empty");
+        let n = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(n.value(0), 3, "num_output_tokens still from the array");
+        let finish = batch
+            .column(11)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(finish.value(0), 5.0, "E2E scalar survives array-off");
     }
 }

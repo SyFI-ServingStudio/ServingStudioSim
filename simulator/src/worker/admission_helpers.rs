@@ -132,6 +132,13 @@ pub struct Batch {
     pub decodes: Vec<(RequestId, DecodeReqState)>,
     /// Transient: ids admitted as prefill this iter; cleared in `complete_iter`.
     pub prefill_admits: Vec<RequestId>,
+    /// Cached `projected_peak`. The projection is non-increasing as decodes
+    /// advance (each live decode's per-step growth is already counted in the
+    /// peak), so only a decode *entering* (`finalize_to_decode`) can raise it and
+    /// only one *leaving* (`release`) lowers it. We recompute the sort on those
+    /// two events and serve `projected_peak_kv` from the cache, skipping the
+    /// O(n log n) sort on every admission probe.
+    cached_peak: u64,
 }
 
 impl Batch {
@@ -141,6 +148,7 @@ impl Batch {
             kv: KvPool::new(kv_capacity),
             decodes: Vec::new(),
             prefill_admits: Vec::new(),
+            cached_peak: 0,
         }
     }
 
@@ -173,6 +181,8 @@ impl Batch {
                 remaining_decode: decode_budget,
             },
         ));
+        // A new decode is the only event that can raise the projected peak.
+        self.recompute_peak();
     }
 
     /// External release: drop from the decode set (if present) and decrement KV.
@@ -180,11 +190,19 @@ impl Batch {
         if let Some(pos) = self.decodes.iter().position(|(r, _)| *r == req_id) {
             self.decodes.remove(pos);
             self.kv.sub_kv(current_kv);
+            // One decode left → peak can only fall; refresh the cache.
+            self.recompute_peak();
         }
     }
 
+    /// Run the O(n log n) `projected_peak` and store it. Called only on the two
+    /// events that change the projection — a decode entering or leaving.
+    fn recompute_peak(&mut self) {
+        self.cached_peak = self.kv.projected_peak(self.decodes.iter().map(|(_, s)| s));
+    }
+
     pub fn projected_peak_kv(&self) -> u64 {
-        self.kv.projected_peak(self.decodes.iter().map(|(_, s)| s))
+        self.cached_peak
     }
 }
 
