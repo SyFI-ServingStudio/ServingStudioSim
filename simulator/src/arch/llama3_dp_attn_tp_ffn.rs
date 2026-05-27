@@ -307,12 +307,18 @@ impl Llama3DpAttnTpFfnModel {
             overlap: 1.0,
             children: attn_groups,
         };
-        let layer = CostNode::Scale {
-            n: self.num_layers,
-            child: Box::new(CostNode::Sum(vec![
-                attn_fanout,
-                self.mlp_block.compile(&mut b),
-            ])),
+        // Tag the homogeneous fold with its repeat-unit noun ("layer") so a
+        // downstream consumer (the Perfetto trace) names the `Scale` repeats
+        // `layer 0..n` semantically instead of assuming `Scale == layer`.
+        let layer = CostNode::Labeled {
+            label: "layer".to_string(),
+            child: Box::new(CostNode::Scale {
+                n: self.num_layers,
+                child: Box::new(CostNode::Sum(vec![
+                    attn_fanout,
+                    self.mlp_block.compile(&mut b),
+                ])),
+            }),
         };
         let final_norm = self.final_norm.compile(&mut b);
         let lm_head = self.lm_head.compile(&mut b);

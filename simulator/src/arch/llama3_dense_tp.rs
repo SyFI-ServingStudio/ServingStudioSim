@@ -268,12 +268,18 @@ impl Llama3DenseTpModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let embed = self.embed.compile(&mut b);
-        let layer = CostNode::Scale {
-            n: self.num_layers,
-            child: Box::new(CostNode::Sum(vec![
-                self.attn_block.compile(&mut b),
-                self.mlp_block.compile(&mut b),
-            ])),
+        // Tag the homogeneous fold with its repeat-unit noun ("layer") so the
+        // Perfetto trace names the `Scale` repeats `layer 0..n` semantically
+        // instead of assuming `Scale == layer`.
+        let layer = CostNode::Labeled {
+            label: "layer".to_string(),
+            child: Box::new(CostNode::Scale {
+                n: self.num_layers,
+                child: Box::new(CostNode::Sum(vec![
+                    self.attn_block.compile(&mut b),
+                    self.mlp_block.compile(&mut b),
+                ])),
+            }),
         };
         let final_norm = self.final_norm.compile(&mut b);
         let lm_head = self.lm_head.compile(&mut b);
