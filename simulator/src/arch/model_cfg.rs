@@ -1,10 +1,13 @@
-//! Numeric model + parallelism config consumed by model_arch `build_configs`
-//! (L4 design.md §1.1 / §3.8).
+//! Numeric model dims (`ModelCfg`) consumed by model_arch `build_configs`
+//! (L4 design.md §1.1). The parallel/sharding degrees are NOT here: each arch
+//! owns its own numeric parallel struct (`DenseParallel`, `DenseTpParallel`, …)
+//! co-located with the arch, per new-interface-design §13 (the retired shared
+//! `ParallelCfg` union).
 //!
 //! These are the *resolved numeric* dims, distinct from the CLI parameter layer
-//! (`schema::ModelCommon` / `ParallelismCommon`, where `model_config` is a JSON
-//! path). `from_json` loads a HuggingFace `config.json` and is the only runtime
-//! source of dims; the `llama3_8b()` preset is a `#[cfg(test)]` fixture, not API.
+//! (`schema::ModelCommon`, where `model_config` is a JSON path). `from_json` loads
+//! a HuggingFace `config.json` and is the only runtime source of dims; the
+//! `llama3_8b()` preset is a `#[cfg(test)]` fixture, not API.
 
 use std::path::Path;
 
@@ -79,34 +82,6 @@ fn parse_dtype(s: &str) -> Result<DType> {
         "int4" => DType::Int4,
         other => bail!("unsupported torch_dtype {other:?}"),
     })
-}
-
-/// Resolved parallelism degrees + the GPU type this model_arch instance targets.
-/// `gpu_name` is the single source of truth threaded into every kernel lookup
-/// (L4 §3.8). Dense local single-GPU = all degrees 1.
-#[derive(Clone, Debug)]
-pub struct ParallelCfg {
-    pub tp_size: u16,
-    pub ep_size: u16,
-    pub num_hp_groups: u16,
-    pub gpu_name: String,
-}
-
-impl ParallelCfg {
-    /// Resolved parallelism degrees from deployment params.
-    pub fn new(tp_size: u16, ep_size: u16, num_hp_groups: u16, gpu_name: impl Into<String>) -> Self {
-        Self {
-            tp_size,
-            ep_size,
-            num_hp_groups,
-            gpu_name: gpu_name.into(),
-        }
-    }
-
-    /// Local single-GPU deployment: no TP/EP/HP split.
-    pub fn local(gpu_name: impl Into<String>) -> Self {
-        Self::new(1, 1, 1, gpu_name)
-    }
 }
 
 /// Test-only fixtures, kept out of the production `impl` block. Runtime dims

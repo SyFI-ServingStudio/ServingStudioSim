@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::model_cfg::{ModelCfg, ParallelCfg};
+use crate::arch::model_cfg::ModelCfg;
 use crate::op::Op;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, RmsNormKernel,
@@ -83,7 +83,16 @@ pub struct Llama3DenseModel {
     n_slots: usize,
 }
 
-pub fn build_configs(model: &ModelCfg, parallel: &ParallelCfg) -> Llama3DenseConfigs {
+/// This arch's numeric parallel input: dense local has no sharding, so the only
+/// dim it forwards is the `gpu_name` every kernel lookup keys on (L4 §3.8). Per
+/// new-interface-design §13: each arch owns the numeric parallel struct it needs,
+/// replacing the retired shared `ParallelCfg` union.
+#[derive(Clone, Debug)]
+pub struct DenseParallel {
+    pub gpu_name: String,
+}
+
+pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseConfigs {
     let gpu = &parallel.gpu_name;
     let dtype_bytes = model.dtype.size_bytes();
     Llama3DenseConfigs {
@@ -381,7 +390,9 @@ mod tests {
     #[test]
     fn build_configs_threads_dims_and_gpu_name() {
         let model = ModelCfg::llama3_8b();
-        let parallel = ParallelCfg::local("H100");
+        let parallel = DenseParallel {
+            gpu_name: "H100".to_string(),
+        };
         let cfgs = build_configs(&model, &parallel);
         assert_eq!(cfgs.num_layers, 32);
         assert_eq!(cfgs.lm_head.n, 128256);
@@ -393,7 +404,12 @@ mod tests {
 
     #[test]
     fn resolve_configs_bakes_worklet_shapes() {
-        let cfgs = build_configs(&ModelCfg::llama3_8b(), &ParallelCfg::local("H100"));
+        let cfgs = build_configs(
+            &ModelCfg::llama3_8b(),
+            &DenseParallel {
+                gpu_name: "H100".to_string(),
+            },
+        );
         let r = resolve_configs(&cfgs);
         assert_eq!(r.pre_attn.qkv.n, 6144);
         assert_eq!(r.post_attn.up_gate.n, 28672);
