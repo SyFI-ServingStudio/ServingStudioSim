@@ -124,6 +124,13 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
                             req,
                         });
                     }
+                    WorkerEvent::PrefillDone { req } => {
+                        out.push(PoolEvent::PrefillDone {
+                            pool,
+                            worker: worker_id,
+                            req,
+                        });
+                    }
                 }
             }
         }
@@ -156,6 +163,8 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpFlow<M, W> {
     fn on_pool_event(&mut self, event: PoolEvent) -> Vec<OrchAction> {
         match event {
             PoolEvent::RequestComplete { req, .. } => vec![OrchAction::Complete { req }],
+            // A single-pool unified deployment never produces a prefill handoff.
+            PoolEvent::PrefillDone { .. } => vec![],
         }
     }
 }

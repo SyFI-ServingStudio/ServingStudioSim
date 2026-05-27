@@ -18,10 +18,17 @@ pub enum OrchAction {
     Complete { req: RequestId },
 }
 
-/// Pool-level event (L6a → L6b). One per worker-level completion in simple_dp.
+/// Pool-level event (L6a → L6b). One per worker-level transition a pool surfaces.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PoolEvent {
     RequestComplete {
+        pool: PoolId,
+        worker: WorkerId,
+        req: RequestId,
+    },
+    /// A PD prefill pool finished a request's prefill — L6b hands it off to the
+    /// decode pool. Only a prefill pool surfaces this.
+    PrefillDone {
         pool: PoolId,
         worker: WorkerId,
         req: RequestId,

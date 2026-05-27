@@ -1,17 +1,20 @@
-//! `HpUnifiedWorker` — the multi-group iter-wise unified worker (L5 design.md
-//! §3.5 "+HP groups"). Same FSM as the barebone worker, but maintains **N
-//! independent `Batch` containers** (one per attention DP shard, `N =
-//! model.num_attn_dp_groups()`) instead of one. A fresh prefill is round-robined
-//! across the groups; the whole iteration is still costed jointly (one shared
-//! `BatchFsmState` cursor, one `eval_iter` per iter — the arch's `Max` fan-out
-//! over the per-group attention slots supplies the DP wallclock).
+//! `PdDecodeWorker` — the decode half of a PD (prefill/decode disaggregation)
+//! deployment. Iter-wise, but its admitted requests have **already been
+//! prefilled** by a sibling prefill pool (handed off via `WorkerEvent::PrefillDone`
+//! → L6 → `enqueue` here): the request's prompt KV is treated as already resident,
+//! so a fresh admit enters the decode set directly (no prefill compute, no
+//! prefill→decode transition). The worker then only runs decode iterations.
 //!
-//! Kept as its own file (not folded into the barebone template): the barebone
-//! worker stays the minimal single-group reference, and this is the multi-group
-//! specialization. The shared admission primitives (`Batch` / `KvAdmission` /
-//! `LoadBalance` / `KvPool`) and the public worker vocabulary (`WorkerConfig` /
-//! `WorkerMsg` / `WorkerEvent` / `WorkerStatus` / FSM enums) are reused, not
-//! duplicated.
+//! Multi-group like `HpUnifiedWorker`: it keeps **N independent `Batch` containers**
+//! (`N = model.num_attn_dp_groups()`), one per attention DP shard, and round-robins
+//! handed-off requests across them. With a non-DP arch (`N == 1`) it degenerates to
+//! a single decode group. The iteration is costed jointly (one `eval_iter`; the
+//! arch's `Max` fan-out over the per-group attention slots supplies the DP
+//! wallclock).
+//!
+//! v1 simplification: the prompt KV is assumed present at admit time (the
+//! prefill→decode transfer is not modeled); the shared `RequestStore` carries the
+//! prefill state (prompt_len, first token already emitted) across the handoff.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -27,24 +30,22 @@ use crate::worker::types::{
     BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
 };
 
-/// Worker-local runtime state (mirrors the barebone worker's, plus the live
-/// `LoadBalance` cursor used to route fresh prefills across the N groups).
-struct HpRuntime {
-    pending_prefills: VecDeque<RequestId>,
-    promised: HashMap<RequestId, (u16, u64)>,
+struct DecodeRuntime {
+    /// Handoff queue: requests whose prefill is done, awaiting a decode slot.
+    pending_decodes: VecDeque<RequestId>,
     request_to_group: HashMap<RequestId, u16>,
     iter_counter: u32,
     iter_compute_start: Time,
     worker_fsm_state: WorkerFsmState,
     batch_fsm_state: BatchFsmState,
+    /// Cursor for routing handed-off requests across the N decode groups.
     balance: LoadBalance,
 }
 
-impl HpRuntime {
+impl DecodeRuntime {
     fn new(balance: LoadBalance) -> Self {
         Self {
-            pending_prefills: VecDeque::new(),
-            promised: HashMap::new(),
+            pending_decodes: VecDeque::new(),
             request_to_group: HashMap::new(),
             iter_counter: 0,
             iter_compute_start: Time::ZERO,
@@ -58,12 +59,12 @@ impl HpRuntime {
     }
 }
 
-pub struct HpUnifiedWorker<M: IterwiseUnifiedModel> {
+pub struct PdDecodeWorker<M: IterwiseUnifiedModel> {
     pub id: WorkerId,
     model: Arc<M>,
     requests: SharedRequests,
     config: WorkerConfig,
-    runtime: HpRuntime,
+    runtime: DecodeRuntime,
     /// One container per attention DP shard; length = `model.num_attn_dp_groups()`.
     batches: Vec<Batch>,
     events: Vec<WorkerEvent>,
@@ -72,7 +73,7 @@ pub struct HpUnifiedWorker<M: IterwiseUnifiedModel> {
     cost_slot_inputs: Vec<SlotInput>,
 }
 
-impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
+impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
     pub fn new(
         id: WorkerId,
         model: Arc<M>,
@@ -87,8 +88,8 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         let batches: Vec<Batch> = (0..num_groups)
             .map(|g| Batch::new(g as u16, kv_capacity))
             .collect();
-        // Round-robin fresh prefills across the groups (config.balance is a hint;
-        // a single-group degenerate still works since choose(1) == 0).
+        // Round-robin handed-off requests across the groups (config.balance is a
+        // hint; a single-group degenerate still works since choose(1) == 0).
         let balance = match config.balance {
             LoadBalance::Single if num_groups > 1 => LoadBalance::RoundRobin { next: 0 },
             other => other,
@@ -108,7 +109,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             model,
             requests,
             config,
-            runtime: HpRuntime::new(balance),
+            runtime: DecodeRuntime::new(balance),
             batches,
             events: Vec::new(),
             cost_logger,
@@ -116,8 +117,6 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             cost_slot_inputs: Vec::new(),
         }
     }
-
-    // ── tick: state-forwarding loop (§3.2.1; identical shape to barebone) ──────
 
     fn tick_inner(&mut self, now: Time) {
         use IterCursor::*;
@@ -157,7 +156,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         }
     }
 
-    // ── Stage 1: form_batch — admit one fresh prefill into a balance-chosen group ─
+    // ── Stage 1: form_batch — admit one handed-off request straight into decode ─
 
     fn form_batch(&mut self) -> bool {
         let had_decode = self
@@ -165,37 +164,46 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             .iter()
             .any(|b| b.iter_decoding().next().is_some());
 
-        // Phase A: route one fresh prefill to a group (RoundRobin over N).
-        if let Some(&rid) = self.runtime.pending_prefills.front() {
-            let (p, d) = {
+        // A handed-off request is already prefilled: its prompt KV is resident and
+        // its first token was emitted by the prefill pool. Admit it directly into a
+        // balance-chosen decode group (no prefill compute), sizing KV from the
+        // prompt + the remaining decode budget.
+        if let Some(&rid) = self.runtime.pending_decodes.front() {
+            let (prompt_kv, remaining) = {
                 let store = self.requests.borrow();
                 let r = &store[rid];
-                (r.prompt_len, r.decode_len)
+                let prompt_kv = (r.prompt_len + r.prefix_kv) as u64;
+                let remaining = r.decode_len.saturating_sub(r.tokens_emitted);
+                (prompt_kv, remaining)
             };
             let gid = self.runtime.balance.choose(self.batches.len()) as u16;
-            let group_promised = self.group_promised_kv(gid);
-            if self
-                .config
-                .admission
-                .try_admit(&self.batches[gid as usize], group_promised, p, d)
+            // Admission gate: the request's peak occupancy is prompt + remaining
+            // decode tokens. `try_admit` takes (prefill, decode) token counts; here
+            // "prefill" is the already-resident prompt KV that loading reserves.
+            if remaining == 0
+                || self.config.admission.try_admit(
+                    &self.batches[gid as usize],
+                    0,
+                    prompt_kv as u32,
+                    remaining,
+                )
             {
-                self.runtime.pending_prefills.pop_front();
-                self.promise(gid, rid, p, d, 0);
+                self.runtime.pending_decodes.pop_front();
+                self.batches[gid as usize].finalize_to_decode(rid, prompt_kv, remaining);
+                self.runtime.request_to_group.insert(rid, gid);
             }
         }
 
-        // Phase B: drain ready promises into their group's prefill_admits.
-        self.drain_promises_into_admits();
-        let had_prefill = self.batches.iter().any(|b| !b.prefill_admits.is_empty());
-
-        if !had_decode && !had_prefill {
+        let still_decoding = self
+            .batches
+            .iter()
+            .any(|b| b.iter_decoding().next().is_some());
+        if !had_decode && !still_decoding {
             return false;
         }
         self.runtime.iter_counter += 1;
         true
     }
-
-    // ── Stage 2: start_iter (build N-group ArchInput, cost query) → compute_end ──
 
     fn start_iter(&mut self, now: Time) -> Time {
         let arch_input = self.build_arch_input();
@@ -244,18 +252,14 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         now + cost_time
     }
 
-    // ── Stage 3: complete_iter — same bookkeeping as barebone, per group ────────
+    // ── Stage 3: complete_iter — decode bookkeeping only (no prefill phase) ──────
 
     fn complete_iter(&mut self, now: Time) {
         let log_tokens = self.config.log_output_token_times;
         for gid in 0..self.batches.len() {
             let mut completed: Vec<RequestId> = Vec::new();
 
-            // (a) live decodes produced one token. Iterate the decode set in place
-            // (not mutated here — `advance_decodes` in (b) does that next), so no
-            // intermediate id Vec; `store` is a separate field, so the shared borrow
-            // of `batches` and the `RefCell` borrow_mut don't conflict. `log_tokens`
-            // gates the per-token array (the hot-path cost — see RequestRecord).
+            // (a) live decodes produced one token.
             {
                 let mut store = self.requests.borrow_mut();
                 for (rid, _) in self.batches[gid].iter_decoding() {
@@ -270,31 +274,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             // (b) bump KV for every live decode.
             self.batches[gid].advance_decodes();
 
-            // (c) prefills resolved → first token; complete now or enter decode set.
-            // Iterate `prefill_admits` in place (cleared below after the deferred
-            // finalize) instead of cloning it.
-            let mut to_finalize: Vec<(RequestId, u64, u32)> = Vec::new();
-            {
-                let mut store = self.requests.borrow_mut();
-                for &rid in &self.batches[gid].prefill_admits {
-                    let r = &mut store[rid];
-                    r.prefill_processed = r.prompt_len;
-                    r.record_first_token(now, log_tokens);
-                    if r.is_complete() {
-                        completed.push(rid);
-                    } else {
-                        let kv = (r.prompt_len + r.prefix_kv) as u64;
-                        let remaining = r.decode_len.saturating_sub(r.tokens_emitted);
-                        to_finalize.push((rid, kv, remaining));
-                    }
-                }
-            }
-            for (rid, kv, remaining) in to_finalize {
-                self.batches[gid].finalize_to_decode(rid, kv, remaining);
-            }
-            self.batches[gid].prefill_admits.clear();
-
-            // (d) emit + release completed requests.
+            // (c) emit + release completed requests.
             for rid in completed {
                 let current_kv = self.batches[gid]
                     .decodes
@@ -309,20 +289,11 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         }
     }
 
-    // ── build_arch_input (§3.10) — one ArchGroupInput per DP shard ──────────────
+    // ── build_arch_input — one group, decode-only (no prefill on a decode worker)
 
     fn build_arch_input(&self) -> UnifiedArchInput {
-        let store = self.requests.borrow();
         let mut groups = Vec::with_capacity(self.batches.len());
         for b in &self.batches {
-            let mut prefill_chunk_pairs = Vec::new();
-            let mut prefill_tokens = 0u32;
-            for &rid in &b.prefill_admits {
-                let r = &store[rid];
-                prefill_chunk_pairs.push((r.prefix_kv, r.active_chunk_len));
-                prefill_tokens += r.active_chunk_len;
-            }
-
             let mut decode_kv_lens = Vec::new();
             let mut total_kv = 0u64;
             for (_, s) in b.iter_decoding() {
@@ -330,12 +301,11 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                 total_kv += s.current_kv;
             }
             let decode_tokens = decode_kv_lens.len() as u32;
-
             groups.push(ArchGroupInput {
-                batch_tokens: prefill_tokens + decode_tokens,
-                prefill_tokens,
+                batch_tokens: decode_tokens,
+                prefill_tokens: 0,
                 decode_tokens,
-                prefill_chunk_pairs,
+                prefill_chunk_pairs: Vec::new(),
                 decode_kv_lens,
                 total_kv_len: total_kv as u32,
             });
@@ -346,70 +316,27 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         }
     }
 
-    // ── lifecycle helpers (gid-aware; same as barebone) ─────────────────────────
-
-    fn promise(&mut self, gid: u16, rid: RequestId, p: u32, d: u32, prefix: u32) {
-        self.runtime
-            .promised
-            .insert(rid, (gid, (p + prefix + d) as u64));
-        self.runtime.request_to_group.insert(rid, gid);
-        let mut store = self.requests.borrow_mut();
-        store.mark_admitted(rid);
-        let r = &mut store[rid];
-        r.active_chunk_len = p;
-        r.prefix_kv = prefix;
-    }
-
-    fn drain_promises_into_admits(&mut self) {
-        let drained: Vec<(u16, RequestId)> = self
-            .runtime
-            .promised
-            .iter()
-            .map(|(&rid, &(gid, _))| (gid, rid))
-            .collect();
-        for (gid, rid) in drained {
-            self.runtime.promised.remove(&rid);
-            self.batches[gid as usize].prefill_admits.push(rid);
-        }
-    }
-
-    #[inline]
-    fn group_promised_kv(&self, gid: u16) -> u64 {
-        self.runtime
-            .promised
-            .values()
-            .filter(|(g, _)| *g == gid)
-            .map(|(_, t)| *t)
-            .sum()
-    }
-
-    /// External release (e.g. cancellation). Cleans up wherever the request sits.
     pub fn release_request(&mut self, rid: RequestId, current_kv: u64) -> Option<u16> {
-        if let Some(pos) = self.runtime.pending_prefills.iter().position(|&x| x == rid) {
-            self.runtime.pending_prefills.remove(pos);
+        if let Some(pos) = self.runtime.pending_decodes.iter().position(|&x| x == rid) {
+            self.runtime.pending_decodes.remove(pos);
             return None;
         }
         if let Some(gid) = self.runtime.request_to_group.remove(&rid) {
-            let b = &mut self.batches[gid as usize];
-            b.release(rid, current_kv);
-            if let Some(p) = b.prefill_admits.iter().position(|&x| x == rid) {
-                b.prefill_admits.swap_remove(p);
-            }
-            self.runtime.promised.remove(&rid);
+            self.batches[gid as usize].release(rid, current_kv);
             return Some(gid);
         }
         None
     }
 }
 
-impl<M: IterwiseUnifiedModel> IterWorker for HpUnifiedWorker<M> {
+impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
     fn id(&self) -> WorkerId {
         self.id
     }
 
     fn enqueue(&mut self, msg: WorkerMsg) {
         match msg {
-            WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
+            WorkerMsg::Request(rid) => self.runtime.pending_decodes.push_back(rid),
         }
     }
 
@@ -427,15 +354,9 @@ impl<M: IterwiseUnifiedModel> IterWorker for HpUnifiedWorker<M> {
             .iter()
             .map(|b| b.iter_decoding().count() as u32)
             .sum();
-        let prefill_admits: u32 = self
-            .batches
-            .iter()
-            .map(|b| b.prefill_admits.len() as u32)
-            .sum();
-        let active = live_decodes + self.runtime.promised.len() as u32 + prefill_admits;
         WorkerStatus {
-            queued_requests: self.runtime.pending_prefills.len() as u32,
-            active_requests: active,
+            queued_requests: self.runtime.pending_decodes.len() as u32,
+            active_requests: live_decodes,
         }
     }
 }
@@ -448,16 +369,15 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    /// Fixed-cost stand-in for an L4 model with a configurable DP-group count.
-    struct FakeDpModel {
+    struct FakeModel {
         ms: f64,
         dp_groups: u16,
     }
-    impl IterwiseUnifiedModel for FakeDpModel {
-        fn eval_iter(&self, batch: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+    impl IterwiseUnifiedModel for FakeModel {
+        fn eval_iter(&self, b: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
             slots.clear();
-            // Assert the worker fed us exactly one group per DP shard.
-            assert_eq!(batch.groups.len(), self.dp_groups as usize);
+            // The worker must feed exactly one decode group per DP shard.
+            assert_eq!(b.groups.len(), self.dp_groups as usize);
             LeafMetrics {
                 m: Metrics4 {
                     time_ms: self.ms as f32,
@@ -472,27 +392,39 @@ mod tests {
             1
         }
         fn gpus_per_replica(&self) -> u16 {
-            self.dp_groups // not under test here
+            self.dp_groups
         }
         fn num_attn_dp_groups(&self) -> u16 {
             self.dp_groups
         }
     }
 
-    fn shared_with(reqs: &[(u32, u32, u32)]) -> SharedRequests {
+    /// A request whose prefill is "already done": prompt set, first token emitted.
+    fn prefilled_store(reqs: &[(u32, u32, u32)]) -> SharedRequests {
         let store = Rc::new(RefCell::new(RequestStore::new()));
         for &(id, prompt, decode) in reqs {
-            store
-                .borrow_mut()
-                .insert(&Request::new(RequestId(id), prompt, decode, Time::ZERO));
+            let r = Request::new(RequestId(id), prompt, decode, Time::ZERO);
+            store.borrow_mut().insert(&r);
+            // Mimic the prefill pool's handoff state on the store record: prefill
+            // processed, first token already emitted.
+            let mut s = store.borrow_mut();
+            let rec = &mut s[RequestId(id)];
+            rec.prefill_processed = prompt;
+            rec.tokens_emitted = 1;
+            rec.first_token_time = Some(Time::ZERO);
+            rec.last_token_time = Some(Time::ZERO);
         }
         store
     }
 
-    fn worker(store: SharedRequests, dp_groups: u16) -> HpUnifiedWorker<FakeDpModel> {
-        HpUnifiedWorker::new(
+    fn worker(store: SharedRequests) -> PdDecodeWorker<FakeModel> {
+        worker_dp(store, 1)
+    }
+
+    fn worker_dp(store: SharedRequests, dp_groups: u16) -> PdDecodeWorker<FakeModel> {
+        PdDecodeWorker::new(
             WorkerId(0),
-            Arc::new(FakeDpModel { ms: 1.0, dp_groups }),
+            Arc::new(FakeModel { ms: 1.0, dp_groups }),
             store,
             WorkerConfig::default(),
             None,
@@ -500,21 +432,61 @@ mod tests {
     }
 
     #[test]
-    fn builds_one_batch_per_dp_group() {
-        let w = worker(shared_with(&[]), 2);
-        assert_eq!(w.batches.len(), 2);
+    fn handed_off_request_decodes_to_completion() {
+        // prompt 16, decode 3 → prefill already emitted token 1, decode emits 2 more.
+        let store = prefilled_store(&[(0, 16, 3)]);
+        let mut w = worker(Rc::clone(&store));
+        w.enqueue(WorkerMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        for step in 0..50u64 {
+            w.tick(Time::from_ms(step as f64));
+            events.extend(w.drain_events());
+        }
+        assert_eq!(
+            events,
+            vec![WorkerEvent::RequestComplete { req: RequestId(0) }]
+        );
+        let s = store.borrow();
+        let r = &s[RequestId(0)];
+        assert!(r.completed);
+        assert_eq!(r.tokens_emitted, 3);
     }
 
     #[test]
-    fn round_robin_spreads_fresh_prefills_across_groups() {
-        // Two long-decode requests, two groups: RR routes them to distinct groups.
-        // One prefill is admitted per iter (1ms each), so by ~step 2 both are live
-        // in decode; the long decode budget keeps them alive past the probe.
-        let store = shared_with(&[(0, 4, 50), (1, 4, 50)]);
-        let mut w = worker(store, 2);
+    fn multiple_handed_off_requests_all_complete() {
+        let store = prefilled_store(&[(0, 8, 2), (1, 8, 2), (2, 8, 2)]);
+        let mut w = worker(Rc::clone(&store));
+        for id in [0, 1, 2] {
+            w.enqueue(WorkerMsg::Request(RequestId(id)));
+        }
+        let mut n = 0;
+        for step in 0..200u64 {
+            w.tick(Time::from_ms(step as f64));
+            n += w.drain_events().len();
+        }
+        assert_eq!(n, 3);
+        let s = store.borrow();
+        for id in [0, 1, 2] {
+            assert!(s[RequestId(id)].completed, "req {id} should complete");
+        }
+    }
+
+    #[test]
+    fn builds_one_decode_group_per_dp_shard() {
+        let w = worker_dp(prefilled_store(&[]), 2);
+        assert_eq!(w.batches.len(), 2);
+        // build_arch_input emits one group per shard (also asserted in eval_iter).
+        assert_eq!(w.build_arch_input().groups.len(), 2);
+    }
+
+    #[test]
+    fn dp_decode_round_robins_handoffs_across_shards() {
+        // Two long-decode handed-off requests, two DP shards: RR routes one to each.
+        let store = prefilled_store(&[(0, 4, 50), (1, 4, 50)]);
+        let mut w = worker_dp(store, 2);
         w.enqueue(WorkerMsg::Request(RequestId(0)));
         w.enqueue(WorkerMsg::Request(RequestId(1)));
-        for step in 0..20u64 {
+        for step in 0..10u64 {
             w.tick(Time::from_ms(step as f64));
         }
         let g0 = w.batches[0].iter_decoding().count();
@@ -522,35 +494,26 @@ mod tests {
         assert_eq!(
             (g0, g1),
             (1, 1),
-            "RoundRobin must place one request in each group"
+            "RoundRobin must place one decode in each DP shard"
         );
     }
 
     #[test]
-    fn build_arch_input_yields_one_group_per_shard() {
-        let w = worker(shared_with(&[]), 3);
-        let ai = w.build_arch_input();
-        assert_eq!(ai.groups.len(), 3);
-    }
-
-    #[test]
-    fn all_arrivals_complete() {
-        let store = shared_with(&[(0, 4, 2), (1, 4, 2), (2, 4, 2)]);
-        let mut w = worker(store, 2);
-        for id in 0..3u32 {
+    fn dp_decode_all_complete() {
+        let store = prefilled_store(&[(0, 8, 2), (1, 8, 2), (2, 8, 2), (3, 8, 2)]);
+        let mut w = worker_dp(Rc::clone(&store), 2);
+        for id in 0..4u32 {
             w.enqueue(WorkerMsg::Request(RequestId(id)));
         }
-        let mut completed = Vec::new();
-        for step in 0..500u64 {
+        let mut n = 0;
+        for step in 0..200u64 {
             w.tick(Time::from_ms(step as f64));
-            for e in w.drain_events() {
-                let WorkerEvent::RequestComplete { req } = e else {
-                    continue;
-                };
-                completed.push(req);
-            }
+            n += w.drain_events().len();
         }
-        completed.sort_by_key(|r| r.0);
-        assert_eq!(completed, (0..3).map(RequestId).collect::<Vec<_>>());
+        assert_eq!(n, 4);
+        let s = store.borrow();
+        for id in 0..4u32 {
+            assert!(s[RequestId(id)].completed, "req {id} should complete");
+        }
     }
 }
