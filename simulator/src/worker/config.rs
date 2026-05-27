@@ -39,6 +39,15 @@ pub enum IterWorkerSel {
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
     },
+    /// Multi-group HP/DP worker: maintains one `Batch` per attention DP shard
+    /// (count comes from the arch's `num_attn_dp_groups`). Pairs with a DP-attention
+    /// arch such as `llama3_dp_attn_tp_ffn`.
+    HpUnified {
+        /// GPU memory for the worker (GB; primarily KV cache budget). Sizes each
+        /// DP shard's KV pool.
+        #[param(default = 80.0)]
+        attn_gpu_memory_gb: f64,
+    },
     ChunkedPrefill {
         /// GPU memory for the worker (GB; primarily KV cache budget).
         #[param(default = 80.0)]

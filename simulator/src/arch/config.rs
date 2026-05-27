@@ -63,6 +63,18 @@ pub enum IterArchSel {
         #[param(default = 2, cache_key)]
         tp_size: u16,
     },
+    Llama3DpAttnTpFfn {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Attention tensor-parallelism size (heads sharded across these ranks).
+        /// DP groups = `ffn_tp_size / attn_tp_size`.
+        #[param(default = 4, cache_key)]
+        attn_tp_size: u16,
+        /// FFN tensor-parallelism size (hidden/intermediate sharded; spans the
+        /// whole replica).
+        #[param(default = 8, cache_key)]
+        ffn_tp_size: u16,
+    },
     DeepseekMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -81,6 +93,7 @@ impl IterArchSel {
         match self {
             Self::Llama3Dense { model }
             | Self::Llama3DenseTp { model, .. }
+            | Self::Llama3DpAttnTpFfn { model, .. }
             | Self::DeepseekMoe { model, .. } => model,
         }
     }

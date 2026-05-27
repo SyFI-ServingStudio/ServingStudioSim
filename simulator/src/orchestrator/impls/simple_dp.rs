@@ -4,7 +4,7 @@
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time};
-use crate::worker::{BareboneWorker, WorkerEvent, WorkerMsg};
+use crate::worker::{IterWorker, WorkerEvent, WorkerMsg};
 
 use super::super::{Flow, GpuInventory, OrchAction, PoolEvent, UnifiedWorkerFactory};
 
@@ -33,14 +33,15 @@ pub struct SimpleDpConfig {
 
 // ── L6a: pool-local orchestration ─────────────────────────────────────────────
 
-pub struct SimpleDpPoolController<M: IterwiseUnifiedModel> {
+pub struct SimpleDpPoolController<M: IterwiseUnifiedModel, W: IterWorker> {
     pool: PoolId,
-    workers: Vec<BareboneWorker<M>>,
+    workers: Vec<W>,
     placement: DpPlacementPolicy,
     rr_next: usize,
+    _model: std::marker::PhantomData<M>,
 }
 
-impl<M: IterwiseUnifiedModel> SimpleDpPoolController<M> {
+impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
     // ── Construction ──────────────────────────────────────────────────────────
     /// Build the pool's workers and register their GPUs into the *run-level*
     /// `inventory` (passed by `&mut`, not owned here). Allocating into a shared
@@ -50,23 +51,23 @@ impl<M: IterwiseUnifiedModel> SimpleDpPoolController<M> {
     /// restarting at 0.
     pub fn new(
         cfg: &SimpleDpPoolConfig,
-        factory: &UnifiedWorkerFactory<M>,
+        factory: &UnifiedWorkerFactory<M, W>,
         inventory: &mut GpuInventory,
     ) -> Self {
-        let workers: Vec<BareboneWorker<M>> =
-            (0..cfg.num_workers).map(|i| factory.build(i)).collect();
+        let workers: Vec<W> = (0..cfg.num_workers).map(|i| factory.build(i)).collect();
         assert!(!workers.is_empty(), "simple_dp needs at least one worker");
         // One block of `gpus_per_worker` contiguous ids per worker, in build order
         // (ref's `allocate(n)` shape). The GPU facts come from the factory, which
         // stamped these workers.
         for w in &workers {
-            inventory.allocate(cfg.pool.0, w.id.0, factory.gpus_per_worker, &factory.gpu_name);
+            inventory.allocate(cfg.pool.0, w.id().0, factory.gpus_per_worker, &factory.gpu_name);
         }
         Self {
             pool: cfg.pool,
             workers,
             placement: cfg.placement,
             rr_next: 0,
+            _model: std::marker::PhantomData,
         }
     }
 
@@ -113,7 +114,7 @@ impl<M: IterwiseUnifiedModel> SimpleDpPoolController<M> {
         let mut out = Vec::new();
         let pool = self.pool;
         for w in &mut self.workers {
-            let worker_id = w.id;
+            let worker_id = w.id();
             for event in w.drain_events() {
                 match event {
                     WorkerEvent::RequestComplete { req } => {
@@ -132,17 +133,17 @@ impl<M: IterwiseUnifiedModel> SimpleDpPoolController<M> {
 
 // ── L6b: deployment flow (the object L7 calls) ────────────────────────────────
 
-pub struct SimpleDpFlow<M: IterwiseUnifiedModel> {
+pub struct SimpleDpFlow<M: IterwiseUnifiedModel, W: IterWorker> {
     requests: SharedRequests,
-    dp_pool: SimpleDpPoolController<M>,
+    dp_pool: SimpleDpPoolController<M, W>,
     /// Run-level GPU registry, aggregated across all pools as they are built. Lives
     /// on the flow (not the pool) so a multi-pool deployment surfaces one combined
     /// inventory with globally-unique ids.
     inventory: GpuInventory,
 }
 
-impl<M: IterwiseUnifiedModel> SimpleDpFlow<M> {
-    pub fn new(cfg: SimpleDpConfig, factory: UnifiedWorkerFactory<M>) -> Self {
+impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpFlow<M, W> {
+    pub fn new(cfg: SimpleDpConfig, factory: UnifiedWorkerFactory<M, W>) -> Self {
         let requests = std::rc::Rc::clone(&factory.requests);
         // The run-level inventory is built here and threaded into each pool's
         // construction; simple_dp has one pool today, but the ownership is what a
@@ -159,7 +160,7 @@ impl<M: IterwiseUnifiedModel> SimpleDpFlow<M> {
     }
 }
 
-impl<M: IterwiseUnifiedModel> Flow for SimpleDpFlow<M> {
+impl<M: IterwiseUnifiedModel, W: IterWorker> Flow for SimpleDpFlow<M, W> {
     fn on_arrival(&mut self, req: Request) {
         let rid = req.id;
         self.requests.borrow_mut().insert(&req);
@@ -187,7 +188,7 @@ mod tests {
     use crate::common::RequestStore;
     use crate::timing::cache::interp::{CoverageFlags, Metrics4};
     use crate::timing::LeafMetrics;
-    use crate::worker::WorkerConfig;
+    use crate::worker::{BareboneWorker, WorkerConfig};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -216,7 +217,10 @@ mod tests {
         }
     }
 
-    fn build_flow(num_workers: u16, placement: DpPlacementPolicy) -> (SimpleDpFlow<FakeModel>, SharedRequests) {
+    fn build_flow(
+        num_workers: u16,
+        placement: DpPlacementPolicy,
+    ) -> (SimpleDpFlow<FakeModel, BareboneWorker<FakeModel>>, SharedRequests) {
         let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
         let factory = UnifiedWorkerFactory::new(
             Arc::new(FakeModel { ms: 1.0 }),
@@ -225,6 +229,7 @@ mod tests {
             None,
             "test-gpu".to_string(),
             1,
+            BareboneWorker::<FakeModel>::new,
         );
         let cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
