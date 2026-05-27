@@ -177,7 +177,7 @@ async def run_analysis(
     Async: across a sweep, many runs' analyze+render overlap under the existing
     semaphore instead of serializing on a blocking call that stalls the event loop.
 
-    `subjects` is the *intent* layer: which subjects to run (e.g. `["slo"]`).
+    `subjects` is the *intent* layer: which subjects to run (e.g. `["slo-general"]`).
     `None`/empty = all subjects applicable to the run's deployment (the analyzer
     self-selects via its applicability gate — the launcher never decides what is
     *applicable*, only what is *wanted*).

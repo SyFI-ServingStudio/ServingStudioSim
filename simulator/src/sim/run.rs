@@ -412,16 +412,26 @@ fn state_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestStateEnt
 }
 
 fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
+    // Per-token array only when it was logged (empty otherwise) — feeds the
+    // `slo-detailed` ITL. The `slo-general` scalars below are computed from the
+    // always-tracked first/last token times + count, so they survive the array
+    // being off.
     let times_ms: Vec<f32> = rec
         .output_token_times
         .iter()
         .map(|t| t.as_ms() as f32)
         .collect();
-    let ttft_ms = rec
-        .first_token_time
-        .map(|t| (t.as_ms() - rec.arrival_time.as_ms()) as f32);
-    // TPOT percentiles are derived on the writer thread from `output_token_times_ms`
-    // (see `log::rows::tpot_stats_ms`); the sort no longer runs on the sim hot path.
+    let first_ms = rec.first_token_time.map(|t| t.as_ms());
+    let last_ms = rec.last_token_time.map(|t| t.as_ms());
+    let ttft_ms = first_ms.map(|f| (f - rec.arrival_time.as_ms()) as f32);
+    let finish_decode_time_ms = last_ms.map(|l| l as f32);
+    // Mean inter-token gap = total decode span / number of gaps (tokens − 1).
+    let tpot_mean_ms = match (first_ms, last_ms) {
+        (Some(f), Some(l)) if rec.tokens_emitted > 1 => {
+            Some(((l - f) / (rec.tokens_emitted - 1) as f64) as f32)
+        }
+        _ => None,
+    };
     RequestSloEntry {
         request_id: id.0,
         logging_time_ms: now.as_ms(),
@@ -429,6 +439,9 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         arrival_time_ms: rec.arrival_time.as_ms(),
         output_token_times_ms: times_ms,
         ttft_ms,
+        num_output_tokens: rec.tokens_emitted,
+        tpot_mean_ms,
+        finish_decode_time_ms,
     }
 }
 
@@ -501,7 +514,8 @@ mod tests {
         let factory = UnifiedWorkerFactory::new(
             Arc::new(FakeModel { ms: 1.0 }),
             Rc::clone(&store),
-            WorkerConfig::default(),
+            // This test asserts the per-token array length, so opt into it.
+            WorkerConfig { log_output_token_times: true, ..WorkerConfig::default() },
             None,
             "test-gpu".to_string(),
             1,

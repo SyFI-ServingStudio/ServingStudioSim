@@ -167,7 +167,7 @@ pub fn request_state_schema() -> Arc<Schema> {
 /// `request_slo` (§7.2) — one row per request with full per-token timing.
 /// Column list / types / nullability match `docs/logging.md §7.2`.
 /// `output_token_times` is `List<f32>` (absolute sim-time ms); it is empty
-/// unless `io.log_token_times` is on (the scalars below are always present).
+/// unless `io.log_output_token_times` is on (the scalars below are always present).
 /// The convenience scalars (`ttft_ms`, `tpot_*_ms`, `last_token_time_ms`) are
 /// nullable: `null` when there are too few output tokens to define them (e.g. a
 /// sim-end-flush of a request still in prefill). `finish_decode_time_ms` is the

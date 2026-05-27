@@ -88,19 +88,30 @@ impl RequestRecord {
         self.tokens_emitted >= self.decode_len
     }
 
-    /// Prefill resolved → first output token emitted.
-    pub fn record_first_token(&mut self, now: Time) {
+    /// Prefill resolved → first output token emitted. `log_tokens` mirrors
+    /// `io.log_output_token_times`: when off, the per-token array is never
+    /// allocated or appended (the scalars below feed `slo-general` regardless).
+    pub fn record_first_token(&mut self, now: Time, log_tokens: bool) {
         self.tokens_emitted = 1;
         self.first_token_time = Some(now);
         self.last_token_time = Some(now);
-        self.output_token_times.push(now);
+        if log_tokens {
+            // The full decode length is known up front, so size the per-token
+            // buffer exactly once here (only for requests that actually start
+            // decoding) — the alternative is ~log2(decode_len) doubling reallocs
+            // per request, each memcpy'ing the growing array.
+            self.output_token_times.reserve_exact(self.decode_len as usize);
+            self.output_token_times.push(now);
+        }
     }
 
-    /// One decode step produced a token.
-    pub fn record_token(&mut self, now: Time) {
+    /// One decode step produced a token. `log_tokens`: see `record_first_token`.
+    pub fn record_token(&mut self, now: Time, log_tokens: bool) {
         self.tokens_emitted += 1;
         self.last_token_time = Some(now);
-        self.output_token_times.push(now);
+        if log_tokens {
+            self.output_token_times.push(now);
+        }
         if self.is_complete() {
             self.completed = true;
         }

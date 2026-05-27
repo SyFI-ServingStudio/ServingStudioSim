@@ -9,14 +9,18 @@ from __future__ import annotations
 import multiprocessing
 import sys
 from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
 from request import slo_plot
 from throughput import segment_plot
 
+# Keys match the analyzer subjects (registry.rs). Both SLO subjects share one
+# renderer, bound to their respective payload file.
 RENDERERS = {
-    "slo": slo_plot.render,
+    "slo-general": partial(slo_plot.render, payload_name="slo_general_cdf.json"),
+    "slo-detailed": partial(slo_plot.render, payload_name="slo_detailed_cdf.json"),
     "throughput": segment_plot.render,
 }
 

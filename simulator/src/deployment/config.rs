@@ -69,13 +69,15 @@ pub struct IoSpec {
     pub quiet: bool,
     /// Force-refresh perf_api rows while building startup caches.
     pub force_cache_build: bool,
-    /// Persist the full per-token `output_token_times` array on each
-    /// `request_slo` row (enables analyzer ITL / per-token timelines). OFF by
-    /// default: that list is the dominant `request_slo` size + writer-encode
-    /// cost on high-throughput runs, and the per-request scalars (ttft, tpot
-    /// percentiles, last_token_time → E2E) are always logged regardless. Turn
-    /// on only when per-token granularity is actually needed.
-    pub log_token_times: bool,
+    /// Record + persist the full per-token `output_token_times` array on each
+    /// `request_slo` row (enables the analyzer's `slo-detailed` ITL metric). OFF
+    /// by default: building that per-token array on the sim hot path is the
+    /// single largest cost on high-throughput runs (a scattered write per token
+    /// per request), and the per-request scalars feeding `slo-general` (ttft,
+    /// tpot mean, last_token_time → E2E) are derived without it. When off, the
+    /// worker neither allocates nor appends the array. Turn on only when
+    /// per-token granularity (ITL) is actually needed.
+    pub log_output_token_times: bool,
 }
 
 /// Top-level config, dispatched on the `deployment` tag.
@@ -164,7 +166,7 @@ mod tests {
     const UNIFIED_YAML: &str = r#"
 deployment: unified
 workload: { trace_files: ["trace/smoke.csv"], duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
-io: { log_dir: "logs/smoke", log_level: info, quiet: false, force_cache_build: false, log_token_times: false }
+io: { log_dir: "logs/smoke", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   main:
     placement: least-queued
@@ -210,7 +212,7 @@ pools:
         let json = serde_json::json!({
             "deployment": "unified",
             "workload": {"trace_files": ["t.csv"], "duration_ms": 5000.0, "run_to_end": true, "request_rate": 10.0},
-            "io": {"log_dir": "logs", "log_level": "info", "quiet": false, "force_cache_build": false, "log_token_times": false},
+            "io": {"log_dir": "logs", "log_level": "info", "quiet": false, "force_cache_build": false, "log_output_token_times": false},
             "pools": {"main": {"placement": "least-queued", "groups": [
                 {"gpu": "H200", "replicas": 1,
                  "arch": {"type": "llama3_dense", "model_config": "m.json", "fp8": false},
@@ -253,7 +255,7 @@ pools:
         let yaml = r#"
 deployment: pd
 workload: { trace_files: ["t.csv"], duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
-io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_token_times: false }
+io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   prefill:
     placement: least-queued

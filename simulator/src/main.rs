@@ -154,7 +154,7 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     let mut flow = build_flow(&cfg, &bridge, Rc::clone(&store))?;
 
     let log_dir = &cfg.io().log_dir;
-    let mut logger = LoggerSession::open(log_dir, cfg.io().log_token_times)?;
+    let mut logger = LoggerSession::open(log_dir, cfg.io().log_output_token_times)?;
     // Run-level GPU facts sidecar (L7): written before the tick loop so the
     // analyzer can normalize per-GPU even if the run later fails.
     simulator::log::write_run_meta(log_dir, flow.inventory())?;
