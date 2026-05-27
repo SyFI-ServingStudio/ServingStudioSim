@@ -1,0 +1,31 @@
+deployment: pd
+
+workload:
+  trace_files:
+    - trace/smoke.csv
+  run_to_end: true
+
+io:
+  log_dir: logs/pd_smoke
+
+pools:
+  prefill:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: llama3_dense_tp
+          model_config: model/config/llama3_8b.json
+          tp_size: 1
+        worker:
+          type: pd_prefill
+  decode:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: llama3_dense_tp
+          model_config: model/config/llama3_8b.json
+          tp_size: 1
+        worker:
+          type: pd_decode

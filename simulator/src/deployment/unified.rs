@@ -70,6 +70,9 @@ impl Deployment for UnifiedDeployment {
             IterWorkerSel::ChunkedPrefill { .. } => {
                 bail!("unified: chunked_prefill worker not wired yet")
             }
+            IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => {
+                bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
+            }
         };
         let worker_config = WorkerConfig {
             attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,

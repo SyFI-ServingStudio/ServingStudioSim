@@ -8,7 +8,8 @@
 //! function pointer — so the trait carries only the per-tick driving methods.
 
 use crate::common::{Time, WorkerId};
-use crate::worker::unified::{BareboneWorker, WorkerEvent, WorkerMsg, WorkerStatus};
+use crate::worker::types::{WorkerEvent, WorkerMsg, WorkerStatus};
+use crate::worker::unified::BareboneWorker;
 use crate::arch::contract::IterwiseUnifiedModel;
 
 /// The surface L6 drives a unified worker through each tick: read its id (for GPU

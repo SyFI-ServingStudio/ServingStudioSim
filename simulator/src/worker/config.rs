@@ -58,6 +58,18 @@ pub enum IterWorkerSel {
         #[param(string, default = "mix", choices = BATCH_POLICY_CHOICES)]
         batch_policy: BatchPolicy,
     },
+    /// PD prefill half: prefills then hands off to a decode pool (no local decode).
+    PdPrefill {
+        /// GPU memory for the worker (GB; primarily KV cache budget).
+        #[param(default = 80.0)]
+        attn_gpu_memory_gb: f64,
+    },
+    /// PD decode half: admits already-prefilled requests straight into decode.
+    PdDecode {
+        /// GPU memory for the worker (GB; primarily KV cache budget).
+        #[param(default = 80.0)]
+        attn_gpu_memory_gb: f64,
+    },
 }
 
 // ── layer-wise attn / ffn contract (afd) — config types only, build() bails ──

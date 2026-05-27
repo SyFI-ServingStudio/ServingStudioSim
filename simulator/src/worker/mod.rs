@@ -9,13 +9,18 @@ pub mod admission_helpers;
 pub mod config;
 pub mod hp_unified;
 pub mod iter_worker;
+pub mod pd_decode;
+pub mod pd_prefill;
+pub mod types;
 pub mod unified;
 
 pub use admission_helpers::{Batch, DecodeReqState, KvAdmission, KvPool, LoadBalance};
 pub use config::{AttnWorkerSel, BatchPolicy, FfnWorkerSel, IterWorkerSel};
 pub use hp_unified::HpUnifiedWorker;
 pub use iter_worker::IterWorker;
-pub use unified::{
-    BareboneWorker, BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState,
-    WorkerMsg, WorkerStatus,
+pub use pd_decode::PdDecodeWorker;
+pub use pd_prefill::PdPrefillWorker;
+pub use types::{
+    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
 };
+pub use unified::BareboneWorker;

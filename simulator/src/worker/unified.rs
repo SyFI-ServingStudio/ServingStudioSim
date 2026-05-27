@@ -18,73 +18,12 @@ use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInp
 use crate::common::{RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
 use crate::timing::LeafMetrics;
-use crate::worker::admission_helpers::{Batch, KvAdmission, LoadBalance};
+use crate::worker::admission_helpers::Batch;
+use crate::worker::types::{
+    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
+};
 
-// ── FSM types ────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkerFsmState {
-    Idle,
-    Active,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IterCursor {
-    NotStarted,
-    Computing,
-    Done,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct BatchFsmState {
-    pub cursor: IterCursor,
-    pub compute_end: Time,
-}
-
-// ── Messages / events / status (L6 interface) ─────────────────────────────────
-
-#[derive(Clone, Debug)]
-pub enum WorkerMsg {
-    Request(RequestId),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WorkerEvent {
-    RequestComplete { req: RequestId },
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct WorkerStatus {
-    pub queued_requests: u32,
-    pub active_requests: u32,
-}
-
-// ── Config / runtime ──────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug)]
-pub struct WorkerConfig {
-    pub admission: KvAdmission,
-    pub balance: LoadBalance,
-    /// This worker's KV-cache memory allowance in bytes (its GPU's attention
-    /// budget). Same per-worker tier as `gpu_name`; the worker divides it by the
-    /// model's `kv_bytes_per_token` to size its `KvPool`.
-    pub attn_kv_bytes: u64,
-    /// Mirror of `io.log_output_token_times`: when off, decodes do not build the
-    /// per-token timestamp array (the hot-path cost on saturated runs). Threaded
-    /// to `RequestRecord::record_token` / `record_first_token`.
-    pub log_output_token_times: bool,
-}
-
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self {
-            admission: KvAdmission::Strict,
-            balance: LoadBalance::Single,
-            attn_kv_bytes: 80_000_000_000, // 80 GB
-            log_output_token_times: false,
-        }
-    }
-}
+// ── Runtime ────────────────────────────────────────────────────────────────────
 
 struct WorkerRuntime {
     pending_prefills: VecDeque<RequestId>,

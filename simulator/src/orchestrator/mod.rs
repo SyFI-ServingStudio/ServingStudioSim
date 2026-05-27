@@ -11,7 +11,8 @@ pub mod config;
 
 pub use self::common::{GpuInfo, GpuInventory, OrchAction, PoolEvent, UnifiedWorkerFactory};
 pub use impls::{
-    DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, SimpleDpPoolController,
+    DpPlacementPolicy, PdFlow, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig,
+    SimpleDpPoolController, PD_DECODE_POOL, PD_PREFILL_POOL,
 };
 pub use config::{GroupSpec, PlacementPolicy, PoolSpec};
 

@@ -9,6 +9,7 @@
 //! `schema::dump` (a structural registry), not on this trait.
 
 pub mod config;
+pub mod pd;
 pub mod unified;
 
 pub use config::{AfdConfig, IoSpec, LogLevel, PdConfig, RunConfig, UnifiedConfig, WorkloadSpec};
@@ -27,7 +28,7 @@ pub fn build_flow(
 ) -> anyhow::Result<Box<dyn Flow>> {
     match cfg {
         RunConfig::Unified(c) => unified::UnifiedDeployment::build(c, bridge, store),
-        RunConfig::Pd(_) => anyhow::bail!("pd deployment not wired yet"),
+        RunConfig::Pd(c) => pd::PdDeployment::build(c, bridge, store),
         RunConfig::Afd(_) => anyhow::bail!("afd deployment not wired yet"),
     }
 }
