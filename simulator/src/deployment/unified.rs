@@ -16,15 +16,19 @@ use anyhow::{bail, ensure, Context};
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::arch::model_cfg::ModelCfg;
-use crate::arch::{llama3_dense, llama3_dense_tp, DenseParallel, DenseTpParallel, IterArchSel};
+use crate::arch::{
+    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, DenseParallel, DenseTpParallel,
+    DpAttnTpFfnParallel, IterArchSel,
+};
 use crate::common::{PoolId, SharedRequests};
 use crate::deployment::UnifiedConfig;
+use crate::orchestrator::common::WorkerBuildFn;
 use crate::orchestrator::{
     DpPlacementPolicy, Flow, PlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig,
     UnifiedWorkerFactory,
 };
 use crate::timing::PerfApiBridge;
-use crate::worker::{IterWorkerSel, WorkerConfig};
+use crate::worker::{BareboneWorker, HpUnifiedWorker, IterWorker, IterWorkerSel, WorkerConfig};
 
 use super::Deployment;
 
@@ -56,10 +60,13 @@ impl Deployment for UnifiedDeployment {
             model_cfg.num_layers = n;
         }
 
-        // L5 worker env: only `attn_kv_bytes` has a sink today (the barebone
-        // worker sizes its own KvPool). chunked_prefill is not wired yet.
+        // L5 worker env: only `attn_kv_bytes` has a sink today (the worker sizes
+        // its own KvPool). Both wired workers (barebone, hp_unified) carry the KV
+        // budget; the worker *type* is matched against the arch in the arms below.
+        // chunked_prefill is not wired yet.
         let attn_gpu_memory_gb = match &g.worker {
-            IterWorkerSel::Barebone { attn_gpu_memory_gb } => *attn_gpu_memory_gb,
+            IterWorkerSel::Barebone { attn_gpu_memory_gb }
+            | IterWorkerSel::HpUnified { attn_gpu_memory_gb } => *attn_gpu_memory_gb,
             IterWorkerSel::ChunkedPrefill { .. } => {
                 bail!("unified: chunked_prefill worker not wired yet")
             }
@@ -81,9 +88,12 @@ impl Deployment for UnifiedDeployment {
         let gpu_name = g.gpu.clone();
 
         // Arch selected by explicit tag; each arm builds its own concrete model
-        // type and erases via assemble_flow.
+        // type, validates the paired worker tag, and erases via assemble_flow.
+        // dense / dense_tp run on the single-group barebone worker; the DP-attn
+        // arch runs on the multi-group hp_unified worker (one Batch per DP shard).
         match &g.arch {
             IterArchSel::Llama3Dense { .. } => {
+                ensure_barebone(&g.worker)?;
                 let parallel = DenseParallel {
                     gpu_name: gpu_name.clone(),
                 };
@@ -100,9 +110,11 @@ impl Deployment for UnifiedDeployment {
                     log_dir,
                     gpu_name,
                     dp_cfg,
+                    BareboneWorker::new,
                 ))
             }
             IterArchSel::Llama3DenseTp { tp_size, .. } => {
+                ensure_barebone(&g.worker)?;
                 let parallel = DenseTpParallel {
                     tp_size: *tp_size,
                     gpu_name: gpu_name.clone(),
@@ -122,6 +134,36 @@ impl Deployment for UnifiedDeployment {
                     log_dir,
                     gpu_name,
                     dp_cfg,
+                    BareboneWorker::new,
+                ))
+            }
+            IterArchSel::Llama3DpAttnTpFfn {
+                attn_tp_size,
+                ffn_tp_size,
+                ..
+            } => {
+                ensure_hp_unified(&g.worker)?;
+                let parallel = DpAttnTpFfnParallel {
+                    attn_tp_size: *attn_tp_size,
+                    ffn_tp_size: *ffn_tp_size,
+                    gpu_name: gpu_name.clone(),
+                };
+                let resolved = llama3_dp_attn_tp_ffn::resolve_configs(
+                    &llama3_dp_attn_tp_ffn::build_configs(&model_cfg, &parallel),
+                );
+                let model = Arc::new(
+                    llama3_dp_attn_tp_ffn::build("unified".to_string(), resolved, bridge).context(
+                        "building Llama3 DP-attn TP-ffn model (often a missing profile.db row)",
+                    )?,
+                );
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    HpUnifiedWorker::new,
                 ))
             }
             IterArchSel::DeepseekMoe { .. } => bail!("unified: deepseek_moe arch not wired yet"),
@@ -129,19 +171,44 @@ impl Deployment for UnifiedDeployment {
     }
 }
 
+/// The dense / dense_tp archs run on the single-group barebone worker.
+fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::Barebone { .. } => Ok(()),
+        other => bail!("unified: this arch requires worker `barebone`, got {other:?}"),
+    }
+}
+
+/// The DP-attention arch runs on the multi-group hp_unified worker.
+fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::HpUnified { .. } => Ok(()),
+        other => bail!("unified: llama3_dp_attn_tp_ffn requires worker `hp_unified`, got {other:?}"),
+    }
+}
+
 /// Wrap a built iter-wise model in a `simple_dp` flow. Generic over the concrete
-/// model `M`; the returned `Box<dyn Flow>` is the only `dyn` erasure point.
-fn assemble_flow<M: IterwiseUnifiedModel>(
+/// model `M` and worker `W`; `build_fn` is the chosen worker's `new`. The returned
+/// `Box<dyn Flow>` is the only `dyn` erasure point.
+fn assemble_flow<M: IterwiseUnifiedModel, W: IterWorker + 'static>(
     model: Arc<M>,
     store: SharedRequests,
     worker_config: WorkerConfig,
     log_dir: Option<PathBuf>,
     gpu_name: String,
     dp_cfg: SimpleDpConfig,
+    build_fn: WorkerBuildFn<M, W>,
 ) -> Box<dyn Flow> {
     let gpus_per_worker = model.gpus_per_replica();
-    let factory =
-        UnifiedWorkerFactory::new(model, store, worker_config, log_dir, gpu_name, gpus_per_worker);
+    let factory = UnifiedWorkerFactory::new(
+        model,
+        store,
+        worker_config,
+        log_dir,
+        gpu_name,
+        gpus_per_worker,
+        build_fn,
+    );
     Box::new(SimpleDpFlow::new(dp_cfg, factory))
 }
 

@@ -271,4 +271,43 @@ pools:
         assert_eq!(p.pools.prefill.groups[0].replicas, 2);
         assert_eq!(p.pools.decode.groups[0].replicas, 4);
     }
+
+    #[test]
+    fn dp_attn_tp_ffn_with_hp_unified_parses() {
+        // DP-attention arch carries two TP degrees; pairs with the hp_unified worker.
+        let yaml = r#"
+deployment: unified
+workload: { trace_files: ["t.csv"], duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
+io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
+pools:
+  main:
+    placement: least-queued
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch: { type: llama3_dp_attn_tp_ffn, model_config: "m.json", fp8: false, attn_tp_size: 4, ffn_tp_size: 8 }
+        worker: { type: hp_unified, attn_gpu_memory_gb: 80.0 }
+"#;
+        let cfg: RunConfig = serde_yaml::from_str(yaml).expect("parse dp-attn unified");
+        let RunConfig::Unified(u) = &cfg else {
+            panic!("expected unified");
+        };
+        let g = &u.pools.main.groups[0];
+        match &g.arch {
+            IterArchSel::Llama3DpAttnTpFfn {
+                model,
+                attn_tp_size,
+                ffn_tp_size,
+            } => {
+                assert_eq!(model.model_config, "m.json");
+                assert_eq!(*attn_tp_size, 4);
+                assert_eq!(*ffn_tp_size, 8);
+            }
+            other => panic!("expected llama3_dp_attn_tp_ffn, got {other:?}"),
+        }
+        assert!(matches!(
+            g.worker,
+            IterWorkerSel::HpUnified { attn_gpu_memory_gb } if attn_gpu_memory_gb == 80.0
+        ));
+    }
 }

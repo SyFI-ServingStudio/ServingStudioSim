@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, RequestId, SharedRequests, WorkerId};
-use crate::worker::{BareboneWorker, WorkerConfig};
+use crate::worker::{IterWorker, WorkerConfig};
 
 /// Deployment-level action returned to L7 each tick. Barebone only completes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,7 +74,14 @@ impl GpuInventory {
 /// `SharedRequests` handle and an `Arc` of the model. The worker sizes its own
 /// `KvPool` from `worker_config.attn_kv_bytes`. (L7 will generalize this into a
 /// trait; for now a concrete generic struct is enough.)
-pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel> {
+/// Constructor signature shared by every iter-wise worker (`BareboneWorker::new`,
+/// `HpUnifiedWorker::new`, …). The factory is handed the chosen worker's `new` as
+/// a plain function pointer, so it can stamp the concrete `W` without `W::new`
+/// living on the [`IterWorker`] trait.
+pub type WorkerBuildFn<M, W> =
+    fn(WorkerId, Arc<M>, SharedRequests, WorkerConfig, Option<PathBuf>) -> W;
+
+pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel, W: IterWorker> {
     pub model: Arc<M>,
     pub requests: SharedRequests,
     pub worker_config: WorkerConfig,
@@ -82,14 +89,17 @@ pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel> {
     /// enables per-iteration cost logging; `None` disables it.
     pub log_dir: Option<PathBuf>,
     /// GPU facts threaded down from the deployment (which reads them off the L4
-    /// `ParallelCfg`): the GPU type every worker runs on, and how many GPUs one
+    /// parallel layout): the GPU type every worker runs on, and how many GPUs one
     /// worker (model replica) spans. The factory does not derive these — it only
     /// carries them so L6 can assemble the run's [`GpuInventory`].
     pub gpu_name: String,
     pub gpus_per_worker: u16,
+    /// The concrete worker's `new`, supplied by the deployment after it picks the
+    /// (arch, worker) pair.
+    build_fn: WorkerBuildFn<M, W>,
 }
 
-impl<M: IterwiseUnifiedModel> UnifiedWorkerFactory<M> {
+impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
     pub fn new(
         model: Arc<M>,
         requests: SharedRequests,
@@ -97,6 +107,7 @@ impl<M: IterwiseUnifiedModel> UnifiedWorkerFactory<M> {
         log_dir: Option<PathBuf>,
         gpu_name: String,
         gpus_per_worker: u16,
+        build_fn: WorkerBuildFn<M, W>,
     ) -> Self {
         Self {
             model,
@@ -105,11 +116,12 @@ impl<M: IterwiseUnifiedModel> UnifiedWorkerFactory<M> {
             log_dir,
             gpu_name,
             gpus_per_worker,
+            build_fn,
         }
     }
 
-    pub fn build(&self, idx: u16) -> BareboneWorker<M> {
-        BareboneWorker::new(
+    pub fn build(&self, idx: u16) -> W {
+        (self.build_fn)(
             WorkerId(idx),
             Arc::clone(&self.model),
             std::rc::Rc::clone(&self.requests),

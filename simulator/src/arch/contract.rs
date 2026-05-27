@@ -90,4 +90,12 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// only read it (to size the run's GPU inventory); they never derive it. A dense
     /// local arch returns 1.
     fn gpus_per_replica(&self) -> u16;
+
+    /// Number of independent attention DP shards (HP groups) the worker must
+    /// maintain — one `Batch` per shard, each seeing a different slice of the
+    /// batch (L4 §3.3 fan-out). Iter-wise archs with a single attention TP group
+    /// return 1 (the default); a DP-attention arch returns `ffn_tp / attn_tp`.
+    fn num_attn_dp_groups(&self) -> u16 {
+        1
+    }
 }
