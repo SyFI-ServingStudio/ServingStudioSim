@@ -10,8 +10,20 @@
 # `libpython3.12.so` without it on LD_LIBRARY_PATH (uv pins the 3.12 interp).
 libdir := `uv run python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"`
 
+# DeepGEMM (grouped_gemm `deepgemm` backend) builds JIT-only and skips its
+# git-clean version assert when this is 0; default is 1, which forces an
+# install-time CUDA compile AND asserts a clean tree (fails in uv's build clone).
+# Exported to every recipe so a cold `just sync` builds deep_gemm correctly
+# without anyone passing it by hand. (Once built, uv caches the wheel by commit.)
+export DG_USE_LOCAL_VERSION := "0"
+
 # Default: the cpu gate.
 default: test-cpu
+
+# Sync the uv env (builds the pinned deep_gemm wheel on a cold cache). Use this
+# as the install entrypoint so DG_USE_LOCAL_VERSION above is in effect.
+sync:
+    uv sync
 
 # cpu tier — Rust unit tests + deterministic mocked pytest. No GPU/binary.
 test-cpu:

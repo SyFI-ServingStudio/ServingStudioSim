@@ -6,6 +6,7 @@ pub mod engine;
 pub mod flashinfer_attn_decode;
 pub mod flashinfer_attn_prefill;
 pub mod flashinfer_attn_rect;
+pub mod grouped_gemm;
 pub mod rms_norm;
 pub mod single_gemm;
 
@@ -27,6 +28,9 @@ pub use flashinfer_attn_prefill::{
 pub use flashinfer_attn_rect::{
     FlashinferAttnRectKernel, FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput,
     FlashinferAttnRectSpec,
+};
+pub use grouped_gemm::{
+    GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
 };
 pub use rms_norm::{RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, RmsNormSpec};
 pub use single_gemm::{

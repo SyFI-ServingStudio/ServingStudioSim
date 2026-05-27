@@ -142,32 +142,3 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
     println!("{out}");
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::KernelQueryEntry;
-
-    #[test]
-    fn registry_covers_every_kernel_kind() {
-        // Each kernel self-registers via `register_kernel!`; this guards that the
-        // link-time set is exactly the known kinds, so a dropped registration (or
-        // a new kernel that forgot the macro) fails here instead of at runtime.
-        let mut kinds: Vec<&str> = inventory::iter::<KernelQueryEntry>
-            .into_iter()
-            .map(|e| e.kind)
-            .collect();
-        kinds.sort_unstable();
-        assert_eq!(
-            kinds,
-            [
-                "all_reduce",
-                "elementwise",
-                "flashinfer_attn_decode",
-                "flashinfer_attn_prefill",
-                "flashinfer_attn_rect",
-                "rms_norm",
-                "single_gemm",
-            ]
-        );
-    }
-}

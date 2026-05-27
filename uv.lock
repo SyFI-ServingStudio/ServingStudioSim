@@ -189,6 +189,11 @@ wheels = [
 ]
 
 [[package]]
+name = "deep-gemm"
+version = "2.2.0"
+source = { git = "https://github.com/serendipity-zk/DeepGEMM.git?rev=b3f7b56e1402b95118e49db2cf1a730afeee3316#b3f7b56e1402b95118e49db2cf1a730afeee3316" }
+
+[[package]]
 name = "duckdb"
 version = "1.5.3"
 source = { registry = "https://pypi.org/simple" }
@@ -401,6 +406,7 @@ launcher = [
     { name = "pyyaml" },
 ]
 profiling = [
+    { name = "deep-gemm" },
     { name = "flashinfer-cubin", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux'" },
     { name = "numpy" },
@@ -424,6 +430,7 @@ launcher = [
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 profiling = [
+    { name = "deep-gemm", git = "https://github.com/serendipity-zk/DeepGEMM.git?rev=b3f7b56e1402b95118e49db2cf1a730afeee3316" },
     { name = "flashinfer-cubin", marker = "sys_platform == 'linux'", specifier = ">=0.6.4,<0.7" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux'", specifier = ">=0.6.4,<0.7" },
     { name = "numpy", specifier = ">=2.0.0" },

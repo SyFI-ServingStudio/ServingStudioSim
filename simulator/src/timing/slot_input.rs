@@ -16,7 +16,8 @@ use serde::Serialize;
 
 use crate::timing::kernels::{
     AllReduceKernelInput, ElementwiseKernelInput, FlashinferAttnDecodeKernelInput,
-    FlashinferAttnRectKernelInput, RmsNormKernelInput, SingleGemmKernelInput,
+    FlashinferAttnRectKernelInput, GroupedGemmKernelInput, RmsNormKernelInput,
+    SingleGemmKernelInput,
 };
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -48,6 +49,7 @@ macro_rules! log_inputs {
 
 log_inputs! {
     Gemm        => SingleGemmKernelInput,
+    GroupedGemm => GroupedGemmKernelInput,
     RmsNorm     => RmsNormKernelInput,
     Elementwise => ElementwiseKernelInput,
     AttnPrefill => AttnPrefillLog,
