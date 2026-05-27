@@ -946,7 +946,7 @@ def _mock_build(monkeypatch, schema):
 def test_main_rejects_bad_analyze_subjects(tmp_path, schema, monkeypatch):
     main_module = _mock_build(monkeypatch, schema)
     preset = _base()
-    preset["analyze_subjects"] = "slo"  # must be a list of strings, not a bare str
+    preset["analyze_subjects"] = "slo-general"  # must be a list of strings, not a bare str
     p = tmp_path / "p.json"
     p.write_text(json.dumps(preset))
     assert main_module.main([str(p), "--dry-run"]) == 2

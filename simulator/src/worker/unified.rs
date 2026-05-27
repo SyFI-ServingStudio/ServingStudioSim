@@ -69,6 +69,10 @@ pub struct WorkerConfig {
     /// budget). Same per-worker tier as `gpu_name`; the worker divides it by the
     /// model's `kv_bytes_per_token` to size its `KvPool`.
     pub attn_kv_bytes: u64,
+    /// Mirror of `io.log_output_token_times`: when off, decodes do not build the
+    /// per-token timestamp array (the hot-path cost on saturated runs). Threaded
+    /// to `RequestRecord::record_token` / `record_first_token`.
+    pub log_output_token_times: bool,
 }
 
 impl Default for WorkerConfig {
@@ -77,6 +81,7 @@ impl Default for WorkerConfig {
             admission: KvAdmission::Strict,
             balance: LoadBalance::Single,
             attn_kv_bytes: 80_000_000_000, // 80 GB
+            log_output_token_times: false,
         }
     }
 }
@@ -332,17 +337,18 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
     // ── Stage 3: complete_iter (token bookkeeping + KV transitions) ────────────
 
     fn complete_iter(&mut self, now: Time) {
-        let admits: Vec<RequestId> = self.batches[0].prefill_admits.clone();
-        let decode_ids: Vec<RequestId> = self.batches[0].iter_decoding().map(|(r, _)| r).collect();
-
         let mut completed: Vec<RequestId> = Vec::new();
 
-        // (a) live decodes produced one token.
+        // (a) live decodes produced one token. Iterate the decode set directly
+        // (it is not mutated here — `advance_decodes` in (b) does that next) so no
+        // intermediate id Vec is materialized; `store` is a separate field, so the
+        // shared borrow of `batches` and the `RefCell` borrow_mut don't conflict.
         {
+            let log_tokens = self.config.log_output_token_times;
             let mut store = self.requests.borrow_mut();
-            for &rid in &decode_ids {
+            for (rid, _) in self.batches[0].iter_decoding() {
                 let r = &mut store[rid];
-                r.record_token(now);
+                r.record_token(now, log_tokens);
                 if r.is_complete() {
                     completed.push(rid);
                 }
@@ -356,10 +362,12 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         let mut to_finalize: Vec<(RequestId, u64, u32)> = Vec::new();
         {
             let mut store = self.requests.borrow_mut();
-            for &rid in &admits {
+            // Iterate `prefill_admits` in place (cleared below after the deferred
+            // finalize) instead of cloning it.
+            for &rid in &self.batches[0].prefill_admits {
                 let r = &mut store[rid];
                 r.prefill_processed = r.prompt_len;
-                r.record_first_token(now);
+                r.record_first_token(now, self.config.log_output_token_times);
                 if r.is_complete() {
                     completed.push(rid);
                 } else {

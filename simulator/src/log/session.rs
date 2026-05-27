@@ -49,10 +49,10 @@ pub struct LoggerSession {
 impl LoggerSession {
     /// Open writers under `<log_dir>/raw/{request_state,request_slo}.parquet`
     /// and spawn the background writer thread. Files are created lazily on the
-    /// first row (an empty stream writes nothing). `log_token_times` controls
+    /// first row (an empty stream writes nothing). `log_output_token_times` controls
     /// whether the per-token `output_token_times` array column is materialized
     /// (the derived SLO scalars are written either way).
-    pub fn open(log_dir: &Path, log_token_times: bool) -> Result<Self> {
+    pub fn open(log_dir: &Path, log_output_token_times: bool) -> Result<Self> {
         let raw = log_dir.join("raw");
         let mut state_writer =
             StreamingParquetWriter::new(raw.join("request_state.parquet"), request_state_schema());
@@ -69,7 +69,7 @@ impl LoggerSession {
                     match msg {
                         LogMsg::State(buf) => state_writer.write(&state_to_record_batch(&buf)?)?,
                         LogMsg::Slo(buf) => {
-                            slo_writer.write(&slo_to_record_batch(&buf, log_token_times)?)?
+                            slo_writer.write(&slo_to_record_batch(&buf, log_output_token_times)?)?
                         }
                     };
                 }
@@ -190,6 +190,8 @@ mod tests {
     use std::fs::File;
 
     fn slo_entry(id: u32, times: Vec<f32>) -> RequestSloEntry {
+        let num = times.len() as u32;
+        let finish = times.last().copied();
         RequestSloEntry {
             request_id: id,
             logging_time_ms: 100.0,
@@ -197,6 +199,9 @@ mod tests {
             arrival_time_ms: 0.0,
             output_token_times_ms: times,
             ttft_ms: Some(1.0),
+            num_output_tokens: num,
+            tpot_mean_ms: None,
+            finish_decode_time_ms: finish,
         }
     }
 

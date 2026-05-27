@@ -66,6 +66,7 @@ impl Deployment for UnifiedDeployment {
         };
         let worker_config = WorkerConfig {
             attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
+            log_output_token_times: cfg.io.log_output_token_times,
             ..WorkerConfig::default()
         };
 

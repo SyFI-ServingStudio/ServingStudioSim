@@ -79,11 +79,19 @@ pub struct Subject {
 /// + the subject's module under `src/<category>/`.
 pub const SUBJECTS: &[Subject] = &[
     Subject {
-        name: "slo",
+        name: "slo-general",
         category: Category::Request,
-        description: "Request/session latency SLOs: TTFT / TPOT / ITL / E2E + session E2E CDFs.",
-        report_name: "slo_report.json",
-        payload_name: "slo_cdf.json",
+        description: "Request/session latency SLOs from scalar columns: TTFT / TPOT / E2E + session E2E CDFs (always available).",
+        report_name: "slo_general_report.json",
+        payload_name: "slo_general_cdf.json",
+        applies: Applies::All,
+    },
+    Subject {
+        name: "slo-detailed",
+        category: Category::Request,
+        description: "Per-token ITL CDF from `output_token_times` (only when io.log_output_token_times was on; otherwise unavailable).",
+        report_name: "slo_detailed_report.json",
+        payload_name: "slo_detailed_cdf.json",
         applies: Applies::All,
     },
     Subject {
@@ -122,7 +130,8 @@ pub fn help() -> String {
 /// not per-category boilerplate.
 pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result<(Value, Value)> {
     match name {
-        "slo" => request::slo::run_slo(ctx, dir).await,
+        "slo-general" => request::slo::run_slo_general(ctx, dir).await,
+        "slo-detailed" => request::slo::run_slo_detailed(ctx, dir).await,
         "throughput" => throughput::segment::run_throughput(ctx, dir).await,
         other => bail!("unknown analyzer subject {other:?}"),
     }
