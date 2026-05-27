@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::model_cfg::{ModelCfg, ParallelCfg};
+use crate::arch::model_cfg::ModelCfg;
 use crate::common::Fabric;
 use crate::op::Op;
 use crate::timing::kernels::{
@@ -88,7 +88,17 @@ pub struct Llama3DenseTpModel {
     n_slots: usize,
 }
 
-pub fn build_configs(model: &ModelCfg, parallel: &ParallelCfg) -> Llama3DenseTpConfigs {
+/// This arch's numeric parallel input: the Megatron `tp_size` it shards on plus
+/// the `gpu_name` every kernel lookup keys on (L4 §3.8). Per new-interface-design
+/// §13: each arch owns the numeric parallel struct it needs, replacing the retired
+/// shared `ParallelCfg` union.
+#[derive(Clone, Debug)]
+pub struct DenseTpParallel {
+    pub tp_size: u16,
+    pub gpu_name: String,
+}
+
+pub fn build_configs(model: &ModelCfg, parallel: &DenseTpParallel) -> Llama3DenseTpConfigs {
     let gpu = &parallel.gpu_name;
     let dtype_bytes = model.dtype.size_bytes();
     Llama3DenseTpConfigs {
@@ -367,7 +377,10 @@ mod tests {
     #[test]
     fn build_configs_threads_tp_into_worklets() {
         let model = ModelCfg::llama3_8b();
-        let parallel = ParallelCfg::new(4, 1, 1, "H100");
+        let parallel = DenseTpParallel {
+            tp_size: 4,
+            gpu_name: "H100".to_string(),
+        };
         let cfgs = build_configs(&model, &parallel);
         assert_eq!(cfgs.tp_size, 4);
         assert_eq!(cfgs.attn_block.tp_size, 4);
@@ -379,7 +392,13 @@ mod tests {
 
     #[test]
     fn resolve_shards_heads_and_intermediate() {
-        let cfgs = build_configs(&ModelCfg::llama3_8b(), &ParallelCfg::new(4, 1, 1, "H100"));
+        let cfgs = build_configs(
+            &ModelCfg::llama3_8b(),
+            &DenseTpParallel {
+                tp_size: 4,
+                gpu_name: "H100".to_string(),
+            },
+        );
         let r = resolve_configs(&cfgs);
         // per-rank: qo 32/4=8, kv 8/4=2; fused qkv (8+2·2)·128 = 1536.
         assert_eq!(r.attn_block.qkv.n, 1536);
@@ -392,7 +411,13 @@ mod tests {
 
     #[test]
     fn kv_bytes_per_token_is_per_rank() {
-        let cfgs = build_configs(&ModelCfg::llama3_8b(), &ParallelCfg::new(4, 1, 1, "H100"));
+        let cfgs = build_configs(
+            &ModelCfg::llama3_8b(),
+            &DenseTpParallel {
+                tp_size: 4,
+                gpu_name: "H100".to_string(),
+            },
+        );
         let r = resolve_configs(&cfgs);
         // per-rank kv heads = 8/4 = 2; 2·2·128·2·32 = 32768 bytes/token/GPU.
         assert_eq!(kv_bytes_per_token(&r), 2 * 2 * 128 * 2 * 32);
@@ -401,7 +426,13 @@ mod tests {
     #[test]
     fn tp1_kv_bytes_matches_full_model() {
         // At tp=1 the per-rank footprint equals the full dense value (8 kv heads).
-        let cfgs = build_configs(&ModelCfg::llama3_8b(), &ParallelCfg::new(1, 1, 1, "H100"));
+        let cfgs = build_configs(
+            &ModelCfg::llama3_8b(),
+            &DenseTpParallel {
+                tp_size: 1,
+                gpu_name: "H100".to_string(),
+            },
+        );
         let r = resolve_configs(&cfgs);
         assert_eq!(kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
         assert_eq!(r.tp_size, 1);

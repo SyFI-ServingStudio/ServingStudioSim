@@ -15,8 +15,8 @@ use std::sync::Arc;
 use anyhow::{bail, ensure, Context};
 
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::arch::model_cfg::{ModelCfg, ParallelCfg};
-use crate::arch::{llama3_dense, llama3_dense_tp, IterArchSel};
+use crate::arch::model_cfg::ModelCfg;
+use crate::arch::{llama3_dense, llama3_dense_tp, DenseParallel, DenseTpParallel, IterArchSel};
 use crate::common::{PoolId, SharedRequests};
 use crate::deployment::UnifiedConfig;
 use crate::orchestrator::{
@@ -84,7 +84,9 @@ impl Deployment for UnifiedDeployment {
         // type and erases via assemble_flow.
         match &g.arch {
             IterArchSel::Llama3Dense { .. } => {
-                let parallel = ParallelCfg::local(gpu_name.clone());
+                let parallel = DenseParallel {
+                    gpu_name: gpu_name.clone(),
+                };
                 let resolved =
                     llama3_dense::resolve_configs(&llama3_dense::build_configs(&model_cfg, &parallel));
                 let model = Arc::new(
@@ -101,7 +103,10 @@ impl Deployment for UnifiedDeployment {
                 ))
             }
             IterArchSel::Llama3DenseTp { tp_size, .. } => {
-                let parallel = ParallelCfg::new(*tp_size, 1, 1, gpu_name.clone());
+                let parallel = DenseTpParallel {
+                    tp_size: *tp_size,
+                    gpu_name: gpu_name.clone(),
+                };
                 let resolved = llama3_dense_tp::resolve_configs(&llama3_dense_tp::build_configs(
                     &model_cfg, &parallel,
                 ));
