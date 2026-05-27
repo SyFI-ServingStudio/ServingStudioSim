@@ -6,10 +6,13 @@ Wire string ``"p2p_inter"`` — matches Rust ``KernelSpec::KIND`` in
 
 The inter-NVL-domain (cross-node NIC) leg of the MoE network model (ref's
 ``get_inter_device_p2p_times_batch`` curve). Same shape as ``p2p_intra``; the
-separate kind keeps the NIC bandwidth curve distinct from the NVLink one. Two
-backends: ``nccl`` (``profiling.runners.comm.p2p``) and ``nvshmem``
-(``profiling.runners.comm.p2p_nvshmem``); ``fabric`` distinguishes the
-namespace. ``metric_family=COMM``; ``gpu_count_fn`` reserves 2 GPUs.
+separate kind keeps the NIC bandwidth curve distinct from the NVLink one.
+
+Cross-node p2p cannot be measured on a single-node box, so this kind does NOT
+do real profiling: both backends point at ``profiling.runners.comm.p2p_inter``,
+which returns a *modeled* time from a measured latency lookup table (ref's
+analytical model). ``metric_family=COMM``; ``gpu_count_fn`` reserves 1 GPU only
+to identify the device family for curve selection — no peer rank is spawned.
 """
 
 from __future__ import annotations
@@ -47,9 +50,12 @@ def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
         args_schema=P2pInterArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
-        gpu_count_fn=lambda spec: 2,
+        gpu_count_fn=lambda spec: 1,
     )
 
 
-register(_spec("nccl", "profiling.runners.comm.p2p"))
-register(_spec("nvshmem", "profiling.runners.comm.p2p_nvshmem"))
+# Both backends resolve to the analytical lookup-table runner: the modeled curve
+# is backend-agnostic, but the two (kind, backend) keys are kept so the Rust
+# cache/facade wiring stays identical to p2p_intra.
+register(_spec("nccl", "profiling.runners.comm.p2p_inter"))
+register(_spec("nvshmem", "profiling.runners.comm.p2p_inter"))

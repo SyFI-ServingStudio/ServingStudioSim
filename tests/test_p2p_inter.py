@@ -38,14 +38,10 @@ def test_kind_wire_string_and_table_stem():
     assert p2p_inter_kernel.KIND == "p2p_inter"
 
 
-@pytest.mark.parametrize(
-    "backend, module_name",
-    [
-        ("nccl", "profiling.runners.comm.p2p"),
-        ("nvshmem", "profiling.runners.comm.p2p_nvshmem"),
-    ],
-)
-def test_register_call_built_a_comm_spec(backend: str, module_name: str):
+# Both backends resolve to the analytical lookup-table runner (no real comm).
+@pytest.mark.parametrize("backend", ["nccl", "nvshmem"])
+def test_register_call_built_a_comm_spec(backend: str):
+    module_name = "profiling.runners.comm.p2p_inter"
     spec = KernelProfilerSpec(
         kernel_kind=KIND,
         backend=backend,
@@ -54,7 +50,7 @@ def test_register_call_built_a_comm_spec(backend: str, module_name: str):
         args_schema=P2pInterArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
-        gpu_count_fn=lambda s: 2,
+        gpu_count_fn=lambda s: 1,
     )
     assert spec.kernel_kind == "p2p_inter"
     assert spec.backend == backend
@@ -62,7 +58,31 @@ def test_register_call_built_a_comm_spec(backend: str, module_name: str):
     assert spec.metric_family is MetricFamily.COMM
     assert spec.runner_ref.module_name == module_name
     assert spec.runner_ref.function_name == "profile_p2p"
-    assert spec.gpu_count_fn({}) == 2
+    assert spec.gpu_count_fn({}) == 1
+
+
+def test_profiled_curve_is_interpolated_not_measured():
+    from profiling.runners.comm.p2p_inter import _compute_inter_device_p2p_time_ms
+
+    # On-grid points return the table value exactly (us -> ms).
+    assert _compute_inter_device_p2p_time_ms(1024, "NVIDIA H100") == pytest.approx(0.03019)
+    assert _compute_inter_device_p2p_time_ms(1 << 30, "B200") == pytest.approx(21.759)
+    # Between grid points: linear interpolation, monotonic in size.
+    mid = _compute_inter_device_p2p_time_ms(100_000, "H200")
+    assert 0.03092 < mid < 0.03210
+
+
+def test_fallback_bandwidth_model_for_non_profiled_gpu():
+    from profiling.runners.comm.p2p_inter import _compute_inter_device_p2p_time_ms
+
+    # A100 = 22 GB/s; sub-32KB transfers are padded to the 32KB floor.
+    assert _compute_inter_device_p2p_time_ms(1024, "NVIDIA A100") == pytest.approx(
+        (32 * 1024) / (22.0 * 1e9) * 1000.0
+    )
+    # Unknown GPU falls back to the default 44 GB/s.
+    assert _compute_inter_device_p2p_time_ms(1 << 20, "MysteryGPU") == pytest.approx(
+        (1 << 20) / (44.0 * 1e9) * 1000.0
+    )
 
 
 def test_facade_functions_exist():
@@ -77,8 +97,7 @@ def test_importing_kernel_module_does_not_eager_import_runner():
         (
             "import sys; "
             "import profiling.kernels.p2p_inter; "
-            "print(any(m in sys.modules for m in "
-            "('profiling.runners.comm.p2p', 'profiling.runners.comm.p2p_nvshmem')))"
+            "print('profiling.runners.comm.p2p_inter' in sys.modules)"
         ),
     ]
     completed = subprocess.run(command, capture_output=True, text=True, check=True)
