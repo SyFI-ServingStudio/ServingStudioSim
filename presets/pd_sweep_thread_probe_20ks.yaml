@@ -1,0 +1,37 @@
+deployment: pd
+
+workload:
+  trace_files:
+    - trace/aime_long.csv
+  request_rate: 150.0
+  duration_ms: 20000000.0
+  run_to_end: false
+
+io:
+  log_dir: "logs/20260528_threadprobe_sweep_20ks/p{prefill_replicas}_d{decode_replicas}"
+
+pools:
+  prefill:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: ${prefill_replicas}
+        arch:
+          type: llama3_dense_tp
+          model_config: model/config/llama3_8b.json
+          tp_size: 1
+        worker:
+          type: pd_prefill
+  decode:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: ${decode_replicas}
+        arch:
+          type: llama3_dense_tp
+          model_config: model/config/llama3_8b.json
+          tp_size: 1
+        worker:
+          type: pd_decode
+
+sweep:
+  prefill_replicas: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  decode_replicas: [32, 64]

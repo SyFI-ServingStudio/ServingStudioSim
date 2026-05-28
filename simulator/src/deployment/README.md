@@ -27,7 +27,8 @@ the deserialized config to its deployment's `build`:
 | `deployment` tag | status |
 |---|---|
 | `unified` | **wired** — `UnifiedDeployment::build` |
-| `pd`, `afd` | parse (so `list-params` advertises them), then error cleanly until wired |
+| `pd` | **wired** — `PdDeployment::build` for the supported prefill/decode arch pairings |
+| `afd` | parses (so `list-params` advertises it), then errors cleanly until wired |
 
 ## The config shape (`config.rs`)
 
@@ -60,22 +61,36 @@ embeds the run-global specs and fixes which **pool roles** exist:
    is parse-only this round).
 2. Load `ModelCfg` from the arch tag's `model_config` JSON, applying any
    `sim_num_layers` / `num_layers` truncation **before** config build.
-3. Build a `WorkerConfig` (today only `attn_kv_bytes`, from the worker tag's
-   `attn_gpu_memory_gb`). The worker is itself a tagged enum (`IterWorkerSel`):
-   `Barebone` is **wired**, `ChunkedPrefill` is parsed but bails (`not wired
-   yet`).
-4. **Select the arch by its explicit tag** — `IterArchSel` has **three** arms,
-   `Llama3Dense` / `Llama3DenseTp` (both **wired**) and `DeepseekMoe` (parsed but
-   bails). Dispatch is provider-first, *not* a `tp_size` dispatch; `tp_size`
-   exists only on the TP tag. Each wired arm runs the L4 cascade `build_configs →
-   resolve_configs → build` with the right `ParallelCfg`, producing a concrete
-   model type `M`.
+3. Build a `WorkerConfig` (`attn_kv_bytes` from the worker tag's
+   `attn_gpu_memory_gb`, plus hot-path logging controls from `io`). The worker is
+   itself a tagged enum (`IterWorkerSel`): `Barebone` and `HpUnified` are wired
+   for `unified`; `ChunkedPrefill` parses but bails (`not wired yet`), and the PD
+   worker tags are rejected here because they belong to the `pd` deployment.
+4. **Select the arch by its explicit tag** — the wired unified arms are
+   `Llama3Dense`, `Llama3DenseTp`, and `Llama3DpAttnTpFfn`; `DeepseekMoe` parses
+   but bails. Dispatch is provider-first, *not* a `tp_size` dispatch. Each wired
+   arm runs the L4 cascade `build_configs → resolve_configs → build` with the
+   right `ParallelCfg`, producing a concrete model type `M`.
 5. `assemble_flow::<M>` wraps the `Arc<M>` in a `UnifiedWorkerFactory` (threading
    `gpu_name` + `model.gpus_per_replica()` for the GPU inventory) and a
    `SimpleDpFlow`, erasing to `Box<dyn Flow>`.
 
 That `Box<dyn Flow>` is the **single `dyn` erasure point** — each concrete model
 monomorphizes its own flow, so the per-iter cost path stays `dyn`-free.
+
+## The build cascade (`PdDeployment`)
+
+`pd` has two fixed pool roles, `prefill` and `decode`, each with one homogeneous
+group in the current implementation. The prefill pool must use the `pd_prefill`
+worker and the decode pool must use `pd_decode`; both pools must point at the
+same model config so the request/KV semantics line up across the handoff. Wired
+arch pairings are:
+
+- `llama3_dense_tp -> llama3_dense_tp`
+- `llama3_dense_tp -> llama3_dp_attn_tp_ffn`
+
+Each side builds its own concrete model (so TP/layout may differ), then
+`assemble_pd_flow` builds a `PdFlow` with one `UnifiedWorkerFactory` per pool.
 
 ## Up / down
 

@@ -22,8 +22,8 @@ use crate::arch::{
 };
 use crate::common::SharedRequests;
 use crate::deployment::config::PdConfig;
-use crate::orchestrator::config::{GroupSpec, PoolSpec};
 use crate::orchestrator::common::WorkerBuildFn;
+use crate::orchestrator::config::{GroupSpec, PoolSpec};
 use crate::orchestrator::{
     DpPlacementPolicy, Flow, PdFlow, PlacementPolicy, SimpleDpPoolConfig, UnifiedWorkerFactory,
     PD_DECODE_POOL, PD_PREFILL_POOL,
@@ -90,10 +90,7 @@ impl Deployment for PdDeployment {
             // Cross-arch PD: TP prefill hands off to a DP-attention decode. Same
             // llama3 weights, only the parallel layout differs (the KV is logically
             // one tensor, re-sharded across the handoff), so it is a valid pair.
-            (
-                IterArchSel::Llama3DenseTp { .. },
-                IterArchSel::Llama3DpAttnTpFfn { .. },
-            ) => {
+            (IterArchSel::Llama3DenseTp { .. }, IterArchSel::Llama3DpAttnTpFfn { .. }) => {
                 let prefill_model = build_dense_tp(pg, bridge)?;
                 let decode_model = build_dp_attn_tp_ffn(dg, bridge)?;
                 Ok(assemble_pd_flow(
@@ -146,7 +143,11 @@ fn ensure_pd_decode(worker: &IterWorkerSel) -> anyhow::Result<()> {
     }
 }
 
-fn worker_config(worker: &IterWorkerSel, _log_dir: &Path, log_output_token_times: bool) -> WorkerConfig {
+fn worker_config(
+    worker: &IterWorkerSel,
+    _log_dir: &Path,
+    log_output_token_times: bool,
+) -> WorkerConfig {
     let attn_gpu_memory_gb = match worker {
         IterWorkerSel::PdPrefill { attn_gpu_memory_gb }
         | IterWorkerSel::PdDecode { attn_gpu_memory_gb } => *attn_gpu_memory_gb,
@@ -160,7 +161,11 @@ fn worker_config(worker: &IterWorkerSel, _log_dir: &Path, log_output_token_times
     }
 }
 
-fn pool_cfg(pool: crate::common::PoolId, replicas: u16, placement: PlacementPolicy) -> SimpleDpPoolConfig {
+fn pool_cfg(
+    pool: crate::common::PoolId,
+    replicas: u16,
+    placement: PlacementPolicy,
+) -> SimpleDpPoolConfig {
     SimpleDpPoolConfig {
         pool,
         num_workers: replicas,
@@ -253,6 +258,7 @@ where
         log_dir.clone(),
         prefill_gpu_name,
         prefill_gpus,
+        "prefill",
         PdPrefillWorker::<MP>::new as WorkerBuildFn<MP, PdPrefillWorker<MP>>,
     );
     let decode_factory: UnifiedWorkerFactory<MD, PdDecodeWorker<MD>> = UnifiedWorkerFactory::new(
@@ -262,6 +268,7 @@ where
         log_dir,
         decode_gpu_name,
         decode_gpus,
+        "decode",
         PdDecodeWorker::<MD>::new as WorkerBuildFn<MD, PdDecodeWorker<MD>>,
     );
     Box::new(PdFlow::new(

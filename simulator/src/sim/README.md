@@ -1,10 +1,11 @@
 # L7 Sim core — the tick driver & trace frontend
 
-The deployment-independent heart of the simulator: **one process, one thread, one
-clock**. It loads a workload trace, drives whatever L6 `Flow` it is handed,
-emits per-request parquet rows, and stops on a termination policy. It knows
-nothing about *which* deployment it runs — it only ticks the `Flow` trait and
-reads request lifecycle back from the shared store for logging.
+The deployment-independent heart of the simulator: **one process, one sim thread,
+one clock**. It loads a workload trace, drives whatever L6 `Flow` it is handed,
+emits per-request parquet rows, and stops on a termination policy. Logging may
+spawn writer threads, but the modeled simulation loop itself is single-threaded.
+It knows nothing about *which* deployment it runs — it only ticks the `Flow` trait
+and reads request lifecycle back from the shared store for logging.
 
 This is the practical, code-matching reference; the code is the ground truth.
 For deeper design intent see `docs/detailed_design/L7/design.md` §2–§3.

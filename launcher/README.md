@@ -439,7 +439,7 @@ the summary step is skipped.
 ```
 python -m launcher <preset.yaml> [<preset2> ...] [--override path=value ...]
                    [--dry-run] [--cache-report] [--refresh]
-                   [--build-type debug|release] [--profile [--profile-freq HZ]]
+                   [--build-type <cargo-profile>] [--profile [--profile-freq HZ]]
                    [--no-analyze]
 python -m launcher list-params [--human] [--build-type ...]
 ```

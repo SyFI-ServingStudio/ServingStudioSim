@@ -1,7 +1,7 @@
 """Render the SLO CDFs from a Rust SLO payload.
 
 Shared by both SLO subjects (`__main__` binds the payload file per subject):
-`slo_general_cdf.json` (ttft / tpot / e2e / session_e2e) and `slo_detailed_cdf.json`
+`slo_general_cdf.json` (ttft / tpot / e2e) and `slo_detailed_cdf.json`
 (itl). One PNG per metric series. Reads only the payload — no parquet. `render`
 returns one *job* per figure (a callable that draws it and returns its path);
 `__main__` runs them in parallel.

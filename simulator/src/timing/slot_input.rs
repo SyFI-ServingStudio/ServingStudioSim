@@ -30,7 +30,7 @@ pub struct AttnPrefillLog {
 /// Declare the `SlotInput` enum + a `From<Input>` per variant from one central
 /// list. `#[serde(untagged)]` so each variant serializes as just its inner input
 /// object (e.g. `{"m":512}`) — the slot's kernel kind is recovered from the
-/// `cost_manifest.json` sidecar, so no tag is needed in the row.
+/// matching per-worker `cost_manifest/` sidecar, so no tag is needed in the row.
 macro_rules! log_inputs {
     ($($variant:ident => $ty:ty),+ $(,)?) => {
         #[derive(Clone, Serialize)]

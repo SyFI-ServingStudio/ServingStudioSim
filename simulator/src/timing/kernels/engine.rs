@@ -8,7 +8,6 @@
 
 use std::marker::PhantomData;
 
-use crate::common::time::Time;
 use crate::timing::bridge::{ArgsPayload, KernelKind, KernelMetrics, PerfApiBridge};
 use crate::timing::cache::interp::LeafMetrics;
 use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning};
@@ -212,18 +211,28 @@ impl<S: KernelSpec> Kernel<S> {
     }
 
     /// All-four-metrics best-of-N for the CostTree eval path: the `Metrics4` of
-    /// the backend with the smallest wallclock. Selection matches `lookup` /
-    /// `lookup_time` (argmin over `Time`), so the chosen backend is identical —
-    /// just without the `LookupResult` name/warning machinery.
+    /// the backend with the smallest non-negative wallclock, without the
+    /// `LookupResult` name/warning machinery.
     pub fn eval(&self, input: &S::Input) -> LeafMetrics {
         let coords = input.coords();
-        self.backend_caches
-            .iter()
-            .map(|backend_cache| backend_cache.eval(&coords))
-            .min_by_key(|leaf| Time::from_ms(leaf.m.time_ms.max(0.0) as f64))
-            .expect("kernel config validation must create at least one backend cache")
+        match self.backend_caches.as_slice() {
+            [] => panic!("kernel config validation must create at least one backend cache"),
+            [backend_cache] => backend_cache.eval(&coords),
+            [first_cache, rest @ ..] => {
+                let mut best = first_cache.eval(&coords);
+                let mut best_time_ms = best.m.time_ms.max(0.0);
+                for backend_cache in rest {
+                    let candidate = backend_cache.eval(&coords);
+                    let candidate_time_ms = candidate.m.time_ms.max(0.0);
+                    if candidate_time_ms < best_time_ms {
+                        best = candidate;
+                        best_time_ms = candidate_time_ms;
+                    }
+                }
+                best
+            }
+        }
     }
-
 }
 
 impl<S: KernelSpec> CacheProbe for Kernel<S>

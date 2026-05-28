@@ -8,6 +8,11 @@ use crate::worker::{IterWorker, WorkerEvent, WorkerMsg};
 
 use super::super::{Flow, GpuInventory, OrchAction, PoolEvent, UnifiedWorkerFactory};
 
+/// Sentinel for a quiescent worker. `Option<Time>` would add a tag; the simulator
+/// clock is a `u64` newtype, so this keeps the hot wakeup array dense while still
+/// carrying a typed timestamp.
+const NO_WAKEUP_TIME: Time = Time::from_ns(u64::MAX);
+
 // ── Configs & policy (simple_dp-specific; L6 design.md §「simple DP」) ──────────
 
 /// Worker placement within a DP pool.
@@ -36,6 +41,11 @@ pub struct SimpleDpConfig {
 pub struct SimpleDpPoolController<M: IterwiseUnifiedModel, W: IterWorker> {
     pool: PoolId,
     workers: Vec<W>,
+    /// Hot wakeup filter: `NO_WAKEUP_TIME` means quiescent; any real timestamp is
+    /// the earliest sim time at which the worker may advance. The L7 driver still
+    /// calls the flow at its configured tick cadence, so this wakes on the first
+    /// outer tick whose `now >= wakeup_time`.
+    worker_wakeup_times: Vec<Time>,
     placement: DpPlacementPolicy,
     rr_next: usize,
     _model: std::marker::PhantomData<M>,
@@ -64,6 +74,7 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
         }
         Self {
             pool: cfg.pool,
+            worker_wakeup_times: vec![NO_WAKEUP_TIME; workers.len()],
             workers,
             placement: cfg.placement,
             rr_next: 0,
@@ -75,6 +86,12 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
     pub fn admit(&mut self, rid: RequestId) {
         let idx = self.choose_worker_idx();
         self.workers[idx].enqueue(WorkerMsg::Request(rid));
+        // An idle worker has no scheduled wakeup; a new request must make it due
+        // immediately. A computing worker already has a `compute_end` wakeup, so
+        // keep that instead of forcing an early poll.
+        if self.worker_wakeup_times[idx] == NO_WAKEUP_TIME {
+            self.worker_wakeup_times[idx] = Time::ZERO;
+        }
     }
 
     fn choose_worker_idx(&mut self) -> usize {
@@ -102,39 +119,36 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
         idx
     }
 
-    // ── Tick driving ──────────────────────────────────────────────────────────
-    pub fn tick_workers(&mut self, now: Time) {
-        for w in &mut self.workers {
-            w.tick(now);
-        }
+    pub fn pool(&self) -> PoolId {
+        self.pool
     }
 
-    // ── Event handling (WorkerEvent → PoolEvent) ──────────────────────────────
-    pub fn drain_events(&mut self) -> Vec<PoolEvent> {
-        let mut out = Vec::new();
-        let pool = self.pool;
-        for w in &mut self.workers {
-            let worker_id = w.id();
-            for event in w.drain_events() {
-                match event {
-                    WorkerEvent::RequestComplete { req } => {
-                        out.push(PoolEvent::RequestComplete {
-                            pool,
-                            worker: worker_id,
-                            req,
-                        });
-                    }
-                    WorkerEvent::PrefillDone { req } => {
-                        out.push(PoolEvent::PrefillDone {
-                            pool,
-                            worker: worker_id,
-                            req,
-                        });
-                    }
-                }
+    // ── Tick driving ──────────────────────────────────────────────────────────
+    /// Tick every worker, each pushing its (self-tagged) completion events into
+    /// the caller's `events` sink. One sweep — no separate drain pass; the worker
+    /// already stamps its id so the pool needs no per-worker attribution loop.
+    pub fn tick_collect(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
+        debug_assert_eq!(self.worker_wakeup_times.len(), self.workers.len());
+        for (wakeup_time, worker) in self
+            .worker_wakeup_times
+            .iter_mut()
+            .zip(self.workers.iter_mut())
+        {
+            if *wakeup_time <= now {
+                *wakeup_time = worker.tick(now, events).unwrap_or(NO_WAKEUP_TIME);
             }
         }
-        out
+    }
+}
+
+/// Tag a worker event with its pool to form the L6b [`PoolEvent`]. The worker
+/// already carries its own id; the flow supplies the pool it is draining.
+pub(crate) fn to_pool_event(pool: PoolId, event: WorkerEvent) -> PoolEvent {
+    match event {
+        WorkerEvent::RequestComplete { worker, req } => {
+            PoolEvent::RequestComplete { pool, worker, req }
+        }
+        WorkerEvent::PrefillDone { worker, req } => PoolEvent::PrefillDone { pool, worker, req },
     }
 }
 
@@ -147,6 +161,9 @@ pub struct SimpleDpFlow<M: IterwiseUnifiedModel, W: IterWorker> {
     /// on the flow (not the pool) so a multi-pool deployment surfaces one combined
     /// inventory with globally-unique ids.
     inventory: GpuInventory,
+    /// Reused per-tick event sink — workers push completions into it during
+    /// `tick_collect`, then it is drained here and cleared for the next tick.
+    events: Vec<WorkerEvent>,
 }
 
 impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpFlow<M, W> {
@@ -157,7 +174,12 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpFlow<M, W> {
         // multi-pool flow needs (allocate into the same inventory, ids continue).
         let mut inventory = GpuInventory::default();
         let dp_pool = SimpleDpPoolController::new(&cfg.dp_pool, &factory, &mut inventory);
-        Self { requests, dp_pool, inventory }
+        Self {
+            requests,
+            dp_pool,
+            inventory,
+            events: Vec::new(),
+        }
     }
 
     fn on_pool_event(&mut self, event: PoolEvent) -> Vec<OrchAction> {
@@ -177,11 +199,15 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> Flow for SimpleDpFlow<M, W> {
     }
 
     fn tick(&mut self, now: Time) -> Vec<OrchAction> {
-        self.dp_pool.tick_workers(now);
+        let mut events = std::mem::take(&mut self.events);
+        events.clear();
+        self.dp_pool.tick_collect(now, &mut events);
+        let pool = self.dp_pool.pool();
         let mut actions = Vec::new();
-        for event in self.dp_pool.drain_events() {
-            actions.extend(self.on_pool_event(event));
+        for ev in events.drain(..) {
+            actions.extend(self.on_pool_event(to_pool_event(pool, ev)));
         }
+        self.events = events;
         actions
     }
 
@@ -206,7 +232,12 @@ mod tests {
         ms: f64,
     }
     impl IterwiseUnifiedModel for FakeModel {
-        fn eval_iter(&self, _b: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+        fn eval_iter(
+            &self,
+            _b: &UnifiedArchInput,
+            slots: &mut Vec<LeafMetrics>,
+            _scratch: &mut Vec<LeafMetrics>,
+        ) -> LeafMetrics {
             slots.clear();
             LeafMetrics {
                 m: Metrics4 {
@@ -238,6 +269,7 @@ mod tests {
             None,
             "test-gpu".to_string(),
             1,
+            "main",
             BareboneWorker::<FakeModel>::new,
         );
         let cfg = SimpleDpConfig {

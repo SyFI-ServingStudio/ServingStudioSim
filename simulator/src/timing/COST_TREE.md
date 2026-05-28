@@ -54,10 +54,11 @@ leaf — no name lookup, no map.
 each composite reserves a contiguous block for its direct children, so `children`
 is a valid `Range<usize>` and **every parent index precedes its children's**.
 That layout is what makes `aggregate` a single bottom-up pass with no recursion
-and no allocation:
+and no allocation when the caller reuses the scratch buffer:
 
 ```rust
-// CostTree::aggregate(flat, buf) — iterate high→low index.
+// CostTree::aggregate(flat, buf, scratch) — iterate high→low index.
+scratch.resize(flat.len(), LeafMetrics::ZERO);
 for i in (0..flat.len()).rev() {
     scratch[i] = match &flat[i] {
         Leaf(slot)            => buf[*slot],
@@ -70,7 +71,8 @@ for i in (0..flat.len()).rev() {
 ```
 
 Walking high→low guarantees each child's subtree result is ready when its parent
-is reached (parent index < child indices).
+is reached (parent index < child indices). The scratch buffer is caller-owned and
+reused by the worker/model across iterations.
 
 ## Names stay off the hot path (INV-5)
 
@@ -79,12 +81,13 @@ Identity lives **only** in compile-time products, never in `FlatCostNode`, the
 
 - **`LeafDesc`** (`slots[i]`) — the dotted leaf `name` + the kernel `kind` /
   one-line `config` summary, captured at compile for the shape render.
-- **`CostManifest`** — the `cost_manifest.json` sidecar: `slots` + the flat
-  `nodes` + `node_labels` (index-aligned to `nodes`; recovers the `Labeled`
-  composite identity that `flatten` drops). This is what lets a downstream
-  analyzer reproduce `total_time_ms` from a row's per-slot `slot_time_ms` (by
-  re-running `aggregate`) and group slots into semantic subtrees *structurally*,
-  without parsing dotted names.
+- **`CostManifest`** — the per-worker
+  `cost_manifest/worker_<pool_tag>_<worker_id>.json` sidecar: `slots` + the
+  flat `nodes` + `node_labels` (index-aligned to `nodes`; recovers the
+  `Labeled` composite identity that `flatten` drops). This is what lets a
+  downstream analyzer reproduce `total_time_ms` from a row's per-slot
+  `slot_time_ms` (by re-running `aggregate`) and group slots into semantic
+  subtrees *structurally*, without parsing dotted names.
 
 `FlatCostNode` carries no `String`; `cost_log` rows carry only `slot_*` lists
 keyed by position. Identity is re-attached from the manifest, off the hot path.

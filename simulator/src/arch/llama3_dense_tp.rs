@@ -332,7 +332,12 @@ impl IterwiseUnifiedModel for Llama3DenseTpModel {
         self.cost_tree().manifest()
     }
 
-    fn eval_iter(&self, batch: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+    fn eval_iter(
+        &self,
+        batch: &UnifiedArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
         assert_eq!(
             batch.groups.len(),
             1,
@@ -347,13 +352,14 @@ impl IterwiseUnifiedModel for Llama3DenseTpModel {
             self.n_slots,
             "eval cursor must fill every slot"
         );
-        CostTree::aggregate(&self.cost_flat, slots)
+        CostTree::aggregate(&self.cost_flat, slots, scratch)
     }
 
     fn eval_iter_with_inputs(
         &self,
         batch: &UnifiedArchInput,
         slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
         inputs: &mut Vec<SlotInput>,
     ) -> LeafMetrics {
         assert_eq!(
@@ -370,7 +376,7 @@ impl IterwiseUnifiedModel for Llama3DenseTpModel {
             self.n_slots,
             "eval cursor must fill every slot"
         );
-        let agg = CostTree::aggregate(&self.cost_flat, slots);
+        let agg = CostTree::aggregate(&self.cost_flat, slots, scratch);
         debug_assert_eq!(inputs.len(), self.n_slots, "slot_input must align to slots");
         agg
     }

@@ -111,6 +111,17 @@ pub fn value_f64(array: &ArrayRef, row: usize) -> Result<f64> {
     bail!("unsupported numeric array type")
 }
 
+pub fn value_string(array: &ArrayRef, row: usize) -> Result<String> {
+    if array.is_null(row) {
+        return Ok(String::new());
+    }
+    let strs = array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow!("expected Utf8 array"))?;
+    Ok(strs.value(row).to_string())
+}
+
 /// One row of a `List<Float32>` column as an owned `Vec<f64>` (e.g.
 /// `output_token_times`). Null row → empty vec.
 pub fn value_f32_list(array: &ArrayRef, row: usize) -> Result<Vec<f64>> {

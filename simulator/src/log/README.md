@@ -54,8 +54,8 @@ run_meta.rs       write_run_meta — the run_meta.json GPU-facts sidecar (plain
 |---|---|---|---|
 | `request_slo.parquet` | `LoggerSession` | L7 `run_sim` | one terminal row per completed request (TTFT/TPOT/E2E inputs) |
 | `request_state.parquet` | `LoggerSession` | L7 `run_sim` | periodic dense snapshot over the admitted set |
-| `cost_log.parquet` | `CostLogger` | each L5 worker | one row per iteration: envelope + per-group `input_section` + the CostTree per-slot breakdown |
-| `cost_manifest.json` | `CostLogger` | each L5 worker | the `CostManifest` (slots + flat aggregation nodes) written once at open |
+| `cost_log/worker_<pool_tag>_<worker_id>.parquet` | `CostLogger` | each L5 worker | one row per iteration: envelope + per-group `input_section` + the CostTree per-slot breakdown |
+| `cost_manifest/worker_<pool_tag>_<worker_id>.json` | `CostLogger` | each L5 worker | the matching `CostManifest` (slots + flat aggregation nodes) written once at open |
 | `run_meta.json` | `run_meta` | L7 (pre-loop) | `schema_version: 1` + the run's `GpuInventory` (per-GPU id/name/pool/worker + worker→gpu grouping) |
 
 `kv_snapshot` and `network_event` have schemas in `schemas.rs` and appear in
@@ -66,12 +66,15 @@ run_meta.rs       write_run_meta — the run_meta.json GPU-facts sidecar (plain
 The `cost_log` row carries the per-slot breakdown as **position-keyed parallel
 lists** — `slot_time_ms` (`List<f32>`), `slot_coverage` (`List<u8>` of
 `CoverageFlags` bits), and the captured `slot_inputs` — never slot *names*. Names
-live once in the `cost_manifest.json` sidecar (which also carries the flattened
-aggregation nodes), so a consumer reproduces `total_time_ms` from a row's per-slot
-times by re-running `CostTree::aggregate`, and labels the list positions from the
-manifest. See [../timing/COST_TREE.md](../timing/COST_TREE.md) for the manifest
-shape. The worker fills the per-slot buffers during its CostTree eval pass and
-hands them to `CostLogger::record` (slot-aligned, one input list per row).
+live once in the per-worker `cost_manifest/worker_<pool_tag>_<worker_id>.json`
+sidecar (which also carries the flattened aggregation nodes), so a consumer
+reproduces `total_time_ms` from a row's per-slot times by re-running
+`CostTree::aggregate`, and labels the list positions from the matching manifest.
+The row carries `pool_tag` because `worker_id` is per-pool; consumers key
+manifests by `(pool_tag, worker_id)`. See [../timing/COST_TREE.md](../timing/COST_TREE.md)
+for the manifest shape. The worker fills the per-slot buffers during its CostTree
+eval pass and hands them to `CostLogger::record` (slot-aligned, one input list per
+row).
 
 The captured `slot_input`s are handed over as inline enums and **serialized to
 JSON strings on the writer thread** (`*_to_record_batch`, off the sim's critical

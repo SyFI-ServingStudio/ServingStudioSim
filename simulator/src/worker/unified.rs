@@ -3,9 +3,9 @@
 //! iter-wise three-state `BatchFsmState` cursor.
 //!
 //! Reconciliations vs the design example (see plan):
-//!   - event-driven surface (`enqueue`/`tick`/`drain_events`/`status`) so the L6
-//!     `simple_dp` pool can drive it; `complete_iter` pushes
-//!     `WorkerEvent::RequestComplete` to an outbox instead of returning a `Vec`.
+//!   - event-driven surface (`enqueue`/`tick`/`status`) so the L6 `simple_dp`
+//!     pool can drive it; `complete_iter` pushes a self-tagged
+//!     `WorkerEvent::RequestComplete` into the caller's event sink.
 //!   - the request slab is the shared `RequestStore`, injected at construction as
 //!     `SharedRequests` and borrowed transiently inside each method (no per-tick
 //!     `&mut RequestStore` parameter). Logger is deferred to L7.
@@ -61,18 +61,20 @@ pub struct BareboneWorker<M: IterwiseUnifiedModel> {
     config: WorkerConfig,
     runtime: WorkerRuntime,
     batches: Vec<Batch>, // length 1 in barebone
-    events: Vec<WorkerEvent>,
     /// Per-iteration `cost_log` writer (`Some` iff a log_dir was supplied).
     /// `cost_slots` is the reused per-slot eval buffer; `cost_slot_inputs` is the
     /// reused per-slot typed-input buffer, filled whenever `cost_log` is active.
     cost_logger: Option<CostLogger>,
     cost_slots: Vec<LeafMetrics>,
+    cost_scratch: Vec<LeafMetrics>,
+    cost_groups: Vec<GroupInputLog>,
     cost_slot_inputs: Vec<crate::timing::SlotInput>,
 }
 
 impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
     pub fn new(
         id: WorkerId,
+        pool_tag: &'static str,
         model: Arc<M>,
         requests: SharedRequests,
         config: WorkerConfig,
@@ -85,7 +87,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         // available. A failure to open disables logging with a warning rather
         // than aborting the sim.
         let cost_logger = match cost_log_dir {
-            Some(dir) => match CostLogger::open(&dir, &model.cost_log_manifest()) {
+            Some(dir) => match CostLogger::open(&dir, pool_tag, id, &model.cost_log_manifest()) {
                 Ok(logger) => Some(logger),
                 Err(e) => {
                     tracing::warn!("cost_log disabled: failed to open writer: {e}");
@@ -101,9 +103,10 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
             config,
             runtime: WorkerRuntime::new(),
             batches: vec![Batch::new(0, kv_capacity)],
-            events: Vec::new(),
             cost_logger,
             cost_slots: Vec::new(),
+            cost_scratch: Vec::new(),
+            cost_groups: Vec::new(),
             cost_slot_inputs: Vec::new(),
         }
     }
@@ -114,10 +117,6 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         match msg {
             WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
         }
-    }
-
-    pub fn drain_events(&mut self) -> Vec<WorkerEvent> {
-        std::mem::take(&mut self.events)
     }
 
     pub fn status(&self) -> WorkerStatus {
@@ -133,7 +132,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     // ── tick: state-forwarding loop (§3.2.1) ──────────────────────────────────
 
-    pub fn tick(&mut self, now: Time) {
+    pub fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
@@ -164,12 +163,30 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                         continue; // forward into the Done arm
                     }
                     Done => {
-                        self.complete_iter(now);
+                        self.complete_iter(now, events);
                         self.runtime.worker_fsm_state = Idle; // Active → Idle
                         continue; // forward into the Idle arm to form the next batch
                     }
                 },
             }
+        }
+        self.next_wakeup(now)
+    }
+
+    fn next_wakeup(&self, now: Time) -> Option<Time> {
+        match self.runtime.worker_fsm_state {
+            WorkerFsmState::Idle => {
+                let status = self.status();
+                if status.queued_requests > 0 || status.active_requests > 0 {
+                    Some(now)
+                } else {
+                    None
+                }
+            }
+            WorkerFsmState::Active => match self.runtime.batch_fsm_state.cursor {
+                IterCursor::NotStarted | IterCursor::Done => Some(now),
+                IterCursor::Computing => Some(self.runtime.batch_fsm_state.compute_end),
+            },
         }
     }
 
@@ -224,28 +241,31 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
             self.model.eval_iter_with_inputs(
                 &arch_input,
                 &mut self.cost_slots,
+                &mut self.cost_scratch,
                 &mut self.cost_slot_inputs,
             )
         } else {
-            self.model.eval_iter(&arch_input, &mut self.cost_slots)
+            self.model
+                .eval_iter(&arch_input, &mut self.cost_slots, &mut self.cost_scratch)
         };
         let cost_time = Time::from_ms(agg.m.time_ms as f64);
         if self.cost_logger.is_some() {
             // Per-iteration input_section: log each group's context (prefill kept
-            // full as moved-over `(prefix, append)` pairs; decode aggregated to
-            // count + total KV — the per-decode KV list is dropped). `arch_input`
-            // is consumed by eval above by reference only, so we can move its Vecs.
-            let groups = arch_input
-                .groups
-                .into_iter()
-                .map(|g| GroupInputLog {
+            // full as `(prefix, append)` pairs; decode aggregated to count + total
+            // KV — the per-decode KV list is dropped). Refilled into the reused
+            // `cost_groups` buffer in place; the per-slot time/coverage/input
+            // breakdowns are appended into the logger's flat chunk buffers by
+            // `record`, so the entry owns no `Vec`.
+            self.cost_groups.clear();
+            for g in &arch_input.groups {
+                self.cost_groups.push(GroupInputLog {
                     batch_tokens: g.batch_tokens,
                     prefill_tokens: g.prefill_tokens,
                     decode_request_count: g.decode_tokens,
                     decode_kv_total: g.total_kv_len,
-                    prefill_chunk_pairs: g.prefill_chunk_pairs,
-                })
-                .collect();
+                    prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                });
+            }
             let entry = CostLogEntry {
                 worker_id: self.id.0,
                 iter_id: self.runtime.iter_counter as u64,
@@ -255,16 +275,17 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                 wall_start_ms: now.as_ms(),
                 total_time_ms: agg.m.time_ms as f64,
                 energy_j: agg.m.energy_j as f64,
-                groups,
-                slot_time_ms: self.cost_slots.iter().map(|l| l.m.time_ms).collect(),
-                slot_coverage: self.cost_slots.iter().map(|l| l.coverage.bits()).collect(),
-                // Filled by `CostLogger::record` after it moves the captured
-                // inputs into the chunk-level flat buffer. `Vec::append` leaves
-                // `cost_slot_inputs` allocated for the next iteration.
+                group_len: 0,
+                slot_len: 0,
                 slot_input_len: 0,
             };
             if let Some(logger) = self.cost_logger.as_mut() {
-                if let Err(e) = logger.record(entry, &mut self.cost_slot_inputs) {
+                if let Err(e) = logger.record(
+                    entry,
+                    &self.cost_slots,
+                    &mut self.cost_groups,
+                    &mut self.cost_slot_inputs,
+                ) {
                     tracing::warn!("cost_log record failed: {e}");
                 }
             }
@@ -275,7 +296,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     // ── Stage 3: complete_iter (token bookkeeping + KV transitions) ────────────
 
-    fn complete_iter(&mut self, now: Time) {
+    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
         let mut completed: Vec<RequestId> = Vec::new();
 
         // (a) live decodes produced one token. Iterate the decode set directly
@@ -331,7 +352,10 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                 .unwrap_or(0);
             self.batches[0].release(rid, current_kv);
             self.runtime.request_to_group.remove(&rid);
-            self.events.push(WorkerEvent::RequestComplete { req: rid });
+            events.push(WorkerEvent::RequestComplete {
+                worker: self.id,
+                req: rid,
+            });
         }
     }
 
@@ -451,6 +475,7 @@ mod tests {
             &self,
             _batch: &UnifiedArchInput,
             slots: &mut Vec<LeafMetrics>,
+            _scratch: &mut Vec<LeafMetrics>,
         ) -> LeafMetrics {
             slots.clear();
             LeafMetrics {
@@ -489,8 +514,7 @@ mod tests {
     ) -> Vec<WorkerEvent> {
         let mut all = Vec::new();
         for step in 0..max_steps {
-            w.tick(Time::from_ms(step as f64));
-            all.extend(w.drain_events());
+            w.tick(Time::from_ms(step as f64), &mut all);
         }
         all
     }
@@ -501,6 +525,7 @@ mod tests {
         let model = Arc::new(FakeModel { ms: 1.0 });
         let mut w = BareboneWorker::new(
             WorkerId(0),
+            "main",
             model,
             Rc::clone(&store),
             WorkerConfig::default(),
@@ -511,7 +536,10 @@ mod tests {
         let events = run_to_quiescence(&mut w, 50);
         assert_eq!(
             events,
-            vec![WorkerEvent::RequestComplete { req: RequestId(0) }]
+            vec![WorkerEvent::RequestComplete {
+                worker: WorkerId(0),
+                req: RequestId(0)
+            }]
         );
         let s = store.borrow();
         let r = &s[RequestId(0)];
@@ -526,6 +554,7 @@ mod tests {
         let model = Arc::new(FakeModel { ms: 1.0 });
         let mut w = BareboneWorker::new(
             WorkerId(0),
+            "main",
             model,
             Rc::clone(&store),
             WorkerConfig::default(),

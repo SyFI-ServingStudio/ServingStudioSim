@@ -18,8 +18,8 @@ pub mod session;
 
 pub use cost_logger::CostLogger;
 pub use parquet_writer::StreamingParquetWriter;
+pub use rows::{CostLogEntry, GroupInputLog, RequestSloEntry, RequestStateEntry};
 pub use run_meta::write_run_meta;
-pub use rows::{CostLogEntry, FinalPhase, GroupInputLog, RequestSloEntry, RequestStateEntry};
 pub use schemas::{
     cost_log_envelope_schema, cost_log_schema, kv_snapshot_schema, network_event_schema,
     request_slo_schema, request_state_schema, ALL_STREAMS,

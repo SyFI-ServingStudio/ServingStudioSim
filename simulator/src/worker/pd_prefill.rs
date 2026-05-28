@@ -60,15 +60,17 @@ pub struct PdPrefillWorker<M: IterwiseUnifiedModel> {
     config: WorkerConfig,
     runtime: PrefillRuntime,
     batches: Vec<Batch>, // length 1 (prefill is single-group in v1)
-    events: Vec<WorkerEvent>,
     cost_logger: Option<CostLogger>,
     cost_slots: Vec<LeafMetrics>,
+    cost_scratch: Vec<LeafMetrics>,
+    cost_groups: Vec<GroupInputLog>,
     cost_slot_inputs: Vec<SlotInput>,
 }
 
 impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
     pub fn new(
         id: WorkerId,
+        pool_tag: &'static str,
         model: Arc<M>,
         requests: SharedRequests,
         config: WorkerConfig,
@@ -76,7 +78,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
     ) -> Self {
         let kv_capacity = (config.attn_kv_bytes / model.kv_bytes_per_token().max(1)).max(1);
         let cost_logger = match cost_log_dir {
-            Some(dir) => match CostLogger::open(&dir, &model.cost_log_manifest()) {
+            Some(dir) => match CostLogger::open(&dir, pool_tag, id, &model.cost_log_manifest()) {
                 Ok(logger) => Some(logger),
                 Err(e) => {
                     tracing::warn!("cost_log disabled: failed to open writer: {e}");
@@ -92,16 +94,17 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             config,
             runtime: PrefillRuntime::new(),
             batches: vec![Batch::new(0, kv_capacity)],
-            events: Vec::new(),
             cost_logger,
             cost_slots: Vec::new(),
+            cost_scratch: Vec::new(),
+            cost_groups: Vec::new(),
             cost_slot_inputs: Vec::new(),
         }
     }
 
     // ── tick: state-forwarding loop (identical to barebone) ────────────────────
 
-    fn tick_inner(&mut self, now: Time) {
+    fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
@@ -130,12 +133,30 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
                         continue;
                     }
                     Done => {
-                        self.complete_iter(now);
+                        self.complete_iter(now, events);
                         self.runtime.worker_fsm_state = Idle;
                         continue;
                     }
                 },
             }
+        }
+        self.next_wakeup(now)
+    }
+
+    fn next_wakeup(&self, now: Time) -> Option<Time> {
+        match self.runtime.worker_fsm_state {
+            WorkerFsmState::Idle => {
+                let status = self.status();
+                if status.queued_requests > 0 || status.active_requests > 0 {
+                    Some(now)
+                } else {
+                    None
+                }
+            }
+            WorkerFsmState::Active => match self.runtime.batch_fsm_state.cursor {
+                IterCursor::NotStarted | IterCursor::Done => Some(now),
+                IterCursor::Computing => Some(self.runtime.batch_fsm_state.compute_end),
+            },
         }
     }
 
@@ -180,24 +201,28 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             self.model.eval_iter_with_inputs(
                 &arch_input,
                 &mut self.cost_slots,
+                &mut self.cost_scratch,
                 &mut self.cost_slot_inputs,
             )
         } else {
-            self.model.eval_iter(&arch_input, &mut self.cost_slots)
+            self.model
+                .eval_iter(&arch_input, &mut self.cost_slots, &mut self.cost_scratch)
         };
         let cost_time = Time::from_ms(agg.m.time_ms as f64);
         if self.cost_logger.is_some() {
-            let groups = arch_input
-                .groups
-                .into_iter()
-                .map(|g| GroupInputLog {
+            // Refill the reused `cost_groups` buffer in place; the per-slot
+            // breakdowns are appended into the logger's flat chunk buffers by
+            // `record`, so the entry owns no `Vec`.
+            self.cost_groups.clear();
+            for g in &arch_input.groups {
+                self.cost_groups.push(GroupInputLog {
                     batch_tokens: g.batch_tokens,
                     prefill_tokens: g.prefill_tokens,
                     decode_request_count: g.decode_tokens,
                     decode_kv_total: g.total_kv_len,
-                    prefill_chunk_pairs: g.prefill_chunk_pairs,
-                })
-                .collect();
+                    prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                });
+            }
             let entry = CostLogEntry {
                 worker_id: self.id.0,
                 iter_id: self.runtime.iter_counter as u64,
@@ -205,13 +230,17 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
                 wall_start_ms: now.as_ms(),
                 total_time_ms: agg.m.time_ms as f64,
                 energy_j: agg.m.energy_j as f64,
-                groups,
-                slot_time_ms: self.cost_slots.iter().map(|l| l.m.time_ms).collect(),
-                slot_coverage: self.cost_slots.iter().map(|l| l.coverage.bits()).collect(),
+                group_len: 0,
+                slot_len: 0,
                 slot_input_len: 0,
             };
             if let Some(logger) = self.cost_logger.as_mut() {
-                if let Err(e) = logger.record(entry, &mut self.cost_slot_inputs) {
+                if let Err(e) = logger.record(
+                    entry,
+                    &self.cost_slots,
+                    &mut self.cost_groups,
+                    &mut self.cost_slot_inputs,
+                ) {
                     tracing::warn!("cost_log record failed: {e}");
                 }
             }
@@ -222,7 +251,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
 
     // ── Stage 3: complete_iter — emit first token, then hand off to decode ──────
 
-    fn complete_iter(&mut self, now: Time) {
+    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
         let log_tokens = self.config.log_output_token_times;
         // The prefill produced the request's first output token (TTFT). Then,
         // instead of entering a local decode set, the request is handed off to a
@@ -242,9 +271,15 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         for (rid, complete) in done {
             self.runtime.request_to_group.remove(&rid);
             if complete {
-                self.events.push(WorkerEvent::RequestComplete { req: rid });
+                events.push(WorkerEvent::RequestComplete {
+                    worker: self.id,
+                    req: rid,
+                });
             } else {
-                self.events.push(WorkerEvent::PrefillDone { req: rid });
+                events.push(WorkerEvent::PrefillDone {
+                    worker: self.id,
+                    req: rid,
+                });
             }
         }
     }
@@ -340,12 +375,8 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdPrefillWorker<M> {
         }
     }
 
-    fn tick(&mut self, now: Time) {
-        self.tick_inner(now);
-    }
-
-    fn drain_events(&mut self) -> Vec<WorkerEvent> {
-        std::mem::take(&mut self.events)
+    fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+        self.tick_inner(now, events)
     }
 
     fn status(&self) -> WorkerStatus {
@@ -370,7 +401,12 @@ mod tests {
         ms: f64,
     }
     impl IterwiseUnifiedModel for FakeModel {
-        fn eval_iter(&self, _b: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+        fn eval_iter(
+            &self,
+            _b: &UnifiedArchInput,
+            slots: &mut Vec<LeafMetrics>,
+            _scratch: &mut Vec<LeafMetrics>,
+        ) -> LeafMetrics {
             slots.clear();
             LeafMetrics {
                 m: Metrics4 {
@@ -403,6 +439,7 @@ mod tests {
     fn worker(store: SharedRequests) -> PdPrefillWorker<FakeModel> {
         PdPrefillWorker::new(
             WorkerId(0),
+            "prefill",
             Arc::new(FakeModel { ms: 1.0 }),
             store,
             WorkerConfig::default(),
@@ -418,10 +455,15 @@ mod tests {
         w.enqueue(WorkerMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..20u64 {
-            w.tick(Time::from_ms(step as f64));
-            events.extend(w.drain_events());
+            w.tick(Time::from_ms(step as f64), &mut events);
         }
-        assert_eq!(events, vec![WorkerEvent::PrefillDone { req: RequestId(0) }]);
+        assert_eq!(
+            events,
+            vec![WorkerEvent::PrefillDone {
+                worker: WorkerId(0),
+                req: RequestId(0)
+            }]
+        );
         let s = store.borrow();
         let r = &s[RequestId(0)];
         assert_eq!(r.tokens_emitted, 1, "prefill emits exactly the first token");
@@ -437,12 +479,14 @@ mod tests {
         w.enqueue(WorkerMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..20u64 {
-            w.tick(Time::from_ms(step as f64));
-            events.extend(w.drain_events());
+            w.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(
             events,
-            vec![WorkerEvent::RequestComplete { req: RequestId(0) }]
+            vec![WorkerEvent::RequestComplete {
+                worker: WorkerId(0),
+                req: RequestId(0)
+            }]
         );
     }
 }

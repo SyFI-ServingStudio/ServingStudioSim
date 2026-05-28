@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use crate::common::{RequestId, RequestRecord, SharedRequests, Time};
-use crate::log::{FinalPhase, LoggerSession, RequestSloEntry, RequestStateEntry};
+use crate::common::{RequestId, RequestRecord, RequestStore, SharedRequests, Time};
+use crate::log::{LoggerSession, RequestSloEntry, RequestStateEntry};
 use crate::orchestrator::{Flow, OrchAction};
 
 /// Sim-time between heartbeat log lines (matches ref/moesim-rs's 1 s).
@@ -43,7 +43,10 @@ struct EveryN {
 impl EveryN {
     fn new(period: u64) -> Self {
         debug_assert!(period > 0, "EveryN period must be > 0");
-        Self { period, countdown: 0 }
+        Self {
+            period,
+            countdown: 0,
+        }
     }
 
     fn fire(&mut self) -> bool {
@@ -189,20 +192,17 @@ pub fn run_sim(
             logger.record_request_slo(slo_entry(req, clock, &s[req]))?;
         }
 
-        // 2b. Periodic `request_state` snapshot — DENSE over the *admitted* set:
-        //     every request that has started prefill is logged each interval
-        //     (`iter_admitted`, the `records[0..=admitted_hi]` prefix). In-flight
-        //     reqs advance; completed reqs keep re-emitting their frozen terminal
-        //     values. This makes per-segment workload a plain diff of consecutive
-        //     snapshots' column sums (no fill-forward over dropped-out requests).
-        //     The never-admitted pending tail is skipped: it's all-zero "queued"
-        //     rows that contribute nothing to the diff, and on a saturated run
-        //     that tail is the bulk of the store.
+        // 2b. Periodic `request_state` snapshot — one AGGREGATE row per tick over
+        //     the *admitted* set (`iter_admitted`, the `records[0..=admitted_hi]`
+        //     prefix). The analyzer only ever needs `Σ completed_input_len` /
+        //     `Σ completed_output_len` per tick (it diffs consecutive ticks for
+        //     per-segment throughput), so the sum is computed here instead of
+        //     emitting one row per request. The never-admitted pending tail has
+        //     zero processed tokens and is skipped — but even on a saturated run,
+        //     where prefill admits ~the whole trace, this is one row, not ~150k.
         if snapshot.fire() {
             let s = store.borrow();
-            for (id, rec) in s.iter_admitted() {
-                logger.record_request_state(state_entry(id, clock, rec))?;
-            }
+            logger.record_request_state(state_agg(&s, clock))?;
             last_state_clock = Some(clock);
         }
 
@@ -337,21 +337,18 @@ pub fn run_sim(
 /// ran, so it is skipped — same scope as the periodic snapshot, 2b).
 ///
 /// The two tables flush asymmetrically because they have different shapes:
-/// - `request_state` is a *snapshot* table, so every admitted request gets a
-///   terminal row (completed ones frozen at their terminal values). A completion
-///   never writes a state row — only the periodic snapshot does — so without this
-///   a request that completed between the last snapshot and sim-end (e.g. a run
-///   that ends within one snapshot interval) would have no terminal state row,
-///   and per-segment throughput would miss its work entirely.
+/// - `request_state` is a *snapshot* table (one aggregate row per tick), so a
+///   final census captures the cumulative token totals at sim-end. Without it, a
+///   run ending within one snapshot interval would log no terminal totals and
+///   per-segment throughput would miss the last interval's work.
 /// - `request_slo` is *terminal-per-request*: completed requests already wrote
 ///   their row at their completion tick, so only the still-incomplete ones get a
 ///   partial row here (writing completed again would duplicate).
 ///
-/// The `request_state` census is skipped entirely when the periodic snapshot (2b)
-/// already wrote one at this exact `clock` (`last_state_clock == Some(clock)`,
-/// i.e. the run ended on a snapshot tick) — re-writing it would duplicate every
-/// `(request_id, logging_time)` row. `request_slo` is unaffected (the periodic
-/// snapshot never writes it).
+/// The `request_state` census is skipped when the periodic snapshot (2b) already
+/// wrote one at this exact `clock` (`last_state_clock == Some(clock)`, i.e. the
+/// run ended on a snapshot tick) — re-writing it would duplicate that tick's
+/// aggregate row. `request_slo` is unaffected (the periodic snapshot never writes it).
 fn finalize(
     store: &SharedRequests,
     logger: &mut LoggerSession,
@@ -360,10 +357,10 @@ fn finalize(
 ) -> anyhow::Result<()> {
     let s = store.borrow();
     let census_already_written = last_state_clock == Some(clock);
+    if !census_already_written {
+        logger.record_request_state(state_agg(&s, clock))?;
+    }
     for (id, rec) in s.iter_admitted() {
-        if !census_already_written {
-            logger.record_request_state(state_entry(id, clock, rec))?;
-        }
         if !rec.completed {
             logger.record_request_slo(slo_entry(id, clock, rec))?;
         }
@@ -371,43 +368,29 @@ fn finalize(
     Ok(())
 }
 
-fn final_phase(rec: &RequestRecord) -> FinalPhase {
-    if rec.completed {
-        FinalPhase::Complete
-    } else if rec.first_token_time.is_some() {
-        FinalPhase::Decode
-    } else if rec.prefill_processed > 0 {
-        FinalPhase::Prefill
-    } else {
-        FinalPhase::Queued
+/// Aggregate the admitted set into one `request_state` row: cumulative prefill /
+/// decode tokens (the analyzer diffs these between ticks for per-segment
+/// throughput) plus admitted/completed counts (diagnostics). O(admitted) — the
+/// only per-tick scan the snapshot needs now that rows are not per-request.
+fn state_agg(store: &RequestStore, now: Time) -> RequestStateEntry {
+    let mut prefill_tokens_cum = 0u64;
+    let mut decode_tokens_cum = 0u64;
+    let mut n_admitted = 0u64;
+    let mut n_completed = 0u64;
+    for (_id, rec) in store.iter_admitted() {
+        prefill_tokens_cum += rec.prefill_processed as u64;
+        decode_tokens_cum += rec.tokens_emitted as u64;
+        n_admitted += 1;
+        if rec.completed {
+            n_completed += 1;
+        }
     }
-}
-
-fn state_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestStateEntry {
-    let arrival_ms = rec.arrival_time.as_ms();
     RequestStateEntry {
-        request_id: id.0,
         logging_time_ms: now.as_ms(),
-        arrival_time_ms: arrival_ms,
-        first_token_time_ms: rec.first_token_time.map(|t| t.as_ms()),
-        completion_time_ms: if rec.completed {
-            rec.last_token_time.map(|t| t.as_ms())
-        } else {
-            None
-        },
-        completed: rec.completed,
-        input_len: rec.prompt_len,
-        output_len: rec.decode_len,
-        completed_input_len: rec.prefill_processed,
-        completed_output_len: rec.tokens_emitted,
-        final_phase: final_phase(rec),
-        // single-round defaults
-        session_id: id.0,
-        round_idx: 0,
-        total_rounds: 1,
-        tool_wait_after_ms: 0.0,
-        session_arrival_time_ms: arrival_ms,
-        preserved_prefix_kv: 0,
+        prefill_tokens_cum,
+        decode_tokens_cum,
+        n_admitted,
+        n_completed,
     }
 }
 
@@ -467,7 +450,12 @@ mod tests {
         ms: f64,
     }
     impl IterwiseUnifiedModel for FakeModel {
-        fn eval_iter(&self, _b: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+        fn eval_iter(
+            &self,
+            _b: &UnifiedArchInput,
+            slots: &mut Vec<LeafMetrics>,
+            _scratch: &mut Vec<LeafMetrics>,
+        ) -> LeafMetrics {
             slots.clear();
             LeafMetrics {
                 m: Metrics4 {
@@ -515,10 +503,14 @@ mod tests {
             Arc::new(FakeModel { ms: 1.0 }),
             Rc::clone(&store),
             // This test asserts the per-token array length, so opt into it.
-            WorkerConfig { log_output_token_times: true, ..WorkerConfig::default() },
+            WorkerConfig {
+                log_output_token_times: true,
+                ..WorkerConfig::default()
+            },
             None,
             "test-gpu".to_string(),
             1,
+            "main",
             BareboneWorker::<FakeModel>::new,
         );
         let cfg = SimpleDpConfig {

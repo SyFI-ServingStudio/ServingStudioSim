@@ -53,7 +53,7 @@ enum Command {
     /// across the run and concatenates them; open in ui.perfetto.dev. A separate
     /// verb (not a subject) — the `analyze run` catalog is untouched.
     Trace {
-        /// Run directory (holds `raw/cost_log.parquet` + `cost_manifest.json`).
+        /// Run directory (holds `raw/cost_log/` + `raw/cost_manifest/`).
         log_dir: PathBuf,
         /// Number of evenly-spaced sample windows.
         #[arg(long, default_value_t = 16)]

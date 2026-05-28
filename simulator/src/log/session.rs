@@ -23,10 +23,10 @@ use crate::log::schemas::{request_slo_schema, request_state_schema};
 const STREAM_FLUSH_ROWS: usize = 8_192;
 
 /// In-flight chunks the channel holds before the sim thread blocks on `send`
-/// (backpressure). Sized so a dense `request_state` snapshot — which emits the
-/// whole live set in a single tick (tens of chunks at once) — queues without
-/// stalling the sim, then drains while the sim runs the next interval. At
-/// `STREAM_FLUSH_ROWS` rows/chunk this bounds buffered memory to ~tens of MB.
+/// (backpressure). `request_state` is now one aggregate row per snapshot tick
+/// (not a per-request dump), so the burst per tick is tiny; the cap mainly
+/// smooths `request_slo` completion bursts. At `STREAM_FLUSH_ROWS` rows/chunk
+/// this bounds buffered memory to ~tens of MB.
 const CHANNEL_CAP: usize = 64;
 
 /// A full row chunk handed to the writer thread (ownership transferred).
@@ -210,7 +210,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut log = LoggerSession::open(dir.path(), true).unwrap();
-            log.record_request_slo(slo_entry(0, vec![1.0, 2.0])).unwrap();
+            log.record_request_slo(slo_entry(0, vec![1.0, 2.0]))
+                .unwrap();
             log.flush_all().unwrap();
         }
         let slo_path = dir.path().join("raw/request_slo.parquet");

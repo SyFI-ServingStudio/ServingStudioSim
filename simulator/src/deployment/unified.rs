@@ -100,8 +100,9 @@ impl Deployment for UnifiedDeployment {
                 let parallel = DenseParallel {
                     gpu_name: gpu_name.clone(),
                 };
-                let resolved =
-                    llama3_dense::resolve_configs(&llama3_dense::build_configs(&model_cfg, &parallel));
+                let resolved = llama3_dense::resolve_configs(&llama3_dense::build_configs(
+                    &model_cfg, &parallel,
+                ));
                 let model = Arc::new(
                     llama3_dense::build("unified".to_string(), resolved, bridge)
                         .context("building Llama3-dense model (often a missing profile.db row)")?,
@@ -186,7 +187,9 @@ fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
 fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
         IterWorkerSel::HpUnified { .. } => Ok(()),
-        other => bail!("unified: llama3_dp_attn_tp_ffn requires worker `hp_unified`, got {other:?}"),
+        other => {
+            bail!("unified: llama3_dp_attn_tp_ffn requires worker `hp_unified`, got {other:?}")
+        }
     }
 }
 
@@ -210,6 +213,7 @@ fn assemble_flow<M: IterwiseUnifiedModel, W: IterWorker + 'static>(
         log_dir,
         gpu_name,
         gpus_per_worker,
+        "main",
         build_fn,
     );
     Box::new(SimpleDpFlow::new(dp_cfg, factory))

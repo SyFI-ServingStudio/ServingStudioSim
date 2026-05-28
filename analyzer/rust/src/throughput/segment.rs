@@ -1,11 +1,11 @@
 //! Per-segment throughput: prefill / decode / total tokens-per-second over each
 //! `request_state` snapshot interval, normalized per-GPU.
 //!
-//! `request_state` logs every admitted request's cumulative `completed_input_len`
-//! (prefill progress) and `completed_output_len` (decode progress) at each tick.
-//! Summed across requests, those columns are monotonic non-decreasing (completed
-//! requests re-emit frozen values; never-admitted ones are skipped), so the tokens
-//! processed in a segment are just the diff of consecutive ticks' column sums.
+//! `request_state` carries one **aggregate** row per tick: `prefill_tokens_cum`
+//! and `decode_tokens_cum` are the cumulative token totals across the admitted
+//! set at that snapshot, monotonic non-decreasing. Tokens processed in a segment
+//! are just the diff of consecutive ticks' columns — no per-request aggregation
+//! is needed on the analyzer side (the sim already sums in `state_agg`).
 //! GPU count + name come from `run_meta.json` (sim-written); per-GPU = ÷ num_gpus.
 
 use std::path::Path;
@@ -18,7 +18,11 @@ use crate::io::{read_run_meta, resolve_artifact_path, SCHEMA_VERSION};
 use crate::session::{col, collect, register_if_exists, require_columns, value_f64};
 
 /// request_state columns the throughput subject depends on (drift guard).
-const STATE_COLS: &[&str] = &["logging_time", "completed_input_len", "completed_output_len"];
+const STATE_COLS: &[&str] = &[
+    "logging_time",
+    "prefill_tokens_cum",
+    "decode_tokens_cum",
+];
 
 /// Coarse view cap: the binned plot uses at most this many equal-width segments
 /// (ref's `compute_throughput_timeseries` shape), so a long run reads as a handful
@@ -46,7 +50,10 @@ pub async fn run_throughput(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
     let state_path = resolve_artifact_path(log_dir, "request_state.parquet");
     if !register_if_exists(ctx, "state", state_path).await? {
         let reason = "request_state.parquet not found";
-        return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+        return Ok((
+            unavailable(log_dir, reason),
+            unavailable_payload(log_dir, reason),
+        ));
     }
     require_columns(ctx, "state", STATE_COLS).await?;
 
@@ -59,7 +66,10 @@ pub async fn run_throughput(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
     let ticks = collect_ticks(ctx).await?;
     if ticks.len() < 2 {
         let reason = "fewer than 2 request_state snapshot ticks (no segment to diff)";
-        return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+        return Ok((
+            unavailable(log_dir, reason),
+            unavailable_payload(log_dir, reason),
+        ));
     }
 
     // Fine view: one segment per snapshot interval (boundaries = the ticks).
@@ -223,28 +233,20 @@ fn interp_cum(ticks: &[Tick], tq: f64) -> (f64, f64) {
 
 /// Per-tick cumulative prefill/decode token sums, ordered by snapshot time.
 ///
-/// We collapse to one row per `(request_id, logging_time)` (MAX) before summing.
-/// The current sim never emits a duplicate `(request_id, logging_time)` — its
-/// end-of-run `finalize` skips the census when the run ends on a snapshot tick
-/// (`sim/run.rs`) — so this is purely defensive: it keeps the analyzer correct on
-/// logs from older sim builds (which re-logged the final tick, double-counting the
-/// last segment) and absorbs any future re-introduction of same-clock duplicates.
+/// `request_state` is already one aggregate row per tick (the sim sums in
+/// `state_agg`), so this is a straight column read — no per-request collapse needed.
 async fn collect_ticks(ctx: &SessionContext) -> Result<Vec<Tick>> {
     let batches = collect(
         ctx,
-        "SELECT logging_time, SUM(p) AS p_cum, SUM(d) AS d_cum FROM ( \
-             SELECT request_id, logging_time, \
-                    MAX(completed_input_len) AS p, \
-                    MAX(completed_output_len) AS d \
-             FROM state GROUP BY request_id, logging_time \
-         ) GROUP BY logging_time ORDER BY logging_time",
+        "SELECT logging_time, prefill_tokens_cum, decode_tokens_cum \
+         FROM state ORDER BY logging_time",
     )
     .await?;
     let mut ticks = Vec::new();
     for batch in &batches {
         let t = col(batch, "logging_time")?;
-        let p = col(batch, "p_cum")?;
-        let d = col(batch, "d_cum")?;
+        let p = col(batch, "prefill_tokens_cum")?;
+        let d = col(batch, "decode_tokens_cum")?;
         for row in 0..batch.num_rows() {
             ticks.push((value_f64(t, row)?, value_f64(p, row)?, value_f64(d, row)?));
         }
@@ -258,8 +260,8 @@ fn definitions() -> Value {
     json!({
         "scope": "all admitted requests, per request_state snapshot interval",
         "segment": "one interval between consecutive request_state logging_time ticks",
-        "prefill_tps": "Δ(Σ completed_input_len) / Δt — prefill tokens processed per second",
-        "decode_tps": "Δ(Σ completed_output_len) / Δt — output tokens generated per second",
+        "prefill_tps": "Δ prefill_tokens_cum / Δt — prefill tokens processed per second",
+        "decode_tps": "Δ decode_tokens_cum / Δt — output tokens generated per second",
         "total_tps": "prefill_tps + decode_tps",
         "per_gpu": "the corresponding rate divided by num_gpus (from run_meta.json)",
         "binned_segments": "the same metric re-aggregated into <=10 equal-width time bins \
