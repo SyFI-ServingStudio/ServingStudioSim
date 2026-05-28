@@ -415,7 +415,7 @@ def test_main_rejects_log_dir_only_sweep(tmp_path, schema, monkeypatch):
 
     preset_path = tmp_path / "preset.json"
     preset_path.write_text(json.dumps(_base(sweep={"ptp": [1, 2]}, log_dir="logs/tp{ptp}")))
-    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type: True)
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     assert main_module.main([str(preset_path), "--dry-run"]) == 2
 
@@ -430,7 +430,7 @@ def test_main_rejects_empty_expansion(tmp_path, schema, monkeypatch):
         sweep={"ptp": [1, 2]},
         constraints=["ptp > 100"],  # rejects every combo → 0 runs
     )))
-    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type: True)
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     with pytest.raises(SystemExit):
         main_module.main([str(preset_path), "--dry-run"])
@@ -506,7 +506,7 @@ def test_main_rejects_placeholder_bad_choice(tmp_path, schema, monkeypatch):
     preset["io"]["log_level"] = "${bad_level}"
     preset_path = tmp_path / "preset.json"
     preset_path.write_text(json.dumps(preset))
-    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type: True)
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     assert main_module.main([str(preset_path), "--dry-run"]) == 2
 
@@ -523,7 +523,7 @@ def test_main_rejects_placeholder_bad_bool(tmp_path, schema, monkeypatch):
     )
     preset_path = tmp_path / "preset.json"
     preset_path.write_text(json.dumps(preset))
-    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type: True)
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     assert main_module.main([str(preset_path), "--dry-run"]) == 2
 
@@ -550,7 +550,7 @@ def test_main_rejects_placeholder_arch_tag(tmp_path, schema, monkeypatch):
     )
     preset_path = tmp_path / "preset.json"
     preset_path.write_text(json.dumps(preset))
-    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type: True)
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     assert main_module.main([str(preset_path), "--dry-run"]) == 2
 
@@ -575,7 +575,7 @@ def test_main_rejects_placeholder_dynamic_tag_missing_required(tmp_path, schema,
     )
     preset_path = tmp_path / "preset.json"
     preset_path.write_text(json.dumps(preset))
-    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type: True)
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     assert main_module.main([str(preset_path), "--dry-run"]) == 2
 
@@ -863,7 +863,7 @@ def test_main_manifest_single_axis_ok(tmp_path, schema, monkeypatch):
     manifest = tmp_path / "m.json"
     manifest.write_text(json.dumps(
         {"variants": {"arch": {"dense": "dense.json", "big": "big.json"}}}))
-    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type: True)
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     assert main_module.main([str(manifest), "--dry-run"]) == 0
 
@@ -875,7 +875,7 @@ def test_main_manifest_multi_axis_rejected(tmp_path, schema, monkeypatch):
     manifest = tmp_path / "m.json"
     manifest.write_text(json.dumps({"variants": {
         "arch": {"dense": "d.json"}, "hw": {"h200": "h.json"}}}))  # two axes → reject
-    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type: True)
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     assert main_module.main([str(manifest), "--dry-run"]) == 2
 
@@ -902,7 +902,7 @@ def test_manifest_extra_key_rejected(tmp_path, schema, monkeypatch):
         "variants": {"arch": {"dense": "d.json"}},
         "sweep": {"typo": [1]},  # stray key
     }))
-    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type: True)
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     assert main_module.main([str(manifest), "--dry-run"]) == 2
 
@@ -938,7 +938,7 @@ def test_io_block_must_be_mapping(schema, bad_io):
 def _mock_build(monkeypatch, schema):
     import launcher.exec as exec_module
     from launcher import __main__ as main_module
-    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type: True)
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     return main_module
 
@@ -1185,7 +1185,7 @@ def test_main_validates_log_dirs_before_dry_run(tmp_path, schema, monkeypatch, c
         sweep={"ptp": [1, 2]},
         log_dir="logs/same",
     )))
-    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type: True)
+    monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
 
     assert main_module.main([str(preset_path), "--dry-run"]) == 2
