@@ -66,15 +66,17 @@ pub struct HpUnifiedWorker<M: IterwiseUnifiedModel> {
     runtime: HpRuntime,
     /// One container per attention DP shard; length = `model.num_attn_dp_groups()`.
     batches: Vec<Batch>,
-    events: Vec<WorkerEvent>,
     cost_logger: Option<CostLogger>,
     cost_slots: Vec<LeafMetrics>,
+    cost_scratch: Vec<LeafMetrics>,
+    cost_groups: Vec<GroupInputLog>,
     cost_slot_inputs: Vec<SlotInput>,
 }
 
 impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
     pub fn new(
         id: WorkerId,
+        pool_tag: &'static str,
         model: Arc<M>,
         requests: SharedRequests,
         config: WorkerConfig,
@@ -94,7 +96,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             other => other,
         };
         let cost_logger = match cost_log_dir {
-            Some(dir) => match CostLogger::open(&dir, &model.cost_log_manifest()) {
+            Some(dir) => match CostLogger::open(&dir, pool_tag, id, &model.cost_log_manifest()) {
                 Ok(logger) => Some(logger),
                 Err(e) => {
                     tracing::warn!("cost_log disabled: failed to open writer: {e}");
@@ -110,16 +112,17 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             config,
             runtime: HpRuntime::new(balance),
             batches,
-            events: Vec::new(),
             cost_logger,
             cost_slots: Vec::new(),
+            cost_scratch: Vec::new(),
+            cost_groups: Vec::new(),
             cost_slot_inputs: Vec::new(),
         }
     }
 
     // ── tick: state-forwarding loop (§3.2.1; identical shape to barebone) ──────
 
-    fn tick_inner(&mut self, now: Time) {
+    fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
@@ -148,12 +151,30 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                         continue;
                     }
                     Done => {
-                        self.complete_iter(now);
+                        self.complete_iter(now, events);
                         self.runtime.worker_fsm_state = Idle;
                         continue;
                     }
                 },
             }
+        }
+        self.next_wakeup(now)
+    }
+
+    fn next_wakeup(&self, now: Time) -> Option<Time> {
+        match self.runtime.worker_fsm_state {
+            WorkerFsmState::Idle => {
+                let status = self.status();
+                if status.queued_requests > 0 || status.active_requests > 0 {
+                    Some(now)
+                } else {
+                    None
+                }
+            }
+            WorkerFsmState::Active => match self.runtime.batch_fsm_state.cursor {
+                IterCursor::NotStarted | IterCursor::Done => Some(now),
+                IterCursor::Computing => Some(self.runtime.batch_fsm_state.compute_end),
+            },
         }
     }
 
@@ -204,24 +225,28 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             self.model.eval_iter_with_inputs(
                 &arch_input,
                 &mut self.cost_slots,
+                &mut self.cost_scratch,
                 &mut self.cost_slot_inputs,
             )
         } else {
-            self.model.eval_iter(&arch_input, &mut self.cost_slots)
+            self.model
+                .eval_iter(&arch_input, &mut self.cost_slots, &mut self.cost_scratch)
         };
         let cost_time = Time::from_ms(agg.m.time_ms as f64);
         if self.cost_logger.is_some() {
-            let groups = arch_input
-                .groups
-                .into_iter()
-                .map(|g| GroupInputLog {
+            // Refill the reused `cost_groups` buffer in place; the per-slot
+            // breakdowns are appended into the logger's flat chunk buffers by
+            // `record`, so the entry owns no `Vec`.
+            self.cost_groups.clear();
+            for g in &arch_input.groups {
+                self.cost_groups.push(GroupInputLog {
                     batch_tokens: g.batch_tokens,
                     prefill_tokens: g.prefill_tokens,
                     decode_request_count: g.decode_tokens,
                     decode_kv_total: g.total_kv_len,
-                    prefill_chunk_pairs: g.prefill_chunk_pairs,
-                })
-                .collect();
+                    prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                });
+            }
             let entry = CostLogEntry {
                 worker_id: self.id.0,
                 iter_id: self.runtime.iter_counter as u64,
@@ -229,13 +254,17 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                 wall_start_ms: now.as_ms(),
                 total_time_ms: agg.m.time_ms as f64,
                 energy_j: agg.m.energy_j as f64,
-                groups,
-                slot_time_ms: self.cost_slots.iter().map(|l| l.m.time_ms).collect(),
-                slot_coverage: self.cost_slots.iter().map(|l| l.coverage.bits()).collect(),
+                group_len: 0,
+                slot_len: 0,
                 slot_input_len: 0,
             };
             if let Some(logger) = self.cost_logger.as_mut() {
-                if let Err(e) = logger.record(entry, &mut self.cost_slot_inputs) {
+                if let Err(e) = logger.record(
+                    entry,
+                    &self.cost_slots,
+                    &mut self.cost_groups,
+                    &mut self.cost_slot_inputs,
+                ) {
                     tracing::warn!("cost_log record failed: {e}");
                 }
             }
@@ -246,7 +275,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
 
     // ── Stage 3: complete_iter — same bookkeeping as barebone, per group ────────
 
-    fn complete_iter(&mut self, now: Time) {
+    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
         let log_tokens = self.config.log_output_token_times;
         for gid in 0..self.batches.len() {
             let mut completed: Vec<RequestId> = Vec::new();
@@ -304,7 +333,10 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                     .unwrap_or(0);
                 self.batches[gid].release(rid, current_kv);
                 self.runtime.request_to_group.remove(&rid);
-                self.events.push(WorkerEvent::RequestComplete { req: rid });
+                events.push(WorkerEvent::RequestComplete {
+                    worker: self.id,
+                    req: rid,
+                });
             }
         }
     }
@@ -413,12 +445,8 @@ impl<M: IterwiseUnifiedModel> IterWorker for HpUnifiedWorker<M> {
         }
     }
 
-    fn tick(&mut self, now: Time) {
-        self.tick_inner(now);
-    }
-
-    fn drain_events(&mut self) -> Vec<WorkerEvent> {
-        std::mem::take(&mut self.events)
+    fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+        self.tick_inner(now, events)
     }
 
     fn status(&self) -> WorkerStatus {
@@ -454,7 +482,12 @@ mod tests {
         dp_groups: u16,
     }
     impl IterwiseUnifiedModel for FakeDpModel {
-        fn eval_iter(&self, batch: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+        fn eval_iter(
+            &self,
+            batch: &UnifiedArchInput,
+            slots: &mut Vec<LeafMetrics>,
+            _scratch: &mut Vec<LeafMetrics>,
+        ) -> LeafMetrics {
             slots.clear();
             // Assert the worker fed us exactly one group per DP shard.
             assert_eq!(batch.groups.len(), self.dp_groups as usize);
@@ -492,6 +525,7 @@ mod tests {
     fn worker(store: SharedRequests, dp_groups: u16) -> HpUnifiedWorker<FakeDpModel> {
         HpUnifiedWorker::new(
             WorkerId(0),
+            "main",
             Arc::new(FakeDpModel { ms: 1.0, dp_groups }),
             store,
             WorkerConfig::default(),
@@ -514,8 +548,9 @@ mod tests {
         let mut w = worker(store, 2);
         w.enqueue(WorkerMsg::Request(RequestId(0)));
         w.enqueue(WorkerMsg::Request(RequestId(1)));
+        let mut events = Vec::new();
         for step in 0..20u64 {
-            w.tick(Time::from_ms(step as f64));
+            w.tick(Time::from_ms(step as f64), &mut events);
         }
         let g0 = w.batches[0].iter_decoding().count();
         let g1 = w.batches[1].iter_decoding().count();
@@ -541,10 +576,11 @@ mod tests {
             w.enqueue(WorkerMsg::Request(RequestId(id)));
         }
         let mut completed = Vec::new();
+        let mut events = Vec::new();
         for step in 0..500u64 {
-            w.tick(Time::from_ms(step as f64));
-            for e in w.drain_events() {
-                let WorkerEvent::RequestComplete { req } = e else {
+            w.tick(Time::from_ms(step as f64), &mut events);
+            for e in events.drain(..) {
+                let WorkerEvent::RequestComplete { req, .. } = e else {
                     continue;
                 };
                 completed.push(req);

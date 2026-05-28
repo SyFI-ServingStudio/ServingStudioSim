@@ -20,6 +20,7 @@ use arrow_schema::{DataType, Field, Fields, Schema};
 /// `output_section` struct columns onto this base.
 pub fn cost_log_envelope_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
+        Field::new("pool_tag", DataType::Utf8, false),
         Field::new("worker_id", DataType::UInt16, false),
         Field::new("worker_kind", DataType::Utf8, false),
         // Iteration index (one forward-pass cycle); shared by every batch a worker
@@ -60,8 +61,9 @@ pub(crate) fn group_input_fields() -> Fields {
 /// then the compiled CostTree's per-slot breakdown as two parallel lists:
 /// `slot_time_ms` (`List<f32>`) and `slot_coverage` (`List<u8>`, the
 /// `CoverageFlags` bits). Slot *names* are NOT a column (INV-5 — names live at
-/// compile time only); they live once in the `cost_manifest.json` sidecar and
-/// label the list positions.
+/// compile time only); they live once in the matching
+/// `cost_manifest/worker_<pool_tag>_<worker_id>.json` sidecar and label the
+/// list positions.
 pub fn cost_log_schema() -> Arc<Schema> {
     let time_item = Arc::new(Field::new("item", DataType::Float32, false));
     let cov_item = Arc::new(Field::new("item", DataType::UInt8, false));
@@ -71,6 +73,10 @@ pub fn cost_log_schema() -> Arc<Schema> {
         false,
     ));
     Arc::new(Schema::new(vec![
+        // Pool tag + worker id are the stable manifest key. WorkerId is per-pool
+        // (PD has prefill worker 0 and decode worker 0), so worker_id alone is
+        // not globally unique inside one run.
+        Field::new("pool_tag", DataType::Utf8, false),
         Field::new("worker_id", DataType::UInt16, false),
         // `iter_id` is the per-worker iteration index (one forward-pass cycle);
         // `batch_id` is the batch *within* that iteration. They coincide today
@@ -138,29 +144,23 @@ pub fn network_event_schema() -> Arc<Schema> {
     ]))
 }
 
-/// `request_state` (§7.1) — periodic snapshot per request × sampling tick.
-/// Column list / order / types / nullability match `docs/logging.md §7.1`
-/// (and the legacy `ref/moesim-rs/src/logging/schemas.rs::request_final_state_schema`,
-/// which the new doc takes verbatim).
+/// `request_state` (§7.1) — one **aggregate** row per snapshot tick (not per
+/// request). The analyzer's only consumer (`throughput/segment.rs`) reduces the
+/// per-request rows to `Σ completed_input_len` / `Σ completed_output_len` per
+/// `logging_time` and diffs consecutive ticks, so the sum is computed at the
+/// source: each row carries the cumulative prefill/decode token totals over the
+/// admitted set at that tick, plus the admitted/completed request counts. This
+/// collapses the table from `O(admitted × ticks)` (tens of millions of rows on a
+/// saturated run, where prefill admits the whole trace while decode lags) to one
+/// row per tick. Per-request session columns that fed the analyzer's session-E2E
+/// rollup move to `request_slo` (terminal-per-request).
 pub fn request_state_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("request_id", DataType::UInt32, false),
         Field::new("logging_time", DataType::Float64, false),
-        Field::new("arrival_time_ms", DataType::Float64, false),
-        Field::new("first_token_time_ms", DataType::Float64, true),
-        Field::new("completion_time_ms", DataType::Float64, true),
-        Field::new("completed", DataType::Boolean, false),
-        Field::new("input_len", DataType::UInt32, false),
-        Field::new("output_len", DataType::UInt32, false),
-        Field::new("completed_input_len", DataType::UInt32, false),
-        Field::new("completed_output_len", DataType::UInt32, false),
-        Field::new("final_phase", DataType::LargeUtf8, false),
-        Field::new("session_id", DataType::UInt32, false),
-        Field::new("round_idx", DataType::UInt32, false),
-        Field::new("total_rounds", DataType::UInt32, false),
-        Field::new("tool_wait_after_ms", DataType::Float64, false),
-        Field::new("session_arrival_time_ms", DataType::Float64, false),
-        Field::new("preserved_prefix_kv", DataType::UInt32, false),
+        Field::new("prefill_tokens_cum", DataType::UInt64, false),
+        Field::new("decode_tokens_cum", DataType::UInt64, false),
+        Field::new("n_admitted", DataType::UInt64, false),
+        Field::new("n_completed", DataType::UInt64, false),
     ]))
 }
 

@@ -9,8 +9,8 @@ use arrow_array::builder::{
     Float32Builder, ListBuilder, StringBuilder, StructBuilder, UInt32Builder, UInt8Builder,
 };
 use arrow_array::{
-    BooleanArray, Float32Array, Float64Array, LargeStringArray, ListArray, RecordBatch,
-    UInt16Array, UInt32Array, UInt64Array,
+    BooleanArray, Float32Array, Float64Array, ListArray, RecordBatch, StringArray, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field};
 
@@ -19,54 +19,18 @@ use crate::log::schemas::{
 };
 use crate::timing::SlotInput;
 
-/// A request's lifecycle phase at snapshot time. A small `#[repr(u8)]` code
-/// rather than a `String`: dense `request_state` emits one row per live request
-/// per interval (tens of millions of rows on a long run), so a per-row `String`
-/// allocation here dominated both the sim thread (alloc) and the writer thread
-/// (dictionary intern). The parquet column is still `LargeUtf8` — `as_str()`
-/// hands back a `&'static str`, so the on-disk output is byte-identical.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FinalPhase {
-    Queued,
-    Prefill,
-    Decode,
-    Complete,
-}
-
-impl FinalPhase {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            FinalPhase::Queued => "queued",
-            FinalPhase::Prefill => "prefill",
-            FinalPhase::Decode => "decode",
-            FinalPhase::Complete => "complete",
-        }
-    }
-}
-
-/// One `request_state` row — a snapshot of a request at `logging_time_ms`.
-/// Single-round runs default the multi-round columns (`session_id = request_id`,
-/// `round_idx = 0`, `total_rounds = 1`, `tool_wait_after_ms = 0`,
-/// `session_arrival_time_ms = arrival`, `preserved_prefix_kv = 0`).
-#[derive(Clone, Debug)]
+/// One `request_state` row — an **aggregate** over the admitted set at one
+/// snapshot tick (`logging_time_ms`), not a per-request row. `*_tokens_cum` are
+/// the cumulative prefill/decode token totals across all admitted requests; the
+/// analyzer diffs them between consecutive ticks for per-segment throughput. The
+/// counts are diagnostics (admitted = touched-by-a-worker, completed = finished).
+#[derive(Clone, Copy, Debug)]
 pub struct RequestStateEntry {
-    pub request_id: u32,
     pub logging_time_ms: f64,
-    pub arrival_time_ms: f64,
-    pub first_token_time_ms: Option<f64>,
-    pub completion_time_ms: Option<f64>,
-    pub completed: bool,
-    pub input_len: u32,
-    pub output_len: u32,
-    pub completed_input_len: u32,
-    pub completed_output_len: u32,
-    pub final_phase: FinalPhase,
-    pub session_id: u32,
-    pub round_idx: u32,
-    pub total_rounds: u32,
-    pub tool_wait_after_ms: f64,
-    pub session_arrival_time_ms: f64,
-    pub preserved_prefix_kv: u32,
+    pub prefill_tokens_cum: u64,
+    pub decode_tokens_cum: u64,
+    pub n_admitted: u64,
+    pub n_completed: u64,
 }
 
 /// One `request_slo` row — terminal (or sim-end-flush) per-token timing for one
@@ -96,6 +60,20 @@ pub struct RequestSloEntry {
     /// Absolute sim-time (ms) of the final output token (= `last_token_time`),
     /// so E2E = `finish - arrival` survives `log_output_token_times` off.
     pub finish_decode_time_ms: Option<f32>,
+    // Multi-round / session columns are deliberately NOT carried here today.
+    // Phase 0 is single-round, so `session_id`, `round_idx`, `total_rounds`,
+    // `tool_wait_after_ms`, `session_arrival_time_ms`, `preserved_prefix_kv`,
+    // and the terminal `final_phase` were either hardcoded constants
+    // (`round_idx = 0`, `total_rounds = 1`, ...) or degenerate duplicates of
+    // existing columns (`session_id == request_id`,
+    // `session_arrival_time_ms == arrival_time_ms`). The analyzer's session-E2E
+    // subject treated each request as its own session — i.e. it computed
+    // request E2E under a different column name. So adding them as defaults
+    // here would be dead schema. When real multi-turn lifecycle lands (the
+    // `common/request.rs` "L7 lifecycle" comment), extend `RequestSloEntry`
+    // with the actually-populated fields and update the analyzer to read
+    // session-grouping columns from `request_slo` (not the per-tick
+    // `request_state`, which is now an aggregate).
 }
 
 /// Inter-token gaps (ms) → `(mean, p50, p99, max)`, all `None` when fewer than
@@ -144,14 +122,17 @@ pub struct GroupInputLog {
 /// One `cost_log` row — a whole-iteration cost query via the compiled CostTree.
 /// `groups` is the per-iteration input context (one entry per HP group);
 /// `slot_time_ms` / `slot_coverage` are the per-slot cost breakdown (positions
-/// named by the `cost_manifest.json` sidecar); the scalars are the rolled-up
-/// totals.
+/// named by the matching per-worker `cost_manifest/` sidecar); the scalars are
+/// the rolled-up totals.
 ///
 /// Not `Clone`/`Debug`: the row is only ever moved into the writer-thread
-/// channel, never cloned or formatted on the sim thread. Per-slot inputs are
-/// stored in [`CostLogChunk::slot_inputs`] as one flat chunk buffer; this row
-/// carries only its slice length so the worker's capture buffer can keep its
-/// allocation across iterations.
+/// channel, never cloned or formatted on the sim thread. The row owns **no**
+/// `Vec`s — its variable-length data (per-iteration `groups`, the per-slot
+/// `time`/`coverage`/`input` breakdowns) lives in the parallel flat buffers on
+/// [`CostLogChunk`]; the row carries only the slice lengths. This keeps the
+/// per-iteration record allocation-free (the worker appends into the chunk's
+/// reused buffers instead of `collect`ing three fresh `Vec`s every forward pass
+/// that would then be freed cross-thread on the writer).
 pub struct CostLogEntry {
     pub worker_id: u16,
     /// Per-worker iteration index (one forward-pass cycle).
@@ -165,26 +146,47 @@ pub struct CostLogEntry {
     /// f64 that barely compressed.
     pub total_time_ms: f64,
     pub energy_j: f64,
-    pub groups: Vec<GroupInputLog>,
-    pub slot_time_ms: Vec<f32>,
-    pub slot_coverage: Vec<u8>,
+    /// Number of entries in [`CostLogChunk::group_logs`] belonging to this row.
+    pub group_len: usize,
+    /// Number of entries in [`CostLogChunk::slot_times`] / [`CostLogChunk::slot_covs`]
+    /// belonging to this row (the per-slot cost breakdown length).
+    pub slot_len: usize,
     /// Number of entries in [`CostLogChunk::slot_inputs`] belonging to this row.
     /// Zero only for models that do not expose a compiled CostTree.
     pub slot_input_len: usize,
 }
 
 /// A cost-log transfer unit sent from the sim thread to the writer thread.
-/// `entries` stores row metadata; `slot_inputs` stores all captured per-slot
-/// inputs back-to-back, avoiding one owned `Vec<SlotInput>` allocation per row.
+/// `entries` stores row metadata; every variable-length field is stored
+/// back-to-back in a parallel flat buffer (`group_logs` / `slot_times` /
+/// `slot_covs` / `slot_inputs`) so the sim thread appends into reused capacity
+/// instead of allocating an owned `Vec` per row. The writer walks all four with
+/// cursors keyed by each row's `*_len`.
 pub struct CostLogChunk {
+    /// Stable pool tag for every row in this chunk. A worker owns one CostLogger,
+    /// so the whole chunk belongs to one `(pool_tag, worker_id)` stream.
+    pub pool_tag: &'static str,
     pub entries: Vec<CostLogEntry>,
+    pub group_logs: Vec<GroupInputLog>,
+    pub slot_times: Vec<f32>,
+    pub slot_covs: Vec<u8>,
     pub slot_inputs: Vec<SlotInput>,
 }
 
 impl CostLogChunk {
-    pub fn with_capacity(row_capacity: usize, slot_input_capacity: usize) -> Self {
+    pub fn with_capacity(
+        pool_tag: &'static str,
+        row_capacity: usize,
+        groups_capacity: usize,
+        slot_capacity: usize,
+        slot_input_capacity: usize,
+    ) -> Self {
         Self {
+            pool_tag,
             entries: Vec::with_capacity(row_capacity),
+            group_logs: Vec::with_capacity(groups_capacity),
+            slot_times: Vec::with_capacity(slot_capacity),
+            slot_covs: Vec::with_capacity(slot_capacity),
             slot_inputs: Vec::with_capacity(slot_input_capacity),
         }
     }
@@ -204,7 +206,7 @@ impl CostLogChunk {
 /// split into the two parallel `prefill_*_lens` lists *here*, on the writer
 /// thread (the worker hands the pairs over un-split). Item/list fields are
 /// non-nullable to match [`group_input_fields`] / `cost_log_schema`.
-fn build_groups_column(entries: &[CostLogEntry]) -> ListArray {
+fn build_groups_column(entries: &[CostLogEntry], group_logs: &[GroupInputLog]) -> ListArray {
     let fields = group_input_fields();
     let u32_item = || Arc::new(Field::new("item", DataType::UInt32, false));
     let new_struct_builder = || {
@@ -222,9 +224,11 @@ fn build_groups_column(entries: &[CostLogEntry]) -> ListArray {
     };
     let struct_field = Arc::new(Field::new("item", DataType::Struct(fields.clone()), false));
     let mut groups_builder = ListBuilder::new(new_struct_builder()).with_field(struct_field);
+    let mut group_cursor = 0usize;
     for e in entries {
         let sb = groups_builder.values();
-        for g in &e.groups {
+        let group_end = group_cursor + e.group_len;
+        for g in &group_logs[group_cursor..group_end] {
             sb.field_builder::<UInt32Builder>(0)
                 .unwrap()
                 .append_value(g.batch_tokens);
@@ -253,6 +257,7 @@ fn build_groups_column(entries: &[CostLogEntry]) -> ListArray {
             }
             sb.append(true);
         }
+        group_cursor = group_end;
         groups_builder.append(true);
     }
     groups_builder.finish()
@@ -260,6 +265,7 @@ fn build_groups_column(entries: &[CostLogEntry]) -> ListArray {
 
 pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> {
     let entries = &chunk.entries;
+    let pool_tag: Vec<&str> = entries.iter().map(|_| chunk.pool_tag).collect();
     let worker_id: Vec<u16> = entries.iter().map(|e| e.worker_id).collect();
     let iter_id: Vec<u64> = entries.iter().map(|e| e.iter_id).collect();
     let batch_id: Vec<u64> = entries.iter().map(|e| e.batch_id).collect();
@@ -268,7 +274,7 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
     let energy: Vec<f64> = entries.iter().map(|e| e.energy_j).collect();
 
     // Per-iteration input_section: one List<Struct> entry per row.
-    let groups = build_groups_column(entries);
+    let groups = build_groups_column(entries, &chunk.group_logs);
 
     // Two parallel List columns, one (non-null, possibly empty) list per row.
     // Non-nullable `item` to match the schema (ListBuilder defaults to nullable).
@@ -284,16 +290,23 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
     let mut input_builder = ListBuilder::new(StringBuilder::new())
         .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
     let mut slot_input_cursor = 0usize;
+    let mut slot_cursor = 0usize;
     let mut json_buf = Vec::new();
     for e in entries {
-        for &t in &e.slot_time_ms {
+        let slot_end = slot_cursor + e.slot_len;
+        ensure!(
+            slot_end <= chunk.slot_times.len() && slot_end <= chunk.slot_covs.len(),
+            "cost_log slot slice exceeds chunk buffer"
+        );
+        for &t in &chunk.slot_times[slot_cursor..slot_end] {
             time_builder.values().append_value(t);
         }
         time_builder.append(true);
-        for &c in &e.slot_coverage {
+        for &c in &chunk.slot_covs[slot_cursor..slot_end] {
             cov_builder.values().append_value(c);
         }
         cov_builder.append(true);
+        slot_cursor = slot_end;
         let slot_input_end = slot_input_cursor + e.slot_input_len;
         ensure!(
             slot_input_end <= chunk.slot_inputs.len(),
@@ -314,10 +327,15 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
         slot_input_cursor == chunk.slot_inputs.len(),
         "cost_log chunk has unused slot_input values"
     );
+    ensure!(
+        slot_cursor == chunk.slot_times.len() && slot_cursor == chunk.slot_covs.len(),
+        "cost_log chunk has unused slot time/coverage values"
+    );
 
     Ok(RecordBatch::try_new(
         cost_log_schema(),
         vec![
+            Arc::new(StringArray::from(pool_tag)),
             Arc::new(UInt16Array::from(worker_id)),
             Arc::new(UInt64Array::from(iter_id)),
             Arc::new(UInt64Array::from(batch_id)),
@@ -333,44 +351,20 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
 }
 
 pub(crate) fn state_to_record_batch(entries: &[RequestStateEntry]) -> Result<RecordBatch> {
-    let request_id: Vec<u32> = entries.iter().map(|e| e.request_id).collect();
     let logging_time: Vec<f64> = entries.iter().map(|e| e.logging_time_ms).collect();
-    let arrival: Vec<f64> = entries.iter().map(|e| e.arrival_time_ms).collect();
-    let first_token: Vec<Option<f64>> = entries.iter().map(|e| e.first_token_time_ms).collect();
-    let completion: Vec<Option<f64>> = entries.iter().map(|e| e.completion_time_ms).collect();
-    let completed: Vec<bool> = entries.iter().map(|e| e.completed).collect();
-    let input_len: Vec<u32> = entries.iter().map(|e| e.input_len).collect();
-    let output_len: Vec<u32> = entries.iter().map(|e| e.output_len).collect();
-    let completed_input: Vec<u32> = entries.iter().map(|e| e.completed_input_len).collect();
-    let completed_output: Vec<u32> = entries.iter().map(|e| e.completed_output_len).collect();
-    let final_phase: Vec<&str> = entries.iter().map(|e| e.final_phase.as_str()).collect();
-    let session_id: Vec<u32> = entries.iter().map(|e| e.session_id).collect();
-    let round_idx: Vec<u32> = entries.iter().map(|e| e.round_idx).collect();
-    let total_rounds: Vec<u32> = entries.iter().map(|e| e.total_rounds).collect();
-    let tool_wait: Vec<f64> = entries.iter().map(|e| e.tool_wait_after_ms).collect();
-    let session_arrival: Vec<f64> = entries.iter().map(|e| e.session_arrival_time_ms).collect();
-    let prefix_kv: Vec<u32> = entries.iter().map(|e| e.preserved_prefix_kv).collect();
+    let prefill_cum: Vec<u64> = entries.iter().map(|e| e.prefill_tokens_cum).collect();
+    let decode_cum: Vec<u64> = entries.iter().map(|e| e.decode_tokens_cum).collect();
+    let n_admitted: Vec<u64> = entries.iter().map(|e| e.n_admitted).collect();
+    let n_completed: Vec<u64> = entries.iter().map(|e| e.n_completed).collect();
 
     Ok(RecordBatch::try_new(
         request_state_schema(),
         vec![
-            Arc::new(UInt32Array::from(request_id)),
             Arc::new(Float64Array::from(logging_time)),
-            Arc::new(Float64Array::from(arrival)),
-            Arc::new(Float64Array::from(first_token)),
-            Arc::new(Float64Array::from(completion)),
-            Arc::new(BooleanArray::from(completed)),
-            Arc::new(UInt32Array::from(input_len)),
-            Arc::new(UInt32Array::from(output_len)),
-            Arc::new(UInt32Array::from(completed_input)),
-            Arc::new(UInt32Array::from(completed_output)),
-            Arc::new(LargeStringArray::from(final_phase)),
-            Arc::new(UInt32Array::from(session_id)),
-            Arc::new(UInt32Array::from(round_idx)),
-            Arc::new(UInt32Array::from(total_rounds)),
-            Arc::new(Float64Array::from(tool_wait)),
-            Arc::new(Float64Array::from(session_arrival)),
-            Arc::new(UInt32Array::from(prefix_kv)),
+            Arc::new(UInt64Array::from(prefill_cum)),
+            Arc::new(UInt64Array::from(decode_cum)),
+            Arc::new(UInt64Array::from(n_admitted)),
+            Arc::new(UInt64Array::from(n_completed)),
         ],
     )?)
 }
@@ -475,6 +469,8 @@ mod tests {
 
     #[test]
     fn cost_log_parallel_list_columns_round_trip() {
+        // Flat layout: row metadata in `entries` (carrying the per-row lengths),
+        // variable-length data back-to-back in the chunk's parallel buffers.
         let entries = vec![
             CostLogEntry {
                 worker_id: 0,
@@ -483,26 +479,8 @@ mod tests {
                 wall_start_ms: 1.0,
                 total_time_ms: 2.0,
                 energy_j: 0.5,
-                groups: vec![
-                    // group 0: two prefills + a decode aggregate.
-                    GroupInputLog {
-                        batch_tokens: 20,
-                        prefill_tokens: 18,
-                        decode_request_count: 2,
-                        decode_kv_total: 100,
-                        prefill_chunk_pairs: vec![(0, 8), (4, 10)],
-                    },
-                    // group 1: pure decode (no prefill pairs).
-                    GroupInputLog {
-                        batch_tokens: 3,
-                        prefill_tokens: 0,
-                        decode_request_count: 3,
-                        decode_kv_total: 60,
-                        prefill_chunk_pairs: vec![],
-                    },
-                ],
-                slot_time_ms: vec![1.0, 0.5, 0.5],
-                slot_coverage: vec![0, 1, 0],
+                group_len: 2,
+                slot_len: 3,
                 slot_input_len: 0,
             },
             CostLogEntry {
@@ -512,36 +490,67 @@ mod tests {
                 wall_start_ms: 3.0,
                 total_time_ms: 1.0,
                 energy_j: 0.2,
-                groups: vec![GroupInputLog {
-                    batch_tokens: 5,
-                    prefill_tokens: 5,
-                    decode_request_count: 0,
-                    decode_kv_total: 0,
-                    prefill_chunk_pairs: vec![(0, 5)],
-                }],
-                slot_time_ms: vec![0.4, 0.6, 0.0],
-                slot_coverage: vec![0, 0, 0],
+                group_len: 1,
+                slot_len: 3,
                 slot_input_len: 0,
             },
         ];
+        let group_logs = vec![
+            // row 0, group 0: two prefills + a decode aggregate.
+            GroupInputLog {
+                batch_tokens: 20,
+                prefill_tokens: 18,
+                decode_request_count: 2,
+                decode_kv_total: 100,
+                prefill_chunk_pairs: vec![(0, 8), (4, 10)],
+            },
+            // row 0, group 1: pure decode (no prefill pairs).
+            GroupInputLog {
+                batch_tokens: 3,
+                prefill_tokens: 0,
+                decode_request_count: 3,
+                decode_kv_total: 60,
+                prefill_chunk_pairs: vec![],
+            },
+            // row 1, group 0.
+            GroupInputLog {
+                batch_tokens: 5,
+                prefill_tokens: 5,
+                decode_request_count: 0,
+                decode_kv_total: 0,
+                prefill_chunk_pairs: vec![(0, 5)],
+            },
+        ];
         let batch = cost_to_record_batch(&CostLogChunk {
+            pool_tag: "decode",
             entries,
+            group_logs,
+            slot_times: vec![1.0, 0.5, 0.5, 0.4, 0.6, 0.0],
+            slot_covs: vec![0, 1, 0, 0, 0, 0],
             slot_inputs: vec![],
         })
         .unwrap();
         assert_eq!(batch.num_rows(), 2);
-        // iter_id column (index 1) carries the per-worker iteration counter.
+        let pool = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(pool.value(0), "decode");
+        assert_eq!(pool.value(1), "decode");
+
+        // iter_id column (index 2) carries the per-worker iteration counter.
         let it = batch
-            .column(1)
+            .column(2)
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
         assert_eq!(it.value(0), 7);
         assert_eq!(it.value(1), 8);
 
-        // groups column (index 6): List<Struct>. Row 0 has 2 groups, row 1 has 1.
+        // groups column (index 7): List<Struct>. Row 0 has 2 groups, row 1 has 1.
         let groups_col = batch
-            .column(6)
+            .column(7)
             .as_any()
             .downcast_ref::<ListArray>()
             .unwrap();

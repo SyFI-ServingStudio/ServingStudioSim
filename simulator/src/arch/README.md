@@ -25,8 +25,8 @@ The arch never sees sim state; the worker never sees worklets/kernels.
 
 | Method | Role |
 |---|---|
-| `eval_iter(batch, &mut slots) -> LeafMetrics` | per-iter CostTree eval: fill `slots` with per-leaf metrics, aggregate, return the root (`.m.time_ms` is the clock) |
-| `eval_iter_with_inputs(batch, &mut slots, &mut inputs)` | same, plus capture each leaf's typed `SlotInput` for cost_log (the clone is paid only here) |
+| `eval_iter(batch, &mut slots, &mut scratch) -> LeafMetrics` | per-iter CostTree eval: fill `slots` with per-leaf metrics, aggregate through the caller-owned scratch buffer, return the root (`.m.time_ms` is the clock) |
+| `eval_iter_with_inputs(batch, &mut slots, &mut scratch, &mut inputs)` | same, plus capture each leaf's typed `SlotInput` for cost_log (the clone is paid only here) |
 | `cost_log_manifest() -> CostManifest` | the slots + flat nodes so a consumer reproduces `total_time_ms` from a row |
 | `kv_bytes_per_token() -> u64` | KV footprint per token; the worker divides its memory budget by this to size its `KvPool`. TP archs report the **per-rank** (tp-head-sharded) footprint; the dense arch reports the full model's |
 | `gpus_per_replica() -> u16` | GPUs one replica spans (the arch knows the real parallel extent); L5/L6 only read it |
@@ -46,8 +46,9 @@ build_configs(&ModelCfg, &ParallelCfg) -> *Configs     // raw worklet/op configs
 `build` instantiates each worklet/op (which profiles its kernels through the
 `bridge`), then **compiles the CostTree once** and caches its flattened form +
 slot count on the model, so the per-iter `eval_iter` only evals leaves and
-aggregates — no per-tick recompile or `String` minting. A dry-run `bridge` turns
-`build` into a coverage tally (no separate traversal).
+aggregates through caller-owned buffers — no per-tick recompile, `String` minting,
+or aggregate scratch allocation. A dry-run `bridge` turns `build` into a coverage
+tally (no separate traversal).
 
 ## The compiled cost structure
 
@@ -81,11 +82,12 @@ pre/attn/post, then final_norm, lm_head — so the evaluator cursor stays aligne
 Serde tagged enums, the symmetric sibling of the worker selector, **provider-first**
 (selecting the tag is the only way its params appear — no global union):
 
-- `IterArchSel` — `llama3_dense` / `llama3_dense_tp` (wired); `deepseek_moe`
-  (parses, `build` bails). `tp_size` is **absent only from `Llama3Dense`**
-  (`Llama3DenseTp` and `DeepseekMoe` both carry it; `DeepseekMoe` adds
-  `ep_size`). `IterArchSel::model()` returns the `ModelSpec` every variant
-  flattens.
+- `IterArchSel` — `llama3_dense`, `llama3_dense_tp`, and
+  `llama3_dp_attn_tp_ffn` are wired for their matching workers/deployments;
+  `deepseek_moe` parses but `build` bails. `tp_size` is **absent only from
+  `Llama3Dense`**. `Llama3DenseTp` carries `tp_size`; `Llama3DpAttnTpFfn` carries
+  `attn_tp_size` / `ffn_tp_size`; `DeepseekMoe` carries `tp_size` + `ep_size`.
+  `IterArchSel::model()` returns the `ModelSpec` every variant flattens.
 - `AttnArchSel` / `FfnArchSel` — the AFD layer-wise contract (config-only today).
 - `ModelSpec` is flattened into every arch tag (`model_config`, `num_layers` /
   `sim_num_layers`, `fp8`); `model_config` + `fp8` are `#[param(cache_key)]`
@@ -94,8 +96,10 @@ Serde tagged enums, the symmetric sibling of the worker selector, **provider-fir
 
 ## Current set & up/down
 
-- **Live archs:** `llama3_dense` (Local, single GPU) and `llama3_dense_tp`
-  (tensor-parallel, ends each block in a `tp_allreduce`).
+- **Live archs:** `llama3_dense` (Local, single GPU), `llama3_dense_tp`
+  (tensor-parallel, ends each block in a `tp_allreduce`), and
+  `llama3_dp_attn_tp_ffn` (attention-DP + FFN-TP, paired with `hp_unified` or PD
+  decode).
 - **Below (assembled):** L3 worklets + L2 atomic ops, and through the CostTree,
   L1 kernels.
 - **Above (consumer):** the `deployment` layer runs the

@@ -118,13 +118,15 @@ def _profile_env() -> dict[str, str]:
     return env
 
 
-def cargo_build(build_type: str = "debug") -> bool:
+def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
     """Build the simulator crate, then run schema discovery (INV-8). Returns
     True on success; on failure no schema is written (design §1.2.7 bootstrap
     edge — `load_schema` then raises `SchemaNotFound`)."""
     cmd = ["cargo", "build"]
     if build_type == "release":
         cmd.append("--release")
+    elif build_type != "debug":
+        cmd.extend(["--profile", build_type])
     if subprocess.run(cmd, cwd=REPO_ROOT).returncode != 0:
         return False
 
@@ -142,12 +144,17 @@ def cargo_build(build_type: str = "debug") -> bool:
         return False
     schema_json_path(build_type).write_text(result.stdout)
 
+    if not build_analyzer:
+        return True
+
     # The analyzer is a standalone workspace crate (not a sim dep), so the build
     # above doesn't produce it — build it explicitly. Best-effort: a missing
     # analyzer must not block runs (the post-run analysis step is also optional).
     analyzer_cmd = ["cargo", "build", "-p", "analyzer"]
     if build_type == "release":
         analyzer_cmd.append("--release")
+    elif build_type != "debug":
+        analyzer_cmd.extend(["--profile", build_type])
     if subprocess.run(analyzer_cmd, cwd=REPO_ROOT).returncode != 0:
         sys.stderr.write("[warn] analyzer build failed; runs will skip post-run analysis\n")
     return True

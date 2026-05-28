@@ -198,7 +198,8 @@ mod tests {
         ffn.eval(&mut ev);
         assert_eq!(ev.filled(), n, "eval must fill every slot");
 
-        let agg = CostTree::aggregate(&flat, &buf).m;
+        let mut scratch = Vec::new();
+        let agg = CostTree::aggregate(&flat, &buf, &mut scratch).m;
         // sum over the two ops: time 3.0 + 1.5, flops 10 + 5, bytes 20 + 8.
         assert_eq!(agg.time_ms, 4.5);
         assert_eq!(agg.flops, 15.0);

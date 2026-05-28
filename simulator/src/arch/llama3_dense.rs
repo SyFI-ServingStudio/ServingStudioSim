@@ -344,7 +344,12 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
     /// per-leaf [`LeafMetrics`] for this iter (reusing the caller's `Vec`
     /// capacity), then roll up `cost_flat` (the `Scale` fold supplies the
     /// `×num_layers`). One eval pass feeds both the `cost_log` row and the clock.
-    fn eval_iter(&self, batch: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+    fn eval_iter(
+        &self,
+        batch: &UnifiedArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
         assert_eq!(
             batch.groups.len(),
             1,
@@ -359,7 +364,7 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
             self.n_slots,
             "eval cursor must fill every slot"
         );
-        CostTree::aggregate(&self.cost_flat, slots)
+        CostTree::aggregate(&self.cost_flat, slots, scratch)
     }
 
     /// Same eval body as [`Self::eval_iter`] via an input-capturing [`Evaluator`]:
@@ -369,6 +374,7 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
         &self,
         batch: &UnifiedArchInput,
         slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
         inputs: &mut Vec<SlotInput>,
     ) -> LeafMetrics {
         assert_eq!(
@@ -385,7 +391,7 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
             self.n_slots,
             "eval cursor must fill every slot"
         );
-        let agg = CostTree::aggregate(&self.cost_flat, slots);
+        let agg = CostTree::aggregate(&self.cost_flat, slots, scratch);
         debug_assert_eq!(inputs.len(), self.n_slots, "slot_input must align to slots");
         agg
     }

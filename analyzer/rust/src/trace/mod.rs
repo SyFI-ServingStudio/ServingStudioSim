@@ -1,7 +1,8 @@
 //! `analyze trace` — Perfetto per-kernel timeline export.
 //!
-//! Reads `cost_log.parquet` (per-iteration leaf timings + captured kernel
-//! inputs) and `cost_manifest.json` (the cost-tree structure), then lays each
+//! Reads `cost_log/worker_<pool>_<id>.parquet` (per-iteration leaf timings +
+//! captured kernel inputs) and the matching
+//! `cost_manifest/worker_<pool>_<id>.json` CostTree structure, then lays each
 //! iteration out as a nested slice tree (iter → layers → kernels) via
 //! [`place::Placer`] onto a [`TraceWriter`], and writes
 //! `traces/<prefix>.pftrace.gz` for ui.perfetto.dev.
@@ -26,12 +27,14 @@ use datafusion::prelude::SessionContext;
 use crate::io::{resolve_artifact_path, trace_path};
 use crate::perfetto::{Annotation, TraceWriter};
 use crate::session::{
-    col, collect, register_if_exists, require_columns, value_f64, value_f32_list, value_str_list,
+    col, collect, register_if_exists, require_columns, value_f32_list, value_f64, value_str_list,
+    value_string,
 };
 use place::{slice_pairs_per_iter, Placer};
 
 /// Columns the trace reads from `cost_log` (drift-guarded).
 const COLUMNS: &[&str] = &[
+    "pool_tag",
     "worker_id",
     "iter_id",
     "batch_id",
@@ -43,7 +46,8 @@ const COLUMNS: &[&str] = &[
 
 /// One iteration's row, materialized from the parquet.
 struct IterRow {
-    worker_id: i64,
+    pool_tag: String,
+    worker_id: u16,
     iter_id: u64,
     batch_id: u64,
     wall_start_ms: f64,
@@ -54,6 +58,16 @@ struct IterRow {
     slot_input: Vec<String>,
 }
 
+impl IterRow {
+    fn manifest_key(&self) -> (String, u16) {
+        (self.pool_tag.clone(), self.worker_id)
+    }
+}
+
+fn worker_label(key: &(String, u16)) -> String {
+    format!("{}/{}", key.0, key.1)
+}
+
 pub async fn run(
     ctx: &SessionContext,
     log_dir: &Path,
@@ -61,24 +75,31 @@ pub async fn run(
     region_ms: f64,
     max_slices: usize,
 ) -> Result<()> {
-    let manifest = crate::io::read_manifest(log_dir)?;
-    let per_iter_pairs = slice_pairs_per_iter(&manifest);
+    let manifests = crate::io::read_cost_manifests(log_dir)?;
 
-    let path = resolve_artifact_path(log_dir, "cost_log.parquet");
+    // Cost log is one parquet per worker under `raw/cost_log/` (a single shared
+    // file would race when 32+ decode workers all open it). DataFusion takes
+    // the directory and unions every `*.parquet` inside.
+    let path = resolve_artifact_path(log_dir, "cost_log");
     if !register_if_exists(ctx, "cost_log", path).await? {
-        bail!("cost_log.parquet not found under {}", log_dir.display());
+        bail!("cost_log/ dir not found under {}", log_dir.display());
     }
     require_columns(ctx, "cost_log", COLUMNS).await?;
 
     let sql = format!(
-        "SELECT {} FROM cost_log ORDER BY worker_id, wall_start_ms",
+        "SELECT {} FROM cost_log ORDER BY pool_tag, worker_id, wall_start_ms",
         COLUMNS.join(", ")
     );
     let batches = collect(ctx, &sql).await?;
 
     let mut rows: Vec<IterRow> = Vec::new();
     for b in &batches {
-        let (wid, iid, bid) = (col(b, "worker_id")?, col(b, "iter_id")?, col(b, "batch_id")?);
+        let (pool_tag, wid, iid, bid) = (
+            col(b, "pool_tag")?,
+            col(b, "worker_id")?,
+            col(b, "iter_id")?,
+            col(b, "batch_id")?,
+        );
         let (ws, tt) = (col(b, "wall_start_ms")?, col(b, "total_time_ms")?);
         let (st, si) = (col(b, "slot_time_ms")?, col(b, "slot_input")?);
         for r in 0..b.num_rows() {
@@ -87,7 +108,8 @@ pub async fn run(
                 .map(|ms| (ms * 1e6).round() as i64)
                 .collect();
             rows.push(IterRow {
-                worker_id: value_f64(wid, r)? as i64,
+                pool_tag: value_string(pool_tag, r)?,
+                worker_id: value_f64(wid, r)? as u16,
                 iter_id: value_f64(iid, r)? as u64,
                 batch_id: value_f64(bid, r)? as u64,
                 wall_start_ms: value_f64(ws, r)?,
@@ -102,7 +124,10 @@ pub async fn run(
     }
 
     // Run span across all workers.
-    let t0 = rows.iter().map(|r| r.wall_start_ms).fold(f64::INFINITY, f64::min);
+    let t0 = rows
+        .iter()
+        .map(|r| r.wall_start_ms)
+        .fold(f64::INFINITY, f64::min);
     let t1 = rows
         .iter()
         .map(|r| r.wall_start_ms + r.total_time_ms)
@@ -129,15 +154,16 @@ pub async fn run(
 
     // Pre-create one process+thread track per worker (avoids a borrow conflict
     // with `w` mid-loop, and fixes a stable track order in the output).
-    let mut worker_ids: Vec<i64> = rows.iter().map(|r| r.worker_id).collect();
-    worker_ids.sort_unstable();
-    worker_ids.dedup();
-    let mut worker_tracks: BTreeMap<i64, u64> = BTreeMap::new();
-    for &wid in &worker_ids {
-        let pid = wid as i32;
-        let proc = w.process_track(pid, &format!("worker {wid}"));
-        let thr = w.thread_track(proc, pid, 0, &format!("worker {wid}"));
-        worker_tracks.insert(wid, thr);
+    let mut worker_keys: Vec<(String, u16)> = rows.iter().map(IterRow::manifest_key).collect();
+    worker_keys.sort_unstable();
+    worker_keys.dedup();
+    let mut worker_tracks: BTreeMap<(String, u16), u64> = BTreeMap::new();
+    for (idx, key) in worker_keys.iter().enumerate() {
+        let pid = idx as i32;
+        let label = worker_label(key);
+        let proc = w.process_track(pid, &label);
+        let thr = w.thread_track(proc, pid, 0, &label);
+        worker_tracks.insert(key.clone(), thr);
     }
 
     let mut placed_pairs = 0usize;
@@ -168,12 +194,17 @@ pub async fn run(
         );
 
         for row in region_rows {
+            let key = row.manifest_key();
+            let manifest = manifests
+                .get(&key)
+                .with_context(|| format!("missing cost manifest for {}", worker_label(&key)))?;
+            let per_iter_pairs = slice_pairs_per_iter(manifest);
             if placed_pairs + per_iter_pairs > max_slices {
                 truncated = true;
                 w.end(region_track, ((offset_ms + region_ms) * 1e6).round() as i64);
                 break 'regions;
             }
-            let track = worker_tracks[&row.worker_id];
+            let track = worker_tracks[&key];
             let base_ns = ((row.wall_start_ms + shift_ms) * 1e6).round() as i64;
 
             w.begin(
@@ -186,7 +217,7 @@ pub async fn run(
                     Annotation::dbl("total_ms", row.total_time_ms),
                 ],
             );
-            let placer = Placer::new(&manifest, &row.slot_ns, &row.slot_input);
+            let placer = Placer::new(manifest, &row.slot_ns, &row.slot_input);
             let dur = placer.place_root(&mut w, track, base_ns);
             w.end(track, base_ns + dur);
 
@@ -222,8 +253,7 @@ pub async fn run(
         .unwrap_or("trace");
     let out = trace_path(log_dir, prefix);
     if let Some(parent) = out.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let bytes = w.into_gzip()?;
     fs::write(&out, &bytes).with_context(|| format!("write {}", out.display()))?;
@@ -253,7 +283,10 @@ mod proto_smoke {
             thr,
             100,
             "qkv_proj",
-            &[Annotation::str("input", "{\"m\":91}"), Annotation::dbl("dur_ms", 0.02)],
+            &[
+                Annotation::str("input", "{\"m\":91}"),
+                Annotation::dbl("dur_ms", 0.02),
+            ],
         );
         w.end(thr, 120);
         w.end(thr, 120);

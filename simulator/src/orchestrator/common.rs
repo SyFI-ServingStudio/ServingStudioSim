@@ -84,9 +84,11 @@ impl GpuInventory {
 /// Constructor signature shared by every iter-wise worker (`BareboneWorker::new`,
 /// `HpUnifiedWorker::new`, …). The factory is handed the chosen worker's `new` as
 /// a plain function pointer, so it can stamp the concrete `W` without `W::new`
-/// living on the [`IterWorker`] trait.
+/// living on the [`IterWorker`] trait. `pool_tag` is the deployment-set pool name
+/// ("main" / "prefill" / "decode" / …) — it disambiguates `cost_log` filenames
+/// across pools, since `WorkerId` is per-pool (every pool starts at 0).
 pub type WorkerBuildFn<M, W> =
-    fn(WorkerId, Arc<M>, SharedRequests, WorkerConfig, Option<PathBuf>) -> W;
+    fn(WorkerId, &'static str, Arc<M>, SharedRequests, WorkerConfig, Option<PathBuf>) -> W;
 
 pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel, W: IterWorker> {
     pub model: Arc<M>,
@@ -101,12 +103,16 @@ pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel, W: IterWorker> {
     /// carries them so L6 can assemble the run's [`GpuInventory`].
     pub gpu_name: String,
     pub gpus_per_worker: u16,
+    /// Pool name handed to every worker so each `cost_log` file is unique
+    /// across pools (`worker_<pool_tag>_<id>.parquet`).
+    pub pool_tag: &'static str,
     /// The concrete worker's `new`, supplied by the deployment after it picks the
     /// (arch, worker) pair.
     build_fn: WorkerBuildFn<M, W>,
 }
 
 impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: Arc<M>,
         requests: SharedRequests,
@@ -114,6 +120,7 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
         log_dir: Option<PathBuf>,
         gpu_name: String,
         gpus_per_worker: u16,
+        pool_tag: &'static str,
         build_fn: WorkerBuildFn<M, W>,
     ) -> Self {
         Self {
@@ -123,6 +130,7 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
             log_dir,
             gpu_name,
             gpus_per_worker,
+            pool_tag,
             build_fn,
         }
     }
@@ -130,6 +138,7 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
     pub fn build(&self, idx: u16) -> W {
         (self.build_fn)(
             WorkerId(idx),
+            self.pool_tag,
             Arc::clone(&self.model),
             std::rc::Rc::clone(&self.requests),
             self.worker_config,

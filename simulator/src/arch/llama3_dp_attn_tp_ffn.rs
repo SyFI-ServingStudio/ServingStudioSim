@@ -227,7 +227,11 @@ pub fn build(
 
     let embed = Op::new(
         embed_name.clone(),
-        Arc::new(ElementwiseKernel::build(embed_name, resolved.embed, bridge)?),
+        Arc::new(ElementwiseKernel::build(
+            embed_name,
+            resolved.embed,
+            bridge,
+        )?),
     );
 
     let attn_block = AttnBlockTpWorklet::build(
@@ -339,8 +343,12 @@ impl Llama3DpAttnTpFfnModel {
     /// `Scale{num_layers}` fold multiplies it — then final_norm, lm_head (pooled).
     fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
         let m_total: u32 = batch.groups.iter().map(|g| g.batch_tokens).sum();
-        self.embed
-            .eval(&ElementwiseKernelInput { num_tokens: m_total }, ev);
+        self.embed.eval(
+            &ElementwiseKernelInput {
+                num_tokens: m_total,
+            },
+            ev,
+        );
         for g in &batch.groups {
             self.attn_block.eval(
                 &AttnBlockTpWorkletInput {
@@ -351,8 +359,12 @@ impl Llama3DpAttnTpFfnModel {
                 ev,
             );
         }
-        self.mlp_block
-            .eval(&MlpBlockTpWorkletInput { batch_tokens: m_total }, ev);
+        self.mlp_block.eval(
+            &MlpBlockTpWorkletInput {
+                batch_tokens: m_total,
+            },
+            ev,
+        );
         self.final_norm.eval(&RmsNormKernelInput { m: m_total }, ev);
         self.lm_head.eval(&SingleGemmKernelInput { m: m_total }, ev);
     }
@@ -377,7 +389,12 @@ impl IterwiseUnifiedModel for Llama3DpAttnTpFfnModel {
         self.cost_tree().manifest()
     }
 
-    fn eval_iter(&self, batch: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+    fn eval_iter(
+        &self,
+        batch: &UnifiedArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
         assert_eq!(
             batch.groups.len(),
             self.num_dp_groups as usize,
@@ -387,14 +404,19 @@ impl IterwiseUnifiedModel for Llama3DpAttnTpFfnModel {
         slots.resize(self.n_slots, LeafMetrics::ZERO);
         let mut ev = Evaluator::new(slots);
         self.eval_into(batch, &mut ev);
-        debug_assert_eq!(ev.filled(), self.n_slots, "eval cursor must fill every slot");
-        CostTree::aggregate(&self.cost_flat, slots)
+        debug_assert_eq!(
+            ev.filled(),
+            self.n_slots,
+            "eval cursor must fill every slot"
+        );
+        CostTree::aggregate(&self.cost_flat, slots, scratch)
     }
 
     fn eval_iter_with_inputs(
         &self,
         batch: &UnifiedArchInput,
         slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
         inputs: &mut Vec<SlotInput>,
     ) -> LeafMetrics {
         assert_eq!(
@@ -406,8 +428,12 @@ impl IterwiseUnifiedModel for Llama3DpAttnTpFfnModel {
         slots.resize(self.n_slots, LeafMetrics::ZERO);
         let mut ev = Evaluator::with_inputs(slots, inputs);
         self.eval_into(batch, &mut ev);
-        debug_assert_eq!(ev.filled(), self.n_slots, "eval cursor must fill every slot");
-        let agg = CostTree::aggregate(&self.cost_flat, slots);
+        debug_assert_eq!(
+            ev.filled(),
+            self.n_slots,
+            "eval cursor must fill every slot"
+        );
+        let agg = CostTree::aggregate(&self.cost_flat, slots, scratch);
         debug_assert_eq!(inputs.len(), self.n_slots, "slot_input must align to slots");
         agg
     }
@@ -446,7 +472,7 @@ mod tests {
         // attention per-rank under attn_tp=4: qo 32/4=8, kv 8/4=2 → fused (8+2·2)·128 = 1536.
         assert_eq!(r.attn_block.qkv.n, 1536);
         assert_eq!(r.attn_block.qkv.k, 4096); // hidden NOT sharded
-        // FFN per-rank under ffn_tp=8: intermediate 14336/8=1792; up_gate n = 2·1792.
+                                              // FFN per-rank under ffn_tp=8: intermediate 14336/8=1792; up_gate n = 2·1792.
         assert_eq!(r.mlp_block.up_gate.n, 2 * 1792);
         assert_eq!(r.mlp_block.down.k, 1792);
     }

@@ -26,6 +26,20 @@ pub struct ArchGroupInput {
     pub total_kv_len: u32,
 }
 
+impl ArchGroupInput {
+    /// Reset to an empty group, retaining `Vec` capacity. Lets a worker refill a
+    /// held `UnifiedArchInput` in place each iteration instead of allocating a
+    /// fresh group + growing `decode_kv_lens` from zero every forward pass.
+    pub fn clear(&mut self) {
+        self.batch_tokens = 0;
+        self.prefill_tokens = 0;
+        self.decode_tokens = 0;
+        self.total_kv_len = 0;
+        self.prefill_chunk_pairs.clear();
+        self.decode_kv_lens.clear();
+    }
+}
+
 /// Unified worker's per-iteration input (attn view `groups` + ffn routing view
 /// `tokens_per_source_rank`). Dense local has a single group and no routing.
 #[derive(Clone, Debug, Default)]
@@ -49,7 +63,17 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// eval pass materializes it either way). Models with no compiled CostTree
     /// clear `slots` and return their fixed aggregate. O(slots) flat writes, no
     /// per-tick allocation when the caller reuses the buffer.
-    fn eval_iter(&self, batch: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics;
+    ///
+    /// `scratch` is a second caller-owned buffer the CostTree aggregation reuses
+    /// for its per-node rollup (one `LeafMetrics` per flat node); threading it in
+    /// keeps the per-iter aggregate walk allocation-free. Callers reuse the same
+    /// `scratch` across iterations; its contents are not meaningful on return.
+    fn eval_iter(
+        &self,
+        batch: &UnifiedArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics;
 
     /// Like [`Self::eval_iter`], but also captures each leaf's typed kernel input
     /// into `inputs` (slot-aligned, in visit order) for the `cost_log`
@@ -60,10 +84,11 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
         &self,
         batch: &UnifiedArchInput,
         slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
         inputs: &mut Vec<SlotInput>,
     ) -> LeafMetrics {
         inputs.clear();
-        self.eval_iter(batch, slots)
+        self.eval_iter(batch, slots, scratch)
     }
 
     /// The `cost_log` manifest: the ordered slots plus the flattened aggregation

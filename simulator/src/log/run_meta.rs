@@ -2,9 +2,10 @@
 //!
 //! The sim's own record of the GPUs a run modeled (id / name / pool / owning
 //! worker), so the analyzer can normalize throughput per-GPU and label plots with
-//! the GPU name. Distinct from the launcher-written `params.json` (run inputs) and
-//! the cost-tree `cost_manifest.json` (CostTree structure). Written once after the
-//! flow is built; mirrors `cost_logger`'s manifest write (serde_json → fs).
+//! the GPU name. Distinct from the launcher-written `params.json` (run inputs)
+//! and the per-worker `cost_manifest/` sidecars (CostTree structure). Written
+//! once after the flow is built; mirrors `cost_logger`'s manifest write
+//! (serde_json → fs).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -22,16 +23,16 @@ pub fn write_run_meta(log_dir: &Path, inventory: &GpuInventory) -> Result<()> {
     let raw = log_dir.join("raw");
     std::fs::create_dir_all(&raw)?;
 
-    // Derived worker→gpu inverse of the flat list (downstream convenience; the
-    // flat `gpus` already carries worker_id per gpu). Pool is uniform per worker.
-    let mut by_worker: BTreeMap<u16, (u16, Vec<u16>)> = BTreeMap::new();
+    // Derived (pool, worker)→gpu inverse of the flat list (downstream
+    // convenience; the flat `gpus` already carries both ids per gpu). WorkerId is
+    // per-pool, so the pair is the unique run-level worker key.
+    let mut by_worker: BTreeMap<(u16, u16), Vec<u16>> = BTreeMap::new();
     for g in &inventory.gpus {
-        let entry = by_worker.entry(g.worker_id).or_insert((g.pool, Vec::new()));
-        entry.1.push(g.id);
+        by_worker.entry((g.pool, g.worker_id)).or_default().push(g.id);
     }
     let workers: Vec<_> = by_worker
         .into_iter()
-        .map(|(worker_id, (pool, gpu_ids))| {
+        .map(|((pool, worker_id), gpu_ids)| {
             json!({ "worker_id": worker_id, "pool": pool, "gpu_ids": gpu_ids })
         })
         .collect();

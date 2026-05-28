@@ -384,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
     # which still validates/expands against the schema).
     from .exec import cargo_build
 
-    if not cargo_build(args.build_type):
+    if not cargo_build(args.build_type, build_analyzer=not args.no_analyze):
         sys.exit("build failed; cannot produce deployment schema (see errors above)")
 
     try:

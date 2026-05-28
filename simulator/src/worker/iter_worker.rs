@@ -13,14 +13,16 @@ use crate::worker::unified::BareboneWorker;
 use crate::arch::contract::IterwiseUnifiedModel;
 
 /// The surface L6 drives a unified worker through each tick: read its id (for GPU
-/// inventory + event attribution), hand it work (`enqueue`), advance its FSM
-/// (`tick`), collect completions (`drain_events`), and read its load for placement
-/// (`status`).
+/// inventory + placement), hand it work (`enqueue`), advance its FSM while pushing
+/// any completions into the caller's `events` sink (`tick`), and read its load for
+/// placement (`status`). `tick` returns the worker's next wakeup so the pool can
+/// skip non-due workers on the fixed global clock without entering their FSM.
+/// Events are pushed (self-tagged with the worker id) rather than buffered +
+/// pulled, so the pool needs no separate per-worker drain sweep.
 pub trait IterWorker {
     fn id(&self) -> WorkerId;
     fn enqueue(&mut self, msg: WorkerMsg);
-    fn tick(&mut self, now: Time);
-    fn drain_events(&mut self) -> Vec<WorkerEvent>;
+    fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time>;
     fn status(&self) -> WorkerStatus;
 }
 
@@ -33,11 +35,8 @@ impl<M: IterwiseUnifiedModel> IterWorker for BareboneWorker<M> {
     fn enqueue(&mut self, msg: WorkerMsg) {
         BareboneWorker::enqueue(self, msg)
     }
-    fn tick(&mut self, now: Time) {
-        BareboneWorker::tick(self, now)
-    }
-    fn drain_events(&mut self) -> Vec<WorkerEvent> {
-        BareboneWorker::drain_events(self)
+    fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+        BareboneWorker::tick(self, now, events)
     }
     fn status(&self) -> WorkerStatus {
         BareboneWorker::status(self)

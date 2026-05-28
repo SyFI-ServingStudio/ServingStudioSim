@@ -95,6 +95,19 @@ lto = true
 codegen-units = 1
 split-debuginfo = "off"
 
+# `profiling` is for trustworthy `perf` call-graphs: LTO off (no cross-crate
+# inlining to confuse the unwinder). Still optimized (inherits release
+# opt-level) so the profile stays representative. Frame pointers don't help
+# here — std/glibc are precompiled without them, so DWARF unwinding through
+# the allocator still derails (verified: stacks land on the `0xcc`
+# uninitialized-stack pattern). If frame pointers are wanted later, pass
+# `RUSTFLAGS="-C force-frame-pointers=yes"` at build time.
+[profile.profiling]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = true
+
 # Optimize dependencies even in dev/test builds so unoptimized deps don't
 # dominate the tick loop during `cargo test`.
 [profile.dev.package."*"]

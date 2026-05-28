@@ -1,15 +1,20 @@
 //! SLO analysis, split into two subjects (see `registry.rs`):
-//!   - `slo-general` — TTFT / TPOT / E2E + session E2E, from the pre-aggregated
-//!     scalar columns only. Always available — survives `io.log_output_token_times`
-//!     being off.
+//!   - `slo-general` — TTFT / TPOT / E2E, from the pre-aggregated scalar columns
+//!     only. Always available — survives `io.log_output_token_times` being off.
 //!   - `slo-detailed` — per-token ITL, derived from the `output_token_times`
 //!     array. Available only when that array was logged (the flag on); otherwise
 //!     the array is empty and the subject reports unavailable.
 //!
-//! Both read `request_slo.parquet` (per-request terminal row). `slo-general` also
-//! reads `request_state.parquet` for the session_id grouping session E2E needs
-//! (`request_slo` has no session_id). Scope: completed requests only (user
-//! decision). Each runner emits the `(report, payload)` pair via the caller.
+//! Both read `request_slo.parquet` (per-request terminal row). Scope: completed
+//! requests only (user decision). Each runner emits the `(report, payload)` pair
+//! via the caller.
+//!
+//! Session E2E (multi-round rollup) is deferred: with the new aggregate
+//! `request_state` schema there is no per-request `session_id`/`session_arrival_time_ms`,
+//! and the previous single-round defaults made the metric a degenerate duplicate of
+//! per-request E2E (one request per "session"). When multi-turn lifecycle work
+//! lands (see `common/request.rs` "L7 lifecycle" comment), add session columns to
+//! `request_slo` and reintroduce the `session_e2e` metric here.
 
 use std::path::Path;
 
@@ -33,13 +38,6 @@ const GENERAL_COLS: &[&str] = &[
 ];
 /// request_slo column `slo-detailed` depends on.
 const DETAILED_COLS: &[&str] = &["completed", "output_token_times"];
-/// request_state columns used for session-level rollup.
-const STATE_COLS: &[&str] = &[
-    "session_id",
-    "session_arrival_time_ms",
-    "completion_time_ms",
-    "completed",
-];
 
 // ════════════════════════════════════════════════════════════════════════════
 // slo-general — scalar-derived latency SLOs (always available)
@@ -50,12 +48,9 @@ struct GeneralSamples {
     ttft: Vec<f64>,
     tpot: Vec<f64>,
     e2e: Vec<f64>,
-    session_e2e: Vec<f64>,
 }
 
-/// TTFT / TPOT / E2E + session E2E from the pre-aggregated scalar columns.
-/// `request_slo` is required; `request_state` is optional (session E2E omitted
-/// if absent).
+/// TTFT / TPOT / E2E from the pre-aggregated scalar columns of `request_slo`.
 pub async fn run_slo_general(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let slo_path = resolve_artifact_path(log_dir, "request_slo.parquet");
     if !register_if_exists(ctx, "slo", slo_path).await? {
@@ -72,14 +67,6 @@ pub async fn run_slo_general(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
     collect_general_samples(ctx, &mut s).await?;
     let completed = s.e2e.len();
 
-    // Session E2E (optional): group completed request_state rows by session_id.
-    let state_path = resolve_artifact_path(log_dir, "request_state.parquet");
-    let has_state = register_if_exists(ctx, "state", state_path).await?;
-    if has_state {
-        require_columns(ctx, "state", STATE_COLS).await?;
-        collect_session_e2e(ctx, &mut s.session_e2e).await?;
-    }
-
     let report = json!({
         "schema_version": SCHEMA_VERSION,
         "meta": {
@@ -87,14 +74,12 @@ pub async fn run_slo_general(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
             "total_requests": total,
             "completed_requests": completed,
             "excluded_requests": total.saturating_sub(completed as u64),
-            "session_level_available": has_state,
         },
         "available": true,
         "metrics": {
             "ttft": stats(&clean_nonnegative_sorted(&s.ttft)),
             "tpot": stats(&clean_nonnegative_sorted(&s.tpot)),
             "e2e": stats(&clean_nonnegative_sorted(&s.e2e)),
-            "session_e2e": stats(&clean_nonnegative_sorted(&s.session_e2e)),
         },
         "definitions": general_definitions(),
     });
@@ -103,7 +88,6 @@ pub async fn run_slo_general(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
         cdf_series("ttft", "TTFT", "ms", &s.ttft),
         cdf_series("tpot", "TPOT", "ms/token", &s.tpot),
         cdf_series("e2e", "End-to-end", "ms", &s.e2e),
-        cdf_series("session_e2e", "Session E2E", "ms", &s.session_e2e),
     ];
     let payload = json!({
         "schema_version": SCHEMA_VERSION,
@@ -151,30 +135,9 @@ async fn collect_general_samples(ctx: &SessionContext, s: &mut GeneralSamples) -
     Ok(())
 }
 
-/// Session E2E = max(completion_time_ms) − session_arrival_time_ms per session,
-/// over completed `request_state` rows. Single-round runs set
-/// `session_id = request_id`, so each session is a size-1 group (degenerate, no
-/// special case). Multi-round: this rolls up to the latest completed round.
-async fn collect_session_e2e(ctx: &SessionContext, session_e2e: &mut Vec<f64>) -> Result<()> {
-    let batches = collect(
-        ctx,
-        "SELECT MAX(completion_time_ms) AS last_completion, \
-                MIN(session_arrival_time_ms) AS sess_arrival \
-         FROM state WHERE completed GROUP BY session_id",
-    )
-    .await?;
-    for batch in &batches {
-        let last = col(batch, "last_completion")?;
-        let arrival = col(batch, "sess_arrival")?;
-        for row in 0..batch.num_rows() {
-            let e2e = value_f64(last, row)? - value_f64(arrival, row)?;
-            if e2e.is_finite() {
-                session_e2e.push(e2e);
-            }
-        }
-    }
-    Ok(())
-}
+// Session E2E (multi-round rollup) was here; it has been removed pending real
+// multi-turn lifecycle (see file header). Reintroduce when `request_slo` carries
+// session_id / session_arrival_time_ms populated from real session metadata.
 
 // ════════════════════════════════════════════════════════════════════════════
 // slo-detailed — per-token ITL (needs the logged `output_token_times` array)
@@ -236,11 +199,7 @@ pub async fn run_slo_detailed(ctx: &SessionContext, log_dir: &Path) -> Result<(V
 /// Consecutive diffs of `output_token_times`, pooled across completed requests.
 /// Empty when the array was not logged.
 async fn collect_itl(ctx: &SessionContext, itl: &mut Vec<f64>) -> Result<()> {
-    let batches = collect(
-        ctx,
-        "SELECT output_token_times FROM slo WHERE completed",
-    )
-    .await?;
+    let batches = collect(ctx, "SELECT output_token_times FROM slo WHERE completed").await?;
     for batch in &batches {
         let times = col(batch, "output_token_times")?;
         for row in 0..batch.num_rows() {
@@ -274,8 +233,6 @@ fn general_definitions() -> Value {
         "ttft": "ttft_ms = first_token_time - arrival (pre-aggregated by the sim)",
         "tpot": "tpot_mean_ms = mean inter-token gap during decode (pre-aggregated)",
         "e2e": "finish_decode_time_ms - arrival_time_ms (scalar; survives log_output_token_times off)",
-        "session_e2e": "max(completion_time_ms) - session_arrival_time_ms per session_id, \
-                        over completed request_state rows",
     })
 }
 

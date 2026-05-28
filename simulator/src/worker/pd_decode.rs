@@ -67,15 +67,21 @@ pub struct PdDecodeWorker<M: IterwiseUnifiedModel> {
     runtime: DecodeRuntime,
     /// One container per attention DP shard; length = `model.num_attn_dp_groups()`.
     batches: Vec<Batch>,
-    events: Vec<WorkerEvent>,
     cost_logger: Option<CostLogger>,
     cost_slots: Vec<LeafMetrics>,
+    cost_scratch: Vec<LeafMetrics>,
+    cost_groups: Vec<GroupInputLog>,
     cost_slot_inputs: Vec<SlotInput>,
+    /// Reused per-iteration arch input. Refilled in place each forward pass
+    /// (`fill_arch_input`) so the hot decode loop allocates ~nothing — the model
+    /// reads it by reference; the cost log snapshots scalars out of it.
+    arch_buf: UnifiedArchInput,
 }
 
 impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
     pub fn new(
         id: WorkerId,
+        pool_tag: &'static str,
         model: Arc<M>,
         requests: SharedRequests,
         config: WorkerConfig,
@@ -95,7 +101,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             other => other,
         };
         let cost_logger = match cost_log_dir {
-            Some(dir) => match CostLogger::open(&dir, &model.cost_log_manifest()) {
+            Some(dir) => match CostLogger::open(&dir, pool_tag, id, &model.cost_log_manifest()) {
                 Ok(logger) => Some(logger),
                 Err(e) => {
                     tracing::warn!("cost_log disabled: failed to open writer: {e}");
@@ -111,49 +117,80 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             config,
             runtime: DecodeRuntime::new(balance),
             batches,
-            events: Vec::new(),
             cost_logger,
             cost_slots: Vec::new(),
+            cost_scratch: Vec::new(),
+            cost_groups: Vec::new(),
             cost_slot_inputs: Vec::new(),
+            arch_buf: UnifiedArchInput::default(),
         }
     }
 
-    fn tick_inner(&mut self, now: Time) {
+    fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
-            match self.runtime.worker_fsm_state {
-                Idle => {
-                    if !self.form_batch() {
-                        break;
-                    }
-                    self.runtime.worker_fsm_state = Active;
-                    self.runtime.batch_fsm_state.cursor = NotStarted;
-                    self.runtime.batch_fsm_state.compute_end = Time::ZERO;
-                    continue;
-                }
+            let should_continue = match self.runtime.worker_fsm_state {
+                Idle => self.tick_idle(),
                 Active => match self.runtime.batch_fsm_state.cursor {
-                    NotStarted => {
-                        let compute_end = self.start_iter(now);
-                        self.runtime.batch_fsm_state.cursor = Computing;
-                        self.runtime.batch_fsm_state.compute_end = compute_end;
-                        break;
-                    }
-                    Computing => {
-                        if now < self.runtime.batch_fsm_state.compute_end {
-                            break;
-                        }
-                        self.runtime.batch_fsm_state.cursor = Done;
-                        continue;
-                    }
-                    Done => {
-                        self.complete_iter(now);
-                        self.runtime.worker_fsm_state = Idle;
-                        continue;
-                    }
+                    NotStarted => self.tick_not_started(now),
+                    Computing => self.tick_computing(now),
+                    Done => self.tick_done(now, events),
                 },
+            };
+            if !should_continue {
+                break;
             }
         }
+        self.next_wakeup(now)
+    }
+
+    fn next_wakeup(&self, now: Time) -> Option<Time> {
+        match self.runtime.worker_fsm_state {
+            WorkerFsmState::Idle => {
+                let status = self.status();
+                if status.queued_requests > 0 || status.active_requests > 0 {
+                    Some(now)
+                } else {
+                    None
+                }
+            }
+            WorkerFsmState::Active => match self.runtime.batch_fsm_state.cursor {
+                IterCursor::NotStarted | IterCursor::Done => Some(now),
+                IterCursor::Computing => Some(self.runtime.batch_fsm_state.compute_end),
+            },
+        }
+    }
+
+    fn tick_idle(&mut self) -> bool {
+        if !self.form_batch() {
+            return false;
+        }
+        self.runtime.worker_fsm_state = WorkerFsmState::Active;
+        self.runtime.batch_fsm_state.cursor = IterCursor::NotStarted;
+        self.runtime.batch_fsm_state.compute_end = Time::ZERO;
+        true
+    }
+
+    fn tick_not_started(&mut self, now: Time) -> bool {
+        let compute_end = self.start_iter(now);
+        self.runtime.batch_fsm_state.cursor = IterCursor::Computing;
+        self.runtime.batch_fsm_state.compute_end = compute_end;
+        false
+    }
+
+    fn tick_computing(&mut self, now: Time) -> bool {
+        if now < self.runtime.batch_fsm_state.compute_end {
+            return false;
+        }
+        self.runtime.batch_fsm_state.cursor = IterCursor::Done;
+        true
+    }
+
+    fn tick_done(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> bool {
+        self.complete_iter(now, events);
+        self.runtime.worker_fsm_state = WorkerFsmState::Idle;
+        true
     }
 
     // ── Stage 1: form_batch — admit one handed-off request straight into decode ─
@@ -206,30 +243,37 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
     }
 
     fn start_iter(&mut self, now: Time) -> Time {
-        let arch_input = self.build_arch_input();
+        self.fill_arch_input();
         let logging_cost = self.cost_logger.is_some();
         let agg = if logging_cost {
             self.model.eval_iter_with_inputs(
-                &arch_input,
+                &self.arch_buf,
                 &mut self.cost_slots,
+                &mut self.cost_scratch,
                 &mut self.cost_slot_inputs,
             )
         } else {
-            self.model.eval_iter(&arch_input, &mut self.cost_slots)
+            self.model
+                .eval_iter(&self.arch_buf, &mut self.cost_slots, &mut self.cost_scratch)
         };
         let cost_time = Time::from_ms(agg.m.time_ms as f64);
         if self.cost_logger.is_some() {
-            let groups = arch_input
-                .groups
-                .into_iter()
-                .map(|g| GroupInputLog {
+            // Snapshot scalars out of the reused `arch_buf` into the reused
+            // `cost_groups` buffer (refilled in place — no per-iter `Vec` alloc);
+            // the per-slot time/coverage/input breakdowns are appended into the
+            // logger's flat chunk buffers by `record`, so the entry owns no `Vec`.
+            // `prefill_chunk_pairs` is empty on a decode worker, so building each
+            // `GroupInputLog` does not allocate.
+            self.cost_groups.clear();
+            for g in &self.arch_buf.groups {
+                self.cost_groups.push(GroupInputLog {
                     batch_tokens: g.batch_tokens,
                     prefill_tokens: g.prefill_tokens,
                     decode_request_count: g.decode_tokens,
                     decode_kv_total: g.total_kv_len,
-                    prefill_chunk_pairs: g.prefill_chunk_pairs,
-                })
-                .collect();
+                    prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                });
+            }
             let entry = CostLogEntry {
                 worker_id: self.id.0,
                 iter_id: self.runtime.iter_counter as u64,
@@ -237,13 +281,17 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                 wall_start_ms: now.as_ms(),
                 total_time_ms: agg.m.time_ms as f64,
                 energy_j: agg.m.energy_j as f64,
-                groups,
-                slot_time_ms: self.cost_slots.iter().map(|l| l.m.time_ms).collect(),
-                slot_coverage: self.cost_slots.iter().map(|l| l.coverage.bits()).collect(),
+                group_len: 0,
+                slot_len: 0,
                 slot_input_len: 0,
             };
             if let Some(logger) = self.cost_logger.as_mut() {
-                if let Err(e) = logger.record(entry, &mut self.cost_slot_inputs) {
+                if let Err(e) = logger.record(
+                    entry,
+                    &self.cost_slots,
+                    &mut self.cost_groups,
+                    &mut self.cost_slot_inputs,
+                ) {
                     tracing::warn!("cost_log record failed: {e}");
                 }
             }
@@ -254,7 +302,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
 
     // ── Stage 3: complete_iter — decode bookkeeping only (no prefill phase) ──────
 
-    fn complete_iter(&mut self, now: Time) {
+    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
         let log_tokens = self.config.log_output_token_times;
         for gid in 0..self.batches.len() {
             let mut completed: Vec<RequestId> = Vec::new();
@@ -284,35 +332,34 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                     .unwrap_or(0);
                 self.batches[gid].release(rid, current_kv);
                 self.runtime.request_to_group.remove(&rid);
-                self.events.push(WorkerEvent::RequestComplete { req: rid });
+                events.push(WorkerEvent::RequestComplete {
+                    worker: self.id,
+                    req: rid,
+                });
             }
         }
     }
 
     // ── build_arch_input — one group, decode-only (no prefill on a decode worker)
 
-    fn build_arch_input(&self) -> UnifiedArchInput {
-        let mut groups = Vec::with_capacity(self.batches.len());
-        for b in &self.batches {
-            let mut decode_kv_lens = Vec::new();
+    /// Refill the reused `arch_buf` in place from the current batches. `groups`
+    /// stays at `batches.len()` (stable for a worker) so `resize_with` is a no-op
+    /// after warmup; each group's `decode_kv_lens` keeps its capacity via `clear`.
+    fn fill_arch_input(&mut self) {
+        let n = self.batches.len();
+        self.arch_buf.groups.resize_with(n, ArchGroupInput::default);
+        self.arch_buf.tokens_per_source_rank.clear();
+        for (g, b) in self.arch_buf.groups.iter_mut().zip(self.batches.iter()) {
+            g.clear();
             let mut total_kv = 0u64;
             for (_, s) in b.iter_decoding() {
-                decode_kv_lens.push(s.current_kv as u32);
+                g.decode_kv_lens.push(s.current_kv as u32);
                 total_kv += s.current_kv;
             }
-            let decode_tokens = decode_kv_lens.len() as u32;
-            groups.push(ArchGroupInput {
-                batch_tokens: decode_tokens,
-                prefill_tokens: 0,
-                decode_tokens,
-                prefill_chunk_pairs: Vec::new(),
-                decode_kv_lens,
-                total_kv_len: total_kv as u32,
-            });
-        }
-        UnifiedArchInput {
-            groups,
-            tokens_per_source_rank: Vec::new(),
+            let decode_tokens = g.decode_kv_lens.len() as u32;
+            g.batch_tokens = decode_tokens;
+            g.decode_tokens = decode_tokens;
+            g.total_kv_len = total_kv as u32;
         }
     }
 
@@ -340,12 +387,8 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
         }
     }
 
-    fn tick(&mut self, now: Time) {
-        self.tick_inner(now);
-    }
-
-    fn drain_events(&mut self) -> Vec<WorkerEvent> {
-        std::mem::take(&mut self.events)
+    fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+        self.tick_inner(now, events)
     }
 
     fn status(&self) -> WorkerStatus {
@@ -374,7 +417,12 @@ mod tests {
         dp_groups: u16,
     }
     impl IterwiseUnifiedModel for FakeModel {
-        fn eval_iter(&self, b: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+        fn eval_iter(
+            &self,
+            b: &UnifiedArchInput,
+            slots: &mut Vec<LeafMetrics>,
+            _scratch: &mut Vec<LeafMetrics>,
+        ) -> LeafMetrics {
             slots.clear();
             // The worker must feed exactly one decode group per DP shard.
             assert_eq!(b.groups.len(), self.dp_groups as usize);
@@ -424,6 +472,7 @@ mod tests {
     fn worker_dp(store: SharedRequests, dp_groups: u16) -> PdDecodeWorker<FakeModel> {
         PdDecodeWorker::new(
             WorkerId(0),
+            "decode",
             Arc::new(FakeModel { ms: 1.0, dp_groups }),
             store,
             WorkerConfig::default(),
@@ -439,12 +488,14 @@ mod tests {
         w.enqueue(WorkerMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..50u64 {
-            w.tick(Time::from_ms(step as f64));
-            events.extend(w.drain_events());
+            w.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(
             events,
-            vec![WorkerEvent::RequestComplete { req: RequestId(0) }]
+            vec![WorkerEvent::RequestComplete {
+                worker: WorkerId(0),
+                req: RequestId(0)
+            }]
         );
         let s = store.borrow();
         let r = &s[RequestId(0)];
@@ -459,12 +510,11 @@ mod tests {
         for id in [0, 1, 2] {
             w.enqueue(WorkerMsg::Request(RequestId(id)));
         }
-        let mut n = 0;
+        let mut events = Vec::new();
         for step in 0..200u64 {
-            w.tick(Time::from_ms(step as f64));
-            n += w.drain_events().len();
+            w.tick(Time::from_ms(step as f64), &mut events);
         }
-        assert_eq!(n, 3);
+        assert_eq!(events.len(), 3);
         let s = store.borrow();
         for id in [0, 1, 2] {
             assert!(s[RequestId(id)].completed, "req {id} should complete");
@@ -475,8 +525,10 @@ mod tests {
     fn builds_one_decode_group_per_dp_shard() {
         let w = worker_dp(prefilled_store(&[]), 2);
         assert_eq!(w.batches.len(), 2);
-        // build_arch_input emits one group per shard (also asserted in eval_iter).
-        assert_eq!(w.build_arch_input().groups.len(), 2);
+        // fill_arch_input emits one group per shard (also asserted in eval_iter).
+        let mut w = w;
+        w.fill_arch_input();
+        assert_eq!(w.arch_buf.groups.len(), 2);
     }
 
     #[test]
@@ -486,8 +538,9 @@ mod tests {
         let mut w = worker_dp(store, 2);
         w.enqueue(WorkerMsg::Request(RequestId(0)));
         w.enqueue(WorkerMsg::Request(RequestId(1)));
+        let mut events = Vec::new();
         for step in 0..10u64 {
-            w.tick(Time::from_ms(step as f64));
+            w.tick(Time::from_ms(step as f64), &mut events);
         }
         let g0 = w.batches[0].iter_decoding().count();
         let g1 = w.batches[1].iter_decoding().count();
@@ -505,12 +558,11 @@ mod tests {
         for id in 0..4u32 {
             w.enqueue(WorkerMsg::Request(RequestId(id)));
         }
-        let mut n = 0;
+        let mut events = Vec::new();
         for step in 0..200u64 {
-            w.tick(Time::from_ms(step as f64));
-            n += w.drain_events().len();
+            w.tick(Time::from_ms(step as f64), &mut events);
         }
-        assert_eq!(n, 4);
+        assert_eq!(events.len(), 4);
         let s = store.borrow();
         for id in 0..4u32 {
             assert!(s[RequestId(id)].completed, "req {id} should complete");

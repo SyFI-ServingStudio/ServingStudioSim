@@ -9,7 +9,7 @@
 //! the vocabulary has a neutral home and no single worker "owns" it. `unified.rs`
 //! now holds only `BareboneWorker`.
 
-use crate::common::{RequestId, Time};
+use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission_helpers::{KvAdmission, LoadBalance};
 
 // ── FSM types ────────────────────────────────────────────────────────────────
@@ -42,11 +42,13 @@ pub enum WorkerMsg {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkerEvent {
-    /// A request finished all its output tokens on this worker.
-    RequestComplete { req: RequestId },
+    /// A request finished all its output tokens on this worker. `worker` is the
+    /// emitting worker's id — the worker self-tags at push time (it knows its own
+    /// id), so the pool no longer needs a separate drain sweep to attribute it.
+    RequestComplete { worker: WorkerId, req: RequestId },
     /// A PD prefill worker finished a request's prefill; L6 hands it off to a
     /// decode pool. Never emitted by unified / decode workers.
-    PrefillDone { req: RequestId },
+    PrefillDone { worker: WorkerId, req: RequestId },
 }
 
 #[derive(Clone, Copy, Debug, Default)]

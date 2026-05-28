@@ -83,13 +83,14 @@ pub struct LeafDesc {
     pub config: String,
 }
 
-/// Serializable description of a compiled [`CostTree`] — the `cost_manifest.json`
-/// sidecar. Pairs the ordered leaf [`slots`](Self::slots) (the position→name/kind
-/// /config map for the parquet `slot_*` list columns) with the flattened
-/// aggregation [`nodes`](Self::nodes), so a consumer reading `cost_log.parquet`
-/// can re-run [`CostTree::aggregate`] over a row's `slot_time_ms` to reproduce
-/// `total_time_ms`: the `Scale{n}` fold, `Sum`, and `Max{overlap}` operators are
-/// all present (slot names alone can't reconstruct the total).
+/// Serializable description of a compiled [`CostTree`] — the per-worker
+/// `cost_manifest/worker_<pool_tag>_<worker_id>.json` sidecar. Pairs the ordered
+/// leaf [`slots`](Self::slots) (the position→name/kind/config map for the
+/// parquet `slot_*` list columns) with the flattened aggregation
+/// [`nodes`](Self::nodes), so a consumer reading a row from `cost_log/` can
+/// re-run [`CostTree::aggregate`] over that row's `slot_time_ms` to reproduce
+/// `total_time_ms`: the `Scale{n}` fold, `Sum`, and `Max{overlap}` operators
+/// are all present (slot names alone can't reconstruct the total).
 ///
 /// [`node_labels`](Self::node_labels) recovers the composite identity that
 /// [`CostTree::flatten`] drops: it is index-aligned to [`nodes`](Self::nodes) —
@@ -325,8 +326,22 @@ impl CostTree {
     /// iterating high→low index has each child's subtree result ready when its
     /// parent is reached. `scratch[i]` holds node `i`'s rolled-up metrics; the
     /// root (index 0) is the answer.
-    pub fn aggregate(flat: &[FlatCostNode], buf: &[LeafMetrics]) -> LeafMetrics {
-        let mut scratch = vec![LeafMetrics::ZERO; flat.len()];
+    ///
+    /// `buf` holds the per-leaf metrics (`buf[slot]`); `scratch` is a caller-owned
+    /// node-metrics buffer reused across calls. This runs once per worker iteration
+    /// (millions of times), so the caller threads in a persistent `scratch` rather
+    /// than allocating a fresh `Vec` each call: we `clear` + `resize(flat.len())`
+    /// in place, keeping the capacity. Steady-state aggregation is allocation-free.
+    pub fn aggregate(
+        flat: &[FlatCostNode],
+        buf: &[LeafMetrics],
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
+        if flat.is_empty() {
+            return LeafMetrics::ZERO;
+        }
+        scratch.clear();
+        scratch.resize(flat.len(), LeafMetrics::ZERO);
         for i in (0..flat.len()).rev() {
             scratch[i] = match &flat[i] {
                 FlatCostNode::Leaf(slot) => buf[*slot],
@@ -358,7 +373,7 @@ impl CostTree {
                 }
             };
         }
-        scratch.into_iter().next().unwrap_or(LeafMetrics::ZERO)
+        scratch[0]
     }
 
     /// Indented render of the compiled structure for inspection ("print after
@@ -544,8 +559,13 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
             leaf(3.0, 0.0, 0.0), // c
             leaf(4.0, 0.0, 0.0), // d
         ];
-        let from_manifest = CostTree::aggregate(&back.nodes, &buf).m.time_ms;
-        let direct = CostTree::aggregate(&tree.flatten(), &buf).m.time_ms;
+        let mut scratch = Vec::new();
+        let from_manifest = CostTree::aggregate(&back.nodes, &buf, &mut scratch)
+            .m
+            .time_ms;
+        let direct = CostTree::aggregate(&tree.flatten(), &buf, &mut scratch)
+            .m
+            .time_ms;
         assert_eq!(from_manifest, direct);
         assert_eq!(from_manifest, 1.0 + 3.0 * (2.0 + 3.0) + 4.0);
         // The manifest carries the fold + slot names (reproducibility, not just labels).
@@ -566,7 +586,8 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
             leaf(3.0, 30.0, 300.0), // c
             leaf(4.0, 40.0, 400.0), // d
         ];
-        let total = CostTree::aggregate(&flat, &buf).m;
+        let mut scratch = Vec::new();
+        let total = CostTree::aggregate(&flat, &buf, &mut scratch).m;
         // time/flops/bytes = a + 3·(b+c) + d (the fold multiplies the layer).
         assert_eq!(total.time_ms, 1.0 + 3.0 * (2.0 + 3.0) + 4.0);
         assert_eq!(total.flops, 10.0 + 3.0 * (20.0 + 30.0) + 40.0);
@@ -583,7 +604,8 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
         };
         let flat = b.finish(root).flatten();
         let buf = [leaf(4.0, 10.0, 100.0), leaf(6.0, 20.0, 200.0)];
-        let total = CostTree::aggregate(&flat, &buf).m;
+        let mut scratch = Vec::new();
+        let total = CostTree::aggregate(&flat, &buf, &mut scratch).m;
         assert_eq!(total.time_ms, 6.0 / 2.0); // max(4, 6)/overlap
         assert_eq!(total.flops, 30.0); // work still sums (INV-4)
         assert_eq!(total.bytes, 300.0);
@@ -600,11 +622,14 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
             leaf(4.0, 0.0, 0.0),
         ];
         buf[2].coverage = CoverageFlags::EXTRAPOLATED; // leaf c, inside Scale{3}
-        let total = CostTree::aggregate(&flat, &buf);
+        let mut scratch = Vec::new();
+        let total = CostTree::aggregate(&flat, &buf, &mut scratch);
         assert!(total.coverage.contains(CoverageFlags::EXTRAPOLATED));
         // A clean buffer leaves the root flag empty.
         buf[2].coverage = CoverageFlags::EMPTY;
-        assert!(CostTree::aggregate(&flat, &buf).coverage.is_empty());
+        assert!(CostTree::aggregate(&flat, &buf, &mut scratch)
+            .coverage
+            .is_empty());
     }
 
     #[test]

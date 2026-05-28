@@ -12,10 +12,10 @@
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time};
-use crate::worker::IterWorker;
+use crate::worker::{IterWorker, WorkerEvent};
 
 use super::super::{Flow, GpuInventory, OrchAction, PoolEvent, UnifiedWorkerFactory};
-use super::simple_dp::{SimpleDpPoolConfig, SimpleDpPoolController};
+use super::simple_dp::{to_pool_event, SimpleDpPoolConfig, SimpleDpPoolController};
 
 // ── L6b: PD deployment flow (the object L7 calls) ──────────────────────────────
 
@@ -34,6 +34,10 @@ where
     prefill_pool: SimpleDpPoolController<MP, WP>,
     decode_pool: SimpleDpPoolController<MD, WD>,
     inventory: GpuInventory,
+    /// Reused per-tick event sinks (one per pool) — workers push completions into
+    /// them during `tick_collect`, drained + cleared here each tick.
+    prefill_events: Vec<WorkerEvent>,
+    decode_events: Vec<WorkerEvent>,
 }
 
 impl<MP, WP, MD, WD> PdFlow<MP, WP, MD, WD>
@@ -62,6 +66,8 @@ where
             prefill_pool,
             decode_pool,
             inventory,
+            prefill_events: Vec::new(),
+            decode_events: Vec::new(),
         }
     }
 
@@ -86,27 +92,34 @@ where
     fn tick(&mut self, now: Time) -> Vec<OrchAction> {
         let mut actions = Vec::new();
 
-        // Producer first (L6 INV-11): tick + drain the prefill pool. A finished
+        // Producer first (L6 INV-11): tick + collect the prefill pool. A finished
         // prefill either completes immediately (single-token request) or hands off
         // to the decode pool this same tick (so the decode pool can admit it below).
-        self.prefill_pool.tick_workers(now);
+        let mut prefill_events = std::mem::take(&mut self.prefill_events);
+        prefill_events.clear();
+        self.prefill_pool.tick_collect(now, &mut prefill_events);
+        let prefill_pool = self.prefill_pool.pool();
         let mut handoffs = Vec::new();
-        for event in self.prefill_pool.drain_events() {
-            match event {
+        for ev in prefill_events.drain(..) {
+            match to_pool_event(prefill_pool, ev) {
                 PoolEvent::PrefillDone { req, .. } => handoffs.push(req),
                 PoolEvent::RequestComplete { req, .. } => {
                     actions.push(OrchAction::Complete { req })
                 }
             }
         }
+        self.prefill_events = prefill_events;
         for req in handoffs {
             self.admit_to_decode(req);
         }
 
-        // Consumer: tick + drain the decode pool. It only ever completes.
-        self.decode_pool.tick_workers(now);
-        for event in self.decode_pool.drain_events() {
-            match event {
+        // Consumer: tick + collect the decode pool. It only ever completes.
+        let mut decode_events = std::mem::take(&mut self.decode_events);
+        decode_events.clear();
+        self.decode_pool.tick_collect(now, &mut decode_events);
+        let decode_pool = self.decode_pool.pool();
+        for ev in decode_events.drain(..) {
+            match to_pool_event(decode_pool, ev) {
                 PoolEvent::RequestComplete { req, .. } => {
                     actions.push(OrchAction::Complete { req })
                 }
@@ -114,6 +127,7 @@ where
                 PoolEvent::PrefillDone { .. } => {}
             }
         }
+        self.decode_events = decode_events;
 
         actions
     }
@@ -144,7 +158,12 @@ mod tests {
         ms: f64,
     }
     impl IterwiseUnifiedModel for FakeModel {
-        fn eval_iter(&self, _b: &UnifiedArchInput, slots: &mut Vec<LeafMetrics>) -> LeafMetrics {
+        fn eval_iter(
+            &self,
+            _b: &UnifiedArchInput,
+            slots: &mut Vec<LeafMetrics>,
+            _scratch: &mut Vec<LeafMetrics>,
+        ) -> LeafMetrics {
             slots.clear();
             LeafMetrics {
                 m: Metrics4 {
@@ -176,6 +195,7 @@ mod tests {
             None,
             "test-gpu".to_string(),
             1,
+            "prefill",
             PdPrefillWorker::<FakeModel>::new,
         );
         let decode_factory = UnifiedWorkerFactory::new(
@@ -185,6 +205,7 @@ mod tests {
             None,
             "test-gpu".to_string(),
             1,
+            "decode",
             PdDecodeWorker::<FakeModel>::new,
         );
         let prefill_cfg = SimpleDpPoolConfig {

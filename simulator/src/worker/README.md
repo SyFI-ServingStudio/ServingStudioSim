@@ -11,27 +11,28 @@ For deeper design intent see `docs/detailed_design/L5/design.md`.
 
 ## What's in the tree
 
-`BareboneWorker` — the minimal viable iter-wise unified worker: one request
-group, `Strict` admission, whole-prefill-in-one-iter, a three-state batch cursor.
-`WorkerConfig` is its construction tier (admission policy, load balance, and
-`attn_kv_bytes` KV budget; `Default` = 80 GB). Plus the shared admission
-primitives. The other worker selectors (chunked-prefill, the AFD attn/ffn
-workers) parse and are advertised in the schema, but `build()` bails for now
+Iter-wise workers currently include `BareboneWorker` (single-group unified),
+`HpUnifiedWorker` (one batch per attention-DP shard), and the PD pair
+`PdPrefillWorker` / `PdDecodeWorker`. `WorkerConfig` is their construction tier
+(KV budget plus hot-path logging controls; `Default` = 80 GB). Shared admission
+primitives live beside them. `chunked_prefill` and the AFD attn/ffn workers parse
+and are advertised in the schema, but their deployments still bail for now
 (`config.rs`).
 
 ## The L6-facing surface (event-driven)
 
-The L6 pool drives the worker through four methods — no return-value plumbing:
+The L6 pool drives a worker through three methods. Events are pushed into a
+caller-owned sink; `tick` returns the worker's next wakeup so L6 can skip sleeping
+workers on the fixed global clock:
 
 | Method | Role |
 |---|---|
 | `enqueue(WorkerMsg::Request(rid))` | hand the worker an admitted request |
-| `tick(now)` | advance the FSM as far as it can at time `now` |
-| `drain_events() -> Vec<WorkerEvent>` | take the outbox (`RequestComplete { req }`) |
+| `tick(now, events) -> Option<Time>` | advance the FSM as far as it can at time `now`, pushing self-tagged events and returning the next wakeup (`None` = quiescent) |
 | `status() -> WorkerStatus` | queued + active request counts (for the pool's load view) |
 
-`complete_iter` pushes `WorkerEvent::RequestComplete` into an outbox the pool
-drains, rather than returning a `Vec`. The request slab is the shared
+`complete_iter` pushes `WorkerEvent::RequestComplete { worker, req }` into the
+caller-provided event sink, rather than returning a `Vec`. The request slab is the shared
 `RequestStore` (`SharedRequests`), injected at construction and borrowed
 transiently inside each method. `release_request(rid, current_kv)` is the
 external cancellation entry point — it cleans the request out of wherever it sits
@@ -49,12 +50,12 @@ state-forwarding loop over three stages:
    nothing is admitted and no decode is in flight.
 2. **`start_iter`** (Active/NotStarted) — build the `UnifiedArchInput` for the
    batch, run **one CostTree eval pass** on the L4 model
-   (`model.eval_iter(&input, &mut cost_slots)`), and arm `compute_end = now +
+   (`model.eval_iter(&input, &mut cost_slots, &mut cost_scratch)`), and arm `compute_end = now +
    cost_time` (`agg.m.time_ms` is the clock). The cursor goes NotStarted →
    Computing; the worker waits until `now >= compute_end`, then Computing → Done.
 3. **`complete_iter`** (Active/Done) — advance decode tokens, transition admitted
    prefills to decoding, release finished requests' KV, and emit
-   `RequestComplete`. Back to Idle to form the next batch.
+   `RequestComplete { worker, req }`. Back to Idle to form the next batch.
 
 ## Admission & batching primitives (`admission_helpers.rs`)
 
@@ -79,7 +80,9 @@ When a `log_dir` is supplied, the worker opens a `CostLogger` against the model'
 per-leaf typed inputs (`cost_slot_inputs`) and writes one `CostLogEntry` per
 iteration (per-slot `slot_time_ms` / `slot_coverage`, the group input section, the
 aggregate time/energy). A failed open disables logging with a warning, never
-aborts the sim.
+aborts the sim. The worker no longer allocates per-row `Vec`s for those variable
+sections: it hands `cost_slots`, `cost_groups`, and `cost_slot_inputs` to
+`CostLogger::record`, which appends them into reused chunk-level flat buffers.
 
 ## Up / down
 
@@ -87,7 +90,8 @@ aborts the sim.
   `eval_iter` / `eval_iter_with_inputs` (the per-iter CostTree eval),
   `kv_bytes_per_token`, `cost_log_manifest`. The worker holds it as `Arc<M>`.
 - **Above (consumer):** the L6 orchestrator pool (`orchestrator::simple_dp`)
-  enqueues requests, ticks the worker, and drains its events.
+  enqueues requests, ticks due workers, and receives self-tagged events through
+  the shared event sink.
 
 ## Config selectors (`config.rs`)
 

@@ -36,8 +36,9 @@ below it is cost + lifecycle.
 
 - **L6a — pool-local orchestration** (*inside* one pool): build and hold the
   worker instances, pick a worker (placement / load balance), tick them, and
-  drain each worker's outbox, translating `WorkerEvent` → `PoolEvent`. L6a never
-  decides deployment-level phase jumps.
+  collect self-tagged `WorkerEvent`s into a caller-owned sink, translating them
+  to `PoolEvent`s for L6b. Workers do not keep a drainable outbox on the current
+  iter-wise path. L6a never decides deployment-level phase jumps.
 - **L6b — inter-pool deployment flow** (*between* pools): consume external
   arrivals and L6a's `PoolEvent`s, decide which pool gets work next, and hold any
   deployment-level phase/priority state. **L6b is the only object L7 holds**,
@@ -65,8 +66,9 @@ common.rs     Shared L6 vocabulary, kept out of mod.rs:
                 GpuInfo / GpuInventory  — the run's flat GPU registry
                 UnifiedWorkerFactory    — stamps identical workers for a pool
 config.rs     Pool + group topology: PoolSpec / GroupSpec / PlacementPolicy.
-impls/        Concrete deployments. Today: simple_dp.
+impls/        Concrete deployments.
   simple_dp.rs  SimpleDpPoolController (L6a) + SimpleDpFlow (L6b) in one file.
+  pd.rs         PdFlow: prefill pool -> decode pool handoff using two simple-DP pools.
 ```
 
 ## `simple_dp` — the one wired deployment
@@ -74,13 +76,15 @@ impls/        Concrete deployments. Today: simple_dp.
 One pool (`main`) of identical unified workers, one homogeneous group. L6a and
 L6b stay two structs even though the file is small:
 
-- **`SimpleDpPoolController` (L6a)** owns the pool's `BareboneWorker`s. `admit(rid)`
-  picks a worker by `DpPlacementPolicy` (`LeastQueued` / `RoundRobin`) and
-  enqueues it; `tick_workers(now)` ticks each; `drain_events` lifts every
-  `WorkerEvent::RequestComplete` to a `PoolEvent`. Note `DpPlacementPolicy`
-  (`simple_dp.rs`, the impl's own enum) and config's `PlacementPolicy`
-  (`config.rs`, the wire/launcher policy) are two distinct types, bridged by
-  `placement_into` in the `deployment` layer.
+- **`SimpleDpPoolController` (L6a)** owns the pool's iter-wise workers.
+  `admit(rid)` picks a worker by `DpPlacementPolicy` (`LeastQueued` /
+  `RoundRobin`) and enqueues it. `tick_collect(now, events)` first checks each
+  worker's next wakeup and only enters due workers; those workers push self-tagged
+  `WorkerEvent`s into `events`. The flow maps those events through
+  `to_pool_event(pool, event)`. Note `DpPlacementPolicy` (`simple_dp.rs`, the
+  impl's own enum) and config's `PlacementPolicy` (`config.rs`, the wire/launcher
+  policy) are two distinct types, bridged by `placement_into` in the `deployment`
+  layer.
 - **`SimpleDpFlow` (L6b)** implements `Flow`. `on_arrival` inserts the request into
   the shared `RequestStore` then admits its id to the pool; `tick` ticks the pool
   and maps each `PoolEvent` to an `OrchAction::Complete`.
@@ -103,6 +107,15 @@ each pool restarting at zero. As one combined run-level artifact it is the
 **reporting source** L7 serializes to `raw/run_meta.json` for the analyzer's
 per-GPU normalization.
 
+## `pd` — prefill/decode disaggregation
+
+`PdFlow` composes two `SimpleDpPoolController`s: a `prefill` pool of
+`PdPrefillWorker`s and a `decode` pool of `PdDecodeWorker`s. The flow ticks the
+producer first, maps `PrefillDone` events to same-tick decode admissions, then
+ticks the decode pool and maps decode completions to `OrchAction::Complete`. The
+pool tags (`prefill` / `decode`) are also threaded into cost-log file names and
+manifests so `(pool_tag, worker_id)` is the stable per-worker key.
+
 ## Topology config (`config.rs`)
 
 The on-disk shape of the hierarchy above. A pool is always `{ placement,
@@ -118,5 +131,5 @@ fields (`placement`, `gpu`, `replicas`) for the launcher schema; `groups` /
 
 - **Above (consumer):** the L7 sim driver calls `Flow::{on_arrival, tick,
   inventory}`. The `deployment` layer constructs the concrete `Flow`.
-- **Below (driven):** L5 workers (`enqueue` / `tick` / `drain_events` / `status`)
+- **Below (driven):** L5 workers (`enqueue` / `tick` / `status`)
   and, through the factory, the L4 model (`Arc<M>`).

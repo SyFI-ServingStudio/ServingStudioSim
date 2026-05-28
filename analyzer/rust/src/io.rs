@@ -3,6 +3,7 @@
 //! `plots/` (Python PNG). The analyzer writes directly into `reports/` /
 //! `payloads/`, so no post-hoc file shuffling is needed.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -66,16 +67,67 @@ pub fn read_run_meta(log_dir: &Path) -> Option<(usize, String)> {
     Some((num_gpus, gpu_name))
 }
 
-/// Read + parse the sim's `cost_manifest.json` (the cost-tree slots + flattened
-/// aggregation nodes the trace builder lays out). Searches the same dirs as
-/// other artifacts. Errors (not `None`) when absent/unparseable — the trace verb
-/// cannot place slices without it, so failing loud is correct here.
-pub fn read_manifest(log_dir: &Path) -> Result<crate::trace::manifest::Manifest> {
-    use anyhow::Context;
-    let path = resolve_artifact_path(log_dir, "cost_manifest.json");
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("read cost_manifest.json at {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+/// Read + parse per-worker cost manifests under `raw/cost_manifest/`.
+///
+/// Manifest filenames are keyed exactly like cost-log parquet filenames:
+/// `worker_<pool_tag>_<worker_id>.json`. `worker_id` is only unique within a
+/// pool, so trace consumers must use the `(pool_tag, worker_id)` pair from each
+/// cost_log row to select the right CostTree.
+pub fn read_cost_manifests(
+    log_dir: &Path,
+) -> Result<BTreeMap<(String, u16), crate::trace::manifest::Manifest>> {
+    use anyhow::{bail, Context};
+    let dir = resolve_artifact_path(log_dir, "cost_manifest");
+    if !dir.is_dir() {
+        bail!("cost_manifest/ dir not found under {}", log_dir.display());
+    }
+
+    let mut manifests = BTreeMap::new();
+    for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .with_context(|| format!("invalid manifest filename {}", path.display()))?;
+        let rest = stem
+            .strip_prefix("worker_")
+            .with_context(|| {
+                format!(
+                    "manifest filename must start with worker_: {}",
+                    path.display()
+                )
+            })?;
+        let (pool_tag, worker_id) = rest
+            .rsplit_once('_')
+            .with_context(|| {
+                format!(
+                    "manifest filename must end with _<worker_id>: {}",
+                    path.display()
+                )
+            })?;
+        let worker_id: u16 = worker_id
+            .parse()
+            .with_context(|| format!("parse worker id from {}", path.display()))?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("read cost manifest at {}", path.display()))?;
+        let manifest =
+            serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        let old = manifests.insert((pool_tag.to_owned(), worker_id), manifest);
+        if old.is_some() {
+            bail!("duplicate cost manifest key ({pool_tag}, {worker_id})");
+        }
+    }
+    if manifests.is_empty() {
+        bail!(
+            "cost_manifest/ contains no worker_*.json files under {}",
+            log_dir.display()
+        );
+    }
+    Ok(manifests)
 }
 
 /// Output path for a Perfetto trace: `<log_dir>/traces/<prefix>.pftrace.gz`.

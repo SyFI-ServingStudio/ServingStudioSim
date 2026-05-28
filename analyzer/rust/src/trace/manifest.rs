@@ -1,4 +1,5 @@
-//! Analyzer-side mirror of the sim's `cost_manifest.json` (the serializable
+//! Analyzer-side mirror of each sim
+//! `cost_manifest/worker_<pool_tag>_<worker_id>.json` (the serializable
 //! [`CostManifest`] from `simulator/src/timing/cost_tree.rs`). The analyzer has
 //! no `simulator` dependency, so we re-declare the shapes as plain serde structs
 //! that must stay wire-compatible with the sim's `#[derive(Serialize)]`. The
@@ -45,10 +46,10 @@ pub struct Manifest {
 mod tests {
     use super::*;
 
-    /// A trimmed but structurally real `cost_manifest.json` (dense Llama3, 2
-    /// slots + a Scale fold), pinning the exact JSON the sim emits. If the sim's
-    /// serde representation drifts (enum tag style, Range shape, field names),
-    /// this fails — that's the drift guard.
+    /// A trimmed but structurally real per-worker cost manifest (dense Llama3,
+    /// 2 slots + a Scale fold), pinning the exact JSON the sim emits. If the
+    /// sim's serde representation drifts (enum tag style, Range shape, field
+    /// names), this fails — that's the drift guard.
     const SAMPLE: &str = r#"{
       "slots": [
         {"name": "m.embedding", "kind": "elementwise", "config": "hidden=4096"},
