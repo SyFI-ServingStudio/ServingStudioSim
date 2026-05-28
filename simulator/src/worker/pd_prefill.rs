@@ -9,8 +9,9 @@
 //! prefill state across pools). The local KvPool therefore stays empty — a prefill
 //! worker reserves KV only transiently during admission, never finalizes a decode.
 //!
-//! Copied from `BareboneWorker` (build-first; the shared iter-wise core will be
-//! factored once the four iter-wise workers exist). Only `complete_iter` differs.
+//! Copied from `BareboneWorker` intentionally for now: the PD lifecycle differs
+//! enough that a shared iter-wise core should be introduced only with a concrete
+//! maintenance win, not just because the shapes rhyme.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -160,7 +161,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         }
     }
 
-    // ── Stage 1: form_batch — admit one fresh prefill (same as barebone) ────────
+    // ── Stage 1: form_batch — admit one fresh prefill by prompt KV only ─────────
 
     fn form_batch(&mut self) -> bool {
         if let Some(&rid) = self.runtime.pending_prefills.front() {
@@ -310,7 +311,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         }
     }
 
-    // ── lifecycle helpers (same as barebone) ────────────────────────────────────
+    // ── lifecycle helpers (PD prefill: no local decode KV finalization) ─────────
 
     fn promise(&mut self, gid: u16, rid: RequestId, p: u32, d: u32, prefix: u32) {
         self.runtime

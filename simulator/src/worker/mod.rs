@@ -1,9 +1,9 @@
 //! `worker` (L5) — per-worker FSM that turns admitted requests into iter cost
 //! queries and drives request lifecycle. See docs/detailed_design/L5/design.md.
 //!
-//! Current set: the barebone iter-wise unified worker (§3.4), the multi-group
-//! HP/DP worker (§3.5), the `IterWorker` trait they share, + the shared admission
-//! primitives (§2).
+//! Current set: barebone and HP/DP unified workers, the PD prefill/decode pair,
+//! the `IterWorker` trait they share, selector/config types, and the shared
+//! admission primitives (§2).
 
 pub mod admission_helpers;
 pub mod config;

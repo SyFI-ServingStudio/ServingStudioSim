@@ -44,7 +44,7 @@ impl<K: Probe> Op<K> {
     /// CostTree eval: push this op's one leaf into the [`Evaluator`] — the inverse
     /// of `compile`'s single `leaf()`. Walking `eval` in the same child order
     /// `compile` minted slots keeps the evaluator's cursor aligned with the slot
-    /// index (INV-2). The leaf metric is the kernel's best-of-N `Metrics4`.
+    /// index (INV-2). The leaf metric is the kernel's best-of-N `LeafMetrics`.
     ///
     /// The `slot_input` capture rides `Evaluator::push`: the closure clones this
     /// op's typed input into the `SlotInput` enum only when the evaluator is

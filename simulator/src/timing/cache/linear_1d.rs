@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(warnings[0].kind, OutlierKind::NonFinite);
 
         // The dropped middle point still leaves a 2-point grid that interpolates
-        // 1.0→3.0 linearly across x=1..3, so lookup(2.0) ≈ 2.0.
+        // 1.0→3.0 linearly across x=1..3, so eval(&[2.0]) ≈ 2.0.
         let mid = cache.eval(&[2.0]);
         assert_eq!(mid.m.time_ms, 2.0);
     }

@@ -25,8 +25,9 @@ levels; L5/L4 own the bottom two.
   count (the data-parallel fan-out) + an arch (L4) + worker (L5) provider. A
   homogeneous pool is one group; a heterogeneous pool lists several (parse-only
   this round, `build()` takes one).
-- **Worker** — one model replica's execution (an L5 `BareboneWorker`), running on
-  `gpus_per_worker` GPUs.
+- **Worker** — one model replica's execution (an L5 iter-wise worker such as
+  `BareboneWorker`, `HpUnifiedWorker`, `PdPrefillWorker`, or `PdDecodeWorker`),
+  running on `gpus_per_worker` GPUs.
 
 The **pool boundary is L6's only abstraction**: no code outside L6 ever holds a
 `&Worker` (Invariant 1). Everything above the worker is routing; everything at or
@@ -71,7 +72,7 @@ impls/        Concrete deployments.
   pd.rs         PdFlow: prefill pool -> decode pool handoff using two simple-DP pools.
 ```
 
-## `simple_dp` — the one wired deployment
+## `simple_dp` — single-pool DP building block
 
 One pool (`main`) of identical unified workers, one homogeneous group. L6a and
 L6b stay two structs even though the file is small:

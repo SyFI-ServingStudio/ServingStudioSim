@@ -97,7 +97,8 @@ sections: it hands `cost_slots`, `cost_groups`, and `cost_slot_inputs` to
 
 Worker selectors are serde tagged enums (`#[serde(tag = "type")]`), the symmetric
 sibling of the arch selector, co-located with the workers they pick:
-`IterWorkerSel` (`barebone` wired; `chunked_prefill` parses, `build` bails),
+`IterWorkerSel` (`barebone` / `hp_unified` wired for `unified`,
+`pd_prefill` / `pd_decode` wired for `pd`, `chunked_prefill` parses but bails),
 `AttnWorkerSel` / `FfnWorkerSel` (the AFD layer-wise contract; config-only today).
 `#[derive(ProviderSchema)]` emits each selector's `(tag, params)` rows for the
 launcher's `list-params` schema.

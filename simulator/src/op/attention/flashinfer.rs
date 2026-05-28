@@ -47,7 +47,7 @@ pub struct FlashInferAttentionConfig {
 }
 
 /// Op-level input: raw per-request data for one attention call in the sim batch
-/// (L2 design §3.2). Partition / dispatch happen inside `lookup` — L3 never sees
+/// (L2 design §3.2). Partition / dispatch happen inside `eval` — L3 never sees
 /// the sub-kernels.
 #[derive(Clone, Debug, Default)]
 pub struct FlashInferAttentionInput {
@@ -111,10 +111,9 @@ impl FlashInferAttentionOp {
 
     /// CostTree eval: fill the two fixed slots `compile` minted — `prefill` then
     /// `decode`. The prefill slot is the INV-1 aggregating leaf: sum the per-request
-    /// `prefill.eval` over `prefill_chunk_pairs` into the one slot
-    /// (mirrors `lookup`'s per-request parts). The decode slot collapses all decode
-    /// requests to one cell (zero metrics when none). Numerically equals the sum of
-    /// `lookup`'s parts, so `aggregate(Sum[prefill, decode])` matches `lookup().time`.
+    /// `prefill.eval` over `prefill_chunk_pairs` into the one slot. The decode
+    /// slot collapses all decode requests to one cell (zero metrics when none).
+    /// `aggregate(Sum[prefill, decode])` reproduces the streamed slot total.
     pub fn eval(&self, input: &FlashInferAttentionInput, ev: &mut Evaluator) {
         let mut prefill = LeafMetrics::ZERO;
         for &(prefix_len, append_len) in &input.prefill_chunk_pairs {

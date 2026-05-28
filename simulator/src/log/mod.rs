@@ -5,9 +5,9 @@
 //! Shape follows `ref/moesim-rs/src/logging/{parquet_writer.rs,mod.rs}`: each
 //! stream buffers rows and flushes a `RecordBatch` once it reaches
 //! `STREAM_FLUSH_ROWS`; `flush_all` (also on `Drop`) force-flushes and closes.
-//! This batch wires only the two per-request tables (`request_state` /
-//! `request_slo`); the worker-internal streams (`cost_log` / `kv_snapshot` /
-//! `network_event`) land with L5 logging.
+//! L7 owns the per-request tables (`request_state` / `request_slo`), while L5
+//! workers own per-worker `cost_log` streams. `kv_snapshot` / `network_event`
+//! still have schemas but no writer is wired yet.
 
 pub mod cost_logger;
 pub mod parquet_writer;

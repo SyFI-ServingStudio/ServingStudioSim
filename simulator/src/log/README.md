@@ -1,7 +1,8 @@
 # Log — streaming parquet output
 
 Cross-layer logging: turn the sim's per-request and per-iteration events into
-parquet streams (plus two JSON sidecars) under `<log_dir>/raw/`. The design
+parquet streams plus JSON sidecars (`run_meta.json` and per-worker
+`cost_manifest/*.json`) under `<log_dir>/raw/`. The design
 constraint is that **logging must not slow the sim**: the sim thread only fills
 row buffers and hands full chunks to a background thread that does the heavy
 parquet encode + ZSTD compression off the critical path.
@@ -65,7 +66,7 @@ run_meta.rs       write_run_meta — the run_meta.json GPU-facts sidecar (plain
 
 The `cost_log` row carries the per-slot breakdown as **position-keyed parallel
 lists** — `slot_time_ms` (`List<f32>`), `slot_coverage` (`List<u8>` of
-`CoverageFlags` bits), and the captured `slot_inputs` — never slot *names*. Names
+`CoverageFlags` bits), and the captured `slot_input` column — never slot *names*. Names
 live once in the per-worker `cost_manifest/worker_<pool_tag>_<worker_id>.json`
 sidecar (which also carries the flattened aggregation nodes), so a consumer
 reproduces `total_time_ms` from a row's per-slot times by re-running
@@ -76,7 +77,7 @@ for the manifest shape. The worker fills the per-slot buffers during its CostTre
 eval pass and hands them to `CostLogger::record` (slot-aligned, one input list per
 row).
 
-The captured `slot_input`s are handed over as inline enums and **serialized to
+The captured `slot_input` values are handed over as inline enums and **serialized to
 JSON strings on the writer thread** (`*_to_record_batch`, off the sim's critical
 path), with a `"null"` fallback if serialization fails — never panicking the run.
 

@@ -15,9 +15,9 @@
 //!     vocab-parallel split yet;
 //!   - one worklet instance per type, reused across `num_layers` via the
 //!     `Scale{num_layers}` fold (not per-layer `build`);
-//!   - `tp_size == 1` degenerates to full shapes + no collective, so this arch
-//!     at tp=1 sums the same leaves as `llama3_dense` (a validation convenience;
-//!     deployment still picks `llama3_dense` at tp=1).
+//!   - `tp_size == 1` degenerates to full shapes + no collective. That is a
+//!     validation convenience for the `llama3_dense_tp` tag, not an automatic
+//!     dispatch path to `llama3_dense`.
 
 use std::sync::Arc;
 

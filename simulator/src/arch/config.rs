@@ -7,8 +7,10 @@
 //! consumes them), so every arch variant flattens [`ModelSpec`]. arch and worker
 //! are symmetric sibling providers (not nested).
 //!
-//! Only the iter-wise `llama3_dense` / `llama3_dense_tp` archs are wired to
-//! `build()` today; the others parse + are advertised but `build()` bails.
+//! Iter-wise `llama3_dense`, `llama3_dense_tp`, and
+//! `llama3_dp_attn_tp_ffn` build today. `deepseek_moe` still parses and is
+//! advertised for schema visibility, but `build()` rejects it until the MoE
+//! vertical lands.
 //!
 //! NOTE (serde): `#[serde(deny_unknown_fields)]` is silently ignored on
 //! internally-tagged enum variants, so a typo inside an arch payload is NOT
@@ -47,8 +49,9 @@ pub struct ModelSpec {
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
-/// Iteration-wise arch provider. `tp_size` lives ONLY on the TP variant
-/// (provider-first: you select the arch, then it exposes its own params).
+/// Iteration-wise arch provider. Sharding parameters live only on the variants
+/// that consume them (provider-first: select the arch, then it exposes its own
+/// params).
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IterArchSel {

@@ -5,10 +5,9 @@
 //!
 //! v1 simplifications (build-first): the prefill→decode KV transfer is not modeled
 //! (handoff is a control-plane event; the shared `RequestStore` carries prefill
-//! state across pools), and **both pools must use the same arch *type*** — only
-//! the parallel dims (e.g. TP degree) and replica counts may differ. That keeps
-//! the model-monomorphization match to one arm per arch instead of a prefill×decode
-//! cartesian. Mixed-arch PD is a later round.
+//! state across pools). Wired pairings are `llama3_dense_tp` → `llama3_dense_tp`
+//! and `llama3_dense_tp` → `llama3_dp_attn_tp_ffn`; other pairings bail until a
+//! concrete experiment needs them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,8 +49,9 @@ impl Deployment for PdDeployment {
         ensure_pd_prefill(&pg.worker)?;
         ensure_pd_decode(&dg.worker)?;
 
-        // Prefill and decode must serve the same model (same dims/vocab/layers) for
-        // the handed-off KV to be meaningful — only the parallel layout may differ.
+        // Prefill and decode must point at the same model config path for the
+        // handed-off KV to be meaningful. The arch match below decides which
+        // parallel layouts are supported; it is the only cross-arch gate here.
         ensure!(
             pg.arch.model().model_config == dg.arch.model().model_config,
             "pd: prefill and decode pools must share a model_config \

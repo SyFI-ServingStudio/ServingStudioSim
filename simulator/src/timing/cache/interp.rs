@@ -77,9 +77,9 @@ impl Metrics4 {
         self.energy_j *= factor;
     }
 
-    /// Field-wise `max(0)` copy. Mirrors the per-field `.max(0.0)` each cache
-    /// `lookup` applies before emitting a `LookupResult`, so the metrics fast
-    /// path (`Cache::eval`) returns identical non-negative numbers.
+    /// Field-wise `max(0)` copy. `Cache::eval` uses this before returning
+    /// [`LeafMetrics`], so extrapolated metrics cannot go negative on the hot
+    /// path.
     pub fn clamped(self) -> Metrics4 {
         Metrics4 {
             time_ms: self.time_ms.max(0.0),

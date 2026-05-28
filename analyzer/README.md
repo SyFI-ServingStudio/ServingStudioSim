@@ -16,11 +16,14 @@ The module is two programs joined by one JSON contract — that is the **only**
 boundary between the halves:
 
 ```
-sim run ──writes→ <log_dir>/raw/*.parquet
+sim run ──writes→ <log_dir>/raw/{request_*.parquet,cost_log/worker_*.parquet,cost_manifest/worker_*.json}
                       │
   target/<build>/analyze run <log_dir> [subjects...]        (Rust, this::rust)
                       ├─→ <log_dir>/reports/<subject>_report.json    numbers, for an LLM
                       └─→ <log_dir>/payloads/<subject>_*.json        arrays, for the plot
+                      │
+  target/<build>/analyze trace <log_dir>                    (Rust, this::rust)
+                      └─→ <log_dir>/traces/<prefix>.pftrace.gz
                       │
   python analyzer/python render <log_dir> [subjects...]     (Python, this::python)
                       └─→ <log_dir>/plots/<subject>_*.png
@@ -40,6 +43,7 @@ sim run ──writes→ <log_dir>/raw/*.parquet
 | Command | Side | Effect |
 |---|---|---|
 | `analyze run <log_dir> [subjects...]` | Rust | Compute subjects → `reports/` + `payloads/`, plus a subject-less `reports/analyzer_timing.json` run-meta sidecar. No subjects = all applicable. |
+| `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
 | `analyze list` | Rust | Print the subject catalog. |
 | `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNGs in `plots/`. No subjects = all renderers. |
 
@@ -50,7 +54,9 @@ run (and `analyze` itself exits 0 even when individual subjects fail).
 
 **Required from below** — a run directory written by the sim/L7, containing:
 
-- `raw/*.parquet` — the sim's per-request / per-state logs (the actual input).
+- `raw/request_slo.parquet` and `raw/request_state.parquet` — subject inputs.
+- `raw/cost_log/worker_<pool_tag>_<worker_id>.parquet` plus matching
+  `raw/cost_manifest/worker_<pool_tag>_<worker_id>.json` — trace inputs.
 - `raw/params.json` — read only for the bare `deployment` string (drives the
   applicability gate). Absent → only deployment-agnostic subjects run.
 - `raw/run_meta.json` — sim-written sidecar (`num_gpus`, `gpu_name`); the
@@ -74,6 +80,7 @@ rust/                The `analyze` binary (DataFusion compute side).
                        serde output shapes (`MetricStats`, `CdfSeries`).
   src/request/         Category = per-request/session metrics (slo).
   src/throughput/      Category = serving-rate-over-time metrics (throughput).
+  src/trace/           Perfetto trace export from per-worker cost logs.
 
 python/              The render side (matplotlib over payload JSON).
   __main__.py          `render <log_dir> [subjects]`; maps subject → renderer,
@@ -97,7 +104,8 @@ Current catalog:
 
 | Subject | Category | Reads | Emits (report / payload) |
 |---|---|---|---|
-| `slo` | request | `request_slo.parquet` (+ optional `request_state.parquet`) | TTFT/TPOT/ITL/E2E + session-E2E stats / per-metric CDF series |
+| `slo-general` | request | `request_slo.parquet` scalar columns | TTFT/TPOT/E2E stats / per-metric CDF series |
+| `slo-detailed` | request | `request_slo.parquet` `output_token_times` column | ITL stats / CDF series when per-token logging is enabled |
 | `throughput` | throughput | `request_state.parquet` (+ `run_meta.json`) | per-GPU prefill/decode/total TPS totals / fine `segments` + coarse `binned_segments` series |
 
 **Deployment knowledge enters in exactly one place**: each subject's `Applies`

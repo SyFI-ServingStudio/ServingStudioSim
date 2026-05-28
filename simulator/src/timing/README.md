@@ -56,7 +56,7 @@ EVAL (every iteration, hot path)
   for each leaf:  Kernel::eval(&Input) ─→ LeafMetrics   (cache interpolation, best-of-N backend)
         │  Evaluator streams them into buf[slot] in visit order
         ▼
-  CostTree::aggregate(flat, buf) ─→ one LeafMetrics   (single reverse pass, zero alloc)
+  CostTree::aggregate(flat, buf, scratch) ─→ one LeafMetrics   (single reverse pass, reused scratch)
 ```
 
 **Build** profiles the sweep grid and fits a cache; **eval** is pure

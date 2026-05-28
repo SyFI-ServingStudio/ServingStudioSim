@@ -19,8 +19,9 @@ use crate::orchestrator::Flow;
 use crate::timing::PerfApiBridge;
 
 /// Dispatch a deserialized `RunConfig` to its deployment's `build`. The single
-/// place the `deployment` tag routes to a concrete topology. `pd` / `afd` parse
-/// (so `list-params` advertises them) but error cleanly until wired.
+/// place the `deployment` tag routes to a concrete topology. `unified` and `pd`
+/// are wired; `afd` parses (so `list-params` advertises it) but errors cleanly
+/// until its deployment is wired.
 pub fn build_flow(
     cfg: &RunConfig,
     bridge: &PerfApiBridge,

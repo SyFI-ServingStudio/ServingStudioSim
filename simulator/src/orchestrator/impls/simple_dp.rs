@@ -1,6 +1,6 @@
-//! `simple_dp` — one DP pool of identical unified workers. L6a
-//! (`SimpleDpPoolController`) + L6b (`SimpleDpFlow`) live in one file because the
-//! deployment is tiny, but stay two structs (L6 design.md §「simple DP」).
+//! `simple_dp` — a reusable DP pool controller plus the single-pool unified flow.
+//! L6a (`SimpleDpPoolController`) + L6b (`SimpleDpFlow`) live in one file because
+//! the deployment is tiny, but stay two structs (L6 design.md §「simple DP」).
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time};
@@ -124,9 +124,10 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
     }
 
     // ── Tick driving ──────────────────────────────────────────────────────────
-    /// Tick every worker, each pushing its (self-tagged) completion events into
-    /// the caller's `events` sink. One sweep — no separate drain pass; the worker
-    /// already stamps its id so the pool needs no per-worker attribution loop.
+    /// Sweep worker wakeup times and tick only due workers, each pushing its
+    /// self-tagged `WorkerEvent`s into the caller's sink. One sweep — no separate
+    /// drain pass; the worker already stamps its id so the pool needs no
+    /// per-worker attribution loop.
     pub fn tick_collect(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
         debug_assert_eq!(self.worker_wakeup_times.len(), self.workers.len());
         for (wakeup_time, worker) in self
@@ -142,7 +143,8 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
 }
 
 /// Tag a worker event with its pool to form the L6b [`PoolEvent`]. The worker
-/// already carries its own id; the flow supplies the pool it is draining.
+/// already carries its own id; the caller supplies the pool context for the
+/// per-pool event sink being converted.
 pub(crate) fn to_pool_event(pool: PoolId, event: WorkerEvent) -> PoolEvent {
     match event {
         WorkerEvent::RequestComplete { worker, req } => {
@@ -161,7 +163,7 @@ pub struct SimpleDpFlow<M: IterwiseUnifiedModel, W: IterWorker> {
     /// on the flow (not the pool) so a multi-pool deployment surfaces one combined
     /// inventory with globally-unique ids.
     inventory: GpuInventory,
-    /// Reused per-tick event sink — workers push completions into it during
+    /// Reused per-tick event sink — workers push `WorkerEvent`s into it during
     /// `tick_collect`, then it is drained here and cleared for the next tick.
     events: Vec<WorkerEvent>,
 }

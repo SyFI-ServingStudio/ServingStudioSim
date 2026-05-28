@@ -2,22 +2,20 @@
 //!
 //! Modeled on `ref/moesim-rs/src/logging/schemas.rs` — each stream gets a
 //! `pub fn xxx_schema() -> Arc<Schema>` returning a real
-//! `arrow_schema::Schema`, ready for direct use by Phase 3's
-//! `StreamingParquetWriter` + `SimLogger`.
+//! `arrow_schema::Schema`, ready for direct use by `StreamingParquetWriter`,
+//! `LoggerSession`, and `CostLogger`.
 //!
-//! Field name / type / nullability follow `docs/logging.md` §3–§7. The
-//! `cost_log` table is *partitioned by `worker_kind`*, so this module exposes
-//! only the worker_kind-agnostic envelope. Per-worker_kind `input_section` +
-//! per-model_arch `output_section` schemas land alongside L5 / L4 work in
-//! Phase 2+.
+//! Field name / type / nullability follow the local logging contract. `cost_log`
+//! is written as one file per `(pool_tag, worker_id)` stream; variable-length
+//! per-group input and per-slot CostTree data live inside list columns.
 
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, Schema};
 
-/// `cost_log` envelope (§3.1) — universal columns shared by every worker_kind
-/// partition. Per-worker_kind extensions append `input_section` /
-/// `output_section` struct columns onto this base.
+/// Legacy ref-style scalar envelope helper. The current writer uses
+/// [`cost_log_schema`] below; do not infer the live parquet columns from this
+/// compatibility surface.
 pub fn cost_log_envelope_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("pool_tag", DataType::Utf8, false),
@@ -81,8 +79,8 @@ pub fn cost_log_schema() -> Arc<Schema> {
         // `iter_id` is the per-worker iteration index (one forward-pass cycle);
         // `batch_id` is the batch *within* that iteration. They coincide today
         // (one batch per iteration) but diverge under AFD/TBO, where a worker runs
-        // several batches in one iteration — so the row key is (worker_id, iter_id,
-        // batch_id), not iter_id alone.
+        // several batches in one iteration — so the row key is (pool_tag,
+        // worker_id, iter_id, batch_id), not iter_id alone.
         Field::new("iter_id", DataType::UInt64, false),
         Field::new("batch_id", DataType::UInt64, false),
         // `wall_end_ms` is intentionally NOT a column: it is exactly

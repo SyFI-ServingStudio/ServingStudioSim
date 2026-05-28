@@ -5,12 +5,12 @@
 //! unified model. Follows the L4 build shape (`build_configs` /
 //! `resolve_configs` / `build`) and exposes `IterwiseUnifiedModel`. Dry-run
 //! coverage is no longer a separate traversal: `build` against a dry-run
-//! [`PerfApiBridge`] tallies missing specs per kernel (see `Kernel::init`).
+//! [`PerfApiBridge`] tallies missing specs per kernel (see `Kernel::build`).
 //!
 //! Deviations from L4 design.md for this v1 dense vertical (see plan):
 //!   - all worklets are `Local` (tp/ep/hp = 1, no collective);
-//!   - one worklet instance per type, reused across `num_layers` in
-//!     `eval_iter` with a per-layer `with_label` (not per-layer `build`);
+//!   - one worklet instance per type, reused across `num_layers` by the
+//!     CostTree `Scale{num_layers}` fold (not per-layer `build`);
 //!   - embedding modeled as an `ElementwiseKernel` gather placeholder.
 
 use std::sync::Arc;
@@ -259,11 +259,11 @@ pub fn build(
 }
 
 impl Llama3DenseModel {
-    /// Compile the per-iteration cost *structure* once (CostTree, milestone 1):
+    /// Compile the per-iteration cost *structure* once:
     /// `Sum( embed, Scale{num_layers}( Sum(pre_attn, attn, post_attn) ),
     /// final_norm, lm_head )`. The `Scale` folds the homogeneous layers — the
     /// per-layer leaves are minted once (not `×num_layers`), matching the
-    /// `eval_iter` fold. Structure only; per-iter eval lands later.
+    /// `eval_iter` fold.
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let embed = self.embed.compile(&mut b);
@@ -293,7 +293,7 @@ impl Llama3DenseModel {
         b.finish(root)
     }
 
-    /// CostTree eval (milestone 2): stream this iteration's per-leaf [`Metrics4`]
+    /// CostTree eval: stream this iteration's per-leaf [`LeafMetrics`]
     /// through `ev` in the exact order [`cost_tree`](Self::cost_tree) minted slots
     /// (embed, then ONE layer's pre/attn/post — the `Scale{num_layers}` fold
     /// multiplies it, INV-3 — then final_norm, lm_head). Takes a prepared

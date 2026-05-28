@@ -30,9 +30,9 @@ is the smallest example; the rest scale it up:
 L1 (config-level polymorphism) — a worklet never selects a backend.
 
 The `Labeled` wrapper is render-only: it tags the composite subtree (e.g.
-`"m.attn (AttnBlockTpWorklet) [tp=4; ...]"`) for the `cost_manifest.json` so an
-analyzer can find a worklet's subtree structurally, and it is dropped from the
-hot-path flat tree (INV-5).
+`"m.attn (AttnBlockTpWorklet) [tp=4; ...]"`) for the per-worker `CostManifest`
+so an analyzer can find a worklet's subtree structurally, and it is dropped from
+the hot-path flat tree (INV-5).
 
 ## `Local` vs `TP` (the group suffix)
 

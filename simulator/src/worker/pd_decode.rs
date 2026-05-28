@@ -340,7 +340,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
         }
     }
 
-    // ── build_arch_input — one group, decode-only (no prefill on a decode worker)
+    // ── build_arch_input — one decode-only ArchGroupInput per DP shard ──────────
 
     /// Refill the reused `arch_buf` in place from the current batches. `groups`
     /// stays at `batches.len()` (stable for a worker) so `resize_with` is a no-op
