@@ -196,9 +196,9 @@ multi-axis manifest (which would need fragment merging) is rejected.
 ### Worked example: every technique in one preset
 
 A `pd` (prefill/decode) sweep that exercises a dict-sweep, a list-sweep, a
-**`compound` group** (correlated `max_batch_tokens` + `batch_policy`), a `derived`
-column, a `constraint`, typed `${name}` injection across **both** pools, a
-templated `log_dir`, two different worker tags, and the launcher-only
+**`compound` group** (correlated per-pool KV-memory budgets), a `derived` column,
+a `constraint`, typed `${name}` injection across **both** pools, a templated
+`log_dir`, the PD-specific worker tags, and the launcher-only
 `analyze_subjects` key (YAML form):
 
 ```yaml
@@ -212,7 +212,7 @@ workload:
   request_rate: 12.0
 
 io:
-  log_dir: "logs/pd_{prefill_tp}_d{decode_tp}tp_r{decode_replicas}_{batch}"   # {prefill_tp}/{batch} = labels; the rest stringify their values
+  log_dir: "logs/pd_{prefill_tp}_d{decode_tp}tp_r{decode_replicas}_{kv_budget}"   # {prefill_tp}/{kv_budget} = labels; the rest stringify their values
   log_level: info
   quiet: false
   force_cache_build: false
@@ -229,10 +229,8 @@ pools:
           fp8: true
           tp_size: ${prefill_tp}
         worker:
-          type: chunked_prefill
-          attn_gpu_memory_gb: 80.0
-          max_batch_tokens: ${max_batch_tokens}   # from the `batch` compound group
-          batch_policy: ${batch_policy}            # …moves together with it
+          type: pd_prefill
+          attn_gpu_memory_gb: ${prefill_mem_gb}   # from the `kv_budget` compound group
   decode:
     placement: round-robin
     groups:
@@ -244,8 +242,8 @@ pools:
           fp8: true
           tp_size: ${decode_tp}
         worker:
-          type: barebone
-          attn_gpu_memory_gb: 80.0
+          type: pd_decode
+          attn_gpu_memory_gb: ${decode_mem_gb}    # co-varies with prefill_mem_gb
 
 sweep:
   prefill_tp:            # dict-sweep → readable labels p8 / p4
@@ -253,9 +251,9 @@ sweep:
     p4: 4
   decode_tp: [2, 4, 8]   # list-sweep → unlabeled, value used directly
 compound:
-  batch:                 # correlated knobs move together (one axis, ticks big/small)
-    big:   { max_batch_tokens: 16384, batch_policy: separate-prefill-priority }
-    small: { max_batch_tokens: 8192,  batch_policy: mix }
+  kv_budget:             # correlated knobs move together (one axis, ticks large/small)
+    large: { prefill_mem_gb: 140.0, decode_mem_gb: 140.0 }
+    small: { prefill_mem_gb: 80.0,  decode_mem_gb: 80.0 }
 derived:
   decode_replicas: "16 // decode_tp"   # decode replicas track a ~16-GPU budget (replicas * tp)
 constraints:
@@ -271,30 +269,31 @@ analyze_subjects:                      # launcher-only; popped before validation
 > makes every one of those harder to read; spell it out.
 
 This expands to **10 runs** — the 2×3×2 cartesian product (prefill_tp × decode_tp ×
-`batch`) minus the two combos `prefill_tp >= decode_tp` rejects (`prefill_tp=4,
-decode_tp=8`, for both `batch` rows):
+`kv_budget`) minus the two combos `prefill_tp >= decode_tp` rejects (`prefill_tp=4,
+decode_tp=8`, for both `kv_budget` rows):
 
-| prefill_tp | decode_tp | decode_replicas | batch | log_dir |
+| prefill_tp | decode_tp | decode_replicas | kv_budget | log_dir |
 |:----------:|:---------:|:---------------:|:-----:|------------------------------|
-|     8      |     2     |        8        | big   | `logs/pd_p8_d2tp_r8_big`     |
+|     8      |     2     |        8        | large | `logs/pd_p8_d2tp_r8_large`   |
 |     8      |     2     |        8        | small | `logs/pd_p8_d2tp_r8_small`   |
-|     8      |     4     |        4        | big   | `logs/pd_p8_d4tp_r4_big`     |
+|     8      |     4     |        4        | large | `logs/pd_p8_d4tp_r4_large`   |
 |     8      |     4     |        4        | small | `logs/pd_p8_d4tp_r4_small`   |
-|     8      |     8     |        2        | big   | `logs/pd_p8_d8tp_r2_big`     |
+|     8      |     8     |        2        | large | `logs/pd_p8_d8tp_r2_large`   |
 |     8      |     8     |        2        | small | `logs/pd_p8_d8tp_r2_small`   |
-|     4      |     2     |        8        | big   | `logs/pd_p4_d2tp_r8_big`     |
+|     4      |     2     |        8        | large | `logs/pd_p4_d2tp_r8_large`   |
 |     4      |     2     |        8        | small | `logs/pd_p4_d2tp_r8_small`   |
-|     4      |     4     |        4        | big   | `logs/pd_p4_d4tp_r4_big`     |
+|     4      |     4     |        4        | large | `logs/pd_p4_d4tp_r4_large`   |
 |     4      |     4     |        4        | small | `logs/pd_p4_d4tp_r4_small`   |
 
 `${prefill_tp}` / `${decode_tp}` land as **ints** in each pool's `arch.tp_size`;
-`${decode_replicas}` (a `derived` int) lands in `decode`'s `replicas`; the `batch`
-group's `${max_batch_tokens}` + `${batch_policy}` land together in the prefill
-worker (they co-vary, so `big`/`small` is one axis, not a 2-way cross). In
-`log_dir`, `{prefill_tp}` / `{batch}` resolve to their labels (`p8` / `big`), while
-`{decode_tp}` / `{decode_replicas}` stringify their values — note `{batch}` is
-needed to keep the two batch rows' dirs distinct. Because only `fp8` + `tp_size`
-are `affects_cache` (the `batch` params are runtime, not kernel-shaping), the
+`${decode_replicas}` (a `derived` int) lands in `decode`'s `replicas`; the
+`kv_budget` group's `${prefill_mem_gb}` + `${decode_mem_gb}` land in the two
+workers (they co-vary, so `large`/`small` is one axis, not a 2-way cross). In
+`log_dir`, `{prefill_tp}` / `{kv_budget}` resolve to their labels (`p8` / `large`),
+while `{decode_tp}` / `{decode_replicas}` stringify their values — note
+`{kv_budget}` is needed to keep the two memory-budget rows' dirs distinct.
+Because only `fp8` + `tp_size` are `affects_cache` (the memory params are runtime,
+not kernel-shaping), the
 prebuild collapses these 10 runs to just the 5 distinct (prefill-tp, decode-tp)
 cache keys (§Cache prebuild).
 
@@ -307,9 +306,10 @@ python -m launcher pd_sweep.yaml \
   --override pools.decode.groups.0.worker.attn_gpu_memory_gb=140
 ```
 
-> `pd` *execution* is not wired yet (`build` bails); schema validation, sweep
-> expansion, cache grouping, and metadata all work — this shows the config
-> interface's full expressiveness, not a runnable deployment.
+> `pd` execution is wired for the supported arch pairings (`llama3_dense_tp` →
+> `llama3_dense_tp`, and `llama3_dense_tp` → `llama3_dp_attn_tp_ffn`); this
+> example uses the first pairing. Schema validation, sweep expansion, cache
+> grouping, metadata, and the run path all share the same concrete config.
 
 ## Validation: what's accepted, what's rejected
 

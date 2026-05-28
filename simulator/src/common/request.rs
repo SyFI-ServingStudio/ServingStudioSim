@@ -1,9 +1,9 @@
 //! Single-round inference request representation + the worker-facing request
 //! store.
 //!
-//! Phase 0 carries the minimum fields the first-milestone (Llama3-8B dense /
-//! local / single-round trace) needs. Multi-round fields (`round_idx`,
-//! `preserved_prefix_kv`, ...) land alongside L7 lifecycle work.
+//! The current lifecycle is single-round and shared by unified, HP unified, and
+//! PD workers. Multi-round fields (`round_idx`, `preserved_prefix_kv`, ...) land
+//! alongside future L7 lifecycle work.
 
 use std::cell::RefCell;
 use std::ops::{Index, IndexMut};
@@ -36,7 +36,7 @@ impl Request {
 /// The full lifecycle record for one request: arrival facts (immutable),
 /// the worker's FSM working fields, and output-token bookkeeping. This is the
 /// `RequestVec` entry of L5 design.md §3.4; it lives in the shared store so a
-/// pool's workers and (later) the L7 logger all read one source of truth.
+/// pool's workers and the L7 logger all read one source of truth.
 #[derive(Clone, Debug)]
 pub struct RequestRecord {
     // ── arrival facts (immutable) ──
@@ -118,9 +118,9 @@ impl RequestRecord {
     }
 }
 
-/// Authoritative slab of all in-flight requests, keyed by id. Conceptually an
-/// L7 object (arrival frontend fills it, the logger reads it); for L5/L6 it is
-/// created by the owner and shared via [`SharedRequests`]. See plan decision 2.
+/// Authoritative slab of all arrived requests, keyed by id. Conceptually an L7
+/// object (arrival frontend fills it, the logger reads it); for L5/L6 it is
+/// created by the owner and shared via [`SharedRequests`].
 #[derive(Default, Debug)]
 pub struct RequestStore {
     /// Dense, id-indexed: `records[id.0]` is request `id`. The trace frontend
@@ -130,11 +130,10 @@ pub struct RequestStore {
     records: Vec<RequestRecord>,
     /// Highest id ever admitted to a worker (i.e. that started prefill), or
     /// `None` before the first admission. Because requests arrive id-dense in
-    /// arrival order and the milestone's single worker admits FIFO, the admitted
-    /// set is the prefix `records[0..=admitted_hi]`. Dense `request_state`
-    /// snapshots iterate only that prefix (`iter_admitted`) so the unserved
-    /// pending-queue tail — all-zero "queued" rows that contribute nothing to
-    /// the downstream snapshot-diff workload — is never logged.
+    /// arrival order. Workers may admit non-FIFO, but the high-watermark remains
+    /// monotonic: `iter_admitted` may transiently include zero-workload gaps, and
+    /// never drops a real admitted request. Dense `request_state` snapshots skip
+    /// the never-admitted pending tail.
     admitted_hi: Option<u32>,
 }
 
@@ -182,10 +181,9 @@ impl RequestStore {
     }
 
     /// Record that `id` has been admitted to a worker (started prefill),
-    /// advancing the admitted-prefix watermark. Called once at admission
-    /// (`BareboneWorker::promise`). `max` keeps the watermark monotonic even if a
-    /// future non-FIFO placement admits ids out of order (it would then only
-    /// transiently over-include a zero-workload gap row, never drop a real one).
+    /// advancing the admitted-prefix watermark. Worker admission/promise helpers
+    /// call this for barebone, HP, and PD prefill paths. `max` keeps the watermark
+    /// monotonic under non-FIFO placement.
     pub fn mark_admitted(&mut self, id: RequestId) {
         self.admitted_hi = Some(self.admitted_hi.map_or(id.0, |hi| hi.max(id.0)));
     }
@@ -210,14 +208,13 @@ impl RequestStore {
             .map(|(i, r)| (RequestId(i as u32), r))
     }
 
-    /// Every inserted request has completed (drives `--run-to-end` termination).
-    /// O(n); not on the per-tick path — the tick loop tracks its own in-flight
-    /// count from arrival / completion events.
+    /// Every inserted request has completed. O(n); not on the per-tick path —
+    /// `run_sim` tracks arrival/completion counters for termination.
     pub fn all_complete(&self) -> bool {
         self.records.iter().all(|r| r.completed)
     }
 
-    /// Count of inserted-but-not-yet-completed requests. O(n); see `all_complete`.
+    /// Count of inserted-but-not-yet-completed requests. O(n); diagnostic helper.
     pub fn in_flight(&self) -> usize {
         self.records.iter().filter(|r| !r.completed).count()
     }
@@ -236,7 +233,7 @@ impl IndexMut<RequestId> for RequestStore {
     }
 }
 
-/// Shared handle injected at construction into the flow → pool → workers. Single
-/// process / single thread, so `Rc<RefCell<>>` (not `Arc<Mutex<>>`); workers are
-/// ticked sequentially so the transient `borrow_mut()` never overlaps.
+/// Shared handle injected at construction into the flow → pool → workers. The
+/// sim thread ticks workers sequentially, so `Rc<RefCell<>>` is enough; writer
+/// threads receive row copies and do not access the store.
 pub type SharedRequests = Rc<RefCell<RequestStore>>;

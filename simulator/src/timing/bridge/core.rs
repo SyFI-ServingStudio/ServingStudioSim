@@ -51,9 +51,9 @@ impl<T> PyErrExt<T> for Result<T, pyo3::PyErr> {
 /// so one bridge serves kernels modeling different GPUs.
 #[derive(Clone, Debug)]
 pub struct PerfApiBridge {
-    /// `Some(..)` puts the bridge in dry-run mode: `Kernel::init` counts missing
+    /// `Some(..)` puts the bridge in dry-run mode: `Kernel::build` counts missing
     /// specs into this report instead of fitting caches (see `enable_dry_run`).
-    /// Interior-mutable because `init` borrows the bridge by `&` only.
+    /// Interior-mutable because `build` borrows the bridge by `&` only.
     dry_run: RefCell<Option<Vec<KernelMissing>>>,
 }
 
@@ -66,7 +66,7 @@ impl PerfApiBridge {
         Ok(bridge)
     }
 
-    /// Switch the bridge into dry-run mode: subsequent `Kernel::init` calls only
+    /// Switch the bridge into dry-run mode: subsequent `Kernel::build` calls only
     /// `count_missing` (no cache fit) and accumulate one [`KernelMissing`] per
     /// kernel. Drain the result with [`take_dry_run_report`](Self::take_dry_run_report).
     pub fn enable_dry_run(&self) {
@@ -109,7 +109,7 @@ impl PerfApiBridge {
 
     /// Re-enable JIT profiling. Used by the `--build-cache-only` entry point
     /// (L1 design.md §7.2): Rust main flips this back on *before* calling any
-    /// `*Kernel::init`, so missing specs are profiled into the DB on demand
+    /// `*Kernel::build`, so missing specs are profiled into the DB on demand
     /// instead of erroring out.
     pub fn enable_jit_profiling(&self) -> Result<(), PerfApiError> {
         self.call_perf_api_void("enable_jit_profiling")

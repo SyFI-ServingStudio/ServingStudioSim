@@ -83,7 +83,7 @@ fn expand_recursive<T>(
 }
 
 /// Upper bound on a kernel's sweep dimensionality. `Coords` is a fixed inline
-/// buffer of this width so `lookup` projects an `Input` to sweep space without
+/// buffer of this width so `Input::coords()` projects to sweep space without
 /// heap allocation. Bump this if a kernel ever needs >4 sweep axes (today the
 /// widest are 2D); `Coords::new` asserts the actual arity fits.
 pub const MAX_SWEEP_DIMS: usize = 4;
@@ -222,7 +222,7 @@ impl Axis {
     ///
     /// Profiler-side contract: every value in this curve must be a row in the
     /// corresponding Python `perf_api` table. Adding or removing points here
-    /// requires the Python profiler to resample, otherwise `Kernel::init` will
+    /// requires the Python profiler to resample, otherwise `Kernel::build` will
     /// fail with `BuildError::MissingEntry`. Build-cache-only paths can
     /// `enable_jit_profiling()` to fill missing rows on demand.
     pub fn token_axis() -> Vec<f64> {

@@ -10,8 +10,8 @@ See `../README.md` for workspace-level context (ref/, worktrees, milestones).
 ```bash
 # Rust simulator
 cargo check                      # verify scaffold compiles
-cargo run -- list-params         # CLI entry, prints stub
-cargo run -- run                 # main run path (stub)
+cargo run -- list-params         # emit deployment schema JSON
+cargo run -- run <run_config.yaml>
 
 # Python side
 uv sync                          # install default dev + profiling deps
@@ -24,10 +24,11 @@ uv run python -m profiling count-missing single_gemm --backend torch --gpu-name 
 uv run python -m profiling run single_gemm --backend torch --force --specs specs.json --db /tmp/profile.db
 ```
 
-`dev` and `profiling` are default uv groups for this repo, so use plain
-`uv run ...` for tests, lint, and profiler entry points. The execution backend
-selects `main/.venv/bin/python` but does not install missing packages at
-profile time. The initial lockfile tracks the reference CUDA 12.8-era stack
+`dev`, `profiling`, `launcher`, and `analyze` are default uv groups for this
+repo, so use plain `uv run ...` for tests, lint, profiler, launcher, and renderer
+entry points. The execution backend selects `main/.venv/bin/python` but does not
+install missing packages at profile time. The initial lockfile tracks the
+reference CUDA 12.8-era stack
 (`torch 2.10.x`, `triton 3.6.x`) until the cluster driver/runtime target is
 validated for a newer stack.
 
@@ -38,8 +39,7 @@ validated for a newer stack.
   modules.
 - `profiling/` — Python L1a runners + L1b db + exec backend.
 - `launcher/` — Python L7-α launcher.
-- `analyze/` — Python analyzer, grouped by subject
-  (worker / pool / lifecycle / profile_db / cross / common).
+- `analyzer/` — Rust `analyze` binary + Python plot renderer.
 - `model/config/`, `gpu/`, `trace/`, `tests/` — data + tests.
 - `docs/` → `../ref/next_gen_design/` (symlink; design is read-only here).
 

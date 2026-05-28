@@ -118,8 +118,8 @@ impl PreAttnLocalWorklet {
         }
     }
 
-    /// CostTree eval: fill the input_norm then qkv slots — same child order as
-    /// `compile`/`lookup`, so `cursor` tracks the minted slot indices.
+    /// CostTree eval: fill the input_norm then qkv slots in the same child order
+    /// as `compile`, so `cursor` tracks the minted slot indices.
     pub fn eval(&self, input: &PreAttnLocalWorkletInput, ev: &mut Evaluator) {
         let norm_in = RmsNormKernelInput {
             m: input.batch_tokens,

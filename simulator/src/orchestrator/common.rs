@@ -12,7 +12,8 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, RequestId, SharedRequests, WorkerId};
 use crate::worker::{IterWorker, WorkerConfig};
 
-/// Deployment-level action returned to L7 each tick. Barebone only completes.
+/// Deployment-level action returned to L7 each tick. Current flows only surface
+/// request completion to L7.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OrchAction {
     Complete { req: RequestId },

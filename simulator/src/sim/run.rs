@@ -1,6 +1,8 @@
 //! L7-β tick driver — the single deployment-independent sim loop. Drains
-//! arrivals, drives the L6 `Flow`, emits per-request parquet rows, and applies
-//! termination policy. One process, one thread, one clock.
+//! arrivals, drives the L6 `Flow`, emits request SLO rows plus aggregate
+//! request-state snapshots, and applies termination policy. One sim thread owns
+//! modeled state and clock; logger/cost writer threads sit outside that modeled
+//! loop.
 //!
 //! Deviation from L7 design §2.4: the `Flow` trait here takes `on_arrival(Request)`
 //! + `tick(now) -> Vec<OrchAction>` against a `SharedRequests` injected at

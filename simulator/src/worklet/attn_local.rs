@@ -94,7 +94,7 @@ impl AttnLocalWorklet {
     }
 
     /// CostTree eval: delegate to the attn op (its two prefill/decode slots),
-    /// mapping the worklet input to the op input — mirrors `compile`/`lookup`.
+    /// mapping the worklet input to the op input in the same order as `compile`.
     pub fn eval(&self, input: &AttnLocalWorkletInput, ev: &mut Evaluator) {
         let op_in = FlashInferAttentionInput {
             prefill_chunk_pairs: input.prefill_chunk_pairs.clone(),

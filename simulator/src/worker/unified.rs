@@ -8,7 +8,8 @@
 //!     `WorkerEvent::RequestComplete` into the caller's event sink.
 //!   - the request slab is the shared `RequestStore`, injected at construction as
 //!     `SharedRequests` and borrowed transiently inside each method (no per-tick
-//!     `&mut RequestStore` parameter). Logger is deferred to L7.
+//!     `&mut RequestStore` parameter). Request/session logging stays in L7; the
+//!     optional worker-local `CostLogger` records per-iteration cost rows.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;

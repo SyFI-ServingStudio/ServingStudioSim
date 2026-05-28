@@ -164,7 +164,7 @@ impl PostAttnLocalWorklet {
     }
 
     /// CostTree eval: fill o_proj, post_norm, up_gate, act, down slots in that
-    /// order — mirrors `compile`/`lookup` so `cursor` tracks the minted slots.
+    /// order, matching `compile` so `cursor` tracks the minted slots.
     pub fn eval(&self, input: &PostAttnLocalWorkletInput, ev: &mut Evaluator) {
         let m = input.batch_tokens;
         let gemm_in = SingleGemmKernelInput { m };

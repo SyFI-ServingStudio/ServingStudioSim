@@ -1,6 +1,7 @@
 //! Shared L5 primitives: KV resource + per-group container + the two pure
-//! policies. See L5 design.md §2. This is the barebone subset (single group,
-//! `Strict` admission, `Single` balance); reentry / chunked-prefill fields from
+//! policies. See L5 design.md §2. These helpers are shared by barebone, HP/DP,
+//! and PD workers: per-group `Batch`, `Strict` / `Tentative` admission, and
+//! `Single` / `RoundRobin` load balance. Reentry / chunked-prefill fields from
 //! §2.2 are omitted until those features land (§3.6 / §3.7).
 //!
 //! std-only on purpose — `decodes` is a `Vec<(RequestId, DecodeReqState)>` to
@@ -120,8 +121,8 @@ pub struct DecodeReqState {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Batch — per-group sticky container (§2.2). Barebone: no reentry heap, no
-// chunked-prefill queue.
+// Batch — per-group sticky container (§2.2). Current workers do not carry the
+// reentry heap or chunked-prefill queue yet.
 // ════════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Debug)]

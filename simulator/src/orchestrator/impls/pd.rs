@@ -34,8 +34,9 @@ where
     prefill_pool: SimpleDpPoolController<MP, WP>,
     decode_pool: SimpleDpPoolController<MD, WD>,
     inventory: GpuInventory,
-    /// Reused per-tick event sinks (one per pool) — workers push completions into
-    /// them during `tick_collect`, drained + cleared here each tick.
+    /// Reused per-tick event sinks (one per pool) — workers push `WorkerEvent`s
+    /// into them during `tick_collect` (`PrefillDone` on the producer side,
+    /// completions on either side), drained + cleared here each tick.
     prefill_events: Vec<WorkerEvent>,
     decode_events: Vec<WorkerEvent>,
 }

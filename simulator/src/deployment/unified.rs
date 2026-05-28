@@ -1,13 +1,13 @@
 //! `unified` deployment — one worker type runs the whole model per iteration
-//! (co-located attention + FFN). First milestone target (Llama3-8B dense, local
-//! or TP, single pool).
+//! (co-located attention + FFN), in one homogeneous `main` pool.
 //!
 //! `build` reads the structured `UnifiedConfig`: a single pool (`main`) with one
 //! homogeneous group. The arch is selected by its explicit tag (NO `tp_size`
-//! dispatch — provider-first, new-interface-design §4); `tp_size` exists only on
-//! the `llama3_dense_tp` tag. The two archs are distinct model types `M`, so each
-//! match arm monomorphizes `assemble_flow::<M>` and erases to `Box<dyn Flow>` —
-//! the single `dyn` point (the cost path is `dyn`-free, L4 §4.1).
+//! dispatch — provider-first, new-interface-design §4). Wired arms are
+//! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`, and
+//! `llama3_dp_attn_tp_ffn` + `hp_unified`; `deepseek_moe` parses but build
+//! bails. Each arm monomorphizes its concrete model/worker pair and erases to
+//! `Box<dyn Flow>` — the single `dyn` point (the cost path is `dyn`-free, L4 §4.1).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -60,9 +60,9 @@ impl Deployment for UnifiedDeployment {
             model_cfg.num_layers = n;
         }
 
-        // L5 worker env: only `attn_kv_bytes` has a sink today (the worker sizes
-        // its own KvPool). Both wired workers (barebone, hp_unified) carry the KV
-        // budget; the worker *type* is matched against the arch in the arms below.
+        // L5 worker env: `attn_kv_bytes` sizes the worker's KvPool, and
+        // `log_output_token_times` controls request_slo detail logging. The
+        // worker *type* is matched against the arch in the arms below.
         // chunked_prefill is not wired yet.
         let attn_gpu_memory_gb = match &g.worker {
             IterWorkerSel::Barebone { attn_gpu_memory_gb }

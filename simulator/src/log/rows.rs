@@ -61,7 +61,8 @@ pub struct RequestSloEntry {
     /// so E2E = `finish - arrival` survives `log_output_token_times` off.
     pub finish_decode_time_ms: Option<f32>,
     // Multi-round / session columns are deliberately NOT carried here today.
-    // Phase 0 is single-round, so `session_id`, `round_idx`, `total_rounds`,
+    // The current request lifecycle is single-round, so `session_id`,
+    // `round_idx`, `total_rounds`,
     // `tool_wait_after_ms`, `session_arrival_time_ms`, `preserved_prefix_kv`,
     // and the terminal `final_phase` were either hardcoded constants
     // (`round_idx = 0`, `total_rounds = 1`, ...) or degenerate duplicates of

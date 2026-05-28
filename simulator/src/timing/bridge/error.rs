@@ -33,7 +33,7 @@ pub enum PerfApiError {
 /// `?`-propagating a `PerfApiError` here would either lose the `&'static str`
 /// backend invariant on `MissingEntry` (Python hands back a runtime `String`)
 /// or silently bury a `MissingEntry` inside `BridgeError`, defeating the
-/// typed-error path that `Kernel::init` relies on. All bridge callsites must
+/// typed-error path that `Kernel::build` relies on. All bridge callsites must
 /// route through `BuildError::from_perf_api(kind, backend, err)` so the
 /// source-literal backend is captured at the point of the call.
 #[derive(Debug, Error)]

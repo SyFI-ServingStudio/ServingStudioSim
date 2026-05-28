@@ -210,9 +210,9 @@ impl<S: KernelSpec> Kernel<S> {
         })
     }
 
-    /// All-four-metrics best-of-N for the CostTree eval path: the `Metrics4` of
-    /// the backend with the smallest non-negative wallclock, without the
-    /// `LookupResult` name/warning machinery.
+    /// All-four-metrics best-of-N for the CostTree eval path: return the
+    /// [`LeafMetrics`] from the backend with the smallest non-negative wallclock,
+    /// preserving that backend's coverage bits.
     pub fn eval(&self, input: &S::Input) -> LeafMetrics {
         let coords = input.coords();
         match self.backend_caches.as_slice() {

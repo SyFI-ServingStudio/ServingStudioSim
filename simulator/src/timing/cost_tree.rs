@@ -1,17 +1,17 @@
-//! CostTree (milestone 1) — compile the cost-model *structure* once, separate
-//! from the per-iter numbers. See `docs/cost_tree.md` §2/§5.
+//! CostTree — compile the cost-model *structure* once, separate from the
+//! per-iter numbers. See `docs/cost_tree.md` §2/§5.
 //!
 //! The structure of a cost query (which primitives, how they compose, the
 //! homogeneous-layer repeat) is stable across iterations; only the leaf metrics
-//! vary with batch shape. So we compile the structure once into a `CostTree` and
-//! (later milestones) stream per-iter `Metrics4` into a flat `buf[slot]`.
+//! vary with batch shape. So we compile the structure once into a `CostTree`,
+//! stream per-iter [`LeafMetrics`] into a flat `buf[slot]`, and aggregate the
+//! flat nodes with a caller-owned scratch buffer. The same slot order backs the
+//! per-worker `CostManifest` sidecar and the `slot_input` cost-log column.
 //!
-//! This milestone builds the structure and prints it — no per-iter eval, no
-//! clock wiring, no logging. The structure is assembled as a recursive
-//! [`CostNode`] tree (each layer's hand-written `compile` mirrors its `lookup`),
-//! then lowered by [`CostTree::flatten`] to the doc's flat [`FlatCostNode`] array
-//! with contiguous child ranges (the form the future zero-alloc aggregate walk
-//! consumes).
+//! The structure is assembled as a recursive [`CostNode`] tree, then lowered by
+//! [`CostTree::flatten`] to the doc's flat [`FlatCostNode`] array with contiguous
+//! child ranges. [`CostTree::aggregate`] consumes that flat form in one reverse
+//! pass with no allocation when the caller reuses `scratch`.
 //!
 //! Names live only here (compile time / the slot list), never on the hot path or
 //! in log rows (INV-5). `Max`/`Scale` are defined for the full algebra even
@@ -31,7 +31,7 @@ use crate::timing::LeafMetrics;
 #[derive(Clone, Debug, PartialEq)]
 pub enum CostNode {
     /// A materialized leaf = one L1 primitive; the `usize` indexes
-    /// [`CostTree::slots`] (and, later, the per-iter `Metrics4` buffer).
+    /// [`CostTree::slots`] and the per-iter [`LeafMetrics`] buffer.
     Leaf(usize),
     /// `Σ children` (serial composition; time/flops/bytes all sum).
     Sum(Vec<CostNode>),
@@ -54,7 +54,7 @@ pub enum CostNode {
 /// Flat, topologically-laid-out form (the lowered product of [`CostTree::flatten`]).
 /// Each composite references its *direct* children by a contiguous range into the
 /// same `Vec<FlatCostNode>`; a parent's index always precedes its children's, so
-/// the future aggregate is a single bottom-up (reverse) pass with no recursion or
+/// aggregate is a single bottom-up (reverse) pass with no recursion or
 /// allocation. Mirrors `docs/cost_tree.md` §4.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FlatCostNode {

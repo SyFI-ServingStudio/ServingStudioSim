@@ -2,8 +2,9 @@
 //! workers they pick (new-interface-design §2).
 //!
 //! Each selector is a serde tagged enum (`#[serde(tag = "type")]`), the symmetric
-//! sibling of the arch selector. Only the iter-wise `barebone` worker is wired to
-//! `build()` today; the others parse + are advertised but `build()` bails.
+//! sibling of the arch selector. `barebone` / `hp_unified` are wired for
+//! `unified`; `pd_prefill` / `pd_decode` are wired for `pd`; `chunked_prefill`
+//! and the AFD selectors parse + are advertised but their deployments bail.
 //!
 //! `#[derive(ProviderSchema)]` emits each selector's `SCHEMA` of `(tag, params)`
 //! rows for the launcher; `schema::dump::list_params` aggregates them.
