@@ -12,7 +12,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, get_type_hints
+from typing import TYPE_CHECKING, Any, get_args, get_origin, get_type_hints
 
 from profiling.db.args import DType, KernelArgs
 from profiling.db.kind import KernelKind
@@ -271,4 +271,13 @@ def _coerce_value(annotation: Any, value: Any) -> Any:
         return float(value)
     if annotation is str:
         return str(value)
+    origin = get_origin(annotation)
+    if origin in (tuple, list):
+        # Distribution-sensitive args (e.g. grouped_gemm per_group_batches) arrive
+        # from the Rust facade / DB as a JSON list. Coerce to the declared origin
+        # (tuple keeps the frozen KernelArgs hashable) and coerce each element.
+        elem_types = [arg for arg in get_args(annotation) if arg is not Ellipsis]
+        elem_type = elem_types[0] if elem_types else None
+        items = [_coerce_value(elem_type, item) for item in value] if elem_type else list(value)
+        return tuple(items) if origin is tuple else items
     return value

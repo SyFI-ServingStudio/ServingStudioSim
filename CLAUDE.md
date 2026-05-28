@@ -5,6 +5,12 @@ Discrete-event simulator for ML serving/training workloads. Rust core
 
 ## Environment (read first)
 
+- **Initialize the env with `just sync`** (install `just` via `cargo install just`).
+  This is the canonical bootstrap: it runs `uv sync` with `DG_USE_LOCAL_VERSION=0`
+  exported (set in the `justfile`), which the pinned `deep_gemm` git dependency
+  needs to build JIT-only and skip its git-clean version assert. A bare `uv sync`
+  on a **cold** cache fails to build `deep_gemm` without that var; once built, uv
+  caches the wheel by commit so later plain `uv sync`/`uv run` are fine.
 - **Always run under `uv`** (`uv run cargo …`, `uv run python …`, `uv run pytest`).
   It pins the 3.12 venv; a bare `python`/`cargo` links the system 3.9 and crashes
   PyO3 init. The Rust test binary also needs libpython on `LD_LIBRARY_PATH`

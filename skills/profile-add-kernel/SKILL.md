@@ -130,6 +130,10 @@ Phase B — Python profiling side
        passes before/independent of the barrel): args field-set+coercion, KIND
        wire string, register-spec shape (table_name==kernel_kind), lazy-import
        (runner module absent from sys.modules after importing the kernel module).
+[ ] B5 ONLY if an Args field is a tuple/list (distribution-sensitive op, §4): add
+       the tuple/list branch to db/batch.py::_coerce_value so the inbound JSON
+       list coerces to the declared origin (tuple → frozen args stay hashable).
+       DB storage already handles it (db/table.py); scalar-only kernels skip this.
 
 Phase C — Rust timing side
 [ ] C1 Create simulator/src/timing/kernels/<kind>.rs: <Name>KernelConfig
@@ -143,6 +147,13 @@ Phase C — Rust timing side
 [ ] C4 Add #[cfg(test)] tests in <kind>.rs mirroring single_gemm.rs (config
        identity, describe_config, input coords flatten, enumerate emits all wire
        fields; for 2D also assert sweep_grid len==2 and cache_kind).
+[ ] C5 Register the kernel's Input in the closed cost-log SlotInput enum in
+       simulator/src/timing/slot_input.rs: add the `use` import for
+       <Name>KernelInput and one `log_inputs!` line (`<Variant> =>
+       <Name>KernelInput`). MANDATORY for every kernel — Op::eval's
+       `K::Input: Into<SlotInput>` bound makes a missing entry a compile error the
+       moment the kernel is composed into an Op<K>; add it up front (harmless: the
+       Input already derives Clone + Serialize).
 
 Phase D — Validate + report
 [ ] D1 ruff: uv run ruff check profiling/ tests/   (clean)
@@ -210,6 +221,42 @@ per Args field (snake_case keys matching the Python dataclass).
 - Reuse existing `Timer` methods, `Energy`, metric dataclasses, default env, and
   built `CacheKind` variants. Adding a new metric family / Timer method / cache
   variant / launcher / subprocess env is a **stop and ask** (section 6).
+
+### The only wiring beyond the per-kernel files
+
+The Rust side has NO central kind registry to edit: `register_kernel!` makes each
+kernel self-register via `inventory`, and `introspect::lookup` iterates that set
+at link time. So the **only** Rust wiring for the L1 kernel itself is the
+`kernels/mod.rs` `pub mod` + `pub use` (step C3). There is intentionally no
+exhaustive "all kinds" list, match, or guard test to update — do not add or
+recreate one (a redundant `introspect::registry_covers_every_kernel_kind` test
+that hardcoded the kind set was removed 2026-05 precisely because it taxed every
+new kernel for zero coverage the per-kernel tests + the build don't already give).
+
+The one Rust file beyond the per-kernel pair that you DO always touch is the
+cost-log `SlotInput` enum in `timing/slot_input.rs` (mandatory step C5). It is a
+deliberately *closed* enum (inline capture, no per-slot box), and `Op::eval`'s
+`K::Input: Into<SlotInput>` bound turns a missing entry into a **compile error**
+the moment the kernel is composed into an `Op<K>`. Add one `log_inputs!` line
+(`<Variant> => <Name>KernelInput`) + the matching `use` import up front for every
+new kernel — it is harmless (the Input already derives `Clone + Serialize`) and
+saves a surprise compile error during later L2/L3/L4 wiring.
+
+### Vector / tuple-valued args field (distribution-sensitive ops)
+
+Most kernels' Args are scalars. A distribution-sensitive op (e.g. `grouped_gemm`'s
+`per_group_batches: tuple[int, ...]`, where the Rust `enumerate` emits a JSON
+array via `RoutingDistribution::to_per_expert_counts`) needs one extra touch the
+scalar path doesn't:
+- DB storage already works: a `tuple[...]` / `list[...]` args field maps to a JSON
+  `TEXT` column (`db/table.py::_sqlite_type` → `_to_db_value` json-dumps it), and
+  it participates in the UNIQUE key like any scalar — no schema change.
+- But `db/batch.py::_coerce_value` MUST handle the `tuple`/`list` origin so the
+  inbound JSON list from the Rust facade is rebuilt into the declared origin
+  (coerce to a **tuple** so the frozen `KernelArgs` stays hashable, and coerce
+  each element by the inner type). Add that branch if it is missing.
+- Rust: `ArgsPayload::with(key, vec)` already accepts a `Vec<u32>` (→ `Value::Array`),
+  and `#[derive(KernelConfig)]` accepts a `Vec<_>` identity field (e.g. `local_ppm`).
 
 ---
 

@@ -86,9 +86,21 @@ pub async fn run(
     }
     require_columns(ctx, "cost_log", COLUMNS).await?;
 
+    // Cast `pool_tag` to VARCHAR in the projection: parquet RLE_DICTIONARY-encodes
+    // low-cardinality string columns (pool_tag is just "prefill" / "decode"
+    // repeated millions of times), and DataFusion preserves that encoding,
+    // surfacing the column as a `DictionaryArray`. `value_string` downcasts to
+    // `StringArray`, which fails on dictionaries — flattening at projection
+    // sidesteps the per-column dictionary dispatch.
+    let other_cols = COLUMNS
+        .iter()
+        .filter(|c| **c != "pool_tag")
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
-        "SELECT {} FROM cost_log ORDER BY pool_tag, worker_id, wall_start_ms",
-        COLUMNS.join(", ")
+        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, {other_cols} \
+         FROM cost_log ORDER BY pool_tag, worker_id, wall_start_ms"
     );
     let batches = collect(ctx, &sql).await?;
 
