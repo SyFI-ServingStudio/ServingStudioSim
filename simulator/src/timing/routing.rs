@@ -3,6 +3,27 @@ pub struct RoutingDistribution {
     ppm: Vec<u32>,
 }
 
+/// Split `ep_size` ranks into contiguous NVL domains of at most `nvl_num_gpu`
+/// ranks each (the last domain may be smaller). `nvl_num_gpu == 0` or
+/// `>= ep_size` collapses to a single domain. Mirrors ref `ranks_per_nvl_domain`
+/// so the L2 NVL layout and the per-token router agree on domain boundaries.
+pub fn ranks_per_nvl_domain(ep_size: u32, nvl_num_gpu: u32) -> Vec<u32> {
+    if ep_size == 0 {
+        return Vec::new();
+    }
+    if nvl_num_gpu == 0 || nvl_num_gpu >= ep_size {
+        return vec![ep_size];
+    }
+    let mut remaining = ep_size;
+    let mut counts = Vec::new();
+    while remaining > 0 {
+        let count = remaining.min(nvl_num_gpu);
+        counts.push(count);
+        remaining -= count;
+    }
+    counts
+}
+
 impl RoutingDistribution {
     pub const TOTAL_PPM: u32 = 1_000_000;
 
@@ -124,9 +145,120 @@ impl RoutingDistribution {
     }
 }
 
+/// Balanced contiguous split of `num_experts` across `buckets` ranks: the first
+/// `num_experts % buckets` ranks get `⌈E/buckets⌉`, the rest `⌊E/buckets⌋`.
+/// Mirrors ref `balanced_counts`.
+pub fn balanced_expert_counts(num_experts: u32, buckets: u32) -> Vec<u32> {
+    if buckets == 0 {
+        return Vec::new();
+    }
+    let base = num_experts / buckets;
+    let rem = num_experts % buckets;
+    (0..buckets).map(|idx| base + u32::from(idx < rem)).collect()
+}
+
+/// Deterministic splitmix64 — the RNG for build-time Monte-Carlo routing. No
+/// transcendental ops, fixed iteration order ⇒ bit-identical across
+/// runs/machines, so the simulator stays reproducible.
+pub(crate) struct RoutingRng(u64);
+
+impl RoutingRng {
+    pub(crate) fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+    }
+}
+
+/// Drive weighted-WITHOUT-replacement top_k routing for `n_tokens` tokens and
+/// invoke `on_token` once per token with that token's realized hit state:
+/// `hit_rank[r]` / `hit_dom[d]` are the per-rank / per-domain DISTINCT-hit masks
+/// (deduped — a token hitting a rank's experts twice still flags it once).
+/// Experts map to ranks via [`balanced_expert_counts`], ranks to domains via
+/// [`ranks_per_nvl_domain`].
+///
+/// This is the single source of the per-token routing law: the MoE comm
+/// simulator (`op::moe::sim`) consumes each token's hit set to price all six
+/// dispatch/combine stages' per-GPU bytes, so the sampling stays bit-identical
+/// (splitmix64 + fixed iteration order, only +/*/< on f64).
+pub(crate) fn for_each_routed_token(
+    ppm: &[u32],
+    top_k: u32,
+    ep_size: u32,
+    nvl_num_gpu: u32,
+    n_tokens: u32,
+    rng: &mut RoutingRng,
+    mut on_token: impl FnMut(&[bool], &[bool]),
+) {
+    let e = ppm.len();
+    let counts = balanced_expert_counts(e as u32, ep_size);
+    let mut expert_rank = vec![0usize; e];
+    let mut idx = 0usize;
+    for (rank, &c) in counts.iter().enumerate() {
+        for _ in 0..c {
+            expert_rank[idx] = rank;
+            idx += 1;
+        }
+    }
+    let ranks_per_domain = ranks_per_nvl_domain(ep_size, nvl_num_gpu);
+    let mut rank_domain = vec![0usize; ep_size as usize];
+    let mut rr = 0usize;
+    for (d, &dr) in ranks_per_domain.iter().enumerate() {
+        for _ in 0..dr {
+            rank_domain[rr] = d;
+            rr += 1;
+        }
+    }
+    let base_w: Vec<f64> = ppm.iter().map(|&p| f64::from(p)).collect();
+    let k = top_k.min(e as u32);
+    let mut w = base_w.clone();
+    let mut hit_rank = vec![false; ep_size as usize];
+    let mut hit_dom = vec![false; ranks_per_domain.len()];
+    for _ in 0..n_tokens {
+        w.clone_from(&base_w); // reuse allocation across tokens
+        hit_rank.iter_mut().for_each(|h| *h = false);
+        hit_dom.iter_mut().for_each(|h| *h = false);
+        let mut total: f64 = w.iter().sum();
+        for _ in 0..k {
+            if total <= 0.0 {
+                break;
+            }
+            let u = rng.next_f64() * total;
+            let mut acc = 0.0;
+            let mut chosen = e - 1;
+            for (i, &wi) in w.iter().enumerate() {
+                acc += wi;
+                if u < acc {
+                    chosen = i;
+                    break;
+                }
+            }
+            let rank = expert_rank[chosen];
+            hit_rank[rank] = true;
+            hit_dom[rank_domain[rank]] = true;
+            total -= w[chosen];
+            w[chosen] = 0.0;
+        }
+        on_token(&hit_rank, &hit_dom);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::timing::routing::RoutingDistribution;
+    use crate::timing::routing::{
+        balanced_expert_counts, for_each_routed_token, ranks_per_nvl_domain, RoutingDistribution,
+        RoutingRng,
+    };
 
     #[test]
     fn routing_distribution_normalizes_and_allocates_counts() {
@@ -173,5 +305,67 @@ mod tests {
         let shard = &dist.ppm()[1..3]; // 300k + 200k = 500k
         let counts = RoutingDistribution::to_per_expert_counts(7, shard);
         assert_eq!(counts.iter().sum::<u32>(), 4);
+    }
+
+    #[test]
+    fn ranks_per_nvl_domain_chunks_and_collapses() {
+        assert_eq!(ranks_per_nvl_domain(8, 4), vec![4, 4]);
+        assert_eq!(ranks_per_nvl_domain(10, 4), vec![4, 4, 2]); // ragged last
+        assert_eq!(ranks_per_nvl_domain(8, 0), vec![8]); // 0 → single domain
+        assert_eq!(ranks_per_nvl_domain(8, 16), vec![8]); // nvl ≥ ep → single
+        assert_eq!(ranks_per_nvl_domain(0, 4), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn balanced_expert_counts_splits_remainder_to_front() {
+        assert_eq!(balanced_expert_counts(8, 4), vec![2, 2, 2, 2]);
+        assert_eq!(balanced_expert_counts(10, 4), vec![3, 3, 2, 2]); // rem=2 → front
+        assert_eq!(balanced_expert_counts(3, 4), vec![1, 1, 1, 0]);
+        assert!(balanced_expert_counts(8, 0).is_empty());
+    }
+
+    /// `for_each_routed_token` is the bit-identical routing core every comm
+    /// stage prices against. Two runs with the same seed must produce the same
+    /// per-token hit sets, and each token must flag exactly its distinct hit
+    /// ranks/domains (≤ top_k ranks, each in its domain).
+    #[test]
+    fn for_each_routed_token_is_deterministic_and_consistent() {
+        let dist = RoutingDistribution::power_law(64, 1.0);
+        let (top_k, ep, nvl, n) = (4u32, 16u32, 8u32, 200u32);
+        let n_domains = ranks_per_nvl_domain(ep, nvl).len();
+
+        let collect = || {
+            let mut rng = RoutingRng::new(0xD1CE_5EED);
+            let mut log: Vec<(Vec<bool>, Vec<bool>)> = Vec::new();
+            for_each_routed_token(dist.ppm(), top_k, ep, nvl, n, &mut rng, |hr, hd| {
+                log.push((hr.to_vec(), hd.to_vec()));
+            });
+            log
+        };
+        let run_a = collect();
+        let run_b = collect();
+        assert_eq!(run_a, run_b, "same seed must replay identical hit sets");
+
+        for (hit_rank, hit_dom) in &run_a {
+            assert_eq!(hit_rank.len(), ep as usize);
+            assert_eq!(hit_dom.len(), n_domains);
+            let n_hit_ranks = hit_rank.iter().filter(|&&h| h).count();
+            assert!(n_hit_ranks >= 1 && n_hit_ranks <= top_k as usize);
+            // Every flagged rank's domain must also be flagged; no spurious domains.
+            let ranks_per_dom = ranks_per_nvl_domain(ep, nvl);
+            let mut dom_of = vec![0usize; ep as usize];
+            let mut r = 0usize;
+            for (d, &dr) in ranks_per_dom.iter().enumerate() {
+                for _ in 0..dr {
+                    dom_of[r] = d;
+                    r += 1;
+                }
+            }
+            for (rank, &hit) in hit_rank.iter().enumerate() {
+                if hit {
+                    assert!(hit_dom[dom_of[rank]], "hit rank's domain must be flagged");
+                }
+            }
+        }
     }
 }
