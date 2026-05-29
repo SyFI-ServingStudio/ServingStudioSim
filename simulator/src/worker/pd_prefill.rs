@@ -470,60 +470,15 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdPrefillWorker<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{PoolId, Request, RequestStore};
-    use crate::timing::cache::interp::{CoverageFlags, Metrics4};
-    use crate::worker::gpu_cluster::{CostSource, GpuCluster, SharedGpuCluster};
-    use std::cell::RefCell;
+    use crate::common::PoolId;
+    use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use std::rc::Rc;
-
-    fn test_cluster() -> SharedGpuCluster {
-        Rc::new(RefCell::new(GpuCluster::new(CostSource::analytic(1.0))))
-    }
-
-    struct FakeModel {
-        ms: f64,
-    }
-    impl IterwiseUnifiedModel for FakeModel {
-        fn eval_iter(
-            &self,
-            _b: &UnifiedArchInput,
-            slots: &mut Vec<LeafMetrics>,
-            _scratch: &mut Vec<LeafMetrics>,
-        ) -> LeafMetrics {
-            slots.clear();
-            LeafMetrics {
-                m: Metrics4 {
-                    time_ms: self.ms as f32,
-                    flops: 0.0,
-                    bytes: 0.0,
-                    energy_j: 0.0,
-                },
-                coverage: CoverageFlags::EMPTY,
-            }
-        }
-        fn total_kv_bytes_per_token(&self) -> u64 {
-            1
-        }
-        fn gpus_per_replica(&self) -> u16 {
-            1
-        }
-    }
-
-    fn shared_with(reqs: &[(u32, u32, u32)]) -> SharedRequests {
-        let store = Rc::new(RefCell::new(RequestStore::new()));
-        for &(id, prompt, decode) in reqs {
-            store
-                .borrow_mut()
-                .insert(&Request::new(RequestId(id), prompt, decode, Time::ZERO));
-        }
-        store
-    }
 
     fn worker(store: SharedRequests) -> PdPrefillWorker<FakeModel> {
         PdPrefillWorker::new(
             WorkerId(0),
             "prefill",
-            Arc::new(FakeModel { ms: 1.0 }),
+            Arc::new(FakeModel::for_ms(1.0)),
             store,
             WorkerConfig::default(),
             None,

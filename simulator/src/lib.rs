@@ -15,3 +15,8 @@ pub mod sim;
 pub mod timing;
 pub mod worker;
 pub mod worklet;
+
+/// Shared helpers for unit-test modules across the crate (FakeModel,
+/// `test_cluster`, request-store builders). Test-only; not exported.
+#[cfg(test)]
+mod test_helpers;

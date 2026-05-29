@@ -433,49 +433,18 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
     use crate::common::{PoolId, RequestStore};
     use crate::orchestrator::{
         DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
     };
     use crate::sim::frontend::TraceFrontend;
-    use crate::timing::cache::interp::{CoverageFlags, Metrics4};
-    use crate::timing::LeafMetrics;
+    use crate::test_helpers::FakeModel;
     use crate::worker::{BareboneWorker, WorkerConfig};
     use std::cell::RefCell;
     use std::io::Write;
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::Arc;
-
-    struct FakeModel {
-        ms: f64,
-    }
-    impl IterwiseUnifiedModel for FakeModel {
-        fn eval_iter(
-            &self,
-            _b: &UnifiedArchInput,
-            slots: &mut Vec<LeafMetrics>,
-            _scratch: &mut Vec<LeafMetrics>,
-        ) -> LeafMetrics {
-            slots.clear();
-            LeafMetrics {
-                m: Metrics4 {
-                    time_ms: self.ms as f32,
-                    flops: 0.0,
-                    bytes: 0.0,
-                    energy_j: 0.0,
-                },
-                coverage: CoverageFlags::EMPTY,
-            }
-        }
-        fn total_kv_bytes_per_token(&self) -> u64 {
-            1
-        }
-        fn gpus_per_replica(&self) -> u16 {
-            1
-        }
-    }
 
     fn write_trace(dir: &std::path::Path, n: u32) -> PathBuf {
         let path = dir.join("trace.csv");
@@ -502,7 +471,7 @@ mod tests {
 
         let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
         let factory = UnifiedWorkerFactory::new(
-            Arc::new(FakeModel { ms: 1.0 }),
+            Arc::new(FakeModel::for_ms(1.0)),
             Rc::clone(&store),
             // This test asserts the per-token array length, so opt into it.
             WorkerConfig {

@@ -650,68 +650,10 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{PoolId, Request, RequestStore};
-    use crate::timing::cache::interp::{CoverageFlags, Metrics4};
-    use crate::worker::gpu_cluster::{CostSource, GpuCluster, SharedGpuCluster};
-    use std::cell::RefCell;
+    use crate::common::PoolId;
+    use crate::test_helpers::{prefilled_store, test_cluster, FakeModel};
+    use crate::worker::gpu_cluster::SharedGpuCluster;
     use std::rc::Rc;
-
-    fn test_cluster() -> SharedGpuCluster {
-        Rc::new(RefCell::new(GpuCluster::new(CostSource::analytic(1.0))))
-    }
-
-    struct FakeModel {
-        ms: f64,
-        dp_groups: u16,
-    }
-    impl IterwiseUnifiedModel for FakeModel {
-        fn eval_iter(
-            &self,
-            b: &UnifiedArchInput,
-            slots: &mut Vec<LeafMetrics>,
-            _scratch: &mut Vec<LeafMetrics>,
-        ) -> LeafMetrics {
-            slots.clear();
-            // The worker must feed exactly one decode group per DP shard.
-            assert_eq!(b.groups.len(), self.dp_groups as usize);
-            LeafMetrics {
-                m: Metrics4 {
-                    time_ms: self.ms as f32,
-                    flops: 0.0,
-                    bytes: 0.0,
-                    energy_j: 0.0,
-                },
-                coverage: CoverageFlags::EMPTY,
-            }
-        }
-        fn total_kv_bytes_per_token(&self) -> u64 {
-            1
-        }
-        fn gpus_per_replica(&self) -> u16 {
-            self.dp_groups
-        }
-        fn num_attn_dp_groups(&self) -> u16 {
-            self.dp_groups
-        }
-    }
-
-    /// A request whose prefill is "already done": prompt set, first token emitted.
-    fn prefilled_store(reqs: &[(u32, u32, u32)]) -> SharedRequests {
-        let store = Rc::new(RefCell::new(RequestStore::new()));
-        for &(id, prompt, decode) in reqs {
-            let r = Request::new(RequestId(id), prompt, decode, Time::ZERO);
-            store.borrow_mut().insert(&r);
-            // Mimic the prefill pool's handoff state on the store record: prefill
-            // processed, first token already emitted.
-            let mut s = store.borrow_mut();
-            let rec = &mut s[RequestId(id)];
-            rec.prefill_processed = prompt;
-            rec.tokens_emitted = 1;
-            rec.first_token_time = Some(Time::ZERO);
-            rec.last_token_time = Some(Time::ZERO);
-        }
-        store
-    }
 
     fn worker(store: SharedRequests) -> PdDecodeWorker<FakeModel> {
         worker_dp(store, 1)

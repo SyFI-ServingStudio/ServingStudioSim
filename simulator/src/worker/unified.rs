@@ -481,59 +481,8 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 mod tests {
     use super::*;
     use crate::common::time::Time;
-    use crate::common::{Request, RequestStore};
-    use crate::timing::cache::interp::{CoverageFlags, Metrics4};
-    use crate::timing::LeafMetrics;
-    use crate::worker::gpu_cluster::{CostSource, GpuCluster, SharedGpuCluster};
-    use std::cell::RefCell;
+    use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use std::rc::Rc;
-
-    /// Test cluster: empty, with an unused analytic cost (barebone never
-    /// transfers, but `new` still calls `allocate` on it).
-    fn test_cluster() -> SharedGpuCluster {
-        Rc::new(RefCell::new(GpuCluster::new(CostSource::analytic(1.0))))
-    }
-
-    /// Fixed-cost stand-in for an L4 model — drives the FSM without Python/bridge.
-    struct FakeModel {
-        ms: f64,
-    }
-    impl IterwiseUnifiedModel for FakeModel {
-        fn eval_iter(
-            &self,
-            _batch: &UnifiedArchInput,
-            slots: &mut Vec<LeafMetrics>,
-            _scratch: &mut Vec<LeafMetrics>,
-        ) -> LeafMetrics {
-            slots.clear();
-            LeafMetrics {
-                m: Metrics4 {
-                    time_ms: self.ms as f32,
-                    flops: 0.0,
-                    bytes: 0.0,
-                    energy_j: 0.0,
-                },
-                coverage: CoverageFlags::EMPTY,
-            }
-        }
-        // 1 byte/token → KvPool capacity == config.attn_kv_bytes (easy to size).
-        fn total_kv_bytes_per_token(&self) -> u64 {
-            1
-        }
-        fn gpus_per_replica(&self) -> u16 {
-            1
-        }
-    }
-
-    fn shared_with(reqs: &[(u32, u32, u32)]) -> crate::common::SharedRequests {
-        let store = Rc::new(RefCell::new(RequestStore::new()));
-        for &(id, prompt, decode) in reqs {
-            store
-                .borrow_mut()
-                .insert(&Request::new(RequestId(id), prompt, decode, Time::ZERO));
-        }
-        store
-    }
 
     /// Drive ticks at coarse 1ms steps until no work remains or a step cap hits.
     fn run_to_quiescence<M: IterwiseUnifiedModel>(
@@ -550,7 +499,7 @@ mod tests {
     #[test]
     fn single_request_prefill_then_decode_completes() {
         let store = shared_with(&[(0, 16, 3)]); // prompt 16, 3 decode tokens
-        let model = Arc::new(FakeModel { ms: 1.0 });
+        let model = Arc::new(FakeModel::for_ms(1.0));
         let mut w = BareboneWorker::new(
             WorkerId(0),
             "main",
@@ -582,7 +531,7 @@ mod tests {
     #[test]
     fn three_requests_all_complete() {
         let store = shared_with(&[(0, 8, 2), (1, 8, 2), (2, 8, 2)]);
-        let model = Arc::new(FakeModel { ms: 1.0 });
+        let model = Arc::new(FakeModel::for_ms(1.0));
         let mut w = BareboneWorker::new(
             WorkerId(0),
             "main",

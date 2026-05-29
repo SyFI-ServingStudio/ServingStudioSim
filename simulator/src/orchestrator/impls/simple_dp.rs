@@ -248,43 +248,12 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> Flow for SimpleDpFlow<M, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::contract::UnifiedArchInput;
     use crate::common::RequestStore;
-    use crate::timing::cache::interp::{CoverageFlags, Metrics4};
-    use crate::timing::LeafMetrics;
+    use crate::test_helpers::FakeModel;
     use crate::worker::{BareboneWorker, WorkerConfig};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
-
-    struct FakeModel {
-        ms: f64,
-    }
-    impl IterwiseUnifiedModel for FakeModel {
-        fn eval_iter(
-            &self,
-            _b: &UnifiedArchInput,
-            slots: &mut Vec<LeafMetrics>,
-            _scratch: &mut Vec<LeafMetrics>,
-        ) -> LeafMetrics {
-            slots.clear();
-            LeafMetrics {
-                m: Metrics4 {
-                    time_ms: self.ms as f32,
-                    flops: 0.0,
-                    bytes: 0.0,
-                    energy_j: 0.0,
-                },
-                coverage: CoverageFlags::EMPTY,
-            }
-        }
-        fn total_kv_bytes_per_token(&self) -> u64 {
-            1
-        }
-        fn gpus_per_replica(&self) -> u16 {
-            1
-        }
-    }
 
     fn build_flow(
         num_workers: u16,
@@ -292,7 +261,7 @@ mod tests {
     ) -> (SimpleDpFlow<FakeModel, BareboneWorker<FakeModel>>, SharedRequests) {
         let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
         let factory = UnifiedWorkerFactory::new(
-            Arc::new(FakeModel { ms: 1.0 }),
+            Arc::new(FakeModel::for_ms(1.0)),
             Rc::clone(&store),
             WorkerConfig::default(),
             None,

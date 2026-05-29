@@ -489,67 +489,15 @@ impl<M: IterwiseUnifiedModel> IterWorker for HpUnifiedWorker<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{PoolId, Request, RequestStore};
-    use crate::timing::cache::interp::{CoverageFlags, Metrics4};
-    use crate::worker::gpu_cluster::{CostSource, GpuCluster, SharedGpuCluster};
-    use std::cell::RefCell;
+    use crate::common::PoolId;
+    use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use std::rc::Rc;
 
-    fn test_cluster() -> SharedGpuCluster {
-        Rc::new(RefCell::new(GpuCluster::new(CostSource::analytic(1.0))))
-    }
-
-    /// Fixed-cost stand-in for an L4 model with a configurable DP-group count.
-    struct FakeDpModel {
-        ms: f64,
-        dp_groups: u16,
-    }
-    impl IterwiseUnifiedModel for FakeDpModel {
-        fn eval_iter(
-            &self,
-            batch: &UnifiedArchInput,
-            slots: &mut Vec<LeafMetrics>,
-            _scratch: &mut Vec<LeafMetrics>,
-        ) -> LeafMetrics {
-            slots.clear();
-            // Assert the worker fed us exactly one group per DP shard.
-            assert_eq!(batch.groups.len(), self.dp_groups as usize);
-            LeafMetrics {
-                m: Metrics4 {
-                    time_ms: self.ms as f32,
-                    flops: 0.0,
-                    bytes: 0.0,
-                    energy_j: 0.0,
-                },
-                coverage: CoverageFlags::EMPTY,
-            }
-        }
-        fn total_kv_bytes_per_token(&self) -> u64 {
-            1
-        }
-        fn gpus_per_replica(&self) -> u16 {
-            self.dp_groups // not under test here
-        }
-        fn num_attn_dp_groups(&self) -> u16 {
-            self.dp_groups
-        }
-    }
-
-    fn shared_with(reqs: &[(u32, u32, u32)]) -> SharedRequests {
-        let store = Rc::new(RefCell::new(RequestStore::new()));
-        for &(id, prompt, decode) in reqs {
-            store
-                .borrow_mut()
-                .insert(&Request::new(RequestId(id), prompt, decode, Time::ZERO));
-        }
-        store
-    }
-
-    fn worker(store: SharedRequests, dp_groups: u16) -> HpUnifiedWorker<FakeDpModel> {
+    fn worker(store: SharedRequests, dp_groups: u16) -> HpUnifiedWorker<FakeModel> {
         HpUnifiedWorker::new(
             WorkerId(0),
             "main",
-            Arc::new(FakeDpModel { ms: 1.0, dp_groups }),
+            Arc::new(FakeModel { ms: 1.0, dp_groups }),
             store,
             WorkerConfig::default(),
             None,
