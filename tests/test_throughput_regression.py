@@ -62,8 +62,9 @@ pools:
       - gpu: "NVIDIA H200"
         replicas: 1
         arch:
-          type: llama3_dense
+          type: llama3_dense_tp
           model_config: model/config/llama3_8b.json
+          tp_size: 1
         worker:
           type: barebone
 """
