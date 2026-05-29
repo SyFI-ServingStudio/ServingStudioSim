@@ -2,10 +2,10 @@
 //! workers: a prefill pool (whose workers only prefill, then hand off) and a
 //! decode pool (whose workers pull the handed-off KV, then decode). L6b routes
 //! the handoff: a prefill worker emits `PrefillDone` carrying its KV layout
-//! (`SendSpec`); this flow forwards that to a placement-chosen decode worker as a
-//! `WorkerMsg::Handoff`, which the decode worker assembles into a full
-//! `TransferPlan` by combining the sender side with its own pre-resolved
-//! destination block (L6 design.md §「PD handoff」).
+//! (`send_gid`, `kv_tokens`); this flow forwards that to a placement-chosen
+//! decode worker as a `WorkerMsg::Handoff`, which the decode worker assembles
+//! into a full `TransferPlan` by combining the sender side with its own pre-
+//! resolved destination block (L6 design.md §「PD handoff」).
 //!
 //! Workers own their own GPU id ranges (self-allocated from the shared cluster
 //! at construction), so there is no flow-side endpoint lookup table — `tick`
@@ -116,21 +116,21 @@ where
         prefill_events.clear();
         self.prefill_pool.tick_collect(now, &mut prefill_events);
         let prefill_pool = self.prefill_pool.pool();
-        // Forward each PrefillDone directly: the sender block (`src_base`,
-        // `src_count`) travels straight from `SendSpec` into `WorkerMsg::Handoff`;
-        // the destination block is the decode worker's own and gets filled in
-        // on receipt. No flow-side endpoint table, no intermediate Vec.
+        // Forward each PrefillDone directly: the sender's comm-group id and KV
+        // token count travel straight into `WorkerMsg::Handoff`; the destination
+        // block is the decode worker's own and gets filled in on receipt.
+        // No flow-side endpoint table, no intermediate Vec.
         for ev in prefill_events.drain(..) {
             match to_pool_event(prefill_pool, ev) {
-                PoolEvent::PrefillDone { worker, req, send_spec, .. } => {
+                PoolEvent::PrefillDone { worker, req, send_gid, kv_tokens, .. } => {
                     // Carry the prefill worker id through so the decode side can
                     // later ack it (step C: `ReleaseKv`) and let it drop the
                     // held KV reservation. The send-side comm group alone is not
                     // enough — multiple prefill workers may share an arch.
                     self.decode_pool.admit_msg(WorkerMsg::Handoff {
                         req,
-                        send_gid: send_spec.send_gid,
-                        tokens: send_spec.kv_tokens,
+                        send_gid,
+                        tokens: kv_tokens,
                         prefill_worker: worker,
                     });
                 }

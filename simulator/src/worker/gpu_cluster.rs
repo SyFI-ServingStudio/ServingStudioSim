@@ -18,7 +18,7 @@
 //! every GPU in the range. Per-GPU storage duplicated that one value across the
 //! range and forced a O(count) loop on every submit; per-group state is O(1).
 //! Workers register their group once at construction ([`register_comm_group`])
-//! and receive a `u16` id that flows through `SendSpec` / `Handoff` /
+//! and receive a `u16` id that flows through `PrefillDone` / `Handoff` /
 //! `TransferPlan` — no `(base, count)` plumbing anymore.
 //!
 //! Why merge registry + timing: the two grow together as workers come online.
@@ -168,7 +168,7 @@ impl GpuCluster {
 
     /// Register one comm group covering `[base, base+count)` and return its id.
     /// Workers register their attn-shard endpoint set once at construction; the
-    /// returned id is what flows through `SendSpec` / `Handoff` / `TransferPlan`.
+    /// returned id is what flows through `PrefillDone` / `Handoff` / `TransferPlan`.
     pub fn register_comm_group(&mut self, base: u16, count: u16) -> u16 {
         let gid = self.groups.len() as u16;
         self.groups.push(CommGroup {

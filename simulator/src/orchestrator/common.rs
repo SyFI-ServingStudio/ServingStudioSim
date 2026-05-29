@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, RequestId, SharedRequests, WorkerId};
-use crate::worker::{IterWorker, SendSpec, SharedGpuCluster, WorkerConfig};
+use crate::worker::{IterWorker, SharedGpuCluster, WorkerConfig};
 
 // Re-export so call sites that still import `crate::orchestrator::{GpuInfo,
 // GpuCluster}` keep working — the canonical home is `worker::gpu_cluster`,
@@ -31,14 +31,15 @@ pub enum PoolEvent {
         req: RequestId,
     },
     /// A PD prefill pool finished a request's prefill — L6b hands it off to the
-    /// decode pool. Only a prefill pool surfaces this. `send_spec` carries the
-    /// sender's KV layout (total bytes + sender attn-shard count) so the flow
-    /// can build the matching `TransferPlan`.
+    /// decode pool. Only a prefill pool surfaces this. `send_gid` is the
+    /// sender's comm-group id; `kv_tokens` is the request's KV token count.
+    /// Together they let L6b build the matching `WorkerMsg::Handoff`.
     PrefillDone {
         pool: PoolId,
         worker: WorkerId,
         req: RequestId,
-        send_spec: SendSpec,
+        send_gid: u16,
+        kv_tokens: u64,
     },
     /// A PD decode pool's pull just landed — L6b routes the ack back to
     /// `prefill_worker` so it can drop its held KV. Only a decode pool

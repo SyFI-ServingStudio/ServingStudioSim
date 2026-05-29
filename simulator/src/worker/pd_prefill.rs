@@ -25,8 +25,7 @@ use crate::worker::admission_helpers::Batch;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, SendSpec, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg,
-    WorkerStatus,
+    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
 };
 
 struct PrefillRuntime {
@@ -81,14 +80,14 @@ pub struct PdPrefillWorker<M: IterwiseUnifiedModel> {
     cost_slot_inputs: Vec<SlotInput>,
     /// This worker's send-side comm group id, registered with the shared cluster
     /// at construction (covers the `model.num_attn_shards()` GPUs that hold KV).
-    /// Stamped into every emitted `SendSpec`; the cluster knows the underlying
+    /// Stamped into every emitted `PrefillDone`; the cluster knows the underlying
     /// link count and free-time, the worker keeps only this opaque id.
     send_gid: u16,
 }
 
 impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
     /// PD prefill self-registers its GPU block in the cluster and stores the
-    /// returned base for emit-time `SendSpec` stamping. It does not keep the
+    /// returned base for emit-time `PrefillDone` stamping. It does not keep the
     /// cluster handle — only the decode side calls `submit_transfer`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -339,7 +338,8 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
                 events.push(WorkerEvent::PrefillDone {
                     worker: worker_id,
                     req: rid,
-                    send_spec: SendSpec { kv_tokens, send_gid },
+                    send_gid,
+                    kv_tokens,
                 });
             }
         }
@@ -498,7 +498,7 @@ mod tests {
         for step in 0..20u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
         }
-        // SendSpec is token-based at the worker boundary: kv_tokens =
+        // PrefillDone is token-based at the worker boundary: kv_tokens =
         // prompt_len (16) + prefix_kv (0). The worker registers one comm
         // group at construction → send_gid=0.
         assert_eq!(
@@ -506,7 +506,8 @@ mod tests {
             vec![WorkerEvent::PrefillDone {
                 worker: WorkerId(0),
                 req: RequestId(0),
-                send_spec: SendSpec { kv_tokens: 16, send_gid: 0 },
+                send_gid: 0,
+                kv_tokens: 16,
             }]
         );
         let s = store.borrow();

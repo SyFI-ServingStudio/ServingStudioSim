@@ -166,8 +166,8 @@ pub(crate) fn to_pool_event(pool: PoolId, event: WorkerEvent) -> PoolEvent {
         WorkerEvent::RequestComplete { worker, req } => {
             PoolEvent::RequestComplete { pool, worker, req }
         }
-        WorkerEvent::PrefillDone { worker, req, send_spec } => {
-            PoolEvent::PrefillDone { pool, worker, req, send_spec }
+        WorkerEvent::PrefillDone { worker, req, send_gid, kv_tokens } => {
+            PoolEvent::PrefillDone { pool, worker, req, send_gid, kv_tokens }
         }
         WorkerEvent::PullComplete { worker, req, prefill_worker } => {
             PoolEvent::PullComplete { pool, worker, req, prefill_worker }

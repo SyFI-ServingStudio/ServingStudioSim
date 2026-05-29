@@ -72,13 +72,16 @@ pub enum WorkerEvent {
     /// id), so the pool no longer needs a separate drain sweep to attribute it.
     RequestComplete { worker: WorkerId, req: RequestId },
     /// A PD prefill worker finished a request's prefill; L6 hands it off to a
-    /// decode pool. Never emitted by unified / decode workers. `send_spec` is the
-    /// sender's KV layout (total bytes + this worker's attn-shard count), enough
-    /// for L6 to build the matching `TransferPlan` without re-deriving the model.
+    /// decode pool. Never emitted by unified / decode workers. `send_gid` is the
+    /// sender's comm-group id (registered at prefill worker construction);
+    /// `kv_tokens` is the request's KV token count (`prompt_len + prefix_kv`).
+    /// Together they let L6 build the matching `WorkerMsg::Handoff` without
+    /// re-deriving the model.
     PrefillDone {
         worker: WorkerId,
         req: RequestId,
-        send_spec: SendSpec,
+        send_gid: u16,
+        kv_tokens: u64,
     },
     /// A PD decode worker's pull just landed at this side — the corresponding
     /// prefill worker can drop its held KV. `worker` is the decode worker (the
@@ -93,19 +96,6 @@ pub enum WorkerEvent {
 }
 
 // ── PD transfer vocabulary ────────────────────────────────────────────────────
-
-/// Sender's KV layout for a PD handoff — what a prefill worker declares when
-/// its iter finishes. `send_gid` is the prefill worker's comm-group id (the
-/// attn-shard endpoint set registered once at construction with the shared
-/// cluster); `kv_tokens` is the request's KV token count (`prompt_len +
-/// prefix_kv`). Token-based at the worker boundary so it lines up with
-/// `KvPool`'s accounting; the decode worker converts to wire bytes at
-/// `cluster.submit_transfer` time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SendSpec {
-    pub kv_tokens: u64,
-    pub send_gid: u16,
-}
 
 /// Fully-resolved transfer plan used inside a decode worker's pending-pull
 /// queue. Sender side comes off the incoming `Handoff` message; destination
