@@ -1,7 +1,7 @@
 //! `PdPrefillWorker` — the prefill half of a PD (prefill/decode disaggregation)
 //! deployment. Iter-wise like the barebone worker, and admits + costs prefills the
 //! same way, but at iter end it does **not** keep the request to decode: it emits
-//! `WorkerEvent::PrefillDone` so L6 hands the request (its prompt KV already
+//! `PdPrefillEvent::PrefillDone` so L6 hands the request (its prompt KV already
 //! computed) off to a decode pool, and releases its own transient state.
 //!
 //! v1 simplification: the prefill→decode KV transfer is not modeled (the handoff
@@ -25,7 +25,8 @@ use crate::worker::admission_helpers::Batch;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
+    BatchFsmState, IterCursor, PdPrefillEvent, PdPrefillMsg, WorkerConfig, WorkerEventCommon,
+    WorkerFsmState, WorkerMsgCommon, WorkerStatus,
 };
 
 struct PrefillRuntime {
@@ -36,7 +37,7 @@ struct PrefillRuntime {
     /// pending the decode side's pull. Each entry's KV-token count counts
     /// against the worker's admission budget so the prefill side doesn't
     /// over-commit beyond what its physical KV can actually hold. Drained
-    /// when the decode worker acks via `WorkerMsg::ReleaseKv`.
+    /// when the decode worker acks via `PdPrefillMsg::ReleaseKv`.
     held: HashMap<RequestId, u64>,
     /// Running sum of `held` values — kept incrementally so `try_admit`
     /// stays O(1). Always equals `held.values().sum()`.
@@ -145,7 +146,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
 
     // ── tick: state-forwarding loop (identical to barebone) ────────────────────
 
-    fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    fn tick_inner(&mut self, now: Time, events: &mut Vec<PdPrefillEvent>) -> Option<Time> {
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
@@ -296,7 +297,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
 
     // ── Stage 3: complete_iter — emit first token, then hand off to decode ──────
 
-    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
+    fn complete_iter(&mut self, now: Time, events: &mut Vec<PdPrefillEvent>) {
         let log_tokens = self.config.log_output_token_times;
         // Sender side is fully determined by this worker's pre-registered comm
         // group; emit stamps the gid and the cluster resolves link count /
@@ -325,17 +326,17 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             // r is unused below — NLL releases the borrow on `store`.
             self.runtime.request_to_group.remove(&rid);
             if complete {
-                events.push(WorkerEvent::RequestComplete {
+                events.push(PdPrefillEvent::Common(WorkerEventCommon::RequestComplete {
                     worker: worker_id,
                     req: rid,
-                });
+                }));
             } else {
                 // KV stays resident on this worker until the decode side acks
-                // the pull via `WorkerMsg::ReleaseKv`. Tracking it in `held`
+                // the pull via `PdPrefillMsg::ReleaseKv`. Tracking it in `held`
                 // keeps it gating future admissions.
                 self.runtime.held.insert(rid, kv_tokens);
                 self.runtime.held_kv_tokens += kv_tokens;
-                events.push(WorkerEvent::PrefillDone {
+                events.push(PdPrefillEvent::PrefillDone {
                     worker: worker_id,
                     req: rid,
                     send_gid,
@@ -348,7 +349,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
     }
 
     /// Release this request's held KV reservation. Called from `enqueue` on
-    /// receipt of `WorkerMsg::ReleaseKv` (decode side finished its pull). A
+    /// receipt of `PdPrefillMsg::ReleaseKv` (decode side finished its pull). A
     /// missing entry is silently ignored — possible if the request was
     /// already cancelled via `release_request` before the ack arrived.
     fn drop_held(&mut self, rid: RequestId) {
@@ -440,20 +441,24 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
 }
 
 impl<M: IterwiseUnifiedModel> IterWorker for PdPrefillWorker<M> {
+    type Msg = PdPrefillMsg;
+    type Event = PdPrefillEvent;
+
     fn id(&self) -> WorkerId {
         self.id
     }
 
-    fn enqueue(&mut self, msg: WorkerMsg) {
+    fn enqueue(&mut self, msg: Self::Msg) {
         match msg {
-            WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
-            WorkerMsg::Handoff { .. } => unreachable!("prefill worker receives no PD handoff"),
+            PdPrefillMsg::Common(WorkerMsgCommon::Request(rid)) => {
+                self.runtime.pending_prefills.push_back(rid)
+            }
             // Decode side has finished pulling — drop the held reservation.
-            WorkerMsg::ReleaseKv { req } => self.drop_held(req),
+            PdPrefillMsg::ReleaseKv { req } => self.drop_held(req),
         }
     }
 
-    fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time> {
         self.tick_inner(now, events)
     }
 
@@ -493,7 +498,7 @@ mod tests {
         // A multi-token request: prefill emits the first token then hands off.
         let store = shared_with(&[(0, 16, 3)]);
         let mut w = worker(Rc::clone(&store));
-        w.enqueue(WorkerMsg::Request(RequestId(0)));
+        w.enqueue(PdPrefillMsg::Common(WorkerMsgCommon::Request(RequestId(0))));
         let mut events = Vec::new();
         for step in 0..20u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
@@ -503,7 +508,7 @@ mod tests {
         // group at construction → send_gid=0.
         assert_eq!(
             events,
-            vec![WorkerEvent::PrefillDone {
+            vec![PdPrefillEvent::PrefillDone {
                 worker: WorkerId(0),
                 req: RequestId(0),
                 send_gid: 0,
@@ -522,17 +527,17 @@ mod tests {
         // decode_len == 1: the prefill's first token is the whole output.
         let store = shared_with(&[(0, 16, 1)]);
         let mut w = worker(Rc::clone(&store));
-        w.enqueue(WorkerMsg::Request(RequestId(0)));
+        w.enqueue(PdPrefillMsg::Common(WorkerMsgCommon::Request(RequestId(0))));
         let mut events = Vec::new();
         for step in 0..20u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(
             events,
-            vec![WorkerEvent::RequestComplete {
+            vec![PdPrefillEvent::Common(WorkerEventCommon::RequestComplete {
                 worker: WorkerId(0),
                 req: RequestId(0)
-            }]
+            })]
         );
     }
 }

@@ -23,7 +23,7 @@ pub use iter_worker::IterWorker;
 pub use pd_decode::PdDecodeWorker;
 pub use pd_prefill::PdPrefillWorker;
 pub use types::{
-    BatchFsmState, IterCursor, TransferPlan, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg,
-    WorkerStatus,
+    BatchFsmState, IterCursor, PdDecodeEvent, PdDecodeMsg, PdPrefillEvent, PdPrefillMsg,
+    TransferPlan, WorkerConfig, WorkerEventCommon, WorkerFsmState, WorkerMsgCommon, WorkerStatus,
 };
 pub use unified::BareboneWorker;

@@ -5,7 +5,7 @@
 //! Reconciliations vs the design example (see plan):
 //!   - event-driven surface (`enqueue`/`tick`/`status`) so the L6 `simple_dp`
 //!     pool can drive it; `complete_iter` pushes a self-tagged
-//!     `WorkerEvent::RequestComplete` into the caller's event sink.
+//!     `WorkerEventCommon::RequestComplete` into the caller's event sink.
 //!   - the request slab is the shared `RequestStore`, injected at construction as
 //!     `SharedRequests` and borrowed transiently inside each method (no per-tick
 //!     `&mut RequestStore` parameter). Request/session logging stays in L7; the
@@ -22,7 +22,8 @@ use crate::timing::LeafMetrics;
 use crate::worker::admission_helpers::Batch;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
+    BatchFsmState, IterCursor, WorkerConfig, WorkerEventCommon, WorkerFsmState, WorkerMsgCommon,
+    WorkerStatus,
 };
 
 // ── Runtime ────────────────────────────────────────────────────────────────────
@@ -130,14 +131,9 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     // ── L6-facing surface ────────────────────────────────────────────────────
 
-    pub fn enqueue(&mut self, msg: WorkerMsg) {
-        match msg {
-            WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
-            WorkerMsg::Handoff { .. } => unreachable!("barebone worker receives no PD handoff"),
-            WorkerMsg::ReleaseKv { .. } => {
-                unreachable!("barebone worker is not a PD prefill; no held KV to release")
-            }
-        }
+    pub fn enqueue(&mut self, msg: WorkerMsgCommon) {
+        let WorkerMsgCommon::Request(rid) = msg;
+        self.runtime.pending_prefills.push_back(rid);
     }
 
     pub fn status(&self) -> WorkerStatus {
@@ -153,7 +149,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     // ── tick: state-forwarding loop (§3.2.1) ──────────────────────────────────
 
-    pub fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    pub fn tick(&mut self, now: Time, events: &mut Vec<WorkerEventCommon>) -> Option<Time> {
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
@@ -317,7 +313,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     // ── Stage 3: complete_iter (token bookkeeping + KV transitions) ────────────
 
-    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
+    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEventCommon>) {
         let mut completed: Vec<RequestId> = Vec::new();
 
         // (a) live decodes produced one token. Iterate the decode set directly
@@ -373,7 +369,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                 .unwrap_or(0);
             self.batches[0].release(rid, current_kv);
             self.runtime.request_to_group.remove(&rid);
-            events.push(WorkerEvent::RequestComplete {
+            events.push(WorkerEventCommon::RequestComplete {
                 worker: self.id,
                 req: rid,
             });
@@ -488,7 +484,7 @@ mod tests {
     fn run_to_quiescence<M: IterwiseUnifiedModel>(
         w: &mut BareboneWorker<M>,
         max_steps: u64,
-    ) -> Vec<WorkerEvent> {
+    ) -> Vec<WorkerEventCommon> {
         let mut all = Vec::new();
         for step in 0..max_steps {
             w.tick(Time::from_ms(step as f64), &mut all);
@@ -511,12 +507,12 @@ mod tests {
             "test-gpu",
             test_cluster(),
         );
-        w.enqueue(WorkerMsg::Request(RequestId(0)));
+        w.enqueue(WorkerMsgCommon::Request(RequestId(0)));
 
         let events = run_to_quiescence(&mut w, 50);
         assert_eq!(
             events,
-            vec![WorkerEvent::RequestComplete {
+            vec![WorkerEventCommon::RequestComplete {
                 worker: WorkerId(0),
                 req: RequestId(0)
             }]
@@ -544,7 +540,7 @@ mod tests {
             test_cluster(),
         );
         for id in [0, 1, 2] {
-            w.enqueue(WorkerMsg::Request(RequestId(id)));
+            w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
         }
         let events = run_to_quiescence(&mut w, 200);
         assert_eq!(events.len(), 3);

@@ -33,12 +33,70 @@ pub struct BatchFsmState {
     pub compute_end: Time,
 }
 
-// ── Messages / events / status (L6 interface) ─────────────────────────────────
+// ── Messages / events (L6 interface) ──────────────────────────────────────────
+//
+// Each worker carries its own `type Msg` / `type Event` (associated types on
+// `IterWorker`), so adding a new worker with role-specific messages or events
+// never forces a change to existing workers' files. The shared base — what every
+// worker must accept (`Request`) and emit (`RequestComplete`) — lives in
+// `WorkerMsgCommon` / `WorkerEventCommon`; role-specific enums (e.g. PD prefill /
+// PD decode) wrap the common base via a `Common(...)` variant so universal
+// admission and completion still flow through one path on the consumer side.
 
-#[derive(Clone, Copy, Debug)]
-pub enum WorkerMsg {
+/// Universal request admission. Every iter-wise worker accepts this; role-
+/// specific enums (e.g. `PdDecodeMsg`) wrap it in a `Common` variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerMsgCommon {
     Request(RequestId),
-    /// PD handoff: the decode pool admits an already-prefilled request and must
+}
+
+/// Universal completion event. Every iter-wise worker eventually emits this for
+/// each request it owned; role-specific enums (e.g. `PdPrefillEvent`) wrap it
+/// in a `Common` variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerEventCommon {
+    RequestComplete { worker: WorkerId, req: RequestId },
+}
+
+/// PD prefill worker's full message set: the universal `Request` plus the
+/// decode-side ack `ReleaseKv` that lets it drop a held KV reservation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PdPrefillMsg {
+    Common(WorkerMsgCommon),
+    /// Decode → prefill ack: a request's KV has fully landed at the decode
+    /// side, so this prefill worker can drop its held reservation. Routed by
+    /// L6 from a `PdDecodeEvent::PullComplete` to the originating prefill
+    /// worker by `WorkerId` (*not* placement-chosen) — only that worker
+    /// holds the request's KV slot.
+    ReleaseKv { req: RequestId },
+}
+
+/// PD prefill worker's full event set: the universal `RequestComplete` (single-
+/// token requests finish on prefill) plus the handoff signal that L6 forwards
+/// to the decode pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PdPrefillEvent {
+    Common(WorkerEventCommon),
+    /// A PD prefill worker finished a request's prefill; L6 hands it off to a
+    /// decode pool. `send_gid` is the sender's comm-group id (registered at
+    /// prefill worker construction); `kv_tokens` is the request's KV token
+    /// count (`prompt_len + prefix_kv`). Together they let L6 build the
+    /// matching `PdDecodeMsg::Handoff` without re-deriving the model.
+    PrefillDone {
+        worker: WorkerId,
+        req: RequestId,
+        send_gid: u16,
+        kv_tokens: u64,
+    },
+}
+
+/// PD decode worker's full message set: the universal `Request` plus the prefill-
+/// side handoff that admits an already-prefilled request and triggers the KV
+/// pull from the sender's comm group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PdDecodeMsg {
+    Common(WorkerMsgCommon),
+    /// PD handoff: this decode pool admits an already-prefilled request and must
     /// pull its KV from the sender's comm group. Only the sender side is in the
     /// wire message — the destination is the receiving decode worker's own
     /// pre-registered comm group, which it already knows; the worker fills its
@@ -54,45 +112,41 @@ pub enum WorkerMsg {
         /// The prefill worker that holds this request's KV until the pull
         /// completes. Carried through the decode worker's pending-pull → in-
         /// flight lifecycle so the worker can later ack the prefill side
-        /// (`WorkerMsg::ReleaseKv`) and let it free its held capacity.
+        /// (`PdPrefillMsg::ReleaseKv`) and let it free its held capacity.
         prefill_worker: WorkerId,
     },
-    /// Decode → prefill ack: a request's KV has fully landed at the decode
-    /// side, so the prefill worker can drop its held reservation. Routed by
-    /// L6 from a `WorkerEvent::PullComplete` to the originating prefill
-    /// worker (by `WorkerId`, *not* placement-chosen) — only that worker
-    /// holds the request's KV slot.
-    ReleaseKv { req: RequestId },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WorkerEvent {
-    /// A request finished all its output tokens on this worker. `worker` is the
-    /// emitting worker's id — the worker self-tags at push time (it knows its own
-    /// id), so the pool no longer needs a separate drain sweep to attribute it.
-    RequestComplete { worker: WorkerId, req: RequestId },
-    /// A PD prefill worker finished a request's prefill; L6 hands it off to a
-    /// decode pool. Never emitted by unified / decode workers. `send_gid` is the
-    /// sender's comm-group id (registered at prefill worker construction);
-    /// `kv_tokens` is the request's KV token count (`prompt_len + prefix_kv`).
-    /// Together they let L6 build the matching `WorkerMsg::Handoff` without
-    /// re-deriving the model.
-    PrefillDone {
-        worker: WorkerId,
-        req: RequestId,
-        send_gid: u16,
-        kv_tokens: u64,
-    },
-    /// A PD decode worker's pull just landed at this side — the corresponding
-    /// prefill worker can drop its held KV. `worker` is the decode worker (the
-    /// emitter); `prefill_worker` is the target prefill worker, copied from the
-    /// pull's `TransferPlan` so L6 can route the ack without consulting the
-    /// request store.
+/// PD decode worker's full event set: the universal `RequestComplete` plus the
+/// pull-landed ack that triggers `ReleaseKv` back to the source prefill worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PdDecodeEvent {
+    Common(WorkerEventCommon),
+    /// A PD decode worker's pull just landed — the corresponding prefill worker
+    /// can drop its held KV. `worker` is the decode worker (the emitter);
+    /// `prefill_worker` is the target prefill worker, copied from the pull's
+    /// `TransferPlan` so L6 can route the ack without consulting the request store.
     PullComplete {
         worker: WorkerId,
         req: RequestId,
         prefill_worker: WorkerId,
     },
+}
+
+// ── Universal-request ergonomics ──────────────────────────────────────────────
+//
+// `From<RequestId>` on every Msg enum lets the pool controller's universal
+// `admit(rid)` convenience build the right concrete `W::Msg` via `rid.into()`,
+// without each call site naming the variant.
+
+impl From<RequestId> for WorkerMsgCommon {
+    fn from(req: RequestId) -> Self { Self::Request(req) }
+}
+impl From<RequestId> for PdPrefillMsg {
+    fn from(req: RequestId) -> Self { Self::Common(req.into()) }
+}
+impl From<RequestId> for PdDecodeMsg {
+    fn from(req: RequestId) -> Self { Self::Common(req.into()) }
 }
 
 // ── PD transfer vocabulary ────────────────────────────────────────────────────

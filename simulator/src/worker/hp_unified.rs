@@ -10,7 +10,7 @@
 //! worker stays the minimal single-group reference, and this is the multi-group
 //! specialization. The shared admission primitives (`Batch` / `KvAdmission` /
 //! `LoadBalance` / `KvPool`) and the public worker vocabulary (`WorkerConfig` /
-//! `WorkerMsg` / `WorkerEvent` / `WorkerStatus` / FSM enums) are reused, not
+//! `WorkerMsgCommon` / `WorkerEventCommon` / `WorkerStatus` / FSM enums) are reused, not
 //! duplicated.
 
 use std::collections::{HashMap, VecDeque};
@@ -25,7 +25,8 @@ use crate::worker::admission_helpers::{Batch, LoadBalance};
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
+    BatchFsmState, IterCursor, WorkerConfig, WorkerEventCommon, WorkerFsmState, WorkerMsgCommon,
+    WorkerStatus,
 };
 
 /// Worker-local runtime state (mirrors the barebone worker's, plus the live
@@ -136,7 +137,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
 
     // ── tick: state-forwarding loop (§3.2.1; identical shape to barebone) ──────
 
-    fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEventCommon>) -> Option<Time> {
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
@@ -289,7 +290,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
 
     // ── Stage 3: complete_iter — same bookkeeping as barebone, per group ────────
 
-    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
+    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEventCommon>) {
         let log_tokens = self.config.log_output_token_times;
         for gid in 0..self.batches.len() {
             let mut completed: Vec<RequestId> = Vec::new();
@@ -347,7 +348,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                     .unwrap_or(0);
                 self.batches[gid].release(rid, current_kv);
                 self.runtime.request_to_group.remove(&rid);
-                events.push(WorkerEvent::RequestComplete {
+                events.push(WorkerEventCommon::RequestComplete {
                     worker: self.id,
                     req: rid,
                 });
@@ -449,21 +450,19 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
 }
 
 impl<M: IterwiseUnifiedModel> IterWorker for HpUnifiedWorker<M> {
+    type Msg = WorkerMsgCommon;
+    type Event = WorkerEventCommon;
+
     fn id(&self) -> WorkerId {
         self.id
     }
 
-    fn enqueue(&mut self, msg: WorkerMsg) {
-        match msg {
-            WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
-            WorkerMsg::Handoff { .. } => unreachable!("hp_unified worker receives no PD handoff"),
-            WorkerMsg::ReleaseKv { .. } => {
-                unreachable!("hp_unified is not a PD prefill; no held KV to release")
-            }
-        }
+    fn enqueue(&mut self, msg: Self::Msg) {
+        let WorkerMsgCommon::Request(rid) = msg;
+        self.runtime.pending_prefills.push_back(rid);
     }
 
-    fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time> {
         self.tick_inner(now, events)
     }
 
@@ -520,8 +519,8 @@ mod tests {
         // in decode; the long decode budget keeps them alive past the probe.
         let store = shared_with(&[(0, 4, 50), (1, 4, 50)]);
         let mut w = worker(store, 2);
-        w.enqueue(WorkerMsg::Request(RequestId(0)));
-        w.enqueue(WorkerMsg::Request(RequestId(1)));
+        w.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        w.enqueue(WorkerMsgCommon::Request(RequestId(1)));
         let mut events = Vec::new();
         for step in 0..20u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
@@ -547,16 +546,14 @@ mod tests {
         let store = shared_with(&[(0, 4, 2), (1, 4, 2), (2, 4, 2)]);
         let mut w = worker(store, 2);
         for id in 0..3u32 {
-            w.enqueue(WorkerMsg::Request(RequestId(id)));
+            w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
         }
         let mut completed = Vec::new();
         let mut events = Vec::new();
         for step in 0..500u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
             for e in events.drain(..) {
-                let WorkerEvent::RequestComplete { req, .. } = e else {
-                    continue;
-                };
+                let WorkerEventCommon::RequestComplete { req, .. } = e;
                 completed.push(req);
             }
         }

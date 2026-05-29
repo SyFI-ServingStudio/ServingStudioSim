@@ -9,7 +9,7 @@ pub mod common;
 pub mod impls;
 pub mod config;
 
-pub use self::common::{GpuCluster, GpuInfo, OrchAction, PoolEvent, UnifiedWorkerFactory};
+pub use self::common::{GpuCluster, GpuInfo, OrchAction, UnifiedWorkerFactory};
 pub use impls::{
     DpPlacementPolicy, PdFlow, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig,
     SimpleDpPoolController, PD_DECODE_POOL, PD_PREFILL_POOL,

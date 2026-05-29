@@ -22,36 +22,6 @@ pub enum OrchAction {
     Complete { req: RequestId },
 }
 
-/// Pool-level event (L6a → L6b). One per worker-level transition a pool surfaces.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PoolEvent {
-    RequestComplete {
-        pool: PoolId,
-        worker: WorkerId,
-        req: RequestId,
-    },
-    /// A PD prefill pool finished a request's prefill — L6b hands it off to the
-    /// decode pool. Only a prefill pool surfaces this. `send_gid` is the
-    /// sender's comm-group id; `kv_tokens` is the request's KV token count.
-    /// Together they let L6b build the matching `WorkerMsg::Handoff`.
-    PrefillDone {
-        pool: PoolId,
-        worker: WorkerId,
-        req: RequestId,
-        send_gid: u16,
-        kv_tokens: u64,
-    },
-    /// A PD decode pool's pull just landed — L6b routes the ack back to
-    /// `prefill_worker` so it can drop its held KV. Only a decode pool
-    /// surfaces this.
-    PullComplete {
-        pool: PoolId,
-        worker: WorkerId,
-        req: RequestId,
-        prefill_worker: WorkerId,
-    },
-}
-
 /// Constructor signature shared by every iter-wise worker (`BareboneWorker::new`,
 /// `HpUnifiedWorker::new`, …). The factory is handed the chosen worker's `new` as
 /// a plain function pointer, so it can stamp the concrete `W` without `W::new`

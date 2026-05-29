@@ -196,7 +196,7 @@ fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
 /// Wrap a built iter-wise model in a `simple_dp` flow. Generic over the concrete
 /// model `M` and worker `W`; `build_fn` is the chosen worker's `new`. The returned
 /// `Box<dyn Flow>` is the only `dyn` erasure point.
-fn assemble_flow<M: IterwiseUnifiedModel, W: IterWorker + 'static>(
+fn assemble_flow<M, W>(
     model: Arc<M>,
     store: SharedRequests,
     worker_config: WorkerConfig,
@@ -204,7 +204,12 @@ fn assemble_flow<M: IterwiseUnifiedModel, W: IterWorker + 'static>(
     gpu_name: String,
     dp_cfg: SimpleDpConfig,
     build_fn: WorkerBuildFn<M, W>,
-) -> Box<dyn Flow> {
+) -> Box<dyn Flow>
+where
+    M: IterwiseUnifiedModel,
+    W: IterWorker<Event = crate::worker::WorkerEventCommon> + 'static,
+    W::Msg: From<crate::common::RequestId>,
+{
     let factory = UnifiedWorkerFactory::new(
         model,
         store,

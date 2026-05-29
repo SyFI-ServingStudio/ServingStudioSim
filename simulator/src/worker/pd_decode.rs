@@ -1,6 +1,6 @@
 //! `PdDecodeWorker` — the decode half of a PD (prefill/decode disaggregation)
 //! deployment. Iter-wise, but its admitted requests have **already been
-//! prefilled** by a sibling prefill pool (handed off via `WorkerEvent::PrefillDone`
+//! prefilled** by a sibling prefill pool (handed off via `PdPrefillEvent::PrefillDone`
 //! → L6 → `enqueue` here): the request's prompt KV is treated as already resident,
 //! so a fresh admit enters the decode set directly (no prefill compute, no
 //! prefill→decode transition). The worker then only runs decode iterations.
@@ -28,8 +28,8 @@ use crate::worker::admission_helpers::{Batch, LoadBalance};
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, TransferPlan, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg,
-    WorkerStatus,
+    BatchFsmState, IterCursor, PdDecodeEvent, PdDecodeMsg, TransferPlan, WorkerConfig,
+    WorkerEventCommon, WorkerFsmState, WorkerMsgCommon, WorkerStatus,
 };
 
 /// One pull actively flowing through the shared cluster. Carries everything
@@ -236,7 +236,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
     ///
     /// Runs at the top of every tick — independent of the decode iteration FSM,
     /// so a pull can complete mid-iter and admit at the next iteration boundary.
-    fn advance_pulls(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
+    fn advance_pulls(&mut self, now: Time, events: &mut Vec<PdDecodeEvent>) {
         loop {
             if let Some(pull) = self.runtime.in_transit {
                 if now >= pull.pull_end {
@@ -246,7 +246,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                     // Ack the prefill side: its held reservation can drop now
                     // that the KV has fully landed here. L6 routes this back
                     // by `prefill_worker` (not placement-chosen).
-                    events.push(WorkerEvent::PullComplete {
+                    events.push(PdDecodeEvent::PullComplete {
                         worker: self.id,
                         req: pull.req,
                         prefill_worker: pull.prefill_worker,
@@ -297,7 +297,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
         }
     }
 
-    fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    fn tick_inner(&mut self, now: Time, events: &mut Vec<PdDecodeEvent>) -> Option<Time> {
         self.advance_pulls(now, events);
         use IterCursor::*;
         use WorkerFsmState::*;
@@ -379,7 +379,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
         true
     }
 
-    fn tick_done(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> bool {
+    fn tick_done(&mut self, now: Time, events: &mut Vec<PdDecodeEvent>) -> bool {
         self.complete_iter(now, events);
         self.runtime.worker_fsm_state = WorkerFsmState::Idle;
         true
@@ -499,7 +499,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
 
     // ── Stage 3: complete_iter — decode bookkeeping only (no prefill phase) ──────
 
-    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
+    fn complete_iter(&mut self, now: Time, events: &mut Vec<PdDecodeEvent>) {
         let log_tokens = self.config.log_output_token_times;
         for gid in 0..self.batches.len() {
             let mut completed: Vec<RequestId> = Vec::new();
@@ -529,10 +529,10 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                     .unwrap_or(0);
                 self.batches[gid].release(rid, current_kv);
                 self.runtime.request_to_group.remove(&rid);
-                events.push(WorkerEvent::RequestComplete {
+                events.push(PdDecodeEvent::Common(WorkerEventCommon::RequestComplete {
                     worker: self.id,
                     req: rid,
-                });
+                }));
             }
         }
     }
@@ -584,16 +584,19 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
 }
 
 impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
+    type Msg = PdDecodeMsg;
+    type Event = PdDecodeEvent;
+
     fn id(&self) -> WorkerId {
         self.id
     }
 
-    fn enqueue(&mut self, msg: WorkerMsg) {
+    fn enqueue(&mut self, msg: Self::Msg) {
         match msg {
             // Direct admit (e.g. tests): KV treated as instantly resident.
             // Still count it toward the backlog so the gate's accounting is
             // consistent — tests use tiny token counts so the budget never bites.
-            WorkerMsg::Request(rid) => {
+            PdDecodeMsg::Common(WorkerMsgCommon::Request(rid)) => {
                 let tokens = {
                     let store = self.requests.borrow();
                     let r = &store[rid];
@@ -608,7 +611,7 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
             // happens at the next `tick_inner` (no `now` available here);
             // `advance_pulls` then routes it to the cluster or, cluster-free,
             // straight to `pending_decodes`.
-            WorkerMsg::Handoff { req, send_gid, tokens, prefill_worker } => {
+            PdDecodeMsg::Handoff { req, send_gid, tokens, prefill_worker } => {
                 self.runtime.pending_pulls.push_back((
                     req,
                     TransferPlan {
@@ -619,13 +622,10 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
                     },
                 ));
             }
-            WorkerMsg::ReleaseKv { .. } => {
-                unreachable!("decode worker holds no KV at the source side; ack is its emitter")
-            }
         }
     }
 
-    fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time> {
         self.tick_inner(now, events)
     }
 
@@ -678,17 +678,17 @@ mod tests {
         // prompt 16, decode 3 → prefill already emitted token 1, decode emits 2 more.
         let store = prefilled_store(&[(0, 16, 3)]);
         let mut w = worker(Rc::clone(&store));
-        w.enqueue(WorkerMsg::Request(RequestId(0)));
+        w.enqueue(PdDecodeMsg::Common(WorkerMsgCommon::Request(RequestId(0))));
         let mut events = Vec::new();
         for step in 0..50u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(
             events,
-            vec![WorkerEvent::RequestComplete {
+            vec![PdDecodeEvent::Common(WorkerEventCommon::RequestComplete {
                 worker: WorkerId(0),
                 req: RequestId(0)
-            }]
+            })]
         );
         let s = store.borrow();
         let r = &s[RequestId(0)];
@@ -701,7 +701,7 @@ mod tests {
         let store = prefilled_store(&[(0, 8, 2), (1, 8, 2), (2, 8, 2)]);
         let mut w = worker(Rc::clone(&store));
         for id in [0, 1, 2] {
-            w.enqueue(WorkerMsg::Request(RequestId(id)));
+            w.enqueue(PdDecodeMsg::Common(WorkerMsgCommon::Request(RequestId(id))));
         }
         let mut events = Vec::new();
         for step in 0..200u64 {
@@ -729,8 +729,8 @@ mod tests {
         // Two long-decode handed-off requests, two DP shards: RR routes one to each.
         let store = prefilled_store(&[(0, 4, 50), (1, 4, 50)]);
         let mut w = worker_dp(store, 2);
-        w.enqueue(WorkerMsg::Request(RequestId(0)));
-        w.enqueue(WorkerMsg::Request(RequestId(1)));
+        w.enqueue(PdDecodeMsg::Common(WorkerMsgCommon::Request(RequestId(0))));
+        w.enqueue(PdDecodeMsg::Common(WorkerMsgCommon::Request(RequestId(1))));
         let mut events = Vec::new();
         for step in 0..10u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
@@ -775,7 +775,7 @@ mod tests {
             Rc::clone(&cluster),
         );
         for &id in &[0u32, 1] {
-            w.enqueue(WorkerMsg::Handoff {
+            w.enqueue(PdDecodeMsg::Handoff {
                 req: RequestId(id),
                 send_gid: sender_gid,
                 tokens: if id == 0 { 40 } else { 20 },
@@ -816,7 +816,7 @@ mod tests {
             "test-gpu",
             Rc::clone(&cluster),
         );
-        w.enqueue(WorkerMsg::Handoff {
+        w.enqueue(PdDecodeMsg::Handoff {
             req: RequestId(0),
             send_gid: sender_gid,
             tokens: 200,
@@ -836,7 +836,7 @@ mod tests {
         let store = prefilled_store(&[(0, 8, 2), (1, 8, 2), (2, 8, 2), (3, 8, 2)]);
         let mut w = worker_dp(Rc::clone(&store), 2);
         for id in 0..4u32 {
-            w.enqueue(WorkerMsg::Request(RequestId(id)));
+            w.enqueue(PdDecodeMsg::Common(WorkerMsgCommon::Request(RequestId(id))));
         }
         let mut events = Vec::new();
         for step in 0..200u64 {
