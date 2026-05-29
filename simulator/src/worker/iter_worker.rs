@@ -20,6 +20,11 @@ use crate::arch::contract::IterwiseUnifiedModel;
 /// pool can skip non-due workers on the fixed global clock without entering
 /// their FSM. Events are pushed (self-tagged with the worker id) rather than
 /// buffered + pulled, so the pool needs no separate per-worker drain sweep.
+///
+/// The shared `GpuCluster` is no longer part of this trait — every worker takes
+/// a `SharedGpuCluster` at construction (used by PD workers for runtime
+/// transfers; ignored by barebone/hp after their one-shot `allocate`). The
+/// previously-separate `KvPuller::set_cluster` trait was dropped.
 pub trait IterWorker {
     fn id(&self) -> WorkerId;
     fn enqueue(&mut self, msg: WorkerMsg);

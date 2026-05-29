@@ -123,4 +123,13 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     fn num_attn_dp_groups(&self) -> u16 {
         1
     }
+
+    /// GPUs one attention shard (HP group) of this model spans — its attn-TP /
+    /// head-parallel degree. This is the count of physical send/recv links a KV
+    /// transfer rides on at this side of a PD handoff. Derived (`gpus_per_replica /
+    /// num_attn_dp_groups`), so the arch owns it and L5/L6 only read — neither the
+    /// prefill worker nor the PD flow re-derives the formula.
+    fn num_attn_shards(&self) -> u16 {
+        (self.gpus_per_replica() / self.num_attn_dp_groups().max(1)).max(1)
+    }
 }

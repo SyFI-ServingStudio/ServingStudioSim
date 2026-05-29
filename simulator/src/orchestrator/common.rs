@@ -6,11 +6,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::Serialize;
-
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, RequestId, SharedRequests, WorkerId};
-use crate::worker::{IterWorker, WorkerConfig};
+use crate::worker::{IterWorker, SendSpec, SharedGpuCluster, WorkerConfig};
+
+// Re-export so call sites that still import `crate::orchestrator::{GpuInfo,
+// GpuCluster}` keep working — the canonical home is `worker::gpu_cluster`,
+// which owns the merged GPU registry / transfer timing oracle.
+pub use crate::worker::{GpuInfo, GpuCluster};
 
 /// Deployment-level action returned to L7 each tick. Current flows only surface
 /// request completion to L7.
@@ -28,69 +31,46 @@ pub enum PoolEvent {
         req: RequestId,
     },
     /// A PD prefill pool finished a request's prefill — L6b hands it off to the
-    /// decode pool. Only a prefill pool surfaces this.
+    /// decode pool. Only a prefill pool surfaces this. `send_spec` carries the
+    /// sender's KV layout (total bytes + sender attn-shard count) so the flow
+    /// can build the matching `TransferPlan`.
     PrefillDone {
         pool: PoolId,
         worker: WorkerId,
         req: RequestId,
+        send_spec: SendSpec,
     },
 }
 
-/// One physical GPU and who owns it. The run's GPU facts are a flat list of these
-/// (see [`GpuInventory`]); `pool` + `worker_id` make the worker→gpu and pool→gpu
-/// groupings derivable without a second table.
-#[derive(Clone, Debug, Serialize)]
-pub struct GpuInfo {
-    pub id: u16,
-    pub name: String,
-    pub pool: u16,
-    pub worker_id: u16,
-}
-
-/// The GPUs a run modeled — a *reporting* artifact (serialized to
-/// `raw/run_meta.json`), not yet a timing oracle like ref's stream-serialized
-/// `GpuCluster`. L6 assembles it as it builds workers ([`GpuInventory::allocate`],
-/// ref's `allocate(n)` shape); the GPU count per worker is the L4 parallel-dim
-/// product, threaded in by the deployment.
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct GpuInventory {
-    pub gpus: Vec<GpuInfo>,
-}
-
-impl GpuInventory {
-    pub fn num_gpus(&self) -> usize {
-        self.gpus.len()
-    }
-
-    /// Register `n` contiguous-id GPUs to `(pool, worker)`, all sharing `name`.
-    /// Ids continue from the current length, so calling once per worker yields a
-    /// dense `0..total` id space.
-    pub fn allocate(&mut self, pool: u16, worker_id: u16, n: u16, name: &str) {
-        let base = self.gpus.len() as u16;
-        for offset in 0..n {
-            self.gpus.push(GpuInfo {
-                id: base + offset,
-                name: name.to_string(),
-                pool,
-                worker_id,
-            });
-        }
-    }
-}
-
-/// Builds identical unified workers for a DP pool, each sharing the one
-/// `SharedRequests` handle and an `Arc` of the model. The worker sizes its own
-/// `KvPool` from `worker_config.attn_kv_bytes`. (L7 will generalize this into a
-/// trait; for now a concrete generic struct is enough.)
 /// Constructor signature shared by every iter-wise worker (`BareboneWorker::new`,
 /// `HpUnifiedWorker::new`, …). The factory is handed the chosen worker's `new` as
 /// a plain function pointer, so it can stamp the concrete `W` without `W::new`
 /// living on the [`IterWorker`] trait. `pool_tag` is the deployment-set pool name
 /// ("main" / "prefill" / "decode" / …) — it disambiguates `cost_log` filenames
 /// across pools, since `WorkerId` is per-pool (every pool starts at 0).
-pub type WorkerBuildFn<M, W> =
-    fn(WorkerId, &'static str, Arc<M>, SharedRequests, WorkerConfig, Option<PathBuf>) -> W;
+///
+/// The cluster handle is threaded through last: every worker self-allocates its
+/// owned GPU block via `cluster.borrow_mut().allocate(pool.0, id.0,
+/// model.gpus_per_replica(), gpu_name)` at construction. PD workers additionally
+/// keep the handle for runtime `submit_transfer`; non-PD workers drop it after
+/// `allocate`. The deployment fills `gpu_name` from its arch/L4 facts; `pool` is
+/// the L6 pool id this worker belongs to.
+pub type WorkerBuildFn<M, W> = fn(
+    WorkerId,
+    &'static str,
+    Arc<M>,
+    SharedRequests,
+    WorkerConfig,
+    Option<PathBuf>,
+    PoolId,
+    &str, // gpu_name
+    SharedGpuCluster,
+) -> W;
 
+/// Builds identical unified workers for a DP pool, each sharing the one
+/// `SharedRequests` handle and an `Arc` of the model. The worker sizes its own
+/// `KvPool` from `worker_config.attn_kv_bytes`. (L7 will generalize this into a
+/// trait; for now a concrete generic struct is enough.)
 pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel, W: IterWorker> {
     pub model: Arc<M>,
     pub requests: SharedRequests,
@@ -98,12 +78,11 @@ pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel, W: IterWorker> {
     /// Run log dir, handed to each worker for its `cost_log` writer. `Some`
     /// enables per-iteration cost logging; `None` disables it.
     pub log_dir: Option<PathBuf>,
-    /// GPU facts threaded down from the deployment (which reads them off the L4
-    /// parallel layout): the GPU type every worker runs on, and how many GPUs one
-    /// worker (model replica) spans. The factory does not derive these — it only
-    /// carries them so L6 can assemble the run's [`GpuInventory`].
+    /// GPU type every worker stamped by this factory runs on. Threaded down from
+    /// the deployment (which reads it off the L4 parallel layout). The per-worker
+    /// GPU **count** is not a factory fact — it's `model.gpus_per_replica()`,
+    /// which the worker reads off the model at allocate time.
     pub gpu_name: String,
-    pub gpus_per_worker: u16,
     /// Pool name handed to every worker so each `cost_log` file is unique
     /// across pools (`worker_<pool_tag>_<id>.parquet`).
     pub pool_tag: &'static str,
@@ -120,7 +99,6 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
         worker_config: WorkerConfig,
         log_dir: Option<PathBuf>,
         gpu_name: String,
-        gpus_per_worker: u16,
         pool_tag: &'static str,
         build_fn: WorkerBuildFn<M, W>,
     ) -> Self {
@@ -130,13 +108,15 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
             worker_config,
             log_dir,
             gpu_name,
-            gpus_per_worker,
             pool_tag,
             build_fn,
         }
     }
 
-    pub fn build(&self, idx: u16) -> W {
+    /// Stamp the `idx`th worker for `pool`, threading the shared `cluster` so the
+    /// worker can self-register its GPU block (and, for PD workers, keep the
+    /// handle for runtime transfers).
+    pub fn build(&self, idx: u16, pool: PoolId, cluster: &SharedGpuCluster) -> W {
         (self.build_fn)(
             WorkerId(idx),
             self.pool_tag,
@@ -144,6 +124,9 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
             std::rc::Rc::clone(&self.requests),
             self.worker_config,
             self.log_dir.clone(),
+            pool,
+            &self.gpu_name,
+            std::rc::Rc::clone(cluster),
         )
     }
 }

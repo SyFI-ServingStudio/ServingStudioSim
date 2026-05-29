@@ -16,10 +16,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
-use crate::common::{RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
 use crate::timing::LeafMetrics;
 use crate::worker::admission_helpers::Batch;
+use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::types::{
     BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
 };
@@ -73,6 +74,9 @@ pub struct BareboneWorker<M: IterwiseUnifiedModel> {
 }
 
 impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
+    /// Barebone has no transfers, so it registers its GPU block in the shared
+    /// cluster (for the run-meta report) and drops the handle — no field needed.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: WorkerId,
         pool_tag: &'static str,
@@ -80,7 +84,13 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         requests: SharedRequests,
         config: WorkerConfig,
         cost_log_dir: Option<PathBuf>,
+        pool: PoolId,
+        gpu_name: &str,
+        cluster: SharedGpuCluster,
     ) -> Self {
+        cluster
+            .borrow_mut()
+            .allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
         // The worker sizes its own KvPool: memory allowance ÷ the model's
         // per-token KV footprint (L5 owns the division; arch owns the footprint).
         let kv_capacity = (config.attn_kv_bytes / model.kv_bytes_per_token().max(1)).max(1);
@@ -117,6 +127,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
     pub fn enqueue(&mut self, msg: WorkerMsg) {
         match msg {
             WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
+            WorkerMsg::Handoff { .. } => unreachable!("barebone worker receives no PD handoff"),
         }
     }
 
@@ -464,8 +475,15 @@ mod tests {
     use crate::common::{Request, RequestStore};
     use crate::timing::cache::interp::{CoverageFlags, Metrics4};
     use crate::timing::LeafMetrics;
+    use crate::worker::gpu_cluster::{CostSource, GpuCluster, SharedGpuCluster};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// Test cluster: empty, with an unused analytic cost (barebone never
+    /// transfers, but `new` still calls `allocate` on it).
+    fn test_cluster() -> SharedGpuCluster {
+        Rc::new(RefCell::new(GpuCluster::new(CostSource::analytic(1.0))))
+    }
 
     /// Fixed-cost stand-in for an L4 model — drives the FSM without Python/bridge.
     struct FakeModel {
@@ -531,6 +549,9 @@ mod tests {
             Rc::clone(&store),
             WorkerConfig::default(),
             None,
+            crate::common::PoolId(0),
+            "test-gpu",
+            test_cluster(),
         );
         w.enqueue(WorkerMsg::Request(RequestId(0)));
 
@@ -560,6 +581,9 @@ mod tests {
             Rc::clone(&store),
             WorkerConfig::default(),
             None,
+            crate::common::PoolId(0),
+            "test-gpu",
+            test_cluster(),
         );
         for id in [0, 1, 2] {
             w.enqueue(WorkerMsg::Request(RequestId(id)));

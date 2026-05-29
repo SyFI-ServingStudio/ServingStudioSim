@@ -1,28 +1,41 @@
 //! `pd` — prefill/decode-disaggregated deployment. Two DP pools of unified-style
 //! workers: a prefill pool (whose workers only prefill, then hand off) and a
-//! decode pool (whose workers admit already-prefilled requests straight into
-//! decode). L6b routes the handoff: a prefill worker emits `PrefillDone`, this
-//! flow enqueues the request into the decode pool (L6 design.md §「PD handoff」).
+//! decode pool (whose workers pull the handed-off KV, then decode). L6b routes
+//! the handoff: a prefill worker emits `PrefillDone` carrying its KV layout
+//! (`SendSpec`); this flow forwards that to a placement-chosen decode worker as a
+//! `WorkerMsg::Handoff`, which the decode worker assembles into a full
+//! `TransferPlan` by combining the sender side with its own pre-resolved
+//! destination block (L6 design.md §「PD handoff」).
 //!
-//! Copied from `simple_dp` (build-first): each pool is its own
-//! `SimpleDpPoolController`, generic over its (model, worker) pair — the prefill
-//! and decode pools may run different archs/workers. v1 ignores the prefill→decode
-//! KV transfer cost; the handoff is a control-plane event only, and the shared
-//! `RequestStore` carries the request's prefill state across pools.
+//! Workers own their own GPU id ranges (self-allocated from the shared cluster
+//! at construction), so there is no flow-side endpoint lookup table — `tick`
+//! simply forwards the sender side and the decode worker fills in its own
+//! destination side.
+//!
+//! The KV transfer cost is modeled via the shared [`GpuCluster`] (the merged
+//! GPU registry + send/recv stream contention oracle, fed by the `p2p_inter`
+//! curve). One cluster is built here and threaded into both pool controllers;
+//! workers register their GPU blocks in it at construction, and PD decode
+//! workers keep a handle for runtime `submit_transfer`. All PD-specific
+//! orchestration lives here; the reused `SimpleDpPoolController` stays
+//! deployment-agnostic (the generic `admit_msg` primitive routes a `Handoff`,
+//! and the shared `RequestStore` carries the request's prefill state across
+//! pools).
 
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::common::{PoolId, Request, RequestId, SharedRequests, Time};
-use crate::worker::{IterWorker, WorkerEvent};
+use crate::common::{PoolId, Request, SharedRequests, Time};
+use crate::worker::{CostSource, GpuCluster, IterWorker, SharedGpuCluster, WorkerEvent, WorkerMsg};
 
-use super::super::{Flow, GpuInventory, OrchAction, PoolEvent, UnifiedWorkerFactory};
+use super::super::{Flow, OrchAction, PoolEvent, UnifiedWorkerFactory};
 use super::simple_dp::{to_pool_event, SimpleDpPoolConfig, SimpleDpPoolController};
 
 // ── L6b: PD deployment flow (the object L7 calls) ──────────────────────────────
 
 /// Prefill + decode pools. Generic over each pool's (model, worker) pair so the
 /// two halves can carry distinct archs/workers (`MP`/`WP` prefill, `MD`/`WD`
-/// decode). The run-level `inventory` aggregates GPUs from both pools with
-/// globally-unique ids (prefill pool first, then decode).
+/// decode). The shared cluster aggregates GPUs from both pools with globally-
+/// unique ids (prefill pool first, then decode) and doubles as the transfer
+/// timing oracle.
 pub struct PdFlow<MP, WP, MD, WD>
 where
     MP: IterwiseUnifiedModel,
@@ -33,7 +46,11 @@ where
     requests: SharedRequests,
     prefill_pool: SimpleDpPoolController<MP, WP>,
     decode_pool: SimpleDpPoolController<MD, WD>,
-    inventory: GpuInventory,
+    /// Shared run-level GPU cluster — both the registry (workers `allocate`
+    /// their own block into it at construction) and the transfer oracle (PD
+    /// decode workers retain a handle for `submit_transfer`). One object, two
+    /// roles; see `worker::gpu_cluster`.
+    cluster: SharedGpuCluster,
     /// Reused per-tick event sinks (one per pool) — workers push `WorkerEvent`s
     /// into them during `tick_collect` (`PrefillDone` on the producer side,
     /// completions on either side), drained + cleared here each tick.
@@ -48,32 +65,31 @@ where
     MD: IterwiseUnifiedModel,
     WD: IterWorker,
 {
-    /// Build both pools into one run-level inventory. `prefill_cfg`/`decode_cfg`
-    /// carry distinct `PoolId`s so each pool's GPUs are tagged correctly; the
-    /// caller threads the same shared store into both factories.
+    /// Build the shared `GpuCluster` with the production transfer cost, then
+    /// both pools (their workers self-register their GPU blocks in the cluster
+    /// at construction). `cost` is the cluster's per-link transfer-cost source
+    /// (the `p2p_inter` kernel in production, an analytic curve in tests).
     pub fn new(
         prefill_cfg: &SimpleDpPoolConfig,
         prefill_factory: &UnifiedWorkerFactory<MP, WP>,
         decode_cfg: &SimpleDpPoolConfig,
         decode_factory: &UnifiedWorkerFactory<MD, WD>,
+        cost: CostSource,
     ) -> Self {
         let requests = std::rc::Rc::clone(&prefill_factory.requests);
-        let mut inventory = GpuInventory::default();
+        let cluster: SharedGpuCluster =
+            std::rc::Rc::new(std::cell::RefCell::new(GpuCluster::new(cost)));
         // Allocate prefill GPUs first, then decode — ids continue across pools.
-        let prefill_pool = SimpleDpPoolController::new(prefill_cfg, prefill_factory, &mut inventory);
-        let decode_pool = SimpleDpPoolController::new(decode_cfg, decode_factory, &mut inventory);
+        let prefill_pool = SimpleDpPoolController::new(prefill_cfg, prefill_factory, &cluster);
+        let decode_pool = SimpleDpPoolController::new(decode_cfg, decode_factory, &cluster);
         Self {
             requests,
             prefill_pool,
             decode_pool,
-            inventory,
+            cluster,
             prefill_events: Vec::new(),
             decode_events: Vec::new(),
         }
-    }
-
-    fn admit_to_decode(&mut self, req: RequestId) {
-        self.decode_pool.admit(req);
     }
 }
 
@@ -100,19 +116,25 @@ where
         prefill_events.clear();
         self.prefill_pool.tick_collect(now, &mut prefill_events);
         let prefill_pool = self.prefill_pool.pool();
-        let mut handoffs = Vec::new();
+        // Forward each PrefillDone directly: the sender block (`src_base`,
+        // `src_count`) travels straight from `SendSpec` into `WorkerMsg::Handoff`;
+        // the destination block is the decode worker's own and gets filled in
+        // on receipt. No flow-side endpoint table, no intermediate Vec.
         for ev in prefill_events.drain(..) {
             match to_pool_event(prefill_pool, ev) {
-                PoolEvent::PrefillDone { req, .. } => handoffs.push(req),
+                PoolEvent::PrefillDone { req, send_spec, .. } => {
+                    self.decode_pool.admit_msg(WorkerMsg::Handoff {
+                        req,
+                        send_gid: send_spec.send_gid,
+                        bytes: send_spec.kv_bytes,
+                    });
+                }
                 PoolEvent::RequestComplete { req, .. } => {
                     actions.push(OrchAction::Complete { req })
                 }
             }
         }
         self.prefill_events = prefill_events;
-        for req in handoffs {
-            self.admit_to_decode(req);
-        }
 
         // Consumer: tick + collect the decode pool. It only ever completes.
         let mut decode_events = std::mem::take(&mut self.decode_events);
@@ -133,8 +155,8 @@ where
         actions
     }
 
-    fn inventory(&self) -> &GpuInventory {
-        &self.inventory
+    fn cluster(&self) -> &SharedGpuCluster {
+        &self.cluster
     }
 }
 
@@ -146,7 +168,7 @@ pub const PD_DECODE_POOL: PoolId = PoolId(1);
 mod tests {
     use super::*;
     use crate::arch::contract::UnifiedArchInput;
-    use crate::common::RequestStore;
+    use crate::common::{RequestId, RequestStore};
     use crate::orchestrator::DpPlacementPolicy;
     use crate::timing::cache::interp::{CoverageFlags, Metrics4};
     use crate::timing::LeafMetrics;
@@ -195,7 +217,6 @@ mod tests {
             WorkerConfig::default(),
             None,
             "test-gpu".to_string(),
-            1,
             "prefill",
             PdPrefillWorker::<FakeModel>::new,
         );
@@ -205,7 +226,6 @@ mod tests {
             WorkerConfig::default(),
             None,
             "test-gpu".to_string(),
-            1,
             "decode",
             PdDecodeWorker::<FakeModel>::new,
         );
@@ -219,7 +239,15 @@ mod tests {
             num_workers: 1,
             placement: DpPlacementPolicy::RoundRobin,
         };
-        let flow = PdFlow::new(&prefill_cfg, &prefill_factory, &decode_cfg, &decode_factory);
+        // FakeModel: 1 gpu/replica, 1 attn dp group → num_attn_shards = 1.
+        // Analytic cost so the transfer path is exercised without a real kernel.
+        let flow = PdFlow::new(
+            &prefill_cfg,
+            &prefill_factory,
+            &decode_cfg,
+            &decode_factory,
+            CostSource::analytic(100.0),
+        );
         (flow, store)
     }
 
@@ -256,11 +284,12 @@ mod tests {
     }
 
     #[test]
-    fn inventory_aggregates_both_pools() {
+    fn cluster_aggregates_both_pools() {
         let (flow, _store) = build_flow();
         // 1 prefill worker + 1 decode worker, 1 gpu each → 2 gpus, dense 0..2 ids.
-        assert_eq!(flow.inventory().num_gpus(), 2);
-        let ids: Vec<u16> = flow.inventory().gpus.iter().map(|g| g.id).collect();
+        let cluster = flow.cluster().borrow();
+        assert_eq!(cluster.num_gpus(), 2);
+        let ids: Vec<u16> = cluster.gpus.iter().map(|g| g.id).collect();
         assert_eq!(ids, vec![0, 1]);
     }
 }

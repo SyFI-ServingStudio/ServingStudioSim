@@ -1,13 +1,14 @@
 //! `pd` deployment — prefill/decode disaggregation. Two pools: a prefill pool of
 //! `PdPrefillWorker`s and a decode pool of `PdDecodeWorker`s, wired into a
 //! [`PdFlow`]. A prefill worker prefills then hands off (`PrefillDone`); the flow
-//! enqueues the request into the decode pool, which decodes it to completion.
+//! resolves physical GPU endpoints, builds a `TransferPlan`, and the decode pool
+//! pulls the KV across the shared `GpuCluster` before decoding to completion.
 //!
-//! v1 simplifications (build-first): the prefill→decode KV transfer is not modeled
-//! (handoff is a control-plane event; the shared `RequestStore` carries prefill
-//! state across pools). Wired pairings are `llama3_dense_tp` → `llama3_dense_tp`
-//! and `llama3_dense_tp` → `llama3_dp_attn_tp_ffn`; other pairings bail until a
-//! concrete experiment needs them.
+//! The KV transfer cost comes from the `p2p_inter` L1 kernel (per-link bandwidth
+//! profiled vs message size); `build_transfer_cost` wires it. Wired pairings are
+//! `llama3_dense_tp` → `llama3_dense_tp` and `llama3_dense_tp` →
+//! `llama3_dp_attn_tp_ffn`; other pairings bail until a concrete experiment
+//! needs them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::{
     llama3_dense_tp, llama3_dp_attn_tp_ffn, DenseTpParallel, DpAttnTpFfnParallel, IterArchSel,
 };
-use crate::common::SharedRequests;
+use crate::common::{Fabric, SharedRequests};
 use crate::deployment::config::PdConfig;
 use crate::orchestrator::common::WorkerBuildFn;
 use crate::orchestrator::config::{GroupSpec, PoolSpec};
@@ -27,8 +28,10 @@ use crate::orchestrator::{
     DpPlacementPolicy, Flow, PdFlow, PlacementPolicy, SimpleDpPoolConfig, UnifiedWorkerFactory,
     PD_DECODE_POOL, PD_PREFILL_POOL,
 };
+use crate::timing::bridge::DType;
+use crate::timing::kernels::{P2pInterKernel, P2pInterKernelConfig};
 use crate::timing::PerfApiBridge;
-use crate::worker::{IterWorkerSel, PdDecodeWorker, PdPrefillWorker, WorkerConfig};
+use crate::worker::{CostSource, IterWorkerSel, PdDecodeWorker, PdPrefillWorker, WorkerConfig};
 
 use super::Deployment;
 
@@ -67,6 +70,11 @@ impl Deployment for PdDeployment {
         let decode_wc = worker_config(&dg.worker, &cfg.io.log_dir, cfg.io.log_output_token_times);
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
 
+        // The KV-transfer cost source: the profiled inter-node p2p curve, keyed
+        // on the decode GPU (receiver). Built once here (the bridge lives at L7)
+        // and handed to the flow's shared `GpuCluster`.
+        let cost = build_transfer_cost(&dg.gpu, bridge)?;
+
         // Only the pairs actually exercised are wired (add a new arm when a new
         // pairing is needed). Each arm builds both pools' concrete models (own
         // dims/TP) then assembles the flow. Today: tp→tp and tp→dp_attn.
@@ -85,6 +93,7 @@ impl Deployment for PdDeployment {
                     dg.gpu.clone(),
                     prefill_cfg,
                     decode_cfg,
+                    cost,
                 ))
             }
             // Cross-arch PD: TP prefill hands off to a DP-attention decode. Same
@@ -104,6 +113,7 @@ impl Deployment for PdDeployment {
                     dg.gpu.clone(),
                     prefill_cfg,
                     decode_cfg,
+                    cost,
                 ))
             }
             (p, d) => bail!(
@@ -244,20 +254,18 @@ fn assemble_pd_flow<MP, MD>(
     decode_gpu_name: String,
     prefill_cfg: SimpleDpPoolConfig,
     decode_cfg: SimpleDpPoolConfig,
+    cost: CostSource,
 ) -> Box<dyn Flow>
 where
     MP: IterwiseUnifiedModel + 'static,
     MD: IterwiseUnifiedModel + 'static,
 {
-    let prefill_gpus = prefill_model.gpus_per_replica();
-    let decode_gpus = decode_model.gpus_per_replica();
     let prefill_factory: UnifiedWorkerFactory<MP, PdPrefillWorker<MP>> = UnifiedWorkerFactory::new(
         prefill_model,
         std::rc::Rc::clone(&store),
         prefill_wc,
         log_dir.clone(),
         prefill_gpu_name,
-        prefill_gpus,
         "prefill",
         PdPrefillWorker::<MP>::new as WorkerBuildFn<MP, PdPrefillWorker<MP>>,
     );
@@ -267,7 +275,6 @@ where
         decode_wc,
         log_dir,
         decode_gpu_name,
-        decode_gpus,
         "decode",
         PdDecodeWorker::<MD>::new as WorkerBuildFn<MD, PdDecodeWorker<MD>>,
     );
@@ -276,7 +283,28 @@ where
         &prefill_factory,
         &decode_cfg,
         &decode_factory,
+        cost,
     ))
+}
+
+/// Build the PD KV-transfer cost source: the profiled `p2p_inter` curve for the
+/// receiver GPU. v1 assumes a cross-node (Infiniband) handoff over the `nccl`
+/// backend and a bf16 element dtype — the curve is keyed by message-size bytes,
+/// so dtype only selects the profiled table. Fabric/dtype become config when PD
+/// placement grows fabric awareness.
+fn build_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result<CostSource> {
+    let kernel = P2pInterKernel::build(
+        "pd_kv_transfer".to_string(),
+        P2pInterKernelConfig {
+            backends: vec!["nccl"],
+            gpu_name: gpu_name.to_string(),
+            fabric: Fabric::Infiniband,
+            dtype: DType::Bf16,
+        },
+        bridge,
+    )
+    .with_context(|| format!("building p2p_inter kernel for PD KV transfer on {gpu_name}"))?;
+    Ok(CostSource::Kernel(kernel))
 }
 
 fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {

@@ -205,14 +205,12 @@ fn assemble_flow<M: IterwiseUnifiedModel, W: IterWorker + 'static>(
     dp_cfg: SimpleDpConfig,
     build_fn: WorkerBuildFn<M, W>,
 ) -> Box<dyn Flow> {
-    let gpus_per_worker = model.gpus_per_replica();
     let factory = UnifiedWorkerFactory::new(
         model,
         store,
         worker_config,
         log_dir,
         gpu_name,
-        gpus_per_worker,
         "main",
         build_fn,
     );

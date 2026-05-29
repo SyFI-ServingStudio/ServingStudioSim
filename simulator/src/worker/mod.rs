@@ -7,6 +7,7 @@
 
 pub mod admission_helpers;
 pub mod config;
+pub mod gpu_cluster;
 pub mod hp_unified;
 pub mod iter_worker;
 pub mod pd_decode;
@@ -16,11 +17,13 @@ pub mod unified;
 
 pub use admission_helpers::{Batch, DecodeReqState, KvAdmission, KvPool, LoadBalance};
 pub use config::{AttnWorkerSel, BatchPolicy, FfnWorkerSel, IterWorkerSel};
+pub use gpu_cluster::{CostSource, GpuCluster, GpuInfo, SharedGpuCluster};
 pub use hp_unified::HpUnifiedWorker;
 pub use iter_worker::IterWorker;
 pub use pd_decode::PdDecodeWorker;
 pub use pd_prefill::PdPrefillWorker;
 pub use types::{
-    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
+    BatchFsmState, IterCursor, SendSpec, TransferPlan, WorkerConfig, WorkerEvent, WorkerFsmState,
+    WorkerMsg, WorkerStatus,
 };
 pub use unified::BareboneWorker;

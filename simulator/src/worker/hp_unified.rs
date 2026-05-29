@@ -18,10 +18,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
-use crate::common::{RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
 use crate::timing::{LeafMetrics, SlotInput};
 use crate::worker::admission_helpers::{Batch, LoadBalance};
+use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
     BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
@@ -74,6 +75,9 @@ pub struct HpUnifiedWorker<M: IterwiseUnifiedModel> {
 }
 
 impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
+    /// HP/DP has no transfers, so it registers its GPU block in the shared
+    /// cluster (for the run-meta report) and drops the handle.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: WorkerId,
         pool_tag: &'static str,
@@ -81,7 +85,13 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         requests: SharedRequests,
         config: WorkerConfig,
         cost_log_dir: Option<PathBuf>,
+        pool: PoolId,
+        gpu_name: &str,
+        cluster: SharedGpuCluster,
     ) -> Self {
+        cluster
+            .borrow_mut()
+            .allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
         let num_groups = model.num_attn_dp_groups().max(1) as usize;
         // Each DP shard is an independent attention TP group with its own KV cache;
         // the per-GPU memory allowance sizes each group's pool identically.
@@ -442,6 +452,7 @@ impl<M: IterwiseUnifiedModel> IterWorker for HpUnifiedWorker<M> {
     fn enqueue(&mut self, msg: WorkerMsg) {
         match msg {
             WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
+            WorkerMsg::Handoff { .. } => unreachable!("hp_unified worker receives no PD handoff"),
         }
     }
 
@@ -471,10 +482,15 @@ impl<M: IterwiseUnifiedModel> IterWorker for HpUnifiedWorker<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{Request, RequestStore};
+    use crate::common::{PoolId, Request, RequestStore};
     use crate::timing::cache::interp::{CoverageFlags, Metrics4};
+    use crate::worker::gpu_cluster::{CostSource, GpuCluster, SharedGpuCluster};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    fn test_cluster() -> SharedGpuCluster {
+        Rc::new(RefCell::new(GpuCluster::new(CostSource::analytic(1.0))))
+    }
 
     /// Fixed-cost stand-in for an L4 model with a configurable DP-group count.
     struct FakeDpModel {
@@ -530,6 +546,9 @@ mod tests {
             store,
             WorkerConfig::default(),
             None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
         )
     }
 

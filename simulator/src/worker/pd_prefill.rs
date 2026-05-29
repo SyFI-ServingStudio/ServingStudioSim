@@ -18,13 +18,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
-use crate::common::{RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
 use crate::timing::{LeafMetrics, SlotInput};
 use crate::worker::admission_helpers::Batch;
+use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
+    BatchFsmState, IterCursor, SendSpec, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg,
+    WorkerStatus,
 };
 
 struct PrefillRuntime {
@@ -66,9 +68,18 @@ pub struct PdPrefillWorker<M: IterwiseUnifiedModel> {
     cost_scratch: Vec<LeafMetrics>,
     cost_groups: Vec<GroupInputLog>,
     cost_slot_inputs: Vec<SlotInput>,
+    /// This worker's send-side comm group id, registered with the shared cluster
+    /// at construction (covers the `model.num_attn_shards()` GPUs that hold KV).
+    /// Stamped into every emitted `SendSpec`; the cluster knows the underlying
+    /// link count and free-time, the worker keeps only this opaque id.
+    send_gid: u16,
 }
 
 impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
+    /// PD prefill self-registers its GPU block in the cluster and stores the
+    /// returned base for emit-time `SendSpec` stamping. It does not keep the
+    /// cluster handle — only the decode side calls `submit_transfer`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: WorkerId,
         pool_tag: &'static str,
@@ -76,7 +87,17 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         requests: SharedRequests,
         config: WorkerConfig,
         cost_log_dir: Option<PathBuf>,
+        pool: PoolId,
+        gpu_name: &str,
+        cluster: SharedGpuCluster,
     ) -> Self {
+        let send_gid = {
+            let mut c = cluster.borrow_mut();
+            let gpu_base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
+            // Arch invariant: `num_attn_shards() ≤ gpus_per_replica`, so the
+            // attn-shard prefix is the comm group covering KV storage.
+            c.register_comm_group(gpu_base, model.num_attn_shards().max(1))
+        };
         let kv_capacity = (config.attn_kv_bytes / model.kv_bytes_per_token().max(1)).max(1);
         let cost_logger = match cost_log_dir {
             Some(dir) => match CostLogger::open(&dir, pool_tag, id, &model.cost_log_manifest()) {
@@ -88,6 +109,9 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             },
             None => None,
         };
+        // Arch invariant: `num_attn_shards() ≤ gpus_per_replica == gpus_per_worker`,
+        // so no clamp against the worker's GPU range is needed — the model is
+        // authoritative for shard count.
         Self {
             id,
             model,
@@ -100,6 +124,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             cost_scratch: Vec::new(),
             cost_groups: Vec::new(),
             cost_slot_inputs: Vec::new(),
+            send_gid,
         }
     }
 
@@ -254,35 +279,45 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
 
     fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
         let log_tokens = self.config.log_output_token_times;
+        let kv_bytes_per_token = self.model.kv_bytes_per_token();
+        // Sender side is fully determined by this worker's pre-registered comm
+        // group; emit stamps the gid and the cluster resolves link count /
+        // free-time at `submit_transfer` time.
+        let send_gid = self.send_gid;
+        let worker_id = self.id;
         // The prefill produced the request's first output token (TTFT). Then,
         // instead of entering a local decode set, the request is handed off to a
         // decode pool: emit RequestComplete if it needed only that one token,
-        // else PrefillDone (L6 routes it to the decode pool).
-        let mut done: Vec<(RequestId, bool)> = Vec::new(); // (rid, is_complete)
-        {
-            let mut store = self.requests.borrow_mut();
-            for &rid in &self.batches[0].prefill_admits {
-                let r = &mut store[rid];
-                r.prefill_processed = r.prompt_len;
-                r.record_first_token(now, log_tokens);
-                done.push((rid, r.is_complete()));
-            }
-        }
-        self.batches[0].prefill_admits.clear();
-        for (rid, complete) in done {
+        // else PrefillDone (L6 routes it to the decode pool). One pass over the
+        // admits — `self.requests` (RefCell), `self.runtime`, `self.batches[0]`
+        // are disjoint fields, so split-borrows let us read+write per-record
+        // and remove `request_to_group` in the same loop without a scratch Vec.
+        let mut store = self.requests.borrow_mut();
+        let n = self.batches[0].prefill_admits.len();
+        for i in 0..n {
+            let rid = self.batches[0].prefill_admits[i];
+            let r = &mut store[rid];
+            r.prefill_processed = r.prompt_len;
+            r.record_first_token(now, log_tokens);
+            let kv_bytes = (r.prompt_len + r.prefix_kv) as u64 * kv_bytes_per_token;
+            let complete = r.is_complete();
+            // r is unused below — NLL releases the borrow on `store`.
             self.runtime.request_to_group.remove(&rid);
             if complete {
                 events.push(WorkerEvent::RequestComplete {
-                    worker: self.id,
+                    worker: worker_id,
                     req: rid,
                 });
             } else {
                 events.push(WorkerEvent::PrefillDone {
-                    worker: self.id,
+                    worker: worker_id,
                     req: rid,
+                    send_spec: SendSpec { kv_bytes, send_gid },
                 });
             }
         }
+        drop(store);
+        self.batches[0].prefill_admits.clear();
     }
 
     // ── build_arch_input — one group, prefill-only (no decodes on a prefill worker)
@@ -373,6 +408,7 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdPrefillWorker<M> {
     fn enqueue(&mut self, msg: WorkerMsg) {
         match msg {
             WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
+            WorkerMsg::Handoff { .. } => unreachable!("prefill worker receives no PD handoff"),
         }
     }
 
@@ -393,10 +429,15 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdPrefillWorker<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{Request, RequestStore};
+    use crate::common::{PoolId, Request, RequestStore};
     use crate::timing::cache::interp::{CoverageFlags, Metrics4};
+    use crate::worker::gpu_cluster::{CostSource, GpuCluster, SharedGpuCluster};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    fn test_cluster() -> SharedGpuCluster {
+        Rc::new(RefCell::new(GpuCluster::new(CostSource::analytic(1.0))))
+    }
 
     struct FakeModel {
         ms: f64,
@@ -445,6 +486,9 @@ mod tests {
             store,
             WorkerConfig::default(),
             None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
         )
     }
 
@@ -458,11 +502,15 @@ mod tests {
         for step in 0..20u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
         }
+        // FakeModel: kv_bytes_per_token=1, 1 gpu, 1 dp group → num_attn_shards=1.
+        // kv_bytes = prompt_len (16) + prefix_kv (0). The worker registers one
+        // comm group at construction → send_gid=0.
         assert_eq!(
             events,
             vec![WorkerEvent::PrefillDone {
                 worker: WorkerId(0),
-                req: RequestId(0)
+                req: RequestId(0),
+                send_spec: SendSpec { kv_bytes: 16, send_gid: 0 },
             }]
         );
         let s = store.borrow();

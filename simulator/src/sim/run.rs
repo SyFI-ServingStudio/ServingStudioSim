@@ -268,7 +268,7 @@ pub fn run_sim(
     // render from it so the log and `summary.json` can't diverge.
     let wall_s = wall_start.elapsed().as_secs_f64();
     let safe_wall = wall_s.max(1e-9);
-    let num_gpus = flow.inventory().num_gpus();
+    let num_gpus = flow.cluster().borrow().num_gpus();
     let summary = {
         let s = store.borrow();
         let total = s.iter().count() as u64;
@@ -511,7 +511,6 @@ mod tests {
             },
             None,
             "test-gpu".to_string(),
-            1,
             "main",
             BareboneWorker::<FakeModel>::new,
         );

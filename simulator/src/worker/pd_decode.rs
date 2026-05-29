@@ -21,18 +21,35 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
-use crate::common::{RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
 use crate::timing::{LeafMetrics, SlotInput};
 use crate::worker::admission_helpers::{Batch, LoadBalance};
+use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
+    BatchFsmState, IterCursor, TransferPlan, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg,
+    WorkerStatus,
 };
 
 struct DecodeRuntime {
-    /// Handoff queue: requests whose prefill is done, awaiting a decode slot.
+    /// Handoff queue: requests whose prefill is done AND KV is resident, awaiting
+    /// a decode slot. Direct-`Request` admits land here too (test path / cluster-
+    /// free runs treat the transfer as instant).
     pending_decodes: VecDeque<RequestId>,
+    /// Handoffs newly delivered to this worker, awaiting submission to the shared
+    /// cluster. Submitted at the next `tick_inner` (no `now` at `enqueue` time).
+    pending_pulls: VecDeque<(RequestId, TransferPlan)>,
+    /// The single pull currently flowing through the cluster (0 or 1). A NCCL
+    /// collective is strictly sequential at one comm, so the worker keeps at
+    /// most one in flight; subsequent handoffs wait in `pending_pulls` until
+    /// the active one's `pull_end` is reached. Promoted to `pending_decodes`
+    /// once `now >= pull_end`.
+    in_transit: Option<(RequestId, Time)>,
+    /// Shared run-level transfer oracle. Always present (handed in at `new`);
+    /// the previous `Option` / `KvPuller::set_cluster` two-phase wiring was
+    /// dropped now that every worker takes the cluster at construction.
+    cluster: SharedGpuCluster,
     request_to_group: HashMap<RequestId, u16>,
     iter_counter: u32,
     iter_compute_start: Time,
@@ -43,9 +60,12 @@ struct DecodeRuntime {
 }
 
 impl DecodeRuntime {
-    fn new(balance: LoadBalance) -> Self {
+    fn new(balance: LoadBalance, cluster: SharedGpuCluster) -> Self {
         Self {
             pending_decodes: VecDeque::new(),
+            pending_pulls: VecDeque::new(),
+            in_transit: None,
+            cluster,
             request_to_group: HashMap::new(),
             iter_counter: 0,
             iter_compute_start: Time::ZERO,
@@ -76,9 +96,18 @@ pub struct PdDecodeWorker<M: IterwiseUnifiedModel> {
     /// (`fill_arch_input`) so the hot decode loop allocates ~nothing — the model
     /// reads it by reference; the cost log snapshots scalars out of it.
     arch_buf: UnifiedArchInput,
+    /// Destination side of every incoming PD handoff = this worker's own comm
+    /// group id (registered once at construction; covers the attn-shard prefix
+    /// of its GPU range, sized by the decode model's `num_attn_shards()`).
+    /// Stamped into each `TransferPlan` enqueued by `enqueue(Handoff)`.
+    recv_gid: u16,
 }
 
 impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
+    /// Decode self-registers its GPU block in the shared cluster, pre-resolves
+    /// its destination block (the first `num_attn_shards` GPUs of its own
+    /// range), and **keeps the cluster handle** for runtime `submit_transfer`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: WorkerId,
         pool_tag: &'static str,
@@ -86,7 +115,17 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
         requests: SharedRequests,
         config: WorkerConfig,
         cost_log_dir: Option<PathBuf>,
+        pool: PoolId,
+        gpu_name: &str,
+        cluster: SharedGpuCluster,
     ) -> Self {
+        let recv_gid = {
+            let mut c = cluster.borrow_mut();
+            let gpu_base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
+            // Arch invariant: `num_attn_shards() ≤ gpus_per_replica`, so the
+            // attn-shard prefix is the comm group used as recv endpoint.
+            c.register_comm_group(gpu_base, model.num_attn_shards().max(1))
+        };
         let num_groups = model.num_attn_dp_groups().max(1) as usize;
         // Each DP shard is an independent attention TP group with its own KV cache;
         // the per-GPU memory allowance sizes each group's pool identically.
@@ -115,7 +154,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             model,
             requests,
             config,
-            runtime: DecodeRuntime::new(balance),
+            runtime: DecodeRuntime::new(balance, cluster),
             batches,
             cost_logger,
             cost_slots: Vec::new(),
@@ -123,10 +162,49 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             cost_groups: Vec::new(),
             cost_slot_inputs: Vec::new(),
             arch_buf: UnifiedArchInput::default(),
+            recv_gid,
+        }
+    }
+
+    /// Pull FSM: drive at most one transfer through the cluster at a time. Each
+    /// call (a) promotes the in-flight pull to `pending_decodes` if its KV is
+    /// now resident, then (b) if no pull is in flight, submits the next pending
+    /// one. The loop wraps both so an instant transfer (zero-byte / zero-cost
+    /// path) doesn't park itself in `in_transit` for a tick. Keeping at most one
+    /// in flight mirrors the cluster's serialization (a comm group's `recv_free`
+    /// queues subsequent transfers anyway) and reads more directly: a glance at
+    /// `in_transit.is_some()` answers "am I waiting on a pull".
+    ///
+    /// Runs at the top of every tick — independent of the decode iteration FSM,
+    /// so a pull can complete mid-iter and admit at the next iteration boundary.
+    fn advance_pulls(&mut self, now: Time) {
+        loop {
+            if let Some((rid, pull_end)) = self.runtime.in_transit {
+                if now >= pull_end {
+                    self.runtime.pending_decodes.push_back(rid);
+                    self.runtime.in_transit = None;
+                } else {
+                    return;
+                }
+            }
+            // Slot free — submit the next handoff if any.
+            let Some((rid, transfer)) = self.runtime.pending_pulls.pop_front() else {
+                return;
+            };
+            let pull_end = self.runtime.cluster.borrow_mut().submit_transfer(
+                now,
+                transfer.send_gid,
+                transfer.recv_gid,
+                transfer.bytes,
+            );
+            self.runtime.in_transit = Some((rid, pull_end));
+            // Loop back: if pull_end <= now (instant transfer), promote it this
+            // same tick rather than parking a finished pull in `in_transit`.
         }
     }
 
     fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+        self.advance_pulls(now);
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
@@ -146,19 +224,39 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
     }
 
     fn next_wakeup(&self, now: Time) -> Option<Time> {
-        match self.runtime.worker_fsm_state {
+        // Two independent pipelines run in this worker — the pull side
+        // (`advance_pulls`) and the decode FSM (`tick_idle`/`tick_*`). Compute
+        // each side's "next interesting time" alone, then take the earlier.
+
+        // Pull side: `advance_pulls` already drained everything it could at
+        // `now`, so by here `pending_pulls` is non-empty only when the slot is
+        // occupied. The only future event is the in-flight pull becoming
+        // resident; once it does, `advance_pulls` can both promote it and submit
+        // the next queued handoff.
+        let pull_wake = self.runtime.in_transit.map(|(_, t)| t);
+
+        // Decode FSM side: when does the compute pipeline want to be re-ticked?
+        let compute_wake = match self.runtime.worker_fsm_state {
+            // Idle only needs to wake if there's a resident request ready to
+            // form_batch; bare pulls-in-flight are handled by `pull_wake`.
             WorkerFsmState::Idle => {
-                let status = self.status();
-                if status.queued_requests > 0 || status.active_requests > 0 {
-                    Some(now)
-                } else {
+                if self.runtime.pending_decodes.is_empty() {
                     None
+                } else {
+                    Some(now)
                 }
             }
             WorkerFsmState::Active => match self.runtime.batch_fsm_state.cursor {
                 IterCursor::NotStarted | IterCursor::Done => Some(now),
                 IterCursor::Computing => Some(self.runtime.batch_fsm_state.compute_end),
             },
+        };
+
+        // Earliest of the two; None only when both pipelines are quiet.
+        match (pull_wake, compute_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(t), None) | (None, Some(t)) => Some(t),
+            (None, None) => None,
         }
     }
 
@@ -383,7 +481,24 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
 
     fn enqueue(&mut self, msg: WorkerMsg) {
         match msg {
+            // Direct admit (e.g. tests): KV treated as instantly resident.
             WorkerMsg::Request(rid) => self.runtime.pending_decodes.push_back(rid),
+            // PD handoff: the wire message only carries the sender side; fill
+            // in this worker's own destination block (pre-resolved at
+            // construction) to assemble the full TransferPlan. Deferred submit
+            // happens at the next `tick_inner` (no `now` available here);
+            // `advance_pulls` then routes it to the cluster or, cluster-free,
+            // straight to `pending_decodes`.
+            WorkerMsg::Handoff { req, send_gid, bytes } => {
+                self.runtime.pending_pulls.push_back((
+                    req,
+                    TransferPlan {
+                        send_gid,
+                        recv_gid: self.recv_gid,
+                        bytes,
+                    },
+                ));
+            }
         }
     }
 
@@ -397,8 +512,13 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
             .iter()
             .map(|b| b.iter_decoding().count() as u32)
             .sum();
+        // Both pulls (pending-submit + the at-most-one in-flight) count as
+        // queued — placement sees them as load just like ready-to-admit decodes.
+        let queued = self.runtime.pending_decodes.len()
+            + self.runtime.pending_pulls.len()
+            + usize::from(self.runtime.in_transit.is_some());
         WorkerStatus {
-            queued_requests: self.runtime.pending_decodes.len() as u32,
+            queued_requests: queued as u32,
             active_requests: live_decodes,
         }
     }
@@ -407,10 +527,15 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{Request, RequestStore};
+    use crate::common::{PoolId, Request, RequestStore};
     use crate::timing::cache::interp::{CoverageFlags, Metrics4};
+    use crate::worker::gpu_cluster::{CostSource, GpuCluster, SharedGpuCluster};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    fn test_cluster() -> SharedGpuCluster {
+        Rc::new(RefCell::new(GpuCluster::new(CostSource::analytic(1.0))))
+    }
 
     struct FakeModel {
         ms: f64,
@@ -477,6 +602,9 @@ mod tests {
             store,
             WorkerConfig::default(),
             None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
         )
     }
 

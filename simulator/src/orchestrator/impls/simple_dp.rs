@@ -4,9 +4,9 @@
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time};
-use crate::worker::{IterWorker, WorkerEvent, WorkerMsg};
+use crate::worker::{CostSource, GpuCluster, IterWorker, SharedGpuCluster, WorkerEvent, WorkerMsg};
 
-use super::super::{Flow, GpuInventory, OrchAction, PoolEvent, UnifiedWorkerFactory};
+use super::super::{Flow, OrchAction, PoolEvent, UnifiedWorkerFactory};
 
 /// Sentinel for a quiescent worker. `Option<Time>` would add a tag; the simulator
 /// clock is a `u64` newtype, so this keeps the hot wakeup array dense while still
@@ -23,8 +23,8 @@ pub enum DpPlacementPolicy {
 }
 
 /// Config for one DP pool — pure orchestration (which workers, how to place).
-/// The GPU facts each worker spans (`gpu_name` / `gpus_per_worker`) live on the
-/// [`UnifiedWorkerFactory`], the worker-stamping infra, not here.
+/// The GPU facts each worker spans live on the [`UnifiedWorkerFactory`] (the
+/// worker-stamping infra) and on the worker's own model, not here.
 pub struct SimpleDpPoolConfig {
     pub pool: PoolId,
     pub num_workers: u16,
@@ -53,25 +53,20 @@ pub struct SimpleDpPoolController<M: IterwiseUnifiedModel, W: IterWorker> {
 
 impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
     // ── Construction ──────────────────────────────────────────────────────────
-    /// Build the pool's workers and register their GPUs into the *run-level*
-    /// `inventory` (passed by `&mut`, not owned here). Allocating into a shared
-    /// inventory is what keeps GPU ids globally unique across pools — a future
-    /// multi-pool deployment threads the same inventory through each pool, so ids
-    /// continue (`allocate` appends from the current length) instead of every pool
-    /// restarting at 0.
+    /// Build the pool's workers, each handed the shared `cluster` so it can
+    /// self-register its GPU block. Sharing one cluster across pools keeps GPU
+    /// ids globally unique — a multi-pool deployment threads the same cluster
+    /// into every pool's `new`, so ids continue (`allocate` appends from the
+    /// current length) instead of every pool restarting at 0.
     pub fn new(
         cfg: &SimpleDpPoolConfig,
         factory: &UnifiedWorkerFactory<M, W>,
-        inventory: &mut GpuInventory,
+        cluster: &SharedGpuCluster,
     ) -> Self {
-        let workers: Vec<W> = (0..cfg.num_workers).map(|i| factory.build(i)).collect();
-        assert!(!workers.is_empty(), "simple_dp needs at least one worker");
-        // One block of `gpus_per_worker` contiguous ids per worker, in build order
-        // (ref's `allocate(n)` shape). The GPU facts come from the factory, which
-        // stamped these workers.
-        for w in &workers {
-            inventory.allocate(cfg.pool.0, w.id().0, factory.gpus_per_worker, &factory.gpu_name);
-        }
+        assert!(cfg.num_workers > 0, "simple_dp needs at least one worker");
+        let workers: Vec<W> = (0..cfg.num_workers)
+            .map(|i| factory.build(i, cfg.pool, cluster))
+            .collect();
         Self {
             pool: cfg.pool,
             worker_wakeup_times: vec![NO_WAKEUP_TIME; workers.len()],
@@ -84,9 +79,17 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
 
     // ── Outward API (called by L6b) ───────────────────────────────────────────
     pub fn admit(&mut self, rid: RequestId) {
+        self.admit_msg(WorkerMsg::Request(rid));
+    }
+
+    /// Pick a worker via the pool's placement policy and enqueue `msg` into it.
+    /// Deployment-agnostic primitive: the unified flow admits a plain `Request`;
+    /// a PD flow uses this to enqueue a `Handoff` (whose content does not depend
+    /// on the chosen worker — the receiver fills in its own destination block).
+    pub fn admit_msg(&mut self, msg: WorkerMsg) {
         let idx = self.choose_worker_idx();
-        self.workers[idx].enqueue(WorkerMsg::Request(rid));
-        // An idle worker has no scheduled wakeup; a new request must make it due
+        self.workers[idx].enqueue(msg);
+        // An idle worker has no scheduled wakeup; new work must make it due
         // immediately. A computing worker already has a `compute_end` wakeup, so
         // keep that instead of forcing an early poll.
         if self.worker_wakeup_times[idx] == NO_WAKEUP_TIME {
@@ -150,7 +153,9 @@ pub(crate) fn to_pool_event(pool: PoolId, event: WorkerEvent) -> PoolEvent {
         WorkerEvent::RequestComplete { worker, req } => {
             PoolEvent::RequestComplete { pool, worker, req }
         }
-        WorkerEvent::PrefillDone { worker, req } => PoolEvent::PrefillDone { pool, worker, req },
+        WorkerEvent::PrefillDone { worker, req, send_spec } => {
+            PoolEvent::PrefillDone { pool, worker, req, send_spec }
+        }
     }
 }
 
@@ -159,10 +164,12 @@ pub(crate) fn to_pool_event(pool: PoolId, event: WorkerEvent) -> PoolEvent {
 pub struct SimpleDpFlow<M: IterwiseUnifiedModel, W: IterWorker> {
     requests: SharedRequests,
     dp_pool: SimpleDpPoolController<M, W>,
-    /// Run-level GPU registry, aggregated across all pools as they are built. Lives
-    /// on the flow (not the pool) so a multi-pool deployment surfaces one combined
-    /// inventory with globally-unique ids.
-    inventory: GpuInventory,
+    /// Shared run-level GPU cluster (registry + transfer oracle), built here and
+    /// threaded into the pool's construction so workers self-register and (PD
+    /// only) keep a handle for runtime transfers. simple_dp has one pool today,
+    /// but the ownership shape generalizes to multi-pool (allocate into the
+    /// same cluster, ids continue).
+    cluster: SharedGpuCluster,
     /// Reused per-tick event sink — workers push `WorkerEvent`s into it during
     /// `tick_collect`, then it is drained here and cleared for the next tick.
     events: Vec<WorkerEvent>,
@@ -171,15 +178,18 @@ pub struct SimpleDpFlow<M: IterwiseUnifiedModel, W: IterWorker> {
 impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpFlow<M, W> {
     pub fn new(cfg: SimpleDpConfig, factory: UnifiedWorkerFactory<M, W>) -> Self {
         let requests = std::rc::Rc::clone(&factory.requests);
-        // The run-level inventory is built here and threaded into each pool's
-        // construction; simple_dp has one pool today, but the ownership is what a
-        // multi-pool flow needs (allocate into the same inventory, ids continue).
-        let mut inventory = GpuInventory::default();
-        let dp_pool = SimpleDpPoolController::new(&cfg.dp_pool, &factory, &mut inventory);
+        // simple_dp has no inter-worker transfers, but the cluster is still the
+        // GPU registry — wire a sentinel `CostSource` whose `submit_transfer`
+        // would return ~zero if ever called (it isn't: only PD decode workers
+        // call it, and there are none here).
+        let cluster: SharedGpuCluster = std::rc::Rc::new(std::cell::RefCell::new(
+            GpuCluster::new(CostSource::analytic(f64::INFINITY)),
+        ));
+        let dp_pool = SimpleDpPoolController::new(&cfg.dp_pool, &factory, &cluster);
         Self {
             requests,
             dp_pool,
-            inventory,
+            cluster,
             events: Vec::new(),
         }
     }
@@ -213,8 +223,8 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> Flow for SimpleDpFlow<M, W> {
         actions
     }
 
-    fn inventory(&self) -> &GpuInventory {
-        &self.inventory
+    fn cluster(&self) -> &SharedGpuCluster {
+        &self.cluster
     }
 }
 
@@ -270,7 +280,6 @@ mod tests {
             WorkerConfig::default(),
             None,
             "test-gpu".to_string(),
-            1,
             "main",
             BareboneWorker::<FakeModel>::new,
         );

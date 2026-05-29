@@ -9,7 +9,7 @@ pub mod common;
 pub mod impls;
 pub mod config;
 
-pub use self::common::{GpuInfo, GpuInventory, OrchAction, PoolEvent, UnifiedWorkerFactory};
+pub use self::common::{GpuCluster, GpuInfo, OrchAction, PoolEvent, UnifiedWorkerFactory};
 pub use impls::{
     DpPlacementPolicy, PdFlow, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig,
     SimpleDpPoolController, PD_DECODE_POOL, PD_PREFILL_POOL,
@@ -17,6 +17,7 @@ pub use impls::{
 pub use config::{GroupSpec, PlacementPolicy, PoolSpec};
 
 use crate::common::{Request, Time};
+use crate::worker::SharedGpuCluster;
 
 /// L6b deployment flow — the only object L7 calls. `on_arrival` takes the full
 /// `Request` (the flow inserts its facts into the shared store, then admits the
@@ -24,7 +25,8 @@ use crate::common::{Request, Time};
 pub trait Flow {
     fn on_arrival(&mut self, req: Request);
     fn tick(&mut self, now: Time) -> Vec<OrchAction>;
-    /// The GPUs this flow's pools/workers occupy — L7 serializes it to
-    /// `raw/run_meta.json` so downstream (the analyzer) can normalize per-GPU.
-    fn inventory(&self) -> &GpuInventory;
+    /// The shared GPU cluster — both the run's GPU registry (the `gpus` field is
+    /// what L7 serializes into `raw/run_meta.json`) and the inter-worker
+    /// transfer timing oracle. L7 borrows it to read either side.
+    fn cluster(&self) -> &SharedGpuCluster;
 }
