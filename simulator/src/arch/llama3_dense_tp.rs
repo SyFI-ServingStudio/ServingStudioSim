@@ -76,7 +76,7 @@ pub struct Llama3DenseTpModel {
     pub name: String,
     pub num_layers: u32,
     pub tp_size: u16,
-    pub kv_bytes_per_token: u64,
+    pub total_kv_bytes_per_token: u64,
     pub attn_block: AttnBlockTpWorklet,
     pub mlp_block: MlpBlockTpWorklet,
     pub embed: Op<ElementwiseKernel>,
@@ -156,16 +156,16 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseTpParallel) -> Llama3Dens
     }
 }
 
-/// Per-GPU KV-cache footprint one token occupies across the whole model. Under
-/// TP the KV heads are head-sharded across ranks, so each GPU sizes its KvPool
-/// from the **per-rank** KV-head count: `2` (K and V) × `num_kv_heads/tp` ×
-/// `head_dim` × `kv_dtype` bytes × `num_layers`, read off the resolved attn
-/// config's already-divided per-rank head count.
-fn kv_bytes_per_token(resolved: &Llama3DenseTpResolved) -> u64 {
-    let attn = &resolved.attn_block.attn; // per-rank FlashInferAttentionConfig
-    2 * attn.num_kv_heads as u64
-        * attn.head_dim as u64
-        * attn.kv_dtype.size_bytes() as u64
+/// **Total** KV-cache bytes one token occupies — summed across all `tp_size`
+/// attention ranks, all layers, all KV heads. This is the wire size of a
+/// token's KV (what a PD handoff transfers); to get per-rank bytes (per-GPU
+/// footprint), divide by `tp_size`. Read straight off the un-sharded
+/// `raw_cfg` — no per-rank ÷tp ×tp round-trip needed.
+fn total_kv_bytes_per_token(resolved: &Llama3DenseTpResolved) -> u64 {
+    let raw = &resolved.attn_block.raw_cfg;
+    2 * raw.num_kv_heads as u64
+        * raw.head_dim as u64
+        * raw.kv_dtype.size_bytes() as u64
         * resolved.num_layers as u64
 }
 
@@ -188,7 +188,7 @@ pub fn build(
 ) -> Result<Llama3DenseTpModel, BuildError> {
     let num_layers = resolved.num_layers;
     let tp_size = resolved.tp_size;
-    let kv_bytes_per_token = kv_bytes_per_token(&resolved);
+    let total_kv_bytes_per_token = total_kv_bytes_per_token(&resolved);
 
     let embed_name = format!("{model_name}.embedding");
     let final_norm_name = format!("{model_name}.final_norm");
@@ -242,7 +242,7 @@ pub fn build(
         name: model_name,
         num_layers,
         tp_size,
-        kv_bytes_per_token,
+        total_kv_bytes_per_token,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -318,8 +318,8 @@ impl Llama3DenseTpModel {
 }
 
 impl IterwiseUnifiedModel for Llama3DenseTpModel {
-    fn kv_bytes_per_token(&self) -> u64 {
-        self.kv_bytes_per_token
+    fn total_kv_bytes_per_token(&self) -> u64 {
+        self.total_kv_bytes_per_token
     }
 
     /// One replica spans the `tp_size` ranks of the TP group (no HP/EP nesting in
@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_bytes_per_token_is_per_rank() {
+    fn total_kv_bytes_per_token_sums_across_ranks() {
         let cfgs = build_configs(
             &ModelCfg::llama3_8b(),
             &DenseTpParallel {
@@ -431,13 +431,13 @@ mod tests {
             },
         );
         let r = resolve_configs(&cfgs);
-        // per-rank kv heads = 8/4 = 2; 2·2·128·2·32 = 32768 bytes/token/GPU.
-        assert_eq!(kv_bytes_per_token(&r), 2 * 2 * 128 * 2 * 32);
+        // total kv heads = 8 (model-level, not per-rank); 2·8·128·2·32.
+        assert_eq!(total_kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
     }
 
     #[test]
     fn tp1_kv_bytes_matches_full_model() {
-        // At tp=1 the per-rank footprint equals the full dense value (8 kv heads).
+        // At tp=1 the total equals the dense value (8 kv heads, undivided).
         let cfgs = build_configs(
             &ModelCfg::llama3_8b(),
             &DenseTpParallel {
@@ -446,7 +446,7 @@ mod tests {
             },
         );
         let r = resolve_configs(&cfgs);
-        assert_eq!(kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
+        assert_eq!(total_kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
         assert_eq!(r.tp_size, 1);
     }
 }

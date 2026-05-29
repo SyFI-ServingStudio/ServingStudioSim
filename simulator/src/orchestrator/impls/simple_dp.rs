@@ -3,7 +3,7 @@
 //! the deployment is tiny, but stay two structs (L6 design.md §「simple DP」).
 
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::common::{PoolId, Request, RequestId, SharedRequests, Time};
+use crate::common::{PoolId, Request, RequestId, SharedRequests, Time, WorkerId};
 use crate::worker::{CostSource, GpuCluster, IterWorker, SharedGpuCluster, WorkerEvent, WorkerMsg};
 
 use super::super::{Flow, OrchAction, PoolEvent, UnifiedWorkerFactory};
@@ -97,6 +97,19 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
         }
     }
 
+    /// Route `msg` to a *specific* worker (bypasses placement). Used for
+    /// targeted acks like PD's `ReleaseKv`, where the message must reach the
+    /// exact worker that holds the addressed request's KV. Panics if
+    /// `worker_id` is outside this pool — silently dropping the ack would
+    /// leak the held reservation forever, so a bad id is treated as a bug.
+    pub fn route_msg_to(&mut self, worker_id: WorkerId, msg: WorkerMsg) {
+        let idx = worker_id.0 as usize;
+        self.workers[idx].enqueue(msg);
+        if self.worker_wakeup_times[idx] == NO_WAKEUP_TIME {
+            self.worker_wakeup_times[idx] = Time::ZERO;
+        }
+    }
+
     fn choose_worker_idx(&mut self) -> usize {
         match self.placement {
             DpPlacementPolicy::LeastQueued => self.choose_least_queued_idx(),
@@ -156,6 +169,9 @@ pub(crate) fn to_pool_event(pool: PoolId, event: WorkerEvent) -> PoolEvent {
         WorkerEvent::PrefillDone { worker, req, send_spec } => {
             PoolEvent::PrefillDone { pool, worker, req, send_spec }
         }
+        WorkerEvent::PullComplete { worker, req, prefill_worker } => {
+            PoolEvent::PullComplete { pool, worker, req, prefill_worker }
+        }
     }
 }
 
@@ -197,8 +213,9 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpFlow<M, W> {
     fn on_pool_event(&mut self, event: PoolEvent) -> Vec<OrchAction> {
         match event {
             PoolEvent::RequestComplete { req, .. } => vec![OrchAction::Complete { req }],
-            // A single-pool unified deployment never produces a prefill handoff.
-            PoolEvent::PrefillDone { .. } => vec![],
+            // A single-pool unified deployment never produces a prefill handoff
+            // or a PD pull ack — those are PD-only events.
+            PoolEvent::PrefillDone { .. } | PoolEvent::PullComplete { .. } => vec![],
         }
     }
 }
@@ -261,7 +278,7 @@ mod tests {
                 coverage: CoverageFlags::EMPTY,
             }
         }
-        fn kv_bytes_per_token(&self) -> u64 {
+        fn total_kv_bytes_per_token(&self) -> u64 {
             1
         }
         fn gpus_per_replica(&self) -> u16 {

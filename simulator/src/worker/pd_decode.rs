@@ -32,20 +32,58 @@ use crate::worker::types::{
     WorkerStatus,
 };
 
+/// One pull actively flowing through the shared cluster. Carries everything
+/// the worker needs at promote time: the request id (→ `pending_decodes`),
+/// the cluster-reported `pull_end` (→ wake-up scheduling), and the prefill
+/// worker that still holds this request's KV (→ ack target once the pull
+/// lands, so the prefill side can free its held capacity).
+/// Pull backlog ceiling as a fraction of `attn_kv_bytes`. The "backlog" is
+/// in-transit bytes + landed-but-not-yet-active bytes; above this, the worker
+/// stops fetching new handoffs so the active decode batch can drain before
+/// more KV piles up. A single request whose KV alone exceeds the budget is
+/// allowed in only when the backlog is empty (single-req exception — prevents
+/// starvation of big requests).
+const PULL_BUDGET_FRAC: f64 = 0.05;
+
+#[derive(Clone, Copy, Debug)]
+struct InFlightPull {
+    req: RequestId,
+    pull_end: Time,
+    prefill_worker: WorkerId,
+    /// KV tokens this pull is bringing in — counted toward the backlog the
+    /// instant it lands in `pending_decodes`. Token-based to match `KvPool`'s
+    /// accounting; wire bytes are computed on the fly at `submit_transfer`.
+    tokens: u64,
+}
+
 struct DecodeRuntime {
     /// Handoff queue: requests whose prefill is done AND KV is resident, awaiting
     /// a decode slot. Direct-`Request` admits land here too (test path / cluster-
     /// free runs treat the transfer as instant).
     pending_decodes: VecDeque<RequestId>,
+    /// Sum of per-request KV tokens for everything in `pending_decodes`. Kept
+    /// incrementally — paired with each push/pop — so the fetch-throttle gate
+    /// is O(1). Decoupled from `Batch`'s own admission accounting (which is
+    /// per-shard); this is the worker-level *backlog* metric. Token-based so
+    /// it shares units with `pull_budget_tokens` and the `KvPool` capacity.
+    pending_decodes_tokens: u64,
     /// Handoffs newly delivered to this worker, awaiting submission to the shared
     /// cluster. Submitted at the next `tick_inner` (no `now` at `enqueue` time).
+    /// **Not counted** toward the backlog: a queued handoff isn't fetching yet,
+    /// so it isn't occupying KV cache on this worker. Backpressure is delivered
+    /// implicitly — once the backlog hits the budget, nothing in `pending_pulls`
+    /// moves until the active batch drains and frees room.
     pending_pulls: VecDeque<(RequestId, TransferPlan)>,
     /// The single pull currently flowing through the cluster (0 or 1). A NCCL
     /// collective is strictly sequential at one comm, so the worker keeps at
     /// most one in flight; subsequent handoffs wait in `pending_pulls` until
     /// the active one's `pull_end` is reached. Promoted to `pending_decodes`
-    /// once `now >= pull_end`.
-    in_transit: Option<(RequestId, Time)>,
+    /// once `now >= pull_end`. Its `tokens` count toward the backlog (KV is
+    /// physically landing during the transfer).
+    in_transit: Option<InFlightPull>,
+    /// Backlog ceiling in tokens (`PULL_BUDGET_FRAC * total_shard_tokens`).
+    /// Computed once at construction.
+    pull_budget_tokens: u64,
     /// Shared run-level transfer oracle. Always present (handed in at `new`);
     /// the previous `Option` / `KvPuller::set_cluster` two-phase wiring was
     /// dropped now that every worker takes the cluster at construction.
@@ -60,11 +98,13 @@ struct DecodeRuntime {
 }
 
 impl DecodeRuntime {
-    fn new(balance: LoadBalance, cluster: SharedGpuCluster) -> Self {
+    fn new(balance: LoadBalance, cluster: SharedGpuCluster, pull_budget_tokens: u64) -> Self {
         Self {
             pending_decodes: VecDeque::new(),
+            pending_decodes_tokens: 0,
             pending_pulls: VecDeque::new(),
             in_transit: None,
+            pull_budget_tokens,
             cluster,
             request_to_group: HashMap::new(),
             iter_counter: 0,
@@ -76,6 +116,14 @@ impl DecodeRuntime {
             },
             balance,
         }
+    }
+
+    /// Current backlog: KV tokens that this worker has already pulled (landed
+    /// in `pending_decodes`) or is actively pulling (`in_transit`). A handoff
+    /// queued in `pending_pulls` is **not** part of the backlog — its tokens
+    /// haven't started arriving yet.
+    fn backlog_tokens(&self) -> u64 {
+        self.pending_decodes_tokens + self.in_transit.map(|p| p.tokens).unwrap_or(0)
     }
 }
 
@@ -127,9 +175,20 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             c.register_comm_group(gpu_base, model.num_attn_shards().max(1))
         };
         let num_groups = model.num_attn_dp_groups().max(1) as usize;
-        // Each DP shard is an independent attention TP group with its own KV cache;
-        // the per-GPU memory allowance sizes each group's pool identically.
-        let kv_capacity = (config.attn_kv_bytes / model.kv_bytes_per_token().max(1)).max(1);
+        // Per-attn-shard physical memory (worker has `num_attn_dp_groups` of
+        // these). KV bytes are summed across the `num_attn_shards` GPUs that
+        // make up one shard set, so dividing by the model-level
+        // `total_kv_bytes_per_token` yields shard capacity in tokens.
+        let group_kv_bytes =
+            config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
+        let total_shard_tokens =
+            (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
+        // Carve the backlog slice out of the active-decode budget so the two
+        // accounts don't double-spend the same KV: `pull_budget_tokens` is the
+        // backlog cap; `Batch` sees only the complement.
+        let pull_budget_tokens =
+            ((total_shard_tokens as f64 * PULL_BUDGET_FRAC) as u64).max(1);
+        let kv_capacity = total_shard_tokens.saturating_sub(pull_budget_tokens).max(1);
         let batches: Vec<Batch> = (0..num_groups)
             .map(|g| Batch::new(g as u16, kv_capacity))
             .collect();
@@ -154,7 +213,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             model,
             requests,
             config,
-            runtime: DecodeRuntime::new(balance, cluster),
+            runtime: DecodeRuntime::new(balance, cluster, pull_budget_tokens),
             batches,
             cost_logger,
             cost_slots: Vec::new(),
@@ -177,34 +236,69 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
     ///
     /// Runs at the top of every tick — independent of the decode iteration FSM,
     /// so a pull can complete mid-iter and admit at the next iteration boundary.
-    fn advance_pulls(&mut self, now: Time) {
+    fn advance_pulls(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
         loop {
-            if let Some((rid, pull_end)) = self.runtime.in_transit {
-                if now >= pull_end {
-                    self.runtime.pending_decodes.push_back(rid);
+            if let Some(pull) = self.runtime.in_transit {
+                if now >= pull.pull_end {
+                    self.runtime.pending_decodes.push_back(pull.req);
+                    self.runtime.pending_decodes_tokens += pull.tokens;
                     self.runtime.in_transit = None;
+                    // Ack the prefill side: its held reservation can drop now
+                    // that the KV has fully landed here. L6 routes this back
+                    // by `prefill_worker` (not placement-chosen).
+                    events.push(WorkerEvent::PullComplete {
+                        worker: self.id,
+                        req: pull.req,
+                        prefill_worker: pull.prefill_worker,
+                    });
                 } else {
                     return;
                 }
             }
-            // Slot free — submit the next handoff if any.
-            let Some((rid, transfer)) = self.runtime.pending_pulls.pop_front() else {
+            // Slot free — peek the next handoff and apply the backlog gate
+            // before consuming it (so a held-back pull stays at the front of
+            // the queue for the next tick to retry).
+            let Some(&(_, ref next)) = self.runtime.pending_pulls.front() else {
                 return;
             };
+            let head_tokens = next.tokens;
+            // Submission gate: keep the pull backlog (in-transit + landed-but-
+            // not-yet-active) under the configured fraction of shard token
+            // capacity. Single-request exception: if the backlog is empty and
+            // one request alone exceeds the budget, still fetch it — otherwise
+            // big requests would starve permanently.
+            let backlog = self.runtime.backlog_tokens();
+            let budget = self.runtime.pull_budget_tokens;
+            let fits_normally = backlog + head_tokens <= budget;
+            let single_req_exception = backlog == 0 && head_tokens > budget;
+            if !fits_normally && !single_req_exception {
+                return;
+            }
+            let (rid, transfer) = self.runtime.pending_pulls.pop_front().unwrap();
+            // Convert tokens → wire bytes for the cluster's transfer cost model.
+            // This is the only place bytes appear inside the worker.
+            let bytes = transfer
+                .tokens
+                .saturating_mul(self.model.total_kv_bytes_per_token());
             let pull_end = self.runtime.cluster.borrow_mut().submit_transfer(
                 now,
                 transfer.send_gid,
                 transfer.recv_gid,
-                transfer.bytes,
+                bytes,
             );
-            self.runtime.in_transit = Some((rid, pull_end));
+            self.runtime.in_transit = Some(InFlightPull {
+                req: rid,
+                pull_end,
+                prefill_worker: transfer.prefill_worker,
+                tokens: transfer.tokens,
+            });
             // Loop back: if pull_end <= now (instant transfer), promote it this
             // same tick rather than parking a finished pull in `in_transit`.
         }
     }
 
     fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
-        self.advance_pulls(now);
+        self.advance_pulls(now, events);
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
@@ -233,7 +327,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
         // occupied. The only future event is the in-flight pull becoming
         // resident; once it does, `advance_pulls` can both promote it and submit
         // the next queued handoff.
-        let pull_wake = self.runtime.in_transit.map(|(_, t)| t);
+        let pull_wake = self.runtime.in_transit.map(|p| p.pull_end);
 
         // Decode FSM side: when does the compute pipeline want to be re-ticked?
         let compute_wake = match self.runtime.worker_fsm_state {
@@ -324,6 +418,11 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                 )
             {
                 self.runtime.pending_decodes.pop_front();
+                // Drain this request's tokens from the backlog counter: it
+                // moved from `pending_decodes` into an active `Batch`, where
+                // `KvPool` admission tracks it now.
+                self.runtime.pending_decodes_tokens =
+                    self.runtime.pending_decodes_tokens.saturating_sub(prompt_kv);
                 self.batches[gid as usize].finalize_to_decode(rid, prompt_kv, remaining);
                 self.runtime.request_to_group.insert(rid, gid);
             }
@@ -464,6 +563,16 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
     pub fn release_request(&mut self, rid: RequestId, current_kv: u64) -> Option<u16> {
         if let Some(pos) = self.runtime.pending_decodes.iter().position(|&x| x == rid) {
             self.runtime.pending_decodes.remove(pos);
+            // Mirror the increment in `enqueue(Request)` / `advance_pulls`'s
+            // promote step: a request leaving the backlog should free its
+            // share of the budget.
+            let tokens = {
+                let store = self.requests.borrow();
+                let r = &store[rid];
+                r.prompt_len as u64 + r.prefix_kv as u64
+            };
+            self.runtime.pending_decodes_tokens =
+                self.runtime.pending_decodes_tokens.saturating_sub(tokens);
             return None;
         }
         if let Some(gid) = self.runtime.request_to_group.remove(&rid) {
@@ -482,22 +591,36 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
     fn enqueue(&mut self, msg: WorkerMsg) {
         match msg {
             // Direct admit (e.g. tests): KV treated as instantly resident.
-            WorkerMsg::Request(rid) => self.runtime.pending_decodes.push_back(rid),
+            // Still count it toward the backlog so the gate's accounting is
+            // consistent — tests use tiny token counts so the budget never bites.
+            WorkerMsg::Request(rid) => {
+                let tokens = {
+                    let store = self.requests.borrow();
+                    let r = &store[rid];
+                    r.prompt_len as u64 + r.prefix_kv as u64
+                };
+                self.runtime.pending_decodes.push_back(rid);
+                self.runtime.pending_decodes_tokens += tokens;
+            }
             // PD handoff: the wire message only carries the sender side; fill
             // in this worker's own destination block (pre-resolved at
             // construction) to assemble the full TransferPlan. Deferred submit
             // happens at the next `tick_inner` (no `now` available here);
             // `advance_pulls` then routes it to the cluster or, cluster-free,
             // straight to `pending_decodes`.
-            WorkerMsg::Handoff { req, send_gid, bytes } => {
+            WorkerMsg::Handoff { req, send_gid, tokens, prefill_worker } => {
                 self.runtime.pending_pulls.push_back((
                     req,
                     TransferPlan {
                         send_gid,
                         recv_gid: self.recv_gid,
-                        bytes,
+                        tokens,
+                        prefill_worker,
                     },
                 ));
+            }
+            WorkerMsg::ReleaseKv { .. } => {
+                unreachable!("decode worker holds no KV at the source side; ack is its emitter")
             }
         }
     }
@@ -561,7 +684,7 @@ mod tests {
                 coverage: CoverageFlags::EMPTY,
             }
         }
-        fn kv_bytes_per_token(&self) -> u64 {
+        fn total_kv_bytes_per_token(&self) -> u64 {
             1
         }
         fn gpus_per_replica(&self) -> u16 {
@@ -677,6 +800,93 @@ mod tests {
             (1, 1),
             "RoundRobin must place one decode in each DP shard"
         );
+    }
+
+    /// Register a 1-link sender comm group in `cluster` for use as the `send_gid`
+    /// in a synthetic `Handoff`. Allocates one dummy GPU first so the registered
+    /// group's `base` lines up with a real GPU id.
+    fn register_test_sender(cluster: &SharedGpuCluster) -> u16 {
+        let mut c = cluster.borrow_mut();
+        c.allocate(99, 99, 1, "sender-gpu");
+        c.register_comm_group(0, 1)
+    }
+
+    /// Pull backlog gate: a second handoff that would push (in-flight + landed-
+    /// but-not-yet-active) tokens above 5% × shard capacity must stay in
+    /// `pending_pulls` until the first drains. With `attn_kv_bytes=1000` and
+    /// `total_kv_bytes_per_token=1` → 1000-token shard → 50-token budget; a
+    /// 40-token + 20-token pair triggers the gate: 40 in-flight + 20 head > 50.
+    #[test]
+    fn pull_backlog_gate_holds_second_handoff_until_first_drains() {
+        let store = prefilled_store(&[(0, 40, 1), (1, 20, 1)]);
+        let cluster = test_cluster();
+        let sender_gid = register_test_sender(&cluster);
+        let mut w = PdDecodeWorker::new(
+            WorkerId(0),
+            "decode",
+            Arc::new(FakeModel { ms: 1.0, dp_groups: 1 }),
+            Rc::clone(&store),
+            WorkerConfig { attn_kv_bytes: 1000, ..WorkerConfig::default() },
+            None,
+            PoolId(0),
+            "test-gpu",
+            Rc::clone(&cluster),
+        );
+        for &id in &[0u32, 1] {
+            w.enqueue(WorkerMsg::Handoff {
+                req: RequestId(id),
+                send_gid: sender_gid,
+                tokens: if id == 0 { 40 } else { 20 },
+                prefill_worker: WorkerId(99),
+            });
+        }
+        let mut events = Vec::new();
+        // First tick at t=0: req0 submits (40 ≤ 50). req1 would push backlog to
+        // 60 → gated, stays in pending_pulls.
+        w.tick(Time::ZERO, &mut events);
+        assert!(
+            w.runtime.in_transit.is_some_and(|p| p.req == RequestId(0)),
+            "req0 should be the in-flight pull"
+        );
+        assert_eq!(
+            w.runtime.pending_pulls.len(),
+            1,
+            "req1 must stay in pending_pulls — gated by 40-token backlog"
+        );
+    }
+
+    /// Single-request exception: a handoff whose KV alone exceeds the 5% budget
+    /// would otherwise starve forever. When the backlog is empty, the gate lets
+    /// it through.
+    #[test]
+    fn pull_backlog_single_req_exception_when_backlog_empty() {
+        let store = prefilled_store(&[(0, 200, 1)]); // 200 tokens > budget (50).
+        let cluster = test_cluster();
+        let sender_gid = register_test_sender(&cluster);
+        let mut w = PdDecodeWorker::new(
+            WorkerId(0),
+            "decode",
+            Arc::new(FakeModel { ms: 1.0, dp_groups: 1 }),
+            Rc::clone(&store),
+            WorkerConfig { attn_kv_bytes: 1000, ..WorkerConfig::default() },
+            None,
+            PoolId(0),
+            "test-gpu",
+            Rc::clone(&cluster),
+        );
+        w.enqueue(WorkerMsg::Handoff {
+            req: RequestId(0),
+            send_gid: sender_gid,
+            tokens: 200,
+            prefill_worker: WorkerId(99),
+        });
+        let mut events = Vec::new();
+        w.tick(Time::ZERO, &mut events);
+        assert!(
+            w.runtime.in_transit.is_some_and(|p| p.req == RequestId(0)),
+            "single big req must go through the exception path"
+        );
+        assert!(w.runtime.pending_pulls.is_empty());
     }
 
     #[test]

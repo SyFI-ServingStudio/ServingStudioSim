@@ -122,21 +122,29 @@ where
         // on receipt. No flow-side endpoint table, no intermediate Vec.
         for ev in prefill_events.drain(..) {
             match to_pool_event(prefill_pool, ev) {
-                PoolEvent::PrefillDone { req, send_spec, .. } => {
+                PoolEvent::PrefillDone { worker, req, send_spec, .. } => {
+                    // Carry the prefill worker id through so the decode side can
+                    // later ack it (step C: `ReleaseKv`) and let it drop the
+                    // held KV reservation. The send-side comm group alone is not
+                    // enough — multiple prefill workers may share an arch.
                     self.decode_pool.admit_msg(WorkerMsg::Handoff {
                         req,
                         send_gid: send_spec.send_gid,
-                        bytes: send_spec.kv_bytes,
+                        tokens: send_spec.kv_tokens,
+                        prefill_worker: worker,
                     });
                 }
                 PoolEvent::RequestComplete { req, .. } => {
                     actions.push(OrchAction::Complete { req })
                 }
+                // Prefill workers never emit a pull ack.
+                PoolEvent::PullComplete { .. } => {}
             }
         }
         self.prefill_events = prefill_events;
 
-        // Consumer: tick + collect the decode pool. It only ever completes.
+        // Consumer: tick + collect the decode pool. It completes requests and
+        // emits PD pull acks (PullComplete) when KV lands at its workers.
         let mut decode_events = std::mem::take(&mut self.decode_events);
         decode_events.clear();
         self.decode_pool.tick_collect(now, &mut decode_events);
@@ -145,6 +153,14 @@ where
             match to_pool_event(decode_pool, ev) {
                 PoolEvent::RequestComplete { req, .. } => {
                     actions.push(OrchAction::Complete { req })
+                }
+                // KV has fully landed at decode — tell the originating prefill
+                // worker to drop its held reservation. Targeted route (by
+                // `prefill_worker` id), *not* placement-chosen: only that
+                // worker tracks this request's held KV.
+                PoolEvent::PullComplete { req, prefill_worker, .. } => {
+                    self.prefill_pool
+                        .route_msg_to(prefill_worker, WorkerMsg::ReleaseKv { req });
                 }
                 // A decode pool never hands off.
                 PoolEvent::PrefillDone { .. } => {}
@@ -198,7 +214,7 @@ mod tests {
                 coverage: CoverageFlags::EMPTY,
             }
         }
-        fn kv_bytes_per_token(&self) -> u64 {
+        fn total_kv_bytes_per_token(&self) -> u64 {
             1
         }
         fn gpus_per_replica(&self) -> u16 {

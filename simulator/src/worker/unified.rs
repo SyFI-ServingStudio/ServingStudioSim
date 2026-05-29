@@ -91,9 +91,15 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         cluster
             .borrow_mut()
             .allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
-        // The worker sizes its own KvPool: memory allowance ÷ the model's
-        // per-token KV footprint (L5 owns the division; arch owns the footprint).
-        let kv_capacity = (config.attn_kv_bytes / model.kv_bytes_per_token().max(1)).max(1);
+        // KvPool capacity in tokens. `attn_kv_bytes` is per-GPU; one attn shard
+        // spans `num_attn_shards()` GPUs and stores the full KV (each GPU holds
+        // a per-rank slice that sums to the model-level total). So group memory
+        // = `num_attn_shards × attn_kv_bytes`; dividing by `total_kv_bytes_per_token`
+        // (the wire size — full model, all ranks summed) yields the per-group
+        // token capacity. L5 owns the division; arch owns the footprint.
+        let group_kv_bytes =
+            config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
+        let kv_capacity = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
         // Open the cost_log writer (+ manifest sidecar) whenever a log dir is
         // available. A failure to open disables logging with a warning rather
         // than aborting the sim.
@@ -128,6 +134,9 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         match msg {
             WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
             WorkerMsg::Handoff { .. } => unreachable!("barebone worker receives no PD handoff"),
+            WorkerMsg::ReleaseKv { .. } => {
+                unreachable!("barebone worker is not a PD prefill; no held KV to release")
+            }
         }
     }
 
@@ -508,7 +517,7 @@ mod tests {
             }
         }
         // 1 byte/token → KvPool capacity == config.attn_kv_bytes (easy to size).
-        fn kv_bytes_per_token(&self) -> u64 {
+        fn total_kv_bytes_per_token(&self) -> u64 {
             1
         }
         fn gpus_per_replica(&self) -> u16 {

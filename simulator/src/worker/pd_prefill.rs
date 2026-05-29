@@ -33,6 +33,15 @@ struct PrefillRuntime {
     pending_prefills: VecDeque<RequestId>,
     promised: HashMap<RequestId, (u16, u64)>,
     request_to_group: HashMap<RequestId, u16>,
+    /// Requests whose prefill is done and whose KV is still resident here
+    /// pending the decode side's pull. Each entry's KV-token count counts
+    /// against the worker's admission budget so the prefill side doesn't
+    /// over-commit beyond what its physical KV can actually hold. Drained
+    /// when the decode worker acks via `WorkerMsg::ReleaseKv`.
+    held: HashMap<RequestId, u64>,
+    /// Running sum of `held` values — kept incrementally so `try_admit`
+    /// stays O(1). Always equals `held.values().sum()`.
+    held_kv_tokens: u64,
     iter_counter: u32,
     iter_compute_start: Time,
     worker_fsm_state: WorkerFsmState,
@@ -45,6 +54,8 @@ impl PrefillRuntime {
             pending_prefills: VecDeque::new(),
             promised: HashMap::new(),
             request_to_group: HashMap::new(),
+            held: HashMap::new(),
+            held_kv_tokens: 0,
             iter_counter: 0,
             iter_compute_start: Time::ZERO,
             worker_fsm_state: WorkerFsmState::Idle,
@@ -98,7 +109,12 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             // attn-shard prefix is the comm group covering KV storage.
             c.register_comm_group(gpu_base, model.num_attn_shards().max(1))
         };
-        let kv_capacity = (config.attn_kv_bytes / model.kv_bytes_per_token().max(1)).max(1);
+        // KvPool capacity in tokens. See `unified::new` for the derivation:
+        // group memory = `num_attn_shards × attn_kv_bytes`, divided by the
+        // model-level `total_kv_bytes_per_token` (all ranks summed).
+        let group_kv_bytes =
+            config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
+        let kv_capacity = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
         let cost_logger = match cost_log_dir {
             Some(dir) => match CostLogger::open(&dir, pool_tag, id, &model.cost_log_manifest()) {
                 Ok(logger) => Some(logger),
@@ -199,7 +215,11 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
                 let store = self.requests.borrow();
                 store[rid].prompt_len
             };
-            let group_promised = self.group_promised_kv(0);
+            // Reservation includes both freshly-promised admits and any KV
+            // still held pending decode acks (post-PrefillDone, pre-ReleaseKv).
+            // Held KV physically occupies the worker's KV cache, so it must
+            // gate new admissions just like a promised one.
+            let group_promised = self.group_promised_kv(0) + self.runtime.held_kv_tokens;
             if self
                 .config
                 .admission
@@ -279,7 +299,6 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
 
     fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
         let log_tokens = self.config.log_output_token_times;
-        let kv_bytes_per_token = self.model.kv_bytes_per_token();
         // Sender side is fully determined by this worker's pre-registered comm
         // group; emit stamps the gid and the cluster resolves link count /
         // free-time at `submit_transfer` time.
@@ -299,7 +318,10 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             let r = &mut store[rid];
             r.prefill_processed = r.prompt_len;
             r.record_first_token(now, log_tokens);
-            let kv_bytes = (r.prompt_len + r.prefix_kv) as u64 * kv_bytes_per_token;
+            // Hand off in tokens — KvPool's native unit. The decode worker
+            // multiplies by its arch's `total_kv_bytes_per_token` only when
+            // calling `cluster.submit_transfer`; bytes are a wire-level concern.
+            let kv_tokens = (r.prompt_len + r.prefix_kv) as u64;
             let complete = r.is_complete();
             // r is unused below — NLL releases the borrow on `store`.
             self.runtime.request_to_group.remove(&rid);
@@ -309,15 +331,30 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
                     req: rid,
                 });
             } else {
+                // KV stays resident on this worker until the decode side acks
+                // the pull via `WorkerMsg::ReleaseKv`. Tracking it in `held`
+                // keeps it gating future admissions.
+                self.runtime.held.insert(rid, kv_tokens);
+                self.runtime.held_kv_tokens += kv_tokens;
                 events.push(WorkerEvent::PrefillDone {
                     worker: worker_id,
                     req: rid,
-                    send_spec: SendSpec { kv_bytes, send_gid },
+                    send_spec: SendSpec { kv_tokens, send_gid },
                 });
             }
         }
         drop(store);
         self.batches[0].prefill_admits.clear();
+    }
+
+    /// Release this request's held KV reservation. Called from `enqueue` on
+    /// receipt of `WorkerMsg::ReleaseKv` (decode side finished its pull). A
+    /// missing entry is silently ignored — possible if the request was
+    /// already cancelled via `release_request` before the ack arrived.
+    fn drop_held(&mut self, rid: RequestId) {
+        if let Some(tokens) = self.runtime.held.remove(&rid) {
+            self.runtime.held_kv_tokens = self.runtime.held_kv_tokens.saturating_sub(tokens);
+        }
     }
 
     // ── build_arch_input — one group, prefill-only (no decodes on a prefill worker)
@@ -396,6 +433,8 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             self.runtime.promised.remove(&rid);
             return Some(gid);
         }
+        // External cancellation while KV was held pending decode ack.
+        self.drop_held(rid);
         None
     }
 }
@@ -409,6 +448,8 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdPrefillWorker<M> {
         match msg {
             WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
             WorkerMsg::Handoff { .. } => unreachable!("prefill worker receives no PD handoff"),
+            // Decode side has finished pulling — drop the held reservation.
+            WorkerMsg::ReleaseKv { req } => self.drop_held(req),
         }
     }
 
@@ -460,7 +501,7 @@ mod tests {
                 coverage: CoverageFlags::EMPTY,
             }
         }
-        fn kv_bytes_per_token(&self) -> u64 {
+        fn total_kv_bytes_per_token(&self) -> u64 {
             1
         }
         fn gpus_per_replica(&self) -> u16 {
@@ -502,15 +543,15 @@ mod tests {
         for step in 0..20u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
         }
-        // FakeModel: kv_bytes_per_token=1, 1 gpu, 1 dp group → num_attn_shards=1.
-        // kv_bytes = prompt_len (16) + prefix_kv (0). The worker registers one
-        // comm group at construction → send_gid=0.
+        // SendSpec is token-based at the worker boundary: kv_tokens =
+        // prompt_len (16) + prefix_kv (0). The worker registers one comm
+        // group at construction → send_gid=0.
         assert_eq!(
             events,
             vec![WorkerEvent::PrefillDone {
                 worker: WorkerId(0),
                 req: RequestId(0),
-                send_spec: SendSpec { kv_bytes: 16, send_gid: 0 },
+                send_spec: SendSpec { kv_tokens: 16, send_gid: 0 },
             }]
         );
         let s = store.borrow();

@@ -88,7 +88,7 @@ pub struct Llama3DpAttnTpFfnModel {
     pub attn_tp_size: u16,
     pub ffn_tp_size: u16,
     pub num_dp_groups: u16,
-    pub kv_bytes_per_token: u64,
+    pub total_kv_bytes_per_token: u64,
     pub attn_block: AttnBlockTpWorklet,
     pub mlp_block: MlpBlockTpWorklet,
     pub embed: Op<ElementwiseKernel>,
@@ -183,16 +183,15 @@ pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3
     }
 }
 
-/// Per-GPU KV-cache footprint one token occupies across the whole model. Under DP
-/// attention the KV heads are head-sharded across the `attn_tp_size` ranks of a DP
-/// shard, so each attention GPU sizes its KvPool from the **per-rank** KV-head
-/// count, read off the resolved attn config's already-divided value: `2` (K and V)
-/// × `num_kv_heads/attn_tp` × `head_dim` × `kv_dtype` bytes × `num_layers`.
-fn kv_bytes_per_token(resolved: &Llama3DpAttnTpFfnResolved) -> u64 {
-    let attn = &resolved.attn_block.attn; // per-rank FlashInferAttentionConfig
-    2 * attn.num_kv_heads as u64
-        * attn.head_dim as u64
-        * attn.kv_dtype.size_bytes() as u64
+/// **Total** KV-cache bytes one token occupies — summed across all
+/// `attn_tp_size` ranks of one DP shard, all layers, all KV heads. This is
+/// the wire size of a token's KV for a PD handoff (each DP shard owns one
+/// full copy of every KV head). Read off `raw_cfg`'s un-sharded values.
+fn total_kv_bytes_per_token(resolved: &Llama3DpAttnTpFfnResolved) -> u64 {
+    let raw = &resolved.attn_block.raw_cfg;
+    2 * raw.num_kv_heads as u64
+        * raw.head_dim as u64
+        * raw.kv_dtype.size_bytes() as u64
         * resolved.num_layers as u64
 }
 
@@ -219,7 +218,7 @@ pub fn build(
     let attn_tp_size = resolved.attn_tp_size;
     let ffn_tp_size = resolved.ffn_tp_size;
     let num_dp_groups = resolved.num_dp_groups;
-    let kv_bytes_per_token = kv_bytes_per_token(&resolved);
+    let total_kv_bytes_per_token = total_kv_bytes_per_token(&resolved);
 
     let embed_name = format!("{model_name}.embedding");
     let final_norm_name = format!("{model_name}.final_norm");
@@ -275,7 +274,7 @@ pub fn build(
         attn_tp_size,
         ffn_tp_size,
         num_dp_groups,
-        kv_bytes_per_token,
+        total_kv_bytes_per_token,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -371,8 +370,8 @@ impl Llama3DpAttnTpFfnModel {
 }
 
 impl IterwiseUnifiedModel for Llama3DpAttnTpFfnModel {
-    fn kv_bytes_per_token(&self) -> u64 {
-        self.kv_bytes_per_token
+    fn total_kv_bytes_per_token(&self) -> u64 {
+        self.total_kv_bytes_per_token
     }
 
     /// One replica spans the FFN TP group — `ffn_tp_size` GPUs, with the DP
@@ -478,10 +477,10 @@ mod tests {
     }
 
     #[test]
-    fn kv_bytes_per_token_uses_attn_rank() {
+    fn total_kv_bytes_per_token_sums_across_attn_ranks() {
         let r = resolve_configs(&build_configs(&ModelCfg::llama3_8b(), &parallel(4, 8)));
-        // per-attn-rank kv heads = 8/4 = 2; 2·2·128·2·32 = 32768 bytes/token/GPU.
-        assert_eq!(kv_bytes_per_token(&r), 2 * 2 * 128 * 2 * 32);
+        // Total kv heads = 8 (per-rank 2 × attn_tp 4); 2·8·128·2·32.
+        assert_eq!(total_kv_bytes_per_token(&r), 2 * 8 * 128 * 2 * 32);
     }
 
     #[test]

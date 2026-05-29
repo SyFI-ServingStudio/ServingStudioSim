@@ -40,6 +40,15 @@ pub enum PoolEvent {
         req: RequestId,
         send_spec: SendSpec,
     },
+    /// A PD decode pool's pull just landed — L6b routes the ack back to
+    /// `prefill_worker` so it can drop its held KV. Only a decode pool
+    /// surfaces this.
+    PullComplete {
+        pool: PoolId,
+        worker: WorkerId,
+        req: RequestId,
+        prefill_worker: WorkerId,
+    },
 }
 
 /// Constructor signature shared by every iter-wise worker (`BareboneWorker::new`,

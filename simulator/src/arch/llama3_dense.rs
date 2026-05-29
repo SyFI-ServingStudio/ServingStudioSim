@@ -69,7 +69,7 @@ pub struct Llama3DenseResolved {
 pub struct Llama3DenseModel {
     pub name: String,
     pub num_layers: u32,
-    pub kv_bytes_per_token: u64,
+    pub total_kv_bytes_per_token: u64,
     pub pre_attn: PreAttnLocalWorklet,
     pub attn: AttnLocalWorklet,
     pub post_attn: PostAttnLocalWorklet,
@@ -156,7 +156,7 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseC
 /// `num_layers`, read off the resolved attention config. Arch-specific (MLA's
 /// compressed latent KV, cross-layer KV sharing, … would compute it differently),
 /// so it lives in the model_arch, not on the parallelism-agnostic `ModelCfg`.
-fn kv_bytes_per_token(resolved: &Llama3DenseResolved) -> u64 {
+fn total_kv_bytes_per_token(resolved: &Llama3DenseResolved) -> u64 {
     let attn = &resolved.attn.attn;
     2 * attn.num_kv_heads as u64
         * attn.head_dim as u64
@@ -182,7 +182,7 @@ pub fn build(
     bridge: &PerfApiBridge,
 ) -> Result<Llama3DenseModel, BuildError> {
     let num_layers = resolved.num_layers;
-    let kv_bytes_per_token = kv_bytes_per_token(&resolved);
+    let total_kv_bytes_per_token = total_kv_bytes_per_token(&resolved);
 
     let embed_name = format!("{model_name}.embedding");
     let final_norm_name = format!("{model_name}.final_norm");
@@ -235,7 +235,7 @@ pub fn build(
         lm_head,
         name: model_name,
         num_layers,
-        kv_bytes_per_token,
+        total_kv_bytes_per_token,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -322,8 +322,8 @@ impl Llama3DenseModel {
 }
 
 impl IterwiseUnifiedModel for Llama3DenseModel {
-    fn kv_bytes_per_token(&self) -> u64 {
-        self.kv_bytes_per_token
+    fn total_kv_bytes_per_token(&self) -> u64 {
+        self.total_kv_bytes_per_token
     }
 
     /// Dense *local* arch: one replica runs the whole model on a single GPU (no

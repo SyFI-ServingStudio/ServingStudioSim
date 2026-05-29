@@ -93,9 +93,13 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             .borrow_mut()
             .allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
         let num_groups = model.num_attn_dp_groups().max(1) as usize;
-        // Each DP shard is an independent attention TP group with its own KV cache;
-        // the per-GPU memory allowance sizes each group's pool identically.
-        let kv_capacity = (config.attn_kv_bytes / model.kv_bytes_per_token().max(1)).max(1);
+        // Each DP shard is an independent attn TP group with its own KV cache.
+        // KvPool capacity in tokens — see `unified::new` for the derivation.
+        // `attn_kv_bytes` is per-GPU; one attn shard spans `num_attn_shards()`
+        // GPUs; the model's `total_kv_bytes_per_token` is summed across them.
+        let group_kv_bytes =
+            config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
+        let kv_capacity = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
         let batches: Vec<Batch> = (0..num_groups)
             .map(|g| Batch::new(g as u16, kv_capacity))
             .collect();
@@ -453,6 +457,9 @@ impl<M: IterwiseUnifiedModel> IterWorker for HpUnifiedWorker<M> {
         match msg {
             WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
             WorkerMsg::Handoff { .. } => unreachable!("hp_unified worker receives no PD handoff"),
+            WorkerMsg::ReleaseKv { .. } => {
+                unreachable!("hp_unified is not a PD prefill; no held KV to release")
+            }
         }
     }
 
@@ -517,7 +524,7 @@ mod tests {
                 coverage: CoverageFlags::EMPTY,
             }
         }
-        fn kv_bytes_per_token(&self) -> u64 {
+        fn total_kv_bytes_per_token(&self) -> u64 {
             1
         }
         fn gpus_per_replica(&self) -> u16 {

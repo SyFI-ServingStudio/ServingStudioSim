@@ -47,9 +47,22 @@ pub enum WorkerMsg {
         req: RequestId,
         /// Sender's comm-group id (registered at prefill worker construction).
         send_gid: u16,
-        /// Total KV bytes to transfer.
-        bytes: u64,
+        /// Total KV **tokens** to transfer (the request's `prompt_len + prefix_kv`).
+        /// The decode side multiplies by its arch's `total_kv_bytes_per_token`
+        /// when calling `cluster.submit_transfer` to recover wire bytes.
+        tokens: u64,
+        /// The prefill worker that holds this request's KV until the pull
+        /// completes. Carried through the decode worker's pending-pull → in-
+        /// flight lifecycle so the worker can later ack the prefill side
+        /// (`WorkerMsg::ReleaseKv`) and let it free its held capacity.
+        prefill_worker: WorkerId,
     },
+    /// Decode → prefill ack: a request's KV has fully landed at the decode
+    /// side, so the prefill worker can drop its held reservation. Routed by
+    /// L6 from a `WorkerEvent::PullComplete` to the originating prefill
+    /// worker (by `WorkerId`, *not* placement-chosen) — only that worker
+    /// holds the request's KV slot.
+    ReleaseKv { req: RequestId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +80,16 @@ pub enum WorkerEvent {
         req: RequestId,
         send_spec: SendSpec,
     },
+    /// A PD decode worker's pull just landed at this side — the corresponding
+    /// prefill worker can drop its held KV. `worker` is the decode worker (the
+    /// emitter); `prefill_worker` is the target prefill worker, copied from the
+    /// pull's `TransferPlan` so L6 can route the ack without consulting the
+    /// request store.
+    PullComplete {
+        worker: WorkerId,
+        req: RequestId,
+        prefill_worker: WorkerId,
+    },
 }
 
 // ── PD transfer vocabulary ────────────────────────────────────────────────────
@@ -74,10 +97,13 @@ pub enum WorkerEvent {
 /// Sender's KV layout for a PD handoff — what a prefill worker declares when
 /// its iter finishes. `send_gid` is the prefill worker's comm-group id (the
 /// attn-shard endpoint set registered once at construction with the shared
-/// cluster); `kv_bytes` is the request's full KV size across all layers.
+/// cluster); `kv_tokens` is the request's KV token count (`prompt_len +
+/// prefix_kv`). Token-based at the worker boundary so it lines up with
+/// `KvPool`'s accounting; the decode worker converts to wire bytes at
+/// `cluster.submit_transfer` time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SendSpec {
-    pub kv_bytes: u64,
+    pub kv_tokens: u64,
     pub send_gid: u16,
 }
 
@@ -85,12 +111,16 @@ pub struct SendSpec {
 /// queue. Sender side comes off the incoming `Handoff` message; destination
 /// side is the receiving decode worker's own comm-group id (pre-resolved at
 /// construction). Both are cluster-internal `u16` indices, so the whole plan
-/// is `Copy` and no allocation is needed per handoff.
+/// is `Copy` and no allocation is needed per handoff. `prefill_worker` is the
+/// owner of the held KV at the source side, threaded through so the decode
+/// worker can ack the prefill side once the pull lands. `tokens` is the wire
+/// KV count; `cluster.submit_transfer` is called with `tokens × total_kv_bytes_per_token`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferPlan {
     pub send_gid: u16,
     pub recv_gid: u16,
-    pub bytes: u64,
+    pub tokens: u64,
+    pub prefill_worker: WorkerId,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

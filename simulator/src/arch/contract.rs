@@ -104,10 +104,18 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
         }
     }
 
-    /// KV-cache bytes one token occupies across the whole model. The worker
-    /// divides its memory allowance by this to size its `KvPool` (L5 owns the
-    /// division; arch owns this footprint).
-    fn kv_bytes_per_token(&self) -> u64;
+    /// **Total** KV-cache bytes one token occupies — summed over **all** layers,
+    /// **all** KV heads, **all** attention ranks. This is the wire size of a
+    /// token's KV (what a PD handoff transfers across the comm group); it is
+    /// *not* per-GPU.
+    ///
+    /// To size a worker's `KvPool` for one attn shard, the worker reads
+    /// `attn_kv_bytes` (per-GPU budget), multiplies by `num_attn_shards()` (the
+    /// GPUs in one attn shard set), and divides by this total to get capacity
+    /// in tokens. To compute a PD transfer size, the prefill worker multiplies
+    /// tokens by this to get total wire bytes; the cluster then divides by
+    /// link count to recover per-rank bytes.
+    fn total_kv_bytes_per_token(&self) -> u64;
 
     /// GPUs one replica of this model spans. The model_arch is the source of truth
     /// for this: it resolved the parallel layout, so it knows the real extent — the
