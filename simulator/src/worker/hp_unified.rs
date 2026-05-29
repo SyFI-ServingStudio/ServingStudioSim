@@ -19,9 +19,8 @@ use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
-use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
-use crate::timing::{LeafMetrics, SlotInput};
 use crate::worker::admission_helpers::{Batch, LoadBalance};
+use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
@@ -68,11 +67,8 @@ pub struct HpUnifiedWorker<M: IterwiseUnifiedModel> {
     runtime: HpRuntime,
     /// One container per attention DP shard; length = `model.num_attn_dp_groups()`.
     batches: Vec<Batch>,
-    cost_logger: Option<CostLogger>,
-    cost_slots: Vec<LeafMetrics>,
-    cost_scratch: Vec<LeafMetrics>,
-    cost_groups: Vec<GroupInputLog>,
-    cost_slot_inputs: Vec<SlotInput>,
+    /// Eval scratch buffers + cost-log writer.
+    cost: CostBuffers,
 }
 
 impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
@@ -110,16 +106,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             LoadBalance::Single if num_groups > 1 => LoadBalance::RoundRobin { next: 0 },
             other => other,
         };
-        let cost_logger = match cost_log_dir {
-            Some(dir) => match CostLogger::open(&dir, pool_tag, id, &model.cost_log_manifest()) {
-                Ok(logger) => Some(logger),
-                Err(e) => {
-                    tracing::warn!("cost_log disabled: failed to open writer: {e}");
-                    None
-                }
-            },
-            None => None,
-        };
+        let cost = CostBuffers::new(cost_log_dir, pool_tag, id, model.as_ref());
         Self {
             id,
             model,
@@ -127,11 +114,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             config,
             runtime: HpRuntime::new(balance),
             batches,
-            cost_logger,
-            cost_slots: Vec::new(),
-            cost_scratch: Vec::new(),
-            cost_groups: Vec::new(),
-            cost_slot_inputs: Vec::new(),
+            cost,
         }
     }
 
@@ -235,55 +218,13 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
 
     fn start_iter(&mut self, now: Time) -> Time {
         let arch_input = self.build_arch_input();
-        let logging_cost = self.cost_logger.is_some();
-        let agg = if logging_cost {
-            self.model.eval_iter_with_inputs(
-                &arch_input,
-                &mut self.cost_slots,
-                &mut self.cost_scratch,
-                &mut self.cost_slot_inputs,
-            )
-        } else {
-            self.model
-                .eval_iter(&arch_input, &mut self.cost_slots, &mut self.cost_scratch)
-        };
-        let cost_time = Time::from_ms(agg.m.time_ms as f64);
-        if self.cost_logger.is_some() {
-            // Refill the reused `cost_groups` buffer in place; the per-slot
-            // breakdowns are appended into the logger's flat chunk buffers by
-            // `record`, so the entry owns no `Vec`.
-            self.cost_groups.clear();
-            for g in &arch_input.groups {
-                self.cost_groups.push(GroupInputLog {
-                    batch_tokens: g.batch_tokens,
-                    prefill_tokens: g.prefill_tokens,
-                    decode_request_count: g.decode_tokens,
-                    decode_kv_total: g.total_kv_len,
-                    prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
-                });
-            }
-            let entry = CostLogEntry {
-                worker_id: self.id.0,
-                iter_id: self.runtime.iter_counter as u64,
-                batch_id: 0,
-                wall_start_ms: now.as_ms(),
-                total_time_ms: agg.m.time_ms as f64,
-                energy_j: agg.m.energy_j as f64,
-                group_len: 0,
-                slot_len: 0,
-                slot_input_len: 0,
-            };
-            if let Some(logger) = self.cost_logger.as_mut() {
-                if let Err(e) = logger.record(
-                    entry,
-                    &self.cost_slots,
-                    &mut self.cost_groups,
-                    &mut self.cost_slot_inputs,
-                ) {
-                    tracing::warn!("cost_log record failed: {e}");
-                }
-            }
-        }
+        let cost_time = self.cost.run_iter(
+            self.model.as_ref(),
+            &arch_input,
+            self.id,
+            self.runtime.iter_counter as u64,
+            now,
+        );
         self.runtime.iter_compute_start = now;
         now + cost_time
     }

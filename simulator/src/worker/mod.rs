@@ -7,6 +7,7 @@
 
 pub mod admission_helpers;
 pub mod config;
+pub mod cost_buffers;
 pub mod gpu_cluster;
 pub mod hp_unified;
 pub mod iter_worker;
@@ -17,6 +18,7 @@ pub mod unified;
 
 pub use admission_helpers::{Batch, DecodeReqState, KvAdmission, KvPool, LoadBalance};
 pub use config::{AttnWorkerSel, BatchPolicy, FfnWorkerSel, IterWorkerSel};
+pub use cost_buffers::CostBuffers;
 pub use gpu_cluster::{CostSource, GpuCluster, GpuInfo, SharedGpuCluster};
 pub use hp_unified::HpUnifiedWorker;
 pub use iter_worker::IterWorker;
