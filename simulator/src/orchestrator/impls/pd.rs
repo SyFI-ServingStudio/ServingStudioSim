@@ -26,7 +26,7 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time};
 use crate::worker::{
     CostSource, GpuCluster, IterWorker, PdDecodeEvent, PdDecodeMsg, PdPrefillEvent, PdPrefillMsg,
-    SharedGpuCluster, WorkerEventCommon,
+    SharedGpuCluster,
 };
 
 use super::super::{Flow, OrchAction, UnifiedWorkerFactory};
@@ -125,7 +125,7 @@ where
         // compile time — `PdPrefillEvent` simply has no such variant.
         for ev in prefill_events.drain(..) {
             match ev {
-                PdPrefillEvent::Common(WorkerEventCommon::RequestComplete { req, .. }) => {
+                PdPrefillEvent::RequestComplete { req, .. } => {
                     actions.push(OrchAction::Complete { req });
                 }
                 PdPrefillEvent::PrefillDone { worker, req, send_gid, kv_tokens } => {
@@ -151,7 +151,7 @@ where
         self.decode_pool.tick_collect(now, &mut decode_events);
         for ev in decode_events.drain(..) {
             match ev {
-                PdDecodeEvent::Common(WorkerEventCommon::RequestComplete { req, .. }) => {
+                PdDecodeEvent::RequestComplete { req, .. } => {
                     actions.push(OrchAction::Complete { req });
                 }
                 // KV has fully landed at decode — tell the originating prefill

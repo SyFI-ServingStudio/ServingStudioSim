@@ -29,7 +29,7 @@ use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
     BatchFsmState, IterCursor, PdDecodeEvent, PdDecodeMsg, TransferPlan, WorkerConfig,
-    WorkerEventCommon, WorkerFsmState, WorkerMsgCommon, WorkerStatus,
+    WorkerFsmState, WorkerStatus,
 };
 
 /// One pull actively flowing through the shared cluster. Carries everything
@@ -529,10 +529,10 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                     .unwrap_or(0);
                 self.batches[gid].release(rid, current_kv);
                 self.runtime.request_to_group.remove(&rid);
-                events.push(PdDecodeEvent::Common(WorkerEventCommon::RequestComplete {
+                events.push(PdDecodeEvent::RequestComplete {
                     worker: self.id,
                     req: rid,
-                }));
+                });
             }
         }
     }
@@ -596,7 +596,7 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
             // Direct admit (e.g. tests): KV treated as instantly resident.
             // Still count it toward the backlog so the gate's accounting is
             // consistent — tests use tiny token counts so the budget never bites.
-            PdDecodeMsg::Common(WorkerMsgCommon::Request(rid)) => {
+            PdDecodeMsg::Request(rid) => {
                 let tokens = {
                     let store = self.requests.borrow();
                     let r = &store[rid];
@@ -678,17 +678,17 @@ mod tests {
         // prompt 16, decode 3 → prefill already emitted token 1, decode emits 2 more.
         let store = prefilled_store(&[(0, 16, 3)]);
         let mut w = worker(Rc::clone(&store));
-        w.enqueue(PdDecodeMsg::Common(WorkerMsgCommon::Request(RequestId(0))));
+        w.enqueue(PdDecodeMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..50u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(
             events,
-            vec![PdDecodeEvent::Common(WorkerEventCommon::RequestComplete {
+            vec![PdDecodeEvent::RequestComplete {
                 worker: WorkerId(0),
                 req: RequestId(0)
-            })]
+            }]
         );
         let s = store.borrow();
         let r = &s[RequestId(0)];
@@ -701,7 +701,7 @@ mod tests {
         let store = prefilled_store(&[(0, 8, 2), (1, 8, 2), (2, 8, 2)]);
         let mut w = worker(Rc::clone(&store));
         for id in [0, 1, 2] {
-            w.enqueue(PdDecodeMsg::Common(WorkerMsgCommon::Request(RequestId(id))));
+            w.enqueue(PdDecodeMsg::Request(RequestId(id)));
         }
         let mut events = Vec::new();
         for step in 0..200u64 {
@@ -729,8 +729,8 @@ mod tests {
         // Two long-decode handed-off requests, two DP shards: RR routes one to each.
         let store = prefilled_store(&[(0, 4, 50), (1, 4, 50)]);
         let mut w = worker_dp(store, 2);
-        w.enqueue(PdDecodeMsg::Common(WorkerMsgCommon::Request(RequestId(0))));
-        w.enqueue(PdDecodeMsg::Common(WorkerMsgCommon::Request(RequestId(1))));
+        w.enqueue(PdDecodeMsg::Request(RequestId(0)));
+        w.enqueue(PdDecodeMsg::Request(RequestId(1)));
         let mut events = Vec::new();
         for step in 0..10u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
@@ -836,7 +836,7 @@ mod tests {
         let store = prefilled_store(&[(0, 8, 2), (1, 8, 2), (2, 8, 2), (3, 8, 2)]);
         let mut w = worker_dp(Rc::clone(&store), 2);
         for id in 0..4u32 {
-            w.enqueue(PdDecodeMsg::Common(WorkerMsgCommon::Request(RequestId(id))));
+            w.enqueue(PdDecodeMsg::Request(RequestId(id)));
         }
         let mut events = Vec::new();
         for step in 0..200u64 {

@@ -25,8 +25,8 @@ use crate::worker::admission_helpers::Batch;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, PdPrefillEvent, PdPrefillMsg, WorkerConfig, WorkerEventCommon,
-    WorkerFsmState, WorkerMsgCommon, WorkerStatus,
+    BatchFsmState, IterCursor, PdPrefillEvent, PdPrefillMsg, WorkerConfig, WorkerFsmState,
+    WorkerStatus,
 };
 
 struct PrefillRuntime {
@@ -326,10 +326,10 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             // r is unused below — NLL releases the borrow on `store`.
             self.runtime.request_to_group.remove(&rid);
             if complete {
-                events.push(PdPrefillEvent::Common(WorkerEventCommon::RequestComplete {
+                events.push(PdPrefillEvent::RequestComplete {
                     worker: worker_id,
                     req: rid,
-                }));
+                });
             } else {
                 // KV stays resident on this worker until the decode side acks
                 // the pull via `PdPrefillMsg::ReleaseKv`. Tracking it in `held`
@@ -450,9 +450,7 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdPrefillWorker<M> {
 
     fn enqueue(&mut self, msg: Self::Msg) {
         match msg {
-            PdPrefillMsg::Common(WorkerMsgCommon::Request(rid)) => {
-                self.runtime.pending_prefills.push_back(rid)
-            }
+            PdPrefillMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
             // Decode side has finished pulling — drop the held reservation.
             PdPrefillMsg::ReleaseKv { req } => self.drop_held(req),
         }
@@ -498,7 +496,7 @@ mod tests {
         // A multi-token request: prefill emits the first token then hands off.
         let store = shared_with(&[(0, 16, 3)]);
         let mut w = worker(Rc::clone(&store));
-        w.enqueue(PdPrefillMsg::Common(WorkerMsgCommon::Request(RequestId(0))));
+        w.enqueue(PdPrefillMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..20u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
@@ -527,17 +525,17 @@ mod tests {
         // decode_len == 1: the prefill's first token is the whole output.
         let store = shared_with(&[(0, 16, 1)]);
         let mut w = worker(Rc::clone(&store));
-        w.enqueue(PdPrefillMsg::Common(WorkerMsgCommon::Request(RequestId(0))));
+        w.enqueue(PdPrefillMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..20u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(
             events,
-            vec![PdPrefillEvent::Common(WorkerEventCommon::RequestComplete {
+            vec![PdPrefillEvent::RequestComplete {
                 worker: WorkerId(0),
                 req: RequestId(0)
-            })]
+            }]
         );
     }
 }

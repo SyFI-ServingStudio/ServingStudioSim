@@ -37,32 +37,37 @@ pub struct BatchFsmState {
 //
 // Each worker carries its own `type Msg` / `type Event` (associated types on
 // `IterWorker`), so adding a new worker with role-specific messages or events
-// never forces a change to existing workers' files. The shared base — what every
-// worker must accept (`Request`) and emit (`RequestComplete`) — lives in
-// `WorkerMsgCommon` / `WorkerEventCommon`; role-specific enums (e.g. PD prefill /
-// PD decode) wrap the common base via a `Common(...)` variant so universal
-// admission and completion still flow through one path on the consumer side.
+// never forces a change to existing workers' files. Workers that have NO role-
+// specific traffic (barebone, HP) use `WorkerMsgCommon` / `WorkerEventCommon`
+// directly; PD prefill / PD decode each have their own flat enum that inlines
+// the universal `Request` / `RequestComplete` variant alongside the role-
+// specific ones. Flat (not nested) — a new universal message would touch each
+// flat enum once, but every call site is single-level (no `::Common(...)`).
 
-/// Universal request admission. Every iter-wise worker accepts this; role-
-/// specific enums (e.g. `PdDecodeMsg`) wrap it in a `Common` variant.
+/// Universal request admission. Worker types that have no role-specific
+/// messages (`BareboneWorker`, `HpUnifiedWorker`) use this as their `Msg`
+/// directly; PD workers inline the `Request` variant in their own enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerMsgCommon {
     Request(RequestId),
 }
 
-/// Universal completion event. Every iter-wise worker eventually emits this for
-/// each request it owned; role-specific enums (e.g. `PdPrefillEvent`) wrap it
-/// in a `Common` variant.
+/// Universal completion event. Worker types that have no role-specific events
+/// (`BareboneWorker`, `HpUnifiedWorker`) use this as their `Event` directly;
+/// PD workers inline the `RequestComplete` variant in their own enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerEventCommon {
     RequestComplete { worker: WorkerId, req: RequestId },
 }
 
-/// PD prefill worker's full message set: the universal `Request` plus the
-/// decode-side ack `ReleaseKv` that lets it drop a held KV reservation.
+/// PD prefill worker's full message set: the universal `Request` (inlined,
+/// single-level) plus the decode-side ack `ReleaseKv` that lets it drop a
+/// held KV reservation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PdPrefillMsg {
-    Common(WorkerMsgCommon),
+    /// Admit a new request — same shape as the universal `Request` (kept
+    /// flat so call sites are single-level).
+    Request(RequestId),
     /// Decode → prefill ack: a request's KV has fully landed at the decode
     /// side, so this prefill worker can drop its held reservation. Routed by
     /// L6 from a `PdDecodeEvent::PullComplete` to the originating prefill
@@ -71,12 +76,15 @@ pub enum PdPrefillMsg {
     ReleaseKv { req: RequestId },
 }
 
-/// PD prefill worker's full event set: the universal `RequestComplete` (single-
-/// token requests finish on prefill) plus the handoff signal that L6 forwards
-/// to the decode pool.
+/// PD prefill worker's full event set: the universal `RequestComplete`
+/// (inlined; single-token requests finish on prefill) plus the handoff signal
+/// that L6 forwards to the decode pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PdPrefillEvent {
-    Common(WorkerEventCommon),
+    /// Universal completion (inlined). Single-token requests finish at the
+    /// prefill worker; multi-token requests emit `PrefillDone` instead and
+    /// hand off to decode.
+    RequestComplete { worker: WorkerId, req: RequestId },
     /// A PD prefill worker finished a request's prefill; L6 hands it off to a
     /// decode pool. `send_gid` is the sender's comm-group id (registered at
     /// prefill worker construction); `kv_tokens` is the request's KV token
@@ -90,12 +98,14 @@ pub enum PdPrefillEvent {
     },
 }
 
-/// PD decode worker's full message set: the universal `Request` plus the prefill-
-/// side handoff that admits an already-prefilled request and triggers the KV
-/// pull from the sender's comm group.
+/// PD decode worker's full message set: the universal `Request` (inlined) plus
+/// the prefill-side handoff that admits an already-prefilled request and
+/// triggers the KV pull from the sender's comm group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PdDecodeMsg {
-    Common(WorkerMsgCommon),
+    /// Admit a new request — same shape as the universal `Request` (kept
+    /// flat so call sites are single-level).
+    Request(RequestId),
     /// PD handoff: this decode pool admits an already-prefilled request and must
     /// pull its KV from the sender's comm group. Only the sender side is in the
     /// wire message — the destination is the receiving decode worker's own
@@ -117,11 +127,14 @@ pub enum PdDecodeMsg {
     },
 }
 
-/// PD decode worker's full event set: the universal `RequestComplete` plus the
-/// pull-landed ack that triggers `ReleaseKv` back to the source prefill worker.
+/// PD decode worker's full event set: the universal `RequestComplete` (inlined)
+/// plus the pull-landed ack that triggers `ReleaseKv` back to the source
+/// prefill worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PdDecodeEvent {
-    Common(WorkerEventCommon),
+    /// Universal completion (inlined). The decode worker finishes a request
+    /// after emitting all its output tokens.
+    RequestComplete { worker: WorkerId, req: RequestId },
     /// A PD decode worker's pull just landed — the corresponding prefill worker
     /// can drop its held KV. `worker` is the decode worker (the emitter);
     /// `prefill_worker` is the target prefill worker, copied from the pull's
@@ -143,10 +156,10 @@ impl From<RequestId> for WorkerMsgCommon {
     fn from(req: RequestId) -> Self { Self::Request(req) }
 }
 impl From<RequestId> for PdPrefillMsg {
-    fn from(req: RequestId) -> Self { Self::Common(req.into()) }
+    fn from(req: RequestId) -> Self { Self::Request(req) }
 }
 impl From<RequestId> for PdDecodeMsg {
-    fn from(req: RequestId) -> Self { Self::Common(req.into()) }
+    fn from(req: RequestId) -> Self { Self::Request(req) }
 }
 
 // ── PD transfer vocabulary ────────────────────────────────────────────────────
