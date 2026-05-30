@@ -24,6 +24,7 @@ from .exec import (
     binary_path,
     cargo_build,
     run_analysis,
+    run_iter_breakdown,
 )
 
 
@@ -54,6 +55,10 @@ async def _run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         # Best-effort: `analyze trace` (the Perfetto tree) + `analyze run`. Cost
         # subjects apply; request/throughput subjects self-skip on a predict dir.
         await run_analysis(log_dir, build_type)
+        # Predict-only: the human-readable cost tree (reports/iter_breakdown.ans).
+        # Not in the shared run_analysis — a real run's thousands of iters would
+        # make that file enormous; a predict dir has only a few cases.
+        await run_iter_breakdown(log_dir, build_type)
     return ok
 
 

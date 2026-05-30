@@ -16,6 +16,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+mod breakdown;
 mod cdf;
 mod io;
 mod perfetto;
@@ -65,6 +66,27 @@ enum Command {
         #[arg(long, default_value_t = 200_000)]
         max_slices: usize,
     },
+    /// Render a human-readable cost tree (time + percentage) per iteration to
+    /// `reports/iter_breakdown.ans` from the standard `cost_log` + `cost_manifest`.
+    /// Arch input header + clean tree (no kernel config/shapes); the critical path
+    /// is flagged with a `▸` gutter. ANSI-colored by default (yellow title bar, timing
+    /// cell tinted by node type — non-leaf blue, leaf white — bold critical path) —
+    /// `cat` it in a terminal; pass `--no-color` for a clean editor view. A verb (not
+    /// a subject): its output is text, not JSON.
+    GenIterBreakdown {
+        /// Run directory (holds `raw/cost_log/` + `raw/cost_manifest/`).
+        log_dir: PathBuf,
+        /// Render only this iteration (by `iter_id`); default = every row.
+        #[arg(long)]
+        iter: Option<u64>,
+        /// Cap on iterations rendered (large real runs have thousands of rows).
+        #[arg(long, default_value_t = 32)]
+        max_iters: usize,
+        /// Emit plain text (no ANSI) so the file reads cleanly in an editor; default
+        /// is colored (yellow title bar, timing non-leaf blue / leaf white, bold crit).
+        #[arg(long)]
+        no_color: bool,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -83,6 +105,15 @@ async fn main() -> Result<()> {
         } => {
             let ctx = build_session();
             trace::run(&ctx, &log_dir, regions, region_ms, max_slices).await
+        }
+        Command::GenIterBreakdown {
+            log_dir,
+            iter,
+            max_iters,
+            no_color,
+        } => {
+            let ctx = build_session();
+            breakdown::run(&ctx, &log_dir, iter, max_iters, !no_color).await
         }
     }
 }

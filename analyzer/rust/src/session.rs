@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-    ListArray, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    ListArray, RecordBatch, StringArray, StructArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 
@@ -138,6 +139,77 @@ pub fn value_f32_list(array: &ArrayRef, row: usize) -> Result<Vec<f64>> {
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| anyhow!("expected List<Float32> values"))?;
     Ok((0..floats.len()).map(|i| floats.value(i) as f64).collect())
+}
+
+/// One iteration's per-HP-group arch input, read from the `groups` `List<Struct>`
+/// column (analyzer-side mirror of the sim's `GroupInputLog`). Only the fields the
+/// breakdown header renders are kept.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GroupInput {
+    pub batch_tokens: u32,
+    pub prefill_tokens: u32,
+    pub decode_request_count: u32,
+    pub decode_kv_total: u32,
+    /// Per prefill request `(prefix_len, append_len)`, re-zipped from the two
+    /// parallel `prefill_*_lens` sub-lists the sim writer splits them into.
+    pub prefill_chunk_pairs: Vec<(u32, u32)>,
+}
+
+/// One row of the `groups` `List<Struct>` column → that iteration's per-group
+/// inputs. Null row → empty vec. Struct field order is fixed by the sim writer
+/// (`simulator/src/log/rows.rs::build_groups_column`): 0 batch_tokens, 1
+/// prefill_tokens, 2 decode_request_count, 3 decode_kv_total, 4 prefill_prefix_lens
+/// (`List<UInt32>`), 5 prefill_append_lens (`List<UInt32>`).
+pub fn value_groups(array: &ArrayRef, row: usize) -> Result<Vec<GroupInput>> {
+    let list = array
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("expected List array for `groups`"))?;
+    if list.is_null(row) {
+        return Ok(Vec::new());
+    }
+    let structs_ref = list.value(row);
+    let structs = structs_ref
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| anyhow!("expected List<Struct> for `groups`"))?;
+    let u32_col = |idx: usize| -> Result<&UInt32Array> {
+        structs
+            .column(idx)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| anyhow!("groups struct field {idx} is not UInt32"))
+    };
+    let (bt, pt, dc, dk) = (u32_col(0)?, u32_col(1)?, u32_col(2)?, u32_col(3)?);
+    let list_col = |idx: usize| -> Result<&ListArray> {
+        structs
+            .column(idx)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| anyhow!("groups struct field {idx} is not List"))
+    };
+    let (prefix_lens, append_lens) = (list_col(4)?, list_col(5)?);
+    let u32_items = |la: &ListArray, g: usize| -> Result<Vec<u32>> {
+        let vals = la.value(g);
+        let arr = vals
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| anyhow!("groups prefill list values are not UInt32"))?;
+        Ok((0..arr.len()).map(|i| arr.value(i)).collect())
+    };
+    let mut out = Vec::with_capacity(structs.len());
+    for g in 0..structs.len() {
+        let prefix = u32_items(prefix_lens, g)?;
+        let append = u32_items(append_lens, g)?;
+        out.push(GroupInput {
+            batch_tokens: bt.value(g),
+            prefill_tokens: pt.value(g),
+            decode_request_count: dc.value(g),
+            decode_kv_total: dk.value(g),
+            prefill_chunk_pairs: prefix.into_iter().zip(append).collect(),
+        });
+    }
+    Ok(out)
 }
 
 /// One row of a `List<Utf8>` column as owned `Vec<String>` (e.g. `slot_input`).

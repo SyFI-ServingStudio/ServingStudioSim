@@ -229,6 +229,29 @@ async def run_analysis(
         print(f"[analyze] trace failed for {log_dir}:\n{out}")
 
 
+async def run_iter_breakdown(log_dir: Path, build_type: str = "debug") -> None:
+    """Best-effort `analyze gen-iter-breakdown` → `reports/iter_breakdown.ans`
+    (human-readable cost tree). Wired ONLY into the iter-timing-predict entry, not
+    the shared `run_analysis`: a real run has thousands of iters, so auto-emitting
+    a per-iter tree there would be a huge file — predict dirs have a handful of
+    cases. The verb itself is general (`analyze gen-iter-breakdown <dir>` works on
+    any artifact dir); only the *automatic* emission is predict-scoped. Failures
+    warn and return (analysis never fails an otherwise-successful run)."""
+    analyzer = analyzer_binary_path(build_type)
+    if not analyzer.exists():
+        print(f"[analyze] {analyzer} not built; skipping iter-breakdown for {log_dir}")
+        return
+    rc, out = await _run_capture([str(analyzer), "gen-iter-breakdown", str(log_dir)])
+    stdout_log = log_dir / "stdout.log"
+    if out:
+        with stdout_log.open("a") as fh:
+            fh.write(f"\n=== analyze gen-iter-breakdown ===\n{out}")
+            if not out.endswith("\n"):
+                fh.write("\n")
+    if rc != 0:
+        print(f"[analyze] gen-iter-breakdown failed for {log_dir}:\n{out}")
+
+
 @dataclass
 class SimulationRunner:
     """One subprocess run. `argv` comes from `schema.build_cli_command`."""
