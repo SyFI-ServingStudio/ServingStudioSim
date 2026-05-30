@@ -21,4 +21,4 @@ pub use llama3_dp_attn_tp_ffn::{DpAttnTpFfnParallel, Llama3DpAttnTpFfnModel};
 pub use model_cfg::ModelCfg;
 pub use moe_model_cfg::MoeModelCfg;
 pub use qwen3_moe_dp_attn_ep_ffn::{Qwen3MoeDpAttnEpFfnModel, Qwen3MoeParallel};
-pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec};
+pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};

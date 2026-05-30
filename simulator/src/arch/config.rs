@@ -49,6 +49,25 @@ pub struct ModelSpec {
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
+/// MoE expert routing distribution kind (the `routing` selector on
+/// [`IterArchSel::Qwen3MoeDpAttnEpFfn`]). v1 exposes `uniform` and a seeded
+/// `random`; the model layer also carries `power_law` / explicit `from_profile`
+/// (see `timing::routing::RoutingDistribution`), reachable here once a config
+/// needs them. Kept a small closed set so the launcher validates it as a
+/// `string` param with `choices` (mirrored by [`ROUTING_KINDS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingKind {
+    /// Even load across all experts (the v1 default).
+    #[default]
+    Uniform,
+    /// Deterministic pseudo-random skew seeded by `routing_seed`.
+    Random,
+}
+
+/// The `routing` choices the launcher schema advertises (mirror of [`RoutingKind`]).
+const ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
+
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own
 /// params).
@@ -96,16 +115,19 @@ pub enum IterArchSel {
         /// for the intra/inter split of MoE dispatch/combine.
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
-        /// Per-expert routing weight profile (length must equal
-        /// `model.num_experts`). Empty / omitted → uniform routing across all
-        /// experts (the v1 default). When non-empty, weights are passed to
-        /// `RoutingDistribution::from_profile` (non-negative `f32`, normalized
-        /// to `TOTAL_PPM`); the resulting distribution drives the L2 MoE
-        /// dispatch/combine `BottleneckCurve` simulation. v1 note: the L3
-        /// grouped-GEMM `local_ppm` stays uniform regardless — per-rank
-        /// `local_ppm` skew is a future follow-up.
+        /// Expert routing distribution: `uniform` (default) spreads load evenly;
+        /// `random` draws a deterministic pseudo-random skew seeded by
+        /// `routing_seed`. Drives the L2 MoE dispatch/combine `BottleneckCurve`
+        /// simulation (the L3 grouped-GEMM `local_ppm` stays uniform in v1 — a
+        /// future follow-up). Omitted → `uniform`.
         #[serde(default)]
-        routing_profile: Vec<f32>,
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        /// Seed for `routing = random` (ignored for `uniform`). Fixed so a run is
+        /// reproducible (the throughput golden is bit-identical); vary it to
+        /// sample a different random skew.
+        #[serde(default)]
+        routing_seed: Option<u64>,
     },
 }
 

@@ -150,7 +150,8 @@ impl Deployment for UnifiedDeployment {
                 ep_size,
                 hp_size,
                 nvl_num_gpu,
-                routing_profile,
+                routing,
+                routing_seed,
                 ..
             } => {
                 ensure_hp_unified(&g.worker)?;
@@ -160,7 +161,8 @@ impl Deployment for UnifiedDeployment {
                     *ep_size,
                     *hp_size,
                     *nvl_num_gpu,
-                    routing_profile.as_slice(),
+                    *routing,
+                    *routing_seed,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

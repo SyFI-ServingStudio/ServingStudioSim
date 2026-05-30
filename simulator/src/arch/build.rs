@@ -12,9 +12,9 @@
 
 use std::path::Path;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result};
 
-use crate::arch::config::{IterArchSel, ModelSpec};
+use crate::arch::config::{IterArchSel, ModelSpec, RoutingKind};
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
@@ -46,20 +46,20 @@ pub fn moe_model_cfg(model_spec: &ModelSpec) -> Result<MoeModelCfg> {
     Ok(cfg)
 }
 
-/// Resolve the MoE routing distribution from the optional selector profile. Empty
-/// → uniform over `num_experts`; non-empty must have length `num_experts` (one
-/// ppm slot per expert for the L2 MoE op).
-pub fn resolve_routing(profile: &[f32], num_experts: u32) -> Result<RoutingDistribution> {
-    if profile.is_empty() {
-        return Ok(RoutingDistribution::uniform(num_experts));
+/// Resolve the MoE routing distribution the L2 MoE op samples against from the
+/// selector's [`RoutingKind`]: `uniform` spreads load evenly over `num_experts`;
+/// `random` draws a `seed`-seeded deterministic skew (0 when unset). Infallible —
+/// both kinds are valid for any `num_experts`. The model layer's `power_law` /
+/// explicit `from_profile` are not yet wired to config.
+pub fn resolve_routing(
+    kind: RoutingKind,
+    seed: Option<u64>,
+    num_experts: u32,
+) -> RoutingDistribution {
+    match kind {
+        RoutingKind::Uniform => RoutingDistribution::uniform(num_experts),
+        RoutingKind::Random => RoutingDistribution::random(num_experts, seed.unwrap_or(0)),
     }
-    ensure!(
-        profile.len() == num_experts as usize,
-        "routing_profile has {} weights but model has {} experts",
-        profile.len(),
-        num_experts,
-    );
-    Ok(RoutingDistribution::from_profile(profile))
 }
 
 /// Build the dense (single-GPU) Llama3 model.
@@ -128,13 +128,14 @@ pub fn qwen3_moe(
     ep_size: u16,
     hp_size: u16,
     nvl_num_gpu: u16,
-    routing_profile: &[f32],
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
 ) -> Result<Qwen3MoeDpAttnEpFfnModel> {
     let model_cfg = moe_model_cfg(model_spec)?;
-    let routing = resolve_routing(routing_profile, model_cfg.num_experts)?;
+    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts);
     let parallel = Qwen3MoeParallel {
         attn_tp_size,
         ep_size,
@@ -184,14 +185,16 @@ pub fn build_iter_model(
             ep_size,
             hp_size,
             nvl_num_gpu,
-            routing_profile,
+            routing,
+            routing_seed,
         } => Box::new(qwen3_moe(
             model,
             *attn_tp_size,
             *ep_size,
             *hp_size,
             *nvl_num_gpu,
-            routing_profile.as_slice(),
+            *routing,
+            *routing_seed,
             gpu,
             name,
             bridge,
