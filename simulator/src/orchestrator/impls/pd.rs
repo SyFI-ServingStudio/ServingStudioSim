@@ -23,11 +23,14 @@
 //! pools).
 
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::common::{PoolId, Request, SharedRequests, Time};
-use crate::worker::{CostSource, GpuCluster, IterWorker, SharedGpuCluster, WorkerEvent, WorkerMsg};
+use crate::common::{PoolId, Request, RequestId, SharedRequests, Time};
+use crate::worker::{
+    CostSource, GpuCluster, IterWorker, PdDecodeEvent, PdDecodeMsg, PdPrefillEvent, PdPrefillMsg,
+    SharedGpuCluster,
+};
 
-use super::super::{Flow, OrchAction, PoolEvent, UnifiedWorkerFactory};
-use super::simple_dp::{to_pool_event, SimpleDpPoolConfig, SimpleDpPoolController};
+use super::super::{Flow, OrchAction, UnifiedWorkerFactory};
+use super::simple_dp::{SimpleDpPoolConfig, SimpleDpPoolController};
 
 // ── L6b: PD deployment flow (the object L7 calls) ──────────────────────────────
 
@@ -39,9 +42,9 @@ use super::simple_dp::{to_pool_event, SimpleDpPoolConfig, SimpleDpPoolController
 pub struct PdFlow<MP, WP, MD, WD>
 where
     MP: IterwiseUnifiedModel,
-    WP: IterWorker,
+    WP: IterWorker<Msg = PdPrefillMsg, Event = PdPrefillEvent>,
     MD: IterwiseUnifiedModel,
-    WD: IterWorker,
+    WD: IterWorker<Msg = PdDecodeMsg, Event = PdDecodeEvent>,
 {
     requests: SharedRequests,
     prefill_pool: SimpleDpPoolController<MP, WP>,
@@ -51,19 +54,20 @@ where
     /// decode workers retain a handle for `submit_transfer`). One object, two
     /// roles; see `worker::gpu_cluster`.
     cluster: SharedGpuCluster,
-    /// Reused per-tick event sinks (one per pool) — workers push `WorkerEvent`s
-    /// into them during `tick_collect` (`PrefillDone` on the producer side,
-    /// completions on either side), drained + cleared here each tick.
-    prefill_events: Vec<WorkerEvent>,
-    decode_events: Vec<WorkerEvent>,
+    /// Reused per-tick event sinks, typed per pool (`PdPrefillEvent` for the
+    /// producer side, `PdDecodeEvent` for the consumer). Drained + cleared
+    /// each tick; the typed sinks make "decode never emits PrefillDone" a
+    /// compile-time fact rather than a silent ignore arm.
+    prefill_events: Vec<PdPrefillEvent>,
+    decode_events: Vec<PdDecodeEvent>,
 }
 
 impl<MP, WP, MD, WD> PdFlow<MP, WP, MD, WD>
 where
     MP: IterwiseUnifiedModel,
-    WP: IterWorker,
+    WP: IterWorker<Msg = PdPrefillMsg, Event = PdPrefillEvent>,
     MD: IterwiseUnifiedModel,
-    WD: IterWorker,
+    WD: IterWorker<Msg = PdDecodeMsg, Event = PdDecodeEvent>,
 {
     /// Build the shared `GpuCluster` with the production transfer cost, then
     /// both pools (their workers self-register their GPU blocks in the cluster
@@ -96,9 +100,10 @@ where
 impl<MP, WP, MD, WD> Flow for PdFlow<MP, WP, MD, WD>
 where
     MP: IterwiseUnifiedModel,
-    WP: IterWorker,
+    WP: IterWorker<Msg = PdPrefillMsg, Event = PdPrefillEvent>,
     MD: IterwiseUnifiedModel,
-    WD: IterWorker,
+    WD: IterWorker<Msg = PdDecodeMsg, Event = PdDecodeEvent>,
+    WP::Msg: From<RequestId>,
 {
     fn on_arrival(&mut self, req: Request) {
         let rid = req.id;
@@ -115,30 +120,26 @@ where
         let mut prefill_events = std::mem::take(&mut self.prefill_events);
         prefill_events.clear();
         self.prefill_pool.tick_collect(now, &mut prefill_events);
-        let prefill_pool = self.prefill_pool.pool();
-        // Forward each PrefillDone directly: the sender's comm-group id and KV
-        // token count travel straight into `WorkerMsg::Handoff`; the destination
-        // block is the decode worker's own and gets filled in on receipt.
-        // No flow-side endpoint table, no intermediate Vec.
+        // Each prefill event is either a request completion (single-token) or
+        // a PrefillDone handoff. Decode-side acks (PullComplete) are absent at
+        // compile time — `PdPrefillEvent` simply has no such variant.
         for ev in prefill_events.drain(..) {
-            match to_pool_event(prefill_pool, ev) {
-                PoolEvent::PrefillDone { worker, req, send_gid, kv_tokens, .. } => {
+            match ev {
+                PdPrefillEvent::RequestComplete { req, .. } => {
+                    actions.push(OrchAction::Complete { req });
+                }
+                PdPrefillEvent::PrefillDone { worker, req, send_gid, kv_tokens } => {
                     // Carry the prefill worker id through so the decode side can
-                    // later ack it (step C: `ReleaseKv`) and let it drop the
-                    // held KV reservation. The send-side comm group alone is not
-                    // enough — multiple prefill workers may share an arch.
-                    self.decode_pool.admit_msg(WorkerMsg::Handoff {
+                    // later ack it (`ReleaseKv`) and let it drop the held KV
+                    // reservation. The send-side comm group alone is not enough
+                    // — multiple prefill workers may share an arch.
+                    self.decode_pool.admit_msg(PdDecodeMsg::Handoff {
                         req,
                         send_gid,
                         tokens: kv_tokens,
                         prefill_worker: worker,
                     });
                 }
-                PoolEvent::RequestComplete { req, .. } => {
-                    actions.push(OrchAction::Complete { req })
-                }
-                // Prefill workers never emit a pull ack.
-                PoolEvent::PullComplete { .. } => {}
             }
         }
         self.prefill_events = prefill_events;
@@ -148,22 +149,19 @@ where
         let mut decode_events = std::mem::take(&mut self.decode_events);
         decode_events.clear();
         self.decode_pool.tick_collect(now, &mut decode_events);
-        let decode_pool = self.decode_pool.pool();
         for ev in decode_events.drain(..) {
-            match to_pool_event(decode_pool, ev) {
-                PoolEvent::RequestComplete { req, .. } => {
-                    actions.push(OrchAction::Complete { req })
+            match ev {
+                PdDecodeEvent::RequestComplete { req, .. } => {
+                    actions.push(OrchAction::Complete { req });
                 }
                 // KV has fully landed at decode — tell the originating prefill
                 // worker to drop its held reservation. Targeted route (by
                 // `prefill_worker` id), *not* placement-chosen: only that
                 // worker tracks this request's held KV.
-                PoolEvent::PullComplete { req, prefill_worker, .. } => {
+                PdDecodeEvent::PullComplete { req, prefill_worker, .. } => {
                     self.prefill_pool
-                        .route_msg_to(prefill_worker, WorkerMsg::ReleaseKv { req });
+                        .route_msg_to(prefill_worker, PdPrefillMsg::ReleaseKv { req });
                 }
-                // A decode pool never hands off.
-                PoolEvent::PrefillDone { .. } => {}
             }
         }
         self.decode_events = decode_events;

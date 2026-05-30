@@ -1,7 +1,7 @@
 //! `PdPrefillWorker` — the prefill half of a PD (prefill/decode disaggregation)
 //! deployment. Iter-wise like the barebone worker, and admits + costs prefills the
 //! same way, but at iter end it does **not** keep the request to decode: it emits
-//! `WorkerEvent::PrefillDone` so L6 hands the request (its prompt KV already
+//! `PdPrefillEvent::PrefillDone` so L6 hands the request (its prompt KV already
 //! computed) off to a decode pool, and releases its own transient state.
 //!
 //! v1 simplification: the prefill→decode KV transfer is not modeled (the handoff
@@ -19,13 +19,13 @@ use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
-use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
-use crate::timing::{LeafMetrics, SlotInput};
+use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::admission_helpers::Batch;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
+    BatchFsmState, IterCursor, PdPrefillEvent, PdPrefillMsg, WorkerConfig, WorkerFsmState,
+    WorkerStatus,
 };
 
 struct PrefillRuntime {
@@ -36,7 +36,7 @@ struct PrefillRuntime {
     /// pending the decode side's pull. Each entry's KV-token count counts
     /// against the worker's admission budget so the prefill side doesn't
     /// over-commit beyond what its physical KV can actually hold. Drained
-    /// when the decode worker acks via `WorkerMsg::ReleaseKv`.
+    /// when the decode worker acks via `PdPrefillMsg::ReleaseKv`.
     held: HashMap<RequestId, u64>,
     /// Running sum of `held` values — kept incrementally so `try_admit`
     /// stays O(1). Always equals `held.values().sum()`.
@@ -73,11 +73,8 @@ pub struct PdPrefillWorker<M: IterwiseUnifiedModel> {
     config: WorkerConfig,
     runtime: PrefillRuntime,
     batches: Vec<Batch>, // length 1 (prefill is single-group in v1)
-    cost_logger: Option<CostLogger>,
-    cost_slots: Vec<LeafMetrics>,
-    cost_scratch: Vec<LeafMetrics>,
-    cost_groups: Vec<GroupInputLog>,
-    cost_slot_inputs: Vec<SlotInput>,
+    /// Eval scratch buffers + cost-log writer.
+    cost: CostBuffers,
     /// This worker's send-side comm group id, registered with the shared cluster
     /// at construction (covers the `model.num_attn_shards()` GPUs that hold KV).
     /// Stamped into every emitted `PrefillDone`; the cluster knows the underlying
@@ -114,16 +111,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         let group_kv_bytes =
             config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
         let kv_capacity = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
-        let cost_logger = match cost_log_dir {
-            Some(dir) => match CostLogger::open(&dir, pool_tag, id, &model.cost_log_manifest()) {
-                Ok(logger) => Some(logger),
-                Err(e) => {
-                    tracing::warn!("cost_log disabled: failed to open writer: {e}");
-                    None
-                }
-            },
-            None => None,
-        };
+        let cost = CostBuffers::new(cost_log_dir, pool_tag, id, model.as_ref());
         // Arch invariant: `num_attn_shards() ≤ gpus_per_replica == gpus_per_worker`,
         // so no clamp against the worker's GPU range is needed — the model is
         // authoritative for shard count.
@@ -134,18 +122,14 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             config,
             runtime: PrefillRuntime::new(),
             batches: vec![Batch::new(0, kv_capacity)],
-            cost_logger,
-            cost_slots: Vec::new(),
-            cost_scratch: Vec::new(),
-            cost_groups: Vec::new(),
-            cost_slot_inputs: Vec::new(),
+            cost,
             send_gid,
         }
     }
 
     // ── tick: state-forwarding loop (identical to barebone) ────────────────────
 
-    fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    fn tick_inner(&mut self, now: Time, events: &mut Vec<PdPrefillEvent>) -> Option<Time> {
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
@@ -241,62 +225,20 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
 
     fn start_iter(&mut self, now: Time) -> Time {
         let arch_input = self.build_arch_input();
-        let logging_cost = self.cost_logger.is_some();
-        let agg = if logging_cost {
-            self.model.eval_iter_with_inputs(
-                &arch_input,
-                &mut self.cost_slots,
-                &mut self.cost_scratch,
-                &mut self.cost_slot_inputs,
-            )
-        } else {
-            self.model
-                .eval_iter(&arch_input, &mut self.cost_slots, &mut self.cost_scratch)
-        };
-        let cost_time = Time::from_ms(agg.m.time_ms as f64);
-        if self.cost_logger.is_some() {
-            // Refill the reused `cost_groups` buffer in place; the per-slot
-            // breakdowns are appended into the logger's flat chunk buffers by
-            // `record`, so the entry owns no `Vec`.
-            self.cost_groups.clear();
-            for g in &arch_input.groups {
-                self.cost_groups.push(GroupInputLog {
-                    batch_tokens: g.batch_tokens,
-                    prefill_tokens: g.prefill_tokens,
-                    decode_request_count: g.decode_tokens,
-                    decode_kv_total: g.total_kv_len,
-                    prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
-                });
-            }
-            let entry = CostLogEntry {
-                worker_id: self.id.0,
-                iter_id: self.runtime.iter_counter as u64,
-                batch_id: 0,
-                wall_start_ms: now.as_ms(),
-                total_time_ms: agg.m.time_ms as f64,
-                energy_j: agg.m.energy_j as f64,
-                group_len: 0,
-                slot_len: 0,
-                slot_input_len: 0,
-            };
-            if let Some(logger) = self.cost_logger.as_mut() {
-                if let Err(e) = logger.record(
-                    entry,
-                    &self.cost_slots,
-                    &mut self.cost_groups,
-                    &mut self.cost_slot_inputs,
-                ) {
-                    tracing::warn!("cost_log record failed: {e}");
-                }
-            }
-        }
+        let cost_time = self.cost.run_iter(
+            self.model.as_ref(),
+            &arch_input,
+            self.id,
+            self.runtime.iter_counter as u64,
+            now,
+        );
         self.runtime.iter_compute_start = now;
         now + cost_time
     }
 
     // ── Stage 3: complete_iter — emit first token, then hand off to decode ──────
 
-    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
+    fn complete_iter(&mut self, now: Time, events: &mut Vec<PdPrefillEvent>) {
         let log_tokens = self.config.log_output_token_times;
         // Sender side is fully determined by this worker's pre-registered comm
         // group; emit stamps the gid and the cluster resolves link count /
@@ -325,17 +267,17 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             // r is unused below — NLL releases the borrow on `store`.
             self.runtime.request_to_group.remove(&rid);
             if complete {
-                events.push(WorkerEvent::RequestComplete {
+                events.push(PdPrefillEvent::RequestComplete {
                     worker: worker_id,
                     req: rid,
                 });
             } else {
                 // KV stays resident on this worker until the decode side acks
-                // the pull via `WorkerMsg::ReleaseKv`. Tracking it in `held`
+                // the pull via `PdPrefillMsg::ReleaseKv`. Tracking it in `held`
                 // keeps it gating future admissions.
                 self.runtime.held.insert(rid, kv_tokens);
                 self.runtime.held_kv_tokens += kv_tokens;
-                events.push(WorkerEvent::PrefillDone {
+                events.push(PdPrefillEvent::PrefillDone {
                     worker: worker_id,
                     req: rid,
                     send_gid,
@@ -348,7 +290,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
     }
 
     /// Release this request's held KV reservation. Called from `enqueue` on
-    /// receipt of `WorkerMsg::ReleaseKv` (decode side finished its pull). A
+    /// receipt of `PdPrefillMsg::ReleaseKv` (decode side finished its pull). A
     /// missing entry is silently ignored — possible if the request was
     /// already cancelled via `release_request` before the ack arrived.
     fn drop_held(&mut self, rid: RequestId) {
@@ -440,20 +382,22 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
 }
 
 impl<M: IterwiseUnifiedModel> IterWorker for PdPrefillWorker<M> {
+    type Msg = PdPrefillMsg;
+    type Event = PdPrefillEvent;
+
     fn id(&self) -> WorkerId {
         self.id
     }
 
-    fn enqueue(&mut self, msg: WorkerMsg) {
+    fn enqueue(&mut self, msg: Self::Msg) {
         match msg {
-            WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
-            WorkerMsg::Handoff { .. } => unreachable!("prefill worker receives no PD handoff"),
+            PdPrefillMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
             // Decode side has finished pulling — drop the held reservation.
-            WorkerMsg::ReleaseKv { req } => self.drop_held(req),
+            PdPrefillMsg::ReleaseKv { req } => self.drop_held(req),
         }
     }
 
-    fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time> {
         self.tick_inner(now, events)
     }
 
@@ -493,7 +437,7 @@ mod tests {
         // A multi-token request: prefill emits the first token then hands off.
         let store = shared_with(&[(0, 16, 3)]);
         let mut w = worker(Rc::clone(&store));
-        w.enqueue(WorkerMsg::Request(RequestId(0)));
+        w.enqueue(PdPrefillMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..20u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
@@ -503,7 +447,7 @@ mod tests {
         // group at construction → send_gid=0.
         assert_eq!(
             events,
-            vec![WorkerEvent::PrefillDone {
+            vec![PdPrefillEvent::PrefillDone {
                 worker: WorkerId(0),
                 req: RequestId(0),
                 send_gid: 0,
@@ -522,14 +466,14 @@ mod tests {
         // decode_len == 1: the prefill's first token is the whole output.
         let store = shared_with(&[(0, 16, 1)]);
         let mut w = worker(Rc::clone(&store));
-        w.enqueue(WorkerMsg::Request(RequestId(0)));
+        w.enqueue(PdPrefillMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..20u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(
             events,
-            vec![WorkerEvent::RequestComplete {
+            vec![PdPrefillEvent::RequestComplete {
                 worker: WorkerId(0),
                 req: RequestId(0)
             }]

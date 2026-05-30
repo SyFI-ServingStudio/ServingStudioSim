@@ -5,7 +5,7 @@
 //! Reconciliations vs the design example (see plan):
 //!   - event-driven surface (`enqueue`/`tick`/`status`) so the L6 `simple_dp`
 //!     pool can drive it; `complete_iter` pushes a self-tagged
-//!     `WorkerEvent::RequestComplete` into the caller's event sink.
+//!     `WorkerEventCommon::RequestComplete` into the caller's event sink.
 //!   - the request slab is the shared `RequestStore`, injected at construction as
 //!     `SharedRequests` and borrowed transiently inside each method (no per-tick
 //!     `&mut RequestStore` parameter). Request/session logging stays in L7; the
@@ -17,12 +17,12 @@ use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
-use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
-use crate::timing::LeafMetrics;
 use crate::worker::admission_helpers::Batch;
+use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
+    BatchFsmState, IterCursor, WorkerConfig, WorkerEventCommon, WorkerFsmState, WorkerMsgCommon,
+    WorkerStatus,
 };
 
 // ── Runtime ────────────────────────────────────────────────────────────────────
@@ -63,14 +63,9 @@ pub struct BareboneWorker<M: IterwiseUnifiedModel> {
     config: WorkerConfig,
     runtime: WorkerRuntime,
     batches: Vec<Batch>, // length 1 in barebone
-    /// Per-iteration `cost_log` writer (`Some` iff a log_dir was supplied).
-    /// `cost_slots` is the reused per-slot eval buffer; `cost_slot_inputs` is the
-    /// reused per-slot typed-input buffer, filled whenever `cost_log` is active.
-    cost_logger: Option<CostLogger>,
-    cost_slots: Vec<LeafMetrics>,
-    cost_scratch: Vec<LeafMetrics>,
-    cost_groups: Vec<GroupInputLog>,
-    cost_slot_inputs: Vec<crate::timing::SlotInput>,
+    /// Eval scratch buffers + cost-log writer. Hides what would otherwise be
+    /// five separate fields and a ~50-line block at end of `start_iter`.
+    cost: CostBuffers,
 }
 
 impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
@@ -100,19 +95,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         let group_kv_bytes =
             config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
         let kv_capacity = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
-        // Open the cost_log writer (+ manifest sidecar) whenever a log dir is
-        // available. A failure to open disables logging with a warning rather
-        // than aborting the sim.
-        let cost_logger = match cost_log_dir {
-            Some(dir) => match CostLogger::open(&dir, pool_tag, id, &model.cost_log_manifest()) {
-                Ok(logger) => Some(logger),
-                Err(e) => {
-                    tracing::warn!("cost_log disabled: failed to open writer: {e}");
-                    None
-                }
-            },
-            None => None,
-        };
+        let cost = CostBuffers::new(cost_log_dir, pool_tag, id, model.as_ref());
         Self {
             id,
             model,
@@ -120,24 +103,15 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
             config,
             runtime: WorkerRuntime::new(),
             batches: vec![Batch::new(0, kv_capacity)],
-            cost_logger,
-            cost_slots: Vec::new(),
-            cost_scratch: Vec::new(),
-            cost_groups: Vec::new(),
-            cost_slot_inputs: Vec::new(),
+            cost,
         }
     }
 
     // ── L6-facing surface ────────────────────────────────────────────────────
 
-    pub fn enqueue(&mut self, msg: WorkerMsg) {
-        match msg {
-            WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
-            WorkerMsg::Handoff { .. } => unreachable!("barebone worker receives no PD handoff"),
-            WorkerMsg::ReleaseKv { .. } => {
-                unreachable!("barebone worker is not a PD prefill; no held KV to release")
-            }
-        }
+    pub fn enqueue(&mut self, msg: WorkerMsgCommon) {
+        let WorkerMsgCommon::Request(rid) = msg;
+        self.runtime.pending_prefills.push_back(rid);
     }
 
     pub fn status(&self) -> WorkerStatus {
@@ -153,7 +127,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     // ── tick: state-forwarding loop (§3.2.1) ──────────────────────────────────
 
-    pub fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    pub fn tick(&mut self, now: Time, events: &mut Vec<WorkerEventCommon>) -> Option<Time> {
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
@@ -250,74 +224,20 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     fn start_iter(&mut self, now: Time) -> Time {
         let arch_input = self.build_arch_input();
-        // One CostTree eval pass fills the per-slot buffer + returns the aggregate;
-        // `.m.time_ms` is the clock. Filling `cost_slots` is free (the eval pass
-        // materializes it either way), so we always pass it and only build the
-        // `cost_log` row from it when a logger is present.
-        // Capture per-leaf inputs whenever cost logging is active: `slot_input`
-        // is part of the cost_log row contract. Without a logger, the plain
-        // `eval_iter` path runs and the input closures are not invoked.
-        let logging_cost = self.cost_logger.is_some();
-        let agg = if logging_cost {
-            self.model.eval_iter_with_inputs(
-                &arch_input,
-                &mut self.cost_slots,
-                &mut self.cost_scratch,
-                &mut self.cost_slot_inputs,
-            )
-        } else {
-            self.model
-                .eval_iter(&arch_input, &mut self.cost_slots, &mut self.cost_scratch)
-        };
-        let cost_time = Time::from_ms(agg.m.time_ms as f64);
-        if self.cost_logger.is_some() {
-            // Per-iteration input_section: log each group's context (prefill kept
-            // full as `(prefix, append)` pairs; decode aggregated to count + total
-            // KV — the per-decode KV list is dropped). Refilled into the reused
-            // `cost_groups` buffer in place; the per-slot time/coverage/input
-            // breakdowns are appended into the logger's flat chunk buffers by
-            // `record`, so the entry owns no `Vec`.
-            self.cost_groups.clear();
-            for g in &arch_input.groups {
-                self.cost_groups.push(GroupInputLog {
-                    batch_tokens: g.batch_tokens,
-                    prefill_tokens: g.prefill_tokens,
-                    decode_request_count: g.decode_tokens,
-                    decode_kv_total: g.total_kv_len,
-                    prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
-                });
-            }
-            let entry = CostLogEntry {
-                worker_id: self.id.0,
-                iter_id: self.runtime.iter_counter as u64,
-                // One batch per iteration in the barebone worker; AFD/TBO will
-                // emit several batches sharing this iter_id with distinct batch_id.
-                batch_id: 0,
-                wall_start_ms: now.as_ms(),
-                total_time_ms: agg.m.time_ms as f64,
-                energy_j: agg.m.energy_j as f64,
-                group_len: 0,
-                slot_len: 0,
-                slot_input_len: 0,
-            };
-            if let Some(logger) = self.cost_logger.as_mut() {
-                if let Err(e) = logger.record(
-                    entry,
-                    &self.cost_slots,
-                    &mut self.cost_groups,
-                    &mut self.cost_slot_inputs,
-                ) {
-                    tracing::warn!("cost_log record failed: {e}");
-                }
-            }
-        }
+        let cost_time = self.cost.run_iter(
+            self.model.as_ref(),
+            &arch_input,
+            self.id,
+            self.runtime.iter_counter as u64,
+            now,
+        );
         self.runtime.iter_compute_start = now;
         now + cost_time
     }
 
     // ── Stage 3: complete_iter (token bookkeeping + KV transitions) ────────────
 
-    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
+    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEventCommon>) {
         let mut completed: Vec<RequestId> = Vec::new();
 
         // (a) live decodes produced one token. Iterate the decode set directly
@@ -373,7 +293,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                 .unwrap_or(0);
             self.batches[0].release(rid, current_kv);
             self.runtime.request_to_group.remove(&rid);
-            events.push(WorkerEvent::RequestComplete {
+            events.push(WorkerEventCommon::RequestComplete {
                 worker: self.id,
                 req: rid,
             });
@@ -488,7 +408,7 @@ mod tests {
     fn run_to_quiescence<M: IterwiseUnifiedModel>(
         w: &mut BareboneWorker<M>,
         max_steps: u64,
-    ) -> Vec<WorkerEvent> {
+    ) -> Vec<WorkerEventCommon> {
         let mut all = Vec::new();
         for step in 0..max_steps {
             w.tick(Time::from_ms(step as f64), &mut all);
@@ -511,12 +431,12 @@ mod tests {
             "test-gpu",
             test_cluster(),
         );
-        w.enqueue(WorkerMsg::Request(RequestId(0)));
+        w.enqueue(WorkerMsgCommon::Request(RequestId(0)));
 
         let events = run_to_quiescence(&mut w, 50);
         assert_eq!(
             events,
-            vec![WorkerEvent::RequestComplete {
+            vec![WorkerEventCommon::RequestComplete {
                 worker: WorkerId(0),
                 req: RequestId(0)
             }]
@@ -544,7 +464,7 @@ mod tests {
             test_cluster(),
         );
         for id in [0, 1, 2] {
-            w.enqueue(WorkerMsg::Request(RequestId(id)));
+            w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
         }
         let events = run_to_quiescence(&mut w, 200);
         assert_eq!(events.len(), 3);
