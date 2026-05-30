@@ -12,6 +12,8 @@
 pub mod attn_block_tp;
 pub mod attn_local;
 pub mod mlp_block_tp;
+pub mod moe_expert_compute_local;
+pub mod moe_router_local;
 pub mod post_attn_local;
 pub mod pre_attn_local;
 
@@ -24,6 +26,14 @@ pub use attn_local::{
 };
 pub use mlp_block_tp::{
     MlpBlockTpWorklet, MlpBlockTpWorkletConfig, MlpBlockTpWorkletInput, MlpBlockTpWorkletResolved,
+};
+pub use moe_expert_compute_local::{
+    MoeExpertComputeLocalWorklet, MoeExpertComputeLocalWorkletConfig,
+    MoeExpertComputeLocalWorkletInput, MoeExpertComputeLocalWorkletResolved, uniform_local_ppm,
+};
+pub use moe_router_local::{
+    MoeRouterLocalWorklet, MoeRouterLocalWorkletConfig, MoeRouterLocalWorkletInput,
+    MoeRouterLocalWorkletResolved,
 };
 pub use post_attn_local::{
     PostAttnLocalWorklet, PostAttnLocalWorkletConfig, PostAttnLocalWorkletInput,

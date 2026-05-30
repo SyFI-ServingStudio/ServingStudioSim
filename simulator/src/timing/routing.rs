@@ -86,6 +86,13 @@ impl RoutingDistribution {
     /// summed across all shards the counts match `global_expert_selections` only within
     /// a ±0.5-per-shard drift — acceptable and intended for sharded EP.
     ///
+    /// v1 low-end floor: a non-empty shard that receives any global mass returns
+    /// at least 1 (placed on its top-residual expert) even when its proportional
+    /// share rounds to 0. This keeps `per_group_batches` non-empty for the
+    /// grouped-GEMM cache; it widens the cross-shard drift at small `global` (Σ
+    /// shards > global), tolerated because the MoE cost path maxes — not sums —
+    /// across EP ranks. `global == 0` still yields all-zero.
+    ///
     /// Associated (not `&self`) so the caller passes whatever ppm slice it
     /// wants: `RoutingDistribution::to_per_expert_counts(total, &dist.ppm()[lo..hi])`.
     pub fn to_per_expert_counts(global_expert_selections: u32, ppm: &[u32]) -> Vec<u32> {
@@ -109,7 +116,23 @@ impl RoutingDistribution {
         // a shard (Σppm < TOTAL_PPM) this is the shard's proportional count, not
         // the global total; for a full distribution it equals global_expert_selections.
         let total_ppm = u128::from(Self::TOTAL_PPM);
-        let target = ((numerator_sum + total_ppm / 2) / total_ppm) as u64;
+        let mut target = ((numerator_sum + total_ppm / 2) / total_ppm) as u64;
+        // v1 floor: a shard whose proportional share rounds below 0.5 (small
+        // `global_expert_selections` split across many EP ranks) would otherwise
+        // get 0 on every local expert, yielding an all-zero `per_group_batches`
+        // the grouped-GEMM profiler/cache cannot represent (DeepGEMM has no
+        // zero-batch row). Any shard that receives *some* global mass loads at
+        // least its top-residual expert once — and only that one (the deficit is
+        // 1, so ep=32's four local experts do NOT all jump to 1). This
+        // over-counts the global total when summed across ranks (Σ shards >
+        // global), but the MoE cost path takes Max across EP ranks rather than
+        // Sum, so the broken conservation never reaches the model output. The
+        // exact fix (re-axis the grouped-GEMM cache to per-rank token counts and
+        // quantile each rank's load at L4) is deferred — see
+        // agent-trace/moe_arch_qwen3_dp_attn_ep_ffn.md.
+        if numerator_sum > 0 {
+            target = target.max(1);
+        }
         let deficit = target.saturating_sub(assigned);
         residuals.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(&rhs.0)));
         for (idx, _) in residuals.into_iter().take(deficit as usize) {
@@ -305,6 +328,40 @@ mod tests {
         let shard = &dist.ppm()[1..3]; // 300k + 200k = 500k
         let counts = RoutingDistribution::to_per_expert_counts(7, shard);
         assert_eq!(counts.iter().sum::<u32>(), 4);
+    }
+
+    #[test]
+    fn to_per_expert_counts_floors_tiny_shard_to_one() {
+        // ep=32 of 128 experts → 4 local experts, uniform ppm ≈ 7812 each
+        // (Σ ≈ 31248 ≈ TOTAL_PPM/32). At low `global` the proportional share
+        // rounds below 0.5, but a shard that got *some* mass must still load one
+        // expert (an all-zero per_group_batches has no grouped-GEMM cache row).
+        let local = vec![7_812u32; 4];
+        // global=1 → share 0.031 → floored onto the top-residual expert only.
+        assert_eq!(
+            RoutingDistribution::to_per_expert_counts(1, &local),
+            vec![1, 0, 0, 0]
+        );
+        // Floor stays at ONE active expert across the low range (NOT [1,1,1,1]):
+        // global=16 → share ≈ 0.5, global=48 → share ≈ 1.5, both deficit 1.
+        assert_eq!(
+            RoutingDistribution::to_per_expert_counts(16, &local),
+            vec![1, 0, 0, 0]
+        );
+        assert_eq!(
+            RoutingDistribution::to_per_expert_counts(48, &local),
+            vec![1, 0, 0, 0]
+        );
+        // Two experts only once the rounded share reaches 2 (global=64 → 2.0).
+        assert_eq!(
+            RoutingDistribution::to_per_expert_counts(64, &local),
+            vec![1, 1, 0, 0]
+        );
+        // No work → no floor.
+        assert_eq!(
+            RoutingDistribution::to_per_expert_counts(0, &local),
+            vec![0, 0, 0, 0]
+        );
     }
 
     #[test]

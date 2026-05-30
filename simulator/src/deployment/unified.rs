@@ -4,10 +4,11 @@
 //! `build` reads the structured `UnifiedConfig`: a single pool (`main`) with one
 //! homogeneous group. The arch is selected by its explicit tag (NO `tp_size`
 //! dispatch — provider-first, new-interface-design §4). Wired arms are
-//! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`, and
-//! `llama3_dp_attn_tp_ffn` + `hp_unified`; `deepseek_moe` parses but build
-//! bails. Each arm monomorphizes its concrete model/worker pair and erases to
-//! `Box<dyn Flow>` — the single `dyn` point (the cost path is `dyn`-free, L4 §4.1).
+//! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
+//! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
+//! `hp_unified`. Each arm monomorphizes its concrete model/worker pair and
+//! erases to `Box<dyn Flow>` — the single `dyn` point (the cost path is
+//! `dyn`-free, L4 §4.1).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,10 +17,12 @@ use anyhow::{bail, ensure, Context};
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::arch::model_cfg::ModelCfg;
+use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, DenseParallel, DenseTpParallel,
-    DpAttnTpFfnParallel, IterArchSel,
+    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen3_moe_dp_attn_ep_ffn, DenseParallel,
+    DenseTpParallel, DpAttnTpFfnParallel, IterArchSel, Qwen3MoeParallel,
 };
+use crate::timing::routing::RoutingDistribution;
 use crate::common::{PoolId, SharedRequests};
 use crate::deployment::UnifiedConfig;
 use crate::orchestrator::common::WorkerBuildFn;
@@ -53,12 +56,10 @@ impl Deployment for UnifiedDeployment {
         let g = &pool.groups[0];
 
         // Model dims load from JSON (arch-independent, §4); `sim_num_layers` /
-        // `num_layers` truncation must apply BEFORE build_configs.
+        // `num_layers` truncation must apply BEFORE build_configs. Loaded per-arm
+        // because dense and MoE archs deserialize different field sets — dense
+        // archs read `ModelCfg`, the MoE arch reads `MoeModelCfg`.
         let model_spec = g.arch.model();
-        let mut model_cfg = ModelCfg::from_json(Path::new(&model_spec.model_config))?;
-        if let Some(n) = model_spec.sim_num_layers.or(model_spec.num_layers) {
-            model_cfg.num_layers = n;
-        }
 
         // L5 worker env: `attn_kv_bytes` sizes the worker's KvPool, and
         // `log_output_token_times` controls request_slo detail logging. The
@@ -97,6 +98,7 @@ impl Deployment for UnifiedDeployment {
         match &g.arch {
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
+                let model_cfg = load_dense_model_cfg(model_spec)?;
                 let parallel = DenseParallel {
                     gpu_name: gpu_name.clone(),
                 };
@@ -119,6 +121,7 @@ impl Deployment for UnifiedDeployment {
             }
             IterArchSel::Llama3DenseTp { tp_size, .. } => {
                 ensure_barebone(&g.worker)?;
+                let model_cfg = load_dense_model_cfg(model_spec)?;
                 let parallel = DenseTpParallel {
                     tp_size: *tp_size,
                     gpu_name: gpu_name.clone(),
@@ -147,6 +150,7 @@ impl Deployment for UnifiedDeployment {
                 ..
             } => {
                 ensure_hp_unified(&g.worker)?;
+                let model_cfg = load_dense_model_cfg(model_spec)?;
                 let parallel = DpAttnTpFfnParallel {
                     attn_tp_size: *attn_tp_size,
                     ffn_tp_size: *ffn_tp_size,
@@ -170,9 +174,85 @@ impl Deployment for UnifiedDeployment {
                     HpUnifiedWorker::new,
                 ))
             }
-            IterArchSel::DeepseekMoe { .. } => bail!("unified: deepseek_moe arch not wired yet"),
+            IterArchSel::Qwen3MoeDpAttnEpFfn {
+                attn_tp_size,
+                ep_size,
+                hp_size,
+                nvl_num_gpu,
+                routing_profile,
+                ..
+            } => {
+                ensure_hp_unified(&g.worker)?;
+                let model_cfg = load_moe_model_cfg(model_spec)?;
+                let routing = resolve_routing(routing_profile.as_slice(), model_cfg.num_experts)?;
+                let parallel = Qwen3MoeParallel {
+                    attn_tp_size: *attn_tp_size,
+                    ep_size: *ep_size,
+                    hp_size: *hp_size,
+                    nvl_num_gpu: *nvl_num_gpu,
+                    gpu_name: gpu_name.clone(),
+                };
+                let resolved = qwen3_moe_dp_attn_ep_ffn::resolve_configs(
+                    &qwen3_moe_dp_attn_ep_ffn::build_configs(&model_cfg, &parallel, &routing),
+                );
+                let model = Arc::new(
+                    qwen3_moe_dp_attn_ep_ffn::build("unified".to_string(), resolved, bridge)
+                        .context(
+                            "building Qwen3-MoE DP-attn EP-ffn model \
+                             (often a missing profile.db row)",
+                        )?,
+                );
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    HpUnifiedWorker::new,
+                ))
+            }
         }
     }
+}
+
+/// Load the dense `ModelCfg` from JSON and apply the `sim_num_layers` /
+/// `num_layers` override that truncates the layer count BEFORE build_configs.
+fn load_dense_model_cfg(model_spec: &crate::arch::ModelSpec) -> anyhow::Result<ModelCfg> {
+    let mut model_cfg = ModelCfg::from_json(Path::new(&model_spec.model_config))?;
+    if let Some(n) = model_spec.sim_num_layers.or(model_spec.num_layers) {
+        model_cfg.num_layers = n;
+    }
+    Ok(model_cfg)
+}
+
+/// Load the MoE `MoeModelCfg` from JSON and apply the layer-count override.
+/// Separate loader because MoE configs include `num_experts` /
+/// `num_experts_per_tok` / `moe_intermediate_size` that the dense parser does
+/// not deserialize.
+fn load_moe_model_cfg(model_spec: &crate::arch::ModelSpec) -> anyhow::Result<MoeModelCfg> {
+    let mut model_cfg = MoeModelCfg::from_json(Path::new(&model_spec.model_config))?;
+    if let Some(n) = model_spec.sim_num_layers.or(model_spec.num_layers) {
+        model_cfg.num_layers = n;
+    }
+    Ok(model_cfg)
+}
+
+/// Resolve the MoE routing distribution from the optional selector profile.
+/// Empty slice → uniform over `num_experts` (the YAML default); non-empty
+/// → must have length `num_experts` (the L2 MoE op needs one ppm slot per
+/// expert).
+fn resolve_routing(profile: &[f32], num_experts: u32) -> anyhow::Result<RoutingDistribution> {
+    if profile.is_empty() {
+        return Ok(RoutingDistribution::uniform(num_experts));
+    }
+    ensure!(
+        profile.len() == num_experts as usize,
+        "routing_profile has {} weights but model has {} experts",
+        profile.len(),
+        num_experts,
+    );
+    Ok(RoutingDistribution::from_profile(profile))
 }
 
 /// The dense / dense_tp archs run on the single-group barebone worker.

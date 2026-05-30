@@ -25,8 +25,11 @@
 //! `#[serde(flatten)]` fields are skipped automatically (the flattened struct
 //! contributes its own `PARAMS` block). A `bool` with no explicit default gets an
 //! implicit `false` (absent flag = off); an `Option<T>` with no default is marked
-//! `.optional()`. A `Vec<T>` is a list param that is still required unless given a
-//! default — it is NOT auto-optional.
+//! `.optional()`. A `Vec<T>` is a list param that is required UNLESS the field
+//! also carries `#[serde(default)]` — in that case (and for any other type
+//! tagged `#[serde(default)]`) the param is marked `.optional()`, matching
+//! serde's "absent = Default::default()" semantics (e.g. `Vec<f32>` defaults to
+//! the empty list).
 
 use proc_macro::TokenStream;
 use quote::{quote, ToTokens};
@@ -163,7 +166,7 @@ fn param_defs<'a>(
 
         // `#[param(string)]` overrides type inference (the Rust field is a
         // foreign enum but the schema treats it as a `string` with `choices`).
-        let cls = if attr.force_string {
+        let mut cls = if attr.force_string {
             Classified {
                 ctor: "string",
                 default_method: "default_string",
@@ -179,6 +182,14 @@ fn param_defs<'a>(
                 }
             }
         };
+        // `#[serde(default)]` declares "absent = Default::default()" at the
+        // deserializer level; surface that as an optional schema param so the
+        // launcher validator doesn't insist the user spell it out. Lets a
+        // `Vec<T>` with a sensible empty default (e.g. routing_profile) stay
+        // omittable in YAML.
+        if is_serde_default(&f.attrs) {
+            cls.optional = true;
+        }
 
         let ctor = syn::Ident::new(cls.ctor, f.span());
         let mut chain = quote! { ::simulator::schema::ParamDef::#ctor(#name_str) };
@@ -374,12 +385,24 @@ fn parse_param_attr(attrs: &[Attribute]) -> syn::Result<ParamAttr> {
 }
 
 fn is_serde_flatten(attrs: &[Attribute]) -> bool {
+    serde_has_marker(attrs, "flatten")
+}
+
+/// `true` iff the field carries `#[serde(default)]` (bare path, no `=`). We
+/// don't try to interpret `#[serde(default = "fn")]` here — that already means
+/// "deserializer fills it", which is the same optional intent at the schema
+/// layer.
+fn is_serde_default(attrs: &[Attribute]) -> bool {
+    serde_has_marker(attrs, "default")
+}
+
+fn serde_has_marker(attrs: &[Attribute], marker: &str) -> bool {
     for a in attrs {
         if !a.path().is_ident("serde") {
             continue;
         }
         if let Ok(nested) = a.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated) {
-            if nested.iter().any(|m| m.path().is_ident("flatten")) {
+            if nested.iter().any(|m| m.path().is_ident(marker)) {
                 return true;
             }
         }

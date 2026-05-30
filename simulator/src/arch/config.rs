@@ -7,10 +7,10 @@
 //! consumes them), so every arch variant flattens [`ModelSpec`]. arch and worker
 //! are symmetric sibling providers (not nested).
 //!
-//! Iter-wise `llama3_dense`, `llama3_dense_tp`, and
-//! `llama3_dp_attn_tp_ffn` build today. `deepseek_moe` still parses and is
-//! advertised for schema visibility, but `build()` rejects it until the MoE
-//! vertical lands.
+//! Iter-wise `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, and
+//! `qwen3_moe_dp_attn_ep_ffn` build today. The MoE variant pairs with the same
+//! `hp_unified` worker as the DP-attn dense variant (one `Batch` per
+//! attn-DP shard); its FFN is the L2 MoE dispatch/combine compound.
 //!
 //! NOTE (serde): `#[serde(deny_unknown_fields)]` is silently ignored on
 //! internally-tagged enum variants, so a typo inside an arch payload is NOT
@@ -78,15 +78,34 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         ffn_tp_size: u16,
     },
-    DeepseekMoe {
+    Qwen3MoeDpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
-        /// Tensor parallelism size.
-        #[param(default = 1, cache_key)]
-        tp_size: u16,
-        /// Expert parallelism size.
+        /// Attention tensor-parallelism size (heads sharded across these ranks).
+        /// `num_dp_groups = ep_size / attn_tp_size`.
+        #[param(default = 4, cache_key)]
+        attn_tp_size: u16,
+        /// Expert-parallelism size (FFN expert ranks; spans the whole replica).
         #[param(default = 8, cache_key)]
         ep_size: u16,
+        /// `ReplicatedHeadParallel` residing-group size on the FFN side
+        /// (drives whether the L2 MoE combine bcast/fanout legs are non-zero).
+        #[param(default = 1, cache_key)]
+        hp_size: u16,
+        /// NVLink-domain size — partitions `ep_size` ranks into NVL domains
+        /// for the intra/inter split of MoE dispatch/combine.
+        #[param(default = 8, cache_key)]
+        nvl_num_gpu: u16,
+        /// Per-expert routing weight profile (length must equal
+        /// `model.num_experts`). Empty / omitted → uniform routing across all
+        /// experts (the v1 default). When non-empty, weights are passed to
+        /// `RoutingDistribution::from_profile` (non-negative `f32`, normalized
+        /// to `TOTAL_PPM`); the resulting distribution drives the L2 MoE
+        /// dispatch/combine `BottleneckCurve` simulation. v1 note: the L3
+        /// grouped-GEMM `local_ppm` stays uniform regardless — per-rank
+        /// `local_ppm` skew is a future follow-up.
+        #[serde(default)]
+        routing_profile: Vec<f32>,
     },
 }
 
@@ -97,7 +116,7 @@ impl IterArchSel {
             Self::Llama3Dense { model }
             | Self::Llama3DenseTp { model, .. }
             | Self::Llama3DpAttnTpFfn { model, .. }
-            | Self::DeepseekMoe { model, .. } => model,
+            | Self::Qwen3MoeDpAttnEpFfn { model, .. } => model,
         }
     }
 }

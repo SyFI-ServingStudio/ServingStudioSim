@@ -1,0 +1,33 @@
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/smoke.csv
+  run_to_end: true
+
+io:
+  log_dir: logs/unified_qwen3_235b_ep8
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: qwen3_moe_dp_attn_ep_ffn
+          model_config: model/config/qwen3_235b.json
+          # Single-node 8-GPU EP. attn_tp_size=4 saturates num_kv_heads=4 (the
+          # hard upper bound from the GQA head split) → num_dp_groups=2:
+          # HpUnifiedWorker keeps 2 Batches, one per attn-DP shard.
+          # hp_size=1 → ReplicatedHeadParallel collapses to RoundRobin, so the
+          # MoE combine bcast/fanout legs are zero. Closest match to ref's
+          # standard_moe qwen3_235b baseline (no head-parallel replication).
+          # experts_per_gpu = 128 / 8 = 16.
+          attn_tp_size: 4
+          ep_size: 8
+          hp_size: 1
+          nvl_num_gpu: 8
+          fp8: false
+        worker:
+          type: hp_unified
+          attn_gpu_memory_gb: 80.0

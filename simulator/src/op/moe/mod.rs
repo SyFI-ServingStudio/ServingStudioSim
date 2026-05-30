@@ -271,7 +271,30 @@ impl BottleneckCurve {
         ev: &mut crate::timing::Evaluator,
     ) {
         use crate::timing::kernels::{P2pInterKernelInput, P2pIntraKernelInput};
+        use crate::timing::LeafMetrics;
         let message_size_bytes = self.bottleneck(tokens);
+        // A zero-byte stage is one that does not occur under this config — e.g.
+        // the inter (NIC) legs when `nvl_num_gpu >= ep_size` (single NVL domain,
+        // no cross-domain hop), or `combine_inter_bcast` / `combine_intra_fanout`
+        // under a single-home placement. The per-token sim assigned it zero
+        // send/recv bytes: NO collective is launched, so the cost is zero. Push a
+        // zero leaf (keeping the slot/taxonomy stable) WITHOUT a p2p lookup — the
+        // p2p curve returns a nonzero launch-overhead floor at size 0, which would
+        // otherwise bill a phantom ~30µs (inter) / ~109µs (intra) per absent stage
+        // across every layer.
+        if message_size_bytes == 0 {
+            match self.tier {
+                P2pTier::IntraDomain => {
+                    let input = P2pIntraKernelInput { message_size_bytes };
+                    ev.push(LeafMetrics::ZERO, || input.clone().into());
+                }
+                P2pTier::InterDomain => {
+                    let input = P2pInterKernelInput { message_size_bytes };
+                    ev.push(LeafMetrics::ZERO, || input.clone().into());
+                }
+            }
+            return;
+        }
         match self.tier {
             P2pTier::IntraDomain => {
                 let input = P2pIntraKernelInput { message_size_bytes };
@@ -351,5 +374,22 @@ mod tests {
         let cfg = sample_cfg();
         assert_eq!(cfg.p2p_intra_config().fabric, Fabric::Nvlink);
         assert_eq!(cfg.p2p_inter_config().fabric, Fabric::Infiniband);
+    }
+
+    /// An absent stage's curve is identically zero, so `bottleneck` returns 0 and
+    /// `push_to` takes its zero-leaf short-circuit (asserted here at the curve
+    /// level; the short-circuit itself needs no p2p lookup, so it cannot pick up
+    /// the kernel's nonzero size-0 launch-overhead floor — the phantom ~30µs/
+    /// ~109µs that absent inter/bcast/fanout stages used to bill every layer).
+    #[test]
+    fn absent_stage_curve_is_zero_so_push_short_circuits() {
+        let curve = BottleneckCurve {
+            tier: P2pTier::InterDomain,
+            points: vec![(128, 0.0), (32_768, 0.0)],
+        };
+        // Zero at every probed T (on-grid, off-grid, and extrapolated).
+        for t in [0u64, 1, 8_192, 50_000] {
+            assert_eq!(curve.bottleneck(t), 0, "absent-stage curve must be 0 at T={t}");
+        }
     }
 }

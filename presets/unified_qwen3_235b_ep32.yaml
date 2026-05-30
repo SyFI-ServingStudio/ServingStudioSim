@@ -1,0 +1,31 @@
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/smoke.csv
+  run_to_end: true
+
+io:
+  log_dir: logs/unified_qwen3_235b_ep32
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: qwen3_moe_dp_attn_ep_ffn
+          model_config: model/config/qwen3_235b.json
+          # 4-node 32-GPU EP. attn_tp_size=4 still saturates num_kv_heads=4
+          # (each attn-DP shard spans 4 GPUs) → num_dp_groups=8:
+          # HpUnifiedWorker keeps 8 Batches. nvl_num_gpu=8 means 4 NVL domains
+          # of 8 GPUs each — both MoE dispatch/combine intra (NVLink) and
+          # inter (NIC) legs carry traffic. experts_per_gpu = 128 / 32 = 4.
+          attn_tp_size: 4
+          ep_size: 32
+          hp_size: 1
+          nvl_num_gpu: 8
+          fp8: false
+        worker:
+          type: hp_unified
+          attn_gpu_memory_gb: 80.0
