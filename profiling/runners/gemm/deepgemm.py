@@ -28,9 +28,16 @@ def profile_grouped_gemm(
     num_local_experts: int,
     per_group_batches: tuple[int, ...] | list[int],
 ) -> ComputeMetrics:
-    # dtype is the compute-precision tag (fp8_e4m3 for this backend); validated
-    # for a well-formed wire value but the kernel is always FP8 in / bf16 out.
-    DType.from_value(dtype)
+    # The deepgemm backend is FP8-only (fp8 in / bf16 out): there is no bf16/fp16
+    # grouped-GEMM path on this kernel. Reject any non-FP8 compute dtype loudly so
+    # a high-precision config can never silently execute as FP8 — bf16/fp16 grouped
+    # GEMMs must route to the `torch` backend instead.
+    dtype = DType.from_value(dtype)
+    if dtype not in (DType.FP8_E4M3, DType.FP8_E5M2):
+        raise ValueError(
+            f"deepgemm grouped-GEMM is FP8-only but got dtype={dtype.value}; "
+            "use the torch backend for bf16/fp16 grouped GEMM"
+        )
     batches = [int(b) for b in per_group_batches]
     if len(batches) != int(num_local_experts):
         raise ValueError(

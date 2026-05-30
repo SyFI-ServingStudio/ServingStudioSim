@@ -76,7 +76,11 @@ const ACT_BACKENDS: &[&str] = &["triton"];
 // See llama3_dense: FlashInfer impls registered under fa2/fa3, not "flashinfer".
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];
 const ALLREDUCE_BACKENDS: &[&str] = &["nccl"];
-const GROUPED_GEMM_BACKENDS: &[&str] = &["deepgemm"];
+// torch `_grouped_mm` runs the expert GEMM at the model's compute dtype (bf16);
+// the deepgemm backend is FP8-only and would otherwise silently run FP8 under a
+// bf16/fp16 (`fp8: false`) config. Switch to deepgemm only when an FP8 path is
+// wired (precision currently rides on `model.dtype`, see note below).
+const GROUPED_GEMM_BACKENDS: &[&str] = &["torch"];
 // p2p backend for both MoE dispatch (inter+intra) and combine. nccl is the
 // portable choice; nvshmem (DeepEP) can be plugged via this constant once its
 // L1 kernel is wired everywhere this arch runs.

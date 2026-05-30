@@ -1,0 +1,34 @@
+# Qwen3-235B MoE (DP-attn × EP-FFN) ep8 perf rerun with the MoE grouped GEMM on
+# the torch (bf16) backend instead of deepgemm (FP8). Identical workload/shape to
+# logs/20260530_0_qwen3_235b_moe_perf/ep8 (rate 150, 90 GB/GPU, 20000s cap,
+# run_to_end:false) — the ONLY change is the grouped-GEMM precision, so the
+# throughput delta isolates the FP8→bf16 expert-FFN switch for the ref(FP16) match.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/aime_long.csv
+  request_rate: 150.0
+  run_to_end: false
+  duration_ms: 20000000.0
+
+io:
+  log_dir: logs/20260530_1_qwen3_235b_moe_fp16torch_ep8
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: qwen3_moe_dp_attn_ep_ffn
+          model_config: model/config/qwen3_235b.json
+          attn_tp_size: 4
+          ep_size: 8
+          hp_size: 1
+          nvl_num_gpu: 8
+          fp8: false
+        worker:
+          type: hp_unified
+          attn_gpu_memory_gb: 90.0
+    placement: least-queued
