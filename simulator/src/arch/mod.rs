@@ -4,6 +4,7 @@
 //! `DpAttnTpFfnParallel` / …) 1:1 into worklet configs, and assembles a
 //! build/cost model. See docs/detailed_design/L4/design.md.
 
+pub mod build;
 pub mod contract;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;

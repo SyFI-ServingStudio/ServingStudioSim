@@ -15,11 +15,9 @@ use std::sync::Arc;
 
 use anyhow::{bail, ensure, Context};
 
+use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::arch::model_cfg::ModelCfg;
-use crate::arch::{
-    llama3_dense_tp, llama3_dp_attn_tp_ffn, DenseTpParallel, DpAttnTpFfnParallel, IterArchSel,
-};
+use crate::arch::IterArchSel;
 use crate::common::{Fabric, SharedRequests};
 use crate::deployment::config::PdConfig;
 use crate::orchestrator::common::WorkerBuildFn;
@@ -36,6 +34,9 @@ use crate::worker::{CostSource, IterWorkerSel, PdDecodeWorker, PdPrefillWorker, 
 use super::Deployment;
 
 pub struct PdDeployment;
+
+/// Both pools' models share this dotted-leaf prefix (e.g. `pd.embedding`).
+const MODEL_NAME: &str = "pd";
 
 impl Deployment for PdDeployment {
     const NAME: &'static str = "pd";
@@ -79,9 +80,14 @@ impl Deployment for PdDeployment {
         // pairing is needed). Each arm builds both pools' concrete models (own
         // dims/TP) then assembles the flow. Today: tp→tp and tp→dp_attn.
         match (&pg.arch, &dg.arch) {
-            (IterArchSel::Llama3DenseTp { .. }, IterArchSel::Llama3DenseTp { .. }) => {
-                let prefill_model = build_dense_tp(pg, bridge)?;
-                let decode_model = build_dense_tp(dg, bridge)?;
+            (
+                IterArchSel::Llama3DenseTp { tp_size: ptp, .. },
+                IterArchSel::Llama3DenseTp { tp_size: dtp, .. },
+            ) => {
+                let prefill_model =
+                    Arc::new(arch_build::dense_tp(pg.arch.model(), *ptp, &pg.gpu, MODEL_NAME, bridge)?);
+                let decode_model =
+                    Arc::new(arch_build::dense_tp(dg.arch.model(), *dtp, &dg.gpu, MODEL_NAME, bridge)?);
                 Ok(assemble_pd_flow(
                     prefill_model,
                     decode_model,
@@ -99,9 +105,24 @@ impl Deployment for PdDeployment {
             // Cross-arch PD: TP prefill hands off to a DP-attention decode. Same
             // llama3 weights, only the parallel layout differs (the KV is logically
             // one tensor, re-sharded across the handoff), so it is a valid pair.
-            (IterArchSel::Llama3DenseTp { .. }, IterArchSel::Llama3DpAttnTpFfn { .. }) => {
-                let prefill_model = build_dense_tp(pg, bridge)?;
-                let decode_model = build_dp_attn_tp_ffn(dg, bridge)?;
+            (
+                IterArchSel::Llama3DenseTp { tp_size: ptp, .. },
+                IterArchSel::Llama3DpAttnTpFfn {
+                    attn_tp_size,
+                    ffn_tp_size,
+                    ..
+                },
+            ) => {
+                let prefill_model =
+                    Arc::new(arch_build::dense_tp(pg.arch.model(), *ptp, &pg.gpu, MODEL_NAME, bridge)?);
+                let decode_model = Arc::new(arch_build::dp_attn_tp_ffn(
+                    dg.arch.model(),
+                    *attn_tp_size,
+                    *ffn_tp_size,
+                    &dg.gpu,
+                    MODEL_NAME,
+                    bridge,
+                )?);
                 Ok(assemble_pd_flow(
                     prefill_model,
                     decode_model,
@@ -181,62 +202,6 @@ fn pool_cfg(
         num_workers: replicas,
         placement: placement_into(placement),
     }
-}
-
-fn load_model_cfg(g: &GroupSpec<IterArchSel, IterWorkerSel>) -> anyhow::Result<ModelCfg> {
-    let model_spec = g.arch.model();
-    let mut model_cfg = ModelCfg::from_json(Path::new(&model_spec.model_config))?;
-    if let Some(n) = model_spec.sim_num_layers.or(model_spec.num_layers) {
-        model_cfg.num_layers = n;
-    }
-    Ok(model_cfg)
-}
-
-fn build_dense_tp(
-    g: &GroupSpec<IterArchSel, IterWorkerSel>,
-    bridge: &PerfApiBridge,
-) -> anyhow::Result<Arc<impl IterwiseUnifiedModel>> {
-    let model_cfg = load_model_cfg(g)?;
-    let IterArchSel::Llama3DenseTp { tp_size, .. } = &g.arch else {
-        unreachable!("build_dense_tp called on non-dense_tp arch");
-    };
-    let parallel = DenseTpParallel {
-        tp_size: *tp_size,
-        gpu_name: g.gpu.clone(),
-    };
-    let resolved =
-        llama3_dense_tp::resolve_configs(&llama3_dense_tp::build_configs(&model_cfg, &parallel));
-    Ok(Arc::new(
-        llama3_dense_tp::build("pd".to_string(), resolved, bridge)
-            .context("building Llama3-dense-TP model (often a missing profile.db row)")?,
-    ))
-}
-
-fn build_dp_attn_tp_ffn(
-    g: &GroupSpec<IterArchSel, IterWorkerSel>,
-    bridge: &PerfApiBridge,
-) -> anyhow::Result<Arc<impl IterwiseUnifiedModel>> {
-    let model_cfg = load_model_cfg(g)?;
-    let IterArchSel::Llama3DpAttnTpFfn {
-        attn_tp_size,
-        ffn_tp_size,
-        ..
-    } = &g.arch
-    else {
-        unreachable!("build_dp_attn_tp_ffn called on non-dp-attn arch");
-    };
-    let parallel = DpAttnTpFfnParallel {
-        attn_tp_size: *attn_tp_size,
-        ffn_tp_size: *ffn_tp_size,
-        gpu_name: g.gpu.clone(),
-    };
-    let resolved = llama3_dp_attn_tp_ffn::resolve_configs(&llama3_dp_attn_tp_ffn::build_configs(
-        &model_cfg, &parallel,
-    ));
-    Ok(Arc::new(
-        llama3_dp_attn_tp_ffn::build("pd".to_string(), resolved, bridge)
-            .context("building Llama3 DP-attn TP-ffn model (often a missing profile.db row)")?,
-    ))
 }
 
 /// Assemble a [`PdFlow`] from two built models. Generic over each pool's concrete

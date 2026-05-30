@@ -360,6 +360,14 @@ def _expand_manifest(
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
+    # `iter-timing-predict` runs the offline whole-iteration timing predictor. Its
+    # config is a minimal arch+cases file, NOT a deployment RunConfig, so it has
+    # its own handler that bypasses schema expansion / sweeps entirely.
+    if argv and argv[0] == "iter-timing-predict":
+        from .timing_predict import main as run_timing_predict
+
+        return run_timing_predict(argv[1:])
+
     # `list-params` subcommand short-circuits before any preset handling.
     if argv and argv[0] == "list-params":
         human = "--human" in argv[1:]

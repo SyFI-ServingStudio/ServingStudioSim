@@ -13,6 +13,7 @@ pub mod orchestrator;
 pub mod schema;
 pub mod sim;
 pub mod timing;
+pub mod timing_predict;
 pub mod worker;
 pub mod worklet;
 
