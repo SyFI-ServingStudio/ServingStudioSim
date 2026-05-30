@@ -10,7 +10,7 @@
 //! worker stays the minimal single-group reference, and this is the multi-group
 //! specialization. The shared admission primitives (`Batch` / `KvAdmission` /
 //! `LoadBalance` / `KvPool`) and the public worker vocabulary (`WorkerConfig` /
-//! `WorkerMsg` / `WorkerEvent` / `WorkerStatus` / FSM enums) are reused, not
+//! `WorkerMsgCommon` / `WorkerEventCommon` / `WorkerStatus` / FSM enums) are reused, not
 //! duplicated.
 
 use std::collections::{HashMap, VecDeque};
@@ -19,13 +19,13 @@ use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
-use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
-use crate::timing::{LeafMetrics, SlotInput};
 use crate::worker::admission_helpers::{Batch, LoadBalance};
+use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, WorkerConfig, WorkerEvent, WorkerFsmState, WorkerMsg, WorkerStatus,
+    BatchFsmState, IterCursor, WorkerConfig, WorkerEventCommon, WorkerFsmState, WorkerMsgCommon,
+    WorkerStatus,
 };
 
 /// Worker-local runtime state (mirrors the barebone worker's, plus the live
@@ -67,11 +67,8 @@ pub struct HpUnifiedWorker<M: IterwiseUnifiedModel> {
     runtime: HpRuntime,
     /// One container per attention DP shard; length = `model.num_attn_dp_groups()`.
     batches: Vec<Batch>,
-    cost_logger: Option<CostLogger>,
-    cost_slots: Vec<LeafMetrics>,
-    cost_scratch: Vec<LeafMetrics>,
-    cost_groups: Vec<GroupInputLog>,
-    cost_slot_inputs: Vec<SlotInput>,
+    /// Eval scratch buffers + cost-log writer.
+    cost: CostBuffers,
 }
 
 impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
@@ -109,16 +106,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             LoadBalance::Single if num_groups > 1 => LoadBalance::RoundRobin { next: 0 },
             other => other,
         };
-        let cost_logger = match cost_log_dir {
-            Some(dir) => match CostLogger::open(&dir, pool_tag, id, &model.cost_log_manifest()) {
-                Ok(logger) => Some(logger),
-                Err(e) => {
-                    tracing::warn!("cost_log disabled: failed to open writer: {e}");
-                    None
-                }
-            },
-            None => None,
-        };
+        let cost = CostBuffers::new(cost_log_dir, pool_tag, id, model.as_ref());
         Self {
             id,
             model,
@@ -126,17 +114,13 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             config,
             runtime: HpRuntime::new(balance),
             batches,
-            cost_logger,
-            cost_slots: Vec::new(),
-            cost_scratch: Vec::new(),
-            cost_groups: Vec::new(),
-            cost_slot_inputs: Vec::new(),
+            cost,
         }
     }
 
     // ── tick: state-forwarding loop (§3.2.1; identical shape to barebone) ──────
 
-    fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    fn tick_inner(&mut self, now: Time, events: &mut Vec<WorkerEventCommon>) -> Option<Time> {
         use IterCursor::*;
         use WorkerFsmState::*;
         loop {
@@ -234,62 +218,20 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
 
     fn start_iter(&mut self, now: Time) -> Time {
         let arch_input = self.build_arch_input();
-        let logging_cost = self.cost_logger.is_some();
-        let agg = if logging_cost {
-            self.model.eval_iter_with_inputs(
-                &arch_input,
-                &mut self.cost_slots,
-                &mut self.cost_scratch,
-                &mut self.cost_slot_inputs,
-            )
-        } else {
-            self.model
-                .eval_iter(&arch_input, &mut self.cost_slots, &mut self.cost_scratch)
-        };
-        let cost_time = Time::from_ms(agg.m.time_ms as f64);
-        if self.cost_logger.is_some() {
-            // Refill the reused `cost_groups` buffer in place; the per-slot
-            // breakdowns are appended into the logger's flat chunk buffers by
-            // `record`, so the entry owns no `Vec`.
-            self.cost_groups.clear();
-            for g in &arch_input.groups {
-                self.cost_groups.push(GroupInputLog {
-                    batch_tokens: g.batch_tokens,
-                    prefill_tokens: g.prefill_tokens,
-                    decode_request_count: g.decode_tokens,
-                    decode_kv_total: g.total_kv_len,
-                    prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
-                });
-            }
-            let entry = CostLogEntry {
-                worker_id: self.id.0,
-                iter_id: self.runtime.iter_counter as u64,
-                batch_id: 0,
-                wall_start_ms: now.as_ms(),
-                total_time_ms: agg.m.time_ms as f64,
-                energy_j: agg.m.energy_j as f64,
-                group_len: 0,
-                slot_len: 0,
-                slot_input_len: 0,
-            };
-            if let Some(logger) = self.cost_logger.as_mut() {
-                if let Err(e) = logger.record(
-                    entry,
-                    &self.cost_slots,
-                    &mut self.cost_groups,
-                    &mut self.cost_slot_inputs,
-                ) {
-                    tracing::warn!("cost_log record failed: {e}");
-                }
-            }
-        }
+        let cost_time = self.cost.run_iter(
+            self.model.as_ref(),
+            &arch_input,
+            self.id,
+            self.runtime.iter_counter as u64,
+            now,
+        );
         self.runtime.iter_compute_start = now;
         now + cost_time
     }
 
     // ── Stage 3: complete_iter — same bookkeeping as barebone, per group ────────
 
-    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
+    fn complete_iter(&mut self, now: Time, events: &mut Vec<WorkerEventCommon>) {
         let log_tokens = self.config.log_output_token_times;
         for gid in 0..self.batches.len() {
             let mut completed: Vec<RequestId> = Vec::new();
@@ -347,7 +289,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                     .unwrap_or(0);
                 self.batches[gid].release(rid, current_kv);
                 self.runtime.request_to_group.remove(&rid);
-                events.push(WorkerEvent::RequestComplete {
+                events.push(WorkerEventCommon::RequestComplete {
                     worker: self.id,
                     req: rid,
                 });
@@ -449,21 +391,19 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
 }
 
 impl<M: IterwiseUnifiedModel> IterWorker for HpUnifiedWorker<M> {
+    type Msg = WorkerMsgCommon;
+    type Event = WorkerEventCommon;
+
     fn id(&self) -> WorkerId {
         self.id
     }
 
-    fn enqueue(&mut self, msg: WorkerMsg) {
-        match msg {
-            WorkerMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
-            WorkerMsg::Handoff { .. } => unreachable!("hp_unified worker receives no PD handoff"),
-            WorkerMsg::ReleaseKv { .. } => {
-                unreachable!("hp_unified is not a PD prefill; no held KV to release")
-            }
-        }
+    fn enqueue(&mut self, msg: Self::Msg) {
+        let WorkerMsgCommon::Request(rid) = msg;
+        self.runtime.pending_prefills.push_back(rid);
     }
 
-    fn tick(&mut self, now: Time, events: &mut Vec<WorkerEvent>) -> Option<Time> {
+    fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time> {
         self.tick_inner(now, events)
     }
 
@@ -520,8 +460,8 @@ mod tests {
         // in decode; the long decode budget keeps them alive past the probe.
         let store = shared_with(&[(0, 4, 50), (1, 4, 50)]);
         let mut w = worker(store, 2);
-        w.enqueue(WorkerMsg::Request(RequestId(0)));
-        w.enqueue(WorkerMsg::Request(RequestId(1)));
+        w.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        w.enqueue(WorkerMsgCommon::Request(RequestId(1)));
         let mut events = Vec::new();
         for step in 0..20u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
@@ -547,16 +487,14 @@ mod tests {
         let store = shared_with(&[(0, 4, 2), (1, 4, 2), (2, 4, 2)]);
         let mut w = worker(store, 2);
         for id in 0..3u32 {
-            w.enqueue(WorkerMsg::Request(RequestId(id)));
+            w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
         }
         let mut completed = Vec::new();
         let mut events = Vec::new();
         for step in 0..500u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
             for e in events.drain(..) {
-                let WorkerEvent::RequestComplete { req, .. } = e else {
-                    continue;
-                };
+                let WorkerEventCommon::RequestComplete { req, .. } = e;
                 completed.push(req);
             }
         }

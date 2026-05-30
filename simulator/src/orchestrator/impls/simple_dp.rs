@@ -4,9 +4,9 @@
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time, WorkerId};
-use crate::worker::{CostSource, GpuCluster, IterWorker, SharedGpuCluster, WorkerEvent, WorkerMsg};
+use crate::worker::{CostSource, GpuCluster, IterWorker, SharedGpuCluster, WorkerEventCommon};
 
-use super::super::{Flow, OrchAction, PoolEvent, UnifiedWorkerFactory};
+use super::super::{Flow, OrchAction, UnifiedWorkerFactory};
 
 /// Sentinel for a quiescent worker. `Option<Time>` would add a tag; the simulator
 /// clock is a `u64` newtype, so this keeps the hot wakeup array dense while still
@@ -78,15 +78,13 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
     }
 
     // ── Outward API (called by L6b) ───────────────────────────────────────────
-    pub fn admit(&mut self, rid: RequestId) {
-        self.admit_msg(WorkerMsg::Request(rid));
-    }
 
     /// Pick a worker via the pool's placement policy and enqueue `msg` into it.
-    /// Deployment-agnostic primitive: the unified flow admits a plain `Request`;
-    /// a PD flow uses this to enqueue a `Handoff` (whose content does not depend
-    /// on the chosen worker — the receiver fills in its own destination block).
-    pub fn admit_msg(&mut self, msg: WorkerMsg) {
+    /// Deployment-agnostic primitive over `W::Msg`: the unified flow admits a
+    /// plain `Request` (via [`Self::admit`] convenience); a PD flow uses this
+    /// to enqueue a `Handoff` whose content does not depend on the chosen
+    /// worker — the receiver fills in its own destination block.
+    pub fn admit_msg(&mut self, msg: W::Msg) {
         let idx = self.choose_worker_idx();
         self.workers[idx].enqueue(msg);
         // An idle worker has no scheduled wakeup; new work must make it due
@@ -102,7 +100,7 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
     /// exact worker that holds the addressed request's KV. Panics if
     /// `worker_id` is outside this pool — silently dropping the ack would
     /// leak the held reservation forever, so a bad id is treated as a bug.
-    pub fn route_msg_to(&mut self, worker_id: WorkerId, msg: WorkerMsg) {
+    pub fn route_msg_to(&mut self, worker_id: WorkerId, msg: W::Msg) {
         let idx = worker_id.0 as usize;
         self.workers[idx].enqueue(msg);
         if self.worker_wakeup_times[idx] == NO_WAKEUP_TIME {
@@ -141,10 +139,13 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
 
     // ── Tick driving ──────────────────────────────────────────────────────────
     /// Sweep worker wakeup times and tick only due workers, each pushing its
-    /// self-tagged `WorkerEvent`s into the caller's sink. One sweep — no separate
-    /// drain pass; the worker already stamps its id so the pool needs no
-    /// per-worker attribution loop.
-    pub fn tick_collect(&mut self, now: Time, events: &mut Vec<WorkerEvent>) {
+    /// self-tagged events into the caller's sink. One sweep — no separate drain
+    /// pass; the worker already stamps its id so the pool needs no per-worker
+    /// attribution loop. The sink type is `Vec<W::Event>` so each pool gets its
+    /// own role-specific event stream (a barebone pool's sink takes
+    /// `WorkerEventCommon`, a PD prefill pool's sink takes `PdPrefillEvent`,
+    /// etc.).
+    pub fn tick_collect(&mut self, now: Time, events: &mut Vec<W::Event>) {
         debug_assert_eq!(self.worker_wakeup_times.len(), self.workers.len());
         for (wakeup_time, worker) in self
             .worker_wakeup_times
@@ -158,26 +159,24 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
     }
 }
 
-/// Tag a worker event with its pool to form the L6b [`PoolEvent`]. The worker
-/// already carries its own id; the caller supplies the pool context for the
-/// per-pool event sink being converted.
-pub(crate) fn to_pool_event(pool: PoolId, event: WorkerEvent) -> PoolEvent {
-    match event {
-        WorkerEvent::RequestComplete { worker, req } => {
-            PoolEvent::RequestComplete { pool, worker, req }
-        }
-        WorkerEvent::PrefillDone { worker, req, send_gid, kv_tokens } => {
-            PoolEvent::PrefillDone { pool, worker, req, send_gid, kv_tokens }
-        }
-        WorkerEvent::PullComplete { worker, req, prefill_worker } => {
-            PoolEvent::PullComplete { pool, worker, req, prefill_worker }
-        }
+// Convenience: every Msg enum impls `From<RequestId>` so the universal
+// "admit a request" entry point can stay one method. Decoupled into its own
+// `impl` block so workers whose Msg does not (or cannot) carry Request — none
+// today, but the bound keeps the trait surface minimal — still compile.
+impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W>
+where
+    W::Msg: From<RequestId>,
+{
+    /// Admit a fresh request (the universal entry) — wraps in the chosen
+    /// worker's `W::Msg::from(rid)`. PD-side admits via `admit_msg` directly.
+    pub fn admit(&mut self, rid: RequestId) {
+        self.admit_msg(W::Msg::from(rid));
     }
 }
 
 // ── L6b: deployment flow (the object L7 calls) ────────────────────────────────
 
-pub struct SimpleDpFlow<M: IterwiseUnifiedModel, W: IterWorker> {
+pub struct SimpleDpFlow<M: IterwiseUnifiedModel, W: IterWorker<Event = WorkerEventCommon>> {
     requests: SharedRequests,
     dp_pool: SimpleDpPoolController<M, W>,
     /// Shared run-level GPU cluster (registry + transfer oracle), built here and
@@ -186,12 +185,17 @@ pub struct SimpleDpFlow<M: IterwiseUnifiedModel, W: IterWorker> {
     /// but the ownership shape generalizes to multi-pool (allocate into the
     /// same cluster, ids continue).
     cluster: SharedGpuCluster,
-    /// Reused per-tick event sink — workers push `WorkerEvent`s into it during
+    /// Reused per-tick event sink — workers push `WorkerEventCommon`s (a unified
+    /// deployment's workers only emit `RequestComplete`) into it during
     /// `tick_collect`, then it is drained here and cleared for the next tick.
-    events: Vec<WorkerEvent>,
+    events: Vec<WorkerEventCommon>,
 }
 
-impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpFlow<M, W> {
+impl<M, W> SimpleDpFlow<M, W>
+where
+    M: IterwiseUnifiedModel,
+    W: IterWorker<Event = WorkerEventCommon>,
+{
     pub fn new(cfg: SimpleDpConfig, factory: UnifiedWorkerFactory<M, W>) -> Self {
         let requests = std::rc::Rc::clone(&factory.requests);
         // simple_dp has no inter-worker transfers, but the cluster is still the
@@ -209,18 +213,14 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpFlow<M, W> {
             events: Vec::new(),
         }
     }
-
-    fn on_pool_event(&mut self, event: PoolEvent) -> Vec<OrchAction> {
-        match event {
-            PoolEvent::RequestComplete { req, .. } => vec![OrchAction::Complete { req }],
-            // A single-pool unified deployment never produces a prefill handoff
-            // or a PD pull ack — those are PD-only events.
-            PoolEvent::PrefillDone { .. } | PoolEvent::PullComplete { .. } => vec![],
-        }
-    }
 }
 
-impl<M: IterwiseUnifiedModel, W: IterWorker> Flow for SimpleDpFlow<M, W> {
+impl<M, W> Flow for SimpleDpFlow<M, W>
+where
+    M: IterwiseUnifiedModel,
+    W: IterWorker<Event = WorkerEventCommon>,
+    W::Msg: From<RequestId>,
+{
     fn on_arrival(&mut self, req: Request) {
         let rid = req.id;
         self.requests.borrow_mut().insert(&req);
@@ -231,10 +231,10 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> Flow for SimpleDpFlow<M, W> {
         let mut events = std::mem::take(&mut self.events);
         events.clear();
         self.dp_pool.tick_collect(now, &mut events);
-        let pool = self.dp_pool.pool();
         let mut actions = Vec::new();
         for ev in events.drain(..) {
-            actions.extend(self.on_pool_event(to_pool_event(pool, ev)));
+            let WorkerEventCommon::RequestComplete { req, .. } = ev;
+            actions.push(OrchAction::Complete { req });
         }
         self.events = events;
         actions

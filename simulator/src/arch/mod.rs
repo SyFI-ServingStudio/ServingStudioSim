@@ -4,6 +4,7 @@
 //! `DpAttnTpFfnParallel` / …) 1:1 into worklet configs, and assembles a
 //! build/cost model. See docs/detailed_design/L4/design.md.
 
+pub mod build;
 pub mod contract;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
@@ -20,4 +21,4 @@ pub use llama3_dp_attn_tp_ffn::{DpAttnTpFfnParallel, Llama3DpAttnTpFfnModel};
 pub use model_cfg::ModelCfg;
 pub use moe_model_cfg::MoeModelCfg;
 pub use qwen3_moe_dp_attn_ep_ffn::{Qwen3MoeDpAttnEpFfnModel, Qwen3MoeParallel};
-pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec};
+pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};

@@ -61,6 +61,22 @@ impl RoutingDistribution {
         Self::from_weights(&weights)
     }
 
+    /// A seeded pseudo-random expert skew: draw one weight per expert from the
+    /// deterministic splitmix64 stream and normalize (the same `from_weights`
+    /// path as `power_law` / `from_profile`). Uses only `+`/`*`/`>>` and one
+    /// division (no transcendental ops), so a fixed `seed` yields a bit-identical
+    /// ppm across runs and machines — a `routing = random` run stays reproducible
+    /// (the throughput golden is bit-identical). Vary `seed` to sample a
+    /// different skew.
+    pub fn random(num_experts: u32, seed: u64) -> Self {
+        if num_experts == 0 {
+            return Self { ppm: Vec::new() };
+        }
+        let mut rng = RoutingRng::new(seed);
+        let weights: Vec<f64> = (0..num_experts).map(|_| rng.next_f64()).collect();
+        Self::from_weights(&weights)
+    }
+
     pub fn num_experts(&self) -> u32 {
         self.ppm.len() as u32
     }
@@ -297,6 +313,19 @@ mod tests {
         assert_eq!(counts.iter().sum::<u32>(), 10);
         assert!(counts[2] >= counts[1]);
         assert!(counts[1] >= counts[0]);
+    }
+
+    #[test]
+    fn random_is_seeded_and_normalized() {
+        // Same seed ⇒ identical ppm (reproducible, golden-safe); ppm normalizes
+        // to TOTAL_PPM; a different seed gives a different skew.
+        let a = RoutingDistribution::random(32, 0xD1CE_5EED);
+        let b = RoutingDistribution::random(32, 0xD1CE_5EED);
+        assert_eq!(a, b, "same seed must replay an identical distribution");
+        assert_eq!(a.num_experts(), 32);
+        assert_eq!(a.ppm().iter().sum::<u32>(), RoutingDistribution::TOTAL_PPM);
+        let c = RoutingDistribution::random(32, 0x0BAD_F00D);
+        assert_ne!(a.ppm(), c.ppm(), "a different seed should skew differently");
     }
 
     #[test]

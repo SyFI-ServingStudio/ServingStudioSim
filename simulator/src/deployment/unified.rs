@@ -10,19 +10,14 @@
 //! erases to `Box<dyn Flow>` — the single `dyn` point (the cost path is
 //! `dyn`-free, L4 §4.1).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Context};
+use anyhow::{bail, ensure};
 
+use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::arch::model_cfg::ModelCfg;
-use crate::arch::moe_model_cfg::MoeModelCfg;
-use crate::arch::{
-    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen3_moe_dp_attn_ep_ffn, DenseParallel,
-    DenseTpParallel, DpAttnTpFfnParallel, IterArchSel, Qwen3MoeParallel,
-};
-use crate::timing::routing::RoutingDistribution;
+use crate::arch::IterArchSel;
 use crate::common::{PoolId, SharedRequests};
 use crate::deployment::UnifiedConfig;
 use crate::orchestrator::common::WorkerBuildFn;
@@ -91,24 +86,16 @@ impl Deployment for UnifiedDeployment {
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
         let gpu_name = g.gpu.clone();
 
-        // Arch selected by explicit tag; each arm builds its own concrete model
-        // type, validates the paired worker tag, and erases via assemble_flow.
-        // dense / dense_tp run on the single-group barebone worker; the DP-attn
-        // arch runs on the multi-group hp_unified worker (one Batch per DP shard).
+        // Arch selected by explicit tag; each arm builds its concrete model via
+        // the shared `arch::build` builders (the same ones the `pd` deployment and
+        // the offline `iter-timing-predict` path use), validates the paired worker
+        // tag, and erases via assemble_flow. dense / dense_tp run on the
+        // single-group barebone worker; the DP-attn / MoE archs run on the
+        // multi-group hp_unified worker (one Batch per DP shard).
         match &g.arch {
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
-                let model_cfg = load_dense_model_cfg(model_spec)?;
-                let parallel = DenseParallel {
-                    gpu_name: gpu_name.clone(),
-                };
-                let resolved = llama3_dense::resolve_configs(&llama3_dense::build_configs(
-                    &model_cfg, &parallel,
-                ));
-                let model = Arc::new(
-                    llama3_dense::build("unified".to_string(), resolved, bridge)
-                        .context("building Llama3-dense model (often a missing profile.db row)")?,
-                );
+                let model = Arc::new(arch_build::dense(model_spec, &gpu_name, MODEL_NAME, bridge)?);
                 Ok(assemble_flow(
                     model,
                     store,
@@ -121,19 +108,9 @@ impl Deployment for UnifiedDeployment {
             }
             IterArchSel::Llama3DenseTp { tp_size, .. } => {
                 ensure_barebone(&g.worker)?;
-                let model_cfg = load_dense_model_cfg(model_spec)?;
-                let parallel = DenseTpParallel {
-                    tp_size: *tp_size,
-                    gpu_name: gpu_name.clone(),
-                };
-                let resolved = llama3_dense_tp::resolve_configs(&llama3_dense_tp::build_configs(
-                    &model_cfg, &parallel,
-                ));
-                let model = Arc::new(
-                    llama3_dense_tp::build("unified".to_string(), resolved, bridge).context(
-                        "building Llama3-dense-TP model (often a missing profile.db row)",
-                    )?,
-                );
+                let model = Arc::new(arch_build::dense_tp(
+                    model_spec, *tp_size, &gpu_name, MODEL_NAME, bridge,
+                )?);
                 Ok(assemble_flow(
                     model,
                     store,
@@ -150,20 +127,14 @@ impl Deployment for UnifiedDeployment {
                 ..
             } => {
                 ensure_hp_unified(&g.worker)?;
-                let model_cfg = load_dense_model_cfg(model_spec)?;
-                let parallel = DpAttnTpFfnParallel {
-                    attn_tp_size: *attn_tp_size,
-                    ffn_tp_size: *ffn_tp_size,
-                    gpu_name: gpu_name.clone(),
-                };
-                let resolved = llama3_dp_attn_tp_ffn::resolve_configs(
-                    &llama3_dp_attn_tp_ffn::build_configs(&model_cfg, &parallel),
-                );
-                let model = Arc::new(
-                    llama3_dp_attn_tp_ffn::build("unified".to_string(), resolved, bridge).context(
-                        "building Llama3 DP-attn TP-ffn model (often a missing profile.db row)",
-                    )?,
-                );
+                let model = Arc::new(arch_build::dp_attn_tp_ffn(
+                    model_spec,
+                    *attn_tp_size,
+                    *ffn_tp_size,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
                 Ok(assemble_flow(
                     model,
                     store,
@@ -179,29 +150,23 @@ impl Deployment for UnifiedDeployment {
                 ep_size,
                 hp_size,
                 nvl_num_gpu,
-                routing_profile,
+                routing,
+                routing_seed,
                 ..
             } => {
                 ensure_hp_unified(&g.worker)?;
-                let model_cfg = load_moe_model_cfg(model_spec)?;
-                let routing = resolve_routing(routing_profile.as_slice(), model_cfg.num_experts)?;
-                let parallel = Qwen3MoeParallel {
-                    attn_tp_size: *attn_tp_size,
-                    ep_size: *ep_size,
-                    hp_size: *hp_size,
-                    nvl_num_gpu: *nvl_num_gpu,
-                    gpu_name: gpu_name.clone(),
-                };
-                let resolved = qwen3_moe_dp_attn_ep_ffn::resolve_configs(
-                    &qwen3_moe_dp_attn_ep_ffn::build_configs(&model_cfg, &parallel, &routing),
-                );
-                let model = Arc::new(
-                    qwen3_moe_dp_attn_ep_ffn::build("unified".to_string(), resolved, bridge)
-                        .context(
-                            "building Qwen3-MoE DP-attn EP-ffn model \
-                             (often a missing profile.db row)",
-                        )?,
-                );
+                let model = Arc::new(arch_build::qwen3_moe(
+                    model_spec,
+                    *attn_tp_size,
+                    *ep_size,
+                    *hp_size,
+                    *nvl_num_gpu,
+                    *routing,
+                    *routing_seed,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
                 Ok(assemble_flow(
                     model,
                     store,
@@ -216,44 +181,8 @@ impl Deployment for UnifiedDeployment {
     }
 }
 
-/// Load the dense `ModelCfg` from JSON and apply the `sim_num_layers` /
-/// `num_layers` override that truncates the layer count BEFORE build_configs.
-fn load_dense_model_cfg(model_spec: &crate::arch::ModelSpec) -> anyhow::Result<ModelCfg> {
-    let mut model_cfg = ModelCfg::from_json(Path::new(&model_spec.model_config))?;
-    if let Some(n) = model_spec.sim_num_layers.or(model_spec.num_layers) {
-        model_cfg.num_layers = n;
-    }
-    Ok(model_cfg)
-}
-
-/// Load the MoE `MoeModelCfg` from JSON and apply the layer-count override.
-/// Separate loader because MoE configs include `num_experts` /
-/// `num_experts_per_tok` / `moe_intermediate_size` that the dense parser does
-/// not deserialize.
-fn load_moe_model_cfg(model_spec: &crate::arch::ModelSpec) -> anyhow::Result<MoeModelCfg> {
-    let mut model_cfg = MoeModelCfg::from_json(Path::new(&model_spec.model_config))?;
-    if let Some(n) = model_spec.sim_num_layers.or(model_spec.num_layers) {
-        model_cfg.num_layers = n;
-    }
-    Ok(model_cfg)
-}
-
-/// Resolve the MoE routing distribution from the optional selector profile.
-/// Empty slice → uniform over `num_experts` (the YAML default); non-empty
-/// → must have length `num_experts` (the L2 MoE op needs one ppm slot per
-/// expert).
-fn resolve_routing(profile: &[f32], num_experts: u32) -> anyhow::Result<RoutingDistribution> {
-    if profile.is_empty() {
-        return Ok(RoutingDistribution::uniform(num_experts));
-    }
-    ensure!(
-        profile.len() == num_experts as usize,
-        "routing_profile has {} weights but model has {} experts",
-        profile.len(),
-        num_experts,
-    );
-    Ok(RoutingDistribution::from_profile(profile))
-}
+/// The model's dotted-leaf prefix for this deployment (e.g. `unified.embedding`).
+const MODEL_NAME: &str = "unified";
 
 /// The dense / dense_tp archs run on the single-group barebone worker.
 fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
@@ -276,7 +205,7 @@ fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
 /// Wrap a built iter-wise model in a `simple_dp` flow. Generic over the concrete
 /// model `M` and worker `W`; `build_fn` is the chosen worker's `new`. The returned
 /// `Box<dyn Flow>` is the only `dyn` erasure point.
-fn assemble_flow<M: IterwiseUnifiedModel, W: IterWorker + 'static>(
+fn assemble_flow<M, W>(
     model: Arc<M>,
     store: SharedRequests,
     worker_config: WorkerConfig,
@@ -284,7 +213,12 @@ fn assemble_flow<M: IterwiseUnifiedModel, W: IterWorker + 'static>(
     gpu_name: String,
     dp_cfg: SimpleDpConfig,
     build_fn: WorkerBuildFn<M, W>,
-) -> Box<dyn Flow> {
+) -> Box<dyn Flow>
+where
+    M: IterwiseUnifiedModel,
+    W: IterWorker<Event = crate::worker::WorkerEventCommon> + 'static,
+    W::Msg: From<crate::common::RequestId>,
+{
     let factory = UnifiedWorkerFactory::new(
         model,
         store,
