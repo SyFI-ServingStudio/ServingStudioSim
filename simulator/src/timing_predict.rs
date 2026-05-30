@@ -18,8 +18,9 @@
 //!
 //! Config (a minimal file, NOT a `RunConfig`): ONE iter-wise arch selector + its
 //! GPU + a log dir + a batched cases file. No workload / pools / io — those
-//! belong to `run`. Built via the shared `deployment::unified::build_iter_model`
-//! seam (the offline path is `dyn`; the sim's cost path stays monomorphized).
+//! belong to `run`. Built via the shared `arch::build::build_iter_model` seam
+//! (the offline path is `dyn`; the sim's cost path stays monomorphized), and the
+//! per-case eval + cost_log write reuse the worker's `CostBuffers` bundle.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,9 +31,9 @@ use serde::Deserialize;
 use crate::arch::build::build_iter_model;
 use crate::arch::contract::{ArchGroupInput, UnifiedArchInput};
 use crate::arch::IterArchSel;
-use crate::common::WorkerId;
-use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
-use crate::timing::{LeafMetrics, PerfApiBridge, SlotInput};
+use crate::common::{Time, WorkerId};
+use crate::timing::PerfApiBridge;
+use crate::worker::CostBuffers;
 
 /// Minimal offline config. `arch` reuses the run-side [`IterArchSel`] (it already
 /// flattens `ModelSpec` — model path, layer overrides, parallel dims), so a
@@ -158,72 +159,30 @@ pub fn run_iter_timing_predict(config_path: &Path) -> Result<()> {
         .context("building the arch model for iter-timing-predict")?;
     let expected_groups = model.num_attn_dp_groups() as usize;
 
-    // Standard per-"worker" artifacts (pool_tag "predict", worker 0): the manifest
-    // sidecar + the cost_log parquet, identical to a real run so the analyzer
-    // consumes them unchanged.
-    let mut logger = CostLogger::open(
-        &cfg.log_dir,
-        "predict",
-        WorkerId(0),
-        &model.cost_log_manifest(),
-    )
-    .context("opening the cost logger")?;
+    // Standard per-"worker" artifacts via the shared `CostBuffers` bundle — the
+    // same one every iter-wise worker carries (`worker/cost_buffers.rs`): it owns
+    // the eval scratch (slots / scratch / slot_inputs + the per-group input log)
+    // plus the cost_log writer, and per case runs `eval_iter_with_inputs` and
+    // writes one parquet row (pool_tag "predict", worker 0). The manifest sidecar +
+    // parquet are byte-identical to a real run, so the analyzer consumes them
+    // unchanged.
+    let mut cost = CostBuffers::new(Some(cfg.log_dir.clone()), "predict", WorkerId(0), &*model);
 
-    // Reused across cases (allocation-free steady state, mirrors the worker).
-    let mut slots: Vec<LeafMetrics> = Vec::new();
-    let mut scratch: Vec<LeafMetrics> = Vec::new();
-    let mut slot_inputs: Vec<SlotInput> = Vec::new();
-    let mut groups: Vec<GroupInputLog> = Vec::new();
-    // Lay cases out back-to-back on the trace's wall-clock axis.
-    let mut wall_ms = 0.0f64;
-    let mut extrapolated_cases = 0usize;
-
+    // Lay cases out back-to-back on the trace's wall-clock axis: `run_iter` stamps
+    // `now` as this row's `wall_start_ms` and returns the iter's predicted time, so
+    // accumulating it starts the next case where this one ends.
+    let mut now = Time::from_ms(0.0);
     for (idx, case) in cases.into_iter().enumerate() {
         let arch_input = case
             .into_arch_input(expected_groups)
             .with_context(|| format!("case {idx}"))?;
-        let agg =
-            model.eval_iter_with_inputs(&arch_input, &mut slots, &mut scratch, &mut slot_inputs);
-        if !agg.coverage.is_empty() {
-            extrapolated_cases += 1;
-        }
-
-        // Per-iteration input_section, one entry per group (mirrors
-        // worker/unified.rs): decode aggregated to count + total KV.
-        groups.clear();
-        for g in &arch_input.groups {
-            groups.push(GroupInputLog {
-                batch_tokens: g.batch_tokens,
-                prefill_tokens: g.prefill_tokens,
-                decode_request_count: g.decode_tokens,
-                decode_kv_total: g.total_kv_len,
-                prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
-            });
-        }
-        let entry = CostLogEntry {
-            worker_id: 0,
-            iter_id: idx as u64,
-            batch_id: 0,
-            wall_start_ms: wall_ms,
-            total_time_ms: agg.m.time_ms as f64,
-            energy_j: agg.m.energy_j as f64,
-            // `record` fills the *_len fields from the slices it is handed.
-            group_len: 0,
-            slot_len: 0,
-            slot_input_len: 0,
-        };
-        logger
-            .record(entry, &slots, &mut groups, &mut slot_inputs)
-            .with_context(|| format!("recording cost_log row for case {idx}"))?;
-        wall_ms += agg.m.time_ms as f64;
+        now += cost.run_iter(&*model, &arch_input, WorkerId(0), idx as u64, now);
     }
-    logger.flush_all().context("flushing the cost logger")?;
+    // The writer flushes its tail and joins on drop (`CostLogger`'s `Drop`), the
+    // same as a worker at sim end; force it here so the parquet is complete before
+    // we report success.
+    drop(cost);
 
-    if extrapolated_cases > 0 {
-        tracing::warn!(
-            "{extrapolated_cases}/{num_cases} case(s) hit extrapolated / uncovered cache regions"
-        );
-    }
     tracing::info!(
         log_dir = %cfg.log_dir.display(),
         "iter-timing-predict wrote {num_cases} case(s)"

@@ -22,6 +22,10 @@ use crate::timing::{LeafMetrics, SlotInput};
 /// Per-worker eval / cost-log scratch state. Drop one of these into a worker
 /// struct in place of `cost_logger` + four `Vec` fields, and call `run_iter`
 /// at the end of `start_iter` in place of the inline eval + record block.
+///
+/// The model generic is `?Sized` so the offline `iter-timing-predict` path can
+/// drive a `&dyn IterwiseUnifiedModel`; workers pass a concrete model and stay
+/// monomorphized, so no dispatch is added to the cost hot path (L4 §4.1).
 pub struct CostBuffers {
     /// Reused per-slot eval output buffer (filled by `model.eval_iter*`).
     pub slots: Vec<LeafMetrics>,
@@ -45,7 +49,7 @@ impl CostBuffers {
     /// configured. An open failure logs a warning and disables logging — never
     /// aborts the sim. `pool_tag` disambiguates writer filenames across pools
     /// (PD's `prefill_<id>.parquet` vs `decode_<id>.parquet`).
-    pub fn new<M: IterwiseUnifiedModel>(
+    pub fn new<M: IterwiseUnifiedModel + ?Sized>(
         log_dir: Option<PathBuf>,
         pool_tag: &'static str,
         worker_id: WorkerId,
@@ -79,7 +83,7 @@ impl CostBuffers {
     ///
     /// `worker_id` / `iter_id` / `now` are stamped into the row; the model is
     /// borrowed only for the eval (no Arc plumbing — workers Deref their Arc).
-    pub fn run_iter<M: IterwiseUnifiedModel>(
+    pub fn run_iter<M: IterwiseUnifiedModel + ?Sized>(
         &mut self,
         model: &M,
         arch_input: &UnifiedArchInput,
