@@ -18,9 +18,11 @@ use crate::arch::config::{IterArchSel, ModelSpec, RoutingKind};
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen3_moe_dp_attn_ep_ffn, DenseParallel,
-    DenseTpParallel, DpAttnTpFfnParallel, IterwiseUnifiedModel, Llama3DenseModel,
-    Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeParallel,
+    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen3_attn_layerwise,
+    qwen3_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn, DenseParallel, DenseTpParallel,
+    DpAttnTpFfnParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
+    Llama3DpAttnTpFfnModel, Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel,
+    Qwen3FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeParallel,
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::PerfApiBridge;
@@ -150,6 +152,61 @@ pub fn qwen3_moe(
         .context("building Qwen3-MoE DP-attn EP-ffn model (often a missing profile.db row)")
 }
 
+/// Build the AFD attn-side (layer-wise) Qwen3-MoE model — attention only, for ONE
+/// DP shard (`attn_tp_size` head-parallel ranks). The attn pool runs one of these
+/// per DP shard (its `replicas`). Pairs with [`qwen3_ffn_moe`].
+pub fn qwen3_attn(
+    model_spec: &ModelSpec,
+    attn_tp_size: u16,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen3AttnLayerwiseModel> {
+    let model_cfg = moe_model_cfg(model_spec)?;
+    let parallel = Qwen3AttnParallel {
+        attn_tp_size,
+        gpu_name: gpu.to_string(),
+    };
+    let resolved =
+        qwen3_attn_layerwise::resolve_configs(&qwen3_attn_layerwise::build_configs(
+            &model_cfg, &parallel,
+        ));
+    qwen3_attn_layerwise::build(name.to_string(), resolved, bridge)
+        .context("building Qwen3 AFD attn-side model (often a missing profile.db row)")
+}
+
+/// Build the AFD ffn-side (layer-wise) Qwen3-MoE model — qkv / o_proj / router /
+/// EP MoE / embed / lm_head. Reuses the iter-wise arch's `build_configs` +
+/// `resolve_configs` (so the split conserves every leaf). Pairs with [`qwen3_attn`].
+#[allow(clippy::too_many_arguments)]
+pub fn qwen3_ffn_moe(
+    model_spec: &ModelSpec,
+    attn_tp_size: u16,
+    ep_size: u16,
+    nvl_num_gpu: u16,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen3FfnMoeLayerwiseModel> {
+    let model_cfg = moe_model_cfg(model_spec)?;
+    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts);
+    let parallel = Qwen3FfnMoeParallel {
+        attn_tp_size,
+        ep_size,
+        nvl_num_gpu,
+        gpu_name: gpu.to_string(),
+    };
+    let resolved = qwen3_ffn_moe_layerwise::resolve_configs(&qwen3_ffn_moe_layerwise::build_configs(
+        &model_cfg,
+        &parallel,
+        &routing,
+    ));
+    qwen3_ffn_moe_layerwise::build(name.to_string(), resolved, bridge)
+        .context("building Qwen3 AFD ffn-side model (often a missing profile.db row)")
+}
+
 /// Build ONE iter-wise arch model from its selector, boxed as `dyn`. The
 /// model-only seam the offline `iter-timing-predict` path uses (it evaluates
 /// [`IterwiseUnifiedModel`] directly, no worker/flow). The deployments do NOT box
@@ -200,4 +257,41 @@ pub fn build_iter_model(
             bridge,
         )?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The moesim-faithful comm sizes (`ref/moesim-rs/.../standard_moe.rs`): attn→ffn
+    /// is the attention output `q_dim·bpe`; ffn→attn is the QKV projection
+    /// `(q_dim + 2·kv_dim)·bpe`. Pure arithmetic on the model dims — no bridge.
+    #[test]
+    fn afd_comm_bytes_match_moesim_formulas() {
+        let model = MoeModelCfg::qwen3_235b();
+        let bpe = model.dtype.size_bytes() as u64;
+        let q_dim = model.num_qo_heads as u64 * model.head_dim as u64;
+        let kv_dim = model.num_kv_heads as u64 * model.head_dim as u64;
+
+        let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
+            &model,
+            &Qwen3AttnParallel {
+                attn_tp_size: 4,
+                gpu_name: "H200".to_string(),
+            },
+        );
+        // attn→ffn outgoing bytes: the attention output, q_dim·bpe.
+        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token, q_dim * bpe);
+        // total KV bytes: 2 (k+v) × kv_heads × head_dim × kv_dtype × layers.
+        assert_eq!(
+            attn_cfgs.total_kv_bytes_per_token,
+            2 * model.num_kv_heads as u64
+                * model.head_dim as u64
+                * model.kv_dtype.size_bytes() as u64
+                * model.num_layers as u64
+        );
+        // ffn→attn outgoing bytes (QKV projection) is the symmetric `(q+2kv)·bpe`,
+        // computed in `qwen3_ffn_moe_layerwise::build` from the same model dims.
+        let _ffn_to_attn = (q_dim + 2 * kv_dim) * bpe;
+    }
 }

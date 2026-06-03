@@ -1,9 +1,12 @@
 //! L4 ↔ L5 data contract: the per-iteration `ArchInput` a worker hands to a
 //! model_arch, plus the iter-wise query trait. See L4 design.md §3.1 / §4.1.
 //!
-//! The current iter-wise contract is used by co-located attn+ffn workers:
-//! barebone/unified, HP unified, and the PD prefill/decode worker pair. Layer-wise
-//! AFD-style `AttnArchInput` / `FfnArchInput` traits remain deferred.
+//! The iter-wise contract ([`IterwiseUnifiedModel`]) is used by co-located
+//! attn+ffn workers: barebone/unified, HP unified, and the PD prefill/decode
+//! worker pair. The layer-wise AFD contract ([`AttnLayerwiseModel`] /
+//! [`FfnLayerwiseModel`] with [`AttnArchInput`] / [`FfnArchInput`]) splits a model
+//! at the per-layer attn/ffn boundary so the two disaggregated worker pools can
+//! interleave attn-of-layer-N with ffn-of-layer-(N-1).
 
 use crate::timing::{CostManifest, LeafMetrics, SlotInput};
 
@@ -140,4 +143,151 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     fn num_attn_shards(&self) -> u16 {
         (self.gpus_per_replica() / self.num_attn_dp_groups().max(1)).max(1)
     }
+}
+
+// ── layer-wise contract (AFD) ────────────────────────────────────────────────
+//
+// AFD (attention-FFN disaggregation) splits a model at the per-layer attn/ffn
+// boundary into two independent worker pools: the attn pool computes only
+// attention; the ffn pool computes qkv / o_proj / router / MoE. Each side is a
+// separate model_arch implementing one of the two traits below. Unlike the
+// iter-wise contract (one `eval_iter` over the whole iteration), these expose
+// *per-layer* cost so the orchestrator can interleave attn-of-layer-N with
+// ffn-of-layer-(N-1). See L4 design.md §4.1 (AFD-style trait formalization) + §7.
+//
+// Both traits use the same `(slots, scratch) -> LeafMetrics` compiled-CostTree
+// protocol as `IterwiseUnifiedModel::eval_iter`: each cost method compiles its own
+// small CostTree at build, then per call fills `slots` (cleared + resized to that
+// group's slot count) and aggregates. The `slot_input` capture (`*_with_inputs`)
+// and per-group cost_log `CostManifest` accessors are deferred until layer-wise
+// cost_log is wired; when added they mirror the iter-wise
+// `eval_iter_with_inputs` / `cost_log_manifest` shape.
+
+/// Attn-side per-iteration input: one [`ArchGroupInput`] per attention DP shard.
+/// The attn worker fans its attention out over these groups (`max` over shards).
+/// This is the `groups` half of [`UnifiedArchInput`], with no ffn routing view.
+#[derive(Clone, Debug, Default)]
+pub struct AttnArchInput {
+    pub groups: Vec<ArchGroupInput>,
+}
+
+/// Ffn-side per-iteration input. Carries the per-DP-shard token view (driving the
+/// qkv / o_proj fan-out) whose pooled total drives router / MoE / lm_head. Routing
+/// distribution is NOT here: it is a build-time `RoutingDistribution` baked into
+/// the model at `build_configs` (see `qwen3_moe_dp_attn_ep_ffn`), so the per-iter
+/// cost only needs token counts. (Hence no `tokens_per_source_rank` field — the
+/// MoE cost path never read it; it derives `m_total` / `m_per_rank` from `groups`.)
+#[derive(Clone, Debug, Default)]
+pub struct FfnArchInput {
+    pub groups: Vec<ArchGroupInput>,
+}
+
+/// Attn-side layer-wise query face (AFD attn worker). Attention is the only
+/// per-layer group on this side, so a single cost method. `&AttnArchInput` is
+/// concrete (no `dyn`); L5 binds via `<M: AttnLayerwiseModel>`.
+pub trait AttnLayerwiseModel: Send + Sync + 'static {
+    fn num_layers(&self) -> u32;
+
+    /// Independent attention DP shards (one `Batch` per shard). A single attn-TP
+    /// group returns 1 (default); a DP-attention arch returns `ep_size / attn_tp`.
+    fn num_attn_dp_groups(&self) -> u16 {
+        1
+    }
+
+    /// GPUs one replica of the attn side spans (`attn_tp_size × num_attn_dp_groups`).
+    fn gpus_per_replica(&self) -> u16;
+
+    /// GPUs one attention shard spans (its attn-TP degree). Derived; L5/L6 only read.
+    fn num_attn_shards(&self) -> u16 {
+        (self.gpus_per_replica() / self.num_attn_dp_groups().max(1)).max(1)
+    }
+
+    /// **Total** KV-cache bytes one token occupies (all layers / KV heads / attn
+    /// ranks). Sizes the attn worker's `KvPool` (same definition as the iter-wise
+    /// `total_kv_bytes_per_token`).
+    fn total_kv_bytes_per_token(&self) -> u64;
+
+    /// Bytes the attn side emits per token to the ffn side after a layer's
+    /// attention (the attention output, `q_dim · bpe`). The attn worker attaches
+    /// `this × tokens` to its handoff; the ffn receiver reads it off the message —
+    /// it never recomputes the size. Only the *outgoing* direction lives here.
+    fn attn_to_ffn_bytes_per_token(&self) -> u64;
+
+    /// Per-layer attention cost over the compiled CostTree: stream each leaf's
+    /// [`LeafMetrics`] into `slots` (cleared + resized to this group's slot count),
+    /// then aggregate. `.m.time_ms` is the attention compute time for `layer_idx`.
+    /// Same buffer protocol as [`IterwiseUnifiedModel::eval_iter`].
+    fn attn_cost(
+        &self,
+        layer_idx: usize,
+        batch: &AttnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics;
+}
+
+/// Ffn-side layer-wise query face (AFD ffn worker). Per layer there are two
+/// groups — pre-attn (`qkv`) and post-attn (`o_proj` + router + MoE) — plus an
+/// iteration prologue (embedding) and epilogue (final_norm + lm_head).
+///
+/// The Bridge / Bootstrap / Terminal fused-kernel split (L4 §4.1): the ffn side's
+/// physical mid-layer kernel fuses post-attn-of-L with pre-attn-of-(L+1). The
+/// split convention impls follow:
+///   - `pre_attn_cost(0)`       = real qkv cost (layer-0 Bootstrap);
+///   - `pre_attn_cost(L > 0)`   = [`LeafMetrics::ZERO`] (the fused Bridge bills
+///                                pre(L+1) inside `post_attn_cost(L)`);
+///   - `post_attn_cost(L < last)` bills post(L) **plus** the fused pre(L+1);
+///   - `post_attn_cost(last)`     is post-only (Terminal).
+///
+/// So `Σ_L pre_attn + Σ_L post_attn` totals exactly one qkv + one o_proj + one MoE
+/// per layer — the L4 §4.1 M_form_consistency the cost-consistency test guards.
+pub trait FfnLayerwiseModel: Send + Sync + 'static {
+    fn num_layers(&self) -> u32;
+
+    /// GPUs one replica of the ffn side spans (`ep_size`).
+    fn gpus_per_replica(&self) -> u16;
+
+    /// Bytes the ffn side emits per token to the attn side (the QKV projection
+    /// output, `(q_dim + 2·kv_dim) · bpe`). The ffn worker attaches `this × tokens`
+    /// to its handoff; the attn receiver reads it off the message, never recomputes.
+    /// Only the *outgoing* direction lives here.
+    fn ffn_to_attn_bytes_per_token(&self) -> u64;
+
+    /// Pre-attention (qkv) cost for `layer_idx`. Per the split convention, layer 0
+    /// returns the real qkv cost and layers > 0 return [`LeafMetrics::ZERO`] (the
+    /// fused pre(L+1) is billed inside `post_attn_cost(L)`).
+    fn pre_attn_cost(
+        &self,
+        layer_idx: usize,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics;
+
+    /// Post-attention cost for `layer_idx` (o_proj + post_norm + router + MoE);
+    /// mid-layers additionally bill the fused pre-attn of `layer_idx + 1`, the last
+    /// layer is post-only.
+    fn post_attn_cost(
+        &self,
+        layer_idx: usize,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics;
+
+    /// Once-per-iteration prologue before the layer loop (embedding).
+    fn prologue_cost(
+        &self,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics;
+
+    /// Once-per-iteration epilogue after the layer loop (final_norm + lm_head).
+    fn epilogue_cost(
+        &self,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics;
 }

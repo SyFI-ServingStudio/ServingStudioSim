@@ -158,6 +158,27 @@ pub enum AttnArchSel {
         #[param(default = 1, cache_key)]
         head_parallel: u16,
     },
+    /// Qwen3-MoE attention side (layer-wise AFD attn pool). **One worker = one DP
+    /// shard**: attention sharded over `attn_tp_size` head-parallel ranks, with its
+    /// own KV cache and request stream. Data parallelism is the attn pool's
+    /// `replicas` (= the unified arch's `ep_size / attn_tp_size`), not an arch
+    /// param. Pairs with the `qwen3_ffn_moe` ffn arch.
+    Qwen3AttnTp {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Attention tensor-parallelism size (heads sharded across these ranks).
+        #[param(default = 4, cache_key)]
+        attn_tp_size: u16,
+    },
+}
+
+impl AttnArchSel {
+    /// The model identity/dims this arch operates on (every variant carries it).
+    pub fn model(&self) -> &ModelSpec {
+        match self {
+            Self::Llama3AttnTp { model, .. } | Self::Qwen3AttnTp { model, .. } => model,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
@@ -173,4 +194,43 @@ pub enum FfnArchSel {
         #[param(default = 8, cache_key)]
         ep_size: u16,
     },
+    /// Qwen3-MoE FFN side (layer-wise AFD ffn pool): qkv / o_proj (on the attn-TP
+    /// layout) + post_norm + router + EP MoE, plus the iteration embed / final_norm
+    /// / lm_head. Mirrors the FFN-side cost of the unified `qwen3_moe_dp_attn_ep_ffn`;
+    /// pairs with the `qwen3_attn` attn arch.
+    Qwen3FfnMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Attention tensor-parallelism size. Drives the qkv / o_proj per-rank
+        /// shape AND the MoE combine residing-group width (a token resides on its
+        /// qkv/o_proj TP group, so combine fans the reduced output back to all
+        /// `attn_tp_size` ranks). Must match the paired attn arch's `attn_tp_size`.
+        #[param(default = 4, cache_key)]
+        attn_tp_size: u16,
+        /// Expert-parallelism size (FFN expert ranks; spans the whole replica).
+        /// `num_dp_groups = ep_size / attn_tp_size`.
+        #[param(default = 8, cache_key)]
+        ep_size: u16,
+        /// NVLink-domain size — partitions `ep_size` ranks into NVL domains for the
+        /// intra/inter split of MoE dispatch/combine.
+        #[param(default = 8, cache_key)]
+        nvl_num_gpu: u16,
+        /// Expert routing distribution: `uniform` (default) or `random` (seeded by
+        /// `routing_seed`). Drives the L2 MoE dispatch/combine simulation.
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        /// Seed for `routing = random` (ignored for `uniform`).
+        #[serde(default)]
+        routing_seed: Option<u64>,
+    },
+}
+
+impl FfnArchSel {
+    /// The model identity/dims this arch operates on (every variant carries it).
+    pub fn model(&self) -> &ModelSpec {
+        match self {
+            Self::DeepseekFfnMoe { model, .. } | Self::Qwen3FfnMoe { model, .. } => model,
+        }
+    }
 }
