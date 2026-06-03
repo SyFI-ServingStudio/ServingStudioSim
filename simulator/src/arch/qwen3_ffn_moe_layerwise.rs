@@ -72,6 +72,7 @@ pub struct Qwen3FfnMoeLayerwiseModel {
     pub name: String,
     pub num_layers: u32,
     pub ep_size: u16,
+    /// Derived at build (`ep_size / attn_tp_size`), cached for the cost-tree fan-out.
     pub num_dp_groups: u16,
     pub top_k: u32,
     pub ffn_to_attn_bytes_per_token: u64,
@@ -186,6 +187,7 @@ pub fn build_configs(
         parallel.ep_size,
         parallel.attn_tp_size,
     );
+    // Derived, not configured: DP shards the ffn side pools.
     let num_dp_groups = parallel.ep_size / parallel.attn_tp_size;
     assert!(parallel.nvl_num_gpu > 0, "nvl_num_gpu must be non-zero");
     assert!(
@@ -615,6 +617,11 @@ impl FfnLayerwiseModel for Qwen3FfnMoeLayerwiseModel {
     /// One ffn replica spans the EP group — `ep_size` GPUs.
     fn gpus_per_replica(&self) -> u16 {
         self.ep_size
+    }
+
+    /// DP shards pooled by the ffn side (derived `ep_size / attn_tp_size` at build).
+    fn num_dp_groups(&self) -> u16 {
+        self.num_dp_groups
     }
 
     fn ffn_to_attn_bytes_per_token(&self) -> u64 {

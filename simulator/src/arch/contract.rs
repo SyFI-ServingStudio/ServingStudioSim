@@ -247,6 +247,16 @@ pub trait FfnLayerwiseModel: Send + Sync + 'static {
     /// GPUs one replica of the ffn side spans (`ep_size`).
     fn gpus_per_replica(&self) -> u16;
 
+    /// Number of attention DP shards the ffn side pools. NOT a configurable knob:
+    /// only `attn_tp_size` + `ep_size` are configured, and `build_configs` derives
+    /// this as `ep_size / attn_tp_size` (with the `ep_size % attn_tp_size == 0`
+    /// assert) and caches it — this accessor just exposes the resolved value. The
+    /// ffn worker partitions its workload across this many groups before costing
+    /// (post_norm + router + MoE home-reduce run replicated per shard on its own
+    /// token slice — the `Max` fan-out that models DP load imbalance). L5 (the
+    /// worker) owns the partition; L6 only hands over the total workload.
+    fn num_dp_groups(&self) -> u16;
+
     /// Bytes the ffn side emits per token to the attn side (the QKV projection
     /// output, `(q_dim + 2·kv_dim) · bpe`). The ffn worker attaches `this × tokens`
     /// to its handoff; the attn receiver reads it off the message, never recomputes.
