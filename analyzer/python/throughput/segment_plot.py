@@ -20,7 +20,7 @@ from functools import partial
 from pathlib import Path
 from typing import Callable
 
-from common.figure import corner_box, finalize, fmt_value, new_axes
+from common.figure import add_legend, corner_box, finalize, fmt_value, new_axes
 from common.style import ACCENT, CURVE, MARKER
 
 # Per-series line colors: total is the primary curve, prefill/decode the accents.
@@ -105,7 +105,7 @@ def _render_view(
     corner_box(ax, [f"avg = {_tps(avg.get('total', 0.0))}", f"peak = {_tps(peak_total)}"],
                loc="upper right")
     ax.set_ylim(bottom=0.0, top=max(1.0, peak_total * 1.08))
-    ax.legend(loc="upper left", frameon=False)
+    add_legend(ax)
     finalize(
         fig, ax, out_path,
         title=title, xlabel="sim time (s)", ylabel="tokens / s per GPU", run_label=run_label,

@@ -16,6 +16,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+mod batch;
 mod breakdown;
 mod cdf;
 mod io;
@@ -25,6 +26,7 @@ mod request;
 mod session;
 mod throughput;
 mod trace;
+mod utilization;
 
 use io::{payload_path, read_deployment, report_path, write_json, SCHEMA_VERSION};
 use session::build_session;

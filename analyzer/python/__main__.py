@@ -13,8 +13,10 @@ from functools import partial
 from pathlib import Path
 from typing import Callable
 
+from batch import scatter_plot
 from request import slo_plot
 from throughput import segment_plot
+from utilization import util_plot
 
 # Keys match the analyzer subjects (registry.rs). Both SLO subjects share one
 # renderer, bound to their respective payload file.
@@ -22,6 +24,8 @@ RENDERERS = {
     "slo-general": partial(slo_plot.render, payload_name="slo_general_cdf.json"),
     "slo-detailed": partial(slo_plot.render, payload_name="slo_detailed_cdf.json"),
     "throughput": segment_plot.render,
+    "utilization": util_plot.render,
+    "batch": scatter_plot.render,
 }
 
 

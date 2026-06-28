@@ -76,6 +76,15 @@ def corner_box(ax, lines: list[str], *, loc: str = "upper left") -> None:
     )
 
 
+def add_legend(ax, *, loc: str = "best") -> None:
+    """Frameless axes legend. Defaults to `"best"` — matplotlib picks the
+    lowest-overlap spot among the data artists, avoiding the fixed-corner
+    collisions a busy curve causes. Use this instead of a raw `ax.legend(...)` so
+    legends look uniform across plots. (`"best"` only dodges curves, not a
+    `corner_box`; if both crowd one corner, pin this `loc` to the opposite side.)"""
+    ax.legend(loc=loc, frameon=False)
+
+
 def finalize(
     fig, ax, out_path: Path, *,
     title: str, xlabel: str, ylabel: str,
