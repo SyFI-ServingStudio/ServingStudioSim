@@ -427,6 +427,7 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         num_output_tokens: rec.tokens_emitted,
         tpot_mean_ms,
         finish_decode_time_ms,
+        prefill_processed: rec.prefill_processed,
     }
 }
 

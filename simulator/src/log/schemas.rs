@@ -190,6 +190,13 @@ pub fn request_slo_schema() -> Arc<Schema> {
         Field::new("tpot_p99_ms", DataType::Float32, true),
         Field::new("tpot_max_ms", DataType::Float32, true),
         Field::new("finish_decode_time_ms", DataType::Float32, true),
+        // Terminal prefill length (`= RequestRecord::prefill_processed`): tokens
+        // prefilled for this request by the time the row was written (full prompt
+        // for a completed request, partial for a sim-end-flush still in prefill).
+        // Appended last (append-only, old readers unaffected). Pairs with
+        // `num_output_tokens` to give per-request (p, d) for the
+        // `workload_conservation` analyzer's expected-work closed forms.
+        Field::new("prefill_processed", DataType::UInt32, false),
     ]))
 }
 

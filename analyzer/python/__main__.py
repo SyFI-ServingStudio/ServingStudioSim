@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from batch import scatter_plot
+from conservation import workload_plot
 from request import slo_plot
 from throughput import segment_plot
 from utilization import util_plot
@@ -26,6 +27,7 @@ RENDERERS = {
     "throughput": segment_plot.render,
     "utilization": util_plot.render,
     "batch": scatter_plot.render,
+    "workload-conservation": workload_plot.render,
 }
 
 

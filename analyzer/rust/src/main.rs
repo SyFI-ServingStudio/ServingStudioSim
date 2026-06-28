@@ -19,6 +19,7 @@ use serde_json::json;
 mod batch;
 mod breakdown;
 mod cdf;
+mod conservation;
 mod io;
 mod perfetto;
 mod registry;

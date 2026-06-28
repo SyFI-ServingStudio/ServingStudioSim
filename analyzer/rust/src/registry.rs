@@ -12,6 +12,7 @@ use datafusion::prelude::SessionContext;
 use serde_json::Value;
 
 use crate::batch;
+use crate::conservation;
 use crate::request;
 use crate::throughput;
 use crate::utilization;
@@ -32,6 +33,9 @@ pub enum Category {
     /// Per-batch (per-iteration) composition over time, from `cost_log`. Tier-1,
     /// deployment-agnostic.
     Batch,
+    /// Run-wide work-accounting invariants — `cost_log` actuals vs `request_slo`
+    /// per-request expected. Tier-1, deployment-agnostic.
+    Conservation,
 }
 
 impl Category {
@@ -41,6 +45,7 @@ impl Category {
             Category::Throughput => "throughput",
             Category::Utilization => "utilization",
             Category::Batch => "batch",
+            Category::Conservation => "conservation",
         }
     }
 }
@@ -128,6 +133,15 @@ pub const SUBJECTS: &[Subject] = &[
         payload_name: "batch_scatter.json",
         applies: Applies::All,
     },
+    Subject {
+        name: "workload-conservation",
+        category: Category::Conservation,
+        description: "Run-wide work accounting: cost_log prefill/decode/FFN/KV actuals vs \
+                      request_slo per-request expected (pass/fail).",
+        report_name: "workload_conservation_report.json",
+        payload_name: "workload_conservation_checks.json",
+        applies: Applies::All,
+    },
 ];
 
 /// Human-readable catalog for `analyze list` — one aligned line per subject:
@@ -161,6 +175,7 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
         "throughput" => throughput::segment::run_throughput(ctx, dir).await,
         "utilization" => utilization::series::run_utilization(ctx, dir).await,
         "batch" => batch::composition::run_batch(ctx, dir).await,
+        "workload-conservation" => conservation::workload::run_workload(ctx, dir).await,
         other => bail!("unknown analyzer subject {other:?}"),
     }
 }

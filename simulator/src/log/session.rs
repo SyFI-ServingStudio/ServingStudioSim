@@ -202,6 +202,7 @@ mod tests {
             num_output_tokens: num,
             tpot_mean_ms: None,
             finish_decode_time_ms: finish,
+            prefill_processed: 0,
         }
     }
 

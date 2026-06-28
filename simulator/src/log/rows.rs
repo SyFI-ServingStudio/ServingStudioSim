@@ -60,6 +60,11 @@ pub struct RequestSloEntry {
     /// Absolute sim-time (ms) of the final output token (= `last_token_time`),
     /// so E2E = `finish - arrival` survives `log_output_token_times` off.
     pub finish_decode_time_ms: Option<f32>,
+    /// Terminal prefill length (`= RequestRecord::prefill_processed`): the `p` in
+    /// the `workload_conservation` expected-work closed forms (`num_output_tokens`
+    /// is the matching `d`). Full prompt for a completed request, partial for a
+    /// sim-end-flush still in prefill.
+    pub prefill_processed: u32,
     // Multi-round / session columns are deliberately NOT carried here today.
     // The current request lifecycle is single-round, so `session_id`,
     // `round_idx`, `total_rounds`,
@@ -388,6 +393,7 @@ pub(crate) fn slo_to_record_batch(
     // `slo-general` scalars are sim-computed (independent of the per-token array,
     // which is empty when `log_output_token_times` is off).
     let num_tokens: Vec<u32> = entries.iter().map(|e| e.num_output_tokens).collect();
+    let prefill_processed: Vec<u32> = entries.iter().map(|e| e.prefill_processed).collect();
     let ttft: Vec<Option<f32>> = entries.iter().map(|e| e.ttft_ms).collect();
     let finish_decode: Vec<Option<f32>> = entries.iter().map(|e| e.finish_decode_time_ms).collect();
     let tpot_mean: Vec<Option<f32>> = entries.iter().map(|e| e.tpot_mean_ms).collect();
@@ -436,6 +442,7 @@ pub(crate) fn slo_to_record_batch(
             Arc::new(Float32Array::from(tpot_p99)),
             Arc::new(Float32Array::from(tpot_max)),
             Arc::new(Float32Array::from(finish_decode)),
+            Arc::new(UInt32Array::from(prefill_processed)),
         ],
     )?)
 }
@@ -465,6 +472,7 @@ mod tests {
             num_output_tokens: num,
             tpot_mean_ms: tpot_mean,
             finish_decode_time_ms: finish,
+            prefill_processed: 0,
         }
     }
 
