@@ -1,56 +1,57 @@
 //! `DisaggAttnWorker` — the attn half of an AFD (attention-FFN disaggregation)
 //! deployment. It owns ONLY the per-layer attention kernel + the KV cache for its
 //! DP shard; everything else (qkv / o_proj / router / MoE) lives on the ffn side.
+//! Completion is NOT decided here (D16): the ffn Terminal owns it and the flow
+//! routes a `Release`; the worker just drops the KV.
 //!
-//! **One worker = one DP shard, one shared KV pool** (D4/D11). It runs a **circular
-//! 3-slot pipeline** with a single `head` pointer (ported faithfully from
-//! `ref/moesim-rs` attn_worker), so attn compute overlaps the attn↔ffn pull:
+//! **One worker = one DP shard, one shared KV pool** (D4/D11). It runs **three
+//! pipelined slots**, each a persistent micro-batch walking the layers through
+//! `Wait → WaitComplete → Pull → PullComplete → Compute`. The slots overlap one
+//! attn↔ffn pull against one attention compute: explicit resource gates admit at
+//! most one slot to `Pull` and one to `Compute` at a time (ref `attn_worker`
+//! serialises the same way off a rotating `head` pointer; this port drops the head
+//! for stateless gates, which compose cleanly with dormant empty slots — below).
 //!
-//!   `head` = Compute slot · `head+1` = Pull slot · `head+2` = Wait slot
+//! **attn-initiated iteration** (diverges from ref's ffn-driven `submit_arrival`):
+//! when a slot reaches layer-0 with members it emits `IterStart` (once per
+//! iteration, guarded by `iter_announced`), which the controller aggregates across
+//! workers to trigger the ffn prolog (embed + layer-0 QKV). The prolog's layer-0
+//! QKV returns as a `ReadyNotification { slot, 0 }` — the SAME slot-addressed
+//! message as every later layer (no special bootstrap path). Notifications are
+//! **slot-addressed**: the worker owns slot assignment, stamps the tag on each
+//! `IterStart` / `AttnLayerOutputsReady`, and L6 echoes it back, so a handshake
+//! routes to a slot in O(1) (no request set on the wire).
 //!
-//! Notifications are **slot-addressed**: the worker owns slot assignment, stamps
-//! the slot tag on each `AttnLayerOutputsReady`, and L6 echoes it in the next
-//! `ReadyNotification`, so the per-layer handshake routes to a slot in O(1) (no
-//! request set on the wire) and readiness is a single per-slot flag. (The layer-0
-//! bootstrap tag round-trip is a Phase-4 flow concern; the worker assumes a live
-//! tag.)
-//!
-//! Each slot is a persistent micro-batch walking the layers through the state
-//! machine `Wait → WaitComplete → Pull → PullComplete → Compute → LayerDone`. The
-//! head only advances (`(head+1)%3`) when its slot reaches `LayerDone`, rotating
-//! the just-computed slot to the back. All three slots are **always in the ring**:
-//! an empty slot is `input_ready` by definition, so it flows through as a no-op
-//! (instant 0-byte pull, instant empty compute) to let the head rotate past it.
-//! A non-empty slot waiting for its layer notification is *not* `input_ready`, so
-//! it stalls in `Wait` and halts the rotation when the head reaches it — that
-//! notification gate is what paces the ring and bounds empty-slot churn. A fully
-//! idle worker (no live reqs, nothing pending) does no work at all.
+//! **Empty slots stay dormant** (diverges from ref's `deferred_empty_advance`
+//! lockstep): a slot with no members sits at layer-0 `Wait` doing nothing — it does
+//! NOT cycle the layers. Cross-worker lockstep is the controller's job: it holds the
+//! per-layer flush barrier over exactly the workers whose slot has members (those
+//! that emitted `IterStart`), so empty slots need no per-layer churn. A decode
+//! iteration loops by the slot wrapping to layer-0 and re-emitting `IterStart`; a
+//! slot whose members all complete (Released) drops back to dormant.
 //!
 //! Admission is the shared two-level scheme (ref / hp_unified): `Admit` only
-//! enqueues to `worker_pending` (Level-1); each tick `drain_pending_admits`
-//! (Level-2) runs the projected-peak KV gate (`KvAdmission::try_admit`) head-of-
-//! line — a rejected request blocks the queue and retries when a `Release` frees
-//! KV, never "admit + warn". An admitted request reserves its FULL footprint
-//! (`prompt_len + prefix_kv + decode_len`, since AFD prefill is NOT done at admit)
-//! in `promised`, picks its least-KV slot (`wlb`), and lands in that slot's
-//! `pending_insert`. It joins `reqs` at the slot's next layer-0 activation.
+//! enqueues to `worker_pending` (Level-1, ref `enqueue_to_pending`); each tick
+//! `drain_pending_admits` (Level-2, ref `drain_worker_pending_to_batches`) runs the
+//! projected-peak KV gate head-of-line — a rejected request blocks the queue and
+//! retries when a `Release` frees KV, never "admit + warn". An admitted request
+//! reserves its FULL footprint (`prompt_len + prefix_kv + decode_len`, since AFD
+//! prefill is NOT done at admit) in `promised`, picks its least-KV slot (`wlb`), and
+//! lands in that slot's `pending_insert`. It joins `reqs` at the slot's next layer-0
+//! iteration open.
 //!
 //! KV accounting is two-phase. `promised` holds reserved-but-not-resident KV;
 //! `Batch` (the shared shard KV pool + decode set) holds resident KV. A request
-//! leaves `promised` and enters `Batch.decodes` (`finalize_to_decode`) at its
-//! prefill→decode boundary: a prefilled handoff (`!is_prefill()` at admit) at
-//! activation; a fresh prefill at the last layer of its prefill pass. The
-//! prefill/decode **discriminator**, though, is the request's authoritative store
-//! status (`is_prefill()`, which the ffn Terminal advances at the boundary), NOT
-//! `promised` membership — `promised` is the reserved-KV admission accounting only.
-//! (This attn worker still never writes the store; the ffn owns the status flip.)
-//! A decode token then adds one KV slot per
-//! request **per iteration**, applied via `advance_subset` exactly when a slot
-//! finishes its **last** layer (the iteration boundary) — per layer would
-//! over-count by `num_layers`.
-//!
-//! Completion is NOT decided here (D16): the ffn Terminal owns it and the flow
-//! routes a `Release`; the worker just drops the KV.
+//! leaves `promised` and enters `Batch.decodes` (`begin_decode`, ref
+//! `finalize_to_decode`) at its prefill→decode boundary: a prefilled handoff
+//! (`!is_prefill()` at admit) at activation; a fresh prefill at the last layer of its
+//! prefill pass. The prefill/decode **discriminator** is the request's authoritative
+//! store status (`is_prefill()`, which the ffn Terminal advances at the boundary),
+//! NOT `promised` membership — `promised` is the reserved-KV admission accounting
+//! only. (This attn worker never writes the store; the ffn owns the status flip.) A
+//! decode token adds one KV slot per request **per iteration**, applied via
+//! `advance_subset` exactly when a slot finishes its **last** layer — per layer
+//! would over-count by `num_layers`.
 //!
 //! Reading order: types → construction → message handling (the `IterWorker` entry
 //! points) → the tick / pipeline loop → its helpers, each following the function
@@ -69,17 +70,17 @@ use crate::worker::types::{AttnWorkerEvent, AttnWorkerMsg, WorkerConfig, WorkerS
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
-/// Pipeline depth — circular slots overlapping pull against compute (ref fixes 3).
+/// Pipeline depth — slots overlapping pull against compute (ref fixes 3).
 const NUM_SLOTS: usize = 3;
 
-/// Per-slot pipeline stage (ref `BatchState`). A slot owns exactly one compute /
-/// pull resource only while at `Compute` / `Pull`, and the head-relative
-/// transitions guarantee ≤1 of each across the worker.
+/// Per-slot pipeline stage (ref `BatchState`). The single-pull / single-compute
+/// invariant is enforced by the worker's resource gates in `try_transitions`, not
+/// by a head pointer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlotState {
-    /// Waiting for this layer's notification (or empty ⇒ trivially ready).
+    /// Waiting for this layer's `ReadyNotification` (dormant if the slot is empty).
     Wait,
-    /// Notification in hand (or empty); ready to pull.
+    /// Notification in hand; ready to pull.
     WaitComplete,
     /// QKV input for `current_layer` is transferring.
     Pull,
@@ -87,26 +88,26 @@ enum SlotState {
     PullComplete,
     /// Attention for `current_layer` is running.
     Compute,
-    /// Layer finished (output emitted); waiting for the head to rotate it on.
-    LayerDone,
 }
 
 struct Slot {
-    /// Micro-batch membership. Empty ⇒ an idle slot that still rides the ring as a
-    /// no-op. Grows at layer-0 activation, shrinks as requests are released.
+    /// Micro-batch membership. Empty ⇒ a dormant slot (no work until `pending_insert`
+    /// brings it members at a layer-0 open). Grows at the layer-0 iteration open,
+    /// shrinks as completed requests are Released.
     reqs: Vec<RequestId>,
-    /// Admitted (Level-2) and assigned here, awaiting this slot's next layer-0
-    /// activation to join `reqs`.
+    /// Admitted (Level-2) and assigned here, awaiting this slot's next layer-0 open
+    /// to join `reqs`.
     pending_insert: Vec<RequestId>,
-    /// The layer this slot is processing (advances `(cur + 1) % num_layers` at
-    /// `LayerDone`). Used only to match notifications, never to order the ring.
+    /// The layer this slot is processing (advances `(cur + 1) % num_layers` when a
+    /// compute finishes). Matches incoming notifications.
     current_layer: u16,
-    /// Set true when layer-0 pull starts (membership locked for this iteration);
-    /// reopened when the slot wraps back to layer 0.
-    closed: bool,
+    /// Set once this iteration's `IterStart` is emitted — it both locks membership
+    /// (no late `pending_insert` join mid-iteration) and dedups the announce. Cleared
+    /// when the slot wraps to layer 0, reopening the next iteration (a decode
+    /// loop-back re-announces).
+    iter_announced: bool,
     state: SlotState,
-    /// Slot-level notification flag (D-H): the whole micro-batch's layer input is
-    /// ready. Empty slots are treated as notified (`input_ready`).
+    /// Slot-level notification flag: this layer's QKV input is ready to pull.
     notified: bool,
     /// Pull descriptor carried from the notification until `start_pull` consumes it.
     pull_send_gid: u16,
@@ -122,7 +123,7 @@ impl Slot {
             reqs: Vec::new(),
             pending_insert: Vec::new(),
             current_layer: 0,
-            closed: false,
+            iter_announced: false,
             state: SlotState::Wait,
             notified: false,
             pull_send_gid: 0,
@@ -132,10 +133,11 @@ impl Slot {
         }
     }
 
-    /// This slot's layer input is ready, so it may leave `Wait`: its notification
-    /// has arrived — or it is empty (empty batches never block; ref `all_notified`).
+    /// This slot may leave `Wait`: it has members AND this layer's QKV notification
+    /// has arrived (ref `all_notified`, minus the empty-slot short-circuit — empty
+    /// slots stay dormant, lockstep is the controller's barrier, not slot churn).
     fn input_ready(&self) -> bool {
-        self.reqs.is_empty() || self.notified
+        !self.reqs.is_empty() && self.notified
     }
 }
 
@@ -145,7 +147,8 @@ pub struct DisaggAttnWorker<M: AttnLayerwiseModel> {
     requests: SharedRequests,
     config: WorkerConfig,
     cluster: SharedGpuCluster,
-    /// This shard's recv endpoint — the QKV pull from the ffn lands here.
+    /// This shard's recv endpoint — the QKV pull from the ffn lands here, and it
+    /// doubles as the send endpoint the ffn pulls attention outputs from.
     recv_gid: u16,
     /// One shard-level `Batch` shared across all slots (the slots are pipelined
     /// micro-batches, NOT DP shards — D11). It bundles the KV pool with the
@@ -153,14 +156,12 @@ pub struct DisaggAttnWorker<M: AttnLayerwiseModel> {
     /// only. Reserved-not-resident KV lives in `promised`.
     batch: Batch,
     slots: [Slot; NUM_SLOTS],
-    /// Pipeline head: `head` = Compute slot, `head+1` = Pull, `head+2` = Wait.
-    head: usize,
     /// Level-1 admission backlog (FIFO). Drained under the KV gate each tick.
     worker_pending: VecDeque<RequestId>,
     /// Reserved-but-not-resident KV per request (full footprint). Admission
     /// accounting only — feeds the `try_admit` group-promised total; a request
-    /// leaves it at `finalize_to_decode`. (NOT the prefill/decode discriminator:
-    /// that is the request's store `is_prefill()` status.)
+    /// leaves it at `begin_decode`. (NOT the prefill/decode discriminator: that is
+    /// the request's store `is_prefill()` status.)
     promised: HashMap<RequestId, u64>,
     /// Sticky request → slot routing (set at admission; survives decode re-entry).
     request_to_slot: HashMap<RequestId, usize>,
@@ -202,7 +203,6 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             recv_gid,
             batch: Batch::new(0, kv_capacity),
             slots: std::array::from_fn(|_| Slot::new()),
-            head: 0,
             worker_pending: VecDeque::new(),
             promised: HashMap::new(),
             request_to_slot: HashMap::new(),
@@ -215,7 +215,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
 // ── message handling (entry points) ─────────────────────────────────────────────
 //
 // The worker's whole external surface: `enqueue` receives the three messages
-// (`Admit` / `ReadyNotification` / `Release`) and dispatches each to a helper;
+// (`Admit` / `ReadyNotification` / `Release`) and dispatches each to a handler;
 // `tick` drives the slot pipeline. Everything below this block is the body those
 // two methods call into.
 
@@ -256,11 +256,10 @@ impl<M: AttnLayerwiseModel> IterWorker for DisaggAttnWorker<M> {
 impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
     // ── admission entry: Admit / Release ─────────────────────────────────────────
 
-    /// Level-1 enqueue (ref `enqueue_to_pending`): record the request as pending.
-    /// No KV is reserved yet — the projected-peak gate runs at the Level-2 drain so
-    /// a rejected request blocks the queue instead of being force-admitted.
-    /// Idempotent: a re-`Admit` of a request already pending / promised / placed is
-    /// dropped.
+    /// Level-1 enqueue (ref `enqueue_to_pending`): record the request as pending. No
+    /// KV is reserved yet — the projected-peak gate runs at the Level-2 drain so a
+    /// rejected request blocks the queue instead of being force-admitted. Idempotent:
+    /// a re-`Admit` of a request already pending / promised / placed is dropped.
     fn on_msg_admit(&mut self, req: RequestId) {
         let known = self.worker_pending.contains(&req)
             || self.promised.contains_key(&req)
@@ -270,9 +269,9 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         }
     }
 
-    /// Drop a completed request's KV (the ffn Terminal completed it; the flow
-    /// routed the release here). Removes it from every level it can sit at; a slot
-    /// that empties stays in the ring (it just rides as a no-op).
+    /// Drop a completed request's KV (the ffn Terminal completed it; the flow routed
+    /// the release here). Removes it from every level it can sit at; a slot that
+    /// empties drops back to dormant.
     fn on_msg_release(&mut self, req: RequestId) {
         if let Some(current_kv) = self
             .batch
@@ -289,16 +288,22 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             let s = &mut self.slots[slot_idx];
             s.reqs.retain(|&r| r != req);
             s.pending_insert.retain(|&r| r != req);
+            // A slot emptied by release drops back to dormant: clear `iter_announced`
+            // so the next members admitted into it reopen the iteration (otherwise the
+            // stale announce flag would block `open_iterations`).
+            if s.reqs.is_empty() {
+                s.iter_announced = false;
+            }
         }
     }
 
-    /// Slot-addressed notification (D-H): the micro-batch in slot `slot` has its
-    /// layer input ready. Routed in O(1) by the tag L6 echoed back — no request
-    /// resolution, a single per-slot `notified` flag (the whole notification IS the
-    /// slot). The ffn drives layers in lockstep (layer L's QKV is produced only
-    /// after the attn emits layer L-1), so a notification ALWAYS finds its slot
-    /// already waiting at exactly that layer — there is no out-of-order arrival to
-    /// buffer. A mismatch is a tag / protocol violation, not a retry.
+    /// Slot-addressed notification: the micro-batch in slot `slot` has its layer-input
+    /// QKV ready to pull from `send_gid`. Routed in O(1) by the tag L6 echoed back —
+    /// no request resolution, a single per-slot `notified` flag. The ffn drives layers
+    /// in lockstep (layer L's QKV is produced only after the attn emits layer L-1), so
+    /// a notification ALWAYS finds its slot already waiting at exactly that layer —
+    /// there is no out-of-order arrival to buffer. A mismatch is a tag / protocol
+    /// violation, not a retry.
     fn on_msg_ready_notification(&mut self, slot: usize, layer: u16, send_gid: u16, bytes: u64) {
         let Some(s) = self.slots.get_mut(slot) else {
             debug_assert!(false, "notification slot tag {slot} out of range");
@@ -322,31 +327,21 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
     // ── tick & pipeline loop ─────────────────────────────────────────────────────
 
     fn tick_inner(&mut self, now: Time, events: &mut Vec<AttnWorkerEvent>) -> Option<Time> {
-        // Idle guard: with no live reqs and nothing queued there is no work
-        // to pace the ring, so empty slots must not churn — do nothing.
+        // Idle guard: no admits pending and no slot holding (or about to hold) a
+        // request ⇒ nothing to do. Dormant empty slots make no transition, so the
+        // fixpoint below cannot churn an idle worker.
         if !self.has_work() {
             return None;
         }
         self.drain_pending_admits();
-        // The ring is paced by non-empty slots. If the drain landed nothing in a slot
-        // — the head-of-line admit was KV-blocked, or the request had no decode work
-        // left (`remaining == 0`) and was dropped — every slot is empty, and running
-        // the loop would spin the empty ring forever (each empty slot rotates as an
-        // instant no-op with no notification gate to stop it). Bail; a later Release /
-        // Notification re-ticks us once there is real slot work. (The entry guard does
-        // not cover this: it can pass on `worker_pending` alone, which the drain may
-        // then empty without placing anything.)
-        if !self.has_slot_work() {
-            return None;
-        }
-        // Pipeline to a fixpoint. Each pass mirrors ref's step() + advance_batch_layer:
-        // activate → completions → head transitions → rotate head.
+        // Fixpoint: open each layer-0 iteration (activate admits + announce
+        // `IterStart`), settle event-time completions, then start the next pull /
+        // compute under the single-pull / single-compute gates.
         loop {
             let mut progressed = false;
-            progressed |= self.activate_slots();
+            progressed |= self.open_iterations(events);
             progressed |= self.advance_completions(now, events);
             progressed |= self.try_transitions(now);
-            progressed |= self.rotate_head();
             if !progressed {
                 break;
             }
@@ -354,19 +349,14 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         self.next_wakeup(now)
     }
 
-    /// Any work that should drive the ring? Empty slots alone (idle worker) must
-    /// not — they would churn forever with no notification gate to pace them.
+    /// A request is queued (an admit to drain) or a slot holds / is about to hold one.
+    /// Empty dormant slots alone are NOT work — they make no transition.
     fn has_work(&self) -> bool {
-        !self.worker_pending.is_empty() || self.has_slot_work()
-    }
-
-    /// A slot holds (or is about to hold) a request — the only thing that paces the
-    /// ring. `worker_pending` alone does NOT: a drained-to-nothing or KV-blocked
-    /// backlog leaves the slots empty, and an empty ring must not churn.
-    fn has_slot_work(&self) -> bool {
-        self.slots
-            .iter()
-            .any(|s| !s.reqs.is_empty() || !s.pending_insert.is_empty())
+        !self.worker_pending.is_empty()
+            || self
+                .slots
+                .iter()
+                .any(|s| !s.reqs.is_empty() || !s.pending_insert.is_empty())
     }
 
     /// Level-2 drain (ref `drain_worker_pending_to_batches`): admit from the head of
@@ -414,7 +404,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
 
     /// Least-KV slot (D-D): the load balancer balances reserved+resident KV across
     /// slots (the user's metric; ref balances request count). Ties pick the lowest
-    /// index — irrelevant to ordering, slots are addressed by identity only.
+    /// index — irrelevant, slots are addressed by identity only.
     fn wlb_choose_least_kv(&self) -> usize {
         (0..NUM_SLOTS)
             .min_by_key(|&i| self.slot_kv_load(i))
@@ -439,35 +429,65 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             .unwrap_or_else(|| self.current_kv(rid))
     }
 
-    /// Activate layer-0 slots (ref :435): once a slot is back at layer 0 and open,
-    /// its `pending_insert` joins `reqs`. A prefilled handoff (`!is_prefill()`)
-    /// becomes resident decode now; a fresh prefill stays in `promised` until the
-    /// last layer of its prefill pass.
-    fn activate_slots(&mut self) -> bool {
+    /// Open each layer-0 slot's iteration (ref :435 activate + the attn-initiated
+    /// announce, D4): drain admitted `pending_insert` into `reqs` (a prefilled handoff
+    /// becomes resident decode now; a fresh prefill stays in `promised` until its last
+    /// prefill layer), then emit `IterStart` once so the controller can trigger the
+    /// ffn prolog. `iter_announced` locks membership + dedups the announce, so a slot
+    /// announces exactly once per iteration (fresh open or decode loop-back).
+    fn open_iterations(&mut self, events: &mut Vec<AttnWorkerEvent>) -> bool {
         let mut progressed = false;
         for idx in 0..NUM_SLOTS {
             let s = &self.slots[idx];
-            if !(s.current_layer == 0
-                && !s.closed
-                && s.state == SlotState::Wait
-                && !s.pending_insert.is_empty())
-            {
+            if !(s.current_layer == 0 && s.state == SlotState::Wait && !s.iter_announced) {
                 continue;
             }
-            let newly: Vec<RequestId> = self.slots[idx].pending_insert.drain(..).collect();
-            for rid in newly {
-                self.slots[idx].reqs.push(rid);
-                if !self.req_is_prefill(rid) {
-                    self.begin_decode(rid); // prefilled handoff: resident decode immediately
+            if !self.slots[idx].pending_insert.is_empty() {
+                let newly: Vec<RequestId> = self.slots[idx].pending_insert.drain(..).collect();
+                for rid in newly {
+                    self.slots[idx].reqs.push(rid);
+                    if !self.req_is_prefill(rid) {
+                        self.begin_decode(rid); // prefilled handoff: resident decode now
+                    }
                 }
+                progressed = true;
+            }
+            if !self.slots[idx].reqs.is_empty() {
+                let reqs = self.slots[idx].reqs.clone();
+                events.push(AttnWorkerEvent::IterStart {
+                    worker: self.id,
+                    slot: idx as u8,
+                    reqs,
+                });
+                self.slots[idx].iter_announced = true;
                 progressed = true;
             }
         }
         progressed
     }
 
-    /// Event-time completions (ref :484): a notified `Wait` slot becomes ready, a
-    /// landed pull becomes ready, a finished compute emits + closes its layer.
+    /// Move a request from reserved (`promised`) to resident decode (ref
+    /// `on_decode_start` / `finalize_to_decode`). The initial resident KV is its
+    /// prompt KV; the budget is its remaining decode horizon. Fires once.
+    fn begin_decode(&mut self, rid: RequestId) {
+        let (initial_kv, decode_budget) = {
+            let store = self.requests.borrow();
+            let r = &store[rid];
+            (
+                (r.prompt_len + r.prefix_kv) as u64,
+                r.decode_len.saturating_sub(r.tokens_emitted),
+            )
+        };
+        self.batch.finalize_to_decode(rid, initial_kv, decode_budget);
+        self.promised.remove(&rid);
+    }
+
+    fn req_is_prefill(&self, rid: RequestId) -> bool {
+        self.requests.borrow()[rid].is_prefill()
+    }
+
+    /// Event-time completions: a notified `Wait` slot becomes pullable, a landed pull
+    /// becomes computable, a finished compute emits its handoff and advances a layer.
     fn advance_completions(&mut self, now: Time, events: &mut Vec<AttnWorkerEvent>) -> bool {
         let mut progressed = false;
         for idx in 0..NUM_SLOTS {
@@ -481,7 +501,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
                     progressed = true;
                 }
                 SlotState::Compute if now >= self.slots[idx].compute_end => {
-                    self.complete_layer(idx, events); // sets LayerDone
+                    self.complete_layer(idx, events);
                     progressed = true;
                 }
                 _ => {}
@@ -490,84 +510,112 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         progressed
     }
 
-    /// Head-relative transitions (ref :511): the head computes (or, fresh off a
-    /// rotation, pulls), and the next slot pulls while the head computes — the
-    /// pull/compute overlap. Single pull / single compute fall out of "pull only on
-    /// head/next, compute only on head".
-    fn try_transitions(&mut self, now: Time) -> bool {
-        let head = self.head;
-        let next = (head + 1) % NUM_SLOTS;
-        let mut progressed = false;
-        if self.slots[head].state == SlotState::PullComplete {
-            self.start_compute(head, now);
-            progressed = true;
+    /// Finish a slot's layer: emit the attn→ffn handoff (producer-computed bytes, so
+    /// the ffn reads them off the message); at the iteration boundary (last layer)
+    /// move finished prefills into decode and grow decoders' KV by one; then advance
+    /// the slot to the next layer. `reqs` is never empty here — empty slots stay
+    /// dormant and never compute.
+    fn complete_layer(&mut self, idx: usize, events: &mut Vec<AttnWorkerEvent>) {
+        let layer = self.slots[idx].current_layer;
+        let reqs = self.slots[idx].reqs.clone();
+        let tokens = self.batch_query_tokens(&reqs);
+        let out_bytes = self.model.attn_to_ffn_bytes_per_token() * tokens;
+        events.push(AttnWorkerEvent::AttnLayerOutputsReady {
+            worker: self.id,
+            slot: idx as u8,
+            reqs: reqs.clone(),
+            layer,
+            send_gid: self.recv_gid,
+            bytes: out_bytes,
+        });
+
+        // Iteration boundary (last layer): a fresh prefill that just finished its pass
+        // enters decode (`promised` → resident); every already-decoding request grows
+        // KV by exactly one token (per iteration, not per layer).
+        if layer == self.num_layers().saturating_sub(1) {
+            let mut decoding = Vec::new();
+            for &rid in &reqs {
+                if self.promised.contains_key(&rid) {
+                    self.begin_decode(rid);
+                } else {
+                    decoding.push(rid);
+                }
+            }
+            self.batch.advance_subset(&decoding);
         }
-        if self.slots[head].state == SlotState::WaitComplete {
-            self.start_pull(head, now);
-            progressed = true;
-        }
-        if matches!(
-            self.slots[head].state,
-            SlotState::Compute | SlotState::LayerDone
-        ) && self.slots[next].state == SlotState::WaitComplete
-        {
-            self.start_pull(next, now);
-            progressed = true;
-        }
-        progressed
+        self.advance_slot_layer(idx);
     }
 
-    /// Advance the head when its slot has finished its layer (ref `advance_batch_layer`):
-    /// bump the slot's layer (reopening membership at the layer-0 wrap) and rotate
-    /// the head to the next slot.
-    fn rotate_head(&mut self) -> bool {
-        let idx = self.head;
-        if self.slots[idx].state != SlotState::LayerDone {
-            return false;
-        }
+    /// Query-token count of a micro-batch this iteration (prefill = its prompt length,
+    /// decode = 1 per request), keyed off the request's `is_prefill()`.
+    fn batch_query_tokens(&self, reqs: &[RequestId]) -> u64 {
+        let store = self.requests.borrow();
+        reqs.iter()
+            .map(|&rid| {
+                if store[rid].is_prefill() {
+                    store[rid].prompt_len as u64
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
+    /// Advance a finished slot to its next layer: bump `current_layer`, reset to
+    /// `Wait`, and clear the per-layer pull / notify state (ref `advance_batch_layer`,
+    /// minus the head rotation). Wrapping to layer 0 reopens the next iteration
+    /// (clears `iter_announced` so a continuing decode re-announces via
+    /// `open_iterations`).
+    fn advance_slot_layer(&mut self, idx: usize) {
         let num_layers = self.model.num_layers() as u16;
         let s = &mut self.slots[idx];
         s.current_layer = (s.current_layer + 1) % num_layers;
         s.state = SlotState::Wait;
         s.notified = false;
-        s.pull_bytes = 0;
         s.pull_send_gid = 0;
+        s.pull_bytes = 0;
         if s.current_layer == 0 {
-            s.closed = false;
+            s.iter_announced = false;
         }
-        self.head = (self.head + 1) % NUM_SLOTS;
-        true
     }
 
-    fn next_wakeup(&self, now: Time) -> Option<Time> {
-        let mut wake: Option<Time> = None;
-        for s in &self.slots {
-            let t = match s.state {
-                SlotState::Compute => s.compute_end,
-                SlotState::Pull => s.pull_end,
-                _ => continue,
-            };
-            if t > now {
-                wake = Some(wake.map_or(t, |c| c.min(t)));
+    /// Start the next pull and compute under the single-pull / single-compute gates:
+    /// one slot may be `Pull`ing and one `Compute`ing at a time (the attn↔ffn pull
+    /// overlapping the attention compute — the pipeline's whole point). ref serialises
+    /// the same way off its rotating `head`; here it is a stateless scan.
+    fn try_transitions(&mut self, now: Time) -> bool {
+        let mut progressed = false;
+        if !self.any_slot_in(SlotState::Pull) {
+            if let Some(idx) = self.first_slot_in(SlotState::WaitComplete) {
+                self.start_pull(idx, now);
+                progressed = true;
             }
         }
-        wake
+        if !self.any_slot_in(SlotState::Compute) {
+            if let Some(idx) = self.first_slot_in(SlotState::PullComplete) {
+                self.start_compute(idx, now);
+                progressed = true;
+            }
+        }
+        progressed
     }
 
-    // ── per-slot work: pull → compute → complete ────────────────────────────────
+    fn any_slot_in(&self, state: SlotState) -> bool {
+        self.slots.iter().any(|s| s.state == state)
+    }
+
+    fn first_slot_in(&self, state: SlotState) -> Option<usize> {
+        (0..NUM_SLOTS).find(|&i| self.slots[i].state == state)
+    }
 
     fn start_pull(&mut self, idx: usize, now: Time) {
-        if self.slots[idx].current_layer == 0 {
-            self.slots[idx].closed = true;
-        }
         self.slots[idx].state = SlotState::Pull;
-        // Empty slots (and zero-byte handoffs) pull instantly — the ring just needs
-        // them to flow so the head can rotate.
-        if self.slots[idx].reqs.is_empty() || self.slots[idx].pull_bytes == 0 {
-            self.slots[idx].pull_end = now;
+        let bytes = self.slots[idx].pull_bytes;
+        if bytes == 0 {
+            self.slots[idx].pull_end = now; // zero-byte handoff: nothing on the wire
             return;
         }
-        let (send_gid, bytes) = (self.slots[idx].pull_send_gid, self.slots[idx].pull_bytes);
+        let send_gid = self.slots[idx].pull_send_gid;
         let end = self
             .cluster
             .borrow_mut()
@@ -577,10 +625,6 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
 
     fn start_compute(&mut self, idx: usize, now: Time) {
         self.slots[idx].state = SlotState::Compute;
-        if self.slots[idx].reqs.is_empty() {
-            self.slots[idx].compute_end = now; // empty slot: instant no-op, no GPU submit
-            return;
-        }
         let input = self.build_attn_input(idx);
         let layer = self.slots[idx].current_layer as usize;
         // Clone the Arc so the immutable model borrow does not alias the mutable
@@ -594,7 +638,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         let store = self.requests.borrow();
         let mut g = ArchGroupInput::default();
         for &rid in &self.slots[idx].reqs {
-            if self.req_is_prefill(rid) {
+            if store[rid].is_prefill() {
                 // Prefilling (v1 non-chunk: whole prompt in one pass): `prompt_len`
                 // query tokens over `prefix_kv` KV.
                 let r = &store[rid];
@@ -624,75 +668,19 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             .map_or(0, |(_, s)| s.current_kv)
     }
 
-    /// Finish a slot's layer: emit the handoff, and at the iteration boundary move
-    /// finished prefills into decode and grow the decoders' KV by one.
-    fn complete_layer(&mut self, idx: usize, events: &mut Vec<AttnWorkerEvent>) {
-        let layer = self.slots[idx].current_layer;
-        let reqs = self.slots[idx].reqs.clone();
-        if !reqs.is_empty() {
-            // Outgoing handoff: producer-computed here so the ffn receiver reads it
-            // off the message (never recomputes).
-            let tokens = self.batch_query_tokens(&reqs);
-            let out_bytes = self.model.attn_to_ffn_bytes_per_token() * tokens;
-            events.push(AttnWorkerEvent::AttnLayerOutputsReady {
-                worker: self.id,
-                slot: idx as u8,
-                reqs: reqs.clone(),
-                layer,
-                bytes: out_bytes,
-            });
-
-            // Iteration boundary (last layer): a fresh prefill that just finished its
-            // pass enters decode (`promised` → resident); every already-decoding
-            // request grows KV by exactly one token (per iteration, not per layer).
-            if layer == self.num_layers().saturating_sub(1) {
-                let mut decoding = Vec::new();
-                for &rid in &reqs {
-                    if self.promised.contains_key(&rid) {
-                        self.begin_decode(rid);
-                    } else {
-                        decoding.push(rid);
-                    }
-                }
-                self.batch.advance_subset(&decoding);
+    fn next_wakeup(&self, now: Time) -> Option<Time> {
+        let mut wake: Option<Time> = None;
+        for s in &self.slots {
+            let t = match s.state {
+                SlotState::Compute => s.compute_end,
+                SlotState::Pull => s.pull_end,
+                _ => continue,
+            };
+            if t > now {
+                wake = Some(wake.map_or(t, |c| c.min(t)));
             }
         }
-        self.slots[idx].state = SlotState::LayerDone;
-    }
-
-    /// Move a request from reserved (`promised`) to resident decode (ref's
-    /// `on_decode_start` / `finalize_to_decode`). The initial resident KV is its
-    /// prompt KV; the budget is its remaining decode horizon. Fires once.
-    fn begin_decode(&mut self, rid: RequestId) {
-        let (initial_kv, decode_budget) = {
-            let store = self.requests.borrow();
-            let r = &store[rid];
-            (
-                (r.prompt_len + r.prefix_kv) as u64,
-                r.decode_len.saturating_sub(r.tokens_emitted),
-            )
-        };
-        self.batch.finalize_to_decode(rid, initial_kv, decode_budget);
-        self.promised.remove(&rid);
-    }
-
-    /// Query-token count of a micro-batch this iteration (prefill = its prompt
-    /// length, decode = 1 per request), keyed off the request's `is_prefill()`.
-    fn batch_query_tokens(&self, reqs: &[RequestId]) -> u64 {
-        let store = self.requests.borrow();
-        reqs.iter()
-            .map(|&rid| {
-                if self.req_is_prefill(rid) {
-                    store[rid].prompt_len as u64
-                } else {
-                    1
-                }
-            })
-            .sum()
-    }
-
-    fn req_is_prefill(&self, rid: RequestId) -> bool {
-        self.requests.borrow()[rid].is_prefill()
+        wake
     }
 
     fn num_layers(&self) -> u16 {
@@ -775,6 +763,22 @@ mod tests {
         c.register_comm_group(0, 1)
     }
 
+    /// All `AttnLayerOutputsReady` events emitted so far (the per-layer handoffs),
+    /// filtering out the `IterStart` announcements.
+    fn outputs(events: &[AttnWorkerEvent]) -> Vec<&AttnWorkerEvent> {
+        events
+            .iter()
+            .filter(|e| matches!(e, AttnWorkerEvent::AttnLayerOutputsReady { .. }))
+            .collect()
+    }
+
+    fn iter_starts(events: &[AttnWorkerEvent]) -> Vec<&AttnWorkerEvent> {
+        events
+            .iter()
+            .filter(|e| matches!(e, AttnWorkerEvent::IterStart { .. }))
+            .collect()
+    }
+
     /// Drive the micro-batch in `slot` through every layer of `w`, one slot-addressed
     /// notification per layer, accumulating emitted events.
     fn run_iteration(
@@ -798,10 +802,11 @@ mod tests {
         }
     }
 
-    /// Admit only enqueues (Level-1). The Level-2 drain + activation runs in tick,
-    /// and a prefilled handoff finalizes to resident decode at activation.
+    /// Admit only enqueues (Level-1). The Level-2 drain + iteration open runs in tick,
+    /// a prefilled handoff finalizes to resident decode at activation, and the slot
+    /// announces its iteration with an `IterStart`.
     #[test]
-    fn admit_drains_reserves_kv_and_activates() {
+    fn admit_drains_reserves_kv_and_announces() {
         let store = prefilled_store(&[(0, 8, 4)]);
         let cluster = test_cluster();
         let mut w = worker(Rc::clone(&store), Rc::clone(&cluster));
@@ -820,10 +825,21 @@ mod tests {
         assert_eq!(w.request_to_slot.get(&RequestId(0)), Some(&0));
         assert!(!w.promised.contains_key(&RequestId(0)), "finalized ⇒ not promised");
         assert!(w.slots[0].reqs.contains(&RequestId(0)));
+        // The slot announced its iteration exactly once (attn-initiated prolog).
+        assert_eq!(
+            iter_starts(&events),
+            vec![&AttnWorkerEvent::IterStart {
+                worker: WorkerId(0),
+                slot: 0,
+                reqs: vec![RequestId(0)],
+            }]
+        );
+        assert!(w.slots[0].iter_announced);
     }
 
-    /// One micro-batch walks all layers of an iteration: one handoff per layer, and
-    /// KV grows by exactly 1 after the last layer (per iteration, not per layer).
+    /// One micro-batch walks all layers of an iteration: one handoff per layer (each
+    /// carrying the shard's send_gid), and KV grows by exactly 1 after the last layer
+    /// (per iteration, not per layer).
     #[test]
     fn one_microbatch_walks_all_layers_and_grows_kv_once() {
         let store = prefilled_store(&[(0, 8, 4)]);
@@ -833,23 +849,26 @@ mod tests {
 
         w.enqueue(AttnWorkerMsg::Admit { req: RequestId(0) });
         let mut events = Vec::new();
-        w.tick(Time::ZERO, &mut events); // drain + activate
+        w.tick(Time::ZERO, &mut events); // drain + open iteration
         let kv_after_activate = w.batch.kv.active_kv;
         assert_eq!(kv_after_activate, 8);
         let slot = w.request_to_slot[&RequestId(0)] as u8;
 
         run_iteration(&mut w, slot, sender, 64, 1, &mut events);
 
-        // One handoff per layer, batch-granular, bytes = attn_to_ffn(2) × 1 token.
-        assert_eq!(events.len(), 2);
-        for (layer, e) in events.iter().enumerate() {
+        // One handoff per layer, batch-granular, bytes = attn_to_ffn(2) × 1 token,
+        // send_gid = this shard's recv/send endpoint.
+        let outs = outputs(&events);
+        assert_eq!(outs.len(), 2);
+        for (layer, e) in outs.iter().enumerate() {
             assert_eq!(
-                e,
+                *e,
                 &AttnWorkerEvent::AttnLayerOutputsReady {
                     worker: WorkerId(0),
                     slot,
                     reqs: vec![RequestId(0)],
                     layer: layer as u16,
+                    send_gid: w.recv_gid,
                     bytes: 2,
                 }
             );
@@ -859,8 +878,45 @@ mod tests {
         assert_eq!(w.current_kv(RequestId(0)), 9);
     }
 
-    /// Release frees the request's KV and empties its slot (the slot stays in the
-    /// ring as a no-op).
+    /// Decode loop-back: after the last layer the slot wraps to layer 0 and
+    /// re-announces a fresh `IterStart` for the continuing decode (clearing
+    /// `iter_announced` reopens the iteration).
+    #[test]
+    fn decode_loopback_reannounces_iter_start() {
+        let store = prefilled_store(&[(0, 8, 4)]);
+        let cluster = test_cluster();
+        let sender = register_test_sender(&cluster);
+        let mut w = worker(Rc::clone(&store), Rc::clone(&cluster));
+        w.enqueue(AttnWorkerMsg::Admit { req: RequestId(0) });
+        let mut events = Vec::new();
+        w.tick(Time::ZERO, &mut events); // open iteration 1
+        let slot = w.request_to_slot[&RequestId(0)] as u8;
+
+        run_iteration(&mut w, slot, sender, 64, 1, &mut events);
+
+        // Two announcements: iteration 1 (at admit) and iteration 2 (decode loop-back
+        // after the last-layer wrap). The slot is back at layer 0, members intact.
+        assert_eq!(iter_starts(&events).len(), 2, "one announce per iteration");
+        assert_eq!(w.slots[slot as usize].current_layer, 0);
+        assert!(w.slots[slot as usize].reqs.contains(&RequestId(0)));
+        assert!(w.slots[slot as usize].iter_announced);
+    }
+
+    /// An idle worker (no admits) makes no transitions and emits nothing — empty
+    /// slots stay dormant rather than churning the ring.
+    #[test]
+    fn empty_slots_stay_dormant() {
+        let store = prefilled_store(&[(0, 8, 4)]);
+        let cluster = test_cluster();
+        let mut w = worker(Rc::clone(&store), Rc::clone(&cluster));
+        let mut events = Vec::new();
+        let wake = w.tick(Time::ZERO, &mut events);
+        assert_eq!(wake, None, "idle worker schedules no wakeup");
+        assert!(events.is_empty(), "no announcements / handoffs from empty slots");
+        assert!(w.slots.iter().all(|s| s.state == SlotState::Wait && !s.iter_announced));
+    }
+
+    /// Release frees the request's KV and drops its slot back to dormant.
     #[test]
     fn release_frees_kv_and_empties_slot() {
         // decode_len 2 with prefilled `tokens_emitted == 1` ⇒ one decode token left,

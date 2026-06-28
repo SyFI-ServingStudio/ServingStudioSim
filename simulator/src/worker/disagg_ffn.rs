@@ -231,12 +231,23 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
         }
     }
 
-    /// Total tokens this task contributes (sum of the workload's per-iter token
-    /// counts) — drives the ffn→attn handoff byte size.
+    /// Total query tokens this task contributes (prefill = its prompt length,
+    /// decode = 1 per request) — sizes the FFN batch and the ffn→attn handoff bytes.
+    /// Derived from the store's `is_prefill()` discriminator, mirroring the attn
+    /// worker's `batch_query_tokens` so both sides of one layer agree on the token
+    /// count. (v1 is non-chunked, so prefill is the whole prompt in one pass; a
+    /// chunked prefill would switch this to `active_chunk_len`.)
     fn workload_tokens(&self, reqs: &[RequestId]) -> u64 {
         let store = self.requests.borrow();
         reqs.iter()
-            .map(|&rid| store[rid].active_chunk_len as u64)
+            .map(|&rid| {
+                let r = &store[rid];
+                if r.is_prefill() {
+                    r.prompt_len as u64
+                } else {
+                    1
+                }
+            })
             .sum()
     }
 
@@ -311,6 +322,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                 }
                 events.push(FfnWorkerEvent::IterComplete {
                     worker: self.id,
+                    slot: task.slot,
                     reqs: task.reqs,
                     completed,
                 });
@@ -323,6 +335,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                 let out_bytes = self.model.ffn_to_attn_bytes_per_token() * total_tokens;
                 events.push(FfnWorkerEvent::SectionReady {
                     worker: self.id,
+                    slot: task.slot,
                     kind: task.kind,
                     reqs: task.reqs,
                     out_send_gid: self.gid,
@@ -459,13 +472,12 @@ mod tests {
 
     #[test]
     fn bootstrap_no_pull_computes_and_emits() {
+        // A fresh (un-prefilled) request: `is_prefill()` ⇒ workload = prompt_len = 8.
         let store = shared_with(&[(0, 8, 4)]);
-        // The worker derives token counts from the store; this request contributes
-        // 8 tokens this iter.
-        store.borrow_mut()[RequestId(0)].active_chunk_len = 8;
         let mut w = worker(Rc::clone(&store), test_cluster());
         w.enqueue(FfnWorkerMsg::Task(FfnTask {
             kind: FfnTaskKind::Bootstrap,
+            slot: 0,
             reqs: vec![RequestId(0)],
             send_gid: 0,
             pull_bytes: 0,
@@ -479,6 +491,7 @@ mod tests {
             events,
             vec![FfnWorkerEvent::SectionReady {
                 worker: WorkerId(0),
+                slot: 0,
                 kind: FfnTaskKind::Bootstrap,
                 reqs: vec![RequestId(0)],
                 out_send_gid: w.gid,
@@ -494,6 +507,7 @@ mod tests {
         let mut w = worker(Rc::clone(&store), test_cluster());
         w.enqueue(FfnWorkerMsg::Task(FfnTask {
             kind: FfnTaskKind::Terminal,
+            slot: 0,
             reqs: vec![RequestId(0)],
             send_gid: 0,
             pull_bytes: 0,
@@ -506,6 +520,7 @@ mod tests {
             events,
             vec![FfnWorkerEvent::IterComplete {
                 worker: WorkerId(0),
+                slot: 0,
                 reqs: vec![RequestId(0)],
                 completed: vec![RequestId(0)],
             }]
@@ -523,12 +538,14 @@ mod tests {
         // Bootstrap (no pull) computes while the Bridge (with a pull) fetches.
         w.enqueue(FfnWorkerMsg::Task(FfnTask {
             kind: FfnTaskKind::Bootstrap,
+            slot: 0,
             reqs: vec![RequestId(0)],
             send_gid: 0,
             pull_bytes: 0,
         }));
         w.enqueue(FfnWorkerMsg::Task(FfnTask {
             kind: FfnTaskKind::Bridge { upstream: 0 },
+            slot: 1,
             reqs: vec![RequestId(1)],
             send_gid: sender,
             pull_bytes: 4096,

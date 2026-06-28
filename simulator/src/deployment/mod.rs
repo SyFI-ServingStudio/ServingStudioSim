@@ -8,6 +8,7 @@
 //! own params (no global param union). The launcher-facing param schema lives in
 //! `schema::dump` (a structural registry), not on this trait.
 
+pub mod afd;
 pub mod config;
 pub mod pd;
 pub mod unified;
@@ -19,9 +20,8 @@ use crate::orchestrator::Flow;
 use crate::timing::PerfApiBridge;
 
 /// Dispatch a deserialized `RunConfig` to its deployment's `build`. The single
-/// place the `deployment` tag routes to a concrete topology. `unified` and `pd`
-/// are wired; `afd` parses (so `list-params` advertises it) but errors cleanly
-/// until its deployment is wired.
+/// place the `deployment` tag routes to a concrete topology. `unified`, `pd`, and
+/// `afd` are all wired.
 pub fn build_flow(
     cfg: &RunConfig,
     bridge: &PerfApiBridge,
@@ -30,7 +30,7 @@ pub fn build_flow(
     match cfg {
         RunConfig::Unified(c) => unified::UnifiedDeployment::build(c, bridge, store),
         RunConfig::Pd(c) => pd::PdDeployment::build(c, bridge, store),
-        RunConfig::Afd(_) => anyhow::bail!("afd deployment not wired yet"),
+        RunConfig::Afd(c) => afd::AfdDeployment::build(c, bridge, store),
     }
 }
 

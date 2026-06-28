@@ -183,32 +183,42 @@ pub struct TransferPlan {
 // ── layer-wise AFD vocabulary (disagg attn / ffn workers) ──────────────────────
 //
 // AFD splits a decoder layer at the attn/ffn boundary into two worker pools.
-// Requests never enter the attn worker directly: they enter the ffn pool, which
-// drives the per-layer handshake (ffn pre-attn → attn → ffn post-attn) and signals
-// the attn worker via `ReadyNotification`. Flat enums, matching the PD style above.
-// A few fields (per-shard byte split, batch composition) are provisional and may
-// be refined when the AFD flow (L6) lands.
+// **attn-initiated**: a request enters the ATTN pool first (KV-locality placement),
+// the attn worker reserves its KV and locally picks a slot, and the slot's entry
+// into layer-0 emits an `IterStart` that the controller aggregates to trigger the
+// ffn prolog (embed + layer-0 QKV). The per-layer handshake is **slot-addressed**:
+// the ffn produces a layer's QKV and the controller signals the attn worker via
+// `ReadyNotification { slot }`; the attn worker computes that slot's attention and
+// emits `AttnLayerOutputsReady { slot }`, which the controller aggregates across all
+// workers (same slot ⇒ same layer, lockstep) into one big ffn batch. Flat enums,
+// matching the PD style above. Cross-worker alignment is by SLOT INDEX + layer
+// (lockstep), never by request — which request sits in which slot is each worker's
+// own local choice. A few fields (per-shard byte split) are provisional.
 
-/// Attn worker messages. A request is first `Admit`ted (sticky slot + KV
-/// reservation), then its micro-batch enters the pull/compute pipeline ONLY via
-/// `ReadyNotification`. L6 passes ids only — the worker reads the shared store for
-/// per-request facts (prompt/decode/prefix, token counts) and tracks its own KV.
-/// (`Vec<RequestId>` fields → no `Copy`, like the ffn types.)
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Attn worker messages. A request is first `Admit`ted (KV reservation + a locally-
+/// chosen slot); the worker announces the slot's iteration via the `IterStart`
+/// event when it reaches layer-0, and the micro-batch then enters the pull/compute
+/// pipeline via `ReadyNotification` (layer-0 QKV from the prolog and every later
+/// layer's QKV are the SAME slot-addressed message). An empty slot stays dormant at
+/// layer 0 (no `ReadyNotification`, no churn) until requests are admitted into it.
+/// L6 passes ids only — the worker reads the shared store for per-request facts
+/// (prompt/decode/prefix, token counts) and tracks its own KV.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttnWorkerMsg {
-    /// KV-admit: the ffn pool admitted `req`; this attn worker reserves its KV and
-    /// picks a sticky slot. Per-request (admitted once). The worker reads
-    /// `prompt_len` / `decode_len` / `prefix_kv` from the store — hence id only.
+    /// KV-admit: the attn pool placed `req` on this worker (KV locality); the worker
+    /// reserves its KV and picks a local slot. Per-request (admitted once). Pure —
+    /// it carries NO QKV (the prolog is attn-initiated via `IterStart`). The worker
+    /// reads `prompt_len` / `decode_len` / `prefix_kv` from the store — hence id only.
     Admit { req: RequestId },
     /// ffn→attn per-layer handshake and the worker's ONLY compute entry: layer
     /// `layer`'s QKV for the micro-batch in slot `slot` is ready to pull from
     /// `send_gid`. `bytes` is the ffn's producer-computed handoff size — the attn
     /// side reads it, never recomputes (it lacks `ffn_to_attn_bytes_per_token`).
-    /// The notification is **slot-addressed**: the attn worker owns slot assignment
-    /// (least-KV), stamps the slot tag on its `AttnLayerOutputsReady`, and L6 echoes
+    /// The notification is **slot-addressed**: the attn worker owns slot assignment,
+    /// stamps the slot tag on its `IterStart` / `AttnLayerOutputsReady`, and L6 echoes
     /// it here so the worker routes the handshake to its slot in O(1) — no request
-    /// set on the wire. The slot already knows its members (admitted there), so the
-    /// worker computes their layer-`layer` attention as one group (D4).
+    /// set on the wire (the slot already knows its local members). Covers layer 0
+    /// (from the prolog) through the last layer uniformly.
     ReadyNotification {
         slot: u8,
         layer: u16,
@@ -227,16 +237,30 @@ pub enum AttnWorkerMsg {
 /// an `AttnWorkerMsg::Release` to drop the KV (no ack event needed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttnWorkerEvent {
+    /// A slot reached layer-0 and is starting a new iteration with local members
+    /// `reqs` (a fresh prefill, or a decode loop-back after the last layer wrapped).
+    /// The controller aggregates same-slot `IterStart`s across workers into one ffn
+    /// prolog (PRE_ATTN), whose layer-0 QKV returns as `ReadyNotification { slot, 0 }`.
+    /// Emitted exactly once per iteration (guarded by the worker's `iter_announced`);
+    /// empty slots emit none (no prolog without members). `worker` attributes it
+    /// (events from all workers share one sink).
+    IterStart {
+        worker: WorkerId,
+        slot: u8,
+        reqs: Vec<RequestId>,
+    },
     /// This micro-batch finished `layer`'s attention; the ffn side pulls `bytes`
-    /// (= `attn_to_ffn_bytes_per_token × tokens`, producer-computed here). Carries
-    /// `slot` (the micro-batch's slot tag, which L6 echoes back in the next
-    /// `ReadyNotification` to keep the handshake slot-addressed) and `reqs` (so L6
-    /// knows whose attention output is ready). Batch-granular.
+    /// (= `attn_to_ffn_bytes_per_token × tokens`, producer-computed here) from
+    /// `send_gid` (this shard's recv/send endpoint). Carries `slot` (the micro-batch's
+    /// slot tag, which L6 echoes back in the next `ReadyNotification` to keep the
+    /// handshake slot-addressed) and `reqs` (so L6 aggregates whose output is ready;
+    /// empty for an empty slot's lockstep completion). Batch-granular.
     AttnLayerOutputsReady {
         worker: WorkerId,
         slot: u8,
         reqs: Vec<RequestId>,
         layer: u16,
+        send_gid: u16,
         bytes: u64,
     },
 }
@@ -267,10 +291,13 @@ pub enum IterEndState {
 /// L6 only hands over the workload — it never groups, never counts tokens, never
 /// constructs arch vocabulary (the only L5↔L4 bridge is the worker). `send_gid` /
 /// `pull_bytes` source the attn→ffn input pull (`pull_bytes == 0` for Bootstrap,
-/// whose input is local). Built by the AFD ffn pool (L6).
+/// whose input is local). `slot` is the pipeline slot the controller aggregated this
+/// batch from; the worker echoes it back on the resulting event so L6 routes the
+/// QKV / token without re-deriving it. Built by the AFD ffn pool (L6).
 #[derive(Clone, Debug)]
 pub struct FfnTask {
     pub kind: FfnTaskKind,
+    pub slot: u8,
     pub reqs: Vec<RequestId>,
     pub send_gid: u16,
     pub pull_bytes: u64,
@@ -291,20 +318,24 @@ pub enum FfnWorkerEvent {
     /// A Bootstrap/Bridge section finished: its QKV output is ready for the
     /// downstream attn layer to pull (`out_bytes` from `out_send_gid`). The worker
     /// stays layer-graph-agnostic — L6 maps `kind` to the downstream attn layer
-    /// (`Bootstrap → 0`, `Bridge{upstream} → upstream + 1`). `kind` is never
+    /// (`Bootstrap → 0`, `Bridge{upstream} → upstream + 1`) and uses `slot` (echoed
+    /// from the task) to scatter the QKV back to that slot. `kind` is never
     /// `Terminal` here (the worker emits `IterComplete` for that).
     SectionReady {
         worker: WorkerId,
+        slot: u8,
         kind: FfnTaskKind,
         reqs: Vec<RequestId>,
         out_send_gid: u16,
         out_bytes: u64,
     },
     /// A Terminal section finished: the iteration's output token was emitted for
-    /// every request in `reqs`. `completed` lists those that hit `decode_len` this
-    /// iteration (the rest loop back for another decode — L6's call).
+    /// every request in `reqs` (the micro-batch from `slot`). `completed` lists those
+    /// that hit `decode_len` this iteration (the rest loop back for another decode —
+    /// the attn slot wraps to layer-0 and re-announces via `IterStart`).
     IterComplete {
         worker: WorkerId,
+        slot: u8,
         reqs: Vec<RequestId>,
         completed: Vec<RequestId>,
     },
