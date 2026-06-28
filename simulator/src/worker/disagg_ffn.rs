@@ -289,6 +289,12 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                     for &rid in &task.reqs {
                         let r = &mut store[rid];
                         if r.tokens_emitted == 0 {
+                            // Prefill resolves on this Terminal: advance the store's
+                            // prefill marker so `is_prefill()` flips to decode. Every
+                            // other worker does this; in AFD the attn shard reads it as
+                            // its authoritative prefill/decode discriminator, so the ffn
+                            // (which owns token emission) must maintain it here.
+                            r.prefill_processed = r.prompt_len;
                             r.record_first_token(now, log_tokens);
                         } else {
                             r.record_token(now, log_tokens);

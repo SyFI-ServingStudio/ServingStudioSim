@@ -201,14 +201,16 @@ pub enum AttnWorkerMsg {
     /// `prompt_len` / `decode_len` / `prefix_kv` from the store — hence id only.
     Admit { req: RequestId },
     /// ffn→attn per-layer handshake and the worker's ONLY compute entry: layer
-    /// `layer`'s QKV for this **micro-batch** is ready to pull from `send_gid`.
-    /// `bytes` is the ffn's producer-computed handoff size — the attn side reads it,
-    /// never recomputes (it lacks `ffn_to_attn_bytes_per_token`). `reqs` is the
-    /// batch (this DP shard's slice of the ffn micro-batch); the worker computes
-    /// their layer-`layer` attention as one group (D4) and reads each req's
-    /// token / KV state from the store.
+    /// `layer`'s QKV for the micro-batch in slot `slot` is ready to pull from
+    /// `send_gid`. `bytes` is the ffn's producer-computed handoff size — the attn
+    /// side reads it, never recomputes (it lacks `ffn_to_attn_bytes_per_token`).
+    /// The notification is **slot-addressed**: the attn worker owns slot assignment
+    /// (least-KV), stamps the slot tag on its `AttnLayerOutputsReady`, and L6 echoes
+    /// it here so the worker routes the handshake to its slot in O(1) — no request
+    /// set on the wire. The slot already knows its members (admitted there), so the
+    /// worker computes their layer-`layer` attention as one group (D4).
     ReadyNotification {
-        reqs: Vec<RequestId>,
+        slot: u8,
         layer: u16,
         send_gid: u16,
         bytes: u64,
@@ -225,11 +227,14 @@ pub enum AttnWorkerMsg {
 /// an `AttnWorkerMsg::Release` to drop the KV (no ack event needed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttnWorkerEvent {
-    /// This **micro-batch** finished `layer`'s attention; the ffn side pulls `bytes`
-    /// (= `attn_to_ffn_bytes_per_token × tokens`, producer-computed here). Batch-
-    /// granular, mirroring the inbound `ReadyNotification`.
+    /// This micro-batch finished `layer`'s attention; the ffn side pulls `bytes`
+    /// (= `attn_to_ffn_bytes_per_token × tokens`, producer-computed here). Carries
+    /// `slot` (the micro-batch's slot tag, which L6 echoes back in the next
+    /// `ReadyNotification` to keep the handshake slot-addressed) and `reqs` (so L6
+    /// knows whose attention output is ready). Batch-granular.
     AttnLayerOutputsReady {
         worker: WorkerId,
+        slot: u8,
         reqs: Vec<RequestId>,
         layer: u16,
         bytes: u64,

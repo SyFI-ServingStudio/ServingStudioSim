@@ -172,6 +172,23 @@ impl Batch {
         }
     }
 
+    /// Iter-end for a *subset* of the decode set. Mirrors [`Self::advance_decodes`]
+    /// but only advances the named requests — AFD's attn worker pipelines several
+    /// micro-batches over one shared `Batch`, and each reaches its iteration
+    /// boundary (last layer) independently, so the whole-shard `advance_decodes`
+    /// would over-count the slots still mid-iteration. Like `advance_decodes`, it
+    /// leaves `cached_peak` untouched (advancing a live decode never raises the
+    /// projected peak — the per-step growth is already counted in the cached peak).
+    pub fn advance_subset(&mut self, reqs: &[RequestId]) {
+        for (rid, s) in &mut self.decodes {
+            if s.remaining_decode > 0 && reqs.contains(rid) {
+                s.current_kv += 1;
+                s.remaining_decode -= 1;
+                self.kv.add_kv(1);
+            }
+        }
+    }
+
     /// Iter-end transition: a realized prefill enters the decode set.
     pub fn finalize_to_decode(&mut self, req_id: RequestId, initial_kv: u64, decode_budget: u32) {
         self.kv.add_kv(initial_kv);
@@ -303,6 +320,24 @@ mod tests {
         b.release(rid(1), 11);
         assert_eq!(b.kv.active_kv, 0);
         assert_eq!(b.decodes.len(), 0);
+    }
+
+    #[test]
+    fn advance_subset_advances_only_named_decodes() {
+        // Two live decodes share one Batch (an AFD shard with two micro-batches);
+        // advancing only req 1's slice grows just req 1 — req 2 is untouched, and
+        // the pool rises by exactly one token, not two.
+        let mut b = Batch::new(0, 1000);
+        b.finalize_to_decode(rid(1), 10, 3);
+        b.finalize_to_decode(rid(2), 20, 3);
+        assert_eq!(b.kv.active_kv, 30);
+
+        b.advance_subset(&[rid(1)]);
+        let s1 = &b.decodes.iter().find(|(r, _)| *r == rid(1)).unwrap().1;
+        let s2 = &b.decodes.iter().find(|(r, _)| *r == rid(2)).unwrap().1;
+        assert_eq!((s1.current_kv, s1.remaining_decode), (11, 2), "req 1 advanced");
+        assert_eq!((s2.current_kv, s2.remaining_decode), (20, 3), "req 2 untouched");
+        assert_eq!(b.kv.active_kv, 31, "pool grew by exactly one token");
     }
 
     #[test]
