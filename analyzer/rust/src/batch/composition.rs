@@ -19,8 +19,8 @@ use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
 use crate::cdf::{clean_nonnegative_sorted, stats, MetricStats};
-use crate::io::{resolve_artifact_path, SCHEMA_VERSION};
-use crate::session::{col, collect, register_if_exists, require_columns, value_f64};
+use crate::io::SCHEMA_VERSION;
+use crate::session::{col, collect, register_cost_log, require_columns, value_f64, COST_LOG_TABLE};
 
 /// cost_log columns the batch subject depends on (drift guard).
 const COST_COLS: &[&str] = &["wall_start_ms", "groups"];
@@ -33,12 +33,11 @@ const MAX_SCATTER_POINTS: usize = 4000;
 type Row = (f64, f64, f64, f64);
 
 pub async fn run_batch(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
-    let cost_path = resolve_artifact_path(log_dir, "cost_log.parquet");
-    if !register_if_exists(ctx, "cost", cost_path).await? {
-        let reason = "cost_log.parquet not found";
+    if !register_cost_log(ctx, log_dir).await? {
+        let reason = "cost_log/ dir not found";
         return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
     }
-    require_columns(ctx, "cost", COST_COLS).await?;
+    require_columns(ctx, COST_LOG_TABLE, COST_COLS).await?;
 
     let mut rows = collect_batches(ctx).await?;
     if rows.is_empty() {
@@ -106,7 +105,7 @@ fn mean(s: &MetricStats) -> Value {
 /// Pull `(wall_start_ms, batch_tokens, prefill_tokens, decode_request_count)` per
 /// iteration, summing each count across the iteration's `groups` struct list.
 async fn collect_batches(ctx: &SessionContext) -> Result<Vec<Row>> {
-    let batches = collect(ctx, "SELECT wall_start_ms, groups FROM cost").await?;
+    let batches = collect(ctx, "SELECT wall_start_ms, groups FROM cost_log").await?;
     let mut out = Vec::new();
     for batch in &batches {
         let wall = col(batch, "wall_start_ms")?;

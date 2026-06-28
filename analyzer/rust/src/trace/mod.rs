@@ -24,11 +24,11 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use datafusion::prelude::SessionContext;
 
-use crate::io::{resolve_artifact_path, trace_path};
+use crate::io::trace_path;
 use crate::perfetto::{Annotation, TraceWriter};
 use crate::session::{
-    col, collect, register_if_exists, require_columns, value_f32_list, value_f64, value_str_list,
-    value_string,
+    col, collect, register_cost_log, require_columns, value_f32_list, value_f64, value_str_list,
+    value_string, COST_LOG_TABLE,
 };
 use place::{slice_pairs_per_iter, Placer};
 
@@ -80,11 +80,10 @@ pub async fn run(
     // Cost log is one parquet per worker under `raw/cost_log/` (a single shared
     // file would race when 32+ decode workers all open it). DataFusion takes
     // the directory and unions every `*.parquet` inside.
-    let path = resolve_artifact_path(log_dir, "cost_log");
-    if !register_if_exists(ctx, "cost_log", path).await? {
+    if !register_cost_log(ctx, log_dir).await? {
         bail!("cost_log/ dir not found under {}", log_dir.display());
     }
-    require_columns(ctx, "cost_log", COLUMNS).await?;
+    require_columns(ctx, COST_LOG_TABLE, COLUMNS).await?;
 
     // Cast `pool_tag` to VARCHAR in the projection: parquet RLE_DICTIONARY-encodes
     // low-cardinality string columns (pool_tag is just "prefill" / "decode"

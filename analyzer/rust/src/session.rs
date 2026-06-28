@@ -38,6 +38,23 @@ pub async fn register_if_exists(ctx: &SessionContext, name: &str, path: PathBuf)
     Ok(true)
 }
 
+/// Canonical table name for the per-worker `cost_log/` directory union.
+pub const COST_LOG_TABLE: &str = "cost_log";
+
+/// Register the per-worker `cost_log/` DIRECTORY (`raw/cost_log/worker_*.parquet`)
+/// as the [`COST_LOG_TABLE`] table, so DataFusion unions every worker's parquet —
+/// PD has 1 prefill + N decode workers; unified has one. Returns `false` when the
+/// dir is absent (caller emits `unavailable` / `bail!`).
+///
+/// This is the ONE correct way to read cost_log. Do NOT register the legacy
+/// single-file `cost_log.parquet`: it predates the per-worker split (commit that
+/// added `cost_log/<worker>.parquet`), so on any multi-worker run it is either
+/// missing (→ false negative) or a stale leftover (→ silently wrong numbers).
+pub async fn register_cost_log(ctx: &SessionContext, log_dir: &std::path::Path) -> Result<bool> {
+    let path = crate::io::resolve_artifact_path(log_dir, "cost_log");
+    register_if_exists(ctx, COST_LOG_TABLE, path).await
+}
+
 /// Drift guard: fail with a clear message if any expected column is absent from
 /// a registered table, instead of letting a later extraction read NaN/null.
 pub async fn require_columns(ctx: &SessionContext, table: &str, columns: &[&str]) -> Result<()> {

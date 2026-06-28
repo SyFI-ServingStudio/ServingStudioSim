@@ -15,8 +15,8 @@ use anyhow::Result;
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
-use crate::io::{read_run_meta, read_worker_pools, resolve_artifact_path, SCHEMA_VERSION};
-use crate::session::{col, collect, register_if_exists, require_columns, value_f64};
+use crate::io::{read_run_meta, read_worker_pools, SCHEMA_VERSION};
+use crate::session::{col, collect, register_cost_log, require_columns, value_f64, COST_LOG_TABLE};
 
 /// cost_log columns the utilization subject depends on (drift guard).
 const COST_COLS: &[&str] = &["worker_id", "wall_start_ms", "total_time_ms"];
@@ -28,12 +28,11 @@ const FINE_BINS: usize = 200;
 type Iter = (u64, f64, f64);
 
 pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
-    let cost_path = resolve_artifact_path(log_dir, "cost_log.parquet");
-    if !register_if_exists(ctx, "cost", cost_path).await? {
-        let reason = "cost_log.parquet not found";
+    if !register_cost_log(ctx, log_dir).await? {
+        let reason = "cost_log/ dir not found";
         return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
     }
-    require_columns(ctx, "cost", COST_COLS).await?;
+    require_columns(ctx, COST_LOG_TABLE, COST_COLS).await?;
 
     let (_num_gpus, gpu_name) = read_run_meta(log_dir).unwrap_or((1, String::new()));
     // worker→pool from run_meta; absent ⇒ every worker is pool 0 (single DP pool).
@@ -185,7 +184,7 @@ fn bin_pool(
 async fn collect_iters(ctx: &SessionContext) -> Result<Vec<Iter>> {
     let batches = collect(
         ctx,
-        "SELECT worker_id, wall_start_ms, total_time_ms FROM cost",
+        "SELECT worker_id, wall_start_ms, total_time_ms FROM cost_log",
     )
     .await?;
     let mut out = Vec::new();

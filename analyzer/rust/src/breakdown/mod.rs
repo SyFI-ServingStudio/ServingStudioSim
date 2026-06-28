@@ -38,10 +38,10 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use datafusion::prelude::SessionContext;
 
-use crate::io::{read_cost_manifests, report_path, resolve_artifact_path};
+use crate::io::{read_cost_manifests, report_path};
 use crate::session::{
-    col, collect, register_if_exists, require_columns, value_f32_list, value_f64, value_groups,
-    value_string, GroupInput,
+    col, collect, register_cost_log, require_columns, value_f32_list, value_f64, value_groups,
+    value_string, COST_LOG_TABLE, GroupInput,
 };
 use crate::trace::manifest::{FlatCostNode, Manifest};
 
@@ -77,11 +77,10 @@ pub async fn run(
 ) -> Result<()> {
     let manifests = read_cost_manifests(log_dir)?;
 
-    let path = resolve_artifact_path(log_dir, "cost_log");
-    if !register_if_exists(ctx, "cost_log", path).await? {
+    if !register_cost_log(ctx, log_dir).await? {
         bail!("cost_log/ dir not found under {}", log_dir.display());
     }
-    require_columns(ctx, "cost_log", COLUMNS).await?;
+    require_columns(ctx, COST_LOG_TABLE, COLUMNS).await?;
 
     // Cast pool_tag → VARCHAR for the same RLE_DICTIONARY reason as `analyze
     // trace`: `value_string` downcasts to StringArray, which fails on the
