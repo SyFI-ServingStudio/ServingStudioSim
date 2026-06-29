@@ -381,6 +381,13 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
                 break; // head-of-line: retry when a Release frees KV
             }
             self.worker_pending.pop_front();
+            // Admission point (mirrors unified/pd `mark_admitted`): the request
+            // leaves the pending queue and starts prefill. Advance the store's
+            // admitted-prefix watermark so the sim's stuck-watchdog sees progress
+            // (and dense `request_state` snapshots log it). This is the ONLY store
+            // write this worker makes — the ffn Terminal still owns the
+            // prefill→decode status flip (D16).
+            self.requests.borrow_mut().mark_admitted(req);
             self.promised.insert(req, prompt_kv + remaining as u64);
             let slot = self.wlb_choose_least_kv();
             self.slots[slot].pending_insert.push(req);

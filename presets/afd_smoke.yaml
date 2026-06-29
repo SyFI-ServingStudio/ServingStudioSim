@@ -1,0 +1,40 @@
+deployment: afd
+
+# Small AFD smoke: the 4-request smoke trace through an attention-FFN
+# disaggregated qwen3-235b. attn pool = ep_size/attn_tp_size = 8/4 = 2 DP shards;
+# ffn pool = one aggregated EP-8 replica. Mirrors unified_qwen3_235b_ep8's dims so
+# the two share kernels (and profile.db rows).
+workload:
+  trace_files:
+    - trace/smoke.csv
+  run_to_end: true
+
+io:
+  log_dir: logs/afd_smoke
+
+pools:
+  attn:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 2
+        arch:
+          type: qwen3_attn_tp
+          model_config: model/config/qwen3_235b.json
+          attn_tp_size: 4
+          fp8: false
+        worker:
+          type: disagg_attn
+          attn_gpu_memory_gb: 80.0
+  ffn:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: qwen3_ffn_moe
+          model_config: model/config/qwen3_235b.json
+          attn_tp_size: 4
+          ep_size: 8
+          nvl_num_gpu: 8
+          fp8: false
+        worker:
+          type: disagg_ffn
