@@ -58,12 +58,13 @@
 //! that calls it → tests.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, AttnArchInput, AttnLayerwiseModel};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
-use crate::timing::LeafMetrics;
 use crate::worker::admission_helpers::Batch;
+use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{AttnWorkerEvent, AttnWorkerMsg, WorkerConfig, WorkerStatus};
@@ -115,6 +116,9 @@ struct Slot {
     /// Live event timestamps for the current `Pull` / `Compute`.
     pull_end: Time,
     compute_end: Time,
+    /// Per-slot forward-pass counter (the `cost_log` row `iter_id`), bumped when the
+    /// slot wraps back to layer 0. Groups all of one forward's per-layer `attn` rows.
+    iter: u64,
 }
 
 impl Slot {
@@ -130,6 +134,7 @@ impl Slot {
             pull_bytes: 0,
             pull_end: Time::ZERO,
             compute_end: Time::ZERO,
+            iter: 0,
         }
     }
 
@@ -165,14 +170,17 @@ pub struct DisaggAttnWorker<M: AttnLayerwiseModel> {
     promised: HashMap<RequestId, u64>,
     /// Sticky request → slot routing (set at admission; survives decode re-entry).
     request_to_slot: HashMap<RequestId, usize>,
-    /// Own eval buffers (cost_log deferred — D10, no `CostBuffers`).
-    slots_buf: Vec<LeafMetrics>,
-    scratch: Vec<LeafMetrics>,
+    /// Eval scratch + the per-section `cost_log` writer. The attn side has one cost
+    /// group, so every row is `section = "attn"` (the layer is the row's `layer`,
+    /// the pipeline slot its `batch_id`). Honest per-layer rows; ZSTD compresses the
+    /// homogeneous layers.
+    cost: CostBuffers,
 }
 
 // ── construction ────────────────────────────────────────────────────────────────
 
 impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: WorkerId,
         model: Arc<M>,
@@ -181,6 +189,8 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         pool: PoolId,
         gpu_name: &str,
         cluster: SharedGpuCluster,
+        cost_log_dir: Option<PathBuf>,
+        pool_tag: &'static str,
     ) -> Self {
         let recv_gid = {
             let mut c = cluster.borrow_mut();
@@ -194,6 +204,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             .attn_kv_bytes
             .saturating_mul(model.num_attn_shards().max(1) as u64);
         let kv_capacity = (shard_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
+        let cost = CostBuffers::new(cost_log_dir, pool_tag, id, &model.cost_log_manifest());
         Self {
             id,
             model,
@@ -206,8 +217,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             worker_pending: VecDeque::new(),
             promised: HashMap::new(),
             request_to_slot: HashMap::new(),
-            slots_buf: Vec::new(),
-            scratch: Vec::new(),
+            cost,
         }
     }
 }
@@ -409,6 +419,32 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         self.promised.values().sum()
     }
 
+    /// This worker's estimated peak KV — the metric the attn pool balances on when it
+    /// pins a fresh request (KV is the binding resource on the attn side, so a
+    /// request-count proxy ignores context-length skew). Sum of this worker's three
+    /// disjoint KV-accounting levels — a request flows L1→L2→L3 and each transition
+    /// moves it out of the prior level, so there is no double count:
+    ///   * L3 resident decodes — the rigorous projected peak ([`Batch::projected_peak_kv`]),
+    ///     modeling each live decode's per-step growth AND the KV freed as the
+    ///     earliest-finishing decodes exit (tighter than a naive sum);
+    ///   * L2 reserved prefills (`promised`) — admitted + prefilling, not yet resident,
+    ///     at full footprint (`prompt_kv + remaining`);
+    ///   * L1 queued admits (`worker_pending`) — enqueued by the pool, not yet drained,
+    ///     at full footprint. `enqueue` reaches `worker_pending` synchronously, so a
+    ///     fresh admit shows up here at once — the pool can spread several same-tick
+    ///     arrivals across shards instead of piling them onto one.
+    pub fn estimated_peak_kv(&self) -> u64 {
+        let queued: u64 = self
+            .worker_pending
+            .iter()
+            .map(|&r| {
+                let (prompt_kv, remaining) = self.footprint(r);
+                prompt_kv + remaining as u64
+            })
+            .sum();
+        self.batch.projected_peak_kv() + self.promised_kv() + queued
+    }
+
     /// Least-KV slot (D-D): the load balancer balances reserved+resident KV across
     /// slots (the user's metric; ref balances request count). Ties pick the lowest
     /// index — irrelevant, slots are addressed by identity only.
@@ -583,6 +619,8 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         s.pull_bytes = 0;
         if s.current_layer == 0 {
             s.iter_announced = false;
+            // Wrapped past the last layer → a new forward pass for this slot opens.
+            s.iter += 1;
         }
     }
 
@@ -634,10 +672,19 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         self.slots[idx].state = SlotState::Compute;
         let input = self.build_attn_input(idx);
         let layer = self.slots[idx].current_layer as usize;
+        let iter_id = self.slots[idx].iter;
         // Clone the Arc so the immutable model borrow does not alias the mutable
-        // slots_buf / scratch borrows (mirrors the ffn worker).
+        // `cost` buffer borrow (mirrors the ffn worker). `run_section` evals via the
+        // closure (same aggregate the timing uses) and writes one `attn` row when
+        // logging — `batch_id` = the pipeline slot, `layer` = this layer.
         let model = Arc::clone(&self.model);
-        let m = model.attn_cost(layer, &input, &mut self.slots_buf, &mut self.scratch);
+        let m = self.cost.run_section(
+            "attn", layer as i16, iter_id, idx as u64, &input.groups, now,
+            |s, sc, inp| match inp {
+                Some(i) => model.attn_cost_with_inputs(layer, &input, s, sc, i),
+                None => model.attn_cost(layer, &input, s, sc),
+            },
+        );
         self.slots[idx].compute_end = now + Time::from_ms(m.m.time_ms as f64);
     }
 
@@ -698,6 +745,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timing::LeafMetrics;
     use crate::test_helpers::{prefilled_store, shared_with, test_cluster};
     use crate::timing::cache::interp::{CoverageFlags, Metrics4};
     use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -757,6 +805,8 @@ mod tests {
             PoolId(0),
             "test-gpu",
             cluster,
+            None,
+            "attn",
         )
     }
 

@@ -100,12 +100,8 @@ pub struct AfdAttnPoolController<M: AttnLayerwiseModel> {
     /// `Terminal` for the last layer.
     num_layers: u16,
     slots: [SlotSched; NUM_SLOTS],
-    /// req → its pinned worker (sticky, KV locality): routes `Release` and keeps
-    /// `load` accurate on completion.
+    /// req → its pinned worker (sticky, KV locality): routes `Release` on completion.
     req_worker: HashMap<RequestId, WorkerId>,
-    /// Per-worker active-request count — the KV-locality placement proxy (least
-    /// loaded wins). v1 uses request count; a token-weighted load is a refinement.
-    load: Vec<u32>,
 }
 
 impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
@@ -114,6 +110,7 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
     /// the shared `cluster` so it self-registers its GPU block + comm group. The
     /// disagg attn worker's `new` is 7-arg, so this builds them directly rather than
     /// through `UnifiedWorkerFactory`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_workers: u16,
         model: Arc<M>,
@@ -122,6 +119,7 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
         pool: PoolId,
         gpu_name: &str,
         cluster: &SharedGpuCluster,
+        cost_log_dir: Option<std::path::PathBuf>,
     ) -> Self {
         assert!(num_workers > 0, "afd attn pool needs at least one worker");
         let num_layers = model.num_layers() as u16;
@@ -135,6 +133,8 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
                     pool,
                     gpu_name,
                     std::rc::Rc::clone(cluster),
+                    cost_log_dir.clone(),
+                    "attn",
                 )
             })
             .collect();
@@ -145,26 +145,28 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
             num_layers,
             slots: std::array::from_fn(|_| SlotSched::new()),
             req_worker: HashMap::new(),
-            load: vec![0; n],
         }
     }
 
     // ── Placement (called by the flow on arrival) ─────────────────────────────
 
-    /// Pin a fresh request to the least-loaded attn worker (KV locality, sticky for
+    /// Pin a fresh request to the least-KV-loaded attn worker (KV locality, sticky for
     /// its whole life) and admit it there with a pure `Admit`. The worker reserves
     /// the KV, picks a local slot, and announces the iteration itself via `IterStart`.
     pub fn admit(&mut self, req: RequestId) {
-        let idx = self.least_loaded_worker();
-        self.load[idx] += 1;
+        let idx = self.least_kv_loaded_worker();
         self.req_worker.insert(req, WorkerId(idx as u16));
         self.workers[idx].enqueue(AttnWorkerMsg::Admit { req });
         self.wake(idx);
     }
 
-    fn least_loaded_worker(&self) -> usize {
+    /// The shard with the least estimated peak KV. KV is the binding resource on the
+    /// attn side, so placement balances each worker's reported projected-peak KV (its
+    /// resident decode trajectory + reserved-not-resident prefills) rather than a
+    /// request count — the worker owns its KV accounting, the pool just reads it.
+    fn least_kv_loaded_worker(&self) -> usize {
         (0..self.workers.len())
-            .min_by_key(|&i| (self.load[i], i))
+            .min_by_key(|&i| (self.workers[i].estimated_peak_kv(), i))
             .unwrap_or(0)
     }
 
@@ -254,7 +256,9 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
                 let idx = w.0 as usize;
                 self.workers[idx].enqueue(AttnWorkerMsg::Release { req });
                 self.wake(idx);
-                self.load[idx] = self.load[idx].saturating_sub(1);
+                // No controller-side load counter to decrement: the worker drops the
+                // request's KV on `Release`, and the pool reads `estimated_peak_kv`
+                // straight from the worker at the next placement.
             }
             completed.push(req);
         }
@@ -411,6 +415,7 @@ mod tests {
             PoolId(0),
             "test-gpu",
             &test_cluster(),
+            None,
         )
     }
 
@@ -515,7 +520,6 @@ mod tests {
         assert_eq!(completed, vec![RequestId(0)]);
         assert!(!p.slots[0].in_flight, "slot freed after completion");
         assert!(!p.req_worker.contains_key(&RequestId(0)), "KV released");
-        assert_eq!(p.load[0], 0);
     }
 
     /// Deadlock guard: a worker whose whole batch completes is stripped from the

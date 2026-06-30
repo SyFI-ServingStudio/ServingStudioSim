@@ -1,0 +1,41 @@
+deployment: afd
+
+# Asymmetric AFD smoke: attn pool shards attention over attn_tp=2 while the ffn pool
+# projects qkv/o_proj over attn_tp=4. Tests that the two pools' attn_tp_size are
+# decoupled (the cross-pool QKV/attn-output handoff is TP-agnostic, and the cluster
+# prices differing send/recv link counts). Same 4-request smoke trace + qwen3-235b
+# dims as afd_smoke.yaml. attn_replicas left at 2 (independent of ffn num_dp_groups).
+workload:
+  trace_files:
+    - trace/smoke.csv
+  run_to_end: true
+
+io:
+  log_dir: logs/afd_smoke_asym
+
+pools:
+  attn:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 2
+        arch:
+          type: qwen3_attn_tp
+          model_config: model/config/qwen3_235b.json
+          attn_tp_size: 2
+          fp8: false
+        worker:
+          type: disagg_attn
+          attn_gpu_memory_gb: 80.0
+  ffn:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: qwen3_ffn_moe
+          model_config: model/config/qwen3_235b.json
+          attn_tp_size: 4
+          ep_size: 8
+          nvl_num_gpu: 8
+          fp8: false
+        worker:
+          type: disagg_ffn

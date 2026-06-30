@@ -144,7 +144,7 @@ pub fn value_f32_list(array: &ArrayRef, row: usize) -> Result<Vec<f64>> {
 /// One iteration's per-HP-group arch input, read from the `groups` `List<Struct>`
 /// column (analyzer-side mirror of the sim's `GroupInputLog`). Only the fields the
 /// breakdown header renders are kept.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct GroupInput {
     pub batch_tokens: u32,
     pub prefill_tokens: u32,

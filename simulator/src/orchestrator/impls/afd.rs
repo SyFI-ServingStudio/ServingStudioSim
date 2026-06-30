@@ -148,6 +148,7 @@ mod tests {
             AFD_ATTN_POOL,
             "attn-gpu",
             &cluster,
+            None,
         );
         let ffn = AfdFfnPoolController::new(
             1,
@@ -157,6 +158,7 @@ mod tests {
             AFD_FFN_POOL,
             "ffn-gpu",
             &cluster,
+            None,
         );
         AfdFlow::new(store, attn, ffn, cluster)
     }

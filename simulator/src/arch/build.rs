@@ -5,7 +5,7 @@
 //! Every caller that needs a built model goes through here: the `unified` and
 //! `pd` deployments call the per-arch [`dense`] / [`dense_tp`] / … builders and
 //! keep the *concrete* type for their dyn-free worker factories (the cost hot
-//! path stays monomorphized, L4 §4.1); the offline `iter-timing-predict` path
+//! path stays monomorphized, L4 §4.1); the offline `timing-predict` path
 //! calls [`build_iter_model`], which boxes one as `dyn` (off the hot path). The
 //! caller supplies `name` — the model's dotted-leaf prefix (`"unified"` / `"pd"`)
 //! — so each deployment's cost manifests read naturally.
@@ -208,7 +208,7 @@ pub fn qwen3_ffn_moe(
 }
 
 /// Build ONE iter-wise arch model from its selector, boxed as `dyn`. The
-/// model-only seam the offline `iter-timing-predict` path uses (it evaluates
+/// model-only seam the offline `timing-predict` (iter arch) path uses (it evaluates
 /// [`IterwiseUnifiedModel`] directly, no worker/flow). The deployments do NOT box
 /// — they call the concrete `dense` / `dense_tp` / … builders above to keep their
 /// worker factories monomorphized (L4 §4.1). This single match is the only place

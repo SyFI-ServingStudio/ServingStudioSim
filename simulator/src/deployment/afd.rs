@@ -8,8 +8,10 @@
 //! The attn↔ffn QKV transfer cost reuses the profiled `p2p_inter` curve (same as
 //! PD's KV handoff); `build_transfer_cost` wires it, keyed on the ffn (aggregation
 //! receiver) GPU. v1 uses one curve for both directions — a faithful per-direction
-//! split is a later calibration item. Wired pairing is `qwen3_attn` → `qwen3_ffn_moe`
-//! (matched `attn_tp_size`); other pairings bail until an experiment needs them.
+//! split is a later calibration item. Wired pairing is `qwen3_attn` → `qwen3_ffn_moe`;
+//! the two sides' `attn_tp_size` may differ (they shard different work and the
+//! handoff is TP-agnostic — see the `assemble` note); other pairings bail until an
+//! experiment needs them.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -77,8 +79,16 @@ impl Deployment for AfdDeployment {
         // aggregation receiver). Built once here (the bridge lives at L7).
         let cost = build_transfer_cost(&fg.gpu, bridge)?;
 
-        // Only the exercised pairing is wired. The attn arch's `attn_tp_size` must
-        // match the ffn arch's (the o_proj / MoE-combine residing width is shared).
+        // Only this arch pairing is wired (others bail below). The attn and ffn
+        // `attn_tp_size` are INDEPENDENT — they shard different work (attn: the
+        // attention core; ffn: the qkv / o_proj projections), and the cross-pool
+        // handoff that connects them is TP-agnostic: `ffn_to_attn_bytes_per_token` /
+        // `attn_to_ffn_bytes_per_token` are full un-sharded wire sizes (model dims
+        // only, not `attn_tp`), and `GpuCluster::submit_transfer` already prices a
+        // send/recv group of differing link counts (`bytes / side_count` per leg,
+        // slower side bounds). So a tp=2 ffn projecting QKV and scattering to a tp=4
+        // attn pool is a valid, costable topology — each pool models its own
+        // sharding. `attn_replicas` (physical attn shard count) is likewise free.
         match (&ag.arch, &fg.arch) {
             (
                 AttnArchSel::Qwen3AttnTp {
@@ -94,10 +104,6 @@ impl Deployment for AfdDeployment {
                     routing_seed,
                 },
             ) => {
-                ensure!(
-                    a_tp == f_tp,
-                    "afd: attn arch attn_tp_size ({a_tp}) must equal ffn arch attn_tp_size ({f_tp})"
-                );
                 let attn_model =
                     Arc::new(arch_build::qwen3_attn(am, *a_tp, &ag.gpu, MODEL_NAME, bridge)?);
                 let ffn_model = Arc::new(arch_build::qwen3_ffn_moe(
@@ -129,6 +135,9 @@ impl Deployment for AfdDeployment {
                     fg.gpu.clone(),
                     ag.replicas,
                     cost,
+                    // Per-building-block cost_log goes under the run's log_dir, same
+                    // as a colocated run (the workers tag rows `attn` / `ffn`).
+                    Some(cfg.io.log_dir.clone()),
                 ))
             }
             (a, f) => bail!(
@@ -184,6 +193,7 @@ fn worker_config(attn_gpu_memory_gb: f64, log_output_token_times: bool) -> Worke
 /// pools), and wires the flow. The returned `Box<dyn Flow>` is the only `dyn`
 /// erasure point.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn assemble_afd_flow<MA, MF>(
     attn_model: Arc<MA>,
     ffn_model: Arc<MF>,
@@ -194,6 +204,7 @@ fn assemble_afd_flow<MA, MF>(
     ffn_gpu_name: String,
     attn_replicas: u16,
     cost: CostSource,
+    cost_log_dir: Option<std::path::PathBuf>,
 ) -> Box<dyn Flow>
 where
     MA: crate::arch::contract::AttnLayerwiseModel,
@@ -208,6 +219,7 @@ where
         AFD_ATTN_POOL,
         &attn_gpu_name,
         &cluster,
+        cost_log_dir.clone(),
     );
     let ffn = AfdFfnPoolController::new(
         1,
@@ -217,6 +229,7 @@ where
         AFD_FFN_POOL,
         &ffn_gpu_name,
         &cluster,
+        cost_log_dir,
     );
     Box::new(AfdFlow::new(store, attn, ffn, cluster))
 }

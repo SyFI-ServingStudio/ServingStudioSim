@@ -1,19 +1,27 @@
-"""`python -m launcher iter-timing-predict <config> [...]` — offline whole-iteration
+"""`python -m launcher timing-predict <config> [...]` — offline per-building-block
 timing prediction.
 
 A predict config is NOT a deployment `RunConfig` (it has no workload / pools /
-sweep — just one iter-wise arch + gpu + a cases file), so this entry bypasses the
-schema expansion the normal run flow does. It performs the shared `cargo_build`,
-then for each config runs the `iter-timing-predict` subcommand (which writes the
-standard `raw/cost_log` + `cost_manifest` artifacts, one row per case) followed by
-the post-run analyzer — `run_analysis` emits the Perfetto `iter → layers →
-kernels` trace plus the cost reports from exactly those artifacts.
+sweep — just one arch selector `{iter|attn|ffn}` + gpu + a cases file), so this
+entry bypasses the schema expansion the normal run flow does. It performs the
+shared `cargo_build`, then for each config runs the predictor subcommand (which
+writes the standard `raw/cost_log` + `cost_manifest` artifacts, one row per
+case/section) followed by the post-run analyzer — `run_analysis` emits the
+Perfetto trace plus the cost reports from exactly those artifacts.
+
+The `arch` selector picks one of `{iter|attn|ffn}` — an iter-wise whole-iteration
+arch, or one half of an AFD split (attn / ffn), each costed independently.
+
+Unlike a real `run` (whose launcher snapshots the expanded config into `log_dir`),
+the predict path previously left no provenance behind; we now copy the config + its
+cases file into `log_dir` so a predict result is self-describing.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -29,14 +37,39 @@ from .exec import (
 
 
 def _load_config(path: Path) -> dict:
-    """Parse the minimal predict config (JSON or YAML) — only `log_dir` is needed
-    launcher-side; the binary re-parses the whole thing."""
+    """Parse the minimal predict config (JSON or YAML) — only `log_dir` /
+    `cases_file` are needed launcher-side; the binary re-parses the whole thing."""
     text = path.read_text()
     if path.suffix == ".json":
         return json.loads(text)
     import yaml
 
     return yaml.safe_load(text)
+
+
+def _snapshot_inputs(config_path: Path, cfg: dict, log_dir: Path) -> None:
+    """Copy the predict config + its cases file into `log_dir` for provenance, so a
+    predict result is self-describing (mirrors a real run's config snapshot). The
+    cases file is resolved relative to the config's directory, the same way the
+    binary resolves it. Best-effort: a copy failure warns but does not fail the run.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(config_path, log_dir / config_path.name)
+        cases_file = cfg.get("cases_file")
+        if cases_file:
+            cases_path = Path(cases_file)
+            if not cases_path.is_absolute():
+                cases_path = config_path.parent / cases_path
+            if cases_path.is_file():
+                shutil.copy2(cases_path, log_dir / cases_path.name)
+            else:
+                print(
+                    f"[warn] cases_file {cases_path} not found; not snapshotted",
+                    file=sys.stderr,
+                )
+    except OSError as e:
+        print(f"[warn] failed to snapshot predict inputs into {log_dir}: {e}", file=sys.stderr)
 
 
 async def _run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
@@ -47,8 +80,10 @@ async def _run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         # launcher-side log_dir to the same root so stdout.log + analysis line up.
         log_dir = REPO_ROOT / log_dir
 
+    _snapshot_inputs(config_path, cfg, log_dir)
+
     binary = binary_path(build_type)
-    argv = [str(binary), "iter-timing-predict", str(config_path)]
+    argv = [str(binary), "timing-predict", str(config_path)]
     runner = SimulationRunner(argv=argv, log_dir=log_dir, env=_build_subprocess_env())
     ok = await runner.run()
     if ok and analyze:
@@ -71,18 +106,18 @@ def main(argv: list[str]) -> int:
         if tok == "--build-type":
             build_type = next(it, "")
             if not build_type:
-                sys.exit("iter-timing-predict: --build-type needs a value")
+                sys.exit("timing-predict: --build-type needs a value")
         elif tok == "--no-analyze":
             analyze = False
         elif tok.startswith("-"):
-            sys.exit(f"iter-timing-predict: unknown flag {tok}")
+            sys.exit(f"timing-predict: unknown flag {tok}")
         else:
             configs.append(tok)
 
     if not configs:
         sys.exit(
-            "iter-timing-predict: no config given; usage: "
-            "python -m launcher iter-timing-predict <config.json> [...]"
+            "timing-predict: no config given; usage: "
+            "python -m launcher timing-predict <config.json> [...]"
         )
 
     # INV-8: the single shared build (also produces the analyzer binary).

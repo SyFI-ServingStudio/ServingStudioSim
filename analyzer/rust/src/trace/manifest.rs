@@ -32,8 +32,8 @@ pub enum FlatCostNode {
     Scale { n: u32, children: Range<usize> },
 }
 
-/// The whole manifest: ordered leaf slots, the flattened aggregation tree, and
-/// the composite labels index-aligned to `nodes` (`node_labels[i]` is the
+/// One section's manifest: ordered leaf slots, the flattened aggregation tree,
+/// and the composite labels index-aligned to `nodes` (`node_labels[i]` is the
 /// worklet/model label that wrapped node `i`, or `None`).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Manifest {
@@ -42,31 +42,72 @@ pub struct Manifest {
     pub node_labels: Vec<Option<String>>,
 }
 
+/// A named building-block section within a worker's manifest doc. The sim emits
+/// `{"section": "...", "slots": [...], "nodes": [...], "node_labels": [...]}` —
+/// the `section` tag plus a flattened [`Manifest`] (sim-side `CostManifestSection`).
+/// A `cost_log` row's `section` field selects which one interprets its slots.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ManifestSection {
+    pub section: String,
+    #[serde(flatten)]
+    pub manifest: Manifest,
+}
+
+/// The whole per-worker manifest: an ordered list of named sections (sim-side
+/// `CostManifestDoc`). An iter-wise worker has a single `iter` section; an AFD
+/// layer-wise worker has several (`attn`, or `prologue` / `pre_attn` / `post_attn`
+/// / `post_attn_last` / `epilogue`), each its own CostTree with its own slots.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ManifestDoc {
+    pub sections: Vec<ManifestSection>,
+}
+
+impl ManifestDoc {
+    /// The sub-manifest for `section`, or `None` if this worker has no such
+    /// section (a `cost_log` row tagged with a section its manifest lacks).
+    pub fn section(&self, name: &str) -> Option<&Manifest> {
+        self.sections
+            .iter()
+            .find(|s| s.section == name)
+            .map(|s| &s.manifest)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A trimmed but structurally real per-worker cost manifest (dense Llama3,
-    /// 2 slots + a Scale fold), pinning the exact JSON the sim emits. If the
-    /// sim's serde representation drifts (enum tag style, Range shape, field
-    /// names), this fails — that's the drift guard.
+    /// A trimmed but structurally real per-worker cost manifest doc (dense Llama3,
+    /// a single `iter` section, 2 slots + a Scale fold), pinning the exact JSON the
+    /// sim emits. If the sim's serde representation drifts (the `sections` wrapper,
+    /// the flattened section tag, enum tag style, Range shape, field names), this
+    /// fails — that's the drift guard.
     const SAMPLE: &str = r#"{
-      "slots": [
-        {"name": "m.embedding", "kind": "elementwise", "config": "hidden=4096"},
-        {"name": "m.lm_head", "kind": "single_gemm", "config": "n=128256 k=4096"}
-      ],
-      "nodes": [
-        {"Sum": {"children": {"start": 1, "end": 3}}},
-        {"Leaf": 0},
-        {"Scale": {"n": 32, "children": {"start": 3, "end": 4}}},
-        {"Leaf": 1}
-      ],
-      "node_labels": ["m [dense local, 32 layers]", null, null, null]
+      "sections": [
+        {
+          "section": "iter",
+          "slots": [
+            {"name": "m.embedding", "kind": "elementwise", "config": "hidden=4096"},
+            {"name": "m.lm_head", "kind": "single_gemm", "config": "n=128256 k=4096"}
+          ],
+          "nodes": [
+            {"Sum": {"children": {"start": 1, "end": 3}}},
+            {"Leaf": 0},
+            {"Scale": {"n": 32, "children": {"start": 3, "end": 4}}},
+            {"Leaf": 1}
+          ],
+          "node_labels": ["m [dense local, 32 layers]", null, null, null]
+        }
+      ]
     }"#;
 
     #[test]
     fn sample_manifest_round_trips() {
-        let m: Manifest = serde_json::from_str(SAMPLE).expect("deserialize sample manifest");
+        let doc: ManifestDoc = serde_json::from_str(SAMPLE).expect("deserialize sample manifest doc");
+        assert_eq!(doc.sections.len(), 1);
+        assert_eq!(doc.sections[0].section, "iter");
+        let m = doc.section("iter").expect("iter section present");
+        assert!(doc.section("missing").is_none());
         assert_eq!(m.slots.len(), 2);
         assert_eq!(m.slots[1].kind, "single_gemm");
         assert_eq!(

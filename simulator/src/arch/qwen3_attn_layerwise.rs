@@ -31,7 +31,8 @@ use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::common::Fabric;
 use crate::op::attention::{FlashInferAttentionInput, FlashInferAttentionOp};
 use crate::timing::{
-    BuildError, CostTree, CostTreeBuilder, Evaluator, FlatCostNode, LeafMetrics, PerfApiBridge,
+    BuildError, CostManifestDoc, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
+    LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWorkletResolved};
 
@@ -187,8 +188,57 @@ impl Qwen3AttnLayerwiseModel {
     /// in the same order.
     fn attn_cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
-        let root = self.attn.compile(&mut b);
+        // Label the root with the arch identity (like the iter-wise archs), so the
+        // manifest's `node_labels[0]` names the arch in the breakdown/trace header.
+        let root = CostNode::Labeled {
+            label: format!(
+                "{} [AFD attn (attn_tp={}), {} layers]",
+                self.name, self.attn_tp_size, self.num_layers
+            ),
+            child: Box::new(self.attn.compile(&mut b)),
+        };
         b.finish(root)
+    }
+
+    /// Shared body for [`attn_cost`](AttnLayerwiseModel::attn_cost) and its
+    /// `*_with_inputs` sibling: fill `slots` over this shard's attention, optionally
+    /// capturing each leaf's input into `inputs`, then aggregate. `layer_idx` does
+    /// not change the cost (every layer sees the same batch within an iteration).
+    fn attn_eval(
+        &self,
+        batch: &AttnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: Option<&mut Vec<SlotInput>>,
+    ) -> LeafMetrics {
+        assert_eq!(
+            batch.groups.len(),
+            1,
+            "AFD attn worker computes one DP shard — expects exactly one group"
+        );
+        slots.clear();
+        slots.resize(self.attn_n_slots, LeafMetrics::ZERO);
+        let mut ev = match inputs {
+            Some(inp) => {
+                inp.clear();
+                Evaluator::with_inputs(slots, inp)
+            }
+            None => Evaluator::new(slots),
+        };
+        let g = &batch.groups[0];
+        self.attn.eval(
+            &FlashInferAttentionInput {
+                prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                decode_kv_lens: g.decode_kv_lens.clone(),
+            },
+            &mut ev,
+        );
+        debug_assert_eq!(
+            ev.filled(),
+            self.attn_n_slots,
+            "eval cursor must fill every slot"
+        );
+        CostTree::aggregate(&self.attn_flat, slots, scratch)
     }
 }
 
@@ -212,6 +262,12 @@ impl AttnLayerwiseModel for Qwen3AttnLayerwiseModel {
         self.attn_to_ffn_bytes_per_token
     }
 
+    /// One `attn` section — this shard's per-layer attention CostTree. Recompiled
+    /// once here (only at logger open), not on the per-layer cost path.
+    fn cost_log_manifest(&self) -> CostManifestDoc {
+        CostManifestDoc::single("attn", self.attn_cost_tree().manifest())
+    }
+
     fn attn_cost(
         &self,
         _layer_idx: usize,
@@ -219,29 +275,17 @@ impl AttnLayerwiseModel for Qwen3AttnLayerwiseModel {
         slots: &mut Vec<LeafMetrics>,
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics {
-        assert_eq!(
-            batch.groups.len(),
-            1,
-            "AFD attn worker computes one DP shard — expects exactly one group"
-        );
-        slots.clear();
-        slots.resize(self.attn_n_slots, LeafMetrics::ZERO);
-        let mut ev = Evaluator::new(slots);
-        // This shard's attention. `layer_idx` does not change the cost (every layer
-        // sees the same batch within an iteration).
-        let g = &batch.groups[0];
-        self.attn.eval(
-            &FlashInferAttentionInput {
-                prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
-                decode_kv_lens: g.decode_kv_lens.clone(),
-            },
-            &mut ev,
-        );
-        debug_assert_eq!(
-            ev.filled(),
-            self.attn_n_slots,
-            "eval cursor must fill every slot"
-        );
-        CostTree::aggregate(&self.attn_flat, slots, scratch)
+        self.attn_eval(batch, slots, scratch, None)
+    }
+
+    fn attn_cost_with_inputs(
+        &self,
+        _layer_idx: usize,
+        batch: &AttnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        self.attn_eval(batch, slots, scratch, Some(inputs))
     }
 }

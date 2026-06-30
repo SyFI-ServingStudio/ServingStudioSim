@@ -1,0 +1,13 @@
+{
+  "arch": {
+    "attn": {
+      "type": "qwen3_attn_tp",
+      "model_config": "model/config/qwen3_235b.json",
+      "attn_tp_size": 4,
+      "fp8": false
+    }
+  },
+  "gpu": "NVIDIA H200",
+  "log_dir": "logs/predict_qwen3_235b_attn",
+  "cases_file": "predict_qwen3_235b_attn_cases.json"
+}

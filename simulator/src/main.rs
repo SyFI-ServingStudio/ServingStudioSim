@@ -59,12 +59,12 @@ enum Cmd {
     /// kernel by `{kind, config, query_points}`; writes the interpolated
     /// best-of-N metrics per point + the fitted grid axes on stdout.
     KernelQuery,
-    /// Predict whole-iteration timing offline for a batch of explicit iteration
-    /// shapes — NO sim/scheduler/trace. Reads a minimal config (one iter-wise
-    /// arch + gpu + a cases_file) and writes the standard `raw/cost_log` +
-    /// `cost_manifest` artifacts (one row per case), which `analyze trace` /
-    /// `analyze run` consume unchanged.
-    IterTimingPredict(RunArgs),
+    /// Predict per-building-block timing offline for a batch of explicit batch
+    /// shapes — NO sim/scheduler/trace. Reads a minimal config (one arch selector
+    /// `{iter|attn|ffn}` + gpu + a cases_file) and writes the standard
+    /// `raw/cost_log` + `cost_manifest` artifacts (one row per case/section, tagged
+    /// with `section`/`layer`), which `analyze trace` / `analyze run` consume.
+    TimingPredict(RunArgs),
 }
 
 /// Shared payload for `run` / `build-cache-only` / `dry-run`: a path to one
@@ -141,9 +141,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::KernelQuery => simulator::introspect::run_kernel_query(),
-        Cmd::IterTimingPredict(args) => {
-            simulator::timing_predict::run_iter_timing_predict(&args.config)
-        }
+        Cmd::TimingPredict(args) => simulator::timing_predict::run_timing_predict(&args.config),
     }
 }
 

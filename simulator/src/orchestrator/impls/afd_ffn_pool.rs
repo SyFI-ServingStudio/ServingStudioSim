@@ -40,9 +40,10 @@ pub struct AfdFfnPoolController<M: FfnLayerwiseModel> {
 impl<M: FfnLayerwiseModel> AfdFfnPoolController<M> {
     // ── Construction ──────────────────────────────────────────────────────────
     /// Build the ffn pool's `num_workers` workers, each handed the shared `cluster`
-    /// so it self-registers its GPU block + comm group. The disagg ffn worker's
-    /// `new` is 7-arg (no `pool_tag` / `log_dir`), so this builds them directly
-    /// rather than through `UnifiedWorkerFactory`.
+    /// so it self-registers its GPU block + comm group, plus the run's `cost_log_dir`
+    /// (the worker tags its rows `pool_tag = "ffn"`). Builds them directly rather than
+    /// through `UnifiedWorkerFactory` (the disagg ffn worker's `new` is bespoke).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_workers: u16,
         model: std::sync::Arc<M>,
@@ -51,6 +52,7 @@ impl<M: FfnLayerwiseModel> AfdFfnPoolController<M> {
         pool: PoolId,
         gpu_name: &str,
         cluster: &SharedGpuCluster,
+        cost_log_dir: Option<std::path::PathBuf>,
     ) -> Self {
         assert!(num_workers > 0, "afd ffn pool needs at least one worker");
         let workers: Vec<DisaggFfnWorker<M>> = (0..num_workers)
@@ -63,6 +65,8 @@ impl<M: FfnLayerwiseModel> AfdFfnPoolController<M> {
                     pool,
                     gpu_name,
                     std::rc::Rc::clone(cluster),
+                    cost_log_dir.clone(),
+                    "ffn",
                 )
             })
             .collect();
@@ -119,6 +123,7 @@ mod tests {
             PoolId(1),
             "test-gpu",
             &test_cluster(),
+            None,
         )
     }
 

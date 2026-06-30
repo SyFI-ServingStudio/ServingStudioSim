@@ -57,8 +57,8 @@ use crate::timing::kernels::{
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::{
-    BuildError, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode, LeafMetrics,
-    PerfApiBridge,
+    BuildError, CostManifestDoc, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
+    LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{
     uniform_local_ppm, MoeExpertComputeLocalWorklet, MoeExpertComputeLocalWorkletConfig,
@@ -514,10 +514,23 @@ impl Qwen3FfnMoeLayerwiseModel {
         ])
     }
 
+    /// One-line arch identity for the `cost_log` manifest root label (the
+    /// breakdown/trace header), mirroring the iter-wise archs' root-label style.
+    /// Every section's root carries it, so each AFD building block names its arch.
+    fn arch_label(&self) -> String {
+        format!(
+            "{} [AFD ffn (ep={}, dp={}) MoE top_k={}, {} layers]",
+            self.name, self.ep_size, self.num_dp_groups, self.top_k, self.num_layers
+        )
+    }
+
     fn compile_pre_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let root = self.compile_pre_node(&mut b);
-        b.finish(root)
+        b.finish(CostNode::Labeled {
+            label: self.arch_label(),
+            child: Box::new(root),
+        })
     }
 
     /// Post-attn cost tree. `with_fused_pre` (mid-layer Bridge) appends the fused
@@ -531,13 +544,19 @@ impl Qwen3FfnMoeLayerwiseModel {
         if with_fused_pre {
             parts.push(self.compile_pre_node(&mut b));
         }
-        b.finish(CostNode::Sum(parts))
+        b.finish(CostNode::Labeled {
+            label: self.arch_label(),
+            child: Box::new(CostNode::Sum(parts)),
+        })
     }
 
     fn compile_prologue_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let root = self.embed.compile(&mut b);
-        b.finish(root)
+        b.finish(CostNode::Labeled {
+            label: self.arch_label(),
+            child: Box::new(root),
+        })
     }
 
     fn compile_epilogue_tree(&self) -> CostTree {
@@ -546,35 +565,30 @@ impl Qwen3FfnMoeLayerwiseModel {
             self.final_norm.compile(&mut b),
             self.lm_head.compile(&mut b),
         ]);
-        b.finish(root)
+        b.finish(CostNode::Labeled {
+            label: self.arch_label(),
+            child: Box::new(root),
+        })
     }
 
     // ── eval helpers: fill slots in the EXACT child order `compile` minted them ──
 
     fn eval_pre(&self, batch: &FfnArchInput, ev: &mut Evaluator) {
-        for g in &batch.groups {
-            self.pre_attn.eval(
-                &PreAttnProjTpWorkletInput {
-                    batch_tokens: g.batch_tokens,
-                },
-                ev,
-            );
+        for &batch_tokens in &batch.tokens_per_group {
+            self.pre_attn
+                .eval(&PreAttnProjTpWorkletInput { batch_tokens }, ev);
         }
     }
 
     fn eval_post_attn(&self, batch: &FfnArchInput, ev: &mut Evaluator) {
-        for g in &batch.groups {
-            self.post_attn.eval(
-                &PostAttnRouterTpWorkletInput {
-                    batch_tokens: g.batch_tokens,
-                },
-                ev,
-            );
+        for &batch_tokens in &batch.tokens_per_group {
+            self.post_attn
+                .eval(&PostAttnRouterTpWorkletInput { batch_tokens }, ev);
         }
     }
 
     fn eval_moe(&self, batch: &FfnArchInput, ev: &mut Evaluator) {
-        let m_total: u32 = batch.groups.iter().map(|g| g.batch_tokens).sum();
+        let m_total: u32 = batch.tokens_per_group.iter().sum();
         let global_expert_selections = m_total * self.top_k;
         let tokens_for_comm = u64::from(m_total);
         self.moe_dispatch.eval(
@@ -592,13 +606,9 @@ impl Qwen3FfnMoeLayerwiseModel {
             );
         }
         // Home reduce: per DP shard on the shard's own tokens.
-        for g in &batch.groups {
-            self.moe_local_reduce.eval(
-                &ElementwiseKernelInput {
-                    num_tokens: g.batch_tokens,
-                },
-                ev,
-            );
+        for &num_tokens in &batch.tokens_per_group {
+            self.moe_local_reduce
+                .eval(&ElementwiseKernelInput { num_tokens }, ev);
         }
         self.moe_combine.eval(
             &MoeNetInput {
@@ -606,6 +616,116 @@ impl Qwen3FfnMoeLayerwiseModel {
             },
             ev,
         );
+    }
+
+    // ── shared cost bodies (used by both `*_cost` and `*_cost_with_inputs`) ──────
+
+    /// Build an evaluator over `slots`, capturing each leaf's typed input into
+    /// `inputs` when `Some` (cleared first so it stays slot-aligned). Collapses the
+    /// iter-wise `eval_iter` / `eval_iter_with_inputs` split into one body.
+    fn evaluator<'a>(
+        slots: &'a mut [LeafMetrics],
+        inputs: Option<&'a mut Vec<SlotInput>>,
+    ) -> Evaluator<'a> {
+        match inputs {
+            Some(inp) => {
+                inp.clear();
+                Evaluator::with_inputs(slots, inp)
+            }
+            None => Evaluator::new(slots),
+        }
+    }
+
+    fn pre_attn_eval(
+        &self,
+        layer_idx: usize,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: Option<&mut Vec<SlotInput>>,
+    ) -> LeafMetrics {
+        slots.clear();
+        if layer_idx == 0 {
+            // Bootstrap: the real qkv of layer 0.
+            slots.resize(self.pre_n_slots, LeafMetrics::ZERO);
+            let mut ev = Self::evaluator(slots, inputs);
+            self.eval_pre(batch, &mut ev);
+            debug_assert_eq!(ev.filled(), self.pre_n_slots, "eval cursor must fill every slot");
+            CostTree::aggregate(&self.pre_flat, slots, scratch)
+        } else {
+            // Bridge bills pre(L) inside post(L-1); standalone pre_attn(L>0) is zero
+            // (no slots, so the captured inputs are empty too).
+            if let Some(i) = inputs {
+                i.clear();
+            }
+            LeafMetrics::ZERO
+        }
+    }
+
+    fn post_attn_eval(
+        &self,
+        layer_idx: usize,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: Option<&mut Vec<SlotInput>>,
+    ) -> LeafMetrics {
+        let last = self.num_layers.saturating_sub(1) as usize;
+        slots.clear();
+        if layer_idx < last {
+            // Bridge: post(L) + the fused pre(L+1).
+            slots.resize(self.post_mid_n_slots, LeafMetrics::ZERO);
+            let mut ev = Self::evaluator(slots, inputs);
+            self.eval_post_attn(batch, &mut ev);
+            self.eval_moe(batch, &mut ev);
+            self.eval_pre(batch, &mut ev);
+            debug_assert_eq!(ev.filled(), self.post_mid_n_slots, "eval cursor must fill every slot");
+            CostTree::aggregate(&self.post_mid_flat, slots, scratch)
+        } else {
+            // Terminal: post-only.
+            slots.resize(self.post_last_n_slots, LeafMetrics::ZERO);
+            let mut ev = Self::evaluator(slots, inputs);
+            self.eval_post_attn(batch, &mut ev);
+            self.eval_moe(batch, &mut ev);
+            debug_assert_eq!(ev.filled(), self.post_last_n_slots, "eval cursor must fill every slot");
+            CostTree::aggregate(&self.post_last_flat, slots, scratch)
+        }
+    }
+
+    fn prologue_eval(
+        &self,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: Option<&mut Vec<SlotInput>>,
+    ) -> LeafMetrics {
+        let m_total: u32 = batch.tokens_per_group.iter().sum();
+        slots.clear();
+        slots.resize(self.prologue_n_slots, LeafMetrics::ZERO);
+        let mut ev = Self::evaluator(slots, inputs);
+        self.embed
+            .eval(&ElementwiseKernelInput { num_tokens: m_total }, &mut ev);
+        debug_assert_eq!(ev.filled(), self.prologue_n_slots, "eval cursor must fill every slot");
+        CostTree::aggregate(&self.prologue_flat, slots, scratch)
+    }
+
+    fn epilogue_eval(
+        &self,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: Option<&mut Vec<SlotInput>>,
+    ) -> LeafMetrics {
+        let m_total: u32 = batch.tokens_per_group.iter().sum();
+        slots.clear();
+        slots.resize(self.epilogue_n_slots, LeafMetrics::ZERO);
+        let mut ev = Self::evaluator(slots, inputs);
+        self.final_norm
+            .eval(&RmsNormKernelInput { m: m_total }, &mut ev);
+        self.lm_head
+            .eval(&SingleGemmKernelInput { m: m_total }, &mut ev);
+        debug_assert_eq!(ev.filled(), self.epilogue_n_slots, "eval cursor must fill every slot");
+        CostTree::aggregate(&self.epilogue_flat, slots, scratch)
     }
 }
 
@@ -635,22 +755,18 @@ impl FfnLayerwiseModel for Qwen3FfnMoeLayerwiseModel {
         slots: &mut Vec<LeafMetrics>,
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics {
-        slots.clear();
-        if layer_idx == 0 {
-            // Bootstrap: the real qkv of layer 0.
-            slots.resize(self.pre_n_slots, LeafMetrics::ZERO);
-            let mut ev = Evaluator::new(slots);
-            self.eval_pre(batch, &mut ev);
-            debug_assert_eq!(
-                ev.filled(),
-                self.pre_n_slots,
-                "eval cursor must fill every slot"
-            );
-            CostTree::aggregate(&self.pre_flat, slots, scratch)
-        } else {
-            // Bridge bills pre(L) inside post(L-1); standalone pre_attn(L>0) is zero.
-            LeafMetrics::ZERO
-        }
+        self.pre_attn_eval(layer_idx, batch, slots, scratch, None)
+    }
+
+    fn pre_attn_cost_with_inputs(
+        &self,
+        layer_idx: usize,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        self.pre_attn_eval(layer_idx, batch, slots, scratch, Some(inputs))
     }
 
     fn post_attn_cost(
@@ -660,34 +776,18 @@ impl FfnLayerwiseModel for Qwen3FfnMoeLayerwiseModel {
         slots: &mut Vec<LeafMetrics>,
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics {
-        let last = self.num_layers.saturating_sub(1) as usize;
-        slots.clear();
-        if layer_idx < last {
-            // Bridge: post(L) + the fused pre(L+1).
-            slots.resize(self.post_mid_n_slots, LeafMetrics::ZERO);
-            let mut ev = Evaluator::new(slots);
-            self.eval_post_attn(batch, &mut ev);
-            self.eval_moe(batch, &mut ev);
-            self.eval_pre(batch, &mut ev);
-            debug_assert_eq!(
-                ev.filled(),
-                self.post_mid_n_slots,
-                "eval cursor must fill every slot"
-            );
-            CostTree::aggregate(&self.post_mid_flat, slots, scratch)
-        } else {
-            // Terminal: post-only.
-            slots.resize(self.post_last_n_slots, LeafMetrics::ZERO);
-            let mut ev = Evaluator::new(slots);
-            self.eval_post_attn(batch, &mut ev);
-            self.eval_moe(batch, &mut ev);
-            debug_assert_eq!(
-                ev.filled(),
-                self.post_last_n_slots,
-                "eval cursor must fill every slot"
-            );
-            CostTree::aggregate(&self.post_last_flat, slots, scratch)
-        }
+        self.post_attn_eval(layer_idx, batch, slots, scratch, None)
+    }
+
+    fn post_attn_cost_with_inputs(
+        &self,
+        layer_idx: usize,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        self.post_attn_eval(layer_idx, batch, slots, scratch, Some(inputs))
     }
 
     fn prologue_cost(
@@ -696,18 +796,17 @@ impl FfnLayerwiseModel for Qwen3FfnMoeLayerwiseModel {
         slots: &mut Vec<LeafMetrics>,
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics {
-        let m_total: u32 = batch.groups.iter().map(|g| g.batch_tokens).sum();
-        slots.clear();
-        slots.resize(self.prologue_n_slots, LeafMetrics::ZERO);
-        let mut ev = Evaluator::new(slots);
-        self.embed
-            .eval(&ElementwiseKernelInput { num_tokens: m_total }, &mut ev);
-        debug_assert_eq!(
-            ev.filled(),
-            self.prologue_n_slots,
-            "eval cursor must fill every slot"
-        );
-        CostTree::aggregate(&self.prologue_flat, slots, scratch)
+        self.prologue_eval(batch, slots, scratch, None)
+    }
+
+    fn prologue_cost_with_inputs(
+        &self,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        self.prologue_eval(batch, slots, scratch, Some(inputs))
     }
 
     fn epilogue_cost(
@@ -716,19 +815,31 @@ impl FfnLayerwiseModel for Qwen3FfnMoeLayerwiseModel {
         slots: &mut Vec<LeafMetrics>,
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics {
-        let m_total: u32 = batch.groups.iter().map(|g| g.batch_tokens).sum();
-        slots.clear();
-        slots.resize(self.epilogue_n_slots, LeafMetrics::ZERO);
-        let mut ev = Evaluator::new(slots);
-        self.final_norm
-            .eval(&RmsNormKernelInput { m: m_total }, &mut ev);
-        self.lm_head
-            .eval(&SingleGemmKernelInput { m: m_total }, &mut ev);
-        debug_assert_eq!(
-            ev.filled(),
-            self.epilogue_n_slots,
-            "eval cursor must fill every slot"
-        );
-        CostTree::aggregate(&self.epilogue_flat, slots, scratch)
+        self.epilogue_eval(batch, slots, scratch, None)
+    }
+
+    fn epilogue_cost_with_inputs(
+        &self,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        self.epilogue_eval(batch, slots, scratch, Some(inputs))
+    }
+
+    /// One section per distinct CostTree. `post_attn` (the mid-layer Bridge, with
+    /// the fused pre of the next layer) and `post_attn_last` (the Terminal, post
+    /// only) are separate sections because they have different slot sets — a
+    /// `cost_log` row tags itself with whichever it cost. Recompiled here (only at
+    /// logger open), not on the per-layer cost path.
+    fn cost_log_manifest(&self) -> CostManifestDoc {
+        let mut doc = CostManifestDoc::empty();
+        doc.push("prologue", self.compile_prologue_tree().manifest());
+        doc.push("pre_attn", self.compile_pre_tree().manifest());
+        doc.push("post_attn", self.compile_post_tree(true).manifest());
+        doc.push("post_attn_last", self.compile_post_tree(false).manifest());
+        doc.push("epilogue", self.compile_epilogue_tree().manifest());
+        doc
     }
 }

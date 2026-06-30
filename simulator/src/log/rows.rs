@@ -9,8 +9,8 @@ use arrow_array::builder::{
     Float32Builder, ListBuilder, StringBuilder, StructBuilder, UInt32Builder, UInt8Builder,
 };
 use arrow_array::{
-    BooleanArray, Float32Array, Float64Array, ListArray, RecordBatch, StringArray, UInt16Array,
-    UInt32Array, UInt64Array,
+    BooleanArray, Float32Array, Float64Array, Int16Array, ListArray, RecordBatch, StringArray,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field};
 
@@ -147,6 +147,15 @@ pub struct CostLogEntry {
     /// f64 that barely compressed.
     pub total_time_ms: f64,
     pub energy_j: f64,
+    /// Building-block group this row costs: `iter` for the fused unified path, or
+    /// `attn` / `prologue` / `pre_attn` / `post_attn` / `epilogue` for the AFD
+    /// layer-wise path. Selects which sub-manifest in the `cost_manifest/` sidecar
+    /// interprets this row's `slot_*` lists. A `&'static str` (section names are
+    /// literals), so the row stays `Copy`-cheap to move to the writer thread.
+    pub section: &'static str,
+    /// Layer index this row costs; `-1` when the row is whole-iteration (the
+    /// iter-wise Scale-folded form, where one row covers all layers).
+    pub layer: i16,
     /// Number of entries in [`CostLogChunk::group_logs`] belonging to this row.
     pub group_len: usize,
     /// Number of entries in [`CostLogChunk::slot_times`] / [`CostLogChunk::slot_covs`]
@@ -273,6 +282,8 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
     let wall_start: Vec<f64> = entries.iter().map(|e| e.wall_start_ms).collect();
     let total_time: Vec<f64> = entries.iter().map(|e| e.total_time_ms).collect();
     let energy: Vec<f64> = entries.iter().map(|e| e.energy_j).collect();
+    let section: Vec<&str> = entries.iter().map(|e| e.section).collect();
+    let layer: Vec<i16> = entries.iter().map(|e| e.layer).collect();
 
     // Per-iteration input_section: one List<Struct> entry per row.
     let groups = build_groups_column(entries, &chunk.group_logs);
@@ -347,6 +358,8 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
             Arc::new(time_builder.finish()),
             Arc::new(cov_builder.finish()),
             Arc::new(input_builder.finish()),
+            Arc::new(StringArray::from(section)),
+            Arc::new(Int16Array::from(layer)),
         ],
     )?)
 }
@@ -480,6 +493,8 @@ mod tests {
                 wall_start_ms: 1.0,
                 total_time_ms: 2.0,
                 energy_j: 0.5,
+                section: "iter",
+                layer: -1,
                 group_len: 2,
                 slot_len: 3,
                 slot_input_len: 0,
@@ -491,6 +506,8 @@ mod tests {
                 wall_start_ms: 3.0,
                 total_time_ms: 1.0,
                 energy_j: 0.2,
+                section: "iter",
+                layer: -1,
                 group_len: 1,
                 slot_len: 3,
                 slot_input_len: 0,

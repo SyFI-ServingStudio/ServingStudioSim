@@ -12,7 +12,8 @@ pub mod sweep;
 pub use bridge::{BuildError, KernelMissing, PerfApiBridge};
 pub use cache::interp::{CoverageFlags, LeafMetrics, Metrics4};
 pub use cost_tree::{
-    CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode, LeafDesc,
+    CostManifest, CostManifestDoc, CostManifestSection, CostNode, CostTree, CostTreeBuilder,
+    Evaluator, FlatCostNode, LeafDesc,
 };
 pub use slot_input::{AttnPrefillLog, SlotInput};
 pub use kernels::engine::KernelConfig;

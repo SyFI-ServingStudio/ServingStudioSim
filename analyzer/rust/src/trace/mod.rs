@@ -38,6 +38,7 @@ const COLUMNS: &[&str] = &[
     "worker_id",
     "iter_id",
     "batch_id",
+    "section",
     "wall_start_ms",
     "total_time_ms",
     "slot_time_ms",
@@ -50,6 +51,10 @@ struct IterRow {
     worker_id: u16,
     iter_id: u64,
     batch_id: u64,
+    /// Building-block section (`iter` for iter-wise; `attn` / `prologue` /
+    /// `pre_attn` / `post_attn` / `post_attn_last` / `epilogue` for AFD). Selects
+    /// which sub-manifest interprets `slot_ns`.
+    section: String,
     wall_start_ms: f64,
     total_time_ms: f64,
     /// Per-slot leaf duration, pre-rounded to ns (index = manifest slot).
@@ -86,21 +91,21 @@ pub async fn run(
     }
     require_columns(ctx, "cost_log", COLUMNS).await?;
 
-    // Cast `pool_tag` to VARCHAR in the projection: parquet RLE_DICTIONARY-encodes
-    // low-cardinality string columns (pool_tag is just "prefill" / "decode"
-    // repeated millions of times), and DataFusion preserves that encoding,
-    // surfacing the column as a `DictionaryArray`. `value_string` downcasts to
-    // `StringArray`, which fails on dictionaries — flattening at projection
-    // sidesteps the per-column dictionary dispatch.
+    // Cast the low-cardinality string columns (`pool_tag`, `section`) to VARCHAR in
+    // the projection: parquet RLE_DICTIONARY-encodes them (pool_tag is just
+    // "prefill" / "decode" repeated millions of times; section likewise), and
+    // DataFusion preserves that encoding, surfacing the column as a `DictionaryArray`.
+    // `value_string` downcasts to `StringArray`, which fails on dictionaries —
+    // flattening at projection sidesteps the per-column dictionary dispatch.
     let other_cols = COLUMNS
         .iter()
-        .filter(|c| **c != "pool_tag")
+        .filter(|c| **c != "pool_tag" && **c != "section")
         .copied()
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, {other_cols} \
-         FROM cost_log ORDER BY pool_tag, worker_id, wall_start_ms"
+        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, CAST(section AS VARCHAR) AS section, \
+         {other_cols} FROM cost_log ORDER BY pool_tag, worker_id, wall_start_ms"
     );
     let batches = collect(ctx, &sql).await?;
 
@@ -112,6 +117,7 @@ pub async fn run(
             col(b, "iter_id")?,
             col(b, "batch_id")?,
         );
+        let sec = col(b, "section")?;
         let (ws, tt) = (col(b, "wall_start_ms")?, col(b, "total_time_ms")?);
         let (st, si) = (col(b, "slot_time_ms")?, col(b, "slot_input")?);
         for r in 0..b.num_rows() {
@@ -124,6 +130,7 @@ pub async fn run(
                 worker_id: value_f64(wid, r)? as u16,
                 iter_id: value_f64(iid, r)? as u64,
                 batch_id: value_f64(bid, r)? as u64,
+                section: value_string(sec, r)?,
                 wall_start_ms: value_f64(ws, r)?,
                 total_time_ms: value_f64(tt, r)?,
                 slot_ns,
@@ -182,6 +189,14 @@ pub async fn run(
     let mut placed_iters = 0usize;
     let mut eligible_iters = 0usize;
     let mut truncated = false;
+    // Per-track high-water end_ns. Back-to-back slices (predict's `now += time`
+    // layout, or sections within one real task) place each `begin` from the sim
+    // clock and each `end` from the placer's leaf-ns sum; the two round
+    // independently, so a slice can begin ~1ns before its predecessor's end. That
+    // sub-ns overlap makes Perfetto nest the next slice under the previous one (a
+    // huge `epilogue`/`lm_head` then appears under a tiny `post_attn_last`). Snap
+    // each `begin` to be ≥ the same track's last `end` to keep siblings flush.
+    let mut track_cursor: BTreeMap<u64, i64> = BTreeMap::new();
 
     'regions: for (i, &pos) in anchors.iter().enumerate() {
         let (lo, hi) = (pos, pos + region_ms);
@@ -207,9 +222,16 @@ pub async fn run(
 
         for row in region_rows {
             let key = row.manifest_key();
-            let manifest = manifests
+            let doc = manifests
                 .get(&key)
                 .with_context(|| format!("missing cost manifest for {}", worker_label(&key)))?;
+            let manifest = doc.section(&row.section).with_context(|| {
+                format!(
+                    "cost manifest for {} has no section {:?}",
+                    worker_label(&key),
+                    row.section
+                )
+            })?;
             let per_iter_pairs = slice_pairs_per_iter(manifest);
             if placed_pairs + per_iter_pairs > max_slices {
                 truncated = true;
@@ -217,21 +239,34 @@ pub async fn run(
                 break 'regions;
             }
             let track = worker_tracks[&key];
+            // Sim-clock begin, snapped forward so it never predates the same track's
+            // last end (see `track_cursor`); the shift is ≤1ns rounding noise.
             let base_ns = ((row.wall_start_ms + shift_ms) * 1e6).round() as i64;
+            let base_ns = base_ns.max(track_cursor.get(&track).copied().unwrap_or(i64::MIN));
 
+            // Iter-wise rows are one slice per iteration (`iter N`); AFD layer-wise
+            // rows are one slice per building block (`iter N · post_attn`).
+            let slice_label = if row.section == "iter" {
+                format!("iter {}", row.iter_id)
+            } else {
+                format!("iter {} · {}", row.iter_id, row.section)
+            };
             w.begin(
                 track,
                 base_ns,
-                &format!("iter {}", row.iter_id),
+                &slice_label,
                 &[
                     Annotation::uint("iter_id", row.iter_id),
                     Annotation::uint("batch_id", row.batch_id),
+                    Annotation::str("section", &row.section),
                     Annotation::dbl("total_ms", row.total_time_ms),
                 ],
             );
             let placer = Placer::new(manifest, &row.slot_ns, &row.slot_input);
             let dur = placer.place_root(&mut w, track, base_ns);
-            w.end(track, base_ns + dur);
+            let end_ns = base_ns + dur;
+            w.end(track, end_ns);
+            track_cursor.insert(track, end_ns);
 
             // Drift guard: the laid-out tree must reproduce total_time_ms up to
             // per-leaf ns rounding (each of per_iter_pairs rounds at most 1 ns).

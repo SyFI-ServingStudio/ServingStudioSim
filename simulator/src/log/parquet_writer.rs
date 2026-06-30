@@ -115,6 +115,8 @@ mod tests {
             wall_start_ms: iter_id as f64 * 0.1,
             total_time_ms: 0.5,
             energy_j: 0.1,
+            section: "iter",
+            layer: -1,
             group_len: 1,
             slot_len: slot_count,
             slot_input_len: 0,

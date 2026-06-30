@@ -25,18 +25,19 @@
 //! partition. Since the ffn side has no attention (no per-request KV locality) it
 //! just splits the total token count evenly across `num_dp_groups` and builds the
 //! L4 `FfnArchInput` (L6 never groups, counts, or touches arch vocabulary).
-//! cost_log is deferred
-//! (D10): the worker holds its own `LeafMetrics` buffers and calls the cost methods
-//! directly, no `CostBuffers`. The comm group is registered single-leg for now; the
+//! cost_log goes through [`CostBuffers`]: one row per section per layer, tagged
+//! `section` + `layer` + `batch_id` = the pipeline slot (so a slot's whole forward
+//! shares an `iter_id`). The comm group is registered single-leg for now; the
 //! attn-TP-wide sizing + per-shard byte split are a Phase-6 calibration item.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::arch::contract::{ArchGroupInput, FfnArchInput, FfnLayerwiseModel};
+use crate::arch::contract::{FfnArchInput, FfnLayerwiseModel};
 use crate::common::{PoolId, RequestId, Time, WorkerId};
 use crate::common::SharedRequests;
-use crate::timing::LeafMetrics;
+use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
@@ -75,15 +76,20 @@ pub struct DisaggFfnWorker<M: FfnLayerwiseModel> {
     incoming: VecDeque<FfnTask>,
     next_task: Option<PullingTask>,
     current_task: Option<RunningTask>,
-    /// Own eval buffers (cost_log deferred — no `CostBuffers`).
-    slots: Vec<LeafMetrics>,
-    scratch: Vec<LeafMetrics>,
+    /// Eval scratch + the per-section `cost_log` writer (one row per building block:
+    /// `prologue` / `pre_attn` / `post_attn` / `post_attn_last` / `epilogue`). Honest
+    /// per-layer rows — the homogeneous layers compress hard under the writer's ZSTD.
+    cost: CostBuffers,
+    /// Per-slot forward-pass counter (the row `iter_id`), bumped on each `Bootstrap`
+    /// so every section of one slot's forward shares an id. Indexed by slot.
+    iter_seq: Vec<u64>,
 }
 
 impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
     /// Self-registers its GPU block + a comm group in the shared cluster (used as
     /// both pull-recv and QKV-send endpoint) and keeps the cluster handle for
     /// runtime `submit_transfer`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: WorkerId,
         model: Arc<M>,
@@ -92,6 +98,8 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
         pool: PoolId,
         gpu_name: &str,
         cluster: SharedGpuCluster,
+        cost_log_dir: Option<PathBuf>,
+        pool_tag: &'static str,
     ) -> Self {
         let gid = {
             let mut c = cluster.borrow_mut();
@@ -113,6 +121,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
             // per-shard send_gids/bytes).
             c.register_comm_group(base, model.gpus_per_replica())
         };
+        let cost = CostBuffers::new(cost_log_dir, pool_tag, id, &model.cost_log_manifest());
         Self {
             id,
             model,
@@ -123,8 +132,8 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
             incoming: VecDeque::new(),
             next_task: None,
             current_task: None,
-            slots: Vec::new(),
-            scratch: Vec::new(),
+            cost,
+            iter_seq: Vec::new(),
         }
     }
 
@@ -199,7 +208,17 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
 
     fn start_compute(&mut self, task: FfnTask, now: Time) -> RunningTask {
         let input = self.build_arch_input(&task.reqs);
-        let dt = self.compute_time(task.kind, &input);
+        // A Bootstrap opens a new forward pass for this slot → bump its row `iter_id`,
+        // which the rest of the pass (Bridges + Terminal) reuses.
+        let slot = task.slot as usize;
+        if matches!(task.kind, FfnTaskKind::Bootstrap) {
+            if slot >= self.iter_seq.len() {
+                self.iter_seq.resize(slot + 1, 0);
+            }
+            self.iter_seq[slot] += 1;
+        }
+        let iter_id = self.iter_seq.get(slot).copied().unwrap_or(0);
+        let dt = self.compute_time(task.kind, task.slot, iter_id, &input, now);
         RunningTask {
             compute_end: now + dt,
             task,
@@ -213,20 +232,17 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
     /// router + MoE home-reduce, `Max`-fanned over shards). So we simply split the
     /// total token count evenly across `num_dp_groups` (remainder to the first
     /// groups). L6 never groups, counts, or constructs arch vocabulary; the worker
-    /// is the only L5↔L4 bridge. The ffn arch reads only `batch_tokens` per group
-    /// (qkv / o_proj / router / MoE are token-count driven), so the attention-shaped
-    /// `ArchGroupInput` fields stay at their defaults.
+    /// is the only L5↔L4 bridge. The ffn arch reads only the per-shard token count
+    /// (qkv / o_proj / router / MoE are token-count driven), so [`FfnArchInput`] is
+    /// just `tokens_per_group` — no attention-shaped vocabulary.
     fn build_arch_input(&self, reqs: &[RequestId]) -> FfnArchInput {
         let num_groups = self.model.num_dp_groups().max(1) as u64;
         let total = self.workload_tokens(reqs);
         let base = (total / num_groups) as u32;
         let rem = total % num_groups;
         FfnArchInput {
-            groups: (0..num_groups)
-                .map(|g| ArchGroupInput {
-                    batch_tokens: base + if g < rem { 1 } else { 0 },
-                    ..Default::default()
-                })
+            tokens_per_group: (0..num_groups)
+                .map(|g| base + if g < rem { 1 } else { 0 })
                 .collect(),
         }
     }
@@ -251,37 +267,79 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
             .sum()
     }
 
-    /// Sum the wall time of the section(s) this task kind covers.
-    fn compute_time(&mut self, kind: FfnTaskKind, input: &FfnArchInput) -> Time {
+    /// Sum the wall time of the section(s) this task kind covers, and (if logging is
+    /// enabled) write one `cost_log` row per section via [`CostBuffers::run_section`]. The
+    /// eval is identical to the non-logging path — `run_section` returns the same
+    /// aggregate the timing uses — so the sim clock is unchanged. `start` is the
+    /// task's compute-window opening; sections are laid out back-to-back from it
+    /// (each row's `wall_start_ms` = the running cursor) so the trace reads in order.
+    fn compute_time(
+        &mut self,
+        kind: FfnTaskKind,
+        slot: u8,
+        iter_id: u64,
+        input: &FfnArchInput,
+        start: Time,
+    ) -> Time {
         let model = Arc::clone(&self.model);
         let last = model.num_layers().saturating_sub(1) as usize;
+        let bid = slot as u64;
         let mut ms = 0.0f64;
+        let mut cursor = start;
         match kind {
             FfnTaskKind::Bootstrap => {
-                ms += model
-                    .prologue_cost(input, &mut self.slots, &mut self.scratch)
-                    .m
-                    .time_ms as f64;
-                ms += model
-                    .pre_attn_cost(0, input, &mut self.slots, &mut self.scratch)
-                    .m
-                    .time_ms as f64;
+                let agg = self.cost.run_section(
+                    "prologue", -1, iter_id, bid, &input.tokens_per_group, cursor,
+                    |s, sc, inp| match inp {
+                        Some(i) => model.prologue_cost_with_inputs(input, s, sc, i),
+                        None => model.prologue_cost(input, s, sc),
+                    },
+                );
+                let t = agg.m.time_ms as f64;
+                ms += t;
+                cursor += Time::from_ms(t);
+                let agg = self.cost.run_section(
+                    "pre_attn", 0, iter_id, bid, &input.tokens_per_group, cursor,
+                    |s, sc, inp| match inp {
+                        Some(i) => model.pre_attn_cost_with_inputs(0, input, s, sc, i),
+                        None => model.pre_attn_cost(0, input, s, sc),
+                    },
+                );
+                let t = agg.m.time_ms as f64;
+                ms += t;
+                cursor += Time::from_ms(t);
             }
             FfnTaskKind::Bridge { upstream } => {
-                ms += model
-                    .post_attn_cost(upstream as usize, input, &mut self.slots, &mut self.scratch)
-                    .m
-                    .time_ms as f64;
+                let agg = self.cost.run_section(
+                    "post_attn", upstream as i16, iter_id, bid, &input.tokens_per_group, cursor,
+                    |s, sc, inp| match inp {
+                        Some(i) => {
+                            model.post_attn_cost_with_inputs(upstream as usize, input, s, sc, i)
+                        }
+                        None => model.post_attn_cost(upstream as usize, input, s, sc),
+                    },
+                );
+                ms += agg.m.time_ms as f64;
             }
             FfnTaskKind::Terminal => {
-                ms += model
-                    .post_attn_cost(last, input, &mut self.slots, &mut self.scratch)
-                    .m
-                    .time_ms as f64;
-                ms += model
-                    .epilogue_cost(input, &mut self.slots, &mut self.scratch)
-                    .m
-                    .time_ms as f64;
+                let agg = self.cost.run_section(
+                    "post_attn_last", last as i16, iter_id, bid, &input.tokens_per_group, cursor,
+                    |s, sc, inp| match inp {
+                        Some(i) => model.post_attn_cost_with_inputs(last, input, s, sc, i),
+                        None => model.post_attn_cost(last, input, s, sc),
+                    },
+                );
+                let t = agg.m.time_ms as f64;
+                ms += t;
+                cursor += Time::from_ms(t);
+                let agg = self.cost.run_section(
+                    "epilogue", -1, iter_id, bid, &input.tokens_per_group, cursor,
+                    |s, sc, inp| match inp {
+                        Some(i) => model.epilogue_cost_with_inputs(input, s, sc, i),
+                        None => model.epilogue_cost(input, s, sc),
+                    },
+                );
+                ms += agg.m.time_ms as f64;
             }
         }
         Time::from_ms(ms)
@@ -376,6 +434,7 @@ impl<M: FfnLayerwiseModel> IterWorker for DisaggFfnWorker<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timing::LeafMetrics;
     use crate::common::RequestId;
     use crate::test_helpers::{shared_with, test_cluster};
     use crate::timing::cache::interp::{CoverageFlags, Metrics4};
@@ -459,6 +518,8 @@ mod tests {
             PoolId(0),
             "test-gpu",
             cluster,
+            None,
+            "ffn",
         )
     }
 

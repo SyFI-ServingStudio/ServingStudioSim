@@ -8,7 +8,7 @@
 //! at the per-layer attn/ffn boundary so the two disaggregated worker pools can
 //! interleave attn-of-layer-N with ffn-of-layer-(N-1).
 
-use crate::timing::{CostManifest, LeafMetrics, SlotInput};
+use crate::timing::{CostManifest, CostManifestDoc, LeafMetrics, SlotInput};
 
 /// One attention/FFN group view for an iter-wise batch. Local/unified and PD
 /// prefill/decode workers usually pass one group; HP/DP-attn variants may pass
@@ -158,10 +158,12 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
 // Both traits use the same `(slots, scratch) -> LeafMetrics` compiled-CostTree
 // protocol as `IterwiseUnifiedModel::eval_iter`: each cost method compiles its own
 // small CostTree at build, then per call fills `slots` (cleared + resized to that
-// group's slot count) and aggregates. The `slot_input` capture (`*_with_inputs`)
-// and per-group cost_log `CostManifest` accessors are deferred until layer-wise
-// cost_log is wired; when added they mirror the iter-wise
-// `eval_iter_with_inputs` / `cost_log_manifest` shape.
+// group's slot count) and aggregates. `cost_log_manifest` exposes those per-section
+// trees as a [`CostManifestDoc`] (one named section per cost group), so the
+// section-aware `cost_log` writer can name each layer-wise row's slots. The
+// `slot_input` capture (`*_with_inputs`) mirrors the iter-wise
+// `eval_iter_with_inputs` shape: each section method has a sibling that also
+// records per-leaf inputs (default clears + falls back to the non-capturing path).
 
 /// Attn-side per-iteration input: one [`ArchGroupInput`] per attention DP shard.
 /// The attn worker fans its attention out over these groups (`max` over shards).
@@ -171,15 +173,28 @@ pub struct AttnArchInput {
     pub groups: Vec<ArchGroupInput>,
 }
 
-/// Ffn-side per-iteration input. Carries the per-DP-shard token view (driving the
-/// qkv / o_proj fan-out) whose pooled total drives router / MoE / lm_head. Routing
-/// distribution is NOT here: it is a build-time `RoutingDistribution` baked into
-/// the model at `build_configs` (see `qwen3_moe_dp_attn_ep_ffn`), so the per-iter
-/// cost only needs token counts. (Hence no `tokens_per_source_rank` field — the
-/// MoE cost path never read it; it derives `m_total` / `m_per_rank` from `groups`.)
-#[derive(Clone, Debug, Default)]
+/// Ffn-side per-iteration input. The ffn cost depends ONLY on per-DP-shard token
+/// counts — qkv / o_proj fan out per shard (`Max`-ed across shards), and their
+/// pooled total drives router / MoE / lm_head. So this carries just the counts,
+/// NOT the attention-shaped [`ArchGroupInput`] (prefill chunks / decode KV lengths)
+/// the attn side needs — the ffn never reads those. Routing distribution is also
+/// not here: it is a build-time `RoutingDistribution` baked into the model at
+/// `build_configs` (see `qwen3_moe_dp_attn_ep_ffn`).
+///
+/// `Deserialize` so this type doubles as the offline `timing-predict` ffn case:
+/// the case→input lowering is the identity (the raw token counts ARE the input),
+/// with no shorthand to expand. That is deliberate — the ffn case must NOT be
+/// forced through the attention-shaped predict case the iter/attn sides share;
+/// each arch owns the shape its cost actually reads. `deny_unknown_fields` keeps a
+/// predicted ffn case from carrying stray attention vocabulary it would silently
+/// drop.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FfnArchInput {
-    pub groups: Vec<ArchGroupInput>,
+    /// Tokens processed by each attention DP shard this forward pass (length =
+    /// `num_dp_groups`). `Max`-fanned across shards for qkv / o_proj / home-reduce;
+    /// summed for the router / MoE / lm_head total.
+    pub tokens_per_group: Vec<u32>,
 }
 
 /// Attn-side layer-wise query face (AFD attn worker). Attention is the only
@@ -224,6 +239,29 @@ pub trait AttnLayerwiseModel: Send + Sync + 'static {
         slots: &mut Vec<LeafMetrics>,
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics;
+
+    /// Like [`Self::attn_cost`], but also captures each leaf's typed kernel input
+    /// into `inputs` (slot-aligned, in visit order) for the `cost_log` `slot_input`
+    /// column. The default clears `inputs` and falls back to the non-capturing path;
+    /// the concrete model overrides it. Mirrors [`IterwiseUnifiedModel::eval_iter_with_inputs`].
+    fn attn_cost_with_inputs(
+        &self,
+        layer_idx: usize,
+        batch: &AttnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        inputs.clear();
+        self.attn_cost(layer_idx, batch, slots, scratch)
+    }
+
+    /// The `cost_log` manifest: the attn side has one cost group, so a single
+    /// `attn` section naming this shard's attention CostTree slots. Empty (default)
+    /// means no compiled CostTree; the concrete model overrides it.
+    fn cost_log_manifest(&self) -> CostManifestDoc {
+        CostManifestDoc::empty()
+    }
 }
 
 /// Ffn-side layer-wise query face (AFD ffn worker). Per layer there are two
@@ -300,4 +338,65 @@ pub trait FfnLayerwiseModel: Send + Sync + 'static {
         slots: &mut Vec<LeafMetrics>,
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics;
+
+    // ── `*_with_inputs` siblings ──────────────────────────────────────────────
+    // Each mirrors the matching cost method but also records per-leaf inputs into
+    // `inputs` (slot-aligned) for the `cost_log` `slot_input` column. The defaults
+    // clear `inputs` and fall back to the non-capturing path; the concrete model
+    // overrides them. Same shape as [`IterwiseUnifiedModel::eval_iter_with_inputs`].
+
+    fn pre_attn_cost_with_inputs(
+        &self,
+        layer_idx: usize,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        inputs.clear();
+        self.pre_attn_cost(layer_idx, batch, slots, scratch)
+    }
+
+    fn post_attn_cost_with_inputs(
+        &self,
+        layer_idx: usize,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        inputs.clear();
+        self.post_attn_cost(layer_idx, batch, slots, scratch)
+    }
+
+    fn prologue_cost_with_inputs(
+        &self,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        inputs.clear();
+        self.prologue_cost(batch, slots, scratch)
+    }
+
+    fn epilogue_cost_with_inputs(
+        &self,
+        batch: &FfnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        inputs.clear();
+        self.epilogue_cost(batch, slots, scratch)
+    }
+
+    /// The `cost_log` manifest: the ffn side has several distinct cost groups
+    /// (different CostTrees / slot sets), so one section each — `prologue`,
+    /// `pre_attn`, `post_attn`, `epilogue`. A `cost_log` row's `section` field
+    /// selects which section names its slots. Empty (default) means no compiled
+    /// CostTree; the concrete model overrides it.
+    fn cost_log_manifest(&self) -> CostManifestDoc {
+        CostManifestDoc::empty()
+    }
 }
