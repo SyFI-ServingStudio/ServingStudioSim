@@ -137,6 +137,11 @@ struct Slot {
     /// Per-slot forward-pass counter (the `cost_log` row `iter_id`), bumped when the
     /// slot wraps back to layer 0. Groups all of one forward's per-layer `attn` rows.
     iter: u64,
+    /// Whether this slot's cached attention input (`slot_inputs[idx]`) is up to date.
+    /// The input is constant across an iteration's layers, so it is rebuilt lazily on
+    /// the first compute after the flag is cleared (iteration wrap / `pending_insert`
+    /// drain / `Release`) and reused for the rest of the iteration's layers.
+    input_valid: bool,
 }
 
 impl Slot {
@@ -153,6 +158,7 @@ impl Slot {
             pull_end: Time::ZERO,
             compute_end: Time::ZERO,
             iter: 0,
+            input_valid: false,
         }
     }
 
@@ -268,11 +274,18 @@ pub struct DisaggAttnWorker<M: AttnLayerwiseModel> {
     /// the pipeline slot its `batch_id`). Honest per-layer rows; ZSTD compresses the
     /// homogeneous layers.
     cost: CostBuffers,
-    /// Reused scratch for the per-compute attention input. `build_attn_input` runs
-    /// once per layer per compute (≈num_layers × per iteration); rebuilding a fresh
-    /// `AttnArchInput` each time allocated its group `Vec`s on the hot path. Held here
-    /// and refilled in place (the `cost_slots` reuse pattern).
-    attn_input_buf: AttnArchInput,
+    /// Per-slot attention-input cache (one `AttnArchInput` per pipeline slot). The
+    /// built input depends only on the slot's `reqs`, each request's `is_prefill()`,
+    /// and each resident decode's `current_kv` — all of which change **only at the
+    /// iteration boundary** (reqs at the layer-0 open / a mid-iteration `Release`;
+    /// `current_kv` at the last-layer `advance_subset`; `is_prefill` at the ffn
+    /// Terminal's boundary flip, D16). So the same input would otherwise be rebuilt
+    /// ~num_layers times per iteration. Each slot keeps its input here and rebuilds it
+    /// only when [`Slot::input_valid`] is cleared — at the iteration wrap
+    /// (`advance_slot_layer`), a `pending_insert` drain (`open_iterations`), and a
+    /// `Release` (`on_msg_release`). Per-slot (not one shared buffer) because a slot's
+    /// cache must survive while another slot computes.
+    slot_inputs: [AttnArchInput; NUM_SLOTS],
 }
 
 // ── construction ────────────────────────────────────────────────────────────────
@@ -316,7 +329,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             promised: IdMap::default(),
             request_to_slot: IdMap::default(),
             cost,
-            attn_input_buf: AttnArchInput { groups: Vec::new() },
+            slot_inputs: std::array::from_fn(|_| AttnArchInput { groups: Vec::new() }),
         }
     }
 }
@@ -406,6 +419,8 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             let s = &mut self.slots[slot_idx];
             s.reqs.retain(|&r| r != req);
             s.pending_insert.retain(|&r| r != req);
+            // `reqs` changed mid-iteration ⇒ the cached attention input is stale.
+            s.input_valid = false;
             // A slot emptied by release drops back to dormant: clear `iter_announced`
             // so the next members admitted into it reopen the iteration (otherwise the
             // stale announce flag would block `open_iterations`).
@@ -624,6 +639,8 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
                         self.begin_decode(rid); // prefilled handoff: resident decode now
                     }
                 }
+                // `reqs` grew ⇒ rebuild the cached attention input on the next compute.
+                self.slots[idx].input_valid = false;
             }
             let reqs = self.slots[idx].reqs.clone();
             events.push(AttnWorkerEvent::IterStart {
@@ -756,6 +773,10 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             s.iter_announced = false;
             // Wrapped past the last layer → a new forward pass for this slot opens.
             s.iter += 1;
+            // Last-layer `advance_subset` grew every decode's `current_kv` and the ffn
+            // Terminal may have flipped a prefill→decode at this boundary ⇒ the cached
+            // attention input must be rebuilt for the new iteration's first compute.
+            s.input_valid = false;
         }
     }
 
@@ -820,7 +841,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         // closure (same aggregate the timing uses) and writes one `attn` row when
         // logging — `batch_id` = the pipeline slot, `layer` = this layer.
         let model = Arc::clone(&self.model);
-        let input = &self.attn_input_buf;
+        let input = &self.slot_inputs[idx];
         let m = self.cost.run_section(
             "attn",
             layer as i16,
@@ -836,13 +857,16 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         self.slots[idx].compute_end = now + Time::from_ms(m.m.time_ms as f64);
     }
 
-    /// Refill the held [`attn_input_buf`](Self::attn_input_buf) for slot `idx` in
-    /// place (D4: exactly one DP-shard group). Owns the buffer out with
-    /// `mem::replace` so `self` stays fully borrowable (store + batch reads) while
-    /// filling, then restores it — reusing the group's `Vec` capacities across the
-    /// per-layer computes instead of allocating a fresh input each time.
+    /// Rebuild slot `idx`'s cached attention input ([`slot_inputs`](Self::slot_inputs))
+    /// in place (D4: exactly one DP-shard group), unless it is still valid for this
+    /// iteration. The group's `Vec` capacities persist across rebuilds. Filling reads
+    /// disjoint fields (`slot_inputs` vs `slots`/`batch`/`requests`) so no `mem::replace`
+    /// dance is needed. See [`Slot::input_valid`] for the invalidation points.
     fn build_attn_input(&mut self, idx: usize) {
-        let mut buf = std::mem::replace(&mut self.attn_input_buf, AttnArchInput { groups: Vec::new() });
+        if self.slots[idx].input_valid {
+            return; // cache hit: `slot_inputs[idx]` is up to date for this iteration
+        }
+        let buf = &mut self.slot_inputs[idx];
         if buf.groups.is_empty() {
             buf.groups.push(ArchGroupInput::default());
         }
@@ -868,7 +892,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             }
         }
         drop(store);
-        self.attn_input_buf = buf;
+        self.slots[idx].input_valid = true;
     }
 
     /// This shard's authoritative resident KV length for a request (fed to the
