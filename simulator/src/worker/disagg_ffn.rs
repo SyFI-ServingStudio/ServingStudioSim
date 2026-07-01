@@ -27,16 +27,16 @@
 //! L4 `FfnArchInput` (L6 never groups, counts, or touches arch vocabulary).
 //! cost_log goes through [`CostBuffers`]: one row per section per layer, tagged
 //! `section` + `layer` + `batch_id` = the pipeline slot (so a slot's whole forward
-//! shares an `iter_id`). The comm group is registered single-leg for now; the
-//! attn-TP-wide sizing + per-shard byte split are a Phase-6 calibration item.
+//! shares an `iter_id`). Attn→ffn input pulls preserve one source chunk per
+//! attention worker, so the source comm-group ownership stays with the producer.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{FfnArchInput, FfnLayerwiseModel};
-use crate::common::{PoolId, RequestId, Time, WorkerId};
 use crate::common::SharedRequests;
+use crate::common::{PoolId, RequestId, Time, WorkerId};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
@@ -105,20 +105,11 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
             let mut c = cluster.borrow_mut();
             let base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
             // One comm group spanning the whole ffn replica's residing fabric
-            // (`gpus_per_replica` = ep_size links). A `FfnTask` is ONE fused
-            // micro-batch handoff — a single `send_gid` / `pull_bytes` covering all
-            // DP shards in `groups` — so the transfer spreads across all ep_size
-            // residing ranks. The link count drives `submit_transfer`'s per-leg time
-            // (`bytes / count / per_link_bw`): sizing it to ep_size keeps the recv
-            // leg from being an artificial single-link bottleneck against the multi-
-            // link attn sender (count=1 would make every handoff ~ep_size× too slow).
-            //
-            // Simplification: collapsing the num_dp_groups senders into one fused
-            // pull averages out per-DP-shard COMM imbalance (the COMPUTE side already
-            // models it via the Max fan-out over groups). The faithful refinement —
-            // num_dp_groups separate transfers (each attn_tp_size links) with a max
-            // over them — is a Phase-4 flow decision (it changes `FfnTask` to carry
-            // per-shard send_gids/bytes).
+            // (`gpus_per_replica` = ep_size links). A `FfnTask` carries the producer
+            // sources reported by the attn workers; the worker submits one transfer per
+            // source into this recv endpoint. Keeping the ffn recv group at ep_size
+            // prevents the destination leg from degenerating into an artificial
+            // single-link bottleneck.
             c.register_comm_group(base, model.gpus_per_replica())
         };
         let cost = CostBuffers::new(cost_log_dir, pool_tag, id, &model.cost_log_manifest());
@@ -196,18 +187,21 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
 
     fn start_pull(&mut self, task: FfnTask, now: Time) -> PullingTask {
         // Bootstrap input is local (the embedded tokens) → no transfer.
-        let pull_end = if task.pull_bytes == 0 {
+        let pull_end = if task.pull_sources.is_empty() {
             now
         } else {
-            self.cluster
-                .borrow_mut()
-                .submit_transfer(now, task.send_gid, self.gid, task.pull_bytes)
+            let mut cluster = self.cluster.borrow_mut();
+            task.pull_sources
+                .iter()
+                .filter(|source| source.bytes > 0)
+                .fold(now, |end, source| {
+                    end.max(cluster.submit_transfer(now, source.send_gid, self.gid, source.bytes))
+                })
         };
         PullingTask { task, pull_end }
     }
 
     fn start_compute(&mut self, task: FfnTask, now: Time) -> RunningTask {
-        let input = self.build_arch_input(&task.reqs);
         // A Bootstrap opens a new forward pass for this slot → bump its row `iter_id`,
         // which the rest of the pass (Bridges + Terminal) reuses.
         let slot = task.slot as usize;
@@ -218,7 +212,15 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
             self.iter_seq[slot] += 1;
         }
         let iter_id = self.iter_seq.get(slot).copied().unwrap_or(0);
-        let dt = self.compute_time(task.kind, task.slot, iter_id, &input, now);
+        // Empty batches are valid control-plane no-ops in the layer -1 / all-worker
+        // barrier path. They still emit the normal downstream event, but must not hit
+        // model cost/profile lookup with zero-token shapes.
+        let dt = if task.reqs.is_empty() {
+            Time::ZERO
+        } else {
+            let input = self.build_arch_input(&task.reqs);
+            self.compute_time(task.kind, task.slot, iter_id, &input, now)
+        };
         RunningTask {
             compute_end: now + dt,
             task,
@@ -289,7 +291,12 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
         match kind {
             FfnTaskKind::Bootstrap => {
                 let agg = self.cost.run_section(
-                    "prologue", -1, iter_id, bid, &input.tokens_per_group, cursor,
+                    "prologue",
+                    -1,
+                    iter_id,
+                    bid,
+                    &input.tokens_per_group,
+                    cursor,
                     |s, sc, inp| match inp {
                         Some(i) => model.prologue_cost_with_inputs(input, s, sc, i),
                         None => model.prologue_cost(input, s, sc),
@@ -299,7 +306,12 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                 ms += t;
                 cursor += Time::from_ms(t);
                 let agg = self.cost.run_section(
-                    "pre_attn", 0, iter_id, bid, &input.tokens_per_group, cursor,
+                    "pre_attn",
+                    0,
+                    iter_id,
+                    bid,
+                    &input.tokens_per_group,
+                    cursor,
                     |s, sc, inp| match inp {
                         Some(i) => model.pre_attn_cost_with_inputs(0, input, s, sc, i),
                         None => model.pre_attn_cost(0, input, s, sc),
@@ -311,7 +323,12 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
             }
             FfnTaskKind::Bridge { upstream } => {
                 let agg = self.cost.run_section(
-                    "post_attn", upstream as i16, iter_id, bid, &input.tokens_per_group, cursor,
+                    "post_attn",
+                    upstream as i16,
+                    iter_id,
+                    bid,
+                    &input.tokens_per_group,
+                    cursor,
                     |s, sc, inp| match inp {
                         Some(i) => {
                             model.post_attn_cost_with_inputs(upstream as usize, input, s, sc, i)
@@ -323,7 +340,12 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
             }
             FfnTaskKind::Terminal => {
                 let agg = self.cost.run_section(
-                    "post_attn_last", last as i16, iter_id, bid, &input.tokens_per_group, cursor,
+                    "post_attn_last",
+                    last as i16,
+                    iter_id,
+                    bid,
+                    &input.tokens_per_group,
+                    cursor,
                     |s, sc, inp| match inp {
                         Some(i) => model.post_attn_cost_with_inputs(last, input, s, sc, i),
                         None => model.post_attn_cost(last, input, s, sc),
@@ -333,7 +355,12 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                 ms += t;
                 cursor += Time::from_ms(t);
                 let agg = self.cost.run_section(
-                    "epilogue", -1, iter_id, bid, &input.tokens_per_group, cursor,
+                    "epilogue",
+                    -1,
+                    iter_id,
+                    bid,
+                    &input.tokens_per_group,
+                    cursor,
                     |s, sc, inp| match inp {
                         Some(i) => model.epilogue_cost_with_inputs(input, s, sc, i),
                         None => model.epilogue_cost(input, s, sc),
@@ -434,11 +461,12 @@ impl<M: FfnLayerwiseModel> IterWorker for DisaggFfnWorker<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timing::LeafMetrics;
     use crate::common::RequestId;
     use crate::test_helpers::{shared_with, test_cluster};
     use crate::timing::cache::interp::{CoverageFlags, Metrics4};
+    use crate::timing::LeafMetrics;
     use crate::worker::gpu_cluster::SharedGpuCluster;
+    use crate::worker::FfnPullSource;
     use std::rc::Rc;
 
     struct FakeFfn {
@@ -540,8 +568,7 @@ mod tests {
             kind: FfnTaskKind::Bootstrap,
             slot: 0,
             reqs: vec![RequestId(0)],
-            send_gid: 0,
-            pull_bytes: 0,
+            pull_sources: Vec::new(),
         }));
         let mut events = Vec::new();
         for step in 0..10u64 {
@@ -562,6 +589,33 @@ mod tests {
     }
 
     #[test]
+    fn empty_bootstrap_is_zero_time_control_noop() {
+        let store = shared_with(&[]);
+        let mut w = worker(Rc::clone(&store), test_cluster());
+        w.enqueue(FfnWorkerMsg::Task(FfnTask {
+            kind: FfnTaskKind::Bootstrap,
+            slot: 0,
+            reqs: Vec::new(),
+            pull_sources: Vec::new(),
+        }));
+        let mut events = Vec::new();
+        let wake = w.tick(Time::ZERO, &mut events);
+
+        assert_eq!(wake, None, "empty Bootstrap finishes in the current tick");
+        assert_eq!(
+            events,
+            vec![FfnWorkerEvent::SectionReady {
+                worker: WorkerId(0),
+                slot: 0,
+                kind: FfnTaskKind::Bootstrap,
+                reqs: Vec::new(),
+                out_send_gid: w.gid,
+                out_bytes: 0,
+            }]
+        );
+    }
+
+    #[test]
     fn terminal_records_token_and_completes() {
         // decode_len 1 → the single token completes the request.
         let store = shared_with(&[(0, 8, 1)]);
@@ -570,8 +624,7 @@ mod tests {
             kind: FfnTaskKind::Terminal,
             slot: 0,
             reqs: vec![RequestId(0)],
-            send_gid: 0,
-            pull_bytes: 0,
+            pull_sources: Vec::new(),
         }));
         let mut events = Vec::new();
         for step in 0..10u64 {
@@ -591,6 +644,31 @@ mod tests {
     }
 
     #[test]
+    fn empty_terminal_is_zero_time_control_noop() {
+        let store = shared_with(&[]);
+        let mut w = worker(Rc::clone(&store), test_cluster());
+        w.enqueue(FfnWorkerMsg::Task(FfnTask {
+            kind: FfnTaskKind::Terminal,
+            slot: 0,
+            reqs: Vec::new(),
+            pull_sources: Vec::new(),
+        }));
+        let mut events = Vec::new();
+        let wake = w.tick(Time::ZERO, &mut events);
+
+        assert_eq!(wake, None, "empty Terminal finishes in the current tick");
+        assert_eq!(
+            events,
+            vec![FfnWorkerEvent::IterComplete {
+                worker: WorkerId(0),
+                slot: 0,
+                reqs: Vec::new(),
+                completed: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
     fn double_buffer_pulls_bridge_while_bootstrap_computes() {
         let store = shared_with(&[(0, 8, 4), (1, 8, 4)]);
         let cluster = test_cluster();
@@ -601,29 +679,48 @@ mod tests {
             kind: FfnTaskKind::Bootstrap,
             slot: 0,
             reqs: vec![RequestId(0)],
-            send_gid: 0,
-            pull_bytes: 0,
+            pull_sources: Vec::new(),
         }));
         w.enqueue(FfnWorkerMsg::Task(FfnTask {
             kind: FfnTaskKind::Bridge { upstream: 0 },
             slot: 1,
             reqs: vec![RequestId(1)],
-            send_gid: sender,
-            pull_bytes: 4096,
+            pull_sources: vec![FfnPullSource {
+                send_gid: sender,
+                bytes: 4096,
+            }],
         }));
         let mut events = Vec::new();
         // At t=0 the Bootstrap is already computing AND the Bridge is already
         // pulling (double-buffer) — the worker reports a future wakeup, not idle.
         let wake = w.tick(Time::ZERO, &mut events);
-        assert!(wake.is_some(), "worker has live compute + pull, must wake later");
+        assert!(
+            wake.is_some(),
+            "worker has live compute + pull, must wake later"
+        );
         assert!(w.current_task.is_some(), "Bootstrap should be computing");
-        assert!(w.next_task.is_some(), "Bridge should be pulling concurrently");
+        assert!(
+            w.next_task.is_some(),
+            "Bridge should be pulling concurrently"
+        );
         for step in 1..200u64 {
             w.tick(Time::from_ms(step as f64), &mut events);
         }
         // Both sections finish, Bootstrap first. Both are Bridge/Bootstrap → SectionReady.
         assert_eq!(events.len(), 2, "both tasks complete");
-        assert!(matches!(events[0], FfnWorkerEvent::SectionReady { kind: FfnTaskKind::Bootstrap, .. }));
-        assert!(matches!(events[1], FfnWorkerEvent::SectionReady { kind: FfnTaskKind::Bridge { upstream: 0 }, .. }));
+        assert!(matches!(
+            events[0],
+            FfnWorkerEvent::SectionReady {
+                kind: FfnTaskKind::Bootstrap,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            FfnWorkerEvent::SectionReady {
+                kind: FfnTaskKind::Bridge { upstream: 0 },
+                ..
+            }
+        ));
     }
 }

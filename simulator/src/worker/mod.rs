@@ -29,9 +29,9 @@ pub use iter_worker::IterWorker;
 pub use pd_decode::PdDecodeWorker;
 pub use pd_prefill::PdPrefillWorker;
 pub use types::{
-    AttnWorkerEvent, AttnWorkerMsg, BatchFsmState, FfnTask, FfnTaskKind, FfnWorkerEvent,
-    FfnWorkerMsg, IterCursor, IterEndState, PdDecodeEvent, PdDecodeMsg, PdPrefillEvent,
-    PdPrefillMsg, TransferPlan, WorkerConfig, WorkerEventCommon, WorkerFsmState, WorkerMsgCommon,
-    WorkerStatus,
+    AttnWorkerEvent, AttnWorkerMsg, BatchFsmState, FfnPullSource, FfnTask, FfnTaskKind,
+    FfnWorkerEvent, FfnWorkerMsg, IterCursor, IterEndState, PdDecodeEvent, PdDecodeMsg,
+    PdPrefillEvent, PdPrefillMsg, TransferPlan, WorkerConfig, WorkerEventCommon, WorkerFsmState,
+    WorkerMsgCommon, WorkerStatus,
 };
 pub use unified::BareboneWorker;

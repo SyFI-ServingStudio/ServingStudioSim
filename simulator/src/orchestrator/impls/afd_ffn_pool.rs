@@ -137,8 +137,7 @@ mod tests {
             kind: FfnTaskKind::Bootstrap,
             slot: 0,
             reqs: vec![RequestId(0)],
-            send_gid: 0,
-            pull_bytes: 0,
+            pull_sources: Vec::new(),
         });
         let mut events = Vec::new();
         for step in 0..10u64 {
@@ -164,8 +163,7 @@ mod tests {
             kind: FfnTaskKind::Terminal,
             slot: 2,
             reqs: vec![RequestId(0)],
-            send_gid: 0,
-            pull_bytes: 0,
+            pull_sources: Vec::new(),
         });
         let mut events = Vec::new();
         for step in 0..10u64 {
