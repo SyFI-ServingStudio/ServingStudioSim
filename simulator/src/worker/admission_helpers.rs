@@ -7,9 +7,7 @@
 //! std-only on purpose — `decodes` is a `Vec<(RequestId, DecodeReqState)>` to
 //! keep insertion order deterministic without pulling in `indexmap`/`rustc_hash`.
 
-use std::collections::HashMap;
-
-use crate::common::RequestId;
+use crate::common::{IdMap, RequestId};
 
 // ════════════════════════════════════════════════════════════════════════════
 // KvPool — passive KV resource (§2.1). Holds no per-request state; the decode
@@ -139,7 +137,7 @@ pub struct Batch {
     /// (`build_attn_input`), and a linear `decodes.iter().find` there was O(decodes)
     /// per lookup → O(N²) as batches fill. `decodes` stays the source of truth
     /// (order + values untouched); this only accelerates by-id reads.
-    index: HashMap<RequestId, usize>,
+    index: IdMap<RequestId, usize>,
     /// Transient: ids admitted as prefill this iter; cleared in `complete_iter`.
     pub prefill_admits: Vec<RequestId>,
     /// Cached `projected_peak`. The projection is non-increasing as decodes
@@ -159,7 +157,7 @@ impl Batch {
             decodes: Vec::new(),
             prefill_admits: Vec::new(),
             cached_peak: 0,
-            index: HashMap::new(),
+            index: IdMap::default(),
         }
     }
 

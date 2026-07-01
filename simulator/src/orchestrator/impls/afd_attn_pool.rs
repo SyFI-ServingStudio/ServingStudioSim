@@ -49,11 +49,10 @@
 //! out. All transitions are forward; a blocked slot simply waits for the ffn it
 //! already dispatched.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::arch::contract::AttnLayerwiseModel;
-use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{IdMap, PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::worker::{
     AttnWorkerEvent, AttnWorkerMsg, DisaggAttnWorker, FfnPullSource, FfnTask, FfnTaskKind,
     FfnWorkerEvent, IterWorker, SharedGpuCluster, WorkerConfig,
@@ -159,7 +158,7 @@ pub struct AfdAttnPoolController<M: AttnLayerwiseModel> {
     num_layers: u16,
     slots: [SlotSched; NUM_SLOTS],
     /// req → its pinned worker (sticky, KV locality): routes `Release` on completion.
-    req_worker: HashMap<RequestId, WorkerId>,
+    req_worker: IdMap<RequestId, WorkerId>,
 }
 
 impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
@@ -205,7 +204,7 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
             workers,
             num_layers,
             slots: std::array::from_fn(|_| SlotSched::new()),
-            req_worker: HashMap::new(),
+            req_worker: IdMap::default(),
         }
     }
 

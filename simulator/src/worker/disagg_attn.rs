@@ -67,12 +67,12 @@
 //! points) → the tick / pipeline loop → its helpers, each following the function
 //! that calls it → tests.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, AttnArchInput, AttnLayerwiseModel};
-use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{IdMap, PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::worker::admission_helpers::Batch;
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -260,9 +260,9 @@ pub struct DisaggAttnWorker<M: AttnLayerwiseModel> {
     /// accounting only — feeds the `try_admit` group-promised total; a request
     /// leaves it at `begin_decode`. (NOT the prefill/decode discriminator: that is
     /// the request's store `is_prefill()` status.)
-    promised: HashMap<RequestId, u64>,
+    promised: IdMap<RequestId, u64>,
     /// Sticky request → slot routing (set at admission; survives decode re-entry).
-    request_to_slot: HashMap<RequestId, usize>,
+    request_to_slot: IdMap<RequestId, usize>,
     /// Eval scratch + the per-section `cost_log` writer. The attn side has one cost
     /// group, so every row is `section = "attn"` (the layer is the row's `layer`,
     /// the pipeline slot its `batch_id`). Honest per-layer rows; ZSTD compresses the
@@ -308,8 +308,8 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             batch: Batch::new(0, kv_capacity),
             slots: std::array::from_fn(|_| Slot::new()),
             worker_pending: PendingQueue::default(),
-            promised: HashMap::new(),
-            request_to_slot: HashMap::new(),
+            promised: IdMap::default(),
+            request_to_slot: IdMap::default(),
             cost,
         }
     }
