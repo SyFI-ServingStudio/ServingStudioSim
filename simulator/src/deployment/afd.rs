@@ -211,6 +211,9 @@ where
     MF: crate::arch::contract::FfnLayerwiseModel,
 {
     let cluster: SharedGpuCluster = Rc::new(RefCell::new(GpuCluster::new(cost)));
+    // Kept for the post-registration `attach_logger` — `cost_log_dir` is moved
+    // into the ffn pool below.
+    let net_log_dir = cost_log_dir.clone();
     let attn = AfdAttnPoolController::new(
         attn_replicas,
         attn_model,
@@ -231,6 +234,12 @@ where
         &cluster,
         cost_log_dir,
     );
+    // Both pools have now self-registered their comm groups (with owner identity);
+    // attach the `gpu_cluster` log so every attn↔ffn transfer is recorded. Runs
+    // without a log dir leave the cluster logger-less.
+    if let Some(dir) = net_log_dir.as_deref() {
+        cluster.borrow_mut().attach_logger(dir);
+    }
     Box::new(AfdFlow::new(store, attn, ffn, cluster))
 }
 

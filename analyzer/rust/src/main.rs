@@ -68,6 +68,11 @@ enum Command {
         /// Cap on total slice pairs (enforced at iteration granularity).
         #[arg(long, default_value_t = 200_000)]
         max_slices: usize,
+        /// Expand `Max` (parallel) branches, each on its own child-track lane
+        /// (the legacy view). Default (off) collapses each `Max` to its critical
+        /// (bottleneck) branch inline, keeping compute on a single lane.
+        #[arg(long)]
+        expanded: bool,
     },
     /// Render a human-readable cost tree (time + percentage) per iteration to
     /// `reports/iter_breakdown.ans` from the standard `cost_log` + `cost_manifest`.
@@ -105,9 +110,10 @@ async fn main() -> Result<()> {
             regions,
             region_ms,
             max_slices,
+            expanded,
         } => {
             let ctx = build_session();
-            trace::run(&ctx, &log_dir, regions, region_ms, max_slices).await
+            trace::run(&ctx, &log_dir, regions, region_ms, max_slices, expanded).await
         }
         Command::GenIterBreakdown {
             log_dir,

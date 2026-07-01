@@ -103,7 +103,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             let gpu_base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
             // Arch invariant: `num_attn_shards() ≤ gpus_per_replica`, so the
             // attn-shard prefix is the comm group covering KV storage.
-            c.register_comm_group(gpu_base, model.num_attn_shards().max(1))
+            c.register_comm_group(gpu_base, model.num_attn_shards().max(1), pool_tag, id.0)
         };
         // KvPool capacity in tokens. See `unified::new` for the derivation:
         // group memory = `num_attn_shards × attn_kv_bytes`, divided by the

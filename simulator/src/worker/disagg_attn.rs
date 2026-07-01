@@ -222,7 +222,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             let mut c = cluster.borrow_mut();
             let base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
             // The attn-shard prefix is the comm group used as the QKV recv endpoint.
-            c.register_comm_group(base, model.num_attn_shards().max(1))
+            c.register_comm_group(base, model.num_attn_shards().max(1), pool_tag, id.0)
         };
         // KV capacity in tokens: per-GPU budget × the shard's GPUs / total wire KV
         // bytes per token (same sizing as the PD decode worker).
@@ -724,7 +724,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         let end = self
             .cluster
             .borrow_mut()
-            .submit_transfer(now, send_gid, self.recv_gid, bytes);
+            .submit_transfer(now, send_gid, self.recv_gid, bytes, "afd_attn_pull", "");
         self.slots[idx].pull_end = end;
     }
 
@@ -889,7 +889,7 @@ mod tests {
     fn register_test_sender(cluster: &SharedGpuCluster) -> u16 {
         let mut c = cluster.borrow_mut();
         c.allocate(99, 99, 1, "ffn-gpu");
-        c.register_comm_group(0, 1)
+        c.register_comm_group(0, 1, "ffn", 99)
     }
 
     /// All `AttnLayerOutputsReady` events emitted so far (the per-layer handoffs),

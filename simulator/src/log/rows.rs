@@ -15,7 +15,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field};
 
 use crate::log::schemas::{
-    cost_log_schema, group_input_fields, request_slo_schema, request_state_schema,
+    cost_log_schema, gpu_cluster_schema, group_input_fields, request_slo_schema,
+    request_state_schema,
 };
 use crate::timing::SlotInput;
 
@@ -456,6 +457,63 @@ pub(crate) fn slo_to_record_batch(
             Arc::new(Float32Array::from(tpot_max)),
             Arc::new(Float32Array::from(finish_decode)),
             Arc::new(UInt32Array::from(prefill_processed)),
+        ],
+    )?)
+}
+
+/// One `gpu_cluster` row — a single cross-worker transfer submitted to the shared
+/// [`GpuCluster`](crate::worker::gpu_cluster::GpuCluster). Both endpoints'
+/// identity is resolved from the two comm groups: `src_*` is the `send_gid`
+/// group's owner, `dst_*` the `recv_gid` group's owner. Pool tags are `&'static
+/// str` (worker pool literals); `tag` is the free-form per-deployment label
+/// (owned, since callers may build it from request ids). One row is small and
+/// transfers are far rarer than cost-log rows, so — unlike [`CostLogChunk`] —
+/// there is no flat-buffer optimization; the [`NetworkLogger`](crate::log::NetworkLogger)
+/// just buffers a `Vec<GpuClusterEntry>`.
+#[derive(Clone, Debug)]
+pub struct GpuClusterEntry {
+    pub net_start_ms: f64,
+    pub net_end_ms: f64,
+    pub src_pool_tag: &'static str,
+    pub src_worker_id: u16,
+    pub dst_pool_tag: &'static str,
+    pub dst_worker_id: u16,
+    pub send_gid: u16,
+    pub recv_gid: u16,
+    pub bytes: u64,
+    /// Stable event category (`pd_kv_pull` / `afd_ffn_pull` / `afd_attn_pull`).
+    pub kind: &'static str,
+    /// Free-form per-deployment identifier (e.g. a request-id list); may be empty.
+    pub tag: String,
+}
+
+pub(crate) fn gpu_cluster_to_record_batch(entries: &[GpuClusterEntry]) -> Result<RecordBatch> {
+    let net_start: Vec<f64> = entries.iter().map(|e| e.net_start_ms).collect();
+    let net_end: Vec<f64> = entries.iter().map(|e| e.net_end_ms).collect();
+    let src_pool: Vec<&str> = entries.iter().map(|e| e.src_pool_tag).collect();
+    let src_worker: Vec<u16> = entries.iter().map(|e| e.src_worker_id).collect();
+    let dst_pool: Vec<&str> = entries.iter().map(|e| e.dst_pool_tag).collect();
+    let dst_worker: Vec<u16> = entries.iter().map(|e| e.dst_worker_id).collect();
+    let send_gid: Vec<u16> = entries.iter().map(|e| e.send_gid).collect();
+    let recv_gid: Vec<u16> = entries.iter().map(|e| e.recv_gid).collect();
+    let bytes: Vec<u64> = entries.iter().map(|e| e.bytes).collect();
+    let kind: Vec<&str> = entries.iter().map(|e| e.kind).collect();
+    let tag: Vec<&str> = entries.iter().map(|e| e.tag.as_str()).collect();
+
+    Ok(RecordBatch::try_new(
+        gpu_cluster_schema(),
+        vec![
+            Arc::new(Float64Array::from(net_start)),
+            Arc::new(Float64Array::from(net_end)),
+            Arc::new(StringArray::from(src_pool)),
+            Arc::new(UInt16Array::from(src_worker)),
+            Arc::new(StringArray::from(dst_pool)),
+            Arc::new(UInt16Array::from(dst_worker)),
+            Arc::new(UInt16Array::from(send_gid)),
+            Arc::new(UInt16Array::from(recv_gid)),
+            Arc::new(UInt64Array::from(bytes)),
+            Arc::new(StringArray::from(kind)),
+            Arc::new(StringArray::from(tag)),
         ],
     )?)
 }

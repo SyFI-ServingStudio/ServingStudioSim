@@ -55,6 +55,19 @@ pub async fn register_cost_log(ctx: &SessionContext, log_dir: &std::path::Path) 
     register_if_exists(ctx, COST_LOG_TABLE, path).await
 }
 
+/// Canonical table name for the single-file `gpu_cluster` stream.
+pub const GPU_CLUSTER_TABLE: &str = "gpu_cluster";
+
+/// Register the run's single `raw/gpu_cluster.parquet` (the cross-worker transfer
+/// log) as [`GPU_CLUSTER_TABLE`]. Unlike `cost_log`, this is ONE file (the whole
+/// run shares one `GpuCluster` writer), so no directory union. Returns `false`
+/// when absent — the transfer overlay is optional, so callers skip it rather than
+/// `bail!` (e.g. a unified/single-worker run that never transfers).
+pub async fn register_gpu_cluster(ctx: &SessionContext, log_dir: &std::path::Path) -> Result<bool> {
+    let path = crate::io::resolve_artifact_path(log_dir, "gpu_cluster.parquet");
+    register_if_exists(ctx, GPU_CLUSTER_TABLE, path).await
+}
+
 /// Drift guard: fail with a clear message if any expected column is absent from
 /// a registered table, instead of letting a later extraction read NaN/null.
 pub async fn require_columns(ctx: &SessionContext, table: &str, columns: &[&str]) -> Result<()> {

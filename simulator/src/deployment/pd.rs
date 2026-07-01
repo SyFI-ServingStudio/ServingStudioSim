@@ -225,6 +225,9 @@ where
     MP: IterwiseUnifiedModel + 'static,
     MD: IterwiseUnifiedModel + 'static,
 {
+    // Kept for the post-build `attach_logger` — `log_dir` itself is moved into the
+    // two worker factories below (each opens its own per-worker `cost_log`).
+    let net_log_dir = log_dir.clone();
     let prefill_factory: UnifiedWorkerFactory<MP, PdPrefillWorker<MP>> = UnifiedWorkerFactory::new(
         prefill_model,
         std::rc::Rc::clone(&store),
@@ -243,13 +246,20 @@ where
         "decode",
         PdDecodeWorker::<MD>::new as WorkerBuildFn<MD, PdDecodeWorker<MD>>,
     );
-    Box::new(PdFlow::new(
+    let flow = PdFlow::new(
         &prefill_cfg,
         &prefill_factory,
         &decode_cfg,
         &decode_factory,
         cost,
-    ))
+    );
+    // The shared cluster is built inside `PdFlow::new`; attach the `gpu_cluster`
+    // log now that its workers have self-registered their comm groups (with owner
+    // identity). Runs without a log dir leave the cluster logger-less.
+    if let Some(dir) = net_log_dir.as_deref() {
+        flow.cluster().borrow_mut().attach_logger(dir);
+    }
+    Box::new(flow)
 }
 
 /// Build the PD KV-transfer cost source: the profiled `p2p_inter` curve for the

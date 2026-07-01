@@ -152,6 +152,35 @@ pub fn network_event_schema() -> Arc<Schema> {
     ]))
 }
 
+/// `gpu_cluster` — one row per cross-worker transfer submitted to the shared
+/// [`GpuCluster`](crate::worker::gpu_cluster::GpuCluster) (the run's single
+/// transfer oracle), written by the [`NetworkLogger`](crate::log::NetworkLogger).
+/// Unlike the ref-shaped [`network_event_schema`] (reserved for future full
+/// disagg-pull semantics), this is the *actual* `submit_transfer` surface: the
+/// on-wire window (`net_start_ms` / `net_end_ms`, both incl. queueing on the same
+/// sim clock as `cost_log.wall_start_ms`), **both** endpoints' worker identity
+/// (`src_*` = sender = `send_gid`'s comm-group owner; `dst_*` = receiver =
+/// `recv_gid`'s owner), the two comm-group ids, the byte count, and a stable
+/// `kind` + free-form `tag` each deployment fills to label the event. All columns
+/// are always populated (no ref-style null padding). The `(dst_pool_tag,
+/// dst_worker_id)` pair is the same key `cost_log` uses, so `analyze trace`
+/// overlays a transfer onto the receiving worker's row.
+pub fn gpu_cluster_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("net_start_ms", DataType::Float64, false),
+        Field::new("net_end_ms", DataType::Float64, false),
+        Field::new("src_pool_tag", DataType::Utf8, false),
+        Field::new("src_worker_id", DataType::UInt16, false),
+        Field::new("dst_pool_tag", DataType::Utf8, false),
+        Field::new("dst_worker_id", DataType::UInt16, false),
+        Field::new("send_gid", DataType::UInt16, false),
+        Field::new("recv_gid", DataType::UInt16, false),
+        Field::new("bytes", DataType::UInt64, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("tag", DataType::Utf8, false),
+    ]))
+}
+
 /// `request_state` (§7.1) — one **aggregate** row per snapshot tick (not per
 /// request). The analyzer's only consumer (`throughput/segment.rs`) reduces the
 /// per-request rows to `Σ completed_input_len` / `Σ completed_output_len` per
@@ -214,6 +243,7 @@ pub fn request_slo_schema() -> Arc<Schema> {
 /// and analyzer file-discovery.
 pub const ALL_STREAMS: &[&str] = &[
     "cost_log",
+    "gpu_cluster",
     "kv_snapshot",
     "network_event",
     "request_state",

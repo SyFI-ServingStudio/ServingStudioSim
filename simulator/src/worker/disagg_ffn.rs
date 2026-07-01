@@ -110,7 +110,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
             // source into this recv endpoint. Keeping the ffn recv group at ep_size
             // prevents the destination leg from degenerating into an artificial
             // single-link bottleneck.
-            c.register_comm_group(base, model.gpus_per_replica())
+            c.register_comm_group(base, model.gpus_per_replica(), pool_tag, id.0)
         };
         let cost = CostBuffers::new(cost_log_dir, pool_tag, id, &model.cost_log_manifest());
         Self {
@@ -195,7 +195,14 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                 .iter()
                 .filter(|source| source.bytes > 0)
                 .fold(now, |end, source| {
-                    end.max(cluster.submit_transfer(now, source.send_gid, self.gid, source.bytes))
+                    end.max(cluster.submit_transfer(
+                        now,
+                        source.send_gid,
+                        self.gid,
+                        source.bytes,
+                        "afd_ffn_pull",
+                        "",
+                    ))
                 })
         };
         PullingTask { task, pull_end }
@@ -556,7 +563,7 @@ mod tests {
     fn register_test_sender(cluster: &SharedGpuCluster) -> u16 {
         let mut c = cluster.borrow_mut();
         c.allocate(99, 99, 1, "attn-gpu");
-        c.register_comm_group(0, 1)
+        c.register_comm_group(0, 1, "attn", 99)
     }
 
     #[test]

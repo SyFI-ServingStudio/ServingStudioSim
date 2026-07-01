@@ -17,7 +17,7 @@
 pub mod manifest;
 mod place;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -27,10 +27,10 @@ use datafusion::prelude::SessionContext;
 use crate::io::trace_path;
 use crate::perfetto::{Annotation, TraceWriter};
 use crate::session::{
-    col, collect, register_cost_log, require_columns, value_f32_list, value_f64, value_str_list,
-    value_string, COST_LOG_TABLE,
+    col, collect, register_cost_log, register_gpu_cluster, require_columns, value_f32_list,
+    value_f64, value_str_list, value_string, COST_LOG_TABLE, GPU_CLUSTER_TABLE,
 };
-use place::{slice_pairs_per_iter, Placer};
+use place::{critical_pairs_per_iter, slice_pairs_per_iter, Placer};
 
 /// Columns the trace reads from `cost_log` (drift-guarded).
 const COLUMNS: &[&str] = &[
@@ -73,12 +73,51 @@ fn worker_label(key: &(String, u16)) -> String {
     format!("{}/{}", key.0, key.1)
 }
 
+/// Columns the transfer overlay reads from `gpu_cluster` (drift-guarded).
+const NET_COLUMNS: &[&str] = &[
+    "net_start_ms",
+    "net_end_ms",
+    "src_pool_tag",
+    "src_worker_id",
+    "dst_pool_tag",
+    "dst_worker_id",
+    "send_gid",
+    "recv_gid",
+    "bytes",
+    "kind",
+];
+
+/// One cross-worker transfer, materialized from `gpu_cluster.parquet`. Placed on
+/// the **receiving** (`dst_*`) worker's dedicated comm lane; the sender (`src_*`)
+/// rides along as a slice annotation.
+struct NetRow {
+    net_start_ms: f64,
+    net_end_ms: f64,
+    src_pool_tag: String,
+    src_worker_id: u16,
+    dst_pool_tag: String,
+    dst_worker_id: u16,
+    send_gid: u16,
+    recv_gid: u16,
+    bytes: u64,
+    kind: String,
+}
+
+impl NetRow {
+    /// The receiving worker — the comm lane this transfer is drawn on. Matches the
+    /// `cost_log` `(pool_tag, worker_id)` compute-track key.
+    fn dst_key(&self) -> (String, u16) {
+        (self.dst_pool_tag.clone(), self.dst_worker_id)
+    }
+}
+
 pub async fn run(
     ctx: &SessionContext,
     log_dir: &Path,
     regions: usize,
     region_ms: f64,
     max_slices: usize,
+    expanded: bool,
 ) -> Result<()> {
     let manifests = crate::io::read_cost_manifests(log_dir)?;
 
@@ -152,6 +191,43 @@ pub async fn run(
         .fold(f64::NEG_INFINITY, f64::max);
     let span = t1 - t0;
 
+    // Optional transfer overlay: read `gpu_cluster` if the run wrote it. Absent on
+    // runs that never transfer (unified / single-worker), where the overlay is
+    // simply skipped — never an error. The compute span above is left untouched;
+    // transfers only get drawn into the windows the compute log already defines.
+    let mut net_rows: Vec<NetRow> = Vec::new();
+    if register_gpu_cluster(ctx, log_dir).await? {
+        require_columns(ctx, GPU_CLUSTER_TABLE, NET_COLUMNS).await?;
+        // Flatten the RLE_DICTIONARY string columns (pool tags / kind) to VARCHAR,
+        // same reason as the cost_log projection above.
+        let sql = "SELECT net_start_ms, net_end_ms, \
+                   CAST(src_pool_tag AS VARCHAR) AS src_pool_tag, src_worker_id, \
+                   CAST(dst_pool_tag AS VARCHAR) AS dst_pool_tag, dst_worker_id, \
+                   send_gid, recv_gid, bytes, CAST(kind AS VARCHAR) AS kind \
+                   FROM gpu_cluster ORDER BY dst_pool_tag, dst_worker_id, net_start_ms";
+        for b in &collect(ctx, sql).await? {
+            let (ns, ne) = (col(b, "net_start_ms")?, col(b, "net_end_ms")?);
+            let (sp, sw) = (col(b, "src_pool_tag")?, col(b, "src_worker_id")?);
+            let (dp, dw) = (col(b, "dst_pool_tag")?, col(b, "dst_worker_id")?);
+            let (sg, rg) = (col(b, "send_gid")?, col(b, "recv_gid")?);
+            let (by, kd) = (col(b, "bytes")?, col(b, "kind")?);
+            for r in 0..b.num_rows() {
+                net_rows.push(NetRow {
+                    net_start_ms: value_f64(ns, r)?,
+                    net_end_ms: value_f64(ne, r)?,
+                    src_pool_tag: value_string(sp, r)?,
+                    src_worker_id: value_f64(sw, r)? as u16,
+                    dst_pool_tag: value_string(dp, r)?,
+                    dst_worker_id: value_f64(dw, r)? as u16,
+                    send_gid: value_f64(sg, r)? as u16,
+                    recv_gid: value_f64(rg, r)? as u16,
+                    bytes: value_f64(by, r)? as u64,
+                    kind: value_string(kd, r)?,
+                });
+            }
+        }
+    }
+
     // Evenly-spaced region anchors. A run shorter than one region collapses to a
     // single window covering the whole thing.
     let regions = regions.max(1);
@@ -175,19 +251,37 @@ pub async fn run(
     let mut worker_keys: Vec<(String, u16)> = rows.iter().map(IterRow::manifest_key).collect();
     worker_keys.sort_unstable();
     worker_keys.dedup();
+    // Which workers RECEIVE a transfer — only these get a comm lane, so a
+    // pure-sender (or a run with no transfers) sprouts no empty lane.
+    let dst_keys: BTreeSet<(String, u16)> = net_rows.iter().map(NetRow::dst_key).collect();
     let mut worker_tracks: BTreeMap<(String, u16), u64> = BTreeMap::new();
+    let mut comm_tracks: BTreeMap<(String, u16), u64> = BTreeMap::new();
     for (idx, key) in worker_keys.iter().enumerate() {
         let pid = idx as i32;
         let label = worker_label(key);
         let proc = w.process_track(pid, &label);
         let thr = w.thread_track(proc, pid, 0, &label);
         worker_tracks.insert(key.clone(), thr);
+        // Comm lane: a second thread track (`tid=1`) under the SAME process, so a
+        // received transfer renders directly beneath the worker's compute lane —
+        // the "same worker row, separate lane" overlay.
+        if dst_keys.contains(key) {
+            let comm = w.thread_track(proc, pid, 1, &format!("{label} · comm"));
+            comm_tracks.insert(key.clone(), comm);
+        }
     }
 
     let mut placed_pairs = 0usize;
     let mut placed_iters = 0usize;
     let mut eligible_iters = 0usize;
+    let mut placed_net = 0usize;
     let mut truncated = false;
+    // Comm-lane high-water end_ns, mirroring `track_cursor`. Transfers into one
+    // recv group serialize (the cluster advances `recv_free`), but a worker with
+    // several recv groups can have genuinely overlapping pulls; snap each `begin`
+    // forward to the lane's last `end` so slices stay flush siblings rather than
+    // nesting (a rare, sub-slice visual nudge).
+    let mut net_track_cursor: BTreeMap<u64, i64> = BTreeMap::new();
     // Per-track high-water end_ns. Back-to-back slices (predict's `now += time`
     // layout, or sections within one real task) place each `begin` from the sim
     // clock and each `end` from the placer's leaf-ns sum; the two round
@@ -231,7 +325,13 @@ pub async fn run(
                     row.section
                 )
             })?;
-            let per_iter_pairs = slice_pairs_per_iter(manifest);
+            // Cap unit: expanded counts every branch; critical (default) counts
+            // only the bottleneck branch each Max collapses to (data-dependent).
+            let per_iter_pairs = if expanded {
+                slice_pairs_per_iter(manifest)
+            } else {
+                critical_pairs_per_iter(manifest, &row.slot_ns)
+            };
             if placed_pairs + per_iter_pairs > max_slices {
                 truncated = true;
                 w.end(region_track, ((offset_ms + region_ms) * 1e6).round() as i64);
@@ -261,7 +361,7 @@ pub async fn run(
                     Annotation::dbl("total_ms", row.total_time_ms),
                 ],
             );
-            let placer = Placer::new(manifest, &row.slot_ns, &row.slot_input);
+            let placer = Placer::new(manifest, &row.slot_ns, &row.slot_input, expanded);
             let dur = placer.place_root(&mut w, track, base_ns);
             let end_ns = base_ns + dur;
             w.end(track, end_ns);
@@ -277,6 +377,43 @@ pub async fn run(
 
             placed_pairs += per_iter_pairs;
             placed_iters += 1;
+        }
+
+        // Overlay this window's transfers onto their receiving worker's comm lane,
+        // using the SAME `shift_ms` as compute so they share the compressed axis.
+        // Not capped by `max_slices` (that budgets the compute slice tree);
+        // transfers are far fewer, one per handoff.
+        for nr in net_rows
+            .iter()
+            .filter(|n| n.net_start_ms >= lo && n.net_start_ms < hi)
+        {
+            let Some(&track) = comm_tracks.get(&nr.dst_key()) else {
+                // Receiver has no compute track (should not happen — every dst is a
+                // cost_log worker). Skip rather than invent a lane.
+                continue;
+            };
+            let begin_ns = ((nr.net_start_ms + shift_ms) * 1e6).round() as i64;
+            let begin_ns = begin_ns.max(net_track_cursor.get(&track).copied().unwrap_or(i64::MIN));
+            let end_ns = (((nr.net_end_ms + shift_ms) * 1e6).round() as i64).max(begin_ns);
+            w.begin(
+                track,
+                begin_ns,
+                &nr.kind,
+                &[
+                    Annotation::str(
+                        "src",
+                        worker_label(&(nr.src_pool_tag.clone(), nr.src_worker_id)),
+                    ),
+                    Annotation::uint("send_gid", nr.send_gid as u64),
+                    Annotation::uint("recv_gid", nr.recv_gid as u64),
+                    Annotation::uint("bytes", nr.bytes),
+                    Annotation::dbl("net_start_ms", nr.net_start_ms),
+                    Annotation::dbl("net_end_ms", nr.net_end_ms),
+                ],
+            );
+            w.end(track, end_ns);
+            net_track_cursor.insert(track, end_ns);
+            placed_net += 1;
         }
 
         w.end(region_track, ((offset_ms + region_ms) * 1e6).round() as i64);
@@ -304,11 +441,12 @@ pub async fn run(
     let bytes = w.into_gzip()?;
     fs::write(&out, &bytes).with_context(|| format!("write {}", out.display()))?;
     println!(
-        "wrote {} ({} regions, {} iterations, {} slice pairs)",
+        "wrote {} ({} regions, {} iterations, {} slice pairs, {} transfers)",
         out.display(),
         anchors.len(),
         placed_iters,
-        placed_pairs
+        placed_pairs,
+        placed_net
     );
     Ok(())
 }

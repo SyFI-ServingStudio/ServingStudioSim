@@ -73,6 +73,33 @@ impl ManifestDoc {
     }
 }
 
+/// Aggregate duration (ns) of the subtree rooted at node `idx`, folding this
+/// tree the same way the sim did to produce `total_time_ms`: Leaf = its slot,
+/// Sum = Σ children, Max = max(children)/overlap, Scale = n × child. Ancestor
+/// `Scale`s are NOT applied (this is the node's own local fold). The root's
+/// value reproduces `total_time_ms` up to per-leaf ns rounding.
+///
+/// Shared by both consumers of a [`Manifest`]: `breakdown` (critical-path gutter
+/// + `Max` bottleneck-member pick) and `trace::place` (critical-path collapse of
+/// `Max`). `trace::place::tests` / `breakdown::tests` pin that this equals
+/// `place`'s emission fold, so the three stay in lockstep.
+pub(crate) fn node_time(m: &Manifest, idx: usize, slot_ns: &[i64]) -> i64 {
+    match &m.nodes[idx] {
+        FlatCostNode::Leaf(slot) => slot_ns.get(*slot).copied().unwrap_or(0),
+        FlatCostNode::Sum { children } => children.clone().map(|c| node_time(m, c, slot_ns)).sum(),
+        FlatCostNode::Max { overlap, children } => {
+            let maxd = children
+                .clone()
+                .map(|c| node_time(m, c, slot_ns))
+                .max()
+                .unwrap_or(0);
+            let ov = (*overlap as f64).max(1e-9);
+            (maxd as f64 / ov).round() as i64
+        }
+        FlatCostNode::Scale { n, children } => (*n as i64) * node_time(m, children.start, slot_ns),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -43,7 +43,7 @@ use crate::session::{
     col, collect, register_cost_log, require_columns, value_f32_list, value_f64, value_groups,
     value_string, COST_LOG_TABLE, GroupInput,
 };
-use crate::trace::manifest::{FlatCostNode, Manifest};
+use crate::trace::manifest::{node_time, FlatCostNode, Manifest};
 
 /// Columns the breakdown reads from `cost_log` (drift-guarded). `groups` (the
 /// per-HP-group arch input) is the one column `analyze trace` doesn't need.
@@ -198,30 +198,9 @@ pub async fn run(
 
 // ── time fold ──────────────────────────────────────────────────────────────
 
-/// Local cost fold for node `idx` (ancestor `Scale`s NOT applied — the renderer
-/// multiplies by `scale_above`). Mirrors `place.rs`'s duration math exactly:
-/// Leaf=slot; Sum=Σ; Max=max/overlap; Scale=n×child. The root's `node_time`
-/// reproduces `total_time_ms` up to per-leaf ns rounding (the drift guard).
-fn node_time(m: &Manifest, idx: usize, slot_ns: &[i64]) -> i64 {
-    match &m.nodes[idx] {
-        FlatCostNode::Leaf(slot) => slot_ns.get(*slot).copied().unwrap_or(0),
-        FlatCostNode::Sum { children } => {
-            children.clone().map(|c| node_time(m, c, slot_ns)).sum()
-        }
-        FlatCostNode::Max { overlap, children } => {
-            let maxd = children
-                .clone()
-                .map(|c| node_time(m, c, slot_ns))
-                .max()
-                .unwrap_or(0);
-            let ov = (*overlap as f64).max(1e-9);
-            (maxd as f64 / ov).round() as i64
-        }
-        FlatCostNode::Scale { n, children } => {
-            (*n as i64) * node_time(m, children.start, slot_ns)
-        }
-    }
-}
+// `node_time` (the local cost fold: Leaf=slot, Sum=Σ, Max=max/overlap,
+// Scale=n×child) now lives in `crate::trace::manifest` — shared with
+// `trace::place`'s critical-path collapse — and is imported at the top.
 
 // ── labels ─────────────────────────────────────────────────────────────────
 

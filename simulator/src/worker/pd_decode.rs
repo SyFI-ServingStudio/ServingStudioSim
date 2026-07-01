@@ -168,7 +168,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             let gpu_base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
             // Arch invariant: `num_attn_shards() ≤ gpus_per_replica`, so the
             // attn-shard prefix is the comm group used as recv endpoint.
-            c.register_comm_group(gpu_base, model.num_attn_shards().max(1))
+            c.register_comm_group(gpu_base, model.num_attn_shards().max(1), pool_tag, id.0)
         };
         let num_groups = model.num_attn_dp_groups().max(1) as usize;
         // Per-attn-shard physical memory (worker has `num_attn_dp_groups` of
@@ -268,6 +268,8 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                 transfer.send_gid,
                 transfer.recv_gid,
                 bytes,
+                "pd_kv_pull",
+                "",
             );
             self.runtime.in_transit = Some(InFlightPull {
                 req: rid,
@@ -687,7 +689,7 @@ mod tests {
     fn register_test_sender(cluster: &SharedGpuCluster) -> u16 {
         let mut c = cluster.borrow_mut();
         c.allocate(99, 99, 1, "sender-gpu");
-        c.register_comm_group(0, 1)
+        c.register_comm_group(0, 1, "prefill", 99)
     }
 
     /// Pull backlog gate: a second handoff that would push (in-flight + landed-

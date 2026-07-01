@@ -53,11 +53,13 @@
 //! transfer touches GPUs owned by two different workers/pools.
 
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 
 use serde::Serialize;
 
 use crate::common::Time;
+use crate::log::{GpuClusterEntry, NetworkLogger};
 use crate::timing::kernels::{P2pInterKernel, P2pInterKernelInput};
 
 /// One physical GPU and who owns it. The cluster's `gpus` field is a flat list
@@ -117,6 +119,15 @@ struct CommGroup {
     send_free: Time,
     /// Earliest time this group's recv streams are idle.
     recv_free: Time,
+    /// The worker that owns this group, supplied at registration. Lets
+    /// `submit_transfer` resolve *both* endpoints of a transfer (sender = the
+    /// `send_gid` group's owner, receiver = the `recv_gid` group's) into the
+    /// `gpu_cluster` log without any caller-side identity plumbing. `pool_tag` is
+    /// a worker pool literal (`&'static str`); the pair keys the same `(pool_tag,
+    /// worker_id)` space `cost_log` uses, so the trace overlays a transfer onto
+    /// the receiving worker's row.
+    owner_pool_tag: &'static str,
+    owner_worker_id: u16,
 }
 
 #[derive(Serialize)]
@@ -134,6 +145,12 @@ pub struct GpuCluster {
     /// bandwidth (see [`CostSource`]).
     #[serde(skip)]
     cost: CostSource,
+    /// The `gpu_cluster` stream writer, attached once a log dir is available
+    /// ([`attach_logger`](GpuCluster::attach_logger)). `None` for tests and
+    /// no-log runs — `submit_transfer` then records nothing. One writer for the
+    /// whole run (the cluster is the single shared transfer oracle).
+    #[serde(skip)]
+    logger: Option<NetworkLogger>,
 }
 
 impl GpuCluster {
@@ -146,6 +163,20 @@ impl GpuCluster {
             gpus: Vec::new(),
             groups: Vec::new(),
             cost,
+            logger: None,
+        }
+    }
+
+    /// Attach the `gpu_cluster` log writer for this run, opening
+    /// `<log_dir>/raw/gpu_cluster.parquet`. Called by the flow after building the
+    /// cluster (PD / AFD) when `cfg.io.log_dir` is set; every subsequent
+    /// [`submit_transfer`](GpuCluster::submit_transfer) then records one row. A
+    /// failed open is logged and left as `None` (transfer timing still runs; only
+    /// the log is absent) so a logging problem never aborts the sim.
+    pub fn attach_logger(&mut self, log_dir: &Path) {
+        match NetworkLogger::open(log_dir) {
+            Ok(l) => self.logger = Some(l),
+            Err(e) => tracing::warn!("failed to open gpu_cluster log: {e:#}"),
         }
     }
 
@@ -166,16 +197,27 @@ impl GpuCluster {
         base
     }
 
-    /// Register one comm group covering `[base, base+count)` and return its id.
-    /// Workers register their attn-shard endpoint set once at construction; the
-    /// returned id is what flows through `PrefillDone` / `Handoff` / `TransferPlan`.
-    pub fn register_comm_group(&mut self, base: u16, count: u16) -> u16 {
+    /// Register one comm group covering `[base, base+count)`, owned by worker
+    /// `(pool_tag, worker_id)`, and return its id. Workers register their
+    /// attn-shard endpoint set once at construction; the returned id is what flows
+    /// through `PrefillDone` / `Handoff` / `TransferPlan`. The owner identity is
+    /// carried so `submit_transfer` can label both ends of a transfer in the
+    /// `gpu_cluster` log — `pool_tag` is the worker's cost-log pool literal.
+    pub fn register_comm_group(
+        &mut self,
+        base: u16,
+        count: u16,
+        pool_tag: &'static str,
+        worker_id: u16,
+    ) -> u16 {
         let gid = self.groups.len() as u16;
         self.groups.push(CommGroup {
             base,
             count,
             send_free: Time::ZERO,
             recv_free: Time::ZERO,
+            owner_pool_tag: pool_tag,
+            owner_worker_id: worker_id,
         });
         gid
     }
@@ -200,12 +242,20 @@ impl GpuCluster {
     /// the KV is resident at the destination = `start + transfer_dur`.
     /// `send_gid` and `recv_gid` may refer to the same group (a self-loop is a
     /// no-op in practice but the API accepts it).
+    ///
+    /// `kind` (a stable category literal, e.g. `pd_kv_pull`) and `tag` (a
+    /// free-form per-deployment identifier, often `""`) are recorded verbatim into
+    /// the `gpu_cluster` log alongside the resolved `start`/`end` window and both
+    /// endpoints' worker identity — but only when a [`NetworkLogger`] is attached;
+    /// otherwise they are ignored and `tag` is never cloned.
     pub fn submit_transfer(
         &mut self,
         now: Time,
         send_gid: u16,
         recv_gid: u16,
         bytes: u64,
+        kind: &'static str,
+        tag: &str,
     ) -> Time {
         let s = self.groups[send_gid as usize];
         let r = self.groups[recv_gid as usize];
@@ -223,6 +273,26 @@ impl GpuCluster {
         let end = start + transfer_dur;
         self.groups[send_gid as usize].send_free = end;
         self.groups[recv_gid as usize].recv_free = end;
+        // Record the on-wire window (incl. queueing) with both endpoints resolved
+        // from the two groups' owners. A logging failure warns but never aborts
+        // the transfer — the timing above is already committed.
+        if let Some(logger) = self.logger.as_mut() {
+            if let Err(e) = logger.record(GpuClusterEntry {
+                net_start_ms: start.as_ms(),
+                net_end_ms: end.as_ms(),
+                src_pool_tag: s.owner_pool_tag,
+                src_worker_id: s.owner_worker_id,
+                dst_pool_tag: r.owner_pool_tag,
+                dst_worker_id: r.owner_worker_id,
+                send_gid,
+                recv_gid,
+                bytes,
+                kind,
+                tag: tag.to_string(),
+            }) {
+                tracing::warn!("gpu_cluster log record failed: {e:#}");
+            }
+        }
         end
     }
 }
@@ -240,14 +310,26 @@ mod tests {
         GpuCluster::new(CostSource::analytic(1.0))
     }
 
+    /// Register a group with a throwaway owner identity — these tests probe
+    /// timing/contention only, and the cluster has no logger, so the owner is
+    /// never read.
+    fn reg(c: &mut GpuCluster, base: u16, count: u16) -> u16 {
+        c.register_comm_group(base, count, "test", 0)
+    }
+
+    /// Submit a transfer with a throwaway `kind`/`tag` (no logger attached).
+    fn xfer(c: &mut GpuCluster, now: Time, s: u16, d: u16, bytes: u64) -> Time {
+        c.submit_transfer(now, s, d, bytes, "test", "")
+    }
+
     #[test]
     fn recv_leg_dominates_when_fewer_dst_links() {
         // 8 send links vs 2 recv links: recv carries bytes/2 per link → slower.
         let mut c = cluster();
-        let s = c.register_comm_group(0, 8);
-        let d = c.register_comm_group(8, 2);
+        let s = reg(&mut c, 0, 8);
+        let d = reg(&mut c, 8, 2);
         let bytes = 8_000_000u64; // 8 MB
-        let end = c.submit_transfer(Time::ZERO, s, d, bytes);
+        let end = xfer(&mut c, Time::ZERO, s, d, bytes);
         // send: (8e6/8)/1e6 = 1ms; recv: (8e6/2)/1e6 = 4ms → resident at 4ms.
         assert!((end.as_ms() - 4.0).abs() < 1e-6, "got {}", end.as_ms());
     }
@@ -256,13 +338,13 @@ mod tests {
     fn more_links_is_faster_aggregated_bandwidth() {
         let bytes = 8_000_000u64;
         let mut c4 = cluster();
-        let s4 = c4.register_comm_group(0, 4);
-        let d4 = c4.register_comm_group(4, 4);
-        let e4 = c4.submit_transfer(Time::ZERO, s4, d4, bytes);
+        let s4 = reg(&mut c4, 0, 4);
+        let d4 = reg(&mut c4, 4, 4);
+        let e4 = xfer(&mut c4, Time::ZERO, s4, d4, bytes);
         let mut c8 = cluster();
-        let s8 = c8.register_comm_group(0, 8);
-        let d8 = c8.register_comm_group(8, 8);
-        let e8 = c8.submit_transfer(Time::ZERO, s8, d8, bytes);
+        let s8 = reg(&mut c8, 0, 8);
+        let d8 = reg(&mut c8, 8, 8);
+        let e8 = xfer(&mut c8, Time::ZERO, s8, d8, bytes);
         assert!(e8.as_ms() < e4.as_ms(), "8 links should beat 4: {} vs {}", e8.as_ms(), e4.as_ms());
     }
 
@@ -270,11 +352,11 @@ mod tests {
     fn same_group_serializes() {
         // Two back-to-back transfers re-using the same src+dst groups queue up.
         let mut c = cluster();
-        let s = c.register_comm_group(0, 1);
-        let d = c.register_comm_group(1, 1);
+        let s = reg(&mut c, 0, 1);
+        let d = reg(&mut c, 1, 1);
         let bytes = 1_000_000u64; // 1 MB → 1ms on a single link
-        let e1 = c.submit_transfer(Time::ZERO, s, d, bytes);
-        let e2 = c.submit_transfer(Time::ZERO, s, d, bytes);
+        let e1 = xfer(&mut c, Time::ZERO, s, d, bytes);
+        let e2 = xfer(&mut c, Time::ZERO, s, d, bytes);
         assert!((e1.as_ms() - 1.0).abs() < 1e-6, "first {}", e1.as_ms());
         assert!((e2.as_ms() - 2.0).abs() < 1e-6, "second {}", e2.as_ms());
     }
@@ -282,13 +364,13 @@ mod tests {
     #[test]
     fn disjoint_groups_do_not_serialize() {
         let mut c = cluster();
-        let s1 = c.register_comm_group(0, 1);
-        let d1 = c.register_comm_group(1, 1);
-        let s2 = c.register_comm_group(2, 1);
-        let d2 = c.register_comm_group(3, 1);
+        let s1 = reg(&mut c, 0, 1);
+        let d1 = reg(&mut c, 1, 1);
+        let s2 = reg(&mut c, 2, 1);
+        let d2 = reg(&mut c, 3, 1);
         let bytes = 1_000_000u64;
-        let e1 = c.submit_transfer(Time::ZERO, s1, d1, bytes);
-        let e2 = c.submit_transfer(Time::ZERO, s2, d2, bytes);
+        let e1 = xfer(&mut c, Time::ZERO, s1, d1, bytes);
+        let e2 = xfer(&mut c, Time::ZERO, s2, d2, bytes);
         assert!((e1.as_ms() - 1.0).abs() < 1e-6);
         assert!((e2.as_ms() - 1.0).abs() < 1e-6, "disjoint groups should not queue: {}", e2.as_ms());
     }
@@ -301,17 +383,17 @@ mod tests {
     #[test]
     fn recv_bottleneck_holds_sender_too() {
         let mut c = cluster();
-        let s = c.register_comm_group(0, 8);     // 8-link sender
-        let r_slow = c.register_comm_group(8, 2); // 2-link receiver — bottleneck
-        let r_fast = c.register_comm_group(10, 8); // 8-link receiver — fast
+        let s = reg(&mut c, 0, 8);     // 8-link sender
+        let r_slow = reg(&mut c, 8, 2); // 2-link receiver — bottleneck
+        let r_fast = reg(&mut c, 10, 8); // 8-link receiver — fast
         // 8MB: send_dur=1ms (8 links), recv_dur=4ms (2 links). collective=4ms.
-        let e1 = c.submit_transfer(Time::ZERO, s, r_slow, 8_000_000);
+        let e1 = xfer(&mut c, Time::ZERO, s, r_slow, 8_000_000);
         assert!((e1.as_ms() - 4.0).abs() < 1e-6, "got {}", e1.as_ms());
         // 1MB, symmetric 8-link both sides: send_dur=recv_dur=0.125ms. But the
         // sender was held for the prior collective until t=4. start=4, end=4.125.
         // The previously-decoupled bookkeeping would have set s.send_free to 1
         // (just send_dur of T1), letting T2 start at t=1 — wrong.
-        let e2 = c.submit_transfer(Time::ZERO, s, r_fast, 1_000_000);
+        let e2 = xfer(&mut c, Time::ZERO, s, r_fast, 1_000_000);
         assert!(
             (e2.as_ms() - 4.125).abs() < 1e-6,
             "sender should be held by recv bottleneck of T1, got {}",
@@ -328,19 +410,19 @@ mod tests {
         // Three sender groups (each 1 link) + one receiver group (1 link); the
         // sender groups are disjoint, the receiver is shared so we can probe
         // its recv_free bookkeeping.
-        let s_busy = c.register_comm_group(0, 1);
-        let d_far = c.register_comm_group(5, 1);
-        let d_probe = c.register_comm_group(4, 1);
-        let s_disjoint = c.register_comm_group(2, 1);
+        let s_busy = reg(&mut c, 0, 1);
+        let d_far = reg(&mut c, 5, 1);
+        let d_probe = reg(&mut c, 4, 1);
+        let s_disjoint = reg(&mut c, 2, 1);
         // Pre-occupy the busy sender out to t=10ms via a 10MB transfer.
-        let _pre = c.submit_transfer(Time::ZERO, s_busy, d_far, 10_000_000);
+        let _pre = xfer(&mut c, Time::ZERO, s_busy, d_far, 10_000_000);
         // 1MB transfer from the busy sender to d_probe. Receiver was idle but
         // sender's send_free=10 → start=10, end=11.
-        let end = c.submit_transfer(Time::ZERO, s_busy, d_probe, 1_000_000);
+        let end = xfer(&mut c, Time::ZERO, s_busy, d_probe, 1_000_000);
         assert!((end.as_ms() - 11.0).abs() < 1e-6, "got {}", end.as_ms());
         // d_probe.recv_free should now be 11. A subsequent transfer from a
         // disjoint sender into d_probe must therefore wait until t=11, not t=0.
-        let end2 = c.submit_transfer(Time::ZERO, s_disjoint, d_probe, 1_000_000);
+        let end2 = xfer(&mut c, Time::ZERO, s_disjoint, d_probe, 1_000_000);
         assert!(
             (end2.as_ms() - 12.0).abs() < 1e-6,
             "recv group's recv_free should track the coupled end, got {}",
