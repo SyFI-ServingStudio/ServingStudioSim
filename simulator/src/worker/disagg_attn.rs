@@ -268,6 +268,11 @@ pub struct DisaggAttnWorker<M: AttnLayerwiseModel> {
     /// the pipeline slot its `batch_id`). Honest per-layer rows; ZSTD compresses the
     /// homogeneous layers.
     cost: CostBuffers,
+    /// Reused scratch for the per-compute attention input. `build_attn_input` runs
+    /// once per layer per compute (≈num_layers × per iteration); rebuilding a fresh
+    /// `AttnArchInput` each time allocated its group `Vec`s on the hot path. Held here
+    /// and refilled in place (the `cost_slots` reuse pattern).
+    attn_input_buf: AttnArchInput,
 }
 
 // ── construction ────────────────────────────────────────────────────────────────
@@ -311,6 +316,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             promised: IdMap::default(),
             request_to_slot: IdMap::default(),
             cost,
+            attn_input_buf: AttnArchInput { groups: Vec::new() },
         }
     }
 }
@@ -806,7 +812,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             self.slots[idx].compute_end = now;
             return;
         }
-        let input = self.build_attn_input(idx);
+        self.build_attn_input(idx);
         let layer = self.slots[idx].current_layer as usize;
         let iter_id = self.slots[idx].iter;
         // Clone the Arc so the immutable model borrow does not alias the mutable
@@ -814,6 +820,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         // closure (same aggregate the timing uses) and writes one `attn` row when
         // logging — `batch_id` = the pipeline slot, `layer` = this layer.
         let model = Arc::clone(&self.model);
+        let input = &self.attn_input_buf;
         let m = self.cost.run_section(
             "attn",
             layer as i16,
@@ -822,16 +829,27 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             &input.groups,
             now,
             |s, sc, inp| match inp {
-                Some(i) => model.attn_cost_with_inputs(layer, &input, s, sc, i),
-                None => model.attn_cost(layer, &input, s, sc),
+                Some(i) => model.attn_cost_with_inputs(layer, input, s, sc, i),
+                None => model.attn_cost(layer, input, s, sc),
             },
         );
         self.slots[idx].compute_end = now + Time::from_ms(m.m.time_ms as f64);
     }
 
-    fn build_attn_input(&self, idx: usize) -> AttnArchInput {
+    /// Refill the held [`attn_input_buf`](Self::attn_input_buf) for slot `idx` in
+    /// place (D4: exactly one DP-shard group). Owns the buffer out with
+    /// `mem::replace` so `self` stays fully borrowable (store + batch reads) while
+    /// filling, then restores it — reusing the group's `Vec` capacities across the
+    /// per-layer computes instead of allocating a fresh input each time.
+    fn build_attn_input(&mut self, idx: usize) {
+        let mut buf = std::mem::replace(&mut self.attn_input_buf, AttnArchInput { groups: Vec::new() });
+        if buf.groups.is_empty() {
+            buf.groups.push(ArchGroupInput::default());
+        }
+        buf.groups.truncate(1);
+        let g = &mut buf.groups[0];
+        g.clear();
         let store = self.requests.borrow();
-        let mut g = ArchGroupInput::default();
         for &rid in &self.slots[idx].reqs {
             if store[rid].is_prefill() {
                 // Prefilling (v1 non-chunk: whole prompt in one pass): `prompt_len`
@@ -842,15 +860,15 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
                 g.batch_tokens += r.prompt_len;
             } else {
                 // Decode: one query token; KV length is this shard's tracked length.
-                let cur_kv = self.current_kv(rid) as u32;
+                let cur_kv = self.batch.decode_current_kv(rid).unwrap_or(0) as u32;
                 g.decode_kv_lens.push(cur_kv);
                 g.decode_tokens += 1;
                 g.batch_tokens += 1;
                 g.total_kv_len += cur_kv;
             }
         }
-        // D4: the attn worker computes exactly one DP-shard group.
-        AttnArchInput { groups: vec![g] }
+        drop(store);
+        self.attn_input_buf = buf;
     }
 
     /// This shard's authoritative resident KV length for a request (fed to the
