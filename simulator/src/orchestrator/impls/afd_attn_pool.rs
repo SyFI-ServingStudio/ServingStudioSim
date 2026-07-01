@@ -408,13 +408,13 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
         if s.in_flight {
             return false;
         }
-        if s.start.reported.contains(&worker) {
-            debug_assert!(
-                false,
-                "worker {worker:?} reported slot {slot}'s start twice"
-            );
-            return false;
-        }
+        // Duplicate-report guard (debug-only): re-announcing a slot's start is a
+        // lockstep violation that cannot happen in a valid run. Assert in debug; skip
+        // the O(workers) scan in release (O(workers²) per iteration per slot at scale).
+        debug_assert!(
+            !s.start.reported.contains(&worker),
+            "worker {worker:?} reported slot {slot}'s start twice"
+        );
         s.start.reported.push(worker);
         s.start.reqs.extend_from_slice(reqs);
         if s.start.reported.len() != n {
@@ -458,13 +458,14 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
             "slot {slot} barrier mixes layers {} and {layer} — lockstep broken",
             s.barrier.layer
         );
-        if s.barrier.reported.iter().any(|&(w, _)| w == worker) {
-            debug_assert!(
-                false,
-                "worker {worker:?} reported slot {slot} twice in one layer"
-            );
-            return false;
-        }
+        // Duplicate-report guard (debug-only): a worker reporting the same (slot, layer)
+        // twice breaks lockstep and cannot happen in a valid run. The O(workers) scan
+        // per report is O(workers²) per completed layer-barrier — small today but scales
+        // with the attn pool — so run it only under `debug_assert` and push in release.
+        debug_assert!(
+            !s.barrier.reported.iter().any(|&(w, _)| w == worker),
+            "worker {worker:?} reported slot {slot} twice in one layer"
+        );
         s.barrier.reported.push((worker, tokens));
         s.barrier.reqs.extend_from_slice(reqs);
         s.barrier
@@ -480,12 +481,14 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
             FfnTaskKind::Bridge { upstream: layer }
         };
         let b = std::mem::take(&mut s.barrier);
-        // Refresh the ffn→attn scatter split from this layer's per-worker token counts.
-        let mut weights = vec![0u64; n];
+        // Refresh the ffn→attn scatter split from this layer's per-worker token counts,
+        // reusing the slot's `scatter_weights` allocation (fully overwritten each
+        // completed barrier) instead of allocating a fresh `vec![0; n]` per layer.
+        s.scatter_weights.clear();
+        s.scatter_weights.resize(n, 0);
         for &(w, t) in &b.reported {
-            weights[w.0 as usize] = t;
+            s.scatter_weights[w.0 as usize] = t;
         }
-        s.scatter_weights = weights;
         tasks.push(FfnTask {
             kind,
             slot: slot as u8,
