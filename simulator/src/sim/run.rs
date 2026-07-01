@@ -114,9 +114,9 @@ impl RunSummary {
     }
 }
 
-/// Tick-loop knobs. Defaults mirror ref/moesim-rs's unified loop: `tick_dt` 100 µs,
-/// `snapshot_dt` (the `request_state` cadence) 100 s, `stuck_threshold` 60 s of
-/// no progress. (Ref's tick_dt is 1 µs — see note in `new`.)
+/// Tick-loop knobs. `snapshot_dt` (the `request_state` cadence) is 100 s and
+/// `stuck_threshold` (no-progress budget) is 60 s; `tick_dt` is the caller-chosen
+/// tick step (`WorkloadSpec::tick_dt_us`, default 100 µs — see `new`).
 #[derive(Clone, Copy, Debug)]
 pub struct TickCfg {
     pub tick_dt: Time,
@@ -127,13 +127,15 @@ pub struct TickCfg {
 }
 
 impl TickCfg {
-    pub fn new(duration_ms: f64, run_to_end: bool) -> Self {
-        // Ref/moesim-rs's unified loop ticks at 1 µs; we tick at 100 µs — 100x
-        // fewer iterations than ref, with 100 µs quantization on TTFT/TPOT
-        // (~0.15% throughput bias vs 10 µs; coarser buys ~no speed since the
-        // per-iteration/token work is O(events), not O(ticks), and the bias
-        // grows — 1 ms costs ~1.4% for no gain).
-        let tick_dt = Time::from_us(100);
+    /// `tick_dt_us` is the fixed tick step in microseconds (from the workload
+    /// config, default 100). Ref/moesim-rs's unified loop ticks at 1 µs; we tick
+    /// coarser to run fewer iterations, trading a little TTFT/TPOT quantization
+    /// for ~no throughput cost (per-tick work is O(events), not O(ticks)). Finer
+    /// ticks also shrink the inter-slice gaps the analyzer trace shows (each
+    /// slice end snaps to the tick grid). Clamp 0 → 1 µs: a zero step would make
+    /// the derived periodic gates (`ticks()` below) divide by zero.
+    pub fn new(duration_ms: f64, run_to_end: bool, tick_dt_us: u64) -> Self {
+        let tick_dt = Time::from_us(tick_dt_us.max(1));
         Self {
             tick_dt,
             duration: Time::from_ms(duration_ms),
@@ -500,7 +502,7 @@ mod tests {
             &store,
             &mut frontend,
             &mut logger,
-            &TickCfg::new(5000.0, true),
+            &TickCfg::new(5000.0, true, 100),
         )
         .unwrap();
         assert_eq!(summary.cause, TerminationCause::DrainComplete);

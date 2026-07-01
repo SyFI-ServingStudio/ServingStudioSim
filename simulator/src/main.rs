@@ -156,7 +156,7 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // build, so a bad trace path errors without first running the cascade.
     let workload = cfg.workload();
     let mut frontend = TraceFrontend::load(&workload.trace_files, workload.request_rate)?;
-    let tick_cfg = TickCfg::new(workload.duration_ms, workload.run_to_end);
+    let tick_cfg = TickCfg::new(workload.duration_ms, workload.run_to_end, workload.tick_dt_us);
 
     let mut flow = build_flow(&cfg, &bridge, Rc::clone(&store))?;
 

@@ -53,6 +53,21 @@ pub struct WorkloadSpec {
     /// Request arrival rate (requests/s).
     #[param(default = 10.0)]
     pub request_rate: f64,
+    /// Fixed simulation tick step (µs) — the time quantum the loop advances by
+    /// each iteration. Finer ticks mean less TTFT/TPOT quantization (and smaller
+    /// inter-slice gaps in the trace) at ~no throughput cost, since per-tick work
+    /// is O(events), not O(ticks). Omit to keep the 100 µs default; `TickCfg`
+    /// clamps 0 → 1 µs so this can never stall the loop.
+    #[serde(default = "default_tick_dt_us")]
+    #[param(default = 100)]
+    pub tick_dt_us: u64,
+}
+
+/// serde fallback for `tick_dt_us`: 100 µs matches the historical hardcoded tick,
+/// so presets/fixtures that omit the field keep their prior behavior. The
+/// launcher still emits the schema default explicitly (see `#[param]` above).
+fn default_tick_dt_us() -> u64 {
+    100
 }
 
 /// Run-global output location + logging controls.
