@@ -709,13 +709,15 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
     /// stays a barrier member.
     fn complete_layer(&mut self, idx: usize, events: &mut Vec<AttnWorkerEvent>) {
         let layer = self.slots[idx].current_layer;
-        let reqs = self.slots[idx].reqs.clone();
-        let tokens = self.batch_query_tokens(&reqs);
+        // Token count reads the slot's `reqs` in place (no clone). The event needs an
+        // owned request set, so clone exactly once and MOVE it in — this runs per
+        // layer (≈num_layers × per iteration), so the old second clone was pure churn.
+        let tokens = self.batch_query_tokens(&self.slots[idx].reqs);
         let out_bytes = self.model.attn_to_ffn_bytes_per_token() * tokens;
         events.push(AttnWorkerEvent::AttnLayerOutputsReady {
             worker: self.id,
             slot: idx as u8,
-            reqs: reqs.clone(),
+            reqs: self.slots[idx].reqs.clone(),
             tokens,
             layer,
             send_gid: self.recv_gid,
@@ -727,7 +729,11 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         // KV by exactly one token (per iteration, not per layer).
         if layer == self.num_layers().saturating_sub(1) {
             let mut decoding = Vec::new();
-            for &rid in &reqs {
+            // Index by position so each `rid` copy releases the `slots` borrow before
+            // `begin_decode` / `advance_subset` take `&mut self` — same order as the
+            // old cloned-`reqs` iteration, so bit-identical, but no clone.
+            for k in 0..self.slots[idx].reqs.len() {
+                let rid = self.slots[idx].reqs[k];
                 if self.promised.contains_key(&rid) {
                     self.begin_decode(rid);
                 } else {
