@@ -11,8 +11,9 @@ pub mod config;
 
 pub use self::common::{GpuCluster, GpuInfo, OrchAction, UnifiedWorkerFactory};
 pub use impls::{
-    DpPlacementPolicy, PdFlow, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig,
-    SimpleDpPoolController, PD_DECODE_POOL, PD_PREFILL_POOL,
+    AfdAttnPoolController, AfdFfnPoolController, AfdFlow, DpPlacementPolicy, PdFlow, SimpleDpConfig,
+    SimpleDpFlow, SimpleDpPoolConfig, SimpleDpPoolController, AFD_ATTN_POOL, AFD_FFN_POOL,
+    PD_DECODE_POOL, PD_PREFILL_POOL,
 };
 pub use config::{GroupSpec, PlacementPolicy, PoolSpec};
 

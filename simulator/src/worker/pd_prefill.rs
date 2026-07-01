@@ -111,7 +111,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         let group_kv_bytes =
             config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
         let kv_capacity = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
-        let cost = CostBuffers::new(cost_log_dir, pool_tag, id, model.as_ref());
+        let cost = CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref());
         // Arch invariant: `num_attn_shards() ≤ gpus_per_replica == gpus_per_worker`,
         // so no clamp against the worker's GPU range is needed — the model is
         // authoritative for shard count.
@@ -228,7 +228,6 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         let cost_time = self.cost.run_iter(
             self.model.as_ref(),
             &arch_input,
-            self.id,
             self.runtime.iter_counter as u64,
             now,
         );

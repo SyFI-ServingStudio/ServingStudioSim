@@ -194,7 +194,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             LoadBalance::Single if num_groups > 1 => LoadBalance::RoundRobin { next: 0 },
             other => other,
         };
-        let cost = CostBuffers::new(cost_log_dir, pool_tag, id, model.as_ref());
+        let cost = CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref());
         Self {
             id,
             model,
@@ -427,7 +427,6 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
         let cost_time = self.cost.run_iter(
             self.model.as_ref(),
             &self.arch_buf,
-            self.id,
             self.runtime.iter_counter as u64,
             now,
         );

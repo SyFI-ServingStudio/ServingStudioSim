@@ -1,47 +1,88 @@
-//! `iter-timing-predict` — offline whole-iteration timing prediction.
+//! `timing-predict` — offline per-building-block timing prediction.
 //!
 //! This is the same family as `dry-run` / `build-cache-only` / `kernel-query`:
 //! it does NOT run the discrete-event sim (no scheduler, no trace, no clock). It
-//! takes a batch of explicit iteration shapes and, for each, runs ONE
-//! `IterwiseUnifiedModel::eval_iter` over the compiled `CostTree`, predicting the
-//! whole forward pass (embedding → all layers via the `Scale{n}` fold → lm_head).
-//! The unit is always a full **iteration**, even for an arch whose model is
-//! layer-wise internally — hence `iter`, not `layer` (a future per-layer-section
-//! `eval_layer` is an *in-sim* AFD method, not this tool).
+//! takes a batch of explicit batch shapes and, for each, runs the cost model over
+//! the compiled `CostTree(s)`, predicting timings WITHOUT a GPU (a warm
+//! `profile.db`) or JIT-profiling on demand (a cold one).
 //!
-//! The output is not a bespoke format: each case is emitted as ONE row of the
-//! standard `raw/cost_log/worker_predict_0.parquet` + the matching
+//! Three arch kinds, one tool (the `arch` selector picks):
+//!   - `iter` — ONE [`IterwiseUnifiedModel::eval_iter`] over the whole forward
+//!     pass (embedding → all layers via the `Scale{n}` fold → lm_head). One row
+//!     per case, `section = "iter"`, `layer = -1`.
+//!   - `attn` — the AFD attn side ([`qwen3_attn`]): one `attn_cost` per case
+//!     (`section = "attn"`). One DP shard = one group.
+//!   - `ffn` — the AFD ffn side ([`qwen3_ffn_moe`]): the per-section building
+//!     blocks of one iteration — `prologue` (embed), `pre_attn` (layer-0 qkv),
+//!     a representative mid-layer `post_attn` (o_proj + router + MoE + fused
+//!     next-layer qkv), the terminal `post_attn_last`, and `epilogue`
+//!     (final_norm + lm_head). One row per section.
+//!
+//! **One arch, not a bundle.** AFD is predicted by running this tool TWICE — once
+//! with the attn arch, once with the ffn arch — each independent. The cross-pool
+//! attn↔ffn handoff is a `GpuCluster` transfer (not a cost-tree leaf) and is out
+//! of scope here; the MoE EP dispatch/combine comm, by contrast, IS an in-tree
+//! compute leaf inside the ffn `post_attn` section and is logged automatically.
+//!
+//! The output is not a bespoke format: every case/section is emitted as one row of
+//! the standard `raw/cost_log/worker_predict_0.parquet` + the matching
 //! `raw/cost_manifest/worker_predict_0.json` — byte-for-byte the artifacts a real
-//! `run` writes (one worker, `iter_id` = case index). So `analyze trace` renders
-//! the `iter → layers → kernels` Perfetto tree and `analyze run` computes its
-//! reports with **zero** changes (`docs/analyzer.md`).
+//! `run` writes (one worker, `iter_id` = case index). All three paths reuse the
+//! worker's [`CostBuffers`]: the iter path via [`CostBuffers::run_iter`], the
+//! layer-wise attn/ffn paths via [`CostBuffers::run_section`], whose rows carry
+//! the `section` + `layer` fields.
 //!
-//! Config (a minimal file, NOT a `RunConfig`): ONE iter-wise arch selector + its
-//! GPU + a log dir + a batched cases file. No workload / pools / io — those
-//! belong to `run`. Built via the shared `arch::build::build_iter_model` seam
-//! (the offline path is `dyn`; the sim's cost path stays monomorphized), and the
-//! per-case eval + cost_log write reuse the worker's `CostBuffers` bundle.
+//! Config (a minimal file, NOT a `RunConfig`): ONE arch selector + its GPU + a log
+//! dir + a batched cases file. No workload / pools / io — those belong to `run`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
-use crate::arch::build::build_iter_model;
-use crate::arch::contract::{ArchGroupInput, UnifiedArchInput};
-use crate::arch::IterArchSel;
+use crate::arch::build::{build_iter_model, qwen3_attn, qwen3_ffn_moe};
+use crate::arch::contract::{
+    ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
+    IterwiseUnifiedModel, UnifiedArchInput,
+};
+use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, WorkerId};
 use crate::timing::PerfApiBridge;
 use crate::worker::CostBuffers;
 
-/// Minimal offline config. `arch` reuses the run-side [`IterArchSel`] (it already
-/// flattens `ModelSpec` — model path, layer overrides, parallel dims), so a
-/// predict config is just that selector plus where to run it and what to predict.
+/// The AFD deployment's dotted-leaf prefix (see `deployment/afd.rs`). Predicting
+/// the attn / ffn arches under the same name makes a predicted manifest's leaf
+/// names match a real AFD run's, so the analyzer renders them identically.
+const AFD_MODEL_NAME: &str = "afd";
+/// The co-located unified run's leaf prefix, reused by the `iter` arch.
+const UNIFIED_MODEL_NAME: &str = "unified";
+/// All predict streams write under one writer/file tag; the building block is the
+/// per-row `section` field, NOT the pool tag (which only names pool/worker identity).
+const PREDICT_POOL_TAG: &str = "predict";
+
+/// Which arch to predict. Externally tagged so the config selects exactly one of
+/// the three families by key: `{ iter: {...} } | { attn: {...} } | { ffn: {...} }`.
+/// Each inner selector is the run-side one (internally tagged on `type`), so a
+/// predict config reuses the same arch grammar a real run uses.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum PredictArchSel {
+    /// A whole-iteration arch — costed as one fused `eval_iter`.
+    Iter(IterArchSel),
+    /// The AFD attn side — costed as one `attn_cost` per case.
+    Attn(AttnArchSel),
+    /// The AFD ffn side — costed as the per-section building blocks of one iteration.
+    Ffn(FfnArchSel),
+}
+
+/// Minimal offline config for `timing-predict`. `arch` is the generalized
+/// [`PredictArchSel`]; the rest mirror the legacy iter config.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TimingPredictConfig {
-    arch: IterArchSel,
+struct PredictConfig {
+    arch: PredictArchSel,
     gpu: String,
     log_dir: PathBuf,
     /// Path to the batched cases JSON/YAML (a top-level array of [`PredictCase`]).
@@ -49,8 +90,9 @@ struct TimingPredictConfig {
     cases_file: PathBuf,
 }
 
-/// One predicted iteration: exactly `num_attn_dp_groups()` attention-DP shards
-/// (validated against the built model), each a per-rank batch view.
+/// One predicted case: a list of attention-DP shards. The expected count depends
+/// on the arch — `iter`/`ffn` want `num_attn_dp_groups`/`num_dp_groups` shards,
+/// `attn` wants exactly one (one model instance = one DP shard).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PredictCase {
@@ -117,98 +159,303 @@ impl PredictGroup {
 }
 
 impl PredictCase {
-    /// Validate the group count against the model's attention-DP degree and lower
-    /// every group. `tokens_per_source_rank` stays empty (same as the workers; its
-    /// L4/L5 ownership is unsettled — see memory `tokens_per_source_rank_layer_conflict`).
-    fn into_arch_input(self, expected_groups: usize) -> Result<UnifiedArchInput> {
+    /// Validate the group count against the model's expected DP degree and lower
+    /// every group to its [`ArchGroupInput`]. This is the attention-shaped lowering
+    /// shared by the iter and attn drivers — both of whose input types wrap
+    /// `Vec<ArchGroupInput>`. It is NOT a universal case→input step: each driver
+    /// owns the construction of its own input type from these groups (iter wraps
+    /// them in a [`UnifiedArchInput`], attn in an [`AttnArchInput`]), and the ffn
+    /// side does not pass through here at all — its case is the lean [`FfnArchInput`]
+    /// itself, whose token counts the ffn cost reads directly. We do not assume a
+    /// future arch's input aligns with this `Vec<ArchGroupInput>` shape.
+    fn into_groups(self, expected_groups: usize) -> Result<Vec<ArchGroupInput>> {
         ensure!(
             self.groups.len() == expected_groups,
-            "case has {} group(s) but the model expects {} (num_attn_dp_groups)",
+            "case has {} group(s) but the model expects {}",
             self.groups.len(),
             expected_groups,
         );
-        let groups = self
-            .groups
+        self.groups
             .into_iter()
             .map(PredictGroup::into_arch_group)
-            .collect::<Result<Vec<_>>>()?;
-        Ok(UnifiedArchInput {
-            groups,
-            tokens_per_source_rank: Vec::new(),
-        })
+            .collect()
     }
 }
 
-/// Entry point for `simulator iter-timing-predict <config>`.
-pub fn run_iter_timing_predict(config_path: &Path) -> Result<()> {
-    let cfg = load_config(config_path)?;
-    let cases = load_cases(&cfg.cases_file, config_path)?;
-    let num_cases = cases.len();
+/// Entry point for `simulator timing-predict <config>` — the generalized tool.
+/// Dispatches on the arch kind: `iter` drives [`CostBuffers::run_iter`];
+/// `attn` / `ffn` build the AFD layer-wise model and drive the per-section evals
+/// through [`CostBuffers::run_section`].
+pub fn run_timing_predict(config_path: &Path) -> Result<()> {
+    let cfg: PredictConfig = parse_config_file(config_path)?;
+    let bridge = predict_bridge()?;
 
-    // Offline what-if: JIT-fill missing `profile.db` rows on build (like
-    // `kernel-query`), rather than the strict fail-fast a real `run` uses. A warm
-    // cache then needs no GPU; a cold one profiles on demand.
-    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
-    bridge
-        .enable_jit_profiling()
-        .context("enabling JIT profiling for offline prediction")?;
-
-    // `name` is the model's dotted-leaf prefix; reuse the co-located unified
-    // run's so a predicted manifest matches a real run's leaf names.
-    let model = build_iter_model(&cfg.arch, &cfg.gpu, "unified", &bridge)
-        .context("building the arch model for iter-timing-predict")?;
-    let expected_groups = model.num_attn_dp_groups() as usize;
-
-    // Standard per-"worker" artifacts via the shared `CostBuffers` bundle — the
-    // same one every iter-wise worker carries (`worker/cost_buffers.rs`): it owns
-    // the eval scratch (slots / scratch / slot_inputs + the per-group input log)
-    // plus the cost_log writer, and per case runs `eval_iter_with_inputs` and
-    // writes one parquet row (pool_tag "predict", worker 0). The manifest sidecar +
-    // parquet are byte-identical to a real run, so the analyzer consumes them
-    // unchanged.
-    let mut cost = CostBuffers::new(Some(cfg.log_dir.clone()), "predict", WorkerId(0), &*model);
-
-    // Lay cases out back-to-back on the trace's wall-clock axis: `run_iter` stamps
-    // `now` as this row's `wall_start_ms` and returns the iter's predicted time, so
-    // accumulating it starts the next case where this one ends.
-    let mut now = Time::from_ms(0.0);
-    for (idx, case) in cases.into_iter().enumerate() {
-        let arch_input = case
-            .into_arch_input(expected_groups)
-            .with_context(|| format!("case {idx}"))?;
-        now += cost.run_iter(&*model, &arch_input, WorkerId(0), idx as u64, now);
-    }
-    // The writer flushes its tail and joins on drop (`CostLogger`'s `Drop`), the
-    // same as a worker at sim end; force it here so the parquet is complete before
-    // we report success.
-    drop(cost);
+    // Cases are loaded per arch family — each arch owns its own case type, so we do
+    // not assume a shared shape: iter/attn take the attention-shaped [`PredictCase`];
+    // ffn takes [`FfnArchInput`] itself (token counts only), which rejects the
+    // attention vocabulary the ffn cost never reads.
+    let num_cases = match &cfg.arch {
+        PredictArchSel::Iter(sel) => {
+            let model = build_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
+                .context("building the iter-wise arch model")?;
+            let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
+            let n = cases.len();
+            run_iter_cases(&*model, cases, &cfg.log_dir)?;
+            n
+        }
+        PredictArchSel::Attn(sel) => {
+            let model = build_attn(sel, &cfg.gpu, &bridge)?;
+            let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
+            let n = cases.len();
+            run_attn_cases(&model, cases, &cfg.log_dir)?;
+            n
+        }
+        PredictArchSel::Ffn(sel) => {
+            let model = build_ffn(sel, &cfg.gpu, &bridge)?;
+            let cases: Vec<FfnArchInput> = load_cases(&cfg.cases_file, config_path)?;
+            let n = cases.len();
+            run_ffn_cases(&model, cases, &cfg.log_dir)?;
+            n
+        }
+    };
 
     tracing::info!(
         log_dir = %cfg.log_dir.display(),
-        "iter-timing-predict wrote {num_cases} case(s)"
+        "timing-predict wrote {num_cases} case(s)"
     );
     Ok(())
 }
 
-/// Parse the minimal config (JSON via the JSON parser for clearer errors, else
-/// YAML — YAML is a JSON superset). Mirrors `main::load_config`.
-fn load_config(path: &Path) -> Result<TimingPredictConfig> {
+/// Offline what-if bridge: JIT-fill missing `profile.db` rows on build (like
+/// `kernel-query`), rather than the strict fail-fast a real `run` uses. A warm
+/// cache then needs no GPU; a cold one profiles on demand.
+fn predict_bridge() -> Result<PerfApiBridge> {
+    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+    bridge
+        .enable_jit_profiling()
+        .context("enabling JIT profiling for offline prediction")?;
+    Ok(bridge)
+}
+
+/// Run the iter-wise cases: one [`CostBuffers::run_iter`] per case (one parquet row
+/// each, `section = "iter"`). Lays cases back-to-back on the wall-clock axis.
+fn run_iter_cases(
+    model: &dyn IterwiseUnifiedModel,
+    cases: Vec<PredictCase>,
+    log_dir: &Path,
+) -> Result<()> {
+    let expected_groups = model.num_attn_dp_groups() as usize;
+    // The shared `CostBuffers` bundle every iter-wise worker carries: it owns the
+    // eval scratch + the cost_log writer (pool_tag "predict", worker 0) and per
+    // case runs `eval_iter_with_inputs` and writes one byte-identical parquet row.
+    let mut cost =
+        CostBuffers::new_iter(Some(log_dir.to_path_buf()), PREDICT_POOL_TAG, WorkerId(0), model);
+    let mut now = Time::from_ms(0.0);
+    for (idx, case) in cases.into_iter().enumerate() {
+        // The iter driver owns its input construction: wrap the shared attention
+        // groups in a `UnifiedArchInput`. `tokens_per_source_rank` stays empty (same
+        // as the workers; its L4/L5 ownership is unsettled — see memory
+        // `tokens_per_source_rank_layer_conflict`).
+        let arch_input = UnifiedArchInput {
+            groups: case
+                .into_groups(expected_groups)
+                .with_context(|| format!("case {idx}"))?,
+            tokens_per_source_rank: Vec::new(),
+        };
+        now += cost.run_iter(model, &arch_input, idx as u64, now);
+    }
+    // Flush the writer's tail + join on drop (`CostLogger`'s `Drop`), same as a
+    // worker at sim end; force it before reporting success.
+    drop(cost);
+    Ok(())
+}
+
+/// Run the AFD attn-side cases: one `attn_cost` per case (`section = "attn"`,
+/// `layer = 0` — every layer sees the same batch within an iteration, so the
+/// per-layer cost is homogeneous). One model instance = one DP shard, so each
+/// case carries exactly one group.
+fn run_attn_cases(
+    model: &impl AttnLayerwiseModel,
+    cases: Vec<PredictCase>,
+    log_dir: &Path,
+) -> Result<()> {
+    let expected_groups = model.num_attn_dp_groups() as usize;
+    let manifest = model.cost_log_manifest();
+    let mut cost =
+        CostBuffers::new(Some(log_dir.to_path_buf()), PREDICT_POOL_TAG, WorkerId(0), &manifest);
+    let mut now = Time::from_ms(0.0);
+    for (idx, case) in cases.into_iter().enumerate() {
+        let groups = case
+            .into_groups(expected_groups)
+            .with_context(|| format!("case {idx}"))?;
+        let input = AttnArchInput { groups };
+        let agg = cost.run_section("attn", 0, idx as u64, 0, &input.groups, now, |slots, scratch, inputs| {
+            match inputs {
+                Some(i) => model.attn_cost_with_inputs(0, &input, slots, scratch, i),
+                None => model.attn_cost(0, &input, slots, scratch),
+            }
+        });
+        now += Time::from_ms(agg.m.time_ms as f64);
+    }
+    drop(cost);
+    Ok(())
+}
+
+/// Run the AFD ffn-side cases: emit the per-section building blocks of one
+/// iteration, each as one row. The repeating per-mid-layer `post_attn` cost is
+/// homogeneous, so a single representative mid layer stands for all of them; the
+/// terminal layer (`post_attn_last`, post-only) is emitted once. `prologue` and
+/// `epilogue` are the once-per-iteration embed / lm_head, `layer = -1`.
+///
+/// The ffn case IS its input: [`FfnArchInput`] deserializes straight from the cases
+/// file (a list of `{ "tokens_per_group": [...] }`), so there is no separate case
+/// type and no lowering — the ffn cost reads the token counts directly. This is the
+/// deliberate counterpoint to the iter/attn drivers' shared attention-shaped case:
+/// each arch's case→input matches the shape its cost actually depends on.
+fn run_ffn_cases(
+    model: &impl FfnLayerwiseModel,
+    cases: Vec<FfnArchInput>,
+    log_dir: &Path,
+) -> Result<()> {
+    let expected_groups = model.num_dp_groups() as usize;
+    let num_layers = model.num_layers();
+    let last = num_layers.saturating_sub(1) as usize;
+    let manifest = model.cost_log_manifest();
+    let mut cost =
+        CostBuffers::new(Some(log_dir.to_path_buf()), PREDICT_POOL_TAG, WorkerId(0), &manifest);
+    let mut now = Time::from_ms(0.0);
+    for (idx, input) in cases.into_iter().enumerate() {
+        ensure!(
+            input.tokens_per_group.len() == expected_groups,
+            "ffn case {idx} has {} group(s) but the model expects {expected_groups} (num_dp_groups)",
+            input.tokens_per_group.len(),
+        );
+        let iid = idx as u64;
+
+        // prologue (embedding), once per iteration.
+        let agg = cost.run_section("prologue", -1, iid, 0, &input.tokens_per_group, now, |slots, scratch, inputs| {
+            match inputs {
+                Some(i) => model.prologue_cost_with_inputs(&input, slots, scratch, i),
+                None => model.prologue_cost(&input, slots, scratch),
+            }
+        });
+        now += Time::from_ms(agg.m.time_ms as f64);
+
+        // pre_attn bootstrap: layer-0 qkv (layers > 0 are fused into the prior
+        // layer's post_attn, so only layer 0 has a standalone pre cost).
+        let agg = cost.run_section("pre_attn", 0, iid, 0, &input.tokens_per_group, now, |slots, scratch, inputs| {
+            match inputs {
+                Some(i) => model.pre_attn_cost_with_inputs(0, &input, slots, scratch, i),
+                None => model.pre_attn_cost(0, &input, slots, scratch),
+            }
+        });
+        now += Time::from_ms(agg.m.time_ms as f64);
+
+        // post_attn for a representative mid layer (Bridge: post(L) + fused pre(L+1)),
+        // standing for every layer in [0, last). Only when there IS a mid layer.
+        if num_layers >= 2 {
+            let mid = (num_layers as usize - 1) / 2; // clearly < last for num_layers >= 2
+            let agg = cost.run_section("post_attn", mid as i16, iid, 0, &input.tokens_per_group, now, |slots, scratch, inputs| {
+                match inputs {
+                    Some(i) => model.post_attn_cost_with_inputs(mid, &input, slots, scratch, i),
+                    None => model.post_attn_cost(mid, &input, slots, scratch),
+                }
+            });
+            now += Time::from_ms(agg.m.time_ms as f64);
+        }
+
+        // post_attn terminal (last layer, post-only).
+        let agg = cost.run_section("post_attn_last", last as i16, iid, 0, &input.tokens_per_group, now, |slots, scratch, inputs| {
+            match inputs {
+                Some(i) => model.post_attn_cost_with_inputs(last, &input, slots, scratch, i),
+                None => model.post_attn_cost(last, &input, slots, scratch),
+            }
+        });
+        now += Time::from_ms(agg.m.time_ms as f64);
+
+        // epilogue (final_norm + lm_head), once per iteration.
+        let agg = cost.run_section("epilogue", -1, iid, 0, &input.tokens_per_group, now, |slots, scratch, inputs| {
+            match inputs {
+                Some(i) => model.epilogue_cost_with_inputs(&input, slots, scratch, i),
+                None => model.epilogue_cost(&input, slots, scratch),
+            }
+        });
+        now += Time::from_ms(agg.m.time_ms as f64);
+    }
+    drop(cost);
+    Ok(())
+}
+
+/// Build the AFD attn-side model from its selector. Only the layer-wise qwen3 arch
+/// has a predict path; the llama3 attn variant bails (mirrors `AfdDeployment`).
+fn build_attn(
+    sel: &AttnArchSel,
+    gpu: &str,
+    bridge: &PerfApiBridge,
+) -> Result<impl AttnLayerwiseModel> {
+    match sel {
+        AttnArchSel::Qwen3AttnTp { model, attn_tp_size } => {
+            qwen3_attn(model, *attn_tp_size, gpu, AFD_MODEL_NAME, bridge)
+        }
+        AttnArchSel::Llama3AttnTp { .. } => bail!(
+            "timing-predict attn: only the qwen3_attn_tp arch has a layer-wise \
+             predict path (got llama3_attn_tp)"
+        ),
+    }
+}
+
+/// Build the AFD ffn-side model from its selector. Only the layer-wise qwen3 arch
+/// has a predict path; the deepseek ffn variant bails (mirrors `AfdDeployment`).
+fn build_ffn(
+    sel: &FfnArchSel,
+    gpu: &str,
+    bridge: &PerfApiBridge,
+) -> Result<impl FfnLayerwiseModel> {
+    match sel {
+        FfnArchSel::Qwen3FfnMoe {
+            model,
+            attn_tp_size,
+            ep_size,
+            nvl_num_gpu,
+            routing,
+            routing_seed,
+        } => qwen3_ffn_moe(
+            model,
+            *attn_tp_size,
+            *ep_size,
+            *nvl_num_gpu,
+            *routing,
+            *routing_seed,
+            gpu,
+            AFD_MODEL_NAME,
+            bridge,
+        ),
+        FfnArchSel::DeepseekFfnMoe { .. } => bail!(
+            "timing-predict ffn: only the qwen3_ffn_moe arch has a layer-wise \
+             predict path (got deepseek_ffn_moe)"
+        ),
+    }
+}
+
+/// Parse a predict config (JSON via the JSON parser for clearer errors, else
+/// YAML — YAML is a JSON superset). Generic over the config type so the legacy
+/// iter config and the generalized one share it. Mirrors `main::load_config`.
+fn parse_config_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading predict config {}", path.display()))?;
-    let cfg = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+    if path.extension().and_then(|e| e.to_str()) == Some("json") {
         serde_json::from_str(&text)
-            .with_context(|| format!("parsing JSON predict config {}", path.display()))?
+            .with_context(|| format!("parsing JSON predict config {}", path.display()))
     } else {
         serde_yaml::from_str(&text)
-            .with_context(|| format!("parsing YAML predict config {}", path.display()))?
-    };
-    Ok(cfg)
+            .with_context(|| format!("parsing YAML predict config {}", path.display()))
+    }
 }
 
 /// Load the batched cases (a top-level array). `cases_file` resolves relative to
 /// the config file's directory so a hand-written config + sibling cases file work
 /// regardless of the launch CWD.
-fn load_cases(cases_file: &Path, config_path: &Path) -> Result<Vec<PredictCase>> {
+fn load_cases<T: DeserializeOwned>(cases_file: &Path, config_path: &Path) -> Result<Vec<T>> {
     let resolved = if cases_file.is_absolute() {
         cases_file.to_path_buf()
     } else {
@@ -219,7 +466,7 @@ fn load_cases(cases_file: &Path, config_path: &Path) -> Result<Vec<PredictCase>>
     };
     let text = fs::read_to_string(&resolved)
         .with_context(|| format!("reading cases file {}", resolved.display()))?;
-    let cases: Vec<PredictCase> = if resolved.extension().and_then(|e| e.to_str()) == Some("json") {
+    let cases: Vec<T> = if resolved.extension().and_then(|e| e.to_str()) == Some("json") {
         serde_json::from_str(&text)
             .with_context(|| format!("parsing JSON cases file {}", resolved.display()))?
     } else {
@@ -286,8 +533,21 @@ mod tests {
             serde_json::from_str(r#"{"groups": [{"decode_count": 1, "average_decode_length": 8}]}"#)
                 .unwrap();
         // Model expects 2 DP shards but the case gave 1.
-        let err = case.into_arch_input(2).unwrap_err().to_string();
-        assert!(err.contains("num_attn_dp_groups"), "got: {err}");
+        let err = case.into_groups(2).unwrap_err().to_string();
+        assert!(err.contains("expects 2"), "got: {err}");
+    }
+
+    #[test]
+    fn ffn_case_is_the_input_struct_directly() {
+        // The ffn case deserializes straight into `FfnArchInput` — no separate case
+        // type, no lowering. Token counts ARE the input.
+        let input: FfnArchInput =
+            serde_json::from_str(r#"{"tokens_per_group": [256, 256]}"#).unwrap();
+        assert_eq!(input.tokens_per_group, vec![256, 256]);
+        // deny_unknown_fields rejects stray attention vocabulary the ffn never reads.
+        let bad: Result<FfnArchInput, _> =
+            serde_json::from_str(r#"{"tokens_per_group": [1], "decode_count": 1}"#);
+        assert!(bad.is_err());
     }
 
     #[test]
@@ -296,5 +556,21 @@ mod tests {
         let parsed: Result<PredictGroup, _> =
             serde_json::from_str(r#"{"decode_kv_len": [10]}"#);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn predict_arch_sel_is_externally_tagged_by_kind() {
+        // The generalized config selects the arch family by key; the inner selector
+        // keeps its own `type` tag.
+        let attn: PredictArchSel = serde_json::from_str(
+            r#"{"attn": {"type": "qwen3_attn_tp", "model_config": "qwen3_235b", "fp8": false, "attn_tp_size": 4}}"#,
+        )
+        .expect("attn variant parses");
+        assert!(matches!(attn, PredictArchSel::Attn(_)));
+
+        // An unknown kind is rejected (lists iter/attn/ffn).
+        let bad: Result<PredictArchSel, _> =
+            serde_json::from_str(r#"{"bogus": {"type": "x"}}"#);
+        assert!(bad.is_err());
     }
 }

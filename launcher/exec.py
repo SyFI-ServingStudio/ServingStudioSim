@@ -231,7 +231,7 @@ async def run_analysis(
 
 async def run_iter_breakdown(log_dir: Path, build_type: str = "debug") -> None:
     """Best-effort `analyze gen-iter-breakdown` → `reports/iter_breakdown.ans`
-    (human-readable cost tree). Wired ONLY into the iter-timing-predict entry, not
+    (human-readable cost tree). Wired ONLY into the timing-predict entry, not
     the shared `run_analysis`: a real run has thousands of iters, so auto-emitting
     a per-iter tree there would be a huge file — predict dirs have a handful of
     cases. The verb itself is general (`analyze gen-iter-breakdown <dir>` works on

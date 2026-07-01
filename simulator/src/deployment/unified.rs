@@ -88,7 +88,7 @@ impl Deployment for UnifiedDeployment {
 
         // Arch selected by explicit tag; each arm builds its concrete model via
         // the shared `arch::build` builders (the same ones the `pd` deployment and
-        // the offline `iter-timing-predict` path use), validates the paired worker
+        // the offline `timing-predict` path use), validates the paired worker
         // tag, and erases via assemble_flow. dense / dense_tp run on the
         // single-group barebone worker; the DP-attn / MoE archs run on the
         // multi-group hp_unified worker (one Batch per DP shard).

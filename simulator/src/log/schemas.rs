@@ -99,6 +99,16 @@ pub fn cost_log_schema() -> Arc<Schema> {
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
             false,
         ),
+        // `section` / `layer` make a row's building-block group explicit (vs the
+        // iter-wise form, where one Scale-folded row covers the whole iteration).
+        // `section` names the cost group — `iter` for the fused unified path, or
+        // `attn` / `prologue` / `pre_attn` / `post_attn` / `epilogue` for the AFD
+        // layer-wise path; it selects which sub-manifest in the `cost_manifest/`
+        // sidecar interprets this row's `slot_*` lists. `layer` is the layer index
+        // (`-1` when the row is whole-iteration / Scale-folded). Appended last:
+        // append-only, so old readers are unaffected.
+        Field::new("section", DataType::Utf8, false),
+        Field::new("layer", DataType::Int16, false),
     ]))
 }
 

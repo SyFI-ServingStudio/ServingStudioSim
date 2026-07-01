@@ -1,0 +1,5 @@
+[
+  { "tokens_per_group": [256, 256] },
+  { "tokens_per_group": [2048, 2048] },
+  { "tokens_per_group": [1088, 1088] }
+]

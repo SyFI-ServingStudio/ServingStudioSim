@@ -18,7 +18,7 @@ use crate::common::WorkerId;
 use crate::log::parquet_writer::StreamingParquetWriter;
 use crate::log::rows::{cost_to_record_batch, CostLogChunk, CostLogEntry, GroupInputLog};
 use crate::log::schemas::cost_log_schema;
-use crate::timing::{CostManifest, LeafMetrics, SlotInput};
+use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
 
 const STREAM_FLUSH_ROWS: usize = 8_192;
 const CHANNEL_CAP: usize = 64;
@@ -59,12 +59,14 @@ impl CostLogger {
     /// decode worker 0). The manifest carries the ordered slots (positions map
     /// to the parquet's `slot_*` lists) *and* the flattened aggregation nodes,
     /// so a consumer can reproduce `total_time_ms` from a row's per-slot
-    /// breakdown for that specific `(pool_tag, worker_id)` stream.
+    /// breakdown for that specific `(pool_tag, worker_id)` stream. The manifest is
+    /// a [`CostManifestDoc`] — one or more named sections, indexed by each row's
+    /// `section` field (the iter-wise path passes a single `iter` section).
     pub fn open(
         log_dir: &Path,
         pool_tag: &'static str,
         worker_id: WorkerId,
-        manifest: &CostManifest,
+        manifest: &CostManifestDoc,
     ) -> Result<Self> {
         let raw = log_dir.join("raw");
         let cost_dir = raw.join("cost_log");
@@ -229,7 +231,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::log::CostLogEntry;
-    use crate::timing::{CoverageFlags, FlatCostNode, LeafDesc, Metrics4};
+    use crate::timing::{CostManifest, CoverageFlags, FlatCostNode, LeafDesc, Metrics4};
 
     #[test]
     fn writes_pool_worker_scoped_cost_artifacts() {
@@ -244,8 +246,9 @@ mod tests {
             node_labels: vec![None],
         };
 
+        let doc = CostManifestDoc::single("iter", manifest);
         let mut logger =
-            CostLogger::open(dir.path(), "decode", WorkerId(7), &manifest).unwrap();
+            CostLogger::open(dir.path(), "decode", WorkerId(7), &doc).unwrap();
         let entry = CostLogEntry {
             worker_id: 7,
             iter_id: 3,
@@ -253,6 +256,8 @@ mod tests {
             wall_start_ms: 10.0,
             total_time_ms: 1.25,
             energy_j: 0.0,
+            section: "iter",
+            layer: -1,
             group_len: 0,
             slot_len: 0,
             slot_input_len: 0,

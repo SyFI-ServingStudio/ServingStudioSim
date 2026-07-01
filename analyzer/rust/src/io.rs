@@ -75,7 +75,7 @@ pub fn read_run_meta(log_dir: &Path) -> Option<(usize, String)> {
 /// cost_log row to select the right CostTree.
 pub fn read_cost_manifests(
     log_dir: &Path,
-) -> Result<BTreeMap<(String, u16), crate::trace::manifest::Manifest>> {
+) -> Result<BTreeMap<(String, u16), crate::trace::manifest::ManifestDoc>> {
     use anyhow::{bail, Context};
     let dir = resolve_artifact_path(log_dir, "cost_manifest");
     if !dir.is_dir() {

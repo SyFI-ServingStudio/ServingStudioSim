@@ -51,16 +51,29 @@ const COLUMNS: &[&str] = &[
     "pool_tag",
     "worker_id",
     "iter_id",
+    "batch_id",
+    "section",
+    "layer",
     "total_time_ms",
     "slot_time_ms",
     "groups",
 ];
 
-/// One iteration's row, materialized from the parquet.
+/// One iteration's (or one AFD building block's) row, materialized from the parquet.
 struct BreakRow {
     pool_tag: String,
     worker_id: u16,
     iter_id: u64,
+    /// Micro-batch / pipeline slot (AFD) — distinguishes rows that share
+    /// `(iter_id, section, layer)` but belong to different slots. `0` for iter-wise.
+    batch_id: u64,
+    /// Building-block section (`iter` for iter-wise; `attn` / `prologue` /
+    /// `pre_attn` / `post_attn` / `post_attn_last` / `epilogue` for AFD). Selects
+    /// which sub-manifest interprets `slot_ns`.
+    section: String,
+    /// Layer index this block belongs to (`-1` for iter-wise / iteration-level
+    /// prologue & epilogue). Shown in the AFD header only.
+    layer: i16,
     total_time_ms: f64,
     /// Per-slot leaf duration, pre-rounded to ns (index = manifest slot).
     slot_ns: Vec<i64>,
@@ -82,24 +95,27 @@ pub async fn run(
     }
     require_columns(ctx, COST_LOG_TABLE, COLUMNS).await?;
 
-    // Cast pool_tag → VARCHAR for the same RLE_DICTIONARY reason as `analyze
-    // trace`: `value_string` downcasts to StringArray, which fails on the
-    // DictionaryArray parquet hands back for a low-cardinality column.
+    // Cast the low-cardinality string columns (pool_tag, section) → VARCHAR for the
+    // same reason as `analyze trace`: parquet hands them back as a DictionaryArray
+    // (RLE_DICTIONARY), which `value_string`'s StringArray downcast rejects. The
+    // rest pass through unchanged.
     let other_cols = COLUMNS
         .iter()
-        .filter(|c| **c != "pool_tag")
+        .filter(|c| **c != "pool_tag" && **c != "section")
         .copied()
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, {other_cols} \
-         FROM cost_log ORDER BY pool_tag, worker_id, iter_id"
+        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, CAST(section AS VARCHAR) AS section, \
+         {other_cols} FROM cost_log ORDER BY pool_tag, worker_id, iter_id"
     );
     let batches = collect(ctx, &sql).await?;
 
     let mut rows: Vec<BreakRow> = Vec::new();
     for b in &batches {
         let (pt, wid, iid) = (col(b, "pool_tag")?, col(b, "worker_id")?, col(b, "iter_id")?);
+        let bid = col(b, "batch_id")?;
+        let (sec, lay) = (col(b, "section")?, col(b, "layer")?);
         let (tt, st, gr) = (
             col(b, "total_time_ms")?,
             col(b, "slot_time_ms")?,
@@ -114,6 +130,9 @@ pub async fn run(
                 pool_tag: value_string(pt, r)?,
                 worker_id: value_f64(wid, r)? as u16,
                 iter_id: value_f64(iid, r)? as u64,
+                batch_id: value_f64(bid, r)? as u64,
+                section: value_string(sec, r)?,
+                layer: value_f64(lay, r)? as i16,
                 total_time_ms: value_f64(tt, r)?,
                 slot_ns,
                 groups: value_groups(gr, r)?,
@@ -138,9 +157,15 @@ pub async fn run(
     let mut out = String::new();
     for row in &rows {
         let key = (row.pool_tag.clone(), row.worker_id);
-        let manifest = manifests
+        let doc = manifests
             .get(&key)
             .with_context(|| format!("missing cost manifest for {}/{}", key.0, key.1))?;
+        let manifest = doc.section(&row.section).with_context(|| {
+            format!(
+                "cost manifest for {}/{} has no section {:?}",
+                key.0, key.1, row.section
+            )
+        })?;
         out.push_str(&render_header(row, manifest, color));
         out.push('\n');
         out.push_str(&render_tree(manifest, &row.slot_ns, color));
@@ -539,7 +564,20 @@ fn render_header(row: &BreakRow, m: &Manifest, color: bool) -> String {
     let mut s = String::new();
 
     // Title bar — yellow when colored, a strong visual separator between iters.
-    let title = format!("═══ worker {}/{} · iter {} ", row.pool_tag, row.worker_id, row.iter_id);
+    // Iter-wise rows keep the bare `iter N` title (non-regressing); AFD layer-wise
+    // rows append the building-block section (+ its layer when ≥ 0, + the pipeline
+    // slot) so rows sharing `(iter, section, layer)` across slots are distinguishable.
+    let section_tag = if row.section == "iter" {
+        String::new()
+    } else if row.layer >= 0 {
+        format!("· {} L{} · slot {} ", row.section, row.layer, row.batch_id)
+    } else {
+        format!("· {} · slot {} ", row.section, row.batch_id)
+    };
+    let title = format!(
+        "═══ worker {}/{} · iter {} {section_tag}",
+        row.pool_tag, row.worker_id, row.iter_id
+    );
     let bar = 64usize.saturating_sub(title.chars().count());
     let title_line = format!("{title}{}", "═".repeat(bar));
     if color {
@@ -551,24 +589,21 @@ fn render_header(row: &BreakRow, m: &Manifest, color: bool) -> String {
 
     s.push_str(&format!("arch:  {arch}\n"));
 
-    // Input: a multi-line list per HP group — `prefill` (with its per-request
-    // sub-components), then `decode`, then `kv total`, each on its own line. The
-    // field labels are padded to a fixed width so values line up.
+    // Input: a faithful dump of the per-group input record (the sim's
+    // `GroupInputLog`), one compact JSON object per group — every field, by its real
+    // name, with its real value, no renaming or zero-suppression. So it shows exactly
+    // what the cost_log row carries: iter/attn groups carry the full prefill/decode/KV
+    // shape; the ffn side carries only `batch_tokens` (the rest stay zero/empty). One
+    // line per group keeps it readable even when a group has many prefill requests.
     if row.groups.is_empty() {
         s.push_str("input: (none)\n");
     } else {
         s.push_str("input:\n");
-        for (i, g) in row.groups.iter().enumerate() {
-            s.push_str(&format!("  group {i}\n"));
-            s.push_str(&format!("    {:<8} {} tok\n", "prefill", g.prefill_tokens));
-            // Per-request `prefix-append` breakdown: prefix = cached context length,
-            // append = new tokens scored this step (a fresh request is `0-N`; a
-            // chunked-prefill continuation carries a non-zero prefix).
-            for (prefix, append) in &g.prefill_chunk_pairs {
-                s.push_str(&format!("      • {prefix}-{append}\n"));
-            }
-            s.push_str(&format!("    {:<8} {} req\n", "decode", g.decode_request_count));
-            s.push_str(&format!("    {:<8} {}\n", "kv total", g.decode_kv_total));
+        for g in &row.groups {
+            let json = serde_json::to_string(g).unwrap_or_else(|_| "{}".into());
+            s.push_str("  ");
+            s.push_str(&json);
+            s.push('\n');
         }
     }
 

@@ -273,6 +273,49 @@ pools:
     }
 
     #[test]
+    fn afd_two_pools_parse() {
+        // AFD config: an attn pool (DP shards, qwen3_attn) + an ffn pool (one
+        // aggregated replica, qwen3_ffn_moe). Mirrors `pd_two_pools_parse`.
+        let yaml = r#"
+deployment: afd
+workload: { trace_files: ["t.csv"], duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
+io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
+pools:
+  attn:
+    placement: least-queued
+    groups:
+      - { gpu: "H200", replicas: 8, arch: {type: qwen3_attn_tp, model_config: "m.json", fp8: false, attn_tp_size: 4}, worker: {type: disagg_attn, attn_gpu_memory_gb: 80.0} }
+  ffn:
+    placement: least-queued
+    groups:
+      - { gpu: "H200", replicas: 1, arch: {type: qwen3_ffn_moe, model_config: "m.json", fp8: false, attn_tp_size: 4, ep_size: 8, nvl_num_gpu: 8}, worker: {type: disagg_ffn} }
+"#;
+        let cfg: RunConfig = serde_yaml::from_str(yaml).expect("parse afd");
+        let RunConfig::Afd(a) = &cfg else { panic!("expected afd") };
+        assert_eq!(a.pools.attn.groups[0].replicas, 8);
+        assert_eq!(a.pools.ffn.groups[0].replicas, 1);
+        match &a.pools.attn.groups[0].arch {
+            AttnArchSel::Qwen3AttnTp { attn_tp_size, .. } => assert_eq!(*attn_tp_size, 4),
+            other => panic!("expected qwen3_attn_tp, got {other:?}"),
+        }
+        match &a.pools.ffn.groups[0].arch {
+            FfnArchSel::Qwen3FfnMoe {
+                attn_tp_size,
+                ep_size,
+                ..
+            } => {
+                assert_eq!(*attn_tp_size, 4);
+                assert_eq!(*ep_size, 8);
+            }
+            other => panic!("expected qwen3_ffn_moe, got {other:?}"),
+        }
+        assert!(matches!(
+            a.pools.ffn.groups[0].worker,
+            FfnWorkerSel::DisaggFfn {}
+        ));
+    }
+
+    #[test]
     fn dp_attn_tp_ffn_with_hp_unified_parses() {
         // DP-attention arch carries two TP degrees; pairs with the hp_unified worker.
         let yaml = r#"

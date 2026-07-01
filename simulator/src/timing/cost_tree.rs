@@ -107,6 +107,59 @@ pub struct CostManifest {
     pub node_labels: Vec<Option<String>>,
 }
 
+/// The `cost_manifest/worker_<pool>_<id>.json` sidecar: one or more named
+/// building-block **sections**, each a [`CostManifest`]. The iter-wise path writes
+/// a single `iter` section (the whole fused iteration); the AFD layer-wise path
+/// writes one section per cost group (`attn` on the attn side; `prologue` /
+/// `pre_attn` / `post_attn` / `epilogue` on the ffn side), because those are
+/// distinct compiled CostTrees with different slot sets. A `cost_log` row's
+/// `section` field selects which section's `slots`/`nodes` interpret that row's
+/// `slot_*` lists — so different-shaped sections coexist in one per-worker stream
+/// (the `slot_time_ms` list is already variable-length per row).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CostManifestDoc {
+    pub sections: Vec<CostManifestSection>,
+}
+
+/// One named section of a [`CostManifestDoc`]. `manifest` is `#[serde(flatten)]`,
+/// so a section serializes as `{"section": "attn", "slots": [...], "nodes": [...],
+/// "node_labels": [...]}` — the [`CostManifest`] fields sit alongside `section`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CostManifestSection {
+    pub section: String,
+    #[serde(flatten)]
+    pub manifest: CostManifest,
+}
+
+impl CostManifestDoc {
+    /// A single-section doc — the iter-wise form (`section = "iter"`), and the
+    /// back-compat wrapper for any model exposing one CostTree.
+    pub fn single(section: impl Into<String>, manifest: CostManifest) -> Self {
+        Self {
+            sections: vec![CostManifestSection {
+                section: section.into(),
+                manifest,
+            }],
+        }
+    }
+
+    /// An empty doc — a model with no compiled CostTree (cost_log disabled).
+    pub fn empty() -> Self {
+        Self {
+            sections: Vec::new(),
+        }
+    }
+
+    /// Append a named section (the AFD ffn side builds up `prologue` / `pre_attn`
+    /// / `post_attn` / `epilogue`).
+    pub fn push(&mut self, section: impl Into<String>, manifest: CostManifest) {
+        self.sections.push(CostManifestSection {
+            section: section.into(),
+            manifest,
+        });
+    }
+}
+
 /// Compiled-once structure: the recursive node tree plus the ordered leaf slots
 /// it indexes (slot index = compile traversal order, INV-2).
 #[derive(Clone, Debug)]

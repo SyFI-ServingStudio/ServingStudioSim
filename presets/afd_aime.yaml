@@ -1,0 +1,43 @@
+deployment: afd
+
+# AFD aime long-run: sustained 150 req/s of the aime trace (long decodes up to
+# ~26k tokens) through the attention-FFN disaggregated qwen3-235b. Same pool dims
+# as afd_smoke (attn EP-2 DP shards over attn_tp=4, ffn aggregated EP-8 replica)
+# so the two share kernels / profile.db rows. Purpose: validate no deadlock /
+# no Stuck under sustained concurrent multi-worker lockstep aggregation.
+workload:
+  trace_files:
+    - trace/aime_long.csv
+  request_rate: 150.0
+  duration_ms: 1000000.0
+  run_to_end: false
+
+io:
+  log_dir: logs/afd_aime
+
+pools:
+  attn:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 2
+        arch:
+          type: qwen3_attn_tp
+          model_config: model/config/qwen3_235b.json
+          attn_tp_size: 4
+          fp8: false
+        worker:
+          type: disagg_attn
+          attn_gpu_memory_gb: 80.0
+  ffn:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: qwen3_ffn_moe
+          model_config: model/config/qwen3_235b.json
+          attn_tp_size: 4
+          ep_size: 8
+          nvl_num_gpu: 8
+          fp8: false
+        worker:
+          type: disagg_ffn

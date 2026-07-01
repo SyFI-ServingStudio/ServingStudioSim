@@ -7,11 +7,27 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::contract::{
+    AttnArchInput, AttnLayerwiseModel, FfnArchInput, IterwiseUnifiedModel, UnifiedArchInput,
+};
 use crate::common::{Request, RequestId, RequestStore, SharedRequests, Time};
 use crate::timing::cache::interp::{CoverageFlags, Metrics4};
 use crate::timing::LeafMetrics;
 use crate::worker::gpu_cluster::{CostSource, GpuCluster, SharedGpuCluster};
+
+/// Fixed-cost [`LeafMetrics`] (`time_ms = ms`, no real cost-tree leaves). The
+/// shared building block for the fake L4 models below.
+pub(crate) fn lm(ms: f64) -> LeafMetrics {
+    LeafMetrics {
+        m: Metrics4 {
+            time_ms: ms as f32,
+            flops: 0.0,
+            bytes: 0.0,
+            energy_j: 0.0,
+        },
+        coverage: CoverageFlags::EMPTY,
+    }
+}
 
 /// Empty GPU cluster with an analytic 1 GB/s transfer cost. Workers' `new`
 /// always calls `allocate`/`register_comm_group` against the cluster; tests
@@ -62,6 +78,101 @@ impl IterwiseUnifiedModel for FakeModel {
     }
     fn num_attn_dp_groups(&self) -> u16 {
         self.dp_groups
+    }
+}
+
+/// Fixed-cost stand-in for an AFD attn-side L4 model: every layer's attention
+/// costs `ms`, the handoff is 2 bytes/token, one shard. Shared by the disagg attn
+/// worker tests and the AFD orchestrator tests.
+pub(crate) struct FakeAttn {
+    pub ms: f64,
+    pub layers: u32,
+}
+
+impl AttnLayerwiseModel for FakeAttn {
+    fn num_layers(&self) -> u32 {
+        self.layers
+    }
+    fn gpus_per_replica(&self) -> u16 {
+        1
+    }
+    fn total_kv_bytes_per_token(&self) -> u64 {
+        1
+    }
+    fn attn_to_ffn_bytes_per_token(&self) -> u64 {
+        2
+    }
+    fn attn_cost(
+        &self,
+        _layer: usize,
+        batch: &AttnArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        _scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
+        assert_eq!(batch.groups.len(), 1, "attn worker feeds exactly one group");
+        slots.clear();
+        lm(self.ms)
+    }
+}
+
+/// Fixed-cost stand-in for an AFD ffn-side L4 model: each section costs `ms`, the
+/// QKV handoff is 2 bytes/token, one DP group. Shared by the disagg ffn worker
+/// tests and the AFD orchestrator tests.
+pub(crate) struct FakeFfn {
+    pub ms: f64,
+    pub layers: u32,
+}
+
+impl crate::arch::contract::FfnLayerwiseModel for FakeFfn {
+    fn num_layers(&self) -> u32 {
+        self.layers
+    }
+    fn gpus_per_replica(&self) -> u16 {
+        1
+    }
+    fn num_dp_groups(&self) -> u16 {
+        1
+    }
+    fn ffn_to_attn_bytes_per_token(&self) -> u64 {
+        2
+    }
+    fn pre_attn_cost(
+        &self,
+        _l: usize,
+        _b: &FfnArchInput,
+        s: &mut Vec<LeafMetrics>,
+        _sc: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
+        s.clear();
+        lm(self.ms)
+    }
+    fn post_attn_cost(
+        &self,
+        _l: usize,
+        _b: &FfnArchInput,
+        s: &mut Vec<LeafMetrics>,
+        _sc: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
+        s.clear();
+        lm(self.ms)
+    }
+    fn prologue_cost(
+        &self,
+        _b: &FfnArchInput,
+        s: &mut Vec<LeafMetrics>,
+        _sc: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
+        s.clear();
+        lm(self.ms)
+    }
+    fn epilogue_cost(
+        &self,
+        _b: &FfnArchInput,
+        s: &mut Vec<LeafMetrics>,
+        _sc: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics {
+        s.clear();
+        lm(self.ms)
     }
 }
 

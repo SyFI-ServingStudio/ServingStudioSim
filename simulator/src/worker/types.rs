@@ -153,13 +153,19 @@ pub enum PdDecodeEvent {
 // without each call site naming the variant.
 
 impl From<RequestId> for WorkerMsgCommon {
-    fn from(req: RequestId) -> Self { Self::Request(req) }
+    fn from(req: RequestId) -> Self {
+        Self::Request(req)
+    }
 }
 impl From<RequestId> for PdPrefillMsg {
-    fn from(req: RequestId) -> Self { Self::Request(req) }
+    fn from(req: RequestId) -> Self {
+        Self::Request(req)
+    }
 }
 impl From<RequestId> for PdDecodeMsg {
-    fn from(req: RequestId) -> Self { Self::Request(req) }
+    fn from(req: RequestId) -> Self {
+        Self::Request(req)
+    }
 }
 
 // ── PD transfer vocabulary ────────────────────────────────────────────────────
@@ -178,6 +184,190 @@ pub struct TransferPlan {
     pub recv_gid: u16,
     pub tokens: u64,
     pub prefill_worker: WorkerId,
+}
+
+// ── layer-wise AFD vocabulary (disagg attn / ffn workers) ──────────────────────
+//
+// AFD splits a decoder layer at the attn/ffn boundary into two worker pools.
+// **attn-initiated**: a request enters the ATTN pool first (KV-locality placement),
+// the attn worker reserves its KV and locally picks a slot, and the slot's entry
+// into layer-0 emits an `IterStart` that the controller aggregates to trigger the
+// ffn prolog (embed + layer-0 QKV). The per-layer handshake is **slot-addressed**:
+// the ffn produces a layer's QKV and the controller signals the attn worker via
+// `ReadyNotification { slot }`; the attn worker computes that slot's attention and
+// emits `AttnLayerOutputsReady { slot }`, which the controller aggregates across all
+// workers (same slot ⇒ same layer, lockstep) into one big ffn batch. Flat enums,
+// matching the PD style above. Cross-worker alignment is by SLOT INDEX + layer
+// (lockstep), never by request — which request sits in which slot is each worker's
+// own local choice. A few fields (per-shard byte split) are provisional.
+
+/// Attn worker messages. A request is first `Admit`ted (KV reservation + a locally-
+/// chosen slot); the worker announces the slot's iteration via the `IterStart`
+/// event when it reaches layer-0, and the micro-batch then enters the pull/compute
+/// pipeline via `ReadyNotification` (layer-0 QKV from the prolog and every later
+/// layer's QKV are the SAME slot-addressed message). An empty slot stays dormant at
+/// layer 0 (no `ReadyNotification`, no churn) until requests are admitted into it.
+/// L6 passes ids only — the worker reads the shared store for per-request facts
+/// (prompt/decode/prefix, token counts) and tracks its own KV.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttnWorkerMsg {
+    /// KV-admit: the attn pool placed `req` on this worker (KV locality); the worker
+    /// reserves its KV and picks a local slot. Per-request (admitted once). Pure —
+    /// it carries NO QKV (the prolog is attn-initiated via `IterStart`). The worker
+    /// reads `prompt_len` / `decode_len` / `prefix_kv` from the store — hence id only.
+    Admit { req: RequestId },
+    /// ffn→attn per-layer handshake and the worker's ONLY compute entry: layer
+    /// `layer`'s QKV for the micro-batch in slot `slot` is ready to pull from
+    /// `send_gid`. `bytes` is the ffn's producer-computed handoff size — the attn
+    /// side reads it, never recomputes (it lacks `ffn_to_attn_bytes_per_token`).
+    /// The notification is **slot-addressed**: the attn worker owns slot assignment,
+    /// stamps the slot tag on its `IterStart` / `AttnLayerOutputsReady`, and L6 echoes
+    /// it here so the worker routes the handshake to its slot in O(1) — no request
+    /// set on the wire (the slot already knows its local members). Covers layer 0
+    /// (from the prolog) through the last layer uniformly.
+    ReadyNotification {
+        slot: u8,
+        layer: u16,
+        send_gid: u16,
+        bytes: u64,
+    },
+    /// The attn pool's per-layer flush barrier completed for `slot` at `layer`: every
+    /// worker in the pool reported that `(slot, layer)`, so this worker may advance
+    /// its slot one layer. It is the release for a slot parked in `AwaitFlush` after
+    /// emitting its `AttnLayerOutputsReady` — the gate that keeps a slot (especially an
+    /// EMPTY one, vacuously `input_ready`) from bursting through every layer in one
+    /// tick ahead of the pool's lockstep. One layer advanced per `SlotFlushed`.
+    SlotFlushed { slot: u8, layer: u16 },
+    /// Drop `req`'s KV (the ffn Terminal completed it; the flow routes the release
+    /// here). Per-request; the worker tracks its own KV count.
+    Release { req: RequestId },
+}
+
+/// Attn worker events. The attn worker is a pure attention+KV engine — it has NO
+/// completion semantics (it never sees `decode_len` or token counts), so it emits
+/// no `RequestComplete`. Iteration completion is decided by the ffn Terminal
+/// (`FfnWorkerEvent::IterComplete { completed }`); the flow then sends this worker
+/// an `AttnWorkerMsg::Release` to drop the KV (no ack event needed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttnWorkerEvent {
+    /// A slot reached layer-0 and is reporting the layer-(-1) start boundary for a
+    /// new iteration. `reqs` may be empty; empty reports are how shards with no local
+    /// tokens participate in the all-worker Bootstrap barrier. The controller
+    /// aggregates same-slot `IterStart`s across workers into one ffn prolog
+    /// (PRE_ATTN), whose layer-0 QKV returns as `ReadyNotification { slot, 0 }`.
+    /// Emitted exactly once per iteration (guarded by the worker's `iter_announced`).
+    /// `worker` attributes it (events from all workers share one sink).
+    IterStart {
+        worker: WorkerId,
+        slot: u8,
+        reqs: Vec<RequestId>,
+    },
+    /// This micro-batch finished `layer`'s attention; the ffn side pulls `bytes`
+    /// (= `attn_to_ffn_bytes_per_token × tokens`, producer-computed here) from
+    /// `send_gid` (this shard's recv/send endpoint). Carries `slot` (the micro-batch's
+    /// slot tag, which L6 echoes back in the next `ReadyNotification` to keep the
+    /// handshake slot-addressed) and `reqs` (so L6 aggregates whose output is ready;
+    /// empty for an empty slot's lockstep completion). Batch-granular.
+    ///
+    /// `tokens` is this shard's query-token count for the batch (prefill = `prompt_len`,
+    /// decode = 1 per request; 0 for an empty lockstep slot) — the same
+    /// `batch_query_tokens` the compute cost is keyed off. L6 uses it to split the
+    /// ffn→attn QKV scatter by each shard's token share (the exact dual of the summed
+    /// attn→ffn `bytes` pull), so the split is by tokens directly, not by the
+    /// `attn_to_ffn`-scaled `bytes`.
+    AttnLayerOutputsReady {
+        worker: WorkerId,
+        slot: u8,
+        reqs: Vec<RequestId>,
+        tokens: u64,
+        layer: u16,
+        send_gid: u16,
+        bytes: u64,
+    },
+}
+
+/// Which ffn section(s) a task computes. The `downstream` attn layer is derived:
+/// `Bootstrap → 0`, `Bridge{upstream} → upstream + 1`, `Terminal → none`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfnTaskKind {
+    /// embed + pre_attn(0); feeds attn layer 0. Input is local (no pull).
+    Bootstrap,
+    /// post_attn(upstream) + fused pre_attn(upstream+1); feeds attn layer upstream+1.
+    Bridge { upstream: u16 },
+    /// post_attn(last) + epilogue; emits the iteration's output token.
+    Terminal,
+}
+
+/// Whether a request has more decode iterations after a Terminal task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IterEndState {
+    MoreWork,
+    Complete,
+}
+
+/// One producer chunk for an attn→ffn input pull. The attn worker owns `send_gid`
+/// because it registered the source comm group; the attn pool only preserves the
+/// per-worker source list while aggregating the layer barrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FfnPullSource {
+    pub send_gid: u16,
+    pub bytes: u64,
+}
+
+/// One unit of ffn work: a micro-batch's section for one layer step. `reqs` is the
+/// **total** workload — the flat request set, NOT pre-grouped. The worker (L5) owns
+/// the DP-shard partition: it round-robins `reqs` across `num_dp_groups`, reads the
+/// store for each request's token count, and builds the L4 `FfnArchInput` itself.
+/// L6 only hands over the workload — it never groups, never counts tokens, never
+/// constructs arch vocabulary (the only L5↔L4 bridge is the worker).
+/// `pull_sources` are the source chunks for the attn→ffn input pull (empty for
+/// Bootstrap, whose input is local). `slot` is the pipeline slot the controller
+/// aggregated this batch from; the worker echoes it back on the resulting event so
+/// L6 routes the QKV / token without re-deriving it. Built by the AFD ffn pool (L6).
+#[derive(Clone, Debug)]
+pub struct FfnTask {
+    pub kind: FfnTaskKind,
+    pub slot: u8,
+    pub reqs: Vec<RequestId>,
+    pub pull_sources: Vec<FfnPullSource>,
+}
+
+/// Ffn worker message set: a single `Task` (the pool composes the batch + token
+/// groups, so there is no degenerate `From<RequestId>` admit).
+#[derive(Clone, Debug)]
+pub enum FfnWorkerMsg {
+    Task(FfnTask),
+}
+
+/// Ffn worker event set. The two variants mirror the two distinct downstream
+/// actions (PD-style: distinct action → distinct variant), so each carries only
+/// its own payload — no dead fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FfnWorkerEvent {
+    /// A Bootstrap/Bridge section finished: its QKV output is ready for the
+    /// downstream attn layer to pull (`out_bytes` from `out_send_gid`). The worker
+    /// stays layer-graph-agnostic — L6 maps `kind` to the downstream attn layer
+    /// (`Bootstrap → 0`, `Bridge{upstream} → upstream + 1`) and uses `slot` (echoed
+    /// from the task) to scatter the QKV back to that slot. `kind` is never
+    /// `Terminal` here (the worker emits `IterComplete` for that).
+    SectionReady {
+        worker: WorkerId,
+        slot: u8,
+        kind: FfnTaskKind,
+        reqs: Vec<RequestId>,
+        out_send_gid: u16,
+        out_bytes: u64,
+    },
+    /// A Terminal section finished: the iteration's output token was emitted for
+    /// every request in `reqs` (the micro-batch from `slot`). `completed` lists those
+    /// that hit `decode_len` this iteration (the rest loop back for another decode —
+    /// the attn slot wraps to layer-0 and re-announces via `IterStart`).
+    IterComplete {
+        worker: WorkerId,
+        slot: u8,
+        reqs: Vec<RequestId>,
+        completed: Vec<RequestId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default)]

@@ -13,10 +13,10 @@
 //!   embed,
 //!   Scale{num_layers}( Sum(
 //!     Max{1.0}( attn_block_tp × num_dp_groups ),     // attn-DP fan-out
-//!     moe_router_local,                              // post_norm + router gemm (single section)
+//!     Max{1.0}( moe_router_local × num_dp_groups ),  // post_norm + router, per-DP-shard (replicated)
 //!     moe_dispatch,                                  // L2 op, 2 leaves (inter, intra)
 //!     Max{1.0}( moe_expert_compute_local × ep_size ),// EP fan-out: per-rank expert compute
-//!     moe_local_reduce,                              // single elementwise atom
+//!     Max{1.0}( moe_local_reduce × num_dp_groups ),  // home reduce, per-DP-shard
 //!     moe_combine,                                   // L2 op, 4 leaves
 //!   )),
 //!   final_norm,
@@ -24,20 +24,24 @@
 //! )
 //! ```
 //!
-//! The two MAX nodes are L4 fan-outs: `attn_block × num_dp_groups` because
-//! distinct DP shards process distinct token slices (their wallclocks are
-//! independent, the sync section's wallclock is the slowest); and
-//! `expert_compute × ep_size` because under skewed routing each EP rank's
-//! `local_ppm` shard yields a distinct grouped-GEMM kernel cache (L1 grouped
-//! gemm is distribution-sensitive). For the v1 uniform routing both shards
-//! are identical and the EP MAX degenerates numerically — the structure stays
-//! ready for the future skew (`MoeExpertComputeLocalWorklet` instances can be
-//! minted with distinct `local_ppm` per EP rank without touching the arch
-//! shape).
+//! The `× num_dp_groups` MAX nodes (attn_block, moe_router, moe_local_reduce)
+//! are the DP-attention fan-out: distinct DP shards process distinct token
+//! slices on the dense path, so their wallclocks are independent and each sync
+//! section's wallclock is the slowest shard — DP load imbalance is modeled
+//! exactly, every child eats its own shard's `batch_tokens` (never a pooled
+//! average). post_norm + router and the post-combine home reduce run
+//! *replicated* on every rank of a shard (the full hidden is replicated across
+//! the shard's `attn_tp_size` ranks after the o_proj all-reduce), so each
+//! shard's cost is its own token slice — NOT `m_total / ep_size`. The
+//! `× ep_size` MAX on `expert_compute` is the EP fan-out: under skewed routing
+//! each EP rank's `local_ppm` shard yields a distinct grouped-GEMM kernel cache
+//! (L1 grouped gemm is distribution-sensitive). For v1 uniform routing the
+//! fan-out children are identical and the MAX degenerates numerically — the
+//! structure stays ready for the future skew (`MoeExpertComputeLocalWorklet`
+//! instances can be minted with distinct `local_ppm` per EP rank without
+//! touching the arch shape).
 //!
 //! v1 deviations (carried over from `llama3_dp_attn_tp_ffn`, plus MoE-specific):
-//!   - attention → FFN resharding is NOT modeled (m_per_rank = m_total / ep_size
-//!     assumed already in place at home rank);
 //!   - embed / final_norm / lm_head are replicated full shapes on the pooled
 //!     token total (no vocab-parallel split);
 //!   - routing distribution is uniform across experts (`uniform_local_ppm`);
@@ -180,6 +184,30 @@ pub struct Qwen3MoeDpAttnEpFfnModel {
     n_slots: usize,
 }
 
+/// The attention-block config for this arch, depending only on `attn_tp_size` +
+/// model dims (input_norm / qkv / attention / o_proj / tp_allreduce partition).
+fn attn_block_config(
+    model: &MoeModelCfg,
+    attn_tp_size: u16,
+    gpu_name: &str,
+) -> AttnBlockTpWorkletConfig {
+    AttnBlockTpWorkletConfig {
+        hidden: model.hidden,
+        num_qo_heads: model.num_qo_heads,
+        num_kv_heads: model.num_kv_heads,
+        head_dim: model.head_dim,
+        dtype: model.dtype,
+        kv_dtype: model.kv_dtype,
+        tp_size: attn_tp_size,
+        allreduce_fabric: TP_FABRIC,
+        gpu_name: gpu_name.to_string(),
+        norm_backends: NORM_BACKENDS.to_vec(),
+        gemm_backends: GEMM_BACKENDS.to_vec(),
+        attn_backends: ATTN_BACKENDS.to_vec(),
+        allreduce_backends: ALLREDUCE_BACKENDS.to_vec(),
+    }
+}
+
 pub fn build_configs(
     model: &MoeModelCfg,
     parallel: &Qwen3MoeParallel,
@@ -246,21 +274,7 @@ pub fn build_configs(
         },
     };
     Qwen3MoeDpAttnEpFfnConfigs {
-        attn_block: AttnBlockTpWorkletConfig {
-            hidden: model.hidden,
-            num_qo_heads: model.num_qo_heads,
-            num_kv_heads: model.num_kv_heads,
-            head_dim: model.head_dim,
-            dtype: model.dtype,
-            kv_dtype: model.kv_dtype,
-            tp_size: parallel.attn_tp_size,
-            allreduce_fabric: TP_FABRIC,
-            gpu_name: gpu.clone(),
-            norm_backends: NORM_BACKENDS.to_vec(),
-            gemm_backends: GEMM_BACKENDS.to_vec(),
-            attn_backends: ATTN_BACKENDS.to_vec(),
-            allreduce_backends: ALLREDUCE_BACKENDS.to_vec(),
-        },
+        attn_block: attn_block_config(model, parallel.attn_tp_size, gpu),
         moe_router: MoeRouterLocalWorkletConfig {
             hidden: model.hidden,
             num_experts: model.num_experts,
@@ -498,7 +512,17 @@ impl Qwen3MoeDpAttnEpFfnModel {
             children: attn_groups,
         };
 
-        let moe_router = self.moe_router.compile(&mut b);
+        // Router fan-out — post_norm + router run replicated per DP shard (the
+        // shard's hidden is replicated across its attn_tp ranks after the o_proj
+        // all-reduce), so each shard routes its OWN token slice. Max-fanned like
+        // the attn block: the section wallclock is the slowest shard.
+        let router_groups: Vec<CostNode> = (0..self.num_dp_groups)
+            .map(|_| self.moe_router.compile(&mut b))
+            .collect();
+        let router_fanout = CostNode::Max {
+            overlap: 1.0,
+            children: router_groups,
+        };
         let moe_dispatch = self.moe_dispatch.compile(&mut b);
 
         // EP fan-out — one expert_compute subtree per EP rank. Identical local_ppm
@@ -511,7 +535,15 @@ impl Qwen3MoeDpAttnEpFfnModel {
             children: expert_groups,
         };
 
-        let moe_local_reduce = self.moe_local_reduce.compile(&mut b);
+        // Home-reduce fan-out — the combine returns each token to its home DP
+        // shard, so the reduce runs per shard on the shard's own tokens.
+        let reduce_groups: Vec<CostNode> = (0..self.num_dp_groups)
+            .map(|_| self.moe_local_reduce.compile(&mut b))
+            .collect();
+        let reduce_fanout = CostNode::Max {
+            overlap: 1.0,
+            children: reduce_groups,
+        };
         let moe_combine = self.moe_combine.compile(&mut b);
 
         let layer = CostNode::Labeled {
@@ -520,10 +552,10 @@ impl Qwen3MoeDpAttnEpFfnModel {
                 n: self.num_layers,
                 child: Box::new(CostNode::Sum(vec![
                     attn_fanout,
-                    moe_router,
+                    router_fanout,
                     moe_dispatch,
                     expert_fanout,
-                    moe_local_reduce,
+                    reduce_fanout,
                     moe_combine,
                 ])),
             }),
@@ -552,15 +584,16 @@ impl Qwen3MoeDpAttnEpFfnModel {
     /// CostTree eval: stream this iteration's per-leaf [`LeafMetrics`] through
     /// `ev` in the EXACT slot order [`cost_tree`](Self::cost_tree) minted them:
     /// embed (pooled), then ONE layer's `num_dp_groups` attn_block evals (one
-    /// per DP shard, each with its own batch_tokens), then moe_router (per-rank
-    /// home tokens), then moe_dispatch (2 leaves on global token count), then
-    /// `ep_size` moe_expert_compute evals (one per EP rank, uniform v1 → same
-    /// input), then moe_local_reduce (per-rank), then moe_combine (4 leaves on
-    /// global token count). The `Scale{num_layers}` fold multiplies one layer
-    /// body. Finally final_norm + lm_head on pooled tokens.
+    /// per DP shard, each with its own batch_tokens), then `num_dp_groups`
+    /// moe_router evals (post_norm + router, replicated per DP shard on the
+    /// shard's own batch_tokens), then moe_dispatch (2 leaves on global token
+    /// count), then `ep_size` moe_expert_compute evals (one per EP rank, uniform
+    /// v1 → same input), then `num_dp_groups` moe_local_reduce evals (home
+    /// reduce, per DP shard), then moe_combine (4 leaves on global token count).
+    /// The `Scale{num_layers}` fold multiplies one layer body. Finally
+    /// final_norm + lm_head on pooled tokens.
     fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
         let m_total: u32 = batch.groups.iter().map(|g| g.batch_tokens).sum();
-        let m_per_rank = m_total / u32::from(self.ep_size);
         let global_expert_selections = m_total * self.top_k;
         let tokens_for_comm = u64::from(m_total);
 
@@ -583,12 +616,15 @@ impl Qwen3MoeDpAttnEpFfnModel {
             );
         }
 
-        self.moe_router.eval(
-            &MoeRouterLocalWorkletInput {
-                batch_tokens: m_per_rank,
-            },
-            ev,
-        );
+        // Router fan-out: replicated per DP shard on the shard's own tokens.
+        for g in &batch.groups {
+            self.moe_router.eval(
+                &MoeRouterLocalWorkletInput {
+                    batch_tokens: g.batch_tokens,
+                },
+                ev,
+            );
+        }
 
         self.moe_dispatch.eval(
             &MoeNetInput {
@@ -607,12 +643,15 @@ impl Qwen3MoeDpAttnEpFfnModel {
             );
         }
 
-        self.moe_local_reduce.eval(
-            &ElementwiseKernelInput {
-                num_tokens: m_per_rank,
-            },
-            ev,
-        );
+        // Home-reduce fan-out: per DP shard on the shard's own tokens.
+        for g in &batch.groups {
+            self.moe_local_reduce.eval(
+                &ElementwiseKernelInput {
+                    num_tokens: g.batch_tokens,
+                },
+                ev,
+            );
+        }
 
         self.moe_combine.eval(
             &MoeNetInput {
