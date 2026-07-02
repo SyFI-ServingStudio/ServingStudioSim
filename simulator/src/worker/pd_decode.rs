@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::log::{KvSampler, KvSubmit};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::admission_helpers::{Batch, LoadBalance};
 use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -136,6 +137,8 @@ pub struct PdDecodeWorker<M: IterwiseUnifiedModel> {
     batches: Vec<Batch>,
     /// Eval scratch buffers + cost-log writer.
     cost: CostBuffers,
+    /// Per-worker KV occupancy sampler (per-group rows); `None` when no log dir.
+    kv: Option<KvSampler>,
     /// Reused per-iteration arch input. Refilled in place each forward pass
     /// (`fill_arch_input`) so the hot decode loop allocates ~nothing — the model
     /// reads it by reference; the cost log snapshots scalars out of it.
@@ -188,6 +191,22 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
         let batches: Vec<Batch> = (0..num_groups)
             .map(|g| Batch::new(g as u16, kv_capacity))
             .collect();
+        // Report each decode shard's static token capacity to the run-meta
+        // registry (before `cluster` is moved into the runtime), and open the
+        // per-worker sampler (borrow `cost_log_dir` before `CostBuffers` moves it).
+        {
+            let mut c = cluster.borrow_mut();
+            for g in 0..num_groups {
+                c.register_kv_capacity(pool_tag, pool.0, id.0, g as u16, kv_capacity);
+            }
+        }
+        let kv = KvSampler::open_opt(
+            cost_log_dir.as_deref(),
+            pool_tag,
+            id,
+            num_groups,
+            config.kv_log_stride,
+        );
         // Round-robin handed-off requests across the groups (config.balance is a
         // hint; a single-group degenerate still works since choose(1) == 0).
         let balance = match config.balance {
@@ -203,6 +222,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             runtime: DecodeRuntime::new(balance, cluster, pull_budget_tokens),
             batches,
             cost,
+            kv,
             arch_buf: UnifiedArchInput::default(),
             recv_gid,
         }
@@ -472,6 +492,18 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                     worker: self.id,
                     req: rid,
                 });
+            }
+
+            // Sample this group's settled KV occupancy. Decode admits enter the
+            // decode set directly (no prefill→decode promise phase), so there is no
+            // per-group promised ledger — `promised_kv` is 0.
+            if self.kv.is_some() {
+                let submit = KvSubmit {
+                    active_kv: self.batches[gid].kv.active_kv,
+                    projected_peak: self.batches[gid].projected_peak_kv(),
+                    promised_kv: 0,
+                };
+                self.kv.as_mut().unwrap().submit(gid as u16, submit, now);
             }
         }
     }

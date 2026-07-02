@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::log::{KvSampler, KvSubmit};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::admission_helpers::Batch;
 use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -75,6 +76,8 @@ pub struct PdPrefillWorker<M: IterwiseUnifiedModel> {
     batches: Vec<Batch>, // length 1 (prefill is single-group in v1)
     /// Eval scratch buffers + cost-log writer.
     cost: CostBuffers,
+    /// Per-worker KV occupancy sampler (single group); `None` when no log dir.
+    kv: Option<KvSampler>,
     /// This worker's send-side comm group id, registered with the shared cluster
     /// at construction (covers the `model.num_attn_shards()` GPUs that hold KV).
     /// Stamped into every emitted `PrefillDone`; the cluster knows the underlying
@@ -111,6 +114,12 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         let group_kv_bytes =
             config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
         let kv_capacity = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
+        // Report the pool's static capacity to the run-meta registry (single group),
+        // and open the sampler (borrow `cost_log_dir` before `CostBuffers` moves it).
+        cluster
+            .borrow_mut()
+            .register_kv_capacity(pool_tag, pool.0, id.0, 0, kv_capacity);
+        let kv = KvSampler::open_opt(cost_log_dir.as_deref(), pool_tag, id, 1, config.kv_log_stride);
         let cost = CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref());
         // Arch invariant: `num_attn_shards() ≤ gpus_per_replica == gpus_per_worker`,
         // so no clamp against the worker's GPU range is needed — the model is
@@ -123,6 +132,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             runtime: PrefillRuntime::new(),
             batches: vec![Batch::new(0, kv_capacity)],
             cost,
+            kv,
             send_gid,
         }
     }
@@ -286,6 +296,21 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         }
         drop(store);
         self.batches[0].prefill_admits.clear();
+
+        // Sample this iteration's KV occupancy. A prefill worker's local KvPool
+        // stays empty (it never finalizes a decode); its real resident KV is the
+        // `held` set (prefilled, awaiting the decode side's pull), and it has no
+        // decode drain, so `projected_peak` equals the held total. `promised_kv` is
+        // the admitted-but-not-yet-prefilled reservation.
+        if self.kv.is_some() {
+            let held = self.runtime.held_kv_tokens;
+            let submit = KvSubmit {
+                active_kv: held,
+                projected_peak: held,
+                promised_kv: self.group_promised_kv(0),
+            };
+            self.kv.as_mut().unwrap().submit(0, submit, now);
+        }
     }
 
     /// Release this request's held KV reservation. Called from `enqueue` on

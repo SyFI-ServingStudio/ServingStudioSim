@@ -21,6 +21,7 @@ mod breakdown;
 mod cdf;
 mod conservation;
 mod io;
+mod kv;
 mod perfetto;
 mod registry;
 mod request;

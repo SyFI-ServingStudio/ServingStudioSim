@@ -152,6 +152,39 @@ pub fn read_worker_pools(log_dir: &Path) -> Option<Vec<(u64, u64)>> {
     (!pairs.is_empty()).then_some(pairs)
 }
 
+/// Per-worker × group KV-pool token capacities from `run_meta.json`'s `workers[]`
+/// (v3+), as `(pool_tag, worker_id, group_id, capacity_tokens)`. This is the static
+/// denominator the `kv-occupancy` subject divides the `kv_snapshot` series by; the
+/// `pool_tag` matches the snapshot rows' key exactly (worker_id alone collides
+/// across pools). Read as bare JSON (no `simulator` dep), like [`read_worker_pools`].
+/// `None` when the sidecar is absent/unparseable or carries no KV worker (a run
+/// with KV logging off, or a deployment with no KV pool) — the subject then reports
+/// raw token occupancy without a capacity reference.
+pub fn read_kv_capacities(log_dir: &Path) -> Option<Vec<(String, u64, u64, u64)>> {
+    let path = resolve_artifact_path(log_dir, "run_meta.json");
+    let text = fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let workers = json.get("workers")?.as_array()?;
+    let mut out = Vec::new();
+    for w in workers {
+        // `pool_tag` is null for non-KV workers (AFD ffn); their `kv_pools` is empty
+        // too, so this loop simply skips them.
+        let Some(tag) = w.get("pool_tag").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let worker_id = w.get("worker_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let Some(pools) = w.get("kv_pools").and_then(|p| p.as_array()) else {
+            continue;
+        };
+        for p in pools {
+            let group_id = p.get("group_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let capacity = p.get("capacity_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            out.push((tag.to_owned(), worker_id, group_id, capacity));
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 pub fn report_path(log_dir: &Path, name: &str) -> PathBuf {
     log_dir.join(REPORTS_DIR).join(name)
 }

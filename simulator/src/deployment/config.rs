@@ -70,6 +70,10 @@ fn default_tick_dt_us() -> u64 {
     100
 }
 
+fn default_kv_log_stride() -> u32 {
+    8
+}
+
 /// Run-global output location + logging controls.
 #[derive(Debug, Clone, Deserialize, ParamStruct)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +97,14 @@ pub struct IoSpec {
     /// worker neither allocates nor appends the array. Turn on only when
     /// per-token granularity (ITL) is actually needed.
     pub log_output_token_times: bool,
+    /// The per-worker `KvSampler` emits one `kv_snapshot` occupancy row every
+    /// `kv_log_stride` per-iteration submits (running-max throttle). Genuinely
+    /// omittable — absent = 8 — so, like `tick_dt_us`, it carries a `serde` default
+    /// (Rust-side) plus a `param` default (launcher schema), rather than the
+    /// required-field treatment the other IO params get.
+    #[serde(default = "default_kv_log_stride")]
+    #[param(default = 8)]
+    pub kv_log_stride: u32,
 }
 
 /// Top-level config, dispatched on the `deployment` tag.

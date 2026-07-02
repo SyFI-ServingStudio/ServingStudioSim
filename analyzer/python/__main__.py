@@ -15,6 +15,7 @@ from typing import Callable
 
 from batch import kernel_throughput_plot, scatter_plot
 from conservation import workload_plot
+from kv import kv_occupancy_plot
 from request import slo_plot
 from throughput import segment_plot
 from utilization import util_plot
@@ -29,6 +30,7 @@ RENDERERS = {
     "batch": scatter_plot.render,
     "kernel-throughput": kernel_throughput_plot.render,
     "workload-conservation": workload_plot.render,
+    "kv-occupancy": kv_occupancy_plot.render,
 }
 
 

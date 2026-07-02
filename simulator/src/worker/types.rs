@@ -390,6 +390,11 @@ pub struct WorkerConfig {
     /// per-token timestamp array (the hot-path cost on saturated runs). Threaded
     /// to `RequestRecord::record_token` / `record_first_token`.
     pub log_output_token_times: bool,
+    /// Mirror of `io.kv_log_stride`: the per-worker `KvSampler` emits one
+    /// `kv_snapshot` row every `kv_log_stride` per-iteration submits (running-max
+    /// throttle). Larger = fewer rows / coarser occupancy series; `1` logs every
+    /// iteration.
+    pub kv_log_stride: u32,
 }
 
 impl Default for WorkerConfig {
@@ -399,6 +404,7 @@ impl Default for WorkerConfig {
             balance: LoadBalance::Single,
             attn_kv_bytes: 80_000_000_000, // 80 GB
             log_output_token_times: false,
+            kv_log_stride: 8,
         }
     }
 }

@@ -67,8 +67,8 @@ impl Deployment for PdDeployment {
         let prefill_cfg = pool_cfg(PD_PREFILL_POOL, pg.replicas, cfg.pools.prefill.placement);
         let decode_cfg = pool_cfg(PD_DECODE_POOL, dg.replicas, cfg.pools.decode.placement);
 
-        let prefill_wc = worker_config(&pg.worker, &cfg.io.log_dir, cfg.io.log_output_token_times);
-        let decode_wc = worker_config(&dg.worker, &cfg.io.log_dir, cfg.io.log_output_token_times);
+        let prefill_wc = worker_config(&pg.worker, &cfg.io.log_dir, cfg.io.log_output_token_times, cfg.io.kv_log_stride);
+        let decode_wc = worker_config(&dg.worker, &cfg.io.log_dir, cfg.io.log_output_token_times, cfg.io.kv_log_stride);
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
 
         // The KV-transfer cost source: the profiled inter-node p2p curve, keyed
@@ -178,6 +178,7 @@ fn worker_config(
     worker: &IterWorkerSel,
     _log_dir: &Path,
     log_output_token_times: bool,
+    kv_log_stride: u32,
 ) -> WorkerConfig {
     let attn_gpu_memory_gb = match worker {
         IterWorkerSel::PdPrefill { attn_gpu_memory_gb }
@@ -188,6 +189,7 @@ fn worker_config(
     WorkerConfig {
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
+        kv_log_stride,
         ..WorkerConfig::default()
     }
 }
