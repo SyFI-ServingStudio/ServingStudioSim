@@ -28,7 +28,8 @@ use crate::io::trace_path;
 use crate::perfetto::{Annotation, TraceWriter};
 use crate::session::{
     col, collect, register_cost_log, register_gpu_cluster, require_columns, value_f32_list,
-    value_f64, value_str_list, value_string, COST_LOG_TABLE, GPU_CLUSTER_TABLE,
+    value_f64, value_groups, value_str_list, value_string, GroupInput, COST_LOG_TABLE,
+    GPU_CLUSTER_TABLE,
 };
 use place::{critical_pairs_per_iter, slice_pairs_per_iter, Placer};
 
@@ -43,6 +44,7 @@ const COLUMNS: &[&str] = &[
     "total_time_ms",
     "slot_time_ms",
     "slot_input",
+    "groups",
 ];
 
 /// One iteration's row, materialized from the parquet.
@@ -61,6 +63,10 @@ struct IterRow {
     slot_ns: Vec<i64>,
     /// Per-slot captured kernel input JSON (empty when the run lacked capture).
     slot_input: Vec<String>,
+    /// This iter/section's top-level arch input (the `input_section`), one per HP
+    /// group — the batch composition fed to the model_arch to cost this row.
+    /// Rendered as a JSON annotation on the per-iter slice.
+    groups: Vec<GroupInput>,
 }
 
 impl IterRow {
@@ -129,6 +135,48 @@ pub async fn run(
     }
     require_columns(ctx, COST_LOG_TABLE, COLUMNS).await?;
 
+    // Global time span via a cheap aggregate — the anchors below need it, but
+    // scanning every row (tens of millions on AFD) just for min/max is wasteful.
+    let span_batches = collect(
+        ctx,
+        "SELECT MIN(wall_start_ms) AS t0, MAX(wall_start_ms + total_time_ms) AS t1 FROM cost_log",
+    )
+    .await?;
+    let (t0, t1) = match span_batches.first() {
+        Some(b) if b.num_rows() > 0 => (value_f64(col(b, "t0")?, 0)?, value_f64(col(b, "t1")?, 0)?),
+        _ => bail!("cost_log has no rows"),
+    };
+    if t0.is_nan() || t1.is_nan() {
+        bail!("cost_log has no rows");
+    }
+    let span = t1 - t0;
+
+    // Evenly-spaced region anchors. A run shorter than one region collapses to a
+    // single window covering the whole thing.
+    let regions = regions.max(1);
+    let region_ms = region_ms.max(0.0);
+    let anchors: Vec<f64> = if span <= region_ms || regions == 1 {
+        vec![t0]
+    } else {
+        (0..regions)
+            .map(|i| t0 + (i as f64) * (span - region_ms) / ((regions - 1) as f64))
+            .collect()
+    };
+    let gap_ms = (0.05 * region_ms).clamp(1.0, 10.0);
+
+    // Only rows inside a sample window are ever placed, so push the window union
+    // into SQL: keep a row whose `col_name` falls in any `[pos, pos+region_ms)`.
+    // This mirrors the in-Rust region filter below (which also keys on the start
+    // column), so the placed output is identical — but we materialize thousands of
+    // rows, not the full cost_log (dropping peak RSS from tens of GB to MB).
+    let window_pred = |col_name: &str| -> String {
+        anchors
+            .iter()
+            .map(|&pos| format!("({col_name} >= {pos} AND {col_name} < {})", pos + region_ms))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    };
+
     // Cast the low-cardinality string columns (`pool_tag`, `section`) to VARCHAR in
     // the projection: parquet RLE_DICTIONARY-encodes them (pool_tag is just
     // "prefill" / "decode" repeated millions of times; section likewise), and
@@ -143,7 +191,8 @@ pub async fn run(
         .join(", ");
     let sql = format!(
         "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, CAST(section AS VARCHAR) AS section, \
-         {other_cols} FROM cost_log ORDER BY pool_tag, worker_id, wall_start_ms"
+         {other_cols} FROM cost_log WHERE {} ORDER BY pool_tag, worker_id, wall_start_ms",
+        window_pred("wall_start_ms")
     );
     let batches = collect(ctx, &sql).await?;
 
@@ -158,6 +207,7 @@ pub async fn run(
         let sec = col(b, "section")?;
         let (ws, tt) = (col(b, "wall_start_ms")?, col(b, "total_time_ms")?);
         let (st, si) = (col(b, "slot_time_ms")?, col(b, "slot_input")?);
+        let gr = col(b, "groups")?;
         for r in 0..b.num_rows() {
             let slot_ns = value_f32_list(st, r)?
                 .iter()
@@ -173,23 +223,13 @@ pub async fn run(
                 total_time_ms: value_f64(tt, r)?,
                 slot_ns,
                 slot_input: value_str_list(si, r)?,
+                groups: value_groups(gr, r)?,
             });
         }
     }
     if rows.is_empty() {
         bail!("cost_log has no rows");
     }
-
-    // Run span across all workers.
-    let t0 = rows
-        .iter()
-        .map(|r| r.wall_start_ms)
-        .fold(f64::INFINITY, f64::min);
-    let t1 = rows
-        .iter()
-        .map(|r| r.wall_start_ms + r.total_time_ms)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let span = t1 - t0;
 
     // Optional transfer overlay: read `gpu_cluster` if the run wrote it. Absent on
     // runs that never transfer (unified / single-worker), where the overlay is
@@ -200,12 +240,15 @@ pub async fn run(
         require_columns(ctx, GPU_CLUSTER_TABLE, NET_COLUMNS).await?;
         // Flatten the RLE_DICTIONARY string columns (pool tags / kind) to VARCHAR,
         // same reason as the cost_log projection above.
-        let sql = "SELECT net_start_ms, net_end_ms, \
-                   CAST(src_pool_tag AS VARCHAR) AS src_pool_tag, src_worker_id, \
-                   CAST(dst_pool_tag AS VARCHAR) AS dst_pool_tag, dst_worker_id, \
-                   send_gid, recv_gid, bytes, CAST(kind AS VARCHAR) AS kind \
-                   FROM gpu_cluster ORDER BY dst_pool_tag, dst_worker_id, net_start_ms";
-        for b in &collect(ctx, sql).await? {
+        let sql = format!(
+            "SELECT net_start_ms, net_end_ms, \
+             CAST(src_pool_tag AS VARCHAR) AS src_pool_tag, src_worker_id, \
+             CAST(dst_pool_tag AS VARCHAR) AS dst_pool_tag, dst_worker_id, \
+             send_gid, recv_gid, bytes, CAST(kind AS VARCHAR) AS kind \
+             FROM gpu_cluster WHERE {} ORDER BY dst_pool_tag, dst_worker_id, net_start_ms",
+            window_pred("net_start_ms")
+        );
+        for b in &collect(ctx, &sql).await? {
             let (ns, ne) = (col(b, "net_start_ms")?, col(b, "net_end_ms")?);
             let (sp, sw) = (col(b, "src_pool_tag")?, col(b, "src_worker_id")?);
             let (dp, dw) = (col(b, "dst_pool_tag")?, col(b, "dst_worker_id")?);
@@ -228,27 +271,17 @@ pub async fn run(
         }
     }
 
-    // Evenly-spaced region anchors. A run shorter than one region collapses to a
-    // single window covering the whole thing.
-    let regions = regions.max(1);
-    let region_ms = region_ms.max(0.0);
-    let anchors: Vec<f64> = if span <= region_ms || regions == 1 {
-        vec![t0]
-    } else {
-        (0..regions)
-            .map(|i| t0 + (i as f64) * (span - region_ms) / ((regions - 1) as f64))
-            .collect()
-    };
-    let gap_ms = (0.05 * region_ms).clamp(1.0, 10.0);
-
     let mut w = TraceWriter::new();
     // Top-level label track marking each region's real wall-clock position.
     let region_proc = w.process_track(-1, "Regions");
     let region_track = w.thread_track(region_proc, -1, 0, "regions");
 
     // Pre-create one process+thread track per worker (avoids a borrow conflict
-    // with `w` mid-loop, and fixes a stable track order in the output).
-    let mut worker_keys: Vec<(String, u16)> = rows.iter().map(IterRow::manifest_key).collect();
+    // with `w` mid-loop, and fixes a stable track order in the output). The roster
+    // comes from the cost manifests (every worker writes one), NOT from `rows` — a
+    // worker with no row inside any sample window still needs its track so the
+    // per-row `worker_tracks[&key]` lookup below never misses.
+    let mut worker_keys: Vec<(String, u16)> = manifests.keys().cloned().collect();
     worker_keys.sort_unstable();
     worker_keys.dedup();
     // Which workers RECEIVE a transfer — only these get a comm lane, so a
@@ -350,17 +383,21 @@ pub async fn run(
             } else {
                 format!("iter {} · {}", row.iter_id, row.section)
             };
-            w.begin(
-                track,
-                base_ns,
-                &slice_label,
-                &[
-                    Annotation::uint("iter_id", row.iter_id),
-                    Annotation::uint("batch_id", row.batch_id),
-                    Annotation::str("section", &row.section),
-                    Annotation::dbl("total_ms", row.total_time_ms),
-                ],
-            );
+            let mut iter_anns = vec![
+                Annotation::uint("iter_id", row.iter_id),
+                Annotation::uint("batch_id", row.batch_id),
+                Annotation::str("section", &row.section),
+                Annotation::dbl("total_ms", row.total_time_ms),
+            ];
+            // Top-level arch input (the `input_section`) as JSON, mirroring how
+            // leaf slices carry their per-kernel `input`. Skipped when the run
+            // logged no groups (model without a compiled CostTree).
+            if !row.groups.is_empty() {
+                if let Ok(json) = serde_json::to_string(&row.groups) {
+                    iter_anns.push(Annotation::str("groups", &json));
+                }
+            }
+            w.begin(track, base_ns, &slice_label, &iter_anns);
             let placer = Placer::new(manifest, &row.slot_ns, &row.slot_input, expanded);
             let dur = placer.place_root(&mut w, track, base_ns);
             let end_ns = base_ns + dur;

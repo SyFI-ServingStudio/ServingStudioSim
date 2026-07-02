@@ -1,15 +1,19 @@
-"""Render per-batch composition from the Rust `batch_scatter.json` payload.
+"""Render per-invocation batch composition from the Rust `batch_scatter.json` payload.
 
-One figure, three stacked subplots sharing the sim-time x-axis — batch_tokens,
-prefill_tokens, decode_request_count — each its own scatter on its own y-scale
-(the counts live on different ranges, so overlaying them would flatten the small
-one). Each point is a cost_log iteration; the points are a time-even downsample of
-all iterations, and each panel's dashed line + corner box is the run-average (over
-all iterations, from the report's stats).
+The payload is grouped by pool (attn / ffn on AFD; one pool on iter-wise runs), so
+this emits ONE figure per pool — `batch_scatter_<pool>.png`. Each figure has three
+stacked subplots sharing the sim-time x-axis — batch_tokens, prefill_tokens,
+decode_request_count — each its own scatter on its own y-scale (the counts live on
+different ranges, so overlaying them would flatten the small one). Each point is one
+cost_log invocation (a time-even downsample of the pool's invocations); each panel's
+dashed line + corner box is the pool average (over all invocations, from the stats).
 
-Reads only the payload — no parquet. `render` returns a single render job. Reuses
-the shared style/formatting (`common.style`, `common.figure`); the per-panel layout
-is the only thing finalize (single-axes) can't do, so it's wired inline here.
+Pools are drawn separately because their batch scales differ (attn is a per-DP-shard
+local slice, ffn is the aggregated batch), so a shared axis would be meaningless.
+
+Reads only the payload — no parquet. Reuses the shared style/formatting
+(`common.style`, `common.figure`); the per-panel layout is the only thing finalize
+(single-axes) can't do, so it's wired inline here.
 """
 
 from __future__ import annotations
@@ -29,22 +33,31 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
     from common.layout import load_payload, plot_output_path
 
     payload = load_payload(log_dir, "batch_scatter.json")
-    if not payload.get("series") or not payload.get("time_ms"):
-        reason = payload.get("meta", {}).get("reason", "no points in batch_scatter.json")
+    pools = payload.get("pools")
+    if not pools:
+        reason = payload.get("meta", {}).get("reason", "no pools in batch_scatter.json")
         print(f"[scatter_plot] nothing to render: {reason}")
         return []
     run_label = Path(payload.get("meta", {}).get("log_dir", str(log_dir))).name
-    return [
-        partial(_render, payload, plot_output_path(log_dir, "batch_scatter.png"),
-                title="Per-batch composition", run_label=run_label),
-    ]
+    jobs: list[Callable[[], Path]] = []
+    for pool in pools:
+        if not pool.get("series") or not pool.get("time_ms"):
+            continue
+        tag = pool.get("pool", "pool")
+        jobs.append(
+            partial(_render, pool, plot_output_path(log_dir, f"batch_scatter_{tag}.png"),
+                    title=f"Per-invocation batch composition — {tag} pool", run_label=run_label),
+        )
+    if not jobs:
+        print("[scatter_plot] nothing to render: no plottable pool in batch_scatter.json")
+    return jobs
 
 
-def _render(payload: dict, out_path: Path, *, title: str, run_label: str = "") -> Path:
-    """Draw the stacked per-field scatter (one subplot per series) to `out_path`."""
-    series = [s for s in payload["series"] if s.get("values")]
-    t_s = [t / 1000.0 for t in payload["time_ms"]]
-    avg = payload.get("meta", {}).get("avg", {})
+def _render(pool: dict, out_path: Path, *, title: str, run_label: str = "") -> Path:
+    """Draw one pool's stacked per-field scatter (one subplot per series) to `out_path`."""
+    series = [s for s in pool["series"] if s.get("values")]
+    t_s = [t / 1000.0 for t in pool["time_ms"]]
+    avg = pool.get("avg", {})
     n = max(len(series), 1)
     fig, axes = plt.subplots(n, 1, figsize=(9.0, 2.4 * n + 0.8), sharex=True)
     if n == 1:

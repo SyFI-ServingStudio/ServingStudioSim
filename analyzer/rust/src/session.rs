@@ -142,6 +142,45 @@ pub fn value_f64(array: &ArrayRef, row: usize) -> Result<f64> {
     bail!("unsupported numeric array type")
 }
 
+/// Extract an entire numeric column as `Vec<f64>` in one type dispatch (null →
+/// NaN), instead of [`value_f64`]'s per-element 11-branch downcast. The hot
+/// cost_log paths read tens of millions of rows, so paying the downcast once per
+/// column rather than once per element is the difference between seconds and
+/// minutes. Same numeric-type coverage as `value_f64`.
+#[allow(clippy::unnecessary_cast)] // uniform `as f64` across the int/float arms
+pub fn column_f64(array: &ArrayRef) -> Result<Vec<f64>> {
+    macro_rules! collect_as {
+        ($ty:ty) => {{
+            let a = array.as_any().downcast_ref::<$ty>().unwrap();
+            return Ok((0..a.len())
+                .map(|i| if a.is_null(i) { f64::NAN } else { a.value(i) as f64 })
+                .collect());
+        }};
+    }
+    if array.as_any().is::<Float64Array>() {
+        collect_as!(Float64Array);
+    } else if array.as_any().is::<Float32Array>() {
+        collect_as!(Float32Array);
+    } else if array.as_any().is::<Int64Array>() {
+        collect_as!(Int64Array);
+    } else if array.as_any().is::<Int32Array>() {
+        collect_as!(Int32Array);
+    } else if array.as_any().is::<Int16Array>() {
+        collect_as!(Int16Array);
+    } else if array.as_any().is::<Int8Array>() {
+        collect_as!(Int8Array);
+    } else if array.as_any().is::<UInt64Array>() {
+        collect_as!(UInt64Array);
+    } else if array.as_any().is::<UInt32Array>() {
+        collect_as!(UInt32Array);
+    } else if array.as_any().is::<UInt16Array>() {
+        collect_as!(UInt16Array);
+    } else if array.as_any().is::<UInt8Array>() {
+        collect_as!(UInt8Array);
+    }
+    bail!("unsupported numeric array type for column_f64")
+}
+
 pub fn value_string(array: &ArrayRef, row: usize) -> Result<String> {
     if array.is_null(row) {
         return Ok(String::new());

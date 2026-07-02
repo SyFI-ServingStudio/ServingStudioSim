@@ -53,7 +53,7 @@ use serde_json::{json, Value};
 
 use crate::io::{read_deployment, resolve_artifact_path, SCHEMA_VERSION};
 use crate::session::{
-    col, collect, register_cost_log, register_if_exists, require_columns, value_f64, value_string,
+    col, collect, column_f64, register_cost_log, register_if_exists, require_columns, value_f64,
     COST_LOG_TABLE,
 };
 
@@ -350,87 +350,106 @@ fn pct_of(delta: f64, expected: f64) -> f64 {
     }
 }
 
-/// Sum the actuals across every cost_log row's `groups` list. AFD logs attention
-/// per layer and FFN per section, so its conservation formulas intentionally use
-/// different row subsets.
+/// Sum the actuals from `cost_log`'s `groups`. AFD logs attention per layer and FFN
+/// per section, so its formulas use different row subsets — split at the SQL layer
+/// (a `WHERE` per side) instead of a per-row pool_tag/section string compare across
+/// tens of millions of rows. Each side then sums over the flattened `groups` child
+/// in one typed pass per column (see [`sum_field`] / [`column_f64`]).
 async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actual> {
-    // Parquet low-cardinality strings come back as DictionaryArray; keep string
-    // extraction centralized by normalizing them to VARCHAR in SQL, matching
-    // `trace` and `breakdown`.
-    let batches = collect(
-        ctx,
-        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, \
-         CAST(section AS VARCHAR) AS section, layer, groups FROM cost_log",
-    )
-    .await?;
     let mut a = Actual::default();
-    let mut layers = BTreeSet::new();
-    for batch in &batches {
-        let pool_tags = col(batch, "pool_tag")?;
-        let sections = col(batch, "section")?;
-        let layer_arr = col(batch, "layer")?;
-        let groups = col(batch, "groups")?
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| anyhow!("`groups` is not a List array"))?;
-        for row in 0..batch.num_rows() {
-            a.iters += 1;
-            let pool_tag = value_string(pool_tags, row)?;
-            let section = value_string(sections, row)?;
-            let layer = value_f64(layer_arr, row)?;
-            if groups.is_null(row) {
-                continue;
+    // `num_iterations` in the report stays the raw cost_log row count (every worker
+    // × layer × section row) for continuity — a cheap COUNT(*), not a full scan.
+    a.iters = count_rows(ctx, "SELECT COUNT(*) AS c FROM cost_log").await?;
+
+    match mode {
+        WorkloadMode::Iterwise => {
+            // One row = one iteration; sum every field over the flattened groups.
+            let batches = collect(ctx, "SELECT groups FROM cost_log").await?;
+            for batch in &batches {
+                let gs = groups_struct(groups_list(batch)?)?;
+                a.prefill_tokens += sum_field(gs, "prefill_tokens")?;
+                a.decode_passes += sum_field(gs, "decode_request_count")?;
+                a.batch_tokens += sum_field(gs, "batch_tokens")?;
+                a.decode_kv += sum_field(gs, "decode_kv_total")?;
+                a.causal += causal_work(gs)?;
             }
-            let g = groups.value(row);
-            let gs = g
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| anyhow!("`groups` elements are not Structs"))?;
-            match mode {
-                WorkloadMode::Iterwise => {
-                    a.prefill_tokens += sum_scalar(gs, "prefill_tokens")?;
-                    a.decode_passes += sum_scalar(gs, "decode_request_count")?;
-                    a.batch_tokens += sum_scalar(gs, "batch_tokens")?;
-                    a.attn_batch_tokens += sum_scalar(gs, "batch_tokens")?;
-                    a.decode_kv += sum_scalar(gs, "decode_kv_total")?;
-                    a.causal += causal_work(gs)?;
-                }
-                WorkloadMode::Afd if pool_tag == "attn" && section == "attn" => {
-                    if layer.is_finite() && layer >= 0.0 {
-                        layers.insert(layer as i16);
+            a.attn_batch_tokens = a.batch_tokens;
+        }
+        WorkloadMode::Afd => {
+            // Attention side: sum over `(pool_tag=attn, section=attn)` rows and count
+            // the distinct layers (the expected side multiplies request work by it).
+            let attn = collect(
+                ctx,
+                "SELECT layer, groups FROM cost_log \
+                 WHERE pool_tag = 'attn' AND section = 'attn'",
+            )
+            .await?;
+            let mut layers = BTreeSet::new();
+            for batch in &attn {
+                for l in column_f64(col(batch, "layer")?)? {
+                    if l.is_finite() && l >= 0.0 {
+                        layers.insert(l as i16);
                     }
-                    a.prefill_tokens += sum_scalar(gs, "prefill_tokens")?;
-                    a.decode_passes += sum_scalar(gs, "decode_request_count")?;
-                    a.attn_batch_tokens += sum_scalar(gs, "batch_tokens")?;
-                    a.decode_kv += sum_scalar(gs, "decode_kv_total")?;
-                    a.causal += causal_work(gs)?;
                 }
-                WorkloadMode::Afd if pool_tag == "ffn" => {
-                    a.batch_tokens += sum_scalar(gs, "batch_tokens")?;
-                }
-                WorkloadMode::Afd => {}
+                let gs = groups_struct(groups_list(batch)?)?;
+                a.prefill_tokens += sum_field(gs, "prefill_tokens")?;
+                a.decode_passes += sum_field(gs, "decode_request_count")?;
+                a.attn_batch_tokens += sum_field(gs, "batch_tokens")?;
+                a.decode_kv += sum_field(gs, "decode_kv_total")?;
+                a.causal += causal_work(gs)?;
+            }
+            a.num_layers = layers.len();
+            if a.num_layers == 0 {
+                return Err(anyhow!(
+                    "AFD workload conservation found no attention layer rows in cost_log"
+                ));
+            }
+            // FFN section-token pass: sum batch_tokens over the ffn pool's rows.
+            let ffn = collect(ctx, "SELECT groups FROM cost_log WHERE pool_tag = 'ffn'").await?;
+            for batch in &ffn {
+                let gs = groups_struct(groups_list(batch)?)?;
+                a.batch_tokens += sum_field(gs, "batch_tokens")?;
             }
         }
-    }
-    a.num_layers = layers.len();
-    if mode == WorkloadMode::Afd && a.num_layers == 0 {
-        return Err(anyhow!(
-            "AFD workload conservation found no attention layer rows in cost_log"
-        ));
     }
     Ok(a)
 }
 
-/// Sum one scalar struct field across all groups of an iteration (one group today).
-fn sum_scalar(gs: &StructArray, field: &str) -> Result<f64> {
+/// The `groups` column of a batch as a `ListArray`.
+fn groups_list(batch: &arrow_array::RecordBatch) -> Result<&ListArray> {
+    col(batch, "groups")?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("`groups` is not a List array"))
+}
+
+/// The flattened struct child of a `groups` list — one entry per (row, group).
+/// Summing/looping over it equals the per-row per-group nesting but pays each column
+/// downcast once, not once per element. Null list rows contribute no child entries,
+/// so the flattened sum matches the old per-row loop that skipped null `groups`.
+fn groups_struct(list: &ListArray) -> Result<&StructArray> {
+    list.values()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| anyhow!("`groups` elements are not Structs"))
+}
+
+/// Sum a scalar struct field over a whole batch's flattened `groups` child in one
+/// typed pass. Fields are `not null`, so the plain sum matches the old accumulate.
+fn sum_field(gs: &StructArray, field: &str) -> Result<f64> {
     let arr = gs
         .column_by_name(field)
         .ok_or_else(|| anyhow!("`groups` struct missing field `{field}`"))?;
-    let mut total = 0.0;
-    for i in 0..arr.len() {
-        total += value_f64(arr, i)?;
+    Ok(column_f64(arr)?.iter().sum())
+}
+
+/// Read a single-row `COUNT(*)` result as `usize`.
+async fn count_rows(ctx: &SessionContext, sql: &str) -> Result<usize> {
+    let batches = collect(ctx, sql).await?;
+    match batches.first() {
+        Some(b) if b.num_rows() > 0 => Ok(value_f64(col(b, "c")?, 0)? as usize),
+        _ => Ok(0),
     }
-    Ok(total)
 }
 
 /// Causal prefill attention work for one iteration's groups: over each group's

@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -195,38 +196,44 @@ async def run_analysis(
     analyzer = analyzer_binary_path(build_type)
     stdout_log = log_dir / "stdout.log"
 
-    def _append(section: str, text: str) -> None:
-        if not text:
-            return
+    def _append(section: str, text: str, elapsed_ms: float) -> None:
+        # Stamp each stage's wall time in the section header. `analyze run` also
+        # writes a per-subject `analyzer_timing.json`; render/trace had no timing
+        # at all before this, and trace is the pipeline's slowest stage.
+        header = f"{section} [{elapsed_ms:.0f} ms]"
         with stdout_log.open("a") as fh:
-            fh.write(f"\n=== {section} ===\n{text}")
-            if not text.endswith("\n"):
+            fh.write(f"\n=== {header} ===\n{text}")
+            if text and not text.endswith("\n"):
                 fh.write("\n")
+
+    async def _timed_step(section: str, argv: list[str]) -> int:
+        t0 = time.perf_counter()
+        rc, out = await _run_capture(argv)
+        _append(section, out, (time.perf_counter() - t0) * 1e3)
+        return rc
 
     if not analyzer.exists():
         print(f"[analyze] {analyzer} not built; skipping analysis for {log_dir}")
         return
     subjects = subjects or []
-    rc, out = await _run_capture([str(analyzer), "run", str(log_dir), *subjects])
-    _append("analyze compute", out)
-    if rc != 0:
-        print(f"[analyze] compute failed for {log_dir}:\n{out}")
+    if await _timed_step("analyze compute", [str(analyzer), "run", str(log_dir), *subjects]) != 0:
+        print(f"[analyze] compute failed for {log_dir}")
         return
-    rc, out = await _run_capture(
-        [sys.executable, str(REPO_ROOT / "analyzer" / "python"), "render", str(log_dir), *subjects]
-    )
-    _append("analyze render", out)
-    if rc != 0:
-        print(f"[analyze] render failed for {log_dir}:\n{out}")
+    if (
+        await _timed_step(
+            "analyze render",
+            [sys.executable, str(REPO_ROOT / "analyzer" / "python"), "render", str(log_dir), *subjects],
+        )
+        != 0
+    ):
+        print(f"[analyze] render failed for {log_dir}")
 
     # Always emit the per-kernel Perfetto timeline (traces/<prefix>.pftrace.gz).
     # A standalone verb, not a subject (different output contract: a binary trace
     # for ui.perfetto.dev, not report/payload JSON), so it runs here with CLI
     # defaults rather than through the subject catalog. Best-effort like the rest.
-    rc, out = await _run_capture([str(analyzer), "trace", str(log_dir)])
-    _append("analyze trace", out)
-    if rc != 0:
-        print(f"[analyze] trace failed for {log_dir}:\n{out}")
+    if await _timed_step("analyze trace", [str(analyzer), "trace", str(log_dir)]) != 0:
+        print(f"[analyze] trace failed for {log_dir}")
 
 
 async def run_iter_breakdown(log_dir: Path, build_type: str = "debug") -> None:

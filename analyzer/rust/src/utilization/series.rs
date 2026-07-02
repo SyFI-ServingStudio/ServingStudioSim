@@ -16,7 +16,7 @@ use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
 use crate::io::{read_run_meta, read_worker_pools, SCHEMA_VERSION};
-use crate::session::{col, collect, register_cost_log, require_columns, value_f64, COST_LOG_TABLE};
+use crate::session::{col, collect, column_f64, register_cost_log, require_columns, COST_LOG_TABLE};
 
 /// cost_log columns the utilization subject depends on (drift guard).
 const COST_COLS: &[&str] = &["worker_id", "wall_start_ms", "total_time_ms"];
@@ -189,15 +189,13 @@ async fn collect_iters(ctx: &SessionContext) -> Result<Vec<Iter>> {
     .await?;
     let mut out = Vec::new();
     for batch in &batches {
-        let w = col(batch, "worker_id")?;
-        let s = col(batch, "wall_start_ms")?;
-        let d = col(batch, "total_time_ms")?;
+        // One typed pass per column beats a per-row 11-branch dispatch across the
+        // whole cost_log (tens of millions of rows on an AFD run).
+        let w = column_f64(col(batch, "worker_id")?)?;
+        let s = column_f64(col(batch, "wall_start_ms")?)?;
+        let d = column_f64(col(batch, "total_time_ms")?)?;
         for row in 0..batch.num_rows() {
-            out.push((
-                value_f64(w, row)? as u64,
-                value_f64(s, row)?,
-                value_f64(d, row)?,
-            ));
+            out.push((w[row] as u64, s[row], d[row]));
         }
     }
     Ok(out)
