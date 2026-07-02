@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::log::{KvSampler, KvSubmit};
 use crate::worker::admission_helpers::{Batch, LoadBalance};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -69,6 +70,9 @@ pub struct HpUnifiedWorker<M: IterwiseUnifiedModel> {
     batches: Vec<Batch>,
     /// Eval scratch buffers + cost-log writer.
     cost: CostBuffers,
+    /// Per-worker KV occupancy sampler (one stream, per-group rows); `None` when no
+    /// log dir. The worker only `submit`s — throttle + running-max live in `KvSampler`.
+    kv: Option<KvSampler>,
 }
 
 impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
@@ -100,6 +104,22 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         let batches: Vec<Batch> = (0..num_groups)
             .map(|g| Batch::new(g as u16, kv_capacity))
             .collect();
+        // Report each group's static token capacity to the run-meta registry, and
+        // open the per-worker sampler across all groups (borrow `cost_log_dir`
+        // before `CostBuffers` moves it).
+        {
+            let mut cl = cluster.borrow_mut();
+            for g in 0..num_groups {
+                cl.register_kv_capacity(pool_tag, pool.0, id.0, g as u16, kv_capacity);
+            }
+        }
+        let kv = KvSampler::open_opt(
+            cost_log_dir.as_deref(),
+            pool_tag,
+            id,
+            num_groups,
+            config.kv_log_stride,
+        );
         // Round-robin fresh prefills across the groups (config.balance is a hint;
         // a single-group degenerate still works since choose(1) == 0).
         let balance = match config.balance {
@@ -115,6 +135,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             runtime: HpRuntime::new(balance),
             batches,
             cost,
+            kv,
         }
     }
 
@@ -292,6 +313,17 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                     worker: self.id,
                     req: rid,
                 });
+            }
+
+            // Sample this group's settled KV occupancy for this iteration (values
+            // read before `self.kv` is borrowed mut, so the `&self` reads end first).
+            if self.kv.is_some() {
+                let submit = KvSubmit {
+                    active_kv: self.batches[gid].kv.active_kv,
+                    projected_peak: self.batches[gid].projected_peak_kv(),
+                    promised_kv: self.group_promised_kv(gid as u16),
+                };
+                self.kv.as_mut().unwrap().submit(gid as u16, submit, now);
             }
         }
     }

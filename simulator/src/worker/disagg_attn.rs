@@ -73,6 +73,7 @@ use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, AttnArchInput, AttnLayerwiseModel};
 use crate::common::{IdMap, PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::log::{KvSampler, KvSubmit};
 use crate::worker::admission_helpers::Batch;
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -274,6 +275,10 @@ pub struct DisaggAttnWorker<M: AttnLayerwiseModel> {
     /// the pipeline slot its `batch_id`). Honest per-layer rows; ZSTD compresses the
     /// homogeneous layers.
     cost: CostBuffers,
+    /// Per-worker KV-occupancy sampler (running-max + stride throttle). `None` when
+    /// the run has no log dir. Fed one `submit` per iteration at the KV settle point
+    /// (last-layer `advance_subset`); group 0 (one shard-level pool).
+    kv: Option<KvSampler>,
     /// Per-slot attention-input cache (one `AttnArchInput` per pipeline slot). The
     /// built input depends only on the slot's `reqs`, each request's `is_prefill()`,
     /// and each resident decode's `current_kv` — all of which change **only at the
@@ -315,6 +320,13 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             .attn_kv_bytes
             .saturating_mul(model.num_attn_shards().max(1) as u64);
         let kv_capacity = (shard_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
+        // Register the static capacity for `run_meta` and open the occupancy sampler
+        // BEFORE `cost_log_dir` is moved into `CostBuffers::new` below. One shard-level
+        // pool → group 0, `num_groups = 1`.
+        cluster
+            .borrow_mut()
+            .register_kv_capacity(pool_tag, pool.0, id.0, 0, kv_capacity);
+        let kv = KvSampler::open_opt(cost_log_dir.as_deref(), pool_tag, id, 1, config.kv_log_stride);
         let cost = CostBuffers::new(cost_log_dir, pool_tag, id, &model.cost_log_manifest());
         Self {
             id,
@@ -329,6 +341,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             promised: IdMap::default(),
             request_to_slot: IdMap::default(),
             cost,
+            kv,
             slot_inputs: std::array::from_fn(|_| AttnArchInput { groups: Vec::new() }),
         }
     }
@@ -690,7 +703,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
                     progressed = true;
                 }
                 SlotState::Compute if now >= self.slots[idx].compute_end => {
-                    self.complete_layer(idx, events);
+                    self.complete_layer(idx, now, events);
                     progressed = true;
                 }
                 _ => {}
@@ -707,7 +720,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
     /// empty: an active batch slot the controller notified runs here as a 0-token no-op
     /// (`tokens = 0`, `out_bytes = 0`, the boundary loops skip the empty set) so it
     /// stays a barrier member.
-    fn complete_layer(&mut self, idx: usize, events: &mut Vec<AttnWorkerEvent>) {
+    fn complete_layer(&mut self, idx: usize, now: Time, events: &mut Vec<AttnWorkerEvent>) {
         let layer = self.slots[idx].current_layer;
         // Token count reads the slot's `reqs` in place (no clone). The event needs an
         // owned request set, so clone exactly once and MOVE it in — this runs per
@@ -741,6 +754,16 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
                 }
             }
             self.batch.advance_subset(&decoding);
+            // KV settle point for this iteration: sample resident (current), projected
+            // peak (future estimate), and reserved-not-resident (promised) occupancy.
+            if self.kv.is_some() {
+                let submit = KvSubmit {
+                    active_kv: self.batch.kv.active_kv,
+                    projected_peak: self.batch.projected_peak_kv(),
+                    promised_kv: self.promised_kv(),
+                };
+                self.kv.as_mut().unwrap().submit(0, submit, now);
+            }
         }
         // Park, do NOT advance: the pool's `SlotFlushed` (after the all-workers barrier)
         // calls `advance_slot_layer` via `on_msg_slot_flushed`.

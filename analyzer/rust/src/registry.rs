@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::batch;
 use crate::conservation;
+use crate::kv;
 use crate::request;
 use crate::throughput;
 use crate::utilization;
@@ -36,6 +37,9 @@ pub enum Category {
     /// Run-wide work-accounting invariants — `cost_log` actuals vs `request_slo`
     /// per-request expected. Tier-1, deployment-agnostic.
     Conservation,
+    /// KV-cache pool occupancy over time, from the `kv_snapshot` stream. Tier-1,
+    /// deployment-agnostic (a run without KV logging degrades to `unavailable`).
+    Kv,
 }
 
 impl Category {
@@ -46,6 +50,7 @@ impl Category {
             Category::Utilization => "utilization",
             Category::Batch => "batch",
             Category::Conservation => "conservation",
+            Category::Kv => "kv",
         }
     }
 }
@@ -151,6 +156,15 @@ pub const SUBJECTS: &[Subject] = &[
         payload_name: "workload_conservation_checks.json",
         applies: Applies::All,
     },
+    Subject {
+        name: "kv-occupancy",
+        category: Category::Kv,
+        description: "Per-pool KV-cache occupancy over time (active / projected-peak / promised tokens, \
+                      and as a fraction of run_meta capacity) from the kv_snapshot stream.",
+        report_name: "kv_occupancy_report.json",
+        payload_name: "kv_occupancy_series.json",
+        applies: Applies::All,
+    },
 ];
 
 /// Human-readable catalog for `analyze list` — one aligned line per subject:
@@ -186,6 +200,7 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
         "batch" => batch::composition::run_batch(ctx, dir).await,
         "kernel-throughput" => batch::kernel_throughput::run_kernel_throughput(ctx, dir).await,
         "workload-conservation" => conservation::workload::run_workload(ctx, dir).await,
+        "kv-occupancy" => kv::occupancy::run_kv_occupancy(ctx, dir).await,
         other => bail!("unknown analyzer subject {other:?}"),
     }
 }

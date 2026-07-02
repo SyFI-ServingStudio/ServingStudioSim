@@ -55,6 +55,21 @@ pub async fn register_cost_log(ctx: &SessionContext, log_dir: &std::path::Path) 
     register_if_exists(ctx, COST_LOG_TABLE, path).await
 }
 
+/// Canonical table name for the per-worker `kv_snapshot/` directory union.
+pub const KV_SNAPSHOT_TABLE: &str = "kv_snapshot";
+
+/// Register the per-worker `kv_snapshot/` DIRECTORY
+/// (`raw/kv_snapshot/worker_*.parquet`) as the [`KV_SNAPSHOT_TABLE`] table — one
+/// file per KV-bearing worker (unified: one; PD: prefill + decode; AFD: every attn
+/// shard), unioned by DataFusion exactly like [`register_cost_log`]. Returns
+/// `false` when the dir is absent (a run with KV logging off, or a deployment with
+/// no KV pool), so the `kv-occupancy` subject emits `unavailable` rather than
+/// `bail!`.
+pub async fn register_kv_snapshot(ctx: &SessionContext, log_dir: &std::path::Path) -> Result<bool> {
+    let path = crate::io::resolve_artifact_path(log_dir, "kv_snapshot");
+    register_if_exists(ctx, KV_SNAPSHOT_TABLE, path).await
+}
+
 /// Canonical table name for the single-file `gpu_cluster` stream.
 pub const GPU_CLUSTER_TABLE: &str = "gpu_cluster";
 

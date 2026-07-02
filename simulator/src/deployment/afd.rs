@@ -74,8 +74,8 @@ impl Deployment for AfdDeployment {
             fg.arch.model().model_config,
         );
 
-        let attn_wc = worker_config(attn_gpu_memory_gb(&ag.worker), cfg.io.log_output_token_times);
-        let ffn_wc = worker_config(80.0, cfg.io.log_output_token_times); // ffn has no KV
+        let attn_wc = worker_config(attn_gpu_memory_gb(&ag.worker), cfg.io.log_output_token_times, cfg.io.kv_log_stride);
+        let ffn_wc = worker_config(80.0, cfg.io.log_output_token_times, cfg.io.kv_log_stride); // ffn has no KV
 
         // attn↔ffn transfer cost: profiled p2p curve, keyed on the ffn GPU (the
         // aggregation receiver). Built once here (the bridge lives at L7).
@@ -183,10 +183,15 @@ fn attn_gpu_memory_gb(worker: &AttnWorkerSel) -> f64 {
     }
 }
 
-fn worker_config(attn_gpu_memory_gb: f64, log_output_token_times: bool) -> WorkerConfig {
+fn worker_config(
+    attn_gpu_memory_gb: f64,
+    log_output_token_times: bool,
+    kv_log_stride: u32,
+) -> WorkerConfig {
     WorkerConfig {
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
+        kv_log_stride,
         ..WorkerConfig::default()
     }
 }

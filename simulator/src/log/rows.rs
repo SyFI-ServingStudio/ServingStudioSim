@@ -15,8 +15,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field};
 
 use crate::log::schemas::{
-    cost_log_schema, gpu_cluster_schema, group_input_fields, request_slo_schema,
-    request_state_schema,
+    cost_log_schema, gpu_cluster_schema, group_input_fields, kv_snapshot_schema,
+    request_slo_schema, request_state_schema,
 };
 use crate::timing::SlotInput;
 
@@ -413,6 +413,53 @@ pub(crate) fn state_to_record_batch(entries: &[RequestStateEntry]) -> Result<Rec
             Arc::new(UInt64Array::from(decode_cum)),
             Arc::new(UInt64Array::from(n_admitted)),
             Arc::new(UInt64Array::from(n_completed)),
+        ],
+    )?)
+}
+
+/// One `kv_snapshot` row — a KV-pool occupancy sample for one group of one worker
+/// at `time_ms`. All fields are token counts; `pool_tag` is carried once per chunk
+/// (the whole chunk is one worker's stream), not per row. The pool's static
+/// `capacity` lives in `run_meta.json` (`kv_pools`) and the occupancy percentages
+/// are the analyzer's job, so neither is a column here. Emitted by
+/// [`KvSampler`](crate::log::kv_sampler::KvSampler), which owns the throttle +
+/// running-max policy deciding which samples become rows.
+#[derive(Clone, Copy, Debug)]
+pub struct KvSnapshotEntry {
+    pub worker_id: u16,
+    pub group_id: u16,
+    pub time_ms: f64,
+    /// Peak committed KV over the throttle window (the "current size").
+    pub active_kv: u64,
+    /// Peak KV the currently-admitted set will reach as it drains
+    /// (`Batch::projected_peak_kv`) — the "future estimate".
+    pub projected_peak: u64,
+    /// Admitted-but-not-yet-realized tokens (the `promised` ledger).
+    pub promised_kv: u64,
+}
+
+/// `pool_tag` is the whole chunk's stream tag (one worker owns one `KvSampler`),
+/// so it is passed once here rather than duplicated into every [`KvSnapshotEntry`]
+/// — mirrors how `cost_to_record_batch` takes `CostLogChunk::pool_tag`.
+pub(crate) fn kv_to_record_batch(pool_tag: &str, entries: &[KvSnapshotEntry]) -> Result<RecordBatch> {
+    let pool: Vec<&str> = entries.iter().map(|_| pool_tag).collect();
+    let worker_id: Vec<u16> = entries.iter().map(|e| e.worker_id).collect();
+    let group_id: Vec<u16> = entries.iter().map(|e| e.group_id).collect();
+    let time_ms: Vec<f64> = entries.iter().map(|e| e.time_ms).collect();
+    let active: Vec<u64> = entries.iter().map(|e| e.active_kv).collect();
+    let peak: Vec<u64> = entries.iter().map(|e| e.projected_peak).collect();
+    let promised: Vec<u64> = entries.iter().map(|e| e.promised_kv).collect();
+
+    Ok(RecordBatch::try_new(
+        kv_snapshot_schema(),
+        vec![
+            Arc::new(StringArray::from(pool)),
+            Arc::new(UInt16Array::from(worker_id)),
+            Arc::new(UInt16Array::from(group_id)),
+            Arc::new(Float64Array::from(time_ms)),
+            Arc::new(UInt64Array::from(active)),
+            Arc::new(UInt64Array::from(peak)),
+            Arc::new(UInt64Array::from(promised)),
         ],
     )?)
 }

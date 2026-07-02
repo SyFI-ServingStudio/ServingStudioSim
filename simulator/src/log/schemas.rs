@@ -128,21 +128,29 @@ pub fn cost_log_schema() -> Arc<Schema> {
     ]))
 }
 
-/// `kv_snapshot` (§4) — sampled KV pool state per worker × group.
+/// `kv_snapshot` (§4) — the per-worker KV-pool occupancy time series: one row per
+/// `(pool_tag, worker_id, group_id)` per throttled sample (emitted by
+/// [`KvSampler`](crate::log::kv_sampler::KvSampler), which owns the sampling
+/// policy). Only raw token counts live here. The static per-pool `capacity` moves
+/// to `run_meta.json` (`kv_pools`), and the occupancy percentages are the
+/// analyzer's join-and-divide, not stored columns — single source of truth, the
+/// same reasoning that drops `wall_end_ms` from `cost_log`. `pool_tag` is part of
+/// the key because `worker_id` restarts at 0 per pool (PD's prefill#0 vs
+/// decode#0), exactly as in `cost_log`.
 pub fn kv_snapshot_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
+        Field::new("pool_tag", DataType::Utf8, false),
         Field::new("worker_id", DataType::UInt16, false),
-        Field::new("group_id", DataType::UInt8, false),
+        Field::new("group_id", DataType::UInt16, false),
         Field::new("time_ms", DataType::Float64, false),
+        // `active_kv`: peak committed KV over the throttle window (a running max,
+        // so decimated sampling never hides an occupancy spike) — the "current
+        // size". `projected_peak`: the max KV the currently-admitted set will reach
+        // as it drains (`Batch::projected_peak_kv`) — the "future estimate".
+        // `promised_kv`: admitted-but-not-yet-realized tokens.
         Field::new("active_kv", DataType::UInt64, false),
         Field::new("projected_peak", DataType::UInt64, false),
         Field::new("promised_kv", DataType::UInt64, false),
-        Field::new("suspended_kv", DataType::UInt64, false),
-        Field::new("capacity", DataType::UInt64, false),
-        Field::new("active_pct", DataType::Float32, false),
-        Field::new("peak_pct", DataType::Float32, false),
-        Field::new("promised_pct", DataType::Float32, false),
-        Field::new("suspended_pct", DataType::Float32, false),
     ]))
 }
 

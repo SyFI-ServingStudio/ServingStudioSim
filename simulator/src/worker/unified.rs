@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::log::{KvSampler, KvSubmit};
 use crate::worker::admission_helpers::Batch;
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -66,6 +67,9 @@ pub struct BareboneWorker<M: IterwiseUnifiedModel> {
     /// Eval scratch buffers + cost-log writer. Hides what would otherwise be
     /// five separate fields and a ~50-line block at end of `start_iter`.
     cost: CostBuffers,
+    /// Per-worker KV occupancy sampler; `None` when no log dir. The worker only
+    /// `submit`s per iteration — throttle + running-max live in `KvSampler`.
+    kv: Option<KvSampler>,
 }
 
 impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
@@ -95,6 +99,13 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         let group_kv_bytes =
             config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
         let kv_capacity = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
+        // Report the pool's static token capacity to the run-meta registry, and
+        // open the per-worker KV occupancy sampler (borrowing `cost_log_dir` before
+        // it is moved into `CostBuffers`). Barebone is single-group (group 0).
+        cluster
+            .borrow_mut()
+            .register_kv_capacity(pool_tag, pool.0, id.0, 0, kv_capacity);
+        let kv = KvSampler::open_opt(cost_log_dir.as_deref(), pool_tag, id, 1, config.kv_log_stride);
         let cost = CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref());
         Self {
             id,
@@ -104,6 +115,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
             runtime: WorkerRuntime::new(),
             batches: vec![Batch::new(0, kv_capacity)],
             cost,
+            kv,
         }
     }
 
@@ -296,6 +308,18 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                 worker: self.id,
                 req: rid,
             });
+        }
+
+        // Sample this iteration's settled KV occupancy (post advance / finalize /
+        // release). Values are read first so the immutable `&self` borrows
+        // (`group_promised_kv`, `batches`) end before `self.kv` is borrowed mut.
+        if self.kv.is_some() {
+            let submit = KvSubmit {
+                active_kv: self.batches[0].kv.active_kv,
+                projected_peak: self.batches[0].projected_peak_kv(),
+                promised_kv: self.group_promised_kv(0),
+            };
+            self.kv.as_mut().unwrap().submit(0, submit, now);
         }
     }
 
