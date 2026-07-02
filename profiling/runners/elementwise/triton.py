@@ -138,9 +138,16 @@ def profile_elementwise(
                     FAN_IN=fan_in,
                 )
 
-        # cupti samples adaptively until convergence with no warmup; energy keeps
-        # a light warmup before its NVML window.
-        time_ms = Timer.cupti(run_once, kernel_name=kernel_name)
+        # The @autotune'd Triton kernel benchmarks every config on its FIRST
+        # launch for a new (OUTPUT_SIZE, FAN_IN) key. Those trial launches would
+        # otherwise fall inside the CUPTI capture window and be summed into the
+        # measured kernel time (~17x inflation: a shape is profiled once in a
+        # fresh subprocess, so every DB row was the polluted first call). Warm up
+        # so autotune resolves OUTSIDE the window — mirrors ref's warmup=100
+        # before its capture. Autotune caches after one launch; a few warmups are
+        # cheap insurance. (Other runners skip warmup safely because flashinfer /
+        # deepgemm kernels aren't Triton-autotuned.)
+        time_ms = Timer.cupti(run_once, warmup=5, kernel_name=kernel_name)
         energy_j = Energy.perf(
             run_once,
             warmup=5,
