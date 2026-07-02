@@ -22,6 +22,12 @@ pub struct Placer<'a> {
     manifest: &'a Manifest,
     slot_ns: &'a [i64],
     slot_input: &'a [String],
+    /// Per-slot achieved FLOPs / bytes (slot-aligned to `slot_ns`), from the
+    /// `slot_flops` / `slot_bytes` cost-log columns. Used to annotate each leaf
+    /// slice with its achieved TFLOP/s and GB/s. Empty when the run predates the
+    /// columns; leaf annotation is then simply skipped.
+    slot_flops: &'a [f64],
+    slot_bytes: &'a [f64],
     expanded: bool,
 }
 
@@ -30,12 +36,16 @@ impl<'a> Placer<'a> {
         manifest: &'a Manifest,
         slot_ns: &'a [i64],
         slot_input: &'a [String],
+        slot_flops: &'a [f64],
+        slot_bytes: &'a [f64],
         expanded: bool,
     ) -> Self {
         Self {
             manifest,
             slot_ns,
             slot_input,
+            slot_flops,
+            slot_bytes,
             expanded,
         }
     }
@@ -67,14 +77,31 @@ impl<'a> Placer<'a> {
     fn place(&self, w: &mut TraceWriter, track: u64, idx: usize, t0: i64, scale: f64) -> i64 {
         match &self.manifest.nodes[idx] {
             FlatCostNode::Leaf(slot) => {
-                let dur = ((self.slot_ns.get(*slot).copied().unwrap_or(0) as f64) * scale).round()
-                    as i64;
+                let leaf_ns = self.slot_ns.get(*slot).copied().unwrap_or(0);
+                let dur = ((leaf_ns as f64) * scale).round() as i64;
                 let desc = &self.manifest.slots[*slot];
                 let mut anns = vec![
                     Annotation::str("kind", desc.kind.clone()),
                     Annotation::str("config", desc.config.clone()),
                     Annotation::dbl("dur_ms", dur as f64 / 1e6),
                 ];
+                // Achieved throughput from the *natural* leaf time (`leaf_ns`, not
+                // the `scale`-compressed display `dur`): a kernel's physical rate
+                // is independent of how the critical-path view squeezes the slice.
+                // `0` flops/bytes (profile row had no rate) or `0` time → skip.
+                let leaf_s = leaf_ns as f64 / 1e9;
+                if leaf_s > 0.0 {
+                    if let Some(&flops) = self.slot_flops.get(*slot) {
+                        if flops > 0.0 {
+                            anns.push(Annotation::dbl("tflops", flops / leaf_s / 1e12));
+                        }
+                    }
+                    if let Some(&bytes) = self.slot_bytes.get(*slot) {
+                        if bytes > 0.0 {
+                            anns.push(Annotation::dbl("gbps", bytes / leaf_s / 1e9));
+                        }
+                    }
+                }
                 if let Some(input) = self.slot_input.get(*slot) {
                     if !input.is_empty() {
                         anns.push(Annotation::str("input", input.clone()));
@@ -250,7 +277,7 @@ mod tests {
         let slot_ns = [10i64, 5];
         let inputs: [String; 0] = [];
         // No Max in this tree → mode is irrelevant; use the default (critical).
-        let placer = Placer::new(&m, &slot_ns, &inputs, false);
+        let placer = Placer::new(&m, &slot_ns, &inputs, &[], &[], false);
         let mut w = TraceWriter::new();
         let p = w.process_track(0, "w");
         let t = w.thread_track(p, 0, 0, "n");
@@ -303,7 +330,7 @@ mod tests {
         // Max{2}[b=8, c=4] = max(8,4)/2 = 4; Scale{3}(4) = 12; Sum(10, 12, 5) = 27.
         let slot_ns = [10i64, 8, 4, 5];
         let inputs: [String; 0] = [];
-        let placer = Placer::new(&m, &slot_ns, &inputs, true); // expanded (lanes)
+        let placer = Placer::new(&m, &slot_ns, &inputs, &[], &[], true); // expanded (lanes)
         let mut w = TraceWriter::new();
         let p = w.process_track(0, "w");
         let t = w.thread_track(p, 0, 0, "n");
@@ -324,7 +351,7 @@ mod tests {
         let m = mixed();
         let slot_ns = [10i64, 8, 4, 5];
         let inputs: [String; 0] = [];
-        let placer = Placer::new(&m, &slot_ns, &inputs, false); // critical (default)
+        let placer = Placer::new(&m, &slot_ns, &inputs, &[], &[], false); // critical (default)
         let mut w = TraceWriter::new();
         let p = w.process_track(0, "w");
         let t = w.thread_track(p, 0, 0, "n");

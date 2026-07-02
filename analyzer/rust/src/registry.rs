@@ -134,6 +134,15 @@ pub const SUBJECTS: &[Subject] = &[
         applies: Applies::All,
     },
     Subject {
+        name: "kernel-throughput",
+        category: Category::Batch,
+        description: "Achieved throughput per cost-tree location (leaf name; Max siblings pooled): \
+                      TFLOP/s (compute) and GB/s (memory BW) over 1/50-sampled cost_log slots.",
+        report_name: "kernel_throughput_report.json",
+        payload_name: "kernel_throughput_locations.json",
+        applies: Applies::All,
+    },
+    Subject {
         name: "workload-conservation",
         category: Category::Conservation,
         description: "Run-wide work accounting: cost_log prefill/decode/FFN/KV actuals vs \
@@ -175,6 +184,7 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
         "throughput" => throughput::segment::run_throughput(ctx, dir).await,
         "utilization" => utilization::series::run_utilization(ctx, dir).await,
         "batch" => batch::composition::run_batch(ctx, dir).await,
+        "kernel-throughput" => batch::kernel_throughput::run_kernel_throughput(ctx, dir).await,
         "workload-conservation" => conservation::workload::run_workload(ctx, dir).await,
         other => bail!("unknown analyzer subject {other:?}"),
     }

@@ -113,7 +113,17 @@ async fn main() -> Result<()> {
             expanded,
         } => {
             let ctx = build_session();
-            trace::run(&ctx, &log_dir, regions, region_ms, max_slices, expanded).await
+            // Trace build wall-time (read → place → write pftrace). Printed here,
+            // not inside `trace::run`, to keep timing at the CLI boundary like the
+            // `analyze run` subject timings. The windowed SQL scan keeps this small
+            // even on multi-million-row cost_logs.
+            let started = Instant::now();
+            let res = trace::run(&ctx, &log_dir, regions, region_ms, max_slices, expanded).await;
+            eprintln!(
+                "[analyze] trace built in {:.1} ms",
+                started.elapsed().as_secs_f64() * 1e3
+            );
+            res
         }
         Command::GenIterBreakdown {
             log_dir,

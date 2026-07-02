@@ -45,6 +45,8 @@ const COLUMNS: &[&str] = &[
     "slot_time_ms",
     "slot_input",
     "groups",
+    "slot_flops",
+    "slot_bytes",
 ];
 
 /// One iteration's row, materialized from the parquet.
@@ -63,6 +65,11 @@ struct IterRow {
     slot_ns: Vec<i64>,
     /// Per-slot captured kernel input JSON (empty when the run lacked capture).
     slot_input: Vec<String>,
+    /// Per-slot achieved FLOPs / bytes (slot-aligned to `slot_ns`). Feed the
+    /// `Placer` so each leaf slice is annotated with achieved TFLOP/s and GB/s.
+    /// Empty on runs predating the `slot_flops` / `slot_bytes` columns.
+    slot_flops: Vec<f64>,
+    slot_bytes: Vec<f64>,
     /// This iter/section's top-level arch input (the `input_section`), one per HP
     /// group — the batch composition fed to the model_arch to cost this row.
     /// Rendered as a JSON annotation on the per-iter slice.
@@ -91,6 +98,8 @@ const NET_COLUMNS: &[&str] = &[
     "recv_gid",
     "bytes",
     "kind",
+    "send_count",
+    "recv_count",
 ];
 
 /// One cross-worker transfer, materialized from `gpu_cluster.parquet`. Placed on
@@ -107,6 +116,10 @@ struct NetRow {
     recv_gid: u16,
     bytes: u64,
     kind: String,
+    /// GPU counts of the send / recv comm groups. Per-link share = `bytes /
+    /// count`; annotated on the slice as raw counts and per-link GB/s.
+    send_count: u16,
+    recv_count: u16,
 }
 
 impl NetRow {
@@ -208,6 +221,7 @@ pub async fn run(
         let (ws, tt) = (col(b, "wall_start_ms")?, col(b, "total_time_ms")?);
         let (st, si) = (col(b, "slot_time_ms")?, col(b, "slot_input")?);
         let gr = col(b, "groups")?;
+        let (sf, sb) = (col(b, "slot_flops")?, col(b, "slot_bytes")?);
         for r in 0..b.num_rows() {
             let slot_ns = value_f32_list(st, r)?
                 .iter()
@@ -223,6 +237,8 @@ pub async fn run(
                 total_time_ms: value_f64(tt, r)?,
                 slot_ns,
                 slot_input: value_str_list(si, r)?,
+                slot_flops: value_f32_list(sf, r)?,
+                slot_bytes: value_f32_list(sb, r)?,
                 groups: value_groups(gr, r)?,
             });
         }
@@ -244,7 +260,8 @@ pub async fn run(
             "SELECT net_start_ms, net_end_ms, \
              CAST(src_pool_tag AS VARCHAR) AS src_pool_tag, src_worker_id, \
              CAST(dst_pool_tag AS VARCHAR) AS dst_pool_tag, dst_worker_id, \
-             send_gid, recv_gid, bytes, CAST(kind AS VARCHAR) AS kind \
+             send_gid, recv_gid, bytes, CAST(kind AS VARCHAR) AS kind, \
+             send_count, recv_count \
              FROM gpu_cluster WHERE {} ORDER BY dst_pool_tag, dst_worker_id, net_start_ms",
             window_pred("net_start_ms")
         );
@@ -254,6 +271,7 @@ pub async fn run(
             let (dp, dw) = (col(b, "dst_pool_tag")?, col(b, "dst_worker_id")?);
             let (sg, rg) = (col(b, "send_gid")?, col(b, "recv_gid")?);
             let (by, kd) = (col(b, "bytes")?, col(b, "kind")?);
+            let (sc, rc) = (col(b, "send_count")?, col(b, "recv_count")?);
             for r in 0..b.num_rows() {
                 net_rows.push(NetRow {
                     net_start_ms: value_f64(ns, r)?,
@@ -266,6 +284,8 @@ pub async fn run(
                     recv_gid: value_f64(rg, r)? as u16,
                     bytes: value_f64(by, r)? as u64,
                     kind: value_string(kd, r)?,
+                    send_count: value_f64(sc, r)? as u16,
+                    recv_count: value_f64(rc, r)? as u16,
                 });
             }
         }
@@ -398,7 +418,14 @@ pub async fn run(
                 }
             }
             w.begin(track, base_ns, &slice_label, &iter_anns);
-            let placer = Placer::new(manifest, &row.slot_ns, &row.slot_input, expanded);
+            let placer = Placer::new(
+                manifest,
+                &row.slot_ns,
+                &row.slot_input,
+                &row.slot_flops,
+                &row.slot_bytes,
+                expanded,
+            );
             let dur = placer.place_root(&mut w, track, base_ns);
             let end_ns = base_ns + dur;
             w.end(track, end_ns);
@@ -432,22 +459,33 @@ pub async fn run(
             let begin_ns = ((nr.net_start_ms + shift_ms) * 1e6).round() as i64;
             let begin_ns = begin_ns.max(net_track_cursor.get(&track).copied().unwrap_or(i64::MIN));
             let end_ns = (((nr.net_end_ms + shift_ms) * 1e6).round() as i64).max(begin_ns);
-            w.begin(
-                track,
-                begin_ns,
-                &nr.kind,
-                &[
-                    Annotation::str(
-                        "src",
-                        worker_label(&(nr.src_pool_tag.clone(), nr.src_worker_id)),
-                    ),
-                    Annotation::uint("send_gid", nr.send_gid as u64),
-                    Annotation::uint("recv_gid", nr.recv_gid as u64),
-                    Annotation::uint("bytes", nr.bytes),
-                    Annotation::dbl("net_start_ms", nr.net_start_ms),
-                    Annotation::dbl("net_end_ms", nr.net_end_ms),
-                ],
-            );
+            let mut net_anns = vec![
+                Annotation::str(
+                    "src",
+                    worker_label(&(nr.src_pool_tag.clone(), nr.src_worker_id)),
+                ),
+                Annotation::uint("send_gid", nr.send_gid as u64),
+                Annotation::uint("recv_gid", nr.recv_gid as u64),
+                Annotation::uint("send_count", nr.send_count as u64),
+                Annotation::uint("recv_count", nr.recv_count as u64),
+                Annotation::uint("bytes", nr.bytes),
+                Annotation::dbl("net_start_ms", nr.net_start_ms),
+                Annotation::dbl("net_end_ms", nr.net_end_ms),
+            ];
+            // Per-link effective bandwidth: each side moves `bytes / count` over
+            // the on-wire window. Skip on a zero-length window (nothing to divide).
+            let dur_s = (nr.net_end_ms - nr.net_start_ms) / 1e3;
+            if dur_s > 0.0 {
+                if nr.send_count > 0 {
+                    let gbps = (nr.bytes as f64 / nr.send_count as f64) / dur_s / 1e9;
+                    net_anns.push(Annotation::dbl("send_per_link_gbps", gbps));
+                }
+                if nr.recv_count > 0 {
+                    let gbps = (nr.bytes as f64 / nr.recv_count as f64) / dur_s / 1e9;
+                    net_anns.push(Annotation::dbl("recv_per_link_gbps", gbps));
+                }
+            }
+            w.begin(track, begin_ns, &nr.kind, &net_anns);
             w.end(track, end_ns);
             net_track_cursor.insert(track, end_ns);
             placed_net += 1;
