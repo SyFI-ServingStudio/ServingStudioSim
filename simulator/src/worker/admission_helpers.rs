@@ -7,7 +7,7 @@
 //! std-only on purpose — `decodes` is a `Vec<(RequestId, DecodeReqState)>` to
 //! keep insertion order deterministic without pulling in `indexmap`/`rustc_hash`.
 
-use crate::common::RequestId;
+use crate::common::{IdMap, RequestId};
 
 // ════════════════════════════════════════════════════════════════════════════
 // KvPool — passive KV resource (§2.1). Holds no per-request state; the decode
@@ -131,6 +131,13 @@ pub struct Batch {
     pub kv: KvPool,
     /// Insertion-ordered live decode set.
     pub decodes: Vec<(RequestId, DecodeReqState)>,
+    /// `RequestId → position in `decodes`` — an O(1) lookup index mirroring
+    /// `decodes` exactly (maintained on every `decodes` mutation). Added because the
+    /// AFD attn worker resolves a decode's resident KV per token per layer
+    /// (`build_attn_input`), and a linear `decodes.iter().find` there was O(decodes)
+    /// per lookup → O(N²) as batches fill. `decodes` stays the source of truth
+    /// (order + values untouched); this only accelerates by-id reads.
+    index: IdMap<RequestId, usize>,
     /// Transient: ids admitted as prefill this iter; cleared in `complete_iter`.
     pub prefill_admits: Vec<RequestId>,
     /// Cached `projected_peak`. The projection is non-increasing as decodes
@@ -150,7 +157,15 @@ impl Batch {
             decodes: Vec::new(),
             prefill_admits: Vec::new(),
             cached_peak: 0,
+            index: IdMap::default(),
         }
+    }
+
+    /// A live decode's resident KV length by id, O(1) via `index`. `None` if `req_id`
+    /// is not in the decode set. Replaces a linear `decodes.iter().find` on the hot
+    /// per-token attn-input path.
+    pub fn decode_current_kv(&self, req_id: RequestId) -> Option<u64> {
+        self.index.get(&req_id).map(|&i| self.decodes[i].1.current_kv)
     }
 
     /// Live decodes (those with tokens still to emit), in insertion order.
@@ -192,6 +207,11 @@ impl Batch {
     /// Iter-end transition: a realized prefill enters the decode set.
     pub fn finalize_to_decode(&mut self, req_id: RequestId, initial_kv: u64, decode_budget: u32) {
         self.kv.add_kv(initial_kv);
+        debug_assert!(
+            !self.index.contains_key(&req_id),
+            "finalize_to_decode: {req_id:?} already resident — decode ids are unique"
+        );
+        self.index.insert(req_id, self.decodes.len());
         self.decodes.push((
             req_id,
             DecodeReqState {
@@ -205,8 +225,14 @@ impl Batch {
 
     /// External release: drop from the decode set (if present) and decrement KV.
     pub fn release(&mut self, req_id: RequestId, current_kv: u64) {
-        if let Some(pos) = self.decodes.iter().position(|(r, _)| *r == req_id) {
+        if let Some(pos) = self.index.remove(&req_id) {
             self.decodes.remove(pos);
+            // `Vec::remove` shifts every entry after `pos` down by one — repair their
+            // index slots (order-preserving, so `decodes` stays byte-identical to the
+            // pre-index behavior; only the auxiliary index moves).
+            for (i, (rid, _)) in self.decodes.iter().enumerate().skip(pos) {
+                self.index.insert(*rid, i);
+            }
             self.kv.sub_kv(current_kv);
             // One decode left → peak can only fall; refresh the cache.
             self.recompute_peak();

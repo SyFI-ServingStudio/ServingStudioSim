@@ -67,12 +67,12 @@
 //! points) → the tick / pipeline loop → its helpers, each following the function
 //! that calls it → tests.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, AttnArchInput, AttnLayerwiseModel};
-use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{IdMap, PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::worker::admission_helpers::Batch;
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -137,6 +137,11 @@ struct Slot {
     /// Per-slot forward-pass counter (the `cost_log` row `iter_id`), bumped when the
     /// slot wraps back to layer 0. Groups all of one forward's per-layer `attn` rows.
     iter: u64,
+    /// Whether this slot's cached attention input (`slot_inputs[idx]`) is up to date.
+    /// The input is constant across an iteration's layers, so it is rebuilt lazily on
+    /// the first compute after the flag is cleared (iteration wrap / `pending_insert`
+    /// drain / `Release`) and reused for the rest of the iteration's layers.
+    input_valid: bool,
 }
 
 impl Slot {
@@ -153,6 +158,7 @@ impl Slot {
             pull_end: Time::ZERO,
             compute_end: Time::ZERO,
             iter: 0,
+            input_valid: false,
         }
     }
 
@@ -172,6 +178,72 @@ impl Slot {
     }
 }
 
+/// Level-1 admission backlog: a FIFO of KV-gated pending admits that also carries a
+/// running full-footprint KV sum.
+///
+/// Why this exists: the attn pool's least-KV placement calls
+/// [`DisaggAttnWorker::estimated_peak_kv`] on every worker for every arrival, which
+/// folded the raw deque — O(|pending|) per arrival. Under a saturated KV pool the
+/// backlog grows to tens of thousands of entries, so placement was O(N²) over a run.
+/// Each entry carries its full-footprint weight (`prompt_kv + remaining`), which is
+/// **constant while the request is queued** — a queued request has not started
+/// decoding (`tokens_emitted == 0`) — so the incrementally-maintained `reserved_kv`
+/// equals a fresh fold of the deque exactly (u64, order-independent), read in O(1).
+/// Order is preserved for the head-of-line drain.
+///
+/// No membership index: in the AFD flow a request is `Admit`ed exactly once
+/// (`AfdFlow::on_arrival`, dense store) and `Release`d only after it has drained
+/// pending→slot, so the old `on_msg_admit` idempotency `contains` and `on_msg_release`
+/// `retain` never actually removed/found anything. Those invariants are now
+/// `debug_assert!`ed (via [`PendingQueue::contains`], a debug-only O(n) scan) and
+/// compile out of `--release` — the path the simulator runs — entirely.
+#[derive(Default)]
+struct PendingQueue {
+    /// FIFO of (request, its full-footprint KV weight at enqueue time).
+    order: VecDeque<(RequestId, u64)>,
+    /// Running sum of the weights in `order` (the `estimated_peak_kv` L1 term).
+    reserved_kv: u64,
+}
+
+impl PendingQueue {
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// Membership by linear scan — **debug-only** (only `debug_assert!` invariant
+    /// checks call it; it compiles out of release). Not a hot-path operation.
+    fn contains(&self, req: RequestId) -> bool {
+        self.order.iter().any(|&(r, _)| r == req)
+    }
+
+    /// The L1 queued footprint — the running sum, O(1) (replaces a deque fold).
+    fn reserved_kv(&self) -> u64 {
+        self.reserved_kv
+    }
+
+    /// Head request without dequeuing (the drain peeks before the KV gate).
+    fn front(&self) -> Option<RequestId> {
+        self.order.front().map(|&(r, _)| r)
+    }
+
+    /// Enqueue a fresh admit at its full-footprint `weight`.
+    fn push_back(&mut self, req: RequestId, weight: u64) {
+        self.order.push_back((req, weight));
+        self.reserved_kv += weight;
+    }
+
+    /// Pop the head (the drain admitted it into a slot). Keeps the sum in step.
+    fn pop_front(&mut self) -> Option<RequestId> {
+        let (req, weight) = self.order.pop_front()?;
+        self.reserved_kv -= weight;
+        Some(req)
+    }
+}
+
 pub struct DisaggAttnWorker<M: AttnLayerwiseModel> {
     pub id: WorkerId,
     model: Arc<M>,
@@ -187,20 +259,33 @@ pub struct DisaggAttnWorker<M: AttnLayerwiseModel> {
     /// only. Reserved-not-resident KV lives in `promised`.
     batch: Batch,
     slots: [Slot; NUM_SLOTS],
-    /// Level-1 admission backlog (FIFO). Drained under the KV gate each tick.
-    worker_pending: VecDeque<RequestId>,
+    /// Level-1 admission backlog (FIFO) with O(1) membership + running reserved-KV
+    /// sum. Drained under the KV gate each tick. See [`PendingQueue`].
+    worker_pending: PendingQueue,
     /// Reserved-but-not-resident KV per request (full footprint). Admission
     /// accounting only — feeds the `try_admit` group-promised total; a request
     /// leaves it at `begin_decode`. (NOT the prefill/decode discriminator: that is
     /// the request's store `is_prefill()` status.)
-    promised: HashMap<RequestId, u64>,
+    promised: IdMap<RequestId, u64>,
     /// Sticky request → slot routing (set at admission; survives decode re-entry).
-    request_to_slot: HashMap<RequestId, usize>,
+    request_to_slot: IdMap<RequestId, usize>,
     /// Eval scratch + the per-section `cost_log` writer. The attn side has one cost
     /// group, so every row is `section = "attn"` (the layer is the row's `layer`,
     /// the pipeline slot its `batch_id`). Honest per-layer rows; ZSTD compresses the
     /// homogeneous layers.
     cost: CostBuffers,
+    /// Per-slot attention-input cache (one `AttnArchInput` per pipeline slot). The
+    /// built input depends only on the slot's `reqs`, each request's `is_prefill()`,
+    /// and each resident decode's `current_kv` — all of which change **only at the
+    /// iteration boundary** (reqs at the layer-0 open / a mid-iteration `Release`;
+    /// `current_kv` at the last-layer `advance_subset`; `is_prefill` at the ffn
+    /// Terminal's boundary flip, D16). So the same input would otherwise be rebuilt
+    /// ~num_layers times per iteration. Each slot keeps its input here and rebuilds it
+    /// only when [`Slot::input_valid`] is cleared — at the iteration wrap
+    /// (`advance_slot_layer`), a `pending_insert` drain (`open_iterations`), and a
+    /// `Release` (`on_msg_release`). Per-slot (not one shared buffer) because a slot's
+    /// cache must survive while another slot computes.
+    slot_inputs: [AttnArchInput; NUM_SLOTS],
 }
 
 // ── construction ────────────────────────────────────────────────────────────────
@@ -240,10 +325,11 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             recv_gid,
             batch: Batch::new(0, kv_capacity),
             slots: std::array::from_fn(|_| Slot::new()),
-            worker_pending: VecDeque::new(),
-            promised: HashMap::new(),
-            request_to_slot: HashMap::new(),
+            worker_pending: PendingQueue::default(),
+            promised: IdMap::default(),
+            request_to_slot: IdMap::default(),
             cost,
+            slot_inputs: std::array::from_fn(|_| AttnArchInput { groups: Vec::new() }),
         }
     }
 }
@@ -297,36 +383,44 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
 
     /// Level-1 enqueue (ref `enqueue_to_pending`): record the request as pending. No
     /// KV is reserved yet — the projected-peak gate runs at the Level-2 drain so a
-    /// rejected request blocks the queue instead of being force-admitted. Idempotent:
-    /// a re-`Admit` of a request already pending / promised / placed is dropped.
+    /// rejected request blocks the queue instead of being force-admitted.
+    ///
+    /// A request is `Admit`ed exactly once (`AfdFlow::on_arrival`, dense store) and is
+    /// never queued while promised / placed, so this is an unconditional enqueue. The
+    /// old idempotency drop is kept as a `debug_assert!` (compiled out of release):
+    /// if it ever fires, the flow's once-per-request invariant broke upstream.
     fn on_msg_admit(&mut self, req: RequestId) {
-        let known = self.worker_pending.contains(&req)
-            || self.promised.contains_key(&req)
-            || self.request_to_slot.contains_key(&req);
-        if !known {
-            self.worker_pending.push_back(req);
-        }
+        debug_assert!(
+            !self.worker_pending.contains(req)
+                && !self.promised.contains_key(&req)
+                && !self.request_to_slot.contains_key(&req),
+            "AFD Admit is once-per-request; re-Admit of {req:?} means the flow invariant broke"
+        );
+        let (prompt_kv, remaining) = self.footprint(req);
+        self.worker_pending.push_back(req, prompt_kv + remaining as u64);
     }
 
     /// Drop a completed request's KV (the ffn Terminal completed it; the flow routed
     /// the release here). Removes it from every level it can sit at; a slot that
     /// empties drops back to dormant.
     fn on_msg_release(&mut self, req: RequestId) {
-        if let Some(current_kv) = self
-            .batch
-            .decodes
-            .iter()
-            .find(|(r, _)| *r == req)
-            .map(|(_, s)| s.current_kv)
-        {
+        if let Some(current_kv) = self.batch.decode_current_kv(req) {
             self.batch.release(req, current_kv);
         }
         self.promised.remove(&req);
-        self.worker_pending.retain(|&r| r != req);
+        // A Release arrives only after the request drained pending→slot (the ffn
+        // Terminal completed it), so it is never still queued here — the old
+        // `worker_pending.retain` always removed nothing. Assert that in debug.
+        debug_assert!(
+            !self.worker_pending.contains(req),
+            "Release of {req:?} while still queued; a pending request cannot complete"
+        );
         if let Some(slot_idx) = self.request_to_slot.remove(&req) {
             let s = &mut self.slots[slot_idx];
             s.reqs.retain(|&r| r != req);
             s.pending_insert.retain(|&r| r != req);
+            // `reqs` changed mid-iteration ⇒ the cached attention input is stale.
+            s.input_valid = false;
             // A slot emptied by release drops back to dormant: clear `iter_announced`
             // so the next members admitted into it reopen the iteration (otherwise the
             // stale announce flag would block `open_iterations`).
@@ -430,7 +524,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
     /// first reject, do not skip). Each admit reserves the FULL footprint in
     /// `promised` and assigns the least-KV slot.
     fn drain_pending_admits(&mut self) {
-        while let Some(&req) = self.worker_pending.front() {
+        while let Some(req) = self.worker_pending.front() {
             let (prompt_kv, remaining) = self.footprint(req);
             if remaining == 0 {
                 self.worker_pending.pop_front(); // nothing left to decode
@@ -490,14 +584,10 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
     ///     fresh admit shows up here at once — the pool can spread several same-tick
     ///     arrivals across shards instead of piling them onto one.
     pub fn estimated_peak_kv(&self) -> u64 {
-        let queued: u64 = self
-            .worker_pending
-            .iter()
-            .map(|&r| {
-                let (prompt_kv, remaining) = self.footprint(r);
-                prompt_kv + remaining as u64
-            })
-            .sum();
+        // L1 queued footprint is the running sum maintained by `PendingQueue` (each
+        // entry's `prompt_kv + remaining`, constant while queued) — O(1) here instead
+        // of folding the whole backlog on every placement probe.
+        let queued = self.worker_pending.reserved_kv();
         self.batch.projected_peak_kv() + self.promised_kv() + queued
     }
 
@@ -549,6 +639,8 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
                         self.begin_decode(rid); // prefilled handoff: resident decode now
                     }
                 }
+                // `reqs` grew ⇒ rebuild the cached attention input on the next compute.
+                self.slots[idx].input_valid = false;
             }
             let reqs = self.slots[idx].reqs.clone();
             events.push(AttnWorkerEvent::IterStart {
@@ -617,13 +709,15 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
     /// stays a barrier member.
     fn complete_layer(&mut self, idx: usize, events: &mut Vec<AttnWorkerEvent>) {
         let layer = self.slots[idx].current_layer;
-        let reqs = self.slots[idx].reqs.clone();
-        let tokens = self.batch_query_tokens(&reqs);
+        // Token count reads the slot's `reqs` in place (no clone). The event needs an
+        // owned request set, so clone exactly once and MOVE it in — this runs per
+        // layer (≈num_layers × per iteration), so the old second clone was pure churn.
+        let tokens = self.batch_query_tokens(&self.slots[idx].reqs);
         let out_bytes = self.model.attn_to_ffn_bytes_per_token() * tokens;
         events.push(AttnWorkerEvent::AttnLayerOutputsReady {
             worker: self.id,
             slot: idx as u8,
-            reqs: reqs.clone(),
+            reqs: self.slots[idx].reqs.clone(),
             tokens,
             layer,
             send_gid: self.recv_gid,
@@ -635,7 +729,11 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         // KV by exactly one token (per iteration, not per layer).
         if layer == self.num_layers().saturating_sub(1) {
             let mut decoding = Vec::new();
-            for &rid in &reqs {
+            // Index by position so each `rid` copy releases the `slots` borrow before
+            // `begin_decode` / `advance_subset` take `&mut self` — same order as the
+            // old cloned-`reqs` iteration, so bit-identical, but no clone.
+            for k in 0..self.slots[idx].reqs.len() {
+                let rid = self.slots[idx].reqs[k];
                 if self.promised.contains_key(&rid) {
                     self.begin_decode(rid);
                 } else {
@@ -681,6 +779,10 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             s.iter_announced = false;
             // Wrapped past the last layer → a new forward pass for this slot opens.
             s.iter += 1;
+            // Last-layer `advance_subset` grew every decode's `current_kv` and the ffn
+            // Terminal may have flipped a prefill→decode at this boundary ⇒ the cached
+            // attention input must be rebuilt for the new iteration's first compute.
+            s.input_valid = false;
         }
     }
 
@@ -737,7 +839,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             self.slots[idx].compute_end = now;
             return;
         }
-        let input = self.build_attn_input(idx);
+        self.build_attn_input(idx);
         let layer = self.slots[idx].current_layer as usize;
         let iter_id = self.slots[idx].iter;
         // Clone the Arc so the immutable model borrow does not alias the mutable
@@ -745,6 +847,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         // closure (same aggregate the timing uses) and writes one `attn` row when
         // logging — `batch_id` = the pipeline slot, `layer` = this layer.
         let model = Arc::clone(&self.model);
+        let input = &self.slot_inputs[idx];
         let m = self.cost.run_section(
             "attn",
             layer as i16,
@@ -753,16 +856,30 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             &input.groups,
             now,
             |s, sc, inp| match inp {
-                Some(i) => model.attn_cost_with_inputs(layer, &input, s, sc, i),
-                None => model.attn_cost(layer, &input, s, sc),
+                Some(i) => model.attn_cost_with_inputs(layer, input, s, sc, i),
+                None => model.attn_cost(layer, input, s, sc),
             },
         );
         self.slots[idx].compute_end = now + Time::from_ms(m.m.time_ms as f64);
     }
 
-    fn build_attn_input(&self, idx: usize) -> AttnArchInput {
+    /// Rebuild slot `idx`'s cached attention input ([`slot_inputs`](Self::slot_inputs))
+    /// in place (D4: exactly one DP-shard group), unless it is still valid for this
+    /// iteration. The group's `Vec` capacities persist across rebuilds. Filling reads
+    /// disjoint fields (`slot_inputs` vs `slots`/`batch`/`requests`) so no `mem::replace`
+    /// dance is needed. See [`Slot::input_valid`] for the invalidation points.
+    fn build_attn_input(&mut self, idx: usize) {
+        if self.slots[idx].input_valid {
+            return; // cache hit: `slot_inputs[idx]` is up to date for this iteration
+        }
+        let buf = &mut self.slot_inputs[idx];
+        if buf.groups.is_empty() {
+            buf.groups.push(ArchGroupInput::default());
+        }
+        buf.groups.truncate(1);
+        let g = &mut buf.groups[0];
+        g.clear();
         let store = self.requests.borrow();
-        let mut g = ArchGroupInput::default();
         for &rid in &self.slots[idx].reqs {
             if store[rid].is_prefill() {
                 // Prefilling (v1 non-chunk: whole prompt in one pass): `prompt_len`
@@ -773,25 +890,23 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
                 g.batch_tokens += r.prompt_len;
             } else {
                 // Decode: one query token; KV length is this shard's tracked length.
-                let cur_kv = self.current_kv(rid) as u32;
+                let cur_kv = self.batch.decode_current_kv(rid).unwrap_or(0) as u32;
                 g.decode_kv_lens.push(cur_kv);
                 g.decode_tokens += 1;
                 g.batch_tokens += 1;
                 g.total_kv_len += cur_kv;
             }
         }
-        // D4: the attn worker computes exactly one DP-shard group.
-        AttnArchInput { groups: vec![g] }
+        drop(store);
+        self.slots[idx].input_valid = true;
     }
 
     /// This shard's authoritative resident KV length for a request (fed to the
     /// attention cost). `0` if not yet finalized into the decode set.
     fn current_kv(&self, rid: RequestId) -> u64 {
-        self.batch
-            .decodes
-            .iter()
-            .find(|(r, _)| *r == rid)
-            .map_or(0, |(_, s)| s.current_kv)
+        // O(1) via the Batch id index — this is on the hot per-token attn-input path
+        // (`build_attn_input`), where a linear scan was O(decodes) per token.
+        self.batch.decode_current_kv(rid).unwrap_or(0)
     }
 
     fn next_wakeup(&self, now: Time) -> Option<Time> {
@@ -1200,7 +1315,7 @@ mod tests {
         );
         assert_eq!(
             w.worker_pending.front(),
-            Some(&RequestId(1)),
+            Some(RequestId(1)),
             "req1 head-of-line"
         );
 
