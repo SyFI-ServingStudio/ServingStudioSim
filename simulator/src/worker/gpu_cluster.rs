@@ -110,8 +110,9 @@ impl CostSource {
 /// stream state would duplicate the same value across the range.
 #[derive(Clone, Copy, Debug)]
 struct CommGroup {
-    /// First GPU id in this group (informational, debugging).
-    #[allow(dead_code)]
+    /// First GPU id in this group; members are the contiguous block
+    /// `[base, base+count)`. Exported (with `count`) via
+    /// [`comm_groups`](GpuCluster::comm_groups) into `run_meta.json`.
     base: u16,
     /// Number of GPUs = link count for aggregate-bandwidth math.
     count: u16,
@@ -230,6 +231,24 @@ impl GpuCluster {
         self.groups.len()
     }
 
+    /// Registered comm groups as `(gid, base, count, owner_pool_tag,
+    /// owner_worker_id)`, `gid` = registration index. Members are the contiguous
+    /// GPU block `[base, base+count)`. The one read path for L7 to export the
+    /// gid→gpu-set mapping into `run_meta.json` — the internal `groups` table is
+    /// `#[serde(skip)]`, so this accessor is how the otherwise-private group
+    /// identity leaves the cluster.
+    pub fn comm_groups(&self) -> impl Iterator<Item = (u16, u16, u16, &'static str, u16)> + '_ {
+        self.groups.iter().enumerate().map(|(gid, g)| {
+            (
+                gid as u16,
+                g.base,
+                g.count,
+                g.owner_pool_tag,
+                g.owner_worker_id,
+            )
+        })
+    }
+
     /// Submit `bytes` from `send_gid` (acting as src) to `recv_gid` (acting as
     /// dst), starting no earlier than `now`. Modeled as one **synchronized**
     /// collective: the transfer begins only once both the src group's send
@@ -286,6 +305,8 @@ impl GpuCluster {
                 dst_worker_id: r.owner_worker_id,
                 send_gid,
                 recv_gid,
+                send_count: s.count,
+                recv_count: r.count,
                 bytes,
                 kind,
                 tag: tag.to_string(),

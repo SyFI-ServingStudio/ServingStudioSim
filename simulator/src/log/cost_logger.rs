@@ -128,6 +128,8 @@ impl CostLogger {
                 .reserve(STREAM_FLUSH_ROWS * group_len.max(1));
             self.buf.slot_times.reserve(STREAM_FLUSH_ROWS * slot_len);
             self.buf.slot_covs.reserve(STREAM_FLUSH_ROWS * slot_len);
+            self.buf.slot_flops.reserve(STREAM_FLUSH_ROWS * slot_len);
+            self.buf.slot_bytes.reserve(STREAM_FLUSH_ROWS * slot_len);
             self.buf
                 .slot_inputs
                 .reserve(STREAM_FLUSH_ROWS * slot_input_len);
@@ -141,6 +143,8 @@ impl CostLogger {
         self.buf
             .slot_covs
             .extend(slots.iter().map(|l| l.coverage.bits()));
+        self.buf.slot_flops.extend(slots.iter().map(|l| l.m.flops));
+        self.buf.slot_bytes.extend(slots.iter().map(|l| l.m.bytes));
         self.buf.group_logs.append(groups);
         self.buf.slot_inputs.append(slot_inputs);
         self.buf.entries.push(entry);

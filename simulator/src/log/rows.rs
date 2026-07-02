@@ -186,6 +186,11 @@ pub struct CostLogChunk {
     pub group_logs: Vec<GroupInputLog>,
     pub slot_times: Vec<f32>,
     pub slot_covs: Vec<u8>,
+    /// Per-slot achieved FLOPs / bytes, parallel to `slot_times` (same cursor,
+    /// same `slot_len`). `0` marks a slot whose profile row had no throughput
+    /// rate. Surfaced as the `slot_flops` / `slot_bytes` cost-log columns.
+    pub slot_flops: Vec<f32>,
+    pub slot_bytes: Vec<f32>,
     pub slot_inputs: Vec<SlotInput>,
 }
 
@@ -203,6 +208,8 @@ impl CostLogChunk {
             group_logs: Vec::with_capacity(groups_capacity),
             slot_times: Vec::with_capacity(slot_capacity),
             slot_covs: Vec::with_capacity(slot_capacity),
+            slot_flops: Vec::with_capacity(slot_capacity),
+            slot_bytes: Vec::with_capacity(slot_capacity),
             slot_inputs: Vec::with_capacity(slot_input_capacity),
         }
     }
@@ -303,6 +310,11 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
         DataType::UInt8,
         false,
     )));
+    // Achieved FLOPs / bytes, slot-aligned to `time_builder` (same cursor).
+    let mut flops_builder = ListBuilder::new(Float32Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
+    let mut bytes_builder = ListBuilder::new(Float32Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
     // Per-slot input JSON, serialized HERE on the writer thread (the sim thread
     // only handed over the inline `SlotInput` enums). One (possibly empty) list per row.
     let mut input_builder = ListBuilder::new(StringBuilder::new())
@@ -313,7 +325,10 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
     for e in entries {
         let slot_end = slot_cursor + e.slot_len;
         ensure!(
-            slot_end <= chunk.slot_times.len() && slot_end <= chunk.slot_covs.len(),
+            slot_end <= chunk.slot_times.len()
+                && slot_end <= chunk.slot_covs.len()
+                && slot_end <= chunk.slot_flops.len()
+                && slot_end <= chunk.slot_bytes.len(),
             "cost_log slot slice exceeds chunk buffer"
         );
         for &t in &chunk.slot_times[slot_cursor..slot_end] {
@@ -324,6 +339,14 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
             cov_builder.values().append_value(c);
         }
         cov_builder.append(true);
+        for &f in &chunk.slot_flops[slot_cursor..slot_end] {
+            flops_builder.values().append_value(f);
+        }
+        flops_builder.append(true);
+        for &b in &chunk.slot_bytes[slot_cursor..slot_end] {
+            bytes_builder.values().append_value(b);
+        }
+        bytes_builder.append(true);
         slot_cursor = slot_end;
         let slot_input_end = slot_input_cursor + e.slot_input_len;
         ensure!(
@@ -346,8 +369,11 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
         "cost_log chunk has unused slot_input values"
     );
     ensure!(
-        slot_cursor == chunk.slot_times.len() && slot_cursor == chunk.slot_covs.len(),
-        "cost_log chunk has unused slot time/coverage values"
+        slot_cursor == chunk.slot_times.len()
+            && slot_cursor == chunk.slot_covs.len()
+            && slot_cursor == chunk.slot_flops.len()
+            && slot_cursor == chunk.slot_bytes.len(),
+        "cost_log chunk has unused slot time/coverage/flops/bytes values"
     );
 
     Ok(RecordBatch::try_new(
@@ -366,6 +392,8 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
             Arc::new(input_builder.finish()),
             Arc::new(StringArray::from(section)),
             Arc::new(Int16Array::from(layer)),
+            Arc::new(flops_builder.finish()),
+            Arc::new(bytes_builder.finish()),
         ],
     )?)
 }
@@ -480,6 +508,12 @@ pub struct GpuClusterEntry {
     pub dst_worker_id: u16,
     pub send_gid: u16,
     pub recv_gid: u16,
+    /// GPU counts of the send / recv comm groups (`CommGroup::count`). The
+    /// per-link share is `bytes / count`, so a consumer derives per-link
+    /// effective bandwidth without joining the `run_meta` comm-group table.
+    /// Always >= 1 (a transfer with a zero-count endpoint is never logged).
+    pub send_count: u16,
+    pub recv_count: u16,
     pub bytes: u64,
     /// Stable event category (`pd_kv_pull` / `afd_ffn_pull` / `afd_attn_pull`).
     pub kind: &'static str,
@@ -496,6 +530,8 @@ pub(crate) fn gpu_cluster_to_record_batch(entries: &[GpuClusterEntry]) -> Result
     let dst_worker: Vec<u16> = entries.iter().map(|e| e.dst_worker_id).collect();
     let send_gid: Vec<u16> = entries.iter().map(|e| e.send_gid).collect();
     let recv_gid: Vec<u16> = entries.iter().map(|e| e.recv_gid).collect();
+    let send_count: Vec<u16> = entries.iter().map(|e| e.send_count).collect();
+    let recv_count: Vec<u16> = entries.iter().map(|e| e.recv_count).collect();
     let bytes: Vec<u64> = entries.iter().map(|e| e.bytes).collect();
     let kind: Vec<&str> = entries.iter().map(|e| e.kind).collect();
     let tag: Vec<&str> = entries.iter().map(|e| e.tag.as_str()).collect();
@@ -514,6 +550,8 @@ pub(crate) fn gpu_cluster_to_record_batch(entries: &[GpuClusterEntry]) -> Result
             Arc::new(UInt64Array::from(bytes)),
             Arc::new(StringArray::from(kind)),
             Arc::new(StringArray::from(tag)),
+            Arc::new(UInt16Array::from(send_count)),
+            Arc::new(UInt16Array::from(recv_count)),
         ],
     )?)
 }
@@ -611,10 +649,32 @@ mod tests {
             group_logs,
             slot_times: vec![1.0, 0.5, 0.5, 0.4, 0.6, 0.0],
             slot_covs: vec![0, 1, 0, 0, 0, 0],
+            slot_flops: vec![10.0, 20.0, 30.0, 40.0, 50.0, 0.0],
+            slot_bytes: vec![1.0, 2.0, 3.0, 4.0, 5.0, 0.0],
             slot_inputs: vec![],
         })
         .unwrap();
         assert_eq!(batch.num_rows(), 2);
+        // slot_flops / slot_bytes round-trip as the last two List<f32> columns,
+        // slot-aligned to slot_time_ms (both rows have slot_len 3).
+        let flops_col = batch
+            .column_by_name("slot_flops")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let flops0 = flops_col.value(0);
+        let flops0 = flops0.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(flops0.values(), &[10.0, 20.0, 30.0]);
+        let bytes_col = batch
+            .column_by_name("slot_bytes")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let bytes1 = bytes_col.value(1);
+        let bytes1 = bytes1.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(bytes1.values(), &[4.0, 5.0, 0.0]);
         let pool = batch
             .column(0)
             .as_any()

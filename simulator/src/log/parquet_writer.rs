@@ -107,6 +107,8 @@ mod tests {
         for s in 0..slot_count {
             chunk.slot_times.push(0.1 + s as f32 * 0.01);
             chunk.slot_covs.push((s & 0xFF) as u8);
+            chunk.slot_flops.push(s as f32 * 1e9);
+            chunk.slot_bytes.push(s as f32 * 1e6);
         }
         chunk.entries.push(CostLogEntry {
             worker_id,

@@ -109,6 +109,22 @@ pub fn cost_log_schema() -> Arc<Schema> {
         // append-only, so old readers are unaffected.
         Field::new("section", DataType::Utf8, false),
         Field::new("layer", DataType::Int16, false),
+        // Per-slot achieved FLOPs / bytes (slot-aligned to `slot_time_ms`; `0`
+        // when the profile row carried no tflops/bandwidth rate — the same
+        // "not measured" sentinel `KernelMetrics::flops`/`bytes` returns). Lets a
+        // consumer derive per-op achieved TFLOP/s (`flops / time`) and GB/s
+        // (`bytes / time`). Appended last: append-only, so old readers are
+        // unaffected.
+        Field::new(
+            "slot_flops",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, false))),
+            false,
+        ),
+        Field::new(
+            "slot_bytes",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, false))),
+            false,
+        ),
     ]))
 }
 
@@ -178,6 +194,12 @@ pub fn gpu_cluster_schema() -> Arc<Schema> {
         Field::new("bytes", DataType::UInt64, false),
         Field::new("kind", DataType::Utf8, false),
         Field::new("tag", DataType::Utf8, false),
+        // GPU count of the send / recv comm group (`CommGroup::count`, always >= 1).
+        // Per-link share is `bytes / count`; lets a consumer derive per-link
+        // effective bandwidth. The full gid→gpu-set mapping lives in
+        // `run_meta.json`'s `comm_groups`. Appended last: append-only.
+        Field::new("send_count", DataType::UInt16, false),
+        Field::new("recv_count", DataType::UInt16, false),
     ]))
 }
 

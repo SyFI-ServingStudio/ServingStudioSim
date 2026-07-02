@@ -159,6 +159,8 @@ mod tests {
                 dst_worker_id: 7,
                 send_gid: 3,
                 recv_gid: 11,
+                send_count: 8,
+                recv_count: 2,
                 bytes: 4_000_000,
                 kind: "pd_kv_pull",
                 tag: "req=42".to_string(),
@@ -193,5 +195,20 @@ mod tests {
             .downcast_ref::<UInt16Array>()
             .unwrap();
         assert_eq!(dst_worker.value(0), 7);
+        // send_count / recv_count round-trip (the two appended UInt16 columns).
+        let send_count = batch
+            .column_by_name("send_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .unwrap();
+        assert_eq!(send_count.value(0), 8);
+        let recv_count = batch
+            .column_by_name("recv_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .unwrap();
+        assert_eq!(recv_count.value(0), 2);
     }
 }
