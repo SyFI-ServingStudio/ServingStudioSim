@@ -249,13 +249,15 @@ where
 
 /// Build the AFD attn↔ffn transfer cost source: the profiled `p2p_inter` curve for
 /// the receiver GPU (same kernel PD uses for its KV handoff). v1 assumes a
-/// cross-node (Infiniband) transfer over `nccl` with a bf16 element dtype — the
-/// curve is keyed by message-size bytes, so dtype only selects the profiled table.
+/// cross-node (Infiniband) transfer with a bf16 element dtype — the curve is keyed
+/// by message-size bytes, so dtype only selects the profiled table. Lists nccl +
+/// nvshmem for parity with the collective ops (best-of-N picks the faster); note
+/// p2p_inter is an analytical, backend-agnostic curve, so both resolve alike here.
 fn build_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result<CostSource> {
     let kernel = P2pInterKernel::build(
         "afd_qkv_transfer".to_string(),
         P2pInterKernelConfig {
-            backends: vec!["nccl"],
+            backends: vec!["nccl", "nvshmem"],
             gpu_name: gpu_name.to_string(),
             fabric: Fabric::Infiniband,
             dtype: DType::Bf16,

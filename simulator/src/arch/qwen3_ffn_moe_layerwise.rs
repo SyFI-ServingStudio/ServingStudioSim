@@ -110,9 +110,12 @@ pub struct Qwen3FfnMoeLayerwiseModel {
 const NORM_BACKENDS: &[&str] = &["flashinfer"];
 const GEMM_BACKENDS: &[&str] = &["torch"];
 const ACT_BACKENDS: &[&str] = &["triton"];
-const ALLREDUCE_BACKENDS: &[&str] = &["nccl"];
+// nccl + nvshmem for the collective/p2p ops: the cost engine evals both and
+// keeps the faster per op (best-of-N). MoE dispatch/combine (p2p_intra) and the
+// router TP all-reduce both benefit — real EP deployments run these over NVSHMEM.
+const ALLREDUCE_BACKENDS: &[&str] = &["nccl", "nvshmem"];
 const GROUPED_GEMM_BACKENDS: &[&str] = &["torch"];
-const P2P_BACKENDS: &[&str] = &["nccl"];
+const P2P_BACKENDS: &[&str] = &["nccl", "nvshmem"];
 const TP_FABRIC: Fabric = Fabric::Nvlink;
 const MOE_INTRA_FABRIC: Fabric = Fabric::Nvlink;
 const MOE_INTER_FABRIC: Fabric = Fabric::Infiniband;

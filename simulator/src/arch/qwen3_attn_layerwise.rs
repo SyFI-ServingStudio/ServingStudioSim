@@ -42,7 +42,9 @@ const NORM_BACKENDS: &[&str] = &["flashinfer"];
 const GEMM_BACKENDS: &[&str] = &["torch"];
 // See llama3_dense: FlashInfer impls registered under fa2/fa3, not "flashinfer".
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];
-const ALLREDUCE_BACKENDS: &[&str] = &["nccl"];
+// nccl + nvshmem: the cost engine evals both and keeps the faster per op
+// (best-of-N), so listing both models whichever the real deployment would use.
+const ALLREDUCE_BACKENDS: &[&str] = &["nccl", "nvshmem"];
 const TP_FABRIC: Fabric = Fabric::Nvlink;
 
 /// Build this arch's attention-block config from the model dims + `attn_tp_size`.
