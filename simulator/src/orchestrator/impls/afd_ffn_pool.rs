@@ -154,6 +154,52 @@ mod tests {
         ));
     }
 
+    /// With >1 worker, independent tasks round-robin: two submits land on worker 0
+    /// then worker 1 (each `IterComplete` carries the computing worker's id). Guards
+    /// the multi-replica ffn path lifted from the old `fg.replicas == 1` gate.
+    #[test]
+    fn round_robin_spreads_tasks_across_two_workers() {
+        let store = shared_with(&[(0, 8, 1), (1, 8, 1)]);
+        let mut p = AfdFfnPoolController::new(
+            2,
+            Arc::new(FakeFfn { ms: 1.0, layers: 2 }),
+            store,
+            WorkerConfig::default(),
+            PoolId(1),
+            "test-gpu",
+            &test_cluster(),
+            None,
+        );
+        p.submit(FfnTask {
+            kind: FfnTaskKind::Terminal,
+            slot: 0,
+            reqs: vec![RequestId(0)],
+            pull_sources: Vec::new(),
+        });
+        p.submit(FfnTask {
+            kind: FfnTaskKind::Terminal,
+            slot: 1,
+            reqs: vec![RequestId(1)],
+            pull_sources: Vec::new(),
+        });
+        let mut events = Vec::new();
+        for step in 0..10u64 {
+            p.tick_collect(Time::from_ms(step as f64), &mut events);
+        }
+        let workers: Vec<u16> = events
+            .iter()
+            .filter_map(|e| match e {
+                FfnWorkerEvent::IterComplete { worker, .. } => Some(worker.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            workers,
+            vec![0, 1],
+            "two independent tasks should round-robin to workers 0 then 1"
+        );
+    }
+
     /// A Terminal task surfaces an `IterComplete` (the worker owns token emission).
     #[test]
     fn terminal_surfaces_iter_complete() {

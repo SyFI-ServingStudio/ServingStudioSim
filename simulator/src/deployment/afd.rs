@@ -56,13 +56,15 @@ impl Deployment for AfdDeployment {
         ensure_disagg_attn(&ag.worker)?;
         ensure_disagg_ffn(&fg.worker)?;
 
-        // v1 topology: ≥1 attn DP shard, exactly one aggregated ffn replica.
+        // Topology: ≥1 attn DP shard and ≥1 ffn replica. Multiple ffn replicas are
+        // data-parallel: the attn controller's aggregated per-layer `FfnTask`s
+        // round-robin across them (see `AfdFfnPoolController`), so concurrent slots'
+        // layers run on different replicas. Each replica is itself a full EP-`ep_size`
+        // group. NOTE: the round-robin cursor is slot-agnostic, so it can break a
+        // worker's per-slot double-buffer pull/compute locality — the overlap model is
+        // optimistic under scatter until the route is made slot-affine / least-queued.
         ensure!(ag.replicas >= 1, "afd: attn pool needs ≥1 replica (got {})", ag.replicas);
-        ensure!(
-            fg.replicas == 1,
-            "afd: v1 supports exactly one ffn replica (got {}); multi-replica EP fan-out is a later milestone",
-            fg.replicas
-        );
+        ensure!(fg.replicas >= 1, "afd: ffn pool needs ≥1 replica (got {})", fg.replicas);
         // Attn and ffn must share the same model_config — the QKV they exchange is
         // one logical tensor split across the attn/ffn boundary.
         ensure!(
@@ -134,6 +136,7 @@ impl Deployment for AfdDeployment {
                     ag.gpu.clone(),
                     fg.gpu.clone(),
                     ag.replicas,
+                    fg.replicas,
                     cost,
                     // Per-building-block cost_log goes under the run's log_dir, same
                     // as a colocated run (the workers tag rows `attn` / `ffn`).
@@ -203,6 +206,7 @@ fn assemble_afd_flow<MA, MF>(
     attn_gpu_name: String,
     ffn_gpu_name: String,
     attn_replicas: u16,
+    ffn_replicas: u16,
     cost: CostSource,
     cost_log_dir: Option<std::path::PathBuf>,
 ) -> Box<dyn Flow>
@@ -225,7 +229,7 @@ where
         cost_log_dir.clone(),
     );
     let ffn = AfdFfnPoolController::new(
-        1,
+        ffn_replicas,
         ffn_model,
         Rc::clone(&store),
         ffn_wc,
