@@ -133,7 +133,7 @@ pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3
             num_kv_heads: model.num_kv_heads,
             head_dim: model.head_dim,
             dtype: model.dtype,
-            kv_dtype: model.kv_dtype,
+            fp8: false,
             tp_size: parallel.attn_tp_size,
             allreduce_fabric: TP_FABRIC,
             gpu_name: gpu.clone(),
@@ -191,7 +191,7 @@ fn total_kv_bytes_per_token(resolved: &Llama3DpAttnTpFfnResolved) -> u64 {
     let raw = &resolved.attn_block.raw_cfg;
     2 * raw.num_kv_heads as u64
         * raw.head_dim as u64
-        * raw.kv_dtype.size_bytes() as u64
+        * raw.kv_dtype().size_bytes() as u64
         * resolved.num_layers as u64
 }
 

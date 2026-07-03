@@ -113,11 +113,12 @@ impl MlpBlockTpWorklet {
                 dtype: cfg.dtype,
             },
             tp_ar: (cfg.tp_size > 1).then(|| AllReduceKernelConfig {
+                // Comm is size-keyed: the all-reduce reads the message bytes
+                // (`dtype_bytes` below) off a dtype-agnostic curve.
                 backends: cfg.allreduce_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_gpus: cfg.tp_size as u32,
                 fabric: cfg.allreduce_fabric,
-                dtype: cfg.dtype,
             }),
             intermediate_per_rank: inter_pr,
             dtype_bytes,

@@ -110,9 +110,8 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseC
             num_qo_heads: model.num_qo_heads,
             num_kv_heads: model.num_kv_heads,
             head_dim: model.head_dim,
-            q_dtype: model.dtype,
-            kv_dtype: model.kv_dtype,
-            o_dtype: model.dtype,
+            dtype: model.dtype,
+            fp8: false,
             gpu_name: gpu.clone(),
             backends: ATTN_BACKENDS.to_vec(),
         },
@@ -160,7 +159,7 @@ fn total_kv_bytes_per_token(resolved: &Llama3DenseResolved) -> u64 {
     let attn = &resolved.attn.attn;
     2 * attn.num_kv_heads as u64
         * attn.head_dim as u64
-        * attn.kv_dtype.size_bytes() as u64
+        * attn.kv_dtype().size_bytes() as u64
         * resolved.num_layers as u64
 }
 

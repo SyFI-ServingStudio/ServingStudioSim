@@ -108,13 +108,14 @@ pub struct Qwen3FfnMoeLayerwiseModel {
 // Backend / fabric policy for this arch. Local copy — the AFD archs are
 // self-contained (no shared arch-level config).
 const NORM_BACKENDS: &[&str] = &["flashinfer"];
-const GEMM_BACKENDS: &[&str] = &["torch"];
+// Dense + grouped GEMM backends are dtype-driven, not a flat const: fp8 runs
+// select `deepgemm`, bf16 runs `torch` (via `MoeModelCfg::gemm_backends()`), so a
+// GEMM never lists a backend without rows for its dtype (would abort the build).
 const ACT_BACKENDS: &[&str] = &["triton"];
 // nccl + nvshmem for the collective/p2p ops: the cost engine evals both and
 // keeps the faster per op (best-of-N). MoE dispatch/combine (p2p_intra) and the
 // router TP all-reduce both benefit — real EP deployments run these over NVSHMEM.
 const ALLREDUCE_BACKENDS: &[&str] = &["nccl", "nvshmem"];
-const GROUPED_GEMM_BACKENDS: &[&str] = &["torch"];
 const P2P_BACKENDS: &[&str] = &["nccl", "nvshmem"];
 const TP_FABRIC: Fabric = Fabric::Nvlink;
 const MOE_INTRA_FABRIC: Fabric = Fabric::Nvlink;
@@ -179,7 +180,10 @@ pub fn build_configs(
     routing: &RoutingDistribution,
 ) -> Qwen3FfnMoeConfigs {
     let gpu = &parallel.gpu_name;
-    let dtype_bytes = model.dtype.size_bytes();
+    // Byte-transfer widths (handoffs, dispatch/combine, local reduce, embed) use
+    // the compute dtype: fp8 halves the wire size, bf16 leaves it unchanged. The
+    // RMSNorm ops below keep the base `model.dtype`.
+    let dtype_bytes = model.compute_dtype().size_bytes();
     assert!(
         parallel.attn_tp_size > 0 && parallel.ep_size > 0,
         "attn_tp_size / ep_size must be non-zero"
@@ -210,7 +214,9 @@ pub fn build_configs(
     let moe_net = MoeNetConfig {
         backends: P2P_BACKENDS.to_vec(),
         gpu_name: gpu.clone(),
-        dtype: model.dtype,
+        // dispatch/combine ship the hidden activation → compute dtype (fp8 in an
+        // fp8 run halves the all-to-all payload).
+        dtype: model.compute_dtype(),
         intra_fabric: MOE_INTRA_FABRIC,
         inter_fabric: MOE_INTER_FABRIC,
         ep_size: u32::from(parallel.ep_size),
@@ -238,10 +244,11 @@ pub fn build_configs(
             num_kv_heads: model.num_kv_heads,
             head_dim: model.head_dim,
             dtype: model.dtype,
+            compute_dtype: model.compute_dtype(),
             tp_size: parallel.attn_tp_size,
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
-            gemm_backends: GEMM_BACKENDS.to_vec(),
+            gemm_backends: model.gemm_backends(),
         },
         // post-attn: row-parallel o_proj + optional tp_allreduce + post_norm + router.
         post_attn: PostAttnRouterTpWorkletConfig {
@@ -250,23 +257,26 @@ pub fn build_configs(
             head_dim: model.head_dim,
             num_experts: model.num_experts,
             dtype: model.dtype,
+            compute_dtype: model.compute_dtype(),
             tp_size: parallel.attn_tp_size,
             allreduce_fabric: TP_FABRIC,
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
-            gemm_backends: GEMM_BACKENDS.to_vec(),
+            gemm_backends: model.gemm_backends(),
             allreduce_backends: ALLREDUCE_BACKENDS.to_vec(),
         },
         moe_dispatch: moe_net.clone(),
+        // MoE expert compute is all-fp8 in an fp8 run (grouped GEMMs + SwiGLU act);
+        // no RMSNorm inside, so the whole worklet takes the compute dtype.
         moe_expert_compute: MoeExpertComputeLocalWorkletConfig {
             hidden: model.hidden,
             moe_intermediate: model.moe_intermediate,
             num_experts: model.num_experts,
             ep_size: parallel.ep_size,
-            dtype: model.dtype,
+            dtype: model.compute_dtype(),
             gpu_name: gpu.clone(),
             act_backends: ACT_BACKENDS.to_vec(),
-            grouped_gemm_backends: GROUPED_GEMM_BACKENDS.to_vec(),
+            grouped_gemm_backends: model.gemm_backends(),
             local_ppm,
         },
         moe_local_reduce: ElementwiseKernelConfig {
@@ -289,11 +299,11 @@ pub fn build_configs(
             dtype: model.dtype,
         },
         lm_head: SingleGemmKernelConfig {
-            backends: GEMM_BACKENDS.to_vec(),
+            backends: model.gemm_backends(),
             gpu_name: gpu.clone(),
             n: model.vocab,
             k: model.hidden,
-            dtype: model.dtype,
+            dtype: model.compute_dtype(),
         },
         num_layers: model.num_layers,
         ep_size: parallel.ep_size,

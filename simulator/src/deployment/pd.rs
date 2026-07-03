@@ -26,7 +26,6 @@ use crate::orchestrator::{
     DpPlacementPolicy, Flow, PdFlow, PlacementPolicy, SimpleDpPoolConfig, UnifiedWorkerFactory,
     PD_DECODE_POOL, PD_PREFILL_POOL,
 };
-use crate::timing::bridge::DType;
 use crate::timing::kernels::{P2pInterKernel, P2pInterKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{CostSource, IterWorkerSel, PdDecodeWorker, PdPrefillWorker, WorkerConfig};
@@ -266,9 +265,9 @@ where
 
 /// Build the PD KV-transfer cost source: the profiled `p2p_inter` curve for the
 /// receiver GPU. v1 assumes a cross-node (Infiniband) handoff over the `nccl`
-/// backend and a bf16 element dtype — the curve is keyed by message-size bytes,
-/// so dtype only selects the profiled table. Fabric/dtype become config when PD
-/// placement grows fabric awareness.
+/// backend; the curve is size-keyed (comm is modeled by message bytes, not
+/// dtype), so the KV handoff cost rides on the transferred byte count. Fabric
+/// becomes config when PD placement grows fabric awareness.
 fn build_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result<CostSource> {
     let kernel = P2pInterKernel::build(
         "pd_kv_transfer".to_string(),
@@ -276,7 +275,6 @@ fn build_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result
             backends: vec!["nccl"],
             gpu_name: gpu_name.to_string(),
             fabric: Fabric::Infiniband,
-            dtype: DType::Bf16,
         },
         bridge,
     )

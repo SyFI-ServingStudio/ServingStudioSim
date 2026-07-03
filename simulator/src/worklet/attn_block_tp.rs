@@ -36,8 +36,11 @@ pub struct AttnBlockTpWorkletConfig {
     pub num_qo_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
+    /// Base (16-bit) dtype — RMSNorm + attention output/decode-query keep it.
     pub dtype: DType,
-    pub kv_dtype: DType,
+    /// FP8 run: qkv / o_proj GEMMs + tp_allreduce move to fp8 (via `gemm_backends`
+    /// = deepgemm); the attention op derives its prefill/decode fp8 presets.
+    pub fp8: bool,
     pub tp_size: u16,
     pub allreduce_fabric: Fabric,
     pub gpu_name: String,
@@ -79,6 +82,14 @@ pub struct AttnBlockTpWorklet {
     resolved: AttnBlockTpWorkletResolved,
 }
 
+impl AttnBlockTpWorkletConfig {
+    /// KV cache dtype: fp8 in an fp8 run (both prefill and decode read fp8 KV),
+    /// else the base dtype. Used by the arch's KV-byte accounting (`raw_cfg`).
+    pub fn kv_dtype(&self) -> DType {
+        if self.fp8 { DType::Fp8E4m3 } else { self.dtype }
+    }
+}
+
 impl AttnBlockTpWorklet {
     pub fn resolve_config(cfg: &AttnBlockTpWorkletConfig) -> AttnBlockTpWorkletResolved {
         let tp = cfg.tp_size as u32;
@@ -104,6 +115,9 @@ impl AttnBlockTpWorklet {
         );
         let qo_pr = cfg.num_qo_heads / tp;
         let kv_pr = cfg.num_kv_heads / tp;
+        // Compute dtype: FP8 for the GEMMs + the tp_allreduce message (halved
+        // transfer); RMSNorm and the attention output keep the base `dtype`.
+        let compute = if cfg.fp8 { DType::Fp8E4m3 } else { cfg.dtype };
         AttnBlockTpWorkletResolved {
             input_norm: RmsNormKernelConfig {
                 backends: cfg.norm_backends.clone(),
@@ -117,7 +131,7 @@ impl AttnBlockTpWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: (qo_pr + 2 * kv_pr) * cfg.head_dim,
                 k: cfg.hidden,
-                dtype: cfg.dtype,
+                dtype: compute,
             },
             attn: FlashInferAttentionConfig {
                 backends: cfg.attn_backends.clone(),
@@ -125,9 +139,8 @@ impl AttnBlockTpWorklet {
                 num_qo_heads: qo_pr,
                 num_kv_heads: kv_pr,
                 head_dim: cfg.head_dim,
-                q_dtype: cfg.dtype,
-                kv_dtype: cfg.kv_dtype,
-                o_dtype: cfg.dtype,
+                dtype: cfg.dtype,
+                fp8: cfg.fp8,
             },
             o_proj: SingleGemmKernelConfig {
                 // row-parallel: input k = per-rank Q heads × head_dim; output n = hidden.
@@ -135,18 +148,19 @@ impl AttnBlockTpWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.hidden,
                 k: qo_pr * cfg.head_dim,
-                dtype: cfg.dtype,
+                dtype: compute,
             },
             tp_ar: (cfg.tp_size > 1).then(|| AllReduceKernelConfig {
+                // Comm is size-keyed: the all-reduce reads the fp8-width message
+                // bytes (`dtype_bytes` below) off a dtype-agnostic curve.
                 backends: cfg.allreduce_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_gpus: cfg.tp_size as u32,
                 fabric: cfg.allreduce_fabric,
-                dtype: cfg.dtype,
             }),
             num_qo_heads_per_rank: qo_pr,
             num_kv_heads_per_rank: kv_pr,
-            dtype_bytes: cfg.dtype.size_bytes(),
+            dtype_bytes: compute.size_bytes(),
             raw_cfg: cfg.clone(),
         }
     }
@@ -259,7 +273,7 @@ mod tests {
             num_kv_heads: 8,
             head_dim: 128,
             dtype: DType::Bf16,
-            kv_dtype: DType::Bf16,
+            fp8: false,
             tp_size,
             allreduce_fabric: Fabric::Nvlink,
             gpu_name: "H100".to_string(),
@@ -298,6 +312,22 @@ mod tests {
         let ar = r.tp_ar.expect("tp>1 must add allreduce");
         assert_eq!(ar.num_gpus, 4);
         assert_eq!(ar.fabric, Fabric::Nvlink);
+    }
+
+    #[test]
+    fn fp8_moves_gemms_to_compute_dtype_but_norm_stays_base() {
+        let mut c = cfg(4);
+        c.fp8 = true;
+        c.gemm_backends = vec!["deepgemm"];
+        let r = AttnBlockTpWorklet::resolve_config(&c);
+        // GEMMs + allreduce byte width go fp8; RMSNorm keeps the base bf16.
+        assert_eq!(r.qkv.dtype, DType::Fp8E4m3);
+        assert_eq!(r.o_proj.dtype, DType::Fp8E4m3);
+        assert_eq!(r.input_norm.dtype, DType::Bf16);
+        assert_eq!(r.dtype_bytes, DType::Fp8E4m3.size_bytes());
+        // The attention op carries the base dtype + fp8 flag (it owns the preset).
+        assert_eq!(r.attn.dtype, DType::Bf16);
+        assert!(r.attn.fp8);
     }
 
     #[test]

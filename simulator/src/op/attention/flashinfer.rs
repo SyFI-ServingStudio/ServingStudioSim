@@ -32,18 +32,28 @@ use crate::timing::{
     Probe,
 };
 
-/// Single op-level config; expands into the two sub-kernel configs (their field
-/// sets are identical, so this is their shared union). L2 design §3.5-1.
+/// Single op-level config; expands into the two sub-kernel configs. The op owns
+/// the FP8 precision policy: `dtype` is the base (16-bit) dtype and `fp8` picks
+/// the per-phase preset (mirrors ref `python_bridge.rs prefill_dtypes` /
+/// `decode_dtypes`):
+///   - prefill / chunked → **fp8816** (q=fp8, kv=fp8, o=bf16) on backend `fa3`.
+///   - decode → **fp16816** (q=bf16, kv=fp8, o=bf16) on backend `fa2` — decode is
+///     KV-bandwidth bound, so only the KV cache is fp8, the query stays 16-bit.
+/// Non-fp8 keeps everything at `dtype` on the caller's `backends`. L2 design §3.5-1.
 #[derive(Clone, Debug)]
 pub struct FlashInferAttentionConfig {
+    /// Backends for the non-fp8 path (best-of-N). In fp8 mode the op overrides
+    /// them per phase (prefill=fa3, decode=fa2), so this is ignored there.
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
     pub num_qo_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
-    pub q_dtype: DType,
-    pub kv_dtype: DType,
-    pub o_dtype: DType,
+    /// Base (16-bit) dtype — the attention output and (fp16816) decode query. In
+    /// non-fp8 it is also q/kv.
+    pub dtype: DType,
+    /// FP8 run: prefill q/kv → fp8 (fp8816), decode kv → fp8 (fp16816).
+    pub fp8: bool,
 }
 
 /// Op-level input: raw per-request data for one attention call in the sim batch
@@ -57,6 +67,14 @@ pub struct FlashInferAttentionInput {
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
     /// Every decode request's KV length (each contributes one `q = 1` token).
     pub decode_kv_lens: Vec<u32>,
+}
+
+impl FlashInferAttentionConfig {
+    /// KV cache dtype: fp8 in an fp8 run (both prefill and decode read fp8 KV),
+    /// else the base dtype. Used by the arch's KV-byte accounting.
+    pub fn kv_dtype(&self) -> DType {
+        if self.fp8 { DType::Fp8E4m3 } else { self.dtype }
+    }
 }
 
 pub struct FlashInferAttentionOp {
@@ -152,29 +170,44 @@ impl FlashInferAttentionOp {
 
 // ─── internal helpers (pure; unit-tested without a bridge) ───────────────────
 
+/// Prefill / chunked preset. fp8 → **fp8816** (q=fp8, kv=fp8, o=base) on `fa3`
+/// (fa2 has no fp8-query kernel); else base dtype on the caller's backends.
 fn prefill_config(cfg: &FlashInferAttentionConfig) -> FlashinferAttnPrefillKernelConfig {
+    let (backends, q, kv) = if cfg.fp8 {
+        (vec!["fa3"], DType::Fp8E4m3, DType::Fp8E4m3)
+    } else {
+        (cfg.backends.clone(), cfg.dtype, cfg.dtype)
+    };
     FlashinferAttnPrefillKernelConfig {
-        backends: cfg.backends.clone(),
+        backends,
         gpu_name: cfg.gpu_name.clone(),
         num_qo_heads: cfg.num_qo_heads,
         num_kv_heads: cfg.num_kv_heads,
         head_dim: cfg.head_dim,
-        q_dtype: cfg.q_dtype,
-        kv_dtype: cfg.kv_dtype,
-        o_dtype: cfg.o_dtype,
+        q_dtype: q,
+        kv_dtype: kv,
+        o_dtype: cfg.dtype,
     }
 }
 
+/// Decode preset. fp8 → **fp16816** (q=base bf16, kv=fp8, o=base) on `fa2` —
+/// decode is KV-bandwidth bound, so only the KV cache is fp8; else base dtype on
+/// the caller's backends.
 fn decode_config(cfg: &FlashInferAttentionConfig) -> FlashinferAttnDecodeKernelConfig {
+    let (backends, kv) = if cfg.fp8 {
+        (vec!["fa2"], DType::Fp8E4m3)
+    } else {
+        (cfg.backends.clone(), cfg.dtype)
+    };
     FlashinferAttnDecodeKernelConfig {
-        backends: cfg.backends.clone(),
+        backends,
         gpu_name: cfg.gpu_name.clone(),
         num_qo_heads: cfg.num_qo_heads,
         num_kv_heads: cfg.num_kv_heads,
         head_dim: cfg.head_dim,
-        q_dtype: cfg.q_dtype,
-        kv_dtype: cfg.kv_dtype,
-        o_dtype: cfg.o_dtype,
+        q_dtype: cfg.dtype,
+        kv_dtype: kv,
+        o_dtype: cfg.dtype,
     }
 }
 
@@ -192,7 +225,49 @@ fn decode_input(decode_kv_lens: &[u32]) -> Option<FlashinferAttnDecodeKernelInpu
 
 #[cfg(test)]
 mod tests {
-    use super::decode_input;
+    use super::{decode_config, decode_input, prefill_config, FlashInferAttentionConfig};
+    use crate::timing::bridge::DType;
+
+    fn cfg(fp8: bool) -> FlashInferAttentionConfig {
+        FlashInferAttentionConfig {
+            backends: vec!["fa2", "fa3"],
+            gpu_name: "H200".to_string(),
+            num_qo_heads: 8,
+            num_kv_heads: 2,
+            head_dim: 128,
+            dtype: DType::Bf16,
+            fp8,
+        }
+    }
+
+    #[test]
+    fn fp8_prefill_is_fp8816_on_fa3() {
+        let p = prefill_config(&cfg(true));
+        assert_eq!(p.backends, vec!["fa3"]);
+        assert_eq!(p.q_dtype, DType::Fp8E4m3);
+        assert_eq!(p.kv_dtype, DType::Fp8E4m3);
+        assert_eq!(p.o_dtype, DType::Bf16);
+    }
+
+    #[test]
+    fn fp8_decode_is_fp16816_on_fa2() {
+        let d = decode_config(&cfg(true));
+        assert_eq!(d.backends, vec!["fa2"]);
+        assert_eq!(d.q_dtype, DType::Bf16); // decode query stays 16-bit
+        assert_eq!(d.kv_dtype, DType::Fp8E4m3);
+        assert_eq!(d.o_dtype, DType::Bf16);
+    }
+
+    #[test]
+    fn non_fp8_keeps_base_dtype_and_backends_both_phases() {
+        let p = prefill_config(&cfg(false));
+        let d = decode_config(&cfg(false));
+        assert_eq!(p.backends, vec!["fa2", "fa3"]);
+        assert_eq!(d.backends, vec!["fa2", "fa3"]);
+        for dt in [p.q_dtype, p.kv_dtype, p.o_dtype, d.q_dtype, d.kv_dtype, d.o_dtype] {
+            assert_eq!(dt, DType::Bf16);
+        }
+    }
 
     #[test]
     fn decode_collapses_to_count_and_total_kv() {

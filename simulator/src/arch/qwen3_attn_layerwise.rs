@@ -39,7 +39,10 @@ use crate::worklet::{AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWo
 // Backend / fabric policy for this arch's attention block. Local copy — the AFD
 // archs are self-contained (no shared arch-level config).
 const NORM_BACKENDS: &[&str] = &["flashinfer"];
-const GEMM_BACKENDS: &[&str] = &["torch"];
+// GEMM backends (qkv/o_proj) are chosen by dtype via `model.gemm_backends()`
+// (torch / deepgemm). NOTE: only the `.attn` sub-kernel of the resolved block is
+// used on this AFD attn side, so these GEMM fields feed the head-split resolve
+// but do not reach the cost path here (the ffn side owns qkv/o_proj cost).
 // See llama3_dense: FlashInfer impls registered under fa2/fa3, not "flashinfer".
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];
 // nccl + nvshmem: the cost engine evals both and keeps the faster per op
@@ -62,12 +65,12 @@ fn attn_block_config(
         num_kv_heads: model.num_kv_heads,
         head_dim: model.head_dim,
         dtype: model.dtype,
-        kv_dtype: model.kv_dtype,
+        fp8: model.fp8,
         tp_size: attn_tp_size,
         allreduce_fabric: TP_FABRIC,
         gpu_name: gpu_name.to_string(),
         norm_backends: NORM_BACKENDS.to_vec(),
-        gemm_backends: GEMM_BACKENDS.to_vec(),
+        gemm_backends: model.gemm_backends(),
         attn_backends: ATTN_BACKENDS.to_vec(),
         allreduce_backends: ALLREDUCE_BACKENDS.to_vec(),
     }
@@ -121,7 +124,9 @@ pub fn build_configs(
     parallel: &Qwen3AttnParallel,
 ) -> Qwen3AttnLayerwiseConfigs {
     assert!(parallel.attn_tp_size > 0, "attn_tp_size must be non-zero");
-    let dtype_bytes = model.dtype.size_bytes() as u64;
+    // attn → ffn handoff ships the (fp8-castable) attention output → compute dtype
+    // width, matching the ffn side's `ffn_to_attn` handoff (both fp8 in an fp8 run).
+    let dtype_bytes = model.compute_dtype().size_bytes() as u64;
     Qwen3AttnLayerwiseConfigs {
         attn_block: attn_block_config(model, parallel.attn_tp_size, &parallel.gpu_name),
         num_layers: model.num_layers,

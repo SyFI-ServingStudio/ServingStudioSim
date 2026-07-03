@@ -30,8 +30,18 @@ pub struct MoeModelCfg {
     pub head_dim: u32,
     pub vocab: u32,
     pub num_layers: u32,
+    /// The model's native dtype (from JSON `torch_dtype`, e.g. bf16). This is the
+    /// dtype for the ops that stay 16-bit in an FP8 run — RMSNorm, the attention
+    /// output, and the decode query. FP8 GEMM/attention inputs use
+    /// [`Self::compute_dtype`] instead.
     pub dtype: DType,
+    /// KV cache dtype — FP8 in an FP8 run (KV is bandwidth/capacity bound), else
+    /// the model's base `dtype`.
     pub kv_dtype: DType,
+    /// Whether this run executes in FP8 (weights + prefill attention q/kv + KV +
+    /// all byte transfers at 1 B/elem). Drives GEMM backend (deepgemm) and
+    /// [`Self::compute_dtype`]. Set from `ModelSpec.fp8` at build time.
+    pub fp8: bool,
     /// Total expert count across all EP ranks (not per-rank).
     pub num_experts: u32,
     /// Experts each token selects (without replacement).
@@ -63,10 +73,42 @@ impl MoeModelCfg {
             num_layers: raw.num_hidden_layers,
             dtype,
             kv_dtype: dtype,
+            fp8: false,
             num_experts: raw.num_experts,
             top_k: raw.num_experts_per_tok,
             moe_intermediate: raw.moe_intermediate_size,
         })
+    }
+
+    /// The compute dtype for GEMMs and prefill attention q/kv: FP8 in an FP8 run,
+    /// else the model's base `dtype`. In a non-FP8 run `compute_dtype() == dtype`.
+    pub fn compute_dtype(&self) -> DType {
+        if self.fp8 { DType::Fp8E4m3 } else { self.dtype }
+    }
+
+    /// Turn FP8 on/off. FP8 moves the KV cache to FP8; the base `dtype` is left
+    /// as the model's native (bf16) dtype — it is what the 16-bit-holdout ops
+    /// (RMSNorm, attention output, decode query) keep using.
+    pub fn with_fp8(mut self, fp8: bool) -> Self {
+        self.fp8 = fp8;
+        if fp8 {
+            self.kv_dtype = DType::Fp8E4m3;
+        }
+        self
+    }
+
+    /// GEMM backend list for this run: the FP8 DeepGEMM backend when fp8, else
+    /// torch. The same choice serves `single_gemm` (qkv / o_proj / router /
+    /// lm_head) and `grouped_gemm` (MoE experts) — both have exactly these two
+    /// backends and fp8 ⇒ deepgemm. Exactly ONE backend by dtype, never both: a
+    /// `torch@fp8` or `deepgemm@bf16` lookup has no rows and would abort the
+    /// build (`MissingEntry`), not fall back.
+    pub fn gemm_backends(&self) -> Vec<&'static str> {
+        if self.fp8 {
+            vec!["deepgemm"]
+        } else {
+            vec!["torch"]
+        }
     }
 }
 
@@ -115,6 +157,7 @@ impl MoeModelCfg {
             num_layers: 94,
             dtype: DType::Bf16,
             kv_dtype: DType::Bf16,
+            fp8: false,
             num_experts: 128,
             top_k: 8,
             moe_intermediate: 3072,
@@ -155,6 +198,22 @@ mod tests {
         assert_eq!(cfg.top_k, 8);
         assert_eq!(cfg.moe_intermediate, 3072);
         assert_eq!(cfg.dtype, DType::Bf16);
+    }
+
+    #[test]
+    fn with_fp8_flips_compute_and_kv_dtype_but_not_base() {
+        let bf16 = MoeModelCfg::qwen3_235b();
+        assert!(!bf16.fp8);
+        assert_eq!(bf16.compute_dtype(), DType::Bf16);
+        assert_eq!(bf16.kv_dtype, DType::Bf16);
+
+        let fp8 = MoeModelCfg::qwen3_235b().with_fp8(true);
+        assert!(fp8.fp8);
+        // Base dtype stays bf16 (norm / attn-o / decode-q keep it); compute + KV
+        // move to fp8.
+        assert_eq!(fp8.dtype, DType::Bf16);
+        assert_eq!(fp8.compute_dtype(), DType::Fp8E4m3);
+        assert_eq!(fp8.kv_dtype, DType::Fp8E4m3);
     }
 
     #[test]

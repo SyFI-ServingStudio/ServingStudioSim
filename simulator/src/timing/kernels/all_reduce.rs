@@ -1,5 +1,13 @@
-//! All-reduce collective kernel: one cached perf model per
-//! `(num_gpus, fabric, dtype)` config, swept over `message_size_bytes`.
+//! All-reduce collective kernel: one cached perf model per `(num_gpus, fabric)`
+//! config, swept over `message_size_bytes`.
+//!
+//! Comm cost is size-keyed, NOT dtype-keyed: the collective's cost is dominated
+//! by the `busbw`-bound bytes moved, so the curve is `time_ms` vs
+//! `message_size_bytes` and dtype is not a cache axis. An fp8 payload is simply
+//! fewer bytes on the same curve (the caller passes the fp8-width
+//! `message_size_bytes`) — and NCCL has no fp8 reduction anyway. The kernel is
+//! profiled once at bf16 (the `enumerate` `dtype` field is a fixed profiling
+//! artifact, kept only to stay aligned with the Python `AllReduceArgs` schema).
 //!
 //! Everything generic (build / eval / the `Probe` impl / for-backend loops)
 //! lives in `engine::Kernel<S>`. This file declares the all-reduce-specific
@@ -34,7 +42,6 @@ pub struct AllReduceKernelConfig {
     pub gpu_name: String,
     pub num_gpus: u32,
     pub fabric: Fabric,
-    pub dtype: DType,
 }
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
@@ -77,7 +84,9 @@ impl KernelSpec for AllReduceSpec {
                 .with("backend", backend)
                 .with("num_gpus", config.num_gpus)
                 .with("message_size_bytes", message_size as u64)
-                .with("dtype", config.dtype.as_str())
+                // Fixed profiling dtype: comm is size-keyed (see module doc), the
+                // curve is measured once at bf16 for every logical payload dtype.
+                .with("dtype", DType::Bf16.as_str())
                 .with("fabric", config.fabric.as_str())
         })
     }
@@ -89,7 +98,6 @@ register_kernel!(AllReduceKernel, AllReduceSpec);
 mod tests {
     use super::{AllReduceKernelConfig, AllReduceKernelInput, AllReduceSpec};
     use crate::common::Fabric;
-    use crate::timing::bridge::DType;
     use crate::timing::cache::CacheKind;
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::SweepCoords;
@@ -101,7 +109,6 @@ mod tests {
             gpu_name: "H100".to_string(),
             num_gpus: 8,
             fabric: Fabric::Nvlink,
-            dtype: DType::Bf16,
         }
     }
 
@@ -111,7 +118,6 @@ mod tests {
         assert_eq!(c.backends, vec!["nccl"]);
         assert_eq!(c.num_gpus, 8);
         assert_eq!(c.fabric, Fabric::Nvlink);
-        assert_eq!(c.dtype, DType::Bf16);
     }
 
     #[test]
@@ -119,7 +125,7 @@ mod tests {
         // Every field in declaration order, no struct-name/braces wrapper.
         assert_eq!(
             cfg().describe_config(),
-            r#"backends=["nccl"] gpu_name="H100" num_gpus=8 fabric=Nvlink dtype=Bf16"#
+            r#"backends=["nccl"] gpu_name="H100" num_gpus=8 fabric=Nvlink"#
         );
     }
 

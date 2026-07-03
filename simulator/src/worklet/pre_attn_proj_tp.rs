@@ -32,7 +32,10 @@ pub struct PreAttnProjTpWorkletConfig {
     pub num_qo_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
+    /// Base (16-bit) dtype — the input RMSNorm keeps it.
     pub dtype: DType,
+    /// Compute dtype (fp8 in an fp8 run, else == `dtype`) — the QKV GEMM uses it.
+    pub compute_dtype: DType,
     pub tp_size: u16,
     pub gpu_name: String,
     pub norm_backends: Vec<&'static str>,
@@ -100,7 +103,7 @@ impl PreAttnProjTpWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: (qo_pr + 2 * kv_pr) * cfg.head_dim,
                 k: cfg.hidden,
-                dtype: cfg.dtype,
+                dtype: cfg.compute_dtype,
             },
             num_qo_heads_per_rank: qo_pr,
             num_kv_heads_per_rank: kv_pr,
@@ -172,6 +175,7 @@ mod tests {
             num_kv_heads: 8,
             head_dim: 128,
             dtype: DType::Bf16,
+            compute_dtype: DType::Bf16,
             tp_size,
             gpu_name: "H100".to_string(),
             norm_backends: vec!["flashinfer"],
@@ -202,5 +206,16 @@ mod tests {
     #[should_panic(expected = "num_kv_heads")]
     fn tp_indivisible_kv_heads_panics() {
         let _ = PreAttnProjTpWorklet::resolve_config(&cfg(16));
+    }
+
+    #[test]
+    fn fp8_moves_qkv_to_compute_dtype_but_norm_stays_base() {
+        let mut c = cfg(4);
+        c.compute_dtype = DType::Fp8E4m3;
+        c.gemm_backends = vec!["deepgemm"];
+        let r = PreAttnProjTpWorklet::resolve_config(&c);
+        // QKV GEMM goes fp8; the input RMSNorm keeps the base bf16.
+        assert_eq!(r.qkv.dtype, DType::Fp8E4m3);
+        assert_eq!(r.input_norm.dtype, DType::Bf16);
     }
 }

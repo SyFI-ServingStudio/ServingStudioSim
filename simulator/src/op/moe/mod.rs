@@ -48,23 +48,23 @@ pub struct MoeNetConfig {
 }
 
 impl MoeNetConfig {
-    /// The intra-domain (NVLink) p2p sub-kernel config.
+    /// The intra-domain (NVLink) p2p sub-kernel config. Comm is size-keyed, so
+    /// `self.dtype` does not enter here — it drives only the `hidden_bytes`
+    /// message width in `net_params` (fp8 → half the bytes on the same curve).
     pub(crate) fn p2p_intra_config(&self) -> P2pIntraKernelConfig {
         P2pIntraKernelConfig {
             backends: self.backends.clone(),
             gpu_name: self.gpu_name.clone(),
             fabric: self.intra_fabric,
-            dtype: self.dtype,
         }
     }
 
-    /// The inter-domain (NIC) p2p sub-kernel config.
+    /// The inter-domain (NIC) p2p sub-kernel config. Size-keyed (see above).
     pub(crate) fn p2p_inter_config(&self) -> P2pInterKernelConfig {
         P2pInterKernelConfig {
             backends: self.backends.clone(),
             gpu_name: self.gpu_name.clone(),
             fabric: self.inter_fabric,
-            dtype: self.dtype,
         }
     }
 

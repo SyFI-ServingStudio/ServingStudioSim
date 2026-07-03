@@ -75,16 +75,13 @@ use crate::worklet::{
 };
 
 const NORM_BACKENDS: &[&str] = &["flashinfer"];
-const GEMM_BACKENDS: &[&str] = &["torch"];
+// Dense + grouped GEMM backends are dtype-driven (`MoeModelCfg::gemm_backends()`):
+// fp8 runs select the FP8-only `deepgemm`, bf16 runs `torch`. A GEMM never lists a
+// backend without rows for its dtype (that would abort the build at prewarm).
 const ACT_BACKENDS: &[&str] = &["triton"];
 // See llama3_dense: FlashInfer impls registered under fa2/fa3, not "flashinfer".
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];
 const ALLREDUCE_BACKENDS: &[&str] = &["nccl"];
-// torch `_grouped_mm` runs the expert GEMM at the model's compute dtype (bf16);
-// the deepgemm backend is FP8-only and would otherwise silently run FP8 under a
-// bf16/fp16 (`fp8: false`) config. Switch to deepgemm only when an FP8 path is
-// wired (precision currently rides on `model.dtype`, see note below).
-const GROUPED_GEMM_BACKENDS: &[&str] = &["torch"];
 // p2p backend for both MoE dispatch (inter+intra) and combine. nccl is the
 // portable choice; nvshmem (DeepEP) can be plugged via this constant once its
 // L1 kernel is wired everywhere this arch runs.
@@ -197,12 +194,12 @@ fn attn_block_config(
         num_kv_heads: model.num_kv_heads,
         head_dim: model.head_dim,
         dtype: model.dtype,
-        kv_dtype: model.kv_dtype,
+        fp8: model.fp8,
         tp_size: attn_tp_size,
         allreduce_fabric: TP_FABRIC,
         gpu_name: gpu_name.to_string(),
         norm_backends: NORM_BACKENDS.to_vec(),
-        gemm_backends: GEMM_BACKENDS.to_vec(),
+        gemm_backends: model.gemm_backends(),
         attn_backends: ATTN_BACKENDS.to_vec(),
         allreduce_backends: ALLREDUCE_BACKENDS.to_vec(),
     }
@@ -214,7 +211,9 @@ pub fn build_configs(
     routing: &RoutingDistribution,
 ) -> Qwen3MoeDpAttnEpFfnConfigs {
     let gpu = &parallel.gpu_name;
-    let dtype_bytes = model.dtype.size_bytes();
+    // Byte-transfer widths (local reduce, embed) use the compute dtype: fp8 halves
+    // the wire size, bf16 leaves it unchanged. The RMSNorm ops keep `model.dtype`.
+    let dtype_bytes = model.compute_dtype().size_bytes();
     assert!(
         parallel.attn_tp_size > 0 && parallel.ep_size > 0,
         "attn_tp_size / ep_size must be non-zero"
@@ -261,7 +260,9 @@ pub fn build_configs(
     let moe_net = MoeNetConfig {
         backends: P2P_BACKENDS.to_vec(),
         gpu_name: gpu.clone(),
-        dtype: model.dtype,
+        // dispatch/combine ship the hidden activation → compute dtype (fp8 halves
+        // the all-to-all payload).
+        dtype: model.compute_dtype(),
         intra_fabric: MOE_INTRA_FABRIC,
         inter_fabric: MOE_INTER_FABRIC,
         ep_size: u32::from(parallel.ep_size),
@@ -279,20 +280,23 @@ pub fn build_configs(
             hidden: model.hidden,
             num_experts: model.num_experts,
             dtype: model.dtype,
+            compute_dtype: model.compute_dtype(),
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
-            gemm_backends: GEMM_BACKENDS.to_vec(),
+            gemm_backends: model.gemm_backends(),
         },
         moe_dispatch: moe_net.clone(),
+        // MoE expert compute is all-fp8 in an fp8 run (grouped GEMMs + SwiGLU act);
+        // no RMSNorm inside, so the whole worklet takes the compute dtype.
         moe_expert_compute: MoeExpertComputeLocalWorkletConfig {
             hidden: model.hidden,
             moe_intermediate: model.moe_intermediate,
             num_experts: model.num_experts,
             ep_size: parallel.ep_size,
-            dtype: model.dtype,
+            dtype: model.compute_dtype(),
             gpu_name: gpu.clone(),
             act_backends: ACT_BACKENDS.to_vec(),
-            grouped_gemm_backends: GROUPED_GEMM_BACKENDS.to_vec(),
+            grouped_gemm_backends: model.gemm_backends(),
             local_ppm,
         },
         // Conservative v1 model: per home-rank token, read+write one full hidden
@@ -321,11 +325,11 @@ pub fn build_configs(
         },
         // Replicated full lm_head for v1 (vocab-parallel split deferred).
         lm_head: SingleGemmKernelConfig {
-            backends: GEMM_BACKENDS.to_vec(),
+            backends: model.gemm_backends(),
             gpu_name: gpu.clone(),
             n: model.vocab,
             k: model.hidden,
-            dtype: model.dtype,
+            dtype: model.compute_dtype(),
         },
         num_layers: model.num_layers,
         attn_tp_size: parallel.attn_tp_size,
@@ -346,7 +350,7 @@ fn total_kv_bytes_per_token(resolved: &Qwen3MoeDpAttnEpFfnResolved) -> u64 {
     let raw = &resolved.attn_block.raw_cfg;
     2 * raw.num_kv_heads as u64
         * raw.head_dim as u64
-        * raw.kv_dtype.size_bytes() as u64
+        * raw.kv_dtype().size_bytes() as u64
         * resolved.num_layers as u64
 }
 

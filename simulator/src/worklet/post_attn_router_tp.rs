@@ -44,7 +44,11 @@ pub struct PostAttnRouterTpWorkletConfig {
     pub num_qo_heads: u32,
     pub head_dim: u32,
     pub num_experts: u32,
+    /// Base (16-bit) dtype — the post-attention RMSNorm keeps it.
     pub dtype: DType,
+    /// Compute dtype (fp8 in an fp8 run, else == `dtype`) — o_proj / router GEMMs
+    /// and the row-parallel all-reduce message width use it.
+    pub compute_dtype: DType,
     pub tp_size: u16,
     pub allreduce_fabric: Fabric,
     pub gpu_name: String,
@@ -99,25 +103,27 @@ impl PostAttnRouterTpWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.hidden,
                 k: qo_pr * cfg.head_dim,
-                dtype: cfg.dtype,
+                dtype: cfg.compute_dtype,
             },
             tp_ar: (cfg.tp_size > 1).then(|| AllReduceKernelConfig {
+                // Comm is size-keyed: the all-reduce reads the fp8-width message
+                // bytes (`dtype_bytes` below) off a dtype-agnostic curve.
                 backends: cfg.allreduce_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_gpus: cfg.tp_size as u32,
                 fabric: cfg.allreduce_fabric,
-                dtype: cfg.dtype,
             }),
             router: MoeRouterLocalWorklet::resolve_config(&MoeRouterLocalWorkletConfig {
                 hidden: cfg.hidden,
                 num_experts: cfg.num_experts,
                 dtype: cfg.dtype,
+                compute_dtype: cfg.compute_dtype,
                 gpu_name: cfg.gpu_name.clone(),
                 norm_backends: cfg.norm_backends.clone(),
                 gemm_backends: cfg.gemm_backends.clone(),
             }),
             num_qo_heads_per_rank: qo_pr,
-            dtype_bytes: cfg.dtype.size_bytes(),
+            dtype_bytes: cfg.compute_dtype.size_bytes(),
             raw_cfg: cfg.clone(),
         }
     }
@@ -204,6 +210,7 @@ mod tests {
             head_dim: 128,
             num_experts: 128,
             dtype: DType::Bf16,
+            compute_dtype: DType::Bf16,
             tp_size,
             allreduce_fabric: Fabric::Nvlink,
             gpu_name: "H100".to_string(),
@@ -246,5 +253,22 @@ mod tests {
     fn tp_indivisible_qo_heads_panics() {
         // 32 qo heads, tp=5 → 32 % 5 != 0.
         let _ = PostAttnRouterTpWorklet::resolve_config(&cfg(5));
+    }
+
+    #[test]
+    fn fp8_moves_gemms_and_allreduce_to_compute_dtype_but_norm_stays_base() {
+        let mut c = cfg(4);
+        c.compute_dtype = DType::Fp8E4m3;
+        c.gemm_backends = vec!["deepgemm"];
+        let r = PostAttnRouterTpWorklet::resolve_config(&c);
+        // o_proj + router GEMMs and the all-reduce message width go fp8; both
+        // norms (composed post-attention RMSNorm) keep the base bf16. The
+        // all-reduce config itself is dtype-agnostic (size-keyed comm), so the
+        // fp8-ness rides on `dtype_bytes` (the message width), not a config dtype.
+        assert_eq!(r.o_proj.dtype, DType::Fp8E4m3);
+        assert_eq!(r.router.router.dtype, DType::Fp8E4m3);
+        assert_eq!(r.dtype_bytes, DType::Fp8E4m3.size_bytes());
+        assert_eq!(r.router.post_norm.dtype, DType::Bf16);
+        assert!(r.tp_ar.is_some(), "tp>1 must add an all-reduce");
     }
 }

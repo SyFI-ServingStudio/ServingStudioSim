@@ -19,9 +19,9 @@ pub struct AttnLocalWorkletConfig {
     pub num_qo_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
-    pub q_dtype: DType,
-    pub kv_dtype: DType,
-    pub o_dtype: DType,
+    /// Base (16-bit) dtype; `fp8` picks the per-phase preset inside the op.
+    pub dtype: DType,
+    pub fp8: bool,
     pub gpu_name: String,
     pub backends: Vec<&'static str>,
 }
@@ -55,9 +55,8 @@ impl AttnLocalWorklet {
                 num_qo_heads: cfg.num_qo_heads,
                 num_kv_heads: cfg.num_kv_heads,
                 head_dim: cfg.head_dim,
-                q_dtype: cfg.q_dtype,
-                kv_dtype: cfg.kv_dtype,
-                o_dtype: cfg.o_dtype,
+                dtype: cfg.dtype,
+                fp8: cfg.fp8,
             },
             raw_cfg: cfg.clone(),
         }
@@ -113,9 +112,8 @@ mod tests {
             num_qo_heads: 32,
             num_kv_heads: 8,
             head_dim: 128,
-            q_dtype: DType::Bf16,
-            kv_dtype: DType::Bf16,
-            o_dtype: DType::Bf16,
+            dtype: DType::Bf16,
+            fp8: false,
             gpu_name: "H100".to_string(),
             backends: vec!["fa2", "fa3"],
         }

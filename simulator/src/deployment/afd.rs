@@ -27,7 +27,6 @@ use crate::orchestrator::config::{GroupSpec, PoolSpec};
 use crate::orchestrator::{
     AfdAttnPoolController, AfdFfnPoolController, AfdFlow, Flow, AFD_ATTN_POOL, AFD_FFN_POOL,
 };
-use crate::timing::bridge::DType;
 use crate::timing::kernels::{P2pInterKernel, P2pInterKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
@@ -254,10 +253,11 @@ where
 
 /// Build the AFD attn↔ffn transfer cost source: the profiled `p2p_inter` curve for
 /// the receiver GPU (same kernel PD uses for its KV handoff). v1 assumes a
-/// cross-node (Infiniband) transfer with a bf16 element dtype — the curve is keyed
-/// by message-size bytes, so dtype only selects the profiled table. Lists nccl +
-/// nvshmem for parity with the collective ops (best-of-N picks the faster); note
-/// p2p_inter is an analytical, backend-agnostic curve, so both resolve alike here.
+/// cross-node (Infiniband) transfer; the curve is size-keyed (comm is modeled by
+/// message bytes, not dtype), so an fp8 handoff is just fewer bytes on the same
+/// curve — the fp8-width byte count is supplied by the arch's handoff size. Lists
+/// nccl + nvshmem for parity with the collective ops (best-of-N picks the faster);
+/// note p2p_inter is an analytical, backend-agnostic curve, so both resolve alike.
 fn build_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result<CostSource> {
     let kernel = P2pInterKernel::build(
         "afd_qkv_transfer".to_string(),
@@ -265,7 +265,6 @@ fn build_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result
             backends: vec!["nccl", "nvshmem"],
             gpu_name: gpu_name.to_string(),
             fabric: Fabric::Infiniband,
-            dtype: DType::Bf16,
         },
         bridge,
     )

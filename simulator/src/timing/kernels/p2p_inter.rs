@@ -1,5 +1,12 @@
-//! Inter-domain point-to-point kernel: one cached perf model per
-//! `(fabric, dtype)` config, swept over `message_size_bytes`.
+//! Inter-domain point-to-point kernel: one cached perf model per `fabric`
+//! config, swept over `message_size_bytes`.
+//!
+//! Comm cost is size-keyed, NOT dtype-keyed: a byte is a byte on the wire, so
+//! the curve is `time_ms` vs `message_size_bytes` and dtype is not a cache axis.
+//! An fp8 payload is simply fewer bytes on the same curve (the caller passes the
+//! fp8-width `message_size_bytes`). The kernel is profiled once at bf16 (the
+//! `enumerate` `dtype` field is a fixed profiling artifact, kept only to stay
+//! aligned with the Python `P2pInterArgs` wire schema).
 //!
 //! This is the inter-NVL-domain (cross-node NIC) leg of the MoE network model
 //! (ref's `get_inter_device_p2p_times_batch` curve in `common_timing.rs`). A
@@ -26,7 +33,6 @@ pub struct P2pInterKernelConfig {
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
     pub fabric: Fabric,
-    pub dtype: DType,
 }
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
@@ -61,7 +67,9 @@ impl KernelSpec for P2pInterSpec {
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("message_size_bytes", message_size as u64)
-                .with("dtype", config.dtype.as_str())
+                // Fixed profiling dtype: comm is size-keyed (see module doc), the
+                // curve is measured once at bf16 for every logical payload dtype.
+                .with("dtype", DType::Bf16.as_str())
                 .with("fabric", config.fabric.as_str())
         })
     }
@@ -73,7 +81,6 @@ register_kernel!(P2pInterKernel, P2pInterSpec);
 mod tests {
     use super::{P2pInterKernelConfig, P2pInterKernelInput, P2pInterSpec};
     use crate::common::Fabric;
-    use crate::timing::bridge::DType;
     use crate::timing::cache::CacheKind;
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::SweepCoords;
@@ -84,7 +91,6 @@ mod tests {
             backends: vec!["nccl"],
             gpu_name: "H100".to_string(),
             fabric: Fabric::Infiniband,
-            dtype: DType::Bf16,
         }
     }
 
@@ -93,14 +99,13 @@ mod tests {
         let c = cfg();
         assert_eq!(c.backends, vec!["nccl"]);
         assert_eq!(c.fabric, Fabric::Infiniband);
-        assert_eq!(c.dtype, DType::Bf16);
     }
 
     #[test]
     fn describe_config_renders_tidy_field_list() {
         assert_eq!(
             cfg().describe_config(),
-            r#"backends=["nccl"] gpu_name="H100" fabric=Infiniband dtype=Bf16"#
+            r#"backends=["nccl"] gpu_name="H100" fabric=Infiniband"#
         );
     }
 

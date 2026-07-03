@@ -45,7 +45,10 @@ pub fn moe_model_cfg(model_spec: &ModelSpec) -> Result<MoeModelCfg> {
     if let Some(n) = model_spec.sim_num_layers.or(model_spec.num_layers) {
         cfg.num_layers = n;
     }
-    Ok(cfg)
+    // Fold the `fp8` selector in here — the single choke point every MoE builder
+    // (unified + both AFD sides) passes through — so FP8 backend/dtype selection
+    // is uniform across archs.
+    Ok(cfg.with_fp8(model_spec.fp8))
 }
 
 /// Resolve the MoE routing distribution the L2 MoE op samples against from the
@@ -293,5 +296,100 @@ mod tests {
         // ffn→attn outgoing bytes (QKV projection) is the symmetric `(q+2kv)·bpe`,
         // computed in `qwen3_ffn_moe_layerwise::build` from the same model dims.
         let _ffn_to_attn = (q_dim + 2 * kv_dim) * bpe;
+    }
+
+    /// FP8 AFD end-to-end config wiring: every GEMM/handoff/KV role goes fp8
+    /// (`bpe = 1`, `deepgemm` backend, `compute_dtype = Fp8E4m3`) while the RMSNorm
+    /// ops and the model's base `dtype` stay bf16 (`bpe = 2`). Mirrors ref's
+    /// `bytes_per_element(p.fp8)` — the attn↔ffn handoffs and KV cache are all
+    /// 1 byte/elem in fp8.
+    #[test]
+    fn fp8_afd_configs_are_one_byte_per_element_and_deepgemm() {
+        use crate::timing::bridge::DType;
+        use crate::timing::routing::RoutingDistribution;
+
+        let model = MoeModelCfg::qwen3_235b().with_fp8(true);
+        // Base dtype is untouched (bf16); only the derived compute/kv dtypes flip.
+        assert_eq!(model.dtype, DType::Bf16);
+        assert_eq!(model.compute_dtype(), DType::Fp8E4m3);
+        assert_eq!(model.kv_dtype, DType::Fp8E4m3);
+        assert_eq!(model.gemm_backends(), vec!["deepgemm"]);
+
+        let q_dim = model.num_qo_heads as u64 * model.head_dim as u64;
+        let kv_dim = model.num_kv_heads as u64 * model.head_dim as u64;
+
+        // --- attn side ---
+        let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
+            &model,
+            &Qwen3AttnParallel {
+                attn_tp_size: 4,
+                gpu_name: "H200".to_string(),
+            },
+        );
+        // Handoff + KV at fp8 = 1 byte/elem.
+        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token, q_dim * 1);
+        assert_eq!(
+            attn_cfgs.total_kv_bytes_per_token,
+            2 * model.num_kv_heads as u64 * model.head_dim as u64 * 1 * model.num_layers as u64
+        );
+        // The attn block carries the base dtype + fp8 flag (op owns the preset);
+        // its GEMMs use deepgemm, KV cache reads fp8.
+        assert_eq!(attn_cfgs.attn_block.dtype, DType::Bf16);
+        assert!(attn_cfgs.attn_block.fp8);
+        assert_eq!(attn_cfgs.attn_block.gemm_backends, vec!["deepgemm"]);
+        assert_eq!(attn_cfgs.attn_block.kv_dtype(), DType::Fp8E4m3);
+
+        // --- ffn side ---
+        let routing = RoutingDistribution::uniform(model.num_experts);
+        let ffn_cfgs = crate::arch::qwen3_ffn_moe_layerwise::build_configs(
+            &model,
+            &crate::arch::qwen3_ffn_moe_layerwise::Qwen3FfnMoeParallel {
+                attn_tp_size: 4,
+                ep_size: 8,
+                nvl_num_gpu: 8,
+                gpu_name: "H200".to_string(),
+            },
+            &routing,
+        );
+        // Symmetric QKV-projection handoff at fp8.
+        assert_eq!(ffn_cfgs.ffn_to_attn_bytes_per_token, (q_dim + 2 * kv_dim) * 1);
+        // GEMM roles fp8+deepgemm; RMSNorm roles stay bf16.
+        assert_eq!(ffn_cfgs.pre_attn.compute_dtype, DType::Fp8E4m3);
+        assert_eq!(ffn_cfgs.pre_attn.dtype, DType::Bf16); // input_norm stays bf16
+        assert_eq!(ffn_cfgs.pre_attn.gemm_backends, vec!["deepgemm"]);
+        assert_eq!(ffn_cfgs.post_attn.compute_dtype, DType::Fp8E4m3);
+        assert_eq!(ffn_cfgs.post_attn.dtype, DType::Bf16); // post_norm stays bf16
+        assert_eq!(ffn_cfgs.moe_expert_compute.dtype, DType::Fp8E4m3); // no norm inside
+        assert_eq!(ffn_cfgs.moe_expert_compute.grouped_gemm_backends, vec!["deepgemm"]);
+        assert_eq!(ffn_cfgs.lm_head.dtype, DType::Fp8E4m3);
+        assert_eq!(ffn_cfgs.lm_head.backends, vec!["deepgemm"]);
+        assert_eq!(ffn_cfgs.final_norm.dtype, DType::Bf16); // final_norm stays bf16
+        // dispatch/combine ship the hidden activation fp8.
+        assert_eq!(ffn_cfgs.moe_dispatch.dtype, DType::Fp8E4m3);
+        assert_eq!(ffn_cfgs.moe_combine.dtype, DType::Fp8E4m3);
+    }
+
+    /// The bf16 negative: no fp8 anywhere — GEMMs are `torch`, every dtype is the
+    /// base bf16, and the handoffs/KV are 2 bytes/elem.
+    #[test]
+    fn bf16_afd_configs_keep_torch_and_two_bytes_per_element() {
+        use crate::timing::bridge::DType;
+
+        let model = MoeModelCfg::qwen3_235b(); // fp8: false
+        assert_eq!(model.compute_dtype(), DType::Bf16);
+        assert_eq!(model.gemm_backends(), vec!["torch"]);
+
+        let q_dim = model.num_qo_heads as u64 * model.head_dim as u64;
+        let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
+            &model,
+            &Qwen3AttnParallel {
+                attn_tp_size: 4,
+                gpu_name: "H200".to_string(),
+            },
+        );
+        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token, q_dim * 2);
+        assert!(!attn_cfgs.attn_block.fp8);
+        assert_eq!(attn_cfgs.attn_block.gemm_backends, vec!["torch"]);
+        assert_eq!(attn_cfgs.attn_block.kv_dtype(), DType::Bf16);
     }
 }

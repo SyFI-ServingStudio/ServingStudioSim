@@ -31,7 +31,10 @@ use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBri
 pub struct MoeRouterLocalWorkletConfig {
     pub hidden: u32,
     pub num_experts: u32,
+    /// Base (16-bit) dtype — the post-attention RMSNorm keeps it.
     pub dtype: DType,
+    /// Compute dtype (fp8 in an fp8 run, else == `dtype`) — the router GEMM uses it.
+    pub compute_dtype: DType,
     pub gpu_name: String,
     pub norm_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
@@ -71,7 +74,7 @@ impl MoeRouterLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.num_experts,
                 k: cfg.hidden,
-                dtype: cfg.dtype,
+                dtype: cfg.compute_dtype,
             },
             raw_cfg: cfg.clone(),
         }
@@ -133,6 +136,7 @@ mod tests {
             hidden: 4096,
             num_experts: 128,
             dtype: DType::Bf16,
+            compute_dtype: DType::Bf16,
             gpu_name: "H100".to_string(),
             norm_backends: vec!["flashinfer"],
             gemm_backends: vec!["torch"],
@@ -146,5 +150,16 @@ mod tests {
         assert_eq!(r.router.n, 128); // n = num_experts
         assert_eq!(r.router.k, 4096); // k = hidden
         assert_eq!(r.router.dtype, DType::Bf16);
+    }
+
+    #[test]
+    fn fp8_moves_router_gemm_to_compute_dtype_but_norm_stays_base() {
+        let mut c = cfg();
+        c.compute_dtype = DType::Fp8E4m3;
+        c.gemm_backends = vec!["deepgemm"];
+        let r = MoeRouterLocalWorklet::resolve_config(&c);
+        // Router GEMM goes fp8; the post-attention RMSNorm keeps the base bf16.
+        assert_eq!(r.router.dtype, DType::Fp8E4m3);
+        assert_eq!(r.post_norm.dtype, DType::Bf16);
     }
 }
