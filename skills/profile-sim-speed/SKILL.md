@@ -40,10 +40,27 @@ uv run cargo build --release -p simulator
 
 Two rules for representativeness:
 
-- **Run long enough that the one-time model build amortizes.** The L4 build
-  (profile.db queries + JIT) shows as `python_build` / `_PyEval_EvalFrameDefault`
-  in the profile. At 5000s sim it's still ~18%; at **20000s** it's ~4% and the
-  steady-state loop dominates. Use `duration_ms = 20000000` for a clean picture.
+- **Isolate the steady state from the one-time build.** The L4 build (profile.db
+  queries + JIT + MoE cost-curve build) shows as `python_build` /
+  `_PyEval_EvalFrameDefault` / `__memcmp` / `for_each_routed_token` /
+  `simulate_once` in the profile, all front-loaded at startup. Two ways to keep it
+  out of the numbers:
+  - **PREFERRED — modest run + window a ~10s steady slice (Step 3a).** Decouple the
+    *run length* from the *sample window*: run long enough that the steady regime is
+    well-developed and representative — aim for **~1min of wall** (e.g. `duration_ms`
+    ≈ 600000-1000000; the KV pool has filled, admission has reached its saturating
+    rhythm) — but still restrict the perf analysis to a **~10s window taken from the
+    middle-to-late part of the run** with `perf report --time <start>,<stop>`. That
+    region is fully warmed up (build long done, caches hot, steady state settled) yet
+    the slice is small, so `perf report` on a 500MB+ `perf.data` returns in seconds
+    instead of minutes. This is the fast iteration loop — a modest capture plus a
+    windowed read beats a 20000s capture for both build-exclusion *and* analysis
+    speed. **10s of steady sim is plenty of samples** (at -F 499 that's ~5000
+    sim-thread samples). Don't sample the last second or two — window a slice that is
+    safely mid-steady, not at the ramp-down tail.
+  - Alternative — run so long the build amortizes globally: at 5000s it's still
+    ~18%, at **20000s** ~4%. Only worth it when you specifically want a whole-run
+    average rather than a clean steady slice; it costs far more wall to capture.
 - **Pin BLAS/OMP to 1 thread** so the build's numpy/torch calls don't smear
   samples across worker threads. `--profile` does this for you.
 
@@ -91,6 +108,20 @@ logging and the tick loop).
 
 ## Step 3 — read the breakdown (native perf, not `perf script`)
 
+**Fast path — one command for the whole breakdown.**
+`tools/sim-speed-perf/perf_breakdown.sh <perf.data>` runs all five views below
+concurrently over a single auto-derived steady window (Step 3a), auto-annotates the
+top-N hot `simulator::` symbols to source lines (Step 3b), and saves the full raw
+output (every symbol / annotated line) next to the `perf.data` under
+`perf_breakdown/` (`*.full.txt` + a head-limited `breakdown.txt` also tee'd to
+stdout). Reach for it first; the manual `perf report` invocations below are the
+fallback when you want a view it doesn't cover or need to tweak a filter.
+
+```bash
+tools/sim-speed-perf/perf_breakdown.sh <log_dir>/perf.data                 # auto window, NSYM=4
+NSYM=6 tools/sim-speed-perf/perf_breakdown.sh <log_dir>/perf.data 1234 1244 # explicit abs-second window
+```
+
 `perf script` piping through Python folding is slow on 100MB+ data. Use
 `perf report`'s native filters. The `-i` paths below use the inline-recipe
 `logs/perf_aime.data`; for a `--profile` run substitute `<log_dir>/perf.data`.
@@ -114,6 +145,35 @@ perf report -i logs/perf_aime.data --stdio -g none -F overhead,symbol 2>/dev/nul
 perf report -i logs/perf_aime.data --stdio -g none -F overhead,symbol --comm=mlsim-logger 2>/dev/null | grep -v '^#' | head -12
 perf report -i logs/perf_aime.data --stdio -g none -F overhead,symbol --comm=simulator   2>/dev/null | grep -v '^#' | head -14
 ```
+
+## Step 3a — window to a warmed-up ~10s steady slice (do this first)
+
+perf's absolute sample clock lets you cut the one-time build out of the read
+without re-running. Get the sim-thread sample time bounds, then take a ~10s window
+from the **middle-to-late** range (warmed up, build excluded):
+
+```bash
+# 1. sim-thread sample time bounds (first .. last, in seconds). One awk pass;
+#    filtered to --comm=simulator so only the sim thread counts. ~30-60s on 500MB.
+perf script -i <log_dir>/perf.data --comm=simulator -F time 2>/dev/null \
+  | awk 'NR==1{f=$1} {l=$1} END{gsub(/:/,"",f); gsub(/:/,"",l); print "first="f" last="l" span="l-f}'
+# e.g. first=1558739.57 last=1558793.39 span=53.82  (≈11s build + ≈43s steady sim)
+
+# 2. pick a ~10s window well past the build front (here the build is ~first 11s,
+#    so start ~20s in) and read the flat self-times inside it:
+perf report -i <log_dir>/perf.data -g none -F overhead,symbol --comm=simulator \
+  --percentage relative --time 1558770,1558780 --stdio 2>/dev/null | grep -vE '^#|^$' | head -20
+```
+
+- `--time <start>,<stop>` takes **absolute seconds** from the same clock `perf
+  script -F time` prints (NOT offsets, NOT percentages — the `45%,100%` form errors
+  with `Invalid time string` on this perf build).
+- `--percentage relative --comm=simulator` rescales so the sim thread = 100%.
+- **Confirm the window is steady, not build:** the build symbols (`__memcmp`,
+  `for_each_routed_token`, `simulate_once`, `_PyEval_EvalFrameDefault`) should be
+  **gone** inside the window. If they're still there, move `start` later.
+- Windowing a 10s slice also makes `perf report` itself fast (fewer samples to
+  fold) — the whole point of the short-run + window loop.
 
 ## Step 3b — the release-inlining caveat (read before trusting the call tree)
 
