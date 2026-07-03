@@ -22,6 +22,7 @@ from profiling.db import (
     RunnerRef,
     Table,
     find_kernel_profiler_spec,
+    known_backends,
     run_profile_batch,
 )
 from profiling.db.table import MissingEntry
@@ -107,6 +108,24 @@ class RecordingPool(GpuPool):
     def acquire_chunks(self, k: int, max_concurrent: int):
         self.acquire_calls.append((k, max_concurrent))
         yield from self.chunks
+
+
+def test_deepgemm_backend_registered_sharing_table_and_args():
+    # The FP8 dense backend shares single_gemm's table + args schema with torch;
+    # it routes to the deepgemm runner. Mirrors grouped_gemm's second register.
+    spec = find_kernel_profiler_spec("single_gemm", "deepgemm")
+    assert spec.kernel_kind == "single_gemm"
+    assert spec.table_name == "single_gemm"  # shares the torch backend's table + schema
+    assert spec.backend == "deepgemm"
+    assert spec.metric_family is MetricFamily.COMPUTE
+    assert spec.args_schema is SingleGemmArgs
+    assert spec.subprocess_env is None  # default env (deep_gemm is a project dep)
+    assert spec.runner_ref.module_name == "profiling.runners.gemm.deepgemm"
+    assert spec.runner_ref.function_name == "profile_single_gemm"
+
+
+def test_single_gemm_known_backends_has_torch_and_deepgemm():
+    assert set(known_backends("single_gemm")) == {"torch", "deepgemm"}
 
 
 def test_dtype_from_value_accepts_runner_aliases():

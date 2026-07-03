@@ -1,15 +1,17 @@
-"""DeepGEMM FP8 grouped-GEMM runner (the `deepgemm` backend of `grouped_gemm`).
+"""DeepGEMM FP8 GEMM runners — the `deepgemm` backend of both `single_gemm`
+(dense) and `grouped_gemm` (MoE experts).
 
-L1a-only: allocate tensors, time one kernel, return metrics. Mirrors
-ref/profile/gemm/grouped_gemm_deepgemm.py (FP8 m-grouped contiguous kernel) but
-generalizes the ref's uniform `batch_size`-per-expert to MLSim's variable
+L1a-only: allocate tensors, time one kernel, return metrics. Both mirror
+ref/profile/gemm/grouped_gemm_deepgemm.py: `profile_single_gemm` ports the ref's
+dense `fp8_gemm_nt`; `profile_grouped_gemm` ports the m-grouped contiguous kernel
+but generalizes the ref's uniform `batch_size`-per-expert to MLSim's variable
 `per_group_batches` vector — the distribution-sensitive cost driver (§2.8).
 
-DeepGEMM needs each expert's rows aligned to the contiguous-layout alignment;
-real rows carry the expert id in `m_indices`, padding rows carry -1 and the
-kernel skips them. FP8: A is per-token cast, each expert's weight is per-block
-cast. Requires a Hopper GPU + the pinned `deep_gemm` wheel (see CLAUDE.md /
-`just sync`); absent it, raises ProfilerNotImplemented.
+DeepGEMM grouped needs each expert's rows aligned to the contiguous-layout
+alignment; real rows carry the expert id in `m_indices`, padding rows carry -1
+and the kernel skips them. FP8: A is per-token cast, each weight is per-block
+cast. Both runners require a Hopper GPU + the pinned `deep_gemm` wheel (see
+CLAUDE.md / `just sync`); absent it, they raise ProfilerNotImplemented.
 """
 
 from __future__ import annotations
@@ -116,6 +118,74 @@ def profile_grouped_gemm(
         flops = 2 * total_real * n * k
         tflops = (flops / (time_ms / 1000.0)) / 1e12 if time_ms > 0 else 0.0
         bytes_accessed = total_tokens * k + num_local_experts * n * k + total_tokens * n * 2
+        bandwidth_gbps = (bytes_accessed / (time_ms / 1000.0)) / 1e9 if time_ms > 0 else 0.0
+        return ComputeMetrics(
+            time_ms=float(time_ms),
+            tflops=float(tflops),
+            memory_bandwidth_gbps=float(bandwidth_gbps),
+            energy_j=float(energy_j),
+        )
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_single_gemm(
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    # Dense FP8 GEMM: (M×K) @ (K×N)^T -> (M×N), fp8 in / bf16 out. Same FP8-only
+    # policy as the grouped path — bf16/fp16 dense GEMMs must route to the `torch`
+    # backend, so reject any non-FP8 compute dtype loudly. Mirrors
+    # ref/profile/gemm/grouped_gemm_deepgemm.py::profile_deepgemm_dense.
+    dtype = DType.from_value(dtype)
+    if dtype not in (DType.FP8_E4M3, DType.FP8_E5M2):
+        raise ValueError(
+            f"deepgemm single-GEMM is FP8-only but got dtype={dtype.value}; "
+            "use the torch backend for bf16/fp16 dense GEMM"
+        )
+
+    try:
+        import torch
+    except ImportError as exc:
+        raise ProfilerNotImplemented("torch required for the deepgemm single-GEMM runner") from exc
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented("CUDA required for the deepgemm single-GEMM runner")
+    try:
+        import deep_gemm
+        from deep_gemm.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
+    except ImportError as exc:
+        raise ProfilerNotImplemented(
+            "deep_gemm required for the deepgemm single-GEMM runner (see CLAUDE.md / `just sync`)"
+        ) from exc
+
+    try:
+        # NT layout: A is (M, K) row-major, B is (N, K) row-major (i.e. stored
+        # transposed), out is (M, N) bf16. A: per-token FP8, B: per-block FP8
+        # (use_ue8m0=False for SM90/Hopper).
+        a_bf16 = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        b_bf16 = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+        out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+
+        a_fp8 = per_token_cast_to_fp8(a_bf16, use_ue8m0=False)
+        b_fp8 = per_block_cast_to_fp8(b_bf16, use_ue8m0=False)
+
+        def kernel():
+            deep_gemm.fp8_gemm_nt(a_fp8, b_fp8, out)
+            return out
+
+        # DeepGEMM's first launch can transiently fail ("doesn't have storage");
+        # prime before timing.
+        _prime(kernel, torch)
+
+        time_ms = Timer.cupti(kernel)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+
+        # Bytes actually moved: A fp8 (1B), B fp8 (1B), out bf16 (2B).
+        flops = 2 * m * n * k
+        tflops = (flops / (time_ms / 1000.0)) / 1e12 if time_ms > 0 else 0.0
+        bytes_accessed = m * k + n * k + m * n * 2
         bandwidth_gbps = (bytes_accessed / (time_ms / 1000.0)) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
