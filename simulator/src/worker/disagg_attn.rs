@@ -846,10 +846,19 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             return;
         }
         let send_gid = self.slots[idx].pull_send_gid;
-        let end = self
-            .cluster
-            .borrow_mut()
-            .submit_transfer(now, send_gid, self.recv_gid, bytes, "afd_attn_pull", "");
+        // Single-source gather (not `submit_transfer`): the arrival is identical
+        // (α + transfer ≡ link_time, so `pull_end` is unchanged), but the *sender*
+        // frees after only its transmission slice (`transfer_time`, latency-
+        // stripped) instead of being held for the coupled collective. So a ffn
+        // worker pulled by several attn workers overlaps its sends by α — matching
+        // the ffn-side pull. See `gpu_cluster::submit_gather`.
+        let end = self.cluster.borrow_mut().submit_gather(
+            now,
+            &[(send_gid, bytes)],
+            self.recv_gid,
+            "afd_attn_pull",
+            "",
+        );
         self.slots[idx].pull_end = end;
     }
 
