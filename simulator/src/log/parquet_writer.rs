@@ -11,11 +11,28 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
-fn writer_properties() -> Result<WriterProperties> {
+fn writer_properties(dictionary_enabled: bool, statistics_enabled: bool) -> Result<WriterProperties> {
     Ok(WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+        // Dictionary encoding dedups each cell against a per-column dictionary via a
+        // hash + `memcmp` (`Interner::intern`). For a column with a handful of
+        // distinct short strings written millions of times (the `gpu_cluster` net log:
+        // `src/dst_pool_tag`, `kind`, always-empty `tag`) that per-cell dedup is the
+        // dominant encode cost, yet buys almost nothing over PLAIN + ZSTD (the
+        // repetition compresses away regardless). Callers that stream such a column at
+        // high volume disable it to keep the writer thread off the sim's critical path.
+        .set_dictionary_enabled(dictionary_enabled)
+        // Per-column min/max statistics compare every cell to the running min/max —
+        // for byte-array (string) columns that is a `memcmp` per cell, the dominant
+        // remaining encode cost once dictionary is off. Nothing reads the net log's
+        // per-column min/max, so high-volume callers disable it as well.
+        .set_statistics_enabled(if statistics_enabled {
+            EnabledStatistics::Page
+        } else {
+            EnabledStatistics::None
+        })
         .build())
 }
 
@@ -27,6 +44,15 @@ pub struct StreamingParquetWriter {
     schema: Arc<Schema>,
     writer: Option<ArrowWriter<File>>,
     rows_written: usize,
+    /// Parquet dictionary encoding — on by default (best on-disk size for the
+    /// low-cardinality cost/kv streams). A high-volume, low-cardinality-string
+    /// stream (the net log) turns it off via [`Self::with_dictionary_enabled`] to
+    /// drop the per-cell interner `memcmp` that otherwise gates the writer thread.
+    dictionary_enabled: bool,
+    /// Parquet per-column min/max statistics — on by default. The net log turns it
+    /// off via [`Self::with_statistics_enabled`] to drop the per-cell `memcmp` its
+    /// (unused) string-column min/max tracking costs.
+    statistics_enabled: bool,
 }
 
 impl StreamingParquetWriter {
@@ -36,7 +62,23 @@ impl StreamingParquetWriter {
             schema,
             writer: None,
             rows_written: 0,
+            dictionary_enabled: true,
+            statistics_enabled: true,
         }
+    }
+
+    /// Opt out of parquet dictionary encoding for this stream (see the field docs).
+    /// Must be set before the first `write` opens the file.
+    pub fn with_dictionary_enabled(mut self, enabled: bool) -> Self {
+        self.dictionary_enabled = enabled;
+        self
+    }
+
+    /// Opt out of parquet per-column min/max statistics for this stream (see the
+    /// field docs). Must be set before the first `write` opens the file.
+    pub fn with_statistics_enabled(mut self, enabled: bool) -> Self {
+        self.statistics_enabled = enabled;
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -53,8 +95,14 @@ impl StreamingParquetWriter {
                 std::fs::create_dir_all(parent)?;
             }
             let file = File::create(&self.path)?;
-            let writer =
-                ArrowWriter::try_new(file, self.schema.clone(), Some(writer_properties()?))?;
+            let writer = ArrowWriter::try_new(
+                file,
+                self.schema.clone(),
+                Some(writer_properties(
+                    self.dictionary_enabled,
+                    self.statistics_enabled,
+                )?),
+            )?;
             self.writer = Some(writer);
         }
         Ok(self.writer.as_mut().unwrap())

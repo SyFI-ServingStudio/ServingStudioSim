@@ -45,7 +45,15 @@ impl NetworkLogger {
         std::fs::create_dir_all(&raw)?;
 
         let path = raw.join("gpu_cluster.parquet");
-        let mut writer = StreamingParquetWriter::new(path, gpu_cluster_schema());
+        // The net log streams millions of rows whose string columns (`src/dst_pool_tag`,
+        // `kind`, always-empty `tag`) have a handful of distinct values. Dictionary
+        // interning AND per-column min/max statistics both `memcmp` every cell — the two
+        // dominant costs on this single writer thread, enough to backpressure the (now
+        // fast) sim thread. Neither is read back for the net log, and PLAIN + ZSTD encodes
+        // far cheaper while compressing the repetition just as well, so disable both.
+        let mut writer = StreamingParquetWriter::new(path, gpu_cluster_schema())
+            .with_dictionary_enabled(false)
+            .with_statistics_enabled(false);
         let (tx, rx) = sync_channel::<Vec<GpuClusterEntry>>(CHANNEL_CAP);
         let handle = std::thread::Builder::new()
             .name("mlsim-net-logger".to_string())
