@@ -99,6 +99,34 @@ impl CostSource {
             }
         }
     }
+
+    /// One-time per-link **latency** (α): the p2p curve's y-intercept — the cost
+    /// of an ~empty transfer, all setup/propagation, no bytes. Extrapolated
+    /// linearly to 0 bytes from the two smallest profiled sweep points (both deep
+    /// in the latency-bound floor, so the extrapolation is ≈ the floor value):
+    /// `α = 2·t(b0) − t(2·b0)`. `Analytic` is a pure bandwidth line with no floor
+    /// (α = 0). This is the cost a gather pays **once**, not per source.
+    fn latency(&self) -> Time {
+        match self {
+            CostSource::Analytic { .. } => Time::ZERO,
+            CostSource::Kernel(_) => {
+                // 2^10 = the p2p_inter sweep floor (see p2p_inter.rs sweep_grid).
+                let b0 = 1024u64;
+                let t0 = self.link_time(b0).as_ms();
+                let t1 = self.link_time(2 * b0).as_ms();
+                Time::from_ms((2.0 * t0 - t1).max(0.0))
+            }
+        }
+    }
+
+    /// The bandwidth-only ("transmission") slice of one link's transfer:
+    /// `link_time(bytes) − α`. This is what occupies a **sender's** link — the
+    /// time it is actively pushing bits — while the latency α is a one-time wire
+    /// cost the collective pays once (not folded into every sender's occupancy).
+    fn transfer_time(&self, message_size_bytes: u64) -> Time {
+        let t = self.link_time(message_size_bytes).as_ms() - self.latency().as_ms();
+        Time::from_ms(t.max(0.0))
+    }
 }
 
 /// One NCCL-style communication group: the contiguous block of GPU ids whose
@@ -356,6 +384,103 @@ impl GpuCluster {
         }
         end
     }
+
+    /// Submit a **fan-in gather**: every `(send_gid, bytes)` in `sources` delivers
+    /// to `recv_gid` as ONE concurrent collective (e.g. the AFD ffn side pulling
+    /// each layer's input from all attn workers at once). Unlike N separate
+    /// [`submit_transfer`](Self::submit_transfer) calls — which serialize on the
+    /// shared `recv_gid` and pay the wire latency once per source — a gather:
+    ///   - pays the per-link latency **once** (`α`, overlapped across all sources);
+    ///   - runs the senders **in parallel**, each holding its own send links only
+    ///     for its transmission slice (`transfer_time`, latency-stripped), so a
+    ///     sender is free for its next push as soon as its bytes are on the wire;
+    ///   - drains the **aggregate** byte total across the receiver's links.
+    /// Duration = `α + max(slowest sender transmission, receiver aggregate drain)`;
+    /// returns the time all bytes are resident at `recv_gid`. A single-source
+    /// gather has the same arrival as `submit_transfer` (α + max ≡ link_time), but
+    /// frees the sender after its own slice rather than the coupled collective.
+    ///
+    /// `kind`/`tag` are logged per source over the shared `[start, arrival]` window
+    /// (only when a [`NetworkLogger`] is attached; `tag` is cloned per source then).
+    pub fn submit_gather(
+        &mut self,
+        now: Time,
+        sources: &[(u16, u64)],
+        recv_gid: u16,
+        kind: &'static str,
+        tag: &str,
+    ) -> Time {
+        let r = self.groups[recv_gid as usize];
+        if r.count == 0 {
+            return now;
+        }
+        // Live sources only: non-empty bytes over a non-empty sender group. The
+        // collective can't start until every involved send link AND the recv link
+        // is idle. `live` carries (send_gid, bytes, send_count).
+        let mut live: Vec<(u16, u64, u16)> = Vec::with_capacity(sources.len());
+        let mut total_bytes: u64 = 0;
+        let mut start = now.max(r.recv_free);
+        for &(sg, bytes) in sources {
+            let s = self.groups[sg as usize];
+            if bytes == 0 || s.count == 0 {
+                continue;
+            }
+            start = start.max(s.send_free);
+            total_bytes += bytes;
+            live.push((sg, bytes, s.count));
+        }
+        if live.is_empty() {
+            return now;
+        }
+        let alpha = self.cost.latency();
+        // Senders push in parallel: the send-side bound is the slowest single
+        // sender's transmission slice (each over its own links), NOT the sum.
+        let mut send_xfer_max = Time::ZERO;
+        for &(_, bytes, count) in &live {
+            let per_link = (bytes as f64 / count as f64).round() as u64;
+            send_xfer_max = send_xfer_max.max(self.cost.transfer_time(per_link));
+        }
+        // The receiver drains the aggregate byte total across its links.
+        let recv_per_link = (total_bytes as f64 / r.count as f64).round() as u64;
+        let recv_xfer = self.cost.transfer_time(recv_per_link);
+        // Latency paid ONCE for the whole gather (overlapped across sources).
+        let arrival = start + alpha + send_xfer_max.max(recv_xfer);
+        // Bookkeeping: each sender frees after its own transmission slice (no
+        // latency, no coupling to the collective); the receiver is busy until
+        // every byte lands (preserves the "recv_free tracks resident time" rule).
+        for &(sg, bytes, count) in &live {
+            let per_link = (bytes as f64 / count as f64).round() as u64;
+            self.groups[sg as usize].send_free = start + self.cost.transfer_time(per_link);
+        }
+        self.groups[recv_gid as usize].recv_free = arrival;
+        // One log row per source over the shared window (resolved endpoints).
+        if self.logger.is_some() {
+            for &(sg, bytes, count) in &live {
+                let s = self.groups[sg as usize];
+                let entry = GpuClusterEntry {
+                    net_start_ms: start.as_ms(),
+                    net_end_ms: arrival.as_ms(),
+                    src_pool_tag: s.owner_pool_tag,
+                    src_worker_id: s.owner_worker_id,
+                    dst_pool_tag: r.owner_pool_tag,
+                    dst_worker_id: r.owner_worker_id,
+                    send_gid: sg,
+                    recv_gid,
+                    send_count: count,
+                    recv_count: r.count,
+                    bytes,
+                    kind,
+                    tag: tag.to_string(),
+                };
+                if let Some(logger) = self.logger.as_mut() {
+                    if let Err(e) = logger.record(entry) {
+                        tracing::warn!("gpu_cluster gather log record failed: {e:#}");
+                    }
+                }
+            }
+        }
+        arrival
+    }
 }
 
 /// Shared run-level handle: one cluster threaded into the PD pools (see module docs).
@@ -489,5 +614,64 @@ mod tests {
             "recv group's recv_free should track the coupled end, got {}",
             end2.as_ms()
         );
+    }
+
+    /// Multi-source gather with a throwaway kind/tag (no logger).
+    fn gather(c: &mut GpuCluster, now: Time, sources: &[(u16, u64)], d: u16) -> Time {
+        c.submit_gather(now, sources, d, "test", "")
+    }
+
+    #[test]
+    fn gather_runs_senders_in_parallel_not_serialized() {
+        // A=2MB, B=6MB, each over a 1-link sender, into a 2-link receiver.
+        // Senders run in parallel → send bound = slowest = 6ms; receiver drains
+        // the 8MB aggregate over 2 links = 4ms → arrival = max(6,4) = 6ms.
+        // Analytic α=0. (N serialized per-source transfers would cost 8ms.)
+        let mut c = cluster();
+        let sa = reg(&mut c, 0, 1);
+        let sb = reg(&mut c, 1, 1);
+        let d = reg(&mut c, 2, 2);
+        let end = gather(&mut c, Time::ZERO, &[(sa, 2_000_000), (sb, 6_000_000)], d);
+        assert!((end.as_ms() - 6.0).abs() < 1e-6, "got {}", end.as_ms());
+    }
+
+    #[test]
+    fn gather_receiver_drains_the_aggregate() {
+        // 4 sources × 1MB into a 2-link receiver. Each 1-link sender pushes
+        // 1MB=1ms in parallel; the receiver drains 4MB/2=2MB per link=2ms →
+        // arrival = max(1,2) = 2ms. Four serialized transfers would cost 4ms.
+        let mut c = cluster();
+        let d = reg(&mut c, 0, 2);
+        let srcs: Vec<(u16, u64)> = (0..4).map(|i| (reg(&mut c, 10 + i, 1), 1_000_000)).collect();
+        let end = gather(&mut c, Time::ZERO, &srcs, d);
+        assert!((end.as_ms() - 2.0).abs() < 1e-6, "got {}", end.as_ms());
+    }
+
+    #[test]
+    fn gather_frees_each_sender_after_its_own_slice() {
+        // A=2MB, B=6MB, 1-link each, into a 2-link receiver (collective ends at
+        // 6ms). A's send link must free after its OWN 2ms transmission, not the
+        // 6ms collective: a follow-up 1MB transfer from A (1-link → 1ms) to a
+        // fast idle receiver therefore starts at t=2 and ends at t=3.
+        let mut c = cluster();
+        let sa = reg(&mut c, 0, 1);
+        let sb = reg(&mut c, 1, 1);
+        let d = reg(&mut c, 2, 2);
+        let fast = reg(&mut c, 4, 1);
+        let _ = gather(&mut c, Time::ZERO, &[(sa, 2_000_000), (sb, 6_000_000)], d);
+        let end = xfer(&mut c, Time::ZERO, sa, fast, 1_000_000);
+        assert!((end.as_ms() - 3.0).abs() < 1e-6, "A should free at 2ms, got end {}", end.as_ms());
+    }
+
+    #[test]
+    fn gather_single_source_matches_transfer_arrival() {
+        // One source, 4-link sender → 2-link receiver, 8MB. send 8MB/4=2ms, recv
+        // 8MB/2=4ms → arrival 4ms — identical to the equivalent submit_transfer
+        // (α + max(a−α, b−α) ≡ max(a, b); α=0 here anyway).
+        let mut c = cluster();
+        let s = reg(&mut c, 0, 4);
+        let d = reg(&mut c, 4, 2);
+        let g = gather(&mut c, Time::ZERO, &[(s, 8_000_000)], d);
+        assert!((g.as_ms() - 4.0).abs() < 1e-6, "got {}", g.as_ms());
     }
 }

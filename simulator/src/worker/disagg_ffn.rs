@@ -186,24 +186,22 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
     }
 
     fn start_pull(&mut self, task: FfnTask, now: Time) -> PullingTask {
-        // Bootstrap input is local (the embedded tokens) → no transfer.
-        let pull_end = if task.pull_sources.is_empty() {
+        // Bootstrap input is local (the embedded tokens) → no transfer. Otherwise
+        // the section's input arrives from potentially many attn workers at once:
+        // one CONCURRENT gather (latency paid once, senders parallel, receiver
+        // drains the aggregate) — not N serialized per-source transfers.
+        let sources: Vec<(u16, u64)> = task
+            .pull_sources
+            .iter()
+            .filter(|source| source.bytes > 0)
+            .map(|source| (source.send_gid, source.bytes))
+            .collect();
+        let pull_end = if sources.is_empty() {
             now
         } else {
-            let mut cluster = self.cluster.borrow_mut();
-            task.pull_sources
-                .iter()
-                .filter(|source| source.bytes > 0)
-                .fold(now, |end, source| {
-                    end.max(cluster.submit_transfer(
-                        now,
-                        source.send_gid,
-                        self.gid,
-                        source.bytes,
-                        "afd_ffn_pull",
-                        "",
-                    ))
-                })
+            self.cluster
+                .borrow_mut()
+                .submit_gather(now, &sources, self.gid, "afd_ffn_pull", "")
         };
         PullingTask { task, pull_end }
     }
