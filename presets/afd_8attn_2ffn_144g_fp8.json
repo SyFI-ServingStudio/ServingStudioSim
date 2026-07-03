@@ -1,0 +1,53 @@
+{
+ "deployment": "afd",
+ "workload": {
+  "trace_files": [
+   "trace/aime_long.csv"
+  ],
+  "request_rate": 150.0,
+  "duration_ms": 2000000.0,
+  "run_to_end": false
+ },
+ "io": {
+  "log_dir": "logs/afd_8attn_2ffn_144g_fp8"
+ },
+ "pools": {
+  "attn": {
+   "groups": [
+    {
+     "gpu": "NVIDIA H200",
+     "replicas": 8,
+     "arch": {
+      "type": "qwen3_attn_tp",
+      "model_config": "model/config/qwen3_235b.json",
+      "attn_tp_size": 4,
+      "fp8": true
+     },
+     "worker": {
+      "type": "disagg_attn",
+      "attn_gpu_memory_gb": 144.0
+     }
+    }
+   ]
+  },
+  "ffn": {
+   "groups": [
+    {
+     "gpu": "NVIDIA H200",
+     "replicas": 2,
+     "arch": {
+      "type": "qwen3_ffn_moe",
+      "model_config": "model/config/qwen3_235b.json",
+      "attn_tp_size": 4,
+      "ep_size": 8,
+      "nvl_num_gpu": 8,
+      "fp8": true
+     },
+     "worker": {
+      "type": "disagg_ffn"
+     }
+    }
+   ]
+  }
+ }
+}
