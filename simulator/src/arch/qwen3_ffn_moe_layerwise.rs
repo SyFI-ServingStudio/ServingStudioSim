@@ -565,7 +565,15 @@ impl Qwen3FfnMoeLayerwiseModel {
 
     fn compile_prologue_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
-        let root = self.embed.compile(&mut b);
+        // Per DP shard: each group embeds its own tokens in parallel → Max over
+        // num_dp_groups (mirrors pre_attn/post_attn/local_reduce).
+        let groups: Vec<CostNode> = (0..self.num_dp_groups)
+            .map(|_| self.embed.compile(&mut b))
+            .collect();
+        let root = CostNode::Max {
+            overlap: 1.0,
+            children: groups,
+        };
         b.finish(CostNode::Labeled {
             label: self.arch_label(),
             child: Box::new(root),
@@ -574,10 +582,21 @@ impl Qwen3FfnMoeLayerwiseModel {
 
     fn compile_epilogue_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
-        let root = CostNode::Sum(vec![
-            self.final_norm.compile(&mut b),
-            self.lm_head.compile(&mut b),
-        ]);
+        // Per DP shard: each group runs final_norm + lm_head on its own tokens in
+        // parallel → Max over num_dp_groups (the epilogue is not vocab-TP sharded,
+        // so each shard computes the full vocab for its local tokens).
+        let groups: Vec<CostNode> = (0..self.num_dp_groups)
+            .map(|_| {
+                CostNode::Sum(vec![
+                    self.final_norm.compile(&mut b),
+                    self.lm_head.compile(&mut b),
+                ])
+            })
+            .collect();
+        let root = CostNode::Max {
+            overlap: 1.0,
+            children: groups,
+        };
         b.finish(CostNode::Labeled {
             label: self.arch_label(),
             child: Box::new(root),
@@ -712,12 +731,15 @@ impl Qwen3FfnMoeLayerwiseModel {
         scratch: &mut Vec<LeafMetrics>,
         inputs: Option<&mut Vec<SlotInput>>,
     ) -> LeafMetrics {
-        let m_total: u32 = batch.tokens_per_group.iter().sum();
         slots.clear();
         slots.resize(self.prologue_n_slots, LeafMetrics::ZERO);
         let mut ev = Self::evaluator(slots, inputs);
-        self.embed
-            .eval(&ElementwiseKernelInput { num_tokens: m_total }, &mut ev);
+        // One embed branch per DP shard, on the shard's own tokens (Max collapses
+        // to the slowest shard). Order matches `compile_prologue_tree`.
+        for &num_tokens in &batch.tokens_per_group {
+            self.embed
+                .eval(&ElementwiseKernelInput { num_tokens }, &mut ev);
+        }
         debug_assert_eq!(ev.filled(), self.prologue_n_slots, "eval cursor must fill every slot");
         CostTree::aggregate(&self.prologue_flat, slots, scratch)
     }
@@ -729,14 +751,15 @@ impl Qwen3FfnMoeLayerwiseModel {
         scratch: &mut Vec<LeafMetrics>,
         inputs: Option<&mut Vec<SlotInput>>,
     ) -> LeafMetrics {
-        let m_total: u32 = batch.tokens_per_group.iter().sum();
         slots.clear();
         slots.resize(self.epilogue_n_slots, LeafMetrics::ZERO);
         let mut ev = Self::evaluator(slots, inputs);
-        self.final_norm
-            .eval(&RmsNormKernelInput { m: m_total }, &mut ev);
-        self.lm_head
-            .eval(&SingleGemmKernelInput { m: m_total }, &mut ev);
+        // One (final_norm, lm_head) branch per DP shard, on the shard's own tokens
+        // (Max collapses to the slowest shard). Order matches `compile_epilogue_tree`.
+        for &m in &batch.tokens_per_group {
+            self.final_norm.eval(&RmsNormKernelInput { m }, &mut ev);
+            self.lm_head.eval(&SingleGemmKernelInput { m }, &mut ev);
+        }
         debug_assert_eq!(ev.filled(), self.epilogue_n_slots, "eval cursor must fill every slot");
         CostTree::aggregate(&self.epilogue_flat, slots, scratch)
     }
