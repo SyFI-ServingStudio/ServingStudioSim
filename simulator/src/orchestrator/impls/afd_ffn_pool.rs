@@ -138,6 +138,7 @@ mod tests {
             slot: 0,
             reqs: vec![RequestId(0)],
             pull_sources: Vec::new(),
+            tokens: 0,
         });
         let mut events = Vec::new();
         for step in 0..10u64 {
@@ -175,12 +176,14 @@ mod tests {
             slot: 0,
             reqs: vec![RequestId(0)],
             pull_sources: Vec::new(),
+            tokens: 0,
         });
         p.submit(FfnTask {
             kind: FfnTaskKind::Terminal,
             slot: 1,
             reqs: vec![RequestId(1)],
             pull_sources: Vec::new(),
+            tokens: 0,
         });
         let mut events = Vec::new();
         for step in 0..10u64 {
@@ -210,6 +213,7 @@ mod tests {
             slot: 2,
             reqs: vec![RequestId(0)],
             pull_sources: Vec::new(),
+            tokens: 0,
         });
         let mut events = Vec::new();
         for step in 0..10u64 {

@@ -206,7 +206,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
         PullingTask { task, pull_end }
     }
 
-    fn start_compute(&mut self, task: FfnTask, now: Time) -> RunningTask {
+    fn start_compute(&mut self, mut task: FfnTask, now: Time) -> RunningTask {
         // A Bootstrap opens a new forward pass for this slot → bump its row `iter_id`,
         // which the rest of the pass (Bridges + Terminal) reuses.
         let slot = task.slot as usize;
@@ -215,6 +215,11 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                 self.iter_seq.resize(slot + 1, 0);
             }
             self.iter_seq[slot] += 1;
+            // The Bootstrap runs before any attn layer-output has reported, so the pool
+            // could not pre-sum its token count — derive it once here from the store and
+            // stamp the task, so this iteration's build + handoff reuse it (Bridge and
+            // Terminal already arrive with `tokens` summed pool-side).
+            task.tokens = self.workload_tokens(&task.reqs);
         }
         let iter_id = self.iter_seq.get(slot).copied().unwrap_or(0);
         // Empty batches are valid control-plane no-ops in the layer -1 / all-worker
@@ -223,7 +228,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
         let dt = if task.reqs.is_empty() {
             Time::ZERO
         } else {
-            let input = self.build_arch_input(&task.reqs);
+            let input = self.build_arch_input(task.tokens);
             self.compute_time(task.kind, task.slot, iter_id, &input, now)
         };
         RunningTask {
@@ -242,9 +247,8 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
     /// is the only L5↔L4 bridge. The ffn arch reads only the per-shard token count
     /// (qkv / o_proj / router / MoE are token-count driven), so [`FfnArchInput`] is
     /// just `tokens_per_group` — no attention-shaped vocabulary.
-    fn build_arch_input(&self, reqs: &[RequestId]) -> FfnArchInput {
+    fn build_arch_input(&self, total: u64) -> FfnArchInput {
         let num_groups = self.model.num_dp_groups().max(1) as u64;
-        let total = self.workload_tokens(reqs);
         let base = (total / num_groups) as u32;
         let rem = total % num_groups;
         FfnArchInput {
@@ -420,9 +424,9 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
             FfnTaskKind::Bootstrap | FfnTaskKind::Bridge { .. } => {
                 // Produces this section's QKV for the downstream attn layer; the
                 // attn side pulls `ffn_to_attn_bytes_per_token × tokens`. L6 maps
-                // `kind` to that downstream layer.
-                let total_tokens = self.workload_tokens(&task.reqs);
-                let out_bytes = self.model.ffn_to_attn_bytes_per_token() * total_tokens;
+                // `kind` to that downstream layer. `task.tokens` was set once (pool-side
+                // for Bridge, worker-side for Bootstrap) — no per-layer store re-scan.
+                let out_bytes = self.model.ffn_to_attn_bytes_per_token() * task.tokens;
                 events.push(FfnWorkerEvent::SectionReady {
                     worker: self.id,
                     slot: task.slot,
@@ -574,6 +578,7 @@ mod tests {
             slot: 0,
             reqs: vec![RequestId(0)],
             pull_sources: Vec::new(),
+            tokens: 0,
         }));
         let mut events = Vec::new();
         for step in 0..10u64 {
@@ -602,6 +607,7 @@ mod tests {
             slot: 0,
             reqs: Vec::new(),
             pull_sources: Vec::new(),
+            tokens: 0,
         }));
         let mut events = Vec::new();
         let wake = w.tick(Time::ZERO, &mut events);
@@ -630,6 +636,7 @@ mod tests {
             slot: 0,
             reqs: vec![RequestId(0)],
             pull_sources: Vec::new(),
+            tokens: 0,
         }));
         let mut events = Vec::new();
         for step in 0..10u64 {
@@ -657,6 +664,7 @@ mod tests {
             slot: 0,
             reqs: Vec::new(),
             pull_sources: Vec::new(),
+            tokens: 0,
         }));
         let mut events = Vec::new();
         let wake = w.tick(Time::ZERO, &mut events);
@@ -685,6 +693,7 @@ mod tests {
             slot: 0,
             reqs: vec![RequestId(0)],
             pull_sources: Vec::new(),
+            tokens: 0,
         }));
         w.enqueue(FfnWorkerMsg::Task(FfnTask {
             kind: FfnTaskKind::Bridge { upstream: 0 },
@@ -694,6 +703,7 @@ mod tests {
                 send_gid: sender,
                 bytes: 4096,
             }],
+            tokens: 0,
         }));
         let mut events = Vec::new();
         // At t=0 the Bootstrap is already computing AND the Bridge is already

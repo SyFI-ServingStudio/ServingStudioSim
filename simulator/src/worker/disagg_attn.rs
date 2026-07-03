@@ -722,10 +722,18 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
     /// stays a barrier member.
     fn complete_layer(&mut self, idx: usize, now: Time, events: &mut Vec<AttnWorkerEvent>) {
         let layer = self.slots[idx].current_layer;
-        // Token count reads the slot's `reqs` in place (no clone). The event needs an
-        // owned request set, so clone exactly once and MOVE it in — this runs per
-        // layer (≈num_layers × per iteration), so the old second clone was pure churn.
-        let tokens = self.batch_query_tokens(&self.slots[idx].reqs);
+        // The query-token count is exactly `slot_inputs[idx].groups[0].batch_tokens`,
+        // which `build_attn_input` accumulates (prefill += prompt_len, decode += 1)
+        // when it builds this iteration's cost input. Ensure it is current, then reuse
+        // it instead of re-walking `reqs` through the store's `is_prefill()` every layer
+        // (that scan was the top steady cost: a random pointer-chase per request ×
+        // ~num_layers). `build_attn_input` is `input_valid`-gated, so on the compute
+        // path (where `start_compute` already built it) this is a no-op early-return;
+        // it only does work for the empty/no-compute lockstep slot, which never runs
+        // `start_compute`. `batch_tokens` is iteration-invariant, so this is
+        // byte-identical to the old per-layer `is_prefill()` sum.
+        self.build_attn_input(idx);
+        let tokens = self.slot_inputs[idx].groups[0].batch_tokens as u64;
         let out_bytes = self.model.attn_to_ffn_bytes_per_token() * tokens;
         events.push(AttnWorkerEvent::AttnLayerOutputsReady {
             worker: self.id,
@@ -768,21 +776,6 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         // Park, do NOT advance: the pool's `SlotFlushed` (after the all-workers barrier)
         // calls `advance_slot_layer` via `on_msg_slot_flushed`.
         self.slots[idx].state = SlotState::AwaitFlush;
-    }
-
-    /// Query-token count of a micro-batch this iteration (prefill = its prompt length,
-    /// decode = 1 per request), keyed off the request's `is_prefill()`.
-    fn batch_query_tokens(&self, reqs: &[RequestId]) -> u64 {
-        let store = self.requests.borrow();
-        reqs.iter()
-            .map(|&rid| {
-                if store[rid].is_prefill() {
-                    store[rid].prompt_len as u64
-                } else {
-                    1
-                }
-            })
-            .sum()
     }
 
     /// Advance a finished slot to its next layer: bump `current_layer`, reset to
