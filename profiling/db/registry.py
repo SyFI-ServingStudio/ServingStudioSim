@@ -19,9 +19,12 @@ from typing import Any
 from profiling.db.args import KernelArgs
 from profiling.db.kind import KernelKind
 from profiling.db.outlier import BatchOutlierPolicy
-from profiling.runners.metrics import Metrics
+from profiling.runners.metrics import Metrics, RunnerResult
 
 ProfileFn = Callable[..., Metrics]
+# A list runner takes the whole (homogeneous) chunk's coerced kwargs and returns
+# one RunnerResult per spec, in order. This is the contract the worker calls.
+ListRunnerFn = Callable[[list[dict]], list[RunnerResult]]
 
 
 class MetricFamily(StrEnum):
@@ -63,6 +66,12 @@ class KernelProfilerSpec:
     subprocess_env: str | None = None
     subprocess_module: str | None = None
     gpu_count_fn: Callable[[dict[str, Any]], int] | None = None
+    # When True the referenced runner already implements the list contract
+    # (``list[dict] -> list[RunnerResult]``) natively — used by the multi-GPU
+    # comm runners so they spawn their rank group once per chunk instead of per
+    # spec. When False (the default) the single-spec runner is wrapped by
+    # ``batched`` to satisfy the same contract.
+    list_native: bool = False
 
     @property
     def runner_module(self) -> str:
@@ -70,6 +79,15 @@ class KernelProfilerSpec:
 
     def load_runner(self) -> ProfileFn:
         return self.runner_ref.load(self.runner_module)
+
+    def load_list_runner(self) -> ListRunnerFn:
+        """Load the runner as a list runner: native if ``list_native``, else the
+        single-spec runner wrapped by ``batched``. This is what the worker calls
+        so its dispatch is uniform (one call, no per-kernel-kind branch)."""
+        from profiling.runners.batched import batched  # lazy: worker-subprocess only
+
+        runner = self.runner_ref.load(self.runner_module)
+        return runner if self.list_native else batched(runner)
 
 
 @dataclass(frozen=True)

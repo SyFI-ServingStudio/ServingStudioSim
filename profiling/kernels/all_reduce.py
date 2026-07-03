@@ -49,12 +49,16 @@ def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
     return KernelProfilerSpec(
         kernel_kind=KIND,
         backend=backend,
-        runner_ref=RunnerRef(module_name=module_name, function_name="profile_all_reduce"),
+        # list_native: the runner spawns its rank group once per chunk and loops
+        # every size inside, so the worker hands it the whole spec list (no per-shape
+        # re-init). function_name points at the batch entry, not the single-spec one.
+        runner_ref=RunnerRef(module_name=module_name, function_name="profile_all_reduce_batch"),
         table_name=KIND,
         args_schema=AllReduceArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
         gpu_count_fn=lambda spec: int(spec["num_gpus"]),
+        list_native=True,
     )
 
 

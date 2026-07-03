@@ -19,6 +19,7 @@ from profiling.db.batch import args_to_spec, coerce_args
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec
 from profiling.exec.payload import metrics_to_payload, resolve_chunk_backend
+from profiling.runners.metrics import RunnerResult
 
 
 def _worker_main(input_path: Path, output_path: Path) -> None:
@@ -27,25 +28,40 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
     chunk_specs = worker_request["specs"]
     backend = resolve_chunk_backend(kernel_kind, chunk_specs)
     profiler_spec = find_kernel_profiler_spec(kernel_kind, backend)
-    runner = profiler_spec.load_runner()
-    worker_results = []
-    for chunk_spec in chunk_specs:
-        runner_spec = {key: value for key, value in chunk_spec.items() if key != "backend"}
-        try:
-            kernel_args = coerce_args(profiler_spec.args_schema, runner_spec)
-            metrics = runner(**args_to_spec(kernel_args))
-            worker_results.append(
-                {
-                    "ok": True,
-                    "metrics": metrics_to_payload(metrics),
-                    "gpu_name": _current_gpu_name(),
-                }
-            )
-        except Exception as exc:
-            _empty_cuda_cache()
-            worker_results.append({"ok": False, "error": str(exc)})
+
+    # The chunk is homogeneous (one backend/gpu_count — enforced upstream), so the
+    # worker dispatch is a single uniform list call. Coercion is hoisted here so
+    # every runner receives already-coerced kwargs (the `batched` adapter and the
+    # native comm runners stay schema-free). List-native comm runners spawn their
+    # rank group once for the whole list; compute runners are wrapped by `batched`.
+    runner = profiler_spec.load_list_runner()
+    kwargs_list = [
+        args_to_spec(coerce_args(profiler_spec.args_schema, _strip_backend(chunk_spec)))
+        for chunk_spec in chunk_specs
+    ]
+    results = runner(kwargs_list)
+    gpu_name = _current_gpu_name()
+    worker_results = [_to_payload(result, gpu_name) for result in results]
 
     output_path.write_text(json.dumps({"results": worker_results}), encoding="utf-8")
+
+
+def _strip_backend(chunk_spec: dict) -> dict:
+    """Drop the ``backend`` selector (already resolved to the chunk spec) so the
+    remaining keys are exactly the runner's schema args."""
+    return {key: value for key, value in chunk_spec.items() if key != "backend"}
+
+
+def _to_payload(result: RunnerResult, gpu_name: str | None) -> dict:
+    """Render one ``RunnerResult`` into the worker's on-disk JSON shape that
+    ``chunk_result_from_payload`` consumes (unchanged from the single-spec loop)."""
+    if result.error is not None or result.metrics is None:
+        return {"ok": False, "error": result.error}
+    return {
+        "ok": True,
+        "metrics": metrics_to_payload(result.metrics),
+        "gpu_name": gpu_name,
+    }
 
 
 def _current_gpu_name() -> str | None:
@@ -57,16 +73,6 @@ def _current_gpu_name() -> str | None:
     except ImportError:
         pass
     return None
-
-
-def _empty_cuda_cache() -> None:
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except ImportError:
-        pass
 
 
 def main(argv: list[str] | None = None) -> int:

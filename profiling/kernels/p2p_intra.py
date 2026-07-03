@@ -43,12 +43,16 @@ def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
     return KernelProfilerSpec(
         kernel_kind=KIND,
         backend=backend,
-        runner_ref=RunnerRef(module_name=module_name, function_name="profile_p2p"),
+        # list_native: the runner spawns its 2-rank group once per chunk and loops
+        # every size inside (no per-shape re-init). function_name points at the batch
+        # entry, not the single-spec one.
+        runner_ref=RunnerRef(module_name=module_name, function_name="profile_p2p_batch"),
         table_name=KIND,
         args_schema=P2pIntraArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
         gpu_count_fn=lambda spec: 2,
+        list_native=True,
     )
 
 

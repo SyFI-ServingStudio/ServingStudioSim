@@ -30,3 +30,19 @@ class CommMetrics:
 
 
 Metrics = ComputeMetrics | CommMetrics
+
+
+@dataclass(frozen=True)
+class RunnerResult:
+    """One item of a list-runner's return value.
+
+    The runner contract is ``run(kwargs_list) -> list[RunnerResult]``, 1:1 and
+    in-order with the input specs. A success carries ``metrics`` (and ``error is
+    None``); a per-item failure carries ``error`` (and ``metrics is None``). This
+    keeps per-item ok/error resilience inside the runner layer (the ``batched``
+    adapter for compute, or the native comm parent) instead of the worker loop.
+    Distinct from L1b's ``ChunkResult``, which additionally carries ``gpu_name``.
+    """
+
+    metrics: Metrics | None = None
+    error: str | None = None

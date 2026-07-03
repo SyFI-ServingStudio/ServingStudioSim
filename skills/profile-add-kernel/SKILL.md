@@ -88,6 +88,11 @@ You MUST keep a live report. Do not write any code before step 0 is done.
   - Python: `profiling/kernels/single_gemm.py` + `profiling/runners/gemm/torch.py`.
   - Rust: `simulator/src/timing/kernels/single_gemm.rs` (+ how it is wired in
     `simulator/src/timing/kernels/mod.rs`).
+- **Multi-GPU comm reference pair** (ONLY if your runner spawns a rank-group
+  launcher — see the runner-contract callout in §3): `profiling/kernels/all_reduce.py`
+  + `profiling/runners/comm/{nccl,nvshmem}.py` + the shared spawn-once orchestration
+  in `profiling/runners/comm/_batch.py`. A single-GPU compute kernel does NOT need
+  these — its single_gemm reference above is complete.
 
 ---
 
@@ -111,6 +116,9 @@ Phase A — Design
        FitFailed).
 [ ] A5 Confirm Python <Kind>Args fields == Rust per-row enumerate fields (minus
        `backend`) == runner kwargs. This contract is load-bearing; write it down.
+       (Runner kwargs = the single-spec fn's `**kwargs` for a compute kernel;
+       for a list-native comm kernel, the fields each spec dict carries and the
+       `_per_rank_batch` fn reads out per size — same field set either way.)
 
 Phase B — Python profiling side
 [ ] B1 Write runner profiling/runners/<family>/<backend>.py (add an empty
@@ -118,9 +126,17 @@ Phase B — Python profiling side
        INSIDE the fn (mirror ref/profile/<family>/ for the real call), use the
        Timer the §8.1 row specifies, call Energy.perf(per_iter_time_ms=time_ms)
        for compute, return ComputeMetrics/CommMetrics.
+       Contract split (see §3 runner-contract callout): COMPUTE kernel = write the
+       single-spec `profile_<kind>(**kwargs) -> Metrics` shown here; the registry
+       auto-wraps it via `batched` (do nothing extra). LAUNCHER/COMM kernel (spawns
+       TorchMpLauncher / NvshmemLauncher) = ALSO expose `profile_<kind>_batch(
+       kwargs_list) -> list[RunnerResult]` that spawns the rank group ONCE and loops
+       sizes inside, else you re-init per shape.
 [ ] B2 NEW kind: create profiling/kernels/<kind>.py — KIND const, <Kind>Args
        frozen dataclass(KernelArgs), register(KernelProfilerSpec(...)) with a
-       lazy RunnerRef and table_name=KIND.
+       lazy RunnerRef and table_name=KIND. Compute: RunnerRef function_name =
+       "profile_<kind>", leave list_native defaulted False. List-native comm:
+       function_name = "profile_<kind>_batch" AND list_native=True.
        NEW backend: add a second register(...) call in the existing
        profiling/kernels/<kind>.py; reuse <Kind>Args; no new file/barrel line.
 [ ] B3 NEW kind only: add `from profiling.kernels import <kind>  # noqa: F401`
@@ -130,6 +146,9 @@ Phase B — Python profiling side
        passes before/independent of the barrel): args field-set+coercion, KIND
        wire string, register-spec shape (table_name==kernel_kind), lazy-import
        (runner module absent from sys.modules after importing the kernel module).
+       List-native comm: also assert spec.list_native is True and
+       spec.runner_ref.function_name == "profile_<kind>_batch" (mirror
+       tests/test_all_reduce.py).
 [ ] B5 ONLY if an Args field is a tuple/list (distribution-sensitive op, §4): add
        the tuple/list branch to db/batch.py::_coerce_value so the inbound JSON
        list coerces to the declared origin (tuple → frozen args stay hashable).
@@ -186,6 +205,31 @@ tflops, memory_bandwidth_gbps, energy_j)`. Raise `KernelLaunchFailed` on
 `RuntimeError`. Do NOT touch DB / env / CUDA_VISIBLE_DEVICES. If `<family>/` is a
 brand-new dir, add an empty `__init__.py` package marker.
 
+### The runner contract: single-spec (default) vs list-native (launcher kernels)
+The worker calls every runner as a **list runner**:
+`run(kwargs_list: list[dict]) -> list[RunnerResult]` (1:1, in order). You almost
+never write that signature yourself:
+
+- **Compute kernels (the common case) — write single-spec, unchanged.** Keep
+  `profile_<kind>(**kwargs) -> Metrics` exactly as `single_gemm` shows. The
+  registry wraps it via `batched()` automatically (`list_native` defaults False),
+  which loops the specs and captures per-item errors. The worker subprocess
+  already amortizes the expensive setup (import / CUDA context) once per chunk, so
+  the per-spec in-process call is cheap. **Do nothing extra.**
+
+- **Multi-GPU comm kernels that spawn a launcher — make it list-native.** A runner
+  that does `TorchMpLauncher(n).run(...)` / `NvshmemLauncher(n).run(...)` pays a
+  full `mp.spawn` + `init_process_group` / `nvshmem.init` (seconds to ~12 s) on
+  EVERY call. Left single-spec, the adapter loops it → one spawn **per message
+  size** (~19× wasted init). Instead expose `profile_<kind>_batch(kwargs_list) ->
+  list[RunnerResult]` that spawns the rank group **once** and loops the sizes
+  inside the live group (a `_per_rank_batch` fn reads each spec's fields and
+  allocates/frees per size). Reuse `profiling/runners/comm/_batch.py::run_comm_batch`
+  (spawn-once + whole-chunk failure semantics: the ranks run sizes in lockstep, so
+  a per-size abort would deadlock the collective — fail the whole chunk instead).
+  `RunnerResult(metrics | error)` is the per-item element. Set `list_native=True`
+  and point `function_name` at the batch entry in B2.
+
 ### B2 per-kernel module (`profiling/kernels/<kind>.py`)
 Copy `single_gemm.py`: `KIND: str = "<kind>"` (snake_case), a
 `@dataclass(frozen=True) class <Kind>Args(KernelArgs)` with the per-row fields,
@@ -193,6 +237,12 @@ and one `register(KernelProfilerSpec(kernel_kind=KIND, backend="<backend>",
 runner_ref=RunnerRef("profiling.runners.<family>.<backend>", "profile_<kind>"),
 table_name=KIND, args_schema=<Kind>Args, metric_family=MetricFamily.COMPUTE,
 batch_outlier_policy=BatchOutlierPolicy()))`.
+
+For a **list-native comm** kernel (see the runner-contract callout above), mirror
+`all_reduce.py` instead: `metric_family=MetricFamily.COMM`, point the `RunnerRef`
+`function_name` at `"profile_<kind>_batch"`, and add `list_native=True` to the
+`KernelProfilerSpec(...)`. Everything else (table_name==KIND, args_schema, lazy
+RunnerRef) is identical.
 
 ### C1 Rust kernel (`simulator/src/timing/kernels/<kind>.rs`)
 Copy `single_gemm.rs`. Static dims → `<Name>KernelConfig` fields (besides
@@ -213,7 +263,10 @@ per Args field (snake_case keys matching the Python dataclass).
 
 ## 4. Ownership rules (don't cross these)
 
-- Runners only allocate/launch/measure and return a metrics dataclass.
+- Runners only allocate/launch/measure and return metrics — a single `Metrics`
+  dataclass (compute; the registry wraps it in the list contract via `batched`) or
+  a `list[RunnerResult]` (list-native comm; see the §3 runner-contract callout).
+  They never touch the DB, env, or `CUDA_VISIBLE_DEVICES`.
 - Do NOT hand-write `get_<kind>_times` in `perf_api.py` — `facade.py` generates
   it from the registry.
 - Do NOT add a central enum on either side — `KIND` is the single source of

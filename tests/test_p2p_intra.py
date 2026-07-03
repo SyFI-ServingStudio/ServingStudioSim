@@ -20,9 +20,11 @@ from profiling.kernels.p2p_intra import KIND, P2pIntraArgs
 
 
 def test_args_field_contract_matches_runner_kwargs():
-    # Field set / order must equal the runner kwargs (message_size_bytes, dtype,
-    # fabric) and the Rust enumerate fields (minus `backend`). No num_gpus: p2p
-    # is always 2 endpoints.
+    # Field set / order must equal the per-spec kwargs the list runner reads out of
+    # each spec dict (message_size_bytes, dtype, fabric) and the Rust enumerate fields
+    # (minus `backend`). No num_gpus: p2p is always 2 endpoints. The runner is now
+    # list-native (`profile_p2p_batch(list[dict])`), but each element still carries
+    # exactly these schema fields.
     field_names = [field.name for field in P2pIntraArgs.__dataclass_fields__.values()]
     assert field_names == ["message_size_bytes", "dtype", "fabric"]
 
@@ -52,19 +54,22 @@ def test_register_call_built_a_comm_spec(backend: str, module_name: str):
     spec = KernelProfilerSpec(
         kernel_kind=KIND,
         backend=backend,
-        runner_ref=RunnerRef(module_name=module_name, function_name="profile_p2p"),
+        runner_ref=RunnerRef(module_name=module_name, function_name="profile_p2p_batch"),
         table_name=KIND,
         args_schema=P2pIntraArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
         gpu_count_fn=lambda s: 2,
+        list_native=True,
     )
     assert spec.kernel_kind == "p2p_intra"
     assert spec.backend == backend
     assert spec.table_name == spec.kernel_kind  # facade-stem invariant
     assert spec.metric_family is MetricFamily.COMM
     assert spec.runner_ref.module_name == module_name
-    assert spec.runner_ref.function_name == "profile_p2p"
+    # Comm runners are list-native: the worker calls the batch entry once per chunk.
+    assert spec.runner_ref.function_name == "profile_p2p_batch"
+    assert spec.list_native is True
     assert spec.gpu_count_fn({}) == 2
 
 
