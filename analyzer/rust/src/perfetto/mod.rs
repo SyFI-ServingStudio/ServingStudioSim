@@ -182,6 +182,29 @@ impl TraceWriter {
             track_uuid: Some(track),
             name: Some(name.to_string()),
             debug_annotations: anns.iter().map(Annotation::to_proto).collect(),
+            flow_ids: Vec::new(),
+        });
+        self.packets.push(p);
+    }
+
+    /// A slice-begin carrying `flow_ids`: any two slices sharing an id are joined
+    /// by a directed arrow in the Perfetto UI (used to link a send to its recv).
+    pub fn begin_flow(
+        &mut self,
+        track: u64,
+        ts_ns: i64,
+        name: &str,
+        anns: &[Annotation],
+        flow_ids: &[u64],
+    ) {
+        let mut p = self.new_packet();
+        p.timestamp = Some(ts_ns as u64);
+        p.track_event = Some(TrackEvent {
+            r#type: Some(EventType::SliceBegin as i32),
+            track_uuid: Some(track),
+            name: Some(name.to_string()),
+            debug_annotations: anns.iter().map(Annotation::to_proto).collect(),
+            flow_ids: flow_ids.to_vec(),
         });
         self.packets.push(p);
     }
@@ -205,6 +228,7 @@ impl TraceWriter {
             track_uuid: Some(track),
             name: Some(name.to_string()),
             debug_annotations: anns.iter().map(Annotation::to_proto).collect(),
+            flow_ids: Vec::new(),
         });
         self.packets.push(p);
     }

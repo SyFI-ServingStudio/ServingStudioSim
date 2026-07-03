@@ -66,6 +66,8 @@ message TrackEvent {
   optional uint64 track_uuid = 11;
   optional string name = 23;
   repeated DebugAnnotation debug_annotations = 4;
+  // Slices sharing a flow_id are connected by an arrow in the UI (send -> recv).
+  repeated fixed64 flow_ids = 47;
 }
 
 // Key/value rider on a slice (shown in the UI's "Arguments" pane). We always

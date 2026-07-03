@@ -208,6 +208,13 @@ pub fn gpu_cluster_schema() -> Arc<Schema> {
         // `run_meta.json`'s `comm_groups`. Appended last: append-only.
         Field::new("send_count", DataType::UInt16, false),
         Field::new("recv_count", DataType::UInt16, false),
+        // When the *sender's* link is freed = end of its transmission slice. For a
+        // gather (attn/ffn pull) this is `net_start + transfer_time` (latency-
+        // stripped, < `net_end`), so the sender overlaps the tail of the collective;
+        // for a coupled `submit_transfer` the sender is held to `net_end` (== this).
+        // Lets `analyze trace` draw the send occupancy separately from the full
+        // on-wire window. Appended last: append-only.
+        Field::new("send_end_ms", DataType::Float64, false),
     ]))
 }
 

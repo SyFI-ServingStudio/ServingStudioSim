@@ -378,6 +378,9 @@ impl GpuCluster {
                 bytes,
                 kind,
                 tag: tag.to_string(),
+                // Coupled transfer: the sender is held for the whole collective,
+                // so its link frees at `end` (no early release, unlike a gather).
+                send_end_ms: end.as_ms(),
             }) {
                 tracing::warn!("gpu_cluster log record failed: {e:#}");
             }
@@ -457,6 +460,11 @@ impl GpuCluster {
         if self.logger.is_some() {
             for &(sg, bytes, count) in &live {
                 let s = self.groups[sg as usize];
+                let per_link = (bytes as f64 / count as f64).round() as u64;
+                // Sender frees after its own transmission slice (latency-stripped) —
+                // strictly before `arrival`, so the send slice ends inside the
+                // collective's window (the overlap `analyze trace` visualizes).
+                let send_end = start + self.cost.transfer_time(per_link);
                 let entry = GpuClusterEntry {
                     net_start_ms: start.as_ms(),
                     net_end_ms: arrival.as_ms(),
@@ -471,6 +479,7 @@ impl GpuCluster {
                     bytes,
                     kind,
                     tag: tag.to_string(),
+                    send_end_ms: send_end.as_ms(),
                 };
                 if let Some(logger) = self.logger.as_mut() {
                     if let Err(e) = logger.record(entry) {

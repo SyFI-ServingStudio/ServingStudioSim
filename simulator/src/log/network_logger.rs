@@ -164,6 +164,7 @@ mod tests {
                 bytes: 4_000_000,
                 kind: "pd_kv_pull",
                 tag: "req=42".to_string(),
+                send_end_ms: 9.0,
             })
             .unwrap();
         logger.flush_all().unwrap();

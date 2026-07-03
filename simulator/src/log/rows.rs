@@ -566,6 +566,10 @@ pub struct GpuClusterEntry {
     pub kind: &'static str,
     /// Free-form per-deployment identifier (e.g. a request-id list); may be empty.
     pub tag: String,
+    /// When the *sender's* link frees = end of its transmission slice. For a gather
+    /// this is `net_start + transfer_time` (latency-stripped, ≤ `net_end`); for a
+    /// coupled `submit_transfer` the sender is held to `net_end` (so == `net_end`).
+    pub send_end_ms: f64,
 }
 
 pub(crate) fn gpu_cluster_to_record_batch(entries: &[GpuClusterEntry]) -> Result<RecordBatch> {
@@ -582,6 +586,7 @@ pub(crate) fn gpu_cluster_to_record_batch(entries: &[GpuClusterEntry]) -> Result
     let bytes: Vec<u64> = entries.iter().map(|e| e.bytes).collect();
     let kind: Vec<&str> = entries.iter().map(|e| e.kind).collect();
     let tag: Vec<&str> = entries.iter().map(|e| e.tag.as_str()).collect();
+    let send_end: Vec<f64> = entries.iter().map(|e| e.send_end_ms).collect();
 
     Ok(RecordBatch::try_new(
         gpu_cluster_schema(),
@@ -599,6 +604,7 @@ pub(crate) fn gpu_cluster_to_record_batch(entries: &[GpuClusterEntry]) -> Result
             Arc::new(StringArray::from(tag)),
             Arc::new(UInt16Array::from(send_count)),
             Arc::new(UInt16Array::from(recv_count)),
+            Arc::new(Float64Array::from(send_end)),
         ],
     )?)
 }

@@ -100,11 +100,14 @@ const NET_COLUMNS: &[&str] = &[
     "kind",
     "send_count",
     "recv_count",
+    "send_end_ms",
 ];
 
-/// One cross-worker transfer, materialized from `gpu_cluster.parquet`. Placed on
-/// the **receiving** (`dst_*`) worker's dedicated comm lane; the sender (`src_*`)
-/// rides along as a slice annotation.
+/// One cross-worker transfer, materialized from `gpu_cluster.parquet`. The full
+/// on-wire window `[net_start, net_end]` is drawn on the **receiving** (`dst_*`)
+/// worker's comm lane; the sender's transmission slice `[net_start, send_end]` is
+/// drawn on the **sending** (`src_*`) worker's send lane, and the two are joined
+/// by a flow arrow (send → recv).
 struct NetRow {
     net_start_ms: f64,
     net_end_ms: f64,
@@ -120,13 +123,21 @@ struct NetRow {
     /// count`; annotated on the slice as raw counts and per-link GB/s.
     send_count: u16,
     recv_count: u16,
+    /// When the sender's link frees (`net_start + transfer_time`). ≤ `net_end`;
+    /// strictly less for a gather (the latency-stripped early release we visualize).
+    send_end_ms: f64,
 }
 
 impl NetRow {
-    /// The receiving worker — the comm lane this transfer is drawn on. Matches the
-    /// `cost_log` `(pool_tag, worker_id)` compute-track key.
+    /// The receiving worker — the comm lane the full transfer window is drawn on.
+    /// Matches the `cost_log` `(pool_tag, worker_id)` compute-track key.
     fn dst_key(&self) -> (String, u16) {
         (self.dst_pool_tag.clone(), self.dst_worker_id)
+    }
+
+    /// The sending worker — the lane the send-occupancy slice is drawn on.
+    fn src_key(&self) -> (String, u16) {
+        (self.src_pool_tag.clone(), self.src_worker_id)
     }
 }
 
@@ -261,7 +272,7 @@ pub async fn run(
              CAST(src_pool_tag AS VARCHAR) AS src_pool_tag, src_worker_id, \
              CAST(dst_pool_tag AS VARCHAR) AS dst_pool_tag, dst_worker_id, \
              send_gid, recv_gid, bytes, CAST(kind AS VARCHAR) AS kind, \
-             send_count, recv_count \
+             send_count, recv_count, send_end_ms \
              FROM gpu_cluster WHERE {} ORDER BY dst_pool_tag, dst_worker_id, net_start_ms",
             window_pred("net_start_ms")
         );
@@ -272,6 +283,7 @@ pub async fn run(
             let (sg, rg) = (col(b, "send_gid")?, col(b, "recv_gid")?);
             let (by, kd) = (col(b, "bytes")?, col(b, "kind")?);
             let (sc, rc) = (col(b, "send_count")?, col(b, "recv_count")?);
+            let se = col(b, "send_end_ms")?;
             for r in 0..b.num_rows() {
                 net_rows.push(NetRow {
                     net_start_ms: value_f64(ns, r)?,
@@ -286,6 +298,7 @@ pub async fn run(
                     kind: value_string(kd, r)?,
                     send_count: value_f64(sc, r)? as u16,
                     recv_count: value_f64(rc, r)? as u16,
+                    send_end_ms: value_f64(se, r)?,
                 });
             }
         }
@@ -304,11 +317,13 @@ pub async fn run(
     let mut worker_keys: Vec<(String, u16)> = manifests.keys().cloned().collect();
     worker_keys.sort_unstable();
     worker_keys.dedup();
-    // Which workers RECEIVE a transfer — only these get a comm lane, so a
-    // pure-sender (or a run with no transfers) sprouts no empty lane.
+    // Which workers RECEIVE / SEND a transfer — only these get the matching lane,
+    // so a worker (or a run) with no transfers on a side sprouts no empty lane.
     let dst_keys: BTreeSet<(String, u16)> = net_rows.iter().map(NetRow::dst_key).collect();
+    let src_keys: BTreeSet<(String, u16)> = net_rows.iter().map(NetRow::src_key).collect();
     let mut worker_tracks: BTreeMap<(String, u16), u64> = BTreeMap::new();
     let mut comm_tracks: BTreeMap<(String, u16), u64> = BTreeMap::new();
+    let mut send_tracks: BTreeMap<(String, u16), u64> = BTreeMap::new();
     for (idx, key) in worker_keys.iter().enumerate() {
         let pid = idx as i32;
         let label = worker_label(key);
@@ -316,11 +331,17 @@ pub async fn run(
         let thr = w.thread_track(proc, pid, 0, &label);
         worker_tracks.insert(key.clone(), thr);
         // Comm lane: a second thread track (`tid=1`) under the SAME process, so a
-        // received transfer renders directly beneath the worker's compute lane —
-        // the "same worker row, separate lane" overlay.
+        // received transfer's full on-wire window renders directly beneath the
+        // worker's compute lane — the "same worker row, separate lane" overlay.
         if dst_keys.contains(key) {
             let comm = w.thread_track(proc, pid, 1, &format!("{label} · comm"));
             comm_tracks.insert(key.clone(), comm);
+        }
+        // Send lane (`tid=2`): the sender's transmission slice `[net_start,
+        // send_end]`, ending before the full window when the sender frees early.
+        if src_keys.contains(key) {
+            let send = w.thread_track(proc, pid, 2, &format!("{label} · send"));
+            send_tracks.insert(key.clone(), send);
         }
     }
 
@@ -335,6 +356,11 @@ pub async fn run(
     // forward to the lane's last `end` so slices stay flush siblings rather than
     // nesting (a rare, sub-slice visual nudge).
     let mut net_track_cursor: BTreeMap<u64, i64> = BTreeMap::new();
+    // Same high-water bookkeeping for the per-sender send lanes.
+    let mut send_track_cursor: BTreeMap<u64, i64> = BTreeMap::new();
+    // Monotonic flow id: one per transfer, stamped on BOTH its send and recv
+    // slice so Perfetto draws a send → recv arrow. Starts at 1 (0 reads as unset).
+    let mut flow_seq: u64 = 1;
     // Per-track high-water end_ns. Back-to-back slices (predict's `now += time`
     // layout, or sections within one real task) place each `begin` from the sim
     // clock and each `end` from the placer's leaf-ns sum; the two round
@@ -485,10 +511,40 @@ pub async fn run(
                     net_anns.push(Annotation::dbl("recv_per_link_gbps", gbps));
                 }
             }
-            w.begin(track, begin_ns, &nr.kind, &net_anns);
+            net_anns.push(Annotation::dbl("send_end_ms", nr.send_end_ms));
+            // One flow id links this transfer's send slice to its recv slice.
+            let flow = flow_seq;
+            flow_seq += 1;
+            // Recv slice: the full on-wire window on the receiver's comm lane.
+            w.begin_flow(track, begin_ns, &nr.kind, &net_anns, &[flow]);
             w.end(track, end_ns);
             net_track_cursor.insert(track, end_ns);
             placed_net += 1;
+
+            // Send slice: the sender's transmission window `[net_start, send_end]`
+            // on its send lane, joined to the recv slice by `flow`. Ends before the
+            // recv window when the sender frees early (the gather α/β overlap).
+            if let Some(&send_track) = send_tracks.get(&nr.src_key()) {
+                let s_begin = ((nr.net_start_ms + shift_ms) * 1e6).round() as i64;
+                let s_begin =
+                    s_begin.max(send_track_cursor.get(&send_track).copied().unwrap_or(i64::MIN));
+                let s_end = (((nr.send_end_ms + shift_ms) * 1e6).round() as i64).max(s_begin);
+                let send_anns = vec![
+                    Annotation::str(
+                        "dst",
+                        worker_label(&(nr.dst_pool_tag.clone(), nr.dst_worker_id)),
+                    ),
+                    Annotation::uint("send_gid", nr.send_gid as u64),
+                    Annotation::uint("recv_gid", nr.recv_gid as u64),
+                    Annotation::uint("bytes", nr.bytes),
+                    Annotation::dbl("net_start_ms", nr.net_start_ms),
+                    Annotation::dbl("send_end_ms", nr.send_end_ms),
+                    Annotation::dbl("net_end_ms", nr.net_end_ms),
+                ];
+                w.begin_flow(send_track, s_begin, &format!("{} · send", nr.kind), &send_anns, &[flow]);
+                w.end(send_track, s_end);
+                send_track_cursor.insert(send_track, s_end);
+            }
         }
 
         w.end(region_track, ((offset_ms + region_ms) * 1e6).round() as i64);
