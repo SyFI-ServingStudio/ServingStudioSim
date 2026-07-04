@@ -5,6 +5,7 @@
 //!   - `run <config>`              — run one sim
 //!   - `build-cache-only <config>` — prebuild profile.db, no sim
 //!   - `dry-run <config>`          — report missing profile.db rows, no sim
+//!   - `emit-backends <config>`    — enumerate distinct kernels (JSON), no sim
 //!   - `list-params`               — emit the param-schema registry JSON
 //!
 //! All three run-like subcommands share one parse (`load_config`) → `RunConfig`
@@ -54,6 +55,12 @@ enum Cmd {
     DryRun(RunArgs),
     /// Print the deployment schema JSON consumed by the launcher (§1.2.7).
     ListParams,
+    /// Enumerate the distinct kernels this config touches — one JSON record per
+    /// `Kernel::build` (`{pool, name, kind, config, backends}`), with NO GPU /
+    /// profiling (builds the cost-tree structure only). The launcher renders the
+    /// `backends` skeleton + validates a backend map from this. Writes JSON on
+    /// stdout (logs go to stderr).
+    EmitBackends(RunArgs),
     /// Probe a built kernel's cost cache (cost-model introspection for the
     /// cache-fidelity harness). Reads a JSON request on stdin describing one
     /// kernel by `{kind, config, query_points}`; writes the interpolated
@@ -132,6 +139,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Run(args) => cmd_run(&args.config),
         Cmd::BuildCacheOnly(args) => cmd_build_cache(&args.config),
         Cmd::DryRun(args) => cmd_dry_run(&args.config),
+        Cmd::EmitBackends(args) => cmd_emit_backends(&args.config),
         Cmd::ListParams => {
             // serde_json::Value serializes infallibly; pretty for `list-params`.
             println!(
@@ -217,6 +225,28 @@ fn cmd_dry_run(config: &Path) -> anyhow::Result<()> {
     println!(
         "total: {total_missing} / {total_specs} specs missing across {} kernels to JIT",
         report.len()
+    );
+    Ok(())
+}
+
+/// `emit-backends` — put the bridge in enumerate mode, run the same build cascade
+/// (which records one `KernelEnum` per `Kernel::build` and skips all profiling /
+/// GPU work), and print the raw records as JSON on stdout. The launcher consumes
+/// this to render the per-kernel `backends` skeleton and to validate a backend
+/// map (dedup by `(pool, name)`, dtype parsed from `config`, options from the
+/// Python capability table). Structural only — no `profile.db`, no CUDA device.
+fn cmd_emit_backends(config: &Path) -> anyhow::Result<()> {
+    let cfg = load_config(config)?;
+    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+    bridge.enable_enumerate();
+    let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+    let _flow = build_flow(&cfg, &bridge, store)?;
+
+    let report = bridge.take_enum_report();
+    // Pure data on stdout (logs are on stderr) so the launcher can parse it.
+    println!(
+        "{}",
+        serde_json::to_string(&report).expect("KernelEnum records serialize")
     );
     Ok(())
 }

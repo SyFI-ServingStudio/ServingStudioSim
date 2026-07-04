@@ -71,7 +71,7 @@ pub fn derive_sweep_coords(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-#[proc_macro_derive(KernelConfig)]
+#[proc_macro_derive(KernelConfig, attributes(compute_dtype, kv_dtype))]
 pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
@@ -110,6 +110,31 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
         quote! { parts.push(::std::format!("{}={:?}", #label, self.#field)); }
     });
 
+    // `#[compute_dtype]` / `#[kv_dtype]` field tags: generate the `KernelConfig`
+    // dtype accessors from the marked field so the enumerate record can emit a
+    // TYPED dtype (the launcher reads it directly, no `describe_config` scraping).
+    // Absent (comm / elementwise) → the trait's `None` default stands.
+    let find_dtype_field = |attr: &str| {
+        fields
+            .iter()
+            .find(|f| f.attrs.iter().any(|a| a.path().is_ident(attr)))
+            .map(|f| f.ident.as_ref().expect("named fields enforced above"))
+    };
+    let compute_dtype_impl = find_dtype_field("compute_dtype").map(|field| {
+        quote! {
+            fn compute_dtype(&self) -> ::core::option::Option<::simulator::timing::DType> {
+                ::core::option::Option::Some(self.#field)
+            }
+        }
+    });
+    let kv_dtype_impl = find_dtype_field("kv_dtype").map(|field| {
+        quote! {
+            fn kv_dtype(&self) -> ::core::option::Option<::simulator::timing::DType> {
+                ::core::option::Option::Some(self.#field)
+            }
+        }
+    });
+
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     let expanded = quote! {
@@ -117,11 +142,17 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
             fn backends(&self) -> &[&'static str] {
                 &self.backends
             }
+            fn set_backends(&mut self, backends: ::std::vec::Vec<&'static str>) {
+                self.backends = backends;
+            }
             const BACKENDS_FIELD: &'static str = #backends_field_label;
 
             fn gpu_name(&self) -> &str {
                 &self.gpu_name
             }
+
+            #compute_dtype_impl
+            #kv_dtype_impl
 
             fn describe_config(&self) -> ::std::string::String {
                 let mut parts: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();

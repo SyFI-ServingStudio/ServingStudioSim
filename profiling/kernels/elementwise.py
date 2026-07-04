@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from profiling.db.args import KernelArgs
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
+    BackendSupport,
     KernelProfilerSpec,
     MetricFamily,
     RunnerRef,
@@ -54,6 +55,8 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="triton",
+        # Byte-keyed / uint8 — dtype-agnostic.
+        supports=BackendSupport(compute=None),
         runner_ref=RunnerRef(
             module_name="profiling.runners.elementwise.triton",
             function_name="profile_elementwise",

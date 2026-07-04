@@ -524,7 +524,13 @@ def _validate_control_blocks(preset: dict) -> list[str]:
     # The reference universe: everywhere a sweep/derived name can legitimately be
     # used — a tree placeholder, a log_dir template field, or an expression input.
     tree = _tree_of(preset)
-    tree_placeholders = collect_placeholders(tree)
+    # The per-kernel `backends` block is a control key (stripped from `tree`), but
+    # its `${name}` values are ordinary sweep participants that DO reach a run's
+    # config (Rust's `RunConfig.backends`). Count them as tree placeholders so a
+    # backend-only sweep dim is config-effective (R2) and its `${...}` is P-checked.
+    tree_placeholders = collect_placeholders(tree) | collect_placeholders(
+        preset.get("backends") or {}
+    )
     log_dir_names, log_dir_errors = _parse_log_dir_template(preset)
     errors.extend(log_dir_errors)
     referenced = tree_placeholders | log_dir_names

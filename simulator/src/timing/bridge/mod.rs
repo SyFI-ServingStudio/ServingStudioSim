@@ -4,7 +4,7 @@ pub mod core;
 pub mod error;
 pub mod payload;
 
-pub use core::{KernelMissing, PerfApiBridge};
+pub use core::{BackendOverrideGuard, KernelEnum, KernelMissing, PerfApiBridge};
 pub use error::{BuildError, PerfApiError};
 pub use payload::{ArgsPayload, DType, DbMetadata, KernelKind, KernelMetrics, ProfilerVersion};
-pub(crate) use payload::de_backends;
+pub(crate) use payload::{de_backends, intern_backend};

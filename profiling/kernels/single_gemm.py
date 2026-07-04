@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from profiling.db.args import DType, KernelArgs
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
+    BackendSupport,
     KernelProfilerSpec,
     MetricFamily,
     RunnerRef,
@@ -47,6 +48,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="torch",
+        supports=BackendSupport(compute=frozenset({DType.BF16, DType.FP16})),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.torch",
             function_name="profile_single_gemm",
@@ -65,6 +67,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="deepgemm",
+        supports=BackendSupport(compute=frozenset({DType.FP8_E4M3})),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.deepgemm",
             function_name="profile_single_gemm",

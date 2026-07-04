@@ -129,11 +129,17 @@ def expand_sweep_params(preset: dict, registry: Registry) -> list[dict]:
     compound = preset.get("compound", {}) or {}
     derived = preset.get("derived", {}) or {}
     constraints = preset.get("constraints", []) or []
+    # The per-kernel backend override map is control (schema-exempt) but is still
+    # a sweep participant: its `${name}` values resolve from the same env, and the
+    # substituted map is written back onto each candidate as a plain `backends`
+    # block (Rust's `RunConfig.backends`). Nested `pool -> role -> value` by now
+    # (`__main__._merge_backends_file` un-flattens the file's `pool/role` keys).
+    backends = preset.get("backends", {}) or {}
 
     # All members across compound groups (each fills a param, like a sweep dim).
     compound_members = {m for rows in compound.values() for row in rows.values() for m in row}
 
-    placeholders = collect_placeholders(tree)
+    placeholders = collect_placeholders(tree) | collect_placeholders(backends)
     resolvable = set(sweep) | set(derived) | set(compound) | compound_members
     missing = placeholders - resolvable
     if missing:
@@ -179,6 +185,11 @@ def expand_sweep_params(preset: dict, registry: Registry) -> list[dict]:
             continue
 
         candidate = _substitute(tree, env)
+        if backends:
+            # Same env, same typed substitution as the tree — so `${attn_be}`
+            # becomes this combo's candidate list. Attached as a plain (non-`_`)
+            # key so `write_config` passes it straight to Rust.
+            candidate["backends"] = _substitute(backends, env)
         if labels:
             candidate[_SWEEP_LABELS_KEY] = labels
         candidate[_ENV_KEY] = env

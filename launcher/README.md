@@ -193,6 +193,45 @@ axis crossed with each file's internal axes), and prefixes each run's `log_dir`
 with the label so cross-file runs never collide. **Strictly one axis** — a
 multi-axis manifest (which would need fragment merging) is rejected.
 
+### `backends` / `backends_file`: per-kernel backend selection
+
+Every kernel picks its backend from a candidate set (best-of-N keeps the fastest
+at eval); the default is the arch's const-default. Override it per kernel with a
+`backends:` block (inline) or a `backends_file:` pointer (an external file with a
+top-level `backends:` map, resolved relative to the preset). Both are **control
+blocks** (schema-exempt, like `sweep:`), keyed by **pool-prefixed dotted role
+name**:
+
+```yaml
+backends_file: backends.yaml           # OR an inline `backends:` block
+
+# backends.yaml (or the inline block):
+backends:
+  attn/afd.attn.prefill: [fa2, fa3]    # best-of-N over the pair
+  ffn/afd.moe_expert_compute.gate_up: [deepgemm]
+  ffn/afd.post_attn.tp_allreduce: ${comm_be}   # a normal sweep var (list-valued)
+```
+
+Generate the skeleton (one entry per distinct kernel role, pre-filled with the
+default + annotated `kind | dtype | options | shape`) with the CLI flag:
+
+```bash
+python -m launcher <preset>.yaml --emit-backends > backends.yaml
+```
+
+`options` is dtype- AND GPU-filtered from each kernel's declared `BackendSupport`
+(the single source of truth — NOT `profile.db` rows), so it lists only backends
+legal for this run. A value can be a literal list or a `${name}` sweep var (a
+backend candidate list cross-products with tp/ep like any axis). Role names are
+shape-invariant, so one file spans a tp/ep sweep; the override is injected in Rust
+at each `Kernel::build` by role name, before caches fit.
+
+Validation (below) re-enumerates per concrete run and rejects an unknown/stale
+role key, a backend the kernel can't run at its dtype/GPU, or a role left
+unassigned (strict coverage). If a sweep yields runs with DIFFERENT role sets
+(e.g. `tp=1` drops `tp_allreduce`), `--emit-backends` hard-rejects — split those
+into separate presets. Shape-only differences are fine (marked `(varies)`).
+
 ### Worked example: every technique in one preset
 
 A `pd` (prefill/decode) sweep that exercises a dict-sweep, a list-sweep, a
@@ -440,7 +479,7 @@ the summary step is skipped.
 python -m launcher <preset.yaml> [<preset2> ...] [--override path=value ...]
                    [--dry-run] [--cache-report] [--refresh]
                    [--build-type <cargo-profile>] [--profile [--profile-freq HZ]]
-                   [--no-analyze]
+                   [--no-analyze] [--emit-backends [FILE]]
 python -m launcher list-params [--human] [--build-type ...]
 ```
 
@@ -451,6 +490,9 @@ python -m launcher list-params [--human] [--build-type ...]
   when possible, else kept as a bare string.
 - `--dry-run` validates + expands + prints the resolved configs; spawns nothing.
 - `--cache-report` reports profile.db coverage per unique cache key, then exits.
+- `--emit-backends [FILE]` enumerates the distinct kernels (structural, no GPU) and
+  writes the annotated `backends:` skeleton (stdout, or `FILE`), then exits — the
+  starting point for a `backends_file` (see the `backends` section above).
 - `--profile` wraps a single run with `perf record` (skill `profile-sim-speed`).
 - `list-params` dumps the Rust-authoritative schema (`--human` for a table).
 

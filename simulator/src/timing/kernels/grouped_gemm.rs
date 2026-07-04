@@ -26,6 +26,7 @@ pub struct GroupedGemmKernelConfig {
     pub gpu_name: String,
     pub n: u32,
     pub k: u32,
+    #[compute_dtype]
     pub dtype: DType,
     /// This GPU's raw ppm shard for its local experts (a slice of the global
     /// `RoutingDistribution`, so `Σ < TOTAL_PPM`). Identity: distinct shards are

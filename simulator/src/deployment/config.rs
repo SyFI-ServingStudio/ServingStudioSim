@@ -20,6 +20,7 @@
 //! `io` are run-global.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use schema_derive::ParamStruct;
@@ -27,6 +28,20 @@ use schema_derive::ParamStruct;
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::orchestrator::PoolSpec;
 use crate::worker::{AttnWorkerSel, FfnWorkerSel, IterWorkerSel};
+
+/// User-configurable per-kernel backend overrides, `pool → role → backends`.
+///
+/// Outer key = pool name (`main` / `attn` / `ffn` / `prefill` / `decode`); inner
+/// key = a kernel's dotted role `name` (pool prefix stripped, e.g.
+/// `afd.moe_expert_compute.gate_up`); value = the candidate backend list that
+/// replaces that kernel's arch const-default (best-of-N still picks the fastest).
+/// The launcher fills this from the preset's `backends_file` (a normal sweep
+/// variable), and each deployment's `build` scopes one pool's submap onto the
+/// bridge via [`PerfApiBridge::with_backend_overrides`] while that pool's model
+/// builds. Absent (the default) = every kernel keeps its arch-declared backends.
+///
+/// [`PerfApiBridge::with_backend_overrides`]: crate::timing::PerfApiBridge::with_backend_overrides
+pub type BackendOverrides = HashMap<String, HashMap<String, Vec<String>>>;
 
 /// Log verbosity. Closed set → serde enum (lowercase matches the wire spelling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -141,6 +156,11 @@ pub struct UnifiedConfig {
     pub workload: WorkloadSpec,
     pub io: IoSpec,
     pub pools: UnifiedPools,
+    /// Per-kernel backend overrides (see [`BackendOverrides`]). Genuinely
+    /// optional — absent = no overrides — so it carries a serde default rather
+    /// than the required-field treatment the valued params get.
+    #[serde(default)]
+    pub backends: BackendOverrides,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +174,9 @@ pub struct PdConfig {
     pub workload: WorkloadSpec,
     pub io: IoSpec,
     pub pools: PdPools,
+    /// Per-kernel backend overrides (see [`BackendOverrides`]); absent = none.
+    #[serde(default)]
+    pub backends: BackendOverrides,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -168,6 +191,9 @@ pub struct AfdConfig {
     pub workload: WorkloadSpec,
     pub io: IoSpec,
     pub pools: AfdPools,
+    /// Per-kernel backend overrides (see [`BackendOverrides`]); absent = none.
+    #[serde(default)]
+    pub backends: BackendOverrides,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -254,6 +280,28 @@ pools:
             u.pools.main.groups[0].arch,
             IterArchSel::Llama3Dense { .. }
         ));
+    }
+
+    #[test]
+    fn backends_overrides_parse_and_default_empty() {
+        // Absent `backends:` → empty map (serde default), i.e. no overrides.
+        let cfg: RunConfig = serde_yaml::from_str(UNIFIED_YAML).unwrap();
+        let RunConfig::Unified(u) = &cfg else { unreachable!() };
+        assert!(u.backends.is_empty());
+
+        // Present → `pool → role → candidate backends`, the shape the launcher
+        // writes from a preset's `backends_file`. Keys are pool-prefix-stripped
+        // dotted role names; values are the best-of-N candidate lists.
+        let with = format!(
+            "{UNIFIED_YAML}\nbackends:\n  \
+             main:\n    \
+             \"unified.attn.qkv\": [fa2, fa3]\n    \
+             \"unified.mlp.down\": [torch]\n"
+        );
+        let cfg: RunConfig = serde_yaml::from_str(&with).expect("parse backends block");
+        let RunConfig::Unified(u) = &cfg else { unreachable!() };
+        assert_eq!(u.backends["main"]["unified.attn.qkv"], vec!["fa2", "fa3"]);
+        assert_eq!(u.backends["main"]["unified.mlp.down"], vec!["torch"]);
     }
 
     #[test]

@@ -87,6 +87,12 @@ impl Deployment for UnifiedDeployment {
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
         let gpu_name = g.gpu.clone();
 
+        // Scope the single pool `main` over the whole arch match: one call
+        // activates its backend overrides (run) and tags it for the enumerate walk
+        // (emit). Every arm's `arch_build::*` threads the same `bridge`; the guard
+        // restores both on drop (end of `build`, or an early `?`).
+        let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
+
         // Arch selected by explicit tag; each arm builds its concrete model via
         // the shared `arch::build` builders (the same ones the `pd` deployment and
         // the offline `timing-predict` path use), validates the paired worker

@@ -105,19 +105,30 @@ impl Deployment for AfdDeployment {
                     routing_seed,
                 },
             ) => {
-                let attn_model =
-                    Arc::new(arch_build::qwen3_attn(am, *a_tp, &ag.gpu, MODEL_NAME, bridge)?);
-                let ffn_model = Arc::new(arch_build::qwen3_ffn_moe(
-                    fm,
-                    *f_tp,
-                    *ep_size,
-                    *nvl_num_gpu,
-                    *routing,
-                    *routing_seed,
-                    &fg.gpu,
-                    MODEL_NAME,
-                    bridge,
-                )?);
+                // Each pool's build is scoped by a single per-pool call: it
+                // activates that pool's backend overrides (run) and tags it for the
+                // enumerate walk (emit), and the guard restores both on drop — so
+                // ffn kernels never inherit attn's overrides. `build_transfer_cost`
+                // above ran with no active pool/override — the AFD QKV comm kernel
+                // is deployment-level, not part of either pool.
+                let attn_model = {
+                    let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
+                    Arc::new(arch_build::qwen3_attn(am, *a_tp, &ag.gpu, MODEL_NAME, bridge)?)
+                };
+                let ffn_model = {
+                    let _scope = bridge.with_backend_overrides("ffn", cfg.backends.get("ffn"));
+                    Arc::new(arch_build::qwen3_ffn_moe(
+                        fm,
+                        *f_tp,
+                        *ep_size,
+                        *nvl_num_gpu,
+                        *routing,
+                        *routing_seed,
+                        &fg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
+                };
                 // The 3-slot ring needs ≥1 layer; (unlike the plan's ≥3, this M2
                 // design does not assume a slot↔layer bijection — slots are
                 // independent micro-batches addressed by index, so a small num_layers

@@ -44,7 +44,9 @@ pub struct FlashinferAttnPrefillKernelConfig {
     pub num_qo_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
+    #[compute_dtype]
     pub q_dtype: DType,
+    #[kv_dtype]
     pub kv_dtype: DType,
     pub o_dtype: DType,
 }

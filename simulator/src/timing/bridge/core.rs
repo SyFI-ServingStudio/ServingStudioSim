@@ -1,11 +1,13 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use serde_json::Value;
 
 use crate::timing::bridge::{
-    ArgsPayload, DbMetadata, KernelKind, KernelMetrics, PerfApiError, ProfilerVersion,
+    intern_backend, ArgsPayload, DType, DbMetadata, KernelKind, KernelMetrics, PerfApiError,
+    ProfilerVersion,
 };
 
 /// One kernel's profile-coverage line for the `dry-run` report: how many of its
@@ -18,6 +20,31 @@ pub struct KernelMissing {
     pub kind: KernelKind,
     pub missing: usize,
     pub total: usize,
+}
+
+/// One distinct kernel's structural facts for the `emit-backends` enumerator: its
+/// pool, dotted role `name`, `kind`, the one-line `describe_config` (carries the
+/// dtype fields the launcher parses for the `options` column), and the current
+/// const-default candidate `backends`. Collected with NO profiling / GPU — the
+/// enumerate bridge mode records this and returns an empty kernel before any
+/// `profile.db` lookup. Reused sites (folded layers, unrolled experts) emit one
+/// record each; the launcher dedups by `(pool, name)` and counts occurrences.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct KernelEnum {
+    pub pool: String,
+    pub name: String,
+    pub kind: KernelKind,
+    /// The run GPU (nvidia-smi name) — a typed field for the launcher's capability
+    /// GPU axis (e.g. trt = Blackwell-only), so it need not scrape `config`.
+    pub gpu: String,
+    /// Compute/kv dtypes as typed fields (serialized to the wire literal `"bf16"`
+    /// / `"fp8_e4m3"` by `DType`, matching the launcher's `DType` enum), `None`
+    /// for dtype-agnostic kernels. These drive capability filtering; `config`
+    /// below is kept ONLY for the launcher's informational shape annotation.
+    pub compute_dtype: Option<DType>,
+    pub kv_dtype: Option<DType>,
+    pub config: String,
+    pub backends: Vec<String>,
 }
 
 /// Convert `Result<T, pyo3::PyErr>` to `Result<T, PerfApiError>` by flattening
@@ -55,12 +82,39 @@ pub struct PerfApiBridge {
     /// specs into this report instead of fitting caches (see `enable_dry_run`).
     /// Interior-mutable because `build` borrows the bridge by `&` only.
     dry_run: RefCell<Option<Vec<KernelMissing>>>,
+    /// Active per-role backend override map (dotted role `name` → interned
+    /// candidate backends). `Kernel::build` consults it by role `name` on the RUN
+    /// path to replace a kernel's const-default candidate set. `None` (the default,
+    /// and always the case under `emit-backends`) = every kernel keeps its
+    /// arch-declared backends. Set + restored, together with `active_pool`, by the
+    /// deployment's single [`with_backend_overrides`] call per pool.
+    ///
+    /// [`with_backend_overrides`]: PerfApiBridge::with_backend_overrides
+    backend_overrides: RefCell<Option<HashMap<String, Vec<&'static str>>>>,
+    /// The pool whose model is currently building. Read ONLY by [`record_enum`] on
+    /// the EMIT path to pool-prefix enumerate role names (worker-local names alone
+    /// don't distinguish AFD's two pools — both are `afd.…`); inert on the run
+    /// path. Set + restored alongside `backend_overrides` by the same
+    /// [`with_backend_overrides`] call — the deployment names the pool once, and
+    /// that name serves both override-scoping (run) and record-tagging (emit).
+    ///
+    /// [`with_backend_overrides`]: PerfApiBridge::with_backend_overrides
+    /// [`record_enum`]: PerfApiBridge::record_enum
+    active_pool: RefCell<Option<String>>,
+    /// `Some(..)` puts the bridge in enumerate mode: `Kernel::build` records one
+    /// [`KernelEnum`] and returns an empty kernel WITHOUT any `profile.db` lookup
+    /// (no GPU, no profiling) — the `emit-backends` structural walk. Distinct from
+    /// `dry_run`, which still calls `count_missing`.
+    enumerate: RefCell<Option<Vec<KernelEnum>>>,
 }
 
 impl PerfApiBridge {
     pub fn new() -> Result<Self, PerfApiError> {
         let bridge = Self {
             dry_run: RefCell::new(None),
+            backend_overrides: RefCell::new(None),
+            active_pool: RefCell::new(None),
+            enumerate: RefCell::new(None),
         };
         bridge.disable_jit_profiling()?;
         Ok(bridge)
@@ -94,6 +148,111 @@ impl PerfApiBridge {
     /// with an empty report. Empty `Vec` if dry-run was never enabled.
     pub fn take_dry_run_report(&self) -> Vec<KernelMissing> {
         match self.dry_run.borrow_mut().as_mut() {
+            Some(report) => std::mem::take(report),
+            None => Vec::new(),
+        }
+    }
+
+    // ── per-pool build scope: overrides (run) + pool tag (emit) ─────────────
+
+    /// Scope one pool's model build. The deployment calls this ONCE per pool,
+    /// naming the pool and passing its override submap; nothing else on the run
+    /// path touches backend/pool state, and the emit path adds no call of its own
+    /// (it is driven solely by [`enable_enumerate`](Self::enable_enumerate)). The
+    /// one pool name serves both concerns:
+    ///
+    /// - RUN — activate the pool's `role → backends` override submap so
+    ///   `Kernel::build` replaces a kernel's const-default candidate set by role
+    ///   `name`. `submap` is the pool's slice of the run config's
+    ///   `pool → role → backends` (`None` = keep arch defaults). Names are interned
+    ///   to `&'static str` here (once per distinct name per process).
+    /// - EMIT — record the pool so [`record_enum`](Self::record_enum) can prefix
+    ///   enumerate role names (inert unless in enumerate mode).
+    ///
+    /// The returned guard save/restores BOTH the previous override map and pool tag
+    /// on drop (even on an early `?` return), so pools built in sequence never leak
+    /// into one another.
+    pub fn with_backend_overrides(
+        &self,
+        pool: &str,
+        submap: Option<&HashMap<String, Vec<String>>>,
+    ) -> BackendOverrideGuard<'_> {
+        let interned = submap.map(|submap| {
+            submap
+                .iter()
+                .map(|(role, backends)| {
+                    (
+                        role.clone(),
+                        backends.iter().map(|b| intern_backend(b)).collect(),
+                    )
+                })
+                .collect()
+        });
+        let prev_overrides =
+            std::mem::replace(&mut *self.backend_overrides.borrow_mut(), interned);
+        let prev_pool = self.active_pool.borrow_mut().replace(pool.to_string());
+        BackendOverrideGuard {
+            bridge: self,
+            prev_pool,
+            prev_overrides,
+        }
+    }
+
+    /// The override candidate set for a kernel's dotted role `name`, if the active
+    /// override submap names it. `Kernel::build` calls this before fitting caches;
+    /// `None` means "keep the arch-declared const-default backends".
+    pub fn backend_override_for(&self, name: &str) -> Option<Vec<&'static str>> {
+        self.backend_overrides
+            .borrow()
+            .as_ref()
+            .and_then(|map| map.get(name).cloned())
+    }
+
+    // ── enumerate mode (emit-backends structural walk) ──────────────────────
+
+    /// Switch the bridge into enumerate mode: subsequent `Kernel::build` calls
+    /// record one [`KernelEnum`] each (no cache fit, no `profile.db` lookup) and
+    /// return an empty kernel. Drain with [`take_enum_report`](Self::take_enum_report).
+    pub fn enable_enumerate(&self) {
+        *self.enumerate.borrow_mut() = Some(Vec::new());
+    }
+
+    /// Whether the bridge is in enumerate mode.
+    pub fn is_enumerate(&self) -> bool {
+        self.enumerate.borrow().is_some()
+    }
+
+    /// Record one kernel's structural facts, tagged with the active pool. No-op
+    /// when not in enumerate mode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_enum(
+        &self,
+        name: String,
+        kind: KernelKind,
+        gpu: &str,
+        compute_dtype: Option<DType>,
+        kv_dtype: Option<DType>,
+        config: String,
+        backends: &[&'static str],
+    ) {
+        if let Some(report) = self.enumerate.borrow_mut().as_mut() {
+            report.push(KernelEnum {
+                pool: self.active_pool.borrow().clone().unwrap_or_default(),
+                name,
+                kind,
+                gpu: gpu.to_string(),
+                compute_dtype,
+                kv_dtype,
+                config,
+                backends: backends.iter().map(|b| b.to_string()).collect(),
+            });
+        }
+    }
+
+    /// Take the accumulated enumerate report, leaving the bridge in enumerate mode
+    /// with an empty report. Empty `Vec` if enumerate was never enabled.
+    pub fn take_enum_report(&self) -> Vec<KernelEnum> {
+        match self.enumerate.borrow_mut().as_mut() {
             Some(report) => std::mem::take(report),
             None => Vec::new(),
         }
@@ -251,6 +410,39 @@ impl PerfApiBridge {
             }
             Ok(versions)
         })
+    }
+}
+
+/// RAII guard from [`PerfApiBridge::with_backend_overrides`]: restores BOTH the
+/// previous override map and the previous pool tag on drop (even on an early `?`
+/// return), so a pool's build scope never leaks into the next. Holds the bridge by
+/// shared ref — its state is `RefCell`, so no `&mut` is needed.
+#[must_use = "the pool scope is active only while this guard is alive"]
+pub struct BackendOverrideGuard<'a> {
+    bridge: &'a PerfApiBridge,
+    prev_pool: Option<String>,
+    prev_overrides: Option<HashMap<String, Vec<&'static str>>>,
+}
+
+impl Drop for BackendOverrideGuard<'_> {
+    fn drop(&mut self) {
+        *self.bridge.backend_overrides.borrow_mut() = self.prev_overrides.take();
+        *self.bridge.active_pool.borrow_mut() = self.prev_pool.take();
+    }
+}
+
+#[cfg(test)]
+impl PerfApiBridge {
+    /// Test-only constructor that skips the Python `disable_jit_profiling` init
+    /// (which imports `profiling.perf_api`). Lets the backend-override unit tests
+    /// exercise pure bridge state with no live perf_api / GIL.
+    pub(crate) fn new_uninit_for_test() -> Self {
+        Self {
+            dry_run: RefCell::new(None),
+            backend_overrides: RefCell::new(None),
+            active_pool: RefCell::new(None),
+            enumerate: RefCell::new(None),
+        }
     }
 }
 
@@ -427,9 +619,150 @@ fn optional_string(item: &PyAny, field: &str) -> Result<Option<String>, PerfApiE
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_payload_backends_match, shared_backend};
+    use super::{ensure_payload_backends_match, shared_backend, PerfApiBridge};
+    use crate::timing::bridge::payload::intern_backend;
     use crate::timing::bridge::{ArgsPayload, PerfApiError};
     use serde_json::Value;
+    use std::collections::HashMap;
+
+    fn submap(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(role, backends)| {
+                (
+                    role.to_string(),
+                    backends.iter().map(|b| b.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn override_scope_sets_by_role_and_clears_on_drop() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        // No overrides active by default.
+        assert_eq!(bridge.backend_override_for("afd.moe_expert_compute.gate_up"), None);
+
+        let map = submap(&[
+            ("afd.moe_expert_compute.gate_up", &["fa3"]),
+            ("afd.attn_block.qkv", &["fa2", "fa3"]),
+        ]);
+        {
+            let _scope = bridge.with_backend_overrides("ffn", Some(&map));
+            // Named roles resolve to their (interned) candidate lists...
+            assert_eq!(
+                bridge.backend_override_for("afd.moe_expert_compute.gate_up"),
+                Some(vec!["fa3"])
+            );
+            assert_eq!(
+                bridge.backend_override_for("afd.attn_block.qkv"),
+                Some(vec!["fa2", "fa3"])
+            );
+            // ...an unnamed role keeps its const default (no override).
+            assert_eq!(bridge.backend_override_for("afd.some.other"), None);
+        }
+        // Guard dropped: overrides restored to none, so a later pool can't inherit them.
+        assert_eq!(bridge.backend_override_for("afd.moe_expert_compute.gate_up"), None);
+    }
+
+    #[test]
+    fn override_scope_none_is_noop() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        let _scope = bridge.with_backend_overrides("main", None);
+        assert_eq!(bridge.backend_override_for("anything"), None);
+    }
+
+    #[test]
+    fn sequential_scopes_do_not_leak_across_pools() {
+        // Mirrors afd/pd: pool A's submap is scoped, dropped, then pool B's — B
+        // must not see A's overrides (and vice versa).
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        let attn = submap(&[("afd.attn_block.qkv", &["fa3"])]);
+        let ffn = submap(&[("afd.moe_expert_compute.gate_up", &["deepgemm"])]);
+        {
+            let _a = bridge.with_backend_overrides("attn", Some(&attn));
+            assert_eq!(bridge.backend_override_for("afd.attn_block.qkv"), Some(vec!["fa3"]));
+        }
+        {
+            let _f = bridge.with_backend_overrides("ffn", Some(&ffn));
+            // ffn scope: attn's role is gone, ffn's role is present.
+            assert_eq!(bridge.backend_override_for("afd.attn_block.qkv"), None);
+            assert_eq!(
+                bridge.backend_override_for("afd.moe_expert_compute.gate_up"),
+                Some(vec!["deepgemm"])
+            );
+        }
+    }
+
+    #[test]
+    fn nested_override_scopes_restore_the_outer_map() {
+        // save/restore (not clear-to-none): an inner scope shadows the outer one,
+        // and dropping it restores the OUTER overrides rather than wiping them.
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        let outer = submap(&[("r", &["fa2"])]);
+        let inner = submap(&[("r", &["fa3"])]);
+        let _o = bridge.with_backend_overrides("p", Some(&outer));
+        assert_eq!(bridge.backend_override_for("r"), Some(vec!["fa2"]));
+        {
+            let _i = bridge.with_backend_overrides("p", Some(&inner));
+            assert_eq!(bridge.backend_override_for("r"), Some(vec!["fa3"]));
+        }
+        assert_eq!(bridge.backend_override_for("r"), Some(vec!["fa2"]));
+    }
+
+    #[test]
+    fn enumerate_records_are_pool_tagged_and_drained() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        assert!(!bridge.is_enumerate());
+        bridge.enable_enumerate();
+        assert!(bridge.is_enumerate());
+        {
+            // The deployment's single per-pool call sets the pool tag (its override
+            // submap is None here — the emit path strips backends).
+            let _s = bridge.with_backend_overrides("ffn", None);
+            bridge.record_enum(
+                "afd.moe.gate_up".into(),
+                "grouped_gemm",
+                "NVIDIA H200",
+                Some(super::DType::Fp8E4m3),
+                None,
+                "dtype=Fp8E4m3".into(),
+                &["deepgemm"],
+            );
+        }
+        // outside any pool scope → empty pool tag (deployment-level kernel).
+        bridge.record_enum(
+            "afd_qkv_transfer".into(),
+            "p2p_inter",
+            "NVIDIA H200",
+            None,
+            None,
+            "fabric=Infiniband".into(),
+            &["nccl", "nvshmem"],
+        );
+        let report = bridge.take_enum_report();
+        assert_eq!(report.len(), 2);
+        assert_eq!(report[0].pool, "ffn");
+        assert_eq!(report[0].name, "afd.moe.gate_up");
+        assert_eq!(report[0].backends, vec!["deepgemm".to_string()]);
+        assert_eq!(report[0].gpu, "NVIDIA H200");
+        assert_eq!(report[0].compute_dtype, Some(super::DType::Fp8E4m3));
+        assert_eq!(report[1].compute_dtype, None); // comm is dtype-agnostic
+        assert_eq!(report[1].pool, ""); // deployment-level, no active pool
+        // draining leaves an empty report while still in enumerate mode.
+        assert!(bridge.take_enum_report().is_empty());
+        assert!(bridge.is_enumerate());
+    }
+
+    #[test]
+    fn intern_backend_dedups_to_one_pointer() {
+        // Same name → same &'static (leaked once); distinct names differ.
+        let a = intern_backend("fa3");
+        let b = intern_backend(&String::from("fa3"));
+        assert_eq!(a, b);
+        assert!(std::ptr::eq(a, b), "same backend name must intern to one pointer");
+        assert_ne!(intern_backend("fa2"), intern_backend("fa3"));
+    }
 
     fn payload(backend: Option<&str>) -> ArgsPayload {
         let mut p = ArgsPayload::new();

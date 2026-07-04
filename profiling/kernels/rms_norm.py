@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from profiling.db.args import DType, KernelArgs
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
+    BackendSupport,
     KernelProfilerSpec,
     MetricFamily,
     RunnerRef,
@@ -45,6 +46,8 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer",
+        # Norms stay 16-bit even in an fp8 run (activation precision).
+        supports=BackendSupport(compute=frozenset({DType.BF16, DType.FP16})),
         runner_ref=RunnerRef(
             module_name="profiling.runners.norm.flashinfer",
             function_name="profile_rms_norm",

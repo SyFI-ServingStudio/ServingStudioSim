@@ -13,7 +13,9 @@ pub mod config;
 pub mod pd;
 pub mod unified;
 
-pub use config::{AfdConfig, IoSpec, LogLevel, PdConfig, RunConfig, UnifiedConfig, WorkloadSpec};
+pub use config::{
+    AfdConfig, BackendOverrides, IoSpec, LogLevel, PdConfig, RunConfig, UnifiedConfig, WorkloadSpec,
+};
 
 use crate::common::SharedRequests;
 use crate::orchestrator::Flow;

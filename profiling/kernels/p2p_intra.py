@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from profiling.db.args import DType, KernelArgs
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
+    BackendSupport,
     KernelProfilerSpec,
     MetricFamily,
     RunnerRef,
@@ -43,6 +44,8 @@ def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
     return KernelProfilerSpec(
         kernel_kind=KIND,
         backend=backend,
+        # Comm is size-keyed — dtype-agnostic.
+        supports=BackendSupport(compute=None),
         # list_native: the runner spawns its 2-rank group once per chunk and loops
         # every size inside (no per-shape re-init). function_name points at the batch
         # entry, not the single-spec one.

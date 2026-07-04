@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from profiling.db.args import DType, KernelArgs
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
+    BackendSupport,
     KernelProfilerSpec,
     MetricFamily,
     RunnerRef,
@@ -45,6 +46,8 @@ def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
     return KernelProfilerSpec(
         kernel_kind=KIND,
         backend=backend,
+        # Comm is size-keyed — dtype-agnostic.
+        supports=BackendSupport(compute=None),
         runner_ref=RunnerRef(module_name=module_name, function_name="profile_p2p"),
         table_name=KIND,
         args_schema=P2pInterArgs,

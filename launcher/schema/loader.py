@@ -41,8 +41,130 @@ from typing import Any
 # launcher/schema/loader.py -> parents: [0]=schema, [1]=launcher, [2]=repo root.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+
+class PresetError(ValueError):
+    """A preset file is malformed (bad root type, duplicate keys, parse error)."""
+
+
+def _reject_duplicate_pairs(pairs: list[tuple]) -> dict:
+    """`object_pairs_hook` / mapping builder that rejects duplicate keys instead of
+    silently keeping the last (both `json` and PyYAML default to last-wins)."""
+    out: dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise PresetError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
+def _load_preset(path: Path) -> dict:
+    """Read a preset file into a mapping. `.json` uses the JSON parser; everything
+    else (`.yaml` / `.yml`) uses YAML (a JSON superset), matching the Rust binary.
+    Strict: duplicate keys are rejected (not last-wins) and the root must be a
+    mapping. Raises `PresetError` on any of these."""
+    text = path.read_text()
+    if path.suffix == ".json":
+        try:
+            data = json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
+        except json.JSONDecodeError as exc:
+            raise PresetError(str(exc)) from exc
+    else:
+        import yaml
+
+        class _StrictLoader(yaml.SafeLoader):
+            pass
+
+        _StrictLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            lambda loader, node: _reject_duplicate_pairs(
+                [
+                    (loader.construct_object(k), loader.construct_object(v))
+                    for k, v in node.value
+                ]
+            ),
+        )
+        try:
+            data = yaml.load(text, Loader=_StrictLoader)
+        except yaml.YAMLError as exc:
+            raise PresetError(str(exc)) from exc
+
+    if not isinstance(data, dict):
+        raise PresetError(
+            f"top-level must be a mapping, got {type(data).__name__}"
+        )
+    return data
+
+
 # Top-level preset keys that are launcher control blocks, not config tree nodes.
-CONTROL_KEYS = frozenset({"sweep", "compound", "derived", "constraints"})
+# `backends` is the per-kernel backend override map (`pool/role -> candidate
+# list`); `backends_file` points at an external file holding it. Both are
+# schema-exempt (not walked by `iter_slots` / not flagged by `unknown_keys`), but
+# `backends` still takes part in `${}` placeholder substitution (it is an ordinary
+# sweep participant) and is written through to the Rust config — see
+# `expand.expand_sweep_params` and `__main__._merge_backends_file`.
+CONTROL_KEYS = frozenset(
+    {"sweep", "compound", "derived", "constraints", "backends", "backends_file"}
+)
+
+
+def _unflatten_backends(flat: dict, kind: str) -> dict:
+    """Un-flatten a `pool/role -> value` map into Rust's nested `pool -> {role ->
+    value}` (`RunConfig.backends`). Every key must be `pool/role` — the
+    pool-prefixed dotted role the dry-run emits — so a key without `/` (which
+    can't be routed to a pool) is an error. `kind` names the source (`backends` /
+    a file path) for the message."""
+    nested: dict = {}
+    for key, value in flat.items():
+        if not isinstance(key, str) or "/" not in key:
+            raise PresetError(
+                f"{kind} key {key!r} must be `pool/role` (pool-prefixed, e.g. "
+                "`ffn/afd.moe_expert_compute.gate_up`); run `--emit-backends` for "
+                "the exact keys"
+            )
+        pool, role = key.split("/", 1)
+        nested.setdefault(pool, {})[role] = value
+    return nested
+
+
+def _merge_backends_file(preset: dict, source: str) -> dict:
+    """Resolve a `backends_file:` pointer + any inline `backends:` block into one
+    nested `backends` map (Rust's `RunConfig.backends`), keyed `pool -> role ->
+    value`.
+
+    Both the file and the inline block use flat pool-prefixed `pool/role:` keys —
+    exactly what `--emit-backends` writes — which are un-flattened here. `${var}`
+    values are left intact for `expand_sweep_params` to substitute per combo. The
+    file (the more specific pointer) wins on a key collision with the inline
+    block. Mutates + returns the preset (dropping `backends_file`). Raises
+    `PresetError` on a malformed block / missing file / non-`pool/role` key."""
+    flat: dict = {}
+    inline = preset.get("backends")
+    if inline is not None:
+        if not isinstance(inline, dict):
+            raise PresetError("`backends` must be a mapping of `pool/role -> backends`")
+        flat.update(inline)
+
+    file_ref = preset.pop("backends_file", None)
+    if file_ref is not None:
+        if not isinstance(file_ref, str):
+            raise PresetError("`backends_file` must be a path string")
+        path = Path(file_ref)
+        if not path.is_absolute():
+            path = Path(source).parent / path  # resolve relative to the preset
+        if not path.is_file():
+            raise PresetError(f"backends_file {file_ref!r} not found")
+        doc = _load_preset(path)
+        file_map = doc.get("backends")
+        if not isinstance(file_map, dict):
+            raise PresetError(
+                f"backends_file {file_ref!r}: expected a top-level `backends:` "
+                "mapping (the shape `--emit-backends` writes)"
+            )
+        flat.update(file_map)
+
+    if flat:
+        preset["backends"] = _unflatten_backends(flat, "backends")
+    return preset
 
 # Fixed skeleton key sets (the uniform pool shape — new-interface-design §8).
 _POOL_KEYS = frozenset({"placement", "groups"})

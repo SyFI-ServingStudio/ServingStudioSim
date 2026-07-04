@@ -112,6 +112,41 @@ placeholder — see `launcher/README.md`.
 
 Prefer one preset with internal sweeps over many sibling experiment folders.
 
+## Per-kernel backend selection (optional)
+
+Every kernel picks its backend from a candidate set; best-of-N keeps the fastest
+at eval. The default set is the arch's const-default. To tailor it per kernel:
+
+1. **Emit the skeleton** — enumerate the distinct kernels this preset touches
+   (structural walk, NO GPU / profiling) and print a `backends:` skeleton, one
+   entry per kernel role, pre-filled with the current default and annotated
+   `kind | dtype | options | shape`:
+   ```bash
+   cd /m-coriander/coriander/kanzhu/MLSim_workspace/main
+   uv run python -m launcher logs/<experiment-name>/preset.yaml \
+     --emit-backends logs/<experiment-name>/backends.yaml
+   ```
+   (omit the FILE arg to print to stdout instead.)
+   `options` is already dtype- AND GPU-filtered (from each kernel's declared
+   `BackendSupport`), so it lists only the backends legal for this run (e.g. `trt`
+   is dropped off a non-Blackwell GPU).
+
+2. **Edit `backends.yaml`** — set each role to a subset (`[fa3]` forces one,
+   `[fa2, fa3]` is best-of-N), keep the default, or point it at a `${var}` declared
+   under the preset's `sweep:` — a backend candidate list is a normal sweep value,
+   so backends cross-product with tp/ep like any other axis.
+
+3. **Point the preset at it** — add `backends_file: backends.yaml` (resolved
+   relative to the preset), or inline a `backends:` block. Keys are pool-prefixed
+   role names (e.g. `attn/afd.attn.prefill`), stable across a tp/ep sweep.
+
+The launcher re-enumerates + validates every concrete run: an unknown/stale role
+key, a backend the kernel can't run at its dtype/GPU, or a role left unassigned
+(strict coverage) is a hard error. If a sweep yields runs with DIFFERENT kernel
+role sets (e.g. `tp=1` has no `tp_allreduce`), `--emit-backends` hard-rejects —
+split those into separate presets/files. Shape-only differences across the sweep
+are fine (the skeleton marks the moved shape `(varies)`; one map still spans it).
+
 ## log_dir Rewrite
 
 `io.log_dir` uses `{name}` string templating where each `{name}` is a **bare

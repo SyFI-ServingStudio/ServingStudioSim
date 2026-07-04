@@ -19,6 +19,7 @@ pub struct SingleGemmKernelConfig {
     pub gpu_name: String,
     pub n: u32,
     pub k: u32,
+    #[compute_dtype]
     pub dtype: DType,
 }
 

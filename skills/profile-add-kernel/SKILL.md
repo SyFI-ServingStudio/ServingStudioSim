@@ -69,7 +69,9 @@ You MUST keep a live report. Do not write any code before step 0 is done.
 - `docs/file_structure.md` — L1 `profiling/` and `simulator/src/timing/` layout.
 - `docs/detailed_design/L1/design.md`:
   - §2.3 runner examples + ownership boundary; §2.5 / §2.5b `Timer` / `Energy`.
-  - §3.2.1 registry / `KernelProfilerSpec` / args-schema ownership.
+  - §3.2.1 registry / `KernelProfilerSpec` / args-schema ownership. Also read
+    `profiling/db/registry.py`'s `BackendSupport` (the per-backend dtype/GPU
+    capability that drives backend selection — step B2c below).
   - §8.1 / §8.2 compute / comm kernel tables — locate your kernel's row. **But
     these tables only give family / runner / cache / metric family / the Timer
     to use. They do NOT list the config fields, nor the Config-vs-Input split.**
@@ -139,6 +141,17 @@ Phase B — Python profiling side
        function_name = "profile_<kind>_batch" AND list_native=True.
        NEW backend: add a second register(...) call in the existing
        profiling/kernels/<kind>.py; reuse <Kind>Args; no new file/barrel line.
+[ ] B2c Declare each backend's capability on its register(...):
+       supports=BackendSupport(compute={dtypes}|None, kv={dtypes}|None,
+       gpus={gpu_names}|None). This is the SINGLE SOURCE OF TRUTH for the
+       `--emit-backends` options column AND the launcher backend-map validator
+       (NOT profile.db row presence). compute=None = dtype-agnostic (comm is
+       size-keyed, elementwise byte-keyed); `kv` only for attention (independent
+       of compute — bf16-query/fp8-KV is valid); `gpus` only to gate a backend to
+       specific parts (e.g. trt = frozenset({"NVIDIA B200"})). Mirror an existing
+       kernel: single_gemm.py (compute-only), flashinfer_attn_prefill.py
+       (compute+kv+gpus), all_reduce.py (compute=None). MUST match the Rust dtype
+       tags in C2b.
 [ ] B3 NEW kind only: add `from profiling.kernels import <kind>  # noqa: F401`
        to profiling/kernels/__init__.py (match the existing single_gemm style;
        ruff will re-sort the import block — that is expected).
@@ -162,6 +175,15 @@ Phase C — Rust timing side
        `pub type <Name>Kernel = Kernel<<Name>Spec>`.
 [ ] C2 enumerate emits the SAME field set as Python <Kind>Args + `backend`
        (verify against A5).
+[ ] C2b If the config carries a dtype, tag its field so the enumerate record emits
+       a TYPED dtype for the launcher capability gate: #[compute_dtype] on the
+       compute field (a GEMM/norm's `dtype`, attention's `q_dtype`), #[kv_dtype]
+       on attention's KV field. #[derive(KernelConfig)] generates the
+       compute_dtype()/kv_dtype() accessors from the tags (untagged = None =
+       dtype-agnostic, e.g. comm/elementwise). These MUST agree with B2c's
+       BackendSupport compute/kv axes — the launcher reads the typed field, never
+       re-parses describe_config. Mirror single_gemm.rs (compute) /
+       flashinfer_attn_prefill.rs (compute+kv).
 [ ] C3 Wire simulator/src/timing/kernels/mod.rs: `pub mod <kind>;` + `pub use`.
 [ ] C4 Add #[cfg(test)] tests in <kind>.rs mirroring single_gemm.rs (config
        identity, describe_config, input coords flatten, enumerate emits all wire
@@ -236,7 +258,15 @@ Copy `single_gemm.py`: `KIND: str = "<kind>"` (snake_case), a
 and one `register(KernelProfilerSpec(kernel_kind=KIND, backend="<backend>",
 runner_ref=RunnerRef("profiling.runners.<family>.<backend>", "profile_<kind>"),
 table_name=KIND, args_schema=<Kind>Args, metric_family=MetricFamily.COMPUTE,
-batch_outlier_policy=BatchOutlierPolicy()))`.
+batch_outlier_policy=BatchOutlierPolicy(), supports=BackendSupport(...)))`.
+
+The `supports=` (step B2c) is the load-bearing new field: it declares which
+dtypes / GPU this `(kind, backend)` can run, and is what the launcher's
+`--emit-backends` skeleton (the `options` column) and its backend-map validator
+consult — *not* whether `profile.db` has a row (a cold cache still counts as
+supported). Get it from the reference kernel comment / the library's real
+constraints, not from what happens to be measured. A compute-agnostic kernel
+(comm, elementwise) passes `compute=None`.
 
 For a **list-native comm** kernel (see the runner-contract callout above), mirror
 `all_reduce.py` instead: `metric_family=MetricFamily.COMM`, point the `RunnerRef`
@@ -247,7 +277,12 @@ RunnerRef) is identical.
 ### C1 Rust kernel (`simulator/src/timing/kernels/<kind>.rs`)
 Copy `single_gemm.rs`. Static dims → `<Name>KernelConfig` fields (besides
 `backends`); runtime sweep dims → `<Name>KernelInput` fields (one field per sweep
-axis).
+axis). If the config has a dtype field, tag it so the enumerate record carries a
+typed dtype (step C2b): `#[compute_dtype]` on the compute field, `#[kv_dtype]` on
+attention's KV field. `#[derive(KernelConfig)]` reads the tags to generate the
+`compute_dtype()`/`kv_dtype()` accessors (untagged → `None`). These typed fields
+must match the Python `BackendSupport` axes (B2c) — the launcher reads them
+directly instead of parsing the `describe_config` string.
 - **1D** (e.g. rms_norm, elementwise): `sweep_grid` = `SweepGrid::new(vec![
   Axis::token_axis()])`; `cache_kind` = `Cache1DLinear`; `enumerate` uses
   `grid.expand_1d`.

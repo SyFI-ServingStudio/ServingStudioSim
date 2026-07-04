@@ -90,18 +90,38 @@ impl<'de> Deserialize<'de> for DType {
 
 /// serde `deserialize_with` for a `KernelConfig`'s `backends: Vec<&'static str>`
 /// field, which is otherwise not `Deserialize` (a borrowed `'static` can't own
-/// JSON-provided strings). Reads `Vec<String>` and leaks each into a
-/// `&'static str`. Only invoked on the `kernel-query` path, which builds one
-/// kernel in a short-lived subprocess and exits — leaking a few backend strings
-/// is negligible and avoids maintaining a central known-backend registry.
+/// JSON-provided strings). Reads `Vec<String>` and interns each into a
+/// `&'static str` via [`intern_backend`]. Only invoked on the `kernel-query`
+/// path, which builds one kernel in a short-lived subprocess and exits.
 pub(crate) fn de_backends<'de, D>(d: D) -> Result<Vec<&'static str>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let v = Vec::<String>::deserialize(d)?;
-    Ok(v.into_iter()
-        .map(|s| &*Box::leak(s.into_boxed_str()))
-        .collect())
+    Ok(v.into_iter().map(|s| intern_backend(&s)).collect())
+}
+
+/// Intern a runtime backend name into a `&'static str`, deduplicating against a
+/// process-global set so each distinct name is leaked at most once. Backend
+/// override values arrive as owned `String`s (from the run config), but
+/// `KernelConfig.backends` is `Vec<&'static str>` (the const-default sets are
+/// string literals). The set of distinct backend names in one process is tiny
+/// and bounded (a handful: `fa2/fa3/torch/deepgemm/nccl/...`), so a dedup-leak
+/// is the pragmatic bridge from owned to `'static`. Unknown-backend rejection is
+/// NOT done here (Rust has no capability table): the launcher validator (Phase 4)
+/// owns that, checking each override value against the kernel's declared
+/// `BackendSupport` at its scheme dtype.
+pub(crate) fn intern_backend(s: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut set = POOL.get_or_init(|| Mutex::new(HashSet::new())).lock().unwrap();
+    if let Some(&existing) = set.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    set.insert(leaked);
+    leaked
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

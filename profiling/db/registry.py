@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from profiling.db.args import KernelArgs
+from profiling.db.args import DType, KernelArgs
 from profiling.db.kind import KernelKind
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.runners.metrics import Metrics, RunnerResult
@@ -55,6 +55,58 @@ class RunnerRef:
 
 
 @dataclass(frozen=True)
+class BackendSupport:
+    """Which dtypes / GPU a ``(kernel_kind, backend)`` can actually run.
+
+    The single source of truth for backend-selection validation and the dry-run
+    ``options`` column — NOT ``profile.db`` row presence. A cold cache has no
+    measured rows yet, but the combo is still *supported* (it can be JIT-filled);
+    conversely a combo the kernel does not support (e.g. ``fa2`` with an fp8
+    *query*) must be rejected before it ever reaches profiling.
+
+    Two dtype axes, because for attention they are genuinely independent:
+
+    - ``compute`` — the compute/activation precision (attention's ``q_dtype``, or
+      the single ``dtype`` of a GEMM/norm). ``None`` = compute-dtype-agnostic
+      (the comm kernels are size-keyed; elementwise is byte-keyed).
+    - ``kv`` — the KV-cache precision (attention only; ``None`` = not applicable).
+      fp8 KV with a bf16 *query* is broadly supported — e.g. ``fa2`` runs bf16-q /
+      fp8-kv, which is a current production config. Only fp8 *compute* needs
+      ``fa3``. Keeping ``compute`` and ``kv`` separate is what lets ``fa2`` stay
+      valid for fp8-KV while ``cudnn`` (bf16-kv only) is correctly excluded.
+    - ``gpus`` — ``None`` = any GPU; a set restricts to those ``gpu_name`` values.
+
+    The profile.db cache still keys on the full dtype tuple; this type only gates
+    *which backends are legal*. Fine, per-request shape constraints (e.g. cudnn
+    causal + prefix_len>0) are NOT modeled here — they stay a JIT/profile-time
+    concern.
+    """
+
+    compute: frozenset[DType] | None
+    kv: frozenset[DType] | None = None
+    gpus: frozenset[str] | None = None
+
+    def allows(
+        self,
+        compute_dtype: DType,
+        kv_dtype: DType | None = None,
+        gpu: str | None = None,
+    ) -> bool:
+        if self.compute is not None and compute_dtype not in self.compute:
+            return False
+        if self.kv is not None and kv_dtype is not None and kv_dtype not in self.kv:
+            return False
+        if self.gpus is not None and gpu is not None and gpu not in self.gpus:
+            return False
+        return True
+
+
+# Permissive default for specs that do not declare a capability (test fixtures);
+# every production kernel below sets `supports=` explicitly.
+_ANY_SUPPORT = BackendSupport(compute=None)
+
+
+@dataclass(frozen=True)
 class KernelProfilerSpec:
     kernel_kind: KernelKind
     backend: str
@@ -63,6 +115,7 @@ class KernelProfilerSpec:
     args_schema: type[KernelArgs]
     metric_family: MetricFamily
     batch_outlier_policy: BatchOutlierPolicy
+    supports: BackendSupport = _ANY_SUPPORT
     subprocess_env: str | None = None
     subprocess_module: str | None = None
     gpu_count_fn: Callable[[dict[str, Any]], int] | None = None
@@ -166,6 +219,16 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
             )
         registered_keys.add(key)
 
+        # An empty dtype set means "supports nothing", which is never intended —
+        # dtype-agnostic axes use `None`.
+        supports = profiler_spec.supports
+        for axis, allowed in (("compute", supports.compute), ("kv", supports.kv)):
+            if allowed is not None and not allowed:
+                raise ValueError(
+                    f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares an "
+                    f"empty {axis} dtype set; use None for a {axis}-agnostic axis"
+                )
+
         expected_contract = table_contracts.get(profiler_spec.table_name)
         actual_contract = _TableContract(
             kernel_kind=profiler_spec.kernel_kind,
@@ -193,6 +256,36 @@ def iter_kernel_profiler_specs(
 
 def known_backends(kernel_kind: KernelKind) -> list[str]:
     return [profiler_spec.backend for profiler_spec in iter_kernel_profiler_specs(kernel_kind)]
+
+
+def backend_supports(
+    kernel_kind: KernelKind,
+    backend: str,
+    compute_dtype: DType,
+    kv_dtype: DType | None = None,
+    gpu: str | None = None,
+) -> bool:
+    """Whether ``backend`` can run ``kernel_kind`` at these dtypes on ``gpu`` — the
+    capability gate for the backend-selection validator (rejects e.g. torch@fp8,
+    or fa2 with an fp8 *query*, while allowing fa2 with fp8 KV + bf16 query)."""
+    return find_kernel_profiler_spec(kernel_kind, backend).supports.allows(
+        compute_dtype, kv_dtype, gpu
+    )
+
+
+def supported_backends(
+    kernel_kind: KernelKind,
+    compute_dtype: DType,
+    kv_dtype: DType | None = None,
+    gpu: str | None = None,
+) -> list[str]:
+    """Registered backends of ``kernel_kind`` that support these dtypes on ``gpu``
+    — the dry-run ``options`` column (already filtered to the kernel's dtypes)."""
+    return [
+        profiler_spec.backend
+        for profiler_spec in iter_kernel_profiler_specs(kernel_kind)
+        if profiler_spec.supports.allows(compute_dtype, kv_dtype, gpu)
+    ]
 
 
 def resolve_spec_backend(kernel_kind: KernelKind, spec: dict[str, Any]) -> str:

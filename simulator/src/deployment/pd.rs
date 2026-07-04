@@ -83,10 +83,14 @@ impl Deployment for PdDeployment {
                 IterArchSel::Llama3DenseTp { tp_size: ptp, .. },
                 IterArchSel::Llama3DenseTp { tp_size: dtp, .. },
             ) => {
-                let prefill_model =
-                    Arc::new(arch_build::dense_tp(pg.arch.model(), *ptp, &pg.gpu, MODEL_NAME, bridge)?);
-                let decode_model =
-                    Arc::new(arch_build::dense_tp(dg.arch.model(), *dtp, &dg.gpu, MODEL_NAME, bridge)?);
+                let prefill_model = {
+                    let _scope = bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
+                    Arc::new(arch_build::dense_tp(pg.arch.model(), *ptp, &pg.gpu, MODEL_NAME, bridge)?)
+                };
+                let decode_model = {
+                    let _scope = bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
+                    Arc::new(arch_build::dense_tp(dg.arch.model(), *dtp, &dg.gpu, MODEL_NAME, bridge)?)
+                };
                 Ok(assemble_pd_flow(
                     prefill_model,
                     decode_model,
@@ -112,16 +116,21 @@ impl Deployment for PdDeployment {
                     ..
                 },
             ) => {
-                let prefill_model =
-                    Arc::new(arch_build::dense_tp(pg.arch.model(), *ptp, &pg.gpu, MODEL_NAME, bridge)?);
-                let decode_model = Arc::new(arch_build::dp_attn_tp_ffn(
-                    dg.arch.model(),
-                    *attn_tp_size,
-                    *ffn_tp_size,
-                    &dg.gpu,
-                    MODEL_NAME,
-                    bridge,
-                )?);
+                let prefill_model = {
+                    let _scope = bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
+                    Arc::new(arch_build::dense_tp(pg.arch.model(), *ptp, &pg.gpu, MODEL_NAME, bridge)?)
+                };
+                let decode_model = {
+                    let _scope = bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
+                    Arc::new(arch_build::dp_attn_tp_ffn(
+                        dg.arch.model(),
+                        *attn_tp_size,
+                        *ffn_tp_size,
+                        &dg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
+                };
                 Ok(assemble_pd_flow(
                     prefill_model,
                     decode_model,

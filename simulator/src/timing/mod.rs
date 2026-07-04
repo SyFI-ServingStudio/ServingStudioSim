@@ -9,7 +9,9 @@ pub mod routing;
 pub mod slot_input;
 pub mod sweep;
 
-pub use bridge::{BuildError, KernelMissing, PerfApiBridge};
+pub use bridge::{
+    BackendOverrideGuard, BuildError, DType, KernelEnum, KernelMissing, PerfApiBridge,
+};
 pub use cache::interp::{CoverageFlags, LeafMetrics, Metrics4};
 pub use cost_tree::{
     CostManifest, CostManifestDoc, CostManifestSection, CostNode, CostTree, CostTreeBuilder,

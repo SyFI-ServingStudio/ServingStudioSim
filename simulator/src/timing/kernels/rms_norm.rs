@@ -21,6 +21,7 @@ pub struct RmsNormKernelConfig {
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
     pub hidden: u32,
+    #[compute_dtype]
     pub dtype: DType,
 }
 

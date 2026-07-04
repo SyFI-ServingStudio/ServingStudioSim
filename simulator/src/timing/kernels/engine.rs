@@ -13,7 +13,7 @@ use crate::timing::cache::interp::LeafMetrics;
 use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning};
 use crate::timing::result::CacheProbe;
 use crate::timing::sweep::{SweepCoords, SweepGrid};
-use crate::timing::{BuildError, Probe};
+use crate::timing::{BuildError, DType, Probe};
 
 /// Per-kernel `*KernelConfig` contract: identity (`Hash + Eq`) + the required
 /// `backends: Vec<&'static str>` field exposed via `backends()`. The proc-macro
@@ -22,6 +22,11 @@ use crate::timing::{BuildError, Probe};
 /// to derive at the generated access site.
 pub trait KernelConfig: std::hash::Hash + Eq + Clone + std::fmt::Debug + 'static {
     fn backends(&self) -> &[&'static str];
+    /// Replace the candidate backend set. The `#[derive(KernelConfig)]` macro
+    /// generates `self.backends = backends`. Called at `Kernel::build` when a
+    /// per-role user override is active on the bridge, so the override lands in
+    /// the config's identity (`Hash`/`describe_config`) before caches are fit.
+    fn set_backends(&mut self, backends: Vec<&'static str>);
     /// Used in build-error messages, e.g. `"SingleGemmKernelConfig.backends"`.
     /// Auto-derived as `"{StructName}.backends"`.
     const BACKENDS_FIELD: &'static str;
@@ -31,6 +36,23 @@ pub trait KernelConfig: std::hash::Hash + Eq + Clone + std::fmt::Debug + 'static
     /// passed to the bridge at `build` (`get_times` / `count_missing`) as the DB
     /// `gpu_name` key.
     fn gpu_name(&self) -> &str;
+
+    /// The compute/activation dtype (a GEMM's `dtype`, attention's `q_dtype`), or
+    /// `None` for a dtype-agnostic kernel (size-keyed comm, byte-keyed
+    /// elementwise). `#[derive(KernelConfig)]` overrides the default from the
+    /// field tagged `#[compute_dtype]`. Emitted as a typed field in the enumerate
+    /// record so the launcher's capability gate reads it directly — never
+    /// re-parses `describe_config`.
+    fn compute_dtype(&self) -> Option<DType> {
+        None
+    }
+
+    /// The KV-cache dtype (attention only; from the field tagged `#[kv_dtype]`),
+    /// or `None` elsewhere. Independent of `compute_dtype`: a bf16 query with an
+    /// fp8 KV cache is a valid attention config.
+    fn kv_dtype(&self) -> Option<DType> {
+        None
+    }
 
     /// One-line config summary for the `Describe` leaf line — the `<cfg>` after
     /// `<name> (<KIND>)`. The default is the full `{self:?}`; `#[derive(KernelConfig)]`
@@ -105,14 +127,47 @@ pub struct Kernel<S: KernelSpec> {
 impl<S: KernelSpec> Kernel<S> {
     pub fn build(
         name: String,
-        config: S::Config,
+        mut config: S::Config,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
+        // User-configurable backends: if a per-role override is active on the
+        // bridge (set by the deployment layer for the pool currently building),
+        // replace this kernel's const-default candidate set by its dotted role
+        // `name`. Interned against the bridge, so the config still owns only
+        // `&'static str`. Overriding before `ensure_has_backends` means an empty
+        // override is rejected here too, and before caches fit means the override
+        // is reflected in `describe_config` / the cost manifest.
+        if let Some(backends) = bridge.backend_override_for(&name) {
+            config.set_backends(backends);
+        }
         ensure_has_backends(
             S::KIND,
             <S::Config as KernelConfig>::BACKENDS_FIELD,
             config.backends(),
         )?;
+
+        // Enumerate mode (`emit-backends`): record this kernel's structural facts
+        // and return an empty kernel WITHOUT any profile.db lookup. GPU-free and
+        // profiling-free — the cost-tree structure is all that's built. Returns
+        // before the sweep grid / dry-run / cache-fit paths below.
+        if bridge.is_enumerate() {
+            bridge.record_enum(
+                name,
+                S::KIND,
+                config.gpu_name(),
+                config.compute_dtype(),
+                config.kv_dtype(),
+                config.describe_config(),
+                config.backends(),
+            );
+            return Ok(Self {
+                config,
+                outlier_warnings: Vec::new(),
+                backend_caches: Vec::new(),
+                _spec: PhantomData,
+            });
+        }
+
         let sweep_grid = S::sweep_grid(&config);
         let backends = config.backends();
 

@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from profiling.db.args import DType, KernelArgs
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
+    BackendSupport,
     KernelProfilerSpec,
     MetricFamily,
     RunnerRef,
@@ -51,6 +52,26 @@ KIND: str = "flashinfer_attn_decode"
 
 _RUNNER_MODULE = "profiling.runners.attention.flashinfer_decode"
 _BACKENDS = ("fa2", "fa3", "trt", "cudnn")
+
+# Per-backend capability on compute (q_dtype) and kv-cache (kv_dtype) axes; fa2
+# runs bf16-q / fp8-kv. See flashinfer_attn_prefill for the rationale.
+_SUPPORTS = {
+    "fa2": BackendSupport(
+        compute=frozenset({DType.BF16}), kv=frozenset({DType.BF16, DType.FP8_E4M3})
+    ),
+    "fa3": BackendSupport(
+        compute=frozenset({DType.BF16, DType.FP8_E4M3}),
+        kv=frozenset({DType.BF16, DType.FP8_E4M3}),
+    ),
+    "cudnn": BackendSupport(
+        compute=frozenset({DType.BF16}), kv=frozenset({DType.BF16})
+    ),
+    "trt": BackendSupport(
+        compute=frozenset({DType.FP8_E4M3}),
+        kv=frozenset({DType.FP8_E4M3}),
+        gpus=frozenset({"NVIDIA B200"}),  # trtllm-gen kernels are Blackwell-only
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -73,6 +94,7 @@ for _backend in _BACKENDS:
         KernelProfilerSpec(
             kernel_kind=KIND,
             backend=_backend,
+            supports=_SUPPORTS[_backend],
             runner_ref=RunnerRef(
                 module_name=_RUNNER_MODULE,
                 function_name=f"profile_flashinfer_attn_decode_{_backend}",

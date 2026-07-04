@@ -1351,6 +1351,106 @@ def test_human_table_shows_registry_sections(schema, capsys, tmp_path, monkeypat
     assert "pool_common" in out and "placement" in out
 
 
+# ── per-kernel backend overrides (backends / backends_file) ──────────────────
+
+
+def test_backends_block_is_control_not_unknown(schema):
+    # `backends` is a control key, so a backends block at the root is not flagged
+    # as an unknown key (it is not a schema-walked config node).
+    errs = validate_params(_base(backends={"main/unified.attn.qkv": ["fa2"]}), schema)
+    assert errs == []
+
+
+def test_backends_unflatten_and_substitute(schema):
+    from launcher.__main__ import _merge_backends_file
+
+    preset = _base(
+        backends={
+            "main/unified.attn.qkv": "${attn_be}",
+            "main/unified.mlp.down": ["torch"],
+        },
+        sweep={"attn_be": {"fa2": ["fa2"], "both": ["fa2", "fa3"]}},
+    )
+    preset = _merge_backends_file(preset, "preset.yml")
+    # flat `pool/role` keys are un-flattened into Rust's nested shape.
+    assert preset["backends"] == {
+        "main": {"unified.attn.qkv": "${attn_be}", "unified.mlp.down": ["torch"]}
+    }
+    cands = expand_sweep_params(preset, schema)
+    got = {
+        c["_sweep_labels"]["attn_be"]: c["backends"]["main"]["unified.attn.qkv"]
+        for c in cands
+    }
+    # the `${attn_be}` value is substituted per combo (best-of-N candidate list)...
+    assert got == {"fa2": ["fa2"], "both": ["fa2", "fa3"]}
+    # ...while the pinned literal is unchanged across combos.
+    assert all(c["backends"]["main"]["unified.mlp.down"] == ["torch"] for c in cands)
+
+
+def test_backends_file_merge(tmp_path, schema):
+    from launcher.__main__ import _merge_backends_file
+
+    (tmp_path / "backends.yaml").write_text(
+        "backends:\n  main/unified.attn.qkv: [fa2, fa3]\n"
+    )
+    preset = _base(backends_file="backends.yaml")
+    preset = _merge_backends_file(preset, str(tmp_path / "preset.yml"))
+    assert "backends_file" not in preset
+    assert preset["backends"] == {"main": {"unified.attn.qkv": ["fa2", "fa3"]}}
+
+
+def test_backends_file_wins_over_inline(tmp_path, schema):
+    from launcher.__main__ import _merge_backends_file
+
+    (tmp_path / "backends.yaml").write_text(
+        "backends:\n  main/unified.attn.qkv: [fa3]\n"
+    )
+    preset = _base(
+        backends={"main/unified.attn.qkv": ["fa2"], "main/unified.mlp.down": ["torch"]},
+        backends_file="backends.yaml",
+    )
+    preset = _merge_backends_file(preset, str(tmp_path / "preset.yml"))
+    # file overrides the inline value on collision; non-colliding inline survives.
+    assert preset["backends"]["main"]["unified.attn.qkv"] == ["fa3"]
+    assert preset["backends"]["main"]["unified.mlp.down"] == ["torch"]
+
+
+def test_backends_non_pool_prefixed_key_rejected():
+    from launcher.__main__ import PresetError, _merge_backends_file
+
+    preset = _base(backends={"unified.attn.qkv": ["fa2"]})  # missing `pool/`
+    with pytest.raises(PresetError, match="pool/role"):
+        _merge_backends_file(preset, "preset.yml")
+
+
+def test_backends_missing_file_rejected(tmp_path):
+    from launcher.__main__ import PresetError, _merge_backends_file
+
+    preset = _base(backends_file="nope.yaml")
+    with pytest.raises(PresetError, match="not found"):
+        _merge_backends_file(preset, str(tmp_path / "preset.yml"))
+
+
+def test_backends_undeclared_placeholder_rejected(schema):
+    from launcher.__main__ import _merge_backends_file
+
+    preset = _base(backends={"main/unified.attn.qkv": "${nope}"})
+    preset = _merge_backends_file(preset, "preset.yml")
+    with pytest.raises(ValueError, match="undefined placeholders"):
+        expand_sweep_params(preset, schema)
+
+
+def test_backends_written_through_to_config(tmp_path):
+    # write_config keeps the `backends` block (a non-`_` key) for the Rust binary.
+    from launcher.schema.argv import write_config
+
+    cand = _base()
+    cand["backends"] = {"main": {"unified.attn.qkv": ["fa2"]}}
+    path = write_config(cand, tmp_path / "cfg.yaml")
+    written = yaml.safe_load(path.read_text())
+    assert written["backends"] == {"main": {"unified.attn.qkv": ["fa2"]}}
+
+
 # ── integration with the real Rust-generated schema ─────────────────────────
 
 

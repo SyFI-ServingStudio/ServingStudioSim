@@ -25,60 +25,15 @@ from .schema import (
     validate_params,
     validate_unique_log_dirs,
 )
-from .schema.loader import Registry, SchemaNotFound, load_schema, schema_path
-
-
-class PresetError(ValueError):
-    """A preset file is malformed (bad root type, duplicate keys, parse error)."""
-
-
-def _reject_duplicate_pairs(pairs: list[tuple]) -> dict:
-    """`object_pairs_hook` / mapping builder that rejects duplicate keys instead of
-    silently keeping the last (both `json` and PyYAML default to last-wins)."""
-    out: dict = {}
-    for key, value in pairs:
-        if key in out:
-            raise PresetError(f"duplicate key {key!r}")
-        out[key] = value
-    return out
-
-
-def _load_preset(path: Path) -> dict:
-    """Read a preset file into a mapping. `.json` uses the JSON parser; everything
-    else (`.yaml` / `.yml`) uses YAML (a JSON superset), matching the Rust binary.
-    Strict: duplicate keys are rejected (not last-wins) and the root must be a
-    mapping. Raises `PresetError` on any of these."""
-    text = path.read_text()
-    if path.suffix == ".json":
-        try:
-            data = json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
-        except json.JSONDecodeError as exc:
-            raise PresetError(str(exc)) from exc
-    else:
-        import yaml
-
-        class _StrictLoader(yaml.SafeLoader):
-            pass
-
-        _StrictLoader.add_constructor(
-            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
-            lambda loader, node: _reject_duplicate_pairs(
-                [
-                    (loader.construct_object(k), loader.construct_object(v))
-                    for k, v in node.value
-                ]
-            ),
-        )
-        try:
-            data = yaml.load(text, Loader=_StrictLoader)
-        except yaml.YAMLError as exc:
-            raise PresetError(str(exc)) from exc
-
-    if not isinstance(data, dict):
-        raise PresetError(
-            f"top-level must be a mapping, got {type(data).__name__}"
-        )
-    return data
+from .schema.loader import (
+    PresetError,
+    Registry,
+    SchemaNotFound,
+    _load_preset,
+    _merge_backends_file,
+    load_schema,
+    schema_path,
+)
 
 
 def _build_argparse():
@@ -144,6 +99,16 @@ def _build_argparse():
         action="store_true",
         help="Skip the per-run analyzer (Rust SLO compute + Python plots) that "
         "otherwise runs after each successful run.",
+    )
+    parser.add_argument(
+        "--emit-backends",
+        nargs="?",
+        const="-",
+        default=None,
+        metavar="FILE",
+        help="Enumerate this preset's distinct kernels (no GPU / no profiling) and "
+        "write a per-kernel `backends` skeleton to FILE (or stdout if omitted), "
+        "then exit. Edit it + point `backends_file:` at it to tailor backends.",
     )
     return parser
 
@@ -226,6 +191,60 @@ def _print_params_table(registry: Registry, human: bool, build_type: str) -> Non
             print(f"  {_params_line(pdef)}")
 
 
+def _emit_backends(args, schema: Registry) -> int:
+    """`--emit-backends`: enumerate ONE preset's distinct kernels and write the
+    per-kernel `backends` skeleton (to a file, or stdout for `-`). Builds the
+    cost-tree structure only — no GPU, no profiling. Strips any existing
+    `backends` / `backends_file` (the skeleton shows the arch defaults), then
+    resolves one concrete config (role names are sweep-stable, so the first
+    combo's roles are the whole set)."""
+    from .backends import BackendEnumError, emit_roles, pool_arch_map, render_skeleton
+
+    if len(args.presets) != 1:
+        print("[invalid] --emit-backends takes exactly one preset", file=sys.stderr)
+        return 2
+    source = args.presets[0]
+    try:
+        preset = _apply_overrides(_load_preset(Path(source)), args.override)
+    except PresetError as exc:
+        print(f"[invalid] {source}: {exc}", file=sys.stderr)
+        return 2
+    # The skeleton reports the arch's const-default backends, so drop any override
+    # inputs; the pool→arch labels come from the raw preset before that.
+    arch_map = pool_arch_map(preset)
+    for key in ("backends", "backends_file", "analyze_subjects"):
+        preset.pop(key, None)
+
+    errors = validate_params(preset, schema)
+    if errors:
+        for error in errors:
+            print(f"[invalid] {source}: {error}", file=sys.stderr)
+        return 2
+    candidates = expand_sweep_params(preset, schema)
+    if not candidates:
+        print(f"[invalid] {source}: preset expands to no runs", file=sys.stderr)
+        return 2
+    # Enumerate EVERY swept run (not just run 0): a sweep whose runs have different
+    # kernel role sets (e.g. tp=1 has no all_reduce) can't share one backends file,
+    # so reject at emit; runs that differ only in shape share it (shapes → `(varies)`).
+    # `_format_log_dir` templates each `log_dir` so a reject names the run (…/tp1).
+    normalized = [_format_log_dir(normalize_params(c, schema)) for c in candidates]
+    try:
+        roles = emit_roles(normalized, args.build_type)
+    except BackendEnumError as exc:
+        print(f"[invalid] {source}: emit-backends failed: {exc}", file=sys.stderr)
+        return 2
+
+    text = render_skeleton(roles, arch_map)
+    dest = args.emit_backends
+    if dest == "-":
+        sys.stdout.write(text)
+    else:
+        Path(dest).write_text(text)
+        print(f"[emit-backends] wrote {len(roles)} kernel roles to {dest}", file=sys.stderr)
+    return 0
+
+
 def _expand_preset(
     preset: dict,
     schema: Registry,
@@ -240,6 +259,14 @@ def _expand_preset(
     branch), tag each run's `_env` with `{axis: label}` so the file becomes a named
     aggregation axis, and prefix its `log_dir` with the label so cross-file runs
     never collide."""
+    # Fold `backends_file` + inline `backends` into one nested `backends` block
+    # BEFORE validation (so `backends_file` is gone) and before expansion (so its
+    # `${var}` values are swept). Un-flattens the file's `pool/role` keys.
+    try:
+        preset = _merge_backends_file(preset, source)
+    except PresetError as exc:
+        print(f"[invalid] {source}: {exc}", file=sys.stderr)
+        return None
     errors = validate_params(preset, schema)
     if errors:
         for error in errors:
@@ -400,6 +427,9 @@ def main(argv: list[str] | None = None) -> int:
     except SchemaNotFound as exc:
         sys.exit(str(exc))
 
+    if args.emit_backends is not None:
+        return _emit_backends(args, schema)
+
     all_candidates: list[dict] = []
     last_preset: dict = {}
     analyze_subjects: list[str] | None = None
@@ -444,6 +474,23 @@ def main(argv: list[str] | None = None) -> int:
     if not validate_unique_log_dirs(all_candidates):
         return 2
     if not validate_distinct_configs(all_candidates):
+        return 2
+
+    # Backend-map gate (compiler front-end): for every candidate carrying a
+    # `backends` block, enumerate its kernels + check the map — unknown role,
+    # strict coverage, or a backend incompatible with the role's dtype. No-op when
+    # no candidate has backends. Grouped by structure, so a backend-only sweep
+    # enumerates once.
+    from .backends import BackendEnumError, validate_backends_for_candidates
+
+    try:
+        backend_errors = validate_backends_for_candidates(all_candidates, args.build_type)
+    except BackendEnumError as exc:
+        print(f"[invalid] backend enumeration failed: {exc}", file=sys.stderr)
+        return 2
+    for err in backend_errors:
+        print(f"[invalid] backends: {err}", file=sys.stderr)
+    if backend_errors:
         return 2
 
     # --profile records one representative run; perf on a parallel sweep is
