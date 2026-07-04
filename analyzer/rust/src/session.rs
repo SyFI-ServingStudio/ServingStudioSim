@@ -32,10 +32,19 @@ pub async fn register_if_exists(ctx: &SessionContext, name: &str, path: PathBuf)
     if !path.exists() {
         return Ok(false);
     }
-    ctx.register_parquet(name, path.to_str().unwrap(), ParquetReadOptions::default())
+    match ctx
+        .register_parquet(name, path.to_str().unwrap(), ParquetReadOptions::default())
         .await
-        .with_context(|| format!("register_parquet({name})"))?;
-    Ok(true)
+    {
+        Ok(()) => Ok(true),
+        // Subjects now run concurrently over one shared ctx, so a peer may have
+        // registered this same shared table between the `table_exist` check above and
+        // here (DataFusion's `register_parquet` errors on a duplicate rather than
+        // replacing). If the table is present now, the race is benign — treat it as
+        // registered; otherwise the error is real.
+        Err(_) if ctx.table_exist(name)? => Ok(true),
+        Err(e) => Err(e).with_context(|| format!("register_parquet({name})")),
+    }
 }
 
 /// Canonical table name for the per-worker `cost_log/` directory union.

@@ -142,19 +142,48 @@ async fn run(log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
     let ctx = build_session();
     let deployment = read_deployment(&log_dir);
 
-    // Best-effort per subject: one subject failing (e.g. missing parquet) must
-    // not sink the others, so an `analyze run <dir>` over a whole catalog still
-    // emits everything it can. The process still exits 0 — the launcher hook
-    // treats analysis as best-effort.
-    //
-    // Timing lives ONLY here (and in the run report below), never in a subject's
-    // own report — those stay deterministic so two runs diff cleanly. The single
-    // dispatch loop means timing every subject is one place, not per-subject.
+    // Pre-register the big shared table once so the concurrent subjects below don't
+    // each re-open cost_log's per-worker parquet set. (Registration is an idempotent
+    // replace in DataFusion, so a subject re-registering is harmless — this just
+    // avoids redundant metadata opens.)
+    let _ = session::register_cost_log(&ctx, &log_dir).await;
+
+    // Best-effort AND concurrent: each subject is an independent read over the shared
+    // read-only ctx (SessionContext is Send+Sync+Clone) that writes its own files, so
+    // on a many-core box overlapping them hides the long poles (batch / workload /
+    // kernel-throughput) behind each other instead of summing. One subject failing or
+    // panicking must not sink the rest. Tasks finish out of order but are reported in
+    // catalog order for a stable log; per-subject timing is still the subject's own
+    // wall (now overlapping), and `total_elapsed_ms` is the concurrent wall.
     let run_start = Instant::now();
+    let selected = registry::select(&subjects, deployment.as_deref());
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, subject) in selected.iter().enumerate() {
+        let ctx = ctx.clone();
+        let log_dir = log_dir.clone();
+        let name = subject.name;
+        set.spawn(async move {
+            let started = Instant::now();
+            let res = registry::run_subject(name, &ctx, &log_dir).await;
+            (idx, res, started.elapsed().as_secs_f64() * 1e3)
+        });
+    }
+    let mut results: Vec<Option<(Result<(serde_json::Value, serde_json::Value)>, f64)>> =
+        (0..selected.len()).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((idx, res, elapsed_ms)) => results[idx] = Some((res, elapsed_ms)),
+            Err(e) => eprintln!("[analyze] a subject task panicked: {e}"),
+        }
+    }
+
     let mut subject_runs = Vec::new();
-    for subject in registry::select(&subjects, deployment.as_deref()) {
-        let started = Instant::now();
-        let status = match registry::run_subject(subject.name, &ctx, &log_dir).await {
+    for (idx, subject) in selected.iter().enumerate() {
+        let (res, elapsed_ms) = match results[idx].take() {
+            Some(r) => r,
+            None => continue, // task panicked (already logged)
+        };
+        let status = match res {
             Ok((report, payload)) => {
                 write_json(&report_path(&log_dir, subject.report_name), &report)?;
                 write_json(&payload_path(&log_dir, subject.payload_name), &payload)?;
@@ -165,7 +194,6 @@ async fn run(log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
                 "failed"
             }
         };
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
         eprintln!("[analyze] {} {status} in {elapsed_ms:.1} ms", subject.name);
         subject_runs.push(json!({
             "name": subject.name,

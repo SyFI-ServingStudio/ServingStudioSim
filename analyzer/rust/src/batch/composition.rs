@@ -27,15 +27,22 @@ use serde_json::{json, Value};
 
 use crate::cdf::{clean_nonnegative_sorted, stats, MetricStats};
 use crate::io::SCHEMA_VERSION;
-use crate::session::{col, collect, column_f64, register_cost_log, require_columns, COST_LOG_TABLE};
+use crate::session::{
+    col, collect, column_f64, register_cost_log, require_columns, value_f64, COST_LOG_TABLE,
+};
 
 /// cost_log columns the batch subject depends on (drift guard).
 const COST_COLS: &[&str] = &["pool_tag", "wall_start_ms", "groups"];
 
 /// Cap on scatter points in the payload, per pool. The run can have millions of
-/// invocations; the scatter is an even time-downsample to this many (stats stay
-/// over ALL rows).
+/// invocations; the scatter is an even time-downsample to this many.
 const MAX_SCATTER_POINTS: usize = 4000;
+
+/// Target number of sampled iterations (`iter_id % stride == 0`). Sized so the
+/// per-pool scatter can fill even for a low-worker-count pool, while cutting the
+/// `groups` decode + sort by `stride×` vs the whole cost_log. Distribution stats
+/// are computed over this sample (a uniform time-slice of the run).
+const TARGET_SAMPLED_ITERS: u64 = 4000;
 
 /// One invocation: `(wall_start_ms, batch_tokens, prefill_tokens, decode_request_count)`.
 type Row = (f64, f64, f64, f64);
@@ -47,16 +54,27 @@ pub async fn run_batch(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, V
     }
     require_columns(ctx, COST_LOG_TABLE, COST_COLS).await?;
 
-    let by_pool = collect_batches(ctx).await?;
-    if by_pool.is_empty() {
+    // True per-pool invocation counts via a cheap COUNT(*) GROUP BY (no `groups`
+    // decode), so `num_calls` stays exact even though the distribution + scatter
+    // below are computed over a time-uniform iteration sample.
+    let true_counts = collect_pool_counts(ctx).await?;
+    if true_counts.is_empty() {
         let reason = "cost_log has no invocations";
         return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
     }
-    let total_calls: usize = by_pool.values().map(Vec::len).sum();
+    let total_calls: usize = true_counts.values().sum();
+
+    // Sample every `stride`-th iteration (all its rows) so we decode `groups` + sort
+    // over a small representative subset, not the whole multi-million-row cost_log
+    // (mirrors `kernel_throughput`'s `iter_id % stride` pushdown).
+    let stride = choose_stride(ctx).await?;
+    let by_pool = collect_sampled_batches(ctx, stride).await?;
 
     let mut report_pools = Vec::new();
     let mut payload_pools = Vec::new();
     for (pool, mut rows) in by_pool {
+        // Exact count from the COUNT(*) above; `rows` here is only the sample.
+        let num_calls = true_counts.get(&pool).copied().unwrap_or(rows.len());
         // Time-order so the even-stride scatter downsample is uniform over sim time
         // (cost_log is iter-ordered per worker; sorting handles the multi-worker case).
         rows.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -73,7 +91,7 @@ pub async fn run_batch(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, V
 
         report_pools.push(json!({
             "pool": pool,
-            "num_calls": rows.len(),
+            "num_calls": num_calls,
             "metrics": {
                 "batch_tokens": bt_stats,
                 "prefill_tokens": pt_stats,
@@ -82,7 +100,7 @@ pub async fn run_batch(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, V
         }));
         payload_pools.push(json!({
             "pool": pool,
-            "num_calls": rows.len(),
+            "num_calls": num_calls,
             "plotted_points": t_s.len(),
             // Per-field pool average — the scatter's corner-box reference.
             "avg": {
@@ -128,16 +146,64 @@ fn mean(s: &MetricStats) -> Value {
     json!(s.mean)
 }
 
-/// Pull `(wall_start_ms, batch_tokens, prefill_tokens, decode_request_count)` per
-/// cost_log row, summing each count across the row's `groups` via the list offsets
-/// in one typed pass per column (see [`column_f64`]), and bucket by `pool_tag`. Each
-/// row is one invocation; the per-row group sum is that invocation's logical batch.
-async fn collect_batches(ctx: &SessionContext) -> Result<BTreeMap<String, Vec<Row>>> {
+/// True per-pool invocation count via `COUNT(*) GROUP BY pool_tag` — an aggregate
+/// pushed into DataFusion (no `groups` decode, no row materialization).
+async fn collect_pool_counts(ctx: &SessionContext) -> Result<BTreeMap<String, usize>> {
     let batches = collect(
         ctx,
-        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, wall_start_ms, groups FROM cost_log",
+        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, COUNT(*) AS c FROM cost_log GROUP BY pool_tag",
     )
     .await?;
+    let mut out = BTreeMap::new();
+    for batch in &batches {
+        let pool_arr = col(batch, "pool_tag")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow!("`pool_tag` is not a Utf8 array"))?;
+        let c = column_f64(col(batch, "c")?)?;
+        for i in 0..batch.num_rows() {
+            out.insert(pool_arr.value(i).to_string(), c[i] as usize);
+        }
+    }
+    Ok(out)
+}
+
+/// Pick a sampling stride so ~[`TARGET_SAMPLED_ITERS`] iterations survive
+/// `iter_id % stride == 0` (mirrors `kernel_throughput::choose_stride`). `iter_id`
+/// is per-worker, so the same iteration indices are kept across all workers — a
+/// uniform time-slice. Short runs get `stride = 1` (keep everything).
+async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
+    let batches = collect(
+        ctx,
+        "SELECT CAST(COALESCE(MAX(iter_id), 0) AS BIGINT) AS mx FROM cost_log",
+    )
+    .await?;
+    let mut num_iters = 1u64;
+    if let Some(b) = batches.first() {
+        if b.num_rows() > 0 {
+            let mx = value_f64(col(b, "mx")?, 0)?;
+            if mx.is_finite() {
+                num_iters = mx as u64 + 1;
+            }
+        }
+    }
+    Ok((num_iters / TARGET_SAMPLED_ITERS).max(1))
+}
+
+/// Pull `(wall_start_ms, batch_tokens, prefill_tokens, decode_request_count)` for the
+/// SAMPLED cost_log rows (`iter_id % stride == 0`), summing each count across the
+/// row's `groups` via the list offsets in one typed pass per column (see
+/// [`column_f64`]), bucketed by `pool_tag`. Each row is one invocation; the per-row
+/// group sum is that invocation's logical batch.
+async fn collect_sampled_batches(
+    ctx: &SessionContext,
+    stride: u64,
+) -> Result<BTreeMap<String, Vec<Row>>> {
+    let sql = format!(
+        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, wall_start_ms, groups \
+         FROM cost_log WHERE iter_id % {stride} = 0"
+    );
+    let batches = collect(ctx, &sql).await?;
     let mut by_pool: BTreeMap<String, Vec<Row>> = BTreeMap::new();
     for batch in &batches {
         let pool_arr = col(batch, "pool_tag")?
