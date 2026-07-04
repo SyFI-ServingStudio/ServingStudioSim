@@ -305,6 +305,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                     iter_id,
                     bid,
                     &input.tokens_per_group,
+                    Some(input.tokens_per_group.as_slice()),
                     cursor,
                     |s, sc, inp| match inp {
                         Some(i) => model.prologue_cost_with_inputs(input, s, sc, i),
@@ -320,6 +321,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                     iter_id,
                     bid,
                     &input.tokens_per_group,
+                    Some(input.tokens_per_group.as_slice()),
                     cursor,
                     |s, sc, inp| match inp {
                         Some(i) => model.pre_attn_cost_with_inputs(0, input, s, sc, i),
@@ -337,6 +339,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                     iter_id,
                     bid,
                     &input.tokens_per_group,
+                    Some(input.tokens_per_group.as_slice()),
                     cursor,
                     |s, sc, inp| match inp {
                         Some(i) => {
@@ -354,6 +357,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                     iter_id,
                     bid,
                     &input.tokens_per_group,
+                    Some(input.tokens_per_group.as_slice()),
                     cursor,
                     |s, sc, inp| match inp {
                         Some(i) => model.post_attn_cost_with_inputs(last, input, s, sc, i),
@@ -369,6 +373,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                     iter_id,
                     bid,
                     &input.tokens_per_group,
+                    Some(input.tokens_per_group.as_slice()),
                     cursor,
                     |s, sc, inp| match inp {
                         Some(i) => model.epilogue_cost_with_inputs(input, s, sc, i),

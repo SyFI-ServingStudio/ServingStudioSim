@@ -289,7 +289,7 @@ fn run_attn_cases(
             .into_groups(expected_groups)
             .with_context(|| format!("case {idx}"))?;
         let input = AttnArchInput { groups };
-        let agg = cost.run_section("attn", 0, idx as u64, 0, &input.groups, now, |slots, scratch, inputs| {
+        let agg = cost.run_section("attn", 0, idx as u64, 0, &input.groups, None, now, |slots, scratch, inputs| {
             match inputs {
                 Some(i) => model.attn_cost_with_inputs(0, &input, slots, scratch, i),
                 None => model.attn_cost(0, &input, slots, scratch),
@@ -333,7 +333,7 @@ fn run_ffn_cases(
         let iid = idx as u64;
 
         // prologue (embedding), once per iteration.
-        let agg = cost.run_section("prologue", -1, iid, 0, &input.tokens_per_group, now, |slots, scratch, inputs| {
+        let agg = cost.run_section("prologue", -1, iid, 0, &input.tokens_per_group, None, now, |slots, scratch, inputs| {
             match inputs {
                 Some(i) => model.prologue_cost_with_inputs(&input, slots, scratch, i),
                 None => model.prologue_cost(&input, slots, scratch),
@@ -343,7 +343,7 @@ fn run_ffn_cases(
 
         // pre_attn bootstrap: layer-0 qkv (layers > 0 are fused into the prior
         // layer's post_attn, so only layer 0 has a standalone pre cost).
-        let agg = cost.run_section("pre_attn", 0, iid, 0, &input.tokens_per_group, now, |slots, scratch, inputs| {
+        let agg = cost.run_section("pre_attn", 0, iid, 0, &input.tokens_per_group, None, now, |slots, scratch, inputs| {
             match inputs {
                 Some(i) => model.pre_attn_cost_with_inputs(0, &input, slots, scratch, i),
                 None => model.pre_attn_cost(0, &input, slots, scratch),
@@ -355,7 +355,7 @@ fn run_ffn_cases(
         // standing for every layer in [0, last). Only when there IS a mid layer.
         if num_layers >= 2 {
             let mid = (num_layers as usize - 1) / 2; // clearly < last for num_layers >= 2
-            let agg = cost.run_section("post_attn", mid as i16, iid, 0, &input.tokens_per_group, now, |slots, scratch, inputs| {
+            let agg = cost.run_section("post_attn", mid as i16, iid, 0, &input.tokens_per_group, None, now, |slots, scratch, inputs| {
                 match inputs {
                     Some(i) => model.post_attn_cost_with_inputs(mid, &input, slots, scratch, i),
                     None => model.post_attn_cost(mid, &input, slots, scratch),
@@ -365,7 +365,7 @@ fn run_ffn_cases(
         }
 
         // post_attn terminal (last layer, post-only).
-        let agg = cost.run_section("post_attn_last", last as i16, iid, 0, &input.tokens_per_group, now, |slots, scratch, inputs| {
+        let agg = cost.run_section("post_attn_last", last as i16, iid, 0, &input.tokens_per_group, None, now, |slots, scratch, inputs| {
             match inputs {
                 Some(i) => model.post_attn_cost_with_inputs(last, &input, slots, scratch, i),
                 None => model.post_attn_cost(last, &input, slots, scratch),
@@ -374,7 +374,7 @@ fn run_ffn_cases(
         now += Time::from_ms(agg.m.time_ms as f64);
 
         // epilogue (final_norm + lm_head), once per iteration.
-        let agg = cost.run_section("epilogue", -1, iid, 0, &input.tokens_per_group, now, |slots, scratch, inputs| {
+        let agg = cost.run_section("epilogue", -1, iid, 0, &input.tokens_per_group, None, now, |slots, scratch, inputs| {
             match inputs {
                 Some(i) => model.epilogue_cost_with_inputs(&input, slots, scratch, i),
                 None => model.epilogue_cost(&input, slots, scratch),

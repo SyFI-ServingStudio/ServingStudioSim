@@ -19,12 +19,63 @@
 //! of the row contract, so it runs only when a logger is attached — we don't pay
 //! the per-leaf clone when no row will be written.
 
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::PathBuf;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{Time, WorkerId};
 use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
+
+/// Upper bound on distinct cached section results per worker. AFD attn keys churn
+/// as KV grows (~a few new keys per iteration), so the table is cleared wholesale
+/// once it exceeds this — cheap and rare, and a dropped entry merely recomputes.
+/// Sized generously so the ffn side's distinct `tokens_per_group` shapes rarely
+/// overflow; each entry is tiny when logging is off (just the `agg`).
+const COST_CACHE_CAP: usize = 1024;
+
+/// A memoized section result — everything a cache hit needs to reproduce the miss
+/// path exactly: the returned aggregate plus, when a logger is attached, the
+/// per-slot breakdown and captured inputs for an identical `cost_log` row. With no
+/// logger the slot vecs stay empty (a hit emits no row), so the sim-speed path pays
+/// no per-entry allocation.
+struct SectionSnapshot {
+    agg: LeafMetrics,
+    slots: Vec<LeafMetrics>,
+    slot_inputs: Vec<SlotInput>,
+}
+
+/// FNV-1a over the whole key byte stream — a *combining* hash. Unlike
+/// [`IdHasher`](crate::common::id::IdHasher), which keeps only the last integer
+/// written (a single Fibonacci multiply) and so is unsuitable for a multi-`u32`
+/// slice key, this folds every byte. Correctness never depends on the hash — the
+/// `Box<[u32]>` key is compared exactly — this only spreads buckets.
+struct FlatHasher(u64);
+
+impl Default for FlatHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325) // FNV-1a 64-bit offset basis
+    }
+}
+
+impl Hasher for FlatHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // The default `write_u32`/`write_usize` (used when hashing the `[u32]` key +
+        // its length prefix) route through here, so folding bytes covers the whole key.
+        let mut h = self.0;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a 64-bit prime
+        }
+        self.0 = h;
+    }
+}
 
 /// Per-worker eval / cost-log scratch state + writer. Drop one of these into a
 /// worker struct in place of a `cost_logger` + the reusable eval buffers, and
@@ -52,6 +103,15 @@ pub struct CostBuffers {
     /// the writer at construction degrades to `None` (with a warn) so the sim
     /// still runs.
     logger: Option<CostLogger>,
+    /// Content-addressed cache of per-section eval results, keyed by the packed
+    /// section name + the arch input's [`cost_signature`](GroupLogSource::cost_signature).
+    /// AFD is layer-homogeneous (every layer re-evaluates the same section on the
+    /// same batch), so all but the first layer of an iteration hit. Bounded by
+    /// [`COST_CACHE_CAP`]; the exact `Box<[u32]>` key makes a hit bit-identical to a
+    /// fresh eval.
+    cache: HashMap<Box<[u32]>, SectionSnapshot, BuildHasherDefault<FlatHasher>>,
+    /// Reused key buffer so a cache lookup allocates nothing on a hit.
+    key_scratch: Vec<u32>,
 }
 
 impl CostBuffers {
@@ -83,6 +143,8 @@ impl CostBuffers {
             groups: Vec::new(),
             worker_id,
             logger,
+            cache: HashMap::default(),
+            key_scratch: Vec::new(),
         }
     }
 
@@ -114,6 +176,15 @@ impl CostBuffers {
     /// and `groups` the per-shard input context (logged as the row's `input_section`)
     /// — the attn/iter sides pass `[ArchGroupInput]`, the ffn side bare `[u32]` token
     /// counts, both via [`GroupLogSource`].
+    ///
+    /// `cache_key` opts this call into result memoization: `Some(k)` caches the section
+    /// result under `(section, k)`, returning it on a repeat without re-running `eval`.
+    /// `k` must be a *small* identity that changes iff the cost input does — the caller
+    /// keeps it cheap: attn passes its `(iter_id, slot)` identity (its real input,
+    /// `decode_kv_lens`, is O(batch) and costlier to hash than the eval it would save,
+    /// and it never repeats across iterations anyway); ffn passes its small
+    /// `tokens_per_group` (which *does* recur across randomly-assigned tasks). `None`
+    /// disables caching (iter-wise callers eval once per iteration — nothing repeats).
     pub fn run_section<G, F>(
         &mut self,
         section: &'static str,
@@ -121,6 +192,7 @@ impl CostBuffers {
         iter_id: u64,
         batch_id: u64,
         groups: &G,
+        cache_key: Option<&[u32]>,
         now: Time,
         eval: F,
     ) -> LeafMetrics
@@ -132,9 +204,56 @@ impl CostBuffers {
             Option<&mut Vec<SlotInput>>,
         ) -> LeafMetrics,
     {
-        // Capture per-leaf inputs only on the path that will actually write the row
-        // — the `*_with_inputs` clone per leaf is part of the cost_log contract, so
-        // we don't pay it when no logger is attached.
+        // Build the key (packed section name + the caller's small identity) and try a
+        // hit. Reuses `key_scratch`, so a hit allocates nothing.
+        if let Some(ck) = cache_key {
+            self.key_scratch.clear();
+            let name = section.as_bytes();
+            self.key_scratch.push(name.len() as u32);
+            for chunk in name.chunks(4) {
+                let mut w = 0u32;
+                for (i, &b) in chunk.iter().enumerate() {
+                    w |= (b as u32) << (8 * i);
+                }
+                self.key_scratch.push(w);
+            }
+            self.key_scratch.extend_from_slice(ck);
+
+            // Hit: the section already ran on this exact input (a prior layer of this
+            // iteration, or a repeated ffn batch). Replay the memoized result. The
+            // `cost_log` row still uses THIS call's iter_id / batch_id / wall_start /
+            // layer — only the input-determined `agg` / `slots` / `slot_inputs` come
+            // from the snapshot — so the row is byte-identical to a fresh eval's.
+            if let Some(snap) = self.cache.get(self.key_scratch.as_slice()) {
+                let agg = snap.agg;
+                if let Some(logger) = self.logger.as_mut() {
+                    groups.fill_group_log(&mut self.groups);
+                    let entry = CostLogEntry {
+                        worker_id: self.worker_id.0,
+                        iter_id,
+                        batch_id,
+                        wall_start_ms: now.as_ms(),
+                        total_time_ms: agg.m.time_ms as f64,
+                        energy_j: agg.m.energy_j as f64,
+                        section,
+                        layer,
+                        group_len: 0,
+                        slot_len: 0,
+                        slot_input_len: 0,
+                    };
+                    if let Err(e) =
+                        logger.record(entry, &snap.slots, &mut self.groups, &snap.slot_inputs)
+                    {
+                        tracing::warn!("cost_log record failed: {e}");
+                    }
+                }
+                return agg;
+            }
+        }
+
+        // Miss (or un-cached): evaluate, write the row. Capture per-leaf inputs only on
+        // the path that will actually write the row — the `*_with_inputs` clone per leaf
+        // is part of the cost_log contract, so we don't pay it when no logger is attached.
         let capture = self.logger.is_some();
         let agg = eval(
             &mut self.slots,
@@ -157,10 +276,28 @@ impl CostBuffers {
                 slot_len: 0,
                 slot_input_len: 0,
             };
-            if let Err(e) = logger.record(entry, &self.slots, &mut self.groups, &mut self.slot_inputs)
-            {
+            if let Err(e) = logger.record(entry, &self.slots, &mut self.groups, &self.slot_inputs) {
                 tracing::warn!("cost_log record failed: {e}");
             }
+        }
+        // Memoize for future hits (`key_scratch` still holds this call's key, untouched
+        // by eval/record). With no logger, hits emit no row, so keep just `agg` (empty
+        // slot vecs -> no per-entry allocation on the sim-speed path). Clone (not
+        // `take`) preserves the worker's reusable buffer capacity.
+        if cache_key.is_some() {
+            let snap = SectionSnapshot {
+                agg,
+                slots: if capture { self.slots.clone() } else { Vec::new() },
+                slot_inputs: if capture {
+                    self.slot_inputs.clone()
+                } else {
+                    Vec::new()
+                },
+            };
+            if self.cache.len() >= COST_CACHE_CAP {
+                self.cache.clear();
+            }
+            self.cache.insert(self.key_scratch.as_slice().into(), snap);
         }
         agg
     }
@@ -185,6 +322,7 @@ impl CostBuffers {
             iter_id,
             0,
             &arch_input.groups,
+            None, // one fused eval per iteration — nothing to memoize
             now,
             |slots, scratch, inputs| match inputs {
                 Some(i) => model.eval_iter_with_inputs(arch_input, slots, scratch, i),
@@ -236,5 +374,177 @@ impl GroupLogSource for Vec<u32> {
                 prefill_chunk_pairs: Vec::new(),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::cell::Cell;
+    use std::fs::File;
+
+    use arrow_array::{Float64Array, Int16Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use tempfile::tempdir;
+
+    use crate::timing::{CostManifest, CoverageFlags, FlatCostNode, LeafDesc, Metrics4};
+
+    fn leaf(time_ms: f32) -> LeafMetrics {
+        LeafMetrics {
+            m: Metrics4 {
+                time_ms,
+                flops: 0.0,
+                bytes: 0.0,
+                energy_j: 0.0,
+            },
+            coverage: CoverageFlags::EMPTY,
+        }
+    }
+
+    /// One decode-only attention group with the given per-request KV lengths.
+    fn grp(kv: &[u32]) -> ArchGroupInput {
+        ArchGroupInput {
+            batch_tokens: kv.len() as u32,
+            prefill_tokens: 0,
+            decode_tokens: kv.len() as u32,
+            prefill_chunk_pairs: Vec::new(),
+            decode_kv_lens: kv.to_vec(),
+            total_kv_len: kv.iter().sum(),
+        }
+    }
+
+    fn trivial_manifest() -> CostManifestDoc {
+        CostManifestDoc::single(
+            "attn",
+            CostManifest {
+                slots: vec![LeafDesc {
+                    name: "m.test".to_owned(),
+                    kind: "unit".to_owned(),
+                    config: "shape=1".to_owned(),
+                }],
+                nodes: vec![FlatCostNode::Leaf(0)],
+                node_labels: vec![None],
+            },
+        )
+    }
+
+    /// With no logger (the sim-speed path), a repeated `(section, cache_key)` hits the
+    /// cache: the eval closure is skipped and the *cached* aggregate is returned. A
+    /// distinct key or a distinct section misses; `None` never caches.
+    #[test]
+    fn cache_hit_skips_eval_and_returns_cached_agg() {
+        let mut cost = CostBuffers::new(None, "attn", WorkerId(0), &trivial_manifest());
+        let a = vec![grp(&[10, 11])];
+        let b = vec![grp(&[10, 12])];
+        let (ka, kb) = ([7u32], [8u32]); // cheap caller identities (e.g. iter/slot)
+        let now = Time::from_ms(0.0);
+        let calls = Cell::new(0u32);
+
+        let m0 = cost.run_section("attn", 0, 0, 0, &a, Some(&ka), now, |slots, _sc, _in| {
+            calls.set(calls.get() + 1);
+            slots.clear();
+            leaf(2.5)
+        });
+        // Same key, next layer: hit. The passed closure returns 777, but the hit must
+        // ignore it and replay the cached 2.5 (and never invoke the closure).
+        let m1 = cost.run_section("attn", 1, 0, 0, &a, Some(&ka), now, |slots, _sc, _in| {
+            calls.set(calls.get() + 1);
+            slots.clear();
+            leaf(777.0)
+        });
+        assert_eq!(calls.get(), 1, "identical (section, cache_key) must hit");
+        assert_eq!(m0.m.time_ms, 2.5);
+        assert_eq!(m1.m.time_ms, 2.5, "hit replays the cached agg, not the closure");
+
+        // Distinct key -> miss.
+        cost.run_section("attn", 2, 0, 0, &b, Some(&kb), now, |slots, _sc, _in| {
+            calls.set(calls.get() + 1);
+            slots.clear();
+            leaf(3.0)
+        });
+        assert_eq!(calls.get(), 2, "a distinct cache_key must miss");
+
+        // Distinct section, same key -> miss (section is part of the key).
+        cost.run_section("prologue", 0, 0, 0, &a, Some(&ka), now, |slots, _sc, _in| {
+            calls.set(calls.get() + 1);
+            slots.clear();
+            leaf(9.0)
+        });
+        assert_eq!(calls.get(), 3, "a distinct section must miss even with same key");
+
+        // `None` never caches: repeats always re-eval.
+        cost.run_section("attn", 3, 0, 0, &a, None, now, |slots, _sc, _in| {
+            calls.set(calls.get() + 1);
+            slots.clear();
+            leaf(1.0)
+        });
+        cost.run_section("attn", 4, 0, 0, &a, None, now, |slots, _sc, _in| {
+            calls.set(calls.get() + 1);
+            slots.clear();
+            leaf(1.0)
+        });
+        assert_eq!(calls.get(), 5, "cache_key=None must always eval");
+    }
+
+    /// With a logger attached, every call still emits one `cost_log` row (a hit does
+    /// not suppress logging), and the row carries THIS call's `layer` while sharing the
+    /// cached `total_time_ms`.
+    #[test]
+    fn cache_hit_still_emits_logrow_with_per_call_layer() {
+        let dir = tempdir().unwrap();
+        let mut cost = CostBuffers::new(
+            Some(dir.path().to_path_buf()),
+            "attn",
+            WorkerId(0),
+            &trivial_manifest(),
+        );
+        let a = vec![grp(&[10, 11])];
+        let b = vec![grp(&[10, 12])];
+        let (ka, kb) = ([7u32], [8u32]);
+        let now = Time::from_ms(0.0);
+
+        // layer 0, key a: miss (total_time_ms 2.5).
+        cost.run_section("attn", 0, 0, 0, &a, Some(&ka), now, |slots, _sc, _in| {
+            slots.clear();
+            slots.push(leaf(2.5));
+            leaf(2.5)
+        });
+        // layer 1, key a: hit. Closure returns 777 but must be skipped -> row logs 2.5.
+        cost.run_section("attn", 1, 0, 0, &a, Some(&ka), now, |slots, _sc, _in| {
+            slots.clear();
+            slots.push(leaf(777.0));
+            leaf(777.0)
+        });
+        // layer 2, key b: miss (3.0).
+        cost.run_section("attn", 2, 0, 0, &b, Some(&kb), now, |slots, _sc, _in| {
+            slots.clear();
+            slots.push(leaf(3.0));
+            leaf(3.0)
+        });
+        drop(cost); // flush + join the writer thread
+
+        let path = dir.path().join("raw/cost_log/worker_attn_0.parquet");
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 3, "every call (hit or miss) emits one row");
+        // Schema column order: 5 = total_time_ms, 12 = layer (see cost_log_schema).
+        let ttm = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let layer = batch
+            .column(12)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        assert_eq!((layer.value(0), layer.value(1), layer.value(2)), (0, 1, 2));
+        assert!((ttm.value(0) - 2.5).abs() < 1e-9);
+        assert!((ttm.value(1) - 2.5).abs() < 1e-9, "hit re-logs the cached time");
+        assert!((ttm.value(2) - 3.0).abs() < 1e-9);
     }
 }

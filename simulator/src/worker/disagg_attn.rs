@@ -873,12 +873,18 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         // logging — `batch_id` = the pipeline slot, `layer` = this layer.
         let model = Arc::clone(&self.model);
         let input = &self.slot_inputs[idx];
+        // Attn is layer-homogeneous: every layer of this iteration re-evaluates `attn`
+        // on the same input, and the input is rebuilt at most once per iteration per
+        // slot. So (iter_id, slot) is a cheap, exact identity for that input — far
+        // cheaper to key on than its O(batch) `decode_kv_lens` content.
+        let cache_key = [iter_id as u32, (iter_id >> 32) as u32, idx as u32];
         let m = self.cost.run_section(
             "attn",
             layer as i16,
             iter_id,
             idx as u64,
             &input.groups,
+            Some(&cache_key),
             now,
             |s, sc, inp| match inp {
                 Some(i) => model.attn_cost_with_inputs(layer, input, s, sc, i),
