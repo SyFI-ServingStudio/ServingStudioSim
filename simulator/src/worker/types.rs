@@ -330,6 +330,16 @@ pub struct FfnTask {
     pub slot: u8,
     pub reqs: Vec<RequestId>,
     pub pull_sources: Vec<FfnPullSource>,
+    /// Total query tokens for this batch (prefill = prompt_len, decode = 1 each) —
+    /// the workload size that drives the FFN cost and the ffn→attn handoff bytes.
+    /// Threaded from the attn side rather than re-derived from the store per layer:
+    /// for a Bridge/Terminal the pool sums the per-shard counts the attn workers
+    /// already reported in `AttnLayerOutputsReady` (identical to a fresh
+    /// `workload_tokens(reqs)` scan, since the shards partition `reqs` and
+    /// `is_prefill` is iteration-constant). A Bootstrap opens the pass before any
+    /// attn layer-output exists, so the pool leaves this `0` and the worker fills it
+    /// once from the store at `start_compute` (see [`super::disagg_ffn`]).
+    pub tokens: u64,
 }
 
 /// Ffn worker message set: a single `Task` (the pool composes the batch + token

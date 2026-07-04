@@ -119,14 +119,6 @@ impl CostSource {
         }
     }
 
-    /// The bandwidth-only ("transmission") slice of one link's transfer:
-    /// `link_time(bytes) − α`. This is what occupies a **sender's** link — the
-    /// time it is actively pushing bits — while the latency α is a one-time wire
-    /// cost the collective pays once (not folded into every sender's occupancy).
-    fn transfer_time(&self, message_size_bytes: u64) -> Time {
-        let t = self.link_time(message_size_bytes).as_ms() - self.latency().as_ms();
-        Time::from_ms(t.max(0.0))
-    }
 }
 
 /// One NCCL-style communication group: the contiguous block of GPU ids whose
@@ -420,7 +412,17 @@ impl GpuCluster {
         // Live sources only: non-empty bytes over a non-empty sender group. The
         // collective can't start until every involved send link AND the recv link
         // is idle. `live` carries (send_gid, bytes, send_count).
-        let mut live: Vec<(u16, u64, u16)> = Vec::with_capacity(sources.len());
+        // α (the one-time wire latency) is invariant per link — a pure function of
+        // the fixed cost curve — so evaluate it ONCE here rather than re-deriving it
+        // (2 constant-input curve evals) inside every per-source cost lookup.
+        let alpha = self.cost.latency();
+        let alpha_ms = alpha.as_ms();
+        // `xfer` = each sender's bandwidth-only transmission slice `link_time(bytes)−α`:
+        // the time it actively pushes bits, latency stripped (the collective pays α
+        // once, not per sender). It is reused three times below — the send-side
+        // bound, `send_free`, and the log row — so evaluate it ONCE per source and
+        // carry it in `live` instead of re-running the curve lookup three times.
+        let mut live: Vec<(u16, u64, u16, Time)> = Vec::with_capacity(sources.len());
         let mut total_bytes: u64 = 0;
         let mut start = now.max(r.recv_free);
         for &(sg, bytes) in sources {
@@ -430,41 +432,39 @@ impl GpuCluster {
             }
             start = start.max(s.send_free);
             total_bytes += bytes;
-            live.push((sg, bytes, s.count));
+            let per_link = (bytes as f64 / s.count as f64).round() as u64;
+            let xfer = Time::from_ms((self.cost.link_time(per_link).as_ms() - alpha_ms).max(0.0));
+            live.push((sg, bytes, s.count, xfer));
         }
         if live.is_empty() {
             return now;
         }
-        let alpha = self.cost.latency();
         // Senders push in parallel: the send-side bound is the slowest single
         // sender's transmission slice (each over its own links), NOT the sum.
         let mut send_xfer_max = Time::ZERO;
-        for &(_, bytes, count) in &live {
-            let per_link = (bytes as f64 / count as f64).round() as u64;
-            send_xfer_max = send_xfer_max.max(self.cost.transfer_time(per_link));
+        for &(_, _, _, xfer) in &live {
+            send_xfer_max = send_xfer_max.max(xfer);
         }
         // The receiver drains the aggregate byte total across its links.
         let recv_per_link = (total_bytes as f64 / r.count as f64).round() as u64;
-        let recv_xfer = self.cost.transfer_time(recv_per_link);
+        let recv_xfer = Time::from_ms((self.cost.link_time(recv_per_link).as_ms() - alpha_ms).max(0.0));
         // Latency paid ONCE for the whole gather (overlapped across sources).
         let arrival = start + alpha + send_xfer_max.max(recv_xfer);
         // Bookkeeping: each sender frees after its own transmission slice (no
         // latency, no coupling to the collective); the receiver is busy until
         // every byte lands (preserves the "recv_free tracks resident time" rule).
-        for &(sg, bytes, count) in &live {
-            let per_link = (bytes as f64 / count as f64).round() as u64;
-            self.groups[sg as usize].send_free = start + self.cost.transfer_time(per_link);
+        for &(sg, _, _, xfer) in &live {
+            self.groups[sg as usize].send_free = start + xfer;
         }
         self.groups[recv_gid as usize].recv_free = arrival;
         // One log row per source over the shared window (resolved endpoints).
         if self.logger.is_some() {
-            for &(sg, bytes, count) in &live {
+            for &(sg, bytes, count, xfer) in &live {
                 let s = self.groups[sg as usize];
-                let per_link = (bytes as f64 / count as f64).round() as u64;
                 // Sender frees after its own transmission slice (latency-stripped) —
                 // strictly before `arrival`, so the send slice ends inside the
                 // collective's window (the overlap `analyze trace` visualizes).
-                let send_end = start + self.cost.transfer_time(per_link);
+                let send_end = start + xfer;
                 let entry = GpuClusterEntry {
                     net_start_ms: start.as_ms(),
                     net_end_ms: arrival.as_ms(),

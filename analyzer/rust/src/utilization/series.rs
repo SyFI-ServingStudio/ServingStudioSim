@@ -12,20 +12,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Result;
+use arrow_array::Array;
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
 use crate::io::{read_run_meta, read_worker_pools, SCHEMA_VERSION};
-use crate::session::{col, collect, column_f64, register_cost_log, require_columns, COST_LOG_TABLE};
+use crate::session::{
+    col, collect, column_f64, register_cost_log, require_columns, value_f64, COST_LOG_TABLE,
+};
 
 /// cost_log columns the utilization subject depends on (drift guard).
 const COST_COLS: &[&str] = &["worker_id", "wall_start_ms", "total_time_ms"];
 
 /// Equal-width time bins for the (single) fine view.
 const FINE_BINS: usize = 200;
-
-/// One worker iteration's busy interval: `(worker_id, start_ms, dur_ms)`.
-type Iter = (u64, f64, f64);
 
 pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
@@ -41,28 +41,15 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
         .into_iter()
         .collect();
 
-    let iters = collect_iters(ctx).await?;
-    if iters.is_empty() {
-        let reason = "cost_log has no iterations to bin";
-        return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
-    }
-
-    // Group busy intervals by pool, and tally each pool's worker roster (seeded from
-    // run_meta so a pool's idle worker still counts toward its capacity, then unioned
-    // with whatever cost_log actually shows).
-    let mut pool_iters: BTreeMap<u64, Vec<(f64, f64)>> = BTreeMap::new();
-    let mut pool_workers: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-    for (&w, &p) in &worker_pool {
-        pool_workers.entry(p).or_default().insert(w);
-    }
-    for (w, start, dur) in &iters {
-        let pool = worker_pool.get(w).copied().unwrap_or(0);
-        pool_iters.entry(pool).or_default().push((*start, *dur));
-        pool_workers.entry(pool).or_default().insert(*w);
-    }
-
-    let t_min = iters.iter().map(|i| i.1).fold(f64::INFINITY, f64::min);
-    let t_max = iters.iter().map(|i| i.1 + i.2).fold(f64::NEG_INFINITY, f64::max);
+    // Run span from a single SQL row so we can size the bins without pulling every
+    // iteration into Rust.
+    let (t_min, t_max) = match query_span(ctx).await? {
+        Some(span) => span,
+        None => {
+            let reason = "cost_log has no iterations to bin";
+            return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+        }
+    };
     if !(t_max > t_min) {
         let reason = "cost_log busy span is zero (no positive iteration durations)";
         return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
@@ -73,16 +60,39 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
     let t_start: Vec<f64> = (0..n_bins).map(|b| t_min + b as f64 * bin_width).collect();
     let t_end: Vec<f64> = (0..n_bins).map(|b| t_min + (b + 1) as f64 * bin_width).collect();
 
+    // Per-(worker, bin) busy-ms via a SQL GROUP BY — collapses tens of millions of
+    // rows to num_workers × n_bins. Each iteration's whole duration lands in the bin
+    // of its start time (no cross-bin interval spread; negligible at ~run/200 bins vs
+    // ms-scale iterations).
+    let worker_bins = collect_worker_bins(ctx, t_min, bin_width, n_bins).await?;
+
+    // Accumulate per pool (worker→pool from run_meta), seeding rosters from run_meta so
+    // a pool's idle worker still counts toward its capacity, then unioning observed.
+    let mut pool_bins: BTreeMap<u64, Vec<f64>> = BTreeMap::new();
+    let mut pool_workers: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for (&w, &p) in &worker_pool {
+        pool_workers.entry(p).or_default().insert(w);
+    }
+    for &(w, bin, busy) in &worker_bins {
+        let pool = worker_pool.get(&w).copied().unwrap_or(0);
+        pool_bins.entry(pool).or_insert_with(|| vec![0.0; n_bins])[bin] += busy;
+        pool_workers.entry(pool).or_default().insert(w);
+    }
+
     // Per-pool fine series + run-average. Sorted by pool id for a stable plot order.
     let mut series = Vec::new();
     let mut totals_per_pool = Vec::new();
     let mut avg = serde_json::Map::new();
     let mut overall_busy = 0.0;
     let mut overall_worker_ms = 0.0;
-    for (pool, ivals) in &pool_iters {
+    for (pool, bins) in &pool_bins {
         let n_workers = pool_workers.get(pool).map_or(1, BTreeSet::len).max(1) as f64;
-        let util = bin_pool(ivals, t_min, bin_width, n_bins, n_workers);
-        let busy: f64 = ivals.iter().map(|&(_, d)| d.max(0.0)).sum();
+        let capacity = bin_width * n_workers;
+        let util: Vec<f64> = bins
+            .iter()
+            .map(|&v| if capacity > 0.0 { (v / capacity).clamp(0.0, 1.0) } else { 0.0 })
+            .collect();
+        let busy: f64 = bins.iter().sum();
         let avg_util = busy / (span_ms * n_workers);
         let key = format!("pool_{pool}");
         series.push(json!({"key": key, "label": format!("Pool {pool}"), "util": util}));
@@ -103,7 +113,7 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
         "meta": {
             "log_dir": log_dir.display().to_string(),
             "gpu_name": gpu_name,
-            "num_pools": pool_iters.len(),
+            "num_pools": pool_bins.len(),
             "num_workers": num_workers,
             "bin_width_ms": bin_width,
             "span_ms": span_ms,
@@ -135,67 +145,52 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
     Ok((report, payload))
 }
 
-/// Ref's interval-spread binning (`analyze-rust/src/utilization.rs`): distribute each
-/// busy interval's duration across the equal-width bins it overlaps — partial edge
-/// bins directly, fully-covered middle bins via a `diff`/prefix-sum — then normalize
-/// each bin by `capacity = bin_width × n_workers` to get the mean busy fraction (0–1).
-fn bin_pool(
-    intervals: &[(f64, f64)],
+/// Run busy span `(t_min, t_max)` from one SQL row — `MIN(wall_start_ms)` and
+/// `MAX(wall_start_ms + total_time_ms)`. `None` when cost_log is empty (aggregates
+/// return a null row).
+async fn query_span(ctx: &SessionContext) -> Result<Option<(f64, f64)>> {
+    let batches = collect(
+        ctx,
+        "SELECT MIN(wall_start_ms) AS t0, MAX(wall_start_ms + total_time_ms) AS t1 FROM cost_log",
+    )
+    .await?;
+    let b = match batches.first() {
+        Some(b) if b.num_rows() > 0 => b,
+        _ => return Ok(None),
+    };
+    let (t0, t1) = (col(b, "t0")?, col(b, "t1")?);
+    if t0.is_null(0) || t1.is_null(0) {
+        return Ok(None);
+    }
+    Ok(Some((value_f64(t0, 0)?, value_f64(t1, 0)?)))
+}
+
+/// Per-(worker, bin) busy-ms via a SQL GROUP BY: `bin` = truncated bin index of the
+/// iteration's start time (`CAST(... AS BIGINT)` = floor for a non-negative offset),
+/// `busy` = `SUM(total_time_ms)`. Returns num_workers × n_bins rows at most, clamped
+/// into `[0, n_bins)`.
+async fn collect_worker_bins(
+    ctx: &SessionContext,
     t_min: f64,
     bin_width: f64,
     n_bins: usize,
-    n_workers: f64,
-) -> Vec<f64> {
-    let mut util = vec![0.0f64; n_bins];
-    let mut diff = vec![0.0f64; n_bins + 1];
+) -> Result<Vec<(u64, usize, f64)>> {
+    let sql = format!(
+        "SELECT worker_id, \
+                CAST((wall_start_ms - {t_min}) / {bin_width} AS BIGINT) AS bin, \
+                SUM(total_time_ms) AS busy \
+         FROM cost_log GROUP BY worker_id, bin"
+    );
+    let batches = collect(ctx, &sql).await?;
     let last = n_bins as isize - 1;
-    for &(start, dur) in intervals {
-        if dur <= 0.0 {
-            continue;
-        }
-        let end = start + dur;
-        let sb = (((start - t_min) / bin_width).floor() as isize).clamp(0, last) as usize;
-        let eb = (((end - t_min) / bin_width).floor() as isize).clamp(0, last) as usize;
-        if sb == eb {
-            util[sb] += dur;
-            continue;
-        }
-        let first_edge = t_min + (sb as f64 + 1.0) * bin_width;
-        let last_edge = t_min + eb as f64 * bin_width;
-        util[sb] += first_edge - start;
-        util[eb] += end - last_edge;
-        if eb > sb + 1 {
-            diff[sb + 1] += bin_width;
-            diff[eb] -= bin_width;
-        }
-    }
-    let mut carry = 0.0;
-    for b in 0..n_bins {
-        carry += diff[b];
-        util[b] += carry;
-    }
-    let capacity = bin_width * n_workers;
-    util.into_iter()
-        .map(|v| if capacity > 0.0 { (v / capacity).clamp(0.0, 1.0) } else { 0.0 })
-        .collect()
-}
-
-/// All `(worker_id, wall_start_ms, total_time_ms)` rows from `cost_log`.
-async fn collect_iters(ctx: &SessionContext) -> Result<Vec<Iter>> {
-    let batches = collect(
-        ctx,
-        "SELECT worker_id, wall_start_ms, total_time_ms FROM cost_log",
-    )
-    .await?;
     let mut out = Vec::new();
     for batch in &batches {
-        // One typed pass per column beats a per-row 11-branch dispatch across the
-        // whole cost_log (tens of millions of rows on an AFD run).
         let w = column_f64(col(batch, "worker_id")?)?;
-        let s = column_f64(col(batch, "wall_start_ms")?)?;
-        let d = column_f64(col(batch, "total_time_ms")?)?;
+        let bin = column_f64(col(batch, "bin")?)?;
+        let busy = column_f64(col(batch, "busy")?)?;
         for row in 0..batch.num_rows() {
-            out.push((w[row] as u64, s[row], d[row]));
+            let bi = (bin[row] as isize).clamp(0, last) as usize;
+            out.push((w[row] as u64, bi, busy[row]));
         }
     }
     Ok(out)

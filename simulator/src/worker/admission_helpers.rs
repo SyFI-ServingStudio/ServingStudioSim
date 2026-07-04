@@ -195,11 +195,20 @@ impl Batch {
     /// leaves `cached_peak` untouched (advancing a live decode never raises the
     /// projected peak — the per-step growth is already counted in the cached peak).
     pub fn advance_subset(&mut self, reqs: &[RequestId]) {
-        for (rid, s) in &mut self.decodes {
-            if s.remaining_decode > 0 && reqs.contains(rid) {
-                s.current_kv += 1;
-                s.remaining_decode -= 1;
-                self.kv.add_kv(1);
+        // Walk the (small) named set and resolve each request through the O(1)
+        // `index` instead of scanning every decode with a linear `reqs.contains`.
+        // The old form was O(decodes × reqs); at large batch (~4800 decodes) that
+        // quadratic scan dominated the attn tick. Order-independent: each request's
+        // update is self-contained and `kv.add_kv` is a commutative running sum, so
+        // the modeled result is byte-identical to the old iteration order.
+        for &rid in reqs {
+            if let Some(&pos) = self.index.get(&rid) {
+                let s = &mut self.decodes[pos].1;
+                if s.remaining_decode > 0 {
+                    s.current_kv += 1;
+                    s.remaining_decode -= 1;
+                    self.kv.add_kv(1);
+                }
             }
         }
     }

@@ -108,15 +108,16 @@ impl CostLogger {
     /// Buffer one cost-log row. The variable-length fields are appended into the
     /// chunk's flat buffers (reused capacity) rather than owned per-row `Vec`s:
     /// `slots` (the per-slot `LeafMetrics`) is split into the `time`/`coverage`
-    /// columns here; `groups` and `slot_inputs` are moved over (drained, so the
-    /// worker keeps their capacity). The first row fixes the per-row sizes used
-    /// to pre-size a rotated chunk in [`Self::send`].
+    /// columns here; `groups` is moved over (drained, so the worker keeps its
+    /// capacity); `slot_inputs` is copied by reference (so the same slice can be
+    /// replayed from a cached section snapshot). The first row fixes the per-row
+    /// sizes used to pre-size a rotated chunk in [`Self::send`].
     pub fn record(
         &mut self,
         mut entry: CostLogEntry,
         slots: &[LeafMetrics],
         groups: &mut Vec<GroupInputLog>,
-        slot_inputs: &mut Vec<SlotInput>,
+        slot_inputs: &[SlotInput],
     ) -> Result<()> {
         let (group_len, slot_len, slot_input_len) = (groups.len(), slots.len(), slot_inputs.len());
         if self.slots_per_row == 0 && slot_len > 0 {
@@ -146,7 +147,7 @@ impl CostLogger {
         self.buf.slot_flops.extend(slots.iter().map(|l| l.m.flops));
         self.buf.slot_bytes.extend(slots.iter().map(|l| l.m.bytes));
         self.buf.group_logs.append(groups);
-        self.buf.slot_inputs.append(slot_inputs);
+        self.buf.slot_inputs.extend_from_slice(slot_inputs);
         self.buf.entries.push(entry);
         if self.buf.len() >= STREAM_FLUSH_ROWS {
             self.send()?;
@@ -276,9 +277,9 @@ mod tests {
             coverage: CoverageFlags::EMPTY,
         }];
         let mut groups = Vec::new();
-        let mut slot_inputs = Vec::new();
+        let slot_inputs = Vec::new();
         logger
-            .record(entry, &slots, &mut groups, &mut slot_inputs)
+            .record(entry, &slots, &mut groups, &slot_inputs)
             .unwrap();
         logger.flush_all().unwrap();
 

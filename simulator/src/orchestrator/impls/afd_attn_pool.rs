@@ -489,11 +489,17 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
         for &(w, t) in &b.reported {
             s.scatter_weights[w.0 as usize] = t;
         }
+        // Sum the per-shard query-token counts the workers already reported (the same
+        // numbers feeding `scatter_weights`). The shards partition `reqs`, so this
+        // equals a fresh `workload_tokens(reqs)` scan on the ffn side — hand it over
+        // so the ffn worker never re-walks the store per layer.
+        let total_tokens: u64 = b.reported.iter().map(|&(_, t)| t).sum();
         tasks.push(FfnTask {
             kind,
             slot: slot as u8,
             reqs: b.reqs,
             pull_sources: b.pull_sources,
+            tokens: total_tokens,
         });
         true
     }
@@ -533,6 +539,9 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
             slot: slot as u8,
             reqs,
             pull_sources: Vec::new(),
+            // A Bootstrap precedes any attn layer-output, so no per-shard count exists
+            // yet; the worker fills `tokens` from the store once at `start_compute`.
+            tokens: 0,
         });
     }
 

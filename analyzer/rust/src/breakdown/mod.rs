@@ -40,8 +40,8 @@ use datafusion::prelude::SessionContext;
 
 use crate::io::{read_cost_manifests, report_path};
 use crate::session::{
-    col, collect, register_cost_log, require_columns, value_f32_list, value_f64, value_groups,
-    value_string, COST_LOG_TABLE, GroupInput,
+    col, collect, column_f64, register_cost_log, require_columns, value_f32_list, value_f64,
+    value_groups, value_string, COST_LOG_TABLE, GroupInput,
 };
 use crate::trace::manifest::{node_time, FlatCostNode, Manifest};
 
@@ -95,10 +95,31 @@ pub async fn run(
     }
     require_columns(ctx, COST_LOG_TABLE, COLUMNS).await?;
 
-    // Cast the low-cardinality string columns (pool_tag, section) → VARCHAR for the
-    // same reason as `analyze trace`: parquet hands them back as a DictionaryArray
-    // (RLE_DICTIONARY), which `value_string`'s StringArray downcast rejects. The
-    // rest pass through unchanged.
+    // Pick the render window in SQL *before* touching the heavy `groups` /
+    // `slot_time_ms` list columns: a 2000s AFD run has ~50M cost_log rows, but we
+    // only ever print `max_iters` of them (default 32). The old path pulled + decoded
+    // every row's list columns and then truncated in Rust — decoding 50M rows to keep
+    // 32. `plan_window` instead uses scalar-only passes (a COUNT and a TopK on
+    // iter_id) to derive a predicate selecting just the window, so the one heavy scan
+    // below is filtered + `LIMIT`ed to <= max_iters rows.
+    let (filter, total_matching) = plan_window(ctx, iter, max_iters).await?;
+    if total_matching == 0 {
+        match iter {
+            Some(want) => bail!("no cost_log row with iter_id={want}"),
+            None => bail!("cost_log has no rows"),
+        }
+    }
+    // Rows beyond the window, counted pre-truncation exactly like the old path
+    // (`rows.len() - max_iters` over the `--iter`-filtered set) so the footer is
+    // unchanged.
+    let omitted = total_matching.saturating_sub(max_iters);
+
+    // Heavy pass, windowed. Cast the low-cardinality string columns (pool_tag,
+    // section) → VARCHAR for the same reason as `analyze trace`: parquet hands them
+    // back as a DictionaryArray (RLE_DICTIONARY), which `value_string`'s StringArray
+    // downcast rejects. `WHERE {filter}` + `ORDER BY … LIMIT` reproduce the old
+    // "sort the whole table, take the first max_iters rows" set exactly (every
+    // windowed row sorts ahead of every excluded one), but decode only the kept rows.
     let other_cols = COLUMNS
         .iter()
         .filter(|c| **c != "pool_tag" && **c != "section")
@@ -107,7 +128,8 @@ pub async fn run(
         .join(", ");
     let sql = format!(
         "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, CAST(section AS VARCHAR) AS section, \
-         {other_cols} FROM cost_log ORDER BY pool_tag, worker_id, iter_id"
+         {other_cols} FROM cost_log WHERE {filter} \
+         ORDER BY pool_tag, worker_id, iter_id LIMIT {max_iters}"
     );
     let batches = collect(ctx, &sql).await?;
 
@@ -138,20 +160,6 @@ pub async fn run(
                 groups: value_groups(gr, r)?,
             });
         }
-    }
-    if rows.is_empty() {
-        bail!("cost_log has no rows");
-    }
-
-    if let Some(want) = iter {
-        rows.retain(|r| r.iter_id == want);
-        if rows.is_empty() {
-            bail!("no cost_log row with iter_id={want}");
-        }
-    }
-    let omitted = rows.len().saturating_sub(max_iters);
-    if omitted > 0 {
-        rows.truncate(max_iters);
     }
 
     let mut out = String::new();
@@ -194,6 +202,62 @@ pub async fn run(
         }
     );
     Ok(())
+}
+
+/// Choose the SQL predicate selecting the rows `gen-iter-breakdown` renders, using
+/// only scalar columns so the heavy `groups` / `slot_time_ms` list columns are never
+/// decoded here. Also returns the count of rows matching the `--iter` filter
+/// (pre-truncation) for the "N omitted" footer.
+///
+/// - `--iter want`: predicate `iter_id = want` (parquet row-group pruning on iter_id
+///   keeps the heavy pass to the row groups holding `want`).
+/// - no `--iter`: the window is the first `max_iters` rows in
+///   (pool_tag, worker_id, iter_id) order. A scalar-only TopK finds the largest
+///   iter_id among them (`M`); `iter_id <= M` is then a superset the heavy pass
+///   re-orders + `LIMIT`s down to exactly those rows — equivalent because every one
+///   of the first max_iters rows has iter_id <= M and no excluded row can sort ahead
+///   of them, and a clean range predicate prunes row groups well.
+async fn plan_window(
+    ctx: &SessionContext,
+    iter: Option<u64>,
+    max_iters: usize,
+) -> Result<(String, usize)> {
+    if let Some(want) = iter {
+        let n = scalar_count(ctx, &format!("WHERE iter_id = {want}")).await?;
+        return Ok((format!("iter_id = {want}"), n));
+    }
+    let total = scalar_count(ctx, "").await?;
+    if total == 0 {
+        // Caller bails; the predicate is never used (`total_matching == 0`).
+        return Ok(("iter_id >= 0".to_string(), 0));
+    }
+    // Order by the VARCHAR-cast pool_tag so this matches the heavy pass's ordering
+    // exactly (both sort the same string values), making `M` the true max iter_id of
+    // the rendered set.
+    let sql = format!(
+        "SELECT iter_id FROM cost_log \
+         ORDER BY CAST(pool_tag AS VARCHAR), worker_id, iter_id LIMIT {max_iters}"
+    );
+    let batches = collect(ctx, &sql).await?;
+    let mut max_iter_id = 0u64;
+    for b in &batches {
+        for id in column_f64(col(b, "iter_id")?)? {
+            max_iter_id = max_iter_id.max(id as u64);
+        }
+    }
+    Ok((format!("iter_id <= {max_iter_id}"), total))
+}
+
+/// `COUNT(*)` over cost_log with an optional `WHERE …` clause (scalar-only, so it
+/// reads row-group metadata / the iter_id column, never the list columns). Empty
+/// table → 0.
+async fn scalar_count(ctx: &SessionContext, where_clause: &str) -> Result<usize> {
+    let sql = format!("SELECT COUNT(*) AS n FROM cost_log {where_clause}");
+    let batches = collect(ctx, &sql).await?;
+    match batches.first() {
+        Some(b) if b.num_rows() > 0 => Ok(value_f64(col(b, "n")?, 0)? as usize),
+        _ => Ok(0),
+    }
 }
 
 // ── time fold ──────────────────────────────────────────────────────────────
