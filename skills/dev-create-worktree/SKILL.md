@@ -1,6 +1,6 @@
 ---
-name: create-worktree
-description: Use when the user asks to create or set up a git worktree for MLSim development (e.g. "start a worktree", "make a wt-<topic> worktree", "work on X in a worktree"). Creates a sibling `wt-<topic>/` worktree off the current `main/` HEAD on a fresh branch, then provisions the untracked / working-copy test artifacts that `git worktree add` does NOT carry — the working-copy `profile.db` kernel cost cache (marked `skip-worktree` so it stays rich yet git-invisible) and untracked traces such as `trace/aime_long.csv` — so simulations and tests run immediately without re-profiling on a GPU. NOT for the parallel-writing-subagent isolation flow (that is `orchestrate-parallel-subagents`).
+name: dev-create-worktree
+description: Use when the user asks to create or set up a git worktree for MLSim development, such as starting a worktree, making a wt-topic worktree, or working on a topic in a worktree. Creates a sibling wt-topic worktree off the current main HEAD on a fresh branch, then provisions the untracked or working-copy test artifacts that git worktree add does not carry. NOT for the parallel-writing-subagent isolation flow (that is dev-orchestrate-parallel-subagents).
 ---
 
 # Create an MLSim worktree (with test artifacts)
@@ -123,8 +123,8 @@ If the dry-run errors on a missing `trace/aime_long.csv`, step 3 did not land.
 
 ## Relationship to other skills
 
-- Once the worktree is ready, use `run-simulation` to launch sims and
-  `run-tests` for the test tiers — both assume the artifacts this skill staged.
+- Once the worktree is ready, use `operate-run-simulation` to launch sims and
+  `dev-run-tests` for the test tiers — both assume the artifacts this skill staged.
 - For isolating **multiple concurrent writing subagents**, use
-  `orchestrate-parallel-subagents` instead; this skill is for a single
+  `dev-orchestrate-parallel-subagents` instead; this skill is for a single
   developer/agent worktree.

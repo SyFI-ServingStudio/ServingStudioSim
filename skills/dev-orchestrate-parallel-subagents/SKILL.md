@@ -1,9 +1,9 @@
 ---
-name: orchestrate-parallel-subagents
-description: Use when you (the orchestrator) are about to launch two or more subagents that will each MODIFY the same repository concurrently — e.g. several independent feature/kernel additions in one fan-out. Mandates git worktree isolation per agent so concurrent edits never race on shared files, every agent can run its task skill unmodified and self-validate end to end, and the orchestrator integrates afterward.
+name: dev-orchestrate-parallel-subagents
+description: "Use when you are about to launch two or more subagents that will each MODIFY the same repository concurrently, such as several independent feature/kernel additions in one fan-out. Mandates git worktree isolation per agent so concurrent edits never race on shared files, every agent can run its task skill unmodified and self-validate end to end, and the orchestrator integrates afterward."
 ---
 
-# Orchestrate Parallel Subagents
+# Dev Orchestrate Parallel Subagents
 
 When you fan out **2+ subagents that each write to the same repo**, give each its
 own **git worktree**. Do NOT run concurrent writing agents in one shared working

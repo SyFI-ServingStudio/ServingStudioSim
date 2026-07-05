@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Of Skills"
+  short_description: "Map repo skill levels and trees"
+  default_prompt: "Use $skill-of-skills to choose the right repo-local skill level before changing skills."

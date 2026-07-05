@@ -1,6 +1,6 @@
 ---
 name: add-analyzer-subject
-description: Use when adding a new MLSim analyzer subject (a metric) end to end — the Rust compute side (a report + payload JSON built from a run's parquet via DataFusion) and the Python render side (a matplotlib PNG drawn from the payload). Covers the flat registry, the report/payload contract, the Applies gate, and — emphatically — reusing the shared session / io / cdf infra and the Python common style / figure / layout helpers instead of re-implementing them. NOT for running an existing analyzer (that is run-moesim-analyzer) or adding an L1 kernel (profile-add-kernel).
+description: Use when adding a new MLSim analyzer subject (a metric) end to end — the Rust compute side (a report + payload JSON built from a run's parquet via DataFusion) and the Python render side (a matplotlib PNG drawn from the payload). Covers the flat registry, the report/payload contract, the Applies gate, and — emphatically — reusing the shared session / io / cdf infra and the Python common style / figure / layout helpers instead of re-implementing them. NOT for running an existing analyzer (that is run-moesim-analyzer) or adding an L1 kernel (that is top-add-kernel).
 ---
 
 # Add Analyzer Subject (Rust compute + Python render)
@@ -20,7 +20,7 @@ family (`docs/analyzer.md` §5), not a registration unit.
 
 > **Single-agent skill.** You are the only agent editing the tree. If several
 > subjects are added in parallel, the orchestrator isolates each in a git worktree
-> (`orchestrate-parallel-subagents`) — you still run every step here normally.
+> (`dev-orchestrate-parallel-subagents`) — you still run every step here normally.
 
 ---
 

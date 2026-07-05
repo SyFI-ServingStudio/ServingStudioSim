@@ -1,6 +1,6 @@
 ---
 name: worker-compose-rules
-description: Use when composing, reviewing, or tidying an MLSim iter-wise worker (the `IterWorker` impls under `simulator/src/worker/` — barebone, hp_unified, pd_prefill, pd_decode, disagg_attn, disagg_ffn) for its house conventions — module-doc + reading order, `on_msg_*` message-handler naming, and the naming-quality checks (a name must earn its keep; no misleading quantifiers; name the actual transition; qualify thin wrappers; reserve `on_*` for handlers; keep `ref` anchors). NOT for cost-model/kernel work (that is profile-add-kernel / validate-kernel-cache) or a general file review (that is file-design-review).
+description: Use when composing, reviewing, or tidying an MLSim iter-wise worker (the `IterWorker` impls under `simulator/src/worker/` — barebone, hp_unified, pd_prefill, pd_decode, disagg_attn, disagg_ffn) for its house conventions — module-doc + reading order, `on_msg_*` message-handler naming, and the naming-quality checks (a name must earn its keep; no misleading quantifiers; name the actual transition; qualify thin wrappers; reserve `on_*` for handlers; keep `ref` anchors). NOT for cost-model/kernel work (that is top-add-kernel / impl-validate-kernel-cache) or a general file review (that is dev-file-design-review).
 ---
 
 # Worker Compose Rules
@@ -11,7 +11,7 @@ Conventions for an MLSim **iter-wise worker** — a struct that implements
 canonical exemplar is `simulator/src/worker/disagg_attn.rs`; read it before
 composing a new worker and mirror its shape.
 
-This skill is the *worker-specific* layer on top of `file-design-review`. When a
+This skill is the *worker-specific* layer on top of `dev-file-design-review`. When a
 rule here and a rule there conflict, this one wins for worker files. Apply these
 when writing a new worker, porting one from `ref/moesim-rs`, or tidying an
 existing one.

@@ -1,5 +1,5 @@
 ---
-name: file-design-review
+name: dev-file-design-review
 description: Use when asked to check, review, tidy, or validate a specific source file against repo design docs, behavioral correctness, naming quality, future-agent-facing comments, and readable code order. Produces either a focused patch plus validation results, or doc-backed findings/questions when code changes are not justified.
 ---
 

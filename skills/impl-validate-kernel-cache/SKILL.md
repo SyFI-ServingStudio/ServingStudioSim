@@ -1,18 +1,19 @@
 ---
-name: validate-kernel-cache
-description: Use when asked to validate, measure, or compare the INTERPOLATION / EXTRAPOLATION fidelity of an MLSim L1 kernel's cost cache — i.e. how faithfully the Rust cache reproduces true kernel time at OFF-GRID shapes vs perf_api ground truth. Covers any registered KernelSpec (1D/2D/3D). NOT for profiling existing rows (that is profile-run-existing-kernel) or batch-aggregation fidelity.
+name: impl-validate-kernel-cache
+description: "Use when implementing the cache-fidelity validation leaf for an MLSim L1 kernel Rust cost cache. Measure or compare INTERPOLATION / EXTRAPOLATION / QUANTIZATION fidelity against perf_api ground truth at off-grid, extrapolated, or bucket-boundary shapes. Covers any registered KernelSpec. NOT for profiling existing rows or batch-aggregation fidelity."
 ---
 
-# Validate Kernel Cache Fidelity
+# Impl Validate Kernel Cache Fidelity
 
-Measure how faithfully a kernel's **cache** (the Rust `Cache2DLinear` /
-`Cache1DLinear` interpolation) reproduces true kernel time at **off-grid** shapes
-— the points between/beyond profiled sweep-grid rows. This is the cache's
-*interpolation/extrapolation* fidelity, distinct from:
+Measure how faithfully a kernel's **cache** reproduces true kernel time:
+`Cache2DLinear` / `Cache1DLinear` interpolation at off-grid shapes,
+direct/bucketed caches such as `Cache1DDirect` at bucket boundaries, or fitted
+cache variants if the codebase provides one. This is the cache's
+*interpolation/extrapolation/quantization* fidelity, distinct from:
 
-- **`profile-run-existing-kernel`** — queries/fills the profiled grid rows
-  themselves. Use that to populate `profile.db`; use THIS to check the interp
-  between those rows.
+- **`operate-profile-existing-kernel`** — queries/fills the profiled grid rows
+  themselves. Use that to populate `profile.db`; use THIS to check cache
+  behavior between rows, beyond rows, or at bucket boundaries.
 - **batch-aggregation fidelity** (`agent-trace/attention_cache_fidelity.md`) — how
   an L2 op collapses a heterogeneous batch into one shape. Separate concern.
 
@@ -21,22 +22,23 @@ Measure how faithfully a kernel's **cache** (the Rust `Cache2DLinear` /
 Two exposed, kernel-agnostic interfaces, fed ONE config from Python:
 
 - **Rust `simulator kernel-query`** (stdin/stdout JSON) = the authoritative
-  interp + grid metadata. We never reimplement bilinear in Python.
+  cache eval + grid metadata. We never reimplement Rust cache math in Python.
 - **Python `perf_api.get_{kind}_times(...)`** = GPU ground truth.
 
-Python holds the single config and sends it to both, so interp and truth can't
-describe different kernels. `ratio = interp / truth`; bar = within ±15%.
+Python holds the single config and sends it to both, so cache eval and truth
+can't describe different kernels. `ratio = cache_eval / truth`; bar = within
+±15%.
 
 ## The two `kernel-query` ops
 
 Request on stdin, JSON on stdout (tracing goes to stderr — stdout stays pure):
 
 ```jsonc
-// grid: fitted axes + resolved config. NO bridge/GPU. Call first.
+// grid: cache axes + resolved config. NO bridge/GPU. Call first.
 {"op":"grid","kind":"<KIND>","config":{...}}
 //  → {"kind","describe_config","input_fields":[...],"grid_axes":[[...],...]}
 
-// eval: best-of-N interp at query points. Builds the kernel (JIT-profiles
+// eval: best-of-N cache eval at query points. Builds the kernel (JIT-profiles
 //       missing grid rows → needs GPU + the perf_api bridge).
 {"op":"eval","kind":"<KIND>","config":{...},"query_points":[{<input_fields>:v},...]}
 //  → {"kind","results":[{"input","time_ms","flops","bytes","energy_j","coverage"},...]}
@@ -116,6 +118,25 @@ grid max, the fresh/diagonal curvature, memory-bound small shapes, interior
 cells. A CSV of per-probe rows lands in `--log-dir`. `ratio < 1` = the cache
 under-estimates time (too optimistic); `> 1` = over-estimates.
 
+Treat command success as transport only; validation means the final ratios are
+acceptable under the user-specified threshold, or the default ±15% bar. If the
+error is too large, classify the failure before changing code:
+
+- interior interpolation error → consider a denser sweep grid, a different
+  built-in cache kind, or an existing fitted variant;
+- extrapolation error → widen the profiled grid or narrow the supported domain;
+- direct-cache quantization error → add bucket-boundary probes, then consider
+  denser buckets or a non-direct cache;
+- re-axis/domain error → verify probes are physical query points and revise the
+  re-axis if the projection is wrong;
+- noisy backend measurements → rerun/pre-warm before treating it as a cache
+  design problem.
+
+Ask the user before accepting a known inaccurate region, materially increasing
+profiling cost with a denser grid, adding a new cache/fitting mechanism, or
+changing the public query/input contract. After any remediation, rerun fidelity
+and report the new final CSV/log summary.
+
 ## Gotchas (hard-won)
 
 - **`gpu_name` is the exact `profile.db` key** — `"NVIDIA H200"`, not `"H200"`.
@@ -128,7 +149,7 @@ under-estimates time (too optimistic); `> 1` = over-estimates.
 - **`eval` JIT-profiles missing grid rows on the GPU.** Pre-warm or expect a slow
   first build. Profiling many *fresh* shapes in one process can OOM the GPU
   (tensors not freed between calls) — profile a handful at a time, or pre-warm
-  via `profile-run-existing-kernel`.
+  via `operate-profile-existing-kernel`.
 - **`grid_axes` may be a re-axis space**, not the query space (see Recipe B).
   `input_fields` always labels the *query* keys; if the cache re-axes internally,
   do NOT place probes off `grid_axes` — use a physical reference grid.

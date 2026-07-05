@@ -1,5 +1,5 @@
 ---
-name: profile-run-existing-kernel
+name: operate-profile-existing-kernel
 description: Use when asked to list, query, count missing rows for, JIT-fill, force-refresh, or validate an existing MLSim L1 profiler entry through `uv run python -m profiling`. Applies only to registered KernelProfilerSpec table/backend pairs and batched specs.
 ---
 
@@ -120,7 +120,7 @@ items as `[x]` only when complete.
 Always report:
 
 - Instruction files used: include concrete paths, especially `AGENTS.md` and
-  `skills/profile-run-existing-kernel/SKILL.md`.
+  `skills/operate-profile-existing-kernel/SKILL.md`.
 - Docs checked: concrete doc paths/sections.
 - Command(s): exact CLI command(s), including `--db`, `--gpu-name`, and
   `--force` when used.

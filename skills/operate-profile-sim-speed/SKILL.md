@@ -1,5 +1,5 @@
 ---
-name: profile-sim-speed
+name: operate-profile-sim-speed
 description: Use when asked to profile, perf, or speed up the MLSim *simulator wallclock* (how fast a run executes), not the modeled cluster throughput and not L1 kernel profiling. Covers building a symbol-rich release binary, capturing a `perf record` of a representative run, and reading the per-thread / flat breakdown to find the bottleneck.
 ---
 
@@ -8,7 +8,8 @@ description: Use when asked to profile, perf, or speed up the MLSim *simulator w
 This is for the question "why is the sim *slow to run*" — wallclock seconds, the
 `x real-time` ratio, where CPU goes across the sim thread and the background
 `mlsim-logger` thread. It is NOT about modeled tok/s (that's the run's output
-metric) and NOT about L1 kernel profile.db (that's `profile-run-existing-kernel`).
+metric) and NOT about L1 kernel profile.db (that's
+`operate-profile-existing-kernel`).
 
 ## Why the env wiring matters
 

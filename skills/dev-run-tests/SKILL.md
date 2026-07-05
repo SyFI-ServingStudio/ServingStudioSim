@@ -1,6 +1,6 @@
 ---
-name: run-tests
-description: Use when asked to run, select, or understand MLSim's tests — which tier needs a GPU / the built binary / an agent runtime / is just CPU, how the auto-skip works, and how the per-GPU throughput & sim-speed goldens are recorded. Covers the `just test-*` recipes, pytest markers, and the GPU-type-tagged golden store. NOT for writing a new kernel's cache-fidelity check (that is validate-kernel-cache).
+name: dev-run-tests
+description: Use when asked to run, select, or understand MLSim's tests — which tier needs a GPU / the built binary / an agent runtime / is just CPU, how the auto-skip works, and how the per-GPU throughput & sim-speed goldens are recorded. Covers the `just test-*` recipes, pytest markers, and the GPU-type-tagged golden store. NOT for writing a new kernel's cache-fidelity check (that is impl-validate-kernel-cache).
 ---
 
 # Run MLSim Tests (capability tiers)

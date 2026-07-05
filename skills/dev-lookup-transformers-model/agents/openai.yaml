@@ -1,0 +1,4 @@
+interface:
+  display_name: "Lookup Transformers Model"
+  short_description: "Find local Transformers model code"
+  default_prompt: "Use $dev-lookup-transformers-model to locate a model implementation in the local Transformers package."

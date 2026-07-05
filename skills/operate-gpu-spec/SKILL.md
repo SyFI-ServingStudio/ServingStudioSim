@@ -1,5 +1,5 @@
 ---
-name: gpu-spec
+name: operate-gpu-spec
 description: Use when reading, querying, verifying, or extending the GPU spec catalog at `gpu/spec.json` — the per-GPU datacenter hardware table (mem/BW, dense TFLOPS by dtype, interconnect, nvl_domain_size, dollar_per_hour). Covers how to INTERPRET each field (TFLOPS are DENSE not sparse, interconnect BW is BIDIRECTIONAL, fp32 is CUDA-core not tensor, dollar_per_hour is the getdeploying on-demand "medium" rate, nvl_domain_size is a deployment param), how to SEARCH for a value (jq/python), how to VERIFY a value is right (sparse-doubling trap, one-way vs bidir, SXM vs PCIe vs NVL form-factor distinction, GB200 combined-for-2-GPU), what to do when a GPU/field is NOT in the table (web-search the fallback and clearly tell the user it is a searched result, not catalog-backed), and how to ADD/refresh a GPU. NOT the simulator timing path — modeled timings come from measured kernels in profile.db, not from these peaks.
 ---
 

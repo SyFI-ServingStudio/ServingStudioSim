@@ -1,6 +1,6 @@
 ---
-name: run-simulation
-description: Use when the user wants to run an MLSim simulation from a preset (YAML preferred, JSON also accepted). This skill locates the repo `logs/` root, names the experiment as `YYYYMMDD_N_<short-name>` (date, then a per-day index, then a name of 5 words or fewer), prefers expressing requested variations as internal sweeps inside one copied preset, always does a `--dry-run` to inspect the expanded run plan before launching, and runs through the MLSim launcher with `uv run python -m launcher`.
+name: operate-run-simulation
+description: Use when the user wants to run an MLSim simulation from a preset (YAML preferred, JSON also accepted). This skill locates the repo logs root, names the experiment as date_index_short_name, prefers expressing requested variations as internal sweeps inside one copied preset, always does a dry run to inspect the expanded run plan before launching, and runs through the MLSim launcher.
 ---
 
 # Run MLSim Simulation
