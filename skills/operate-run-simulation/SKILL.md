@@ -17,6 +17,10 @@ authoritative, worked reference for the format — the tree skeleton, every swee
 mechanism, and the validation rules — is `launcher/README.md`. This skill is the
 run *workflow*; defer to that README for the preset *grammar*.
 
+For the *offline* cost predictor (explicit batch shapes, no discrete-event sim /
+workload / pools) use `operate-run-timing-predict` instead — this skill is only
+for a real deployment run driven by a workload trace.
+
 Repo root:
 - `/m-coriander/coriander/kanzhu/MLSim_workspace/main`
 

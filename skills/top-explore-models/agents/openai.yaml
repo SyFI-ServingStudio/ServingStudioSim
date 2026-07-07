@@ -1,0 +1,4 @@
+interface:
+  display_name: "Explore Models"
+  short_description: "Understand new model architectures"
+  default_prompt: "Use $top-explore-models to summarize a new Hugging Face model architecture."

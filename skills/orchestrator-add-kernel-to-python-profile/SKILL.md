@@ -141,7 +141,7 @@ new semantic dimensions, decide whether the kind is underspecified and return to
 Path A or ask the user for a schema decision.
 
 **Task B.1 — Framework source and wrapper plan.** Ask the implementer to identify
-the framework implementation to wrap by using `impl-explore-kernel-source`.
+the framework implementation to wrap by using `dev-explore-kernel`.
 
 Things to verify:
 

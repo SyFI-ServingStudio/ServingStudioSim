@@ -1,16 +1,20 @@
 ---
 name: dev-lookup-transformers-model
-description: "Use when the user mentions a Transformer model or checkpoint that has not yet been implemented or modeled in MLSim, and you need to locate its architecture semantics from Hugging Face metadata and the local Transformers package installed under main. Helps map a model family or checkpoint name to model_type, architecture components, config parameters, modeling files, class names, kernel-relevant operations, and optional Torch reference code. This is a dev lookup skill and does not edit code."
+description: "Use as the lower-level code-exploration step for a Transformer model or checkpoint when high-level Hugging Face config/model-card/public-source evidence is insufficient. Trigger for local Transformers or Torch implementation questions such as operation lists, exact forward paths, class/function locations, QKV/RoPE/cache/MLP/MoE semantics, inherited model code, kernel-relevant behavior, or the smallest Torch reference. Usually follows top-explore-models; this dev lookup skill does not edit code."
 ---
 
 # Dev Lookup Transformers Model
 
-Use this skill when the user mentions a Transformer model or checkpoint that has
-not yet been implemented or modeled in MLSim. The goal is to understand the
-model architecture from the Hugging Face model metadata and the local
-`transformers` install: components, config parameters, operation shapes, and
-kernel-relevant paths. A later task may use this to build a small Torch
-reference for an operation or an MLSim kernel contract.
+Use this skill when a model-level pass is not enough and the request needs local
+Transformers or Torch implementation evidence. The goal is to locate the code
+that defines model semantics: modeling files, inherited parents, config fields,
+class/function names, operation shapes, cache behavior, and kernel-relevant
+paths. A later task may use this to build a small Torch reference for an
+operation or an MLSim kernel contract.
+
+For new-model exploration, enter through `top-explore-models` first. This skill
+is the optional lower-level step for questions like "list all operations in the
+model", "which function implements attention", or "extract a Torch reference".
 
 ## Reality Check
 
@@ -33,6 +37,11 @@ families have several nearby variants.
 Run commands from `main/` and use `uv run python`, so you inspect the same
 environment MLSim uses.
 
+If arriving from `top-explore-models`, reuse its resolved repo id, downloaded
+`config.json` / `README.md` paths, `model_type`, public sources, and unresolved
+implementation question. Do not repeat broad model-card or blog research unless
+the handoff is missing or contradicted by local code.
+
 1. Locate Transformers and list likely model modules.
 
 ```bash
@@ -49,7 +58,7 @@ for path in sorted((root / "models").glob(f"*{needle}*")):
 PY
 ```
 
-2. Map the requested name to a `model_type`.
+2. Map or confirm the requested name to a `model_type`.
 
 Use the auto mappings first. This avoids guessing which nearby architecture
 variant a checkpoint belongs to.
@@ -66,16 +75,19 @@ for key in sorted(CONFIG_MAPPING_NAMES):
 PY
 ```
 
-If the user provided a checkpoint and it is already cached locally, you can also
-try `AutoConfig.from_pretrained(model_id, local_files_only=True)`. Do not trigger
-a download unless the user asked for network access or model weights.
+If `top-explore-models` already resolved `model_type`, confirm that the local
+Transformers package has a matching config/modeling module. If the user provided
+a checkpoint and it is already cached locally, you can also try
+`AutoConfig.from_pretrained(model_id, local_files_only=True)`. Do not trigger a
+weight download.
 
-3. Check the Hugging Face model page for the exact checkpoint.
+3. Fill missing Hugging Face checkpoint metadata only when needed.
 
-When the user gives a repo id or a close checkpoint name, use Hugging Face as the
-checkpoint-level source of truth. If the repo id is ambiguous, search first and
-ask the user before choosing between plausible matches. Download only metadata:
-`config.json` and `README.md`, never model weights.
+If the top-level handoff did not include checkpoint metadata, or the exact
+`model_type` remains unclear, use Hugging Face as the checkpoint-level source of
+truth. If the repo id is ambiguous, search first and ask the user before choosing
+between plausible matches. Download only metadata: `config.json` and
+`README.md`, never model weights.
 
 ```bash
 uv run python - <<'PY'
@@ -134,13 +146,14 @@ Many model families reuse parents. If the model module imports pieces from
 another family, or if the class body is `pass` or only overrides a small method,
 follow the import to the parent file and record both paths.
 
-6. Summarize the architecture and kernel-relevant operations.
+6. Summarize the code-level architecture and kernel-relevant operations.
 
-First build a model-level picture. Record the component stack, such as token
-embedding, decoder layer pattern, attention or linear-attention blocks, norm
-placement, MLP or MoE blocks, router/shared-expert behavior, vision/audio
-branches, and output heads. Tie each component to the config fields that control
-its shape or behavior.
+First build the code-level picture needed for the implementation question.
+Record the component stack, such as token embedding, decoder layer pattern,
+attention or linear-attention blocks, norm placement, MLP or MoE blocks,
+router/shared-expert behavior, vision/audio branches, and output heads. Tie each
+component to the config fields and local classes/functions that control its
+shape or behavior.
 
 Then identify the kernel-relevant operations and their parameters:
 
@@ -162,11 +175,24 @@ establishes the required semantics instead of copying the whole model. Make that
 reference runnable with representative tensors and state shape, dtype,
 tolerance, edge cases, and unsupported cases.
 
+If the user asks for a particular operation's Torch code, do not return or copy
+the full Transformers modeling file. Extract only the key related functions,
+small helper functions, constants, and minimal module state needed for that
+operation, then assemble them into a complete but minimal standalone file. The
+file should run independently with representative inputs and should preserve
+source attribution in short comments, but it should avoid unrelated model
+classes, generation wrappers, loss code, checkpoint loading, and unused branches.
+When a method depends on `self`, either include the minimal lightweight module
+that owns the required parameters or rewrite the operation as a small functional
+reference with explicit arguments.
+
 ## Report Back
 
 Return:
 
 - Transformers version and package root;
+- whether this was entered from `top-explore-models` and which metadata paths or
+  public sources were reused;
 - requested checkpoint/name and resolved `model_type`;
 - Hugging Face repo id, commit sha if checked, and downloaded `config.json` /
   `README.md` paths, or the reason they were not checked;
@@ -175,6 +201,7 @@ Return:
 - relevant classes/functions and any parent files followed;
 - config fields that define shape and dtype semantics;
 - kernel-relevant operations and their shape/dtype/capability parameters;
-- the smallest candidate Torch reference to use, if one is needed;
+- the smallest candidate Torch reference to use, if one is needed, described as
+  extracted functions/helpers rather than a copied full modeling file;
 - anything not found locally, including whether the model likely needs a newer
   Transformers version or a remote `trust_remote_code` repo.

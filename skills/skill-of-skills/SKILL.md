@@ -32,15 +32,33 @@ Folder name and frontmatter `name` must match exactly.
 ## Current Tree
 
 ```text
+top-add-new-arch - add a whole model architecture end to end (explore → split → build L1–L4)
+├── top-split-model-into-kernels - explore + break the forward into the kernel/op sequence
+├── top-add-kernel - create each new L1 kernel (L1-Python impl-register-kernel + L1-Rust impl-wire-kernel-to-rust)
+├── impl-compose-op - compose kernels into L2 ops
+├── impl-compose-worklet - compose ops into L3 sync-section worklets
+├── impl-compose-arch - wire worklets into the L4 model_arch cost file
+└── impl-wire-new-arch - integrate the arch into dispatch/build/timing-predict/deployment (Phase 3, before Validate)
+
 top-add-kernel - add an L1 kernel end to end
 ├── orchestrator-add-kernel-to-python-profile - plan and verify Python profiling
-│   ├── impl-explore-kernel-source - find a framework source and wrapper plan
+│   ├── dev-explore-kernel - search vLLM/SGLang/FlashInfer for a source to wrap (shared)
 │   └── impl-register-kernel - register a Python profiler kind or backend
 └── orchestrator-wire-kernel-to-rust - plan and verify Rust timing/cache wiring
     ├── impl-wire-kernel-to-rust - implement KernelSpec and cache wiring
     └── impl-validate-kernel-cache - measure Rust cache fidelity
 
-operate-run-simulation - run simulations from presets
+top-explore-models - understand a new model or checkpoint from HF/public sources
+├── dev-calculate-kv-cache-capacity - calculate KV cache bytes and capacity
+└── dev-lookup-transformers-model - inspect local Transformers/Torch semantics
+
+top-split-model-into-kernels - break a model forward into the MLSim kernel sequence
+├── top-explore-models - step 1: establish the architecture (entry above)
+├── dev-lookup-transformers-model - what math each op computes (shared)
+└── dev-explore-kernel - whether a real fused kernel exists in the ecosystem (shared)
+
+operate-run-simulation - run deployment simulations from presets (DES, workload trace)
+operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
 operate-gpu-spec - query or update the GPU spec catalog
 operate-profile-sim-speed - profile simulator wallclock speed
 operate-profile-existing-kernel - query or fill registered profiler rows
@@ -50,7 +68,6 @@ dev-orchestrate-parallel-subagents - isolate concurrent writing subagents
 dev-run-tests - select and run MLSim test tiers
 dev-file-design-review - review one file against docs and contracts
 dev-present-changes-for-review - organize a diff for human review
-dev-lookup-transformers-model - locate local Transformers model code
 ```
 
 ## Updating The Tree

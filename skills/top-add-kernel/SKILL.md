@@ -2,20 +2,36 @@
 name: top-add-kernel
 description: >-
   Use as the entry point whenever the user asks to add an MLSim L1 kernel. This
-  is a top-level router: it does not contain implementation details. First route
-  Python profiling work to orchestrator-add-kernel-to-python-profile, then route
-  Rust timing/cache wiring to orchestrator-wire-kernel-to-rust once the Python
-  handoff is ready.
+  is a top-level orchestrator skill: it does not contain implementation details. Do not pass
+  the whole end-to-end kernel request to an implementer; implementers only
+  receive bounded impl-* subtasks issued from the relevant orchestrator phase.
 ---
 
 # Top Add Kernel
 
-Use this skill as the entry point for adding an L1 kernel. Do not implement from
-this file; issue the work to the two role-specific orchestrators.
+Use this skill when you are the orchestrator for an end-to-end L1 kernel
+request. Do not implement from this file, and do not treat this file as an
+implementer brief. Use it to enter the two child orchestrator skills in order.
+
+## Delegation Boundary
+
+Stay in the orchestrator role. Read and follow
+`orchestrator-add-kernel-to-python-profile` first. After that phase produces a
+working Python-to-Rust handoff, read and follow
+`orchestrator-wire-kernel-to-rust`.
+
+Do not ask an implementer to "add the kernel end to end", use this top-level
+skill, choose the orchestration sequence, or own both Python profiling and Rust
+timing/cache wiring.
+
+Only issue implementer work from inside the relevant child orchestrator phase.
+Each implementer brief must be a narrow leaf task that names the exact `impl-*`
+skill to use and the evidence required for you, the orchestrator, to verify
+completion.
 
 ## Steps
 
-1. Fix it in Python.
+1. Coordinate the Python profiling orchestrator.
 
 Use `orchestrator-add-kernel-to-python-profile` to define and validate the
 Python profiling side:
@@ -23,9 +39,10 @@ Python profiling side:
 - decide whether this is a brand-new kernel kind or a new backend;
 - ground the operation and dtype/shape contract;
 - build or verify the Torch reference when needed;
-- register Python profiling backends and verify `python -m profiling` smoke.
+- register Python profiling backends and verify `python -m profiling` smoke;
+- produce the Python-to-Rust handoff for the Rust orchestrator.
 
-2. Wire it into Rust.
+2. Coordinate the Rust timing/cache orchestrator.
 
 Use `orchestrator-wire-kernel-to-rust` after the Python side has a working
 handoff:
