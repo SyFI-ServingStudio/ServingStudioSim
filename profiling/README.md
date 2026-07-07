@@ -172,8 +172,9 @@ must pass `batch_outlier_policy=...`); then add
 / `count_missing_<kind>` appear automatically — do **not** hand-write wrappers in
 `perf_api.py`. The matching runner goes under `runners/<family>/` and is wired
 lazily via `RunnerRef`. Full end-to-end procedure (Python + the Rust `KernelSpec`
-side): skill `profile-add-kernel`. To fill/refresh rows for an existing kernel:
-skill `profile-run-existing-kernel`.
+side): skill `top-add-kernel`; the Python registration alone is skill
+`impl-register-kernel`. To fill/refresh rows for an existing kernel: skill
+`operate-profile-existing-kernel`.
 
 ## CLI
 

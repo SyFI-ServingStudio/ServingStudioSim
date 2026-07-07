@@ -78,5 +78,5 @@ over-estimates only when several small-q prefills are batched. See
   calling `compile`/`eval` on each op slot. The worklet never sees an op's
   sub-kernels or its internal normalization (INV-3.5-3).
 
-Authoring: skills `op-add-atomic` (one `Op::new` line) and `op-add-compound`
-(scaffold a `op/<family>/<name>.rs`).
+Authoring: skill `impl-compose-op` — atomic is one `Op::new` line at the wiring
+site; compound scaffolds `op/<family>/<name>.rs` (mirror `attention/flashinfer.rs`).

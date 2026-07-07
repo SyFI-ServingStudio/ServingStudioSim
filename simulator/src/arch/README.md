@@ -105,3 +105,8 @@ Serde tagged enums, the symmetric sibling of the worker selector, **provider-fir
 - **Above (consumer):** the `deployment` layer runs the
   `build_configs → resolve_configs → build` cascade and selects the arch by tag;
   the L5 worker then holds the model as `Arc<M>` and calls `eval_iter`.
+
+## Authoring
+
+Adding an arch: skill `impl-compose-arch` (scaffold `arch/<family>.rs` + register
+the `config.rs` selector, mirror `llama3_dense.rs`).

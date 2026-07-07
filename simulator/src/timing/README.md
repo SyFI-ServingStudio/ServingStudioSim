@@ -107,7 +107,8 @@ carry `backends` + `gpu_name`), `Input` (`#[derive(SweepCoords)]`), a unit
 `Kernel<S>` supplies build/eval/`Probe`, and `inventory` wires it into the
 `kernel-query` dispatch with no central match. Add the kind to `kernels/mod.rs`
 and, if its input reaches a leaf, one line in `slot_input.rs`. Full end-to-end
-procedure (incl. the Python profiling side): skill `profile-add-kernel`.
+procedure: skill `top-add-kernel`; the Rust timing/cache wiring alone is skill
+`impl-wire-kernel-to-rust`, and its cache-fidelity check is `impl-validate-kernel-cache`.
 
 Two optional `KernelSpec` hooks (default no-ops, but load-bearing when needed):
 

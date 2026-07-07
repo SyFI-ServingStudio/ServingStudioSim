@@ -78,3 +78,8 @@ Two TP invariants that are easy to miss:
 layer); `attn_block_tp`, `mlp_block_tp` (the tensor-parallel `arch::llama3_dense_tp`
 layer). Each module re-exports its `{Worklet, Config, Input, Resolved}` quartet
 through `mod.rs`.
+
+## Authoring
+
+Adding a worklet: skill `impl-compose-worklet` (scaffold
+`worklet/<family>_<suffix>.rs`, mirror `attn_block_tp.rs`).
