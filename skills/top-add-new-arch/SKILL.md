@@ -100,13 +100,15 @@ integration that turns it into a selectable, predictable arch — and paves the 
 for a future worker. Route to `impl-wire-new-arch`. It connects the new arch to
 the shared dispatch sites:
 
-- **`arch/build.rs`** — a concrete builder + (iter) the `build_iter_model` arm;
-  this single monomorphized seam is what both the deployments AND the offline
-  predictor call.
-- **`timing_predict.rs`** — (AFD only) the `build_attn` / `build_ffn` arm; the iter
-  path is automatic once `build_iter_model` resolves the tag.
+- **`arch/build.rs`** — a concrete builder + its predictor arm in
+  `build_iter_model` / `build_attn_model` / `build_ffn_model` (one uniform seam per
+  kind, each boxed). This is what the offline predictor calls; `timing_predict.rs`
+  needs no per-arch edit.
 - **`deployment/{unified,pd,afd}.rs`** — the worker-pairing arm, or an explicit
   `bail!` "worker not wired yet" so future worker dev is a drop-in.
+
+Uniform rule: **one predictor arm in `arch/build.rs` + one deployment arm**, for
+every arch kind.
 
 Most sites are **compiler-forced** (exhaustive matches) — adding the selector
 variant breaks the build until each arm exists, so the compiler is the checklist.

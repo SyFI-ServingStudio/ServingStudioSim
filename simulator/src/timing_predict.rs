@@ -42,7 +42,7 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
-use crate::arch::build::{build_iter_model, qwen3_attn, qwen3_ffn_moe};
+use crate::arch::build::{build_attn_model, build_ffn_model, build_iter_model};
 use crate::arch::contract::{
     ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
     IterwiseUnifiedModel, UnifiedArchInput,
@@ -204,17 +204,17 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             n
         }
         PredictArchSel::Attn(sel) => {
-            let model = build_attn(sel, &cfg.gpu, &bridge)?;
+            let model = build_attn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
-            run_attn_cases(&model, cases, &cfg.log_dir)?;
+            run_attn_cases(&*model, cases, &cfg.log_dir)?;
             n
         }
         PredictArchSel::Ffn(sel) => {
-            let model = build_ffn(sel, &cfg.gpu, &bridge)?;
+            let model = build_ffn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
             let cases: Vec<FfnArchInput> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
-            run_ffn_cases(&model, cases, &cfg.log_dir)?;
+            run_ffn_cases(&*model, cases, &cfg.log_dir)?;
             n
         }
     };
@@ -275,7 +275,7 @@ fn run_iter_cases(
 /// per-layer cost is homogeneous). One model instance = one DP shard, so each
 /// case carries exactly one group.
 fn run_attn_cases(
-    model: &impl AttnLayerwiseModel,
+    model: &dyn AttnLayerwiseModel,
     cases: Vec<PredictCase>,
     log_dir: &Path,
 ) -> Result<()> {
@@ -313,7 +313,7 @@ fn run_attn_cases(
 /// deliberate counterpoint to the iter/attn drivers' shared attention-shaped case:
 /// each arch's case→input matches the shape its cost actually depends on.
 fn run_ffn_cases(
-    model: &impl FfnLayerwiseModel,
+    model: &dyn FfnLayerwiseModel,
     cases: Vec<FfnArchInput>,
     log_dir: &Path,
 ) -> Result<()> {
@@ -384,57 +384,6 @@ fn run_ffn_cases(
     }
     drop(cost);
     Ok(())
-}
-
-/// Build the AFD attn-side model from its selector. Only the layer-wise qwen3 arch
-/// has a predict path; the llama3 attn variant bails (mirrors `AfdDeployment`).
-fn build_attn(
-    sel: &AttnArchSel,
-    gpu: &str,
-    bridge: &PerfApiBridge,
-) -> Result<impl AttnLayerwiseModel> {
-    match sel {
-        AttnArchSel::Qwen3AttnTp { model, attn_tp_size } => {
-            qwen3_attn(model, *attn_tp_size, gpu, AFD_MODEL_NAME, bridge)
-        }
-        AttnArchSel::Llama3AttnTp { .. } => bail!(
-            "timing-predict attn: only the qwen3_attn_tp arch has a layer-wise \
-             predict path (got llama3_attn_tp)"
-        ),
-    }
-}
-
-/// Build the AFD ffn-side model from its selector. Only the layer-wise qwen3 arch
-/// has a predict path; the deepseek ffn variant bails (mirrors `AfdDeployment`).
-fn build_ffn(
-    sel: &FfnArchSel,
-    gpu: &str,
-    bridge: &PerfApiBridge,
-) -> Result<impl FfnLayerwiseModel> {
-    match sel {
-        FfnArchSel::Qwen3FfnMoe {
-            model,
-            attn_tp_size,
-            ep_size,
-            nvl_num_gpu,
-            routing,
-            routing_seed,
-        } => qwen3_ffn_moe(
-            model,
-            *attn_tp_size,
-            *ep_size,
-            *nvl_num_gpu,
-            *routing,
-            *routing_seed,
-            gpu,
-            AFD_MODEL_NAME,
-            bridge,
-        ),
-        FfnArchSel::DeepseekFfnMoe { .. } => bail!(
-            "timing-predict ffn: only the qwen3_ffn_moe arch has a layer-wise \
-             predict path (got deepseek_ffn_moe)"
-        ),
-    }
 }
 
 /// Parse a predict config (JSON via the JSON parser for clearer errors, else

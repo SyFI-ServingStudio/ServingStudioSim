@@ -5,9 +5,9 @@ description: >-
   so it is selectable by tag, predictable via timing-predict, and ready for a
   future worker — the integration step AFTER impl-compose-arch has produced the
   arch file. Covers arch/mod.rs re-exports, the arch/build.rs concrete builder +
-  build_iter_model dispatch, the timing_predict.rs build_attn/build_ffn arms
-  (AFD), and the deployment build arm (worker pairing or explicit bail). The
-  completion proof is a green timing-predict run on the new arch. Does NOT author
+  its uniform predictor dispatch (build_iter_model / build_attn_model /
+  build_ffn_model), and the deployment build arm (worker pairing or explicit bail).
+  The completion proof is a green timing-predict run on the new arch. Does NOT author
   the arch cost file / trait impl (that is impl-compose-arch) or build a worker.
 ---
 
@@ -41,10 +41,11 @@ Do not start until all hold:
 ## Read First
 
 - `simulator/src/arch/README.md` (the L4↔L5 contract) and `arch/contract.rs`;
-- `simulator/src/arch/build.rs` (the `build_iter_model` match + the concrete `dense`
-  / `qwen3_moe` / `qwen3_attn` / `qwen3_ffn_moe` builders — copy the closest);
-- `simulator/src/timing_predict.rs` (`PredictArchSel`, `build_attn`, `build_ffn`,
-  `run_iter_cases` / `run_attn_cases` / `run_ffn_cases`);
+- `simulator/src/arch/build.rs` (the `build_iter_model` / `build_attn_model` /
+  `build_ffn_model` predictor matches + the concrete `dense` / `qwen3_moe` /
+  `qwen3_attn` / `qwen3_ffn_moe` builders — copy the closest);
+- `simulator/src/timing_predict.rs` (`PredictArchSel` and the `run_iter_cases` /
+  `run_attn_cases` / `run_ffn_cases` drivers that call the `build_*_model` seam);
 - the matching deployment: `deployment/unified.rs` + `deployment/pd.rs` (iter),
   or `deployment/afd.rs` (attn/ffn); and `deployment/config.rs` (the pool maps).
 
@@ -60,25 +61,29 @@ registry to update (the launcher `list-params` schema is *derived* from
 | Site | iter | attn | ffn |
 |---|:--:|:--:|:--:|
 | `arch/config.rs` — `*ArchSel::model()` `\|`-chain | ✔ | ✔ | ✔ |
-| `arch/build.rs` — `build_iter_model` match | ✔ | — | — |
-| `timing_predict.rs` — `build_attn` match | — | ✔ | — |
-| `timing_predict.rs` — `build_ffn` match | — | — | ✔ |
+| `arch/build.rs` — `build_{iter,attn,ffn}_model` match (**the predictor seam**) | ✔ | ✔ | ✔ |
 | `deployment/unified.rs` — `match &g.arch` | ✔ | — | — |
+
+The predictor dispatch is **uniform**: all three kinds go through a
+`build_*_model` match in `arch/build.rs` (each returns `Box<dyn …LayerwiseModel>` /
+`Box<dyn IterwiseUnifiedModel>`). `timing_predict.rs` just *calls* those and needs
+**no** per-arch edit. So the rule is one-liner: **one predictor arm in
+`arch/build.rs` + one deployment arm — for every arch kind.**
 
 **Catch-all `bail!` (compiles without you; add an arm only to enable that deployment):**
 `deployment/pd.rs` (iter, tuple match on prefill/decode) and `deployment/afd.rs`
 (attn/ffn, tuple match on attn/ffn). Leaving these unwired is fine for a
 timing-predict-only milestone — the arch still predicts; only a real run bails.
 
-> **AFD trap — two independent build sites.** An attn/ffn arch is built from TWO
-> separate places: the deployment (`afd.rs`, a full worker flow) and the predictor
-> (`timing_predict.rs::build_attn` / `build_ffn`, the bare layer-wise model). They
-> share the concrete `arch_build::*` builder but are wired **independently** — so a
-> real AFD run can work while timing-predict bails, or vice-versa, if you wire only
-> one. Wire BOTH. (An `iter` arch has no such split: the one `build_iter_model` seam
-> feeds the deployments AND the predictor, so it cannot drift.) This split IS the
-> one thing genuinely specific to timing-predict — for `iter` there is nothing
-> predict-specific to do; prediction rides the shared seam for free.
+> **Two arms, two consumers — wire both.** Every arch is built from TWO places
+> that share the same concrete `arch_build::<family>` builder but dispatch
+> **independently**: the **predictor** arm (`build_*_model` in `arch/build.rs`,
+> boxed, no worker) and the **deployment** arm (`unified.rs`/`pd.rs`/`afd.rs`, a
+> concrete-typed worker flow). Wiring only one means a green timing-predict with a
+> bailing real run, or vice-versa. This shape is now identical for iter and AFD —
+> the predictor seam lives in `arch/build.rs` for all three kinds (it used to be
+> split off in `timing_predict.rs` for AFD; that asymmetry was removed so a second
+> AFD arch lands as one more match arm, not a signature break).
 
 ## Expected Write Scope
 
@@ -88,12 +93,13 @@ timing-predict-only milestone — the arch still predicts; only a real run bails
   params>, gpu, name, bridge) -> Result<<Model>>` mirroring the closest existing
   one (`ModelSpec` → `dense_model_cfg`/`moe_model_cfg`, build the `*Parallel`
   struct, `resolve_configs(build_configs(...))`, `build(name, resolved, bridge)`
-  with a `.context(...)` naming the likely missing-`profile.db`-row failure). For
-  an **iter** arch also add its `build_iter_model` arm (`Box::new(<family>(...)?)`).
-- `timing_predict.rs` — **AFD only**: add the arm in `build_attn` (attn) or
-  `build_ffn` (ffn) calling your concrete builder with `AFD_MODEL_NAME`. Iter needs
-  nothing here: `PredictArchSel::Iter` already routes any `IterArchSel` through
-  `build_iter_model` + `run_iter_cases`.
+  with a `.context(...)` naming the likely missing-`profile.db`-row failure). Then
+  add its **predictor arm** to the matching `build_iter_model` / `build_attn_model`
+  / `build_ffn_model` (`Box::new(<family>(...)?)`) — the uniform seam both the
+  deployment and the predictor build from.
+- `timing_predict.rs` — **no per-arch edit.** It calls `build_{iter,attn,ffn}_model`
+  generically, so the `arch/build.rs` predictor arm above is all prediction needs
+  (for any kind — iter and AFD alike).
 - `arch/config.rs` — extend the `model()` `|`-chain to include the new variant
   (compiler-forced). Confirm the variant's `#[param(cache_key)]` flags are right
   (model identity / dtype / any param that changes which kernels are needed).

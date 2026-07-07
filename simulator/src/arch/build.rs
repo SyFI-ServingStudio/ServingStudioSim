@@ -12,17 +12,18 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
-use crate::arch::config::{IterArchSel, ModelSpec, RoutingKind};
+use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
     llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen3_attn_layerwise,
-    qwen3_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn, DenseParallel, DenseTpParallel,
-    DpAttnTpFfnParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
-    Llama3DpAttnTpFfnModel, Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel,
-    Qwen3FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeParallel,
+    qwen3_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn, AttnLayerwiseModel, DenseParallel,
+    DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, IterwiseUnifiedModel,
+    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen3AttnLayerwiseModel,
+    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeParallel,
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::PerfApiBridge;
@@ -259,6 +260,67 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
+    })
+}
+
+/// Build ONE AFD attn-side model from its selector, boxed as `dyn` — the
+/// [`build_iter_model`] counterpart for the attn arch. The model-only seam the
+/// offline `timing-predict` (attn arch) path uses: it drives [`AttnLayerwiseModel`]
+/// directly, no worker/flow. The `afd` deployment does NOT box — it calls the
+/// concrete [`qwen3_attn`] builder to keep its worker factory monomorphized. Only
+/// the qwen3 arch has a layer-wise predict path; the llama3 attn variant bails
+/// (mirrors `AfdDeployment`). Returning `Box<dyn>` (not `impl`) is what lets a
+/// second buildable attn arch land as one more match arm without a signature break.
+pub fn build_attn_model(
+    sel: &AttnArchSel,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Box<dyn AttnLayerwiseModel>> {
+    Ok(match sel {
+        AttnArchSel::Qwen3AttnTp {
+            model,
+            attn_tp_size,
+        } => Box::new(qwen3_attn(model, *attn_tp_size, gpu, name, bridge)?),
+        AttnArchSel::Llama3AttnTp { .. } => bail!(
+            "timing-predict attn: only the qwen3_attn_tp arch has a layer-wise \
+             predict path (got llama3_attn_tp)"
+        ),
+    })
+}
+
+/// Build ONE AFD ffn-side model from its selector, boxed as `dyn` — the ffn
+/// counterpart to [`build_attn_model`]. Only the qwen3 arch has a layer-wise
+/// predict path; the deepseek ffn variant bails (mirrors `AfdDeployment`).
+pub fn build_ffn_model(
+    sel: &FfnArchSel,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Box<dyn FfnLayerwiseModel>> {
+    Ok(match sel {
+        FfnArchSel::Qwen3FfnMoe {
+            model,
+            attn_tp_size,
+            ep_size,
+            nvl_num_gpu,
+            routing,
+            routing_seed,
+        } => Box::new(qwen3_ffn_moe(
+            model,
+            *attn_tp_size,
+            *ep_size,
+            *nvl_num_gpu,
+            *routing,
+            *routing_seed,
+            gpu,
+            name,
+            bridge,
+        )?),
+        FfnArchSel::DeepseekFfnMoe { .. } => bail!(
+            "timing-predict ffn: only the qwen3_ffn_moe arch has a layer-wise \
+             predict path (got deepseek_ffn_moe)"
+        ),
     })
 }
 

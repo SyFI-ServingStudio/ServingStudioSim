@@ -90,10 +90,10 @@ backends/algorithms = different arch files (no in-file if/match polymorphism).
 
 **Next — hand off to `impl-wire-new-arch`.** This skill's proof is the no-bridge
 unit tests (the arch builds in isolation). Making the arch *reachable* from a
-config/predictor and a worker — the `arch/build.rs` builder + `build_iter_model`
-dispatch, the `timing_predict.rs` AFD arms, and the deployment arm — is the wiring
-phase. The launcher-reachable dry-run / timing-predict smoke above only passes
-once that wiring exists.
+config/predictor and a worker — the `arch/build.rs` builder + its
+`build_{iter,attn,ffn}_model` predictor dispatch, and the deployment arm — is the
+wiring phase. The launcher-reachable dry-run / timing-predict smoke above only
+passes once that wiring exists.
 
 ## Report Back
 
