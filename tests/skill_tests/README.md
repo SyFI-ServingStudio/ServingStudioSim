@@ -34,7 +34,7 @@ uv run python tests/skill_tests/run_codex_skill_tests.py --case profile_query_si
 uv run python tests/skill_tests/run_codex_skill_tests.py --case profile_run_single_gemm_torch_force --runner-sandbox danger-full-access
 ```
 
-Artifacts are written under `/tmp/mlsim_skill_tests/<timestamp>/` by default.
+Artifacts are written under `/tmp/vibesim_skill_tests/<timestamp>/` by default.
 Use `--out-dir` to keep a specific run. GPU profiling cases may require
 `--runner-sandbox danger-full-access` on hosts where the normal Codex sandbox
 cannot access CUDA/NVML.

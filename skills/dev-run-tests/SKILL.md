@@ -1,11 +1,11 @@
 ---
 name: dev-run-tests
-description: Use when asked to run, select, or understand MLSim's tests — which tier needs a GPU / the built binary / an agent runtime / is just CPU, how the auto-skip works, and how the per-GPU throughput & sim-speed goldens are recorded. Covers the `just test-*` recipes, pytest markers, and the GPU-type-tagged golden store. NOT for writing a new kernel's cache-fidelity check (that is impl-validate-kernel-cache).
+description: Use when asked to run, select, or understand VibeSim's tests — which tier needs a GPU / the built binary / an agent runtime / is just CPU, how the auto-skip works, and how the per-GPU throughput & sim-speed goldens are recorded. Covers the `just test-*` recipes, pytest markers, and the GPU-type-tagged golden store. NOT for writing a new kernel's cache-fidelity check (that is impl-validate-kernel-cache).
 ---
 
-# Run MLSim Tests (capability tiers)
+# Run VibeSim Tests (capability tiers)
 
-MLSim tests span three runtimes (Rust `cargo test`, `pytest`, and a Codex
+VibeSim tests span three runtimes (Rust `cargo test`, `pytest`, and a Codex
 skill-test harness) and several **capability tiers**. A test declares its tier
 with a pytest marker; `tests/conftest.py` **auto-skips** the tiers the host can't
 run, so bare `uv run pytest` "just works" anywhere. Prefer the `just` recipes —
@@ -13,7 +13,7 @@ they encode the env gotchas (notably the libpython `LD_LIBRARY_PATH` the Rust
 test binary needs) so you don't re-derive them.
 
 Run everything under `uv` (pins the 3.12 venv; bare python/cargo links system 3.9
-and crashes — see memory `mlsim_pyo3_build_python_pin`).
+and crashes — see memory `vibesim_pyo3_build_python_pin`).
 
 ## Tiers
 

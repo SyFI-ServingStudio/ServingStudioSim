@@ -2,7 +2,7 @@
 //! contract. Each model_arch picks an L3 worklet set, forwards `ModelCfg` + its
 //! own numeric parallel struct (`DenseParallel` / `DenseTpParallel` /
 //! `DpAttnTpFfnParallel` / …) 1:1 into worklet configs, and assembles a
-//! build/cost model. See docs/detailed_design/L4/design.md.
+//! build/cost model. See doc/detailed_design/L4.md.
 
 pub mod build;
 pub mod contract;

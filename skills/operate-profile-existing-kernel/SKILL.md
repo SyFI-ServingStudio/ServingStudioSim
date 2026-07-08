@@ -1,6 +1,6 @@
 ---
 name: operate-profile-existing-kernel
-description: Use when asked to list, query, count missing rows for, JIT-fill, force-refresh, or validate an existing MLSim L1 profiler entry through `uv run python -m profiling`. Applies only to registered KernelProfilerSpec table/backend pairs and batched specs.
+description: Use when asked to list, query, count missing rows for, JIT-fill, force-refresh, or validate an existing VibeSim L1 profiler entry through `uv run python -m profiling`. Applies only to registered KernelProfilerSpec table/backend pairs and batched specs.
 ---
 
 # Profile Run Existing Kernel
@@ -15,8 +15,8 @@ ask before changing code.
 Read these before running or editing:
 
 - `AGENTS.md`, especially L1 rules.
-- `docs/detailed_design/L1/design.md` §3.2.3, §3.3, §6, §8.1/§8.2.
-- `docs/file_structure.md` L1 `profiling/` layout.
+- `doc/detailed_design/L1.md` — the L1 layer overview.
+- `profiling/README.md` — the L1 `profiling/` directory map.
 - `README.md` Python/uv quick-start.
 
 ## Exact Interface

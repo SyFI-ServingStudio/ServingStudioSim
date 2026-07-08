@@ -39,7 +39,7 @@ the sim's `Kernel::eval` argmin); report `ratio = interp / truth`.
    `query_points` to `kernel-query` (which projects them) and physical `specs` to
    perf_api, so the re-axis stays invisible here.
 
-See skill `validate-kernel-cache` for the full workflow + gotchas.
+See skill `impl-validate-kernel-cache` for the full workflow + gotchas.
 
 Run from the repo root under uv (pins the PyO3 / venv interpreter).
 """

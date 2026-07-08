@@ -82,7 +82,7 @@ Table(spec, db_path).insert([ProfileRow(
 #[ignore = "needs the venv 3.12 interpreter; see module docs for the run command"]
 fn bridge_round_trips_metadata_count_hit_and_missing() {
     let db_path =
-        std::env::temp_dir().join(format!("mlsim_bridge_smoke_{}.db", std::process::id()));
+        std::env::temp_dir().join(format!("vibesim_bridge_smoke_{}.db", std::process::id()));
     let db_path_str = db_path.to_str().unwrap().to_string();
     let _ = std::fs::remove_file(&db_path);
     seed_db(&db_path_str);

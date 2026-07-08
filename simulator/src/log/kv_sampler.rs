@@ -122,7 +122,7 @@ impl KvSampler {
         let mut writer = StreamingParquetWriter::new(path, kv_snapshot_schema());
         let (tx, rx) = sync_channel::<Vec<KvSnapshotEntry>>(CHANNEL_CAP);
         let handle = std::thread::Builder::new()
-            .name("mlsim-kv-sampler".to_string())
+            .name("vibesim-kv-sampler".to_string())
             .spawn(move || -> Result<()> {
                 for chunk in rx {
                     writer.write(&kv_to_record_batch(pool_tag, &chunk)?)?;

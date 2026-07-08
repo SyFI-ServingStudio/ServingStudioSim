@@ -24,9 +24,9 @@ of files. The review has five required dimensions:
    - Use `rg`/`rg --files` first for search.
 
 2. **Find the design contract before judging**
-   - Search `README*`, `docs/`, and repo-local `AGENTS.md` when present.
-   - For MLSim, map the file path to the layer in `docs/file_structure.md`,
-     then read the relevant `docs/detailed_design/<layer>/design.md` section.
+   - Search `README*`, `doc/`, and repo-local `AGENTS.md` when present.
+   - For VibeSim, map the file path to its layer via `doc/architecture.md`, then
+     read the relevant `doc/detailed_design/L<n>.md`.
    - Record the concrete doc anchor that justifies each nontrivial change.
    - If no doc guideline exists for a proposed change, ask the user or label it
      explicitly as a non-doc-backed recommendation.
@@ -53,7 +53,7 @@ of files. The review has five required dimensions:
    - Check public parameters, dataclass fields, registry hooks, generated
      symbols, and private helper names for consistency.
    - Rename vague terms when the surrounding design has a more precise owner or
-     concept. Update docs/tests/callers together so terminology does not split.
+     concept. Update docs, tests, and callers together so terminology does not split.
 
 6. **Check comments for future agents**
    - Add short comments where they clarify ownership, invariants, generation

@@ -1,4 +1,4 @@
-"""Shared pytest gating + fixtures for the MLSim test tiers.
+"""Shared pytest gating + fixtures for the VibeSim test tiers.
 
 Tests declare a **capability tier** with a marker; this conftest auto-skips the
 ones the host can't run, so bare ``uv run pytest`` "just works" anywhere:
@@ -15,7 +15,7 @@ Numeric goldens that depend on hardware (throughput, kernel time) are stored
 the detected device (see the ``golden`` fixture). ``--update-golden`` records.
 
 Run under ``uv`` so torch / the venv interpreter resolve (see
-``mlsim_pyo3_build_python_pin``); ``just test-<tier>`` wraps the right flags.
+``vibesim_pyo3_build_python_pin``); ``just test-<tier>`` wraps the right flags.
 """
 
 from __future__ import annotations

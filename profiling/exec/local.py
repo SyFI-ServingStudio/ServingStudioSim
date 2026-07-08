@@ -55,7 +55,7 @@ class LocalGpuChunk(GpuChunk):
         profiler_env = resolve_profile_env(profiler_spec.subprocess_env)
         profiler_env.validate_python_executable()
 
-        with tempfile.TemporaryDirectory(prefix="mlsim-profile-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="vibesim-profile-") as tmp:
             input_path = Path(tmp) / "input.json"
             output_path = Path(tmp) / "output.json"
             input_path.write_text(

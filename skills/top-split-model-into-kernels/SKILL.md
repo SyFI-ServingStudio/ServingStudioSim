@@ -2,7 +2,7 @@
 name: top-split-model-into-kernels
 description: >-
   Use as the entry point when the user wants to break a Transformer model's
-  forward pass into the sequence of MLSim kernels it costs as — the per-op
+  forward pass into the sequence of VibeSim kernels it costs as — the per-op
   boundary decision. First calls top-explore-models to establish the
   architecture, then for each op routes to dev-lookup-transformers-model (what
   math) and dev-explore-kernel (whether a real fused kernel exists at what launch
@@ -14,7 +14,7 @@ description: >-
 
 # Top Split Model Into Kernels
 
-Top-level orchestrator. Turn a model's forward pass into the sequence of MLSim
+Top-level orchestrator. Turn a model's forward pass into the sequence of VibeSim
 kernels it costs as. You own the boundary judgment; you do not implement kernels
 and you do not run the ecosystem search yourself — you sequence the lower-level
 skills and decide from their findings. Your output is the input to
@@ -31,7 +31,7 @@ boundary decision.
 
 ## Step 2: diff against the nearest reference
 
-Do not judge every op from scratch. MLSim already has canonical decompositions —
+Do not judge every op from scratch. VibeSim already has canonical decompositions —
 the dense GQA transformer in `simulator/src/arch/llama3_dense.rs` plus its
 `worklet/` and `op/` leaves is the worked example. Find the closest existing
 reference decomposition, reuse its verdicts wholesale, and only give the

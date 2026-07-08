@@ -19,7 +19,7 @@ encoding (``kv_len = prefix_len + append_len`` >= ``q_len``) cannot. The runner
 ``profiling.runners.attention.flashinfer_attn_prefill_and_rect``) passes these
 straight to the ragged wrapper.
 
-Backends ``{fa2, fa3, trt, cudnn}`` are MLSim backend strings, not kinds: each
+Backends ``{fa2, fa3, trt, cudnn}`` are VibeSim backend strings, not kinds: each
 registers its own spec -> the same ``args_schema`` and table, routing to its own
 ``profile_flashinfer_attn_rect_<backend>`` entry. Unsupported combos raise
 ``ProfilerNotImplemented`` at profile time: ``cudnn+fp8``, and ``trt`` entirely

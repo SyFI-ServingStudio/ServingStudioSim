@@ -1,6 +1,6 @@
 ---
 name: skill-of-skills
-description: "Use when adding, renaming, reorganizing, or choosing among repo-local MLSim skills under main/skills. Defines the skill hierarchy, naming conventions, and parent/child relationships between top-level, orchestrator-level, and implement-level skills."
+description: "Use when adding, renaming, reorganizing, or choosing among repo-local VibeSim skills under main/skills. Defines the skill hierarchy, naming conventions, and parent/child relationships between top-level, orchestrator-level, and implement-level skills."
 ---
 
 # Skill Of Skills
@@ -52,7 +52,7 @@ top-explore-models - understand a new model or checkpoint from HF/public sources
 ├── dev-calculate-kv-cache-capacity - calculate KV cache bytes and capacity
 └── dev-lookup-transformers-model - inspect local Transformers/Torch semantics
 
-top-split-model-into-kernels - break a model forward into the MLSim kernel sequence
+top-split-model-into-kernels - break a model forward into the VibeSim kernel sequence
 ├── top-explore-models - step 1: establish the architecture (entry above)
 ├── dev-lookup-transformers-model - what math each op computes (shared)
 └── dev-explore-kernel - whether a real fused kernel exists in the ecosystem (shared)
@@ -63,9 +63,9 @@ operate-gpu-spec - query or update the GPU spec catalog
 operate-profile-sim-speed - profile simulator wallclock speed
 operate-profile-existing-kernel - query or fill registered profiler rows
 
-dev-create-worktree - create an MLSim development worktree
+dev-create-worktree - create an VibeSim development worktree
 dev-orchestrate-parallel-subagents - isolate concurrent writing subagents
-dev-run-tests - select and run MLSim test tiers
+dev-run-tests - select and run VibeSim test tiers
 dev-file-design-review - review one file against docs and contracts
 dev-present-changes-for-review - organize a diff for human review
 ```

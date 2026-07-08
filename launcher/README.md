@@ -1,4 +1,4 @@
-# MLSim Launcher (L7)
+# VibeSim Launcher (L7)
 
 The **run interface**: turn a **preset** (a JSON/YAML config) into one or more
 reproducible invocations of the Rust `simulator` binary. The launcher owns
@@ -7,10 +7,9 @@ the binary's own schema, expanding sweeps, prebuilding the kernel cache, writing
 repro metadata, spawning runs in parallel, and kicking off post-run analysis. It
 contains **no simulation logic**; the Rust binary does the actual work.
 
-This is the practical, code-matching reference. The authoritative spec is
-`docs/detailed_design/L7/design.md` (and `docs/new-interface-design.md` for the
-config-tree shape); if this file disagrees with the code, the code (and the
-design docs) win — open an issue.
+This is the practical, code-matching reference. For the layer overview see
+`doc/detailed_design/L7.md`; the archived config-tree design intent is
+`old-doc/new-interface-design.md`. If this file disagrees with the code, the code wins — open an issue.
 
 ## What it exposes / what it requires
 
@@ -493,8 +492,8 @@ python -m launcher list-params [--human] [--build-type ...]
 - `--emit-backends [FILE]` enumerates the distinct kernels (structural, no GPU) and
   writes the annotated `backends:` skeleton (stdout, or `FILE`), then exits — the
   starting point for a `backends_file` (see the `backends` section above).
-- `--profile` wraps a single run with `perf record` (skill `profile-sim-speed`).
+- `--profile` wraps a single run with `perf record` (skill `operate-profile-sim-speed`).
 - `list-params` dumps the Rust-authoritative schema (`--human` for a table).
 
-See skill `run-simulation` for preset/sweep authoring conventions and dated log
+See skill `operate-run-simulation` for preset/sweep authoring conventions and dated log
 dirs.

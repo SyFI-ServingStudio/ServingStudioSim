@@ -1,5 +1,5 @@
 //! `GpuCluster` — the unified GPU registry **and** inter-worker transfer timing
-//! oracle (L5 / `docs/layers.md` §「GpuCluster」).
+//! oracle (L5 / `doc/detailed_design/L5.md`).
 //!
 //! Two roles folded into one object:
 //!   1. **Registry** — flat `gpus: Vec<GpuInfo>` indexed by run-level GPU id

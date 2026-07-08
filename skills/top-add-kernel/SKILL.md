@@ -1,7 +1,7 @@
 ---
 name: top-add-kernel
 description: >-
-  Use as the entry point whenever the user asks to add an MLSim L1 kernel. This
+  Use as the entry point whenever the user asks to add an VibeSim L1 kernel. This
   is a top-level orchestrator skill: it does not contain implementation details. Do not pass
   the whole end-to-end kernel request to an implementer; implementers only
   receive bounded impl-* subtasks issued from the relevant orchestrator phase.

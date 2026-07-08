@@ -1,11 +1,11 @@
 ---
 name: dev-create-worktree
-description: Use when the user asks to create or set up a git worktree for MLSim development, such as starting a worktree, making a wt-topic worktree, or working on a topic in a worktree. Creates a sibling wt-topic worktree off the current main HEAD on a fresh branch, then provisions the untracked or working-copy test artifacts that git worktree add does not carry. NOT for the parallel-writing-subagent isolation flow (that is dev-orchestrate-parallel-subagents).
+description: Use when the user asks to create or set up a git worktree for VibeSim development, such as starting a worktree, making a wt-topic worktree, or working on a topic in a worktree. Creates a sibling wt-topic worktree off the current main HEAD on a fresh branch, then provisions the untracked or working-copy test artifacts that git worktree add does not carry. NOT for the parallel-writing-subagent isolation flow (that is dev-orchestrate-parallel-subagents).
 ---
 
-# Create an MLSim worktree (with test artifacts)
+# Create an VibeSim worktree (with test artifacts)
 
-Spin up an isolated git worktree for a piece of MLSim work AND stage the test
+Spin up an isolated git worktree for a piece of VibeSim work AND stage the test
 inputs that a bare `git worktree add` leaves behind, so the new tree can run
 `uv run python -m launcher …` and `just test-*` without first re-profiling
 kernels or hunting for trace files.
@@ -30,13 +30,13 @@ is git-ignored and rebuilt on demand: the first `uv run` / launcher call does
 `uv sync` and builds the release binary. Do **not** copy those — a copied
 `target/` can carry stale incremental state across a different source tree.
 
-## Convention (see memory `mlsim-worktree-convention`)
+## Convention (see memory `vibesim-worktree-convention`)
 
 Worktrees are **siblings of `main/`**, named `wt-<topic>/` — never nested inside
 `main/`. The workspace root holds `main/` and every `wt-*/` next to it:
 
 ```
-/m-coriander/coriander/kanzhu/MLSim_workspace/
+/m-coriander/coriander/kanzhu/VibeSim_workspace/
 ├── main/          ← primary tree (source of the working profile.db + traces)
 ├── wt-<topic>/    ← what this skill creates
 └── …
@@ -45,7 +45,7 @@ Worktrees are **siblings of `main/`**, named `wt-<topic>/` — never nested insi
 Set these once:
 
 ```bash
-WS=/m-coriander/coriander/kanzhu/MLSim_workspace
+WS=/m-coriander/coriander/kanzhu/VibeSim_workspace
 MAIN=$WS/main
 TOPIC=<topic>              # short kebab, e.g. kv-cache-logging
 WT=$WS/wt-$TOPIC

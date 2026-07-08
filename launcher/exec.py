@@ -80,7 +80,7 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
-# ── perf profiling (skill `profile-sim-speed`) ──────────────────────────────
+# ── perf profiling (skill `operate-profile-sim-speed`) ──────────────────────────────
 
 
 def perf_available() -> bool:
@@ -94,7 +94,7 @@ def wrap_with_perf(argv: list[str], perf_data: Path, freq: int = 499) -> list[st
     because the release profile omits frame pointers; `-F` is the sampling Hz
     (499/999 avoids lock-step with timers). Output is the binary `perf.data` at
     `perf_data` — read it with `perf report`, never `cat`. See skill
-    `profile-sim-speed`."""
+    `operate-profile-sim-speed`."""
     return [
         "perf",
         "record",
@@ -112,7 +112,7 @@ def wrap_with_perf(argv: list[str], perf_data: Path, freq: int = 499) -> list[st
 def _profile_env() -> dict[str, str]:
     """`_build_subprocess_env` plus single-threaded BLAS/OMP so the one-time L4
     model build's numpy/torch calls don't smear samples across worker threads
-    (skill `profile-sim-speed` Step 2)."""
+    (skill `operate-profile-sim-speed` Step 2)."""
     env = _build_subprocess_env()
     env["OPENBLAS_NUM_THREADS"] = "1"
     env["OMP_NUM_THREADS"] = "1"

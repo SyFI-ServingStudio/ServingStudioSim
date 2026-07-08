@@ -1,7 +1,7 @@
 [project]
-name = "mlsim"
+name = "vibesim"
 version = "0.1.0"
-description = "MLSim — discrete-event simulator for ML serving + training workloads"
+description = "VibeSim — discrete-event simulator for ML serving + training workloads"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "transformers>=5.13.0",

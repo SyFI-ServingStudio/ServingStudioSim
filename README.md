@@ -1,7 +1,9 @@
-# MLSim — main
+# VibeSim — main
 
-Implementation tree for MLSim. Layout follows `docs/file_structure.md`
-(symlinked to the design docs in the legacy MoESim repo via `../ref/`).
+Implementation tree for VibeSim. The current design docs live in `doc/` — start at
+`doc/README.md`, and see `doc/architecture.md` for the module→layer map. The
+original design record is archived under `old-doc/` (a read-only symlink into the
+legacy MoESim repo via `../ref/`).
 
 See `../README.md` for workspace-level context (ref/, worktrees, milestones).
 
@@ -41,7 +43,10 @@ validated for a newer stack.
 - `launcher/` — Python L7-α launcher.
 - `analyzer/` — Rust `analyze` binary + Python plot renderer.
 - `model/config/`, `gpu/`, `trace/`, `tests/` — data + tests.
-- `docs/` → `../ref/next_gen_design/` (symlink; design is read-only here).
+- `doc/` — the current, git-tracked design docs (thesis, architecture, invariants,
+  per-layer detail).
+- `old-doc/` → `../ref/next_gen_design/` (symlink; the archived original design,
+  read-only here).
 
 ## First milestone
 

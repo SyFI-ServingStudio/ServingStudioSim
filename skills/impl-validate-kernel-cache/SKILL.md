@@ -1,6 +1,6 @@
 ---
 name: impl-validate-kernel-cache
-description: "Use when implementing the cache-fidelity validation leaf for an MLSim L1 kernel Rust cost cache. Measure or compare INTERPOLATION / EXTRAPOLATION / QUANTIZATION fidelity against perf_api ground truth at off-grid, extrapolated, or bucket-boundary shapes. Covers any registered KernelSpec. NOT for profiling existing rows or batch-aggregation fidelity."
+description: "Use when implementing the cache-fidelity validation leaf for an VibeSim L1 kernel Rust cost cache. Measure or compare INTERPOLATION / EXTRAPOLATION / QUANTIZATION fidelity against perf_api ground truth at off-grid, extrapolated, or bucket-boundary shapes. Covers any registered KernelSpec. NOT for profiling existing rows or batch-aggregation fidelity."
 ---
 
 # Impl Validate Kernel Cache Fidelity

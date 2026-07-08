@@ -1,4 +1,4 @@
-# MLSim Analyzer
+# VibeSim Analyzer
 
 Post-sim analysis: turn a run's parquet logs into **numbers** (for a human / LLM)
 and **plots** (for the user). It is a **standalone crate** — the binary is
@@ -6,9 +6,8 @@ and **plots** (for the user). It is a **standalone crate** — the binary is
 it reads sim parquet purely **by column name** with a drift guard that fails loud
 if the log schema moves.
 
-This is the practical, code-matching reference. The authoritative spec is
-`docs/analyzer.md`; if this file disagrees with the code, the code (and the
-design doc) win — open an issue.
+This is the practical, code-matching reference; if this file disagrees with the code, the code wins —
+open an issue.
 
 ## The split: Rust computes, Python renders
 
@@ -139,5 +138,5 @@ run-meta sidecar (which subjects ran, status, wall time) — not a
 
 The Rust side never depends on `simulator`; the Python side never depends on
 parquet. New metric work edits one category folder on each side plus the catalog
-row — see `docs/analyzer.md` for the design contract that keeps it from
-re-fragmenting into per-deployment analyzers.
+row — a flat registry, not per-deployment analyzers, is what keeps it from
+re-fragmenting.

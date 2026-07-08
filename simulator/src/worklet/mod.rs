@@ -2,7 +2,7 @@
 //! `compile` / `eval` pair. Each worklet is a hand-written struct of L2 op slots
 //! exposing (`*Config` / `*Resolved` / `*Input` / `Self` / `resolve_config` /
 //! `build` / `compile` / `eval`).
-//! See docs/detailed_design/L3/design.md.
+//! See doc/detailed_design/L3.md.
 //!
 //! Current set: the three `Local` worklets of a dense decoder layer
 //! (pre-attention / attention / post-attention), used by `arch::llama3_dense`;

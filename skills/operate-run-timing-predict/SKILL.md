@@ -1,9 +1,9 @@
 ---
 name: operate-run-timing-predict
-description: Use when the user wants to run MLSim's offline timing-predict mode — per-building-block cost prediction for explicit batch shapes WITHOUT the discrete-event sim (no scheduler/clock/trace, no workload). Covers the three arch selectors (iter / attn / ffn), the PD→iter and AFD→attn+ffn mapping, the minimal predict config + cases-file grammar, and the launcher entry `python -m launcher timing-predict`. NOT for a real deployment run from a workload trace (that is operate-run-simulation).
+description: Use when the user wants to run VibeSim's offline timing-predict mode — per-building-block cost prediction for explicit batch shapes WITHOUT the discrete-event sim (no scheduler/clock/trace, no workload). Covers the three arch selectors (iter / attn / ffn), the PD→iter and AFD→attn+ffn mapping, the minimal predict config + cases-file grammar, and the launcher entry `python -m launcher timing-predict`. NOT for a real deployment run from a workload trace (that is operate-run-simulation).
 ---
 
-# Run MLSim Timing-Predict
+# Run VibeSim Timing-Predict
 
 Offline **per-building-block timing prediction**. Same family as `dry-run` /
 `build-cache-only` / `kernel-query`: it does **not** run the discrete-event sim
@@ -18,7 +18,7 @@ This is the run *workflow* for the predictor. The authoritative code is
 (the `arch` selectors, config, and cases grammar) — defer to those for edge cases.
 
 Repo root / logs root / launcher: same as `operate-run-simulation`
-(`/m-coriander/coriander/kanzhu/MLSim_workspace/main`, `.../logs`, run under `uv`).
+(`/m-coriander/coriander/kanzhu/VibeSim_workspace/main`, `.../logs`, run under `uv`).
 
 ## When NOT to use this
 
@@ -110,13 +110,13 @@ count, don't guess a formula.
 4. Run (the launcher builds the release + analyzer binaries and warms the cache
    itself). Pin an idle GPU in case of a cold-cache JIT fill:
    ```bash
-   cd /m-coriander/coriander/kanzhu/MLSim_workspace/main
+   cd /m-coriander/coriander/kanzhu/VibeSim_workspace/main
    # PD:
    CUDA_VISIBLE_DEVICES=<idle> uv run python -m launcher timing-predict presets/<pd_iter>.json
    # AFD (both halves in one call — multiple configs are accepted):
    CUDA_VISIBLE_DEVICES=<idle> uv run python -m launcher timing-predict presets/<afd_attn>.json presets/<afd_ffn>.json
    ```
-   `uv run` is mandatory (PyO3 3.12 venv pin; see memory `mlsim_pyo3_build_python_pin`).
+   `uv run` is mandatory (PyO3 3.12 venv pin; see memory `vibesim_pyo3_build_python_pin`).
    Flags: `--build-type <t>` (default `release`), `--no-analyze` (skip the analyzer
    pass). There is **no** `--dry-run` / `--override` — those are run-only.
 5. Read the results (below) and report.

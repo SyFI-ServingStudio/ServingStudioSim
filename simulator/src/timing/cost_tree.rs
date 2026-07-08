@@ -1,5 +1,5 @@
 //! CostTree — compile the cost-model *structure* once, separate from the
-//! per-iter numbers. See `docs/cost_tree.md` §2/§5.
+//! per-iter numbers. See `COST_TREE.md`.
 //!
 //! The structure of a cost query (which primitives, how they compose, the
 //! homogeneous-layer repeat) is stable across iterations; only the leaf metrics
@@ -55,7 +55,7 @@ pub enum CostNode {
 /// Each composite references its *direct* children by a contiguous range into the
 /// same `Vec<FlatCostNode>`; a parent's index always precedes its children's, so
 /// aggregate is a single bottom-up (reverse) pass with no recursion or
-/// allocation. Mirrors `docs/cost_tree.md` §4.
+/// allocation. Mirrors the flatten pass in `COST_TREE.md`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FlatCostNode {
     Leaf(usize),

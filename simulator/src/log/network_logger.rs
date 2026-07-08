@@ -56,7 +56,7 @@ impl NetworkLogger {
             .with_statistics_enabled(false);
         let (tx, rx) = sync_channel::<Vec<GpuClusterEntry>>(CHANNEL_CAP);
         let handle = std::thread::Builder::new()
-            .name("mlsim-net-logger".to_string())
+            .name("vibesim-net-logger".to_string())
             .spawn(move || -> Result<()> {
                 for chunk in rx {
                     writer.write(&gpu_cluster_to_record_batch(&chunk)?)?;

@@ -8,7 +8,7 @@ It knows nothing about *which* deployment it runs — it only ticks the `Flow` t
 and reads request lifecycle back from the shared store for logging.
 
 This is the practical, code-matching reference; the code is the ground truth.
-For deeper design intent see `docs/detailed_design/L7/design.md` §2–§3.
+For the layer overview see `doc/detailed_design/L7.md`.
 
 ## Two parts
 

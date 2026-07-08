@@ -7,8 +7,7 @@ The structure of a cost query — which L1 primitives run, how they compose, whe
 a homogeneous layer repeats — is **stable across iterations**; only the leaf
 metrics change with batch shape. So we compile the structure once into a
 `CostTree`, then stream per-iter leaf `LeafMetrics` through it and fold them to one
-total. This file is the code-matching reference; the authoritative spec is
-`docs/cost_tree.md` (its §-numbers and INV-numbers are cited below).
+total. This file is the code-matching reference for the CostTree.
 
 ## The node algebra
 
@@ -114,7 +113,7 @@ Sum
 │  Leaf#3 d (kd) x=4
 ```
 
-## Invariants (docs/cost_tree.md §11)
+## Invariants
 
 - **INV-1** Structure is fixed across iterations; variable fan-out must aggregate
   into fixed slots. `n_slots()` is decided at compile.

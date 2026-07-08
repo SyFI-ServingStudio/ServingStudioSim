@@ -2,7 +2,7 @@
 
 ## Agent Input
 
-Work in `/m-coriander/coriander/kanzhu/MLSim_workspace/main` with no prior
+Work in `/m-coriander/coriander/kanzhu/VibeSim_workspace/main` with no prior
 knowledge beyond repo-local instructions. Use the appropriate repo-local skill
 to count missing rows for an existing L1 kernel without profiling anything.
 
@@ -23,7 +23,7 @@ the exact command and count summary.
 ## Expected Output Description
 
 The final answer should show the agent used
-`skills/profile-run-existing-kernel/SKILL.md`, confirmed the registry entry via
+`skills/operate-profile-existing-kernel/SKILL.md`, confirmed the registry entry via
 `list --json`, and ran only `count-missing --json` for the batch.
 
 For a fresh temp DB, the expected summary is `spec_count: 3` and

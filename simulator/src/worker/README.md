@@ -7,7 +7,7 @@ then book-keep tokens and KV until requests finish. It is the first layer that
 holds **mutable sim state**; everything below it (L4→L1) is a pure cost query.
 
 This is the practical, code-matching reference; the code is the ground truth.
-For deeper design intent see `docs/detailed_design/L5/design.md`.
+For the layer overview see `doc/detailed_design/L5.md`.
 
 ## What's in the tree
 

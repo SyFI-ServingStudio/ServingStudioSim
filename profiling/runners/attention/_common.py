@@ -47,7 +47,7 @@ def to_torch_dtype(dt: DType | str) -> Any:
 
 
 def flashinfer_backend_name(backend: str) -> str:
-    """MLSim backend string -> FlashInfer wrapper ``backend`` kwarg."""
+    """VibeSim backend string -> FlashInfer wrapper ``backend`` kwarg."""
     return "trtllm-gen" if backend == "trt" else backend
 
 

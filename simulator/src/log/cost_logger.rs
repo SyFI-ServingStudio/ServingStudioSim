@@ -84,7 +84,7 @@ impl CostLogger {
         let mut writer = StreamingParquetWriter::new(path, cost_log_schema());
         let (tx, rx) = sync_channel::<CostLogChunk>(CHANNEL_CAP);
         let handle = std::thread::Builder::new()
-            .name("mlsim-cost-logger".to_string())
+            .name("vibesim-cost-logger".to_string())
             .spawn(move || -> Result<()> {
                 for chunk in rx {
                     writer.write(&cost_to_record_batch(&chunk)?)?;

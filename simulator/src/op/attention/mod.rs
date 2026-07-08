@@ -1,4 +1,4 @@
-//! `op/attention` — compound attention ops. See docs/detailed_design/L2/ §3.
+//! `op/attention` — compound attention ops. See doc/detailed_design/L2.md.
 
 pub mod flashinfer;
 

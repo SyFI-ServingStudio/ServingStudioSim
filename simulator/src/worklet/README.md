@@ -8,7 +8,7 @@ sub-op/sub-kernel configs are baked. A worklet still returns only metrics — it
 owns no sim state.
 
 This is the practical, code-matching reference; the code is the ground truth.
-For deeper design intent see `docs/detailed_design/L3/design.md`.
+For the layer overview see `doc/detailed_design/L3.md`.
 
 ## The worklet shape (every file follows it)
 

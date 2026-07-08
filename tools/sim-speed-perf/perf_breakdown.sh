@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Parallel per-thread + per-symbol breakdown of a sim-speed `perf.data`, over a
-# single warmed-up steady window. Companion to the `profile-sim-speed` skill:
+# single warmed-up steady window. Companion to the `operate-profile-sim-speed` skill:
 # instead of running five `perf report` invocations by hand (each slow on a
 # 500MB capture), this fires the common views concurrently on the SAME window so
 # the whole picture lands in one shot.
@@ -9,8 +9,8 @@
 # The five views (see the skill's Step 3 / 3a / 3b):
 #   1. per-thread CPU split (`--sort comm`)      — which thread is the gate
 #   2. simulator thread flat self-times          — the sim hot path (sim=100%)
-#   3. mlsim-net-logger thread flat self-times   — the single net-log writer
-#   4. mlsim-cost-logger threads flat self-times — the (sharded) cost writers
+#   3. vibesim-net-logger thread flat self-times   — the single net-log writer
+#   4. vibesim-cost-logger threads flat self-times — the (sharded) cost writers
 #   5. source-line annotations of the top N sim symbols (`perf annotate -l`) —
 #      instruction samples bucketed by file:line (the "why is THIS symbol hot")
 #
@@ -23,8 +23,8 @@
 # the middle-to-late range (warmed up, small ⇒ fast to fold). Pass explicit
 # absolute-second bounds (from `perf script -F time`) to override.
 #
-# Thread-name filters use perf's 15-char-truncated comm (mlsim-net-logge,
-# mlsim-cost-logg) — the kernel truncates TASK_COMM_LEN, so the full names miss.
+# Thread-name filters use perf's 15-char-truncated comm (vibesim-net-logge,
+# vibesim-cost-logg) — the kernel truncates TASK_COMM_LEN, so the full names miss.
 set -u
 
 DATA="${1:?usage: perf_breakdown.sh <perf.data> [start] [stop]}"
@@ -56,9 +56,9 @@ perf report -i "$DATA" -g none -F overhead --sort comm $W 2>/dev/null \
   | grep -vE '^#|^$' > "$OUTDIR/1_threads.full.txt" &
 perf report -i "$DATA" -g none -F overhead,symbol --comm=simulator --percentage relative $W 2>/dev/null \
   | grep -vE '^#|^$' > "$OUTDIR/2_sim.full.txt" &
-perf report -i "$DATA" -g none -F overhead,symbol --comm=mlsim-net-logge --percentage relative $W 2>/dev/null \
+perf report -i "$DATA" -g none -F overhead,symbol --comm=vibesim-net-logge --percentage relative $W 2>/dev/null \
   | grep -vE '^#|^$' > "$OUTDIR/3_netlog.full.txt" &
-perf report -i "$DATA" -g none -F overhead,symbol --comm=mlsim-cost-logg --percentage relative $W 2>/dev/null \
+perf report -i "$DATA" -g none -F overhead,symbol --comm=vibesim-cost-logg --percentage relative $W 2>/dev/null \
   | grep -vE '^#|^$' > "$OUTDIR/4_costlog.full.txt" &
 wait
 
@@ -67,7 +67,7 @@ wait
 # the instruction-level attribution, mapped back to file:line. Auto-picks the top
 # `NSYM` symbols from view 2 whose name is in the `simulator::` crate (skips libc /
 # parquet / alloc leaves, which have no source here). Release caveat: a line's %
-# absorbs INLINED callees (see the profile-sim-speed skill's Step 3b). Full sorted
+# absorbs INLINED callees (see the operate-profile-sim-speed skill's Step 3b). Full sorted
 # summary (all lines) → 5_anno_*.full.txt.
 NSYM="${NSYM:-4}"
 mapfile -t SYMS < <(sed 's/.*\[\.\] //' "$OUTDIR/2_sim.full.txt" | grep 'simulator::' | head -"$NSYM")

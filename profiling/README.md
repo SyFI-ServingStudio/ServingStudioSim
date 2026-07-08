@@ -1,13 +1,13 @@
-# MLSim Profiling (L1)
+# VibeSim Profiling (L1)
 
 The **L1 cost layer**: the source of truth for "how long does one kernel take on
 one GPU". The Rust simulator never measures a kernel itself — it asks this Python
 package for a cached time, and this package either returns a stored measurement
 or (when allowed) runs the real kernel on a real GPU to produce one.
 
-This is the practical, code-matching reference. The authoritative spec is
-`docs/detailed_design/L1/design.md`; if this file disagrees with the code, the
-code (and design.md) win — open an issue.
+This is the practical, code-matching reference. For the layer overview see
+`doc/detailed_design/L1.md`. If this file disagrees with the code, the
+code wins — open an issue.
 
 ## Two halves: measure (L1a) vs. cache+serve (L1b)
 

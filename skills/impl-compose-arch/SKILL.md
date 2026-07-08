@@ -16,7 +16,7 @@ You implement one L4 `model_arch` under `simulator/src/arch/`, the full-model wi
 for one worker type. Its L3 worklets must already build. This is the top of the
 bottom-up build; after it, register the arch selector so the launcher can run it.
 
-**Code is the contract**, not `docs/detailed_design/L4/design.md`: the live arch
+**Code is the contract**: the live arch
 uses `build_configs` / `resolve_configs` / `build` + `cost_tree` +
 `IterwiseUnifiedModel` over the CostTree — NOT the design doc's `dry_run` →
 `JitPlan` or `Describe` (retired; dry-run is now `build` against a dry-run bridge,

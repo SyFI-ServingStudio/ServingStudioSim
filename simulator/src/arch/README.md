@@ -8,7 +8,7 @@ embedding→layers→lm_head structure, and it is the worker's (L5) sole view of
 model".
 
 This is the practical, code-matching reference; the code is the ground truth.
-For deeper design intent see `docs/detailed_design/L4/design.md`.
+For the layer overview see `doc/detailed_design/L4.md`.
 
 ## The L4 ↔ L5 contract (`contract.rs`)
 

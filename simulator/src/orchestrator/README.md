@@ -6,7 +6,7 @@ inventory, and defers the actual per-iteration cost + request lifecycle to the L
 workers. To read this layer you first need its abstraction.
 
 This is the practical, code-matching reference; the code is the ground truth.
-For deeper design intent see `docs/detailed_design/L6/design.md`.
+For the layer overview see `doc/detailed_design/L6.md`.
 
 ## The abstraction: deployment → pool → group → worker
 

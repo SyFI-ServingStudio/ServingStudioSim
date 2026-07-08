@@ -1,6 +1,6 @@
 //! Cross-cutting types referenced by every simulator layer.
 //!
-//! See `docs/file_structure.md` (top-level `common/` block).
+//! See `doc/architecture.md` (the `common/` cross-cutting module).
 
 pub mod fabric;
 pub mod id;

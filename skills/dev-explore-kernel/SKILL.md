@@ -1,13 +1,13 @@
 ---
 name: dev-explore-kernel
-description: Use to search the kernel/serving ecosystem (vLLM, SGLang, TensorRT-LLM, FlashInfer, flash-attn, cutlass) for how an operation is really implemented — the exact call path, the launch granularity (one fused kernel or several), and the constraints. Read-only. Reports findings and, when a source is chosen to wrap, a concrete wrapper plan for impl-register-kernel. Does NOT decide the op's MLSim kernel home (that is top-split-model-into-kernels) and does not edit code or register KernelProfilerSpec rows.
+description: Use to search the kernel/serving ecosystem (vLLM, SGLang, TensorRT-LLM, FlashInfer, flash-attn, cutlass) for how an operation is really implemented — the exact call path, the launch granularity (one fused kernel or several), and the constraints. Read-only. Reports findings and, when a source is chosen to wrap, a concrete wrapper plan for impl-register-kernel. Does NOT decide the op's VibeSim kernel home (that is top-split-model-into-kernels) and does not edit code or register KernelProfilerSpec rows.
 ---
 
 # Dev Explore Kernel
 
 Read-only search. Given an operation, find how it is really issued as GPU kernels
 in the serving/kernel ecosystem and report the facts. You do not decide where the
-op lands in MLSim's vocabulary — `top-split-model-into-kernels` makes that
+op lands in VibeSim's vocabulary — `top-split-model-into-kernels` makes that
 boundary verdict from your findings, and the add-kernel orchestrator uses your
 wrapper plan. Do not edit code or register anything.
 

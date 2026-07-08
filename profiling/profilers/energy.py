@@ -298,7 +298,7 @@ class _NvmlPoller:
         self._sample_once()
         self._thread = threading.Thread(
             target=self._poll_until_stopped,
-            name="mlsim-nvml-power-poller",
+            name="vibesim-nvml-power-poller",
             daemon=True,
         )
         self._thread.start()

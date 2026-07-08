@@ -183,7 +183,7 @@ mod tests {
             "moe_intermediate_size": 3072
         }"#;
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("mlsim_moe_cfg_{}.json", std::process::id()));
+        let path = dir.join(format!("vibesim_moe_cfg_{}.json", std::process::id()));
         std::fs::write(&path, json).unwrap();
         let cfg = MoeModelCfg::from_json(&path).unwrap();
         std::fs::remove_file(&path).ok();

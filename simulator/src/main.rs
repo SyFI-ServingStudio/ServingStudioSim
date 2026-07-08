@@ -37,7 +37,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[command(
     name = "simulator",
     version,
-    about = "MLSim — ML serving + training simulator"
+    about = "VibeSim — ML serving + training simulator"
 )]
 struct Cli {
     #[command(subcommand)]

@@ -1,13 +1,13 @@
 ---
 name: operate-profile-sim-speed
-description: Use when asked to profile, perf, or speed up the MLSim *simulator wallclock* (how fast a run executes), not the modeled cluster throughput and not L1 kernel profiling. Covers building a symbol-rich release binary, capturing a `perf record` of a representative run, and reading the per-thread / flat breakdown to find the bottleneck.
+description: Use when asked to profile, perf, or speed up the VibeSim *simulator wallclock* (how fast a run executes), not the modeled cluster throughput and not L1 kernel profiling. Covers building a symbol-rich release binary, capturing a `perf record` of a representative run, and reading the per-thread / flat breakdown to find the bottleneck.
 ---
 
 # Profile Sim Speed
 
 This is for the question "why is the sim *slow to run*" — wallclock seconds, the
 `x real-time` ratio, where CPU goes across the sim thread and the background
-`mlsim-logger` thread. It is NOT about modeled tok/s (that's the run's output
+`vibesim-logger` thread. It is NOT about modeled tok/s (that's the run's output
 metric) and NOT about L1 kernel profile.db (that's
 `operate-profile-existing-kernel`).
 
@@ -30,12 +30,12 @@ workspace `[profile.release]` already sets `debug = true`, so release carries
 DWARF for inline attribution — no separate `profiling` profile needed.
 
 ```bash
-cd /m-coriander/coriander/kanzhu/MLSim_workspace/main
+cd /m-coriander/coriander/kanzhu/VibeSim_workspace/main
 uv run cargo build --release -p simulator
 ```
 
 `uv run` is mandatory (pins PyO3 to the 3.12 venv). See memory
-`mlsim_pyo3_build_python_pin`.
+`vibesim_pyo3_build_python_pin`.
 
 ## Step 2 — capture a representative run under perf
 
@@ -140,10 +140,10 @@ perf report -i logs/perf_aime.data --stdio -g none -F overhead,symbol 2>/dev/nul
 ```
 
 **One thread at a time** (thread names: `simulator` = sim thread,
-`mlsim-logger` = background parquet writer):
+`vibesim-logger` = background parquet writer):
 
 ```bash
-perf report -i logs/perf_aime.data --stdio -g none -F overhead,symbol --comm=mlsim-logger 2>/dev/null | grep -v '^#' | head -12
+perf report -i logs/perf_aime.data --stdio -g none -F overhead,symbol --comm=vibesim-logger 2>/dev/null | grep -v '^#' | head -12
 perf report -i logs/perf_aime.data --stdio -g none -F overhead,symbol --comm=simulator   2>/dev/null | grep -v '^#' | head -14
 ```
 
@@ -247,7 +247,7 @@ for tbk,tb,fr in sorted(rows, reverse=True)[:18]:
 ```
 
 `tbk` (blocks) ≈ malloc/free calls = the churn that shows as `_int_*` in perf;
-`tb` (bytes) flags large transient buffers. The recurring MLSim finding is
+`tb` (bytes) flags large transient buffers. The recurring VibeSim finding is
 **per-iteration scratch `Vec`s** (`build_arch_input`, `complete_iter`,
 `CostTree::aggregate`, `projected_peak`) that should be reused buffers held on the
 worker (the `cost_slots` pattern), plus stray `.clone()`s (`eval_buf`).
@@ -257,7 +257,7 @@ worker (the `cost_slots` pattern), plus stray `.clone()`s (`eval_buf`).
 Three artifacts, in this order:
 
 1. **Per-thread split** (`--sort comm`): is cost in `simulator` (sim thread) or
-   `mlsim-logger` / `mlsim-cost-logg` (background writers)? Quote each thread's %.
+   `vibesim-logger` / `vibesim-cost-logg` (background writers)? Quote each thread's %.
 2. **Sim-thread cost tree, normalized to "sim thread = 100%"** — built from flat
    self-times grouped into logical buckets (driver loop / allocation / cost-model
    eval / admission+sort / one-time build / tail), NOT from perf's `-g graph`.
@@ -276,7 +276,7 @@ Optional: export a flamegraph SVG from an existing `perf.data` with the
 - `sim::run::run_sim`, `SimpleDpFlow::tick`, `BareboneWorker::tick` — the real
   per-tick simulation loop. If these dominate, the lever is the loop itself
   (e.g. event-driven next-event advance instead of fixed 100µs ticks), not I/O.
-- `mlsim-logger` thread / `parquet::*` / `Interner::intern` /
+- `vibesim-logger` thread / `parquet::*` / `Interner::intern` /
   `compare_greater` — parquet encode + ZSTD on the background writer. If this is
   large, the lever is **logged row volume** (the dense `request_state` snapshot)
   or per-row allocations.
@@ -301,7 +301,7 @@ real-time** after the watchdog fix below):
    per-tick scan = ~87%).
 2. Cost model `cost_whole_iter_time` fast path (no `LookupResult` tree alloc);
    `cost_verbose` config keeps the full tree opt-in.
-3. Background `mlsim-logger` thread (bounded `sync_channel`, `CHANNEL_CAP=64` so
+3. Background `vibesim-logger` thread (bounded `sync_channel`, `CHANNEL_CAP=64` so
    a dense-snapshot burst queues without stalling the sim).
 4. 100µs tick (was 1µs).
 5. Dense snapshot logs only the **admitted** prefix (`RequestStore::iter_admitted`),

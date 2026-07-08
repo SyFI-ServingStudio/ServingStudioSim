@@ -8,8 +8,7 @@ calls. L2 is **parallelism-agnostic and sim-state-agnostic**: an op sees per-ran
 shapes and returns metrics; it never reads `ParallelConfig` or simulation state.
 
 This is the practical, code-matching reference; the code is the ground truth.
-For deeper design intent and cost math see `docs/detailed_design/L2/`
-(`abstract.md` + `design.md`).
+For the layer overview see `doc/detailed_design/L2.md`.
 
 ## Two forms of op
 
@@ -67,7 +66,7 @@ over-estimates only when several small-q prefills are batched. See
 - **Live:** `Op<K>` (atomic) and `FlashInferAttentionOp` (compound).
 - **Stubs:** `op/comm`, `op/moe`, `op/ssm` are one-line module headers. The
   compound ops they will hold (e.g. an MoE dispatch op, comm ops, SSM) are
-  specified in `docs/detailed_design/L2/`.
+  specified in `doc/detailed_design/L2.md`.
 
 ## Up / down
 

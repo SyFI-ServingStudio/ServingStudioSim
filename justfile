@@ -1,5 +1,5 @@
-# MLSim test-tier runner. One recipe per capability tier (see tests/conftest.py
-# + skill `run-tests`). Install just: `cargo install just` (or your package mgr).
+# VibeSim test-tier runner. One recipe per capability tier (see tests/conftest.py
+# + skill `dev-run-tests`). Install just: `cargo install just` (or your package mgr).
 #
 #   just            # = test-cpu (the fast default gate)
 #   just test-gpu   # GPU tier (throughput regression etc.)

@@ -1,14 +1,14 @@
 ---
 name: operate-run-simulation
-description: Use when the user wants to run an MLSim simulation from a preset (YAML preferred, JSON also accepted). This skill locates the repo logs root, names the experiment as date_index_short_name, prefers expressing requested variations as internal sweeps inside one copied preset, always does a dry run to inspect the expanded run plan before launching, and runs through the MLSim launcher.
+description: Use when the user wants to run an VibeSim simulation from a preset (YAML preferred, JSON also accepted). This skill locates the repo logs root, names the experiment as date_index_short_name, prefers expressing requested variations as internal sweeps inside one copied preset, always does a dry run to inspect the expanded run plan before launching, and runs through the VibeSim launcher.
 ---
 
-# Run MLSim Simulation
+# Run VibeSim Simulation
 
-Prepare and run an MLSim simulation from an existing preset. This is the
-MLSim analogue of the global `run-moesim-experiment` skill — same shape (copy a
+Prepare and run an VibeSim simulation from an existing preset. This is the
+VibeSim analogue of the global `run-moesim-experiment` skill — same shape (copy a
 preset into a dated experiment dir, encode variations as sweeps, launch), but
-the launcher and conventions below are MLSim-specific. When in doubt about the
+the launcher and conventions below are VibeSim-specific. When in doubt about the
 preset/sweep philosophy, defer to `run-moesim-experiment`.
 
 **Preset format is the nested config tree** (`deployment` / `workload` / `io` /
@@ -22,22 +22,22 @@ workload / pools) use `operate-run-timing-predict` instead — this skill is onl
 for a real deployment run driven by a workload trace.
 
 Repo root:
-- `/m-coriander/coriander/kanzhu/MLSim_workspace/main`
+- `/m-coriander/coriander/kanzhu/VibeSim_workspace/main`
 
 Canonical logs root:
-- `/m-coriander/coriander/kanzhu/MLSim_workspace/main/logs`
+- `/m-coriander/coriander/kanzhu/VibeSim_workspace/main/logs`
 
 Launcher (run from the repo root):
 - `uv run python -m launcher <preset>.yaml [--dry-run] [--override path=value ...]`
 
 `uv run` is mandatory — it pins the PyO3-embedded interpreter to the 3.12 venv;
 a bare `python` / `cargo` links the system 3.9 and crashes (see memory
-`mlsim_pyo3_build_python_pin`). The launcher builds the binary + schema itself,
+`vibesim_pyo3_build_python_pin`). The launcher builds the binary + schema itself,
 so you never set `LD_LIBRARY_PATH`/`PYTHONPATH` by hand.
 
 ## Trigger
 
-Use when the user wants to run a named MLSim simulation, gives a preset to
+Use when the user wants to run a named VibeSim simulation, gives a preset to
 run, or wants a preset copied into a dedicated dated experiment log directory
 before launch.
 
@@ -77,7 +77,7 @@ If the user did not give a name, ask for one before proceeding.
 8. **Dry-run first** — validate + expand without launching, and inspect the run
    plan and per-run `log_dir`s:
    ```bash
-   cd /m-coriander/coriander/kanzhu/MLSim_workspace/main
+   cd /m-coriander/coriander/kanzhu/VibeSim_workspace/main
    uv run python -m launcher logs/<experiment-name>/preset.yaml --dry-run
    ```
    Confirm the `[plan] N run(s)` count and that each expanded `log_dir` is
@@ -126,7 +126,7 @@ at eval. The default set is the arch's const-default. To tailor it per kernel:
    entry per kernel role, pre-filled with the current default and annotated
    `kind | dtype | options | shape`:
    ```bash
-   cd /m-coriander/coriander/kanzhu/MLSim_workspace/main
+   cd /m-coriander/coriander/kanzhu/VibeSim_workspace/main
    uv run python -m launcher logs/<experiment-name>/preset.yaml \
      --emit-backends logs/<experiment-name>/backends.yaml
    ```

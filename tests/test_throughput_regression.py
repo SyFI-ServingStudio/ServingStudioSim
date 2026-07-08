@@ -1,5 +1,5 @@
 """GPU throughput + sim-speed + PD functional regression — the worked example
-of the capability-tiered test infra (see tests/conftest.py + skill `run-tests`).
+of the capability-tiered test infra (see tests/conftest.py + skill `dev-run-tests`).
 
 Each test runs a fixed deterministically-generated trace
 (tests/fixtures/gen_throughput_trace.py) through the **launcher** (the canonical

@@ -1,4 +1,4 @@
-//! `analyze` — MLSim post-sim analyzer binary.
+//! `analyze` — VibeSim post-sim analyzer binary.
 //!
 //! Reads a run's `raw/*.parquet` via DataFusion, computes metrics, and writes a
 //! *report* JSON (numbers, into `reports/`) + a *payload* JSON (plot arrays for
@@ -34,7 +34,7 @@ use io::{payload_path, read_deployment, report_path, write_json, SCHEMA_VERSION}
 use session::build_session;
 
 #[derive(Parser, Debug)]
-#[command(name = "analyze", about = "MLSim post-sim parquet analyzer")]
+#[command(name = "analyze", about = "VibeSim post-sim parquet analyzer")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

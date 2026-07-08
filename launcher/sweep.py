@@ -64,7 +64,7 @@ async def _launch_one(
 
     `profile=True` wraps the run argv with `perf record` (output `<log_dir>/
     perf.data`) under a single-threaded BLAS/OMP env — the launcher's wallclock
-    profiling mode (skill `profile-sim-speed`).
+    profiling mode (skill `operate-profile-sim-speed`).
 
     `analyze=True` runs the post-run analyzer (Rust compute → Python plots) after
     a successful run; best-effort, so analysis failures never fail the run.
@@ -126,7 +126,7 @@ def run_single(
     caller must pass the already-loaded Rust schema from `load_schema()`; the
     sweep layer never loads a schema implicitly. Resumes by default (skips a run
     already marked `.complete`); `refresh=True` re-runs. `profile=True` wraps the
-    run with `perf record` (skill `profile-sim-speed`). `analyze=True` runs the
+    run with `perf record` (skill `operate-profile-sim-speed`). `analyze=True` runs the
     post-run analyzer (best-effort); `analyze_subjects` narrows which subjects."""
     if schema is None:
         raise TypeError("run_single requires a loaded Schema; call load_schema() first")

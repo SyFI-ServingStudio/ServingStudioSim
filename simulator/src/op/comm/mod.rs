@@ -1,1 +1,1 @@
-//! `op/comm` — stub; see docs/file_structure.md + docs/detailed_design/
+//! `op/comm` — stub; see doc/architecture.md + doc/detailed_design/L2.md

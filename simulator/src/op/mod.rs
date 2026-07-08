@@ -1,5 +1,5 @@
 //! L2 (Operation) — names one or more L1 kernels into an op with `compile` /
-//! `eval` entry points (CostTree). See `docs/detailed_design/L2/`.
+//! `eval` entry points (CostTree). See `doc/detailed_design/L2.md`.
 //!
 //! This module holds the generic single-kernel wrapper `Op<K>` (L2 design §2.2).
 //! Atomic ops (qkv / o_proj / gate_up / down / lm_head / rms_norm …) are all

@@ -8,9 +8,9 @@ row buffers and hands full chunks to a background thread that does the heavy
 parquet encode + ZSTD compression off the critical path.
 
 This is the practical, code-matching reference; the code is the ground truth.
-`docs/logging.md` specifies the *tables* — the schemas, the two-tier (per-request
+This README specifies the *tables* — the schemas, the two-tier (per-request
 vs. cost_log) split, the replay flow. The **threading model below is the
-implementation's own** (the doc says nothing about it): the table layout follows
+implementation's own**: the table layout follows
 `ref/moesim-rs`, but the sim-thread/writer-thread split is this code's decision,
 stated here and in the `session.rs` / `cost_logger.rs` headers.
 

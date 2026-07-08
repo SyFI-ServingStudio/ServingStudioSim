@@ -1,7 +1,7 @@
 //! The analyzer's subject catalog — one flat, root-level table for **every**
 //! category. A *subject* is one analysis that emits a `(report, payload)` pair;
-//! a *category* groups subjects sharing an analytical grain + input source (see
-//! `docs/analyzer.md`). The registry is intentionally NOT per-category: keeping
+//! a *category* groups subjects sharing an analytical grain + input source. The
+//! registry is intentionally NOT per-category: keeping
 //! it flat means adding a metric in any category is one [`SUBJECTS`] row + one
 //! [`run_subject`] arm, never a new per-category table/dispatch to repeat.
 

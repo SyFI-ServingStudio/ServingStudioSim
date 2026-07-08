@@ -2,7 +2,7 @@
 
 ## Agent Input
 
-Work in `/m-coriander/coriander/kanzhu/MLSim_workspace/main` with no prior
+Work in `/m-coriander/coriander/kanzhu/VibeSim_workspace/main` with no prior
 knowledge beyond repo-local instructions. Use the appropriate repo-local skill
 to profile the existing L1 kernel `single_gemm` with backend `torch`.
 
@@ -20,7 +20,7 @@ the public `uv run python -m profiling ...` CLI path; do not call runners or
 ## Expected Output Description
 
 The final answer should say which instruction files were used, especially
-`AGENTS.md` and `skills/profile-run-existing-kernel/SKILL.md`. It should show
+`AGENTS.md` and `skills/operate-profile-existing-kernel/SKILL.md`. It should show
 the exact CLI commands for `list --json`, a pre-run `count-missing`, the
 `run --force --json`, and a post-run `count-missing` or `query` against the
 same temp DB.
@@ -36,7 +36,7 @@ pretending this fixed range is universal.
 
 ## Pass Criteria
 
-- Uses `skills/profile-run-existing-kernel/SKILL.md`.
+- Uses `skills/operate-profile-existing-kernel/SKILL.md`.
 - Confirms `single_gemm` / `torch` exists through `python -m profiling list`.
 - Uses a temp DB path and records it in the final report.
 - Runs through `python -m profiling run ... --force --json`.

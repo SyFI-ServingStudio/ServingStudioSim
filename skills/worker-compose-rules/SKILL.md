@@ -1,11 +1,11 @@
 ---
 name: worker-compose-rules
-description: Use when composing, reviewing, or tidying an MLSim iter-wise worker (the `IterWorker` impls under `simulator/src/worker/` — barebone, hp_unified, pd_prefill, pd_decode, disagg_attn, disagg_ffn) for its house conventions — module-doc + reading order, `on_msg_*` message-handler naming, and the naming-quality checks (a name must earn its keep; no misleading quantifiers; name the actual transition; qualify thin wrappers; reserve `on_*` for handlers; keep `ref` anchors). NOT for cost-model/kernel work (that is top-add-kernel / impl-validate-kernel-cache) or a general file review (that is dev-file-design-review).
+description: Use when composing, reviewing, or tidying an VibeSim iter-wise worker (the `IterWorker` impls under `simulator/src/worker/` — barebone, hp_unified, pd_prefill, pd_decode, disagg_attn, disagg_ffn) for its house conventions — module-doc + reading order, `on_msg_*` message-handler naming, and the naming-quality checks (a name must earn its keep; no misleading quantifiers; name the actual transition; qualify thin wrappers; reserve `on_*` for handlers; keep `ref` anchors). NOT for cost-model/kernel work (that is top-add-kernel / impl-validate-kernel-cache) or a general file review (that is dev-file-design-review).
 ---
 
 # Worker Compose Rules
 
-Conventions for an MLSim **iter-wise worker** — a struct that implements
+Conventions for an VibeSim **iter-wise worker** — a struct that implements
 `IterWorker` (`simulator/src/worker/iter_worker.rs`: `id` / `enqueue` / `tick` /
 `status`) and is driven by `SimpleDpPoolController` one tick at a time. The
 canonical exemplar is `simulator/src/worker/disagg_attn.rs`; read it before

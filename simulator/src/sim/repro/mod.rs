@@ -1,1 +1,1 @@
-//! `sim/repro` — stub; see docs/file_structure.md + docs/detailed_design/
+//! `sim/repro` — stub; see doc/architecture.md + doc/detailed_design/L7.md

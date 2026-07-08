@@ -1,4 +1,4 @@
-//! Arrow schema definitions for the five MLSim parquet streams.
+//! Arrow schema definitions for the five VibeSim parquet streams.
 //!
 //! Modeled on `ref/moesim-rs/src/logging/schemas.rs` — each stream gets a
 //! `pub fn xxx_schema() -> Arc<Schema>` returning a real
@@ -35,7 +35,7 @@ pub fn cost_log_envelope_schema() -> Arc<Schema> {
     ]))
 }
 
-/// The per-group `input_section` struct (`docs/logging.md` §3.2): one struct per
+/// The per-group `input_section` struct (see `simulator/src/log/README.md`): one struct per
 /// `ArchGroupInput` the worker fed to the model_arch this iteration. Prefill is
 /// kept at full per-request fidelity (the two parallel `prefill_*_lens` lists);
 /// decode is aggregated to two scalars (`decode_request_count` / `decode_kv_total`)
@@ -238,8 +238,8 @@ pub fn request_state_schema() -> Arc<Schema> {
     ]))
 }
 
-/// `request_slo` (§7.2) — one row per request with full per-token timing.
-/// Column list / types / nullability match `docs/logging.md §7.2`.
+/// `request_slo` — one row per request with full per-token timing.
+/// Column list / types / nullability match `simulator/src/log/README.md`.
 /// `output_token_times` is `List<f32>` (absolute sim-time ms); it is empty
 /// unless `io.log_output_token_times` is on (the scalars below are always present).
 /// The convenience scalars (`ttft_ms`, `tpot_*_ms`, `last_token_time_ms`) are

@@ -44,7 +44,7 @@ def _build_argparse():
 
     parser = argparse.ArgumentParser(
         prog="python -m launcher",
-        description="MLSim launcher — run / sweep simulations from preset JSON.",
+        description="VibeSim launcher — run / sweep simulations from preset JSON.",
     )
     parser.add_argument(
         "presets",
@@ -85,7 +85,7 @@ def _build_argparse():
         "--profile",
         action="store_true",
         help="Wrap the run with `perf record` to profile simulator wallclock; writes "
-        "`<log_dir>/perf.data`. Requires exactly one run (skill profile-sim-speed).",
+        "`<log_dir>/perf.data`. Requires exactly one run (skill operate-profile-sim-speed).",
     )
     parser.add_argument(
         "--profile-freq",
@@ -494,7 +494,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # --profile records one representative run; perf on a parallel sweep is
-    # meaningless. Enforce a single expanded candidate (skill profile-sim-speed).
+    # meaningless. Enforce a single expanded candidate (skill operate-profile-sim-speed).
     if args.profile and len(all_candidates) != 1:
         sys.exit(
             f"--profile requires exactly one run, but the preset expands to "

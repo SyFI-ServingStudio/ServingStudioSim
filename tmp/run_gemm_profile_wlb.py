@@ -114,7 +114,7 @@ class TracingLocalGpuChunk(GpuChunk):
         profiler_env = resolve_profile_env(profiler_spec.subprocess_env)
         profiler_env.validate_python_executable()
 
-        with tempfile.TemporaryDirectory(prefix="mlsim-profile-debug-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="vibesim-profile-debug-") as tmp:
             input_path = Path(tmp) / "input.json"
             output_path = Path(tmp) / "output.json"
             input_path.write_text(
@@ -270,7 +270,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--db-path",
         type=Path,
-        default=Path("/tmp/mlsim_gemm_wlb_profile.db"),
+        default=Path("/tmp/vibesim_gemm_wlb_profile.db"),
     )
     parser.add_argument("--gpu-name", help="DB gpu_name override; defaults to torch device 0")
     parser.add_argument("--fresh-db", action="store_true", help="Delete db_path before running")

@@ -1,6 +1,6 @@
 ---
 name: add-analyzer-subject
-description: Use when adding a new MLSim analyzer subject (a metric) end to end — the Rust compute side (a report + payload JSON built from a run's parquet via DataFusion) and the Python render side (a matplotlib PNG drawn from the payload). Covers the flat registry, the report/payload contract, the Applies gate, and — emphatically — reusing the shared session / io / cdf infra and the Python common style / figure / layout helpers instead of re-implementing them. NOT for running an existing analyzer (that is run-moesim-analyzer) or adding an L1 kernel (that is top-add-kernel).
+description: Use when adding a new VibeSim analyzer subject (a metric) end to end — the Rust compute side (a report + payload JSON built from a run's parquet via DataFusion) and the Python render side (a matplotlib PNG drawn from the payload). Covers the flat registry, the report/payload contract, the Applies gate, and — emphatically — reusing the shared session / io / cdf infra and the Python common style / figure / layout helpers instead of re-implementing them. NOT for running an existing analyzer (that is run-moesim-analyzer) or adding an L1 kernel (that is top-add-kernel).
 ---
 
 # Add Analyzer Subject (Rust compute + Python render)
@@ -16,7 +16,7 @@ more PNGs) across both halves of the boundary:
 
 The JSON pair is the ONLY boundary. A subject lives in a **category** folder
 (`request/`, `throughput/`, `utilization/`, …) — the category is a tag + a source
-family (`docs/analyzer.md` §5), not a registration unit.
+family (`old-doc/analyzer.md` §5), not a registration unit.
 
 > **Single-agent skill.** You are the only agent editing the tree. If several
 > subjects are added in parallel, the orchestrator isolates each in a git worktree
@@ -66,7 +66,7 @@ parallel by `__main__`. One payload may drive several figures.
 
 ## 1. Required reading (read first; cite the anchors you use)
 
-- `docs/analyzer.md` — the design contract. Especially **§2** (report/payload
+- `old-doc/analyzer.md` — the design contract. Especially **§2** (report/payload
   shapes), **§4** (flat registry), **§5** (categories: grain + source — find your
   metric's row, or justify a new category), **§7** (Applies gate), **§9** (How to
   extend — this skill operationalizes it).
@@ -76,7 +76,7 @@ parallel by `__main__`. One payload may drive several figures.
   - *Time-series* subject → `analyzer/rust/src/throughput/segment.rs` +
     `analyzer/python/throughput/segment_plot.py`, or the simpler
     `analyzer/rust/src/utilization/series.rs` + `analyzer/python/utilization/util_plot.py`.
-- The `cost_log` schema (`docs/logging.md`) if your source is `cost_log`.
+- The `cost_log` schema (`old-doc/logging.md`) if your source is `cost_log`.
 
 ---
 
@@ -85,7 +85,7 @@ parallel by `__main__`. One payload may drive several figures.
 1. **Name** — the snake_case CLI token (`analyze run <dir> <name>`) AND the Python
    `RENDERERS` key. Same string both sides.
 2. **Category** — an existing one (sibling subject, reuse its folder + extraction)
-   or new (`docs/analyzer.md` §5 grain+source test). New category = one `Category`
+   or new (`old-doc/analyzer.md` §5 grain+source test). New category = one `Category`
    variant + a `src/<category>/` folder; the registry STAYS flat.
 3. **Source parquet + columns** — the `require_columns` contract.
 4. **Applies** — `Applies::All` (Tier-1, deployment-agnostic) or
@@ -164,7 +164,7 @@ Verify (§5)
   report's total.
 - Skill friction (be candid): unclear/missing/out-of-order steps; where you read
   source instead of the skill; the one change that would have helped most.
-- `docs/analyzer.md` is a symlink into a separate repo — note whether the §5 table
+- `old-doc/analyzer.md` is a symlink into a separate repo — note whether the §5 table
   row was updated or deferred.
 
 ---
@@ -180,4 +180,4 @@ Pause (or note loudly and pick the nearest sane option) when:
 - The metric is genuinely deployment-shaped (Tier-2: `cost_log` per-rank/phase via
   the cost-tree manifest `node_labels`) — confirm the `Applies` set and whether the
   manifest exposes what you need.
-- A new category's grain+source doesn't cleanly fit `docs/analyzer.md` §5.
+- A new category's grain+source doesn't cleanly fit `old-doc/analyzer.md` §5.

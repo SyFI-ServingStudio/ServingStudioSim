@@ -15,7 +15,7 @@ not the kernel params**: the cache identity is ``(prefix_len, append_len)`` and
 the runner derives ``q_len = append_len``, ``kv_len = prefix_len + append_len``
 (that mapping lives in ``profiling.runners.attention.flashinfer_attn_prefill_and_rect``).
 
-Backends ``{fa2, fa3, trt, cudnn}`` are MLSim backend strings, not kinds: each
+Backends ``{fa2, fa3, trt, cudnn}`` are VibeSim backend strings, not kinds: each
 registers its own spec -> the same ``args_schema`` and table, routing to its own
 ``profile_flashinfer_attn_prefill_<backend>`` entry (the worker strips ``backend``
 before calling, so the runner is selected by backend, not told it). Unsupported

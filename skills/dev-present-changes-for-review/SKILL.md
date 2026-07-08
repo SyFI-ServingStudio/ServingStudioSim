@@ -58,7 +58,7 @@ defines *how many rounds and when*.
 2. **Pull the file list + churn:** `git diff --stat <base>` (or `<base>...HEAD`).
    If there are logical commits, note them (`git log --oneline <base>..HEAD`) —
    they are a hint, not necessarily the best reading order.
-3. **Bucket every changed file by module/layer.** For MLSim map each path to:
+3. **Bucket every changed file by module/layer.** For VibeSim map each path to:
    - **Launcher / user entry** (`launcher/`) — CLI flags, schema, sweep,
      validation: the invocation surface the user drives.
    - **Deployment** (`simulator/src/deployment/`) — config + per-pool flow build.
@@ -67,7 +67,7 @@ defines *how many rounds and when*.
      the eval engine; and derive macros (`*-derive/`).
    - **Analyzer** — Rust compute (`analyzer/rust/src/breakdown/…`) + Python render.
    - **Profiling / capability** (`profiling/`).
-   - **Tests** (`tests/`), **docs** (`docs/`, `README*`), **skills / memory**.
+   - **Tests** (`tests/`), **docs** (`doc/`, `README*`), **skills / memory**.
 4. **Emit a scope table:** module → files → churn (+/−) → one line on what that
    module's change accomplishes. This is the reviewer's map before any detail.
 5. **List but set aside noise** (generated code, lockfiles, pure-format churn,

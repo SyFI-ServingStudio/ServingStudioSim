@@ -61,7 +61,7 @@ impl LoggerSession {
 
         let (tx, rx) = sync_channel::<LogMsg>(CHANNEL_CAP);
         let handle = std::thread::Builder::new()
-            .name("mlsim-logger".to_string())
+            .name("vibesim-logger".to_string())
             .spawn(move || -> Result<()> {
                 // Encode + compress + write each chunk off the sim thread. The
                 // loop ends when every `tx` is dropped (channel disconnected).

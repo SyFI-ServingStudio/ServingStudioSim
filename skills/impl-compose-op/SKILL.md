@@ -18,7 +18,7 @@ You implement one L2 op under `simulator/src/op/`. `top-add-new-arch` Phase 2 (v
 reuse an existing kernel as an atomic `Op<K>`, or a new compound op — and the L1
 kernels it wraps must already build. Do not add kernels or worklets here.
 
-**The code is the contract**, not `docs/detailed_design/L2/design.md`: the live
+**The code is the contract**: the live
 op layer uses a **CostTree** (`build` / `compile` / `eval`), not the design doc's
 `init_ops` / `dry_run_init_ops` / `lookup -> LookupResult` (retired). Read the
 README and a real op before writing.

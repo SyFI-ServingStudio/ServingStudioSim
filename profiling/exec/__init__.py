@@ -29,11 +29,11 @@ def set_default_pool(pool: GpuPool | None) -> None:
 def get_default_pool() -> GpuPool:
     if _default_pool is not None:
         return _default_pool
-    # Escape hatch: MLSIM_PROFILE_GPUS=0,1,2,3 forces profiling onto an explicit
+    # Escape hatch: VIBESIM_PROFILE_GPUS=0,1,2,3 forces profiling onto an explicit
     # GPU set, bypassing the idle-GPU guard (find_idle_gpus). Use only when you
     # know those GPUs are yours to use — it will profile regardless of other jobs'
     # residency/util. Unset (the default) keeps the safe idle-GPU selection.
-    forced = os.environ.get("MLSIM_PROFILE_GPUS")
+    forced = os.environ.get("VIBESIM_PROFILE_GPUS")
     if forced:
         gpus = [int(x) for x in forced.split(",") if x.strip()]
         if gpus:

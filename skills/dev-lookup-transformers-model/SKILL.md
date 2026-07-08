@@ -10,7 +10,7 @@ Transformers or Torch implementation evidence. The goal is to locate the code
 that defines model semantics: modeling files, inherited parents, config fields,
 class/function names, operation shapes, cache behavior, and kernel-relevant
 paths. A later task may use this to build a small Torch reference for an
-operation or an MLSim kernel contract.
+operation or an VibeSim kernel contract.
 
 For new-model exploration, enter through `top-explore-models` first. This skill
 is the optional lower-level step for questions like "list all operations in the
@@ -35,7 +35,7 @@ families have several nearby variants.
 ## Workflow
 
 Run commands from `main/` and use `uv run python`, so you inspect the same
-environment MLSim uses.
+environment VibeSim uses.
 
 If arriving from `top-explore-models`, reuse its resolved repo id, downloaded
 `config.json` / `README.md` paths, `model_type`, public sources, and unresolved

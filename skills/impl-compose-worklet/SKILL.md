@@ -16,7 +16,7 @@ You implement one L3 worklet under `simulator/src/worklet/`, a single sync secti
 (one GPU group, ending at a collective or single-GPU self-completion). Its L2 ops
 must already build. Do not add ops or wire the arch here.
 
-**Code is the contract**, not `docs/detailed_design/L3/design.md`: the live worklet
+**Code is the contract**: the live worklet
 uses `resolve_config` / `build` / `compile` / `eval` over the CostTree — NOT the
 design doc's `init_ops` / `dry_run_init_ops` / `lookup` / `Describe` (retired; the
 partition label is now folded into a `CostNode::Labeled`).

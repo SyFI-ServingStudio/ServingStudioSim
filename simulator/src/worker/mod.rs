@@ -1,5 +1,5 @@
 //! `worker` (L5) — per-worker FSM that turns admitted requests into iter cost
-//! queries and drives request lifecycle. See docs/detailed_design/L5/design.md.
+//! queries and drives request lifecycle. See doc/detailed_design/L5.md.
 //!
 //! Current set: barebone and HP/DP unified workers, the PD prefill/decode pair,
 //! the `IterWorker` trait they share, selector/config types, and the shared

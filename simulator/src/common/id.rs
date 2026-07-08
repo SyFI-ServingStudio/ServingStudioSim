@@ -1,7 +1,7 @@
 //! Newtyped identifiers used across simulator layers.
 //!
 //! Each id wraps a fixed-width integer chosen to match the matching parquet
-//! column width in `docs/logging.md` (e.g. `request_id : u32`, `worker_id : u16`).
+//! column width in `simulator/src/log/README.md` (e.g. `request_id : u32`, `worker_id : u16`).
 //! Newtyping prevents accidentally passing a worker id where a request id is
 //! expected.
 

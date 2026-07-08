@@ -108,7 +108,7 @@ fn tpot_stats_ms(times_ms: &[f32]) -> (Option<f32>, Option<f32>, Option<f32>, Op
 }
 
 /// One HP group's input context for a `cost_log` row — the per-iteration
-/// `input_section` (`docs/logging.md` §3.2), one per `ArchGroupInput` the worker
+/// `input_section` (see `simulator/src/log/README.md`), one per `ArchGroupInput` the worker
 /// fed the model_arch. Prefill is kept full (`prefill_chunk_pairs`, moved over
 /// un-split — the writer thread splits `(prefix, append)` into the two parallel
 /// list columns); decode is aggregated to `decode_request_count` /

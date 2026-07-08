@@ -2,7 +2,7 @@
 name = "analyzer"
 version = "0.1.0"
 edition = "2021"
-description = "MLSim post-sim analyzer — DataFusion parquet scan → report + plot-payload JSON"
+description = "VibeSim post-sim analyzer — DataFusion parquet scan → report + plot-payload JSON"
 
 [[bin]]
 name = "analyze"

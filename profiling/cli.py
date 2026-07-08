@@ -39,7 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m profiling",
-        description="Run/query existing MLSim L1 profile entries through profiling.perf_api.",
+        description="Run/query existing VibeSim L1 profile entries through profiling.perf_api.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

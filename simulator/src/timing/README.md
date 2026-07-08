@@ -7,9 +7,9 @@ total. It never measures a GPU itself — it asks the Python profiling layer for
 profiled samples, fits an interpolating cache over them once, then evaluates that
 cache millions of times.
 
-This is the practical, code-matching reference. The authoritative specs are
-`docs/detailed_design/L1/design.md` and `docs/cost_tree.md`; if this file
-disagrees with the code, the code (and the design docs) win — open an issue.
+This is the practical, code-matching reference. For the layer overview see
+`doc/detailed_design/L1.md`, and `COST_TREE.md` for the CostTree spec. If this file
+disagrees with the code, the code wins — open an issue.
 
 ## What it exposes / what it requires
 

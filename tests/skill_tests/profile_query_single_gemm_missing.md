@@ -2,7 +2,7 @@
 
 ## Agent Input
 
-Work in `/m-coriander/coriander/kanzhu/MLSim_workspace/main` with no prior
+Work in `/m-coriander/coriander/kanzhu/VibeSim_workspace/main` with no prior
 knowledge beyond repo-local instructions. Use the appropriate repo-local skill
 to query, but not profile, the existing L1 kernel `single_gemm` with backend
 `torch`.
@@ -19,7 +19,7 @@ status. Do not run real CUDA profiling.
 ## Expected Output Description
 
 The final answer should show that the agent discovered
-`skills/profile-run-existing-kernel/SKILL.md`, confirmed `single_gemm` /
+`skills/operate-profile-existing-kernel/SKILL.md`, confirmed `single_gemm` /
 `torch` with `list --json`, and then used `query --json` against the fresh temp
 DB.
 

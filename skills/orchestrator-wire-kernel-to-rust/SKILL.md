@@ -1,7 +1,7 @@
 ---
 name: orchestrator-wire-kernel-to-rust
 description: >-
-  Use when orchestrating the Rust timing/cache wiring for an MLSim L1 kernel
+  Use when orchestrating the Rust timing/cache wiring for an VibeSim L1 kernel
   after the Python profiling side is defined. This skill is for the coordinator
   who turns a Python-to-Rust handoff into Rust implementation tasks, verifies
   KernelSpec/cache/bridge behavior, and decides when cache fidelity is good

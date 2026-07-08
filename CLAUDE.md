@@ -1,4 +1,4 @@
-# MLSim — agent notes
+# VibeSim — agent notes
 
 Discrete-event simulator for ML serving/training workloads. Rust core
 (`simulator/`) + Python L1 profiling/launcher, bridged via PyO3. Answer user questions using Chinese. Draft plans also in Chinese. Write code comments in English.
@@ -26,7 +26,7 @@ itself (no manual `LD_LIBRARY_PATH`/`PYTHONPATH`) and prewarms the kernel cache:
 uv run python -m launcher <preset>.json [--dry-run] [--override k=v ...]
 ```
 
-See skill `run-simulation` for preset/sweep conventions and dated log dirs.
+See skill `operate-run-simulation` for preset/sweep conventions and dated log dirs.
 
 ## Testing
 
@@ -50,6 +50,6 @@ changed the cost model. If that change was intended, confirm the numbers and
 `tests/golden/<metric>/<gpu_name>.json`; the test skips on a GPU with no recorded
 golden.
 
-Tiers, markers, the golden store, and how to add a tiered test: skill `run-tests`.
-Other test/quality skills: `validate-kernel-cache`, `profile-run-existing-kernel`,
-`profile-add-kernel`, `profile-sim-speed`.
+Tiers, markers, the golden store, and how to add a tiered test: skill `dev-run-tests`.
+Other test/quality skills: `impl-validate-kernel-cache`, `operate-profile-existing-kernel`,
+`top-add-kernel`, `operate-profile-sim-speed`.

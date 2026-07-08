@@ -1,6 +1,6 @@
 ---
 name: dev-calculate-kv-cache-capacity
-description: "Use when the user asks to calculate, estimate, or sanity-check KV cache size, attention-state size, available KV memory budget, bytes per token, max cached tokens, max concurrent requests, or capacity for a model. Uses a concise three-step workflow: determine available memory after model/reserves, calculate and show per-token or per-request cache/state size from config and public architecture sources, then draw the capacity conclusion. Covers dense MHA/MQA/GQA KV, MLA/DSA/GDN/custom cached states, sliding-window or paged allocation, and MLSim attention memory budgets."
+description: "Use when the user asks to calculate, estimate, or sanity-check KV cache size, attention-state size, available KV memory budget, bytes per token, max cached tokens, max concurrent requests, or capacity for a model. Uses a concise three-step workflow: determine available memory after model/reserves, calculate and show per-token or per-request cache/state size from config and public architecture sources, then draw the capacity conclusion. Covers dense MHA/MQA/GQA KV, MLA/DSA/GDN/custom cached states, sliding-window or paged allocation, and VibeSim attention memory budgets."
 ---
 
 # Dev Calculate KV Cache Capacity
