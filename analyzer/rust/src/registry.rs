@@ -11,6 +11,8 @@ use anyhow::{bail, Result};
 use datafusion::prelude::SessionContext;
 use serde_json::Value;
 
+use crate::alignment_e2e;
+use crate::alignment_iteration;
 use crate::batch;
 use crate::conservation;
 use crate::kv;
@@ -40,6 +42,10 @@ pub enum Category {
     /// KV-cache pool occupancy over time, from the `kv_snapshot` stream. Tier-1,
     /// deployment-agnostic (a run without KV logging degrades to `unavailable`).
     Kv,
+    /// One measured vLLM model iteration joined to one offline predict case.
+    AlignmentIteration,
+    /// One request and run-level completion timeline joined across real/sim runs.
+    AlignmentE2e,
 }
 
 impl Category {
@@ -51,6 +57,26 @@ impl Category {
             Category::Batch => "batch",
             Category::Conservation => "conservation",
             Category::Kv => "kv",
+            Category::AlignmentIteration => "alignment-iteration",
+            Category::AlignmentE2e => "alignment-e2e",
+        }
+    }
+}
+
+/// Which CLI artifact root a subject consumes. This is orthogonal to deployment
+/// applicability: a normal simulation run and a paired alignment bundle are
+/// different source envelopes, but both remain rows in the one flat registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Run,
+    Alignment,
+}
+
+impl Scope {
+    fn label(self) -> &'static str {
+        match self {
+            Scope::Run => "run",
+            Scope::Alignment => "alignment",
         }
     }
 }
@@ -93,6 +119,7 @@ pub struct Subject {
     pub report_name: &'static str,
     pub payload_name: &'static str,
     pub applies: Applies,
+    pub scope: Scope,
 }
 
 /// The whole catalog. Adding a metric = one row here + one arm in [`run_subject`]
@@ -105,6 +132,7 @@ pub const SUBJECTS: &[Subject] = &[
         report_name: "slo_general_report.json",
         payload_name: "slo_general_cdf.json",
         applies: Applies::All,
+        scope: Scope::Run,
     },
     Subject {
         name: "slo-detailed",
@@ -113,6 +141,7 @@ pub const SUBJECTS: &[Subject] = &[
         report_name: "slo_detailed_report.json",
         payload_name: "slo_detailed_cdf.json",
         applies: Applies::All,
+        scope: Scope::Run,
     },
     Subject {
         name: "throughput",
@@ -121,6 +150,7 @@ pub const SUBJECTS: &[Subject] = &[
         report_name: "throughput_report.json",
         payload_name: "throughput_segments.json",
         applies: Applies::All,
+        scope: Scope::Run,
     },
     Subject {
         name: "utilization",
@@ -129,6 +159,7 @@ pub const SUBJECTS: &[Subject] = &[
         report_name: "utilization_report.json",
         payload_name: "utilization_series.json",
         applies: Applies::All,
+        scope: Scope::Run,
     },
     Subject {
         name: "batch",
@@ -137,6 +168,7 @@ pub const SUBJECTS: &[Subject] = &[
         report_name: "batch_report.json",
         payload_name: "batch_scatter.json",
         applies: Applies::All,
+        scope: Scope::Run,
     },
     Subject {
         name: "kernel-throughput",
@@ -146,6 +178,7 @@ pub const SUBJECTS: &[Subject] = &[
         report_name: "kernel_throughput_report.json",
         payload_name: "kernel_throughput_locations.json",
         applies: Applies::All,
+        scope: Scope::Run,
     },
     Subject {
         name: "workload-conservation",
@@ -155,6 +188,7 @@ pub const SUBJECTS: &[Subject] = &[
         report_name: "workload_conservation_report.json",
         payload_name: "workload_conservation_checks.json",
         applies: Applies::All,
+        scope: Scope::Run,
     },
     Subject {
         name: "kv-occupancy",
@@ -164,6 +198,25 @@ pub const SUBJECTS: &[Subject] = &[
         report_name: "kv_occupancy_report.json",
         payload_name: "kv_occupancy_series.json",
         applies: Applies::All,
+        scope: Scope::Run,
+    },
+    Subject {
+        name: "alignment-iteration",
+        category: Category::AlignmentIteration,
+        description: "Per-vLLM-iteration measured vs timing-predict totals, per-kernel stacked breakdowns, mapping coverage, and kernel inventory.",
+        report_name: "alignment_iteration_report.json",
+        payload_name: "alignment_iteration_series.json",
+        applies: Applies::All,
+        scope: Scope::Alignment,
+    },
+    Subject {
+        name: "alignment-e2e",
+        category: Category::AlignmentE2e,
+        description: "Paired real-vs-sim request TTFT/TPOT/E2E deltas and completion-throughput over time.",
+        report_name: "alignment_e2e_report.json",
+        payload_name: "alignment_e2e_series.json",
+        applies: Applies::All,
+        scope: Scope::Alignment,
     },
 ];
 
@@ -171,16 +224,21 @@ pub const SUBJECTS: &[Subject] = &[
 /// `name  [category]  (applicability)  description`.
 pub fn help() -> String {
     let name_w = SUBJECTS.iter().map(|s| s.name.len()).max().unwrap_or(0);
-    let cat_w = SUBJECTS.iter().map(|s| s.category.label().len()).max().unwrap_or(0);
+    let cat_w = SUBJECTS
+        .iter()
+        .map(|s| s.category.label().len())
+        .max()
+        .unwrap_or(0);
     let mut out = String::from(
-        "analyzer subjects — run with `analyze run <log_dir> [subjects...]` \
-         (no subjects = all applicable):\n",
+        "analyzer subjects — run with `analyze {run|alignment} <log_dir> \
+         [subjects...]` (no subjects = all applicable in that scope):\n",
     );
     for s in SUBJECTS {
         out.push_str(&format!(
-            "  {:<name_w$}  [{:<cat_w$}]  ({})  {}\n",
+            "  {:<name_w$}  [{:<cat_w$}]  ({}, {})  {}\n",
             s.name,
             s.category.label(),
+            s.scope.label(),
             s.applies.label(),
             s.description,
         ));
@@ -201,6 +259,8 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
         "kernel-throughput" => batch::kernel_throughput::run_kernel_throughput(ctx, dir).await,
         "workload-conservation" => conservation::workload::run_workload(ctx, dir).await,
         "kv-occupancy" => kv::occupancy::run_kv_occupancy(ctx, dir).await,
+        "alignment-iteration" => alignment_iteration::run(ctx, dir).await,
+        "alignment-e2e" => alignment_e2e::run(ctx, dir).await,
         other => bail!("unknown analyzer subject {other:?}"),
     }
 }
@@ -211,7 +271,11 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
 /// analyzer at any run "just works" — agnostic metrics always run, deployment-
 /// shaped ones self-select). A requested name that matches no subject is a typo,
 /// so it warns loudly with the valid names rather than silently running nothing.
-pub fn select(requested: &[String], deployment: Option<&str>) -> Vec<&'static Subject> {
+pub fn select(
+    requested: &[String],
+    deployment: Option<&str>,
+    scope: Scope,
+) -> Vec<&'static Subject> {
     for name in requested {
         if !SUBJECTS.iter().any(|s| s.name == name) {
             let known: Vec<&str> = SUBJECTS.iter().map(|s| s.name).collect();
@@ -224,6 +288,9 @@ pub fn select(requested: &[String], deployment: Option<&str>) -> Vec<&'static Su
     SUBJECTS
         .iter()
         .filter(|s| {
+            if s.scope != scope {
+                return false;
+            }
             let wanted = requested.is_empty() || requested.iter().any(|r| r == s.name);
             if !wanted {
                 return false;

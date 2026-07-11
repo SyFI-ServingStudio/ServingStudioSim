@@ -1,21 +1,25 @@
-//! `analyze` — VibeSim post-sim analyzer binary.
+//! `analyze` — VibeSim post-run artifact analyzer binary.
 //!
 //! Reads a run's `raw/*.parquet` via DataFusion, computes metrics, and writes a
 //! *report* JSON (numbers, into `reports/`) + a *payload* JSON (plot arrays for
 //! the Python plotter, into `payloads/`). The Python side (`analyzer/python`)
 //! renders PNGs from the payloads — it never touches parquet.
 //!
-//! One verb: `analyze run <log_dir> [subjects...]`. With no subjects it runs
-//! every subject applicable to the run's deployment (mirrors the Python renderer
-//! defaulting to all). The subject catalog lives in [`registry`].
+//! `analyze run <log_dir> [subjects...]` computes simulator subjects;
+//! `analyze alignment <analysis_log_dir> [subjects...]` computes paired measured
+//! subjects from an `alignment_manifest.json`. Both use the one flat catalog in
+//! [`registry`], separated by its source [`registry::Scope`] gate.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+mod alignment_e2e;
+mod alignment_input;
+mod alignment_iteration;
 mod batch;
 mod breakdown;
 mod cdf;
@@ -34,7 +38,7 @@ use io::{payload_path, read_deployment, report_path, write_json, SCHEMA_VERSION}
 use session::build_session;
 
 #[derive(Parser, Debug)]
-#[command(name = "analyze", about = "VibeSim post-sim parquet analyzer")]
+#[command(name = "analyze", about = "VibeSim post-run artifact analyzer")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -49,6 +53,14 @@ enum Command {
         /// and `payloads/` subdirs.
         log_dir: PathBuf,
         /// Subject names to run (e.g. `slo`); empty = all applicable.
+        subjects: Vec<String>,
+    },
+    /// Accept the dedicated alignment-analysis artifact directory.
+    Alignment {
+        /// Analysis directory containing `alignment_manifest.json`; outputs
+        /// land in this directory's report/payload dirs.
+        analysis_log_dir: PathBuf,
+        /// Alignment subject names; empty = both iteration and E2E subjects.
         subjects: Vec<String>,
     },
     /// List the available analyzer subjects and what each produces.
@@ -106,6 +118,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Run { log_dir, subjects } => run(log_dir, subjects).await,
+        Command::Alignment {
+            analysis_log_dir,
+            subjects,
+        } => alignment(analysis_log_dir, subjects).await,
         Command::Trace {
             log_dir,
             regions,
@@ -138,6 +154,25 @@ async fn main() -> Result<()> {
     }
 }
 
+async fn alignment(analysis_log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
+    let manifest = analysis_log_dir.join("alignment_manifest.json");
+    if !manifest.is_file() {
+        bail!(
+            "alignment manifest not found: {}; run alignment timing-predict first",
+            manifest.display()
+        );
+    }
+    let ctx = build_session();
+    run_subjects(
+        ctx,
+        analysis_log_dir,
+        subjects,
+        None,
+        registry::Scope::Alignment,
+    )
+    .await
+}
+
 async fn run(log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
     let ctx = build_session();
     let deployment = read_deployment(&log_dir);
@@ -148,6 +183,16 @@ async fn run(log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
     // avoids redundant metadata opens.)
     let _ = session::register_cost_log(&ctx, &log_dir).await;
 
+    run_subjects(ctx, log_dir, subjects, deployment, registry::Scope::Run).await
+}
+
+async fn run_subjects(
+    ctx: datafusion::prelude::SessionContext,
+    log_dir: PathBuf,
+    subjects: Vec<String>,
+    deployment: Option<String>,
+    scope: registry::Scope,
+) -> Result<()> {
     // Best-effort AND concurrent: each subject is an independent read over the shared
     // read-only ctx (SessionContext is Send+Sync+Clone) that writes its own files, so
     // on a many-core box overlapping them hides the long poles (batch / workload /
@@ -156,7 +201,7 @@ async fn run(log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
     // catalog order for a stable log; per-subject timing is still the subject's own
     // wall (now overlapping), and `total_elapsed_ms` is the concurrent wall.
     let run_start = Instant::now();
-    let selected = registry::select(&subjects, deployment.as_deref());
+    let selected = registry::select(&subjects, deployment.as_deref(), scope);
     let mut set = tokio::task::JoinSet::new();
     for (idx, subject) in selected.iter().enumerate() {
         let ctx = ctx.clone();

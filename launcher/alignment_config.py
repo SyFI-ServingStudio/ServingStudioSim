@@ -1,0 +1,421 @@
+"""Strict launcher-owned schemas for the three alignment-specific phases.
+
+The ordinary simulation phase keeps using the normal VibeSim preset schema.
+Every path parsed here is resolved relative to the file that declared it, so a
+dated experiment directory can be moved as one self-contained unit. Runtime
+modules receive typed values and never parse YAML or JSON themselves.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
+
+from alignment.load_generator.config import LoadGeneratorConfig
+from alignment.profiler.config import IdleWaitConfig, NsysConfig, ProfileConfig, ServerConfig
+from alignment.timing_predict_input import VllmTextInputSpec
+
+from .schema.loader import PresetError, _load_preset
+
+CONFIG_SUFFIXES = frozenset({".json", ".yaml", ".yml"})
+
+
+@dataclass(frozen=True)
+class TimingPredictPhaseConfig:
+    """Completed artifacts and builder policy for one offline prediction phase."""
+
+    simulation_log_dir: Path
+    profile_log_dir: Path
+    log_dir: Path
+    input_builder: VllmTextInputSpec
+
+
+@dataclass(frozen=True)
+class IterationAnalysisPolicy:
+    enabled: bool = True
+    labeled_kernel_sequences_file: Path | None = None
+
+
+@dataclass(frozen=True)
+class E2EAnalysisPolicy:
+    enabled: bool = True
+    throughput_bins: int = 20
+
+
+@dataclass(frozen=True)
+class AnalyzePhaseConfig:
+    """Completed artifacts and analyzer policy for the final alignment phase."""
+
+    simulation_log_dir: Path
+    profile_log_dir: Path
+    timing_predict_log_dir: Path
+    log_dir: Path
+    iteration: IterationAnalysisPolicy
+    e2e: E2EAnalysisPolicy
+
+    @property
+    def subjects(self) -> list[str]:
+        selected = []
+        if self.iteration.enabled:
+            selected.append("alignment-iteration")
+        if self.e2e.enabled:
+            selected.append("alignment-e2e")
+        return selected
+
+
+def load_profile_config(path: Path) -> ProfileConfig:
+    """Load the profile-only schema and normalize its filesystem inputs."""
+    raw = _phase_document(path, "profile")
+    base = path.resolve().parent
+    try:
+        server_raw = _pop_mapping(raw, "server", "profile")
+        workload_raw = _pop_mapping(raw, "workload", "profile")
+        idle_raw = _pop_optional_mapping(raw, "idle", "profile")
+        nsys_raw = _pop_optional_mapping(raw, "nsys", "profile")
+        server = ServerConfig(**server_raw)
+        workload = LoadGeneratorConfig.from_mapping(workload_raw)
+        workload = replace(
+            workload,
+            frontend=replace(
+                workload.frontend,
+                path=str(_config_path(base, workload.frontend.path, "workload.frontend.path")),
+            ),
+            text_file=str(_config_path(base, workload.text_file, "workload.text_file")),
+        )
+        idle = IdleWaitConfig(**idle_raw)
+        nsys = NsysConfig(**nsys_raw)
+        nsys.validate()
+        log_dir = _config_path(base, raw.pop("log_dir"), "log_dir")
+        fork_python = raw.pop("fork_python", "")
+        if fork_python:
+            fork_python = str(_config_path_preserving_symlink(base, fork_python, "fork_python"))
+        config = ProfileConfig(
+            log_dir=str(log_dir),
+            server=server,
+            workload=workload,
+            idle=idle,
+            nsys=nsys,
+            fork_python=fork_python,
+            **raw,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid profile config: {exc}") from exc
+    _require_nonempty(config.name, "name")
+    _require_nonempty(config.gpu, "gpu")
+    return config
+
+
+def load_timing_predict_config(path: Path) -> TimingPredictPhaseConfig:
+    """Load one timing-input build and offline-predict phase config."""
+    raw = _phase_document(path, "timing-predict")
+    base = path.resolve().parent
+    try:
+        builder_raw = _pop_mapping(raw, "input_builder", "timing-predict")
+        builder_type = builder_raw.pop("type", None)
+        if builder_type != "vllm_text":
+            raise ValueError(
+                f"unsupported input_builder.type {builder_type!r}; available: ['vllm_text']"
+            )
+        builder = VllmTextInputSpec(**builder_raw)
+        builder.validate()
+        config = TimingPredictPhaseConfig(
+            simulation_log_dir=_config_path(
+                base, raw.pop("simulation_log_dir"), "simulation_log_dir"
+            ),
+            profile_log_dir=_config_path(base, raw.pop("profile_log_dir"), "profile_log_dir"),
+            log_dir=_config_path(base, raw.pop("log_dir"), "log_dir"),
+            input_builder=builder,
+        )
+        _reject_extra(raw, "timing-predict")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid timing-predict config: {exc}") from exc
+    _require_distinct(
+        {
+            "simulation_log_dir": config.simulation_log_dir,
+            "profile_log_dir": config.profile_log_dir,
+            "log_dir": config.log_dir,
+        }
+    )
+    return config
+
+
+def load_analyze_config(path: Path) -> AnalyzePhaseConfig:
+    """Load the final analyzer phase without consulting an earlier config file."""
+    raw = _phase_document(path, "analyze")
+    base = path.resolve().parent
+    try:
+        iteration_raw = _pop_optional_mapping(raw, "iteration", "analyze")
+        e2e_raw = _pop_optional_mapping(raw, "e2e", "analyze")
+        sequences_text = iteration_raw.pop("labeled_kernel_sequences_file", None)
+        iteration = IterationAnalysisPolicy(
+            labeled_kernel_sequences_file=(
+                _config_path(
+                    base,
+                    sequences_text,
+                    "iteration.labeled_kernel_sequences_file",
+                )
+                if sequences_text is not None
+                else None
+            ),
+            **iteration_raw,
+        )
+        e2e = E2EAnalysisPolicy(**e2e_raw)
+        if iteration.enabled and iteration.labeled_kernel_sequences_file is None:
+            raise ValueError(
+                "iteration.labeled_kernel_sequences_file is required when iteration.enabled is true"
+            )
+        if e2e.throughput_bins <= 0:
+            raise ValueError("e2e.throughput_bins must be > 0")
+        config = AnalyzePhaseConfig(
+            simulation_log_dir=_config_path(
+                base, raw.pop("simulation_log_dir"), "simulation_log_dir"
+            ),
+            profile_log_dir=_config_path(base, raw.pop("profile_log_dir"), "profile_log_dir"),
+            timing_predict_log_dir=_config_path(
+                base, raw.pop("timing_predict_log_dir"), "timing_predict_log_dir"
+            ),
+            log_dir=_config_path(base, raw.pop("log_dir"), "log_dir"),
+            iteration=iteration,
+            e2e=e2e,
+        )
+        _reject_extra(raw, "analyze")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid analyze config: {exc}") from exc
+    if not config.subjects:
+        raise ValueError("invalid analyze config: at least one analysis subject must be enabled")
+    _require_distinct(
+        {
+            "simulation_log_dir": config.simulation_log_dir,
+            "profile_log_dir": config.profile_log_dir,
+            "timing_predict_log_dir": config.timing_predict_log_dir,
+            "log_dir": config.log_dir,
+        }
+    )
+    return config
+
+
+def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
+    """Validate the self-contained folded inventory before snapshotting it."""
+    path = Path(path)
+    if path.suffix.lower() != ".json":
+        raise ValueError(f"labeled kernel sequences must be JSON: {path}")
+    raw = _document(path, "labeled kernel sequences")
+    required = {"schema_version", "encoding", "source_parsed", "folding_policy", "phases"}
+    extra = set(raw) - required
+    missing = required - set(raw)
+    if extra or missing:
+        raise ValueError(
+            "labeled kernel sequence keys mismatch: "
+            f"missing={sorted(missing)} extra={sorted(extra)}"
+        )
+    if raw["schema_version"] != 2 or raw["encoding"] != "folded-v1":
+        raise ValueError("labeled kernel sequences require schema_version 2 encoding folded-v1")
+    phases = raw["phases"]
+    if not isinstance(phases, dict) or not phases:
+        raise ValueError("labeled kernel sequences phases must be a non-empty mapping")
+
+    operation_signatures: dict[str, tuple[tuple[str, ...], str, str]] = {}
+    slots: dict[str, str] = {}
+    for phase_name, phase in phases.items():
+        _require_nonempty(phase_name, "phase name")
+        if not isinstance(phase, dict) or set(phase) != {"unique_sequences"}:
+            raise ValueError(f"phase {phase_name!r} must contain only unique_sequences")
+        sequences = phase["unique_sequences"]
+        if not isinstance(sequences, list) or not sequences:
+            raise ValueError(f"phase {phase_name!r} unique_sequences must be non-empty")
+        sequence_ids: set[str] = set()
+        assigned_iterations: set[int] = set()
+        for index, sequence in enumerate(sequences):
+            context = f"phases.{phase_name}.unique_sequences[{index}]"
+            if not isinstance(sequence, dict) or set(sequence) != {
+                "sequence_id",
+                "iterations",
+                "expanded_kernel_count",
+                "program",
+            }:
+                raise ValueError(f"{context} has invalid keys")
+            sequence_id = sequence["sequence_id"]
+            _require_nonempty(sequence_id, f"{context}.sequence_id")
+            if sequence_id in sequence_ids:
+                raise ValueError(f"{context} duplicates sequence_id {sequence_id!r}")
+            sequence_ids.add(sequence_id)
+            iterations = sequence["iterations"]
+            if (
+                not isinstance(iterations, list)
+                or not iterations
+                or not all(isinstance(value, int) and value >= 0 for value in iterations)
+            ):
+                raise ValueError(f"{context}.iterations must be non-negative integers")
+            overlap = assigned_iterations.intersection(iterations)
+            if overlap:
+                raise ValueError(
+                    f"phase {phase_name!r} assigns iterations twice: {sorted(overlap)}"
+                )
+            assigned_iterations.update(iterations)
+            expanded = _validate_labeled_program(
+                sequence["program"], context, operation_signatures, slots
+            )
+            if sequence["expanded_kernel_count"] != expanded:
+                raise ValueError(
+                    f"{context}.expanded_kernel_count "
+                    f"{sequence['expanded_kernel_count']} != {expanded}"
+                )
+    return raw
+
+
+def _validate_labeled_program(
+    program: Any,
+    context: str,
+    operations: dict[str, tuple[tuple[str, ...], str, str]],
+    slots: dict[str, str],
+) -> int:
+    if not isinstance(program, list) or not program:
+        raise ValueError(f"{context}.program must be non-empty")
+    expanded = 0
+    for node_index, node in enumerate(program):
+        node_context = f"{context}.program[{node_index}]"
+        if not isinstance(node, dict) or len(node) != 1:
+            raise ValueError(f"{node_context} must be one tagged node")
+        if "kernels" in node:
+            kernels = node["kernels"]
+            count = 1
+        elif "repeat" in node:
+            repeat = node["repeat"]
+            if not isinstance(repeat, dict) or set(repeat) != {"count", "body"}:
+                raise ValueError(f"{node_context}.repeat has invalid keys")
+            count = repeat["count"]
+            if not isinstance(count, int) or count < 2:
+                raise ValueError(f"{node_context}.repeat.count must be >= 2")
+            body = repeat["body"]
+            if not isinstance(body, dict) or set(body) != {"kernels"}:
+                raise ValueError(f"{node_context}.repeat.body must contain only kernels")
+            kernels = body["kernels"]
+        else:
+            raise ValueError(f"{node_context} must contain kernels or repeat")
+        if not isinstance(kernels, list) or not kernels:
+            raise ValueError(f"{node_context} kernels must be non-empty")
+        for kernel_index, kernel in enumerate(kernels):
+            _validate_labeled_kernel(
+                kernel,
+                f"{node_context}.kernels[{kernel_index}]",
+                operations,
+                slots,
+            )
+        expanded += len(kernels) * count
+    return expanded
+
+
+def _validate_labeled_kernel(
+    kernel: Any,
+    context: str,
+    operations: dict[str, tuple[tuple[str, ...], str, str]],
+    slots: dict[str, str],
+) -> None:
+    if not isinstance(kernel, dict) or set(kernel) != {"name", "suggested_category", "label"}:
+        raise ValueError(f"{context} must contain name, suggested_category, and label")
+    _require_nonempty(kernel["name"], f"{context}.name")
+    _require_nonempty(kernel["suggested_category"], f"{context}.suggested_category")
+    label = kernel["label"]
+    if not isinstance(label, dict) or "status" not in label:
+        raise ValueError(f"{context}.label must have explicit status")
+    if label["status"] == "unmapped":
+        if set(label) != {"status"}:
+            raise ValueError(f"{context} unmapped label cannot contain mapping fields")
+        return
+    if label["status"] != "mapped":
+        raise ValueError(f"{context}.label.status must be mapped or unmapped")
+    expected = {"status", "operation", "simulated_slots", "type", "role"}
+    if set(label) != expected:
+        raise ValueError(f"{context} mapped label must contain {sorted(expected)}")
+    for field in expected - {"status", "simulated_slots"}:
+        _require_nonempty(label[field], f"{context}.label.{field}")
+    simulated_slots = label["simulated_slots"]
+    if (
+        not isinstance(simulated_slots, list)
+        or not simulated_slots
+        or not all(isinstance(slot, str) and slot.strip() for slot in simulated_slots)
+    ):
+        raise ValueError(f"{context}.label.simulated_slots must be a non-empty string list")
+    if len(set(simulated_slots)) != len(simulated_slots):
+        raise ValueError(f"{context}.label.simulated_slots cannot contain duplicates")
+    operation = label["operation"]
+    signature = (tuple(simulated_slots), label["type"], label["role"])
+    old_signature = operations.setdefault(operation, signature)
+    if old_signature != signature:
+        raise ValueError(f"operation {operation!r} has inconsistent label metadata")
+    for simulated_slot in simulated_slots:
+        old_operation = slots.setdefault(simulated_slot, operation)
+        if old_operation != operation:
+            raise ValueError(f"simulated slot {simulated_slot!r} belongs to multiple operations")
+
+
+def _phase_document(path: Path, role: str) -> dict[str, Any]:
+    raw = _document(path, f"{role} config")
+    version = raw.pop("schema_version", None)
+    if version != 1:
+        raise ValueError(f"{role} config schema_version must be 1")
+    return raw
+
+
+def _document(path: Path, role: str) -> dict[str, Any]:
+    path = Path(path)
+    if path.suffix.lower() not in CONFIG_SUFFIXES:
+        raise ValueError(f"{role} must be YAML or JSON: {path}")
+    try:
+        return dict(_load_preset(path))
+    except (OSError, PresetError) as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _pop_mapping(raw: dict, field: str, role: str) -> dict:
+    value = raw.pop(field)
+    if not isinstance(value, dict):
+        raise ValueError(f"{role}.{field} must be a mapping")
+    return dict(value)
+
+
+def _pop_optional_mapping(raw: dict, field: str, role: str) -> dict:
+    value = raw.pop(field, {})
+    if not isinstance(value, dict):
+        raise ValueError(f"{role}.{field} must be a mapping")
+    return dict(value)
+
+
+def _config_path(base: Path, value: Any, field: str) -> Path:
+    _require_nonempty(value, field)
+    path = Path(value)
+    return (path if path.is_absolute() else base / path).resolve()
+
+
+def _config_path_preserving_symlink(base: Path, value: Any, field: str) -> Path:
+    """Anchor an executable path without escaping its virtual environment.
+
+    A venv's ``bin/python`` is normally a symlink to the base interpreter.
+    Resolving that final symlink changes how Python discovers site-packages, so
+    ``fork_python`` must retain the lexical venv path passed to the subprocess.
+    """
+    _require_nonempty(value, field)
+    path = Path(value)
+    anchored = path if path.is_absolute() else base / path
+    return Path(os.path.abspath(os.path.normpath(anchored)))
+
+
+def _require_nonempty(value: Any, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+
+
+def _reject_extra(raw: dict, role: str) -> None:
+    if raw:
+        raise ValueError(f"unknown {role} config keys: {sorted(raw)}")
+
+
+def _require_distinct(paths: dict[str, Path]) -> None:
+    by_path: dict[Path, list[str]] = {}
+    for name, path in paths.items():
+        by_path.setdefault(path, []).append(name)
+    overlaps = [names for names in by_path.values() if len(names) > 1]
+    if overlaps:
+        raise ValueError(f"phase artifact directories must be distinct: {overlaps}")

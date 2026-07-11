@@ -1,7 +1,8 @@
 # VibeSim Analyzer
 
-Post-sim analysis: turn a run's parquet logs into **numbers** (for a human / LLM)
-and **plots** (for the user). It is a **standalone crate** — the binary is
+Post-run analysis: turn simulator parquet logs into **numbers** (for a human / LLM)
+and **plots** (for the user), including paired measured alignment profiles. It
+is a **standalone crate** — the binary is
 `analyze`, it has **no `simulator` dependency** (so it never drags in PyO3), and
 it reads sim parquet purely **by column name** with a drift guard that fails loud
 if the log schema moves.
@@ -26,6 +27,15 @@ sim run ──writes→ <log_dir>/raw/{request_*.parquet,cost_log/worker_*.parqu
                       │
   python analyzer/python render <log_dir> [subjects...]     (Python, this::python)
                       └─→ <log_dir>/plots/<subject>_*.png
+
+alignment profile ──writes→ <profile_log_dir>/{parsed.json,profile_result.json,...}
+alignment timing-predict ──writes→ <predict_log_dir>/{raw/,cases,config,input_manifest}
+alignment analyze ──reads completed roots + mapping
+                  └─writes→ <analysis_log_dir>/alignment_manifest.json
+                                           │
+  target/<build>/analyze alignment <analysis_log_dir> [subjects...] (Rust)
+                                           ├─→ reports/alignment_{iteration,e2e}_report.json
+                                           └─→ payloads/alignment_{iteration,e2e}_series.json
 ```
 
 - **Rust does all compute** — scans parquet via DataFusion (parallel vectorized
@@ -42,16 +52,20 @@ sim run ──writes→ <log_dir>/raw/{request_*.parquet,cost_log/worker_*.parqu
 | Command | Side | Effect |
 |---|---|---|
 | `analyze run <log_dir> [subjects...]` | Rust | Compute subjects → `reports/` + `payloads/`, plus a subject-less `reports/analyzer_timing.json` run-meta sidecar. No subjects = all applicable. |
+| `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E subjects into this analysis root. No subjects = both. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
 | `analyze list` | Rust | Print the subject catalog. |
 | `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNGs in `plots/`. No subjects = all renderers. |
 
 The **launcher** is the primary caller: `launcher.exec.run_analysis` runs the
-Rust `analyze run` then the Python `render` after each successful sim run. It is
-**best-effort** — a missing analyzer binary or a failed subject never fails the
-run (and `analyze` itself exits 0 even when individual subjects fail).
+Rust `analyze run` then the Python `render` after each successful sim run;
+`run_alignment_analysis` computes and renders the subjects enabled by the
+separate analyze phase config. Both execution paths are
+**best-effort** — a missing analyzer binary, failed handoff, or failed subject
+never fails the completed run.
 
-**Required from below** — a run directory written by the sim/L7, containing:
+**Required from below** — `analyze run` consumes a run directory written by the
+sim/L7, containing:
 
 - `raw/request_slo.parquet` and `raw/request_state.parquet` — subject inputs.
 - `raw/cost_log/worker_<pool_tag>_<worker_id>.parquet` plus matching
@@ -62,13 +76,20 @@ run (and `analyze` itself exits 0 even when individual subjects fail).
   throughput subject reads it to normalize per-GPU. Absent → treated as 1 GPU.
 
 All three are read as bare JSON / parquet by name — no `simulator` types crossed.
+The alignment path reads `<analysis_log_dir>/alignment_manifest.json`, which
+points to normalized NSYS JSON in the profile root, timing-predict cost
+parquet/manifest, the profile's `replay_result` TraceLab JSONL, sim request-SLO
+parquet, and exact sequence-row-to-operation labels. An operation may own one
+or more simulated leaf slots; its measured kernel durations are counted once
+and its folded slot workloads are summed. Reports, payloads, and plots stay in
+the analysis root; the input roots are never used as output directories.
 
 ## Directory map
 
 ```
 rust/                The `analyze` binary (DataFusion compute side).
-  src/main.rs          CLI (`run` / `list`); the best-effort per-subject dispatch
-                       loop; writes each (report, payload) + a run-timing report.
+  src/main.rs          CLI (`run` / `alignment` / `list`); the best-effort
+                       per-subject dispatch loop shared by both source scopes.
   src/registry.rs      THE SUBJECT CATALOG. `SUBJECTS` table + `run_subject`
                        dispatch + `select` (applicability gate). Adding a metric
                        touches only this file + a module under src/<category>/.
@@ -79,6 +100,9 @@ rust/                The `analyze` binary (DataFusion compute side).
                        serde output shapes (`MetricStats`, `CdfSeries`).
   src/request/         Category = per-request/session metrics (slo).
   src/throughput/      Category = serving-rate-over-time metrics (throughput).
+  src/alignment_iteration/  Per-iteration total/operation/kernel comparison.
+  src/alignment_e2e/        Paired request latency + completion throughput.
+  src/alignment_input.rs    Shared alignment manifest/path contract.
   src/trace/           Perfetto trace export from per-worker cost logs.
 
 python/              The render side (matplotlib over payload JSON).
@@ -86,6 +110,7 @@ python/              The render side (matplotlib over payload JSON).
                        runs figure jobs in parallel (fork processes; matplotlib
                        is thread-hostile).
   request/, throughput/  One renderer module per subject; returns figure "jobs".
+  alignment_iteration/, alignment_e2e/  Alignment payload renderers.
   common/              Shared plotting: payload loader + run-dir layout, figure
                        scaffolding, CDF plot, style.
 ```
@@ -106,8 +131,12 @@ Current catalog:
 | `slo-general` | request | `request_slo.parquet` scalar columns | TTFT/TPOT/E2E stats / per-metric CDF series |
 | `slo-detailed` | request | `request_slo.parquet` `output_token_times` column | ITL stats / CDF series when per-token logging is enabled |
 | `throughput` | throughput | `request_state.parquet` (+ `run_meta.json`) | per-GPU prefill/decode/total TPS totals / fine `segments` + coarse `binned_segments` series |
+| `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping | total/mapping-group/kernel error stats / overview + per-iteration mapped stacks |
+| `alignment-e2e` | alignment-e2e | TraceLab replay JSONL + sim `request_slo.parquet` | paired TTFT/TPOT/E2E stats + completion throughput / throughput + error CDFs |
 
-**Deployment knowledge enters in exactly one place**: each subject's `Applies`
+The flat registry also carries a `Scope` (`run` or `alignment`) so default
+selection never points a normal-run subject at an alignment bundle or vice
+versa. **Deployment knowledge enters in exactly one place**: each subject's `Applies`
 gate. Tier-1 (uniform-envelope) metrics are `Applies::All` and stay
 deployment-blind; a deployment-shaped metric names the deployments it understands
 and `select` drops it (with a note) for runs it doesn't apply to. So "point the

@@ -40,6 +40,11 @@ This is the practical, code-matching reference. For the layer overview see
 __main__.py    CLI entry. Thin dispatch only: parse argv, apply --override,
                build once, then validate → expand → (dry-run | cache-report |
                run_single | run_sweep). No sim logic.
+alignment.py   Explicit alignment stage entry: sim, profile, timing-predict, and
+               analyze. No stage implicitly starts the next one.
+timing_predict.py
+               Offline per-building-block timing prediction from a minimal
+               YAML/JSON config; bypasses deployment schema expansion and DES.
 __init__.py    The importable public API (re-exports from schema/ + sweep).
 
 schema/        The single source of param truth on the Python side. Per-param
@@ -55,7 +60,8 @@ schema/        The single source of param truth on the Python side. Per-param
   argv.py        Concrete config tree → config file on disk + [binary, sub, path].
 
 exec.py        cargo_build (+ schema discovery, INV-8), the PyO3 subprocess env,
-               async `SimulationRunner` (one run subprocess), and `run_analysis`.
+               async `SimulationRunner`, `run_analysis`, and the measured-profile
+               `run_alignment_analysis` handoff.
 sweep.py       Top-level flow: `run_single` / `run_sweep`. Resume markers,
                parallel launch under a semaphore, sweep-axis aggregation contract.
 cache_build.py Prebuild profile.db per unique cache key, sequentially (INV-3),
@@ -475,13 +481,22 @@ the summary step is skipped.
 ## CLI
 
 ```
-python -m launcher <preset.yaml> [<preset2> ...] [--override path=value ...]
+python -m launcher <preset.yaml|json> [<preset2.yaml|json> ...]
+                   [--override path=value ...]
                    [--dry-run] [--cache-report] [--refresh]
                    [--build-type <cargo-profile>] [--profile [--profile-freq HZ]]
                    [--no-analyze] [--emit-backends [FILE]]
+python -m launcher timing-predict <config.yaml|json> [<config2.yaml|json> ...]
+                   [--build-type <cargo-profile>] [--no-analyze]
 python -m launcher list-params [--human] [--build-type ...]
+python -m launcher alignment sim <simulation.yaml|json> [simulation options]
+python -m launcher alignment profile <profile.yaml|json> [--dry-run]
+python -m launcher alignment timing-predict <timing_predict.yaml|json> [--build-type ...]
+python -m launcher alignment analyze <analyze.yaml|json> [--build-type ...]
 ```
 
+- Simulation presets, timing-predict configs, and all alignment stage inputs
+  accept YAML (`.yaml` / `.yml`) or JSON.
 - Multiple presets run as one batch; single vs. sweep is decided by how many
   configs the preset(s) expand to.
 - `--override path=value` patches the **nested** tree by dotted path
@@ -493,7 +508,73 @@ python -m launcher list-params [--human] [--build-type ...]
   writes the annotated `backends:` skeleton (stdout, or `FILE`), then exits — the
   starting point for a `backends_file` (see the `backends` section above).
 - `--profile` wraps a single run with `perf record` (skill `operate-profile-sim-speed`).
+- `timing-predict` evaluates explicit batch shapes without a workload, scheduler,
+  clock, or discrete-event simulation; its config is not a deployment preset.
 - `list-params` dumps the Rust-authoritative schema (`--human` for a table).
+
+### Staged simulation ↔ real profiling alignment
+
+`launcher alignment` is the only launch surface for a cost-model alignment run.
+It exposes four explicit stages with four independent configs:
+
+- `alignment sim` passes the simulation config through the ordinary
+  build → validate → expand → cache → run pipeline.
+- `alignment profile` uses the profiling config to launch the instrumented vLLM
+  server, NSYS capture, and TraceLab frontend, ending at normalized `parsed.json`.
+- `alignment timing-predict` pairs those completed artifacts, generates exact
+  predictor cases, and runs the offline predictor. Its arch/gpu target comes
+  from the simulation run's normalized `raw/params.json`, not the source preset.
+- `alignment analyze` assembles the analyzer manifest from completed artifact
+  directories and invokes only the enabled top-level alignment subjects.
+
+Keep `simulation.yaml`, `profile.yaml`, `timing_predict.yaml`, and `analyze.yaml`
+under one dated experiment directory. The simulation file is a normal preset.
+The other three schemas are parsed strictly by `launcher/alignment_config.py`;
+their relative paths are anchored to the declaring file.
+
+There is intentionally no automatic sequential mode. After `profile`, the user
+inspects `parsed.json` before writing the tagged `input_builder` policy in
+`timing_predict.yaml`. That phase writes cases, case map, generated generic
+predict config, predictor output, and `timing_predict_input_manifest.json` only
+under its own root. It does not know the analyze config or embedded kernel labels.
+`alignment analyze` later validates and snapshots the labeled folded inventory and writes
+`alignment_manifest.json`, reports, payloads, plots, and analyzer logs beneath
+the analysis root.
+The simulation's `workload.trace_files` should contain exactly the profiling
+config's `workload.frontend.path`. The check happens when `timing-predict` pairs
+the artifacts; a mismatch prints `[warn] alignment trace mismatch` but is
+non-fatal. The profiling workload selects a typed TraceLab
+frontend (`frontend.type: session` or `vibesim`) and supplies the current
+synthetic-text inputs directly as `text_file` and `tokenizer`. A request-builder
+tag should be introduced only when another construction path has real runtime
+dispatch; unrelated trace schemas are not normalized into one sparse row.
+
+Alignment v1 requires a direct `deployment: unified` result with one main group,
+one replica, and profile `server.tp_size: 1`. The first input-builder variant is
+`{type: vllm_text, measured_phase: forward, group_assignment: single}`. The
+labeled folded inventory belongs only to `analyze.yaml`; iteration and E2E
+analysis can be enabled independently.
+
+Example:
+
+```yaml
+# timing_predict.yaml
+schema_version: 1
+simulation_log_dir: ./simulation
+profile_log_dir: ./profile
+log_dir: ./timing_predict
+input_builder:
+  type: vllm_text
+  measured_phase: forward
+  group_assignment: single
+```
+
+```bash
+uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml
+uv run python -m launcher alignment profile logs/<experiment>/profile.yaml
+uv run python -m launcher alignment timing-predict logs/<experiment>/timing_predict.yaml
+uv run python -m launcher alignment analyze logs/<experiment>/analyze.yaml
+```
 
 See skill `operate-run-simulation` for preset/sweep authoring conventions and dated log
 dirs.

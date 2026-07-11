@@ -1,11 +1,21 @@
-"""CLI entry — thin dispatch, no sim logic (design §1.2.6).
+"""VibeSim launcher CLI dispatch — no simulation logic (L7 design).
 
-    python -m launcher path.json [more.json ...] [--override k=v ...]
-    python -m launcher list-params [--human]
+Modes:
 
-Positional `.json` paths only; single vs batch is decided by count. Sweep
-expansion happens inside `launcher.schema` regardless of how many presets were
-passed. No `--web` / `--tui` / `--gui` (UI deleted per discussion.md).
+    python -m launcher PRESET.{yaml,yml,json} [MORE_PRESETS ...] [run options]
+    python -m launcher timing-predict CONFIG.{yaml,yml,json} [MORE_CONFIGS ...]
+    python -m launcher alignment {sim,profile,timing-predict,analyze} ...
+    python -m launcher list-params [--human] [--build-type PROFILE]
+
+The default mode runs or sweeps deployment simulations. Its run options also
+expose validation-only (`--dry-run`), cache coverage (`--cache-report`), backend
+enumeration (`--emit-backends`), and simulator wallclock profiling (`--profile`)
+paths. YAML and JSON are accepted for simulation presets, timing-predict configs,
+and alignment stage configs.
+
+Single versus batch execution is decided by the number of expanded configs.
+Sweep expansion belongs to `launcher.schema`. No `--web` / `--tui` / `--gui`
+(UI deleted per discussion.md).
 """
 
 from __future__ import annotations
@@ -37,19 +47,26 @@ from .schema.loader import (
 
 
 def _build_argparse():
-    """The launcher's argparse: positional preset JSON paths + repeatable
+    """The launcher's argparse: positional preset paths + repeatable
     `--override key=value`. Adding a schema param needs no edit here (params come
     from the preset / `--override`, validated against the Rust schema)."""
     import argparse
 
     parser = argparse.ArgumentParser(
         prog="python -m launcher",
-        description="VibeSim launcher — run / sweep simulations from preset JSON.",
+        description="VibeSim launcher simulation mode — run or sweep YAML/JSON presets.",
+        epilog=(
+            "Other modes:\n"
+            "  python -m launcher timing-predict CONFIG.yaml|json [...]\n"
+            "  python -m launcher alignment {sim,profile,timing-predict,analyze} ...\n"
+            "  python -m launcher list-params [--human]"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "presets",
         nargs="*",
-        help="Preset JSON path(s). Multiple presets run as one batch.",
+        help="Simulation preset YAML/JSON path(s). Multiple presets run as one batch.",
     )
     parser.add_argument(
         "--override",
@@ -387,6 +404,13 @@ def _expand_manifest(
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
+    # `alignment` exposes explicit workflow stages. Its `sim` handler re-enters
+    # this main function, so dispatch must short-circuit before preset parsing.
+    if argv and argv[0] == "alignment":
+        from .alignment import main as run_alignment
+
+        return run_alignment(argv[1:])
+
     # `timing-predict` runs the offline per-building-block timing predictor. Its
     # config is a minimal arch+cases file, NOT a deployment RunConfig, so it has its
     # own handler that bypasses schema expansion / sweeps entirely.
@@ -410,7 +434,10 @@ def main(argv: list[str] | None = None) -> int:
 
     args = _build_argparse().parse_args(argv)
     if not args.presets:
-        sys.exit("no preset given; usage: python -m launcher path.json [...]")
+        sys.exit(
+            "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
+            "(or choose timing-predict, alignment, or list-params)"
+        )
 
     # INV-8 / design §1.2.3: the single shared build per batch. Building also
     # runs `list-params` → deployment_schema.json (§1.2.7), so this is what

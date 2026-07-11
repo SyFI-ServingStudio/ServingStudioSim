@@ -1,0 +1,4 @@
+interface:
+  display_name: "Align with vLLM"
+  short_description: "Run VibeSim and vLLM alignment end to end"
+  default_prompt: "Use $operate-align-with-vllm to run a four-phase VibeSim-to-vLLM alignment experiment."

@@ -1,0 +1,517 @@
+"""CPU contract tests for the v1 alignment preparation and analyzer stack."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+from alignment.profiler import nsys_capture, vllm_server
+from alignment.profiler.config import NsysConfig
+from alignment.timing_predict_input.vllm_text import build_cases
+from launcher.alignment_config import load_labeled_kernel_sequences
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_cuda_profiler_api_nsys_prefix_targets_spawned_worker(tmp_path):
+    prefix = nsys_capture.build_nsys_prefix(
+        NsysConfig(capture_mode="cuda_profiler_api"), tmp_path / "profile"
+    )
+
+    assert "--trace-fork-before-exec=true" in prefix
+    assert "--capture-range=cudaProfilerApi" in prefix
+    assert "--capture-range-end=stop" in prefix
+
+
+def test_structured_vllm_iteration_record_is_the_only_metrics_contract(tmp_path):
+    record = {
+        "schema_version": 1,
+        "input_adapter": "vllm_text",
+        "iteration_index": 7,
+        "prefill_tokens": 8,
+        "decode_requests": 2,
+        "decode_tokens_scheduled": 2,
+        "prefill_chunk_pairs": [[4, 8]],
+        "decode_kv_lens": [100, 120],
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "Iteration(6): 1 context requests, 8 context tokens, "
+        "2 generation requests, 2 generation tokens\n"
+        f"INFO VibeSimAlignmentIteration {json.dumps(record)}\n"
+    )
+    output = tmp_path / "metrics.jsonl"
+
+    assert vllm_server.extract_metrics_jsonl(server_log, output) == 1
+    assert json.loads(output.read_text()) == record
+
+
+def test_vllm_text_adapter_preserves_exact_shape_and_join():
+    parsed = {
+        "iteration_details": [
+            {
+                "iteration": 34,
+                "metrics": {
+                    "schema_version": 1,
+                    "input_adapter": "vllm_text",
+                    "prefill_tokens": 8,
+                    "decode_requests": 2,
+                    "decode_tokens_scheduled": 2,
+                    "prefill_chunk_pairs": [[4, 8]],
+                    "decode_kv_lens": [100, 120],
+                },
+                "ranges": [{"phase": "forward", "kernel_count": 2}],
+            }
+        ]
+    }
+    cases, case_map, excluded = build_cases(parsed, "forward")
+
+    assert cases == [
+        {
+            "groups": [
+                {
+                    "prefill_chunk_pairs": [[4, 8]],
+                    "decode_kv_lens": [100, 120],
+                }
+            ]
+        }
+    ]
+    assert case_map == [{"case_index": 0, "measured_iteration": 34, "stage": "mixed"}]
+    assert excluded == []
+
+
+def _labeled_doc(phases: dict | None = None) -> dict:
+    return {
+        "schema_version": 2,
+        "encoding": "folded-v1",
+        "source_parsed": "profile/parsed.json",
+        "folding_policy": {
+            "kind": "exact_contiguous_repeat",
+            "match_fields": ["name", "suggested_category"],
+            "row_identity": "sequence_id:expanded_ordinal",
+        },
+        "phases": phases
+        or {
+            "forward": {
+                "unique_sequences": [
+                    {
+                        "sequence_id": "sequence_a",
+                        "iterations": [34],
+                        "expanded_kernel_count": 1,
+                        "program": [
+                            {
+                                "kernels": [
+                                    {
+                                        "name": "attention_kernel",
+                                        "suggested_category": "attention",
+                                        "label": {
+                                            "status": "mapped",
+                                            "operation": "attention",
+                                            "type": "attention",
+                                            "role": "attention main",
+                                            "simulated_slots": ["unified.attn"],
+                                        },
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+    }
+
+
+def test_labeled_sequences_require_explicit_status(tmp_path):
+    path = tmp_path / "kernel_sequences_labeled.json"
+    doc = _labeled_doc()
+    del doc["phases"]["forward"]["unique_sequences"][0]["program"][0]["kernels"][0]["label"]
+    path.write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="must contain name, suggested_category, and label"):
+        load_labeled_kernel_sequences(path)
+
+
+def test_labeled_sequences_validate_embedded_operation(tmp_path):
+    path = tmp_path / "kernel_sequences_labeled.json"
+    doc = _labeled_doc()
+    path.write_text(json.dumps(doc))
+    normalized = load_labeled_kernel_sequences(path)
+    label = normalized["phases"]["forward"]["unique_sequences"][0]["program"][0]["kernels"][0][
+        "label"
+    ]
+    assert label["operation"] == "attention"
+    assert label["simulated_slots"] == ["unified.attn"]
+
+
+def test_labeled_sequences_accept_multiple_simulated_slots(tmp_path):
+    path = tmp_path / "kernel_sequences_labeled.json"
+    doc = _labeled_doc()
+    label = doc["phases"]["forward"]["unique_sequences"][0]["program"][0]["kernels"][0]["label"]
+    label["simulated_slots"] = ["unified.attn.main", "unified.attn.combine"]
+    path.write_text(json.dumps(doc))
+
+    normalized = load_labeled_kernel_sequences(path)
+
+    assert normalized["phases"]["forward"]["unique_sequences"][0]["program"][0]["kernels"][0][
+        "label"
+    ]["simulated_slots"] == ["unified.attn.main", "unified.attn.combine"]
+
+
+@pytest.mark.parametrize("slots", [[], ["unified.attn", "unified.attn"]])
+def test_labeled_sequences_reject_invalid_simulated_slots(tmp_path, slots):
+    path = tmp_path / "kernel_sequences_labeled.json"
+    doc = _labeled_doc()
+    label = doc["phases"]["forward"]["unique_sequences"][0]["program"][0]["kernels"][0]["label"]
+    label["simulated_slots"] = slots
+    path.write_text(json.dumps(doc))
+
+    with pytest.raises(ValueError, match="simulated_slots"):
+        load_labeled_kernel_sequences(path)
+
+
+def test_labeled_sequences_reject_slot_shared_by_different_operations(tmp_path):
+    path = tmp_path / "kernel_sequences_labeled.json"
+    doc = _labeled_doc()
+    sequence = doc["phases"]["forward"]["unique_sequences"][0]
+    second = json.loads(json.dumps(sequence["program"][0]["kernels"][0]))
+    second["name"] = "second_kernel"
+    second["label"]["operation"] = "second_operation"
+    sequence["program"][0]["kernels"].append(second)
+    sequence["expanded_kernel_count"] = 2
+    path.write_text(json.dumps(doc))
+
+    with pytest.raises(ValueError, match="belongs to multiple operations"):
+        load_labeled_kernel_sequences(path)
+
+
+def test_labeled_sequences_reject_inconsistent_slots_for_one_operation(tmp_path):
+    path = tmp_path / "kernel_sequences_labeled.json"
+    doc = _labeled_doc()
+    sequence = doc["phases"]["forward"]["unique_sequences"][0]
+    second = json.loads(json.dumps(sequence["program"][0]["kernels"][0]))
+    second["name"] = "second_kernel"
+    second["label"]["simulated_slots"] = ["unified.attn.other"]
+    sequence["program"][0]["kernels"].append(second)
+    sequence["expanded_kernel_count"] = 2
+    path.write_text(json.dumps(doc))
+
+    with pytest.raises(ValueError, match="inconsistent label metadata"):
+        load_labeled_kernel_sequences(path)
+
+
+def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
+    analyzer = REPO_ROOT / "target" / "debug" / "analyze"
+    if not analyzer.is_file():
+        pytest.skip("build analyzer first")
+
+    profile = tmp_path / "profile"
+    predict = tmp_path / "timing_predict"
+    analysis = tmp_path / "analysis"
+    sim = tmp_path / "sim"
+    (predict / "raw" / "cost_manifest").mkdir(parents=True)
+    (predict / "raw" / "cost_log").mkdir(parents=True)
+    (sim / "raw").mkdir(parents=True)
+    profile.mkdir(exist_ok=True)
+    analysis.mkdir()
+
+    manifest = {
+        "sections": [
+            {
+                "section": "iter",
+                "slots": [
+                    {"name": "unified.qkv", "kind": "single_gemm", "config": ""},
+                    {"name": "unified.attn", "kind": "flashinfer_attn_decode", "config": ""},
+                    {"name": "unified.attn.combine", "kind": "elementwise", "config": ""},
+                    {"name": "unified.lm_head", "kind": "single_gemm", "config": ""},
+                ],
+                "nodes": [
+                    {"Sum": {"children": {"start": 1, "end": 5}}},
+                    {"Leaf": 0},
+                    {"Leaf": 1},
+                    {"Leaf": 2},
+                    {"Leaf": 3},
+                ],
+                "node_labels": ["unified", None, None, None, None],
+            }
+        ]
+    }
+    (predict / "raw" / "cost_manifest" / "worker_predict_0.json").write_text(json.dumps(manifest))
+    pq.write_table(
+        pa.table(
+            {
+                "pool_tag": ["predict", "predict"],
+                "worker_id": pa.array([0, 0], type=pa.uint16()),
+                "iter_id": pa.array([0, 1], type=pa.uint64()),
+                "section": ["iter", "iter"],
+                "total_time_ms": [3.8, 4.2],
+                "slot_time_ms": pa.array(
+                    [[2.2, 0.8, 0.3, 0.5], [2.4, 0.9, 0.3, 0.6]],
+                    type=pa.list_(pa.float32()),
+                ),
+            }
+        ),
+        predict / "raw" / "cost_log" / "worker_predict_0.parquet",
+    )
+
+    parsed = {
+        "schema_version": 2,
+        "kernel_names": {"1": "nvjet_qkv", "2": "flashinfer_decode", "3": "nvjet_lm_head"},
+        "iteration_details": [
+            _measured_iteration(34, 2_000_000, 1_000_000, 500_000),
+            _measured_iteration(35, 2_100_000, 1_100_000, 600_000),
+        ],
+    }
+    parsed_path = profile / "parsed.json"
+    parsed_path.write_text(json.dumps(parsed))
+    case_map = predict / "timing_predict_case_map.json"
+    case_map.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cases": [
+                    {"case_index": 0, "measured_iteration": 34, "stage": "decode"},
+                    {"case_index": 1, "measured_iteration": 35, "stage": "decode"},
+                ],
+            }
+        )
+    )
+    labeled = predict / "kernel_sequences_labeled.json"
+
+    def mapped(name, category, operation, kernel_type, role, slots):
+        return {
+            "name": name,
+            "suggested_category": category,
+            "label": {
+                "status": "mapped",
+                "operation": operation,
+                "type": kernel_type,
+                "role": role,
+                "simulated_slots": slots,
+            },
+        }
+
+    labeled.write_text(
+        json.dumps(
+            _labeled_doc(
+                {
+                    "forward": {
+                        "unique_sequences": [
+                            {
+                                "sequence_id": "sequence_forward",
+                                "iterations": [34, 35],
+                                "expanded_kernel_count": 2,
+                                "program": [
+                                    {
+                                        "kernels": [
+                                            mapped(
+                                                "nvjet_qkv",
+                                                "gemm_or_cutlass",
+                                                "dense_gemm",
+                                                "gemm",
+                                                "qkv projection",
+                                                ["unified.qkv"],
+                                            ),
+                                            mapped(
+                                                "flashinfer_decode",
+                                                "attention",
+                                                "attention",
+                                                "attention",
+                                                "decode attention",
+                                                ["unified.attn", "unified.attn.combine"],
+                                            ),
+                                        ]
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                    "postprocess": {
+                        "unique_sequences": [
+                            {
+                                "sequence_id": "sequence_postprocess",
+                                "iterations": [34, 35],
+                                "expanded_kernel_count": 1,
+                                "program": [
+                                    {
+                                        "kernels": [
+                                            mapped(
+                                                "nvjet_lm_head",
+                                                "gemm_or_cutlass",
+                                                "model.lm_head",
+                                                "gemm",
+                                                "final vocabulary projection",
+                                                ["unified.lm_head"],
+                                            )
+                                        ]
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+    )
+
+    replay = profile / "replay.jsonl"
+    replay.write_text("\n".join([_replay_row("1", 1.0, 1.2), _replay_row("2", 1.0, 1.3)]))
+    pq.write_table(
+        pa.table(
+            {
+                "request_id": pa.array([1, 2], type=pa.uint32()),
+                "completed": [True, True],
+                "arrival_time_ms": [0.0, 0.0],
+                "num_output_tokens": pa.array([10, 10], type=pa.uint32()),
+                "ttft_ms": pa.array([40.0, 50.0], type=pa.float32()),
+                "tpot_mean_ms": pa.array([18.0, 25.0], type=pa.float32()),
+                "finish_decode_time_ms": pa.array([200.0, 300.0], type=pa.float32()),
+            }
+        ),
+        sim / "raw" / "request_slo.parquet",
+    )
+
+    (profile / "profile_result.json").write_text(json.dumps({"log_dir": str(profile)}))
+    (analysis / "alignment_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "profile_log_dir": str(profile),
+                "simulation_log_dir": str(sim),
+                "analysis_log_dir": str(analysis),
+                "parsed_nsys": str(parsed_path),
+                "replay_result": str(replay),
+                "predict_log_dir": str(predict),
+                "timing_predict_case_map": str(case_map),
+                "labeled_kernel_sequences": str(labeled),
+                "iteration": {"enabled": True},
+                "e2e": {"enabled": True, "throughput_bins": 4},
+            }
+        )
+    )
+
+    subprocess.run([str(analyzer), "alignment", str(analysis)], cwd=REPO_ROOT, check=True)
+    subprocess.run(
+        [
+            str(REPO_ROOT / ".venv" / "bin" / "python"),
+            str(REPO_ROOT / "analyzer" / "python"),
+            "render",
+            str(analysis),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+
+    iteration_report = json.loads(
+        (analysis / "reports" / "alignment_iteration_report.json").read_text()
+    )
+    iteration_payload = json.loads(
+        (analysis / "payloads" / "alignment_iteration_series.json").read_text()
+    )
+    e2e_report = json.loads((analysis / "reports" / "alignment_e2e_report.json").read_text())
+    assert iteration_report["mapping"]["coverage"]["measured_duration_fraction"] == 1.0
+    assert len(iteration_report["kernels"]) == 3
+    assert iteration_report["iterations"][0]["measured_ms"] == 3.5
+    breakdown = iteration_payload["breakdowns"][0]
+    assert "operations" not in breakdown
+    assert [kernel["name"] for kernel in breakdown["measured_kernels"]] == [
+        "nvjet_qkv",
+        "flashinfer_decode",
+        "nvjet_lm_head",
+    ]
+    assert [kernel["phase"] for kernel in breakdown["measured_kernels"]] == [
+        "forward",
+        "forward",
+        "postprocess",
+    ]
+    assert [kernel["calls"] for kernel in breakdown["measured_kernels"]] == [1, 1, 1]
+    assert [kernel["name"] for kernel in breakdown["simulated_kernels"]] == [
+        "unified.qkv",
+        "unified.attn",
+        "unified.attn.combine",
+        "unified.lm_head",
+    ]
+    assert [kernel["multiplicity"] for kernel in breakdown["simulated_kernels"]] == [1, 1, 1, 1]
+    assert [phase["phase"] for phase in breakdown["phase_summary"]] == [
+        "forward",
+        "postprocess",
+    ]
+    assert [item["operation"] for item in breakdown["operation_summary"]] == [
+        "attention",
+        "dense_gemm",
+        "model.lm_head",
+    ]
+    attention = next(
+        item for item in breakdown["operation_summary"] if item["operation"] == "attention"
+    )
+    assert attention["measured_ms"] == 1.0
+    assert attention["simulated_ms"] == pytest.approx(1.1)
+    attention_mapping = next(
+        item
+        for item in iteration_report["mapping"]["operations"]
+        if item["operation"] == "attention"
+    )
+    assert attention_mapping["simulated_slots"] == [
+        "unified.attn",
+        "unified.attn.combine",
+    ]
+    assert e2e_report["meta"]["paired_requests"] == 2
+    assert (analysis / "plots" / "alignment_iteration_overview.png").is_file()
+    assert (analysis / "plots" / "alignment_iteration_34_breakdown.png").is_file()
+    assert (analysis / "plots" / "alignment_e2e_completion_throughput.png").is_file()
+
+
+def _measured_iteration(iteration: int, gemm_ns: int, attention_ns: int, lm_head_ns: int) -> dict:
+    return {
+        "iteration": iteration,
+        "iteration_type": "decode",
+        "ranges": [
+            {
+                "device_id": 0,
+                "phase": "forward",
+                "kernel_busy_union_ns": gemm_ns + attention_ns,
+                "kernels": [
+                    {"name_id": 1, "category": "gemm_or_cutlass", "start_ns": 0, "end_ns": gemm_ns},
+                    {
+                        "name_id": 2,
+                        "category": "attention",
+                        "start_ns": gemm_ns,
+                        "end_ns": gemm_ns + attention_ns,
+                    },
+                ],
+            },
+            {
+                "device_id": 0,
+                "phase": "postprocess",
+                "kernels": [
+                    {
+                        "name_id": 3,
+                        "category": "gemm_or_cutlass",
+                        "start_ns": gemm_ns + attention_ns,
+                        "end_ns": gemm_ns + attention_ns + lm_head_ns,
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def _replay_row(request_id: str, submit: float, complete: float) -> str:
+    return json.dumps(
+        {
+            "source": {"type": "vibe_sim_request", "data": {"id": request_id}},
+            "outcome": {
+                "status": "SUCCESS",
+                "submit_timestamp": submit,
+                "post_timestamp": submit,
+                "complete_timestamp": complete,
+                "output_len_actual": 10,
+                "first_token_ms": 40.0,
+                "total_duration_ms": (complete - submit) * 1000.0,
+            },
+        }
+    )

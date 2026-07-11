@@ -59,6 +59,7 @@ top-split-model-into-kernels - break a model forward into the VibeSim kernel seq
 
 operate-run-simulation - run deployment simulations from presets (DES, workload trace)
 operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
+operate-align-with-vllm - run four-phase measured VibeSim-to-vLLM alignment and label folded kernel positions
 operate-gpu-spec - query or update the GPU spec catalog
 operate-profile-sim-speed - profile simulator wallclock speed
 operate-profile-existing-kernel - query or fill registered profiler rows

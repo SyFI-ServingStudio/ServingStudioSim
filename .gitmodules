@@ -1,0 +1,8 @@
+[submodule "alignment/load_generator/tracelab"]
+	path = alignment/load_generator/tracelab
+	url = https://github.com/serendipity-zk/TraceLab.git
+	branch = vibesim
+[submodule "alignment/profiler/vllm"]
+	path = alignment/profiler/vllm
+	url = https://github.com/serendipity-zk/vllm.git
+	branch = moesim-profile

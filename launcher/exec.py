@@ -222,7 +222,13 @@ async def run_analysis(
     if (
         await _timed_step(
             "analyze render",
-            [sys.executable, str(REPO_ROOT / "analyzer" / "python"), "render", str(log_dir), *subjects],
+            [
+                sys.executable,
+                str(REPO_ROOT / "analyzer" / "python"),
+                "render",
+                str(log_dir),
+                *subjects,
+            ],
         )
         != 0
     ):
@@ -234,6 +240,54 @@ async def run_analysis(
     # defaults rather than through the subject catalog. Best-effort like the rest.
     if await _timed_step("analyze trace", [str(analyzer), "trace", str(log_dir)]) != 0:
         print(f"[analyze] trace failed for {log_dir}")
+
+
+async def run_alignment_analysis(
+    log_dir: Path,
+    build_type: str = "debug",
+    subjects: list[str] | None = None,
+) -> None:
+    """Compute and render the two measured↔simulated alignment subjects."""
+    analyzer = analyzer_binary_path(build_type)
+    if not analyzer.exists():
+        print(f"[analyze] {analyzer} not built; skipping alignment analysis for {log_dir}")
+        return
+
+    stdout_log = log_dir / "stdout.log"
+
+    async def run_step(section: str, argv: list[str]) -> int:
+        started = time.perf_counter()
+        rc, out = await _run_capture(argv)
+        elapsed_ms = (time.perf_counter() - started) * 1e3
+        with stdout_log.open("a") as fh:
+            fh.write(f"\n=== {section} [{elapsed_ms:.0f} ms] ===\n")
+            fh.write(out)
+            if out and not out.endswith("\n"):
+                fh.write("\n")
+        return rc
+
+    selected = subjects or ["alignment-iteration", "alignment-e2e"]
+    rc = await run_step(
+        "analyze alignment compute",
+        [str(analyzer), "alignment", str(log_dir), *selected],
+    )
+    if rc != 0:
+        print(f"[analyze] alignment compute failed for {log_dir}")
+        return
+    if (
+        await run_step(
+            "analyze alignment render",
+            [
+                sys.executable,
+                str(REPO_ROOT / "analyzer" / "python"),
+                "render",
+                str(log_dir),
+                *selected,
+            ],
+        )
+        != 0
+    ):
+        print(f"[analyze] alignment render failed for {log_dir}")
 
 
 async def run_iter_breakdown(log_dir: Path, build_type: str = "debug") -> None:

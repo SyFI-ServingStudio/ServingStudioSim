@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import multiprocessing
 import sys
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from pathlib import Path
-from typing import Callable
 
+from alignment_e2e import series_plot as alignment_e2e_plot
+from alignment_iteration import series_plot as alignment_iteration_plot
 from batch import kernel_throughput_plot, scatter_plot
 from conservation import workload_plot
 from kv import kv_occupancy_plot
@@ -31,7 +33,11 @@ RENDERERS = {
     "kernel-throughput": kernel_throughput_plot.render,
     "workload-conservation": workload_plot.render,
     "kv-occupancy": kv_occupancy_plot.render,
+    "alignment-iteration": alignment_iteration_plot.render,
+    "alignment-e2e": alignment_e2e_plot.render,
 }
+ALIGNMENT_SUBJECTS = ("alignment-iteration", "alignment-e2e")
+RUN_SUBJECTS = tuple(name for name in RENDERERS if name not in ALIGNMENT_SUBJECTS)
 
 
 def _invoke(job: Callable[[], Path]) -> Path:
@@ -43,11 +49,15 @@ def _run_jobs(jobs: list[Callable[[], Path]]) -> list[Path]:
     """Render every figure in parallel, one process per worker. Fork context (not
     spawn) so workers inherit `sys.path[0]` — the `analyzer/python` dir, needed to
     import `common.*` — and the already-`Agg`-configured matplotlib. matplotlib is
-    thread-hostile, so processes (not threads). max_workers defaults to cpu_count
-    and naturally uses fewer when there are fewer figures."""
+    thread-hostile, so processes (not threads). Cap the pool: alignment can emit
+    dozens of figures, while hundreds of forked matplotlib workers only multiply
+    memory pressure and make rendering slower."""
     if not jobs:
         return []
-    with ProcessPoolExecutor(mp_context=multiprocessing.get_context("fork")) as ex:
+    with ProcessPoolExecutor(
+        max_workers=min(len(jobs), 8),
+        mp_context=multiprocessing.get_context("fork"),
+    ) as ex:
         return list(ex.map(_invoke, jobs))
 
 
@@ -59,7 +69,14 @@ def main(argv: list[str]) -> int:
     if not log_dir.is_dir():
         print(f"not a directory: {log_dir}", file=sys.stderr)
         return 2
-    subjects = argv[2:] or list(RENDERERS)
+    # Mirror Rust's source Scope gate for the default-is-all behavior. The
+    # registry stays flat; the manifest identifies which artifact envelope this
+    # directory carries, so a normal run never probes alignment-only payloads
+    # and an alignment bundle never probes normal-run payloads.
+    default_subjects = (
+        ALIGNMENT_SUBJECTS if (log_dir / "alignment_manifest.json").is_file() else RUN_SUBJECTS
+    )
+    subjects = argv[2:] or default_subjects
     jobs: list[Callable[[], Path]] = []
     for subject in subjects:
         renderer = RENDERERS.get(subject)

@@ -1,5 +1,5 @@
-"""`python -m launcher timing-predict <config> [...]` — offline per-building-block
-timing prediction.
+"""`python -m launcher timing-predict CONFIG.{yaml,yml,json} [...]` — offline
+per-building-block timing prediction.
 
 A predict config is NOT a deployment `RunConfig` (it has no workload / pools /
 sweep — just one arch selector `{iter|attn|ffn}` + gpu + a cases file), so this
@@ -55,14 +55,21 @@ def _snapshot_inputs(config_path: Path, cfg: dict, log_dir: Path) -> None:
     """
     log_dir.mkdir(parents=True, exist_ok=True)
     try:
-        shutil.copy2(config_path, log_dir / config_path.name)
+        # Alignment generates its config directly in the predict root. Treat
+        # that as an already-complete snapshot instead of asking shutil to copy
+        # a file onto itself and obscuring the rest of the provenance step.
+        config_snapshot = log_dir / config_path.name
+        if config_path.resolve() != config_snapshot.resolve():
+            shutil.copy2(config_path, config_snapshot)
         cases_file = cfg.get("cases_file")
         if cases_file:
             cases_path = Path(cases_file)
             if not cases_path.is_absolute():
                 cases_path = config_path.parent / cases_path
             if cases_path.is_file():
-                shutil.copy2(cases_path, log_dir / cases_path.name)
+                cases_snapshot = log_dir / cases_path.name
+                if cases_path.resolve() != cases_snapshot.resolve():
+                    shutil.copy2(cases_path, cases_snapshot)
             else:
                 print(
                     f"[warn] cases_file {cases_path} not found; not snapshotted",
@@ -72,7 +79,12 @@ def _snapshot_inputs(config_path: Path, cfg: dict, log_dir: Path) -> None:
         print(f"[warn] failed to snapshot predict inputs into {log_dir}: {e}", file=sys.stderr)
 
 
-async def _run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
+async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
+    """Run one already-built predictor config.
+
+    Public so the alignment timing-predict stage can reuse the exact predictor
+    execution/snapshot path.
+    """
     cfg = _load_config(config_path)
     log_dir = Path(cfg["log_dir"])
     if not log_dir.is_absolute():
@@ -117,7 +129,7 @@ def main(argv: list[str]) -> int:
     if not configs:
         sys.exit(
             "timing-predict: no config given; usage: "
-            "python -m launcher timing-predict <config.json> [...]"
+            "python -m launcher timing-predict CONFIG.yaml|json [...]"
         )
 
     # INV-8: the single shared build (also produces the analyzer binary).
@@ -131,6 +143,6 @@ def main(argv: list[str]) -> int:
             print(f"[invalid] {c}: not a file", file=sys.stderr)
             rc = 2
             continue
-        if not asyncio.run(_run_one(config_path, build_type, analyze)):
+        if not asyncio.run(run_one(config_path, build_type, analyze)):
             rc = rc or 1
     return rc
