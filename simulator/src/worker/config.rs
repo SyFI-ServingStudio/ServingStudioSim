@@ -31,6 +31,16 @@ const BATCH_POLICY_CHOICES: [&str; 3] = [
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
+/// serde/param fallback for every worker selector's `gpu_time_multiplier`: 1.0
+/// = no inter-kernel overhead (kernel-folded time IS the wall time), so presets
+/// that omit the field keep their prior behavior. A worker scales the wall time
+/// it advances the clock by as `kernel_time * gpu_time_multiplier` (≥ 1.0);
+/// cost_log / manifest stay pre-scale (pure kernel), so the overhead surfaces as
+/// a gap between iter/section slices in the trace, never inside a kernel slice.
+fn default_gpu_time_multiplier() -> f64 {
+    1.0
+}
+
 /// Iteration-wise worker provider.
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -39,6 +49,11 @@ pub enum IterWorkerSel {
         /// GPU memory for the worker (GB; primarily KV cache budget).
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
     },
     /// Multi-group HP/DP worker: maintains one `Batch` per attention DP shard
     /// (count comes from the arch's `num_attn_dp_groups`). Pairs with a DP-attention
@@ -48,6 +63,11 @@ pub enum IterWorkerSel {
         /// DP shard's KV pool.
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
     },
     ChunkedPrefill {
         /// GPU memory for the worker (GB; primarily KV cache budget).
@@ -58,18 +78,33 @@ pub enum IterWorkerSel {
         /// How returning decode mixes with pending prefill.
         #[param(string, default = "mix", choices = BATCH_POLICY_CHOICES)]
         batch_policy: BatchPolicy,
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {
         /// GPU memory for the worker (GB; primarily KV cache budget).
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
     },
     /// PD decode half: admits already-prefilled requests straight into decode.
     PdDecode {
         /// GPU memory for the worker (GB; primarily KV cache budget).
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
     },
 }
 
@@ -82,11 +117,22 @@ pub enum AttnWorkerSel {
         /// GPU memory for the attention worker (GB; KV cache budget).
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
     },
 }
 
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FfnWorkerSel {
-    DisaggFfn {},
+    DisaggFfn {
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
+    },
 }

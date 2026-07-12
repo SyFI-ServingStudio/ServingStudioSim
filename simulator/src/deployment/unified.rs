@@ -60,9 +60,15 @@ impl Deployment for UnifiedDeployment {
         // `log_output_token_times` controls request_slo detail logging. The
         // worker *type* is matched against the arch in the arms below.
         // chunked_prefill is not wired yet.
-        let attn_gpu_memory_gb = match &g.worker {
-            IterWorkerSel::Barebone { attn_gpu_memory_gb }
-            | IterWorkerSel::HpUnified { attn_gpu_memory_gb } => *attn_gpu_memory_gb,
+        let (attn_gpu_memory_gb, gpu_time_multiplier) = match &g.worker {
+            IterWorkerSel::Barebone {
+                attn_gpu_memory_gb,
+                gpu_time_multiplier,
+            }
+            | IterWorkerSel::HpUnified {
+                attn_gpu_memory_gb,
+                gpu_time_multiplier,
+            } => (*attn_gpu_memory_gb, *gpu_time_multiplier),
             IterWorkerSel::ChunkedPrefill { .. } => {
                 bail!("unified: chunked_prefill worker not wired yet")
             }
@@ -74,6 +80,7 @@ impl Deployment for UnifiedDeployment {
             attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
             log_output_token_times: cfg.io.log_output_token_times,
             kv_log_stride: cfg.io.kv_log_stride,
+            gpu_time_multiplier,
             ..WorkerConfig::default()
         };
 

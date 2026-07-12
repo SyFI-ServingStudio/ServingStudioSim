@@ -263,6 +263,7 @@ fn run_iter_cases(
         PREDICT_POOL_TAG,
         WorkerId(0),
         model,
+        1.0, // predict = pure building-block cost; no inter-kernel overhead
     );
     let mut now = Time::from_ms(0.0);
     for (idx, case) in cases.into_iter().enumerate() {
@@ -300,6 +301,7 @@ fn run_attn_cases(
         PREDICT_POOL_TAG,
         WorkerId(0),
         &manifest,
+        1.0, // predict = pure building-block cost; no inter-kernel overhead
     );
     let mut now = Time::from_ms(0.0);
     for (idx, case) in cases.into_iter().enumerate() {
@@ -307,7 +309,7 @@ fn run_attn_cases(
             .into_groups(expected_groups)
             .with_context(|| format!("case {idx}"))?;
         let input = AttnArchInput { groups };
-        let agg = cost.run_section(
+        let seg = cost.run_section(
             "attn",
             0,
             idx as u64,
@@ -320,7 +322,7 @@ fn run_attn_cases(
                 None => model.attn_cost(0, &input, slots, scratch),
             },
         );
-        now += Time::from_ms(agg.m.time_ms as f64);
+        now += seg;
     }
     drop(cost);
     Ok(())
@@ -351,6 +353,7 @@ fn run_ffn_cases(
         PREDICT_POOL_TAG,
         WorkerId(0),
         &manifest,
+        1.0, // predict = pure building-block cost; no inter-kernel overhead
     );
     let mut now = Time::from_ms(0.0);
     for (idx, input) in cases.into_iter().enumerate() {
@@ -362,7 +365,7 @@ fn run_ffn_cases(
         let iid = idx as u64;
 
         // prologue (embedding), once per iteration.
-        let agg = cost.run_section(
+        let seg = cost.run_section(
             "prologue",
             -1,
             iid,
@@ -375,11 +378,11 @@ fn run_ffn_cases(
                 None => model.prologue_cost(&input, slots, scratch),
             },
         );
-        now += Time::from_ms(agg.m.time_ms as f64);
+        now += seg;
 
         // pre_attn bootstrap: layer-0 qkv (layers > 0 are fused into the prior
         // layer's post_attn, so only layer 0 has a standalone pre cost).
-        let agg = cost.run_section(
+        let seg = cost.run_section(
             "pre_attn",
             0,
             iid,
@@ -392,13 +395,13 @@ fn run_ffn_cases(
                 None => model.pre_attn_cost(0, &input, slots, scratch),
             },
         );
-        now += Time::from_ms(agg.m.time_ms as f64);
+        now += seg;
 
         // post_attn for a representative mid layer (Bridge: post(L) + fused pre(L+1)),
         // standing for every layer in [0, last). Only when there IS a mid layer.
         if num_layers >= 2 {
             let mid = (num_layers as usize - 1) / 2; // clearly < last for num_layers >= 2
-            let agg = cost.run_section(
+            let seg = cost.run_section(
                 "post_attn",
                 mid as i16,
                 iid,
@@ -411,11 +414,11 @@ fn run_ffn_cases(
                     None => model.post_attn_cost(mid, &input, slots, scratch),
                 },
             );
-            now += Time::from_ms(agg.m.time_ms as f64);
+            now += seg;
         }
 
         // post_attn terminal (last layer, post-only).
-        let agg = cost.run_section(
+        let seg = cost.run_section(
             "post_attn_last",
             last as i16,
             iid,
@@ -428,10 +431,10 @@ fn run_ffn_cases(
                 None => model.post_attn_cost(last, &input, slots, scratch),
             },
         );
-        now += Time::from_ms(agg.m.time_ms as f64);
+        now += seg;
 
         // epilogue (final_norm + lm_head), once per iteration.
-        let agg = cost.run_section(
+        let seg = cost.run_section(
             "epilogue",
             -1,
             iid,
@@ -444,7 +447,7 @@ fn run_ffn_cases(
                 None => model.epilogue_cost(&input, slots, scratch),
             },
         );
-        now += Time::from_ms(agg.m.time_ms as f64);
+        now += seg;
     }
     drop(cost);
     Ok(())

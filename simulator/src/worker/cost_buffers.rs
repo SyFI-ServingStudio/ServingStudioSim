@@ -112,6 +112,10 @@ pub struct CostBuffers {
     cache: HashMap<Box<[u32]>, SectionSnapshot, BuildHasherDefault<FlatHasher>>,
     /// Reused key buffer so a cache lookup allocates nothing on a hit.
     key_scratch: Vec<u32>,
+    /// GPU wall / kernel time multiplier (≥ 1.0): every segment's returned wall
+    /// Time is `kernel_time * gpu_time_multiplier` (inter-kernel overhead). From
+    /// the worker's [`WorkerConfig`]; 1.0 = no overhead (predict passes 1.0).
+    gpu_time_multiplier: f64,
 }
 
 impl CostBuffers {
@@ -125,6 +129,7 @@ impl CostBuffers {
         pool_tag: &'static str,
         worker_id: WorkerId,
         manifest: &CostManifestDoc,
+        gpu_time_multiplier: f64,
     ) -> Self {
         let logger = match log_dir {
             Some(dir) => match CostLogger::open(&dir, pool_tag, worker_id, manifest) {
@@ -145,6 +150,7 @@ impl CostBuffers {
             logger,
             cache: HashMap::default(),
             key_scratch: Vec::new(),
+            gpu_time_multiplier,
         }
     }
 
@@ -156,18 +162,24 @@ impl CostBuffers {
         pool_tag: &'static str,
         worker_id: WorkerId,
         model: &M,
+        gpu_time_multiplier: f64,
     ) -> Self {
         Self::new(
             log_dir,
             pool_tag,
             worker_id,
             &CostManifestDoc::single("iter", model.cost_log_manifest()),
+            gpu_time_multiplier,
         )
     }
 
     /// Run one building block's eval through `eval` and (if logging) write its
-    /// `cost_log` row, returning the section aggregate (the caller advances `now`
-    /// by `agg.m.time_ms`). `eval` is handed the reused `slots` + `scratch` buffers
+    /// `cost_log` row, returning the segment's **wall `Time`** = kernel-folded time
+    /// × this worker's `gpu_time_multiplier` (inter-kernel overhead). The `cost_log`
+    /// row it writes stays PRE-scale (pure kernel time); only the returned Time
+    /// carries the overhead, so the overhead surfaces as a gap between iter/section
+    /// slices in the trace, never inside a kernel slice. `eval` is handed the reused
+    /// `slots` + `scratch` buffers
     /// and an optional capture sink: `Some(inputs)` when a logger is attached (call
     /// the model's `*_with_inputs` method), `None` otherwise (call the plain `*_cost`
     /// method). `section` names the block (`attn` / `prologue` / `pre_attn` /
@@ -195,7 +207,7 @@ impl CostBuffers {
         cache_key: Option<&[u32]>,
         now: Time,
         eval: F,
-    ) -> LeafMetrics
+    ) -> Time
     where
         G: GroupLogSource,
         F: FnOnce(
@@ -247,7 +259,7 @@ impl CostBuffers {
                         tracing::warn!("cost_log record failed: {e}");
                     }
                 }
-                return agg;
+                return self.wall_time(&agg);
             }
         }
 
@@ -299,7 +311,15 @@ impl CostBuffers {
             }
             self.cache.insert(self.key_scratch.as_slice().into(), snap);
         }
-        agg
+        self.wall_time(&agg)
+    }
+
+    /// kernel-folded time → wall `Time`, applying this worker's inter-kernel
+    /// `gpu_time_multiplier` (≥ 1.0). The single place the overhead enters the
+    /// clock; `cost_log` rows are written pre-scale (pure kernel) by the callers
+    /// above, so folding a row's `slot_time_ms` still reproduces its `total_time_ms`.
+    fn wall_time(&self, agg: &LeafMetrics) -> Time {
+        Time::from_ms(agg.m.time_ms as f64 * self.gpu_time_multiplier)
     }
 
     /// Iter-wise convenience over [`run_section`](Self::run_section): the whole
@@ -316,7 +336,8 @@ impl CostBuffers {
     ) -> Time {
         // One batch per iteration today; AFD/TBO emit several batches sharing an
         // iter_id with distinct batch_id via `run_section` instead.
-        let agg = self.run_section(
+        // `run_section` already applies `gpu_time_multiplier` and returns wall Time.
+        self.run_section(
             "iter",
             -1,
             iter_id,
@@ -328,8 +349,7 @@ impl CostBuffers {
                 Some(i) => model.eval_iter_with_inputs(arch_input, slots, scratch, i),
                 None => model.eval_iter(arch_input, slots, scratch),
             },
-        );
-        Time::from_ms(agg.m.time_ms as f64)
+        )
     }
 }
 
@@ -434,7 +454,7 @@ mod tests {
     /// distinct key or a distinct section misses; `None` never caches.
     #[test]
     fn cache_hit_skips_eval_and_returns_cached_agg() {
-        let mut cost = CostBuffers::new(None, "attn", WorkerId(0), &trivial_manifest());
+        let mut cost = CostBuffers::new(None, "attn", WorkerId(0), &trivial_manifest(), 1.0);
         let a = vec![grp(&[10, 11])];
         let b = vec![grp(&[10, 12])];
         let (ka, kb) = ([7u32], [8u32]); // cheap caller identities (e.g. iter/slot)
@@ -454,8 +474,9 @@ mod tests {
             leaf(777.0)
         });
         assert_eq!(calls.get(), 1, "identical (section, cache_key) must hit");
-        assert_eq!(m0.m.time_ms, 2.5);
-        assert_eq!(m1.m.time_ms, 2.5, "hit replays the cached agg, not the closure");
+        // run_section returns wall Time (× gpu_time_multiplier = 1.0 here).
+        assert_eq!(m0.as_ms(), 2.5);
+        assert_eq!(m1.as_ms(), 2.5, "hit replays the cached agg, not the closure");
 
         // Distinct key -> miss.
         cost.run_section("attn", 2, 0, 0, &b, Some(&kb), now, |slots, _sc, _in| {
@@ -487,6 +508,29 @@ mod tests {
         assert_eq!(calls.get(), 5, "cache_key=None must always eval");
     }
 
+    /// `gpu_time_multiplier > 1` scales the RETURNED wall Time (× mult) while the
+    /// eval's kernel-folded time is untouched — the overhead lives only in the Time
+    /// the worker advances its clock by, never in the kernel cost itself. The cache
+    /// hit replays the same scaled wall Time.
+    #[test]
+    fn gpu_time_multiplier_scales_returned_wall_time() {
+        let mut cost = CostBuffers::new(None, "attn", WorkerId(0), &trivial_manifest(), 2.0);
+        let a = vec![grp(&[10, 11])];
+        let now = Time::from_ms(0.0);
+        // kernel-folded time = 2.5ms; wall = 2.5 × 2.0 = 5.0ms.
+        let miss = cost.run_section("attn", 0, 0, 0, &a, Some(&[7u32]), now, |slots, _sc, _in| {
+            slots.clear();
+            leaf(2.5)
+        });
+        assert_eq!(miss.as_ms(), 5.0);
+        // A cache hit (same section+key) replays the same scaled wall Time.
+        let hit = cost.run_section("attn", 1, 0, 0, &a, Some(&[7u32]), now, |slots, _sc, _in| {
+            slots.clear();
+            leaf(999.0)
+        });
+        assert_eq!(hit.as_ms(), 5.0);
+    }
+
     /// With a logger attached, every call still emits one `cost_log` row (a hit does
     /// not suppress logging), and the row carries THIS call's `layer` while sharing the
     /// cached `total_time_ms`.
@@ -498,6 +542,7 @@ mod tests {
             "attn",
             WorkerId(0),
             &trivial_manifest(),
+            1.0,
         );
         let a = vec![grp(&[10, 11])];
         let b = vec![grp(&[10, 12])];

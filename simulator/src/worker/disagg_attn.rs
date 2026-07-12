@@ -327,7 +327,13 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             .borrow_mut()
             .register_kv_capacity(pool_tag, pool.0, id.0, 0, kv_capacity);
         let kv = KvSampler::open_opt(cost_log_dir.as_deref(), pool_tag, id, 1, config.kv_log_stride);
-        let cost = CostBuffers::new(cost_log_dir, pool_tag, id, &model.cost_log_manifest());
+        let cost = CostBuffers::new(
+            cost_log_dir,
+            pool_tag,
+            id,
+            &model.cost_log_manifest(),
+            config.gpu_time_multiplier,
+        );
         Self {
             id,
             model,
@@ -878,7 +884,8 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         // slot. So (iter_id, slot) is a cheap, exact identity for that input — far
         // cheaper to key on than its O(batch) `decode_kv_lens` content.
         let cache_key = [iter_id as u32, (iter_id >> 32) as u32, idx as u32];
-        let m = self.cost.run_section(
+        // `run_section` returns wall Time (kernel × gpu_time_multiplier).
+        let seg = self.cost.run_section(
             "attn",
             layer as i16,
             iter_id,
@@ -891,7 +898,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
                 None => model.attn_cost(layer, input, s, sc),
             },
         );
-        self.slots[idx].compute_end = now + Time::from_ms(m.m.time_ms as f64);
+        self.slots[idx].compute_end = now + seg;
     }
 
     /// Rebuild slot `idx`'s cached attention input ([`slot_inputs`](Self::slot_inputs))

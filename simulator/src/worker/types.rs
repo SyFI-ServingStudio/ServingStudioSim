@@ -405,6 +405,12 @@ pub struct WorkerConfig {
     /// throttle). Larger = fewer rows / coarser occupancy series; `1` logs every
     /// iteration.
     pub kv_log_stride: u32,
+    /// GPU wall / kernel time multiplier (≥ 1.0): the worker advances its clock by
+    /// `kernel_time * gpu_time_multiplier`, modeling inter-kernel overhead not
+    /// attributed to any single kernel. 1.0 = no overhead. From the worker
+    /// selector; passed to `CostBuffers`, applied where a segment's wall time is
+    /// returned (cost_log stays pre-scale).
+    pub gpu_time_multiplier: f64,
 }
 
 impl Default for WorkerConfig {
@@ -415,6 +421,7 @@ impl Default for WorkerConfig {
             attn_kv_bytes: 80_000_000_000, // 80 GB
             log_output_token_times: false,
             kv_log_stride: 8,
+            gpu_time_multiplier: 1.0,
         }
     }
 }

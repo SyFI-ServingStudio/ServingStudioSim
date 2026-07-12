@@ -262,7 +262,7 @@ pools:
         }
         assert!(matches!(
             g.worker,
-            IterWorkerSel::Barebone { attn_gpu_memory_gb } if attn_gpu_memory_gb == 80.0
+            IterWorkerSel::Barebone { attn_gpu_memory_gb, .. } if attn_gpu_memory_gb == 80.0
         ));
         assert_eq!(cfg.io().log_level, LogLevel::Info);
         assert_eq!(cfg.workload().request_rate, 10.0);
@@ -395,7 +395,7 @@ pools:
         }
         assert!(matches!(
             a.pools.ffn.groups[0].worker,
-            FfnWorkerSel::DisaggFfn {}
+            FfnWorkerSel::DisaggFfn { .. }
         ));
     }
 
@@ -434,7 +434,7 @@ pools:
         }
         assert!(matches!(
             g.worker,
-            IterWorkerSel::HpUnified { attn_gpu_memory_gb } if attn_gpu_memory_gb == 80.0
+            IterWorkerSel::HpUnified { attn_gpu_memory_gb, .. } if attn_gpu_memory_gb == 80.0
         ));
     }
 }

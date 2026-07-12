@@ -112,7 +112,13 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
             // single-link bottleneck.
             c.register_comm_group(base, model.gpus_per_replica(), pool_tag, id.0)
         };
-        let cost = CostBuffers::new(cost_log_dir, pool_tag, id, &model.cost_log_manifest());
+        let cost = CostBuffers::new(
+            cost_log_dir,
+            pool_tag,
+            id,
+            &model.cost_log_manifest(),
+            config.gpu_time_multiplier,
+        );
         Self {
             id,
             model,
@@ -295,11 +301,15 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
         let model = Arc::clone(&self.model);
         let last = model.num_layers().saturating_sub(1) as usize;
         let bid = slot as u64;
-        let mut ms = 0.0f64;
+        // `run_section` returns wall Time (kernel × gpu_time_multiplier); accumulate
+        // it directly. `cursor` (each section's start, logged as its pre-scale
+        // wall_start_ms) advances by the post-scale wall time, so cost_log section
+        // starts reflect real wallclock and the overhead shows as inter-section gap.
+        let mut total = Time::ZERO;
         let mut cursor = start;
         match kind {
             FfnTaskKind::Bootstrap => {
-                let agg = self.cost.run_section(
+                let seg = self.cost.run_section(
                     "prologue",
                     -1,
                     iter_id,
@@ -312,10 +322,9 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                         None => model.prologue_cost(input, s, sc),
                     },
                 );
-                let t = agg.m.time_ms as f64;
-                ms += t;
-                cursor += Time::from_ms(t);
-                let agg = self.cost.run_section(
+                total += seg;
+                cursor += seg;
+                let seg = self.cost.run_section(
                     "pre_attn",
                     0,
                     iter_id,
@@ -328,12 +337,11 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                         None => model.pre_attn_cost(0, input, s, sc),
                     },
                 );
-                let t = agg.m.time_ms as f64;
-                ms += t;
-                cursor += Time::from_ms(t);
+                total += seg;
+                cursor += seg;
             }
             FfnTaskKind::Bridge { upstream } => {
-                let agg = self.cost.run_section(
+                let seg = self.cost.run_section(
                     "post_attn",
                     upstream as i16,
                     iter_id,
@@ -348,10 +356,10 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                         None => model.post_attn_cost(upstream as usize, input, s, sc),
                     },
                 );
-                ms += agg.m.time_ms as f64;
+                total += seg;
             }
             FfnTaskKind::Terminal => {
-                let agg = self.cost.run_section(
+                let seg = self.cost.run_section(
                     "post_attn_last",
                     last as i16,
                     iter_id,
@@ -364,10 +372,9 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                         None => model.post_attn_cost(last, input, s, sc),
                     },
                 );
-                let t = agg.m.time_ms as f64;
-                ms += t;
-                cursor += Time::from_ms(t);
-                let agg = self.cost.run_section(
+                total += seg;
+                cursor += seg;
+                let seg = self.cost.run_section(
                     "epilogue",
                     -1,
                     iter_id,
@@ -380,10 +387,10 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                         None => model.epilogue_cost(input, s, sc),
                     },
                 );
-                ms += agg.m.time_ms as f64;
+                total += seg;
             }
         }
-        Time::from_ms(ms)
+        total
     }
 
     fn finish_task(&mut self, task: FfnTask, now: Time, events: &mut Vec<FfnWorkerEvent>) {

@@ -188,16 +188,23 @@ fn worker_config(
     log_output_token_times: bool,
     kv_log_stride: u32,
 ) -> WorkerConfig {
-    let attn_gpu_memory_gb = match worker {
-        IterWorkerSel::PdPrefill { attn_gpu_memory_gb }
-        | IterWorkerSel::PdDecode { attn_gpu_memory_gb } => *attn_gpu_memory_gb,
+    let (attn_gpu_memory_gb, gpu_time_multiplier) = match worker {
+        IterWorkerSel::PdPrefill {
+            attn_gpu_memory_gb,
+            gpu_time_multiplier,
+        }
+        | IterWorkerSel::PdDecode {
+            attn_gpu_memory_gb,
+            gpu_time_multiplier,
+        } => (*attn_gpu_memory_gb, *gpu_time_multiplier),
         // ensure_* gates the worker tag before this is reached.
-        _ => 80.0,
+        _ => (80.0, 1.0),
     };
     WorkerConfig {
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
         kv_log_stride,
+        gpu_time_multiplier,
         ..WorkerConfig::default()
     }
 }

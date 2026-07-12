@@ -213,7 +213,8 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             LoadBalance::Single if num_groups > 1 => LoadBalance::RoundRobin { next: 0 },
             other => other,
         };
-        let cost = CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref());
+        let cost =
+            CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref(), config.gpu_time_multiplier);
         Self {
             id,
             model,

@@ -120,7 +120,8 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             .borrow_mut()
             .register_kv_capacity(pool_tag, pool.0, id.0, 0, kv_capacity);
         let kv = KvSampler::open_opt(cost_log_dir.as_deref(), pool_tag, id, 1, config.kv_log_stride);
-        let cost = CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref());
+        let cost =
+            CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref(), config.gpu_time_multiplier);
         // Arch invariant: `num_attn_shards() ≤ gpus_per_replica == gpus_per_worker`,
         // so no clamp against the worker's GPU range is needed — the model is
         // authoritative for shard count.
