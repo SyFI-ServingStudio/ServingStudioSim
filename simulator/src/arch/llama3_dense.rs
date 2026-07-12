@@ -307,11 +307,16 @@ impl Llama3DenseModel {
     /// `eval_iter` and `eval_iter_with_inputs`. The cursor must end at `n_slots`.
     fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
         let g = &batch.groups[0];
-        let m = g.batch_tokens;
-        self.embed
-            .eval(&ElementwiseKernelInput { num_tokens: m }, ev);
+        let batch_tokens = g.batch_tokens;
+        let request_count = g.request_count();
+        self.embed.eval(
+            &ElementwiseKernelInput {
+                num_tokens: batch_tokens,
+            },
+            ev,
+        );
         self.pre_attn
-            .eval(&PreAttnLocalWorkletInput { batch_tokens: m }, ev);
+            .eval(&PreAttnLocalWorkletInput { batch_tokens }, ev);
         self.attn.eval(
             &AttnLocalWorkletInput {
                 prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
@@ -320,9 +325,11 @@ impl Llama3DenseModel {
             ev,
         );
         self.post_attn
-            .eval(&PostAttnLocalWorkletInput { batch_tokens: m }, ev);
-        self.final_norm.eval(&RmsNormKernelInput { m }, ev);
-        self.lm_head.eval(&SingleGemmKernelInput { m }, ev);
+            .eval(&PostAttnLocalWorkletInput { batch_tokens }, ev);
+        self.final_norm
+            .eval(&RmsNormKernelInput { m: batch_tokens }, ev);
+        self.lm_head
+            .eval(&SingleGemmKernelInput { m: request_count }, ev);
     }
 }
 

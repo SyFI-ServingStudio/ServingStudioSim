@@ -343,9 +343,11 @@ impl Llama3DpAttnTpFfnModel {
     /// in the exact order [`cost_tree`](Self::cost_tree) minted slots: embed (pooled
     /// tokens), then ONE layer's `num_dp_groups` attn_block evals (one per DP shard,
     /// each with that shard's batch) followed by the FFN (pooled tokens) — the
-    /// `Scale{num_layers}` fold multiplies it — then final_norm, lm_head (pooled).
+    /// `Scale{num_layers}` fold multiplies it — then final_norm on pooled tokens
+    /// and lm_head on pooled requests.
     fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
         let m_total: u32 = batch.groups.iter().map(|g| g.batch_tokens).sum();
+        let request_count: u32 = batch.groups.iter().map(|g| g.request_count()).sum();
         self.embed.eval(
             &ElementwiseKernelInput {
                 num_tokens: m_total,
@@ -369,7 +371,8 @@ impl Llama3DpAttnTpFfnModel {
             ev,
         );
         self.final_norm.eval(&RmsNormKernelInput { m: m_total }, ev);
-        self.lm_head.eval(&SingleGemmKernelInput { m: m_total }, ev);
+        self.lm_head
+            .eval(&SingleGemmKernelInput { m: request_count }, ev);
     }
 }
 

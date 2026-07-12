@@ -598,10 +598,11 @@ impl Qwen3MoeDpAttnEpFfnModel {
     /// count), then `ep_size` moe_expert_compute evals (one per EP rank, uniform
     /// v1 → same input), then `num_dp_groups` moe_local_reduce evals (home
     /// reduce, per DP shard), then moe_combine (4 leaves on global token count).
-    /// The `Scale{num_layers}` fold multiplies one layer body. Finally
-    /// final_norm + lm_head on pooled tokens.
+    /// The `Scale{num_layers}` fold multiplies one layer body. Finally,
+    /// final_norm runs on pooled tokens and lm_head on pooled requests.
     fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
         let m_total: u32 = batch.groups.iter().map(|g| g.batch_tokens).sum();
+        let request_count: u32 = batch.groups.iter().map(|g| g.request_count()).sum();
         let global_expert_selections = m_total * self.top_k;
         let tokens_for_comm = u64::from(m_total);
 
@@ -669,7 +670,8 @@ impl Qwen3MoeDpAttnEpFfnModel {
         );
 
         self.final_norm.eval(&RmsNormKernelInput { m: m_total }, ev);
-        self.lm_head.eval(&SingleGemmKernelInput { m: m_total }, ev);
+        self.lm_head
+            .eval(&SingleGemmKernelInput { m: request_count }, ev);
     }
 }
 

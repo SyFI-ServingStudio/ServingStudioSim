@@ -30,6 +30,16 @@ pub struct ArchGroupInput {
 }
 
 impl ArchGroupInput {
+    /// Requests represented by this group's current non-speculative iteration.
+    ///
+    /// Each listed prefill chunk and decode KV length owns one request and one
+    /// lm-head row. Input modes with different logits semantics must use a
+    /// different ArchInput type instead of adding optional axes here.
+    pub fn request_count(&self) -> u32 {
+        u32::try_from(self.prefill_chunk_pairs.len() + self.decode_kv_lens.len())
+            .expect("ArchGroupInput request count must fit u32")
+    }
+
     /// Reset to an empty group, retaining `Vec` capacity. Lets a worker refill a
     /// held `UnifiedArchInput` in place each iteration instead of allocating a
     /// fresh group + growing `decode_kv_lens` from zero every forward pass.
@@ -40,6 +50,25 @@ impl ArchGroupInput {
         self.total_kv_len = 0;
         self.prefill_chunk_pairs.clear();
         self.decode_kv_lens.clear();
+    }
+}
+
+#[cfg(test)]
+mod arch_group_input_tests {
+    use super::ArchGroupInput;
+
+    #[test]
+    fn request_count_counts_prefill_and_decode_requests_not_tokens() {
+        let group = ArchGroupInput {
+            batch_tokens: 2048,
+            prefill_tokens: 2047,
+            decode_tokens: 1,
+            prefill_chunk_pairs: vec![(0, 512), (0, 512), (0, 512), (0, 511)],
+            decode_kv_lens: vec![512],
+            total_kv_len: 2560,
+        };
+
+        assert_eq!(group.request_count(), 5);
     }
 }
 

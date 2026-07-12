@@ -19,7 +19,9 @@ The arch never sees sim state; the worker never sees worklets/kernels.
   one) + `tokens_per_source_rank` (FFN routing view; empty for dense). An
   `ArchGroupInput` is the batch state: `batch_tokens`, the `prefill_tokens` /
   `decode_tokens` split, the `(prefix_len, append_len)` `prefill_chunk_pairs`,
-  `decode_kv_lens`, `total_kv_len`.
+  `decode_kv_lens`, `total_kv_len`. Its derived `request_count()` is the lm-head
+  row count for this non-speculative input type; modes with different logits
+  semantics use a different ArchInput type rather than optional future fields.
 - **`IterwiseUnifiedModel`** — the iter-wise query face (one call costs the whole
   iteration):
 
