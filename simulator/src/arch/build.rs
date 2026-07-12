@@ -375,7 +375,8 @@ mod tests {
         assert_eq!(model.dtype, DType::Bf16);
         assert_eq!(model.compute_dtype(), DType::Fp8E4m3);
         assert_eq!(model.kv_dtype, DType::Fp8E4m3);
-        assert_eq!(model.gemm_backends(), vec!["deepgemm"]);
+        assert_eq!(model.single_gemm_backends(), vec!["deepgemm"]);
+        assert_eq!(model.grouped_gemm_backends(), vec!["deepgemm"]);
 
         let q_dim = model.num_qo_heads as u64 * model.head_dim as u64;
         let kv_dim = model.num_kv_heads as u64 * model.head_dim as u64;
@@ -431,15 +432,16 @@ mod tests {
         assert_eq!(ffn_cfgs.moe_combine.dtype, DType::Fp8E4m3);
     }
 
-    /// The bf16 negative: no fp8 anywhere — GEMMs are `torch`, every dtype is the
-    /// base bf16, and the handoffs/KV are 2 bytes/elem.
+    /// The bf16 negative: no fp8 anywhere — dense GEMMs choose the faster Torch
+    /// layout, grouped GEMMs stay `torch`, and handoffs/KV are 2 bytes/elem.
     #[test]
     fn bf16_afd_configs_keep_torch_and_two_bytes_per_element() {
         use crate::timing::bridge::DType;
 
         let model = MoeModelCfg::qwen3_235b(); // fp8: false
         assert_eq!(model.compute_dtype(), DType::Bf16);
-        assert_eq!(model.gemm_backends(), vec!["torch"]);
+        assert_eq!(model.single_gemm_backends(), vec!["torch", "torch_linear"]);
+        assert_eq!(model.grouped_gemm_backends(), vec!["torch"]);
 
         let q_dim = model.num_qo_heads as u64 * model.head_dim as u64;
         let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
@@ -451,7 +453,10 @@ mod tests {
         );
         assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token, q_dim * 2);
         assert!(!attn_cfgs.attn_block.fp8);
-        assert_eq!(attn_cfgs.attn_block.gemm_backends, vec!["torch"]);
+        assert_eq!(
+            attn_cfgs.attn_block.gemm_backends,
+            vec!["torch", "torch_linear"]
+        );
         assert_eq!(attn_cfgs.attn_block.kv_dtype(), DType::Bf16);
     }
 }

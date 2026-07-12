@@ -39,7 +39,8 @@ use crate::worklet::{AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWo
 // Backend / fabric policy for this arch's attention block. Local copy — the AFD
 // archs are self-contained (no shared arch-level config).
 const NORM_BACKENDS: &[&str] = &["flashinfer"];
-// GEMM backends (qkv/o_proj) are chosen by dtype via `model.gemm_backends()`
+// GEMM backends (qkv/o_proj) are chosen by dtype via
+// `model.single_gemm_backends()`.
 // (torch / deepgemm). NOTE: only the `.attn` sub-kernel of the resolved block is
 // used on this AFD attn side, so these GEMM fields feed the head-split resolve
 // but do not reach the cost path here (the ffn side owns qkv/o_proj cost).
@@ -70,7 +71,7 @@ fn attn_block_config(
         allreduce_fabric: TP_FABRIC,
         gpu_name: gpu_name.to_string(),
         norm_backends: NORM_BACKENDS.to_vec(),
-        gemm_backends: model.gemm_backends(),
+        gemm_backends: model.single_gemm_backends(),
         attn_backends: ATTN_BACKENDS.to_vec(),
         kv_cache_append_backends: vec!["vllm_cuda"],
         kv_cache_block_size: 16,

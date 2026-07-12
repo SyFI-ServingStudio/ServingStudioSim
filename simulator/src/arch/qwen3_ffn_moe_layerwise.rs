@@ -108,9 +108,8 @@ pub struct Qwen3FfnMoeLayerwiseModel {
 // Backend / fabric policy for this arch. Local copy — the AFD archs are
 // self-contained (no shared arch-level config).
 const NORM_BACKENDS: &[&str] = &["flashinfer"];
-// Dense + grouped GEMM backends are dtype-driven, not a flat const: fp8 runs
-// select `deepgemm`, bf16 runs `torch` (via `MoeModelCfg::gemm_backends()`), so a
-// GEMM never lists a backend without rows for its dtype (would abort the build).
+// GEMM backends are dtype-driven, not a flat const: fp8 uses DeepGEMM; bf16
+// dense GEMMs compare both Torch layouts while grouped experts stay `torch`.
 const ACT_BACKENDS: &[&str] = &["triton"];
 // nccl + nvshmem for the collective/p2p ops: the cost engine evals both and
 // keeps the faster per op (best-of-N). MoE dispatch/combine (p2p_intra) and the
@@ -248,7 +247,7 @@ pub fn build_configs(
             tp_size: parallel.attn_tp_size,
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
-            gemm_backends: model.gemm_backends(),
+            gemm_backends: model.single_gemm_backends(),
         },
         // post-attn: row-parallel o_proj + optional tp_allreduce + post_norm + router.
         post_attn: PostAttnRouterTpWorkletConfig {
@@ -262,7 +261,7 @@ pub fn build_configs(
             allreduce_fabric: TP_FABRIC,
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
-            gemm_backends: model.gemm_backends(),
+            gemm_backends: model.single_gemm_backends(),
             allreduce_backends: ALLREDUCE_BACKENDS.to_vec(),
         },
         moe_dispatch: moe_net.clone(),
@@ -276,7 +275,7 @@ pub fn build_configs(
             dtype: model.compute_dtype(),
             gpu_name: gpu.clone(),
             act_backends: ACT_BACKENDS.to_vec(),
-            grouped_gemm_backends: model.gemm_backends(),
+            grouped_gemm_backends: model.grouped_gemm_backends(),
             local_ppm,
         },
         moe_local_reduce: ElementwiseKernelConfig {
@@ -299,7 +298,7 @@ pub fn build_configs(
             dtype: model.dtype,
         },
         lm_head: SingleGemmKernelConfig {
-            backends: model.gemm_backends(),
+            backends: model.single_gemm_backends(),
             gpu_name: gpu.clone(),
             n: model.vocab,
             k: model.hidden,

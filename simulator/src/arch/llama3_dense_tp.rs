@@ -41,7 +41,7 @@ use crate::worklet::{
 };
 
 const NORM_BACKENDS: &[&str] = &["flashinfer"];
-const GEMM_BACKENDS: &[&str] = &["torch"];
+const GEMM_BACKENDS: &[&str] = &["torch", "torch_linear"];
 const ACT_BACKENDS: &[&str] = &["triton"];
 // See llama3_dense: FlashInfer impls registered under fa2/fa3, not "flashinfer".
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];

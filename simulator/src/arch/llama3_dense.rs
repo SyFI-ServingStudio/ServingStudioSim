@@ -35,7 +35,7 @@ use crate::worklet::{
 };
 
 const NORM_BACKENDS: &[&str] = &["flashinfer"];
-const GEMM_BACKENDS: &[&str] = &["torch"];
+const GEMM_BACKENDS: &[&str] = &["torch", "torch_linear"];
 const ACT_BACKENDS: &[&str] = &["triton"];
 // Attention backends are FlashInfer *implementations* (the profiler registers
 // `flashinfer_attn_{prefill,decode,rect}` under `fa2`/`fa3`/`trt`/`cudnn`), NOT a

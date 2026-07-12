@@ -97,13 +97,19 @@ impl MoeModelCfg {
         self
     }
 
-    /// GEMM backend list for this run: the FP8 DeepGEMM backend when fp8, else
-    /// torch. The same choice serves `single_gemm` (qkv / o_proj / router /
-    /// lm_head) and `grouped_gemm` (MoE experts) — both have exactly these two
-    /// backends and fp8 ⇒ deepgemm. Exactly ONE backend by dtype, never both: a
-    /// `torch@fp8` or `deepgemm@bf16` lookup has no rows and would abort the
-    /// build (`MissingEntry`), not fall back.
-    pub fn gemm_backends(&self) -> Vec<&'static str> {
+    /// Candidate implementations for dense single GEMMs. BF16/FP16 evaluates
+    /// both RHS layouts and keeps the faster cache result per runtime shape.
+    pub fn single_gemm_backends(&self) -> Vec<&'static str> {
+        if self.fp8 {
+            vec!["deepgemm"]
+        } else {
+            vec!["torch", "torch_linear"]
+        }
+    }
+
+    /// Grouped expert GEMMs have no `F.linear` analogue; keep their dtype-driven
+    /// backend separate from the dense single-GEMM candidate set.
+    pub fn grouped_gemm_backends(&self) -> Vec<&'static str> {
         if self.fp8 {
             vec!["deepgemm"]
         } else {

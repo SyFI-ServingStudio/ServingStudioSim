@@ -75,9 +75,9 @@ use crate::worklet::{
 };
 
 const NORM_BACKENDS: &[&str] = &["flashinfer"];
-// Dense + grouped GEMM backends are dtype-driven (`MoeModelCfg::gemm_backends()`):
-// fp8 runs select the FP8-only `deepgemm`, bf16 runs `torch`. A GEMM never lists a
-// backend without rows for its dtype (that would abort the build at prewarm).
+// GEMM backends are dtype-driven by `MoeModelCfg`: fp8 uses DeepGEMM; bf16
+// dense GEMMs compare both Torch weight layouts while grouped experts stay on
+// their one registered Torch implementation.
 const ACT_BACKENDS: &[&str] = &["triton"];
 // See llama3_dense: FlashInfer impls registered under fa2/fa3, not "flashinfer".
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];
@@ -199,7 +199,7 @@ fn attn_block_config(
         allreduce_fabric: TP_FABRIC,
         gpu_name: gpu_name.to_string(),
         norm_backends: NORM_BACKENDS.to_vec(),
-        gemm_backends: model.gemm_backends(),
+        gemm_backends: model.single_gemm_backends(),
         attn_backends: ATTN_BACKENDS.to_vec(),
         kv_cache_append_backends: vec!["vllm_cuda"],
         kv_cache_block_size: 16,
@@ -287,7 +287,7 @@ pub fn build_configs(
             compute_dtype: model.compute_dtype(),
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
-            gemm_backends: model.gemm_backends(),
+            gemm_backends: model.single_gemm_backends(),
         },
         moe_dispatch: moe_net.clone(),
         // MoE expert compute is all-fp8 in an fp8 run (grouped GEMMs + SwiGLU act);
@@ -300,7 +300,7 @@ pub fn build_configs(
             dtype: model.compute_dtype(),
             gpu_name: gpu.clone(),
             act_backends: ACT_BACKENDS.to_vec(),
-            grouped_gemm_backends: model.gemm_backends(),
+            grouped_gemm_backends: model.grouped_gemm_backends(),
             local_ppm,
         },
         // Conservative v1 model: per home-rank token, read+write one full hidden
@@ -329,7 +329,7 @@ pub fn build_configs(
         },
         // Replicated full lm_head for v1 (vocab-parallel split deferred).
         lm_head: SingleGemmKernelConfig {
-            backends: model.gemm_backends(),
+            backends: model.single_gemm_backends(),
             gpu_name: gpu.clone(),
             n: model.vocab,
             k: model.hidden,
