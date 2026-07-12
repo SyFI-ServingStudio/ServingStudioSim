@@ -38,8 +38,8 @@ def profile_single_gemm(
         def kernel():
             return torch.mm(a, b)
 
-        # cupti samples adaptively until convergence (kernel-only, cold L2),
-        # no warmup; kernel_name=None sums the GEMM kernel(s) in the window.
+        # Timer.cupti read-displaces L2 before each logical launch and excludes
+        # the reduction kernel from the returned GEMM-only duration.
         time_ms = Timer.cupti(kernel)
         energy_j = Energy.perf(
             kernel,
@@ -163,7 +163,8 @@ def profile_grouped_gemm(
         def kernel():
             return torch._grouped_mm(a, w, offs=offs)
 
-        # cupti times the single grouped kernel (kernel-only, cold L2, no warmup).
+        # cupti applies the shared read-displacement policy and reports only the
+        # grouped callable's kernel time.
         time_ms = Timer.cupti(kernel)
         energy_j = Energy.perf(
             kernel,

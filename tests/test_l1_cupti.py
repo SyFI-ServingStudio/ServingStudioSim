@@ -94,6 +94,7 @@ def test_cupti_profile_until_converged_stops_early_for_stable_kernel():
         run_matmul,
         device=device,
         batch=10,
+        min_duration_ms=0,
         min_iter=20,
         max_iter=500,
         tol=0.01,
@@ -108,12 +109,12 @@ def test_cupti_profile_until_converged_stops_early_for_stable_kernel():
     assert summary.min_ms <= summary.median_ms <= summary.max_ms
 
 
-def test_timer_cupti_default_path_converges_on_real_gpu():
+def test_timer_cupti_duration_path_runs_on_real_gpu():
     torch = _require_cuda_cupti()
     from profiling.profilers.timer import Timer
 
     _, run_matmul = _make_matmul_callable(torch)
 
-    # No rep => adaptive convergence path end to end.
-    time_ms = Timer.cupti(run_matmul, max_rep=200)
+    # Keep the GPU-tier test short while exercising estimate -> formal capture.
+    time_ms = Timer.cupti(run_matmul, min_duration_ms=10, max_rep=100_000)
     assert 0 < time_ms < 100

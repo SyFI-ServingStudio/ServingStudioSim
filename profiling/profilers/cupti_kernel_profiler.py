@@ -11,7 +11,7 @@ import os
 import site
 from collections.abc import Callable
 from dataclasses import dataclass
-from math import sqrt
+from math import ceil, sqrt
 from pathlib import Path
 from statistics import fmean, median, stdev
 from typing import Any
@@ -58,6 +58,14 @@ class KernelProfileSummary:
     clear_l2_between_launches: bool
     per_iter_ms: list[float]
     matched_kernel_count_per_run: list[int]
+
+
+@dataclass(frozen=True)
+class _LaunchPattern:
+    """Exact CUPTI kernel-name pattern for one callable and one L2 clear."""
+
+    callable_kernel_names: tuple[str, ...]
+    clear_kernel_names: tuple[str, ...]
 
 
 def _require_torch() -> Any:
@@ -146,10 +154,15 @@ def default_l2_flush_bytes(device: int | str | Any = 0) -> int:
 
 
 def clear_l2_cache(buffer: Any) -> None:
-    # Launch a write kernel over a buffer larger than L2, then sync so the next
-    # measured interval starts from a cold-ish cache state.
+    """Read-displace L2, then synchronize before the next measured interval.
+
+    A reduction over a buffer larger than L2 leaves mostly clean cache lines and
+    avoids the dirty writeback pressure created by ``zero_()``/memset clears.
+    This is a cold-ish cache preconditioner, not a hardware invalidate.
+    """
+
     torch_mod = _require_torch()
-    buffer.zero_()
+    buffer.sum()
     torch_mod.cuda.synchronize(buffer.device)
 
 
@@ -193,6 +206,142 @@ def match_kernel_records(
     return records
 
 
+def _ordered_records(records: list[KernelRecord]) -> list[KernelRecord]:
+    """Return a deterministic launch order for one synchronized capture."""
+
+    return sorted(
+        records,
+        key=lambda record: (record.start_ns, record.end_ns, record.correlation_id),
+    )
+
+
+def _prepare_launch_pattern(
+    profiler: CuptiKernelProfiler,
+    fn: Callable[[], object],
+    *,
+    clear_l2_before_run: bool,
+    clear_l2_between_launches: bool,
+    kernel_name_contains: str | None,
+) -> _LaunchPattern:
+    """Probe one callable launch and the inter-launch L2 clear separately.
+
+    A multi-launch capture also records the clear-buffer kernels. Remembering
+    the complete ordered patterns lets the measured burst be split by position,
+    rather than guessing from implementation names that may be shared by an
+    unrelated target kernel.
+    """
+
+    callable_records = _ordered_records(
+        profiler.capture_once(
+            fn,
+            launches_per_run=1,
+            clear_l2_before_run=clear_l2_before_run,
+            clear_l2_between_launches=False,
+        )
+    )
+    match_kernel_records(
+        callable_records,
+        kernel_name_contains=kernel_name_contains,
+    )
+
+    clear_records: list[KernelRecord] = []
+    if clear_l2_between_launches:
+        clear_records = _ordered_records(
+            profiler.capture_once(
+                lambda: profiler._clear_buffer.sum(),
+                launches_per_run=1,
+                clear_l2_before_run=False,
+                clear_l2_between_launches=False,
+            )
+        )
+        if not clear_records:
+            raise RuntimeError("No CUPTI kernel records captured for the L2 clear")
+
+    return _LaunchPattern(
+        callable_kernel_names=tuple(record.name for record in callable_records),
+        clear_kernel_names=tuple(record.name for record in clear_records),
+    )
+
+
+def _capture_launch_unit(
+    profiler: CuptiKernelProfiler,
+    fn: Callable[[], object],
+    *,
+    launches_per_run: int,
+    clear_l2_before_run: bool,
+    clear_l2_between_launches: bool,
+    kernel_name_contains: str | None,
+    launch_pattern: _LaunchPattern | None,
+) -> tuple[list[float], set[str], list[int]]:
+    """Capture one unit and return one duration/count per logical callable run."""
+
+    records = _ordered_records(
+        profiler.capture_once(
+            fn,
+            launches_per_run=launches_per_run,
+            clear_l2_before_run=clear_l2_before_run,
+            clear_l2_between_launches=clear_l2_between_launches,
+        )
+    )
+    if launches_per_run == 1:
+        matched = match_kernel_records(
+            records,
+            kernel_name_contains=kernel_name_contains,
+        )
+        return (
+            [sum(record.duration_ns for record in matched) / 1e6],
+            {record.name for record in matched},
+            [len(matched)],
+        )
+
+    if launch_pattern is None:
+        raise RuntimeError("multi-launch CUPTI capture requires a launch pattern")
+
+    callable_count = len(launch_pattern.callable_kernel_names)
+    clear_count = len(launch_pattern.clear_kernel_names)
+    expected_count = launches_per_run * callable_count
+    if clear_l2_between_launches:
+        expected_count += (launches_per_run - 1) * clear_count
+    if len(records) != expected_count:
+        raise RuntimeError(
+            "CUPTI multi-launch record count changed: "
+            f"expected={expected_count}, captured={len(records)}"
+        )
+
+    cursor = 0
+    per_launch_ms: list[float] = []
+    matched_kernel_names: set[str] = set()
+    matched_kernel_counts: list[int] = []
+    for launch_index in range(launches_per_run):
+        callable_records = records[cursor : cursor + callable_count]
+        cursor += callable_count
+        callable_names = tuple(record.name for record in callable_records)
+        if callable_names != launch_pattern.callable_kernel_names:
+            raise RuntimeError(
+                "CUPTI callable kernel pattern changed inside the multi-launch "
+                f"capture at logical launch {launch_index}"
+            )
+        matched = match_kernel_records(
+            callable_records,
+            kernel_name_contains=kernel_name_contains,
+        )
+        per_launch_ms.append(sum(record.duration_ns for record in matched) / 1e6)
+        matched_kernel_names.update(record.name for record in matched)
+        matched_kernel_counts.append(len(matched))
+
+        if clear_l2_between_launches and launch_index + 1 < launches_per_run:
+            clear_records = records[cursor : cursor + clear_count]
+            cursor += clear_count
+            clear_names = tuple(record.name for record in clear_records)
+            if clear_names != launch_pattern.clear_kernel_names:
+                raise RuntimeError(
+                    "CUPTI L2-clear kernel pattern changed inside the multi-launch "
+                    f"capture after logical launch {launch_index}"
+                )
+
+    return per_launch_ms, matched_kernel_names, matched_kernel_counts
+
+
 class CuptiKernelProfiler:
     """Reusable CUPTI profiler for CUDA callables that launch kernels."""
 
@@ -212,14 +361,12 @@ class CuptiKernelProfiler:
 
         self._profiler = _get_extension().CuptiKernelActivityProfiler()
         self.clear_l2_bytes = (
-            default_l2_flush_bytes(self.device)
-            if clear_l2_bytes is None
-            else clear_l2_bytes
+            default_l2_flush_bytes(self.device) if clear_l2_bytes is None else clear_l2_bytes
         )
-        self._clear_buffer = torch_mod.empty(
+        self._clear_buffer = torch_mod.ones(
             self.clear_l2_bytes // 4,
             device=self.device,
-            dtype=torch_mod.int32,
+            dtype=torch_mod.float32,
         )
 
     def clear_l2_cache(self) -> None:
@@ -235,13 +382,13 @@ class CuptiKernelProfiler:
         # Only fires when launches_per_run > 1 (it cools L2 between the launches
         # batched into one capture window); with the usual launches_per_run == 1
         # it is a no-op and clear_l2_before_run already gives each launch cold L2.
-        # Caveat: this flush runs INSIDE the capture window, so with
-        # launches_per_run > 1 it is captured by CUPTI -- pass a kernel_name filter
-        # there so the zero_() kernel is not summed into the measured time.
+        # Caveat: this read-displacement reduction runs INSIDE the capture
+        # window. Multi-launch parsing identifies its exact record pattern and
+        # excludes it from the callable's reported kernel time.
         for launch_idx in range(launches_per_run):
             fn()
             if clear_l2_between_launches and launch_idx + 1 < launches_per_run:
-                self._clear_buffer.zero_()
+                self._clear_buffer.sum()
 
     def capture_once(
         self,
@@ -327,8 +474,9 @@ class CuptiKernelProfiler:
         *,
         num_warmup: int = 0,
         batch: int = 10,
+        min_duration_ms: int = 2_000,
         min_iter: int = 20,
-        max_iter: int = 500,
+        max_iter: int = 5_000_000,
         tol: float = 0.01,
         launches_per_run: int = 1,
         clear_l2_before_run: bool = True,
@@ -337,21 +485,28 @@ class CuptiKernelProfiler:
     ) -> KernelProfileSummary:
         """Sample per-kernel timings until the mean estimate converges, then stop.
 
-        CUPTI records each launch's true kernel duration, so a stable kernel
-        converges in a few dozen samples -- far cheaper than a fixed huge count
-        whose per-launch CUPTI overhead dominates. We sample in ``batch`` bursts
-        and stop once ``relative_sem`` (the mean's relative standard error) drops
-        below ``tol``, bounded by ``[min_iter, max_iter]``. ``num_warmup`` defaults
-        to 0: each captured launch is L2-flushed and independent, and convergence
-        absorbs a cold first sample on its own.
+        CUPTI records each launch's true kernel duration. We sample in ``batch``
+        bursts and stop only after the matched kernels have accumulated
+        ``min_duration_ms`` of GPU active time and ``relative_sem`` (the mean's
+        relative standard error) drops below ``tol``. ``max_iter`` is a hard
+        safety cap: reaching it before both conditions raises rather than
+        returning a measurement shorter than the requested duration.
+
+        ``num_warmup`` defaults to 0: each captured launch is L2-flushed and
+        independent, and convergence absorbs a cold first sample on its own.
+        Set ``min_duration_ms=0`` only for a deliberately duration-free diagnostic.
         """
 
         if batch <= 0:
             raise ValueError("batch must be positive")
+        if min_duration_ms < 0:
+            raise ValueError("min_duration_ms must be >= 0")
         if min_iter < 2:
             raise ValueError("min_iter must be >= 2")
         if max_iter < min_iter:
             raise ValueError("max_iter must be >= min_iter")
+        if max_iter < launches_per_run:
+            raise ValueError("max_iter must cover at least one launches_per_run unit")
 
         torch_mod = _require_torch()
         for _ in range(num_warmup):
@@ -367,22 +522,52 @@ class CuptiKernelProfiler:
         per_iter_ms: list[float] = []
         matched_kernel_names: set[str] = set()
         matched_kernel_count_per_run: list[int] = []
+        launch_pattern = None
+        if launches_per_run > 1:
+            launch_pattern = _prepare_launch_pattern(
+                self,
+                fn,
+                clear_l2_before_run=clear_l2_before_run,
+                clear_l2_between_launches=clear_l2_between_launches,
+                kernel_name_contains=kernel_name_contains,
+            )
+        accumulated_kernel_ms = 0.0
         while len(per_iter_ms) < max_iter:
             for _ in range(batch):
-                records = self.capture_once(
+                if len(per_iter_ms) + launches_per_run > max_iter:
+                    break
+                (
+                    unit_per_launch_ms,
+                    unit_kernel_names,
+                    unit_kernel_counts,
+                ) = _capture_launch_unit(
+                    self,
                     fn,
                     launches_per_run=launches_per_run,
                     clear_l2_before_run=clear_l2_before_run,
                     clear_l2_between_launches=clear_l2_between_launches,
+                    kernel_name_contains=kernel_name_contains,
+                    launch_pattern=launch_pattern,
                 )
-                matched = match_kernel_records(records, kernel_name_contains=kernel_name_contains)
-                per_iter_ms.append(sum(record.duration_ns for record in matched) / 1e6)
-                matched_kernel_names.update(record.name for record in matched)
-                matched_kernel_count_per_run.append(len(matched))
-                if len(per_iter_ms) >= max_iter:
-                    break
-            if len(per_iter_ms) >= min_iter and relative_sem(per_iter_ms) < tol:
+                per_iter_ms.extend(unit_per_launch_ms)
+                accumulated_kernel_ms += sum(unit_per_launch_ms)
+                matched_kernel_names.update(unit_kernel_names)
+                matched_kernel_count_per_run.extend(unit_kernel_counts)
+            duration_reached = accumulated_kernel_ms >= min_duration_ms
+            converged = len(per_iter_ms) >= min_iter and relative_sem(per_iter_ms) < tol
+            if duration_reached and converged:
                 break
+
+        duration_reached = accumulated_kernel_ms >= min_duration_ms
+        converged = len(per_iter_ms) >= min_iter and relative_sem(per_iter_ms) < tol
+        if not duration_reached or not converged:
+            raise RuntimeError(
+                "CUPTI reached max_iter before satisfying the measurement "
+                f"contract: iterations={len(per_iter_ms)}, "
+                f"accumulated_kernel_ms={accumulated_kernel_ms:.6f}, "
+                f"min_duration_ms={min_duration_ms}, "
+                f"relative_sem={relative_sem(per_iter_ms):.6g}, tol={tol}"
+            )
 
         return KernelProfileSummary(
             matched_kernel_names=sorted(matched_kernel_names),
@@ -399,6 +584,110 @@ class CuptiKernelProfiler:
             matched_kernel_count_per_run=matched_kernel_count_per_run,
         )
 
+    def profile_for_duration(
+        self,
+        fn: Callable[[], object],
+        *,
+        num_warmup: int = 0,
+        estimate_iter: int = 10,
+        min_duration_ms: int = 2_000,
+        min_iter: int = 20,
+        max_iter: int = 5_000_000,
+        clear_l2_before_run: bool = True,
+        clear_l2_between_launches: bool = True,
+        kernel_name_contains: str | None = None,
+    ) -> KernelProfileSummary:
+        """Estimate a launch count, then measure it in one CUPTI window.
+
+        The estimator records ``estimate_iter`` real callable launches and uses
+        their kernel-only mean to size ``ceil(min_duration_ms / estimate_ms)``.
+        The formal measurement is exactly one uninterrupted CUPTI activity
+        window containing that many logical launches. This keeps the requested
+        active-time budget without injecting periodic capture restarts into the
+        workload's power/clock state.
+
+        By default every logical launch starts after a read-only reduction over
+        the L2-displacement buffer. The clear kernels are captured for ordering
+        validation but excluded from the callable's reported duration. Explicit
+        flags remain available for warm-cache diagnostics.
+        """
+
+        if num_warmup < 0:
+            raise ValueError("num_warmup must be >= 0")
+        if estimate_iter <= 0:
+            raise ValueError("estimate_iter must be positive")
+        if min_duration_ms < 0:
+            raise ValueError("min_duration_ms must be >= 0")
+        if min_iter <= 0:
+            raise ValueError("min_iter must be positive")
+        if max_iter < min_iter:
+            raise ValueError("max_iter must be >= min_iter")
+
+        torch_mod = _require_torch()
+        for _ in range(num_warmup):
+            self._run_launch_burst(
+                fn,
+                launches_per_run=1,
+                clear_l2_between_launches=clear_l2_between_launches,
+            )
+        if num_warmup:
+            torch_mod.cuda.synchronize(self.device)
+
+        launch_pattern = _prepare_launch_pattern(
+            self,
+            fn,
+            clear_l2_before_run=clear_l2_before_run,
+            clear_l2_between_launches=clear_l2_between_launches,
+            kernel_name_contains=kernel_name_contains,
+        )
+        estimate_ms, _, _ = _capture_launch_unit(
+            self,
+            fn,
+            launches_per_run=estimate_iter,
+            clear_l2_before_run=clear_l2_before_run,
+            clear_l2_between_launches=clear_l2_between_launches,
+            kernel_name_contains=kernel_name_contains,
+            launch_pattern=launch_pattern,
+        )
+        estimate_mean_ms = fmean(estimate_ms)
+        if estimate_mean_ms <= 0:
+            raise RuntimeError(f"CUPTI duration estimate must be positive, got {estimate_mean_ms}")
+
+        formal_iter = max(ceil(min_duration_ms / estimate_mean_ms), min_iter)
+        if formal_iter > max_iter:
+            raise RuntimeError(
+                "CUPTI estimated launch count exceeds max_iter: "
+                f"estimate_mean_ms={estimate_mean_ms:.9f}, "
+                f"min_duration_ms={min_duration_ms}, "
+                f"formal_iter={formal_iter}, max_iter={max_iter}"
+            )
+
+        per_iter_ms, matched_kernel_names, matched_kernel_count_per_run = (
+            _capture_launch_unit(
+                self,
+                fn,
+                launches_per_run=formal_iter,
+                clear_l2_before_run=clear_l2_before_run,
+                clear_l2_between_launches=clear_l2_between_launches,
+                kernel_name_contains=kernel_name_contains,
+                launch_pattern=launch_pattern,
+            )
+        )
+        return KernelProfileSummary(
+            matched_kernel_names=sorted(matched_kernel_names),
+            mean_ms=fmean(per_iter_ms),
+            median_ms=median(per_iter_ms),
+            min_ms=min(per_iter_ms),
+            max_ms=max(per_iter_ms),
+            num_warmup=num_warmup,
+            num_iter=len(per_iter_ms),
+            launches_per_run=formal_iter,
+            clear_l2_bytes=self.clear_l2_bytes,
+            clear_l2_between_launches=clear_l2_between_launches,
+            per_iter_ms=per_iter_ms,
+            matched_kernel_count_per_run=matched_kernel_count_per_run,
+        )
+
 
 def profile_kernel(
     fn: Callable[[], object],
@@ -409,7 +698,7 @@ def profile_kernel(
     launches_per_run: int = 1,
     clear_l2_bytes: int | None = None,
     clear_l2_before_run: bool = True,
-    clear_l2_between_launches: bool = False,
+    clear_l2_between_launches: bool = True,
     kernel_name_contains: str | None = None,
 ) -> KernelProfileSummary:
     profiler = CuptiKernelProfiler(device=device, clear_l2_bytes=clear_l2_bytes)
@@ -430,13 +719,14 @@ def profile_kernel_until_converged(
     device: int | str | Any = "cuda",
     num_warmup: int = 0,
     batch: int = 10,
+    min_duration_ms: int = 2_000,
     min_iter: int = 20,
-    max_iter: int = 500,
+    max_iter: int = 5_000_000,
     tol: float = 0.01,
     launches_per_run: int = 1,
     clear_l2_bytes: int | None = None,
     clear_l2_before_run: bool = True,
-    clear_l2_between_launches: bool = False,
+    clear_l2_between_launches: bool = True,
     kernel_name_contains: str | None = None,
 ) -> KernelProfileSummary:
     profiler = CuptiKernelProfiler(device=device, clear_l2_bytes=clear_l2_bytes)
@@ -444,10 +734,39 @@ def profile_kernel_until_converged(
         fn,
         num_warmup=num_warmup,
         batch=batch,
+        min_duration_ms=min_duration_ms,
         min_iter=min_iter,
         max_iter=max_iter,
         tol=tol,
         launches_per_run=launches_per_run,
+        clear_l2_before_run=clear_l2_before_run,
+        clear_l2_between_launches=clear_l2_between_launches,
+        kernel_name_contains=kernel_name_contains,
+    )
+
+
+def profile_kernel_for_duration(
+    fn: Callable[[], object],
+    *,
+    device: int | str | Any = "cuda",
+    num_warmup: int = 0,
+    estimate_iter: int = 10,
+    min_duration_ms: int = 2_000,
+    min_iter: int = 20,
+    max_iter: int = 5_000_000,
+    clear_l2_bytes: int | None = None,
+    clear_l2_before_run: bool = True,
+    clear_l2_between_launches: bool = True,
+    kernel_name_contains: str | None = None,
+) -> KernelProfileSummary:
+    profiler = CuptiKernelProfiler(device=device, clear_l2_bytes=clear_l2_bytes)
+    return profiler.profile_for_duration(
+        fn,
+        num_warmup=num_warmup,
+        estimate_iter=estimate_iter,
+        min_duration_ms=min_duration_ms,
+        min_iter=min_iter,
+        max_iter=max_iter,
         clear_l2_before_run=clear_l2_before_run,
         clear_l2_between_launches=clear_l2_between_launches,
         kernel_name_contains=kernel_name_contains,

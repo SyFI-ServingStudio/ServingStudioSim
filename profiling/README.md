@@ -54,6 +54,23 @@ This is why `KernelKind` strings must match exactly across the boundary (below).
 - The `profilers/` timing primitives (`Timer.cupti`, `Energy.perf`, the CUPTI
   C++ extension).
 
+`Timer.cupti`'s duration path is a two-pass GPU-active-time measurement. It
+first records 10 real callable launches, computes
+`ceil(min_duration_ms / estimate_mean_ms)`, then records exactly that many
+launches in one uninterrupted CUPTI activity window. The default budget is
+2000 ms; `min_rep` floors the formal launch count and `max_rep` is a hard safety
+cap. By default, both passes run a read-only reduction over a 64 MiB (or
+`2 × reported L2`, whichever is larger) FP32 tensor before every logical
+callable launch. The reduction's CUPTI records validate ordering but are
+excluded from the callable time. This clean-line displacement avoids the dirty
+writeback artifact of memset/`zero_()`; it remains a cold-ish preconditioner,
+not a hardware invalidate. `Timer.cupti(clear_l2=False)` is the explicit
+warm-cache diagnostic escape hatch. Keeping the formal workload in one window
+is intentional: periodic CUPTI restart gaps materially change the power/clock
+state of sustained GEMMs. Fixed `rep` remains the explicit median-of-three
+escape hatch. This is distinct from `Energy.perf`'s 500 ms minimum
+wall-clock/NVML window.
+
 ## Directory map
 
 ```

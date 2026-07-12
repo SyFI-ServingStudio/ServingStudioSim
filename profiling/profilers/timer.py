@@ -23,11 +23,13 @@ _ESTIMATE_WARMUP = 10
 _ESTIMATE_ITERS = 10
 _MIN_PER_ITER_MS = 1e-4
 
-# Adaptive CUPTI sampling defaults (see Timer.cupti).
-_CUPTI_BATCH = 10
+# Duration-sized CUPTI defaults (see Timer.cupti). Ten real launches estimate
+# the formal count; one uninterrupted capture then records the full active-time
+# budget so capture restarts do not reset the workload's power/clock state.
+_CUPTI_ESTIMATE_ITERS = 10
 _CUPTI_MIN_ITER = 20
-_CUPTI_MAX_ITER = 500
-_CUPTI_TOL = 0.01
+_CUPTI_MAX_ITER = 5_000_000
+_CUPTI_MIN_DURATION_MS = 2_000
 
 
 class Timer:
@@ -59,10 +61,11 @@ class Timer:
     sizes its own inner loop -- so for it the resolved iteration count is
     converted back to a ms budget (``iters * per_iter_ms``) before handing off.
 
-    ``cupti`` is the exception: it records each launch's true kernel duration, so
-    instead of a time budget it samples adaptively and stops once the mean
-    converges (see ``Timer.cupti``). It takes ``min_rep`` / ``max_rep`` / ``tol``
-    rather than ``min_duration_ms``, and needs no warmup.
+    ``cupti`` uses a GPU-active-time budget rather than wall clock. Ten CUPTI
+    samples estimate the count required for ``min_duration_ms`` (default 2000
+    ms), then one uninterrupted capture records exactly that many launches. By
+    default each launch is preceded by a read-only 64 MiB L2-displacement
+    reduction; pass ``clear_l2=False`` only for an explicit warm-cache probe.
     """
 
     @staticmethod
@@ -184,27 +187,33 @@ class Timer:
         *,
         warmup: int = 0,
         rep: int | None = None,
+        min_duration_ms: int | None = None,
         min_rep: int | None = None,
         max_rep: int | None = None,
-        tol: float | None = None,
         kernel_name: str | None = None,
+        clear_l2: bool = True,
     ) -> float:
         """Return average kernel-only runtime in milliseconds using CUPTI.
 
         Unlike the wall-clock timers, CUPTI records each launch's true kernel
-        duration, so the default path samples adaptively (batches of
-        ``_CUPTI_BATCH``) and stops once the mean's relative standard error drops
-        below ``tol`` (default 1%), bounded by ``[min_rep, max_rep]`` samples and
-        needing no warmup. Pass ``rep`` for a fixed sample count instead -- a
-        deterministic escape hatch, mutually exclusive with the convergence knobs.
+        duration. The default path measures ten launches, computes
+        ``ceil(min_duration_ms / estimate_ms)``, and records that many launches
+        in one uninterrupted formal capture. With ``clear_l2=True`` (default),
+        a read-only 64 MiB reduction displaces L2 before every logical launch;
+        its CUPTI records are excluded from the returned callable time.
+        ``min_rep`` is a launch-count floor and ``max_rep`` is a hard safety cap.
+        Pass ``rep`` for the fixed-count median-of-three path instead.
         """
 
         _validate_warmup("Timer.cupti", warmup)
         if rep is not None and (
-            min_rep is not None or max_rep is not None or tol is not None
+            min_duration_ms is not None
+            or min_rep is not None
+            or max_rep is not None
         ):
             raise ValueError(
-                "Timer.cupti: rep is mutually exclusive with min_rep / max_rep / tol"
+                "Timer.cupti: rep is mutually exclusive with min_duration_ms / "
+                "min_rep / max_rep"
             )
         cupti = _load_cupti_module()
 
@@ -217,6 +226,8 @@ class Timer:
                     fn,
                     num_warmup=warmup,
                     num_iter=rep,
+                    clear_l2_before_run=clear_l2,
+                    clear_l2_between_launches=clear_l2,
                     kernel_name_contains=kernel_name,
                 )
                 return float(summary.mean_ms)
@@ -224,13 +235,18 @@ class Timer:
             return _median_aggregate_time(measure_once)
 
         warn_if_multi_gpu_duration_mode("Timer.cupti")
-        summary = cupti.profile_kernel_until_converged(
+        duration_ms = _CUPTI_MIN_DURATION_MS if min_duration_ms is None else min_duration_ms
+        if duration_ms < 0:
+            raise ValueError("Timer.cupti min_duration_ms must be >= 0")
+        summary = cupti.profile_kernel_for_duration(
             fn,
             num_warmup=warmup,
-            batch=_CUPTI_BATCH,
+            estimate_iter=_CUPTI_ESTIMATE_ITERS,
+            min_duration_ms=duration_ms,
             min_iter=_CUPTI_MIN_ITER if min_rep is None else min_rep,
             max_iter=_CUPTI_MAX_ITER if max_rep is None else max_rep,
-            tol=_CUPTI_TOL if tol is None else tol,
+            clear_l2_before_run=clear_l2,
+            clear_l2_between_launches=clear_l2,
             kernel_name_contains=kernel_name,
         )
         return float(summary.mean_ms)
