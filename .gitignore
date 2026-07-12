@@ -14,6 +14,8 @@ __pycache__/
 *.pftrace
 profile.db-journal
 logs/
+# Large workload trace: provisioned per-worktree, not tracked (see create-worktree)
+trace/aime_long.csv
 
 # Editor / OS
 .vscode/
