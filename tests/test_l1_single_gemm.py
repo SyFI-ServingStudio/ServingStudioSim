@@ -4,6 +4,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import types
 from dataclasses import replace
 from pathlib import Path
 
@@ -226,6 +227,125 @@ def test_energy_perf_uses_total_energy_counter(monkeypatch: pytest.MonkeyPatch):
     assert Energy.perf(fn, warmup=0, min_duration_ms=1000) == pytest.approx(0.1)
     assert fn_calls == 3
     assert FakeCuda.sync_calls == 2
+
+
+def test_energy_perf_resolves_remapped_cuda_device_by_uuid(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from profiling.profilers import energy as energy_mod
+    from profiling.profilers.energy import Energy
+
+    energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
+
+    class FakeCuda:
+        sync_calls = 0
+
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def current_device() -> int:
+            return 0
+
+        @staticmethod
+        def get_device_properties(device_idx: int) -> object:
+            assert device_idx == 0
+            # Torch's _CUuuid string omits the GPU- prefix required by NVML.
+            return types.SimpleNamespace(uuid="physical-gpu-3")
+
+        @staticmethod
+        def synchronize() -> None:
+            FakeCuda.sync_calls += 1
+
+    class FakeTorch:
+        cuda = FakeCuda
+
+    class FakeNVMLError(Exception):
+        pass
+
+    class FakePynvml:
+        NVMLError = FakeNVMLError
+
+        def __init__(self) -> None:
+            self.requested_uuids: list[str] = []
+            self.total_energy_reads = [777, 1000, 1300]
+
+        def nvmlInit(self) -> None:
+            pass
+
+        def nvmlDeviceGetHandleByUUID(self, uuid: str) -> str:
+            self.requested_uuids.append(uuid)
+            assert uuid == "GPU-physical-gpu-3"
+            return "physical-handle-3"
+
+        def nvmlDeviceGetHandleByIndex(self, device_idx: int) -> str:
+            raise AssertionError(f"must not use logical CUDA index {device_idx} for NVML")
+
+        def nvmlDeviceGetUUID(self, handle: str) -> str:
+            assert handle == "physical-handle-3"
+            return "GPU-physical-gpu-3"
+
+        def nvmlDeviceGetTotalEnergyConsumption(self, handle: str) -> int:
+            assert handle == "physical-handle-3"
+            return self.total_energy_reads.pop(0)
+
+    fake_pynvml = FakePynvml()
+    fn_calls = 0
+
+    def fn() -> None:
+        nonlocal fn_calls
+        fn_calls += 1
+
+    monkeypatch.setitem(sys.modules, "pynvml", fake_pynvml)
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch)
+    monkeypatch.setattr(Energy, "_estimate_iters", staticmethod(lambda *_, **__: 3))
+    monkeypatch.setattr(energy_mod.time, "perf_counter", iter([0.0, 1.0]).__next__)
+
+    assert Energy.perf(fn, warmup=0, min_duration_ms=1000) == pytest.approx(0.1)
+    assert fake_pynvml.requested_uuids == ["GPU-physical-gpu-3"]
+    assert fn_calls == 3
+    assert FakeCuda.sync_calls == 2
+
+
+def test_energy_perf_does_not_guess_nvml_index_when_uuid_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from profiling.profilers import energy as energy_mod
+    from profiling.profilers.energy import Energy
+
+    energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def current_device() -> int:
+            return 0
+
+    class FakeTorch:
+        cuda = FakeCuda
+
+    class FakeNVMLError(Exception):
+        pass
+
+    class FakePynvml:
+        NVMLError = FakeNVMLError
+
+        def nvmlInit(self) -> None:
+            pass
+
+        def nvmlDeviceGetHandleByIndex(self, device_idx: int) -> str:
+            raise AssertionError(f"must not guess physical index from logical {device_idx}")
+
+    monkeypatch.setitem(sys.modules, "pynvml", FakePynvml())
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch)
+
+    assert Energy.perf(lambda: None, warmup=0, min_duration_ms=1000) == 0.0
 
 
 def test_energy_perf_uses_passed_timing_for_iteration_count(

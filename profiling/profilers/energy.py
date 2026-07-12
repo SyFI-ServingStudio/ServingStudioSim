@@ -11,6 +11,7 @@ across ranks. Multi-GPU / collective runs must not rely on this path -- see
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -67,7 +68,12 @@ class Energy:
 
         pynvml.nvmlInit()
         device_idx = torch.cuda.current_device()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
+        try:
+            handle = _nvml_handle_for_cuda_device(pynvml, torch, device_idx)
+        except pynvml.NVMLError:
+            return 0.0
+        if handle is None:
+            return 0.0
 
         # Agent note: runners should pass the real Timer result so Energy uses
         # the same kernel timing contract as the recorded row. The internal
@@ -117,6 +123,52 @@ class Energy:
             synchronize()
         elapsed_ms = max((time.perf_counter() - start_s) * 1000.0, 0.01)
         return iters_for_duration(min_duration_ms, elapsed_ms)
+
+
+def _nvml_handle_for_cuda_device(
+    pynvml: Any,
+    torch: Any,
+    logical_device_idx: int,
+) -> object | None:
+    """Resolve Torch's current CUDA device to the same physical NVML device.
+
+    Local profiling workers commonly see physical GPU N as logical CUDA device
+    0 through ``CUDA_VISIBLE_DEVICES=N``. Torch's device UUID survives that
+    remapping, while an NVML index does not. If an older Torch build cannot
+    expose the UUID, only use the logical index when no visibility remapping is
+    present; returning no handle is safer than recording another GPU's energy.
+    """
+
+    get_device_properties = getattr(torch.cuda, "get_device_properties", None)
+    if get_device_properties is not None:
+        cuda_uuid = getattr(get_device_properties(logical_device_idx), "uuid", None)
+        nvml_uuid = _normalize_nvml_uuid(cuda_uuid)
+        if nvml_uuid is not None:
+            try:
+                return pynvml.nvmlDeviceGetHandleByUUID(nvml_uuid)
+            except AttributeError:
+                # Old pynvml without UUID lookup may still be safe in an
+                # unmasked single-GPU process, handled by the fallback below.
+                pass
+
+    if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
+        return None
+    return pynvml.nvmlDeviceGetHandleByIndex(logical_device_idx)
+
+
+def _normalize_nvml_uuid(cuda_uuid: object) -> str | None:
+    if cuda_uuid is None:
+        return None
+    if isinstance(cuda_uuid, bytes):
+        uuid_text = cuda_uuid.decode("utf-8", errors="strict")
+    else:
+        uuid_text = str(cuda_uuid)
+    uuid_text = uuid_text.strip()
+    if not uuid_text:
+        return None
+    if uuid_text.startswith(("GPU-", "MIG-")):
+        return uuid_text
+    return f"GPU-{uuid_text}"
 
 
 def _supports_total_energy(pynvml: Any, handle: object, device_idx: int) -> bool:
