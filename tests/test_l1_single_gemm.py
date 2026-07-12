@@ -125,8 +125,17 @@ def test_deepgemm_backend_registered_sharing_table_and_args():
     assert spec.runner_ref.function_name == "profile_single_gemm"
 
 
-def test_single_gemm_known_backends_has_torch_and_deepgemm():
-    assert set(known_backends("single_gemm")) == {"torch", "deepgemm"}
+def test_single_gemm_known_backends_include_both_torch_layouts_and_deepgemm():
+    assert set(known_backends("single_gemm")) == {"torch", "torch_linear", "deepgemm"}
+
+
+def test_torch_linear_backend_registered_sharing_table_and_args():
+    spec = find_kernel_profiler_spec("single_gemm", "torch_linear")
+    assert spec.table_name == "single_gemm"
+    assert spec.args_schema is SingleGemmArgs
+    assert spec.metric_family is MetricFamily.COMPUTE
+    assert spec.runner_ref.module_name == "profiling.runners.gemm.torch"
+    assert spec.runner_ref.function_name == "profile_single_gemm_linear"
 
 
 def test_dtype_from_value_accepts_runner_aliases():
@@ -646,6 +655,69 @@ def test_torch_single_gemm_passes_timer_result_to_energy(
     assert metrics.time_ms == 2.5
     assert metrics.energy_j == 0.25
     assert captured_energy_kwargs["per_iter_time_ms"] == 2.5
+
+
+def test_torch_linear_single_gemm_uses_model_weight_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from profiling.runners.gemm import torch as torch_gemm_runner
+
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+    class FakeTensor:
+        def __init__(self, rows: int, columns: int) -> None:
+            self.rows = rows
+            self.columns = columns
+
+        def numel(self) -> int:
+            return self.rows * self.columns
+
+    class FakeTorch(types.ModuleType):
+        cuda = FakeCuda
+        float16 = "float16"
+        bfloat16 = "bfloat16"
+        float32 = "float32"
+
+        @staticmethod
+        def randn(rows: int, columns: int, *, dtype: object, device: str) -> FakeTensor:
+            return FakeTensor(rows, columns)
+
+    functional = types.ModuleType("torch.nn.functional")
+    captured_shapes = []
+
+    def linear(activations: FakeTensor, weight: FakeTensor) -> FakeTensor:
+        captured_shapes.append(
+            ((activations.rows, activations.columns), (weight.rows, weight.columns))
+        )
+        return FakeTensor(activations.rows, weight.rows)
+
+    functional.linear = linear
+    torch_module = FakeTorch("torch")
+    nn_module = types.ModuleType("torch.nn")
+    nn_module.functional = functional
+    torch_module.nn = nn_module
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
+    monkeypatch.setitem(sys.modules, "torch.nn", nn_module)
+    monkeypatch.setitem(sys.modules, "torch.nn.functional", functional)
+    monkeypatch.setattr(
+        torch_gemm_runner.Timer,
+        "cupti",
+        staticmethod(lambda fn, **kwargs: (fn(), 2.0)[1]),
+    )
+    monkeypatch.setattr(
+        torch_gemm_runner.Energy,
+        "perf",
+        staticmethod(lambda fn, **kwargs: (fn(), 0.2)[1]),
+    )
+
+    metrics = torch_gemm_runner.profile_single_gemm_linear(2, 3, 4, DType.FP16)
+
+    assert captured_shapes == [((2, 4), (3, 4)), ((2, 4), (3, 4))]
+    assert metrics.time_ms == 2.0
+    assert metrics.energy_j == 0.2
 
 
 def test_single_gemm_perf_api_query_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

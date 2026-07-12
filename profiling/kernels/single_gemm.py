@@ -9,9 +9,10 @@ Wire string: ``"single_gemm"`` — matches Rust ``KernelSpec::KIND`` in
 by ``profiling.facade`` to generate ``get_single_gemm_times`` /
 ``count_missing_single_gemm``.
 
-Two backends share this kind/table/schema: ``torch`` (bf16/fp16 dense GEMM) and
-``deepgemm`` (FP8 dense GEMM, ``dtype = fp8_e4m3``). The simulator selects one by
-dtype (deepgemm iff fp8), so a bf16 config never resolves to the FP8-only kernel.
+Three backends share this kind/table/schema: ``torch`` (contiguous-RHS
+``torch.mm``), ``torch_linear`` (model-weight-layout ``F.linear``), and
+``deepgemm`` (FP8 dense GEMM, ``dtype = fp8_e4m3``). BF16/FP16 model defaults
+offer both Torch variants and the timing cache selects the faster one per shape.
 
 Importing this module has a side effect: it appends ``KernelProfilerSpec`` rows
 to the registry. The runner modules ``profiling.runners.gemm.{torch,deepgemm}``
@@ -52,6 +53,22 @@ register(
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.torch",
             function_name="profile_single_gemm",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="torch_linear",
+        supports=BackendSupport(compute=frozenset({DType.BF16, DType.FP16})),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.torch",
+            function_name="profile_single_gemm_linear",
         ),
         table_name=KIND,
         args_schema=SingleGemmArgs,

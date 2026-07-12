@@ -61,6 +61,61 @@ def profile_single_gemm(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
+def profile_single_gemm_linear(
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    """Profile the model-linear layout used by vLLM and Transformers.
+
+    Unlike ``profile_single_gemm``, which owns a contiguous ``(k, n)`` RHS and
+    calls ``torch.mm``, this backend owns the canonical ``(n, k)`` weight and
+    calls ``F.linear``. The distinction is part of backend identity because it
+    selects different NvJet transpose/tile variants on Hopper.
+    """
+    dtype = DType.from_value(dtype)
+
+    try:
+        import torch
+        import torch.nn.functional as functional
+    except ImportError as exc:
+        raise ProfilerNotImplemented("torch is required for the torch_linear backend") from exc
+
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented("CUDA is required for the torch_linear backend")
+
+    try:
+        torch_dtype = dtype.torch()
+        activations = torch.randn(m, k, dtype=torch_dtype, device="cuda")
+        weight = torch.randn(n, k, dtype=torch_dtype, device="cuda")
+
+        def kernel():
+            return functional.linear(activations, weight)
+
+        # Time the canonical model-weight layout through the shared CUPTI timer.
+        time_ms = Timer.cupti(kernel)
+        energy_j = Energy.perf(
+            kernel,
+            warmup=5,
+            per_iter_time_ms=time_ms,
+        )
+
+        flops = 2 * m * n * k
+        tflops = (flops / (time_ms / 1000.0)) / 1e12 if time_ms > 0.0 else 0.0
+        elements = activations.numel() + weight.numel() + m * n
+        bytes_accessed = int(elements * dtype.size_bytes())
+        bandwidth_gbps = (bytes_accessed / (time_ms / 1000.0)) / 1e9 if time_ms > 0.0 else 0.0
+        return ComputeMetrics(
+            time_ms=float(time_ms),
+            tflops=float(tflops),
+            memory_bandwidth_gbps=float(bandwidth_gbps),
+            energy_j=float(energy_j),
+        )
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
 def profile_grouped_gemm(
     n: int,
     k: int,

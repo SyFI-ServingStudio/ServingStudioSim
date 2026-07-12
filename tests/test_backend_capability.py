@@ -24,14 +24,16 @@ from profiling.db.outlier import BatchOutlierPolicy
 
 
 def test_gemm_backend_is_locked_to_dtype():
-    # torch⟺bf16/fp16, deepgemm⟺fp8 — the "one backend by dtype, never both" rule
-    # (a torch@fp8 / deepgemm@bf16 lookup has no rows).
+    # Torch layouts ⟺ bf16/fp16, deepgemm ⟺ fp8.
     for kind in ("single_gemm", "grouped_gemm"):
         assert backend_supports(kind, "torch", DType.BF16)
         assert backend_supports(kind, "torch", DType.FP16)
         assert not backend_supports(kind, "torch", DType.FP8_E4M3)
         assert backend_supports(kind, "deepgemm", DType.FP8_E4M3)
         assert not backend_supports(kind, "deepgemm", DType.BF16)
+    assert backend_supports("single_gemm", "torch_linear", DType.BF16)
+    assert backend_supports("single_gemm", "torch_linear", DType.FP16)
+    assert not backend_supports("single_gemm", "torch_linear", DType.FP8_E4M3)
 
 
 def test_attention_backend_dtype_matrix():
@@ -68,7 +70,7 @@ def test_comm_and_elementwise_are_dtype_agnostic():
 def test_supported_backends_filters_options_by_dtype():
     # The dry-run `options` column: filter registered backends to a dtype.
     assert supported_backends("single_gemm", DType.FP8_E4M3) == ["deepgemm"]
-    assert supported_backends("single_gemm", DType.BF16) == ["torch"]
+    assert supported_backends("single_gemm", DType.BF16) == ["torch", "torch_linear"]
     assert set(supported_backends("flashinfer_attn_prefill", DType.FP8_E4M3)) == {
         "fa3",
         "trt",
