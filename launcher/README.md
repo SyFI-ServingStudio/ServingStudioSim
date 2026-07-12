@@ -29,7 +29,9 @@ This is the practical, code-matching reference. For the layer overview see
   launcher never hardcodes param data (it is Rust-authoritative).
 - The PyO3 env the binary needs to embed Python (it calls L1 `profiling.perf_api`
   for kernel times). `exec._build_subprocess_env` wires `LD_LIBRARY_PATH` /
-  `PYTHONHOME` / `PYTHONPATH` so callers never set them by hand.
+  `PYTHONHOME` / `PYTHONPATH` so callers never set them by hand. `cargo_build`
+  also pins `PYO3_PYTHON` to the interpreter running the launcher, so build-time
+  linking and the embedded runtime cannot silently select different Python ABIs.
 - For real runs: GPUs + a warm/warmable `profile.db` (the launcher prebuilds it).
 - Optionally the standalone **`analyzer`** crate + its Python renderer (post-run
   analysis is best-effort; a missing analyzer never fails a run).

@@ -80,6 +80,25 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _cargo_build_env() -> dict[str, str]:
+    """Select the launcher's interpreter when PyO3 configures the Rust build.
+
+    ``cargo build`` otherwise discovers Python from the ambient shell PATH. A
+    launcher invoked as ``.venv/bin/python -m launcher`` can therefore compile
+    against system Python while `_build_subprocess_env` later supplies the venv
+    runtime, producing an ABI/stdlib mismatch before Python can import
+    ``encodings``. Build-time PyO3 needs the interpreter selector, not the
+    runtime's PYTHONHOME/PYTHONPATH, so remove inherited path overrides here.
+    """
+
+    env = os.environ.copy()
+    env["PYTHON"] = sys.executable
+    env["PYO3_PYTHON"] = sys.executable
+    env.pop("PYTHONHOME", None)
+    env.pop("PYTHONPATH", None)
+    return env
+
+
 # ── perf profiling (skill `operate-profile-sim-speed`) ──────────────────────────────
 
 
@@ -128,7 +147,8 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
         cmd.append("--release")
     elif build_type != "debug":
         cmd.extend(["--profile", build_type])
-    if subprocess.run(cmd, cwd=REPO_ROOT).returncode != 0:
+    build_env = _cargo_build_env()
+    if subprocess.run(cmd, cwd=REPO_ROOT, env=build_env).returncode != 0:
         return False
 
     # Schema discovery: list-params → deployment_schema.json.
@@ -156,7 +176,7 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
         analyzer_cmd.append("--release")
     elif build_type != "debug":
         analyzer_cmd.extend(["--profile", build_type])
-    if subprocess.run(analyzer_cmd, cwd=REPO_ROOT).returncode != 0:
+    if subprocess.run(analyzer_cmd, cwd=REPO_ROOT, env=build_env).returncode != 0:
         sys.stderr.write("[warn] analyzer build failed; runs will skip post-run analysis\n")
     return True
 

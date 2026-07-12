@@ -21,7 +21,12 @@ import yaml
 
 from launcher import metadata
 from launcher.cache_build import cache_key
-from launcher.exec import SimulationRunner, _build_subprocess_env, binary_path
+from launcher.exec import (
+    SimulationRunner,
+    _build_subprocess_env,
+    _cargo_build_env,
+    binary_path,
+)
 from launcher.schema import (
     _format_log_dir,
     build_cli_command,
@@ -1243,6 +1248,20 @@ def test_aggregate_passes_run_infos(monkeypatch, tmp_path):
 
 
 # ── real subprocess plumbing (uses the built binary) ────────────────────────
+
+
+def test_cargo_build_env_pins_launcher_python_and_drops_runtime_paths(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("PYTHONHOME", "/poisoned/python-home")
+    monkeypatch.setenv("PYTHONPATH", "/poisoned/python-path")
+
+    env = _cargo_build_env()
+
+    assert env["PYTHON"] == sys.executable
+    assert env["PYO3_PYTHON"] == sys.executable
+    assert "PYTHONHOME" not in env
+    assert "PYTHONPATH" not in env
 
 
 def test_simulation_runner_captures_stdout(tmp_path):
