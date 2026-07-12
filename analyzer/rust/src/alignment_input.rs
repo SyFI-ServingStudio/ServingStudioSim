@@ -1,6 +1,6 @@
 //! Shared alignment artifact envelope.
 //!
-//! Both alignment categories consume the same launcher-written manifest but use
+//! Alignment categories consume the same launcher-written manifest but use
 //! disjoint sources beneath it. Keeping path/schema parsing here avoids each
 //! subject inventing its own interpretation; metric formulas remain in their
 //! category modules.
@@ -23,12 +23,25 @@ pub struct AlignmentManifest {
     pub timing_predict_case_map: PathBuf,
     pub labeled_kernel_sequences: Option<PathBuf>,
     pub iteration: IterationInput,
+    #[serde(default)]
+    pub workload: WorkloadInput,
     pub e2e: E2eInput,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IterationInput {
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkloadInput {
+    pub enabled: bool,
+}
+
+impl Default for WorkloadInput {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

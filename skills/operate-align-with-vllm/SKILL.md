@@ -1,6 +1,6 @@
 ---
 name: operate-align-with-vllm
-description: Use when the user wants to run, rerun, resume, or inspect an end-to-end VibeSim-to-vLLM alignment experiment. Covers the four explicit phases (simulation, instrumented vLLM/NSYS profile, measured-shape timing prediction, and analysis/rendering), semantic matching from folded measured kernel positions to simulated CostTree slots, and explicit embedded-label decisions. NOT for implementing alignment infrastructure, running an unrelated deployment simulation, or using timing-predict without measured vLLM alignment.
+description: Use when the user wants to run, rerun, resume, or inspect an end-to-end VibeSim-to-vLLM alignment experiment. Covers the four explicit phases (simulation, instrumented vLLM/NSYS profile, measured-shape timing prediction, and analysis/rendering), measured kernel-time versus GPU-cycle utilization, semantic matching from folded measured kernel positions to simulated CostTree slots, and explicit embedded-label decisions. NOT for implementing alignment infrastructure, running an unrelated deployment simulation, or using timing-predict without measured vLLM alignment.
 ---
 
 # Align VibeSim With vLLM
@@ -24,6 +24,49 @@ Check the current boundary before allocating a GPU. Alignment v1 supports:
 
 Stop and report the unsupported dimension instead of silently reducing a TP,
 replica, deployment, or input-builder request to this boundary.
+
+## Measure kernel time versus GPU time
+
+Use `profile/parsed.json` plus the source NSYS SQLite; do not infer GPU timing
+from analyzer category totals. For every valid iteration, collect all attributed
+kernel intervals across its captured phases and define:
+
+- **kernel duration sum** = `sum(kernel.end_ns - kernel.start_ns)`. Preserve this
+  additive workload number for CostTree comparison, but do not call it GPU wall
+  time because concurrent intervals would be counted more than once;
+- **kernel busy union** = the merged union of that iteration's attributed kernel
+  intervals;
+- **GPU iteration time / GPU cycle** = `first_kernel_start(i + 1) -
+  first_kernel_start(i)`, using CUPTI GPU execution `start_ns`, not the host CUDA
+  launch-API timestamp;
+- **global kernel busy union** = the merged union of every
+  `CUPTI_ACTIVITY_KIND_KERNEL` interval on the same device, clipped to that GPU
+  cycle;
+- **GPU no-kernel gap** = `GPU cycle - global kernel busy union`;
+- **kernel/GPU percentage** = `global kernel busy union / GPU cycle`.
+
+Compute an overall percentage as `sum(global busy) / sum(GPU cycle)`, never as
+the arithmetic mean of per-iteration percentages. Report per-stage totals as
+well because prefill, mixed, and decode duty cycles differ. Exclude an iteration
+with no kernel and the last valid iteration, whose next first-kernel boundary is
+unavailable. Check `global busy - attributed busy`: retain a nonzero value as
+other/unattributed GPU work instead of calling it idle.
+
+Do not use the indexed phase NVTX envelope as GPU E2E. Those are host submission
+ranges; CUDA-graph kernels may execute after the marker closes. Likewise, do not
+subtract one iteration's own busy union from `host start -> own last kernel` and
+call the remainder CPU overhead or GPU idle: it can be queue time occupied by a
+previous iteration. Measure CPU overhead separately from the CPU/runtime
+timeline.
+
+When using measured duty cycle to model inter-kernel overhead, set the selected
+worker's `gpu_time_multiplier` to `1 / measured_kernel_gpu_fraction` (for
+example, `1 / 0.95`). Record the capture, iteration population, weighting, and
+derived factor in the experiment. The multiplier scales simulator wall time
+returned by the worker while cost logs remain pre-scale pure-kernel time. Treat
+the measured fraction as experiment-specific, not a universal GPU constant,
+and rerun the full simulation because the longer wall time can change batching,
+TTFT, TPOT, E2E latency, and throughput.
 
 ## Match measured kernels to simulated slots
 

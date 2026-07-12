@@ -45,6 +45,13 @@ class E2EAnalysisPolicy:
 
 
 @dataclass(frozen=True)
+class WorkloadAnalysisPolicy:
+    """Enable scheduler-workload comparison by each run's iteration ids."""
+
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class AnalyzePhaseConfig:
     """Completed artifacts and analyzer policy for the final alignment phase."""
 
@@ -53,6 +60,7 @@ class AnalyzePhaseConfig:
     timing_predict_log_dir: Path
     log_dir: Path
     iteration: IterationAnalysisPolicy
+    workload: WorkloadAnalysisPolicy
     e2e: E2EAnalysisPolicy
 
     @property
@@ -60,6 +68,8 @@ class AnalyzePhaseConfig:
         selected = []
         if self.iteration.enabled:
             selected.append("alignment-iteration")
+        if self.workload.enabled:
+            selected.append("alignment-workload")
         if self.e2e.enabled:
             selected.append("alignment-e2e")
         return selected
@@ -147,6 +157,7 @@ def load_analyze_config(path: Path) -> AnalyzePhaseConfig:
     base = path.resolve().parent
     try:
         iteration_raw = _pop_optional_mapping(raw, "iteration", "analyze")
+        workload_raw = _pop_optional_mapping(raw, "workload", "analyze")
         e2e_raw = _pop_optional_mapping(raw, "e2e", "analyze")
         sequences_text = iteration_raw.pop("labeled_kernel_sequences_file", None)
         iteration = IterationAnalysisPolicy(
@@ -161,6 +172,7 @@ def load_analyze_config(path: Path) -> AnalyzePhaseConfig:
             ),
             **iteration_raw,
         )
+        workload = WorkloadAnalysisPolicy(**workload_raw)
         e2e = E2EAnalysisPolicy(**e2e_raw)
         if iteration.enabled and iteration.labeled_kernel_sequences_file is None:
             raise ValueError(
@@ -178,6 +190,7 @@ def load_analyze_config(path: Path) -> AnalyzePhaseConfig:
             ),
             log_dir=_config_path(base, raw.pop("log_dir"), "log_dir"),
             iteration=iteration,
+            workload=workload,
             e2e=e2e,
         )
         _reject_extra(raw, "analyze")

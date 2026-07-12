@@ -15,6 +15,7 @@ from pathlib import Path
 
 from alignment_e2e import series_plot as alignment_e2e_plot
 from alignment_iteration import series_plot as alignment_iteration_plot
+from alignment_workload import series_plot as alignment_workload_plot
 from batch import kernel_throughput_plot, scatter_plot
 from conservation import workload_plot
 from kv import kv_occupancy_plot
@@ -34,9 +35,10 @@ RENDERERS = {
     "workload-conservation": workload_plot.render,
     "kv-occupancy": kv_occupancy_plot.render,
     "alignment-iteration": alignment_iteration_plot.render,
+    "alignment-workload": alignment_workload_plot.render,
     "alignment-e2e": alignment_e2e_plot.render,
 }
-ALIGNMENT_SUBJECTS = ("alignment-iteration", "alignment-e2e")
+ALIGNMENT_SUBJECTS = ("alignment-iteration", "alignment-workload", "alignment-e2e")
 RUN_SUBJECTS = tuple(name for name in RENDERERS if name not in ALIGNMENT_SUBJECTS)
 
 

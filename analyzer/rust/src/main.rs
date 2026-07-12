@@ -20,6 +20,7 @@ use serde_json::json;
 mod alignment_e2e;
 mod alignment_input;
 mod alignment_iteration;
+mod alignment_workload;
 mod batch;
 mod breakdown;
 mod cdf;
@@ -60,7 +61,7 @@ enum Command {
         /// Analysis directory containing `alignment_manifest.json`; outputs
         /// land in this directory's report/payload dirs.
         analysis_log_dir: PathBuf,
-        /// Alignment subject names; empty = both iteration and E2E subjects.
+        /// Alignment subject names; empty = all alignment subjects.
         subjects: Vec<String>,
     },
     /// List the available analyzer subjects and what each produces.

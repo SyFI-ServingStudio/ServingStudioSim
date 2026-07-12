@@ -263,6 +263,9 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
                 "iteration": {
                     "enabled": config.iteration.enabled,
                 },
+                "workload": {
+                    "enabled": config.workload.enabled,
+                },
                 "e2e": {
                     "enabled": config.e2e.enabled,
                     "throughput_bins": config.e2e.throughput_bins,

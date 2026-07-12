@@ -34,8 +34,8 @@ alignment analyze ──reads completed roots + mapping
                   └─writes→ <analysis_log_dir>/alignment_manifest.json
                                            │
   target/<build>/analyze alignment <analysis_log_dir> [subjects...] (Rust)
-                                           ├─→ reports/alignment_{iteration,e2e}_report.json
-                                           └─→ payloads/alignment_{iteration,e2e}_series.json
+                                           ├─→ reports/alignment_{iteration,e2e,workload}_report.json
+                                           └─→ payloads/alignment_{iteration,e2e,workload}_series.json
 ```
 
 - **Rust does all compute** — scans parquet via DataFusion (parallel vectorized
@@ -52,7 +52,7 @@ alignment analyze ──reads completed roots + mapping
 | Command | Side | Effect |
 |---|---|---|
 | `analyze run <log_dir> [subjects...]` | Rust | Compute subjects → `reports/` + `payloads/`, plus a subject-less `reports/analyzer_timing.json` run-meta sidecar. No subjects = all applicable. |
-| `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E subjects into this analysis root. No subjects = both. |
+| `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
 | `analyze list` | Rust | Print the subject catalog. |
 | `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNGs in `plots/`. No subjects = all renderers. |
@@ -102,6 +102,7 @@ rust/                The `analyze` binary (DataFusion compute side).
   src/throughput/      Category = serving-rate-over-time metrics (throughput).
   src/alignment_iteration/  Per-iteration total/operation/kernel comparison.
   src/alignment_e2e/        Paired request latency + completion throughput.
+  src/alignment_workload/   Measured-vs-sim scheduler batch shapes by iteration id.
   src/alignment_input.rs    Shared alignment manifest/path contract.
   src/trace/           Perfetto trace export from per-worker cost logs.
 
@@ -110,7 +111,7 @@ python/              The render side (matplotlib over payload JSON).
                        runs figure jobs in parallel (fork processes; matplotlib
                        is thread-hostile).
   request/, throughput/  One renderer module per subject; returns figure "jobs".
-  alignment_iteration/, alignment_e2e/  Alignment payload renderers.
+  alignment_iteration/, alignment_e2e/, alignment_workload/  Alignment payload renderers.
   common/              Shared plotting: payload loader + run-dir layout, figure
                        scaffolding, CDF plot, style.
 ```
@@ -133,6 +134,7 @@ Current catalog:
 | `throughput` | throughput | `request_state.parquet` (+ `run_meta.json`) | per-GPU prefill/decode/total TPS totals / fine `segments` + coarse `binned_segments` series |
 | `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping | total/mapping-group/kernel error stats / overview + per-iteration mapped stacks |
 | `alignment-e2e` | alignment-e2e | TraceLab replay JSONL + sim `request_slo.parquet` | paired TTFT/TPOT/E2E stats + completion throughput / throughput + error CDFs |
+| `alignment-workload` | alignment-workload | normalized NSYS iteration metrics + sim `cost_log.groups` | per-side workload summaries / fine prefill-token, decode-batch-size, and scheduled-KV-workload series by iteration id |
 
 The flat registry also carries a `Scope` (`run` or `alignment`) so default
 selection never points a normal-run subject at an alignment bundle or vice

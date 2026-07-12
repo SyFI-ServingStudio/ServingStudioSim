@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::alignment_e2e;
 use crate::alignment_iteration;
+use crate::alignment_workload;
 use crate::batch;
 use crate::conservation;
 use crate::kv;
@@ -44,6 +45,8 @@ pub enum Category {
     Kv,
     /// One measured vLLM model iteration joined to one offline predict case.
     AlignmentIteration,
+    /// Per-iteration scheduler workload over each run's recorded iteration ids.
+    AlignmentWorkload,
     /// One request and run-level completion timeline joined across real/sim runs.
     AlignmentE2e,
 }
@@ -58,6 +61,7 @@ impl Category {
             Category::Conservation => "conservation",
             Category::Kv => "kv",
             Category::AlignmentIteration => "alignment-iteration",
+            Category::AlignmentWorkload => "alignment-workload",
             Category::AlignmentE2e => "alignment-e2e",
         }
     }
@@ -210,6 +214,15 @@ pub const SUBJECTS: &[Subject] = &[
         scope: Scope::Alignment,
     },
     Subject {
+        name: "alignment-workload",
+        category: Category::AlignmentWorkload,
+        description: "Measured-vs-sim scheduler workload by iteration id: prefill tokens, decode batch size, and scheduled KV tokens.",
+        report_name: "alignment_workload_report.json",
+        payload_name: "alignment_workload_series.json",
+        applies: Applies::All,
+        scope: Scope::Alignment,
+    },
+    Subject {
         name: "alignment-e2e",
         category: Category::AlignmentE2e,
         description: "Paired real-vs-sim request TTFT/TPOT/E2E deltas and completion-throughput over time.",
@@ -260,6 +273,7 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
         "workload-conservation" => conservation::workload::run_workload(ctx, dir).await,
         "kv-occupancy" => kv::occupancy::run_kv_occupancy(ctx, dir).await,
         "alignment-iteration" => alignment_iteration::run(ctx, dir).await,
+        "alignment-workload" => alignment_workload::run(ctx, dir).await,
         "alignment-e2e" => alignment_e2e::run(ctx, dir).await,
         other => bail!("unknown analyzer subject {other:?}"),
     }

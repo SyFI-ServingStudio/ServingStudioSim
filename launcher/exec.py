@@ -267,7 +267,7 @@ async def run_alignment_analysis(
     build_type: str = "debug",
     subjects: list[str] | None = None,
 ) -> None:
-    """Compute and render the two measured↔simulated alignment subjects."""
+    """Compute and render the selected measured↔simulated alignment subjects."""
     analyzer = analyzer_binary_path(build_type)
     if not analyzer.exists():
         print(f"[analyze] {analyzer} not built; skipping alignment analysis for {log_dir}")
@@ -286,7 +286,11 @@ async def run_alignment_analysis(
                 fh.write("\n")
         return rc
 
-    selected = subjects or ["alignment-iteration", "alignment-e2e"]
+    selected = subjects or [
+        "alignment-iteration",
+        "alignment-workload",
+        "alignment-e2e",
+    ]
     rc = await run_step(
         "analyze alignment compute",
         [str(analyzer), "alignment", str(log_dir), *selected],

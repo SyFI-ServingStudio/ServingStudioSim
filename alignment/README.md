@@ -155,16 +155,23 @@ log_dir: ./analysis
 iteration:
   enabled: true
   labeled_kernel_sequences_file: ./kernel_sequences_labeled.json
+workload:
+  enabled: true
 e2e:
   enabled: true
   throughput_bins: 20
 ```
 
-Iteration and E2E subjects can be enabled independently. A labeled folded
-inventory is required only when iteration analysis is enabled. The launcher
-validates and snapshots it into `analysis/`; the analyzer losslessly expands
-all captured phases, validates names/categories against `parsed.json`, and
-validates mapped slots against the timing-predict cost manifest.
+Iteration, workload, and E2E subjects can be enabled independently. Workload
+analysis plots each side against its recorded iteration ids and emits fine-grained
+prefill-token, decode-batch-size, and scheduled-KV-workload series, where scheduled
+KV workload is `sum(decode_kv_lens) + sum(prefill_prefix_len +
+prefill_append_len)`. It is deliberately not resident KV-pool occupancy. A
+labeled folded inventory is required only when iteration analysis is enabled.
+The launcher validates and snapshots it into `analysis/`; the analyzer
+losslessly expands all captured phases, validates names/categories against
+`parsed.json`, and validates mapped slots against the timing-predict cost
+manifest.
 
 ## Commands
 

@@ -100,6 +100,7 @@ def _phase_configs(tmp_path: Path, suffix: str = ".yaml") -> dict[str, Path]:
                 "enabled": True,
                 "labeled_kernel_sequences_file": "./kernel_sequences_labeled.json",
             },
+            "workload": {"enabled": True},
             "e2e": {"enabled": True, "throughput_bins": 20},
         },
     )
@@ -382,12 +383,13 @@ def test_analyze_creates_manifest_and_runs_selected_subjects(tmp_path, monkeypat
     assert manifest["schema_version"] == 3
     assert manifest["labeled_kernel_sequences"] == str(analysis / "kernel_sequences_labeled.json")
     assert manifest["iteration"] == {"enabled": True}
+    assert manifest["workload"] == {"enabled": True}
     assert calls == [
         (
             analysis.resolve(),
             {
                 "build_type": "release",
-                "subjects": ["alignment-iteration", "alignment-e2e"],
+                "subjects": ["alignment-iteration", "alignment-workload", "alignment-e2e"],
             },
         )
     ]
@@ -398,6 +400,7 @@ def test_analyze_e2e_only_does_not_require_labeled_inventory(tmp_path, monkeypat
     _write_timing_artifacts(tmp_path)
     raw = yaml.safe_load(paths["analyze"].read_text())
     raw["iteration"] = {"enabled": False}
+    raw["workload"] = {"enabled": False}
     paths["analyze"].write_text(yaml.safe_dump(raw))
     calls = []
     monkeypatch.setattr(
@@ -414,6 +417,7 @@ def test_analyze_rejects_all_subjects_disabled(tmp_path, capsys):
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["analyze"].read_text())
     raw["iteration"] = {"enabled": False}
+    raw["workload"] = {"enabled": False}
     raw["e2e"] = {"enabled": False}
     paths["analyze"].write_text(yaml.safe_dump(raw))
 
