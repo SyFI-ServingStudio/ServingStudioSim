@@ -1,0 +1,34 @@
+# Qwen3-235B MoE (DP-attn × EP-FFN) ep32 perf run with the MoE grouped GEMM on
+# the torch (bf16) backend instead of deepgemm (FP8) — the ep32 counterpart of
+# logs/20260530_1_qwen3_235b_moe_fp16torch_ep8. Same workload (rate 150, 20000s
+# cap, run_to_end:false) and the ep32 KV budget (120 GB/GPU). Isolates the
+# FP8→bf16 expert-FFN switch at ep32 for the ref(FP16) match.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/aime_long.csv
+  request_rate: 150.0
+  run_to_end: false
+  duration_ms: 20000000.0
+
+io:
+  log_dir: logs/20260530_2_qwen3_235b_moe_fp16torch_ep32
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: qwen3_moe_dp_attn_ep_ffn
+          model_config: model/config/qwen3_235b.json
+          attn_tp_size: 4
+          ep_size: 32
+          hp_size: 1
+          nvl_num_gpu: 8
+          fp8: false
+        worker:
+          type: hp_unified
+          attn_gpu_memory_gb: 120.0
+    placement: least-queued
