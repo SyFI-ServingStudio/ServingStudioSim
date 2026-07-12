@@ -32,8 +32,9 @@
 //! layer-wise attn/ffn paths via [`CostBuffers::run_section`], whose rows carry
 //! the `section` + `layer` fields.
 //!
-//! Config (a minimal file, NOT a `RunConfig`): ONE arch selector + its GPU + a log
-//! dir + a batched cases file. No workload / pools / io — those belong to `run`.
+//! Config (a minimal file, NOT a `RunConfig`): ONE arch selector + its GPU + an
+//! optional per-role backend policy + a log dir + a batched cases file. No
+//! workload / pools / io — those belong to `run`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,6 +50,7 @@ use crate::arch::contract::{
 };
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, WorkerId};
+use crate::deployment::BackendOverrides;
 use crate::timing::PerfApiBridge;
 use crate::worker::CostBuffers;
 
@@ -84,6 +86,11 @@ enum PredictArchSel {
 struct PredictConfig {
     arch: PredictArchSel,
     gpu: String,
+    /// Same pool→role backend override contract as `RunConfig`. Iter prediction
+    /// uses pool `main`; AFD attn/ffn prediction uses its matching pool name.
+    /// Absent keeps the arch-declared defaults for standalone predict configs.
+    #[serde(default)]
+    backends: BackendOverrides,
     log_dir: PathBuf,
     /// Path to the batched cases JSON/YAML (a top-level array of [`PredictCase`]).
     /// Resolved relative to this config file's directory when not absolute.
@@ -196,6 +203,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
     // attention vocabulary the ffn cost never reads.
     let num_cases = match &cfg.arch {
         PredictArchSel::Iter(sel) => {
+            let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
             let model = build_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
                 .context("building the iter-wise arch model")?;
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
@@ -204,6 +212,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             n
         }
         PredictArchSel::Attn(sel) => {
+            let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
             let model = build_attn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
@@ -211,6 +220,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             n
         }
         PredictArchSel::Ffn(sel) => {
+            let _scope = bridge.with_backend_overrides("ffn", cfg.backends.get("ffn"));
             let model = build_ffn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
             let cases: Vec<FfnArchInput> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
@@ -521,5 +531,29 @@ mod tests {
         let bad: Result<PredictArchSel, _> =
             serde_json::from_str(r#"{"bogus": {"type": "x"}}"#);
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn predict_config_preserves_backend_overrides() {
+        let cfg: PredictConfig = serde_json::from_str(
+            r#"{
+                "arch": {"iter": {
+                    "type": "llama3_dense",
+                    "model_config": "model/config/llama3_8b.json",
+                    "fp8": false
+                }},
+                "gpu": "NVIDIA H200",
+                "backends": {"main": {
+                    "unified.pre_attn.qkv_proj": ["torch_linear"]
+                }},
+                "log_dir": "logs/predict",
+                "cases_file": "cases.json"
+            }"#,
+        )
+        .expect("predict config with backend overrides parses");
+        assert_eq!(
+            cfg.backends["main"]["unified.pre_attn.qkv_proj"],
+            vec!["torch_linear"]
+        );
     }
 }

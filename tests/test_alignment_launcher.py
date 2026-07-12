@@ -220,6 +220,7 @@ def _write_timing_artifacts(tmp_path: Path) -> Path:
             output_dir=output,
             gpu="NVIDIA H200",
             arch={"type": "llama3_dense", "fp8": False},
+            backends={},
             input_spec=alignment_launcher.load_timing_predict_config(
                 tmp_path / "timing_predict.yaml"
             ).input_builder,
@@ -332,6 +333,24 @@ def test_timing_predict_uses_one_phase_config_and_no_labeled_inventory(tmp_path,
     assert "replay_result" not in input_manifest
     assert not (tmp_path / "analysis_run").exists()
     assert not (output / "kernel_sequences_labeled.json").exists()
+
+
+def test_timing_predict_preserves_simulation_backend_policy(tmp_path, monkeypatch):
+    paths = _phase_configs(tmp_path)
+    simulation, _, _ = _write_completed_inputs(tmp_path)
+    params_path = simulation / "raw" / "params.json"
+    params = json.loads(params_path.read_text())
+    params["backends"] = {
+        "main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}
+    }
+    params_path.write_text(json.dumps(params))
+    monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
+
+    assert alignment_launcher.main(["timing-predict", str(paths["timing"])]) == 0
+    predict_config = json.loads(
+        (tmp_path / "timing_predict_run" / "timing_predict_config.json").read_text()
+    )
+    assert predict_config["backends"] == params["backends"]
 
 
 def test_timing_predict_warns_on_trace_mismatch(tmp_path, monkeypatch, capsys):

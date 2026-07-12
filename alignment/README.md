@@ -103,8 +103,12 @@ input_builder:
 The builder writes `timing_predict_cases.json`,
 `timing_predict_case_map.json`, `timing_predict_config.json`, and
 `timing_predict_input_manifest.json`, then the launcher invokes the generic
-timing-predict command. Future multimodal/sharded builders are sibling tagged
-variants with their own required fields; no sparse all-purpose record is used.
+timing-predict command. The generated predictor config copies the normalized
+simulation's complete per-role backend policy along with its arch and GPU, so
+iteration prediction rebuilds the same CostTree instead of reverting to an
+arch's default best-of-N candidates. Future multimodal/sharded builders are
+sibling tagged variants with their own required fields; no sparse all-purpose
+record is used.
 
 This phase compares the simulation and profile source traces. A mismatch emits
 a warning and continues. It never reads embedded kernel labels or writes

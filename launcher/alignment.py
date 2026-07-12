@@ -115,6 +115,32 @@ def _simulation_target(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return gpu, arch
 
 
+def _simulation_backends(params: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
+    """Return the normalized run's backend policy for predictor parity.
+
+    A completed launcher run always records a validated mapping in params.json.
+    Keep the check here because alignment consumes an artifact boundary rather
+    than trusting that an arbitrary directory was produced by this launcher.
+    """
+    backends = params.get("backends", {})
+    if not isinstance(backends, dict):
+        raise ValueError("completed simulation backends must be a mapping")
+    for pool, roles in backends.items():
+        if not isinstance(pool, str) or not isinstance(roles, dict):
+            raise ValueError("completed simulation backends must map pool names to role maps")
+        for role, candidates in roles.items():
+            if (
+                not isinstance(role, str)
+                or not isinstance(candidates, list)
+                or not candidates
+                or not all(isinstance(candidate, str) for candidate in candidates)
+            ):
+                raise ValueError(
+                    "completed simulation backend roles must map to non-empty string lists"
+                )
+    return backends
+
+
 def _load_profile_result(profile_log_dir: Path) -> dict[str, Any]:
     result_path = profile_log_dir / "profile_result.json"
     if not result_path.is_file():
@@ -335,6 +361,7 @@ def _run_timing_predict(args: argparse.Namespace) -> int:
             output_dir=config.log_dir,
             gpu=gpu,
             arch=arch,
+            backends=_simulation_backends(params),
             input_spec=config.input_builder,
         )
     )

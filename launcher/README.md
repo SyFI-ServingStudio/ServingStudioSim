@@ -524,8 +524,9 @@ It exposes four explicit stages with four independent configs:
 - `alignment profile` uses the profiling config to launch the instrumented vLLM
   server, NSYS capture, and TraceLab frontend, ending at normalized `parsed.json`.
 - `alignment timing-predict` pairs those completed artifacts, generates exact
-  predictor cases, and runs the offline predictor. Its arch/gpu target comes
-  from the simulation run's normalized `raw/params.json`, not the source preset.
+  predictor cases, and runs the offline predictor. Its arch, GPU, and complete
+  per-role backend policy come from the simulation run's normalized
+  `raw/params.json`, not the source preset.
 - `alignment analyze` assembles the analyzer manifest from completed artifact
   directories and invokes only the enabled top-level alignment subjects.
 

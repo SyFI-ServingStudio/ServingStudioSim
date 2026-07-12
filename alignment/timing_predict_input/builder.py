@@ -47,6 +47,10 @@ class BuildRequest:
     output_dir: Path
     gpu: str
     arch: dict[str, Any]
+    # Backend policy is part of the simulated CostTree identity. Preserve the
+    # normalized run's complete pool→role map so offline prediction cannot
+    # silently fall back to an arch's best-of-N defaults.
+    backends: dict[str, dict[str, list[str]]]
     input_spec: VllmTextInputSpec
 
 
@@ -95,6 +99,7 @@ def build_inputs(request: BuildRequest) -> BuildResult:
             {
                 "arch": {"iter": request.arch},
                 "gpu": request.gpu,
+                "backends": request.backends,
                 "log_dir": str(output_dir),
                 "cases_file": str(cases_path),
             },
