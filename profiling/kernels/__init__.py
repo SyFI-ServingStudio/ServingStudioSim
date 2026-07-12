@@ -17,6 +17,7 @@ from profiling.kernels import (
     flashinfer_attn_prefill,  # noqa: F401
     flashinfer_attn_rect,  # noqa: F401
     grouped_gemm,  # noqa: F401
+    kv_cache_append,  # noqa: F401
     p2p_inter,  # noqa: F401
     p2p_intra,  # noqa: F401
     rms_norm,  # noqa: F401

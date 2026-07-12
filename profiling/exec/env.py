@@ -58,7 +58,12 @@ ENV_REGISTRY: dict[str, ProfileEnv] = {
         "flashinfer_local",
         _profile_env_python("flashinfer_local"),
     ),
-    "vllm_env": ProfileEnv("vllm_env", _profile_env_python("vllm_env")),
+    # The exact vLLM CUDA runners must use the same instrumented fork and wheel
+    # stack as alignment profiling; this sibling venv is its documented owner.
+    "vllm_env": ProfileEnv(
+        "vllm_env",
+        _PROJECT_ROOT / "alignment" / "profiler" / "vllm" / ".venv" / "bin" / "python",
+    ),
 }
 
 

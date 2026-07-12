@@ -4,11 +4,8 @@ Per L1 design.md §2.1 / §2.2, each ``KernelProfilerSpec`` points at one
 ``KernelArgs`` subclass. Its field names are the shared contract between public
 spec dicts, runner keyword arguments, and DB key columns.
 
-Agent note: concrete ``<Kind>Args`` dataclasses live in
-``profiling/kernels/<kind>.py`` (co-located with the kernel's ``KIND`` and
-registry row). This module only defines the ``KernelArgs`` base + the shared
-``DType`` enum. Sweep grids, cache policy, table names, and backend behavior
-belong to Rust kernels or L1b registry/table code.
+Sweep grids, cache policy, table names, and backend behavior belong to Rust
+kernels or L1b registry/table code.
 """
 
 from __future__ import annotations
@@ -85,5 +82,18 @@ class KernelArgs:
     - declaration order = DB column order;
     - all fields frozen so args can be reused as immutable DB/query identities.
 
-    Concrete subclasses live in ``profiling/kernels/<kind>.py``.
+    Concrete subclasses are declared below so schema ownership stays separate
+    from registry mutation.
     """
+
+
+@dataclass(frozen=True)
+class KvCacheAppendArgs(KernelArgs):
+    num_kv_heads: int
+    head_dim: int
+    block_size: int
+    input_dtype: DType
+    kv_dtype: DType
+    cache_layout: str
+    scale_granularity: str
+    num_tokens: int
