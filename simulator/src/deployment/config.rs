@@ -65,9 +65,18 @@ pub struct WorkloadSpec {
     pub duration_ms: f64,
     /// Keep ticking past duration_ms until every request completes.
     pub run_to_end: bool,
-    /// Request arrival rate (requests/s).
+    /// Request arrival rate (requests/s). Ignored under closed-loop
+    /// (`max_concurrency` set).
     #[param(default = 10.0)]
     pub request_rate: f64,
+    /// Closed-loop concurrency cap. When set, the frontend IGNORES CSV
+    /// arrival_time / request_rate and instead keeps at most this many requests
+    /// in flight, admitting a new one the instant a slot frees — mirroring the
+    /// alignment load-generator's --max-concurrency (a tokio Semaphore of N
+    /// permits acquired *after* arrival, held until completion). Absent (default)
+    /// = open-loop arrival-time replay.
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
     /// Fixed simulation tick step (µs) — the time quantum the loop advances by
     /// each iteration. Finer ticks mean less TTFT/TPOT quantization (and smaller
     /// inter-slice gaps in the trace) at ~no throughput cost, since per-tick work

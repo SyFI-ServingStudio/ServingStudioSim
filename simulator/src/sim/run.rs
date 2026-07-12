@@ -160,11 +160,11 @@ pub fn run_sim(
     let mut clock = Time::ZERO;
     let mut prev_progress = 0u64;
     let mut idle_for = Time::ZERO;
-    // In-flight is tracked from arrival / completion events, not by scanning the
-    // store every tick (that scan was ~90% of runtime on large backlogs).
-    // `arrived` counts drained requests; `completed` counts `Complete` actions.
-    let mut arrived = 0u64;
-    let mut completed = 0u64;
+    // In-flight is the frontend's ledger (its emitted cursor − completions fed
+    // back below), not a per-tick store scan (that scan was ~90% of runtime on
+    // large backlogs). The run loop is a pure consumer: it forwards each
+    // completion to the frontend and reads `submitted`/`completed`/`in_flight`
+    // back — it keeps no arrival/completion tally of its own.
     // Clock of the most recent periodic `request_state` census. `finalize` reads
     // it to avoid re-writing the same census when the run ends on a snapshot tick
     // (which would duplicate every `(request_id, logging_time)` row).
@@ -182,16 +182,13 @@ pub fn run_sim(
     let cause = loop {
         // 1. Drain arrivals due by now → Flow inserts into the shared store.
         //    The frontend owns the drain loop, so the whole tick is emptied here.
-        frontend.drain_due(clock, |req| {
-            arrived += 1;
-            flow.on_arrival(req);
-        });
+        frontend.drain_due(clock, |req| flow.on_arrival(req));
 
         // 2. Advance one tick; each completion writes its terminal `request_slo`
         //    row. `request_state` is a periodic table (2b), not written here.
         for action in flow.tick(clock) {
             let OrchAction::Complete { req } = action;
-            completed += 1;
+            frontend.record_completion();
             let s = store.borrow();
             logger.record_request_slo(slo_entry(req, clock, &s[req]))?;
         }
@@ -211,17 +208,18 @@ pub fn run_sim(
         }
 
         // 2c. Periodic heartbeat. `fire()` runs first so the gate advances every
-        //     tick regardless. `submitted`/`completed` are maintained counters;
-        //     `admitted` (requests that have started prefill = "touched") is the
-        //     O(1) store watermark, read only on a heartbeat tick (no scan).
-        //     `processing` = admitted - completed (touched but not yet done).
+        //     tick regardless. `submitted`/`completed` are the frontend's ledger
+        //     counts; `admitted` (requests that have started prefill = "touched")
+        //     is the O(1) store watermark, read only on a heartbeat tick (no
+        //     scan). `processing` = admitted - completed (touched but not done).
         if heartbeat.fire() && tracing::enabled!(tracing::Level::INFO) {
             let admitted = store.borrow().admitted_watermark();
+            let completed = frontend.num_completed();
             tracing::info!(
                 "t={:.0}ms: completed={} submitted={} admitted={} processing={}",
                 clock.as_ms(),
                 completed,
-                arrived,
+                frontend.submitted(),
                 admitted,
                 admitted - completed,
             );
@@ -229,7 +227,7 @@ pub fn run_sim(
 
         // 3. Termination — both checks are O(1): in-flight is the maintained
         //    arrival/completion delta, exhaustion is a trace cursor compare.
-        let in_flight = arrived - completed;
+        let in_flight = frontend.in_flight();
         let exhausted = frontend.exhausted();
         if exhausted && in_flight == 0 {
             break TerminationCause::DrainComplete;
@@ -245,7 +243,7 @@ pub fn run_sim(
         //     advancing (trace already drained, work still in flight) is a
         //     deadlock. Only checked post-exhaustion, where Stuck can occur.
         if exhausted && in_flight > 0 && watchdog.fire() {
-            let progress = completed + store.borrow().admitted_watermark();
+            let progress = frontend.num_completed() + store.borrow().admitted_watermark();
             if progress > prev_progress {
                 prev_progress = progress;
                 idle_for = Time::ZERO;
@@ -494,7 +492,7 @@ mod tests {
             },
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
-        let mut frontend = TraceFrontend::load(&[trace], 1.0).unwrap();
+        let mut frontend = TraceFrontend::load(&[trace], 1.0, None).unwrap();
         let mut logger = LoggerSession::open(dir.path(), true).unwrap();
 
         let summary = run_sim(

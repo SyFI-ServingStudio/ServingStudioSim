@@ -14,11 +14,20 @@ For the layer overview see `doc/detailed_design/L7.md`.
 
 - **`frontend.rs` (L7-γ) — `TraceFrontend`.** Loads single-round workload CSV(s)
   once at startup into an immutable, arrival-ordered queue
-  (`id,input_len,output_len,arrival_time`). `drain_due(now, emit)` emits every
-  `Request` whose **effective** arrival time `≤ now`, where effective time =
-  `arrival_time / request_rate` (a higher rate compresses the timeline). The
-  drain loop lives here so a caller can't under-drain by polling once per tick.
-  Multi-round traces are rejected (deferred).
+  (`id,input_len,output_len,arrival_time`). Two replay modes:
+  - **Open-loop** (default): `drain_due(now, emit)` emits every `Request` whose
+    **effective** arrival time `≤ now`, where effective time =
+    `arrival_time / request_rate` (a higher rate compresses the timeline).
+  - **Closed-loop** (`workload.max_concurrency` set): the CSV arrival timeline /
+    `request_rate` are **ignored**; the frontend keeps at most N requests in
+    flight, admitting the next the instant a slot frees and stamping its arrival
+    with the admission clock. Mirrors the alignment load-generator's
+    `--max-concurrency`. To gate this, the frontend **owns the in-flight ledger**
+    (`cursor` emitted − `completed` fed back via `record_completion`); the tick
+    loop is a pure consumer of `submitted`/`in_flight`/`num_completed`.
+
+  The drain loop lives here so a caller can't under-drain by polling once per
+  tick. Multi-round traces are rejected (deferred).
 - **`run.rs` (L7-β) — `run_sim`.** The single tick loop. Returns
   `anyhow::Result<RunSummary>`.
 
