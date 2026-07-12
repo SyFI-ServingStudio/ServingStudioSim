@@ -258,8 +258,12 @@ fn run_iter_cases(
     // The shared `CostBuffers` bundle every iter-wise worker carries: it owns the
     // eval scratch + the cost_log writer (pool_tag "predict", worker 0) and per
     // case runs `eval_iter_with_inputs` and writes one byte-identical parquet row.
-    let mut cost =
-        CostBuffers::new_iter(Some(log_dir.to_path_buf()), PREDICT_POOL_TAG, WorkerId(0), model);
+    let mut cost = CostBuffers::new_iter(
+        Some(log_dir.to_path_buf()),
+        PREDICT_POOL_TAG,
+        WorkerId(0),
+        model,
+    );
     let mut now = Time::from_ms(0.0);
     for (idx, case) in cases.into_iter().enumerate() {
         // The iter driver owns its input construction: wrap the shared attention
@@ -291,20 +295,31 @@ fn run_attn_cases(
 ) -> Result<()> {
     let expected_groups = model.num_attn_dp_groups() as usize;
     let manifest = model.cost_log_manifest();
-    let mut cost =
-        CostBuffers::new(Some(log_dir.to_path_buf()), PREDICT_POOL_TAG, WorkerId(0), &manifest);
+    let mut cost = CostBuffers::new(
+        Some(log_dir.to_path_buf()),
+        PREDICT_POOL_TAG,
+        WorkerId(0),
+        &manifest,
+    );
     let mut now = Time::from_ms(0.0);
     for (idx, case) in cases.into_iter().enumerate() {
         let groups = case
             .into_groups(expected_groups)
             .with_context(|| format!("case {idx}"))?;
         let input = AttnArchInput { groups };
-        let agg = cost.run_section("attn", 0, idx as u64, 0, &input.groups, None, now, |slots, scratch, inputs| {
-            match inputs {
+        let agg = cost.run_section(
+            "attn",
+            0,
+            idx as u64,
+            0,
+            &input.groups,
+            None,
+            now,
+            |slots, scratch, inputs| match inputs {
                 Some(i) => model.attn_cost_with_inputs(0, &input, slots, scratch, i),
                 None => model.attn_cost(0, &input, slots, scratch),
-            }
-        });
+            },
+        );
         now += Time::from_ms(agg.m.time_ms as f64);
     }
     drop(cost);
@@ -331,8 +346,12 @@ fn run_ffn_cases(
     let num_layers = model.num_layers();
     let last = num_layers.saturating_sub(1) as usize;
     let manifest = model.cost_log_manifest();
-    let mut cost =
-        CostBuffers::new(Some(log_dir.to_path_buf()), PREDICT_POOL_TAG, WorkerId(0), &manifest);
+    let mut cost = CostBuffers::new(
+        Some(log_dir.to_path_buf()),
+        PREDICT_POOL_TAG,
+        WorkerId(0),
+        &manifest,
+    );
     let mut now = Time::from_ms(0.0);
     for (idx, input) in cases.into_iter().enumerate() {
         ensure!(
@@ -343,53 +362,88 @@ fn run_ffn_cases(
         let iid = idx as u64;
 
         // prologue (embedding), once per iteration.
-        let agg = cost.run_section("prologue", -1, iid, 0, &input.tokens_per_group, None, now, |slots, scratch, inputs| {
-            match inputs {
+        let agg = cost.run_section(
+            "prologue",
+            -1,
+            iid,
+            0,
+            &input.tokens_per_group,
+            None,
+            now,
+            |slots, scratch, inputs| match inputs {
                 Some(i) => model.prologue_cost_with_inputs(&input, slots, scratch, i),
                 None => model.prologue_cost(&input, slots, scratch),
-            }
-        });
+            },
+        );
         now += Time::from_ms(agg.m.time_ms as f64);
 
         // pre_attn bootstrap: layer-0 qkv (layers > 0 are fused into the prior
         // layer's post_attn, so only layer 0 has a standalone pre cost).
-        let agg = cost.run_section("pre_attn", 0, iid, 0, &input.tokens_per_group, None, now, |slots, scratch, inputs| {
-            match inputs {
+        let agg = cost.run_section(
+            "pre_attn",
+            0,
+            iid,
+            0,
+            &input.tokens_per_group,
+            None,
+            now,
+            |slots, scratch, inputs| match inputs {
                 Some(i) => model.pre_attn_cost_with_inputs(0, &input, slots, scratch, i),
                 None => model.pre_attn_cost(0, &input, slots, scratch),
-            }
-        });
+            },
+        );
         now += Time::from_ms(agg.m.time_ms as f64);
 
         // post_attn for a representative mid layer (Bridge: post(L) + fused pre(L+1)),
         // standing for every layer in [0, last). Only when there IS a mid layer.
         if num_layers >= 2 {
             let mid = (num_layers as usize - 1) / 2; // clearly < last for num_layers >= 2
-            let agg = cost.run_section("post_attn", mid as i16, iid, 0, &input.tokens_per_group, None, now, |slots, scratch, inputs| {
-                match inputs {
+            let agg = cost.run_section(
+                "post_attn",
+                mid as i16,
+                iid,
+                0,
+                &input.tokens_per_group,
+                None,
+                now,
+                |slots, scratch, inputs| match inputs {
                     Some(i) => model.post_attn_cost_with_inputs(mid, &input, slots, scratch, i),
                     None => model.post_attn_cost(mid, &input, slots, scratch),
-                }
-            });
+                },
+            );
             now += Time::from_ms(agg.m.time_ms as f64);
         }
 
         // post_attn terminal (last layer, post-only).
-        let agg = cost.run_section("post_attn_last", last as i16, iid, 0, &input.tokens_per_group, None, now, |slots, scratch, inputs| {
-            match inputs {
+        let agg = cost.run_section(
+            "post_attn_last",
+            last as i16,
+            iid,
+            0,
+            &input.tokens_per_group,
+            None,
+            now,
+            |slots, scratch, inputs| match inputs {
                 Some(i) => model.post_attn_cost_with_inputs(last, &input, slots, scratch, i),
                 None => model.post_attn_cost(last, &input, slots, scratch),
-            }
-        });
+            },
+        );
         now += Time::from_ms(agg.m.time_ms as f64);
 
         // epilogue (final_norm + lm_head), once per iteration.
-        let agg = cost.run_section("epilogue", -1, iid, 0, &input.tokens_per_group, None, now, |slots, scratch, inputs| {
-            match inputs {
+        let agg = cost.run_section(
+            "epilogue",
+            -1,
+            iid,
+            0,
+            &input.tokens_per_group,
+            None,
+            now,
+            |slots, scratch, inputs| match inputs {
                 Some(i) => model.epilogue_cost_with_inputs(&input, slots, scratch, i),
                 None => model.epilogue_cost(&input, slots, scratch),
-            }
-        });
+            },
+        );
         now += Time::from_ms(agg.m.time_ms as f64);
     }
     drop(cost);
@@ -432,7 +486,11 @@ fn load_cases<T: DeserializeOwned>(cases_file: &Path, config_path: &Path) -> Res
         serde_yaml::from_str(&text)
             .with_context(|| format!("parsing YAML cases file {}", resolved.display()))?
     };
-    ensure!(!cases.is_empty(), "cases file {} is empty", resolved.display());
+    ensure!(
+        !cases.is_empty(),
+        "cases file {} is empty",
+        resolved.display()
+    );
     Ok(cases)
 }
 
@@ -446,9 +504,11 @@ mod tests {
 
     #[test]
     fn exact_decode_list_is_used_verbatim() {
-        let g = group(r#"{"prefill_chunk_pairs": [[0, 1025], [1024, 8]], "decode_kv_lens": [100, 200, 300]}"#)
-            .into_arch_group()
-            .unwrap();
+        let g = group(
+            r#"{"prefill_chunk_pairs": [[0, 1025], [1024, 8]], "decode_kv_lens": [100, 200, 300]}"#,
+        )
+        .into_arch_group()
+        .unwrap();
         // prefill_tokens = Σ append_len; decode from the explicit list.
         assert_eq!(g.prefill_tokens, 1025 + 8);
         assert_eq!(g.decode_tokens, 3);
@@ -470,10 +530,11 @@ mod tests {
 
     #[test]
     fn both_decode_forms_is_an_error() {
-        let err = group(r#"{"decode_kv_lens": [10], "decode_count": 1, "average_decode_length": 10}"#)
-            .into_arch_group()
-            .unwrap_err()
-            .to_string();
+        let err =
+            group(r#"{"decode_kv_lens": [10], "decode_count": 1, "average_decode_length": 10}"#)
+                .into_arch_group()
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("exactly one"), "got: {err}");
     }
 
@@ -488,9 +549,10 @@ mod tests {
 
     #[test]
     fn group_count_must_match_dp_degree() {
-        let case: PredictCase =
-            serde_json::from_str(r#"{"groups": [{"decode_count": 1, "average_decode_length": 8}]}"#)
-                .unwrap();
+        let case: PredictCase = serde_json::from_str(
+            r#"{"groups": [{"decode_count": 1, "average_decode_length": 8}]}"#,
+        )
+        .unwrap();
         // Model expects 2 DP shards but the case gave 1.
         let err = case.into_groups(2).unwrap_err().to_string();
         assert!(err.contains("expects 2"), "got: {err}");
@@ -512,8 +574,7 @@ mod tests {
     #[test]
     fn unknown_field_in_group_is_rejected() {
         // deny_unknown_fields guards a typo like `decode_kv_len` (missing the `s`).
-        let parsed: Result<PredictGroup, _> =
-            serde_json::from_str(r#"{"decode_kv_len": [10]}"#);
+        let parsed: Result<PredictGroup, _> = serde_json::from_str(r#"{"decode_kv_len": [10]}"#);
         assert!(parsed.is_err());
     }
 
@@ -528,8 +589,7 @@ mod tests {
         assert!(matches!(attn, PredictArchSel::Attn(_)));
 
         // An unknown kind is rejected (lists iter/attn/ffn).
-        let bad: Result<PredictArchSel, _> =
-            serde_json::from_str(r#"{"bogus": {"type": "x"}}"#);
+        let bad: Result<PredictArchSel, _> = serde_json::from_str(r#"{"bogus": {"type": "x"}}"#);
         assert!(bad.is_err());
     }
 

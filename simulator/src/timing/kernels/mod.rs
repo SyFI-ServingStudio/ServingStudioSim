@@ -13,16 +13,14 @@ pub mod p2p_intra;
 pub mod rms_norm;
 pub mod single_gemm;
 
-pub use all_reduce::{
-    AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, AllReduceSpec,
-};
+pub use all_reduce::{AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, AllReduceSpec};
 pub use elementwise::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ElementwiseSpec,
 };
 pub use engine::{Kernel, KernelConfig, KernelSpec};
 pub use flashinfer_attn_decode::{
-    FlashinferAttnDecodeKernel, FlashinferAttnDecodeKernelConfig,
-    FlashinferAttnDecodeKernelInput, FlashinferAttnDecodeSpec,
+    FlashinferAttnDecodeKernel, FlashinferAttnDecodeKernelConfig, FlashinferAttnDecodeKernelInput,
+    FlashinferAttnDecodeSpec,
 };
 pub use flashinfer_attn_prefill::{
     FlashinferAttnPrefillKernel, FlashinferAttnPrefillKernelConfig,

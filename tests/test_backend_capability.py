@@ -10,17 +10,17 @@ from __future__ import annotations
 import pytest
 
 from profiling.db.args import DType
+from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
-    backend_supports,
-    known_backends,
-    supported_backends,
-    _validate_registry,
     KernelProfilerSpec,
     MetricFamily,
     RunnerRef,
+    _validate_registry,
+    backend_supports,
+    known_backends,
+    supported_backends,
 )
-from profiling.db.outlier import BatchOutlierPolicy
 
 
 def test_gemm_backend_is_locked_to_dtype():
@@ -94,7 +94,9 @@ def test_trt_attention_is_blackwell_gated():
         assert not backend_supports(kind, "trt", DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200")
         assert backend_supports(kind, "trt", DType.FP8_E4M3, DType.FP8_E4M3)  # gpu=None → skip
         # options at fp8: trt drops on H200 (keeps fa3), returns on B200.
-        assert supported_backends(kind, DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200") == ["fa3"]
+        assert supported_backends(kind, DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200") == [
+            "fa3"
+        ]
         assert set(supported_backends(kind, DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA B200")) == {
             "fa3",
             "trt",
@@ -102,9 +104,7 @@ def test_trt_attention_is_blackwell_gated():
 
 
 def test_backend_support_allows_gpu_restriction():
-    only_b200 = BackendSupport(
-        compute=frozenset({DType.FP8_E4M3}), gpus=frozenset({"NVIDIA B200"})
-    )
+    only_b200 = BackendSupport(compute=frozenset({DType.FP8_E4M3}), gpus=frozenset({"NVIDIA B200"}))
     assert only_b200.allows(DType.FP8_E4M3, gpu="NVIDIA B200")
     assert not only_b200.allows(DType.FP8_E4M3, gpu="NVIDIA H200")
     assert not only_b200.allows(DType.BF16, gpu="NVIDIA B200")

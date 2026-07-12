@@ -207,13 +207,10 @@ class Timer:
 
         _validate_warmup("Timer.cupti", warmup)
         if rep is not None and (
-            min_duration_ms is not None
-            or min_rep is not None
-            or max_rep is not None
+            min_duration_ms is not None or min_rep is not None or max_rep is not None
         ):
             raise ValueError(
-                "Timer.cupti: rep is mutually exclusive with min_duration_ms / "
-                "min_rep / max_rep"
+                "Timer.cupti: rep is mutually exclusive with min_duration_ms / min_rep / max_rep"
             )
         cupti = _load_cupti_module()
 
@@ -275,9 +272,7 @@ def _resolve_loop_size(
     """
 
     if rep is not None and (min_duration_ms is not None or min_rep is not None):
-        raise ValueError(
-            f"{timer_name}: rep is mutually exclusive with min_duration_ms / min_rep"
-        )
+        raise ValueError(f"{timer_name}: rep is mutually exclusive with min_duration_ms / min_rep")
 
     if rep is not None:
         if rep <= 0:

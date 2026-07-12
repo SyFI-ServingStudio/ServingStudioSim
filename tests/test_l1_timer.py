@@ -21,9 +21,7 @@ def test_timer_do_bench_uses_triton_testing(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, "triton", fake_triton)
     # do_bench converts a rep COUNT to a ms budget via the estimate; pin it to
     # 1.0 ms/iter so rep=3 -> 3 ms and the call stays CUDA-free.
-    monkeypatch.setattr(
-        "profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 1.0
-    )
+    monkeypatch.setattr("profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 1.0)
 
     fn_calls = 0
 
@@ -46,9 +44,7 @@ def test_timer_warns_when_aggregate_runs_diverge(monkeypatch: pytest.MonkeyPatch
 
     fake_triton = SimpleNamespace(testing=SimpleNamespace(do_bench=fake_do_bench))
     monkeypatch.setitem(sys.modules, "triton", fake_triton)
-    monkeypatch.setattr(
-        "profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 1.0
-    )
+    monkeypatch.setattr("profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 1.0)
 
     with pytest.warns(RuntimeWarning, match="Timer aggregate runs differ by 1.10x"):
         assert Timer.do_bench(lambda: None, warmup=0, rep=1) == 1.05
@@ -247,12 +243,8 @@ def test_timer_do_bench_default_is_time_centric(monkeypatch: pytest.MonkeyPatch)
     # resolved iter count (max(ceil(500/2.0)=250, min_rep 3)=250) is converted
     # back to a ms budget: 250 * 2.0 = 500 ms handed to Triton.
     calls: list[tuple[int, int]] = []
-    monkeypatch.setitem(
-        sys.modules, "triton", _fake_triton_recording(calls, [2.0, 2.0, 2.0])
-    )
-    monkeypatch.setattr(
-        "profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 2.0
-    )
+    monkeypatch.setitem(sys.modules, "triton", _fake_triton_recording(calls, [2.0, 2.0, 2.0]))
+    monkeypatch.setattr("profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 2.0)
 
     assert Timer.do_bench(lambda: None, warmup=7) == 2.0
     assert calls == [(7, 500), (7, 500), (7, 500)]
@@ -262,12 +254,8 @@ def test_timer_do_bench_rep_count_converts_to_ms(monkeypatch: pytest.MonkeyPatch
     # do_bench's Triton rep is a ms budget, so a rep COUNT is converted via the
     # estimate: 300 iters * 2.0 ms/iter = 600 ms.
     calls: list[tuple[int, int]] = []
-    monkeypatch.setitem(
-        sys.modules, "triton", _fake_triton_recording(calls, [1.0, 1.0, 1.0])
-    )
-    monkeypatch.setattr(
-        "profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 2.0
-    )
+    monkeypatch.setitem(sys.modules, "triton", _fake_triton_recording(calls, [1.0, 1.0, 1.0]))
+    monkeypatch.setattr("profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 2.0)
 
     assert Timer.do_bench(lambda: None, warmup=4, rep=300) == 1.0
     assert calls == [(4, 600), (4, 600), (4, 600)]
@@ -362,6 +350,7 @@ def test_cupti_multi_launch_unit_splits_target_and_l2_clear_records(
     from profiling.profilers import cupti_kernel_profiler as cupti
 
     monkeypatch.setattr(cupti, "_require_torch", lambda: SimpleNamespace())
+
     def target_fn(): ...
 
     clear_buffer = SimpleNamespace(sum=lambda: None)
@@ -436,9 +425,7 @@ def test_cupti_duration_path_estimates_count_then_uses_one_formal_window(
         **kwargs,
     ):
         del profiler, fn, kwargs
-        launches.append(
-            (launches_per_run, clear_l2_before_run, clear_l2_between_launches)
-        )
+        launches.append((launches_per_run, clear_l2_before_run, clear_l2_between_launches))
         value_ms = 100.0 if launches_per_run == 10 else 110.0
         return [value_ms] * launches_per_run, {"gemm"}, [1] * launches_per_run
 
@@ -524,9 +511,7 @@ def test_cupti_l2_displacement_reads_buffer_then_synchronizes(
 def test_timer_cuda_event_default_runs_time_centric(monkeypatch: pytest.MonkeyPatch):
     # No knobs => default 500 ms; iteration timer keeps the count directly.
     # ceil(500 / 0.25) = 2000 iters, above the min_rep floor.
-    monkeypatch.setattr(
-        "profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 0.25
-    )
+    monkeypatch.setattr("profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 0.25)
     loop_iters: list[int] = []
 
     class FakeEvent:
@@ -536,7 +521,7 @@ def test_timer_cuda_event_default_runs_time_centric(monkeypatch: pytest.MonkeyPa
         def record(self) -> None: ...
         def synchronize(self) -> None: ...
 
-        def elapsed_time(self, end: "FakeEvent") -> float:
+        def elapsed_time(self, end: FakeEvent) -> float:
             return 5000.0
 
     class FakeCuda:
@@ -561,12 +546,8 @@ def test_timer_cuda_event_default_runs_time_centric(monkeypatch: pytest.MonkeyPa
 
 
 def test_timer_warns_multi_gpu_in_min_duration_mode(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setitem(
-        sys.modules, "triton", _fake_triton_recording([], [1.0, 1.0, 1.0])
-    )
-    monkeypatch.setattr(
-        "profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 1.0
-    )
+    monkeypatch.setitem(sys.modules, "triton", _fake_triton_recording([], [1.0, 1.0, 1.0]))
+    monkeypatch.setattr("profiling.profilers.timer._estimate_per_iter_ms", lambda fn: 1.0)
     fake_torch = SimpleNamespace(
         distributed=SimpleNamespace(
             is_available=lambda: True,

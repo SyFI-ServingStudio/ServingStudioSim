@@ -9,7 +9,9 @@
 //! `gpu_name` rides in the config (L3 §1.6 / `gpu_name in *KernelConfig`); the
 //! `*Input` is pure shape.
 
-use crate::op::attention::{FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp};
+use crate::op::attention::{
+    FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp,
+};
 use crate::timing::bridge::DType;
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
 
@@ -75,7 +77,8 @@ impl AttnLocalWorklet {
         resolved: AttnLocalWorkletResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
-        let attn = FlashInferAttentionOp::build(format!("{name}.attn"), resolved.attn.clone(), bridge)?;
+        let attn =
+            FlashInferAttentionOp::build(format!("{name}.attn"), resolved.attn.clone(), bridge)?;
         Ok(Self {
             name,
             attn,

@@ -90,7 +90,11 @@ impl AttnBlockTpWorkletConfig {
     /// KV cache dtype: fp8 in an fp8 run (both prefill and decode read fp8 KV),
     /// else the base dtype. Used by the arch's KV-byte accounting (`raw_cfg`).
     pub fn kv_dtype(&self) -> DType {
-        if self.fp8 { DType::Fp8E4m3 } else { self.dtype }
+        if self.fp8 {
+            DType::Fp8E4m3
+        } else {
+            self.dtype
+        }
     }
 }
 
@@ -183,17 +187,29 @@ impl AttnBlockTpWorklet {
         let o_name = format!("{name}.o_proj");
         let input_norm = Op::new(
             norm_name.clone(),
-            Arc::new(RmsNormKernel::build(norm_name, resolved.input_norm.clone(), bridge)?),
+            Arc::new(RmsNormKernel::build(
+                norm_name,
+                resolved.input_norm.clone(),
+                bridge,
+            )?),
         );
         let qkv = Op::new(
             qkv_name.clone(),
-            Arc::new(SingleGemmKernel::build(qkv_name, resolved.qkv.clone(), bridge)?),
+            Arc::new(SingleGemmKernel::build(
+                qkv_name,
+                resolved.qkv.clone(),
+                bridge,
+            )?),
         );
         let attn =
             FlashInferAttentionOp::build(format!("{name}.attn"), resolved.attn.clone(), bridge)?;
         let o_proj = Op::new(
             o_name.clone(),
-            Arc::new(SingleGemmKernel::build(o_name, resolved.o_proj.clone(), bridge)?),
+            Arc::new(SingleGemmKernel::build(
+                o_name,
+                resolved.o_proj.clone(),
+                bridge,
+            )?),
         );
         let tp_ar = match &resolved.tp_ar {
             Some(ar_cfg) => {

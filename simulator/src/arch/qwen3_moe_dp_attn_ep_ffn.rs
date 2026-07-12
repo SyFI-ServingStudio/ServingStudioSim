@@ -52,10 +52,8 @@ use std::sync::Arc;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::common::Fabric;
+use crate::op::moe::{MoeCombineOp, MoeDispatchOp, MoeNetConfig, MoeNetInput, Placement};
 use crate::op::Op;
-use crate::op::moe::{
-    MoeCombineOp, MoeDispatchOp, MoeNetConfig, MoeNetInput, Placement,
-};
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, RmsNormKernel,
     RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
@@ -67,11 +65,10 @@ use crate::timing::{
     LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{
-    AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWorkletInput,
-    AttnBlockTpWorkletResolved, MoeExpertComputeLocalWorklet,
-    MoeExpertComputeLocalWorkletConfig, MoeExpertComputeLocalWorkletInput,
-    MoeExpertComputeLocalWorkletResolved, MoeRouterLocalWorklet, MoeRouterLocalWorkletConfig,
-    MoeRouterLocalWorkletInput, MoeRouterLocalWorkletResolved, uniform_local_ppm,
+    uniform_local_ppm, AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWorkletInput,
+    AttnBlockTpWorkletResolved, MoeExpertComputeLocalWorklet, MoeExpertComputeLocalWorkletConfig,
+    MoeExpertComputeLocalWorkletInput, MoeExpertComputeLocalWorkletResolved, MoeRouterLocalWorklet,
+    MoeRouterLocalWorkletConfig, MoeRouterLocalWorkletInput, MoeRouterLocalWorkletResolved,
 };
 
 const NORM_BACKENDS: &[&str] = &["flashinfer"];
@@ -402,7 +399,11 @@ pub fn build(
 
     let embed = Op::new(
         embed_name.clone(),
-        Arc::new(ElementwiseKernel::build(embed_name, resolved.embed, bridge)?),
+        Arc::new(ElementwiseKernel::build(
+            embed_name,
+            resolved.embed,
+            bridge,
+        )?),
     );
 
     let attn_block = AttnBlockTpWorklet::build(
