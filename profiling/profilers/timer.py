@@ -15,6 +15,7 @@ from profiling.profilers._duration import (
     iters_for_duration,
     warn_if_multi_gpu_duration_mode,
 )
+from profiling.profilers.measure_context import get_measure_context
 from profiling.runners.exceptions import ProfilerNotImplemented
 
 _AGGREGATE_RUNS = 3
@@ -203,7 +204,20 @@ class Timer:
         its CUPTI records are excluded from the returned callable time.
         ``min_rep`` is a launch-count floor and ``max_rep`` is a hard safety cap.
         Pass ``rep`` for the fixed-count median-of-three path instead.
+
+        When a ``MeasureContext`` is active (only ever set by ``python -m profiling
+        measure``), this call is diverted to a sustained trend+telemetry capture
+        that writes CSV / summary / plots into the context's output dir and returns
+        the per-launch median so the runner still completes. The guard is inert for
+        every normal ``run`` / ``query`` / simulator call.
         """
+
+        measure_context = get_measure_context()
+        if measure_context is not None and not measure_context.consumed:
+            measure_context.consumed = True
+            from profiling.profilers.trend import run_measure_capture
+
+            return run_measure_capture(fn, measure_context)
 
         _validate_warmup("Timer.cupti", warmup)
         if rep is not None and (

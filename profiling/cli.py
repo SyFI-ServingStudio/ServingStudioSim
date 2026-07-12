@@ -67,6 +67,26 @@ def build_parser() -> argparse.ArgumentParser:
                 "run": _cmd_run,
             }[command]
         )
+
+    measure_parser = subparsers.add_parser(
+        "measure",
+        help="Sustained per-launch trend + NVML telemetry for one CUPTI kernel spec.",
+    )
+    _add_common_profile_args(measure_parser)
+    measure_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Where to write CSV / summary.json / plots. Defaults to ./measure_<table>_<backend>.",
+    )
+    measure_parser.add_argument("--duration-s", type=float, default=10.0)
+    measure_parser.add_argument("--telemetry-hz", type=float, default=20.0)
+    measure_parser.add_argument(
+        "--no-clear-l2",
+        dest="clear_l2",
+        action="store_false",
+        help="Warm continuous window (no per-launch L2 displacement); reveals power/clock drift.",
+    )
+    measure_parser.set_defaults(command_fn=_cmd_measure, clear_l2=True)
     return parser
 
 
@@ -172,6 +192,41 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         _print_result_payload(payload)
     return 0 if command_ok else 1
+
+
+def _cmd_measure(args: argparse.Namespace) -> int:
+    specs = _load_specs(args.spec, args.specs)
+    if len(specs) != 1:
+        raise ValueError(f"measure takes exactly one spec, got {len(specs)}")
+    output_dir = args.output_dir or Path(f"measure_{args.table}_{args.backend}")
+    result = perf_api.measure_kernel(
+        args.table,
+        specs[0],
+        backend=args.backend,
+        gpu_name=args.gpu_name,
+        output_dir=output_dir,
+        duration_s=args.duration_s,
+        telemetry_hz=args.telemetry_hz,
+        clear_l2=args.clear_l2,
+    )
+    if args.json:
+        print(json.dumps({"ok": True, **result}, indent=2, sort_keys=True))
+    else:
+        _print_measure_result(result)
+    return 0
+
+
+def _print_measure_result(result: Mapping[str, Any]) -> None:
+    print(f"kernel: {result['kernel_kind']}:{result['backend']}")
+    print(f"gpu_index: {result['gpu_index']}")
+    print(f"output_dir: {result['output_dir']}")
+    if result.get("time_ms") is not None:
+        print(f"trend_median_ms: {float(result['time_ms']):.6f}")
+    if result.get("runner_error"):
+        print(f"runner_error: {result['runner_error']}")
+    print("artifacts:")
+    for artifact in result.get("artifacts", []):
+        print(f"  {artifact}")
 
 
 def _load_specs(spec_values: Sequence[str], specs_path: Path | None) -> list[dict[str, Any]]:

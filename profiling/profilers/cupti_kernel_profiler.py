@@ -10,11 +10,12 @@ from __future__ import annotations
 import os
 import site
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from math import ceil, sqrt
 from pathlib import Path
 from statistics import fmean, median, stdev
-from typing import Any
+from typing import Any, cast
 
 try:
     import torch
@@ -340,6 +341,75 @@ def _capture_launch_unit(
                 )
 
     return per_launch_ms, matched_kernel_names, matched_kernel_counts
+
+
+def split_launch_series(
+    records: list[KernelRecord],
+    *,
+    launch_pattern: _LaunchPattern,
+    launches_per_run: int,
+    clear_l2_between_launches: bool,
+    kernel_name_contains: str | None = None,
+) -> list[dict[str, object]]:
+    """Split one multi-launch capture into a per-launch time series.
+
+    Companion to ``_capture_launch_unit``: same ordered-pattern splitting, but it
+    keeps each launch's start/end timestamps so a duration *trend* (per-launch
+    start_ns + kernel-only duration) can be plotted, not just the aggregate mean.
+    Interleaved L2-clear kernels are located by ``launch_pattern`` and excluded
+    from each launch's reported duration. Used by ``profilers.trend``.
+    """
+
+    ordered = _ordered_records(records)
+    callable_count = len(launch_pattern.callable_kernel_names)
+    clear_count = len(launch_pattern.clear_kernel_names)
+    expected_count = launches_per_run * callable_count
+    if clear_l2_between_launches:
+        expected_count += (launches_per_run - 1) * clear_count
+    if len(ordered) != expected_count:
+        raise RuntimeError(
+            "CUPTI launch-series record count mismatch: "
+            f"expected={expected_count}, captured={len(ordered)}"
+        )
+
+    cursor = 0
+    series: list[dict[str, object]] = []
+    for launch_index in range(launches_per_run):
+        callable_records = ordered[cursor : cursor + callable_count]
+        cursor += callable_count
+        callable_names = tuple(record.name for record in callable_records)
+        if callable_names != launch_pattern.callable_kernel_names:
+            raise RuntimeError(
+                "CUPTI callable kernel pattern changed inside the launch series "
+                f"at logical launch {launch_index}"
+            )
+        matched = match_kernel_records(
+            callable_records,
+            kernel_name_contains=kernel_name_contains,
+        )
+        series.append(
+            {
+                "start_ns": min(record.start_ns for record in matched),
+                "end_ns": max(record.end_ns for record in matched),
+                "duration_ms": sum(record.duration_ns for record in matched) / 1e6,
+                "kernel_count": len(matched),
+                "kernel_names": " | ".join(
+                    dict.fromkeys(record.name for record in matched)
+                ),
+            }
+        )
+
+        if clear_l2_between_launches and launch_index + 1 < launches_per_run:
+            clear_records = ordered[cursor : cursor + clear_count]
+            cursor += clear_count
+            clear_names = tuple(record.name for record in clear_records)
+            if clear_names != launch_pattern.clear_kernel_names:
+                raise RuntimeError(
+                    "CUPTI L2-clear kernel pattern changed inside the launch series "
+                    f"after logical launch {launch_index}"
+                )
+
+    return series
 
 
 class CuptiKernelProfiler:
@@ -687,6 +757,108 @@ class CuptiKernelProfiler:
             per_iter_ms=per_iter_ms,
             matched_kernel_count_per_run=matched_kernel_count_per_run,
         )
+
+    def profile_series_for_duration(
+        self,
+        fn: Callable[[], object],
+        *,
+        duration_s: float,
+        estimate_iter: int = 10,
+        min_iter: int = 20,
+        max_iter: int = 5_000_000,
+        clear_l2_before_run: bool = True,
+        clear_l2_between_launches: bool = True,
+        kernel_name_contains: str | None = None,
+        capture_hook: Any | None = None,
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        """Capture a per-launch duration *series* over one ~``duration_s`` window.
+
+        This is the trend-diagnostic sibling of ``profile_for_duration``: it sizes
+        the launch count the same way (estimate from ``estimate_iter`` real
+        launches, then ``ceil(duration_ms / estimate_ms)``) and records exactly
+        that many logical launches in one uninterrupted CUPTI window, but returns
+        every launch's ``start_ns`` + kernel-only ``duration_ms`` instead of a
+        single reduced mean. ``capture_hook`` is an optional context manager
+        wrapping only the formal capture (the telemetry sampler enters here so its
+        wall-clock origin lines up with the first launch).
+
+        ``clear_l2_between_launches=False`` is the warm continuous window that
+        surfaces sustained power/clock drift; the default clears L2 before every
+        launch, matching the ``profile.db`` measurement character.
+        """
+
+        if duration_s <= 0:
+            raise ValueError("duration_s must be positive")
+
+        torch_mod = _require_torch()
+        launch_pattern = _prepare_launch_pattern(
+            self,
+            fn,
+            clear_l2_before_run=clear_l2_before_run,
+            clear_l2_between_launches=clear_l2_between_launches,
+            kernel_name_contains=kernel_name_contains,
+        )
+        estimate_ms, _, _ = _capture_launch_unit(
+            self,
+            fn,
+            launches_per_run=estimate_iter,
+            clear_l2_before_run=clear_l2_before_run,
+            clear_l2_between_launches=clear_l2_between_launches,
+            kernel_name_contains=kernel_name_contains,
+            launch_pattern=launch_pattern,
+        )
+        estimate_mean_ms = fmean(estimate_ms)
+        if estimate_mean_ms <= 0:
+            raise RuntimeError(
+                f"CUPTI duration estimate must be positive, got {estimate_mean_ms}"
+            )
+
+        duration_ms = duration_s * 1000.0
+        formal_iter = max(ceil(duration_ms / estimate_mean_ms), min_iter)
+        if formal_iter > max_iter:
+            raise RuntimeError(
+                "CUPTI estimated launch count exceeds max_iter: "
+                f"estimate_mean_ms={estimate_mean_ms:.9f}, duration_s={duration_s}, "
+                f"formal_iter={formal_iter}, max_iter={max_iter}"
+            )
+
+        hook = capture_hook if capture_hook is not None else nullcontext()
+        with hook:
+            records = self.capture_once(
+                fn,
+                launches_per_run=formal_iter,
+                clear_l2_before_run=clear_l2_before_run,
+                clear_l2_between_launches=clear_l2_between_launches,
+            )
+        series = split_launch_series(
+            records,
+            launch_pattern=launch_pattern,
+            launches_per_run=formal_iter,
+            clear_l2_between_launches=clear_l2_between_launches,
+            kernel_name_contains=kernel_name_contains,
+        )
+        first_start_ns = cast(int, series[0]["start_ns"])
+        for sample_index, sample in enumerate(series):
+            sample["sample_index"] = sample_index
+            sample["start_s"] = (cast(int, sample["start_ns"]) - first_start_ns) / 1e9
+
+        metadata: dict[str, object] = {
+            "gpu": torch_mod.cuda.get_device_name(self.device),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "requested_duration_s": duration_s,
+            "estimate_mean_ms": estimate_mean_ms,
+            "launch_count": formal_iter,
+            "cupti_record_count": len(records),
+            "callable_kernel_names": list(launch_pattern.callable_kernel_names),
+            "clear_kernel_names": list(launch_pattern.clear_kernel_names),
+            "clear_l2_before_run": clear_l2_before_run,
+            "clear_l2_between_launches": clear_l2_between_launches,
+            "clear_l2_bytes": self.clear_l2_bytes,
+            "gpu_kernel_span_s": (
+                cast(int, series[-1]["end_ns"]) - first_start_ns
+            ) / 1e9,
+        }
+        return series, metadata
 
 
 def profile_kernel(

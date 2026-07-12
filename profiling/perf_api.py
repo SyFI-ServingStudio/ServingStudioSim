@@ -48,6 +48,40 @@ def submit_remote(profile_request):
     raise NotImplementedError("RemoteGpuPool submission has not landed yet")
 
 
+def measure_kernel(
+    kernel_kind,
+    spec,
+    *,
+    backend=None,
+    gpu_name=None,
+    output_dir,
+    duration_s: float = 10.0,
+    telemetry_hz: float = 20.0,
+    clear_l2: bool = True,
+    telemetry: bool = True,
+):
+    """Cache-free trend+telemetry diagnostic for one CUPTI kernel spec.
+
+    Unlike ``get_<kind>_times``, this does not read or write ``profile.db``; it
+    runs a sustained per-launch capture and writes CSV / summary / plots into
+    ``output_dir``. See ``profiling.measure``.
+    """
+
+    from profiling.measure import measure_kernel as _measure_kernel
+
+    return _measure_kernel(
+        kernel_kind,
+        spec,
+        backend=backend,
+        gpu_name=gpu_name,
+        output_dir=output_dir,
+        duration_s=duration_s,
+        telemetry_hz=telemetry_hz,
+        clear_l2=clear_l2,
+        telemetry=telemetry,
+    )
+
+
 def get_current_gpu_name() -> str:
     return _get_current_gpu_name()
 

@@ -105,6 +105,12 @@ runners/           L1a measurement. Subpackage per op family (gemm, attention,
 
 profilers/         Low-level timing/energy primitives used by runners
                    (Timer.cupti, Energy.perf, CUPTI kernel profiler + C++ ext).
+                   Also the `measure`-verb diagnostic: measure_context (the
+                   Timer.cupti seam), trend (sustained capture + summary),
+                   telemetry (NVML sampler + alignment), trend_plot (figures).
+
+measure.py         `python -m profiling measure` driver: spawns the worker with a
+                   measure block, collects artifacts. Cache-free; never writes DB.
 
 exec/              How a runner actually runs. GpuPool/GpuChunk contracts,
   pool.py            LocalGpuPool (spawns a worker subprocess per chunk),
@@ -203,7 +209,21 @@ python -m profiling list [--json]
 python -m profiling query         <table> --backend <b> [--spec '{...}'] [--specs file] [--gpu-name N] [--db path]
 python -m profiling count-missing <table> --backend <b> ...
 python -m profiling run           <table> --backend <b> [--force] ...    # JIT-fills (or force-refreshes) then reports
+python -m profiling measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2]
 ```
 
 `run` enables JIT for the call (or uses `force=True`), so it is the one CLI verb
 that can launch real GPU work; `query`/`count-missing` are read-only.
+
+`measure` is a **cache-free diagnostic** (it never touches `profile.db`). For one
+CUPTI-timed compute spec it runs a sustained ~`duration_s` capture in a single
+CUPTI window, records **every** per-launch kernel duration, samples NVML telemetry
+(power / SM-clock / mem-clock / util / temp / throttle) on a background thread, and
+writes `runtimes.csv`, `telemetry.csv`, `summary.json`, `runtime_trend.png`, and
+`runtime_telemetry.png` into `--output-dir`. It reaches the kernel's callable
+through the shared `Timer.cupti` seam via a process-wide `MeasureContext` set only
+for this verb (see `profilers/measure_context.py`, `profilers/trend.py`) — **no
+runner changes**, and the guard is inert for every other call. `--no-clear-l2`
+switches from the default cold per-launch L2-displacement (matching the `profile.db`
+measurement) to a warm continuous window that surfaces sustained power/clock drift.
+Kernels whose runner does not time through `Timer.cupti` (e.g. comm) are rejected.
