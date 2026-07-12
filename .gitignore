@@ -24,3 +24,5 @@ logs/
 # are tracked, local settings files are not)
 .claude/settings.local.json
 .codex/*.local.*
+
+/tmp/
