@@ -47,6 +47,10 @@ pub struct AttnBlockTpWorkletConfig {
     pub norm_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
     pub attn_backends: Vec<&'static str>,
+    pub kv_cache_append_backends: Vec<&'static str>,
+    pub kv_cache_block_size: u32,
+    pub kv_cache_layout: String,
+    pub kv_scale_granularity: String,
     pub allreduce_backends: Vec<&'static str>,
 }
 
@@ -141,6 +145,10 @@ impl AttnBlockTpWorklet {
                 head_dim: cfg.head_dim,
                 dtype: cfg.dtype,
                 fp8: cfg.fp8,
+                kv_cache_append_backends: cfg.kv_cache_append_backends.clone(),
+                kv_cache_block_size: cfg.kv_cache_block_size,
+                kv_cache_layout: cfg.kv_cache_layout.clone(),
+                kv_scale_granularity: cfg.kv_scale_granularity.clone(),
             },
             o_proj: SingleGemmKernelConfig {
                 // row-parallel: input k = per-rank Q heads × head_dim; output n = hidden.
@@ -208,7 +216,7 @@ impl AttnBlockTpWorklet {
         })
     }
 
-    /// CostTree compile: sum input_norm + qkv + attn (its prefill/decode leaves)
+    /// CostTree compile: sum input_norm + qkv + attn (append/prefill/decode leaves)
     /// + o_proj + optional tp_allreduce, wrapped in a `Labeled` partition header.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let r = &self.resolved;
@@ -280,6 +288,10 @@ mod tests {
             norm_backends: vec!["flashinfer"],
             gemm_backends: vec!["torch"],
             attn_backends: vec!["fa2", "fa3"],
+            kv_cache_append_backends: vec!["vllm_cuda"],
+            kv_cache_block_size: 16,
+            kv_cache_layout: "NHD".to_string(),
+            kv_scale_granularity: "tensor".to_string(),
             allreduce_backends: vec!["nccl"],
         }
     }

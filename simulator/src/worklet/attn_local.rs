@@ -24,6 +24,10 @@ pub struct AttnLocalWorkletConfig {
     pub fp8: bool,
     pub gpu_name: String,
     pub backends: Vec<&'static str>,
+    pub kv_cache_append_backends: Vec<&'static str>,
+    pub kv_cache_block_size: u32,
+    pub kv_cache_layout: String,
+    pub kv_scale_granularity: String,
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +61,10 @@ impl AttnLocalWorklet {
                 head_dim: cfg.head_dim,
                 dtype: cfg.dtype,
                 fp8: cfg.fp8,
+                kv_cache_append_backends: cfg.kv_cache_append_backends.clone(),
+                kv_cache_block_size: cfg.kv_cache_block_size,
+                kv_cache_layout: cfg.kv_cache_layout.clone(),
+                kv_scale_granularity: cfg.kv_scale_granularity.clone(),
             },
             raw_cfg: cfg.clone(),
         }
@@ -75,7 +83,7 @@ impl AttnLocalWorklet {
         })
     }
 
-    /// CostTree compile: the attention op's two fixed prefill/decode leaves,
+    /// CostTree compile: the attention op's fixed append/prefill/decode leaves,
     /// wrapped in a `Labeled` node carrying the worklet identity + partition/shape
     /// annotation (the old `Describe` header lines).
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
@@ -92,7 +100,7 @@ impl AttnLocalWorklet {
         }
     }
 
-    /// CostTree eval: delegate to the attn op (its two prefill/decode slots),
+    /// CostTree eval: delegate to the attn op (append/prefill/decode slots),
     /// mapping the worklet input to the op input in the same order as `compile`.
     pub fn eval(&self, input: &AttnLocalWorkletInput, ev: &mut Evaluator) {
         let op_in = FlashInferAttentionInput {
@@ -116,6 +124,10 @@ mod tests {
             fp8: false,
             gpu_name: "H100".to_string(),
             backends: vec!["fa2", "fa3"],
+            kv_cache_append_backends: vec!["vllm_cuda"],
+            kv_cache_block_size: 16,
+            kv_cache_layout: "NHD".to_string(),
+            kv_scale_granularity: "tensor".to_string(),
         }
     }
 

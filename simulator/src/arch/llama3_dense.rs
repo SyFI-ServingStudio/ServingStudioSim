@@ -114,6 +114,12 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseC
             fp8: false,
             gpu_name: gpu.clone(),
             backends: ATTN_BACKENDS.to_vec(),
+            // Match the instrumented vLLM FlashInfer serving path. These are
+            // explicit kernel identity, not folded into attention compute.
+            kv_cache_append_backends: vec!["vllm_cuda"],
+            kv_cache_block_size: 16,
+            kv_cache_layout: "NHD".to_string(),
+            kv_scale_granularity: "tensor".to_string(),
         },
         post_attn: PostAttnLocalWorkletConfig {
             hidden: model.hidden,

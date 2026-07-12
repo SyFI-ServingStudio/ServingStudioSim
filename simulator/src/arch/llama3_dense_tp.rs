@@ -115,6 +115,10 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseTpParallel) -> Llama3Dens
             norm_backends: NORM_BACKENDS.to_vec(),
             gemm_backends: GEMM_BACKENDS.to_vec(),
             attn_backends: ATTN_BACKENDS.to_vec(),
+            kv_cache_append_backends: vec!["vllm_cuda"],
+            kv_cache_block_size: 16,
+            kv_cache_layout: "NHD".to_string(),
+            kv_scale_granularity: "tensor".to_string(),
             allreduce_backends: ALLREDUCE_BACKENDS.to_vec(),
         },
         mlp_block: MlpBlockTpWorkletConfig {

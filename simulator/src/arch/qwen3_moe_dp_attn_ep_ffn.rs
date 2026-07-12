@@ -201,6 +201,10 @@ fn attn_block_config(
         norm_backends: NORM_BACKENDS.to_vec(),
         gemm_backends: model.gemm_backends(),
         attn_backends: ATTN_BACKENDS.to_vec(),
+        kv_cache_append_backends: vec!["vllm_cuda"],
+        kv_cache_block_size: 16,
+        kv_cache_layout: "NHD".to_string(),
+        kv_scale_granularity: "tensor".to_string(),
         allreduce_backends: ALLREDUCE_BACKENDS.to_vec(),
     }
 }

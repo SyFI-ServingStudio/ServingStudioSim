@@ -1,6 +1,7 @@
 //! `FlashInferAttentionOp` — compound L2 op (L2 design §3). One attention call
-//! over a sim batch dispatches to two L1 kernels: `flashinfer_attn_prefill`
-//! (causal, merges fresh + chunked) and `flashinfer_attn_decode`.
+//! over a sim batch dispatches to three L1 kernels: `kv_cache_append`,
+//! `flashinfer_attn_prefill` (causal, merges fresh + chunked), and
+//! `flashinfer_attn_decode`.
 //!
 //! **v1 cost model (deliberately simple).** The validated tuple/banding model
 //! (shape × log2(kv) partition + 3-tuple collapse) is deferred. Instead:
@@ -25,14 +26,15 @@ use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     FlashinferAttnDecodeKernel, FlashinferAttnDecodeKernelConfig, FlashinferAttnDecodeKernelInput,
     FlashinferAttnPrefillKernel, FlashinferAttnPrefillKernelConfig,
-    FlashinferAttnPrefillKernelInput,
+    FlashinferAttnPrefillKernelInput, KvCacheAppendKernel, KvCacheAppendKernelConfig,
+    KvCacheAppendKernelInput,
 };
 use crate::timing::{
     AttnPrefillLog, BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge,
     Probe,
 };
 
-/// Single op-level config; expands into the two sub-kernel configs. The op owns
+/// Single op-level config; expands into three sub-kernel configs. The op owns
 /// the FP8 precision policy: `dtype` is the base (16-bit) dtype and `fp8` picks
 /// the per-phase preset (mirrors ref `python_bridge.rs prefill_dtypes` /
 /// `decode_dtypes`):
@@ -54,6 +56,11 @@ pub struct FlashInferAttentionConfig {
     pub dtype: DType,
     /// FP8 run: prefill q/kv → fp8 (fp8816), decode kv → fp8 (fp16816).
     pub fp8: bool,
+    /// Separate cache-write implementation and physical paged-cache contract.
+    pub kv_cache_append_backends: Vec<&'static str>,
+    pub kv_cache_block_size: u32,
+    pub kv_cache_layout: String,
+    pub kv_scale_granularity: String,
 }
 
 /// Op-level input: raw per-request data for one attention call in the sim batch
@@ -73,12 +80,17 @@ impl FlashInferAttentionConfig {
     /// KV cache dtype: fp8 in an fp8 run (both prefill and decode read fp8 KV),
     /// else the base dtype. Used by the arch's KV-byte accounting.
     pub fn kv_dtype(&self) -> DType {
-        if self.fp8 { DType::Fp8E4m3 } else { self.dtype }
+        if self.fp8 {
+            DType::Fp8E4m3
+        } else {
+            self.dtype
+        }
     }
 }
 
 pub struct FlashInferAttentionOp {
     pub name: String,
+    pub kv_cache_append: Arc<KvCacheAppendKernel>,
     pub prefill: Arc<FlashinferAttnPrefillKernel>,
     pub decode: Arc<FlashinferAttnDecodeKernel>,
 }
@@ -89,6 +101,11 @@ impl FlashInferAttentionOp {
         cfg: FlashInferAttentionConfig,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
+        let kv_cache_append = Arc::new(KvCacheAppendKernel::build(
+            format!("{name}.kv_cache_append"),
+            kv_cache_append_config(&cfg),
+            bridge,
+        )?);
         let prefill = Arc::new(FlashinferAttnPrefillKernel::build(
             format!("{name}.prefill"),
             prefill_config(&cfg),
@@ -101,12 +118,13 @@ impl FlashInferAttentionOp {
         )?);
         Ok(Self {
             name,
+            kv_cache_append,
             prefill,
             decode,
         })
     }
 
-    /// CostTree compile: two fixed leaves — `prefill` and `decode` — regardless
+    /// CostTree compile: three fixed leaves — append, prefill, decode — regardless
     /// of request count (INV-1: stable shape). The per-request prefill fan-out is
     /// NOT one slot per request; at eval the `prefill` slot is the aggregating leaf
     /// that sums `prefill.eval(prefix_i, append_i)` over
@@ -114,6 +132,11 @@ impl FlashInferAttentionOp {
     /// cell). Each leaf carries its sub-kernel's `kind`/`config` for the render.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Sum(vec![
+            builder.leaf(
+                format!("{}.kv_cache_append", self.name),
+                self.kv_cache_append.kind(),
+                self.kv_cache_append.describe_config(),
+            ),
             builder.leaf(
                 format!("{}.prefill", self.name),
                 self.prefill.kind(),
@@ -127,12 +150,23 @@ impl FlashInferAttentionOp {
         ])
     }
 
-    /// CostTree eval: fill the two fixed slots `compile` minted — `prefill` then
-    /// `decode`. The prefill slot is the INV-1 aggregating leaf: sum the per-request
-    /// `prefill.eval` over `prefill_chunk_pairs` into the one slot. The decode
+    /// CostTree eval: fill the three fixed slots `compile` minted — append,
+    /// `prefill`, then `decode`. The prefill slot is the INV-1 aggregating leaf:
+    /// sum the per-request `prefill.eval` over `prefill_chunk_pairs` into one slot. The decode
     /// slot collapses all decode requests to one cell (zero metrics when none).
-    /// `aggregate(Sum[prefill, decode])` reproduces the streamed slot total.
+    /// `aggregate(Sum[append, prefill, decode])` reproduces the streamed slot total.
     pub fn eval(&self, input: &FlashInferAttentionInput, ev: &mut Evaluator) {
+        let cache_append = kv_cache_append_input(input);
+        let cache_append_metrics = match &cache_append {
+            Some(shape) => self.kv_cache_append.eval(shape),
+            None => LeafMetrics::ZERO,
+        };
+        ev.push(cache_append_metrics, || {
+            cache_append
+                .unwrap_or(KvCacheAppendKernelInput { num_tokens: 0 })
+                .into()
+        });
+
         let mut prefill = LeafMetrics::ZERO;
         for &(prefix_len, append_len) in &input.prefill_chunk_pairs {
             prefill.add(self.prefill.eval(&FlashinferAttnPrefillKernelInput {
@@ -169,6 +203,32 @@ impl FlashInferAttentionOp {
 }
 
 // ─── internal helpers (pure; unit-tested without a bridge) ───────────────────
+
+fn kv_cache_append_config(cfg: &FlashInferAttentionConfig) -> KvCacheAppendKernelConfig {
+    KvCacheAppendKernelConfig {
+        backends: cfg.kv_cache_append_backends.clone(),
+        gpu_name: cfg.gpu_name.clone(),
+        num_kv_heads: cfg.num_kv_heads,
+        head_dim: cfg.head_dim,
+        block_size: cfg.kv_cache_block_size,
+        input_dtype: cfg.dtype,
+        kv_dtype: cfg.kv_dtype(),
+        cache_layout: cfg.kv_cache_layout.clone(),
+        scale_granularity: cfg.kv_scale_granularity.clone(),
+    }
+}
+
+/// vLLM appends every actual new token once per layer: each prefill contributes
+/// its append length, and each decode request contributes one token.
+fn kv_cache_append_input(input: &FlashInferAttentionInput) -> Option<KvCacheAppendKernelInput> {
+    let prefill_tokens: u32 = input
+        .prefill_chunk_pairs
+        .iter()
+        .map(|&(_, append_len)| append_len)
+        .sum();
+    let num_tokens = prefill_tokens + input.decode_kv_lens.len() as u32;
+    (num_tokens > 0).then_some(KvCacheAppendKernelInput { num_tokens })
+}
 
 /// Prefill / chunked preset. fp8 → **fp8816** (q=fp8, kv=fp8, o=base) on `fa3`
 /// (fa2 has no fp8-query kernel); else base dtype on the caller's backends.
@@ -225,7 +285,10 @@ fn decode_input(decode_kv_lens: &[u32]) -> Option<FlashinferAttnDecodeKernelInpu
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_config, decode_input, prefill_config, FlashInferAttentionConfig};
+    use super::{
+        decode_config, decode_input, kv_cache_append_config, kv_cache_append_input, prefill_config,
+        FlashInferAttentionConfig, FlashInferAttentionInput,
+    };
     use crate::timing::bridge::DType;
 
     fn cfg(fp8: bool) -> FlashInferAttentionConfig {
@@ -237,6 +300,10 @@ mod tests {
             head_dim: 128,
             dtype: DType::Bf16,
             fp8,
+            kv_cache_append_backends: vec!["vllm_cuda"],
+            kv_cache_block_size: 16,
+            kv_cache_layout: "NHD".to_string(),
+            kv_scale_granularity: "tensor".to_string(),
         }
     }
 
@@ -264,7 +331,9 @@ mod tests {
         let d = decode_config(&cfg(false));
         assert_eq!(p.backends, vec!["fa2", "fa3"]);
         assert_eq!(d.backends, vec!["fa2", "fa3"]);
-        for dt in [p.q_dtype, p.kv_dtype, p.o_dtype, d.q_dtype, d.kv_dtype, d.o_dtype] {
+        for dt in [
+            p.q_dtype, p.kv_dtype, p.o_dtype, d.q_dtype, d.kv_dtype, d.o_dtype,
+        ] {
             assert_eq!(dt, DType::Bf16);
         }
     }
@@ -279,5 +348,26 @@ mod tests {
     #[test]
     fn decode_input_is_none_when_no_decode_requests() {
         assert!(decode_input(&[]).is_none());
+    }
+
+    #[test]
+    fn cache_append_counts_prefill_appends_and_decode_requests() {
+        let input = FlashInferAttentionInput {
+            prefill_chunk_pairs: vec![(0, 512), (1024, 128)],
+            decode_kv_lens: vec![100, 200, 300],
+        };
+        assert_eq!(kv_cache_append_input(&input).unwrap().num_tokens, 643);
+        assert!(kv_cache_append_input(&FlashInferAttentionInput::default()).is_none());
+    }
+
+    #[test]
+    fn cache_append_config_uses_kv_precision_and_layout() {
+        let c = kv_cache_append_config(&cfg(true));
+        assert_eq!(c.backends, vec!["vllm_cuda"]);
+        assert_eq!(c.input_dtype, DType::Bf16);
+        assert_eq!(c.kv_dtype, DType::Fp8E4m3);
+        assert_eq!(c.block_size, 16);
+        assert_eq!(c.cache_layout, "NHD");
+        assert_eq!(c.scale_granularity, "tensor");
     }
 }

@@ -44,11 +44,15 @@ kernel input not listed in `timing::slot_input::log_inputs!` fails to compile he
 
 ## Worked compound op: `FlashInferAttentionOp`
 
-One attention call over a sim batch dispatches to two L1 kernels
-(`flashinfer_attn_prefill`, `flashinfer_attn_decode`):
+One attention call over a sim batch dispatches to three L1 kernels
+(`kv_cache_append`, `flashinfer_attn_prefill`, `flashinfer_attn_decode`):
 
-- **Two fixed leaves** — `prefill` and `decode` — minted regardless of how many
+- **Three fixed leaves** — `kv_cache_append`, `prefill`, and `decode` — minted regardless of how many
   requests the step carries (INV-1).
+- **`kv_cache_append` collapses all new tokens** to one `num_tokens` cell:
+  prefill/chunked requests contribute `append_len`; each decode request
+  contributes one. This matches vLLM's `slot_mapping.size(0)` launch shape and
+  keeps cache-write cost out of the FlashInfer compute leaves.
 - **`prefill` is an aggregating leaf**: `eval` sums `prefill.eval(prefix_i,
   append_i)` over every `(prefix_len, append_len)` in `prefill_chunk_pairs` into
   that one slot. A prefill/chunked request *is* the prefill kernel's cache cell,
