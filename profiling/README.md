@@ -215,6 +215,11 @@ python -m profiling measure       <table> --backend <b> --spec '{...}' [--output
 `run` enables JIT for the call (or uses `force=True`), so it is the one CLI verb
 that can launch real GPU work; `query`/`count-missing` are read-only.
 
+`single_gemm` uses a GEMM-local extension of the shared token axis: measured
+points `m=1,2,4,8,16` precede the common `m=32..65536` grid. Dense decode must
+therefore use direct/interior small-batch samples rather than extrapolating the
+first `[32,64]` segment. Other token-shaped kernels retain the shared axis.
+
 `measure` is a **cache-free diagnostic** (it never touches `profile.db`). For one
 CUPTI-timed compute spec it runs a sustained ~`duration_s` capture in a single
 CUPTI window, records **every** per-launch kernel duration, samples NVML telemetry

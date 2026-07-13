@@ -37,7 +37,12 @@ impl KernelSpec for SingleGemmSpec {
     const KIND: KernelKind = "single_gemm";
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![Axis::token_axis()])
+        // Dense decode routinely evaluates GEMMs below the shared token axis'
+        // m=32 floor. Keep those points measured instead of extrapolating the
+        // first [32, 64] segment into the scheduler's common 1..16 batches.
+        // This extension is GEMM-local so attention/norm/elementwise grids do
+        // not inherit forty unrelated Llama-3 profiling rows.
+        SweepGrid::new(vec![Axis::chain([Axis::pow2(0, 4), Axis::token_axis()])])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -148,5 +153,21 @@ mod tests {
         assert_eq!(fields.get("dtype"), Some(&Value::from("bf16")));
         assert!(fields.get("m").and_then(Value::as_u64).is_some());
         assert_eq!(first.backend(), Some("torch"));
+    }
+
+    #[test]
+    fn sweep_measures_decode_microbatches_before_the_shared_token_axis() {
+        let cfg = SingleGemmKernelConfig {
+            backends: vec!["torch"],
+            gpu_name: "H100".to_string(),
+            n: 4096,
+            k: 4096,
+            dtype: DType::Bf16,
+        };
+
+        let grid = SingleGemmSpec::sweep_grid(&cfg);
+
+        assert_eq!(&grid.axes()[0][..6], &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0]);
+        assert_eq!(grid.axes()[0].len(), 68);
     }
 }
