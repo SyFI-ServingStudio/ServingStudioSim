@@ -7,6 +7,14 @@ own file with its own caller; only the op-agnostic mechanics (paged-KV
 construction, dtype/backend helpers, do_bench + metrics) are shared via
 ``_common``.
 
+``fa2`` keeps FlashInfer's ordinary eager plan. ``fa2_cudagraph`` uses the same
+FA2 implementation with ``use_cuda_graph=True`` and fixed metadata buffers,
+matching vLLM's pure-decode planning mode. On the supported FlashInfer version
+that plan selects split-KV and the timed callable therefore contains both the
+main attention kernel and ``PersistentVariableLengthMergeStatesKernel``. The
+profiler does not need to replay a captured graph: CUPTI sums the same two GPU
+kernels, and direct launch avoids folding graph-launch mechanics into L1 time.
+
 Cache identity is ``(batch_size, total_tokens)`` — batch is a real axis, and
 ``total_tokens`` is the total kv across the batch (so a flat cap keeps every
 grid corner feasible). The runner derives the per-request mean length
@@ -78,6 +86,7 @@ def _run_cudnn_decode(
 def _run_decode(
     *,
     backend: str,
+    use_cuda_graph_plan: bool = False,
     batch_size: int,
     total_tokens: int,
     num_qo_heads: int,
@@ -128,11 +137,25 @@ def _run_decode(
             num_kv_heads=num_kv_heads, head_dim=head_dim,
             q_dtype=q_dtype, kv_dtype=kv_dtype, o_dtype=o_dtype, page_size=_PAGE_SIZE,
         )
+        wrapper_kwargs = {
+            "kv_layout": "NHD",
+            "backend": _common.flashinfer_backend_name(backend),
+            "use_tensor_cores": True,
+        }
+        if use_cuda_graph_plan:
+            # FlashInfer requires stable, capacity-sized metadata buffers when
+            # CUDA-graph planning is enabled. ``plan`` copies the concrete
+            # shape into these buffers; keeping them on the wrapper keeps their
+            # addresses alive for every timed launch.
+            wrapper_kwargs.update(
+                use_cuda_graph=True,
+                paged_kv_indptr_buffer=torch.empty_like(inp.kv_indptr),
+                paged_kv_indices_buffer=torch.empty_like(inp.kv_indices),
+                paged_kv_last_page_len_buffer=torch.empty_like(inp.kv_last_page_len),
+            )
         wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             _common.make_workspace(),
-            kv_layout="NHD",
-            backend=_common.flashinfer_backend_name(backend),
-            use_tensor_cores=True,
+            **wrapper_kwargs,
         )
         plan_kwargs = dict(
             indptr=inp.kv_indptr,
@@ -161,6 +184,14 @@ def _run_decode(
             def benchmark_fn():
                 return wrapper.run(inp.q, paged_kv_cache)
 
+        if use_cuda_graph_plan:
+            # The graph-enabled wrapper's first run performs one-time internal
+            # setup and launches extra helper kernels. Stabilize that launch
+            # composition before Timer.cupti learns its callable pattern; the
+            # measured steady state is then exactly attention-main + merge.
+            benchmark_fn()
+            torch.cuda.synchronize()
+
         flops = _common.attention_flops(
             q_len=1, kv_len=seq_len, num_qo_heads=num_qo_heads,
             head_dim=head_dim, causal=False, batch_size=batch_size,
@@ -175,6 +206,12 @@ def _run_decode(
 
 def profile_flashinfer_attn_decode_fa2(**kwargs) -> ComputeMetrics:
     return _run_decode(backend="fa2", **kwargs)
+
+
+def profile_flashinfer_attn_decode_fa2_cudagraph(**kwargs) -> ComputeMetrics:
+    """Profile vLLM-style FA2 decode planning (split main + merge kernels)."""
+
+    return _run_decode(backend="fa2", use_cuda_graph_plan=True, **kwargs)
 
 
 def profile_flashinfer_attn_decode_fa3(**kwargs) -> ComputeMetrics:

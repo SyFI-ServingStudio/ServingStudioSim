@@ -15,11 +15,16 @@ import pytest
 
 from profiling.db.args import DType
 from profiling.db.outlier import BatchOutlierPolicy
-from profiling.db.registry import KernelProfilerSpec, MetricFamily, RunnerRef
+from profiling.db.registry import (
+    KernelProfilerSpec,
+    MetricFamily,
+    RunnerRef,
+    find_kernel_profiler_spec,
+)
 from profiling.kernels import flashinfer_attn_decode as decode_kernel
 from profiling.kernels.flashinfer_attn_decode import KIND, FlashinferAttnDecodeArgs
 
-_BACKENDS = ("fa2", "fa3", "trt", "cudnn")
+_BACKENDS = ("fa2", "fa2_cudagraph", "fa3", "trt", "cudnn")
 _RUNNER_MODULE = "profiling.runners.attention.flashinfer_decode"
 
 
@@ -83,6 +88,17 @@ def test_register_call_built_one_compute_spec_per_backend():
         assert spec.metric_family is MetricFamily.COMPUTE
         assert spec.runner_ref.module_name == _RUNNER_MODULE
         assert spec.runner_ref.function_name == f"profile_flashinfer_attn_decode_{backend}"
+
+
+def test_fa2_cudagraph_backend_is_registered_lazily_on_the_existing_table():
+    spec = find_kernel_profiler_spec(KIND, "fa2_cudagraph")
+    assert spec.args_schema is FlashinferAttnDecodeArgs
+    assert spec.table_name == KIND
+    assert spec.metric_family is MetricFamily.COMPUTE
+    assert spec.runner_ref == RunnerRef(
+        module_name=_RUNNER_MODULE,
+        function_name="profile_flashinfer_attn_decode_fa2_cudagraph",
+    )
 
 
 def test_importing_kernel_module_does_not_eager_import_runner():
