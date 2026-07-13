@@ -81,9 +81,12 @@ workload:
 ```
 
 It writes the replay log, server log, NSYS report/SQLite, `parsed.json`, the
-folded label-ready `kernel_sequences.json`, and `profile_result.json` beneath
+folded label-ready `kernel_sequences.json`, engine-core per-request TTFT in
+`vllm/<name>_request_timings.jsonl`, and `profile_result.json` beneath
 `profile/`. `profile_result.replay_result` identifies the TraceLab per-request
-JSONL used later for E2E comparison. It has no timing-predict or analysis fields.
+JSONL used later for client-observed E2E comparison, while
+`profile_result.request_timings_jsonl` identifies the vLLM engine-core timing
+records. It has no timing-predict or analysis fields.
 
 ### `timing_predict.yaml`
 
@@ -164,14 +167,29 @@ e2e:
 
 Iteration, workload, and E2E subjects can be enabled independently. Workload
 analysis plots each side against its recorded iteration ids and emits fine-grained
-prefill-token, decode-batch-size, and scheduled-KV-workload series, where scheduled
-KV workload is `sum(decode_kv_lens) + sum(prefill_prefix_len +
+prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle
+series. vLLM cycle time is first-kernel to next-first-kernel; simulation cycle time
+is one actual `wall_start_ms` to the next, so it already includes the worker's
+`gpu_time_multiplier`, tick quantization, and scheduler gaps. Scheduled KV
+workload is `sum(decode_kv_lens) + sum(prefill_prefix_len +
 prefill_append_len)`. It is deliberately not resident KV-pool occupancy. A
 labeled folded inventory is required only when iteration analysis is enabled.
 The launcher validates and snapshots it into `analysis/`; the analyzer
 losslessly expands all captured phases, validates names/categories against
 `parsed.json`, and validates mapped slots against the timing-predict cost
 manifest.
+
+E2E analysis writes two distinct TTFT overlays: TraceLab client-observed TTFT vs
+simulator TTFT, and vLLM engine-core queued-to-first-output TTFT vs the same
+simulator TTFT. It also overlays raw TPOT and E2E CDFs. Each measured/simulated
+pair is compared as independent distributions; no per-request latency ratio is
+computed. Request ids only audit whether either side lost requests, which matters
+when the two schedulers execute simultaneous arrivals in different orders.
+An older profile captured before engine-core request timing instrumentation can
+still provide client TTFT, TPOT, E2E, and throughput analysis: its manifest
+records `request_timings_result: null`, the report marks server TTFT unavailable,
+and no server-TTFT plot is rendered. Missing timing data is never reconstructed
+or substituted from client measurements.
 
 ## Commands
 
@@ -188,6 +206,24 @@ Standalone NSYS normalization remains available as:
 uv run python -m alignment parse --sqlite capture.sqlite --metrics metrics.jsonl \
   --iteration-start 24 --iteration-end 48 --output parsed.json
 ```
+
+After a profile completes, derive that capture's experiment-specific GPU-cycle
+correction with:
+
+```bash
+uv run python -m alignment gpu-kernel-ratio \
+  --profile-dir logs/<experiment>/profile \
+  --output logs/<experiment>/gpu_kernel_ratio.json
+```
+
+The command defines a GPU cycle as one iteration's first attributed kernel start
+to the next kernel-bearing iteration's first kernel start on the same device.
+It reports the attributed kernel union for ownership auditing and independently
+unions every CUPTI kernel on that device inside each cycle.  The pooled
+`gpu_time_multiplier` is `sum(GPU cycle) / sum(global kernel busy)`; copy that
+value into the selected simulation worker and rerun the simulation.  The final
+iteration per device is excluded because it has no next boundary.  Never reuse
+the factor as a GPU-wide constant across unrelated captures.
 
 ## Current v1 boundary
 

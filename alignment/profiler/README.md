@@ -2,8 +2,9 @@
 
 The alignment ground truth comes from the **vLLM submodule in this directory**,
 which adds `vllm_iteration(N): <phase>` NVTX scopes and a versioned
-`VibeSimAlignmentIteration {json}` model-input record. The fork source is already
-vendored (as a git submodule) at:
+`VibeSimAlignmentIteration {json}` model-input record. It also emits one
+`VibeSimAlignmentRequestTiming {json}` record when each request's first-token
+iteration finishes. The fork source is already vendored (as a git submodule) at:
 
     alignment/profiler/vllm      # branch: moesim-profile
 
@@ -95,6 +96,31 @@ accepts only indexed iteration ranges and attributes kernels by
 `kernel.correlationId → runtime.correlationId → indexed phase`. CUDA-graph
 profiles must also use `--cuda-graph-trace=node` and verify non-null
 `graphNodeId` rows.
+
+Request TTFT instrumentation reuses vLLM's native EngineCore events and clock:
+`QUEUED` is recorded when `Scheduler.add_request` appends the request to its
+waiting queue, and the end is the `EngineCoreOutputs.timestamp` created after
+the iteration producing the first token has returned and its model output has
+been processed. The structured record carries `engine_core_ttft_ms`, its
+`engine_queue_wait_ms` component, and
+`engine_first_schedule_to_first_token_ms`. For chunked prefill the end remains
+the iteration that actually emits the first token, not the first prompt chunk.
+The extractor removes vLLM completions' `cmpl-<X-Request-Id>-0` envelope into
+the canonical TraceLab `request_id` and retains the raw `engine_request_id` for
+audit.
+The profile runner extracts these lines to
+`profile/vllm/<name>_request_timings.jsonl` and records that path in
+`profile_result.json`. This engine-core metric excludes HTTP/frontend ingress,
+tokenization, detokenization, and first-token SSE return time; TraceLab's
+`first_token_ms` remains the client-observed E2E TTFT.
+
+NSYS exports the CUPTI runtime and kernel tables without lookup indexes. Before
+attribution, the parser adds persistent `vibesim_` indexes on
+`runtime(globalTid, start)` and `kernel(globalPid, correlationId, start)` to the
+exported SQLite derivative. The `.nsys-rep` remains the immutable capture. The
+indexes do not change event rows or attribution results; they prevent one full
+runtime/kernel table scan per indexed phase range and are reused by later parse
+runs.
 
 ## Parser output contract
 

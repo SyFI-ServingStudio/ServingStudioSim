@@ -26,7 +26,7 @@ sim run ──writes→ <log_dir>/raw/{request_*.parquet,cost_log/worker_*.parqu
                       └─→ <log_dir>/traces/<prefix>.pftrace.gz
                       │
   python analyzer/python render <log_dir> [subjects...]     (Python, this::python)
-                      └─→ <log_dir>/plots/<subject>_*.png
+                      └─→ <log_dir>/plots/  (PNG overview and breakdowns)
 
 alignment profile ──writes→ <profile_log_dir>/{parsed.json,profile_result.json,...}
 alignment timing-predict ──writes→ <predict_log_dir>/{raw/,cases,config,input_manifest}
@@ -55,7 +55,7 @@ alignment analyze ──reads completed roots + mapping
 | `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
 | `analyze list` | Rust | Print the subject catalog. |
-| `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNGs in `plots/`. No subjects = all renderers. |
+| `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNG plots, including sampled alignment breakdowns. No subjects = all renderers. |
 
 The **launcher** is the primary caller: `launcher.exec.run_analysis` runs the
 Rust `analyze run` then the Python `render` after each successful sim run;
@@ -70,16 +70,20 @@ sim/L7, containing:
 - `raw/request_slo.parquet` and `raw/request_state.parquet` — subject inputs.
 - `raw/cost_log/worker_<pool_tag>_<worker_id>.parquet` plus matching
   `raw/cost_manifest/worker_<pool_tag>_<worker_id>.json` — trace inputs.
-- `raw/params.json` — read only for the bare `deployment` string (drives the
-  applicability gate). Absent → only deployment-agnostic subjects run.
+- `raw/params.json` — normal analysis reads the bare `deployment` string (drives
+  the applicability gate); alignment iteration analysis additionally reads the
+  sole supported worker group's `gpu_time_multiplier` to scale timing-predict
+  totals for the GPU-cycle overview. Absent → only deployment-agnostic normal
+  subjects run; an alignment bundle without the explicit multiplier fails loud.
 - `raw/run_meta.json` — sim-written sidecar (`num_gpus`, `gpu_name`); the
   throughput subject reads it to normalize per-GPU. Absent → treated as 1 GPU.
 
 All three are read as bare JSON / parquet by name — no `simulator` types crossed.
 The alignment path reads `<analysis_log_dir>/alignment_manifest.json`, which
 points to normalized NSYS JSON in the profile root, timing-predict cost
-parquet/manifest, the profile's `replay_result` TraceLab JSONL, sim request-SLO
-parquet, and exact sequence-row-to-operation labels. An operation may own one
+parquet/manifest, the profile's `replay_result` TraceLab JSONL, its optional
+engine-core `request_timings_result` JSONL, sim request-SLO parquet, and exact
+sequence-row-to-operation labels. An operation may own one
 or more simulated leaf slots; its measured kernel durations are counted once
 and its folded slot workloads are summed. Reports, payloads, and plots stay in
 the analysis root; the input roots are never used as output directories.
@@ -132,9 +136,22 @@ Current catalog:
 | `slo-general` | request | `request_slo.parquet` scalar columns | TTFT/TPOT/E2E stats / per-metric CDF series |
 | `slo-detailed` | request | `request_slo.parquet` `output_token_times` column | ITL stats / CDF series when per-token logging is enabled |
 | `throughput` | throughput | `request_state.parquet` (+ `run_meta.json`) | per-GPU prefill/decode/total TPS totals / fine `segments` + coarse `binned_segments` series |
-| `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping | total/mapping-group/kernel error stats / overview + per-iteration mapped stacks |
-| `alignment-e2e` | alignment-e2e | TraceLab replay JSONL + sim `request_slo.parquet` | paired TTFT/TPOT/E2E stats + completion throughput / throughput + error CDFs |
-| `alignment-workload` | alignment-workload | normalized NSYS iteration metrics + sim `cost_log.groups` | per-side workload summaries / fine prefill-token, decode-batch-size, and scheduled-KV-workload series by iteration id |
+| `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping + simulation `gpu_time_multiplier` | kernel/mapping error stats / separate kernel-busy and measured first-kernel-to-next-first-kernel GPU-cycle overviews + per-iteration mapped stacks |
+| `alignment-e2e` | alignment-e2e | TraceLab replay JSONL + optional vLLM engine-core request timing JSONL + sim `request_slo.parquet` | independent client-TTFT/sim, optional server-TTFT/sim, TPOT, and E2E stats + completion throughput / available raw latency CDF overlays + throughput |
+| `alignment-workload` | alignment-workload | normalized NSYS iteration metrics + sim `cost_log.groups`/`wall_start_ms` | per-side workload summaries / fine prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle series by iteration id |
+
+The alignment-iteration payload and report retain every paired iteration, but
+the Python renderer evenly samples at most 128 per-iteration breakdown PNGs.
+It keeps the overview and other subject-level plots directly under `plots/`,
+then groups breakdowns in batches of 32 under raw-id ranges such as
+`plots/iter_6_to_305/iter_6_breakdown.png`. Sampling therefore bounds rendering
+cost without changing any computed statistic or discarding payload rows.
+Breakdowns use a pre-sized 18-inch, 150-DPI canvas (2700 pixels wide), skip the
+tight-bounding-box redraw, and use lossless PNG compression level 1. The smaller
+set of overview/CDF figures keeps the shared 300-DPI PNG default. A breakdown
+PNG newer than both its payload and renderer source is skipped, so an interrupted render resumes missing/stale figures
+instead of regenerating all 128. Stale generated rows and replaced PNG
+or JPG breakdowns are removed without touching subject-level plots.
 
 The flat registry also carries a `Scope` (`run` or `alignment`) so default
 selection never points a normal-run subject at an alignment bundle or vice
