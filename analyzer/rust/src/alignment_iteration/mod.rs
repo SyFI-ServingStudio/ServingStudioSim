@@ -235,6 +235,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .iter()
         .map(|item| (item.iteration, item))
         .collect();
+    let measured_gpu_cycles_ms = measured_gpu_cycles_ms(&measured.iteration_details)?;
+    let gpu_time_multiplier = read_gpu_time_multiplier(&input.simulation_log_dir)?;
     let kernel_names: BTreeMap<u64, &str> = measured
         .kernel_names
         .iter()
@@ -253,6 +255,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let mut total_abs_relative = Vec::new();
     let mut cumulative_measured = 0.0;
     let mut cumulative_simulated = 0.0;
+    let mut cumulative_measured_gpu_cycle = 0.0;
+    let mut cumulative_simulated_gpu_cycle = 0.0;
     let mut kernel_inventory: BTreeMap<String, KernelAggregate> = BTreeMap::new();
     let mut operation_stats: BTreeMap<String, OperationAggregate> = BTreeMap::new();
     let mut unmapped_measured: BTreeMap<(String, String), (String, usize, f64)> = BTreeMap::new();
@@ -324,6 +328,32 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             total_relative.push(value);
             total_abs_relative.push(value.abs());
         }
+        let measured_gpu_cycle_ms = measured_gpu_cycles_ms
+            .get(&measured_iter.iteration)
+            .copied();
+        let simulated_gpu_cycle_ms =
+            measured_gpu_cycle_ms.map(|_| sim.total_ms * gpu_time_multiplier);
+        let (
+            gpu_cycle_delta_ms,
+            gpu_cycle_relative_diff_pct,
+            gpu_cycle_cumulative_delta_ms,
+            gpu_cycle_cumulative_relative_diff_pct,
+        ) = match (measured_gpu_cycle_ms, simulated_gpu_cycle_ms) {
+            (Some(measured_cycle), Some(simulated_cycle)) => {
+                cumulative_measured_gpu_cycle += measured_cycle;
+                cumulative_simulated_gpu_cycle += simulated_cycle;
+                let delta = simulated_cycle - measured_cycle;
+                let cumulative_delta =
+                    cumulative_simulated_gpu_cycle - cumulative_measured_gpu_cycle;
+                (
+                    Some(delta),
+                    ratio_pct(delta, measured_cycle),
+                    Some(cumulative_delta),
+                    ratio_pct(cumulative_delta, cumulative_measured_gpu_cycle),
+                )
+            }
+            _ => (None, None, None, None),
+        };
 
         let mut measured_ops: BTreeMap<String, f64> = BTreeMap::new();
         let mut sim_ops: BTreeMap<String, f64> = BTreeMap::new();
@@ -569,6 +599,12 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "relative_diff_pct": relative_pct,
             "cumulative_delta_ms": cumulative_delta_ms,
             "cumulative_relative_diff_pct": cumulative_relative_pct,
+            "measured_gpu_cycle_ms": measured_gpu_cycle_ms,
+            "simulated_gpu_cycle_ms": simulated_gpu_cycle_ms,
+            "gpu_cycle_delta_ms": gpu_cycle_delta_ms,
+            "gpu_cycle_relative_diff_pct": gpu_cycle_relative_diff_pct,
+            "gpu_cycle_cumulative_delta_ms": gpu_cycle_cumulative_delta_ms,
+            "gpu_cycle_cumulative_relative_diff_pct": gpu_cycle_cumulative_relative_diff_pct,
         }));
         breakdowns.push(json!({
             "case_index": joined.case_index,
@@ -642,6 +678,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "predict_log_dir": input.predict_log_dir.display().to_string(),
             "measured_phases": inventory.phases.keys().collect::<Vec<_>>(),
             "iterations": iteration_rows.len(),
+            "gpu_time_multiplier": gpu_time_multiplier,
         },
         "available": true,
         "total_iteration": {
@@ -678,6 +715,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
             "measured_phases": inventory.phases.keys().collect::<Vec<_>>(),
+            "gpu_time_multiplier": gpu_time_multiplier,
         },
         "iterations": report["iterations"],
         "breakdowns": breakdowns,
@@ -975,6 +1013,78 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }
 
+/// Read the wall-time scale from the one worker supported by alignment v1.
+///
+/// The analyzer deliberately reads the launcher-normalized JSON as bare values:
+/// it must not depend on simulator config types, while the explicit one-group
+/// check prevents silently choosing a multiplier in an unsupported deployment.
+fn read_gpu_time_multiplier(simulation_log_dir: &Path) -> Result<f64> {
+    let params_path = resolve_artifact_path(simulation_log_dir, "params.json");
+    let params: Value = read_json(&params_path)?;
+    let pools = params
+        .get("pools")
+        .and_then(Value::as_object)
+        .context("simulation params.json must contain a pools object")?;
+    let mut groups = Vec::new();
+    for (pool_name, pool) in pools {
+        let pool_groups = pool
+            .get("groups")
+            .and_then(Value::as_array)
+            .with_context(|| format!("simulation pool {pool_name:?} must contain groups"))?;
+        groups.extend(pool_groups);
+    }
+    ensure!(
+        groups.len() == 1,
+        "alignment v1 expects exactly one simulation worker group; found {}",
+        groups.len()
+    );
+    let multiplier = groups[0]
+        .pointer("/worker/gpu_time_multiplier")
+        .and_then(Value::as_f64)
+        .context("aligned simulation worker is missing numeric gpu_time_multiplier")?;
+    ensure!(
+        multiplier.is_finite() && multiplier >= 1.0,
+        "gpu_time_multiplier must be finite and >= 1.0; found {multiplier}"
+    );
+    Ok(multiplier)
+}
+
+/// Build first-kernel(i) -> first-kernel(i+1) GPU cycles in execution order.
+/// The final valid iteration intentionally has no entry because its next GPU
+/// boundary is unknown; the overview renderer excludes that row.
+fn measured_gpu_cycles_ms(iterations: &[MeasuredIteration]) -> Result<BTreeMap<u64, f64>> {
+    let mut starts = Vec::new();
+    let mut seen_iterations = BTreeSet::new();
+    for iteration in iterations {
+        ensure!(
+            seen_iterations.insert(iteration.iteration),
+            "duplicate measured iteration {}",
+            iteration.iteration
+        );
+        let first_start_ns = iteration
+            .ranges
+            .iter()
+            .flat_map(|range| range.kernels.iter().map(|kernel| kernel.start_ns))
+            .min();
+        if let Some(first_start_ns) = first_start_ns {
+            starts.push((first_start_ns, iteration.iteration));
+        }
+    }
+    starts.sort_unstable();
+
+    let mut cycles = BTreeMap::new();
+    for pair in starts.windows(2) {
+        let (start_ns, iteration_id) = pair[0];
+        let (next_start_ns, next_iteration_id) = pair[1];
+        ensure!(
+            next_start_ns > start_ns,
+            "measured iterations {iteration_id} and {next_iteration_id} have non-increasing first-kernel timestamps"
+        );
+        cycles.insert(iteration_id, (next_start_ns - start_ns) as f64 / 1e6);
+    }
+    Ok(cycles)
+}
+
 fn interval_union_ns(intervals: &[(u64, u64)]) -> u64 {
     let mut sorted: Vec<_> = intervals
         .iter()
@@ -1028,6 +1138,9 @@ fn definitions() -> Value {
         "total_measured_ms": "union of CUDA kernel intervals across every captured NSYS phase",
         "total_simulated_ms": "timing-predict cost-tree total_time_ms (Sum/Max/Scale semantics preserved)",
         "relative_diff_pct": "(simulated - measured) / measured * 100; positive means overprediction",
+        "measured_gpu_cycle_ms": "CUPTI first-kernel start of the next valid measured iteration minus first-kernel start of this iteration; the final valid iteration has no cycle",
+        "simulated_gpu_cycle_ms": "timing-predict total_time_ms multiplied by the aligned simulation worker's gpu_time_multiplier",
+        "gpu_cycle_relative_diff_pct": "(scaled timing-predict GPU cycle - measured GPU cycle) / measured GPU cycle * 100; positive means overprediction",
         "operation_measured_ms": "sum of durations of measured CUDA kernels mapped to the operation",
         "operation_simulated_ms": "sum of mapped sim leaf times after CostTree Scale multiplicity; workload time, not additive wall time when Max/overlap exists",
         "measured_kernel_duration_ms": "sum of launch durations for one exact NSYS kernel identity within an iteration; repeated calls remain visible through calls",
@@ -1061,6 +1174,35 @@ mod tests {
     #[test]
     fn interval_union_merges_overlap_across_phases() {
         assert_eq!(interval_union_ns(&[(10, 20), (15, 30), (40, 45)]), 25);
+    }
+
+    #[test]
+    fn gpu_cycles_use_chronological_first_kernel_boundaries() {
+        let measured_iteration = |iteration, start_ns| MeasuredIteration {
+            iteration,
+            iteration_type: "decode".into(),
+            ranges: vec![MeasuredRange {
+                device_id: Some(0),
+                phase: "forward".into(),
+                kernels: vec![MeasuredKernel {
+                    name_id: 1,
+                    category: "gemm".into(),
+                    start_ns,
+                    end_ns: start_ns + 100,
+                }],
+            }],
+        };
+        let iterations = vec![
+            measured_iteration(9, 20_000_000),
+            measured_iteration(7, 5_000_000),
+            measured_iteration(8, 12_000_000),
+        ];
+
+        let cycles = measured_gpu_cycles_ms(&iterations).unwrap();
+
+        assert_eq!(cycles[&7], 7.0);
+        assert_eq!(cycles[&8], 8.0);
+        assert!(!cycles.contains_key(&9));
     }
 
     #[test]

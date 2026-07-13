@@ -19,6 +19,7 @@ pub struct AlignmentManifest {
     pub analysis_log_dir: PathBuf,
     pub parsed_nsys: PathBuf,
     pub replay_result: PathBuf,
+    pub request_timings_result: Option<PathBuf>,
     pub predict_log_dir: PathBuf,
     pub timing_predict_case_map: PathBuf,
     pub labeled_kernel_sequences: Option<PathBuf>,
@@ -57,7 +58,7 @@ pub fn read(log_dir: &Path) -> Result<AlignmentManifest> {
     let manifest: AlignmentManifest = serde_json::from_str(&text)
         .with_context(|| format!("parse alignment manifest at {}", path.display()))?;
     ensure!(
-        manifest.schema_version == 3,
+        manifest.schema_version == 4,
         "unsupported alignment manifest schema_version {}",
         manifest.schema_version
     );

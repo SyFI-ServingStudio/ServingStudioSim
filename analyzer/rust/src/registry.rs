@@ -225,7 +225,7 @@ pub const SUBJECTS: &[Subject] = &[
     Subject {
         name: "alignment-e2e",
         category: Category::AlignmentE2e,
-        description: "Paired real-vs-sim request TTFT/TPOT/E2E deltas and completion-throughput over time.",
+        description: "Measured-vs-simulated raw TTFT/TPOT/E2E distributions and completion throughput; request ids audit completeness only.",
         report_name: "alignment_e2e_report.json",
         payload_name: "alignment_e2e_series.json",
         applies: Applies::All,

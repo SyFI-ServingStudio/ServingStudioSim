@@ -68,6 +68,9 @@ struct MeasuredKernel {
 struct WorkloadPoint {
     iteration_id: u64,
     time_ms: f64,
+    /// Actual cycle boundary to the next iteration. The final point has no next
+    /// boundary and therefore remains `None` rather than inventing a duration.
+    iteration_cycle_ms: Option<f64>,
     prefill_tokens: u64,
     decode_batch_size: u64,
     scheduled_kv_tokens: u64,
@@ -112,6 +115,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "simulated_iterations": simulated.len(),
             "measured_span_ms": measured.last().map(|point| point.time_ms),
             "simulated_span_ms": simulated.last().map(|point| point.time_ms),
+            "measured_iteration_cycles": measured.iter().filter(|point| point.iteration_cycle_ms.is_some()).count(),
+            "simulated_iteration_cycles": simulated.iter().filter(|point| point.iteration_cycle_ms.is_some()).count(),
         },
         "available": true,
         "metrics": {
@@ -126,6 +131,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 &simulated,
                 |point| point.scheduled_kv_tokens,
             ),
+            "iteration_cycle_ms": paired_cycle_stats(&measured, &simulated),
         },
         "definitions": definitions.clone(),
     });
@@ -185,18 +191,21 @@ fn read_measured_points(path: &Path) -> Result<Vec<WorkloadPoint>> {
     let Some(origin_ns) = raw.first().map(|row| row.0) else {
         return Ok(Vec::new());
     };
-    Ok(raw
+    let mut points: Vec<WorkloadPoint> = raw
         .into_iter()
         .map(
             |(start_ns, iteration_id, metrics, scheduled_kv_tokens)| WorkloadPoint {
                 iteration_id,
                 time_ms: start_ns.saturating_sub(origin_ns) as f64 / 1e6,
+                iteration_cycle_ms: None,
                 prefill_tokens: metrics.prefill_tokens,
                 decode_batch_size: metrics.decode_kv_lens.len() as u64,
                 scheduled_kv_tokens,
             },
         )
-        .collect())
+        .collect();
+    assign_iteration_cycles(&mut points);
+    Ok(points)
 }
 
 async fn read_simulated_points(ctx: &SessionContext) -> Result<Vec<WorkloadPoint>> {
@@ -253,6 +262,7 @@ async fn read_simulated_points(ctx: &SessionContext) -> Result<Vec<WorkloadPoint
             raw.push(WorkloadPoint {
                 iteration_id,
                 time_ms: value_f64(wall_start_ms, row)?,
+                iteration_cycle_ms: None,
                 prefill_tokens,
                 decode_batch_size,
                 scheduled_kv_tokens,
@@ -267,12 +277,23 @@ async fn read_simulated_points(ctx: &SessionContext) -> Result<Vec<WorkloadPoint
         streams
     );
     raw.sort_by(|left, right| left.time_ms.total_cmp(&right.time_ms));
+    assign_iteration_cycles(&mut raw);
     if let Some(origin_ms) = raw.first().map(|point| point.time_ms) {
         for point in &mut raw {
             point.time_ms -= origin_ms;
         }
     }
     Ok(raw)
+}
+
+/// Derive actual iteration cycles from adjacent execution boundaries. On the
+/// measured side `time_ms` comes from first GPU-kernel starts; on the simulation
+/// side it is the worker's actual `wall_start_ms`, after `gpu_time_multiplier`
+/// and tick scheduling have already affected the clock.
+fn assign_iteration_cycles(points: &mut [WorkloadPoint]) {
+    for index in 0..points.len().saturating_sub(1) {
+        points[index].iteration_cycle_ms = Some(points[index + 1].time_ms - points[index].time_ms);
+    }
 }
 
 fn paired_stats<F>(measured: &[WorkloadPoint], simulated: &[WorkloadPoint], select: F) -> Value
@@ -287,10 +308,29 @@ where
     })
 }
 
+fn paired_cycle_stats(measured: &[WorkloadPoint], simulated: &[WorkloadPoint]) -> Value {
+    let measured_values: Vec<f64> = measured
+        .iter()
+        .filter_map(|point| point.iteration_cycle_ms)
+        .collect();
+    let simulated_values: Vec<f64> = simulated
+        .iter()
+        .filter_map(|point| point.iteration_cycle_ms)
+        .collect();
+    json!({
+        "measured": stats(&clean_nonnegative_sorted(&measured_values)),
+        "simulated": stats(&clean_nonnegative_sorted(&simulated_values)),
+    })
+}
+
 fn point_series(points: &[WorkloadPoint]) -> Value {
     json!({
         "time_ms": points.iter().map(|point| point.time_ms).collect::<Vec<_>>(),
         "iteration_id": points.iter().map(|point| point.iteration_id).collect::<Vec<_>>(),
+        "iteration_cycle_ms": points
+            .iter()
+            .map(|point| point.iteration_cycle_ms)
+            .collect::<Vec<_>>(),
         "prefill_tokens": points.iter().map(|point| point.prefill_tokens).collect::<Vec<_>>(),
         "decode_batch_size": points
             .iter()
@@ -307,6 +347,11 @@ fn definitions() -> Value {
     json!({
         "grain": "one scheduler iteration; measured and simulated series keep their own iteration ids",
         "plot_axis": "recorded iteration_id on each side; ids are not renumbered or paired",
+        "iteration_cycle_ms": {
+            "measured": "first kernel start of this NSYS iteration to first kernel start of the next valid iteration",
+            "simulated": "this actual top-level iter cost_log wall_start_ms to the next; includes gpu_time_multiplier, tick quantization, and any scheduler gap",
+            "last_iteration": "null because no next boundary exists",
+        },
         "time_axis": {
             "measured": "first kernel launch of an NSYS iteration minus the first captured iteration's first kernel launch",
             "simulated": "top-level iter cost_log wall_start_ms minus the first simulated iteration's wall_start_ms; this includes simulator gpu_time_multiplier effects",

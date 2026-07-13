@@ -51,6 +51,59 @@ def test_structured_vllm_iteration_record_is_the_only_metrics_contract(tmp_path)
     assert json.loads(output.read_text()) == record
 
 
+def test_structured_vllm_request_timing_is_extracted_separately(tmp_path):
+    record = {
+        "schema_version": 1,
+        "engine_request_id": "cmpl-vibesim_7-0",
+        "engine_core_ttft_ms": 12.5,
+        "engine_queue_wait_ms": 3.0,
+        "engine_first_schedule_to_first_token_ms": 9.5,
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(f"INFO VibeSimAlignmentRequestTiming {json.dumps(record)}\n")
+    output = tmp_path / "request_timings.jsonl"
+
+    assert vllm_server.extract_request_timings_jsonl(server_log, output) == 1
+    assert json.loads(output.read_text()) == {**record, "request_id": "vibesim_7"}
+
+
+def test_request_timing_extraction_filters_frontend_preflight_requests(tmp_path):
+    def record(engine_request_id: str) -> dict:
+        return {
+            "schema_version": 1,
+            "engine_request_id": engine_request_id,
+            "engine_core_ttft_ms": 12.5,
+            "engine_queue_wait_ms": 3.0,
+            "engine_first_schedule_to_first_token_ms": 9.5,
+        }
+
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            f"INFO VibeSimAlignmentRequestTiming {json.dumps(row)}"
+            for row in [
+                record("cmpl-prefix-cache-probe-0"),
+                record("cmpl-vibesim_7-0"),
+                record("cmpl-vibesim_8-0"),
+            ]
+        )
+    )
+    output = tmp_path / "request_timings.jsonl"
+
+    assert (
+        vllm_server.extract_request_timings_jsonl(
+            server_log,
+            output,
+            expected_request_ids={"vibesim_7", "vibesim_8"},
+        )
+        == 2
+    )
+    assert [json.loads(line)["request_id"] for line in output.read_text().splitlines()] == [
+        "vibesim_7",
+        "vibesim_8",
+    ]
+
+
 def test_vllm_text_adapter_preserves_exact_shape_and_join():
     parsed = {
         "iteration_details": [
@@ -218,6 +271,9 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     (sim / "raw").mkdir(parents=True)
     profile.mkdir(exist_ok=True)
     analysis.mkdir()
+    (sim / "raw" / "params.json").write_text(
+        json.dumps({"pools": {"main": {"groups": [{"worker": {"gpu_time_multiplier": 1.25}}]}}})
+    )
 
     manifest = {
         "sections": [
@@ -262,8 +318,8 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
         "schema_version": 2,
         "kernel_names": {"1": "nvjet_qkv", "2": "flashinfer_decode", "3": "nvjet_lm_head"},
         "iteration_details": [
-            _measured_iteration(34, 2_000_000, 1_000_000, 500_000),
-            _measured_iteration(35, 2_100_000, 1_100_000, 600_000),
+            _measured_iteration(34, 2_000_000, 1_000_000, 500_000, start_ns=0),
+            _measured_iteration(35, 2_100_000, 1_100_000, 600_000, start_ns=10_000_000),
         ],
     }
     parsed_path = profile / "parsed.json"
@@ -360,6 +416,27 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
 
     replay = profile / "replay.jsonl"
     replay.write_text("\n".join([_replay_row("1", 1.0, 1.2), _replay_row("2", 1.0, 1.3)]))
+    request_timings = profile / "request_timings.jsonl"
+    request_timings.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "request_id": "vibesim_1",
+                        "engine_core_ttft_ms": 30.0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "request_id": "vibesim_2",
+                        "engine_core_ttft_ms": 35.0,
+                    }
+                ),
+            ]
+        )
+    )
     pq.write_table(
         pa.table(
             {
@@ -379,12 +456,13 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     (analysis / "alignment_manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "profile_log_dir": str(profile),
                 "simulation_log_dir": str(sim),
                 "analysis_log_dir": str(analysis),
                 "parsed_nsys": str(parsed_path),
                 "replay_result": str(replay),
+                "request_timings_result": str(request_timings),
                 "predict_log_dir": str(predict),
                 "timing_predict_case_map": str(case_map),
                 "labeled_kernel_sequences": str(labeled),
@@ -416,6 +494,10 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     assert iteration_report["mapping"]["coverage"]["measured_duration_fraction"] == 1.0
     assert len(iteration_report["kernels"]) == 3
     assert iteration_report["iterations"][0]["measured_ms"] == 3.5
+    assert iteration_report["meta"]["gpu_time_multiplier"] == 1.25
+    assert iteration_report["iterations"][0]["measured_gpu_cycle_ms"] == 10.0
+    assert iteration_report["iterations"][0]["simulated_gpu_cycle_ms"] == 4.75
+    assert iteration_report["iterations"][1]["measured_gpu_cycle_ms"] is None
     breakdown = iteration_payload["breakdowns"][0]
     assert "operations" not in breakdown
     assert [kernel["name"] for kernel in breakdown["measured_kernels"]] == [
@@ -459,13 +541,25 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
         "unified.attn",
         "unified.attn.combine",
     ]
-    assert e2e_report["meta"]["paired_requests"] == 2
+    assert e2e_report["meta"]["request_id_audit"]["shared_ids"] == 2
+    assert e2e_report["latency"]["client_ttft"]["measured_ms"]["mean"] == 40.0
+    assert e2e_report["latency"]["server_ttft"]["measured_ms"]["mean"] == 32.5
     assert (analysis / "plots" / "alignment_iteration_overview.png").is_file()
-    assert (analysis / "plots" / "alignment_iteration_34_breakdown.png").is_file()
+    assert (analysis / "plots" / "alignment_iteration_gpu_cycle_overview.png").is_file()
+    assert (analysis / "plots" / "iter_34_to_35" / "iter_34_breakdown.png").is_file()
     assert (analysis / "plots" / "alignment_e2e_completion_throughput.png").is_file()
+    assert (analysis / "plots" / "alignment_client_ttft_cdf_comparison.png").is_file()
+    assert (analysis / "plots" / "alignment_server_ttft_cdf_comparison.png").is_file()
 
 
-def _measured_iteration(iteration: int, gemm_ns: int, attention_ns: int, lm_head_ns: int) -> dict:
+def _measured_iteration(
+    iteration: int,
+    gemm_ns: int,
+    attention_ns: int,
+    lm_head_ns: int,
+    *,
+    start_ns: int,
+) -> dict:
     return {
         "iteration": iteration,
         "iteration_type": "decode",
@@ -475,12 +569,17 @@ def _measured_iteration(iteration: int, gemm_ns: int, attention_ns: int, lm_head
                 "phase": "forward",
                 "kernel_busy_union_ns": gemm_ns + attention_ns,
                 "kernels": [
-                    {"name_id": 1, "category": "gemm_or_cutlass", "start_ns": 0, "end_ns": gemm_ns},
+                    {
+                        "name_id": 1,
+                        "category": "gemm_or_cutlass",
+                        "start_ns": start_ns,
+                        "end_ns": start_ns + gemm_ns,
+                    },
                     {
                         "name_id": 2,
                         "category": "attention",
-                        "start_ns": gemm_ns,
-                        "end_ns": gemm_ns + attention_ns,
+                        "start_ns": start_ns + gemm_ns,
+                        "end_ns": start_ns + gemm_ns + attention_ns,
                     },
                 ],
             },
@@ -491,8 +590,8 @@ def _measured_iteration(iteration: int, gemm_ns: int, attention_ns: int, lm_head
                     {
                         "name_id": 3,
                         "category": "gemm_or_cutlass",
-                        "start_ns": gemm_ns + attention_ns,
-                        "end_ns": gemm_ns + attention_ns + lm_head_ns,
+                        "start_ns": start_ns + gemm_ns + attention_ns,
+                        "end_ns": start_ns + gemm_ns + attention_ns + lm_head_ns,
                     }
                 ],
             },

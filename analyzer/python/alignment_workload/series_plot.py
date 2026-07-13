@@ -31,6 +31,12 @@ _PLOTS = (
         "KV tokens touched",
         "alignment_scheduled_kv_workload_over_time.png",
     ),
+    (
+        "iteration_cycle_ms",
+        "Actual iteration cycle: vLLM vs VibeSim",
+        "iteration cycle (ms)",
+        "alignment_iteration_time_by_iteration.png",
+    ),
 )
 
 
@@ -69,17 +75,29 @@ def _render_series(
     *,
     run_label: str,
 ) -> Path:
-    measured_iteration_ids = measured["iteration_id"]
-    simulated_iteration_ids = simulated["iteration_id"]
-    measured_values = measured[key]
-    simulated_values = simulated[key]
+    measured_points = [
+        (iteration_id, value)
+        for iteration_id, value in zip(measured["iteration_id"], measured[key], strict=True)
+        if value is not None
+    ]
+    simulated_points = [
+        (iteration_id, value)
+        for iteration_id, value in zip(simulated["iteration_id"], simulated[key], strict=True)
+        if value is not None
+    ]
+    measured_iteration_ids, measured_values = zip(*measured_points, strict=True)
+    simulated_iteration_ids, simulated_values = zip(*simulated_points, strict=True)
+    measured_label = "vLLM GPU cycle" if key == "iteration_cycle_ms" else "vLLM measured"
+    simulated_label = (
+        "VibeSim actual cycle" if key == "iteration_cycle_ms" else "VibeSim"
+    )
 
     fig, ax = new_axes(figsize=(10.0, 4.8))
     ax.step(
         measured_iteration_ids,
         measured_values,
         where="post",
-        label="vLLM measured",
+        label=measured_label,
         color=CURVE,
         linewidth=1.8,
     )
@@ -87,7 +105,7 @@ def _render_series(
         simulated_iteration_ids,
         simulated_values,
         where="post",
-        label="VibeSim",
+        label=simulated_label,
         color=ACCENT,
         linewidth=1.8,
         linestyle="--",

@@ -10,7 +10,9 @@ orchestrated in `__main__.py`.
 The fork (`alignment/profiler/vllm`, branch `moesim-profile`) adds the
 `vllm_iteration(N): <phase>` NVTX scopes (gated by `VLLM_NVTX_SCOPES_FOR_PROFILING`)
 and a versioned `VibeSimAlignmentIteration {json}` record containing the exact
-model input shape consumed by the typed predictor adapter.
+model input shape consumed by the typed predictor adapter. Per-request
+`VibeSimAlignmentRequestTiming {json}` records expose engine-queue-to-first-token
+timing separately from TraceLab's client-observed TTFT.
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ HEALTH_ENDPOINTS = ("/health", "/v1/models")
 # Structured fork-owned record. Do not parse the human `Iteration(...)` line:
 # its wording is vLLM UI, while this JSON is the versioned analyzer contract.
 _ALIGNMENT_ITERATION_RE = re.compile(r"VibeSimAlignmentIteration\s+(\{.*\})\s*$")
+_ALIGNMENT_REQUEST_TIMING_RE = re.compile(r"VibeSimAlignmentRequestTiming\s+(\{.*\})\s*$")
+_COMPLETION_ENGINE_REQUEST_RE = re.compile(r"^cmpl-(.+)-0$")
 
 
 def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
@@ -172,18 +176,19 @@ def _get(url: str, timeout: float = 5.0):
         return None, None
 
 
-def set_cuda_profile(base_url: str, *, active: bool, timeout: float = 30.0) -> None:
-    """Start or stop vLLM's worker-owned CUDA profiler through its HTTP API."""
+def set_cuda_profile(base_url: str, *, active: bool, timeout: float = 120.0) -> None:
+    """Start or stop vLLM's worker-owned CUDA profiler through its HTTP API.
+
+    Stopping can block while Nsight finalizes a large report inside the worker;
+    the HTTP response is therefore allowed to outlive the ordinary health-check
+    timeout. The launcher still owns process shutdown if this bound is exceeded.
+    """
     action = "start_profile" if active else "stop_profile"
-    request = urllib.request.Request(
-        f"{base_url}/{action}", data=b"", method="POST"
-    )
+    request = urllib.request.Request(f"{base_url}/{action}", data=b"", method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             if response.status != 200:
-                raise RuntimeError(
-                    f"vLLM /{action} returned HTTP {response.status}"
-                )
+                raise RuntimeError(f"vLLM /{action} returned HTTP {response.status}")
     except (urllib.error.URLError, OSError) as exc:
         raise RuntimeError(f"vLLM /{action} failed: {exc}") from exc
 
@@ -229,9 +234,7 @@ def extract_metrics_jsonl(server_log: Path, out_jsonl: Path) -> int:
             row = json.loads(m.group(1))
             missing = required - set(row)
             if missing:
-                raise ValueError(
-                    f"alignment iteration record missing fields {sorted(missing)}"
-                )
+                raise ValueError(f"alignment iteration record missing fields {sorted(missing)}")
             if row["schema_version"] != 1 or row["input_adapter"] != "vllm_text":
                 raise ValueError(
                     "unsupported alignment iteration record "
@@ -239,6 +242,87 @@ def extract_metrics_jsonl(server_log: Path, out_jsonl: Path) -> int:
                 )
             out.write(json.dumps(row) + "\n")
             n += 1
+    return n
+
+
+def extract_request_timings_jsonl(
+    server_log: Path,
+    out_jsonl: Path,
+    *,
+    expected_request_ids: set[str] | None = None,
+) -> int:
+    """Extract engine-queue → first-token-iteration timing per request.
+
+    This is deliberately separate from client-observed TraceLab TTFT. Both
+    boundaries are EngineCore monotonic timestamps, so the result excludes the
+    HTTP/frontend ingress and first-token SSE return path.
+    """
+    duration_fields = {
+        "engine_core_ttft_ms",
+        "engine_queue_wait_ms",
+        "engine_first_schedule_to_first_token_ms",
+    }
+    required = {"schema_version", *duration_fields}
+    request_ids: set[str] = set()
+    n = 0
+    with Path(out_jsonl).open("w") as out:
+        for line in Path(server_log).read_text(errors="replace").splitlines():
+            match = _ALIGNMENT_REQUEST_TIMING_RE.search(line)
+            if not match:
+                continue
+            row = json.loads(match.group(1))
+            missing = required - set(row)
+            if missing:
+                raise ValueError(
+                    f"alignment request timing record missing fields {sorted(missing)}"
+                )
+            if row["schema_version"] != 1:
+                raise ValueError(
+                    f"unsupported alignment request timing schema {row['schema_version']!r}"
+                )
+            # The vLLM OpenAI completions frontend wraps X-Request-Id before
+            # enqueueing it as `cmpl-<source-id>-0`. TraceLab sends one prompt
+            # per request, so index 0 is the only supported alignment shape.
+            # `request_id` was the raw field name in the first instrumented run;
+            # accept it so an in-flight capture remains extractable.
+            engine_request_id = row.get("engine_request_id", row.get("request_id"))
+            if not isinstance(engine_request_id, str) or not engine_request_id:
+                raise ValueError("alignment request timing engine_request_id must be non-empty")
+            completion_match = _COMPLETION_ENGINE_REQUEST_RE.fullmatch(engine_request_id)
+            request_id = (
+                completion_match.group(1) if completion_match is not None else engine_request_id
+            )
+            # vLLM may issue frontend-owned prefix-cache probes before TraceLab
+            # starts the replay. The replay's successful request ids are the
+            # authoritative experiment population; unrelated timing records are
+            # intentionally excluded instead of relying on a fixed probe count.
+            if expected_request_ids is not None and request_id not in expected_request_ids:
+                continue
+            if request_id in request_ids:
+                raise ValueError(f"duplicate alignment request timing for {request_id!r}")
+            request_ids.add(request_id)
+            row["engine_request_id"] = engine_request_id
+            row["request_id"] = request_id
+            for field in duration_fields:
+                value = row[field]
+                if not isinstance(value, (int, float)) or value < 0:
+                    raise ValueError(f"alignment request timing {field} must be nonnegative")
+            components_ms = (
+                row["engine_queue_wait_ms"] + row["engine_first_schedule_to_first_token_ms"]
+            )
+            if abs(row["engine_core_ttft_ms"] - components_ms) > 1e-6:
+                raise ValueError(
+                    "alignment request timing components do not sum to engine_core_ttft_ms"
+                )
+            out.write(json.dumps(row) + "\n")
+            n += 1
+    if expected_request_ids is not None and request_ids != expected_request_ids:
+        missing = sorted(expected_request_ids - request_ids)
+        extra = sorted(request_ids - expected_request_ids)
+        raise ValueError(
+            "alignment request timing ids do not match successful replay ids: "
+            f"missing={missing[:8]!r} extra={extra[:8]!r}"
+        )
     return n
 
 

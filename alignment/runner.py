@@ -27,6 +27,27 @@ from .profiler.config import ProfileConfig
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _successful_replay_request_ids(replay_jsonl: Path) -> set[str]:
+    """Return the exact TraceLab request ids submitted successfully to vLLM."""
+    request_ids: set[str] = set()
+    for line_number, line in enumerate(replay_jsonl.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        outcome = row.get("outcome")
+        if not isinstance(outcome, dict) or outcome.get("status") != "SUCCESS":
+            continue
+        request_id = outcome.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError(
+                f"successful replay row {line_number} has no non-empty outcome.request_id"
+            )
+        if request_id in request_ids:
+            raise ValueError(f"duplicate successful replay request id {request_id!r}")
+        request_ids.add(request_id)
+    return request_ids
+
+
 def _resolve_fork_python(cfg: ProfileConfig) -> str:
     default_fork = REPO_ROOT / "alignment/profiler/vllm/.venv/bin/python"
     fork = Path(cfg.fork_python) if cfg.fork_python else default_fork
@@ -138,10 +159,18 @@ def run_profile(cfg: ProfileConfig) -> dict:
     sqlite_path = nsys_capture.export_sqlite(rep)
     metrics_jsonl = vllm_dir / f"{cfg.name}_metrics.jsonl"
     n_metrics = vllm_server.extract_metrics_jsonl(server_log, metrics_jsonl)
+    request_timings_jsonl = vllm_dir / f"{cfg.name}_request_timings.jsonl"
+    successful_request_ids = _successful_replay_request_ids(prepared_replay.log_path)
+    n_request_timings = vllm_server.extract_request_timings_jsonl(
+        server_log,
+        request_timings_jsonl,
+        expected_request_ids=successful_request_ids,
+    )
     validation = nsys_capture.validate_export(sqlite_path)
     print(
         f"[profile] export ok: sqlite={sqlite_path.name} "
-        f"metrics_iters={n_metrics} validation={validation}"
+        f"metrics_iters={n_metrics} request_timings={n_request_timings} "
+        f"validation={validation}"
     )
     if not validation["ok"]:
         print("[warn] export validation failed — capture window may have missed target iterations")
@@ -168,6 +197,8 @@ def run_profile(cfg: ProfileConfig) -> dict:
         "log_dir": str(log_dir),
         "sqlite": str(sqlite_path),
         "metrics_jsonl": str(metrics_jsonl),
+        "request_timings_jsonl": str(request_timings_jsonl),
+        "request_timing_count": n_request_timings,
         "parsed_nsys": str(parsed_path),
         "kernel_sequences": str(kernel_sequences_path),
         "server_log": str(server_log),

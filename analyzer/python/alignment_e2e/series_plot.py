@@ -1,4 +1,4 @@
-"""Render completion-throughput and paired latency-error CDFs."""
+"""Render completion throughput and raw measured-vs-sim latency CDFs."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
-from common.cdf_plot import render_cdf
+from common.cdf_plot import render_cdf_comparison
 from common.figure import add_legend, finalize, new_axes
 from common.layout import load_payload, plot_output_path, resolve_artifact
 from common.style import ACCENT, CURVE
@@ -31,14 +31,15 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
             run_label=log_dir.name,
         )
     ]
-    for series in payload.get("latency_abs_relative_cdf") or []:
-        if not series.get("x"):
-            continue
+    for comparison in payload.get("latency_cdf_comparisons") or []:
         jobs.append(
             partial(
-                render_cdf,
-                series,
-                plot_output_path(log_dir, f"alignment_{series['key']}_cdf.png"),
+                render_cdf_comparison,
+                comparison,
+                plot_output_path(
+                    log_dir,
+                    f"alignment_{comparison['key']}_cdf_comparison.png",
+                ),
                 run_label=log_dir.name,
             )
         )

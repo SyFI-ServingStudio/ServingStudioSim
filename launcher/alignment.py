@@ -164,6 +164,13 @@ def _profile_artifact(result: dict[str, Any], key: str) -> Path:
     return path
 
 
+def _optional_profile_artifact(result: dict[str, Any], key: str) -> Path | None:
+    """Resolve a versioned profile artifact that older captures may not own."""
+    if result.get(key) is None:
+        return None
+    return _profile_artifact(result, key)
+
+
 def _warn_if_trace_mismatch(params: dict[str, Any], profile_result: dict[str, Any]) -> None:
     workload = params.get("workload")
     traces = workload.get("trace_files") if isinstance(workload, dict) else None
@@ -224,6 +231,9 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
     simulation_params = _load_simulation_params(config.simulation_log_dir)
     _simulation_target(simulation_params)
     profile_result = _load_profile_result(config.profile_log_dir)
+    request_timings_result = _optional_profile_artifact(
+        profile_result, "request_timings_jsonl"
+    )
     input_manifest = _read_input_manifest(config.timing_predict_log_dir)
     _require_manifest_dir(input_manifest, "simulation_log_dir", config.simulation_log_dir)
     _require_manifest_dir(input_manifest, "profile_log_dir", config.profile_log_dir)
@@ -249,12 +259,15 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
     manifest_path.write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "profile_log_dir": str(config.profile_log_dir),
                 "simulation_log_dir": str(config.simulation_log_dir),
                 "analysis_log_dir": str(config.log_dir),
                 "parsed_nsys": str(_manifest_path(input_manifest, "parsed_nsys")),
                 "replay_result": str(_profile_artifact(profile_result, "replay_result")),
+                "request_timings_result": (
+                    str(request_timings_result) if request_timings_result else None
+                ),
                 "predict_log_dir": str(config.timing_predict_log_dir),
                 "timing_predict_case_map": str(
                     _manifest_path(input_manifest, "timing_predict_case_map")

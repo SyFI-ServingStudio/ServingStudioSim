@@ -1,11 +1,12 @@
 //! End-to-end measured ↔ simulated request alignment.
 //!
-//! The shared VibeSim trace gives both sides the same request ids. This subject
-//! pairs completed requests for TTFT/TPOT/E2E error statistics and compares
-//! output-token completion throughput on one common time/bin axis. Completion
-//! throughput is intentionally named: TraceLab does not log every token timestamp,
-//! so both sides assign a request's output tokens to its completion bin rather
-//! than pretending to have an instantaneous token-production trace.
+//! TTFT/TPOT/E2E are compared as two independent raw distributions. Request ids
+//! only audit whether either run lost requests: execution order can differ even
+//! when both runs consume the same trace, so per-id latency subtraction would
+//! compare scheduler positions that are not equivalent. Completion throughput is
+//! intentionally named: TraceLab does not log every token timestamp, so both sides
+//! assign a request's output tokens to its completion bin rather than pretending
+//! to have an instantaneous token-production trace.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,7 +17,7 @@ use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
 use crate::alignment_input;
-use crate::cdf::{cdf_series, clean_nonnegative_sorted, percentile_sorted, stats, CdfSeries};
+use crate::cdf::{cdf_series, clean_nonnegative_sorted, stats};
 use crate::io::{resolve_artifact_path, SCHEMA_VERSION};
 use crate::session::{col, collect, register_if_exists, require_columns, value_f64};
 
@@ -40,15 +41,6 @@ struct RequestMetrics {
     e2e_ms: Option<f64>,
 }
 
-#[derive(Default)]
-struct PairedSamples {
-    measured: Vec<f64>,
-    simulated: Vec<f64>,
-    delta: Vec<f64>,
-    relative_pct: Vec<f64>,
-    abs_relative_pct: Vec<f64>,
-}
-
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read(log_dir)?;
     if !input.e2e.enabled {
@@ -60,6 +52,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     ensure!(input.e2e.throughput_bins > 0, "throughput_bins must be > 0");
 
     let measured = read_measured_requests(&input.replay_result)?;
+    let server_ttft = input
+        .request_timings_result
+        .as_deref()
+        .map(read_server_ttft)
+        .transpose()?;
     let simulated = read_sim_requests(ctx, &input.simulation_log_dir).await?;
     ensure!(
         !measured.is_empty(),
@@ -69,42 +66,69 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         !simulated.is_empty(),
         "simulation request_slo contains no completed requests"
     );
-
-    let mut ttft = PairedSamples::default();
-    let mut tpot = PairedSamples::default();
-    let mut e2e = PairedSamples::default();
-    let mut paired_requests = 0usize;
-    for (request_id, real) in &measured {
-        let Some(sim) = simulated.get(request_id) else {
-            continue;
-        };
-        paired_requests += 1;
-        add_pair(&mut ttft, real.ttft_ms, sim.ttft_ms);
-        add_pair(&mut tpot, real.tpot_ms, sim.tpot_ms);
-        add_pair(&mut e2e, real.e2e_ms, sim.e2e_ms);
+    if let Some(server_ttft) = &server_ttft {
+        ensure!(
+            server_ttft.len() == measured.len(),
+            "server timing request count {} does not match client replay request count {}",
+            server_ttft.len(),
+            measured.len()
+        );
     }
 
+    let measured_ttft = latency_samples(&measured, |request| request.ttft_ms);
+    let simulated_ttft = latency_samples(&simulated, |request| request.ttft_ms);
+    let measured_tpot = latency_samples(&measured, |request| request.tpot_ms);
+    let simulated_tpot = latency_samples(&simulated, |request| request.tpot_ms);
+    let measured_e2e = latency_samples(&measured, |request| request.e2e_ms);
+    let simulated_e2e = latency_samples(&simulated, |request| request.e2e_ms);
+
+    let shared_request_ids = measured
+        .keys()
+        .filter(|request_id| simulated.contains_key(*request_id))
+        .count();
+
     let throughput = throughput_series(&measured, &simulated, input.e2e.throughput_bins);
-    let latency_cdfs: Vec<CdfSeries> = vec![
-        cdf_series(
-            "ttft_abs_relative_error",
-            "TTFT absolute relative error",
-            "%",
-            &ttft.abs_relative_pct,
+    let mut latency_cdf_comparisons = vec![latency_cdf_comparison(
+        "client_ttft",
+        "Client-observed TTFT",
+        "Client measured",
+        &measured_ttft,
+        &simulated_ttft,
+    )];
+    if let Some(server_ttft) = &server_ttft {
+        latency_cdf_comparisons.push(latency_cdf_comparison(
+            "server_ttft",
+            "Server engine-core TTFT",
+            "Server measured",
+            server_ttft,
+            &simulated_ttft,
+        ));
+    }
+    latency_cdf_comparisons.extend([
+        latency_cdf_comparison(
+            "tpot",
+            "TPOT",
+            "Client measured",
+            &measured_tpot,
+            &simulated_tpot,
         ),
-        cdf_series(
-            "tpot_abs_relative_error",
-            "TPOT absolute relative error",
-            "%",
-            &tpot.abs_relative_pct,
+        latency_cdf_comparison(
+            "e2e",
+            "E2E",
+            "Client measured",
+            &measured_e2e,
+            &simulated_e2e,
         ),
-        cdf_series(
-            "e2e_abs_relative_error",
-            "E2E absolute relative error",
-            "%",
-            &e2e.abs_relative_pct,
-        ),
-    ];
+    ]);
+    let server_ttft_report = server_ttft.as_ref().map_or_else(
+        || {
+            json!({
+                "available": false,
+                "reason": "profile does not contain engine-core request timing instrumentation",
+            })
+        },
+        |samples| latency_distribution_report(samples, &simulated_ttft),
+    );
     let definitions = definitions();
     let report = json!({
         "schema_version": SCHEMA_VERSION,
@@ -113,16 +137,20 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "profile_log_dir": input.profile_log_dir.display().to_string(),
             "simulation_log_dir": input.simulation_log_dir.display().to_string(),
             "measured_successful_requests": measured.len(),
+            "server_measured_requests": server_ttft.as_ref().map(Vec::len),
             "simulated_completed_requests": simulated.len(),
-            "paired_requests": paired_requests,
-            "unpaired_measured_requests": measured.len().saturating_sub(paired_requests),
-            "unpaired_simulated_requests": simulated.len().saturating_sub(paired_requests),
+            "request_id_audit": {
+                "shared_ids": shared_request_ids,
+                "measured_only_ids": measured.len().saturating_sub(shared_request_ids),
+                "simulated_only_ids": simulated.len().saturating_sub(shared_request_ids),
+            },
         },
         "available": true,
         "latency": {
-            "ttft": paired_report(&ttft),
-            "tpot": paired_report(&tpot),
-            "e2e": paired_report(&e2e),
+            "client_ttft": latency_distribution_report(&measured_ttft, &simulated_ttft),
+            "server_ttft": server_ttft_report,
+            "tpot": latency_distribution_report(&measured_tpot, &simulated_tpot),
+            "e2e": latency_distribution_report(&measured_e2e, &simulated_e2e),
         },
         "throughput": throughput["summary"],
         "definitions": definitions.clone(),
@@ -135,10 +163,51 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "throughput_bins": input.e2e.throughput_bins,
         },
         "throughput": throughput["series"],
-        "latency_abs_relative_cdf": latency_cdfs,
+        "latency_cdf_comparisons": latency_cdf_comparisons,
         "definitions": definitions,
     });
     Ok((report, payload))
+}
+
+fn read_server_ttft(path: &Path) -> Result<Vec<f64>> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut request_ids = std::collections::BTreeSet::new();
+    let mut samples = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line)
+            .with_context(|| format!("parse {} line {}", path.display(), line_index + 1))?;
+        ensure!(
+            value.get("schema_version").and_then(Value::as_u64) == Some(1),
+            "unsupported server request timing schema at {} line {}",
+            path.display(),
+            line_index + 1
+        );
+        let request_id = value
+            .get("request_id")
+            .and_then(Value::as_str)
+            .context("server request timing missing request_id")?;
+        ensure!(
+            request_ids.insert(request_id.to_string()),
+            "duplicate server request timing id {request_id:?}"
+        );
+        let ttft_ms = value
+            .get("engine_core_ttft_ms")
+            .and_then(Value::as_f64)
+            .context("server request timing missing engine_core_ttft_ms")?;
+        ensure!(
+            ttft_ms.is_finite() && ttft_ms >= 0.0,
+            "server engine_core_ttft_ms must be finite and nonnegative"
+        );
+        samples.push(ttft_ms);
+    }
+    ensure!(
+        !samples.is_empty(),
+        "server request timing result contains no requests"
+    );
+    Ok(samples)
 }
 
 fn read_measured_requests(path: &Path) -> Result<BTreeMap<String, RequestMetrics>> {
@@ -267,32 +336,37 @@ async fn read_sim_requests(
     Ok(requests)
 }
 
-fn add_pair(samples: &mut PairedSamples, measured: Option<f64>, simulated: Option<f64>) {
-    let (Some(measured), Some(simulated)) = (measured, simulated) else {
-        return;
-    };
-    if !measured.is_finite() || !simulated.is_finite() || measured < 0.0 || simulated < 0.0 {
-        return;
-    }
-    let delta = simulated - measured;
-    samples.measured.push(measured);
-    samples.simulated.push(simulated);
-    samples.delta.push(delta);
-    if measured > 1e-12 {
-        let relative = delta / measured * 100.0;
-        samples.relative_pct.push(relative);
-        samples.abs_relative_pct.push(relative.abs());
-    }
+fn latency_samples(
+    requests: &BTreeMap<String, RequestMetrics>,
+    select: impl Fn(&RequestMetrics) -> Option<f64>,
+) -> Vec<f64> {
+    requests
+        .values()
+        .filter_map(select)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .collect()
 }
 
-fn paired_report(samples: &PairedSamples) -> Value {
+fn latency_distribution_report(measured: &[f64], simulated: &[f64]) -> Value {
     json!({
-        "n": samples.delta.len(),
-        "measured_ms": signed_stats(&samples.measured),
-        "simulated_ms": signed_stats(&samples.simulated),
-        "delta_ms": signed_stats(&samples.delta),
-        "relative_diff_pct": signed_stats(&samples.relative_pct),
-        "abs_relative_error_pct": stats(&clean_nonnegative_sorted(&samples.abs_relative_pct)),
+        "measured_ms": stats(&clean_nonnegative_sorted(measured)),
+        "simulated_ms": stats(&clean_nonnegative_sorted(simulated)),
+    })
+}
+
+fn latency_cdf_comparison(
+    key: &str,
+    label: &str,
+    measured_label: &str,
+    measured: &[f64],
+    simulated: &[f64],
+) -> Value {
+    json!({
+        "key": key,
+        "label": label,
+        "unit": "ms",
+        "measured": cdf_series(&format!("{key}_measured"), measured_label, "ms", measured),
+        "simulated": cdf_series(&format!("{key}_simulated"), "Simulated", "ms", simulated),
     })
 }
 
@@ -362,34 +436,14 @@ fn finite(value: f64) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
-fn signed_stats(samples: &[f64]) -> Value {
-    let mut sorted: Vec<_> = samples
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect();
-    sorted.sort_by(f64::total_cmp);
-    if sorted.is_empty() {
-        return json!({"n": 0, "mean": null, "p50": null, "p90": null, "p99": null, "min": null, "max": null});
-    }
-    json!({
-        "n": sorted.len(),
-        "mean": sorted.iter().sum::<f64>() / sorted.len() as f64,
-        "p50": percentile_sorted(&sorted, 50.0),
-        "p90": percentile_sorted(&sorted, 90.0),
-        "p99": percentile_sorted(&sorted, 99.0),
-        "min": sorted.first(),
-        "max": sorted.last(),
-    })
-}
-
 fn definitions() -> Value {
     json!({
-        "pairing": "TraceLab source.data.id joined to simulator request_slo.request_id; completed/successful requests only",
-        "delta": "simulated - measured; positive means the simulator is slower",
-        "ttft": "measured first_token_ms vs simulator ttft_ms",
-        "tpot": "measured (total_duration_ms - first_token_ms)/(output_tokens-1) vs simulator tpot_mean_ms",
-        "e2e": "measured total_duration_ms vs simulator finish_decode_time_ms-arrival_time_ms",
+        "request_id_audit": "TraceLab source.data.id and simulator request_slo.request_id are intersected only to detect missing requests; ids do not pair latency samples",
+        "latency_comparison": "measured and simulated raw latency distributions are summarized independently and overlaid as two CDF curves; no per-request subtraction or division",
+        "client_ttft": "TraceLab client-observed first_token_ms distribution vs simulator ttft_ms distribution; includes frontend/network/tokenization and response-path overhead outside the engine",
+        "server_ttft": "vLLM EngineCore queued timestamp to first-token EngineCore output timestamp distribution vs the same simulator ttft_ms distribution; excludes client/frontend transport",
+        "tpot": "measured (total_duration_ms - first_token_ms)/(output_tokens-1) distribution vs simulator tpot_mean_ms distribution",
+        "e2e": "measured total_duration_ms distribution vs simulator finish_decode_time_ms-arrival_time_ms distribution",
         "completion_throughput": "output tokens assigned to the request completion bin on both sides; not instantaneous token-production throughput",
     })
 }
@@ -406,7 +460,7 @@ fn unavailable(log_dir: &Path, reason: &str) -> (Value, Value) {
         "schema_version": SCHEMA_VERSION,
         "meta": {"analysis_log_dir": log_dir.display().to_string(), "available": false, "reason": reason},
         "throughput": {},
-        "latency_abs_relative_cdf": [],
+        "latency_cdf_comparisons": [],
         "definitions": definitions(),
     });
     (report, payload)
@@ -441,5 +495,40 @@ mod tests {
         let value = throughput_series(&measured, &simulated, 2);
         assert_eq!(value["series"]["measured_output_tps"][1], 1000.0);
         assert_eq!(value["series"]["simulated_output_tps"][1], 1000.0);
+    }
+
+    #[test]
+    fn latency_distributions_do_not_pair_by_request_id() {
+        let measured = BTreeMap::from([
+            ("1".into(), request_with_ttft(10.0)),
+            ("2".into(), request_with_ttft(20.0)),
+        ]);
+        let simulated = BTreeMap::from([
+            ("1".into(), request_with_ttft(200.0)),
+            ("2".into(), request_with_ttft(100.0)),
+        ]);
+
+        let measured_samples = latency_samples(&measured, |request| request.ttft_ms);
+        let simulated_samples = latency_samples(&simulated, |request| request.ttft_ms);
+        let comparison = latency_cdf_comparison(
+            "client_ttft",
+            "Client-observed TTFT",
+            "Client measured",
+            &measured_samples,
+            &simulated_samples,
+        );
+
+        assert_eq!(comparison["measured"]["x"], json!([10.0, 20.0]));
+        assert_eq!(comparison["simulated"]["x"], json!([100.0, 200.0]));
+    }
+
+    fn request_with_ttft(ttft_ms: f64) -> RequestMetrics {
+        RequestMetrics {
+            output_tokens: 1,
+            completion_ms: 0.0,
+            ttft_ms: Some(ttft_ms),
+            tpot_ms: None,
+            e2e_ms: None,
+        }
     }
 }

@@ -40,6 +40,26 @@ plt.rcParams.update(
 )
 
 
-def save_plot(fig, path, dpi: int = 300) -> None:
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+def save_plot(
+    fig,
+    path,
+    dpi: int = 300,
+    *,
+    tight: bool = True,
+    pil_kwargs: dict[str, object] | None = None,
+) -> None:
+    """Save and close one figure.
+
+    Most subject-level figures benefit from a tight bounding-box pass. Large
+    batches of pre-sized diagnostic figures may opt out: ``bbox_inches='tight'``
+    triggers another full layout/draw and dominates their render time.
+    """
+    save_kwargs: dict[str, object] = {"dpi": dpi}
+    if tight:
+        save_kwargs["bbox_inches"] = "tight"
+    if pil_kwargs is not None:
+        # Forward only explicit image-format policy from a renderer. Subject
+        # plots otherwise retain Matplotlib/Pillow defaults.
+        save_kwargs["pil_kwargs"] = pil_kwargs
+    fig.savefig(path, **save_kwargs)
     plt.close(fig)

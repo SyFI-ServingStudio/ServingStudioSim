@@ -380,7 +380,7 @@ def test_analyze_creates_manifest_and_runs_selected_subjects(tmp_path, monkeypat
     assert alignment_launcher.main(["analyze", str(paths["analyze"])]) == 0
     analysis = tmp_path / "analysis_run"
     manifest = json.loads((analysis / "alignment_manifest.json").read_text())
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] == 4
     assert manifest["labeled_kernel_sequences"] == str(analysis / "kernel_sequences_labeled.json")
     assert manifest["iteration"] == {"enabled": True}
     assert manifest["workload"] == {"enabled": True}
