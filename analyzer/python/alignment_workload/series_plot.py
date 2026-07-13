@@ -1,4 +1,4 @@
-"""Render measured-vs-sim scheduler workload by recorded iteration id."""
+"""Render measured-vs-sim scheduler workload by iteration id or elapsed time."""
 
 from __future__ import annotations
 
@@ -39,6 +39,13 @@ _PLOTS = (
     ),
 )
 
+_DECODE_TIME_PLOT = (
+    "decode_batch_size",
+    "Decode batch size over elapsed time",
+    "decode requests",
+    "alignment_decode_batch_size_over_elapsed_time.png",
+)
+
 
 def render(log_dir: Path) -> list[Callable[[], Path]]:
     if not resolve_artifact(log_dir, PAYLOAD).is_file():
@@ -50,7 +57,7 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
         reason = payload.get("meta", {}).get("reason", "no workload iteration series")
         print(f"[alignment_workload] nothing to render: {reason}")
         return []
-    return [
+    iteration_jobs = [
         partial(
             _render_series,
             measured,
@@ -63,6 +70,23 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
         )
         for key, title, ylabel, filename in _PLOTS
     ]
+    key, title, ylabel, filename = _DECODE_TIME_PLOT
+    # Rust independently normalizes each side's time_ms to its first observed
+    # iteration. Keep that contract here; absolute host/GPU clocks are unrelated.
+    elapsed_time_job = partial(
+        _render_series,
+        measured,
+        simulated,
+        key,
+        title,
+        ylabel,
+        plot_output_path(log_dir, filename),
+        x_key="time_ms",
+        x_scale=1e-3,
+        xlabel="elapsed time (s)",
+        run_label=log_dir.name,
+    )
+    return [*iteration_jobs, elapsed_time_job]
 
 
 def _render_series(
@@ -74,19 +98,22 @@ def _render_series(
     out_path: Path,
     *,
     run_label: str,
+    x_key: str = "iteration_id",
+    x_scale: float = 1.0,
+    xlabel: str = "iteration id",
 ) -> Path:
     measured_points = [
-        (iteration_id, value)
-        for iteration_id, value in zip(measured["iteration_id"], measured[key], strict=True)
-        if value is not None
+        (x_value * x_scale, value)
+        for x_value, value in zip(measured[x_key], measured[key], strict=True)
+        if x_value is not None and value is not None
     ]
     simulated_points = [
-        (iteration_id, value)
-        for iteration_id, value in zip(simulated["iteration_id"], simulated[key], strict=True)
-        if value is not None
+        (x_value * x_scale, value)
+        for x_value, value in zip(simulated[x_key], simulated[key], strict=True)
+        if x_value is not None and value is not None
     ]
-    measured_iteration_ids, measured_values = zip(*measured_points, strict=True)
-    simulated_iteration_ids, simulated_values = zip(*simulated_points, strict=True)
+    measured_x, measured_values = zip(*measured_points, strict=True)
+    simulated_x, simulated_values = zip(*simulated_points, strict=True)
     measured_label = "vLLM GPU cycle" if key == "iteration_cycle_ms" else "vLLM measured"
     simulated_label = (
         "VibeSim actual cycle" if key == "iteration_cycle_ms" else "VibeSim"
@@ -94,7 +121,7 @@ def _render_series(
 
     fig, ax = new_axes(figsize=(10.0, 4.8))
     ax.step(
-        measured_iteration_ids,
+        measured_x,
         measured_values,
         where="post",
         label=measured_label,
@@ -102,7 +129,7 @@ def _render_series(
         linewidth=1.8,
     )
     ax.step(
-        simulated_iteration_ids,
+        simulated_x,
         simulated_values,
         where="post",
         label=simulated_label,
@@ -126,7 +153,7 @@ def _render_series(
         ax,
         out_path,
         title=title,
-        xlabel="iteration id",
+        xlabel=xlabel,
         ylabel=ylabel,
         run_label=run_label,
     )

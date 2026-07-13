@@ -168,9 +168,11 @@ e2e:
 Iteration, workload, and E2E subjects can be enabled independently. Workload
 analysis plots each side against its recorded iteration ids and emits fine-grained
 prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle
-series. vLLM cycle time is first-kernel to next-first-kernel; simulation cycle time
-is one actual `wall_start_ms` to the next, so it already includes the worker's
-`gpu_time_multiplier`, tick quantization, and scheduler gaps. Scheduled KV
+series. It also plots decode batch size against each side's independently
+normalized elapsed time. vLLM cycle time is first-kernel to next-first-kernel;
+simulation cycle time is one actual `wall_start_ms` to the next, so it already
+includes the worker's `gpu_time_multiplier`, tick quantization, and scheduler
+gaps. Scheduled KV
 workload is `sum(decode_kv_lens) + sum(prefill_prefix_len +
 prefill_append_len)`. It is deliberately not resident KV-pool occupancy. A
 labeled folded inventory is required only when iteration analysis is enabled.
