@@ -9,7 +9,6 @@ NSYS normalization, and timing-predict input conversion.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import shutil
 import sys
@@ -330,7 +329,7 @@ def _launch_alignment_analysis(log_dir: Path, *, build_type: str, subjects: list
     if not analyzer_binary_path(build_type).is_file():
         print("[alignment] analyzer build failed", file=sys.stderr)
         return False
-    asyncio.run(run_alignment_analysis(log_dir, build_type, subjects))
+    run_alignment_analysis(log_dir, build_type, subjects)
     return True
 
 

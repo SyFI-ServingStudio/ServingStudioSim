@@ -195,6 +195,26 @@ async def _run_capture(argv: list[str]) -> tuple[int, str]:
     return proc.returncode, out.decode(errors="replace")
 
 
+def _run_capture_sync(argv: list[str]) -> tuple[int, str]:
+    """Run one sequential launcher stage and capture its combined output.
+
+    Alignment analysis is a one-shot compute -> render pipeline, not a sweep.
+    Keep it outside the async subprocess machinery: the renderer creates its own
+    process pool, and nesting that pool under ``asyncio`` pipe/child-watcher
+    bookkeeping can leave the one-shot CLI waiting after every child has exited.
+    Simulation sweeps continue to use :func:`_run_capture` and
+    :class:`SimulationRunner` for their required concurrency.
+    """
+    result = subprocess.run(
+        argv,
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    return result.returncode, result.stdout.decode(errors="replace")
+
+
 async def run_analysis(
     log_dir: Path, build_type: str = "debug", subjects: list[str] | None = None
 ) -> None:
@@ -262,12 +282,16 @@ async def run_analysis(
         print(f"[analyze] trace failed for {log_dir}")
 
 
-async def run_alignment_analysis(
+def run_alignment_analysis(
     log_dir: Path,
     build_type: str = "debug",
     subjects: list[str] | None = None,
 ) -> None:
-    """Compute and render the selected measured↔simulated alignment subjects."""
+    """Synchronously compute and render selected alignment subjects.
+
+    This explicit alignment command has no sweep-level parallelism to preserve;
+    each phase must finish before the next consumes its artifacts.
+    """
     analyzer = analyzer_binary_path(build_type)
     if not analyzer.exists():
         print(f"[analyze] {analyzer} not built; skipping alignment analysis for {log_dir}")
@@ -275,9 +299,9 @@ async def run_alignment_analysis(
 
     stdout_log = log_dir / "stdout.log"
 
-    async def run_step(section: str, argv: list[str]) -> int:
+    def run_step(section: str, argv: list[str]) -> int:
         started = time.perf_counter()
-        rc, out = await _run_capture(argv)
+        rc, out = _run_capture_sync(argv)
         elapsed_ms = (time.perf_counter() - started) * 1e3
         with stdout_log.open("a") as fh:
             fh.write(f"\n=== {section} [{elapsed_ms:.0f} ms] ===\n")
@@ -291,7 +315,7 @@ async def run_alignment_analysis(
         "alignment-workload",
         "alignment-e2e",
     ]
-    rc = await run_step(
+    rc = run_step(
         "analyze alignment compute",
         [str(analyzer), "alignment", str(log_dir), *selected],
     )
@@ -299,7 +323,7 @@ async def run_alignment_analysis(
         print(f"[analyze] alignment compute failed for {log_dir}")
         return
     if (
-        await run_step(
+        run_step(
             "analyze alignment render",
             [
                 sys.executable,

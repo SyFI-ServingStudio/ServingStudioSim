@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 
@@ -445,14 +444,14 @@ def test_alignment_analysis_calls_only_selected_subjects(tmp_path, monkeypatch):
     log_dir.mkdir()
     invocations = []
 
-    async def fake_capture(argv):
+    def fake_capture(argv):
         invocations.append(argv)
         return 0, "alignment accepted\n"
 
     monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda build_type: analyzer)
-    monkeypatch.setattr(launcher_exec, "_run_capture", fake_capture)
+    monkeypatch.setattr(launcher_exec, "_run_capture_sync", fake_capture)
 
-    asyncio.run(launcher_exec.run_alignment_analysis(log_dir, "release", ["alignment-e2e"]))
+    launcher_exec.run_alignment_analysis(log_dir, "release", ["alignment-e2e"])
     assert invocations[0] == [str(analyzer), "alignment", str(log_dir), "alignment-e2e"]
     assert invocations[1][-1:] == ["alignment-e2e"]
 
