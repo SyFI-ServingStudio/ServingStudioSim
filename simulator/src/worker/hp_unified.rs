@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{KvSampler, KvSubmit};
-use crate::worker::admission_helpers::{Batch, LoadBalance};
+use crate::worker::admission_helpers::{prefill_fits_budget, Batch, LoadBalance};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
@@ -206,22 +206,66 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             .iter()
             .any(|b| b.iter_decoding().next().is_some());
 
-        // Phase A: route one fresh prefill to a group (RoundRobin over N).
-        if let Some(&rid) = self.runtime.pending_prefills.front() {
-            let (p, d) = {
-                let store = self.requests.borrow();
-                let r = &store[rid];
-                (r.prompt_len, r.decode_len)
-            };
-            let gid = self.runtime.balance.choose(self.batches.len()) as u16;
-            let group_promised = self.group_promised_kv(gid);
-            if self
-                .config
-                .admission
-                .try_admit(&self.batches[gid as usize], group_promised, p, d)
-            {
-                self.runtime.pending_prefills.pop_front();
-                self.promise(gid, rid, p, d, 0);
+        // Phase A: route fresh prefill(s) to a group (RoundRobin over N). Without
+        // a token budget one prefill is admitted per iter; with `max_batch_tokens`
+        // the budget applies PER DP group — each group reserves its own live
+        // decodes (1 tok/req) then fills its own remainder with whole prefills.
+        match self.config.max_batch_tokens {
+            None => {
+                if let Some(&rid) = self.runtime.pending_prefills.front() {
+                    let (p, d) = {
+                        let store = self.requests.borrow();
+                        let r = &store[rid];
+                        (r.prompt_len, r.decode_len)
+                    };
+                    let gid = self.runtime.balance.choose(self.batches.len()) as u16;
+                    let group_promised = self.group_promised_kv(gid);
+                    if self
+                        .config
+                        .admission
+                        .try_admit(&self.batches[gid as usize], group_promised, p, d)
+                    {
+                        self.runtime.pending_prefills.pop_front();
+                        self.promise(gid, rid, p, d, 0);
+                    }
+                }
+            }
+            Some(budget) => {
+                let n = self.batches.len();
+                // Per-group decode reserve (fixed for this iter) + admitted tally.
+                let decode_tokens: Vec<u32> = self
+                    .batches
+                    .iter()
+                    .map(|b| b.iter_decoding().count() as u32)
+                    .collect();
+                let mut admitted = vec![0u32; n];
+                while let Some(&rid) = self.runtime.pending_prefills.front() {
+                    let (p, d) = {
+                        let store = self.requests.borrow();
+                        let r = &store[rid];
+                        (r.prompt_len, r.decode_len)
+                    };
+                    // RR picks the head's target group; if that group can't take it
+                    // (its own budget or the KV gate), stop — the head waits for a
+                    // later iter (the cursor has advanced, so RR tries the next
+                    // group then). Naive: no cross-group re-routing within an iter.
+                    let gid = self.runtime.balance.choose(n) as u16;
+                    let g = gid as usize;
+                    if !prefill_fits_budget(budget, decode_tokens[g], admitted[g], p) {
+                        break;
+                    }
+                    let group_promised = self.group_promised_kv(gid);
+                    if !self
+                        .config
+                        .admission
+                        .try_admit(&self.batches[g], group_promised, p, d)
+                    {
+                        break;
+                    }
+                    self.runtime.pending_prefills.pop_front();
+                    self.promise(gid, rid, p, d, 0);
+                    admitted[g] += p;
+                }
             }
         }
 
@@ -463,7 +507,6 @@ mod tests {
     use super::*;
     use crate::common::PoolId;
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
-    use std::rc::Rc;
 
     fn worker(store: SharedRequests, dp_groups: u16) -> HpUnifiedWorker<FakeModel> {
         HpUnifiedWorker::new(
@@ -532,5 +575,51 @@ mod tests {
         }
         completed.sort_by_key(|r| r.0);
         assert_eq!(completed, (0..3).map(RequestId).collect::<Vec<_>>());
+    }
+
+    fn worker_cfg(
+        store: SharedRequests,
+        dp_groups: u16,
+        config: WorkerConfig,
+    ) -> HpUnifiedWorker<FakeModel> {
+        HpUnifiedWorker::new(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel { ms: 1.0, dp_groups }),
+            store,
+            config,
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    #[test]
+    fn per_dp_budget_admits_independently_per_group() {
+        // Two groups, budget 16 PER group, six 8-token prefills. RoundRobin
+        // spreads them, so one form_batch fills each group to 16 (two prefills)
+        // → 4 admitted (2 per group), 2 still queued. The budget is applied per
+        // DP node, not globally (a global 16 would admit only two total).
+        let store = shared_with(&[
+            (0, 8, 0),
+            (1, 8, 0),
+            (2, 8, 0),
+            (3, 8, 0),
+            (4, 8, 0),
+            (5, 8, 0),
+        ]);
+        let cfg = WorkerConfig {
+            max_batch_tokens: Some(16),
+            ..WorkerConfig::default()
+        };
+        let mut w = worker_cfg(store, 2, cfg);
+        for id in 0..6u32 {
+            w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        w.form_batch();
+        assert_eq!(w.batches[0].prefill_admits.len(), 2);
+        assert_eq!(w.batches[1].prefill_admits.len(), 2);
+        assert_eq!(w.runtime.pending_prefills.len(), 2);
     }
 }

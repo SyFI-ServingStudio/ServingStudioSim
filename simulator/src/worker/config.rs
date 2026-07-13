@@ -54,6 +54,15 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
+        /// Optional per-iteration token budget. When set, admission reserves the
+        /// budget for the live decodes (1 tok/req) first, then admits whole
+        /// prefills (FIFO) until the remaining budget is exhausted; a single
+        /// over-long prefill is still force-admitted when the group holds budget
+        /// but nothing yet. None = legacy one-prefill/iter. (Distinct from
+        /// `ChunkedPrefill::max_batch_tokens`, which is a hard cap that chunks
+        /// prefills to fit; this budget is soft — one whole prefill may exceed it.)
+        #[serde(default)]
+        max_batch_tokens: Option<u32>,
     },
     /// Multi-group HP/DP worker: maintains one `Batch` per attention DP shard
     /// (count comes from the arch's `num_attn_dp_groups`). Pairs with a DP-attention
@@ -68,6 +77,11 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
+        /// Optional per-iteration token budget, applied PER DP group (each shard
+        /// reserves its own live decodes then fills its own remainder). See
+        /// `Barebone::max_batch_tokens`. None = legacy one-prefill/iter.
+        #[serde(default)]
+        max_batch_tokens: Option<u32>,
     },
     ChunkedPrefill {
         /// GPU memory for the worker (GB; primarily KV cache budget).

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{KvSampler, KvSubmit};
-use crate::worker::admission_helpers::Batch;
+use crate::worker::admission_helpers::{prefill_fits_budget, Batch};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::types::{
@@ -203,21 +203,53 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
     fn form_batch(&mut self) -> bool {
         let had_decode = self.batches[0].iter_decoding().next().is_some();
 
-        // Phase A: admit one fresh prefill from the queue (barebone: one/iter).
-        if let Some(&rid) = self.runtime.pending_prefills.front() {
-            let (p, d) = {
-                let store = self.requests.borrow();
-                let r = &store[rid];
-                (r.prompt_len, r.decode_len)
-            };
-            let group_promised = self.group_promised_kv(0);
-            if self
-                .config
-                .admission
-                .try_admit(&self.batches[0], group_promised, p, d)
-            {
-                self.runtime.pending_prefills.pop_front();
-                self.promise(0, rid, p, d, 0);
+        // Phase A: admit fresh prefill(s) from the queue. Without a token budget
+        // barebone admits one per iter; with `max_batch_tokens` it reserves the
+        // budget for the live decodes (1 tok/req) then fills the remainder with
+        // whole prefills (see `prefill_fits_budget`). The KV gate always applies.
+        match self.config.max_batch_tokens {
+            None => {
+                if let Some(&rid) = self.runtime.pending_prefills.front() {
+                    let (p, d) = {
+                        let store = self.requests.borrow();
+                        let r = &store[rid];
+                        (r.prompt_len, r.decode_len)
+                    };
+                    let group_promised = self.group_promised_kv(0);
+                    if self
+                        .config
+                        .admission
+                        .try_admit(&self.batches[0], group_promised, p, d)
+                    {
+                        self.runtime.pending_prefills.pop_front();
+                        self.promise(0, rid, p, d, 0);
+                    }
+                }
+            }
+            Some(budget) => {
+                let decode_tokens = self.batches[0].iter_decoding().count() as u32;
+                let mut admitted = 0u32;
+                while let Some(&rid) = self.runtime.pending_prefills.front() {
+                    let (p, d) = {
+                        let store = self.requests.borrow();
+                        let r = &store[rid];
+                        (r.prompt_len, r.decode_len)
+                    };
+                    if !prefill_fits_budget(budget, decode_tokens, admitted, p) {
+                        break; // token budget exhausted for this iter
+                    }
+                    let group_promised = self.group_promised_kv(0);
+                    if !self
+                        .config
+                        .admission
+                        .try_admit(&self.batches[0], group_promised, p, d)
+                    {
+                        break; // KV gate blocks the FIFO head; retry next iter
+                    }
+                    self.runtime.pending_prefills.pop_front();
+                    self.promise(0, rid, p, d, 0);
+                    admitted += p;
+                }
             }
         }
 
@@ -496,5 +528,69 @@ mod tests {
         for id in [0, 1, 2] {
             assert!(s[RequestId(id)].completed, "req {id} should complete");
         }
+    }
+
+    // ── per-iter prefill token budget (max_batch_tokens) ─────────────────────
+
+    fn cfg_budget(n: u32) -> WorkerConfig {
+        WorkerConfig {
+            max_batch_tokens: Some(n),
+            ..WorkerConfig::default()
+        }
+    }
+
+    fn worker_with(store: SharedRequests, config: WorkerConfig) -> BareboneWorker<FakeModel> {
+        BareboneWorker::new(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            store,
+            config,
+            None,
+            crate::common::PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    #[test]
+    fn budget_admits_multiple_prefills_in_one_iter() {
+        // budget 20, four 8-token prefills: one form_batch admits 8+8 = 16 (≤20),
+        // then rejects the third (24 > 20). Two admitted, two still queued.
+        let store = shared_with(&[(0, 8, 0), (1, 8, 0), (2, 8, 0), (3, 8, 0)]);
+        let mut w = worker_with(store, cfg_budget(20));
+        for id in [0, 1, 2, 3] {
+            w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        w.form_batch();
+        assert_eq!(w.batches[0].prefill_admits.len(), 2);
+        assert_eq!(w.runtime.pending_prefills.len(), 2);
+    }
+
+    #[test]
+    fn none_budget_admits_one_prefill_per_iter() {
+        // Default config (no budget) keeps the legacy one-prefill/iter behavior.
+        let store = shared_with(&[(0, 8, 0), (1, 8, 0), (2, 8, 0)]);
+        let mut w = worker_with(store, WorkerConfig::default());
+        for id in [0, 1, 2] {
+            w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        w.form_batch();
+        assert_eq!(w.batches[0].prefill_admits.len(), 1);
+        assert_eq!(w.runtime.pending_prefills.len(), 2);
+    }
+
+    #[test]
+    fn budget_force_admits_single_overlong_prefill() {
+        // budget 4 but the head prompt is 10 (> budget) and nothing admitted yet:
+        // force-admit exactly one; the second over-long prefill waits its turn.
+        let store = shared_with(&[(0, 10, 0), (1, 10, 0)]);
+        let mut w = worker_with(store, cfg_budget(4));
+        for id in [0, 1] {
+            w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        w.form_batch();
+        assert_eq!(w.batches[0].prefill_admits.len(), 1);
+        assert_eq!(w.runtime.pending_prefills.len(), 1);
     }
 }

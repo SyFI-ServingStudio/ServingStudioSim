@@ -411,6 +411,13 @@ pub struct WorkerConfig {
     /// selector; passed to `CostBuffers`, applied where a segment's wall time is
     /// returned (cost_log stays pre-scale).
     pub gpu_time_multiplier: f64,
+    /// Optional per-iteration prefill token budget (from the worker selector).
+    /// `Some(n)`: admission reserves the budget for live decodes (1 tok/req)
+    /// then fills the remainder with whole prefills, force-admitting one
+    /// over-long prefill when the group holds budget but nothing yet. `None`:
+    /// legacy one-prefill/iter. For the multi-group worker the budget is applied
+    /// per DP group. See [`crate::worker::admission_helpers::prefill_fits_budget`].
+    pub max_batch_tokens: Option<u32>,
 }
 
 impl Default for WorkerConfig {
@@ -422,6 +429,7 @@ impl Default for WorkerConfig {
             log_output_token_times: false,
             kv_log_stride: 8,
             gpu_time_multiplier: 1.0,
+            max_batch_tokens: None,
         }
     }
 }

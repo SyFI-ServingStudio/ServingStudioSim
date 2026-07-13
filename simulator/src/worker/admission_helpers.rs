@@ -318,6 +318,36 @@ impl LoadBalance {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Prefill token budget — reserve-decode-then-fill admission predicate (§ opt-in
+// `WorkerConfig::max_batch_tokens`).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Token-axis gate for the optional per-iteration prefill budget. The budget
+/// first reserves room for the live decodes (`decode_tokens`, 1 tok/req); the
+/// remainder is the prefill budget. The queue head of `next` prompt tokens is
+/// admitted while the running `admitted` prefill total plus `next` stays within
+/// that remainder. Special case: when the group still holds prefill budget
+/// (`remainder > 0`) but has admitted nothing yet, a single over-long prefill
+/// (`next` alone exceeds the remainder) is force-admitted so it is never
+/// starved. The caller applies the KV gate ([`KvAdmission::try_admit`])
+/// separately — this is the token axis only.
+///
+/// For the multi-group (DP) worker this is evaluated per group with that
+/// group's own `decode_tokens` / `admitted`, so the budget applies to each DP
+/// node independently.
+pub(crate) fn prefill_fits_budget(
+    budget: u32,
+    decode_tokens: u32,
+    admitted: u32,
+    next: u32,
+) -> bool {
+    let prefill_budget = budget.saturating_sub(decode_tokens);
+    let fits = admitted.saturating_add(next) <= prefill_budget;
+    let force_first = admitted == 0 && prefill_budget > 0 && next > prefill_budget;
+    fits || force_first
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +463,36 @@ mod tests {
         assert!(adm.try_admit(&b, 0, 60, 30));
         // with 20 already promised: 90 + 20 = 110 > 100 → reject
         assert!(!adm.try_admit(&b, 20, 60, 30));
+    }
+
+    #[test]
+    fn budget_fills_until_exhausted_then_stops() {
+        // budget 20, no decode: admit 8 (8≤20), admit 8 (16≤20), reject 8 (24>20).
+        assert!(prefill_fits_budget(20, 0, 0, 8));
+        assert!(prefill_fits_budget(20, 0, 8, 8));
+        assert!(!prefill_fits_budget(20, 0, 16, 8));
+    }
+
+    #[test]
+    fn budget_reserves_decode_tokens_first() {
+        // budget 12, 10 live decodes → prefill remainder = 2.
+        assert!(prefill_fits_budget(12, 10, 0, 2)); // first 2-token prefill fits
+        // remainder exhausted and something already admitted → no force, reject.
+        assert!(!prefill_fits_budget(12, 10, 2, 1));
+    }
+
+    #[test]
+    fn budget_fully_consumed_by_decode_admits_no_prefill() {
+        // decode tokens ≥ budget → remainder 0 → even force-first is off.
+        assert!(!prefill_fits_budget(8, 8, 0, 1));
+        assert!(!prefill_fits_budget(8, 20, 0, 1)); // saturating remainder 0
+    }
+
+    #[test]
+    fn budget_force_admits_single_overlong_prefill_when_empty() {
+        // budget 4, no decode, head prompt 10 > budget: force-admit the one…
+        assert!(prefill_fits_budget(4, 0, 0, 10));
+        // …but once something is admitted, a second over-long one is rejected.
+        assert!(!prefill_fits_budget(4, 0, 10, 10));
     }
 }
