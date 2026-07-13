@@ -1,7 +1,9 @@
-"""Alignment-local artifact utility CLI — `python -m alignment parse`.
+"""Alignment-local artifact utilities — `python -m alignment <command>`.
 
     python -m alignment parse   --sqlite T.sqlite --metrics M.jsonl \
                                 --iteration-start N --iteration-end M
+    python -m alignment gpu-kernel-ratio --profile-dir profile/ \
+                                --output gpu_kernel_ratio.json
 
 Launching belongs to `python -m launcher alignment
 {sim,profile,timing-predict,analyze}`. Configs may be YAML or JSON. `parse` is
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import sys
 
+from .nsys import gpu_kernel_ratio
 from .nsys import parse as nsys_parse
 
 
@@ -29,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "parse":
         return nsys_parse.main(rest)
+    if cmd == "gpu-kernel-ratio":
+        return gpu_kernel_ratio.main(rest)
 
     print(f"unknown subcommand: {cmd!r}")
     return _usage()

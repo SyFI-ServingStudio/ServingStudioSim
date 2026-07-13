@@ -43,6 +43,9 @@ from .sequence import build_kernel_sequences
 # comes from the same iteration index in the metrics JSONL.
 ITER_RE = re.compile(r"^(?:vllm|sglang)_iteration\((\d+)\):\s*(.+)$")
 
+_RUNTIME_LOOKUP_INDEX = "vibesim_runtime_gtid_start_idx"
+_KERNEL_LOOKUP_INDEX = "vibesim_kernel_gpid_corr_start_idx"
+
 
 def iteration_kind(metric: dict | None, fallback: str = "all") -> str:
     """Classify one workload unit without collapsing mixed into prefill."""
@@ -195,6 +198,29 @@ def load_string_ids(con: sqlite3.Connection) -> dict[int, str]:
     return {
         int(row_id): str(value) for row_id, value in con.execute("SELECT id, value FROM StringIds")
     }
+
+
+def ensure_query_indexes(con: sqlite3.Connection) -> None:
+    """Persist the two indexes required by correlation-based attribution.
+
+    NSYS exports these CUPTI tables without indexes. Attribution issues two
+    selective queries for every indexed phase range, so leaving them unindexed
+    turns a few thousand ranges into repeated full-table scans. The SQLite file
+    is a rebuildable derivative of the immutable ``.nsys-rep`` capture; adding
+    B-tree indexes changes neither source rows nor attribution semantics.
+    """
+    con.execute(
+        f"CREATE INDEX IF NOT EXISTS {_RUNTIME_LOOKUP_INDEX} "
+        "ON CUPTI_ACTIVITY_KIND_RUNTIME(globalTid, start)"
+    )
+    con.execute(
+        f"CREATE INDEX IF NOT EXISTS {_KERNEL_LOOKUP_INDEX} "
+        "ON CUPTI_ACTIVITY_KIND_KERNEL(globalPid, correlationId, start)"
+    )
+    # Make the one-time acceleration reusable by standalone parse/analyze runs.
+    # SQLite DDL is transactional, so an interrupted build cannot leave a
+    # partially formed index behind.
+    con.commit()
 
 
 def load_workers(con: sqlite3.Connection) -> dict[int, Worker]:
@@ -557,6 +583,7 @@ def parse_trace(
     """
     con = sqlite3.connect(str(sqlite_path))
     try:
+        ensure_query_indexes(con)
         metrics = load_metrics(metrics_jsonl)
         string_ids = load_string_ids(con)
         workers = load_workers(con)

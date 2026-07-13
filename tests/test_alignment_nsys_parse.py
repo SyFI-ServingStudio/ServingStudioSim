@@ -1,9 +1,11 @@
 """Focused contract tests for alignment's indexed NSYS markers."""
 
+import json
 import sqlite3
 
 import pytest
 
+from alignment.nsys.gpu_kernel_ratio import compute_profile_gpu_kernel_ratio
 from alignment.nsys.parse import (
     KernelEvent,
     RangeStats,
@@ -12,6 +14,7 @@ from alignment.nsys.parse import (
     build_iteration_details,
     build_kernel_name_index,
     build_parser,
+    ensure_query_indexes,
     iteration_kind,
     load_ranges,
 )
@@ -37,6 +40,37 @@ def test_parse_defaults_to_all_indexed_phases():
     )
 
     assert args.range_mode == "phases"
+
+
+def test_parse_persists_correlation_lookup_indexes_idempotently():
+    con = sqlite3.connect(":memory:")
+    con.executescript(
+        """
+        CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (
+            globalTid INTEGER,
+            start INTEGER,
+            correlationId INTEGER
+        );
+        CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (
+            globalPid INTEGER,
+            correlationId INTEGER,
+            start INTEGER
+        );
+        """
+    )
+
+    ensure_query_indexes(con)
+    ensure_query_indexes(con)
+
+    runtime_indexes = con.execute(
+        "PRAGMA index_list('CUPTI_ACTIVITY_KIND_RUNTIME')"
+    ).fetchall()
+    kernel_indexes = con.execute(
+        "PRAGMA index_list('CUPTI_ACTIVITY_KIND_KERNEL')"
+    ).fetchall()
+    assert [row[1] for row in runtime_indexes] == ["vibesim_runtime_gtid_start_idx"]
+    assert [row[1] for row in kernel_indexes] == ["vibesim_kernel_gpid_corr_start_idx"]
+    assert not con.in_transaction
 
 
 @pytest.mark.parametrize(
@@ -231,3 +265,75 @@ def test_fold_prefers_layer_aligned_repeat_with_final_suffix():
         "steady_b",
         "steady_a",
     ]
+
+
+def test_gpu_kernel_ratio_uses_global_busy_and_audits_attribution(tmp_path):
+    profile_dir = tmp_path / "profile"
+    profile_dir.mkdir()
+    sqlite_path = profile_dir / "capture.sqlite"
+    parsed_path = profile_dir / "parsed.json"
+
+    with sqlite3.connect(sqlite_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (
+                start INTEGER NOT NULL,
+                end INTEGER NOT NULL,
+                deviceId INTEGER NOT NULL
+            );
+            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (100, 150, 0);
+            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (160, 180, 0);
+            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (190, 210, 0);
+            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (200, 240, 0);
+            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (230, 260, 0);
+            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (300, 320, 0);
+            """
+        )
+
+    def detail(iteration, iteration_type, intervals):
+        return {
+            "iteration": iteration,
+            "iteration_type": iteration_type,
+            "ranges": [
+                {
+                    "device_id": 0,
+                    "kernels": [
+                        {"start_ns": start_ns, "end_ns": end_ns}
+                        for start_ns, end_ns in intervals
+                    ],
+                }
+            ],
+        }
+
+    parsed_path.write_text(
+        json.dumps(
+            {
+                "iteration_details": [
+                    detail(1, "mixed", [(100, 150), (190, 210)]),
+                    detail(2, "decode", [(200, 240)]),
+                    detail(3, "decode", [(300, 320)]),
+                ]
+            }
+        )
+    )
+    (profile_dir / "profile_result.json").write_text(
+        json.dumps({"parsed_nsys": str(parsed_path), "sqlite": str(sqlite_path)})
+    )
+
+    result = compute_profile_gpu_kernel_ratio(profile_dir)
+
+    assert result["overall"]["cycles"] == 2
+    assert result["overall"]["gpu_cycle_ms"] == pytest.approx(0.0002)
+    assert result["overall"]["global_kernel_busy_in_cycle_ms"] == pytest.approx(
+        0.00014
+    )
+    assert result["overall"]["attributed_kernel_busy_in_cycle_ms"] == pytest.approx(
+        0.0001
+    )
+    assert result["overall"]["kernel_gpu_fraction"] == pytest.approx(0.7)
+    assert result["overall"]["gpu_time_multiplier"] == pytest.approx(1.0 / 0.7)
+    assert result["overall"]["cycles_with_unattributed_kernel_busy"] == 2
+    assert result["overall"]["cycles_with_attributed_kernel_outside_cycle"] == 1
+    assert result["by_iteration_type"]["mixed"]["gpu_time_multiplier"] == pytest.approx(
+        1.25
+    )
