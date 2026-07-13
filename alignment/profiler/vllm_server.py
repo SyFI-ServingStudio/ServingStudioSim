@@ -11,13 +11,14 @@ The fork (`alignment/profiler/vllm`, branch `moesim-profile`) adds the
 `vllm_iteration(N): <phase>` NVTX scopes (gated by `VLLM_NVTX_SCOPES_FOR_PROFILING`)
 and a versioned `VibeSimAlignmentIteration {json}` record containing the exact
 model input shape consumed by the typed predictor adapter. Per-request
-`VibeSimAlignmentRequestTiming {json}` records expose engine-queue-to-first-token
-timing separately from TraceLab's client-observed TTFT.
+`VibeSimAlignmentRequestTiming {json}` records expose EngineCore TTFT and TPOT
+separately from TraceLab's client-observed latency accounting.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -251,18 +252,23 @@ def extract_request_timings_jsonl(
     *,
     expected_request_ids: set[str] | None = None,
 ) -> int:
-    """Extract engine-queue → first-token-iteration timing per request.
+    """Extract one complete EngineCore timing record per request.
 
-    This is deliberately separate from client-observed TraceLab TTFT. Both
-    boundaries are EngineCore monotonic timestamps, so the result excludes the
-    HTTP/frontend ingress and first-token SSE return path.
+    Schema v1 contains TTFT only. Schema v2 adds first-token → last-token TPOT;
+    all boundaries use EngineCore monotonic timestamps and therefore exclude
+    HTTP/frontend ingress, SSE return, and client completion accounting.
     """
-    duration_fields = {
+    ttft_duration_fields = {
         "engine_core_ttft_ms",
         "engine_queue_wait_ms",
         "engine_first_schedule_to_first_token_ms",
     }
-    required = {"schema_version", *duration_fields}
+    tpot_fields = {
+        "engine_core_decode_ms",
+        "engine_core_tpot_ms",
+        "num_output_tokens",
+    }
+    required = {"schema_version", *ttft_duration_fields}
     request_ids: set[str] = set()
     n = 0
     with Path(out_jsonl).open("w") as out:
@@ -276,10 +282,16 @@ def extract_request_timings_jsonl(
                 raise ValueError(
                     f"alignment request timing record missing fields {sorted(missing)}"
                 )
-            if row["schema_version"] != 1:
-                raise ValueError(
-                    f"unsupported alignment request timing schema {row['schema_version']!r}"
-                )
+            schema_version = row["schema_version"]
+            if schema_version not in {1, 2}:
+                raise ValueError(f"unsupported alignment request timing schema {schema_version!r}")
+            if schema_version == 2:
+                missing = tpot_fields - set(row)
+                if missing:
+                    raise ValueError(
+                        "alignment request timing schema v2 record missing fields "
+                        f"{sorted(missing)}"
+                    )
             # The vLLM OpenAI completions frontend wraps X-Request-Id before
             # enqueueing it as `cmpl-<source-id>-0`. TraceLab sends one prompt
             # per request, so index 0 is the only supported alignment shape.
@@ -303,9 +315,14 @@ def extract_request_timings_jsonl(
             request_ids.add(request_id)
             row["engine_request_id"] = engine_request_id
             row["request_id"] = request_id
-            for field in duration_fields:
+            for field in ttft_duration_fields:
                 value = row[field]
-                if not isinstance(value, (int, float)) or value < 0:
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or value < 0
+                ):
                     raise ValueError(f"alignment request timing {field} must be nonnegative")
             components_ms = (
                 row["engine_queue_wait_ms"] + row["engine_first_schedule_to_first_token_ms"]
@@ -314,6 +331,50 @@ def extract_request_timings_jsonl(
                 raise ValueError(
                     "alignment request timing components do not sum to engine_core_ttft_ms"
                 )
+            if schema_version == 2:
+                num_output_tokens = row["num_output_tokens"]
+                if (
+                    isinstance(num_output_tokens, bool)
+                    or not isinstance(num_output_tokens, int)
+                    or num_output_tokens <= 0
+                ):
+                    raise ValueError(
+                        "alignment request timing num_output_tokens must be a positive integer"
+                    )
+                decode_ms = row["engine_core_decode_ms"]
+                if (
+                    isinstance(decode_ms, bool)
+                    or not isinstance(decode_ms, (int, float))
+                    or not math.isfinite(decode_ms)
+                    or decode_ms < 0
+                ):
+                    raise ValueError(
+                        "alignment request timing engine_core_decode_ms must be nonnegative"
+                    )
+                tpot_ms = row["engine_core_tpot_ms"]
+                if num_output_tokens == 1:
+                    if tpot_ms is not None:
+                        raise ValueError(
+                            "alignment request timing engine_core_tpot_ms must be null "
+                            "for a one-token request"
+                        )
+                else:
+                    if (
+                        isinstance(tpot_ms, bool)
+                        or not isinstance(tpot_ms, (int, float))
+                        or not math.isfinite(tpot_ms)
+                        or tpot_ms < 0
+                    ):
+                        raise ValueError(
+                            "alignment request timing engine_core_tpot_ms must be "
+                            "nonnegative for a multi-token request"
+                        )
+                    expected_tpot_ms = decode_ms / (num_output_tokens - 1)
+                    if abs(tpot_ms - expected_tpot_ms) > 1e-6:
+                        raise ValueError(
+                            "alignment request timing engine_core_tpot_ms does not equal "
+                            "engine_core_decode_ms/(num_output_tokens-1)"
+                        )
             out.write(json.dumps(row) + "\n")
             n += 1
     if expected_request_ids is not None and request_ids != expected_request_ids:

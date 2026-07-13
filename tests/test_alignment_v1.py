@@ -67,6 +67,43 @@ def test_structured_vllm_request_timing_is_extracted_separately(tmp_path):
     assert json.loads(output.read_text()) == {**record, "request_id": "vibesim_7"}
 
 
+def test_structured_vllm_request_timing_v2_includes_server_tpot(tmp_path):
+    record = {
+        "schema_version": 2,
+        "engine_request_id": "cmpl-vibesim_7-0",
+        "engine_core_ttft_ms": 12.5,
+        "engine_queue_wait_ms": 3.0,
+        "engine_first_schedule_to_first_token_ms": 9.5,
+        "engine_core_decode_ms": 180.0,
+        "num_output_tokens": 10,
+        "engine_core_tpot_ms": 20.0,
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(f"INFO VibeSimAlignmentRequestTiming {json.dumps(record)}\n")
+    output = tmp_path / "request_timings.jsonl"
+
+    assert vllm_server.extract_request_timings_jsonl(server_log, output) == 1
+    assert json.loads(output.read_text()) == {**record, "request_id": "vibesim_7"}
+
+
+def test_structured_vllm_request_timing_v2_rejects_inconsistent_tpot(tmp_path):
+    record = {
+        "schema_version": 2,
+        "engine_request_id": "cmpl-vibesim_7-0",
+        "engine_core_ttft_ms": 12.5,
+        "engine_queue_wait_ms": 3.0,
+        "engine_first_schedule_to_first_token_ms": 9.5,
+        "engine_core_decode_ms": 180.0,
+        "num_output_tokens": 10,
+        "engine_core_tpot_ms": 19.0,
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(f"INFO VibeSimAlignmentRequestTiming {json.dumps(record)}\n")
+
+    with pytest.raises(ValueError, match="does not equal"):
+        vllm_server.extract_request_timings_jsonl(server_log, tmp_path / "request_timings.jsonl")
+
+
 def test_request_timing_extraction_filters_frontend_preflight_requests(tmp_path):
     def record(engine_request_id: str) -> dict:
         return {
@@ -422,16 +459,22 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
             [
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "request_id": "vibesim_1",
                         "engine_core_ttft_ms": 30.0,
+                        "engine_core_decode_ms": 180.0,
+                        "num_output_tokens": 10,
+                        "engine_core_tpot_ms": 20.0,
                     }
                 ),
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "request_id": "vibesim_2",
                         "engine_core_ttft_ms": 35.0,
+                        "engine_core_decode_ms": 225.0,
+                        "num_output_tokens": 10,
+                        "engine_core_tpot_ms": 25.0,
                     }
                 ),
             ]
@@ -544,12 +587,14 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     assert e2e_report["meta"]["request_id_audit"]["shared_ids"] == 2
     assert e2e_report["latency"]["client_ttft"]["measured_ms"]["mean"] == 40.0
     assert e2e_report["latency"]["server_ttft"]["measured_ms"]["mean"] == 32.5
+    assert e2e_report["latency"]["server_tpot"]["measured_ms"]["mean"] == 22.5
     assert (analysis / "plots" / "alignment_iteration_overview.png").is_file()
     assert (analysis / "plots" / "alignment_iteration_gpu_cycle_overview.png").is_file()
     assert (analysis / "plots" / "iter_34_to_35" / "iter_34_breakdown.png").is_file()
     assert (analysis / "plots" / "alignment_e2e_completion_throughput.png").is_file()
     assert (analysis / "plots" / "alignment_client_ttft_cdf_comparison.png").is_file()
     assert (analysis / "plots" / "alignment_server_ttft_cdf_comparison.png").is_file()
+    assert (analysis / "plots" / "alignment_server_tpot_cdf_comparison.png").is_file()
 
 
 def _measured_iteration(

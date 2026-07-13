@@ -3,8 +3,9 @@
 The alignment ground truth comes from the **vLLM submodule in this directory**,
 which adds `vllm_iteration(N): <phase>` NVTX scopes and a versioned
 `VibeSimAlignmentIteration {json}` model-input record. It also emits one
-`VibeSimAlignmentRequestTiming {json}` record when each request's first-token
-iteration finishes. The fork source is already vendored (as a git submodule) at:
+`VibeSimAlignmentRequestTiming {json}` record when each request completes. The
+record contains both first-token and decode-span timing. The fork source is
+already vendored (as a git submodule) at:
 
     alignment/profiler/vllm      # branch: moesim-profile
 
@@ -97,22 +98,30 @@ accepts only indexed iteration ranges and attributes kernels by
 profiles must also use `--cuda-graph-trace=node` and verify non-null
 `graphNodeId` rows.
 
-Request TTFT instrumentation reuses vLLM's native EngineCore events and clock:
+Request TTFT/TPOT instrumentation reuses vLLM's native EngineCore events and clock:
 `QUEUED` is recorded when `Scheduler.add_request` appends the request to its
 waiting queue, and the end is the `EngineCoreOutputs.timestamp` created after
 the iteration producing the first token has returned and its model output has
-been processed. The structured record carries `engine_core_ttft_ms`, its
-`engine_queue_wait_ms` component, and
-`engine_first_schedule_to_first_token_ms`. For chunked prefill the end remains
-the iteration that actually emits the first token, not the first prompt chunk.
+been processed. `engine_core_ttft_ms` spans those boundaries and is decomposed
+into `engine_queue_wait_ms` and
+`engine_first_schedule_to_first_token_ms`. For chunked prefill the first-token
+boundary remains the iteration that actually emits the first token, not the
+first prompt chunk.
+
+The same schema-v2 record is emitted once, when the request completes. Its
+`engine_core_decode_ms` spans the first-token EngineCore output timestamp to the
+last-token EngineCore output timestamp, and `engine_core_tpot_ms` is that span
+divided by `num_output_tokens - 1`. A one-token request records a null TPOT
+because it has no inter-token interval. The v1 TTFT-only record remains readable
+for older captures.
 The extractor removes vLLM completions' `cmpl-<X-Request-Id>-0` envelope into
 the canonical TraceLab `request_id` and retains the raw `engine_request_id` for
 audit.
 The profile runner extracts these lines to
 `profile/vllm/<name>_request_timings.jsonl` and records that path in
-`profile_result.json`. This engine-core metric excludes HTTP/frontend ingress,
-tokenization, detokenization, and first-token SSE return time; TraceLab's
-`first_token_ms` remains the client-observed E2E TTFT.
+`profile_result.json`. These engine-core metrics exclude HTTP/frontend ingress,
+tokenization, detokenization, SSE return, `[DONE]`, and client post-processing;
+TraceLab's fields remain the client-observed latency measurements.
 
 NSYS exports the CUPTI runtime and kernel tables without lookup indexes. Before
 attribution, the parser adds persistent `vibesim_` indexes on

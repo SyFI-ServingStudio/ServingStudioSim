@@ -1,12 +1,13 @@
 //! End-to-end measured ↔ simulated request alignment.
 //!
-//! TTFT/TPOT/E2E are compared as two independent raw distributions. Request ids
-//! only audit whether either run lost requests: execution order can differ even
-//! when both runs consume the same trace, so per-id latency subtraction would
-//! compare scheduler positions that are not equivalent. Completion throughput is
-//! intentionally named: TraceLab does not log every token timestamp, so both sides
-//! assign a request's output tokens to its completion bin rather than pretending
-//! to have an instantaneous token-production trace.
+//! Client TTFT/TPOT/E2E and server EngineCore TTFT/TPOT are compared as
+//! independent raw distributions. Request ids only audit whether either run lost
+//! requests: execution order can differ even when both runs consume the same
+//! trace, so per-id latency subtraction would compare scheduler positions that
+//! are not equivalent. Completion throughput is intentionally named: TraceLab
+//! does not log every token timestamp, so both sides assign a request's output
+//! tokens to its completion bin rather than pretending to have an instantaneous
+//! token-production trace.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -41,6 +42,14 @@ struct RequestMetrics {
     e2e_ms: Option<f64>,
 }
 
+struct ServerRequestTimings {
+    request_count: usize,
+    ttft_ms: Vec<f64>,
+    // Schema v1 files do not carry TPOT. Schema v2 files carry Some, which may
+    // still be empty when every completed request generated exactly one token.
+    tpot_ms: Option<Vec<f64>>,
+}
+
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read(log_dir)?;
     if !input.e2e.enabled {
@@ -52,10 +61,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     ensure!(input.e2e.throughput_bins > 0, "throughput_bins must be > 0");
 
     let measured = read_measured_requests(&input.replay_result)?;
-    let server_ttft = input
+    let server_timings = input
         .request_timings_result
         .as_deref()
-        .map(read_server_ttft)
+        .map(read_server_request_timings)
         .transpose()?;
     let simulated = read_sim_requests(ctx, &input.simulation_log_dir).await?;
     ensure!(
@@ -66,11 +75,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         !simulated.is_empty(),
         "simulation request_slo contains no completed requests"
     );
-    if let Some(server_ttft) = &server_ttft {
+    if let Some(server_timings) = &server_timings {
         ensure!(
-            server_ttft.len() == measured.len(),
+            server_timings.request_count == measured.len(),
             "server timing request count {} does not match client replay request count {}",
-            server_ttft.len(),
+            server_timings.request_count,
             measured.len()
         );
     }
@@ -95,39 +104,69 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         &measured_ttft,
         &simulated_ttft,
     )];
-    if let Some(server_ttft) = &server_ttft {
+    if let Some(server_timings) = &server_timings {
         latency_cdf_comparisons.push(latency_cdf_comparison(
             "server_ttft",
             "Server engine-core TTFT",
             "Server measured",
-            server_ttft,
+            &server_timings.ttft_ms,
             &simulated_ttft,
         ));
     }
-    latency_cdf_comparisons.extend([
-        latency_cdf_comparison(
-            "tpot",
-            "TPOT",
-            "Client measured",
-            &measured_tpot,
+    latency_cdf_comparisons.push(latency_cdf_comparison(
+        "tpot",
+        "Client-accounted TPOT",
+        "Client measured",
+        &measured_tpot,
+        &simulated_tpot,
+    ));
+    if let Some(server_tpot) = server_timings
+        .as_ref()
+        .and_then(|timings| timings.tpot_ms.as_ref())
+        .filter(|samples| !samples.is_empty())
+    {
+        latency_cdf_comparisons.push(latency_cdf_comparison(
+            "server_tpot",
+            "Server engine-core TPOT",
+            "Server measured",
+            server_tpot,
             &simulated_tpot,
-        ),
-        latency_cdf_comparison(
-            "e2e",
-            "E2E",
-            "Client measured",
-            &measured_e2e,
-            &simulated_e2e,
-        ),
-    ]);
-    let server_ttft_report = server_ttft.as_ref().map_or_else(
+        ));
+    }
+    latency_cdf_comparisons.push(latency_cdf_comparison(
+        "e2e",
+        "E2E",
+        "Client measured",
+        &measured_e2e,
+        &simulated_e2e,
+    ));
+    let server_ttft_report = server_timings.as_ref().map_or_else(
         || {
             json!({
                 "available": false,
                 "reason": "profile does not contain engine-core request timing instrumentation",
             })
         },
-        |samples| latency_distribution_report(samples, &simulated_ttft),
+        |timings| latency_distribution_report(&timings.ttft_ms, &simulated_ttft),
+    );
+    let server_tpot_report = server_timings.as_ref().map_or_else(
+        || {
+            json!({
+                "available": false,
+                "reason": "profile does not contain engine-core request timing instrumentation",
+            })
+        },
+        |timings| match timings.tpot_ms.as_ref() {
+            None => json!({
+                "available": false,
+                "reason": "profile request timing schema v1 does not contain engine-core TPOT",
+            }),
+            Some(samples) if samples.is_empty() => json!({
+                "available": false,
+                "reason": "profile contains no multi-token request with a defined engine-core TPOT",
+            }),
+            Some(samples) => latency_distribution_report(samples, &simulated_tpot),
+        },
     );
     let definitions = definitions();
     let report = json!({
@@ -137,7 +176,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "profile_log_dir": input.profile_log_dir.display().to_string(),
             "simulation_log_dir": input.simulation_log_dir.display().to_string(),
             "measured_successful_requests": measured.len(),
-            "server_measured_requests": server_ttft.as_ref().map(Vec::len),
+            "server_measured_requests": server_timings.as_ref().map(|timings| timings.request_count),
+            "server_tpot_requests": server_timings
+                .as_ref()
+                .and_then(|timings| timings.tpot_ms.as_ref())
+                .map(Vec::len),
             "simulated_completed_requests": simulated.len(),
             "request_id_audit": {
                 "shared_ids": shared_request_ids,
@@ -150,6 +193,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "client_ttft": latency_distribution_report(&measured_ttft, &simulated_ttft),
             "server_ttft": server_ttft_report,
             "tpot": latency_distribution_report(&measured_tpot, &simulated_tpot),
+            "server_tpot": server_tpot_report,
             "e2e": latency_distribution_report(&measured_e2e, &simulated_e2e),
         },
         "throughput": throughput["summary"],
@@ -169,22 +213,40 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     Ok((report, payload))
 }
 
-fn read_server_ttft(path: &Path) -> Result<Vec<f64>> {
+fn read_server_request_timings(path: &Path) -> Result<ServerRequestTimings> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut request_ids = std::collections::BTreeSet::new();
-    let mut samples = Vec::new();
+    let mut schema_version = None;
+    let mut ttft_ms = Vec::new();
+    let mut tpot_ms = Vec::new();
     for (line_index, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let value: Value = serde_json::from_str(line)
             .with_context(|| format!("parse {} line {}", path.display(), line_index + 1))?;
+        let row_schema_version = value
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .context("server request timing missing schema_version")?;
         ensure!(
-            value.get("schema_version").and_then(Value::as_u64) == Some(1),
-            "unsupported server request timing schema at {} line {}",
+            matches!(row_schema_version, 1 | 2),
+            "unsupported server request timing schema {} at {} line {}",
+            row_schema_version,
             path.display(),
             line_index + 1
         );
+        if let Some(expected_schema_version) = schema_version {
+            ensure!(
+                expected_schema_version == row_schema_version,
+                "mixed server request timing schemas {} and {} in {}",
+                expected_schema_version,
+                row_schema_version,
+                path.display()
+            );
+        } else {
+            schema_version = Some(row_schema_version);
+        }
         let request_id = value
             .get("request_id")
             .and_then(Value::as_str)
@@ -193,21 +255,65 @@ fn read_server_ttft(path: &Path) -> Result<Vec<f64>> {
             request_ids.insert(request_id.to_string()),
             "duplicate server request timing id {request_id:?}"
         );
-        let ttft_ms = value
+        let ttft_sample_ms = value
             .get("engine_core_ttft_ms")
             .and_then(Value::as_f64)
             .context("server request timing missing engine_core_ttft_ms")?;
         ensure!(
-            ttft_ms.is_finite() && ttft_ms >= 0.0,
+            ttft_sample_ms.is_finite() && ttft_sample_ms >= 0.0,
             "server engine_core_ttft_ms must be finite and nonnegative"
         );
-        samples.push(ttft_ms);
+        ttft_ms.push(ttft_sample_ms);
+
+        if row_schema_version == 2 {
+            let num_output_tokens = value
+                .get("num_output_tokens")
+                .and_then(Value::as_u64)
+                .context("server request timing missing num_output_tokens")?;
+            ensure!(
+                num_output_tokens > 0,
+                "server request timing num_output_tokens must be positive"
+            );
+            let decode_ms = value
+                .get("engine_core_decode_ms")
+                .and_then(Value::as_f64)
+                .context("server request timing missing engine_core_decode_ms")?;
+            ensure!(
+                decode_ms.is_finite() && decode_ms >= 0.0,
+                "server engine_core_decode_ms must be finite and nonnegative"
+            );
+            if num_output_tokens == 1 {
+                ensure!(
+                    value.get("engine_core_tpot_ms") == Some(&Value::Null),
+                    "server engine_core_tpot_ms must be null for a one-token request"
+                );
+            } else {
+                let sample = value
+                    .get("engine_core_tpot_ms")
+                    .and_then(Value::as_f64)
+                    .context("server request timing missing engine_core_tpot_ms")?;
+                ensure!(
+                    sample.is_finite() && sample >= 0.0,
+                    "server engine_core_tpot_ms must be finite and nonnegative"
+                );
+                let expected = decode_ms / (num_output_tokens - 1) as f64;
+                ensure!(
+                    (sample - expected).abs() <= 1e-6,
+                    "server engine_core_tpot_ms does not equal engine_core_decode_ms/(num_output_tokens-1)"
+                );
+                tpot_ms.push(sample);
+            }
+        }
     }
     ensure!(
-        !samples.is_empty(),
+        !ttft_ms.is_empty(),
         "server request timing result contains no requests"
     );
-    Ok(samples)
+    Ok(ServerRequestTimings {
+        request_count: ttft_ms.len(),
+        ttft_ms,
+        tpot_ms: (schema_version == Some(2)).then_some(tpot_ms),
+    })
 }
 
 fn read_measured_requests(path: &Path) -> Result<BTreeMap<String, RequestMetrics>> {
@@ -442,7 +548,8 @@ fn definitions() -> Value {
         "latency_comparison": "measured and simulated raw latency distributions are summarized independently and overlaid as two CDF curves; no per-request subtraction or division",
         "client_ttft": "TraceLab client-observed first_token_ms distribution vs simulator ttft_ms distribution; includes frontend/network/tokenization and response-path overhead outside the engine",
         "server_ttft": "vLLM EngineCore queued timestamp to first-token EngineCore output timestamp distribution vs the same simulator ttft_ms distribution; excludes client/frontend transport",
-        "tpot": "measured (total_duration_ms - first_token_ms)/(output_tokens-1) distribution vs simulator tpot_mean_ms distribution",
+        "tpot": "client-accounted (total_duration_ms - first_token_ms)/(output_tokens-1) distribution vs simulator tpot_mean_ms distribution; total_duration_ms includes response completion and client post-processing",
+        "server_tpot": "vLLM EngineCore (last-token output timestamp - first-token output timestamp)/(num_output_tokens-1) distribution vs simulator tpot_mean_ms distribution; excludes HTTP/SSE/client completion overhead",
         "e2e": "measured total_duration_ms distribution vs simulator finish_decode_time_ms-arrival_time_ms distribution",
         "completion_throughput": "output tokens assigned to the request completion bin on both sides; not instantaneous token-production throughput",
     })
@@ -520,6 +627,26 @@ mod tests {
 
         assert_eq!(comparison["measured"]["x"], json!([10.0, 20.0]));
         assert_eq!(comparison["simulated"]["x"], json!([100.0, 200.0]));
+    }
+
+    #[test]
+    fn schema_v1_server_timing_keeps_ttft_and_marks_tpot_unavailable() {
+        let path = std::env::temp_dir().join(format!(
+            "vibesim_alignment_server_timing_v1_{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"schema_version":1,"request_id":"vibesim_1","engine_core_ttft_ms":12.5}"#,
+        )
+        .unwrap();
+
+        let timings = read_server_request_timings(&path).unwrap();
+        let _ = fs::remove_file(path);
+
+        assert_eq!(timings.request_count, 1);
+        assert_eq!(timings.ttft_ms, vec![12.5]);
+        assert!(timings.tpot_ms.is_none());
     }
 
     fn request_with_ttft(ttft_ms: f64) -> RequestMetrics {
