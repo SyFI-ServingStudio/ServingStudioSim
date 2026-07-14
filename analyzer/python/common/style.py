@@ -17,6 +17,35 @@ ACCENT = "#F58518"
 GRID = "#98A2B3"
 MARKER = "#667085"
 
+# Fixed per-backend (color, matplotlib marker) so the kernel-input-distribution
+# scatters read consistently run-to-run and across positions: the same backend is
+# always the same color+shape. A backend not in this table (a new kernel backend)
+# gets a deterministic fallback keyed by its name, so old payloads never break.
+_BACKEND_STYLE = {
+    "fa2": ("#4C78A8", "o"),          # flashinfer attn v2 — blue circle
+    "fa3": ("#F58518", "^"),          # flashinfer attn v3 — orange triangle
+    "torch": ("#54A24B", "s"),        # torch reference — green square
+    "torch_linear": ("#B279A2", "D"),  # torch linear — purple diamond
+    "trt": ("#E45756", "v"),          # trtllm-gen — red down-triangle
+    "deepgemm": ("#72B7B2", "P"),     # deep_gemm — teal plus
+}
+_FALLBACK_COLORS = ["#9D755D", "#BAB0AC", "#EECA3B", "#FF9DA6", "#79706E", "#D37295"]
+_FALLBACK_MARKERS = ["X", "*", "p", "h", "<", ">"]
+
+
+def backend_style(name: str) -> tuple[str, str]:
+    """`(color, marker)` for a backend name. Known backends use the fixed palette
+    above; an unknown name gets a deterministic fallback (hashed to a stable
+    color+marker) so the plot never guesses and a new backend still renders."""
+    if name in _BACKEND_STYLE:
+        return _BACKEND_STYLE[name]
+    # Stable hash → same fallback for the same name every run (Python's built-in
+    # hash is salted per process, so fold the bytes ourselves).
+    h = 0
+    for ch in name.encode("utf-8"):
+        h = (h * 131 + ch) & 0xFFFFFFFF
+    return _FALLBACK_COLORS[h % len(_FALLBACK_COLORS)], _FALLBACK_MARKERS[h % len(_FALLBACK_MARKERS)]
+
 plt.rcParams.update(
     {
         "font.size": 12,

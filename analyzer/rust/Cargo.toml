@@ -19,6 +19,10 @@ serde_json = "1.0"
 datafusion = { version = "45", default-features = false, features = ["parquet"] }
 arrow-array = { version = "54", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Pure-Rust linear algebra — used only by `src/pca.rs` for the symmetric
+# eigendecomposition behind the kernel-input-distribution feature projection
+# (no BLAS/LAPACK system dependency; keeps the analyzer a self-contained build).
+nalgebra = "0.33"
 # Perfetto trace export: prost encodes the generated proto types to protobuf;
 # flate2 gzips the result into a `.pftrace.gz`. The proto types are codegen'd at
 # build time from `proto/perfetto_trace.proto` by `build.rs` (prost-build).

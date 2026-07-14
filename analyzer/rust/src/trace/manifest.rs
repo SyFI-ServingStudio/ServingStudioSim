@@ -13,11 +13,20 @@ use serde::Deserialize;
 
 /// Per-slot leaf identity (kernel kind + one-line config). Slot index = position
 /// in `slot_time_ms` / `slot_input` parquet list columns.
+///
+/// `backends` is the leaf's ordered candidate backend list — the index space of
+/// the `cost_log` `slot_backend` column (`backends[slot_backend]` names the
+/// backend best-of-N selected), so a consumer never parses the `config` string.
+/// `#[serde(default)]`: manifests written before the field existed deserialize to
+/// an empty list, which the `kernel-input-distribution` subject reads as "backend
+/// selection unavailable" rather than guessing.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct LeafDesc {
     pub name: String,
     pub kind: String,
     pub config: String,
+    #[serde(default)]
+    pub backends: Vec<String>,
 }
 
 /// Flattened cost-tree node. `children` is a contiguous range into `nodes`; a
@@ -115,7 +124,7 @@ mod tests {
           "section": "iter",
           "slots": [
             {"name": "m.embedding", "kind": "elementwise", "config": "hidden=4096"},
-            {"name": "m.lm_head", "kind": "single_gemm", "config": "n=128256 k=4096"}
+            {"name": "m.lm_head", "kind": "single_gemm", "config": "n=128256 k=4096", "backends": ["torch_linear"]}
           ],
           "nodes": [
             {"Sum": {"children": {"start": 1, "end": 3}}},
@@ -137,6 +146,10 @@ mod tests {
         assert!(doc.section("missing").is_none());
         assert_eq!(m.slots.len(), 2);
         assert_eq!(m.slots[1].kind, "single_gemm");
+        // `backends` is `#[serde(default)]`: absent on slot 0 (pre-field manifest
+        // shape) → empty; present on slot 1 → the ordered candidate list.
+        assert!(m.slots[0].backends.is_empty());
+        assert_eq!(m.slots[1].backends, vec!["torch_linear".to_owned()]);
         assert_eq!(
             m.nodes[0],
             FlatCostNode::Sum { children: 1..3 },
