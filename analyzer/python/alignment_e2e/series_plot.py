@@ -7,7 +7,7 @@ from functools import partial
 from pathlib import Path
 
 from common.cdf_plot import render_cdf_comparison
-from common.figure import add_legend, finalize, new_axes
+from common.figure import add_legend, corner_box, finalize, fmt_value, new_axes
 from common.layout import load_payload, plot_output_path, resolve_artifact
 from common.style import ACCENT, CURVE
 
@@ -19,6 +19,7 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
         return []
     payload = load_payload(log_dir, PAYLOAD)
     throughput = payload.get("throughput") or {}
+    throughput_summary = payload.get("throughput_summary") or {}
     if not throughput.get("t_start_ms"):
         reason = payload.get("meta", {}).get("reason", "no E2E throughput bins")
         print(f"[alignment_e2e] nothing to render: {reason}")
@@ -28,6 +29,7 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
             _render_throughput,
             throughput,
             plot_output_path(log_dir, "alignment_e2e_completion_throughput.png"),
+            summary=throughput_summary,
             run_label=log_dir.name,
         )
     ]
@@ -46,7 +48,13 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
     return jobs
 
 
-def _render_throughput(series: dict, out_path: Path, *, run_label: str) -> Path:
+def _render_throughput(
+    series: dict,
+    out_path: Path,
+    *,
+    summary: dict,
+    run_label: str,
+) -> Path:
     starts = series["t_start_ms"]
     ends = series["t_end_ms"]
     edges_s = [value / 1000.0 for value in (*starts, ends[-1])]
@@ -70,6 +78,18 @@ def _render_throughput(series: dict, out_path: Path, *, run_label: str) -> Path:
     )
     ax.set_xlim(edges_s[0], edges_s[-1])
     ax.set_ylim(bottom=0.0)
+    summary_fields = (
+        ("measured_client_completion_tps", "client avg"),
+        ("measured_server_gpu_span_tps", "server GPU avg"),
+        ("simulated_completion_tps", "sim avg"),
+    )
+    summary_lines = [
+        f"{label} = {fmt_value(summary[key], 'tok/s')}"
+        for key, label in summary_fields
+        if key in summary
+    ]
+    if summary_lines:
+        corner_box(ax, summary_lines, loc="upper right")
     add_legend(ax)
     finalize(
         fig,

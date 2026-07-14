@@ -588,6 +588,17 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     assert e2e_report["latency"]["client_ttft"]["measured_ms"]["mean"] == 40.0
     assert e2e_report["latency"]["server_ttft"]["measured_ms"]["mean"] == 32.5
     assert e2e_report["latency"]["server_tpot"]["measured_ms"]["mean"] == 22.5
+    assert e2e_report["throughput"]["measured_client_completion_tps"] == pytest.approx(
+        20 / 0.3
+    )
+    assert e2e_report["throughput"]["measured_server_gpu_span_ms"] == 13.8
+    assert e2e_report["throughput"]["measured_server_gpu_span_tps"] == pytest.approx(
+        20 / 0.0138
+    )
+    e2e_payload = json.loads(
+        (analysis / "payloads" / "alignment_e2e_series.json").read_text()
+    )
+    assert e2e_payload["throughput_summary"] == e2e_report["throughput"]
     assert (analysis / "plots" / "alignment_iteration_overview.png").is_file()
     assert (analysis / "plots" / "alignment_iteration_gpu_cycle_overview.png").is_file()
     assert (analysis / "plots" / "iter_34_to_35" / "iter_34_breakdown.png").is_file()

@@ -189,6 +189,14 @@ then overlays client E2E. Each measured/simulated pair is compared as independen
 distributions; no per-request latency ratio is computed. Request ids only audit
 whether either side lost requests, which matters when the two schedulers execute
 simultaneous arrivals in different orders.
+Throughput reports both client completion time and server GPU time. The client
+rate uses TraceLab's earliest post/submit through latest completion. The server
+GPU rate uses parsed NSYS's first observed kernel start through last observed
+kernel end, so it includes inter-iteration gaps and the terminal iteration that
+first-kernel-to-next-first-kernel cycle sums omit. The per-bin plot remains a
+client-completion versus simulation comparison because NSYS does not attribute
+completed output tokens to individual server timestamps; its summary box shows
+all three aggregate rates without inventing a server token-production series.
 An older profile captured before engine-core request timing instrumentation can
 still provide client TTFT, TPOT, E2E, and throughput analysis: its manifest
 records `request_timings_result: null`, the report marks server TTFT/TPOT
