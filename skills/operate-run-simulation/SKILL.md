@@ -207,6 +207,16 @@ parallel launch. That output now lands under
 experiment dir, named after the run folder — not a scattered top-level hash
 dir). Nothing to configure; just expect that `.cache_build/` subdir.
 
+## Analysis output
+
+Each finished run is auto-analyzed (best-effort — a failure never fails the run)
+into `reports/` (numbers JSON), `payloads/` (plot JSON), and `plots/` (PNG) under
+its `log_dir`. The full list of analysis **subjects** a run produces and what each
+one reads and emits is the canonical Subjects catalog in
+`analyzer/README.md` — point there instead of guessing metric names. Selection is
+the optional preset key `analyze_subjects` (omit = all applicable); `--no-analyze`
+skips analysis for one launch.
+
 ## Output
 
 After setup and launch, report:

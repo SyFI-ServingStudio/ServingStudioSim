@@ -102,11 +102,19 @@ rust/                The `analyze` binary (DataFusion compute side).
                        extraction, and `require_columns` (the schema drift guard).
   src/cdf.rs           Shared numeric kernels: percentile, CDF downsample, and the
                        serde output shapes (`MetricStats`, `CdfSeries`).
+  src/pca.rs           Shared numeric kernel: standardize + top-2 principal
+                       components (the kernel-input-distribution feature projection).
   src/request/         Category = per-request/session metrics (slo).
   src/throughput/      Category = serving-rate-over-time metrics (throughput).
+  src/utilization/     Per-pool GPU busy-fraction over time.
+  src/batch/           Batch composition + per-location achieved kernel throughput.
+  src/backend/         Backend selection over a kernel position's input feature space.
+  src/breakdown/       CostTree replay + run-wide leaf-position composition.
+  src/conservation/    Run-wide work-accounting checks (actual vs expected).
+  src/kv/              Per-pool KV-cache occupancy over time.
   src/alignment_iteration/  Per-iteration total/operation/kernel comparison.
   src/alignment_e2e/        Paired request latency + completion throughput.
-  src/alignment_workload/   Measured-vs-sim scheduler batch shapes by iteration id.
+  src/alignment_workload/   Measured-vs-sim scheduler batch shapes by iteration id and elapsed time.
   src/alignment_input.rs    Shared alignment manifest/path contract.
   src/trace/           Perfetto trace export from per-worker cost logs.
 
@@ -114,7 +122,7 @@ python/              The render side (matplotlib over payload JSON).
   __main__.py          `render <log_dir> [subjects]`; maps subject → renderer,
                        runs figure jobs in parallel (fork processes; matplotlib
                        is thread-hostile).
-  request/, throughput/  One renderer module per subject; returns figure "jobs".
+  request/, throughput/, utilization/, batch/, backend/, breakdown/, conservation/, kv/  One renderer module per subject; returns figure "jobs".
   alignment_iteration/, alignment_e2e/, alignment_workload/  Alignment payload renderers.
   common/              Shared plotting: payload loader + run-dir layout, figure
                        scaffolding, CDF plot, style.
@@ -136,9 +144,16 @@ Current catalog:
 | `slo-general` | request | `request_slo.parquet` scalar columns | TTFT/TPOT/E2E stats / per-metric CDF series |
 | `slo-detailed` | request | `request_slo.parquet` `output_token_times` column | ITL stats / CDF series when per-token logging is enabled |
 | `throughput` | throughput | `request_state.parquet` (+ `run_meta.json`) | per-GPU prefill/decode/total TPS totals / fine `segments` + coarse `binned_segments` series |
+| `utilization` | utilization | `cost_log` slot times (+ `run_meta.json`) | per-pool GPU compute utilization (fraction of workers busy) over time / `utilization_series` |
+| `batch` | batch | `request_state.parquet` | per-batch composition (batch / prefill / decode token counts) over time + stats / `batch_scatter` series |
+| `kernel-throughput` | batch | 1/50-sampled `cost_log` slots + matching CostTree manifests | achieved TFLOP/s (compute) and GB/s (memory BW) per cost-tree location / per-location `kernel_throughput_locations` stats |
+| `kernel-input-distribution` | backend | sampled `cost_log` `slot_input` + `slot_backend` + matching CostTree manifest `backends` lists | per-position selected-backend counts/ratios + PCA/feature projection / one scatter per position (`kernel_input_distribution_scatter`), rendered to `plots/kernel_input_dist/<position>.png`; unavailable on runs without per-slot backend + input logging |
+| `kernel-time-share` | breakdown | `cost_log` slot times + matching CostTree manifests | root kernel-time share by leaf position at overall / pool / worker levels; exact on small runs and bounded worker-stratified sampling on large runs |
+| `workload-conservation` | conservation | `cost_log` actuals + `request_slo.parquet` per-request expected | run-wide prefill/decode/FFN/KV work accounting, pass/fail / `workload_conservation_checks` |
+| `kv-occupancy` | kv | `kv_snapshot` stream + `run_meta.json` capacity | per-pool KV occupancy (active / projected-peak / promised tokens, and as a fraction of capacity) over time / `kv_occupancy_series` |
 | `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping + simulation `gpu_time_multiplier` | kernel/mapping error stats / separate kernel-busy and measured first-kernel-to-next-first-kernel GPU-cycle overviews + per-iteration mapped stacks |
-| `alignment-e2e` | alignment-e2e | TraceLab replay JSONL + optional vLLM engine-core request timing JSONL + sim `request_slo.parquet` | independent client-TTFT/sim, optional server-TTFT/sim, TPOT, and E2E stats + completion throughput / available raw latency CDF overlays + throughput |
-| `alignment-workload` | alignment-workload | normalized NSYS iteration metrics + sim `cost_log.groups`/`wall_start_ms` | per-side workload summaries / fine prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle series by iteration id |
+| `alignment-e2e` | alignment-e2e | TraceLab replay JSONL + optional vLLM engine-core request timing JSONL + sim `request_slo.parquet` | independent client-TTFT/sim, optional server-TTFT/sim, client-TPOT/sim, optional server-TPOT/sim, and E2E stats + completion throughput / available raw latency CDF overlays + throughput |
+| `alignment-workload` | alignment-workload | normalized NSYS iteration metrics + sim `cost_log.groups`/`wall_start_ms` | per-side workload summaries / fine prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle series by iteration id, plus decode batch size by elapsed time |
 
 The alignment-iteration payload and report retain every paired iteration, but
 the Python renderer evenly samples at most 128 per-iteration breakdown PNGs.

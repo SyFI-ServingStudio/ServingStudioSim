@@ -55,6 +55,9 @@ infrastructure.
 - **[detailed_design/](detailed_design/)** — one concise document per layer
   (`L1.md` … `L7.md`): its role, boundary, the directory and key types that
   implement it, and its own invariants.
+- **[analyzer.md](analyzer.md)** — the post-run analyzer's design contract (the
+  Rust-computes / Python-renders split, the report/payload envelope, the flat
+  subject registry, applicability/scope, and the speed budget).
 
 Two companion sources sit alongside this folder:
 
