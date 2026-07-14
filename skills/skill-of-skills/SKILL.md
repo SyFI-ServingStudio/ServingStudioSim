@@ -57,9 +57,14 @@ top-split-model-into-kernels - break a model forward into the VibeSim kernel seq
 ├── dev-lookup-transformers-model - what math each op computes (shared)
 └── dev-explore-kernel - whether a real fused kernel exists in the ecosystem (shared)
 
+top-align-with-framework - evaluate VibeSim↔framework alignment quality (kernel-only deviation + missing-chunk coverage, GPU duty cycle, TTFT/TPOT)
+├── operate-run-alignment - run the four-phase alignment pipeline and label folded kernels (Step 0, below)
+├── impl-validate-kernel-cache - fix a wrong-shape kernel cost surfaced by Check 1
+└── top-add-kernel - add/repair a kernel whose backend the sim mismodels
+
 operate-run-simulation - run deployment simulations from presets (DES, workload trace)
 operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
-operate-align-with-vllm - run four-phase measured VibeSim-to-vLLM alignment and label folded kernel positions
+operate-run-alignment - run the four-phase measured VibeSim-to-vLLM alignment pipeline and label folded kernel positions (evaluate the result via top-align-with-framework)
 operate-gpu-spec - query or update the GPU spec catalog
 operate-profile-sim-speed - profile simulator wallclock speed
 operate-profile-existing-kernel - query or fill registered profiler rows
