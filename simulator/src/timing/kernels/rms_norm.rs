@@ -13,14 +13,14 @@ use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
-use crate::timing::{KernelConfig, SweepCoords};
+use crate::timing::{Dim, KernelConfig, SweepCoords};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
 pub struct RmsNormKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
-    pub hidden: u32,
+    pub hidden: Dim,
     #[compute_dtype]
     pub dtype: DType,
 }
@@ -55,7 +55,7 @@ impl KernelSpec for RmsNormSpec {
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("m", m as u32)
-                .with("hidden", config.hidden)
+                .with("hidden", config.hidden.get())
                 .with("dtype", config.dtype.as_str())
         })
     }
@@ -76,7 +76,7 @@ mod tests {
         let cfg = RmsNormKernelConfig {
             backends: vec!["flashinfer"],
             gpu_name: "H100".to_string(),
-            hidden: 4096,
+            hidden: 4096.into(),
             dtype: DType::Fp16,
         };
         assert_eq!(cfg.backends, vec!["flashinfer"]);
@@ -89,7 +89,7 @@ mod tests {
         let cfg = RmsNormKernelConfig {
             backends: vec!["flashinfer"],
             gpu_name: "H100".to_string(),
-            hidden: 8192,
+            hidden: 8192.into(),
             dtype: DType::Bf16,
         };
         // Every field in declaration order, no struct-name/braces wrapper.
@@ -102,7 +102,7 @@ mod tests {
         let multi = RmsNormKernelConfig {
             backends: vec!["flashinfer", "triton"],
             gpu_name: "H100".to_string(),
-            hidden: 8192,
+            hidden: 8192.into(),
             dtype: DType::Bf16,
         };
         assert_eq!(
@@ -122,7 +122,7 @@ mod tests {
         let cfg = RmsNormKernelConfig {
             backends: vec!["flashinfer"],
             gpu_name: "H100".to_string(),
-            hidden: 4096,
+            hidden: 4096.into(),
             dtype: DType::Bf16,
         };
         let grid = RmsNormSpec::sweep_grid(&cfg);

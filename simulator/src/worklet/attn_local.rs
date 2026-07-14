@@ -13,14 +13,14 @@ use crate::op::attention::{
     FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp,
 };
 use crate::timing::bridge::DType;
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 /// Raw config; mirrors `FlashInferAttentionConfig` (no partition under `Local`).
 #[derive(Clone, Debug)]
 pub struct AttnLocalWorkletConfig {
-    pub num_qo_heads: u32,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
+    pub num_qo_heads: Dim,
+    pub num_kv_heads: Dim,
+    pub head_dim: Dim,
     /// Base (16-bit) dtype; `fp8` picks the per-phase preset inside the op.
     pub dtype: DType,
     pub fp8: bool,
@@ -58,9 +58,9 @@ impl AttnLocalWorklet {
             attn: FlashInferAttentionConfig {
                 backends: cfg.backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                num_qo_heads: cfg.num_qo_heads,
-                num_kv_heads: cfg.num_kv_heads,
-                head_dim: cfg.head_dim,
+                num_qo_heads: cfg.num_qo_heads.clone(),
+                num_kv_heads: cfg.num_kv_heads.clone(),
+                head_dim: cfg.head_dim.clone(),
                 dtype: cfg.dtype,
                 fp8: cfg.fp8,
                 kv_cache_append_backends: cfg.kv_cache_append_backends.clone(),
@@ -120,9 +120,9 @@ mod tests {
 
     fn cfg() -> AttnLocalWorkletConfig {
         AttnLocalWorkletConfig {
-            num_qo_heads: 32,
-            num_kv_heads: 8,
-            head_dim: 128,
+            num_qo_heads: 32.into(),
+            num_kv_heads: 8.into(),
+            head_dim: 128.into(),
             dtype: DType::Bf16,
             fp8: false,
             gpu_name: "H100".to_string(),

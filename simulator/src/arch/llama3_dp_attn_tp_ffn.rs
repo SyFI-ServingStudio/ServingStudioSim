@@ -36,7 +36,7 @@ use crate::timing::kernels::{
     SingleGemmKernelInput,
 };
 use crate::timing::{
-    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
+    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{
@@ -88,7 +88,7 @@ pub struct Llama3DpAttnTpFfnModel {
     pub attn_tp_size: u16,
     pub ffn_tp_size: u16,
     pub num_dp_groups: u16,
-    pub total_kv_bytes_per_token: u64,
+    pub total_kv_bytes_per_token: Dim,
     pub attn_block: AttnBlockTpWorklet,
     pub mlp_block: MlpBlockTpWorklet,
     pub embed: Op<ElementwiseKernel>,
@@ -115,6 +115,7 @@ pub struct DpAttnTpFfnParallel {
 pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3DpAttnTpFfnConfigs {
     let gpu = &parallel.gpu_name;
     let dtype_bytes = model.dtype.size_bytes();
+    let bytes = Dim::param("bytes", dtype_bytes);
     assert!(
         parallel.attn_tp_size > 0 && parallel.ffn_tp_size > 0,
         "attn_tp_size / ffn_tp_size must be non-zero"
@@ -128,13 +129,14 @@ pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3
     let num_dp_groups = parallel.ffn_tp_size / parallel.attn_tp_size;
     Llama3DpAttnTpFfnConfigs {
         attn_block: AttnBlockTpWorkletConfig {
-            hidden: model.hidden,
-            num_qo_heads: model.num_qo_heads,
-            num_kv_heads: model.num_kv_heads,
-            head_dim: model.head_dim,
+            hidden: model.hidden.clone(),
+            num_qo_heads: model.num_qo_heads.clone(),
+            num_kv_heads: model.num_kv_heads.clone(),
+            head_dim: model.head_dim.clone(),
             dtype: model.dtype,
             fp8: false,
             tp_size: parallel.attn_tp_size,
+            tp_name: "attn_tp",
             allreduce_fabric: TP_FABRIC,
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
@@ -147,10 +149,11 @@ pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3
             allreduce_backends: ALLREDUCE_BACKENDS.to_vec(),
         },
         mlp_block: MlpBlockTpWorkletConfig {
-            hidden: model.hidden,
-            intermediate: model.intermediate,
+            hidden: model.hidden.clone(),
+            intermediate: model.intermediate.clone(),
             dtype: model.dtype,
             tp_size: parallel.ffn_tp_size,
+            tp_name: "ffn_tp",
             allreduce_fabric: TP_FABRIC,
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
@@ -163,21 +166,21 @@ pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3
         embed: ElementwiseKernelConfig {
             backends: ACT_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            input_bytes_per_token: model.hidden * dtype_bytes,
-            output_bytes_per_token: model.hidden * dtype_bytes,
+            input_bytes_per_token: model.hidden.clone() * bytes.clone(),
+            output_bytes_per_token: model.hidden.clone() * bytes.clone(),
         },
         final_norm: RmsNormKernelConfig {
             backends: NORM_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            hidden: model.hidden,
+            hidden: model.hidden.clone(),
             dtype: model.dtype,
         },
         // Replicated full lm_head for v1 (vocab-parallel split deferred).
         lm_head: SingleGemmKernelConfig {
             backends: GEMM_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            n: model.vocab,
-            k: model.hidden,
+            n: model.vocab.clone(),
+            k: model.hidden.clone(),
             dtype: model.dtype,
         },
         num_layers: model.num_layers,
@@ -191,12 +194,12 @@ pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3
 /// `attn_tp_size` ranks of one DP shard, all layers, all KV heads. This is
 /// the wire size of a token's KV for a PD handoff (each DP shard owns one
 /// full copy of every KV head). Read off `raw_cfg`'s un-sharded values.
-fn total_kv_bytes_per_token(resolved: &Llama3DpAttnTpFfnResolved) -> u64 {
+fn total_kv_bytes_per_token(resolved: &Llama3DpAttnTpFfnResolved) -> Dim {
     let raw = &resolved.attn_block.raw_cfg;
-    2 * raw.num_kv_heads as u64
-        * raw.head_dim as u64
-        * raw.kv_dtype().size_bytes() as u64
-        * resolved.num_layers as u64
+    2 * raw.num_kv_heads.clone()
+        * raw.head_dim.clone()
+        * Dim::param("bytes", raw.kv_dtype().size_bytes())
+        * Dim::param("num_layers", resolved.num_layers)
 }
 
 pub fn resolve_configs(cfgs: &Llama3DpAttnTpFfnConfigs) -> Llama3DpAttnTpFfnResolved {
@@ -378,7 +381,7 @@ impl Llama3DpAttnTpFfnModel {
 
 impl IterwiseUnifiedModel for Llama3DpAttnTpFfnModel {
     fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token
+        self.total_kv_bytes_per_token.get() as u64
     }
 
     /// One replica spans the FFN TP group — `ffn_tp_size` GPUs, with the DP

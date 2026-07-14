@@ -20,14 +20,14 @@ use crate::timing::kernels::{
     RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 #[derive(Clone, Debug)]
 pub struct PostAttnLocalWorkletConfig {
-    pub hidden: u32,
-    pub intermediate: u32,
-    pub num_qo_heads: u32,
-    pub head_dim: u32,
+    pub hidden: Dim,
+    pub intermediate: Dim,
+    pub num_qo_heads: Dim,
+    pub head_dim: Dim,
     pub dtype: DType,
     pub gpu_name: String,
     pub norm_backends: Vec<&'static str>,
@@ -63,38 +63,39 @@ pub struct PostAttnLocalWorklet {
 impl PostAttnLocalWorklet {
     pub fn resolve_config(cfg: &PostAttnLocalWorkletConfig) -> PostAttnLocalWorkletResolved {
         let dtype_bytes = cfg.dtype.size_bytes();
+        let bytes = Dim::param("bytes", dtype_bytes);
         PostAttnLocalWorkletResolved {
             o_proj: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: cfg.hidden,
-                k: cfg.num_qo_heads * cfg.head_dim,
+                n: cfg.hidden.clone(),
+                k: cfg.num_qo_heads.clone() * cfg.head_dim.clone(),
                 dtype: cfg.dtype,
             },
             post_norm: RmsNormKernelConfig {
                 backends: cfg.norm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                hidden: cfg.hidden,
+                hidden: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
             up_gate: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: 2 * cfg.intermediate, // gate ‖ up concat
-                k: cfg.hidden,
+                n: 2 * cfg.intermediate.clone(), // gate ‖ up concat
+                k: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
             act: ElementwiseKernelConfig {
                 backends: cfg.act_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                input_bytes_per_token: 2 * cfg.intermediate * dtype_bytes,
-                output_bytes_per_token: cfg.intermediate * dtype_bytes,
+                input_bytes_per_token: 2 * cfg.intermediate.clone() * bytes.clone(),
+                output_bytes_per_token: cfg.intermediate.clone() * bytes.clone(),
             },
             down: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: cfg.hidden,
-                k: cfg.intermediate,
+                n: cfg.hidden.clone(),
+                k: cfg.intermediate.clone(),
                 dtype: cfg.dtype,
             },
             raw_cfg: cfg.clone(),
@@ -184,10 +185,10 @@ mod tests {
 
     fn cfg() -> PostAttnLocalWorkletConfig {
         PostAttnLocalWorkletConfig {
-            hidden: 4096,
-            intermediate: 14336,
-            num_qo_heads: 32,
-            head_dim: 128,
+            hidden: 4096.into(),
+            intermediate: 14336.into(),
+            num_qo_heads: 32.into(),
+            head_dim: 128.into(),
             dtype: DType::Bf16,
             gpu_name: "H100".to_string(),
             norm_backends: vec!["flashinfer"],

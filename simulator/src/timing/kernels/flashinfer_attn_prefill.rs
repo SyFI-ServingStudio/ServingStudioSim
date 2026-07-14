@@ -34,16 +34,16 @@ use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
-use crate::timing::{Coords, KernelConfig, SweepCoords};
+use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
 pub struct FlashinferAttnPrefillKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
-    pub num_qo_heads: u32,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
+    pub num_qo_heads: Dim,
+    pub num_kv_heads: Dim,
+    pub head_dim: Dim,
     #[compute_dtype]
     pub q_dtype: DType,
     #[kv_dtype]
@@ -130,9 +130,9 @@ impl KernelSpec for FlashinferAttnPrefillSpec {
             let prefix_len = (a - b / 2.0).max(0.0).round() as u32;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("num_qo_heads", config.num_qo_heads)
-                .with("num_kv_heads", config.num_kv_heads)
-                .with("head_dim", config.head_dim)
+                .with("num_qo_heads", config.num_qo_heads.get())
+                .with("num_kv_heads", config.num_kv_heads.get())
+                .with("head_dim", config.head_dim.get())
                 .with("q_dtype", config.q_dtype.as_str())
                 .with("kv_dtype", config.kv_dtype.as_str())
                 .with("o_dtype", config.o_dtype.as_str())
@@ -160,9 +160,9 @@ mod tests {
         FlashinferAttnPrefillKernelConfig {
             backends: vec!["fa2", "fa3", "trt", "cudnn"],
             gpu_name: "H100".to_string(),
-            num_qo_heads: 32,
-            num_kv_heads: 8,
-            head_dim: 128,
+            num_qo_heads: 32.into(),
+            num_kv_heads: 8.into(),
+            head_dim: 128.into(),
             q_dtype: DType::Bf16,
             kv_dtype: DType::Bf16,
             o_dtype: DType::Bf16,

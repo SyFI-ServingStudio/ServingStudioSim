@@ -61,7 +61,7 @@ use crate::timing::kernels::{
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::{
-    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
+    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{
@@ -162,7 +162,8 @@ pub struct Qwen3MoeDpAttnEpFfnModel {
     pub nvl_num_gpu: u16,
     pub top_k: u32,
     pub num_experts: u32,
-    pub total_kv_bytes_per_token: u64,
+    /// Symbolic KV footprint per token (folds to bytes at the worker seam).
+    pub total_kv_bytes_per_token: Dim,
     pub attn_block: AttnBlockTpWorklet,
     pub moe_router: MoeRouterLocalWorklet,
     pub moe_dispatch: MoeDispatchOp,
@@ -186,13 +187,14 @@ fn attn_block_config(
     gpu_name: &str,
 ) -> AttnBlockTpWorkletConfig {
     AttnBlockTpWorkletConfig {
-        hidden: model.hidden,
-        num_qo_heads: model.num_qo_heads,
-        num_kv_heads: model.num_kv_heads,
-        head_dim: model.head_dim,
+        hidden: model.hidden.clone(),
+        num_qo_heads: model.num_qo_heads.clone(),
+        num_kv_heads: model.num_kv_heads.clone(),
+        head_dim: model.head_dim.clone(),
         dtype: model.dtype,
         fp8: model.fp8,
         tp_size: attn_tp_size,
+        tp_name: "attn_tp",
         allreduce_fabric: TP_FABRIC,
         gpu_name: gpu_name.to_string(),
         norm_backends: NORM_BACKENDS.to_vec(),
@@ -215,6 +217,7 @@ pub fn build_configs(
     // Byte-transfer widths (local reduce, embed) use the compute dtype: fp8 halves
     // the wire size, bf16 leaves it unchanged. The RMSNorm ops keep `model.dtype`.
     let dtype_bytes = model.compute_dtype().size_bytes();
+    let bytes = Dim::param("bytes", dtype_bytes);
     assert!(
         parallel.attn_tp_size > 0 && parallel.ep_size > 0,
         "attn_tp_size / ep_size must be non-zero"
@@ -240,14 +243,14 @@ pub fn build_configs(
     );
     assert!(parallel.nvl_num_gpu > 0, "nvl_num_gpu must be non-zero");
     assert!(
-        model.num_experts % u32::from(parallel.ep_size) == 0,
+        model.num_experts.get() % u32::from(parallel.ep_size) == 0,
         "num_experts {} not divisible by ep_size {}",
         model.num_experts,
         parallel.ep_size,
     );
     assert_eq!(
         routing.num_experts(),
-        model.num_experts,
+        model.num_experts.get(),
         "routing distribution has {} experts, model has {}",
         routing.num_experts(),
         model.num_experts,
@@ -257,7 +260,7 @@ pub fn build_configs(
     // hence different curves. The L3 grouped-GEMM `local_ppm` stays uniform
     // (v1 deviation, see agent-trace): per-rank `local_ppm` skew on the FFN
     // compute side is a deferred follow-up.
-    let local_ppm = uniform_local_ppm(model.num_experts, parallel.ep_size);
+    let local_ppm = uniform_local_ppm(model.num_experts.get(), parallel.ep_size);
     let moe_net = MoeNetConfig {
         backends: P2P_BACKENDS.to_vec(),
         gpu_name: gpu.clone(),
@@ -268,7 +271,8 @@ pub fn build_configs(
         inter_fabric: MOE_INTER_FABRIC,
         ep_size: u32::from(parallel.ep_size),
         nvl_num_gpu: u32::from(parallel.nvl_num_gpu),
-        h: model.hidden,
+        // Comm-sizing seam: the MoE all-to-all payload is byte-keyed.
+        h: model.hidden.get(),
         top_k: model.top_k,
         routing: routing.clone(),
         placement: Placement::ReplicatedHeadParallel {
@@ -278,8 +282,8 @@ pub fn build_configs(
     Qwen3MoeDpAttnEpFfnConfigs {
         attn_block: attn_block_config(model, parallel.attn_tp_size, gpu),
         moe_router: MoeRouterLocalWorkletConfig {
-            hidden: model.hidden,
-            num_experts: model.num_experts,
+            hidden: model.hidden.clone(),
+            num_experts: model.num_experts.clone(),
             dtype: model.dtype,
             compute_dtype: model.compute_dtype(),
             gpu_name: gpu.clone(),
@@ -290,9 +294,9 @@ pub fn build_configs(
         // MoE expert compute is all-fp8 in an fp8 run (grouped GEMMs + SwiGLU act);
         // no RMSNorm inside, so the whole worklet takes the compute dtype.
         moe_expert_compute: MoeExpertComputeLocalWorkletConfig {
-            hidden: model.hidden,
-            moe_intermediate: model.moe_intermediate,
-            num_experts: model.num_experts,
+            hidden: model.hidden.clone(),
+            moe_intermediate: model.moe_intermediate.clone(),
+            num_experts: model.num_experts.clone(),
             ep_size: parallel.ep_size,
             dtype: model.compute_dtype(),
             gpu_name: gpu.clone(),
@@ -306,8 +310,8 @@ pub fn build_configs(
         moe_local_reduce: ElementwiseKernelConfig {
             backends: ACT_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            input_bytes_per_token: model.hidden * dtype_bytes,
-            output_bytes_per_token: model.hidden * dtype_bytes,
+            input_bytes_per_token: model.hidden.clone() * bytes.clone(),
+            output_bytes_per_token: model.hidden.clone() * bytes.clone(),
         },
         moe_combine: moe_net,
         // Embedding gather placeholder: read one hidden-wide row, write one out
@@ -315,21 +319,21 @@ pub fn build_configs(
         embed: ElementwiseKernelConfig {
             backends: ACT_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            input_bytes_per_token: model.hidden * dtype_bytes,
-            output_bytes_per_token: model.hidden * dtype_bytes,
+            input_bytes_per_token: model.hidden.clone() * bytes.clone(),
+            output_bytes_per_token: model.hidden.clone() * bytes.clone(),
         },
         final_norm: RmsNormKernelConfig {
             backends: NORM_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            hidden: model.hidden,
+            hidden: model.hidden.clone(),
             dtype: model.dtype,
         },
         // Replicated full lm_head for v1 (vocab-parallel split deferred).
         lm_head: SingleGemmKernelConfig {
             backends: model.single_gemm_backends(),
             gpu_name: gpu.clone(),
-            n: model.vocab,
-            k: model.hidden,
+            n: model.vocab.clone(),
+            k: model.hidden.clone(),
             dtype: model.compute_dtype(),
         },
         num_layers: model.num_layers,
@@ -339,7 +343,8 @@ pub fn build_configs(
         hp_size: parallel.hp_size,
         nvl_num_gpu: parallel.nvl_num_gpu,
         top_k: model.top_k,
-        num_experts: model.num_experts,
+        // Arch-level scalar kept for the model label only (a count, not a shape).
+        num_experts: model.num_experts.get(),
     }
 }
 
@@ -347,12 +352,12 @@ pub fn build_configs(
 /// `attn_tp_size` ranks of one DP shard, all layers, all KV heads. Same
 /// definition as `llama3_dp_attn_tp_ffn`: the wire size of a token's KV for a
 /// PD handoff (each DP shard owns one full copy of every KV head).
-fn total_kv_bytes_per_token(resolved: &Qwen3MoeDpAttnEpFfnResolved) -> u64 {
+fn total_kv_bytes_per_token(resolved: &Qwen3MoeDpAttnEpFfnResolved) -> Dim {
     let raw = &resolved.attn_block.raw_cfg;
-    2 * raw.num_kv_heads as u64
-        * raw.head_dim as u64
-        * raw.kv_dtype().size_bytes() as u64
-        * resolved.num_layers as u64
+    2 * raw.num_kv_heads.clone()
+        * raw.head_dim.clone()
+        * Dim::param("bytes", raw.kv_dtype().size_bytes())
+        * Dim::param("num_layers", resolved.num_layers)
 }
 
 pub fn resolve_configs(cfgs: &Qwen3MoeDpAttnEpFfnConfigs) -> Qwen3MoeDpAttnEpFfnResolved {
@@ -678,7 +683,7 @@ impl Qwen3MoeDpAttnEpFfnModel {
 
 impl IterwiseUnifiedModel for Qwen3MoeDpAttnEpFfnModel {
     fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token
+        self.total_kv_bytes_per_token.get() as u64
     }
 
     /// One replica spans the EP group — `ep_size` GPUs, with the DP-attention
@@ -760,7 +765,7 @@ mod tests {
     }
 
     fn uniform_routing_for(model: &MoeModelCfg) -> RoutingDistribution {
-        RoutingDistribution::uniform(model.num_experts)
+        RoutingDistribution::uniform(model.num_experts.get())
     }
 
     #[test]
@@ -837,7 +842,7 @@ mod tests {
         // verbatim; the L2 dispatch/combine sim consumes it. The L3 worklet's
         // `local_ppm` stays uniform regardless (v1 limitation).
         let model = MoeModelCfg::qwen3_235b();
-        let mut weights = vec![0.1f32; model.num_experts as usize];
+        let mut weights = vec![0.1f32; model.num_experts.get() as usize];
         weights[0] = 5.0;
         weights[1] = 3.0;
         let skewed = RoutingDistribution::from_profile(&weights);
@@ -845,7 +850,7 @@ mod tests {
         assert_eq!(cfgs.moe_dispatch.routing, skewed);
         assert_eq!(cfgs.moe_combine.routing, skewed);
         // local_ppm still uniform: every entry equals TOTAL_PPM / num_experts.
-        let per_expert = RoutingDistribution::TOTAL_PPM / model.num_experts;
+        let per_expert = RoutingDistribution::TOTAL_PPM / model.num_experts.get();
         assert!(
             cfgs.moe_expert_compute
                 .local_ppm
@@ -881,7 +886,7 @@ mod tests {
     #[should_panic(expected = "routing distribution has")]
     fn routing_distribution_expert_count_mismatch_panics() {
         let model = MoeModelCfg::qwen3_235b();
-        let wrong = RoutingDistribution::uniform(model.num_experts + 1);
+        let wrong = RoutingDistribution::uniform(model.num_experts.get() + 1);
         let _ = build_configs(&model, &parallel(4, 8, 2, 8), &wrong);
     }
 }

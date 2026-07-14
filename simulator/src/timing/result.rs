@@ -7,6 +7,8 @@
 //! shape print is rendered by [`CostTree::describe`](crate::timing::CostTree) from
 //! the kernel `kind`/`config` captured at compile.
 
+use std::collections::BTreeMap;
+
 use crate::timing::LeafMetrics;
 
 pub trait Probe {
@@ -23,6 +25,11 @@ pub trait Probe {
 
     /// One-line shape/dtype config summary for the compiled leaf's manifest entry.
     fn describe_config(&self) -> String;
+
+    /// The leaf's `symbol -> value` legend (union of its `Dim` fields'
+    /// [`bindings`](crate::timing::Dim::bindings)) — captured into `LeafDesc.symbols`
+    /// so a consumer can resolve the rendered formula to its concrete inputs.
+    fn symbol_bindings(&self) -> BTreeMap<&'static str, u32>;
 
     /// This leaf's ordered candidate backend names, for the manifest
     /// `LeafDesc.backends`. The order is the one best-of-N indexes over in

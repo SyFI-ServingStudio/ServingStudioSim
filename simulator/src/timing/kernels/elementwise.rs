@@ -21,15 +21,15 @@ use crate::timing::bridge::{de_backends, ArgsPayload, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
-use crate::timing::{KernelConfig, SweepCoords};
+use crate::timing::{Dim, KernelConfig, SweepCoords};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
 pub struct ElementwiseKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
-    pub input_bytes_per_token: u32,
-    pub output_bytes_per_token: u32,
+    pub input_bytes_per_token: Dim,
+    pub output_bytes_per_token: Dim,
 }
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
@@ -62,8 +62,8 @@ impl KernelSpec for ElementwiseSpec {
             let tokens = num_tokens as u64;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("input_size_bytes", config.input_bytes_per_token as u64 * tokens)
-                .with("output_size_bytes", config.output_bytes_per_token as u64 * tokens)
+                .with("input_size_bytes", config.input_bytes_per_token.get() as u64 * tokens)
+                .with("output_size_bytes", config.output_bytes_per_token.get() as u64 * tokens)
         })
     }
 }
@@ -83,8 +83,8 @@ mod tests {
         ElementwiseKernelConfig {
             backends: vec!["triton"],
             gpu_name: "H100".to_string(),
-            input_bytes_per_token: 8192,
-            output_bytes_per_token: 4096,
+            input_bytes_per_token: 8192.into(),
+            output_bytes_per_token: 4096.into(),
         }
     }
 

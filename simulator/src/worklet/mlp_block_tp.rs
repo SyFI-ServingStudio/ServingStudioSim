@@ -23,16 +23,19 @@ use crate::timing::kernels::{
     ElementwiseKernelConfig, ElementwiseKernelInput, RmsNormKernel, RmsNormKernelConfig,
     RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 /// Raw global config + TP degree + the collective fabric/backends. Partition is
 /// derived in `resolve_config`.
 #[derive(Clone, Debug)]
 pub struct MlpBlockTpWorkletConfig {
-    pub hidden: u32,
-    pub intermediate: u32,
+    pub hidden: Dim,
+    pub intermediate: Dim,
     pub dtype: DType,
     pub tp_size: u16,
+    /// Symbol name for `tp_size` in the derivation formula (`ffn_tp`/`tp`) — the
+    /// arch owns which sharding degree this worklet's `tp` is.
+    pub tp_name: &'static str,
     pub allreduce_fabric: Fabric,
     pub gpu_name: String,
     pub norm_backends: Vec<&'static str>,
@@ -49,7 +52,7 @@ pub struct MlpBlockTpWorkletResolved {
     pub act: ElementwiseKernelConfig,
     pub down: SingleGemmKernelConfig,
     pub tp_ar: Option<AllReduceKernelConfig>, // tp_size == 1 → None
-    pub intermediate_per_rank: u32,
+    pub intermediate_per_rank: Dim,
     pub dtype_bytes: u32,
 }
 
@@ -74,26 +77,27 @@ impl MlpBlockTpWorklet {
     pub fn resolve_config(cfg: &MlpBlockTpWorkletConfig) -> MlpBlockTpWorkletResolved {
         let tp = cfg.tp_size as u32;
         assert!(
-            cfg.intermediate % tp == 0,
+            cfg.intermediate.get() % tp == 0,
             "intermediate {} not divisible by tp_size {}",
             cfg.intermediate,
             tp
         );
-        let inter_pr = cfg.intermediate / tp;
+        let inter_pr = cfg.intermediate.clone() / Dim::param(cfg.tp_name, tp);
         let dtype_bytes = cfg.dtype.size_bytes();
+        let bytes = Dim::param("bytes", dtype_bytes);
         MlpBlockTpWorkletResolved {
             post_norm: RmsNormKernelConfig {
                 backends: cfg.norm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                hidden: cfg.hidden, // full hidden, replicated
+                hidden: cfg.hidden.clone(), // full hidden, replicated
                 dtype: cfg.dtype,
             },
             up_gate: SingleGemmKernelConfig {
                 // column-parallel: per-rank gate‖up concat = 2·(intermediate/tp).
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: 2 * inter_pr,
-                k: cfg.hidden,
+                n: 2 * inter_pr.clone(),
+                k: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
             act: ElementwiseKernelConfig {
@@ -101,15 +105,15 @@ impl MlpBlockTpWorklet {
                 // writes (intermediate/tp) elements/token.
                 backends: cfg.act_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                input_bytes_per_token: 2 * inter_pr * dtype_bytes,
-                output_bytes_per_token: inter_pr * dtype_bytes,
+                input_bytes_per_token: 2 * inter_pr.clone() * bytes.clone(),
+                output_bytes_per_token: inter_pr.clone() * bytes.clone(),
             },
             down: SingleGemmKernelConfig {
                 // row-parallel: input k = per-rank intermediate; output n = hidden.
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: cfg.hidden,
-                k: inter_pr,
+                n: cfg.hidden.clone(),
+                k: inter_pr.clone(),
                 dtype: cfg.dtype,
             },
             tp_ar: (cfg.tp_size > 1).then(|| AllReduceKernelConfig {
@@ -178,11 +182,10 @@ impl MlpBlockTpWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let r = &self.resolved;
         let label = format!(
-            "{} (MlpBlockTpWorklet) [tp={}; hidden={} (replicated), intermediate {}→{}/tp]",
+            "{} (MlpBlockTpWorklet) [tp={}; {:?} (replicated), {:?}]",
             self.name,
             r.raw_cfg.tp_size,
             r.raw_cfg.hidden,
-            r.raw_cfg.intermediate,
             r.intermediate_per_rank,
         );
         let mut parts = vec![
@@ -213,7 +216,7 @@ impl MlpBlockTpWorklet {
             // All-reduce the FULL [tokens × hidden] down partial-sum (see
             // AllReduceKernelInput: message is the complete output, not hidden/tp).
             let message_size_bytes = (m as u64)
-                * (self.resolved.raw_cfg.hidden as u64)
+                * (self.resolved.raw_cfg.hidden.get() as u64)
                 * (self.resolved.dtype_bytes as u64);
             tp_ar.eval(&AllReduceKernelInput { message_size_bytes }, ev);
         }
@@ -226,10 +229,11 @@ mod tests {
 
     fn cfg(tp_size: u16) -> MlpBlockTpWorkletConfig {
         MlpBlockTpWorkletConfig {
-            hidden: 4096,
-            intermediate: 14336,
+            hidden: 4096.into(),
+            intermediate: 14336.into(),
             dtype: DType::Bf16,
             tp_size,
+            tp_name: "tp",
             allreduce_fabric: Fabric::Nvlink,
             gpu_name: "H100".to_string(),
             norm_backends: vec!["flashinfer"],

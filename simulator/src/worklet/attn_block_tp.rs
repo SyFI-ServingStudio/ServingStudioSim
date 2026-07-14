@@ -26,22 +26,25 @@ use crate::timing::kernels::{
     RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 /// Raw global config + TP degree + the collective fabric/backends. Partition is
 /// derived in `resolve_config`.
 #[derive(Clone, Debug)]
 pub struct AttnBlockTpWorkletConfig {
-    pub hidden: u32,
-    pub num_qo_heads: u32,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
+    pub hidden: Dim,
+    pub num_qo_heads: Dim,
+    pub num_kv_heads: Dim,
+    pub head_dim: Dim,
     /// Base (16-bit) dtype — RMSNorm + attention output/decode-query keep it.
     pub dtype: DType,
     /// FP8 run: qkv / o_proj GEMMs + tp_allreduce move to fp8 (via `gemm_backends`
     /// = deepgemm); the attention op derives its prefill/decode fp8 presets.
     pub fp8: bool,
     pub tp_size: u16,
+    /// Symbol name for `tp_size` in the derivation formula (`attn_tp`/`tp`) — the
+    /// arch owns which sharding degree this worklet's `tp` is.
+    pub tp_name: &'static str,
     pub allreduce_fabric: Fabric,
     pub gpu_name: String,
     pub norm_backends: Vec<&'static str>,
@@ -62,8 +65,8 @@ pub struct AttnBlockTpWorkletResolved {
     pub attn: FlashInferAttentionConfig,
     pub o_proj: SingleGemmKernelConfig,
     pub tp_ar: Option<AllReduceKernelConfig>, // tp_size == 1 → None
-    pub num_qo_heads_per_rank: u32,
-    pub num_kv_heads_per_rank: u32,
+    pub num_qo_heads_per_rank: Dim,
+    pub num_kv_heads_per_rank: Dim,
     pub dtype_bytes: u32,
 }
 
@@ -104,25 +107,26 @@ impl AttnBlockTpWorklet {
         // GQA dual-divisibility: both head counts split across the TP ranks.
         // tp <= num_kv_heads (no KV-head replication in v1).
         assert!(
-            cfg.num_qo_heads % tp == 0,
+            cfg.num_qo_heads.get() % tp == 0,
             "num_qo_heads {} not divisible by tp_size {}",
             cfg.num_qo_heads,
             tp
         );
         assert!(
-            cfg.num_kv_heads % tp == 0,
+            cfg.num_kv_heads.get() % tp == 0,
             "num_kv_heads {} not divisible by tp_size {}",
             cfg.num_kv_heads,
             tp
         );
         assert!(
-            tp <= cfg.num_kv_heads,
+            tp <= cfg.num_kv_heads.get(),
             "tp_size {} exceeds num_kv_heads {} (KV-head replication unsupported)",
             tp,
             cfg.num_kv_heads
         );
-        let qo_pr = cfg.num_qo_heads / tp;
-        let kv_pr = cfg.num_kv_heads / tp;
+        let tp_dim = Dim::param(cfg.tp_name, tp);
+        let qo_pr = cfg.num_qo_heads.clone() / tp_dim.clone();
+        let kv_pr = cfg.num_kv_heads.clone() / tp_dim;
         // Compute dtype: FP8 for the GEMMs + the tp_allreduce message (halved
         // transfer); RMSNorm and the attention output keep the base `dtype`.
         let compute = if cfg.fp8 { DType::Fp8E4m3 } else { cfg.dtype };
@@ -130,23 +134,23 @@ impl AttnBlockTpWorklet {
             input_norm: RmsNormKernelConfig {
                 backends: cfg.norm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                hidden: cfg.hidden,
+                hidden: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
             qkv: SingleGemmKernelConfig {
                 // column-parallel: per-rank fused QKV output = (qo + 2·kv)/tp heads.
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: (qo_pr + 2 * kv_pr) * cfg.head_dim,
-                k: cfg.hidden,
+                n: (qo_pr.clone() + 2 * kv_pr.clone()) * cfg.head_dim.clone(),
+                k: cfg.hidden.clone(),
                 dtype: compute,
             },
             attn: FlashInferAttentionConfig {
                 backends: cfg.attn_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                num_qo_heads: qo_pr,
-                num_kv_heads: kv_pr,
-                head_dim: cfg.head_dim,
+                num_qo_heads: qo_pr.clone(),
+                num_kv_heads: kv_pr.clone(),
+                head_dim: cfg.head_dim.clone(),
                 dtype: cfg.dtype,
                 fp8: cfg.fp8,
                 kv_cache_append_backends: cfg.kv_cache_append_backends.clone(),
@@ -158,8 +162,8 @@ impl AttnBlockTpWorklet {
                 // row-parallel: input k = per-rank Q heads × head_dim; output n = hidden.
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: cfg.hidden,
-                k: qo_pr * cfg.head_dim,
+                n: cfg.hidden.clone(),
+                k: qo_pr.clone() * cfg.head_dim.clone(),
                 dtype: compute,
             },
             tp_ar: (cfg.tp_size > 1).then(|| AllReduceKernelConfig {
@@ -237,12 +241,10 @@ impl AttnBlockTpWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let r = &self.resolved;
         let label = format!(
-            "{} (AttnBlockTpWorklet) [tp={}; qo {}→{}/tp, kv {}→{}/tp, head_dim={}]",
+            "{} (AttnBlockTpWorklet) [tp={}; qo {:?}, kv {:?}, {:?}]",
             self.name,
             r.raw_cfg.tp_size,
-            r.raw_cfg.num_qo_heads,
             r.num_qo_heads_per_rank,
-            r.raw_cfg.num_kv_heads,
             r.num_kv_heads_per_rank,
             r.raw_cfg.head_dim,
         );
@@ -279,7 +281,7 @@ impl AttnBlockTpWorklet {
             // All-reduce the FULL [tokens × hidden] o_proj partial-sum (see
             // AllReduceKernelInput: message is the complete output, not hidden/tp).
             let message_size_bytes = (m as u64)
-                * (self.resolved.raw_cfg.hidden as u64)
+                * (self.resolved.raw_cfg.hidden.get() as u64)
                 * (self.resolved.dtype_bytes as u64);
             tp_ar.eval(&AllReduceKernelInput { message_size_bytes }, ev);
         }
@@ -292,13 +294,14 @@ mod tests {
 
     fn cfg(tp_size: u16) -> AttnBlockTpWorkletConfig {
         AttnBlockTpWorkletConfig {
-            hidden: 4096,
-            num_qo_heads: 32,
-            num_kv_heads: 8,
-            head_dim: 128,
+            hidden: 4096.into(),
+            num_qo_heads: 32.into(),
+            num_kv_heads: 8.into(),
+            head_dim: 128.into(),
             dtype: DType::Bf16,
             fp8: false,
             tp_size,
+            tp_name: "tp",
             allreduce_fabric: Fabric::Nvlink,
             gpu_name: "H100".to_string(),
             norm_backends: vec!["flashinfer"],

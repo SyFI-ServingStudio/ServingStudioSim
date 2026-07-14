@@ -17,7 +17,7 @@
 //! in log rows (INV-5). `Max`/`Scale` are defined for the full algebra even
 //! though the dense vertical only emits `Leaf`/`Sum`/`Scale`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
 use std::ops::Range;
 
@@ -87,6 +87,13 @@ pub struct LeafDesc {
     pub kind: String,
     pub config: String,
     pub backends: Vec<String>,
+    /// The leaf's `symbol -> value` legend: every named input in this leaf's
+    /// `Dim` formulas (`{num_qo_heads: 64, attn_tp: 4, head_dim: 128, …}`), so a
+    /// consumer can resolve the `config` expression to its concrete parts (the
+    /// expression↔value toggle). Empty for comm / no-shape leaves. Skipped from
+    /// JSON when empty so existing manifests are byte-compatible.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub symbols: BTreeMap<String, u32>,
 }
 
 /// Serializable description of a compiled [`CostTree`] — the per-worker
@@ -199,12 +206,27 @@ impl CostTreeBuilder {
         config: impl Into<String>,
         backends: Vec<String>,
     ) -> CostNode {
+        self.leaf_with_symbols(name, kind, config, backends, BTreeMap::new())
+    }
+
+    /// [`Self::leaf`] plus the leaf's `symbol -> value` legend (from the kernel
+    /// config's `Dim` fields, via `Probe::symbol_bindings`). Keys are the
+    /// `&'static str` symbol names, owned here for the serializable [`LeafDesc`].
+    pub fn leaf_with_symbols(
+        &mut self,
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        config: impl Into<String>,
+        backends: Vec<String>,
+        symbols: BTreeMap<&'static str, u32>,
+    ) -> CostNode {
         let slot = self.slots.len();
         self.slots.push(LeafDesc {
             name: name.into(),
             kind: kind.into(),
             config: config.into(),
             backends,
+            symbols: symbols.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
         });
         CostNode::Leaf(slot)
     }
@@ -495,6 +517,28 @@ mod tests {
         };
         let d = b.leaf("d", "kd", "x=4", vec![]);
         b.finish(CostNode::Sum(vec![a, layer, d]))
+    }
+
+    #[test]
+    fn leaf_desc_carries_symbols_and_skips_when_empty() {
+        // `leaf_with_symbols` captures the per-leaf legend; it serializes under a
+        // `symbols` key and is omitted entirely when empty (manifest byte-compat).
+        let mut b = CostTreeBuilder::new();
+        let mut syms = BTreeMap::new();
+        syms.insert("attn_tp", 4u32);
+        syms.insert("num_qo_heads", 64u32);
+        b.leaf_with_symbols("m.qkv", "single_gemm", "n=…", vec![], syms);
+        b.leaf("m.comm", "p2p_inter", "", vec![]); // no Dim fields → empty
+        let tree = b.finish(CostNode::Sum(vec![CostNode::Leaf(0), CostNode::Leaf(1)]));
+
+        assert_eq!(tree.slots[0].symbols.get("attn_tp"), Some(&4));
+        assert_eq!(tree.slots[0].symbols.get("num_qo_heads"), Some(&64));
+        assert!(tree.slots[1].symbols.is_empty());
+
+        let with = serde_json::to_string(&tree.slots[0]).unwrap();
+        assert!(with.contains(r#""symbols""#) && with.contains(r#""attn_tp":4"#));
+        let empty = serde_json::to_string(&tree.slots[1]).unwrap();
+        assert!(!empty.contains("symbols")); // skip_serializing_if empty
     }
 
     #[test]

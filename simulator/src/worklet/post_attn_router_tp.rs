@@ -29,7 +29,7 @@ use crate::timing::kernels::{
     AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 use super::moe_router_local::{
     MoeRouterLocalWorklet, MoeRouterLocalWorkletConfig, MoeRouterLocalWorkletInput,
@@ -40,16 +40,19 @@ use super::moe_router_local::{
 /// partition and the composed router config are derived in `resolve_config`.
 #[derive(Clone, Debug)]
 pub struct PostAttnRouterTpWorkletConfig {
-    pub hidden: u32,
-    pub num_qo_heads: u32,
-    pub head_dim: u32,
-    pub num_experts: u32,
+    pub hidden: Dim,
+    pub num_qo_heads: Dim,
+    pub head_dim: Dim,
+    pub num_experts: Dim,
     /// Base (16-bit) dtype — the post-attention RMSNorm keeps it.
     pub dtype: DType,
     /// Compute dtype (fp8 in an fp8 run, else == `dtype`) — o_proj / router GEMMs
     /// and the row-parallel all-reduce message width use it.
     pub compute_dtype: DType,
     pub tp_size: u16,
+    /// Symbol name for `tp_size` in the derivation formula (`attn_tp`/`tp`) — the
+    /// arch owns which sharding degree this worklet's `tp` is.
+    pub tp_name: &'static str,
     pub allreduce_fabric: Fabric,
     pub gpu_name: String,
     /// post-attention RMSNorm backends (forwarded to the composed router worklet).
@@ -65,7 +68,7 @@ pub struct PostAttnRouterTpWorkletResolved {
     pub o_proj: SingleGemmKernelConfig,
     pub tp_ar: Option<AllReduceKernelConfig>, // tp_size == 1 → None
     pub router: MoeRouterLocalWorkletResolved,
-    pub num_qo_heads_per_rank: u32,
+    pub num_qo_heads_per_rank: Dim,
     pub dtype_bytes: u32,
 }
 
@@ -90,19 +93,19 @@ impl PostAttnRouterTpWorklet {
         // o_proj only depends on the query-head split (its input is the attention
         // output, `num_qo_heads/tp · head_dim` per rank).
         assert!(
-            cfg.num_qo_heads % tp == 0,
+            cfg.num_qo_heads.get() % tp == 0,
             "num_qo_heads {} not divisible by tp_size {}",
             cfg.num_qo_heads,
             tp
         );
-        let qo_pr = cfg.num_qo_heads / tp;
+        let qo_pr = cfg.num_qo_heads.clone() / Dim::param(cfg.tp_name, tp);
         PostAttnRouterTpWorkletResolved {
             // row-parallel o_proj: input k = per-rank Q heads × head_dim; output n = hidden.
             o_proj: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: cfg.hidden,
-                k: qo_pr * cfg.head_dim,
+                n: cfg.hidden.clone(),
+                k: qo_pr.clone() * cfg.head_dim.clone(),
                 dtype: cfg.compute_dtype,
             },
             tp_ar: (cfg.tp_size > 1).then(|| AllReduceKernelConfig {
@@ -114,8 +117,8 @@ impl PostAttnRouterTpWorklet {
                 fabric: cfg.allreduce_fabric,
             }),
             router: MoeRouterLocalWorklet::resolve_config(&MoeRouterLocalWorkletConfig {
-                hidden: cfg.hidden,
-                num_experts: cfg.num_experts,
+                hidden: cfg.hidden.clone(),
+                num_experts: cfg.num_experts.clone(),
                 dtype: cfg.dtype,
                 compute_dtype: cfg.compute_dtype,
                 gpu_name: cfg.gpu_name.clone(),
@@ -164,7 +167,7 @@ impl PostAttnRouterTpWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let r = &self.resolved;
         let label = format!(
-            "{} (PostAttnRouterTpWorklet) [tp={}; o_proj k={}·{}/tp, n={}, num_experts={}]",
+            "{} (PostAttnRouterTpWorklet) [tp={}; o_proj k={}·{}/tp, n={:?}, {:?}]",
             self.name,
             r.raw_cfg.tp_size,
             r.raw_cfg.num_qo_heads,
@@ -191,7 +194,7 @@ impl PostAttnRouterTpWorklet {
         if let Some(tp_ar) = &self.tp_ar {
             // All-reduce the FULL [tokens × hidden] o_proj partial-sum.
             let message_size_bytes =
-                (m as u64) * (self.resolved.raw_cfg.hidden as u64) * (self.resolved.dtype_bytes as u64);
+                (m as u64) * (self.resolved.raw_cfg.hidden.get() as u64) * (self.resolved.dtype_bytes as u64);
             tp_ar.eval(&AllReduceKernelInput { message_size_bytes }, ev);
         }
         self.router
@@ -205,13 +208,14 @@ mod tests {
 
     fn cfg(tp_size: u16) -> PostAttnRouterTpWorkletConfig {
         PostAttnRouterTpWorkletConfig {
-            hidden: 4096,
-            num_qo_heads: 32,
-            head_dim: 128,
-            num_experts: 128,
+            hidden: 4096.into(),
+            num_qo_heads: 32.into(),
+            head_dim: 128.into(),
+            num_experts: 128.into(),
             dtype: DType::Bf16,
             compute_dtype: DType::Bf16,
             tp_size,
+            tp_name: "tp",
             allreduce_fabric: Fabric::Nvlink,
             gpu_name: "H100".to_string(),
             norm_backends: vec!["flashinfer"],

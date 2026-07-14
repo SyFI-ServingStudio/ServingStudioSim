@@ -24,7 +24,7 @@ use crate::timing::kernels::{
     SingleGemmKernelInput,
 };
 use crate::timing::{
-    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
+    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{
@@ -69,7 +69,10 @@ pub struct Llama3DenseResolved {
 pub struct Llama3DenseModel {
     pub name: String,
     pub num_layers: u32,
-    pub total_kv_bytes_per_token: u64,
+    /// KV footprint per token, kept SYMBOLIC (`2*num_kv_heads*head_dim*kv_bytes
+    /// *num_layers`); folds to bytes only at the `IterwiseUnifiedModel` boundary
+    /// where a worker sizes its `KvPool`.
+    pub total_kv_bytes_per_token: Dim,
     pub pre_attn: PreAttnLocalWorklet,
     pub attn: AttnLocalWorklet,
     pub post_attn: PostAttnLocalWorklet,
@@ -95,21 +98,22 @@ pub struct DenseParallel {
 pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseConfigs {
     let gpu = &parallel.gpu_name;
     let dtype_bytes = model.dtype.size_bytes();
+    let bytes = Dim::param("bytes", dtype_bytes);
     Llama3DenseConfigs {
         pre_attn: PreAttnLocalWorkletConfig {
-            hidden: model.hidden,
-            num_qo_heads: model.num_qo_heads,
-            num_kv_heads: model.num_kv_heads,
-            head_dim: model.head_dim,
+            hidden: model.hidden.clone(),
+            num_qo_heads: model.num_qo_heads.clone(),
+            num_kv_heads: model.num_kv_heads.clone(),
+            head_dim: model.head_dim.clone(),
             dtype: model.dtype,
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
             gemm_backends: GEMM_BACKENDS.to_vec(),
         },
         attn: AttnLocalWorkletConfig {
-            num_qo_heads: model.num_qo_heads,
-            num_kv_heads: model.num_kv_heads,
-            head_dim: model.head_dim,
+            num_qo_heads: model.num_qo_heads.clone(),
+            num_kv_heads: model.num_kv_heads.clone(),
+            head_dim: model.head_dim.clone(),
             dtype: model.dtype,
             fp8: false,
             gpu_name: gpu.clone(),
@@ -122,10 +126,10 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseC
             kv_scale_granularity: "tensor".to_string(),
         },
         post_attn: PostAttnLocalWorkletConfig {
-            hidden: model.hidden,
-            intermediate: model.intermediate,
-            num_qo_heads: model.num_qo_heads,
-            head_dim: model.head_dim,
+            hidden: model.hidden.clone(),
+            intermediate: model.intermediate.clone(),
+            num_qo_heads: model.num_qo_heads.clone(),
+            head_dim: model.head_dim.clone(),
             dtype: model.dtype,
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
@@ -136,20 +140,20 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseC
         embed: ElementwiseKernelConfig {
             backends: ACT_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            input_bytes_per_token: model.hidden * dtype_bytes,
-            output_bytes_per_token: model.hidden * dtype_bytes,
+            input_bytes_per_token: model.hidden.clone() * bytes.clone(),
+            output_bytes_per_token: model.hidden.clone() * bytes.clone(),
         },
         final_norm: RmsNormKernelConfig {
             backends: NORM_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            hidden: model.hidden,
+            hidden: model.hidden.clone(),
             dtype: model.dtype,
         },
         lm_head: SingleGemmKernelConfig {
             backends: GEMM_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            n: model.vocab,
-            k: model.hidden,
+            n: model.vocab.clone(),
+            k: model.hidden.clone(),
             dtype: model.dtype,
         },
         num_layers: model.num_layers,
@@ -161,12 +165,12 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseC
 /// `num_layers`, read off the resolved attention config. Arch-specific (MLA's
 /// compressed latent KV, cross-layer KV sharing, … would compute it differently),
 /// so it lives in the model_arch, not on the parallelism-agnostic `ModelCfg`.
-fn total_kv_bytes_per_token(resolved: &Llama3DenseResolved) -> u64 {
+fn total_kv_bytes_per_token(resolved: &Llama3DenseResolved) -> Dim {
     let attn = &resolved.attn.attn;
-    2 * attn.num_kv_heads as u64
-        * attn.head_dim as u64
-        * attn.kv_dtype().size_bytes() as u64
-        * resolved.num_layers as u64
+    2 * attn.num_kv_heads.clone()
+        * attn.head_dim.clone()
+        * Dim::param("bytes", attn.kv_dtype().size_bytes())
+        * Dim::param("num_layers", resolved.num_layers)
 }
 
 pub fn resolve_configs(cfgs: &Llama3DenseConfigs) -> Llama3DenseResolved {
@@ -335,7 +339,9 @@ impl Llama3DenseModel {
 
 impl IterwiseUnifiedModel for Llama3DenseModel {
     fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token
+        // Seam B: collapse the symbolic KV footprint to bytes for the worker's
+        // KvPool sizing.
+        self.total_kv_bytes_per_token.get() as u64
     }
 
     /// Dense *local* arch: one replica runs the whole model on a single GPU (no

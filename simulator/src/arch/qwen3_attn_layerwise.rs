@@ -31,7 +31,7 @@ use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::common::Fabric;
 use crate::op::attention::{FlashInferAttentionInput, FlashInferAttentionOp};
 use crate::timing::{
-    BuildError, CostManifestDoc, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
+    BuildError, CostManifestDoc, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWorkletResolved};
@@ -61,13 +61,14 @@ fn attn_block_config(
     gpu_name: &str,
 ) -> AttnBlockTpWorkletConfig {
     AttnBlockTpWorkletConfig {
-        hidden: model.hidden,
-        num_qo_heads: model.num_qo_heads,
-        num_kv_heads: model.num_kv_heads,
-        head_dim: model.head_dim,
+        hidden: model.hidden.clone(),
+        num_qo_heads: model.num_qo_heads.clone(),
+        num_kv_heads: model.num_kv_heads.clone(),
+        head_dim: model.head_dim.clone(),
         dtype: model.dtype,
         fp8: model.fp8,
         tp_size: attn_tp_size,
+        tp_name: "attn_tp",
         allreduce_fabric: TP_FABRIC,
         gpu_name: gpu_name.to_string(),
         norm_backends: NORM_BACKENDS.to_vec(),
@@ -96,8 +97,8 @@ pub struct Qwen3AttnLayerwiseConfigs {
     pub attn_block: AttnBlockTpWorkletConfig,
     pub num_layers: u32,
     pub attn_tp_size: u16,
-    pub total_kv_bytes_per_token: u64,
-    pub attn_to_ffn_bytes_per_token: u64,
+    pub total_kv_bytes_per_token: Dim,
+    pub attn_to_ffn_bytes_per_token: Dim,
 }
 
 /// Post-resolve aggregate: the attn-block partition (only `.attn` is built) +
@@ -106,16 +107,16 @@ pub struct Qwen3AttnLayerwiseResolved {
     pub attn_block: AttnBlockTpWorkletResolved,
     pub num_layers: u32,
     pub attn_tp_size: u16,
-    pub total_kv_bytes_per_token: u64,
-    pub attn_to_ffn_bytes_per_token: u64,
+    pub total_kv_bytes_per_token: Dim,
+    pub attn_to_ffn_bytes_per_token: Dim,
 }
 
 pub struct Qwen3AttnLayerwiseModel {
     pub name: String,
     pub num_layers: u32,
     pub attn_tp_size: u16,
-    pub total_kv_bytes_per_token: u64,
-    pub attn_to_ffn_bytes_per_token: u64,
+    pub total_kv_bytes_per_token: Dim,
+    pub attn_to_ffn_bytes_per_token: Dim,
     pub attn: FlashInferAttentionOp,
     /// This shard's per-layer attention cost tree (a single `attn`), compiled once
     /// + flattened. Layer-homogeneous — every layer sees the same batch within an
@@ -131,22 +132,24 @@ pub fn build_configs(
     assert!(parallel.attn_tp_size > 0, "attn_tp_size must be non-zero");
     // attn → ffn handoff ships the (fp8-castable) attention output → compute dtype
     // width, matching the ffn side's `ffn_to_attn` handoff (both fp8 in an fp8 run).
-    let dtype_bytes = model.compute_dtype().size_bytes() as u64;
+    let dtype_bytes = model.compute_dtype().size_bytes();
+    let bytes = Dim::param("bytes", dtype_bytes);
     Qwen3AttnLayerwiseConfigs {
         attn_block: attn_block_config(model, parallel.attn_tp_size, &parallel.gpu_name),
         num_layers: model.num_layers,
         attn_tp_size: parallel.attn_tp_size,
         // Total KV bytes per token: 2 (k+v) × kv_heads × head_dim × kv_dtype × layers.
         // FULL (un-sharded) wire size — same definition as the iter-wise arch.
+        // Kept symbolic; folds to bytes at the worker/comm seam.
         total_kv_bytes_per_token: 2
-            * model.num_kv_heads as u64
-            * model.head_dim as u64
-            * model.kv_dtype.size_bytes() as u64
-            * model.num_layers as u64,
+            * model.num_kv_heads.clone()
+            * model.head_dim.clone()
+            * Dim::param("bytes", model.kv_dtype.size_bytes())
+            * Dim::param("num_layers", model.num_layers),
         // attn → ffn handoff: the attention output, q_dim · bpe per token.
-        attn_to_ffn_bytes_per_token: model.num_qo_heads as u64
-            * model.head_dim as u64
-            * dtype_bytes,
+        attn_to_ffn_bytes_per_token: model.num_qo_heads.clone()
+            * model.head_dim.clone()
+            * bytes.clone(),
     }
 }
 
@@ -155,8 +158,8 @@ pub fn resolve_configs(cfgs: &Qwen3AttnLayerwiseConfigs) -> Qwen3AttnLayerwiseRe
         attn_block: AttnBlockTpWorklet::resolve_config(&cfgs.attn_block),
         num_layers: cfgs.num_layers,
         attn_tp_size: cfgs.attn_tp_size,
-        total_kv_bytes_per_token: cfgs.total_kv_bytes_per_token,
-        attn_to_ffn_bytes_per_token: cfgs.attn_to_ffn_bytes_per_token,
+        total_kv_bytes_per_token: cfgs.total_kv_bytes_per_token.clone(),
+        attn_to_ffn_bytes_per_token: cfgs.attn_to_ffn_bytes_per_token.clone(),
     }
 }
 
@@ -267,11 +270,11 @@ impl AttnLayerwiseModel for Qwen3AttnLayerwiseModel {
     }
 
     fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token
+        self.total_kv_bytes_per_token.get() as u64
     }
 
     fn attn_to_ffn_bytes_per_token(&self) -> u64 {
-        self.attn_to_ffn_bytes_per_token
+        self.attn_to_ffn_bytes_per_token.get() as u64
     }
 
     /// One `attn` section — this shard's per-layer attention CostTree. Recompiled

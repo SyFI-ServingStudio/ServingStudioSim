@@ -17,15 +17,15 @@ use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::sweep::{Axis, SweepGrid};
-use crate::timing::{KernelConfig, SweepCoords};
+use crate::timing::{Dim, KernelConfig, SweepCoords};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
 pub struct GroupedGemmKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
-    pub n: u32,
-    pub k: u32,
+    pub n: Dim,
+    pub k: Dim,
     #[compute_dtype]
     pub dtype: DType,
     /// This GPU's raw ppm shard for its local experts (a slice of the global
@@ -78,8 +78,8 @@ impl KernelSpec for GroupedGemmSpec {
             );
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("n", config.n)
-                .with("k", config.k)
+                .with("n", config.n.get())
+                .with("k", config.k.get())
                 .with("dtype", config.dtype.as_str())
                 .with("num_local_experts", num_local_experts)
                 .with("per_group_batches", per_group_batches)
@@ -102,8 +102,8 @@ mod tests {
         GroupedGemmKernelConfig {
             backends: vec!["torch"],
             gpu_name: "H100".to_string(),
-            n: 4096,
-            k: 8192,
+            n: 4096.into(),
+            k: 8192.into(),
             dtype: DType::Bf16,
             local_ppm: vec![300_000, 200_000],
         }

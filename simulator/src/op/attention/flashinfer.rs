@@ -30,8 +30,8 @@ use crate::timing::kernels::{
     KvCacheAppendKernelInput,
 };
 use crate::timing::{
-    AttnPrefillLog, BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge,
-    Probe,
+    AttnPrefillLog, BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics,
+    PerfApiBridge, Probe,
 };
 
 /// Single op-level config; expands into three sub-kernel configs. The op owns
@@ -48,9 +48,9 @@ pub struct FlashInferAttentionConfig {
     /// them per phase (prefill=fa3, decode=fa2), so this is ignored there.
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
-    pub num_qo_heads: u32,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
+    pub num_qo_heads: Dim,
+    pub num_kv_heads: Dim,
+    pub head_dim: Dim,
     /// Base (16-bit) dtype — the attention output and (fp16816) decode query. In
     /// non-fp8 it is also q/kv.
     pub dtype: DType,
@@ -214,8 +214,8 @@ fn kv_cache_append_config(cfg: &FlashInferAttentionConfig) -> KvCacheAppendKerne
     KvCacheAppendKernelConfig {
         backends: cfg.kv_cache_append_backends.clone(),
         gpu_name: cfg.gpu_name.clone(),
-        num_kv_heads: cfg.num_kv_heads,
-        head_dim: cfg.head_dim,
+        num_kv_heads: cfg.num_kv_heads.clone(),
+        head_dim: cfg.head_dim.clone(),
         block_size: cfg.kv_cache_block_size,
         input_dtype: cfg.dtype,
         kv_dtype: cfg.kv_dtype(),
@@ -247,9 +247,9 @@ fn prefill_config(cfg: &FlashInferAttentionConfig) -> FlashinferAttnPrefillKerne
     FlashinferAttnPrefillKernelConfig {
         backends,
         gpu_name: cfg.gpu_name.clone(),
-        num_qo_heads: cfg.num_qo_heads,
-        num_kv_heads: cfg.num_kv_heads,
-        head_dim: cfg.head_dim,
+        num_qo_heads: cfg.num_qo_heads.clone(),
+        num_kv_heads: cfg.num_kv_heads.clone(),
+        head_dim: cfg.head_dim.clone(),
         q_dtype: q,
         kv_dtype: kv,
         o_dtype: cfg.dtype,
@@ -268,9 +268,9 @@ fn decode_config(cfg: &FlashInferAttentionConfig) -> FlashinferAttnDecodeKernelC
     FlashinferAttnDecodeKernelConfig {
         backends,
         gpu_name: cfg.gpu_name.clone(),
-        num_qo_heads: cfg.num_qo_heads,
-        num_kv_heads: cfg.num_kv_heads,
-        head_dim: cfg.head_dim,
+        num_qo_heads: cfg.num_qo_heads.clone(),
+        num_kv_heads: cfg.num_kv_heads.clone(),
+        head_dim: cfg.head_dim.clone(),
         q_dtype: cfg.dtype,
         kv_dtype: kv,
         o_dtype: cfg.dtype,
@@ -301,9 +301,9 @@ mod tests {
         FlashInferAttentionConfig {
             backends: vec!["fa2", "fa3"],
             gpu_name: "H200".to_string(),
-            num_qo_heads: 8,
-            num_kv_heads: 2,
-            head_dim: 128,
+            num_qo_heads: 8.into(),
+            num_kv_heads: 2.into(),
+            head_dim: 128.into(),
             dtype: DType::Bf16,
             fp8,
             kv_cache_append_backends: vec!["vllm_cuda"],

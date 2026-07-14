@@ -15,16 +15,21 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::timing::bridge::DType;
+use crate::timing::Dim;
 
-/// Raw transformer dims (per-model identity, parallelism-agnostic).
+/// Raw transformer dims (per-model identity, parallelism-agnostic). The shape
+/// dims are [`Dim`]s carrying their HF-config provenance (`hidden` → the leaf
+/// `Dim::param("hidden", …)`), so every per-op fixed dim derived from them
+/// records the formula. `num_layers` is a fold count, not a shape, so it stays a
+/// plain `u32`.
 #[derive(Clone, Debug)]
 pub struct ModelCfg {
-    pub hidden: u32,
-    pub intermediate: u32,
-    pub num_qo_heads: u32,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
-    pub vocab: u32,
+    pub hidden: Dim,
+    pub intermediate: Dim,
+    pub num_qo_heads: Dim,
+    pub num_kv_heads: Dim,
+    pub head_dim: Dim,
+    pub vocab: Dim,
     pub num_layers: u32,
     pub dtype: DType,
     pub kv_dtype: DType,
@@ -44,12 +49,12 @@ impl ModelCfg {
             .head_dim
             .unwrap_or(raw.hidden_size / raw.num_attention_heads);
         Ok(Self {
-            hidden: raw.hidden_size,
-            intermediate: raw.intermediate_size,
-            num_qo_heads: raw.num_attention_heads,
-            num_kv_heads: raw.num_key_value_heads,
-            head_dim,
-            vocab: raw.vocab_size,
+            hidden: Dim::param("hidden", raw.hidden_size),
+            intermediate: Dim::param("intermediate", raw.intermediate_size),
+            num_qo_heads: Dim::param("num_qo_heads", raw.num_attention_heads),
+            num_kv_heads: Dim::param("num_kv_heads", raw.num_key_value_heads),
+            head_dim: Dim::param("head_dim", head_dim),
+            vocab: Dim::param("vocab", raw.vocab_size),
             num_layers: raw.num_hidden_layers,
             dtype,
             kv_dtype: dtype,
@@ -91,12 +96,12 @@ impl ModelCfg {
     /// Llama3-8B dense preset (bf16).
     pub fn llama3_8b() -> Self {
         Self {
-            hidden: 4096,
-            intermediate: 14336,
-            num_qo_heads: 32,
-            num_kv_heads: 8,
-            head_dim: 128,
-            vocab: 128256,
+            hidden: Dim::param("hidden", 4096),
+            intermediate: Dim::param("intermediate", 14336),
+            num_qo_heads: Dim::param("num_qo_heads", 32),
+            num_kv_heads: Dim::param("num_kv_heads", 8),
+            head_dim: Dim::param("head_dim", 128),
+            vocab: Dim::param("vocab", 128256),
             num_layers: 32,
             dtype: DType::Bf16,
             kv_dtype: DType::Bf16,
@@ -135,6 +140,28 @@ mod tests {
         assert_eq!(cfg.num_layers, 32);
         assert_eq!(cfg.dtype, DType::Bf16);
         assert_eq!(cfg.kv_dtype, DType::Bf16);
+    }
+
+    /// The payoff: a per-op fixed dim derived from `ModelCfg` carries its
+    /// derivation formula, not just the folded value. The QKV-projection `n`
+    /// (as computed in `pre_attn_local::resolve`) renders through `Dim`'s
+    /// `Debug` — the same path `KernelConfig::describe_config` (`{:?}`) takes —
+    /// as `formula=value` with the originating HF-config param names. This is
+    /// what surfaces in `cost_tree.describe()` / the `CostManifest` slot config.
+    #[test]
+    fn derived_dim_carries_model_config_provenance() {
+        let m = ModelCfg::llama3_8b();
+        // Fused QKV output width: (num_qo_heads + 2·num_kv_heads)·head_dim.
+        let qkv_n = (m.num_qo_heads.clone() + 2 * m.num_kv_heads.clone()) * m.head_dim.clone();
+
+        assert_eq!(qkv_n, 6144); // folds to the same value (cache key unchanged)
+        assert_eq!(
+            format!("{qkv_n:?}"),
+            "(num_qo_heads+2*num_kv_heads)*head_dim=6144"
+        );
+        // Provenance = exactly the model dims that feed this op.
+        let params: Vec<&str> = qkv_n.params().into_iter().collect();
+        assert_eq!(params, ["head_dim", "num_kv_heads", "num_qo_heads"]);
     }
 
     #[test]

@@ -24,13 +24,13 @@ use crate::timing::kernels::{
     RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 /// Raw config. The two leaf shapes are derivable directly (no partition).
 #[derive(Clone, Debug)]
 pub struct MoeRouterLocalWorkletConfig {
-    pub hidden: u32,
-    pub num_experts: u32,
+    pub hidden: Dim,
+    pub num_experts: Dim,
     /// Base (16-bit) dtype — the post-attention RMSNorm keeps it.
     pub dtype: DType,
     /// Compute dtype (fp8 in an fp8 run, else == `dtype`) — the router GEMM uses it.
@@ -66,14 +66,14 @@ impl MoeRouterLocalWorklet {
             post_norm: RmsNormKernelConfig {
                 backends: cfg.norm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                hidden: cfg.hidden,
+                hidden: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
             router: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: cfg.num_experts,
-                k: cfg.hidden,
+                n: cfg.num_experts.clone(),
+                k: cfg.hidden.clone(),
                 dtype: cfg.compute_dtype,
             },
             raw_cfg: cfg.clone(),
@@ -133,8 +133,8 @@ mod tests {
 
     fn cfg() -> MoeRouterLocalWorkletConfig {
         MoeRouterLocalWorkletConfig {
-            hidden: 4096,
-            num_experts: 128,
+            hidden: 4096.into(),
+            num_experts: 128.into(),
             dtype: DType::Bf16,
             compute_dtype: DType::Bf16,
             gpu_name: "H100".to_string(),

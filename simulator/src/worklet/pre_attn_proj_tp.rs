@@ -22,21 +22,24 @@ use crate::timing::kernels::{
     RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 /// Raw global config + TP degree. Partition (per-rank head split) is derived in
 /// `resolve_config`.
 #[derive(Clone, Debug)]
 pub struct PreAttnProjTpWorkletConfig {
-    pub hidden: u32,
-    pub num_qo_heads: u32,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
+    pub hidden: Dim,
+    pub num_qo_heads: Dim,
+    pub num_kv_heads: Dim,
+    pub head_dim: Dim,
     /// Base (16-bit) dtype — the input RMSNorm keeps it.
     pub dtype: DType,
     /// Compute dtype (fp8 in an fp8 run, else == `dtype`) — the QKV GEMM uses it.
     pub compute_dtype: DType,
     pub tp_size: u16,
+    /// Symbol name for `tp_size` in the derivation formula (`attn_tp`/`ffn_tp`/
+    /// `tp`) — the arch owns which sharding degree this worklet's `tp` is.
+    pub tp_name: &'static str,
     pub gpu_name: String,
     pub norm_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
@@ -47,8 +50,8 @@ pub struct PreAttnProjTpWorkletResolved {
     pub raw_cfg: PreAttnProjTpWorkletConfig,
     pub input_norm: RmsNormKernelConfig,
     pub qkv: SingleGemmKernelConfig,
-    pub num_qo_heads_per_rank: u32,
-    pub num_kv_heads_per_rank: u32,
+    pub num_qo_heads_per_rank: Dim,
+    pub num_kv_heads_per_rank: Dim,
 }
 
 /// Per-call shape: `batch_tokens` (this DP shard's token count) drives the norm
@@ -71,38 +74,39 @@ impl PreAttnProjTpWorklet {
         // GQA dual-divisibility, identical to the attention TP front: both head
         // counts split across the ranks, tp <= num_kv_heads (no KV replication).
         assert!(
-            cfg.num_qo_heads % tp == 0,
+            cfg.num_qo_heads.get() % tp == 0,
             "num_qo_heads {} not divisible by tp_size {}",
             cfg.num_qo_heads,
             tp
         );
         assert!(
-            cfg.num_kv_heads % tp == 0,
+            cfg.num_kv_heads.get() % tp == 0,
             "num_kv_heads {} not divisible by tp_size {}",
             cfg.num_kv_heads,
             tp
         );
         assert!(
-            tp <= cfg.num_kv_heads,
+            tp <= cfg.num_kv_heads.get(),
             "tp_size {} exceeds num_kv_heads {} (KV-head replication unsupported)",
             tp,
             cfg.num_kv_heads
         );
-        let qo_pr = cfg.num_qo_heads / tp;
-        let kv_pr = cfg.num_kv_heads / tp;
+        let tp_dim = Dim::param(cfg.tp_name, tp);
+        let qo_pr = cfg.num_qo_heads.clone() / tp_dim.clone();
+        let kv_pr = cfg.num_kv_heads.clone() / tp_dim;
         PreAttnProjTpWorkletResolved {
             input_norm: RmsNormKernelConfig {
                 backends: cfg.norm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                hidden: cfg.hidden,
+                hidden: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
             // column-parallel fused QKV: per-rank output = (qo + 2·kv)/tp heads.
             qkv: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: (qo_pr + 2 * kv_pr) * cfg.head_dim,
-                k: cfg.hidden,
+                n: (qo_pr.clone() + 2 * kv_pr.clone()) * cfg.head_dim.clone(),
+                k: cfg.hidden.clone(),
                 dtype: cfg.compute_dtype,
             },
             num_qo_heads_per_rank: qo_pr,
@@ -138,12 +142,10 @@ impl PreAttnProjTpWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let r = &self.resolved;
         let label = format!(
-            "{} (PreAttnProjTpWorklet) [tp={}; qo {}→{}/tp, kv {}→{}/tp, head_dim={}]",
+            "{} (PreAttnProjTpWorklet) [tp={}; qo {:?}, kv {:?}, {:?}]",
             self.name,
             r.raw_cfg.tp_size,
-            r.raw_cfg.num_qo_heads,
             r.num_qo_heads_per_rank,
-            r.raw_cfg.num_kv_heads,
             r.num_kv_heads_per_rank,
             r.raw_cfg.head_dim,
         );
@@ -170,13 +172,14 @@ mod tests {
 
     fn cfg(tp_size: u16) -> PreAttnProjTpWorkletConfig {
         PreAttnProjTpWorkletConfig {
-            hidden: 4096,
-            num_qo_heads: 32,
-            num_kv_heads: 8,
-            head_dim: 128,
+            hidden: 4096.into(),
+            num_qo_heads: 32.into(),
+            num_kv_heads: 8.into(),
+            head_dim: 128.into(),
             dtype: DType::Bf16,
             compute_dtype: DType::Bf16,
             tp_size,
+            tp_name: "tp",
             gpu_name: "H100".to_string(),
             norm_backends: vec!["flashinfer"],
             gemm_backends: vec!["torch"],

@@ -10,15 +10,15 @@ use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
-use crate::timing::{KernelConfig, SweepCoords};
+use crate::timing::{Dim, KernelConfig, SweepCoords};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
 pub struct SingleGemmKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
-    pub n: u32,
-    pub k: u32,
+    pub n: Dim,
+    pub k: Dim,
     #[compute_dtype]
     pub dtype: DType,
 }
@@ -58,8 +58,8 @@ impl KernelSpec for SingleGemmSpec {
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("m", m as u32)
-                .with("n", config.n)
-                .with("k", config.k)
+                .with("n", config.n.get())
+                .with("k", config.k.get())
                 .with("dtype", config.dtype.as_str())
         })
     }
@@ -80,8 +80,8 @@ mod tests {
         let cfg = SingleGemmKernelConfig {
             backends: vec!["torch"],
             gpu_name: "H100".to_string(),
-            n: 128,
-            k: 256,
+            n: 128.into(),
+            k: 256.into(),
             dtype: DType::Fp16,
         };
         assert_eq!(cfg.backends, vec!["torch"]);
@@ -95,8 +95,8 @@ mod tests {
         let cfg = SingleGemmKernelConfig {
             backends: vec!["torch"],
             gpu_name: "H100".to_string(),
-            n: 8192,
-            k: 8192,
+            n: 8192.into(),
+            k: 8192.into(),
             dtype: DType::Bf16,
         };
         // Every field in declaration order, no struct-name/braces wrapper.
@@ -109,14 +109,38 @@ mod tests {
         let multi = SingleGemmKernelConfig {
             backends: vec!["torch", "triton"],
             gpu_name: "H100".to_string(),
-            n: 8192,
-            k: 8192,
+            n: 8192.into(),
+            k: 8192.into(),
             dtype: DType::Bf16,
         };
         assert_eq!(
             multi.describe_config(),
             r#"backends=["torch", "triton"] gpu_name="H100" n=8192 k=8192 dtype=Bf16"#
         );
+    }
+
+    #[test]
+    fn symbol_bindings_unions_dim_field_provenance() {
+        use crate::timing::Dim;
+        let hidden = Dim::param("hidden", 4096);
+        let qo = Dim::param("num_qo_heads", 64);
+        let head = Dim::param("head_dim", 128);
+        let tp = Dim::param("attn_tp", 4);
+        let cfg = SingleGemmKernelConfig {
+            backends: vec!["torch"],
+            gpu_name: "H100".to_string(),
+            n: qo / tp * head, // (num_qo_heads/attn_tp)*head_dim
+            k: hidden,         // hidden
+            dtype: DType::Bf16,
+        };
+        // The derive unions `bindings()` over the Dim-typed fields (n, k); the
+        // non-Dim fields (dtype/backends/gpu_name) contribute nothing.
+        let b = cfg.symbol_bindings();
+        assert_eq!(b.get("num_qo_heads"), Some(&64));
+        assert_eq!(b.get("attn_tp"), Some(&4));
+        assert_eq!(b.get("head_dim"), Some(&128));
+        assert_eq!(b.get("hidden"), Some(&4096));
+        assert_eq!(b.len(), 4);
     }
 
     #[test]
@@ -130,8 +154,8 @@ mod tests {
         let cfg = SingleGemmKernelConfig {
             backends: vec!["torch"],
             gpu_name: "H100".to_string(),
-            n: 4096,
-            k: 8192,
+            n: 4096.into(),
+            k: 8192.into(),
             dtype: DType::Bf16,
         };
         let grid = SingleGemmSpec::sweep_grid(&cfg);
@@ -160,8 +184,8 @@ mod tests {
         let cfg = SingleGemmKernelConfig {
             backends: vec!["torch"],
             gpu_name: "H100".to_string(),
-            n: 4096,
-            k: 4096,
+            n: 4096.into(),
+            k: 4096.into(),
             dtype: DType::Bf16,
         };
 

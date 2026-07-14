@@ -14,16 +14,16 @@ use crate::timing::kernels::{
     RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 /// Raw global config (no partition: `Local` = 1 GPU). Backend strings pass
 /// straight through to L1 (config-level polymorphism, L3 §1.6).
 #[derive(Clone, Debug)]
 pub struct PreAttnLocalWorkletConfig {
-    pub hidden: u32,
-    pub num_qo_heads: u32,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
+    pub hidden: Dim,
+    pub num_qo_heads: Dim,
+    pub num_kv_heads: Dim,
+    pub head_dim: Dim,
     pub dtype: DType,
     pub gpu_name: String,
     pub norm_backends: Vec<&'static str>,
@@ -55,19 +55,19 @@ pub struct PreAttnLocalWorklet {
 impl PreAttnLocalWorklet {
     pub fn resolve_config(cfg: &PreAttnLocalWorkletConfig) -> PreAttnLocalWorkletResolved {
         // Fused QKV output dim: q heads + 2× kv heads (GQA), each `head_dim` wide.
-        let qkv_n = (cfg.num_qo_heads + 2 * cfg.num_kv_heads) * cfg.head_dim;
+        let qkv_n = (cfg.num_qo_heads.clone() + 2 * cfg.num_kv_heads.clone()) * cfg.head_dim.clone();
         PreAttnLocalWorkletResolved {
             input_norm: RmsNormKernelConfig {
                 backends: cfg.norm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                hidden: cfg.hidden,
+                hidden: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
             qkv: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 n: qkv_n,
-                k: cfg.hidden,
+                k: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
             raw_cfg: cfg.clone(),
@@ -138,10 +138,10 @@ mod tests {
 
     fn cfg() -> PreAttnLocalWorkletConfig {
         PreAttnLocalWorkletConfig {
-            hidden: 4096,
-            num_qo_heads: 32,
-            num_kv_heads: 8,
-            head_dim: 128,
+            hidden: 4096.into(),
+            num_qo_heads: 32.into(),
+            num_kv_heads: 8.into(),
+            head_dim: 128.into(),
             dtype: DType::Bf16,
             gpu_name: "H100".to_string(),
             norm_backends: vec!["flashinfer"],

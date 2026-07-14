@@ -444,6 +444,7 @@ mod tests {
                     kind: "unit".to_owned(),
                     config: "shape=1".to_owned(),
                     backends: vec!["torch".to_owned()],
+                    symbols: Default::default(),
                 }],
                 nodes: vec![FlatCostNode::Leaf(0)],
                 node_labels: vec![None],

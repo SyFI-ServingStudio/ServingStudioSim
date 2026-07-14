@@ -57,7 +57,7 @@ use crate::timing::kernels::{
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::{
-    BuildError, CostManifestDoc, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
+    BuildError, CostManifestDoc, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{
@@ -75,7 +75,7 @@ pub struct Qwen3FfnMoeLayerwiseModel {
     /// Derived at build (`ep_size / attn_tp_size`), cached for the cost-tree fan-out.
     pub num_dp_groups: u16,
     pub top_k: u32,
-    pub ffn_to_attn_bytes_per_token: u64,
+    pub ffn_to_attn_bytes_per_token: Dim,
     // Dense attn-adjacent worklets, both sharded over `attn_tp_size` (the head
     // split is internal to each worklet's resolve_config):
     //   pre_attn  = input_norm + qkv
@@ -150,7 +150,7 @@ pub struct Qwen3FfnMoeConfigs {
     pub ep_size: u16,
     pub num_dp_groups: u16,
     pub top_k: u32,
-    pub ffn_to_attn_bytes_per_token: u64,
+    pub ffn_to_attn_bytes_per_token: Dim,
 }
 
 /// Post-resolve aggregate; the atomic ops (embed / final_norm / lm_head /
@@ -170,7 +170,7 @@ pub struct Qwen3FfnMoeResolved {
     pub ep_size: u16,
     pub num_dp_groups: u16,
     pub top_k: u32,
-    pub ffn_to_attn_bytes_per_token: u64,
+    pub ffn_to_attn_bytes_per_token: Dim,
 }
 
 pub fn build_configs(
@@ -183,6 +183,7 @@ pub fn build_configs(
     // the compute dtype: fp8 halves the wire size, bf16 leaves it unchanged. The
     // RMSNorm ops below keep the base `model.dtype`.
     let dtype_bytes = model.compute_dtype().size_bytes();
+    let bytes = Dim::param("bytes", dtype_bytes);
     assert!(
         parallel.attn_tp_size > 0 && parallel.ep_size > 0,
         "attn_tp_size / ep_size must be non-zero"
@@ -197,7 +198,7 @@ pub fn build_configs(
     let num_dp_groups = parallel.ep_size / parallel.attn_tp_size;
     assert!(parallel.nvl_num_gpu > 0, "nvl_num_gpu must be non-zero");
     assert!(
-        model.num_experts % u32::from(parallel.ep_size) == 0,
+        model.num_experts.get() % u32::from(parallel.ep_size) == 0,
         "num_experts {} not divisible by ep_size {}",
         model.num_experts,
         parallel.ep_size,
@@ -209,7 +210,7 @@ pub fn build_configs(
         routing.num_experts(),
         model.num_experts,
     );
-    let local_ppm = uniform_local_ppm(model.num_experts, parallel.ep_size);
+    let local_ppm = uniform_local_ppm(model.num_experts.get(), parallel.ep_size);
     let moe_net = MoeNetConfig {
         backends: P2P_BACKENDS.to_vec(),
         gpu_name: gpu.clone(),
@@ -220,7 +221,9 @@ pub fn build_configs(
         inter_fabric: MOE_INTER_FABRIC,
         ep_size: u32::from(parallel.ep_size),
         nvl_num_gpu: u32::from(parallel.nvl_num_gpu),
-        h: model.hidden,
+        // Comm-sizing seam: the MoE all-to-all payload is byte-keyed, so fold the
+        // symbolic hidden to a concrete width here.
+        h: model.hidden.get(),
         top_k: model.top_k,
         routing: routing.clone(),
         // A token resides on its qkv/o_proj TP group (post-allreduce every attn_tp
@@ -232,32 +235,34 @@ pub fn build_configs(
     };
     // ffn → attn handoff: the QKV projection output, (q + 2·kv)·head_dim·bpe per
     // token (full, un-sharded wire size).
-    let ffn_to_attn_bytes_per_token = (model.num_qo_heads as u64 + 2 * model.num_kv_heads as u64)
-        * model.head_dim as u64
-        * dtype_bytes as u64;
+    let ffn_to_attn_bytes_per_token = (model.num_qo_heads.clone() + 2 * model.num_kv_heads.clone())
+        * model.head_dim.clone()
+        * bytes.clone();
     Qwen3FfnMoeConfigs {
         // pre-attn: input_norm + column-parallel qkv (head split over attn_tp).
         pre_attn: PreAttnProjTpWorkletConfig {
-            hidden: model.hidden,
-            num_qo_heads: model.num_qo_heads,
-            num_kv_heads: model.num_kv_heads,
-            head_dim: model.head_dim,
+            hidden: model.hidden.clone(),
+            num_qo_heads: model.num_qo_heads.clone(),
+            num_kv_heads: model.num_kv_heads.clone(),
+            head_dim: model.head_dim.clone(),
             dtype: model.dtype,
             compute_dtype: model.compute_dtype(),
             tp_size: parallel.attn_tp_size,
+            tp_name: "attn_tp",
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
             gemm_backends: model.single_gemm_backends(),
         },
         // post-attn: row-parallel o_proj + optional tp_allreduce + post_norm + router.
         post_attn: PostAttnRouterTpWorkletConfig {
-            hidden: model.hidden,
-            num_qo_heads: model.num_qo_heads,
-            head_dim: model.head_dim,
-            num_experts: model.num_experts,
+            hidden: model.hidden.clone(),
+            num_qo_heads: model.num_qo_heads.clone(),
+            head_dim: model.head_dim.clone(),
+            num_experts: model.num_experts.clone(),
             dtype: model.dtype,
             compute_dtype: model.compute_dtype(),
             tp_size: parallel.attn_tp_size,
+            tp_name: "attn_tp",
             allreduce_fabric: TP_FABRIC,
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
@@ -268,9 +273,9 @@ pub fn build_configs(
         // MoE expert compute is all-fp8 in an fp8 run (grouped GEMMs + SwiGLU act);
         // no RMSNorm inside, so the whole worklet takes the compute dtype.
         moe_expert_compute: MoeExpertComputeLocalWorkletConfig {
-            hidden: model.hidden,
-            moe_intermediate: model.moe_intermediate,
-            num_experts: model.num_experts,
+            hidden: model.hidden.clone(),
+            moe_intermediate: model.moe_intermediate.clone(),
+            num_experts: model.num_experts.clone(),
             ep_size: parallel.ep_size,
             dtype: model.compute_dtype(),
             gpu_name: gpu.clone(),
@@ -281,27 +286,27 @@ pub fn build_configs(
         moe_local_reduce: ElementwiseKernelConfig {
             backends: ACT_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            input_bytes_per_token: model.hidden * dtype_bytes,
-            output_bytes_per_token: model.hidden * dtype_bytes,
+            input_bytes_per_token: model.hidden.clone() * bytes.clone(),
+            output_bytes_per_token: model.hidden.clone() * bytes.clone(),
         },
         moe_combine: moe_net,
         embed: ElementwiseKernelConfig {
             backends: ACT_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            input_bytes_per_token: model.hidden * dtype_bytes,
-            output_bytes_per_token: model.hidden * dtype_bytes,
+            input_bytes_per_token: model.hidden.clone() * bytes.clone(),
+            output_bytes_per_token: model.hidden.clone() * bytes.clone(),
         },
         final_norm: RmsNormKernelConfig {
             backends: NORM_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            hidden: model.hidden,
+            hidden: model.hidden.clone(),
             dtype: model.dtype,
         },
         lm_head: SingleGemmKernelConfig {
             backends: model.single_gemm_backends(),
             gpu_name: gpu.clone(),
-            n: model.vocab,
-            k: model.hidden,
+            n: model.vocab.clone(),
+            k: model.hidden.clone(),
             dtype: model.compute_dtype(),
         },
         num_layers: model.num_layers,
@@ -327,7 +332,7 @@ pub fn resolve_configs(cfgs: &Qwen3FfnMoeConfigs) -> Qwen3FfnMoeResolved {
         ep_size: cfgs.ep_size,
         num_dp_groups: cfgs.num_dp_groups,
         top_k: cfgs.top_k,
-        ffn_to_attn_bytes_per_token: cfgs.ffn_to_attn_bytes_per_token,
+        ffn_to_attn_bytes_per_token: cfgs.ffn_to_attn_bytes_per_token.clone(),
     }
 }
 
@@ -780,7 +785,7 @@ impl FfnLayerwiseModel for Qwen3FfnMoeLayerwiseModel {
     }
 
     fn ffn_to_attn_bytes_per_token(&self) -> u64 {
-        self.ffn_to_attn_bytes_per_token
+        self.ffn_to_attn_bytes_per_token.get() as u64
     }
 
     fn pre_attn_cost(

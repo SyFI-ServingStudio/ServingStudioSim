@@ -31,15 +31,15 @@ use crate::timing::kernels::{
     GroupedGemmKernelConfig, GroupedGemmKernelInput,
 };
 use crate::timing::routing::RoutingDistribution;
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 /// Raw config + this rank's `local_ppm` shard. Partition is derivable
 /// (`experts_per_gpu = num_experts / ep_size`).
 #[derive(Clone, Debug)]
 pub struct MoeExpertComputeLocalWorkletConfig {
-    pub hidden: u32,
-    pub moe_intermediate: u32,
-    pub num_experts: u32,
+    pub hidden: Dim,
+    pub moe_intermediate: Dim,
+    pub num_experts: Dim,
     pub ep_size: u16,
     pub dtype: DType,
     pub gpu_name: String,
@@ -57,7 +57,9 @@ pub struct MoeExpertComputeLocalWorkletResolved {
     pub gate_up: GroupedGemmKernelConfig,
     pub act: ElementwiseKernelConfig,
     pub down: GroupedGemmKernelConfig,
-    pub experts_per_gpu: u32,
+    /// Per-rank expert count, symbolic: `num_experts / ep`. Folds to the plain
+    /// count at `.get()`; the grouped GEMM's real expert axis is `local_ppm`.
+    pub experts_per_gpu: Dim,
     pub dtype_bytes: u32,
 }
 
@@ -84,26 +86,30 @@ impl MoeExpertComputeLocalWorklet {
         let ep = cfg.ep_size as u32;
         assert!(ep > 0, "ep_size must be non-zero");
         assert!(
-            cfg.num_experts % ep == 0,
+            cfg.num_experts.get() % ep == 0,
             "num_experts {} not divisible by ep_size {}",
             cfg.num_experts,
             ep,
         );
-        let experts_per_gpu = cfg.num_experts / ep;
+        // A per-rank expert count — symbolic `num_experts / ep` so the derivation
+        // survives (folds to the plain count at `.get()`). The grouped GEMM's real
+        // expert axis is `local_ppm`, not this count.
+        let experts_per_gpu = cfg.num_experts.clone() / Dim::param("ep", ep);
         assert_eq!(
             cfg.local_ppm.len() as u32,
-            experts_per_gpu,
+            experts_per_gpu.get(),
             "local_ppm len ({}) must equal experts_per_gpu ({})",
             cfg.local_ppm.len(),
-            experts_per_gpu,
+            experts_per_gpu.get(),
         );
         let dtype_bytes = cfg.dtype.size_bytes();
+        let bytes = Dim::param("bytes", dtype_bytes);
         MoeExpertComputeLocalWorkletResolved {
             gate_up: GroupedGemmKernelConfig {
                 backends: cfg.grouped_gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: 2 * cfg.moe_intermediate,
-                k: cfg.hidden,
+                n: 2 * cfg.moe_intermediate.clone(),
+                k: cfg.hidden.clone(),
                 dtype: cfg.dtype,
                 local_ppm: cfg.local_ppm.clone(),
             },
@@ -112,14 +118,14 @@ impl MoeExpertComputeLocalWorklet {
                 // moe_intermediate elements per routed (token,expert) pair.
                 backends: cfg.act_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                input_bytes_per_token: 2 * cfg.moe_intermediate * dtype_bytes,
-                output_bytes_per_token: cfg.moe_intermediate * dtype_bytes,
+                input_bytes_per_token: 2 * cfg.moe_intermediate.clone() * bytes.clone(),
+                output_bytes_per_token: cfg.moe_intermediate.clone() * bytes.clone(),
             },
             down: GroupedGemmKernelConfig {
                 backends: cfg.grouped_gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: cfg.hidden,
-                k: cfg.moe_intermediate,
+                n: cfg.hidden.clone(),
+                k: cfg.moe_intermediate.clone(),
                 dtype: cfg.dtype,
                 local_ppm: cfg.local_ppm.clone(),
             },
@@ -162,12 +168,8 @@ impl MoeExpertComputeLocalWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let r = &self.resolved;
         let label = format!(
-            "{} (MoeExpertComputeLocalWorklet) [hidden={}, m_inter={}, experts_per_gpu={}/{}]",
-            self.name,
-            r.raw_cfg.hidden,
-            r.raw_cfg.moe_intermediate,
-            r.experts_per_gpu,
-            r.raw_cfg.num_experts,
+            "{} (MoeExpertComputeLocalWorklet) [{:?}, {:?}, experts_per_gpu={:?}]",
+            self.name, r.raw_cfg.hidden, r.raw_cfg.moe_intermediate, r.experts_per_gpu,
         );
         CostNode::Labeled {
             label,
@@ -232,9 +234,9 @@ mod tests {
     fn cfg(ep_size: u16) -> MoeExpertComputeLocalWorkletConfig {
         let num_experts = 128u32;
         MoeExpertComputeLocalWorkletConfig {
-            hidden: 4096,
-            moe_intermediate: 3072,
-            num_experts,
+            hidden: 4096.into(),
+            moe_intermediate: 3072.into(),
+            num_experts: num_experts.into(),
             ep_size,
             dtype: DType::Bf16,
             gpu_name: "H100".to_string(),

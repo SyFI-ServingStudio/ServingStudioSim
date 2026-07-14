@@ -3,6 +3,7 @@
 pub mod bridge;
 pub mod cache;
 pub mod cost_tree;
+pub mod dims;
 pub mod kernels;
 pub mod result;
 pub mod routing;
@@ -13,6 +14,7 @@ pub use bridge::{
     BackendOverrideGuard, BuildError, DType, KernelEnum, KernelMissing, PerfApiBridge,
 };
 pub use cache::interp::{CoverageFlags, LeafMetrics, Metrics4};
+pub use dims::Dim;
 pub use cost_tree::{
     CostManifest, CostManifestDoc, CostManifestSection, CostNode, CostTree, CostTreeBuilder,
     Evaluator, FlatCostNode, LeafDesc,

@@ -141,7 +141,7 @@ pub fn qwen3_moe(
     bridge: &PerfApiBridge,
 ) -> Result<Qwen3MoeDpAttnEpFfnModel> {
     let model_cfg = moe_model_cfg(model_spec)?;
-    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts);
+    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts.get());
     let parallel = Qwen3MoeParallel {
         attn_tp_size,
         ep_size,
@@ -195,7 +195,7 @@ pub fn qwen3_ffn_moe(
     bridge: &PerfApiBridge,
 ) -> Result<Qwen3FfnMoeLayerwiseModel> {
     let model_cfg = moe_model_cfg(model_spec)?;
-    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts);
+    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts.get());
     let parallel = Qwen3FfnMoeParallel {
         attn_tp_size,
         ep_size,
@@ -335,8 +335,8 @@ mod tests {
     fn afd_comm_bytes_match_moesim_formulas() {
         let model = MoeModelCfg::qwen3_235b();
         let bpe = model.dtype.size_bytes() as u64;
-        let q_dim = model.num_qo_heads as u64 * model.head_dim as u64;
-        let kv_dim = model.num_kv_heads as u64 * model.head_dim as u64;
+        let q_dim = model.num_qo_heads.get() as u64 * model.head_dim.get() as u64;
+        let kv_dim = model.num_kv_heads.get() as u64 * model.head_dim.get() as u64;
 
         let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
             &model,
@@ -346,12 +346,12 @@ mod tests {
             },
         );
         // attn→ffn outgoing bytes: the attention output, q_dim·bpe.
-        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token, q_dim * bpe);
+        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64, q_dim * bpe);
         // total KV bytes: 2 (k+v) × kv_heads × head_dim × kv_dtype × layers.
         assert_eq!(
-            attn_cfgs.total_kv_bytes_per_token,
-            2 * model.num_kv_heads as u64
-                * model.head_dim as u64
+            attn_cfgs.total_kv_bytes_per_token.get() as u64,
+            2 * model.num_kv_heads.get() as u64
+                * model.head_dim.get() as u64
                 * model.kv_dtype.size_bytes() as u64
                 * model.num_layers as u64
         );
@@ -378,8 +378,8 @@ mod tests {
         assert_eq!(model.single_gemm_backends(), vec!["deepgemm"]);
         assert_eq!(model.grouped_gemm_backends(), vec!["deepgemm"]);
 
-        let q_dim = model.num_qo_heads as u64 * model.head_dim as u64;
-        let kv_dim = model.num_kv_heads as u64 * model.head_dim as u64;
+        let q_dim = model.num_qo_heads.get() as u64 * model.head_dim.get() as u64;
+        let kv_dim = model.num_kv_heads.get() as u64 * model.head_dim.get() as u64;
 
         // --- attn side ---
         let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
@@ -390,10 +390,10 @@ mod tests {
             },
         );
         // Handoff + KV at fp8 = 1 byte/elem.
-        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token, q_dim * 1);
+        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64, q_dim * 1);
         assert_eq!(
-            attn_cfgs.total_kv_bytes_per_token,
-            2 * model.num_kv_heads as u64 * model.head_dim as u64 * 1 * model.num_layers as u64
+            attn_cfgs.total_kv_bytes_per_token.get() as u64,
+            2 * model.num_kv_heads.get() as u64 * model.head_dim.get() as u64 * 1 * model.num_layers as u64
         );
         // The attn block carries the base dtype + fp8 flag (op owns the preset);
         // its GEMMs use deepgemm, KV cache reads fp8.
@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(attn_cfgs.attn_block.kv_dtype(), DType::Fp8E4m3);
 
         // --- ffn side ---
-        let routing = RoutingDistribution::uniform(model.num_experts);
+        let routing = RoutingDistribution::uniform(model.num_experts.get());
         let ffn_cfgs = crate::arch::qwen3_ffn_moe_layerwise::build_configs(
             &model,
             &crate::arch::qwen3_ffn_moe_layerwise::Qwen3FfnMoeParallel {
@@ -415,7 +415,7 @@ mod tests {
             &routing,
         );
         // Symmetric QKV-projection handoff at fp8.
-        assert_eq!(ffn_cfgs.ffn_to_attn_bytes_per_token, (q_dim + 2 * kv_dim) * 1);
+        assert_eq!(ffn_cfgs.ffn_to_attn_bytes_per_token.get() as u64, (q_dim + 2 * kv_dim) * 1);
         // GEMM roles fp8+deepgemm; RMSNorm roles stay bf16.
         assert_eq!(ffn_cfgs.pre_attn.compute_dtype, DType::Fp8E4m3);
         assert_eq!(ffn_cfgs.pre_attn.dtype, DType::Bf16); // input_norm stays bf16
@@ -443,7 +443,7 @@ mod tests {
         assert_eq!(model.single_gemm_backends(), vec!["torch", "torch_linear"]);
         assert_eq!(model.grouped_gemm_backends(), vec!["torch"]);
 
-        let q_dim = model.num_qo_heads as u64 * model.head_dim as u64;
+        let q_dim = model.num_qo_heads.get() as u64 * model.head_dim.get() as u64;
         let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
             &model,
             &Qwen3AttnParallel {
@@ -451,7 +451,7 @@ mod tests {
                 gpu_name: "H200".to_string(),
             },
         );
-        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token, q_dim * 2);
+        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64, q_dim * 2);
         assert!(!attn_cfgs.attn_block.fp8);
         assert_eq!(
             attn_cfgs.attn_block.gemm_backends,

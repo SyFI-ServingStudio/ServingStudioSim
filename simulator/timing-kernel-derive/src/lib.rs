@@ -16,7 +16,14 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields};
+use syn::{parse_macro_input, Data, DeriveInput, Fields, Type};
+
+/// True when a field's type is written exactly `Dim` (the only type carrying a
+/// `bindings()` symbol→value legend). Wrapped Dims (`Option<Dim>`, `Vec<Dim>`)
+/// aren't used in kernel configs, so a bare last-segment match is sufficient.
+fn is_dim_type(ty: &Type) -> bool {
+    matches!(ty, Type::Path(tp) if tp.path.segments.last().is_some_and(|s| s.ident == "Dim"))
+}
 
 #[proc_macro_derive(SweepCoords)]
 pub fn derive_sweep_coords(input: TokenStream) -> TokenStream {
@@ -110,6 +117,15 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
         quote! { parts.push(::std::format!("{}={:?}", #label, self.#field)); }
     });
 
+    // `symbol_bindings`: union each `Dim`-typed field's `bindings()` into one
+    // `name -> value` legend. Only `Dim` fields have a `bindings()`, so non-Dim
+    // fields (dtype / backends / u32 knobs) are skipped — self-maintaining as new
+    // Dim fields are added.
+    let binding_extends = fields.iter().filter(|f| is_dim_type(&f.ty)).map(|f| {
+        let field = f.ident.as_ref().expect("named fields enforced above");
+        quote! { map.extend(self.#field.bindings()); }
+    });
+
     // `#[compute_dtype]` / `#[kv_dtype]` field tags: generate the `KernelConfig`
     // dtype accessors from the marked field so the enumerate record can emit a
     // TYPED dtype (the launcher reads it directly, no `describe_config` scraping).
@@ -158,6 +174,12 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
                 let mut parts: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
                 #( #describe_pushes )*
                 parts.join(" ")
+            }
+
+            fn symbol_bindings(&self) -> ::std::collections::BTreeMap<&'static str, u32> {
+                let mut map = ::std::collections::BTreeMap::new();
+                #( #binding_extends )*
+                map
             }
         }
     };

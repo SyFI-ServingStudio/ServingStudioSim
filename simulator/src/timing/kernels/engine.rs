@@ -6,6 +6,7 @@
 //! the runtime input. Comm / compute / distribution-sensitive kernels are all
 //! the same shape here — variations live in each per-kernel `KernelSpec`.
 
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 use crate::timing::bridge::{ArgsPayload, KernelKind, KernelMetrics, PerfApiBridge};
@@ -60,6 +61,15 @@ pub trait KernelConfig: std::hash::Hash + Eq + Clone + std::fmt::Debug + 'static
     /// `backends`), dropping only the struct-name + braces wrapper.
     fn describe_config(&self) -> String {
         format!("{self:?}")
+    }
+
+    /// The `symbol -> value` legend for this config's `Dim` shape fields — the
+    /// union of each field's [`Dim::bindings`]. Lets a UI resolve a leaf's
+    /// rendered formula (`n=(num_qo_heads/attn_tp+…)*head_dim`) to its parts.
+    /// `#[derive(KernelConfig)]` overrides it, unioning `bindings()` over every
+    /// `Dim`-typed field; the default (comm / no-shape configs) is empty.
+    fn symbol_bindings(&self) -> BTreeMap<&'static str, u32> {
+        BTreeMap::new()
     }
 }
 
@@ -353,6 +363,9 @@ impl<S: KernelSpec> Probe for Kernel<S> {
     }
     fn describe_config(&self) -> String {
         self.config.describe_config()
+    }
+    fn symbol_bindings(&self) -> BTreeMap<&'static str, u32> {
+        KernelConfig::symbol_bindings(&self.config)
     }
     /// The (post-override) candidate backend list — same source as the fitted
     /// `backend_caches`, so the manifest order matches the `slot_backend` index.

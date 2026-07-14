@@ -34,11 +34,12 @@ impl<K: Probe> Op<K> {
     /// carrying the kernel's `kind`/`config` for the shape render (the old
     /// `Describe` leaf line).
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        builder.leaf(
+        builder.leaf_with_symbols(
             self.name.clone(),
             self.kernel.kind(),
             self.kernel.describe_config(),
             self.kernel.backends(),
+            self.kernel.symbol_bindings(),
         )
     }
 
@@ -97,6 +98,9 @@ mod tests {
         }
         fn describe_config(&self) -> String {
             self.config.to_string()
+        }
+        fn symbol_bindings(&self) -> std::collections::BTreeMap<&'static str, u32> {
+            std::collections::BTreeMap::new()
         }
         fn backends(&self) -> Vec<String> {
             vec!["fake".to_string()]

@@ -9,15 +9,15 @@ use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
-use crate::timing::{KernelConfig, SweepCoords};
+use crate::timing::{Dim, KernelConfig, SweepCoords};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
 pub struct KvCacheAppendKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
+    pub num_kv_heads: Dim,
+    pub head_dim: Dim,
     pub block_size: u32,
     #[compute_dtype]
     pub input_dtype: DType,
@@ -64,8 +64,8 @@ impl KernelSpec for KvCacheAppendSpec {
         grid.expand_1d(|num_tokens| {
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("num_kv_heads", config.num_kv_heads)
-                .with("head_dim", config.head_dim)
+                .with("num_kv_heads", config.num_kv_heads.get())
+                .with("head_dim", config.head_dim.get())
                 .with("block_size", config.block_size)
                 .with("input_dtype", config.input_dtype.as_str())
                 .with("kv_dtype", config.kv_dtype.as_str())
@@ -91,8 +91,8 @@ mod tests {
         KvCacheAppendKernelConfig {
             backends: vec!["vllm_cuda"],
             gpu_name: "NVIDIA H200".to_string(),
-            num_kv_heads: 8,
-            head_dim: 128,
+            num_kv_heads: 8.into(),
+            head_dim: 128.into(),
             block_size: 16,
             input_dtype: DType::Bf16,
             kv_dtype: DType::Bf16,

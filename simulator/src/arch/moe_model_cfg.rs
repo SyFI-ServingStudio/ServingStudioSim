@@ -20,15 +20,18 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::timing::bridge::DType;
+use crate::timing::Dim;
 
-/// Raw MoE transformer dims (per-model identity, parallelism-agnostic).
+/// Raw MoE transformer dims (per-model identity, parallelism-agnostic). Shape
+/// dims are provenance-carrying [`Dim`]s (see [`ModelCfg`]); `num_layers` /
+/// `top_k` are counts, not shapes, so they stay plain `u32`.
 #[derive(Clone, Debug)]
 pub struct MoeModelCfg {
-    pub hidden: u32,
-    pub num_qo_heads: u32,
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
-    pub vocab: u32,
+    pub hidden: Dim,
+    pub num_qo_heads: Dim,
+    pub num_kv_heads: Dim,
+    pub head_dim: Dim,
+    pub vocab: Dim,
     pub num_layers: u32,
     /// The model's native dtype (from JSON `torch_dtype`, e.g. bf16). This is the
     /// dtype for the ops that stay 16-bit in an FP8 run — RMSNorm, the attention
@@ -42,12 +45,13 @@ pub struct MoeModelCfg {
     /// all byte transfers at 1 B/elem). Drives GEMM backend (deepgemm) and
     /// [`Self::compute_dtype`]. Set from `ModelSpec.fp8` at build time.
     pub fp8: bool,
-    /// Total expert count across all EP ranks (not per-rank).
-    pub num_experts: u32,
-    /// Experts each token selects (without replacement).
+    /// Total expert count across all EP ranks (not per-rank). Router output dim,
+    /// so a shape [`Dim`].
+    pub num_experts: Dim,
+    /// Experts each token selects (without replacement). A count, not a shape.
     pub top_k: u32,
     /// Per-expert intermediate dim (MoE FFN gate/up/down width).
-    pub moe_intermediate: u32,
+    pub moe_intermediate: Dim,
 }
 
 impl MoeModelCfg {
@@ -65,18 +69,18 @@ impl MoeModelCfg {
             .head_dim
             .unwrap_or(raw.hidden_size / raw.num_attention_heads);
         Ok(Self {
-            hidden: raw.hidden_size,
-            num_qo_heads: raw.num_attention_heads,
-            num_kv_heads: raw.num_key_value_heads,
-            head_dim,
-            vocab: raw.vocab_size,
+            hidden: Dim::param("hidden", raw.hidden_size),
+            num_qo_heads: Dim::param("num_qo_heads", raw.num_attention_heads),
+            num_kv_heads: Dim::param("num_kv_heads", raw.num_key_value_heads),
+            head_dim: Dim::param("head_dim", head_dim),
+            vocab: Dim::param("vocab", raw.vocab_size),
             num_layers: raw.num_hidden_layers,
             dtype,
             kv_dtype: dtype,
             fp8: false,
-            num_experts: raw.num_experts,
+            num_experts: Dim::param("num_experts", raw.num_experts),
             top_k: raw.num_experts_per_tok,
-            moe_intermediate: raw.moe_intermediate_size,
+            moe_intermediate: Dim::param("moe_intermediate", raw.moe_intermediate_size),
         })
     }
 
@@ -155,18 +159,18 @@ impl MoeModelCfg {
     /// `moesim-rs/src/workload/standard_moe.rs::qwen3_235b`.
     pub fn qwen3_235b() -> Self {
         Self {
-            hidden: 4096,
-            num_qo_heads: 64,
-            num_kv_heads: 4,
-            head_dim: 128,
-            vocab: 152064,
+            hidden: Dim::param("hidden", 4096),
+            num_qo_heads: Dim::param("num_qo_heads", 64),
+            num_kv_heads: Dim::param("num_kv_heads", 4),
+            head_dim: Dim::param("head_dim", 128),
+            vocab: Dim::param("vocab", 152064),
             num_layers: 94,
             dtype: DType::Bf16,
             kv_dtype: DType::Bf16,
             fp8: false,
-            num_experts: 128,
+            num_experts: Dim::param("num_experts", 128),
             top_k: 8,
-            moe_intermediate: 3072,
+            moe_intermediate: Dim::param("moe_intermediate", 3072),
         }
     }
 }
