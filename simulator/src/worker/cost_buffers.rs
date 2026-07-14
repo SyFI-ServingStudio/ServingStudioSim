@@ -419,6 +419,7 @@ mod tests {
                 energy_j: 0.0,
             },
             coverage: CoverageFlags::EMPTY,
+            backend_index: LeafMetrics::NO_BACKEND,
         }
     }
 
@@ -442,6 +443,7 @@ mod tests {
                     name: "m.test".to_owned(),
                     kind: "unit".to_owned(),
                     config: "shape=1".to_owned(),
+                    backends: vec!["torch".to_owned()],
                 }],
                 nodes: vec![FlatCostNode::Leaf(0)],
                 node_labels: vec![None],

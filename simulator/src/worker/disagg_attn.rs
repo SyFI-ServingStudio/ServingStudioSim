@@ -989,6 +989,7 @@ mod tests {
                 energy_j: 0.0,
             },
             coverage: CoverageFlags::EMPTY,
+            backend_index: LeafMetrics::NO_BACKEND,
         }
     }
     impl AttnLayerwiseModel for FakeAttn {

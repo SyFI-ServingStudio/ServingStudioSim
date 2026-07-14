@@ -23,6 +23,12 @@ pub trait Probe {
 
     /// One-line shape/dtype config summary for the compiled leaf's manifest entry.
     fn describe_config(&self) -> String;
+
+    /// This leaf's ordered candidate backend names, for the manifest
+    /// `LeafDesc.backends`. The order is the one best-of-N indexes over in
+    /// [`Self::eval`] and that the kernel's caches were fit in, so a `cost_log`
+    /// `slot_backend` value is a position-local index into this list.
+    fn backends(&self) -> Vec<String>;
 }
 
 /// Object-safe sibling of [`Probe`] for cost-model *introspection* (the

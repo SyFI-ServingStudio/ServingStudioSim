@@ -125,6 +125,17 @@ pub fn cost_log_schema() -> Arc<Schema> {
             DataType::List(Arc::new(Field::new("item", DataType::Float32, false))),
             false,
         ),
+        // Per-slot selected backend (slot-aligned to `slot_time_ms`): the
+        // position-local index into the leaf's candidate list (`backends` in the
+        // matching `cost_manifest` sidecar), or `255` when the leaf was not
+        // executed this iteration. Lets a consumer see which of a multi-backend
+        // position's candidates best-of-N picked. Appended last: append-only, so
+        // old readers are unaffected.
+        Field::new(
+            "slot_backend",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt8, false))),
+            false,
+        ),
     ]))
 }
 

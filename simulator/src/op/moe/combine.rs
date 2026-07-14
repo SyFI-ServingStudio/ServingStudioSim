@@ -76,28 +76,34 @@ impl MoeCombineOp {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let intra_kind = self.p2p_intra.kind();
         let intra_cfg = self.p2p_intra.describe_config();
+        let intra_backends = self.p2p_intra.backends();
         let inter_kind = self.p2p_inter.kind();
         let inter_cfg = self.p2p_inter.describe_config();
+        let inter_backends = self.p2p_inter.backends();
         CostNode::Sum(vec![
             builder.leaf(
                 format!("{}.combine_intra_reduce", self.name),
                 intra_kind,
                 intra_cfg.clone(),
+                intra_backends.clone(),
             ),
             builder.leaf(
                 format!("{}.combine_inter_reduce", self.name),
                 inter_kind,
                 inter_cfg.clone(),
+                inter_backends.clone(),
             ),
             builder.leaf(
                 format!("{}.combine_inter_bcast", self.name),
                 inter_kind,
                 inter_cfg,
+                inter_backends,
             ),
             builder.leaf(
                 format!("{}.combine_intra_fanout", self.name),
                 intra_kind,
                 intra_cfg,
+                intra_backends,
             ),
         ])
     }

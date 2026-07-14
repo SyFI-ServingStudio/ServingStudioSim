@@ -65,11 +65,13 @@ impl MoeDispatchOp {
                 format!("{}.dispatch_inter", self.name),
                 self.p2p_inter.kind(),
                 self.p2p_inter.describe_config(),
+                self.p2p_inter.backends(),
             ),
             builder.leaf(
                 format!("{}.dispatch_intra", self.name),
                 self.p2p_intra.kind(),
                 self.p2p_intra.describe_config(),
+                self.p2p_intra.backends(),
             ),
         ])
     }

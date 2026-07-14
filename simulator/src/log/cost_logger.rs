@@ -131,6 +131,7 @@ impl CostLogger {
             self.buf.slot_covs.reserve(STREAM_FLUSH_ROWS * slot_len);
             self.buf.slot_flops.reserve(STREAM_FLUSH_ROWS * slot_len);
             self.buf.slot_bytes.reserve(STREAM_FLUSH_ROWS * slot_len);
+            self.buf.slot_backends.reserve(STREAM_FLUSH_ROWS * slot_len);
             self.buf
                 .slot_inputs
                 .reserve(STREAM_FLUSH_ROWS * slot_input_len);
@@ -146,6 +147,9 @@ impl CostLogger {
             .extend(slots.iter().map(|l| l.coverage.bits()));
         self.buf.slot_flops.extend(slots.iter().map(|l| l.m.flops));
         self.buf.slot_bytes.extend(slots.iter().map(|l| l.m.bytes));
+        self.buf
+            .slot_backends
+            .extend(slots.iter().map(|l| l.backend_index));
         self.buf.group_logs.append(groups);
         self.buf.slot_inputs.extend_from_slice(slot_inputs);
         self.buf.entries.push(entry);
@@ -231,7 +235,7 @@ mod tests {
 
     use std::fs::File;
 
-    use arrow_array::StringArray;
+    use arrow_array::{Array, ListArray, StringArray, UInt8Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use tempfile::tempdir;
 
@@ -246,6 +250,7 @@ mod tests {
                 name: "m.test".to_owned(),
                 kind: "unit".to_owned(),
                 config: "shape=1".to_owned(),
+                backends: vec!["torch".to_owned()],
             }],
             nodes: vec![FlatCostNode::Leaf(0)],
             node_labels: vec![None],
@@ -275,6 +280,7 @@ mod tests {
                 energy_j: 0.0,
             },
             coverage: CoverageFlags::EMPTY,
+            backend_index: 0,
         }];
         let mut groups = Vec::new();
         let slot_inputs = Vec::new();
@@ -301,5 +307,20 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(pool.value(0), "decode");
+        // slot_backend round-trips the selected index (last column, appended).
+        let backend_col = batch
+            .column_by_name("slot_backend")
+            .expect("slot_backend column")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let backend_slots = backend_col
+            .value(0)
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap()
+            .clone();
+        assert_eq!(backend_slots.len(), 1);
+        assert_eq!(backend_slots.value(0), 0);
     }
 }

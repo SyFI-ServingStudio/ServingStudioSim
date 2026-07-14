@@ -157,6 +157,7 @@ mod tests {
             chunk.slot_covs.push((s & 0xFF) as u8);
             chunk.slot_flops.push(s as f32 * 1e9);
             chunk.slot_bytes.push(s as f32 * 1e6);
+            chunk.slot_backends.push((s & 0xFF) as u8);
         }
         chunk.entries.push(CostLogEntry {
             worker_id,

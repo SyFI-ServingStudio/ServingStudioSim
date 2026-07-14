@@ -191,6 +191,11 @@ pub struct CostLogChunk {
     /// rate. Surfaced as the `slot_flops` / `slot_bytes` cost-log columns.
     pub slot_flops: Vec<f32>,
     pub slot_bytes: Vec<f32>,
+    /// Per-slot selected backend, parallel to `slot_times` (same cursor, same
+    /// `slot_len`): the position-local index into the leaf's manifest
+    /// `backends`, or `255` (`LeafMetrics::NO_BACKEND`) for a leaf not executed
+    /// this row. Surfaced as the `slot_backend` cost-log column.
+    pub slot_backends: Vec<u8>,
     pub slot_inputs: Vec<SlotInput>,
 }
 
@@ -210,6 +215,7 @@ impl CostLogChunk {
             slot_covs: Vec::with_capacity(slot_capacity),
             slot_flops: Vec::with_capacity(slot_capacity),
             slot_bytes: Vec::with_capacity(slot_capacity),
+            slot_backends: Vec::with_capacity(slot_capacity),
             slot_inputs: Vec::with_capacity(slot_input_capacity),
         }
     }
@@ -315,6 +321,10 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
         .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
     let mut bytes_builder = ListBuilder::new(Float32Builder::new())
         .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
+    // Selected backend per slot, slot-aligned to `time_builder` (same cursor).
+    let mut backend_builder = ListBuilder::new(UInt8Builder::new()).with_field(Arc::new(
+        Field::new("item", DataType::UInt8, false),
+    ));
     // Per-slot input JSON, serialized HERE on the writer thread (the sim thread
     // only handed over the inline `SlotInput` enums). One (possibly empty) list per row.
     let mut input_builder = ListBuilder::new(StringBuilder::new())
@@ -328,7 +338,8 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
             slot_end <= chunk.slot_times.len()
                 && slot_end <= chunk.slot_covs.len()
                 && slot_end <= chunk.slot_flops.len()
-                && slot_end <= chunk.slot_bytes.len(),
+                && slot_end <= chunk.slot_bytes.len()
+                && slot_end <= chunk.slot_backends.len(),
             "cost_log slot slice exceeds chunk buffer"
         );
         for &t in &chunk.slot_times[slot_cursor..slot_end] {
@@ -347,6 +358,10 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
             bytes_builder.values().append_value(b);
         }
         bytes_builder.append(true);
+        for &b in &chunk.slot_backends[slot_cursor..slot_end] {
+            backend_builder.values().append_value(b);
+        }
+        backend_builder.append(true);
         slot_cursor = slot_end;
         let slot_input_end = slot_input_cursor + e.slot_input_len;
         ensure!(
@@ -372,8 +387,9 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
         slot_cursor == chunk.slot_times.len()
             && slot_cursor == chunk.slot_covs.len()
             && slot_cursor == chunk.slot_flops.len()
-            && slot_cursor == chunk.slot_bytes.len(),
-        "cost_log chunk has unused slot time/coverage/flops/bytes values"
+            && slot_cursor == chunk.slot_bytes.len()
+            && slot_cursor == chunk.slot_backends.len(),
+        "cost_log chunk has unused slot time/coverage/flops/bytes/backend values"
     );
 
     Ok(RecordBatch::try_new(
@@ -394,6 +410,7 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
             Arc::new(Int16Array::from(layer)),
             Arc::new(flops_builder.finish()),
             Arc::new(bytes_builder.finish()),
+            Arc::new(backend_builder.finish()),
         ],
     )?)
 }
@@ -612,7 +629,7 @@ pub(crate) fn gpu_cluster_to_record_batch(entries: &[GpuClusterEntry]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Array, StructArray};
+    use arrow_array::{Array, StructArray, UInt8Array};
 
     fn slo_entry(id: u32, times: Vec<f32>) -> RequestSloEntry {
         // Mirror `sim::run::slo_entry`: the general scalars are computed from
@@ -704,6 +721,7 @@ mod tests {
             slot_covs: vec![0, 1, 0, 0, 0, 0],
             slot_flops: vec![10.0, 20.0, 30.0, 40.0, 50.0, 0.0],
             slot_bytes: vec![1.0, 2.0, 3.0, 4.0, 5.0, 0.0],
+            slot_backends: vec![0, 1, 0, 2, 0, 255],
             slot_inputs: vec![],
         })
         .unwrap();
@@ -728,6 +746,20 @@ mod tests {
         let bytes1 = bytes_col.value(1);
         let bytes1 = bytes1.as_any().downcast_ref::<Float32Array>().unwrap();
         assert_eq!(bytes1.values(), &[4.0, 5.0, 0.0]);
+        // slot_backend round-trips as a List<u8> slot-aligned to slot_time_ms;
+        // 255 is the "not executed" sentinel.
+        let backend_col = batch
+            .column_by_name("slot_backend")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let backend0 = backend_col.value(0);
+        let backend0 = backend0.as_any().downcast_ref::<UInt8Array>().unwrap();
+        assert_eq!(backend0.values(), &[0, 1, 0]);
+        let backend1 = backend_col.value(1);
+        let backend1 = backend1.as_any().downcast_ref::<UInt8Array>().unwrap();
+        assert_eq!(backend1.values(), &[2, 0, 255]);
         let pool = batch
             .column(0)
             .as_any()

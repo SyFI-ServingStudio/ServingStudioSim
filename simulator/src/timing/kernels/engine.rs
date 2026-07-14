@@ -145,6 +145,17 @@ impl<S: KernelSpec> Kernel<S> {
             <S::Config as KernelConfig>::BACKENDS_FIELD,
             config.backends(),
         )?;
+        // The `cost_log` slot_backend index is a position-local `u8` with
+        // [`LeafMetrics::NO_BACKEND`] (255) reserved for "no backend", so a
+        // position may carry at most 255 candidates (indices 0..=254).
+        assert!(
+            config.backends().len() <= LeafMetrics::NO_BACKEND as usize,
+            "kernel {name} ({}) declares {} candidate backends; the cost_log \
+             slot_backend index supports at most {}",
+            S::KIND,
+            config.backends().len(),
+            LeafMetrics::NO_BACKEND,
+        );
 
         // Enumerate mode (`emit-backends`): record this kernel's structural facts
         // and return an empty kernel WITHOUT any profile.db lookup. GPU-free and
@@ -272,18 +283,31 @@ impl<S: KernelSpec> Kernel<S> {
         let coords = input.coords();
         match self.backend_caches.as_slice() {
             [] => panic!("kernel config validation must create at least one backend cache"),
-            [backend_cache] => backend_cache.eval(&coords),
+            [backend_cache] => {
+                // Single candidate: it is trivially the selected one. Stamp its
+                // position-local index (0) so the `cost_log` slot_backend column
+                // carries a real choice, not the [`LeafMetrics::NO_BACKEND`]
+                // sentinel a bare cache eval returns.
+                let mut only = backend_cache.eval(&coords);
+                only.backend_index = 0;
+                only
+            }
             [first_cache, rest @ ..] => {
                 let mut best = first_cache.eval(&coords);
                 let mut best_time_ms = best.m.time_ms.max(0.0);
-                for backend_cache in rest {
+                let mut best_index = 0u8;
+                for (offset, backend_cache) in rest.iter().enumerate() {
                     let candidate = backend_cache.eval(&coords);
                     let candidate_time_ms = candidate.m.time_ms.max(0.0);
                     if candidate_time_ms < best_time_ms {
                         best = candidate;
                         best_time_ms = candidate_time_ms;
+                        best_index = (offset + 1) as u8;
                     }
                 }
+                // Position-local index into this kernel's ordered candidate list
+                // (== manifest `LeafDesc.backends` order, == cache fit order).
+                best.backend_index = best_index;
                 best
             }
         }
@@ -329,6 +353,15 @@ impl<S: KernelSpec> Probe for Kernel<S> {
     }
     fn describe_config(&self) -> String {
         self.config.describe_config()
+    }
+    /// The (post-override) candidate backend list — same source as the fitted
+    /// `backend_caches`, so the manifest order matches the `slot_backend` index.
+    fn backends(&self) -> Vec<String> {
+        self.config
+            .backends()
+            .iter()
+            .map(|b| b.to_string())
+            .collect()
     }
 }
 

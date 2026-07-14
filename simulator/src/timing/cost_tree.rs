@@ -76,11 +76,17 @@ pub enum FlatCostNode {
 /// in from the old `Describe` trait — `kind` is the kernel KIND tag and `config`
 /// the one-line shape/dtype summary (`KernelConfig::describe_config`). Captured at
 /// compile so [`CostTree::describe`] is the sole shape renderer.
+///
+/// `backends` is the leaf's ordered candidate backend list, the structured form of
+/// what `config` renders inline. Its order is the index space of the `cost_log`
+/// `slot_backend` column (`backends[slot_backend]` names the selected backend), so
+/// an analyzer never parses the human-readable `config` string.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LeafDesc {
     pub name: String,
     pub kind: String,
     pub config: String,
+    pub backends: Vec<String>,
 }
 
 /// Serializable description of a compiled [`CostTree`] — the per-worker
@@ -184,18 +190,21 @@ impl CostTreeBuilder {
 
     /// Allocate the next slot for a materialized leaf and return its [`CostNode`].
     /// `kind`/`config` carry the kernel identity for the shape render (the old
-    /// `Describe` leaf line).
+    /// `Describe` leaf line); `backends` is the leaf's ordered candidate list (the
+    /// index space of the `cost_log` `slot_backend` column).
     pub fn leaf(
         &mut self,
         name: impl Into<String>,
         kind: impl Into<String>,
         config: impl Into<String>,
+        backends: Vec<String>,
     ) -> CostNode {
         let slot = self.slots.len();
         self.slots.push(LeafDesc {
             name: name.into(),
             kind: kind.into(),
             config: config.into(),
+            backends,
         });
         CostNode::Leaf(slot)
     }
@@ -476,15 +485,15 @@ mod tests {
     /// the dense shape in miniature (a fold wrapping a 2-leaf subtree).
     fn sample() -> CostTree {
         let mut b = CostTreeBuilder::new();
-        let a = b.leaf("a", "ka", "x=1");
+        let a = b.leaf("a", "ka", "x=1", vec![]);
         let layer = CostNode::Scale {
             n: 3,
             child: Box::new(CostNode::Sum(vec![
-                b.leaf("b", "kb", "x=2"),
-                b.leaf("c", "kc", "x=3"),
+                b.leaf("b", "kb", "x=2", vec![]),
+                b.leaf("c", "kc", "x=3", vec![]),
             ])),
         };
-        let d = b.leaf("d", "kd", "x=4");
+        let d = b.leaf("d", "kd", "x=4", vec![]);
         b.finish(CostNode::Sum(vec![a, layer, d]))
     }
 
@@ -517,7 +526,7 @@ Sum
         // annotation) above its child — the "no less than describe" guard: the
         // leaf still carries its kernel kind + config.
         let mut b = CostTreeBuilder::new();
-        let leaf = b.leaf("w.norm", "rms_norm", "hidden=4096, dtype=Bf16");
+        let leaf = b.leaf("w.norm", "rms_norm", "hidden=4096, dtype=Bf16", vec![]);
         let tree = b.finish(CostNode::Labeled {
             label: "w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]".to_string(),
             child: Box::new(CostNode::Sum(vec![leaf])),
@@ -558,13 +567,14 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
                 "m.pre_attn.norm",
                 "rms_norm",
                 "",
+                vec![],
             )])),
         };
         let attn = CostNode::Labeled {
             label: "m.attn (AttnLocalWorklet)".to_string(),
             child: Box::new(CostNode::Sum(vec![
-                b.leaf("m.attn.prefill", "flashinfer_attn_prefill", ""),
-                b.leaf("m.attn.decode", "flashinfer_attn_decode", ""),
+                b.leaf("m.attn.prefill", "flashinfer_attn_prefill", "", vec![]),
+                b.leaf("m.attn.decode", "flashinfer_attn_decode", "", vec![]),
             ])),
         };
         let tree = b.finish(CostNode::Sum(vec![pre, attn]));
@@ -594,6 +604,7 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
                 energy_j: 0.0,
             },
             coverage: CoverageFlags::EMPTY,
+            backend_index: LeafMetrics::NO_BACKEND,
         }
     }
 
@@ -653,7 +664,7 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
         let mut b = CostTreeBuilder::new();
         let root = CostNode::Max {
             overlap: 2.0,
-            children: vec![b.leaf("x", "kx", ""), b.leaf("y", "ky", "")],
+            children: vec![b.leaf("x", "kx", "", vec![]), b.leaf("y", "ky", "", vec![])],
         };
         let flat = b.finish(root).flatten();
         let buf = [leaf(4.0, 10.0, 100.0), leaf(6.0, 20.0, 200.0)];

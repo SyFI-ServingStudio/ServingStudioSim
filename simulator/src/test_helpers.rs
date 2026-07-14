@@ -26,6 +26,7 @@ pub(crate) fn lm(ms: f64) -> LeafMetrics {
             energy_j: 0.0,
         },
         coverage: CoverageFlags::EMPTY,
+        backend_index: LeafMetrics::NO_BACKEND,
     }
 }
 
@@ -68,6 +69,7 @@ impl IterwiseUnifiedModel for FakeModel {
                 energy_j: 0.0,
             },
             coverage: CoverageFlags::EMPTY,
+            backend_index: LeafMetrics::NO_BACKEND,
         }
     }
     fn total_kv_bytes_per_token(&self) -> u64 {

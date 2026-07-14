@@ -132,27 +132,69 @@ impl std::ops::BitOrAssign for CoverageFlags {
 }
 
 /// One cost *query* result: the numeric [`Metrics4`] plus the leaf's
-/// [`CoverageFlags`]. Distinct from the bare `Metrics4` stored/blended inside
-/// caches (kept lean for cache-line density) — this is what `eval`,
-/// the CostTree eval buffer, and `aggregate` carry, so coverage rides alongside
-/// the numbers without bloating the profiled arrays.
+/// [`CoverageFlags`] and the position-local backend that best-of-N selected.
+/// Distinct from the bare `Metrics4` stored/blended inside caches (kept lean for
+/// cache-line density) — this is what `eval`, the CostTree eval buffer, and
+/// `aggregate` carry, so coverage and the chosen backend ride alongside the
+/// numbers without bloating the profiled arrays.
+///
+/// `backend_index` is the index into this leaf's ordered candidate backend list
+/// (the manifest `LeafDesc.backends`, same order as the kernel's fitted caches),
+/// set by [`crate::timing::Probe::eval`]'s best-of-N. [`Self::NO_BACKEND`] marks
+/// a value that is not a selected leaf: a placeholder cache miss, an aggregated
+/// (`Sum`/`Max`/`Scale`) node, or a leaf not executed this iteration.
 #[derive(Clone, Copy, Debug)]
 pub struct LeafMetrics {
     pub m: Metrics4,
     pub coverage: CoverageFlags,
+    pub backend_index: u8,
 }
 
 impl LeafMetrics {
+    /// Sentinel `backend_index`: no selected backend (placeholder / aggregate /
+    /// leaf not executed this iteration). Reserves the top `u8`, so a position may
+    /// carry up to 255 candidate backends (validated at build).
+    pub const NO_BACKEND: u8 = u8::MAX;
+
     pub const ZERO: LeafMetrics = LeafMetrics {
         m: Metrics4::ZERO,
         coverage: CoverageFlags::EMPTY,
+        backend_index: Self::NO_BACKEND,
     };
 
-    /// Serial composition (a `Sum` node, or the per-request prefill fan-in):
-    /// field-wise sum of metrics, union of coverage flags.
+    /// Cache-miss / empty placeholder: zero metrics flagged
+    /// [`CoverageFlags::NO_COVERAGE`] so a 0-time result can't pass silently as a
+    /// real measurement, and [`Self::NO_BACKEND`] (no leaf was selected).
+    pub const MISS: LeafMetrics = LeafMetrics {
+        m: Metrics4::ZERO,
+        coverage: CoverageFlags::NO_COVERAGE,
+        backend_index: Self::NO_BACKEND,
+    };
+
+    /// Serial composition of aggregate NODES (a `Sum` / `Max` fold in
+    /// [`crate::timing::CostTree::aggregate`]): field-wise sum of metrics, union of
+    /// coverage. An aggregate node is not a single leaf's backend selection, so
+    /// `backend_index` stays [`Self::NO_BACKEND`] — use [`Self::add_fanin`] for the
+    /// leaf fan-in that must carry the selected backend into its logged slot.
     pub fn add(&mut self, other: LeafMetrics) {
         self.m.add_scaled(other.m, 1.0);
         self.coverage |= other.coverage;
+    }
+
+    /// Fan-in of per-request LEAF evals into ONE aggregating leaf slot — the
+    /// attention prefill slot sums `prefill.eval` over each `(prefix, append)`
+    /// request. Like [`Self::add`], but also adopts the first executed
+    /// contribution's `backend_index`, so the logged `slot_backend` records which
+    /// backend best-of-N selected rather than the [`Self::NO_BACKEND`] sentinel the
+    /// `ZERO` accumulator starts at. The v1 attention model has ≤1 prefill request
+    /// per step in the common continuous-batching case, so first-wins is exact;
+    /// a rare multi-prefill step records the first request's pick (a single `u8`
+    /// slot can hold only one).
+    pub fn add_fanin(&mut self, other: LeafMetrics) {
+        self.add(other);
+        if self.backend_index == Self::NO_BACKEND {
+            self.backend_index = other.backend_index;
+        }
     }
 
     /// Homogeneous-layer fold (`Scale{n}`): scale the metrics; coverage passes
@@ -207,4 +249,43 @@ pub(crate) fn locate(xs: &[f32], x: f32) -> (usize, usize, f32, bool) {
     };
     let outside = x < xs[0] || x > xs[last];
     (lo, hi, t, outside)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CoverageFlags, LeafMetrics, Metrics4};
+
+    fn leaf(time_ms: f32, backend: u8) -> LeafMetrics {
+        LeafMetrics {
+            m: Metrics4 { time_ms, flops: 0.0, bytes: 0.0, energy_j: 0.0 },
+            coverage: CoverageFlags::EMPTY,
+            backend_index: backend,
+        }
+    }
+
+    #[test]
+    fn add_fanin_adopts_first_executed_backend() {
+        // The prefill fan-in starts at ZERO (NO_BACKEND) and accumulates per-request
+        // leaf evals; the aggregated slot must carry the selected backend.
+        let mut acc = LeafMetrics::ZERO;
+        assert_eq!(acc.backend_index, LeafMetrics::NO_BACKEND);
+        acc.add_fanin(leaf(2.0, 1)); // first request picked candidate 1
+        assert_eq!(acc.backend_index, 1);
+        assert_eq!(acc.m.time_ms, 2.0);
+        // A second request picking a different backend does not overwrite (a single
+        // u8 slot holds one; first-executed wins), but its time still sums in.
+        acc.add_fanin(leaf(3.0, 0));
+        assert_eq!(acc.backend_index, 1);
+        assert_eq!(acc.m.time_ms, 5.0);
+    }
+
+    #[test]
+    fn plain_add_stays_backendless() {
+        // `add` is the aggregate-node fold (Sum/Max); it must NOT adopt a backend —
+        // an internal node is not a single leaf's selection.
+        let mut acc = LeafMetrics::ZERO;
+        acc.add(leaf(2.0, 1));
+        assert_eq!(acc.backend_index, LeafMetrics::NO_BACKEND);
+        assert_eq!(acc.m.time_ms, 2.0);
+    }
 }

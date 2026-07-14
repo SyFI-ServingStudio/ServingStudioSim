@@ -70,10 +70,7 @@ impl Cache for Cache1DLinear {
         if self.xs.is_empty() || x.is_nan() {
             // Empty cache / NaN coord → zero placeholder, flagged NoCoverage so a
             // 0-time result can't pass silently as a real measurement downstream.
-            return LeafMetrics {
-                m: Metrics4::ZERO,
-                coverage: CoverageFlags::NO_COVERAGE,
-            };
+            return LeafMetrics::MISS;
         }
         let (m, extrapolated) = self.interpolate(x as f32);
         LeafMetrics {
@@ -83,6 +80,7 @@ impl Cache for Cache1DLinear {
             } else {
                 CoverageFlags::EMPTY
             },
+            backend_index: LeafMetrics::NO_BACKEND,
         }
     }
 }

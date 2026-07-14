@@ -148,10 +148,7 @@ impl Cache for Cache2DLinear {
         );
         let (x0, x1) = (sweep[0], sweep[1]);
         if x0.is_nan() || x1.is_nan() || !self.any_valid {
-            return LeafMetrics {
-                m: Metrics4::ZERO,
-                coverage: CoverageFlags::NO_COVERAGE,
-            };
+            return LeafMetrics::MISS;
         }
         let (cell, extrapolated) = self.interpolate_cell(x0 as f32, x1 as f32);
         LeafMetrics {
@@ -161,6 +158,7 @@ impl Cache for Cache2DLinear {
             } else {
                 CoverageFlags::EMPTY
             },
+            backend_index: LeafMetrics::NO_BACKEND,
         }
     }
 }

@@ -38,6 +38,7 @@ impl<K: Probe> Op<K> {
             self.name.clone(),
             self.kernel.kind(),
             self.kernel.describe_config(),
+            self.kernel.backends(),
         )
     }
 
@@ -88,6 +89,7 @@ mod tests {
                     energy_j: 0.0,
                 },
                 coverage: CoverageFlags::EMPTY,
+                backend_index: 0,
             }
         }
         fn kind(&self) -> &'static str {
@@ -95,6 +97,9 @@ mod tests {
         }
         fn describe_config(&self) -> String {
             self.config.to_string()
+        }
+        fn backends(&self) -> Vec<String> {
+            vec!["fake".to_string()]
         }
     }
 

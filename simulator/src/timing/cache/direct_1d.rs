@@ -109,10 +109,7 @@ impl Cache for Cache1DDirect {
             "Cache1DDirect lookup requires one coordinate"
         );
         if sweep[0].is_nan() {
-            return LeafMetrics {
-                m: Metrics4::ZERO,
-                coverage: CoverageFlags::NO_COVERAGE,
-            };
+            return LeafMetrics::MISS;
         }
         let (idx, scale, outside) = self.index(sweep[0] as f32);
         match self.buckets[idx] {
@@ -125,13 +122,11 @@ impl Cache for Cache1DDirect {
                     } else {
                         CoverageFlags::EMPTY
                     },
+                    backend_index: LeafMetrics::NO_BACKEND,
                 }
             }
             // Landed bucket's fit-time sample was dropped as non-finite.
-            None => LeafMetrics {
-                m: Metrics4::ZERO,
-                coverage: CoverageFlags::NO_COVERAGE,
-            },
+            None => LeafMetrics::MISS,
         }
     }
 }

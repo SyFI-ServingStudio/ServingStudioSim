@@ -136,16 +136,19 @@ impl FlashInferAttentionOp {
                 format!("{}.kv_cache_append", self.name),
                 self.kv_cache_append.kind(),
                 self.kv_cache_append.describe_config(),
+                self.kv_cache_append.backends(),
             ),
             builder.leaf(
                 format!("{}.prefill", self.name),
                 self.prefill.kind(),
                 self.prefill.describe_config(),
+                self.prefill.backends(),
             ),
             builder.leaf(
                 format!("{}.decode", self.name),
                 self.decode.kind(),
                 self.decode.describe_config(),
+                self.decode.backends(),
             ),
         ])
     }
@@ -169,7 +172,10 @@ impl FlashInferAttentionOp {
 
         let mut prefill = LeafMetrics::ZERO;
         for &(prefix_len, append_len) in &input.prefill_chunk_pairs {
-            prefill.add(self.prefill.eval(&FlashinferAttnPrefillKernelInput {
+            // `add_fanin` (not `add`) so the aggregated prefill slot carries the
+            // selected backend into `slot_backend` — otherwise it keeps the ZERO
+            // accumulator's NO_BACKEND sentinel and reads as "never executed".
+            prefill.add_fanin(self.prefill.eval(&FlashinferAttnPrefillKernelInput {
                 prefix_len,
                 append_len,
             }));
