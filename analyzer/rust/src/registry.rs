@@ -14,7 +14,9 @@ use serde_json::Value;
 use crate::alignment_e2e;
 use crate::alignment_iteration;
 use crate::alignment_workload;
+use crate::backend;
 use crate::batch;
+use crate::breakdown;
 use crate::conservation;
 use crate::kv;
 use crate::request;
@@ -37,6 +39,13 @@ pub enum Category {
     /// Per-batch (per-iteration) composition over time, from `cost_log`. Tier-1,
     /// deployment-agnostic.
     Batch,
+    /// Best-of-N backend selection over a kernel position's input feature space,
+    /// from `cost_log` `slot_input` + `slot_backend` and the manifest candidate
+    /// lists. Tier-1, deployment-agnostic (a run without the columns is unavailable).
+    Backend,
+    /// Run-wide CostTree kernel-time composition by semantic leaf position,
+    /// reconstructed from `cost_log` slot lists + matching manifests.
+    Breakdown,
     /// Run-wide work-accounting invariants — `cost_log` actuals vs `request_slo`
     /// per-request expected. Tier-1, deployment-agnostic.
     Conservation,
@@ -58,6 +67,8 @@ impl Category {
             Category::Throughput => "throughput",
             Category::Utilization => "utilization",
             Category::Batch => "batch",
+            Category::Backend => "backend",
+            Category::Breakdown => "breakdown",
             Category::Conservation => "conservation",
             Category::Kv => "kv",
             Category::AlignmentIteration => "alignment-iteration",
@@ -185,6 +196,26 @@ pub const SUBJECTS: &[Subject] = &[
         scope: Scope::Run,
     },
     Subject {
+        name: "kernel-input-distribution",
+        category: Category::Backend,
+        description: "Per cost-tree position, the input feature-space distribution colored by which \
+                      backend best-of-N selected (raw axes / PCA); one scatter per position. \
+                      Unavailable on runs without per-slot backend + input logging.",
+        report_name: "kernel_input_distribution_report.json",
+        payload_name: "kernel_input_distribution_scatter.json",
+        applies: Applies::All,
+        scope: Scope::Run,
+    },
+    Subject {
+        name: "kernel-time-share",
+        category: Category::Breakdown,
+        description: "Kernel-time composition by cost-tree leaf position at overall, per-pool, and per-worker levels (exact for small runs; bounded regular sampling for large runs).",
+        report_name: "kernel_time_share_report.json",
+        payload_name: "kernel_time_share_composition.json",
+        applies: Applies::All,
+        scope: Scope::Run,
+    },
+    Subject {
         name: "workload-conservation",
         category: Category::Conservation,
         description: "Run-wide work accounting: cost_log prefill/decode/FFN/KV actuals vs \
@@ -270,6 +301,8 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
         "utilization" => utilization::series::run_utilization(ctx, dir).await,
         "batch" => batch::composition::run_batch(ctx, dir).await,
         "kernel-throughput" => batch::kernel_throughput::run_kernel_throughput(ctx, dir).await,
+        "kernel-input-distribution" => backend::kernel_input_distribution::run(ctx, dir).await,
+        "kernel-time-share" => breakdown::kernel_time_share::run(ctx, dir).await,
         "workload-conservation" => conservation::workload::run_workload(ctx, dir).await,
         "kv-occupancy" => kv::occupancy::run_kv_occupancy(ctx, dir).await,
         "alignment-iteration" => alignment_iteration::run(ctx, dir).await,

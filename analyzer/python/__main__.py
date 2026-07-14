@@ -16,7 +16,9 @@ from pathlib import Path
 from alignment_e2e import series_plot as alignment_e2e_plot
 from alignment_iteration import series_plot as alignment_iteration_plot
 from alignment_workload import series_plot as alignment_workload_plot
+from backend import kernel_input_distribution_plot
 from batch import kernel_throughput_plot, scatter_plot
+from breakdown import kernel_time_share_plot
 from conservation import workload_plot
 from kv import kv_occupancy_plot
 from request import slo_plot
@@ -32,6 +34,8 @@ RENDERERS = {
     "utilization": util_plot.render,
     "batch": scatter_plot.render,
     "kernel-throughput": kernel_throughput_plot.render,
+    "kernel-input-distribution": kernel_input_distribution_plot.render,
+    "kernel-time-share": kernel_time_share_plot.render,
     "workload-conservation": workload_plot.render,
     "kv-occupancy": kv_occupancy_plot.render,
     "alignment-iteration": alignment_iteration_plot.render,
