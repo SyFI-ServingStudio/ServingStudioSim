@@ -1,6 +1,6 @@
 ---
 name: operate-profile-existing-kernel
-description: Use when asked to list, query, count missing rows for, JIT-fill, force-refresh, or validate an existing VibeSim L1 profiler entry through `uv run python -m profiling`. Applies only to registered KernelProfilerSpec table/backend pairs and batched specs.
+description: Use when asked to list, query, count missing rows for, JIT-fill, force-refresh, validate, or run the `measure` NVML/CUPTI telemetry diagnostic for an existing VibeSim L1 profiler entry through `uv run python -m profiling`. Applies only to registered KernelProfilerSpec table/backend pairs and batched specs.
 ---
 
 # Profile Run Existing Kernel
@@ -53,6 +53,44 @@ Important semantics:
   selector. The standard CLI does not expose a `--gpus` hardware-selection flag.
 - The CLI is a wrapper over generated `perf_api` functions. Do not call runners
   or `run_profile_batch` directly for this workflow.
+- A fifth verb, `measure`, is **not** a cache operation — it is a cache-free
+  NVML/CUPTI telemetry diagnostic. See "The `measure` diagnostic" below.
+
+## The `measure` diagnostic (NVML telemetry, out of the cache path)
+
+`python -m profiling` has a fifth verb, `measure`, that the four cache verbs
+above do not cover. It is the sustained per-launch CUPTI trend + NVML telemetry
+instrument (the ~10 s window): run it to inspect power / SM-clock / mem-clock /
+util / temp / throttle drift for one kernel spec, **not** to fill or refresh
+`profile.db`.
+
+```bash
+uv run python -m profiling measure <table> --backend <backend> --spec JSON \
+  [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2] [--gpu-name NAME] [--db PATH] [--json]
+```
+
+How it differs from the cache verbs:
+
+- **Cache-free.** It never reads or writes `profile.db`; no row is stored. The
+  Validation and Required-User-Report checklists below are about DB rows and do
+  not apply — report the artifact paths and telemetry summary instead.
+- **Exactly one spec.** `measure` rejects a multi-spec batch.
+- Runs a single CUPTI window of `--duration-s` (default 10 s), records **every**
+  per-launch kernel duration, samples NVML telemetry on a background thread at
+  `--telemetry-hz` (default 20 Hz), and writes `runtimes.csv`, `telemetry.csv`,
+  `summary.json`, and two `.png` plots to `--output-dir` (default
+  `./measure_<table>_<backend>`).
+- `--no-clear-l2` switches from the default cold per-launch L2 displacement
+  (which matches the `profile.db` measurement) to a warm continuous window that
+  surfaces sustained power/clock drift.
+- Only kernels whose runner times through `Timer.cupti` are accepted; comm
+  kernels are rejected.
+
+For the full mechanism — the `Timer.cupti` two-pass timing, the `Energy.perf`
+NVML energy window that feeds the recorded `energy_j` column, and the `measure`
+output schema — see `profiling/README.md` (the `Timer.cupti` / `Energy.perf`
+paragraph and the `measure` paragraph). This skill covers running the
+diagnostic, not editing it.
 
 ## Workflow Checklist
 
