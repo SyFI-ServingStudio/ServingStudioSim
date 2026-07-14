@@ -31,6 +31,8 @@
 //!   with a `▸` gutter (and bold when colored); other rows get a blank gutter. When
 //!   colored, the timing cell is tinted by node type: non-leaf blue, leaf white.
 
+pub mod kernel_time_share;
+
 use std::fs;
 use std::ops::Range;
 use std::path::Path;
