@@ -190,7 +190,9 @@ The HTTP layer must not copy that catalog or translate tokens to UI-specific
 names. A subject is independently `pending`, `ready`, `unavailable`,
 `not_generated`, or `failed`; an optional subject failure never invalidates the
 descriptor or another subject. Only the bounded summary and topology are core
-page resources.
+page resources. The topology envelope has its own
+`TOPOLOGY_SCHEMA_VERSION`; it is not coupled to the report/payload envelope
+version.
 
 Every resource link is selected from a server-built allowlist for a resolved
 run. Request parameters are never joined directly to filesystem paths. Roots
@@ -200,6 +202,26 @@ paths. Catalog, descriptor, and immutable artifacts use `ETag` and conditional
 `304` responses so a UI can poll pending analysis without repeatedly decoding
 unchanged JSON. Errors use `application/problem+json` with a stable `code` in
 addition to human-readable detail.
+
+The default Host allowlist is limited to loopback spellings (`localhost`,
+`127.0.0.1`, and `[::1]`) as a DNS-rebinding boundary. A same-origin development
+proxy should preserve or rewrite `Host` to the loopback analyzer target. A
+non-loopback reverse-proxy hostname is accepted only when the operator repeats
+`--allow-host <hostname>` explicitly; changing `--bind` alone never expands the
+allowlist. Method rejection includes `Allow: GET`.
+
+Catalog discovery is cached for 30 seconds, refreshed by one single-flight scan
+on a blocking worker, and never runs a multi-gigabyte tree walk on an async
+request worker. Descriptor JSON has a bounded metadata-stamped cache. Artifact
+reads on Linux use `openat2(RESOLVE_BENEATH|NO_SYMLINKS)` from a stable
+configured-root descriptor over the combined root-relative run and artifact
+path, then enforce the maximum and serve from that same descriptor. Linux
+kernels without usable `openat2` support fail closed. Non-Linux builds retain
+canonical containment and therefore treat configured logs roots as a
+trusted-writer boundary. Large traces stream without a trace-sized service
+buffer; their weak ETag contains device, inode, length, mtime seconds, and mtime
+nanoseconds from the atomically published file, so conditional requests do not
+hash or scan a 512 MB file first.
 
 The full wire schema, href restrictions, cache-key rules, and analyzer-token to
 UI-domain mapping live in the consumer protocol contract at

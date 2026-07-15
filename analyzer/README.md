@@ -56,11 +56,12 @@ callers shell out):
 | `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
 | `analyze list` | Rust | Print the subject catalog. |
-| `analyze serve --logs-root <dir> [--logs-root <dir> ...] [--bind 127.0.0.1:8787]` | Rust | Recursively discover runs and expose only protocol-v1 bounded UI artifacts over a read-only, loopback-by-default HTTP API. |
+| `analyze serve --logs-root <dir> [--logs-root <dir> ...] [--bind 127.0.0.1:8787] [--allow-host <hostname> ...]` | Rust | Recursively discover runs and expose only protocol-v1 bounded UI artifacts over a read-only, loopback-by-default HTTP API. Non-loopback proxy hosts require an explicit allowlist entry. |
 | `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNG plots, including sampled alignment breakdowns. No subjects = all renderers. |
 
-The **launcher** is the primary caller: `launcher.exec.run_analysis` runs the
-Rust `analyze run` then the Python `render` after each successful sim run;
+The **launcher** is the primary caller: `launcher.exec.run_analysis` publishes
+one atomically versioned generation around Rust `analyze run`, Python `render`,
+and Rust `analyze trace` after each successful sim run;
 `run_alignment_analysis` computes and renders the subjects enabled by the
 separate analyze phase config. Both execution paths are
 **best-effort** — a missing analyzer binary, failed handoff, or failed subject
@@ -101,10 +102,11 @@ rust/                The `analyze` binary (DataFusion compute side).
                        dispatch + `select` (applicability gate). Adding a metric
                        touches only this file + a module under src/<category>/.
   src/io.rs            Artifact paths, `SCHEMA_VERSION`, read_deployment/run_meta.
-  src/ui_service.rs    Read-only `/api/v1` run catalog/descriptor and bounded
-                       summary/topology/subject/Perfetto artifact service. It
-                       resolves opaque run ids before selecting registry-owned
-                       resources and never exposes parquet or arbitrary paths.
+  src/ui_service/      Read-only `/api/v1` service split by protocol/router,
+                       discovery/cache, safe artifact reads, and lifecycle /
+                       descriptor assembly. It resolves opaque run ids before
+                       selecting registry-owned resources and never exposes
+                       parquet or arbitrary paths.
   src/session.rs       DataFusion session, parquet registration, Arrow→Vec
                        extraction, and `require_columns` (the schema drift guard).
   src/cdf.rs           Shared numeric kernels: percentile, CDF downsample, and the
@@ -165,10 +167,42 @@ unreachable. Canonical containment checks also reject symlink escapes. Successfu
 resources include `ETag`; conditional `If-None-Match` reads return `304`, while
 errors use `application/problem+json` with a stable `code`.
 
+The launcher publishes `reports/analyzer_pipeline_state.json` before compute
+and after each compute/render/trace transition. A new generation is visible as
+`pending` immediately. Requested JSON subjects become current only after the
+matching generation's compute timing records them; old or unrequested pairs
+remain hidden. The total state becomes `complete` only after trace reaches a
+terminal state. Optional render/trace failure keeps its resource failed without
+hiding valid JSON, while compute failure makes the total pipeline failed. The
+state binds the exact trace path and real producer version/revision/binary digest;
+a per-run lease prevents overlapping generations. Legacy runs without the
+sidecar use bounded artifact inspection, stable content-derived revisions, and
+producer identity `legacy-unknown`.
+
+Analyzer JSON and trace files are written by durable same-directory atomic
+replacement. On Linux the service opens root-and-run-relative artifacts from a
+stable configured-root descriptor with
+`openat2(RESOLVE_BENEATH|NO_SYMLINKS)`, bounds and serves the same descriptor,
+and streams large traces instead of allocating a trace-sized response buffer.
+Linux kernels without usable `openat2` support fail closed. Trace conditional
+requests use a weak device/inode/length/mtime/mtime-nanoseconds ETag, so `304`
+does not require a full-file hash; non-Linux logs roots are a trusted-writer
+boundary.
+Catalog scans use a
+30-second single-flight cache on a blocking worker; descriptor parsing uses a
+bounded metadata-stamped cache.
+
 The API intentionally emits no permissive CORS policy. The visualization UI
 must reach it through a same-origin `/api` proxy (the Vite development server
 uses this shape too); a random browser origin must not be able to read local run
 artifacts merely because the analyzer listener is on loopback.
+
+Requests also pass a Host allowlist. By default only `localhost`, `127.0.0.1`,
+and `[::1]` are accepted. Configure Vite's proxy target as the loopback analyzer
+address (with `changeOrigin: true`), or preserve an equivalent loopback Host.
+For a trusted non-loopback reverse-proxy name, add one explicit
+`--allow-host ui.example.internal` per hostname. `--bind 0.0.0.0:8787` does not
+implicitly trust arbitrary Host headers.
 
 ## Subjects (the unit of analysis)
 

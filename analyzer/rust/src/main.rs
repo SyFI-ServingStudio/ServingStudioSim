@@ -45,7 +45,11 @@ use io::{payload_path, read_deployment, report_path, write_json, SCHEMA_VERSION}
 use session::build_session;
 
 #[derive(Parser, Debug)]
-#[command(name = "analyze", about = "VibeSim post-run artifact analyzer")]
+#[command(
+    name = "analyze",
+    version,
+    about = "VibeSim post-run artifact analyzer"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -59,6 +63,10 @@ enum Command {
         /// Run directory (holds `raw/*.parquet`); outputs land in its `reports/`
         /// and `payloads/` subdirs.
         log_dir: PathBuf,
+        /// Opaque launcher generation written into analyzer_timing.json. UI
+        /// readers use it to reject artifacts left by an older generation.
+        #[arg(long)]
+        generation_id: Option<String>,
         /// Subject names to run (e.g. `slo`); empty = all applicable.
         subjects: Vec<String>,
     },
@@ -81,6 +89,10 @@ enum Command {
         /// an explicit operator choice.
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: SocketAddr,
+        /// Trusted HTTP Host name accepted by the artifact service. Loopback
+        /// spellings are always allowed; repeat for an explicit reverse proxy.
+        #[arg(long = "allow-host", value_name = "HOST")]
+        allow_hosts: Vec<String>,
     },
     /// Export a Perfetto per-kernel timeline (`traces/<prefix>.pftrace.gz`).
     /// Samples `regions` evenly-spaced contiguous windows of `region_ms` each
@@ -134,8 +146,16 @@ async fn main() -> Result<()> {
             print!("{}", registry::help());
             Ok(())
         }
-        Command::Serve { logs_roots, bind } => ui_service::serve(logs_roots, bind).await,
-        Command::Run { log_dir, subjects } => run(log_dir, subjects).await,
+        Command::Serve {
+            logs_roots,
+            bind,
+            allow_hosts,
+        } => ui_service::serve(logs_roots, bind, allow_hosts).await,
+        Command::Run {
+            log_dir,
+            generation_id,
+            subjects,
+        } => run(log_dir, subjects, generation_id).await,
         Command::Alignment {
             analysis_log_dir,
             subjects,
@@ -187,11 +207,12 @@ async fn alignment(analysis_log_dir: PathBuf, subjects: Vec<String>) -> Result<(
         subjects,
         None,
         registry::Scope::Alignment,
+        None,
     )
     .await
 }
 
-async fn run(log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
+async fn run(log_dir: PathBuf, subjects: Vec<String>, generation_id: Option<String>) -> Result<()> {
     let ctx = build_session();
     let deployment = read_deployment(&log_dir);
 
@@ -201,7 +222,15 @@ async fn run(log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
     // avoids redundant metadata opens.)
     let _ = session::register_cost_log(&ctx, &log_dir).await;
 
-    run_subjects(ctx, log_dir, subjects, deployment, registry::Scope::Run).await
+    run_subjects(
+        ctx,
+        log_dir,
+        subjects,
+        deployment,
+        registry::Scope::Run,
+        generation_id,
+    )
+    .await
 }
 
 async fn run_subjects(
@@ -210,6 +239,7 @@ async fn run_subjects(
     subjects: Vec<String>,
     deployment: Option<String>,
     scope: registry::Scope,
+    generation_id: Option<String>,
 ) -> Result<()> {
     // Best-effort AND concurrent: each subject is an independent read over the shared
     // read-only ctx (SessionContext is Send+Sync+Clone) that writes its own files, so
@@ -272,6 +302,7 @@ async fn run_subjects(
         "schema_version": SCHEMA_VERSION,
         "log_dir": log_dir.display().to_string(),
         "deployment": deployment,
+        "generation_id": generation_id,
         "subjects": subject_runs,
         "total_elapsed_ms": run_start.elapsed().as_secs_f64() * 1e3,
     });

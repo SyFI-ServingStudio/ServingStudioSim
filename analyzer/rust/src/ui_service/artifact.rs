@@ -1,0 +1,441 @@
+//! Containment-checked bounded artifact reads and conditional responses.
+
+use super::*;
+
+/// Open one run-relative artifact without permitting a symlink traversal.
+/// Linux uses `openat2(RESOLVE_BENEATH|NO_SYMLINKS)` from the stable configured
+/// root descriptor, so run containment and open are one kernel operation;
+/// metadata, reads, and streaming reuse the resulting artifact descriptor.
+/// The portable fallback retains canonical containment for non-Linux builds,
+/// where configured logs roots remain a trusted-writer boundary.
+pub(super) fn open_contained_artifact(
+    run: &RunRecord,
+    relative: &Path,
+    resource: &str,
+) -> Result<(fs::File, PathBuf), ApiProblem> {
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ApiProblem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_resource_path",
+            "Invalid resource path",
+            "The server-built artifact path is not a normalized relative path.",
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+        use rustix::io::Errno;
+
+        let run_relative = run.path.strip_prefix(&run.root).map_err(|_| {
+            ApiProblem::new(
+                StatusCode::FORBIDDEN,
+                "artifact_outside_run",
+                "Artifact escaped its run",
+                "The resolved run is not relative to its configured logs root.",
+            )
+        })?;
+        if run_relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(ApiProblem::new(
+                StatusCode::FORBIDDEN,
+                "artifact_outside_run",
+                "Artifact escaped its run",
+                "The resolved run path is not normalized beneath its logs root.",
+            ));
+        }
+        let root_relative = run_relative.join(relative);
+        let descriptor = openat2(
+            &*run.root_directory,
+            &root_relative,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
+        )
+        .map_err(|error| match error {
+            Errno::NOENT | Errno::NOTDIR => ApiProblem::artifact_missing(resource),
+            Errno::LOOP | Errno::XDEV => ApiProblem::new(
+                StatusCode::FORBIDDEN,
+                "artifact_outside_run",
+                "Artifact escaped its run",
+                format!("The bounded {resource} artifact traverses a forbidden symlink."),
+            ),
+            // ENOSYS/EINVAL includes kernels without usable openat2 support.
+            // Linux deliberately fails closed instead of weakening containment.
+            _ => ApiProblem::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "Artifact read failed",
+                format!("Cannot securely open the bounded {resource}: {error}"),
+            ),
+        })?;
+        let file = fs::File::from(descriptor);
+        if !file
+            .metadata()
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+        {
+            return Err(ApiProblem::artifact_missing(resource));
+        }
+        Ok((file, run.path.join(relative)))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let path = resolve_contained_file(&run.root, &run.path, relative, resource)?;
+        let file = fs::File::open(&path).map_err(|error| {
+            ApiProblem::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "Artifact read failed",
+                format!("Cannot open the bounded {resource}: {error}"),
+            )
+        })?;
+        Ok((file, path))
+    }
+}
+
+pub(super) fn resolve_contained_file(
+    root: &Path,
+    run: &Path,
+    relative: &Path,
+    resource: &str,
+) -> Result<PathBuf, ApiProblem> {
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ApiProblem::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_resource_path",
+            "Invalid resource path",
+            "The server-built artifact path is not a normalized relative path.",
+        ));
+    }
+    let candidate = run.join(relative);
+    let canonical = match candidate.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err(ApiProblem::artifact_missing(resource))
+        }
+        Err(error) => {
+            return Err(ApiProblem::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "Artifact read failed",
+                format!("Cannot resolve the bounded {resource} artifact: {error}"),
+            ))
+        }
+    };
+    if !canonical.starts_with(root) || !canonical.starts_with(run) {
+        return Err(ApiProblem::new(
+            StatusCode::FORBIDDEN,
+            "artifact_outside_run",
+            "Artifact escaped its run",
+            format!("The bounded {resource} artifact resolves outside its canonical run."),
+        ));
+    }
+    if !canonical.is_file() {
+        return Err(ApiProblem::artifact_missing(resource));
+    }
+    Ok(canonical)
+}
+
+pub(super) fn read_json_value(
+    run: &RunRecord,
+    relative: &Path,
+    resource: &str,
+) -> Result<Value, ApiProblem> {
+    let bytes = read_json_artifact(run, relative, resource)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| ApiProblem::artifact_incompatible(resource, error.to_string()))
+}
+
+pub(super) fn read_json_value_optional(run: &RunRecord, relative: &Path) -> Option<Value> {
+    read_json_value(run, relative, "optional run metadata").ok()
+}
+
+pub(super) fn read_json_artifact(
+    run: &RunRecord,
+    relative: &Path,
+    resource: &str,
+) -> Result<Vec<u8>, ApiProblem> {
+    let (bytes, _) = read_bounded_artifact(run, relative, MAX_JSON_BYTES, resource)?;
+    serde_json::from_slice::<Value>(&bytes)
+        .map_err(|error| ApiProblem::artifact_incompatible(resource, error.to_string()))?;
+    Ok(bytes)
+}
+
+pub(super) fn read_bounded_artifact(
+    run: &RunRecord,
+    relative: &Path,
+    maximum: u64,
+    resource: &str,
+) -> Result<(Vec<u8>, SystemTime), ApiProblem> {
+    let (file, _) = open_contained_artifact(run, relative, resource)?;
+    read_bounded_open_file(file, maximum, resource)
+}
+
+fn read_bounded_open_file(
+    file: fs::File,
+    maximum: u64,
+    resource: &str,
+) -> Result<(Vec<u8>, SystemTime), ApiProblem> {
+    let metadata = file.metadata().map_err(|error| {
+        ApiProblem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact_read_failed",
+            "Artifact read failed",
+            format!("Cannot inspect the opened bounded {resource}: {error}"),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(ApiProblem::artifact_missing(resource));
+    }
+    if metadata.len() > maximum {
+        return Err(ApiProblem::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "artifact_too_large",
+            "Artifact is too large",
+            format!("The bounded {resource} exceeds the service safety limit."),
+        ));
+    }
+    let initial_capacity = usize::try_from(metadata.len().min(1024 * 1024)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    file.take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ApiProblem::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "Artifact read failed",
+                format!("Cannot read the bounded {resource}: {error}"),
+            )
+        })?;
+    if bytes.len() as u64 > maximum {
+        return Err(ApiProblem::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "artifact_too_large",
+            "Artifact is too large",
+            format!("The bounded {resource} exceeds the service safety limit."),
+        ));
+    }
+    Ok((bytes, metadata.modified().unwrap_or(UNIX_EPOCH)))
+}
+
+pub(super) fn json_response<T: Serialize>(
+    headers: &HeaderMap,
+    value: &T,
+) -> Result<Response, ApiProblem> {
+    conditional_bytes(headers, "application/json", encode_json(value)?)
+}
+
+pub(super) fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ApiProblem> {
+    serde_json::to_vec(value).map_err(|error| {
+        ApiProblem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response_encoding_failed",
+            "Response encoding failed",
+            error.to_string(),
+        )
+    })
+}
+
+pub(super) fn conditional_bytes(
+    headers: &HeaderMap,
+    content_type: &'static str,
+    bytes: Vec<u8>,
+) -> Result<Response, ApiProblem> {
+    let etag = format!("\"sha256-{}\"", hex(&Sha256::digest(&bytes)));
+    if if_none_match(headers, &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::empty())
+            .map_err(response_build_problem);
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(bytes))
+        .map_err(response_build_problem)
+}
+
+struct PreparedTrace {
+    file: fs::File,
+    byte_length: u64,
+    etag: String,
+}
+
+pub(super) async fn conditional_trace(
+    headers: &HeaderMap,
+    content_type: &'static str,
+    run: RunRecord,
+    path: PathBuf,
+) -> Result<Response, ApiProblem> {
+    let prepared = tokio::task::spawn_blocking(move || prepare_trace(&run, path))
+        .await
+        .map_err(|error| {
+            ApiProblem::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "Artifact read failed",
+                format!("Perfetto trace reader task failed: {error}"),
+            )
+        })??;
+    if if_none_match(headers, &prepared.etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, prepared.etag)
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::empty())
+            .map_err(response_build_problem);
+    }
+
+    let stream =
+        ReaderStream::new(tokio::fs::File::from_std(prepared.file).take(prepared.byte_length));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, prepared.byte_length)
+        .header(header::ETAG, prepared.etag)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .map_err(response_build_problem)
+}
+
+fn prepare_trace(run: &RunRecord, path: PathBuf) -> Result<PreparedTrace, ApiProblem> {
+    let relative = path.strip_prefix(&run.path).map_err(|_| {
+        ApiProblem::new(
+            StatusCode::FORBIDDEN,
+            "artifact_outside_run",
+            "Artifact escaped its run",
+            "The selected Perfetto trace is not relative to its resolved run.",
+        )
+    })?;
+    let (mut file, _) = open_contained_artifact(run, relative, "Perfetto trace")?;
+    let metadata = file.metadata().map_err(|error| {
+        ApiProblem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact_read_failed",
+            "Artifact read failed",
+            format!("Cannot inspect the opened bounded Perfetto trace: {error}"),
+        )
+    })?;
+    if metadata.len() > MAX_TRACE_BYTES {
+        return Err(ApiProblem::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "artifact_too_large",
+            "Artifact is too large",
+            "The bounded Perfetto trace exceeds the service safety limit.",
+        ));
+    }
+
+    // fstat is the cheap early bound. A one-byte probe at max catches growth
+    // between open and fstat without hashing/scanning the representation.
+    file.seek(SeekFrom::Start(MAX_TRACE_BYTES))
+        .and_then(|_| {
+            let mut overflow = [0u8; 1];
+            file.read(&mut overflow)
+        })
+        .map_err(|error| {
+            ApiProblem::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "Artifact read failed",
+                format!("Cannot enforce the Perfetto trace hard limit: {error}"),
+            )
+        })?
+        .eq(&0)
+        .then_some(())
+        .ok_or_else(|| {
+            ApiProblem::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "artifact_too_large",
+                "Artifact is too large",
+                "The bounded Perfetto trace exceeds the service safety limit.",
+            )
+        })?;
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        ApiProblem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact_read_failed",
+            "Artifact read failed",
+            format!("Cannot rewind the bounded Perfetto trace: {error}"),
+        )
+    })?;
+
+    Ok(PreparedTrace {
+        file,
+        byte_length: metadata.len(),
+        etag: trace_metadata_etag(&metadata),
+    })
+}
+
+fn trace_metadata_etag(metadata: &fs::Metadata) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        format!(
+            "W/\"trace-v1-{:x}-{:x}-{:x}-{:x}-{:x}\"",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec()
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata
+            .modified()
+            .unwrap_or(UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("W/\"trace-v1-{:x}-{modified:x}\"", metadata.len())
+    }
+}
+
+pub(super) fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|candidate| {
+            candidate == "*" || candidate.trim_start_matches("W/") == etag.trim_start_matches("W/")
+        })
+}
+
+pub(super) fn response_build_problem(error: axum::http::Error) -> ApiProblem {
+    ApiProblem::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "response_build_failed",
+        "Response build failed",
+        error.to_string(),
+    )
+}
+
+pub(super) fn timestamp(time: SystemTime) -> String {
+    DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+pub(super) fn hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}

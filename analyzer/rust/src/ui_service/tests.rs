@@ -1,0 +1,912 @@
+use super::*;
+
+use std::fs;
+
+use axum::body::{to_bytes, Body};
+use axum::http::{header, Request, StatusCode};
+use serde_json::{json, Value};
+use tempfile::TempDir;
+use tower::ServiceExt;
+
+fn write_json(path: &Path, value: &Value) {
+    fs::create_dir_all(path.parent().expect("test artifact has parent")).unwrap();
+    fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+}
+
+fn params(deployment: &str) -> Value {
+    let roles: &[&str] = match deployment {
+        "unified" => &["main"],
+        "pd" => &["prefill", "decode"],
+        "afd" => &["attn", "ffn"],
+        other => panic!("unsupported test deployment {other}"),
+    };
+    let pools = roles
+        .iter()
+        .map(|role| {
+            (
+                (*role).to_string(),
+                json!({
+                    "placement": "least-queued",
+                    "groups": [{
+                        "gpu": "NVIDIA H200",
+                        "replicas": 1,
+                        "arch": {
+                            "type": "test",
+                            "model_config": "model/test.json",
+                            "fp8": false
+                        },
+                        "worker": {"type": "test"}
+                    }]
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({"deployment": deployment, "pools": pools})
+}
+
+fn run_meta(deployment: &str) -> Value {
+    let roles = pool_roles(deployment).unwrap();
+    let gpus = roles
+        .iter()
+        .enumerate()
+        .map(|(pool, _)| json!({"id": pool, "name": "NVIDIA H200", "pool": pool, "worker_id": 0}))
+        .collect::<Vec<_>>();
+    let workers = roles
+        .iter()
+        .enumerate()
+        .map(|(pool, role)| {
+            json!({
+                "worker_id": 0,
+                "pool": pool,
+                "pool_tag": role,
+                "gpu_ids": [pool],
+                "kv_pools": []
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": 3,
+        "num_gpus": roles.len(),
+        "gpus": gpus,
+        "workers": workers,
+        "comm_groups": []
+    })
+}
+
+fn create_run(root: &Path, relative: &str, deployment: &str, complete: bool) -> PathBuf {
+    let run = root.join(relative);
+    write_json(&run.join("raw/params.json"), &params(deployment));
+    write_json(&run.join("raw/run_meta.json"), &run_meta(deployment));
+    write_json(
+        &run.join("summary.json"),
+        &json!({"total_tok_s": 1.0, "num_gpus": pool_roles(deployment).unwrap().len(), "requests_finished": 1}),
+    );
+    if complete {
+        fs::write(run.join(".complete"), b"").unwrap();
+    }
+    run
+}
+
+fn write_subject(run: &Path, subject_name: &str, available: bool, reason: Option<&str>) {
+    let subject = SUBJECTS
+        .iter()
+        .find(|subject| subject.name == subject_name)
+        .unwrap();
+    let mut report = json!({"schema_version": 1, "available": available});
+    let mut payload = json!({"schema_version": 1, "meta": {"available": available}});
+    if let Some(reason) = reason {
+        report["reason"] = Value::String(reason.to_string());
+        payload["meta"]["reason"] = Value::String(reason.to_string());
+    }
+    write_json(&run.join("reports").join(subject.report_name), &report);
+    write_json(&run.join("payloads").join(subject.payload_name), &payload);
+}
+
+fn write_timing(run: &Path, statuses: &[(&str, &str)]) {
+    write_timing_generation(run, statuses, None);
+}
+
+fn write_timing_generation(run: &Path, statuses: &[(&str, &str)], generation_id: Option<&str>) {
+    write_json(
+        &run.join("reports/analyzer_timing.json"),
+        &json!({
+            "schema_version": 1,
+            "generation_id": generation_id,
+            "subjects": statuses.iter().map(|(name, status)| json!({"name": name, "status": status})).collect::<Vec<_>>()
+        }),
+    );
+}
+
+fn write_pipeline(
+    run: &Path,
+    generation_id: &str,
+    status: &str,
+    compute: &str,
+    render: &str,
+    trace: &str,
+    requested_subjects: Option<&[&str]>,
+    trace_artifact: Option<&str>,
+) {
+    let stage = |stage_name: &str, stage_status: &str, artifact: Option<&str>| {
+        let code = (stage_status == "failed").then(|| format!("{stage_name}_failed"));
+        json!({
+            "status": stage_status,
+            "updated_at": "2026-07-15T00:00:00.000Z",
+            "code": code,
+            "artifact": artifact,
+        })
+    };
+    write_json(
+        &run.join(PIPELINE_STATE_PATH),
+        &json!({
+            "schema_version": 1,
+            "generation_id": generation_id,
+            "artifact_revision": format!("pipeline-{generation_id}"),
+            "status": status,
+            "started_at": "2026-07-15T00:00:00.000Z",
+            "updated_at": "2026-07-15T00:00:01.000Z",
+            "completed_at": matches!(status, "complete" | "failed").then_some("2026-07-15T00:00:01.000Z"),
+            "producer": {
+                "name": "vibesim-analyzer",
+                "version": "0.1.0",
+                "revision": "a".repeat(40),
+                "binary_sha256": format!("sha256:{}", "b".repeat(64)),
+            },
+            "requested_subjects": requested_subjects,
+            "stages": {
+                "compute": stage("compute", compute, None),
+                "render": stage("render", render, None),
+                "trace": stage("trace", trace, trace_artifact),
+            },
+        }),
+    );
+}
+
+fn state(root: &TempDir) -> ServiceState {
+    ServiceState {
+        roots: configure_roots(vec![root.path().to_path_buf()]).unwrap(),
+        discovery: RwLock::new(DiscoveryCache::default()),
+        discovery_refresh: AsyncMutex::new(()),
+        descriptors: RwLock::new(HashMap::new()),
+        allowed_hosts: configure_allowed_hosts(Vec::new()).unwrap(),
+    }
+}
+
+async fn body_json(response: Response) -> Value {
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[test]
+fn nested_duplicate_basenames_have_stable_distinct_ids() {
+    let root = TempDir::new().unwrap();
+    create_run(root.path(), "sweep-a/simulation", "unified", true);
+    create_run(root.path(), "sweep-b/simulation", "unified", true);
+    // A cache-build copy has a params sidecar too, but is not a public run.
+    create_run(root.path(), ".cache_build/simulation", "unified", true);
+    let state = state(&root);
+
+    let first = discover_runs(&state).unwrap();
+    let second = discover_runs(&state).unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(
+        first.iter().map(|run| &run.run_id).collect::<Vec<_>>(),
+        second.iter().map(|run| &run.run_id).collect::<Vec<_>>()
+    );
+    assert_ne!(first[0].run_id, first[1].run_id);
+    let labels = first
+        .iter()
+        .map(|run| run.display_name.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        labels,
+        HashSet::from(["sweep-a/simulation", "sweep-b/simulation"])
+    );
+    assert!(first.iter().all(|run| run.run_id.starts_with("r_")));
+    assert!(first.iter().all(|run| !run.run_id.contains("simulation")));
+}
+
+#[test]
+fn repeated_logs_roots_keep_identical_relative_paths_distinct() {
+    let first_root = TempDir::new().unwrap();
+    let second_root = TempDir::new().unwrap();
+    create_run(first_root.path(), "simulation", "unified", true);
+    create_run(second_root.path(), "simulation", "unified", true);
+    let state = ServiceState {
+        roots: configure_roots(vec![
+            first_root.path().to_path_buf(),
+            second_root.path().to_path_buf(),
+        ])
+        .unwrap(),
+        discovery: RwLock::new(DiscoveryCache::default()),
+        discovery_refresh: AsyncMutex::new(()),
+        descriptors: RwLock::new(HashMap::new()),
+        allowed_hosts: configure_allowed_hosts(Vec::new()).unwrap(),
+    };
+
+    let runs = discover_runs(&state).unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(
+        runs.iter()
+            .map(|run| run.display_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["simulation", "simulation"]
+    );
+    assert_ne!(runs[0].run_id, runs[1].run_id);
+}
+
+#[test]
+fn pd_descriptor_preserves_deployment_and_composite_workers() {
+    let root = TempDir::new().unwrap();
+    create_run(root.path(), "pd-run", "pd", true);
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+
+    let descriptor = build_descriptor(&record).unwrap();
+    assert_eq!(descriptor.deployment, "pd");
+    assert_eq!(descriptor.topology.href, "topology");
+    assert_eq!(descriptor.topology.schema_version, Some(1));
+    assert_eq!(
+        descriptor.workers.unwrap(),
+        vec![
+            WorkerRef {
+                pool_tag: "prefill".to_string(),
+                worker_id: 0,
+            },
+            WorkerRef {
+                pool_tag: "decode".to_string(),
+                worker_id: 0,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn registry_is_the_only_report_payload_allowlist() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing(&run, &[("slo-general", "ok")]);
+    let state = state(&root);
+    let run_id = discover_runs(&state).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let ready = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/reports/slo-general"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+
+    for path in [
+        format!("/api/v1/runs/{run_id}/reports/not-in-registry"),
+        format!("/api/v1/runs/{run_id}/raw/params.json"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        assert_eq!(body_json(response).await["code"], "resource_not_found");
+    }
+}
+
+#[tokio::test]
+async fn summary_is_passed_through_without_rewriting_its_shape_or_bytes() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    let original = b"{\n  \"future_summary_field\": [3, 2, 1],\n  \"total_tok_s\": 7.5\n}\n";
+    fs::write(run.join("summary.json"), original).unwrap();
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/summary"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(bytes.as_ref(), original);
+}
+
+#[tokio::test]
+async fn unknown_run_is_a_structured_problem() {
+    let root = TempDir::new().unwrap();
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs/r_unknown/descriptor")
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(response).await["code"], "run_not_found");
+}
+
+#[tokio::test]
+async fn api_is_same_origin_only_and_rejects_noncanonical_paths_and_writes() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing(&run, &[("slo-general", "ok")]);
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let rejected_host = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs")
+                .header(header::HOST, "attacker.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected_host.status(), StatusCode::MISDIRECTED_REQUEST);
+    assert_eq!(body_json(rejected_host).await["code"], "host_not_allowed");
+
+    let catalog = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs")
+                .header(header::HOST, "localhost")
+                .header(header::ORIGIN, "https://untrusted.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog.status(), StatusCode::OK);
+    assert!(!catalog
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+
+    let encoded = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/reports/%73lo-general"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(encoded.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(encoded).await["code"], "invalid_resource_path");
+
+    let write_attempt = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/runs")
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write_attempt.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(write_attempt.headers()[header::ALLOW], "GET");
+    assert_eq!(body_json(write_attempt).await["code"], "method_not_allowed");
+}
+
+#[tokio::test]
+async fn explicitly_configured_proxy_host_is_accepted() {
+    let root = TempDir::new().unwrap();
+    create_run(root.path(), "run", "unified", true);
+    let app = router_with_hosts(
+        vec![root.path().to_path_buf()],
+        vec!["ui.internal".to_string()],
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs")
+                .header(header::HOST, "UI.INTERNAL:5177")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_escape_is_rejected_after_run_resolution() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    let outside_summary = outside.path().join("summary.json");
+    write_json(&outside_summary, &json!({"secret": true}));
+    fs::remove_file(run.join("summary.json")).unwrap();
+    symlink(outside_summary, run.join("summary.json")).unwrap();
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/summary"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "artifact_outside_run");
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_a_discovered_run_with_a_symlink_cannot_escape_the_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_json(
+        &outside.path().join("summary.json"),
+        &json!({"secret": true}),
+    );
+    let discovered = discover_runs(&state(&root)).unwrap().remove(0);
+
+    fs::rename(&run, root.path().join("discovered-run-moved")).unwrap();
+    symlink(outside.path(), &run).unwrap();
+
+    let problem = open_contained_artifact(&discovered, Path::new("summary.json"), "summary")
+        .expect_err("replacement symlink must not escape the configured root");
+    assert_eq!(problem.status, StatusCode::FORBIDDEN);
+    assert_eq!(problem.code, "artifact_outside_run");
+}
+
+#[tokio::test]
+async fn catalog_descriptor_and_artifact_honor_etag() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing(&run, &[("slo-general", "ok")]);
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    for uri in [
+        "/api/v1/runs".to_string(),
+        format!("/api/v1/runs/{run_id}/descriptor"),
+        format!("/api/v1/runs/{run_id}/payloads/slo-general"),
+    ] {
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first.headers()[header::ETAG].clone();
+        let conditional = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(header::HOST, "localhost")
+                    .header(header::IF_NONE_MATCH, etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED, "{uri}");
+        assert!(to_bytes(conditional.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+fn descriptor_reports_subject_states_independently() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_subject(
+        &run,
+        "slo-detailed",
+        false,
+        Some("output token times were not logged"),
+    );
+    write_timing(
+        &run,
+        &[
+            ("slo-general", "ok"),
+            ("slo-detailed", "ok"),
+            ("throughput", "failed"),
+        ],
+    );
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let descriptor = build_descriptor(&record).unwrap();
+
+    assert!(matches!(
+        descriptor.subjects["slo-general"],
+        SubjectState::Ready { .. }
+    ));
+    assert!(matches!(
+        descriptor.subjects["slo-detailed"],
+        SubjectState::Unavailable { .. }
+    ));
+    assert!(matches!(
+        descriptor.subjects["throughput"],
+        SubjectState::Failed { .. }
+    ));
+    assert!(matches!(
+        descriptor.subjects["batch"],
+        SubjectState::NotGenerated { .. }
+    ));
+    assert_eq!(descriptor.lifecycle.analysis, StageStatus::Complete);
+    assert!(descriptor.analysis.is_some());
+}
+
+#[test]
+fn unfinished_run_marks_missing_subjects_pending() {
+    let root = TempDir::new().unwrap();
+    create_run(root.path(), "run", "unified", false);
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let descriptor = build_descriptor(&record).unwrap();
+    assert_eq!(descriptor.lifecycle.simulation, StageStatus::Pending);
+    assert!(matches!(
+        descriptor.subjects["slo-general"],
+        SubjectState::Pending { .. }
+    ));
+}
+
+#[test]
+fn completed_legacy_run_does_not_call_missing_subjects_pending() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let descriptor = build_descriptor(&record).unwrap();
+
+    assert_eq!(descriptor.lifecycle.analysis, StageStatus::NotStarted);
+    assert!(matches!(
+        descriptor.subjects["slo-general"],
+        SubjectState::Ready { .. }
+    ));
+    assert!(matches!(
+        descriptor.subjects["throughput"],
+        SubjectState::NotGenerated { .. }
+    ));
+    let identity = descriptor
+        .analysis
+        .expect("ready legacy artifact has identity");
+    assert_eq!(identity.generator_version, LEGACY_GENERATOR_VERSION);
+    let rebuilt = build_descriptor(&record).unwrap().analysis.unwrap();
+    assert_eq!(identity.revision, rebuilt.revision);
+}
+
+#[test]
+fn pending_generation_hides_legacy_subject_and_trace_files() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing(&run, &[("slo-general", "ok")]);
+    fs::create_dir_all(run.join("traces")).unwrap();
+    fs::write(run.join("traces/old.pftrace.gz"), b"old trace").unwrap();
+    write_pipeline(
+        &run,
+        "generation-new",
+        "pending",
+        "pending",
+        "not_started",
+        "not_started",
+        Some(&["slo-general"]),
+        None,
+    );
+
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let descriptor = build_descriptor(&record).unwrap();
+    assert_eq!(descriptor.lifecycle.analysis, StageStatus::Pending);
+    assert!(matches!(
+        descriptor.subjects["slo-general"],
+        SubjectState::Pending { .. }
+    ));
+    assert!(matches!(
+        descriptor.subjects["throughput"],
+        SubjectState::NotGenerated { .. }
+    ));
+    assert!(matches!(
+        descriptor.traces["perfetto"],
+        TraceState::Pending { .. }
+    ));
+    assert!(descriptor.analysis.is_none());
+}
+
+#[test]
+fn compute_generation_and_requested_subjects_gate_current_ready_files() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_subject(&run, "throughput", true, None);
+    write_timing_generation(&run, &[("slo-general", "ok")], Some("generation-current"));
+    write_pipeline(
+        &run,
+        "generation-current",
+        "pending",
+        "complete",
+        "pending",
+        "not_started",
+        Some(&["slo-general"]),
+        None,
+    );
+
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let descriptor = build_descriptor(&record).unwrap();
+    assert_eq!(descriptor.lifecycle.analysis, StageStatus::Pending);
+    assert!(matches!(
+        descriptor.subjects["slo-general"],
+        SubjectState::Ready { .. }
+    ));
+    assert!(matches!(
+        descriptor.subjects["throughput"],
+        SubjectState::NotGenerated { .. }
+    ));
+    let identity = descriptor.analysis.expect("compute identity");
+    assert_eq!(identity.revision, "pipeline-generation-current");
+    assert_ne!(identity.generator_version, LEGACY_GENERATOR_VERSION);
+}
+
+#[test]
+fn complete_pipeline_preserves_json_when_trace_stage_failed() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing_generation(
+        &run,
+        &[("slo-general", "ok")],
+        Some("generation-trace-failed"),
+    );
+    write_pipeline(
+        &run,
+        "generation-trace-failed",
+        "complete",
+        "complete",
+        "complete",
+        "failed",
+        Some(&["slo-general"]),
+        None,
+    );
+
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let descriptor = build_descriptor(&record).unwrap();
+    assert_eq!(descriptor.lifecycle.analysis, StageStatus::Complete);
+    assert!(matches!(
+        descriptor.subjects["slo-general"],
+        SubjectState::Ready { .. }
+    ));
+    assert!(matches!(
+        &descriptor.traces["perfetto"],
+        TraceState::Failed { code, .. } if code == "trace_failed"
+    ));
+}
+
+#[test]
+fn generation_mismatch_never_revives_old_ready_files() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing_generation(&run, &[("slo-general", "ok")], Some("generation-old"));
+    fs::create_dir_all(run.join("traces")).unwrap();
+    fs::write(run.join("traces/current.pftrace.gz"), b"trace").unwrap();
+    write_pipeline(
+        &run,
+        "generation-new",
+        "complete",
+        "complete",
+        "complete",
+        "complete",
+        Some(&["slo-general"]),
+        Some("traces/current.pftrace.gz"),
+    );
+
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let descriptor = build_descriptor(&record).unwrap();
+    assert_eq!(descriptor.lifecycle.analysis, StageStatus::Failed);
+    assert!(matches!(
+        &descriptor.subjects["slo-general"],
+        SubjectState::Failed { code, .. } if code == "analysis_generation_mismatch"
+    ));
+    assert!(matches!(
+        &descriptor.traces["perfetto"],
+        TraceState::Failed { code, .. } if code == "analysis_generation_mismatch"
+    ));
+    assert!(descriptor.analysis.is_none());
+}
+
+#[test]
+fn incompatible_pipeline_state_never_falls_back_to_legacy_artifacts() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing(&run, &[("slo-general", "ok")]);
+    write_json(
+        &run.join(PIPELINE_STATE_PATH),
+        &json!({"schema_version": 99, "status": "complete"}),
+    );
+
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let descriptor = build_descriptor(&record).unwrap();
+    assert_eq!(descriptor.lifecycle.analysis, StageStatus::Failed);
+    assert!(matches!(
+        &descriptor.subjects["slo-general"],
+        SubjectState::Failed { code, .. } if code == "pipeline_state_incompatible"
+    ));
+    assert!(descriptor.analysis.is_none());
+}
+
+#[tokio::test]
+async fn pipeline_selects_exact_trace_and_trace_endpoint_honors_etag() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing_generation(&run, &[("slo-general", "ok")], Some("generation-trace"));
+    fs::create_dir_all(run.join("traces")).unwrap();
+    fs::write(run.join("traces/old.pftrace.gz"), b"old").unwrap();
+    let current = b"current generation trace";
+    fs::write(run.join("traces/current.pftrace.gz"), current).unwrap();
+    write_pipeline(
+        &run,
+        "generation-trace",
+        "complete",
+        "complete",
+        "complete",
+        "complete",
+        Some(&["slo-general"]),
+        Some("traces/current.pftrace.gz"),
+    );
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let uri = format!("/api/v1/runs/{run_id}/traces/perfetto");
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(
+        first.headers()[header::CONTENT_LENGTH],
+        current.len().to_string()
+    );
+    let etag = first.headers()[header::ETAG].clone();
+    assert!(etag.to_str().unwrap().starts_with("W/\"trace-v1-"));
+    assert_eq!(
+        to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        current
+    );
+
+    let conditional = app
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header(header::HOST, "localhost")
+                .header(header::IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+}
+
+#[test]
+fn oversized_trace_is_not_declared_ready() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing_generation(
+        &run,
+        &[("slo-general", "ok")],
+        Some("generation-large-trace"),
+    );
+    fs::create_dir_all(run.join("traces")).unwrap();
+    let trace = run.join("traces/large.pftrace.gz");
+    fs::File::create(&trace)
+        .unwrap()
+        .set_len(MAX_TRACE_BYTES + 1)
+        .unwrap();
+    write_pipeline(
+        &run,
+        "generation-large-trace",
+        "complete",
+        "complete",
+        "complete",
+        "complete",
+        Some(&["slo-general"]),
+        Some("traces/large.pftrace.gz"),
+    );
+
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let descriptor = build_descriptor(&record).unwrap();
+    assert!(matches!(
+        &descriptor.traces["perfetto"],
+        TraceState::Failed { code, .. } if code == "artifact_too_large"
+    ));
+}
+
+#[tokio::test]
+async fn topology_is_the_exact_v1_params_run_meta_envelope() {
+    let root = TempDir::new().unwrap();
+    create_run(root.path(), "run", "afd", true);
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/topology"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(
+        body.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<HashSet<_>>(),
+        HashSet::from(["schema_version", "params", "run_meta"])
+    );
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["params"]["deployment"], "afd");
+    assert_eq!(body["run_meta"]["num_gpus"], 2);
+}

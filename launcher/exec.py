@@ -61,9 +61,7 @@ def _build_subprocess_env() -> dict[str, str]:
     if libdir:
         current_ld_path = env.get("LD_LIBRARY_PATH", "")
         if libdir not in current_ld_path:
-            env["LD_LIBRARY_PATH"] = (
-                f"{libdir}:{current_ld_path}" if current_ld_path else libdir
-            )
+            env["LD_LIBRARY_PATH"] = f"{libdir}:{current_ld_path}" if current_ld_path else libdir
 
     if sys.base_prefix:
         env["PYTHONHOME"] = sys.base_prefix

@@ -18,7 +18,8 @@ serde_json = "1.0"
 # RecordBatches resolve to the same arrow types (matches ref/moesim-rs analyze-rust).
 datafusion = { version = "45", default-features = false, features = ["parquet"] }
 arrow-array = { version = "54", default-features = false }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread"] }
+tokio-util = { version = "0.7", features = ["io"] }
 # The UI boundary is a small read-only HTTP service. Axum owns routing;
 # artifact selection remains in this crate so no general-purpose file server
 # can expose parquet by accident.
