@@ -341,9 +341,7 @@ def test_timing_predict_preserves_simulation_backend_policy(tmp_path, monkeypatc
     simulation, _, _ = _write_completed_inputs(tmp_path)
     params_path = simulation / "raw" / "params.json"
     params = json.loads(params_path.read_text())
-    params["backends"] = {
-        "main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}
-    }
+    params["backends"] = {"main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}}
     params_path.write_text(json.dumps(params))
     monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
 
