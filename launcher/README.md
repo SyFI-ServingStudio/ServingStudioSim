@@ -306,7 +306,7 @@ constraints:
   - "prefill_tp >= decode_tp"          # prefill must shard at least as fine as decode
 analyze_subjects:                      # launcher-only; popped before validation
   - throughput
-  - latency
+  - slo-general
 ```
 
 > **Name sweeps/derived for what they mean** (`prefill_tp`, not `ptp`). That name
@@ -374,6 +374,12 @@ Before validation, the loader is strict: a preset file's **root must be a mappin
 (an empty file / `[]` is rejected, not a traceback), **duplicate keys are rejected**
 (`json`/PyYAML default to last-wins — that silent drop is an error here), and the
 launcher-only `analyze_subjects` must be a **list of strings**.
+Token membership is deliberately checked later against the just-built analyzer's
+machine-readable registry contract: unknown and non-Run tokens publish a terminal
+analysis failure and are never copied into `requested_subjects`.
+Launcher binary/schema paths come from Cargo's effective target directory, not a
+hard-coded `./target`; `CARGO_TARGET_DIR` and Cargo config overrides therefore
+select the same artifacts for build, identity, and execution.
 
 ### Raw, pre-expansion (`validate.validate_params`)
 

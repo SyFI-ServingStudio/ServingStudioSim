@@ -15,6 +15,7 @@ Per design §1.2.3 / §1.2.7:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -22,24 +23,53 @@ import sys
 import sysconfig
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
-from .analyzer_pipeline import AnalyzerPipelinePublisher, discover_producer_identity
+from .analyzer_pipeline import AnalyzerPipelinePublisher, snapshot_analyzer_binary
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARALLELISM = 200
 
 
+@lru_cache(maxsize=4)
+def _cargo_target_directory(configured_target: str | None, repo_root_name: str) -> Path:
+    """Resolve Cargo's real target directory, including config-file overrides."""
+
+    repo_root = Path(repo_root_name)
+    if configured_target:
+        target = Path(configured_target)
+        return target if target.is_absolute() else repo_root / target
+    result = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"cannot resolve Cargo target directory: {result.stderr.strip()}")
+    try:
+        target = json.loads(result.stdout)["target_directory"]
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise RuntimeError("cargo metadata returned no target_directory") from error
+    return Path(target)
+
+
+def cargo_target_directory() -> Path:
+    return _cargo_target_directory(os.environ.get("CARGO_TARGET_DIR"), str(REPO_ROOT))
+
+
 def binary_path(build_type: str = "debug") -> Path:
-    return REPO_ROOT / "target" / build_type / "simulator"
+    return cargo_target_directory() / build_type / "simulator"
 
 
 def analyzer_binary_path(build_type: str = "debug") -> Path:
-    return REPO_ROOT / "target" / build_type / "analyze"
+    return cargo_target_directory() / build_type / "analyze"
 
 
 def schema_json_path(build_type: str = "debug") -> Path:
-    return REPO_ROOT / "target" / build_type / "deployment_schema.json"
+    return cargo_target_directory() / build_type / "deployment_schema.json"
 
 
 def _build_subprocess_env() -> dict[str, str]:
@@ -178,6 +208,13 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
         analyzer_cmd.extend(["--profile", build_type])
     if subprocess.run(analyzer_cmd, cwd=REPO_ROOT, env=build_env).returncode != 0:
         sys.stderr.write("[warn] analyzer build failed; runs will skip post-run analysis\n")
+    else:
+        # Prime the inode-pinned identity/snapshot singleflight before a sweep's
+        # async run tasks start. Per-run calls then perform metadata-only hits.
+        try:
+            snapshot_analyzer_binary(analyzer_binary_path(build_type), REPO_ROOT)
+        except Exception as error:
+            sys.stderr.write(f"[warn] analyzer identity unavailable: {error}\n")
     return True
 
 
@@ -235,8 +272,24 @@ async def run_analysis(
     Each step's combined stdout+stderr is appended to the run's `stdout.log` (the
     sim run already closed it, so analysis output would otherwise be lost) under a
     labeled section, keeping the full run record in one file."""
-    analyzer = analyzer_binary_path(build_type)
+    built_analyzer = analyzer_binary_path(build_type)
     stdout_log = log_dir / "stdout.log"
+
+    def _publish_precompute_failure(
+        code: str,
+        producer: dict[str, object],
+    ) -> None:
+        """Hide stale artifacts behind one validator-legal failed generation."""
+
+        try:
+            failed_pipeline = AnalyzerPipelinePublisher.begin(log_dir, producer, None)
+        except OSError as error:
+            print(f"[analyze] cannot publish pipeline state for {log_dir}: {error}")
+            return
+        try:
+            failed_pipeline.fail_compute_and_finish(code)
+        finally:
+            failed_pipeline.close()
 
     def _append(section: str, text: str, elapsed_ms: float) -> None:
         # Stamp each stage's wall time in the section header. `analyze run` also
@@ -263,38 +316,43 @@ async def run_analysis(
             print(f"[analyze] {section} could not run for {log_dir}: {error}")
             return None
 
+    unavailable_producer: dict[str, object] = {
+        "name": "vibesim-analyzer",
+        "version": "unavailable",
+        "revision": "unavailable",
+        "binary_sha256": "unavailable",
+    }
+    if not built_analyzer.is_file():
+        _publish_precompute_failure("analyzer_unavailable", unavailable_producer)
+        print(f"[analyze] {built_analyzer} not built; skipping analysis for {log_dir}")
+        return
+
     try:
-        producer = await asyncio.to_thread(
-            discover_producer_identity,
-            analyzer,
-            REPO_ROOT,
-        )
+        # The inode singleflight hashes only once per built binary; subsequent
+        # sweep runs are metadata-only cache hits.
+        analyzer, analyzer_contract = snapshot_analyzer_binary(built_analyzer, REPO_ROOT)
     except Exception as error:
-        producer = {
-            "name": "vibesim-analyzer",
-            "version": "unavailable",
-            "revision": "unavailable",
-            "binary_sha256": "unavailable",
-        }
+        _publish_precompute_failure("producer_identity_unavailable", unavailable_producer)
         print(f"[analyze] cannot identify producer for {log_dir}: {error}")
+        return
     try:
-        pipeline = await asyncio.to_thread(
-            AnalyzerPipelinePublisher.begin,
-            log_dir,
-            producer,
-            subjects,
+        canonical_subjects = analyzer_contract.canonical_run_subjects(subjects)
+    except ValueError as error:
+        _publish_precompute_failure("subject_selection_invalid", analyzer_contract.producer)
+        print(f"[analyze] invalid subject selection for {log_dir}: {error}")
+        return
+    try:
+        # One launcher schedules at most one generation per run; the flock is
+        # normally uncontended and protects against external launcher processes.
+        pipeline = AnalyzerPipelinePublisher.begin(
+            log_dir, analyzer_contract.producer, canonical_subjects
         )
     except OSError as error:
         print(f"[analyze] cannot publish pipeline state for {log_dir}: {error}")
         return
 
     try:
-        if not analyzer.exists():
-            pipeline.fail_compute_and_finish("analyzer_unavailable")
-            print(f"[analyze] {analyzer} not built; skipping analysis for {log_dir}")
-            return
-
-        subjects = subjects or []
+        selected_subjects = canonical_subjects or []
         compute_rc = await _execute_stage(
             "analyze compute",
             [
@@ -303,13 +361,22 @@ async def run_analysis(
                 str(log_dir),
                 "--generation-id",
                 pipeline.generation_id,
-                *subjects,
+                *selected_subjects,
             ],
         )
         if compute_rc != 0:
             pipeline.fail_compute_and_finish("compute_failed")
             print(f"[analyze] compute failed for {log_dir}")
             return
+
+        # A sweep may rebuild the shared target while another run is analyzing.
+        # Never publish artifacts under provenance learned from a different
+        # executable inode/content than the one still present after compute.
+        if not analyzer_contract.matches_executable(analyzer):
+            pipeline.fail_compute_and_finish("producer_identity_changed")
+            print(f"[analyze] producer changed during compute for {log_dir}")
+            return
+
         pipeline.complete_compute_and_start_render()
         render_rc = await _execute_stage(
             "analyze render",
@@ -318,7 +385,7 @@ async def run_analysis(
                 str(REPO_ROOT / "analyzer" / "python"),
                 "render",
                 str(log_dir),
-                *subjects,
+                *selected_subjects,
             ],
         )
         if render_rc == 0:
@@ -334,9 +401,13 @@ async def run_analysis(
             [str(analyzer), "trace", str(log_dir)],
         )
         if trace_rc == 0:
-            pipeline.complete_trace_and_finish(
-                artifact=f"traces/{log_dir.name}.pftrace.gz",
-            )
+            if analyzer_contract.matches_executable(analyzer):
+                pipeline.complete_trace_and_finish(
+                    artifact=f"traces/{log_dir.name}.pftrace.gz",
+                )
+            else:
+                pipeline.fail_trace_and_finish("producer_identity_changed")
+                print(f"[analyze] trace producer changed for {log_dir}")
         else:
             pipeline.fail_trace_and_finish("trace_failed")
             print(f"[analyze] trace failed for {log_dir}")
@@ -359,9 +430,17 @@ def run_alignment_analysis(
     This explicit alignment command has no sweep-level parallelism to preserve;
     each phase must finish before the next consumes its artifacts.
     """
-    analyzer = analyzer_binary_path(build_type)
-    if not analyzer.exists():
-        print(f"[analyze] {analyzer} not built; skipping alignment analysis for {log_dir}")
+    built_analyzer = analyzer_binary_path(build_type)
+    if not built_analyzer.exists():
+        print(f"[analyze] {built_analyzer} not built; skipping alignment analysis for {log_dir}")
+        return
+    try:
+        analyzer, analyzer_contract = snapshot_analyzer_binary(built_analyzer, REPO_ROOT)
+        selected = analyzer_contract.canonical_subjects(subjects, scope="alignment")
+        if selected is None:
+            selected = analyzer_contract.subjects_in_scope("alignment")
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"[analyze] cannot prepare alignment analyzer for {log_dir}: {error}")
         return
 
     stdout_log = log_dir / "stdout.log"
@@ -377,11 +456,6 @@ def run_alignment_analysis(
                 fh.write("\n")
         return rc
 
-    selected = subjects or [
-        "alignment-iteration",
-        "alignment-workload",
-        "alignment-e2e",
-    ]
     rc = run_step(
         "analyze alignment compute",
         [str(analyzer), "alignment", str(log_dir), *selected],

@@ -56,6 +56,7 @@ callers shell out):
 | `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
 | `analyze list` | Rust | Print the subject catalog. |
+| `analyze identity` | Rust | Print schema-v1 machine JSON containing the executable's package version, build-time source revision, and flat subject/scope catalog. |
 | `analyze serve --logs-root <dir> [--logs-root <dir> ...] [--bind 127.0.0.1:8787] [--allow-host <hostname> ...]` | Rust | Recursively discover runs and expose only protocol-v1 bounded UI artifacts over a read-only, loopback-by-default HTTP API. Non-loopback proxy hosts require an explicit allowlist entry. |
 | `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNG plots, including sampled alignment breakdowns. No subjects = all renderers. |
 
@@ -66,6 +67,22 @@ and Rust `analyze trace` after each successful sim run;
 separate analyze phase config. Both execution paths are
 **best-effort** — a missing analyzer binary, failed handoff, or failed subject
 never fails the completed run.
+
+Explicit subject tokens are strict at the Rust CLI boundary. An unknown token,
+or a known `alignment` token passed to `analyze run` (and vice versa), exits
+nonzero before a DataFusion session or output artifact is created. Before the
+launcher claims a generation it queries `analyze identity`, validates
+`analyze_subjects` against that executable's Run-scope rows, canonicalizes them
+in registry order, and hashes the same executable. Identity, compute, and trace
+all use one content-addressed, inode-pinned hard link under Cargo's effective target
+directory, so a concurrent rebuild of `target/<profile>/analyze` cannot split a
+generation across binaries. The target directory is a trusted-writer boundary;
+snapshot metadata drift fails closed. The launcher never attributes a stale
+built binary to the launcher's current checkout HEAD; missing/malformed identity
+publishes a terminal compute failure rather than an unreadable complete state.
+The embedded revision is specifically the build-time source commit, not a claim
+that the build worktree was clean; `binary_sha256` distinguishes exact binaries,
+including dirty builds from that commit.
 
 **Required from below** — `analyze run` consumes a run directory written by the
 sim/L7, containing:
@@ -95,7 +112,7 @@ the analysis root; the input roots are never used as output directories.
 
 ```
 rust/                The `analyze` binary (DataFusion compute side).
-  src/main.rs          CLI (`run` / `alignment` / `trace` / `list` / `serve`);
+  src/main.rs          CLI (`run` / `alignment` / `trace` / `list` / `identity` / `serve`);
                        the best-effort per-subject dispatch loop is shared by
                        both source scopes.
   src/registry.rs      THE SUBJECT CATALOG. `SUBJECTS` table + `run_subject`
@@ -258,7 +275,9 @@ or JPG breakdowns are removed without touching subject-level plots.
 
 The flat registry also carries a `Scope` (`run` or `alignment`) so default
 selection never points a normal-run subject at an alignment bundle or vice
-versa. **Deployment knowledge enters in exactly one place**: each subject's `Applies`
+versa. Explicit selection is also scope-strict: typos and cross-scope tokens are
+hard errors, while only a valid subject's deployment applicability remains a
+best-effort self-skip. **Deployment knowledge enters in exactly one place**: each subject's `Applies`
 gate. Tier-1 (uniform-envelope) metrics are `Applies::All` and stay
 deployment-blind; a deployment-shaped metric names the deployments it understands
 and `select` drops it (with a note) for runs it doesn't apply to. So "point the

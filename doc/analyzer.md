@@ -99,7 +99,10 @@ Three independent decisions, never collapsed:
   applicability lives with the metric, `analyze run <dir>` on any run "just works".
 - **Scope** (`Scope::{Run, Alignment}`) gates the **source envelope**, not
   deployment: `analyze run` selects only `Run` subjects, `analyze alignment` only
-  `Alignment` subjects. There is no second alignment registry.
+  `Alignment` subjects. There is no second alignment registry. An explicit CLI
+  token must exist in that command's scope: unknown tokens and known tokens from
+  the other scope fail before a DataFusion session starts or an artifact is
+  written.
 - **Intent** (which applicable subjects to actually run) lives at the
   launcher/preset and can only *narrow within* what is applicable — it never
   overrides applicability into running a nonsensical metric.
@@ -167,6 +170,24 @@ file sync, and atomic replace. Thus readers see the old or new complete file,
 never a partially encoded artifact. A run's subject selection is a durable
 preset key (`analyze_subjects`, omitted = all applicable); `--no-analyze` is the
 transient "skip it this time" switch.
+
+The producer version, build-time source revision, and flat subject catalog come
+from the machine-readable `analyze identity` command of the executable that will
+perform compute; the launcher hashes that same executable for `binary_sha256`.
+It resolves Cargo's effective target directory (including environment/config
+overrides), atomically pins the executable inode with a content-addressed hard
+link below that target, and uses the pinned path for identity, compute, and
+trace. A concurrent Cargo rebuild therefore cannot change the producer midway
+through a generation. The target directory remains a trusted-writer boundary;
+metadata checks fail the generation if that pinned executable is replaced.
+It validates explicit `analyze_subjects` against the binary-owned Run catalog and
+records only canonical registry tokens. Identity/selection failure is published
+as a terminal compute failure before subject execution, never as a generation
+that can later become `complete`. The launcher's current checkout HEAD is not
+producer provenance for an already-built binary.
+`producer.revision` names the commit checked out when Cargo built the executable;
+it does not claim a clean worktree. The binary digest is the exact identity that
+distinguishes dirty builds made from the same source commit.
 
 ## Read-only UI service
 

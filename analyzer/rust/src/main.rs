@@ -80,6 +80,10 @@ enum Command {
     },
     /// List the available analyzer subjects and what each produces.
     List,
+    /// Print the machine-readable build identity and subject registry contract.
+    /// The launcher uses this exact executable-owned metadata before claiming a
+    /// published analysis generation.
+    Identity,
     /// Serve bounded, read-only analyzer artifacts to the visualization UI.
     Serve {
         /// Logs roots to discover recursively. Repeat for independent roots.
@@ -146,6 +150,10 @@ async fn main() -> Result<()> {
             print!("{}", registry::help());
             Ok(())
         }
+        Command::Identity => {
+            println!("{}", serde_json::to_string(&identity_document())?);
+            Ok(())
+        }
         Command::Serve {
             logs_roots,
             bind,
@@ -193,6 +201,7 @@ async fn main() -> Result<()> {
 }
 
 async fn alignment(analysis_log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
+    let selected = registry::select(&subjects, None, registry::Scope::Alignment)?;
     let manifest = analysis_log_dir.join("alignment_manifest.json");
     if !manifest.is_file() {
         bail!(
@@ -201,20 +210,13 @@ async fn alignment(analysis_log_dir: PathBuf, subjects: Vec<String>) -> Result<(
         );
     }
     let ctx = build_session();
-    run_subjects(
-        ctx,
-        analysis_log_dir,
-        subjects,
-        None,
-        registry::Scope::Alignment,
-        None,
-    )
-    .await
+    run_subjects(ctx, analysis_log_dir, selected, None, None).await
 }
 
 async fn run(log_dir: PathBuf, subjects: Vec<String>, generation_id: Option<String>) -> Result<()> {
-    let ctx = build_session();
     let deployment = read_deployment(&log_dir);
+    let selected = registry::select(&subjects, deployment.as_deref(), registry::Scope::Run)?;
+    let ctx = build_session();
 
     // Pre-register the big shared table once so the concurrent subjects below don't
     // each re-open cost_log's per-worker parquet set. (Registration is an idempotent
@@ -222,23 +224,14 @@ async fn run(log_dir: PathBuf, subjects: Vec<String>, generation_id: Option<Stri
     // avoids redundant metadata opens.)
     let _ = session::register_cost_log(&ctx, &log_dir).await;
 
-    run_subjects(
-        ctx,
-        log_dir,
-        subjects,
-        deployment,
-        registry::Scope::Run,
-        generation_id,
-    )
-    .await
+    run_subjects(ctx, log_dir, selected, deployment, generation_id).await
 }
 
 async fn run_subjects(
     ctx: datafusion::prelude::SessionContext,
     log_dir: PathBuf,
-    subjects: Vec<String>,
+    selected: Vec<&'static registry::Subject>,
     deployment: Option<String>,
-    scope: registry::Scope,
     generation_id: Option<String>,
 ) -> Result<()> {
     // Best-effort AND concurrent: each subject is an independent read over the shared
@@ -249,7 +242,6 @@ async fn run_subjects(
     // catalog order for a stable log; per-subject timing is still the subject's own
     // wall (now overlapping), and `total_elapsed_ms` is the concurrent wall.
     let run_start = Instant::now();
-    let selected = registry::select(&subjects, deployment.as_deref(), scope);
     let mut set = tokio::task::JoinSet::new();
     for (idx, subject) in selected.iter().enumerate() {
         let ctx = ctx.clone();
@@ -308,4 +300,79 @@ async fn run_subjects(
     });
     write_json(&report_path(&log_dir, "analyzer_timing.json"), &run_report)?;
     Ok(())
+}
+
+fn identity_document() -> serde_json::Value {
+    let subjects = registry::SUBJECTS
+        .iter()
+        .map(|subject| {
+            json!({
+                "name": subject.name,
+                "scope": subject.scope.label(),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema_version": 1,
+        "name": "vibesim-analyzer",
+        "version": env!("CARGO_PKG_VERSION"),
+        "revision": env!("VIBESIM_ANALYZER_REVISION"),
+        "subjects": subjects,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn machine_identity_is_concrete_and_exposes_both_subject_scopes() {
+        let identity = identity_document();
+        assert_eq!(identity["schema_version"], 1);
+        assert_eq!(identity["name"], "vibesim-analyzer");
+        assert_ne!(identity["version"], "unavailable");
+        let revision = identity["revision"].as_str().unwrap();
+        assert_eq!(revision.len(), 40);
+        assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let subjects = identity["subjects"].as_array().unwrap();
+        assert!(subjects
+            .iter()
+            .any(|subject| subject == &json!({"name": "throughput", "scope": "run"})));
+        assert!(subjects
+            .iter()
+            .any(|subject| subject == &json!({"name": "alignment-e2e", "scope": "alignment"})));
+    }
+
+    #[tokio::test]
+    async fn run_handler_rejects_unknown_subject_before_creating_artifacts() {
+        let run_dir = tempfile::tempdir().unwrap();
+        let error = run(
+            run_dir.path().to_path_buf(),
+            vec!["through-put".to_string()],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown run analyzer subject"));
+        assert!(!run_dir.path().join("reports").exists());
+        assert!(!run_dir.path().join("payloads").exists());
+    }
+
+    #[tokio::test]
+    async fn run_handler_rejects_alignment_subject_before_creating_artifacts() {
+        let run_dir = tempfile::tempdir().unwrap();
+        let error = run(
+            run_dir.path().to_path_buf(),
+            vec!["alignment-e2e".to_string()],
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("has alignment scope and cannot be used with `analyze run`"));
+        assert!(!run_dir.path().join("reports").exists());
+        assert!(!run_dir.path().join("payloads").exists());
+    }
 }

@@ -88,7 +88,7 @@ pub enum Scope {
 }
 
 impl Scope {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Scope::Run => "run",
             Scope::Alignment => "alignment",
@@ -130,6 +130,7 @@ impl Applies {
 /// the Python renderer key; `description` is the one-line help shown by
 /// `analyze list`; `report_name`/`payload_name` are the artifact files it writes
 /// under `reports/` / `payloads/`.
+#[derive(Debug)]
 pub struct Subject {
     pub name: &'static str,
     pub category: Category,
@@ -316,26 +317,41 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
 }
 
 /// Resolve the subjects to run. Empty `requested` = all (the `run <dir>` default);
-/// otherwise the named ones. Either way, subjects whose [`Applies`] gate rejects
-/// this run's `deployment` are dropped with a note (best-effort: pointing the
-/// analyzer at any run "just works" — agnostic metrics always run, deployment-
-/// shaped ones self-select). A requested name that matches no subject is a typo,
-/// so it warns loudly with the valid names rather than silently running nothing.
+/// otherwise every token must name a subject in the command's source scope.
+/// Validation completes before any DataFusion session or output artifact is
+/// created, so a typo or an alignment token passed to `analyze run` is a hard
+/// CLI error rather than a successful no-op. Applicable subjects retain catalog
+/// order and deployment-shaped subjects may still self-skip with a note.
 pub fn select(
     requested: &[String],
     deployment: Option<&str>,
     scope: Scope,
-) -> Vec<&'static Subject> {
+) -> Result<Vec<&'static Subject>> {
     for name in requested {
-        if !SUBJECTS.iter().any(|s| s.name == name) {
-            let known: Vec<&str> = SUBJECTS.iter().map(|s| s.name).collect();
-            eprintln!(
-                "[analyze] unknown subject `{name}`; known: {} (see `analyze list`)",
-                known.join(", ")
-            );
+        match SUBJECTS.iter().find(|subject| subject.name == name) {
+            None => {
+                let known = SUBJECTS
+                    .iter()
+                    .filter(|subject| subject.scope == scope)
+                    .map(|subject| subject.name)
+                    .collect::<Vec<_>>();
+                bail!(
+                    "unknown {scope} analyzer subject {name:?}; known: {} (see `analyze list`)",
+                    known.join(", "),
+                    scope = scope.label(),
+                );
+            }
+            Some(subject) if subject.scope != scope => {
+                bail!(
+                    "analyzer subject {name:?} has {} scope and cannot be used with `analyze {}`",
+                    subject.scope.label(),
+                    scope.label(),
+                );
+            }
+            Some(_) => {}
         }
     }
-    SUBJECTS
+    Ok(SUBJECTS
         .iter()
         .filter(|s| {
             if s.scope != scope {
@@ -355,5 +371,35 @@ pub fn select(
             }
             true
         })
-        .collect()
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_run_subjects_keep_canonical_catalog_order() {
+        let requested = vec!["throughput".to_string(), "slo-general".to_string()];
+        let selected = select(&requested, None, Scope::Run).unwrap();
+        let names = selected
+            .iter()
+            .map(|subject| subject.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["slo-general", "throughput"]);
+    }
+
+    #[test]
+    fn unknown_subject_is_a_hard_error() {
+        let error = select(&["through-put".to_string()], None, Scope::Run).unwrap_err();
+        assert!(error.to_string().contains("unknown run analyzer subject"));
+    }
+
+    #[test]
+    fn subject_from_another_scope_is_a_hard_error() {
+        let error = select(&["alignment-e2e".to_string()], None, Scope::Run).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("has alignment scope and cannot be used with `analyze run`"));
+    }
 }

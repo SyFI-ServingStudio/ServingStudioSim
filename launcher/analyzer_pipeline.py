@@ -8,11 +8,14 @@ written last.
 
 from __future__ import annotations
 
+import atexit
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -22,6 +25,7 @@ from pathlib import Path
 from typing import BinaryIO, Final, Literal
 
 PIPELINE_SCHEMA_VERSION: Final = 1
+ANALYZER_IDENTITY_SCHEMA_VERSION: Final = 1
 PIPELINE_STATE_RELATIVE_PATH: Final = Path("reports/analyzer_pipeline_state.json")
 PIPELINE_PRODUCER_NAME: Final = "vibesim-analyzer"
 
@@ -68,77 +72,267 @@ def atomic_write_json(path: Path, value: object) -> None:
         raise
 
 
-def discover_producer_identity(analyzer: Path, repo_root: Path) -> dict[str, object]:
-    """Return the producer identity recorded in a new pipeline generation.
+@dataclass(frozen=True)
+class AnalyzerBinaryContract:
+    """Machine contract owned by one concrete analyzer executable.
 
-    The version comes from the binary that will actually run, not the serving
-    binary.  The revision describes the source checkout from which the launcher
-    builds that analyzer.  Failed generations may report an
-    unavailable version, but successful generations should always have the
-    concrete analyzer version enabled by clap's ``--version`` flag.
+    ``subject_scopes`` comes from the Rust registry in that same executable, so
+    the launcher can narrow intent without maintaining a second subject table.
     """
 
-    try:
-        analyzer_stat = analyzer.stat()
-    except OSError:
-        analyzer_stat = None
-    return dict(
-        _discover_producer_identity_cached(
-            str(analyzer),
-            analyzer_stat.st_size if analyzer_stat else -1,
-            analyzer_stat.st_mtime_ns if analyzer_stat else -1,
-            str(repo_root),
-        )
+    version: str
+    revision: str
+    binary_sha256: str
+    subject_scopes: tuple[tuple[str, str], ...]
+    binary_fingerprint: tuple[int, int, int, int]
+
+    @property
+    def producer(self) -> dict[str, object]:
+        return {
+            "name": PIPELINE_PRODUCER_NAME,
+            "version": self.version,
+            "revision": self.revision,
+            "binary_sha256": self.binary_sha256,
+        }
+
+    def canonical_subjects(
+        self, requested: list[str] | None, *, scope: Literal["run", "alignment"]
+    ) -> list[str] | None:
+        """Validate explicit intent and return registry-order scope tokens."""
+
+        if not requested:
+            return None
+        scope_by_name = dict(self.subject_scopes)
+        for token in requested:
+            token_scope = scope_by_name.get(token)
+            if token_scope is None:
+                known = [name for name, row_scope in self.subject_scopes if row_scope == scope]
+                raise ValueError(
+                    f"unknown {scope} analyzer subject {token!r}; known: {', '.join(known)}"
+                )
+            if token_scope != scope:
+                raise ValueError(
+                    f"analyzer subject {token!r} has {token_scope} scope and cannot be used "
+                    f"with `analyze {scope}`"
+                )
+        wanted = set(requested)
+        return [
+            name for name, row_scope in self.subject_scopes if row_scope == scope and name in wanted
+        ]
+
+    def subjects_in_scope(self, scope: Literal["run", "alignment"]) -> list[str]:
+        """Return every binary-registry token in one source scope."""
+
+        return [name for name, row_scope in self.subject_scopes if row_scope == scope]
+
+    def canonical_run_subjects(self, requested: list[str] | None) -> list[str] | None:
+        return self.canonical_subjects(requested, scope="run")
+
+    def matches_executable(self, analyzer: Path) -> bool:
+        """Whether ``analyzer`` still names the executable that was hashed."""
+
+        try:
+            current = analyzer.stat()
+        except OSError:
+            return False
+        return (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+        ) == self.binary_fingerprint
+
+
+_SNAPSHOT_LOCK = threading.Lock()
+_SNAPSHOT_CACHE: dict[tuple[int, int, int, int], tuple[Path, AnalyzerBinaryContract]] = {}
+_SNAPSHOT_DIRECTORIES: dict[Path, Path] = {}
+
+
+def _stat_fingerprint(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _snapshot_directory(target_profile_directory: Path) -> Path:
+    existing = _SNAPSHOT_DIRECTORIES.get(target_profile_directory)
+    if existing is not None:
+        return existing
+    directory = (
+        target_profile_directory / ".analyzer-snapshots" / f"{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    directory.mkdir(parents=True, exist_ok=False)
+    _SNAPSHOT_DIRECTORIES[target_profile_directory] = directory
+    atexit.register(shutil.rmtree, directory, ignore_errors=True)
+    return directory
+
+
+def discover_analyzer_contract(analyzer: Path, repo_root: Path) -> AnalyzerBinaryContract:
+    """Read identity and subject metadata from the executable that will run."""
+
+    analyzer_stat = analyzer.stat()
+    return _discover_analyzer_contract_cached(
+        str(analyzer),
+        analyzer_stat.st_dev,
+        analyzer_stat.st_ino,
+        analyzer_stat.st_size,
+        analyzer_stat.st_mtime_ns,
+        str(repo_root),
     )
 
 
+def snapshot_analyzer_binary(
+    analyzer: Path, repo_root: Path
+) -> tuple[Path, AnalyzerBinaryContract]:
+    """Publish and validate the exact executable used by one generation.
+
+    Cargo may atomically replace ``target/<profile>/analyze`` while a large
+    sweep is still publishing earlier runs. An atomic hard link pins one inode
+    without copying the (often ~1 GB debug) file. The process-wide lock/cache is
+    also the singleflight boundary: one sweep hashes and queries each inode once,
+    then every run executes the same pinned path. Per-process links are removed
+    at normal interpreter exit.
+    """
+
+    with _SNAPSHOT_LOCK:
+        for _attempt in range(3):
+            source_before = _stat_fingerprint(analyzer)
+            cached = _SNAPSHOT_CACHE.get(source_before)
+            if cached is not None:
+                snapshot, contract = cached
+                if contract.matches_executable(snapshot):
+                    return snapshot, contract
+                _SNAPSHOT_CACHE.pop(source_before, None)
+
+            directory = _snapshot_directory(analyzer.parent)
+            temporary_path = directory / f".analyze-{uuid.uuid4().hex}.tmp"
+            os.link(analyzer, temporary_path)
+            pinned = _stat_fingerprint(temporary_path)
+            try:
+                source_after = _stat_fingerprint(analyzer)
+            except OSError:
+                source_after = None
+            if source_before != pinned or source_after != pinned:
+                temporary_path.unlink()
+                continue
+
+            try:
+                contract = discover_analyzer_contract(temporary_path, repo_root)
+                digest_hex = contract.binary_sha256.removeprefix("sha256:")
+                if len(digest_hex) != 64:
+                    raise RuntimeError("analyzer snapshot has no concrete binary digest")
+                snapshot = directory / f"analyze-{digest_hex}"
+                if snapshot.exists():
+                    temporary_path.unlink()
+                    existing_contract = next(
+                        (
+                            cached_contract
+                            for cached_snapshot, cached_contract in _SNAPSHOT_CACHE.values()
+                            if cached_snapshot == snapshot
+                            and cached_contract.matches_executable(snapshot)
+                        ),
+                        None,
+                    )
+                    contract = existing_contract or discover_analyzer_contract(snapshot, repo_root)
+                    if contract.binary_sha256 != f"sha256:{digest_hex}":
+                        raise RuntimeError("existing analyzer snapshot violates its digest name")
+                else:
+                    temporary_path.rename(snapshot)
+                if not contract.matches_executable(snapshot):
+                    raise RuntimeError("analyzer snapshot inode changed during publication")
+                _SNAPSHOT_CACHE[pinned] = (snapshot, contract)
+                return snapshot, contract
+            except BaseException:
+                temporary_path.unlink(missing_ok=True)
+                raise
+        raise RuntimeError("Cargo analyzer output changed repeatedly while being pinned")
+
+
 @lru_cache(maxsize=8)
-def _discover_producer_identity_cached(
+def _discover_analyzer_contract_cached(
     analyzer_name: str,
+    analyzer_device: int,
+    analyzer_inode: int,
     analyzer_size: int,
     analyzer_mtime_ns: int,
     repo_root_name: str,
-) -> tuple[tuple[str, object], ...]:
+) -> AnalyzerBinaryContract:
     """Cache identity work for the one binary shared by a large sweep."""
 
-    del analyzer_size, analyzer_mtime_ns  # They intentionally form the cache key.
+    del analyzer_device, analyzer_inode, analyzer_size, analyzer_mtime_ns
+    # The deleted values intentionally remain part of the cache key.
     analyzer = Path(analyzer_name)
     repo_root = Path(repo_root_name)
-    version = "unavailable"
-    binary_sha256 = "unavailable"
-    if analyzer.is_file():
-        result = subprocess.run(
-            [str(analyzer), "--version"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode == 0:
-            words = result.stdout.strip().split()
-            if len(words) >= 2:
-                version = words[-1]
-        digest = sha256()
-        with analyzer.open("rb") as analyzer_file:
-            while chunk := analyzer_file.read(1024 * 1024):
-                digest.update(chunk)
-        binary_sha256 = f"sha256:{digest.hexdigest()}"
-
-    revision_result = subprocess.run(
-        ["git", "rev-parse", "--verify", "HEAD"],
+    before = analyzer.stat()
+    result = subprocess.run(
+        [str(analyzer), "identity"],
         cwd=repo_root,
         capture_output=True,
         text=True,
         check=False,
     )
-    revision = revision_result.stdout.strip() if revision_result.returncode == 0 else "unavailable"
-    return tuple(
-        {
-            "name": PIPELINE_PRODUCER_NAME,
-            "version": version,
-            "revision": revision,
-            "binary_sha256": binary_sha256,
-        }.items()
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"analyzer identity command failed with status {result.returncode}: "
+            f"{result.stderr.strip()}"
+        )
+    try:
+        identity = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("analyzer identity command returned invalid JSON") from error
+    if not isinstance(identity, dict):
+        raise RuntimeError("analyzer identity must be a JSON object")
+    if identity.get("schema_version") != ANALYZER_IDENTITY_SCHEMA_VERSION:
+        raise RuntimeError("unsupported analyzer identity schema_version")
+    if identity.get("name") != PIPELINE_PRODUCER_NAME:
+        raise RuntimeError("analyzer identity has an unexpected producer name")
+
+    version = identity.get("version")
+    revision = identity.get("revision")
+    if not isinstance(version, str) or not version or len(version) > 160:
+        raise RuntimeError("analyzer identity has no bounded concrete version")
+    if version == "unavailable":
+        raise RuntimeError("analyzer identity version is unavailable")
+    if (
+        not isinstance(revision, str)
+        or len(revision) != 40
+        or any(character not in "0123456789abcdef" for character in revision)
+    ):
+        raise RuntimeError("analyzer identity revision is not a full source revision")
+
+    raw_subjects = identity.get("subjects")
+    if not isinstance(raw_subjects, list) or not raw_subjects:
+        raise RuntimeError("analyzer identity has no subject registry")
+    subject_scopes: list[tuple[str, str]] = []
+    seen_subjects: set[str] = set()
+    for row in raw_subjects:
+        if not isinstance(row, dict) or set(row) != {"name", "scope"}:
+            raise RuntimeError("analyzer identity subject row has an invalid shape")
+        name = row["name"]
+        scope = row["scope"]
+        if not isinstance(name, str) or not name or len(name) > 160 or name in seen_subjects:
+            raise RuntimeError("analyzer identity contains a missing or duplicate subject")
+        if scope not in {"run", "alignment"}:
+            raise RuntimeError(f"analyzer identity subject {name!r} has invalid scope")
+        seen_subjects.add(name)
+        subject_scopes.append((name, scope))
+    if not any(scope == "run" for _, scope in subject_scopes):
+        raise RuntimeError("analyzer identity has no Run-scope subjects")
+
+    digest = sha256()
+    with analyzer.open("rb") as analyzer_file:
+        while chunk := analyzer_file.read(1024 * 1024):
+            digest.update(chunk)
+    after = analyzer.stat()
+    before_signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    after_signature = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if after_signature != before_signature:
+        raise RuntimeError("analyzer executable changed while its identity was read")
+    return AnalyzerBinaryContract(
+        version=version,
+        revision=revision,
+        binary_sha256=f"sha256:{digest.hexdigest()}",
+        subject_scopes=tuple(subject_scopes),
+        binary_fingerprint=before_signature,
     )
 
 
@@ -181,7 +375,9 @@ class AnalyzerPipelinePublisher:
             "started_at": timestamp,
             "updated_at": timestamp,
             "producer": producer,
-            "requested_subjects": (sorted(set(requested_subjects)) if requested_subjects else None),
+            # The launcher resolves this through the executing binary's registry
+            # contract before entering the publication state machine.
+            "requested_subjects": (list(requested_subjects) if requested_subjects else None),
             "stages": {
                 "compute": {"status": "pending", "updated_at": timestamp},
                 "render": {"status": "not_started", "updated_at": timestamp},

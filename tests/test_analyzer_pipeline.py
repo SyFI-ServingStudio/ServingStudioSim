@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -12,8 +14,11 @@ from launcher import analyzer_pipeline
 from launcher import exec as launcher_exec
 from launcher.analyzer_pipeline import (
     PIPELINE_STATE_RELATIVE_PATH,
+    AnalyzerBinaryContract,
     AnalyzerPipelinePublisher,
     atomic_write_json,
+    discover_analyzer_contract,
+    snapshot_analyzer_binary,
 )
 
 PIPELINE_LIFECYCLE_FIXTURE = (
@@ -89,6 +94,24 @@ def _producer() -> dict[str, object]:
         "revision": "a" * 40,
         "binary_sha256": f"sha256:{'b' * 64}",
     }
+
+
+def _contract(analyzer: Path | None = None, *, revision: str = "a" * 40) -> AnalyzerBinaryContract:
+    fingerprint = (0, 0, 0, 0)
+    if analyzer is not None:
+        stat = analyzer.stat()
+        fingerprint = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    return AnalyzerBinaryContract(
+        version="0.1.0",
+        revision=revision,
+        binary_sha256=f"sha256:{'b' * 64}",
+        subject_scopes=(
+            ("slo-general", "run"),
+            ("throughput", "run"),
+            ("alignment-e2e", "alignment"),
+        ),
+        binary_fingerprint=fingerprint,
+    )
 
 
 def test_pipeline_is_not_complete_until_trace_finishes(tmp_path: Path) -> None:
@@ -169,6 +192,133 @@ def test_atomic_json_failure_preserves_previous_file(tmp_path: Path, monkeypatch
     assert not list(destination.parent.glob(f".{destination.name}.*.tmp"))
 
 
+def test_binary_contract_comes_from_machine_identity_and_binary_digest(tmp_path: Path) -> None:
+    analyzer = tmp_path / "analyze"
+    identity = {
+        "schema_version": 1,
+        "name": "vibesim-analyzer",
+        "version": "9.8.7",
+        "revision": "c" * 40,
+        "subjects": [
+            {"name": "throughput", "scope": "run"},
+            {"name": "alignment-e2e", "scope": "alignment"},
+        ],
+    }
+    analyzer.write_text(f"#!/usr/bin/env python3\nimport json\nprint(json.dumps({identity!r}))\n")
+    analyzer.chmod(0o755)
+
+    contract = discover_analyzer_contract(analyzer, tmp_path)
+
+    assert contract.version == "9.8.7"
+    assert contract.revision == "c" * 40
+    assert contract.binary_sha256 == f"sha256:{sha256(analyzer.read_bytes()).hexdigest()}"
+    assert contract.subject_scopes == (
+        ("throughput", "run"),
+        ("alignment-e2e", "alignment"),
+    )
+
+
+def test_content_addressed_snapshot_survives_cargo_output_replacement(tmp_path: Path) -> None:
+    analyzer = tmp_path / "analyze"
+    identity = {
+        "schema_version": 1,
+        "name": "vibesim-analyzer",
+        "version": "1.2.3",
+        "revision": "d" * 40,
+        "subjects": [{"name": "throughput", "scope": "run"}],
+    }
+    analyzer.write_text(f"#!/usr/bin/env python3\nimport json\nprint(json.dumps({identity!r}))\n")
+    analyzer.chmod(0o755)
+    original_bytes = analyzer.read_bytes()
+    source_inode = analyzer.stat().st_ino
+
+    snapshot, contract = snapshot_analyzer_binary(analyzer, tmp_path)
+    cached_snapshot, cached_contract = snapshot_analyzer_binary(analyzer, tmp_path)
+    replacement = tmp_path / "replacement-analyze"
+    replacement.write_bytes(b"replacement cargo output")
+    os.replace(replacement, analyzer)
+
+    assert snapshot != analyzer
+    assert snapshot.stat().st_ino == source_inode
+    assert cached_snapshot == snapshot
+    assert cached_contract == contract
+    assert snapshot.read_bytes() == original_bytes
+    assert snapshot.name == f"analyze-{sha256(original_bytes).hexdigest()}"
+    assert contract.matches_executable(snapshot)
+    assert (
+        subprocess.run(
+            [str(snapshot), "identity"], capture_output=True, text=True, check=False
+        ).returncode
+        == 0
+    )
+
+
+def test_identical_cargo_rebuild_reuses_existing_snapshot_inode(tmp_path: Path) -> None:
+    analyzer = tmp_path / "analyze"
+    identity = {
+        "schema_version": 1,
+        "name": "vibesim-analyzer",
+        "version": "1.2.3",
+        "revision": "e" * 40,
+        "subjects": [{"name": "throughput", "scope": "run"}],
+    }
+    analyzer.write_text(f"#!/usr/bin/env python3\nimport json\nprint(json.dumps({identity!r}))\n")
+    analyzer.chmod(0o755)
+    snapshot, first_contract = snapshot_analyzer_binary(analyzer, tmp_path)
+    snapshot_inode = snapshot.stat().st_ino
+
+    replacement = tmp_path / "replacement-analyze"
+    replacement.write_bytes(analyzer.read_bytes())
+    replacement.chmod(0o755)
+    os.replace(replacement, analyzer)
+    rebuilt_snapshot, rebuilt_contract = snapshot_analyzer_binary(analyzer, tmp_path)
+
+    assert rebuilt_snapshot == snapshot
+    assert rebuilt_snapshot.stat().st_ino == snapshot_inode
+    assert rebuilt_contract == first_contract
+
+
+def test_binary_contract_canonicalizes_only_known_run_subjects() -> None:
+    contract = _contract()
+    assert contract.canonical_run_subjects(["throughput", "slo-general", "throughput"]) == [
+        "slo-general",
+        "throughput",
+    ]
+    with pytest.raises(ValueError, match="unknown run analyzer subject"):
+        contract.canonical_run_subjects(["through-put"])
+    with pytest.raises(ValueError, match="has alignment scope"):
+        contract.canonical_run_subjects(["alignment-e2e"])
+    assert contract.canonical_subjects(["alignment-e2e"], scope="alignment") == ["alignment-e2e"]
+
+
+def test_cargo_target_env_controls_all_launcher_artifact_paths(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path))
+    assert launcher_exec.binary_path("release") == tmp_path / "release" / "simulator"
+    assert launcher_exec.analyzer_binary_path("release") == tmp_path / "release" / "analyze"
+    assert launcher_exec.schema_json_path("release") == (
+        tmp_path / "release" / "deployment_schema.json"
+    )
+
+
+def test_cargo_metadata_target_directory_honors_cargo_config(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+    launcher_exec._cargo_target_directory.cache_clear()
+
+    def fake_metadata(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args=["cargo", "metadata"],
+            returncode=0,
+            stdout=json.dumps({"target_directory": str(tmp_path)}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(launcher_exec.subprocess, "run", fake_metadata)
+    try:
+        assert launcher_exec.cargo_target_directory() == tmp_path
+    finally:
+        launcher_exec._cargo_target_directory.cache_clear()
+
+
 def test_run_analysis_publishes_complete_generation(tmp_path: Path, monkeypatch) -> None:
     analyzer = tmp_path / "analyze"
     analyzer.touch()
@@ -179,13 +329,19 @@ def test_run_analysis_publishes_complete_generation(tmp_path: Path, monkeypatch)
         return 0, "ok\n"
 
     monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda _build: analyzer)
-    monkeypatch.setattr(launcher_exec, "discover_producer_identity", lambda *_args: _producer())
+    monkeypatch.setattr(
+        launcher_exec,
+        "snapshot_analyzer_binary",
+        lambda *_args: (analyzer, _contract(analyzer)),
+    )
     monkeypatch.setattr(launcher_exec, "_run_capture", fake_capture)
 
     asyncio.run(launcher_exec.run_analysis(tmp_path, subjects=["throughput"]))
 
     state = _read_state(tmp_path)
     assert state["status"] == "complete"
+    assert state["producer"] == _producer()
+    assert state["requested_subjects"] == ["throughput"]
     assert [call[1] if call[0] == str(analyzer) else call[2] for call in calls] == [
         "run",
         "render",
@@ -205,7 +361,11 @@ def test_run_analysis_keeps_render_failure_until_trace_stops(tmp_path: Path, mon
         return (1 if stage == "render" else 0), ""
 
     monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda _build: analyzer)
-    monkeypatch.setattr(launcher_exec, "discover_producer_identity", lambda *_args: _producer())
+    monkeypatch.setattr(
+        launcher_exec,
+        "snapshot_analyzer_binary",
+        lambda *_args: (analyzer, _contract(analyzer)),
+    )
     monkeypatch.setattr(launcher_exec, "_run_capture", fake_capture)
 
     asyncio.run(launcher_exec.run_analysis(tmp_path))
@@ -227,7 +387,11 @@ def test_run_analysis_distinguishes_trace_failure(tmp_path: Path, monkeypatch) -
         return (1 if stage == "trace" else 0), ""
 
     monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda _build: analyzer)
-    monkeypatch.setattr(launcher_exec, "discover_producer_identity", lambda *_args: _producer())
+    monkeypatch.setattr(
+        launcher_exec,
+        "snapshot_analyzer_binary",
+        lambda *_args: (analyzer, _contract(analyzer)),
+    )
     monkeypatch.setattr(launcher_exec, "_run_capture", fake_capture)
 
     asyncio.run(launcher_exec.run_analysis(tmp_path))
@@ -250,7 +414,11 @@ def test_run_analysis_compute_failure_never_starts_later_stages(
         return 1, ""
 
     monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda _build: analyzer)
-    monkeypatch.setattr(launcher_exec, "discover_producer_identity", lambda *_args: _producer())
+    monkeypatch.setattr(
+        launcher_exec,
+        "snapshot_analyzer_binary",
+        lambda *_args: (analyzer, _contract(analyzer)),
+    )
     monkeypatch.setattr(launcher_exec, "_run_capture", fake_capture)
 
     asyncio.run(launcher_exec.run_analysis(tmp_path))
@@ -268,7 +436,6 @@ def test_run_analysis_missing_binary_is_a_terminal_compute_failure(
 ) -> None:
     analyzer = tmp_path / "missing-analyze"
     monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda _build: analyzer)
-    monkeypatch.setattr(launcher_exec, "discover_producer_identity", lambda *_args: _producer())
 
     asyncio.run(launcher_exec.run_analysis(tmp_path))
 
@@ -288,7 +455,11 @@ def test_run_analysis_subprocess_exception_becomes_terminal_state(
         raise OSError("cannot spawn")
 
     monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda _build: analyzer)
-    monkeypatch.setattr(launcher_exec, "discover_producer_identity", lambda *_args: _producer())
+    monkeypatch.setattr(
+        launcher_exec,
+        "snapshot_analyzer_binary",
+        lambda *_args: (analyzer, _contract(analyzer)),
+    )
     monkeypatch.setattr(launcher_exec, "_run_capture", fail_capture)
 
     asyncio.run(launcher_exec.run_analysis(tmp_path))
@@ -296,3 +467,87 @@ def test_run_analysis_subprocess_exception_becomes_terminal_state(
     state = _read_state(tmp_path)
     assert state["status"] == "failed"
     assert state["failure_code"] == "compute_failed"
+
+
+def test_run_analysis_identity_failure_is_terminal_before_compute(
+    tmp_path: Path, monkeypatch
+) -> None:
+    analyzer = tmp_path / "analyze"
+    analyzer.touch()
+    compute_called = False
+
+    def fail_identity(*_args):
+        raise RuntimeError("identity unavailable")
+
+    async def fake_capture(_argv: list[str]) -> tuple[int, str]:
+        nonlocal compute_called
+        compute_called = True
+        return 0, ""
+
+    monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda _build: analyzer)
+    monkeypatch.setattr(launcher_exec, "snapshot_analyzer_binary", fail_identity)
+    monkeypatch.setattr(launcher_exec, "_run_capture", fake_capture)
+
+    asyncio.run(launcher_exec.run_analysis(tmp_path))
+
+    state = _read_state(tmp_path)
+    assert not compute_called
+    assert state["status"] == "failed"
+    assert state["failure_code"] == "producer_identity_unavailable"
+    assert state["producer"]["revision"] == "unavailable"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("subject", ["through-put", "alignment-e2e"])
+def test_run_analysis_invalid_run_subject_is_terminal_before_compute(
+    tmp_path: Path, monkeypatch, subject: str
+) -> None:
+    analyzer = tmp_path / "analyze"
+    analyzer.touch()
+    compute_called = False
+
+    async def fake_capture(_argv: list[str]) -> tuple[int, str]:
+        nonlocal compute_called
+        compute_called = True
+        return 0, ""
+
+    monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda _build: analyzer)
+    monkeypatch.setattr(
+        launcher_exec,
+        "snapshot_analyzer_binary",
+        lambda *_args: (analyzer, _contract(analyzer)),
+    )
+    monkeypatch.setattr(launcher_exec, "_run_capture", fake_capture)
+
+    asyncio.run(launcher_exec.run_analysis(tmp_path, subjects=[subject]))
+
+    state = _read_state(tmp_path)
+    assert not compute_called
+    assert state["status"] == "failed"
+    assert state["failure_code"] == "subject_selection_invalid"
+    assert state["requested_subjects"] is None
+
+
+def test_run_analysis_binary_change_after_compute_is_terminal(tmp_path: Path, monkeypatch) -> None:
+    analyzer = tmp_path / "analyze"
+    analyzer.touch()
+    original_contract = _contract(analyzer)
+
+    async def fake_capture(argv: list[str]) -> tuple[int, str]:
+        if argv[1] == "run":
+            analyzer.write_bytes(b"rebuilt analyzer")
+        return 0, ""
+
+    monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda _build: analyzer)
+    monkeypatch.setattr(
+        launcher_exec,
+        "snapshot_analyzer_binary",
+        lambda *_args: (analyzer, original_contract),
+    )
+    monkeypatch.setattr(launcher_exec, "_run_capture", fake_capture)
+
+    asyncio.run(launcher_exec.run_analysis(tmp_path))
+
+    state = _read_state(tmp_path)
+    assert state["status"] == "failed"
+    assert state["failure_code"] == "producer_identity_changed"
+    assert state["stages"]["render"]["status"] == "not_started"  # type: ignore[index]
