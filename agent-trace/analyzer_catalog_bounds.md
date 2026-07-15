@@ -29,7 +29,7 @@
 
 ## Validation
 
-- `cargo test -p analyzer --offline`: 96 passed.
+- `cargo test -p analyzer --offline`: 102 passed on the integrated main tree.
 - Catalog regressions prove concurrent cold requests perform one lifecycle body
   build, cached `200` and conditional `304` requests perform no lifecycle body
   reads, marker/timing mutation invalidates the cached ETag and lifecycle, and
@@ -49,3 +49,20 @@
   stable `artifact_generation_changed` response.
 - Scoped `rustfmt` and `cargo check -p analyzer --offline` are run on the final
   change set; `git diff --check` reports no whitespace errors.
+
+## Review
+
+独立审查首先发现预检后重新按路径打开文件会破坏累计预算，以及 metadata
+stamp 不能作为响应 bytes 的强 ETag；修复后又发现 per-file 上限先于 aggregate
+预算执行，会让一个坏 run 毒死整个 catalog。这三项均已修复并由 atomic
+replacement、response-body digest、single timing 16 MiB+1 与 pipeline 1 MiB+1
+回归锁定。最终复审确认 exact-FD fence、row-local failed 投影、catalog 413、
+singleflight、run cap 与三次 churn 后 409 均无 blocker。
+
+## Feedback
+
+当前冷建最多可暂存约两倍 run-count 的 lifecycle 文件描述符，且 singleflight
+锁位于 artifact permit 之后；1,024-run 上限使其在当前部署的 65,535 soft FD
+limit 内可控，但部署文档应保留 FD 预算要求。若规模继续增长，应优先降低或
+动态计算 run cap，并把 permit 获取移动到 singleflight leader 路径，避免等待者
+占用读取许可。
