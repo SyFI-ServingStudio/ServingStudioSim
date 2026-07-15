@@ -273,6 +273,8 @@ fn state(root: &TempDir) -> ServiceState {
         discovery: RwLock::new(DiscoveryCache::default()),
         discovery_refresh: AsyncMutex::new(()),
         discovery_scan_count: AtomicUsize::new(0),
+        catalog: RwLock::new(None),
+        catalog_build: StdMutex::new(()),
         descriptors: RwLock::new(HashMap::new()),
         descriptor_build: StdMutex::new(()),
         subject_proofs: RwLock::new(HashMap::new()),
@@ -439,6 +441,8 @@ fn repeated_logs_roots_keep_identical_relative_paths_distinct() {
         discovery: RwLock::new(DiscoveryCache::default()),
         discovery_refresh: AsyncMutex::new(()),
         discovery_scan_count: AtomicUsize::new(0),
+        catalog: RwLock::new(None),
+        catalog_build: StdMutex::new(()),
         descriptors: RwLock::new(HashMap::new()),
         descriptor_build: StdMutex::new(()),
         subject_proofs: RwLock::new(HashMap::new()),
@@ -1131,6 +1135,206 @@ async fn catalog_descriptor_and_artifact_honor_etag() {
             .unwrap()
             .is_empty());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_cold_build_is_singleflight_and_cache_hits_skip_lifecycle_bodies() {
+    let _observer_guard = ARTIFACT_READ_TEST_LOCK.lock().unwrap();
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_timing_generation(&run, &[("slo-general", "ok")], Some("catalog-generation"));
+    write_pipeline(
+        &run,
+        "catalog-generation",
+        "complete",
+        "complete",
+        "complete",
+        "failed",
+        Some(&["slo-general"]),
+        None,
+    );
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let (reads_tx, reads_rx) = std::sync::mpsc::channel();
+    set_artifact_read_observer(Some(reads_tx));
+
+    let first_request = app.clone().oneshot(
+        Request::builder()
+            .uri("/api/v1/runs")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let second_request = app.clone().oneshot(
+        Request::builder()
+            .uri("/api/v1/runs")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let (first, second) = tokio::join!(first_request, second_request);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let etag = first.headers()[header::ETAG].clone();
+    assert_eq!(second.headers()[header::ETAG], etag);
+
+    let cold_reads = reads_rx.try_iter().collect::<Vec<_>>();
+    assert_eq!(
+        cold_reads
+            .iter()
+            .filter(|path| *path == &run.join(PIPELINE_STATE_PATH))
+            .count(),
+        1
+    );
+    assert_eq!(
+        cold_reads
+            .iter()
+            .filter(|path| *path == &run.join("reports/analyzer_timing.json"))
+            .count(),
+        1
+    );
+
+    let cached = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs")
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached.status(), StatusCode::OK);
+    let conditional = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs")
+                .header(header::HOST, "localhost")
+                .header(header::IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+    set_artifact_read_observer(None);
+    assert!(reads_rx
+        .try_iter()
+        .all(|observed| !observed.starts_with(&run)));
+}
+
+#[tokio::test]
+async fn catalog_cache_invalidates_when_lifecycle_metadata_changes() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", false);
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs")
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_etag = first.headers()[header::ETAG].clone();
+    let first_body = body_json(first).await;
+    assert_eq!(first_body["runs"][0]["lifecycle"]["simulation"], "pending");
+    assert_eq!(
+        first_body["runs"][0]["lifecycle"]["analysis"],
+        "not_started"
+    );
+
+    fs::write(run.join(".complete"), b"").unwrap();
+    write_timing(&run, &[("slo-general", "ok")]);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs")
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_ne!(second.headers()[header::ETAG], first_etag);
+    let second_body = body_json(second).await;
+    assert_eq!(
+        second_body["runs"][0]["lifecycle"]["simulation"],
+        "complete"
+    );
+    assert_eq!(second_body["runs"][0]["lifecycle"]["analysis"], "complete");
+}
+
+#[tokio::test]
+async fn catalog_rejects_aggregate_lifecycle_input_before_reading_bodies() {
+    let _observer_guard = ARTIFACT_READ_TEST_LOCK.lock().unwrap();
+    let root = TempDir::new().unwrap();
+    let per_run_bytes = MAX_CATALOG_LIFECYCLE_BYTES / 2 + 1;
+    for name in ["run-a", "run-b"] {
+        let run = create_run(root.path(), name, "unified", true);
+        fs::create_dir_all(run.join("reports")).unwrap();
+        let timing = fs::File::create(run.join("reports/analyzer_timing.json")).unwrap();
+        timing.set_len(per_run_bytes).unwrap();
+    }
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let (reads_tx, reads_rx) = std::sync::mpsc::channel();
+    set_artifact_read_observer(Some(reads_tx));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs")
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let problem = body_json(response).await;
+    set_artifact_read_observer(None);
+    assert_eq!(problem["code"], "catalog_state_too_large");
+    assert!(reads_rx
+        .try_iter()
+        .all(|observed| !observed.starts_with(root.path())));
+}
+
+#[test]
+fn catalog_returns_stable_conflict_after_bounded_metadata_churn() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_timing(&run, &[("slo-general", "ok")]);
+    let service_state = state(&root);
+    let records = discover_runs(&service_state).unwrap();
+    let timing_path = run.join("reports/analyzer_timing.json");
+    let hook_calls = std::cell::Cell::new(0);
+
+    let result =
+        prepare_catalog_with_build_hook(&service_state, &HeaderMap::new(), &records, |attempt| {
+            hook_calls.set(hook_calls.get() + 1);
+            fs::write(&timing_path, vec![b' '; attempt + 1]).unwrap();
+        });
+    let problem = match result {
+        Err(problem) => problem,
+        Ok(_) => panic!("continuous metadata churn must exhaust the bounded fence"),
+    };
+
+    assert_eq!(hook_calls.get(), MAX_GENERATION_READ_ATTEMPTS);
+    assert_eq!(problem.status, StatusCode::CONFLICT);
+    assert_eq!(problem.code, "artifact_generation_changed");
+    assert_eq!(
+        problem.detail,
+        "Analyzer catalog lifecycle metadata changed during all 3 bounded read attempts."
+    );
 }
 
 #[test]

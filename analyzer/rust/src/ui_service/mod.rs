@@ -7,12 +7,14 @@
 //! surface even when a caller guesses their on-disk names.
 
 mod artifact;
+mod catalog;
 mod discovery;
 mod lifecycle;
 #[cfg(test)]
 mod tests;
 
 use artifact::*;
+use catalog::*;
 use discovery::*;
 use lifecycle::*;
 
@@ -57,6 +59,10 @@ const MAX_PIPELINE_STATE_BYTES: u64 = 1024 * 1024;
 // 1.49 MiB, so 16 MiB leaves ample evolution room without allowing one request
 // to reserve an unreviewed 128 MiB JSON document.
 const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
+// A catalog cold build reads pipeline/timing JSON across every discovered run.
+// Keep that fan-in within one service-wide budget instead of multiplying the
+// per-file JSON limit by the number of runs.
+const MAX_CATALOG_LIFECYCLE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TRACE_BYTES: u64 = 512 * 1024 * 1024;
 const CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_DESCRIPTOR_CACHE_ENTRIES: usize = 256;
@@ -82,6 +88,8 @@ struct ServiceState {
     discovery_refresh: AsyncMutex<()>,
     #[cfg(test)]
     discovery_scan_count: AtomicUsize,
+    catalog: RwLock<Option<Arc<CachedCatalog>>>,
+    catalog_build: StdMutex<()>,
     descriptors: RwLock<HashMap<String, CachedDescriptor>>,
     descriptor_build: StdMutex<()>,
     subject_proofs: RwLock<HashMap<SubjectProofKey, SubjectReadinessProof>>,
@@ -199,23 +207,6 @@ enum PipelineStateRead {
 struct Lifecycle {
     simulation: StageStatus,
     analysis: StageStatus,
-}
-
-#[derive(Debug, Serialize)]
-struct RunCatalog {
-    protocol_version: u32,
-    generated_at: String,
-    runs: Vec<RunCatalogEntry>,
-}
-
-#[derive(Debug, Serialize)]
-struct RunCatalogEntry {
-    run_id: String,
-    kind: &'static str,
-    display_name: String,
-    descriptor_href: String,
-    lifecycle: Lifecycle,
-    updated_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -472,6 +463,8 @@ fn router_with_hosts(logs_roots: Vec<PathBuf>, allow_hosts: Vec<String>) -> Resu
         discovery_refresh: AsyncMutex::new(()),
         #[cfg(test)]
         discovery_scan_count: AtomicUsize::new(0),
+        catalog: RwLock::new(None),
+        catalog_build: StdMutex::new(()),
         descriptors: RwLock::new(HashMap::new()),
         descriptor_build: StdMutex::new(()),
         subject_proofs: RwLock::new(HashMap::new()),
@@ -571,32 +564,13 @@ async fn list_runs(
     let records = discover_runs_cached(&state)
         .await
         .map_err(discovery_problem)?;
-    let bytes = run_blocking_artifact_task(&state, "catalog lifecycle", move || {
-        let generated_at = records
-            .iter()
-            .map(|run| run.updated_at)
-            .max()
-            .unwrap_or(UNIX_EPOCH);
-        let mut runs = Vec::with_capacity(records.len());
-        for run in records {
-            let lifecycle = lifecycle(&run);
-            runs.push(RunCatalogEntry {
-                descriptor_href: format!("runs/{}/descriptor", run.run_id),
-                run_id: run.run_id,
-                kind: "simulation",
-                display_name: run.display_name,
-                lifecycle,
-                updated_at: timestamp(run.updated_at),
-            });
-        }
-        encode_json(&RunCatalog {
-            protocol_version: PROTOCOL_VERSION,
-            generated_at: timestamp(generated_at),
-            runs,
-        })
+    let task_state = Arc::clone(&state);
+    let task_headers = headers.clone();
+    let prepared = run_blocking_artifact_task(&state, "catalog lifecycle", move || {
+        prepare_catalog(&task_state, &task_headers, &records)
     })
     .await?;
-    conditional_bytes(&headers, "application/json", bytes)
+    conditional_response("application/json", prepared)
 }
 
 async fn get_descriptor(

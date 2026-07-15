@@ -436,18 +436,6 @@ pub(super) fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ApiProblem
     })
 }
 
-pub(super) fn conditional_bytes(
-    headers: &HeaderMap,
-    content_type: &'static str,
-    bytes: Vec<u8>,
-) -> Result<Response, ApiProblem> {
-    let etag = format!("\"sha256-{}\"", hex(&Sha256::digest(&bytes)));
-    if if_none_match(headers, &etag) {
-        return conditional_response(content_type, ConditionalBody::NotModified { etag });
-    }
-    conditional_response(content_type, ConditionalBody::Bytes { etag, bytes })
-}
-
 pub(super) fn conditional_response(
     content_type: &'static str,
     prepared: ConditionalBody,

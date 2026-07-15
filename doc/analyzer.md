@@ -249,8 +249,13 @@ allowlist. Method rejection includes `Allow: GET`.
 
 Catalog discovery is cached for 30 seconds, refreshed by one single-flight scan
 on a blocking worker, and never runs a multi-gigabyte tree walk on an async
-request worker. Descriptor JSON has a bounded metadata-stamped cache. Artifact
-filesystem I/O and JSON parsing run on blocking workers behind one fail-fast,
+request worker. The catalog lifecycle projection has its own metadata-stamped,
+single-flight cache: the stamp covers ordered run ids and timestamps, completion
+markers, and pipeline/timing file identities. A cold build rejects more than 16
+MiB of aggregate pipeline/timing input before reading bodies, retries a changing
+snapshot three times, then fails with `artifact_generation_changed`. Descriptor
+JSON has a bounded metadata-stamped cache. Artifact filesystem I/O and JSON
+parsing run on blocking workers behind one fail-fast,
 four-permit service semaphore (`artifact_read_busy`, `Retry-After: 1` when
 saturated). Run-scope JSON is capped at 16 MiB per file; this is intentionally
 well above current bounded/downsampled payloads without retaining the previous

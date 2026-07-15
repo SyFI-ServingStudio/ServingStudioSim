@@ -214,7 +214,11 @@ does not require a full-file hash; non-Linux logs roots are a trusted-writer
 boundary.
 Catalog scans use a
 30-second single-flight cache on a blocking worker; descriptor parsing uses a
-bounded metadata-stamped cache. All artifact I/O/JSON parsing runs on bounded
+bounded metadata-stamped cache. Catalog lifecycle bytes are cached separately
+behind a stamp of the ordered runs, lifecycle markers, and pipeline/timing file
+identities. Cold catalog builds single-flight, reject more than 16 MiB of
+aggregate pipeline/timing input before reading bodies, and fail closed after
+three unstable metadata snapshots. All artifact I/O/JSON parsing runs on bounded
 blocking workers (four concurrent reads, fail-fast `artifact_read_busy` when
 saturated), and each run-scope JSON file is capped at 16 MiB. Descriptor-ready
 subject pairs keep a strong metadata proof, allowing report and payload routes
