@@ -2,6 +2,27 @@
 
 use super::*;
 
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
+
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::OwnedSemaphorePermit;
+
+fn acquire_artifact_read_permit(
+    state: &Arc<ServiceState>,
+) -> Result<OwnedSemaphorePermit, ApiProblem> {
+    Arc::clone(&state.artifact_reads)
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiProblem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "artifact_read_busy",
+                "Artifact readers are busy",
+                "The bounded artifact read limit is already in use; retry shortly.",
+            )
+        })
+}
+
 /// Execute filesystem access and JSON parsing outside Tokio's async workers.
 /// `try_acquire_owned` is intentionally fail-fast: a semaphore with an
 /// unbounded waiter queue would merely move the request-amplification problem.
@@ -14,16 +35,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ApiProblem> + Send + 'static,
 {
-    let permit = Arc::clone(&state.artifact_reads)
-        .try_acquire_owned()
-        .map_err(|_| {
-            ApiProblem::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "artifact_read_busy",
-                "Artifact readers are busy",
-                "The bounded artifact read limit is already in use; retry shortly.",
-            )
-        })?;
+    let permit = acquire_artifact_read_permit(state)?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         task()
@@ -37,6 +49,30 @@ where
             format!("The blocking {operation} task failed: {error}"),
         )
     })?
+}
+
+/// Prepare a streamed artifact on a blocking worker, but return its permit to
+/// the response body. Slow or abandoned clients therefore remain part of the
+/// same finite admission budget until their stream is consumed or dropped.
+pub(super) async fn run_blocking_stream_task<T, F>(
+    state: &Arc<ServiceState>,
+    operation: &'static str,
+    task: F,
+) -> Result<(T, OwnedSemaphorePermit), ApiProblem>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ApiProblem> + Send + 'static,
+{
+    let permit = acquire_artifact_read_permit(state)?;
+    let output = tokio::task::spawn_blocking(task).await.map_err(|error| {
+        ApiProblem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact_read_failed",
+            "Artifact read failed",
+            format!("The blocking {operation} task failed: {error}"),
+        )
+    })??;
+    Ok((output, permit))
 }
 
 pub(super) struct BoundedArtifact {
@@ -337,13 +373,16 @@ where
 {
     let artifact = open_bounded_artifact(run, relative, maximum, resource)?;
     let etag = metadata_etag("json-artifact-v1", &[(relative, &artifact.metadata)]);
-    if if_none_match(headers, &etag) {
+    if if_none_match_exact(headers, &etag) {
         return Ok(ConditionalBody::NotModified { etag });
     }
     let (bytes, _) = read_bounded_open_file(artifact, maximum, resource)?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| ApiProblem::artifact_incompatible(resource, error.to_string()))?;
     validate(&value)?;
+    if if_none_match(headers, &etag) {
+        return Ok(ConditionalBody::NotModified { etag });
+    }
     Ok(ConditionalBody::Bytes { etag, bytes })
 }
 
@@ -436,12 +475,29 @@ pub(super) struct PreparedTrace {
     etag: String,
 }
 
+struct PermitReader<R> {
+    inner: R,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for PermitReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
 pub(super) fn conditional_prepared_trace(
     headers: &HeaderMap,
     content_type: &'static str,
     prepared: PreparedTrace,
+    permit: OwnedSemaphorePermit,
 ) -> Result<Response, ApiProblem> {
     if if_none_match(headers, &prepared.etag) {
+        drop(permit);
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, prepared.etag)
@@ -450,8 +506,11 @@ pub(super) fn conditional_prepared_trace(
             .map_err(response_build_problem);
     }
 
-    let stream =
-        ReaderStream::new(tokio::fs::File::from_std(prepared.file).take(prepared.byte_length));
+    let reader = PermitReader {
+        inner: tokio::fs::File::from_std(prepared.file).take(prepared.byte_length),
+        _permit: permit,
+    };
+    let stream = ReaderStream::new(reader);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
@@ -556,6 +615,16 @@ pub(super) fn trace_metadata_etag(metadata: &fs::Metadata) -> String {
 }
 
 pub(super) fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    if_none_match_candidates(headers, etag, true)
+}
+
+/// Exact validators are safe before parsing a metadata-stable JSON artifact.
+/// RFC wildcard semantics are preserved by a second check after validation.
+pub(super) fn if_none_match_exact(headers: &HeaderMap, etag: &str) -> bool {
+    if_none_match_candidates(headers, etag, false)
+}
+
+fn if_none_match_candidates(headers: &HeaderMap, etag: &str, accept_wildcard: bool) -> bool {
     headers
         .get_all(header::IF_NONE_MATCH)
         .iter()
@@ -563,7 +632,8 @@ pub(super) fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
         .flat_map(|value| value.split(','))
         .map(str::trim)
         .any(|candidate| {
-            candidate == "*" || candidate.trim_start_matches("W/") == etag.trim_start_matches("W/")
+            (accept_wildcard && candidate == "*")
+                || candidate.trim_start_matches("W/") == etag.trim_start_matches("W/")
         })
 }
 

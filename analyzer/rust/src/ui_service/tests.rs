@@ -720,6 +720,75 @@ async fn saturated_artifact_reader_limit_fails_fast_with_stable_problem() {
     drop(held_permit);
 }
 
+#[tokio::test]
+async fn trace_stream_holds_its_artifact_reader_permit_until_body_drop() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing_generation(&run, &[("slo-general", "ok")], Some("generation-trace"));
+    fs::create_dir_all(run.join("traces")).unwrap();
+    fs::write(run.join("traces/current.pftrace.gz"), b"trace bytes").unwrap();
+    write_pipeline(
+        &run,
+        "generation-trace",
+        "complete",
+        "complete",
+        "complete",
+        "complete",
+        Some(&["slo-general"]),
+        Some("traces/current.pftrace.gz"),
+    );
+
+    let mut service_state = state(&root);
+    service_state.artifact_reads = Arc::new(Semaphore::new(1));
+    let service_state = Arc::new(service_state);
+    let run_id = discover_runs(&service_state).unwrap().remove(0).run_id;
+    let app = router_from_state(Arc::clone(&service_state));
+    let trace_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/runs/{run_id}/revisions/pipeline-generation-trace/traces/perfetto"
+                ))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(trace_response.status(), StatusCode::OK);
+    assert_eq!(service_state.artifact_reads.available_permits(), 0);
+
+    let saturated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/summary"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body_json(saturated).await["code"], "artifact_read_busy");
+
+    drop(trace_response);
+    assert_eq!(service_state.artifact_reads.available_permits(), 1);
+    let after_drop = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/summary"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_drop.status(), StatusCode::OK);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn artifact_io_runs_on_a_blocking_worker() {
     let root = TempDir::new().unwrap();
@@ -764,6 +833,30 @@ async fn matching_metadata_etag_returns_before_reading_invalid_json() {
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn wildcard_etag_does_not_bypass_json_validation() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    fs::write(run.join("summary.json"), b"not json").unwrap();
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/summary"))
+                .header(header::HOST, "localhost")
+                .header(header::IF_NONE_MATCH, "*")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body_json(response).await["code"], "artifact_incompatible");
 }
 
 #[tokio::test]
@@ -1334,6 +1427,72 @@ async fn stale_revision_link_fails_closed_after_generation_cutover() {
         .unwrap();
     assert_eq!(current.status(), StatusCode::OK);
     assert_eq!(body_json(current).await["marker"], "new-bytes");
+}
+
+#[tokio::test]
+async fn current_revision_non_ready_subject_is_not_a_generation_conflict() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    publish_subject_generation(&run, "generation-current", "current-bytes");
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/runs/{run_id}/revisions/pipeline-generation-current/reports/throughput"
+                ))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(response).await["code"], "resource_not_ready");
+}
+
+#[tokio::test]
+async fn descriptor_ready_subject_remains_readable_while_simulation_is_pending() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", false);
+    publish_subject_generation(&run, "generation-current", "current-bytes");
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let descriptor = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/descriptor"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(descriptor.status(), StatusCode::OK);
+    let descriptor = body_json(descriptor).await;
+    assert_eq!(descriptor["lifecycle"]["simulation"], "pending");
+    assert_eq!(descriptor["subjects"]["slo-general"]["status"], "ready");
+    let report_href = descriptor["subjects"]["slo-general"]["report_href"]
+        .as_str()
+        .unwrap();
+
+    let report = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/{report_href}"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.status(), StatusCode::OK);
+    assert_eq!(body_json(report).await["marker"], "current-bytes");
 }
 
 #[test]

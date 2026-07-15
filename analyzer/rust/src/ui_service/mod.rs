@@ -836,7 +836,7 @@ fn prepare_topology(headers: &HeaderMap, run: &RunRecord) -> Result<ConditionalB
             (run_meta_relative, &run_meta_artifact.metadata),
         ],
     );
-    if if_none_match(headers, &etag) {
+    if if_none_match_exact(headers, &etag) {
         return Ok(ConditionalBody::NotModified { etag });
     }
     let (params_bytes, _) =
@@ -853,6 +853,9 @@ fn prepare_topology(headers: &HeaderMap, run: &RunRecord) -> Result<ConditionalB
             "topology",
             "params and run_meta must both be JSON objects",
         ));
+    }
+    if if_none_match(headers, &etag) {
+        return Ok(ConditionalBody::NotModified { etag });
     }
     let bytes = encode_json(&serde_json::json!({
         "schema_version": TOPOLOGY_SCHEMA_VERSION,
@@ -935,10 +938,8 @@ fn prepare_subject_artifact(
     let deployment = read_deployment(run)?;
     with_consistent_analysis_snapshot(run, |snapshot| {
         snapshot.require_revision(revision)?;
-        let lifecycle = lifecycle_from(run, snapshot.pipeline(), snapshot.timing());
-        if lifecycle.simulation == StageStatus::Pending
-            || subject_preflight_state(subject, &deployment, snapshot.pipeline(), snapshot.timing())
-                .is_some()
+        if subject_preflight_state(subject, &deployment, snapshot.pipeline(), snapshot.timing())
+            .is_some()
         {
             return Err(subject_not_ready(subject_id));
         }
@@ -970,17 +971,22 @@ fn get_subject_readiness_proof(
 
     let cached = get_or_build_descriptor(state, run, run_id)?;
     cache_readiness_proofs(state, run_id, cached.subject_proofs.clone())?;
+    let current_revision = cached
+        .analysis_proof
+        .as_ref()
+        .map(|proof| proof.revision.as_str());
     cached
         .subject_proofs
         .into_iter()
         .find_map(|(proof_revision, proof_subject, proof)| {
             (proof_revision == revision && proof_subject == subject.name).then_some(proof)
         })
-        .ok_or_else(|| {
-            ApiProblem::artifact_generation_changed(format!(
+        .ok_or_else(|| match current_revision {
+            Some(current) if current == revision => subject_not_ready(subject.name),
+            _ => ApiProblem::artifact_generation_changed(format!(
                 "Revision {revision:?} has no cached ready pair for subject {:?}; refresh the descriptor.",
                 subject.name
-            ))
+            )),
         })
 }
 
@@ -1081,8 +1087,8 @@ async fn get_perfetto_trace(
 ) -> Result<Response, ApiProblem> {
     let run = resolve_run(&state, &run_id).await?;
     let task_state = Arc::clone(&state);
-    let (media_type, prepared) =
-        run_blocking_artifact_task(&state, "Perfetto trace preparation", move || {
+    let ((media_type, prepared), permit) =
+        run_blocking_stream_task(&state, "Perfetto trace preparation", move || {
             let cached = get_or_build_descriptor(&task_state, &run, &run_id)?;
             let proof = cached.analysis_proof.ok_or_else(|| {
                 ApiProblem::artifact_generation_changed(
@@ -1132,7 +1138,7 @@ async fn get_perfetto_trace(
             })
         })
         .await?;
-    conditional_prepared_trace(&headers, media_type, prepared)
+    conditional_prepared_trace(&headers, media_type, prepared, permit)
 }
 
 fn prepare_legacy_trace(
