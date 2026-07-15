@@ -269,7 +269,7 @@ async fn scalar_count(ctx: &SessionContext, where_clause: &str) -> Result<usize>
 
 // ── time fold ──────────────────────────────────────────────────────────────
 
-// `node_time` (the local cost fold: Leaf=slot, Sum=Σ, Max=max,
+// `node_time` (the local cost fold: Leaf=slot, Sum=Σ, Max=max/overlap,
 // Scale=n×child) now lives in `crate::trace::manifest` — shared with
 // `trace::place`'s critical-path collapse — and is imported at the top.
 
@@ -680,8 +680,8 @@ mod tests {
         }
     }
 
-    /// Same mixed tree as `place.rs`: Sum( Leaf0, Scale{3}( Max[Leaf1,Leaf2] ), Leaf3 ).
-    /// BFS-flat: 0 Sum{1..4} 1 Leaf0 2 Scale{3,4..5} 3 Leaf3 4 Max{1,5..7} 5 Leaf1 6 Leaf2.
+    /// Same mixed tree as `place.rs`: Sum( Leaf0, Scale{3}( Max{2}[Leaf1,Leaf2] ), Leaf3 ).
+    /// BFS-flat: 0 Sum{1..4} 1 Leaf0 2 Scale{3,4..5} 3 Leaf3 4 Max{2,5..7} 5 Leaf1 6 Leaf2.
     fn mixed() -> Manifest {
         serde_json::from_str(
             r#"{
@@ -696,7 +696,7 @@ mod tests {
                 {"Leaf": 0},
                 {"Scale": {"n": 3, "children": {"start": 4, "end": 5}}},
                 {"Leaf": 3},
-                {"Max": {"overlap": 1.0, "children": {"start": 5, "end": 7}}},
+                {"Max": {"overlap": 2.0, "children": {"start": 5, "end": 7}}},
                 {"Leaf": 1},
                 {"Leaf": 2}
               ],
@@ -709,11 +709,11 @@ mod tests {
     #[test]
     fn node_time_matches_place_fold() {
         let m = mixed();
-        // a=10, b=8, c=4, d=5. Max[8,4]=8; Scale{3}(8)=24; Sum(10,24,5)=39.
+        // a=10, b=8, c=4, d=5. Max{2}[8,4]=4; Scale{3}(4)=12; Sum=27.
         let slot_ns = [10i64, 8, 4, 5];
-        assert_eq!(node_time(&m, 0, &slot_ns), 39);
-        assert_eq!(node_time(&m, 4, &slot_ns), 8, "Max[8,4]");
-        assert_eq!(node_time(&m, 2, &slot_ns), 24, "Scale{{3}}(8)");
+        assert_eq!(node_time(&m, 0, &slot_ns), 27);
+        assert_eq!(node_time(&m, 4, &slot_ns), 4, "Max{{2}}[8,4]");
+        assert_eq!(node_time(&m, 2, &slot_ns), 12, "Scale{{3}}(4)");
     }
 
     #[test]
@@ -728,14 +728,14 @@ mod tests {
         };
         let mut lines = Vec::new();
         r.render(0, 1, &root_indent(), true, None, &mut lines);
-        // The Scale line and the Max child under it both show 24ns (the ×3
-        // whole-iteration contribution), not the 8ns single-layer time.
+        // The Scale line and the Max child under it both show 12ns (the ×3
+        // whole-iteration contribution), not the 4ns single-layer time.
         let scale_line = lines.iter().find(|l| l.plain.contains("layer ×3")).unwrap();
-        assert_eq!(scale_line.time_ns, 24);
+        assert_eq!(scale_line.time_ns, 12);
         let attn_line = lines.iter().find(|l| l.plain.contains("attn")).unwrap();
         assert_eq!(
-            attn_line.time_ns, 24,
-            "Max child ×3 = 24, scale passed through"
+            attn_line.time_ns, 12,
+            "Max child ×3 = 12, scale passed through"
         );
     }
 
@@ -823,13 +823,13 @@ mod tests {
         };
         let mut lines = Vec::new();
         r.render(0, 1, &root_indent(), true, None, &mut lines);
-        // root (Sum=39) critical; its max child is Scale (24) > Leaf0 (10) > Leaf3 (5).
+        // root (Sum=27) critical; its max child is Scale (12) > Leaf0 (10) > Leaf3 (5).
         let total = lines.iter().find(|l| l.plain == "total").unwrap();
         assert!(total.critical);
         let scale = lines.iter().find(|l| l.plain.contains("layer ×3")).unwrap();
-        assert!(scale.critical, "Scale(24) is the max child of root");
+        assert!(scale.critical, "Scale(12) is the max child of root");
         let leaf_a = lines.iter().find(|l| l.plain.contains("a (k)")).unwrap();
-        assert!(!leaf_a.critical, "Leaf0(10) < Scale(24), off critical path");
+        assert!(!leaf_a.critical, "Leaf0(10) < Scale(12), off critical path");
     }
 
     #[test]

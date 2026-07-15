@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write;
 use std::ops::Range;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::timing::slot_input::SlotInput;
 use crate::timing::LeafMetrics;
@@ -35,10 +35,12 @@ pub enum CostNode {
     Leaf(usize),
     /// `Σ children` (serial composition; time/flops/bytes all sum).
     Sum(Vec<CostNode>),
-    /// Synchronized fan-out: wallclock `= max(children)`. The build API exposes
-    /// no overlap coefficient: protocol v1 has only this pure-max semantic. The
-    /// compatibility field lives exclusively in [`FlatCostNode::Max`].
-    Max { children: Vec<CostNode> },
+    /// Fan-out: wallclock `= max(children) / overlap`. The coefficient belongs
+    /// to the composition boundary; leaf work still remains fully accounted.
+    Max {
+        overlap: f32,
+        children: Vec<CostNode>,
+    },
     /// Fold: `n ×` an identical child subtree — the homogeneous-layer repeat,
     /// evaluated once and scaled, never materialized `n` times (INV-3).
     Scale { n: u32, child: Box<CostNode> },
@@ -61,10 +63,6 @@ pub enum FlatCostNode {
         children: Range<usize>,
     },
     Max {
-        /// Protocol-v1 wire compatibility only. [`CostTree::flatten`] always
-        /// writes `1.0`, and deserialization rejects every other value. A
-        /// measured overlap model requires a new protocol version.
-        #[serde(deserialize_with = "deserialize_v1_overlap")]
         overlap: f32,
         children: Range<usize>,
     },
@@ -72,22 +70,6 @@ pub enum FlatCostNode {
         n: u32,
         children: Range<usize>,
     },
-}
-
-/// Decode the protocol-v1 compatibility field without admitting a second
-/// authoring semantic through manifests produced outside this crate.
-fn deserialize_v1_overlap<'de, D>(deserializer: D) -> Result<f32, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let overlap = f32::deserialize(deserializer)?;
-    if overlap == 1.0 {
-        Ok(overlap)
-    } else {
-        Err(serde::de::Error::custom(
-            "CostTree protocol v1 requires FlatCostNode::Max overlap to equal 1.0",
-        ))
-    }
 }
 
 /// Per-slot manifest entry: the dotted leaf name plus the kernel identity folded
@@ -361,12 +343,10 @@ impl CostTree {
                     let range = Self::reserve(&mut out, &mut labels, &mut queue, children);
                     FlatCostNode::Sum { children: range }
                 }
-                CostNode::Max { children } => {
+                CostNode::Max { overlap, children } => {
                     let range = Self::reserve(&mut out, &mut labels, &mut queue, children);
                     FlatCostNode::Max {
-                        // Keep the v1 manifest shape stable while making any
-                        // other value unrepresentable through the build API.
-                        overlap: 1.0,
+                        overlap: *overlap,
                         children: range,
                     }
                 }
@@ -425,7 +405,7 @@ impl CostTree {
     /// Composites combine:
     ///   - `Sum`  — field-wise sum of children (coverage flags unioned);
     ///   - `Scale{n}` — child subtree × `n` (the homogeneous-layer fold);
-    ///   - `Max` — `time = max(child.time)`, other fields summed
+    ///   - `Max{overlap}` — `time = max(child.time) / overlap`, other fields summed
     ///     (flops/bytes/energy always add — work doesn't overlap away, INV-4).
     /// Coverage flags always OR up the tree, so a warning anywhere surfaces at
     /// the root.
@@ -468,7 +448,7 @@ impl CostTree {
                     acc.scale(*n as f32);
                     acc
                 }
-                FlatCostNode::Max { children, .. } => {
+                FlatCostNode::Max { overlap, children } => {
                     let mut acc = LeafMetrics::ZERO;
                     let mut max_time = 0.0f32;
                     for c in children.clone() {
@@ -476,7 +456,7 @@ impl CostTree {
                         max_time = max_time.max(cm.m.time_ms);
                         acc.add(cm);
                     }
-                    acc.m.time_ms = max_time;
+                    acc.m.time_ms = max_time / overlap;
                     acc
                 }
             };
@@ -505,8 +485,8 @@ impl CostTree {
                     self.write_node(c, depth + 1, out);
                 }
             }
-            CostNode::Max { children } => {
-                writeln!(out, "{ind}Max").unwrap();
+            CostNode::Max { overlap, children } => {
+                writeln!(out, "{ind}Max{{overlap={overlap}}}").unwrap();
                 for c in children {
                     self.write_node(c, depth + 1, out);
                 }
@@ -727,19 +707,19 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
     }
 
     #[test]
-    fn aggregate_max_takes_slowest_time_but_sums_work() {
-        // Build Max(leaf x, leaf y): time = max(x,y), flops/bytes sum. Its flat
-        // protocol-v1 representation retains the fixed `overlap=1` field.
+    fn aggregate_max_applies_overlap_but_sums_work() {
+        // Max{overlap=2}(leaf x, leaf y): time = max(x,y)/2, flops/bytes sum.
         let mut b = CostTreeBuilder::new();
         let root = CostNode::Max {
+            overlap: 2.0,
             children: vec![b.leaf("x", "kx", "", vec![]), b.leaf("y", "ky", "", vec![])],
         };
         let tree = b.finish(root);
-        assert!(tree.describe().starts_with("Max\n"));
+        assert!(tree.describe().starts_with("Max{overlap=2}"));
         let flat = tree.flatten();
-        assert!(matches!(flat[0], FlatCostNode::Max { overlap: 1.0, .. }));
+        assert!(matches!(flat[0], FlatCostNode::Max { overlap: 2.0, .. }));
         let wire_json = serde_json::to_string(&flat[0]).unwrap();
-        assert!(wire_json.contains(r#""overlap":1.0"#));
+        assert!(wire_json.contains(r#""overlap":2.0"#));
         assert_eq!(
             serde_json::from_str::<FlatCostNode>(&wire_json).unwrap(),
             flat[0]
@@ -747,21 +727,25 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
         let buf = [leaf(4.0, 10.0, 100.0), leaf(6.0, 20.0, 200.0)];
         let mut scratch = Vec::new();
         let total = CostTree::aggregate(&flat, &buf, &mut scratch).m;
-        assert_eq!(total.time_ms, 6.0); // synchronized fan-out waits for the slowest branch
+        assert_eq!(total.time_ms, 3.0);
         assert_eq!(total.flops, 30.0); // work still sums (INV-4)
         assert_eq!(total.bytes, 300.0);
     }
 
     #[test]
-    fn wire_decoder_rejects_unversioned_overlap_semantics() {
-        let json = r#"{"Max":{"overlap":1.01,"children":{"start":1,"end":3}}}"#;
-        let error = serde_json::from_str::<FlatCostNode>(json).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("FlatCostNode::Max overlap to equal 1.0"),
-            "unexpected decode error: {error}"
-        );
+    fn aggregate_max_overlap_one_preserves_existing_fanout_result() {
+        let mut b = CostTreeBuilder::new();
+        let root = CostNode::Max {
+            overlap: 1.0,
+            children: vec![b.leaf("x", "kx", "", vec![]), b.leaf("y", "ky", "", vec![])],
+        };
+        let flat = b.finish(root).flatten();
+        let buf = [leaf(4.0, 10.0, 100.0), leaf(6.0, 20.0, 200.0)];
+        let mut scratch = Vec::new();
+        let total = CostTree::aggregate(&flat, &buf, &mut scratch).m;
+        assert_eq!(total.time_ms, 6.0);
+        assert_eq!(total.flops, 30.0);
+        assert_eq!(total.bytes, 300.0);
     }
 
     #[test]

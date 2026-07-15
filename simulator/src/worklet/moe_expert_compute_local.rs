@@ -2,7 +2,7 @@
 //! between MoE dispatch and MoE combine): grouped-up_gate → SwiGLU activation →
 //! grouped-down. `Local` group suffix (L3 §1.5): one sync section on ONE GPU,
 //! no collective inside. The arch wraps `ep_size` independent instances of this
-//! worklet under a `Max` so the slowest EP rank's expert compute is the
+//! worklet under a `Max{1.0}` so the slowest EP rank's expert compute is the
 //! cell's wallclock (L4 §3.3 fan-out for per-GPU imbalance).
 //!
 //! `local_ppm` is this rank's SHARD of the global routing distribution (one

@@ -9,21 +9,7 @@
 
 use std::ops::Range;
 
-use serde::{de::Error as _, Deserialize, Deserializer};
-
-fn deserialize_v1_overlap<'de, D>(deserializer: D) -> Result<f32, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let overlap = f32::deserialize(deserializer)?;
-    if overlap == 1.0 {
-        Ok(overlap)
-    } else {
-        Err(D::Error::custom(format!(
-            "CostTree protocol v1 requires Max overlap to equal 1.0, received {overlap}"
-        )))
-    }
-}
+use serde::Deserialize;
 
 /// Per-slot leaf identity (kernel kind + one-line config). Slot index = position
 /// in `slot_time_ms` / `slot_input` parquet list columns.
@@ -54,7 +40,6 @@ pub enum FlatCostNode {
         children: Range<usize>,
     },
     Max {
-        #[serde(deserialize_with = "deserialize_v1_overlap")]
         overlap: f32,
         children: Range<usize>,
     },
@@ -107,8 +92,7 @@ impl ManifestDoc {
 
 /// Aggregate duration (ns) of the subtree rooted at node `idx`, folding this
 /// tree the same way the sim did to produce `total_time_ms`: Leaf = its slot,
-/// Sum = Σ children, Max = max(children), Scale = n × child. Protocol v1
-/// validates the retained Max `overlap` field as exactly `1.0`. Ancestor
+/// Sum = Σ children, Max = max(children) / overlap, Scale = n × child. Ancestor
 /// `Scale`s are NOT applied (this is the node's own local fold). The root's
 /// value reproduces `total_time_ms` up to per-leaf ns rounding.
 ///
@@ -120,11 +104,15 @@ pub(crate) fn node_time(m: &Manifest, idx: usize, slot_ns: &[i64]) -> i64 {
     match &m.nodes[idx] {
         FlatCostNode::Leaf(slot) => slot_ns.get(*slot).copied().unwrap_or(0),
         FlatCostNode::Sum { children } => children.clone().map(|c| node_time(m, c, slot_ns)).sum(),
-        FlatCostNode::Max { children, .. } => children
-            .clone()
-            .map(|c| node_time(m, c, slot_ns))
-            .max()
-            .unwrap_or(0),
+        FlatCostNode::Max { overlap, children } => {
+            let max_duration = children
+                .clone()
+                .map(|c| node_time(m, c, slot_ns))
+                .max()
+                .unwrap_or(0);
+            let overlap = (*overlap as f64).max(1e-9);
+            (max_duration as f64 / overlap).round() as i64
+        }
         FlatCostNode::Scale { n, children } => (*n as i64) * node_time(m, children.start, slot_ns),
     }
 }
@@ -187,20 +175,6 @@ mod tests {
         assert_eq!(
             m.node_labels[0].as_deref(),
             Some("m [dense local, 32 layers]")
-        );
-    }
-
-    #[test]
-    fn rejects_unversioned_overlap_semantics() {
-        let error = serde_json::from_str::<FlatCostNode>(
-            r#"{"Max":{"overlap":1.01,"children":{"start":1,"end":2}}}"#,
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("CostTree protocol v1 requires Max overlap to equal 1.0"),
-            "unexpected error: {error}"
         );
     }
 }

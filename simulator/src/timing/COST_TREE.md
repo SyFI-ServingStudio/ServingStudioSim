@@ -19,18 +19,13 @@ The build-time tree is a recursive `CostNode`; the eval-time form is the flat
 | `Leaf(slot)` | one L1 primitive; `slot` indexes the per-iter buffer | from cache | from cache |
 | `Sum(children)` | serial composition | Σ children | Σ children |
 | `Scale{n, child}` | homogeneous-layer fold: `n ×` one child subtree | `n ×` | `n ×` |
-| `Max{children}` | synchronized fan-out | `max(child.time)` | **Σ children** (work never overlaps away) |
+| `Max{overlap, children}` | fan-out / overlap | `max(child.time) / overlap` | **Σ children** (work never overlaps away) |
 | `Labeled{label, child}` | render-only identity wrapper | — | — (dropped at flatten) |
 
-`flops`/`bytes`/`energy` **always sum**; `Scale` changes `time`, while `Max`
-selects the slowest branch (INV-4). The build API is deliberately
-`CostNode::Max { children }`, so an author cannot express any second overlap
-semantic. Protocol v1 keeps `FlatCostNode::Max { overlap, children }` only as a
-compatible wire shape: `flatten()` always writes `overlap = 1.0`, and serde
-rejects every other value while decoding. A future measured overlap model must
-introduce an explicitly versioned semantic instead of overloading this field.
-`coverage` flags always OR up the tree, so an off-grid leaf anywhere surfaces at
-the root.
+`flops`/`bytes`/`energy` **always sum**; only `Scale` and `Max{overlap}` change
+`time` (INV-4). `overlap` is a composition coefficient: it shortens the
+synchronized fan-out wallclock without erasing any child work. `coverage` flags
+always OR up the tree, so an off-grid leaf anywhere surfaces at the root.
 
 `Scale` is the key economy: a 32-layer model evaluates one layer subtree and
 multiplies, never materializing 32 copies. Use it **only for provably-identical
@@ -69,8 +64,7 @@ for i in (0..flat.len()).rev() {
         Leaf(slot)            => buf[*slot],
         Sum { children }      => Σ scratch[children],
         Scale { n, children } => (Σ scratch[children]) × n,
-        // FlatCostNode wire form; overlap is fixed and decode-gated in v1.
-        Max { overlap: 1, children } => { time = max; work = Σ },
+        Max { overlap, children } => { time = max / overlap; work = Σ },
     };
 }
 // scratch[0] (the root) is the answer.
@@ -128,9 +122,8 @@ Sum
   (`Evaluator`) share one walk.
 - **INV-3** `Scale`/fold only for provably-identical subtrees; heterogeneous
   fan-out uses `Max` with N children.
-- **INV-4** `flops`/`bytes`/`energy` always sum; build-time `Max{children}`
-  selects the slowest branch and `Scale` multiplies `time`; `coverage` always
-  ORs up. The fixed v1 compatibility field is a wire concern only.
+- **INV-4** `flops`/`bytes`/`energy` always sum; only `Max{overlap}` and `Scale`
+  touch `time`; `coverage` always ORs up.
 - **INV-5** names/labels live only in compile-time products (`CostManifest`);
   the hot path and log rows are name-free, reconstructed via slot position +
   manifest.
@@ -139,4 +132,5 @@ Sum
   builds in no taxonomy.
 
 > The dense vertical currently emits only `Leaf` / `Sum` / `Scale`; `Max` is
-> defined for the full algebra and lands with the first fan-out (HP / EP) path.
+> defined for the full algebra and lands with the first overlap/fan-out
+> (HP / EP) path.

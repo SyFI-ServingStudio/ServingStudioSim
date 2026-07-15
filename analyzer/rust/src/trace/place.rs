@@ -53,7 +53,7 @@ impl<'a> Placer<'a> {
     /// Place the whole tree (root = node 0) on `track` starting at `t0` ns.
     /// Returns the laid-out duration in ns (≈ `total_time_ms`, the drift guard).
     pub fn place_root(&self, w: &mut TraceWriter, track: u64, t0: i64) -> i64 {
-        self.place(w, track, 0, t0)
+        self.place(w, track, 0, t0, 1.0)
     }
 
     /// The composite label the arch attached to flat node `idx` (worklet name,
@@ -69,15 +69,14 @@ impl<'a> Placer<'a> {
         self.node_label(idx).unwrap_or(default).to_string()
     }
 
-    /// Place node `idx` at `t0`, returning its displayed duration in ns.
-    /// Protocol-v1 `Max` is a synchronized fan-out: expanded mode draws every
-    /// lane at its natural duration, while critical mode keeps only the slowest
-    /// branch on the parent track.
-    fn place(&self, w: &mut TraceWriter, track: u64, idx: usize, t0: i64) -> i64 {
+    /// Place node `idx` at `t0`, returning its displayed duration in ns. Natural
+    /// leaf time is multiplied by `scale`; a critical-path `Max` uses that scale
+    /// to compress its bottleneck subtree into `max(child) / overlap`.
+    fn place(&self, w: &mut TraceWriter, track: u64, idx: usize, t0: i64, scale: f64) -> i64 {
         match &self.manifest.nodes[idx] {
             FlatCostNode::Leaf(slot) => {
                 let leaf_ns = self.slot_ns.get(*slot).copied().unwrap_or(0);
-                let dur = leaf_ns;
+                let dur = ((leaf_ns as f64) * scale).round() as i64;
                 let desc = &self.manifest.slots[*slot];
                 let mut anns = vec![
                     Annotation::str("kind", desc.kind.clone()),
@@ -113,7 +112,7 @@ impl<'a> Placer<'a> {
                 w.begin(track, t0, &label, &[]);
                 let mut t = t0;
                 for c in children.clone() {
-                    t += self.place(w, track, c, t);
+                    t += self.place(w, track, c, t, scale);
                 }
                 w.end(track, t);
                 t - t0
@@ -138,35 +137,37 @@ impl<'a> Placer<'a> {
                         None => format!("[{l}]"),
                     };
                     w.begin(track, t, &name, &[]);
-                    let d = self.place(w, track, child, t);
+                    let d = self.place(w, track, child, t, scale);
                     w.end(track, t + d);
                     t += d;
                 }
                 w.end(track, t);
                 t - t0
             }
-            FlatCostNode::Max { children, .. } => {
+            FlatCostNode::Max { overlap, children } => {
                 let label = self.label_or(idx, "max");
                 w.begin(track, t0, &label, &[]);
                 let dd = if self.expanded {
-                    // Each branch gets its own child-track lane starting at t0;
-                    // the synchronized parent ends with the slowest lane.
+                    // Draw every natural branch on its own lane; only the parent
+                    // synchronization window is shortened by overlap.
                     let mut maxd = 0i64;
                     for (i, c) in children.clone().enumerate() {
                         let lane = w.child_track(track, &format!("lane {i}"), i as u64);
-                        maxd = maxd.max(self.place(w, lane, c, t0));
+                        maxd = maxd.max(self.place(w, lane, c, t0, scale));
                     }
-                    maxd
+                    ((maxd as f64) / (*overlap as f64)).round() as i64
                 } else {
                     // Critical-path collapse: place ONLY the bottleneck branch
-                    // (largest `node_time`) inline on this same track. The wrapper
-                    // and child have the same natural duration, with no synthetic
-                    // compression or sub-ns overhang.
+                    // inline, compressed so its displayed duration equals this
+                    // Max node's effective overlap-adjusted window.
                     let crit = children
                         .clone()
                         .max_by_key(|&c| node_time(self.manifest, c, self.slot_ns))
                         .expect("Max node has at least one child");
-                    self.place(w, track, crit, t0)
+                    let crit_natural = node_time(self.manifest, crit, self.slot_ns).max(1);
+                    let effective = ((crit_natural as f64) / (*overlap as f64)).round() as i64;
+                    let child_scale = scale * (effective as f64) / (crit_natural as f64);
+                    self.place(w, track, crit, t0, child_scale)
                 };
                 w.end(track, t0 + dd);
                 dd
@@ -281,11 +282,10 @@ mod tests {
         assert_eq!(slice_pairs_per_iter(&m), 12);
     }
 
-    /// A hand-built tree mixing all three composites, covering a synchronized
-    /// `Max` nested inside `Scale` inside `Sum`:
-    ///   Sum( Leaf0, Scale{3}( Max[ Leaf1, Leaf2 ] ), Leaf3 )
+    /// A hand-built tree mixing all three composites:
+    ///   Sum( Leaf0, Scale{3}( Max{2}[ Leaf1, Leaf2 ] ), Leaf3 )
     /// BFS-flat layout (parent index < its contiguous child range):
-    ///   0 Sum{1..4}  1 Leaf0  2 Scale{3,4..5}  3 Leaf3  4 Max{1,5..7}  5 Leaf1  6 Leaf2
+    ///   0 Sum{1..4}  1 Leaf0  2 Scale{3,4..5}  3 Leaf3  4 Max{2,5..7}  5 Leaf1  6 Leaf2
     fn mixed() -> Manifest {
         serde_json::from_str(
             r#"{
@@ -300,7 +300,7 @@ mod tests {
                 {"Leaf": 0},
                 {"Scale": {"n": 3, "children": {"start": 4, "end": 5}}},
                 {"Leaf": 3},
-                {"Max": {"overlap": 1.0, "children": {"start": 5, "end": 7}}},
+                {"Max": {"overlap": 2.0, "children": {"start": 5, "end": 7}}},
                 {"Leaf": 1},
                 {"Leaf": 2}
               ],
@@ -314,7 +314,7 @@ mod tests {
     fn placed_dur_mixes_sum_scale_max_expanded() {
         let m = mixed();
         // slots: a=10, b=8, c=4, d=5.
-        // Max[b=8, c=4] = 8; Scale{3}(8) = 24; Sum(10, 24, 5) = 39.
+        // Max{2}[b=8, c=4] = 4; Scale{3}(4) = 12; Sum(10, 12, 5) = 27.
         let slot_ns = [10i64, 8, 4, 5];
         let inputs: [String; 0] = [];
         let placer = Placer::new(&m, &slot_ns, &inputs, &[], &[], true); // expanded (lanes)
@@ -322,7 +322,7 @@ mod tests {
         let p = w.process_track(0, "w");
         let t = w.thread_track(p, 0, 0, "n");
         let dur = placer.place_root(&mut w, t, 0);
-        assert_eq!(dur, 39, "Sum(10, Scale{{3}}(Max(8,4)=8)=24, 5)");
+        assert_eq!(dur, 27, "Sum(10, Scale{{3}}(Max{{2}}(8,4)=4)=12, 5)");
         // Expanded mode fans the Max into child-track lanes.
         let bytes = w.into_gzip().unwrap();
         assert_eq!(&bytes[..2], &[0x1f, 0x8b]);
@@ -333,8 +333,8 @@ mod tests {
         );
     }
 
-    /// Critical mode collapses the `Max` onto the parent track at the bottleneck
-    /// branch's natural duration and emits no child-track lane.
+    /// Critical mode collapses the `Max` onto the parent track and compresses
+    /// the bottleneck branch by the overlap coefficient.
     #[test]
     fn placed_dur_critical_collapses_max() {
         let m = mixed();
@@ -345,10 +345,7 @@ mod tests {
         let p = w.process_track(0, "w");
         let t = w.thread_track(p, 0, 0, "n");
         let dur = placer.place_root(&mut w, t, 0);
-        assert_eq!(
-            dur, 39,
-            "critical Max contributes the slowest branch → Sum=39"
-        );
+        assert_eq!(dur, 27, "critical Max contributes max/overlap → Sum=27");
         let raw = decompress(&w.into_gzip().unwrap());
         assert!(
             !raw.windows(5).any(|win| win == b"lane "),

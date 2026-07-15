@@ -12,7 +12,7 @@
 //! Per-layer cost is split at the attn boundary into two groups plus an iteration
 //! prologue/epilogue, with the Bridge/Bootstrap/Terminal fused-kernel convention
 //! (L4 design.md §4.1):
-//!   - `pre_attn_cost(0)`        = `Max( pre_attn × num_dp )`  (Bootstrap)
+//!   - `pre_attn_cost(0)`        = `Max{1.0}( pre_attn × num_dp )`  (Bootstrap)
 //!   - `pre_attn_cost(L > 0)`    = ZERO  (the Bridge bills pre(L) inside post(L-1))
 //!   - `post_attn_cost(L)`       = post_attn + MoE, and for `L < last` additionally
 //!                                 the fused pre(L+1) (Bridge); `L == last` is post-only (Terminal)
@@ -20,8 +20,8 @@
 //!   - `epilogue_cost`           = Sum(final_norm, lm_head)
 //!
 //! where
-//!   post_attn = `Max( PostAttnRouterTpWorklet × num_dp )`,
-//!   MoE       = `Sum( dispatch, Max(expert × ep), Max(local_reduce × num_dp), combine )`.
+//!   post_attn = `Max{1.0}( PostAttnRouterTpWorklet × num_dp )`,
+//!   MoE       = `Sum( dispatch, Max{1.0}(expert × ep), Max{1.0}(local_reduce × num_dp), combine )`.
 //!
 //! The `× num_dp_groups` MAX nodes (pre_attn, post_attn, local_reduce) are the
 //! DP-attention fan-out: each shard runs the dense + routing + home-reduce path on
@@ -482,26 +482,32 @@ pub fn build(
 impl Qwen3FfnMoeLayerwiseModel {
     // ── compile: each node mints slots in the order its eval helper fills them ──
 
-    /// Pre-attn section: `Max( pre_attn × num_dp_groups )` — one input_norm +
+    /// Pre-attn section: `Max{1.0}( pre_attn × num_dp_groups )` — one input_norm +
     /// qkv per DP shard, on the shard's own tokens.
     fn compile_pre_node(&self, b: &mut CostTreeBuilder) -> CostNode {
         let groups: Vec<CostNode> = (0..self.num_dp_groups)
             .map(|_| self.pre_attn.compile(b))
             .collect();
-        CostNode::Max { children: groups }
+        CostNode::Max {
+            overlap: 1.0,
+            children: groups,
+        }
     }
 
-    /// Post-attn section: `Max( post_attn × num_dp_groups )` — o_proj +
+    /// Post-attn section: `Max{1.0}( post_attn × num_dp_groups )` — o_proj +
     /// [tp_allreduce] + post_norm + router per DP shard, on the shard's own tokens.
     fn compile_post_attn_node(&self, b: &mut CostTreeBuilder) -> CostNode {
         let groups: Vec<CostNode> = (0..self.num_dp_groups)
             .map(|_| self.post_attn.compile(b))
             .collect();
-        CostNode::Max { children: groups }
+        CostNode::Max {
+            overlap: 1.0,
+            children: groups,
+        }
     }
 
-    /// MoE section: `Sum( dispatch, Max(expert × ep_size),
-    /// Max(local_reduce × num_dp_groups), combine )`. The router has moved
+    /// MoE section: `Sum( dispatch, Max{1.0}(expert × ep_size),
+    /// Max{1.0}(local_reduce × num_dp_groups), combine )`. The router has moved
     /// into `post_attn`; the home reduce is per DP shard (combine returns each
     /// token to its home shard).
     fn compile_moe_node(&self, b: &mut CostTreeBuilder) -> CostNode {
@@ -510,12 +516,14 @@ impl Qwen3FfnMoeLayerwiseModel {
             .map(|_| self.moe_expert_compute.compile(b))
             .collect();
         let expert_fanout = CostNode::Max {
+            overlap: 1.0,
             children: expert_groups,
         };
         let reduce_groups: Vec<CostNode> = (0..self.num_dp_groups)
             .map(|_| self.moe_local_reduce.compile(b))
             .collect();
         let reduce_fanout = CostNode::Max {
+            overlap: 1.0,
             children: reduce_groups,
         };
         let moe_combine = self.moe_combine.compile(b);
@@ -570,7 +578,10 @@ impl Qwen3FfnMoeLayerwiseModel {
         let groups: Vec<CostNode> = (0..self.num_dp_groups)
             .map(|_| self.embed.compile(&mut b))
             .collect();
-        let root = CostNode::Max { children: groups };
+        let root = CostNode::Max {
+            overlap: 1.0,
+            children: groups,
+        };
         b.finish(CostNode::Labeled {
             label: self.arch_label(),
             child: Box::new(root),
@@ -590,7 +601,10 @@ impl Qwen3FfnMoeLayerwiseModel {
                 ])
             })
             .collect();
-        let root = CostNode::Max { children: groups };
+        let root = CostNode::Max {
+            overlap: 1.0,
+            children: groups,
+        };
         b.finish(CostNode::Labeled {
             label: self.arch_label(),
             child: Box::new(root),
