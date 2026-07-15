@@ -218,10 +218,12 @@ bounded metadata-stamped cache. Catalog lifecycle bytes are cached separately
 behind a stamp of the ordered runs, lifecycle markers, and pipeline/timing file
 identities. Catalogs are limited to 1,024 runs (`catalog_too_many_runs`). Cold
 catalog builds single-flight, retain and parse the same opened descriptors whose
-metadata passed per-file and 16 MiB aggregate limits
-(`catalog_state_too_large`), and fail closed after three unstable metadata
-snapshots. Catalog ETags are strong SHA-256 digests of the final serialized
-bytes; metadata stamps remain internal invalidation keys. All artifact I/O/JSON
+metadata is counted first against the 16 MiB aggregate limit
+(`catalog_state_too_large`). Inputs that exceed only a smaller per-file limit are
+not read and fail that run's analysis lifecycle without poisoning other catalog
+rows. Cold builds fail closed after three unstable metadata snapshots. Catalog
+ETags are strong SHA-256 digests of the final serialized bytes; metadata stamps
+remain internal invalidation keys. All artifact I/O/JSON
 parsing runs on bounded blocking workers (four concurrent reads, fail-fast
 `artifact_read_busy` when saturated), and each run-scope JSON file is capped at
 16 MiB. Descriptor-ready

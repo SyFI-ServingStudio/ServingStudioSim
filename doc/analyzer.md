@@ -253,12 +253,13 @@ request worker. The catalog lifecycle projection has its own metadata-stamped,
 single-flight cache: the stamp covers ordered run ids and timestamps, completion
 markers, and pipeline/timing file identities. A catalog is limited to 1,024 runs
 (`catalog_too_many_runs`). A cold build retains the exact opened pipeline/timing
-descriptors whose per-file and aggregate metadata passed validation, rejects
-more than 16 MiB of aggregate input before reading those descriptors
-(`catalog_state_too_large`), retries a changing snapshot three times, then fails
-with `artifact_generation_changed`. Its public ETag is a strong SHA-256 digest
-of the final serialized catalog bytes; the metadata stamp is only an internal
-invalidation fence. Descriptor JSON has a bounded
+descriptors and accounts every opened length toward the 16 MiB aggregate limit
+before applying per-file policy. Exceeding the aggregate fails the whole request
+with `catalog_state_too_large`; a file that exceeds only its smaller per-file
+limit is not read and makes that run's analysis lifecycle failed. A changing
+snapshot is retried three times, then fails with `artifact_generation_changed`.
+The public ETag is a strong SHA-256 digest of the final serialized catalog bytes;
+the metadata stamp is only an internal invalidation fence. Descriptor JSON has a bounded
 metadata-stamped cache. Artifact filesystem I/O and JSON parsing run on blocking
 workers behind one fail-fast,
 four-permit service semaphore (`artifact_read_busy`, `Retry-After: 1` when

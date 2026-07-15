@@ -47,8 +47,20 @@ struct CapturedCatalog<'a> {
 struct CapturedRun<'a> {
     run: &'a RunRecord,
     simulation: StageStatus,
-    pipeline: Option<BoundedArtifact>,
-    timing: Option<BoundedArtifact>,
+    pipeline: CapturedArtifact,
+    timing: CapturedArtifact,
+}
+
+enum CapturedArtifact {
+    Missing,
+    Ready(BoundedArtifact),
+    Invalid(ApiProblem),
+}
+
+impl CapturedArtifact {
+    fn is_present(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
 }
 
 pub(super) fn prepare_catalog(
@@ -204,28 +216,37 @@ fn build_catalog(captured: CapturedCatalog<'_>) -> Result<Vec<u8>, ApiProblem> {
     })
 }
 
-fn read_captured_pipeline(artifact: Option<BoundedArtifact>) -> PipelineStateRead {
-    let Some(artifact) = artifact else {
-        return PipelineStateRead::Missing;
-    };
-    let captured_length = artifact.metadata.len();
-    match read_bounded_open_file(artifact, captured_length, "catalog analyzer pipeline") {
-        Ok((bytes, _)) => parse_pipeline_state_bytes(&bytes),
-        Err(problem) => PipelineStateRead::Invalid {
+fn read_captured_pipeline(artifact: CapturedArtifact) -> PipelineStateRead {
+    match artifact {
+        CapturedArtifact::Missing => PipelineStateRead::Missing,
+        CapturedArtifact::Invalid(problem) => PipelineStateRead::Invalid {
             code: problem.code,
             reason: problem.detail,
         },
+        CapturedArtifact::Ready(artifact) => {
+            let captured_length = artifact.metadata.len();
+            match read_bounded_open_file(artifact, captured_length, "catalog analyzer pipeline") {
+                Ok((bytes, _)) => parse_pipeline_state_bytes(&bytes),
+                Err(problem) => PipelineStateRead::Invalid {
+                    code: problem.code,
+                    reason: problem.detail,
+                },
+            }
+        }
     }
 }
 
-fn read_captured_timing(artifact: Option<BoundedArtifact>) -> TimingState {
-    let Some(artifact) = artifact else {
-        return TimingState::Missing;
-    };
-    let captured_length = artifact.metadata.len();
-    match read_bounded_open_file(artifact, captured_length, "catalog analyzer timing") {
-        Ok((bytes, modified_at)) => parse_timing_bytes(bytes, modified_at),
-        Err(problem) => TimingState::Invalid(problem.detail),
+fn read_captured_timing(artifact: CapturedArtifact) -> TimingState {
+    match artifact {
+        CapturedArtifact::Missing => TimingState::Missing,
+        CapturedArtifact::Invalid(problem) => TimingState::Invalid(problem.detail),
+        CapturedArtifact::Ready(artifact) => {
+            let captured_length = artifact.metadata.len();
+            match read_bounded_open_file(artifact, captured_length, "catalog analyzer timing") {
+                Ok((bytes, modified_at)) => parse_timing_bytes(bytes, modified_at),
+                Err(problem) => TimingState::Invalid(problem.detail),
+            }
+        }
     }
 }
 
@@ -242,10 +263,10 @@ fn capture_catalog(records: &[RunRecord]) -> Result<CapturedCatalog<'_>, ApiProb
         hash_catalog_run(&mut hasher, run);
         let complete =
             open_catalog_artifact(&mut hasher, run, completion_marker(), &mut lifecycle_bytes)?
-                .is_some();
+                .is_present();
         let failed =
             open_catalog_artifact(&mut hasher, run, failure_marker(), &mut lifecycle_bytes)?
-                .is_some();
+                .is_present();
         let pipeline =
             open_catalog_artifact(&mut hasher, run, pipeline_artifact(), &mut lifecycle_bytes)?;
         let timing =
@@ -351,30 +372,36 @@ fn open_catalog_artifact(
     run: &RunRecord,
     artifact: CatalogArtifact<'_>,
     lifecycle_bytes: &mut u64,
-) -> Result<Option<BoundedArtifact>, ApiProblem> {
+) -> Result<CapturedArtifact, ApiProblem> {
     hash_catalog_field(hasher, artifact.relative.as_os_str().as_encoded_bytes());
-    let maximum_bytes = artifact.maximum_bytes.unwrap_or(u64::MAX);
-    let opened =
-        match open_bounded_artifact(run, artifact.relative, maximum_bytes, artifact.resource) {
-            Ok(opened) => opened,
-            Err(problem) if problem.code == "artifact_missing" => {
-                hasher.update(b"\0missing\0");
-                return Ok(None);
-            }
-            Err(problem) => return Err(problem),
-        };
+    let opened = match open_artifact_with_metadata(run, artifact.relative, artifact.resource) {
+        Ok(opened) => opened,
+        Err(problem) if problem.code == "artifact_missing" => {
+            hasher.update(b"\0missing\0");
+            return Ok(CapturedArtifact::Missing);
+        }
+        Err(problem) => return Err(problem),
+    };
     hasher.update(b"\0present\0");
     hash_metadata(hasher, &opened.metadata);
 
-    if artifact.maximum_bytes.is_some() {
+    if let Some(maximum_bytes) = artifact.maximum_bytes {
+        // Aggregate accounting deliberately precedes the per-file policy. One
+        // document larger than the total service budget is a catalog-level
+        // error, while a smaller per-file violation remains row-local.
         *lifecycle_bytes = lifecycle_bytes
             .checked_add(opened.metadata.len())
             .ok_or_else(catalog_too_large_problem)?;
         if *lifecycle_bytes > MAX_CATALOG_LIFECYCLE_BYTES {
             return Err(catalog_too_large_problem());
         }
+        if opened.metadata.len() > maximum_bytes {
+            return Ok(CapturedArtifact::Invalid(artifact_too_large_problem(
+                artifact.resource,
+            )));
+        }
     }
-    Ok(Some(opened))
+    Ok(CapturedArtifact::Ready(opened))
 }
 
 pub(super) fn catalog_etag(bytes: &[u8]) -> String {

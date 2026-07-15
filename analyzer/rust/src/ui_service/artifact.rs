@@ -286,6 +286,21 @@ pub(super) fn open_bounded_artifact(
     maximum: u64,
     resource: &str,
 ) -> Result<BoundedArtifact, ApiProblem> {
+    let artifact = open_artifact_with_metadata(run, relative, resource)?;
+    if artifact.metadata.len() > maximum {
+        return Err(artifact_too_large_problem(resource));
+    }
+    Ok(artifact)
+}
+
+/// Open and stat one contained regular file without applying a size policy.
+/// Callers that combine several artifacts can account the exact opened-file
+/// metadata before deciding whether an individual body may be read.
+pub(super) fn open_artifact_with_metadata(
+    run: &RunRecord,
+    relative: &Path,
+    resource: &str,
+) -> Result<BoundedArtifact, ApiProblem> {
     let (file, path) = open_contained_artifact(run, relative, resource)?;
     let metadata = file.metadata().map_err(|error| {
         ApiProblem::new(
@@ -298,19 +313,20 @@ pub(super) fn open_bounded_artifact(
     if !metadata.is_file() {
         return Err(ApiProblem::artifact_missing(resource));
     }
-    if metadata.len() > maximum {
-        return Err(ApiProblem::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "artifact_too_large",
-            "Artifact is too large",
-            format!("The bounded {resource} exceeds the service safety limit."),
-        ));
-    }
     Ok(BoundedArtifact {
         file,
         metadata,
         path,
     })
+}
+
+pub(super) fn artifact_too_large_problem(resource: &str) -> ApiProblem {
+    ApiProblem::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "artifact_too_large",
+        "Artifact is too large",
+        format!("The bounded {resource} exceeds the service safety limit."),
+    )
 }
 
 pub(super) fn read_bounded_open_file(

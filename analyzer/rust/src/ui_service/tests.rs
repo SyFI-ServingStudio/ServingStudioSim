@@ -1328,6 +1328,68 @@ async fn catalog_rejects_aggregate_lifecycle_input_before_reading_bodies() {
         .all(|observed| !observed.starts_with(root.path())));
 }
 
+#[tokio::test]
+async fn catalog_reports_single_timing_over_total_budget_as_aggregate_error() {
+    let _observer_guard = ARTIFACT_READ_TEST_LOCK.lock().unwrap();
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    fs::create_dir_all(run.join("reports")).unwrap();
+    let timing_path = run.join("reports/analyzer_timing.json");
+    let timing = fs::File::create(&timing_path).unwrap();
+    timing.set_len(MAX_CATALOG_LIFECYCLE_BYTES + 1).unwrap();
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let (reads_tx, reads_rx) = std::sync::mpsc::channel();
+    set_artifact_read_observer(Some(reads_tx));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs")
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let problem = body_json(response).await;
+    set_artifact_read_observer(None);
+    assert_eq!(problem["code"], "catalog_state_too_large");
+    assert!(reads_rx.try_iter().all(|observed| observed != timing_path));
+}
+
+#[tokio::test]
+async fn oversized_pipeline_is_a_row_local_failure_without_a_body_read() {
+    let _observer_guard = ARTIFACT_READ_TEST_LOCK.lock().unwrap();
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    fs::create_dir_all(run.join("reports")).unwrap();
+    let pipeline_path = run.join(PIPELINE_STATE_PATH);
+    let pipeline = fs::File::create(&pipeline_path).unwrap();
+    pipeline.set_len(MAX_PIPELINE_STATE_BYTES + 1).unwrap();
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let (reads_tx, reads_rx) = std::sync::mpsc::channel();
+    set_artifact_read_observer(Some(reads_tx));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs")
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let catalog = body_json(response).await;
+    set_artifact_read_observer(None);
+    assert_eq!(catalog["runs"][0]["lifecycle"]["analysis"], "failed");
+    assert!(reads_rx
+        .try_iter()
+        .all(|observed| observed != pipeline_path));
+}
+
 #[test]
 fn catalog_returns_stable_conflict_after_bounded_metadata_churn() {
     let root = TempDir::new().unwrap();
