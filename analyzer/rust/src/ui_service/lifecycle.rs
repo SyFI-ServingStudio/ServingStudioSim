@@ -329,6 +329,7 @@ pub(super) fn with_consistent_analysis_snapshot<T>(
     ))
 }
 
+#[cfg(test)]
 pub(super) fn build_descriptor(run: &RunRecord) -> Result<RunDescriptor, ApiProblem> {
     with_consistent_analysis_snapshot(run, |snapshot| build_descriptor_at_snapshot(run, snapshot))
 }
