@@ -12,7 +12,8 @@
 //! Track UUIDs are a pure function of their identity (pid / name / seed), so the
 //! same logical trace serializes to byte-stable output run to run.
 
-mod proto;
+#[allow(dead_code)]
+pub(crate) mod proto;
 
 use std::io::Write;
 
@@ -23,8 +24,7 @@ use prost::Message;
 
 use proto::track_event::Type as EventType;
 use proto::{
-    DebugAnnotation, ProcessDescriptor, ThreadDescriptor, Trace, TracePacket, TrackDescriptor,
-    TrackEvent,
+    DebugAnnotation, ProcessDescriptor, ThreadDescriptor, TracePacket, TrackDescriptor, TrackEvent,
 };
 
 /// One synthetic packet sequence for the whole trace. The UI drops track_event
@@ -233,15 +233,22 @@ impl TraceWriter {
         self.packets.push(p);
     }
 
-    /// Prost-encode the packet stream to protobuf, then gzip it into the final
-    /// `.pftrace.gz` bytes openable in ui.perfetto.dev.
+    /// Stream the protobuf packet fields through gzip into ``output``.
+    ///
+    /// A protobuf repeated message may be encoded as consecutive field-1
+    /// length-delimited values. Encoding one packet at a time avoids holding a
+    /// full raw protobuf buffer alongside the final gzip buffer for large runs.
+    pub fn write_gzip<W: Write>(self, output: W) -> Result<W> {
+        let mut encoder = GzEncoder::new(output, Compression::default());
+        for packet in self.packets {
+            encoder.write_all(&[0x0a])?; // Trace.packet: field 1, wire type 2.
+            encoder.write_all(&packet.encode_length_delimited_to_vec())?;
+        }
+        Ok(encoder.finish()?)
+    }
+
+    #[cfg(test)]
     pub fn into_gzip(self) -> Result<Vec<u8>> {
-        let trace = Trace {
-            packet: self.packets,
-        };
-        let raw = trace.encode_to_vec();
-        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(&raw)?;
-        Ok(enc.finish()?)
+        self.write_gzip(Vec::new())
     }
 }

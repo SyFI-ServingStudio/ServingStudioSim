@@ -24,6 +24,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .analyzer_pipeline import AnalyzerPipelinePublisher, discover_producer_identity
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARALLELISM = 200
 
@@ -218,9 +220,11 @@ def _run_capture_sync(argv: list[str]) -> tuple[int, str]:
 async def run_analysis(
     log_dir: Path, build_type: str = "debug", subjects: list[str] | None = None
 ) -> None:
-    """Best-effort post-run analysis: Rust `analyze run` (parquet → report+payload
-    JSON) then the Python renderer (payload JSON → PNGs). Failures warn and return
-    — analysis must never fail an otherwise-successful run.
+    """Best-effort post-run analysis with a durable publication lifecycle.
+
+    Rust compute, Python render, and Rust trace remain optional with respect to
+    the completed simulation.  For UI readers they form one generation, which
+    is published as complete only after all three stages have stopped.
 
     Async: across a sweep, many runs' analyze+render overlap under the existing
     semaphore instead of serializing on a blocking call that stalls the event loop.
@@ -252,15 +256,68 @@ async def run_analysis(
         _append(section, out, (time.perf_counter() - t0) * 1e3)
         return rc
 
-    if not analyzer.exists():
-        print(f"[analyze] {analyzer} not built; skipping analysis for {log_dir}")
+    async def _execute_stage(section: str, argv: list[str]) -> int | None:
+        try:
+            return await _timed_step(section, argv)
+        except Exception as error:
+            # Subprocess setup failures are stage failures too. Keep the error in
+            # the human log and the durable protocol limited to a stable code.
+            print(f"[analyze] {section} could not run for {log_dir}: {error}")
+            return None
+
+    try:
+        producer = await asyncio.to_thread(
+            discover_producer_identity,
+            analyzer,
+            REPO_ROOT,
+        )
+    except Exception as error:
+        producer = {
+            "name": "vibesim-analyzer",
+            "version": "unavailable",
+            "revision": "unavailable",
+            "binary_sha256": "unavailable",
+        }
+        print(f"[analyze] cannot identify producer for {log_dir}: {error}")
+    try:
+        pipeline = await asyncio.to_thread(
+            AnalyzerPipelinePublisher.begin,
+            log_dir,
+            producer,
+            subjects,
+        )
+    except OSError as error:
+        print(f"[analyze] cannot publish pipeline state for {log_dir}: {error}")
         return
-    subjects = subjects or []
-    if await _timed_step("analyze compute", [str(analyzer), "run", str(log_dir), *subjects]) != 0:
-        print(f"[analyze] compute failed for {log_dir}")
-        return
-    if (
-        await _timed_step(
+
+    try:
+        if not analyzer.exists():
+            pipeline.fail_stage("compute", "analyzer_unavailable")
+            pipeline.finish()
+            print(f"[analyze] {analyzer} not built; skipping analysis for {log_dir}")
+            return
+
+        subjects = subjects or []
+        compute_rc = await _execute_stage(
+            "analyze compute",
+            [
+                str(analyzer),
+                "run",
+                str(log_dir),
+                "--generation-id",
+                pipeline.generation_id,
+                *subjects,
+            ],
+        )
+        if compute_rc != 0:
+            pipeline.fail_stage("compute", "compute_failed")
+            pipeline.finish()
+            print(f"[analyze] compute failed for {log_dir}")
+            return
+        pipeline.complete_stage("compute")
+
+        pipeline.start_stage("render")
+        render_rc = await _execute_stage(
             "analyze render",
             [
                 sys.executable,
@@ -270,16 +327,35 @@ async def run_analysis(
                 *subjects,
             ],
         )
-        != 0
-    ):
-        print(f"[analyze] render failed for {log_dir}")
+        if render_rc == 0:
+            pipeline.complete_stage("render")
+        else:
+            pipeline.fail_stage("render", "render_failed")
+            print(f"[analyze] render failed for {log_dir}")
 
-    # Always emit the per-kernel Perfetto timeline (traces/<prefix>.pftrace.gz).
-    # A standalone verb, not a subject (different output contract: a binary trace
-    # for ui.perfetto.dev, not report/payload JSON), so it runs here with CLI
-    # defaults rather than through the subject catalog. Best-effort like the rest.
-    if await _timed_step("analyze trace", [str(analyzer), "trace", str(log_dir)]) != 0:
-        print(f"[analyze] trace failed for {log_dir}")
+        # The Perfetto overview is a standalone binary artifact rather than a
+        # registry subject, but it belongs to the same visible generation.
+        pipeline.start_stage("trace")
+        trace_rc = await _execute_stage(
+            "analyze trace",
+            [str(analyzer), "trace", str(log_dir)],
+        )
+        if trace_rc == 0:
+            pipeline.complete_stage(
+                "trace",
+                artifact=f"traces/{log_dir.name}.pftrace.gz",
+            )
+        else:
+            pipeline.fail_stage("trace", "trace_failed")
+            print(f"[analyze] trace failed for {log_dir}")
+        pipeline.finish()
+    except Exception as error:
+        # If a state transition cannot be published, the last durable state is
+        # intentionally left pending.  That is safer than exposing old files as
+        # the current generation, and analysis remains best-effort for the sim.
+        print(f"[analyze] pipeline publication failed for {log_dir}: {error}")
+    finally:
+        pipeline.close()
 
 
 def run_alignment_analysis(

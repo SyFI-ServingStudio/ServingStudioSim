@@ -24,7 +24,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use datafusion::prelude::SessionContext;
 
-use crate::io::trace_path;
+use crate::io::{atomic_write_file, trace_path};
 use crate::perfetto::{Annotation, TraceWriter};
 use crate::session::{
     col, collect, register_cost_log, register_gpu_cluster, require_columns, value_f32_list,
@@ -569,8 +569,11 @@ pub async fn run(
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let bytes = w.into_gzip()?;
-    fs::write(&out, &bytes).with_context(|| format!("write {}", out.display()))?;
+    atomic_write_file(&out, move |temporary| {
+        w.write_gzip(temporary)?;
+        Ok(())
+    })
+    .with_context(|| format!("write {}", out.display()))?;
     println!(
         "wrote {} ({} regions, {} iterations, {} slice pairs, {} transfers)",
         out.display(),
@@ -585,6 +588,9 @@ pub async fn run(
 #[cfg(test)]
 mod proto_smoke {
     use crate::perfetto::{Annotation, TraceWriter};
+    use flate2::read::GzDecoder;
+    use prost::Message;
+    use std::io::Read;
 
     /// Build a tiny nested-slice trace and confirm it gzips to non-empty bytes.
     #[test]
@@ -610,5 +616,14 @@ mod proto_smoke {
         assert!(bytes.len() > 20, "expected non-trivial gzip output");
         // gzip magic — decoded against the authoritative perfetto proto during dev.
         assert_eq!(&bytes[..2], &[0x1f, 0x8b]);
+        let mut raw = Vec::new();
+        GzDecoder::new(bytes.as_slice())
+            .read_to_end(&mut raw)
+            .expect("decode gzip");
+        let trace = crate::perfetto::proto::Trace::decode(raw.as_slice()).expect("decode trace");
+        assert!(
+            !trace.packet.is_empty(),
+            "packet stream must decode as Trace"
+        );
     }
 }

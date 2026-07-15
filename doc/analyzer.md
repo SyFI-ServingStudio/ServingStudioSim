@@ -127,14 +127,46 @@ any specific constant:
 If none of these gets a large run under budget, that is a signal to change the
 payload shape or pre-aggregate on the sim side, not to ship a slow subject.
 
-## Launcher integration
+## Launcher integration and publication lifecycle
 
-Analysis is **best-effort** end to end — a missing analyzer binary, a failed
-handoff, or a failed subject never fails a completed run. The launcher builds the
-analyzer crate explicitly (a failed build warns, does not block), and after each
-successful run it runs the Rust `analyze run` then the Python `render`. A run's
-subject selection is a durable preset key (`analyze_subjects`, omitted = all
-applicable); `--no-analyze` is the transient "skip it this time" switch.
+Analysis is **best-effort with respect to simulation** — a missing analyzer
+binary, a failed handoff, or a failed subject never changes a completed
+simulation into a failed simulation. Publication to readers is stricter. After
+each successful run the launcher executes one ordered generation:
+
+1. Rust `analyze run` computes report/payload JSON;
+2. Python `render` creates plots;
+3. Rust `analyze trace` creates the bounded overview Perfetto trace.
+
+Before compute starts, and after every transition, the launcher atomically
+replaces `reports/analyzer_pipeline_state.json`. Its version-1 envelope contains
+a fresh opaque `generation_id`, a stable `artifact_revision`, requested subject
+tokens, exact trace artifact path, real producer version/revision/binary digest,
+timestamps, the pipeline status (`pending`, `complete`, or `failed`), and explicit
+compute/render/trace stage states. One per-run lease serializes generations so an
+older producer cannot overwrite a newer attempt. `complete` is published only
+after the trace stage reaches a terminal state. A compute failure makes the
+pipeline `failed`; optional render or trace failure leaves the orchestration
+`complete` but keeps that stage/resource explicitly failed (in particular,
+`trace_failed` never becomes a ready trace). A launcher crash leaves a durable
+`pending` generation. State is bounded JSON; readers never scrape stdout.
+
+Before current-generation compute completes, old report/payload/trace files are
+never published as `ready`. After compute completes, only requested subjects
+listed by a timing artifact carrying the same `generation_id` may become ready,
+even while render/trace is still pending; an unrequested or mismatched old pair
+stays hidden. A trace becomes ready only when its stage is complete and its exact
+state-recorded path passes containment and size checks. `artifact_revision` is
+the stable `analysis.revision` for that generation. Runs predating this sidecar
+remain readable through an explicit legacy path: valid bounded artifact pairs
+may be ready, their revision is derived from immutable artifact contents, and
+their producer is `legacy-unknown`, never the serving binary.
+
+All analyzer JSON and trace outputs use a durable same-directory temporary file,
+file sync, and atomic replace. Thus readers see the old or new complete file,
+never a partially encoded artifact. A run's subject selection is a durable
+preset key (`analyze_subjects`, omitted = all applicable); `--no-analyze` is the
+transient "skip it this time" switch.
 
 ## Read-only UI service
 
