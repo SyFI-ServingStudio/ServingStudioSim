@@ -136,6 +136,44 @@ successful run it runs the Rust `analyze run` then the Python `render`. A run's
 subject selection is a durable preset key (`analyze_subjects`, omitted = all
 applicable); `--no-analyze` is the transient "skip it this time" switch.
 
+## Read-only UI service
+
+The analyzer also owns the read boundary between completed run artifacts and
+the browser. `analyze serve --logs-root <dir>` recursively discovers simulation
+runs below one or more explicitly configured roots and exposes protocol-v1,
+bounded resources under `/api/v1/`. This remains a read-only analyzer concern:
+the service does not run subjects, render plots, mutate a run, or expose parquet.
+
+The public resources are:
+
+- `GET /api/v1/runs` — a catalog whose `run_id` values are stable opaque ids;
+  a basename is only display text because nested sweeps commonly repeat names
+  such as `simulation` and `tp4`;
+- `GET /api/v1/runs/{run_id}/descriptor` — deployment, lifecycle, workers,
+  analyzer-registry subject states, and relative artifact links;
+- descriptor-linked summary, topology, report, payload, and Perfetto resources.
+
+`SUBJECTS` remains the only source of subject tokens and report/payload names.
+The HTTP layer must not copy that catalog or translate tokens to UI-specific
+names. A subject is independently `pending`, `ready`, `unavailable`,
+`not_generated`, or `failed`; an optional subject failure never invalidates the
+descriptor or another subject. Only the bounded summary and topology are core
+page resources.
+
+Every resource link is selected from a server-built allowlist for a resolved
+run. Request parameters are never joined directly to filesystem paths. Roots
+and runs are canonicalized, symlink escapes are rejected, and the service never
+serves `raw/*.parquet`, `raw/gpu_cluster/**`, temporary files, or arbitrary
+paths. Catalog, descriptor, and immutable artifacts use `ETag` and conditional
+`304` responses so a UI can poll pending analysis without repeatedly decoding
+unchanged JSON. Errors use `application/problem+json` with a stable `code` in
+addition to human-readable detail.
+
+The full wire schema, href restrictions, cache-key rules, and analyzer-token to
+UI-domain mapping live in the consumer protocol contract at
+`../viz-ui/docs/data-protocol.md`. Both transports — checked-in artifact export
+and HTTP — must reuse the same subject-specific decoders.
+
 ## Relationship to other docs
 
 This document supersedes the archived `old-doc/analyzer.md` (kept only as design
