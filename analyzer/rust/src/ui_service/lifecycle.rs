@@ -2,12 +2,6 @@
 
 use super::*;
 
-pub(super) fn lifecycle(run: &RunRecord) -> Lifecycle {
-    let pipeline = read_pipeline_state(run);
-    let timing = read_timing(run);
-    lifecycle_from(run, &pipeline, &timing)
-}
-
 pub(super) fn lifecycle_from(
     run: &RunRecord,
     pipeline: &PipelineStateRead,
@@ -20,6 +14,18 @@ pub(super) fn lifecycle_from(
     } else {
         StageStatus::Pending
     };
+    lifecycle_from_simulation(simulation, pipeline, timing)
+}
+
+/// Project lifecycle from an already-fenced simulation marker state. Catalog
+/// cold builds use this entry point so marker replacement cannot make their
+/// row disagree with the pipeline/timing descriptors captured in the same
+/// attempt.
+pub(super) fn lifecycle_from_simulation(
+    simulation: StageStatus,
+    pipeline: &PipelineStateRead,
+    timing: &TimingState,
+) -> Lifecycle {
     let analysis = analysis_status(pipeline, timing);
     Lifecycle {
         simulation,
@@ -66,6 +72,12 @@ pub(super) fn read_pipeline_state(run: &RunRecord) -> PipelineStateRead {
                 }
             }
         };
+    parse_pipeline_state_bytes(&bytes)
+}
+
+/// Decode a bounded pipeline document that the caller has already read from a
+/// containment-checked descriptor.
+pub(super) fn parse_pipeline_state_bytes(bytes: &[u8]) -> PipelineStateRead {
     let value: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(error) => {
@@ -599,6 +611,12 @@ pub(super) fn read_timing(run: &RunRecord) -> TimingState {
             Err(problem) if problem.code == "artifact_missing" => return TimingState::Missing,
             Err(problem) => return TimingState::Invalid(problem.detail),
         };
+    parse_timing_bytes(bytes, modified_at)
+}
+
+/// Decode timing bytes while preserving the opened descriptor's modification
+/// time in the legacy revision contract.
+pub(super) fn parse_timing_bytes(bytes: Vec<u8>, modified_at: SystemTime) -> TimingState {
     let value: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(error) => {

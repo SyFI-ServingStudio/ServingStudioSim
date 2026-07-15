@@ -1137,8 +1137,8 @@ async fn catalog_descriptor_and_artifact_honor_etag() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn catalog_cold_build_is_singleflight_and_cache_hits_skip_lifecycle_bodies() {
+#[test]
+fn catalog_cold_build_is_singleflight_and_cache_hits_skip_lifecycle_bodies() {
     let _observer_guard = ARTIFACT_READ_TEST_LOCK.lock().unwrap();
     let root = TempDir::new().unwrap();
     let run = create_run(root.path(), "run", "unified", true);
@@ -1153,31 +1153,65 @@ async fn catalog_cold_build_is_singleflight_and_cache_hits_skip_lifecycle_bodies
         Some(&["slo-general"]),
         None,
     );
-    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let service_state = Arc::new(state(&root));
+    let records = discover_runs(&service_state).unwrap();
     let (reads_tx, reads_rx) = std::sync::mpsc::channel();
     set_artifact_read_observer(Some(reads_tx));
 
-    let first_request = app.clone().oneshot(
-        Request::builder()
-            .uri("/api/v1/runs")
-            .header(header::HOST, "localhost")
-            .body(Body::empty())
-            .unwrap(),
-    );
-    let second_request = app.clone().oneshot(
-        Request::builder()
-            .uri("/api/v1/runs")
-            .header(header::HOST, "localhost")
-            .body(Body::empty())
-            .unwrap(),
-    );
-    let (first, second) = tokio::join!(first_request, second_request);
-    let first = first.unwrap();
-    let second = second.unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
-    assert_eq!(second.status(), StatusCode::OK);
-    let etag = first.headers()[header::ETAG].clone();
-    assert_eq!(second.headers()[header::ETAG], etag);
+    // The first builder pauses after retaining its descriptors while holding
+    // catalog_build. The second request reaches the pre-lock hook before the
+    // barrier releases both, so the overlap is deterministic rather than a
+    // scheduler-dependent pair of fast requests.
+    let overlap = Arc::new(std::sync::Barrier::new(2));
+    let (first_captured_tx, first_captured_rx) = std::sync::mpsc::channel();
+    let first_state = Arc::clone(&service_state);
+    let first_records = records.clone();
+    let first_overlap = Arc::clone(&overlap);
+    let first = std::thread::spawn(move || {
+        prepare_catalog_with_hooks(
+            &first_state,
+            &HeaderMap::new(),
+            &first_records,
+            || {},
+            move |attempt| {
+                if attempt == 0 {
+                    first_captured_tx.send(()).unwrap();
+                    first_overlap.wait();
+                }
+            },
+            |_, _| {},
+        )
+    });
+    first_captured_rx.recv().unwrap();
+
+    let second_state = Arc::clone(&service_state);
+    let second_records = records.clone();
+    let second_overlap = Arc::clone(&overlap);
+    let second = std::thread::spawn(move || {
+        prepare_catalog_with_hooks(
+            &second_state,
+            &HeaderMap::new(),
+            &second_records,
+            move || {
+                second_overlap.wait();
+            },
+            |_| {},
+            |_, _| {},
+        )
+    });
+
+    let first = first.join().unwrap().unwrap();
+    let second = second.join().unwrap().unwrap();
+    let (first_etag, first_bytes) = match first {
+        ConditionalBody::Bytes { etag, bytes } => (etag, bytes),
+        ConditionalBody::NotModified { .. } => panic!("cold builder returned 304"),
+    };
+    let (second_etag, second_bytes) = match second {
+        ConditionalBody::Bytes { etag, bytes } => (etag, bytes),
+        ConditionalBody::NotModified { .. } => panic!("cold waiter returned 304"),
+    };
+    assert_eq!(second_etag, first_etag);
+    assert_eq!(second_bytes, first_bytes);
 
     let cold_reads = reads_rx.try_iter().collect::<Vec<_>>();
     assert_eq!(
@@ -1195,30 +1229,16 @@ async fn catalog_cold_build_is_singleflight_and_cache_hits_skip_lifecycle_bodies
         1
     );
 
-    let cached = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/runs")
-                .header(header::HOST, "localhost")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(cached.status(), StatusCode::OK);
-    let conditional = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/runs")
-                .header(header::HOST, "localhost")
-                .header(header::IF_NONE_MATCH, etag)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+    assert!(matches!(
+        prepare_catalog(&service_state, &HeaderMap::new(), &records).unwrap(),
+        ConditionalBody::Bytes { .. }
+    ));
+    let mut conditional_headers = HeaderMap::new();
+    conditional_headers.insert(header::IF_NONE_MATCH, first_etag.parse().unwrap());
+    assert!(matches!(
+        prepare_catalog(&service_state, &conditional_headers, &records).unwrap(),
+        ConditionalBody::NotModified { .. }
+    ));
     set_artifact_read_observer(None);
     assert!(reads_rx
         .try_iter()
@@ -1318,11 +1338,17 @@ fn catalog_returns_stable_conflict_after_bounded_metadata_churn() {
     let timing_path = run.join("reports/analyzer_timing.json");
     let hook_calls = std::cell::Cell::new(0);
 
-    let result =
-        prepare_catalog_with_build_hook(&service_state, &HeaderMap::new(), &records, |attempt| {
+    let result = prepare_catalog_with_hooks(
+        &service_state,
+        &HeaderMap::new(),
+        &records,
+        || {},
+        |_| {},
+        |attempt, _| {
             hook_calls.set(hook_calls.get() + 1);
             fs::write(&timing_path, vec![b' '; attempt + 1]).unwrap();
-        });
+        },
+    );
     let problem = match result {
         Err(problem) => problem,
         Ok(_) => panic!("continuous metadata churn must exhaust the bounded fence"),
@@ -1334,6 +1360,116 @@ fn catalog_returns_stable_conflict_after_bounded_metadata_churn() {
     assert_eq!(
         problem.detail,
         "Analyzer catalog lifecycle metadata changed during all 3 bounded read attempts."
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn catalog_reads_the_preflighted_inode_after_atomic_replacement() {
+    use std::os::unix::fs::MetadataExt;
+
+    let _observer_guard = ARTIFACT_READ_TEST_LOCK.lock().unwrap();
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_timing(&run, &[("slo-general", "ok")]);
+    let timing_path = run.join("reports/analyzer_timing.json");
+    let old_inode = fs::metadata(&timing_path).unwrap().ino();
+    let service_state = state(&root);
+    let records = discover_runs(&service_state).unwrap();
+    let built_attempts = std::cell::RefCell::new(Vec::new());
+    let (reads_tx, reads_rx) = std::sync::mpsc::channel();
+    set_artifact_read_observer(Some(reads_tx));
+
+    let result = prepare_catalog_with_hooks(
+        &service_state,
+        &HeaderMap::new(),
+        &records,
+        || {},
+        |attempt| {
+            if attempt == 0 {
+                let replacement = run.join("reports/analyzer_timing.replacement.json");
+                fs::write(&replacement, b"{}").unwrap();
+                fs::rename(replacement, &timing_path).unwrap();
+            }
+        },
+        |_, bytes| built_attempts.borrow_mut().push(bytes.to_vec()),
+    )
+    .unwrap();
+    let new_inode = fs::metadata(&timing_path).unwrap().ino();
+    assert_ne!(old_inode, new_inode);
+
+    let built_attempts = built_attempts.into_inner();
+    assert_eq!(built_attempts.len(), 2);
+    let first_attempt: Value = serde_json::from_slice(&built_attempts[0]).unwrap();
+    let second_attempt: Value = serde_json::from_slice(&built_attempts[1]).unwrap();
+    assert_eq!(
+        first_attempt["runs"][0]["lifecycle"]["analysis"], "complete",
+        "the first body must come from the retained pre-replacement inode"
+    );
+    assert_eq!(second_attempt["runs"][0]["lifecycle"]["analysis"], "failed");
+    let final_bytes = match result {
+        ConditionalBody::Bytes { bytes, .. } => bytes,
+        ConditionalBody::NotModified { .. } => panic!("replacement rebuild returned 304"),
+    };
+    assert_eq!(final_bytes, built_attempts[1]);
+    set_artifact_read_observer(None);
+    assert_eq!(
+        reads_rx
+            .try_iter()
+            .filter(|observed| observed == &timing_path)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn catalog_etag_is_the_strong_digest_of_serialized_bytes() {
+    let root = TempDir::new().unwrap();
+    create_run(root.path(), "run", "unified", true);
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/runs")
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(etag, catalog_etag(&bytes));
+    assert!(!etag.starts_with("W/"));
+
+    let mut changed_representation = bytes.to_vec();
+    changed_representation.push(b' ');
+    assert_ne!(etag, catalog_etag(&changed_representation));
+}
+
+#[test]
+fn catalog_rejects_run_count_before_open_amplification() {
+    let root = TempDir::new().unwrap();
+    create_run(root.path(), "run", "unified", true);
+    let service_state = state(&root);
+    let record = discover_runs(&service_state).unwrap().remove(0);
+    let records = vec![record; MAX_CATALOG_RUNS + 1];
+
+    let result = prepare_catalog(&service_state, &HeaderMap::new(), &records);
+    let problem = match result {
+        Err(problem) => problem,
+        Ok(_) => panic!("oversized run catalog passed its count boundary"),
+    };
+    assert_eq!(problem.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(problem.code, "catalog_too_many_runs");
+    assert_eq!(
+        problem.detail,
+        "The analyzer catalog exceeds the service safety limit of 1024 runs."
     );
 }
 
