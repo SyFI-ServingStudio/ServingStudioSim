@@ -108,7 +108,10 @@ pub enum Applies {
 }
 
 impl Applies {
-    fn matches(&self, deployment: Option<&str>) -> bool {
+    /// Shared applicability check used both by analysis dispatch and by the UI
+    /// descriptor. Keeping it here prevents the read service from growing a
+    /// second deployment-aware subject catalog.
+    pub(crate) fn matches(&self, deployment: Option<&str>) -> bool {
         match self {
             Applies::All => true,
             Applies::Deployments(list) => deployment.is_some_and(|d| list.contains(&d)),

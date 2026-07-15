@@ -47,7 +47,8 @@ alignment analyze ──reads completed roots + mapping
 
 ## What it exposes / what it requires
 
-**Exposed upward** — two CLIs (no importable library API; callers shell out):
+**Exposed upward** — command-line entry points (no importable library API;
+callers shell out):
 
 | Command | Side | Effect |
 |---|---|---|
@@ -55,6 +56,7 @@ alignment analyze ──reads completed roots + mapping
 | `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
 | `analyze list` | Rust | Print the subject catalog. |
+| `analyze serve --logs-root <dir> [--logs-root <dir> ...] [--bind 127.0.0.1:8787]` | Rust | Recursively discover runs and expose only protocol-v1 bounded UI artifacts over a read-only, loopback-by-default HTTP API. |
 | `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNG plots, including sampled alignment breakdowns. No subjects = all renderers. |
 
 The **launcher** is the primary caller: `launcher.exec.run_analysis` runs the
@@ -92,12 +94,17 @@ the analysis root; the input roots are never used as output directories.
 
 ```
 rust/                The `analyze` binary (DataFusion compute side).
-  src/main.rs          CLI (`run` / `alignment` / `list`); the best-effort
-                       per-subject dispatch loop shared by both source scopes.
+  src/main.rs          CLI (`run` / `alignment` / `trace` / `list` / `serve`);
+                       the best-effort per-subject dispatch loop is shared by
+                       both source scopes.
   src/registry.rs      THE SUBJECT CATALOG. `SUBJECTS` table + `run_subject`
                        dispatch + `select` (applicability gate). Adding a metric
                        touches only this file + a module under src/<category>/.
   src/io.rs            Artifact paths, `SCHEMA_VERSION`, read_deployment/run_meta.
+  src/ui_service.rs    Read-only `/api/v1` run catalog/descriptor and bounded
+                       summary/topology/subject/Perfetto artifact service. It
+                       resolves opaque run ids before selecting registry-owned
+                       resources and never exposes parquet or arbitrary paths.
   src/session.rs       DataFusion session, parquet registration, Arrow→Vec
                        extraction, and `require_columns` (the schema drift guard).
   src/cdf.rs           Shared numeric kernels: percentile, CDF downsample, and the
@@ -127,6 +134,41 @@ python/              The render side (matplotlib over payload JSON).
   common/              Shared plotting: payload loader + run-dir layout, figure
                        scaffolding, CDF plot, style.
 ```
+
+## Read-only UI service
+
+Start the browser-facing artifact boundary with one or more explicit logs roots:
+
+```bash
+cargo run -p analyzer -- serve \
+  --logs-root logs \
+  --bind 127.0.0.1:8787
+```
+
+The default listener is loopback-only. Each configured root is canonicalized at
+startup; run discovery then looks recursively for `raw/params.json`, skips
+resolved run internals and cache-build trees, and assigns a stable opaque id from
+the configured root ordinal plus its root-relative path. Nested runs with the
+same basename therefore remain distinct. Public routes are limited to:
+
+- `GET /api/v1/runs`
+- `GET /api/v1/runs/{run_id}/descriptor`
+- descriptor-linked `summary`, topology, registry report/payload, and Perfetto
+  resources
+
+The topology resource is the v1 envelope
+`{schema_version, params, run_meta}`; `summary.json` is passed through unchanged.
+Report and payload route tokens come directly from `registry::SUBJECTS`, then
+map back to that row's filenames. There is no arbitrary filesystem route, and
+`raw/*.parquet`, `raw/gpu_cluster/**`, cache trees, and unregistered JSON remain
+unreachable. Canonical containment checks also reject symlink escapes. Successful
+resources include `ETag`; conditional `If-None-Match` reads return `304`, while
+errors use `application/problem+json` with a stable `code`.
+
+The API intentionally emits no permissive CORS policy. The visualization UI
+must reach it through a same-origin `/api` proxy (the Vite development server
+uses this shape too); a random browser origin must not be able to read local run
+artifacts merely because the analyzer listener is on loopback.
 
 ## Subjects (the unit of analysis)
 

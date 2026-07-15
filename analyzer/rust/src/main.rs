@@ -9,7 +9,10 @@
 //! `analyze alignment <analysis_log_dir> [subjects...]` computes paired measured
 //! subjects from an `alignment_manifest.json`. Both use the one flat catalog in
 //! [`registry`], separated by its source [`registry::Scope`] gate.
+//! `analyze serve --logs-root <dir>` exposes their bounded artifacts through the
+//! read-only protocol-v1 UI boundary.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -35,6 +38,7 @@ mod request;
 mod session;
 mod throughput;
 mod trace;
+mod ui_service;
 mod utilization;
 
 use io::{payload_path, read_deployment, report_path, write_json, SCHEMA_VERSION};
@@ -68,6 +72,16 @@ enum Command {
     },
     /// List the available analyzer subjects and what each produces.
     List,
+    /// Serve bounded, read-only analyzer artifacts to the visualization UI.
+    Serve {
+        /// Logs roots to discover recursively. Repeat for independent roots.
+        #[arg(long = "logs-root", required = true, value_name = "DIR")]
+        logs_roots: Vec<PathBuf>,
+        /// HTTP listener. The default is loopback-only; exposing another bind is
+        /// an explicit operator choice.
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: SocketAddr,
+    },
     /// Export a Perfetto per-kernel timeline (`traces/<prefix>.pftrace.gz`).
     /// Samples `regions` evenly-spaced contiguous windows of `region_ms` each
     /// across the run and concatenates them; open in ui.perfetto.dev. A separate
@@ -120,6 +134,7 @@ async fn main() -> Result<()> {
             print!("{}", registry::help());
             Ok(())
         }
+        Command::Serve { logs_roots, bind } => ui_service::serve(logs_roots, bind).await,
         Command::Run { log_dir, subjects } => run(log_dir, subjects).await,
         Command::Alignment {
             analysis_log_dir,
