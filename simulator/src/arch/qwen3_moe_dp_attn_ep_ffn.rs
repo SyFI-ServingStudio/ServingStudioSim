@@ -12,11 +12,11 @@
 //! Sum(
 //!   embed,
 //!   Scale{num_layers}( Sum(
-//!     Max{1.0}( attn_block_tp × num_dp_groups ),     // attn-DP fan-out
-//!     Max{1.0}( moe_router_local × num_dp_groups ),  // post_norm + router, per-DP-shard (replicated)
+//!     Max( attn_block_tp × num_dp_groups ),          // attn-DP fan-out
+//!     Max( moe_router_local × num_dp_groups ),       // post_norm + router, per-DP-shard (replicated)
 //!     moe_dispatch,                                  // L2 op, 2 leaves (inter, intra)
-//!     Max{1.0}( moe_expert_compute_local × ep_size ),// EP fan-out: per-rank expert compute
-//!     Max{1.0}( moe_local_reduce × num_dp_groups ),  // home reduce, per-DP-shard
+//!     Max( moe_expert_compute_local × ep_size ),     // EP fan-out: per-rank expert compute
+//!     Max( moe_local_reduce × num_dp_groups ),       // home reduce, per-DP-shard
 //!     moe_combine,                                   // L2 op, 4 leaves
 //!   )),
 //!   final_norm,
@@ -522,7 +522,6 @@ impl Qwen3MoeDpAttnEpFfnModel {
             .map(|_| self.attn_block.compile(&mut b))
             .collect();
         let attn_fanout = CostNode::Max {
-            overlap: 1.0,
             children: attn_groups,
         };
 
@@ -534,7 +533,6 @@ impl Qwen3MoeDpAttnEpFfnModel {
             .map(|_| self.moe_router.compile(&mut b))
             .collect();
         let router_fanout = CostNode::Max {
-            overlap: 1.0,
             children: router_groups,
         };
         let moe_dispatch = self.moe_dispatch.compile(&mut b);
@@ -545,7 +543,6 @@ impl Qwen3MoeDpAttnEpFfnModel {
             .map(|_| self.moe_expert_compute.compile(&mut b))
             .collect();
         let expert_fanout = CostNode::Max {
-            overlap: 1.0,
             children: expert_groups,
         };
 
@@ -555,7 +552,6 @@ impl Qwen3MoeDpAttnEpFfnModel {
             .map(|_| self.moe_local_reduce.compile(&mut b))
             .collect();
         let reduce_fanout = CostNode::Max {
-            overlap: 1.0,
             children: reduce_groups,
         };
         let moe_combine = self.moe_combine.compile(&mut b);

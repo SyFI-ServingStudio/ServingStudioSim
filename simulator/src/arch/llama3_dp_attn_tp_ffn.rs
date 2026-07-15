@@ -11,9 +11,9 @@
 //!
 //! Cost shape (iter-wise, mirrors `llama3_dense_tp` but with a DP fan-out on
 //! attention):
-//!   - per layer: `Sum( Max{1.0}( attn_block × num_dp_groups ), mlp_block )` — the
+//!   - per layer: `Sum( Max( attn_block × num_dp_groups ), mlp_block )` — the
 //!     `Max` is the L4 §3.3 DP fan-out (independent shards run concurrently; the
-//!     sync wallclock is the slowest shard, `overlap = 1.0`), and the FFN sees the
+//!     sync wallclock is the slowest shard), and the FFN sees the
 //!     pooled token total (L4 §3.5, TP collective is intra-group symmetric);
 //!   - `attn_block` is fed `attn_tp_size`, `mlp_block` is fed `ffn_tp_size`; the
 //!     two TP worklets are reused unchanged (each takes one `tp_size`);
@@ -301,7 +301,7 @@ pub fn build(
 
 impl Llama3DpAttnTpFfnModel {
     /// Compile the per-iteration cost *structure* once:
-    /// `Sum( embed, Scale{num_layers}( Sum( Max{1.0}(attn_block × num_dp_groups),
+    /// `Sum( embed, Scale{num_layers}( Sum( Max(attn_block × num_dp_groups),
     /// mlp_block ) ), final_norm, lm_head )`. The `Max` is the DP fan-out — one
     /// attn_block subtree (own slots) per DP shard; the `Scale` folds the
     /// homogeneous layers, so the per-layer leaves are minted once.
@@ -314,7 +314,6 @@ impl Llama3DpAttnTpFfnModel {
             .map(|_| self.attn_block.compile(&mut b))
             .collect();
         let attn_fanout = CostNode::Max {
-            overlap: 1.0,
             children: attn_groups,
         };
         // Tag the homogeneous fold with its repeat-unit noun ("layer") so a
