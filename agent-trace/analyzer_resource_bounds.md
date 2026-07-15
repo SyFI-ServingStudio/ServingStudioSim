@@ -60,3 +60,17 @@ read/hash work before deciding that a metadata-stable response was unchanged.
   cold validation.
 - Trace responses are bounded and streamed from an opened descriptor, but a
   client may still consume up to the documented 512 MiB trace limit.
+
+## Review
+
+主代理 cherry-pick 后重跑了 analyzer 与 simulator 测试。独立审查确认核心
+generation 隔离正确，同时发现 trace permit 在准备完成后过早释放、wildcard
+ETag 可跳过 JSON 校验，以及两处 readiness 状态不一致；这些已在 `b1bc2bb`
+修复并由流 body-drop、wildcard malformed JSON、404/409 与 pending-simulation
+回归测试覆盖。Catalog 的累计预算与缓存作为后续独立补丁处理。
+
+## Feedback
+
+资源上限和 opened-file fence 的实现扎实，但 `mod.rs`、`lifecycle.rs` 已超过
+适合继续堆叠职责的体量。下一轮维护优先提取 `readiness.rs`，并让 stream
+许可生命周期成为所有大对象响应的统一 helper 契约。

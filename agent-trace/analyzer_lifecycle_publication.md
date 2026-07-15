@@ -41,3 +41,14 @@
 
 - 共享表只刻画 lifecycle status 组合；producer identity、subject token、trace artifact path 等其他字段仍由 Rust validator 单独校验。现有 launcher 继续通过既有受控生成路径提供这些字段，本修复没有改变它们。
 - artifact 已产生但 sidecar 边界写入前进程崩溃时，读者仍会看到上一份合法 `pending` 状态。这是文档明确允许的 crash 语义，而不是非法中间状态。
+
+## Review
+
+主代理逐条对照 Rust validator 与共享 fixture，确认每次原子发布都是完整合法
+状态，而不是依赖下一次写入修复中间态。补丁已以 `db08d11` 合入，并在后续
+Rust/Python 联合测试中保持通过。
+
+## Feedback
+
+用语义化 transition API 代替通用 setter 是本次最有价值的可维护性改进。
+未来扩展 stage 时应继续先扩共享状态表，再同步 producer 与 reader validator。

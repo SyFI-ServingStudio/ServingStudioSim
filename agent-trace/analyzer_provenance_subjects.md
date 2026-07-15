@@ -79,3 +79,17 @@
 - 不修改 generation reader、discovery 或 artifact resource bounds；合并时应
   保留主线 revision-scoped route 的 URL/read validation，并保留本提交的
   binary-owned producer/subject preflight。
+
+## Review
+
+主代理在资源边界提交之上合入为 `dea1db6`，并独立运行 93 个 Rust 测试和
+37 个 Python pipeline/alignment 测试。独立只读审查未发现 correctness
+blocker；unknown/cross-scope token、实际执行 binary identity 与 pinned inode
+路径均符合协议。Ruff 发现一处测试格式漂移，已单独修正。
+
+## Feedback
+
+把 registry contract 归属到实际 executable 而非 launcher checkout 是正确
+抽象。剩余低风险是 hardlink pin 依赖 trusted Cargo target、强杀可能残留临时
+目录，以及暂不支持 cross-compile target triple；这些应在需要跨机构部署前
+再提升为显式平台契约。

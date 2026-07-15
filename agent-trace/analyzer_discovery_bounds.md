@@ -35,3 +35,14 @@ and catalog lookup followed different cache rules.
   changed Rust files.
 - `cargo test -p analyzer`: 68 passed.
 - `git diff --check`: passed.
+
+## Review
+
+主代理复核了 opaque-id 负缓存与 TTL singleflight 的边界，确认未知 ID 不再
+触发按请求重扫，也没有改变合法 run 的发现顺序。补丁已以 `a65c9aa` 合入；
+后续完整 analyzer 测试继续通过。
+
+## Feedback
+
+实现和回归测试都聚焦且易审。后续若 discovery 规模继续增长，建议把扫描
+计数以只读 telemetry 暴露，而不是依赖测试专用 counter；本次不需要扩大范围。

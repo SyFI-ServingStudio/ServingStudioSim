@@ -48,3 +48,14 @@ an exact trace artifact.
 - `cargo test -p analyzer`: 70 passed.
 - Scoped `rustfmt --edition 2021 --config skip_children=true`: passed.
 - `git diff --check`: passed.
+
+## Review
+
+主代理与独立审查均未发现跨 generation 返回错误 report/payload/trace 的
+correctness blocker；revision link、pair proof、有限 seqlock 与 opened trace
+fd 共同封闭了切代窗口。补丁已以 `d11f221` 合入。
+
+## Feedback
+
+一致性证明覆盖充分。后续应把 descriptor/proof/readiness 从大文件中拆成独立
+模块，并用命名结构体替代三元 proof tuple，降低继续扩展协议时的认知负担。
