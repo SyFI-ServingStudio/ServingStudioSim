@@ -35,8 +35,9 @@ pub enum CostNode {
     Leaf(usize),
     /// `Σ children` (serial composition; time/flops/bytes all sum).
     Sum(Vec<CostNode>),
-    /// Fan-out: wallclock `= max(children)/overlap`. Unused by the dense vertical
-    /// (no collective); present for future HP/EP fan-out (INV-3).
+    /// Synchronized fan-out: wallclock `= max(children)`. Protocol v1 retains
+    /// `overlap` on the wire but requires it to be exactly `1.0`; a future
+    /// measured overlap model needs an explicitly versioned semantic (INV-3).
     Max {
         overlap: f32,
         children: Vec<CostNode>,
@@ -226,7 +227,10 @@ impl CostTreeBuilder {
             kind: kind.into(),
             config: config.into(),
             backends,
-            symbols: symbols.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            symbols: symbols
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
         });
         CostNode::Leaf(slot)
     }
@@ -340,6 +344,10 @@ impl CostTree {
                     FlatCostNode::Sum { children: range }
                 }
                 CostNode::Max { overlap, children } => {
+                    assert_eq!(
+                        *overlap, 1.0,
+                        "CostTree protocol v1 requires Max overlap to equal 1.0"
+                    );
                     let range = Self::reserve(&mut out, &mut labels, &mut queue, children);
                     FlatCostNode::Max {
                         overlap: *overlap,
@@ -401,7 +409,7 @@ impl CostTree {
     /// Composites combine:
     ///   - `Sum`  — field-wise sum of children (coverage flags unioned);
     ///   - `Scale{n}` — child subtree × `n` (the homogeneous-layer fold);
-    ///   - `Max{overlap}` — `time = max(child.time)/overlap`, other fields summed
+    ///   - `Max{overlap=1}` — `time = max(child.time)`, other fields summed
     ///     (flops/bytes/energy always add — work doesn't overlap away, INV-4).
     /// Coverage flags always OR up the tree, so a warning anywhere surfaces at
     /// the root.
@@ -445,6 +453,7 @@ impl CostTree {
                     acc
                 }
                 FlatCostNode::Max { overlap, children } => {
+                    debug_assert_eq!(*overlap, 1.0);
                     let mut acc = LeafMetrics::ZERO;
                     let mut max_time = 0.0f32;
                     for c in children.clone() {
@@ -452,7 +461,7 @@ impl CostTree {
                         max_time = max_time.max(cm.m.time_ms);
                         acc.add(cm);
                     }
-                    acc.m.time_ms = max_time / overlap;
+                    acc.m.time_ms = max_time;
                     acc
                 }
             };
@@ -703,20 +712,33 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
     }
 
     #[test]
-    fn aggregate_max_takes_overlapped_time_but_sums_work() {
-        // Max{overlap=2}( leaf x, leaf y ): time = max(x,y)/2, flops/bytes sum.
+    fn aggregate_max_takes_slowest_time_but_sums_work() {
+        // Max{overlap=1}( leaf x, leaf y ): time = max(x,y), flops/bytes sum.
         let mut b = CostTreeBuilder::new();
         let root = CostNode::Max {
-            overlap: 2.0,
+            overlap: 1.0,
             children: vec![b.leaf("x", "kx", "", vec![]), b.leaf("y", "ky", "", vec![])],
         };
         let flat = b.finish(root).flatten();
         let buf = [leaf(4.0, 10.0, 100.0), leaf(6.0, 20.0, 200.0)];
         let mut scratch = Vec::new();
         let total = CostTree::aggregate(&flat, &buf, &mut scratch).m;
-        assert_eq!(total.time_ms, 6.0 / 2.0); // max(4, 6)/overlap
+        assert_eq!(total.time_ms, 6.0); // synchronized fan-out waits for the slowest branch
         assert_eq!(total.flops, 30.0); // work still sums (INV-4)
         assert_eq!(total.bytes, 300.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "CostTree protocol v1 requires Max overlap to equal 1.0")]
+    fn flatten_rejects_unversioned_overlap_semantics() {
+        let mut b = CostTreeBuilder::new();
+        let left = b.leaf("x", "kx", "", vec![]);
+        let right = b.leaf("y", "ky", "", vec![]);
+        b.finish(CostNode::Max {
+            overlap: 2.0,
+            children: vec![left, right],
+        })
+        .flatten();
     }
 
     #[test]
