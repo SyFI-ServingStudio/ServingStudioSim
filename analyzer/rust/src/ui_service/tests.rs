@@ -229,6 +229,42 @@ fn shared_publisher_lifecycle_table_matches_rust_validation() {
     }
 }
 
+fn publish_subject_generation(run: &Path, generation_id: &str, marker: &str) {
+    write_pipeline(
+        run,
+        generation_id,
+        "pending",
+        "pending",
+        "not_started",
+        "not_started",
+        Some(&["slo-general"]),
+        None,
+    );
+    let subject = SUBJECTS
+        .iter()
+        .find(|subject| subject.name == "slo-general")
+        .unwrap();
+    write_json(
+        &run.join("reports").join(subject.report_name),
+        &json!({"schema_version": 1, "available": true, "marker": marker}),
+    );
+    write_json(
+        &run.join("payloads").join(subject.payload_name),
+        &json!({"schema_version": 1, "meta": {"available": true}, "marker": marker}),
+    );
+    write_timing_generation(run, &[("slo-general", "ok")], Some(generation_id));
+    write_pipeline(
+        run,
+        generation_id,
+        "complete",
+        "complete",
+        "complete",
+        "failed",
+        Some(&["slo-general"]),
+        None,
+    );
+}
+
 fn state(root: &TempDir) -> ServiceState {
     ServiceState {
         roots: configure_roots(vec![root.path().to_path_buf()]).unwrap(),
@@ -445,14 +481,22 @@ async fn registry_is_the_only_report_payload_allowlist() {
     write_subject(&run, "slo-general", true, None);
     write_timing(&run, &[("slo-general", "ok")]);
     let state = state(&root);
-    let run_id = discover_runs(&state).unwrap().remove(0).run_id;
+    let record = discover_runs(&state).unwrap().remove(0);
+    let run_id = record.run_id.clone();
+    let revision = build_descriptor(&record)
+        .unwrap()
+        .analysis
+        .unwrap()
+        .revision;
     let app = router(vec![root.path().to_path_buf()]).unwrap();
 
     let ready = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/api/v1/runs/{run_id}/reports/slo-general"))
+                .uri(format!(
+                    "/api/v1/runs/{run_id}/revisions/{revision}/reports/slo-general"
+                ))
                 .header(header::HOST, "localhost")
                 .body(Body::empty())
                 .unwrap(),
@@ -462,7 +506,7 @@ async fn registry_is_the_only_report_payload_allowlist() {
     assert_eq!(ready.status(), StatusCode::OK);
 
     for path in [
-        format!("/api/v1/runs/{run_id}/reports/not-in-registry"),
+        format!("/api/v1/runs/{run_id}/revisions/{revision}/reports/not-in-registry"),
         format!("/api/v1/runs/{run_id}/raw/params.json"),
     ] {
         let response = app
@@ -533,7 +577,13 @@ async fn api_is_same_origin_only_and_rejects_noncanonical_paths_and_writes() {
     let run = create_run(root.path(), "run", "unified", true);
     write_subject(&run, "slo-general", true, None);
     write_timing(&run, &[("slo-general", "ok")]);
-    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let run_id = record.run_id.clone();
+    let revision = build_descriptor(&record)
+        .unwrap()
+        .analysis
+        .unwrap()
+        .revision;
     let app = router(vec![root.path().to_path_buf()]).unwrap();
 
     let rejected_host = app
@@ -571,7 +621,9 @@ async fn api_is_same_origin_only_and_rejects_noncanonical_paths_and_writes() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/api/v1/runs/{run_id}/reports/%73lo-general"))
+                .uri(format!(
+                    "/api/v1/runs/{run_id}/revisions/{revision}/reports/%73lo-general"
+                ))
                 .header(header::HOST, "localhost")
                 .body(Body::empty())
                 .unwrap(),
@@ -678,13 +730,19 @@ async fn catalog_descriptor_and_artifact_honor_etag() {
     let run = create_run(root.path(), "run", "unified", true);
     write_subject(&run, "slo-general", true, None);
     write_timing(&run, &[("slo-general", "ok")]);
-    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let run_id = record.run_id.clone();
+    let revision = build_descriptor(&record)
+        .unwrap()
+        .analysis
+        .unwrap()
+        .revision;
     let app = router(vec![root.path().to_path_buf()]).unwrap();
 
     for uri in [
         "/api/v1/runs".to_string(),
         format!("/api/v1/runs/{run_id}/descriptor"),
-        format!("/api/v1/runs/{run_id}/payloads/slo-general"),
+        format!("/api/v1/runs/{run_id}/revisions/{revision}/payloads/slo-general"),
     ] {
         let first = app
             .clone()
@@ -858,8 +916,13 @@ fn compute_generation_and_requested_subjects_gate_current_ready_files() {
     let descriptor = build_descriptor(&record).unwrap();
     assert_eq!(descriptor.lifecycle.analysis, StageStatus::Pending);
     assert!(matches!(
-        descriptor.subjects["slo-general"],
-        SubjectState::Ready { .. }
+        &descriptor.subjects["slo-general"],
+        SubjectState::Ready {
+            report_href,
+            payload_href,
+            ..
+        } if report_href == "revisions/pipeline-generation-current/reports/slo-general"
+            && payload_href == "revisions/pipeline-generation-current/payloads/slo-general"
     ));
     assert!(matches!(
         descriptor.subjects["throughput"],
@@ -959,6 +1022,194 @@ fn incompatible_pipeline_state_never_falls_back_to_legacy_artifacts() {
 }
 
 #[tokio::test]
+async fn stale_revision_link_fails_closed_after_generation_cutover() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    publish_subject_generation(&run, "generation-old", "old-bytes");
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let run_id = record.run_id.clone();
+    let old_descriptor = build_descriptor(&record).unwrap();
+    let old_report_href = match &old_descriptor.subjects["slo-general"] {
+        SubjectState::Ready { report_href, .. } => report_href.clone(),
+        state => panic!("expected old ready subject, got {state:?}"),
+    };
+    assert!(old_report_href.contains("pipeline-generation-old"));
+
+    publish_subject_generation(&run, "generation-new", "new-bytes");
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let stale = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/{old_report_href}"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(stale).await["code"],
+        "artifact_generation_changed"
+    );
+
+    let new_descriptor = build_descriptor(&record).unwrap();
+    let new_report_href = match &new_descriptor.subjects["slo-general"] {
+        SubjectState::Ready { report_href, .. } => report_href.clone(),
+        state => panic!("expected new ready subject, got {state:?}"),
+    };
+    let current = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/{new_report_href}"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.status(), StatusCode::OK);
+    assert_eq!(body_json(current).await["marker"], "new-bytes");
+}
+
+#[test]
+fn descriptor_seqlock_discards_a_descriptor_crossed_by_cutover() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    publish_subject_generation(&run, "generation-old", "old-bytes");
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let mut attempts = 0usize;
+
+    let descriptor = with_consistent_analysis_snapshot(&record, |snapshot| {
+        attempts += 1;
+        let descriptor = build_descriptor_at_snapshot(&record, snapshot)?;
+        if attempts == 1 {
+            publish_subject_generation(&run, "generation-new", "new-bytes");
+        }
+        Ok(descriptor)
+    })
+    .unwrap();
+
+    assert_eq!(attempts, 2);
+    assert_eq!(
+        descriptor.analysis.unwrap().revision,
+        "pipeline-generation-new"
+    );
+    assert!(matches!(
+        &descriptor.subjects["slo-general"],
+        SubjectState::Ready { report_href, .. }
+            if report_href.contains("pipeline-generation-new")
+    ));
+}
+
+#[test]
+fn generation_seqlock_retries_the_whole_read_after_cutover() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    publish_subject_generation(&run, "generation-old", "old-bytes");
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let deployment = read_deployment(&record).unwrap();
+    let subject = SUBJECTS
+        .iter()
+        .find(|subject| subject.name == "slo-general")
+        .unwrap();
+    let mut attempts = 0usize;
+
+    let observed_marker = with_consistent_analysis_snapshot(&record, |snapshot| {
+        attempts += 1;
+        let lifecycle = lifecycle_from(&record, snapshot.pipeline(), snapshot.timing());
+        let mut artifact_bytes = SubjectArtifactBytes::default();
+        assert!(matches!(
+            subject_state(
+                &record,
+                subject,
+                &deployment,
+                lifecycle,
+                snapshot.pipeline(),
+                snapshot.timing(),
+                snapshot.artifact_revision(),
+                Some(&mut artifact_bytes),
+            ),
+            SubjectState::Ready { .. }
+        ));
+        let marker = serde_json::from_slice::<Value>(&artifact_bytes.report).unwrap()["marker"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        if attempts == 1 {
+            publish_subject_generation(&run, "generation-new", "new-bytes");
+        }
+        Ok(marker)
+    })
+    .unwrap();
+
+    assert_eq!(attempts, 2);
+    assert_eq!(observed_marker, "new-bytes");
+}
+
+#[test]
+fn generation_seqlock_returns_stable_conflict_under_repeated_cutover() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    publish_subject_generation(&run, "generation-0", "bytes-0");
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let mut attempts = 0usize;
+
+    let result: Result<String, ApiProblem> =
+        with_consistent_analysis_snapshot(&record, |snapshot| {
+            let observed = snapshot.artifact_revision().unwrap().to_string();
+            attempts += 1;
+            publish_subject_generation(
+                &run,
+                &format!("generation-{attempts}"),
+                &format!("bytes-{attempts}"),
+            );
+            Ok(observed)
+        });
+
+    let problem = match result {
+        Ok(revision) => panic!("repeated cutover unexpectedly returned {revision}"),
+        Err(problem) => problem,
+    };
+    assert_eq!(attempts, MAX_GENERATION_READ_ATTEMPTS);
+    assert_eq!(problem.status, StatusCode::CONFLICT);
+    assert_eq!(problem.code, "artifact_generation_changed");
+}
+
+#[test]
+fn versioned_descriptor_stamp_ignores_unclaimed_newer_trace() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing_generation(&run, &[("slo-general", "ok")], Some("generation-trace"));
+    fs::create_dir_all(run.join("traces")).unwrap();
+    fs::write(run.join("traces/current.pftrace.gz"), b"current").unwrap();
+    write_pipeline(
+        &run,
+        "generation-trace",
+        "complete",
+        "complete",
+        "complete",
+        "complete",
+        Some(&["slo-general"]),
+        Some("traces/current.pftrace.gz"),
+    );
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let before = descriptor_stamp(&record);
+
+    fs::write(run.join("traces/unclaimed-newer.pftrace.gz"), b"unclaimed").unwrap();
+    assert_eq!(descriptor_stamp(&record), before);
+
+    fs::write(
+        run.join("traces/current.pftrace.gz"),
+        b"changed-current-trace",
+    )
+    .unwrap();
+    assert_ne!(descriptor_stamp(&record), before);
+}
+
+#[tokio::test]
 async fn pipeline_selects_exact_trace_and_trace_endpoint_honors_etag() {
     let root = TempDir::new().unwrap();
     let run = create_run(root.path(), "run", "unified", true);
@@ -980,7 +1231,7 @@ async fn pipeline_selects_exact_trace_and_trace_endpoint_honors_etag() {
     );
     let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
     let app = router(vec![root.path().to_path_buf()]).unwrap();
-    let uri = format!("/api/v1/runs/{run_id}/traces/perfetto");
+    let uri = format!("/api/v1/runs/{run_id}/revisions/pipeline-generation-trace/traces/perfetto");
 
     let first = app
         .clone()
@@ -1020,6 +1271,72 @@ async fn pipeline_selects_exact_trace_and_trace_endpoint_honors_etag() {
         .await
         .unwrap();
     assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+}
+
+#[test]
+fn trace_fd_is_not_served_when_generation_changes_after_open() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing_generation(&run, &[("slo-general", "ok")], Some("generation-old"));
+    fs::create_dir_all(run.join("traces")).unwrap();
+    let trace = run.join("traces/current.pftrace.gz");
+    fs::write(&trace, b"old-trace").unwrap();
+    write_pipeline(
+        &run,
+        "generation-old",
+        "complete",
+        "complete",
+        "complete",
+        "complete",
+        Some(&["slo-general"]),
+        Some("traces/current.pftrace.gz"),
+    );
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let mut cut_over = false;
+
+    let result: Result<PreparedTrace, ApiProblem> =
+        with_consistent_analysis_snapshot(&record, |snapshot| {
+            snapshot.require_revision("pipeline-generation-old")?;
+            let path = select_trace_for_pipeline(&record, snapshot.pipeline())?;
+            let prepared = prepare_trace(&record, path)?;
+            if !cut_over {
+                cut_over = true;
+                write_pipeline(
+                    &run,
+                    "generation-new",
+                    "pending",
+                    "pending",
+                    "not_started",
+                    "not_started",
+                    Some(&["slo-general"]),
+                    None,
+                );
+                let replacement = run.join("traces/replacement.tmp");
+                fs::write(&replacement, b"new-trace").unwrap();
+                fs::rename(replacement, &trace).unwrap();
+                write_timing_generation(&run, &[("slo-general", "ok")], Some("generation-new"));
+                write_pipeline(
+                    &run,
+                    "generation-new",
+                    "complete",
+                    "complete",
+                    "complete",
+                    "complete",
+                    Some(&["slo-general"]),
+                    Some("traces/current.pftrace.gz"),
+                );
+            }
+            Ok(prepared)
+        });
+
+    let problem = match result {
+        Ok(_) => panic!("old trace fd must not survive a revision cutover response"),
+        Err(problem) => problem,
+    };
+    assert!(cut_over);
+    assert_eq!(problem.status, StatusCode::CONFLICT);
+    assert_eq!(problem.code, "artifact_generation_changed");
 }
 
 #[test]

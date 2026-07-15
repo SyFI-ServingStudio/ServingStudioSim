@@ -251,12 +251,95 @@ pub(super) fn timing_matches_generation(timing: &TimingState, generation_id: &st
     )
 }
 
+/// A reader fence for the fixed on-disk artifact names.
+///
+/// Versioned publishers expose their full pipeline and timing state. Legacy
+/// runs have no publication pointer, so their content-derived revision is the
+/// fence. Callers must capture this before and after every multi-file read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AnalysisSnapshot {
+    pipeline: PipelineStateRead,
+    timing: TimingState,
+    legacy_revision: Option<String>,
+}
+
+impl AnalysisSnapshot {
+    fn capture(run: &RunRecord) -> Self {
+        let pipeline = read_pipeline_state(run);
+        let timing = read_timing(run);
+        let legacy_revision = matches!(&pipeline, PipelineStateRead::Missing)
+            .then(|| legacy_analysis_revision(run, &timing));
+        Self {
+            pipeline,
+            timing,
+            legacy_revision,
+        }
+    }
+
+    /// Only a compute-complete, timing-verified generation can own ready
+    /// versioned JSON. Legacy artifacts use their content-derived revision.
+    pub(super) fn artifact_revision(&self) -> Option<&str> {
+        match &self.pipeline {
+            PipelineStateRead::Valid(state)
+                if state.stages.compute.status == StageStatus::Complete
+                    && timing_matches_generation(&self.timing, &state.generation_id) =>
+            {
+                Some(&state.artifact_revision)
+            }
+            PipelineStateRead::Missing => self.legacy_revision.as_deref(),
+            PipelineStateRead::Valid(_) | PipelineStateRead::Invalid { .. } => None,
+        }
+    }
+
+    pub(super) fn pipeline(&self) -> &PipelineStateRead {
+        &self.pipeline
+    }
+
+    pub(super) fn timing(&self) -> &TimingState {
+        &self.timing
+    }
+
+    pub(super) fn require_revision(&self, requested_revision: &str) -> Result<(), ApiProblem> {
+        if self.artifact_revision() == Some(requested_revision) {
+            return Ok(());
+        }
+        Err(ApiProblem::artifact_generation_changed(format!(
+            "Artifact revision {requested_revision:?} is no longer the current readable generation."
+        )))
+    }
+}
+
+/// Seqlock-style bounded read over atomically replaced generation artifacts.
+/// A generation cutover retries the whole operation; repeated churn fails
+/// closed instead of returning bytes assembled under a stale revision.
+pub(super) fn with_consistent_analysis_snapshot<T>(
+    run: &RunRecord,
+    mut read: impl FnMut(&AnalysisSnapshot) -> Result<T, ApiProblem>,
+) -> Result<T, ApiProblem> {
+    for _ in 0..MAX_GENERATION_READ_ATTEMPTS {
+        let before = AnalysisSnapshot::capture(run);
+        let result = read(&before);
+        let after = AnalysisSnapshot::capture(run);
+        if before == after {
+            return result;
+        }
+    }
+    Err(ApiProblem::artifact_generation_changed(
+        "The analyzer generation changed repeatedly while the resource was being read; retry the revision-linked request.",
+    ))
+}
+
 pub(super) fn build_descriptor(run: &RunRecord) -> Result<RunDescriptor, ApiProblem> {
+    with_consistent_analysis_snapshot(run, |snapshot| build_descriptor_at_snapshot(run, snapshot))
+}
+
+pub(super) fn build_descriptor_at_snapshot(
+    run: &RunRecord,
+    snapshot: &AnalysisSnapshot,
+) -> Result<RunDescriptor, ApiProblem> {
     let params = read_json_value(run, Path::new("raw/params.json"), "params")?;
     let deployment = deployment_from_params(&params)?;
-    let pipeline = read_pipeline_state(run);
-    let timing = read_timing(run);
-    let lifecycle = lifecycle_from(run, &pipeline, &timing);
+    let lifecycle = lifecycle_from(run, &snapshot.pipeline, &snapshot.timing);
     let run_meta = read_json_value_optional(run, Path::new("raw/run_meta.json"));
     let workers = run_meta
         .as_ref()
@@ -273,8 +356,9 @@ pub(super) fn build_descriptor(run: &RunRecord) -> Result<RunDescriptor, ApiProb
                     subject,
                     &deployment,
                     lifecycle,
-                    &pipeline,
-                    &timing,
+                    &snapshot.pipeline,
+                    &snapshot.timing,
+                    snapshot.artifact_revision(),
                     None,
                 ),
             )
@@ -303,9 +387,18 @@ pub(super) fn build_descriptor(run: &RunRecord) -> Result<RunDescriptor, ApiProb
         }),
     );
     let mut traces = BTreeMap::new();
-    traces.insert("perfetto", trace_state(run, lifecycle, &pipeline, &timing));
+    traces.insert(
+        "perfetto",
+        trace_state(
+            run,
+            lifecycle,
+            &snapshot.pipeline,
+            &snapshot.timing,
+            snapshot.artifact_revision(),
+        ),
+    );
 
-    let analysis = analysis_identity(run, &pipeline, &timing, &subjects);
+    let analysis = analysis_identity(run, snapshot, &subjects, &traces);
     let generated_at = analysis
         .as_ref()
         .map(|identity| identity.generated_at.clone());
@@ -376,7 +469,14 @@ pub(super) fn descriptor_stamp(run: &RunRecord) -> String {
             &Path::new("payloads").join(subject.payload_name),
         );
     }
-    match select_trace(run) {
+    let pipeline = read_pipeline_state(run);
+    let selected_trace = match &pipeline {
+        PipelineStateRead::Missing => select_trace(run),
+        PipelineStateRead::Valid(_) | PipelineStateRead::Invalid { .. } => {
+            select_trace_for_pipeline(run, &pipeline)
+        }
+    };
+    match selected_trace {
         Ok(trace) => stamp_metadata(&mut hasher, &trace),
         Err(_) => hasher.update(b"\0trace-missing\0"),
     }
@@ -554,6 +654,7 @@ pub(super) fn subject_state(
     lifecycle: Lifecycle,
     pipeline: &PipelineStateRead,
     timing: &TimingState,
+    artifact_revision: Option<&str>,
     artifact_bytes: Option<&mut SubjectArtifactBytes>,
 ) -> SubjectState {
     if !subject.applies.matches(Some(deployment)) {
@@ -712,10 +813,19 @@ pub(super) fn subject_state(
                 artifact_bytes.report = std::mem::take(report_bytes);
                 artifact_bytes.payload = std::mem::take(payload_bytes);
             }
+            let Some(artifact_revision) = artifact_revision else {
+                return SubjectState::Failed {
+                    code: "analysis_generation_mismatch".to_string(),
+                    reason: format!(
+                        "Analyzer subject {:?} has no stable artifact revision.",
+                        subject.name
+                    ),
+                };
+            };
             SubjectState::Ready {
                 schema_version: *report_version,
-                report_href: format!("reports/{}", subject.name),
-                payload_href: format!("payloads/{}", subject.name),
+                report_href: format!("revisions/{artifact_revision}/reports/{}", subject.name),
+                payload_href: format!("revisions/{artifact_revision}/payloads/{}", subject.name),
             }
         }
         _ if timing_status(timing, subject.name) == Some("ok") => SubjectState::Failed {
@@ -839,6 +949,7 @@ pub(super) fn trace_state(
     lifecycle: Lifecycle,
     pipeline: &PipelineStateRead,
     timing: &TimingState,
+    artifact_revision: Option<&str>,
 ) -> TraceState {
     match pipeline {
         PipelineStateRead::Invalid { code, reason } => TraceState::Failed {
@@ -870,18 +981,30 @@ pub(super) fn trace_state(
                         .unwrap_or_else(|| "trace_failed".to_string()),
                     reason: "Current-generation Perfetto trace generation failed.".to_string(),
                 },
-                StageStatus::Complete => match select_trace_for_pipeline(run, pipeline) {
-                    Ok(path) => trace_ready_state(run, &path),
-                    Err(problem) => TraceState::Failed {
-                        code: problem.code,
-                        reason: problem.detail,
-                    },
-                },
+                StageStatus::Complete => {
+                    match (artifact_revision, select_trace_for_pipeline(run, pipeline)) {
+                        (Some(artifact_revision), Ok(path)) => {
+                            trace_ready_state(run, &path, artifact_revision)
+                        }
+                        (None, Ok(_)) => TraceState::Failed {
+                            code: "analysis_generation_mismatch".to_string(),
+                            reason: "Perfetto trace has no stable artifact revision.".to_string(),
+                        },
+                        (_, Err(problem)) => TraceState::Failed {
+                            code: problem.code,
+                            reason: problem.detail,
+                        },
+                    }
+                }
             }
         }
-        PipelineStateRead::Missing => match select_trace(run) {
-            Ok(path) => trace_ready_state(run, &path),
-            Err(problem) if problem.code == "artifact_missing" => {
+        PipelineStateRead::Missing => match (artifact_revision, select_trace(run)) {
+            (Some(artifact_revision), Ok(path)) => trace_ready_state(run, &path, artifact_revision),
+            (None, Ok(_)) => TraceState::Failed {
+                code: "analysis_generation_mismatch".to_string(),
+                reason: "Legacy Perfetto trace has no stable artifact revision.".to_string(),
+            },
+            (_, Err(problem)) if problem.code == "artifact_missing" => {
                 if lifecycle.simulation == StageStatus::Pending
                     || lifecycle.analysis == StageStatus::Pending
                 {
@@ -894,7 +1017,7 @@ pub(super) fn trace_state(
                     }
                 }
             }
-            Err(problem) => TraceState::Failed {
+            (_, Err(problem)) => TraceState::Failed {
                 code: problem.code,
                 reason: problem.detail,
             },
@@ -902,7 +1025,11 @@ pub(super) fn trace_state(
     }
 }
 
-pub(super) fn trace_ready_state(run: &RunRecord, path: &Path) -> TraceState {
+pub(super) fn trace_ready_state(
+    run: &RunRecord,
+    path: &Path,
+    artifact_revision: &str,
+) -> TraceState {
     let relative = match path.strip_prefix(&run.path) {
         Ok(relative) => relative,
         Err(_) => {
@@ -923,7 +1050,7 @@ pub(super) fn trace_ready_state(run: &RunRecord, path: &Path) -> TraceState {
         })
     }) {
         Ok(metadata) if metadata.len() <= MAX_TRACE_BYTES => TraceState::Ready {
-            href: "traces/perfetto",
+            href: format!("revisions/{artifact_revision}/traces/perfetto"),
             media_type: trace_media_type(path),
             byte_length: metadata.len(),
         },
@@ -1031,16 +1158,16 @@ pub(super) fn select_trace_from(root: &Path, run: &Path) -> Result<PathBuf, ApiP
 
 pub(super) fn analysis_identity(
     run: &RunRecord,
-    pipeline: &PipelineStateRead,
-    timing: &TimingState,
+    snapshot: &AnalysisSnapshot,
     subjects: &BTreeMap<String, SubjectState>,
+    traces: &BTreeMap<&'static str, TraceState>,
 ) -> Option<AnalysisIdentity> {
-    match pipeline {
+    match &snapshot.pipeline {
         PipelineStateRead::Valid(state)
             if state.stages.compute.status == StageStatus::Complete
-                && timing_matches_generation(timing, &state.generation_id) =>
+                && timing_matches_generation(&snapshot.timing, &state.generation_id) =>
         {
-            let TimingState::Valid(timing) = timing else {
+            let TimingState::Valid(timing) = &snapshot.timing else {
                 unreachable!("generation match requires valid timing")
             };
             let revision = state.producer.revision.chars().take(12).collect::<String>();
@@ -1055,15 +1182,21 @@ pub(super) fn analysis_identity(
         }
         PipelineStateRead::Valid(_) | PipelineStateRead::Invalid { .. } => None,
         PipelineStateRead::Missing => {
-            let has_ready_subject = subjects
+            let has_ready_artifact = subjects
                 .values()
-                .any(|state| matches!(state, SubjectState::Ready { .. }));
-            if !has_ready_subject && !matches!(timing, TimingState::Valid(_)) {
+                .any(|state| matches!(state, SubjectState::Ready { .. }))
+                || traces
+                    .values()
+                    .any(|state| matches!(state, TraceState::Ready { .. }));
+            if !has_ready_artifact && !matches!(&snapshot.timing, TimingState::Valid(_)) {
                 return None;
             }
             Some(AnalysisIdentity {
-                revision: legacy_analysis_revision(run, timing),
-                generated_at: timestamp(legacy_analysis_generated_at(run, timing)),
+                revision: snapshot
+                    .legacy_revision
+                    .clone()
+                    .expect("legacy analysis snapshot always has a revision"),
+                generated_at: timestamp(legacy_analysis_generated_at(run, &snapshot.timing)),
                 generator_version: LEGACY_GENERATOR_VERSION.to_string(),
             })
         }
@@ -1090,6 +1223,33 @@ pub(super) fn legacy_analysis_revision(run: &RunRecord, timing: &TimingState) ->
             run,
             &Path::new("payloads").join(subject.payload_name),
         );
+    }
+    // Legacy has no state-recorded trace path. Bind the selected newest trace's
+    // opened-file identity without scanning a potentially 512 MiB body.
+    match select_trace(run).and_then(|path| {
+        let relative = path.strip_prefix(&run.path).map_err(|_| {
+            ApiProblem::new(
+                StatusCode::FORBIDDEN,
+                "artifact_outside_run",
+                "Artifact escaped its run",
+                "The selected legacy trace is outside its resolved run.",
+            )
+        })?;
+        let (file, _) = open_contained_artifact(run, relative, "Perfetto trace")?;
+        file.metadata().map_err(|error| {
+            ApiProblem::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "Artifact read failed",
+                format!("Cannot inspect the selected legacy trace: {error}"),
+            )
+        })
+    }) {
+        Ok(metadata) => {
+            hasher.update(b"\0trace\0");
+            hasher.update(trace_metadata_etag(&metadata).as_bytes());
+        }
+        Err(_) => hasher.update(b"\0trace-missing\0"),
     }
     format!("legacy-sha256-{}", hex(&hasher.finalize()))
 }
@@ -1123,6 +1283,11 @@ pub(super) fn legacy_analysis_generated_at(run: &RunRecord, timing: &TimingState
                     generated_at = generated_at.max(modified_at);
                 }
             }
+        }
+    }
+    if let Ok(path) = select_trace(run) {
+        if let Ok(modified_at) = path.metadata().and_then(|metadata| metadata.modified()) {
+            generated_at = generated_at.max(modified_at);
         }
     }
     generated_at

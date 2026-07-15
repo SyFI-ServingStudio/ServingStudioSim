@@ -155,8 +155,8 @@ same basename therefore remain distinct. Public routes are limited to:
 
 - `GET /api/v1/runs`
 - `GET /api/v1/runs/{run_id}/descriptor`
-- descriptor-linked `summary`, topology, registry report/payload, and Perfetto
-  resources
+- descriptor-linked `summary`, topology, and revision-scoped registry
+  report/payload and Perfetto resources
 
 The topology resource is the v1 envelope
 `{schema_version, params, run_meta}`; `summary.json` is passed through unchanged.
@@ -178,6 +178,13 @@ state binds the exact trace path and real producer version/revision/binary diges
 a per-run lease prevents overlapping generations. Legacy runs without the
 sidecar use bounded artifact inspection, stable content-derived revisions, and
 producer identity `legacy-unknown`.
+
+Ready artifact hrefs contain that revision. The service checks the pipeline and
+timing snapshot before and after descriptor or JSON reads, retrying the whole
+multi-file read on a cutover and returning `artifact_generation_changed` after
+bounded churn. Trace handling opens the selected file before the final snapshot
+check and streams that same descriptor. A stale revision href therefore cannot
+serve a newly replaced fixed-path artifact under the old descriptor identity.
 
 Analyzer JSON and trace files are written by durable same-directory atomic
 replacement. On Linux the service opens root-and-run-relative artifacts from a

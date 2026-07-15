@@ -203,6 +203,17 @@ paths. Catalog, descriptor, and immutable artifacts use `ETag` and conditional
 unchanged JSON. Errors use `application/problem+json` with a stable `code` in
 addition to human-readable detail.
 
+Ready report, payload, and trace links are relative paths scoped by the
+descriptor's `analysis.revision`. A request carrying a revision other than the
+current readable generation fails closed with `artifact_generation_changed`;
+the service never resolves that old link to a fixed filename from a newer
+generation. Descriptor assembly and linked-resource reads use a bounded
+seqlock-style check: capture pipeline/timing state, open or read every required
+artifact, then capture state again and retry the whole read if it changed. Trace
+reads keep the opened file descriptor across the final check, so a subsequent
+atomic replacement cannot change the bytes being streamed. Legacy runs use the
+content-derived legacy revision as the same read fence.
+
 The default Host allowlist is limited to loopback spellings (`localhost`,
 `127.0.0.1`, and `[::1]`) as a DNS-rebinding boundary. A same-origin development
 proxy should preserve or rewrite `Host` to the loopback analyzer target. A

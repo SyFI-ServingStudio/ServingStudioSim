@@ -271,28 +271,17 @@ pub(super) fn conditional_bytes(
         .map_err(response_build_problem)
 }
 
-struct PreparedTrace {
+pub(super) struct PreparedTrace {
     file: fs::File,
     byte_length: u64,
     etag: String,
 }
 
-pub(super) async fn conditional_trace(
+pub(super) fn conditional_prepared_trace(
     headers: &HeaderMap,
     content_type: &'static str,
-    run: RunRecord,
-    path: PathBuf,
+    prepared: PreparedTrace,
 ) -> Result<Response, ApiProblem> {
-    let prepared = tokio::task::spawn_blocking(move || prepare_trace(&run, path))
-        .await
-        .map_err(|error| {
-            ApiProblem::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "artifact_read_failed",
-                "Artifact read failed",
-                format!("Perfetto trace reader task failed: {error}"),
-            )
-        })??;
     if if_none_match(headers, &prepared.etag) {
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
@@ -314,7 +303,7 @@ pub(super) async fn conditional_trace(
         .map_err(response_build_problem)
 }
 
-fn prepare_trace(run: &RunRecord, path: PathBuf) -> Result<PreparedTrace, ApiProblem> {
+pub(super) fn prepare_trace(run: &RunRecord, path: PathBuf) -> Result<PreparedTrace, ApiProblem> {
     let relative = path.strip_prefix(&run.path).map_err(|_| {
         ApiProblem::new(
             StatusCode::FORBIDDEN,
@@ -382,7 +371,7 @@ fn prepare_trace(run: &RunRecord, path: PathBuf) -> Result<PreparedTrace, ApiPro
     })
 }
 
-fn trace_metadata_etag(metadata: &fs::Metadata) -> String {
+pub(super) fn trace_metadata_etag(metadata: &fs::Metadata) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

@@ -56,6 +56,7 @@ const MAX_JSON_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TRACE_BYTES: u64 = 512 * 1024 * 1024;
 const CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_DESCRIPTOR_CACHE_ENTRIES: usize = 256;
+const MAX_GENERATION_READ_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug)]
 struct ConfiguredRoot {
@@ -108,7 +109,7 @@ enum StageStatus {
     Failed,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct PipelineProducer {
     name: String,
     version: String,
@@ -116,7 +117,7 @@ struct PipelineProducer {
     binary_sha256: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct PipelineStage {
     status: StageStatus,
     #[serde(default)]
@@ -125,14 +126,14 @@ struct PipelineStage {
     artifact: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct PipelineStages {
     compute: PipelineStage,
     render: PipelineStage,
     trace: PipelineStage,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct PipelineStateV1 {
     schema_version: u32,
     generation_id: String,
@@ -148,7 +149,7 @@ struct PipelineStateV1 {
     stages: PipelineStages,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PipelineStateRead {
     Missing,
     Valid(Box<PipelineStateV1>),
@@ -223,7 +224,7 @@ enum SubjectState {
 #[serde(tag = "status", rename_all = "snake_case")]
 enum TraceState {
     Ready {
-        href: &'static str,
+        href: String,
         media_type: &'static str,
         byte_length: u64,
     },
@@ -279,7 +280,7 @@ struct RunDescriptor {
     provenance: AnalyzerProvenance,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TimingInfo {
     statuses: HashMap<String, String>,
     bytes: Vec<u8>,
@@ -287,7 +288,7 @@ struct TimingInfo {
     generation_id: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum TimingState {
     Missing,
     Valid(TimingInfo),
@@ -375,6 +376,15 @@ impl ApiProblem {
             ),
         )
     }
+
+    fn artifact_generation_changed(detail: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "artifact_generation_changed",
+            "Artifact generation changed",
+            detail,
+        )
+    }
 }
 
 impl IntoResponse for ApiProblem {
@@ -440,15 +450,15 @@ fn router_with_hosts(logs_roots: Vec<PathBuf>, allow_hosts: Vec<String>) -> Resu
         .route("/api/v1/runs/{run_id}/summary", get(get_summary))
         .route("/api/v1/runs/{run_id}/topology", get(get_topology))
         .route(
-            "/api/v1/runs/{run_id}/reports/{subject_id}",
+            "/api/v1/runs/{run_id}/revisions/{revision}/reports/{subject_id}",
             get(get_subject_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/payloads/{subject_id}",
+            "/api/v1/runs/{run_id}/revisions/{revision}/payloads/{subject_id}",
             get(get_subject_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/traces/perfetto",
+            "/api/v1/runs/{run_id}/revisions/{revision}/traces/perfetto",
             get(get_perfetto_trace),
         )
         .fallback(unknown_resource)
@@ -631,23 +641,24 @@ async fn get_topology(
 
 async fn get_subject_report(
     State(state): State<Arc<ServiceState>>,
-    RoutePath((run_id, subject_id)): RoutePath<(String, String)>,
+    RoutePath((run_id, revision, subject_id)): RoutePath<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiProblem> {
-    get_subject_artifact(&state, &run_id, &subject_id, true, &headers).await
+    get_subject_artifact(&state, &run_id, &revision, &subject_id, true, &headers).await
 }
 
 async fn get_subject_payload(
     State(state): State<Arc<ServiceState>>,
-    RoutePath((run_id, subject_id)): RoutePath<(String, String)>,
+    RoutePath((run_id, revision, subject_id)): RoutePath<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiProblem> {
-    get_subject_artifact(&state, &run_id, &subject_id, false, &headers).await
+    get_subject_artifact(&state, &run_id, &revision, &subject_id, false, &headers).await
 }
 
 async fn get_subject_artifact(
     state: &Arc<ServiceState>,
     run_id: &str,
+    revision: &str,
     subject_id: &str,
     report: bool,
     headers: &HeaderMap,
@@ -665,60 +676,83 @@ async fn get_subject_artifact(
             )
         })?;
     let deployment = read_deployment(&run)?;
-    let pipeline = read_pipeline_state(&run);
-    let timing = read_timing(&run);
-    let lifecycle = lifecycle_from(&run, &pipeline, &timing);
-    let mut artifact_bytes = SubjectArtifactBytes::default();
-    if !matches!(
-        subject_state(
-            &run,
-            subject,
-            &deployment,
-            lifecycle,
-            &pipeline,
-            &timing,
-            Some(&mut artifact_bytes),
-        ),
-        SubjectState::Ready { .. }
-    ) {
-        return Err(ApiProblem::new(
-            StatusCode::NOT_FOUND,
-            "resource_not_ready",
-            "Resource is not ready",
-            format!("Analyzer subject {subject_id:?} does not declare a ready artifact."),
-        ));
-    }
-    let bytes = if report {
-        artifact_bytes.report
-    } else {
-        artifact_bytes.payload
-    };
+    let bytes = with_consistent_analysis_snapshot(&run, |snapshot| {
+        snapshot.require_revision(revision)?;
+        let lifecycle = lifecycle_from(&run, snapshot.pipeline(), snapshot.timing());
+        let mut artifact_bytes = SubjectArtifactBytes::default();
+        if !matches!(
+            subject_state(
+                &run,
+                subject,
+                &deployment,
+                lifecycle,
+                snapshot.pipeline(),
+                snapshot.timing(),
+                snapshot.artifact_revision(),
+                Some(&mut artifact_bytes),
+            ),
+            SubjectState::Ready { .. }
+        ) {
+            return Err(ApiProblem::new(
+                StatusCode::NOT_FOUND,
+                "resource_not_ready",
+                "Resource is not ready",
+                format!("Analyzer subject {subject_id:?} does not declare a ready artifact."),
+            ));
+        }
+        Ok(if report {
+            artifact_bytes.report
+        } else {
+            artifact_bytes.payload
+        })
+    })?;
     conditional_bytes(headers, "application/json", bytes)
 }
 
 async fn get_perfetto_trace(
     State(state): State<Arc<ServiceState>>,
-    RoutePath(run_id): RoutePath<String>,
+    RoutePath((run_id, revision)): RoutePath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiProblem> {
     let run = resolve_run(&state, &run_id).await?;
-    let pipeline = read_pipeline_state(&run);
-    let timing = read_timing(&run);
-    let lifecycle = lifecycle_from(&run, &pipeline, &timing);
-    if !matches!(
-        trace_state(&run, lifecycle, &pipeline, &timing),
-        TraceState::Ready { .. }
-    ) {
-        return Err(ApiProblem::new(
-            StatusCode::NOT_FOUND,
-            "resource_not_ready",
-            "Resource is not ready",
-            "This run does not declare a ready Perfetto trace.",
-        ));
-    }
-    let path = select_trace_for_pipeline(&run, &pipeline)?;
-    let media_type = trace_media_type(&path);
-    conditional_trace(&headers, media_type, run, path).await
+    let prepared = tokio::task::spawn_blocking(move || {
+        with_consistent_analysis_snapshot(&run, |snapshot| {
+            snapshot.require_revision(&revision)?;
+            let lifecycle = lifecycle_from(&run, snapshot.pipeline(), snapshot.timing());
+            if !matches!(
+                trace_state(
+                    &run,
+                    lifecycle,
+                    snapshot.pipeline(),
+                    snapshot.timing(),
+                    snapshot.artifact_revision(),
+                ),
+                TraceState::Ready { .. }
+            ) {
+                return Err(ApiProblem::new(
+                    StatusCode::NOT_FOUND,
+                    "resource_not_ready",
+                    "Resource is not ready",
+                    "This run does not declare a ready Perfetto trace.",
+                ));
+            }
+            let path = select_trace_for_pipeline(&run, snapshot.pipeline())?;
+            let media_type = trace_media_type(&path);
+            // Keep this fd open across the final snapshot validation. Atomic
+            // replacement cannot change the inode that the response streams.
+            Ok((media_type, prepare_trace(&run, path)?))
+        })
+    })
+    .await
+    .map_err(|error| {
+        ApiProblem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact_read_failed",
+            "Artifact read failed",
+            format!("Perfetto trace reader task failed: {error}"),
+        )
+    })??;
+    conditional_prepared_trace(&headers, prepared.0, prepared.1)
 }
 
 async fn unknown_resource(uri: Uri) -> ApiProblem {
