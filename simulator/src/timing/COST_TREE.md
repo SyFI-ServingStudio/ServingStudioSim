@@ -129,8 +129,8 @@ Sum
 - **INV-3** `Scale`/fold only for provably-identical subtrees; heterogeneous
   fan-out uses `Max` with N children.
 - **INV-4** `flops`/`bytes`/`energy` always sum; build-time `Max{children}`
-  selects the slowest branch, its v1 flat/wire form carries fixed
-  `overlap=1`, and `Scale` multiplies `time`; `coverage` always ORs up.
+  selects the slowest branch and `Scale` multiplies `time`; `coverage` always
+  ORs up. The fixed v1 compatibility field is a wire concern only.
 - **INV-5** names/labels live only in compile-time products (`CostManifest`);
   the hot path and log rows are name-free, reconstructed via slot position +
   manifest.

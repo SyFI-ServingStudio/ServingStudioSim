@@ -310,14 +310,6 @@ fn node_label(m: &Manifest, idx: usize) -> Option<&str> {
     m.node_labels.get(idx).and_then(|o| o.as_deref())
 }
 
-fn fmt_overlap(o: f32) -> String {
-    if (o - o.round()).abs() < 1e-6 {
-        format!("{}", o.round() as i64)
-    } else {
-        format!("{o}")
-    }
-}
-
 /// us from ns, rounded.
 fn us(ns: i64) -> i64 {
     (ns as f64 / 1000.0).round() as i64
@@ -337,9 +329,7 @@ fn base_label(m: &Manifest, idx: usize) -> String {
             format!("{} ({})", leaf_short(&d.name), d.kind)
         }
         FlatCostNode::Sum { .. } => lbl.unwrap_or("Sum").to_string(),
-        FlatCostNode::Max { overlap, .. } => lbl
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("Max{{overlap={}}}", fmt_overlap(*overlap))),
+        FlatCostNode::Max { .. } => lbl.unwrap_or("Max").to_string(),
         FlatCostNode::Scale { n, .. } => format!("{} ×{}", lbl.unwrap_or("scale"), n),
     }
 }
@@ -363,12 +353,8 @@ fn signature(m: &Manifest, idx: usize) -> String {
             format!("L[{lbl}|{}|{}]", d.kind, leaf_short(&d.name))
         }
         FlatCostNode::Sum { children } => format!("S[{lbl}]({})", sig_children(m, children)),
-        FlatCostNode::Max { overlap, children } => {
-            format!(
-                "M[{lbl}|{}]({})",
-                fmt_overlap(*overlap),
-                sig_children(m, children)
-            )
+        FlatCostNode::Max { children, .. } => {
+            format!("M[{lbl}]({})", sig_children(m, children))
         }
         FlatCostNode::Scale { n, children } => {
             format!("X[{lbl}|{n}]({})", signature(m, children.start))

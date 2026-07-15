@@ -120,9 +120,9 @@ pub struct LeafDesc {
 /// parquet `slot_*` list columns) with the flattened aggregation
 /// [`nodes`](Self::nodes), so a consumer reading a row from `cost_log/` can
 /// re-run [`CostTree::aggregate`] over that row's `slot_time_ms` to reproduce
-/// `total_time_ms`: the `Scale{n}` fold, `Sum`, and wire-compatible
-/// `Max{overlap=1}` operators are all present (slot names alone can't reconstruct
-/// the total).
+/// `total_time_ms`: the `Scale{n}` fold, `Sum`, and `Max` operators are all
+/// present (slot names alone can't reconstruct the total). The flat `Max` node
+/// retains its fixed protocol-v1 compatibility field on the wire.
 ///
 /// [`node_labels`](Self::node_labels) recovers the composite identity that
 /// [`CostTree::flatten`] drops: it is index-aligned to [`nodes`](Self::nodes) —
@@ -425,7 +425,7 @@ impl CostTree {
     /// Composites combine:
     ///   - `Sum`  — field-wise sum of children (coverage flags unioned);
     ///   - `Scale{n}` — child subtree × `n` (the homogeneous-layer fold);
-    ///   - `Max{overlap=1}` — `time = max(child.time)`, other fields summed
+    ///   - `Max` — `time = max(child.time)`, other fields summed
     ///     (flops/bytes/energy always add — work doesn't overlap away, INV-4).
     /// Coverage flags always OR up the tree, so a warning anywhere surfaces at
     /// the root.
@@ -506,9 +506,7 @@ impl CostTree {
                 }
             }
             CostNode::Max { children } => {
-                // `overlap=1` is retained here as a useful reminder of the v1
-                // wire representation; authors cannot choose another value.
-                writeln!(out, "{ind}Max{{overlap=1}}").unwrap();
+                writeln!(out, "{ind}Max").unwrap();
                 for c in children {
                     self.write_node(c, depth + 1, out);
                 }
@@ -737,7 +735,7 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
             children: vec![b.leaf("x", "kx", "", vec![]), b.leaf("y", "ky", "", vec![])],
         };
         let tree = b.finish(root);
-        assert!(tree.describe().starts_with("Max{overlap=1}\n"));
+        assert!(tree.describe().starts_with("Max\n"));
         let flat = tree.flatten();
         assert!(matches!(flat[0], FlatCostNode::Max { overlap: 1.0, .. }));
         let wire_json = serde_json::to_string(&flat[0]).unwrap();
