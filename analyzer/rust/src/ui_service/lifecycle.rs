@@ -359,7 +359,6 @@ pub(super) fn build_descriptor_at_snapshot(
                     &snapshot.pipeline,
                     &snapshot.timing,
                     snapshot.artifact_revision(),
-                    None,
                 ),
             )
         })
@@ -438,9 +437,8 @@ pub(super) fn build_descriptor_at_snapshot(
     })
 }
 
-/// Cheap descriptor cache key. Analyzer publishers replace artifacts atomically,
-/// so size + nanosecond mtime metadata changes before a new generation is
-/// observable; unchanged polls avoid reparsing every report/payload JSON pair.
+/// Cheap descriptor cache key over opened-file identity. Device + inode make an
+/// atomic replacement observable even when length and mtime are preserved.
 pub(super) fn descriptor_stamp(run: &RunRecord) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"vibesim-ui-descriptor-stamp-v1\0");
@@ -477,7 +475,10 @@ pub(super) fn descriptor_stamp(run: &RunRecord) -> String {
         }
     };
     match selected_trace {
-        Ok(trace) => stamp_metadata(&mut hasher, &trace),
+        Ok(trace) => match trace.strip_prefix(&run.path) {
+            Ok(relative) => stamp_path_metadata(&mut hasher, run, relative),
+            Err(_) => hasher.update(b"\0trace-outside-run\0"),
+        },
         Err(_) => hasher.update(b"\0trace-missing\0"),
     }
     hex(&hasher.finalize())
@@ -485,25 +486,18 @@ pub(super) fn descriptor_stamp(run: &RunRecord) -> String {
 
 fn stamp_path_metadata(hasher: &mut Sha256, run: &RunRecord, relative: &Path) {
     hasher.update(relative.as_os_str().as_encoded_bytes());
-    match resolve_contained_file(&run.root, &run.path, relative, "descriptor stamp") {
-        Ok(path) => stamp_metadata(hasher, &path),
+    match open_contained_artifact(run, relative, "descriptor stamp").and_then(|(file, _)| {
+        file.metadata().map_err(|error| {
+            ApiProblem::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "Artifact read failed",
+                format!("Cannot inspect descriptor stamp artifact: {error}"),
+            )
+        })
+    }) {
+        Ok(metadata) => hash_metadata(hasher, &metadata),
         Err(_) => hasher.update(b"\0missing\0"),
-    }
-}
-
-fn stamp_metadata(hasher: &mut Sha256, path: &Path) {
-    match path.metadata() {
-        Ok(metadata) => {
-            hasher.update(metadata.len().to_be_bytes());
-            let modified = metadata
-                .modified()
-                .unwrap_or(UNIX_EPOCH)
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            hasher.update(modified.to_be_bytes());
-        }
-        Err(_) => hasher.update(b"\0metadata-error\0"),
     }
 }
 
@@ -655,104 +649,17 @@ pub(super) fn subject_state(
     pipeline: &PipelineStateRead,
     timing: &TimingState,
     artifact_revision: Option<&str>,
-    artifact_bytes: Option<&mut SubjectArtifactBytes>,
 ) -> SubjectState {
-    if !subject.applies.matches(Some(deployment)) {
-        return SubjectState::Unavailable {
-            reason: format!(
-                "Analyzer subject {:?} does not apply to deployment {deployment:?}.",
-                subject.name
-            ),
-            code: Some("subject_not_applicable".to_string()),
-        };
-    }
-    match pipeline {
-        PipelineStateRead::Invalid { code, reason } => {
-            return SubjectState::Failed {
-                code: code.clone(),
-                reason: reason.clone(),
-            }
-        }
-        PipelineStateRead::Valid(state) => {
-            let requested = state
-                .requested_subjects
-                .as_ref()
-                .is_none_or(|subjects| subjects.iter().any(|name| name == subject.name));
-            if !requested {
-                return SubjectState::NotGenerated {
-                    reason: Some(format!(
-                        "Analyzer subject {:?} was not requested for generation {:?}.",
-                        subject.name, state.generation_id
-                    )),
-                };
-            }
-            match state.stages.compute.status {
-                StageStatus::NotStarted | StageStatus::Pending => {
-                    return SubjectState::Pending {
-                        reason: Some(format!(
-                            "Analyzer subject {:?} is waiting for current-generation compute.",
-                            subject.name
-                        )),
-                    }
-                }
-                StageStatus::Failed => {
-                    return SubjectState::Failed {
-                        code: state
-                            .stages
-                            .compute
-                            .code
-                            .clone()
-                            .unwrap_or_else(|| "compute_failed".to_string()),
-                        reason: format!(
-                            "Analyzer compute failed before subject {:?} became current.",
-                            subject.name
-                        ),
-                    }
-                }
-                StageStatus::Complete => {
-                    if !timing_matches_generation(timing, &state.generation_id) {
-                        return SubjectState::Failed {
-                            code: "analysis_generation_mismatch".to_string(),
-                            reason: format!(
-                                "Analyzer timing does not belong to current generation {:?}.",
-                                state.generation_id
-                            ),
-                        };
-                    }
-                    if timing_status(timing, subject.name).is_none() {
-                        return SubjectState::Failed {
-                            code: "analysis_subject_unrecorded".to_string(),
-                            reason: format!(
-                                "Current generation did not record requested subject {:?}.",
-                                subject.name
-                            ),
-                        };
-                    }
-                }
-            }
-        }
-        PipelineStateRead::Missing => {}
-    }
-    if matches!(
-        timing,
-        TimingState::Valid(TimingInfo { statuses, .. })
-            if statuses.get(subject.name).is_some_and(|status| status == "failed")
-    ) {
-        return SubjectState::Failed {
-            code: "analysis_failed".to_string(),
-            reason: format!(
-                "Analyzer subject {:?} failed during generation.",
-                subject.name
-            ),
-        };
+    if let Some(state) = subject_preflight_state(subject, deployment, pipeline, timing) {
+        return state;
     }
 
-    let mut report = probe_json(
+    let report = probe_json(
         run,
         &Path::new("reports").join(subject.report_name),
         "subject report",
     );
-    let mut payload = probe_json(
+    let payload = probe_json(
         run,
         &Path::new("payloads").join(subject.payload_name),
         "subject payload",
@@ -770,17 +677,17 @@ pub(super) fn subject_state(
         };
     }
 
-    match (&mut report, &mut payload) {
+    match (&report, &payload) {
         (
             JsonProbe::Valid {
                 schema_version: report_version,
                 value: report_value,
-                bytes: report_bytes,
+                ..
             },
             JsonProbe::Valid {
                 schema_version: payload_version,
                 value: payload_value,
-                bytes: payload_bytes,
+                ..
             },
         ) => {
             if report_version != payload_version {
@@ -808,10 +715,6 @@ pub(super) fn subject_state(
                         .or_else(|| artifact_code(payload_value))
                         .or_else(|| Some("subject_unavailable".to_string())),
                 };
-            }
-            if let Some(artifact_bytes) = artifact_bytes {
-                artifact_bytes.report = std::mem::take(report_bytes);
-                artifact_bytes.payload = std::mem::take(payload_bytes);
             }
             let Some(artifact_revision) = artifact_revision else {
                 return SubjectState::Failed {
@@ -867,6 +770,107 @@ pub(super) fn subject_state(
     }
 }
 
+/// Project lifecycle/generation gates without opening either subject artifact.
+/// Resource handlers reuse this before reading exactly the requested side of
+/// the report/payload pair; descriptor assembly continues with both probes.
+pub(super) fn subject_preflight_state(
+    subject: &Subject,
+    deployment: &str,
+    pipeline: &PipelineStateRead,
+    timing: &TimingState,
+) -> Option<SubjectState> {
+    if !subject.applies.matches(Some(deployment)) {
+        return Some(SubjectState::Unavailable {
+            reason: format!(
+                "Analyzer subject {:?} does not apply to deployment {deployment:?}.",
+                subject.name
+            ),
+            code: Some("subject_not_applicable".to_string()),
+        });
+    }
+    match pipeline {
+        PipelineStateRead::Invalid { code, reason } => {
+            return Some(SubjectState::Failed {
+                code: code.clone(),
+                reason: reason.clone(),
+            })
+        }
+        PipelineStateRead::Valid(state) => {
+            let requested = state
+                .requested_subjects
+                .as_ref()
+                .is_none_or(|subjects| subjects.iter().any(|name| name == subject.name));
+            if !requested {
+                return Some(SubjectState::NotGenerated {
+                    reason: Some(format!(
+                        "Analyzer subject {:?} was not requested for generation {:?}.",
+                        subject.name, state.generation_id
+                    )),
+                });
+            }
+            match state.stages.compute.status {
+                StageStatus::NotStarted | StageStatus::Pending => {
+                    return Some(SubjectState::Pending {
+                        reason: Some(format!(
+                            "Analyzer subject {:?} is waiting for current-generation compute.",
+                            subject.name
+                        )),
+                    })
+                }
+                StageStatus::Failed => {
+                    return Some(SubjectState::Failed {
+                        code: state
+                            .stages
+                            .compute
+                            .code
+                            .clone()
+                            .unwrap_or_else(|| "compute_failed".to_string()),
+                        reason: format!(
+                            "Analyzer compute failed before subject {:?} became current.",
+                            subject.name
+                        ),
+                    })
+                }
+                StageStatus::Complete => {
+                    if !timing_matches_generation(timing, &state.generation_id) {
+                        return Some(SubjectState::Failed {
+                            code: "analysis_generation_mismatch".to_string(),
+                            reason: format!(
+                                "Analyzer timing does not belong to current generation {:?}.",
+                                state.generation_id
+                            ),
+                        });
+                    }
+                    if timing_status(timing, subject.name).is_none() {
+                        return Some(SubjectState::Failed {
+                            code: "analysis_subject_unrecorded".to_string(),
+                            reason: format!(
+                                "Current generation did not record requested subject {:?}.",
+                                subject.name
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        PipelineStateRead::Missing => {}
+    }
+    if matches!(
+        timing,
+        TimingState::Valid(TimingInfo { statuses, .. })
+            if statuses.get(subject.name).is_some_and(|status| status == "failed")
+    ) {
+        return Some(SubjectState::Failed {
+            code: "analysis_failed".to_string(),
+            reason: format!(
+                "Analyzer subject {:?} failed during generation.",
+                subject.name
+            ),
+        });
+    }
+    None
+}
+
 pub(super) fn timing_status<'a>(timing: &'a TimingState, subject: &str) -> Option<&'a str> {
     match timing {
         TimingState::Valid(info) => info.statuses.get(subject).map(String::as_str),
@@ -915,7 +919,6 @@ pub(super) fn probe_json(run: &RunRecord, relative: &Path, resource: &str) -> Js
     JsonProbe::Valid {
         schema_version,
         value,
-        bytes,
     }
 }
 

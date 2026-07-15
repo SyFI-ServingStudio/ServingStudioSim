@@ -8,6 +8,8 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+static ARTIFACT_READ_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
 fn write_json(path: &Path, value: &Value) {
     fs::create_dir_all(path.parent().expect("test artifact has parent")).unwrap();
     fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
@@ -272,6 +274,9 @@ fn state(root: &TempDir) -> ServiceState {
         discovery_refresh: AsyncMutex::new(()),
         discovery_scan_count: AtomicUsize::new(0),
         descriptors: RwLock::new(HashMap::new()),
+        descriptor_build: StdMutex::new(()),
+        subject_proofs: RwLock::new(HashMap::new()),
+        artifact_reads: Arc::new(Semaphore::new(MAX_IN_FLIGHT_ARTIFACT_READS)),
         allowed_hosts: configure_allowed_hosts(Vec::new()).unwrap(),
     }
 }
@@ -435,6 +440,9 @@ fn repeated_logs_roots_keep_identical_relative_paths_distinct() {
         discovery_refresh: AsyncMutex::new(()),
         discovery_scan_count: AtomicUsize::new(0),
         descriptors: RwLock::new(HashMap::new()),
+        descriptor_build: StdMutex::new(()),
+        subject_proofs: RwLock::new(HashMap::new()),
+        artifact_reads: Arc::new(Semaphore::new(MAX_IN_FLIGHT_ARTIFACT_READS)),
         allowed_hosts: configure_allowed_hosts(Vec::new()).unwrap(),
     };
 
@@ -527,6 +535,261 @@ async fn registry_is_the_only_report_payload_allowlist() {
         );
         assert_eq!(body_json(response).await["code"], "resource_not_found");
     }
+}
+
+#[tokio::test]
+async fn report_request_does_not_read_or_parse_the_payload() {
+    let _observer_guard = ARTIFACT_READ_TEST_LOCK.lock().unwrap();
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing_generation(&run, &[("slo-general", "ok")], Some("generation-current"));
+    write_pipeline(
+        &run,
+        "generation-current",
+        "pending",
+        "complete",
+        "pending",
+        "not_started",
+        Some(&["slo-general"]),
+        None,
+    );
+    let subject = SUBJECTS
+        .iter()
+        .find(|subject| subject.name == "slo-general")
+        .unwrap();
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let (reads_tx, reads_rx) = std::sync::mpsc::channel();
+    set_artifact_read_observer(Some(reads_tx));
+
+    let descriptor = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/descriptor"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(descriptor.status(), StatusCode::OK);
+    while reads_rx.try_recv().is_ok() {}
+
+    let report = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/runs/{run_id}/revisions/pipeline-generation-current/reports/slo-general"
+                ))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.status(), StatusCode::OK);
+    let reads = reads_rx.try_iter().collect::<Vec<_>>();
+    set_artifact_read_observer(None);
+    assert!(reads.contains(&run.join("reports").join(subject.report_name)));
+    assert!(!reads.contains(&run.join("payloads").join(subject.payload_name)));
+}
+
+#[tokio::test]
+async fn legacy_subject_reuses_content_revision_without_rehashing_counterpart() {
+    let _observer_guard = ARTIFACT_READ_TEST_LOCK.lock().unwrap();
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing(&run, &[("slo-general", "ok")]);
+    let subject = SUBJECTS
+        .iter()
+        .find(|subject| subject.name == "slo-general")
+        .unwrap();
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let descriptor = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/descriptor"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let descriptor = body_json(descriptor).await;
+    let revision = descriptor["analysis"]["revision"].as_str().unwrap();
+    let (reads_tx, reads_rx) = std::sync::mpsc::channel();
+    set_artifact_read_observer(Some(reads_tx));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/runs/{run_id}/revisions/{revision}/reports/slo-general"
+                ))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let reads = reads_rx.try_iter().collect::<Vec<_>>();
+    set_artifact_read_observer(None);
+    assert!(reads.contains(&run.join("reports").join(subject.report_name)));
+    assert!(!reads.contains(&run.join("payloads").join(subject.payload_name)));
+}
+
+#[tokio::test]
+async fn changed_counterpart_invalidates_cached_subject_readiness() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    publish_subject_generation(&run, "generation-current", "before");
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let descriptor = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/descriptor"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(descriptor.status(), StatusCode::OK);
+
+    let subject = SUBJECTS
+        .iter()
+        .find(|subject| subject.name == "slo-general")
+        .unwrap();
+    fs::write(run.join("payloads").join(subject.payload_name), b"not json").unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/runs/{run_id}/revisions/pipeline-generation-current/reports/slo-general"
+                ))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(response).await["code"],
+        "artifact_generation_changed"
+    );
+}
+
+#[tokio::test]
+async fn saturated_artifact_reader_limit_fails_fast_with_stable_problem() {
+    let root = TempDir::new().unwrap();
+    create_run(root.path(), "run", "unified", true);
+    let mut service_state = state(&root);
+    service_state.artifact_reads = Arc::new(Semaphore::new(1));
+    let service_state = Arc::new(service_state);
+    let held_permit = Arc::clone(&service_state.artifact_reads)
+        .try_acquire_owned()
+        .unwrap();
+    let run_id = discover_runs(&service_state).unwrap().remove(0).run_id;
+    let app = router_from_state(Arc::clone(&service_state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/summary"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    assert_eq!(body_json(response).await["code"], "artifact_read_busy");
+    drop(held_permit);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn artifact_io_runs_on_a_blocking_worker() {
+    let root = TempDir::new().unwrap();
+    let service_state = Arc::new(state(&root));
+    let async_worker = std::thread::current().id();
+
+    let blocking_worker =
+        run_blocking_artifact_task(&service_state, "thread-boundary test", move || {
+            Ok(std::thread::current().id())
+        })
+        .await
+        .unwrap();
+
+    assert_ne!(blocking_worker, async_worker);
+}
+
+#[tokio::test]
+async fn matching_metadata_etag_returns_before_reading_invalid_json() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    fs::write(run.join("summary.json"), b"not json").unwrap();
+    let record = discover_runs(&state(&root)).unwrap().remove(0);
+    let relative = Path::new("summary.json");
+    let artifact = open_bounded_artifact(&record, relative, MAX_JSON_BYTES, "summary").unwrap();
+    let etag = metadata_etag("json-artifact-v1", &[(relative, &artifact.metadata)]);
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{}/summary", record.run_id))
+                .header(header::HOST, "localhost")
+                .header(header::IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert!(to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn json_artifact_limit_is_enforced_before_allocation() {
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    fs::File::create(run.join("summary.json"))
+        .unwrap()
+        .set_len(MAX_JSON_BYTES + 1)
+        .unwrap();
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/summary"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(response).await["code"], "artifact_too_large");
 }
 
 #[tokio::test]
@@ -1109,7 +1372,6 @@ fn generation_seqlock_retries_the_whole_read_after_cutover() {
     let run = create_run(root.path(), "run", "unified", true);
     publish_subject_generation(&run, "generation-old", "old-bytes");
     let record = discover_runs(&state(&root)).unwrap().remove(0);
-    let deployment = read_deployment(&record).unwrap();
     let subject = SUBJECTS
         .iter()
         .find(|subject| subject.name == "slo-general")
@@ -1118,25 +1380,15 @@ fn generation_seqlock_retries_the_whole_read_after_cutover() {
 
     let observed_marker = with_consistent_analysis_snapshot(&record, |snapshot| {
         attempts += 1;
-        let lifecycle = lifecycle_from(&record, snapshot.pipeline(), snapshot.timing());
-        let mut artifact_bytes = SubjectArtifactBytes::default();
-        assert!(matches!(
-            subject_state(
-                &record,
-                subject,
-                &deployment,
-                lifecycle,
-                snapshot.pipeline(),
-                snapshot.timing(),
-                snapshot.artifact_revision(),
-                Some(&mut artifact_bytes),
-            ),
-            SubjectState::Ready { .. }
-        ));
-        let marker = serde_json::from_slice::<Value>(&artifact_bytes.report).unwrap()["marker"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        snapshot
+            .artifact_revision()
+            .expect("published generation has a revision");
+        let report = read_json_value(
+            &record,
+            &Path::new("reports").join(subject.report_name),
+            "subject report",
+        )?;
+        let marker = report["marker"].as_str().unwrap().to_string();
         if attempts == 1 {
             publish_subject_generation(&run, "generation-new", "new-bytes");
         }
@@ -1271,6 +1523,63 @@ async fn pipeline_selects_exact_trace_and_trace_endpoint_honors_etag() {
         .await
         .unwrap();
     assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn legacy_trace_conditional_get_reuses_cached_content_revision() {
+    let _observer_guard = ARTIFACT_READ_TEST_LOCK.lock().unwrap();
+    let root = TempDir::new().unwrap();
+    let run = create_run(root.path(), "run", "unified", true);
+    write_subject(&run, "slo-general", true, None);
+    write_timing(&run, &[("slo-general", "ok")]);
+    fs::create_dir_all(run.join("traces")).unwrap();
+    fs::write(run.join("traces/legacy.pftrace.gz"), b"legacy trace").unwrap();
+    let run_id = discover_runs(&state(&root)).unwrap().remove(0).run_id;
+    let app = router(vec![root.path().to_path_buf()]).unwrap();
+    let descriptor = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/runs/{run_id}/descriptor"))
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let descriptor = body_json(descriptor).await;
+    let href = descriptor["traces"]["perfetto"]["href"].as_str().unwrap();
+    let uri = format!("/api/v1/runs/{run_id}/{href}");
+    let (reads_tx, reads_rx) = std::sync::mpsc::channel();
+    set_artifact_read_observer(Some(reads_tx));
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header(header::HOST, "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let etag = first.headers()[header::ETAG].clone();
+    let conditional = app
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header(header::HOST, "localhost")
+                .header(header::IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+    set_artifact_read_observer(None);
+    assert!(reads_rx.try_iter().collect::<Vec<_>>().is_empty());
 }
 
 #[test]

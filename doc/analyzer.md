@@ -212,7 +212,12 @@ seqlock-style check: capture pipeline/timing state, open or read every required
 artifact, then capture state again and retry the whole read if it changed. Trace
 reads keep the opened file descriptor across the final check, so a subsequent
 atomic replacement cannot change the bytes being streamed. Legacy runs use the
-content-derived legacy revision as the same read fence.
+content-derived legacy revision as the same read fence. The service memoizes
+that content hash only behind a strong device/inode/length/mtime metadata fence;
+legacy linked reads recheck the fence before and after I/O instead of hashing
+every subject body again. A descriptor-validated report/payload pair is cached
+the same way, so a linked request reads only its target JSON body while still
+failing closed if either member of the pair changes.
 
 The default Host allowlist is limited to loopback spellings (`localhost`,
 `127.0.0.1`, and `[::1]`) as a DNS-rebinding boundary. A same-origin development
@@ -224,6 +229,13 @@ allowlist. Method rejection includes `Allow: GET`.
 Catalog discovery is cached for 30 seconds, refreshed by one single-flight scan
 on a blocking worker, and never runs a multi-gigabyte tree walk on an async
 request worker. Descriptor JSON has a bounded metadata-stamped cache. Artifact
+filesystem I/O and JSON parsing run on blocking workers behind one fail-fast,
+four-permit service semaphore (`artifact_read_busy`, `Retry-After: 1` when
+saturated). Run-scope JSON is capped at 16 MiB per file; this is intentionally
+well above current bounded/downsampled payloads without retaining the previous
+128 MiB per-request allocation surface. JSON conditional requests use an
+opened-file device/inode/length/mtime ETag and return `304` before reading or
+hashing an unchanged body. Artifact
 reads on Linux use `openat2(RESOLVE_BENEATH|NO_SYMLINKS)` from a stable
 configured-root descriptor over the combined root-relative run and artifact
 path, then enforce the maximum and serve from that same descriptor. Linux

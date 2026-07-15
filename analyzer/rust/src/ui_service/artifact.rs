@@ -2,6 +2,67 @@
 
 use super::*;
 
+/// Execute filesystem access and JSON parsing outside Tokio's async workers.
+/// `try_acquire_owned` is intentionally fail-fast: a semaphore with an
+/// unbounded waiter queue would merely move the request-amplification problem.
+pub(super) async fn run_blocking_artifact_task<T, F>(
+    state: &Arc<ServiceState>,
+    operation: &'static str,
+    task: F,
+) -> Result<T, ApiProblem>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ApiProblem> + Send + 'static,
+{
+    let permit = Arc::clone(&state.artifact_reads)
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiProblem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "artifact_read_busy",
+                "Artifact readers are busy",
+                "The bounded artifact read limit is already in use; retry shortly.",
+            )
+        })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task()
+    })
+    .await
+    .map_err(|error| {
+        ApiProblem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact_read_failed",
+            "Artifact read failed",
+            format!("The blocking {operation} task failed: {error}"),
+        )
+    })?
+}
+
+pub(super) struct BoundedArtifact {
+    pub(super) file: fs::File,
+    pub(super) metadata: fs::Metadata,
+    path: PathBuf,
+}
+
+#[cfg(test)]
+static ARTIFACT_READ_OBSERVER: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::sync::mpsc::Sender<PathBuf>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(super) fn set_artifact_read_observer(observer: Option<std::sync::mpsc::Sender<PathBuf>>) {
+    *ARTIFACT_READ_OBSERVER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("artifact read observer lock") = observer;
+}
+
+pub(super) enum ConditionalBody {
+    NotModified { etag: String },
+    Bytes { etag: String, bytes: Vec<u8> },
+}
+
 /// Open one run-relative artifact without permitting a symlink traversal.
 /// Linux uses `openat2(RESOLVE_BENEATH|NO_SYMLINKS)` from the stable configured
 /// root descriptor, so run containment and open are one kernel operation;
@@ -179,15 +240,17 @@ pub(super) fn read_bounded_artifact(
     maximum: u64,
     resource: &str,
 ) -> Result<(Vec<u8>, SystemTime), ApiProblem> {
-    let (file, _) = open_contained_artifact(run, relative, resource)?;
-    read_bounded_open_file(file, maximum, resource)
+    let artifact = open_bounded_artifact(run, relative, maximum, resource)?;
+    read_bounded_open_file(artifact, maximum, resource)
 }
 
-fn read_bounded_open_file(
-    file: fs::File,
+pub(super) fn open_bounded_artifact(
+    run: &RunRecord,
+    relative: &Path,
     maximum: u64,
     resource: &str,
-) -> Result<(Vec<u8>, SystemTime), ApiProblem> {
+) -> Result<BoundedArtifact, ApiProblem> {
+    let (file, path) = open_contained_artifact(run, relative, resource)?;
     let metadata = file.metadata().map_err(|error| {
         ApiProblem::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -207,6 +270,34 @@ fn read_bounded_open_file(
             format!("The bounded {resource} exceeds the service safety limit."),
         ));
     }
+    Ok(BoundedArtifact {
+        file,
+        metadata,
+        path,
+    })
+}
+
+pub(super) fn read_bounded_open_file(
+    artifact: BoundedArtifact,
+    maximum: u64,
+    resource: &str,
+) -> Result<(Vec<u8>, SystemTime), ApiProblem> {
+    let BoundedArtifact {
+        file,
+        metadata,
+        path,
+    } = artifact;
+    #[cfg(test)]
+    if let Some(observer) = ARTIFACT_READ_OBSERVER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("artifact read observer lock")
+        .as_ref()
+    {
+        let _ = observer.send(path);
+    }
+    #[cfg(not(test))]
+    let _ = path;
     let initial_capacity = usize::try_from(metadata.len().min(1024 * 1024)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(initial_capacity);
     file.take(maximum + 1)
@@ -230,11 +321,69 @@ fn read_bounded_open_file(
     Ok((bytes, metadata.modified().unwrap_or(UNIX_EPOCH)))
 }
 
-pub(super) fn json_response<T: Serialize>(
+/// Prepare a bounded JSON response from one stable file descriptor. The weak
+/// ETag is derived from trusted-writer metadata, so an unchanged conditional
+/// request returns before reading, hashing, or parsing the document.
+pub(super) fn prepare_json_artifact<F>(
     headers: &HeaderMap,
-    value: &T,
-) -> Result<Response, ApiProblem> {
-    conditional_bytes(headers, "application/json", encode_json(value)?)
+    run: &RunRecord,
+    relative: &Path,
+    maximum: u64,
+    resource: &str,
+    validate: F,
+) -> Result<ConditionalBody, ApiProblem>
+where
+    F: FnOnce(&Value) -> Result<(), ApiProblem>,
+{
+    let artifact = open_bounded_artifact(run, relative, maximum, resource)?;
+    let etag = metadata_etag("json-artifact-v1", &[(relative, &artifact.metadata)]);
+    if if_none_match(headers, &etag) {
+        return Ok(ConditionalBody::NotModified { etag });
+    }
+    let (bytes, _) = read_bounded_open_file(artifact, maximum, resource)?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| ApiProblem::artifact_incompatible(resource, error.to_string()))?;
+    validate(&value)?;
+    Ok(ConditionalBody::Bytes { etag, bytes })
+}
+
+pub(super) fn metadata_etag(namespace: &str, artifacts: &[(&Path, &fs::Metadata)]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"vibesim-ui-artifact-metadata-v1\0");
+    hasher.update(namespace.as_bytes());
+    for (relative, metadata) in artifacts {
+        hasher.update(b"\0");
+        hasher.update(relative.as_os_str().as_encoded_bytes());
+        hash_metadata(&mut hasher, metadata);
+    }
+    format!("W/\"artifact-meta-v1-{}\"", hex(&hasher.finalize()))
+}
+
+pub(super) fn hash_metadata(hasher: &mut Sha256, metadata: &fs::Metadata) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for value in [
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime() as u64,
+            metadata.mtime_nsec() as u64,
+        ] {
+            hasher.update(value.to_be_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        hasher.update(metadata.len().to_be_bytes());
+        let modified = metadata
+            .modified()
+            .unwrap_or(UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        hasher.update(modified.to_be_bytes());
+    }
 }
 
 pub(super) fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ApiProblem> {
@@ -255,20 +404,30 @@ pub(super) fn conditional_bytes(
 ) -> Result<Response, ApiProblem> {
     let etag = format!("\"sha256-{}\"", hex(&Sha256::digest(&bytes)));
     if if_none_match(headers, &etag) {
-        return Response::builder()
+        return conditional_response(content_type, ConditionalBody::NotModified { etag });
+    }
+    conditional_response(content_type, ConditionalBody::Bytes { etag, bytes })
+}
+
+pub(super) fn conditional_response(
+    content_type: &'static str,
+    prepared: ConditionalBody,
+) -> Result<Response, ApiProblem> {
+    match prepared {
+        ConditionalBody::NotModified { etag } => Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, etag)
             .header(header::CACHE_CONTROL, "no-cache")
             .body(Body::empty())
-            .map_err(response_build_problem);
+            .map_err(response_build_problem),
+        ConditionalBody::Bytes { etag, bytes } => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(bytes))
+            .map_err(response_build_problem),
     }
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::ETAG, etag)
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from(bytes))
-        .map_err(response_build_problem)
 }
 
 pub(super) struct PreparedTrace {

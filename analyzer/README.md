@@ -197,7 +197,12 @@ does not require a full-file hash; non-Linux logs roots are a trusted-writer
 boundary.
 Catalog scans use a
 30-second single-flight cache on a blocking worker; descriptor parsing uses a
-bounded metadata-stamped cache.
+bounded metadata-stamped cache. All artifact I/O/JSON parsing runs on bounded
+blocking workers (four concurrent reads, fail-fast `artifact_read_busy` when
+saturated), and each run-scope JSON file is capped at 16 MiB. Descriptor-ready
+subject pairs keep a strong metadata proof, allowing report and payload routes
+to read only the requested body without losing pair readiness. Legacy content
+revisions are memoized only while that strong proof remains unchanged.
 
 The API intentionally emits no permissive CORS policy. The visualization UI
 must reach it through a same-origin `/api` proxy (the Vite development server
