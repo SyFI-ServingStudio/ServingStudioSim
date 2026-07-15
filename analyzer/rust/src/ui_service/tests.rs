@@ -162,6 +162,73 @@ fn write_pipeline(
     );
 }
 
+fn pipeline_from_lifecycle_row(row: &Value) -> PipelineStateV1 {
+    let status = |name: &str| {
+        serde_json::from_value::<StageStatus>(row[name].clone())
+            .unwrap_or_else(|error| panic!("invalid {name} status in lifecycle fixture: {error}"))
+    };
+    let pipeline = status("pipeline");
+    let compute = status("compute");
+    let render = status("render");
+    let trace = status("trace");
+    let stage = |name: &str, stage_status: StageStatus| PipelineStage {
+        status: stage_status,
+        code: (stage_status == StageStatus::Failed).then(|| format!("{name}_failed")),
+        artifact: (name == "trace" && stage_status == StageStatus::Complete)
+            .then(|| "traces/test.pftrace.gz".to_string()),
+    };
+    PipelineStateV1 {
+        schema_version: PIPELINE_SCHEMA_VERSION,
+        generation_id: "fixture-generation".to_string(),
+        artifact_revision: "pipeline-fixture-generation".to_string(),
+        status: pipeline,
+        started_at: "2026-07-15T00:00:00.000Z".to_string(),
+        updated_at: "2026-07-15T00:00:01.000Z".to_string(),
+        completed_at: matches!(pipeline, StageStatus::Complete | StageStatus::Failed)
+            .then(|| "2026-07-15T00:00:01.000Z".to_string()),
+        producer: PipelineProducer {
+            name: "vibesim-analyzer".to_string(),
+            version: "0.1.0".to_string(),
+            revision: "a".repeat(40),
+            binary_sha256: format!("sha256:{}", "b".repeat(64)),
+        },
+        requested_subjects: None,
+        stages: PipelineStages {
+            compute: stage("compute", compute),
+            render: stage("render", render),
+            trace: stage("trace", trace),
+        },
+    }
+}
+
+#[test]
+fn shared_publisher_lifecycle_table_matches_rust_validation() {
+    // Python publication tests consume this same table, so a lifecycle change
+    // cannot silently make the producer and reader disagree again.
+    let contract: Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/analyzer_pipeline_lifecycle_v1.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        contract["schema_version"],
+        Value::from(PIPELINE_SCHEMA_VERSION)
+    );
+
+    for row in contract["valid_states"].as_array().unwrap() {
+        let state = pipeline_from_lifecycle_row(row);
+        if let Err(reason) = validate_pipeline_state(&state) {
+            panic!("shared lifecycle fixture row {row} was rejected: {reason}");
+        }
+    }
+    for row in contract["invalid_regressions"].as_array().unwrap() {
+        let state = pipeline_from_lifecycle_row(row);
+        assert!(
+            validate_pipeline_state(&state).is_err(),
+            "regression lifecycle fixture row unexpectedly validated: {row}"
+        );
+    }
+}
+
 fn state(root: &TempDir) -> ServiceState {
     ServiceState {
         roots: configure_roots(vec![root.path().to_path_buf()]).unwrap(),

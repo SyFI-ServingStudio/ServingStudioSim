@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "valid_states": [
+    {"pipeline": "pending", "compute": "pending", "render": "not_started", "trace": "not_started"},
+    {"pipeline": "pending", "compute": "complete", "render": "pending", "trace": "not_started"},
+    {"pipeline": "pending", "compute": "complete", "render": "complete", "trace": "not_started"},
+    {"pipeline": "pending", "compute": "complete", "render": "complete", "trace": "pending"},
+    {"pipeline": "pending", "compute": "complete", "render": "complete", "trace": "complete"},
+    {"pipeline": "pending", "compute": "complete", "render": "complete", "trace": "failed"},
+    {"pipeline": "pending", "compute": "complete", "render": "failed", "trace": "not_started"},
+    {"pipeline": "pending", "compute": "complete", "render": "failed", "trace": "pending"},
+    {"pipeline": "pending", "compute": "complete", "render": "failed", "trace": "complete"},
+    {"pipeline": "pending", "compute": "complete", "render": "failed", "trace": "failed"},
+    {"pipeline": "complete", "compute": "complete", "render": "complete", "trace": "complete"},
+    {"pipeline": "complete", "compute": "complete", "render": "complete", "trace": "failed"},
+    {"pipeline": "complete", "compute": "complete", "render": "failed", "trace": "complete"},
+    {"pipeline": "complete", "compute": "complete", "render": "failed", "trace": "failed"},
+    {"pipeline": "failed", "compute": "failed", "render": "not_started", "trace": "not_started"}
+  ],
+  "invalid_regressions": [
+    {"pipeline": "pending", "compute": "complete", "render": "not_started", "trace": "not_started"},
+    {"pipeline": "pending", "compute": "failed", "render": "not_started", "trace": "not_started"}
+  ]
+}

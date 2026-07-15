@@ -16,9 +16,70 @@ from launcher.analyzer_pipeline import (
     atomic_write_json,
 )
 
+PIPELINE_LIFECYCLE_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "analyzer_pipeline_lifecycle_v1.json"
+)
+LifecycleShape = tuple[str, str, str, str]
+
 
 def _read_state(log_dir: Path) -> dict[str, object]:
     return json.loads((log_dir / PIPELINE_STATE_RELATIVE_PATH).read_text())
+
+
+def _lifecycle_shape(state: object) -> LifecycleShape:
+    assert isinstance(state, dict)
+    stages = state["stages"]
+    assert isinstance(stages, dict)
+    compute = stages["compute"]
+    render = stages["render"]
+    trace = stages["trace"]
+    assert isinstance(compute, dict)
+    assert isinstance(render, dict)
+    assert isinstance(trace, dict)
+    return (
+        str(state["status"]),
+        str(compute["status"]),
+        str(render["status"]),
+        str(trace["status"]),
+    )
+
+
+@pytest.fixture(autouse=True)
+def assert_published_pipeline_states_are_rust_valid(monkeypatch):
+    """Check every durable publisher write against the Rust lifecycle table."""
+
+    lifecycle_contract = json.loads(PIPELINE_LIFECYCLE_FIXTURE.read_text())
+    valid_shapes = {
+        (
+            row["pipeline"],
+            row["compute"],
+            row["render"],
+            row["trace"],
+        )
+        for row in lifecycle_contract["valid_states"]
+    }
+    published_shapes: list[LifecycleShape] = []
+    original_atomic_write_json = analyzer_pipeline.atomic_write_json
+
+    def recording_atomic_write_json(path: Path, value: object) -> None:
+        original_atomic_write_json(path, value)
+        if path.name == PIPELINE_STATE_RELATIVE_PATH.name:
+            # Record only after the durable replace succeeds. Later transitions
+            # mutate the publisher's in-memory dictionary in place.
+            published_shapes.append(_lifecycle_shape(value))
+
+    monkeypatch.setattr(
+        analyzer_pipeline,
+        "atomic_write_json",
+        recording_atomic_write_json,
+    )
+    yield
+
+    unexpected_shapes = [shape for shape in published_shapes if shape not in valid_shapes]
+    assert not unexpected_shapes, (
+        "publisher emitted lifecycle snapshots rejected by the Rust v1 validator: "
+        f"{unexpected_shapes}"
+    )
 
 
 def _producer() -> dict[str, object]:
@@ -34,17 +95,15 @@ def test_pipeline_is_not_complete_until_trace_finishes(tmp_path: Path) -> None:
     publisher = AnalyzerPipelinePublisher.begin(tmp_path, _producer())
     initial_revision = publisher.state["artifact_revision"]
 
-    publisher.complete_stage("compute")
-    publisher.start_stage("render")
-    publisher.complete_stage("render")
-    publisher.start_stage("trace")
-    publisher.complete_stage("trace")
+    publisher.complete_compute_and_start_render()
+    publisher.complete_render_and_start_trace()
 
     before_finish = _read_state(tmp_path)
     assert before_finish["status"] == "pending"
     assert before_finish["artifact_revision"] == initial_revision
+    assert before_finish["stages"]["trace"]["status"] == "pending"  # type: ignore[index]
 
-    publisher.finish()
+    publisher.complete_trace_and_finish(artifact="traces/test.pftrace.gz")
     complete = _read_state(tmp_path)
     assert complete["status"] == "complete"
     assert complete["artifact_revision"] == initial_revision
@@ -68,7 +127,7 @@ def test_new_generation_waits_for_lease_and_old_publisher_cannot_overwrite(
     second_state = _read_state(tmp_path)
     assert second_state["generation_id"] == second.generation_id
     with pytest.raises(RuntimeError, match="no longer owns"):
-        first.complete_stage("compute")
+        first.complete_compute_and_start_render()
     assert _read_state(tmp_path)["generation_id"] == second.generation_id
     second.close()
 

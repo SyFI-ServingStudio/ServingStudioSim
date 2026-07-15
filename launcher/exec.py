@@ -290,8 +290,7 @@ async def run_analysis(
 
     try:
         if not analyzer.exists():
-            pipeline.fail_stage("compute", "analyzer_unavailable")
-            pipeline.finish()
+            pipeline.fail_compute_and_finish("analyzer_unavailable")
             print(f"[analyze] {analyzer} not built; skipping analysis for {log_dir}")
             return
 
@@ -308,13 +307,10 @@ async def run_analysis(
             ],
         )
         if compute_rc != 0:
-            pipeline.fail_stage("compute", "compute_failed")
-            pipeline.finish()
+            pipeline.fail_compute_and_finish("compute_failed")
             print(f"[analyze] compute failed for {log_dir}")
             return
-        pipeline.complete_stage("compute")
-
-        pipeline.start_stage("render")
+        pipeline.complete_compute_and_start_render()
         render_rc = await _execute_stage(
             "analyze render",
             [
@@ -326,27 +322,24 @@ async def run_analysis(
             ],
         )
         if render_rc == 0:
-            pipeline.complete_stage("render")
+            pipeline.complete_render_and_start_trace()
         else:
-            pipeline.fail_stage("render", "render_failed")
+            pipeline.fail_render_and_start_trace("render_failed")
             print(f"[analyze] render failed for {log_dir}")
 
         # The Perfetto overview is a standalone binary artifact rather than a
         # registry subject, but it belongs to the same visible generation.
-        pipeline.start_stage("trace")
         trace_rc = await _execute_stage(
             "analyze trace",
             [str(analyzer), "trace", str(log_dir)],
         )
         if trace_rc == 0:
-            pipeline.complete_stage(
-                "trace",
+            pipeline.complete_trace_and_finish(
                 artifact=f"traces/{log_dir.name}.pftrace.gz",
             )
         else:
-            pipeline.fail_stage("trace", "trace_failed")
+            pipeline.fail_trace_and_finish("trace_failed")
             print(f"[analyze] trace failed for {log_dir}")
-        pipeline.finish()
     except Exception as error:
         # If a state transition cannot be published, the last durable state is
         # intentionally left pending.  That is safer than exposing old files as

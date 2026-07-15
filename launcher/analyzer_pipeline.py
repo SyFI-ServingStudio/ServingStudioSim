@@ -27,6 +27,7 @@ PIPELINE_PRODUCER_NAME: Final = "vibesim-analyzer"
 
 StageName = Literal["compute", "render", "trace"]
 StageStatus = Literal["not_started", "pending", "complete", "failed"]
+PipelineStatus = Literal["pending", "complete", "failed"]
 
 
 def _utc_now() -> str:
@@ -143,7 +144,12 @@ def _discover_producer_identity_cached(
 
 @dataclass
 class AnalyzerPipelinePublisher:
-    """Publish the state machine for one analyzer artifact generation."""
+    """Publish the state machine for one analyzer artifact generation.
+
+    Public transition methods own whole stage boundaries. Keep the underlying
+    stage mutation private: publishing half of a boundary can create a durable
+    snapshot that the Rust lifecycle validator must reject.
+    """
 
     state_path: Path
     state: dict[str, object]
@@ -190,42 +196,94 @@ class AnalyzerPipelinePublisher:
             publisher.close()
             raise
 
-    def start_stage(self, stage: StageName) -> None:
-        self._set_stage(stage, "pending")
-
     @property
     def generation_id(self) -> str:
         generation_id = self.state["generation_id"]
         assert isinstance(generation_id, str)
         return generation_id
 
-    def complete_stage(self, stage: StageName, *, artifact: str | None = None) -> None:
-        self._set_stage(stage, "complete", artifact=artifact)
+    def complete_compute_and_start_render(self) -> None:
+        """Atomically publish the successful compute-to-render handoff."""
 
-    def fail_stage(self, stage: StageName, code: str) -> None:
-        self._set_stage(stage, "failed", code=code)
-
-    def finish(self) -> None:
-        stages = self._stages()
-        if stages["compute"]["status"] == "failed":
-            self.state["status"] = "failed"
-            self.state["failure_code"] = stages["compute"]["code"]
-        elif (
-            stages["compute"]["status"] == "complete"
-            and stages["render"]["status"] in {"complete", "failed"}
-            and stages["trace"]["status"] in {"complete", "failed"}
-        ):
-            # Complete means orchestration reached a terminal state. Optional
-            # render/trace failures remain explicit on their stages without
-            # hiding valid current-generation JSON subjects.
-            self.state["status"] = "complete"
-            self.state.pop("failure_code", None)
-        else:
-            raise ValueError("cannot finish an analyzer pipeline with unfinished stages")
-
+        self._require_shape("pending", "pending", "not_started", "not_started")
         timestamp = _utc_now()
-        self.state["updated_at"] = timestamp
+        self._update_stage("compute", "complete", timestamp)
+        self._update_stage("render", "pending", timestamp)
+        self._publish_at(timestamp)
+
+    def fail_compute_and_finish(self, code: str) -> None:
+        """Atomically publish a terminal compute failure."""
+
+        self._require_shape("pending", "pending", "not_started", "not_started")
+        timestamp = _utc_now()
+        self._update_stage("compute", "failed", timestamp, code=code)
+        self.state["status"] = "failed"
+        self.state["failure_code"] = code
         self.state["completed_at"] = timestamp
+        self._publish_at(timestamp)
+
+    def complete_render_and_start_trace(self) -> None:
+        """Atomically publish the successful render-to-trace handoff."""
+
+        self._finish_render_and_start_trace("complete")
+
+    def fail_render_and_start_trace(self, code: str) -> None:
+        """Atomically publish an optional render failure and start trace."""
+
+        self._finish_render_and_start_trace("failed", code=code)
+
+    def complete_trace_and_finish(self, *, artifact: str) -> None:
+        """Atomically publish a successful trace and terminal generation."""
+
+        self._finish_trace("complete", artifact=artifact)
+
+    def fail_trace_and_finish(self, code: str) -> None:
+        """Atomically publish an optional trace failure and terminal generation."""
+
+        self._finish_trace("failed", code=code)
+
+    def _finish_render_and_start_trace(
+        self,
+        render_status: Literal["complete", "failed"],
+        *,
+        code: str | None = None,
+    ) -> None:
+        self._require_shape("pending", "complete", "pending", "not_started")
+        timestamp = _utc_now()
+        self._update_stage("render", render_status, timestamp, code=code)
+        self._update_stage("trace", "pending", timestamp)
+        self._publish_at(timestamp)
+
+    def _finish_trace(
+        self,
+        trace_status: Literal["complete", "failed"],
+        *,
+        code: str | None = None,
+        artifact: str | None = None,
+    ) -> None:
+        stages = self._stages()
+        render_status = stages["render"]["status"]
+        if render_status not in {"complete", "failed"}:
+            raise ValueError("trace cannot finish before render reaches a terminal state")
+        self._require_shape("pending", "complete", render_status, "pending")
+        timestamp = _utc_now()
+        self._update_stage(
+            "trace",
+            trace_status,
+            timestamp,
+            code=code,
+            artifact=artifact,
+        )
+        # Complete means orchestration reached a terminal state. Optional
+        # render/trace failures remain explicit on their stages without hiding
+        # valid current-generation JSON subjects.
+        self.state["status"] = "complete"
+        self.state.pop("failure_code", None)
+        self.state["completed_at"] = timestamp
+        self._publish_at(timestamp)
+
+    def _publish_at(self, timestamp: str) -> None:
+        self.state["updated_at"] = timestamp
         self._publish()
 
     def close(self) -> None:
@@ -237,15 +295,15 @@ class AnalyzerPipelinePublisher:
         finally:
             self._lease_file.close()
 
-    def _set_stage(
+    def _update_stage(
         self,
         stage: StageName,
         status: StageStatus,
+        timestamp: str,
         *,
         code: str | None = None,
         artifact: str | None = None,
     ) -> None:
-        timestamp = _utc_now()
         stage_state = self._stages()[stage]
         stage_state["status"] = status
         stage_state["updated_at"] = timestamp
@@ -257,8 +315,26 @@ class AnalyzerPipelinePublisher:
             stage_state.pop("artifact", None)
         else:
             stage_state["artifact"] = artifact
-        self.state["updated_at"] = timestamp
-        self._publish()
+
+    def _require_shape(
+        self,
+        pipeline: PipelineStatus,
+        compute: StageStatus,
+        render: StageStatus,
+        trace: StageStatus,
+    ) -> None:
+        stages = self._stages()
+        observed = (
+            self.state["status"],
+            stages["compute"]["status"],
+            stages["render"]["status"],
+            stages["trace"]["status"],
+        )
+        expected = (pipeline, compute, render, trace)
+        if observed != expected:
+            raise ValueError(
+                f"analyzer pipeline transition expected {expected}, observed {observed}"
+            )
 
     def _stages(self) -> dict[str, dict[str, object]]:
         stages = self.state["stages"]
