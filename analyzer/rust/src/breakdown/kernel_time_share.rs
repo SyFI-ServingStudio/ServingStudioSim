@@ -2,7 +2,7 @@
 //!
 //! The hot `cost_log` stores slot-aligned durations while the matching manifest
 //! owns each slot's semantic name and the Sum/Max/Scale aggregation tree. This
-//! subject reconstructs an overlap-aware root attribution for every selected
+//! subject reconstructs a critical-path-aware root attribution for every selected
 //! row, then rolls it up at three levels: `(pool_tag, worker_id)`, `pool_tag`, and
 //! the whole run. A Sum forwards attribution to every child, Scale multiplies its
 //! child, and Max forwards only to the row's critical child (equal critical
@@ -153,13 +153,10 @@ impl SectionPlan {
                 FlatCostNode::Sum { children } => {
                     children.clone().map(|child| self.node_times[child]).sum()
                 }
-                FlatCostNode::Max { overlap, children } => {
-                    let max_child = children
-                        .clone()
-                        .map(|child| self.node_times[child])
-                        .fold(0.0_f64, f64::max);
-                    max_child / f64::from(*overlap).max(TIME_EPSILON_MS)
-                }
+                FlatCostNode::Max { children, .. } => children
+                    .clone()
+                    .map(|child| self.node_times[child])
+                    .fold(0.0_f64, f64::max),
                 FlatCostNode::Scale { n, children } => {
                     f64::from(*n) * self.node_times[children.start]
                 }
@@ -195,7 +192,7 @@ impl SectionPlan {
                     FlatCostNode::Scale { n, children } => {
                         self.node_weights[children.start] += weight * f64::from(*n);
                     }
-                    FlatCostNode::Max { overlap, children } => {
+                    FlatCostNode::Max { children, .. } => {
                         let max_child = children
                             .clone()
                             .map(|child| self.node_times[child])
@@ -208,9 +205,7 @@ impl SectionPlan {
                             })
                             .collect();
                         if !critical.is_empty() {
-                            let child_weight = weight
-                                / f64::from(*overlap).max(TIME_EPSILON_MS)
-                                / critical.len() as f64;
+                            let child_weight = weight / critical.len() as f64;
                             for child in critical {
                                 self.node_weights[child] += child_weight;
                             }
@@ -652,7 +647,15 @@ fn validate_tree(manifest: &Manifest) -> Result<()> {
                 }
                 continue;
             }
-            FlatCostNode::Sum { children } | FlatCostNode::Max { children, .. } => children,
+            FlatCostNode::Sum { children } => children,
+            FlatCostNode::Max { overlap, children } => {
+                if *overlap != 1.0 {
+                    bail!(
+                        "Max node {idx} has incompatible overlap {overlap}; protocol v1 requires 1.0"
+                    );
+                }
+                children
+            }
             FlatCostNode::Scale { children, .. } => {
                 if children.end != children.start + 1 {
                     bail!("Scale node {idx} must own exactly one child");
@@ -709,7 +712,7 @@ fn definitions() -> Value {
         "position": "the manifest leaf's full semantic name; identical names across Max siblings and worker replicas are pooled",
         "kernel_time_ms": "exact DataFusion SUM(cost_log.total_time_ms) for the scope; sampled position mixtures are normalized to each worker's exact root total",
         "share_pct": "position-attributed kernel_time_ms / scope kernel_time_ms × 100; segments sum to 100%",
-        "tree_attribution": "Sum forwards to all children; Scale multiplies its child; Max forwards to the critical child and divides by overlap; exactly tied critical children split evenly",
+        "tree_attribution": "Sum forwards to all children; Scale multiplies its child; protocol-v1 Max forwards to the critical child; exactly tied critical children split evenly",
         "levels": "workers are keyed by (pool_tag, worker_id); pools sum their workers; overall sums all pools",
         "sampling": "DataFusion first counts scalar rows per worker, then predicate/projection-pushes a worker-local regular iter_id stride into the heavy slot_time_ms scan; meta.exact=false marks estimates",
     })
@@ -755,7 +758,7 @@ mod tests {
     fn mixed_manifest() -> Manifest {
         Manifest {
             slots: vec![leaf("m.a"), leaf("m.b"), leaf("m.c")],
-            // Sum(Leaf a, Scale{2}(Max{overlap=2}(Leaf b, Leaf c)))
+            // Sum(Leaf a, Scale{2}(Max{overlap=1}(Leaf b, Leaf c)))
             nodes: vec![
                 FlatCostNode::Sum { children: 1..3 },
                 FlatCostNode::Leaf(0),
@@ -764,7 +767,7 @@ mod tests {
                     children: 3..4,
                 },
                 FlatCostNode::Max {
-                    overlap: 2.0,
+                    overlap: 1.0,
                     children: 4..6,
                 },
                 FlatCostNode::Leaf(1),
@@ -778,10 +781,10 @@ mod tests {
     fn attributes_scale_and_max_to_critical_leaf() {
         let mut plan = SectionPlan::new(&mixed_manifest(), vec![0, 1, 2]).unwrap();
         let shares = plan.position_shares(&[4.0, 6.0, 10.0]).unwrap();
-        // root = 4 + 2 × (10 / 2) = 14; a owns 4, c owns 10.
+        // root = 4 + 2 × 10 = 24; a owns 4, critical leaf c owns 20.
         assert_eq!(shares.len(), 2);
-        assert!((shares.iter().find(|(id, _)| *id == 0).unwrap().1 - 4.0 / 14.0).abs() < 1e-12);
-        assert!((shares.iter().find(|(id, _)| *id == 2).unwrap().1 - 10.0 / 14.0).abs() < 1e-12);
+        assert!((shares.iter().find(|(id, _)| *id == 0).unwrap().1 - 4.0 / 24.0).abs() < 1e-12);
+        assert!((shares.iter().find(|(id, _)| *id == 2).unwrap().1 - 20.0 / 24.0).abs() < 1e-12);
         assert!((shares.iter().map(|(_, share)| share).sum::<f64>() - 1.0).abs() < 1e-12);
     }
 

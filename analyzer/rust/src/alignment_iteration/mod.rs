@@ -1142,7 +1142,7 @@ fn definitions() -> Value {
         "simulated_gpu_cycle_ms": "timing-predict total_time_ms multiplied by the aligned simulation worker's gpu_time_multiplier",
         "gpu_cycle_relative_diff_pct": "(scaled timing-predict GPU cycle - measured GPU cycle) / measured GPU cycle * 100; positive means overprediction",
         "operation_measured_ms": "sum of durations of measured CUDA kernels mapped to the operation",
-        "operation_simulated_ms": "sum of mapped sim leaf times after CostTree Scale multiplicity; workload time, not additive wall time when Max/overlap exists",
+        "operation_simulated_ms": "sum of mapped sim leaf times after CostTree Scale multiplicity; workload time, not additive wall time when synchronized Max fan-out exists",
         "measured_kernel_duration_ms": "sum of launch durations for one exact NSYS kernel identity within an iteration; repeated calls remain visible through calls",
         "simulated_kernel_folded_ms": "one L1 leaf slot time multiplied by its exact CostTree Scale multiplicity",
         "mapping_coverage": "duration/workload fraction assigned by embedded labels; unmatched entries stay explicit and are never filled with zero",
