@@ -23,6 +23,8 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -68,6 +70,8 @@ struct ServiceState {
     roots: Vec<ConfiguredRoot>,
     discovery: RwLock<DiscoveryCache>,
     discovery_refresh: AsyncMutex<()>,
+    #[cfg(test)]
+    discovery_scan_count: AtomicUsize,
     descriptors: RwLock<HashMap<String, CachedDescriptor>>,
     allowed_hosts: HashSet<String>,
 }
@@ -425,6 +429,8 @@ fn router_with_hosts(logs_roots: Vec<PathBuf>, allow_hosts: Vec<String>) -> Resu
         roots: configure_roots(logs_roots)?,
         discovery: RwLock::new(DiscoveryCache::default()),
         discovery_refresh: AsyncMutex::new(()),
+        #[cfg(test)]
+        discovery_scan_count: AtomicUsize::new(0),
         descriptors: RwLock::new(HashMap::new()),
         allowed_hosts: configure_allowed_hosts(allow_hosts)?,
     });

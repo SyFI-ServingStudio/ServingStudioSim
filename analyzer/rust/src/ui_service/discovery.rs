@@ -2,6 +2,11 @@
 
 use super::*;
 
+const OPAQUE_RUN_ID_PREFIX: &str = "r_";
+// `opaque_run_id` hashes with SHA-256 and `hex` emits two lowercase digits per
+// byte. Keep validation exact so arbitrary path segments cannot trigger scans.
+const OPAQUE_RUN_ID_HEX_LENGTH: usize = 64;
+
 pub(super) fn discovery_problem(error: anyhow::Error) -> ApiProblem {
     eprintln!("[analyze] run discovery failed: {error:#}");
     ApiProblem::new(
@@ -13,22 +18,18 @@ pub(super) fn discovery_problem(error: anyhow::Error) -> ApiProblem {
 }
 
 pub(super) async fn discover_runs_cached(state: &Arc<ServiceState>) -> Result<Vec<RunRecord>> {
-    refresh_discovery(state, false).await
+    refresh_discovery(state).await
 }
 
-pub(super) async fn refresh_discovery(
-    state: &Arc<ServiceState>,
-    force: bool,
-) -> Result<Vec<RunRecord>> {
+pub(super) async fn refresh_discovery(state: &Arc<ServiceState>) -> Result<Vec<RunRecord>> {
     let observed_refresh = {
         let cache = state
             .discovery
             .read()
             .map_err(|_| anyhow::anyhow!("run discovery cache lock is poisoned"))?;
-        if !force
-            && cache
-                .refreshed_at
-                .is_some_and(|refreshed_at| refreshed_at.elapsed() < CATALOG_REFRESH_INTERVAL)
+        if cache
+            .refreshed_at
+            .is_some_and(|refreshed_at| refreshed_at.elapsed() < CATALOG_REFRESH_INTERVAL)
         {
             return Ok(cache.runs.clone());
         }
@@ -44,16 +45,19 @@ pub(super) async fn refresh_discovery(
             .read()
             .map_err(|_| anyhow::anyhow!("run discovery cache lock is poisoned"))?;
         if cache.refreshed_at != observed_refresh
-            || (!force
-                && cache
-                    .refreshed_at
-                    .is_some_and(|refreshed_at| refreshed_at.elapsed() < CATALOG_REFRESH_INTERVAL))
+            || cache
+                .refreshed_at
+                .is_some_and(|refreshed_at| refreshed_at.elapsed() < CATALOG_REFRESH_INTERVAL)
         {
             return Ok(cache.runs.clone());
         }
     }
 
     let roots = state.roots.clone();
+    #[cfg(test)]
+    state
+        .discovery_scan_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let runs = tokio::task::spawn_blocking(move || discover_runs_uncached(&roots))
         .await
         .context("run discovery worker task failed")??;
@@ -174,23 +178,26 @@ pub(super) async fn resolve_run(
     state: &Arc<ServiceState>,
     run_id: &str,
 ) -> Result<RunRecord, ApiProblem> {
-    let cached = state
-        .discovery
-        .read()
-        .map_err(|_| discovery_problem(anyhow::anyhow!("run discovery cache lock is poisoned")))?
-        .runs
-        .iter()
-        .find(|run| run.run_id == run_id)
-        .cloned();
-    if let Some(run) = cached {
-        return Ok(run);
+    if !is_canonical_run_id(run_id) {
+        return Err(ApiProblem::run_not_found(run_id));
     }
-    refresh_discovery(state, true)
+
+    discover_runs_cached(state)
         .await
         .map_err(discovery_problem)?
         .into_iter()
         .find(|run| run.run_id == run_id)
         .ok_or_else(|| ApiProblem::run_not_found(run_id))
+}
+
+pub(super) fn is_canonical_run_id(run_id: &str) -> bool {
+    let Some(digest) = run_id.strip_prefix(OPAQUE_RUN_ID_PREFIX) else {
+        return false;
+    };
+    digest.len() == OPAQUE_RUN_ID_HEX_LENGTH
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub(super) fn opaque_run_id(root_ordinal: usize, relative: &Path) -> String {
@@ -200,7 +207,7 @@ pub(super) fn opaque_run_id(root_ordinal: usize, relative: &Path) -> String {
     hasher.update(b"\0");
     hasher.update(relative.as_os_str().as_encoded_bytes());
     let digest = hasher.finalize();
-    format!("r_{}", hex(&digest))
+    format!("{OPAQUE_RUN_ID_PREFIX}{}", hex(&digest))
 }
 
 pub(super) fn relative_label(relative: &Path) -> String {

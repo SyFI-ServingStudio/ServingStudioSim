@@ -167,6 +167,7 @@ fn state(root: &TempDir) -> ServiceState {
         roots: configure_roots(vec![root.path().to_path_buf()]).unwrap(),
         discovery: RwLock::new(DiscoveryCache::default()),
         discovery_refresh: AsyncMutex::new(()),
+        discovery_scan_count: AtomicUsize::new(0),
         descriptors: RwLock::new(HashMap::new()),
         allowed_hosts: configure_allowed_hosts(Vec::new()).unwrap(),
     }
@@ -206,6 +207,115 @@ fn nested_duplicate_basenames_have_stable_distinct_ids() {
     assert!(first.iter().all(|run| !run.run_id.contains("simulation")));
 }
 
+#[tokio::test]
+async fn malformed_run_id_is_rejected_without_discovery() {
+    let root = TempDir::new().unwrap();
+    let state = Arc::new(state(&root));
+
+    let problem = resolve_run(&state, "r_unknown")
+        .await
+        .expect_err("a non-canonical run id must not resolve");
+
+    assert_eq!(problem.code, "run_not_found");
+    assert_eq!(
+        state
+            .discovery_scan_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn different_unknown_run_ids_share_one_fresh_discovery_scan() {
+    let root = TempDir::new().unwrap();
+    let state = Arc::new(state(&root));
+    let missing_ids = [
+        opaque_run_id(0, Path::new("missing-a")),
+        opaque_run_id(0, Path::new("missing-b")),
+        opaque_run_id(0, Path::new("missing-c")),
+        opaque_run_id(0, Path::new("missing-d")),
+    ];
+
+    let (first, second, third) = tokio::join!(
+        resolve_run(&state, &missing_ids[0]),
+        resolve_run(&state, &missing_ids[1]),
+        resolve_run(&state, &missing_ids[2]),
+    );
+    for result in [first, second, third] {
+        assert_eq!(result.unwrap_err().code, "run_not_found");
+    }
+    assert_eq!(
+        state
+            .discovery_scan_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "single-flight must collapse concurrent cold-cache misses"
+    );
+
+    assert_eq!(
+        resolve_run(&state, &missing_ids[3]).await.unwrap_err().code,
+        "run_not_found"
+    );
+    assert_eq!(
+        state
+            .discovery_scan_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a different unknown id cannot bypass the fresh catalog TTL"
+    );
+}
+
+#[tokio::test]
+async fn expired_discovery_refreshes_and_finds_a_new_run() {
+    let root = TempDir::new().unwrap();
+    let state = Arc::new(state(&root));
+    let missing_id = opaque_run_id(0, Path::new("initial-miss"));
+
+    assert_eq!(
+        resolve_run(&state, &missing_id).await.unwrap_err().code,
+        "run_not_found"
+    );
+    create_run(root.path(), "new-run", "unified", true);
+    let new_run_id = opaque_run_id(0, Path::new("new-run"));
+
+    assert_eq!(
+        resolve_run(&state, &new_run_id).await.unwrap_err().code,
+        "run_not_found",
+        "a fresh catalog is also the bounded negative cache"
+    );
+    assert_eq!(
+        state
+            .discovery_scan_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    state.discovery.write().unwrap().refreshed_at =
+        Some(Instant::now() - CATALOG_REFRESH_INTERVAL - Duration::from_millis(1));
+    let discovered = resolve_run(&state, &new_run_id)
+        .await
+        .expect("an expired catalog must refresh");
+
+    assert_eq!(discovered.display_name, "new-run");
+    assert_eq!(
+        state
+            .discovery_scan_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}
+
+#[test]
+fn canonical_run_id_validation_matches_the_sha256_generator() {
+    let run_id = opaque_run_id(7, Path::new("sweep/simulation"));
+
+    assert_eq!(run_id.len(), 2 + 64);
+    assert!(is_canonical_run_id(&run_id));
+    assert!(!is_canonical_run_id("r_deadbeef"));
+    assert!(!is_canonical_run_id(&format!("r_{}", "A".repeat(64))));
+    assert!(!is_canonical_run_id(&format!("x_{}", "a".repeat(64))));
+}
+
 #[test]
 fn repeated_logs_roots_keep_identical_relative_paths_distinct() {
     let first_root = TempDir::new().unwrap();
@@ -220,6 +330,7 @@ fn repeated_logs_roots_keep_identical_relative_paths_distinct() {
         .unwrap(),
         discovery: RwLock::new(DiscoveryCache::default()),
         discovery_refresh: AsyncMutex::new(()),
+        discovery_scan_count: AtomicUsize::new(0),
         descriptors: RwLock::new(HashMap::new()),
         allowed_hosts: configure_allowed_hosts(Vec::new()).unwrap(),
     };
