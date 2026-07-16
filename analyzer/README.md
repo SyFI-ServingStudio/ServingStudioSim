@@ -111,6 +111,7 @@ rust/                The `analyze` binary (DataFusion compute side).
   src/backend/         Backend selection over a kernel position's input feature space.
   src/breakdown/       CostTree replay + run-wide leaf-position composition.
   src/conservation/    Run-wide work-accounting checks (actual vs expected).
+  src/concurrency/     Run-level in-flight requests over simulated wall-clock time.
   src/kv/              Per-pool KV-cache occupancy over time.
   src/alignment_iteration/  Per-iteration total/operation/kernel comparison.
   src/alignment_e2e/        Paired request latency + completion throughput.
@@ -122,7 +123,7 @@ python/              The render side (matplotlib over payload JSON).
   __main__.py          `render <log_dir> [subjects]`; maps subject → renderer,
                        runs figure jobs in parallel (fork processes; matplotlib
                        is thread-hostile).
-  request/, throughput/, utilization/, batch/, backend/, breakdown/, conservation/, kv/  One renderer module per subject; returns figure "jobs".
+  request/, throughput/, utilization/, batch/, backend/, breakdown/, conservation/, concurrency/, kv/  One renderer module per subject; returns figure "jobs".
   alignment_iteration/, alignment_e2e/, alignment_workload/  Alignment payload renderers.
   common/              Shared plotting: payload loader + run-dir layout, figure
                        scaffolding, CDF plot, style.
@@ -149,6 +150,7 @@ Current catalog:
 | `kernel-throughput` | batch | 1/50-sampled `cost_log` slots + matching CostTree manifests | achieved TFLOP/s (compute) and GB/s (memory BW) per cost-tree location / per-location `kernel_throughput_locations` stats |
 | `kernel-input-distribution` | backend | sampled `cost_log` `slot_input` + `slot_backend` + matching CostTree manifest `backends` lists | per-position selected-backend counts/ratios + PCA/feature projection / one scatter per position (`kernel_input_distribution_scatter`), rendered to `plots/kernel_input_dist/<position>.png`; unavailable on runs without per-slot backend + input logging |
 | `kernel-time-share` | breakdown | `cost_log` slot times + matching CostTree manifests | root kernel-time share by leaf position at overall / pool / worker levels; exact on small runs and bounded worker-stratified sampling on large runs |
+| `concurrency` | concurrency | `request_slo.parquet` arrival + terminal timestamps | exact request count/peak/mean / <=512-bin time-weighted active-request series |
 | `workload-conservation` | conservation | `cost_log` actuals + `request_slo.parquet` per-request expected | run-wide prefill/decode/FFN/KV work accounting, pass/fail / `workload_conservation_checks` |
 | `kv-occupancy` | kv | `kv_snapshot` stream + `run_meta.json` capacity | per-pool KV occupancy (active / projected-peak / promised tokens, and as a fraction of capacity) over time / `kv_occupancy_series` |
 | `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping + simulation `gpu_time_multiplier` | kernel/mapping error stats / separate kernel-busy and measured first-kernel-to-next-first-kernel GPU-cycle overviews + per-iteration mapped stacks |

@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 use super::artifact::{read_bytes, read_run_json};
 use super::discovery::{regular_file, timestamp, DiscoveredRun, StageStatus};
 use super::model::model_config_path;
+use super::subjects::concurrency_descriptor;
+use super::workload::trace_file_paths;
 use super::PROTOCOL_VERSION;
 
 pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
@@ -43,6 +45,16 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
             "media_type": "application/json",
             "schema_version": 1,
         });
+    }
+    if !trace_file_paths(&params)?.is_empty() {
+        descriptor["workload"] = json!({
+            "href": "workload",
+            "media_type": "application/json",
+            "schema_version": 1,
+        });
+    }
+    if let Some(concurrency) = concurrency_descriptor(run)? {
+        descriptor["subjects"]["concurrency"] = concurrency;
     }
     if run.lifecycle.analysis == StageStatus::Complete {
         let timing_path = run.path.join("reports/analyzer_timing.json");

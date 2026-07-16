@@ -8,7 +8,9 @@ use super::catalog::build_catalog;
 use super::core::{build_descriptor, read_summary};
 use super::discovery::{configure_logs_roots, discover_runs};
 use super::model::read_model;
+use super::subjects::{read_concurrency_payload, read_concurrency_report};
 use super::topology::build_topology;
+use super::workload::read_workload;
 
 fn make_run(path: &Path, complete: bool, analyzed: bool) {
     fs::create_dir_all(path.join("raw")).expect("create raw directory");
@@ -29,6 +31,10 @@ fn make_core_run(path: &Path) {
         path.join("raw/params.json"),
         r#"{
             "deployment": "afd",
+            "workload": {
+                "trace_files": ["trace/workload.csv"],
+                "request_rate": 2.0
+            },
             "pools": {
                 "attn": {
                     "groups": [{"arch": {"model_config": "model/config/qwen.json"}}]
@@ -49,9 +55,20 @@ fn make_core_run(path: &Path) {
     .expect("write summary");
     fs::write(
         path.join("reports/analyzer_timing.json"),
-        r#"{"subjects": []}"#,
+        r#"{"subjects": [{"name": "concurrency", "status": "ok"}]}"#,
     )
     .expect("write timing");
+    fs::write(
+        path.join("reports/concurrency_report.json"),
+        r#"{"schema_version": 1, "available": true, "totals": {"peak_active": 2}}"#,
+    )
+    .expect("write concurrency report");
+    fs::create_dir_all(path.join("payloads")).expect("create payloads directory");
+    fs::write(
+        path.join("payloads/concurrency_series.json"),
+        r#"{"schema_version": 1, "t_ms": [5.0, 10.0], "active": [2.0, 1.0], "peak": 2}"#,
+    )
+    .expect("write concurrency payload");
     fs::write(path.join(".complete"), "").expect("write completion marker");
 }
 
@@ -128,7 +145,13 @@ fn descriptor_indexes_existing_core_resources() {
     assert_eq!(descriptor["summary"]["href"], "summary");
     assert_eq!(descriptor["topology"]["href"], "topology");
     assert_eq!(descriptor["topology"]["schema_version"], 1);
-    assert_eq!(descriptor["subjects"], json!({}));
+    assert_eq!(descriptor["workload"]["href"], "workload");
+    assert_eq!(descriptor["workload"]["schema_version"], 1);
+    assert_eq!(descriptor["subjects"]["concurrency"]["status"], "ready");
+    assert_eq!(
+        descriptor["subjects"]["concurrency"]["payload_href"],
+        "subjects/concurrency/payload"
+    );
     assert!(descriptor["analysis"]["revision"]
         .as_str()
         .is_some_and(|revision| revision.starts_with("legacy-sha256-")));
@@ -203,6 +226,111 @@ fn model_resource_rejects_paths_outside_model_config() {
     let error = read_model(&run, temporary.path()).expect_err("reject path traversal");
 
     assert!(error.to_string().contains("below model/config"));
+}
+
+#[test]
+fn workload_resource_summarizes_configured_trace() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    let repo = TempDir::new().expect("temporary repository");
+    fs::create_dir_all(repo.path().join("trace")).expect("create trace directory");
+    fs::write(
+        repo.path().join("trace/workload.csv"),
+        "id,input_len,output_len,arrival_time\n\
+         0,8,32,0\n\
+         1,16,64,2000\n\
+         2,32,128,4000\n",
+    )
+    .expect("write trace");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let workload = read_workload(&run, repo.path()).expect("read workload resource");
+
+    assert_eq!(workload["schema_version"], 1);
+    assert_eq!(workload["scope"], "configured_trace");
+    assert_eq!(workload["source_paths"], json!(["trace/workload.csv"]));
+    assert_eq!(workload["request_count"], 3);
+    assert_eq!(workload["arrival_basis"], "effective_open_loop");
+    let arrival_seconds = workload["arrival_seconds"]
+        .as_array()
+        .expect("arrival seconds");
+    assert_eq!(arrival_seconds.len(), 3);
+    assert!((arrival_seconds[0].as_f64().unwrap() - 1.0 / 3.0).abs() < 1e-9);
+    assert_eq!(arrival_seconds[1], 1.0);
+    assert!((arrival_seconds[2].as_f64().unwrap() - 5.0 / 3.0).abs() < 1e-9);
+    assert_eq!(workload["arrivals"], json!([1, 1, 1]));
+    assert_eq!(workload["peak_to_mean"], 1.0);
+    assert_eq!(workload["token_lengths"].as_array().map(Vec::len), Some(72));
+}
+
+#[test]
+fn workload_resource_rejects_paths_outside_trace() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    let params_path = run_path.join("raw/params.json");
+    let params = fs::read_to_string(&params_path)
+        .expect("read params")
+        .replace("trace/workload.csv", "../outside.csv");
+    fs::write(params_path, params).expect("write unsafe params");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let error = read_workload(&run, temporary.path()).expect_err("reject path traversal");
+
+    assert!(error.to_string().contains("below trace"));
+}
+
+#[test]
+fn concurrency_resources_reuse_analyzer_artifacts() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let report = read_concurrency_report(&run).expect("read concurrency report");
+    let payload = read_concurrency_payload(&run).expect("read concurrency payload");
+
+    assert_eq!(report["totals"]["peak_active"], 2);
+    assert_eq!(payload["t_ms"], json!([5.0, 10.0]));
+    assert_eq!(payload["active"], json!([2.0, 1.0]));
+    assert_eq!(payload["peak"], 2);
+}
+
+#[test]
+fn unavailable_concurrency_is_not_published_as_ready() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    fs::write(
+        run_path.join("reports/concurrency_report.json"),
+        r#"{"schema_version":1,"available":false,"reason":"request_slo.parquet not found"}"#,
+    )
+    .expect("write unavailable concurrency report");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let descriptor = build_descriptor(&run).expect("build descriptor");
+
+    assert!(descriptor["subjects"].get("concurrency").is_none());
 }
 
 #[cfg(unix)]

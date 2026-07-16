@@ -77,6 +77,7 @@ categories:
 | `backend` | a cost-tree position's selected backend over its input feature space | `cost_log` `slot_input` + `slot_backend` + manifest `backends` |
 | `breakdown` | a cost-tree subtree by leaf position | `cost_log` + manifest labels |
 | `conservation` | run-wide work accounting | `cost_log` vs `request_slo` |
+| `concurrency` | system over request lifecycle time | `request_slo` arrival and terminal events |
 | `kv` | a KV pool over time | `kv_snapshot` + `run_meta` capacity |
 | `alignment-iteration` | one measured iteration joined to one predict case | normalized NSYS + predict `cost_log`/manifest + mapping |
 | `alignment-e2e` | one measured/simulated latency distribution | TraceLab replay JSONL + optional vLLM EngineCore request-timing JSONL + sim `request_slo` |

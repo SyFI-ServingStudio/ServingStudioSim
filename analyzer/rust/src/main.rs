@@ -26,6 +26,7 @@ mod backend;
 mod batch;
 mod breakdown;
 mod cdf;
+mod concurrency;
 mod conservation;
 mod io;
 mod kv;

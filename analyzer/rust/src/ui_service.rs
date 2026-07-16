@@ -9,9 +9,11 @@ mod catalog;
 mod core;
 mod discovery;
 mod model;
+mod subjects;
 #[cfg(test)]
 mod tests;
 mod topology;
+mod workload;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -29,7 +31,9 @@ use catalog::build_catalog;
 use core::{build_descriptor, read_summary};
 use discovery::{configure_logs_roots, resolve_run, ConfiguredRoot, DiscoveredRun};
 use model::read_model;
+use subjects::{read_concurrency_payload, read_concurrency_report};
 use topology::build_topology;
+use workload::read_workload;
 
 const PROTOCOL_VERSION: u32 = 1;
 
@@ -52,6 +56,15 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
         .route("/api/v1/runs/{run_id}/summary", get(get_summary))
         .route("/api/v1/runs/{run_id}/topology", get(get_topology))
         .route("/api/v1/runs/{run_id}/model", get(get_model))
+        .route("/api/v1/runs/{run_id}/workload", get(get_workload))
+        .route(
+            "/api/v1/runs/{run_id}/subjects/concurrency/report",
+            get(get_concurrency_report),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/concurrency/payload",
+            get(get_concurrency_payload),
+        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -98,6 +111,28 @@ async fn get_model(
 ) -> Response {
     let repo_root = Arc::clone(&state.repo_root);
     read_run_resource(state, run_id, move |run| read_model(&run, &repo_root)).await
+}
+
+async fn get_workload(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    let repo_root = Arc::clone(&state.repo_root);
+    read_run_resource(state, run_id, move |run| read_workload(&run, &repo_root)).await
+}
+
+async fn get_concurrency_report(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_concurrency_report(&run)).await
+}
+
+async fn get_concurrency_payload(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_concurrency_payload(&run)).await
 }
 
 async fn read_run_resource(

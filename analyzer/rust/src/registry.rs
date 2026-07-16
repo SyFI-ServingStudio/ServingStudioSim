@@ -17,6 +17,7 @@ use crate::alignment_workload;
 use crate::backend;
 use crate::batch;
 use crate::breakdown;
+use crate::concurrency;
 use crate::conservation;
 use crate::kv;
 use crate::request;
@@ -49,6 +50,9 @@ pub enum Category {
     /// Run-wide work-accounting invariants — `cost_log` actuals vs `request_slo`
     /// per-request expected. Tier-1, deployment-agnostic.
     Conservation,
+    /// Run-level in-flight request concurrency over time, reconstructed from
+    /// request arrival and terminal events in `request_slo`.
+    Concurrency,
     /// KV-cache pool occupancy over time, from the `kv_snapshot` stream. Tier-1,
     /// deployment-agnostic (a run without KV logging degrades to `unavailable`).
     Kv,
@@ -70,6 +74,7 @@ impl Category {
             Category::Backend => "backend",
             Category::Breakdown => "breakdown",
             Category::Conservation => "conservation",
+            Category::Concurrency => "concurrency",
             Category::Kv => "kv",
             Category::AlignmentIteration => "alignment-iteration",
             Category::AlignmentWorkload => "alignment-workload",
@@ -216,6 +221,15 @@ pub const SUBJECTS: &[Subject] = &[
         scope: Scope::Run,
     },
     Subject {
+        name: "concurrency",
+        category: Category::Concurrency,
+        description: "Run-level in-flight request concurrency over time from request_slo arrival and terminal events.",
+        report_name: "concurrency_report.json",
+        payload_name: "concurrency_series.json",
+        applies: Applies::All,
+        scope: Scope::Run,
+    },
+    Subject {
         name: "workload-conservation",
         category: Category::Conservation,
         description: "Run-wide work accounting: cost_log prefill/decode/FFN/KV actuals vs \
@@ -303,6 +317,7 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
         "kernel-throughput" => batch::kernel_throughput::run_kernel_throughput(ctx, dir).await,
         "kernel-input-distribution" => backend::kernel_input_distribution::run(ctx, dir).await,
         "kernel-time-share" => breakdown::kernel_time_share::run(ctx, dir).await,
+        "concurrency" => concurrency::series::run_concurrency(ctx, dir).await,
         "workload-conservation" => conservation::workload::run_workload(ctx, dir).await,
         "kv-occupancy" => kv::occupancy::run_kv_occupancy(ctx, dir).await,
         "alignment-iteration" => alignment_iteration::run(ctx, dir).await,
