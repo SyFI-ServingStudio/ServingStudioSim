@@ -5,8 +5,10 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use super::catalog::build_catalog;
-use super::core::{build_descriptor, build_topology, read_summary};
+use super::core::{build_descriptor, read_summary};
 use super::discovery::{configure_logs_roots, discover_runs};
+use super::model::read_model;
+use super::topology::build_topology;
 
 fn make_run(path: &Path, complete: bool, analyzed: bool) {
     fs::create_dir_all(path.join("raw")).expect("create raw directory");
@@ -29,7 +31,7 @@ fn make_core_run(path: &Path) {
             "deployment": "afd",
             "pools": {
                 "attn": {
-                    "groups": [{"arch": {"model_config": "model/qwen.json"}}]
+                    "groups": [{"arch": {"model_config": "model/config/qwen.json"}}]
                 }
             }
         }"#,
@@ -120,7 +122,9 @@ fn descriptor_indexes_existing_core_resources() {
 
     assert_eq!(descriptor["run_id"], run.run_id);
     assert_eq!(descriptor["deployment"], "afd");
-    assert_eq!(descriptor["model_name"], "model/qwen.json");
+    assert_eq!(descriptor["model_name"], "model/config/qwen.json");
+    assert_eq!(descriptor["model"]["href"], "model");
+    assert_eq!(descriptor["model"]["schema_version"], 1);
     assert_eq!(descriptor["summary"]["href"], "summary");
     assert_eq!(descriptor["topology"]["href"], "topology");
     assert_eq!(descriptor["topology"]["schema_version"], 1);
@@ -150,6 +154,55 @@ fn summary_and_topology_reuse_simulator_artifacts() {
     assert_eq!(topology["schema_version"], 1);
     assert_eq!(topology["params"]["deployment"], "afd");
     assert_eq!(topology["run_meta"]["workers"], json!([]));
+}
+
+#[test]
+fn model_resource_reads_repo_config_named_by_run_params() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    let repo = TempDir::new().expect("temporary repository");
+    fs::create_dir_all(repo.path().join("model/config")).expect("create model config directory");
+    fs::write(
+        repo.path().join("model/config/qwen.json"),
+        r#"{"hidden_size": 6144, "num_hidden_layers": 62}"#,
+    )
+    .expect("write model config");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let model = read_model(&run, repo.path()).expect("read model resource");
+
+    assert_eq!(model["schema_version"], 1);
+    assert_eq!(model["source_path"], "model/config/qwen.json");
+    assert_eq!(model["config"]["hidden_size"], 6144);
+    assert_eq!(model["config"]["num_hidden_layers"], 62);
+}
+
+#[test]
+fn model_resource_rejects_paths_outside_model_config() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    let params_path = run_path.join("raw/params.json");
+    let params = fs::read_to_string(&params_path)
+        .expect("read params")
+        .replace("model/config/qwen.json", "../../outside.json");
+    fs::write(params_path, params).expect("write unsafe params");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let error = read_model(&run, temporary.path()).expect_err("reject path traversal");
+
+    assert!(error.to_string().contains("below model/config"));
 }
 
 #[cfg(unix)]

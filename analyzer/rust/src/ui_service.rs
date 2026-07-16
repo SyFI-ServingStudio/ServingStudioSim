@@ -4,11 +4,14 @@
 //! resources live in separate modules so later subjects do not grow one service
 //! file into a second analyzer.
 
+mod artifact;
 mod catalog;
 mod core;
 mod discovery;
+mod model;
 #[cfg(test)]
 mod tests;
+mod topology;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,26 +26,32 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use catalog::build_catalog;
-use core::{build_descriptor, build_topology, read_summary};
+use core::{build_descriptor, read_summary};
 use discovery::{configure_logs_roots, resolve_run, ConfiguredRoot, DiscoveredRun};
+use model::read_model;
+use topology::build_topology;
 
 const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, Debug)]
 struct ServiceState {
     roots: Arc<Vec<ConfiguredRoot>>,
+    repo_root: Arc<PathBuf>,
 }
 
 pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<()> {
     let roots = configure_logs_roots(logs_roots)?;
+    let repo_root = std::env::current_dir().context("resolve analyzer repository root")?;
     let state = ServiceState {
         roots: Arc::new(roots),
+        repo_root: Arc::new(repo_root),
     };
     let app = Router::new()
         .route("/api/v1/runs", get(list_runs))
         .route("/api/v1/runs/{run_id}/descriptor", get(get_descriptor))
         .route("/api/v1/runs/{run_id}/summary", get(get_summary))
         .route("/api/v1/runs/{run_id}/topology", get(get_topology))
+        .route("/api/v1/runs/{run_id}/model", get(get_model))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -81,6 +90,14 @@ async fn get_topology(
     State(state): State<ServiceState>,
 ) -> Response {
     read_run_resource(state, run_id, |run| build_topology(&run)).await
+}
+
+async fn get_model(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    let repo_root = Arc::clone(&state.repo_root);
+    read_run_resource(state, run_id, move |run| read_model(&run, &repo_root)).await
 }
 
 async fn read_run_resource(
