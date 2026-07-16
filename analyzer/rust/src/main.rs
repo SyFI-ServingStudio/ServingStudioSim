@@ -10,6 +10,7 @@
 //! subjects from an `alignment_manifest.json`. Both use the one flat catalog in
 //! [`registry`], separated by its source [`registry::Scope`] gate.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -35,6 +36,7 @@ mod request;
 mod session;
 mod throughput;
 mod trace;
+mod ui_service;
 mod utilization;
 
 use io::{payload_path, read_deployment, report_path, write_json, SCHEMA_VERSION};
@@ -68,6 +70,15 @@ enum Command {
     },
     /// List the available analyzer subjects and what each produces.
     List,
+    /// Serve the read-only protocol-v1 run catalog for viz-ui.
+    Serve {
+        /// Logs root to scan recursively. Repeat for additional roots.
+        #[arg(long = "logs-root", required = true)]
+        logs_roots: Vec<PathBuf>,
+        /// Loopback listener used by the viz-ui development proxy.
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: SocketAddr,
+    },
     /// Export a Perfetto per-kernel timeline (`traces/<prefix>.pftrace.gz`).
     /// Samples `regions` evenly-spaced contiguous windows of `region_ms` each
     /// across the run and concatenates them; open in ui.perfetto.dev. A separate
@@ -120,6 +131,7 @@ async fn main() -> Result<()> {
             print!("{}", registry::help());
             Ok(())
         }
+        Command::Serve { logs_roots, bind } => ui_service::serve(bind, logs_roots).await,
         Command::Run { log_dir, subjects } => run(log_dir, subjects).await,
         Command::Alignment {
             analysis_log_dir,

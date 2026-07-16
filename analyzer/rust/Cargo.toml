@@ -18,7 +18,12 @@ serde_json = "1.0"
 # RecordBatches resolve to the same arrow types (matches ref/moesim-rs analyze-rust).
 datafusion = { version = "45", default-features = false, features = ["parquet"] }
 arrow-array = { version = "54", default-features = false }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+# The first UI wiring slice exposes only a read-only run catalog. Axum owns the
+# small HTTP surface; filesystem discovery remains explicit in this crate.
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+sha2 = "0.10"
 # Pure-Rust linear algebra — used only by `src/pca.rs` for the symmetric
 # eigendecomposition behind the kernel-input-distribution feature projection
 # (no BLAS/LAPACK system dependency; keeps the analyzer a self-contained build).
@@ -31,6 +36,9 @@ flate2 = "1"
 
 [build-dependencies]
 prost-build = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
 
 # Build profiles (release / maxperf) come from the workspace root Cargo.toml and
 # apply to every member — defining them here would be ignored (cargo warns).
