@@ -106,7 +106,7 @@ rust/                The `analyze` binary (DataFusion compute side).
                        components (the kernel-input-distribution feature projection).
   src/request/         Category = per-request/session metrics (slo).
   src/throughput/      Category = serving-rate-over-time metrics (throughput).
-  src/utilization/     Per-pool GPU busy-fraction over time.
+  src/utilization/     Per-worker GPU busy-fraction with per-pool averages over time.
   src/batch/           Batch composition + per-location achieved kernel throughput.
   src/backend/         Backend selection over a kernel position's input feature space.
   src/breakdown/       CostTree replay + run-wide leaf-position composition.
@@ -145,7 +145,7 @@ Current catalog:
 | `slo-general` | request | `request_slo.parquet` scalar columns | TTFT/TPOT/E2E stats / per-metric CDF series |
 | `slo-detailed` | request | `request_slo.parquet` `output_token_times` column | ITL stats / CDF series when per-token logging is enabled |
 | `throughput` | throughput | `request_state.parquet` (+ `run_meta.json`) | per-GPU prefill/decode/total TPS totals / fine `segments` + coarse `binned_segments` series |
-| `utilization` | utilization | `cost_log` slot times (+ `run_meta.json`) | per-pool GPU compute utilization (fraction of workers busy) over time / `utilization_series` |
+| `utilization` | utilization | `cost_log` slot times (+ `run_meta.json`) | per-worker GPU compute utilization plus per-pool averages over time / `utilization_series` |
 | `batch` | batch | `request_state.parquet` | per-batch composition (batch / prefill / decode token counts) over time + stats / `batch_scatter` series |
 | `kernel-throughput` | batch | 1/50-sampled `cost_log` slots + matching CostTree manifests | achieved TFLOP/s (compute) and GB/s (memory BW) per cost-tree location / per-location `kernel_throughput_locations` stats |
 | `kernel-input-distribution` | backend | sampled `cost_log` `slot_input` + `slot_backend` + matching CostTree manifest `backends` lists | per-position selected-backend counts/ratios + PCA/feature projection / one scatter per position (`kernel_input_distribution_scatter`), rendered to `plots/kernel_input_dist/<position>.png`; unavailable on runs without per-slot backend + input logging |

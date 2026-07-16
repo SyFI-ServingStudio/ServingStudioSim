@@ -5,9 +5,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::artifact::{read_bytes, read_run_json};
+use super::concurrency::concurrency_descriptor;
 use super::discovery::{regular_file, timestamp, DiscoveredRun, StageStatus};
 use super::model::model_config_path;
-use super::subjects::concurrency_descriptor;
+use super::slo::slo_general_descriptor;
+use super::throughput::throughput_descriptor;
+use super::utilization::utilization_descriptor;
 use super::workload::trace_file_paths;
 use super::PROTOCOL_VERSION;
 
@@ -55,6 +58,15 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     }
     if let Some(concurrency) = concurrency_descriptor(run)? {
         descriptor["subjects"]["concurrency"] = concurrency;
+    }
+    if let Some(slo_general) = slo_general_descriptor(run)? {
+        descriptor["subjects"]["slo-general"] = slo_general;
+    }
+    if let Some(throughput) = throughput_descriptor(run)? {
+        descriptor["subjects"]["throughput"] = throughput;
+    }
+    if let Some(utilization) = utilization_descriptor(run)? {
+        descriptor["subjects"]["utilization"] = utilization;
     }
     if run.lifecycle.analysis == StageStatus::Complete {
         let timing_path = run.path.join("reports/analyzer_timing.json");

@@ -175,7 +175,7 @@ pub const SUBJECTS: &[Subject] = &[
     Subject {
         name: "utilization",
         category: Category::Utilization,
-        description: "Per-pool GPU compute utilization (fraction of workers busy) over time.",
+        description: "Per-worker GPU compute utilization with per-pool averages over time.",
         report_name: "utilization_report.json",
         payload_name: "utilization_series.json",
         applies: Applies::All,

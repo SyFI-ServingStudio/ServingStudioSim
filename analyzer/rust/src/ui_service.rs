@@ -6,13 +6,16 @@
 
 mod artifact;
 mod catalog;
+mod concurrency;
 mod core;
 mod discovery;
 mod model;
-mod subjects;
+mod slo;
 #[cfg(test)]
 mod tests;
+mod throughput;
 mod topology;
+mod utilization;
 mod workload;
 
 use std::net::SocketAddr;
@@ -28,11 +31,14 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use catalog::build_catalog;
+use concurrency::{read_concurrency_payload, read_concurrency_report};
 use core::{build_descriptor, read_summary};
 use discovery::{configure_logs_roots, resolve_run, ConfiguredRoot, DiscoveredRun};
 use model::read_model;
-use subjects::{read_concurrency_payload, read_concurrency_report};
+use slo::{read_slo_general_payload, read_slo_general_report};
+use throughput::{read_throughput_payload, read_throughput_report};
 use topology::build_topology;
+use utilization::{read_utilization_payload, read_utilization_report};
 use workload::read_workload;
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -64,6 +70,30 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
         .route(
             "/api/v1/runs/{run_id}/subjects/concurrency/payload",
             get(get_concurrency_payload),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/slo-general/report",
+            get(get_slo_general_report),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/slo-general/payload",
+            get(get_slo_general_payload),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/throughput/report",
+            get(get_throughput_report),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/throughput/payload",
+            get(get_throughput_payload),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/utilization/report",
+            get(get_utilization_report),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/utilization/payload",
+            get(get_utilization_payload),
         )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind)
@@ -133,6 +163,48 @@ async fn get_concurrency_payload(
     State(state): State<ServiceState>,
 ) -> Response {
     read_run_resource(state, run_id, |run| read_concurrency_payload(&run)).await
+}
+
+async fn get_slo_general_report(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_slo_general_report(&run)).await
+}
+
+async fn get_slo_general_payload(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_slo_general_payload(&run)).await
+}
+
+async fn get_throughput_report(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_throughput_report(&run)).await
+}
+
+async fn get_throughput_payload(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_throughput_payload(&run)).await
+}
+
+async fn get_utilization_report(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_utilization_report(&run)).await
+}
+
+async fn get_utilization_payload(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_utilization_payload(&run)).await
 }
 
 async fn read_run_resource(

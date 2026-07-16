@@ -5,11 +5,14 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 
 use super::catalog::build_catalog;
+use super::concurrency::{read_concurrency_payload, read_concurrency_report};
 use super::core::{build_descriptor, read_summary};
 use super::discovery::{configure_logs_roots, discover_runs};
 use super::model::read_model;
-use super::subjects::{read_concurrency_payload, read_concurrency_report};
+use super::slo::{read_slo_general_payload, read_slo_general_report};
+use super::throughput::{read_throughput_payload, read_throughput_report};
 use super::topology::build_topology;
+use super::utilization::{read_utilization_payload, read_utilization_report};
 use super::workload::read_workload;
 
 fn make_run(path: &Path, complete: bool, analyzed: bool) {
@@ -55,7 +58,12 @@ fn make_core_run(path: &Path) {
     .expect("write summary");
     fs::write(
         path.join("reports/analyzer_timing.json"),
-        r#"{"subjects": [{"name": "concurrency", "status": "ok"}]}"#,
+        r#"{"subjects": [
+            {"name": "concurrency", "status": "ok"},
+            {"name": "slo-general", "status": "ok"},
+            {"name": "throughput", "status": "ok"},
+            {"name": "utilization", "status": "ok"}
+        ]}"#,
     )
     .expect("write timing");
     fs::write(
@@ -69,6 +77,91 @@ fn make_core_run(path: &Path) {
         r#"{"schema_version": 1, "t_ms": [5.0, 10.0], "active": [2.0, 1.0], "peak": 2}"#,
     )
     .expect("write concurrency payload");
+    fs::write(
+        path.join("reports/slo_general_report.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "metrics": {
+                "ttft": {"mean": 12.0},
+                "tpot": {"mean": 4.0},
+                "e2e": {"mean": 40.0}
+            }
+        }"#,
+    )
+    .expect("write SLO report");
+    fs::write(
+        path.join("payloads/slo_general_cdf.json"),
+        r#"{
+            "schema_version": 1,
+            "series": [
+                {"key": "ttft", "x": [10.0], "y_pct": [100.0]},
+                {"key": "tpot", "x": [4.0], "y_pct": [100.0]},
+                {"key": "e2e", "x": [40.0], "y_pct": [100.0]}
+            ]
+        }"#,
+    )
+    .expect("write SLO payload");
+    fs::write(
+        path.join("reports/throughput_report.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "totals": {
+                "prefill_tps": 1200.0,
+                "decode_tps": 300.0,
+                "total_tps": 1500.0,
+                "total_tps_per_gpu": 187.5
+            }
+        }"#,
+    )
+    .expect("write throughput report");
+    fs::write(
+        path.join("payloads/throughput_segments.json"),
+        r#"{
+            "schema_version": 1,
+            "t_start_ms": [0.0],
+            "t_end_ms": [1000.0],
+            "series": [
+                {"key": "total", "per_gpu": [187.5]},
+                {"key": "prefill", "per_gpu": [150.0]},
+                {"key": "decode", "per_gpu": [37.5]}
+            ]
+        }"#,
+    )
+    .expect("write throughput payload");
+    fs::write(
+        path.join("reports/utilization_report.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "totals": {
+                "per_pool": [{"pool": 0, "pool_tag": "attn", "avg_util": 0.6}],
+                "per_worker": [
+                    {"pool": 0, "pool_tag": "attn", "worker_id": 0, "avg_util": 0.8},
+                    {"pool": 0, "pool_tag": "attn", "worker_id": 1, "avg_util": 0.4}
+                ],
+                "overall_avg": 0.6
+            }
+        }"#,
+    )
+    .expect("write utilization report");
+    fs::write(
+        path.join("payloads/utilization_series.json"),
+        r#"{
+            "schema_version": 1,
+            "t_start_ms": [0.0],
+            "t_end_ms": [1000.0],
+            "series": [
+                {"key": "pool_0", "label": "Pool 0", "pool_tag": "attn", "util": [0.6]}
+            ],
+            "worker_series": [
+                {"key": "worker_0_0", "label": "attn/0", "pool_tag": "attn", "worker_id": 0, "util": [0.8]},
+                {"key": "worker_0_1", "label": "attn/1", "pool_tag": "attn", "worker_id": 1, "util": [0.4]}
+            ]
+        }"#,
+    )
+    .expect("write utilization payload");
     fs::write(path.join(".complete"), "").expect("write completion marker");
 }
 
@@ -151,6 +244,33 @@ fn descriptor_indexes_existing_core_resources() {
     assert_eq!(
         descriptor["subjects"]["concurrency"]["payload_href"],
         "subjects/concurrency/payload"
+    );
+    assert_eq!(descriptor["subjects"]["slo-general"]["status"], "ready");
+    assert_eq!(
+        descriptor["subjects"]["slo-general"]["report_href"],
+        "subjects/slo-general/report"
+    );
+    assert_eq!(
+        descriptor["subjects"]["slo-general"]["payload_href"],
+        "subjects/slo-general/payload"
+    );
+    assert_eq!(descriptor["subjects"]["throughput"]["status"], "ready");
+    assert_eq!(
+        descriptor["subjects"]["throughput"]["report_href"],
+        "subjects/throughput/report"
+    );
+    assert_eq!(
+        descriptor["subjects"]["throughput"]["payload_href"],
+        "subjects/throughput/payload"
+    );
+    assert_eq!(descriptor["subjects"]["utilization"]["status"], "ready");
+    assert_eq!(
+        descriptor["subjects"]["utilization"]["report_href"],
+        "subjects/utilization/report"
+    );
+    assert_eq!(
+        descriptor["subjects"]["utilization"]["payload_href"],
+        "subjects/utilization/payload"
     );
     assert!(descriptor["analysis"]["revision"]
         .as_str()
@@ -309,6 +429,144 @@ fn concurrency_resources_reuse_analyzer_artifacts() {
     assert_eq!(payload["t_ms"], json!([5.0, 10.0]));
     assert_eq!(payload["active"], json!([2.0, 1.0]));
     assert_eq!(payload["peak"], 2);
+}
+
+#[test]
+fn slo_general_resources_expose_ttft_tpot_and_e2e() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let report = read_slo_general_report(&run).expect("read SLO report");
+    let payload = read_slo_general_payload(&run).expect("read SLO payload");
+
+    assert_eq!(report["metrics"]["ttft"]["mean"], 12.0);
+    assert_eq!(report["metrics"]["tpot"]["mean"], 4.0);
+    assert_eq!(report["metrics"]["e2e"]["mean"], 40.0);
+    let series_keys = payload["series"]
+        .as_array()
+        .expect("SLO series")
+        .iter()
+        .map(|series| series["key"].as_str().expect("series key"))
+        .collect::<Vec<_>>();
+    assert_eq!(series_keys, ["ttft", "tpot", "e2e"]);
+}
+
+#[test]
+fn unavailable_slo_general_is_not_published_as_ready() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    fs::write(
+        run_path.join("reports/slo_general_report.json"),
+        r#"{"schema_version":1,"available":false,"reason":"request_slo.parquet not found"}"#,
+    )
+    .expect("write unavailable SLO report");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let descriptor = build_descriptor(&run).expect("build descriptor");
+
+    assert!(descriptor["subjects"].get("slo-general").is_none());
+}
+
+#[test]
+fn throughput_resources_expose_total_prefill_and_decode_rates() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let report = read_throughput_report(&run).expect("read throughput report");
+    let payload = read_throughput_payload(&run).expect("read throughput payload");
+
+    assert_eq!(report["totals"]["total_tps"], 1500.0);
+    assert_eq!(report["totals"]["total_tps_per_gpu"], 187.5);
+    let series_keys = payload["series"]
+        .as_array()
+        .expect("throughput series")
+        .iter()
+        .map(|series| series["key"].as_str().expect("series key"))
+        .collect::<Vec<_>>();
+    assert_eq!(series_keys, ["total", "prefill", "decode"]);
+}
+
+#[test]
+fn unavailable_throughput_is_not_published_as_ready() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    fs::write(
+        run_path.join("reports/throughput_report.json"),
+        r#"{"schema_version":1,"available":false,"reason":"request_state.parquet not found"}"#,
+    )
+    .expect("write unavailable throughput report");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let descriptor = build_descriptor(&run).expect("build descriptor");
+
+    assert!(descriptor["subjects"].get("throughput").is_none());
+}
+
+#[test]
+fn utilization_resources_expose_workers_and_pool_average() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let report = read_utilization_report(&run).expect("read utilization report");
+    let payload = read_utilization_payload(&run).expect("read utilization payload");
+
+    assert_eq!(report["totals"]["per_pool"][0]["avg_util"], 0.6);
+    assert_eq!(report["totals"]["per_worker"][0]["worker_id"], 0);
+    assert_eq!(payload["series"][0]["util"], json!([0.6]));
+    assert_eq!(payload["worker_series"][0]["util"], json!([0.8]));
+    assert_eq!(payload["worker_series"][1]["util"], json!([0.4]));
+}
+
+#[test]
+fn unavailable_utilization_is_not_published_as_ready() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    fs::write(
+        run_path.join("reports/utilization_report.json"),
+        r#"{"schema_version":1,"available":false,"reason":"cost_log/ dir not found"}"#,
+    )
+    .expect("write unavailable utilization report");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let descriptor = build_descriptor(&run).expect("build descriptor");
+
+    assert!(descriptor["subjects"].get("utilization").is_none());
 }
 
 #[test]

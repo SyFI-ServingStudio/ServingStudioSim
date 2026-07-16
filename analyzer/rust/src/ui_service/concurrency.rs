@@ -1,4 +1,4 @@
-//! UI publication for analyzer-produced report/payload subject artifacts.
+//! UI publication for analyzer-produced concurrency artifacts.
 
 use anyhow::Result;
 use serde_json::{json, Value};
