@@ -34,6 +34,7 @@ nalgebra = "0.33"
 # build time from `proto/perfetto_trace.proto` by `build.rs` (prost-build).
 prost = "0.13"
 flate2 = "1"
+futures-util = "0.3"
 
 [build-dependencies]
 prost-build = "0.13"

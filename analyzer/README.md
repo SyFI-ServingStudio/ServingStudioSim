@@ -54,6 +54,7 @@ alignment analyze ──reads completed roots + mapping
 | `analyze run <log_dir> [subjects...]` | Rust | Compute subjects → `reports/` + `payloads/`, plus a subject-less `reports/analyzer_timing.json` run-meta sidecar. No subjects = all applicable. |
 | `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
+| `analyze serve --logs-root <dir>` | Rust | Serve the read-only viz-ui catalog, bounded worker operation windows, and exact `(worker, iter, batch, operation)` CostTrees reconstructed lazily from `cost_log` + manifest. |
 | `analyze list` | Rust | Print the subject catalog. |
 | `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNG plots, including sampled alignment breakdowns. No subjects = all renderers. |
 
@@ -79,6 +80,26 @@ sim/L7, containing:
   throughput subject reads it to normalize per-GPU. Absent → treated as 1 GPU.
 
 All three are read as bare JSON / parquet by name — no `simulator` types crossed.
+Worker detail remains outside the run descriptor body: the descriptor advertises
+the `workers` capability, and the only selectable entity is one raw operation.
+`workers/{pool}/{worker}/operations?offset=...&limit=...` reads any contiguous
+global-ordinal range (at most 384 summaries); the UI uses 64-operation ranges
+for drag navigation. Each summary is one `worker_cost` row with stable identity
+`(iter_id,batch_id,operation_id)`, section/layer, and its exact bounded interval.
+The worker index sorts globally by `(start_ms,iter_id,batch_id,operation_id)`;
+the local decimal `operation_id` is assigned by
+`(wall_start_ms,section,layer,total_time_ms)`. Duplicate local keys or
+non-monotonic global end times fail loud, preserving deterministic O(log N +
+hits) half-open seek without rescanning millions of rows.
+
+`workers/{pool}/{worker}/operations/seek?at_ms=...` returns every operation
+covering the cursor, an anchor (or nearest operation when there is no hit), a
+suggested 64-operation viewport, and one surrounding 192-operation buffer.
+`worker_kind` is `afd_attn`, `afd_ffn`, or `iterwise`; `batch_role` states
+whether `batch_id` represents a `slot` or a `batch`. Exact CostTrees use
+`operations/{iter_id}/{batch_id}/{operation_id}/cost-tree` and reconstruct only
+that one raw row. A streaming scan builds a compact per-worker index once; a
+512 MiB byte-budgeted LRU bounds retained indexes, and range JSON is not cached.
 The alignment path reads `<analysis_log_dir>/alignment_manifest.json`, which
 points to normalized NSYS JSON in the profile root, timing-predict cost
 parquet/manifest, the profile's `replay_result` TraceLab JSONL, its optional
