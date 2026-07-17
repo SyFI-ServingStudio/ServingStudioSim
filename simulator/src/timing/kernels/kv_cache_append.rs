@@ -11,7 +11,7 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct KvCacheAppendKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
@@ -105,7 +105,13 @@ mod tests {
     fn config_identity_describes_the_physical_write_path() {
         assert_eq!(
             config().describe_config(),
-            r#"backends=["vllm_cuda"] gpu_name="NVIDIA H200" num_kv_heads=8 head_dim=128 block_size=16 input_dtype=Bf16 kv_dtype=Bf16 cache_layout="NHD" scale_granularity="tensor""#
+            serde_json::json!({
+                "backends": ["vllm_cuda"], "gpu_name": "NVIDIA H200",
+                "num_kv_heads": {"value": 8, "expression": null, "bindings": {}},
+                "head_dim": {"value": 128, "expression": null, "bindings": {}},
+                "block_size": 16, "input_dtype": "bf16", "kv_dtype": "bf16",
+                "cache_layout": "NHD", "scale_granularity": "tensor",
+            })
         );
     }
 

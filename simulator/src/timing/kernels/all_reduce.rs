@@ -35,7 +35,7 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AllReduceKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
@@ -122,10 +122,12 @@ mod tests {
 
     #[test]
     fn describe_config_renders_tidy_field_list() {
-        // Every field in declaration order, no struct-name/braces wrapper.
         assert_eq!(
             cfg().describe_config(),
-            r#"backends=["nccl"] gpu_name="H100" num_gpus=8 fabric=Nvlink"#
+            serde_json::json!({
+                "backends": ["nccl"], "gpu_name": "H100",
+                "num_gpus": 8, "fabric": "nvlink",
+            })
         );
     }
 

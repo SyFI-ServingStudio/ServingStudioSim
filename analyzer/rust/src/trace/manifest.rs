@@ -9,24 +9,89 @@
 
 use std::ops::Range;
 
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer};
+use serde_json::{Map, Value};
 
-/// Per-slot leaf identity (kernel kind + one-line config). Slot index = position
+/// Per-slot leaf identity (kernel kind + structured config). Slot index = position
 /// in `slot_time_ms` / `slot_input` parquet list columns.
 ///
-/// `backends` is the leaf's ordered candidate backend list — the index space of
-/// the `cost_log` `slot_backend` column (`backends[slot_backend]` names the
-/// backend best-of-N selected), so a consumer never parses the `config` string.
-/// `#[serde(default)]`: manifests written before the field existed deserialize to
-/// an empty list, which the `kernel-input-distribution` subject reads as "backend
-/// selection unavailable" rather than guessing.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LeafDesc {
     pub name: String,
     pub kind: String,
-    pub config: String,
+    pub kernel_config: Value,
+}
+
+#[derive(Deserialize)]
+struct WireLeafDesc {
+    name: String,
+    kind: String,
     #[serde(default)]
-    pub backends: Vec<String>,
+    kernel_config: Option<Value>,
+    #[serde(default)]
+    config: Option<String>,
+    #[serde(default)]
+    backends: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for LeafDesc {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = WireLeafDesc::deserialize(deserializer)?;
+        let mut kernel_config = match wire.kernel_config {
+            Some(Value::Object(config)) => config,
+            Some(_) => {
+                return Err(de::Error::custom(
+                    "field `kernel_config` must be a JSON object",
+                ));
+            }
+            None => {
+                let legacy_config = wire.config.ok_or_else(|| {
+                    de::Error::custom("missing field `kernel_config` (or legacy `config`)")
+                })?;
+                let mut config = Map::new();
+                // The retired field is display text, not a parseable identity. Keep
+                // it verbatim so archived manifests remain inspectable without
+                // guessing structure from strings such as `n=... k=...`.
+                config.insert("config".to_owned(), Value::String(legacy_config));
+                config
+            }
+        };
+
+        // Some transition-era manifests carry a structured kernel config but
+        // still keep the slot-backend index space at the old top level. Normalize
+        // that representation at the read boundary; current manifests remain
+        // authoritative when they already contain `kernel_config.backends`.
+        if !kernel_config.contains_key("backends") && !wire.backends.is_empty() {
+            kernel_config.insert(
+                "backends".to_owned(),
+                Value::Array(wire.backends.into_iter().map(Value::String).collect()),
+            );
+        }
+
+        Ok(Self {
+            name: wire.name,
+            kind: wire.kind,
+            kernel_config: Value::Object(kernel_config),
+        })
+    }
+}
+
+impl LeafDesc {
+    /// Ordered best-of-N candidates. Their JSON array position is the index space
+    /// of `cost_log.slot_backend`; no duplicate manifest field is maintained.
+    pub fn backends(&self) -> Vec<String> {
+        self.kernel_config
+            .get("backends")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 /// Flattened cost-tree node. `children` is a contiguous range into `nodes`; a
@@ -36,9 +101,17 @@ pub struct LeafDesc {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub enum FlatCostNode {
     Leaf(usize),
-    Sum { children: Range<usize> },
-    Max { overlap: f32, children: Range<usize> },
-    Scale { n: u32, children: Range<usize> },
+    Sum {
+        children: Range<usize>,
+    },
+    Max {
+        overlap: f32,
+        children: Range<usize>,
+    },
+    Scale {
+        n: u32,
+        children: Range<usize>,
+    },
 }
 
 /// One section's manifest: ordered leaf slots, the flattened aggregation tree,
@@ -123,8 +196,8 @@ mod tests {
         {
           "section": "iter",
           "slots": [
-            {"name": "m.embedding", "kind": "elementwise", "config": "hidden=4096"},
-            {"name": "m.lm_head", "kind": "single_gemm", "config": "n=128256 k=4096", "backends": ["torch_linear"]}
+            {"name": "m.embedding", "kind": "elementwise", "kernel_config": {"hidden": {"value": 4096, "expression": "hidden", "bindings": {"hidden": 4096}}, "backends": ["torch"]}},
+            {"name": "m.lm_head", "kind": "single_gemm", "kernel_config": {"n": {"value": 128256, "expression": null, "bindings": {}}, "k": {"value": 4096, "expression": null, "bindings": {}}, "backends": ["torch_linear"]}}
           ],
           "nodes": [
             {"Sum": {"children": {"start": 1, "end": 3}}},
@@ -139,17 +212,16 @@ mod tests {
 
     #[test]
     fn sample_manifest_round_trips() {
-        let doc: ManifestDoc = serde_json::from_str(SAMPLE).expect("deserialize sample manifest doc");
+        let doc: ManifestDoc =
+            serde_json::from_str(SAMPLE).expect("deserialize sample manifest doc");
         assert_eq!(doc.sections.len(), 1);
         assert_eq!(doc.sections[0].section, "iter");
         let m = doc.section("iter").expect("iter section present");
         assert!(doc.section("missing").is_none());
         assert_eq!(m.slots.len(), 2);
         assert_eq!(m.slots[1].kind, "single_gemm");
-        // `backends` is `#[serde(default)]`: absent on slot 0 (pre-field manifest
-        // shape) → empty; present on slot 1 → the ordered candidate list.
-        assert!(m.slots[0].backends.is_empty());
-        assert_eq!(m.slots[1].backends, vec!["torch_linear".to_owned()]);
+        assert_eq!(m.slots[0].backends(), vec!["torch".to_owned()]);
+        assert_eq!(m.slots[1].backends(), vec!["torch_linear".to_owned()]);
         assert_eq!(
             m.nodes[0],
             FlatCostNode::Sum { children: 1..3 },
@@ -158,11 +230,68 @@ mod tests {
         assert_eq!(m.nodes[1], FlatCostNode::Leaf(0));
         assert_eq!(
             m.nodes[2],
-            FlatCostNode::Scale { n: 32, children: 3..4 }
+            FlatCostNode::Scale {
+                n: 32,
+                children: 3..4
+            }
         );
         assert_eq!(
             m.node_labels[0].as_deref(),
             Some("m [dense local, 32 layers]")
         );
+    }
+
+    #[test]
+    fn legacy_leaf_normalizes_config_and_top_level_backends() {
+        let leaf: LeafDesc = serde_json::from_str(
+            r#"{
+                "name": "m.qkv",
+                "kind": "single_gemm",
+                "config": "backends=torch,torch_linear n=6144 k=4096",
+                "backends": ["torch", "torch_linear"]
+            }"#,
+        )
+        .expect("deserialize legacy leaf");
+
+        assert_eq!(
+            leaf.kernel_config,
+            serde_json::json!({
+                "config": "backends=torch,torch_linear n=6144 k=4096",
+                "backends": ["torch", "torch_linear"],
+            })
+        );
+        assert_eq!(
+            leaf.backends(),
+            vec!["torch".to_owned(), "torch_linear".to_owned()]
+        );
+    }
+
+    #[test]
+    fn structured_config_wins_while_legacy_backends_fill_only_a_missing_list() {
+        let transitional: LeafDesc = serde_json::from_str(
+            r#"{
+                "name": "m.qkv",
+                "kind": "single_gemm",
+                "kernel_config": {"n": 6144},
+                "config": "retired display text",
+                "backends": ["torch_linear"]
+            }"#,
+        )
+        .expect("deserialize transitional leaf");
+        assert_eq!(
+            transitional.kernel_config,
+            serde_json::json!({"n": 6144, "backends": ["torch_linear"]})
+        );
+
+        let current: LeafDesc = serde_json::from_str(
+            r#"{
+                "name": "m.qkv",
+                "kind": "single_gemm",
+                "kernel_config": {"n": 6144, "backends": ["cutlass"]},
+                "backends": ["torch_linear"]
+            }"#,
+        )
+        .expect("deserialize current leaf with a redundant legacy field");
+        assert_eq!(current.backends(), vec!["cutlass".to_owned()]);
     }
 }

@@ -124,23 +124,26 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 .manifest
                 .slots
                 .iter()
-                .map(|leaf| match pos_id.get(leaf.name.as_str()) {
-                    Some(&id) => {
-                        let p = &mut positions[id as usize];
-                        if p.backends.is_empty() && !leaf.backends.is_empty() {
-                            p.backends = leaf.backends.clone();
+                .map(|leaf| {
+                    let leaf_backends = leaf.backends();
+                    match pos_id.get(leaf.name.as_str()) {
+                        Some(&id) => {
+                            let p = &mut positions[id as usize];
+                            if p.backends.is_empty() && !leaf_backends.is_empty() {
+                                p.backends = leaf_backends;
+                            }
+                            id
                         }
-                        id
-                    }
-                    None => {
-                        let id = positions.len() as u32;
-                        pos_id.insert(&leaf.name, id);
-                        positions.push(Position {
-                            name: leaf.name.clone(),
-                            kind: leaf.kind.clone(),
-                            backends: leaf.backends.clone(),
-                        });
-                        id
+                        None => {
+                            let id = positions.len() as u32;
+                            pos_id.insert(&leaf.name, id);
+                            positions.push(Position {
+                                name: leaf.name.clone(),
+                                kind: leaf.kind.clone(),
+                                backends: leaf_backends,
+                            });
+                            id
+                        }
                     }
                 })
                 .collect();

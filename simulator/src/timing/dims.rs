@@ -33,6 +33,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::{Add, Div, Mul, Sub};
 use std::sync::Arc;
 
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A model dimension carrying its folded value + derivation. Cheap to clone.
@@ -82,7 +83,6 @@ impl From<u32> for Dim {
 }
 
 impl Dim {
-
     /// The folded value. O(1): every node memoizes it. THIS is the collapse to a
     /// raw integer — only call it at an external boundary (see module docs).
     pub fn get(&self) -> u32 {
@@ -147,7 +147,12 @@ fn expr(op: DimOp, lhs: Dim, rhs: Dim) -> Dim {
         DimOp::Mul => a * b,
         DimOp::Div => a / b,
     };
-    Dim(Arc::new(DimNode::Expr { value, op, lhs, rhs }))
+    Dim(Arc::new(DimNode::Expr {
+        value,
+        op,
+        lhs,
+        rhs,
+    }))
 }
 
 // --- Arithmetic: Dim⊕Dim, Dim⊕u32, u32⊕Dim for +, -, *, / ------------------
@@ -272,18 +277,47 @@ impl fmt::Debug for Dim {
     }
 }
 
-// --- serde: transparently a u32 (no provenance survives a round-trip) --------
-// Kernel configs are constructed in Rust from `ModelCfg` (where provenance is
-// born); the only JSON path is the kernel-query introspection tool, which never
-// needs a formula, so deserialize yields an anonymous `Const`.
+// --- serde: numeric value plus provenance ------------------------------------
+// Cost manifests are the machine-readable kernel-config boundary. Preserve the
+// expression and its bindings there while keeping `value` authoritative for a
+// kernel-query round-trip; deserialization intentionally rebuilds an anonymous
+// `Const` because cache identity depends only on the folded value.
 impl Serialize for Dim {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u32(self.get())
+        let mut state = s.serialize_struct("Dim", 3)?;
+        state.serialize_field("value", &self.get())?;
+        let expression = match &*self.0 {
+            DimNode::Const(_) => None,
+            _ => Some(self.to_string()),
+        };
+        state.serialize_field("expression", &expression)?;
+        state.serialize_field("bindings", &self.bindings())?;
+        state.end()
     }
 }
 impl<'de> Deserialize<'de> for Dim {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Dim::lit(u32::deserialize(d)?))
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum DimWire {
+            Value(u32),
+            Rich {
+                value: u32,
+                #[serde(default, rename = "expression")]
+                _expression: Option<String>,
+                #[serde(default, rename = "bindings")]
+                _bindings: BTreeMap<String, u32>,
+            },
+        }
+        let value = match DimWire::deserialize(d)? {
+            DimWire::Value(value) => value,
+            DimWire::Rich {
+                value,
+                _expression: _,
+                _bindings: _,
+            } => value,
+        };
+        Ok(Dim::lit(value))
     }
 }
 
@@ -385,11 +419,20 @@ mod tests {
     }
 
     #[test]
-    fn serde_round_trips_as_u32() {
+    fn serde_round_trips_value_and_emits_provenance() {
         let d = Dim::param("hidden", 4096);
-        let json = serde_json::to_string(&d).unwrap();
-        assert_eq!(json, "4096");
-        let back: Dim = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "value": 4096,
+                "expression": "hidden",
+                "bindings": {"hidden": 4096},
+            })
+        );
+        let back: Dim = serde_json::from_value(json).unwrap();
         assert_eq!(back.get(), 4096); // value survives; provenance does not
+        let legacy_number: Dim = serde_json::from_value(serde_json::json!(2048)).unwrap();
+        assert_eq!(legacy_number.get(), 2048);
     }
 }

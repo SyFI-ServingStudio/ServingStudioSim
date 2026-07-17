@@ -23,7 +23,7 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ElementwiseKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
@@ -62,8 +62,14 @@ impl KernelSpec for ElementwiseSpec {
             let tokens = num_tokens as u64;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("input_size_bytes", config.input_bytes_per_token.get() as u64 * tokens)
-                .with("output_size_bytes", config.output_bytes_per_token.get() as u64 * tokens)
+                .with(
+                    "input_size_bytes",
+                    config.input_bytes_per_token.get() as u64 * tokens,
+                )
+                .with(
+                    "output_size_bytes",
+                    config.output_bytes_per_token.get() as u64 * tokens,
+                )
         })
     }
 }
@@ -100,7 +106,11 @@ mod tests {
     fn describe_config_renders_tidy_field_list() {
         assert_eq!(
             config().describe_config(),
-            r#"backends=["triton"] gpu_name="H100" input_bytes_per_token=8192 output_bytes_per_token=4096"#
+            serde_json::json!({
+                "backends": ["triton"], "gpu_name": "H100",
+                "input_bytes_per_token": {"value": 8192, "expression": null, "bindings": {}},
+                "output_bytes_per_token": {"value": 4096, "expression": null, "bindings": {}},
+            })
         );
     }
 
@@ -138,8 +148,14 @@ mod tests {
         assert_eq!(fields.len(), 3);
         assert_eq!(fields.get("backend"), Some(&Value::from("triton")));
         // First token-axis point is 32 (see Axis::token_axis): 8192*32, 4096*32.
-        assert_eq!(fields.get("input_size_bytes"), Some(&Value::from(8192_u64 * 32)));
-        assert_eq!(fields.get("output_size_bytes"), Some(&Value::from(4096_u64 * 32)));
+        assert_eq!(
+            fields.get("input_size_bytes"),
+            Some(&Value::from(8192_u64 * 32))
+        );
+        assert_eq!(
+            fields.get("output_size_bytes"),
+            Some(&Value::from(4096_u64 * 32))
+        );
         assert_eq!(first.backend(), Some("triton"));
     }
 }

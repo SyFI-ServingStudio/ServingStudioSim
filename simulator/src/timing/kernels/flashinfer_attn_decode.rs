@@ -25,7 +25,7 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FlashinferAttnDecodeKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
@@ -89,8 +89,7 @@ register_kernel!(FlashinferAttnDecodeKernel, FlashinferAttnDecodeSpec);
 #[cfg(test)]
 mod tests {
     use super::{
-        FlashinferAttnDecodeKernelConfig, FlashinferAttnDecodeKernelInput,
-        FlashinferAttnDecodeSpec,
+        FlashinferAttnDecodeKernelConfig, FlashinferAttnDecodeKernelInput, FlashinferAttnDecodeSpec,
     };
     use crate::timing::bridge::DType;
     use crate::timing::cache::CacheKind;
@@ -127,7 +126,13 @@ mod tests {
     fn describe_config_renders_tidy_field_list() {
         assert_eq!(
             config().describe_config(),
-            r#"backends=["fa2", "fa3", "trt", "cudnn"] gpu_name="H100" num_qo_heads=32 num_kv_heads=8 head_dim=128 q_dtype=Bf16 kv_dtype=Bf16 o_dtype=Bf16"#
+            serde_json::json!({
+                "backends": ["fa2", "fa3", "trt", "cudnn"], "gpu_name": "H100",
+                "num_qo_heads": {"value": 32, "expression": null, "bindings": {}},
+                "num_kv_heads": {"value": 8, "expression": null, "bindings": {}},
+                "head_dim": {"value": 128, "expression": null, "bindings": {}},
+                "q_dtype": "bf16", "kv_dtype": "bf16", "o_dtype": "bf16",
+            })
         );
     }
 

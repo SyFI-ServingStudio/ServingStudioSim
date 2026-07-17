@@ -21,7 +21,9 @@ use crate::timing::{BuildError, DType, Probe};
 /// `#[derive(KernelConfig)]` in `timing-kernel-derive` generates this impl by
 /// reading `&self.backends` directly; structs without a `backends` field fail
 /// to derive at the generated access site.
-pub trait KernelConfig: std::hash::Hash + Eq + Clone + std::fmt::Debug + 'static {
+pub trait KernelConfig:
+    std::hash::Hash + Eq + Clone + std::fmt::Debug + serde::Serialize + 'static
+{
     fn backends(&self) -> &[&'static str];
     /// Replace the candidate backend set. The `#[derive(KernelConfig)]` macro
     /// generates `self.backends = backends`. Called at `Kernel::build` when a
@@ -55,12 +57,10 @@ pub trait KernelConfig: std::hash::Hash + Eq + Clone + std::fmt::Debug + 'static
         None
     }
 
-    /// One-line config summary for the `Describe` leaf line — the `<cfg>` after
-    /// `<name> (<KIND>)`. The default is the full `{self:?}`; `#[derive(KernelConfig)]`
-    /// overrides it with a tidy `field=value` list over every field (including
-    /// `backends`), dropping only the struct-name + braces wrapper.
-    fn describe_config(&self) -> String {
-        format!("{self:?}")
+    /// The single structured kernel-config representation used by manifests,
+    /// introspection and presentation. `Dim` values retain formula provenance.
+    fn describe_config(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("KernelConfig must serialize to JSON")
     }
 
     /// The `symbol -> value` legend for this config's `Dim` shape fields — the
@@ -332,7 +332,7 @@ where
         S::KIND
     }
 
-    fn describe_config(&self) -> String {
+    fn describe_config(&self) -> serde_json::Value {
         KernelConfig::describe_config(&self.config)
     }
 
@@ -361,20 +361,8 @@ impl<S: KernelSpec> Probe for Kernel<S> {
     fn kind(&self) -> &'static str {
         S::KIND
     }
-    fn describe_config(&self) -> String {
+    fn describe_config(&self) -> serde_json::Value {
         self.config.describe_config()
-    }
-    fn symbol_bindings(&self) -> BTreeMap<&'static str, u32> {
-        KernelConfig::symbol_bindings(&self.config)
-    }
-    /// The (post-override) candidate backend list — same source as the fitted
-    /// `backend_caches`, so the manifest order matches the `slot_backend` index.
-    fn backends(&self) -> Vec<String> {
-        self.config
-            .backends()
-            .iter()
-            .map(|b| b.to_string())
-            .collect()
     }
 }
 
@@ -393,7 +381,10 @@ pub(crate) struct KernelQueryEntry {
     /// `grid` path: deserialize config and report
     /// `(describe_config, grid_axes, input_field_names)` from `sweep_grid` +
     /// the Input's `SweepCoords` alone — no bridge, no profiling, no GPU.
-    pub describe: fn(serde_json::Value) -> anyhow::Result<(String, Vec<Vec<f64>>, &'static [&'static str])>,
+    pub describe: fn(
+        serde_json::Value,
+    )
+        -> anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>,
 }
 
 inventory::collect!(KernelQueryEntry);
@@ -439,7 +430,7 @@ where
 /// a built cache.
 fn describe_from_json<S>(
     config: serde_json::Value,
-) -> anyhow::Result<(String, Vec<Vec<f64>>, &'static [&'static str])>
+) -> anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>
 where
     S: KernelSpec,
     S::Config: serde::de::DeserializeOwned,

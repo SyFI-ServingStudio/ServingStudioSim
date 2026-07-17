@@ -82,7 +82,7 @@ impl<'a> Placer<'a> {
                 let desc = &self.manifest.slots[*slot];
                 let mut anns = vec![
                     Annotation::str("kind", desc.kind.clone()),
-                    Annotation::str("config", desc.config.clone()),
+                    Annotation::str("kernel_config", desc.kernel_config.to_string()),
                     Annotation::dbl("dur_ms", dur as f64 / 1e6),
                 ];
                 // Achieved throughput from the *natural* leaf time (`leaf_ns`, not
@@ -255,8 +255,8 @@ mod tests {
         serde_json::from_str(
             r#"{
               "slots": [
-                {"name": "m.embedding", "kind": "elementwise", "config": "h=4096"},
-                {"name": "m.lm_head", "kind": "single_gemm", "config": "n=128256"}
+                {"name": "m.embedding", "kind": "elementwise", "kernel_config": {"hidden": 4096}},
+                {"name": "m.lm_head", "kind": "single_gemm", "kernel_config": {"n": 128256}}
               ],
               "nodes": [
                 {"Sum": {"children": {"start": 1, "end": 3}}},
@@ -303,10 +303,10 @@ mod tests {
         serde_json::from_str(
             r#"{
               "slots": [
-                {"name": "a", "kind": "k", "config": "c"},
-                {"name": "b", "kind": "k", "config": "c"},
-                {"name": "c", "kind": "k", "config": "c"},
-                {"name": "d", "kind": "k", "config": "c"}
+                {"name": "a", "kind": "k", "kernel_config": {}},
+                {"name": "b", "kind": "k", "kernel_config": {}},
+                {"name": "c", "kind": "k", "kernel_config": {}},
+                {"name": "d", "kind": "k", "kernel_config": {}}
               ],
               "nodes": [
                 {"Sum": {"children": {"start": 1, "end": 4}}},
@@ -340,7 +340,10 @@ mod tests {
         let bytes = w.into_gzip().unwrap();
         assert_eq!(&bytes[..2], &[0x1f, 0x8b]);
         let raw = decompress(&bytes);
-        assert!(raw.windows(5).any(|win| win == b"lane "), "expanded emits lanes");
+        assert!(
+            raw.windows(5).any(|win| win == b"lane "),
+            "expanded emits lanes"
+        );
     }
 
     /// Critical mode collapses the `Max` onto the parent track: same root dur

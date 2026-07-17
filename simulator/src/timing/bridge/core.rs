@@ -23,8 +23,7 @@ pub struct KernelMissing {
 }
 
 /// One distinct kernel's structural facts for the `emit-backends` enumerator: its
-/// pool, dotted role `name`, `kind`, the one-line `describe_config` (carries the
-/// dtype fields the launcher parses for the `options` column), and the current
+/// pool, dotted role `name`, `kind`, structured `describe_config`, and the current
 /// const-default candidate `backends`. Collected with NO profiling / GPU — the
 /// enumerate bridge mode records this and returns an empty kernel before any
 /// `profile.db` lookup. Reused sites (folded layers, unrolled experts) emit one
@@ -43,7 +42,7 @@ pub struct KernelEnum {
     /// below is kept ONLY for the launcher's informational shape annotation.
     pub compute_dtype: Option<DType>,
     pub kv_dtype: Option<DType>,
-    pub config: String,
+    pub config: Value,
     pub backends: Vec<String>,
 }
 
@@ -188,8 +187,7 @@ impl PerfApiBridge {
                 })
                 .collect()
         });
-        let prev_overrides =
-            std::mem::replace(&mut *self.backend_overrides.borrow_mut(), interned);
+        let prev_overrides = std::mem::replace(&mut *self.backend_overrides.borrow_mut(), interned);
         let prev_pool = self.active_pool.borrow_mut().replace(pool.to_string());
         BackendOverrideGuard {
             bridge: self,
@@ -232,7 +230,7 @@ impl PerfApiBridge {
         gpu: &str,
         compute_dtype: Option<DType>,
         kv_dtype: Option<DType>,
-        config: String,
+        config: Value,
         backends: &[&'static str],
     ) {
         if let Some(report) = self.enumerate.borrow_mut().as_mut() {
@@ -641,7 +639,10 @@ mod tests {
     fn override_scope_sets_by_role_and_clears_on_drop() {
         let bridge = PerfApiBridge::new_uninit_for_test();
         // No overrides active by default.
-        assert_eq!(bridge.backend_override_for("afd.moe_expert_compute.gate_up"), None);
+        assert_eq!(
+            bridge.backend_override_for("afd.moe_expert_compute.gate_up"),
+            None
+        );
 
         let map = submap(&[
             ("afd.moe_expert_compute.gate_up", &["fa3"]),
@@ -662,7 +663,10 @@ mod tests {
             assert_eq!(bridge.backend_override_for("afd.some.other"), None);
         }
         // Guard dropped: overrides restored to none, so a later pool can't inherit them.
-        assert_eq!(bridge.backend_override_for("afd.moe_expert_compute.gate_up"), None);
+        assert_eq!(
+            bridge.backend_override_for("afd.moe_expert_compute.gate_up"),
+            None
+        );
     }
 
     #[test]
@@ -681,7 +685,10 @@ mod tests {
         let ffn = submap(&[("afd.moe_expert_compute.gate_up", &["deepgemm"])]);
         {
             let _a = bridge.with_backend_overrides("attn", Some(&attn));
-            assert_eq!(bridge.backend_override_for("afd.attn_block.qkv"), Some(vec!["fa3"]));
+            assert_eq!(
+                bridge.backend_override_for("afd.attn_block.qkv"),
+                Some(vec!["fa3"])
+            );
         }
         {
             let _f = bridge.with_backend_overrides("ffn", Some(&ffn));
@@ -749,7 +756,7 @@ mod tests {
         assert_eq!(report[0].compute_dtype, Some(super::DType::Fp8E4m3));
         assert_eq!(report[1].compute_dtype, None); // comm is dtype-agnostic
         assert_eq!(report[1].pool, ""); // deployment-level, no active pool
-        // draining leaves an empty report while still in enumerate mode.
+                                        // draining leaves an empty report while still in enumerate mode.
         assert!(bridge.take_enum_report().is_empty());
         assert!(bridge.is_enumerate());
     }
@@ -760,7 +767,10 @@ mod tests {
         let a = intern_backend("fa3");
         let b = intern_backend(&String::from("fa3"));
         assert_eq!(a, b);
-        assert!(std::ptr::eq(a, b), "same backend name must intern to one pointer");
+        assert!(
+            std::ptr::eq(a, b),
+            "same backend name must intern to one pointer"
+        );
         assert_ne!(intern_backend("fa2"), intern_backend("fa3"));
     }
 

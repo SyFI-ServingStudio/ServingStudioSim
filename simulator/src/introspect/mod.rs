@@ -49,8 +49,8 @@ enum KernelQueryRequest {
 #[derive(Serialize)]
 struct GridResponse {
     kind: String,
-    /// One-line `field=value` of the resolved config.
-    describe_config: String,
+    /// Structured resolved config; rich Dim objects retain formula provenance.
+    describe_config: Value,
     /// The Input field names a query point must carry, in `grid_axes` order:
     /// `input_fields[i]` labels `grid_axes[i]` (e.g. `["prefix_len","append_len"]`).
     input_fields: &'static [&'static str],
@@ -89,7 +89,10 @@ fn lookup(kind: &str) -> anyhow::Result<&'static KernelQueryEntry> {
                 .into_iter()
                 .map(|e| e.kind)
                 .collect();
-            anyhow::anyhow!("kernel-query: unknown kernel kind '{kind}' (have: {})", have.join(", "))
+            anyhow::anyhow!(
+                "kernel-query: unknown kernel kind '{kind}' (have: {})",
+                have.join(", ")
+            )
         })
 }
 
@@ -115,13 +118,18 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
             })?
         }
         // eval: build the kernel (JIT-profiles missing grid rows), interpolate.
-        KernelQueryRequest::Eval { kind, config, query_points } => {
+        KernelQueryRequest::Eval {
+            kind,
+            config,
+            query_points,
+        } => {
             let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
             bridge
                 .enable_jit_profiling()
                 .context("enabling JIT profiling for the fidelity grid build")?;
-            let probe = (lookup(&kind)?.build)(config, &bridge)
-                .with_context(|| format!("building '{kind}' kernel (often a missing profile.db row)"))?;
+            let probe = (lookup(&kind)?.build)(config, &bridge).with_context(|| {
+                format!("building '{kind}' kernel (often a missing profile.db row)")
+            })?;
 
             let mut results = Vec::with_capacity(query_points.len());
             for point in &query_points {
@@ -135,7 +143,10 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
                     coverage: lm.coverage.bits(),
                 });
             }
-            serde_json::to_string_pretty(&EvalResponse { kind: probe.kind().to_string(), results })?
+            serde_json::to_string_pretty(&EvalResponse {
+                kind: probe.kind().to_string(),
+                results,
+            })?
         }
     };
 

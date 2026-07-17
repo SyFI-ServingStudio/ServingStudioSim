@@ -34,12 +34,10 @@ impl<K: Probe> Op<K> {
     /// carrying the kernel's `kind`/`config` for the shape render (the old
     /// `Describe` leaf line).
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        builder.leaf_with_symbols(
+        builder.leaf(
             self.name.clone(),
             self.kernel.kind(),
             self.kernel.describe_config(),
-            self.kernel.backends(),
-            self.kernel.symbol_bindings(),
         )
     }
 
@@ -96,14 +94,8 @@ mod tests {
         fn kind(&self) -> &'static str {
             self.kind
         }
-        fn describe_config(&self) -> String {
-            self.config.to_string()
-        }
-        fn symbol_bindings(&self) -> std::collections::BTreeMap<&'static str, u32> {
-            std::collections::BTreeMap::new()
-        }
-        fn backends(&self) -> Vec<String> {
-            vec!["fake".to_string()]
+        fn describe_config(&self) -> serde_json::Value {
+            serde_json::json!({"label": self.config})
         }
     }
 
@@ -132,7 +124,10 @@ mod tests {
         // (the merged-in `Describe` leaf line).
         assert_eq!(tree.slots[0].name, "model.attn.o_proj");
         assert_eq!(tree.slots[0].kind, "single_gemm");
-        assert_eq!(tree.slots[0].config, "n=4096, k=4096");
+        assert_eq!(
+            tree.slots[0].kernel_config,
+            serde_json::json!({"label": "n=4096, k=4096"})
+        );
     }
 
     #[test]

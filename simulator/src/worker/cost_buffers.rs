@@ -299,7 +299,11 @@ impl CostBuffers {
         if cache_key.is_some() {
             let snap = SectionSnapshot {
                 agg,
-                slots: if capture { self.slots.clone() } else { Vec::new() },
+                slots: if capture {
+                    self.slots.clone()
+                } else {
+                    Vec::new()
+                },
                 slot_inputs: if capture {
                     self.slot_inputs.clone()
                 } else {
@@ -442,9 +446,7 @@ mod tests {
                 slots: vec![LeafDesc {
                     name: "m.test".to_owned(),
                     kind: "unit".to_owned(),
-                    config: "shape=1".to_owned(),
-                    backends: vec!["torch".to_owned()],
-                    symbols: Default::default(),
+                    kernel_config: serde_json::json!({"shape": 1, "backends": ["torch"]}),
                 }],
                 nodes: vec![FlatCostNode::Leaf(0)],
                 node_labels: vec![None],
@@ -479,7 +481,11 @@ mod tests {
         assert_eq!(calls.get(), 1, "identical (section, cache_key) must hit");
         // run_section returns wall Time (× gpu_time_multiplier = 1.0 here).
         assert_eq!(m0.as_ms(), 2.5);
-        assert_eq!(m1.as_ms(), 2.5, "hit replays the cached agg, not the closure");
+        assert_eq!(
+            m1.as_ms(),
+            2.5,
+            "hit replays the cached agg, not the closure"
+        );
 
         // Distinct key -> miss.
         cost.run_section("attn", 2, 0, 0, &b, Some(&kb), now, |slots, _sc, _in| {
@@ -490,12 +496,25 @@ mod tests {
         assert_eq!(calls.get(), 2, "a distinct cache_key must miss");
 
         // Distinct section, same key -> miss (section is part of the key).
-        cost.run_section("prologue", 0, 0, 0, &a, Some(&ka), now, |slots, _sc, _in| {
-            calls.set(calls.get() + 1);
-            slots.clear();
-            leaf(9.0)
-        });
-        assert_eq!(calls.get(), 3, "a distinct section must miss even with same key");
+        cost.run_section(
+            "prologue",
+            0,
+            0,
+            0,
+            &a,
+            Some(&ka),
+            now,
+            |slots, _sc, _in| {
+                calls.set(calls.get() + 1);
+                slots.clear();
+                leaf(9.0)
+            },
+        );
+        assert_eq!(
+            calls.get(),
+            3,
+            "a distinct section must miss even with same key"
+        );
 
         // `None` never caches: repeats always re-eval.
         cost.run_section("attn", 3, 0, 0, &a, None, now, |slots, _sc, _in| {
@@ -521,16 +540,34 @@ mod tests {
         let a = vec![grp(&[10, 11])];
         let now = Time::from_ms(0.0);
         // kernel-folded time = 2.5ms; wall = 2.5 × 2.0 = 5.0ms.
-        let miss = cost.run_section("attn", 0, 0, 0, &a, Some(&[7u32]), now, |slots, _sc, _in| {
-            slots.clear();
-            leaf(2.5)
-        });
+        let miss = cost.run_section(
+            "attn",
+            0,
+            0,
+            0,
+            &a,
+            Some(&[7u32]),
+            now,
+            |slots, _sc, _in| {
+                slots.clear();
+                leaf(2.5)
+            },
+        );
         assert_eq!(miss.as_ms(), 5.0);
         // A cache hit (same section+key) replays the same scaled wall Time.
-        let hit = cost.run_section("attn", 1, 0, 0, &a, Some(&[7u32]), now, |slots, _sc, _in| {
-            slots.clear();
-            leaf(999.0)
-        });
+        let hit = cost.run_section(
+            "attn",
+            1,
+            0,
+            0,
+            &a,
+            Some(&[7u32]),
+            now,
+            |slots, _sc, _in| {
+                slots.clear();
+                leaf(999.0)
+            },
+        );
         assert_eq!(hit.as_ms(), 5.0);
     }
 
@@ -578,7 +615,11 @@ mod tests {
             .build()
             .unwrap();
         let batch = reader.next().unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 3, "every call (hit or miss) emits one row");
+        assert_eq!(
+            batch.num_rows(),
+            3,
+            "every call (hit or miss) emits one row"
+        );
         // Schema column order: 5 = total_time_ms, 12 = layer (see cost_log_schema).
         let ttm = batch
             .column(5)
@@ -592,7 +633,10 @@ mod tests {
             .unwrap();
         assert_eq!((layer.value(0), layer.value(1), layer.value(2)), (0, 1, 2));
         assert!((ttm.value(0) - 2.5).abs() < 1e-9);
-        assert!((ttm.value(1) - 2.5).abs() < 1e-9, "hit re-logs the cached time");
+        assert!(
+            (ttm.value(1) - 2.5).abs() < 1e-9,
+            "hit re-logs the cached time"
+        );
         assert!((ttm.value(2) - 3.0).abs() < 1e-9);
     }
 }

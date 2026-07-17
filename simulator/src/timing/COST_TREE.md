@@ -78,8 +78,9 @@ reused by the worker/model across iterations.
 Identity lives **only** in compile-time products, never in `FlatCostNode`, the
 `aggregate` pass, or log rows:
 
-- **`LeafDesc`** (`slots[i]`) — the dotted leaf `name` + the kernel `kind` /
-  one-line `config` summary, captured at compile for the shape render.
+- **`LeafDesc`** (`slots[i]`) — the dotted leaf `name` + kernel `kind` and
+  structured `kernel_config`, captured at compile for downstream cache queries;
+  presentation derives any human-readable summary from that JSON.
 - **`CostManifest`** — the per-worker
   `cost_manifest/worker_<pool_tag>_<worker_id>.json` sidecar: `slots` + the
   flat `nodes` + `node_labels` (index-aligned to `nodes`; recovers the

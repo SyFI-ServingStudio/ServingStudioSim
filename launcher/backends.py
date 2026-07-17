@@ -21,7 +21,6 @@ annotation is derived from `config`.
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -34,9 +33,6 @@ from profiling.db.registry import backend_supports, known_backends, supported_ba
 
 from .exec import _build_subprocess_env, binary_path
 
-# `key=value` in a describe_config, value = a bracket list / a quoted string / a
-# bare run (order matters: try the delimited forms before the greedy `\S+`).
-_KV_RE = re.compile(r"(\w+)=(\[[^\]]*\]|\"[^\"]*\"|\S+)")
 # describe_config tokens that are NOT geometry: the candidate set, the GPU
 # identity, the dtype columns (surfaced separately as `dtype=…`), and the
 # per-expert routing load (a workload signal, and 16+ ints of noise). Whatever
@@ -60,8 +56,17 @@ def _dtype(wire: str | None) -> DType | None:
     return DType(wire) if wire else None
 
 
-def _parse_shape(config: str) -> str:
-    """The kernel's geometry from its `describe_config` — every `key=value` except
+def _display_config_value(value: object) -> str:
+    if isinstance(value, dict) and "value" in value:
+        expression = value.get("expression")
+        return f"{expression}={value['value']}" if expression else str(value["value"])
+    if isinstance(value, list):
+        return json.dumps(value, separators=(",", ":"))
+    return str(value)
+
+
+def _parse_shape(config: dict[str, object]) -> str:
+    """The kernel's geometry from structured `describe_config` — every field except
     the candidate set, GPU identity, dtype columns, and routing load (see
     `_SHAPE_NOISE_KEYS`). E.g. attention → `num_qo_heads=16 num_kv_heads=1
     head_dim=128`, a GEMM → `n=6144 k=4096`, comm → `num_gpus=4 fabric=Nvlink`.
@@ -70,7 +75,9 @@ def _parse_shape(config: str) -> str:
     tp/ep sweep. The backend map keys on the shape-invariant role NAME, never on
     this, so shape is informational only (a skeleton annotation), never a key."""
     return " ".join(
-        f"{k}={v}" for k, v in _KV_RE.findall(config) if k not in _SHAPE_NOISE_KEYS
+        f"{key}={_display_config_value(value)}"
+        for key, value in config.items()
+        if key not in _SHAPE_NOISE_KEYS
     )
 
 
@@ -130,9 +137,7 @@ def enumerate_kernels(config: dict, build_type: str = "debug") -> list[dict]:
     launcher-internal `_`-keys stripped) and return the JSON records. Structural
     build only — no GPU, no `profile.db`."""
     binary = binary_path(build_type)
-    stripped = {
-        k: v for k, v in config.items() if k != "backends" and not k.startswith("_")
-    }
+    stripped = {k: v for k, v in config.items() if k != "backends" and not k.startswith("_")}
     with tempfile.TemporaryDirectory() as td:
         # Redirect the build's log_dir into the throwaway temp dir: building the
         # flow writes cost_manifest / cost_log sidecars, which must NOT land in
@@ -141,9 +146,7 @@ def enumerate_kernels(config: dict, build_type: str = "debug") -> list[dict]:
         io["log_dir"] = td
         stripped["io"] = io
         cfg_path = Path(td) / "emit.yaml"
-        cfg_path.write_text(
-            yaml.safe_dump(stripped, default_flow_style=False, sort_keys=False)
-        )
+        cfg_path.write_text(yaml.safe_dump(stripped, default_flow_style=False, sort_keys=False))
         proc = subprocess.run(
             [str(binary), "emit-backends", str(cfg_path)],
             capture_output=True,
@@ -292,9 +295,7 @@ def render_skeleton(roles: list[Role], pool_arch: dict[str, str] | None = None) 
         names = ", ".join(
             f"{r.name} ({r.kind}{', ' + r.shape if r.shape else ''})" for r in deployment
         )
-        lines.append(
-            f"\n# deployment-level kernels (not per-pool overridable): {names}"
-        )
+        lines.append(f"\n# deployment-level kernels (not per-pool overridable): {names}")
     return "\n".join(lines) + "\n"
 
 
@@ -335,9 +336,7 @@ def validate_backend_map(nested: dict, roles: list[Role]) -> list[str]:
                         f"{pool}/{name}: unknown backend {be!r} for {role.kind} "
                         f"(registered: {known})"
                     )
-                elif not backend_supports(
-                    role.kind, be, role.compute, role.kv, role.gpu
-                ):
+                elif not backend_supports(role.kind, be, role.compute, role.kv, role.gpu):
                     at = f"dtype={role.compute.value if role.compute else 'any'}"
                     if role.gpu:
                         at += f", gpu={role.gpu}"
@@ -361,9 +360,7 @@ def _structure_key(candidate: dict) -> str:
     launcher-internal `_`-keys — so two runs that differ only in backend values
     (a backend-only sweep) share one structure and are enumerated once, while an
     fp8 / quant sweep (which changes kernel dtypes) re-enumerates."""
-    tree = {
-        k: v for k, v in candidate.items() if k != "backends" and not k.startswith("_")
-    }
+    tree = {k: v for k, v in candidate.items() if k != "backends" and not k.startswith("_")}
     io = tree.get("io")
     if isinstance(io, dict):
         tree["io"] = {k: v for k, v in io.items() if k != "log_dir"}

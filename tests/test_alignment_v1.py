@@ -316,10 +316,26 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
         "sections": [
             {
                 "section": "iter",
+                # Deliberately pin an archived manifest shape here: the current
+                # simulator writes `kernel_config`, while Analyzer must still be
+                # able to re-analyze runs written with `config` and `backends`.
                 "slots": [
-                    {"name": "unified.qkv", "kind": "single_gemm", "config": ""},
-                    {"name": "unified.attn", "kind": "flashinfer_attn_decode", "config": ""},
-                    {"name": "unified.attn.combine", "kind": "elementwise", "config": ""},
+                    {
+                        "name": "unified.qkv",
+                        "kind": "single_gemm",
+                        "config": "n=6144 k=4096",
+                        "backends": ["torch", "torch_linear"],
+                    },
+                    {
+                        "name": "unified.attn",
+                        "kind": "flashinfer_attn_decode",
+                        "config": "",
+                    },
+                    {
+                        "name": "unified.attn.combine",
+                        "kind": "elementwise",
+                        "config": "",
+                    },
                     {"name": "unified.lm_head", "kind": "single_gemm", "config": ""},
                 ],
                 "nodes": [

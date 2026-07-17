@@ -747,8 +747,7 @@ mod tests {
         LeafDesc {
             name: name.into(),
             kind: "k".into(),
-            config: String::new(),
-            backends: Vec::new(),
+            kernel_config: json!({"backends": []}),
         }
     }
 

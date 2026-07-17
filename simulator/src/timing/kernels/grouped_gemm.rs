@@ -19,7 +19,7 @@ use crate::timing::routing::RoutingDistribution;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GroupedGemmKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
@@ -124,7 +124,12 @@ mod tests {
     fn describe_config_renders_every_field_in_order() {
         assert_eq!(
             config().describe_config(),
-            r#"backends=["torch"] gpu_name="H100" n=4096 k=8192 dtype=Bf16 local_ppm=[300000, 200000]"#
+            serde_json::json!({
+                "backends": ["torch"], "gpu_name": "H100",
+                "n": {"value": 4096, "expression": null, "bindings": {}},
+                "k": {"value": 8192, "expression": null, "bindings": {}},
+                "dtype": "bf16", "local_ppm": [300000, 200000],
+            })
         );
     }
 
@@ -156,7 +161,10 @@ mod tests {
         }
         // 32 appears once (deduped against token_axis), 48 sits before 64.
         assert_eq!(axis.iter().filter(|&&v| v == 32.0).count(), 1);
-        assert!(axis.windows(2).all(|w| w[0] < w[1]), "axis must be strictly increasing");
+        assert!(
+            axis.windows(2).all(|w| w[0] < w[1]),
+            "axis must be strictly increasing"
+        );
     }
 
     #[test]

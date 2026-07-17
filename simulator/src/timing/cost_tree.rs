@@ -17,7 +17,7 @@
 //! in log rows (INV-5). `Max`/`Scale` are defined for the full algebra even
 //! though the dense vertical only emits `Leaf`/`Sum`/`Scale`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt::Write;
 use std::ops::Range;
 
@@ -72,28 +72,14 @@ pub enum FlatCostNode {
     },
 }
 
-/// Per-slot manifest entry: the dotted leaf name plus the kernel identity folded
-/// in from the old `Describe` trait — `kind` is the kernel KIND tag and `config`
-/// the one-line shape/dtype summary (`KernelConfig::describe_config`). Captured at
-/// compile so [`CostTree::describe`] is the sole shape renderer.
-///
-/// `backends` is the leaf's ordered candidate backend list, the structured form of
-/// what `config` renders inline. Its order is the index space of the `cost_log`
-/// `slot_backend` column (`backends[slot_backend]` names the selected backend), so
-/// an analyzer never parses the human-readable `config` string.
+/// Per-slot manifest entry: the dotted leaf name plus its kernel identity.
+/// `kernel_config` is authoritative machine-readable input; display summaries
+/// are derived at presentation boundaries rather than duplicated here.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LeafDesc {
     pub name: String,
     pub kind: String,
-    pub config: String,
-    pub backends: Vec<String>,
-    /// The leaf's `symbol -> value` legend: every named input in this leaf's
-    /// `Dim` formulas (`{num_qo_heads: 64, attn_tp: 4, head_dim: 128, …}`), so a
-    /// consumer can resolve the `config` expression to its concrete parts (the
-    /// expression↔value toggle). Empty for comm / no-shape leaves. Skipped from
-    /// JSON when empty so existing manifests are byte-compatible.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub symbols: BTreeMap<String, u32>,
+    pub kernel_config: serde_json::Value,
 }
 
 /// Serializable description of a compiled [`CostTree`] — the per-worker
@@ -196,37 +182,20 @@ impl CostTreeBuilder {
     }
 
     /// Allocate the next slot for a materialized leaf and return its [`CostNode`].
-    /// `kind`/`config` carry the kernel identity for the shape render (the old
-    /// `Describe` leaf line); `backends` is the leaf's ordered candidate list (the
-    /// index space of the `cost_log` `slot_backend` column).
+    /// `kind` + `kernel_config` are the complete kernel identity. In particular,
+    /// `kernel_config.backends` defines the `slot_backend` index space and each
+    /// rich `Dim` embeds its own formula bindings.
     pub fn leaf(
         &mut self,
         name: impl Into<String>,
         kind: impl Into<String>,
-        config: impl Into<String>,
-        backends: Vec<String>,
-    ) -> CostNode {
-        self.leaf_with_symbols(name, kind, config, backends, BTreeMap::new())
-    }
-
-    /// [`Self::leaf`] plus the leaf's `symbol -> value` legend (from the kernel
-    /// config's `Dim` fields, via `Probe::symbol_bindings`). Keys are the
-    /// `&'static str` symbol names, owned here for the serializable [`LeafDesc`].
-    pub fn leaf_with_symbols(
-        &mut self,
-        name: impl Into<String>,
-        kind: impl Into<String>,
-        config: impl Into<String>,
-        backends: Vec<String>,
-        symbols: BTreeMap<&'static str, u32>,
+        kernel_config: serde_json::Value,
     ) -> CostNode {
         let slot = self.slots.len();
         self.slots.push(LeafDesc {
             name: name.into(),
             kind: kind.into(),
-            config: config.into(),
-            backends,
-            symbols: symbols.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            kernel_config,
         });
         CostNode::Leaf(slot)
     }
@@ -473,7 +442,12 @@ impl CostTree {
         match node {
             CostNode::Leaf(slot) => {
                 let d = &self.slots[*slot];
-                writeln!(out, "{ind}Leaf#{slot} {} ({}) {}", d.name, d.kind, d.config).unwrap()
+                writeln!(
+                    out,
+                    "{ind}Leaf#{slot} {} ({}) {}",
+                    d.name, d.kind, d.kernel_config
+                )
+                .unwrap()
             }
             CostNode::Sum(children) => {
                 writeln!(out, "{ind}Sum").unwrap();
@@ -507,38 +481,32 @@ mod tests {
     /// the dense shape in miniature (a fold wrapping a 2-leaf subtree).
     fn sample() -> CostTree {
         let mut b = CostTreeBuilder::new();
-        let a = b.leaf("a", "ka", "x=1", vec![]);
+        let a = b.leaf("a", "ka", serde_json::json!({"x": 1}));
         let layer = CostNode::Scale {
             n: 3,
             child: Box::new(CostNode::Sum(vec![
-                b.leaf("b", "kb", "x=2", vec![]),
-                b.leaf("c", "kc", "x=3", vec![]),
+                b.leaf("b", "kb", serde_json::json!({"x": 2})),
+                b.leaf("c", "kc", serde_json::json!({"x": 3})),
             ])),
         };
-        let d = b.leaf("d", "kd", "x=4", vec![]);
+        let d = b.leaf("d", "kd", serde_json::json!({"x": 4}));
         b.finish(CostNode::Sum(vec![a, layer, d]))
     }
 
     #[test]
-    fn leaf_desc_carries_symbols_and_skips_when_empty() {
-        // `leaf_with_symbols` captures the per-leaf legend; it serializes under a
-        // `symbols` key and is omitted entirely when empty (manifest byte-compat).
+    fn leaf_desc_carries_only_structured_kernel_config() {
         let mut b = CostTreeBuilder::new();
-        let mut syms = BTreeMap::new();
-        syms.insert("attn_tp", 4u32);
-        syms.insert("num_qo_heads", 64u32);
-        b.leaf_with_symbols("m.qkv", "single_gemm", "n=…", vec![], syms);
-        b.leaf("m.comm", "p2p_inter", "", vec![]); // no Dim fields → empty
-        let tree = b.finish(CostNode::Sum(vec![CostNode::Leaf(0), CostNode::Leaf(1)]));
-
-        assert_eq!(tree.slots[0].symbols.get("attn_tp"), Some(&4));
-        assert_eq!(tree.slots[0].symbols.get("num_qo_heads"), Some(&64));
-        assert!(tree.slots[1].symbols.is_empty());
-
-        let with = serde_json::to_string(&tree.slots[0]).unwrap();
-        assert!(with.contains(r#""symbols""#) && with.contains(r#""attn_tp":4"#));
-        let empty = serde_json::to_string(&tree.slots[1]).unwrap();
-        assert!(!empty.contains("symbols")); // skip_serializing_if empty
+        b.leaf(
+            "m.qkv",
+            "single_gemm",
+            serde_json::json!({"backends": ["torch"], "n": {"value": 64}}),
+        );
+        let tree = b.finish(CostNode::Leaf(0));
+        let value = serde_json::to_value(&tree.slots[0]).unwrap();
+        assert_eq!(value["kernel_config"]["n"]["value"], 64);
+        assert!(value.get("config").is_none());
+        assert!(value.get("backends").is_none());
+        assert!(value.get("symbols").is_none());
     }
 
     #[test]
@@ -554,12 +522,12 @@ mod tests {
     fn describe_renders_fold_and_leaves() {
         let expected = "\
 Sum
-│  Leaf#0 a (ka) x=1
+│  Leaf#0 a (ka) {\"x\":1}
 │  Scale{n=3}
 │  │  Sum
-│  │  │  Leaf#1 b (kb) x=2
-│  │  │  Leaf#2 c (kc) x=3
-│  Leaf#3 d (kd) x=4
+│  │  │  Leaf#1 b (kb) {\"x\":2}
+│  │  │  Leaf#2 c (kc) {\"x\":3}
+│  Leaf#3 d (kd) {\"x\":4}
 ";
         assert_eq!(sample().describe(), expected);
     }
@@ -570,7 +538,11 @@ Sum
         // annotation) above its child — the "no less than describe" guard: the
         // leaf still carries its kernel kind + config.
         let mut b = CostTreeBuilder::new();
-        let leaf = b.leaf("w.norm", "rms_norm", "hidden=4096, dtype=Bf16", vec![]);
+        let leaf = b.leaf(
+            "w.norm",
+            "rms_norm",
+            serde_json::json!({"hidden": 4096, "dtype": "bf16"}),
+        );
         let tree = b.finish(CostNode::Labeled {
             label: "w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]".to_string(),
             child: Box::new(CostNode::Sum(vec![leaf])),
@@ -578,7 +550,7 @@ Sum
         let expected = "\
 w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
 │  Sum
-│  │  Leaf#0 w.norm (rms_norm) hidden=4096, dtype=Bf16
+│  │  Leaf#0 w.norm (rms_norm) {\"hidden\":4096,\"dtype\":\"bf16\"}
 ";
         assert_eq!(tree.describe(), expected);
         // Labeled is cost-transparent: flatten drops it, leaving Sum→Leaf only.
@@ -610,15 +582,22 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
             child: Box::new(CostNode::Sum(vec![b.leaf(
                 "m.pre_attn.norm",
                 "rms_norm",
-                "",
-                vec![],
+                serde_json::json!({}),
             )])),
         };
         let attn = CostNode::Labeled {
             label: "m.attn (AttnLocalWorklet)".to_string(),
             child: Box::new(CostNode::Sum(vec![
-                b.leaf("m.attn.prefill", "flashinfer_attn_prefill", "", vec![]),
-                b.leaf("m.attn.decode", "flashinfer_attn_decode", "", vec![]),
+                b.leaf(
+                    "m.attn.prefill",
+                    "flashinfer_attn_prefill",
+                    serde_json::json!({}),
+                ),
+                b.leaf(
+                    "m.attn.decode",
+                    "flashinfer_attn_decode",
+                    serde_json::json!({}),
+                ),
             ])),
         };
         let tree = b.finish(CostNode::Sum(vec![pre, attn]));
@@ -708,7 +687,10 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
         let mut b = CostTreeBuilder::new();
         let root = CostNode::Max {
             overlap: 2.0,
-            children: vec![b.leaf("x", "kx", "", vec![]), b.leaf("y", "ky", "", vec![])],
+            children: vec![
+                b.leaf("x", "kx", serde_json::json!({})),
+                b.leaf("y", "ky", serde_json::json!({})),
+            ],
         };
         let flat = b.finish(root).flatten();
         let buf = [leaf(4.0, 10.0, 100.0), leaf(6.0, 20.0, 200.0)];

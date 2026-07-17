@@ -12,7 +12,7 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SingleGemmKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
@@ -99,13 +99,16 @@ mod tests {
             k: 8192.into(),
             dtype: DType::Bf16,
         };
-        // Every field in declaration order, no struct-name/braces wrapper.
         assert_eq!(
             cfg.describe_config(),
-            r#"backends=["torch"] gpu_name="H100" n=8192 k=8192 dtype=Bf16"#
+            serde_json::json!({
+                "backends": ["torch"], "gpu_name": "H100",
+                "n": {"value": 8192, "expression": null, "bindings": {}},
+                "k": {"value": 8192, "expression": null, "bindings": {}},
+                "dtype": "bf16",
+            })
         );
 
-        // A Vec field renders via `{:?}` — standard bracketed, comma-separated.
         let multi = SingleGemmKernelConfig {
             backends: vec!["torch", "triton"],
             gpu_name: "H100".to_string(),
@@ -115,7 +118,12 @@ mod tests {
         };
         assert_eq!(
             multi.describe_config(),
-            r#"backends=["torch", "triton"] gpu_name="H100" n=8192 k=8192 dtype=Bf16"#
+            serde_json::json!({
+                "backends": ["torch", "triton"], "gpu_name": "H100",
+                "n": {"value": 8192, "expression": null, "bindings": {}},
+                "k": {"value": 8192, "expression": null, "bindings": {}},
+                "dtype": "bf16",
+            })
         );
     }
 

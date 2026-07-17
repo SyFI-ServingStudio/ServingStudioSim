@@ -1,8 +1,8 @@
 """Unit tests for the per-kernel backend-selection launcher module.
 
 CPU tier (unmarked): these drive `launcher.backends` with SYNTHETIC
-`emit-backends` records (the JSON the Rust enumerator would emit — dtype/gpu are
-TYPED fields, only shape stays a `config` string), so no binary / GPU is needed.
+`emit-backends` records (the JSON the Rust enumerator would emit — config,
+dtype, and GPU are typed fields), so no binary / GPU is needed.
 They assert shape parsing, dedup/count, skeleton render, and — against the real
 `profiling.db.registry` capability table — the validation gate, including the
 two-axis `fa2` bf16-query/fp8-KV case (the current prod config).
@@ -40,26 +40,53 @@ def _rec(pool, name, kind, config, backends, *, compute=None, kv=None, gpu=None)
     }
 
 
+def _dim(value, expression=None, bindings=None):
+    return {"value": value, "expression": expression, "bindings": bindings or {}}
+
+
 # ── shape parsing (geometry tokens, dtype/backends/gpu/routing stripped) ──────
 
 
 def test_parse_shape_keeps_geometry_drops_noise():
     # attention: heads/dim kept; backends, gpu_name, all dtype columns dropped.
-    cfg = ('backends=["fa2", "fa3"] gpu_name="NVIDIA H200" num_qo_heads=16 '
-           "num_kv_heads=1 head_dim=128 q_dtype=Bf16 kv_dtype=Bf16 o_dtype=Bf16")
+    cfg = {
+        "backends": ["fa2", "fa3"],
+        "gpu_name": "NVIDIA H200",
+        "num_qo_heads": _dim(16),
+        "num_kv_heads": _dim(1),
+        "head_dim": _dim(128),
+        "q_dtype": "bf16",
+        "kv_dtype": "bf16",
+        "o_dtype": "bf16",
+    }
     assert _parse_shape(cfg) == "num_qo_heads=16 num_kv_heads=1 head_dim=128"
 
 
 def test_parse_shape_gemm_and_drops_routing_load():
     # grouped GEMM: n/k kept; the 16-int per-expert local_ppm routing load dropped.
-    cfg = ('backends=["deepgemm"] gpu_name="NVIDIA H200" n=6144 k=4096 '
-           "dtype=Fp8E4m3 local_ppm=[7812, 7812, 7812, 7812]")
+    cfg = {
+        "backends": ["deepgemm"],
+        "gpu_name": "NVIDIA H200",
+        "n": _dim(6144),
+        "k": _dim(4096),
+        "dtype": "fp8_e4m3",
+        "local_ppm": [7812, 7812, 7812, 7812],
+    }
     assert _parse_shape(cfg) == "n=6144 k=4096"
 
 
 def test_parse_shape_comm_keeps_fabric():
-    assert _parse_shape('backends=["nccl"] gpu_name="NVIDIA H200" num_gpus=4 '
-                        "fabric=Nvlink") == "num_gpus=4 fabric=Nvlink"
+    assert (
+        _parse_shape(
+            {
+                "backends": ["nccl"],
+                "gpu_name": "NVIDIA H200",
+                "num_gpus": 4,
+                "fabric": "nvlink",
+            }
+        )
+        == "num_gpus=4 fabric=nvlink"
+    )
 
 
 # ── dedup + occurrence count ─────────────────────────────────────────────────
@@ -67,9 +94,27 @@ def test_parse_shape_comm_keeps_fabric():
 
 def test_dedup_counts_reused_roles():
     recs = [
-        _rec("ffn", "afd.moe_expert_compute.gate_up", "grouped_gemm", "k=1 dtype=Fp8E4m3", ["deepgemm"]),
-        _rec("ffn", "afd.moe_expert_compute.gate_up", "grouped_gemm", "k=1 dtype=Fp8E4m3", ["deepgemm"]),
-        _rec("ffn", "afd.lm_head", "single_gemm", "n=1 k=1 dtype=Bf16", ["torch"]),
+        _rec(
+            "ffn",
+            "afd.moe_expert_compute.gate_up",
+            "grouped_gemm",
+            {"k": _dim(1), "dtype": "fp8_e4m3"},
+            ["deepgemm"],
+        ),
+        _rec(
+            "ffn",
+            "afd.moe_expert_compute.gate_up",
+            "grouped_gemm",
+            {"k": _dim(1), "dtype": "fp8_e4m3"},
+            ["deepgemm"],
+        ),
+        _rec(
+            "ffn",
+            "afd.lm_head",
+            "single_gemm",
+            {"n": _dim(1), "k": _dim(1), "dtype": "bf16"},
+            ["torch"],
+        ),
     ]
     roles = dedup_roles(recs)
     assert [r.key for r in roles] == ["ffn/afd.moe_expert_compute.gate_up", "ffn/afd.lm_head"]
@@ -81,16 +126,38 @@ def test_dedup_counts_reused_roles():
 
 
 def _afd_roles():
-    return dedup_roles([
-        _rec("attn", "afd.attn.prefill", "flashinfer_attn_prefill",
-             "q_dtype=Bf16 kv_dtype=Bf16 o_dtype=Bf16", ["fa2", "fa3"],
-             compute=DType.BF16, kv=DType.BF16),
-        _rec("ffn", "afd.moe_expert_compute.gate_up", "grouped_gemm", "dtype=Fp8E4m3",
-             ["deepgemm"], compute=DType.FP8_E4M3),
-        _rec("ffn", "afd.moe_expert_compute.gate_up", "grouped_gemm", "dtype=Fp8E4m3",
-             ["deepgemm"], compute=DType.FP8_E4M3),
-        _rec("", "afd_qkv_transfer", "p2p_inter", "fabric=Infiniband", ["nccl", "nvshmem"]),
-    ])
+    return dedup_roles(
+        [
+            _rec(
+                "attn",
+                "afd.attn.prefill",
+                "flashinfer_attn_prefill",
+                {"q_dtype": "bf16", "kv_dtype": "bf16", "o_dtype": "bf16"},
+                ["fa2", "fa3"],
+                compute=DType.BF16,
+                kv=DType.BF16,
+            ),
+            _rec(
+                "ffn",
+                "afd.moe_expert_compute.gate_up",
+                "grouped_gemm",
+                {"dtype": "fp8_e4m3"},
+                ["deepgemm"],
+                compute=DType.FP8_E4M3,
+            ),
+            _rec(
+                "ffn",
+                "afd.moe_expert_compute.gate_up",
+                "grouped_gemm",
+                {"dtype": "fp8_e4m3"},
+                ["deepgemm"],
+                compute=DType.FP8_E4M3,
+            ),
+            _rec(
+                "", "afd_qkv_transfer", "p2p_inter", {"fabric": "infiniband"}, ["nccl", "nvshmem"]
+            ),
+        ]
+    )
 
 
 def test_render_skeleton_shape():
@@ -110,33 +177,60 @@ def test_render_skeleton_shape():
 
 
 def test_render_skeleton_annotates_shape():
-    roles = dedup_roles([
-        _rec("attn", "afd.attn.prefill", "flashinfer_attn_prefill",
-             'backends=["fa2"] gpu_name="H200" num_qo_heads=16 num_kv_heads=1 '
-             "head_dim=128 q_dtype=Bf16 kv_dtype=Bf16 o_dtype=Bf16", ["fa2", "fa3"],
-             compute=DType.BF16, kv=DType.BF16),
-        _rec("ffn", "afd.lm_head", "single_gemm",
-             'backends=["deepgemm"] n=152064 k=4096 dtype=Fp8E4m3', ["deepgemm"],
-             compute=DType.FP8_E4M3),
-        # a comm kernel with no geometry beyond fabric, at the deployment level.
-        _rec("", "afd_qkv_transfer", "p2p_inter",
-             'backends=["nccl"] fabric=Infiniband', ["nccl", "nvshmem"]),
-    ])
+    roles = dedup_roles(
+        [
+            _rec(
+                "attn",
+                "afd.attn.prefill",
+                "flashinfer_attn_prefill",
+                {
+                    "backends": ["fa2"],
+                    "gpu_name": "H200",
+                    "num_qo_heads": _dim(16),
+                    "num_kv_heads": _dim(1),
+                    "head_dim": _dim(128),
+                    "q_dtype": "bf16",
+                    "kv_dtype": "bf16",
+                    "o_dtype": "bf16",
+                },
+                ["fa2", "fa3"],
+                compute=DType.BF16,
+                kv=DType.BF16,
+            ),
+            _rec(
+                "ffn",
+                "afd.lm_head",
+                "single_gemm",
+                {"backends": ["deepgemm"], "n": _dim(152064), "k": _dim(4096), "dtype": "fp8_e4m3"},
+                ["deepgemm"],
+                compute=DType.FP8_E4M3,
+            ),
+            # a comm kernel with no geometry beyond fabric, at the deployment level.
+            _rec(
+                "",
+                "afd_qkv_transfer",
+                "p2p_inter",
+                {"backends": ["nccl"], "fabric": "infiniband"},
+                ["nccl", "nvshmem"],
+            ),
+        ]
+    )
     text = render_skeleton(roles)
     # geometry surfaced in-line; dtype columns and the candidate set are NOT.
     assert "shape: num_qo_heads=16 num_kv_heads=1 head_dim=128" in text
     assert "shape: n=152064 k=4096" in text
     assert "kv_dtype" not in text  # dtype columns never leak into the shape note
     # deployment-level kernel shows its fabric in the trailing note.
-    assert "afd_qkv_transfer (p2p_inter, fabric=Infiniband)" in text
+    assert "afd_qkv_transfer (p2p_inter, fabric=infiniband)" in text
 
 
 # ── multi-variant reconcile (emit across a sweep) ────────────────────────────
 
 
 def _r(pool, name, shape, kind="single_gemm", default=("deepgemm",)):
-    return Role(pool=pool, name=name, kind=kind, compute=None, kv=None,
-                default=list(default), shape=shape)
+    return Role(
+        pool=pool, name=name, kind=kind, compute=None, kv=None, default=list(default), shape=shape
+    )
 
 
 def test_merge_variants_same_roles_marks_varying_shape():
@@ -194,16 +288,36 @@ def test_validate_unknown_role():
 
 def test_validate_incompatible_backend_kind():
     # `fa2` is not a single_gemm backend at all.
-    roles = dedup_roles([_rec("main", "m.qkv", "single_gemm", "n=1 k=1 dtype=Bf16",
-                              ["torch"], compute=DType.BF16)])
+    roles = dedup_roles(
+        [
+            _rec(
+                "main",
+                "m.qkv",
+                "single_gemm",
+                {"n": _dim(1), "k": _dim(1), "dtype": "bf16"},
+                ["torch"],
+                compute=DType.BF16,
+            )
+        ]
+    )
     errs = validate_backend_map({"main": {"m.qkv": ["fa2"]}}, roles)
     assert any("unknown backend 'fa2' for single_gemm" in e for e in errs)
 
 
 def test_validate_incompatible_backend_dtype():
     # torch has no fp8 rows — torch@fp8 is a registered-but-incompatible combo.
-    roles = dedup_roles([_rec("ffn", "g", "single_gemm", "n=1 k=1 dtype=Fp8E4m3",
-                              ["deepgemm"], compute=DType.FP8_E4M3)])
+    roles = dedup_roles(
+        [
+            _rec(
+                "ffn",
+                "g",
+                "single_gemm",
+                {"n": _dim(1), "k": _dim(1), "dtype": "fp8_e4m3"},
+                ["deepgemm"],
+                compute=DType.FP8_E4M3,
+            )
+        ]
+    )
     errs = validate_backend_map({"ffn": {"g": ["torch"]}}, roles)
     assert any("unsupported for single_gemm at dtype=fp8_e4m3" in e for e in errs)
 
@@ -227,9 +341,20 @@ def test_emit_filters_and_rejects_backends_by_gpu():
     # An fp8 attention role carries its run GPU (parsed from `gpu_name=`); the
     # options column and the validator both honour the capability GPU axis.
     def prefill_role(gpu, backends):
-        return dedup_roles([_rec("attn", "afd.attn.prefill", "flashinfer_attn_prefill",
-            f'gpu_name="{gpu}" q_dtype=Fp8E4m3 kv_dtype=Fp8E4m3', backends,
-            compute=DType.FP8_E4M3, kv=DType.FP8_E4M3, gpu=gpu)])[0]
+        return dedup_roles(
+            [
+                _rec(
+                    "attn",
+                    "afd.attn.prefill",
+                    "flashinfer_attn_prefill",
+                    {"gpu_name": gpu, "q_dtype": "fp8_e4m3", "kv_dtype": "fp8_e4m3"},
+                    backends,
+                    compute=DType.FP8_E4M3,
+                    kv=DType.FP8_E4M3,
+                    gpu=gpu,
+                )
+            ]
+        )[0]
 
     h200 = prefill_role("NVIDIA H200", ["fa3"])
     assert h200.gpu == "NVIDIA H200"
@@ -245,11 +370,19 @@ def test_emit_filters_and_rejects_backends_by_gpu():
 def test_fa2_bf16_query_fp8_kv_is_valid():
     # THE two-axis case: fa2 with bf16 query + fp8 KV cache — the current prod
     # config. Must validate (fp8 *compute* would not, but fp8 *KV* alone does).
-    roles = dedup_roles([
-        _rec("attn", "afd.attn.prefill", "flashinfer_attn_prefill",
-             "q_dtype=Bf16 kv_dtype=Fp8E4m3 o_dtype=Bf16", ["fa2", "fa3"],
-             compute=DType.BF16, kv=DType.FP8_E4M3),
-    ])
+    roles = dedup_roles(
+        [
+            _rec(
+                "attn",
+                "afd.attn.prefill",
+                "flashinfer_attn_prefill",
+                {"q_dtype": "bf16", "kv_dtype": "fp8_e4m3", "o_dtype": "bf16"},
+                ["fa2", "fa3"],
+                compute=DType.BF16,
+                kv=DType.FP8_E4M3,
+            ),
+        ]
+    )
     assert validate_backend_map({"attn": {"afd.attn.prefill": ["fa2"]}}, roles) == []
     # cudnn is bf16-only on the KV axis → rejected for fp8 KV.
     errs = validate_backend_map({"attn": {"afd.attn.prefill": ["cudnn"]}}, roles)

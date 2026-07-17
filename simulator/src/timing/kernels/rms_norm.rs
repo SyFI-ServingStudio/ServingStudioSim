@@ -15,7 +15,7 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RmsNormKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
@@ -92,13 +92,15 @@ mod tests {
             hidden: 8192.into(),
             dtype: DType::Bf16,
         };
-        // Every field in declaration order, no struct-name/braces wrapper.
         assert_eq!(
             cfg.describe_config(),
-            r#"backends=["flashinfer"] gpu_name="H100" hidden=8192 dtype=Bf16"#
+            serde_json::json!({
+                "backends": ["flashinfer"], "gpu_name": "H100",
+                "hidden": {"value": 8192, "expression": null, "bindings": {}},
+                "dtype": "bf16",
+            })
         );
 
-        // A Vec field renders via `{:?}` — standard bracketed, comma-separated.
         let multi = RmsNormKernelConfig {
             backends: vec!["flashinfer", "triton"],
             gpu_name: "H100".to_string(),
@@ -107,7 +109,11 @@ mod tests {
         };
         assert_eq!(
             multi.describe_config(),
-            r#"backends=["flashinfer", "triton"] gpu_name="H100" hidden=8192 dtype=Bf16"#
+            serde_json::json!({
+                "backends": ["flashinfer", "triton"], "gpu_name": "H100",
+                "hidden": {"value": 8192, "expression": null, "bindings": {}},
+                "dtype": "bf16",
+            })
         );
     }
 

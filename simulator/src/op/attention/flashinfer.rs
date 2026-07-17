@@ -136,19 +136,16 @@ impl FlashInferAttentionOp {
                 format!("{}.kv_cache_append", self.name),
                 self.kv_cache_append.kind(),
                 self.kv_cache_append.describe_config(),
-                self.kv_cache_append.backends(),
             ),
             builder.leaf(
                 format!("{}.prefill", self.name),
                 self.prefill.kind(),
                 self.prefill.describe_config(),
-                self.prefill.backends(),
             ),
             builder.leaf(
                 format!("{}.decode", self.name),
                 self.decode.kind(),
                 self.decode.describe_config(),
-                self.decode.backends(),
             ),
         ])
     }

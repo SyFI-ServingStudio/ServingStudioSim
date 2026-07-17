@@ -27,7 +27,7 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
-#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Deserialize)]
+#[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct P2pInterKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
@@ -105,7 +105,9 @@ mod tests {
     fn describe_config_renders_tidy_field_list() {
         assert_eq!(
             cfg().describe_config(),
-            r#"backends=["nccl"] gpu_name="H100" fabric=Infiniband"#
+            serde_json::json!({
+                "backends": ["nccl"], "gpu_name": "H100", "fabric": "infiniband",
+            })
         );
     }
 

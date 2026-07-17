@@ -59,7 +59,10 @@ pub fn derive_sweep_coords(input: TokenStream) -> TokenStream {
     // Same fields, same order, as string literals — so a `grid` response labels
     // each axis with the input key it sweeps.
     let field_names = fields.iter().map(|f| {
-        f.ident.as_ref().expect("named fields enforced above").to_string()
+        f.ident
+            .as_ref()
+            .expect("named fields enforced above")
+            .to_string()
     });
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
@@ -105,17 +108,6 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
             .into();
         }
     };
-
-    // `describe_config`: a tidy `field=value` line over every config field
-    // (`backends` included — it is a load-bearing part of the kernel's identity).
-    // Each field renders via `{:?}` so any field type works without a `Display`
-    // bound (e.g. `dtype` -> `Bf16`, `backends` -> `["torch"]`). This just drops
-    // the struct-name + braces wrapper that the full `{self:?}` would print.
-    let describe_pushes = fields.iter().map(|f| {
-        let field = f.ident.as_ref().expect("named fields enforced above");
-        let label = field.to_string();
-        quote! { parts.push(::std::format!("{}={:?}", #label, self.#field)); }
-    });
 
     // `symbol_bindings`: union each `Dim`-typed field's `bindings()` into one
     // `name -> value` legend. Only `Dim` fields have a `bindings()`, so non-Dim
@@ -170,10 +162,9 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
             #compute_dtype_impl
             #kv_dtype_impl
 
-            fn describe_config(&self) -> ::std::string::String {
-                let mut parts: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
-                #( #describe_pushes )*
-                parts.join(" ")
+            fn describe_config(&self) -> ::serde_json::Value {
+                ::serde_json::to_value(self)
+                    .expect("KernelConfig must serialize to structured JSON")
             }
 
             fn symbol_bindings(&self) -> ::std::collections::BTreeMap<&'static str, u32> {

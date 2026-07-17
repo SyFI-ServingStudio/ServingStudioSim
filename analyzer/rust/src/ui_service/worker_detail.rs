@@ -868,8 +868,7 @@ fn tree_json(manifest: &Manifest, row: &ExactRow, node_index: usize) -> Result<V
                 .slot_backend
                 .get(*slot_index)
                 .and_then(|index| (*index != u8::MAX).then_some(*index as usize))
-                .and_then(|index| slot.backends.get(index))
-                .cloned();
+                .and_then(|index| slot.backends().get(index).cloned());
             let input = row
                 .slot_input
                 .get(*slot_index)
@@ -880,7 +879,12 @@ fn tree_json(manifest: &Manifest, row: &ExactRow, node_index: usize) -> Result<V
                 .unwrap_or(Value::Null);
             Ok(json!({
                 "kind": "leaf",
-                "slot": {"name": slot.name, "kind": slot.kind, "config": slot.config, "backend": backend},
+                "slot": {
+                    "name": slot.name,
+                    "kind": slot.kind,
+                    "kernel_config": slot.kernel_config,
+                    "backend": backend,
+                },
                 "base": time_ms,
                 "stats": {
                     "input": input,
@@ -1043,14 +1047,15 @@ mod tests {
                 LeafDesc {
                     name: "gemm".to_owned(),
                     kind: "single_gemm".to_owned(),
-                    config: "n=8".to_owned(),
-                    backends: vec!["torch".to_owned(), "triton".to_owned()],
+                    kernel_config: json!({
+                        "n": {"value": 8, "expression": null, "bindings": {}},
+                        "backends": ["torch", "triton"],
+                    }),
                 },
                 LeafDesc {
                     name: "copy".to_owned(),
                     kind: "elementwise".to_owned(),
-                    config: String::new(),
-                    backends: vec![],
+                    kernel_config: json!({"backends": []}),
                 },
             ],
             nodes: vec![

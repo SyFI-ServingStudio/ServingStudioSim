@@ -249,17 +249,14 @@ mod tests {
             slots: vec![LeafDesc {
                 name: "m.test".to_owned(),
                 kind: "unit".to_owned(),
-                config: "shape=1".to_owned(),
-                backends: vec!["torch".to_owned()],
-                symbols: Default::default(),
+                kernel_config: serde_json::json!({"shape": 1, "backends": ["torch"]}),
             }],
             nodes: vec![FlatCostNode::Leaf(0)],
             node_labels: vec![None],
         };
 
         let doc = CostManifestDoc::single("iter", manifest);
-        let mut logger =
-            CostLogger::open(dir.path(), "decode", WorkerId(7), &doc).unwrap();
+        let mut logger = CostLogger::open(dir.path(), "decode", WorkerId(7), &doc).unwrap();
         let entry = CostLogEntry {
             worker_id: 7,
             iter_id: 3,
@@ -290,9 +287,7 @@ mod tests {
             .unwrap();
         logger.flush_all().unwrap();
 
-        let manifest_path = dir
-            .path()
-            .join("raw/cost_manifest/worker_decode_7.json");
+        let manifest_path = dir.path().join("raw/cost_manifest/worker_decode_7.json");
         assert!(manifest_path.exists());
         let parquet_path = dir.path().join("raw/cost_log/worker_decode_7.parquet");
         let mut reader =
