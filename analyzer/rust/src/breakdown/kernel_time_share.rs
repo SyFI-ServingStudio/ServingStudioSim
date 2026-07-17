@@ -778,7 +778,7 @@ mod tests {
     fn attributes_scale_and_max_to_critical_leaf() {
         let mut plan = SectionPlan::new(&mixed_manifest(), vec![0, 1, 2]).unwrap();
         let shares = plan.position_shares(&[4.0, 6.0, 10.0]).unwrap();
-        // root = 4 + 2 × (10 / 2) = 14; a owns 4, critical leaf c owns 10.
+        // root = 4 + 2 × (10 / 2) = 14; a owns 4, c owns 10.
         assert_eq!(shares.len(), 2);
         assert!((shares.iter().find(|(id, _)| *id == 0).unwrap().1 - 4.0 / 14.0).abs() < 1e-12);
         assert!((shares.iter().find(|(id, _)| *id == 2).unwrap().1 - 10.0 / 14.0).abs() < 1e-12);

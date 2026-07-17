@@ -99,10 +99,7 @@ Three independent decisions, never collapsed:
   applicability lives with the metric, `analyze run <dir>` on any run "just works".
 - **Scope** (`Scope::{Run, Alignment}`) gates the **source envelope**, not
   deployment: `analyze run` selects only `Run` subjects, `analyze alignment` only
-  `Alignment` subjects. There is no second alignment registry. An explicit CLI
-  token must exist in that command's scope: unknown tokens and known tokens from
-  the other scope fail before a DataFusion session starts or an artifact is
-  written.
+  `Alignment` subjects. There is no second alignment registry.
 - **Intent** (which applicable subjects to actually run) lives at the
   launcher/preset and can only *narrow within* what is applicable — it never
   overrides applicability into running a nonsensical metric.
@@ -130,158 +127,14 @@ any specific constant:
 If none of these gets a large run under budget, that is a signal to change the
 payload shape or pre-aggregate on the sim side, not to ship a slow subject.
 
-## Launcher integration and publication lifecycle
+## Launcher integration
 
-Analysis is **best-effort with respect to simulation** — a missing analyzer
-binary, a failed handoff, or a failed subject never changes a completed
-simulation into a failed simulation. Publication to readers is stricter. After
-each successful run the launcher executes one ordered generation:
-
-1. Rust `analyze run` computes report/payload JSON;
-2. Python `render` creates plots;
-3. Rust `analyze trace` creates the bounded overview Perfetto trace.
-
-Before compute starts, and after every transition, the launcher atomically
-replaces `reports/analyzer_pipeline_state.json`. Its version-1 envelope contains
-a fresh opaque `generation_id`, a stable `artifact_revision`, requested subject
-tokens, exact trace artifact path, real producer version/revision/binary digest,
-timestamps, the pipeline status (`pending`, `complete`, or `failed`), and explicit
-compute/render/trace stage states. One per-run lease serializes generations so an
-older producer cannot overwrite a newer attempt. `complete` is published only
-after the trace stage reaches a terminal state. A compute failure makes the
-pipeline `failed`; optional render or trace failure leaves the orchestration
-`complete` but keeps that stage/resource explicitly failed (in particular,
-`trace_failed` never becomes a ready trace). A launcher crash leaves a durable
-`pending` generation. State is bounded JSON; readers never scrape stdout.
-
-Before current-generation compute completes, old report/payload/trace files are
-never published as `ready`. After compute completes, only requested subjects
-listed by a timing artifact carrying the same `generation_id` may become ready,
-even while render/trace is still pending; an unrequested or mismatched old pair
-stays hidden. A trace becomes ready only when its stage is complete and its exact
-state-recorded path passes containment and size checks. `artifact_revision` is
-the stable `analysis.revision` for that generation. Runs predating this sidecar
-remain readable through an explicit legacy path: valid bounded artifact pairs
-may be ready, their revision is derived from immutable artifact contents, and
-their producer is `legacy-unknown`, never the serving binary.
-
-All analyzer JSON and trace outputs use a durable same-directory temporary file,
-file sync, and atomic replace. Thus readers see the old or new complete file,
-never a partially encoded artifact. A run's subject selection is a durable
-preset key (`analyze_subjects`, omitted = all applicable); `--no-analyze` is the
-transient "skip it this time" switch.
-
-The producer version, build-time source revision, and flat subject catalog come
-from the machine-readable `analyze identity` command of the executable that will
-perform compute; the launcher hashes that same executable for `binary_sha256`.
-It resolves Cargo's effective target directory (including environment/config
-overrides), atomically pins the executable inode with a content-addressed hard
-link below that target, and uses the pinned path for identity, compute, and
-trace. A concurrent Cargo rebuild therefore cannot change the producer midway
-through a generation. The target directory remains a trusted-writer boundary;
-metadata checks fail the generation if that pinned executable is replaced.
-It validates explicit `analyze_subjects` against the binary-owned Run catalog and
-records only canonical registry tokens. Identity/selection failure is published
-as a terminal compute failure before subject execution, never as a generation
-that can later become `complete`. The launcher's current checkout HEAD is not
-producer provenance for an already-built binary.
-`producer.revision` names the commit checked out when Cargo built the executable;
-it does not claim a clean worktree. The binary digest is the exact identity that
-distinguishes dirty builds made from the same source commit.
-
-## Read-only UI service
-
-The analyzer also owns the read boundary between completed run artifacts and
-the browser. `analyze serve --logs-root <dir>` recursively discovers simulation
-runs below one or more explicitly configured roots and exposes protocol-v1,
-bounded resources under `/api/v1/`. This remains a read-only analyzer concern:
-the service does not run subjects, render plots, mutate a run, or expose parquet.
-
-The public resources are:
-
-- `GET /api/v1/runs` — a catalog whose `run_id` values are stable opaque ids;
-  a basename is only display text because nested sweeps commonly repeat names
-  such as `simulation` and `tp4`;
-- `GET /api/v1/runs/{run_id}/descriptor` — deployment, lifecycle, workers,
-  analyzer-registry subject states, and relative artifact links;
-- descriptor-linked summary, topology, report, payload, and Perfetto resources.
-
-`SUBJECTS` remains the only source of subject tokens and report/payload names.
-The HTTP layer must not copy that catalog or translate tokens to UI-specific
-names. A subject is independently `pending`, `ready`, `unavailable`,
-`not_generated`, or `failed`; an optional subject failure never invalidates the
-descriptor or another subject. Only the bounded summary and topology are core
-page resources. The topology envelope has its own
-`TOPOLOGY_SCHEMA_VERSION`; it is not coupled to the report/payload envelope
-version.
-
-Every resource link is selected from a server-built allowlist for a resolved
-run. Request parameters are never joined directly to filesystem paths. Roots
-and runs are canonicalized, symlink escapes are rejected, and the service never
-serves `raw/*.parquet`, `raw/gpu_cluster/**`, temporary files, or arbitrary
-paths. Catalog, descriptor, and immutable artifacts use `ETag` and conditional
-`304` responses so a UI can poll pending analysis without repeatedly decoding
-unchanged JSON. Errors use `application/problem+json` with a stable `code` in
-addition to human-readable detail.
-
-Ready report, payload, and trace links are relative paths scoped by the
-descriptor's `analysis.revision`. A request carrying a revision other than the
-current readable generation fails closed with `artifact_generation_changed`;
-the service never resolves that old link to a fixed filename from a newer
-generation. Descriptor assembly and linked-resource reads use a bounded
-seqlock-style check: capture pipeline/timing state, open or read every required
-artifact, then capture state again and retry the whole read if it changed. Trace
-reads keep the opened file descriptor across the final check, so a subsequent
-atomic replacement cannot change the bytes being streamed. Legacy runs use the
-content-derived legacy revision as the same read fence. The service memoizes
-that content hash only behind a strong device/inode/length/mtime metadata fence;
-legacy linked reads recheck the fence before and after I/O instead of hashing
-every subject body again. A descriptor-validated report/payload pair is cached
-the same way, so a linked request reads only its target JSON body while still
-failing closed if either member of the pair changes.
-
-The default Host allowlist is limited to loopback spellings (`localhost`,
-`127.0.0.1`, and `[::1]`) as a DNS-rebinding boundary. A same-origin development
-proxy should preserve or rewrite `Host` to the loopback analyzer target. A
-non-loopback reverse-proxy hostname is accepted only when the operator repeats
-`--allow-host <hostname>` explicitly; changing `--bind` alone never expands the
-allowlist. Method rejection includes `Allow: GET`.
-
-Catalog discovery is cached for 30 seconds, refreshed by one single-flight scan
-on a blocking worker, and never runs a multi-gigabyte tree walk on an async
-request worker. The catalog lifecycle projection has its own metadata-stamped,
-single-flight cache: the stamp covers ordered run ids and timestamps, completion
-markers, and pipeline/timing file identities. A catalog is limited to 1,024 runs
-(`catalog_too_many_runs`). A cold build retains the exact opened pipeline/timing
-descriptors and accounts every opened length toward the 16 MiB aggregate limit
-before applying per-file policy. Exceeding the aggregate fails the whole request
-with `catalog_state_too_large`; a file that exceeds only its smaller per-file
-limit is not read and makes that run's analysis lifecycle failed. A changing
-snapshot is retried three times, then fails with `artifact_generation_changed`.
-The public ETag is a strong SHA-256 digest of the final serialized catalog bytes;
-the metadata stamp is only an internal invalidation fence. Descriptor JSON has a bounded
-metadata-stamped cache. Artifact filesystem I/O and JSON parsing run on blocking
-workers behind one fail-fast,
-four-permit service semaphore (`artifact_read_busy`, `Retry-After: 1` when
-saturated). Run-scope JSON is capped at 16 MiB per file; this is intentionally
-well above current bounded/downsampled payloads without retaining the previous
-128 MiB per-request allocation surface. JSON conditional requests use an
-opened-file device/inode/length/mtime ETag and return `304` before reading or
-hashing an unchanged body. Artifact
-reads on Linux use `openat2(RESOLVE_BENEATH|NO_SYMLINKS)` from a stable
-configured-root descriptor over the combined root-relative run and artifact
-path, then enforce the maximum and serve from that same descriptor. Linux
-kernels without usable `openat2` support fail closed. Non-Linux builds retain
-canonical containment and therefore treat configured logs roots as a
-trusted-writer boundary. Large traces stream without a trace-sized service
-buffer; their weak ETag contains device, inode, length, mtime seconds, and mtime
-nanoseconds from the atomically published file, so conditional requests do not
-hash or scan a 512 MB file first.
-
-The full wire schema, href restrictions, cache-key rules, and analyzer-token to
-UI-domain mapping live in the consumer protocol contract at
-`../viz-ui/docs/data-protocol.md`. Both transports — checked-in artifact export
-and HTTP — must reuse the same subject-specific decoders.
+Analysis is **best-effort** end to end — a missing analyzer binary, a failed
+handoff, or a failed subject never fails a completed run. The launcher builds the
+analyzer crate explicitly (a failed build warns, does not block), and after each
+successful run it runs the Rust `analyze run` then the Python `render`. A run's
+subject selection is a durable preset key (`analyze_subjects`, omitted = all
+applicable); `--no-analyze` is the transient "skip it this time" switch.
 
 ## Relationship to other docs
 

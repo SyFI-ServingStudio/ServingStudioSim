@@ -5,13 +5,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
-use tempfile::Builder;
 
 /// Version of the report/payload JSON contract shared by every metric. Bump on
 /// any breaking change to the envelope shape (`meta`/`metrics`/`series`/…) so the
@@ -239,98 +237,10 @@ pub fn payload_path(log_dir: &Path, name: &str) -> PathBuf {
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
-    atomic_write_bytes(path, &bytes)?;
-    println!("wrote {}", path.display());
-    Ok(())
-}
-
-/// Durably publish one complete artifact with a same-directory atomic replace.
-///
-/// The writer receives the temporary file directly, allowing large encoders
-/// (notably Perfetto gzip) to stream without building a second full-size buffer.
-/// The destination remains unchanged if encoding or syncing fails.
-pub fn atomic_write_file(
-    path: &Path,
-    write_artifact: impl FnOnce(&mut fs::File) -> Result<()>,
-) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("artifact path has no parent: {}", path.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("artifact");
-    let mut temporary = Builder::new()
-        .prefix(&format!(".{file_name}."))
-        .suffix(".tmp")
-        .tempfile_in(parent)?;
-
-    write_artifact(temporary.as_file_mut())?;
-    temporary.as_file_mut().flush()?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(path)
-        .map_err(|error| anyhow::anyhow!("persist {}: {}", path.display(), error.error))?;
-
-    // Persisting the directory entry is a separate durability boundary from
-    // syncing the file contents. This is supported on the Linux deployment
-    // target; tolerate only the portable "unsupported" case elsewhere.
-    if let Err(error) = fs::File::open(parent).and_then(|directory| directory.sync_all()) {
-        if error.kind() != io::ErrorKind::Unsupported {
-            return Err(error.into());
-        }
-    }
+    fs::write(path, serde_json::to_vec_pretty(value)?)?;
+    println!("wrote {}", path.display());
     Ok(())
-}
-
-pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    atomic_write_file(path, |temporary| {
-        temporary.write_all(bytes)?;
-        Ok(())
-    })
-}
-
-#[cfg(test)]
-mod atomic_publish_tests {
-    use super::{atomic_write_bytes, atomic_write_file};
-    use anyhow::bail;
-    use std::fs;
-    use std::io::Write;
-
-    #[test]
-    fn failed_encoder_preserves_previous_artifact_and_cleans_temp() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let destination = directory.path().join("artifact.json");
-        atomic_write_bytes(&destination, b"old-complete").expect("initial artifact");
-
-        let error = atomic_write_file(&destination, |temporary| {
-            temporary.write_all(b"partial-new")?;
-            bail!("injected encoder failure")
-        })
-        .expect_err("the encoder must fail");
-
-        assert!(error.to_string().contains("injected encoder failure"));
-        assert_eq!(
-            fs::read(&destination).expect("old artifact"),
-            b"old-complete"
-        );
-        let entries = fs::read_dir(directory.path())
-            .expect("directory")
-            .map(|entry| entry.expect("entry").file_name())
-            .collect::<Vec<_>>();
-        assert_eq!(entries, vec![destination.file_name().unwrap()]);
-    }
-
-    #[test]
-    fn successful_publish_atomically_replaces_existing_artifact() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let destination = directory.path().join("artifact.json");
-        atomic_write_bytes(&destination, b"old").expect("initial artifact");
-        atomic_write_bytes(&destination, b"new-complete").expect("replacement artifact");
-        assert_eq!(fs::read(destination).expect("artifact"), b"new-complete");
-    }
 }

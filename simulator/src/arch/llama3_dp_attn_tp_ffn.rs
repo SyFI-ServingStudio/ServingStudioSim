@@ -13,7 +13,7 @@
 //! attention):
 //!   - per layer: `Sum( Max{1.0}( attn_block × num_dp_groups ), mlp_block )` — the
 //!     `Max` is the L4 §3.3 DP fan-out (independent shards run concurrently; the
-//!     sync wallclock is the slowest shard), and the FFN sees the
+//!     sync wallclock is the slowest shard, `overlap = 1.0`), and the FFN sees the
 //!     pooled token total (L4 §3.5, TP collective is intra-group symmetric);
 //!   - `attn_block` is fed `attn_tp_size`, `mlp_block` is fed `ffn_tp_size`; the
 //!     two TP worklets are reused unchanged (each takes one `tp_size`);

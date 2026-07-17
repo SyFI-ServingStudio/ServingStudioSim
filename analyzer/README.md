@@ -47,8 +47,7 @@ alignment analyze ──reads completed roots + mapping
 
 ## What it exposes / what it requires
 
-**Exposed upward** — command-line entry points (no importable library API;
-callers shell out):
+**Exposed upward** — two CLIs (no importable library API; callers shell out):
 
 | Command | Side | Effect |
 |---|---|---|
@@ -56,33 +55,14 @@ callers shell out):
 | `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
 | `analyze list` | Rust | Print the subject catalog. |
-| `analyze identity` | Rust | Print schema-v1 machine JSON containing the executable's package version, build-time source revision, and flat subject/scope catalog. |
-| `analyze serve --logs-root <dir> [--logs-root <dir> ...] [--bind 127.0.0.1:8787] [--allow-host <hostname> ...]` | Rust | Recursively discover runs and expose only protocol-v1 bounded UI artifacts over a read-only, loopback-by-default HTTP API. Non-loopback proxy hosts require an explicit allowlist entry. |
 | `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNG plots, including sampled alignment breakdowns. No subjects = all renderers. |
 
-The **launcher** is the primary caller: `launcher.exec.run_analysis` publishes
-one atomically versioned generation around Rust `analyze run`, Python `render`,
-and Rust `analyze trace` after each successful sim run;
+The **launcher** is the primary caller: `launcher.exec.run_analysis` runs the
+Rust `analyze run` then the Python `render` after each successful sim run;
 `run_alignment_analysis` computes and renders the subjects enabled by the
 separate analyze phase config. Both execution paths are
 **best-effort** — a missing analyzer binary, failed handoff, or failed subject
 never fails the completed run.
-
-Explicit subject tokens are strict at the Rust CLI boundary. An unknown token,
-or a known `alignment` token passed to `analyze run` (and vice versa), exits
-nonzero before a DataFusion session or output artifact is created. Before the
-launcher claims a generation it queries `analyze identity`, validates
-`analyze_subjects` against that executable's Run-scope rows, canonicalizes them
-in registry order, and hashes the same executable. Identity, compute, and trace
-all use one content-addressed, inode-pinned hard link under Cargo's effective target
-directory, so a concurrent rebuild of `target/<profile>/analyze` cannot split a
-generation across binaries. The target directory is a trusted-writer boundary;
-snapshot metadata drift fails closed. The launcher never attributes a stale
-built binary to the launcher's current checkout HEAD; missing/malformed identity
-publishes a terminal compute failure rather than an unreadable complete state.
-The embedded revision is specifically the build-time source commit, not a claim
-that the build worktree was clean; `binary_sha256` distinguishes exact binaries,
-including dirty builds from that commit.
 
 **Required from below** — `analyze run` consumes a run directory written by the
 sim/L7, containing:
@@ -112,18 +92,12 @@ the analysis root; the input roots are never used as output directories.
 
 ```
 rust/                The `analyze` binary (DataFusion compute side).
-  src/main.rs          CLI (`run` / `alignment` / `trace` / `list` / `identity` / `serve`);
-                       the best-effort per-subject dispatch loop is shared by
-                       both source scopes.
+  src/main.rs          CLI (`run` / `alignment` / `list`); the best-effort
+                       per-subject dispatch loop shared by both source scopes.
   src/registry.rs      THE SUBJECT CATALOG. `SUBJECTS` table + `run_subject`
                        dispatch + `select` (applicability gate). Adding a metric
                        touches only this file + a module under src/<category>/.
   src/io.rs            Artifact paths, `SCHEMA_VERSION`, read_deployment/run_meta.
-  src/ui_service/      Read-only `/api/v1` service split by protocol/router,
-                       discovery/cache, safe artifact reads, and lifecycle /
-                       descriptor assembly. It resolves opaque run ids before
-                       selecting registry-owned resources and never exposes
-                       parquet or arbitrary paths.
   src/session.rs       DataFusion session, parquet registration, Arrow→Vec
                        extraction, and `require_columns` (the schema drift guard).
   src/cdf.rs           Shared numeric kernels: percentile, CDF downsample, and the
@@ -153,95 +127,6 @@ python/              The render side (matplotlib over payload JSON).
   common/              Shared plotting: payload loader + run-dir layout, figure
                        scaffolding, CDF plot, style.
 ```
-
-## Read-only UI service
-
-Start the browser-facing artifact boundary with one or more explicit logs roots:
-
-```bash
-cargo run -p analyzer -- serve \
-  --logs-root logs \
-  --bind 127.0.0.1:8787
-```
-
-The default listener is loopback-only. Each configured root is canonicalized at
-startup; run discovery then looks recursively for `raw/params.json`, skips
-resolved run internals and cache-build trees, and assigns a stable opaque id from
-the configured root ordinal plus its root-relative path. Nested runs with the
-same basename therefore remain distinct. Public routes are limited to:
-
-- `GET /api/v1/runs`
-- `GET /api/v1/runs/{run_id}/descriptor`
-- descriptor-linked `summary`, topology, and revision-scoped registry
-  report/payload and Perfetto resources
-
-The topology resource is the v1 envelope
-`{schema_version, params, run_meta}`; `summary.json` is passed through unchanged.
-Report and payload route tokens come directly from `registry::SUBJECTS`, then
-map back to that row's filenames. There is no arbitrary filesystem route, and
-`raw/*.parquet`, `raw/gpu_cluster/**`, cache trees, and unregistered JSON remain
-unreachable. Canonical containment checks also reject symlink escapes. Successful
-resources include `ETag`; conditional `If-None-Match` reads return `304`, while
-errors use `application/problem+json` with a stable `code`.
-
-The launcher publishes `reports/analyzer_pipeline_state.json` before compute
-and after each compute/render/trace transition. A new generation is visible as
-`pending` immediately. Requested JSON subjects become current only after the
-matching generation's compute timing records them; old or unrequested pairs
-remain hidden. The total state becomes `complete` only after trace reaches a
-terminal state. Optional render/trace failure keeps its resource failed without
-hiding valid JSON, while compute failure makes the total pipeline failed. The
-state binds the exact trace path and real producer version/revision/binary digest;
-a per-run lease prevents overlapping generations. Legacy runs without the
-sidecar use bounded artifact inspection, stable content-derived revisions, and
-producer identity `legacy-unknown`.
-
-Ready artifact hrefs contain that revision. The service checks the pipeline and
-timing snapshot before and after descriptor or JSON reads, retrying the whole
-multi-file read on a cutover and returning `artifact_generation_changed` after
-bounded churn. Trace handling opens the selected file before the final snapshot
-check and streams that same descriptor. A stale revision href therefore cannot
-serve a newly replaced fixed-path artifact under the old descriptor identity.
-
-Analyzer JSON and trace files are written by durable same-directory atomic
-replacement. On Linux the service opens root-and-run-relative artifacts from a
-stable configured-root descriptor with
-`openat2(RESOLVE_BENEATH|NO_SYMLINKS)`, bounds and serves the same descriptor,
-and streams large traces instead of allocating a trace-sized response buffer.
-Linux kernels without usable `openat2` support fail closed. Trace conditional
-requests use a weak device/inode/length/mtime/mtime-nanoseconds ETag, so `304`
-does not require a full-file hash; non-Linux logs roots are a trusted-writer
-boundary.
-Catalog scans use a
-30-second single-flight cache on a blocking worker; descriptor parsing uses a
-bounded metadata-stamped cache. Catalog lifecycle bytes are cached separately
-behind a stamp of the ordered runs, lifecycle markers, and pipeline/timing file
-identities. Catalogs are limited to 1,024 runs (`catalog_too_many_runs`). Cold
-catalog builds single-flight, retain and parse the same opened descriptors whose
-metadata is counted first against the 16 MiB aggregate limit
-(`catalog_state_too_large`). Inputs that exceed only a smaller per-file limit are
-not read and fail that run's analysis lifecycle without poisoning other catalog
-rows. Cold builds fail closed after three unstable metadata snapshots. Catalog
-ETags are strong SHA-256 digests of the final serialized bytes; metadata stamps
-remain internal invalidation keys. All artifact I/O/JSON
-parsing runs on bounded blocking workers (four concurrent reads, fail-fast
-`artifact_read_busy` when saturated), and each run-scope JSON file is capped at
-16 MiB. Descriptor-ready
-subject pairs keep a strong metadata proof, allowing report and payload routes
-to read only the requested body without losing pair readiness. Legacy content
-revisions are memoized only while that strong proof remains unchanged.
-
-The API intentionally emits no permissive CORS policy. The visualization UI
-must reach it through a same-origin `/api` proxy (the Vite development server
-uses this shape too); a random browser origin must not be able to read local run
-artifacts merely because the analyzer listener is on loopback.
-
-Requests also pass a Host allowlist. By default only `localhost`, `127.0.0.1`,
-and `[::1]` are accepted. Configure Vite's proxy target as the loopback analyzer
-address (with `changeOrigin: true`), or preserve an equivalent loopback Host.
-For a trusted non-loopback reverse-proxy name, add one explicit
-`--allow-host ui.example.internal` per hostname. `--bind 0.0.0.0:8787` does not
-implicitly trust arbitrary Host headers.
 
 ## Subjects (the unit of analysis)
 
@@ -285,9 +170,7 @@ or JPG breakdowns are removed without touching subject-level plots.
 
 The flat registry also carries a `Scope` (`run` or `alignment`) so default
 selection never points a normal-run subject at an alignment bundle or vice
-versa. Explicit selection is also scope-strict: typos and cross-scope tokens are
-hard errors, while only a valid subject's deployment applicability remains a
-best-effort self-skip. **Deployment knowledge enters in exactly one place**: each subject's `Applies`
+versa. **Deployment knowledge enters in exactly one place**: each subject's `Applies`
 gate. Tier-1 (uniform-envelope) metrics are `Applies::All` and stay
 deployment-blind; a deployment-shaped metric names the deployments it understands
 and `select` drops it (with a note) for runs it doesn't apply to. So "point the

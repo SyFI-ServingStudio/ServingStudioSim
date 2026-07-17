@@ -15,8 +15,8 @@
 //!     Max{1.0}( attn_block_tp × num_dp_groups ),     // attn-DP fan-out
 //!     Max{1.0}( moe_router_local × num_dp_groups ),  // post_norm + router, per-DP-shard (replicated)
 //!     moe_dispatch,                                  // L2 op, 2 leaves (inter, intra)
-//!     Max{1.0}( moe_expert_compute_local × ep_size ), // EP fan-out: per-rank expert compute
-//!     Max{1.0}( moe_local_reduce × num_dp_groups ),   // home reduce, per-DP-shard
+//!     Max{1.0}( moe_expert_compute_local × ep_size ),// EP fan-out: per-rank expert compute
+//!     Max{1.0}( moe_local_reduce × num_dp_groups ),  // home reduce, per-DP-shard
 //!     moe_combine,                                   // L2 op, 4 leaves
 //!   )),
 //!   final_norm,

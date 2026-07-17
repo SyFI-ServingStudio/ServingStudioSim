@@ -19,13 +19,12 @@ The build-time tree is a recursive `CostNode`; the eval-time form is the flat
 | `Leaf(slot)` | one L1 primitive; `slot` indexes the per-iter buffer | from cache | from cache |
 | `Sum(children)` | serial composition | Σ children | Σ children |
 | `Scale{n, child}` | homogeneous-layer fold: `n ×` one child subtree | `n ×` | `n ×` |
-| `Max{overlap, children}` | fan-out / overlap | `max(child.time) / overlap` | **Σ children** (work never overlaps away) |
+| `Max{overlap, children}` | fan-out / overlap | `max(child.time)/overlap` | **Σ children** (work never overlaps away) |
 | `Labeled{label, child}` | render-only identity wrapper | — | — (dropped at flatten) |
 
 `flops`/`bytes`/`energy` **always sum**; only `Scale` and `Max{overlap}` change
-`time` (INV-4). `overlap` is a composition coefficient: it shortens the
-synchronized fan-out wallclock without erasing any child work. `coverage` flags
-always OR up the tree, so an off-grid leaf anywhere surfaces at the root.
+`time` (INV-4). `coverage` flags always OR up the tree, so an off-grid leaf
+anywhere surfaces at the root.
 
 `Scale` is the key economy: a 32-layer model evaluates one layer subtree and
 multiplies, never materializing 32 copies. Use it **only for provably-identical
@@ -64,7 +63,7 @@ for i in (0..flat.len()).rev() {
         Leaf(slot)            => buf[*slot],
         Sum { children }      => Σ scratch[children],
         Scale { n, children } => (Σ scratch[children]) × n,
-        Max { overlap, children } => { time = max / overlap; work = Σ },
+        Max { overlap, children } => { time = max/overlap; work = Σ },
     };
 }
 // scratch[0] (the root) is the answer.
@@ -122,7 +121,7 @@ Sum
   (`Evaluator`) share one walk.
 - **INV-3** `Scale`/fold only for provably-identical subtrees; heterogeneous
   fan-out uses `Max` with N children.
-- **INV-4** `flops`/`bytes`/`energy` always sum; only `Max{overlap}` and `Scale`
+- **INV-4** `flops`/`bytes`/`energy` always sum; only `Max{overlap}`/`Scale`
   touch `time`; `coverage` always ORs up.
 - **INV-5** names/labels live only in compile-time products (`CostManifest`);
   the hot path and log rows are name-free, reconstructed via slot position +

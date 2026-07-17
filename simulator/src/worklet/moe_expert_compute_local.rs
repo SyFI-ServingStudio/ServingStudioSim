@@ -145,27 +145,15 @@ impl MoeExpertComputeLocalWorklet {
         let dn_name = format!("{name}.down");
         let gate_up = Op::new(
             gu_name.clone(),
-            Arc::new(GroupedGemmKernel::build(
-                gu_name,
-                resolved.gate_up.clone(),
-                bridge,
-            )?),
+            Arc::new(GroupedGemmKernel::build(gu_name, resolved.gate_up.clone(), bridge)?),
         );
         let act = Op::new(
             act_name.clone(),
-            Arc::new(ElementwiseKernel::build(
-                act_name,
-                resolved.act.clone(),
-                bridge,
-            )?),
+            Arc::new(ElementwiseKernel::build(act_name, resolved.act.clone(), bridge)?),
         );
         let down = Op::new(
             dn_name.clone(),
-            Arc::new(GroupedGemmKernel::build(
-                dn_name,
-                resolved.down.clone(),
-                bridge,
-            )?),
+            Arc::new(GroupedGemmKernel::build(dn_name, resolved.down.clone(), bridge)?),
         );
         Ok(Self {
             name,
@@ -262,7 +250,7 @@ mod tests {
     fn uniform_local_ppm_distributes_evenly() {
         let s = uniform_local_ppm(128, 8);
         assert_eq!(s.len(), 16); // 128 / 8
-                                 // Each expert gets TOTAL_PPM / num_experts (rounded toward zero).
+        // Each expert gets TOTAL_PPM / num_experts (rounded toward zero).
         assert_eq!(s[0], 1_000_000 / 128);
         assert!(s.iter().all(|&v| v == s[0]));
     }

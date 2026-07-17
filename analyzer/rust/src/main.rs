@@ -9,10 +9,7 @@
 //! `analyze alignment <analysis_log_dir> [subjects...]` computes paired measured
 //! subjects from an `alignment_manifest.json`. Both use the one flat catalog in
 //! [`registry`], separated by its source [`registry::Scope`] gate.
-//! `analyze serve --logs-root <dir>` exposes their bounded artifacts through the
-//! read-only protocol-v1 UI boundary.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -38,18 +35,13 @@ mod request;
 mod session;
 mod throughput;
 mod trace;
-mod ui_service;
 mod utilization;
 
 use io::{payload_path, read_deployment, report_path, write_json, SCHEMA_VERSION};
 use session::build_session;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "analyze",
-    version,
-    about = "VibeSim post-run artifact analyzer"
-)]
+#[command(name = "analyze", about = "VibeSim post-run artifact analyzer")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -63,10 +55,6 @@ enum Command {
         /// Run directory (holds `raw/*.parquet`); outputs land in its `reports/`
         /// and `payloads/` subdirs.
         log_dir: PathBuf,
-        /// Opaque launcher generation written into analyzer_timing.json. UI
-        /// readers use it to reject artifacts left by an older generation.
-        #[arg(long)]
-        generation_id: Option<String>,
         /// Subject names to run (e.g. `slo`); empty = all applicable.
         subjects: Vec<String>,
     },
@@ -80,24 +68,6 @@ enum Command {
     },
     /// List the available analyzer subjects and what each produces.
     List,
-    /// Print the machine-readable build identity and subject registry contract.
-    /// The launcher uses this exact executable-owned metadata before claiming a
-    /// published analysis generation.
-    Identity,
-    /// Serve bounded, read-only analyzer artifacts to the visualization UI.
-    Serve {
-        /// Logs roots to discover recursively. Repeat for independent roots.
-        #[arg(long = "logs-root", required = true, value_name = "DIR")]
-        logs_roots: Vec<PathBuf>,
-        /// HTTP listener. The default is loopback-only; exposing another bind is
-        /// an explicit operator choice.
-        #[arg(long, default_value = "127.0.0.1:8787")]
-        bind: SocketAddr,
-        /// Trusted HTTP Host name accepted by the artifact service. Loopback
-        /// spellings are always allowed; repeat for an explicit reverse proxy.
-        #[arg(long = "allow-host", value_name = "HOST")]
-        allow_hosts: Vec<String>,
-    },
     /// Export a Perfetto per-kernel timeline (`traces/<prefix>.pftrace.gz`).
     /// Samples `regions` evenly-spaced contiguous windows of `region_ms` each
     /// across the run and concatenates them; open in ui.perfetto.dev. A separate
@@ -150,20 +120,7 @@ async fn main() -> Result<()> {
             print!("{}", registry::help());
             Ok(())
         }
-        Command::Identity => {
-            println!("{}", serde_json::to_string(&identity_document())?);
-            Ok(())
-        }
-        Command::Serve {
-            logs_roots,
-            bind,
-            allow_hosts,
-        } => ui_service::serve(logs_roots, bind, allow_hosts).await,
-        Command::Run {
-            log_dir,
-            generation_id,
-            subjects,
-        } => run(log_dir, subjects, generation_id).await,
+        Command::Run { log_dir, subjects } => run(log_dir, subjects).await,
         Command::Alignment {
             analysis_log_dir,
             subjects,
@@ -201,7 +158,6 @@ async fn main() -> Result<()> {
 }
 
 async fn alignment(analysis_log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
-    let selected = registry::select(&subjects, None, registry::Scope::Alignment)?;
     let manifest = analysis_log_dir.join("alignment_manifest.json");
     if !manifest.is_file() {
         bail!(
@@ -210,13 +166,19 @@ async fn alignment(analysis_log_dir: PathBuf, subjects: Vec<String>) -> Result<(
         );
     }
     let ctx = build_session();
-    run_subjects(ctx, analysis_log_dir, selected, None, None).await
+    run_subjects(
+        ctx,
+        analysis_log_dir,
+        subjects,
+        None,
+        registry::Scope::Alignment,
+    )
+    .await
 }
 
-async fn run(log_dir: PathBuf, subjects: Vec<String>, generation_id: Option<String>) -> Result<()> {
-    let deployment = read_deployment(&log_dir);
-    let selected = registry::select(&subjects, deployment.as_deref(), registry::Scope::Run)?;
+async fn run(log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
     let ctx = build_session();
+    let deployment = read_deployment(&log_dir);
 
     // Pre-register the big shared table once so the concurrent subjects below don't
     // each re-open cost_log's per-worker parquet set. (Registration is an idempotent
@@ -224,15 +186,15 @@ async fn run(log_dir: PathBuf, subjects: Vec<String>, generation_id: Option<Stri
     // avoids redundant metadata opens.)
     let _ = session::register_cost_log(&ctx, &log_dir).await;
 
-    run_subjects(ctx, log_dir, selected, deployment, generation_id).await
+    run_subjects(ctx, log_dir, subjects, deployment, registry::Scope::Run).await
 }
 
 async fn run_subjects(
     ctx: datafusion::prelude::SessionContext,
     log_dir: PathBuf,
-    selected: Vec<&'static registry::Subject>,
+    subjects: Vec<String>,
     deployment: Option<String>,
-    generation_id: Option<String>,
+    scope: registry::Scope,
 ) -> Result<()> {
     // Best-effort AND concurrent: each subject is an independent read over the shared
     // read-only ctx (SessionContext is Send+Sync+Clone) that writes its own files, so
@@ -242,6 +204,7 @@ async fn run_subjects(
     // catalog order for a stable log; per-subject timing is still the subject's own
     // wall (now overlapping), and `total_elapsed_ms` is the concurrent wall.
     let run_start = Instant::now();
+    let selected = registry::select(&subjects, deployment.as_deref(), scope);
     let mut set = tokio::task::JoinSet::new();
     for (idx, subject) in selected.iter().enumerate() {
         let ctx = ctx.clone();
@@ -294,85 +257,9 @@ async fn run_subjects(
         "schema_version": SCHEMA_VERSION,
         "log_dir": log_dir.display().to_string(),
         "deployment": deployment,
-        "generation_id": generation_id,
         "subjects": subject_runs,
         "total_elapsed_ms": run_start.elapsed().as_secs_f64() * 1e3,
     });
     write_json(&report_path(&log_dir, "analyzer_timing.json"), &run_report)?;
     Ok(())
-}
-
-fn identity_document() -> serde_json::Value {
-    let subjects = registry::SUBJECTS
-        .iter()
-        .map(|subject| {
-            json!({
-                "name": subject.name,
-                "scope": subject.scope.label(),
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "schema_version": 1,
-        "name": "vibesim-analyzer",
-        "version": env!("CARGO_PKG_VERSION"),
-        "revision": env!("VIBESIM_ANALYZER_REVISION"),
-        "subjects": subjects,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn machine_identity_is_concrete_and_exposes_both_subject_scopes() {
-        let identity = identity_document();
-        assert_eq!(identity["schema_version"], 1);
-        assert_eq!(identity["name"], "vibesim-analyzer");
-        assert_ne!(identity["version"], "unavailable");
-        let revision = identity["revision"].as_str().unwrap();
-        assert_eq!(revision.len(), 40);
-        assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
-
-        let subjects = identity["subjects"].as_array().unwrap();
-        assert!(subjects
-            .iter()
-            .any(|subject| subject == &json!({"name": "throughput", "scope": "run"})));
-        assert!(subjects
-            .iter()
-            .any(|subject| subject == &json!({"name": "alignment-e2e", "scope": "alignment"})));
-    }
-
-    #[tokio::test]
-    async fn run_handler_rejects_unknown_subject_before_creating_artifacts() {
-        let run_dir = tempfile::tempdir().unwrap();
-        let error = run(
-            run_dir.path().to_path_buf(),
-            vec!["through-put".to_string()],
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("unknown run analyzer subject"));
-        assert!(!run_dir.path().join("reports").exists());
-        assert!(!run_dir.path().join("payloads").exists());
-    }
-
-    #[tokio::test]
-    async fn run_handler_rejects_alignment_subject_before_creating_artifacts() {
-        let run_dir = tempfile::tempdir().unwrap();
-        let error = run(
-            run_dir.path().to_path_buf(),
-            vec!["alignment-e2e".to_string()],
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("has alignment scope and cannot be used with `analyze run`"));
-        assert!(!run_dir.path().join("reports").exists());
-        assert!(!run_dir.path().join("payloads").exists());
-    }
 }

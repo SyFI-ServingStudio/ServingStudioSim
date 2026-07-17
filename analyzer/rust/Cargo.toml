@@ -18,14 +18,7 @@ serde_json = "1.0"
 # RecordBatches resolve to the same arrow types (matches ref/moesim-rs analyze-rust).
 datafusion = { version = "45", default-features = false, features = ["parquet"] }
 arrow-array = { version = "54", default-features = false }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread"] }
-tokio-util = { version = "0.7", features = ["io"] }
-# The UI boundary is a small read-only HTTP service. Axum owns routing;
-# artifact selection remains in this crate so no general-purpose file server
-# can expose parquet by accident.
-axum = "0.8"
-sha2 = "0.10"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # Pure-Rust linear algebra — used only by `src/pca.rs` for the symmetric
 # eigendecomposition behind the kernel-input-distribution feature projection
 # (no BLAS/LAPACK system dependency; keeps the analyzer a self-contained build).
@@ -35,14 +28,9 @@ nalgebra = "0.33"
 # build time from `proto/perfetto_trace.proto` by `build.rs` (prost-build).
 prost = "0.13"
 flate2 = "1"
-tempfile = "3"
-rustix = { version = "1.1", features = ["fs"] }
 
 [build-dependencies]
 prost-build = "0.13"
-
-[dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 
 # Build profiles (release / maxperf) come from the workspace root Cargo.toml and
 # apply to every member — defining them here would be ignored (cargo warns).

@@ -36,17 +36,9 @@ pub struct LeafDesc {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub enum FlatCostNode {
     Leaf(usize),
-    Sum {
-        children: Range<usize>,
-    },
-    Max {
-        overlap: f32,
-        children: Range<usize>,
-    },
-    Scale {
-        n: u32,
-        children: Range<usize>,
-    },
+    Sum { children: Range<usize> },
+    Max { overlap: f32, children: Range<usize> },
+    Scale { n: u32, children: Range<usize> },
 }
 
 /// One section's manifest: ordered leaf slots, the flattened aggregation tree,
@@ -92,7 +84,7 @@ impl ManifestDoc {
 
 /// Aggregate duration (ns) of the subtree rooted at node `idx`, folding this
 /// tree the same way the sim did to produce `total_time_ms`: Leaf = its slot,
-/// Sum = Σ children, Max = max(children) / overlap, Scale = n × child. Ancestor
+/// Sum = Σ children, Max = max(children)/overlap, Scale = n × child. Ancestor
 /// `Scale`s are NOT applied (this is the node's own local fold). The root's
 /// value reproduces `total_time_ms` up to per-leaf ns rounding.
 ///
@@ -105,13 +97,13 @@ pub(crate) fn node_time(m: &Manifest, idx: usize, slot_ns: &[i64]) -> i64 {
         FlatCostNode::Leaf(slot) => slot_ns.get(*slot).copied().unwrap_or(0),
         FlatCostNode::Sum { children } => children.clone().map(|c| node_time(m, c, slot_ns)).sum(),
         FlatCostNode::Max { overlap, children } => {
-            let max_duration = children
+            let maxd = children
                 .clone()
                 .map(|c| node_time(m, c, slot_ns))
                 .max()
                 .unwrap_or(0);
-            let overlap = (*overlap as f64).max(1e-9);
-            (max_duration as f64 / overlap).round() as i64
+            let ov = (*overlap as f64).max(1e-9);
+            (maxd as f64 / ov).round() as i64
         }
         FlatCostNode::Scale { n, children } => (*n as i64) * node_time(m, children.start, slot_ns),
     }
@@ -147,8 +139,7 @@ mod tests {
 
     #[test]
     fn sample_manifest_round_trips() {
-        let doc: ManifestDoc =
-            serde_json::from_str(SAMPLE).expect("deserialize sample manifest doc");
+        let doc: ManifestDoc = serde_json::from_str(SAMPLE).expect("deserialize sample manifest doc");
         assert_eq!(doc.sections.len(), 1);
         assert_eq!(doc.sections[0].section, "iter");
         let m = doc.section("iter").expect("iter section present");
@@ -167,10 +158,7 @@ mod tests {
         assert_eq!(m.nodes[1], FlatCostNode::Leaf(0));
         assert_eq!(
             m.nodes[2],
-            FlatCostNode::Scale {
-                n: 32,
-                children: 3..4
-            }
+            FlatCostNode::Scale { n: 32, children: 3..4 }
         );
         assert_eq!(
             m.node_labels[0].as_deref(),

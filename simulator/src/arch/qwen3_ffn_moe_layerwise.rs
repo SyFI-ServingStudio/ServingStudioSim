@@ -388,11 +388,7 @@ pub fn build(
     let embed_name = format!("{model_name}.embedding");
     let embed = Op::new(
         embed_name.clone(),
-        Arc::new(ElementwiseKernel::build(
-            embed_name,
-            resolved.embed,
-            bridge,
-        )?),
+        Arc::new(ElementwiseKernel::build(embed_name, resolved.embed, bridge)?),
     );
     let final_norm_name = format!("{model_name}.final_norm");
     let final_norm = Op::new(
@@ -690,11 +686,7 @@ impl Qwen3FfnMoeLayerwiseModel {
             slots.resize(self.pre_n_slots, LeafMetrics::ZERO);
             let mut ev = Self::evaluator(slots, inputs);
             self.eval_pre(batch, &mut ev);
-            debug_assert_eq!(
-                ev.filled(),
-                self.pre_n_slots,
-                "eval cursor must fill every slot"
-            );
+            debug_assert_eq!(ev.filled(), self.pre_n_slots, "eval cursor must fill every slot");
             CostTree::aggregate(&self.pre_flat, slots, scratch)
         } else {
             // Bridge bills pre(L) inside post(L-1); standalone pre_attn(L>0) is zero
@@ -723,11 +715,7 @@ impl Qwen3FfnMoeLayerwiseModel {
             self.eval_post_attn(batch, &mut ev);
             self.eval_moe(batch, &mut ev);
             self.eval_pre(batch, &mut ev);
-            debug_assert_eq!(
-                ev.filled(),
-                self.post_mid_n_slots,
-                "eval cursor must fill every slot"
-            );
+            debug_assert_eq!(ev.filled(), self.post_mid_n_slots, "eval cursor must fill every slot");
             CostTree::aggregate(&self.post_mid_flat, slots, scratch)
         } else {
             // Terminal: post-only.
@@ -735,11 +723,7 @@ impl Qwen3FfnMoeLayerwiseModel {
             let mut ev = Self::evaluator(slots, inputs);
             self.eval_post_attn(batch, &mut ev);
             self.eval_moe(batch, &mut ev);
-            debug_assert_eq!(
-                ev.filled(),
-                self.post_last_n_slots,
-                "eval cursor must fill every slot"
-            );
+            debug_assert_eq!(ev.filled(), self.post_last_n_slots, "eval cursor must fill every slot");
             CostTree::aggregate(&self.post_last_flat, slots, scratch)
         }
     }
@@ -760,11 +744,7 @@ impl Qwen3FfnMoeLayerwiseModel {
             self.embed
                 .eval(&ElementwiseKernelInput { num_tokens }, &mut ev);
         }
-        debug_assert_eq!(
-            ev.filled(),
-            self.prologue_n_slots,
-            "eval cursor must fill every slot"
-        );
+        debug_assert_eq!(ev.filled(), self.prologue_n_slots, "eval cursor must fill every slot");
         CostTree::aggregate(&self.prologue_flat, slots, scratch)
     }
 
@@ -784,11 +764,7 @@ impl Qwen3FfnMoeLayerwiseModel {
             self.final_norm.eval(&RmsNormKernelInput { m }, &mut ev);
             self.lm_head.eval(&SingleGemmKernelInput { m }, &mut ev);
         }
-        debug_assert_eq!(
-            ev.filled(),
-            self.epilogue_n_slots,
-            "eval cursor must fill every slot"
-        );
+        debug_assert_eq!(ev.filled(), self.epilogue_n_slots, "eval cursor must fill every slot");
         CostTree::aggregate(&self.epilogue_flat, slots, scratch)
     }
 }

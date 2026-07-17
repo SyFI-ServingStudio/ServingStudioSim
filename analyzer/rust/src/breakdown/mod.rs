@@ -43,7 +43,7 @@ use datafusion::prelude::SessionContext;
 use crate::io::{read_cost_manifests, report_path};
 use crate::session::{
     col, collect, column_f64, register_cost_log, require_columns, value_f32_list, value_f64,
-    value_groups, value_string, GroupInput, COST_LOG_TABLE,
+    value_groups, value_string, COST_LOG_TABLE, GroupInput,
 };
 use crate::trace::manifest::{node_time, FlatCostNode, Manifest};
 
@@ -137,11 +137,7 @@ pub async fn run(
 
     let mut rows: Vec<BreakRow> = Vec::new();
     for b in &batches {
-        let (pt, wid, iid) = (
-            col(b, "pool_tag")?,
-            col(b, "worker_id")?,
-            col(b, "iter_id")?,
-        );
+        let (pt, wid, iid) = (col(b, "pool_tag")?, col(b, "worker_id")?, col(b, "iter_id")?);
         let bid = col(b, "batch_id")?;
         let (sec, lay) = (col(b, "section")?, col(b, "layer")?);
         let (tt, st, gr) = (
@@ -196,8 +192,7 @@ pub async fn run(
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    fs::write(&out_path, out.as_bytes())
-        .with_context(|| format!("write {}", out_path.display()))?;
+    fs::write(&out_path, out.as_bytes()).with_context(|| format!("write {}", out_path.display()))?;
     println!(
         "wrote {} ({} iteration(s){})",
         out_path.display(),
@@ -283,10 +278,7 @@ fn leaf_short(name: &str) -> &str {
 /// Strip a trailing ` [..]` shape bracket off a worklet label
 /// (`unified.attn_block (AttnBlockTpWorklet) [tp=4; …]` → `… (AttnBlockTpWorklet)`).
 fn strip_brackets(label: &str) -> &str {
-    label
-        .split_once(" [")
-        .map(|(head, _)| head)
-        .unwrap_or(label)
+    label.split_once(" [").map(|(head, _)| head).unwrap_or(label)
 }
 
 /// Strip a trailing ` (Xxx)` parenthetical (the worklet struct name) off a label
@@ -310,6 +302,14 @@ fn node_label(m: &Manifest, idx: usize) -> Option<&str> {
     m.node_labels.get(idx).and_then(|o| o.as_deref())
 }
 
+fn fmt_overlap(o: f32) -> String {
+    if (o - o.round()).abs() < 1e-6 {
+        format!("{}", o.round() as i64)
+    } else {
+        format!("{o}")
+    }
+}
+
 /// us from ns, rounded.
 fn us(ns: i64) -> i64 {
     (ns as f64 / 1000.0).round() as i64
@@ -329,7 +329,10 @@ fn base_label(m: &Manifest, idx: usize) -> String {
             format!("{} ({})", leaf_short(&d.name), d.kind)
         }
         FlatCostNode::Sum { .. } => lbl.unwrap_or("Sum").to_string(),
-        FlatCostNode::Max { .. } => lbl.unwrap_or("Max").to_string(),
+        FlatCostNode::Max { overlap, .. } => {
+            lbl.map(str::to_string)
+                .unwrap_or_else(|| format!("Max{{overlap={}}}", fmt_overlap(*overlap)))
+        }
         FlatCostNode::Scale { n, .. } => format!("{} ×{}", lbl.unwrap_or("scale"), n),
     }
 }
@@ -353,8 +356,8 @@ fn signature(m: &Manifest, idx: usize) -> String {
             format!("L[{lbl}|{}|{}]", d.kind, leaf_short(&d.name))
         }
         FlatCostNode::Sum { children } => format!("S[{lbl}]({})", sig_children(m, children)),
-        FlatCostNode::Max { children, .. } => {
-            format!("M[{lbl}]({})", sig_children(m, children))
+        FlatCostNode::Max { overlap, children } => {
+            format!("M[{lbl}|{}]({})", fmt_overlap(*overlap), sig_children(m, children))
         }
         FlatCostNode::Scale { n, children } => {
             format!("X[{lbl}|{n}]({})", signature(m, children.start))
@@ -497,11 +500,7 @@ impl<'a> Renderer<'a> {
                     .iter()
                     .enumerate()
                     .max_by_key(|(_, g)| {
-                        node_time(
-                            self.m,
-                            rep_of(self.m, g, is_max, self.slot_ns),
-                            self.slot_ns,
-                        )
+                        node_time(self.m, rep_of(self.m, g, is_max, self.slot_ns), self.slot_ns)
                     })
                     .map(|(gi, _)| gi);
                 let n_groups = groups.len();
@@ -547,11 +546,7 @@ impl<'a> Renderer<'a> {
 /// column and (when `color`) wrapping critical-path rows yellow.
 fn render_tree(m: &Manifest, slot_ns: &[i64], color: bool) -> String {
     let root_ns = node_time(m, 0, slot_ns);
-    let r = Renderer {
-        m,
-        slot_ns,
-        root_ns,
-    };
+    let r = Renderer { m, slot_ns, root_ns };
     let mut lines = Vec::new();
     let root_indent = Indent {
         own: String::new(),
@@ -573,11 +568,7 @@ fn format_lines(lines: &[Line], color: bool) -> String {
     // text too (so `--no-color` still shows it).
     let lead = |l: &Line| format!("{}{}", if l.critical { "▸ " } else { "  " }, l.plain);
     // Single aligned time column: pad every lead to the widest, then the time cell.
-    let width = lines
-        .iter()
-        .map(|l| lead(l).chars().count())
-        .max()
-        .unwrap_or(0);
+    let width = lines.iter().map(|l| lead(l).chars().count()).max().unwrap_or(0);
     let mut out = String::new();
     for l in lines {
         let head = lead(l);
@@ -661,10 +652,7 @@ fn render_header(row: &BreakRow, m: &Manifest, color: bool) -> String {
         }
     }
 
-    s.push_str(&format!(
-        "total: {} us\n",
-        us((row.total_time_ms * 1e6).round() as i64)
-    ));
+    s.push_str(&format!("total: {} us\n", us((row.total_time_ms * 1e6).round() as i64)));
     s
 }
 
@@ -709,7 +697,7 @@ mod tests {
     #[test]
     fn node_time_matches_place_fold() {
         let m = mixed();
-        // a=10, b=8, c=4, d=5. Max{2}[8,4]=4; Scale{3}(4)=12; Sum=27.
+        // a=10, b=8, c=4, d=5. Max{2}[8,4]=4; Scale{3}(4)=12; Sum(10,12,5)=27.
         let slot_ns = [10i64, 8, 4, 5];
         assert_eq!(node_time(&m, 0, &slot_ns), 27);
         assert_eq!(node_time(&m, 4, &slot_ns), 4, "Max{{2}}[8,4]");
@@ -721,11 +709,7 @@ mod tests {
         let m = mixed();
         let slot_ns = [10i64, 8, 4, 5];
         let root_ns = node_time(&m, 0, &slot_ns);
-        let r = Renderer {
-            m: &m,
-            slot_ns: &slot_ns,
-            root_ns,
-        };
+        let r = Renderer { m: &m, slot_ns: &slot_ns, root_ns };
         let mut lines = Vec::new();
         r.render(0, 1, &root_indent(), true, None, &mut lines);
         // The Scale line and the Max child under it both show 12ns (the ×3
@@ -733,10 +717,7 @@ mod tests {
         let scale_line = lines.iter().find(|l| l.plain.contains("layer ×3")).unwrap();
         assert_eq!(scale_line.time_ns, 12);
         let attn_line = lines.iter().find(|l| l.plain.contains("attn")).unwrap();
-        assert_eq!(
-            attn_line.time_ns, 12,
-            "Max child ×3 = 12, scale passed through"
-        );
+        assert_eq!(attn_line.time_ns, 12, "Max child ×3 = 12, scale passed through");
     }
 
     #[test]
@@ -752,10 +733,7 @@ mod tests {
             clean_label("unified.attn_block (AttnBlockTpWorklet) [tp=4; qo 64→16]"),
             "unified.attn_block"
         );
-        assert_eq!(
-            clean_label("unified.moe_router (MoeRouterLocalWorklet)"),
-            "unified.moe_router"
-        );
+        assert_eq!(clean_label("unified.moe_router (MoeRouterLocalWorklet)"), "unified.moe_router");
         // No parenthetical / no bracket → untouched.
         assert_eq!(clean_label("layer"), "layer");
     }
@@ -789,22 +767,14 @@ mod tests {
         let m = two_experts();
         let slot_ns = [10i64, 6]; // expert times differ (skew)
         let root_ns = node_time(&m, 0, &slot_ns);
-        let r = Renderer {
-            m: &m,
-            slot_ns: &slot_ns,
-            root_ns,
-        };
+        let r = Renderer { m: &m, slot_ns: &slot_ns, root_ns };
         let mut lines = Vec::new();
         r.render(0, 1, &root_indent(), true, None, &mut lines);
         // root Max + collapsed ×2 representative Sum + that Sum's leaf = 3 lines
         // (only the two sibling Sums collapse; the rep still renders its child).
         assert_eq!(lines.len(), 3);
         let rep = &lines[1];
-        assert!(
-            rep.plain.contains("expert_compute ×2"),
-            "got {:?}",
-            rep.plain
-        );
+        assert!(rep.plain.contains("expert_compute ×2"), "got {:?}", rep.plain);
         // Trailing shows avg only = (10+6)/2 = 8; the max is the row's time column.
         assert_eq!(rep.trailing, format!("avg {} us", us(8)));
         // Representative shows the slow (max) member's subtree → 10ns.
@@ -816,11 +786,7 @@ mod tests {
         let m = mixed();
         let slot_ns = [10i64, 8, 4, 5];
         let root_ns = node_time(&m, 0, &slot_ns);
-        let r = Renderer {
-            m: &m,
-            slot_ns: &slot_ns,
-            root_ns,
-        };
+        let r = Renderer { m: &m, slot_ns: &slot_ns, root_ns };
         let mut lines = Vec::new();
         r.render(0, 1, &root_indent(), true, None, &mut lines);
         // root (Sum=27) critical; its max child is Scale (12) > Leaf0 (10) > Leaf3 (5).

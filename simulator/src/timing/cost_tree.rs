@@ -35,8 +35,8 @@ pub enum CostNode {
     Leaf(usize),
     /// `Σ children` (serial composition; time/flops/bytes all sum).
     Sum(Vec<CostNode>),
-    /// Fan-out: wallclock `= max(children) / overlap`. The coefficient belongs
-    /// to the composition boundary; leaf work still remains fully accounted.
+    /// Fan-out: wallclock `= max(children)/overlap`. Unused by the dense vertical
+    /// (no collective); present for future HP/EP fan-out (INV-3).
     Max {
         overlap: f32,
         children: Vec<CostNode>,
@@ -102,9 +102,8 @@ pub struct LeafDesc {
 /// parquet `slot_*` list columns) with the flattened aggregation
 /// [`nodes`](Self::nodes), so a consumer reading a row from `cost_log/` can
 /// re-run [`CostTree::aggregate`] over that row's `slot_time_ms` to reproduce
-/// `total_time_ms`: the `Scale{n}` fold, `Sum`, and `Max` operators are all
-/// present (slot names alone can't reconstruct the total). The flat `Max` node
-/// retains its fixed protocol-v1 compatibility field on the wire.
+/// `total_time_ms`: the `Scale{n}` fold, `Sum`, and `Max{overlap}` operators
+/// are all present (slot names alone can't reconstruct the total).
 ///
 /// [`node_labels`](Self::node_labels) recovers the composite identity that
 /// [`CostTree::flatten`] drops: it is index-aligned to [`nodes`](Self::nodes) —
@@ -227,10 +226,7 @@ impl CostTreeBuilder {
             kind: kind.into(),
             config: config.into(),
             backends,
-            symbols: symbols
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
+            symbols: symbols.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
         });
         CostNode::Leaf(slot)
     }
@@ -405,7 +401,7 @@ impl CostTree {
     /// Composites combine:
     ///   - `Sum`  — field-wise sum of children (coverage flags unioned);
     ///   - `Scale{n}` — child subtree × `n` (the homogeneous-layer fold);
-    ///   - `Max{overlap}` — `time = max(child.time) / overlap`, other fields summed
+    ///   - `Max{overlap}` — `time = max(child.time)/overlap`, other fields summed
     ///     (flops/bytes/energy always add — work doesn't overlap away, INV-4).
     /// Coverage flags always OR up the tree, so a warning anywhere surfaces at
     /// the root.
@@ -707,44 +703,19 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
     }
 
     #[test]
-    fn aggregate_max_applies_overlap_but_sums_work() {
-        // Max{overlap=2}(leaf x, leaf y): time = max(x,y)/2, flops/bytes sum.
+    fn aggregate_max_takes_overlapped_time_but_sums_work() {
+        // Max{overlap=2}( leaf x, leaf y ): time = max(x,y)/2, flops/bytes sum.
         let mut b = CostTreeBuilder::new();
         let root = CostNode::Max {
             overlap: 2.0,
-            children: vec![b.leaf("x", "kx", "", vec![]), b.leaf("y", "ky", "", vec![])],
-        };
-        let tree = b.finish(root);
-        assert!(tree.describe().starts_with("Max{overlap=2}"));
-        let flat = tree.flatten();
-        assert!(matches!(flat[0], FlatCostNode::Max { overlap: 2.0, .. }));
-        let wire_json = serde_json::to_string(&flat[0]).unwrap();
-        assert!(wire_json.contains(r#""overlap":2.0"#));
-        assert_eq!(
-            serde_json::from_str::<FlatCostNode>(&wire_json).unwrap(),
-            flat[0]
-        );
-        let buf = [leaf(4.0, 10.0, 100.0), leaf(6.0, 20.0, 200.0)];
-        let mut scratch = Vec::new();
-        let total = CostTree::aggregate(&flat, &buf, &mut scratch).m;
-        assert_eq!(total.time_ms, 3.0);
-        assert_eq!(total.flops, 30.0); // work still sums (INV-4)
-        assert_eq!(total.bytes, 300.0);
-    }
-
-    #[test]
-    fn aggregate_max_overlap_one_preserves_existing_fanout_result() {
-        let mut b = CostTreeBuilder::new();
-        let root = CostNode::Max {
-            overlap: 1.0,
             children: vec![b.leaf("x", "kx", "", vec![]), b.leaf("y", "ky", "", vec![])],
         };
         let flat = b.finish(root).flatten();
         let buf = [leaf(4.0, 10.0, 100.0), leaf(6.0, 20.0, 200.0)];
         let mut scratch = Vec::new();
         let total = CostTree::aggregate(&flat, &buf, &mut scratch).m;
-        assert_eq!(total.time_ms, 6.0);
-        assert_eq!(total.flops, 30.0);
+        assert_eq!(total.time_ms, 6.0 / 2.0); // max(4, 6)/overlap
+        assert_eq!(total.flops, 30.0); // work still sums (INV-4)
         assert_eq!(total.bytes, 300.0);
     }
 

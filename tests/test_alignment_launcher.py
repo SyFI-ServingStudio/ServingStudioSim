@@ -14,7 +14,6 @@ from launcher import alignment as alignment_launcher
 from launcher import exec as launcher_exec
 from launcher import timing_predict as timing_predict_launcher
 from launcher.alignment_config import load_analyze_config, load_profile_config
-from launcher.analyzer_pipeline import AnalyzerBinaryContract
 
 
 def _write_config(path: Path, config: dict) -> None:
@@ -341,7 +340,9 @@ def test_timing_predict_preserves_simulation_backend_policy(tmp_path, monkeypatc
     simulation, _, _ = _write_completed_inputs(tmp_path)
     params_path = simulation / "raw" / "params.json"
     params = json.loads(params_path.read_text())
-    params["backends"] = {"main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}}
+    params["backends"] = {
+        "main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}
+    }
     params_path.write_text(json.dumps(params))
     monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
 
@@ -448,64 +449,11 @@ def test_alignment_analysis_calls_only_selected_subjects(tmp_path, monkeypatch):
         return 0, "alignment accepted\n"
 
     monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda build_type: analyzer)
-    stat = analyzer.stat()
-    contract = AnalyzerBinaryContract(
-        version="0.1.0",
-        revision="a" * 40,
-        binary_sha256=f"sha256:{'b' * 64}",
-        subject_scopes=(
-            ("throughput", "run"),
-            ("alignment-e2e", "alignment"),
-        ),
-        binary_fingerprint=(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns),
-    )
-    monkeypatch.setattr(
-        launcher_exec,
-        "snapshot_analyzer_binary",
-        lambda *_args: (analyzer, contract),
-    )
     monkeypatch.setattr(launcher_exec, "_run_capture_sync", fake_capture)
 
     launcher_exec.run_alignment_analysis(log_dir, "release", ["alignment-e2e"])
     assert invocations[0] == [str(analyzer), "alignment", str(log_dir), "alignment-e2e"]
     assert invocations[1][-1:] == ["alignment-e2e"]
-
-
-def test_alignment_analysis_default_comes_from_binary_registry(tmp_path, monkeypatch):
-    analyzer = tmp_path / "analyze"
-    analyzer.touch()
-    log_dir = tmp_path / "analysis"
-    log_dir.mkdir()
-    invocations = []
-    stat = analyzer.stat()
-    contract = AnalyzerBinaryContract(
-        version="0.1.0",
-        revision="a" * 40,
-        binary_sha256=f"sha256:{'b' * 64}",
-        subject_scopes=(
-            ("throughput", "run"),
-            ("alignment-e2e", "alignment"),
-            ("alignment-future", "alignment"),
-        ),
-        binary_fingerprint=(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns),
-    )
-
-    monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda _build: analyzer)
-    monkeypatch.setattr(
-        launcher_exec,
-        "snapshot_analyzer_binary",
-        lambda *_args: (analyzer, contract),
-    )
-    monkeypatch.setattr(
-        launcher_exec,
-        "_run_capture_sync",
-        lambda argv: invocations.append(argv) or (0, "accepted\n"),
-    )
-
-    launcher_exec.run_alignment_analysis(log_dir, "release")
-
-    assert invocations[0][-2:] == ["alignment-e2e", "alignment-future"]
-    assert invocations[1][-2:] == ["alignment-e2e", "alignment-future"]
 
 
 def test_tracelab_invocation_keeps_vibesim_as_a_typed_frontend(tmp_path, monkeypatch):
