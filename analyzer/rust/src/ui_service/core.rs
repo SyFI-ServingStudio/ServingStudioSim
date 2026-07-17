@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use super::artifact::{read_bytes, read_run_json};
 use super::concurrency::concurrency_descriptor;
 use super::discovery::{regular_file, timestamp, DiscoveredRun, StageStatus};
+use super::kernel_time_share::kernel_time_share_descriptor;
 use super::kv_occupancy::kv_occupancy_descriptor;
 use super::model::model_config_path;
 use super::slo::slo_general_descriptor;
@@ -72,6 +73,9 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     }
     if let Some(kv_occupancy) = kv_occupancy_descriptor(run)? {
         descriptor["subjects"]["kv-occupancy"] = kv_occupancy;
+    }
+    if let Some(kernel_time_share) = kernel_time_share_descriptor(run)? {
+        descriptor["subjects"]["kernel-time-share"] = kernel_time_share;
     }
     if let Some(detail) = details_descriptor(run) {
         descriptor["details"]["worker-operation-index"] = detail.clone();

@@ -8,6 +8,7 @@ use super::catalog::build_catalog;
 use super::concurrency::{read_concurrency_payload, read_concurrency_report};
 use super::core::{build_descriptor, read_summary};
 use super::discovery::{configure_logs_roots, discover_runs};
+use super::kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
 use super::kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use super::model::read_model;
 use super::slo::{read_slo_general_payload, read_slo_general_report};
@@ -91,6 +92,7 @@ fn make_core_run(path: &Path) {
             {"name": "slo-general", "status": "ok"},
             {"name": "throughput", "status": "ok"},
             {"name": "utilization", "status": "ok"},
+            {"name": "kernel-time-share", "status": "ok"},
             {"name": "kv-occupancy", "status": "ok"}
         ]}"#,
     )
@@ -191,6 +193,38 @@ fn make_core_run(path: &Path) {
         }"#,
     )
     .expect("write utilization payload");
+    fs::write(
+        path.join("reports/kernel_time_share_report.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "totals": {"overall": {"kernel_time_ms": 10.0}}
+        }"#,
+    )
+    .expect("write kernel-time-share report");
+    fs::write(
+        path.join("payloads/kernel_time_share_composition.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "overall": {
+                "kernel_time_ms": 10.0,
+                "segments": [{
+                    "position": "attn.decode",
+                    "kind": "flashinfer_attn_decode",
+                    "kernel_time_ms": 10.0,
+                    "share_pct": 100.0
+                }]
+            },
+            "pools": [],
+            "workers": [],
+            "positions": [],
+            "definitions": {
+                "tree_attribution": "critical path with Sum/Scale/Max/overlap"
+            }
+        }"#,
+    )
+    .expect("write kernel-time-share payload");
     fs::write(
         path.join("reports/kv_occupancy_report.json"),
         r#"{
@@ -355,6 +389,14 @@ fn descriptor_indexes_existing_core_resources() {
     assert_eq!(
         descriptor["subjects"]["kv-occupancy"]["payload_href"],
         "subjects/kv-occupancy/payload"
+    );
+    assert_eq!(
+        descriptor["subjects"]["kernel-time-share"]["status"],
+        "ready"
+    );
+    assert_eq!(
+        descriptor["subjects"]["kernel-time-share"]["payload_href"],
+        "subjects/kernel-time-share/payload"
     );
     assert!(descriptor["analysis"]["revision"]
         .as_str()
@@ -660,6 +702,27 @@ fn kv_occupancy_resources_expose_workers_and_pool_average() {
         payload["series"][0]["workers"][1]["active_tokens"],
         json!([40])
     );
+}
+
+#[test]
+fn kernel_time_share_resources_preserve_critical_path_attribution() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let report = read_kernel_time_share_report(&run).expect("read kernel-time-share report");
+    let payload = read_kernel_time_share_payload(&run).expect("read kernel-time-share payload");
+
+    assert_eq!(report["totals"]["overall"]["kernel_time_ms"], 10.0);
+    assert_eq!(payload["overall"]["segments"][0]["share_pct"], 100.0);
+    assert!(payload["definitions"]["tree_attribution"]
+        .as_str()
+        .is_some_and(|definition| definition.contains("critical path")));
 }
 
 #[test]
