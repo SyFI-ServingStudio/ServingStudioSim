@@ -54,6 +54,7 @@ alignment analyze ──reads completed roots + mapping
 | `analyze run <log_dir> [subjects...]` | Rust | Compute subjects → `reports/` + `payloads/`, plus a subject-less `reports/analyzer_timing.json` run-meta sidecar. No subjects = all applicable. |
 | `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
+| `analyze serve --logs-root <dir>` | Rust | Serve the read-only viz-ui catalog, bounded worker operation windows, and exact `(worker, iter, batch, operation)` CostTrees reconstructed lazily from `cost_log` + manifest. |
 | `analyze list` | Rust | Print the subject catalog. |
 | `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNG plots, including sampled alignment breakdowns. No subjects = all renderers. |
 
@@ -79,6 +80,26 @@ sim/L7, containing:
   throughput subject reads it to normalize per-GPU. Absent → treated as 1 GPU.
 
 All three are read as bare JSON / parquet by name — no `simulator` types crossed.
+Worker detail remains outside the run descriptor body: the descriptor advertises
+the `workers` capability, and the only selectable entity is one raw operation.
+`workers/{pool}/{worker}/operations?offset=...&limit=...` reads any contiguous
+global-ordinal range (at most 384 summaries); the UI uses 64-operation ranges
+for drag navigation. Each summary is one `worker_cost` row with stable identity
+`(iter_id,batch_id,operation_id)`, section/layer, and its exact bounded interval.
+The worker index sorts globally by `(start_ms,iter_id,batch_id,operation_id)`;
+the local decimal `operation_id` is assigned by
+`(wall_start_ms,section,layer,total_time_ms)`. Duplicate local keys or
+non-monotonic global end times fail loud, preserving deterministic O(log N +
+hits) half-open seek without rescanning millions of rows.
+
+`workers/{pool}/{worker}/operations/seek?at_ms=...` returns every operation
+covering the cursor, an anchor (or nearest operation when there is no hit), a
+suggested 64-operation viewport, and one surrounding 192-operation buffer.
+`worker_kind` is `afd_attn`, `afd_ffn`, or `iterwise`; `batch_role` states
+whether `batch_id` represents a `slot` or a `batch`. Exact CostTrees use
+`operations/{iter_id}/{batch_id}/{operation_id}/cost-tree` and reconstruct only
+that one raw row. A streaming scan builds a compact per-worker index once; a
+512 MiB byte-budgeted LRU bounds retained indexes, and range JSON is not cached.
 The alignment path reads `<analysis_log_dir>/alignment_manifest.json`, which
 points to normalized NSYS JSON in the profile root, timing-predict cost
 parquet/manifest, the profile's `replay_result` TraceLab JSONL, its optional
@@ -106,11 +127,12 @@ rust/                The `analyze` binary (DataFusion compute side).
                        components (the kernel-input-distribution feature projection).
   src/request/         Category = per-request/session metrics (slo).
   src/throughput/      Category = serving-rate-over-time metrics (throughput).
-  src/utilization/     Per-pool GPU busy-fraction over time.
+  src/utilization/     Per-worker GPU busy-fraction with per-pool averages over time.
   src/batch/           Batch composition + per-location achieved kernel throughput.
   src/backend/         Backend selection over a kernel position's input feature space.
   src/breakdown/       CostTree replay + run-wide leaf-position composition.
   src/conservation/    Run-wide work-accounting checks (actual vs expected).
+  src/concurrency/     Run-level in-flight requests over simulated wall-clock time.
   src/kv/              Per-pool KV-cache occupancy over time.
   src/alignment_iteration/  Per-iteration total/operation/kernel comparison.
   src/alignment_e2e/        Paired request latency + completion throughput.
@@ -122,7 +144,7 @@ python/              The render side (matplotlib over payload JSON).
   __main__.py          `render <log_dir> [subjects]`; maps subject → renderer,
                        runs figure jobs in parallel (fork processes; matplotlib
                        is thread-hostile).
-  request/, throughput/, utilization/, batch/, backend/, breakdown/, conservation/, kv/  One renderer module per subject; returns figure "jobs".
+  request/, throughput/, utilization/, batch/, backend/, breakdown/, conservation/, concurrency/, kv/  One renderer module per subject; returns figure "jobs".
   alignment_iteration/, alignment_e2e/, alignment_workload/  Alignment payload renderers.
   common/              Shared plotting: payload loader + run-dir layout, figure
                        scaffolding, CDF plot, style.
@@ -144,11 +166,12 @@ Current catalog:
 | `slo-general` | request | `request_slo.parquet` scalar columns | TTFT/TPOT/E2E stats / per-metric CDF series |
 | `slo-detailed` | request | `request_slo.parquet` `output_token_times` column | ITL stats / CDF series when per-token logging is enabled |
 | `throughput` | throughput | `request_state.parquet` (+ `run_meta.json`) | per-GPU prefill/decode/total TPS totals / fine `segments` + coarse `binned_segments` series |
-| `utilization` | utilization | `cost_log` slot times (+ `run_meta.json`) | per-pool GPU compute utilization (fraction of workers busy) over time / `utilization_series` |
+| `utilization` | utilization | `cost_log` slot times (+ `run_meta.json`) | per-worker GPU compute utilization plus per-pool averages over time / `utilization_series` |
 | `batch` | batch | `request_state.parquet` | per-batch composition (batch / prefill / decode token counts) over time + stats / `batch_scatter` series |
 | `kernel-throughput` | batch | 1/50-sampled `cost_log` slots + matching CostTree manifests | achieved TFLOP/s (compute) and GB/s (memory BW) per cost-tree location / per-location `kernel_throughput_locations` stats |
 | `kernel-input-distribution` | backend | sampled `cost_log` `slot_input` + `slot_backend` + matching CostTree manifest `backends` lists | per-position selected-backend counts/ratios + PCA/feature projection / one scatter per position (`kernel_input_distribution_scatter`), rendered to `plots/kernel_input_dist/<position>.png`; unavailable on runs without per-slot backend + input logging |
 | `kernel-time-share` | breakdown | `cost_log` slot times + matching CostTree manifests | root kernel-time share by leaf position at overall / pool / worker levels; exact on small runs and bounded worker-stratified sampling on large runs |
+| `concurrency` | concurrency | `request_slo.parquet` arrival + terminal timestamps | exact request count/peak/mean / <=512-bin time-weighted active-request series |
 | `workload-conservation` | conservation | `cost_log` actuals + `request_slo.parquet` per-request expected | run-wide prefill/decode/FFN/KV work accounting, pass/fail / `workload_conservation_checks` |
 | `kv-occupancy` | kv | `kv_snapshot` stream + `run_meta.json` capacity | per-pool KV occupancy (active / projected-peak / promised tokens, and as a fraction of capacity) over time / `kv_occupancy_series` |
 | `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping + simulation `gpu_time_multiplier` | kernel/mapping error stats / separate kernel-busy and measured first-kernel-to-next-first-kernel GPU-cycle overviews + per-iteration mapped stacks |

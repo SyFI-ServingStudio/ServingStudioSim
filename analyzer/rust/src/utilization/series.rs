@@ -1,5 +1,5 @@
-//! Per-pool GPU utilization over time: the mean fraction of a pool's workers busy
-//! computing, binned into equal-width time segments (ref's interval-spread).
+//! Per-worker GPU utilization plus per-pool averages over time, binned into
+//! equal-width time segments (ref's interval-spread).
 //!
 //! `cost_log` records each worker iteration's busy interval
 //! `[wall_start_ms, wall_start_ms + total_time_ms]`. Grouped by pool (the
@@ -47,10 +47,21 @@ struct PoolUsage {
     bins: Vec<f64>,
 }
 
+#[derive(Debug, PartialEq)]
+struct WorkerUsage {
+    pool_id: u64,
+    pool_tag: String,
+    worker_id: u64,
+    bins: Vec<f64>,
+}
+
 pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
         let reason = "cost_log/ dir not found";
-        return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+        return Ok((
+            unavailable(log_dir, reason),
+            unavailable_payload(log_dir, reason),
+        ));
     }
     require_columns(ctx, COST_LOG_TABLE, COST_COLS).await?;
 
@@ -69,18 +80,26 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
         Some(span) => span,
         None => {
             let reason = "cost_log has no iterations to bin";
-            return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+            return Ok((
+                unavailable(log_dir, reason),
+                unavailable_payload(log_dir, reason),
+            ));
         }
     };
     if !(t_max > t_min) {
         let reason = "cost_log busy span is zero (no positive iteration durations)";
-        return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+        return Ok((
+            unavailable(log_dir, reason),
+            unavailable_payload(log_dir, reason),
+        ));
     }
     let span_ms = t_max - t_min;
     let n_bins = FINE_BINS;
     let bin_width = span_ms / n_bins as f64;
     let t_start: Vec<f64> = (0..n_bins).map(|b| t_min + b as f64 * bin_width).collect();
-    let t_end: Vec<f64> = (0..n_bins).map(|b| t_min + (b + 1) as f64 * bin_width).collect();
+    let t_end: Vec<f64> = (0..n_bins)
+        .map(|b| t_min + (b + 1) as f64 * bin_width)
+        .collect();
 
     // Per-((pool_tag, worker), bin) busy-ms via a SQL GROUP BY — collapses tens of
     // millions of rows to num_workers × n_bins. Each iteration's whole duration
@@ -93,10 +112,14 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
     // remain the aggregation key even when an old run lacks run_meta; the numeric
     // id is only a stable, backwards-compatible output label.
     let pool_usage = collect_pool_usage(&pool_id_by_worker, &worker_bins, n_bins);
+    let worker_usage = collect_worker_usage(&pool_usage, &worker_bins, n_bins);
 
-    // Per-pool fine series + run-average. Sorted by pool id for a stable plot order.
+    // Pool-average series stay under `series` for v1 compatibility. Worker
+    // series are additive and retain the composite `(pool_tag, worker_id)` identity.
     let mut series = Vec::new();
+    let mut worker_series = Vec::new();
     let mut totals_per_pool = Vec::new();
+    let mut totals_per_worker = Vec::new();
     let mut avg = serde_json::Map::new();
     let mut overall_busy = 0.0;
     let mut overall_worker_ms = 0.0;
@@ -124,7 +147,28 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
         overall_busy += busy;
         overall_worker_ms += span_ms * n_workers;
     }
-    let overall_avg = if overall_worker_ms > 0.0 { overall_busy / overall_worker_ms } else { 0.0 };
+    for worker in &worker_usage {
+        let util = utilization_values(&worker.bins, bin_width, 1.0);
+        let avg_util = worker.bins.iter().sum::<f64>() / span_ms;
+        worker_series.push(json!({
+            "key": format!("worker_{}_{}", worker.pool_id, worker.worker_id),
+            "label": format!("{}/{}", worker.pool_tag, worker.worker_id),
+            "pool_tag": worker.pool_tag,
+            "worker_id": worker.worker_id,
+            "util": util,
+        }));
+        totals_per_worker.push(json!({
+            "pool": worker.pool_id,
+            "pool_tag": worker.pool_tag,
+            "worker_id": worker.worker_id,
+            "avg_util": avg_util,
+        }));
+    }
+    let overall_avg = if overall_worker_ms > 0.0 {
+        overall_busy / overall_worker_ms
+    } else {
+        0.0
+    };
 
     let report = json!({
         "schema_version": SCHEMA_VERSION,
@@ -140,6 +184,7 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
         "available": true,
         "totals": {
             "per_pool": totals_per_pool,
+            "per_worker": totals_per_worker,
             "overall_avg": overall_avg,
         },
         "definitions": definitions(),
@@ -151,12 +196,14 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
             "log_dir": log_dir.display().to_string(),
             "gpu_name": gpu_name,
             "unit": "fraction of pool workers busy (0-1)",
+            "worker_unit": "fraction of worker/GPU busy time (0-1)",
             // Per-pool run-average — the fine plot's dashed reference line.
             "avg": Value::Object(avg),
         },
         "t_start_ms": t_start,
         "t_end_ms": t_end,
         "series": series,
+        "worker_series": worker_series,
         "definitions": definitions(),
     });
 
@@ -246,6 +293,49 @@ fn collect_pool_usage(
     usage
 }
 
+/// Rebuild dense per-worker bins from the bounded SQL aggregate. Seeding from
+/// `pool_usage` keeps idle workers from run metadata visible as all-zero series.
+fn collect_worker_usage(
+    pool_usage: &[PoolUsage],
+    worker_bins: &[WorkerBin],
+    n_bins: usize,
+) -> Vec<WorkerUsage> {
+    let mut bins_by_worker: BTreeMap<WorkerKey, Vec<f64>> = pool_usage
+        .iter()
+        .flat_map(|pool| {
+            pool.worker_ids
+                .iter()
+                .map(|worker_id| ((pool.pool_tag.clone(), *worker_id), vec![0.0; n_bins]))
+        })
+        .collect();
+    for worker_bin in worker_bins {
+        bins_by_worker
+            .entry((worker_bin.pool_tag.clone(), worker_bin.worker_id))
+            .or_insert_with(|| vec![0.0; n_bins])[worker_bin.bin] += worker_bin.busy_ms;
+    }
+
+    let pool_id_by_tag: BTreeMap<&str, u64> = pool_usage
+        .iter()
+        .map(|pool| (pool.pool_tag.as_str(), pool.pool_id))
+        .collect();
+    let mut usage = bins_by_worker
+        .into_iter()
+        .map(|((pool_tag, worker_id), bins)| WorkerUsage {
+            pool_id: pool_id_by_tag[pool_tag.as_str()],
+            pool_tag,
+            worker_id,
+            bins,
+        })
+        .collect::<Vec<_>>();
+    usage.sort_by(|left, right| {
+        left.pool_id
+            .cmp(&right.pool_id)
+            .then_with(|| left.pool_tag.cmp(&right.pool_tag))
+            .then_with(|| left.worker_id.cmp(&right.worker_id))
+    });
+    usage
+}
+
 fn utilization_values(bins: &[f64], bin_width: f64, n_workers: f64) -> Vec<f64> {
     let capacity = bin_width * n_workers;
     bins.iter()
@@ -312,11 +402,12 @@ async fn collect_worker_bins(
 
 fn definitions() -> Value {
     json!({
-        "scope": "all cost_log iterations, grouped by pool",
-        "metric": "mean fraction of a pool's workers busy computing in each time bin",
+        "scope": "all cost_log iterations, grouped by worker and pool",
+        "metric": "fraction of each worker busy computing, plus the mean across each pool, in each time bin",
         "bin": "one equal-width time segment (fine view, 200 bins over the run span)",
-        "capacity": "bin_width × workers_in_pool — the denominator making util a 0-1 fraction",
-        "avg_util": "pool busy time / (span × workers_in_pool) — the run-average reference",
+        "worker_capacity": "bin_width — the denominator for one worker's busy fraction",
+        "pool_capacity": "bin_width × workers_in_pool — the denominator for the pool-average fraction",
+        "avg_util": "worker busy time / span, or pool busy time / (span × workers_in_pool)",
         "note": "a unified worker runs its replica in lockstep across its GPUs, so \
                  worker-busy ≡ GPU-busy and the fraction reads as per-GPU utilization",
     })
@@ -339,6 +430,7 @@ fn unavailable_payload(log_dir: &Path, reason: &str) -> Value {
         "t_start_ms": [],
         "t_end_ms": [],
         "series": [],
+        "worker_series": [],
     })
 }
 
@@ -366,6 +458,7 @@ mod tests {
         ];
 
         let usage = collect_pool_usage(&pool_id_by_worker, &worker_bins, 1);
+        let workers = collect_worker_usage(&usage, &worker_bins, 1);
 
         assert_eq!(usage.len(), 2);
         assert_eq!(
@@ -381,10 +474,37 @@ mod tests {
         assert_eq!(usage[1].pool_id, 1);
         assert_eq!(usage[1].pool_tag, "ffn");
         assert_eq!(usage[1].bins, vec![12.0]);
+        assert_eq!(workers.len(), 2);
+        assert_eq!(workers[0].pool_tag, "attn");
+        assert_eq!(workers[0].worker_id, 0);
+        assert_eq!(workers[0].bins, vec![6.0]);
+        assert_eq!(workers[1].pool_tag, "ffn");
+        assert_eq!(workers[1].worker_id, 0);
+        assert_eq!(workers[1].bins, vec![12.0]);
 
         // The analyzer must expose an impossible overlap instead of hiding it
         // behind an output clamp; this makes future accounting bugs diagnosable.
         let ffn_util = utilization_values(&usage[1].bins, 10.0, 1.0);
         assert!((ffn_util[0] - 1.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn idle_roster_worker_remains_visible() {
+        let pool_id_by_worker =
+            BTreeMap::from([(("attn".to_owned(), 0), 3), (("attn".to_owned(), 1), 3)]);
+        let worker_bins = vec![WorkerBin {
+            pool_tag: "attn".to_owned(),
+            worker_id: 0,
+            bin: 0,
+            busy_ms: 5.0,
+        }];
+
+        let pools = collect_pool_usage(&pool_id_by_worker, &worker_bins, 2);
+        let workers = collect_worker_usage(&pools, &worker_bins, 2);
+
+        assert_eq!(workers.len(), 2);
+        assert_eq!(workers[0].bins, vec![5.0, 0.0]);
+        assert_eq!(workers[1].worker_id, 1);
+        assert_eq!(workers[1].bins, vec![0.0, 0.0]);
     }
 }
