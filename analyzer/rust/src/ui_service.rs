@@ -9,6 +9,7 @@ mod catalog;
 mod concurrency;
 mod core;
 mod discovery;
+mod kernel_input_distribution;
 mod kernel_time_share;
 mod kv_occupancy;
 mod model;
@@ -20,6 +21,7 @@ mod topology;
 mod utilization;
 mod worker_detail;
 mod workload;
+mod workload_conservation;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -40,6 +42,9 @@ use catalog::build_catalog;
 use concurrency::{read_concurrency_payload, read_concurrency_report};
 use core::{build_descriptor, read_summary};
 use discovery::{configure_logs_roots, resolve_run, ConfiguredRoot, DiscoveredRun};
+use kernel_input_distribution::{
+    read_kernel_input_distribution_payload, read_kernel_input_distribution_report,
+};
 use kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
 use kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use model::read_model;
@@ -51,6 +56,9 @@ use worker_detail::{
     exact_operation_cost_tree, operation_range, operation_seek, OperationIndexCache, OperationRange,
 };
 use workload::read_workload;
+use workload_conservation::{
+    read_workload_conservation_payload, read_workload_conservation_report,
+};
 
 const PROTOCOL_VERSION: u32 = 1;
 const TIMELINE_PROFILE_BODY_LIMIT: usize = 16 * 1024;
@@ -120,12 +128,28 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
             get(get_kv_occupancy_payload),
         )
         .route(
+            "/api/v1/runs/{run_id}/subjects/kernel-input-distribution/report",
+            get(get_kernel_input_distribution_report),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/kernel-input-distribution/payload",
+            get(get_kernel_input_distribution_payload),
+        )
+        .route(
             "/api/v1/runs/{run_id}/subjects/kernel-time-share/report",
             get(get_kernel_time_share_report),
         )
         .route(
             "/api/v1/runs/{run_id}/subjects/kernel-time-share/payload",
             get(get_kernel_time_share_payload),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/workload-conservation/report",
+            get(get_workload_conservation_report),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/workload-conservation/payload",
+            get(get_workload_conservation_payload),
         )
         .route(
             "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations",
@@ -336,11 +360,48 @@ async fn get_kernel_time_share_report(
     read_run_resource(state, run_id, |run| read_kernel_time_share_report(&run)).await
 }
 
+async fn get_kernel_input_distribution_report(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| {
+        read_kernel_input_distribution_report(&run)
+    })
+    .await
+}
+
+async fn get_kernel_input_distribution_payload(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| {
+        read_kernel_input_distribution_payload(&run)
+    })
+    .await
+}
+
 async fn get_kernel_time_share_payload(
     RoutePath(run_id): RoutePath<String>,
     State(state): State<ServiceState>,
 ) -> Response {
     read_run_resource(state, run_id, |run| read_kernel_time_share_payload(&run)).await
+}
+
+async fn get_workload_conservation_report(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_workload_conservation_report(&run)).await
+}
+
+async fn get_workload_conservation_payload(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| {
+        read_workload_conservation_payload(&run)
+    })
+    .await
 }
 
 #[derive(Deserialize)]

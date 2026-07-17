@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use super::artifact::{read_bytes, read_run_json};
 use super::concurrency::concurrency_descriptor;
 use super::discovery::{regular_file, timestamp, DiscoveredRun, StageStatus};
+use super::kernel_input_distribution::kernel_input_distribution_descriptor;
 use super::kernel_time_share::kernel_time_share_descriptor;
 use super::kv_occupancy::kv_occupancy_descriptor;
 use super::model::model_config_path;
@@ -15,6 +16,7 @@ use super::throughput::throughput_descriptor;
 use super::utilization::utilization_descriptor;
 use super::worker_detail::details_descriptor;
 use super::workload::trace_file_paths;
+use super::workload_conservation::workload_conservation_descriptor;
 use super::PROTOCOL_VERSION;
 
 pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
@@ -74,8 +76,14 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     if let Some(kv_occupancy) = kv_occupancy_descriptor(run)? {
         descriptor["subjects"]["kv-occupancy"] = kv_occupancy;
     }
+    if let Some(kernel_input_distribution) = kernel_input_distribution_descriptor(run)? {
+        descriptor["subjects"]["kernel-input-distribution"] = kernel_input_distribution;
+    }
     if let Some(kernel_time_share) = kernel_time_share_descriptor(run)? {
         descriptor["subjects"]["kernel-time-share"] = kernel_time_share;
+    }
+    if let Some(workload_conservation) = workload_conservation_descriptor(run)? {
+        descriptor["subjects"]["workload-conservation"] = workload_conservation;
     }
     if let Some(detail) = details_descriptor(run) {
         descriptor["details"]["worker-operation-index"] = detail.clone();

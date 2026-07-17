@@ -8,6 +8,9 @@ use super::catalog::build_catalog;
 use super::concurrency::{read_concurrency_payload, read_concurrency_report};
 use super::core::{build_descriptor, read_summary};
 use super::discovery::{configure_logs_roots, discover_runs};
+use super::kernel_input_distribution::{
+    read_kernel_input_distribution_payload, read_kernel_input_distribution_report,
+};
 use super::kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
 use super::kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use super::model::read_model;
@@ -16,6 +19,9 @@ use super::throughput::{read_throughput_payload, read_throughput_report};
 use super::topology::build_topology;
 use super::utilization::{read_utilization_payload, read_utilization_report};
 use super::workload::read_workload;
+use super::workload_conservation::{
+    read_workload_conservation_payload, read_workload_conservation_report,
+};
 use super::{timeline_profile_log_line, TimelineProfileEvent};
 
 #[test]
@@ -92,8 +98,10 @@ fn make_core_run(path: &Path) {
             {"name": "slo-general", "status": "ok"},
             {"name": "throughput", "status": "ok"},
             {"name": "utilization", "status": "ok"},
+            {"name": "kernel-input-distribution", "status": "ok"},
             {"name": "kernel-time-share", "status": "ok"},
-            {"name": "kv-occupancy", "status": "ok"}
+            {"name": "kv-occupancy", "status": "ok"},
+            {"name": "workload-conservation", "status": "ok"}
         ]}"#,
     )
     .expect("write timing");
@@ -194,6 +202,40 @@ fn make_core_run(path: &Path) {
     )
     .expect("write utilization payload");
     fs::write(
+        path.join("reports/kernel_input_distribution_report.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "meta": {"num_positions_plotted": 1},
+            "positions": [{"name": "m.layers.mlp", "num_points": 2}]
+        }"#,
+    )
+    .expect("write kernel-input-distribution report");
+    fs::write(
+        path.join("payloads/kernel_input_distribution_scatter.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "positions": [{
+                "name": "m.layers.mlp",
+                "kind": "grouped_gemm",
+                "candidate_backends": ["triton", "cutlass"],
+                "selection": [
+                    {"backend_index": 0, "backend_name": "triton", "count": 3, "ratio": 0.75},
+                    {"backend_index": 1, "backend_name": "cutlass", "count": 1, "ratio": 0.25}
+                ],
+                "projection": "raw_2d",
+                "axis_labels": ["tokens", "experts"],
+                "explained_variance": null,
+                "points": [
+                    {"x": 64.0, "y": 8.0, "backend_index": 0, "backend_name": "triton", "count": 3},
+                    {"x": 128.0, "y": 8.0, "backend_index": 1, "backend_name": "cutlass", "count": 1}
+                ]
+            }]
+        }"#,
+    )
+    .expect("write kernel-input-distribution payload");
+    fs::write(
         path.join("reports/kernel_time_share_report.json"),
         r#"{
             "schema_version": 1,
@@ -225,6 +267,49 @@ fn make_core_run(path: &Path) {
         }"#,
     )
     .expect("write kernel-time-share payload");
+    fs::write(
+        path.join("reports/workload_conservation_report.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "all_ok": true,
+            "checks": [{
+                "name": "prefill_tokens",
+                "description": "actual prefill tokens equal expected request tokens",
+                "actual": 42.0,
+                "expected": 42.0,
+                "delta": 0.0,
+                "delta_pct": 0.0,
+                "status": "OK"
+            }]
+        }"#,
+    )
+    .expect("write workload-conservation report");
+    fs::write(
+        path.join("payloads/workload_conservation_checks.json"),
+        r#"{
+            "schema_version": 1,
+            "meta": {
+                "log_dir": "simulation",
+                "available": true,
+                "deployment": "afd",
+                "mode": "afd-layered",
+                "tolerance_pct": 0.01,
+                "warn_pct": 5.0,
+                "all_ok": true
+            },
+            "checks": [{
+                "name": "prefill_tokens",
+                "description": "actual prefill tokens equal expected request tokens",
+                "actual": 42.0,
+                "expected": 42.0,
+                "delta": 0.0,
+                "delta_pct": 0.0,
+                "status": "OK"
+            }]
+        }"#,
+    )
+    .expect("write workload-conservation payload");
     fs::write(
         path.join("reports/kv_occupancy_report.json"),
         r#"{
@@ -391,12 +476,28 @@ fn descriptor_indexes_existing_core_resources() {
         "subjects/kv-occupancy/payload"
     );
     assert_eq!(
+        descriptor["subjects"]["kernel-input-distribution"]["status"],
+        "ready"
+    );
+    assert_eq!(
+        descriptor["subjects"]["kernel-input-distribution"]["payload_href"],
+        "subjects/kernel-input-distribution/payload"
+    );
+    assert_eq!(
         descriptor["subjects"]["kernel-time-share"]["status"],
         "ready"
     );
     assert_eq!(
         descriptor["subjects"]["kernel-time-share"]["payload_href"],
         "subjects/kernel-time-share/payload"
+    );
+    assert_eq!(
+        descriptor["subjects"]["workload-conservation"]["status"],
+        "ready"
+    );
+    assert_eq!(
+        descriptor["subjects"]["workload-conservation"]["payload_href"],
+        "subjects/workload-conservation/payload"
     );
     assert!(descriptor["analysis"]["revision"]
         .as_str()
@@ -723,6 +824,107 @@ fn kernel_time_share_resources_preserve_critical_path_attribution() {
     assert!(payload["definitions"]["tree_attribution"]
         .as_str()
         .is_some_and(|definition| definition.contains("critical path")));
+}
+
+#[test]
+fn kernel_input_distribution_resources_preserve_backend_selection() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let report =
+        read_kernel_input_distribution_report(&run).expect("read kernel-input-distribution report");
+    let payload = read_kernel_input_distribution_payload(&run)
+        .expect("read kernel-input-distribution payload");
+
+    assert_eq!(report["meta"]["num_positions_plotted"], 1);
+    assert_eq!(payload["positions"][0]["candidate_backends"][1], "cutlass");
+    assert_eq!(payload["positions"][0]["points"][0]["count"], 3);
+}
+
+#[test]
+fn unavailable_kernel_input_distribution_remains_a_generated_subject() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    fs::write(
+        run_path.join("reports/kernel_input_distribution_report.json"),
+        r#"{"schema_version":1,"available":false,"reason":"cost_log has no slot_backend column"}"#,
+    )
+    .expect("write unavailable kernel-input-distribution report");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let descriptor = build_descriptor(&run).expect("build descriptor");
+
+    assert_eq!(
+        descriptor["subjects"]["kernel-input-distribution"]["status"],
+        "ready"
+    );
+}
+
+#[test]
+fn workload_conservation_resources_preserve_accounting_checks() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let report =
+        read_workload_conservation_report(&run).expect("read workload-conservation report");
+    let payload =
+        read_workload_conservation_payload(&run).expect("read workload-conservation payload");
+
+    assert_eq!(report["all_ok"], true);
+    assert_eq!(payload["meta"]["all_ok"], true);
+    assert_eq!(payload["checks"][0]["name"], "prefill_tokens");
+    assert_eq!(payload["checks"][0]["status"], "OK");
+}
+
+#[test]
+fn unavailable_workload_conservation_remains_a_generated_subject() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    fs::write(
+        run_path.join("payloads/workload_conservation_checks.json"),
+        r#"{
+            "schema_version": 1,
+            "meta": {
+                "log_dir": "simulation",
+                "available": false,
+                "reason": "request_slo.parquet not found"
+            },
+            "checks": []
+        }"#,
+    )
+    .expect("write unavailable workload-conservation payload");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let descriptor = build_descriptor(&run).expect("build descriptor");
+
+    assert_eq!(
+        descriptor["subjects"]["workload-conservation"]["status"],
+        "ready"
+    );
 }
 
 #[test]
