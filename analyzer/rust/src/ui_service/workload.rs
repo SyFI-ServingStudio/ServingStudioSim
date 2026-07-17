@@ -48,6 +48,17 @@ pub(super) fn read_workload(run: &DiscoveredRun, repo_root: &Path) -> Result<Val
         .context("raw/params.json workload.request_rate must be finite and positive")?;
     let closed_loop = params.pointer("/workload/max_concurrency").is_some();
     let arrival_scale = if closed_loop { 1.0 } else { request_rate };
+    let request_count = entries.len() as f64;
+    let average_input_tokens = entries
+        .iter()
+        .map(|entry| u64::from(entry.input_len))
+        .sum::<u64>() as f64
+        / request_count;
+    let average_output_tokens = entries
+        .iter()
+        .map(|entry| u64::from(entry.output_len))
+        .sum::<u64>() as f64
+        / request_count;
     let (token_lengths, input_density, output_density) = length_distribution(&entries);
     let (arrival_seconds, arrivals, arrival_trend, peak_to_mean) =
         arrival_distribution(&entries, arrival_scale);
@@ -57,6 +68,8 @@ pub(super) fn read_workload(run: &DiscoveredRun, repo_root: &Path) -> Result<Val
         "scope": "configured_trace",
         "source_paths": source_paths,
         "request_count": entries.len(),
+        "average_input_tokens": average_input_tokens,
+        "average_output_tokens": average_output_tokens,
         "arrival_basis": if closed_loop { "source_trace" } else { "effective_open_loop" },
         "request_rate": request_rate,
         "token_lengths": token_lengths,

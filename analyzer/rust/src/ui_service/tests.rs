@@ -460,6 +460,8 @@ fn workload_resource_summarizes_configured_trace() {
     assert_eq!(workload["scope"], "configured_trace");
     assert_eq!(workload["source_paths"], json!(["trace/workload.csv"]));
     assert_eq!(workload["request_count"], 3);
+    assert!((workload["average_input_tokens"].as_f64().unwrap() - 56.0 / 3.0).abs() < 1e-9);
+    assert!((workload["average_output_tokens"].as_f64().unwrap() - 224.0 / 3.0).abs() < 1e-9);
     assert_eq!(workload["arrival_basis"], "effective_open_loop");
     let arrival_seconds = workload["arrival_seconds"]
         .as_array()
