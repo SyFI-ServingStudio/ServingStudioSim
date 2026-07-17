@@ -10,6 +10,7 @@ mod concurrency;
 mod core;
 mod discovery;
 mod kernel_input_distribution;
+mod kernel_throughput_analysis;
 mod kernel_time_share;
 mod kv_occupancy;
 mod model;
@@ -45,6 +46,7 @@ use discovery::{configure_logs_roots, resolve_run, ConfiguredRoot, DiscoveredRun
 use kernel_input_distribution::{
     read_kernel_input_distribution_payload, read_kernel_input_distribution_report,
 };
+use kernel_throughput_analysis::analyze_kernel_throughput;
 use kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
 use kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use model::read_model;
@@ -162,6 +164,10 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
         .route(
             "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations/{iter_id}/{batch_id}/{operation_id}/cost-tree",
             get(get_worker_cost_tree),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations/{iter_id}/{batch_id}/{operation_id}/cost-tree/{leaf_id}/kernel-throughput-analysis",
+            get(get_kernel_throughput_analysis),
         )
         .with_state(state)
         // The service otherwise receives no bodies. Bound this temporary
@@ -551,6 +557,43 @@ async fn get_worker_cost_tree(
         request_started.elapsed().as_secs_f64() * 1000.0
     );
     response
+}
+
+async fn get_kernel_throughput_analysis(
+    RoutePath((run_id, pool_tag, worker_id, iter_id, batch_id, operation_id, leaf_id)): RoutePath<
+        (String, String, u16, u64, u64, u64, usize),
+    >,
+    State(state): State<ServiceState>,
+) -> Response {
+    let request_id = NEXT_WORKER_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let run = match resolve_run(&state.roots, &run_id) {
+        Ok(run) => run,
+        Err(error) => return worker_resource_error(error),
+    };
+    let detail = match exact_operation_cost_tree(
+        &run,
+        &pool_tag,
+        worker_id,
+        iter_id,
+        batch_id,
+        operation_id,
+        request_id,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return worker_resource_error(error),
+    };
+    let repo_root = Arc::clone(&state.repo_root);
+    match tokio::task::spawn_blocking(move || {
+        analyze_kernel_throughput(&repo_root, detail, leaf_id)
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => worker_resource_error(error),
+        Err(error) => worker_resource_error(anyhow::anyhow!(error)),
+    }
 }
 
 fn worker_resource_error(error: anyhow::Error) -> Response {

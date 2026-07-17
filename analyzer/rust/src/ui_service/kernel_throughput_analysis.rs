@@ -1,0 +1,278 @@
+//! Adapter from one exact CostTree leaf to the simulator's existing
+//! `kernel-query grid` + `kernel-query eval` introspection protocol.
+//!
+//! The simulator remains the sole owner of kernel config decoding, sweep grids,
+//! cache construction and interpolation. This module only selects the exact leaf,
+//! expands the declared grid, and packages the two query responses for viz-ui.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+
+const MAX_GRID_POINTS: usize = 16_384;
+
+#[derive(Deserialize)]
+struct GridResponse {
+    kind: String,
+    describe_config: Value,
+    input_fields: Vec<String>,
+    grid_axes: Vec<Vec<f64>>,
+}
+
+pub(super) fn analyze_kernel_throughput(
+    repo_root: &Path,
+    cost_tree_detail: Value,
+    leaf_id: usize,
+) -> Result<Value> {
+    let tree = cost_tree_detail
+        .get("tree")
+        .context("cost-tree detail has no tree")?;
+    let leaf = find_preorder_node(tree, leaf_id)
+        .with_context(|| format!("cost-tree node {leaf_id} is absent"))?;
+    if leaf.get("kind").and_then(Value::as_str) != Some("leaf") {
+        bail!("cost-tree node {leaf_id} is not a kernel leaf");
+    }
+    let slot = leaf
+        .get("slot")
+        .and_then(Value::as_object)
+        .context("kernel leaf has no slot object")?;
+    let kind = slot
+        .get("kind")
+        .and_then(Value::as_str)
+        .context("kernel leaf slot has no kind")?;
+    let config = slot
+        .get("kernel_config")
+        .filter(|value| value.is_object())
+        .context("kernel leaf slot has no structured kernel_config")?;
+    let simulator = simulator_binary(repo_root)?;
+
+    let grid_value = run_kernel_query(
+        repo_root,
+        &simulator,
+        json!({"op": "grid", "kind": kind, "config": config}),
+    )?;
+    let grid: GridResponse = serde_json::from_value(grid_value)
+        .with_context(|| format!("decode {kind} grid response"))?;
+    if grid.kind != kind {
+        bail!(
+            "kernel-query grid returned kind {:?}, expected {kind:?}",
+            grid.kind
+        );
+    }
+    let query_points = expand_query_points(&grid.input_fields, &grid.grid_axes)?;
+    let eval = run_kernel_query(
+        repo_root,
+        &simulator,
+        json!({
+            "op": "eval",
+            "kind": kind,
+            "config": config,
+            "query_points": query_points,
+        }),
+    )?;
+    let results = eval
+        .get("results")
+        .and_then(Value::as_array)
+        .context("kernel-query eval response has no results array")?;
+    if results.len() != query_points.len() {
+        bail!(
+            "kernel-query eval returned {} points for a {}-point grid",
+            results.len(),
+            query_points.len()
+        );
+    }
+
+    Ok(json!({
+        "schema_version": 1,
+        "identity": cost_tree_detail.get("identity"),
+        "leaf_id": leaf_id,
+        "slot": slot,
+        "exact_input": leaf.pointer("/stats/input"),
+        "describe_config": grid.describe_config,
+        "input_fields": grid.input_fields,
+        "grid_axes": grid.grid_axes,
+        "points": results,
+        "semantics": "cache_eval_at_declared_grid",
+    }))
+}
+
+fn find_preorder_node(node: &Value, target: usize) -> Option<&Value> {
+    fn walk<'a>(node: &'a Value, target: usize, next: &mut usize) -> Option<&'a Value> {
+        let current = *next;
+        *next += 1;
+        if current == target {
+            return Some(node);
+        }
+        for child in node
+            .get("children")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(found) = walk(child, target, next) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(node, target, &mut 0)
+}
+
+fn expand_query_points(input_fields: &[String], axes: &[Vec<f64>]) -> Result<Vec<Value>> {
+    if input_fields.is_empty() || input_fields.len() != axes.len() {
+        bail!(
+            "kernel grid has {} input fields for {} axes",
+            input_fields.len(),
+            axes.len()
+        );
+    }
+    if axes.iter().any(Vec::is_empty) {
+        bail!("kernel grid contains an empty axis");
+    }
+    let point_count = axes.iter().try_fold(1usize, |count, axis| {
+        count
+            .checked_mul(axis.len())
+            .context("kernel grid size overflow")
+    })?;
+    if point_count > MAX_GRID_POINTS {
+        bail!("kernel grid has {point_count} points; limit is {MAX_GRID_POINTS}");
+    }
+
+    let mut points = Vec::with_capacity(point_count);
+    let mut values = vec![0.0; axes.len()];
+    fn expand(
+        fields: &[String],
+        axes: &[Vec<f64>],
+        depth: usize,
+        values: &mut [f64],
+        points: &mut Vec<Value>,
+    ) {
+        if depth == axes.len() {
+            let object: Map<String, Value> = fields
+                .iter()
+                .cloned()
+                .zip(values.iter().copied().map(json_coord))
+                .collect();
+            points.push(Value::Object(object));
+            return;
+        }
+        for &value in &axes[depth] {
+            values[depth] = value;
+            expand(fields, axes, depth + 1, values, points);
+        }
+    }
+    expand(input_fields, axes, 0, &mut values, &mut points);
+    Ok(points)
+}
+
+/// Sweep axes use `f64` internally for interpolation, while every current
+/// physical kernel Input uses integer counts/bytes/tokens. Preserve integral
+/// coordinates as JSON integers so serde can decode the kernel's own `u32`/
+/// `u64` input type; genuinely fractional axes remain JSON floats.
+fn json_coord(value: f64) -> Value {
+    if value >= 0.0 && value.fract() == 0.0 && value <= u64::MAX as f64 {
+        Value::from(value as u64)
+    } else {
+        Value::from(value)
+    }
+}
+
+fn simulator_binary(repo_root: &Path) -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    // Release is the launcher-built production binary and therefore carries
+    // the same PyO3 ABI as `.venv`; prefer it over an incidental debug build.
+    candidates.push(repo_root.join("target/release/simulator"));
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(directory) = current.parent() {
+            candidates.push(directory.join("simulator"));
+        }
+    }
+    candidates.push(repo_root.join("target/debug/simulator"));
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .context("could not find a built simulator beside analyze or under target/{release,debug}")
+}
+
+fn run_kernel_query(repo_root: &Path, simulator: &Path, request: Value) -> Result<Value> {
+    let python = repo_root.join(".venv/bin/python");
+    if !python.is_file() {
+        bail!("launcher Python is absent at {}", python.display());
+    }
+    let mut child = Command::new(&python)
+        .args(["-m", "launcher.kernel_query", "--simulator"])
+        .arg(simulator)
+        .current_dir(repo_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("start launcher kernel-query via {}", python.display()))?;
+    serde_json::to_writer(
+        child
+            .stdin
+            .as_mut()
+            .context("kernel-query stdin was not piped")?,
+        &request,
+    )
+    .context("write kernel-query request")?;
+    child
+        .stdin
+        .take()
+        .context("kernel-query stdin disappeared")?
+        .flush()
+        .context("flush kernel-query request")?;
+    let output = child.wait_with_output().context("wait for kernel-query")?;
+    if !output.status.success() {
+        bail!(
+            "kernel-query failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("decode kernel-query stdout")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_grid_in_row_major_order() {
+        let points = expand_query_points(
+            &["m".into(), "n".into()],
+            &[vec![1.0, 2.0], vec![8.0, 16.0]],
+        )
+        .unwrap();
+        assert_eq!(
+            points,
+            vec![
+                json!({"m": 1, "n": 8}),
+                json!({"m": 1, "n": 16}),
+                json!({"m": 2, "n": 8}),
+                json!({"m": 2, "n": 16}),
+            ]
+        );
+    }
+
+    #[test]
+    fn selects_the_same_preorder_id_as_ui_annotation() {
+        let tree = json!({
+            "kind": "sum",
+            "children": [
+                {"kind": "leaf", "slot": {"name": "a"}},
+                {"kind": "scale", "children": [
+                    {"kind": "leaf", "slot": {"name": "b"}}
+                ]}
+            ]
+        });
+        assert_eq!(
+            find_preorder_node(&tree, 3).unwrap().pointer("/slot/name"),
+            Some(&json!("b"))
+        );
+    }
+}
