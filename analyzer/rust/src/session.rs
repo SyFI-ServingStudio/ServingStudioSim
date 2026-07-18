@@ -177,7 +177,13 @@ pub fn column_f64(array: &ArrayRef) -> Result<Vec<f64>> {
         ($ty:ty) => {{
             let a = array.as_any().downcast_ref::<$ty>().unwrap();
             return Ok((0..a.len())
-                .map(|i| if a.is_null(i) { f64::NAN } else { a.value(i) as f64 })
+                .map(|i| {
+                    if a.is_null(i) {
+                        f64::NAN
+                    } else {
+                        a.value(i) as f64
+                    }
+                })
                 .collect());
         }};
     }

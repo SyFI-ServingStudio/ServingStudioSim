@@ -50,7 +50,10 @@ type Row = (f64, f64, f64, f64);
 pub async fn run_batch(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
         let reason = "cost_log/ dir not found";
-        return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+        return Ok((
+            unavailable(log_dir, reason),
+            unavailable_payload(log_dir, reason),
+        ));
     }
     require_columns(ctx, COST_LOG_TABLE, COST_COLS).await?;
 
@@ -60,7 +63,10 @@ pub async fn run_batch(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, V
     let true_counts = collect_pool_counts(ctx).await?;
     if true_counts.is_empty() {
         let reason = "cost_log has no invocations";
-        return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+        return Ok((
+            unavailable(log_dir, reason),
+            unavailable_payload(log_dir, reason),
+        ));
     }
     let total_calls: usize = true_counts.values().sum();
 

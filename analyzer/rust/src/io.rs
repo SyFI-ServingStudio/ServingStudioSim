@@ -94,22 +94,18 @@ pub fn read_cost_manifests(
             .file_stem()
             .and_then(|s| s.to_str())
             .with_context(|| format!("invalid manifest filename {}", path.display()))?;
-        let rest = stem
-            .strip_prefix("worker_")
-            .with_context(|| {
-                format!(
-                    "manifest filename must start with worker_: {}",
-                    path.display()
-                )
-            })?;
-        let (pool_tag, worker_id) = rest
-            .rsplit_once('_')
-            .with_context(|| {
-                format!(
-                    "manifest filename must end with _<worker_id>: {}",
-                    path.display()
-                )
-            })?;
+        let rest = stem.strip_prefix("worker_").with_context(|| {
+            format!(
+                "manifest filename must start with worker_: {}",
+                path.display()
+            )
+        })?;
+        let (pool_tag, worker_id) = rest.rsplit_once('_').with_context(|| {
+            format!(
+                "manifest filename must end with _<worker_id>: {}",
+                path.display()
+            )
+        })?;
         let worker_id: u16 = worker_id
             .parse()
             .with_context(|| format!("parse worker id from {}", path.display()))?;
@@ -194,7 +190,10 @@ pub fn read_kv_capacities(log_dir: &Path) -> Option<Vec<(String, u64, u64, u64)>
         };
         for p in pools {
             let group_id = p.get("group_id").and_then(|v| v.as_u64()).unwrap_or(0);
-            let capacity = p.get("capacity_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let capacity = p
+                .get("capacity_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             out.push((tag.to_owned(), worker_id, group_id, capacity));
         }
     }

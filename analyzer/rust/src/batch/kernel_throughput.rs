@@ -68,14 +68,21 @@ struct Loc {
 pub async fn run_kernel_throughput(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
         let reason = "cost_log/ dir not found";
-        return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+        return Ok((
+            unavailable(log_dir, reason),
+            unavailable_payload(log_dir, reason),
+        ));
     }
     require_columns(ctx, COST_LOG_TABLE, COST_COLS).await?;
     let manifests = match read_cost_manifests(log_dir) {
         Ok(m) => m,
         Err(e) => {
-            let reason = format!("cost_manifest/ unreadable ({e:#}); needed to name tree locations");
-            return Ok((unavailable(log_dir, &reason), unavailable_payload(log_dir, &reason)));
+            let reason =
+                format!("cost_manifest/ unreadable ({e:#}); needed to name tree locations");
+            return Ok((
+                unavailable(log_dir, &reason),
+                unavailable_payload(log_dir, &reason),
+            ));
         }
     };
 
@@ -117,7 +124,10 @@ pub async fn run_kernel_throughput(ctx: &SessionContext, log_dir: &Path) -> Resu
     locs.retain(|l| !l.tflops.is_empty() || !l.gbps.is_empty());
     if locs.is_empty() {
         let reason = "no sampled slots with a profiled throughput rate";
-        return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+        return Ok((
+            unavailable(log_dir, reason),
+            unavailable_payload(log_dir, reason),
+        ));
     }
     locs.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -175,8 +185,11 @@ pub async fn run_kernel_throughput(ctx: &SessionContext, log_dir: &Path) -> Resu
 /// to `[1, MAX_STRIDE]`. Long runs land at the [`MAX_STRIDE`] cap (~1/50); short
 /// runs shrink toward 1 so the sample stays representative. Cheap: one MAX scan.
 async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
-    let batches =
-        collect(ctx, "SELECT CAST(COALESCE(MAX(iter_id), 0) AS BIGINT) AS mx FROM cost_log").await?;
+    let batches = collect(
+        ctx,
+        "SELECT CAST(COALESCE(MAX(iter_id), 0) AS BIGINT) AS mx FROM cost_log",
+    )
+    .await?;
     let mut num_iters = 1u64;
     if let Some(b) = batches.first() {
         if b.num_rows() > 0 {

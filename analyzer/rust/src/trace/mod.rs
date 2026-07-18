@@ -526,8 +526,12 @@ pub async fn run(
             // recv window when the sender frees early (the gather α/β overlap).
             if let Some(&send_track) = send_tracks.get(&nr.src_key()) {
                 let s_begin = ((nr.net_start_ms + shift_ms) * 1e6).round() as i64;
-                let s_begin =
-                    s_begin.max(send_track_cursor.get(&send_track).copied().unwrap_or(i64::MIN));
+                let s_begin = s_begin.max(
+                    send_track_cursor
+                        .get(&send_track)
+                        .copied()
+                        .unwrap_or(i64::MIN),
+                );
                 let s_end = (((nr.send_end_ms + shift_ms) * 1e6).round() as i64).max(s_begin);
                 let send_anns = vec![
                     Annotation::str(
@@ -541,7 +545,13 @@ pub async fn run(
                     Annotation::dbl("send_end_ms", nr.send_end_ms),
                     Annotation::dbl("net_end_ms", nr.net_end_ms),
                 ];
-                w.begin_flow(send_track, s_begin, &format!("{} · send", nr.kind), &send_anns, &[flow]);
+                w.begin_flow(
+                    send_track,
+                    s_begin,
+                    &format!("{} · send", nr.kind),
+                    &send_anns,
+                    &[flow],
+                );
                 w.end(send_track, s_end);
                 send_track_cursor.insert(send_track, s_end);
             }

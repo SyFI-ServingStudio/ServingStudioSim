@@ -18,10 +18,32 @@ each successive gap is an attributable source of sub-optimality:
 Buckets telescope and sum exactly back to Real, drawn as a stacked bar at five
 levels — cluster / pool / worker / iteration (idle 0 by construction) / per-kernel.
 
+The payload also carries one per-worker kernel rung ladder. Its R0/R1 bars reuse
+the additive R2 kernel baseline and append two explicit aggregate chunks
+(`imbalance = R1-R2`, `idle = R0-R1`); R2..R5 carry each location's attributable
+value. The renderer keeps a kernel's color across all six bars and connects it
+with a ribbon, without pretending the two aggregate gaps have a per-kernel
+critical-path attribution.
+
 ## Files
 
-- `mod.rs` — `run_optimality`: reads `cost_log`, manifests, `run_meta` GPU counts,
-  `gpu/spec.json`; folds R0..R5 per worker → pool → cluster + per-kernel; buckets.
+The subject is split by pipeline stage and aggregation tier — `mod.rs` is a thin
+hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`):
+
+- `run.rs` — orchestration. `run_optimality` reads `cost_log`, manifests,
+  `run_meta` GPU counts and `gpu/spec.json`, wires the stages below, and assembles
+  the report/payload JSON (+ the `unavailable` degrade paths, `definitions`).
+- `prepare.rs` — preparation. Interns every manifest leaf into a global location
+  and precomputes each `(pool, worker, section)`'s fold weights `α` + rate ceilings
+  (`build_section_fold_plans`); no folding here.
+- `fold.rs` — the algorithm. Exact R0/R1 SQL sums (`read_exact_worker_totals`) + the
+  stride-sampled R2..R5 mean-fold hot loop (`accumulate_fold`, `leaf_optimal_ms`).
+- `levels.rs` — the worker / pool / cluster tiers. `assemble_tiers` turns the fold's
+  per-worker accumulators into R0..R5 rung arrays and rolls them up; `levels_json`
+  + `level_entry_json` + `rung_report_json` emit the level/report JSON.
+- `kernel.rs` — the kernel tier. Per-location bars (`kernel_levels_json`, single-leaf so
+  only batching/communication/hw), the report's `worst_batching`, and the
+  per-worker kernel rung ladders (`worker_kernel_ladders_json`).
 - `grid_peaks.rs` — the R3 ceiling. Enumerates unique `(kind, config)` from the
   manifests, asks the simulator for each config's fitted-grid peak rate in one
   batched `kernel-query peak` call (via `crate::kernel_query`), caches it as

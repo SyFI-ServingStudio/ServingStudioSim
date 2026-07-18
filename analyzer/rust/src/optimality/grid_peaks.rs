@@ -32,28 +32,30 @@ const SIDECAR: &str = "kernel_grid_peaks.json";
 /// One config's fitted-grid ceiling: best achieved compute (TFLOP/s) and memory /
 /// collective bandwidth (GB/s) over its batch axis. A comm kernel has `tflops == 0`.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Peak {
+pub(crate) struct GridPeakRates {
     pub tflops: f64,
     pub gbps: f64,
 }
 
 /// The run's per-config peaks plus where they came from (for the report caveat).
-pub(crate) struct Peaks {
-    by_config: HashMap<String, Peak>,
+pub(crate) struct GridPeakCatalog {
+    rates_by_config_key: HashMap<String, GridPeakRates>,
     /// `"sidecar"` (cached file), `"generated"` (fresh query, now cached), or
     /// `"unavailable: <why>"` (subject falls back to run-observed peaks).
     pub source: String,
 }
 
-impl Peaks {
+impl GridPeakCatalog {
     /// The grid peak for a leaf's `(kind, config)`, or `None` when this config was
     /// never queried (degraded run) or failed to build — caller uses the observed peak.
-    pub fn get(&self, kind: &str, config: &Value) -> Option<Peak> {
-        self.by_config.get(&config_key(kind, config)).copied()
+    pub fn get(&self, kind: &str, config: &Value) -> Option<GridPeakRates> {
+        self.rates_by_config_key
+            .get(&config_key(kind, config))
+            .copied()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_config.is_empty()
+        self.rates_by_config_key.is_empty()
     }
 }
 
@@ -74,14 +76,14 @@ fn config_key(kind: &str, config: &Value) -> String {
 pub(crate) fn load_or_generate(
     log_dir: &Path,
     manifests: &BTreeMap<(String, u16), ManifestDoc>,
-) -> Peaks {
+) -> GridPeakCatalog {
     if let Some(peaks) = load(log_dir) {
         return peaks;
     }
     match generate(log_dir, manifests) {
         Ok(peaks) => peaks,
-        Err(e) => Peaks {
-            by_config: HashMap::new(),
+        Err(e) => GridPeakCatalog {
+            rates_by_config_key: HashMap::new(),
             source: format!("unavailable: {e:#}"),
         },
     }
@@ -89,27 +91,27 @@ pub(crate) fn load_or_generate(
 
 /// Read a previously-written `raw/kernel_grid_peaks.json` into a lookup map.
 /// `None` if absent/unparseable (the caller then tries generation).
-fn load(log_dir: &Path) -> Option<Peaks> {
+fn load(log_dir: &Path) -> Option<GridPeakCatalog> {
     let path = resolve_artifact_path(log_dir, SIDECAR);
     let text = std::fs::read_to_string(&path).ok()?;
     let doc: SidecarDoc = serde_json::from_str(&text).ok()?;
-    let mut by_config = HashMap::new();
+    let mut rates_by_config_key = HashMap::new();
     for entry in doc.configs {
         // A per-config build failure is recorded with a null peak; skip it so the
         // leaf falls back to its observed peak rather than a bogus 0-rate ceiling.
         if entry.error.is_some() {
             continue;
         }
-        by_config.insert(
+        rates_by_config_key.insert(
             config_key(&entry.kind, &entry.config),
-            Peak {
+            GridPeakRates {
                 tflops: entry.peak_tflops,
                 gbps: entry.peak_gbps,
             },
         );
     }
-    Some(Peaks {
-        by_config,
+    Some(GridPeakCatalog {
+        rates_by_config_key,
         source: "sidecar".to_string(),
     })
 }
@@ -119,7 +121,7 @@ fn load(log_dir: &Path) -> Option<Peaks> {
 fn generate(
     log_dir: &Path,
     manifests: &BTreeMap<(String, u16), ManifestDoc>,
-) -> Result<Peaks> {
+) -> Result<GridPeakCatalog> {
     let unique = enumerate_unique(manifests);
     if unique.is_empty() {
         anyhow::bail!("no kernel configs found in manifests");
@@ -148,19 +150,25 @@ fn generate(
         );
     }
 
-    let mut by_config = HashMap::new();
+    let mut rates_by_config_key = HashMap::new();
     let mut sidecar_entries = Vec::with_capacity(unique.len());
     for ((kind, config), result) in unique.iter().zip(results) {
         let error = result
             .get("error")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let peak_tflops = result.get("peak_tflops").and_then(Value::as_f64).unwrap_or(0.0);
-        let peak_gbps = result.get("peak_gbps").and_then(Value::as_f64).unwrap_or(0.0);
+        let peak_tflops = result
+            .get("peak_tflops")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let peak_gbps = result
+            .get("peak_gbps")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         if error.is_none() {
-            by_config.insert(
+            rates_by_config_key.insert(
                 config_key(kind, config),
-                Peak {
+                GridPeakRates {
                     tflops: peak_tflops,
                     gbps: peak_gbps,
                 },
@@ -188,8 +196,8 @@ fn generate(
         eprintln!("[optimality] could not cache {SIDECAR}: {e:#}");
     }
 
-    Ok(Peaks {
-        by_config,
+    Ok(GridPeakCatalog {
+        rates_by_config_key,
         source: "generated".to_string(),
     })
 }

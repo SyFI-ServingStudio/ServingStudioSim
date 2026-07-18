@@ -291,8 +291,14 @@ mod tests {
             slots: Vec::new(), // slot descs unused by the fold
             nodes: vec![
                 FlatCostNode::Sum { children: 1..3 },
-                FlatCostNode::Max { overlap: 1.0, children: 3..5 },
-                FlatCostNode::Scale { n: 3, children: 5..6 },
+                FlatCostNode::Max {
+                    overlap: 1.0,
+                    children: 3..5,
+                },
+                FlatCostNode::Scale {
+                    n: 3,
+                    children: 5..6,
+                },
                 FlatCostNode::Leaf(0),
                 FlatCostNode::Leaf(1),
                 FlatCostNode::Leaf(2),

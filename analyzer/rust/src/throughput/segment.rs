@@ -18,11 +18,7 @@ use crate::io::{read_run_meta, resolve_artifact_path, SCHEMA_VERSION};
 use crate::session::{col, collect, register_if_exists, require_columns, value_f64};
 
 /// request_state columns the throughput subject depends on (drift guard).
-const STATE_COLS: &[&str] = &[
-    "logging_time",
-    "prefill_tokens_cum",
-    "decode_tokens_cum",
-];
+const STATE_COLS: &[&str] = &["logging_time", "prefill_tokens_cum", "decode_tokens_cum"];
 
 /// Coarse view cap: the binned plot uses at most this many equal-width segments
 /// (ref's `compute_throughput_timeseries` shape), so a long run reads as a handful

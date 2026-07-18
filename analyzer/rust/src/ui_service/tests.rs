@@ -12,9 +12,9 @@ use super::kernel_input_distribution::{
     read_kernel_input_distribution_payload, read_kernel_input_distribution_report,
 };
 use super::kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
-use super::optimality::{read_optimality_payload, read_optimality_report};
 use super::kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use super::model::read_model;
+use super::optimality::{read_optimality_payload, read_optimality_report};
 use super::slo::{read_slo_general_payload, read_slo_general_report};
 use super::throughput::{read_throughput_payload, read_throughput_report};
 use super::topology::build_topology;

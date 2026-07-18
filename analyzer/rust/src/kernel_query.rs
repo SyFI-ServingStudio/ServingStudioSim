@@ -47,7 +47,11 @@ pub(crate) fn simulator_binary(repo_root: &Path) -> Result<PathBuf> {
 /// launcher transport (`python -m launcher.kernel_query`) and decode its stdout
 /// JSON. The launcher module applies the same PYTHONHOME/PYTHONPATH/
 /// LD_LIBRARY_PATH as every other launcher-owned simulator subprocess.
-pub(crate) fn run_kernel_query(repo_root: &Path, simulator: &Path, request: Value) -> Result<Value> {
+pub(crate) fn run_kernel_query(
+    repo_root: &Path,
+    simulator: &Path,
+    request: Value,
+) -> Result<Value> {
     let python = repo_root.join(".venv/bin/python");
     if !python.is_file() {
         bail!("launcher Python is absent at {}", python.display());

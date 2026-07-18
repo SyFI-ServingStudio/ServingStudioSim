@@ -75,7 +75,14 @@ pub fn clean_nonnegative_sorted(samples: &[f64]) -> Vec<f64> {
 
 pub fn stats(sorted: &[f64]) -> MetricStats {
     if sorted.is_empty() {
-        return MetricStats { n: 0, mean: None, p50: None, p90: None, p99: None, max: None };
+        return MetricStats {
+            n: 0,
+            mean: None,
+            p50: None,
+            p90: None,
+            p99: None,
+            max: None,
+        };
     }
     let sum: f64 = sorted.iter().sum();
     MetricStats {

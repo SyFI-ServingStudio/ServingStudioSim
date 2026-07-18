@@ -59,7 +59,10 @@ struct Agg {
 pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     if !register_kv_snapshot(ctx, log_dir).await? {
         let reason = "kv_snapshot/ dir not found (KV logging off or no KV pool)";
-        return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+        return Ok((
+            unavailable(log_dir, reason),
+            unavailable_payload(log_dir, reason),
+        ));
     }
     require_columns(ctx, KV_SNAPSHOT_TABLE, KV_COLS).await?;
 
@@ -77,7 +80,10 @@ pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(V
     let rows = collect_rows(ctx).await?;
     if rows.is_empty() {
         let reason = "kv_snapshot has no rows to bin";
-        return Ok((unavailable(log_dir, reason), unavailable_payload(log_dir, reason)));
+        return Ok((
+            unavailable(log_dir, reason),
+            unavailable_payload(log_dir, reason),
+        ));
     }
 
     let t_min = rows.iter().map(|r| r.3).fold(f64::INFINITY, f64::min);
@@ -88,7 +94,9 @@ pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(V
     let n_bins = FINE_BINS;
     let bin_width = span_ms / n_bins as f64;
     let t_start: Vec<f64> = (0..n_bins).map(|b| t_min + b as f64 * bin_width).collect();
-    let t_end: Vec<f64> = (0..n_bins).map(|b| t_min + (b + 1) as f64 * bin_width).collect();
+    let t_end: Vec<f64> = (0..n_bins)
+        .map(|b| t_min + (b + 1) as f64 * bin_width)
+        .collect();
 
     // Group rows by (pool_tag, group_id) → one plotted series; count groups per
     // pool_tag so a single-group pool gets a clean label (no `· g0` noise).
@@ -302,7 +310,11 @@ async fn collect_rows(ctx: &SessionContext) -> Result<Vec<Row>> {
         let p = column_f64(col(batch, "projected_peak")?)?;
         let r = column_f64(col(batch, "promised_kv")?)?;
         for row in 0..batch.num_rows() {
-            let tag = if tags.is_null(row) { "" } else { tags.value(row) };
+            let tag = if tags.is_null(row) {
+                ""
+            } else {
+                tags.value(row)
+            };
             out.push((
                 tag.to_string(),
                 g[row] as u64,
