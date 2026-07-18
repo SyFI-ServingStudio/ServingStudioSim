@@ -13,16 +13,19 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::json;
 
+use crate::common::StageVocab;
 use crate::worker::GpuCluster;
 
-// v4 makes `workers[].pool_tag` authoritative for every worker (stamped on each GPU
+// v5 adds `stage_vocab` (deployment + `code → "category:detail"` names, decoding
+// the `request_slo` stage-transition list columns). v4 makes
+// `workers[].pool_tag` authoritative for every worker (stamped on each GPU
 // at `GpuCluster::allocate`), so non-KV workers (e.g. AFD ffn) no longer carry a null
 // tag that consumers had to reverse-recover through `comm_groups`. v3 added per-worker
 // `kv_pools` (`group_id` → KV token `capacity_tokens`); v2 added the `comm_groups`
 // array. Append-only; the analyzer reads by field name and never asserts the version,
 // so older readers are unaffected and older logs (null ffn tag) still parse via the
 // analyzer's legacy `comm_groups` fallback.
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 /// Write `<log_dir>/raw/run_meta.json` from the run's [`GpuCluster`]'s GPU
 /// registry. Emits the flat per-GPU list, a derived worker→gpu grouping (each
@@ -31,7 +34,7 @@ const SCHEMA_VERSION: u32 = 4;
 /// (gid → base/count/gpu_ids, via [`GpuCluster::comm_groups`]). (The cluster's
 /// runtime state — `cost` / `logger` / `kv_caps` — is `#[serde(skip)]` and never
 /// reaches disk via the derived `Serialize`; only the reads above export it.)
-pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster) -> Result<()> {
+pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster, stage_vocab: StageVocab) -> Result<()> {
     let raw = log_dir.join("raw");
     std::fs::create_dir_all(&raw)?;
 
@@ -105,12 +108,22 @@ pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster) -> Result<()> {
         })
         .collect();
 
+    // Stage vocabulary: the per-deployment `code → "category:detail"` table that
+    // decodes the `request_slo` stage-transition list columns. `names[code]` is
+    // the name for stage `code`; categories are open so analyzers preserve any
+    // unknown first-level term rather than rejecting a future vocabulary.
+    let stage_vocab = json!({
+        "deployment": stage_vocab.deployment,
+        "names": stage_vocab.names,
+    });
+
     let meta = json!({
         "schema_version": SCHEMA_VERSION,
         "num_gpus": cluster.num_gpus(),
         "gpus": cluster.gpus,
         "workers": workers,
         "comm_groups": comm_groups,
+        "stage_vocab": stage_vocab,
     });
     std::fs::write(raw.join("run_meta.json"), serde_json::to_vec_pretty(&meta)?)?;
     Ok(())

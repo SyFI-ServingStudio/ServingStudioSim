@@ -335,17 +335,15 @@ pub fn run_sim(
     Ok(summary)
 }
 
-/// Sim-end flush over the *admitted* set (the never-admitted pending tail never
-/// ran, so it is skipped — same scope as the periodic snapshot, 2b).
-///
 /// The two tables flush asymmetrically because they have different shapes:
 /// - `request_state` is a *snapshot* table (one aggregate row per tick), so a
-///   final census captures the cumulative token totals at sim-end. Without it, a
-///   run ending within one snapshot interval would log no terminal totals and
-///   per-segment throughput would miss the last interval's work.
+///   final census over the admitted set captures the cumulative token totals at
+///   sim-end. Never-admitted requests have no processed tokens and stay outside
+///   this throughput/accounting stream.
 /// - `request_slo` is *terminal-per-request*: completed requests already wrote
-///   their row at their completion tick, so only the still-incomplete ones get a
-///   partial row here (writing completed again would duplicate).
+///   their row at their completion tick. Every still-incomplete arrived request
+///   gets a partial row here, including the never-admitted pending tail whose
+///   queue-stage history is required for backpressure analysis.
 ///
 /// The `request_state` census is skipped when the periodic snapshot (2b) already
 /// wrote one at this exact `clock` (`last_state_clock == Some(clock)`, i.e. the
@@ -362,7 +360,7 @@ fn finalize(
     if !census_already_written {
         logger.record_request_state(state_agg(&s, clock))?;
     }
-    for (id, rec) in s.iter_admitted() {
+    for (id, rec) in s.iter() {
         if !rec.completed {
             logger.record_request_slo(slo_entry(id, clock, rec))?;
         }
@@ -417,6 +415,20 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         }
         _ => None,
     };
+    // Stage-transition timeline → four parallel arrays. `rec.stage_log` is empty
+    // when `io.log_stage_transitions` is off (`record_stage` never appended), so
+    // this is a no-op unpack in that case.
+    let n_stages = rec.stage_log.len();
+    let mut stage_times_ms = Vec::with_capacity(n_stages);
+    let mut stage_codes = Vec::with_capacity(n_stages);
+    let mut stage_pool_ids = Vec::with_capacity(n_stages);
+    let mut stage_worker_ids = Vec::with_capacity(n_stages);
+    for ev in &rec.stage_log {
+        stage_times_ms.push(ev.time.as_ms() as f32);
+        stage_codes.push(ev.code);
+        stage_pool_ids.push(ev.pool.0);
+        stage_worker_ids.push(ev.worker.0);
+    }
     RequestSloEntry {
         request_id: id.0,
         logging_time_ms: now.as_ms(),
@@ -428,13 +440,17 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         tpot_mean_ms,
         finish_decode_time_ms,
         prefill_processed: rec.prefill_processed,
+        stage_times_ms,
+        stage_codes,
+        stage_pool_ids,
+        stage_worker_ids,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{PoolId, RequestStore};
+    use crate::common::{PoolId, Request, RequestStore, UnifiedStage, WorkerId};
     use crate::orchestrator::{
         DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
     };
@@ -447,14 +463,18 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
-    fn write_trace(dir: &std::path::Path, n: u32) -> PathBuf {
+    fn write_trace_with_output_len(dir: &std::path::Path, n: u32, output_len: u32) -> PathBuf {
         let path = dir.join("trace.csv");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "id,input_len,output_len,arrival_time").unwrap();
         for id in 0..n {
-            writeln!(f, "{id},8,3,0.0").unwrap();
+            writeln!(f, "{id},8,{output_len},0.0").unwrap();
         }
         path
+    }
+
+    fn write_trace(dir: &std::path::Path, n: u32) -> PathBuf {
+        write_trace_with_output_len(dir, n, 3)
     }
 
     #[test]
@@ -493,7 +513,7 @@ mod tests {
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
         let mut frontend = TraceFrontend::load(&[trace], 1.0, None).unwrap();
-        let mut logger = LoggerSession::open(dir.path(), true).unwrap();
+        let mut logger = LoggerSession::open(dir.path(), true, false).unwrap();
 
         let summary = run_sim(
             &mut flow,
@@ -528,6 +548,101 @@ mod tests {
         assert!(slo.exists(), "request_slo.parquet missing");
         assert!(state.exists(), "request_state.parquet missing");
         assert_eq!(parquet_rows(&slo), 4, "one slo row per completed request");
+    }
+
+    #[test]
+    fn single_token_request_writes_one_completed_slo_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let trace = write_trace_with_output_len(dir.path(), 1, 1);
+        let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+        let factory = UnifiedWorkerFactory::new(
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig::default(),
+            None,
+            "test-gpu".to_string(),
+            "main",
+            BareboneWorker::<FakeModel>::new,
+        );
+        let cfg = SimpleDpConfig {
+            dp_pool: SimpleDpPoolConfig {
+                pool: PoolId(0),
+                num_workers: 1,
+                placement: DpPlacementPolicy::RoundRobin,
+            },
+        };
+        let mut flow = SimpleDpFlow::new(cfg, factory);
+        let mut frontend = TraceFrontend::load(&[trace], 1.0, None).unwrap();
+        let mut logger = LoggerSession::open(dir.path(), false, false).unwrap();
+
+        let summary = run_sim(
+            &mut flow,
+            &store,
+            &mut frontend,
+            &mut logger,
+            &TickCfg::new(5000.0, true, 100),
+        )
+        .unwrap();
+
+        assert_eq!(summary.requests_finished, 1);
+        assert!(store.borrow()[RequestId(0)].completed);
+        assert_eq!(
+            parquet_rows(&dir.path().join("raw/request_slo.parquet")),
+            1,
+            "completion and sim-end flush must not duplicate the SLO row",
+        );
+    }
+
+    #[test]
+    fn finalize_preserves_never_admitted_request_stage_log() {
+        use arrow_array::{Array, ListArray, UInt16Array, UInt32Array};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+        {
+            let mut s = store.borrow_mut();
+            s.insert(&Request::new(RequestId(0), 8, 2, Time::ZERO));
+            s[RequestId(0)].record_stage(
+                Time::ZERO,
+                UnifiedStage::Pending as u16,
+                PoolId(0),
+                WorkerId(0),
+                true,
+            );
+        }
+        assert_eq!(store.borrow().admitted_watermark(), 0);
+
+        let mut logger = LoggerSession::open(dir.path(), false, true).unwrap();
+        finalize(&store, &mut logger, Time::from_ms(10.0), None).unwrap();
+        logger.flush_all().unwrap();
+
+        let slo_path = dir.path().join("raw/request_slo.parquet");
+        let batch =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(slo_path).unwrap())
+                .unwrap()
+                .build()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let request_ids = batch
+            .column_by_name("request_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(request_ids.value(0), 0);
+        let stage_codes = batch
+            .column_by_name("stage_codes")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let codes = stage_codes.value(0);
+        let codes = codes.as_any().downcast_ref::<UInt16Array>().unwrap();
+        assert_eq!(codes.values(), &[UnifiedStage::Pending as u16]);
     }
 
     fn parquet_rows(path: &std::path::Path) -> usize {

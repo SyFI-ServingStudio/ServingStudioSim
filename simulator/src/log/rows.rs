@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use anyhow::{ensure, Result};
 use arrow_array::builder::{
-    Float32Builder, ListBuilder, StringBuilder, StructBuilder, UInt32Builder, UInt8Builder,
+    Float32Builder, ListBuilder, StringBuilder, StructBuilder, UInt16Builder, UInt32Builder,
+    UInt8Builder,
 };
 use arrow_array::{
     BooleanArray, Float32Array, Float64Array, Int16Array, ListArray, RecordBatch, StringArray,
@@ -66,6 +67,16 @@ pub struct RequestSloEntry {
     /// is the matching `d`). Full prompt for a completed request, partial for a
     /// sim-end-flush still in prefill.
     pub prefill_processed: u32,
+    /// Per-request stage/location transition timeline: four parallel, equal-length
+    /// arrays (`stage_times_ms[i]` the request entered stage `stage_codes[i]` on
+    /// pool `stage_pool_ids[i]` / worker `stage_worker_ids[i]`). Only populated
+    /// when `io.log_stage_transitions` is on. `code` decodes to a `"category:detail"`
+    /// name via the per-deployment table in `run_meta.json`; `(pool_id, worker_id)`
+    /// pins the specific worker (`worker_id` alone is only unique within a pool).
+    pub stage_times_ms: Vec<f32>,
+    pub stage_codes: Vec<u16>,
+    pub stage_pool_ids: Vec<u16>,
+    pub stage_worker_ids: Vec<u16>,
     // Multi-round / session columns are deliberately NOT carried here today.
     // The current request lifecycle is single-round, so `session_id`,
     // `round_idx`, `total_rounds`,
@@ -491,6 +502,7 @@ pub(crate) fn kv_to_record_batch(pool_tag: &str, entries: &[KvSnapshotEntry]) ->
 pub(crate) fn slo_to_record_batch(
     entries: &[RequestSloEntry],
     log_output_token_times: bool,
+    log_stage_transitions: bool,
 ) -> Result<RecordBatch> {
     let request_id: Vec<u32> = entries.iter().map(|e| e.request_id).collect();
     let logging_time: Vec<f64> = entries.iter().map(|e| e.logging_time_ms).collect();
@@ -533,6 +545,43 @@ pub(crate) fn slo_to_record_batch(
     }
     let output_token_times = times_builder.finish();
 
+    // Stage-transition list columns (four parallel; one row's four lists are
+    // equal length). Gated by `log_stage_transitions` exactly like the token
+    // array: when off, one empty (non-null) list per row keeps the columns
+    // row-aligned. Items are non-nullable to match the schema.
+    let mut stage_times_b = ListBuilder::new(Float32Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
+    let mut stage_codes_b = ListBuilder::new(UInt16Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::UInt16, false)));
+    let mut stage_pool_b = ListBuilder::new(UInt16Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::UInt16, false)));
+    let mut stage_worker_b = ListBuilder::new(UInt16Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::UInt16, false)));
+    for e in entries {
+        if log_stage_transitions {
+            for &t in &e.stage_times_ms {
+                stage_times_b.values().append_value(t);
+            }
+            for &c in &e.stage_codes {
+                stage_codes_b.values().append_value(c);
+            }
+            for &p in &e.stage_pool_ids {
+                stage_pool_b.values().append_value(p);
+            }
+            for &w in &e.stage_worker_ids {
+                stage_worker_b.values().append_value(w);
+            }
+        }
+        stage_times_b.append(true);
+        stage_codes_b.append(true);
+        stage_pool_b.append(true);
+        stage_worker_b.append(true);
+    }
+    let stage_times = stage_times_b.finish();
+    let stage_codes_col = stage_codes_b.finish();
+    let stage_pool_ids = stage_pool_b.finish();
+    let stage_worker_ids = stage_worker_b.finish();
+
     Ok(RecordBatch::try_new(
         request_slo_schema(),
         vec![
@@ -549,6 +598,10 @@ pub(crate) fn slo_to_record_batch(
             Arc::new(Float32Array::from(tpot_max)),
             Arc::new(Float32Array::from(finish_decode)),
             Arc::new(UInt32Array::from(prefill_processed)),
+            Arc::new(stage_times),
+            Arc::new(stage_codes_col),
+            Arc::new(stage_pool_ids),
+            Arc::new(stage_worker_ids),
         ],
     )?)
 }
@@ -652,6 +705,10 @@ mod tests {
             tpot_mean_ms: tpot_mean,
             finish_decode_time_ms: finish,
             prefill_processed: 0,
+            stage_times_ms: Vec::new(),
+            stage_codes: Vec::new(),
+            stage_pool_ids: Vec::new(),
+            stage_worker_ids: Vec::new(),
         }
     }
 
@@ -813,7 +870,7 @@ mod tests {
     #[test]
     fn slo_list_column_round_trips() {
         let entries = vec![slo_entry(0, vec![1.0, 3.0, 5.0]), slo_entry(1, vec![2.0])];
-        let batch = slo_to_record_batch(&entries, true).unwrap();
+        let batch = slo_to_record_batch(&entries, true, false).unwrap();
         assert_eq!(batch.num_rows(), 2);
         // num_output_tokens column (index 5) reflects the list lengths.
         let n = batch
@@ -861,7 +918,7 @@ mod tests {
         // log_output_token_times = false → the array column is empty, but the derived
         // scalars (num, tpot, finish_decode) are still computed from the array.
         let entries = vec![slo_entry(0, vec![1.0, 3.0, 5.0])];
-        let batch = slo_to_record_batch(&entries, false).unwrap();
+        let batch = slo_to_record_batch(&entries, false, false).unwrap();
         let times = batch
             .column(4)
             .as_any()
@@ -880,5 +937,53 @@ mod tests {
             .downcast_ref::<Float32Array>()
             .unwrap();
         assert_eq!(finish.value(0), 5.0, "E2E scalar survives array-off");
+    }
+
+    #[test]
+    fn slo_stage_columns_round_trip_and_gate() {
+        // Schema column order appends the four stage lists last: 13=times,
+        // 14=codes, 15=pool_ids, 16=worker_ids.
+        let mut e = slo_entry(0, vec![1.0, 2.0]);
+        e.stage_times_ms = vec![0.0, 5.0, 9.0];
+        e.stage_codes = vec![0, 1, 2];
+        e.stage_pool_ids = vec![0, 0, 1];
+        e.stage_worker_ids = vec![3, 3, 7];
+
+        // On: the four parallel lists carry the values, equal length.
+        let batch = slo_to_record_batch(std::slice::from_ref(&e), false, true).unwrap();
+        let list = |i: usize| {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(list(13).len(), 3);
+        assert_eq!(list(14).len(), 3);
+        assert_eq!(list(15).len(), 3);
+        assert_eq!(list(16).len(), 3);
+        let codes = list(14);
+        assert_eq!(
+            codes.as_any().downcast_ref::<UInt16Array>().unwrap().values(),
+            &[0, 1, 2]
+        );
+        let workers = list(16);
+        assert_eq!(
+            workers.as_any().downcast_ref::<UInt16Array>().unwrap().values(),
+            &[3, 3, 7],
+            "worker_id disambiguates same-code stages across pools"
+        );
+
+        // Off: all four stage columns are empty (gated exactly like the token array).
+        let batch_off = slo_to_record_batch(std::slice::from_ref(&e), false, false).unwrap();
+        for col in [13, 14, 15, 16] {
+            let l = batch_off
+                .column(col)
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            assert_eq!(l.value(0).len(), 0, "stage column {col} must be empty when gated off");
+        }
     }
 }

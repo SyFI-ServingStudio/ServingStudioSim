@@ -5,9 +5,11 @@
 pub mod fabric;
 pub mod id;
 pub mod request;
+pub mod request_stage;
 pub mod time;
 
 pub use fabric::Fabric;
 pub use id::{BatchId, ExpertId, GroupId, IdMap, PoolId, RequestId, WorkerId};
 pub use request::{Request, RequestRecord, RequestStore, SharedRequests};
+pub use request_stage::{AfdStage, PdStage, StageEvent, StageVocab, UnifiedStage};
 pub use time::Time;

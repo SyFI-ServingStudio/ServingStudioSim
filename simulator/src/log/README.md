@@ -53,7 +53,7 @@ run_meta.rs       write_run_meta — the run_meta.json GPU-facts sidecar (plain
 
 | File | Writer | Opened by | Content |
 |---|---|---|---|
-| `request_slo.parquet` | `LoggerSession` | L7 `run_sim` | one terminal row per completed request (TTFT/TPOT/E2E inputs) |
+| `request_slo.parquet` | `LoggerSession` | L7 `run_sim` | one terminal row per completed request, or one sim-end partial row per incomplete arrived request |
 | `request_state.parquet` | `LoggerSession` | L7 `run_sim` | periodic dense snapshot over the admitted set |
 | `cost_log/worker_<pool_tag>_<worker_id>.parquet` | `CostLogger` | each L5 worker | one row per iteration: envelope + per-group `input_section` + the CostTree per-slot breakdown |
 | `cost_manifest/worker_<pool_tag>_<worker_id>.json` | `CostLogger` | each L5 worker | the matching `CostManifest` (slots + flat aggregation nodes) written once at open |

@@ -11,7 +11,8 @@ use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
-use super::id::RequestId;
+use super::id::{PoolId, RequestId, WorkerId};
+use super::request_stage::StageEvent;
 use super::time::Time;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,6 +62,16 @@ pub struct RequestRecord {
     pub output_token_times: Vec<Time>,
     pub tokens_emitted: u32,
     pub completed: bool,
+
+    // ── location / stage timeline ──
+    /// Current location: the last stage/worker this request transitioned to.
+    /// Always maintained (a cheap value copy) so "where is request X now" is
+    /// an O(1) read even when the timeline below is not logged.
+    pub current_stage: StageEvent,
+    /// Full stage-transition timeline; only allocated/appended when
+    /// `io.log_stage_transitions` is on. Drained into the `request_slo` row's
+    /// stage list columns at terminal time.
+    pub stage_log: Vec<StageEvent>,
 }
 
 impl RequestRecord {
@@ -77,6 +88,41 @@ impl RequestRecord {
             output_token_times: Vec::new(),
             tokens_emitted: 0,
             completed: false,
+            current_stage: StageEvent::unset(req.arrival_time),
+            stage_log: Vec::new(),
+        }
+    }
+
+    /// Record a location/stage transition: at `now` the request moved to stage
+    /// `code` on `(pool, worker)`. `log` mirrors `io.log_stage_transitions`:
+    /// when off, the timeline `Vec` is never appended (`current_stage` is still
+    /// updated for the live "where is this request" query). A repeat of the
+    /// current `(code, pool, worker)` is dropped so the timeline holds only real
+    /// moves.
+    pub fn record_stage(
+        &mut self,
+        now: Time,
+        code: u16,
+        pool: PoolId,
+        worker: WorkerId,
+        log: bool,
+    ) {
+        if (
+            self.current_stage.code,
+            self.current_stage.pool,
+            self.current_stage.worker,
+        ) == (code, pool, worker)
+        {
+            return;
+        }
+        self.current_stage = StageEvent {
+            time: now,
+            code,
+            pool,
+            worker,
+        };
+        if log {
+            self.stage_log.push(self.current_stage);
         }
     }
 
@@ -95,6 +141,10 @@ impl RequestRecord {
         self.tokens_emitted = 1;
         self.first_token_time = Some(now);
         self.last_token_time = Some(now);
+        // Token emission owns the completion invariant. In particular, workers
+        // must not need a separate decode_len == 1 branch just to keep the
+        // lifecycle flag consistent with `is_complete()`.
+        self.completed = self.is_complete();
         if log_tokens {
             // The full decode length is known up front, so size the per-token
             // buffer exactly once here (only for requests that actually start
@@ -115,6 +165,23 @@ impl RequestRecord {
         if self.is_complete() {
             self.completed = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_token_completes_single_token_request() {
+        let req = Request::new(RequestId(0), 8, 1, Time::ZERO);
+        let mut rec = RequestRecord::from_request(&req);
+
+        rec.record_first_token(Time::from_ms(1.0), false);
+
+        assert_eq!(rec.tokens_emitted, 1);
+        assert!(rec.is_complete());
+        assert!(rec.completed);
     }
 }
 

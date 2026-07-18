@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
-use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{PdStage, PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{KvSampler, KvSubmit};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::admission_helpers::{Batch, LoadBalance};
@@ -129,6 +129,9 @@ impl DecodeRuntime {
 
 pub struct PdDecodeWorker<M: IterwiseUnifiedModel> {
     pub id: WorkerId,
+    /// This worker's pool; paired with `id` to globally identify the worker in
+    /// `record_stage` (`id` alone is only unique within a pool).
+    pool: PoolId,
     model: Arc<M>,
     requests: SharedRequests,
     config: WorkerConfig,
@@ -217,6 +220,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref(), config.gpu_time_multiplier);
         Self {
             id,
+            pool,
             model,
             requests,
             config,
@@ -247,6 +251,14 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                     self.runtime.pending_decodes.push_back(pull.req);
                     self.runtime.pending_decodes_tokens += pull.tokens;
                     self.runtime.in_transit = None;
+                    // Location: KV landed → awaiting a decode slot on this worker.
+                    self.requests.borrow_mut()[pull.req].record_stage(
+                        now,
+                        PdStage::PendingDecode as u16,
+                        self.pool,
+                        self.id,
+                        self.config.log_stage_transitions,
+                    );
                     // Ack the prefill side: its held reservation can drop now
                     // that the KV has fully landed here. L6 routes this back
                     // by `prefill_worker` (not placement-chosen).
@@ -298,6 +310,14 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                 prefill_worker: transfer.prefill_worker,
                 tokens: transfer.tokens,
             });
+            // Location: KV pull now in flight to this decode worker.
+            self.requests.borrow_mut()[rid].record_stage(
+                now,
+                PdStage::Transfer as u16,
+                self.pool,
+                self.id,
+                self.config.log_stage_transitions,
+            );
             // Loop back: if pull_end <= now (instant transfer), promote it this
             // same tick rather than parking a finished pull in `in_transit`.
         }
@@ -309,7 +329,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
         use WorkerFsmState::*;
         loop {
             let should_continue = match self.runtime.worker_fsm_state {
-                Idle => self.tick_idle(),
+                Idle => self.tick_idle(now),
                 Active => match self.runtime.batch_fsm_state.cursor {
                     NotStarted => self.tick_not_started(now),
                     Computing => self.tick_computing(now),
@@ -360,8 +380,8 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
         }
     }
 
-    fn tick_idle(&mut self) -> bool {
-        if !self.form_batch() {
+    fn tick_idle(&mut self, now: Time) -> bool {
+        if !self.form_batch(now) {
             return false;
         }
         self.runtime.worker_fsm_state = WorkerFsmState::Active;
@@ -393,7 +413,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
 
     // ── Stage 1: form_batch — admit one handed-off request straight into decode ─
 
-    fn form_batch(&mut self) -> bool {
+    fn form_batch(&mut self, now: Time) -> bool {
         let had_decode = self
             .batches
             .iter()
@@ -431,6 +451,14 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                     self.runtime.pending_decodes_tokens.saturating_sub(prompt_kv);
                 self.batches[gid as usize].finalize_to_decode(rid, prompt_kv, remaining);
                 self.runtime.request_to_group.insert(rid, gid);
+                // Location: KV resident + slot granted → decoding on this worker.
+                self.requests.borrow_mut()[rid].record_stage(
+                    now,
+                    PdStage::Decode as u16,
+                    self.pool,
+                    self.id,
+                    self.config.log_stage_transitions,
+                );
             }
         }
 
@@ -466,11 +494,14 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
 
             // (a) live decodes produced one token.
             {
+                let (pool, wid, log_stage) =
+                    (self.pool, self.id, self.config.log_stage_transitions);
                 let mut store = self.requests.borrow_mut();
                 for (rid, _) in self.batches[gid].iter_decoding() {
                     let r = &mut store[rid];
                     r.record_token(now, log_tokens);
                     if r.is_complete() {
+                        r.record_stage(now, PdStage::Done as u16, pool, wid, log_stage);
                         completed.push(rid);
                     }
                 }
@@ -576,6 +607,17 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
                 };
                 self.runtime.pending_decodes.push_back(rid);
                 self.runtime.pending_decodes_tokens += tokens;
+                // Direct-admit path: KV instantly resident → awaiting a decode
+                // slot. Stamped at arrival (enqueue carries no clock).
+                let mut store = self.requests.borrow_mut();
+                let arrival = store[rid].arrival_time;
+                store[rid].record_stage(
+                    arrival,
+                    PdStage::PendingDecode as u16,
+                    self.pool,
+                    self.id,
+                    self.config.log_stage_transitions,
+                );
             }
             // PD handoff: the wire message only carries the sender side; fill
             // in this worker's own destination block (pre-resolved at

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
-use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{PdStage, PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{KvSampler, KvSubmit};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::admission_helpers::Batch;
@@ -69,6 +69,9 @@ impl PrefillRuntime {
 
 pub struct PdPrefillWorker<M: IterwiseUnifiedModel> {
     pub id: WorkerId,
+    /// This worker's pool; paired with `id` to globally identify the worker in
+    /// `record_stage` (`id` alone is only unique within a pool).
+    pool: PoolId,
     model: Arc<M>,
     requests: SharedRequests,
     config: WorkerConfig,
@@ -127,6 +130,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         // authoritative for shard count.
         Self {
             id,
+            pool,
             model,
             requests,
             config,
@@ -146,7 +150,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         loop {
             match self.runtime.worker_fsm_state {
                 Idle => {
-                    if !self.form_batch() {
+                    if !self.form_batch(now) {
                         break;
                     }
                     self.runtime.worker_fsm_state = Active;
@@ -198,7 +202,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
 
     // ── Stage 1: form_batch — admit one fresh prefill by prompt KV only ─────────
 
-    fn form_batch(&mut self) -> bool {
+    fn form_batch(&mut self, now: Time) -> bool {
         if let Some(&rid) = self.runtime.pending_prefills.front() {
             // PD prefill admits by PROMPT only: the request hands off after prefill
             // and never decodes locally (its local KvPool stays empty), so its peak
@@ -220,7 +224,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
                 .try_admit(&self.batches[0], group_promised, p, 0)
             {
                 self.runtime.pending_prefills.pop_front();
-                self.promise(0, rid, p, 0, 0);
+                self.promise(now, 0, rid, p, 0, 0);
             }
         }
         self.drain_promises_into_admits();
@@ -255,6 +259,8 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         // free-time at `submit_transfer` time.
         let send_gid = self.send_gid;
         let worker_id = self.id;
+        let pool = self.pool;
+        let log_stage = self.config.log_stage_transitions;
         // The prefill produced the request's first output token (TTFT). Then,
         // instead of entering a local decode set, the request is handed off to a
         // decode pool: emit RequestComplete if it needed only that one token,
@@ -274,6 +280,21 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             // calling `cluster.submit_transfer`; bytes are a wire-level concern.
             let kv_tokens = (r.prompt_len + r.prefix_kv) as u64;
             let complete = r.is_complete();
+            // Location (while `r` still borrowed): a single-token request finishes
+            // here (Done); otherwise its KV is held on this worker awaiting the
+            // decode-side pull (`PrefillDoneAwaitPull`) — the decode worker
+            // records the rest.
+            r.record_stage(
+                now,
+                if complete {
+                    PdStage::Done
+                } else {
+                    PdStage::PrefillDoneAwaitPull
+                } as u16,
+                pool,
+                worker_id,
+                log_stage,
+            );
             // r is unused below — NLL releases the borrow on `store`.
             self.runtime.request_to_group.remove(&rid);
             if complete {
@@ -352,7 +373,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
 
     // ── lifecycle helpers (PD prefill: no local decode KV finalization) ─────────
 
-    fn promise(&mut self, gid: u16, rid: RequestId, p: u32, d: u32, prefix: u32) {
+    fn promise(&mut self, now: Time, gid: u16, rid: RequestId, p: u32, d: u32, prefix: u32) {
         self.runtime
             .promised
             .insert(rid, (gid, (p + prefix + d) as u64));
@@ -362,6 +383,14 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         let r = &mut store[rid];
         r.active_chunk_len = p;
         r.prefix_kv = prefix;
+        // Location: pending → prefilling on this prefill worker.
+        r.record_stage(
+            now,
+            PdStage::Prefill as u16,
+            self.pool,
+            self.id,
+            self.config.log_stage_transitions,
+        );
     }
 
     fn drain_promises_into_admits(&mut self) {
@@ -416,7 +445,20 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdPrefillWorker<M> {
 
     fn enqueue(&mut self, msg: Self::Msg) {
         match msg {
-            PdPrefillMsg::Request(rid) => self.runtime.pending_prefills.push_back(rid),
+            PdPrefillMsg::Request(rid) => {
+                self.runtime.pending_prefills.push_back(rid);
+                // Location: request now queued on this prefill worker. Stamped at
+                // its arrival time (enqueue carries no clock; arrival is on record).
+                let mut store = self.requests.borrow_mut();
+                let arrival = store[rid].arrival_time;
+                store[rid].record_stage(
+                    arrival,
+                    PdStage::PendingPrefill as u16,
+                    self.pool,
+                    self.id,
+                    self.config.log_stage_transitions,
+                );
+            }
             // Decode side has finished pulling — drop the held reservation.
             PdPrefillMsg::ReleaseKv { req } => self.drop_held(req),
         }
@@ -503,5 +545,6 @@ mod tests {
                 req: RequestId(0)
             }]
         );
+        assert!(store.borrow()[RequestId(0)].completed);
     }
 }

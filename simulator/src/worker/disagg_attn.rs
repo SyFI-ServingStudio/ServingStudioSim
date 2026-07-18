@@ -72,7 +72,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, AttnArchInput, AttnLayerwiseModel};
-use crate::common::{IdMap, PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{AfdStage, IdMap, PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{KvSampler, KvSubmit};
 use crate::worker::admission_helpers::Batch;
 use crate::worker::cost_buffers::CostBuffers;
@@ -247,6 +247,9 @@ impl PendingQueue {
 
 pub struct DisaggAttnWorker<M: AttnLayerwiseModel> {
     pub id: WorkerId,
+    /// This worker's pool; paired with `id` to globally identify the worker in
+    /// `record_stage` (`id` alone is only unique within a pool).
+    pool: PoolId,
     model: Arc<M>,
     requests: SharedRequests,
     config: WorkerConfig,
@@ -336,6 +339,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         );
         Self {
             id,
+            pool,
             model,
             requests,
             config,
@@ -417,6 +421,17 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         );
         let (prompt_kv, remaining) = self.footprint(req);
         self.worker_pending.push_back(req, prompt_kv + remaining as u64);
+        // Location: request now queued on this attn worker. Stamped at its arrival
+        // time (admit carries no clock; arrival is on the record).
+        let mut store = self.requests.borrow_mut();
+        let arrival = store[req].arrival_time;
+        store[req].record_stage(
+            arrival,
+            AfdStage::Pending as u16,
+            self.pool,
+            self.id,
+            self.config.log_stage_transitions,
+        );
     }
 
     /// Drop a completed request's KV (the ffn Terminal completed it; the flow routed
@@ -507,7 +522,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         if !self.has_work() {
             return None;
         }
-        self.drain_pending_admits();
+        self.drain_pending_admits(now);
         // Fixpoint: open each layer-0 iteration (activate admits + announce
         // `IterStart`), settle event-time completions, then start the next pull /
         // compute under the single-pull / single-compute gates.
@@ -542,7 +557,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
     /// `worker_pending` under the projected-peak KV gate, head-of-line (stop at the
     /// first reject, do not skip). Each admit reserves the FULL footprint in
     /// `promised` and assigns the least-KV slot.
-    fn drain_pending_admits(&mut self) {
+    fn drain_pending_admits(&mut self, now: Time) {
         while let Some(req) = self.worker_pending.front() {
             let (prompt_kv, remaining) = self.footprint(req);
             if remaining == 0 {
@@ -566,7 +581,19 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             // (and dense `request_state` snapshots log it). This is the ONLY store
             // write this worker makes — the ffn Terminal still owns the
             // prefill→decode status flip (D16).
-            self.requests.borrow_mut().mark_admitted(req);
+            {
+                let mut store = self.requests.borrow_mut();
+                store.mark_admitted(req);
+                // Location: pending → admitted into a slot (prefilling) on this
+                // attn worker. The ffn Terminal later records decode/done.
+                store[req].record_stage(
+                    now,
+                    AfdStage::Prefill as u16,
+                    self.pool,
+                    self.id,
+                    self.config.log_stage_transitions,
+                );
+            }
             self.promised.insert(req, prompt_kv + remaining as u64);
             let slot = self.wlb_choose_least_kv();
             self.slots[slot].pending_insert.push(req);

@@ -121,6 +121,17 @@ pub struct IoSpec {
     /// worker neither allocates nor appends the array. Turn on only when
     /// per-token granularity (ITL) is actually needed.
     pub log_output_token_times: bool,
+    /// Record + persist the per-request stage/location transition timeline on
+    /// each `request_slo` row (the stage list columns): every time a request
+    /// moves between queues/workers, one `(time, code, pool_id, worker_id)`
+    /// event is appended. OFF by default — like `log_output_token_times`, the
+    /// timeline `Vec` is only allocated/appended when this is on. Codes decode
+    /// to `"category:detail"` names via the per-deployment table in `run_meta.json`.
+    /// Genuinely omittable (absent = false), so it carries `serde`/`param`
+    /// defaults rather than the required-field treatment.
+    #[serde(default)]
+    #[param(default = false)]
+    pub log_stage_transitions: bool,
     /// The per-worker `KvSampler` emits one `kv_snapshot` occupancy row every
     /// `kv_log_stride` per-iteration submits (running-max throttle). Genuinely
     /// omittable — absent = 8 — so, like `tick_dt_us`, it carries a `serde` default
@@ -154,6 +165,17 @@ impl RunConfig {
             RunConfig::Unified(c) => &c.io,
             RunConfig::Pd(c) => &c.io,
             RunConfig::Afd(c) => &c.io,
+        }
+    }
+
+    /// The per-deployment stage vocabulary (`code → "category:detail"` names) written
+    /// into `run_meta.json` so the analyzer can decode the `request_slo`
+    /// stage-transition codes. Barebone and HP unified share `UnifiedStage`.
+    pub fn stage_vocab(&self) -> crate::common::StageVocab {
+        match self {
+            RunConfig::Unified(_) => crate::common::UnifiedStage::VOCAB,
+            RunConfig::Pd(_) => crate::common::PdStage::VOCAB,
+            RunConfig::Afd(_) => crate::common::AfdStage::VOCAB,
         }
     }
 }

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
-use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{PoolId, RequestId, SharedRequests, Time, UnifiedStage, WorkerId};
 use crate::log::{KvSampler, KvSubmit};
 use crate::worker::admission_helpers::{prefill_fits_budget, Batch};
 use crate::worker::cost_buffers::CostBuffers;
@@ -59,6 +59,9 @@ impl WorkerRuntime {
 
 pub struct BareboneWorker<M: IterwiseUnifiedModel> {
     pub id: WorkerId,
+    /// This worker's pool. Paired with `id` to globally identify the worker in
+    /// `record_stage` (`id` alone is only unique within a pool).
+    pool: PoolId,
     model: Arc<M>,
     requests: SharedRequests,
     config: WorkerConfig,
@@ -110,6 +113,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
             CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref(), config.gpu_time_multiplier);
         Self {
             id,
+            pool,
             model,
             requests,
             config,
@@ -125,6 +129,17 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
     pub fn enqueue(&mut self, msg: WorkerMsgCommon) {
         let WorkerMsgCommon::Request(rid) = msg;
         self.runtime.pending_prefills.push_back(rid);
+        // Location: the request now sits in this worker's pending queue. Stamped
+        // at its arrival time (enqueue carries no clock; arrival is on the record).
+        let mut store = self.requests.borrow_mut();
+        let arrival = store[rid].arrival_time;
+        store[rid].record_stage(
+            arrival,
+            UnifiedStage::Pending as u16,
+            self.pool,
+            self.id,
+            self.config.log_stage_transitions,
+        );
     }
 
     pub fn status(&self) -> WorkerStatus {
@@ -146,7 +161,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         loop {
             match self.runtime.worker_fsm_state {
                 Idle => {
-                    if !self.form_batch() {
+                    if !self.form_batch(now) {
                         break; // no work this tick; quiesce
                     }
                     // Idle → Active/NotStarted (transition owned here, not in form_batch).
@@ -200,7 +215,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     // ── Stage 1: form_batch (Phase A admit + Phase B drain) ────────────────────
 
-    fn form_batch(&mut self) -> bool {
+    fn form_batch(&mut self, now: Time) -> bool {
         let had_decode = self.batches[0].iter_decoding().next().is_some();
 
         // Phase A: admit fresh prefill(s) from the queue. Without a token budget
@@ -222,7 +237,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                         .try_admit(&self.batches[0], group_promised, p, d)
                     {
                         self.runtime.pending_prefills.pop_front();
-                        self.promise(0, rid, p, d, 0);
+                        self.promise(now, 0, rid, p, d, 0);
                     }
                 }
             }
@@ -247,7 +262,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                         break; // KV gate blocks the FIFO head; retry next iter
                     }
                     self.runtime.pending_prefills.pop_front();
-                    self.promise(0, rid, p, d, 0);
+                    self.promise(now, 0, rid, p, d, 0);
                     admitted += p;
                 }
             }
@@ -290,11 +305,13 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         // shared borrow of `batches` and the `RefCell` borrow_mut don't conflict.
         {
             let log_tokens = self.config.log_output_token_times;
+            let (pool, wid, log_stage) = (self.pool, self.id, self.config.log_stage_transitions);
             let mut store = self.requests.borrow_mut();
             for (rid, _) in self.batches[0].iter_decoding() {
                 let r = &mut store[rid];
                 r.record_token(now, log_tokens);
                 if r.is_complete() {
+                    r.record_stage(now, UnifiedStage::Done as u16, pool, wid, log_stage);
                     completed.push(rid);
                 }
             }
@@ -306,6 +323,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         // (c) prefills resolved → first token; complete now or enter decode set.
         let mut to_finalize: Vec<(RequestId, u64, u32)> = Vec::new();
         {
+            let (pool, wid, log_stage) = (self.pool, self.id, self.config.log_stage_transitions);
             let mut store = self.requests.borrow_mut();
             // Iterate `prefill_admits` in place (cleared below after the deferred
             // finalize) instead of cloning it.
@@ -314,10 +332,14 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
                 r.prefill_processed = r.prompt_len;
                 r.record_first_token(now, self.config.log_output_token_times);
                 if r.is_complete() {
+                    // Single-token request: prefill resolved straight to done.
+                    r.record_stage(now, UnifiedStage::Done as u16, pool, wid, log_stage);
                     completed.push(rid);
                 } else {
                     let kv = (r.prompt_len + r.prefix_kv) as u64;
                     let remaining = r.decode_len.saturating_sub(r.tokens_emitted);
+                    // Location: prefilling → decoding on this worker.
+                    r.record_stage(now, UnifiedStage::Decode as u16, pool, wid, log_stage);
                     to_finalize.push((rid, kv, remaining));
                 }
             }
@@ -395,7 +417,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
 
     // ── lifecycle helpers ──────────────────────────────────────────────────────
 
-    fn promise(&mut self, gid: u16, rid: RequestId, p: u32, d: u32, prefix: u32) {
+    fn promise(&mut self, now: Time, gid: u16, rid: RequestId, p: u32, d: u32, prefix: u32) {
         self.runtime
             .promised
             .insert(rid, (gid, (p + prefix + d) as u64));
@@ -408,6 +430,14 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
         let r = &mut store[rid];
         r.active_chunk_len = p;
         r.prefix_kv = prefix;
+        // Location: pending → prefilling on this worker.
+        r.record_stage(
+            now,
+            UnifiedStage::Prefill as u16,
+            self.pool,
+            self.id,
+            self.config.log_stage_transitions,
+        );
     }
 
     /// Barebone readiness predicate is always true (KV is local; no remote pulls).
@@ -562,7 +592,7 @@ mod tests {
         for id in [0, 1, 2, 3] {
             w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
         }
-        w.form_batch();
+        w.form_batch(Time::ZERO);
         assert_eq!(w.batches[0].prefill_admits.len(), 2);
         assert_eq!(w.runtime.pending_prefills.len(), 2);
     }
@@ -575,7 +605,7 @@ mod tests {
         for id in [0, 1, 2] {
             w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
         }
-        w.form_batch();
+        w.form_batch(Time::ZERO);
         assert_eq!(w.batches[0].prefill_admits.len(), 1);
         assert_eq!(w.runtime.pending_prefills.len(), 2);
     }
@@ -589,7 +619,7 @@ mod tests {
         for id in [0, 1] {
             w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
         }
-        w.form_batch();
+        w.form_batch(Time::ZERO);
         assert_eq!(w.batches[0].prefill_admits.len(), 1);
         assert_eq!(w.runtime.pending_prefills.len(), 1);
     }

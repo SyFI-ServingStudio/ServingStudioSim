@@ -6,10 +6,11 @@
 //!   - **expected**: closed forms over each request's terminal `(p, d)` in
 //!     `request_slo` (`p = prefill_processed`, `d = num_output_tokens`).
 //!
-//! `request_slo` covers exactly the admitted set (completed rows at their
-//! completion tick + sim-end-flush partial rows for in-flight reqs), which is
-//! exactly the set `cost_log` did work for, so the two sides are comparable on
-//! any run — not just fully drained ones.
+//! `request_slo` covers every arrived request (completed rows at their completion
+//! tick + sim-end-flush partial rows for incomplete reqs). Never-admitted rows
+//! contribute zero expected work. They are excluded from the positive boundary
+//! allowance, which applies only after a request has emitted its first token and
+//! may therefore have one uncommitted decode pass at sim-end.
 //!
 //! Checks for iter-wise deployments (single-round today, so preserved-prefix
 //! `pre = 0`):
@@ -117,6 +118,7 @@ struct Expected {
     causal: f64,
     requests: usize,
     incomplete_requests: usize,
+    boundary_decode_requests: usize,
     max_context_len: f64,
 }
 
@@ -158,6 +160,7 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
             "num_layers": actual.num_layers,
             "num_requests": expected.requests,
             "num_incomplete_requests": expected.incomplete_requests,
+            "num_boundary_decode_requests": expected.boundary_decode_requests,
             "max_context_len": expected.max_context_len,
         },
         "available": true,
@@ -196,9 +199,9 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
         WorkloadMode::Iterwise => 1.0,
         WorkloadMode::Afd => actual.num_layers as f64 + 3.0,
     };
-    let incomplete = expected.incomplete_requests as f64;
-    let decode_boundary_allowance = incomplete * layer_multiplier;
-    let ffn_boundary_allowance = incomplete * ffn_multiplier;
+    let boundary_decode_requests = expected.boundary_decode_requests as f64;
+    let decode_boundary_allowance = boundary_decode_requests * layer_multiplier;
+    let ffn_boundary_allowance = boundary_decode_requests * ffn_multiplier;
     let decode_kv_boundary_allowance =
         (actual.decode_passes - expected.decode_passes).max(0.0) * expected.max_context_len;
 
@@ -521,8 +524,12 @@ async fn collect_expected(
             e.requests += 1;
             let p = value_f64(p_arr, row)?;
             let d = value_f64(d_arr, row)?;
-            if !completed.value(row) {
+            let is_completed = completed.value(row);
+            if !is_completed {
                 e.incomplete_requests += 1;
+            }
+            if contributes_boundary_allowance(is_completed, d) {
+                e.boundary_decode_requests += 1;
             }
             e.max_context_len = e.max_context_len.max(p + d);
             let m = (d - 1.0).max(0.0); // decode forward passes (first token from prefill)
@@ -536,6 +543,10 @@ async fn collect_expected(
     Ok(e)
 }
 
+fn contributes_boundary_allowance(completed: bool, num_output_tokens: f64) -> bool {
+    !completed && num_output_tokens > 0.0
+}
+
 fn definitions() -> Value {
     json!({
         "scope": "whole run — cost_log actuals vs request_slo per-request expected",
@@ -544,9 +555,10 @@ fn definitions() -> Value {
         "preserved_prefix": "assumed 0 (single-round today); add when multi-round lands",
         "status": "OK |unexplained Δ%| <= tolerance_pct; WARN <= warn_pct; FAIL otherwise",
         "boundary_allowance_note": "positive-only allowance for DurationReached pipeline tails: \
-                                   an incomplete request may have at most one un-emitted decode \
-                                   token partially through the layer/section pipeline; negative \
-                                   deltas are never absorbed",
+                                   an incomplete request that has emitted at least one output \
+                                   token may have at most one additional decode token partially \
+                                   through the layer/section pipeline; never-admitted and prefill-only \
+                                   requests do not enlarge the allowance; negative deltas are never absorbed",
         "afd_note": "for deployment=afd, attention actuals are summed from pool_tag=attn, \
                      section=attn and multiplied by observed layer count; FFN actuals are \
                      summed from pool_tag=ffn section rows and expected as Σ[p+m]×(layers+3)",
@@ -576,4 +588,39 @@ fn unavailable_payload(log_dir: &Path, reason: &str) -> Value {
         "meta": {"log_dir": log_dir.display().to_string(), "available": false, "reason": reason},
         "checks": [],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boundary_allowance_excludes_pending_and_completed_requests() {
+        assert!(!contributes_boundary_allowance(false, 0.0));
+        assert!(contributes_boundary_allowance(false, 1.0));
+        assert!(!contributes_boundary_allowance(true, 1.0));
+    }
+
+    #[test]
+    fn boundary_allowance_uses_eligible_count_not_all_incomplete_requests() {
+        let expected = Expected {
+            requests: 4,
+            incomplete_requests: 3,
+            boundary_decode_requests: 1,
+            ..Expected::default()
+        };
+
+        let checks = checks_for_mode(WorkloadMode::Iterwise, &Actual::default(), &expected);
+        let decode = checks
+            .iter()
+            .find(|check| check["name"] == "decode_passes")
+            .unwrap();
+        let ffn = checks
+            .iter()
+            .find(|check| check["name"] == "ffn_token_pass")
+            .unwrap();
+
+        assert_eq!(decode["positive_boundary_allowance"], 1.0);
+        assert_eq!(ffn["positive_boundary_allowance"], 1.0);
+    }
 }

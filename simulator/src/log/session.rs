@@ -51,8 +51,13 @@ impl LoggerSession {
     /// and spawn the background writer thread. Files are created lazily on the
     /// first row (an empty stream writes nothing). `log_output_token_times` controls
     /// whether the per-token `output_token_times` array column is materialized
-    /// (the derived SLO scalars are written either way).
-    pub fn open(log_dir: &Path, log_output_token_times: bool) -> Result<Self> {
+    /// (the derived SLO scalars are written either way). `log_stage_transitions`
+    /// likewise gates the per-request stage-transition list columns.
+    pub fn open(
+        log_dir: &Path,
+        log_output_token_times: bool,
+        log_stage_transitions: bool,
+    ) -> Result<Self> {
         let raw = log_dir.join("raw");
         let mut state_writer =
             StreamingParquetWriter::new(raw.join("request_state.parquet"), request_state_schema());
@@ -68,9 +73,11 @@ impl LoggerSession {
                 for msg in rx {
                     match msg {
                         LogMsg::State(buf) => state_writer.write(&state_to_record_batch(&buf)?)?,
-                        LogMsg::Slo(buf) => {
-                            slo_writer.write(&slo_to_record_batch(&buf, log_output_token_times)?)?
-                        }
+                        LogMsg::Slo(buf) => slo_writer.write(&slo_to_record_batch(
+                            &buf,
+                            log_output_token_times,
+                            log_stage_transitions,
+                        )?)?,
                     };
                 }
                 state_writer.close()?;
@@ -203,6 +210,10 @@ mod tests {
             tpot_mean_ms: None,
             finish_decode_time_ms: finish,
             prefill_processed: 0,
+            stage_times_ms: Vec::new(),
+            stage_codes: Vec::new(),
+            stage_pool_ids: Vec::new(),
+            stage_worker_ids: Vec::new(),
         }
     }
 
@@ -210,7 +221,7 @@ mod tests {
     fn logger_session_writes_both_parquets() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut log = LoggerSession::open(dir.path(), true).unwrap();
+            let mut log = LoggerSession::open(dir.path(), true, false).unwrap();
             log.record_request_slo(slo_entry(0, vec![1.0, 2.0]))
                 .unwrap();
             log.flush_all().unwrap();

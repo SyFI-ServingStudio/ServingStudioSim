@@ -173,10 +173,14 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     let mut flow = build_flow(&cfg, &bridge, Rc::clone(&store))?;
 
     let log_dir = &cfg.io().log_dir;
-    let mut logger = LoggerSession::open(log_dir, cfg.io().log_output_token_times)?;
+    let mut logger = LoggerSession::open(
+        log_dir,
+        cfg.io().log_output_token_times,
+        cfg.io().log_stage_transitions,
+    )?;
     // Run-level GPU facts sidecar (L7): written before the tick loop so the
     // analyzer can normalize per-GPU even if the run later fails.
-    simulator::log::write_run_meta(log_dir, &flow.cluster().borrow())?;
+    simulator::log::write_run_meta(log_dir, &flow.cluster().borrow(), cfg.stage_vocab())?;
     let summary = run_sim(flow.as_mut(), &store, &mut frontend, &mut logger, &tick_cfg)?;
     // run_sim emits the stats summary (completed/throughput/wall) to the log;
     // persist the structured form as `<log_dir>/summary.json` for regression
