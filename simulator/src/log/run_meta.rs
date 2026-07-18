@@ -15,11 +15,14 @@ use serde_json::json;
 
 use crate::worker::GpuCluster;
 
-// v3 adds per-worker `kv_pools` (`group_id` → KV token `capacity_tokens`), sourced
-// from `GpuCluster::kv_capacities`; v2 added the `comm_groups` array. Append-only;
-// the analyzer reads by field name and never asserts the version, so older readers
-// are unaffected.
-const SCHEMA_VERSION: u32 = 3;
+// v4 makes `workers[].pool_tag` authoritative for every worker (stamped on each GPU
+// at `GpuCluster::allocate`), so non-KV workers (e.g. AFD ffn) no longer carry a null
+// tag that consumers had to reverse-recover through `comm_groups`. v3 added per-worker
+// `kv_pools` (`group_id` → KV token `capacity_tokens`); v2 added the `comm_groups`
+// array. Append-only; the analyzer reads by field name and never asserts the version,
+// so older readers are unaffected and older logs (null ffn tag) still parse via the
+// analyzer's legacy `comm_groups` fallback.
+const SCHEMA_VERSION: u32 = 4;
 
 /// Write `<log_dir>/raw/run_meta.json` from the run's [`GpuCluster`]'s GPU
 /// registry. Emits the flat per-GPU list, a derived worker→gpu grouping (each
@@ -32,44 +35,47 @@ pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster) -> Result<()> {
     let raw = log_dir.join("raw");
     std::fs::create_dir_all(&raw)?;
 
-    // Derived (pool, worker)→gpu inverse of the flat list (downstream
-    // convenience; the flat `gpus` already carries both ids per gpu). WorkerId is
-    // per-pool, so the pair is the unique run-level worker key.
-    let mut by_worker: BTreeMap<(u16, u16), Vec<u16>> = BTreeMap::new();
+    // Derived (pool, worker)→(gpu ids, pool_tag) inverse of the flat list
+    // (downstream convenience; the flat `gpus` already carries all three per gpu).
+    // WorkerId is per-pool, so the pair is the unique run-level worker key. Every
+    // GPU of a worker shares its `pool_tag` (stamped at `allocate`), so the first
+    // one seen is authoritative — this is what makes each worker's tag independent
+    // of whether it registered a KV pool or a comm group.
+    let mut by_worker: BTreeMap<(u16, u16), (Vec<u16>, &str)> = BTreeMap::new();
     for g in &cluster.gpus {
-        by_worker.entry((g.pool, g.worker_id)).or_default().push(g.id);
+        let entry = by_worker
+            .entry((g.pool, g.worker_id))
+            .or_insert_with(|| (Vec::new(), g.pool_tag.as_str()));
+        entry.0.push(g.id);
     }
 
     // Per-worker KV-pool capacities (static token counts), grouped by the same
     // (pool, worker_id) key as `workers`. This is where the `kv_snapshot` stream's
     // former `capacity` column lives now — recorded once here, not per occupancy
-    // row. The KV worker's `pool_tag` is carried alongside so the entry can stamp
-    // the same `(pool_tag, worker_id, group_id)` key the `kv_snapshot` rows use (an
-    // exact analyzer join even when `worker_id` collides across pools). Empty for
-    // workers with no KV pool (e.g. AFD ffn).
-    let mut kv_by_worker: BTreeMap<(u16, u16), (&'static str, Vec<(u16, u64)>)> = BTreeMap::new();
-    for (pool_tag, pool, worker_id, group_id, capacity) in cluster.kv_capacities() {
+    // row. Empty for workers with no KV pool (e.g. AFD ffn); the worker's tag no
+    // longer rides along here since `by_worker` now carries it for every worker.
+    let mut kv_by_worker: BTreeMap<(u16, u16), Vec<(u16, u64)>> = BTreeMap::new();
+    for (_pool_tag, pool, worker_id, group_id, capacity) in cluster.kv_capacities() {
         kv_by_worker
             .entry((pool, worker_id))
-            .or_insert_with(|| (pool_tag, Vec::new()))
-            .1
+            .or_default()
             .push((group_id, capacity));
     }
 
     let workers: Vec<_> = by_worker
         .into_iter()
-        .map(|((pool, worker_id), gpu_ids)| {
-            let kv = kv_by_worker.get(&(pool, worker_id));
-            let kv_pools: Vec<_> = kv
+        .map(|((pool, worker_id), (gpu_ids, pool_tag))| {
+            let kv_pools: Vec<_> = kv_by_worker
+                .get(&(pool, worker_id))
                 .into_iter()
-                .flat_map(|(_, pools)| pools.iter())
+                .flatten()
                 .map(|(group_id, capacity)| {
                     json!({ "group_id": group_id, "capacity_tokens": capacity })
                 })
                 .collect();
-            // `pool_tag` only for KV-bearing workers — the analyzer's `kv_snapshot`
-            // join key. Absent (`null`) for workers with no KV pool.
-            let pool_tag = kv.map(|(tag, _)| *tag);
+            // `pool_tag` is authoritative for every worker (stamped per GPU at
+            // `allocate`), so non-KV workers keep their role tag — no `comm_groups`
+            // reverse-recovery needed downstream.
             json!({
                 "worker_id": worker_id,
                 "pool": pool,

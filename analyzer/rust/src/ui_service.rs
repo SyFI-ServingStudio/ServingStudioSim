@@ -14,6 +14,7 @@ mod kernel_throughput_analysis;
 mod kernel_time_share;
 mod kv_occupancy;
 mod model;
+mod optimality;
 mod slo;
 #[cfg(test)]
 mod tests;
@@ -48,6 +49,7 @@ use kernel_input_distribution::{
 };
 use kernel_throughput_analysis::analyze_kernel_throughput;
 use kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
+use optimality::{read_optimality_payload, read_optimality_report};
 use kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use model::read_model;
 use slo::{read_slo_general_payload, read_slo_general_report};
@@ -144,6 +146,14 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
         .route(
             "/api/v1/runs/{run_id}/subjects/kernel-time-share/payload",
             get(get_kernel_time_share_payload),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/optimality/report",
+            get(get_optimality_report),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/optimality/payload",
+            get(get_optimality_payload),
         )
         .route(
             "/api/v1/runs/{run_id}/subjects/workload-conservation/report",
@@ -391,6 +401,20 @@ async fn get_kernel_time_share_payload(
     State(state): State<ServiceState>,
 ) -> Response {
     read_run_resource(state, run_id, |run| read_kernel_time_share_payload(&run)).await
+}
+
+async fn get_optimality_report(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_optimality_report(&run)).await
+}
+
+async fn get_optimality_payload(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_optimality_payload(&run)).await
 }
 
 async fn get_workload_conservation_report(

@@ -14,6 +14,7 @@ pub use bridge::{
     BackendOverrideGuard, BuildError, DType, KernelEnum, KernelMissing, PerfApiBridge,
 };
 pub use cache::interp::{CoverageFlags, LeafMetrics, Metrics4};
+pub use cache::PeakRates;
 pub use dims::Dim;
 pub use cost_tree::{
     CostManifest, CostManifestDoc, CostManifestSection, CostNode, CostTree, CostTreeBuilder,

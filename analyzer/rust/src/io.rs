@@ -140,12 +140,13 @@ pub fn trace_path(log_dir: &Path, prefix: &str) -> PathBuf {
 /// (sim-written, L7). `worker_id` is only unique within a pool, so dropping the
 /// tag would alias workers such as AFD `attn/0` and `ffn/0`.
 ///
-/// KV-bearing workers carry `pool_tag` directly in `workers[]`. A non-KV worker
-/// (currently AFD FFN) gets the same tag through its `comm_groups[]` owner; the
-/// group's base GPU joins back to the numeric `workers[].pool`. Read as bare JSON
-/// (no `simulator` dep), like [`read_run_meta`]. `None` means the sidecar lacks a
-/// usable tagged roster; the utilization subject then derives its roster from the
-/// observed composite keys in `cost_log`.
+/// Every worker carries an authoritative `pool_tag` in `workers[]` (run_meta v4+,
+/// stamped per GPU at `GpuCluster::allocate`), so the role tag is read directly —
+/// no `comm_groups` reverse-recovery. Read as bare JSON (no `simulator` dep), like
+/// [`read_run_meta`]. `None` means the sidecar lacks a usable tagged roster (absent
+/// file, or a pre-v4 log whose non-KV workers still have a null tag); the
+/// utilization subject then derives its roster from the observed composite keys in
+/// `cost_log`.
 pub fn read_worker_pools(log_dir: &Path) -> Option<Vec<(String, u64, u64)>> {
     let path = resolve_artifact_path(log_dir, "run_meta.json");
     let text = fs::read_to_string(path).ok()?;
@@ -155,40 +156,12 @@ pub fn read_worker_pools(log_dir: &Path) -> Option<Vec<(String, u64, u64)>> {
 
 fn worker_pools_from_run_meta(json: &serde_json::Value) -> Option<Vec<(String, u64, u64)>> {
     let workers = json.get("workers")?.as_array()?;
-
-    // `comm_groups.base` is a run-level GPU id. Resolve it to the numeric pool so
-    // non-KV workers, whose `workers[].pool_tag` is null, retain their role tag.
-    let pool_by_gpu: BTreeMap<u64, u64> = json
-        .get("gpus")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|gpu| Some((gpu.get("id")?.as_u64()?, gpu.get("pool")?.as_u64()?)))
-        .collect();
-    let comm_tags: BTreeMap<(u64, u64), String> = json
-        .get("comm_groups")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|group| {
-            let pool_tag = group.get("owner_pool")?.as_str()?.to_owned();
-            let worker_id = group.get("owner_worker_id")?.as_u64()?;
-            let base_gpu = group.get("base")?.as_u64()?;
-            let pool = *pool_by_gpu.get(&base_gpu)?;
-            Some(((pool, worker_id), pool_tag))
-        })
-        .collect();
-
     let worker_pool_rows: Vec<(String, u64, u64)> = workers
         .iter()
         .filter_map(|worker| {
             let worker_id = worker.get("worker_id")?.as_u64()?;
             let pool = worker.get("pool")?.as_u64()?;
-            let pool_tag = worker
-                .get("pool_tag")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| comm_tags.get(&(pool, worker_id)).cloned())?;
+            let pool_tag = worker.get("pool_tag").and_then(Value::as_str)?.to_owned();
             Some((pool_tag, worker_id, pool))
         })
         .collect();
@@ -210,8 +183,8 @@ pub fn read_kv_capacities(log_dir: &Path) -> Option<Vec<(String, u64, u64, u64)>
     let workers = json.get("workers")?.as_array()?;
     let mut out = Vec::new();
     for w in workers {
-        // `pool_tag` is null for non-KV workers (AFD ffn); their `kv_pools` is empty
-        // too, so this loop simply skips them.
+        // Every worker carries a `pool_tag` (v4+); a non-KV worker (AFD ffn) simply
+        // has an empty `kv_pools`, so the inner loop emits nothing for it.
         let Some(tag) = w.get("pool_tag").and_then(|t| t.as_str()) else {
             continue;
         };
@@ -226,6 +199,35 @@ pub fn read_kv_capacities(log_dir: &Path) -> Option<Vec<(String, u64, u64, u64)>
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// Per-worker physical GPU counts from `run_meta.json`'s `workers[]`, keyed by
+/// the `(pool_tag, worker_id)` composite the cost_log rows and cost manifests use
+/// — `(pool_tag, worker_id, gpu_ids.len())`.
+///
+/// `G_worker` MUST be read here, never inferred from tp×dp×ep degrees: whether a
+/// "tp4+dp8" pool is one 32-GPU worker or eight 4-GPU workers is a deployment
+/// definition, and it is what the `optimality` subject multiplies busy/held wall
+/// time by to get GPU·seconds. Every worker carries an authoritative `pool_tag`
+/// (run_meta v4+), so the role tag is read directly — no `comm_groups` recovery.
+/// `None` when the sidecar is absent/unparseable or carries no worker roster (or a
+/// pre-v4 log whose non-KV workers still have a null tag); the subject then degrades
+/// to a single aggregate GPU.
+pub fn read_worker_gpu_counts(log_dir: &Path) -> Option<Vec<(String, u16, usize)>> {
+    let path = resolve_artifact_path(log_dir, "run_meta.json");
+    let text = fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let workers = json.get("workers")?.as_array()?;
+    let rows: Vec<(String, u16, usize)> = workers
+        .iter()
+        .filter_map(|worker| {
+            let worker_id = worker.get("worker_id")?.as_u64()?;
+            let pool_tag = worker.get("pool_tag").and_then(Value::as_str)?.to_owned();
+            let gpus = worker.get("gpu_ids").and_then(Value::as_array)?.len();
+            Some((pool_tag, worker_id as u16, gpus))
+        })
+        .collect();
+    (!rows.is_empty()).then_some(rows)
 }
 
 pub fn report_path(log_dir: &Path, name: &str) -> PathBuf {

@@ -20,6 +20,7 @@ use crate::breakdown;
 use crate::concurrency;
 use crate::conservation;
 use crate::kv;
+use crate::optimality;
 use crate::request;
 use crate::throughput;
 use crate::utilization;
@@ -47,6 +48,10 @@ pub enum Category {
     /// Run-wide CostTree kernel-time composition by semantic leaf position,
     /// reconstructed from `cost_log` slot lists + matching manifests.
     Breakdown,
+    /// Distance from optimal GPU usage as a ladder of idealized lower bounds
+    /// (idle / imbalance / batching / communication / hardware), from `cost_log`
+    /// + manifests + `run_meta` GPU counts + `gpu/spec.json`. Tier-1.
+    Optimality,
     /// Run-wide work-accounting invariants — `cost_log` actuals vs `request_slo`
     /// per-request expected. Tier-1, deployment-agnostic.
     Conservation,
@@ -73,6 +78,7 @@ impl Category {
             Category::Batch => "batch",
             Category::Backend => "backend",
             Category::Breakdown => "breakdown",
+            Category::Optimality => "optimality",
             Category::Conservation => "conservation",
             Category::Concurrency => "concurrency",
             Category::Kv => "kv",
@@ -221,6 +227,17 @@ pub const SUBJECTS: &[Subject] = &[
         scope: Scope::Run,
     },
     Subject {
+        name: "optimality",
+        category: Category::Optimality,
+        description: "Distance from optimal GPU usage as a sub-optimality waterfall (GPU·s): \
+                      idle / imbalance / batching / communication / hardware-gap / hardware-optimal, \
+                      at cluster / pool / worker / iteration / per-kernel levels.",
+        report_name: "optimality_report.json",
+        payload_name: "optimality_waterfall.json",
+        applies: Applies::All,
+        scope: Scope::Run,
+    },
+    Subject {
         name: "concurrency",
         category: Category::Concurrency,
         description: "Run-level in-flight request concurrency over time from request_slo arrival and terminal events.",
@@ -317,6 +334,7 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
         "kernel-throughput" => batch::kernel_throughput::run_kernel_throughput(ctx, dir).await,
         "kernel-input-distribution" => backend::kernel_input_distribution::run(ctx, dir).await,
         "kernel-time-share" => breakdown::kernel_time_share::run(ctx, dir).await,
+        "optimality" => optimality::run_optimality(ctx, dir).await,
         "concurrency" => concurrency::series::run_concurrency(ctx, dir).await,
         "workload-conservation" => conservation::workload::run_workload(ctx, dir).await,
         "kv-occupancy" => kv::occupancy::run_kv_occupancy(ctx, dir).await,

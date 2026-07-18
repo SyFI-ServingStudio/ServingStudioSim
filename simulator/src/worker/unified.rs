@@ -89,7 +89,7 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
     ) -> Self {
         cluster
             .borrow_mut()
-            .allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
+            .allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name, pool_tag);
         // KvPool capacity in tokens. `attn_kv_bytes` is per-GPU; one attn shard
         // spans `num_attn_shards()` GPUs and stores the full KV (each GPU holds
         // a per-rank slice that sums to the model-level total). So group memory

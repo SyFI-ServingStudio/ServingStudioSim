@@ -5,13 +5,13 @@
 //! cache construction and interpolation. This module only selects the exact leaf,
 //! expands the declared grid, and packages the two query responses for viz-ui.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+
+use crate::kernel_query::{run_kernel_query, simulator_binary};
 
 const MAX_GRID_POINTS: usize = 16_384;
 
@@ -179,62 +179,6 @@ fn json_coord(value: f64) -> Value {
     } else {
         Value::from(value)
     }
-}
-
-fn simulator_binary(repo_root: &Path) -> Result<PathBuf> {
-    let mut candidates = Vec::new();
-    // Release is the launcher-built production binary and therefore carries
-    // the same PyO3 ABI as `.venv`; prefer it over an incidental debug build.
-    candidates.push(repo_root.join("target/release/simulator"));
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(directory) = current.parent() {
-            candidates.push(directory.join("simulator"));
-        }
-    }
-    candidates.push(repo_root.join("target/debug/simulator"));
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .context("could not find a built simulator beside analyze or under target/{release,debug}")
-}
-
-fn run_kernel_query(repo_root: &Path, simulator: &Path, request: Value) -> Result<Value> {
-    let python = repo_root.join(".venv/bin/python");
-    if !python.is_file() {
-        bail!("launcher Python is absent at {}", python.display());
-    }
-    let mut child = Command::new(&python)
-        .args(["-m", "launcher.kernel_query", "--simulator"])
-        .arg(simulator)
-        .current_dir(repo_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("start launcher kernel-query via {}", python.display()))?;
-    serde_json::to_writer(
-        child
-            .stdin
-            .as_mut()
-            .context("kernel-query stdin was not piped")?,
-        &request,
-    )
-    .context("write kernel-query request")?;
-    child
-        .stdin
-        .take()
-        .context("kernel-query stdin disappeared")?
-        .flush()
-        .context("flush kernel-query request")?;
-    let output = child.wait_with_output().context("wait for kernel-query")?;
-    if !output.status.success() {
-        bail!(
-            "kernel-query failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    serde_json::from_slice(&output.stdout).context("decode kernel-query stdout")
 }
 
 #[cfg(test)]

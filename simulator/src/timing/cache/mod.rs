@@ -1,7 +1,7 @@
 //! Cache interpolation primitives for L1 kernels.
 
 use crate::timing::bridge::{BuildError, KernelKind, KernelMetrics};
-use crate::timing::cache::interp::LeafMetrics;
+use crate::timing::cache::interp::{LeafMetrics, Metrics4};
 use crate::timing::sweep::SweepGrid;
 
 pub mod backend;
@@ -29,6 +29,62 @@ pub trait Cache: Send + Sync {
     /// [`CostTree::aggregate`](crate::timing::CostTree)). NaN/empty → zero, fields
     /// clamped non-negative; off-grid lookups set `EXTRAPOLATED`/`NO_COVERAGE`.
     fn eval(&self, sweep: &[f64]) -> LeafMetrics;
+
+    /// Peak achieved compute / bandwidth rates over this cache's fitted grid
+    /// cells — the per-config "best batching" ceiling the optimality analyzer
+    /// divides work by. Reads the stored cells directly (no interpolation, no
+    /// coords remap), so it is correct for re-axis caches too. Default zero for
+    /// variants that carry no per-cell metrics (never built today).
+    fn peak_rates(&self) -> PeakRates {
+        PeakRates::default()
+    }
+}
+
+/// Peak achieved compute / bandwidth rates over a kernel cache's fitted grid —
+/// the per-config batching ceiling. `tflops` is the fastest compute rate
+/// (`flops / time`) any profiled shape reached; `gbps` the fastest bandwidth
+/// (`bytes / time`). A comm kernel (no flops) reports `tflops == 0` and a real
+/// `gbps`. A zero field means no fitted cell carried that metric.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PeakRates {
+    pub tflops: f64,
+    pub gbps: f64,
+}
+
+impl PeakRates {
+    /// Element-wise max — the best over a kernel's several backend caches
+    /// (best-of-N applies to peaks too).
+    pub fn merge(self, other: PeakRates) -> PeakRates {
+        PeakRates {
+            tflops: self.tflops.max(other.tflops),
+            gbps: self.gbps.max(other.gbps),
+        }
+    }
+}
+
+/// Fold a cache's stored cells into their peak achieved rates. A cell counts only
+/// when its time is finite and strictly positive (dropped / infeasible cells hold
+/// `Metrics4::ZERO` or a non-finite value and are skipped); each rate counts only
+/// when its numerator is finite and positive (a comm cell's `flops == 0` adds no
+/// compute rate).
+pub(crate) fn peak_over_cells(cells: impl IntoIterator<Item = Metrics4>) -> PeakRates {
+    let mut peak = PeakRates::default();
+    for c in cells {
+        let time_ms = c.time_ms as f64;
+        if !(time_ms.is_finite() && time_ms > 0.0) {
+            continue;
+        }
+        let secs = time_ms / 1e3;
+        let flops = c.flops as f64;
+        if flops.is_finite() && flops > 0.0 {
+            peak.tflops = peak.tflops.max(flops / secs / 1e12);
+        }
+        let bytes = c.bytes as f64;
+        if bytes.is_finite() && bytes > 0.0 {
+            peak.gbps = peak.gbps.max(bytes / secs / 1e9);
+        }
+    }
+    peak
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

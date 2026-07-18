@@ -168,7 +168,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
     ) -> Self {
         let recv_gid = {
             let mut c = cluster.borrow_mut();
-            let gpu_base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
+            let gpu_base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name, pool_tag);
             // Arch invariant: `num_attn_shards() ≤ gpus_per_replica`, so the
             // attn-shard prefix is the comm group used as recv endpoint.
             c.register_comm_group(gpu_base, model.num_attn_shards().max(1), pool_tag, id.0)
@@ -721,7 +721,7 @@ mod tests {
     /// group's `base` lines up with a real GPU id.
     fn register_test_sender(cluster: &SharedGpuCluster) -> u16 {
         let mut c = cluster.borrow_mut();
-        c.allocate(99, 99, 1, "sender-gpu");
+        c.allocate(99, 99, 1, "sender-gpu", "prefill");
         c.register_comm_group(0, 1, "prefill", 99)
     }
 

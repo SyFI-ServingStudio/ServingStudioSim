@@ -2,7 +2,7 @@
 //!
 //! This is *introspection*, not simulation — the same family as `list-params` /
 //! `dry-run` / `build-cache-only` (build/inspect the cost model without running a
-//! sim). One subcommand, two interfaces selected by the request's `op`, each
+//! sim). One subcommand, three interfaces selected by the request's `op`, each
 //! describing **one kernel by its own config** (`kind` + the kernel's
 //! `KernelConfig` fields):
 //!
@@ -12,6 +12,10 @@
 //!   - **`eval`** → best-of-N interpolated metrics at a batch of `query_points`
 //!     (each the kernel's own `Input` fields). Builds the kernel (profiles
 //!     missing grid rows via JIT), so it needs the perf_api bridge.
+//!   - **`peak`** → the fitted grid's peak achieved compute/BW rates (the
+//!     per-config "best batching" ceiling the optimality analyzer divides work
+//!     by). Builds the kernel like `eval`, then reads the peak straight off the
+//!     cache cells — no query points, no coords remap. Needs the bridge.
 //!
 //! Division of labor: Python (`tools/cache_fidelity.py`) owns the one config and
 //! feeds it to **both** the Rust interpolation (here) and the perf_api ground
@@ -29,8 +33,9 @@ use serde_json::Value;
 use crate::timing::kernels::engine::KernelQueryEntry;
 use crate::timing::PerfApiBridge;
 
-/// Both ops carry the kernel `kind` + its `KernelConfig` fields; `eval` adds the
-/// points. Tagged by `op` so the one subcommand serves two interfaces.
+/// `grid`/`eval` carry one kernel `kind` + its `KernelConfig` fields (`eval` adds
+/// the points); `peak` carries a batch of `{kind, config}` items. Tagged by `op`
+/// so the one subcommand serves all three interfaces.
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum KernelQueryRequest {
@@ -44,6 +49,19 @@ enum KernelQueryRequest {
         /// (e.g. `{"prefix_len":0,"append_len":192}`).
         query_points: Vec<Value>,
     },
+    /// Report each config's fitted-grid peak achieved compute/BW rates (the
+    /// per-config batching ceiling). A **batch** so the optimality sidecar amortizes
+    /// the one-time PyO3/bridge import across every unique run config in a single
+    /// subprocess. Builds each kernel like `eval`, then reads the cache cells
+    /// directly — no query points, no coords remap.
+    Peak { requests: Vec<PeakRequestItem> },
+}
+
+/// One entry of a batched `peak` request: a kernel `kind` + its `KernelConfig`.
+#[derive(Deserialize)]
+struct PeakRequestItem {
+    kind: String,
+    config: Value,
 }
 
 #[derive(Serialize)]
@@ -75,6 +93,28 @@ struct PointResult {
 struct EvalResponse {
     kind: String,
     results: Vec<PointResult>,
+}
+
+/// One config's peak result within a batched `peak` response.
+#[derive(Serialize)]
+struct PeakItemResult {
+    kind: String,
+    /// Max achieved TFLOP/s over the fitted grid (compute ceiling); `0` for a
+    /// comm kernel (no flops).
+    peak_tflops: f64,
+    /// Max achieved GB/s over the fitted grid (bandwidth ceiling).
+    peak_gbps: f64,
+    /// Set (with the rates left `0`) when this one config failed to build — e.g.
+    /// a profile.db row is missing. A per-item error keeps one bad config from
+    /// sinking the whole sidecar; the caller degrades that leaf to its observed peak.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// `peak` response: one result per requested config, in request order.
+#[derive(Serialize)]
+struct PeakResponse {
+    results: Vec<PeakItemResult>,
 }
 
 /// Find a kernel's registry entry by `kind` (each kernel self-registers via
@@ -147,6 +187,49 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
                 kind: probe.kind().to_string(),
                 results,
             })?
+        }
+        // peak: one bridge for the whole batch; build each kernel (like eval), then
+        // read its fitted grid's peak achieved rates straight off the cache cells
+        // (best over backends). No query points, no coords remap — correct for
+        // re-axis kernels. A per-item build failure is reported, not fatal.
+        KernelQueryRequest::Peak { requests } => {
+            let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+            bridge
+                .enable_jit_profiling()
+                .context("enabling JIT profiling for the peak grid build")?;
+            let mut results = Vec::with_capacity(requests.len());
+            for item in requests {
+                let entry = match lookup(&item.kind) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        results.push(PeakItemResult {
+                            kind: item.kind,
+                            peak_tflops: 0.0,
+                            peak_gbps: 0.0,
+                            error: Some(format!("{e:#}")),
+                        });
+                        continue;
+                    }
+                };
+                match (entry.build)(item.config, &bridge) {
+                    Ok(probe) => {
+                        let peak = probe.peak_rates();
+                        results.push(PeakItemResult {
+                            kind: probe.kind().to_string(),
+                            peak_tflops: peak.tflops,
+                            peak_gbps: peak.gbps,
+                            error: None,
+                        });
+                    }
+                    Err(e) => results.push(PeakItemResult {
+                        kind: item.kind,
+                        peak_tflops: 0.0,
+                        peak_gbps: 0.0,
+                        error: Some(format!("build failed (often a missing profile.db row): {e:#}")),
+                    }),
+                }
+            }
+            serde_json::to_string_pretty(&PeakResponse { results })?
         }
     };
 

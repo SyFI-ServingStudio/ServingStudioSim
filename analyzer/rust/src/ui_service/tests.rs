@@ -12,6 +12,7 @@ use super::kernel_input_distribution::{
     read_kernel_input_distribution_payload, read_kernel_input_distribution_report,
 };
 use super::kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
+use super::optimality::{read_optimality_payload, read_optimality_report};
 use super::kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use super::model::read_model;
 use super::slo::{read_slo_general_payload, read_slo_general_report};
@@ -100,6 +101,7 @@ fn make_core_run(path: &Path) {
             {"name": "utilization", "status": "ok"},
             {"name": "kernel-input-distribution", "status": "ok"},
             {"name": "kernel-time-share", "status": "ok"},
+            {"name": "optimality", "status": "ok"},
             {"name": "kv-occupancy", "status": "ok"},
             {"name": "workload-conservation", "status": "ok"}
         ]}"#,
@@ -267,6 +269,39 @@ fn make_core_run(path: &Path) {
         }"#,
     )
     .expect("write kernel-time-share payload");
+    fs::write(
+        path.join("reports/optimality_report.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "optimality_ratio": 0.33,
+            "unit": "gpu_seconds",
+            "cluster": {"real": 96.0, "hardware_limit": 31.8}
+        }"#,
+    )
+    .expect("write optimality report");
+    fs::write(
+        path.join("payloads/optimality_waterfall.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "unit": "gpu_seconds",
+            "optimality_ratio": 0.33,
+            "bucket_keys": ["idle", "imbalance", "batching", "communication", "hardware_gap", "hardware_optimal"],
+            "levels": [{
+                "level": "cluster", "key": "cluster", "label": "Cluster", "total": 96.0,
+                "buckets": {"idle": 29.0, "imbalance": 0.0, "batching": 15.6,
+                            "communication": 1.8, "hardware_gap": 17.8, "hardware_optimal": 31.8},
+                "optimality_ratio": 0.33
+            }],
+            "kernels": [{
+                "name": "afd.attn.decode", "kind": "flashinfer_attn_decode", "is_comm": false,
+                "real": 45.7,
+                "buckets": {"batching": 4.3, "communication": 0.0, "hardware_gap": 16.7, "hardware_optimal": 24.7}
+            }]
+        }"#,
+    )
+    .expect("write optimality payload");
     fs::write(
         path.join("reports/workload_conservation_report.json"),
         r#"{
@@ -824,6 +859,39 @@ fn kernel_time_share_resources_preserve_critical_path_attribution() {
     assert!(payload["definitions"]["tree_attribution"]
         .as_str()
         .is_some_and(|definition| definition.contains("critical path")));
+}
+
+#[test]
+fn optimality_resources_expose_waterfall_levels_and_kernels() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let descriptor = build_descriptor(&run).expect("descriptor");
+    assert_eq!(descriptor["subjects"]["optimality"]["status"], "ready");
+    assert_eq!(
+        descriptor["subjects"]["optimality"]["payload_href"],
+        "subjects/optimality/payload"
+    );
+
+    let report = read_optimality_report(&run).expect("read optimality report");
+    let payload = read_optimality_payload(&run).expect("read optimality payload");
+    assert_eq!(report["optimality_ratio"], 0.33);
+    // The cluster waterfall's telescoping buckets sum back to its Real GPU·s.
+    let cluster = &payload["levels"][0];
+    let sum: f64 = cluster["buckets"]
+        .as_object()
+        .expect("bucket object")
+        .values()
+        .map(|value| value.as_f64().unwrap_or(0.0))
+        .sum();
+    assert!((sum - cluster["total"].as_f64().unwrap()).abs() < 1e-6);
+    assert_eq!(payload["kernels"][0]["name"], "afd.attn.decode");
 }
 
 #[test]

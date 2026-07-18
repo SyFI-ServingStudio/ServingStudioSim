@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 
 use crate::timing::bridge::{ArgsPayload, KernelKind, KernelMetrics, PerfApiBridge};
 use crate::timing::cache::interp::LeafMetrics;
-use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning};
+use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning, PeakRates};
 use crate::timing::result::CacheProbe;
 use crate::timing::sweep::{SweepCoords, SweepGrid};
 use crate::timing::{BuildError, DType, Probe};
@@ -322,6 +322,17 @@ impl<S: KernelSpec> Kernel<S> {
             }
         }
     }
+
+    /// Best achievable compute / BW rates over this kernel's fitted grid, across
+    /// all its backend caches (best-of-N applies to peaks too). The per-config
+    /// "best batching" ceiling the optimality analyzer reads via `kernel-query
+    /// peak`. Empty (all zero) in enumerate / dry-run mode, which builds no caches.
+    pub fn peak_rates(&self) -> PeakRates {
+        self.backend_caches
+            .iter()
+            .map(BackendCache::peak_rates)
+            .fold(PeakRates::default(), PeakRates::merge)
+    }
 }
 
 impl<S: KernelSpec> CacheProbe for Kernel<S>
@@ -347,6 +358,10 @@ where
         let input: S::Input = serde_json::from_value(input.clone())
             .map_err(|e| anyhow::anyhow!("query point does not match {} Input: {e}", S::KIND))?;
         Ok(self.eval(&input))
+    }
+
+    fn peak_rates(&self) -> PeakRates {
+        Kernel::peak_rates(self)
     }
 }
 

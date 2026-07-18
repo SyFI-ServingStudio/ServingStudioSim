@@ -310,7 +310,7 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
     ) -> Self {
         let recv_gid = {
             let mut c = cluster.borrow_mut();
-            let base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
+            let base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name, pool_tag);
             // The attn-shard prefix is the comm group used as the QKV recv endpoint.
             c.register_comm_group(base, model.num_attn_shards().max(1), pool_tag, id.0)
         };
@@ -1042,7 +1042,7 @@ mod tests {
 
     fn register_test_sender(cluster: &SharedGpuCluster) -> u16 {
         let mut c = cluster.borrow_mut();
-        c.allocate(99, 99, 1, "ffn-gpu");
+        c.allocate(99, 99, 1, "ffn-gpu", "ffn");
         c.register_comm_group(0, 1, "ffn", 99)
     }
 

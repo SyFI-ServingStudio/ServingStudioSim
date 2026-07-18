@@ -1,6 +1,6 @@
 use crate::timing::bridge::KernelMetrics;
 use crate::timing::cache::interp::{CoverageFlags, LeafMetrics, Metrics4, MONOTONICITY_TOLERANCE};
-use crate::timing::cache::{Cache, OutlierKind, OutlierWarning};
+use crate::timing::cache::{peak_over_cells, Cache, OutlierKind, OutlierWarning, PeakRates};
 use crate::timing::sweep::SweepGrid;
 
 /// Direct-indexed 1D cache for bounded-range, uniformly-sampled data — e.g. a
@@ -128,6 +128,10 @@ impl Cache for Cache1DDirect {
             // Landed bucket's fit-time sample was dropped as non-finite.
             None => LeafMetrics::MISS,
         }
+    }
+
+    fn peak_rates(&self) -> PeakRates {
+        peak_over_cells(self.buckets.iter().flatten().copied())
     }
 }
 

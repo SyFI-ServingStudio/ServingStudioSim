@@ -10,6 +10,7 @@ use super::discovery::{regular_file, timestamp, DiscoveredRun, StageStatus};
 use super::kernel_input_distribution::kernel_input_distribution_descriptor;
 use super::kernel_time_share::kernel_time_share_descriptor;
 use super::kv_occupancy::kv_occupancy_descriptor;
+use super::optimality::optimality_descriptor;
 use super::model::model_config_path;
 use super::slo::slo_general_descriptor;
 use super::throughput::throughput_descriptor;
@@ -81,6 +82,9 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     }
     if let Some(kernel_time_share) = kernel_time_share_descriptor(run)? {
         descriptor["subjects"]["kernel-time-share"] = kernel_time_share;
+    }
+    if let Some(optimality) = optimality_descriptor(run)? {
+        descriptor["subjects"]["optimality"] = optimality;
     }
     if let Some(workload_conservation) = workload_conservation_descriptor(run)? {
         descriptor["subjects"]["workload-conservation"] = workload_conservation;

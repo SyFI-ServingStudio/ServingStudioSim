@@ -182,6 +182,49 @@ pub(crate) fn node_time(m: &Manifest, idx: usize, slot_ns: &[i64]) -> i64 {
     }
 }
 
+/// Balanced (perfect-parallelism) fold of the subtree at `idx`, streamed as
+/// per-leaf `(slot, weight)` visits rather than a single number. This is the
+/// **mean-mode** sibling of [`node_time`]: where `node_time` collapses a `Max`
+/// (parallel shards) to its straggler (`max/overlap`), this collapses it to the
+/// balanced average (`mean/overlap`) — modelling every shard's GPU doing an equal
+/// share, i.e. the imbalance-free lower bound the `optimality` subject wants.
+///
+/// The fold is **linear** in the leaf values, so it factors into a per-leaf
+/// weight `α` (`∏ 1/(child_count·overlap)` over `Max` ancestors × `∏ n` over
+/// `Scale` ancestors) times that leaf's value. Emitting `(slot, α)` lets one walk
+/// serve every rung (real time, per-config-best, hardware roofline) and every
+/// aggregate (worker total + per-kernel attribution) — the caller multiplies `α`
+/// by whichever leaf value that rung/bucket needs. `visit` is called exactly once
+/// per `Leaf` node in the subtree.
+pub(crate) fn fold_mean<F: FnMut(usize, f64)>(
+    m: &Manifest,
+    idx: usize,
+    weight: f64,
+    visit: &mut F,
+) {
+    match &m.nodes[idx] {
+        FlatCostNode::Leaf(slot) => visit(*slot, weight),
+        FlatCostNode::Sum { children } => {
+            for c in children.clone() {
+                fold_mean(m, c, weight, visit);
+            }
+        }
+        FlatCostNode::Max { overlap, children } => {
+            let count = children.len().max(1) as f64;
+            let ov = (*overlap as f64).max(1e-9);
+            let child_weight = weight / (count * ov);
+            for c in children.clone() {
+                fold_mean(m, c, child_weight, visit);
+            }
+        }
+        // `Scale` applies its subtree `n` times on one timeline (num_layers); like
+        // `node_time` it recurses through `children.start` (the single child).
+        FlatCostNode::Scale { n, children } => {
+            fold_mean(m, children.start, weight * (*n as f64), visit);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +282,34 @@ mod tests {
             m.node_labels[0].as_deref(),
             Some("m [dense local, 32 layers]")
         );
+    }
+
+    #[test]
+    fn fold_mean_is_linear_and_collapses_max_to_mean() {
+        // Sum[ Max{overlap:1}[ Leaf0, Leaf1 ], Scale{n:3}[ Leaf2 ] ].
+        let m = Manifest {
+            slots: Vec::new(), // slot descs unused by the fold
+            nodes: vec![
+                FlatCostNode::Sum { children: 1..3 },
+                FlatCostNode::Max { overlap: 1.0, children: 3..5 },
+                FlatCostNode::Scale { n: 3, children: 5..6 },
+                FlatCostNode::Leaf(0),
+                FlatCostNode::Leaf(1),
+                FlatCostNode::Leaf(2),
+            ],
+            node_labels: Vec::new(),
+        };
+        // α: Leaf0/Leaf1 sit under Max/2 → 0.5 each; Leaf2 under Scale×3 → 3.
+        let mut alpha = [0.0f64; 3];
+        fold_mean(&m, 0, 1.0, &mut |slot, w| alpha[slot] += w);
+        assert_eq!(alpha, [0.5, 0.5, 3.0]);
+
+        // Mean-fold value: 0.5·t0 + 0.5·t1 + 3·t2 (mean over the Max pair), whereas
+        // node_time takes the Max (straggler) → max(t0,t1) + 3·t2.
+        let slot_ns = [10i64, 20, 5];
+        let mean: f64 = (0..3).map(|i| alpha[i] * slot_ns[i] as f64).sum();
+        assert_eq!(mean, 0.5 * 10.0 + 0.5 * 20.0 + 3.0 * 5.0); // 30.0
+        assert_eq!(node_time(&m, 0, &slot_ns), 20 + 3 * 5); // 35 (max branch)
     }
 
     #[test]

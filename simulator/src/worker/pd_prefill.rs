@@ -103,7 +103,7 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
     ) -> Self {
         let send_gid = {
             let mut c = cluster.borrow_mut();
-            let gpu_base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
+            let gpu_base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name, pool_tag);
             // Arch invariant: `num_attn_shards() ≤ gpus_per_replica`, so the
             // attn-shard prefix is the comm group covering KV storage.
             c.register_comm_group(gpu_base, model.num_attn_shards().max(1), pool_tag, id.0)

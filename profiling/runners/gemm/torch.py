@@ -14,6 +14,19 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 from profiling.runners.metrics import ComputeMetrics
 
 
+def _grouped_gemm_logical_elements(n: int, k: int, batches: tuple[int, ...]) -> int:
+    """Operand elements touched by grouped GEMM.
+
+    The weight stack is allocated for every local expert, but an empty group has
+    no output rows and its weight matrix is not an operand of this launch. Count
+    one full ``k x n`` matrix only for each active expert so the derived bandwidth
+    remains an achieved logical-traffic rate rather than an allocation-size rate.
+    """
+    total_m = sum(batches)
+    active_experts = sum(batch > 0 for batch in batches)
+    return total_m * k + active_experts * k * n + total_m * n
+
+
 def profile_single_gemm(
     m: int,
     n: int,
@@ -174,8 +187,9 @@ def profile_grouped_gemm(
 
         flops = 2 * total_m * n * k
         tflops = (flops / (time_ms / 1000.0)) / 1e12 if time_ms > 0 else 0.0
-        # Read A (Σ m_g·k) + all weights (E·k·n), write out (Σ m_g·n).
-        elems = total_m * k + num_local_experts * k * n + total_m * n
+        # Read A + active-expert weights, then write output. Empty groups retain
+        # allocated weight slices but the grouped launch does not consume them.
+        elems = _grouped_gemm_logical_elements(n, k, batches)
         bytes_accessed = int(elems * dtype.size_bytes())
         bandwidth_gbps = (bytes_accessed / (time_ms / 1000.0)) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(

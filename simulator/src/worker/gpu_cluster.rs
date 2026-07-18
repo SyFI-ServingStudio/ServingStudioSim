@@ -65,12 +65,19 @@ use crate::timing::kernels::{P2pInterKernel, P2pInterKernelInput};
 /// One physical GPU and who owns it. The cluster's `gpus` field is a flat list
 /// of these (the reporting / `run_meta.json` subset); `pool` + `worker_id` make
 /// the worker→gpu and pool→gpu groupings derivable without a second table.
+///
+/// `pool_tag` is the worker pool's role literal (e.g. `attn` / `ffn` / `prefill`),
+/// stamped on every GPU at [`allocate`](GpuCluster::allocate) regardless of whether
+/// the owning worker holds a KV pool or a comm group. It is the authoritative source
+/// `run_meta.json` uses for each worker row's tag, so downstream consumers never have
+/// to reverse-recover a non-KV worker's role through `comm_groups`.
 #[derive(Clone, Debug, Serialize)]
 pub struct GpuInfo {
     pub id: u16,
     pub name: String,
     pub pool: u16,
     pub worker_id: u16,
+    pub pool_tag: String,
 }
 
 /// Where a transfer's per-link time comes from. `Kernel` is the profiled
@@ -216,10 +223,12 @@ impl GpuCluster {
     }
 
     /// Register `n` contiguous-id GPUs owned by `(pool, worker_id)`, all sharing
-    /// `name`, and return the base id of the new block. Ids continue from the
-    /// current length, so calling once per worker yields a dense `0..total` id
-    /// space across all pools.
-    pub fn allocate(&mut self, pool: u16, worker_id: u16, n: u16, name: &str) -> u16 {
+    /// `name` and the worker's `pool_tag`, and return the base id of the new block.
+    /// Ids continue from the current length, so calling once per worker yields a
+    /// dense `0..total` id space across all pools. Every worker calls this exactly
+    /// once at construction, so stamping `pool_tag` here is what makes each worker's
+    /// role tag reach `run_meta.json` independent of KV / comm-group registration.
+    pub fn allocate(&mut self, pool: u16, worker_id: u16, n: u16, name: &str, pool_tag: &str) -> u16 {
         let base = self.gpus.len() as u16;
         for offset in 0..n {
             self.gpus.push(GpuInfo {
@@ -227,6 +236,7 @@ impl GpuCluster {
                 name: name.to_string(),
                 pool,
                 worker_id,
+                pool_tag: pool_tag.to_string(),
             });
         }
         base

@@ -1,6 +1,6 @@
 use crate::timing::bridge::KernelMetrics;
 use crate::timing::cache::interp::{locate, CoverageFlags, LeafMetrics, Metrics4, MONOTONICITY_TOLERANCE};
-use crate::timing::cache::{Cache, OutlierKind, OutlierWarning};
+use crate::timing::cache::{peak_over_cells, Cache, OutlierKind, OutlierWarning, PeakRates};
 use crate::timing::sweep::SweepGrid;
 
 /// Bilinear interpolation over a rectangular 2D profile grid. Both axes are
@@ -160,6 +160,10 @@ impl Cache for Cache2DLinear {
             },
             backend_index: LeafMetrics::NO_BACKEND,
         }
+    }
+
+    fn peak_rates(&self) -> PeakRates {
+        peak_over_cells(self.cells.iter().copied())
     }
 }
 

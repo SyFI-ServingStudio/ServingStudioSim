@@ -54,4 +54,9 @@ pub trait CacheProbe {
     /// own fields, e.g. `{"prefix_len":0,"append_len":192}`). Errors if the JSON
     /// doesn't match the kernel's Input schema.
     fn eval_json(&self, input: &serde_json::Value) -> anyhow::Result<LeafMetrics>;
+
+    /// Peak achieved compute / BW rates over the kernel's fitted grid — the
+    /// per-config "best batching" ceiling. Reads the built cache cells directly
+    /// (no re-eval, no coords remap), so it is correct for re-axis kernels too.
+    fn peak_rates(&self) -> crate::timing::cache::PeakRates;
 }

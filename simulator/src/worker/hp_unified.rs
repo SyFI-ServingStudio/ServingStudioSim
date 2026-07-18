@@ -92,7 +92,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
     ) -> Self {
         cluster
             .borrow_mut()
-            .allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
+            .allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name, pool_tag);
         let num_groups = model.num_attn_dp_groups().max(1) as usize;
         // Each DP shard is an independent attn TP group with its own KV cache.
         // KvPool capacity in tokens — see `unified::new` for the derivation.

@@ -56,6 +56,29 @@ def test_coerce_args_turns_json_list_into_hashable_tuple():
     assert hash(args) == hash(coerce_args(GroupedGemmArgs, spec))
 
 
+def test_torch_logical_elements_exclude_inactive_expert_weights():
+    from profiling.runners.gemm.torch import _grouped_gemm_logical_elements
+
+    # Five real rows split across two active experts; two empty experts retain
+    # allocated weights but contribute no logical traffic for this launch.
+    assert _grouped_gemm_logical_elements(n=5, k=7, batches=(3, 0, 2, 0)) == (
+        5 * 7 + 2 * 7 * 5 + 5 * 5
+    )
+
+
+def test_deepgemm_logical_bytes_exclude_inactive_expert_weights():
+    from profiling.runners.gemm.deepgemm import _grouped_gemm_logical_bytes
+
+    # The two active groups are padded to eight rows each. A/out count padded
+    # rows, while the FP8 weight term counts only those two active experts.
+    assert _grouped_gemm_logical_bytes(
+        n=5,
+        k=7,
+        batches=[3, 0, 2, 0],
+        aligned=[8, 0, 8, 0],
+    ) == (16 * 7 + 2 * 5 * 7 + 16 * 5 * 2)
+
+
 def test_register_spec_shape():
     spec = find_kernel_profiler_spec("grouped_gemm", "torch")
     assert spec.kernel_kind == KIND

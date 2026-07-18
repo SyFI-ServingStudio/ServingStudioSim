@@ -7,7 +7,7 @@
 
 use crate::timing::bridge::{BuildError, KernelKind, KernelMetrics};
 use crate::timing::cache::interp::LeafMetrics;
-use crate::timing::cache::{build_cache, Cache, CacheKind, OutlierWarning};
+use crate::timing::cache::{build_cache, Cache, CacheKind, OutlierWarning, PeakRates};
 use crate::timing::sweep::SweepGrid;
 
 /// Per-backend cache wrapper: a fitted `Box<dyn Cache>`. `*Kernel` runs
@@ -32,6 +32,12 @@ impl BackendCache {
     /// selects best-of-N itself. See `Cache::eval`.
     pub(crate) fn eval(&self, sweep: &[f64]) -> LeafMetrics {
         self.cache.eval(sweep)
+    }
+
+    /// Peak achieved rates over this backend's fitted grid — see
+    /// [`Cache::peak_rates`]. `Kernel::peak_rates` merges these across backends.
+    pub(crate) fn peak_rates(&self) -> PeakRates {
+        self.cache.peak_rates()
     }
 }
 

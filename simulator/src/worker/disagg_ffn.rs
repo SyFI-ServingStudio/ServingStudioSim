@@ -103,7 +103,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
     ) -> Self {
         let gid = {
             let mut c = cluster.borrow_mut();
-            let base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name);
+            let base = c.allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name, pool_tag);
             // One comm group spanning the whole ffn replica's residing fabric
             // (`gpus_per_replica` = ep_size links). A `FfnTask` carries the producer
             // sources reported by the attn workers; the worker submits one transfer per
@@ -577,7 +577,7 @@ mod tests {
     /// pull has a real `send_gid`. Allocates a dummy GPU first so `base` lines up.
     fn register_test_sender(cluster: &SharedGpuCluster) -> u16 {
         let mut c = cluster.borrow_mut();
-        c.allocate(99, 99, 1, "attn-gpu");
+        c.allocate(99, 99, 1, "attn-gpu", "attn");
         c.register_comm_group(0, 1, "attn", 99)
     }
 

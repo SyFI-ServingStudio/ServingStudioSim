@@ -22,6 +22,7 @@ from breakdown import kernel_time_share_plot
 from conservation import workload_plot
 from concurrency import series_plot as concurrency_plot
 from kv import kv_occupancy_plot
+from optimality import optimality_plot
 from request import slo_plot
 from throughput import segment_plot
 from utilization import util_plot
@@ -37,6 +38,7 @@ RENDERERS = {
     "kernel-throughput": kernel_throughput_plot.render,
     "kernel-input-distribution": kernel_input_distribution_plot.render,
     "kernel-time-share": kernel_time_share_plot.render,
+    "optimality": optimality_plot.render,
     "concurrency": concurrency_plot.render,
     "workload-conservation": workload_plot.render,
     "kv-occupancy": kv_occupancy_plot.render,

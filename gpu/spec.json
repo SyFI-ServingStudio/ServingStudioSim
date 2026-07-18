@@ -2,6 +2,12 @@
   "gpus": [
     {
       "name": "V100-SXM2-32GB",
+      "aliases": [
+        "NVIDIA V100",
+        "V100",
+        "Tesla V100",
+        "V100-SXM2"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Volta",
       "year": 2017,
@@ -21,6 +27,9 @@
     },
     {
       "name": "A100-SXM4-40GB",
+      "aliases": [
+        "A100-40GB"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Ampere",
       "year": 2020,
@@ -40,6 +49,13 @@
     },
     {
       "name": "A100-SXM4-80GB",
+      "aliases": [
+        "NVIDIA A100",
+        "A100",
+        "A100-SXM",
+        "A100-SXM4",
+        "A100-80GB"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Ampere",
       "year": 2020,
@@ -59,6 +75,9 @@
     },
     {
       "name": "A100-PCIe-40GB",
+      "aliases": [
+        "A100-PCIe"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Ampere",
       "year": 2020,
@@ -78,6 +97,7 @@
     },
     {
       "name": "A100-PCIe-80GB",
+      "aliases": [],
       "vendor": "NVIDIA",
       "architecture": "Ampere",
       "year": 2020,
@@ -97,6 +117,12 @@
     },
     {
       "name": "H100-SXM5-80GB",
+      "aliases": [
+        "NVIDIA H100",
+        "H100",
+        "H100-SXM",
+        "H100-SXM5"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Hopper",
       "year": 2022,
@@ -116,6 +142,9 @@
     },
     {
       "name": "H100-PCIe-80GB",
+      "aliases": [
+        "H100-PCIe"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Hopper",
       "year": 2022,
@@ -135,6 +164,11 @@
     },
     {
       "name": "H200-SXM-141GB",
+      "aliases": [
+        "NVIDIA H200",
+        "H200",
+        "H200-SXM"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Hopper",
       "year": 2024,
@@ -154,6 +188,11 @@
     },
     {
       "name": "B200-SXM-180GB",
+      "aliases": [
+        "NVIDIA B200",
+        "B200",
+        "B200-SXM"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Blackwell",
       "year": 2024,
@@ -174,6 +213,11 @@
     },
     {
       "name": "B300-SXM-288GB",
+      "aliases": [
+        "NVIDIA B300",
+        "B300",
+        "B300-SXM"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Blackwell",
       "year": 2025,
@@ -195,6 +239,11 @@
     },
     {
       "name": "GB200-Superchip",
+      "aliases": [
+        "NVIDIA GB200",
+        "GB200",
+        "GB200-NVL72"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Blackwell",
       "year": 2024,
@@ -216,6 +265,12 @@
     },
     {
       "name": "H800-SXM5-80GB",
+      "aliases": [
+        "NVIDIA H800",
+        "H800",
+        "H800-SXM",
+        "H800-SXM5"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Hopper",
       "year": 2022,
@@ -229,13 +284,18 @@
       "int8_tops": 1979,
       "tdp_watts": 700,
       "interconnect": "NVLink 4.0",
-  "interconnect_bandwidth_gbps": 400,
+      "interconnect_bandwidth_gbps": 400,
       "nvl_domain_size": 8,
       "dollar_per_hour": null,
       "notes": "China-export variant with reduced NVLink bandwidth. Not listed on getdeploying at the as_of date."
     },
     {
       "name": "H20-SXM-96GB",
+      "aliases": [
+        "NVIDIA H20",
+        "H20",
+        "H20-SXM"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Hopper",
       "year": 2024,
@@ -256,6 +316,9 @@
     },
     {
       "name": "A40",
+      "aliases": [
+        "NVIDIA A40"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Ampere",
       "year": 2020,
@@ -271,10 +334,13 @@
       "interconnect": "NVLink 3.0",
       "interconnect_bandwidth_gbps": 112.5,
       "nvl_domain_size": 2,
-      "dollar_per_hour": 1.30
+      "dollar_per_hour": 1.3
     },
     {
       "name": "L40",
+      "aliases": [
+        "NVIDIA L40"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Ada Lovelace",
       "year": 2022,
@@ -294,6 +360,9 @@
     },
     {
       "name": "L40S",
+      "aliases": [
+        "NVIDIA L40S"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Ada Lovelace",
       "year": 2023,
@@ -309,10 +378,13 @@
       "interconnect": "PCIe 4.0",
       "interconnect_bandwidth_gbps": 64,
       "nvl_domain_size": 1,
-      "dollar_per_hour": 1.70
+      "dollar_per_hour": 1.7
     },
     {
       "name": "L4",
+      "aliases": [
+        "NVIDIA L4"
+      ],
       "vendor": "NVIDIA",
       "architecture": "Ada Lovelace",
       "year": 2023,
@@ -332,6 +404,10 @@
     },
     {
       "name": "MI300X",
+      "aliases": [
+        "AMD MI300X",
+        "MI300"
+      ],
       "vendor": "AMD",
       "architecture": "CDNA3",
       "year": 2023,
@@ -351,6 +427,10 @@
     },
     {
       "name": "MI325X",
+      "aliases": [
+        "AMD MI325X",
+        "MI325"
+      ],
       "vendor": "AMD",
       "architecture": "CDNA3",
       "year": 2024,
@@ -370,6 +450,10 @@
     },
     {
       "name": "Gaudi2",
+      "aliases": [
+        "Intel Gaudi2",
+        "HL-225"
+      ],
       "vendor": "Intel",
       "architecture": "Gaudi",
       "year": 2022,
@@ -389,6 +473,9 @@
     },
     {
       "name": "Gaudi3",
+      "aliases": [
+        "Intel Gaudi3"
+      ],
       "vendor": "Intel",
       "architecture": "Gaudi",
       "year": 2024,

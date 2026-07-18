@@ -23,6 +23,23 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 from profiling.runners.metrics import ComputeMetrics
 
 
+def _grouped_gemm_logical_bytes(
+    n: int,
+    k: int,
+    batches: list[int],
+    aligned: list[int],
+) -> int:
+    """Logical bytes touched by the FP8 grouped launch.
+
+    Activation/output traffic follows the aligned contiguous layout. Weight
+    traffic includes one FP8 ``n x k`` matrix per active expert; experts with no
+    real rows have no id in ``m_indices`` and their allocated weights are skipped.
+    """
+    total_tokens = sum(aligned)
+    active_experts = sum(batch > 0 for batch in batches)
+    return total_tokens * k + active_experts * n * k + total_tokens * n * 2
+
+
 def profile_grouped_gemm(
     n: int,
     k: int,
@@ -113,11 +130,11 @@ def profile_grouped_gemm(
         time_ms = Timer.cupti(kernel)
         energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
 
-        # FLOPs over real tokens (padding rows do no useful work); bytes over the
-        # padded layout actually moved: A fp8 (1B), B fp8 (1B), out bf16 (2B).
+        # FLOPs cover real tokens; activation/output bytes cover the padded
+        # layout, while weights include only experts with real rows.
         flops = 2 * total_real * n * k
         tflops = (flops / (time_ms / 1000.0)) / 1e12 if time_ms > 0 else 0.0
-        bytes_accessed = total_tokens * k + num_local_experts * n * k + total_tokens * n * 2
+        bytes_accessed = _grouped_gemm_logical_bytes(n, k, batches, aligned)
         bandwidth_gbps = (bytes_accessed / (time_ms / 1000.0)) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
