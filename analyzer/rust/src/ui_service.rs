@@ -16,6 +16,7 @@ mod kernel_time_share;
 mod kv_occupancy;
 mod model;
 mod optimality;
+mod request_state;
 mod slo;
 #[cfg(test)]
 mod tests;
@@ -55,6 +56,7 @@ use kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_r
 use kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use model::read_model;
 use optimality::{read_optimality_payload, read_optimality_report};
+use request_state::{read_request_state_payload, read_request_state_report};
 use slo::{read_slo_general_payload, read_slo_general_report};
 use throughput::{read_throughput_payload, read_throughput_report};
 use topology::build_topology;
@@ -101,6 +103,14 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
         .route(
             "/api/v1/runs/{run_id}/subjects/concurrency/payload",
             get(get_concurrency_payload),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/request-state/report",
+            get(get_request_state_report),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/request-state/payload",
+            get(get_request_state_payload),
         )
         .route(
             "/api/v1/runs/{run_id}/subjects/slo-general/report",
@@ -326,6 +336,20 @@ async fn get_concurrency_payload(
     State(state): State<ServiceState>,
 ) -> Response {
     read_run_resource(state, run_id, |run| read_concurrency_payload(&run)).await
+}
+
+async fn get_request_state_report(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_request_state_report(&run)).await
+}
+
+async fn get_request_state_payload(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_request_state_payload(&run)).await
 }
 
 async fn get_slo_general_report(

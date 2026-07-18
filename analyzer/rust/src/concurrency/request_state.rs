@@ -3,9 +3,12 @@
 //!
 //! The cluster view preserves every open `category:*` term from `stage_vocab`,
 //! including `done`, so the stacked categories conserve every request that has
-//! entered stage tracking. Pool and worker views intentionally focus on
-//! `pending:*`: they expose backpressure as
-//! per-worker queue depth, pool total, and pool worker-average. Equal-width,
+//! entered stage tracking. Worker views preserve the same open categories at
+//! each request-owner `(pool, worker)` location. Pool summaries additionally
+//! expose pending backpressure as per-worker queue depth, pool total, and pool
+//! worker-average. Only pools represented by stage events are published; their
+//! full run-metadata worker roster remains present so execution-only pools (AFD
+//! FFN) do not appear as false all-zero request-state owners. Equal-width,
 //! time-weighted bins bound the payload while exact peaks remain in the report.
 
 use std::cmp::Ordering;
@@ -55,7 +58,7 @@ struct EventSet {
     requests_with_history: usize,
     transitions: usize,
     cluster: BTreeMap<String, Vec<TimedDelta>>,
-    pending_by_worker: BTreeMap<WorkerKey, Vec<TimedDelta>>,
+    categories_by_worker: BTreeMap<WorkerKey, BTreeMap<String, Vec<TimedDelta>>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -152,7 +155,13 @@ pub async fn run_request_state(ctx: &SessionContext, log_dir: &Path) -> Result<(
         }
         entry.1.insert(worker_id);
     }
-    for &(pool, worker) in events.pending_by_worker.keys() {
+    let request_owner_pools = events
+        .categories_by_worker
+        .keys()
+        .map(|(pool, _)| *pool)
+        .collect::<BTreeSet<_>>();
+    pool_roster.retain(|pool, _| request_owner_pools.contains(pool));
+    for &(pool, worker) in events.categories_by_worker.keys() {
         pool_roster
             .entry(pool)
             .or_insert_with(|| (format!("pool_{pool}"), BTreeSet::new()))
@@ -167,23 +176,43 @@ pub async fn run_request_state(ctx: &SessionContext, log_dir: &Path) -> Result<(
         let mut worker_payloads = Vec::new();
         let mut pool_events = Vec::new();
         for worker_id in &worker_ids {
-            let worker_events = events
-                .pending_by_worker
-                .get(&(pool, *worker_id))
+            let worker_categories = events.categories_by_worker.get(&(pool, *worker_id));
+            let pending_events = worker_categories
+                .and_then(|worker_categories| worker_categories.get(PENDING_CATEGORY))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            pool_events.extend_from_slice(worker_events);
-            let series = bin_deltas(worker_events, events.span_ms, n_bins)?;
+            pool_events.extend_from_slice(pending_events);
+            let pending = bin_deltas(pending_events, events.span_ms, n_bins)?;
+            let mut category_payloads = Vec::new();
+            let mut category_totals = Vec::new();
+            for category in &categories {
+                let category_events = worker_categories
+                    .and_then(|worker_categories| worker_categories.get(category))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let category_series = bin_deltas(category_events, events.span_ms, n_bins)?;
+                category_payloads.push(json!({
+                    "category": category,
+                    "values": category_series.values,
+                }));
+                category_totals.push(json!({
+                    "category": category,
+                    "peak": category_series.peak,
+                    "mean": category_series.mean,
+                }));
+            }
             worker_payloads.push(json!({
                 "worker_id": worker_id,
-                "pending": series.values,
+                "pending": pending.values,
+                "series": category_payloads,
             }));
             worker_totals.push(json!({
                 "pool": pool,
                 "pool_tag": pool_tag,
                 "worker_id": worker_id,
-                "peak_pending": series.peak,
-                "mean_pending": series.mean,
+                "peak_pending": pending.peak,
+                "mean_pending": pending.mean,
+                "categories": category_totals,
             }));
         }
         let total = bin_deltas(&pool_events, events.span_ms, n_bins)?;
@@ -302,15 +331,15 @@ fn build_event_set(timelines: &[(f64, Vec<Transition>)], names: &[String]) -> Re
                         time_ms: transition.time_ms,
                         delta: -1,
                     });
-                if old_category == PENDING_CATEGORY {
-                    out.pending_by_worker
-                        .entry((old_pool, old_worker))
-                        .or_default()
-                        .push(TimedDelta {
-                            time_ms: transition.time_ms,
-                            delta: -1,
-                        });
-                }
+                out.categories_by_worker
+                    .entry((old_pool, old_worker))
+                    .or_default()
+                    .entry(old_category.to_owned())
+                    .or_default()
+                    .push(TimedDelta {
+                        time_ms: transition.time_ms,
+                        delta: -1,
+                    });
             }
             out.cluster
                 .entry(category.to_owned())
@@ -319,15 +348,15 @@ fn build_event_set(timelines: &[(f64, Vec<Transition>)], names: &[String]) -> Re
                     time_ms: transition.time_ms,
                     delta: 1,
                 });
-            if category == PENDING_CATEGORY {
-                out.pending_by_worker
-                    .entry((transition.pool, transition.worker))
-                    .or_default()
-                    .push(TimedDelta {
-                        time_ms: transition.time_ms,
-                        delta: 1,
-                    });
-            }
+            out.categories_by_worker
+                .entry((transition.pool, transition.worker))
+                .or_default()
+                .entry(category.to_owned())
+                .or_default()
+                .push(TimedDelta {
+                    time_ms: transition.time_ms,
+                    delta: 1,
+                });
             previous = Some((category, transition.pool, transition.worker));
             previous_time = transition.time_ms;
             out.span_ms = out.span_ms.max(transition.time_ms);
@@ -458,9 +487,11 @@ fn value_u16_list(array: &ArrayRef, row: usize, label: &str) -> Result<Vec<u16>>
 fn definitions() -> Value {
     json!({
         "scope": "all request_slo stage transitions when io.log_stage_transitions is enabled",
-        "category": "the open category term before ':' in run_meta.stage_vocab.names; every category, including done, is preserved at cluster level",
+        "category": "the open category term before ':' in run_meta.stage_vocab.names; every category, including done, is preserved at cluster and worker levels",
+        "worker_category": "time-weighted population in one category at the event's request-owner (pool, worker) location",
         "done": "terminal category; completed requests remain resident here so the stacked cluster populations conserve all stage-tracked requests",
-        "pending": "all pending:* stages, grouped by the event's numeric pool and worker location",
+        "pending": "all pending:* stages, grouped by the event's numeric request-owner pool and worker location",
+        "request_owner_pools": "only pools represented by stage events are published; the full run_meta worker roster is retained inside each represented pool",
         "pool_total_pending": "sum of worker pending queue depths in the pool",
         "pool_average_pending": "pool total pending divided by the run_meta worker roster size",
         "bin": "one of 200 equal-width simulated-time bins; plotted values are exact time-weighted means within each bin",
@@ -504,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn event_reconstruction_tracks_categories_and_worker_pending() {
+    fn event_reconstruction_tracks_categories_at_each_worker() {
         let names = vec![
             "pending:prefill".to_owned(),
             "active:prefill".to_owned(),
@@ -543,7 +574,19 @@ mod tests {
         );
         assert_eq!(events.requests_with_history, 2);
         assert_eq!(events.transitions, 5);
-        assert_eq!(events.pending_by_worker.len(), 2);
+        assert_eq!(events.categories_by_worker.len(), 3);
+        assert_eq!(
+            bin_deltas(&events.categories_by_worker[&(0, 0)]["active"], 10.0, 10)
+                .unwrap()
+                .values,
+            active.values
+        );
+        assert_eq!(
+            bin_deltas(&events.categories_by_worker[&(0, 0)]["done"], 10.0, 10)
+                .unwrap()
+                .values,
+            done.values
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ use super::kernel_time_share::kernel_time_share_descriptor;
 use super::kv_occupancy::kv_occupancy_descriptor;
 use super::model::model_config_path;
 use super::optimality::optimality_descriptor;
+use super::request_state::request_state_descriptor;
 use super::slo::slo_general_descriptor;
 use super::throughput::throughput_descriptor;
 use super::utilization::utilization_descriptor;
@@ -65,6 +66,9 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     }
     if let Some(concurrency) = concurrency_descriptor(run)? {
         descriptor["subjects"]["concurrency"] = concurrency;
+    }
+    if let Some(request_state) = request_state_descriptor(run)? {
+        descriptor["subjects"]["request-state"] = request_state;
     }
     if let Some(slo_general) = slo_general_descriptor(run)? {
         descriptor["subjects"]["slo-general"] = slo_general;

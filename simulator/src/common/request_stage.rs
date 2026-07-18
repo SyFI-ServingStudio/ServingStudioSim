@@ -129,11 +129,13 @@ impl PdStage {
 
 /// AFD lifecycle across the layer-lockstep attention and FFN pools.
 ///
-/// V1 is deliberately coarse: the attention worker owns admission (`Pending`,
-/// then `Prefill`), while the FFN worker owns token emission and completion
-/// (`Decode`, then `Done`). Only once-per-request points are recorded because a
-/// per-iteration marker would explode as FFN tasks round-robin across workers.
-/// Intra-slot pipeline sub-stages remain outside this lifecycle vocabulary.
+/// V1 is deliberately coarse: the sticky attention worker owns request-state
+/// location for the whole lifecycle. The FFN Terminal owns token emission and
+/// completion bookkeeping, but its `Decode` / `Done` category transitions retain
+/// the attention owner's `(pool, worker)` rather than moving the request to a
+/// round-robin FFN executor. Only once-per-request points are recorded because a
+/// per-iteration marker would explode. Intra-slot pipeline sub-stages remain
+/// outside this lifecycle vocabulary.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AfdStage {
@@ -141,9 +143,9 @@ pub enum AfdStage {
     Pending = 0,
     /// Attention worker: admitted into a slot (`mark_admitted`), prefilling.
     Prefill = 1,
-    /// FFN worker: first output token emitted (prefill resolved -> decoding).
+    /// Attention owner: first output token emitted (prefill resolved -> decoding).
     Decode = 2,
-    /// FFN worker: completed.
+    /// Attention owner: completed.
     Done = 3,
 }
 

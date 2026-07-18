@@ -85,19 +85,15 @@ def _request_label(value: float) -> str:
     return fmt_value(value, "requests")
 
 
-def _render_cluster(payload: dict, out_path: Path, *, run_label: str) -> Path:
-    """Draw every category as one conserved stacked request population."""
-    fig, ax = new_axes(figsize=(9.5, 4.8))
-    edges = _edges_s(payload)
+def _draw_category_stack(ax, edges: list[float], series_rows: list[dict]):
+    """Draw the shared open-category stack used by cluster and worker tiers."""
     palette = (CURVE, ACCENT, MARKER)
     hatches = ("", "//", "\\\\", "..")
-    peak_total = 0.0
-    mean_total = 0.0
     totals = [0.0] * (len(edges) - 1)
     category_values: list[list[float]] = []
     labels: list[str] = []
     colors: list[str] = []
-    for index, series in enumerate(payload.get("cluster_series") or []):
+    for index, series in enumerate(series_rows):
         values = series.get("values") or []
         if not values:
             continue
@@ -118,9 +114,16 @@ def _render_cluster(payload: dict, out_path: Path, *, run_label: str) -> Path:
         )
         for index, layer in enumerate(layers):
             layer.set_hatch(hatches[index % len(hatches)])
-    if totals:
-        peak_total = max(totals)
-        mean_total = sum(totals) / len(totals)
+    return labels, totals
+
+
+def _render_cluster(payload: dict, out_path: Path, *, run_label: str) -> Path:
+    """Draw every category as one conserved stacked request population."""
+    fig, ax = new_axes(figsize=(9.5, 4.8))
+    edges = _edges_s(payload)
+    labels, totals = _draw_category_stack(ax, edges, payload.get("cluster_series") or [])
+    peak_total = max(totals, default=0.0)
+    mean_total = sum(totals) / len(totals) if totals else 0.0
     ax.set_xlim(left=edges[0], right=edges[-1])
     ax.set_ylim(bottom=0.0, top=max(1.0, peak_total * 1.08))
     corner_box(
@@ -227,20 +230,26 @@ def _render_worker(
     *,
     run_label: str,
 ) -> Path:
-    """Draw one worker's pending queue over simulated time."""
+    """Draw one worker's complete category population as its own tier."""
     fig, ax = new_axes(figsize=(9.0, 4.5))
     edges = _edges_s(payload)
-    pending = worker.get("pending") or []
-    ax.stairs(pending, edges, color=CURVE, linewidth=2.2, label="pending", baseline=None)
-    ax.fill_between(edges[:-1], pending, step="post", color=CURVE, alpha=0.14)
-
-    peak = max(pending, default=0.0)
-    mean = sum(pending) / len(pending) if pending else 0.0
+    worker_series = worker.get("series") or []
+    if not worker_series and worker.get("pending"):
+        # Old payloads had only the pending tier. Preserve their renderability
+        # without claiming unavailable categories.
+        worker_series = [{"category": "pending", "values": worker["pending"]}]
+    labels, totals = _draw_category_stack(ax, edges, worker_series)
+    peak = max(totals, default=0.0)
+    mean = sum(totals) / len(totals) if totals else 0.0
     ax.set_xlim(left=edges[0], right=edges[-1])
     ax.set_ylim(bottom=0.0, top=max(1.0, peak * 1.08))
     corner_box(
         ax,
-        [f"mean = {_request_label(mean)}", f"peak = {_request_label(peak)}"],
+        [
+            f"mean at worker = {_request_label(mean)}",
+            f"peak at worker = {_request_label(peak)}",
+            f"categories = {len(labels)}",
+        ],
         loc="upper right",
     )
     add_legend(ax, loc="upper left")
@@ -250,9 +259,9 @@ def _render_worker(
         fig,
         ax,
         out_path,
-        title=f"Pending requests · {pool_name} worker {worker_id}",
+        title=f"Request state · {pool_name} worker {worker_id}",
         xlabel="sim time (s)",
-        ylabel="pending requests",
+        ylabel="requests",
         run_label=run_label,
     )
     return out_path

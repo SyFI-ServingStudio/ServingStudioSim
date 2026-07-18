@@ -16,6 +16,7 @@ use super::kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_
 use super::kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use super::model::read_model;
 use super::optimality::{read_optimality_payload, read_optimality_report};
+use super::request_state::{read_request_state_payload, read_request_state_report};
 use super::slo::{read_slo_general_payload, read_slo_general_report};
 use super::throughput::{read_throughput_payload, read_throughput_report};
 use super::topology::build_topology;
@@ -97,6 +98,7 @@ fn make_core_run(path: &Path) {
         path.join("reports/analyzer_timing.json"),
         r#"{"subjects": [
             {"name": "concurrency", "status": "ok"},
+            {"name": "request-state", "status": "ok"},
             {"name": "slo-general", "status": "ok"},
             {"name": "throughput", "status": "ok"},
             {"name": "utilization", "status": "ok"},
@@ -120,6 +122,27 @@ fn make_core_run(path: &Path) {
         r#"{"schema_version": 1, "t_ms": [5.0, 10.0], "active": [2.0, 1.0], "peak": 2}"#,
     )
     .expect("write concurrency payload");
+    fs::write(
+        path.join("reports/request_state_report.json"),
+        r#"{"schema_version":1,"available":true,"totals":{"cluster_categories":[{"category":"pending","peak":2}]}}"#,
+    )
+    .expect("write request-state report");
+    fs::write(
+        path.join("payloads/request_state_series.json"),
+        r#"{
+            "schema_version": 1,
+            "meta": {"log_dir": "logs/test"},
+            "t_start_ms": [0.0, 5.0],
+            "t_end_ms": [5.0, 10.0],
+            "cluster_series": [
+                {"category": "pending", "values": [1.0, 2.0]},
+                {"category": "active", "values": [2.0, 1.0]},
+                {"category": "done", "values": [0.0, 1.0]}
+            ],
+            "pools": []
+        }"#,
+    )
+    .expect("write request-state payload");
     fs::write(
         path.join("reports/slo_general_report.json"),
         r#"{
@@ -505,6 +528,11 @@ fn descriptor_indexes_existing_core_resources() {
         descriptor["subjects"]["concurrency"]["payload_href"],
         "subjects/concurrency/payload"
     );
+    assert_eq!(descriptor["subjects"]["request-state"]["status"], "ready");
+    assert_eq!(
+        descriptor["subjects"]["request-state"]["payload_href"],
+        "subjects/request-state/payload"
+    );
     assert_eq!(descriptor["subjects"]["slo-general"]["status"], "ready");
     assert_eq!(
         descriptor["subjects"]["slo-general"]["report_href"],
@@ -724,6 +752,47 @@ fn concurrency_resources_reuse_analyzer_artifacts() {
     assert_eq!(payload["t_ms"], json!([5.0, 10.0]));
     assert_eq!(payload["active"], json!([2.0, 1.0]));
     assert_eq!(payload["peak"], 2);
+}
+
+#[test]
+fn request_state_resources_reuse_hierarchical_analyzer_artifacts() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let report = read_request_state_report(&run).expect("read request-state report");
+    let payload = read_request_state_payload(&run).expect("read request-state payload");
+
+    assert_eq!(report["totals"]["cluster_categories"][0]["peak"], 2);
+    assert_eq!(payload["cluster_series"][0]["category"], "pending");
+    assert_eq!(payload["cluster_series"][1]["values"], json!([2.0, 1.0]));
+}
+
+#[test]
+fn unavailable_request_state_is_not_published_as_ready() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    fs::write(
+        run_path.join("reports/request_state_report.json"),
+        r#"{"schema_version":1,"available":false,"reason":"stage logging disabled"}"#,
+    )
+    .expect("write unavailable request-state report");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let descriptor = build_descriptor(&run).expect("build descriptor");
+
+    assert!(descriptor["subjects"].get("request-state").is_none());
 }
 
 #[test]

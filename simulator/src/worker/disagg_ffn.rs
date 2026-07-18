@@ -7,6 +7,10 @@
 //! [`FfnWorkerEvent`] — [`SectionReady`](FfnWorkerEvent::SectionReady) for a
 //! Bootstrap/Bridge QKV handoff, [`IterComplete`](FfnWorkerEvent::IterComplete)
 //! for a Terminal token.
+//! Request-state location remains owned by the sticky attention worker: Terminal
+//! advances token/completion bookkeeping and changes the request's category, but
+//! preserves the `(pool, worker)` from `RequestRecord::current_stage`. The ffn
+//! worker therefore never becomes a request-state location.
 //!
 //! Double-buffering (port of moesim `ffn_worker.rs`): at most one task `computing`
 //! (`current`) and one `pulling` (`next`) at a time, so the next section's input
@@ -64,9 +68,6 @@ struct RunningTask {
 
 pub struct DisaggFfnWorker<M: FfnLayerwiseModel> {
     pub id: WorkerId,
-    /// This worker's pool; paired with `id` to globally identify the worker in
-    /// `record_stage` (`id` alone is only unique within a pool).
-    pool: PoolId,
     model: Arc<M>,
     requests: SharedRequests,
     config: WorkerConfig,
@@ -123,7 +124,6 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
         );
         Self {
             id,
-            pool,
             model,
             requests,
             config,
@@ -403,13 +403,18 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                 // the batch; bookkeeping (and the per-request completion split) is
                 // the worker's (plan §3).
                 let log_tokens = self.config.log_output_token_times;
-                let (pool, wid, log_stage) =
-                    (self.pool, self.id, self.config.log_stage_transitions);
+                let log_stage = self.config.log_stage_transitions;
                 let mut completed = Vec::new();
                 {
                     let mut store = self.requests.borrow_mut();
                     for &rid in &task.reqs {
                         let r = &mut store[rid];
+                        // AFD request placement is sticky on the attention side.
+                        // Terminal owns the status flip/token emission, but is not a
+                        // request-location handoff: preserve the attention owner from
+                        // the previous stage for both Decode and Done. `current_stage`
+                        // is maintained even when full stage logging is disabled.
+                        let request_owner = (r.current_stage.pool, r.current_stage.worker);
                         if r.tokens_emitted == 0 {
                             // Prefill resolves on this Terminal: advance the store's
                             // prefill marker so `is_prefill()` flips to decode. Every
@@ -418,14 +423,26 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                             // (which owns token emission) must maintain it here.
                             r.prefill_processed = r.prompt_len;
                             r.record_first_token(now, log_tokens);
-                            // Location: prefill resolved → decoding (first token, ffn).
+                            // Prefill resolved → decoding on the sticky attn owner.
                             // Recorded once per request (only the first Terminal).
-                            r.record_stage(now, AfdStage::Decode as u16, pool, wid, log_stage);
+                            r.record_stage(
+                                now,
+                                AfdStage::Decode as u16,
+                                request_owner.0,
+                                request_owner.1,
+                                log_stage,
+                            );
                         } else {
                             r.record_token(now, log_tokens);
                         }
                         if r.is_complete() {
-                            r.record_stage(now, AfdStage::Done as u16, pool, wid, log_stage);
+                            r.record_stage(
+                                now,
+                                AfdStage::Done as u16,
+                                request_owner.0,
+                                request_owner.1,
+                                log_stage,
+                            );
                             completed.push(rid);
                         }
                     }
@@ -670,6 +687,55 @@ mod tests {
         );
         assert!(store.borrow()[RequestId(0)].completed);
         assert_eq!(store.borrow()[RequestId(0)].tokens_emitted, 1);
+    }
+
+    #[test]
+    fn terminal_preserves_attention_request_owner() {
+        let store = shared_with(&[(0, 8, 1)]);
+        let attn_pool = PoolId(7);
+        let attn_worker = WorkerId(3);
+        store.borrow_mut()[RequestId(0)].record_stage(
+            Time::ZERO,
+            AfdStage::Prefill as u16,
+            attn_pool,
+            attn_worker,
+            true,
+        );
+        let mut config = WorkerConfig::default();
+        config.log_stage_transitions = true;
+        let mut w = DisaggFfnWorker::new(
+            WorkerId(0),
+            Arc::new(FakeFfn { ms: 1.0, layers: 2 }),
+            Rc::clone(&store),
+            config,
+            PoolId(9),
+            "test-gpu",
+            test_cluster(),
+            None,
+            "ffn",
+        );
+        w.enqueue(FfnWorkerMsg::Task(FfnTask {
+            kind: FfnTaskKind::Terminal,
+            slot: 0,
+            reqs: vec![RequestId(0)],
+            pull_sources: Vec::new(),
+            tokens: 0,
+        }));
+
+        let mut events = Vec::new();
+        for step in 0..10u64 {
+            w.tick(Time::from_ms(step as f64), &mut events);
+        }
+
+        let store_ref = store.borrow();
+        let record = &store_ref[RequestId(0)];
+        assert_eq!(record.stage_log.len(), 3);
+        assert_eq!(record.stage_log[1].code, AfdStage::Decode as u16);
+        assert_eq!(record.stage_log[2].code, AfdStage::Done as u16);
+        assert!(record
+            .stage_log
+            .iter()
+            .all(|stage| (stage.pool, stage.worker) == (attn_pool, attn_worker)));
     }
 
     #[test]
