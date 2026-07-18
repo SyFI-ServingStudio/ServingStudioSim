@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
-use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{PoolId, RequestId, SharedRequests, Time, UnifiedStage, WorkerId};
 use crate::log::{KvSampler, KvSubmit};
 use crate::worker::admission_helpers::{prefill_fits_budget, Batch, LoadBalance};
 use crate::worker::cost_buffers::CostBuffers;
@@ -62,6 +62,9 @@ impl HpRuntime {
 
 pub struct HpUnifiedWorker<M: IterwiseUnifiedModel> {
     pub id: WorkerId,
+    /// This worker's pool; paired with `id` to globally identify the worker in
+    /// `record_stage` (`id` alone is only unique within a pool).
+    pool: PoolId,
     model: Arc<M>,
     requests: SharedRequests,
     config: WorkerConfig,
@@ -130,6 +133,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref(), config.gpu_time_multiplier);
         Self {
             id,
+            pool,
             model,
             requests,
             config,
@@ -148,7 +152,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         loop {
             match self.runtime.worker_fsm_state {
                 Idle => {
-                    if !self.form_batch() {
+                    if !self.form_batch(now) {
                         break;
                     }
                     self.runtime.worker_fsm_state = Active;
@@ -200,7 +204,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
 
     // ── Stage 1: form_batch — admit one fresh prefill into a balance-chosen group ─
 
-    fn form_batch(&mut self) -> bool {
+    fn form_batch(&mut self, now: Time) -> bool {
         let had_decode = self
             .batches
             .iter()
@@ -226,7 +230,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                         .try_admit(&self.batches[gid as usize], group_promised, p, d)
                     {
                         self.runtime.pending_prefills.pop_front();
-                        self.promise(gid, rid, p, d, 0);
+                        self.promise(now, gid, rid, p, d, 0);
                     }
                 }
             }
@@ -263,7 +267,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                         break;
                     }
                     self.runtime.pending_prefills.pop_front();
-                    self.promise(gid, rid, p, d, 0);
+                    self.promise(now, gid, rid, p, d, 0);
                     admitted[g] += p;
                 }
             }
@@ -307,11 +311,14 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             // of `batches` and the `RefCell` borrow_mut don't conflict. `log_tokens`
             // gates the per-token array (the hot-path cost — see RequestRecord).
             {
+                let (pool, wid, log_stage) =
+                    (self.pool, self.id, self.config.log_stage_transitions);
                 let mut store = self.requests.borrow_mut();
                 for (rid, _) in self.batches[gid].iter_decoding() {
                     let r = &mut store[rid];
                     r.record_token(now, log_tokens);
                     if r.is_complete() {
+                        r.record_stage(now, UnifiedStage::Done as u16, pool, wid, log_stage);
                         completed.push(rid);
                     }
                 }
@@ -325,16 +332,20 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             // finalize) instead of cloning it.
             let mut to_finalize: Vec<(RequestId, u64, u32)> = Vec::new();
             {
+                let (pool, wid, log_stage) =
+                    (self.pool, self.id, self.config.log_stage_transitions);
                 let mut store = self.requests.borrow_mut();
                 for &rid in &self.batches[gid].prefill_admits {
                     let r = &mut store[rid];
                     r.prefill_processed = r.prompt_len;
                     r.record_first_token(now, log_tokens);
                     if r.is_complete() {
+                        r.record_stage(now, UnifiedStage::Done as u16, pool, wid, log_stage);
                         completed.push(rid);
                     } else {
                         let kv = (r.prompt_len + r.prefix_kv) as u64;
                         let remaining = r.decode_len.saturating_sub(r.tokens_emitted);
+                        r.record_stage(now, UnifiedStage::Decode as u16, pool, wid, log_stage);
                         to_finalize.push((rid, kv, remaining));
                     }
                 }
@@ -412,7 +423,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
 
     // ── lifecycle helpers (gid-aware; same as barebone) ─────────────────────────
 
-    fn promise(&mut self, gid: u16, rid: RequestId, p: u32, d: u32, prefix: u32) {
+    fn promise(&mut self, now: Time, gid: u16, rid: RequestId, p: u32, d: u32, prefix: u32) {
         self.runtime
             .promised
             .insert(rid, (gid, (p + prefix + d) as u64));
@@ -422,6 +433,14 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         let r = &mut store[rid];
         r.active_chunk_len = p;
         r.prefix_kv = prefix;
+        // Location: pending → prefilling on this worker.
+        r.record_stage(
+            now,
+            UnifiedStage::Prefill as u16,
+            self.pool,
+            self.id,
+            self.config.log_stage_transitions,
+        );
     }
 
     fn drain_promises_into_admits(&mut self) {
@@ -477,6 +496,17 @@ impl<M: IterwiseUnifiedModel> IterWorker for HpUnifiedWorker<M> {
     fn enqueue(&mut self, msg: Self::Msg) {
         let WorkerMsgCommon::Request(rid) = msg;
         self.runtime.pending_prefills.push_back(rid);
+        // Location: the request now sits in this worker's pending queue. Stamped
+        // at its arrival time (enqueue carries no clock; arrival is on the record).
+        let mut store = self.requests.borrow_mut();
+        let arrival = store[rid].arrival_time;
+        store[rid].record_stage(
+            arrival,
+            UnifiedStage::Pending as u16,
+            self.pool,
+            self.id,
+            self.config.log_stage_transitions,
+        );
     }
 
     fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time> {
@@ -617,7 +647,7 @@ mod tests {
         for id in 0..6u32 {
             w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
         }
-        w.form_batch();
+        w.form_batch(Time::ZERO);
         assert_eq!(w.batches[0].prefill_admits.len(), 2);
         assert_eq!(w.batches[1].prefill_admits.len(), 2);
         assert_eq!(w.runtime.pending_prefills.len(), 2);

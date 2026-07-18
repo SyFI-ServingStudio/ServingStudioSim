@@ -284,6 +284,31 @@ pub fn request_slo_schema() -> Arc<Schema> {
         // `num_output_tokens` to give per-request (p, d) for the
         // `workload_conservation` analyzer's expected-work closed forms.
         Field::new("prefill_processed", DataType::UInt32, false),
+        // Stage/location transition timeline — four parallel List columns, each
+        // empty unless `io.log_stage_transitions` is on. `stage_codes[i]` decodes
+        // to a `"category:detail"` name via the per-deployment table in `run_meta.json`;
+        // `(stage_pool_ids[i], stage_worker_ids[i])` pins the worker. Appended
+        // last (append-only, old readers unaffected).
+        Field::new(
+            "stage_times_ms",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, false))),
+            false,
+        ),
+        Field::new(
+            "stage_codes",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt16, false))),
+            false,
+        ),
+        Field::new(
+            "stage_pool_ids",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt16, false))),
+            false,
+        ),
+        Field::new(
+            "stage_worker_ids",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt16, false))),
+            false,
+        ),
     ]))
 }
 

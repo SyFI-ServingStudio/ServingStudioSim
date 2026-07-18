@@ -77,12 +77,14 @@ impl Deployment for AfdDeployment {
             attn_gpu_memory_gb(&ag.worker),
             attn_gpu_time_multiplier(&ag.worker),
             cfg.io.log_output_token_times,
+            cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
         );
         let ffn_wc = worker_config(
             80.0, // ffn has no KV
             ffn_gpu_time_multiplier(&fg.worker),
             cfg.io.log_output_token_times,
+            cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
         );
 
@@ -219,11 +221,13 @@ fn worker_config(
     attn_gpu_memory_gb: f64,
     gpu_time_multiplier: f64,
     log_output_token_times: bool,
+    log_stage_transitions: bool,
     kv_log_stride: u32,
 ) -> WorkerConfig {
     WorkerConfig {
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
+        log_stage_transitions,
         kv_log_stride,
         gpu_time_multiplier,
         ..WorkerConfig::default()

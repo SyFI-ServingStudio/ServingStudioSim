@@ -56,12 +56,14 @@ In-flight is tracked from arrival/completion **counters**, never by scanning the
 store each tick (that scan was ~90% of runtime on large backlogs). Periodic steps
 share one `EveryN` iteration gate.
 
-At sim-end, `finalize` flushes one last pass over the admitted set: a terminal
-`request_state` row per request (so work between the last snapshot and sim-end
-isn't lost) and a `request_slo` row for the still-incomplete ones. The
+At sim-end, `finalize` flushes the two streams over their respective scopes. The
+final aggregate `request_state` census covers the admitted set, so work between
+the last snapshot and sim-end is not lost. Partial `request_slo` rows cover every
+still-incomplete arrived request, including a never-admitted pending tail whose
+stage timeline is needed for queue/backpressure analysis. The
 `census_already_written` guard skips the `request_state` census when the run
-ended on a snapshot tick (`last_state_clock == Some(clock)`) — re-writing it
-would duplicate every `(request_id, logging_time)` row.
+ended on a snapshot tick (`last_state_clock == Some(clock)`) to avoid duplicating
+that aggregate row.
 
 ## `TickCfg` — the loop knobs
 

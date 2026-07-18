@@ -35,8 +35,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::arch::contract::{FfnArchInput, FfnLayerwiseModel};
-use crate::common::SharedRequests;
-use crate::common::{PoolId, RequestId, Time, WorkerId};
+use crate::common::{AfdStage, PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
@@ -65,6 +64,9 @@ struct RunningTask {
 
 pub struct DisaggFfnWorker<M: FfnLayerwiseModel> {
     pub id: WorkerId,
+    /// This worker's pool; paired with `id` to globally identify the worker in
+    /// `record_stage` (`id` alone is only unique within a pool).
+    pool: PoolId,
     model: Arc<M>,
     requests: SharedRequests,
     config: WorkerConfig,
@@ -121,6 +123,7 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
         );
         Self {
             id,
+            pool,
             model,
             requests,
             config,
@@ -400,6 +403,8 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                 // the batch; bookkeeping (and the per-request completion split) is
                 // the worker's (plan §3).
                 let log_tokens = self.config.log_output_token_times;
+                let (pool, wid, log_stage) =
+                    (self.pool, self.id, self.config.log_stage_transitions);
                 let mut completed = Vec::new();
                 {
                     let mut store = self.requests.borrow_mut();
@@ -413,15 +418,14 @@ impl<M: FfnLayerwiseModel> DisaggFfnWorker<M> {
                             // (which owns token emission) must maintain it here.
                             r.prefill_processed = r.prompt_len;
                             r.record_first_token(now, log_tokens);
+                            // Location: prefill resolved → decoding (first token, ffn).
+                            // Recorded once per request (only the first Terminal).
+                            r.record_stage(now, AfdStage::Decode as u16, pool, wid, log_stage);
                         } else {
                             r.record_token(now, log_tokens);
                         }
-                        // `record_token` sets `completed` itself, but `record_first_token`
-                        // does not — so a `decode_len == 1` request completing on its very
-                        // first Terminal needs the flag set here. Authoritative completion
-                        // is the worker's (the sim census only reads the flag).
                         if r.is_complete() {
-                            r.completed = true;
+                            r.record_stage(now, AfdStage::Done as u16, pool, wid, log_stage);
                             completed.push(rid);
                         }
                     }
