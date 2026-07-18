@@ -76,6 +76,43 @@ pub(super) async fn read_exact_worker_totals(
     Ok(worker_accumulators)
 }
 
+/// Exact totals for one selected worker iteration. An iteration has no scheduler
+/// holding-span boundary of its own, so `span_ms == busy_ms` and therefore R0=R1.
+pub(super) async fn read_exact_iteration_total(
+    ctx: &SessionContext,
+    pool_tag: &str,
+    worker_id: u16,
+    iter_id: u64,
+    gpu_count: f64,
+) -> Result<Option<WorkerFoldAccumulator>> {
+    let sql_pool_tag = sql_string_literal(pool_tag);
+    let record_batches = collect(
+        ctx,
+        &format!(
+            "SELECT COUNT(*) AS n, SUM(total_time_ms) AS busy \
+             FROM cost_log WHERE CAST(pool_tag AS VARCHAR) = '{sql_pool_tag}' \
+             AND worker_id = {worker_id} AND iter_id = {iter_id}"
+        ),
+    )
+    .await?;
+    let Some(batch) = record_batches.first() else {
+        return Ok(None);
+    };
+    if batch.num_rows() == 0 || value_f64(col(batch, "n")?, 0)? <= 0.0 {
+        return Ok(None);
+    }
+    let busy_ms = value_f64(col(batch, "busy")?, 0)?.max(0.0);
+    Ok(Some(WorkerFoldAccumulator {
+        pool_tag: pool_tag.to_string(),
+        worker_id,
+        gpu_count,
+        busy_ms,
+        span_ms: busy_ms,
+        sampled_busy_ms: 0.0,
+        sampled_rungs_ms: [0.0; 4],
+    }))
+}
+
 /// Pick the iteration stride: `num_iters / TARGET`, clamped `[1, MAX_STRIDE]`.
 pub(super) async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
     let record_batches = collect(
@@ -112,6 +149,60 @@ pub(super) async fn accumulate_fold(
                 slot_time_ms, slot_flops, slot_bytes \
          FROM cost_log WHERE iter_id % {stride} = 0"
     );
+    accumulate_fold_query(
+        ctx,
+        &sql,
+        hardware_bandwidth_gbps,
+        section_fold_plan_by_key,
+        worker_index_by_key,
+        workers,
+        sampled_rungs_by_location_worker,
+    )
+    .await
+}
+
+/// Exact R2..R5 fold for one selected iteration. Unlike the run aggregate this
+/// reads every matching row, so its anchor is exactly the worker's GPU count.
+pub(super) async fn accumulate_iteration_fold(
+    ctx: &SessionContext,
+    pool_tag: &str,
+    worker_id: u16,
+    iter_id: u64,
+    hardware_bandwidth_gbps: f64,
+    section_fold_plan_by_key: &HashMap<(String, u16, String), SectionFoldPlan>,
+    worker_index_by_key: &HashMap<(String, u16), usize>,
+    workers: &mut [WorkerFoldAccumulator],
+    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 4]>,
+) -> Result<u64> {
+    let pool_tag = sql_string_literal(pool_tag);
+    let sql = format!(
+        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, worker_id, \
+                CAST(section AS VARCHAR) AS section, total_time_ms, \
+                slot_time_ms, slot_flops, slot_bytes \
+         FROM cost_log WHERE CAST(pool_tag AS VARCHAR) = '{pool_tag}' \
+         AND worker_id = {worker_id} AND iter_id = {iter_id}"
+    );
+    accumulate_fold_query(
+        ctx,
+        &sql,
+        hardware_bandwidth_gbps,
+        section_fold_plan_by_key,
+        worker_index_by_key,
+        workers,
+        sampled_rungs_by_location_worker,
+    )
+    .await
+}
+
+async fn accumulate_fold_query(
+    ctx: &SessionContext,
+    sql: &str,
+    hardware_bandwidth_gbps: f64,
+    section_fold_plan_by_key: &HashMap<(String, u16, String), SectionFoldPlan>,
+    worker_index_by_key: &HashMap<(String, u16), usize>,
+    workers: &mut [WorkerFoldAccumulator],
+    sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 4]>,
+) -> Result<u64> {
     let record_batches = collect(ctx, &sql).await?;
     let mut sampled_rows = 0u64;
     for batch in &record_batches {
@@ -230,6 +321,10 @@ pub(super) async fn accumulate_fold(
         }
     }
     Ok(sampled_rows)
+}
+
+fn sql_string_literal(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 /// One leaf's optimal time (ms) = `work / peak_rate`, roofline over compute and

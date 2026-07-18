@@ -20,7 +20,7 @@ use super::{fold, grid_peaks, kernel, levels, prepare};
 use super::{ratio, BUCKET_KEYS, KERNEL_RUNG_KEYS, R0, R5, RUNG_KEYS};
 
 /// cost_log columns this subject depends on (drift guard).
-const COST_COLS: &[&str] = &[
+pub(super) const COST_COLS: &[&str] = &[
     "pool_tag",
     "worker_id",
     "section",

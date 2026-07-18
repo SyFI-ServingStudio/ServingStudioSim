@@ -47,12 +47,14 @@
 
 mod fold;
 mod grid_peaks;
+mod iteration;
 mod kernel;
 mod levels;
 mod prepare;
 mod run;
 mod spec;
 
+pub(crate) use iteration::iteration_kernel_ladder;
 pub use run::run_optimality;
 
 /// Rung index into the per-unit `[f64; 6]` GPU·ms accumulators (R0..R5).

@@ -89,6 +89,15 @@ pub(crate) fn load_or_generate(
     }
 }
 
+/// Read-only service path: reuse the sidecar produced by `analyze run` without
+/// launching kernel-query or mutating the run directory during an HTTP GET.
+pub(crate) fn load_cached(log_dir: &Path) -> GridPeakCatalog {
+    load(log_dir).unwrap_or_else(|| GridPeakCatalog {
+        rates_by_config_key: HashMap::new(),
+        source: "unavailable: cached sidecar missing or unreadable".to_string(),
+    })
+}
+
 /// Read a previously-written `raw/kernel_grid_peaks.json` into a lookup map.
 /// `None` if absent/unparseable (the caller then tries generation).
 fn load(log_dir: &Path) -> Option<GridPeakCatalog> {

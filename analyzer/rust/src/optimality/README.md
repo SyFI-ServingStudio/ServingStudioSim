@@ -25,6 +25,11 @@ value. The renderer keeps a kernel's color across all six bars and connects it
 with a ribbon, without pretending the two aggregate gaps have a per-kernel
 critical-path attribution.
 
+The UI service exposes the same ladder on demand for one selected
+`(pool_tag, worker_id, iter_id)`. That detail folds every matching row rather
+than sampling. It defines R0=R1 because an individual iteration has no scheduler
+holding-span boundary, and keeps `R1-R2` as one aggregate imbalance chunk.
+
 ## Files
 
 The subject is split by pipeline stage and aggregation tier — `mod.rs` is a thin

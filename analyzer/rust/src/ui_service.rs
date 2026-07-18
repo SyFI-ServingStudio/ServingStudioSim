@@ -5,6 +5,7 @@
 //! file into a second analyzer.
 
 mod artifact;
+mod batch;
 mod catalog;
 mod concurrency;
 mod core;
@@ -40,6 +41,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::optimality::iteration_kernel_ladder;
+use batch::{read_batch_payload, read_batch_report};
 use catalog::build_catalog;
 use concurrency::{read_concurrency_payload, read_concurrency_report};
 use core::{build_descriptor, read_summary};
@@ -124,6 +127,14 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
             get(get_utilization_payload),
         )
         .route(
+            "/api/v1/runs/{run_id}/subjects/batch/report",
+            get(get_batch_report),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/batch/payload",
+            get(get_batch_payload),
+        )
+        .route(
             "/api/v1/runs/{run_id}/subjects/kv-occupancy/report",
             get(get_kv_occupancy_report),
         )
@@ -170,6 +181,10 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
         .route(
             "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations/seek",
             get(seek_worker_operation),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/iterations/{iter_id}/optimality-kernel-ladder",
+            get(get_iteration_optimality_kernel_ladder),
         )
         .route(
             "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations/{iter_id}/{batch_id}/{operation_id}/cost-tree",
@@ -355,6 +370,20 @@ async fn get_utilization_payload(
     read_run_resource(state, run_id, |run| read_utilization_payload(&run)).await
 }
 
+async fn get_batch_report(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_batch_report(&run)).await
+}
+
+async fn get_batch_payload(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_batch_payload(&run)).await
+}
+
 async fn get_kv_occupancy_report(
     RoutePath(run_id): RoutePath<String>,
     State(state): State<ServiceState>,
@@ -533,6 +562,28 @@ async fn seek_worker_operation(
         request_started.elapsed().as_secs_f64() * 1000.0
     );
     response
+}
+
+async fn get_iteration_optimality_kernel_ladder(
+    RoutePath((run_id, pool_tag, worker_id, iter_id)): RoutePath<(String, String, u16, u64)>,
+    State(state): State<ServiceState>,
+) -> Response {
+    let run = match resolve_run(&state.roots, &run_id) {
+        Ok(run) => run,
+        Err(error) => return worker_resource_error(error),
+    };
+    match iteration_kernel_ladder(
+        state.repo_root.as_ref(),
+        &run.path,
+        &pool_tag,
+        worker_id,
+        iter_id,
+    )
+    .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => worker_resource_error(error),
+    }
 }
 
 async fn get_worker_cost_tree(

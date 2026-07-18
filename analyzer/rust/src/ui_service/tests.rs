@@ -4,6 +4,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+use super::batch::{read_batch_payload, read_batch_report};
 use super::catalog::build_catalog;
 use super::concurrency::{read_concurrency_payload, read_concurrency_report};
 use super::core::{build_descriptor, read_summary};
@@ -99,6 +100,7 @@ fn make_core_run(path: &Path) {
             {"name": "slo-general", "status": "ok"},
             {"name": "throughput", "status": "ok"},
             {"name": "utilization", "status": "ok"},
+            {"name": "batch", "status": "ok"},
             {"name": "kernel-input-distribution", "status": "ok"},
             {"name": "kernel-time-share", "status": "ok"},
             {"name": "optimality", "status": "ok"},
@@ -203,6 +205,35 @@ fn make_core_run(path: &Path) {
         }"#,
     )
     .expect("write utilization payload");
+    fs::write(
+        path.join("reports/batch_report.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "meta": {"num_calls": 2}
+        }"#,
+    )
+    .expect("write batch report");
+    fs::write(
+        path.join("payloads/batch_scatter.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "meta": {"log_dir": "simulation", "num_calls": 2},
+            "pools": [{
+                "pool": "attn",
+                "num_calls": 2,
+                "plotted_points": 2,
+                "time_ms": [0.0, 1.0],
+                "series": [
+                    {"key": "batch_tokens", "label": "Batch tokens", "values": [8, 16]},
+                    {"key": "prefill_tokens", "label": "Prefill tokens", "values": [8, 0]},
+                    {"key": "decode_request_count", "label": "Decode requests", "values": [0, 16]}
+                ]
+            }]
+        }"#,
+    )
+    .expect("write batch payload");
     fs::write(
         path.join("reports/kernel_input_distribution_report.json"),
         r#"{
@@ -812,6 +843,27 @@ fn utilization_resources_expose_workers_and_pool_average() {
 }
 
 #[test]
+fn batch_resources_publish_existing_pool_composition() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let descriptor = build_descriptor(&run).expect("build descriptor");
+    let report = read_batch_report(&run).expect("read batch report");
+    let payload = read_batch_payload(&run).expect("read batch payload");
+
+    assert_eq!(descriptor["subjects"]["batch"]["status"], "ready");
+    assert_eq!(report["available"], true);
+    assert_eq!(payload["pools"][0]["pool"], "attn");
+    assert_eq!(payload["pools"][0]["series"][0]["values"], json!([8, 16]));
+}
+
+#[test]
 fn kv_occupancy_resources_expose_workers_and_pool_average() {
     let temporary = TempDir::new().expect("temporary logs root");
     make_core_run(&temporary.path().join("simulation"));
@@ -878,7 +930,6 @@ fn optimality_resources_expose_waterfall_levels_and_kernels() {
         descriptor["subjects"]["optimality"]["payload_href"],
         "subjects/optimality/payload"
     );
-
     let report = read_optimality_report(&run).expect("read optimality report");
     let payload = read_optimality_payload(&run).expect("read optimality payload");
     assert_eq!(report["optimality_ratio"], 0.33);

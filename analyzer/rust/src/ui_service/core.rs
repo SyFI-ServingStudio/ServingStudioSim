@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::artifact::{read_bytes, read_run_json};
+use super::batch::batch_descriptor;
 use super::concurrency::concurrency_descriptor;
 use super::discovery::{regular_file, timestamp, DiscoveredRun, StageStatus};
 use super::kernel_input_distribution::kernel_input_distribution_descriptor;
@@ -74,6 +75,9 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     if let Some(utilization) = utilization_descriptor(run)? {
         descriptor["subjects"]["utilization"] = utilization;
     }
+    if let Some(batch) = batch_descriptor(run)? {
+        descriptor["subjects"]["batch"] = batch;
+    }
     if let Some(kv_occupancy) = kv_occupancy_descriptor(run)? {
         descriptor["subjects"]["kv-occupancy"] = kv_occupancy;
     }
@@ -83,15 +87,21 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     if let Some(kernel_time_share) = kernel_time_share_descriptor(run)? {
         descriptor["subjects"]["kernel-time-share"] = kernel_time_share;
     }
-    if let Some(optimality) = optimality_descriptor(run)? {
+    let optimality_ready = if let Some(optimality) = optimality_descriptor(run)? {
         descriptor["subjects"]["optimality"] = optimality;
-    }
+        true
+    } else {
+        false
+    };
     if let Some(workload_conservation) = workload_conservation_descriptor(run)? {
         descriptor["subjects"]["workload-conservation"] = workload_conservation;
     }
     if let Some(detail) = details_descriptor(run) {
         descriptor["details"]["worker-operation-index"] = detail.clone();
-        descriptor["details"]["worker-cost-tree"] = detail;
+        descriptor["details"]["worker-cost-tree"] = detail.clone();
+        if optimality_ready {
+            descriptor["details"]["iteration-optimality-kernel-ladder"] = detail;
+        }
     }
     if run.lifecycle.analysis == StageStatus::Complete {
         let timing_path = run.path.join("reports/analyzer_timing.json");

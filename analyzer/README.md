@@ -100,6 +100,12 @@ whether `batch_id` represents a `slot` or a `batch`. Exact CostTrees use
 `operations/{iter_id}/{batch_id}/{operation_id}/cost-tree` and reconstruct only
 that one raw row. A streaming scan builds a compact per-worker index once; a
 512 MiB byte-budgeted LRU bounds retained indexes, and range JSON is not cached.
+When the optimality subject is ready,
+`workers/{pool}/{worker}/iterations/{iter_id}/optimality-kernel-ladder` folds all
+rows for that exact worker iteration into the same R0-R5 per-kernel ladder used
+by the run payload. Iterations have no scheduler holding-span boundary, so
+R0=R1 and idle is zero; R1-R2 remains aggregate imbalance. This high-cardinality
+detail is requested on selection and is not embedded for every iteration.
 The alignment path reads `<analysis_log_dir>/alignment_manifest.json`, which
 points to normalized NSYS JSON in the profile root, timing-predict cost
 parquet/manifest, the profile's `replay_result` TraceLab JSONL, its optional
