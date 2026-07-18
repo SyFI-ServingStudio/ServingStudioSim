@@ -68,6 +68,35 @@ pub fn read_run_meta(log_dir: &Path) -> Option<(usize, String)> {
     Some((num_gpus, gpu_name))
 }
 
+/// Deployment-defined request-stage vocabulary from `run_meta.json` (v5+).
+/// Stage codes in `request_slo` are intentionally opaque to the analyzer until
+/// decoded through this sidecar; keeping that lookup here prevents subjects from
+/// hard-coding deployment enums or importing simulator types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageVocabDoc {
+    pub deployment: String,
+    pub names: Vec<String>,
+}
+
+pub fn read_stage_vocab(log_dir: &Path) -> Option<StageVocabDoc> {
+    let path = resolve_artifact_path(log_dir, "run_meta.json");
+    let text = fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    stage_vocab_from_run_meta(&json)
+}
+
+fn stage_vocab_from_run_meta(json: &serde_json::Value) -> Option<StageVocabDoc> {
+    let vocab = json.get("stage_vocab")?;
+    let deployment = vocab.get("deployment")?.as_str()?.to_owned();
+    let names = vocab
+        .get("names")?
+        .as_array()?
+        .iter()
+        .map(|name| name.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    (!names.is_empty()).then_some(StageVocabDoc { deployment, names })
+}
+
 /// Read + parse per-worker cost manifests under `raw/cost_manifest/`.
 ///
 /// Manifest filenames are keyed exactly like cost-log parquet filenames:
@@ -244,4 +273,27 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::write(path, serde_json::to_vec_pretty(value)?)?;
     println!("wrote {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stage_vocab_parser_preserves_open_category_names() {
+        let doc = stage_vocab_from_run_meta(&json!({
+            "stage_vocab": {
+                "deployment": "future",
+                "names": ["pending:prefill", "suspended:preempted", "done:request"]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(doc.deployment, "future");
+        assert_eq!(
+            doc.names,
+            vec!["pending:prefill", "suspended:preempted", "done:request"]
+        );
+    }
 }

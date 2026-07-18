@@ -247,6 +247,15 @@ pub const SUBJECTS: &[Subject] = &[
         scope: Scope::Run,
     },
     Subject {
+        name: "request-state",
+        category: Category::Concurrency,
+        description: "Request-stage populations over time: every category in a conserved cluster stack, plus pending queues at pool and worker levels.",
+        report_name: "request_state_report.json",
+        payload_name: "request_state_series.json",
+        applies: Applies::All,
+        scope: Scope::Run,
+    },
+    Subject {
         name: "workload-conservation",
         category: Category::Conservation,
         description: "Run-wide work accounting: cost_log prefill/decode/FFN/KV actuals vs \
@@ -336,6 +345,7 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
         "kernel-time-share" => breakdown::kernel_time_share::run(ctx, dir).await,
         "optimality" => optimality::run_optimality(ctx, dir).await,
         "concurrency" => concurrency::series::run_concurrency(ctx, dir).await,
+        "request-state" => concurrency::request_state::run_request_state(ctx, dir).await,
         "workload-conservation" => conservation::workload::run_workload(ctx, dir).await,
         "kv-occupancy" => kv::occupancy::run_kv_occupancy(ctx, dir).await,
         "alignment-iteration" => alignment_iteration::run(ctx, dir).await,

@@ -78,7 +78,7 @@ categories:
 | `breakdown` | a cost-tree subtree by leaf position | `cost_log` + manifest labels |
 | `optimality` | distance from optimal GPU·s as a lower-bound ladder | `cost_log` + manifest + `run_meta` GPU counts + `gpu/spec.json` |
 | `conservation` | run-wide work accounting | `cost_log` vs `request_slo` |
-| `concurrency` | system over request lifecycle time | `request_slo` arrival and terminal events |
+| `concurrency` | system, pool, or worker request populations over lifecycle time | `request_slo` arrival/terminal events and optional stage-transition timelines |
 | `kv` | a KV pool over time | `kv_snapshot` + `run_meta` capacity |
 | `alignment-iteration` | one measured iteration joined to one predict case | normalized NSYS + predict `cost_log`/manifest + mapping |
 | `alignment-e2e` | one measured/simulated latency distribution | TraceLab replay JSONL + optional vLLM EngineCore request-timing JSONL + sim `request_slo` |

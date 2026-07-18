@@ -20,6 +20,7 @@ from backend import kernel_input_distribution_plot
 from batch import kernel_throughput_plot, scatter_plot
 from breakdown import kernel_time_share_plot
 from conservation import workload_plot
+from concurrency import request_state_plot
 from concurrency import series_plot as concurrency_plot
 from kv import kv_occupancy_plot
 from optimality import optimality_plot
@@ -40,6 +41,7 @@ RENDERERS = {
     "kernel-time-share": kernel_time_share_plot.render,
     "optimality": optimality_plot.render,
     "concurrency": concurrency_plot.render,
+    "request-state": request_state_plot.render,
     "workload-conservation": workload_plot.render,
     "kv-occupancy": kv_occupancy_plot.render,
     "alignment-iteration": alignment_iteration_plot.render,

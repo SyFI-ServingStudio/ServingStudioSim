@@ -141,7 +141,7 @@ rust/                The `analyze` binary (DataFusion compute side).
                        grid_peaks.rs sidecar (sim `kernel-query peak`) + spec.rs roofline.
   src/kernel_query.rs  Shared transport to the sim `kernel-query` subcommand (grid/eval/peak).
   src/conservation/    Run-wide work-accounting checks (actual vs expected).
-  src/concurrency/     Run-level in-flight requests over simulated wall-clock time.
+  src/concurrency/     In-flight concurrency and hierarchical request-stage populations over simulated wall-clock time.
   src/kv/              Per-pool KV-cache occupancy over time.
   src/alignment_iteration/  Per-iteration total/operation/kernel comparison.
   src/alignment_e2e/        Paired request latency + completion throughput.
@@ -182,6 +182,7 @@ Current catalog:
 | `kernel-time-share` | breakdown | `cost_log` slot times + matching CostTree manifests | root kernel-time share by leaf position at overall / pool / worker levels; exact on small runs and bounded worker-stratified sampling on large runs |
 | `optimality` | optimality | `cost_log` (exact R0/R1 + 1/stride-sampled fold) + CostTree manifests + `run_meta` `gpu_ids` counts + `gpu/spec.json` roofline + `raw/kernel_grid_peaks.json` sidecar | sub-optimality waterfall in GPU·s — telescoping buckets at cluster / pool / worker / iteration / per-kernel levels, plus per-worker R0→R5 stacked-kernel ladders with aggregate idle/imbalance chunks / `optimality_waterfall` |
 | `concurrency` | concurrency | `request_slo.parquet` arrival + terminal timestamps | exact request count/peak/mean / <=512-bin time-weighted active-request series |
+| `request-state` | concurrency | `request_slo.parquet` stage-transition lists + `run_meta.json` stage vocab/worker roster | exact category/pending peaks and means / 200-bin cluster category stack plus pool/worker pending series; unavailable when stage logging is off |
 | `workload-conservation` | conservation | `cost_log` actuals + `request_slo.parquet` per-request expected | run-wide prefill/decode/FFN/KV work accounting, pass/fail / `workload_conservation_checks` |
 | `kv-occupancy` | kv | `kv_snapshot` stream + `run_meta.json` capacity | per-pool KV occupancy (active / projected-peak / promised tokens, and as a fraction of capacity) over time / `kv_occupancy_series` |
 | `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping + simulation `gpu_time_multiplier` | kernel/mapping error stats / separate kernel-busy and measured first-kernel-to-next-first-kernel GPU-cycle overviews + per-iteration mapped stacks |

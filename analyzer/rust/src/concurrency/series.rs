@@ -199,7 +199,13 @@ fn build_series(events: &[Event], max_points: usize) -> Result<Option<Concurrenc
     }))
 }
 
-fn add_interval_area(bins: &mut [f64], bin_width: f64, start_ms: f64, end_ms: f64, active: f64) {
+pub(crate) fn add_interval_area(
+    bins: &mut [f64],
+    bin_width: f64,
+    start_ms: f64,
+    end_ms: f64,
+    active: f64,
+) {
     let first_bin = ((start_ms / bin_width).floor() as usize).min(bins.len() - 1);
     let last_bin = (((end_ms / bin_width).ceil() as usize).saturating_sub(1)).min(bins.len() - 1);
     for (bin, area) in bins
