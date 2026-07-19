@@ -1,6 +1,6 @@
 //! Shared L5 primitives: KV resource + per-group container + the two pure
 //! policies. See L5 design.md §2. These helpers are shared by barebone, HP/DP,
-//! and PD workers: per-group `Batch`, `Strict` / `Tentative` admission, and
+//! and PD workers: per-group `Batch`, strict KV admission, and
 //! `Single` / `RoundRobin` load balance. Reentry / chunked-prefill fields from
 //! §2.2 are omitted until those features land (§3.6 / §3.7).
 //!
@@ -266,19 +266,13 @@ impl Batch {
 #[derive(Clone, Copy, Debug)]
 pub enum KvAdmission {
     Strict,
-    Tentative { headroom_tokens: u64 },
 }
 
 impl KvAdmission {
     /// Will `(p + d)` tokens fit on top of the group's projected peak and the
     /// already-promised (admitted-not-yet-realized) tokens?
     pub fn try_admit(&self, group: &Batch, group_promised: u64, p: u32, d: u32) -> bool {
-        let cap = match self {
-            Self::Strict => group.kv.kv_capacity,
-            Self::Tentative { headroom_tokens } => {
-                group.kv.kv_capacity.saturating_sub(*headroom_tokens)
-            }
-        };
+        let admission_capacity = group.kv.kv_capacity;
         let demand = group_promised + (p + d) as u64;
         // `projected_peak` is always ≥ `active_kv` (it starts there and only
         // takes max), so `active_kv + demand ≤ cap` is a *necessary* condition
@@ -287,10 +281,10 @@ impl KvAdmission {
         // rejected almost every iteration) this skips the sort entirely, while
         // the exact peak is still computed whenever a freed slot makes the cheap
         // bound pass. Decision is identical to computing the peak unconditionally.
-        if group.kv.active_kv + demand > cap {
+        if group.kv.active_kv + demand > admission_capacity {
             return false;
         }
-        group.projected_peak_kv() + demand <= cap
+        group.projected_peak_kv() + demand <= admission_capacity
     }
 }
 
