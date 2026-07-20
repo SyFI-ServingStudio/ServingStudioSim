@@ -24,6 +24,7 @@ use crate::worker::admission_helpers::{prefill_fits_budget, Batch, LoadBalance};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
+use crate::worker::prefix_cache::PrefixCache;
 use crate::worker::types::{
     BatchFsmState, IterCursor, WorkerConfig, WorkerEventCommon, WorkerFsmState, WorkerMsgCommon,
     WorkerStatus,
@@ -35,6 +36,12 @@ struct HpRuntime {
     pending_prefills: VecDeque<RequestId>,
     promised: HashMap<RequestId, (u16, u64)>,
     request_to_group: HashMap<RequestId, u16>,
+    /// KV-offloaded (preempted) decodes per group, FIFO `(rid, kv_tokens)`.
+    swapped: Vec<VecDeque<(RequestId, u64)>>,
+    /// Host-pool bytes holding swapped KV (shared across groups).
+    host_used_bytes: u64,
+    /// Swap transfer time accrued since last iteration start (see barebone).
+    pending_transfer: Time,
     iter_counter: u32,
     iter_compute_start: Time,
     worker_fsm_state: WorkerFsmState,
@@ -43,11 +50,14 @@ struct HpRuntime {
 }
 
 impl HpRuntime {
-    fn new(balance: LoadBalance) -> Self {
+    fn new(balance: LoadBalance, num_groups: usize) -> Self {
         Self {
             pending_prefills: VecDeque::new(),
             promised: HashMap::new(),
             request_to_group: HashMap::new(),
+            swapped: (0..num_groups).map(|_| VecDeque::new()).collect(),
+            host_used_bytes: 0,
+            pending_transfer: Time::ZERO,
             iter_counter: 0,
             iter_compute_start: Time::ZERO,
             worker_fsm_state: WorkerFsmState::Idle,
@@ -73,6 +83,9 @@ pub struct HpUnifiedWorker<M: IterwiseUnifiedModel> {
     /// Per-worker KV occupancy sampler (one stream, per-group rows); `None` when no
     /// log dir. The worker only `submit`s — throttle + running-max live in `KvSampler`.
     kv: Option<KvSampler>,
+    /// Session-scoped prefix-cache model, one per DP group (each shard retains
+    /// its own sessions' KV); empty when disabled = legacy always-hit replay.
+    prefix_caches: Vec<PrefixCache>,
 }
 
 impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
@@ -98,8 +111,9 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         // KvPool capacity in tokens — see `unified::new` for the derivation.
         // `attn_kv_bytes` is per-GPU; one attn shard spans `num_attn_shards()`
         // GPUs; the model's `total_kv_bytes_per_token` is summed across them.
-        let group_kv_bytes =
-            config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
+        let group_kv_bytes = config
+            .attn_kv_bytes
+            .saturating_mul(model.num_attn_shards().max(1) as u64);
         let kv_capacity = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
         let batches: Vec<Batch> = (0..num_groups)
             .map(|g| Batch::new(g as u16, kv_capacity))
@@ -126,17 +140,30 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             LoadBalance::Single if num_groups > 1 => LoadBalance::RoundRobin { next: 0 },
             other => other,
         };
-        let cost =
-            CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref(), config.gpu_time_multiplier);
+        let cost = CostBuffers::new_iter(
+            cost_log_dir,
+            pool_tag,
+            id,
+            model.as_ref(),
+            config.gpu_time_multiplier,
+        );
+        let prefix_caches = match config.prefix_cache_bytes {
+            Some(b) => {
+                let tokens = b / model.total_kv_bytes_per_token().max(1);
+                (0..num_groups).map(|_| PrefixCache::new(tokens)).collect()
+            }
+            None => Vec::new(),
+        };
         Self {
             id,
             model,
             requests,
             config,
-            runtime: HpRuntime::new(balance),
+            runtime: HpRuntime::new(balance, num_groups),
             batches,
             cost,
             kv,
+            prefix_caches,
         }
     }
 
@@ -200,7 +227,85 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
 
     // ── Stage 1: form_batch — admit one fresh prefill into a balance-chosen group ─
 
+    /// Per-group KV-offload step (see the barebone `drive_kv_offload` for the
+    /// policy; the host pool budget is shared across groups).
+    fn drive_kv_offload(&mut self) {
+        let Some(off) = self.config.kv_offload else {
+            return;
+        };
+        let bytes_per_token = self.model.total_kv_bytes_per_token().max(1);
+        let transfer_time =
+            |bytes: u64| -> Time { Time::from_ms(bytes as f64 / (off.host_bw_gbps * 1e9) * 1e3) };
+        for g in 0..self.batches.len() {
+            // (1) swap-in, FIFO.
+            while let Some(&(rid, kv_tokens)) = self.runtime.swapped[g].front() {
+                let remaining = {
+                    let store = self.requests.borrow();
+                    let r = &store[rid];
+                    r.decode_len.saturating_sub(r.tokens_emitted)
+                };
+                let group_promised = self.group_promised_kv(g as u16);
+                if !self.config.admission.try_admit(
+                    &self.batches[g],
+                    group_promised,
+                    kv_tokens as u32,
+                    remaining,
+                ) {
+                    break;
+                }
+                self.runtime.swapped[g].pop_front();
+                let bytes = kv_tokens.saturating_mul(bytes_per_token);
+                self.runtime.host_used_bytes = self.runtime.host_used_bytes.saturating_sub(bytes);
+                self.runtime.pending_transfer =
+                    self.runtime.pending_transfer + transfer_time(bytes);
+                self.batches[g].finalize_to_decode(rid, kv_tokens, remaining);
+                self.runtime.request_to_group.insert(rid, g as u16);
+            }
+        }
+        // (2) swap-out for a blocked-but-feasible pending head, on the group RR
+        // would route it to (peek without advancing the cursor).
+        let Some(&head) = self.runtime.pending_prefills.front() else {
+            return;
+        };
+        let (p, d, prefix) = {
+            let store = self.requests.borrow();
+            let r = &store[head];
+            (r.prompt_len, r.decode_len, r.prefix_kv)
+        };
+        let g = self.runtime.balance.peek(self.batches.len());
+        let demand = u64::from(p) + u64::from(prefix) + u64::from(d);
+        if demand > self.batches[g].kv.kv_capacity {
+            return;
+        }
+        loop {
+            let group_promised = self.group_promised_kv(g as u16);
+            if self
+                .config
+                .admission
+                .try_admit(&self.batches[g], group_promised, p + prefix, d)
+            {
+                break;
+            }
+            let Some(&(victim, ref state)) = self.batches[g].decodes.last() else {
+                break;
+            };
+            let kv = state.current_kv;
+            let bytes = kv.saturating_mul(bytes_per_token);
+            if self.runtime.host_used_bytes + bytes > off.host_capacity_bytes {
+                break;
+            }
+            self.batches[g].release(victim, kv);
+            self.runtime.swapped[g].push_back((victim, kv));
+            self.runtime.host_used_bytes += bytes;
+            self.runtime.pending_transfer = self.runtime.pending_transfer + transfer_time(bytes);
+        }
+    }
+
     fn form_batch(&mut self) -> bool {
+        self.drive_kv_offload();
+        if let Some(cap) = self.config.chunk_prefill_tokens {
+            return self.form_batch_chunked(cap);
+        }
         let had_decode = self
             .batches
             .iter()
@@ -213,20 +318,23 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         match self.config.max_batch_tokens {
             None => {
                 if let Some(&rid) = self.runtime.pending_prefills.front() {
-                    let (p, d) = {
+                    let (p, d, prefix) = {
                         let store = self.requests.borrow();
                         let r = &store[rid];
-                        (r.prompt_len, r.decode_len)
+                        (r.prompt_len, r.decode_len, r.prefix_kv)
                     };
                     let gid = self.runtime.balance.choose(self.batches.len()) as u16;
                     let group_promised = self.group_promised_kv(gid);
-                    if self
-                        .config
-                        .admission
-                        .try_admit(&self.batches[gid as usize], group_promised, p, d)
-                    {
+                    // The trace-declared cached prefix occupies KV alongside the
+                    // prefilled prompt, so the gate demands `p + prefix`.
+                    if self.config.admission.try_admit(
+                        &self.batches[gid as usize],
+                        group_promised,
+                        p + prefix,
+                        d,
+                    ) {
                         self.runtime.pending_prefills.pop_front();
-                        self.promise(gid, rid, p, d, 0);
+                        self.promise(gid, rid, p, d, prefix);
                     }
                 }
             }
@@ -240,10 +348,10 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                     .collect();
                 let mut admitted = vec![0u32; n];
                 while let Some(&rid) = self.runtime.pending_prefills.front() {
-                    let (p, d) = {
+                    let (p, d, prefix) = {
                         let store = self.requests.borrow();
                         let r = &store[rid];
-                        (r.prompt_len, r.decode_len)
+                        (r.prompt_len, r.decode_len, r.prefix_kv)
                     };
                     // RR picks the head's target group; if that group can't take it
                     // (its own budget or the KV gate), stop — the head waits for a
@@ -255,15 +363,16 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                         break;
                     }
                     let group_promised = self.group_promised_kv(gid);
-                    if !self
-                        .config
-                        .admission
-                        .try_admit(&self.batches[g], group_promised, p, d)
-                    {
+                    if !self.config.admission.try_admit(
+                        &self.batches[g],
+                        group_promised,
+                        p + prefix,
+                        d,
+                    ) {
                         break;
                     }
                     self.runtime.pending_prefills.pop_front();
-                    self.promise(gid, rid, p, d, 0);
+                    self.promise(gid, rid, p, d, prefix);
                     admitted[g] += p;
                 }
             }
@@ -274,6 +383,96 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         let had_prefill = self.batches.iter().any(|b| !b.prefill_admits.is_empty());
 
         if !had_decode && !had_prefill {
+            return false;
+        }
+        self.runtime.iter_counter += 1;
+        true
+    }
+
+    /// Chunked-prefill batch formation, applied PER DP group: each group has a
+    /// HARD `cap`-token iteration budget (its live decodes reserve 1 token
+    /// each), dealt FIFO to in-flight partial prefills then fresh admissions
+    /// (RR-routed to a group, KV-gated on the full context). See the barebone
+    /// `form_batch_chunked` for the single-group semantics this mirrors.
+    fn form_batch_chunked(&mut self, cap: u32) -> bool {
+        let had_decode = self
+            .batches
+            .iter()
+            .any(|b| b.iter_decoding().next().is_some());
+        let n = self.batches.len();
+        let decode_tokens: Vec<u32> = self
+            .batches
+            .iter()
+            .map(|b| b.iter_decoding().count() as u32)
+            .collect();
+
+        // Fresh admissions: RR picks the head's target group; admit while that
+        // group still has chunk budget beyond its in-flight partials' demand.
+        // Naive like the legacy path: a blocked head stops admission this iter.
+        let mut left: Vec<u32> = (0..n)
+            .map(|g| {
+                let inflight: u32 = {
+                    let store = self.requests.borrow();
+                    self.batches[g]
+                        .prefill_admits
+                        .iter()
+                        .map(|&rid| {
+                            let r = &store[rid];
+                            r.prefill_target.saturating_sub(r.prefill_processed)
+                        })
+                        .sum()
+                };
+                cap.saturating_sub(decode_tokens[g])
+                    .saturating_sub(inflight.min(cap))
+            })
+            .collect();
+        while let Some(&rid) = self.runtime.pending_prefills.front() {
+            let (p, d, prefix) = {
+                let store = self.requests.borrow();
+                let r = &store[rid];
+                (r.prompt_len, r.decode_len, r.prefix_kv)
+            };
+            let gid = self.runtime.balance.choose(n) as u16;
+            let g = gid as usize;
+            if left[g] == 0 {
+                break;
+            }
+            let group_promised = self.group_promised_kv(gid);
+            if !self
+                .config
+                .admission
+                .try_admit(&self.batches[g], group_promised, p + prefix, d)
+            {
+                break;
+            }
+            self.runtime.pending_prefills.pop_front();
+            self.promise(gid, rid, p, d, prefix);
+            left[g] = left[g].saturating_sub(p.min(left[g]));
+        }
+        self.drain_promises_into_admits();
+
+        // Deal chunks FIFO per group (partials first — retained in admission
+        // order across iterations). Force-deal one chunk on an otherwise-empty
+        // worker so a decode-free, budget-starved iter can't stall forever.
+        let mut dealt_any = false;
+        for g in 0..n {
+            let mut budget = cap.saturating_sub(decode_tokens[g]);
+            let mut store = self.requests.borrow_mut();
+            for &rid in &self.batches[g].prefill_admits {
+                let r = &mut store[rid];
+                let remaining = r.prefill_target.saturating_sub(r.prefill_processed);
+                let chunk = if budget == 0 && !dealt_any && !had_decode {
+                    remaining.min(cap)
+                } else {
+                    remaining.min(budget)
+                };
+                r.active_chunk_len = chunk;
+                budget = budget.saturating_sub(chunk);
+                dealt_any |= chunk > 0;
+            }
+        }
+
+        if !had_decode && !dealt_any {
             return false;
         }
         self.runtime.iter_counter += 1;
@@ -291,7 +490,10 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             now,
         );
         self.runtime.iter_compute_start = now;
-        now + cost_time
+        // Swap traffic (KV offload) stalls the worker (see barebone start_iter).
+        let transfer = self.runtime.pending_transfer;
+        self.runtime.pending_transfer = Time::ZERO;
+        now + cost_time + transfer
     }
 
     // ── Stage 3: complete_iter — same bookkeeping as barebone, per group ────────
@@ -320,20 +522,29 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             // (b) bump KV for every live decode.
             self.batches[gid].advance_decodes();
 
-            // (c) prefills resolved → first token; complete now or enter decode set.
-            // Iterate `prefill_admits` in place (cleared below after the deferred
-            // finalize) instead of cloning it.
+            // (c) prefills advance by this iter's chunk; a request whose target
+            // is reached resolves to first token, an unfinished chunked partial
+            // stays admitted. Whole-prefill mode deals the full target as one
+            // chunk, so "advance + check target" covers both modes.
             let mut to_finalize: Vec<(RequestId, u64, u32)> = Vec::new();
+            let mut still_prefilling: Vec<RequestId> = Vec::new();
             {
                 let mut store = self.requests.borrow_mut();
                 for &rid in &self.batches[gid].prefill_admits {
                     let r = &mut store[rid];
-                    r.prefill_processed = r.prompt_len;
+                    r.prefill_processed += r.active_chunk_len;
+                    r.active_chunk_len = 0;
+                    if r.is_prefill() {
+                        still_prefilling.push(rid);
+                        continue;
+                    }
                     r.record_first_token(now, log_tokens);
                     if r.is_complete() {
                         completed.push(rid);
                     } else {
-                        let kv = (r.prompt_len + r.prefix_kv) as u64;
+                        // Full context: recomputed miss tokens live inside
+                        // prefill_target.
+                        let kv = (r.prefill_target + r.prefix_kv) as u64;
                         let remaining = r.decode_len.saturating_sub(r.tokens_emitted);
                         to_finalize.push((rid, kv, remaining));
                     }
@@ -342,10 +553,21 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             for (rid, kv, remaining) in to_finalize {
                 self.batches[gid].finalize_to_decode(rid, kv, remaining);
             }
-            self.batches[gid].prefill_admits.clear();
+            self.batches[gid].prefill_admits = still_prefilling;
 
-            // (d) emit + release completed requests.
+            // (d) emit + release completed requests; retain the freed context in
+            // the group's session prefix cache.
             for rid in completed {
+                if let Some(cache) = self.prefix_caches.get_mut(gid) {
+                    let store = self.requests.borrow();
+                    let r = &store[rid];
+                    if let Some(session) = r.session {
+                        let ctx = u64::from(r.prefill_target)
+                            + u64::from(r.prefix_kv)
+                            + u64::from(r.tokens_emitted);
+                        cache.insert(session, ctx);
+                    }
+                }
                 let current_kv = self.batches[gid]
                     .decodes
                     .iter()
@@ -383,7 +605,12 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             let mut prefill_tokens = 0u32;
             for &rid in &b.prefill_admits {
                 let r = &store[rid];
-                prefill_chunk_pairs.push((r.prefix_kv, r.active_chunk_len));
+                if r.active_chunk_len == 0 {
+                    continue; // chunked partial with no budget this iter
+                }
+                // Already-processed chunks are cached context: they join the
+                // trace-declared prefix on the attention side.
+                prefill_chunk_pairs.push((r.prefix_kv + r.prefill_processed, r.active_chunk_len));
                 prefill_tokens += r.active_chunk_len;
             }
 
@@ -420,8 +647,19 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         let mut store = self.requests.borrow_mut();
         store.mark_admitted(rid);
         let r = &mut store[rid];
-        r.active_chunk_len = p;
-        r.prefix_kv = prefix;
+        // Prefix-cache model (per DP group): the declared prefix only hits up
+        // to what this session left resident on the serving group; the
+        // shortfall is recomputed. See the barebone worker's `promise`.
+        let hit = match (self.prefix_caches.get_mut(gid as usize), r.session) {
+            (Some(cache), Some(session)) => cache.lookup_touch(session, prefix),
+            (Some(_), None) => 0,
+            (None, _) => prefix,
+        };
+        r.prefix_kv = hit;
+        r.prefill_target = p + (prefix - hit);
+        // Whole-prefill mode runs the full target as one chunk; chunked mode
+        // overwrites this in the dealing pass.
+        r.active_chunk_len = r.prefill_target;
     }
 
     fn drain_promises_into_admits(&mut self) {

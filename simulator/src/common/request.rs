@@ -19,6 +19,15 @@ pub struct Request {
     pub id: RequestId,
     pub prompt_len: u32,
     pub decode_len: u32,
+    /// KV tokens already cached for this request at arrival (a trace-declared
+    /// prefix-cache hit). `prompt_len` counts only the uncached suffix that is
+    /// actually prefilled; the prefix still occupies KV and is attended over.
+    pub prefix_kv: u32,
+    /// Session this request belongs to (trace `session_id` column). Groups the
+    /// sequential calls of one agent/user conversation: the prefix-cache model
+    /// keys retained KV by session, and `session-sticky` placement routes a
+    /// session to one worker. `None` = sessionless (always treated cold).
+    pub session: Option<u32>,
     pub arrival_time: Time,
 }
 
@@ -28,8 +37,23 @@ impl Request {
             id,
             prompt_len,
             decode_len,
+            prefix_kv: 0,
+            session: None,
             arrival_time,
         }
+    }
+
+    /// Trace rows may declare an already-cached prefix (frontend `prefix_kv`
+    /// column); workers seed their admission prefix from it.
+    pub const fn with_prefix_kv(mut self, prefix_kv: u32) -> Self {
+        self.prefix_kv = prefix_kv;
+        self
+    }
+
+    /// Trace rows may declare a session id (frontend `session_id` column).
+    pub const fn with_session(mut self, session: Option<u32>) -> Self {
+        self.session = session;
+        self
     }
 }
 
@@ -43,10 +67,16 @@ pub struct RequestRecord {
     pub prompt_len: u32,
     pub decode_len: u32,
     pub arrival_time: Time,
+    /// See [`Request::session`].
+    pub session: Option<u32>,
 
     // ── FSM working fields (mutated by the worker) ──
-    /// Prefill tokens already processed; `== prompt_len` once prefill is done.
+    /// Prefill tokens already processed; `== prefill_target` once prefill is done.
     pub prefill_processed: u32,
+    /// Tokens this request must prefill. Starts at `prompt_len`; a prefix-cache
+    /// MISS at admission raises it by the missed prefix (those tokens must be
+    /// recomputed) while `prompt_len` stays the immutable arrival fact.
+    pub prefill_target: u32,
     /// KV (tokens) already present from prior rounds this request builds on.
     pub prefix_kv: u32,
     /// Tokens this request contributes to the current iter (prefill chunk len
@@ -69,8 +99,10 @@ impl RequestRecord {
             prompt_len: req.prompt_len,
             decode_len: req.decode_len,
             arrival_time: req.arrival_time,
+            session: req.session,
             prefill_processed: 0,
-            prefix_kv: 0,
+            prefill_target: req.prompt_len,
+            prefix_kv: req.prefix_kv,
             active_chunk_len: 0,
             first_token_time: None,
             last_token_time: None,
@@ -81,7 +113,7 @@ impl RequestRecord {
     }
 
     pub fn is_prefill(&self) -> bool {
-        self.prefill_processed < self.prompt_len
+        self.prefill_processed < self.prefill_target
     }
 
     pub fn is_complete(&self) -> bool {
@@ -95,12 +127,18 @@ impl RequestRecord {
         self.tokens_emitted = 1;
         self.first_token_time = Some(now);
         self.last_token_time = Some(now);
+        if self.is_complete() {
+            // A decode_len==1 request is done at its first token; mirror
+            // `record_token` so the completed flag can't go stale.
+            self.completed = true;
+        }
         if log_tokens {
             // The full decode length is known up front, so size the per-token
             // buffer exactly once here (only for requests that actually start
             // decoding) — the alternative is ~log2(decode_len) doubling reallocs
             // per request, each memcpy'ing the growing array.
-            self.output_token_times.reserve_exact(self.decode_len as usize);
+            self.output_token_times
+                .reserve_exact(self.decode_len as usize);
             self.output_token_times.push(now);
         }
     }

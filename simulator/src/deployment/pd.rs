@@ -66,8 +66,18 @@ impl Deployment for PdDeployment {
         let prefill_cfg = pool_cfg(PD_PREFILL_POOL, pg.replicas, cfg.pools.prefill.placement);
         let decode_cfg = pool_cfg(PD_DECODE_POOL, dg.replicas, cfg.pools.decode.placement);
 
-        let prefill_wc = worker_config(&pg.worker, &cfg.io.log_dir, cfg.io.log_output_token_times, cfg.io.kv_log_stride);
-        let decode_wc = worker_config(&dg.worker, &cfg.io.log_dir, cfg.io.log_output_token_times, cfg.io.kv_log_stride);
+        let prefill_wc = worker_config(
+            &pg.worker,
+            &cfg.io.log_dir,
+            cfg.io.log_output_token_times,
+            cfg.io.kv_log_stride,
+        );
+        let decode_wc = worker_config(
+            &dg.worker,
+            &cfg.io.log_dir,
+            cfg.io.log_output_token_times,
+            cfg.io.kv_log_stride,
+        );
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
 
         // The KV-transfer cost source: the profiled inter-node p2p curve, keyed
@@ -84,12 +94,26 @@ impl Deployment for PdDeployment {
                 IterArchSel::Llama3DenseTp { tp_size: dtp, .. },
             ) => {
                 let prefill_model = {
-                    let _scope = bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
-                    Arc::new(arch_build::dense_tp(pg.arch.model(), *ptp, &pg.gpu, MODEL_NAME, bridge)?)
+                    let _scope =
+                        bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
+                    Arc::new(arch_build::dense_tp(
+                        pg.arch.model(),
+                        *ptp,
+                        &pg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
                 };
                 let decode_model = {
-                    let _scope = bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
-                    Arc::new(arch_build::dense_tp(dg.arch.model(), *dtp, &dg.gpu, MODEL_NAME, bridge)?)
+                    let _scope =
+                        bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
+                    Arc::new(arch_build::dense_tp(
+                        dg.arch.model(),
+                        *dtp,
+                        &dg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
                 };
                 Ok(assemble_pd_flow(
                     prefill_model,
@@ -117,11 +141,19 @@ impl Deployment for PdDeployment {
                 },
             ) => {
                 let prefill_model = {
-                    let _scope = bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
-                    Arc::new(arch_build::dense_tp(pg.arch.model(), *ptp, &pg.gpu, MODEL_NAME, bridge)?)
+                    let _scope =
+                        bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
+                    Arc::new(arch_build::dense_tp(
+                        pg.arch.model(),
+                        *ptp,
+                        &pg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
                 };
                 let decode_model = {
-                    let _scope = bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
+                    let _scope =
+                        bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
                     Arc::new(arch_build::dp_attn_tp_ffn(
                         dg.arch.model(),
                         *attn_tp_size,
@@ -302,5 +334,6 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+        PlacementPolicy::SessionSticky => DpPlacementPolicy::SessionSticky,
     }
 }

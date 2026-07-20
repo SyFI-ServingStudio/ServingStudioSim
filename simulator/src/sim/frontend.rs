@@ -16,9 +16,13 @@
 //! tally of its own.
 //!
 //! Single-round shape (mirrors `ref/moesim-rs/src/trace/mod.rs`):
-//! `id,input_len,output_len,arrival_time`. Multi-round (a `round_idx` column)
-//! is rejected — per-round `Request` allocation + continuation linkage is
-//! deferred (see L7 design §3.2/§3.3).
+//! `id,input_len,output_len,arrival_time`, plus an optional `prefix_kv` column
+//! declaring KV tokens already cached at arrival (a prefix-cache hit measured
+//! by the trace producer): `input_len` then counts only the uncached suffix
+//! that is actually prefilled, while `prefix_kv` still occupies KV and is
+//! attended over. Absent column = 0 (no cached prefix). Multi-round (a
+//! `round_idx` column) is rejected — per-round `Request` allocation +
+//! continuation linkage is deferred (see L7 design §3.2/§3.3).
 
 use std::path::{Path, PathBuf};
 
@@ -34,6 +38,13 @@ pub struct TraceEntry {
     pub input_len: u32,
     pub output_len: u32,
     pub arrival_time: f64,
+    /// KV tokens already cached at arrival (optional column; default 0).
+    #[serde(default)]
+    pub prefix_kv: u32,
+    /// Session this request belongs to (optional column). Enables the
+    /// prefix-cache model and `session-sticky` placement; absent = sessionless.
+    #[serde(default)]
+    pub session_id: Option<u32>,
 }
 
 /// Immutable arrival queue + a cursor into it, plus the in-flight ledger.
@@ -140,7 +151,9 @@ impl TraceFrontend {
                 }
             };
             let e = &self.entries[self.cursor];
-            let req = Request::new(RequestId(e.id), e.input_len, e.output_len, arrival);
+            let req = Request::new(RequestId(e.id), e.input_len, e.output_len, arrival)
+                .with_prefix_kv(e.prefix_kv)
+                .with_session(e.session_id);
             self.cursor += 1;
             emit(req);
         }
@@ -299,6 +312,34 @@ mod tests {
             "id,input_len,output_len,arrival_time\n0,8,2,0.0\n",
         );
         assert!(TraceFrontend::load(&[path], 0.0, None).is_err());
+    }
+
+    #[test]
+    fn prefix_kv_column_is_optional_and_passed_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_csv(
+            dir.path(),
+            "pfx.csv",
+            "id,input_len,output_len,arrival_time,prefix_kv\n\
+             0,8,2,0.0,0\n\
+             1,16,4,1.0,4096\n",
+        );
+        let mut fe = TraceFrontend::load(&[path], 1.0, None).unwrap();
+        let mut reqs = Vec::new();
+        fe.drain_due(Time::from_ms(10.0), |r| reqs.push(r));
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].prefix_kv, 0);
+        assert_eq!(reqs[1].prefix_kv, 4096);
+        // 4-column traces (no prefix_kv header) default the field to 0.
+        let p4 = write_csv(
+            dir.path(),
+            "p4.csv",
+            "id,input_len,output_len,arrival_time\n0,8,2,0.0\n",
+        );
+        let mut fe4 = TraceFrontend::load(&[p4], 1.0, None).unwrap();
+        let mut r4 = Vec::new();
+        fe4.drain_due(Time::from_ms(0.0), |r| r4.push(r));
+        assert_eq!(r4[0].prefix_kv, 0);
     }
 
     #[test]

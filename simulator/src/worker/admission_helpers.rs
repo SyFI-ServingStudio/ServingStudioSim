@@ -57,12 +57,10 @@ impl KvPool {
     /// decodes that finished before `t` released their KV (`kv_prefix[k]`).
     /// Sampling makes this a heuristic guard, not an exact bound. O(n log n).
     /// (§2.1)
-    pub fn projected_peak<'a>(
-        &self,
-        decodes: impl Iterator<Item = &'a DecodeReqState>,
-    ) -> u64 {
-        let mut entries: Vec<(u32, u64)> =
-            decodes.map(|s| (s.remaining_decode, s.current_kv)).collect();
+    pub fn projected_peak<'a>(&self, decodes: impl Iterator<Item = &'a DecodeReqState>) -> u64 {
+        let mut entries: Vec<(u32, u64)> = decodes
+            .map(|s| (s.remaining_decode, s.current_kv))
+            .collect();
         if entries.is_empty() {
             return self.active_kv;
         }
@@ -165,7 +163,9 @@ impl Batch {
     /// is not in the decode set. Replaces a linear `decodes.iter().find` on the hot
     /// per-token attn-input path.
     pub fn decode_current_kv(&self, req_id: RequestId) -> Option<u64> {
-        self.index.get(&req_id).map(|&i| self.decodes[i].1.current_kv)
+        self.index
+            .get(&req_id)
+            .map(|&i| self.decodes[i].1.current_kv)
     }
 
     /// Live decodes (those with tokens still to emit), in insertion order.
@@ -305,6 +305,14 @@ pub enum LoadBalance {
 }
 
 impl LoadBalance {
+    /// The group `choose` WOULD return, without advancing the cursor.
+    pub fn peek(&self, num_groups: usize) -> usize {
+        match self {
+            Self::Single => 0,
+            Self::RoundRobin { next } => (*next as usize) % num_groups,
+        }
+    }
+
     /// Returns the chosen group index (ignoring admittability).
     pub fn choose(&mut self, num_groups: usize) -> usize {
         match self {
@@ -400,8 +408,16 @@ mod tests {
         b.advance_subset(&[rid(1)]);
         let s1 = &b.decodes.iter().find(|(r, _)| *r == rid(1)).unwrap().1;
         let s2 = &b.decodes.iter().find(|(r, _)| *r == rid(2)).unwrap().1;
-        assert_eq!((s1.current_kv, s1.remaining_decode), (11, 2), "req 1 advanced");
-        assert_eq!((s2.current_kv, s2.remaining_decode), (20, 3), "req 2 untouched");
+        assert_eq!(
+            (s1.current_kv, s1.remaining_decode),
+            (11, 2),
+            "req 1 advanced"
+        );
+        assert_eq!(
+            (s2.current_kv, s2.remaining_decode),
+            (20, 3),
+            "req 2 untouched"
+        );
         assert_eq!(b.kv.active_kv, 31, "pool grew by exactly one token");
     }
 
@@ -477,7 +493,7 @@ mod tests {
     fn budget_reserves_decode_tokens_first() {
         // budget 12, 10 live decodes → prefill remainder = 2.
         assert!(prefill_fits_budget(12, 10, 0, 2)); // first 2-token prefill fits
-        // remainder exhausted and something already admitted → no force, reject.
+                                                    // remainder exhausted and something already admitted → no force, reject.
         assert!(!prefill_fits_budget(12, 10, 2, 1));
     }
 

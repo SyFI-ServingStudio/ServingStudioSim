@@ -41,6 +41,11 @@ fn default_gpu_time_multiplier() -> f64 {
     1.0
 }
 
+/// serde/param fallback for `kv_offload_bw_gbps`: ~PCIe gen5 x16 sustained.
+fn default_host_bw_gbps() -> f64 {
+    55.0
+}
+
 /// Iteration-wise worker provider.
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -63,6 +68,22 @@ pub enum IterWorkerSel {
         /// prefills to fit; this budget is soft — one whole prefill may exceed it.)
         #[serde(default)]
         max_batch_tokens: Option<u32>,
+        /// Session-scoped prefix-cache budget (GB). `Some`: a request's
+        /// trace-declared `prefix_kv` only hits up to what its session left
+        /// resident (LRU under this budget; misses are recomputed). `None` =
+        /// always-hit replay.
+        #[serde(default)]
+        prefix_cache_gb: Option<f64>,
+        /// KV-offload host pool (GB). `Some`: KV-blocked heads preempt the
+        /// newest decodes, swapping their KV to host and back (vLLM-style swap
+        /// space). `None` = no offload.
+        #[serde(default)]
+        kv_offload_host_gb: Option<f64>,
+        /// Host-link bandwidth (GB/s) pricing swap transfers (analytic; default
+        /// approximates PCIe gen5 x16). Only read when `kv_offload_host_gb` set.
+        #[serde(default = "default_host_bw_gbps")]
+        #[param(default = 55.0)]
+        kv_offload_bw_gbps: f64,
     },
     /// Multi-group HP/DP worker: maintains one `Batch` per attention DP shard
     /// (count comes from the arch's `num_attn_dp_groups`). Pairs with a DP-attention
@@ -82,6 +103,28 @@ pub enum IterWorkerSel {
         /// `Barebone::max_batch_tokens`. None = legacy one-prefill/iter.
         #[serde(default)]
         max_batch_tokens: Option<u32>,
+        /// Chunked-prefill mode, applied PER DP group: a HARD per-iteration
+        /// token cap that splits long prompts across iterations (decodes
+        /// reserve 1 token each first). Mutually exclusive with
+        /// `max_batch_tokens`. None = whole-prefill-in-one-iter.
+        #[serde(default)]
+        chunk_prefill_tokens: Option<u32>,
+        /// Session-scoped prefix-cache budget (GB). `Some`: a request's
+        /// trace-declared `prefix_kv` only hits up to what its session left
+        /// resident (LRU under this budget; misses are recomputed). `None` =
+        /// always-hit replay.
+        #[serde(default)]
+        prefix_cache_gb: Option<f64>,
+        /// KV-offload host pool (GB). `Some`: KV-blocked heads preempt the
+        /// newest decodes, swapping their KV to host and back (vLLM-style swap
+        /// space). `None` = no offload.
+        #[serde(default)]
+        kv_offload_host_gb: Option<f64>,
+        /// Host-link bandwidth (GB/s) pricing swap transfers (analytic; default
+        /// approximates PCIe gen5 x16). Only read when `kv_offload_host_gb` set.
+        #[serde(default = "default_host_bw_gbps")]
+        #[param(default = 55.0)]
+        kv_offload_bw_gbps: f64,
     },
     ChunkedPrefill {
         /// GPU memory for the worker (GB; primarily KV cache budget).
@@ -92,6 +135,12 @@ pub enum IterWorkerSel {
         /// How returning decode mixes with pending prefill.
         #[param(string, default = "mix", choices = BATCH_POLICY_CHOICES)]
         batch_policy: BatchPolicy,
+        /// Session-scoped prefix-cache budget (GB). `Some`: a request's
+        /// trace-declared `prefix_kv` only hits up to what its session left
+        /// resident (LRU under this budget; misses are recomputed). `None` =
+        /// always-hit replay.
+        #[serde(default)]
+        prefix_cache_gb: Option<f64>,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
