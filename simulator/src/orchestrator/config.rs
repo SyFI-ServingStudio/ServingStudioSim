@@ -27,9 +27,12 @@ use schema_derive::ParamStruct;
 pub enum PlacementPolicy {
     LeastQueued,
     RoundRobin,
+    /// Pin each session to one worker (prefix-cache locality); sessionless
+    /// requests place least-queued.
+    SessionSticky,
 }
 
-const PLACEMENT_CHOICES: [&str; 2] = ["least-queued", "round-robin"];
+const PLACEMENT_CHOICES: [&str; 3] = ["least-queued", "round-robin", "session-sticky"];
 
 /// One pool: a placement policy plus one-or-more homogeneous groups.
 #[derive(Debug, Clone, Deserialize, ParamStruct)]

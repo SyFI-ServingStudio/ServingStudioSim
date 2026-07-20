@@ -26,6 +26,8 @@ use crate::orchestrator::{
     UnifiedWorkerFactory,
 };
 use crate::timing::PerfApiBridge;
+use crate::worker::config::BatchPolicy;
+use crate::worker::types::KvOffloadConfig;
 use crate::worker::{BareboneWorker, HpUnifiedWorker, IterWorker, IterWorkerSel, WorkerConfig};
 
 use super::Deployment;
@@ -59,20 +61,76 @@ impl Deployment for UnifiedDeployment {
         // L5 worker env: `attn_kv_bytes` sizes the worker's KvPool, and
         // `log_output_token_times` controls request_slo detail logging. The
         // worker *type* is matched against the arch in the arms below.
-        // chunked_prefill is not wired yet.
-        let (attn_gpu_memory_gb, gpu_time_multiplier, max_batch_tokens) = match &g.worker {
+        let (
+            attn_gpu_memory_gb,
+            gpu_time_multiplier,
+            max_batch_tokens,
+            chunk_prefill_tokens,
+            prefix_cache_gb,
+            kv_offload,
+        ) = match &g.worker {
             IterWorkerSel::Barebone {
                 attn_gpu_memory_gb,
                 gpu_time_multiplier,
                 max_batch_tokens,
-            }
-            | IterWorkerSel::HpUnified {
+                prefix_cache_gb,
+                kv_offload_host_gb,
+                kv_offload_bw_gbps,
+            } => (
+                *attn_gpu_memory_gb,
+                *gpu_time_multiplier,
+                *max_batch_tokens,
+                None,
+                *prefix_cache_gb,
+                kv_offload_host_gb.map(|gb| KvOffloadConfig {
+                    host_capacity_bytes: (gb * 1e9) as u64,
+                    host_bw_gbps: *kv_offload_bw_gbps,
+                }),
+            ),
+            IterWorkerSel::HpUnified {
                 attn_gpu_memory_gb,
                 gpu_time_multiplier,
                 max_batch_tokens,
-            } => (*attn_gpu_memory_gb, *gpu_time_multiplier, *max_batch_tokens),
-            IterWorkerSel::ChunkedPrefill { .. } => {
-                bail!("unified: chunked_prefill worker not wired yet")
+                chunk_prefill_tokens,
+                prefix_cache_gb,
+                kv_offload_host_gb,
+                kv_offload_bw_gbps,
+            } => {
+                ensure!(
+                        max_batch_tokens.is_none() || chunk_prefill_tokens.is_none(),
+                        "unified: hp_unified `max_batch_tokens` and `chunk_prefill_tokens` are mutually exclusive"
+                    );
+                (
+                    *attn_gpu_memory_gb,
+                    *gpu_time_multiplier,
+                    *max_batch_tokens,
+                    *chunk_prefill_tokens,
+                    *prefix_cache_gb,
+                    kv_offload_host_gb.map(|gb| KvOffloadConfig {
+                        host_capacity_bytes: (gb * 1e9) as u64,
+                        host_bw_gbps: *kv_offload_bw_gbps,
+                    }),
+                )
+            }
+            IterWorkerSel::ChunkedPrefill {
+                attn_gpu_memory_gb,
+                max_batch_tokens,
+                batch_policy,
+                prefix_cache_gb,
+                gpu_time_multiplier,
+            } => {
+                ensure!(
+                        *batch_policy == BatchPolicy::Mix,
+                        "unified: chunked_prefill batch_policy `{batch_policy:?}` not wired yet (only `mix`)"
+                    );
+                (
+                    *attn_gpu_memory_gb,
+                    *gpu_time_multiplier,
+                    None,
+                    Some(*max_batch_tokens),
+                    *prefix_cache_gb,
+                    None,
+                )
             }
             IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => {
                 bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
@@ -84,6 +142,9 @@ impl Deployment for UnifiedDeployment {
             kv_log_stride: cfg.io.kv_log_stride,
             gpu_time_multiplier,
             max_batch_tokens,
+            chunk_prefill_tokens,
+            prefix_cache_bytes: prefix_cache_gb.map(|gb| (gb * 1e9) as u64),
+            kv_offload,
             ..WorkerConfig::default()
         };
 
@@ -112,7 +173,9 @@ impl Deployment for UnifiedDeployment {
         match &g.arch {
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
-                let model = Arc::new(arch_build::dense(model_spec, &gpu_name, MODEL_NAME, bridge)?);
+                let model = Arc::new(arch_build::dense(
+                    model_spec, &gpu_name, MODEL_NAME, bridge,
+                )?);
                 Ok(assemble_flow(
                     model,
                     store,
@@ -201,10 +264,11 @@ impl Deployment for UnifiedDeployment {
 /// The model's dotted-leaf prefix for this deployment (e.g. `unified.embedding`).
 const MODEL_NAME: &str = "unified";
 
-/// The dense / dense_tp archs run on the single-group barebone worker.
+/// The dense / dense_tp archs run on the single-group barebone worker
+/// (`chunked_prefill` is the same worker with a hard per-iter token cap).
 fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
-        IterWorkerSel::Barebone { .. } => Ok(()),
+        IterWorkerSel::Barebone { .. } | IterWorkerSel::ChunkedPrefill { .. } => Ok(()),
         other => bail!("unified: this arch requires worker `barebone`, got {other:?}"),
     }
 }
@@ -252,5 +316,6 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+        PlacementPolicy::SessionSticky => DpPlacementPolicy::SessionSticky,
     }
 }

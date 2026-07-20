@@ -15,6 +15,7 @@ pub mod hp_unified;
 pub mod iter_worker;
 pub mod pd_decode;
 pub mod pd_prefill;
+pub mod prefix_cache;
 pub mod types;
 pub mod unified;
 

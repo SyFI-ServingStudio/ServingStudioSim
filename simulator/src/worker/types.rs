@@ -418,6 +418,35 @@ pub struct WorkerConfig {
     /// legacy one-prefill/iter. For the multi-group worker the budget is applied
     /// per DP group. See [`crate::worker::admission_helpers::prefill_fits_budget`].
     pub max_batch_tokens: Option<u32>,
+    /// Chunked-prefill mode: a HARD per-iteration token cap. Live decodes
+    /// reserve 1 token each; the remainder is dealt to prefills FIFO, splitting
+    /// a long prompt across iterations (`prefill_processed` tracks progress, the
+    /// attention chunk is `(prefix_kv + prefill_processed, chunk)`). `None` =
+    /// whole-prefill-in-one-iter (the legacy behavior). Mutually independent of
+    /// `max_batch_tokens`, which is a soft admit-whole-prefills budget.
+    pub chunk_prefill_tokens: Option<u32>,
+    /// Prefix-cache budget in BYTES (the worker divides by the model's
+    /// per-token KV wire size, like `attn_kv_bytes`). `Some`: a request's
+    /// trace-declared `prefix_kv` only hits up to what its session left
+    /// resident (LRU under this budget); the shortfall is recomputed
+    /// (`prefill_target` grows). `None`: legacy always-hit replay.
+    pub prefix_cache_bytes: Option<u64>,
+    /// KV offload (vLLM-style preemption swap to host memory). `Some`: when the
+    /// KV gate blocks the pending head, the newest decodes are preempted and
+    /// their KV swapped out to a host pool of `host_capacity_bytes`, then
+    /// swapped back in when capacity frees (FIFO, ahead of fresh admissions).
+    /// Swap time = bytes / `host_bw_gbps` (analytic host-link bandwidth — the
+    /// same accepted CostSource alternative the gpu_cluster uses; upgrade path
+    /// is a profiled host-copy curve) and stalls the worker clock. `None` = no
+    /// offload: blocked requests just wait.
+    pub kv_offload: Option<KvOffloadConfig>,
+}
+
+/// See [`WorkerConfig::kv_offload`].
+#[derive(Clone, Copy, Debug)]
+pub struct KvOffloadConfig {
+    pub host_capacity_bytes: u64,
+    pub host_bw_gbps: f64,
 }
 
 impl Default for WorkerConfig {
@@ -430,6 +459,9 @@ impl Default for WorkerConfig {
             kv_log_stride: 8,
             gpu_time_multiplier: 1.0,
             max_batch_tokens: None,
+            chunk_prefill_tokens: None,
+            prefix_cache_bytes: None,
+            kv_offload: None,
         }
     }
 }

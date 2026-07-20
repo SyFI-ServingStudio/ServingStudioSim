@@ -20,6 +20,10 @@ const NO_WAKEUP_TIME: Time = Time::from_ns(u64::MAX);
 pub enum DpPlacementPolicy {
     LeastQueued,
     RoundRobin,
+    /// Pin each session to one worker (first request placed least-queued, later
+    /// requests follow). Keeps a session's prefix-cache locality — pair with the
+    /// workers' `prefix_cache_gb`. Sessionless requests fall back to least-queued.
+    SessionSticky,
 }
 
 /// Config for one DP pool — pure orchestration (which workers, how to place).
@@ -48,6 +52,9 @@ pub struct SimpleDpPoolController<M: IterwiseUnifiedModel, W: IterWorker> {
     worker_wakeup_times: Vec<Time>,
     placement: DpPlacementPolicy,
     rr_next: usize,
+    /// `SessionSticky` assignments: session → worker idx (grows monotonically;
+    /// sessions are trace-bounded so no eviction is needed).
+    session_to_worker: std::collections::HashMap<u32, usize>,
     _model: std::marker::PhantomData<M>,
 }
 
@@ -73,6 +80,7 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
             workers,
             placement: cfg.placement,
             rr_next: 0,
+            session_to_worker: std::collections::HashMap::new(),
             _model: std::marker::PhantomData,
         }
     }
@@ -85,7 +93,26 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
     /// to enqueue a `Handoff` whose content does not depend on the chosen
     /// worker — the receiver fills in its own destination block.
     pub fn admit_msg(&mut self, msg: W::Msg) {
-        let idx = self.choose_worker_idx();
+        self.admit_msg_for_session(None, msg)
+    }
+
+    /// `admit_msg` with the request's session identity, so `SessionSticky`
+    /// placement can pin the session to its worker. Non-sticky policies and
+    /// sessionless requests behave exactly like `admit_msg`.
+    pub fn admit_msg_for_session(&mut self, session: Option<u32>, msg: W::Msg) {
+        let idx = match (self.placement, session) {
+            (DpPlacementPolicy::SessionSticky, Some(sid)) => {
+                match self.session_to_worker.get(&sid) {
+                    Some(&idx) => idx,
+                    None => {
+                        let idx = self.choose_least_queued_idx();
+                        self.session_to_worker.insert(sid, idx);
+                        idx
+                    }
+                }
+            }
+            _ => self.choose_worker_idx(),
+        };
         self.workers[idx].enqueue(msg);
         // An idle worker has no scheduled wakeup; new work must make it due
         // immediately. A computing worker already has a `compute_end` wakeup, so
@@ -110,7 +137,9 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
 
     fn choose_worker_idx(&mut self) -> usize {
         match self.placement {
-            DpPlacementPolicy::LeastQueued => self.choose_least_queued_idx(),
+            DpPlacementPolicy::LeastQueued | DpPlacementPolicy::SessionSticky => {
+                self.choose_least_queued_idx()
+            }
             DpPlacementPolicy::RoundRobin => self.choose_round_robin_idx(),
         }
     }
@@ -172,6 +201,11 @@ where
     pub fn admit(&mut self, rid: RequestId) {
         self.admit_msg(W::Msg::from(rid));
     }
+
+    /// Session-aware admit for `SessionSticky` placement.
+    pub fn admit_for_session(&mut self, session: Option<u32>, rid: RequestId) {
+        self.admit_msg_for_session(session, W::Msg::from(rid));
+    }
 }
 
 // ── L6b: deployment flow (the object L7 calls) ────────────────────────────────
@@ -202,9 +236,9 @@ where
         // GPU registry — wire a sentinel `CostSource` whose `submit_transfer`
         // would return ~zero if ever called (it isn't: only PD decode workers
         // call it, and there are none here).
-        let cluster: SharedGpuCluster = std::rc::Rc::new(std::cell::RefCell::new(
-            GpuCluster::new(CostSource::analytic(f64::INFINITY)),
-        ));
+        let cluster: SharedGpuCluster = std::rc::Rc::new(std::cell::RefCell::new(GpuCluster::new(
+            CostSource::analytic(f64::INFINITY),
+        )));
         let dp_pool = SimpleDpPoolController::new(&cfg.dp_pool, &factory, &cluster);
         Self {
             requests,
@@ -223,8 +257,9 @@ where
 {
     fn on_arrival(&mut self, req: Request) {
         let rid = req.id;
+        let session = req.session;
         self.requests.borrow_mut().insert(&req);
-        self.dp_pool.admit(rid);
+        self.dp_pool.admit_for_session(session, rid);
     }
 
     fn tick(&mut self, now: Time) -> Vec<OrchAction> {
@@ -258,7 +293,10 @@ mod tests {
     fn build_flow(
         num_workers: u16,
         placement: DpPlacementPolicy,
-    ) -> (SimpleDpFlow<FakeModel, BareboneWorker<FakeModel>>, SharedRequests) {
+    ) -> (
+        SimpleDpFlow<FakeModel, BareboneWorker<FakeModel>>,
+        SharedRequests,
+    ) {
         let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
         let factory = UnifiedWorkerFactory::new(
             Arc::new(FakeModel::for_ms(1.0)),

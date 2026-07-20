@@ -20,8 +20,8 @@ use std::sync::Arc;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{KvSampler, KvSubmit};
-use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::admission_helpers::Batch;
+use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
@@ -111,17 +111,29 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         // KvPool capacity in tokens. See `unified::new` for the derivation:
         // group memory = `num_attn_shards × attn_kv_bytes`, divided by the
         // model-level `total_kv_bytes_per_token` (all ranks summed).
-        let group_kv_bytes =
-            config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
+        let group_kv_bytes = config
+            .attn_kv_bytes
+            .saturating_mul(model.num_attn_shards().max(1) as u64);
         let kv_capacity = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
         // Report the pool's static capacity to the run-meta registry (single group),
         // and open the sampler (borrow `cost_log_dir` before `CostBuffers` moves it).
         cluster
             .borrow_mut()
             .register_kv_capacity(pool_tag, pool.0, id.0, 0, kv_capacity);
-        let kv = KvSampler::open_opt(cost_log_dir.as_deref(), pool_tag, id, 1, config.kv_log_stride);
-        let cost =
-            CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref(), config.gpu_time_multiplier);
+        let kv = KvSampler::open_opt(
+            cost_log_dir.as_deref(),
+            pool_tag,
+            id,
+            1,
+            config.kv_log_stride,
+        );
+        let cost = CostBuffers::new_iter(
+            cost_log_dir,
+            pool_tag,
+            id,
+            model.as_ref(),
+            config.gpu_time_multiplier,
+        );
         // Arch invariant: `num_attn_shards() ≤ gpus_per_replica == gpus_per_worker`,
         // so no clamp against the worker's GPU range is needed — the model is
         // authoritative for shard count.
@@ -205,22 +217,24 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             // KV occupancy here is the prompt — the decode budget is the decode
             // pool's concern. (Passing decode_len, as the barebone copy-source does,
             // would over-reserve and wrongly throttle prefill admission.)
-            let p = {
+            let (p, prefix) = {
                 let store = self.requests.borrow();
-                store[rid].prompt_len
+                let r = &store[rid];
+                (r.prompt_len, r.prefix_kv)
             };
             // Reservation includes both freshly-promised admits and any KV
             // still held pending decode acks (post-PrefillDone, pre-ReleaseKv).
             // Held KV physically occupies the worker's KV cache, so it must
-            // gate new admissions just like a promised one.
+            // gate new admissions just like a promised one. A trace-declared
+            // cached prefix occupies KV alongside the prefilled prompt.
             let group_promised = self.group_promised_kv(0) + self.runtime.held_kv_tokens;
             if self
                 .config
                 .admission
-                .try_admit(&self.batches[0], group_promised, p, 0)
+                .try_admit(&self.batches[0], group_promised, p + prefix, 0)
             {
                 self.runtime.pending_prefills.pop_front();
-                self.promise(0, rid, p, 0, 0);
+                self.promise(0, rid, p, 0, prefix);
             }
         }
         self.drain_promises_into_admits();
@@ -483,7 +497,10 @@ mod tests {
         let r = &s[RequestId(0)];
         assert_eq!(r.tokens_emitted, 1, "prefill emits exactly the first token");
         assert!(r.first_token_time.is_some());
-        assert!(!r.completed, "multi-token request is not complete after prefill");
+        assert!(
+            !r.completed,
+            "multi-token request is not complete after prefill"
+        );
     }
 
     #[test]
