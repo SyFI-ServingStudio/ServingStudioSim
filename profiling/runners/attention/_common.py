@@ -275,11 +275,17 @@ def measure(
     """Time the closure with CUPTI, sample energy, assemble ComputeMetrics.
 
     Timer.cupti measures kernel-only time with cold L2, sampling adaptively until
-    the mean converges (no warmup). kernel_name=None sums every kernel the closure
+    the mean converges. kernel_name=None sums every kernel the closure
     launches in the window. NOTE: this diverges from the ref's do_bench (warm,
     wall-clock) measurement -- the recorded numbers are cold-L2 kernel-only.
+
+    warmup=5 exists to stabilize the launch PATTERN, not the timing: FlashInfer
+    lazily plans/tunes on the first call(s) of a shape, so an unwarmed closure
+    launches extra one-shot kernels during CUPTI's pattern-detection pass that
+    vanish by the formal capture — tripping the record-count guard (seen on
+    fa2/fa3 pure-prefill shapes). Per-launch cold-L2 timing is unaffected.
     """
-    time_ms = Timer.cupti(benchmark_fn)
+    time_ms = Timer.cupti(benchmark_fn, warmup=5)
     energy_j = Energy.perf(
         benchmark_fn,
         warmup=5,

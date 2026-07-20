@@ -238,7 +238,9 @@ def _measure_best_split(
             kwargs["fixed_split_size"] = split
         try:
             wrapper.plan(**kwargs)
-            time_ms = Timer.cupti(benchmark_fn)
+            # warmup=5: see _common.measure — stabilizes the launch pattern
+            # against FlashInfer's lazy per-plan tuning kernels.
+            time_ms = Timer.cupti(benchmark_fn, warmup=5)
         except Exception:  # noqa: BLE001 — a bad fixed split is skipped, not fatal
             if split is None:
                 raise
