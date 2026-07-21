@@ -39,9 +39,14 @@ class VllmTextInputSpec:
 
 @dataclass(frozen=True)
 class BuildRequest:
-    """Resolved cross-stage artifacts supplied by the launcher."""
+    """Resolved cross-stage artifacts supplied by the launcher.
 
-    simulation_log_dir: Path
+    `simulation_preset` is the sim preset the gpu / arch / backends were read
+    from (recorded for provenance only); timing-predict never consumes a
+    completed simulation run.
+    """
+
+    simulation_preset: Path
     profile_log_dir: Path
     parsed_nsys: Path
     output_dir: Path
@@ -110,7 +115,7 @@ def build_inputs(request: BuildRequest) -> BuildResult:
         json.dumps(
             {
                 "schema_version": 1,
-                "simulation_log_dir": str(request.simulation_log_dir.resolve()),
+                "simulation_preset": str(request.simulation_preset.resolve()),
                 "profile_log_dir": str(request.profile_log_dir.resolve()),
                 "parsed_nsys": str(request.parsed_nsys.resolve()),
                 "predict_log_dir": str(output_dir),

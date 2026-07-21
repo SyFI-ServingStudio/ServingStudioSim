@@ -189,13 +189,15 @@ range mode does not change the per-kernel record schema.
 ## Launch contract
 
 Do not launch this profiler directly or keep run configs in this implementation
-directory. Create one dated experiment directory and preserve all four phase
-configs there; each may be YAML or JSON. Run the two capture-producing stages
-independently:
+directory. Create one dated experiment directory and preserve every phase config
+there; each may be YAML or JSON. The profile is the first capture-producing stage;
+the simulation runs later (after kernel-align derives the multiplier it injects):
 
 ```bash
-uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml
 uv run python -m launcher alignment profile logs/<experiment>/profile.yaml
+# ... timing-predict, kernel-align ...
+uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml \
+  --gpu-time-multiplier-from logs/<experiment>/analysis_kernel
 ```
 
 `profile.yaml` is only the vLLM/TraceLab/NSYS run input. It owns one artifact

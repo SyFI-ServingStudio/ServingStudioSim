@@ -5,7 +5,6 @@ import sqlite3
 
 import pytest
 
-from alignment.nsys.gpu_kernel_ratio import compute_profile_gpu_kernel_ratio
 from alignment.nsys.parse import (
     KernelEvent,
     RangeStats,
@@ -267,73 +266,51 @@ def test_fold_prefers_layer_aligned_repeat_with_final_suffix():
     ]
 
 
-def test_gpu_kernel_ratio_uses_global_busy_and_audits_attribution(tmp_path):
-    profile_dir = tmp_path / "profile"
-    profile_dir.mkdir()
-    sqlite_path = profile_dir / "capture.sqlite"
-    parsed_path = profile_dir / "parsed.json"
+def test_tp_sequence_inventory_keeps_one_validated_rank():
+    rank_kernels = [
+        {"name_id": 1, "category": "other"},
+        {"name_id": 2, "category": "nccl_collective"},
+    ]
+    details = [
+        {
+            "iteration": 7,
+            "iteration_type": "decode",
+            "ranges": [
+                {"device_id": 0, "phase": "forward", "kernels": rank_kernels},
+                {"device_id": 1, "phase": "forward", "kernels": rank_kernels},
+            ],
+        }
+    ]
 
-    with sqlite3.connect(sqlite_path) as connection:
-        connection.executescript(
-            """
-            CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (
-                start INTEGER NOT NULL,
-                end INTEGER NOT NULL,
-                deviceId INTEGER NOT NULL
-            );
-            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (100, 150, 0);
-            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (160, 180, 0);
-            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (190, 210, 0);
-            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (200, 240, 0);
-            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (230, 260, 0);
-            INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (300, 320, 0);
-            """
-        )
+    catalog = build_kernel_sequences(details, {1: "gemm", 2: "nccl"})["forward"]
 
-    def detail(iteration, iteration_type, intervals):
-        return {
-            "iteration": iteration,
-            "iteration_type": iteration_type,
+    sequence = catalog["unique_sequences"][0]
+    assert sequence["expanded_kernel_count"] == 2
+    assert [row["name"] for row in expand_program(sequence["program"])] == [
+        "gemm",
+        "nccl",
+    ]
+
+
+def test_tp_sequence_inventory_rejects_asymmetric_ranks():
+    details = [
+        {
+            "iteration": 7,
+            "iteration_type": "decode",
             "ranges": [
                 {
                     "device_id": 0,
-                    "kernels": [
-                        {"start_ns": start_ns, "end_ns": end_ns}
-                        for start_ns, end_ns in intervals
-                    ],
-                }
+                    "phase": "forward",
+                    "kernels": [{"name_id": 1, "category": "other"}],
+                },
+                {
+                    "device_id": 1,
+                    "phase": "forward",
+                    "kernels": [{"name_id": 2, "category": "other"}],
+                },
             ],
         }
+    ]
 
-    parsed_path.write_text(
-        json.dumps(
-            {
-                "iteration_details": [
-                    detail(1, "mixed", [(100, 150), (190, 210)]),
-                    detail(2, "decode", [(200, 240)]),
-                    detail(3, "decode", [(300, 320)]),
-                ]
-            }
-        )
-    )
-    (profile_dir / "profile_result.json").write_text(
-        json.dumps({"parsed_nsys": str(parsed_path), "sqlite": str(sqlite_path)})
-    )
-
-    result = compute_profile_gpu_kernel_ratio(profile_dir)
-
-    assert result["overall"]["cycles"] == 2
-    assert result["overall"]["gpu_cycle_ms"] == pytest.approx(0.0002)
-    assert result["overall"]["global_kernel_busy_in_cycle_ms"] == pytest.approx(
-        0.00014
-    )
-    assert result["overall"]["attributed_kernel_busy_in_cycle_ms"] == pytest.approx(
-        0.0001
-    )
-    assert result["overall"]["kernel_gpu_fraction"] == pytest.approx(0.7)
-    assert result["overall"]["gpu_time_multiplier"] == pytest.approx(1.0 / 0.7)
-    assert result["overall"]["cycles_with_unattributed_kernel_busy"] == 2
-    assert result["overall"]["cycles_with_attributed_kernel_outside_cycle"] == 1
-    assert result["by_iteration_type"]["mixed"]["gpu_time_multiplier"] == pytest.approx(
-        1.25
-    )
+    with pytest.raises(ValueError, match="not symmetric"):
+        build_kernel_sequences(details, {1: "rank0", 2: "rank1"})

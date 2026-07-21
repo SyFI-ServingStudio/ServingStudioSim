@@ -264,7 +264,11 @@ def test_labeled_sequences_reject_invalid_simulated_slots(tmp_path, slots):
         load_labeled_kernel_sequences(path)
 
 
-def test_labeled_sequences_reject_slot_shared_by_different_operations(tmp_path):
+def test_labeled_sequences_accept_slot_shared_by_different_operations(tmp_path):
+    # A single simulated slot may be the aggregate boundary for several
+    # operations (e.g. a fused vs. unfused all-reduce sharing one tp_allreduce
+    # slot). The loader accepts this; the analyzer resolves the per-iteration
+    # owner from the operations actually present.
     path = tmp_path / "kernel_sequences_labeled.json"
     doc = _labeled_doc()
     sequence = doc["phases"]["forward"]["unique_sequences"][0]
@@ -275,8 +279,14 @@ def test_labeled_sequences_reject_slot_shared_by_different_operations(tmp_path):
     sequence["expanded_kernel_count"] = 2
     path.write_text(json.dumps(doc))
 
-    with pytest.raises(ValueError, match="belongs to multiple operations"):
-        load_labeled_kernel_sequences(path)
+    normalized = load_labeled_kernel_sequences(path)
+
+    kernels = normalized["phases"]["forward"]["unique_sequences"][0]["program"][0]["kernels"]
+    assert [kernel["label"]["operation"] for kernel in kernels] == [
+        "attention",
+        "second_operation",
+    ]
+    assert all(kernel["label"]["simulated_slots"] == ["unified.attn"] for kernel in kernels)
 
 
 def test_labeled_sequences_reject_inconsistent_slots_for_one_operation(tmp_path):
@@ -512,10 +522,14 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     )
 
     (profile / "profile_result.json").write_text(json.dumps({"log_dir": str(profile)}))
+    # End-to-end fixture exercises all three alignment subjects in one analyzer
+    # invocation, so it writes the union of both typed manifests' fields. Each
+    # subject deserializes only its own type (kernel-align vs e2e-align) and
+    # ignores the other's fields.
     (analysis / "alignment_manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 4,
+                "schema_version": 6,
                 "profile_log_dir": str(profile),
                 "simulation_log_dir": str(sim),
                 "analysis_log_dir": str(analysis),
@@ -525,8 +539,7 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
                 "predict_log_dir": str(predict),
                 "timing_predict_case_map": str(case_map),
                 "labeled_kernel_sequences": str(labeled),
-                "iteration": {"enabled": True},
-                "e2e": {"enabled": True, "throughput_bins": 4},
+                "throughput_bins": 4,
             }
         )
     )
@@ -553,9 +566,17 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     assert iteration_report["mapping"]["coverage"]["measured_duration_fraction"] == 1.0
     assert len(iteration_report["kernels"]) == 3
     assert iteration_report["iterations"][0]["measured_ms"] == 3.5
-    assert iteration_report["meta"]["gpu_time_multiplier"] == 1.25
+    # The iteration pass self-computes the duty-cycle multiplier from measured
+    # quantities alone: Σ measured_gpu_cycle_ms / Σ measured_ms over iterations
+    # that have a next-iteration cycle. Only iteration 0 has a cycle here
+    # (10.0 ms), so recommended == 10.0 / 3.5. The sim params multiplier (1.25)
+    # is deliberately ignored.
+    recommended = 10.0 / 3.5
+    assert iteration_report["meta"]["recommended_gpu_time_multiplier"] == pytest.approx(recommended)
     assert iteration_report["iterations"][0]["measured_gpu_cycle_ms"] == 10.0
-    assert iteration_report["iterations"][0]["simulated_gpu_cycle_ms"] == 4.75
+    assert iteration_report["iterations"][0]["simulated_gpu_cycle_ms"] == pytest.approx(
+        3.8 * recommended
+    )
     assert iteration_report["iterations"][1]["measured_gpu_cycle_ms"] is None
     breakdown = iteration_payload["breakdowns"][0]
     assert "operations" not in breakdown

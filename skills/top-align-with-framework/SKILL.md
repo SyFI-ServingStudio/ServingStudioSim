@@ -40,11 +40,12 @@ async), not the cost model.
 
 ## Step 0 — Run the alignment
 
-Route to `operate-run-alignment` for the four phases. It produces the artifacts
-every check below reads: the per-iteration labeled kernel breakdown (measured
-duration vs simulated CostTree slot per mapped operation), `gpu_kernel_ratio.json`
-(pooled and per-iteration-type kernel/GPU fractions), and the E2E TTFT/TPOT/
-throughput overlays. Interpret those artifacts; do not re-derive them here.
+Route to `operate-run-alignment` for the phases. It produces the artifacts every
+check below reads: the per-iteration labeled kernel breakdown (measured duration
+vs simulated CostTree slot per mapped operation) plus the kernel-align pass's
+`recommended_gpu_time_multiplier` (in `alignment_iteration_report.json` meta), and
+the E2E TTFT/TPOT/throughput overlays. Interpret those artifacts; do not re-derive
+them here.
 
 ## Check 1 — Per-iteration kernel-only timing
 
@@ -95,19 +96,23 @@ modeled time deviates a lot from measured, and attribute it:
 ## Check 2 — GPU time / duty cycle
 
 Kernel-only sums exclude the inter-kernel gaps (launch overhead, sync, scheduling)
-that real wall time contains. `operate-run-alignment`'s *Measure kernel time
-versus GPU time* step derives `gpu_time_multiplier = 1 / kernel_gpu_fraction` from
-`gpu_kernel_ratio.json`. Judge whether that correction is reasonable:
+that real wall time contains. The kernel-align pass derives the duty-cycle
+correction `recommended_gpu_time_multiplier = Σ measured_gpu_cycle_ms / Σ
+measured_ms` — the same per-occurrence `measured_ms` reduction the breakdown
+reports, so numerator and denominator are one consistent metric. Judge whether
+that correction is reasonable:
 
-- the pooled `kernel_gpu_fraction` is plausible for the workload (a well-batched
-  run spends most of the GPU cycle in kernels; a low fraction means large host
-  bubbles that deserve an explanation, not silent absorption into the multiplier);
-- the `by_iteration_type` fractions differ in the expected direction — decode is
-  more launch-bound (lower fraction), prefill more compute-bound (higher);
-- after applying the multiplier, the simulated iteration cycle time tracks the
-  measured GPU cycle. If Check 1 is clean (kernels themselves match) but the
-  iteration cycle is still off, the **ratio correction**, not the kernels, is the
-  suspect — revisit the fraction and its population.
+- its inverse (the pooled kernel/GPU busy fraction) is plausible for the workload
+  (a well-batched run spends most of the GPU cycle in kernels, so the multiplier
+  is near 1; a large multiplier means big host bubbles that deserve an
+  explanation, not silent absorption);
+- the per-iteration `measured_gpu_cycle_ms` vs `measured_ms` gaps differ in the
+  expected direction — decode is more launch-bound (larger gap), prefill more
+  compute-bound (smaller);
+- after the simulation bakes in the multiplier, the simulated iteration cycle time
+  tracks the measured GPU cycle. If Check 1 is clean (kernels themselves match)
+  but the iteration cycle is still off, the **duty-cycle correction**, not the
+  kernels, is the suspect — revisit the multiplier and its population.
 
 ## Check 3 — TTFT and TPOT
 

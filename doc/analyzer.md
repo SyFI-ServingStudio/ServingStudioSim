@@ -84,6 +84,35 @@ categories:
 | `alignment-e2e` | one measured/simulated latency distribution | TraceLab replay JSONL + optional vLLM EngineCore request-timing JSONL + sim `request_slo` |
 | `alignment-workload` | one scheduler iteration by recorded iteration id | normalized NSYS iteration metrics + sim `cost_log` |
 
+For a symmetric tensor-parallel alignment, one measured iteration contains one
+range set per rank. The analyzer reduces each measured occurrence across its
+ranks into one replica critical-path contribution, then sums those — so the
+per-kernel segments and per-operation rows add up to the headline `measured_ms`,
+which is compared to the simulator's Sum/Max cost tree. The reduction depends on
+the mapping table's per-kernel `cross_rank` class, never on a category or name:
+
+- **independent** (compute, point-to-point): the occurrence costs `max` over
+  ranks of `(end - start)`. Cross-rank compute imbalance stays real work on the
+  path — exactly what the single-rank sim cost under-models if it assumes balance.
+- **synchronizing** (all-reduce / all-gather / all-to-all / fused all-reduce+norm):
+  a barrier whose per-rank kernel duration includes waiting for the slowest rank
+  to arrive. The occurrence costs `max(end) - max(start)` — from "last rank
+  arrived" to "collective done" — which drops the arrival wait while keeping a
+  self-imbalanced collective's bottleneck rank. For a symmetric all-reduce this
+  equals `min(duration)`; for an imbalanced all-to-all it does not.
+
+The dropped arrival wait is not attributed to any kernel; it surfaces only in the
+wall-clock `measured_gpu_cycle_ms`. The kernel-align pass's derived duty-cycle
+multiplier `recommended_gpu_time_multiplier = Σ measured_gpu_cycle_ms / Σ
+measured_ms` spans exactly this gap, so its denominator shares the per-occurrence
+`measured_ms` reduction above. GPU durations from different ranks are never
+summed. `measured_busy_union_ms`
+retains the old cross-rank interval union for audit. The analyzer keeps per-device
+populations so rank skew is auditable, and distinguishes raw `rank_launches` from
+`replica_calls` (symmetric launches divided by the captured device count). A shared
+folded label program is valid only when the parser has proved the exact ordered
+kernel sequence is identical across all participating devices.
+
 The alignment trio is separate not by deployment but by **source scope** (see
 below): it reads an alignment manifest instead of a plain run directory.
 

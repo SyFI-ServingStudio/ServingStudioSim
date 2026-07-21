@@ -31,7 +31,8 @@ def _phase_configs(tmp_path: Path, suffix: str = ".yaml") -> dict[str, Path]:
         "simulation": tmp_path / f"simulation{suffix}",
         "profile": tmp_path / f"profile{suffix}",
         "timing": tmp_path / f"timing_predict{suffix}",
-        "analyze": tmp_path / f"analyze{suffix}",
+        "analyze_kernel": tmp_path / f"analyze_kernel{suffix}",
+        "analyze_e2e": tmp_path / f"analyze_e2e{suffix}",
         "labeled": tmp_path / "kernel_sequences_labeled.json",
     }
     _write_config(
@@ -77,7 +78,9 @@ def _phase_configs(tmp_path: Path, suffix: str = ".yaml") -> dict[str, Path]:
         paths["timing"],
         {
             "schema_version": 1,
-            "simulation_log_dir": "./simulation_run",
+            # Single-pass DAG: timing-predict reads the sim *preset* for
+            # gpu/arch/backends, so it runs before any completed simulation.
+            "simulation_preset": f"./simulation{suffix}",
             "profile_log_dir": "./profile_run",
             "log_dir": "./timing_predict_run",
             "input_builder": {
@@ -88,17 +91,26 @@ def _phase_configs(tmp_path: Path, suffix: str = ".yaml") -> dict[str, Path]:
         },
     )
     _write_config(
-        paths["analyze"],
+        paths["analyze_kernel"],
+        {
+            "schema_version": 1,
+            "profile_log_dir": "./profile_run",
+            "timing_predict_log_dir": "./timing_predict_run",
+            "log_dir": "./analysis_kernel_run",
+            "iteration": {
+                "enabled": True,
+                "labeled_kernel_sequences_file": "./kernel_sequences_labeled.json",
+            },
+        },
+    )
+    _write_config(
+        paths["analyze_e2e"],
         {
             "schema_version": 1,
             "simulation_log_dir": "./simulation_run",
             "profile_log_dir": "./profile_run",
             "timing_predict_log_dir": "./timing_predict_run",
-            "log_dir": "./analysis_run",
-            "iteration": {
-                "enabled": True,
-                "labeled_kernel_sequences_file": "./kernel_sequences_labeled.json",
-            },
+            "log_dir": "./analysis_e2e_run",
             "workload": {"enabled": True},
             "e2e": {"enabled": True, "throughput_bins": 20},
         },
@@ -210,20 +222,21 @@ def _parsed_iteration() -> dict:
 
 
 def _write_timing_artifacts(tmp_path: Path) -> Path:
-    simulation, profile, profile_result = _write_completed_inputs(tmp_path)
+    _, profile, profile_result = _write_completed_inputs(tmp_path)
     output = tmp_path / "timing_predict_run"
+    timing_config = alignment_launcher.load_timing_predict_config(
+        tmp_path / "timing_predict.yaml"
+    )
     result = build_inputs(
         BuildRequest(
-            simulation_log_dir=simulation,
+            simulation_preset=timing_config.simulation_preset,
             profile_log_dir=profile,
             parsed_nsys=Path(profile_result["parsed_nsys"]),
             output_dir=output,
             gpu="NVIDIA H200",
             arch={"type": "llama3_dense", "fp8": False},
             backends={},
-            input_spec=alignment_launcher.load_timing_predict_config(
-                tmp_path / "timing_predict.yaml"
-            ).input_builder,
+            input_spec=timing_config.input_builder,
         )
     )
     (output / "raw" / "cost_manifest").mkdir(parents=True)
@@ -242,6 +255,48 @@ def test_alignment_sim_runs_only_existing_simulation(tmp_path, monkeypatch):
 
     assert alignment_launcher.main(["sim", str(paths["simulation"])]) == 0
     assert calls[0][0] == paths["simulation"]
+    assert calls[0][1]["overrides"] == []
+
+
+def test_alignment_sim_auto_injects_kernel_align_multiplier(tmp_path, monkeypatch):
+    paths = _phase_configs(tmp_path)
+    kernel_align = tmp_path / "kernel_align_run"
+    report = kernel_align / "reports" / "alignment_iteration_report.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({"meta": {"recommended_gpu_time_multiplier": 1.329}}))
+    calls = []
+    monkeypatch.setattr(
+        alignment_launcher,
+        "_launch_simulation",
+        lambda path, **kwargs: calls.append((path, kwargs)) or 0,
+    )
+
+    assert (
+        alignment_launcher.main(
+            ["sim", str(paths["simulation"]), "--gpu-time-multiplier-from", str(kernel_align)]
+        )
+        == 0
+    )
+    assert calls[0][1]["overrides"] == [
+        "pools.main.groups.0.worker.gpu_time_multiplier=1.329"
+    ]
+
+
+def test_alignment_sim_rejects_below_unity_multiplier(tmp_path, monkeypatch, capsys):
+    paths = _phase_configs(tmp_path)
+    kernel_align = tmp_path / "kernel_align_run"
+    report = kernel_align / "reports" / "alignment_iteration_report.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({"meta": {"recommended_gpu_time_multiplier": 0.5}}))
+    monkeypatch.setattr(alignment_launcher, "_launch_simulation", lambda *args, **kwargs: 0)
+
+    assert (
+        alignment_launcher.main(
+            ["sim", str(paths["simulation"]), "--gpu-time-multiplier-from", str(kernel_align)]
+        )
+        == 2
+    )
+    assert "recommended_gpu_time_multiplier" in capsys.readouterr().err
 
 
 def test_profile_config_is_profile_only_and_config_relative(tmp_path, monkeypatch):
@@ -286,7 +341,7 @@ def test_all_phase_parsers_accept_json(tmp_path):
         alignment_launcher.load_timing_predict_config(paths["timing"]).log_dir
         == (tmp_path / "timing_predict_run").resolve()
     )
-    assert alignment_launcher.load_analyze_config(paths["analyze"]).e2e.throughput_bins == 20
+    assert alignment_launcher.load_analyze_config(paths["analyze_e2e"]).e2e.throughput_bins == 20
 
 
 def test_profile_fork_python_preserves_virtualenv_symlink(tmp_path):
@@ -308,12 +363,22 @@ def test_profile_fork_python_preserves_virtualenv_symlink(tmp_path):
 
 def test_analyze_rejects_removed_kernel_mapping_field(tmp_path):
     paths = _phase_configs(tmp_path)
-    raw = yaml.safe_load(paths["analyze"].read_text())
+    raw = yaml.safe_load(paths["analyze_kernel"].read_text())
     raw["iteration"] = {"enabled": True, "kernel_mapping_file": "./mapping.yaml"}
-    paths["analyze"].write_text(yaml.safe_dump(raw))
+    paths["analyze_kernel"].write_text(yaml.safe_dump(raw))
 
     with pytest.raises(ValueError, match="kernel_mapping_file"):
-        load_analyze_config(paths["analyze"])
+        load_analyze_config(paths["analyze_kernel"])
+
+
+def test_analyze_rejects_mixing_kernel_align_and_e2e_phases(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["analyze_kernel"].read_text())
+    raw["e2e"] = {"enabled": True, "throughput_bins": 20}
+    paths["analyze_kernel"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="one phase"):
+        load_analyze_config(paths["analyze_kernel"])
 
 
 def test_timing_predict_uses_one_phase_config_and_no_labeled_inventory(tmp_path, monkeypatch):
@@ -337,20 +402,22 @@ def test_timing_predict_uses_one_phase_config_and_no_labeled_inventory(tmp_path,
 
 def test_timing_predict_preserves_simulation_backend_policy(tmp_path, monkeypatch):
     paths = _phase_configs(tmp_path)
-    simulation, _, _ = _write_completed_inputs(tmp_path)
-    params_path = simulation / "raw" / "params.json"
-    params = json.loads(params_path.read_text())
-    params["backends"] = {
-        "main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}
-    }
-    params_path.write_text(json.dumps(params))
+    _write_completed_inputs(tmp_path)
+    # The preset carries backends in the flat "pool/role" form; timing-predict
+    # re-nests them into {pool: {role: [...]}} for the offline predictor so the
+    # predicted CostTree matches the simulation's backend identity.
+    preset = yaml.safe_load(paths["simulation"].read_text())
+    preset["backends"] = {"main/unified.pre_attn.qkv_proj": ["torch_linear"]}
+    paths["simulation"].write_text(yaml.safe_dump(preset))
     monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
 
     assert alignment_launcher.main(["timing-predict", str(paths["timing"])]) == 0
     predict_config = json.loads(
         (tmp_path / "timing_predict_run" / "timing_predict_config.json").read_text()
     )
-    assert predict_config["backends"] == params["backends"]
+    assert predict_config["backends"] == {
+        "main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}
+    }
 
 
 def test_timing_predict_warns_on_trace_mismatch(tmp_path, monkeypatch, capsys):
@@ -366,7 +433,7 @@ def test_timing_predict_warns_on_trace_mismatch(tmp_path, monkeypatch, capsys):
     assert "[warn] alignment trace mismatch" in capsys.readouterr().err
 
 
-def test_analyze_creates_manifest_and_runs_selected_subjects(tmp_path, monkeypatch):
+def test_analyze_kernel_align_writes_kernel_only_manifest(tmp_path, monkeypatch):
     paths = _phase_configs(tmp_path)
     _write_timing_artifacts(tmp_path)
     calls = []
@@ -376,51 +443,55 @@ def test_analyze_creates_manifest_and_runs_selected_subjects(tmp_path, monkeypat
         lambda log_dir, **kwargs: calls.append((log_dir, kwargs)) or True,
     )
 
-    assert alignment_launcher.main(["analyze", str(paths["analyze"])]) == 0
-    analysis = tmp_path / "analysis_run"
+    assert alignment_launcher.main(["analyze", str(paths["analyze_kernel"])]) == 0
+    analysis = tmp_path / "analysis_kernel_run"
     manifest = json.loads((analysis / "alignment_manifest.json").read_text())
-    assert manifest["schema_version"] == 4
+    assert manifest["schema_version"] == 6
     assert manifest["labeled_kernel_sequences"] == str(analysis / "kernel_sequences_labeled.json")
-    assert manifest["iteration"] == {"enabled": True}
-    assert manifest["workload"] == {"enabled": True}
+    assert manifest["predict_log_dir"] == str(tmp_path / "timing_predict_run")
+    # kernel-align names no simulation, replay, or subject-enabled bookkeeping.
+    assert "simulation_log_dir" not in manifest
+    assert "replay_result" not in manifest
+    assert "iteration" not in manifest and "workload" not in manifest and "e2e" not in manifest
     assert calls == [
-        (
-            analysis.resolve(),
-            {
-                "build_type": "release",
-                "subjects": ["alignment-iteration", "alignment-workload", "alignment-e2e"],
-            },
-        )
+        (analysis.resolve(), {"build_type": "release", "subjects": ["alignment-iteration"]})
     ]
 
 
-def test_analyze_e2e_only_does_not_require_labeled_inventory(tmp_path, monkeypatch):
+def test_analyze_e2e_align_writes_simulation_manifest_without_labels(tmp_path, monkeypatch):
     paths = _phase_configs(tmp_path)
     _write_timing_artifacts(tmp_path)
-    raw = yaml.safe_load(paths["analyze"].read_text())
-    raw["iteration"] = {"enabled": False}
-    raw["workload"] = {"enabled": False}
-    paths["analyze"].write_text(yaml.safe_dump(raw))
     calls = []
     monkeypatch.setattr(
         alignment_launcher,
         "_launch_alignment_analysis",
-        lambda log_dir, **kwargs: calls.append(kwargs["subjects"]) or True,
+        lambda log_dir, **kwargs: calls.append((log_dir, kwargs)) or True,
     )
 
-    assert alignment_launcher.main(["analyze", str(paths["analyze"])]) == 0
-    assert calls == [["alignment-e2e"]]
+    assert alignment_launcher.main(["analyze", str(paths["analyze_e2e"])]) == 0
+    analysis = tmp_path / "analysis_e2e_run"
+    manifest = json.loads((analysis / "alignment_manifest.json").read_text())
+    assert manifest["schema_version"] == 6
+    assert manifest["simulation_log_dir"] == str(tmp_path / "simulation_run")
+    assert manifest["throughput_bins"] == 20
+    # e2e-align names no timing-predict labels or per-subject flags.
+    assert "labeled_kernel_sequences" not in manifest
+    assert "iteration" not in manifest and "workload" not in manifest and "e2e" not in manifest
+    assert calls == [
+        (
+            analysis.resolve(),
+            {"build_type": "release", "subjects": ["alignment-workload", "alignment-e2e"]},
+        )
+    ]
 
 
 def test_analyze_rejects_all_subjects_disabled(tmp_path, capsys):
     paths = _phase_configs(tmp_path)
-    raw = yaml.safe_load(paths["analyze"].read_text())
+    raw = yaml.safe_load(paths["analyze_kernel"].read_text())
     raw["iteration"] = {"enabled": False}
-    raw["workload"] = {"enabled": False}
-    raw["e2e"] = {"enabled": False}
-    paths["analyze"].write_text(yaml.safe_dump(raw))
+    paths["analyze_kernel"].write_text(yaml.safe_dump(raw))
 
-    assert alignment_launcher.main(["analyze", str(paths["analyze"])]) == 2
+    assert alignment_launcher.main(["analyze", str(paths["analyze_kernel"])]) == 2
     assert "at least one analysis subject" in capsys.readouterr().err
 
 

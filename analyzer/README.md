@@ -72,10 +72,10 @@ sim/L7, containing:
 - `raw/cost_log/worker_<pool_tag>_<worker_id>.parquet` plus matching
   `raw/cost_manifest/worker_<pool_tag>_<worker_id>.json` — trace inputs.
 - `raw/params.json` — normal analysis reads the bare `deployment` string (drives
-  the applicability gate); alignment iteration analysis additionally reads the
-  sole supported worker group's `gpu_time_multiplier` to scale timing-predict
-  totals for the GPU-cycle overview. Absent → only deployment-agnostic normal
-  subjects run; an alignment bundle without the explicit multiplier fails loud.
+  the applicability gate). Absent → only deployment-agnostic normal subjects run.
+  Alignment iteration analysis needs no completed simulation: it derives the
+  GPU-cycle multiplier from measured quantities alone (`Σ measured_gpu_cycle_ms /
+  Σ measured_ms`) and applies it to the timing-predict totals itself.
 - `raw/run_meta.json` — sim-written sidecar (`num_gpus`, `gpu_name`); the
   throughput subject reads it to normalize per-GPU. Absent → treated as 1 GPU.
 
@@ -185,7 +185,7 @@ Current catalog:
 | `request-state` | concurrency | `request_slo.parquet` stage-transition lists + `run_meta.json` stage vocab/worker roster | exact category/pending peaks and means / 200-bin cluster and request-owner-worker open-category stacks plus owner-pool aggregate/average/worker pending series; execution-only pools (AFD FFN) are omitted; unavailable when stage logging is off |
 | `workload-conservation` | conservation | `cost_log` actuals + `request_slo.parquet` per-request expected | run-wide prefill/decode/FFN/KV work accounting, pass/fail / `workload_conservation_checks` |
 | `kv-occupancy` | kv | `kv_snapshot` stream + `run_meta.json` capacity | per-pool KV occupancy (active / projected-peak / promised tokens, and as a fraction of capacity) over time / `kv_occupancy_series` |
-| `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping + simulation `gpu_time_multiplier` | kernel/mapping error stats / separate kernel-busy and measured first-kernel-to-next-first-kernel GPU-cycle overviews + per-iteration mapped stacks |
+| `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping (no simulation) | kernel/mapping error stats + self-derived `recommended_gpu_time_multiplier` (`Σ measured_gpu_cycle_ms / Σ measured_ms`) / separate kernel-busy and measured first-kernel-to-next-first-kernel GPU-cycle overviews + per-iteration mapped stacks |
 | `alignment-e2e` | alignment-e2e | TraceLab replay JSONL + parsed NSYS GPU timeline + optional vLLM engine-core request timing JSONL + sim `request_slo.parquet` | independent client-TTFT/sim, optional server-TTFT/sim, client-TPOT/sim, optional server-TPOT/sim, E2E stats, client-completion throughput, and server GPU-span throughput / available raw latency CDF overlays + client/sim completion series annotated with all aggregate rates |
 | `alignment-workload` | alignment-workload | normalized NSYS iteration metrics + sim `cost_log.groups`/`wall_start_ms` | per-side workload summaries / fine prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle series by iteration id, plus decode batch size by elapsed time |
 

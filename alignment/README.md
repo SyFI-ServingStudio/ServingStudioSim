@@ -1,18 +1,23 @@
 # VibeSim Alignment
 
 Alignment validates VibeSim against one measured vLLM run. It is an explicit
-four-phase workflow; each phase has one config and one disjoint artifact root.
+phased workflow; each phase has one config and one disjoint artifact root. The
+GPU-cycle duty-cycle correction (`gpu_time_multiplier`) is a pure measured
+quantity: the analyzer's **kernel-align** pass derives it before the simulation,
+and the simulation phase injects it automatically. So `analyze` splits into two
+semantic passes that bracket the simulation:
 
 ```text
-simulation.yaml ── alignment sim ────────────────→ simulation/
-profile.yaml ───── alignment profile ────────────→ profile/
-timing_predict.yaml ─ alignment timing-predict ─→ timing_predict/
-analyze.yaml ────── alignment analyze ───────────→ analysis/
+profile.yaml ─────── alignment profile ──────────────→ profile/
+timing_predict.yaml ─ alignment timing-predict ──────→ timing_predict/   (reads simulation.yaml preset)
+analyze_kernel.yaml ─ alignment analyze (kernel-align)→ analysis_kernel/  (emits recommended_gpu_time_multiplier)
+simulation.yaml ──── alignment sim ──────────────────→ simulation/        (auto-injects the multiplier)
+analyze_e2e.yaml ─── alignment analyze (e2e-align) ──→ analysis_e2e/      (consumes the completed sim)
 ```
 
 No phase implicitly launches the next one. YAML and JSON are both accepted.
-`simulation.yaml` remains an ordinary VibeSim preset. Paths in the other three
-configs are resolved relative to the declaring config file.
+`simulation.yaml` remains an ordinary VibeSim preset. Paths in the other configs
+are resolved relative to the declaring config file.
 
 ## Ownership
 
@@ -25,7 +30,7 @@ alignment/
   timing_predict_input/     measured iteration → generic predictor inputs
 
 launcher/
-  alignment.py              four commands and cross-stage orchestration
+  alignment.py              phase commands and cross-stage orchestration
   alignment_config.py       strict phase YAML/JSON schemas and path resolution
 
 analyzer/
@@ -39,7 +44,7 @@ timing-predict inputs. The analyze launcher alone creates
 
 ## Phase configs
 
-Keep the four files beside each other in one dated experiment directory.
+Keep the config files beside each other in one dated experiment directory.
 
 ### `simulation.yaml`
 
@@ -94,7 +99,7 @@ After inspecting `profile/parsed.json`, select an explicit tagged input builder:
 
 ```yaml
 schema_version: 1
-simulation_log_dir: ./simulation
+simulation_preset: ./simulation.yaml
 profile_log_dir: ./profile
 log_dir: ./timing_predict
 input_builder:
@@ -103,21 +108,36 @@ input_builder:
   group_assignment: single
 ```
 
-The builder writes `timing_predict_cases.json`,
-`timing_predict_case_map.json`, `timing_predict_config.json`, and
-`timing_predict_input_manifest.json`, then the launcher invokes the generic
-timing-predict command. The generated predictor config copies the normalized
-simulation's complete per-role backend policy along with its arch and GPU, so
-iteration prediction rebuilds the same CostTree instead of reverting to an
+Timing prediction is kernel-only, so it reads the simulation **preset**
+(`simulation_preset`), not a completed run — it takes the gpu, arch, and backend
+policy straight from `simulation.yaml`. This lets it run before the simulation,
+so kernel-align can derive the multiplier the simulation later bakes in. The
+builder writes `timing_predict_cases.json`, `timing_predict_case_map.json`,
+`timing_predict_config.json`, and `timing_predict_input_manifest.json`, then the
+launcher invokes the generic timing-predict command. The generated predictor
+config re-nests the preset's flat `"pool/role": [...]` backend policy into
+`{pool: {role: [...]}}` along with its arch and GPU, so iteration prediction
+rebuilds the same CostTree the simulation will use instead of reverting to an
 arch's default best-of-N candidates. Future multimodal/sharded builders are
 sibling tagged variants with their own required fields; no sparse all-purpose
 record is used.
 
-This phase compares the simulation and profile source traces. A mismatch emits
-a warning and continues. It never reads embedded kernel labels or writes
+This phase compares the preset and profile source traces. A mismatch emits a
+warning and continues. It never reads embedded kernel labels or writes
 `analysis/`.
 
-### `analyze.yaml`
+### `analyze_kernel.yaml` and `analyze_e2e.yaml`
+
+`analyze` splits into two semantic passes selected purely by which subjects are
+enabled — there is no new flag:
+
+- **kernel-align** (`iteration.enabled`) — measured↔predicted per-kernel/iteration
+  cost accuracy. It needs no completed simulation, so `simulation_log_dir` is
+  omitted. It emits `recommended_gpu_time_multiplier` into
+  `reports/alignment_iteration_report.json`.
+- **e2e-align** (`workload.enabled` / `e2e.enabled`) — both read the completed DES
+  simulation (cost_log / request_slo), so `simulation_log_dir` is required and
+  points at the sim that already baked in the multiplier.
 
 After timing prediction, copy the folded inventory and label every stored kernel
 occurrence. Repeat-body labels apply to every exact expansion:
@@ -131,7 +151,11 @@ complete mapped label with `operation`, `type`, `role`, and a non-empty
 `simulated_slots` list. One measured operation may own multiple simulated leaf
 slots; the analyzer counts its measured kernels once and sums the selected
 folded leaf workloads. This is an operation-workload comparison, not an
-overlap-aware wall-clock sum when the slots sit under `Max` branches.
+overlap-aware wall-clock sum when the slots sit under `Max` branches. Conversely
+one simulated slot may be owned by several operations (a fused aggregate boundary
+and an unfused split boundary sharing one `tp_allreduce` slot); the analyzer
+resolves the per-iteration owner from the operations present. One *operation*
+still keeps a single consistent `type`/`role`/`simulated_slots`.
 The labeled JSON is the only mapping source; there is no separate mapping YAML.
 
 ```json
@@ -150,14 +174,23 @@ The labeled JSON is the only mapping source; there is no separate mapping YAML.
 ```
 
 ```yaml
+# analyze_kernel.yaml — kernel-align; no simulation needed
+schema_version: 1
+profile_log_dir: ./profile
+timing_predict_log_dir: ./timing_predict
+log_dir: ./analysis_kernel
+iteration:
+  enabled: true
+  labeled_kernel_sequences_file: ./kernel_sequences_labeled.json
+```
+
+```yaml
+# analyze_e2e.yaml — e2e-align; consumes the completed sim
 schema_version: 1
 simulation_log_dir: ./simulation
 profile_log_dir: ./profile
 timing_predict_log_dir: ./timing_predict
-log_dir: ./analysis
-iteration:
-  enabled: true
-  labeled_kernel_sequences_file: ./kernel_sequences_labeled.json
+log_dir: ./analysis_e2e
 workload:
   enabled: true
 e2e:
@@ -165,7 +198,11 @@ e2e:
   throughput_bins: 20
 ```
 
-Iteration, workload, and E2E subjects can be enabled independently. Workload
+One analyze config is exactly one phase: enable `iteration` (kernel-align) or
+`workload`/`e2e` (e2e-align), never both — the two write distinct typed manifests
+and mixing them is rejected. Every subject defaults to disabled, so a phase is
+opted into by naming only its block; `simulation_log_dir` is required only for
+the e2e-align phase. Workload
 analysis plots each side against its recorded iteration ids and emits fine-grained
 prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle
 series. It also plots decode batch size against each side's independently
@@ -207,11 +244,19 @@ data is never reconstructed or substituted from client measurements.
 ## Commands
 
 ```bash
-uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml
 uv run python -m launcher alignment profile logs/<experiment>/profile.yaml
 uv run python -m launcher alignment timing-predict logs/<experiment>/timing_predict.yaml
-uv run python -m launcher alignment analyze logs/<experiment>/analyze.yaml
+uv run python -m launcher alignment analyze logs/<experiment>/analyze_kernel.yaml
+uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml \
+  --gpu-time-multiplier-from logs/<experiment>/analysis_kernel
+uv run python -m launcher alignment analyze logs/<experiment>/analyze_e2e.yaml
 ```
+
+`--gpu-time-multiplier-from <kernel-align-dir>` makes the simulation read that
+pass's `recommended_gpu_time_multiplier` and inject it as
+`--override pools.main.groups.0.worker.gpu_time_multiplier=<v>` — no manual copy.
+Omit the flag to run the simulation with whatever `gpu_time_multiplier` the
+preset's worker already carries (defaults to 1.0).
 
 Standalone NSYS normalization remains available as:
 
@@ -220,28 +265,30 @@ uv run python -m alignment parse --sqlite capture.sqlite --metrics metrics.jsonl
   --iteration-start 24 --iteration-end 48 --output parsed.json
 ```
 
-After a profile completes, derive that capture's experiment-specific GPU-cycle
-correction with:
+The duty-cycle correction is derived by the analyzer's kernel-align pass, not a
+standalone command. It pools `Σ measured_gpu_cycle_ms / Σ measured_ms` over
+iterations that have a next-iteration GPU cycle (a GPU cycle is one iteration's
+first attributed kernel start to the next kernel-bearing iteration's first kernel
+start on the same device; the terminal iteration per device is excluded). The
+numerator and denominator share the analyzer's per-occurrence cross-rank
+reduction, so the kernel-layer and GPU-cycle-layer gaps stay consistent. Treat
+the factor as experiment-specific, never a GPU-wide constant.
 
-```bash
-uv run python -m alignment gpu-kernel-ratio \
-  --profile-dir logs/<experiment>/profile \
-  --output logs/<experiment>/gpu_kernel_ratio.json
-```
-
-The command defines a GPU cycle as one iteration's first attributed kernel start
-to the next kernel-bearing iteration's first kernel start on the same device.
-It reports the attributed kernel union for ownership auditing and independently
-unions every CUPTI kernel on that device inside each cycle.  The pooled
-`gpu_time_multiplier` is `sum(GPU cycle) / sum(global kernel busy)`; copy that
-value into the selected simulation worker and rerun the simulation.  The final
-iteration per device is excluded because it has no next boundary.  Never reuse
-the factor as a GPU-wide constant across unrelated captures.
-
-## Current v1 boundary
+## Current boundary
 
 - one direct `deployment: unified` simulation target;
 - one main group and one replica;
-- one vLLM model rank (`server.tp_size: 1`);
+- one symmetric tensor-parallel vLLM replica; the visible CUDA-device count must
+  equal `server.tp_size`, and the simulation arch must carry the same `tp_size`;
 - `vllm_text/single` is the first input-builder variant;
 - exact folded sequence positions and unmatched measured/simulated kernels remain explicit.
+
+For tensor parallelism, every rank keeps its own normalized ranges. The folded
+labeling inventory stores one representative sequence only after proving that
+the ordered `(name, suggested_category)` sequence is identical on every device
+for every phase/iteration. Analysis applies those labels independently to each
+rank and reduces per occurrence across ranks (an independent op takes the
+max-rank duration; a synchronizing collective takes `max(end) − max(start)`,
+dropping arrival wait), never by summing GPU durations. The kernel-align
+multiplier is derived from this same per-occurrence measured population, so its
+`measured_ms` numerator matches the breakdown the analyzer reports.
