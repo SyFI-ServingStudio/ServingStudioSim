@@ -77,21 +77,15 @@ struct WorkloadPoint {
 }
 
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
-    let input = alignment_input::read(log_dir)?;
-    if !input.workload.enabled {
-        return Ok(unavailable_pair(
-            log_dir,
-            "workload alignment disabled in analyze config",
-        ));
-    }
-
+    let input = alignment_input::read_e2e_align(log_dir)?;
+    let simulation_log_dir = input.simulation_log_dir.as_path();
     let measured = read_measured_points(&input.parsed_nsys)?;
     ensure!(
         !measured.is_empty(),
         "parsed NSYS contains no iterations with both scheduler metrics and kernels"
     );
 
-    if !register_cost_log(ctx, &input.simulation_log_dir).await? {
+    if !register_cost_log(ctx, simulation_log_dir).await? {
         return Ok(unavailable_pair(
             log_dir,
             "simulation cost_log/ dir not found",
@@ -110,7 +104,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
-            "simulation_log_dir": input.simulation_log_dir.display().to_string(),
+            "simulation_log_dir": simulation_log_dir.display().to_string(),
             "measured_iterations": measured.len(),
             "simulated_iterations": simulated.len(),
             "measured_span_ms": measured.last().map(|point| point.time_ms),
@@ -140,7 +134,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
-            "simulation_log_dir": input.simulation_log_dir.display().to_string(),
+            "simulation_log_dir": simulation_log_dir.display().to_string(),
         },
         "available": true,
         "measured": point_series(&measured),

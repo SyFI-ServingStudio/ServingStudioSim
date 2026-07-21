@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -44,7 +45,7 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
             iterations,
             plot_output_path(log_dir, "alignment_iteration_gpu_cycle_overview.png"),
             run_label=log_dir.name,
-            gpu_time_multiplier=float(payload["meta"]["gpu_time_multiplier"]),
+            gpu_time_multiplier=float(payload["meta"]["recommended_gpu_time_multiplier"]),
         ),
     ]
     sampled_breakdowns = _evenly_sample_breakdowns(payload.get("breakdowns") or [])
@@ -253,8 +254,13 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
         if float(item.get("folded_ms", 0.0)) > 1e-12
     ]
     key_rows = len(measured) + len(simulated)
-    fig_height = max(6.8, 4.7 + 0.16 * math.ceil(key_rows / 2))
-    fig, ax = plt.subplots(figsize=(18.0, fig_height))
+    fig_height = max(10.2, 7.3 + 0.16 * math.ceil(key_rows / 2))
+    fig, (ax, cumulative_ax) = plt.subplots(
+        2,
+        1,
+        figsize=(18.0, fig_height),
+        gridspec_kw={"height_ratios": [3.5, 1.6]},
+    )
 
     mapped_ids = list(
         dict.fromkeys(item["operation"] for item in measured + simulated if item.get("operation"))
@@ -282,11 +288,13 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
         label=_simulated_key,
     )
     _label_measured_phases(ax, measured)
-    for mapping_id in measured_centers.keys() & simulated_centers.keys():
+    for mapping_id, measured_center, simulated_center in _mapping_center_pairs(
+        measured_centers, simulated_centers
+    ):
         ax.add_artist(
             ConnectionPatch(
-                xyA=(measured_centers[mapping_id], 0.72),
-                xyB=(simulated_centers[mapping_id], 0.28),
+                xyA=(measured_center, 0.72),
+                xyB=(simulated_center, 0.28),
                 coordsA="data",
                 coordsB="data",
                 axesA=ax,
@@ -301,25 +309,39 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
 
     measured_sum = float(row.get("measured_kernel_sum_ms", 0.0))
     simulated_sum = float(row.get("simulated_leaf_workload_ms", 0.0))
+    _draw_cumulative_workload_error(
+        cumulative_ax,
+        measured,
+        simulated,
+        simulated_colors,
+        measured_sum_ms=measured_sum,
+        simulated_sum_ms=simulated_sum,
+    )
+    shared_workload_limit_ms = max(measured_sum, simulated_sum) * 1.03
+    if shared_workload_limit_ms <= 1e-12:
+        shared_workload_limit_ms = 1.0
+    ax.set_xlim(0.0, shared_workload_limit_ms)
+    cumulative_ax.set_xlim(0.0, shared_workload_limit_ms)
     ax.set_yticks([1.0, 0.0])
     ax.set_yticklabels(
         [
-            f"Nsight measured\n{measured_sum:.3f} ms launch sum",
+            f"Nsight measured\n{measured_sum:.3f} ms replica path",
             f"Timing-predict\n{simulated_sum:.3f} ms folded leaves",
         ]
     )
     ax.set_ylim(-0.65, 1.65)
-    ax.set_xlabel("kernel duration / folded leaf workload (ms)")
+    ax.set_xlabel("critical-path contribution / folded leaf workload (ms)")
     ax.set_title(
         f"{run_label}\nIteration {row['iteration_id']} · "
-        f"{row.get('stage', '')} per-kernel stacked breakdown"
+        f"{row.get('stage', '')} per-kernel replica critical-path breakdown"
     )
     ax.grid(True, axis="x")
     ax.text(
         0.0,
         -0.28,
-        "Measured = sum of CUDA launch durations; simulated = leaf time × exact CostTree Scale. "
-        "They are workload stacks, not overlap-aware wall-clock totals.",
+        "Measured = per-occurrence cross-rank reduction (independent: slowest-rank duration; "
+        "synchronizing collective: last-arrival→done), summed. Simulated = leaf time × CostTree Scale. "
+        "Collective arrival-wait is excluded here and lives in the GPU-cycle correction.",
         transform=ax.transAxes,
         fontsize=9,
         color="#475467",
@@ -328,10 +350,10 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
     )
     handles = measured_handles + simulated_handles
     if handles:
-        ax.legend(
+        fig.legend(
             handles=handles,
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.37),
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.015),
             ncol=2,
             frameon=False,
             fontsize=8,
@@ -342,7 +364,8 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
         left=0.14,
         right=0.98,
         top=0.88,
-        bottom=min(0.72, 0.30 + key_rows * 0.008),
+        bottom=min(0.58, 0.24 + key_rows * 0.007),
+        hspace=0.55,
     )
     # Margins and the 18-inch width above contain the title, annotation, and
     # two-column legend. Avoid tight-bbox's second layout/draw; low-compression
@@ -369,12 +392,17 @@ def _draw_stack(
     value_key: str,
     colors: list,
     label: Callable[[str, dict], str],
-) -> tuple[list[Patch], dict[str, float]]:
-    """Draw one stack and return centers for exact mapping-group arrows."""
+) -> tuple[list[Patch], dict[str, list[float]]]:
+    """Draw one stack and retain every center owned by each operation.
+
+    One measured operation may own multiple additive simulated slots.  Keeping
+    all centers prevents a later slot from silently replacing an earlier one in
+    the diagnostic arrows.
+    """
     left = 0.0
     total = sum(float(item[value_key]) for item in rows)
     handles = []
-    mapped_centers = {}
+    mapped_centers: dict[str, list[float]] = {}
     for index, (item, color) in enumerate(zip(rows, colors, strict=True), start=1):
         segment_id = f"{prefix}{index}"
         value = float(item[value_key])
@@ -401,9 +429,147 @@ def _draw_stack(
             )
         handles.append(Patch(facecolor=color, edgecolor="white", label=label(segment_id, item)))
         if item.get("operation"):
-            mapped_centers[item["operation"]] = left + value / 2
+            mapped_centers.setdefault(item["operation"], []).append(left + value / 2)
         left += value
     return handles, mapped_centers
+
+
+def _mapping_center_pairs(
+    measured_centers: dict[str, list[float]],
+    simulated_centers: dict[str, list[float]],
+) -> list[tuple[str, float, float]]:
+    """Return every operation-owned measured-to-simulated segment pair."""
+    return [
+        (operation, measured_center, simulated_center)
+        for operation in measured_centers.keys() & simulated_centers.keys()
+        for measured_center in measured_centers[operation]
+        for simulated_center in simulated_centers[operation]
+    ]
+
+
+def _simulated_width_cumulative_error_steps(
+    measured: list[dict], simulated: list[dict]
+) -> tuple[float, list[float], list[float]]:
+    """Accumulate error over variable-width simulated-slot intervals.
+
+    When one measured operation owns several simulated slots, apportion its
+    measured duration by simulated slot width.  This is a plotting convention:
+    it preserves the operation total and exact iteration endpoint without
+    inventing a kernel-level split.
+    """
+    measured_by_operation: dict[str, float] = defaultdict(float)
+    unmatched_measured_ms = 0.0
+    for item in measured:
+        operation = item.get("operation")
+        if operation:
+            measured_by_operation[operation] += float(item["duration_ms"])
+        else:
+            unmatched_measured_ms += float(item["duration_ms"])
+
+    simulated_by_operation: dict[str, float] = defaultdict(float)
+    for item in simulated:
+        operation = item.get("operation")
+        if operation:
+            simulated_by_operation[operation] += float(item["folded_ms"])
+
+    unmatched_measured_ms += sum(
+        duration_ms
+        for operation, duration_ms in measured_by_operation.items()
+        if simulated_by_operation.get(operation, 0.0) <= 1e-12
+    )
+    edges_ms = [0.0]
+    cumulative_errors_ms: list[float] = []
+    cumulative_error_ms = -unmatched_measured_ms
+    for item in simulated:
+        simulated_ms = float(item["folded_ms"])
+        operation = item.get("operation")
+        measured_share_ms = 0.0
+        if operation:
+            operation_simulated_ms = simulated_by_operation[operation]
+            measured_share_ms = (
+                measured_by_operation.get(operation, 0.0)
+                * simulated_ms
+                / operation_simulated_ms
+            )
+        cumulative_error_ms += simulated_ms - measured_share_ms
+        edges_ms.append(edges_ms[-1] + simulated_ms)
+        cumulative_errors_ms.append(cumulative_error_ms)
+    return -unmatched_measured_ms, edges_ms, cumulative_errors_ms
+
+
+def _draw_cumulative_workload_error(
+    ax,
+    measured: list[dict],
+    simulated: list[dict],
+    simulated_colors: list,
+    *,
+    measured_sum_ms: float,
+    simulated_sum_ms: float,
+) -> None:
+    """Draw a compact cumulative-error row aligned to simulated slot widths."""
+    baseline_ms, edges_ms, cumulative_errors_ms = (
+        _simulated_width_cumulative_error_steps(measured, simulated)
+    )
+    if not simulated:
+        return
+
+    for index, (item, color) in enumerate(
+        zip(simulated, simulated_colors, strict=True), start=1
+    ):
+        left_ms = edges_ms[index - 1]
+        right_ms = edges_ms[index]
+        ax.axvspan(left_ms, right_ms, color=color, alpha=0.18, linewidth=0.0)
+        if simulated_sum_ms > 0.0 and (right_ms - left_ms) / simulated_sum_ms >= 0.025:
+            ax.text(
+                (left_ms + right_ms) / 2.0,
+                0.94,
+                f"S{index}",
+                transform=ax.get_xaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=6.5,
+                color="#344054",
+            )
+
+    interval_levels_ms = [baseline_ms, *cumulative_errors_ms[:-1]]
+    ax.stairs(
+        interval_levels_ms,
+        edges_ms,
+        baseline=None,
+        color="#6941C6",
+        linewidth=1.4,
+    )
+    ax.vlines(
+        edges_ms[-1],
+        interval_levels_ms[-1],
+        cumulative_errors_ms[-1],
+        color="#6941C6",
+        linewidth=1.4,
+    )
+    ax.scatter(edges_ms[1:], cumulative_errors_ms, color="#6941C6", s=9, zorder=3)
+    ax.axhline(0.0, color="#667085", linewidth=0.9, linestyle="--")
+    ax.set_ylabel("cumulative\nsim − measured (ms)", fontsize=8)
+    ax.set_xlabel("simulated cumulative folded workload (ms)", fontsize=8)
+    ax.grid(True, axis="y", alpha=0.35)
+
+    total_delta_ms = simulated_sum_ms - measured_sum_ms
+    relative_diff_pct = (
+        total_delta_ms / measured_sum_ms * 100.0
+        if measured_sum_ms > 1e-12
+        else math.nan
+    )
+    relative_label = (
+        f"{relative_diff_pct:+.1f}%" if math.isfinite(relative_diff_pct) else "n/a"
+    )
+    ax.text(
+        edges_ms[-1],
+        cumulative_errors_ms[-1],
+        f" total {total_delta_ms:+.3f} ms ({relative_label})",
+        ha="right",
+        va="bottom",
+        fontsize=8,
+        color="#344054",
+    )
 
 
 def _aggregate_measured_for_plot(rows: list[dict]) -> list[dict]:

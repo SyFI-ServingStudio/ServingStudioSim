@@ -4,13 +4,17 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 ANALYZER_PYTHON = Path(__file__).resolve().parents[1] / "analyzer" / "python"
 sys.path.insert(0, str(ANALYZER_PYTHON))
 
 from alignment_iteration.series_plot import (  # noqa: E402
     _evenly_sample_breakdowns,
+    _mapping_center_pairs,
     _output_is_current,
     _remove_stale_breakdown_outputs,
+    _simulated_width_cumulative_error_steps,
 )
 
 
@@ -32,6 +36,47 @@ def test_evenly_sample_breakdowns_sorts_and_keeps_small_inputs() -> None:
     rows = [{"iteration_id": 9}, {"iteration_id": 3}, {"iteration_id": 7}]
 
     assert [row["iteration_id"] for row in _evenly_sample_breakdowns(rows)] == [3, 7, 9]
+
+
+def test_mapping_center_pairs_keeps_one_to_many_simulated_slots() -> None:
+    measured_centers = {"layer.attention": [1.5]}
+    simulated_centers = {"layer.attention": [2.0, 3.0]}
+
+    assert _mapping_center_pairs(measured_centers, simulated_centers) == [
+        ("layer.attention", 1.5, 2.0),
+        ("layer.attention", 1.5, 3.0),
+    ]
+
+
+def test_simulated_width_cumulative_error_steps_use_slot_workload_widths() -> None:
+    measured = [
+        {
+            "phase": "forward",
+            "name": "attention",
+            "operation": "layer.attention",
+            "duration_ms": 1.5,
+        },
+        {
+            "phase": "forward",
+            "name": "helper",
+            "operation": None,
+            "duration_ms": 0.2,
+        },
+    ]
+    simulated = [
+        {"name": "prefill", "operation": "layer.attention", "folded_ms": 0.4},
+        {"name": "decode", "operation": "layer.attention", "folded_ms": 0.6},
+        {"name": "sim-only", "operation": None, "folded_ms": 0.3},
+    ]
+
+    baseline_ms, edges_ms, cumulative_errors_ms = (
+        _simulated_width_cumulative_error_steps(measured, simulated)
+    )
+
+    assert baseline_ms == -0.2
+    assert edges_ms == [0.0, 0.4, 1.0, 1.3]
+    assert cumulative_errors_ms == pytest.approx([-0.4, -0.7, -0.4])
+    assert cumulative_errors_ms[-1] == pytest.approx(1.3 - 1.7)
 
 
 def test_output_is_current_tracks_every_render_input(tmp_path: Path) -> None:

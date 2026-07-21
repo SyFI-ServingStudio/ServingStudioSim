@@ -82,15 +82,10 @@ struct ServerGpuSpan {
 }
 
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
-    let input = alignment_input::read(log_dir)?;
-    if !input.e2e.enabled {
-        return Ok(unavailable(
-            log_dir,
-            "E2E alignment disabled in profiling config",
-        ));
-    }
-    ensure!(input.e2e.throughput_bins > 0, "throughput_bins must be > 0");
+    let input = alignment_input::read_e2e_align(log_dir)?;
+    ensure!(input.throughput_bins > 0, "throughput_bins must be > 0");
 
+    let simulation_log_dir = input.simulation_log_dir.as_path();
     let measured = read_measured_requests(&input.replay_result)?;
     let server_gpu_span = read_server_gpu_span(&input.parsed_nsys)?;
     let server_timings = input
@@ -98,7 +93,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .as_deref()
         .map(read_server_request_timings)
         .transpose()?;
-    let simulated = read_sim_requests(ctx, &input.simulation_log_dir).await?;
+    let simulated = read_sim_requests(ctx, simulation_log_dir).await?;
     ensure!(
         !measured.is_empty(),
         "measured replay contains no successful VibeSim requests"
@@ -132,7 +127,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         &measured,
         &simulated,
         server_gpu_span,
-        input.e2e.throughput_bins,
+        input.throughput_bins,
     );
     let mut latency_cdf_comparisons = vec![latency_cdf_comparison(
         "client_ttft",
@@ -211,7 +206,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
-            "simulation_log_dir": input.simulation_log_dir.display().to_string(),
+            "simulation_log_dir": simulation_log_dir.display().to_string(),
             "measured_successful_requests": measured.len(),
             "server_measured_requests": server_timings.as_ref().map(|timings| timings.request_count),
             "server_tpot_requests": server_timings
@@ -241,7 +236,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
-            "throughput_bins": input.e2e.throughput_bins,
+            "throughput_bins": input.throughput_bins,
         },
         "throughput": throughput["series"],
         "throughput_summary": throughput["summary"],
@@ -651,24 +646,6 @@ fn definitions() -> Value {
         "server_gpu_span_throughput": "all measured output tokens divided by parsed NSYS first-kernel-start to last-kernel-end span; includes inter-iteration no-kernel gaps and the final iteration, but excludes queue time before the first GPU kernel and client completion overhead",
         "simulated_completion_throughput": "all simulated output tokens divided by earliest arrival to latest finish_decode_time span",
     })
-}
-
-fn unavailable(log_dir: &Path, reason: &str) -> (Value, Value) {
-    let report = json!({
-        "schema_version": SCHEMA_VERSION,
-        "meta": {"analysis_log_dir": log_dir.display().to_string()},
-        "available": false,
-        "reason": reason,
-        "definitions": definitions(),
-    });
-    let payload = json!({
-        "schema_version": SCHEMA_VERSION,
-        "meta": {"analysis_log_dir": log_dir.display().to_string(), "available": false, "reason": reason},
-        "throughput": {},
-        "latency_cdf_comparisons": [],
-        "definitions": definitions(),
-    });
-    (report, payload)
 }
 
 #[cfg(test)]
