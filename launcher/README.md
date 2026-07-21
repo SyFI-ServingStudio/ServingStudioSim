@@ -552,8 +552,10 @@ synthetic-text inputs directly as `text_file` and `tokenizer`. A request-builder
 tag should be introduced only when another construction path has real runtime
 dispatch; unrelated trace schemas are not normalized into one sparse row.
 
-Alignment v1 requires a direct `deployment: unified` result with one main group,
-one replica, and profile `server.tp_size: 1`. The first input-builder variant is
+Alignment requires a direct `deployment: unified` result with one main group,
+one replica, and matching profile/simulation tensor-parallel sizes. A TP profile
+uses exactly `server.tp_size` visible CUDA devices and a simulation
+`llama3_dense_tp` arch with the same `tp_size`. The first input-builder variant is
 `{type: vllm_text, measured_phase: forward, group_assignment: single}`. The
 labeled folded inventory belongs only to `analyze.yaml`; iteration and E2E
 analysis can be enabled independently.

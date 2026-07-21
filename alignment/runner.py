@@ -183,6 +183,11 @@ def run_profile(cfg: ProfileConfig) -> dict:
         cfg.nsys.analyze_iteration_end,
         range_mode="phases",
     )
+    if len(parsed["device_ids"]) != cfg.server.tp_size:
+        raise RuntimeError(
+            "normalized NSYS device population does not match server tensor parallelism: "
+            f"devices={parsed['device_ids']} tp_size={cfg.server.tp_size}"
+        )
     parsed_path.write_text(json.dumps(parsed, indent=2))
     kernel_sequences_path = log_dir / "kernel_sequences.json"
     write_kernel_sequences(kernel_sequences_path, parsed, parsed_path)
@@ -204,6 +209,8 @@ def run_profile(cfg: ProfileConfig) -> dict:
         "server_log": str(server_log),
         "gpu": cfg.gpu,
         "server_tp_size": cfg.server.tp_size,
+        "cuda_visible_devices": cfg.cuda_visible_devices,
+        "parsed_device_ids": parsed["device_ids"],
         "replay_result": str(prepared_replay.log_path.resolve()),
         "drive_summary": drive_summary,
         "validation": validation,

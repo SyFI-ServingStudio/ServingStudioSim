@@ -6,8 +6,8 @@ artifact root. YAML/JSON parsing belongs to ``launcher.alignment_config``; this
 module only defines the typed runtime values consumed by profiling code.
 
 `ServerConfig` / `IdleWaitConfig` are the launch-level knobs consumed by
-`vllm_server.py` (a lean, single-GPU descendant of the reference harness's
-`launchers/config.py`).
+`vllm_server.py`. One profile represents one replica and may expose several
+devices when tensor parallelism is enabled.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from ..load_generator.config import LoadGeneratorConfig
 
 @dataclass
 class ServerConfig:
-    """How to launch one vLLM server on one GPU (single-GPU, tp=1 milestone)."""
+    """How to launch one vLLM server for one tensor-parallel replica."""
 
     model_path: str
     host: str = "127.0.0.1"
@@ -102,7 +102,7 @@ class ProfileConfig:
     name: str
     log_dir: str
     gpu: str  # DB/display GPU name, e.g. "NVIDIA H200"
-    cuda_visible_devices: str = "0"  # the single physical GPU to run on
+    cuda_visible_devices: str = "0"  # comma-separated physical GPUs; count equals tp_size
 
     # --- vLLM side ---
     fork_python: str = ""  # abs path to the instrumented-fork venv python

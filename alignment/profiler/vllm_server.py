@@ -1,4 +1,4 @@
-"""Launch one instrumented-fork vLLM server on one GPU (single-GPU milestone).
+"""Launch one instrumented-fork vLLM server for one TP replica.
 
 A lean, single-GPU descendant of the reference harness's `launchers/vllm.py` +
 `base.py`. Builds the server argv and a **clean subprocess env** (the vLLM/torch
@@ -41,7 +41,7 @@ _COMPLETION_ENGINE_REQUEST_RE = re.compile(r"^cmpl-(.+)-0$")
 
 
 def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
-    """The `python -m vllm.entrypoints.openai.api_server ...` argv (single GPU)."""
+    """The `python -m vllm.entrypoints.openai.api_server ...` argv."""
     argv = [
         fork_python,
         "-m",

@@ -18,11 +18,66 @@ KernelOccurrence = dict[str, str]
 def build_kernel_sequences(
     iteration_details: list[dict[str, Any]], kernel_names: dict[int, str]
 ) -> dict[str, dict[str, Any]]:
-    """Deduplicate exact phase sequences and fold their contiguous repeats."""
+    """Build one canonical catalog after proving TP-rank sequence symmetry.
+
+    A tensor-parallel replica executes rank-local kernels concurrently. Folding
+    ranges from several devices into one phase sequence would serialize those
+    ranks and double/quadruple the apparent model work. Keep one representative
+    device only after every participating device has the exact same catalog.
+    """
+    catalogs, _, _ = build_symmetric_device_kernel_sequences(iteration_details, kernel_names)
+    return catalogs
+
+
+def build_symmetric_device_kernel_sequences(
+    iteration_details: list[dict[str, Any]], kernel_names: dict[int, str]
+) -> tuple[dict[str, dict[str, Any]], list[int], int]:
+    """Return the representative catalog and its validated device population."""
+    device_ids = sorted(
+        {
+            int(range_row["device_id"])
+            for detail in iteration_details
+            for range_row in detail.get("ranges", [])
+            if range_row.get("device_id") is not None and range_row.get("kernels")
+        }
+    )
+    # Small unit fixtures written before the normalized schema carried an
+    # explicit device id represent the original single-rank contract.
+    if not device_ids and any(
+        range_row.get("kernels")
+        for detail in iteration_details
+        for range_row in detail.get("ranges", [])
+    ):
+        device_ids = [0]
+    if not device_ids:
+        raise ValueError("kernel sequence inventory has no kernel-bearing device")
+
+    catalogs_by_device = {
+        device_id: _build_device_kernel_sequences(iteration_details, kernel_names, device_id)
+        for device_id in device_ids
+    }
+    representative_device_id = device_ids[0]
+    representative = catalogs_by_device[representative_device_id]
+    for device_id in device_ids[1:]:
+        if catalogs_by_device[device_id] != representative:
+            raise ValueError(
+                "tensor-parallel kernel sequences are not symmetric: "
+                f"device {device_id} differs from representative device "
+                f"{representative_device_id}"
+            )
+    return representative, device_ids, representative_device_id
+
+
+def _build_device_kernel_sequences(
+    iteration_details: list[dict[str, Any]], kernel_names: dict[int, str], device_id: int
+) -> dict[str, dict[str, Any]]:
+    """Deduplicate and fold exact phase sequences for one physical rank."""
     grouped: dict[tuple[str, tuple[int, ...]], dict[str, Any]] = {}
     for detail in iteration_details:
         ranges_by_phase: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for range_row in detail.get("ranges", []):
+            if int(range_row.get("device_id", 0)) != device_id:
+                continue
             ranges_by_phase[str(range_row["phase"])].extend(range_row.get("kernels", []))
         for phase, kernels in ranges_by_phase.items():
             if not kernels:

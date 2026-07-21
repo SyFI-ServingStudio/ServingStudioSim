@@ -37,7 +37,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .sequence import build_kernel_sequences
+from .sequence import build_symmetric_device_kernel_sequences
 
 # Alignment traces require inline, indexed iteration markers. Stage information
 # comes from the same iteration index in the metrics JSONL.
@@ -621,6 +621,9 @@ def parse_trace(
             "all": summarize_devices(phase_ranges, top_n),
         }
     iteration_details = build_iteration_details(ranges, metrics, kernel_name_ids)
+    kernel_sequences, device_ids, representative_device_id = (
+        build_symmetric_device_kernel_sequences(iteration_details, kernel_names)
+    )
     return {
         "schema_version": 2,
         "sqlite": str(sqlite_path),
@@ -633,7 +636,9 @@ def parse_trace(
         "phases": phases,
         "kernel_names": kernel_names,
         "iteration_details": iteration_details,
-        "kernel_sequences": build_kernel_sequences(iteration_details, kernel_names),
+        "device_ids": device_ids,
+        "representative_device_id": representative_device_id,
+        "kernel_sequences": kernel_sequences,
         "by_phase": by_phase,
         "by_stage": by_stage,
         "all": summarize_devices(ranges, top_n),
@@ -666,13 +671,16 @@ def build_parser() -> argparse.ArgumentParser:
 def write_kernel_sequences(path: Path, parsed: dict, source_parsed: Path | None) -> None:
     """Write the folded, label-ready sequence inventory separately from parsed.json."""
     document = {
-        "schema_version": 2,
+        "schema_version": 3,
         "encoding": "folded-v1",
         "source_parsed": str(source_parsed) if source_parsed is not None else None,
+        "device_ids": parsed["device_ids"],
+        "representative_device_id": parsed["representative_device_id"],
         "folding_policy": {
             "kind": "exact_contiguous_repeat",
             "match_fields": ["name", "suggested_category"],
             "row_identity": "sequence_id:expanded_ordinal",
+            "rank_policy": "one representative after exact cross-device equality",
         },
         "phases": parsed["kernel_sequences"],
     }
