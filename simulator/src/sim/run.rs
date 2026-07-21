@@ -21,6 +21,10 @@ use crate::orchestrator::{Flow, OrchAction};
 /// Sim-time between heartbeat log lines (matches ref/moesim-rs's 1 s).
 const HEARTBEAT_INTERVAL_MS: f64 = 1000.0;
 
+/// Sim-time between aggregate `request_state` rows. Segmented throughput diffs
+/// consecutive rows, so this is its raw temporal resolution.
+const REQUEST_STATE_SNAPSHOT_INTERVAL_MS: f64 = 10_000.0;
+
 /// Sim-time between stuck-watchdog samples. The watchdog is an O(1) liveness
 /// check (did `completed` or the admitted-id watermark advance since the last
 /// sample), so the cadence only bounds how fast a true stall is detected, not
@@ -114,7 +118,7 @@ impl RunSummary {
     }
 }
 
-/// Tick-loop knobs. `snapshot_dt` (the `request_state` cadence) is 100 s and
+/// Tick-loop knobs. `snapshot_dt` (the `request_state` cadence) is 10 s and
 /// `stuck_threshold` (no-progress budget) is 60 s; `tick_dt` is the caller-chosen
 /// tick step (`WorkloadSpec::tick_dt_us`, default 100 µs — see `new`).
 #[derive(Clone, Copy, Debug)]
@@ -140,7 +144,7 @@ impl TickCfg {
             tick_dt,
             duration: Time::from_ms(duration_ms),
             run_to_end,
-            snapshot_dt: Time::from_ms(100_000.0),
+            snapshot_dt: Time::from_ms(REQUEST_STATE_SNAPSHOT_INTERVAL_MS),
             stuck_threshold: Time::from_ms(60_000.0),
         }
     }
@@ -483,6 +487,13 @@ mod tests {
         let fires: Vec<bool> = (0..7).map(|_| e.fire()).collect();
         // Fires on call 0 (t=0 baseline), then every 3rd call.
         assert_eq!(fires, vec![true, false, false, true, false, false, true]);
+    }
+
+    #[test]
+    fn tick_cfg_samples_request_state_every_ten_seconds() {
+        let cfg = TickCfg::new(60_000.0, false, 100);
+
+        assert_eq!(cfg.snapshot_dt, Time::from_ms(10_000.0));
     }
 
     #[test]

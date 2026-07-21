@@ -1,6 +1,7 @@
 //! Per-kind L1 kernel structs.
 
 pub mod all_reduce;
+pub mod all_reduce_residual_rms_norm;
 pub mod elementwise;
 pub mod engine;
 pub mod flashinfer_attn_decode;
@@ -14,6 +15,10 @@ pub mod rms_norm;
 pub mod single_gemm;
 
 pub use all_reduce::{AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, AllReduceSpec};
+pub use all_reduce_residual_rms_norm::{
+    AllReduceResidualRmsNormKernel, AllReduceResidualRmsNormKernelConfig,
+    AllReduceResidualRmsNormKernelInput, AllReduceResidualRmsNormSpec,
+};
 pub use elementwise::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ElementwiseSpec,
 };

@@ -67,7 +67,8 @@ that aggregate row.
 
 ## `TickCfg` — the loop knobs
 
-`tick_dt` 100 µs, `snapshot_dt` 100 s, `stuck_threshold` 60 s. The 100 µs tick is
+`tick_dt` 100 µs, `snapshot_dt` 10 s, `stuck_threshold` 60 s. The 10 s snapshot
+cadence is the raw temporal resolution of segmented throughput. The 100 µs tick is
 a deliberate quantization choice: per-iteration/token work is `O(events)`, not
 `O(ticks)`, so a finer tick buys ~no accuracy for more iterations (the doc-comment
 records the bias measurements).
