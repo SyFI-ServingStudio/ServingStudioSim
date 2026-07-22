@@ -16,6 +16,7 @@ import pytest
 
 from model.work import Workload, load_model
 from model.work.core import AttnInteraction
+from model.work.parameter_counts import compute_parameter_counts
 from model.work.registry import UnknownArchitecture, build_model
 
 CONFIG = Path(__file__).resolve().parents[1] / "model" / "config" / "llama3_8b.json"
@@ -57,6 +58,16 @@ def test_params(model):
     assert breakdown["lm_head"] == EMBED
     assert breakdown["norm"] == NORMS
     assert breakdown["experts"] == 0 and breakdown["shared"] == 0
+
+
+def test_parameter_count_subprocess_contract():
+    counts = compute_parameter_counts(CONFIG)
+    assert counts == {
+        "total": 8_030_261_248,
+        "active": 8_030_261_248,
+        "active_layers": 6_979_588_096,
+        "active_definition": "with_embed_head",
+    }
 
 
 def test_decode_flop_buckets(model):

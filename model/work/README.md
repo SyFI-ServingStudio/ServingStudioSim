@@ -45,6 +45,7 @@ tensor traffic is fusible away; norm and activation compute remain unpinned.
 ```
 uv run python -m model.work model/config/llama3_8b.json --decode 256x4096
 uv run python -m model.work <config> --prefill 8192@0 --gpu B200 --json
+uv run python -m model.work.parameter_counts <config>
 ```
 
 ## Architecture: compose, don't cross-product

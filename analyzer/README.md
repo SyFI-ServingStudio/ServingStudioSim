@@ -84,6 +84,11 @@ sim/L7, containing:
 - `raw/run_meta.json` — sim-written sidecar (`num_gpus`, `gpu_name`); the
   throughput subject reads it to normalize per-GPU. Absent → treated as 1 GPU.
 
+The UI model resource preserves the raw config and enriches it with optional
+`model.work` parameter counts (`total`, model-card-style `active`, and
+`active_layers`). Unsupported architectures degrade only this enrichment to
+`null`; the config resource remains readable.
+
 All three are read as bare JSON / parquet by name — no `simulator` types crossed.
 Worker detail remains outside the run descriptor body: the descriptor advertises
 the `workers` capability, and the only selectable entity is one raw operation.

@@ -536,7 +536,7 @@ fn descriptor_indexes_existing_core_resources() {
     assert_eq!(descriptor["deployment"], "afd");
     assert_eq!(descriptor["model_name"], "model/config/qwen.json");
     assert_eq!(descriptor["model"]["href"], "model");
-    assert_eq!(descriptor["model"]["schema_version"], 1);
+    assert_eq!(descriptor["model"]["schema_version"], 2);
     assert_eq!(descriptor["summary"]["href"], "summary");
     assert_eq!(descriptor["topology"]["href"], "topology");
     assert_eq!(descriptor["topology"]["schema_version"], 1);
@@ -660,10 +660,13 @@ fn model_resource_reads_repo_config_named_by_run_params() {
 
     let model = read_model(&run, repo.path()).expect("read model resource");
 
-    assert_eq!(model["schema_version"], 1);
+    assert_eq!(model["schema_version"], 2);
     assert_eq!(model["source_path"], "model/config/qwen.json");
     assert_eq!(model["config"]["hidden_size"], 6144);
     assert_eq!(model["config"]["num_hidden_layers"], 62);
+    // The temporary repository intentionally has no model.work package; raw
+    // config remains available while optional enrichment degrades to null.
+    assert!(model["parameter_counts"].is_null());
 }
 
 #[test]

@@ -54,7 +54,7 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
         descriptor["model"] = json!({
             "href": "model",
             "media_type": "application/json",
-            "schema_version": 1,
+            "schema_version": 2,
         });
     }
     if !trace_file_paths(&params)?.is_empty() {

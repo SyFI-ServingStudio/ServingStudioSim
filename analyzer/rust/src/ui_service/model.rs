@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -38,11 +39,29 @@ pub(super) fn read_model(run: &DiscoveredRun, repo_root: &Path) -> Result<Value>
     if !canonical_model.starts_with(&canonical_root) {
         anyhow::bail!("model_config resolves outside model/config");
     }
+    let parameter_counts = model_work_parameter_counts(repo_root, &canonical_model);
     Ok(json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "source_path": source_path,
         "config": read_json(&canonical_model)?,
+        "parameter_counts": parameter_counts,
     }))
+}
+
+/// Keep the overview independent of HF config conventions: `model.work` owns
+/// architecture-aware total/active counting. Unsupported models degrade only
+/// this optional enrichment, never the raw model resource.
+fn model_work_parameter_counts(repo_root: &Path, model_path: &Path) -> Option<Value> {
+    let output = Command::new("uv")
+        .args(["run", "python", "-m", "model.work.parameter_counts"])
+        .arg(model_path)
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 pub(super) fn model_config_path(params: &Value) -> Result<Option<String>> {
