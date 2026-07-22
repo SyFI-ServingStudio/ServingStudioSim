@@ -447,6 +447,19 @@ impl WorkloadTotals {
         self.decode_kv += other.decode_kv;
         self.prefill_requests += other.prefill_requests;
     }
+
+    /// Replicate independent copies of one workload without changing sequence
+    /// geometry. Every stored quantity is additive across batch entries, so this
+    /// models rebatching; it must never be interpreted as lengthening context.
+    pub(crate) fn scale(&mut self, factor: f64) {
+        self.matmul_tokens *= factor;
+        self.prefill_tokens *= factor;
+        self.decode_passes *= factor;
+        self.prefill_pairs *= factor;
+        self.prefill_cached *= factor;
+        self.decode_kv *= factor;
+        self.prefill_requests *= factor;
+    }
 }
 
 /// Aggregate `cost_log` `groups` per (pool_tag, worker_id) in one scan. Walks the list
@@ -792,5 +805,22 @@ mod tests {
 
         assert_eq!(decode["positive_boundary_allowance"], 1.0);
         assert_eq!(ffn["positive_boundary_allowance"], 1.0);
+    }
+
+    #[test]
+    fn workload_replication_scales_additive_geometry_without_recomputing_it() {
+        let mut totals = WorkloadTotals {
+            matmul_tokens: 3.0,
+            prefill_tokens: 2.0,
+            decode_passes: 1.0,
+            prefill_pairs: 7.0,
+            prefill_cached: 4.0,
+            decode_kv: 16.0,
+            prefill_requests: 1.0,
+        };
+        totals.scale(1_000.0);
+        assert_eq!(totals.matmul_tokens, 3_000.0);
+        assert_eq!(totals.prefill_pairs, 7_000.0);
+        assert_eq!(totals.decode_kv, 16_000.0);
     }
 }

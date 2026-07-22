@@ -116,11 +116,13 @@ returns the full one-row waterfall for that worker iteration, while the sibling
 `optimality-kernel-ladder` resource returns the per-kernel ladder.
 Both fold every matching row and use the explicit `mode` query. Iterations have
 no scheduler holding-span boundary, so R0=R1 and idle is zero; R1-R2 remains
-aggregate imbalance. In batch-locked mode the waterfall may split R5 with the
-exact fixed-batch segmented and fully fused necessary-work floors. When a strict
-versioned semantic-location map covers the manifest, the kernel ladder also
-appends R6 and per-location necessary/redundant/under-accounted work; otherwise
-it remains R0-R5.
+aggregate imbalance. Both modes may split R5 with segmented and fully fused
+necessary-work floors. Batch-locked mode labels the exact observed batch; unlocked
+mode labels 1000 independent copies of its batch entries and normalizes back to one
+iteration, amortizing weights without changing sequence length. When a strict
+versioned semantic-location map covers the manifest, either mode's kernel ladder
+also appends R6 and per-location necessary/redundant/under-accounted work; otherwise
+it remains R0-R5. The detail meta records the mode and replication factor.
 The alignment path reads `<analysis_log_dir>/alignment_manifest.json`, which
 points to normalized NSYS JSON in the profile root, timing-predict cost
 parquet/manifest, the profile's `replay_result` TraceLab JSONL, its optional

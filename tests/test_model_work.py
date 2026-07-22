@@ -197,6 +197,29 @@ def test_llama_semantic_segments_include_attention_phases_and_cache_write(model)
     assert rows["input_norm"].flops_total == 0
 
 
+def test_replicated_batch_amortizes_weights_but_preserves_per_iteration_kv(model):
+    replication_factor = 1_000
+    base = {s.name: s for s in model.label(Workload.causal_lm(decode=[4096])).segments}
+    replicated = {
+        s.name: s
+        for s in model.label(Workload.causal_lm(decode=[4096] * replication_factor)).segments
+    }
+
+    # Replication means more independent batch entries, never a longer context.
+    assert replicated["qkv"].flops_total / replication_factor == base["qkv"].flops_total
+    assert (
+        replicated["attn.decode"].bytes_total / replication_factor
+        == base["attn.decode"].bytes_total
+    )
+    assert (
+        replicated["kv_cache_append"].bytes_total / replication_factor
+        == base["kv_cache_append"].bytes_total
+    )
+    # Dense weights load once for the mega-batch and are amortized on normalization.
+    assert replicated["qkv"].bytes_total == base["qkv"].bytes_total
+    assert replicated["qkv"].bytes_total / replication_factor < base["qkv"].bytes_total
+
+
 # --------------------------------------------------------------------------- #
 # Phase 2: MoE (Qwen3-MoE)
 # --------------------------------------------------------------------------- #

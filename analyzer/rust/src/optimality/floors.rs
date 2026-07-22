@@ -11,9 +11,10 @@
 //!   truly irreducible floor.
 //! - **segmented** — `Σ_seg max(compute, memory)`: per-op serial bound (≥ necessary).
 //!
-//! Run aggregates use one unlocked mega-batch. Exact batch-locked iteration detail
-//! instead sends only that iteration's observed workload, preserving its weight-load
-//! and expert-occupancy batch. The labeler is a subprocess
+//! Run aggregates use one unlocked mega-batch. Exact iteration detail uses the
+//! observed workload directly in locked mode; unlocked mode replicates its independent
+//! batch entries before labeling and normalizes the result back to one iteration.
+//! Replication amortizes weights without changing sequence geometry. The labeler is a subprocess
 //! (`uv run python -m model.work.floors`); any failure degrades gracefully to the
 //! plain R0..R5 ladder (the caller records a caveat).
 
@@ -67,28 +68,36 @@ pub(super) async fn compute_floors(ctx: &SessionContext, log_dir: &Path) -> Resu
     run_labeler(log_dir, &levels)
 }
 
-/// Label the exact observed batch of one worker iteration. This is the locked-batch
-/// counterpart of [`compute_floors`]: it intentionally sends only one iteration to
-/// `model.work`, so neither weight traffic nor expert occupancy is amortized across
-/// iterations. The returned pair still distinguishes full-forward fusion
-/// (`necessary`) from the serial per-segment roofline (`segmented`).
+/// Label one worker iteration after replicating its independent batch entries.
+/// `replication_factor=1` is the exact locked batch. A larger factor is the unlocked
+/// large-batch counterfactual: additive compute/KV work scales, while model weights
+/// remain loaded once inside `model.work`; all output is normalized back to one
+/// original iteration before returning.
 pub(super) async fn compute_iteration_label(
     ctx: &SessionContext,
     log_dir: &Path,
     pool_tag: &str,
     worker_id: u16,
     iter_id: u64,
+    replication_factor: u32,
 ) -> Result<IterationLabel> {
-    let totals = collect_iteration_workload(ctx, pool_tag, worker_id, iter_id).await?;
+    if replication_factor == 0 {
+        return Err(anyhow!("iteration replication factor must be positive"));
+    }
+    let mut totals = collect_iteration_workload(ctx, pool_tag, worker_id, iter_id).await?;
     if totals.matmul_tokens <= 0.0 {
         return Err(anyhow!("iteration has no model workload to label"));
     }
+    let normalization = f64::from(replication_factor);
+    totals.scale(normalization);
     let level_key = format!("{pool_tag}/{worker_id}");
     let levels = HashMap::from([(level_key.clone(), totals)]);
     let response = run_labeler_json(log_dir, &levels)?;
-    let floors = parse_response(&response)?
+    let mut floors = parse_response(&response)?
         .remove(&level_key)
         .context("labeler output missing exact iteration floor")?;
+    floors.necessary /= normalization;
+    floors.segmented /= normalization;
     let level = response
         .get("levels")
         .and_then(Value::as_object)
@@ -109,11 +118,13 @@ pub(super) async fn compute_iteration_label(
                 flops: segment
                     .get("flops")
                     .and_then(Value::as_f64)
-                    .context("semantic segment missing flops")?,
+                    .context("semantic segment missing flops")?
+                    / normalization,
                 bytes: segment
                     .get("bytes")
                     .and_then(Value::as_f64)
-                    .context("semantic segment missing bytes")?,
+                    .context("semantic segment missing bytes")?
+                    / normalization,
             })
         })
         .collect::<Result<Vec<_>>>()?;

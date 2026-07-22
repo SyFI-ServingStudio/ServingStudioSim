@@ -17,10 +17,10 @@ each successive gap is an attributable source of sub-optimality:
 
 Buckets telescope and sum exactly back to Real, drawn as a stacked bar at five
 levels — cluster / pool / worker / iteration (idle 0 by construction) / per-kernel.
-For unlocked analysis, the independent `model.work` labeler adds segmented and
+For unlocked run-level analysis, the independent `model.work` labeler adds segmented and
 global necessary-work bounds below R5. The R5 green band then splits into
 `excess_over_necessary`, `fusion`, and `hardware_necessary`; their sum remains
-exactly R5. Locked analysis does not compute these bounds because its observed
+exactly R5. Locked run-level analysis does not compute these bounds because its observed
 operating points are fixed and cannot be globally rebatchable.
 
 The payload also carries one per-worker kernel rung ladder. Its R0/R1 bars reuse
@@ -34,12 +34,14 @@ The UI service exposes two separate on-demand contracts for one selected
 `(pool_tag, worker_id, iter_id)`: a complete one-row waterfall and a per-kernel
 ladder. Both fold every matching row rather than sampling and define
 R0=R1 because an individual iteration has no scheduler holding-span boundary;
-`R1-R2` remains one aggregate imbalance chunk. In batch-locked mode only, the
-waterfall reconstructs that iteration's exact workload from `groups` and splits
-R5 at the segmented and fully fused necessary-work floors.
+`R1-R2` remains one aggregate imbalance chunk. In both modes, the waterfall
+reconstructs that iteration's workload from `groups` and splits R5 at the segmented
+and fully fused necessary-work floors. Locked mode labels the exact batch. Unlocked
+mode replicates each independent batch entry 1000 times, labels that large-batch
+counterfactual, then divides every result by 1000; it never multiplies sequence length.
 
-For a batch-locked exact iteration, a versioned semantic-location map may provide
-that missing rule. The independent labeler emits minimum FLOPs/bytes per semantic
+For an exact iteration, a versioned semantic-location map provides the attribution
+rule. The independent labeler emits minimum FLOPs/bytes per semantic
 operation; the map assigns each row exactly once to an exact manifest location.
 Only a complete, reconciling map extends the kernel ladder with a
 location-attributed segmented-necessary rung. Otherwise the endpoint remains the
@@ -75,9 +77,9 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
 - `spec.rs` — the R5 hardware ceilings. Resolves the run's `gpu_name` to a `gpu/spec.json`
   entry by its explicit `aliases`, then dense peak TFLOP/s by dtype + HBM GB/s.
 - `floors.rs` — bridge to the independent `model.work` labeler. It computes
-  unlocked per-level bounds and the locked-only exact-iteration pair; failure is
+  unlocked per-level bounds plus exact-iteration bounds for both modes; failure is
   additive-only and degrades to the plain R5 ladder.
-- `location.rs` — strict locked-iteration semantic-location mapping. It validates
+- `location.rs` — strict exact-iteration semantic-location mapping. It validates
   complete coverage, computes per-location `max(FLOPs/TFLOPS, bytes/BW)`, and
   attaches R6 plus redundant/under-accounted diagnostics atomically.
 

@@ -15,6 +15,16 @@ use super::run::COST_COLS;
 use super::spec::{self, GpuSpec};
 use super::{floors, fold, grid_peaks, kernel, levels, location, prepare};
 
+const UNLOCKED_ITERATION_REPLICATION_FACTOR: u32 = 1_000;
+
+fn necessary_work_replication_factor(lock_batch_size: bool) -> u32 {
+    if lock_batch_size {
+        1
+    } else {
+        UNLOCKED_ITERATION_REPLICATION_FACTOR
+    }
+}
+
 struct ExactIterationFold {
     ladder: Value,
     worker_rungs_gpu_ms: [f64; 6],
@@ -49,39 +59,43 @@ pub(crate) async fn iteration_kernel_ladder(
     )
     .await?;
     let mut caveats = Vec::new();
-    let attribution = if lock_batch_size {
-        let ctx = build_session();
-        if !register_cost_log(&ctx, log_dir).await? {
-            bail!("cost_log/ dir not found");
-        }
-        match floors::compute_iteration_label(&ctx, log_dir, pool_tag, worker_id, iter_id).await {
-            Ok(label) => match location::attribute_iteration(
-                repo_root,
-                log_dir,
-                pool_tag,
-                &exact.kernel_locations,
-                &mut exact.ladder,
-                &label,
-                exact.gpu_spec,
-                exact.gpu_count,
-            ) {
-                Ok(attribution) => Some(attribution),
-                Err(error) => {
-                    caveats.push(format!(
-                        "per-location necessary work unavailable ({error:#})"
-                    ));
-                    None
-                }
-            },
+    let replication_factor = necessary_work_replication_factor(lock_batch_size);
+    let ctx = build_session();
+    if !register_cost_log(&ctx, log_dir).await? {
+        bail!("cost_log/ dir not found");
+    }
+    let attribution = match floors::compute_iteration_label(
+        &ctx,
+        log_dir,
+        pool_tag,
+        worker_id,
+        iter_id,
+        replication_factor,
+    )
+    .await
+    {
+        Ok(label) => match location::attribute_iteration(
+            repo_root,
+            log_dir,
+            pool_tag,
+            &exact.kernel_locations,
+            &mut exact.ladder,
+            &label,
+            exact.gpu_spec,
+            exact.gpu_count,
+        ) {
+            Ok(attribution) => Some(attribution),
             Err(error) => {
                 caveats.push(format!(
-                    "exact iteration necessary work unavailable ({error:#})"
+                    "per-location necessary work unavailable ({error:#})"
                 ));
                 None
             }
+        },
+        Err(error) => {
+            caveats.push(format!("iteration necessary work unavailable ({error:#})"));
+            None
         }
-    } else {
-        None
     };
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
@@ -99,6 +113,8 @@ pub(crate) async fn iteration_kernel_ladder(
             "folded_rows": exact.folded_rows,
             "batch_size_locked": lock_batch_size,
             "necessary_work_available": attribution.is_some(),
+            "necessary_work_replication_factor": replication_factor,
+            "necessary_work_mode": if lock_batch_size { "batch_locked" } else { "replicated_large_batch" },
             "location_mapping_id": attribution.as_ref().map(|value| value.mapping_id.as_str()),
             "caveats": caveats,
         },
@@ -126,22 +142,28 @@ pub(crate) async fn iteration_waterfall(
     )
     .await?;
     let mut caveats = Vec::new();
-    let iteration_floor = if lock_batch_size {
-        let ctx = build_session();
-        if !register_cost_log(&ctx, log_dir).await? {
-            bail!("cost_log/ dir not found");
+    let replication_factor = necessary_work_replication_factor(lock_batch_size);
+    let ctx = build_session();
+    if !register_cost_log(&ctx, log_dir).await? {
+        bail!("cost_log/ dir not found");
+    }
+    let iteration_floor = match floors::compute_iteration_label(
+        &ctx,
+        log_dir,
+        pool_tag,
+        worker_id,
+        iter_id,
+        replication_factor,
+    )
+    .await
+    {
+        Ok(label) => Some(label.floors),
+        Err(error) => {
+            caveats.push(format!(
+                "exact iteration necessary-work floors unavailable ({error:#})"
+            ));
+            None
         }
-        match floors::compute_iteration_label(&ctx, log_dir, pool_tag, worker_id, iter_id).await {
-            Ok(label) => Some(label.floors),
-            Err(error) => {
-                caveats.push(format!(
-                    "exact iteration necessary-work floors unavailable ({error:#})"
-                ));
-                None
-            }
-        }
-    } else {
-        None
     };
     let level_key = format!("{pool_tag}/{worker_id}/{iter_id}");
     let level_label = format!("{pool_tag}/{worker_id} / iter {iter_id}");
@@ -166,6 +188,8 @@ pub(crate) async fn iteration_waterfall(
             "folded_rows": exact.folded_rows,
             "batch_size_locked": lock_batch_size,
             "necessary_work_available": iteration_floor.is_some(),
+            "necessary_work_replication_factor": replication_factor,
+            "necessary_work_mode": if lock_batch_size { "batch_locked" } else { "replicated_large_batch" },
             "caveats": caveats,
         },
     }))

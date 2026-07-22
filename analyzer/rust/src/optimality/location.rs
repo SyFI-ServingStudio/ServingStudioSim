@@ -1,4 +1,4 @@
-//! Strict semantic-work → exact CostTree-location attribution for a locked batch.
+//! Strict semantic-work → exact CostTree-location attribution for one iteration.
 //!
 //! Mapping files are model-independent of simulator shapes: they connect stable
 //! `model.work` semantic rows to versioned manifest location names. Attribution is
@@ -40,7 +40,7 @@ struct NecessaryWork {
     bytes: f64,
 }
 
-/// Add R6 and per-location necessary-work diagnostics to an exact locked ladder.
+/// Add R6 and per-location necessary-work diagnostics to an exact iteration ladder.
 /// Any validation failure returns before mutation, preserving the plain R0..R5 view.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn attribute_iteration(
