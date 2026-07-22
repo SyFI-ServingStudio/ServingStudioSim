@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from model.work import Workload, load_model
+from model.work import floors as work_floors
 from model.work.core import AttnInteraction
 from model.work.parameter_counts import compute_parameter_counts
 from model.work.registry import UnknownArchitecture, build_model
@@ -68,6 +69,32 @@ def test_parameter_count_subprocess_contract():
         "active_layers": 6_979_588_096,
         "active_definition": "with_embed_head",
     }
+
+
+def test_floor_batch_isolates_one_heterogeneous_level(monkeypatch, model):
+    pool_specs = {
+        "main": {"config": str(CONFIG), "gpu": "H200", "dtype": "bf16"},
+        "other": {"config": "different-model.json", "gpu": "H200", "dtype": "bf16"},
+    }
+    monkeypatch.setattr(work_floors, "_pool_specs", lambda _log_dir: pool_specs)
+    monkeypatch.setattr(work_floors, "_model", lambda _config_path: model)
+    totals = {
+        "matmul_tokens": 1,
+        "prefill_tokens": 0,
+        "decode_passes": 1,
+        "prefill_pairs": 0,
+        "prefill_cached": 0,
+        "decode_kv": 1,
+        "prefill_requests": 0,
+    }
+
+    result = work_floors.compute_floors(
+        Path("unused"), {"cluster": totals, "main": totals}
+    )
+
+    assert "error" in result["cluster"]
+    assert result["main"]["necessary"] > 0
+    assert result["main"]["segmented"] >= result["main"]["necessary"]
 
 
 def test_decode_flop_buckets(model):

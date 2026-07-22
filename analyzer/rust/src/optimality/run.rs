@@ -15,9 +15,10 @@ use crate::io::{read_cost_manifests, read_run_meta, read_worker_gpu_counts, SCHE
 use crate::kernel_query::repo_root;
 use crate::session::{register_cost_log, require_columns, COST_LOG_TABLE};
 
+use super::ladder::NecessaryWorkPolicy;
 use super::spec::{self, GpuSpec};
 use super::{
-    bucket_keys, ms_to_s, ratio, rung_keys, BUCKET_KEYS, KERNEL_RUNG_KEYS, R0, R5, RUNG_KEYS,
+    bucket_keys, ms_to_s, ratio, rung_keys, BUCKET_KEYS, KERNEL_RUNG_KEYS, RUNG_KEYS,
     UNLOCKED_ITERATION_REPLICATION_FACTOR,
 };
 use super::{floors, fold, grid_peaks, kernel, levels, location, prepare};
@@ -185,15 +186,22 @@ pub async fn run_optimality(
         }
     };
     let necessary_work_floors = run_labels.as_ref().map(|labels| &labels.floors);
-    let has_necessary_work_floors = necessary_work_floors.is_some();
+    let has_necessary_work_floors = necessary_work_floors.is_some_and(|floors| !floors.is_empty());
+    if let Some(labels) = run_labels.as_ref() {
+        for (level_key, error) in &labels.errors {
+            caveats.push(format!(
+                "necessary-work label unavailable for {level_key:?} ({error})"
+            ));
+        }
+    }
     let cluster_floor = necessary_work_floors
         .and_then(|by_level| by_level.get("cluster"))
         .copied();
     let cluster_necessary_ratio = cluster_floor.map(|floor| {
-        let green_s = ms_to_s(tier_aggregates.cluster_rungs[R5]);
+        let green_s = ms_to_s(tier_aggregates.cluster_rungs.hardware_limit);
         ratio(
-            floor.necessary.clamp(0.0, green_s),
-            ms_to_s(tier_aggregates.cluster_rungs[R0]),
+            floor.fused.clamp(0.0, green_s),
+            ms_to_s(tier_aggregates.cluster_rungs.real),
         )
     });
     let kernel_rungs_by_location = kernel::aggregate_kernel_rungs(
@@ -201,7 +209,7 @@ pub async fn run_optimality(
         &tier_aggregates.worker_anchor_factors,
         kernel_locations.len(),
     );
-    let mut worker_kernel_ladders = kernel::worker_kernel_ladders_json(
+    let mut worker_kernel_ladders = kernel::worker_kernel_ladders(
         &kernel_locations,
         &workers,
         &tier_aggregates.worker_rungs_in_fold_order,
@@ -209,73 +217,81 @@ pub async fn run_optimality(
         &tier_aggregates.worker_anchor_factors,
     );
     let mut composed_location_mapping_ids = BTreeSet::new();
-    let composed_necessary_work_available = if let Some(labels) = run_labels.as_ref() {
-        let mut attributed_ladders = worker_kernel_ladders.clone();
-        let attribution_result = (|| -> Result<()> {
-            let repository_root = repository_root
-                .as_deref()
-                .context("repo root unavailable for semantic-location maps")?;
-            for ladder in &mut attributed_ladders {
-                let pool_tag = ladder["pool_tag"]
-                    .as_str()
-                    .context("worker ladder missing pool_tag")?
-                    .to_string();
-                let worker_id = ladder["worker_id"]
-                    .as_u64()
-                    .and_then(|value| u16::try_from(value).ok())
-                    .context("worker ladder missing u16 worker_id")?;
-                let worker_key = (pool_tag.clone(), worker_id);
-                let label = labels.saturated_workers.get(&worker_key).with_context(|| {
-                    format!("saturated label missing for {pool_tag}/{worker_id}")
-                })?;
-                let locations = kernel_locations_by_worker
-                    .get(&worker_key)
-                    .with_context(|| {
-                        format!("manifest locations missing for {pool_tag}/{worker_id}")
-                    })?;
-                let gpu_count = workers
-                    .iter()
-                    .find(|worker| worker.pool_tag == pool_tag && worker.worker_id == worker_id)
-                    .map(|worker| worker.gpu_count)
-                    .unwrap_or(1.0);
-                let attribution = location::attribute_ladder(
-                    repository_root,
-                    log_dir,
-                    &pool_tag,
-                    locations,
-                    ladder,
-                    label,
-                    gpu_spec,
-                    gpu_count,
-                )?;
-                composed_location_mapping_ids.insert(attribution.mapping_id);
-                ladder["necessary_work_mode"] = json!("replicated_large_batch");
-                ladder["necessary_work_replication_factor"] =
-                    json!(UNLOCKED_ITERATION_REPLICATION_FACTOR);
+    let mut attributed_worker_count = 0usize;
+    if let Some(labels) = run_labels.as_ref() {
+        let catalog = repository_root
+            .as_deref()
+            .context("repo root unavailable for semantic-location maps")
+            .and_then(|repository_root| location::LocationCatalog::load(repository_root, log_dir));
+        match catalog {
+            Ok(catalog) => {
+                for ladder in &mut worker_kernel_ladders {
+                    let (pool_tag, worker_id) = ladder
+                        .worker_ref()
+                        .context("worker ladder unexpectedly has aggregate scope")?;
+                    let pool_tag = pool_tag.to_string();
+                    let worker_key = (pool_tag.clone(), worker_id);
+                    let Some(label) = labels.saturated_workers.get(&worker_key) else {
+                        continue;
+                    };
+                    let attribution_result = (|| -> Result<_> {
+                        let locations =
+                            kernel_locations_by_worker
+                                .get(&worker_key)
+                                .with_context(|| {
+                                    format!("manifest locations missing for {pool_tag}/{worker_id}")
+                                })?;
+                        let gpu_count = workers
+                            .iter()
+                            .find(|worker| {
+                                worker.pool_tag == pool_tag && worker.worker_id == worker_id
+                            })
+                            .map(|worker| worker.gpu_count)
+                            .unwrap_or(1.0);
+                        catalog.attribute_ladder(
+                            &pool_tag,
+                            locations,
+                            ladder,
+                            label,
+                            gpu_spec,
+                            gpu_count,
+                            NecessaryWorkPolicy::Saturated {
+                                replication_factor: UNLOCKED_ITERATION_REPLICATION_FACTOR,
+                            },
+                        )
+                    })();
+                    match attribution_result {
+                        Ok(attribution) => {
+                            attributed_worker_count += 1;
+                            composed_location_mapping_ids.insert(attribution.mapping_id);
+                        }
+                        Err(error) => caveats.push(format!(
+                            "per-location necessary work unavailable for {pool_tag}/{worker_id} ({error:#})"
+                        )),
+                    }
+                }
             }
-            Ok(())
-        })();
-        match attribution_result {
-            Ok(()) => {
-                worker_kernel_ladders = attributed_ladders;
-                true
-            }
-            Err(error) => {
-                composed_location_mapping_ids.clear();
-                caveats.push(format!(
-                    "composed per-location necessary work unavailable ({error:#})"
-                ));
-                false
-            }
+            Err(error) => caveats.push(format!(
+                "per-location necessary work catalog unavailable ({error:#})"
+            )),
         }
-    } else {
-        false
-    };
-    let aggregate_kernel_ladders = kernel::aggregate_kernel_ladders_json(&worker_kernel_ladders)?;
+    }
+    let composed_necessary_work_available =
+        attributed_worker_count == worker_kernel_ladders.len() && !worker_kernel_ladders.is_empty();
+    let any_composed_necessary_work = attributed_worker_count > 0;
+    let aggregate_kernel_ladders = kernel::aggregate_kernel_ladders(&worker_kernel_ladders)?;
+    let worker_kernel_ladder_values = worker_kernel_ladders
+        .iter()
+        .map(|ladder| ladder.to_json())
+        .collect::<Result<Vec<_>>>()?;
+    let aggregate_kernel_ladder_values = aggregate_kernel_ladders
+        .iter()
+        .map(|ladder| ladder.to_json())
+        .collect::<Result<Vec<_>>>()?;
 
     let cluster_optimality_ratio = ratio(
-        tier_aggregates.cluster_rungs[R5],
-        tier_aggregates.cluster_rungs[R0],
+        tier_aggregates.cluster_rungs.hardware_limit,
+        tier_aggregates.cluster_rungs.real,
     );
 
     let level_entries = levels::levels_json(&tier_aggregates, necessary_work_floors);
@@ -293,6 +309,7 @@ pub async fn run_optimality(
         "num_workers": workers.len(),
         "num_locations": kernel_locations.len(),
         "composed_necessary_work_available": composed_necessary_work_available,
+        "composed_necessary_work_workers": attributed_worker_count,
         "composed_necessary_work_basis": if lock_batch_size { None } else { Some("saturated_worker_workload") },
         "composed_necessary_work_replication_factor": if lock_batch_size { None } else { Some(UNLOCKED_ITERATION_REPLICATION_FACTOR) },
         "composed_location_mapping_ids": composed_location_mapping_ids,
@@ -338,15 +355,15 @@ pub async fn run_optimality(
         "necessary_ratio": cluster_necessary_ratio,
         "bucket_keys": bucket_keys(has_necessary_work_floors),
         "rung_keys": rung_keys(has_necessary_work_floors),
-        "kernel_rung_keys": if composed_necessary_work_available {
+        "kernel_rung_keys": if any_composed_necessary_work {
             KERNEL_RUNG_KEYS.iter().copied().chain(["necessary_limit"]).collect::<Vec<_>>()
         } else {
             KERNEL_RUNG_KEYS.to_vec()
         },
         "levels": level_entries,
         "kernels": kernel_entries,
-        "worker_kernel_ladders": worker_kernel_ladders,
-        "aggregate_kernel_ladders": aggregate_kernel_ladders,
+        "worker_kernel_ladders": worker_kernel_ladder_values,
+        "aggregate_kernel_ladders": aggregate_kernel_ladder_values,
         "definitions": definitions(lock_batch_size),
     });
 
@@ -362,7 +379,7 @@ fn definitions(lock_batch_size: bool) -> Value {
     let necessary_work = if lock_batch_size {
         "disabled: the global fused-workload counterfactual requires batch size to be unlocked"
     } else {
-        "model/work labeler bounds below R5: segmented necessary work sums per-op rooflines; hardware necessary work applies one global roofline to the whole workload"
+        "model/work labeler bounds below R5: segmented necessary work sums per-location rooflines; scope-fused necessary work adds FLOPs/bytes first and applies one roofline at that scope"
     };
     let buckets = if lock_batch_size {
         "idle, imbalance, batching, communication, hardware_gap, hardware_optimal — telescoping differences of R0..R5; sum to Real"
@@ -388,8 +405,9 @@ fn definitions(lock_batch_size: bool) -> Value {
                          single-leaf so no idle/imbalance — only batching/communication/hw",
         "kernel_ladders": "the analyzer emits complete worker/pool/cluster ladders: R0/R1 reuse \
                            the attributable R2 kernel baseline plus aggregate idle/imbalance; \
-                           R2..R6 carry per-location values; R7 is aggregate-only; every rollup \
-                           is reconciled before emission and is never recomputed by the UI",
+                           R2..R6 carry per-location values; R7 is aggregate-only; parent R6/R7 \
+                           are recomputed from additive FLOPs/bytes before emission and are never \
+                           reconstructed by the UI",
     })
 }
 

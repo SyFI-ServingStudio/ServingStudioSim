@@ -17,19 +17,19 @@
 //! | R4 ignore network  | R3, comm leaves→0  | **communication**               |
 //! | R5 hardware limit  | active work unit / matching spec peak | **profiled↔hardware** |
 //! | R6 segmented necessary | Σ per-location semantic rooflines | **redundant work**    |
-//! | R7 hardware necessary | globally fused semantic roofline | **fusion**              |
+//! | R7 scope-fused necessary | one roofline over this scope's semantic work | **fusion** |
 //!
 //! Buckets telescope and sum exactly back to Real, so the output is an additive
 //! stacked **waterfall** rendered at five levels (cluster / pool / worker /
 //! iteration — idle 0 by construction / per-kernel). In unlocked mode only, the
-//! `model.work` labeler adds two global necessary-work bounds below R5 and splits
+//! `model.work` labeler adds segmented and scope-fused bounds below R5 and splits
 //! `hw-optimal` into `[excess-over-necessary | fusion | hardware-necessary]`.
 //! Batch-locked run aggregates keep the plain six-bucket R0..R5 ladder because
 //! their current operating points must not be globally rebatchable. An exact
 //! iteration waterfall may append the two aggregate `model.work` floors in either
 //! mode: locked labels the exact batch, while unlocked labels 10,000 independent
 //! copies and normalizes back to one iteration. Exact and run kernel ladders append
-//! mapped segmented R6 plus aggregate-only fused R7 when a strict semantic-location
+//! mapped segmented R6 plus aggregate-only scope-fused R7 when a strict semantic-location
 //! map covers the manifest. Run pool/cluster ladders are summed and reconciled by the
 //! analyzer rather than reconstructed by the UI.
 //!
@@ -63,6 +63,7 @@ mod fold;
 mod grid_peaks;
 mod iteration;
 mod kernel;
+mod ladder;
 mod levels;
 mod location;
 mod prepare;
@@ -71,14 +72,6 @@ mod spec;
 
 pub(crate) use iteration::{iteration_kernel_ladder, iteration_waterfall};
 pub use run::run_optimality;
-
-/// Rung index into the per-unit `[f64; 6]` GPU·ms accumulators (R0..R5).
-pub(crate) const R0: usize = 0;
-pub(crate) const R1: usize = 1;
-pub(crate) const R2: usize = 2;
-pub(crate) const R3: usize = 3;
-pub(crate) const R4: usize = 4;
-pub(crate) const R5: usize = 5;
 
 /// Waterfall segment order (top of the Real bar → the irreducible floor).
 pub(crate) const BUCKET_KEYS: [&str; 6] = [

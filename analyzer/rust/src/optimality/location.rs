@@ -10,12 +10,13 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
-use serde_json::{json, Value};
 
 use super::floors::{IterationLabel, SemanticWork};
+use super::ladder::{
+    KernelContribution, KernelLadder, KernelNecessaryWork, KernelRungs, NecessaryWorkPolicy,
+};
 use super::prepare::KernelLocation;
 use super::spec::GpuSpec;
-use super::under_accounted_difference;
 
 #[derive(Deserialize)]
 struct LocationMap {
@@ -31,6 +32,41 @@ struct LocationRule {
     semantics: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct ParamsDocument {
+    pools: BTreeMap<String, PoolParams>,
+}
+
+#[derive(Deserialize)]
+struct PoolParams {
+    groups: Vec<GroupParams>,
+}
+
+#[derive(Deserialize)]
+struct GroupParams {
+    arch: ArchParams,
+}
+
+#[derive(Deserialize)]
+struct ArchParams {
+    #[serde(rename = "type")]
+    arch_type: String,
+    #[serde(default)]
+    fp8: bool,
+}
+
+struct PoolModelSpec {
+    arch_type: String,
+    compute_dtype: &'static str,
+}
+
+/// Run-scoped semantic attribution inputs. Params and every mapping file are
+/// parsed once, then reused across workers and exact-iteration projections.
+pub(super) struct LocationCatalog {
+    maps: Vec<LocationMap>,
+    pool_specs: BTreeMap<String, PoolModelSpec>,
+}
+
 pub(super) struct LocationAttribution {
     pub(super) mapping_id: String,
 }
@@ -41,145 +77,218 @@ struct NecessaryWork {
     bytes: f64,
 }
 
-/// Add R6 and per-location necessary-work diagnostics to one worker ladder. The
-/// semantic label may describe an exact iteration or a saturated run aggregate.
-/// Any validation failure returns before mutation, preserving the plain R0..R5 view.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn attribute_ladder(
-    repo_root: &Path,
-    log_dir: &Path,
-    pool_tag: &str,
-    kernel_locations: &[KernelLocation],
-    ladder: &mut Value,
-    label: &IterationLabel,
-    gpu_spec: GpuSpec,
-    gpu_count: f64,
-) -> Result<LocationAttribution> {
-    let arch_type = pool_arch_type(log_dir, pool_tag)?;
-    let location_map = load_location_map(repo_root, &arch_type)?;
-    validate_mapping(&location_map, kernel_locations, &label.segments)?;
-
-    let semantic_work: BTreeMap<&str, NecessaryWork> = label
-        .segments
-        .iter()
-        .map(|segment| {
-            (
-                segment.name.as_str(),
-                NecessaryWork {
-                    flops: segment.flops,
-                    bytes: segment.bytes,
+impl LocationCatalog {
+    pub(super) fn load(repo_root: &Path, log_dir: &Path) -> Result<Self> {
+        let params: ParamsDocument =
+            serde_json::from_slice(&std::fs::read(log_dir.join("raw/params.json"))?)
+                .context("parse raw/params.json for semantic attribution")?;
+        let mut pool_specs = BTreeMap::new();
+        for (pool_tag, pool) in params.pools {
+            let group = pool
+                .groups
+                .into_iter()
+                .next()
+                .with_context(|| format!("params has no group for pool {pool_tag:?}"))?;
+            pool_specs.insert(
+                pool_tag,
+                PoolModelSpec {
+                    arch_type: group.arch.arch_type,
+                    compute_dtype: if group.arch.fp8 { "fp8" } else { "bf16" },
                 },
-            )
-        })
-        .collect();
-    let dtype = pool_compute_dtype(log_dir, pool_tag)?;
-    let peak_tflops = gpu_spec.peak_tflops(&dtype);
-    let bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
-    if peak_tflops <= 0.0 || bandwidth_gbps <= 0.0 {
-        bail!("GPU spec lacks positive {dtype} compute peak or memory bandwidth");
+            );
+        }
+
+        let directory = repo_root.join("model/work/location_maps");
+        let mut maps = Vec::new();
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("read location-map directory {}", directory.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            maps.push(
+                serde_json::from_slice(&std::fs::read(&path)?)
+                    .with_context(|| format!("parse {}", path.display()))?,
+            );
+        }
+        maps.sort_by(|left: &LocationMap, right: &LocationMap| {
+            left.mapping_id.cmp(&right.mapping_id)
+        });
+        Ok(Self { maps, pool_specs })
     }
 
-    let kind_by_location: BTreeMap<&str, &str> = kernel_locations
-        .iter()
-        .map(|location| (location.name.as_str(), location.kind.as_str()))
-        .collect();
-    let mut details_by_location = BTreeMap::new();
-    let mut segmented_necessary_gpu_s = 0.0;
-    for rule in &location_map.locations {
-        let work =
-            rule.semantics
-                .iter()
-                .try_fold(NecessaryWork::default(), |mut total, semantic| {
+    /// Add R6/R7 and per-location work to one typed ladder. The semantic label
+    /// may describe an exact iteration or a saturated run aggregate. Mutation is
+    /// transactional: every validation and reconciliation succeeds before the
+    /// caller's ladder is replaced.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attribute_ladder(
+        &self,
+        pool_tag: &str,
+        kernel_locations: &[KernelLocation],
+        ladder: &mut KernelLadder,
+        label: &IterationLabel,
+        gpu_spec: GpuSpec,
+        gpu_count: f64,
+        policy: NecessaryWorkPolicy,
+    ) -> Result<LocationAttribution> {
+        let pool_spec = self
+            .pool_specs
+            .get(pool_tag)
+            .with_context(|| format!("semantic attribution missing pool {pool_tag:?}"))?;
+        let location_map = select_location_map(&self.maps, &pool_spec.arch_type, kernel_locations)?;
+        validate_mapping(location_map, kernel_locations, &label.segments)?;
+
+        let semantic_work: BTreeMap<&str, NecessaryWork> = label
+            .segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.name.as_str(),
+                    NecessaryWork {
+                        flops: segment.flops,
+                        bytes: segment.bytes,
+                    },
+                )
+            })
+            .collect();
+        let peak_tflops = gpu_spec.peak_tflops(pool_spec.compute_dtype);
+        let bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
+        if peak_tflops <= 0.0 || bandwidth_gbps <= 0.0 {
+            bail!(
+                "GPU spec lacks positive {} compute peak or memory bandwidth",
+                pool_spec.compute_dtype
+            );
+        }
+
+        let kind_by_location: BTreeMap<&str, &str> = kernel_locations
+            .iter()
+            .map(|location| (location.name.as_str(), location.kind.as_str()))
+            .collect();
+        let mut work_by_location = BTreeMap::new();
+        for rule in &location_map.locations {
+            let work = rule.semantics.iter().try_fold(
+                NecessaryWork::default(),
+                |mut total, semantic| {
                     let row = semantic_work
                         .get(semantic.as_str())
                         .with_context(|| format!("mapped semantic row {semantic:?} is absent"))?;
                     total.flops += row.flops;
                     total.bytes += row.bytes;
                     Ok::<_, anyhow::Error>(total)
-                })?;
-        let compute_gpu_s = work.flops / (peak_tflops * 1e12);
-        let memory_gpu_s = work.bytes / (bandwidth_gbps * 1e9);
-        let necessary_gpu_s = compute_gpu_s.max(memory_gpu_s);
-        segmented_necessary_gpu_s += necessary_gpu_s;
-        details_by_location.insert(
-            rule.location.as_str(),
-            json!({
-                "semantics": rule.semantics,
-                "min_flops": work.flops,
-                "min_bytes": work.bytes,
-                "compute_gpu_s": compute_gpu_s,
-                "memory_gpu_s": memory_gpu_s,
-                "necessary_gpu_s": necessary_gpu_s,
-                "wall_s": necessary_gpu_s / gpu_count,
-                "bound": if compute_gpu_s >= memory_gpu_s { "compute" } else { "memory" },
-            }),
-        );
-    }
-    let tolerance = (label.floors.segmented.abs() * 1e-7).max(1e-12);
-    if (segmented_necessary_gpu_s - label.floors.segmented).abs() > tolerance {
-        bail!(
-            "mapped location floor {segmented_necessary_gpu_s} does not reconcile with semantic floor {}",
-            label.floors.segmented
-        );
-    }
+                },
+            )?;
+            work_by_location.insert(
+                rule.location.as_str(),
+                KernelNecessaryWork::from_rates(
+                    rule.semantics.iter().cloned(),
+                    work.flops,
+                    work.bytes,
+                    peak_tflops,
+                    bandwidth_gbps,
+                    gpu_count,
+                ),
+            );
+        }
 
-    let kernels = ladder
-        .get_mut("kernels")
-        .and_then(Value::as_array_mut)
-        .context("iteration ladder missing kernels")?;
-    let existing_names: BTreeSet<String> = kernels
-        .iter()
-        .filter_map(|kernel| {
-            kernel
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect();
-    for rule in &location_map.locations {
-        if !existing_names.contains(&rule.location) {
-            let detail = &details_by_location[rule.location.as_str()];
-            if detail["necessary_gpu_s"].as_f64().unwrap_or(0.0) > 0.0 {
-                kernels.push(json!({
-                    "name": rule.location,
-                    "kind": kind_by_location.get(rule.location.as_str()).copied().unwrap_or("unknown"),
-                    "is_comm": false,
-                    "rungs": {
-                        "balanced": 0.0,
-                        "per_config_best": 0.0,
-                        "ignore_network": 0.0,
-                        "hardware_limit": 0.0,
-                    },
-                }));
+        let mut attributed_ladder = ladder.clone();
+        let existing_names: BTreeSet<String> = attributed_ladder
+            .kernels
+            .iter()
+            .map(|kernel| kernel.name.clone())
+            .collect();
+        for rule in &location_map.locations {
+            if !existing_names.contains(&rule.location)
+                && work_by_location[rule.location.as_str()].necessary_gpu_s() > 0.0
+            {
+                attributed_ladder.kernels.push(KernelContribution {
+                    name: rule.location.clone(),
+                    kind: kind_by_location
+                        .get(rule.location.as_str())
+                        .copied()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    is_comm: false,
+                    rungs: KernelRungs::default(),
+                    necessary_work: None,
+                });
             }
         }
-    }
-    for kernel in kernels {
-        let Some(name) = kernel.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(mut detail) = details_by_location.remove(name) else {
-            continue;
-        };
-        let hardware_limit = kernel["rungs"]["hardware_limit"].as_f64().unwrap_or(0.0);
-        let necessary_gpu_s = detail["necessary_gpu_s"].as_f64().unwrap_or(0.0);
-        let (under_accounted_gpu_s, under_accounted_raw_gpu_s, accounting_tolerance_gpu_s) =
-            under_accounted_difference(hardware_limit, necessary_gpu_s);
-        detail["redundant_gpu_s"] = json!((hardware_limit - necessary_gpu_s).max(0.0));
-        detail["under_accounted_gpu_s"] = json!(under_accounted_gpu_s);
-        detail["under_accounted_raw_gpu_s"] = json!(under_accounted_raw_gpu_s);
-        detail["accounting_tolerance_gpu_s"] = json!(accounting_tolerance_gpu_s);
-        kernel["rungs"]["necessary_limit"] = json!(necessary_gpu_s);
-        kernel["necessary_work"] = detail;
-    }
-    ladder["rungs"]["segmented_necessary"] = json!(segmented_necessary_gpu_s);
-    ladder["rungs"]["hardware_necessary"] = json!(label.floors.necessary);
-    ladder["special_chunks"]["fusion"] =
-        json!((segmented_necessary_gpu_s - label.floors.necessary).max(0.0));
+        for kernel in &mut attributed_ladder.kernels {
+            kernel.necessary_work = if kernel.is_comm {
+                Some(KernelNecessaryWork::zero())
+            } else {
+                work_by_location.remove(kernel.name.as_str())
+            };
+        }
+        attributed_ladder.finalize_necessary_work(policy)?;
+        let segmented_necessary_gpu_s = attributed_ladder
+            .rungs
+            .segmented_necessary
+            .context("finalized ladder missing segmented floor")?;
+        let scope_fused_necessary_gpu_s = attributed_ladder
+            .rungs
+            .scope_fused_necessary
+            .context("finalized ladder missing fused floor")?;
+        let tolerance = (label.floors.segmented.abs() * 1e-7).max(1e-12);
+        if (segmented_necessary_gpu_s - label.floors.segmented).abs() > tolerance
+            || (scope_fused_necessary_gpu_s - label.floors.fused).abs() > tolerance
+        {
+            bail!(
+                "mapped location floors ({segmented_necessary_gpu_s}, {scope_fused_necessary_gpu_s}) do not reconcile with semantic floors ({}, {})",
+                label.floors.segmented,
+                label.floors.fused
+            );
+        }
+        *ladder = attributed_ladder;
 
-    Ok(LocationAttribution {
-        mapping_id: location_map.mapping_id,
-    })
+        Ok(LocationAttribution {
+            mapping_id: location_map.mapping_id.clone(),
+        })
+    }
+}
+
+fn select_location_map<'map>(
+    maps: &'map [LocationMap],
+    arch_type: &str,
+    kernel_locations: &[KernelLocation],
+) -> Result<&'map LocationMap> {
+    let expected_locations: BTreeSet<&str> = kernel_locations
+        .iter()
+        .filter(|location| !location.is_communication)
+        .map(|location| location.name.as_str())
+        .collect();
+    let matches: Vec<&LocationMap> = maps
+        .iter()
+        .filter(|location_map| {
+            location_map
+                .arch_types
+                .iter()
+                .any(|candidate| candidate == arch_type)
+        })
+        .filter(|location_map| {
+            location_map
+                .locations
+                .iter()
+                .map(|rule| rule.location.as_str())
+                .collect::<BTreeSet<_>>()
+                == expected_locations
+        })
+        .collect();
+    match matches.as_slice() {
+        [location_map] => Ok(*location_map),
+        [] => Err(anyhow!(
+            "no semantic location map matches arch type {arch_type:?} and its exact manifest locations"
+        )),
+        _ => Err(anyhow!(
+            "multiple semantic location maps match arch type {arch_type:?} and its exact manifest locations: {:?}",
+            matches
+                .iter()
+                .map(|location_map| location_map.mapping_id.as_str())
+                .collect::<Vec<_>>()
+        )),
+    }
 }
 
 fn validate_mapping(
@@ -244,60 +353,6 @@ fn validate_mapping(
     Ok(())
 }
 
-fn load_location_map(repo_root: &Path, arch_type: &str) -> Result<LocationMap> {
-    let directory = repo_root.join("model/work/location_maps");
-    for entry in std::fs::read_dir(&directory)
-        .with_context(|| format!("read location-map directory {}", directory.display()))?
-    {
-        let path = entry?.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
-        let map: LocationMap = serde_json::from_slice(&std::fs::read(&path)?)
-            .with_context(|| format!("parse {}", path.display()))?;
-        if map
-            .arch_types
-            .iter()
-            .any(|candidate| candidate == arch_type)
-        {
-            return Ok(map);
-        }
-    }
-    Err(anyhow!(
-        "no semantic location map for arch type {arch_type:?}"
-    ))
-}
-
-fn pool_arch(log_dir: &Path, pool_tag: &str) -> Result<Value> {
-    let params: Value = serde_json::from_slice(&std::fs::read(log_dir.join("raw/params.json"))?)?;
-    params["pools"][pool_tag]["groups"]
-        .as_array()
-        .and_then(|groups| groups.first())
-        .and_then(|group| group.get("arch"))
-        .cloned()
-        .with_context(|| format!("params missing first arch for pool {pool_tag:?}"))
-}
-
-fn pool_arch_type(log_dir: &Path, pool_tag: &str) -> Result<String> {
-    pool_arch(log_dir, pool_tag)?["type"]
-        .as_str()
-        .map(str::to_string)
-        .context("pool arch missing type")
-}
-
-fn pool_compute_dtype(log_dir: &Path, pool_tag: &str) -> Result<String> {
-    Ok(
-        if pool_arch(log_dir, pool_tag)?["fp8"]
-            .as_bool()
-            .unwrap_or(false)
-        {
-            "fp8".to_string()
-        } else {
-            "bf16".to_string()
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +405,32 @@ mod tests {
             &[segment("gemm")],
         )
         .is_err());
+    }
+
+    #[test]
+    fn map_selection_disambiguates_layouts_that_share_an_arch_type() {
+        let maps = vec![
+            LocationMap {
+                schema_version: 1,
+                mapping_id: "unified".to_string(),
+                arch_types: vec!["llama3_dense".to_string()],
+                locations: vec![LocationRule {
+                    location: "unified.gemm".to_string(),
+                    semantics: vec!["gemm".to_string()],
+                }],
+            },
+            LocationMap {
+                schema_version: 1,
+                mapping_id: "pd".to_string(),
+                arch_types: vec!["llama3_dense".to_string()],
+                locations: vec![LocationRule {
+                    location: "pd.gemm".to_string(),
+                    semantics: vec!["gemm".to_string()],
+                }],
+            },
+        ];
+
+        let selected = select_location_map(&maps, "llama3_dense", &[location("pd.gemm")]).unwrap();
+        assert_eq!(selected.mapping_id, "pd");
     }
 }

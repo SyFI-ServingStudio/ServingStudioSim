@@ -6,11 +6,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
 use crate::io::{read_cost_manifests, read_run_meta, read_worker_gpu_counts, SCHEMA_VERSION};
 use crate::session::{build_session, register_cost_log, require_columns, COST_LOG_TABLE};
 
+use super::ladder::{KernelLadder, NecessaryWorkPolicy};
 use super::run::COST_COLS;
 use super::spec::{self, GpuSpec};
 use super::{
@@ -27,8 +29,8 @@ fn necessary_work_replication_factor(lock_batch_size: bool) -> u32 {
 }
 
 struct ExactIterationFold {
-    ladder: Value,
-    worker_rungs_gpu_ms: [f64; 6],
+    ladder: KernelLadder,
+    worker_rungs_gpu_ms: levels::BaseRungs,
     gpu_name: String,
     gpu_spec_matched: Option<String>,
     peaks_source: String,
@@ -36,6 +38,15 @@ struct ExactIterationFold {
     folded_rows: u64,
     kernel_locations: Vec<prepare::KernelLocation>,
     gpu_spec: GpuSpec,
+}
+
+/// Shared typed computation projected by the two exact-iteration resources.
+/// Keeping the transport contracts separate no longer duplicates fold/label rules.
+struct ExactIterationAnalysis {
+    exact: ExactIterationFold,
+    label: Option<floors::IterationLabel>,
+    label_caveats: Vec<String>,
+    replication_factor: u32,
 }
 
 /// Build the exact stacked-kernel ladder for one selected worker iteration.
@@ -50,7 +61,7 @@ pub(crate) async fn iteration_kernel_ladder(
     iter_id: u64,
     lock_batch_size: bool,
 ) -> Result<Value> {
-    let mut exact = fold_exact_iteration(
+    let mut analysis = analyze_exact_iteration(
         repo_root,
         log_dir,
         pool_tag,
@@ -59,62 +70,55 @@ pub(crate) async fn iteration_kernel_ladder(
         lock_batch_size,
     )
     .await?;
-    let mut caveats = Vec::new();
-    let replication_factor = necessary_work_replication_factor(lock_batch_size);
-    let ctx = build_session();
-    if !register_cost_log(&ctx, log_dir).await? {
-        bail!("cost_log/ dir not found");
-    }
-    let attribution = match floors::compute_iteration_label(
-        &ctx,
-        log_dir,
-        pool_tag,
-        worker_id,
-        iter_id,
-        replication_factor,
-    )
-    .await
-    {
-        Ok(label) => match location::attribute_ladder(
-            repo_root,
-            log_dir,
-            pool_tag,
-            &exact.kernel_locations,
-            &mut exact.ladder,
-            &label,
-            exact.gpu_spec,
-            exact.gpu_count,
-        ) {
-            Ok(attribution) => Some(attribution),
-            Err(error) => {
-                caveats.push(format!(
-                    "per-location necessary work unavailable ({error:#})"
-                ));
-                None
+    let mut caveats = analysis.label_caveats.clone();
+    let attribution = match analysis.label.as_ref() {
+        Some(label) => {
+            match location::LocationCatalog::load(repo_root, log_dir).and_then(|catalog| {
+                catalog.attribute_ladder(
+                    pool_tag,
+                    &analysis.exact.kernel_locations,
+                    &mut analysis.exact.ladder,
+                    label,
+                    analysis.exact.gpu_spec,
+                    analysis.exact.gpu_count,
+                    if lock_batch_size {
+                        NecessaryWorkPolicy::BatchLocked
+                    } else {
+                        NecessaryWorkPolicy::Saturated {
+                            replication_factor: analysis.replication_factor,
+                        }
+                    },
+                )
+            }) {
+                Ok(attribution) => Some(attribution),
+                Err(error) => {
+                    caveats.push(format!(
+                        "per-location necessary work unavailable ({error:#})"
+                    ));
+                    None
+                }
             }
-        },
-        Err(error) => {
-            caveats.push(format!("iteration necessary work unavailable ({error:#})"));
-            None
         }
+        None => None,
     };
+    let ladder_value = analysis.exact.ladder.to_json()?;
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "unit": "gpu_seconds",
         "worker": {"pool_tag": pool_tag, "worker_id": worker_id},
         "iter_id": iter_id,
-        "rungs": exact.ladder["rungs"],
-        "special_chunks": exact.ladder["special_chunks"],
-        "kernels": exact.ladder["kernels"],
+        "rungs": ladder_value["rungs"],
+        "special_chunks": ladder_value["special_chunks"],
+        "kernels": ladder_value["kernels"],
         "meta": {
-            "gpu_name": exact.gpu_name,
-            "gpu_spec_matched": exact.gpu_spec_matched,
-            "peaks_source": exact.peaks_source,
-            "gpu_count": exact.gpu_count,
-            "folded_rows": exact.folded_rows,
+            "gpu_name": analysis.exact.gpu_name,
+            "gpu_spec_matched": analysis.exact.gpu_spec_matched,
+            "peaks_source": analysis.exact.peaks_source,
+            "gpu_count": analysis.exact.gpu_count,
+            "folded_rows": analysis.exact.folded_rows,
             "batch_size_locked": lock_batch_size,
             "necessary_work_available": attribution.is_some(),
-            "necessary_work_replication_factor": replication_factor,
+            "necessary_work_replication_factor": analysis.replication_factor,
             "necessary_work_mode": if lock_batch_size { "batch_locked" } else { "replicated_large_batch" },
             "location_mapping_id": attribution.as_ref().map(|value| value.mapping_id.as_str()),
             "caveats": caveats,
@@ -123,7 +127,7 @@ pub(crate) async fn iteration_kernel_ladder(
 }
 
 /// Build the full telescoping waterfall for one selected worker iteration.
-/// The fully fused floor belongs only to this aggregate view; the sibling ladder
+/// The scope-fused floor belongs only to this aggregate view; the sibling ladder
 /// may expose the segmented floor because that one is location-attributable.
 pub(crate) async fn iteration_waterfall(
     repo_root: &Path,
@@ -133,7 +137,7 @@ pub(crate) async fn iteration_waterfall(
     iter_id: u64,
     lock_batch_size: bool,
 ) -> Result<Value> {
-    let exact = fold_exact_iteration(
+    let analysis = analyze_exact_iteration(
         repo_root,
         log_dir,
         pool_tag,
@@ -142,36 +146,13 @@ pub(crate) async fn iteration_waterfall(
         lock_batch_size,
     )
     .await?;
-    let mut caveats = Vec::new();
-    let replication_factor = necessary_work_replication_factor(lock_batch_size);
-    let ctx = build_session();
-    if !register_cost_log(&ctx, log_dir).await? {
-        bail!("cost_log/ dir not found");
-    }
-    let iteration_floor = match floors::compute_iteration_label(
-        &ctx,
-        log_dir,
-        pool_tag,
-        worker_id,
-        iter_id,
-        replication_factor,
-    )
-    .await
-    {
-        Ok(label) => Some(label.floors),
-        Err(error) => {
-            caveats.push(format!(
-                "exact iteration necessary-work floors unavailable ({error:#})"
-            ));
-            None
-        }
-    };
+    let iteration_floor = analysis.label.as_ref().map(|label| label.floors);
     let level_key = format!("{pool_tag}/{worker_id}/{iter_id}");
     let level_label = format!("{pool_tag}/{worker_id} / iter {iter_id}");
     let level = levels::exact_iteration_level_json(
         &level_key,
         &level_label,
-        &exact.worker_rungs_gpu_ms,
+        &analysis.exact.worker_rungs_gpu_ms,
         iteration_floor,
     );
 
@@ -182,21 +163,72 @@ pub(crate) async fn iteration_waterfall(
         "iter_id": iter_id,
         "level": level,
         "meta": {
-            "gpu_name": exact.gpu_name,
-            "gpu_spec_matched": exact.gpu_spec_matched,
-            "peaks_source": exact.peaks_source,
-            "gpu_count": exact.gpu_count,
-            "folded_rows": exact.folded_rows,
+            "gpu_name": analysis.exact.gpu_name,
+            "gpu_spec_matched": analysis.exact.gpu_spec_matched,
+            "peaks_source": analysis.exact.peaks_source,
+            "gpu_count": analysis.exact.gpu_count,
+            "folded_rows": analysis.exact.folded_rows,
             "batch_size_locked": lock_batch_size,
             "necessary_work_available": iteration_floor.is_some(),
-            "necessary_work_replication_factor": replication_factor,
+            "necessary_work_replication_factor": analysis.replication_factor,
             "necessary_work_mode": if lock_batch_size { "batch_locked" } else { "replicated_large_batch" },
-            "caveats": caveats,
+            "caveats": analysis.label_caveats,
         },
     }))
 }
 
+async fn analyze_exact_iteration(
+    repo_root: &Path,
+    log_dir: &Path,
+    pool_tag: &str,
+    worker_id: u16,
+    iter_id: u64,
+    lock_batch_size: bool,
+) -> Result<ExactIterationAnalysis> {
+    let context = build_session();
+    if !register_cost_log(&context, log_dir).await? {
+        bail!("cost_log/ dir not found");
+    }
+    require_columns(&context, COST_LOG_TABLE, COST_COLS).await?;
+    let exact = fold_exact_iteration(
+        &context,
+        repo_root,
+        log_dir,
+        pool_tag,
+        worker_id,
+        iter_id,
+        lock_batch_size,
+    )
+    .await?;
+    let replication_factor = necessary_work_replication_factor(lock_batch_size);
+    let (label, label_caveats) = match floors::compute_iteration_label(
+        &context,
+        log_dir,
+        pool_tag,
+        worker_id,
+        iter_id,
+        replication_factor,
+    )
+    .await
+    {
+        Ok(label) => (Some(label), Vec::new()),
+        Err(error) => (
+            None,
+            vec![format!(
+                "exact iteration necessary work unavailable ({error:#})"
+            )],
+        ),
+    };
+    Ok(ExactIterationAnalysis {
+        exact,
+        label,
+        label_caveats,
+        replication_factor,
+    })
+}
+
 async fn fold_exact_iteration(
+    context: &SessionContext,
     repo_root: &Path,
     log_dir: &Path,
     pool_tag: &str,
@@ -237,13 +269,8 @@ async fn fold_exact_iteration(
     let (kernel_locations, section_fold_plan_by_key) =
         prepare::build_section_fold_plans(&manifests_by_worker, &grid_peak_catalog, &gpu_spec);
 
-    let ctx = build_session();
-    if !register_cost_log(&ctx, log_dir).await? {
-        bail!("cost_log/ dir not found");
-    }
-    require_columns(&ctx, COST_LOG_TABLE, COST_COLS).await?;
     let Some(worker) =
-        fold::read_exact_iteration_total(&ctx, pool_tag, worker_id, iter_id, gpu_count).await?
+        fold::read_exact_iteration_total(context, pool_tag, worker_id, iter_id, gpu_count).await?
     else {
         bail!("iteration {iter_id} has no rows for worker {pool_tag}/{worker_id}");
     };
@@ -251,7 +278,7 @@ async fn fold_exact_iteration(
     let worker_index_by_key = HashMap::from([(worker_key, 0usize)]);
     let mut rungs_by_location_worker = HashMap::new();
     let folded_rows = fold::accumulate_iteration_fold(
-        &ctx,
+        context,
         pool_tag,
         worker_id,
         iter_id,
@@ -268,7 +295,7 @@ async fn fold_exact_iteration(
     }
 
     let tier_aggregates = levels::assemble_tiers(&workers);
-    let ladder = kernel::worker_kernel_ladders_json(
+    let ladder = kernel::worker_kernel_ladders(
         &kernel_locations,
         &workers,
         &tier_aggregates.worker_rungs_in_fold_order,

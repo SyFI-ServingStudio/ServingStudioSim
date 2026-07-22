@@ -18,7 +18,7 @@ each successive gap is an attributable source of sub-optimality:
 Buckets telescope and sum exactly back to Real, drawn as a stacked bar at five
 levels — cluster / pool / worker / iteration (idle 0 by construction) / per-kernel.
 For unlocked run-level analysis, the independent `model.work` labeler adds segmented and
-global necessary-work bounds below R5. The R5 green band then splits into
+scope-fused necessary-work bounds below R5. The R5 green band then splits into
 `excess_over_necessary`, `fusion`, and `hardware_necessary`; their sum remains
 exactly R5. Locked run-level analysis does not compute these bounds because its observed
 operating points are fixed and cannot be globally rebatchable.
@@ -32,12 +32,16 @@ critical-path attribution. In unlocked mode each worker workload is saturated by
 scaling its compressed additive totals 10,000× and normalizing the label back. This
 is the efficient equivalent of summing saturated iterations once each semantic op's
 bound has stabilized. The analyzer maps the label to locations as R6 segmented
-necessary work and retains R7 globally fused work as an aggregate-only rung.
+necessary work and retains R7 scope-fused work as an aggregate-only rung.
 
-The analyzer—not the UI—then adds complete worker ladders into explicit pool and
-cluster `aggregate_kernel_ladders`. It checks every scope before emission:
-`Σ_location R2..R6` must match the corresponding scope rung, and
-`R6 = R7 + fusion`. The UI only selects the requested scope and renders it.
+The analyzer—not the UI—then reduces complete worker ladders into explicit pool and
+cluster `aggregate_kernel_ladders`. R0..R5 GPU seconds are additive. R6/R7 are
+not: the reducer adds each location's `(FLOPs, bytes)` first, then reevaluates the
+location rooflines for R6 and one scope-wide roofline for R7. Therefore a pool or
+cluster R7 is never `Σ worker R7`, which would be wrong when workers have different
+active bounds. It checks every scope before emission: `Σ_location R2..R6` must
+match the corresponding scope rung, and `R6 = R7 + fusion`. The UI only selects
+the requested scope and renders it.
 
 The UI service exposes two separate on-demand contracts for one selected
 `(pool_tag, worker_id, iter_id)`: a complete one-row waterfall and a per-kernel
@@ -52,6 +56,9 @@ counterfactual, then divides every result by 10,000; it never multiplies sequenc
 For an exact iteration, a versioned semantic-location map provides the attribution
 rule. The independent labeler emits minimum FLOPs/bytes per semantic
 operation; the map assigns each row exactly once to an exact manifest location.
+Maps are selected by both model `arch_type` and the exact non-communication
+manifest location set, because unified and PD layouts may share one model arch
+type while using different location namespaces.
 Only a complete, reconciling map extends the kernel ladder with a
 location-attributed segmented-necessary rung. Otherwise the endpoint remains the
 unchanged R0..R5 ladder and records a caveat. Per-location redundancy is
@@ -75,12 +82,14 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   stride-sampled R2..R5 mean-fold hot loop (`accumulate_fold`,
   `leaf_selected_throughput_ms`).
 - `levels.rs` — the worker / pool / cluster tiers. `assemble_tiers` turns the fold's
-  per-worker accumulators into R0..R5 rung arrays and rolls them up; `levels_json`
+  per-worker accumulators into named R0..R5 values and rolls them up; `levels_json`
   + `level_entry_json` + `rung_report_json` emit the level/report JSON.
 - `kernel.rs` — the kernel tier. Per-location bars (`kernel_levels_json`, single-leaf so
   only batching/communication/hw), the report's `worst_batching`, and the
-  per-worker kernel rung ladders plus analyzer-owned pool/cluster rollups
-  (`worker_kernel_ladders_json`, `aggregate_kernel_ladders_json`).
+  per-worker kernel rung ladders.
+- `ladder.rs` — typed kernel-ladder/work domain and the sole worker → pool →
+  cluster reducer. It serializes at the publication boundary only and recomputes
+  every parent R6/R7 from additive work rather than summing child roofline times.
 - `grid_peaks.rs` — the R3 ceiling. Enumerates unique `(kind, config)` from the
   manifests, asks the simulator for each config's fitted-grid peak rate in one
   batched `kernel-query peak` call (including maximum grid arithmetic intensity,
@@ -90,8 +99,8 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   entry by its explicit `aliases`, then dense peak TFLOP/s by dtype + HBM GB/s.
 - `floors.rs` — bridge to the independent `model.work` labeler. One batched call computes
   unlocked per-level bounds, saturated worker semantic labels, and exact-iteration
-  bounds for both modes; failure is
-  additive-only and degrades to the plain R5 ladder.
+  bounds for both modes; transport failure degrades the request, while one
+  unsupported/heterogeneous level degrades only that scope to the plain R5 ladder.
 - `location.rs` — strict exact-iteration semantic-location mapping. It validates
   complete coverage, computes per-location `max(FLOPs/TFLOPS, bytes/BW)`, and
   attaches R6 plus redundant/under-accounted diagnostics atomically.

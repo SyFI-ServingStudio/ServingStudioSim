@@ -1,14 +1,15 @@
 //! Labeler-derived necessary-work floors — two independent lower bounds that sit
-//! BELOW the R5 `hardware_limit` green. R5 is a roofline of the sim's *actual* per
-//! -kernel work (weights re-loaded every iteration, activation I/O, sim's attention
+//! BELOW the R5 `hardware_limit` green. R5 is a roofline of the sim's *actual*
+//! per-kernel work (weights re-loaded every iteration, activation I/O, sim's attention
 //! approximation), so it is not the true floor. Here we aggregate each level's
 //! workload (reusing the `workload-conservation` subject's `groups` parser — never
 //! the cost tree's `slot_flops`/`slot_bytes`, to stay independent) and hand it to the
 //! Python `model.work` labeler, which returns two roofline floors per level in GPU·s:
 //!
-//! - **necessary** — global roofline `max(ΣFLOPs/peak, Σbytes/bw)` of the run's whole
-//!   token workload as one fused mega-forward (weights counted once): the loosest,
-//!   truly irreducible floor.
+//! - **scope-fused** — global roofline `max(ΣFLOPs/peak, Σbytes/bw)` of the run's
+//!   whole token workload as one fused mega-forward (weights counted once): the
+//!   loosest, truly irreducible floor. The stable labeler wire field remains
+//!   `necessary` for schema compatibility.
 //! - **segmented** — `Σ_seg max(compute, memory)`: per-op serial bound (≥ necessary).
 //!
 //! Run-level waterfalls use one unlocked mega-batch per level. The same batched
@@ -18,8 +19,9 @@
 //! unlocked mode replicates its independent batch entries before labeling and
 //! normalizes the result back to one iteration. Replication amortizes weights without
 //! changing sequence geometry. The labeler is a subprocess
-//! (`uv run python -m model.work.floors`); any failure degrades gracefully to the
-//! plain R0..R5 ladder (the caller records a caveat).
+//! (`uv run python -m model.work.floors`). Transport/parse failure degrades the
+//! request; a per-level label failure degrades only that scope and leaves other
+//! worker/pool labels available.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -35,10 +37,10 @@ use crate::conservation::workload::{
 };
 use crate::kernel_query::repo_root;
 
-/// One level's two labeler floors, in GPU·seconds. Ordered `necessary ≤ segmented`.
+/// One level's two labeler floors, in GPU·seconds. Ordered `fused ≤ segmented`.
 #[derive(Clone, Copy, Default)]
 pub(super) struct Floors {
-    pub(super) necessary: f64,
+    pub(super) fused: f64,
     pub(super) segmented: f64,
 }
 
@@ -54,9 +56,26 @@ pub(super) struct IterationLabel {
     pub(super) segments: Vec<SemanticWork>,
 }
 
+impl IterationLabel {
+    fn normalize(&mut self, normalization: f64) {
+        self.floors.fused /= normalization;
+        self.floors.segmented /= normalization;
+        for segment in &mut self.segments {
+            segment.flops /= normalization;
+            segment.bytes /= normalization;
+        }
+    }
+}
+
 pub(super) struct RunLabels {
     pub(super) floors: FloorsByLevel,
     pub(super) saturated_workers: HashMap<(String, u16), IterationLabel>,
+    pub(super) errors: HashMap<String, String>,
+}
+
+struct ParsedLabels {
+    labels: HashMap<String, IterationLabel>,
+    errors: HashMap<String, String>,
 }
 
 /// Per-level floors keyed exactly like `levels.rs`'s level `key`:
@@ -64,9 +83,9 @@ pub(super) struct RunLabels {
 pub(super) type FloorsByLevel = HashMap<String, Floors>;
 
 /// Aggregate the run's workload per level, hand it to the labeler, and return the two
-/// floors per level. Errors (SQL, missing labeler, non-zero exit, bad JSON) propagate
-/// so the caller can turn them into a caveat + graceful degrade — they never abort the
-/// optimality subject.
+/// floors per level. Transport errors propagate so the caller can degrade the whole
+/// label stage; individual level errors stay in `RunLabels::errors`, preserving every
+/// independently valid scope.
 pub(super) async fn compute_run_labels(
     ctx: &SessionContext,
     log_dir: &Path,
@@ -87,19 +106,23 @@ pub(super) async fn compute_run_labels(
         levels.insert(saturated_worker_key(pool_tag, *worker_id), saturated_totals);
     }
     let response = run_labeler_json(log_dir, &levels)?;
-    let mut floors = parse_response(&response)?;
+    let ParsedLabels { mut labels, errors } = parse_labels(&response)?;
     let mut saturated_workers = HashMap::new();
     for (pool_tag, worker_id) in by_worker.keys() {
         let key = saturated_worker_key(pool_tag, *worker_id);
-        floors.remove(&key);
-        saturated_workers.insert(
-            (pool_tag.clone(), *worker_id),
-            parse_label(&response, &key, normalization)?,
-        );
+        if let Some(mut label) = labels.remove(&key) {
+            label.normalize(normalization);
+            saturated_workers.insert((pool_tag.clone(), *worker_id), label);
+        }
     }
+    let floors = labels
+        .into_iter()
+        .map(|(key, label)| (key, label.floors))
+        .collect();
     Ok(RunLabels {
         floors,
         saturated_workers,
+        errors,
     })
 }
 
@@ -128,7 +151,16 @@ pub(super) async fn compute_iteration_label(
     let level_key = format!("{pool_tag}/{worker_id}");
     let levels = HashMap::from([(level_key.clone(), totals)]);
     let response = run_labeler_json(log_dir, &levels)?;
-    parse_label(&response, &level_key, normalization)
+    let mut parsed = parse_labels(&response)?;
+    if let Some(error) = parsed.errors.remove(&level_key) {
+        return Err(anyhow!("labeler could not label iteration: {error}"));
+    }
+    let mut label = parsed
+        .labels
+        .remove(&level_key)
+        .context("labeler output missing iteration")?;
+    label.normalize(normalization);
+    Ok(label)
 }
 
 fn saturated_worker_key(pool_tag: &str, worker_id: u16) -> String {
@@ -137,43 +169,59 @@ fn saturated_worker_key(pool_tag: &str, worker_id: u16) -> String {
     format!("{pool_tag}/__saturated_worker__/{worker_id}")
 }
 
-fn parse_label(response: &Value, level_key: &str, normalization: f64) -> Result<IterationLabel> {
-    let mut floors = parse_response(response)?
-        .remove(level_key)
-        .context("labeler output missing semantic floor")?;
-    floors.necessary /= normalization;
-    floors.segmented /= normalization;
-    let level = response
+fn parse_labels(response: &Value) -> Result<ParsedLabels> {
+    let levels = response
         .get("levels")
         .and_then(Value::as_object)
-        .and_then(|levels| levels.get(level_key))
-        .context("labeler output missing semantic level")?;
-    let segments = level
-        .get("segments")
-        .and_then(Value::as_array)
-        .context("labeler output missing semantic segments")?
-        .iter()
-        .map(|segment| {
-            Ok(SemanticWork {
-                name: segment
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .context("semantic segment missing name")?
-                    .to_string(),
-                flops: segment
-                    .get("flops")
-                    .and_then(Value::as_f64)
-                    .context("semantic segment missing flops")?
-                    / normalization,
-                bytes: segment
-                    .get("bytes")
-                    .and_then(Value::as_f64)
-                    .context("semantic segment missing bytes")?
-                    / normalization,
+        .context("labeler output missing `levels` object")?;
+    let mut labels = HashMap::new();
+    let mut errors = HashMap::new();
+    for (key, level) in levels {
+        if let Some(error) = level.get("error").and_then(Value::as_str) {
+            errors.insert(key.clone(), error.to_string());
+            continue;
+        }
+        let segments = level
+            .get("segments")
+            .and_then(Value::as_array)
+            .context("labeler output missing semantic segments")?
+            .iter()
+            .map(|segment| {
+                Ok(SemanticWork {
+                    name: segment
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .context("semantic segment missing name")?
+                        .to_string(),
+                    flops: segment
+                        .get("flops")
+                        .and_then(Value::as_f64)
+                        .context("semantic segment missing flops")?,
+                    bytes: segment
+                        .get("bytes")
+                        .and_then(Value::as_f64)
+                        .context("semantic segment missing bytes")?,
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(IterationLabel { floors, segments })
+            .collect::<Result<Vec<_>>>()?;
+        labels.insert(
+            key.clone(),
+            IterationLabel {
+                floors: Floors {
+                    fused: level
+                        .get("necessary")
+                        .and_then(Value::as_f64)
+                        .context("semantic level missing fused floor")?,
+                    segmented: level
+                        .get("segmented")
+                        .and_then(Value::as_f64)
+                        .context("semantic level missing segmented floor")?,
+                },
+                segments,
+            },
+        );
+    }
+    Ok(ParsedLabels { labels, errors })
 }
 
 /// Roll the per-worker totals up into the three level granularities the waterfall
@@ -247,26 +295,28 @@ fn build_request(levels: &HashMap<String, WorkloadTotals>) -> Value {
     json!({ "levels": Value::Object(level_json) })
 }
 
-fn parse_response(parsed: &Value) -> Result<FloorsByLevel> {
-    let level_map = parsed
-        .get("levels")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("labeler output missing `levels` object"))?;
-    let mut floors = FloorsByLevel::new();
-    for (key, value) in level_map {
-        floors.insert(
-            key.clone(),
-            Floors {
-                necessary: value
-                    .get("necessary")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0),
-                segmented: value
-                    .get("segmented")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0),
-            },
-        );
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::parse_labels;
+
+    #[test]
+    fn one_level_error_does_not_discard_other_labels() {
+        let parsed = parse_labels(&json!({
+            "levels": {
+                "cluster": {"error": "heterogeneous models"},
+                "main/0": {
+                    "necessary": 2.0,
+                    "segmented": 3.0,
+                    "segments": [{"name": "gemm", "flops": 4.0, "bytes": 5.0}]
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.errors["cluster"], "heterogeneous models");
+        assert_eq!(parsed.labels["main/0"].floors.fused, 2.0);
+        assert_eq!(parsed.labels["main/0"].segments[0].name, "gemm");
     }
-    Ok(floors)
 }

@@ -1,4 +1,4 @@
-"""optimality floors — the two global necessary-work lower bounds, per level.
+"""Optimality floors — segmented and scope-fused necessary work, per level.
 
 Called by the Rust `optimality` analyzer subject as a subprocess:
 
@@ -18,12 +18,16 @@ the first path component still selects the model spec. This
 script is the *model-aware* half: it never touches the cost_log / parquet. For
 each level it loads that pool's model, assembles ONE aggregate ``Workload`` (the
 whole run's tokens as a single mega-forward — weights counted once, the loosest
-necessary floor), and emits the two roofline floors in **GPU·seconds** on stdout::
+scope-fused floor), and emits the two roofline floors in **GPU·seconds** on stdout::
 
     {"levels": {"<level_key>": {"necessary": s, "segmented": s}, ...},
      "meta": {...}}
 
-- **necessary** = global roofline ``max(ΣFLOPs/peak, Σbytes/bw)`` (`roofline_ms`).
+An independent row that cannot be labeled is returned as ``{"error": ...}``;
+other rows in the same batch remain available.
+
+- **necessary** = the stable wire name for the scope-fused roofline
+  ``max(ΣFLOPs/peak, Σbytes/bw)`` (`roofline_ms`).
 - **segmented** = ``Σ_seg max(compute, memory)`` (`segmented_lower_bound_ms`).
 
 `num_gpus=1`: the labeler computes the FULL / unsharded ``F_min``, so
@@ -141,24 +145,29 @@ def compute_floors(log_dir: Path, levels: dict[str, dict]) -> dict[str, dict]:
     pool_specs = _pool_specs(log_dir)
     out: dict[str, dict] = {}
     for level_key, totals in levels.items():
-        spec = _spec_for_level(level_key, pool_specs)
-        model = _model(spec["config"])
-        workload = _aggregate_workload(totals)
-        label = model.label(workload)
-        compute_ms, memory_ms, _bound = label.roofline_ms(spec["gpu"], spec["dtype"])
-        segmented_ms = label.segmented_lower_bound_ms(spec["gpu"], spec["dtype"])
-        out[level_key] = {
-            "necessary": max(compute_ms, memory_ms) / 1e3,  # ms -> GPU·seconds
-            "segmented": segmented_ms / 1e3,
-            "segments": [
-                {
-                    "name": segment.name,
-                    "flops": segment.flops_total,
-                    "bytes": segment.bytes_total,
-                }
-                for segment in label.segments
-            ],
-        }
+        try:
+            spec = _spec_for_level(level_key, pool_specs)
+            model = _model(spec["config"])
+            workload = _aggregate_workload(totals)
+            label = model.label(workload)
+            compute_ms, memory_ms, _bound = label.roofline_ms(spec["gpu"], spec["dtype"])
+            segmented_ms = label.segmented_lower_bound_ms(spec["gpu"], spec["dtype"])
+            out[level_key] = {
+                "necessary": max(compute_ms, memory_ms) / 1e3,  # ms -> GPU·seconds
+                "segmented": segmented_ms / 1e3,
+                "segments": [
+                    {
+                        "name": segment.name,
+                        "flops": segment.flops_total,
+                        "bytes": segment.bytes_total,
+                    }
+                    for segment in label.segments
+                ],
+            }
+        except Exception as error:  # noqa: BLE001 - isolate independent batch rows
+            # One heterogeneous or unsupported scope must not discard valid
+            # worker/pool labels in the same subprocess batch.
+            out[level_key] = {"error": f"{type(error).__name__}: {error}"}
     return out
 
 
