@@ -37,8 +37,8 @@ R0=R1 because an individual iteration has no scheduler holding-span boundary;
 `R1-R2` remains one aggregate imbalance chunk. In both modes, the waterfall
 reconstructs that iteration's workload from `groups` and splits R5 at the segmented
 and fully fused necessary-work floors. Locked mode labels the exact batch. Unlocked
-mode replicates each independent batch entry 1000 times, labels that large-batch
-counterfactual, then divides every result by 1000; it never multiplies sequence length.
+mode replicates each independent batch entry 10,000 times, labels that large-batch
+counterfactual, then divides every result by 10,000; it never multiplies sequence length.
 
 For an exact iteration, a versioned semantic-location map provides the attribution
 rule. The independent labeler emits minimum FLOPs/bytes per semantic

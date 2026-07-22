@@ -25,7 +25,7 @@
 //! Batch-locked run aggregates keep the plain six-bucket R0..R5 ladder because
 //! their current operating points must not be globally rebatchable. An exact
 //! iteration waterfall may append the two aggregate `model.work` floors in either
-//! mode: locked labels the exact batch, while unlocked labels 1000 independent
+//! mode: locked labels the exact batch, while unlocked labels 10,000 independent
 //! copies and normalizes back to one iteration. Its kernel ladder appends one mapped
 //! segmented-necessary R6 when a strict semantic-location map covers the manifest.
 //! Neither alters the run aggregate.

@@ -118,7 +118,7 @@ Both fold every matching row and use the explicit `mode` query. Iterations have
 no scheduler holding-span boundary, so R0=R1 and idle is zero; R1-R2 remains
 aggregate imbalance. Both modes may split R5 with segmented and fully fused
 necessary-work floors. Batch-locked mode labels the exact observed batch; unlocked
-mode labels 1000 independent copies of its batch entries and normalizes back to one
+mode labels 10,000 independent copies of its batch entries and normalizes back to one
 iteration, amortizing weights without changing sequence length. When a strict
 versioned semantic-location map covers the manifest, either mode's kernel ladder
 also appends R6 and per-location necessary/redundant/under-accounted work; otherwise

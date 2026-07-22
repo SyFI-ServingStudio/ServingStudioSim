@@ -15,7 +15,7 @@ use super::run::COST_COLS;
 use super::spec::{self, GpuSpec};
 use super::{floors, fold, grid_peaks, kernel, levels, location, prepare};
 
-const UNLOCKED_ITERATION_REPLICATION_FACTOR: u32 = 1_000;
+const UNLOCKED_ITERATION_REPLICATION_FACTOR: u32 = 10_000;
 
 fn necessary_work_replication_factor(lock_batch_size: bool) -> u32 {
     if lock_batch_size {
