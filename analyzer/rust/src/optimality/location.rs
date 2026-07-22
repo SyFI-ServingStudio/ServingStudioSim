@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use super::floors::{IterationLabel, SemanticWork};
 use super::prepare::KernelLocation;
 use super::spec::GpuSpec;
+use super::under_accounted_difference;
 
 #[derive(Deserialize)]
 struct LocationMap {
@@ -162,8 +163,12 @@ pub(super) fn attribute_ladder(
         };
         let hardware_limit = kernel["rungs"]["hardware_limit"].as_f64().unwrap_or(0.0);
         let necessary_gpu_s = detail["necessary_gpu_s"].as_f64().unwrap_or(0.0);
+        let (under_accounted_gpu_s, under_accounted_raw_gpu_s, accounting_tolerance_gpu_s) =
+            under_accounted_difference(hardware_limit, necessary_gpu_s);
         detail["redundant_gpu_s"] = json!((hardware_limit - necessary_gpu_s).max(0.0));
-        detail["under_accounted_gpu_s"] = json!((necessary_gpu_s - hardware_limit).max(0.0));
+        detail["under_accounted_gpu_s"] = json!(under_accounted_gpu_s);
+        detail["under_accounted_raw_gpu_s"] = json!(under_accounted_raw_gpu_s);
+        detail["accounting_tolerance_gpu_s"] = json!(accounting_tolerance_gpu_s);
         kernel["rungs"]["necessary_limit"] = json!(necessary_gpu_s);
         kernel["necessary_work"] = detail;
     }

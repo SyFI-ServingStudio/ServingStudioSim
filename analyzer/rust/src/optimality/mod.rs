@@ -152,6 +152,24 @@ pub(crate) const TOP_KERNELS: usize = 16;
 /// scaled additive totals).
 pub(crate) const UNLOCKED_ITERATION_REPLICATION_FACTOR: u32 = 10_000;
 
+/// R5 is stride-sampled while R6 uses exact workload groups. Preserve their raw
+/// difference, but do not classify sampling-scale noise as missing simulator work.
+pub(crate) const UNDER_ACCOUNTED_RELATIVE_TOLERANCE: f64 = 0.005;
+
+pub(crate) fn under_accounted_difference(
+    hardware_limit_gpu_s: f64,
+    necessary_limit_gpu_s: f64,
+) -> (f64, f64, f64) {
+    let raw_gpu_s = (necessary_limit_gpu_s - hardware_limit_gpu_s).max(0.0);
+    let tolerance_gpu_s = necessary_limit_gpu_s.max(0.0) * UNDER_ACCOUNTED_RELATIVE_TOLERANCE;
+    let material_gpu_s = if raw_gpu_s > tolerance_gpu_s {
+        raw_gpu_s
+    } else {
+        0.0
+    };
+    (material_gpu_s, raw_gpu_s, tolerance_gpu_s)
+}
+
 pub(crate) fn ms_to_s(ms: f64) -> f64 {
     ms / 1000.0
 }
@@ -161,5 +179,22 @@ pub(crate) fn ratio(num: f64, den: f64) -> f64 {
         (num / den).clamp(0.0, 1.0)
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::under_accounted_difference;
+
+    #[test]
+    fn under_accounted_requires_more_than_half_a_percent() {
+        let (material, raw, tolerance) = under_accounted_difference(0.999, 1.0);
+        assert_eq!(material, 0.0);
+        assert!((raw - 0.001).abs() < 1e-12);
+        assert_eq!(tolerance, 0.005);
+
+        let (material, raw, _) = under_accounted_difference(0.994, 1.0);
+        assert_eq!(material, raw);
+        assert!((material - 0.006).abs() < 1e-12);
     }
 }

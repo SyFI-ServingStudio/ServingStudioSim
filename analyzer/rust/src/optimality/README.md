@@ -56,7 +56,9 @@ Only a complete, reconciling map extends the kernel ladder with a
 location-attributed segmented-necessary rung. Otherwise the endpoint remains the
 unchanged R0..R5 ladder and records a caveat. Per-location redundancy is
 `max(R5 - necessary, 0)`; the opposite sign is retained as `under_accounted`
-rather than clamped away.
+rather than clamped away. Because R5 is stride-sampled while R6 uses exact groups,
+the payload retains the positive raw difference but classifies it as material
+`under_accounted_gpu_s` only when it exceeds 0.5% of R6.
 
 ## Files
 

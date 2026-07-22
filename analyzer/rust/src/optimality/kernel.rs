@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use super::fold::WorkerFoldAccumulator;
 use super::prepare::KernelLocation;
-use super::{ms_to_s, R0, R1, R2, RUNG_KEYS, TOP_KERNELS};
+use super::{ms_to_s, under_accounted_difference, R0, R1, R2, RUNG_KEYS, TOP_KERNELS};
 
 const LADDER_KERNEL_RUNG_KEYS: [&str; 5] = [
     "balanced",
@@ -450,6 +450,8 @@ fn kernel_accumulator_json(name: String, accumulator: KernelLadderAccumulator) -
     let hardware_limit = accumulator.rungs["hardware_limit"];
     let necessary_limit = accumulator.rungs.get("necessary_limit").copied();
     let necessary_work = accumulator.necessary_work.map(|work| {
+        let (under_accounted_gpu_s, under_accounted_raw_gpu_s, accounting_tolerance_gpu_s) =
+            under_accounted_difference(hardware_limit, work.necessary_gpu_s);
         json!({
             "semantics": work.semantics,
             "min_flops": work.min_flops,
@@ -459,7 +461,9 @@ fn kernel_accumulator_json(name: String, accumulator: KernelLadderAccumulator) -
             "necessary_gpu_s": work.necessary_gpu_s,
             "wall_s": work.wall_s,
             "redundant_gpu_s": (hardware_limit - work.necessary_gpu_s).max(0.0),
-            "under_accounted_gpu_s": (work.necessary_gpu_s - hardware_limit).max(0.0),
+            "under_accounted_gpu_s": under_accounted_gpu_s,
+            "under_accounted_raw_gpu_s": under_accounted_raw_gpu_s,
+            "accounting_tolerance_gpu_s": accounting_tolerance_gpu_s,
             "bound": if work.compute_gpu_s >= work.memory_gpu_s { "compute" } else { "memory" },
         })
     });
