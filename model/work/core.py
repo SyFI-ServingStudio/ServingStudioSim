@@ -445,7 +445,12 @@ class Model:
                 )
             )
 
-        # --- embedding gather (whole iteration): reads the rows for the tokens. ---
+        # --- embedding gather (whole iteration): reads the needed rows of the table. ---
+        # The embedding matrix is a weight, so its read is capped at ONE pass of the
+        # table (F_min's read-once convention): a batch with more tokens than vocab
+        # entries cannot force more than one full table pass, and a smaller batch
+        # touches at most ``tokens`` distinct rows. Without the cap a giant aggregate
+        # batch (T ≫ vocab) would over-count the embedding read ~T/vocab times.
         embedding_params = self.vocab * self.hidden
         breakdown["embedding"] += embedding_params
         total_params += embedding_params
@@ -455,7 +460,7 @@ class Model:
                 bucket="embedding",
                 byte_kind="weights",
                 flops=0.0,
-                bytes=tokens * self.hidden * self.weight_dtype_bytes,
+                bytes=min(tokens, self.vocab) * self.hidden * self.weight_dtype_bytes,
                 count=1,
             )
         )

@@ -16,8 +16,8 @@ use crate::kernel_query::repo_root;
 use crate::session::{register_cost_log, require_columns, COST_LOG_TABLE};
 
 use super::spec::{self, GpuSpec};
-use super::{fold, grid_peaks, kernel, levels, prepare};
-use super::{ratio, BUCKET_KEYS, KERNEL_RUNG_KEYS, R0, R5, RUNG_KEYS};
+use super::{floors, fold, grid_peaks, kernel, levels, prepare};
+use super::{bucket_keys, ms_to_s, ratio, rung_keys, BUCKET_KEYS, KERNEL_RUNG_KEYS, R0, R5, RUNG_KEYS};
 
 /// cost_log columns this subject depends on (drift guard).
 pub(super) const COST_COLS: &[&str] = &[
@@ -151,6 +151,32 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
 
     // Assemble rungs (GPU·ms) per worker → pool → cluster; then per-kernel.
     let tier_aggregates = levels::assemble_tiers(&workers);
+
+    // Labeler necessary-work floors below R5 (`model.work` subprocess over the run's
+    // aggregated workload). Additive info, never load-bearing: any failure degrades to
+    // the plain 6-rung ladder with a caveat.
+    let floors = match floors::compute_floors(ctx, log_dir).await {
+        Ok(floors) => Some(floors),
+        Err(error) => {
+            caveats.push(format!(
+                "labeler necessary-work floors unavailable ({error:#}); \
+                 waterfall shows the plain hardware-optimal floor"
+            ));
+            None
+        }
+    };
+    let has_floors = floors.is_some();
+    let cluster_floor = floors
+        .as_ref()
+        .and_then(|by_level| by_level.get("cluster"))
+        .copied();
+    let cluster_necessary_ratio = cluster_floor.map(|floor| {
+        let green_s = ms_to_s(tier_aggregates.cluster_rungs[R5]);
+        ratio(
+            floor.necessary.clamp(0.0, green_s),
+            ms_to_s(tier_aggregates.cluster_rungs[R0]),
+        )
+    });
     let kernel_rungs_by_location = kernel::aggregate_kernel_rungs(
         &sampled_rungs_by_location_worker,
         &tier_aggregates.worker_anchor_factors,
@@ -169,7 +195,7 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
         tier_aggregates.cluster_rungs[R0],
     );
 
-    let level_entries = levels::levels_json(&tier_aggregates);
+    let level_entries = levels::levels_json(&tier_aggregates, floors.as_ref());
     let kernel_entries = kernel::kernel_levels_json(&kernel_locations, &kernel_rungs_by_location);
 
     let analysis_meta = json!({
@@ -190,15 +216,19 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
         "available": true,
         "meta": analysis_meta,
         "optimality_ratio": cluster_optimality_ratio,
+        "necessary_ratio": cluster_necessary_ratio,
         "unit": "gpu_seconds",
-        "cluster": levels::rung_report_json(&tier_aggregates.cluster_rungs),
+        "cluster": levels::rung_report_json(&tier_aggregates.cluster_rungs, cluster_floor),
         "pools": tier_aggregates
             .pool_rungs_by_tag
             .iter()
             .map(|(pool_tag, pool_rungs)| {
                 json!({
                     "pool": pool_tag,
-                    "rungs": levels::rung_report_json(pool_rungs),
+                    "rungs": levels::rung_report_json(
+                        pool_rungs,
+                        floors.as_ref().and_then(|by_level| by_level.get(pool_tag)).copied(),
+                    ),
                 })
             })
             .collect::<Vec<_>>(),
@@ -215,8 +245,9 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
         "meta": analysis_meta,
         "unit": "gpu_seconds",
         "optimality_ratio": cluster_optimality_ratio,
-        "bucket_keys": BUCKET_KEYS,
-        "rung_keys": RUNG_KEYS,
+        "necessary_ratio": cluster_necessary_ratio,
+        "bucket_keys": bucket_keys(has_floors),
+        "rung_keys": rung_keys(has_floors),
         "kernel_rung_keys": KERNEL_RUNG_KEYS,
         "levels": level_entries,
         "kernels": kernel_entries,

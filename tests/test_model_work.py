@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from model.work import Workload, load_model
+from model.work.core import AttnInteraction
 from model.work.registry import UnknownArchitecture, build_model
 
 CONFIG = Path(__file__).resolve().parents[1] / "model" / "config" / "llama3_8b.json"
@@ -81,6 +82,50 @@ def test_prefill_uses_causal_triangle(model):
     assert label.flops["attn_internal"] == 4 * NUM_QO * HEAD_DIM * triangle_pairs * L
     # a full-rectangle bug would give 8*8 = 64 pairs -> ~1.78x larger
     assert label.flops["attn_internal"] != 4 * NUM_QO * HEAD_DIM * 64 * L
+
+
+def test_full_mask_aggregation_equals_stepwise_sum(model):
+    """The `model.work.floors` optimality-floor aggregation trick, validated.
+
+    `internal_flops` and `kv_bytes` are LINEAR sums over `wl.attn`
+    (`per_pair·Σ pairs()` and `per_cached·Σ num_cached_key`), so a whole batch of
+    per-step causal interactions collapses to ONE `mask="full"` interaction carrying
+    the summed pair / cached counts — which is exactly what `floors.py` builds from the
+    Rust-aggregated scalars instead of materializing 1.7-billion decode interactions.
+    Here we prove the collapse is exact against the step-by-step `causal_lm` reference.
+    """
+    # A realistic mixed batch: two chunked-prefill requests + a spread of decode steps.
+    prefill = [(512, 0), (128, 512), (300, 0)]  # (append_len, prefix_len)
+    decode = [4096, 4097, 1, 2048, 33, 100000]  # per-step kv_len
+    reference = Workload.causal_lm(
+        prefill=prefill, decode=decode, sampled=len(decode) + len(prefill)
+    )
+
+    # Collapse prefill and decode each into a single full interaction (floors.py shape):
+    # num_key = Σ pairs(), num_cached_key = Σ num_cached_key — over that side's steps.
+    def collapse(interactions: list[AttnInteraction]) -> AttnInteraction:
+        total_pairs = sum(interaction.pairs() for interaction in interactions)
+        total_cached = sum(interaction.num_cached_key for interaction in interactions)
+        # pairs() for full = num_query·num_key, so num_query=1 makes pairs() == total_pairs.
+        assert total_pairs == int(total_pairs)  # integer for integer step geometry
+        return AttnInteraction(1, int(total_pairs), int(total_cached), "full")
+
+    prefill_interactions = reference.attn[: len(prefill)]
+    decode_interactions = reference.attn[len(prefill) :]
+    aggregate = Workload(
+        matmul_tokens=reference.matmul_tokens,
+        head_positions=reference.head_positions,
+        attn=[collapse(prefill_interactions), collapse(decode_interactions)],
+    )
+
+    ref_label = model.label(reference)
+    agg_label = model.label(aggregate)
+    # The attention terms are the whole point of the trick — they must be bit-identical.
+    assert agg_label.flops["attn_internal"] == ref_label.flops["attn_internal"]
+    assert agg_label.bytes["kv"] == ref_label.bytes["kv"]
+    # matmul_tokens / head_positions match, so every other bucket does too -> totals equal.
+    assert agg_label.flops_total == ref_label.flops_total
+    assert agg_label.bytes_total == ref_label.bytes_total
 
 
 def test_roofline_memory_bound_decode(model):

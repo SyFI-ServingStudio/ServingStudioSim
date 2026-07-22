@@ -1,8 +1,13 @@
 """Render the optimality sub-optimality waterfall.
 
 The Rust `optimality` subject emits, per aggregation **level** (cluster / pool /
-worker / iteration), six telescoping buckets that sum to that level's Real GPU·s:
+worker / iteration), telescoping buckets that sum to that level's Real GPU·s:
 `idle | imbalance | batching | communication | hardware_gap | hardware_optimal`.
+When the `model.work` labeler floors are available, the single green
+`hardware_optimal` is replaced by a three-step green ramp that sums back to it —
+`excess_over_necessary | fusion | hardware_necessary` (deep green = the irreducible
+global-roofline floor; pale = recoverable weight-reload + activation I/O). The
+draw code is bucket-key driven, so both shapes render from the same loop.
 It also emits a per-kernel array (the balanced Real of each location split into
 batching / communication / hardware_gap / hardware_optimal).
 
@@ -37,7 +42,12 @@ PAYLOAD = "optimality_waterfall.json"
 # Semantic bucket colors: green = irreducible optimal, warmer/greyer = recoverable
 # waste. Keys match the Rust `bucket_keys`.
 BUCKET_COLOR = {
-    "hardware_optimal": "#54A24B",  # green — irreducible compute floor
+    "hardware_optimal": "#54A24B",  # green — irreducible compute floor (no floors)
+    # When the labeler floors are present, the single green splits into a green ramp
+    # (deep = irreducible necessary work; pale = recoverable, closest to the waste).
+    "hardware_necessary": "#2C6E49",  # deep green — global-roofline irreducible floor
+    "fusion": "#5FA777",  # medium green — op-segmentation headroom (fuse/overlap)
+    "excess_over_necessary": "#ACD9A5",  # pale green — weight reload + activation I/O
     "hardware_gap": "#4C78A8",  # blue — profiled↔hardware maturity
     "communication": "#E45756",  # red — network
     "batching": "#F58518",  # orange — small-batch loss
@@ -51,6 +61,9 @@ BUCKET_LABEL = {
     "communication": "communication (network)",
     "hardware_gap": "hardware gap (kernel maturity)",
     "hardware_optimal": "hardware-optimal (irreducible)",
+    "excess_over_necessary": "excess (weight reload + activation I/O)",
+    "fusion": "fusion headroom (op segmentation)",
+    "hardware_necessary": "hardware-necessary (irreducible)",
 }
 # Kernel-level bars carry only the four attributable-to-a-leaf buckets.
 KERNEL_BUCKETS = ["batching", "communication", "hardware_gap", "hardware_optimal"]
@@ -208,13 +221,31 @@ def _render_levels(
     )
     ax.grid(True, axis="x")
     _bucket_legend(ax, top_down)
+    # `necessary_ratio` is present only when the labeler floors succeeded; None on the
+    # 6-bucket degrade path (headline then falls back to the plain hardware-optimal share).
+    necessary_ratio = payload.get("necessary_ratio")
+    necessary_note = (
+        f" · {float(necessary_ratio) * 100:.0f}% hardware-necessary"
+        if necessary_ratio is not None
+        else ""
+    )
     if normalize:
-        ax.set_title(f"{run_label}\nOptimality waterfall (normalized) — each bar = its Real (100%)")
+        ax.set_title(
+            f"{run_label}\nOptimality waterfall (normalized) — each bar = its Real (100%)"
+            f"{necessary_note}"
+        )
     else:
         headline = float(payload.get("optimality_ratio", 0.0)) * 100
-        ax.set_title(
-            f"{run_label}\nOptimality waterfall — {headline:.0f}% of GPU·s is hardware-optimal work"
-        )
+        if necessary_ratio is not None:
+            ax.set_title(
+                f"{run_label}\nOptimality waterfall — {headline:.0f}% hardware-optimal, of which "
+                f"{float(necessary_ratio) * 100:.0f}% is hardware-necessary (irreducible)"
+            )
+        else:
+            ax.set_title(
+                f"{run_label}\nOptimality waterfall — "
+                f"{headline:.0f}% of GPU·s is hardware-optimal work"
+            )
     save_plot(fig, out_path)
     return out_path
 
