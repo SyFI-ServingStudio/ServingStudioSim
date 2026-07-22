@@ -17,6 +17,11 @@ each successive gap is an attributable source of sub-optimality:
 
 Buckets telescope and sum exactly back to Real, drawn as a stacked bar at five
 levels — cluster / pool / worker / iteration (idle 0 by construction) / per-kernel.
+For unlocked analysis, the independent `model.work` labeler adds segmented and
+global necessary-work bounds below R5. The R5 green band then splits into
+`excess_over_necessary`, `fusion`, and `hardware_necessary`; their sum remains
+exactly R5. Locked analysis does not compute these bounds because its observed
+operating points are fixed and cannot be globally rebatchable.
 
 The payload also carries one per-worker kernel rung ladder. Its R0/R1 bars reuse
 the additive R2 kernel baseline and append two explicit aggregate chunks
@@ -57,6 +62,9 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   `raw/kernel_grid_peaks.json`. Absent + un-generatable → R3 = R2 with a caveat.
 - `spec.rs` — the R5 hardware ceilings. Resolves the run's `gpu_name` to a `gpu/spec.json`
   entry by its explicit `aliases`, then dense peak TFLOP/s by dtype + HBM GB/s.
+- `floors.rs` — unlocked-only bridge to the independent `model.work` labeler. It
+  computes per-level segmented and globally fused necessary-work roofline bounds;
+  failure is additive-only and degrades to the plain R5 bucket.
 
 ## Cost model notes
 
@@ -73,7 +81,8 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   ridge, the config uses only its peak TFLOP/s; otherwise it uses only peak GB/s.
 - `analyze run --lock-batch-size` disables that counterfactual (`R3 = R2`) and
   skips grid-peak generation. R5 then classifies every observed leaf separately
-  from its current `FLOPs / bytes` versus the GPU ridge point.
+  from its current `FLOPs / bytes` versus the GPU ridge point. It also disables
+  the global necessary-work floors, which assume the workload can be rebatchable.
 - Unlocked output uses `optimality_report.json` and
   `optimality_waterfall.json`; locked output uses the separate
   `optimality_batch_locked_report.json` and

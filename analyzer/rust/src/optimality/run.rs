@@ -16,8 +16,10 @@ use crate::kernel_query::repo_root;
 use crate::session::{register_cost_log, require_columns, COST_LOG_TABLE};
 
 use super::spec::{self, GpuSpec};
-use super::{fold, grid_peaks, kernel, levels, prepare};
-use super::{ratio, BUCKET_KEYS, KERNEL_RUNG_KEYS, R0, R5, RUNG_KEYS};
+use super::{
+    bucket_keys, ms_to_s, ratio, rung_keys, BUCKET_KEYS, KERNEL_RUNG_KEYS, R0, R5, RUNG_KEYS,
+};
+use super::{floors, fold, grid_peaks, kernel, levels, prepare};
 
 /// cost_log columns this subject depends on (drift guard).
 pub(super) const COST_COLS: &[&str] = &[
@@ -160,6 +162,37 @@ pub async fn run_optimality(
 
     // Assemble rungs (GPU·ms) per worker → pool → cluster; then per-kernel.
     let tier_aggregates = levels::assemble_tiers(&workers);
+
+    // The labeler treats the whole level workload as one globally batchable
+    // mega-forward. That counterfactual belongs only to unlocked analysis. A
+    // batch-locked run deliberately keeps the current operating points, so it
+    // stops at R5 and retains the unsplit hardware-optimal bucket.
+    let necessary_work_floors = if lock_batch_size {
+        None
+    } else {
+        match floors::compute_floors(ctx, log_dir).await {
+            Ok(computed_floors) => Some(computed_floors),
+            Err(error) => {
+                caveats.push(format!(
+                    "labeler necessary-work floors unavailable ({error:#}); \
+                     waterfall shows the plain hardware-optimal floor"
+                ));
+                None
+            }
+        }
+    };
+    let has_necessary_work_floors = necessary_work_floors.is_some();
+    let cluster_floor = necessary_work_floors
+        .as_ref()
+        .and_then(|by_level| by_level.get("cluster"))
+        .copied();
+    let cluster_necessary_ratio = cluster_floor.map(|floor| {
+        let green_s = ms_to_s(tier_aggregates.cluster_rungs[R5]);
+        ratio(
+            floor.necessary.clamp(0.0, green_s),
+            ms_to_s(tier_aggregates.cluster_rungs[R0]),
+        )
+    });
     let kernel_rungs_by_location = kernel::aggregate_kernel_rungs(
         &sampled_rungs_by_location_worker,
         &tier_aggregates.worker_anchor_factors,
@@ -178,7 +211,7 @@ pub async fn run_optimality(
         tier_aggregates.cluster_rungs[R0],
     );
 
-    let level_entries = levels::levels_json(&tier_aggregates);
+    let level_entries = levels::levels_json(&tier_aggregates, necessary_work_floors.as_ref());
     let kernel_entries = kernel::kernel_levels_json(&kernel_locations, &kernel_rungs_by_location);
 
     let analysis_meta = json!({
@@ -200,15 +233,22 @@ pub async fn run_optimality(
         "available": true,
         "meta": analysis_meta,
         "optimality_ratio": cluster_optimality_ratio,
+        "necessary_ratio": cluster_necessary_ratio,
         "unit": "gpu_seconds",
-        "cluster": levels::rung_report_json(&tier_aggregates.cluster_rungs),
+        "cluster": levels::rung_report_json(&tier_aggregates.cluster_rungs, cluster_floor),
         "pools": tier_aggregates
             .pool_rungs_by_tag
             .iter()
             .map(|(pool_tag, pool_rungs)| {
                 json!({
                     "pool": pool_tag,
-                    "rungs": levels::rung_report_json(pool_rungs),
+                    "rungs": levels::rung_report_json(
+                        pool_rungs,
+                        necessary_work_floors
+                            .as_ref()
+                            .and_then(|by_level| by_level.get(pool_tag))
+                            .copied(),
+                    ),
                 })
             })
             .collect::<Vec<_>>(),
@@ -225,8 +265,9 @@ pub async fn run_optimality(
         "meta": analysis_meta,
         "unit": "gpu_seconds",
         "optimality_ratio": cluster_optimality_ratio,
-        "bucket_keys": BUCKET_KEYS,
-        "rung_keys": RUNG_KEYS,
+        "necessary_ratio": cluster_necessary_ratio,
+        "bucket_keys": bucket_keys(has_necessary_work_floors),
+        "rung_keys": rung_keys(has_necessary_work_floors),
         "kernel_rung_keys": KERNEL_RUNG_KEYS,
         "levels": level_entries,
         "kernels": kernel_entries,
@@ -243,6 +284,16 @@ fn definitions(lock_batch_size: bool) -> Value {
     } else {
         "large-batch grid ceiling for the leaf's fixed config: peak TFLOP/s when any fitted point crosses the GPU ridge, otherwise peak GB/s; gap = batching"
     };
+    let necessary_work = if lock_batch_size {
+        "disabled: the global fused-workload counterfactual requires batch size to be unlocked"
+    } else {
+        "model/work labeler bounds below R5: segmented necessary work sums per-op rooflines; hardware necessary work applies one global roofline to the whole workload"
+    };
+    let buckets = if lock_batch_size {
+        "idle, imbalance, batching, communication, hardware_gap, hardware_optimal — telescoping differences of R0..R5; sum to Real"
+    } else {
+        "idle, imbalance, batching, communication, hardware_gap, then R5 split into excess_over_necessary, fusion, hardware_necessary when labeler bounds are available; sum to Real"
+    };
     json!({
         "scope": "per-worker CostTree manifest re-folded with per-rung leaf substitutions; \
                   unit GPU-seconds = wall time × the worker's run_meta gpu_ids count",
@@ -253,9 +304,9 @@ fn definitions(lock_batch_size: bool) -> Value {
             "per_config_best": per_config_best,
             "ignore_network": "per_config_best with comm leaves dropped; gap = communication",
             "hardware_limit": "active compute or memory work unit / matching gpu-spec peak; unlocked reuses the R3 grid regime, locked uses each current operating point; gap = profiled↔hardware",
+            "necessary_work": necessary_work,
         },
-        "buckets": "idle, imbalance, batching, communication, hardware_gap, hardware_optimal — \
-                    telescoping differences of the rungs; sum to Real",
+        "buckets": buckets,
         "sampling": "R0/R1 exact over all rows; R2..R5 folded over 1-in-sample_stride iterations \
                      and anchored to the exact R1 by their sampled ratio",
         "kernel_level": "per manifest location (name); Max siblings + DP replicas pool; \

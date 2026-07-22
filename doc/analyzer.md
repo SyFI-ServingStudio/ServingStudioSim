@@ -82,7 +82,7 @@ categories:
 | `batch` | one scheduled batch / one cost-tree location over time | `request_state`, `cost_log` |
 | `backend` | a cost-tree position's selected backend over its input feature space | `cost_log` `slot_input` + `slot_backend` + manifest `backends` |
 | `breakdown` | a cost-tree subtree by leaf position | `cost_log` + manifest labels |
-| `optimality` | distance from optimal GPU·s as a lower-bound ladder | `cost_log` + manifest + `run_meta` GPU counts + `gpu/spec.json` |
+| `optimality` | distance from optimal GPU·s as a lower-bound ladder | `cost_log` + manifest + `run_meta` GPU counts + `gpu/spec.json` + unlocked-only `model.work` necessary-work labeler |
 | `conservation` | run-wide work accounting | `cost_log` vs `request_slo` |
 | `concurrency` | system, pool, or worker request populations over lifecycle time | `request_slo` arrival/terminal events and optional stage-transition timelines |
 | `kv` | a KV pool over time | `kv_snapshot` + `run_meta` capacity |

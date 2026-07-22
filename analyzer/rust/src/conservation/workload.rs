@@ -44,11 +44,13 @@
 //! as `batch::composition` (sum for partition-style, pick-one for replicate-style
 //! HP) — one group today (unified dense asserts a single HP group).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
-use arrow_array::{Array, BooleanArray, ListArray, StructArray, UInt32Array};
+use arrow_array::{
+    Array, BooleanArray, ListArray, StringArray, StructArray, UInt16Array, UInt32Array,
+};
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
@@ -416,6 +418,118 @@ async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actu
         }
     }
     Ok(a)
+}
+
+/// Per-(pool_tag, worker_id) workload aggregate for the optimality floors. The same
+/// `groups` quantities [`collect_actual`] sums run-wide, plus the two extra fields the
+/// labeler roofline needs (prefill KV read + request count). All fields are additive,
+/// so pool / cluster levels are plain rollups of this map. A rollup of every worker
+/// reproduces the run-wide conservation `actual`, which is the cross-check.
+#[derive(Default, Clone)]
+pub(crate) struct WorkloadTotals {
+    pub(crate) matmul_tokens: f64,    // Σ batch_tokens
+    pub(crate) prefill_tokens: f64,   // Σ prefill_tokens
+    pub(crate) decode_passes: f64,    // Σ decode_request_count
+    pub(crate) prefill_pairs: f64, // Σ_chunk [a·prefix + a(a+1)/2]  (causal, = labeler prefill pairs)
+    pub(crate) prefill_cached: f64, // Σ prefix                        (prefill KV read)
+    pub(crate) decode_kv: f64, // Σ decode_kv_total               (= labeler decode pairs / cached)
+    pub(crate) prefill_requests: f64, // Σ prefill chunk count           (lm_head sampled positions)
+}
+
+impl WorkloadTotals {
+    pub(crate) fn add(&mut self, other: &WorkloadTotals) {
+        self.matmul_tokens += other.matmul_tokens;
+        self.prefill_tokens += other.prefill_tokens;
+        self.decode_passes += other.decode_passes;
+        self.prefill_pairs += other.prefill_pairs;
+        self.prefill_cached += other.prefill_cached;
+        self.decode_kv += other.decode_kv;
+        self.prefill_requests += other.prefill_requests;
+    }
+}
+
+/// Aggregate `cost_log` `groups` per (pool_tag, worker_id) in one scan. Walks the list
+/// offsets so each flattened group maps back to its row's worker, accumulating into a
+/// per-worker running total that is flushed to the map whenever the worker changes (so
+/// a string key is allocated ~once per worker, not per row). Reuses the exact same
+/// `groups` parsing as the run-wide path — the two cannot drift.
+pub(crate) async fn collect_workload_by_worker(
+    ctx: &SessionContext,
+) -> Result<HashMap<(String, u16), WorkloadTotals>> {
+    let batches = collect(
+        ctx,
+        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, worker_id, groups FROM cost_log",
+    )
+    .await?;
+    let mut by_worker: HashMap<(String, u16), WorkloadTotals> = HashMap::new();
+    for batch in &batches {
+        let pool_tags = col(batch, "pool_tag")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow!("`pool_tag` is not a String array"))?;
+        let worker_ids = col(batch, "worker_id")?
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .ok_or_else(|| anyhow!("`worker_id` is not a UInt16 array"))?;
+        let groups = groups_list(batch)?;
+        let gs = groups_struct(groups)?;
+        let offsets = groups.value_offsets();
+        let batch_tokens = column_f64(field(gs, "batch_tokens")?)?;
+        let prefill_tokens = column_f64(field(gs, "prefill_tokens")?)?;
+        let decode_req = column_f64(field(gs, "decode_request_count")?)?;
+        let decode_kv = column_f64(field(gs, "decode_kv_total")?)?;
+        let prefix_lists = list_field(gs, "prefill_prefix_lens")?;
+        let append_lists = list_field(gs, "prefill_append_lens")?;
+
+        // Running total for the current worker; flushed on change / at batch end. Rows
+        // of one worker are contiguous (one cost_log file per worker), but a worker may
+        // straddle a batch boundary — the flush merges into any existing map entry.
+        let mut current: Option<((String, u16), WorkloadTotals)> = None;
+        for row in 0..batch.num_rows() {
+            let pool = pool_tags.value(row);
+            let worker_id = worker_ids.value(row);
+            let same = current
+                .as_ref()
+                .is_some_and(|((p, w), _)| p.as_str() == pool && *w == worker_id);
+            if !same {
+                if let Some((key, totals)) = current.take() {
+                    by_worker.entry(key).or_default().add(&totals);
+                }
+                current = Some(((pool.to_string(), worker_id), WorkloadTotals::default()));
+            }
+            let totals = &mut current.as_mut().expect("current set above").1;
+            for elem in (offsets[row] as usize)..(offsets[row + 1] as usize) {
+                totals.matmul_tokens += batch_tokens[elem];
+                totals.prefill_tokens += prefill_tokens[elem];
+                totals.decode_passes += decode_req[elem];
+                totals.decode_kv += decode_kv[elem];
+                if prefix_lists.is_null(elem) || append_lists.is_null(elem) {
+                    continue;
+                }
+                let pv = prefix_lists.value(elem);
+                let av = append_lists.value(elem);
+                let pv = u32_values(&pv, "prefill_prefix_lens")?;
+                let av = u32_values(&av, "prefill_append_lens")?;
+                for k in 0..pv.len().min(av.len()) {
+                    let prefix = pv.value(k) as f64;
+                    let a = av.value(k) as f64;
+                    totals.prefill_pairs += a * prefix + a * (a + 1.0) / 2.0;
+                    totals.prefill_cached += prefix;
+                    totals.prefill_requests += 1.0;
+                }
+            }
+        }
+        if let Some((key, totals)) = current.take() {
+            by_worker.entry(key).or_default().add(&totals);
+        }
+    }
+    Ok(by_worker)
+}
+
+/// A scalar struct field of the flattened `groups` child by name.
+fn field<'a>(gs: &'a StructArray, name: &str) -> Result<&'a arrow_array::ArrayRef> {
+    gs.column_by_name(name)
+        .ok_or_else(|| anyhow!("`groups` struct missing field `{name}`"))
 }
 
 /// The `groups` column of a batch as a `ListArray`.

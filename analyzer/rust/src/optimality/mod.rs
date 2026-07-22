@@ -18,9 +18,12 @@
 //! | R5 hardware limit  | active work unit / matching spec peak | **profiled↔hardware** |
 //!
 //! Buckets telescope and sum exactly back to Real, so the output is an additive
-//! stacked **waterfall** `[idle | imbalance | batching | communication | hw-gap |
-//! hw-optimal]` rendered at five levels (cluster / pool / worker / iteration —
-//! idle 0 by construction / per-kernel).
+//! stacked **waterfall** rendered at five levels (cluster / pool / worker /
+//! iteration — idle 0 by construction / per-kernel). In unlocked mode only, the
+//! `model.work` labeler adds two global necessary-work bounds below R5 and splits
+//! `hw-optimal` into `[excess-over-necessary | fusion | hardware-necessary]`.
+//! Batch-locked analysis keeps the plain six-bucket R0..R5 ladder because its
+//! current operating points must not be globally rebatchable.
 //!
 //! Cost model. `G_worker` is read from `run_meta` (`workers[].gpu_ids.len()`),
 //! never inferred from tp×dp×ep. R0/R1 are exact SQL sums over every row; R2..R5
@@ -46,6 +49,7 @@
 //! - `grid_peaks.rs` — the R3 grid-peak ceiling sidecar.
 //! - `spec.rs` — the R5 GPU-spec compute/bandwidth ceilings.
 
+mod floors;
 mod fold;
 mod grid_peaks;
 mod iteration;
@@ -83,6 +87,40 @@ pub(crate) const RUNG_KEYS: [&str; 6] = [
     "ignore_network",
     "hardware_limit",
 ];
+
+/// In unlocked mode, when the labeler floors are available, the single green
+/// `hardware_optimal` bucket
+/// (= R5) is split into these three sub-buckets, listed top-of-bar → floor (so they
+/// slot in right after `hardware_gap`, replacing `hardware_optimal`). They telescope:
+/// `excess_over_necessary = R5 − segmented`, `fusion = segmented − necessary`,
+/// `hardware_necessary = necessary`; their sum is exactly R5, so the bar is unchanged.
+pub(crate) const FLOOR_BUCKET_KEYS: [&str; 3] =
+    ["excess_over_necessary", "fusion", "hardware_necessary"];
+/// The two extra rungs the floors add below R5 (`hardware_limit`), for the report.
+pub(crate) const FLOOR_RUNG_KEYS: [&str; 2] = ["segmented_necessary", "hardware_necessary"];
+
+/// Waterfall bucket keys in top-down order, with the green split into the three floor
+/// sub-buckets when the labeler floors are present (else the plain 6).
+pub(crate) fn bucket_keys(with_floors: bool) -> Vec<&'static str> {
+    if with_floors {
+        BUCKET_KEYS[..5]
+            .iter()
+            .copied()
+            .chain(FLOOR_BUCKET_KEYS)
+            .collect()
+    } else {
+        BUCKET_KEYS.to_vec()
+    }
+}
+
+/// Rung keys with the two floor rungs appended below `hardware_limit` when present.
+pub(crate) fn rung_keys(with_floors: bool) -> Vec<&'static str> {
+    if with_floors {
+        RUNG_KEYS.iter().copied().chain(FLOOR_RUNG_KEYS).collect()
+    } else {
+        RUNG_KEYS.to_vec()
+    }
+}
 /// The four attributable rungs a kernel carries (R2..R5); no idle/imbalance.
 pub(crate) const KERNEL_RUNG_KEYS: [&str; 4] = [
     "balanced",

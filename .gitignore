@@ -27,4 +27,8 @@ trace/aime_long.csv
 .claude/settings.local.json
 .codex/*.local.*
 
+# Generated docs / sample output — regenerable, not source of truth
+.code-lessons/
+model/work/examples/
+
 /tmp/

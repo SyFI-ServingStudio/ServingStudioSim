@@ -8,8 +8,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
+use super::floors::{Floors, FloorsByLevel};
 use super::fold::WorkerFoldAccumulator;
-use super::{ms_to_s, ratio, BUCKET_KEYS, R0, R1, R2, R3, R4, R5, RUNG_KEYS};
+use super::{ms_to_s, ratio, R0, R1, R2, R3, R4, R5, RUNG_KEYS};
 
 /// The rung arrays at every non-kernel tier, plus the per-worker anchor factors the
 /// kernel tier needs. `worker_anchor_factors` and `worker_rungs_in_fold_order` use
@@ -82,8 +83,16 @@ pub(super) fn assemble_tiers(workers: &[WorkerFoldAccumulator]) -> TierAggregate
 }
 
 /// Build the payload `levels` array: cluster, each pool (sorted), each worker
-/// (sorted), and the Busy-anchored iteration level (idle 0 by construction).
-pub(super) fn levels_json(aggregates: &TierAggregates) -> Vec<Value> {
+/// (sorted), and the Busy-anchored iteration level (idle 0 by construction). When
+/// `floors` is present, every level's green `hardware_optimal` splits into the three
+/// floor sub-buckets (the iteration level reuses the cluster floor).
+pub(super) fn levels_json(
+    aggregates: &TierAggregates,
+    floors: Option<&FloorsByLevel>,
+) -> Vec<Value> {
+    let split = floors.is_some();
+    let floor_of = |key: &str| floors.and_then(|by_level| by_level.get(key)).copied();
+
     let mut levels: Vec<Value> = Vec::new();
     levels.push(level_entry_json(
         "cluster",
@@ -91,6 +100,8 @@ pub(super) fn levels_json(aggregates: &TierAggregates) -> Vec<Value> {
         "Cluster",
         &aggregates.cluster_rungs,
         false,
+        split,
+        floor_of("cluster"),
     ));
     for (pool_tag, pool_rungs) in &aggregates.pool_rungs_by_tag {
         levels.push(level_entry_json(
@@ -99,6 +110,8 @@ pub(super) fn levels_json(aggregates: &TierAggregates) -> Vec<Value> {
             &format!("Pool {pool_tag}"),
             pool_rungs,
             false,
+            split,
+            floor_of(pool_tag),
         ));
     }
     for (pool_tag, worker_id, worker_rungs) in &aggregates.sorted_worker_rungs {
@@ -109,6 +122,8 @@ pub(super) fn levels_json(aggregates: &TierAggregates) -> Vec<Value> {
             &worker_key,
             worker_rungs,
             false,
+            split,
+            floor_of(&worker_key),
         ));
     }
     // Iteration level: the cluster waterfall with idle forced to 0 (idle is a
@@ -119,19 +134,40 @@ pub(super) fn levels_json(aggregates: &TierAggregates) -> Vec<Value> {
         "Iteration",
         &aggregates.cluster_rungs,
         true,
+        split,
+        floor_of("cluster"),
     ));
     levels
 }
 
-/// Convert a rung array (GPU·ms) into one level's payload object: the six waterfall
-/// buckets (GPU·s) plus the rung values + optimality ratio. `idle_zero` tops the
-/// bar at Busy (the iteration level) instead of Real.
+/// Resolve a level's clamped `(necessary, segmented)` floors in GPU·s against its
+/// green R5 (`green_s`). Enforces `0 ≤ necessary ≤ segmented ≤ green` so the three
+/// sub-buckets are non-negative and sum to green; a level with no floor attributes the
+/// whole green to `necessary` (the plain green, just re-labelled).
+fn clamp_floor(floor: Option<Floors>, green_s: f64) -> (f64, f64) {
+    match floor {
+        Some(floor) => {
+            let necessary = floor.necessary.clamp(0.0, green_s);
+            let segmented = floor.segmented.clamp(necessary, green_s);
+            (necessary, segmented)
+        }
+        None => (green_s, green_s),
+    }
+}
+
+/// Convert a rung array (GPU·ms) into one level's payload object: the waterfall buckets
+/// (GPU·s) plus the rung values + optimality ratio. `idle_zero` tops the bar at Busy
+/// (the iteration level) instead of Real. When `split`, the green `hardware_optimal`
+/// bucket is replaced by `excess_over_necessary | fusion | hardware_necessary` (which
+/// sum to it), and the two floor rungs + a `necessary_ratio` are added.
 fn level_entry_json(
     level: &str,
     key: &str,
     label: &str,
     rungs: &[f64; 6],
     idle_zero: bool,
+    split: bool,
+    floor: Option<Floors>,
 ) -> Value {
     let total = if idle_zero { rungs[R1] } else { rungs[R0] };
     let idle = if idle_zero {
@@ -139,29 +175,44 @@ fn level_entry_json(
     } else {
         rungs[R0] - rungs[R1]
     };
-    let buckets = [
-        idle,
-        rungs[R1] - rungs[R2],
-        rungs[R2] - rungs[R3],
-        rungs[R3] - rungs[R4],
-        rungs[R4] - rungs[R5],
-        rungs[R5],
-    ];
-    let bucket_obj: serde_json::Map<String, Value> = BUCKET_KEYS
-        .iter()
-        .zip(buckets.iter())
-        .map(|(bucket_key, bucket_gpu_ms)| {
-            (
-                bucket_key.to_string(),
-                json!(ms_to_s(bucket_gpu_ms.max(0.0))),
-            )
-        })
-        .collect();
-    let rung_obj: serde_json::Map<String, Value> = RUNG_KEYS
+    let green_s = ms_to_s(rungs[R5]);
+
+    // The five buckets above the green floor are the same telescoping rung diffs.
+    let mut bucket_obj = serde_json::Map::new();
+    for (bucket_key, bucket_gpu_ms) in [
+        ("idle", idle),
+        ("imbalance", rungs[R1] - rungs[R2]),
+        ("batching", rungs[R2] - rungs[R3]),
+        ("communication", rungs[R3] - rungs[R4]),
+        ("hardware_gap", rungs[R4] - rungs[R5]),
+    ] {
+        bucket_obj.insert(
+            bucket_key.to_string(),
+            json!(ms_to_s(bucket_gpu_ms.max(0.0))),
+        );
+    }
+    let mut rung_obj: serde_json::Map<String, Value> = RUNG_KEYS
         .iter()
         .zip(rungs.iter())
         .map(|(rung_key, rung_gpu_ms)| (rung_key.to_string(), json!(ms_to_s(*rung_gpu_ms))))
         .collect();
+
+    let necessary_ratio = if split {
+        let (necessary, segmented) = clamp_floor(floor, green_s);
+        bucket_obj.insert(
+            "excess_over_necessary".into(),
+            json!((green_s - segmented).max(0.0)),
+        );
+        bucket_obj.insert("fusion".into(), json!((segmented - necessary).max(0.0)));
+        bucket_obj.insert("hardware_necessary".into(), json!(necessary));
+        rung_obj.insert("segmented_necessary".into(), json!(segmented));
+        rung_obj.insert("hardware_necessary".into(), json!(necessary));
+        Some(ratio(necessary, ms_to_s(total)))
+    } else {
+        bucket_obj.insert("hardware_optimal".into(), json!(green_s));
+        None
+    };
+
     json!({
         "level": level,
         "key": key,
@@ -170,20 +221,27 @@ fn level_entry_json(
         "buckets": bucket_obj,
         "rungs": rung_obj,
         "optimality_ratio": ratio(rungs[R5], total),
+        "necessary_ratio": necessary_ratio,
     })
 }
 
-/// Report-side rung object for one tier: the six rung values (GPU·s), the telescoping
-/// buckets as `{gpu_s, frac}`, and the tier's optimality ratio.
-pub(super) fn rung_report_json(rungs: &[f64; 6]) -> Value {
+/// Report-side rung object for one tier: the rung values (GPU·s), the telescoping
+/// buckets as `{gpu_s, frac}`, and the tier's optimality ratio. When `floor` is present
+/// the two floor rungs are added and the `hardware_optimal` bucket splits into the
+/// three floor sub-buckets (fractions are of Real, same as the others).
+pub(super) fn rung_report_json(rungs: &[f64; 6], floor: Option<Floors>) -> Value {
     let real_gpu_ms = rungs[R0].max(1e-9);
-    let bucket = |bucket_gpu_ms: f64| {
+    let bucket_ms = |bucket_gpu_ms: f64| {
         json!({
             "gpu_s": ms_to_s(bucket_gpu_ms.max(0.0)),
             "frac": bucket_gpu_ms.max(0.0) / real_gpu_ms,
         })
     };
-    json!({
+    // Floor sub-buckets arrive already in GPU·s (from the labeler); mirror the shape.
+    let real_gpu_s = ms_to_s(real_gpu_ms);
+    let bucket_s = |bucket_gpu_s: f64| json!({ "gpu_s": bucket_gpu_s.max(0.0), "frac": bucket_gpu_s.max(0.0) / real_gpu_s });
+
+    let mut report = json!({
         "real": ms_to_s(rungs[R0]),
         "busy": ms_to_s(rungs[R1]),
         "balanced": ms_to_s(rungs[R2]),
@@ -191,13 +249,48 @@ pub(super) fn rung_report_json(rungs: &[f64; 6]) -> Value {
         "ignore_network": ms_to_s(rungs[R4]),
         "hardware_limit": ms_to_s(rungs[R5]),
         "optimality_ratio": ratio(rungs[R5], rungs[R0]),
-        "buckets": {
-            "idle": bucket(rungs[R0] - rungs[R1]),
-            "imbalance": bucket(rungs[R1] - rungs[R2]),
-            "batching": bucket(rungs[R2] - rungs[R3]),
-            "communication": bucket(rungs[R3] - rungs[R4]),
-            "hardware_gap": bucket(rungs[R4] - rungs[R5]),
-            "hardware_optimal": bucket(rungs[R5]),
-        },
-    })
+    });
+    let mut buckets = json!({
+        "idle": bucket_ms(rungs[R0] - rungs[R1]),
+        "imbalance": bucket_ms(rungs[R1] - rungs[R2]),
+        "batching": bucket_ms(rungs[R2] - rungs[R3]),
+        "communication": bucket_ms(rungs[R3] - rungs[R4]),
+        "hardware_gap": bucket_ms(rungs[R4] - rungs[R5]),
+    });
+    let green_s = ms_to_s(rungs[R5]);
+    if floor.is_some() {
+        let (necessary, segmented) = clamp_floor(floor, green_s);
+        report["segmented_necessary"] = json!(segmented);
+        report["hardware_necessary"] = json!(necessary);
+        report["necessary_ratio"] = json!(ratio(necessary, real_gpu_s));
+        buckets["excess_over_necessary"] = bucket_s(green_s - segmented);
+        buckets["fusion"] = bucket_s(segmented - necessary);
+        buckets["hardware_necessary"] = bucket_s(necessary);
+    } else {
+        buckets["hardware_optimal"] = bucket_ms(rungs[R5]);
+    }
+    report["buckets"] = buckets;
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rung_report_json, Floors};
+
+    #[test]
+    fn necessary_work_split_preserves_green_and_uses_seconds_for_ratio() {
+        let rungs = [10_000.0, 9_000.0, 8_000.0, 7_000.0, 6_000.0, 5_000.0];
+        let report = rung_report_json(
+            &rungs,
+            Some(Floors {
+                necessary: 2.0,
+                segmented: 3.0,
+            }),
+        );
+
+        assert_eq!(report["necessary_ratio"], 0.2);
+        assert_eq!(report["buckets"]["hardware_necessary"]["gpu_s"], 2.0);
+        assert_eq!(report["buckets"]["fusion"]["gpu_s"], 1.0);
+        assert_eq!(report["buckets"]["excess_over_necessary"]["gpu_s"], 2.0);
+    }
 }
