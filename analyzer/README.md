@@ -51,7 +51,7 @@ alignment analyze ──reads completed roots + mapping
 
 | Command | Side | Effect |
 |---|---|---|
-| `analyze run <log_dir> [subjects...]` | Rust | Compute subjects → `reports/` + `payloads/`, plus a subject-less `reports/analyzer_timing.json` run-meta sidecar. No subjects = all applicable. |
+| `analyze run <log_dir> [--lock-batch-size] [subjects...]` | Rust | Compute subjects → `reports/` + `payloads/`, plus a subject-less `reports/analyzer_timing.json` run-meta sidecar. Unlocked optimality keeps the standard names; `--lock-batch-size` writes `optimality_batch_locked_report.json` / `optimality_batch_locked_waterfall.json`, makes `R3=R2`, and classifies each current leaf for R5. No subjects = all applicable. |
 | `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
 | `analyze serve --logs-root <dir>` | Rust | Serve the read-only viz-ui catalog, bounded worker operation windows, and exact `(worker, iter, batch, operation)` CostTrees reconstructed lazily from `cost_log` + manifest. |
@@ -64,6 +64,11 @@ Rust `analyze run` then the Python `render` after each successful sim run;
 separate analyze phase config. Both execution paths are
 **best-effort** — a missing analyzer binary, failed handoff, or failed subject
 never fails the completed run.
+
+When optimality is in launcher intent, `run_analysis` computes locked optimality
+first and the normal unlocked subject set second. Both JSON pairs coexist;
+Python renders the primary unlocked payload, while the UI descriptor publishes
+locked optimality as `variants.batch_locked` for interactive switching.
 
 **Required from below** — `analyze run` consumes a run directory written by the
 sim/L7, containing:
@@ -138,7 +143,7 @@ rust/                The `analyze` binary (DataFusion compute side).
   src/backend/         Backend selection over a kernel position's input feature space.
   src/breakdown/       CostTree replay + run-wide leaf-position composition.
   src/optimality/      Sub-optimality waterfall (R0..R5 lower-bound ladder) in GPU·s;
-                       grid_peaks.rs sidecar (sim `kernel-query peak`) + spec.rs roofline.
+                       grid_peaks.rs sidecar (sim `kernel-query peak`) + spec.rs hardware ceilings.
   src/kernel_query.rs  Shared transport to the sim `kernel-query` subcommand (grid/eval/peak).
   src/conservation/    Run-wide work-accounting checks (actual vs expected).
   src/concurrency/     In-flight concurrency and hierarchical request-stage populations over simulated wall-clock time.
@@ -180,7 +185,7 @@ Current catalog:
 | `kernel-throughput` | batch | 1/50-sampled `cost_log` slots + matching CostTree manifests | achieved TFLOP/s (compute) and GB/s (memory BW) per cost-tree location / per-location `kernel_throughput_locations` stats |
 | `kernel-input-distribution` | backend | sampled `cost_log` `slot_input` + `slot_backend` + matching CostTree manifest `backends` lists | per-position selected-backend counts/ratios + PCA/feature projection / one scatter per position (`kernel_input_distribution_scatter`), rendered to `plots/kernel_input_dist/<position>.png`; unavailable on runs without per-slot backend + input logging |
 | `kernel-time-share` | breakdown | `cost_log` slot times + matching CostTree manifests | root kernel-time share by leaf position at overall / pool / worker levels; exact on small runs and bounded worker-stratified sampling on large runs |
-| `optimality` | optimality | `cost_log` (exact R0/R1 + 1/stride-sampled fold) + CostTree manifests + `run_meta` `gpu_ids` counts + `gpu/spec.json` roofline + `raw/kernel_grid_peaks.json` sidecar | sub-optimality waterfall in GPU·s — telescoping buckets at cluster / pool / worker / iteration / per-kernel levels, plus per-worker R0→R5 stacked-kernel ladders with aggregate idle/imbalance chunks / `optimality_waterfall` |
+| `optimality` | optimality | `cost_log` (exact R0/R1 + 1/stride-sampled fold) + CostTree manifests + `run_meta` `gpu_ids` counts + `gpu/spec.json` hardware ceilings + `raw/kernel_grid_peaks.json` sidecar | sub-optimality waterfall in GPU·s — telescoping buckets at cluster / pool / worker / iteration / per-kernel levels, plus per-worker R0→R5 stacked-kernel ladders with aggregate idle/imbalance chunks / `optimality_waterfall` |
 | `concurrency` | concurrency | `request_slo.parquet` arrival + terminal timestamps | exact request count/peak/mean / <=512-bin time-weighted active-request series |
 | `request-state` | concurrency | `request_slo.parquet` stage-transition lists + `run_meta.json` stage vocab/worker roster | exact category/pending peaks and means / 200-bin cluster and request-owner-worker open-category stacks plus owner-pool aggregate/average/worker pending series; execution-only pools (AFD FFN) are omitted; unavailable when stage logging is off |
 | `workload-conservation` | conservation | `cost_log` actuals + `request_slo.parquet` per-request expected | run-wide prefill/decode/FFN/KV work accounting, pass/fail / `workload_conservation_checks` |

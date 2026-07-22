@@ -3,10 +3,10 @@
 //! R0/R1 are exact SQL sums over every row ([`read_exact_worker_totals`]). R2..R5 fold
 //! a stride-sampled set of rows ([`accumulate_fold`]): the mean-mode fold is linear,
 //! so each rung is `Σ_slot α·value` with the precomputed per-slot weight `α`, one
-//! dot product per row. Each leaf's per-rung value comes from [`leaf_optimal_ms`], a
-//! roofline over the leaf's grid-peak (R3) then the GPU-spec peak (R5). The sampled
-//! sums land in each worker's accumulators and, per slot, in `(location, worker)`
-//! cells for the kernel-level attribution.
+//! dot product per row. Unlocked analysis selects one grid throughput basis for
+//! R3 and reuses it for R5. Locked-batch analysis sets R3=R2 and selects R5's
+//! basis from each current leaf. The sampled sums land in each worker's
+//! accumulators and, per slot, in `(location, worker)` attribution cells.
 
 use std::collections::HashMap;
 
@@ -138,6 +138,7 @@ pub(super) async fn accumulate_fold(
     ctx: &SessionContext,
     stride: u64,
     hardware_bandwidth_gbps: f64,
+    lock_batch_size: bool,
     section_fold_plan_by_key: &HashMap<(String, u16, String), SectionFoldPlan>,
     worker_index_by_key: &HashMap<(String, u16), usize>,
     workers: &mut [WorkerFoldAccumulator],
@@ -153,6 +154,7 @@ pub(super) async fn accumulate_fold(
         ctx,
         &sql,
         hardware_bandwidth_gbps,
+        lock_batch_size,
         section_fold_plan_by_key,
         worker_index_by_key,
         workers,
@@ -169,6 +171,7 @@ pub(super) async fn accumulate_iteration_fold(
     worker_id: u16,
     iter_id: u64,
     hardware_bandwidth_gbps: f64,
+    lock_batch_size: bool,
     section_fold_plan_by_key: &HashMap<(String, u16, String), SectionFoldPlan>,
     worker_index_by_key: &HashMap<(String, u16), usize>,
     workers: &mut [WorkerFoldAccumulator],
@@ -186,6 +189,7 @@ pub(super) async fn accumulate_iteration_fold(
         ctx,
         &sql,
         hardware_bandwidth_gbps,
+        lock_batch_size,
         section_fold_plan_by_key,
         worker_index_by_key,
         workers,
@@ -198,6 +202,7 @@ async fn accumulate_fold_query(
     ctx: &SessionContext,
     sql: &str,
     hardware_bandwidth_gbps: f64,
+    lock_batch_size: bool,
     section_fold_plan_by_key: &HashMap<(String, u16, String), SectionFoldPlan>,
     worker_index_by_key: &HashMap<(String, u16), usize>,
     workers: &mut [WorkerFoldAccumulator],
@@ -261,32 +266,36 @@ async fn accumulate_fold_query(
                 let leaf_flops = flops.value(value_index) as f64;
                 let leaf_bytes = bytes.value(value_index) as f64;
                 let is_communication = fold_plan.is_communication_by_slot[slot];
-                let per_config_best_ms = leaf_optimal_ms(
+                let uses_compute_throughput = if lock_batch_size {
+                    current_point_uses_compute_throughput(
+                        leaf_flops,
+                        leaf_bytes,
+                        is_communication,
+                        fold_plan.hardware_peak_tflops_by_slot[slot],
+                        hardware_bandwidth_gbps,
+                    )
+                } else {
+                    fold_plan.r3_uses_compute_throughput_by_slot[slot]
+                };
+                let per_config_best_ms = leaf_per_config_best_ms(
+                    lock_batch_size,
                     observed_time_ms,
                     leaf_flops,
                     leaf_bytes,
-                    is_communication,
+                    uses_compute_throughput,
                     fold_plan.grid_peak_tflops_by_slot[slot],
                     fold_plan.grid_peak_gbps_by_slot[slot],
                 );
                 let hardware_limit_ms = if is_communication {
                     0.0
                 } else {
-                    // Drop the memory term for a non-physical byte count (grouped_gemm),
-                    // leaving the compute roofline — its real hardware gap survives.
-                    let effective_hardware_bandwidth_gbps =
-                        if fold_plan.has_physical_memory_bytes_by_slot[slot] {
-                            hardware_bandwidth_gbps
-                        } else {
-                            0.0
-                        };
-                    leaf_optimal_ms(
+                    leaf_selected_throughput_ms(
                         per_config_best_ms,
                         leaf_flops,
                         leaf_bytes,
-                        false,
+                        uses_compute_throughput,
                         fold_plan.hardware_peak_tflops_by_slot[slot],
-                        effective_hardware_bandwidth_gbps,
+                        hardware_bandwidth_gbps,
                     )
                 };
                 // R2 real, R3 per-config-best, R4 drop-comm, R5 hardware.
@@ -327,32 +336,110 @@ fn sql_string_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-/// One leaf's optimal time (ms) = `work / peak_rate`, roofline over compute and
-/// bandwidth, clamped to `real` (a peak can't make a leaf slower than observed).
-/// A comm leaf uses only the bandwidth term. No measurable work/peak → `real`
-/// (that leaf contributes no headroom at this rung).
-fn leaf_optimal_ms(
+/// Apply one already-selected productive-throughput unit. Unlocked R3 calls
+/// this with profiled grid peaks; R5 calls it with hardware peaks and either the
+/// unlocked grid classification or the locked current-point classification.
+fn leaf_selected_throughput_ms(
     observed_upper_bound_ms: f64,
     work_flops: f64,
     traffic_bytes: f64,
-    is_communication: bool,
+    uses_compute_throughput: bool,
     ceiling_tflops: f64,
     ceiling_gbps: f64,
 ) -> f64 {
-    let mut lower_bound_ms = 0.0f64;
-    let mut has_rate_ceiling = false;
-    if !is_communication && ceiling_tflops > 0.0 && work_flops > 0.0 {
-        lower_bound_ms = lower_bound_ms.max(work_flops / ceiling_tflops / 1e9);
-        has_rate_ceiling = true;
+    let candidate_ms = if uses_compute_throughput && ceiling_tflops > 0.0 && work_flops > 0.0 {
+        Some(work_flops / ceiling_tflops / 1e9)
+    } else if !uses_compute_throughput && ceiling_gbps > 0.0 && traffic_bytes > 0.0 {
+        Some(traffic_bytes / ceiling_gbps / 1e6)
+    } else {
+        None
+    };
+    candidate_ms
+        .unwrap_or(observed_upper_bound_ms)
+        .min(observed_upper_bound_ms)
+        .max(0.0)
+}
+
+fn leaf_per_config_best_ms(
+    lock_batch_size: bool,
+    observed_time_ms: f64,
+    work_flops: f64,
+    traffic_bytes: f64,
+    uses_compute_throughput: bool,
+    grid_peak_tflops: f64,
+    grid_peak_gbps: f64,
+) -> f64 {
+    if lock_batch_size {
+        observed_time_ms
+    } else {
+        leaf_selected_throughput_ms(
+            observed_time_ms,
+            work_flops,
+            traffic_bytes,
+            uses_compute_throughput,
+            grid_peak_tflops,
+            grid_peak_gbps,
+        )
     }
-    if ceiling_gbps > 0.0 && traffic_bytes > 0.0 {
-        lower_bound_ms = lower_bound_ms.max(traffic_bytes / ceiling_gbps / 1e6);
-        has_rate_ceiling = true;
+}
+
+fn current_point_uses_compute_throughput(
+    work_flops: f64,
+    traffic_bytes: f64,
+    is_communication: bool,
+    hardware_peak_tflops: f64,
+    hardware_bandwidth_gbps: f64,
+) -> bool {
+    if is_communication
+        || work_flops <= 0.0
+        || hardware_peak_tflops <= 0.0
+        || hardware_bandwidth_gbps <= 0.0
+    {
+        return false;
     }
-    if !has_rate_ceiling {
-        return observed_upper_bound_ms;
+    if traffic_bytes <= 0.0 {
+        return true;
     }
-    lower_bound_ms.min(observed_upper_bound_ms).max(0.0)
+    let current_arithmetic_intensity_flops_per_byte = work_flops / traffic_bytes;
+    let hardware_ridge_flops_per_byte = hardware_peak_tflops * 1_000.0 / hardware_bandwidth_gbps;
+    current_arithmetic_intensity_flops_per_byte >= hardware_ridge_flops_per_byte
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        current_point_uses_compute_throughput, leaf_per_config_best_ms, leaf_selected_throughput_ms,
+    };
+
+    #[test]
+    fn r3_uses_only_the_classified_throughput_basis() {
+        let compute_ms = leaf_selected_throughput_ms(10.0, 2.0e12, 9.0e9, true, 1_000.0, 1_000.0);
+        let memory_ms = leaf_selected_throughput_ms(10.0, 2.0e12, 9.0e9, false, 1_000.0, 1_000.0);
+
+        assert_eq!(compute_ms, 2.0);
+        assert_eq!(memory_ms, 9.0);
+    }
+
+    #[test]
+    fn locked_batch_classifies_each_current_operating_point() {
+        assert!(current_point_uses_compute_throughput(
+            400.0, 1.0, false, 900.0, 3_000.0
+        ));
+        assert!(!current_point_uses_compute_throughput(
+            100.0, 1.0, false, 900.0, 3_000.0
+        ));
+        assert!(!current_point_uses_compute_throughput(
+            400.0, 1.0, true, 900.0, 3_000.0
+        ));
+    }
+
+    #[test]
+    fn locked_batch_makes_r3_identical_to_r2() {
+        assert_eq!(
+            leaf_per_config_best_ms(true, 7.0, 2.0e12, 9.0e9, true, 1_000.0, 1_000.0),
+            7.0
+        );
+    }
 }
 
 fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {

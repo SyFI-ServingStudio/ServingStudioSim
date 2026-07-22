@@ -231,7 +231,8 @@ pub const SUBJECTS: &[Subject] = &[
         category: Category::Optimality,
         description: "Distance from optimal GPU usage as a sub-optimality waterfall (GPU·s): \
                       idle / imbalance / batching / communication / hardware-gap / hardware-optimal, \
-                      at cluster / pool / worker / iteration / per-kernel levels.",
+                      at cluster / pool / worker / iteration / per-kernel levels; `analyze run \
+                      --lock-batch-size` disables the batching counterfactual.",
         report_name: "optimality_report.json",
         payload_name: "optimality_waterfall.json",
         applies: Applies::All,
@@ -333,7 +334,32 @@ pub fn help() -> String {
 /// Name → runner. The one place that grows an arm per subject (mapping a CLI
 /// string to a typed async fn is irreducible) — but it's a single root function,
 /// not per-category boilerplate.
-pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result<(Value, Value)> {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RunOptions {
+    pub lock_batch_size: bool,
+}
+
+/// Resolve the output pair for one subject invocation. Optimality is the only
+/// subject with two durable variants: keeping the original names for unlocked
+/// preserves old consumers, while the locked names let launcher publish both
+/// counterfactuals from one simulation without either overwriting the other.
+pub fn artifact_names(subject: &Subject, options: RunOptions) -> (&'static str, &'static str) {
+    if subject.name == "optimality" && options.lock_batch_size {
+        (
+            "optimality_batch_locked_report.json",
+            "optimality_batch_locked_waterfall.json",
+        )
+    } else {
+        (subject.report_name, subject.payload_name)
+    }
+}
+
+pub async fn run_subject(
+    name: &str,
+    ctx: &SessionContext,
+    dir: &Path,
+    options: RunOptions,
+) -> Result<(Value, Value)> {
     match name {
         "slo-general" => request::slo::run_slo_general(ctx, dir).await,
         "slo-detailed" => request::slo::run_slo_detailed(ctx, dir).await,
@@ -343,7 +369,7 @@ pub async fn run_subject(name: &str, ctx: &SessionContext, dir: &Path) -> Result
         "kernel-throughput" => batch::kernel_throughput::run_kernel_throughput(ctx, dir).await,
         "kernel-input-distribution" => backend::kernel_input_distribution::run(ctx, dir).await,
         "kernel-time-share" => breakdown::kernel_time_share::run(ctx, dir).await,
-        "optimality" => optimality::run_optimality(ctx, dir).await,
+        "optimality" => optimality::run_optimality(ctx, dir, options.lock_batch_size).await,
         "concurrency" => concurrency::series::run_concurrency(ctx, dir).await,
         "request-state" => concurrency::request_state::run_request_state(ctx, dir).await,
         "workload-conservation" => conservation::workload::run_workload(ctx, dir).await,
@@ -396,4 +422,33 @@ pub fn select(
             true
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{artifact_names, RunOptions, SUBJECTS};
+
+    #[test]
+    fn optimality_artifact_names_keep_both_batch_modes() {
+        let subject = SUBJECTS
+            .iter()
+            .find(|subject| subject.name == "optimality")
+            .expect("optimality subject");
+        assert_eq!(
+            artifact_names(subject, RunOptions::default()),
+            ("optimality_report.json", "optimality_waterfall.json")
+        );
+        assert_eq!(
+            artifact_names(
+                subject,
+                RunOptions {
+                    lock_batch_size: true,
+                },
+            ),
+            (
+                "optimality_batch_locked_report.json",
+                "optimality_batch_locked_waterfall.json",
+            )
+        );
+    }
 }

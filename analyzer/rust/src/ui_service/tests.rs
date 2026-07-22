@@ -15,7 +15,10 @@ use super::kernel_input_distribution::{
 use super::kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
 use super::kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use super::model::read_model;
-use super::optimality::{read_optimality_payload, read_optimality_report};
+use super::optimality::{
+    read_locked_optimality_payload, read_locked_optimality_report, read_optimality_payload,
+    read_optimality_report,
+};
 use super::request_state::{read_request_state_payload, read_request_state_report};
 use super::slo::{read_slo_general_payload, read_slo_general_report};
 use super::throughput::{read_throughput_payload, read_throughput_report};
@@ -356,6 +359,22 @@ fn make_core_run(path: &Path) {
         }"#,
     )
     .expect("write optimality payload");
+    fs::write(
+        path.join("reports/optimality_batch_locked_report.json"),
+        r#"{
+            "schema_version": 1,
+            "available": true,
+            "meta": {"batch_size_locked": true},
+            "optimality_ratio": 0.33,
+            "unit": "gpu_seconds"
+        }"#,
+    )
+    .expect("write batch-locked optimality report");
+    fs::copy(
+        path.join("payloads/optimality_waterfall.json"),
+        path.join("payloads/optimality_batch_locked_waterfall.json"),
+    )
+    .expect("write batch-locked optimality payload");
     fs::write(
         path.join("reports/workload_conservation_report.json"),
         r#"{
@@ -999,9 +1018,19 @@ fn optimality_resources_expose_waterfall_levels_and_kernels() {
         descriptor["subjects"]["optimality"]["payload_href"],
         "subjects/optimality/payload"
     );
+    assert_eq!(
+        descriptor["subjects"]["optimality"]["variants"]["batch_locked"]["payload_href"],
+        "subjects/optimality/variants/batch-locked/payload"
+    );
     let report = read_optimality_report(&run).expect("read optimality report");
     let payload = read_optimality_payload(&run).expect("read optimality payload");
+    let locked_report =
+        read_locked_optimality_report(&run).expect("read batch-locked optimality report");
+    let locked_payload =
+        read_locked_optimality_payload(&run).expect("read batch-locked optimality payload");
     assert_eq!(report["optimality_ratio"], 0.33);
+    assert_eq!(locked_report["optimality_ratio"], 0.33);
+    assert_eq!(locked_payload["optimality_ratio"], 0.33);
     // The cluster waterfall's telescoping buckets sum back to its Real GPU·s.
     let cluster = &payload["levels"][0];
     let sum: f64 = cluster["buckets"]

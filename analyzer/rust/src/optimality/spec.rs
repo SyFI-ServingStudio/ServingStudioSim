@@ -1,7 +1,9 @@
-//! Hardware roofline peaks from `gpu/spec.json` — the R5 "hardware limit" rung.
+//! Hardware peaks from `gpu/spec.json` — the R5 "hardware limit" rung.
 //!
-//! R5 divides each compute leaf's work by the GPU's *spec-sheet* dense peak (not a
-//! profiled kernel's peak), so the R4→R5 gap is the profiled↔hardware maturity gap.
+//! R5 divides each leaf's active throughput unit by the matching spec-sheet
+//! peak. Unlocked analysis reuses R3's grid regime; locked-batch analysis uses
+//! the leaf's current operating-point regime. The R4→R5 gap is therefore the
+//! profiled↔hardware maturity gap under the chosen batching assumption.
 //! `gpu/spec.json` is a flat list of GPU dicts (`fp8_tflops`, `bf16_tflops`,
 //! `mem_bandwidth_gbps`, …), each carrying an explicit `aliases` list — the
 //! authoritative set of names a run's `gpu_name` might use (`"NVIDIA H200"`,
@@ -9,14 +11,14 @@
 //! case-insensitive exact lookup against `name` ∪ `aliases`; no fuzzy guessing.
 //!
 //! That alias table is meant to be the single GPU-name canonicalization source for
-//! the whole system (this roofline today; preset parsing / profile.db key matching
+//! the whole system (this hardware ceiling today; preset parsing / profile.db key matching
 //! later), so extending coverage is one JSON edit, not a code change here.
 
 use std::path::Path;
 
 use serde_json::Value;
 
-/// The peak rates the R5 roofline needs for one GPU model.
+/// The peak rates the R5 ceiling needs for one GPU model.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct GpuSpec {
     fp8_tflops: f64,
@@ -30,7 +32,7 @@ pub(crate) struct GpuSpec {
 impl GpuSpec {
     /// Dense compute peak (TFLOP/s) for a leaf's compute `dtype`. Falls back to
     /// bf16 (the common training/inference default) for an unrecognized dtype, and
-    /// to `0.0` — meaning "no hardware roofline, R5 leaf degrades to R4" — when the
+    /// to `0.0` — meaning "no hardware ceiling, R5 leaf degrades to R4" — when the
     /// matched spec entry lacks that field (e.g. an fp8 kernel on a pre-fp8 GPU).
     pub fn peak_tflops(&self, dtype: &str) -> f64 {
         let d = dtype.to_ascii_lowercase();

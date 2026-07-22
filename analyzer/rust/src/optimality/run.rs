@@ -32,12 +32,16 @@ pub(super) const COST_COLS: &[&str] = &[
     "slot_bytes",
 ];
 
-pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
+pub async fn run_optimality(
+    ctx: &SessionContext,
+    log_dir: &Path,
+    lock_batch_size: bool,
+) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
         let reason = "cost_log/ dir not found";
         return Ok((
-            unavailable(log_dir, reason),
-            unavailable_payload(log_dir, reason),
+            unavailable(log_dir, reason, lock_batch_size),
+            unavailable_payload(log_dir, reason, lock_batch_size),
         ));
     }
     require_columns(ctx, COST_LOG_TABLE, COST_COLS).await?;
@@ -47,8 +51,8 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
             let reason =
                 format!("cost_manifest/ unreadable ({error:#}); needed to fold the ladder");
             return Ok((
-                unavailable(log_dir, &reason),
-                unavailable_payload(log_dir, &reason),
+                unavailable(log_dir, &reason, lock_batch_size),
+                unavailable_payload(log_dir, &reason, lock_batch_size),
             ));
         }
     };
@@ -71,7 +75,7 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
         .map(|(pool_tag, worker_id, gpu_count)| ((pool_tag, worker_id), gpu_count.max(1) as f64))
         .collect();
 
-    // Hardware roofline (R5) + grid-peak ceilings (R3).
+    // Hardware rate ceilings (R5) + grid-peak ceilings (R3).
     let (_num_gpus, gpu_name) = read_run_meta(log_dir).unwrap_or((1, String::new()));
     let repository_root = repo_root().ok();
     let matched_gpu_spec = repository_root
@@ -81,16 +85,20 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
         Some((matched_name, spec)) => (Some(matched_name), spec),
         None => {
             caveats.push(format!(
-                "no gpu/spec.json entry for gpu_name {gpu_name:?}; R5 hardware limit \
-                 collapses onto R4 (no hardware-gap bucket) — add an alias"
+                "no gpu/spec.json entry for gpu_name {gpu_name:?}; R3 defaults to its \
+                 bandwidth basis and R5 hardware limit collapses onto R4 — add an alias"
             ));
             (None, GpuSpec::default())
         }
     };
     let hardware_bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
 
-    let grid_peak_catalog = grid_peaks::load_or_generate(log_dir, &manifests_by_worker);
-    if grid_peak_catalog.is_empty() {
+    let grid_peak_catalog = if lock_batch_size {
+        grid_peaks::GridPeakCatalog::batch_locked()
+    } else {
+        grid_peaks::load_or_generate(log_dir, &manifests_by_worker)
+    };
+    if !lock_batch_size && grid_peak_catalog.is_empty() {
         caveats.push(format!(
             "grid-peaks sidecar {}: batching headroom not computed (R3 = R2)",
             grid_peak_catalog.source
@@ -106,8 +114,8 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
     if workers.is_empty() {
         let reason = "cost_log has no (pool_tag, worker_id) rows";
         return Ok((
-            unavailable(log_dir, reason),
-            unavailable_payload(log_dir, reason),
+            unavailable(log_dir, reason, lock_batch_size),
+            unavailable_payload(log_dir, reason, lock_batch_size),
         ));
     }
     // A cost_log worker with no run_meta GPU count falls back to G=1 (see
@@ -142,6 +150,7 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
         ctx,
         sample_stride,
         hardware_bandwidth_gbps,
+        lock_batch_size,
         &section_fold_plan_by_key,
         &worker_index_by_key,
         &mut workers,
@@ -175,6 +184,7 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
     let analysis_meta = json!({
         "log_dir": log_dir.display().to_string(),
         "gpu_name": gpu_name,
+        "batch_size_locked": lock_batch_size,
         "gpu_spec_matched": gpu_spec_matched,
         "peaks_source": grid_peak_catalog.source,
         "sample_stride": sample_stride,
@@ -206,7 +216,7 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
             &kernel_locations,
             &kernel_rungs_by_location,
         ),
-        "definitions": definitions(),
+        "definitions": definitions(lock_batch_size),
     });
 
     let payload = json!({
@@ -221,13 +231,18 @@ pub async fn run_optimality(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
         "levels": level_entries,
         "kernels": kernel_entries,
         "worker_kernel_ladders": worker_kernel_ladders,
-        "definitions": definitions(),
+        "definitions": definitions(lock_batch_size),
     });
 
     Ok((report, payload))
 }
 
-fn definitions() -> Value {
+fn definitions(lock_batch_size: bool) -> Value {
+    let per_config_best = if lock_batch_size {
+        "batch size locked: identical to balanced (R3=R2); batching gap is zero"
+    } else {
+        "large-batch grid ceiling for the leaf's fixed config: peak TFLOP/s when any fitted point crosses the GPU ridge, otherwise peak GB/s; gap = batching"
+    };
     json!({
         "scope": "per-worker CostTree manifest re-folded with per-rung leaf substitutions; \
                   unit GPU-seconds = wall time × the worker's run_meta gpu_ids count",
@@ -235,9 +250,9 @@ fn definitions() -> Value {
             "real": "span × G — GPU·s actually held (includes idle)",
             "busy": "Σ total_time_ms × G — no scheduler idle; gap vs real = idle",
             "balanced": "real slot times, Max folded to mean — perfect load balance; gap = imbalance",
-            "per_config_best": "work / grid-peak rate for the leaf's fixed config over its batch axis; gap = batching",
+            "per_config_best": per_config_best,
             "ignore_network": "per_config_best with comm leaves dropped; gap = communication",
-            "hardware_limit": "work / gpu-spec dense peak (roofline); gap = profiled↔hardware; this rung = irreducible",
+            "hardware_limit": "active compute or memory work unit / matching gpu-spec peak; unlocked reuses the R3 grid regime, locked uses each current operating point; gap = profiled↔hardware",
         },
         "buckets": "idle, imbalance, batching, communication, hardware_gap, hardware_optimal — \
                     telescoping differences of the rungs; sum to Real",
@@ -250,20 +265,22 @@ fn definitions() -> Value {
     })
 }
 
-fn unavailable(log_dir: &Path, reason: &str) -> Value {
+fn unavailable(log_dir: &Path, reason: &str, lock_batch_size: bool) -> Value {
     json!({
         "schema_version": SCHEMA_VERSION,
-        "meta": {"log_dir": log_dir.display().to_string()},
+        "meta": {"log_dir": log_dir.display().to_string(),
+                 "batch_size_locked": lock_batch_size},
         "available": false,
         "reason": reason,
-        "definitions": definitions(),
+        "definitions": definitions(lock_batch_size),
     })
 }
 
-fn unavailable_payload(log_dir: &Path, reason: &str) -> Value {
+fn unavailable_payload(log_dir: &Path, reason: &str, lock_batch_size: bool) -> Value {
     json!({
         "schema_version": SCHEMA_VERSION,
-        "meta": {"log_dir": log_dir.display().to_string(), "available": false, "reason": reason},
+        "meta": {"log_dir": log_dir.display().to_string(), "available": false, "reason": reason,
+                 "batch_size_locked": lock_batch_size},
         "bucket_keys": BUCKET_KEYS,
         "rung_keys": RUNG_KEYS,
         "kernel_rung_keys": KERNEL_RUNG_KEYS,

@@ -33,14 +33,13 @@ pub(super) struct SectionFoldPlan {
     /// Grid-peak ceilings for R3 (`0` = no sidecar entry → that leaf's R3 = R2).
     pub(super) grid_peak_tflops_by_slot: Vec<f64>,
     pub(super) grid_peak_gbps_by_slot: Vec<f64>,
+    /// R3 chooses exactly one grid throughput basis. A config is compute-capable
+    /// when any fitted point reaches the GPU-spec ridge intensity; otherwise it
+    /// uses bandwidth. This deliberately models the large-batch regime rather
+    /// than rooflining the current small-batch point.
+    pub(super) r3_uses_compute_throughput_by_slot: Vec<bool>,
     /// Hardware spec compute peak for R5 by the slot's dtype (`0` = no spec).
     pub(super) hardware_peak_tflops_by_slot: Vec<f64>,
-    /// Whether this leaf's logged `bytes` are physical HBM traffic — false when
-    /// its grid `peak_gbps` exceeds the GPU's HBM peak (e.g. grouped_gemm counts
-    /// logical operand bytes, not HBM movement). Gates the R5 memory roofline: a
-    /// non-physical byte count would otherwise inflate `τ_hw` and erase the leaf's
-    /// hardware-gap. R3 is unaffected (its huge peak_gbps makes the term negligible).
-    pub(super) has_physical_memory_bytes_by_slot: Vec<bool>,
 }
 
 /// Intern every manifest leaf into a global location, and precompute each
@@ -75,8 +74,8 @@ pub(super) fn build_section_fold_plans(
             let mut is_communication_by_slot = Vec::with_capacity(num_slots);
             let mut grid_peak_tflops_by_slot = Vec::with_capacity(num_slots);
             let mut grid_peak_gbps_by_slot = Vec::with_capacity(num_slots);
+            let mut r3_uses_compute_throughput_by_slot = Vec::with_capacity(num_slots);
             let mut hardware_peak_tflops_by_slot = Vec::with_capacity(num_slots);
-            let mut has_physical_memory_bytes_by_slot = Vec::with_capacity(num_slots);
             for leaf in &manifest.slots {
                 let is_communication = is_communication_kind(&leaf.kind);
                 let location_id =
@@ -99,18 +98,25 @@ pub(super) fn build_section_fold_plans(
                 grid_peak_tflops_by_slot.push(peak.tflops);
                 grid_peak_gbps_by_slot.push(peak.gbps);
                 let dtype = compute_dtype(&leaf.kernel_config);
-                hardware_peak_tflops_by_slot.push(if is_communication {
+                let hardware_peak_tflops = if is_communication {
                     0.0
                 } else {
                     gpu_spec.peak_tflops(&dtype)
-                });
-                // Trust `bytes` as HBM traffic unless the grid says the leaf
-                // achieved a bandwidth above the GPU's physical HBM peak.
+                };
+                hardware_peak_tflops_by_slot.push(hardware_peak_tflops);
                 let hardware_bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
-                has_physical_memory_bytes_by_slot.push(
-                    hardware_bandwidth_gbps > 0.0
-                        && (peak.gbps <= 0.0 || peak.gbps <= hardware_bandwidth_gbps),
-                );
+                let hardware_ridge_flops_per_byte =
+                    if hardware_peak_tflops > 0.0 && hardware_bandwidth_gbps > 0.0 {
+                        hardware_peak_tflops * 1_000.0 / hardware_bandwidth_gbps
+                    } else {
+                        f64::INFINITY
+                    };
+                r3_uses_compute_throughput_by_slot.push(r3_uses_compute_throughput(
+                    peak.max_arithmetic_intensity_flops_per_byte,
+                    peak.tflops,
+                    is_communication,
+                    hardware_ridge_flops_per_byte,
+                ));
             }
             section_fold_plans.insert(
                 (
@@ -124,13 +130,24 @@ pub(super) fn build_section_fold_plans(
                     is_communication_by_slot,
                     grid_peak_tflops_by_slot,
                     grid_peak_gbps_by_slot,
+                    r3_uses_compute_throughput_by_slot,
                     hardware_peak_tflops_by_slot,
-                    has_physical_memory_bytes_by_slot,
                 },
             );
         }
     }
     (kernel_locations, section_fold_plans)
+}
+
+fn r3_uses_compute_throughput(
+    max_arithmetic_intensity_flops_per_byte: f64,
+    peak_tflops: f64,
+    is_communication: bool,
+    hardware_ridge_flops_per_byte: f64,
+) -> bool {
+    !is_communication
+        && peak_tflops > 0.0
+        && max_arithmetic_intensity_flops_per_byte >= hardware_ridge_flops_per_byte
 }
 
 /// Best-effort compute dtype for a leaf's roofline: the first present of the
@@ -160,4 +177,16 @@ fn is_communication_kind(kind: &str) -> bool {
     ) || kind.starts_with("p2p")
         || kind.starts_with("nccl")
         || kind.starts_with("comm")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::r3_uses_compute_throughput;
+
+    #[test]
+    fn r3_basis_follows_whether_the_grid_crosses_the_hardware_ridge() {
+        assert!(r3_uses_compute_throughput(400.0, 700.0, false, 300.0));
+        assert!(!r3_uses_compute_throughput(100.0, 700.0, false, 300.0));
+        assert!(!r3_uses_compute_throughput(400.0, 0.0, true, 300.0));
+    }
 }

@@ -35,6 +35,7 @@ const SIDECAR: &str = "kernel_grid_peaks.json";
 pub(crate) struct GridPeakRates {
     pub tflops: f64,
     pub gbps: f64,
+    pub max_arithmetic_intensity_flops_per_byte: f64,
 }
 
 /// The run's per-config peaks plus where they came from (for the report caveat).
@@ -46,6 +47,15 @@ pub(crate) struct GridPeakCatalog {
 }
 
 impl GridPeakCatalog {
+    /// Locked-batch analysis has no R3 batching counterfactual, so it must not
+    /// launch the expensive kernel-query sidecar generator.
+    pub fn batch_locked() -> Self {
+        Self {
+            rates_by_config_key: HashMap::new(),
+            source: "disabled: batch size locked".to_string(),
+        }
+    }
+
     /// The grid peak for a leaf's `(kind, config)`, or `None` when this config was
     /// never queried (degraded run) or failed to build — caller uses the observed peak.
     pub fn get(&self, kind: &str, config: &Value) -> Option<GridPeakRates> {
@@ -111,11 +121,14 @@ fn load(log_dir: &Path) -> Option<GridPeakCatalog> {
         if entry.error.is_some() {
             continue;
         }
+        let max_arithmetic_intensity_flops_per_byte =
+            entry.max_arithmetic_intensity_flops_per_byte?;
         rates_by_config_key.insert(
             config_key(&entry.kind, &entry.config),
             GridPeakRates {
                 tflops: entry.peak_tflops,
                 gbps: entry.peak_gbps,
+                max_arithmetic_intensity_flops_per_byte,
             },
         );
     }
@@ -174,12 +187,17 @@ fn generate(
             .get("peak_gbps")
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
+        let max_arithmetic_intensity_flops_per_byte = result
+            .get("max_arithmetic_intensity_flops_per_byte")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         if error.is_none() {
             rates_by_config_key.insert(
                 config_key(kind, config),
                 GridPeakRates {
                     tflops: peak_tflops,
                     gbps: peak_gbps,
+                    max_arithmetic_intensity_flops_per_byte,
                 },
             );
         }
@@ -188,6 +206,7 @@ fn generate(
             "config": config,
             "peak_tflops": peak_tflops,
             "peak_gbps": peak_gbps,
+            "max_arithmetic_intensity_flops_per_byte": max_arithmetic_intensity_flops_per_byte,
             "error": error,
         }));
     }
@@ -240,6 +259,9 @@ struct SidecarEntry {
     peak_tflops: f64,
     #[serde(default)]
     peak_gbps: f64,
+    // Optional on purpose: an old sidecar must be regenerated rather than
+    // silently classifying every compute kernel as memory-bound.
+    max_arithmetic_intensity_flops_per_byte: Option<f64>,
     #[serde(default)]
     error: Option<String>,
 }

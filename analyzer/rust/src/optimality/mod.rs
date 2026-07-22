@@ -15,7 +15,7 @@
 //! | R2 Balanced        | real times, Max→mean | **imbalance** (DP/EP straggler)|
 //! | R3 per-config best | work / grid-peak rate | **batching** (small-batch loss)|
 //! | R4 ignore network  | R3, comm leaves→0  | **communication**               |
-//! | R5 hardware limit  | work / spec peak   | **profiled↔hardware** (maturity)|
+//! | R5 hardware limit  | active work unit / matching spec peak | **profiled↔hardware** |
 //!
 //! Buckets telescope and sum exactly back to Real, so the output is an additive
 //! stacked **waterfall** `[idle | imbalance | batching | communication | hw-gap |
@@ -38,12 +38,13 @@
 //! - `prepare.rs` — preparation: interns manifest leaves into locations and
 //!   precomputes each section's fold weights + rate ceilings (`build_section_fold_plans`).
 //! - `fold.rs` — the algorithm: exact R0/R1 SQL sums + the stride-sampled R2..R5
-//!   mean-fold (`read_exact_worker_totals`, `accumulate_fold`, `leaf_optimal_ms`).
+//!   mean-fold (`read_exact_worker_totals`, `accumulate_fold`,
+//!   `leaf_selected_throughput_ms`).
 //! - `levels.rs` — the worker / pool / cluster tiers: rung assembly + rollup +
 //!   level/report JSON.
 //! - `kernel.rs` — the kernel tier: per-location bars + the per-worker kernel ladders.
 //! - `grid_peaks.rs` — the R3 grid-peak ceiling sidecar.
-//! - `spec.rs` — the R5 gpu-spec roofline.
+//! - `spec.rs` — the R5 GPU-spec compute/bandwidth ceilings.
 
 mod fold;
 mod grid_peaks;

@@ -104,6 +104,9 @@ struct PeakItemResult {
     peak_tflops: f64,
     /// Max achieved GB/s over the fitted grid (bandwidth ceiling).
     peak_gbps: f64,
+    /// Highest algorithmic intensity among fitted cells. The analyzer compares
+    /// this with the GPU-spec ridge point to choose R3's one throughput basis.
+    max_arithmetic_intensity_flops_per_byte: f64,
     /// Set (with the rates left `0`) when this one config failed to build — e.g.
     /// a profile.db row is missing. A per-item error keeps one bad config from
     /// sinking the whole sidecar; the caller degrades that leaf to its observed peak.
@@ -206,6 +209,7 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
                             kind: item.kind,
                             peak_tflops: 0.0,
                             peak_gbps: 0.0,
+                            max_arithmetic_intensity_flops_per_byte: 0.0,
                             error: Some(format!("{e:#}")),
                         });
                         continue;
@@ -218,6 +222,8 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
                             kind: probe.kind().to_string(),
                             peak_tflops: peak.tflops,
                             peak_gbps: peak.gbps,
+                            max_arithmetic_intensity_flops_per_byte: peak
+                                .max_arithmetic_intensity_flops_per_byte,
                             error: None,
                         });
                     }
@@ -225,7 +231,10 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
                         kind: item.kind,
                         peak_tflops: 0.0,
                         peak_gbps: 0.0,
-                        error: Some(format!("build failed (often a missing profile.db row): {e:#}")),
+                        max_arithmetic_intensity_flops_per_byte: 0.0,
+                        error: Some(format!(
+                            "build failed (often a missing profile.db row): {e:#}"
+                        )),
                     }),
                 }
             }

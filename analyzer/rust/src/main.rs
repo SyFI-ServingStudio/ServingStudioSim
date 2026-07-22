@@ -60,6 +60,10 @@ enum Command {
         /// Run directory (holds `raw/*.parquet`); outputs land in its `reports/`
         /// and `payloads/` subdirs.
         log_dir: PathBuf,
+        /// Hold every kernel at its observed batch size. Optimality then sets
+        /// R3=R2 and classifies R5 from each observed leaf's arithmetic intensity.
+        #[arg(long)]
+        lock_batch_size: bool,
         /// Subject names to run (e.g. `slo`); empty = all applicable.
         subjects: Vec<String>,
     },
@@ -135,7 +139,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Serve { logs_roots, bind } => ui_service::serve(bind, logs_roots).await,
-        Command::Run { log_dir, subjects } => run(log_dir, subjects).await,
+        Command::Run {
+            log_dir,
+            lock_batch_size,
+            subjects,
+        } => run(log_dir, subjects, lock_batch_size).await,
         Command::Alignment {
             analysis_log_dir,
             subjects,
@@ -187,11 +195,12 @@ async fn alignment(analysis_log_dir: PathBuf, subjects: Vec<String>) -> Result<(
         subjects,
         None,
         registry::Scope::Alignment,
+        registry::RunOptions::default(),
     )
     .await
 }
 
-async fn run(log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
+async fn run(log_dir: PathBuf, subjects: Vec<String>, lock_batch_size: bool) -> Result<()> {
     let ctx = build_session();
     let deployment = read_deployment(&log_dir);
 
@@ -201,7 +210,15 @@ async fn run(log_dir: PathBuf, subjects: Vec<String>) -> Result<()> {
     // avoids redundant metadata opens.)
     let _ = session::register_cost_log(&ctx, &log_dir).await;
 
-    run_subjects(ctx, log_dir, subjects, deployment, registry::Scope::Run).await
+    run_subjects(
+        ctx,
+        log_dir,
+        subjects,
+        deployment,
+        registry::Scope::Run,
+        registry::RunOptions { lock_batch_size },
+    )
+    .await
 }
 
 async fn run_subjects(
@@ -210,6 +227,7 @@ async fn run_subjects(
     subjects: Vec<String>,
     deployment: Option<String>,
     scope: registry::Scope,
+    options: registry::RunOptions,
 ) -> Result<()> {
     // Best-effort AND concurrent: each subject is an independent read over the shared
     // read-only ctx (SessionContext is Send+Sync+Clone) that writes its own files, so
@@ -220,6 +238,28 @@ async fn run_subjects(
     // wall (now overlapping), and `total_elapsed_ms` is the concurrent wall.
     let run_start = Instant::now();
     let selected = registry::select(&subjects, deployment.as_deref(), scope);
+    // A failed locked recomputation must not leave a previous variant looking
+    // current beside a newly generated unlocked report. Primary subjects keep
+    // their historical best-effort behavior; this cleanup is scoped to the new
+    // derived variant whose coexistence would otherwise make staleness invisible.
+    if options.lock_batch_size {
+        for subject in selected
+            .iter()
+            .filter(|subject| subject.name == "optimality")
+        {
+            let (report_name, payload_name) = registry::artifact_names(subject, options);
+            for artifact_path in [
+                report_path(&log_dir, report_name),
+                payload_path(&log_dir, payload_name),
+            ] {
+                match std::fs::remove_file(&artifact_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
     let mut set = tokio::task::JoinSet::new();
     for (idx, subject) in selected.iter().enumerate() {
         let ctx = ctx.clone();
@@ -227,7 +267,7 @@ async fn run_subjects(
         let name = subject.name;
         set.spawn(async move {
             let started = Instant::now();
-            let res = registry::run_subject(name, &ctx, &log_dir).await;
+            let res = registry::run_subject(name, &ctx, &log_dir, options).await;
             (idx, res, started.elapsed().as_secs_f64() * 1e3)
         });
     }
@@ -248,8 +288,9 @@ async fn run_subjects(
         };
         let status = match res {
             Ok((report, payload)) => {
-                write_json(&report_path(&log_dir, subject.report_name), &report)?;
-                write_json(&payload_path(&log_dir, subject.payload_name), &payload)?;
+                let (report_name, payload_name) = registry::artifact_names(subject, options);
+                write_json(&report_path(&log_dir, report_name), &report)?;
+                write_json(&payload_path(&log_dir, payload_name), &payload)?;
                 "ok"
             }
             Err(e) => {

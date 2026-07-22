@@ -11,9 +11,9 @@ each successive gap is an attributable source of sub-optimality:
 | R0 Real            | `span × G`            | — (GPU·s actually held) |
 | R1 Busy            | `Σ total_time × G`   | **idle** (scheduler gaps) |
 | R2 Balanced        | real times, `Max`→mean | **imbalance** (DP/EP straggler) |
-| R3 per-config best | `work / grid-peak rate` over the batch axis | **batching** |
+| R3 per-config best | unlocked: selected grid-peak throughput; locked: R2 unchanged | **batching** |
 | R4 ignore network  | R3, comm leaves → 0  | **communication** |
-| R5 hardware limit  | `work / gpu-spec peak` (roofline) | **profiled↔hardware** |
+| R5 hardware limit  | active regime's work unit / matching GPU-spec peak | **profiled↔hardware** |
 
 Buckets telescope and sum exactly back to Real, drawn as a stacked bar at five
 levels — cluster / pool / worker / iteration (idle 0 by construction) / per-kernel.
@@ -42,7 +42,8 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   and precomputes each `(pool, worker, section)`'s fold weights `α` + rate ceilings
   (`build_section_fold_plans`); no folding here.
 - `fold.rs` — the algorithm. Exact R0/R1 SQL sums (`read_exact_worker_totals`) + the
-  stride-sampled R2..R5 mean-fold hot loop (`accumulate_fold`, `leaf_optimal_ms`).
+  stride-sampled R2..R5 mean-fold hot loop (`accumulate_fold`,
+  `leaf_selected_throughput_ms`).
 - `levels.rs` — the worker / pool / cluster tiers. `assemble_tiers` turns the fold's
   per-worker accumulators into R0..R5 rung arrays and rolls them up; `levels_json`
   + `level_entry_json` + `rung_report_json` emit the level/report JSON.
@@ -51,9 +52,10 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   per-worker kernel rung ladders (`worker_kernel_ladders_json`).
 - `grid_peaks.rs` — the R3 ceiling. Enumerates unique `(kind, config)` from the
   manifests, asks the simulator for each config's fitted-grid peak rate in one
-  batched `kernel-query peak` call (via `crate::kernel_query`), caches it as
+  batched `kernel-query peak` call (including maximum grid arithmetic intensity,
+  used with the GPU ridge point to select one throughput basis), caches it as
   `raw/kernel_grid_peaks.json`. Absent + un-generatable → R3 = R2 with a caveat.
-- `spec.rs` — the R5 roofline. Resolves the run's `gpu_name` to a `gpu/spec.json`
+- `spec.rs` — the R5 hardware ceilings. Resolves the run's `gpu_name` to a `gpu/spec.json`
   entry by its explicit `aliases`, then dense peak TFLOP/s by dtype + HBM GB/s.
 
 ## Cost model notes
@@ -66,6 +68,16 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
 - The mean-mode fold (`trace::manifest::fold_mean`) is linear ⇒ a precomputed
   per-leaf weight `α` (`∏ 1/(child·overlap)` over `Max` × `∏ n` over `Scale`) gives
   both the per-worker totals and the additive per-kernel attribution in one walk.
-- R5 drops the memory-roofline term for a leaf whose grid `peak_gbps` exceeds the
-  GPU's HBM peak (e.g. `grouped_gemm` logs logical operand bytes, not HBM traffic),
-  so a non-physical byte count can't erase its hardware gap.
+- R3 is not a roofline of the current point. It approximates large-batch
+  operation: if any fitted point's algorithmic intensity reaches the GPU-spec
+  ridge, the config uses only its peak TFLOP/s; otherwise it uses only peak GB/s.
+- `analyze run --lock-batch-size` disables that counterfactual (`R3 = R2`) and
+  skips grid-peak generation. R5 then classifies every observed leaf separately
+  from its current `FLOPs / bytes` versus the GPU ridge point.
+- Unlocked output uses `optimality_report.json` and
+  `optimality_waterfall.json`; locked output uses the separate
+  `optimality_batch_locked_report.json` and
+  `optimality_batch_locked_waterfall.json`. Launcher generates both whenever
+  optimality is selected, and exact iteration requests carry the mode explicitly.
+- R5 uses the active regime: unlocked analysis reuses the R3 grid classification;
+  locked analysis uses the current-point classification.

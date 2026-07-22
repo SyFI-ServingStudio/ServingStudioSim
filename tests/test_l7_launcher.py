@@ -26,6 +26,7 @@ from launcher.exec import (
     _build_subprocess_env,
     _cargo_build_env,
     binary_path,
+    run_analysis,
 )
 from launcher.schema import (
     _format_log_dir,
@@ -151,6 +152,33 @@ def _base(*, arch=None, worker=None, log_dir="logs/x", **extra):
 
 def _arch(cand):
     return cand["pools"]["main"]["groups"][0]["arch"]
+
+
+def test_run_analysis_generates_locked_then_unlocked_optimality(monkeypatch, tmp_path):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    log_dir = tmp_path / "run"
+    log_dir.mkdir()
+    (log_dir / "stdout.log").write_text("")
+    captured_commands: list[list[str]] = []
+
+    async def capture_command(command):
+        captured_commands.append([str(argument) for argument in command])
+        return 0, ""
+
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._run_capture", capture_command)
+
+    asyncio.run(run_analysis(log_dir, subjects=["optimality"]))
+
+    assert captured_commands[0] == [
+        str(analyzer_path),
+        "run",
+        str(log_dir),
+        "--lock-batch-size",
+        "optimality",
+    ]
+    assert captured_commands[1] == [str(analyzer_path), "run", str(log_dir), "optimality"]
 
 
 # ── validation ──────────────────────────────────────────────────────────────

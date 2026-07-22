@@ -1,6 +1,6 @@
 //! On-demand exact kernel ladder for one `(worker, iter_id)`. This is the
 //! high-cardinality detail counterpart of the run payload's sampled per-worker
-//! ladders: it reuses the same preparation, leaf rooflines, and attribution code,
+//! ladders: it reuses the same preparation, leaf rate ceilings, and attribution code,
 //! but folds every row belonging to the selected iteration.
 
 use std::collections::{BTreeMap, HashMap};
@@ -25,7 +25,11 @@ pub(crate) async fn iteration_kernel_ladder(
     pool_tag: &str,
     worker_id: u16,
     iter_id: u64,
+    lock_batch_size: bool,
 ) -> Result<Value> {
+    // The UI chooses the same explicit variant for the aggregate payload and
+    // this exact fold. Do not infer mode from a mutable report file: both
+    // variants coexist for every launcher-produced run.
     let mut manifests_by_worker = read_cost_manifests(log_dir)?;
     let worker_key = (pool_tag.to_string(), worker_id);
     let manifest = manifests_by_worker
@@ -47,7 +51,11 @@ pub(crate) async fn iteration_kernel_ladder(
         .map(|(name, spec)| (Some(name), spec))
         .unwrap_or((None, GpuSpec::default()));
     let hardware_bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
-    let grid_peak_catalog = grid_peaks::load_cached(log_dir);
+    let grid_peak_catalog = if lock_batch_size {
+        grid_peaks::GridPeakCatalog::batch_locked()
+    } else {
+        grid_peaks::load_cached(log_dir)
+    };
     let peaks_source = grid_peak_catalog.source.clone();
     let (kernel_locations, section_fold_plan_by_key) =
         prepare::build_section_fold_plans(&manifests_by_worker, &grid_peak_catalog, &gpu_spec);
@@ -71,6 +79,7 @@ pub(crate) async fn iteration_kernel_ladder(
         worker_id,
         iter_id,
         hardware_bandwidth_gbps,
+        lock_batch_size,
         &section_fold_plan_by_key,
         &worker_index_by_key,
         &mut workers,
@@ -107,6 +116,7 @@ pub(crate) async fn iteration_kernel_ladder(
             "peaks_source": peaks_source,
             "gpu_count": gpu_count,
             "folded_rows": folded_rows,
+            "batch_size_locked": lock_batch_size,
         },
     }))
 }

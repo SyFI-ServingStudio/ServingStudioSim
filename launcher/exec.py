@@ -59,9 +59,7 @@ def _build_subprocess_env() -> dict[str, str]:
     if libdir:
         current_ld_path = env.get("LD_LIBRARY_PATH", "")
         if libdir not in current_ld_path:
-            env["LD_LIBRARY_PATH"] = (
-                f"{libdir}:{current_ld_path}" if current_ld_path else libdir
-            )
+            env["LD_LIBRARY_PATH"] = f"{libdir}:{current_ld_path}" if current_ld_path else libdir
 
     if sys.base_prefix:
         env["PYTHONHOME"] = sys.base_prefix
@@ -256,6 +254,23 @@ async def run_analysis(
         print(f"[analyze] {analyzer} not built; skipping analysis for {log_dir}")
         return
     subjects = subjects or []
+    # Optimality has two durable counterfactuals over the same simulation. Run
+    # the locked variant first into its variant-specific artifact names; the
+    # normal all-subject pass then publishes unlocked optimality and leaves the
+    # final analyzer_timing.json representative of the requested analysis set.
+    if not subjects or "optimality" in subjects:
+        locked_return_code = await _timed_step(
+            "analyze compute · optimality batch locked",
+            [
+                str(analyzer),
+                "run",
+                str(log_dir),
+                "--lock-batch-size",
+                "optimality",
+            ],
+        )
+        if locked_return_code != 0:
+            print(f"[analyze] batch-locked optimality failed for {log_dir}")
     if await _timed_step("analyze compute", [str(analyzer), "run", str(log_dir), *subjects]) != 0:
         print(f"[analyze] compute failed for {log_dir}")
         return

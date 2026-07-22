@@ -55,7 +55,10 @@ use kernel_throughput_analysis::analyze_kernel_throughput;
 use kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
 use kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use model::read_model;
-use optimality::{read_optimality_payload, read_optimality_report};
+use optimality::{
+    read_locked_optimality_payload, read_locked_optimality_report, read_optimality_payload,
+    read_optimality_report,
+};
 use request_state::{read_request_state_payload, read_request_state_report};
 use slo::{read_slo_general_payload, read_slo_general_report};
 use throughput::{read_throughput_payload, read_throughput_report};
@@ -175,6 +178,14 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
         .route(
             "/api/v1/runs/{run_id}/subjects/optimality/payload",
             get(get_optimality_payload),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/optimality/variants/batch-locked/report",
+            get(get_locked_optimality_report),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/subjects/optimality/variants/batch-locked/payload",
+            get(get_locked_optimality_payload),
         )
         .route(
             "/api/v1/runs/{run_id}/subjects/workload-conservation/report",
@@ -470,6 +481,20 @@ async fn get_optimality_payload(
     read_run_resource(state, run_id, |run| read_optimality_payload(&run)).await
 }
 
+async fn get_locked_optimality_report(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_locked_optimality_report(&run)).await
+}
+
+async fn get_locked_optimality_payload(
+    RoutePath(run_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, |run| read_locked_optimality_payload(&run)).await
+}
+
 async fn get_workload_conservation_report(
     RoutePath(run_id): RoutePath<String>,
     State(state): State<ServiceState>,
@@ -498,6 +523,19 @@ struct OperationRangeQuery {
 #[derive(Deserialize)]
 struct OperationSeekQuery {
     at_ms: f64,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OptimalityMode {
+    Unlocked,
+    BatchLocked,
+}
+
+#[derive(Deserialize)]
+struct OptimalityModeQuery {
+    #[serde(default)]
+    mode: Option<OptimalityMode>,
 }
 
 fn default_operation_limit() -> usize {
@@ -590,6 +628,7 @@ async fn seek_worker_operation(
 
 async fn get_iteration_optimality_kernel_ladder(
     RoutePath((run_id, pool_tag, worker_id, iter_id)): RoutePath<(String, String, u16, u64)>,
+    Query(query): Query<OptimalityModeQuery>,
     State(state): State<ServiceState>,
 ) -> Response {
     let run = match resolve_run(&state.roots, &run_id) {
@@ -602,6 +641,7 @@ async fn get_iteration_optimality_kernel_ladder(
         &pool_tag,
         worker_id,
         iter_id,
+        matches!(query.mode, Some(OptimalityMode::BatchLocked)),
     )
     .await
     {

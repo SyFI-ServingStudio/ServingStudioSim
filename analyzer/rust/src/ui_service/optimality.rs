@@ -8,6 +8,8 @@ use super::discovery::{regular_file, DiscoveredRun, StageStatus};
 
 const REPORT: &str = "reports/optimality_report.json";
 const PAYLOAD: &str = "payloads/optimality_waterfall.json";
+const LOCKED_REPORT: &str = "reports/optimality_batch_locked_report.json";
+const LOCKED_PAYLOAD: &str = "payloads/optimality_batch_locked_waterfall.json";
 
 pub(super) fn optimality_descriptor(run: &DiscoveredRun) -> Result<Option<Value>> {
     if run.lifecycle.analysis != StageStatus::Complete
@@ -21,12 +23,33 @@ pub(super) fn optimality_descriptor(run: &DiscoveredRun) -> Result<Option<Value>
     if report.get("available").and_then(Value::as_bool) != Some(true) {
         return Ok(None);
     }
-    Ok(Some(json!({
+    let mut descriptor = json!({
         "status": "ready",
         "schema_version": 1,
         "report_href": "subjects/optimality/report",
         "payload_href": "subjects/optimality/payload",
-    })))
+    });
+    let locked_ready = regular_file(&run.path.join(LOCKED_REPORT))
+        && regular_file(&run.path.join(LOCKED_PAYLOAD))
+        && read_run_json(&run.path, LOCKED_REPORT)
+            .ok()
+            .is_some_and(|locked_report| {
+                locked_report.get("available").and_then(Value::as_bool) == Some(true)
+                    && locked_report
+                        .get("meta")
+                        .and_then(|meta| meta.get("batch_size_locked"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            });
+    if locked_ready {
+        descriptor["variants"] = json!({
+            "batch_locked": {
+                "report_href": "subjects/optimality/variants/batch-locked/report",
+                "payload_href": "subjects/optimality/variants/batch-locked/payload",
+            }
+        });
+    }
+    Ok(Some(descriptor))
 }
 
 pub(super) fn read_optimality_report(run: &DiscoveredRun) -> Result<Value> {
@@ -35,6 +58,14 @@ pub(super) fn read_optimality_report(run: &DiscoveredRun) -> Result<Value> {
 
 pub(super) fn read_optimality_payload(run: &DiscoveredRun) -> Result<Value> {
     read_run_json(&run.path, PAYLOAD)
+}
+
+pub(super) fn read_locked_optimality_report(run: &DiscoveredRun) -> Result<Value> {
+    read_run_json(&run.path, LOCKED_REPORT)
+}
+
+pub(super) fn read_locked_optimality_payload(run: &DiscoveredRun) -> Result<Value> {
+    read_run_json(&run.path, LOCKED_PAYLOAD)
 }
 
 fn latest_run_succeeded(run: &DiscoveredRun) -> Result<bool> {

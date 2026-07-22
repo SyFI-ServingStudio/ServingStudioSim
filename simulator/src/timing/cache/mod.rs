@@ -43,12 +43,14 @@ pub trait Cache: Send + Sync {
 /// Peak achieved compute / bandwidth rates over a kernel cache's fitted grid —
 /// the per-config batching ceiling. `tflops` is the fastest compute rate
 /// (`flops / time`) any profiled shape reached; `gbps` the fastest bandwidth
-/// (`bytes / time`). A comm kernel (no flops) reports `tflops == 0` and a real
-/// `gbps`. A zero field means no fitted cell carried that metric.
+/// (`bytes / time`); `max_arithmetic_intensity_flops_per_byte` records whether
+/// any fitted shape can cross the GPU's hardware ridge point. A comm kernel (no
+/// flops) reports zero compute rate/intensity and a real `gbps`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PeakRates {
     pub tflops: f64,
     pub gbps: f64,
+    pub max_arithmetic_intensity_flops_per_byte: f64,
 }
 
 impl PeakRates {
@@ -58,6 +60,9 @@ impl PeakRates {
         PeakRates {
             tflops: self.tflops.max(other.tflops),
             gbps: self.gbps.max(other.gbps),
+            max_arithmetic_intensity_flops_per_byte: self
+                .max_arithmetic_intensity_flops_per_byte
+                .max(other.max_arithmetic_intensity_flops_per_byte),
         }
     }
 }
@@ -82,6 +87,11 @@ pub(crate) fn peak_over_cells(cells: impl IntoIterator<Item = Metrics4>) -> Peak
         let bytes = c.bytes as f64;
         if bytes.is_finite() && bytes > 0.0 {
             peak.gbps = peak.gbps.max(bytes / secs / 1e9);
+            if flops.is_finite() && flops > 0.0 {
+                peak.max_arithmetic_intensity_flops_per_byte = peak
+                    .max_arithmetic_intensity_flops_per_byte
+                    .max(flops / bytes);
+            }
         }
     }
     peak
@@ -143,5 +153,30 @@ pub fn build_cache(
             kind: kernel_kind,
             reason: format!("cache variant {kind:?} is not yet implemented"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{peak_over_cells, Metrics4};
+
+    #[test]
+    fn grid_peaks_include_maximum_arithmetic_intensity() {
+        let peak = peak_over_cells([
+            Metrics4 {
+                time_ms: 2.0,
+                flops: 400.0,
+                bytes: 20.0,
+                energy_j: 0.0,
+            },
+            Metrics4 {
+                time_ms: 1.0,
+                flops: 300.0,
+                bytes: 10.0,
+                energy_j: 0.0,
+            },
+        ]);
+
+        assert_eq!(peak.max_arithmetic_intensity_flops_per_byte, 30.0);
     }
 }

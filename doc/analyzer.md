@@ -49,6 +49,12 @@ Both shapes are built inline with `serde_json::json!` values. `definitions` — 
 small map of one-line metric definitions — is embedded in both the report and the
 payload so each artifact is self-describing.
 
+A subject may publish named **variants** when the same schema represents explicit
+counterfactual policies. The primary report/payload names remain the backward-
+compatible default; each variant gets its own durable files and descriptor hrefs.
+Variants are not separate subjects and inherit the subject's schema version.
+Optimality publishes primary unlocked artifacts plus a `batch_locked` variant.
+
 ## The flat registry
 
 `registry.rs` holds **one** `SUBJECTS` catalog and **one** `run_subject` dispatch
@@ -166,6 +172,10 @@ analyzer crate explicitly (a failed build warns, does not block), and after each
 successful run it runs the Rust `analyze run` then the Python `render`. A run's
 subject selection is a durable preset key (`analyze_subjects`, omitted = all
 applicable); `--no-analyze` is the transient "skip it this time" switch.
+When optimality is selected, launcher first computes its `batch_locked` variant
+and then performs the normal unlocked analysis pass, so both policies are
+available to viz-ui without rerunning simulation. The final
+`analyzer_timing.json` belongs to the normal requested-subject pass.
 
 ## Relationship to other docs
 
