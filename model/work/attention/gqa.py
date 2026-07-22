@@ -13,6 +13,8 @@ from ..core import MatmulGroup, Workload
 
 @dataclass
 class GQA:
+    split_attention_phases = True
+
     hidden: int
     num_qo_heads: int
     num_kv_heads: int
@@ -48,3 +50,8 @@ class GQA:
         # Only cached keys are HBM reads; K and V both -> factor 2.
         per_cached_token = 2.0 * self.num_kv_heads * self.head_dim * self.kv_dtype_bytes
         return per_cached_token * sum(interaction.num_cached_key for interaction in wl.attn)
+
+    def cache_write_bytes(self, wl: Workload) -> float:
+        """Compulsory persistent K/V writes for every newly processed token."""
+        per_new_token = 2.0 * self.num_kv_heads * self.head_dim * self.kv_dtype_bytes
+        return per_new_token * wl.matmul_tokens

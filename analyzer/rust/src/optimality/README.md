@@ -31,14 +31,21 @@ with a ribbon, without pretending the two aggregate gaps have a per-kernel
 critical-path attribution.
 
 The UI service exposes two separate on-demand contracts for one selected
-`(pool_tag, worker_id, iter_id)`: a complete one-row waterfall and an R0-R5
-per-kernel ladder. Both fold every matching row rather than sampling and define
+`(pool_tag, worker_id, iter_id)`: a complete one-row waterfall and a per-kernel
+ladder. Both fold every matching row rather than sampling and define
 R0=R1 because an individual iteration has no scheduler holding-span boundary;
 `R1-R2` remains one aggregate imbalance chunk. In batch-locked mode only, the
 waterfall reconstructs that iteration's exact workload from `groups` and splits
-R5 at the segmented and fully fused necessary-work floors. These independent
-`model.work` bounds never enter the kernel-ladder payload because they cannot be
-assigned to simulator kernels without an attribution rule.
+R5 at the segmented and fully fused necessary-work floors.
+
+For a batch-locked exact iteration, a versioned semantic-location map may provide
+that missing rule. The independent labeler emits minimum FLOPs/bytes per semantic
+operation; the map assigns each row exactly once to an exact manifest location.
+Only a complete, reconciling map extends the kernel ladder with a
+location-attributed segmented-necessary rung. Otherwise the endpoint remains the
+unchanged R0..R5 ladder and records a caveat. Per-location redundancy is
+`max(R5 - necessary, 0)`; the opposite sign is retained as `under_accounted`
+rather than clamped away.
 
 ## Files
 
@@ -70,6 +77,9 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
 - `floors.rs` — bridge to the independent `model.work` labeler. It computes
   unlocked per-level bounds and the locked-only exact-iteration pair; failure is
   additive-only and degrades to the plain R5 ladder.
+- `location.rs` — strict locked-iteration semantic-location mapping. It validates
+  complete coverage, computes per-location `max(FLOPs/TFLOPS, bytes/BW)`, and
+  attaches R6 plus redundant/under-accounted diagnostics atomically.
 
 ## Cost model notes
 

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "mapping_id": "llama3-unified-v1",
+  "arch_types": ["llama3_dense", "llama3_dense_tp"],
+  "locations": [
+    {"location": "unified.embedding", "semantics": ["embedding"]},
+    {"location": "unified.pre_attn.input_norm", "semantics": ["input_norm"]},
+    {"location": "unified.pre_attn.qkv_proj", "semantics": ["qkv"]},
+    {
+      "location": "unified.attn.attn.kv_cache_append",
+      "semantics": ["kv_cache_append"]
+    },
+    {"location": "unified.attn.attn.prefill", "semantics": ["attn.prefill"]},
+    {"location": "unified.attn.attn.decode", "semantics": ["attn.decode"]},
+    {"location": "unified.post_attn.o_proj", "semantics": ["o"]},
+    {"location": "unified.post_attn.post_norm", "semantics": ["post_norm"]},
+    {"location": "unified.post_attn.up_gate_proj", "semantics": ["gate_up"]},
+    {"location": "unified.post_attn.activation", "semantics": []},
+    {"location": "unified.post_attn.down_proj", "semantics": ["down"]},
+    {"location": "unified.final_norm", "semantics": ["final_norm"]},
+    {"location": "unified.lm_head", "semantics": ["lm_head"]}
+  ]
+}

@@ -34,6 +34,7 @@ O_PROJ = (NUM_QO * HEAD_DIM) * HIDDEN  # 4096 * 4096 = 16_777_216
 ATTN_LAYER = QKV + O_PROJ  # 41_943_040
 FFN_LAYER = (2 * INTERMEDIATE) * HIDDEN + HIDDEN * INTERMEDIATE  # 176_160_768
 EMBED = VOCAB * HIDDEN  # 525_336_576
+NORMS = (2 * L + 1) * HIDDEN
 
 
 @pytest.fixture(scope="module")
@@ -43,17 +44,18 @@ def model():
 
 def test_params(model):
     label = model.label(Workload.causal_lm(decode=[4096], sampled=1))
-    activated = (ATTN_LAYER + FFN_LAYER) * L  # 6_979_321_856
+    activated = (ATTN_LAYER + FFN_LAYER) * L + NORMS
     total = activated + EMBED + EMBED  # + embedding + untied lm_head
     assert label.params["activated"]["layers"] == activated
     assert label.params["activated"]["with_embed_head"] == total  # dense: layers == total minus io
     assert label.params["total"] == total
-    assert label.params["total"] == 8_029_995_008  # headline ~8.03B
+    assert label.params["total"] == 8_030_261_248  # includes all RMSNorm scales
     breakdown = label.params["breakdown"]
     assert breakdown["attn"] == ATTN_LAYER * L
     assert breakdown["ffn"] == FFN_LAYER * L
     assert breakdown["embedding"] == EMBED
     assert breakdown["lm_head"] == EMBED
+    assert breakdown["norm"] == NORMS
     assert breakdown["experts"] == 0 and breakdown["shared"] == 0
 
 
@@ -69,10 +71,10 @@ def test_decode_flop_buckets(model):
 
 
 def test_decode_kv_bytes(model):
-    # cached keys = kv_len - 1 = 4095; K and V, num_kv heads, bf16.
+    # Cached reads plus the compulsory new-token K/V write cover kv_len tokens.
     label = model.label(Workload.causal_lm(decode=[4096], sampled=1))
-    per_cached = 2 * NUM_KV * HEAD_DIM * 2  # 4096 bytes/token/layer
-    assert label.bytes["kv"] == per_cached * 4095 * L  # 536_739_840
+    per_token = 2 * NUM_KV * HEAD_DIM * 2  # 4096 bytes/token/layer
+    assert label.bytes["kv"] == per_token * 4096 * L  # 536_870_912
 
 
 def test_prefill_uses_causal_triangle(model):
@@ -117,6 +119,14 @@ def test_full_mask_aggregation_equals_stepwise_sum(model):
         head_positions=reference.head_positions,
         attn=[collapse(prefill_interactions), collapse(decode_interactions)],
         attention_step_count=len(reference.attn),
+        attention_step_count_by_phase={
+            "prefill": len(prefill_interactions),
+            "decode": len(decode_interactions),
+        },
+        attention_tokens_by_phase={
+            "prefill": sum(append_len for append_len, _prefix_len in prefill),
+            "decode": len(decode),
+        },
     )
 
     ref_label = model.label(reference)
@@ -159,7 +169,21 @@ def test_decode_segments_are_memory_bound(model):
     label = model.label(Workload.causal_lm(decode=[4096], sampled=1))
     rows = {row["name"]: row for row in label.segment_rows("H200", "bf16")}
     assert rows["qkv"]["bound"] == "memory"
-    assert rows["attn"]["bound"] == "memory"
+    assert rows["attn.decode"]["bound"] == "memory"
+
+
+def test_llama_semantic_segments_include_attention_phases_and_cache_write(model):
+    label = model.label(Workload.causal_lm(prefill=[(8, 0)], decode=[4096], sampled=2))
+    rows = {segment.name: segment for segment in label.segments}
+    assert {"attn.prefill", "attn.decode", "kv_cache_append"} <= rows.keys()
+    assert rows["attn.prefill"].flops_total > 0
+    assert rows["attn.decode"].bytes_total > 0
+    assert rows["kv_cache_append"].flops_total == 0
+    assert rows["kv_cache_append"].bytes_total == 2 * NUM_KV * HEAD_DIM * 2 * 9 * L
+    assert rows["input_norm"].bytes_total == HIDDEN * 2 * L
+    assert rows["post_norm"].bytes_total == HIDDEN * 2 * L
+    assert rows["final_norm"].bytes_total == HIDDEN * 2
+    assert rows["input_norm"].flops_total == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -300,7 +324,7 @@ def test_gdn_state_is_context_independent():
     # linear-attention recurrent state does NOT grow with context (its whole point)...
     assert short["linear.attn"].bytes == long["linear.attn"].bytes
     # ...while the full-attention KV cache does.
-    assert long["full.attn"].bytes > 10 * short["full.attn"].bytes
+    assert long["full.attn.decode"].bytes > 10 * short["full.attn.decode"].bytes
 
 
 def test_gdn_internal_flops_linear_and_state_scaling():

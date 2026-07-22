@@ -28,6 +28,20 @@ label.segmented_lower_bound_ms("H200", "bf16")  # realistic: Σ per-op max(compu
 label.work_efficiency(achieved_flops)           # F_min / achieved ∈ (0, 1]
 ```
 
+For fixed-batch per-location attribution, `segments` are stable semantic work
+rows, not simulator shapes. Causal GQA emits separate `attn.prefill` and
+`attn.decode` rows plus `kv_cache_append`; the latter counts compulsory K/V
+cache writes that remain even when adjacent leaves fuse. Versioned files under
+`location_maps/` map these semantic rows to exact CostTree location names. A map
+must consume every semantic row exactly once and explicitly list every
+non-communication location. An empty semantic list means that location has zero
+minimum under the cross-leaf-fusion convention. The mapping never derives
+minimum work from simulator shapes.
+
+Learned normalization scales are compulsory model weights and therefore remain
+in the minimum at their norm locations. Only the intermediate norm/activation
+tensor traffic is fusible away; norm and activation compute remain unpinned.
+
 ```
 uv run python -m model.work model/config/llama3_8b.json --decode 256x4096
 uv run python -m model.work <config> --prefill 8192@0 --gpu B200 --json
@@ -116,6 +130,12 @@ The gap between them is the compute a memory-bound global view hides (e.g. decod
 attention is KV-bandwidth-bound, but the QKV/FFN GEMMs still add their compute time on
 top). Ceiling throughput is reported from the segmented bound.
 
+For a mapped CostTree, the per-location segmented floor is recomputed after
+semantic rows are assigned: each location first sums its minimum FLOPs/bytes and
+then applies its own `max(FLOPs/peak, bytes/bandwidth)`. Llama's v1 mapping is
+one-to-one for non-zero semantic rows, so this reconciles exactly with the
+semantic segmented lower bound.
+
 ## The four pinned conventions (what defines `F_min`)
 
 1. **Causal prefill uses the exact triangle** `pairs = q·(k − (q−1)/2)`, not the full
@@ -123,9 +143,10 @@ top). Ceiling throughput is reported from the segmented bound.
 2. **`lm_head` counts only sampled positions** (`head_positions`), not every token — so a
    run that projects all prefill tokens through the head shows up as redundancy.
 3. **`router` is a real matmul** → counted in `activated_params` and `router` FLOPs.
-4. **`norm / rope / softmax / activation` are OUT of the denominator.** They are tiny,
-   necessary, and impl-defined; keeping them out keeps `F_min` exact and oracle-checkable.
-   Their achieved work is reported as its own gap bucket, never diluting `F_min`.
+4. **`norm / rope / softmax / activation` compute and fusible intermediate traffic are
+   OUT of the denominator.** Learned norm scales and persistent KV-cache writes are
+   weights/state that cannot be fused away, so their bytes remain in the denominator.
+   Keeping optional elementwise math out keeps `F_min` exact and oracle-checkable.
 
 ## Parameter counts
 
@@ -133,11 +154,11 @@ top). Ceiling throughput is reported from the segmented bound.
 `total_count` (all instances, `num_experts`). "Activated" has more than one defensible
 convention, so `params["activated"]` exposes **all** of them rather than picking one:
 
-- `activated["layers"]` = `Σ activated_mult·n·k · num_layers` — the per-token transformer
-  compute (attn + ffn/experts + router).
+- `activated["layers"]` = `Σ activated_mult·n·k · num_layers` plus declared norm
+  weights — the per-token transformer parameters (attn + ffn/experts + router + norm).
 - `activated["with_embed_head"]` = the above **+ embedding + lm_head** — the "A-XXB" figure
   most model cards quote (e.g. Qwen3-235B-**A22B**: layers ≈ 20.9 B, with-embed-head ≈ 22.2 B).
-- `total` = `Σ total_count·n·k · num_layers` + embedding + lm_head (respecting
+- `total` = `Σ total_count·n·k · num_layers` + declared norm weights + embedding + lm_head (respecting
   `tie_word_embeddings`) — the model's headline size (e.g. 235 B).
 
 ## Two validation gates

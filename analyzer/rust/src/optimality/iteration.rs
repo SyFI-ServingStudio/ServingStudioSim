@@ -13,7 +13,7 @@ use crate::session::{build_session, register_cost_log, require_columns, COST_LOG
 
 use super::run::COST_COLS;
 use super::spec::{self, GpuSpec};
-use super::{floors, fold, grid_peaks, kernel, levels, prepare};
+use super::{floors, fold, grid_peaks, kernel, levels, location, prepare};
 
 struct ExactIterationFold {
     ladder: Value,
@@ -23,11 +23,14 @@ struct ExactIterationFold {
     peaks_source: String,
     gpu_count: f64,
     folded_rows: u64,
+    kernel_locations: Vec<prepare::KernelLocation>,
+    gpu_spec: GpuSpec,
 }
 
-/// Build the exact R0..R5 stacked-kernel ladder for one selected worker
-/// iteration. R0 equals R1 because an iteration has no scheduler holding-span
-/// boundary; imbalance remains the exact R1-R2 aggregate chunk.
+/// Build the exact stacked-kernel ladder for one selected worker iteration.
+/// Locked mode adds mapped R6 necessary work when strict attribution succeeds.
+/// R0 equals R1 because an iteration has no scheduler holding-span boundary;
+/// imbalance remains the exact R1-R2 aggregate chunk.
 pub(crate) async fn iteration_kernel_ladder(
     repo_root: &Path,
     log_dir: &Path,
@@ -36,7 +39,7 @@ pub(crate) async fn iteration_kernel_ladder(
     iter_id: u64,
     lock_batch_size: bool,
 ) -> Result<Value> {
-    let exact = fold_exact_iteration(
+    let mut exact = fold_exact_iteration(
         repo_root,
         log_dir,
         pool_tag,
@@ -45,6 +48,41 @@ pub(crate) async fn iteration_kernel_ladder(
         lock_batch_size,
     )
     .await?;
+    let mut caveats = Vec::new();
+    let attribution = if lock_batch_size {
+        let ctx = build_session();
+        if !register_cost_log(&ctx, log_dir).await? {
+            bail!("cost_log/ dir not found");
+        }
+        match floors::compute_iteration_label(&ctx, log_dir, pool_tag, worker_id, iter_id).await {
+            Ok(label) => match location::attribute_iteration(
+                repo_root,
+                log_dir,
+                pool_tag,
+                &exact.kernel_locations,
+                &mut exact.ladder,
+                &label,
+                exact.gpu_spec,
+                exact.gpu_count,
+            ) {
+                Ok(attribution) => Some(attribution),
+                Err(error) => {
+                    caveats.push(format!(
+                        "per-location necessary work unavailable ({error:#})"
+                    ));
+                    None
+                }
+            },
+            Err(error) => {
+                caveats.push(format!(
+                    "exact iteration necessary work unavailable ({error:#})"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
     Ok(json!({
         "schema_version": SCHEMA_VERSION,
         "unit": "gpu_seconds",
@@ -60,13 +98,16 @@ pub(crate) async fn iteration_kernel_ladder(
             "gpu_count": exact.gpu_count,
             "folded_rows": exact.folded_rows,
             "batch_size_locked": lock_batch_size,
+            "necessary_work_available": attribution.is_some(),
+            "location_mapping_id": attribution.as_ref().map(|value| value.mapping_id.as_str()),
+            "caveats": caveats,
         },
     }))
 }
 
 /// Build the full telescoping waterfall for one selected worker iteration.
-/// Fixed-batch necessary-work floors belong only to this aggregate view; the
-/// sibling kernel-ladder contract remains strictly R0..R5 and leaf-attributable.
+/// The fully fused floor belongs only to this aggregate view; the sibling ladder
+/// may expose the segmented floor because that one is location-attributable.
 pub(crate) async fn iteration_waterfall(
     repo_root: &Path,
     log_dir: &Path,
@@ -90,8 +131,8 @@ pub(crate) async fn iteration_waterfall(
         if !register_cost_log(&ctx, log_dir).await? {
             bail!("cost_log/ dir not found");
         }
-        match floors::compute_iteration_floors(&ctx, log_dir, pool_tag, worker_id, iter_id).await {
-            Ok(computed_floor) => Some(computed_floor),
+        match floors::compute_iteration_label(&ctx, log_dir, pool_tag, worker_id, iter_id).await {
+            Ok(label) => Some(label.floors),
             Err(error) => {
                 caveats.push(format!(
                     "exact iteration necessary-work floors unavailable ({error:#})"
@@ -221,5 +262,7 @@ async fn fold_exact_iteration(
         peaks_source,
         gpu_count,
         folded_rows,
+        kernel_locations,
+        gpu_spec,
     })
 }

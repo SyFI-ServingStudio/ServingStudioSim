@@ -24,8 +24,9 @@
 //! `hw-optimal` into `[excess-over-necessary | fusion | hardware-necessary]`.
 //! Batch-locked run aggregates keep the plain six-bucket R0..R5 ladder because
 //! their current operating points must not be globally rebatchable. An exact
-//! locked iteration may append two `model.work` rungs computed from that one
-//! observed batch; those do not alter the run aggregate.
+//! locked iteration waterfall may append the two aggregate `model.work` floors;
+//! its kernel ladder appends one mapped segmented-necessary R6 when a strict
+//! semantic-location map covers the manifest. Neither alters the run aggregate.
 //!
 //! Cost model. `G_worker` is read from `run_meta` (`workers[].gpu_ids.len()`),
 //! never inferred from tp×dp×ep. R0/R1 are exact SQL sums over every row; R2..R5
@@ -57,6 +58,7 @@ mod grid_peaks;
 mod iteration;
 mod kernel;
 mod levels;
+mod location;
 mod prepare;
 mod run;
 mod spec;

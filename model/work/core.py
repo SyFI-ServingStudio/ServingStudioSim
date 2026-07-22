@@ -80,6 +80,9 @@ class AttnInteraction:
     num_key: int
     num_cached_key: int
     mask: str  # "causal" | "full" | "cross"
+    # Optional semantic phase used only for independent per-location accounting.
+    # It never affects attention math.
+    phase: str | None = None
 
     def pairs(self) -> float:
         """(query, key) pairs actually computed. Causal uses the exact triangle."""
@@ -109,6 +112,8 @@ class Workload:
     # Original attention state transactions represented by `attn`. Analyzer
     # aggregates can collapse geometry while retaining recurrent-state traffic.
     attention_step_count: int | None = None
+    attention_step_count_by_phase: dict[str, int] | None = None
+    attention_tokens_by_phase: dict[str, int] | None = None
 
     @property
     def num_attention_steps(self) -> int:
@@ -139,6 +144,7 @@ class Workload:
                     num_key=prefix_len + append_len,
                     num_cached_key=prefix_len,
                     mask="causal",
+                    phase="prefill",
                 )
             )
             matmul_tokens += append_len
@@ -149,6 +155,7 @@ class Workload:
                     num_key=kv_len,
                     num_cached_key=kv_len - 1,
                     mask="causal",
+                    phase="decode",
                 )
             )
             matmul_tokens += 1
@@ -159,7 +166,62 @@ class Workload:
             head_positions=sampled,
             attn=attn,
             attention_step_count=len(attn),
+            attention_step_count_by_phase={"prefill": len(prefill), "decode": len(decode)},
+            attention_tokens_by_phase={
+                "prefill": sum(append_len for append_len, _prefix_len in prefill),
+                "decode": len(decode),
+            },
         )
+
+    def attention_phases(self) -> list[tuple[str | None, Workload]]:
+        """Stable phase partitions for semantic attention location rows.
+
+        Untagged workloads preserve the historical single ``attn`` segment.
+        Analyzer-collapsed workloads provide explicit token/step counts because
+        their synthetic interactions no longer retain those counts geometrically.
+        """
+        phase_order: list[str | None] = []
+        interactions_by_phase: dict[str | None, list[AttnInteraction]] = {}
+        if self.attention_tokens_by_phase is not None:
+            for phase in self.attention_tokens_by_phase:
+                phase_order.append(phase)
+                interactions_by_phase[phase] = []
+        for interaction in self.attn:
+            if interaction.phase not in interactions_by_phase:
+                phase_order.append(interaction.phase)
+                interactions_by_phase[interaction.phase] = []
+            interactions_by_phase[interaction.phase].append(interaction)
+        if not phase_order:
+            return [(None, self)]
+        partitions: list[tuple[str | None, Workload]] = []
+        for phase in phase_order:
+            interactions = interactions_by_phase[phase]
+            if phase is None:
+                phase_tokens = self.matmul_tokens
+                phase_steps = self.num_attention_steps
+            else:
+                phase_tokens = (
+                    self.attention_tokens_by_phase.get(phase, 0)
+                    if self.attention_tokens_by_phase is not None
+                    else sum(interaction.num_query for interaction in interactions)
+                )
+                phase_steps = (
+                    self.attention_step_count_by_phase.get(phase, 0)
+                    if self.attention_step_count_by_phase is not None
+                    else len(interactions)
+                )
+            partitions.append(
+                (
+                    phase,
+                    Workload(
+                        matmul_tokens=phase_tokens,
+                        head_positions=0,
+                        attn=interactions,
+                        attention_step_count=phase_steps,
+                    ),
+                )
+            )
+        return partitions
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +292,16 @@ class MatmulGroup:
 
 _FLOPS_KEYS = ("attn_proj", "attn_internal", "ffn", "router", "lm_head")
 _BYTES_KEYS = ("weights", "kv")
-_PARAM_BREAKDOWN_KEYS = ("embedding", "attn", "ffn", "experts", "shared", "router", "lm_head")
+_PARAM_BREAKDOWN_KEYS = (
+    "embedding",
+    "norm",
+    "attn",
+    "ffn",
+    "experts",
+    "shared",
+    "router",
+    "lm_head",
+)
 
 
 @dataclass
@@ -382,6 +453,20 @@ class LayerStack:
 
 
 @dataclass
+class NormWeightGroup:
+    """Compulsory normalization scale weights with no pinned activation traffic.
+
+    The global lower bound permits cross-kernel fusion, so normalization inputs and
+    outputs need not round-trip through HBM. Its learned scale is still a model weight
+    and therefore must be read at least once for every distinct layer instance.
+    """
+
+    name: str
+    elements: int
+    count: int
+
+
+@dataclass
 class Model:
     """A whole model: a list of layer archetypes + shared embedding/head.
 
@@ -397,6 +482,7 @@ class Model:
     weight_dtype_bytes: float
     tie_word_embeddings: bool
     layers: list[LayerStack]
+    norm_weights: list[NormWeightGroup] = field(default_factory=list)
 
     @property
     def num_layers(self) -> int:
@@ -413,6 +499,7 @@ class Model:
         ffn: FFNSpec,
         weight_dtype_bytes: float,
         tie_word_embeddings: bool,
+        norm_weights: list[NormWeightGroup] | None = None,
     ) -> Model:
         """A model whose every layer is the same (attn, ffn) archetype."""
         return cls(
@@ -422,6 +509,7 @@ class Model:
             weight_dtype_bytes=weight_dtype_bytes,
             tie_word_embeddings=tie_word_embeddings,
             layers=[LayerStack(attn=attn, ffn=ffn, count=num_layers)],
+            norm_weights=norm_weights or [],
         )
 
     def label(self, wl: Workload) -> WorkLabel:
@@ -454,18 +542,55 @@ class Model:
                 total_params += group.total_params * stack.count
                 breakdown[_PARAM_BUCKET[group.bucket]] += group.total_params * stack.count
 
-            # attention: one fused kernel per layer — reads the KV cache / recurrent
-            # state and computes scores+context (no weights of its own).
+            # Attention semantic phases remain independent of simulator shapes.
+            # Tagged causal workloads split prefill/decode so a versioned map can
+            # assign them to distinct locations; untagged workloads retain `attn`.
+            attention_phases = (
+                wl.attention_phases() if stack.attn.split_attention_phases else [(None, wl)]
+            )
+            for phase, phase_workload in attention_phases:
+                phase_suffix = f".{phase}" if phase is not None else ""
+                segments.append(
+                    Segment(
+                        name=f"{prefix}attn{phase_suffix}",
+                        bucket="attn_internal",
+                        byte_kind="kv",
+                        flops=stack.attn.internal_flops(phase_workload),
+                        bytes=stack.attn.kv_bytes(phase_workload),
+                        count=stack.count,
+                    )
+                )
+            cache_write_bytes = stack.attn.cache_write_bytes(wl)
+            if cache_write_bytes > 0.0:
+                segments.append(
+                    Segment(
+                        name=f"{prefix}kv_cache_append",
+                        bucket="embedding",
+                        byte_kind="kv",
+                        flops=0.0,
+                        bytes=cache_write_bytes,
+                        count=stack.count,
+                    )
+                )
+
+        # Normalization activations can stay on-chip across a globally fused path,
+        # but learned scale vectors are compulsory model weights. They intentionally
+        # carry zero FLOPs here: only matmul/attention math is pinned as irreducible.
+        for norm_weight in self.norm_weights:
             segments.append(
                 Segment(
-                    name=f"{prefix}attn",
-                    bucket="attn_internal",
-                    byte_kind="kv",
-                    flops=stack.attn.internal_flops(wl),
-                    bytes=stack.attn.kv_bytes(wl),
-                    count=stack.count,
+                    name=norm_weight.name,
+                    bucket="embedding",
+                    byte_kind="weights",
+                    flops=0.0,
+                    bytes=norm_weight.elements * self.weight_dtype_bytes,
+                    count=norm_weight.count,
                 )
             )
+            norm_params = norm_weight.elements * norm_weight.count
+            activated_params += norm_params
+            total_params += norm_params
+            breakdown["norm"] += norm_params
 
         # --- embedding gather (whole iteration): reads the needed rows of the table. ---
         # The embedding matrix is a weight, so its read is capped at ONE pass of the
@@ -511,8 +636,8 @@ class Model:
             byte_sum[segment.byte_kind] += segment.bytes_total
 
         # "activated" has more than one defensible convention; expose all of them
-        # rather than picking one. "layers" is the per-token transformer compute
-        # (attn + ffn/experts + router); "with_embed_head" additionally counts the
+        # rather than picking one. "layers" is the per-token transformer parameter
+        # path (attn + ffn/experts + router + declared norms); "with_embed_head" counts
         # embedding + lm_head matrices — the "A-XXB" figure most model cards quote.
         activated = {
             "layers": activated_params,

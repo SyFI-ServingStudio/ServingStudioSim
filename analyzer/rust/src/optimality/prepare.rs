@@ -16,6 +16,7 @@ use super::spec::GpuSpec;
 /// One cost-tree location (leaf identity) pooled across workers, keyed by the
 /// manifest `name` — exactly like `kernel-throughput`, so `Max` siblings and DP
 /// replicas of a location pool together.
+#[derive(Clone, Debug)]
 pub(super) struct KernelLocation {
     pub(super) name: String,
     pub(super) kind: String,

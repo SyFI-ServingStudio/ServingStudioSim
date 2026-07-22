@@ -7,7 +7,7 @@ from the config. Mistral (also GQA + dense) can register against this same build
 from __future__ import annotations
 
 from ..attention.gqa import GQA
-from ..core import Model, dtype_bytes
+from ..core import Model, NormWeightGroup, dtype_bytes
 from ..ffn.dense import DenseSwiGLU
 
 
@@ -36,4 +36,9 @@ def build(raw_config: dict) -> Model:
         ffn=ffn,
         weight_dtype_bytes=weight_bytes,
         tie_word_embeddings=raw_config.get("tie_word_embeddings", False),
+        norm_weights=[
+            NormWeightGroup("input_norm", hidden, raw_config["num_hidden_layers"]),
+            NormWeightGroup("post_norm", hidden, raw_config["num_hidden_layers"]),
+            NormWeightGroup("final_norm", hidden, 1),
+        ],
     )

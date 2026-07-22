@@ -103,15 +103,34 @@ def _aggregate_workload(totals: dict) -> Workload:
     attn: list[AttnInteraction] = []
     prefill_pairs = int(totals["prefill_pairs"])
     if prefill_pairs > 0:
-        attn.append(AttnInteraction(1, prefill_pairs, int(totals["prefill_cached"]), "full"))
+        attn.append(
+            AttnInteraction(
+                1,
+                prefill_pairs,
+                int(totals["prefill_cached"]),
+                "full",
+                phase="prefill",
+            )
+        )
     decode_kv = int(totals["decode_kv"])
     if decode_kv > 0:
-        attn.append(AttnInteraction(1, decode_kv, decode_kv, "full"))
+        attn.append(AttnInteraction(1, decode_kv, decode_kv, "full", phase="decode"))
+    prefill_tokens = int(totals["prefill_tokens"])
+    decode_passes = int(totals["decode_passes"])
+    prefill_requests = int(totals["prefill_requests"])
     return Workload(
         matmul_tokens=matmul_tokens,
         head_positions=sampled,
         attn=attn,
         attention_step_count=sampled,
+        attention_step_count_by_phase={
+            "prefill": prefill_requests,
+            "decode": decode_passes,
+        },
+        attention_tokens_by_phase={
+            "prefill": prefill_tokens,
+            "decode": decode_passes,
+        },
     )
 
 
@@ -129,6 +148,14 @@ def compute_floors(log_dir: Path, levels: dict[str, dict]) -> dict[str, dict]:
         out[level_key] = {
             "necessary": max(compute_ms, memory_ms) / 1e3,  # ms -> GPU·seconds
             "segmented": segmented_ms / 1e3,
+            "segments": [
+                {
+                    "name": segment.name,
+                    "flops": segment.flops_total,
+                    "bytes": segment.bytes_total,
+                }
+                for segment in label.segments
+            ],
         }
     return out
 

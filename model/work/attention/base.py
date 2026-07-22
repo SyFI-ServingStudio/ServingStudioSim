@@ -9,6 +9,7 @@ in three ways:
   function of the workload's per-interaction (query, key) pair counts.
 - ``kv_bytes(wl)`` — the KV/state bytes that must be read from HBM (the cached keys;
   a cache-less full-attention interaction reads nothing — its KV is fused activation).
+- ``cache_write_bytes(wl)`` — persistent cache/state writes not removable by fusion.
 
 New attention mechanisms (MLA, sliding-window, SSM/linear) implement this same
 protocol in a new file; every FFN combination then works unchanged.
@@ -22,8 +23,12 @@ from ..core import MatmulGroup, Workload
 
 
 class AttentionSpec(Protocol):
+    split_attention_phases: bool
+
     def matmul_groups(self) -> list[MatmulGroup]: ...
 
     def internal_flops(self, wl: Workload) -> float: ...
 
     def kv_bytes(self, wl: Workload) -> float: ...
+
+    def cache_write_bytes(self, wl: Workload) -> float: ...

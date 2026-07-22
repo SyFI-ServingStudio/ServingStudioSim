@@ -108,12 +108,14 @@ that one raw row. A streaming scan builds a compact per-worker index once; a
 When the optimality subject is ready, exact iteration analysis uses two distinct
 high-cardinality resources. `workers/{pool}/{worker}/iterations/{iter_id}/optimality-waterfall`
 returns the full one-row waterfall for that worker iteration, while the sibling
-`optimality-kernel-ladder` resource returns only the R0-R5 per-kernel ladder.
+`optimality-kernel-ladder` resource returns the per-kernel ladder.
 Both fold every matching row and use the explicit `mode` query. Iterations have
 no scheduler holding-span boundary, so R0=R1 and idle is zero; R1-R2 remains
 aggregate imbalance. In batch-locked mode the waterfall may split R5 with the
-exact fixed-batch segmented and fully fused necessary-work floors. Those
-aggregate bounds never enter the kernel-ladder contract.
+exact fixed-batch segmented and fully fused necessary-work floors. When a strict
+versioned semantic-location map covers the manifest, the kernel ladder also
+appends R6 and per-location necessary/redundant/under-accounted work; otherwise
+it remains R0-R5.
 The alignment path reads `<analysis_log_dir>/alignment_manifest.json`, which
 points to normalized NSYS JSON in the profile root, timing-predict cost
 parquet/manifest, the profile's `replay_result` TraceLab JSONL, its optional

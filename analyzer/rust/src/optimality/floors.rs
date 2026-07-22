@@ -38,6 +38,18 @@ pub(super) struct Floors {
     pub(super) segmented: f64,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct SemanticWork {
+    pub(super) name: String,
+    pub(super) flops: f64,
+    pub(super) bytes: f64,
+}
+
+pub(super) struct IterationLabel {
+    pub(super) floors: Floors,
+    pub(super) segments: Vec<SemanticWork>,
+}
+
 /// Per-level floors keyed exactly like `levels.rs`'s level `key`:
 /// `"cluster"` | `<pool_tag>` | `"<pool_tag>/<worker_id>"`.
 pub(super) type FloorsByLevel = HashMap<String, Floors>;
@@ -60,22 +72,52 @@ pub(super) async fn compute_floors(ctx: &SessionContext, log_dir: &Path) -> Resu
 /// `model.work`, so neither weight traffic nor expert occupancy is amortized across
 /// iterations. The returned pair still distinguishes full-forward fusion
 /// (`necessary`) from the serial per-segment roofline (`segmented`).
-pub(super) async fn compute_iteration_floors(
+pub(super) async fn compute_iteration_label(
     ctx: &SessionContext,
     log_dir: &Path,
     pool_tag: &str,
     worker_id: u16,
     iter_id: u64,
-) -> Result<Floors> {
+) -> Result<IterationLabel> {
     let totals = collect_iteration_workload(ctx, pool_tag, worker_id, iter_id).await?;
     if totals.matmul_tokens <= 0.0 {
         return Err(anyhow!("iteration has no model workload to label"));
     }
     let level_key = format!("{pool_tag}/{worker_id}");
     let levels = HashMap::from([(level_key.clone(), totals)]);
-    run_labeler(log_dir, &levels)?
+    let response = run_labeler_json(log_dir, &levels)?;
+    let floors = parse_response(&response)?
         .remove(&level_key)
-        .context("labeler output missing exact iteration floor")
+        .context("labeler output missing exact iteration floor")?;
+    let level = response
+        .get("levels")
+        .and_then(Value::as_object)
+        .and_then(|levels| levels.get(&level_key))
+        .context("labeler output missing exact iteration level")?;
+    let segments = level
+        .get("segments")
+        .and_then(Value::as_array)
+        .context("labeler output missing exact iteration segments")?
+        .iter()
+        .map(|segment| {
+            Ok(SemanticWork {
+                name: segment
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .context("semantic segment missing name")?
+                    .to_string(),
+                flops: segment
+                    .get("flops")
+                    .and_then(Value::as_f64)
+                    .context("semantic segment missing flops")?,
+                bytes: segment
+                    .get("bytes")
+                    .and_then(Value::as_f64)
+                    .context("semantic segment missing bytes")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(IterationLabel { floors, segments })
 }
 
 /// Roll the per-worker totals up into the three level granularities the waterfall
@@ -97,6 +139,10 @@ fn rollup_levels(
 }
 
 fn run_labeler(log_dir: &Path, levels: &HashMap<String, WorkloadTotals>) -> Result<FloorsByLevel> {
+    parse_response(&run_labeler_json(log_dir, levels)?)
+}
+
+fn run_labeler_json(log_dir: &Path, levels: &HashMap<String, WorkloadTotals>) -> Result<Value> {
     let root = repo_root().context("repo root not found for the labeler subprocess")?;
     let request = build_request(levels);
     let log_dir_abs: PathBuf = if log_dir.is_absolute() {
@@ -127,7 +173,7 @@ fn run_labeler(log_dir: &Path, levels: &HashMap<String, WorkloadTotals>) -> Resu
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    parse_response(&output.stdout)
+    serde_json::from_slice(&output.stdout).context("parse labeler stdout as JSON")
 }
 
 fn build_request(levels: &HashMap<String, WorkloadTotals>) -> Value {
@@ -149,8 +195,7 @@ fn build_request(levels: &HashMap<String, WorkloadTotals>) -> Value {
     json!({ "levels": Value::Object(level_json) })
 }
 
-fn parse_response(stdout: &[u8]) -> Result<FloorsByLevel> {
-    let parsed: Value = serde_json::from_slice(stdout).context("parse labeler stdout as JSON")?;
+fn parse_response(parsed: &Value) -> Result<FloorsByLevel> {
     let level_map = parsed
         .get("levels")
         .and_then(Value::as_object)

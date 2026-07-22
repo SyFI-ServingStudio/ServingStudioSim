@@ -28,6 +28,8 @@ from ..core import MatmulGroup, Workload
 
 @dataclass
 class GatedDeltaNet:
+    split_attention_phases = False
+
     hidden: int
     num_v_heads: int  # linear_num_value_heads
     num_k_heads: int  # linear_num_key_heads
@@ -91,3 +93,7 @@ class GatedDeltaNet:
         state_elems = self.num_v_heads * self.head_k_dim * self.head_v_dim
         state_per_sequence = state_elems * self.state_dtype_bytes
         return 2.0 * wl.num_attention_steps * state_per_sequence
+
+    def cache_write_bytes(self, wl: Workload) -> float:
+        # `kv_bytes` already counts both the recurrent-state read and write.
+        return 0.0
