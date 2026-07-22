@@ -361,10 +361,11 @@ fn sum_kernel_ladders(
         }
     }
 
-    let kernel_rows: Vec<Value> = kernels
+    let mut kernel_rows: Vec<Value> = kernels
         .into_iter()
         .map(|(name, accumulator)| kernel_accumulator_json(name, accumulator))
         .collect();
+    sort_kernel_rows(&mut kernel_rows);
     reconcile_aggregate_ladder(
         &rung_values,
         &special_chunks,
@@ -383,6 +384,19 @@ fn sum_kernel_ladders(
         "necessary_work_replication_factor": has_necessary_work
             .then_some(super::UNLOCKED_ITERATION_REPLICATION_FACTOR),
     }))
+}
+
+fn sort_kernel_rows(kernel_rows: &mut [Value]) {
+    kernel_rows.sort_by(|left, right| {
+        let left_balanced = left["rungs"]["balanced"].as_f64().unwrap_or(0.0);
+        let right_balanced = right["rungs"]["balanced"].as_f64().unwrap_or(0.0);
+        right_balanced.total_cmp(&left_balanced).then_with(|| {
+            left["name"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["name"].as_str().unwrap_or_default())
+        })
+    });
 }
 
 fn sum_path(members: &[&Value], path: &[&str]) -> Result<f64> {
@@ -520,7 +534,7 @@ fn reconcile_aggregate_ladder(
 mod tests {
     use serde_json::json;
 
-    use super::aggregate_kernel_ladders_json;
+    use super::{aggregate_kernel_ladders_json, sort_kernel_rows};
 
     fn worker_ladder(worker_id: u16, scale: f64) -> serde_json::Value {
         json!({
@@ -580,5 +594,18 @@ mod tests {
         assert_eq!(cluster["special_chunks"]["fusion"], 3.0);
         assert_eq!(cluster["kernels"][0]["rungs"]["necessary_limit"], 9.0);
         assert_eq!(aggregates[1]["level"], "pool");
+    }
+
+    #[test]
+    fn aggregate_kernel_rows_sort_by_balanced_then_name() {
+        let mut rows = vec![
+            json!({"name": "z", "rungs": {"balanced": 1.0}}),
+            json!({"name": "b", "rungs": {"balanced": 3.0}}),
+            json!({"name": "a", "rungs": {"balanced": 3.0}}),
+        ];
+        sort_kernel_rows(&mut rows);
+        assert_eq!(rows[0]["name"], "a");
+        assert_eq!(rows[1]["name"], "b");
+        assert_eq!(rows[2]["name"], "z");
     }
 }
