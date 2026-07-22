@@ -1004,7 +1004,10 @@ fn kernel_time_share_resources_preserve_critical_path_attribution() {
 #[test]
 fn optimality_resources_expose_waterfall_levels_and_kernels() {
     let temporary = TempDir::new().expect("temporary logs root");
-    make_core_run(&temporary.path().join("simulation"));
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    fs::create_dir_all(run_path.join("cost_log")).expect("create cost log detail root");
+    fs::create_dir_all(run_path.join("cost_manifest")).expect("create cost manifest detail root");
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
     let run = discover_runs(&roots)
@@ -1021,6 +1024,14 @@ fn optimality_resources_expose_waterfall_levels_and_kernels() {
     assert_eq!(
         descriptor["subjects"]["optimality"]["variants"]["batch_locked"]["payload_href"],
         "subjects/optimality/variants/batch-locked/payload"
+    );
+    assert_eq!(
+        descriptor["details"]["iteration-optimality-kernel-ladder"]["status"],
+        "ready"
+    );
+    assert_eq!(
+        descriptor["details"]["iteration-optimality-waterfall"]["status"],
+        "ready"
     );
     let report = read_optimality_report(&run).expect("read optimality report");
     let payload = read_optimality_payload(&run).expect("read optimality payload");

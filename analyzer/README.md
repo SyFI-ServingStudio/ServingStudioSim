@@ -51,7 +51,7 @@ alignment analyze ──reads completed roots + mapping
 
 | Command | Side | Effect |
 |---|---|---|
-| `analyze run <log_dir> [--lock-batch-size] [subjects...]` | Rust | Compute subjects → `reports/` + `payloads/`, plus a subject-less `reports/analyzer_timing.json` run-meta sidecar. Unlocked optimality keeps the standard names; `--lock-batch-size` writes `optimality_batch_locked_report.json` / `optimality_batch_locked_waterfall.json`, makes `R3=R2`, and classifies each current leaf for R5. No subjects = all applicable. |
+| `analyze run <log_dir> [--lock-batch-size] [subjects...]` | Rust | Compute subjects → `reports/` + `payloads/`, plus one complete `reports/analyzer_timing.json` run-meta sidecar. Whenever optimality is selected, the normal command emits both unlocked primary and batch-locked variant atomically. `--lock-batch-size` is the low-level locked-only recomputation path. No subjects = all applicable. |
 | `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
 | `analyze serve --logs-root <dir>` | Rust | Serve the read-only viz-ui catalog, bounded worker operation windows, and exact `(worker, iter, batch, operation)` CostTrees reconstructed lazily from `cost_log` + manifest. |
@@ -65,10 +65,10 @@ separate analyze phase config. Both execution paths are
 **best-effort** — a missing analyzer binary, failed handoff, or failed subject
 never fails the completed run.
 
-When optimality is in launcher intent, `run_analysis` computes locked optimality
-first and the normal unlocked subject set second. Both JSON pairs coexist;
-Python renders the primary unlocked payload, while the UI descriptor publishes
-locked optimality as `variants.batch_locked` for interactive switching.
+When optimality is selected, one normal `analyze run` atomically computes both
+the unlocked primary and locked variant and records both in the same timing
+sidecar. Python renders the primary unlocked payload, while the UI descriptor
+publishes locked optimality as `variants.batch_locked` for interactive switching.
 
 **Required from below** — `analyze run` consumes a run directory written by the
 sim/L7, containing:
@@ -105,12 +105,15 @@ whether `batch_id` represents a `slot` or a `batch`. Exact CostTrees use
 `operations/{iter_id}/{batch_id}/{operation_id}/cost-tree` and reconstruct only
 that one raw row. A streaming scan builds a compact per-worker index once; a
 512 MiB byte-budgeted LRU bounds retained indexes, and range JSON is not cached.
-When the optimality subject is ready,
-`workers/{pool}/{worker}/iterations/{iter_id}/optimality-kernel-ladder` folds all
-rows for that exact worker iteration into the same R0-R5 per-kernel ladder used
-by the run payload. Iterations have no scheduler holding-span boundary, so
-R0=R1 and idle is zero; R1-R2 remains aggregate imbalance. This high-cardinality
-detail is requested on selection and is not embedded for every iteration.
+When the optimality subject is ready, exact iteration analysis uses two distinct
+high-cardinality resources. `workers/{pool}/{worker}/iterations/{iter_id}/optimality-waterfall`
+returns the full one-row waterfall for that worker iteration, while the sibling
+`optimality-kernel-ladder` resource returns only the R0-R5 per-kernel ladder.
+Both fold every matching row and use the explicit `mode` query. Iterations have
+no scheduler holding-span boundary, so R0=R1 and idle is zero; R1-R2 remains
+aggregate imbalance. In batch-locked mode the waterfall may split R5 with the
+exact fixed-batch segmented and fully fused necessary-work floors. Those
+aggregate bounds never enter the kernel-ladder contract.
 The alignment path reads `<analysis_log_dir>/alignment_manifest.json`, which
 points to normalized NSYS JSON in the profile root, timing-predict cost
 parquet/manifest, the profile's `replay_result` TraceLab JSONL, its optional

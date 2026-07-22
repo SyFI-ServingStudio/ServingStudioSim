@@ -104,7 +104,8 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
         descriptor["details"]["worker-operation-index"] = detail.clone();
         descriptor["details"]["worker-cost-tree"] = detail.clone();
         if optimality_ready {
-            descriptor["details"]["iteration-optimality-kernel-ladder"] = detail;
+            descriptor["details"]["iteration-optimality-kernel-ladder"] = detail.clone();
+            descriptor["details"]["iteration-optimality-waterfall"] = detail;
         }
     }
     if run.lifecycle.analysis == StageStatus::Complete {

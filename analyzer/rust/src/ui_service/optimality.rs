@@ -77,6 +77,7 @@ fn latest_run_succeeded(run: &DiscoveredRun) -> Result<bool> {
             subjects.iter().any(|entry| {
                 entry.get("name").and_then(Value::as_str) == Some("optimality")
                     && entry.get("status").and_then(Value::as_str) == Some("ok")
+                    && entry.get("variant").and_then(Value::as_str) != Some("batch_locked")
             })
         }))
 }

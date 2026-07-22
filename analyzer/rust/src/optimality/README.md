@@ -30,10 +30,15 @@ value. The renderer keeps a kernel's color across all six bars and connects it
 with a ribbon, without pretending the two aggregate gaps have a per-kernel
 critical-path attribution.
 
-The UI service exposes the same ladder on demand for one selected
-`(pool_tag, worker_id, iter_id)`. That detail folds every matching row rather
-than sampling. It defines R0=R1 because an individual iteration has no scheduler
-holding-span boundary, and keeps `R1-R2` as one aggregate imbalance chunk.
+The UI service exposes two separate on-demand contracts for one selected
+`(pool_tag, worker_id, iter_id)`: a complete one-row waterfall and an R0-R5
+per-kernel ladder. Both fold every matching row rather than sampling and define
+R0=R1 because an individual iteration has no scheduler holding-span boundary;
+`R1-R2` remains one aggregate imbalance chunk. In batch-locked mode only, the
+waterfall reconstructs that iteration's exact workload from `groups` and splits
+R5 at the segmented and fully fused necessary-work floors. These independent
+`model.work` bounds never enter the kernel-ladder payload because they cannot be
+assigned to simulator kernels without an attribution rule.
 
 ## Files
 
@@ -62,9 +67,9 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   `raw/kernel_grid_peaks.json`. Absent + un-generatable → R3 = R2 with a caveat.
 - `spec.rs` — the R5 hardware ceilings. Resolves the run's `gpu_name` to a `gpu/spec.json`
   entry by its explicit `aliases`, then dense peak TFLOP/s by dtype + HBM GB/s.
-- `floors.rs` — unlocked-only bridge to the independent `model.work` labeler. It
-  computes per-level segmented and globally fused necessary-work roofline bounds;
-  failure is additive-only and degrades to the plain R5 bucket.
+- `floors.rs` — bridge to the independent `model.work` labeler. It computes
+  unlocked per-level bounds and the locked-only exact-iteration pair; failure is
+  additive-only and degrades to the plain R5 ladder.
 
 ## Cost model notes
 
@@ -86,7 +91,8 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
 - Unlocked output uses `optimality_report.json` and
   `optimality_waterfall.json`; locked output uses the separate
   `optimality_batch_locked_report.json` and
-  `optimality_batch_locked_waterfall.json`. Launcher generates both whenever
-  optimality is selected, and exact iteration requests carry the mode explicitly.
+  `optimality_batch_locked_waterfall.json`. A normal analyzer invocation generates
+  both whenever optimality is selected; `--lock-batch-size` recomputes only the
+  locked variant. Exact iteration requests carry the mode explicitly.
 - R5 uses the active regime: unlocked analysis reuses the R3 grid classification;
   locked analysis uses the current-point classification.

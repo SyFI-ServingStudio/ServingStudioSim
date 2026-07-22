@@ -27,10 +27,11 @@ necessary floor), and emits the two roofline floors in **GPU·seconds** on stdou
 `num_gpus=1`: the labeler computes the FULL / unsharded ``F_min``, so
 ``total_work / peak`` is already the ×G GPU·seconds the Rust R5 rung is in.
 
-The attention geometry is passed as pre-summed scalars, so a single
-``mask="full"`` interaction (``pairs() = q·k`` with ``q=1``, ``k=Σpairs``)
-reproduces the per-step sum exactly — no labeler-core change, and no 1.7-billion
--element interaction list.
+The attention geometry is passed as pre-summed scalars, so one prefill and one
+decode ``mask="full"`` interaction (``pairs() = q·k`` with ``q=1``,
+``k=Σpairs``) reproduce the GQA work exactly without a 1.7-billion-element list.
+``attention_step_count`` separately preserves the original state-transaction
+count required by recurrent linear attention.
 """
 
 from __future__ import annotations
@@ -81,9 +82,7 @@ def _spec_for_level(level_key: str, pool_specs: dict[str, dict]) -> dict:
     if level_key == "cluster":
         distinct = {(s["config"], s["gpu"], s["dtype"]) for s in pool_specs.values()}
         if len(distinct) != 1:
-            raise ValueError(
-                f"cluster floor needs one shared model across pools, saw {distinct}"
-            )
+            raise ValueError(f"cluster floor needs one shared model across pools, saw {distinct}")
         return next(iter(pool_specs.values()))
     # Pool level is the bare tag; worker level is "<pool_tag>/<worker_id>".
     pool_tag = level_key.split("/", 1)[0]
@@ -104,13 +103,16 @@ def _aggregate_workload(totals: dict) -> Workload:
     attn: list[AttnInteraction] = []
     prefill_pairs = int(totals["prefill_pairs"])
     if prefill_pairs > 0:
-        attn.append(
-            AttnInteraction(1, prefill_pairs, int(totals["prefill_cached"]), "full")
-        )
+        attn.append(AttnInteraction(1, prefill_pairs, int(totals["prefill_cached"]), "full"))
     decode_kv = int(totals["decode_kv"])
     if decode_kv > 0:
         attn.append(AttnInteraction(1, decode_kv, decode_kv, "full"))
-    return Workload(matmul_tokens=matmul_tokens, head_positions=sampled, attn=attn)
+    return Workload(
+        matmul_tokens=matmul_tokens,
+        head_positions=sampled,
+        attn=attn,
+        attention_step_count=sampled,
+    )
 
 
 def compute_floors(log_dir: Path, levels: dict[str, dict]) -> dict[str, dict]:

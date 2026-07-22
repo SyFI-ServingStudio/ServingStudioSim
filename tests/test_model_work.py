@@ -30,10 +30,10 @@ VOCAB = 128256
 
 # per-layer weight params
 QKV = (NUM_QO + 2 * NUM_KV) * HEAD_DIM * HIDDEN  # 6144 * 4096 = 25_165_824
-O_PROJ = (NUM_QO * HEAD_DIM) * HIDDEN            # 4096 * 4096 = 16_777_216
-ATTN_LAYER = QKV + O_PROJ                        # 41_943_040
+O_PROJ = (NUM_QO * HEAD_DIM) * HIDDEN  # 4096 * 4096 = 16_777_216
+ATTN_LAYER = QKV + O_PROJ  # 41_943_040
 FFN_LAYER = (2 * INTERMEDIATE) * HIDDEN + HIDDEN * INTERMEDIATE  # 176_160_768
-EMBED = VOCAB * HIDDEN                            # 525_336_576
+EMBED = VOCAB * HIDDEN  # 525_336_576
 
 
 @pytest.fixture(scope="module")
@@ -43,12 +43,12 @@ def model():
 
 def test_params(model):
     label = model.label(Workload.causal_lm(decode=[4096], sampled=1))
-    activated = (ATTN_LAYER + FFN_LAYER) * L                 # 6_979_321_856
-    total = activated + EMBED + EMBED                        # + embedding + untied lm_head
+    activated = (ATTN_LAYER + FFN_LAYER) * L  # 6_979_321_856
+    total = activated + EMBED + EMBED  # + embedding + untied lm_head
     assert label.params["activated"]["layers"] == activated
     assert label.params["activated"]["with_embed_head"] == total  # dense: layers == total minus io
     assert label.params["total"] == total
-    assert label.params["total"] == 8_029_995_008           # headline ~8.03B
+    assert label.params["total"] == 8_029_995_008  # headline ~8.03B
     breakdown = label.params["breakdown"]
     assert breakdown["attn"] == ATTN_LAYER * L
     assert breakdown["ffn"] == FFN_LAYER * L
@@ -60,10 +60,10 @@ def test_params(model):
 def test_decode_flop_buckets(model):
     # 1 decode token at kv_len=4096: matmul_tokens=1, causal pairs = kv = 4096.
     label = model.label(Workload.causal_lm(decode=[4096], sampled=1))
-    assert label.flops["attn_proj"] == 2 * 1 * ATTN_LAYER * L        # 2_684_354_560
-    assert label.flops["ffn"] == 2 * 1 * FFN_LAYER * L              # 11_274_289_152
+    assert label.flops["attn_proj"] == 2 * 1 * ATTN_LAYER * L  # 2_684_354_560
+    assert label.flops["ffn"] == 2 * 1 * FFN_LAYER * L  # 11_274_289_152
     assert label.flops["attn_internal"] == 4 * NUM_QO * HEAD_DIM * 4096 * L  # 2_147_483_648
-    assert label.flops["lm_head"] == 2 * 1 * HIDDEN * VOCAB          # 1_050_673_152
+    assert label.flops["lm_head"] == 2 * 1 * HIDDEN * VOCAB  # 1_050_673_152
     assert label.flops["router"] == 0
     assert label.flops_total == 17_156_800_512
 
@@ -72,7 +72,7 @@ def test_decode_kv_bytes(model):
     # cached keys = kv_len - 1 = 4095; K and V, num_kv heads, bf16.
     label = model.label(Workload.causal_lm(decode=[4096], sampled=1))
     per_cached = 2 * NUM_KV * HEAD_DIM * 2  # 4096 bytes/token/layer
-    assert label.bytes["kv"] == per_cached * 4095 * L               # 536_739_840
+    assert label.bytes["kv"] == per_cached * 4095 * L  # 536_739_840
 
 
 def test_prefill_uses_causal_triangle(model):
@@ -116,6 +116,7 @@ def test_full_mask_aggregation_equals_stepwise_sum(model):
         matmul_tokens=reference.matmul_tokens,
         head_positions=reference.head_positions,
         attn=[collapse(prefill_interactions), collapse(decode_interactions)],
+        attention_step_count=len(reference.attn),
     )
 
     ref_label = model.label(reference)
@@ -270,6 +271,28 @@ def test_qwen3_6_segments_roll_up():
     assert sum(s.bytes_total for s in label.segments) == pytest.approx(label.bytes_total)
 
 
+def test_collapsed_workload_preserves_linear_attention_state_transactions():
+    """Geometry compression must retain recurrent-state read/write count."""
+    model = load_model(QWEN36)
+    reference = Workload.causal_lm(prefill=[(8, 0), (4, 8)], decode=[32, 64, 128])
+    aggregate = Workload(
+        matmul_tokens=reference.matmul_tokens,
+        head_positions=reference.head_positions,
+        attn=[AttnInteraction(1, 1, 0, "full")],
+        attention_step_count=len(reference.attn),
+    )
+
+    reference_label = model.label(reference)
+    aggregate_label = model.label(aggregate)
+    reference_linear = next(
+        segment for segment in reference_label.segments if segment.name == "linear.attn"
+    )
+    aggregate_linear = next(
+        segment for segment in aggregate_label.segments if segment.name == "linear.attn"
+    )
+    assert aggregate_linear.bytes == reference_linear.bytes
+
+
 def test_gdn_state_is_context_independent():
     model = load_model(QWEN36)
     short = {s.name: s for s in model.label(Workload.causal_lm(decode=[4096], sampled=1)).segments}
@@ -284,8 +307,13 @@ def test_gdn_internal_flops_linear_and_state_scaling():
     from model.work.attention.linear import GatedDeltaNet
 
     gdn = GatedDeltaNet(
-        hidden=5120, num_v_heads=48, num_k_heads=16, head_k_dim=128, head_v_dim=128,
-        conv_kernel=4, state_dtype_bytes=4,
+        hidden=5120,
+        num_v_heads=48,
+        num_k_heads=16,
+        head_k_dim=128,
+        head_v_dim=128,
+        conv_kernel=4,
+        state_dtype_bytes=4,
     )
     # O(T): 3 d_k·d_v products per (token, v-head) -> 6·num_v·d_k·d_v, linear in tokens.
     ten = Workload.causal_lm(decode=[4096] * 10, sampled=10)
@@ -302,8 +330,14 @@ def test_gated_attention_doubles_q_projection():
     from model.work.attention.gqa import GQA
 
     plain = GQA(hidden=5120, num_qo_heads=24, num_kv_heads=4, head_dim=256, kv_dtype_bytes=2.0)
-    gated = GQA(hidden=5120, num_qo_heads=24, num_kv_heads=4, head_dim=256, kv_dtype_bytes=2.0,
-                output_gate=True)
+    gated = GQA(
+        hidden=5120,
+        num_qo_heads=24,
+        num_kv_heads=4,
+        head_dim=256,
+        kv_dtype_bytes=2.0,
+        output_gate=True,
+    )
     qkv_plain = next(g for g in plain.matmul_groups() if g.name == "qkv")
     qkv_gated = next(g for g in gated.matmul_groups() if g.name == "qkv")
     assert qkv_plain.n == (24 + 2 * 4) * 256  # 8192

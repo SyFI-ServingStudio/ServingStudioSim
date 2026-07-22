@@ -42,7 +42,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::optimality::iteration_kernel_ladder;
+use crate::optimality::{iteration_kernel_ladder, iteration_waterfall};
 use batch::{read_batch_payload, read_batch_report};
 use catalog::build_catalog;
 use concurrency::{read_concurrency_payload, read_concurrency_report};
@@ -206,6 +206,10 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
         .route(
             "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/iterations/{iter_id}/optimality-kernel-ladder",
             get(get_iteration_optimality_kernel_ladder),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/iterations/{iter_id}/optimality-waterfall",
+            get(get_iteration_optimality_waterfall),
         )
         .route(
             "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations/{iter_id}/{batch_id}/{operation_id}/cost-tree",
@@ -636,6 +640,30 @@ async fn get_iteration_optimality_kernel_ladder(
         Err(error) => return worker_resource_error(error),
     };
     match iteration_kernel_ladder(
+        state.repo_root.as_ref(),
+        &run.path,
+        &pool_tag,
+        worker_id,
+        iter_id,
+        matches!(query.mode, Some(OptimalityMode::BatchLocked)),
+    )
+    .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => worker_resource_error(error),
+    }
+}
+
+async fn get_iteration_optimality_waterfall(
+    RoutePath((run_id, pool_tag, worker_id, iter_id)): RoutePath<(String, String, u16, u64)>,
+    Query(query): Query<OptimalityModeQuery>,
+    State(state): State<ServiceState>,
+) -> Response {
+    let run = match resolve_run(&state.roots, &run_id) {
+        Ok(run) => run,
+        Err(error) => return worker_resource_error(error),
+    };
+    match iteration_waterfall(
         state.repo_root.as_ref(),
         &run.path,
         &pool_tag,

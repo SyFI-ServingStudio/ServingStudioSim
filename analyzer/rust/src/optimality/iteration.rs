@@ -1,7 +1,6 @@
-//! On-demand exact kernel ladder for one `(worker, iter_id)`. This is the
-//! high-cardinality detail counterpart of the run payload's sampled per-worker
-//! ladders: it reuses the same preparation, leaf rate ceilings, and attribution code,
-//! but folds every row belonging to the selected iteration.
+//! On-demand exact optimality details for one `(worker, iter_id)`. The waterfall
+//! and kernel ladder have separate transport contracts, while both reuse this
+//! module's all-row fold so their R0..R5 values are defined identically.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -14,7 +13,17 @@ use crate::session::{build_session, register_cost_log, require_columns, COST_LOG
 
 use super::run::COST_COLS;
 use super::spec::{self, GpuSpec};
-use super::{fold, grid_peaks, kernel, levels, prepare};
+use super::{floors, fold, grid_peaks, kernel, levels, prepare};
+
+struct ExactIterationFold {
+    ladder: Value,
+    worker_rungs_gpu_ms: [f64; 6],
+    gpu_name: String,
+    gpu_spec_matched: Option<String>,
+    peaks_source: String,
+    gpu_count: f64,
+    folded_rows: u64,
+}
 
 /// Build the exact R0..R5 stacked-kernel ladder for one selected worker
 /// iteration. R0 equals R1 because an iteration has no scheduler holding-span
@@ -27,6 +36,108 @@ pub(crate) async fn iteration_kernel_ladder(
     iter_id: u64,
     lock_batch_size: bool,
 ) -> Result<Value> {
+    let exact = fold_exact_iteration(
+        repo_root,
+        log_dir,
+        pool_tag,
+        worker_id,
+        iter_id,
+        lock_batch_size,
+    )
+    .await?;
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "unit": "gpu_seconds",
+        "worker": {"pool_tag": pool_tag, "worker_id": worker_id},
+        "iter_id": iter_id,
+        "rungs": exact.ladder["rungs"],
+        "special_chunks": exact.ladder["special_chunks"],
+        "kernels": exact.ladder["kernels"],
+        "meta": {
+            "gpu_name": exact.gpu_name,
+            "gpu_spec_matched": exact.gpu_spec_matched,
+            "peaks_source": exact.peaks_source,
+            "gpu_count": exact.gpu_count,
+            "folded_rows": exact.folded_rows,
+            "batch_size_locked": lock_batch_size,
+        },
+    }))
+}
+
+/// Build the full telescoping waterfall for one selected worker iteration.
+/// Fixed-batch necessary-work floors belong only to this aggregate view; the
+/// sibling kernel-ladder contract remains strictly R0..R5 and leaf-attributable.
+pub(crate) async fn iteration_waterfall(
+    repo_root: &Path,
+    log_dir: &Path,
+    pool_tag: &str,
+    worker_id: u16,
+    iter_id: u64,
+    lock_batch_size: bool,
+) -> Result<Value> {
+    let exact = fold_exact_iteration(
+        repo_root,
+        log_dir,
+        pool_tag,
+        worker_id,
+        iter_id,
+        lock_batch_size,
+    )
+    .await?;
+    let mut caveats = Vec::new();
+    let iteration_floor = if lock_batch_size {
+        let ctx = build_session();
+        if !register_cost_log(&ctx, log_dir).await? {
+            bail!("cost_log/ dir not found");
+        }
+        match floors::compute_iteration_floors(&ctx, log_dir, pool_tag, worker_id, iter_id).await {
+            Ok(computed_floor) => Some(computed_floor),
+            Err(error) => {
+                caveats.push(format!(
+                    "exact iteration necessary-work floors unavailable ({error:#})"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let level_key = format!("{pool_tag}/{worker_id}/{iter_id}");
+    let level_label = format!("{pool_tag}/{worker_id} / iter {iter_id}");
+    let level = levels::exact_iteration_level_json(
+        &level_key,
+        &level_label,
+        &exact.worker_rungs_gpu_ms,
+        iteration_floor,
+    );
+
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "unit": "gpu_seconds",
+        "worker": {"pool_tag": pool_tag, "worker_id": worker_id},
+        "iter_id": iter_id,
+        "level": level,
+        "meta": {
+            "gpu_name": exact.gpu_name,
+            "gpu_spec_matched": exact.gpu_spec_matched,
+            "peaks_source": exact.peaks_source,
+            "gpu_count": exact.gpu_count,
+            "folded_rows": exact.folded_rows,
+            "batch_size_locked": lock_batch_size,
+            "necessary_work_available": iteration_floor.is_some(),
+            "caveats": caveats,
+        },
+    }))
+}
+
+async fn fold_exact_iteration(
+    repo_root: &Path,
+    log_dir: &Path,
+    pool_tag: &str,
+    worker_id: u16,
+    iter_id: u64,
+    lock_batch_size: bool,
+) -> Result<ExactIterationFold> {
     // The UI chooses the same explicit variant for the aggregate payload and
     // this exact fold. Do not infer mode from a mutable report file: both
     // variants coexist for every launcher-produced run.
@@ -102,21 +213,13 @@ pub(crate) async fn iteration_kernel_ladder(
     .next()
     .context("iteration fold produced no worker ladder")?;
 
-    Ok(json!({
-        "schema_version": SCHEMA_VERSION,
-        "unit": "gpu_seconds",
-        "worker": {"pool_tag": pool_tag, "worker_id": worker_id},
-        "iter_id": iter_id,
-        "rungs": ladder["rungs"],
-        "special_chunks": ladder["special_chunks"],
-        "kernels": ladder["kernels"],
-        "meta": {
-            "gpu_name": gpu_name,
-            "gpu_spec_matched": gpu_spec_matched,
-            "peaks_source": peaks_source,
-            "gpu_count": gpu_count,
-            "folded_rows": folded_rows,
-            "batch_size_locked": lock_batch_size,
-        },
-    }))
+    Ok(ExactIterationFold {
+        ladder,
+        worker_rungs_gpu_ms: tier_aggregates.worker_rungs_in_fold_order[0],
+        gpu_name,
+        gpu_spec_matched,
+        peaks_source,
+        gpu_count,
+        folded_rows,
+    })
 }

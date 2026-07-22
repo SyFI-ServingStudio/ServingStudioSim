@@ -45,6 +45,7 @@
 //! HP) — one group today (unified dense asserts a single HP group).
 
 use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
@@ -474,12 +475,7 @@ pub(crate) async fn collect_workload_by_worker(
         let groups = groups_list(batch)?;
         let gs = groups_struct(groups)?;
         let offsets = groups.value_offsets();
-        let batch_tokens = column_f64(field(gs, "batch_tokens")?)?;
-        let prefill_tokens = column_f64(field(gs, "prefill_tokens")?)?;
-        let decode_req = column_f64(field(gs, "decode_request_count")?)?;
-        let decode_kv = column_f64(field(gs, "decode_kv_total")?)?;
-        let prefix_lists = list_field(gs, "prefill_prefix_lens")?;
-        let append_lists = list_field(gs, "prefill_append_lens")?;
+        let workload_columns = WorkloadGroupColumns::new(gs)?;
 
         // Running total for the current worker; flushed on change / at batch end. Rows
         // of one worker are contiguous (one cost_log file per worker), but a worker may
@@ -498,32 +494,92 @@ pub(crate) async fn collect_workload_by_worker(
                 current = Some(((pool.to_string(), worker_id), WorkloadTotals::default()));
             }
             let totals = &mut current.as_mut().expect("current set above").1;
-            for elem in (offsets[row] as usize)..(offsets[row + 1] as usize) {
-                totals.matmul_tokens += batch_tokens[elem];
-                totals.prefill_tokens += prefill_tokens[elem];
-                totals.decode_passes += decode_req[elem];
-                totals.decode_kv += decode_kv[elem];
-                if prefix_lists.is_null(elem) || append_lists.is_null(elem) {
-                    continue;
-                }
-                let pv = prefix_lists.value(elem);
-                let av = append_lists.value(elem);
-                let pv = u32_values(&pv, "prefill_prefix_lens")?;
-                let av = u32_values(&av, "prefill_append_lens")?;
-                for k in 0..pv.len().min(av.len()) {
-                    let prefix = pv.value(k) as f64;
-                    let a = av.value(k) as f64;
-                    totals.prefill_pairs += a * prefix + a * (a + 1.0) / 2.0;
-                    totals.prefill_cached += prefix;
-                    totals.prefill_requests += 1.0;
-                }
-            }
+            workload_columns
+                .add_range((offsets[row] as usize)..(offsets[row + 1] as usize), totals)?;
         }
         if let Some((key, totals)) = current.take() {
             by_worker.entry(key).or_default().add(&totals);
         }
     }
     Ok(by_worker)
+}
+
+/// Exact fixed-batch workload for one worker iteration. Unlike
+/// [`collect_workload_by_worker`], this does not combine separate iterations, so
+/// `model.work` reads each weight matrix once for this observed batch rather than
+/// once for a run-wide mega-batch.
+pub(crate) async fn collect_iteration_workload(
+    ctx: &SessionContext,
+    pool_tag: &str,
+    worker_id: u16,
+    iter_id: u64,
+) -> Result<WorkloadTotals> {
+    let escaped_pool_tag = pool_tag.replace('\'', "''");
+    let sql = format!(
+        "SELECT groups FROM cost_log \
+         WHERE CAST(pool_tag AS VARCHAR) = '{escaped_pool_tag}' \
+         AND worker_id = {worker_id} AND iter_id = {iter_id}"
+    );
+    let batches = collect(ctx, &sql).await?;
+    let mut totals = WorkloadTotals::default();
+    for batch in &batches {
+        let groups = groups_list(batch)?;
+        let workload_columns = WorkloadGroupColumns::new(groups_struct(groups)?)?;
+        workload_columns.add_range(0..groups.values().len(), &mut totals)?;
+    }
+    Ok(totals)
+}
+
+/// Typed, once-per-record-batch view of the fields needed by `model.work`.
+/// Keeping range accumulation here makes the run aggregate and exact-iteration
+/// paths share one workload formula without paying Arrow downcasts per row.
+struct WorkloadGroupColumns<'a> {
+    batch_tokens: Vec<f64>,
+    prefill_tokens: Vec<f64>,
+    decode_requests: Vec<f64>,
+    decode_kv: Vec<f64>,
+    prefill_prefix_lists: &'a ListArray,
+    prefill_append_lists: &'a ListArray,
+}
+
+impl<'a> WorkloadGroupColumns<'a> {
+    fn new(groups: &'a StructArray) -> Result<Self> {
+        Ok(Self {
+            batch_tokens: column_f64(field(groups, "batch_tokens")?)?,
+            prefill_tokens: column_f64(field(groups, "prefill_tokens")?)?,
+            decode_requests: column_f64(field(groups, "decode_request_count")?)?,
+            decode_kv: column_f64(field(groups, "decode_kv_total")?)?,
+            prefill_prefix_lists: list_field(groups, "prefill_prefix_lens")?,
+            prefill_append_lists: list_field(groups, "prefill_append_lens")?,
+        })
+    }
+
+    fn add_range(&self, elements: Range<usize>, totals: &mut WorkloadTotals) -> Result<()> {
+        for element in elements {
+            totals.matmul_tokens += self.batch_tokens[element];
+            totals.prefill_tokens += self.prefill_tokens[element];
+            totals.decode_passes += self.decode_requests[element];
+            totals.decode_kv += self.decode_kv[element];
+            if self.prefill_prefix_lists.is_null(element)
+                || self.prefill_append_lists.is_null(element)
+            {
+                continue;
+            }
+            let prefix_values = self.prefill_prefix_lists.value(element);
+            let append_values = self.prefill_append_lists.value(element);
+            let prefix_values = u32_values(&prefix_values, "prefill_prefix_lens")?;
+            let append_values = u32_values(&append_values, "prefill_append_lens")?;
+            for index in 0..prefix_values.len().min(append_values.len()) {
+                let prefix_length = prefix_values.value(index) as f64;
+                let append_length = append_values.value(index) as f64;
+                totals.prefill_pairs +=
+                    append_length * prefix_length + append_length * (append_length + 1.0) / 2.0;
+                totals.prefill_cached += prefix_length;
+                totals.prefill_requests += 1.0;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A scalar struct field of the flattened `groups` child by name.

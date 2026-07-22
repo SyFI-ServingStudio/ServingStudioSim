@@ -225,6 +225,19 @@ fn level_entry_json(
     })
 }
 
+/// Exact iteration waterfall for one selected worker. Unlike the run-level
+/// synthetic `iteration` row, this receives only that worker iteration's rungs.
+/// Keeping this constructor here guarantees the on-demand endpoint uses the
+/// same telescoping bucket contract as cluster, pool, and worker waterfalls.
+pub(super) fn exact_iteration_level_json(
+    key: &str,
+    label: &str,
+    rungs: &[f64; 6],
+    floor: Option<Floors>,
+) -> Value {
+    level_entry_json("iteration", key, label, rungs, true, floor.is_some(), floor)
+}
+
 /// Report-side rung object for one tier: the rung values (GPU·s), the telescoping
 /// buckets as `{gpu_s, frac}`, and the tier's optimality ratio. When `floor` is present
 /// the two floor rungs are added and the `hardware_optimal` bucket splits into the

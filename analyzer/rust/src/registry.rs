@@ -231,8 +231,8 @@ pub const SUBJECTS: &[Subject] = &[
         category: Category::Optimality,
         description: "Distance from optimal GPU usage as a sub-optimality waterfall (GPU·s): \
                       idle / imbalance / batching / communication / hardware-gap / hardware-optimal, \
-                      at cluster / pool / worker / iteration / per-kernel levels; `analyze run \
-                      --lock-batch-size` disables the batching counterfactual.",
+                      at cluster / pool / worker / iteration / per-kernel levels; normal runs emit \
+                      both batch modes, while `--lock-batch-size` recomputes only the locked variant.",
         report_name: "optimality_report.json",
         payload_name: "optimality_waterfall.json",
         applies: Applies::All,

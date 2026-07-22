@@ -22,8 +22,10 @@
 //! iteration — idle 0 by construction / per-kernel). In unlocked mode only, the
 //! `model.work` labeler adds two global necessary-work bounds below R5 and splits
 //! `hw-optimal` into `[excess-over-necessary | fusion | hardware-necessary]`.
-//! Batch-locked analysis keeps the plain six-bucket R0..R5 ladder because its
-//! current operating points must not be globally rebatchable.
+//! Batch-locked run aggregates keep the plain six-bucket R0..R5 ladder because
+//! their current operating points must not be globally rebatchable. An exact
+//! locked iteration may append two `model.work` rungs computed from that one
+//! observed batch; those do not alter the run aggregate.
 //!
 //! Cost model. `G_worker` is read from `run_meta` (`workers[].gpu_ids.len()`),
 //! never inferred from tp×dp×ep. R0/R1 are exact SQL sums over every row; R2..R5
@@ -59,7 +61,7 @@ mod prepare;
 mod run;
 mod spec;
 
-pub(crate) use iteration::iteration_kernel_ladder;
+pub(crate) use iteration::{iteration_kernel_ladder, iteration_waterfall};
 pub use run::run_optimality;
 
 /// Rung index into the per-unit `[f64; 6]` GPU·ms accumulators (R0..R5).

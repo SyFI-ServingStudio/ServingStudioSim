@@ -66,8 +66,13 @@ _FIXTURE = {
                 "llama3_dense": {"params": []},
                 "llama3_dense_tp": {
                     "params": [
-                        {"name": "tp_size", "type": "int", "default": 2,
-                         "affects_cache": True, "description": ""},
+                        {
+                            "name": "tp_size",
+                            "type": "int",
+                            "default": 2,
+                            "affects_cache": True,
+                            "description": "",
+                        },
                     ]
                 },
             }
@@ -76,26 +81,48 @@ _FIXTURE = {
             "iter_wise": {
                 "barebone": {
                     "params": [
-                        {"name": "attn_gpu_memory_gb", "type": "float",
-                         "default": 80.0, "description": ""},
+                        {
+                            "name": "attn_gpu_memory_gb",
+                            "type": "float",
+                            "default": 80.0,
+                            "description": "",
+                        },
                     ]
                 },
                 "chunked_prefill": {
                     "params": [
-                        {"name": "attn_gpu_memory_gb", "type": "float",
-                         "default": 80.0, "description": ""},
-                        {"name": "max_batch_tokens", "type": "int",
-                         "required": True, "description": ""},
-                        {"name": "batch_policy", "type": "string", "default": "mix",
-                         "choices": ["mix", "separate-prefill-priority"], "description": ""},
+                        {
+                            "name": "attn_gpu_memory_gb",
+                            "type": "float",
+                            "default": 80.0,
+                            "description": "",
+                        },
+                        {
+                            "name": "max_batch_tokens",
+                            "type": "int",
+                            "required": True,
+                            "description": "",
+                        },
+                        {
+                            "name": "batch_policy",
+                            "type": "string",
+                            "default": "mix",
+                            "choices": ["mix", "separate-prefill-priority"],
+                            "description": "",
+                        },
                     ]
                 },
             }
         },
     },
     "arch_common": [
-        {"name": "model_config", "type": "string", "required": True,
-         "affects_cache": True, "description": ""},
+        {
+            "name": "model_config",
+            "type": "string",
+            "required": True,
+            "affects_cache": True,
+            "description": "",
+        },
         {"name": "num_layers", "type": "int", "required": False, "description": ""},
         {"name": "sim_num_layers", "type": "int", "required": False, "description": ""},
         {"name": "fp8", "type": "bool", "default": False, "affects_cache": True, "description": ""},
@@ -105,8 +132,13 @@ _FIXTURE = {
         {"name": "replicas", "type": "int", "default": 1, "description": ""},
     ],
     "pool_common": [
-        {"name": "placement", "type": "string", "default": "least-queued",
-         "choices": ["least-queued", "round-robin"], "description": ""},
+        {
+            "name": "placement",
+            "type": "string",
+            "default": "least-queued",
+            "choices": ["least-queued", "round-robin"],
+            "description": "",
+        },
     ],
     "common": {
         "workload": [
@@ -117,8 +149,13 @@ _FIXTURE = {
         ],
         "io": [
             {"name": "log_dir", "type": "path", "default": "logs", "description": ""},
-            {"name": "log_level", "type": "string", "default": "info",
-             "choices": ["trace", "debug", "info", "warn", "error"], "description": ""},
+            {
+                "name": "log_level",
+                "type": "string",
+                "default": "info",
+                "choices": ["trace", "debug", "info", "warn", "error"],
+                "description": "",
+            },
             {"name": "quiet", "type": "bool", "default": False, "description": ""},
             {"name": "force_cache_build", "type": "bool", "default": False, "description": ""},
         ],
@@ -142,9 +179,11 @@ def _base(*, arch=None, worker=None, log_dir="logs/x", **extra):
         "deployment": "unified",
         "workload": {"trace_files": ["t.csv"]},
         "io": {"log_dir": log_dir},
-        "pools": {"main": {"groups": [
-            {"gpu": "H200", "replicas": 1, "arch": arch_node, "worker": worker_node}
-        ]}},
+        "pools": {
+            "main": {
+                "groups": [{"gpu": "H200", "replicas": 1, "arch": arch_node, "worker": worker_node}]
+            }
+        },
     }
     preset.update(extra)
     return preset
@@ -154,7 +193,7 @@ def _arch(cand):
     return cand["pools"]["main"]["groups"][0]["arch"]
 
 
-def test_run_analysis_generates_locked_then_unlocked_optimality(monkeypatch, tmp_path):
+def test_run_analysis_delegates_both_optimality_modes_to_analyzer(monkeypatch, tmp_path):
     analyzer_path = tmp_path / "analyze"
     analyzer_path.write_text("")
     log_dir = tmp_path / "run"
@@ -171,14 +210,10 @@ def test_run_analysis_generates_locked_then_unlocked_optimality(monkeypatch, tmp
 
     asyncio.run(run_analysis(log_dir, subjects=["optimality"]))
 
-    assert captured_commands[0] == [
-        str(analyzer_path),
-        "run",
-        str(log_dir),
-        "--lock-batch-size",
-        "optimality",
+    analyzer_run_commands = [
+        command for command in captured_commands if len(command) > 1 and command[1] == "run"
     ]
-    assert captured_commands[1] == [str(analyzer_path), "run", str(log_dir), "optimality"]
+    assert analyzer_run_commands == [[str(analyzer_path), "run", str(log_dir), "optimality"]]
 
 
 # ── validation ──────────────────────────────────────────────────────────────
@@ -241,9 +276,7 @@ def test_validate_rejects_placeholder_arch_tag(schema):
 
 
 def test_validate_rejects_placeholder_worker_tag(schema):
-    errs = validate_params(
-        _base(worker={"type": "${wk}"}, sweep={"wk": ["barebone"]}), schema
-    )
+    errs = validate_params(_base(worker={"type": "${wk}"}, sweep={"wk": ["barebone"]}), schema)
     assert any("worker.type='${wk}'" in e and "structure" in e for e in errs)
 
 
@@ -256,9 +289,7 @@ def test_validate_rejects_placeholder_whole_arch_block(schema):
 
 
 def test_validate_rejects_placeholder_deployment(schema):
-    errs = validate_params(
-        {"deployment": "${d}", "sweep": {"d": ["unified"]}}, schema
-    )
+    errs = validate_params({"deployment": "${d}", "sweep": {"d": ["unified"]}}, schema)
     assert any("deployment '${d}' is a placeholder" in e for e in errs)
 
 
@@ -278,8 +309,9 @@ def test_validate_log_level_choices(schema):
 
 def test_validate_batch_policy_choices(schema):
     errs = validate_params(
-        _base(worker={"type": "chunked_prefill", "max_batch_tokens": 16384,
-                       "batch_policy": "loud"}),
+        _base(
+            worker={"type": "chunked_prefill", "max_batch_tokens": 16384, "batch_policy": "loud"}
+        ),
         schema,
     )
     assert any("batch_policy" in e and "not one of" in e for e in errs)
@@ -380,25 +412,31 @@ def test_r2_derived_correlation_is_effective(schema):
 
 
 def test_control_block_bad_shape_rejected(schema):
-    assert any("`sweep` must be a mapping" in e
-               for e in validate_params(_base(sweep=[]), schema))
-    assert any("`derived` must be a mapping" in e
-               for e in validate_params(_base(derived=[]), schema))
-    assert any("`constraints` must be a list" in e
-               for e in validate_params(_base(constraints="1"), schema))
-    assert any("constraints[0] must be a string" in e
-               for e in validate_params(_base(sweep={"ptp": [1]}, constraints=[1]), schema))
+    assert any("`sweep` must be a mapping" in e for e in validate_params(_base(sweep=[]), schema))
+    assert any(
+        "`derived` must be a mapping" in e for e in validate_params(_base(derived=[]), schema)
+    )
+    assert any(
+        "`constraints` must be a list" in e for e in validate_params(_base(constraints="1"), schema)
+    )
+    assert any(
+        "constraints[0] must be a string" in e
+        for e in validate_params(_base(sweep={"ptp": [1]}, constraints=[1]), schema)
+    )
 
 
-@pytest.mark.parametrize("template", [
-    "logs/{ptp.__class__}",
-    "logs/{ptp[0]}",
-    "logs/{ptp!r}",
-    "logs/{ptp:04d}",
-    "logs/{}",
-    "logs/{0}",
-    "logs/{ptp",
-])
+@pytest.mark.parametrize(
+    "template",
+    [
+        "logs/{ptp.__class__}",
+        "logs/{ptp[0]}",
+        "logs/{ptp!r}",
+        "logs/{ptp:04d}",
+        "logs/{}",
+        "logs/{0}",
+        "logs/{ptp",
+    ],
+)
 def test_log_dir_non_bare_identifier_rejected(schema, template):
     preset = _base(
         arch={"type": "llama3_dense_tp", "tp_size": "${ptp}"},
@@ -427,17 +465,27 @@ def test_r4_empty_sweep_rejected(schema):
 def test_r5_distinct_configs_rejects_identical():
     # Two candidates with identical config trees, different log_dir only.
     def cand(log_dir):
-        return {"deployment": "unified", "io": {"log_dir": log_dir},
-                "pools": {"main": {"groups": [
-                    {"gpu": "H200", "arch": {"type": "llama3_dense"}}]}}}
+        return {
+            "deployment": "unified",
+            "io": {"log_dir": log_dir},
+            "pools": {"main": {"groups": [{"gpu": "H200", "arch": {"type": "llama3_dense"}}]}},
+        }
+
     assert validate_distinct_configs([cand("logs/tp1"), cand("logs/tp2")]) is False
 
 
 def test_r5_distinct_configs_accepts_real_difference():
     def cand(log_dir, tp):
-        return {"deployment": "unified", "io": {"log_dir": log_dir},
-                "pools": {"main": {"groups": [
-                    {"gpu": "H200", "arch": {"type": "llama3_dense_tp", "tp_size": tp}}]}}}
+        return {
+            "deployment": "unified",
+            "io": {"log_dir": log_dir},
+            "pools": {
+                "main": {
+                    "groups": [{"gpu": "H200", "arch": {"type": "llama3_dense_tp", "tp_size": tp}}]
+                }
+            },
+        }
+
     assert validate_distinct_configs([cand("logs/tp1", 1), cand("logs/tp2", 2)]) is True
 
 
@@ -458,11 +506,15 @@ def test_main_rejects_empty_expansion(tmp_path, schema, monkeypatch):
     from launcher import __main__ as main_module
 
     preset_path = tmp_path / "preset.json"
-    preset_path.write_text(json.dumps(_base(
-        arch={"type": "llama3_dense_tp", "tp_size": "${ptp}"},
-        sweep={"ptp": [1, 2]},
-        constraints=["ptp > 100"],  # rejects every combo → 0 runs
-    )))
+    preset_path.write_text(
+        json.dumps(
+            _base(
+                arch={"type": "llama3_dense_tp", "tp_size": "${ptp}"},
+                sweep={"ptp": [1, 2]},
+                constraints=["ptp > 100"],  # rejects every combo → 0 runs
+            )
+        )
+    )
     monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     with pytest.raises(SystemExit):
@@ -593,8 +645,7 @@ def test_validate_expanded_rejects_dynamic_tag_missing_required(schema):
     # required params (chunked_prefill's max_batch_tokens) cannot be checked. With
     # the tag now concrete, the missing required param must be flagged.
     cand = _base(worker={"type": "chunked_prefill"})  # no max_batch_tokens
-    assert any("max_batch_tokens" in e and "required" in e
-               for e in validate_expanded(cand, schema))
+    assert any("max_batch_tokens" in e and "required" in e for e in validate_expanded(cand, schema))
 
 
 def test_main_rejects_placeholder_dynamic_tag_missing_required(tmp_path, schema, monkeypatch):
@@ -619,10 +670,8 @@ def test_validate_dropped_workload_block_still_flags_required(schema):
     # leaves are still inspected.
     preset = _base()
     del preset["workload"]
-    assert any("trace_files" in e and "required" in e
-               for e in validate_params(preset, schema))
-    assert any("trace_files" in e and "required" in e
-               for e in validate_expanded(preset, schema))
+    assert any("trace_files" in e and "required" in e for e in validate_params(preset, schema))
+    assert any("trace_files" in e and "required" in e for e in validate_expanded(preset, schema))
 
 
 def test_validate_nested_underscore_key_rejected(schema):
@@ -644,19 +693,21 @@ def _concrete_attacks():
     def add(cid, cand, sub):
         cases.append(pytest.param(cand, sub, id=cid))
 
-    add("bad-arch-tag",
+    add(
+        "bad-arch-tag",
         _base(arch={"type": "not_a_real_arch", "model_config": "m.json"}),
-        "arch.type='not_a_real_arch'")
-    add("bad-worker-tag", _base(worker={"type": "no_such_worker"}),
-        "worker.type='no_such_worker'")
-    add("tag-required-missing", _base(worker={"type": "chunked_prefill"}),
-        "max_batch_tokens")
-    add("bad-int-type", _base(arch={"type": "llama3_dense_tp", "tp_size": "x"}),
-        "not a valid int")
+        "arch.type='not_a_real_arch'",
+    )
+    add("bad-worker-tag", _base(worker={"type": "no_such_worker"}), "worker.type='no_such_worker'")
+    add("tag-required-missing", _base(worker={"type": "chunked_prefill"}), "max_batch_tokens")
+    add("bad-int-type", _base(arch={"type": "llama3_dense_tp", "tp_size": "x"}), "not a valid int")
     add("unknown-key", _base(arch={"bogus_field": 1}), "bogus_field")
     add("nested-underscore-key", _base(arch={"_typo": 1}), "_typo")
-    add("whole-placeholder-residue",
-        _base(arch={"type": "llama3_dense_tp", "tp_size": "${ptp}"}), "placeholder")
+    add(
+        "whole-placeholder-residue",
+        _base(arch={"type": "llama3_dense_tp", "tp_size": "${ptp}"}),
+        "placeholder",
+    )
 
     bad_choice = _base()
     bad_choice["io"]["log_level"] = "verbose"
@@ -687,8 +738,11 @@ def _valid_presets():
     """Valid presets whose expansions feed the invariant tests below."""
     return [
         _base(),
-        _base(arch={"type": "llama3_dense_tp", "tp_size": "${ptp}"},
-              sweep={"ptp": [1, 2, 4]}, log_dir="logs/tp{ptp}"),
+        _base(
+            arch={"type": "llama3_dense_tp", "tp_size": "${ptp}"},
+            sweep={"ptp": [1, 2, 4]},
+            log_dir="logs/tp{ptp}",
+        ),
     ]
 
 
@@ -793,8 +847,9 @@ def _compound_preset(**extra):
 
 
 def test_expand_compound_zip(schema):
-    preset = _compound_preset(compound={"tp_rate": {
-        "fast": {"tp": 4, "rate": 10}, "slow": {"tp": 8, "rate": 20}}})
+    preset = _compound_preset(
+        compound={"tp_rate": {"fast": {"tp": 4, "rate": 10}, "slow": {"tp": 8, "rate": 20}}}
+    )
     cands = expand_sweep_params(preset, schema)
     assert len(cands) == 2  # zipped rows, NOT a 2x2 grid
     rows = {(_arch(c)["tp_size"], c["workload"]["request_rate"]) for c in cands}
@@ -808,8 +863,7 @@ def test_expand_compound_zip(schema):
 
 def test_expand_compound_crosses_sweep(schema):
     preset = _compound_preset(
-        compound={"tp_rate": {"fast": {"tp": 4, "rate": 10},
-                              "slow": {"tp": 8, "rate": 20}}},
+        compound={"tp_rate": {"fast": {"tp": 4, "rate": 10}, "slow": {"tp": 8, "rate": 20}}},
         sweep={"gpu_kind": ["NVIDIA H200", "NVIDIA H100"]},
     )
     preset["pools"]["main"]["groups"][0]["gpu"] = "${gpu_kind}"
@@ -821,14 +875,16 @@ def test_expand_compound_crosses_sweep(schema):
 
 
 def test_validate_compound_ok(schema):
-    preset = _compound_preset(compound={"tp_rate": {
-        "fast": {"tp": 4, "rate": 10}, "slow": {"tp": 8, "rate": 20}}})
+    preset = _compound_preset(
+        compound={"tp_rate": {"fast": {"tp": 4, "rate": 10}, "slow": {"tp": 8, "rate": 20}}}
+    )
     assert validate_params(preset, schema) == []
 
 
 def test_compound_inconsistent_member_set_rejected(schema):
-    preset = _compound_preset(compound={"tp_rate": {
-        "fast": {"tp": 4, "rate": 10}, "slow": {"tp": 8}}})  # slow lacks rate
+    preset = _compound_preset(
+        compound={"tp_rate": {"fast": {"tp": 4, "rate": 10}, "slow": {"tp": 8}}}
+    )  # slow lacks rate
     errs = validate_params(preset, schema)
     assert any("every row must declare the same members" in e for e in errs)
 
@@ -849,16 +905,18 @@ def test_compound_member_not_config_effective_rejected(schema):
         compound={"g": {"a": {"tp": 4, "extra": 1}, "b": {"tp": 8, "extra": 2}}},
     )
     errs = validate_params(preset, schema)
-    assert any("compound member 'extra' never reaches a run config value" in e
-               for e in errs)
+    assert any("compound member 'extra' never reaches a run config value" in e for e in errs)
 
 
-@pytest.mark.parametrize("compound, needle", [
-    ([1, 2], "`compound` must be a mapping"),
-    ({"g": [1, 2]}, "compound group 'g' must be a non-empty mapping"),
-    ({"g": {}}, "compound group 'g' must be a non-empty mapping"),
-    ({"g": {"a": 5}}, "compound['g']['a'] must be a non-empty mapping"),
-])
+@pytest.mark.parametrize(
+    "compound, needle",
+    [
+        ([1, 2], "`compound` must be a mapping"),
+        ({"g": [1, 2]}, "compound group 'g' must be a non-empty mapping"),
+        ({"g": {}}, "compound group 'g' must be a non-empty mapping"),
+        ({"g": {"a": 5}}, "compound['g']['a'] must be a non-empty mapping"),
+    ],
+)
 def test_compound_bad_shape_rejected(schema, compound, needle):
     errs = validate_params(_base(compound=compound), schema)
     assert any(needle in e for e in errs), f"{compound!r}: {errs}"
@@ -870,11 +928,18 @@ def test_compound_bad_shape_rejected(schema, compound, needle):
 def test_expand_manifest_single_axis_tags_and_prefixes(tmp_path, schema):
     from launcher.__main__ import _expand_manifest
 
-    (tmp_path / "dense.json").write_text(json.dumps(_base(
-        arch={"type": "llama3_dense_tp", "tp_size": "${tp}"},
-        sweep={"tp": [2, 4]}, log_dir="logs/d{tp}")))
-    (tmp_path / "big.json").write_text(json.dumps(_base(
-        arch={"type": "llama3_dense_tp", "tp_size": 8}, log_dir="logs/b")))
+    (tmp_path / "dense.json").write_text(
+        json.dumps(
+            _base(
+                arch={"type": "llama3_dense_tp", "tp_size": "${tp}"},
+                sweep={"tp": [2, 4]},
+                log_dir="logs/d{tp}",
+            )
+        )
+    )
+    (tmp_path / "big.json").write_text(
+        json.dumps(_base(arch={"type": "llama3_dense_tp", "tp_size": 8}, log_dir="logs/b"))
+    )
     manifest = {"variants": {"arch": {"dense": "dense.json", "big": "big.json"}}}
 
     cands = _expand_manifest(manifest, schema, str(tmp_path / "m.json"), [])
@@ -888,14 +953,22 @@ def test_main_manifest_single_axis_ok(tmp_path, schema, monkeypatch):
     import launcher.exec as exec_module
     from launcher import __main__ as main_module
 
-    (tmp_path / "dense.json").write_text(json.dumps(_base(
-        arch={"type": "llama3_dense_tp", "tp_size": "${tp}"},
-        sweep={"tp": [2, 4]}, log_dir="logs/d{tp}")))
-    (tmp_path / "big.json").write_text(json.dumps(_base(
-        arch={"type": "llama3_dense_tp", "tp_size": 8}, log_dir="logs/b")))
+    (tmp_path / "dense.json").write_text(
+        json.dumps(
+            _base(
+                arch={"type": "llama3_dense_tp", "tp_size": "${tp}"},
+                sweep={"tp": [2, 4]},
+                log_dir="logs/d{tp}",
+            )
+        )
+    )
+    (tmp_path / "big.json").write_text(
+        json.dumps(_base(arch={"type": "llama3_dense_tp", "tp_size": 8}, log_dir="logs/b"))
+    )
     manifest = tmp_path / "m.json"
-    manifest.write_text(json.dumps(
-        {"variants": {"arch": {"dense": "dense.json", "big": "big.json"}}}))
+    manifest.write_text(
+        json.dumps({"variants": {"arch": {"dense": "dense.json", "big": "big.json"}}})
+    )
     monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     assert main_module.main([str(manifest), "--dry-run"]) == 0
@@ -906,8 +979,9 @@ def test_main_manifest_multi_axis_rejected(tmp_path, schema, monkeypatch):
     from launcher import __main__ as main_module
 
     manifest = tmp_path / "m.json"
-    manifest.write_text(json.dumps({"variants": {
-        "arch": {"dense": "d.json"}, "hw": {"h200": "h.json"}}}))  # two axes → reject
+    manifest.write_text(
+        json.dumps({"variants": {"arch": {"dense": "d.json"}, "hw": {"h200": "h.json"}}})
+    )  # two axes → reject
     monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     assert main_module.main([str(manifest), "--dry-run"]) == 2
@@ -918,9 +992,15 @@ def test_manifest_axis_collision_with_inner_env_rejected(tmp_path, schema):
     # overwrites that _env binding (corrupting log_dir + the aggregation axis).
     from launcher.__main__ import _expand_manifest
 
-    (tmp_path / "p.json").write_text(json.dumps(_base(
-        arch={"type": "llama3_dense_tp", "tp_size": "${tp}"},
-        sweep={"tp": [2, 4]}, log_dir="logs/{tp}")))
+    (tmp_path / "p.json").write_text(
+        json.dumps(
+            _base(
+                arch={"type": "llama3_dense_tp", "tp_size": "${tp}"},
+                sweep={"tp": [2, 4]},
+                log_dir="logs/{tp}",
+            )
+        )
+    )
     manifest = {"variants": {"tp": {"dense": "p.json"}}}  # axis 'tp' collides
     assert _expand_manifest(manifest, schema, str(tmp_path / "m.json"), []) is None
 
@@ -931,21 +1011,31 @@ def test_manifest_extra_key_rejected(tmp_path, schema, monkeypatch):
     from launcher import __main__ as main_module
 
     manifest = tmp_path / "m.json"
-    manifest.write_text(json.dumps({
-        "variants": {"arch": {"dense": "d.json"}},
-        "sweep": {"typo": [1]},  # stray key
-    }))
+    manifest.write_text(
+        json.dumps(
+            {
+                "variants": {"arch": {"dense": "d.json"}},
+                "sweep": {"typo": [1]},  # stray key
+            }
+        )
+    )
     monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     assert main_module.main([str(manifest), "--dry-run"]) == 2
 
 
-@pytest.mark.parametrize("preset_kw, needle", [
-    ({"sweep": {1: [2]}}, "sweep dim name 1 must be a string identifier"),
-    ({"compound": {1: {"a": {"tp": 4}}}}, "compound group name 1 must be a string identifier"),
-    ({"compound": {"g": {"a": {2: 4}}}}, "compound member name 2 must be a string identifier"),
-    ({"compound": {"g": {"a/b": {"tp": 4}}}}, "label 'a/b' must be a non-empty path-safe string"),
-])
+@pytest.mark.parametrize(
+    "preset_kw, needle",
+    [
+        ({"sweep": {1: [2]}}, "sweep dim name 1 must be a string identifier"),
+        ({"compound": {1: {"a": {"tp": 4}}}}, "compound group name 1 must be a string identifier"),
+        ({"compound": {"g": {"a": {2: 4}}}}, "compound member name 2 must be a string identifier"),
+        (
+            {"compound": {"g": {"a/b": {"tp": 4}}}},
+            "label 'a/b' must be a non-empty path-safe string",
+        ),
+    ],
+)
 def test_symbol_names_must_be_identifiers(schema, preset_kw, needle):
     # Non-identifier names leak into _env and crash _sweep_axes' mixed-type sort.
     errs = validate_params(_base(**preset_kw), schema)
@@ -954,8 +1044,11 @@ def test_symbol_names_must_be_identifiers(schema, preset_kw, needle):
 
 def test_dict_sweep_label_must_be_path_safe(schema):
     # A dict-sweep label reaches io.log_dir as a path segment → no `..` traversal.
-    preset = _base(arch={"type": "llama3_dense_tp", "tp_size": "${tp}"},
-                   sweep={"tp": {"../escape": 4}}, log_dir="logs/{tp}")
+    preset = _base(
+        arch={"type": "llama3_dense_tp", "tp_size": "${tp}"},
+        sweep={"tp": {"../escape": 4}},
+        log_dir="logs/{tp}",
+    )
     errs = validate_params(preset, schema)
     assert any("label '../escape'" in e for e in errs)
 
@@ -971,6 +1064,7 @@ def test_io_block_must_be_mapping(schema, bad_io):
 def _mock_build(monkeypatch, schema):
     import launcher.exec as exec_module
     from launcher import __main__ as main_module
+
     monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
     return main_module
@@ -1013,25 +1107,52 @@ def test_readme_worked_example(schema):
     # sweep must validate clean and expand to exactly 10 runs (2×3×2 − 2 rejected),
     # collapsing to 5 distinct cache keys (batch params are not affects_cache).
     def grp(tp, worker):
-        return {"gpu": "NVIDIA H200", "replicas": tp[1], "arch": {
-            "type": "llama3_dense_tp", "model_config": "model/config/llama3_8b.json",
-            "fp8": True, "tp_size": tp[0]}, "worker": worker}
+        return {
+            "gpu": "NVIDIA H200",
+            "replicas": tp[1],
+            "arch": {
+                "type": "llama3_dense_tp",
+                "model_config": "model/config/llama3_8b.json",
+                "fp8": True,
+                "tp_size": tp[0],
+            },
+            "worker": worker,
+        }
 
     preset = {
         "deployment": "pd",
         "workload": {"trace_files": ["trace/aime_long.csv"]},
         "io": {"log_dir": "logs/pd_{prefill_tp}_d{decode_tp}tp_r{decode_replicas}_{batch}"},
         "pools": {
-            "prefill": {"groups": [grp(("${prefill_tp}", 2), {
-                "type": "chunked_prefill", "attn_gpu_memory_gb": 80.0,
-                "max_batch_tokens": "${max_batch_tokens}", "batch_policy": "${batch_policy}"})]},
-            "decode": {"groups": [grp(("${decode_tp}", "${decode_replicas}"), {
-                "type": "barebone", "attn_gpu_memory_gb": 80.0})]},
+            "prefill": {
+                "groups": [
+                    grp(
+                        ("${prefill_tp}", 2),
+                        {
+                            "type": "chunked_prefill",
+                            "attn_gpu_memory_gb": 80.0,
+                            "max_batch_tokens": "${max_batch_tokens}",
+                            "batch_policy": "${batch_policy}",
+                        },
+                    )
+                ]
+            },
+            "decode": {
+                "groups": [
+                    grp(
+                        ("${decode_tp}", "${decode_replicas}"),
+                        {"type": "barebone", "attn_gpu_memory_gb": 80.0},
+                    )
+                ]
+            },
         },
         "sweep": {"prefill_tp": {"p8": 8, "p4": 4}, "decode_tp": [2, 4, 8]},
-        "compound": {"batch": {
-            "big": {"max_batch_tokens": 16384, "batch_policy": "separate-prefill-priority"},
-            "small": {"max_batch_tokens": 8192, "batch_policy": "mix"}}},
+        "compound": {
+            "batch": {
+                "big": {"max_batch_tokens": 16384, "batch_policy": "separate-prefill-priority"},
+                "small": {"max_batch_tokens": 8192, "batch_policy": "mix"},
+            }
+        },
         "derived": {"decode_replicas": "16 // decode_tp"},
         "constraints": ["prefill_tp >= decode_tp"],
     }
@@ -1115,8 +1236,10 @@ def test_cache_key_from_real_schema():
     except SchemaNotFound:
         pytest.skip("simulator not built")
     cfg = normalize_params(
-        _base(arch={"type": "llama3_dense_tp", "model_config": "m.json", "tp_size": 4},
-              gpu="NVIDIA H200"),
+        _base(
+            arch={"type": "llama3_dense_tp", "model_config": "m.json", "tp_size": 4},
+            gpu="NVIDIA H200",
+        ),
         real,
     )
     keys = {path for path, _ in cache_key(cfg, real)}
@@ -1129,14 +1252,16 @@ def test_cache_key_from_real_schema():
 
 
 def test_format_log_dir_from_env():
-    out = _format_log_dir({"io": {"log_dir": "logs/tp{ptp}_r{rate}"},
-                           "_env": {"ptp": 4, "rate": 10.0}})
+    out = _format_log_dir(
+        {"io": {"log_dir": "logs/tp{ptp}_r{rate}"}, "_env": {"ptp": 4, "rate": 10.0}}
+    )
     assert out["io"]["log_dir"] == "logs/tp4_r10.0"
 
 
 def test_format_log_dir_uses_label():
-    out = _format_log_dir({"io": {"log_dir": "logs/{ptp}"},
-                           "_env": {"ptp": 1}, "_sweep_labels": {"ptp": "small"}})
+    out = _format_log_dir(
+        {"io": {"log_dir": "logs/{ptp}"}, "_env": {"ptp": 1}, "_sweep_labels": {"ptp": "small"}}
+    )
     assert out["io"]["log_dir"] == "logs/small"
 
 
@@ -1158,8 +1283,7 @@ def test_write_shared_and_run_metadata(tmp_path):
     root_dir = tmp_path / "sweep"
     log_dir = tmp_path / "run"
     preset = {"deployment": "unified", "sweep": {"ptp": [1, 4]}}
-    params = {"deployment": "unified", "io": {"log_dir": str(log_dir)},
-              "_sweep_labels": {"x": "y"}}
+    params = {"deployment": "unified", "io": {"log_dir": str(log_dir)}, "_sweep_labels": {"x": "y"}}
     metadata.write_shared_metadata(root_dir, preset)
     metadata.write_run_metadata(log_dir, params, ["/bin/sim", "run", "cfg.json"])
 
@@ -1213,11 +1337,15 @@ def test_main_validates_log_dirs_before_dry_run(tmp_path, schema, monkeypatch, c
     preset_path = tmp_path / "preset.json"
     # Two sweep points that DO change config (tp_size), but write to the same
     # (un-templated) log_dir → collision caught after the plan print.
-    preset_path.write_text(json.dumps(_base(
-        arch={"type": "llama3_dense_tp", "tp_size": "${ptp}"},
-        sweep={"ptp": [1, 2]},
-        log_dir="logs/same",
-    )))
+    preset_path.write_text(
+        json.dumps(
+            _base(
+                arch={"type": "llama3_dense_tp", "tp_size": "${ptp}"},
+                sweep={"ptp": [1, 2]},
+                log_dir="logs/same",
+            )
+        )
+    )
     monkeypatch.setattr(exec_module, "cargo_build", lambda build_type, **kwargs: True)
     monkeypatch.setattr(main_module, "load_schema", lambda build_type: schema)
 
@@ -1299,19 +1427,42 @@ def test_simulation_runner_captures_stdout(tmp_path):
     # A config pointing at a nonexistent trace fails fast; we just verify the
     # wrapper spawns, captures stdout, and reports the non-zero exit.
     cfg = tmp_path / "cfg.json"
-    cfg.write_text(json.dumps({
-        "deployment": "unified",
-        "workload": {"trace_files": ["does/not/exist.csv"], "duration_ms": 5000.0,
-                     "run_to_end": False, "request_rate": 10.0},
-        "io": {"log_dir": str(tmp_path), "log_level": "info", "quiet": False,
-               "force_cache_build": False},
-        "pools": {"main": {"placement": "least-queued", "groups": [
-            {"gpu": "NVIDIA H200", "replicas": 1,
-             "arch": {"type": "llama3_dense", "model_config": "model/config/llama3_8b.json",
-                      "fp8": False},
-             "worker": {"type": "barebone", "attn_gpu_memory_gb": 80.0}}
-        ]}},
-    }))
+    cfg.write_text(
+        json.dumps(
+            {
+                "deployment": "unified",
+                "workload": {
+                    "trace_files": ["does/not/exist.csv"],
+                    "duration_ms": 5000.0,
+                    "run_to_end": False,
+                    "request_rate": 10.0,
+                },
+                "io": {
+                    "log_dir": str(tmp_path),
+                    "log_level": "info",
+                    "quiet": False,
+                    "force_cache_build": False,
+                },
+                "pools": {
+                    "main": {
+                        "placement": "least-queued",
+                        "groups": [
+                            {
+                                "gpu": "NVIDIA H200",
+                                "replicas": 1,
+                                "arch": {
+                                    "type": "llama3_dense",
+                                    "model_config": "model/config/llama3_8b.json",
+                                    "fp8": False,
+                                },
+                                "worker": {"type": "barebone", "attn_gpu_memory_gb": 80.0},
+                            }
+                        ],
+                    }
+                },
+            }
+        )
+    )
     argv = [str(binary), "run", str(cfg)]
     runner = SimulationRunner(argv=argv, log_dir=tmp_path, env=_build_subprocess_env())
     ok = asyncio.run(runner.run())
@@ -1350,9 +1501,11 @@ def test_failed_run_leaves_no_marker(tmp_path, schema):
         pytest.skip("simulator not built")
     log_dir = tmp_path / "run"
     params = normalize_params(
-        _base(log_dir=str(log_dir),
-              arch={"model_config": "model/config/llama3_8b.json"},
-              gpu="NVIDIA H200"),
+        _base(
+            log_dir=str(log_dir),
+            arch={"model_config": "model/config/llama3_8b.json"},
+            gpu="NVIDIA H200",
+        ),
         schema,
     )
     # No trace file on disk → run fails; marker must not be written.
@@ -1424,10 +1577,7 @@ def test_backends_unflatten_and_substitute(schema):
         "main": {"unified.attn.qkv": "${attn_be}", "unified.mlp.down": ["torch"]}
     }
     cands = expand_sweep_params(preset, schema)
-    got = {
-        c["_sweep_labels"]["attn_be"]: c["backends"]["main"]["unified.attn.qkv"]
-        for c in cands
-    }
+    got = {c["_sweep_labels"]["attn_be"]: c["backends"]["main"]["unified.attn.qkv"] for c in cands}
     # the `${attn_be}` value is substituted per combo (best-of-N candidate list)...
     assert got == {"fa2": ["fa2"], "both": ["fa2", "fa3"]}
     # ...while the pinned literal is unchanged across combos.
@@ -1437,9 +1587,7 @@ def test_backends_unflatten_and_substitute(schema):
 def test_backends_file_merge(tmp_path, schema):
     from launcher.__main__ import _merge_backends_file
 
-    (tmp_path / "backends.yaml").write_text(
-        "backends:\n  main/unified.attn.qkv: [fa2, fa3]\n"
-    )
+    (tmp_path / "backends.yaml").write_text("backends:\n  main/unified.attn.qkv: [fa2, fa3]\n")
     preset = _base(backends_file="backends.yaml")
     preset = _merge_backends_file(preset, str(tmp_path / "preset.yml"))
     assert "backends_file" not in preset
@@ -1449,9 +1597,7 @@ def test_backends_file_merge(tmp_path, schema):
 def test_backends_file_wins_over_inline(tmp_path, schema):
     from launcher.__main__ import _merge_backends_file
 
-    (tmp_path / "backends.yaml").write_text(
-        "backends:\n  main/unified.attn.qkv: [fa3]\n"
-    )
+    (tmp_path / "backends.yaml").write_text("backends:\n  main/unified.attn.qkv: [fa3]\n")
     preset = _base(
         backends={"main/unified.attn.qkv": ["fa2"], "main/unified.mlp.down": ["torch"]},
         backends_file="backends.yaml",

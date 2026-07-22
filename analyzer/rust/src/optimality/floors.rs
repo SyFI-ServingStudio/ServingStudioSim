@@ -1,4 +1,4 @@
-//! Labeler-derived necessary-work floors — the two global lower bounds that sit
+//! Labeler-derived necessary-work floors — two independent lower bounds that sit
 //! BELOW the R5 `hardware_limit` green. R5 is a roofline of the sim's *actual* per
 //! -kernel work (weights re-loaded every iteration, activation I/O, sim's attention
 //! approximation), so it is not the true floor. Here we aggregate each level's
@@ -11,8 +11,11 @@
 //!   truly irreducible floor.
 //! - **segmented** — `Σ_seg max(compute, memory)`: per-op serial bound (≥ necessary).
 //!
-//! The labeler is a subprocess (`uv run python -m model.work.floors`); any failure
-//! degrades gracefully to the plain 6-rung ladder (the caller records a caveat).
+//! Run aggregates use one unlocked mega-batch. Exact batch-locked iteration detail
+//! instead sends only that iteration's observed workload, preserving its weight-load
+//! and expert-occupancy batch. The labeler is a subprocess
+//! (`uv run python -m model.work.floors`); any failure degrades gracefully to the
+//! plain R0..R5 ladder (the caller records a caveat).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -23,7 +26,9 @@ use anyhow::{anyhow, Context, Result};
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Map, Value};
 
-use crate::conservation::workload::{collect_workload_by_worker, WorkloadTotals};
+use crate::conservation::workload::{
+    collect_iteration_workload, collect_workload_by_worker, WorkloadTotals,
+};
 use crate::kernel_query::repo_root;
 
 /// One level's two labeler floors, in GPU·seconds. Ordered `necessary ≤ segmented`.
@@ -48,6 +53,29 @@ pub(super) async fn compute_floors(ctx: &SessionContext, log_dir: &Path) -> Resu
     }
     let levels = rollup_levels(&by_worker);
     run_labeler(log_dir, &levels)
+}
+
+/// Label the exact observed batch of one worker iteration. This is the locked-batch
+/// counterpart of [`compute_floors`]: it intentionally sends only one iteration to
+/// `model.work`, so neither weight traffic nor expert occupancy is amortized across
+/// iterations. The returned pair still distinguishes full-forward fusion
+/// (`necessary`) from the serial per-segment roofline (`segmented`).
+pub(super) async fn compute_iteration_floors(
+    ctx: &SessionContext,
+    log_dir: &Path,
+    pool_tag: &str,
+    worker_id: u16,
+    iter_id: u64,
+) -> Result<Floors> {
+    let totals = collect_iteration_workload(ctx, pool_tag, worker_id, iter_id).await?;
+    if totals.matmul_tokens <= 0.0 {
+        return Err(anyhow!("iteration has no model workload to label"));
+    }
+    let level_key = format!("{pool_tag}/{worker_id}");
+    let levels = HashMap::from([(level_key.clone(), totals)]);
+    run_labeler(log_dir, &levels)?
+        .remove(&level_key)
+        .context("labeler output missing exact iteration floor")
 }
 
 /// Roll the per-worker totals up into the three level granularities the waterfall

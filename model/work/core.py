@@ -35,10 +35,20 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _DTYPE_BYTES = {
-    "float32": 4, "fp32": 4, "f32": 4,
-    "float16": 2, "fp16": 2, "f16": 2, "half": 2,
-    "bfloat16": 2, "bf16": 2,
-    "float8": 1, "fp8": 1, "float8_e4m3fn": 1, "float8_e5m2": 1, "f8": 1,
+    "float32": 4,
+    "fp32": 4,
+    "f32": 4,
+    "float16": 2,
+    "fp16": 2,
+    "f16": 2,
+    "half": 2,
+    "bfloat16": 2,
+    "bf16": 2,
+    "float8": 1,
+    "fp8": 1,
+    "float8_e4m3fn": 1,
+    "float8_e5m2": 1,
+    "f8": 1,
     "int8": 1,
 }
 
@@ -96,6 +106,13 @@ class Workload:
     matmul_tokens: int  # T: positions through every weight matmul + FFN
     head_positions: int  # T_out: positions through the output (lm_head) projection
     attn: list[AttnInteraction] = field(default_factory=list)
+    # Original attention state transactions represented by `attn`. Analyzer
+    # aggregates can collapse geometry while retaining recurrent-state traffic.
+    attention_step_count: int | None = None
+
+    @property
+    def num_attention_steps(self) -> int:
+        return len(self.attn) if self.attention_step_count is None else self.attention_step_count
 
     @classmethod
     def causal_lm(
@@ -137,7 +154,12 @@ class Workload:
             matmul_tokens += 1
         if sampled is None:
             sampled = len(prefill) + len(decode)
-        return cls(matmul_tokens=matmul_tokens, head_positions=sampled, attn=attn)
+        return cls(
+            matmul_tokens=matmul_tokens,
+            head_positions=sampled,
+            attn=attn,
+            attention_step_count=len(attn),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -529,9 +551,7 @@ def _find_gpu(name: str, spec_path: str | Path | None) -> dict:
         names = [entry["name"], *entry.get("aliases", [])]
         if any(wanted == candidate.lower() for candidate in names):
             return entry
-    raise KeyError(
-        f"GPU {name!r} not found in gpu/spec.json (matched against name ∪ aliases)"
-    )
+    raise KeyError(f"GPU {name!r} not found in gpu/spec.json (matched against name ∪ aliases)")
 
 
 _TFLOPS_FIELD = {

@@ -92,6 +92,11 @@ num_cached_key, mask)`. `mask` picks causal-triangle vs full-rectangle pair coun
 vision encoders / cross-attention are future constructors — the `label()` signature never
 changes.
 
+`attention_step_count` normally equals `len(attn)`. Analyzer inputs may collapse many
+GQA interactions into one geometry-preserving aggregate; the explicit count retains the
+original recurrent-state transactions required by linear-attention models without
+materializing every decode step.
+
 ## Two time floors
 
 `label(wl)` also decomposes the forward into `segments` — one kernel-like unit per

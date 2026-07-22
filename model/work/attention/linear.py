@@ -55,8 +55,12 @@ class GatedDeltaNet:
         # params = conv_dim*conv_kernel and flops = 2·T·conv_dim·conv_kernel both match a
         # groups=conv_dim depthwise Conv1d exactly.
         return [
-            MatmulGroup("in_proj_qkv", n=self.key_dim * 2 + self.value_dim, k=self.hidden,
-                        bucket="attn_proj"),
+            MatmulGroup(
+                "in_proj_qkv",
+                n=self.key_dim * 2 + self.value_dim,
+                k=self.hidden,
+                bucket="attn_proj",
+            ),
             MatmulGroup("in_proj_z", n=self.value_dim, k=self.hidden, bucket="attn_proj"),
             MatmulGroup("in_proj_b", n=self.num_v_heads, k=self.hidden, bucket="attn_proj"),
             MatmulGroup("in_proj_a", n=self.num_v_heads, k=self.hidden, bucket="attn_proj"),
@@ -81,9 +85,9 @@ class GatedDeltaNet:
         # The persistent recurrent state (HF caches it as `recurrent_states`, shape
         # [num_v_heads, head_k_dim, head_v_dim] per sequence, in mamba_ssm_dtype) is the
         # KV-cache analogue: read then written back each step -> factor 2. It scales with
-        # the number of sequences (one interaction per sequence in a causal_lm workload),
-        # NOT with context length -- this fixed-size state is exactly what keeps hybrid
-        # long-context memory flat while a real KV cache grows.
+        # the number of state transactions (one per original causal_lm interaction),
+        # NOT with context length. Analyzer workloads may collapse the geometry of
+        # many interactions, so `num_attention_steps` retains their original count.
         state_elems = self.num_v_heads * self.head_k_dim * self.head_v_dim
         state_per_sequence = state_elems * self.state_dtype_bytes
-        return 2.0 * len(wl.attn) * state_per_sequence
+        return 2.0 * wl.num_attention_steps * state_per_sequence

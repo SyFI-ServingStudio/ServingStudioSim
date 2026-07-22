@@ -55,13 +55,13 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run analyzer subjects over a run dir. With no subjects, runs all that are
-    /// applicable to the run's deployment.
+    /// applicable; selected optimality generates both batch modes by default.
     Run {
         /// Run directory (holds `raw/*.parquet`); outputs land in its `reports/`
         /// and `payloads/` subdirs.
         log_dir: PathBuf,
-        /// Hold every kernel at its observed batch size. Optimality then sets
-        /// R3=R2 and classifies R5 from each observed leaf's arithmetic intensity.
+        /// Recompute only the batch-locked optimality variant. Normal runs generate
+        /// both unlocked and locked optimality automatically.
         #[arg(long)]
         lock_batch_size: bool,
         /// Subject names to run (e.g. `slo`); empty = all applicable.
@@ -238,41 +238,43 @@ async fn run_subjects(
     // wall (now overlapping), and `total_elapsed_ms` is the concurrent wall.
     let run_start = Instant::now();
     let selected = registry::select(&subjects, deployment.as_deref(), scope);
+    let invocations = subject_invocations(&selected, scope, options);
+
     // A failed locked recomputation must not leave a previous variant looking
     // current beside a newly generated unlocked report. Primary subjects keep
     // their historical best-effort behavior; this cleanup is scoped to the new
     // derived variant whose coexistence would otherwise make staleness invisible.
-    if options.lock_batch_size {
-        for subject in selected
-            .iter()
-            .filter(|subject| subject.name == "optimality")
-        {
-            let (report_name, payload_name) = registry::artifact_names(subject, options);
-            for artifact_path in [
-                report_path(&log_dir, report_name),
-                payload_path(&log_dir, payload_name),
-            ] {
-                match std::fs::remove_file(&artifact_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
+    for (subject, invocation_options) in
+        invocations.iter().filter(|(subject, invocation_options)| {
+            subject.name == "optimality" && invocation_options.lock_batch_size
+        })
+    {
+        let (report_name, payload_name) = registry::artifact_names(subject, *invocation_options);
+        for artifact_path in [
+            report_path(&log_dir, report_name),
+            payload_path(&log_dir, payload_name),
+        ] {
+            match std::fs::remove_file(&artifact_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
     }
     let mut set = tokio::task::JoinSet::new();
-    for (idx, subject) in selected.iter().enumerate() {
+    for (idx, (subject, invocation_options)) in invocations.iter().enumerate() {
         let ctx = ctx.clone();
         let log_dir = log_dir.clone();
         let name = subject.name;
+        let invocation_options = *invocation_options;
         set.spawn(async move {
             let started = Instant::now();
-            let res = registry::run_subject(name, &ctx, &log_dir, options).await;
+            let res = registry::run_subject(name, &ctx, &log_dir, invocation_options).await;
             (idx, res, started.elapsed().as_secs_f64() * 1e3)
         });
     }
     let mut results: Vec<Option<(Result<(serde_json::Value, serde_json::Value)>, f64)>> =
-        (0..selected.len()).map(|_| None).collect();
+        (0..invocations.len()).map(|_| None).collect();
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok((idx, res, elapsed_ms)) => results[idx] = Some((res, elapsed_ms)),
@@ -281,14 +283,15 @@ async fn run_subjects(
     }
 
     let mut subject_runs = Vec::new();
-    for (idx, subject) in selected.iter().enumerate() {
+    for (idx, (subject, invocation_options)) in invocations.iter().enumerate() {
         let (res, elapsed_ms) = match results[idx].take() {
             Some(r) => r,
             None => continue, // task panicked (already logged)
         };
         let status = match res {
             Ok((report, payload)) => {
-                let (report_name, payload_name) = registry::artifact_names(subject, options);
+                let (report_name, payload_name) =
+                    registry::artifact_names(subject, *invocation_options);
                 write_json(&report_path(&log_dir, report_name), &report)?;
                 write_json(&payload_path(&log_dir, payload_name), &payload)?;
                 "ok"
@@ -298,9 +301,21 @@ async fn run_subjects(
                 "failed"
             }
         };
-        eprintln!("[analyze] {} {status} in {elapsed_ms:.1} ms", subject.name);
+        let variant = if invocation_options.lock_batch_size {
+            Some("batch_locked")
+        } else {
+            None
+        };
+        let variant_label = variant
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default();
+        eprintln!(
+            "[analyze] {}{variant_label} {status} in {elapsed_ms:.1} ms",
+            subject.name
+        );
         subject_runs.push(json!({
             "name": subject.name,
+            "variant": variant,
             "status": status,
             "elapsed_ms": elapsed_ms,
         }));
@@ -318,4 +333,70 @@ async fn run_subjects(
     });
     write_json(&report_path(&log_dir, "analyzer_timing.json"), &run_report)?;
     Ok(())
+}
+
+fn subject_invocations(
+    selected: &[&'static registry::Subject],
+    scope: registry::Scope,
+    options: registry::RunOptions,
+) -> Vec<(&'static registry::Subject, registry::RunOptions)> {
+    let mut invocations: Vec<_> = selected.iter().map(|subject| (*subject, options)).collect();
+    // A normal run is the complete UI publication unit. Whenever optimality is
+    // selected, generate its locked counterfactual beside the unlocked primary in
+    // this same invocation so artifact completeness and analyzer_timing cannot
+    // depend on launcher call order. `--lock-batch-size` remains the explicit
+    // low-level path for recomputing only that variant.
+    if scope == registry::Scope::Run && !options.lock_batch_size {
+        if let Some(optimality) = selected.iter().find(|subject| subject.name == "optimality") {
+            invocations.push((
+                *optimality,
+                registry::RunOptions {
+                    lock_batch_size: true,
+                },
+            ));
+        }
+    }
+    invocations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{registry, subject_invocations};
+
+    #[test]
+    fn normal_run_expands_optimality_to_both_batch_modes() {
+        let selected = registry::select(
+            &["optimality".into()],
+            Some("unified"),
+            registry::Scope::Run,
+        );
+        let invocations = subject_invocations(
+            &selected,
+            registry::Scope::Run,
+            registry::RunOptions::default(),
+        );
+
+        assert_eq!(invocations.len(), 2);
+        assert!(!invocations[0].1.lock_batch_size);
+        assert!(invocations[1].1.lock_batch_size);
+    }
+
+    #[test]
+    fn explicit_locked_run_does_not_add_unlocked_optimality() {
+        let selected = registry::select(
+            &["optimality".into()],
+            Some("unified"),
+            registry::Scope::Run,
+        );
+        let invocations = subject_invocations(
+            &selected,
+            registry::Scope::Run,
+            registry::RunOptions {
+                lock_batch_size: true,
+            },
+        );
+
+        assert_eq!(invocations.len(), 1);
+        assert!(invocations[0].1.lock_batch_size);
+    }
 }
