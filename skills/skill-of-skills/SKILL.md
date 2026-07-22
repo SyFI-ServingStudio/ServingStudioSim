@@ -62,6 +62,11 @@ top-align-with-framework - evaluate VibeSim↔framework alignment quality (kerne
 ├── impl-validate-kernel-cache - fix a wrong-shape kernel cost surfaced by Check 1
 └── top-add-kernel - add/repair a kernel whose backend the sim mismodels
 
+top-guide-real-implementation - guide a real serving implementation toward a simulation-grounded throughput target
+├── top-explore-models - establish exact checkpoint architecture and support requirements
+├── top-add-new-arch - add missing L1–L4, timing-predict, and deployment support before simulation
+└── operate-run-simulation - produce predicted throughput and analyzer-backed kernel breakdowns
+
 operate-run-simulation - run deployment simulations from presets (DES, workload trace)
 operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
 operate-run-alignment - run the phased measured VibeSim-to-vLLM alignment pipeline (profile, timing-predict, kernel-align, sim with auto-injected multiplier, e2e-align) and label folded kernel positions (evaluate the result via top-align-with-framework)
