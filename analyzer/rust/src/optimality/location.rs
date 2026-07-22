@@ -40,10 +40,11 @@ struct NecessaryWork {
     bytes: f64,
 }
 
-/// Add R6 and per-location necessary-work diagnostics to an exact iteration ladder.
+/// Add R6 and per-location necessary-work diagnostics to one worker ladder. The
+/// semantic label may describe an exact iteration or a saturated run aggregate.
 /// Any validation failure returns before mutation, preserving the plain R0..R5 view.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn attribute_iteration(
+pub(super) fn attribute_ladder(
     repo_root: &Path,
     log_dir: &Path,
     pool_tag: &str,
@@ -167,6 +168,9 @@ pub(super) fn attribute_iteration(
         kernel["necessary_work"] = detail;
     }
     ladder["rungs"]["segmented_necessary"] = json!(segmented_necessary_gpu_s);
+    ladder["rungs"]["hardware_necessary"] = json!(label.floors.necessary);
+    ladder["special_chunks"]["fusion"] =
+        json!((segmented_necessary_gpu_s - label.floors.necessary).max(0.0));
 
     Ok(LocationAttribution {
         mapping_id: location_map.mapping_id,

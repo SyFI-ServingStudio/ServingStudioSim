@@ -23,12 +23,21 @@ global necessary-work bounds below R5. The R5 green band then splits into
 exactly R5. Locked run-level analysis does not compute these bounds because its observed
 operating points are fixed and cannot be globally rebatchable.
 
-The payload also carries one per-worker kernel rung ladder. Its R0/R1 bars reuse
+The payload also carries per-worker kernel rung ladders. Its R0/R1 bars reuse
 the additive R2 kernel baseline and append two explicit aggregate chunks
 (`imbalance = R1-R2`, `idle = R0-R1`); R2..R5 carry each location's attributable
 value. The renderer keeps a kernel's color across all six bars and connects it
 with a ribbon, without pretending the two aggregate gaps have a per-kernel
-critical-path attribution.
+critical-path attribution. In unlocked mode each worker workload is saturated by
+scaling its compressed additive totals 10,000× and normalizing the label back. This
+is the efficient equivalent of summing saturated iterations once each semantic op's
+bound has stabilized. The analyzer maps the label to locations as R6 segmented
+necessary work and retains R7 globally fused work as an aggregate-only rung.
+
+The analyzer—not the UI—then adds complete worker ladders into explicit pool and
+cluster `aggregate_kernel_ladders`. It checks every scope before emission:
+`Σ_location R2..R6` must match the corresponding scope rung, and
+`R6 = R7 + fusion`. The UI only selects the requested scope and renders it.
 
 The UI service exposes two separate on-demand contracts for one selected
 `(pool_tag, worker_id, iter_id)`: a complete one-row waterfall and a per-kernel
@@ -68,7 +77,8 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   + `level_entry_json` + `rung_report_json` emit the level/report JSON.
 - `kernel.rs` — the kernel tier. Per-location bars (`kernel_levels_json`, single-leaf so
   only batching/communication/hw), the report's `worst_batching`, and the
-  per-worker kernel rung ladders (`worker_kernel_ladders_json`).
+  per-worker kernel rung ladders plus analyzer-owned pool/cluster rollups
+  (`worker_kernel_ladders_json`, `aggregate_kernel_ladders_json`).
 - `grid_peaks.rs` — the R3 ceiling. Enumerates unique `(kind, config)` from the
   manifests, asks the simulator for each config's fitted-grid peak rate in one
   batched `kernel-query peak` call (including maximum grid arithmetic intensity,
@@ -76,8 +86,9 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   `raw/kernel_grid_peaks.json`. Absent + un-generatable → R3 = R2 with a caveat.
 - `spec.rs` — the R5 hardware ceilings. Resolves the run's `gpu_name` to a `gpu/spec.json`
   entry by its explicit `aliases`, then dense peak TFLOP/s by dtype + HBM GB/s.
-- `floors.rs` — bridge to the independent `model.work` labeler. It computes
-  unlocked per-level bounds plus exact-iteration bounds for both modes; failure is
+- `floors.rs` — bridge to the independent `model.work` labeler. One batched call computes
+  unlocked per-level bounds, saturated worker semantic labels, and exact-iteration
+  bounds for both modes; failure is
   additive-only and degrades to the plain R5 ladder.
 - `location.rs` — strict exact-iteration semantic-location mapping. It validates
   complete coverage, computes per-location `max(FLOPs/TFLOPS, bytes/BW)`, and

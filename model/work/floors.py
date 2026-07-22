@@ -11,8 +11,10 @@ The Rust side already aggregates each level's workload (reusing the
                                 prefill_pairs, prefill_cached, decode_kv,
                                 prefill_requests}, ...}}
 
-where a level_key is ``cluster`` | ``<pool_tag>`` | ``<pool_tag>/<worker_id>``
-(exactly the `levels.rs` level keys). This
+where a public level_key is ``cluster`` | ``<pool_tag>`` | ``<pool_tag>/<worker_id>``
+(exactly the `levels.rs` level keys). The analyzer may include private
+``<pool_tag>/__saturated_worker__/<worker_id>`` rows in the same batched request;
+the first path component still selects the model spec. This
 script is the *model-aware* half: it never touches the cost_log / parquet. For
 each level it loads that pool's model, assembles ONE aggregate ``Workload`` (the
 whole run's tokens as a single mega-forward — weights counted once, the loosest

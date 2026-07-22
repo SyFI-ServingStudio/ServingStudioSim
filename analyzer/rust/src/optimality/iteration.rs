@@ -13,9 +13,10 @@ use crate::session::{build_session, register_cost_log, require_columns, COST_LOG
 
 use super::run::COST_COLS;
 use super::spec::{self, GpuSpec};
-use super::{floors, fold, grid_peaks, kernel, levels, location, prepare};
-
-const UNLOCKED_ITERATION_REPLICATION_FACTOR: u32 = 10_000;
+use super::{
+    floors, fold, grid_peaks, kernel, levels, location, prepare,
+    UNLOCKED_ITERATION_REPLICATION_FACTOR,
+};
 
 fn necessary_work_replication_factor(lock_batch_size: bool) -> u32 {
     if lock_batch_size {
@@ -74,7 +75,7 @@ pub(crate) async fn iteration_kernel_ladder(
     )
     .await
     {
-        Ok(label) => match location::attribute_iteration(
+        Ok(label) => match location::attribute_ladder(
             repo_root,
             log_dir,
             pool_tag,

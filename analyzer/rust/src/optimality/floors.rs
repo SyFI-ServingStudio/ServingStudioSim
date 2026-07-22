@@ -11,10 +11,13 @@
 //!   truly irreducible floor.
 //! - **segmented** — `Σ_seg max(compute, memory)`: per-op serial bound (≥ necessary).
 //!
-//! Run aggregates use one unlocked mega-batch. Exact iteration detail uses the
-//! observed workload directly in locked mode; unlocked mode replicates its independent
-//! batch entries before labeling and normalizes the result back to one iteration.
-//! Replication amortizes weights without changing sequence geometry. The labeler is a subprocess
+//! Run-level waterfalls use one unlocked mega-batch per level. The same batched
+//! request also carries one 10,000× saturated row per worker; those normalized
+//! semantic labels feed analyzer-owned worker → pool → cluster kernel ladders.
+//! Exact iteration detail uses the observed workload directly in locked mode;
+//! unlocked mode replicates its independent batch entries before labeling and
+//! normalizes the result back to one iteration. Replication amortizes weights without
+//! changing sequence geometry. The labeler is a subprocess
 //! (`uv run python -m model.work.floors`); any failure degrades gracefully to the
 //! plain R0..R5 ladder (the caller records a caveat).
 
@@ -51,6 +54,11 @@ pub(super) struct IterationLabel {
     pub(super) segments: Vec<SemanticWork>,
 }
 
+pub(super) struct RunLabels {
+    pub(super) floors: FloorsByLevel,
+    pub(super) saturated_workers: HashMap<(String, u16), IterationLabel>,
+}
+
 /// Per-level floors keyed exactly like `levels.rs`'s level `key`:
 /// `"cluster"` | `<pool_tag>` | `"<pool_tag>/<worker_id>"`.
 pub(super) type FloorsByLevel = HashMap<String, Floors>;
@@ -59,13 +67,40 @@ pub(super) type FloorsByLevel = HashMap<String, Floors>;
 /// floors per level. Errors (SQL, missing labeler, non-zero exit, bad JSON) propagate
 /// so the caller can turn them into a caveat + graceful degrade — they never abort the
 /// optimality subject.
-pub(super) async fn compute_floors(ctx: &SessionContext, log_dir: &Path) -> Result<FloorsByLevel> {
+pub(super) async fn compute_run_labels(
+    ctx: &SessionContext,
+    log_dir: &Path,
+    replication_factor: u32,
+) -> Result<RunLabels> {
+    if replication_factor == 0 {
+        return Err(anyhow!("worker replication factor must be positive"));
+    }
     let by_worker = collect_workload_by_worker(ctx).await?;
     if by_worker.is_empty() {
         return Err(anyhow!("no cost_log workload rows to aggregate"));
     }
-    let levels = rollup_levels(&by_worker);
-    run_labeler(log_dir, &levels)
+    let mut levels = rollup_levels(&by_worker);
+    let normalization = f64::from(replication_factor);
+    for ((pool_tag, worker_id), totals) in &by_worker {
+        let mut saturated_totals = totals.clone();
+        saturated_totals.scale(normalization);
+        levels.insert(saturated_worker_key(pool_tag, *worker_id), saturated_totals);
+    }
+    let response = run_labeler_json(log_dir, &levels)?;
+    let mut floors = parse_response(&response)?;
+    let mut saturated_workers = HashMap::new();
+    for (pool_tag, worker_id) in by_worker.keys() {
+        let key = saturated_worker_key(pool_tag, *worker_id);
+        floors.remove(&key);
+        saturated_workers.insert(
+            (pool_tag.clone(), *worker_id),
+            parse_label(&response, &key, normalization)?,
+        );
+    }
+    Ok(RunLabels {
+        floors,
+        saturated_workers,
+    })
 }
 
 /// Label one worker iteration after replicating its independent batch entries.
@@ -93,20 +128,30 @@ pub(super) async fn compute_iteration_label(
     let level_key = format!("{pool_tag}/{worker_id}");
     let levels = HashMap::from([(level_key.clone(), totals)]);
     let response = run_labeler_json(log_dir, &levels)?;
-    let mut floors = parse_response(&response)?
-        .remove(&level_key)
-        .context("labeler output missing exact iteration floor")?;
+    parse_label(&response, &level_key, normalization)
+}
+
+fn saturated_worker_key(pool_tag: &str, worker_id: u16) -> String {
+    // `model.work.floors` resolves the model spec from the first slash-delimited
+    // component, so this private key remains batchable with ordinary level keys.
+    format!("{pool_tag}/__saturated_worker__/{worker_id}")
+}
+
+fn parse_label(response: &Value, level_key: &str, normalization: f64) -> Result<IterationLabel> {
+    let mut floors = parse_response(response)?
+        .remove(level_key)
+        .context("labeler output missing semantic floor")?;
     floors.necessary /= normalization;
     floors.segmented /= normalization;
     let level = response
         .get("levels")
         .and_then(Value::as_object)
-        .and_then(|levels| levels.get(&level_key))
-        .context("labeler output missing exact iteration level")?;
+        .and_then(|levels| levels.get(level_key))
+        .context("labeler output missing semantic level")?;
     let segments = level
         .get("segments")
         .and_then(Value::as_array)
-        .context("labeler output missing exact iteration segments")?
+        .context("labeler output missing semantic segments")?
         .iter()
         .map(|segment| {
             Ok(SemanticWork {
@@ -147,10 +192,6 @@ fn rollup_levels(
             .add(totals);
     }
     levels
-}
-
-fn run_labeler(log_dir: &Path, levels: &HashMap<String, WorkloadTotals>) -> Result<FloorsByLevel> {
-    parse_response(&run_labeler_json(log_dir, levels)?)
 }
 
 fn run_labeler_json(log_dir: &Path, levels: &HashMap<String, WorkloadTotals>) -> Result<Value> {

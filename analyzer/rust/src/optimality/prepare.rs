@@ -23,6 +23,35 @@ pub(super) struct KernelLocation {
     pub(super) is_communication: bool,
 }
 
+/// Exact manifest location set for each worker. Run-level locations are interned
+/// globally for the fold, but semantic maps are architecture-local: validating one
+/// worker against the global union would incorrectly fail on heterogeneous pools.
+pub(super) fn kernel_locations_by_worker(
+    manifests_by_worker: &BTreeMap<(String, u16), ManifestDoc>,
+) -> BTreeMap<(String, u16), Vec<KernelLocation>> {
+    manifests_by_worker
+        .iter()
+        .map(|(worker_key, manifest_doc)| {
+            let mut location_index_by_name = HashMap::new();
+            let mut locations = Vec::new();
+            for manifest_section in &manifest_doc.sections {
+                for leaf in &manifest_section.manifest.slots {
+                    if location_index_by_name.contains_key(&leaf.name) {
+                        continue;
+                    }
+                    location_index_by_name.insert(leaf.name.clone(), locations.len());
+                    locations.push(KernelLocation {
+                        name: leaf.name.clone(),
+                        kind: leaf.kind.clone(),
+                        is_communication: is_communication_kind(&leaf.kind),
+                    });
+                }
+            }
+            (worker_key.clone(), locations)
+        })
+        .collect()
+}
+
 /// Per `(pool_tag, worker_id, section)` structural metadata, precomputed once so
 /// the hot row loop is array indexing: the mean-fold weight `α` per slot, the
 /// slot→location map, and each slot's rate ceilings.

@@ -154,7 +154,7 @@ rust/                The `analyze` binary (DataFusion compute side).
   src/batch/           Batch composition + per-location achieved kernel throughput.
   src/backend/         Backend selection over a kernel position's input feature space.
   src/breakdown/       CostTree replay + run-wide leaf-position composition.
-  src/optimality/      Sub-optimality waterfall (R0..R5 lower-bound ladder) in GPU·s;
+  src/optimality/      Sub-optimality waterfall (R0..R7 lower-bound ladder) in GPU·s;
                        grid_peaks.rs sidecar (sim `kernel-query peak`) + spec.rs hardware ceilings.
   src/kernel_query.rs  Shared transport to the sim `kernel-query` subcommand (grid/eval/peak).
   src/conservation/    Run-wide work-accounting checks (actual vs expected).
@@ -197,7 +197,7 @@ Current catalog:
 | `kernel-throughput` | batch | 1/50-sampled `cost_log` slots + matching CostTree manifests | achieved TFLOP/s (compute) and GB/s (memory BW) per cost-tree location / per-location `kernel_throughput_locations` stats |
 | `kernel-input-distribution` | backend | sampled `cost_log` `slot_input` + `slot_backend` + matching CostTree manifest `backends` lists | per-position selected-backend counts/ratios + PCA/feature projection / one scatter per position (`kernel_input_distribution_scatter`), rendered to `plots/kernel_input_dist/<position>.png`; unavailable on runs without per-slot backend + input logging |
 | `kernel-time-share` | breakdown | `cost_log` slot times + matching CostTree manifests | root kernel-time share by leaf position at overall / pool / worker levels; exact on small runs and bounded worker-stratified sampling on large runs |
-| `optimality` | optimality | `cost_log` (exact R0/R1 + 1/stride-sampled fold) + CostTree manifests + `run_meta` `gpu_ids` counts + `gpu/spec.json` hardware ceilings + `raw/kernel_grid_peaks.json` sidecar + unlocked-only `model.work` necessary-work labeler | sub-optimality waterfall in GPU·s — telescoping buckets at cluster / pool / worker / iteration / per-kernel levels, plus per-worker R0→R5 stacked-kernel ladders with aggregate idle/imbalance chunks; unlocked level bars may split R5 into global necessary-work bands / `optimality_waterfall` |
+| `optimality` | optimality | `cost_log` (exact R0/R1 + 1/stride-sampled fold) + CostTree manifests + `run_meta` `gpu_ids` counts + `gpu/spec.json` hardware ceilings + `raw/kernel_grid_peaks.json` sidecar + unlocked-only `model.work` necessary-work labeler | sub-optimality waterfall in GPU·s — telescoping buckets at cluster / pool / worker / iteration / per-kernel levels; analyzer-owned worker/pool/cluster kernel ladders extend R0→R5 with location-attributed segmented R6 and aggregate fused R7 when available / `optimality_waterfall` |
 | `concurrency` | concurrency | `request_slo.parquet` arrival + terminal timestamps | exact request count/peak/mean / <=512-bin time-weighted active-request series |
 | `request-state` | concurrency | `request_slo.parquet` stage-transition lists + `run_meta.json` stage vocab/worker roster | exact category/pending peaks and means / 200-bin cluster and request-owner-worker open-category stacks plus owner-pool aggregate/average/worker pending series; execution-only pools (AFD FFN) are omitted; unavailable when stage logging is off |
 | `workload-conservation` | conservation | `cost_log` actuals + `request_slo.parquet` per-request expected | run-wide prefill/decode/FFN/KV work accounting, pass/fail / `workload_conservation_checks` |

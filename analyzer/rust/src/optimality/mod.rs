@@ -16,6 +16,8 @@
 //! | R3 per-config best | work / grid-peak rate | **batching** (small-batch loss)|
 //! | R4 ignore network  | R3, comm leaves→0  | **communication**               |
 //! | R5 hardware limit  | active work unit / matching spec peak | **profiled↔hardware** |
+//! | R6 segmented necessary | Σ per-location semantic rooflines | **redundant work**    |
+//! | R7 hardware necessary | globally fused semantic roofline | **fusion**              |
 //!
 //! Buckets telescope and sum exactly back to Real, so the output is an additive
 //! stacked **waterfall** rendered at five levels (cluster / pool / worker /
@@ -26,9 +28,10 @@
 //! their current operating points must not be globally rebatchable. An exact
 //! iteration waterfall may append the two aggregate `model.work` floors in either
 //! mode: locked labels the exact batch, while unlocked labels 10,000 independent
-//! copies and normalizes back to one iteration. Its kernel ladder appends one mapped
-//! segmented-necessary R6 when a strict semantic-location map covers the manifest.
-//! Neither alters the run aggregate.
+//! copies and normalizes back to one iteration. Exact and run kernel ladders append
+//! mapped segmented R6 plus aggregate-only fused R7 when a strict semantic-location
+//! map covers the manifest. Run pool/cluster ladders are summed and reconciled by the
+//! analyzer rather than reconstructed by the UI.
 //!
 //! Cost model. `G_worker` is read from `run_meta` (`workers[].gpu_ids.len()`),
 //! never inferred from tp×dp×ep. R0/R1 are exact SQL sums over every row; R2..R5
@@ -50,7 +53,8 @@
 //!   `leaf_selected_throughput_ms`).
 //! - `levels.rs` — the worker / pool / cluster tiers: rung assembly + rollup +
 //!   level/report JSON.
-//! - `kernel.rs` — the kernel tier: per-location bars + the per-worker kernel ladders.
+//! - `kernel.rs` — the kernel tier: per-location bars, per-worker kernel ladders,
+//!   and analyzer-owned pool/cluster ladder rollups.
 //! - `grid_peaks.rs` — the R3 grid-peak ceiling sidecar.
 //! - `spec.rs` — the R5 GPU-spec compute/bandwidth ceilings.
 
@@ -142,6 +146,11 @@ pub(crate) const TARGET_SAMPLED_ITERS: u64 = 80;
 /// Top-N kernels drawn as individual bars at the kernel level; the rest fold into
 /// an `other` bar so the figure stays legible on a many-location deployment.
 pub(crate) const TOP_KERNELS: usize = 16;
+
+/// Large enough that one-time model weights no longer determine the replicated
+/// workload's bound, without materializing any requests (the labeler receives only
+/// scaled additive totals).
+pub(crate) const UNLOCKED_ITERATION_REPLICATION_FACTOR: u32 = 10_000;
 
 pub(crate) fn ms_to_s(ms: f64) -> f64 {
     ms / 1000.0
