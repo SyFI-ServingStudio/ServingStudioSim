@@ -3,7 +3,8 @@ name: top-compose-real-framework-from-sim
 description: >-
   Use by the orchestrator as the top entry point when VibeSim should actively
   build a real LLM-serving framework from scratch or optimize an existing one
-  from simulation evidence, using trusted correctness and benchmark utilities.
+  from simulation evidence, using trusted correctness and benchmark utilities
+  in a repeated Tick (simulation) / Tock (one measured code trial) loop.
 ---
 
 THIS SKILL IS MAINLY FOR ORCHESTRATOR
@@ -15,10 +16,6 @@ THIS SKILL IS MAINLY FOR ORCHESTRATOR
 Turn simulation into a real framework implementation. The user may give you an
 optimization goal. Explore the design space inside the simulator, then use its
 results to guide the real-world implementation.
-
-Advance the simulation and real framework in a tick-tock way: improve the
-simulated deployment first, then update the real framework to catch up. Return
-to the simulator afterward to explore whether it can do even better.
 
 The user may provide accuracy-checking and benchmark utilities. Do not modify
 them; treat them as trusted evaluation contracts.
@@ -34,6 +31,28 @@ being improved. Keep simulation predictions, measured framework results, and
 comparisons derived from named artifacts separate. Never fill an evidence gap
 with an estimate, and do not use `top-align-with-framework` or
 `operate-run-alignment` for this direction.
+
+## Governing loop — Tick, Tock, Tick again
+
+This workflow is a repeated tick-tock loop, not a one-pass linear plan:
+
+1. **Tick — VibeSim advances first.** Establish the grounded target, inspect the
+   full analyzer evidence, and choose one feasible, high-leverage improvement.
+2. **Tock — the real framework catches up.** Freeze that single trial, delegate
+   only its code, pass trusted correctness, benchmark it on the target GPU, and
+   retain or reject it from measured evidence.
+3. **Tick again — VibeSim searches ahead.** Use the measured outcome, rejected
+   hypothesis if applicable, and remaining headroom to select the next
+   simulation-backed opportunity.
+
+Every plan, progress log, and handoff must name the current Tick or Tock and the
+cycle number. Never compress multiple cycles into one numbered implementation
+plan. A Tock contains exactly one attributable code change, and the next
+framework change cannot begin until that Tock is measured, explained, decided,
+and followed by a new Tick.
+
+Repeat until the analyzer and measured results expose no further justified,
+feasible improvement, or until the user stops the loop.
 
 ## Operating model
 
@@ -77,7 +96,7 @@ convenient preset. Ask the user only when a missing choice materially changes
 the experiment. An empty target directory is a valid starting condition, not a
 missing input.
 
-### Step 2 — Establish the VibeSim target
+### Step 2 — Tick: establish and advance the VibeSim target
 
 Work directly through existing repo-local VibeSim skills when necessary:
 
@@ -103,7 +122,7 @@ When the simulator itself is wrong or incomplete, pause real-framework work,
 repair VibeSim through its owning top/orchestrator/impl skill, rerun the target,
 and only then resume.
 
-### Step 3 — Build or advance the real framework
+### Step 3 — Tock: build or advance the real framework
 
 After obtaining a simulated result, inspect `/framework/name`.
 
@@ -160,11 +179,17 @@ tested that proposal, and whether the explanation fits the measured result.
 Preserve the VibeSim target and every available real-framework baseline, and
 record the decision before starting another trial.
 
-## Step 4 — Explore more simulation possibilities
+A Tock is incomplete until the orchestrator has recorded the trusted accuracy,
+benchmark, and relevant profiler results; explained why the outcome does or
+does not support the proposal; and explicitly retained or rejected the change.
 
-After the real result is close enough to the simulation, or the remaining
-fundamental gap is explained, return to the simulator to explore more of the
-design space.
+## Step 4 — Tick again: explore more simulation possibilities
+
+After every completed Tock, return to the simulator before choosing another
+framework change. Feed the measured outcome and remaining headroom into the
+next search. A successful Tock raises the real baseline; a rejected Tock still
+constrains the next hypothesis. Do not skip this Tick merely because another
+implementation idea already looks promising.
 
 When several directions are viable, prefer the one with the best
 **effort-to-leverage ratio** — cheap to try and easy to attribute. The levels below
@@ -208,8 +233,8 @@ breakdown, optimality — not just the headline number. A candidate that improve
 headline but that the breakdown shows is infeasible (e.g. exceeds KV capacity) is not
 a valid pick.
 
-When the simulation finds another feasible improvement, return to Step 3 to
-advance the real framework with one new trial.
+When this Tick finds another feasible improvement, freeze only the
+highest-leverage candidate and return to Step 3 for the next Tock.
 
 ## Completion
 
