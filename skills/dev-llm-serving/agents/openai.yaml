@@ -1,0 +1,4 @@
+interface:
+  display_name: "Develop LLM Serving Systems"
+  short_description: "Implement and optimize real LLM serving engines"
+  default_prompt: "Use $dev-llm-serving to implement this bounded LLM-serving change with the relevant framework and backend references."

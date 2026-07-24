@@ -62,10 +62,13 @@ top-align-with-framework - evaluate VibeSim↔framework alignment quality (kerne
 ├── impl-validate-kernel-cache - fix a wrong-shape kernel cost surfaced by Check 1
 └── top-add-kernel - add/repair a kernel whose backend the sim mismodels
 
-top-guide-real-implementation - guide a real serving implementation toward a simulation-grounded throughput target
+top-compose-real-framework-from-sim - actively build a real serving framework from VibeSim evidence; the orchestrator owns the workflow and delegates only actual code writing
 ├── top-explore-models - establish exact checkpoint architecture and support requirements
-├── top-add-new-arch - add missing L1–L4, timing-predict, and deployment support before simulation
-└── operate-run-simulation - produce predicted throughput and analyzer-backed kernel breakdowns
+├── top-add-new-arch - add missing VibeSim L1–L4 support before selecting a real-code trial
+├── top-add-kernel - add missing measured kernel/backend support
+├── operate-run-simulation - produce the comparable serving-workload target and analyzer artifacts
+├── operate-run-timing-predict - compare exact fixed-shape building-block candidates
+└── dev-llm-serving - implement the frozen trial in the real framework using the routed serving reference library
 
 operate-run-simulation - run deployment simulations from presets (DES, workload trace)
 operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
@@ -79,6 +82,7 @@ dev-orchestrate-parallel-subagents - isolate concurrent writing subagents
 dev-run-tests - select and run VibeSim test tiers
 dev-file-design-review - review one file against docs and contracts
 dev-present-changes-for-review - organize a diff for human review
+dev-llm-serving - implement or review real LLM/multimodal serving framework code using the copied models/algorithms/backends/frameworks/hardware/engines/tooling reference library
 ```
 
 ## Updating The Tree
