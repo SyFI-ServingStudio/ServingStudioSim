@@ -2,8 +2,8 @@
 name: top-compose-real-framework-from-sim
 description: >-
   Use by the orchestrator as the top entry point when VibeSim should actively
-  build or optimize a real LLM-serving framework from simulation evidence, with
-  access to the target code and its trusted benchmark.
+  build a real LLM-serving framework from scratch or optimize an existing one
+  from simulation evidence, using trusted correctness and benchmark utilities.
 ---
 
 THIS SKILL IS MAINLY FOR ORCHESTRATOR
@@ -23,7 +23,11 @@ to the simulator afterward to explore whether it can do even better.
 The user may provide accuracy-checking and benchmark utilities. Do not modify
 them; treat them as trusted evaluation contracts.
 
-Implement framework code under `/framework/name`.
+Implement framework code under `/framework/name`. That directory may initially
+be empty: do not assume that a repository, runnable server, or baseline
+implementation already exists. When it is empty, compose the first
+implementation from VibeSim evidence and the trusted evaluation contracts. When
+it already contains a runnable implementation, improve it in place.
 
 VibeSim is the optimization reference; the real framework is the implementation
 being improved. Keep simulation predictions, measured framework results, and
@@ -58,7 +62,8 @@ collapse the role boundary by having the Orchestrator write the implementation.
 Make sure you are confident with the following:
 
 - model/checkpoint revision, dtype, quantization, and KV dtype;
-- target framework/repository revision and current dirty-tree state;
+- target path and whether it is empty or contains an existing implementation;
+- repository revision and dirty-tree state only when a repository exists;
 - GPU type/count/topology and TP/EP/CP/PP;
 - scheduler, batching, KV layout, and kernel/backend choices;
 - arrival process, request-rate or concurrency policy, input/output
@@ -66,10 +71,11 @@ Make sure you are confident with the following:
 - exact throughput, TTFT, TPOT, and correctness definitions;
 - trusted accuracy, benchmark, and profiler commands.
 
-Do not compare runs whose workloads or metric semantics differ. If the real
-framework already has a fixed benchmark, make the simulation reproduce it
-rather than choosing a convenient preset. Ask the user only when a missing
-choice materially changes the experiment.
+Do not compare runs whose workloads or metric semantics differ. Make the
+simulation reproduce the trusted benchmark contract rather than choosing a
+convenient preset. Ask the user only when a missing choice materially changes
+the experiment. An empty target directory is a valid starting condition, not a
+missing input.
 
 ### Step 2 — Establish the VibeSim target
 
@@ -97,16 +103,23 @@ When the simulator itself is wrong or incomplete, pause real-framework work,
 repair VibeSim through its owning top/orchestrator/impl skill, rerun the target,
 and only then resume.
 
-### Step 3 — Advance the real framework
+### Step 3 — Build or advance the real framework
 
-After obtaining a simulated result, improve the real framework to close the
-performance gap.
+After obtaining a simulated result, inspect `/framework/name`.
 
-Before changing code, run the trusted correctness check, benchmark, and
-profiler on the unchanged framework. Preserve the command, revision,
-configuration, raw output, completed/requested counts, throughput, TTFT/TPOT,
-and profiler provenance. Use both profiler evidence and simulator analyzer
-artifacts to reason about performance.
+- **Empty or non-runnable target** — select one coherent bootstrap trial that
+  creates a real, runnable implementation for the exact trusted correctness and
+  benchmark contracts. Do not request a pre-existing codebase, commit,
+  benchmark result, or profiler trace, and do not use stubs or
+  benchmark-specific shortcuts. The first correctness-passing, benchmarkable
+  implementation becomes the real-framework baseline.
+- **Existing runnable target** — before changing code, run the trusted
+  correctness check, benchmark, and profiler on the unchanged implementation.
+  Preserve the command, revision, configuration, raw output,
+  completed/requested counts, throughput, TTFT/TPOT, and profiler provenance.
+
+Use simulator analyzer artifacts for both cases. Use measured framework
+profiling to diagnose a performance gap only after a runnable baseline exists.
 
 Check GPU idleness before launching the benchmark and ensure that no other
 process is using the target GPU. Otherwise, the measured gap may be a scheduling
@@ -127,22 +140,25 @@ Consider the following aspects when aligning the performance:
   implementation-time techniques that raise the GPU **duty cycle**. These do **not**
   move the sim breakdown, so alignment is the only place they show up.
 
-Diagnose the gap in order: verify workload and batch-shape equivalence; match
-measured operations to CostTree slots; separate localized kernel/backend gaps
-from clock or thermal shifts; compare kernel-busy time with GPU-cycle time; then
-explain remaining scheduling, queueing, batching, memory, and framework
-overhead. Leave uncertain operation matches unresolved rather than forcing them.
+For an existing baseline, diagnose the gap in order: verify workload and
+batch-shape equivalence; match measured operations to CostTree slots; separate
+localized kernel/backend gaps from clock or thermal shifts; compare kernel-busy
+time with GPU-cycle time; then explain remaining scheduling, queueing, batching,
+memory, and framework overhead. Leave uncertain operation matches unresolved
+rather than forcing them.
 
-Select exactly one carefully scoped trial from this evidence. Freeze its
+Select exactly one carefully scoped trial: either the bootstrap trial for an
+empty target or one optimization trial for an existing baseline. Freeze its
 hypothesis, code scope, invariants, expected observable effect, and trusted
 validation commands. Delegate only that implementation work to the Implementer,
-using `dev-llm-serving` for relevant techniques and source maps. The
-Orchestrator must inspect the diff and run the trusted checks itself.
+using `dev-llm-serving` for relevant techniques and source maps. The Orchestrator
+must inspect the diff and run the trusted checks itself.
 
 Correctness is mandatory. Evaluate the trial not only by absolute speedup, but
 also by whether its proposal was technically sound, whether the implementation
 tested that proposal, and whether the explanation fits the measured result.
-Preserve both baselines and record the decision before starting another trial.
+Preserve the VibeSim target and every available real-framework baseline, and
+record the decision before starting another trial.
 
 ## Step 4 — Explore more simulation possibilities
 
@@ -199,7 +215,7 @@ advance the real framework with one new trial.
 
 Report:
 
-- the real comparison contract and baseline revision;
+- the real comparison contract and starting state (empty or existing revision);
 - VibeSim target and CostTree/analyzer provenance;
 - each frozen trial and implementation diff;
 - trusted correctness, benchmark, and profiler artifacts;
