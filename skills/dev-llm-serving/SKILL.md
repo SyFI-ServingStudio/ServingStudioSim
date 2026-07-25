@@ -29,6 +29,34 @@ a different optimization. Do not sweep parameters, substitute a favorite
 backend, call the simulator, or judge the measured result unless the parent
 explicitly assigns that work.
 
+### Implementation mode — what the code may be made of
+
+A parent workflow may also declare an **implementation mode**. It is not a style
+preference; it decides what this library is used *for*.
+
+- **Clean-room composition.** Follow [`OVERVIEW.md`](OVERVIEW.md)'s reading order
+  **(A) Build a serving engine from scratch** — *not* (B) Extend vLLM / SGLang /
+  TensorRT-LLM. In this mode the engine source maps under
+  [`references/engines/`](references/engines/) and any `$SERVE_REPOS` checkout are
+  **read-only architectural references**: learn the architecture and public API
+  behavior from them, but do not import, execute, link, vendor, copy, adapt, or
+  mechanically translate their source. Public primitive libraries (PyTorch,
+  Transformers weight loading, FlashInfer, FastAPI, Uvicorn) are allowed only as
+  declared in the brief's dependency list.
+  Before handing work back, run a source-hygiene self-check for the forbidden
+  forms: engine imports (`rg -n '^\s*(import|from)\s+(vllm|sglang|tensorrt_llm)'`),
+  `sys.path` injection pointing at an engine checkout, launching an engine as a
+  subprocess, linking its binaries, and vendored or line-by-line-translated source.
+- **Extend an existing framework** — reading order (B) applies; work inside that
+  framework.
+- **Assemble around an existing runtime** — only when the brief says so
+  explicitly.
+
+If the brief does not state a mode and the target has no runnable
+implementation, ask the parent rather than assuming an existing engine may serve
+as the runtime. The presence of a reference checkout is not authorization to
+depend on it.
+
 ## Baseline completeness checks (NVIDIA serving)
 
 Three techniques every production serving system on NVIDIA ships with — confirm all three are in place before pursuing workload-specific optimizations:
