@@ -108,18 +108,17 @@ it keeps every decision and every evidence-producing action.
 | Review the diff, run trusted gates, run source hygiene | Orchestrator |
 | Run the canonical benchmark (end of Tock) | Orchestrator |
 | Probe: attribute the outcome from artifacts and profiles | Orchestrator |
-| Probe: behavior-neutral diagnostic instrumentation | Orchestrator/Implementer |
+| Define a Probe's diagnostic question and required ranges | Orchestrator |
+| Write a Probe's behavior-neutral diagnostic instrumentation | Implementer |
 | Probe: retain / reject / inconclusive | Orchestrator |
 | Record progress periodically in Markdown files | Orchestrator |
 
 If no code-writing agent is available, stop and ask for one. Do not silently
 collapse the role boundary by having the Orchestrator write the implementation.
-
-**One explicit exception to that boundary:** the Orchestrator *may* write the
-Probe's diagnostic instrumentation itself — behavior-neutral, opt-in,
-default-off ranges in a separate diagnostic commit (contract in Step 4). This is
-not a general licence to write implementation code; anything that can change
-measured behavior still goes to the Implementer through a frozen brief.
+That boundary also applies to temporary Probe instrumentation: the Orchestrator
+defines the diagnostic question and stable ranges, delegates a bounded patch to
+the Implementer, then runs the evidence-producing capture, analyzes its
+artifacts, and decides. The Orchestrator never writes the patch itself.
 
 ## Concrete Steps
 
@@ -131,14 +130,20 @@ decides what may change, and in which direction.
 
 | Class | Fields | Rule |
 | --- | --- | --- |
-| **Exogenous — must match** | model/checkpoint revision; dtype, quantization, KV dtype; GPU type/count/topology; arrival process; request-rate or concurrency policy; input/output length distributions; warmup; duration; request cap; cutoff; SLO; throughput/TTFT/TPOT/correctness definitions; trusted accuracy, benchmark, and profiler commands | Identical on both sides. **Only a change in this class may update the comparison contract.** |
-| **Simulated target design** | scheduler; batching policy; KV allocation and layout; kernel and backend choices; parallelism (TP/EP/CP/PP); deployment topology | Chosen by VibeSim. The real implementation **chases** it. Never copied backward from the real engine. |
+| **Exogenous — must match** | every value fixed by the user, trusted evaluator/benchmark, or environment; commonly model/checkpoint revision, dtype, quantization, KV dtype, GPU type/count/topology, TP/PP/EP/CP, arrival process, request-rate or concurrency policy, input/output length distributions, warmup, duration, request cap, cutoff, SLO, and throughput/TTFT/TPOT/correctness definitions | Identical on both sides. Classification follows **who fixed the value**, not the field's intrinsic name. **Only a change in this class may update the comparison contract.** |
+| **Simulated target design** | only choices left unfixed for VibeSim to select; these may include scheduler, batching policy, KV allocation/layout, kernel/backend, parallelism, or deployment topology | Chosen by VibeSim. The real implementation **chases** it. Never copied backward from the real engine. A field is not a target-design field merely because it is usually tunable. |
 | **Current real-engine limitations** | active slot count; allocated KV memory; synchronization points; CUDA-graph coverage; current backend behavior; host/Python overhead | **Diagnostic gaps.** Never an experimental control, never copied into the simulation target. Fixed in reality or recorded as an open gap. |
 
 **Comparison table gate.** Before *every* sim/real comparison, write each field
 into one of the three columns above. A field that has not been classified does
 not enter the comparison. This gate is what catches a real-engine limitation
 being smuggled in as an experimental control.
+
+Trusted command semantics belong to the real evidence protocol, not to an
+imaginary simulation command parity rule. Exact profiler executable, capture
+mode, and flag parity applies between comparable **real baseline and real
+trial Probe captures**. VibeSim need not and cannot run the real profiler
+command.
 
 Do not compare runs whose workloads or metric semantics differ. Make the
 simulation reproduce the trusted benchmark contract **for the exogenous class
@@ -341,11 +346,14 @@ phase is unattributable no matter how good the NVTX coverage is.
 **4. Probe boundaries.** A Probe is diagnosis, not a performance trial:
 
 - only behavior-neutral, opt-in, default-off, exception-safe instrumentation;
+- the Orchestrator specifies the diagnostic question and stable ranges; the
+  Implementer alone writes the bounded instrumentation patch;
 - instrumentation lands in a **separate diagnostic commit**, never mixed with
   the trial commit;
 - a Probe **must not** introduce the next optimization;
-- the same workload, capture mode, and capture flags as the baseline —
-  a flag change invalidates the pair;
+- comparable real baseline/trial captures use the same workload, profiler
+  executable, capture mode, and capture flags — a change invalidates that real
+  capture pair, not a simulation/real comparison;
 - revert the instrumentation when the Probe ends, unless it is deliberately kept
   as dormant, default-off observability support.
 

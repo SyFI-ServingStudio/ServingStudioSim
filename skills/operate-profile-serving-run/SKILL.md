@@ -48,6 +48,17 @@ Then:
 
 - **Pin the GPU** — `CUDA_VISIBLE_DEVICES=<idx>` on both the server and any
   client, and record which physical index that was.
+- **Resolve the profiler executable** — do not assume `nsys` is on `PATH`, and
+  do not treat one machine's installation path as universal. Require an exact
+  `NSYS_BIN`, resolve it, verify that it is executable, and record its version:
+
+  ```bash
+  NSYS_BIN="${NSYS_BIN:?set NSYS_BIN to the exact Nsight Systems executable}"
+  NSYS_BIN="$(readlink -f -- "$NSYS_BIN")"
+  test -x "$NSYS_BIN"
+  "$NSYS_BIN" --version | tee <artifact_dir>/nsys-version.txt
+  ```
+
 - **Clean up before starting** — a previous run's server holding the port or KV
   pool changes the numbers. Check the port is free and no orphan worker
   survives (`ss -ltnp | grep <port>`; check for stale shared-memory segments if
@@ -68,12 +79,14 @@ Then:
 Provenance that is reconstructed after the fact is not provenance. Write it
 into the run's artifact directory as the run starts.
 
-## Step 2 — Capture parity
+## Step 2 — Comparable real-capture parity
 
-Two captures are comparable only if **everything except the code under test is
-identical**. Fix these once, then never vary them within a comparison:
+Two **real baseline/trial Probe captures** are comparable only if everything
+except the code under test is identical. This rule does not imply that a
+simulation has, or must reproduce, a profiler command. Fix these once, then
+never vary them within a real-capture comparison:
 
-- the same capture tool, capture mode, and **exact flag string**;
+- the same resolved `NSYS_BIN` version, capture mode, and **exact flag string**;
 - the same workload, request rate/concurrency, and seed policy;
 - the same warmup and the same measurement window;
 - the same instrumentation switch state (both on, or both off);
@@ -99,7 +112,7 @@ former reaches steady state, the latter measures the ramp.
 
 ```bash
 # Time-bounded: skip the first 60 s, capture 10 s of steady state.
-nsys profile \
+"$NSYS_BIN" profile \
   --trace=cuda,nvtx,osrt \
   --cuda-graph-trace=node \
   --delay=60 --duration=10 \
@@ -111,7 +124,7 @@ nsys profile \
 ```bash
 # Range-bounded: the engine itself declares the window. More precise than a
 # timer when the steady point is workload-dependent rather than clock-dependent.
-nsys profile \
+"$NSYS_BIN" profile \
   --trace=cuda,nvtx \
   --cuda-graph-trace=node \
   --capture-range=cudaProfilerApi \
@@ -119,6 +132,33 @@ nsys profile \
   -o <artifact_dir>/steady \
   <server command>
 ```
+
+### External-load lifecycle
+
+Profile only the server process tree. The load generator is an external sibling,
+not a child of `nsys`; otherwise client CPU/network activity pollutes the
+profiled process tree.
+
+Run the lifecycle in this order:
+
+1. create a run-local PID directory and install an exit trap;
+2. launch `"$NSYS_BIN" profile ... <server command>` in the background and
+   record the profiler PID (and a server PID from a small `exec` wrapper when
+   the launcher does not preserve it);
+3. poll both `/health` and `/v1/models` until the server is genuinely ready, or
+   fail if the profiled process exits;
+4. run the fixed warmup client outside the capture window;
+5. launch the identical bounded client workload that spans the delayed/range
+   capture, recording its PID separately;
+6. wait for the client and capture to finish, then send TERM and finally KILL
+   only to still-live PIDs recorded by this workflow, in reverse launch order.
+
+Never use a blanket `pkill`/`killall`, never attach `nsys` to the external
+client, and never reuse an unverified server left from another run. Preserve
+the server command, client command, readiness result, warmup boundary, capture
+window, and owned PID list in provenance. The client result from this profiled
+run is diagnostic only; capture overhead means its throughput is not the
+canonical score.
 
 Keep the trace small enough to actually read. A multi-minute full-server trace
 is unreadable and slow to export; seconds of steady state answer the question.
@@ -190,6 +230,13 @@ under these rules:
 - **Reverted when the Probe ends**, unless deliberately kept as dormant
   observability support — and if kept, it stays default-off.
 
+The Orchestrator defines the diagnostic question and range set, then gives the
+Implementer a bounded instrumentation brief. Only the Implementer writes the
+patch. To compare baseline and trial, apply the **identical diagnostic
+instrumentation patch** to both revisions and enable it in both captures.
+Instrumentation present in only one revision, or enabled in only one capture,
+invalidates the pair.
+
 **CUDA-graph caveat.** A host-side range around a graph *replay* measures the
 launch, not the replayed GPU work; ranges captured *inside* a graph are baked in
 at capture time and do not re-emit per replay. Read graph work from the CUDA
@@ -202,104 +249,82 @@ fails in a distinct way and a merged range cannot separate them.
 
 | Range | Covers | The question it answers |
 |:------|:-------|:------------------------|
-| `engine_iteration` | one scheduler step end-to-end | what is the real per-iteration wall, and how much of it is not kernels |
-| `scheduling` | admission, batch composition, preemption | is batch formation on the critical path |
-| `input_preparation` | token/position/slot-mapping tensor build, H2D | is per-step tensor construction host-bound |
-| `attention_planning` | backend plan/metadata build (e.g. FlashInfer plan) | does planning cost scale with batch and dominate at low batch |
-| `graph_preparation` | shape bucketing, buffer copy-in before replay | is graph dispatch overhead eating the graph's win |
-| `graph_replay` | the replay launch itself | is the graph actually being used on this path |
-| `sampling_and_d2h` | logits post-processing + the device→host token transfer | is there a blocking sync per step |
-| `token_acceptance` | accept/bookkeeping after sampling (incl. speculative) | is acceptance bookkeeping serialized against the next step |
-| `cleanup` | finished-request teardown, KV block release | does teardown spike with completion bursts |
-| `detokenization` | token ids → text | is detokenization on the critical path or offloaded |
-| `streaming` | response emit / network write | is client I/O back-pressuring the engine |
+| `<prefix>.engine.iteration` | one scheduler step end-to-end | what is the real per-iteration wall, and how much of it is not kernels |
+| `<prefix>.engine.scheduling` | admission, batch composition, preemption | is batch formation on the critical path |
+| `<prefix>.engine.input_preparation` | token/position/slot-mapping tensor build, H2D | is per-step tensor construction host-bound |
+| `<prefix>.attention.planning` | backend plan/metadata build (e.g. FlashInfer plan) | does planning cost scale with batch and dominate at low batch |
+| `<prefix>.graph.preparation` | shape bucketing, buffer copy-in before replay | is graph dispatch overhead eating the graph's win |
+| `<prefix>.graph.replay` | the replay launch itself | is the graph actually being used on this path |
+| `<prefix>.sampling.d2h` | logits post-processing + the device→host token transfer | is there a blocking sync per step |
+| `<prefix>.token.acceptance` | accept/bookkeeping after sampling (incl. speculative) | is acceptance bookkeeping serialized against the next step |
+| `<prefix>.request.cleanup` | finished-request teardown, KV block release | does teardown spike with completion bursts |
+| `<prefix>.api.detokenization` | token ids → text | is detokenization on the critical path or offloaded |
+| `<prefix>.api.streaming` | response emit / network write | is client I/O back-pressuring the engine |
 
-Name ranges with a stable identifier (e.g. the step index) so a range can be
-followed across iterations rather than only aggregated.
+Range names must be stable, low-cardinality, and prefixed for machine filtering
+(for example `vibeserve.decode.model_submission`). Never embed a step, request,
+sequence, or token ID in the name. If one iteration must be followed
+individually, carry its identifier in an NVTX payload/category or emit a
+separate marker; keep the enclosing range label fixed so occurrence aggregation
+remains bounded and comparable.
 
 ## Step 5 — Export and aggregate
 
 Read exported numbers, not screenshots.
 
 ```bash
-nsys stats <artifact_dir>/steady.nsys-rep            # quick per-kernel / per-API summary
-nsys export --type sqlite \
+"$NSYS_BIN" stats <artifact_dir>/steady.nsys-rep
+"$NSYS_BIN" export --type sqlite \
   --output <artifact_dir>/steady.sqlite \
   <artifact_dir>/steady.nsys-rep
+uv run python skills/operate-profile-serving-run/scripts/aggregate_nsys.py \
+  <artifact_dir>/steady.sqlite \
+  --range-prefix '<prefix>.' \
+  > <artifact_dir>/steady-ranges.json
 ```
 
-**Check the schema first — table and column names vary across nsys versions:**
+`aggregate_nsys.py` uses only the Python standard library and opens the input
+SQLite with `mode=ro`. It creates no tables or indexes and never modifies the
+evidence artifact. It introspects the required tables and columns before
+reading data; a schema mismatch is a hard error, not a partially populated
+report.
 
-```bash
-sqlite3 <artifact_dir>/steady.sqlite ".tables"
-sqlite3 <artifact_dir>/steady.sqlite ".schema NVTX_EVENTS"
-sqlite3 <artifact_dir>/steady.sqlite ".schema CUPTI_ACTIVITY_KIND_KERNEL"
-```
+The script deliberately does not assume
+`CUPTI_ACTIVITY_KIND_RUNTIME.globalPid` exists. It:
 
-The correlation has two joins, and they are different in kind:
+1. maps each range's `globalTid` into a process namespace from `PROCESSES`
+   (including the workspace export's Python-main-thread identity
+   `globalPid + pid`);
+2. finds runtime calls whose launch start is inside the range on that same
+   `globalTid`;
+3. matches kernels by the process-qualified key
+   `(resolved globalPid, correlationId)`, so equal correlation IDs from
+   different workers cannot cross-join.
 
-1. **NVTX range → CUDA API call**: by *time containment* on the same thread
-   (`globalTid`), because an NVTX range is a host-side interval.
-2. **CUDA API call → GPU kernel**: by `correlationId` **scoped to `globalPid`**,
-   because that is the launch↔execution identity CUPTI records and it is only
-   unique within a process. Omitting `globalPid` cross-joins workers in any
-   multi-process (TP/EP) capture.
+CUDA-owning ranges on mapped non-main threads are listed explicitly in
+`thread_diagnostics`; unmapped or ambiguous threads are also listed, with
+runtime calls counted but kernels intentionally left unattributed. Never
+replace an unmapped thread with a guessed process.
 
-Under node-level graph tracing, replayed graph kernels carry their own
-`correlationId` and join through this same path — which is exactly why Step 3
-insists on it.
+The JSON aggregates each fixed range label by occurrence and reports:
 
-Chaining both gives GPU time attributed to a named engine phase:
+- occurrence, runtime-call, and kernel counts;
+- summed host wall time;
+- summed kernel work (individual kernel durations may overlap);
+- GPU-busy time from the **union of kernel intervals clipped to each occurrence
+  before aggregation**;
+- nonnegative uncovered host time and GPU-busy fraction.
 
-```sql
--- GPU kernel time and launch count attributed to each NVTX range name.
-WITH ranges AS (
-  SELECT COALESCE(e.text, s.value) AS range_name, e.start, e.end, e.globalTid
-  FROM NVTX_EVENTS e
-  LEFT JOIN StringIds s ON s.id = e.textId
-  WHERE e.end IS NOT NULL
-)
-SELECT r.range_name,
-       COUNT(*)                                   AS kernel_launches,
-       SUM(k.end - k.start) / 1e6                 AS gpu_ms,
-       SUM(r.end - r.start) / 1e6                 AS host_range_ms
-FROM ranges r
-JOIN CUPTI_ACTIVITY_KIND_RUNTIME api
-  ON api.start >= r.start AND api.end <= r.end
- AND api.globalTid = r.globalTid
-JOIN CUPTI_ACTIVITY_KIND_KERNEL k
-  ON k.correlationId = api.correlationId
- AND k.globalPid    = api.globalPid      -- correlationId is per-process
-GROUP BY r.range_name
-ORDER BY gpu_ms DESC;
-```
-
-The CUPTI tables are exported **without indexes**, so this join degrades into
-repeated full scans on a real trace. Adding B-tree indexes to the SQLite file is
-safe — it is a rebuildable derivative of the immutable `.nsys-rep`, and indexes
-change neither the rows nor the attribution:
-
-```sql
-CREATE INDEX IF NOT EXISTS ix_rt  ON CUPTI_ACTIVITY_KIND_RUNTIME(globalTid, start);
-CREATE INDEX IF NOT EXISTS ix_krn ON CUPTI_ACTIVITY_KIND_KERNEL(globalPid, correlationId, start);
-```
-
-Two derived numbers carry most of the diagnosis:
-
-- **`host_range_ms − gpu_ms` per range** — the host-side cost the GPU did not
-  absorb. This is the launch-overhead / sync / Python cost, localized to a named
-  phase instead of an anonymous gap.
-- **GPU busy fraction inside `engine_iteration`** — `gpu_ms / host_range_ms`.
-  Low means the iteration is not kernel-bound, and the ranking of the other
-  ranges says which phase to attack.
+Because busy intervals are clipped and unioned per occurrence,
+`gpu_busy_fraction` cannot exceed 1.0. `kernel_work_ns` can exceed host wall
+time when kernels overlap or extend past the host range. NVTX labels may be
+nested, so never sum metrics across parent/child levels; compare one stable
+level at a time.
 
 For blocking synchronization specifically, aggregate the sync APIs by enclosing
 range (`cudaStreamSynchronize` / `cudaMemcpyAsync`-then-sync / `cudaEventSynchronize`
-in `CUPTI_ACTIVITY_KIND_RUNTIME` joined to `StringIds`), rather than inferring a
-sync from gap shape.
-
-Nested ranges double-count if summed naively — either aggregate one nesting
-level at a time, or subtract child ranges from their parent before comparing.
+in `CUPTI_ACTIVITY_KIND_RUNTIME` joined to `StringIds`) in a separate read-only
+analysis, rather than inferring a sync from gap shape.
 
 ## Step 6 — Report
 
@@ -311,8 +336,9 @@ vocabulary.
 
 A report is one primary class plus:
 
-1. the evidence rows that establish it (range name, `gpu_ms`, `host_range_ms`,
-   counts) — numbers, not impressions;
+1. the evidence rows that establish it (range label, `gpu_busy_time_ns`,
+   `host_wall_time_ns`, `uncovered_host_time_ns`, and counts) — numbers, not
+   impressions;
 2. the artifact paths and the provenance block from Step 1;
 3. what remains unattributed, stated explicitly. Unattributed host time is a
    real finding; silently dropping it makes a partial picture look complete.
@@ -323,13 +349,15 @@ Any of these means the two captures are not comparable — fix and re-measure,
 do not reason across the difference:
 
 - different capture flags, capture mode, or trace set;
+- different resolved profiler executable/version;
 - one capture at `--cuda-graph-trace=node` and the other at graph level — the
   two do not even contain the same rows;
 - one run with CUDA graphs enabled and the other eager — different kernel sets,
   not a faster or slower version of the same set;
 - different measurement window or warmup;
 - a foreign process on the target GPU in either run;
-- instrumentation on in one run and off in the other;
+- different diagnostic instrumentation patches, or instrumentation on in one
+  run and off in the other;
 - a profiled run's throughput quoted against an unprofiled run's throughput;
 - a different GPU, different clock policy, or a thermally throttled capture.
 
