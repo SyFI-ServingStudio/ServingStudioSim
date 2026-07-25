@@ -170,6 +170,15 @@ pub const SUBJECTS: &[Subject] = &[
         scope: Scope::Run,
     },
     Subject {
+        name: "slo-goodput",
+        category: Category::Request,
+        description: "Trusted-cutoff output goodput over every arrived request: partial tokens count, arithmetic-mean TPOT must be strictly below 30 ms.",
+        report_name: "slo_goodput_report.json",
+        payload_name: "slo_goodput_cdf.json",
+        applies: Applies::All,
+        scope: Scope::Run,
+    },
+    Subject {
         name: "throughput",
         category: Category::Throughput,
         description: "Per-GPU prefill / decode / total tokens-per-second, per time segment.",
@@ -363,6 +372,7 @@ pub async fn run_subject(
     match name {
         "slo-general" => request::slo::run_slo_general(ctx, dir).await,
         "slo-detailed" => request::slo::run_slo_detailed(ctx, dir).await,
+        "slo-goodput" => request::slo_goodput::run_slo_goodput(ctx, dir).await,
         "throughput" => throughput::segment::run_throughput(ctx, dir).await,
         "utilization" => utilization::series::run_utilization(ctx, dir).await,
         "batch" => batch::composition::run_batch(ctx, dir).await,

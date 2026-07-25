@@ -122,7 +122,10 @@ mode labels 10,000 independent copies of its batch entries and normalizes back t
 iteration, amortizing weights without changing sequence length. When a strict
 versioned semantic-location map covers the manifest, either mode's kernel ladder
 also appends R6 and per-location necessary/redundant/under-accounted work; otherwise
-it remains R0-R5. The detail meta records the mode and replication factor.
+it remains R0-R5. Run-level output uses the same distinction: locked analysis adds
+per-iteration R6/R7 through worker, pool, and cluster; unlocked analysis composes
+additive work under its saturated-batch policy. The detail meta records the mode and
+replication factor.
 The alignment path reads `<analysis_log_dir>/alignment_manifest.json`, which
 points to normalized NSYS JSON in the profile root, timing-predict cost
 parquet/manifest, the profile's `replay_result` TraceLab JSONL, its optional
@@ -191,13 +194,14 @@ Current catalog:
 |---|---|---|---|
 | `slo-general` | request | `request_slo.parquet` scalar columns | TTFT/TPOT/E2E stats / per-metric CDF series |
 | `slo-detailed` | request | `request_slo.parquet` `output_token_times` column | ITL stats / CDF series when per-token logging is enabled |
+| `slo-goodput` | request | `request_slo.parquet` completed/output-token/TPOT scalar columns + `params.json` configured duration/rate | hard-cutoff all-request accounting, strict arithmetic-mean TPOT pass, and fixed-window output goodput / TPOT CDF series |
 | `throughput` | throughput | `request_state.parquet` (+ `run_meta.json`) | per-GPU prefill/decode/total TPS totals / fine `segments` + coarse `binned_segments` series |
 | `utilization` | utilization | `cost_log` slot times (+ `run_meta.json`) | per-worker GPU compute utilization plus per-pool averages over time / `utilization_series` |
 | `batch` | batch | `request_state.parquet` | per-batch composition (batch / prefill / decode token counts) over time + stats / `batch_scatter` series |
 | `kernel-throughput` | batch | 1/50-sampled `cost_log` slots + matching CostTree manifests | achieved TFLOP/s (compute) and GB/s (memory BW) per cost-tree location / per-location `kernel_throughput_locations` stats |
 | `kernel-input-distribution` | backend | sampled `cost_log` `slot_input` + `slot_backend` + matching CostTree manifest `backends` lists | per-position selected-backend counts/ratios + PCA/feature projection / one scatter per position (`kernel_input_distribution_scatter`), rendered to `plots/kernel_input_dist/<position>.png`; unavailable on runs without per-slot backend + input logging |
 | `kernel-time-share` | breakdown | `cost_log` slot times + matching CostTree manifests | root kernel-time share by leaf position at overall / pool / worker levels; exact on small runs and bounded worker-stratified sampling on large runs |
-| `optimality` | optimality | `cost_log` (exact R0/R1 + 1/stride-sampled fold) + CostTree manifests + `run_meta` `gpu_ids` counts + `gpu/spec.json` hardware ceilings + `raw/kernel_grid_peaks.json` sidecar + unlocked-only `model.work` necessary-work labeler | sub-optimality waterfall in GPU·s — telescoping buckets at cluster / pool / worker / iteration / per-kernel levels; analyzer-owned worker/pool/cluster kernel ladders extend R0→R5 with location-attributed segmented R6 and scope-fused R7 recomputed from additive work / `optimality_waterfall` |
+| `optimality` | optimality | `cost_log` (exact R0/R1 + 1/stride-sampled fold) + CostTree manifests + `run_meta` `gpu_ids` counts + `gpu/spec.json` hardware ceilings + `raw/kernel_grid_peaks.json` sidecar + `model.work` necessary-work labeler | sub-optimality waterfall in GPU·s — telescoping buckets at cluster / pool / worker / iteration / per-kernel levels; analyzer-owned worker/pool/cluster kernel ladders extend R0→R5 with location-attributed segmented R6 and scope-fused R7, using saturated-work recomputation when unlocked and fixed-iteration addition when locked / `optimality_waterfall` |
 | `concurrency` | concurrency | `request_slo.parquet` arrival + terminal timestamps | exact request count/peak/mean / <=512-bin time-weighted active-request series |
 | `request-state` | concurrency | `request_slo.parquet` stage-transition lists + `run_meta.json` stage vocab/worker roster | exact category/pending peaks and means / 200-bin cluster and request-owner-worker open-category stacks plus owner-pool aggregate/average/worker pending series; execution-only pools (AFD FFN) are omitted; unavailable when stage logging is off |
 | `workload-conservation` | conservation | `cost_log` actuals + `request_slo.parquet` per-request expected | run-wide prefill/decode/FFN/KV work accounting, pass/fail / `workload_conservation_checks` |

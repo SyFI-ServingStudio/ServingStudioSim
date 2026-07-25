@@ -28,11 +28,12 @@ from request import slo_plot
 from throughput import segment_plot
 from utilization import util_plot
 
-# Keys match the analyzer subjects (registry.rs). Both SLO subjects share one
-# renderer, bound to their respective payload file.
+# Keys match the analyzer subjects (registry.rs). The SLO subjects share one
+# renderer, bound to their respective payload files.
 RENDERERS = {
     "slo-general": partial(slo_plot.render, payload_name="slo_general_cdf.json"),
     "slo-detailed": partial(slo_plot.render, payload_name="slo_detailed_cdf.json"),
+    "slo-goodput": partial(slo_plot.render, payload_name="slo_goodput_cdf.json"),
     "throughput": segment_plot.render,
     "utilization": util_plot.render,
     "batch": scatter_plot.render,
