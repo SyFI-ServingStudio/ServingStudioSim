@@ -62,12 +62,13 @@ top-align-with-framework - evaluate VibeSim↔framework alignment quality (kerne
 ├── impl-validate-kernel-cache - fix a wrong-shape kernel cost surfaced by Check 1
 └── top-add-kernel - add/repair a kernel whose backend the sim mismodels
 
-top-compose-real-framework-from-sim - actively build a real serving framework from VibeSim evidence; the orchestrator owns the workflow and delegates only actual code writing
+top-compose-real-framework-from-sim - actively build a real serving framework from VibeSim evidence in a Tick (sim) / Tock (one measured trial) / Probe (attribute and decide) loop; the orchestrator owns the workflow and delegates only actual code writing
 ├── top-explore-models - establish exact checkpoint architecture and support requirements
 ├── top-add-new-arch - add missing VibeSim L1–L4 support before selecting a real-code trial
 ├── top-add-kernel - add missing measured kernel/backend support
 ├── operate-run-simulation - produce the comparable serving-workload target and analyzer artifacts
 ├── operate-run-timing-predict - compare exact fixed-shape building-block candidates
+├── operate-profile-serving-run - capture and attribute a real serving profile (the Probe step)
 └── dev-llm-serving - implement the frozen trial in the real framework using the routed serving reference library
 
 operate-run-simulation - run deployment simulations from presets (DES, workload trace)
@@ -75,6 +76,7 @@ operate-run-timing-predict - offline per-building-block cost prediction (no DES;
 operate-run-alignment - run the phased measured VibeSim-to-vLLM alignment pipeline (profile, timing-predict, kernel-align, sim with auto-injected multiplier, e2e-align) and label folded kernel positions (evaluate the result via top-align-with-framework)
 operate-gpu-spec - query or update the GPU spec catalog
 operate-profile-sim-speed - profile simulator wallclock speed
+operate-profile-serving-run - capture a comparable bounded profile of a real serving process and attribute its wall time to named engine phases (NVTX readiness + instrumentation contract, node-level CUDA-graph tracing, nsys SQLite aggregation)
 operate-profile-existing-kernel - query or fill registered profiler rows
 
 dev-create-worktree - create an VibeSim development worktree

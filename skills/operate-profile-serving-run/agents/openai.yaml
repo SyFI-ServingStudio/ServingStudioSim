@@ -1,0 +1,4 @@
+interface:
+  display_name: "Profile a Real Serving Run"
+  short_description: "Capture and attribute a real serving process profile"
+  default_prompt: "Use $operate-profile-serving-run to capture a comparable, bounded profile of the real serving process and attribute its wall time to named engine phases."

@@ -324,6 +324,7 @@ Prefer machine-readable exports (`nsys stats`, SQLite) over screenshots:
 
 ## See also
 
+- `operate-profile-serving-run` (repo skill) — profiling a serving engine **you wrote**. Rule 3 above says to annotate with NVTX; that skill makes it a precondition: when a custom serving loop's trace shows only kernels and unnamed host gaps, adding opt-in default-off instrumentation comes *before* picking a CPU/launch-overhead fix, because an anonymous gap is equally compatible with scheduling, input prep, attention planning, a hidden sync, and Python overhead. Also covers capture-flag parity between baseline and trial, and the `nsys export --type sqlite` joins that attribute GPU time to a named range.
 - [`tooling/serving-benchmark/`](serving-benchmark.md) — benchmark is the *input* to the profiler; get benchmark hygiene right first
 - [`algorithms/async-scheduling/`](../algorithms/async-scheduling.md) — common fix when nsys says `cpu_launch_bound` / `python_overhead_bound`
 - [`backends/cuda-graph/`](../backends/cuda-graph.md) — common fix when nsys shows gaps between kernels

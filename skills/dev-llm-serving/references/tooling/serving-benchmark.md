@@ -15,6 +15,8 @@ A correct serving benchmark measures steady-state latency percentiles under a re
 
 Report percentiles (p50, p95, p99), not means. Means hide tail behavior that matters for SLOs.
 
+**Exception — a trusted evaluator's score semantics win.** When the task is graded by an evaluator you do not control and it defines the metric (e.g. arithmetic-mean TPOT), that definition is the acceptance number. Percentiles stay valuable as supplementary diagnosis — report both — but never substitute them for the trusted score.
+
 ## Open-loop vs closed-loop
 
 **Closed-loop**: each client has a fixed concurrency (e.g., 32 workers sending one request at a time, waiting for response, sending next). Equivalent to Little's Law: throughput × avg_latency = concurrency. Results:
