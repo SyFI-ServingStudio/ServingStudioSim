@@ -98,6 +98,12 @@ fn default_kv_log_stride() -> u32 {
     8
 }
 
+/// Stage timelines are part of the normal request-level diagnostics. Keep the
+/// serde fallback aligned with the launcher's emitted default.
+fn default_log_stage_transitions() -> bool {
+    true
+}
+
 /// Run-global output location + logging controls.
 #[derive(Debug, Clone, Deserialize, ParamStruct)]
 #[serde(deny_unknown_fields)]
@@ -124,13 +130,13 @@ pub struct IoSpec {
     /// Record + persist the per-request stage/location transition timeline on
     /// each `request_slo` row (the stage list columns): every time a request
     /// moves between queues/workers, one `(time, code, pool_id, worker_id)`
-    /// event is appended. OFF by default — like `log_output_token_times`, the
-    /// timeline `Vec` is only allocated/appended when this is on. Codes decode
+    /// event is appended. ON by default; disable it explicitly when the timeline
+    /// allocation/append cost is not wanted. Codes decode
     /// to `"category:detail"` names via the per-deployment table in `run_meta.json`.
-    /// Genuinely omittable (absent = false), so it carries `serde`/`param`
+    /// Genuinely omittable (absent = true), so it carries `serde`/`param`
     /// defaults rather than the required-field treatment.
-    #[serde(default)]
-    #[param(default = false)]
+    #[serde(default = "default_log_stage_transitions")]
+    #[param(default = true)]
     pub log_stage_transitions: bool,
     /// The per-worker `KvSampler` emits one `kv_snapshot` occupancy row every
     /// `kv_log_stride` per-iteration submits (running-max throttle). Genuinely
@@ -287,6 +293,7 @@ pools:
             IterWorkerSel::Barebone { attn_gpu_memory_gb, .. } if attn_gpu_memory_gb == 80.0
         ));
         assert_eq!(cfg.io().log_level, LogLevel::Info);
+        assert!(cfg.io().log_stage_transitions);
         assert_eq!(cfg.workload().request_rate, 10.0);
     }
 

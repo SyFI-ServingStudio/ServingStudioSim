@@ -431,7 +431,7 @@ impl Default for WorkerConfig {
             balance: LoadBalance::Single,
             attn_kv_bytes: 80_000_000_000, // 80 GB
             log_output_token_times: false,
-            log_stage_transitions: false,
+            log_stage_transitions: true,
             kv_log_stride: 8,
             gpu_time_multiplier: 1.0,
             max_batch_tokens: None,
