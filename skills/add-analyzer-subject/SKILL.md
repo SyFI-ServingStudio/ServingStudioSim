@@ -181,8 +181,14 @@ Write these down before touching code:
 2. `analyze run logs/unified_smoke <name>` → report + payload; cross-check a total
    against an independent duckdb one-liner (`uv run --with duckdb python -c ...`).
 3. `uv run python analyzer/python render logs/unified_smoke <name>` → PNG; eyeball it.
-4. Larger run (`logs/unified_aime`) sanity + cross-check, and confirm the subject's
-   printed wall stays within the speed budget above.
+4. A **larger run that actually carries your subject's inputs** — sanity +
+   cross-check, and confirm the subject's printed wall stays within the speed
+   budget above. Pick the run by checking for the sidecars/columns you read, not
+   by name: `logs/` holds runs written by older launchers, and a subject that
+   reads a sidecar block those runs predate will correctly report `unavailable`
+   there. (`logs/unified_aime` is one such run — its `params.json` is the legacy
+   flat layout with no nested `workload` block.) An `unavailable` on an old run
+   is a passing graceful-degrade, not a verification.
 5. No regression: `analyze run logs/unified_smoke` (all subjects) still ok; existing
    reports unchanged; `(cd analyzer/rust && cargo test)` passes; a full render has no
    import error.
