@@ -4,7 +4,7 @@ Called by the Rust `optimality` analyzer subject as a subprocess:
 
     uv run python -m model.work.floors <log_dir>
 
-The Rust side already aggregates each level's workload (reusing the
+For unlocked analysis, Rust aggregates each level's workload (reusing the
 `workload-conservation` subject's `groups` parser) and pipes it in on **stdin** as::
 
     {"levels": {"<level_key>": {matmul_tokens, prefill_tokens, decode_passes,
@@ -22,6 +22,18 @@ scope-fused floor), and emits the two roofline floors in **GPU·seconds** on std
 
     {"levels": {"<level_key>": {"necessary": s, "segmented": s}, ...},
      "meta": {...}}
+
+For batch-locked run analysis, Rust instead sends deduplicated iteration shapes::
+
+    {"locked_compositions": {"<worker_key>": [
+        {"occurrences": 3, "totals": {...}}, ...
+    ]}}
+
+Each fixed-batch roofline is evaluated before occurrence weighting. Dense affine
+bases vectorize the common path; every basis is independently checked against one
+direct ``model.label`` result, with a per-shape direct fallback on mismatch. The
+worker response includes ``composition`` counters so Rust can validate the
+shape/iteration contract and expose whether any fallback was required.
 
 An independent row that cannot be labeled is returned as ``{"error": ...}``;
 other rows in the same batch remain available.
@@ -44,10 +56,18 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import defaultdict
 from functools import cache
 from pathlib import Path
 
-from .core import AttnInteraction, Workload
+import numpy as np
+
+from .core import (
+    AttnInteraction,
+    Workload,
+    gpu_mem_bandwidth_gbps,
+    gpu_peak_tflops,
+)
 from .registry import load_model
 
 
@@ -140,6 +160,289 @@ def _aggregate_workload(totals: dict) -> Workload:
     )
 
 
+def _label_payload(model, totals: dict, spec: dict) -> dict:
+    """Serialize one workload label, including each semantic's own roofline."""
+    peak_tflops = gpu_peak_tflops(spec["gpu"], spec["dtype"])
+    bandwidth_gbps = gpu_mem_bandwidth_gbps(spec["gpu"])
+    label = model.label(_aggregate_workload(totals))
+    segment_work = {
+        segment.name: (segment.flops_total, segment.bytes_total) for segment in label.segments
+    }
+    return _payload_from_segment_work(segment_work, peak_tflops, bandwidth_gbps)
+
+
+def _payload_from_segment_work(
+    segment_work: dict[str, tuple[float, float]], peak_tflops: float, bandwidth_gbps: float
+) -> dict:
+    segments = []
+    total_flops = 0.0
+    total_bytes = 0.0
+    for name in sorted(segment_work):
+        flops, bytes_ = segment_work[name]
+        compute_seconds = flops / (peak_tflops * 1e12)
+        memory_seconds = bytes_ / (bandwidth_gbps * 1e9)
+        segments.append(
+            {
+                "name": name,
+                "flops": flops,
+                "bytes": bytes_,
+                "necessary": max(compute_seconds, memory_seconds),
+            }
+        )
+        total_flops += flops
+        total_bytes += bytes_
+    compute_seconds = total_flops / (peak_tflops * 1e12)
+    memory_seconds = total_bytes / (bandwidth_gbps * 1e9)
+    return {
+        "necessary": max(compute_seconds, memory_seconds),
+        "segmented": sum(segment["necessary"] for segment in segments),
+        "segments": segments,
+    }
+
+
+_WORKLOAD_FIELDS = (
+    "matmul_tokens",
+    "prefill_tokens",
+    "decode_passes",
+    "prefill_pairs",
+    "prefill_cached",
+    "decode_kv",
+    "prefill_requests",
+)
+_LARGE_GEOMETRY_FIELDS = {"prefill_pairs", "prefill_cached", "decode_kv"}
+_GEOMETRY_PROBE = 1_048_576
+
+
+def _segment_work(model, totals: dict) -> dict[str, tuple[float, float]]:
+    label = model.label(_aggregate_workload(totals))
+    return {segment.name: (segment.flops_total, segment.bytes_total) for segment in label.segments}
+
+
+def _subtract_segment_work(
+    left: dict[str, tuple[float, float]], right: dict[str, tuple[float, float]]
+) -> dict[str, tuple[float, float]]:
+    return {
+        name: (
+            (left.get(name) or (0.0, 0.0))[0] - (right.get(name) or (0.0, 0.0))[0],
+            (left.get(name) or (0.0, 0.0))[1] - (right.get(name) or (0.0, 0.0))[1],
+        )
+        for name in left.keys() | right.keys()
+    }
+
+
+def _has_routed_matmul(model) -> bool:
+    return any(
+        group.routed
+        for stack in model.layers
+        for group in (*stack.attn.matmul_groups(), *stack.ffn.matmul_groups())
+    )
+
+
+def _basis_key(model, totals: dict, has_routed_matmul: bool) -> tuple[int | None, bool]:
+    matmul_tokens = int(totals["matmul_tokens"])
+    return (
+        matmul_tokens if has_routed_matmul else None,
+        matmul_tokens >= model.vocab,
+    )
+
+
+def _workload_basis(
+    model, totals: dict, has_routed_matmul: bool
+) -> dict[str, dict[str, tuple[float, float]] | dict[str, int]]:
+    """Affine semantic-work basis, with nonlinear dimensions pinned in the key.
+
+    Current model specs are affine in the seven compressed workload scalars except
+    routed-expert weight loading and the embedding-table cap. Routed token counts are
+    therefore pinned exactly; dense token counts use one basis on each side of the
+    vocab cap. The first shape using a basis is independently checked below.
+    """
+    base_totals = {field_name: 0 for field_name in _WORKLOAD_FIELDS}
+    matmul_tokens = int(totals["matmul_tokens"])
+    if has_routed_matmul:
+        base_totals["matmul_tokens"] = matmul_tokens
+    elif matmul_tokens >= model.vocab:
+        base_totals["matmul_tokens"] = model.vocab
+    base = _segment_work(model, base_totals)
+    coefficients = {}
+    for field_name in _WORKLOAD_FIELDS:
+        if has_routed_matmul and field_name == "matmul_tokens":
+            continue
+        probe = _GEOMETRY_PROBE if field_name in _LARGE_GEOMETRY_FIELDS else 1
+        probe_totals = dict(base_totals)
+        probe_totals[field_name] += probe
+        if field_name == "prefill_cached":
+            # `_aggregate_workload` materializes prefill attention only when pairs>0.
+            probe_totals["prefill_pairs"] = _GEOMETRY_PROBE
+            reference_totals = dict(base_totals, prefill_pairs=_GEOMETRY_PROBE)
+            reference = _segment_work(model, reference_totals)
+        else:
+            reference = base
+        delta = _subtract_segment_work(_segment_work(model, probe_totals), reference)
+        coefficients[field_name] = {
+            name: (flops / probe, bytes_ / probe) for name, (flops, bytes_) in delta.items()
+        }
+    return {"origin": base_totals, "base": base, "coefficients": coefficients}
+
+
+def _reconstruct_segment_work(basis: dict, totals: dict) -> dict[str, tuple[float, float]]:
+    coefficients = basis["coefficients"]
+    segment_names = set(basis["base"])
+    for coefficient in coefficients.values():
+        segment_names.update(coefficient)
+    segment_work = {}
+    for name in segment_names:
+        flops, bytes_ = basis["base"].get(name, (0.0, 0.0))
+        for field_name, coefficient in coefficients.items():
+            coefficient_flops, coefficient_bytes = coefficient.get(name, (0.0, 0.0))
+            field_delta = int(totals[field_name]) - basis["origin"][field_name]
+            flops += coefficient_flops * field_delta
+            bytes_ += coefficient_bytes * field_delta
+        segment_work[name] = (flops, bytes_)
+    return segment_work
+
+
+def _segment_work_matches(
+    reconstructed: dict[str, tuple[float, float]], direct: dict[str, tuple[float, float]]
+) -> bool:
+    if reconstructed.keys() != direct.keys():
+        return False
+    for name, direct_values in direct.items():
+        for reconstructed_value, direct_value in zip(
+            reconstructed[name], direct_values, strict=True
+        ):
+            tolerance = max(abs(direct_value), 1.0) * 1e-9
+            if abs(reconstructed_value - direct_value) > tolerance:
+                return False
+    return True
+
+
+def _validated_basis(
+    model,
+    totals: dict,
+    has_routed_matmul: bool,
+    basis_cache: dict[tuple[int | None, bool], dict | None],
+) -> dict | None:
+    """Build and independently validate one basis before any batch reduction."""
+    basis_key = _basis_key(model, totals, has_routed_matmul)
+    if basis_key not in basis_cache:
+        candidate = _workload_basis(model, totals, has_routed_matmul)
+        reconstructed = _reconstruct_segment_work(candidate, totals)
+        direct = _segment_work(model, totals)
+        basis_cache[basis_key] = candidate if _segment_work_matches(reconstructed, direct) else None
+    return basis_cache[basis_key]
+
+
+def _reduce_affine_group(
+    basis: dict,
+    weighted_shapes: list[dict],
+    peak_tflops: float,
+    bandwidth_gbps: float,
+) -> tuple[float, float, dict[str, dict]]:
+    """Evaluate all shapes sharing one basis as dense array operations."""
+    coefficients = basis["coefficients"]
+    field_names = tuple(coefficients)
+    segment_names = set(basis["base"])
+    for coefficient in coefficients.values():
+        segment_names.update(coefficient)
+    segment_names = tuple(sorted(segment_names))
+
+    base_flops = np.asarray(
+        [basis["base"].get(name, (0.0, 0.0))[0] for name in segment_names], dtype=np.float64
+    )
+    base_bytes = np.asarray(
+        [basis["base"].get(name, (0.0, 0.0))[1] for name in segment_names], dtype=np.float64
+    )
+    coefficient_flops = np.asarray(
+        [
+            [coefficients[field_name].get(name, (0.0, 0.0))[0] for name in segment_names]
+            for field_name in field_names
+        ],
+        dtype=np.float64,
+    )
+    coefficient_bytes = np.asarray(
+        [
+            [coefficients[field_name].get(name, (0.0, 0.0))[1] for name in segment_names]
+            for field_name in field_names
+        ],
+        dtype=np.float64,
+    )
+    workload_deltas = np.asarray(
+        [
+            [
+                int(weighted_shape["totals"][field_name]) - basis["origin"][field_name]
+                for field_name in field_names
+            ]
+            for weighted_shape in weighted_shapes
+        ],
+        dtype=np.float64,
+    )
+    occurrences = np.asarray(
+        [int(weighted_shape["occurrences"]) for weighted_shape in weighted_shapes],
+        dtype=np.float64,
+    )
+    segment_flops = workload_deltas @ coefficient_flops + base_flops
+    segment_bytes = workload_deltas @ coefficient_bytes + base_bytes
+    compute_seconds = segment_flops / (peak_tflops * 1e12)
+    memory_seconds = segment_bytes / (bandwidth_gbps * 1e9)
+    segment_necessary = np.maximum(compute_seconds, memory_seconds)
+
+    fused_seconds = float(
+        occurrences
+        @ np.maximum(
+            segment_flops.sum(axis=1) / (peak_tflops * 1e12),
+            segment_bytes.sum(axis=1) / (bandwidth_gbps * 1e9),
+        )
+    )
+    segmented_seconds = float(occurrences @ segment_necessary.sum(axis=1))
+    aggregate_flops = occurrences @ segment_flops
+    aggregate_bytes = occurrences @ segment_bytes
+    aggregate_necessary = occurrences @ segment_necessary
+    segments = {
+        name: {
+            "name": name,
+            "flops": float(aggregate_flops[index]),
+            "bytes": float(aggregate_bytes[index]),
+            "necessary": float(aggregate_necessary[index]),
+        }
+        for index, name in enumerate(segment_names)
+    }
+    return fused_seconds, segmented_seconds, segments
+
+
+def _reduce_direct_group(
+    model, weighted_shapes: list[dict], spec: dict
+) -> tuple[float, float, dict[str, dict]]:
+    """Correct fallback for a future model whose work is not affine in a basis."""
+    fused_seconds = 0.0
+    segmented_seconds = 0.0
+    segments_by_name: dict[str, dict] = {}
+    for weighted_shape in weighted_shapes:
+        occurrences = int(weighted_shape["occurrences"])
+        payload = _label_payload(model, weighted_shape["totals"], spec)
+        fused_seconds += payload["necessary"] * occurrences
+        segmented_seconds += payload["segmented"] * occurrences
+        for segment in payload["segments"]:
+            aggregate = segments_by_name.setdefault(
+                segment["name"],
+                {"name": segment["name"], "flops": 0.0, "bytes": 0.0, "necessary": 0.0},
+            )
+            aggregate["flops"] += segment["flops"] * occurrences
+            aggregate["bytes"] += segment["bytes"] * occurrences
+            aggregate["necessary"] += segment["necessary"] * occurrences
+    return fused_seconds, segmented_seconds, segments_by_name
+
+
+def _merge_segment_totals(target: dict[str, dict], source: dict[str, dict]) -> None:
+    for name, segment in source.items():
+        aggregate = target.setdefault(
+            name,
+            {"name": name, "flops": 0.0, "bytes": 0.0, "necessary": 0.0},
+        )
+        aggregate["flops"] += segment["flops"]
+        aggregate["bytes"] += segment["bytes"]
+        aggregate["necessary"] += segment["necessary"]
+
+
 def compute_floors(log_dir: Path, levels: dict[str, dict]) -> dict[str, dict]:
     """Per-level {necessary, segmented} in GPU·seconds via the labeler roofline."""
     pool_specs = _pool_specs(log_dir)
@@ -148,25 +451,71 @@ def compute_floors(log_dir: Path, levels: dict[str, dict]) -> dict[str, dict]:
         try:
             spec = _spec_for_level(level_key, pool_specs)
             model = _model(spec["config"])
-            workload = _aggregate_workload(totals)
-            label = model.label(workload)
-            compute_ms, memory_ms, _bound = label.roofline_ms(spec["gpu"], spec["dtype"])
-            segmented_ms = label.segmented_lower_bound_ms(spec["gpu"], spec["dtype"])
-            out[level_key] = {
-                "necessary": max(compute_ms, memory_ms) / 1e3,  # ms -> GPU·seconds
-                "segmented": segmented_ms / 1e3,
-                "segments": [
-                    {
-                        "name": segment.name,
-                        "flops": segment.flops_total,
-                        "bytes": segment.bytes_total,
-                    }
-                    for segment in label.segments
-                ],
-            }
+            out[level_key] = _label_payload(model, totals, spec)
         except Exception as error:  # noqa: BLE001 - isolate independent batch rows
             # One heterogeneous or unsupported scope must not discard valid
             # worker/pool labels in the same subprocess batch.
+            out[level_key] = {"error": f"{type(error).__name__}: {error}"}
+    return out
+
+
+def compute_locked_compositions(log_dir: Path, compositions: dict[str, list[dict]]) -> dict:
+    """Compose fixed-batch labels without fusing work across iteration boundaries.
+
+    Rust deduplicates equal workloads. Each row here is one distinct shape plus its
+    occurrence count; roofline times are evaluated before weighting and addition.
+    The response is one compact semantic label per worker, independent of the number
+    of source iterations.
+    """
+    pool_specs = _pool_specs(log_dir)
+    out: dict[str, dict] = {}
+    for level_key, weighted_shapes in compositions.items():
+        try:
+            spec = _spec_for_level(level_key, pool_specs)
+            model = _model(spec["config"])
+            fused_seconds = 0.0
+            segmented_seconds = 0.0
+            segments_by_name: dict[str, dict] = {}
+            iteration_count = sum(int(shape["occurrences"]) for shape in weighted_shapes)
+            has_routed_matmul = _has_routed_matmul(model)
+            basis_cache: dict[tuple[int | None, bool], dict | None] = {}
+            shapes_by_basis: dict[tuple[int | None, bool], list[dict]] = defaultdict(list)
+            for weighted_shape in weighted_shapes:
+                occurrences = int(weighted_shape["occurrences"])
+                if occurrences <= 0:
+                    raise ValueError(f"occurrences must be positive, got {occurrences}")
+                shapes_by_basis[
+                    _basis_key(model, weighted_shape["totals"], has_routed_matmul)
+                ].append(weighted_shape)
+            peak_tflops = gpu_peak_tflops(spec["gpu"], spec["dtype"])
+            bandwidth_gbps = gpu_mem_bandwidth_gbps(spec["gpu"])
+            for basis_shapes in shapes_by_basis.values():
+                basis = _validated_basis(
+                    model, basis_shapes[0]["totals"], has_routed_matmul, basis_cache
+                )
+                if basis is None:
+                    group_fused, group_segmented, group_segments = _reduce_direct_group(
+                        model, basis_shapes, spec
+                    )
+                else:
+                    group_fused, group_segmented, group_segments = _reduce_affine_group(
+                        basis, basis_shapes, peak_tflops, bandwidth_gbps
+                    )
+                fused_seconds += group_fused
+                segmented_seconds += group_segmented
+                _merge_segment_totals(segments_by_name, group_segments)
+            out[level_key] = {
+                "necessary": fused_seconds,
+                "segmented": segmented_seconds,
+                "segments": [segments_by_name[name] for name in sorted(segments_by_name)],
+                "composition": {
+                    "unique_shapes": len(weighted_shapes),
+                    "iterations": iteration_count,
+                    "affine_bases": sum(basis is not None for basis in basis_cache.values()),
+                    "direct_fallback_bases": sum(basis is None for basis in basis_cache.values()),
+                },
+            }
+        except Exception as error:  # noqa: BLE001 - isolate independent workers
             out[level_key] = {"error": f"{type(error).__name__}: {error}"}
     return out
 
@@ -177,7 +526,10 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("usage: python -m model.work.floors <log_dir>  (scalars on stdin)")
     log_dir = Path(argv[0])
     request = json.load(sys.stdin)
-    floors = compute_floors(log_dir, request["levels"])
+    if "locked_compositions" in request:
+        floors = compute_locked_compositions(log_dir, request["locked_compositions"])
+    else:
+        floors = compute_floors(log_dir, request["levels"])
     json.dump({"levels": floors, "meta": {"unit": "gpu_seconds"}}, sys.stdout)
     sys.stdout.write("\n")
 

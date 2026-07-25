@@ -88,13 +88,71 @@ def test_floor_batch_isolates_one_heterogeneous_level(monkeypatch, model):
         "prefill_requests": 0,
     }
 
-    result = work_floors.compute_floors(
-        Path("unused"), {"cluster": totals, "main": totals}
-    )
+    result = work_floors.compute_floors(Path("unused"), {"cluster": totals, "main": totals})
 
     assert "error" in result["cluster"]
     assert result["main"]["necessary"] > 0
     assert result["main"]["segmented"] >= result["main"]["necessary"]
+
+
+@pytest.mark.parametrize("force_direct_fallback", [False, True])
+def test_locked_composition_evaluates_each_shape_before_addition(
+    monkeypatch, model, force_direct_fallback
+):
+    spec = {"config": str(CONFIG), "gpu": "H200", "dtype": "bf16"}
+    monkeypatch.setattr(work_floors, "_pool_specs", lambda _log_dir: {"main": spec})
+    monkeypatch.setattr(work_floors, "_model", lambda _config_path: model)
+    if force_direct_fallback:
+        monkeypatch.setattr(work_floors, "_segment_work_matches", lambda *_values: False)
+    decode_shape = {
+        "matmul_tokens": 1,
+        "prefill_tokens": 0,
+        "decode_passes": 1,
+        "prefill_pairs": 0,
+        "prefill_cached": 0,
+        "decode_kv": 4096,
+        "prefill_requests": 0,
+    }
+    long_decode_shape = {**decode_shape, "decode_kv": 65536}
+    prefill_shape = {
+        "matmul_tokens": 128,
+        "prefill_tokens": 128,
+        "decode_passes": 0,
+        "prefill_pairs": 128 * 129 // 2,
+        "prefill_cached": 0,
+        "decode_kv": 0,
+        "prefill_requests": 1,
+    }
+    weighted_shapes = [
+        {"occurrences": 3, "totals": decode_shape},
+        {"occurrences": 4, "totals": long_decode_shape},
+        {"occurrences": 2, "totals": prefill_shape},
+    ]
+
+    result = work_floors.compute_locked_compositions(Path("unused"), {"main/0": weighted_shapes})[
+        "main/0"
+    ]
+
+    expected_fused = 0.0
+    expected_segmented = 0.0
+    for weighted_shape in weighted_shapes:
+        label = model.label(work_floors._aggregate_workload(weighted_shape["totals"]))
+        compute_ms, memory_ms, _bound = label.roofline_ms("H200", "bf16")
+        expected_fused += max(compute_ms, memory_ms) / 1e3 * weighted_shape["occurrences"]
+        expected_segmented += (
+            label.segmented_lower_bound_ms("H200", "bf16") / 1e3 * weighted_shape["occurrences"]
+        )
+    assert result["necessary"] == pytest.approx(expected_fused)
+    assert result["segmented"] == pytest.approx(expected_segmented)
+    assert sum(segment["necessary"] for segment in result["segments"]) == pytest.approx(
+        expected_segmented
+    )
+    assert result["composition"] == {
+        "unique_shapes": 3,
+        "iterations": 9,
+        "affine_bases": int(not force_direct_fallback),
+        "direct_fallback_bases": int(force_direct_fallback),
+    }
 
 
 def test_decode_flop_buckets(model):
