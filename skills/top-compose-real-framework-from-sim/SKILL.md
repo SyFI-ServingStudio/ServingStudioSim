@@ -4,7 +4,8 @@ description: >-
   Use by the orchestrator as the top entry point when VibeSim should actively
   build a real LLM-serving framework from scratch or optimize an existing one
   from simulation evidence, using trusted correctness and benchmark utilities
-  in a repeated Tick (simulation) / Tock (one measured code trial) loop.
+  in a repeated Tick (simulation) / Tock (one measured code trial) / Probe
+  (attribute the outcome and decide) loop.
 ---
 
 THIS SKILL IS MAINLY FOR ORCHESTRATOR
@@ -20,39 +21,77 @@ results to guide the real-world implementation.
 The user may provide accuracy-checking and benchmark utilities. Do not modify
 them; treat them as trusted evaluation contracts.
 
-Implement framework code under `/framework/name`. That directory may initially
-be empty: do not assume that a repository, runnable server, or baseline
-implementation already exists. When it is empty, compose the first
-implementation from VibeSim evidence and the trusted evaluation contracts. When
-it already contains a runnable implementation, improve it in place.
+Before planning implementation work, identify and record the user's intended
+starting mode:
 
-VibeSim is the optimization reference; the real framework is the implementation
-being improved. Keep simulation predictions, measured framework results, and
-comparisons derived from named artifacts separate. Never fill an evidence gap
-with an estimate, and do not use `top-align-with-framework` or
-`operate-run-alignment` for this direction.
+- **Fresh build** — compose a new implementation from VibeSim evidence and the
+  trusted evaluation contracts. Do not assume an existing serving framework,
+  repository, runnable server, or measured baseline.
+- **Existing-code optimization** — use the user-selected codebase as the real
+  baseline, preserve its history and local changes, and improve it in place.
 
-## Governing loop — Tick, Tock, Tick again
+Use explicit user wording and the named target to determine the mode. Directory
+contents alone do not determine intent: a fresh-build workspace may contain
+evaluators or reference assets, while an existing-code task may point to a
+codebase elsewhere. If the mode remains ambiguous and choosing one would change
+the implementation strategy, ask the user before proceeding.
 
-This workflow is a repeated tick-tock loop, not a one-pass linear plan:
+The starting mode says **where the real baseline comes from**. It does *not* say
+what the implementation may be built out of — that is a second, independent
+decision made in Step 1 (*Implementation mode*). An empty target implies neither.
+
+Implement framework code under `/framework/name` unless the user selected
+another target. Inspect the target only after identifying the mode, then verify
+that its actual state is compatible with that mode.
+
+## Direction invariant
+
+**VibeSim is the optimization reference; the real framework is the
+implementation being improved.** Keep simulation predictions, measured framework
+results, and comparisons derived from named artifacts separate. Never fill an
+evidence gap with an estimate, and do not use `top-align-with-framework` or
+`operate-run-alignment` for this direction — those measure a real framework in
+order to correct VibeSim, which is the opposite direction.
+
+The hard guard, applied every time a real measurement seems to contradict the
+simulated target:
+
+> Before changing a simulation because of a real measurement, ask whether an
+> **external contract fact** changed or whether the **current implementation
+> merely differs**. Only the former may update the comparison contract. A real
+> limitation must be fixed in reality, not normalized into the simulation.
+
+The direction is fixed once, at the start of the task, and holds for the whole
+loop. **A new measurement never re-opens it.** The realistic failure mode is not
+forgetting the rule — it is learning something new mid-loop and quietly
+re-deciding, usually in the name of making the comparison "fair". The more a
+real-engine limitation looks like an unfair experimental condition (an active
+slot cap, an allocated KV budget, missing graph coverage), the more likely it is
+precisely the gap this workflow exists to expose. Copying it back into the
+simulation destroys the target that justified the work.
+
+## Governing loop — Tick, Tock, Probe
+
+This workflow is a repeated three-beat loop, not a one-pass linear plan:
 
 1. **Tick — VibeSim advances first.** Establish the grounded target, inspect the
-   full analyzer evidence, and choose one feasible, high-leverage improvement.
-2. **Tock — the real framework catches up.** Freeze that single trial, delegate
-   only its code, pass trusted correctness, benchmark it on the target GPU, and
-   retain or reject it from measured evidence.
-3. **Tick again — VibeSim searches ahead.** Use the measured outcome, rejected
-   hypothesis if applicable, and remaining headroom to select the next
-   simulation-backed opportunity.
+   full analyzer evidence, and **freeze exactly one hypothesis** as a trial brief.
+2. **Tock — the real framework catches up.** Implement that single change, pass
+   trusted correctness, and run the canonical benchmark. **A Tock ends at
+   measurement** — no interpretation, no acceptance, no rejection.
+3. **Probe — attribute the outcome and decide.** Explain the result from
+   artifacts, profile when artifacts are insufficient, add temporary
+   instrumentation only when the trace cannot attribute the gap, and close with
+   an explicit **retain / reject / inconclusive**.
 
-Every plan, progress log, and handoff must name the current Tick or Tock and the
-cycle number. Never compress multiple cycles into one numbered implementation
-plan. A Tock contains exactly one attributable code change, and the next
-framework change cannot begin until that Tock is measured, explained, decided,
-and followed by a new Tick.
+Then Tick again: feed the Probe's evidence and the remaining headroom into the
+next simulation-backed search.
 
-Repeat until the analyzer and measured results expose no further justified,
-feasible improvement, or until the user stops the loop.
+Every plan, progress log, and handoff must name the current Tick, Tock, or Probe
+and the cycle number. Never compress multiple cycles into one numbered
+implementation plan. A Tock contains exactly one attributable code change, and
+**a cycle is complete only once its Probe has recorded a decision**. The next
+framework change cannot begin before that.
 
 ## Operating model
 
@@ -62,39 +101,117 @@ it keeps every decision and every evidence-producing action.
 
 | Work | Owner |
 | --- | --- |
-| Lock comparison contract | Orchestrator |
+| Lock comparison contract and implementation mode | Orchestrator |
 | Run simulation/timing-predict and inspect artifacts | Orchestrator |
-| Select exactly one trial | Orchestrator |
+| Freeze exactly one trial | Orchestrator |
 | Write the real-framework code for that trial | Implementer |
-| Review the diff and run trusted gates | Orchestrator |
-| Run the canonical benchmark/profile | Orchestrator |
-| Explain the result and accept/reject the trial | Orchestrator |
+| Review the diff, run trusted gates, run source hygiene | Orchestrator |
+| Run the canonical benchmark (end of Tock) | Orchestrator |
+| Probe: attribute the outcome from artifacts and profiles | Orchestrator |
+| Probe: behavior-neutral diagnostic instrumentation | Orchestrator/Implementer |
+| Probe: retain / reject / inconclusive | Orchestrator |
 | Record progress periodically in Markdown files | Orchestrator |
 
 If no code-writing agent is available, stop and ask for one. Do not silently
 collapse the role boundary by having the Orchestrator write the implementation.
 
+**One explicit exception to that boundary:** the Orchestrator *may* write the
+Probe's diagnostic instrumentation itself — behavior-neutral, opt-in,
+default-off ranges in a separate diagnostic commit (contract in Step 4). This is
+not a general licence to write implementation code; anything that can change
+measured behavior still goes to the Implementer through a frozen brief.
+
 ## Concrete Steps
 
 ### Step 1 — Lock the real comparison contract
 
-Make sure you are confident with the following:
+Every field that could differ between the simulation and the real framework
+belongs to exactly one of three classes. Classify before comparing — the class
+decides what may change, and in which direction.
 
-- model/checkpoint revision, dtype, quantization, and KV dtype;
-- target path and whether it is empty or contains an existing implementation;
-- repository revision and dirty-tree state only when a repository exists;
-- GPU type/count/topology and TP/EP/CP/PP;
-- scheduler, batching, KV layout, and kernel/backend choices;
-- arrival process, request-rate or concurrency policy, input/output
-  distributions, warmup, duration, and completion policy;
-- exact throughput, TTFT, TPOT, and correctness definitions;
-- trusted accuracy, benchmark, and profiler commands.
+| Class | Fields | Rule |
+| --- | --- | --- |
+| **Exogenous — must match** | model/checkpoint revision; dtype, quantization, KV dtype; GPU type/count/topology; arrival process; request-rate or concurrency policy; input/output length distributions; warmup; duration; request cap; cutoff; SLO; throughput/TTFT/TPOT/correctness definitions; trusted accuracy, benchmark, and profiler commands | Identical on both sides. **Only a change in this class may update the comparison contract.** |
+| **Simulated target design** | scheduler; batching policy; KV allocation and layout; kernel and backend choices; parallelism (TP/EP/CP/PP); deployment topology | Chosen by VibeSim. The real implementation **chases** it. Never copied backward from the real engine. |
+| **Current real-engine limitations** | active slot count; allocated KV memory; synchronization points; CUDA-graph coverage; current backend behavior; host/Python overhead | **Diagnostic gaps.** Never an experimental control, never copied into the simulation target. Fixed in reality or recorded as an open gap. |
+
+**Comparison table gate.** Before *every* sim/real comparison, write each field
+into one of the three columns above. A field that has not been classified does
+not enter the comparison. This gate is what catches a real-engine limitation
+being smuggled in as an experimental control.
 
 Do not compare runs whose workloads or metric semantics differ. Make the
-simulation reproduce the trusted benchmark contract rather than choosing a
-convenient preset. Ask the user only when a missing choice materially changes
-the experiment. An empty target directory is a valid starting condition, not a
-missing input.
+simulation reproduce the trusted benchmark contract **for the exogenous class
+only** — never reshape the simulated target design to match what the real engine
+currently happens to do. Ask the user only when a missing choice materially
+changes the experiment. An empty target directory is a valid condition for a
+fresh build, not a missing input. For existing-code optimization, do not silently
+replace a missing or non-runnable selected codebase with a fresh implementation.
+
+#### Implementation mode — engine provenance
+
+A second, independent decision, and it is **mandatory before the first Tock**.
+The starting mode answers *where the real baseline comes from*; this answers
+*what the implementation is allowed to be made of*. An empty target implies
+neither.
+
+| Mode | When it applies | What it allows |
+| --- | --- | --- |
+| **Clean-room composition** | **Default** whenever the target holds no runnable implementation | Existing serving engines (vLLM, SGLang, TensorRT-LLM) are **read-only architectural references**: they may not be imported, executed, linked, vendored, copied, adapted, or mechanically translated. Public primitive libraries — PyTorch, Transformers weight loading, FlashInfer, FastAPI, Uvicorn — are allowed **when declared**. |
+| **Extend an existing framework** | The target **itself** contains that runnable framework, or the user names it | Change it in place |
+| **Assemble around an existing runtime** | **Explicit user authorization only** | vLLM/SGLang/TensorRT-LLM may execute underneath |
+
+Three guards, each closing a path that makes the wrong choice look legitimate:
+
+- **Evaluator directories do not make a target an existing implementation.** A
+  target holding only evaluators, datasets, or reference assets is still empty.
+- **A reference checkout elsewhere in the workspace does not authorize a runtime
+  dependency.** Being able to read vLLM is not permission to depend on vLLM.
+- **"Use as reference" means** learning the architecture and public API
+  behavior — **not** copying source and not translating it line by line.
+
+If the user has not selected a mode: default to clean-room for an empty target,
+and state the provenance declaration (Step 3) so the choice is visible rather
+than silent. Ask first when the signals conflict — the user named an engine, or
+the target already contains a runnable framework.
+
+#### Trusted-metric precedence
+
+When a trusted evaluator defines the score, **its semantics win**. If the
+evaluator mandates arithmetic-mean TPOT, arithmetic-mean TPOT is the acceptance
+number. The general guidance in
+[`dev-llm-serving/references/tooling/serving-benchmark.md`](../dev-llm-serving/references/tooling/serving-benchmark.md)
+to prefer percentiles over means is sound as *diagnosis*, and percentiles remain
+useful as supplementary evidence — but they never replace the trusted score.
+Report both; accept on the trusted one.
+
+#### Variance policy
+
+Interpret a delta only against a known noise level.
+
+- Large, unambiguous delta → a single run may carry the conclusion, but record
+  it as a single run.
+- Small delta, **or** a result near the target / an acceptance threshold /
+  an evaluator threshold → establish a noise band first: repeat the baseline
+  under the same contract at least three times, and record the band in the
+  contract.
+- A delta inside the noise band is **inconclusive** — not accepted, not
+  rejected. Say so plainly instead of picking the flattering reading.
+- A change to the contract or the hardware voids the band; re-measure it.
+
+#### Finite-workload ceiling audit
+
+When the benchmark caps requests, the evaluator can bound the score below the
+server's real capacity. Before reading any result as saturation:
+
+- compute the reachable ceiling — `request_cap × max_output_tokens ÷ window`;
+- check completed vs requested counts, and whether the trace was exhausted
+  before the window closed;
+- raise the request rate and see whether throughput **repeats the same number**
+  rather than rising.
+
+A result at that ceiling is **evaluator-limited**. Label it so. It is not server
+saturation, and it is not evidence that the real engine has reached its limit.
 
 ### Step 2 — Tick: establish and advance the VibeSim target
 
@@ -122,74 +239,133 @@ When the simulator itself is wrong or incomplete, pause real-framework work,
 repair VibeSim through its owning top/orchestrator/impl skill, rerun the target,
 and only then resume.
 
+**A Tick ends by freezing exactly one trial brief:** the hypothesis, the code
+scope, the invariants that must hold, the expected observable effect, and the
+trusted validation commands. The Tock starts from that brief and nothing else.
+
 ### Step 3 — Tock: build or advance the real framework
 
 After obtaining a simulated result, inspect `/framework/name`.
 
-- **Empty or non-runnable target** — select one coherent bootstrap trial that
-  creates a real, runnable implementation for the exact trusted correctness and
-  benchmark contracts. Do not request a pre-existing codebase, commit,
-  benchmark result, or profiler trace, and do not use stubs or
-  benchmark-specific shortcuts. The first correctness-passing, benchmarkable
-  implementation becomes the real-framework baseline.
-- **Existing runnable target** — before changing code, run the trusted
-  correctness check, benchmark, and profiler on the unchanged implementation.
-  Preserve the command, revision, configuration, raw output,
+- **Fresh build** — select one coherent bootstrap trial that creates a real,
+  runnable implementation for the exact trusted correctness and benchmark
+  contracts, within the implementation mode locked in Step 1. Do not request a
+  pre-existing codebase, commit, benchmark result, or profiler trace, and do not
+  use stubs or benchmark-specific shortcuts. The first correctness-passing,
+  benchmarkable implementation becomes the real-framework baseline.
+- **Existing-code optimization** — before changing code, run the trusted
+  correctness check, benchmark, and profiler on the selected unchanged
+  implementation. Preserve the command, revision, configuration, raw output,
   completed/requested counts, throughput, TTFT/TPOT, and profiler provenance.
 
 Use simulator analyzer artifacts for both cases. Use measured framework
 profiling to diagnose a performance gap only after a runnable baseline exists.
 
-Check GPU idleness before launching the benchmark and ensure that no other
-process is using the target GPU. Otherwise, the measured gap may be a scheduling
-artifact rather than a cost-model gap.
+Before launching any benchmark or capture, run the preflight in
+`operate-profile-serving-run` — GPU idleness, process cleanup, provenance.
+A measured gap taken on a contended GPU is a scheduling artifact, not evidence.
 
-Consider the following aspects when aligning the performance:
+**Declare provenance before delegating.** The brief does not go to the
+Implementer until these five are written down:
 
-- **Fundamental improvement** — the *modeled work itself* is off: a real kernel/op is
-  slower than the sim's slot cost (different backend/implementation, a shape/quant
-  edge), or the batch shapes / parallelism the server actually runs differ from what
-  the sim assumed. Close it by lowering the server's fundamental cost to match the
-  sim.
+1. engine provenance — which implementation mode from Step 1;
+2. runtime dependencies — the declared list, nothing outside it;
+3. who owns model execution — which code actually runs the forward pass;
+4. the attention backend;
+5. whether **any** existing serving engine participates in execution.
 
-- **Overhead reduction** — the kernels already match the sim's slot costs, but the
-  measured wallclock is larger because of **implementation-dependent overhead** the
-  sim does not model: CPU launch overhead, gaps between kernels, no CUDA-graph
-  capture, no async-scheduler overlap, Python overhead. Close it with
-  implementation-time techniques that raise the GPU **duty cycle**. These do **not**
-  move the sim breakdown, so alignment is the only place they show up.
+A missing declaration blocks delegation. Delegate only the frozen trial to the
+Implementer, using `dev-llm-serving` for relevant techniques and source maps.
 
-For an existing baseline, diagnose the gap in order: verify workload and
-batch-shape equivalence; match measured operations to CostTree slots; separate
-localized kernel/backend gaps from clock or thermal shifts; compare kernel-busy
-time with GPU-cycle time; then explain remaining scheduling, queueing, batching,
-memory, and framework overhead. Leave uncertain operation matches unresolved
-rather than forcing them.
+**Review the diff yourself, and run source hygiene under clean-room mode.**
+The Orchestrator inspects the diff and runs the trusted checks itself. Under
+clean-room, also check for the forbidden forms: engine imports
+(`rg -n '^\s*(import|from)\s+(vllm|sglang|tensorrt_llm)' <target>`), `sys.path`
+injection pointing at an engine checkout, launching an engine as a subprocess,
+linking its binaries, and vendored or line-by-line-translated source. **A hit
+voids the Tock** — it does not proceed to Probe.
 
-Select exactly one carefully scoped trial: either the bootstrap trial for an
-empty target or one optimization trial for an existing baseline. Freeze its
-hypothesis, code scope, invariants, expected observable effect, and trusted
-validation commands. Delegate only that implementation work to the Implementer,
-using `dev-llm-serving` for relevant techniques and source maps. The Orchestrator
-must inspect the diff and run the trusted checks itself.
+Correctness is mandatory.
 
-Correctness is mandatory. Evaluate the trial not only by absolute speedup, but
-also by whether its proposal was technically sound, whether the implementation
-tested that proposal, and whether the explanation fits the measured result.
-Preserve the VibeSim target and every available real-framework baseline, and
-record the decision before starting another trial.
+**A Tock ends at measurement.** Record the trusted accuracy result, the
+canonical benchmark result, and the artifact paths — then stop. Do not
+interpret, retain, or reject here; that is Step 4.
 
-A Tock is incomplete until the orchestrator has recorded the trusted accuracy,
-benchmark, and relevant profiler results; explained why the outcome does or
-does not support the proposal; and explicitly retained or rejected the change.
+### Step 4 — Probe: attribute the outcome and decide
 
-## Step 4 — Tick again: explore more simulation possibilities
+Run these in order. The order matters: the direction check is cheap and
+disqualifies whole classes of wrong conclusion before any profiling effort.
 
-After every completed Tock, return to the simulator before choosing another
-framework change. Feed the measured outcome and remaining headroom into the
-next search. A successful Tock raises the real baseline; a rejected Tock still
-constrains the next hypothesis. Do not skip this Tick merely because another
-implementation idea already looks promising.
+**1. Direction checkpoint — first, always.** If the measurement appears to
+contradict the simulated target, return to the *Direction invariant* and the
+Step 1 three-way table before anything else. Did an **exogenous fact** change,
+or does the **current implementation merely differ**? Only the former may touch
+the comparison contract. A real-engine limitation discovered here is a finding
+to be fixed in reality — never a reason to adjust the simulation, and never an
+experimental control to be held constant.
+
+**2. Explain from existing artifacts first.** Two causes need separating,
+because they have different fixes and only one moves the simulated breakdown:
+
+- **Fundamental improvement** — the *modeled work itself* is off: a real
+  kernel/op is slower than the sim's slot cost (different backend/implementation,
+  a shape/quant edge), or the batch shapes / parallelism the server actually runs
+  differ from what the sim assumed. Close it by lowering the server's fundamental
+  cost to match the sim.
+- **Overhead reduction** — the kernels already match the sim's slot costs, but
+  measured wallclock is larger because of **implementation-dependent overhead**
+  the sim does not model: CPU launch overhead, gaps between kernels, no
+  CUDA-graph capture, no async-scheduler overlap, Python overhead. Close it with
+  implementation-time techniques that raise the GPU **duty cycle**. These do
+  **not** move the sim breakdown, so this comparison is the only place they show.
+
+Diagnose the gap in order: verify workload and batch-shape equivalence; match
+measured operations to CostTree slots; separate localized kernel/backend gaps
+from clock or thermal shifts; compare kernel-busy time with GPU-cycle time; then
+explain remaining scheduling, queueing, batching, memory, and framework overhead.
+Leave uncertain operation matches unresolved rather than forcing them.
+
+**3. Observability gate.** Before selecting any **CPU / launch-overhead** class
+optimization, you must already hold evidence attributing time to specific engine
+phases. An opaque host gap is not such evidence — it is equally compatible with
+scheduling, input preparation, attention planning, a hidden device sync, and
+plain Python overhead, which are different bugs with different fixes. If the
+trace cannot name the gap, add observability *before* choosing the optimization.
+Route to `operate-profile-serving-run` for the capture, the NVTX readiness test,
+the instrumentation contract, and the SQLite aggregation that turns ranges into
+per-phase GPU-busy and host-gap numbers. For any engine that replays CUDA
+graphs, that skill's node-level tracing requirement is part of the gate: at
+graph level the graph-covered iterations contain no kernel rows at all, so the
+phase is unattributable no matter how good the NVTX coverage is.
+
+**4. Probe boundaries.** A Probe is diagnosis, not a performance trial:
+
+- only behavior-neutral, opt-in, default-off, exception-safe instrumentation;
+- instrumentation lands in a **separate diagnostic commit**, never mixed with
+  the trial commit;
+- a Probe **must not** introduce the next optimization;
+- the same workload, capture mode, and capture flags as the baseline —
+  a flag change invalidates the pair;
+- revert the instrumentation when the Probe ends, unless it is deliberately kept
+  as dormant, default-off observability support.
+
+**5. Decide.** Close the cycle with an explicit **retain / reject /
+inconclusive**, applying the variance policy from Step 1. Judge the trial not
+only by absolute speedup, but also by whether the proposal was technically
+sound, whether the implementation actually tested that proposal, and whether the
+explanation fits the measured result. A change whose delta sits inside the noise
+band is *inconclusive* — record it that way rather than resolving it by
+preference. Preserve the VibeSim target and every available real-framework
+baseline, and record the decision before starting another trial.
+
+### Step 5 — Tick again: explore more simulation possibilities
+
+After every completed **Probe**, return to the simulator before choosing another
+framework change. Feed the measured outcome and remaining headroom into the next
+search. A successful cycle raises the real baseline; a rejected one still
+constrains the next hypothesis; an inconclusive one usually means the next step
+is a better measurement, not a new optimization. Do not skip this Tick merely
+because another implementation idea already looks promising.
 
 When several directions are viable, prefer the one with the best
 **effort-to-leverage ratio** — cheap to try and easy to attribute. The levels below
@@ -223,11 +399,16 @@ menu: **this skill names the level, `dev-llm-serving` names the techniques.**
    Prefill/decode (PD) disaggregation, disaggregated / multi-node serving, replica
    routing. → `dev-llm-serving`: frameworks.
 
+Candidates at level 4, and any candidate justified by host-side overhead rather
+than modeled work, require a passed **observability gate** (Step 4.3) before they
+may be frozen. Picking a launch-overhead fix from an unattributed gap is
+guesswork wearing an optimization's clothes.
+
 Inside the level the breakdown points at, rank candidates by **leverage** = (fraction
 of predicted time the change targets) × (fraction of that it could plausibly remove):
 a change on a 5% slice caps at a 5% win; the headroom is on the dominant slice. Pick
 the single highest-leverage change per iteration (one attributable change keeps the
-later alignment's gap explainable), and confirm in the grounded sim that it is
+later attribution explainable), and confirm in the grounded sim that it is
 **feasible across the *whole* analyzer output** — throughput **and** KV capacity, iter
 breakdown, optimality — not just the headline number. A candidate that improves the
 headline but that the breakdown shows is infeasible (e.g. exceeds KV capacity) is not
@@ -240,14 +421,21 @@ highest-leverage candidate and return to Step 3 for the next Tock.
 
 Report:
 
-- the real comparison contract and starting state (empty or existing revision);
+- the real comparison contract, its three-way field classification, and the
+  starting state (empty or existing revision);
+- the implementation mode and the five-field provenance declaration;
 - VibeSim target and CostTree/analyzer provenance;
 - each frozen trial and implementation diff;
 - trusted correctness, benchmark, and profiler artifacts;
 - predicted versus measured results with diagnosed residuals;
+- per cycle: the Probe's attribution and its retain / reject / inconclusive
+  decision;
+- the measured noise band, where one was established;
+- any result labeled evaluator-limited;
 - retained/rejected changes and the remaining evidence gap.
 
 ## Neighboring workflows
 
-- Real serving implementation techniques and source maps:
-  `dev-llm-serving`.
+- Real serving implementation techniques and source maps: `dev-llm-serving`.
+- Capturing and attributing a real serving profile (Probe):
+  `operate-profile-serving-run`.
