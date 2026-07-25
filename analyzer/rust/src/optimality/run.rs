@@ -166,23 +166,23 @@ pub async fn run_optimality(
     // Assemble rungs (GPU·ms) per worker → pool → cluster; then per-kernel.
     let tier_aggregates = levels::assemble_tiers(&workers);
 
-    // The labeler treats the whole level workload as one globally batchable
-    // mega-forward. That counterfactual belongs only to unlocked analysis. A
-    // batch-locked run deliberately keeps the current operating points, so it
-    // stops at R5 and retains the unsplit hardware-optimal bucket.
-    let run_labels = if lock_batch_size {
-        None
+    // Locked composition labels each distinct observed iteration shape and adds
+    // its roofline with occurrence weight. Unlocked composition uses one saturated
+    // large-batch label per worker and may recompute rooflines after work rollup.
+    let run_label_result = if lock_batch_size {
+        floors::compute_batch_locked_run_labels(ctx, log_dir).await
     } else {
-        match floors::compute_run_labels(ctx, log_dir, UNLOCKED_ITERATION_REPLICATION_FACTOR).await
-        {
-            Ok(computed_labels) => Some(computed_labels),
-            Err(error) => {
-                caveats.push(format!(
-                    "labeler necessary-work floors unavailable ({error:#}); \
-                     waterfall shows the plain hardware-optimal floor"
-                ));
-                None
-            }
+        floors::compute_saturated_run_labels(ctx, log_dir, UNLOCKED_ITERATION_REPLICATION_FACTOR)
+            .await
+    };
+    let run_labels = match run_label_result {
+        Ok(computed_labels) => Some(computed_labels),
+        Err(error) => {
+            caveats.push(format!(
+                "labeler necessary-work floors unavailable ({error:#}); \
+                 waterfall shows the plain hardware-optimal floor"
+            ));
+            None
         }
     };
     let necessary_work_floors = run_labels.as_ref().map(|labels| &labels.floors);
@@ -231,7 +231,7 @@ pub async fn run_optimality(
                         .context("worker ladder unexpectedly has aggregate scope")?;
                     let pool_tag = pool_tag.to_string();
                     let worker_key = (pool_tag.clone(), worker_id);
-                    let Some(label) = labels.saturated_workers.get(&worker_key) else {
+                    let Some(composition) = labels.workers.get(&worker_key) else {
                         continue;
                     };
                     let attribution_result = (|| -> Result<_> {
@@ -248,15 +248,19 @@ pub async fn run_optimality(
                             })
                             .map(|worker| worker.gpu_count)
                             .unwrap_or(1.0);
-                        catalog.attribute_ladder(
+                        catalog.attribute_composed_ladder(
                             &pool_tag,
                             locations,
                             ladder,
-                            label,
+                            composition,
                             gpu_spec,
                             gpu_count,
-                            NecessaryWorkPolicy::Saturated {
-                                replication_factor: UNLOCKED_ITERATION_REPLICATION_FACTOR,
+                            if lock_batch_size {
+                                NecessaryWorkPolicy::BatchLocked
+                            } else {
+                                NecessaryWorkPolicy::Saturated {
+                                    replication_factor: UNLOCKED_ITERATION_REPLICATION_FACTOR,
+                                }
                             },
                         )
                     })();
@@ -310,8 +314,12 @@ pub async fn run_optimality(
         "num_locations": kernel_locations.len(),
         "composed_necessary_work_available": composed_necessary_work_available,
         "composed_necessary_work_workers": attributed_worker_count,
-        "composed_necessary_work_basis": if lock_batch_size { None } else { Some("saturated_worker_workload") },
-        "composed_necessary_work_replication_factor": if lock_batch_size { None } else { Some(UNLOCKED_ITERATION_REPLICATION_FACTOR) },
+        "composed_necessary_work_basis": if lock_batch_size { "fixed_iteration_composition" } else { "saturated_worker_workload" },
+        "composed_necessary_work_replication_factor": if lock_batch_size { 1 } else { UNLOCKED_ITERATION_REPLICATION_FACTOR },
+        "composed_necessary_work_unique_shapes": run_labels.as_ref().and_then(|labels| labels.batch_locked_unique_shapes),
+        "composed_necessary_work_iterations": run_labels.as_ref().and_then(|labels| labels.batch_locked_iterations),
+        "composed_necessary_work_affine_bases": run_labels.as_ref().and_then(|labels| labels.batch_locked_affine_bases),
+        "composed_necessary_work_direct_fallback_bases": run_labels.as_ref().and_then(|labels| labels.batch_locked_direct_fallback_bases),
         "composed_location_mapping_ids": composed_location_mapping_ids,
         "caveats": caveats,
     });
@@ -377,15 +385,11 @@ fn definitions(lock_batch_size: bool) -> Value {
         "large-batch grid ceiling for the leaf's fixed config: peak TFLOP/s when any fitted point crosses the GPU ridge, otherwise peak GB/s; gap = batching"
     };
     let necessary_work = if lock_batch_size {
-        "disabled: the global fused-workload counterfactual requires batch size to be unlocked"
+        "model/work labels each distinct fixed-batch iteration shape once; occurrence-weighted per-iteration rooflines add through worker, pool, and cluster without rebatching"
     } else {
         "model/work labeler bounds below R5: segmented necessary work sums per-location rooflines; scope-fused necessary work adds FLOPs/bytes first and applies one roofline at that scope"
     };
-    let buckets = if lock_batch_size {
-        "idle, imbalance, batching, communication, hardware_gap, hardware_optimal — telescoping differences of R0..R5; sum to Real"
-    } else {
-        "idle, imbalance, batching, communication, hardware_gap, then R5 split into excess_over_necessary, fusion, hardware_necessary when labeler bounds are available; sum to Real"
-    };
+    let buckets = "idle, imbalance, batching, communication, hardware_gap, then R5 split into excess_over_necessary, fusion, hardware_necessary when labeler bounds are available; sum to Real";
     json!({
         "scope": "per-worker CostTree manifest re-folded with per-rung leaf substitutions; \
                   unit GPU-seconds = wall time × the worker's run_meta gpu_ids count",
@@ -405,9 +409,9 @@ fn definitions(lock_batch_size: bool) -> Value {
                          single-leaf so no idle/imbalance — only batching/communication/hw",
         "kernel_ladders": "the analyzer emits complete worker/pool/cluster ladders: R0/R1 reuse \
                            the attributable R2 kernel baseline plus aggregate idle/imbalance; \
-                           R2..R6 carry per-location values; R7 is aggregate-only; parent R6/R7 \
-                           are recomputed from additive FLOPs/bytes before emission and are never \
-                           reconstructed by the UI",
+                           R2..R6 carry per-location values; R7 is aggregate-only; unlocked parents \
+                           recompute R6/R7 from additive FLOPs/bytes, while locked parents add values \
+                           already evaluated at fixed-iteration boundaries; the UI never reconstructs them",
     })
 }
 

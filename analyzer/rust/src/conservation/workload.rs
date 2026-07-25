@@ -426,7 +426,7 @@ async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actu
 /// labeler roofline needs (prefill KV read + request count). All fields are additive,
 /// so pool / cluster levels are plain rollups of this map. A rollup of every worker
 /// reproduces the run-wide conservation `actual`, which is the cross-check.
-#[derive(Default, Clone)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct WorkloadTotals {
     pub(crate) matmul_tokens: f64,    // Σ batch_tokens
     pub(crate) prefill_tokens: f64,   // Σ prefill_tokens
@@ -435,6 +435,62 @@ pub(crate) struct WorkloadTotals {
     pub(crate) prefill_cached: f64, // Σ prefix                        (prefill KV read)
     pub(crate) decode_kv: f64, // Σ decode_kv_total               (= labeler decode pairs / cached)
     pub(crate) prefill_requests: f64, // Σ prefill chunk count           (lm_head sampled positions)
+}
+
+/// One exact fixed-batch workload and the number of iterations with that shape.
+/// The labeler evaluates each distinct shape once; callers multiply its roofline
+/// result by `occurrences`, preserving batch boundaries without one subprocess row
+/// per iteration.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WeightedWorkload {
+    pub(crate) totals: WorkloadTotals,
+    pub(crate) occurrences: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct WorkloadShape {
+    matmul_tokens: u64,
+    prefill_tokens: u64,
+    decode_passes: u64,
+    prefill_pairs: u64,
+    prefill_cached: u64,
+    decode_kv: u64,
+    prefill_requests: u64,
+}
+
+impl WorkloadShape {
+    fn from_totals(totals: WorkloadTotals) -> Result<Self> {
+        Ok(Self {
+            matmul_tokens: exact_count(totals.matmul_tokens, "matmul_tokens")?,
+            prefill_tokens: exact_count(totals.prefill_tokens, "prefill_tokens")?,
+            decode_passes: exact_count(totals.decode_passes, "decode_passes")?,
+            prefill_pairs: exact_count(totals.prefill_pairs, "prefill_pairs")?,
+            prefill_cached: exact_count(totals.prefill_cached, "prefill_cached")?,
+            decode_kv: exact_count(totals.decode_kv, "decode_kv")?,
+            prefill_requests: exact_count(totals.prefill_requests, "prefill_requests")?,
+        })
+    }
+
+    fn totals(self) -> WorkloadTotals {
+        WorkloadTotals {
+            matmul_tokens: self.matmul_tokens as f64,
+            prefill_tokens: self.prefill_tokens as f64,
+            decode_passes: self.decode_passes as f64,
+            prefill_pairs: self.prefill_pairs as f64,
+            prefill_cached: self.prefill_cached as f64,
+            decode_kv: self.decode_kv as f64,
+            prefill_requests: self.prefill_requests as f64,
+        }
+    }
+}
+
+fn exact_count(value: f64, field_name: &str) -> Result<u64> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
+        return Err(anyhow!(
+            "workload field {field_name:?} is not a non-negative exact u64: {value}"
+        ));
+    }
+    Ok(value as u64)
 }
 
 impl WorkloadTotals {
@@ -541,6 +597,81 @@ pub(crate) async fn collect_iteration_workload(
         workload_columns.add_range(0..groups.values().len(), &mut totals)?;
     }
     Ok(totals)
+}
+
+/// Collect fixed-batch workloads for a whole run in one scan and deduplicate equal
+/// iteration shapes per worker. Rows sharing an `iter_id` are summed before shape
+/// comparison, which keeps AFD/layered logs correct as well as one-row iterwise logs.
+pub(crate) async fn collect_workload_shapes_by_worker(
+    ctx: &SessionContext,
+) -> Result<HashMap<(String, u16), Vec<WeightedWorkload>>> {
+    let batches = collect(
+        ctx,
+        "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, worker_id, iter_id, groups FROM cost_log",
+    )
+    .await?;
+    let mut totals_by_iteration: HashMap<(String, u16, u64), WorkloadTotals> = HashMap::new();
+    for batch in &batches {
+        let pool_tags = col(batch, "pool_tag")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow!("`pool_tag` is not a String array"))?;
+        let worker_ids = col(batch, "worker_id")?
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .ok_or_else(|| anyhow!("`worker_id` is not a UInt16 array"))?;
+        let iteration_ids = col(batch, "iter_id")?;
+        let groups = groups_list(batch)?;
+        let offsets = groups.value_offsets();
+        let workload_columns = WorkloadGroupColumns::new(groups_struct(groups)?)?;
+        for row_index in 0..batch.num_rows() {
+            let iteration_id = exact_count(value_f64(iteration_ids, row_index)?, "iter_id")?;
+            let totals = totals_by_iteration
+                .entry((
+                    pool_tags.value(row_index).to_string(),
+                    worker_ids.value(row_index),
+                    iteration_id,
+                ))
+                .or_default();
+            workload_columns.add_range(
+                (offsets[row_index] as usize)..(offsets[row_index + 1] as usize),
+                totals,
+            )?;
+        }
+    }
+
+    let mut occurrence_by_shape: HashMap<((String, u16), WorkloadShape), u64> = HashMap::new();
+    for ((pool_tag, worker_id, _iteration_id), totals) in totals_by_iteration {
+        let shape = WorkloadShape::from_totals(totals)?;
+        *occurrence_by_shape
+            .entry(((pool_tag, worker_id), shape))
+            .or_default() += 1;
+    }
+    let mut shapes_by_worker: HashMap<(String, u16), Vec<WeightedWorkload>> = HashMap::new();
+    for ((worker_key, shape), occurrences) in occurrence_by_shape {
+        shapes_by_worker
+            .entry(worker_key)
+            .or_default()
+            .push(WeightedWorkload {
+                totals: shape.totals(),
+                occurrences,
+            });
+    }
+    for shapes in shapes_by_worker.values_mut() {
+        shapes.sort_by_key(|shape| {
+            let totals = shape.totals;
+            (
+                totals.matmul_tokens as u64,
+                totals.prefill_tokens as u64,
+                totals.decode_passes as u64,
+                totals.decode_kv as u64,
+                totals.prefill_pairs as u64,
+                totals.prefill_cached as u64,
+                totals.prefill_requests as u64,
+            )
+        });
+    }
+    Ok(shapes_by_worker)
 }
 
 /// Typed, once-per-record-batch view of the fields needed by `model.work`.

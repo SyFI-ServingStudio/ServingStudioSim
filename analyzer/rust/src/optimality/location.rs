@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
-use super::floors::{IterationLabel, SemanticWork};
+use super::floors::{Floors, IterationLabel, SemanticWork, WorkerComposition};
 use super::ladder::{
     KernelContribution, KernelLadder, KernelNecessaryWork, KernelRungs, NecessaryWorkPolicy,
 };
@@ -75,6 +75,7 @@ pub(super) struct LocationAttribution {
 struct NecessaryWork {
     flops: f64,
     bytes: f64,
+    roofline_gpu_s: f64,
 }
 
 impl LocationCatalog {
@@ -133,26 +134,66 @@ impl LocationCatalog {
         gpu_count: f64,
         policy: NecessaryWorkPolicy,
     ) -> Result<LocationAttribution> {
+        self.attribute_label_refs(
+            pool_tag,
+            kernel_locations,
+            ladder,
+            &[(label, 1)],
+            gpu_spec,
+            gpu_count,
+            policy,
+        )
+    }
+
+    /// Attribute a run-level worker composition. A batch-locked composition may
+    /// contain many distinct iteration shapes with occurrence counts; saturated
+    /// composition contains one already-normalized large-batch label.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attribute_composed_ladder(
+        &self,
+        pool_tag: &str,
+        kernel_locations: &[KernelLocation],
+        ladder: &mut KernelLadder,
+        composition: &WorkerComposition,
+        gpu_spec: GpuSpec,
+        gpu_count: f64,
+        policy: NecessaryWorkPolicy,
+    ) -> Result<LocationAttribution> {
+        let label_refs: Vec<(&IterationLabel, u64)> = composition
+            .labels
+            .iter()
+            .map(|weighted| (&weighted.label, weighted.occurrences))
+            .collect();
+        self.attribute_label_refs(
+            pool_tag,
+            kernel_locations,
+            ladder,
+            &label_refs,
+            gpu_spec,
+            gpu_count,
+            policy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attribute_label_refs(
+        &self,
+        pool_tag: &str,
+        kernel_locations: &[KernelLocation],
+        ladder: &mut KernelLadder,
+        labels: &[(&IterationLabel, u64)],
+        gpu_spec: GpuSpec,
+        gpu_count: f64,
+        policy: NecessaryWorkPolicy,
+    ) -> Result<LocationAttribution> {
+        if labels.is_empty() {
+            bail!("semantic attribution has no workload labels");
+        }
         let pool_spec = self
             .pool_specs
             .get(pool_tag)
             .with_context(|| format!("semantic attribution missing pool {pool_tag:?}"))?;
         let location_map = select_location_map(&self.maps, &pool_spec.arch_type, kernel_locations)?;
-        validate_mapping(location_map, kernel_locations, &label.segments)?;
-
-        let semantic_work: BTreeMap<&str, NecessaryWork> = label
-            .segments
-            .iter()
-            .map(|segment| {
-                (
-                    segment.name.as_str(),
-                    NecessaryWork {
-                        flops: segment.flops,
-                        bytes: segment.bytes,
-                    },
-                )
-            })
-            .collect();
         let peak_tflops = gpu_spec.peak_tflops(pool_spec.compute_dtype);
         let bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
         if peak_tflops <= 0.0 || bandwidth_gbps <= 0.0 {
@@ -166,30 +207,58 @@ impl LocationCatalog {
             .iter()
             .map(|location| (location.name.as_str(), location.kind.as_str()))
             .collect();
-        let mut work_by_location = BTreeMap::new();
-        for rule in &location_map.locations {
-            let work = rule.semantics.iter().try_fold(
-                NecessaryWork::default(),
-                |mut total, semantic| {
-                    let row = semantic_work
-                        .get(semantic.as_str())
-                        .with_context(|| format!("mapped semantic row {semantic:?} is absent"))?;
-                    total.flops += row.flops;
-                    total.bytes += row.bytes;
-                    Ok::<_, anyhow::Error>(total)
-                },
-            )?;
-            work_by_location.insert(
-                rule.location.as_str(),
-                KernelNecessaryWork::from_rates(
+        let mut work_by_location: BTreeMap<&str, KernelNecessaryWork> = BTreeMap::new();
+        let mut expected_floors = Floors::default();
+        for (label, occurrences) in labels {
+            validate_mapping(location_map, kernel_locations, &label.segments)?;
+            let occurrence_scale = *occurrences as f64;
+            expected_floors.fused += label.floors.fused * occurrence_scale;
+            expected_floors.segmented += label.floors.segmented * occurrence_scale;
+            let semantic_work: BTreeMap<&str, NecessaryWork> = label
+                .segments
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.name.as_str(),
+                        NecessaryWork {
+                            flops: segment.flops,
+                            bytes: segment.bytes,
+                            roofline_gpu_s: segment.necessary_gpu_s,
+                        },
+                    )
+                })
+                .collect();
+            for rule in &location_map.locations {
+                let work = rule.semantics.iter().try_fold(
+                    NecessaryWork::default(),
+                    |mut total, semantic| {
+                        let row = semantic_work.get(semantic.as_str()).with_context(|| {
+                            format!("mapped semantic row {semantic:?} is absent")
+                        })?;
+                        total.flops += row.flops;
+                        total.bytes += row.bytes;
+                        total.roofline_gpu_s += row.roofline_gpu_s;
+                        Ok::<_, anyhow::Error>(total)
+                    },
+                )?;
+                let mut weighted_work = KernelNecessaryWork::from_rates_with_roofline(
                     rule.semantics.iter().cloned(),
                     work.flops,
                     work.bytes,
                     peak_tflops,
                     bandwidth_gbps,
+                    work.roofline_gpu_s,
                     gpu_count,
-                ),
-            );
+                );
+                weighted_work.scale(occurrence_scale);
+                work_by_location
+                    .entry(rule.location.as_str())
+                    .or_default()
+                    .add_assign_for_policy(&weighted_work, policy);
+            }
+        }
+        for work in work_by_location.values_mut() {
+            work.set_worker_wall_time(gpu_count);
         }
 
         let mut attributed_ladder = ladder.clone();
@@ -222,7 +291,7 @@ impl LocationCatalog {
                 work_by_location.remove(kernel.name.as_str())
             };
         }
-        attributed_ladder.finalize_necessary_work(policy)?;
+        attributed_ladder.finalize_necessary_work(policy, Some(expected_floors.fused))?;
         let segmented_necessary_gpu_s = attributed_ladder
             .rungs
             .segmented_necessary
@@ -231,14 +300,14 @@ impl LocationCatalog {
             .rungs
             .scope_fused_necessary
             .context("finalized ladder missing fused floor")?;
-        let tolerance = (label.floors.segmented.abs() * 1e-7).max(1e-12);
-        if (segmented_necessary_gpu_s - label.floors.segmented).abs() > tolerance
-            || (scope_fused_necessary_gpu_s - label.floors.fused).abs() > tolerance
+        let tolerance = (expected_floors.segmented.abs() * 1e-7).max(1e-12);
+        if (segmented_necessary_gpu_s - expected_floors.segmented).abs() > tolerance
+            || (scope_fused_necessary_gpu_s - expected_floors.fused).abs() > tolerance
         {
             bail!(
                 "mapped location floors ({segmented_necessary_gpu_s}, {scope_fused_necessary_gpu_s}) do not reconcile with semantic floors ({}, {})",
-                label.floors.segmented,
-                label.floors.fused
+                expected_floors.segmented,
+                expected_floors.fused
             );
         }
         *ladder = attributed_ladder;
@@ -370,6 +439,7 @@ mod tests {
             name: name.to_string(),
             flops: 1.0,
             bytes: 2.0,
+            necessary_gpu_s: 2.0,
         }
     }
 

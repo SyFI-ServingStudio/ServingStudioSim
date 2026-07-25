@@ -1,9 +1,10 @@
 //! Typed kernel-ladder domain and the single worker -> pool -> cluster reducer.
 //!
-//! R0..R5 are additive GPU-second measurements. R6/R7 are different: their
-//! inputs (`flops`, `bytes`) are additive, but a roofline time is not. This
-//! module therefore never rolls a child roofline time upward. It first adds the
-//! work vectors and only then evaluates the roofline at the requested scope.
+//! R0..R5 are additive GPU-second measurements. R6/R7 follow the declared policy:
+//! batch-locked composition adds rooflines already evaluated at each fixed-batch
+//! boundary, while saturated composition adds (`flops`, `bytes`) and reevaluates
+//! rooflines at the wider scope. Keeping this distinction here prevents a hierarchy
+//! caller from silently rebatching locked iterations.
 //! JSON exists only at [`KernelLadder::to_json`], the publication boundary.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -112,8 +113,8 @@ impl LadderRungs {
             value["segmented_necessary"] = json!(segmented_necessary);
         }
         if let Some(scope_fused_necessary) = self.scope_fused_necessary {
-            // Keep the v1 wire name for compatibility. Internally this is always
-            // recomputed at the ladder's scope; it is never a sum of child R7s.
+            // Keep the v1 wire name for compatibility. Saturated scopes recompute
+            // this rung from work; batch-locked scopes add their fixed-batch R7s.
             value["hardware_necessary"] = json!(scope_fused_necessary);
         }
         value
@@ -190,28 +191,52 @@ pub(super) struct KernelNecessaryWork {
     pub(super) min_bytes: f64,
     pub(super) compute_gpu_s: f64,
     pub(super) memory_gpu_s: f64,
+    roofline_gpu_s: f64,
     pub(super) wall_s: Option<f64>,
 }
 
 impl KernelNecessaryWork {
-    pub(super) fn from_rates(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_rates_with_roofline(
         semantics: impl IntoIterator<Item = String>,
         min_flops: f64,
         min_bytes: f64,
         peak_tflops: f64,
         bandwidth_gbps: f64,
+        roofline_gpu_s: f64,
         gpu_count: f64,
     ) -> Self {
         let compute_gpu_s = min_flops / (peak_tflops * 1e12);
         let memory_gpu_s = min_bytes / (bandwidth_gbps * 1e9);
-        let necessary_gpu_s = compute_gpu_s.max(memory_gpu_s);
+        Self::from_gpu_seconds(
+            semantics,
+            min_flops,
+            min_bytes,
+            compute_gpu_s,
+            memory_gpu_s,
+            roofline_gpu_s,
+            gpu_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_gpu_seconds(
+        semantics: impl IntoIterator<Item = String>,
+        min_flops: f64,
+        min_bytes: f64,
+        compute_gpu_s: f64,
+        memory_gpu_s: f64,
+        roofline_gpu_s: f64,
+        gpu_count: f64,
+    ) -> Self {
         Self {
             semantics: semantics.into_iter().collect(),
             min_flops,
             min_bytes,
             compute_gpu_s,
             memory_gpu_s,
-            wall_s: Some(necessary_gpu_s / gpu_count.max(1.0)),
+            roofline_gpu_s,
+            wall_s: Some(roofline_gpu_s / gpu_count.max(1.0)),
         }
     }
 
@@ -223,18 +248,35 @@ impl KernelNecessaryWork {
     }
 
     pub(super) fn necessary_gpu_s(&self) -> f64 {
-        self.compute_gpu_s.max(self.memory_gpu_s)
+        self.roofline_gpu_s
     }
 
-    fn add_assign_for_aggregate(&mut self, other: &Self) {
+    pub(super) fn scale(&mut self, factor: f64) {
+        self.min_flops *= factor;
+        self.min_bytes *= factor;
+        self.compute_gpu_s *= factor;
+        self.memory_gpu_s *= factor;
+        self.roofline_gpu_s *= factor;
+        self.wall_s = self.wall_s.map(|wall_s| wall_s * factor);
+    }
+
+    pub(super) fn add_assign_for_policy(&mut self, other: &Self, policy: NecessaryWorkPolicy) {
         self.semantics.extend(other.semantics.iter().cloned());
         self.min_flops += other.min_flops;
         self.min_bytes += other.min_bytes;
         self.compute_gpu_s += other.compute_gpu_s;
         self.memory_gpu_s += other.memory_gpu_s;
+        self.roofline_gpu_s = match policy {
+            NecessaryWorkPolicy::BatchLocked => self.roofline_gpu_s + other.roofline_gpu_s,
+            NecessaryWorkPolicy::Saturated { .. } => self.compute_gpu_s.max(self.memory_gpu_s),
+        };
         // Wall time is not additive across parallel workers. Aggregate ladders
         // intentionally publish only GPU seconds.
         self.wall_s = None;
+    }
+
+    pub(super) fn set_worker_wall_time(&mut self, gpu_count: f64) {
+        self.wall_s = Some(self.roofline_gpu_s / gpu_count.max(1.0));
     }
 
     fn to_json(&self, hardware_limit_gpu_s: f64) -> Value {
@@ -349,7 +391,11 @@ impl KernelLadder {
 
     /// Finish one strict location attribution. Both lower rungs are derived from
     /// the typed location work, so callers cannot create a non-reconciling ladder.
-    pub(super) fn finalize_necessary_work(&mut self, policy: NecessaryWorkPolicy) -> Result<()> {
+    pub(super) fn finalize_necessary_work(
+        &mut self,
+        policy: NecessaryWorkPolicy,
+        scope_fused_override: Option<f64>,
+    ) -> Result<()> {
         if self
             .kernels
             .iter()
@@ -375,7 +421,8 @@ impl KernelLadder {
             .filter_map(|kernel| kernel.necessary_work.as_ref())
             .map(|work| work.memory_gpu_s)
             .sum();
-        let scope_fused_necessary = compute_gpu_s.max(memory_gpu_s);
+        let scope_fused_necessary =
+            scope_fused_override.unwrap_or_else(|| compute_gpu_s.max(memory_gpu_s));
         self.rungs.segmented_necessary = Some(segmented_necessary);
         self.rungs.scope_fused_necessary = Some(scope_fused_necessary);
         self.special_chunks.fusion = Some((segmented_necessary - scope_fused_necessary).max(0.0));
@@ -383,10 +430,10 @@ impl KernelLadder {
         self.validate()
     }
 
-    /// The only hierarchy reducer for kernel ladders. R0..R5 add directly;
-    /// location work adds as `(compute_gpu_s, memory_gpu_s)` and R6/R7 are then
-    /// recomputed at the parent scope. A partial child set keeps the parent at
-    /// R0..R5 instead of misrepresenting missing work as zero.
+    /// The only hierarchy reducer for kernel ladders. R0..R5 add directly.
+    /// Saturated R6/R7 reevaluate after adding work; batch-locked R6/R7 add child
+    /// fixed-batch rooflines. A partial child set keeps the parent at R0..R5 instead
+    /// of misrepresenting missing work as zero.
     pub(super) fn aggregate(
         level: AggregateLevel,
         key: &str,
@@ -445,11 +492,12 @@ impl KernelLadder {
                         .necessary_work
                         .as_mut()
                         .expect("initialized when every member has necessary work")
-                        .add_assign_for_aggregate(
+                        .add_assign_for_policy(
                             kernel
                                 .necessary_work
                                 .as_ref()
                                 .context("complete ladder kernel missing necessary work")?,
+                            common_policy.expect("complete members have one policy"),
                         );
                 }
             }
@@ -480,7 +528,26 @@ impl KernelLadder {
             necessary_work_policy: None,
         };
         if let Some(policy) = common_policy {
-            aggregate.finalize_necessary_work(policy)?;
+            match policy {
+                NecessaryWorkPolicy::BatchLocked => {
+                    let segmented: f64 = members
+                        .iter()
+                        .filter_map(|member| member.rungs.segmented_necessary)
+                        .sum();
+                    let scope_fused: f64 = members
+                        .iter()
+                        .filter_map(|member| member.rungs.scope_fused_necessary)
+                        .sum();
+                    aggregate.rungs.segmented_necessary = Some(segmented);
+                    aggregate.rungs.scope_fused_necessary = Some(scope_fused);
+                    aggregate.special_chunks.fusion = Some((segmented - scope_fused).max(0.0));
+                    aggregate.necessary_work_policy = Some(policy);
+                    aggregate.validate()?;
+                }
+                NecessaryWorkPolicy::Saturated { .. } => {
+                    aggregate.finalize_necessary_work(policy, None)?;
+                }
+            }
         } else {
             aggregate.validate()?;
         }
@@ -641,12 +708,17 @@ mod tests {
                 min_bytes: memory_gpu_s,
                 compute_gpu_s,
                 memory_gpu_s,
+                roofline_gpu_s: compute_gpu_s.max(memory_gpu_s),
                 wall_s: Some(compute_gpu_s.max(memory_gpu_s)),
             }),
         }
     }
 
-    fn worker(worker_id: u16, kernel: KernelContribution) -> KernelLadder {
+    fn worker(
+        worker_id: u16,
+        kernel: KernelContribution,
+        policy: NecessaryWorkPolicy,
+    ) -> KernelLadder {
         let balanced = kernel.rungs.balanced;
         let mut ladder = KernelLadder {
             scope: LadderScope::Worker {
@@ -666,18 +738,17 @@ mod tests {
             kernels: vec![kernel],
             necessary_work_policy: None,
         };
-        ladder
-            .finalize_necessary_work(NecessaryWorkPolicy::Saturated {
-                replication_factor: 10_000,
-            })
-            .unwrap();
+        ladder.finalize_necessary_work(policy, None).unwrap();
         ladder
     }
 
     #[test]
     fn parent_recomputes_rooflines_after_bound_switching() {
-        let compute_worker = worker(0, kernel("compute", 10.0, 10.0, 1.0));
-        let memory_worker = worker(1, kernel("memory", 10.0, 1.0, 10.0));
+        let policy = NecessaryWorkPolicy::Saturated {
+            replication_factor: 10_000,
+        };
+        let compute_worker = worker(0, kernel("compute", 10.0, 10.0, 1.0), policy);
+        let memory_worker = worker(1, kernel("memory", 10.0, 1.0, 10.0), policy);
         let aggregate = KernelLadder::aggregate(
             AggregateLevel::Cluster,
             "cluster",
@@ -700,9 +771,45 @@ mod tests {
     }
 
     #[test]
+    fn batch_locked_parent_adds_fixed_batch_rooflines_across_bound_switches() {
+        let compute_iteration = worker(
+            0,
+            kernel("model.gemm", 10.0, 10.0, 1.0),
+            NecessaryWorkPolicy::BatchLocked,
+        );
+        let memory_iteration = worker(
+            1,
+            kernel("model.gemm", 10.0, 1.0, 10.0),
+            NecessaryWorkPolicy::BatchLocked,
+        );
+        let aggregate = KernelLadder::aggregate(
+            AggregateLevel::Cluster,
+            "cluster",
+            "Cluster aggregate",
+            &[&compute_iteration, &memory_iteration],
+        )
+        .unwrap();
+
+        assert_eq!(
+            aggregate.kernels[0]
+                .necessary_work
+                .as_ref()
+                .unwrap()
+                .necessary_gpu_s(),
+            20.0
+        );
+        assert_eq!(aggregate.rungs.segmented_necessary, Some(20.0));
+        assert_eq!(aggregate.rungs.scope_fused_necessary, Some(20.0));
+        assert_eq!(aggregate.special_chunks.fusion, Some(0.0));
+    }
+
+    #[test]
     fn partial_child_attribution_does_not_turn_missing_work_into_zero() {
-        let complete = worker(0, kernel("model.gemm", 10.0, 3.0, 1.0));
-        let mut missing = worker(1, kernel("model.gemm", 10.0, 3.0, 1.0));
+        let policy = NecessaryWorkPolicy::Saturated {
+            replication_factor: 10_000,
+        };
+        let complete = worker(0, kernel("model.gemm", 10.0, 3.0, 1.0), policy);
+        let mut missing = worker(1, kernel("model.gemm", 10.0, 3.0, 1.0), policy);
         missing.rungs.segmented_necessary = None;
         missing.rungs.scope_fused_necessary = None;
         missing.special_chunks.fusion = None;

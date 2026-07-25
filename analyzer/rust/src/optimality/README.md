@@ -14,14 +14,17 @@ each successive gap is an attributable source of sub-optimality:
 | R3 per-config best | unlocked: selected grid-peak throughput; locked: R2 unchanged | **batching** |
 | R4 ignore network  | R3, comm leaves → 0  | **communication** |
 | R5 hardware limit  | active regime's work unit / matching GPU-spec peak | **profiled↔hardware** |
+| R6 segmented necessary | sum of per-location semantic rooflines | **redundant work** |
+| R7 scope-fused necessary | fused semantic roofline within the allowed batch boundary | **fusion** |
 
 Buckets telescope and sum exactly back to Real, drawn as a stacked bar at five
 levels — cluster / pool / worker / iteration (idle 0 by construction) / per-kernel.
-For unlocked run-level analysis, the independent `model.work` labeler adds segmented and
+For both run-level modes, the independent `model.work` labeler adds segmented and
 scope-fused necessary-work bounds below R5. The R5 green band then splits into
 `excess_over_necessary`, `fusion`, and `hardware_necessary`; their sum remains
-exactly R5. Locked run-level analysis does not compute these bounds because its observed
-operating points are fixed and cannot be globally rebatchable.
+exactly R5. Unlocked mode may compose work into a saturated batch. Locked mode
+preserves every observed iteration boundary: equal shapes are deduplicated only as
+an evaluation optimization, then restored by occurrence weighting before rollup.
 
 The payload also carries per-worker kernel rung ladders. Its R0/R1 bars reuse
 the additive R2 kernel baseline and append two explicit aggregate chunks
@@ -32,16 +35,20 @@ critical-path attribution. In unlocked mode each worker workload is saturated by
 scaling its compressed additive totals 10,000× and normalizing the label back. This
 is the efficient equivalent of summing saturated iterations once each semantic op's
 bound has stabilized. The analyzer maps the label to locations as R6 segmented
-necessary work and retains R7 scope-fused work as an aggregate-only rung.
+necessary work and retains R7 scope-fused work as an aggregate-only rung. In locked
+mode it evaluates both rooflines for each distinct fixed-batch shape before weighting
+and addition.
 
 The analyzer—not the UI—then reduces complete worker ladders into explicit pool and
-cluster `aggregate_kernel_ladders`. R0..R5 GPU seconds are additive. R6/R7 are
-not: the reducer adds each location's `(FLOPs, bytes)` first, then reevaluates the
-location rooflines for R6 and one scope-wide roofline for R7. Therefore a pool or
-cluster R7 is never `Σ worker R7`, which would be wrong when workers have different
-active bounds. It checks every scope before emission: `Σ_location R2..R6` must
-match the corresponding scope rung, and `R6 = R7 + fusion`. The UI only selects
-the requested scope and renders it.
+cluster `aggregate_kernel_ladders`. R0..R5 GPU seconds are additive. For unlocked
+composition, the reducer adds each location's `(FLOPs, bytes)` first, then reevaluates
+the location rooflines for R6 and one scope-wide roofline for R7; a pool or cluster
+R7 is therefore not `Σ worker R7` when active bounds differ. For locked composition,
+the allowed boundary is each observed iteration, so the reducer adds the already
+evaluated worker R6/R7 values and never lets a compute-bound iteration offset a
+memory-bound one. It checks every scope before emission: `Σ_location R2..R6` must
+match the corresponding scope rung, and `R6 = R7 + fusion`. The UI only selects the
+requested scope and renders it.
 
 The UI service exposes two separate on-demand contracts for one selected
 `(pool_tag, worker_id, iter_id)`: a complete one-row waterfall and a per-kernel
@@ -88,8 +95,9 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   only batching/communication/hw), the report's `worst_batching`, and the
   per-worker kernel rung ladders.
 - `ladder.rs` — typed kernel-ladder/work domain and the sole worker → pool →
-  cluster reducer. It serializes at the publication boundary only and recomputes
-  every parent R6/R7 from additive work rather than summing child roofline times.
+  cluster reducer. It serializes at the publication boundary only. Unlocked parents
+  recompute R6/R7 from additive work; locked parents add child rooflines that were
+  already evaluated at fixed-iteration boundaries.
 - `grid_peaks.rs` — the R3 ceiling. Enumerates unique `(kind, config)` from the
   manifests, asks the simulator for each config's fitted-grid peak rate in one
   batched `kernel-query peak` call (including maximum grid arithmetic intensity,
@@ -98,9 +106,11 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
 - `spec.rs` — the R5 hardware ceilings. Resolves the run's `gpu_name` to a `gpu/spec.json`
   entry by its explicit `aliases`, then dense peak TFLOP/s by dtype + HBM GB/s.
 - `floors.rs` — bridge to the independent `model.work` labeler. One batched call computes
-  unlocked per-level bounds, saturated worker semantic labels, and exact-iteration
-  bounds for both modes; transport failure degrades the request, while one
-  unsupported/heterogeneous level degrades only that scope to the plain R5 ladder.
+  unlocked per-level/saturated-worker labels or deduplicated fixed-iteration labels;
+  exact-iteration detail uses the same contract. Transport failure degrades the
+  request, while one unsupported/heterogeneous scope degrades only that scope to the
+  plain R5 ladder. Locked responses expose shape, iteration, affine-basis, and direct
+  fallback counters in payload meta.
 - `location.rs` — strict exact-iteration semantic-location mapping. It validates
   complete coverage, computes per-location `max(FLOPs/TFLOPS, bytes/BW)`, and
   attaches R6 plus redundant/under-accounted diagnostics atomically.
@@ -120,8 +130,8 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   ridge, the config uses only its peak TFLOP/s; otherwise it uses only peak GB/s.
 - `analyze run --lock-batch-size` disables that counterfactual (`R3 = R2`) and
   skips grid-peak generation. R5 then classifies every observed leaf separately
-  from its current `FLOPs / bytes` versus the GPU ridge point. It also disables
-  the global necessary-work floors, which assume the workload can be rebatchable.
+  from its current `FLOPs / bytes` versus the GPU ridge point. R6/R7 remain available,
+  but they preserve fixed iteration boundaries rather than assuming global rebatching.
 - Unlocked output uses `optimality_report.json` and
   `optimality_waterfall.json`; locked output uses the separate
   `optimality_batch_locked_report.json` and

@@ -21,14 +21,14 @@
 //!
 //! Buckets telescope and sum exactly back to Real, so the output is an additive
 //! stacked **waterfall** rendered at five levels (cluster / pool / worker /
-//! iteration — idle 0 by construction / per-kernel). In unlocked mode only, the
+//! iteration — idle 0 by construction / per-kernel). In both modes, the
 //! `model.work` labeler adds segmented and scope-fused bounds below R5 and splits
 //! `hw-optimal` into `[excess-over-necessary | fusion | hardware-necessary]`.
-//! Batch-locked run aggregates keep the plain six-bucket R0..R5 ladder because
-//! their current operating points must not be globally rebatchable. An exact
-//! iteration waterfall may append the two aggregate `model.work` floors in either
-//! mode: locked labels the exact batch, while unlocked labels 10,000 independent
-//! copies and normalizes back to one iteration. Exact and run kernel ladders append
+//! Unlocked run aggregation may fuse additive work into a saturated batch. Locked
+//! aggregation evaluates each observed iteration's rooflines first, then adds them
+//! through worker / pool / cluster without rebatching. An exact iteration waterfall
+//! uses the same distinction: locked labels the exact batch, while unlocked labels
+//! 10,000 independent copies and normalizes back to one iteration. Exact and run kernel ladders append
 //! mapped segmented R6 plus aggregate-only scope-fused R7 when a strict semantic-location
 //! map covers the manifest. Run pool/cluster ladders are summed and reconciled by the
 //! analyzer rather than reconstructed by the UI.
