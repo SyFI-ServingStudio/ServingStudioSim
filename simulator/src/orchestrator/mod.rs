@@ -6,16 +6,16 @@
 //! `common`; concrete deployments live under `impls`.
 
 pub mod common;
-pub mod impls;
 pub mod config;
+pub mod impls;
 
-pub use self::common::{GpuCluster, GpuInfo, OrchAction, UnifiedWorkerFactory};
-pub use impls::{
-    AfdAttnPoolController, AfdFfnPoolController, AfdFlow, DpPlacementPolicy, PdFlow, SimpleDpConfig,
-    SimpleDpFlow, SimpleDpPoolConfig, SimpleDpPoolController, AFD_ATTN_POOL, AFD_FFN_POOL,
-    PD_DECODE_POOL, PD_PREFILL_POOL,
-};
+pub use self::common::{GpuCluster, GpuInfo, OrchAction, UnifiedWorkerFactory, WorkerFactory};
 pub use config::{GroupSpec, PlacementPolicy, PoolSpec};
+pub use impls::{
+    AfdAttnPoolController, AfdFfnPoolController, AfdFlow, DpPlacementPolicy, PdFlow,
+    SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, SimpleDpPoolController, AFD_ATTN_POOL,
+    AFD_FFN_POOL, PD_DECODE_POOL, PD_PREFILL_POOL,
+};
 
 use crate::common::{Request, Time};
 use crate::worker::SharedGpuCluster;

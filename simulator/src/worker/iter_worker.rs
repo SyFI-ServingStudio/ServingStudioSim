@@ -1,17 +1,18 @@
-//! `IterWorker` — the L6-facing surface shared by every iter-wise
-//! `IterwiseUnifiedModel`-backed worker (barebone, HP/DP, PD prefill/decode).
-//! Factored into a trait so the orchestrator's worker-stamping infra
-//! (`UnifiedWorkerFactory`) and DP flow (`SimpleDpFlow`) are generic over the
-//! concrete worker type, not pinned to one.
+//! `IterWorker` — the L6-facing surface shared by every iter-wise worker.
+//! A worker may be backed by `IterwiseUnifiedModel`, a paired model-specific
+//! input contract, or multiple resident models; L6 deliberately sees none of
+//! those construction details. `WorkerFactory<W>` stamps concrete workers and
+//! `SimpleDpFlow<W>` drives only this trait.
 //!
 //! Construction stays OFF the trait: each worker keeps its own `new(...)` (all
 //! sharing the same signature), and the factory is handed that `new` as a plain
 //! function pointer — so the trait carries only the per-tick driving methods.
 
+use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{Time, WorkerId};
+use crate::worker::types::{AttnWorkerEvent, AttnWorkerMsg, FfnWorkerEvent, FfnWorkerMsg};
 use crate::worker::types::{WorkerEventCommon, WorkerMsgCommon, WorkerStatus};
 use crate::worker::unified::BareboneWorker;
-use crate::arch::contract::IterwiseUnifiedModel;
 
 /// The surface L6 drives an iter-wise worker through each tick: read its id (for
 /// GPU inventory + placement), hand it work (`enqueue`), advance its FSM while
@@ -44,6 +45,26 @@ pub trait IterWorker {
     fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time>;
     fn status(&self) -> WorkerStatus;
 }
+
+/// Extra L6-facing capability required by the AFD attention pool.
+///
+/// The pool constructs the common slot/barrier messages through `From` and
+/// balances new requests by the worker-owned projected KV peak. A PD-for-AFD
+/// variant may use a wider message enum (for example, adding a prefill handoff)
+/// while still accepting the common AFD control protocol.
+pub trait AfdAttnWorker: IterWorker<Event = AttnWorkerEvent>
+where
+    Self::Msg: From<AttnWorkerMsg>,
+{
+    fn estimated_peak_kv(&self) -> u64;
+}
+
+/// L6-facing capability for an AFD FFN executor.  Unlike attention there is no
+/// placement metric: a FFN worker consumes independent aggregated tasks, so its
+/// complete contract is the typed `IterWorker` message/event surface.
+pub trait AfdFfnWorker: IterWorker<Msg = FfnWorkerMsg, Event = FfnWorkerEvent> {}
+
+impl<T> AfdFfnWorker for T where T: IterWorker<Msg = FfnWorkerMsg, Event = FfnWorkerEvent> {}
 
 /// Barebone worker (§3.4) plugs in by delegating to its existing inherent methods
 /// — its bodies are unchanged; this only exposes them through the trait.

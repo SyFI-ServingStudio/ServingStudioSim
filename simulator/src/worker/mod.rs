@@ -18,6 +18,17 @@ pub mod pd_prefill;
 pub mod types;
 pub mod unified;
 
+// Compile the worker-composition experiment against the real crate in test builds.
+// Keeping this private and test-only lets the stress census exercise crate-private
+// L5 contracts without changing production selectors or module exports.
+#[cfg(test)]
+#[path = "../../../sketch/worker_compose/mod.rs"]
+mod worker_compose_stress;
+
+#[cfg(test)]
+#[path = "../../../sketch/worker_v2/mod.rs"]
+mod worker_v2_stress;
+
 pub use admission_helpers::{Batch, DecodeReqState, KvAdmission, KvPool, LoadBalance};
 pub use config::{AttnWorkerSel, BatchPolicy, FfnWorkerSel, IterWorkerSel};
 pub use cost_buffers::CostBuffers;
@@ -25,7 +36,7 @@ pub use disagg_attn::DisaggAttnWorker;
 pub use disagg_ffn::DisaggFfnWorker;
 pub use gpu_cluster::{CostSource, GpuCluster, GpuInfo, SharedGpuCluster};
 pub use hp_unified::HpUnifiedWorker;
-pub use iter_worker::IterWorker;
+pub use iter_worker::{AfdAttnWorker, AfdFfnWorker, IterWorker};
 pub use pd_decode::PdDecodeWorker;
 pub use pd_prefill::PdPrefillWorker;
 pub use types::{

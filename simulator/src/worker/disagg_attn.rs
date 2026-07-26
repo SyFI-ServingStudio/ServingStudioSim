@@ -77,7 +77,7 @@ use crate::log::{KvSampler, KvSubmit};
 use crate::worker::admission_helpers::Batch;
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::iter_worker::IterWorker;
+use crate::worker::iter_worker::{AfdAttnWorker, IterWorker};
 use crate::worker::types::{AttnWorkerEvent, AttnWorkerMsg, WorkerConfig, WorkerStatus};
 
 // ── types ─────────────────────────────────────────────────────────────────────
@@ -329,7 +329,13 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
         cluster
             .borrow_mut()
             .register_kv_capacity(pool_tag, pool.0, id.0, 0, kv_capacity);
-        let kv = KvSampler::open_opt(cost_log_dir.as_deref(), pool_tag, id, 1, config.kv_log_stride);
+        let kv = KvSampler::open_opt(
+            cost_log_dir.as_deref(),
+            pool_tag,
+            id,
+            1,
+            config.kv_log_stride,
+        );
         let cost = CostBuffers::new(
             cost_log_dir,
             pool_tag,
@@ -401,6 +407,12 @@ impl<M: AttnLayerwiseModel> IterWorker for DisaggAttnWorker<M> {
     }
 }
 
+impl<M: AttnLayerwiseModel> AfdAttnWorker for DisaggAttnWorker<M> {
+    fn estimated_peak_kv(&self) -> u64 {
+        DisaggAttnWorker::estimated_peak_kv(self)
+    }
+}
+
 impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
     // ── admission entry: Admit / Release ─────────────────────────────────────────
 
@@ -420,7 +432,8 @@ impl<M: AttnLayerwiseModel> DisaggAttnWorker<M> {
             "AFD Admit is once-per-request; re-Admit of {req:?} means the flow invariant broke"
         );
         let (prompt_kv, remaining) = self.footprint(req);
-        self.worker_pending.push_back(req, prompt_kv + remaining as u64);
+        self.worker_pending
+            .push_back(req, prompt_kv + remaining as u64);
         // Location: request now queued on this attn worker. Stamped at its arrival
         // time (admit carries no clock; arrival is on the record).
         let mut store = self.requests.borrow_mut();

@@ -2,11 +2,10 @@
 //! L6a (`SimpleDpPoolController`) + L6b (`SimpleDpFlow`) live in one file because
 //! the deployment is tiny, but stay two structs (L6 design.md §「simple DP」).
 
-use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time, WorkerId};
 use crate::worker::{CostSource, GpuCluster, IterWorker, SharedGpuCluster, WorkerEventCommon};
 
-use super::super::{Flow, OrchAction, UnifiedWorkerFactory};
+use super::super::{Flow, OrchAction, WorkerFactory};
 
 /// Sentinel for a quiescent worker. `Option<Time>` would add a tag; the simulator
 /// clock is a `u64` newtype, so this keeps the hot wakeup array dense while still
@@ -23,8 +22,8 @@ pub enum DpPlacementPolicy {
 }
 
 /// Config for one DP pool — pure orchestration (which workers, how to place).
-/// The GPU facts each worker spans live on the [`UnifiedWorkerFactory`] (the
-/// worker-stamping infra) and on the worker's own model, not here.
+/// The GPU facts each worker spans live behind its [`WorkerFactory`] and on the
+/// worker's paired model/arch contract, not here.
 pub struct SimpleDpPoolConfig {
     pub pool: PoolId,
     pub num_workers: u16,
@@ -38,7 +37,7 @@ pub struct SimpleDpConfig {
 
 // ── L6a: pool-local orchestration ─────────────────────────────────────────────
 
-pub struct SimpleDpPoolController<M: IterwiseUnifiedModel, W: IterWorker> {
+pub struct SimpleDpPoolController<W: IterWorker> {
     pool: PoolId,
     workers: Vec<W>,
     /// Hot wakeup filter: `NO_WAKEUP_TIME` means quiescent; any real timestamp is
@@ -48,21 +47,19 @@ pub struct SimpleDpPoolController<M: IterwiseUnifiedModel, W: IterWorker> {
     worker_wakeup_times: Vec<Time>,
     placement: DpPlacementPolicy,
     rr_next: usize,
-    _model: std::marker::PhantomData<M>,
 }
 
-impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
+impl<W: IterWorker> SimpleDpPoolController<W> {
     // ── Construction ──────────────────────────────────────────────────────────
     /// Build the pool's workers, each handed the shared `cluster` so it can
     /// self-register its GPU block. Sharing one cluster across pools keeps GPU
     /// ids globally unique — a multi-pool deployment threads the same cluster
     /// into every pool's `new`, so ids continue (`allocate` appends from the
     /// current length) instead of every pool restarting at 0.
-    pub fn new(
-        cfg: &SimpleDpPoolConfig,
-        factory: &UnifiedWorkerFactory<M, W>,
-        cluster: &SharedGpuCluster,
-    ) -> Self {
+    pub fn new<F>(cfg: &SimpleDpPoolConfig, factory: &F, cluster: &SharedGpuCluster) -> Self
+    where
+        F: WorkerFactory<W>,
+    {
         assert!(cfg.num_workers > 0, "simple_dp needs at least one worker");
         let workers: Vec<W> = (0..cfg.num_workers)
             .map(|i| factory.build(i, cfg.pool, cluster))
@@ -73,7 +70,6 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
             workers,
             placement: cfg.placement,
             rr_next: 0,
-            _model: std::marker::PhantomData,
         }
     }
 
@@ -163,7 +159,7 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W> {
 // "admit a request" entry point can stay one method. Decoupled into its own
 // `impl` block so workers whose Msg does not (or cannot) carry Request — none
 // today, but the bound keeps the trait surface minimal — still compile.
-impl<M: IterwiseUnifiedModel, W: IterWorker> SimpleDpPoolController<M, W>
+impl<W: IterWorker> SimpleDpPoolController<W>
 where
     W::Msg: From<RequestId>,
 {
@@ -176,9 +172,9 @@ where
 
 // ── L6b: deployment flow (the object L7 calls) ────────────────────────────────
 
-pub struct SimpleDpFlow<M: IterwiseUnifiedModel, W: IterWorker<Event = WorkerEventCommon>> {
+pub struct SimpleDpFlow<W: IterWorker<Event = WorkerEventCommon>> {
     requests: SharedRequests,
-    dp_pool: SimpleDpPoolController<M, W>,
+    dp_pool: SimpleDpPoolController<W>,
     /// Shared run-level GPU cluster (registry + transfer oracle), built here and
     /// threaded into the pool's construction so workers self-register and (PD
     /// only) keep a handle for runtime transfers. simple_dp has one pool today,
@@ -191,20 +187,22 @@ pub struct SimpleDpFlow<M: IterwiseUnifiedModel, W: IterWorker<Event = WorkerEve
     events: Vec<WorkerEventCommon>,
 }
 
-impl<M, W> SimpleDpFlow<M, W>
+impl<W> SimpleDpFlow<W>
 where
-    M: IterwiseUnifiedModel,
     W: IterWorker<Event = WorkerEventCommon>,
 {
-    pub fn new(cfg: SimpleDpConfig, factory: UnifiedWorkerFactory<M, W>) -> Self {
-        let requests = std::rc::Rc::clone(&factory.requests);
+    pub fn new<F>(cfg: SimpleDpConfig, factory: F) -> Self
+    where
+        F: WorkerFactory<W>,
+    {
+        let requests = std::rc::Rc::clone(factory.requests());
         // simple_dp has no inter-worker transfers, but the cluster is still the
         // GPU registry — wire a sentinel `CostSource` whose `submit_transfer`
         // would return ~zero if ever called (it isn't: only PD decode workers
         // call it, and there are none here).
-        let cluster: SharedGpuCluster = std::rc::Rc::new(std::cell::RefCell::new(
-            GpuCluster::new(CostSource::analytic(f64::INFINITY)),
-        ));
+        let cluster: SharedGpuCluster = std::rc::Rc::new(std::cell::RefCell::new(GpuCluster::new(
+            CostSource::analytic(f64::INFINITY),
+        )));
         let dp_pool = SimpleDpPoolController::new(&cfg.dp_pool, &factory, &cluster);
         Self {
             requests,
@@ -215,9 +213,8 @@ where
     }
 }
 
-impl<M, W> Flow for SimpleDpFlow<M, W>
+impl<W> Flow for SimpleDpFlow<W>
 where
-    M: IterwiseUnifiedModel,
     W: IterWorker<Event = WorkerEventCommon>,
     W::Msg: From<RequestId>,
 {
@@ -249,6 +246,7 @@ where
 mod tests {
     use super::*;
     use crate::common::RequestStore;
+    use crate::orchestrator::UnifiedWorkerFactory;
     use crate::test_helpers::FakeModel;
     use crate::worker::{BareboneWorker, WorkerConfig};
     use std::cell::RefCell;
@@ -258,7 +256,7 @@ mod tests {
     fn build_flow(
         num_workers: u16,
         placement: DpPlacementPolicy,
-    ) -> (SimpleDpFlow<FakeModel, BareboneWorker<FakeModel>>, SharedRequests) {
+    ) -> (SimpleDpFlow<BareboneWorker<FakeModel>>, SharedRequests) {
         let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
         let factory = UnifiedWorkerFactory::new(
             Arc::new(FakeModel::for_ms(1.0)),

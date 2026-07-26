@@ -1,0 +1,984 @@
+schema_version: 1
+
+lesson:
+  id: worker-v2-four-axis
+  title: "worker_v2 —— 四轴 worker 组合抽象导览"
+  description: >
+    按真实代码读懂 L5 worker 重设计在 sketch/worker_v2 里的编码方式:一个 worker
+    如何拆成四根正交轴(KV / admission / execution / cadence-shell),为什么编译期
+    census 就是"它们能组合"的证明,以及每根轴的核心 trait 与它的多个具体 impl 各自
+    长什么样。阅读顺序:先看门面(整体控制面 + 证明),再按依赖序逐轴深入到 KV、
+    admission、IterModelExecution,最后到持有 FSM 的 shell 与四种 cadence。代码注释与标识符
+    保留英文原文。
+
+  metadata:
+    type: architecture
+    lifecycle: permanent
+
+  chapters:
+    - id: overview
+      title: "第 1 章 · 形状与证明"
+
+      steps:
+        - id: axes-facade
+          title: "四轴,一轴一文件夹"
+          primary:
+            file: sketch/worker_v2/mod.rs
+            range:
+              start_line: 10
+              end_line: 26
+          explanation: |
+            **`worker_v2` 是一个纯编译实验:把一个 L5 worker 拆成四根正交轴,每轴一个文件夹** —— `kv/`、`admission/`、`execution/`,再加上持有 cadence 的 `workers/`,共享一层 `shared/` 词汇。`workers/` 内再按 cadence family 分目录,每个具体 `build_*` recipe 独占同名文件。它不接任何生产 selector,只以 `cfg(test)` 引入,目的就是让 `cargo check` 从类型上验证这些接缝能拼在一起。
+          key_points:
+            - 函数体是粗糙的,但每个输入/输出类型、每个对外部函数的调用都与 `simulator/src/` 逐字对齐(重新核验过,不是照抄旧 sketch)。
+            - 22 个 server 覆盖 16 个不同 worker 类型,均在 `census.rs` 里被编译断言。
+
+        - id: compose-shape
+          title: "一个 worker = ⟨K, A, E⟩ 装到 shell 上"
+          primary:
+            file: sketch/worker_v2/workers/iter/iter_batch_worker.rs
+            range:
+              start_line: 53
+              end_line: 65
+          explanation: |
+            **一个 worker 就是三元组 `⟨K, A, E⟩` 装到某个 cadence shell 上,`where` 子句就是全部契约。** `IterBatchWorker` 对 [KV](code-ref:kv-axis)(`K: KvStore + IterWorkerKv`)、[admission](code-ref:admission-axis)(`A: IterAdmission<K>`)、[execution](code-ref:exec-axis)(`E: IterModelExecution<K>`)三者泛型。关键点:admission 与 exec 把 `K` 当作**trait 参数**而非方法泛型,于是某个 impl 可以在自己的 bound 里对 `K` 追加能力要求。
+          related:
+            - id: kv-axis
+              title: "KvStore —— 唯一跨 family 的轴"
+              location:
+                file: sketch/worker_v2/kv/mod.rs
+                range:
+                  start_line: 41
+                  end_line: 69
+            - id: admission-axis
+              title: "IterAdmission<K> —— lifecycle 轴"
+              location:
+                file: sketch/worker_v2/admission/mod.rs
+                range:
+                  start_line: 30
+                  end_line: 57
+            - id: exec-axis
+              title: "IterModelExecution<K> —— 执行轴"
+              location:
+                file: sketch/worker_v2/execution/mod.rs
+                range:
+                  start_line: 42
+                  end_line: 56
+
+        - id: census-mechanism
+          title: "cargo check 通过 = 证明"
+          primary:
+            file: sketch/worker_v2/census.rs
+            range:
+              start_line: 45
+              end_line: 52
+          explanation: |
+            **`cargo check` 通过本身就是"每个采样组合都合法"的证明。** `assert_iter` 和 `assert_afd_attn` 是把 `W` 约束到真实 L6 worker trait 的泛型空函数;一个[永不被调用的 `census` 函数](code-ref:census-body)用具体的 `⟨K, A, E⟩` 元组实例化它们,逼编译器在类型检查期把每一条 trait bound 兑现掉。
+          related:
+            - id: census-body
+              title: "被采样的元组清单"
+              location:
+                file: sketch/worker_v2/census.rs
+                range:
+                  start_line: 57
+                  end_line: 66
+
+        - id: census-iter-rows
+          title: "iter 家族 × 四种 KV 全断言"
+          primary:
+            file: sketch/worker_v2/census.rs
+            range:
+              start_line: 58
+              end_line: 140
+          explanation: |
+            **普通 iter 组合仍复用 `IterBatchWorker`,但 speculative 已被 census 明确断言为独立的 `DraftVerifyWorker` 类型。** barebone、HP-DP、PD-prefill、chunked、prefix、hybrid 与 multi-model 展示 KV/admission/policy 的组合复用;speculative 则因 runtime acceptance 与 tentative KV lifecycle 改变 cadence,走单独的 S6 类型,不再伪装成 `decode_steps` 配置。
+          key_points:
+            - policy 交换是纯 type-param 变化,census 里表现为 `<FifoOrder>` / `<ShortestJobFirst>` 两行,无任何 lifecycle/KV/shell 改动。
+
+        - id: census-coverage
+          title: "blind test 与轴可选的家族"
+          primary:
+            file: sketch/worker_v2/census.rs
+            range:
+              start_line: 140
+              end_line: 179
+          explanation: |
+            **最有戏的几行:展示可扩展性与"轴可选"。** `TieredMemoryKv` 两行是盲测 —— 一个全新 KV 布局不改任何既有代码就能组合,而且一个 tier-aware 的 [`TierAwareIterExecution`](code-ref:tiered-exec-def) 把它的 `K` bound 升级到 `TieredKvView` 来对 offload 计费。下方 [`BufferedFfnWorker<E>`](code-ref:ffn-only) 只用 execution 一根轴组合 —— 一个家族只取它需要的轴,`<K, A, E>` 三元组不是每个 worker 都要填满的固定形状。
+          related:
+            - id: tiered-exec-def
+              title: "TierAwareIterExecution —— 升级到 TieredKvView 的 exec"
+              location:
+                file: sketch/worker_v2/execution/tier_aware_iter.rs
+                range:
+                  start_line: 49
+                  end_line: 72
+            - id: ffn-only
+              title: "FfnTaskExecution —— 无 KV、无 store"
+              location:
+                file: sketch/worker_v2/execution/mod.rs
+                range:
+                  start_line: 96
+                  end_line: 116
+
+    - id: common-vocab
+      title: "第 2 章 · 共享词汇"
+
+      steps:
+        - id: grouping
+          title: "资源轴 ⟂ 请求轴"
+          primary:
+            file: sketch/worker_v2/shared/advance_scope.rs
+            range:
+              start_line: 9
+              end_line: 23
+          explanation: |
+            **整套设计立足的唯一公理:资源轴(`PartitionId`)与请求轴(`AdvanceScope`)正交。** 容量问题(fits / reserve / release / pressure)以裸 partition 为键;请求推进与 input 渲染以"这次操作碰哪些 request"为键。AFD 是这条正交性的证明 —— 一个 shard partition 配三个 slot grouping;barebone 则处处退化为 `WholePartition(0)`。`AdvanceScope::RequestSubset` 显式带上 `partition`,让空 slot 也能报出自己的资源分区。
+
+        - id: worker-ctx
+          title: "组件无关的共享态"
+          primary:
+            file: sketch/worker_v2/shared/context.rs
+            range:
+              start_line: 11
+              end_line: 20
+          explanation: |
+            **`WorkerContext` 只装"多个组件都要用、但谁都不该独占"的东西** —— worker 身份、[共享请求 slab](code-ref:shared-requests)、两个 lifecycle 日志开关。它刻意**不是**整个 `WorkerConfig`:构造期字段在 shell 的 builder 里消费掉,策略字段落在 admission 轴上。
+          related:
+            - id: shared-requests
+              title: "SharedRequests —— 请求存储句柄"
+              location:
+                file: simulator/src/common/request.rs
+                range:
+                  start_line: 303
+                  end_line: 306
+
+        - id: token-emit
+          title: "两家族共享的 token 记账原语"
+          primary:
+            file: simulator/src/common/request.rs
+            range:
+              start_line: 133
+              end_line: 168
+          explanation: |
+            **逐 token 完成记账是 family 无关的,但真正共享的是 `RequestRecord` 的方法本身 —— `record_first_token`、`record_token`、`is_complete`。** ordinary iter、DraftVerify lifecycle 与 AFD-ffn Terminal 各自按自己的 cadence 调用这些原语,不共享一个会掩盖 completion ownership 的 wrapper。
+
+    - id: kv-axis-chapter
+      title: "第 3 章 · KV —— 唯一跨 family 的轴"
+
+      steps:
+        - id: kvstate-core
+          title: "每个 impl 都要答的核心"
+          primary:
+            file: sketch/worker_v2/kv/mod.rs
+            range:
+              start_line: 41
+              end_line: 69
+          explanation: |
+            **`KvStore` 是唯一跨家族统一的轴,每个 KV impl 都实现它。** 它的 `Footprint` 对 admission **不透明** —— prefill vs decode 的角色差异藏在 admission "传进来什么"(prefill 令 decode=0),不在 KV 里。容量问题只有一个:`fits`;没有 remaining/capacity/peak 之类标量泄漏,admission 只能通过中性的 `KvCapacityPressure` 报告去排压力序。
+
+        - id: iter-batch-kv
+          title: "iter 家族的窄查询视图"
+          primary:
+            file: sketch/worker_v2/kv/mod.rs
+            range:
+              start_line: 76
+              end_line: 91
+          explanation: |
+            **`IterWorkerKv` 是 whole-iteration cadence(barebone/HP/PD/chunked,以及 S6 的基础视图)读取的一组窄事实**,以拥有所有权的快照返回,从不泄漏 `&Batch`。`DraftVerifyWorker` 再额外要求 `SpeculativeKv`,把 tentative proposal 生命周期作为能力加上去。
+
+        - id: kv-capability
+          title: "能力子 trait(ISP)与乘法叠加"
+          primary:
+            file: sketch/worker_v2/kv/mod.rs
+            range:
+              start_line: 151
+              end_line: 164
+          explanation: |
+            **能力是接口隔离(ISP)子 trait:只由需要它的 impl 实现、只被需要它的轴读取。** `PrefixCacheKv` 是范例 —— 一个前缀感知的 lifecycle 把 bound 升级到 `where K: PrefixCacheKv`,能力在类型检查期被强制,而不是运行时 flag。叠加是免费的:把能力用 `+` AND 到 bound 上即可,比如 [`HandoffKv`](code-ref:held-cap) 的 hold/drop、[`ChunkedPrefillKv`](code-ref:chunked-cap) 的分块落地、[`TieredKvView`](code-ref:tiered-cap) 的分层视图可以共存,谁都不给别的 impl 强加 dummy 方法。
+          related:
+            - id: held-cap
+              title: "HandoffKv —— PD hold/drop 能力"
+              location:
+                file: sketch/worker_v2/kv/mod.rs
+                range:
+                  start_line: 102
+                  end_line: 119
+            - id: chunked-cap
+              title: "ChunkedPrefillKv —— 分块 prefill 能力"
+              location:
+                file: sketch/worker_v2/kv/mod.rs
+                range:
+                  start_line: 121
+                  end_line: 146
+            - id: tiered-cap
+              title: "TieredKvView —— 分层读视图"
+              location:
+                file: sketch/worker_v2/kv/mod.rs
+                range:
+                  start_line: 200
+                  end_line: 220
+
+        - id: kv-leaf
+          title: "唯一的真实 leaf,其余都包它"
+          primary:
+            file: sketch/worker_v2/kv/full_attn.rs
+            range:
+              start_line: 55
+              end_line: 69
+          explanation: |
+            **`FullAttnKv` 是唯一的真实 leaf —— 其它每个 KV impl 都是它的薄壳。** 它每个 partition 持有真实共享 `Batch`,外加 `promised` 预留账本、`held` 账本(PD)、`KvAdmission` 门与占用 `sampler`,所以 `fits` / `reserve` / `advance` 逐字复用生产计费。它产出的 [`FullAttentionKvFootprint`](code-ref:full-footprint) 不预先求和,好让 `fits` 直接调真实的 `KvAdmission::try_admit`。
+          related:
+            - id: full-footprint
+              title: "FullAttentionKvFootprint —— 不透明货币"
+              location:
+                file: sketch/worker_v2/kv/full_attn.rs
+                range:
+                  start_line: 20
+                  end_line: 53
+
+        - id: kv-wrapper
+          title: "新 KV 变体 = 壳 + 一个读视图(tiered)"
+          primary:
+            file: sketch/worker_v2/kv/tiered.rs
+            range:
+              start_line: 27
+              end_line: 53
+          explanation: |
+            **一个新 KV 变体以"壳 + 一个读视图 + 一行 census"进入,不碰任何既有函数体。** `TieredMemoryKv` 包住一个用**总容量(fast + slow)**构造的 `FullAttnKv`,于是每个 `KvStore` / `IterWorkerKv` 方法都纯委托、`fits`/`reserve` 无需改;唯一新增代码是 [`resident_by_tier`](code-ref:resident-by-tier) —— tier-aware cost model 能据以计费的 fast/slow 切分。
+          related:
+            - id: resident-by-tier
+              title: "resident_by_tier —— 唯一新增方法"
+              location:
+                file: sketch/worker_v2/kv/tiered.rs
+                range:
+                  start_line: 135
+                  end_line: 146
+
+        - id: kv-wrap-prefix
+          title: "prefix 壳:partition-local probe + sticky placement"
+          primary:
+            file: sketch/worker_v2/kv/mod.rs
+            range:
+              start_line: 147
+              end_line: 172
+          explanation: |
+            **`PrefixCacheKv` 返回 partition-local 的 `PrefixPlacementProbe`:命中量与 opaque footprint 来自同一次 cache snapshot,避免"在 A partition 探测、拿 B partition 的 footprint 准入"。** [`PrefixPrefillDecodeAdmission` 的 placement](code-ref:prefix-placement)遍历可容纳的 partitions,先选 reusable prefix 更多者,再用 normalized KV pressure 破平局;`reserve(req, chosen_partition, footprint)` 随后把 request→partition 固化,收尾逐 partition 推进,因此 prefill、decode、release 保持 sticky。
+
+            容量语义要分开看:**prefix storage 与 request KV 共用同一个 HBM capacity gate**,但当前 sketch 没有 radix index/refcount/replacement ledger,所以 `cached_prefix` 仍按 request 保守地重复计费,尚未模拟真正的共享块。这个 fidelity 缺口留在 KV impl 内,不污染 Admission/Shell 抽象。
+          related:
+            - id: prefix-placement
+              title: "PrefixPrefillDecodeAdmission —— probe、fits、pressure 后选择 partition"
+              location:
+                file: sketch/worker_v2/admission/prefix_prefill_decode_admission.rs
+                range:
+                  start_line: 37
+                  end_line: 86
+
+        - id: kv-wrap-hybrid
+          title: "hybrid 壳:per-kind advance 不对称"
+          primary:
+            file: sketch/worker_v2/kv/hybrid.rs
+            range:
+              start_line: 114
+              end_line: 132
+          explanation: |
+            **`HybridStateKv` 把 full-attention 交给内层 `Batch`(每 token +1),另立一个 recurrent 侧账本(定长 +0)—— 这个 per-kind advance 不对称就是混合模型本身。** `commit_resident` 让全注意力部分进真实 decode 集,同时给 recurrent 账本插一条定长条目;`advance` 只增长内层 `Batch`,从不碰 recurrent。那份定长态经 [`footprint` 的 fixed_state 分量](code-ref:hybrid-footprint)占住池子,而 [`HybridKvView`](code-ref:hybrid-view) 把两种 kind 的长度都暴露给 report/estimator。
+
+            **别把"增长率不同"读成"要两个池"** —— 它们正交。增长差异已经在 `advance` 里表达完了;容量侧共用一个池是因为物理上就是一块 HBM(recurrent 态占的每一 byte 就是 attention KV 拿不到的 byte),分成两个独立预算反而会 over-commit。真正需要第二个池的只有三种情况:静态 carve-out、硬 state-slot 上限、单位不可换算 —— 那时在 `fits` 里加一个 `&&` 条件,仍然全在本文件内,worker/admission/shell 一个字节不动。
+
+            **但同一个池不等于可以直接 delegate `fits`** —— 见[下一步](code-ref:hybrid-fits)。
+          related:
+            - id: hybrid-footprint
+              title: "footprint:recurrent 态进 fixed_state 槽(不是 prefix 槽)"
+              location:
+                file: sketch/worker_v2/kv/hybrid.rs
+                range:
+                  start_line: 77
+                  end_line: 88
+            - id: hybrid-fits
+              title: "fits —— 唯一一个不能直接 delegate 的壳"
+              location:
+                file: sketch/worker_v2/kv/hybrid.rs
+                range:
+                  start_line: 91
+                  end_line: 107
+            - id: hybrid-view
+              title: "HybridKvView —— 两种 kind 的长度视图"
+              location:
+                file: sketch/worker_v2/kv/hybrid.rs
+                range:
+                  start_line: 184
+                  end_line: 197
+
+        - id: kv-wrap-ledger-rule
+          title: "壳的判别式:自带资源账本 ⇒ delegate 必假"
+          primary:
+            file: sketch/worker_v2/kv/hybrid.rs
+            range:
+              start_line: 91
+              end_line: 107
+          explanation: |
+            `HybridStateKv::fits` 是全部五个 KV 里**唯一**不能写成 `self.inner.fits(..)` 的。原因是一条可复用的判别式:
+
+            > **wrapper 自己存了"占地方的东西"(资源账本)⇒ delegate 必然是假的;只存配置 / 阈值 / 路由 ⇒ delegate 成立。**
+
+            对照三个壳:`TieredMemoryKv` 把 `fast + slow` 在**构造时**折进 inner 的 capacity,自己只留一个只读阈值;`ModelPartitionedKv` 一 model 一 partition,自己只存路由;`ModeledPrefixCacheKv` 只存一个命中率配置,它的贡献全部走 footprint。三者 delegate 都是真的。只有 `HybridStateKv` 存了 `recurrent` 这本**真实占用**的账。
+
+            它会错在哪、错多少:候选自己的 recurrent 态确实经 `footprint.fixed_state` 进了门,`reserve` 也把它记进了 `promised`。但 [`commit_resident`](code-ref:commit-drops-it) 一执行,`promised.remove(&req)` 把它清掉,而传给 `finalize_to_decode` 的 `initial_kv` 是 admission 算的 `prompt + prefix_kv`、**不含 recurrent** —— 于是那份 token 离开 `promised`、从未进 `active_kv`,`try_admit` 从此看不见它。**每多一个常驻请求就超发一份 state**。
+
+            修法是照抄 inner 自己的 `held` 账本:`held` 也是"占了池子但不在 `active_kv` 里"的量,`FullAttnKv::fits` 早就把它加进 `group_promised`。所以开一个 [`fits_with_extra_occupied`](code-ref:fits-extra) 缝,`FullAttnKv::fits` 传 0,`HybridStateKv` 传 `partition_recurrent(partition)`。不会重复计数:一个请求要么在 `promised`、要么在 `recurrent`,`commit_resident` 是交接点,不重叠。
+          related:
+            - id: commit-drops-it
+              title: "commit_resident —— token 消失的那一行"
+              location:
+                file: sketch/worker_v2/kv/full_attn.rs
+                range:
+                  start_line: 181
+                  end_line: 193
+            - id: fits-extra
+              title: "fits_with_extra_occupied —— 给兄弟账本开的缝"
+              location:
+                file: sketch/worker_v2/kv/full_attn.rs
+                range:
+                  start_line: 110
+                  end_line: 145
+
+    - id: admission-axis-chapter
+      title: "第 4 章 · Admission —— lifecycle × selection"
+
+      steps:
+        - id: admission-trait
+          title: "over &mut K 的 per-family lifecycle"
+          primary:
+            file: sketch/worker_v2/admission/mod.rs
+            range:
+              start_line: 31
+              end_line: 61
+          explanation: |
+            **`IterAdmission<K>` 是 iter 家族的 lifecycle —— `accept_message` → `form_batch` → `complete_iteration` —— 并把 `K` 当 trait 参数。** 正因 `K` 是类型参数,某条 lifecycle 才能在 impl 块里要求一个能力:[`PrefillHandoffAdmission` 要 `K: HandoffKv`](code-ref:kv-held),好让它的 `ReleaseKv` 消息经 `accept_message` 拿到的 `&mut K` 去 drop 一个 held 预留 —— 这是只收消息的 accept 做不到的。
+          related:
+            - id: kv-held
+              title: "HandoffKv —— PrefillHandoffAdmission 要求的能力"
+              location:
+                file: sketch/worker_v2/kv/mod.rs
+                range:
+                  start_line: 102
+                  end_line: 119
+
+        - id: prefill-decode-formbatch
+          title: "参考 lifecycle:form_batch"
+          primary:
+            file: sketch/worker_v2/admission/local_prefill_decode_admission.rs
+            range:
+              start_line: 124
+              end_line: 175
+          explanation: |
+            **`LocalPrefillDecodeAdmission<P>` 是参考 lifecycle;`form_batch` 演示了准入的标准编排:取队头 → `kv.fits` → `kv.reserve`,并对 N 个分区通用。** 候选事实在 `accept_message`(到达)就冻结好了,`form_batch` 只跟 [policy 队列的头](code-ref:policy-order)打交道:`peek()` 看一眼、过了 token 预算 + KV 门才 `pop()`;被拒的头**留在队里**(peek 不出队)。`LoadBalance` 决定新 prefill 落哪个 DP shard —— 于是 barebone(N=1, `Single`)与 HP/DP(N, `RoundRobin`)共用同一段代码,N=1 时逐字等价。
+
+            两个分支的区别只是**取几个头**:`None` 取一个;`Some(budget)` 用 `while let Some(cand) = peek()` 一直取到预算或 KV 门首次挡住为止。注意**尾部从不被检视**——这正是下面那条性能规律的来源。
+          related:
+            - id: policy-order
+              title: "PendingOrderPolicy —— policy 自持队列,只给一个头"
+              location:
+                file: sketch/worker_v2/admission/policy/mod.rs
+                range:
+                  start_line: 49
+                  end_line: 73
+
+        - id: prefill-decode-complete
+          title: "参考 lifecycle:complete_iteration"
+          primary:
+            file: sketch/worker_v2/admission/local_prefill_decode_admission.rs
+            range:
+              start_line: 161
+              end_line: 227
+          explanation: |
+            **`complete_iteration` 现在只表达普通 autoregressive decode:每个 live request 记 1 个 token,整 partition `advance(...,1)`,再完成 prefill 转换与释放。** 完成事件仍走 [RequestRecord 的共享记账方法](code-ref:emit-token-ref);runtime-variable speculative completion 则由独立的 [DraftVerify lifecycle](code-ref:draft-verify-completion) 消费逐请求结果,不再把固定 N 塞进这个普通 lifecycle。
+          related:
+            - id: emit-token-ref
+              title: "RequestRecord 的共享记账方法"
+              location:
+                file: simulator/src/common/request.rs
+                range:
+                  start_line: 140
+                  end_line: 168
+            - id: draft-verify-completion
+              title: "逐请求 speculative completion"
+              location:
+                file: sketch/worker_v2/admission/draft_verify_admission.rs
+                range:
+                  start_line: 52
+                  end_line: 95
+
+        - id: prefill-handoff
+          title: "PD prefill:要求 HandoffKv 的 lifecycle"
+          primary:
+            file: sketch/worker_v2/admission/prefill_handoff_admission.rs
+            range:
+              start_line: 38
+              end_line: 74
+          explanation: |
+            **`PrefillHandoffAdmission` 是 PD prefill 的 lifecycle:prefill 后不本地 decode,而是把 KV держ住等 decode 侧来拉。** impl bound 升到 `K: IterWorkerKv + HandoffKv`(与 `ChunkedPrefillAdmission` 的 `ChunkedPrefillKv` 同型的能力升级);`accept_message` 处理两类消息 —— 新请求入队,以及 decode 侧的 `ReleaseKv → kv.drop_held`;`form_batch` 只按 prompt 预留(无本地 decode 预留,held KV 已经通过 `fits` 门)。收尾时它 [hold 住 KV 并发 `PrefillDone`](code-ref:handoff-hold) 让 L6 路由一个 decode。
+          related:
+            - id: handoff-hold
+              title: "complete_iteration:hold + PrefillDone"
+              location:
+                file: sketch/worker_v2/admission/prefill_handoff_admission.rs
+                range:
+                  start_line: 111
+                  end_line: 120
+
+        - id: slot-admission
+          title: "AFD-attn 是另一张准入面"
+          primary:
+            file: sketch/worker_v2/admission/mod.rs
+            range:
+              start_line: 62
+              end_line: 93
+          explanation: |
+            **AFD-attn 家族的准入是一张**不同**的 trait,不是 iter 家族的 `IterAdmission`。** `SlotPipelineAdmission` 两级 —— `enqueue_fresh_request`(入队新请求,尚无 KV)与 `reserve_fitting_requests`(KV 门控的预留,返回准入 id 交 shell 去排 slot)—— 没有 `form_batch`/`complete_iteration`,因为 shell 拥有逐层 cadence,完成记账落在配对的 FFN worker。per-family ≠ per-worker:第二个 AFD-attn worker 复用这同一张面。
+
+        - id: fresh-reserve
+          title: "FreshRequestSlotAdmission:AFD 的两级准入"
+          primary:
+            file: sketch/worker_v2/admission/fresh_request_slot_admission.rs
+            range:
+              start_line: 36
+              end_line: 72
+          explanation: |
+            **`FreshRequestSlotAdmission` 是 `SlotPipelineAdmission` 的具体实现,演示两级:`enqueue_fresh_request` 只入 FIFO 队(盖 `Pending`,不碰 KV),`reserve_fitting_requests` 才对队头逐个预留满 footprint(prompt+decode)直到 KV 装不下。** 它只写两处 KV:reserve(准入)与 release(取消);commit→resident 在层边界由 shell 驱动。v1 无 `PendingOrderPolicy`(AFD 走 FIFO),要加策略就像 `LocalPrefillDecodeAdmission<P>` 那样插入。
+
+        - id: selection-policy
+          title: "调度是纯子轴"
+          primary:
+            file: sketch/worker_v2/admission/policy/mod.rs
+            range:
+              start_line: 49
+              end_line: 73
+          explanation: |
+            **调度是 admission 之下的子轴,而且 policy 自己**持有**待选队列:lifecycle 往里 `push` 一个到达,之后每次只问它要**一个头**。** 全程不碰 KV、不改资源 —— 于是 `FifoOrder` 换 `ShortestJobFirst` 依然是一次 type-param 变化,对 KV / lifecycle / shell 零影响。`AdmissionCandidate.deadline` 就是将来 SLO / priority 请求插入的接缝。
+
+            **为什么是"自持队列"而不是"给我切片、还我全排列"。** 原先的签名是 `order(&[AdmissionCandidate]) -> Vec<usize>`,它**强制**调用方物化整个 backlog 并要求实现方返回一个拥有所有权的全排列 —— 而 `form_batch` 每个模拟迭代跑一次,却只用 `order.first()`。每迭代的账:一次 `Vec<AdmissionCandidate>` 堆分配 + N 次 store 索引 + 再一次 `Vec<usize>` 堆分配(`FifoOrder` 也逃不掉)+ SJF 的 O(N log N) 排序 + 结尾 `pending.retain(|rid| !admitted.contains(rid))` 的 O(N×M) 扫描。**为选 1 个元素做 3 遍全量遍历 + 2 次分配。**
+
+            更糟的是病态情形恰好是饱和情形:backlog 深 + KV 满 → 全量重建排序 → 一个都准入不进 → `form_batch` 返回 false → 下个 tick 原样再来。而生产代码 `worker/unified_iter.rs` 做的是 `pending_prefills.front()`,**O(1) 零分配** —— sketch 当时是一次相对生产的性能回归,且 sketch 是迁移蓝图,不能这样迁进去。
+
+            自持队列把这笔账拆干净:[`FifoOrder` = `VecDeque`](code-ref:fifo-queue)(push/peek/pop 全 O(1),与生产同成本),`ShortestJobFirst` = `BinaryHeap`(push/pop O(log N),peek O(1),**永不重排**,见下一步)。store 查找搬到 `accept_message`,于是是"每请求一次"而非"每 pending 请求每迭代一次";`retain` 整条消失(pop 即出队)。关键性质是:**若某个 policy 的排序真的依赖每迭代变化的状态(deadline 相对时钟的 slack、KV 压力、随缓存填充而变的前缀命中),它可以在自己的 `peek` 里重算 —— 代价落在需要它的那个 policy 身上,而不是让所有 policy 替最贵的那个买单。**
+          related:
+            - id: fifo-queue
+              title: "FifoOrder —— 队列即顺序,与生产 pending_prefills.front() 同成本"
+              location:
+                file: sketch/worker_v2/admission/policy/fifo.rs
+                range:
+                  start_line: 16
+                  end_line: 58
+
+        - id: shortest-job
+          title: "具体 policy:只读 AdmissionCandidate,增量维序"
+          primary:
+            file: sketch/worker_v2/admission/policy/shortest_job_first.rs
+            range:
+              start_line: 66
+              end_line: 101
+          explanation: |
+            **`ShortestJobFirst` 坐实"纯 swap":它只读 lifecycle 在到达时算好的 `prompt`/`decode`,按总工作量升序出队。** 无 store 访问、无 lifecycle 改动 —— 一个 worker 从吞吐向 FIFO 切到延迟向 SJF,只靠 `P` 这个类型参数。这就是 census 里 `<FifoOrder>` / `<ShortestJobFirst>` 两行断言背后的全部代价。
+
+            顺序由 [`ShortestWorkFirst` 的 `Ord`](code-ref:by-work) **增量**维持,不是每迭代重排:`BinaryHeap` 是大顶堆,所以 `Ord` 写成**反向**(`other.cmp(self)`),并用 `arrival_seq` 破平局 —— 逐字复现原先 stable sort 的 FIFO tie-break,**出队顺序与旧实现一致**,只是从 O(N log N)/迭代摊销成了 O(log N)/请求。`remove`(取消)是唯一的 O(n):`BinaryHeap` 没有按键删除,只能过滤重建 —— 可以接受,因为那是罕见控制路径,而每迭代的队头路径才是热路径。
+          related:
+            - id: by-work
+              title: "ShortestWorkFirst::Ord —— 反向比较 + arrival_seq 破平局"
+              location:
+                file: sketch/worker_v2/admission/policy/shortest_job_first.rs
+                range:
+                  start_line: 20
+                  end_line: 53
+
+        - id: policy-working-set
+          title: "ChunkedPrefillAdmission:多个 prefill,至多一个跨轮 chunk"
+          primary:
+            file: sketch/worker_v2/admission/chunked_prefill_admission.rs
+            range:
+              start_line: 36
+              end_line: 49
+          explanation: |
+            **一个 partition 的同一 iteration 可以包含多个 prefill,但跨 iteration 延续的 partial prefill 至多一个。** `policy` 持有所有尚未开始的 fresh 请求;`active_chunk: Option<AdmissionCandidate>` 只持 token budget 边界切出的唯一 continuation。下一轮先续这个 chunk,若完成后仍有预算,再从 policy 队头装入若干完整 prefill,最后仍至多留下一个新的 partial。
+
+            因而 `ChunkedPrefillAdmission<ShortestJobFirst>` 的准确含义是"最短的 fresh 作业下一个开始":SJF 增量维护 pending 顺序,却不能抢占 `active_chunk`。这也保持了单一 membership owner —— fresh 在 policy,已准入的 continuation 在 lifecycle/KV,没有一份排干后又混装 fresh 与 partial 的第二队列。
+
+    - id: exec-axis-chapter
+      title: "第 5 章 · IterModelExecution —— 执行与成本"
+
+      steps:
+        - id: modelexec-trait
+          title: "K 作 trait 参数(Root ② 修复)"
+          primary:
+            file: sketch/worker_v2/execution/mod.rs
+            range:
+              start_line: 45
+              end_line: 61
+          explanation: |
+            **`IterModelExecution<K>` 拥有 model-specific 的 `Input`、ArchInput builder 与成本求值,而且它同样把 `K` 当 trait 参数。** 这份与 `IterAdmission<K>` 的对称正是 [Root ② 修复](code-ref:root2-note):一个 tier- 或 modality-aware 的 exec 可以升级到 [`K: TieredKvView`](code-ref:kv-tiered-cap) 或 `HybridKvView` 去读能力视图,而通用的 `UnifiedIterExecution` 仍 impl for all `K: IterWorkerKv`,因此和每种 KV 都能组合。
+          related:
+            - id: root2-note
+              title: "模块注释里的 Root ② 原理"
+              location:
+                file: sketch/worker_v2/execution/mod.rs
+                range:
+                  start_line: 8
+                  end_line: 17
+            - id: kv-tiered-cap
+              title: "TieredKvView —— tier-aware exec 读的视图"
+              location:
+                file: sketch/worker_v2/kv/mod.rs
+                range:
+                  start_line: 200
+                  end_line: 220
+
+        - id: unified-exec
+          title: "通用 exec:对所有 K 成立"
+          primary:
+            file: sketch/worker_v2/execution/unified_iter.rs
+            range:
+              start_line: 28
+              end_line: 61
+          explanation: |
+            **`UnifiedIterExecution<M>` 是整迭代执行适配器,`impl<M, K: IterWorkerKv> IterModelExecution<K>` —— 对每种 iter KV 都成立。** `build_iteration_input` 复刻真实 `BareboneWorker::build_arch_input`:对每个 KV partition(DP shard)建一个 `ArchGroupInput`,逐 prefill admit 读 `prefix_kv`/`active_chunk_len`、逐 decode 读 `current_kv`,于是 N=1 barebone(一组)与 N>1 HP/DP(N 组)走**同一条代码路径**,arch 侧靠 `Max` fan-out 给出 DP 墙钟。
+          key_points:
+            - 类型 `Input = UnifiedArchInput`;`evaluate_iteration` 直接调真实 `CostBuffers::run_iter(model, input, iter, now)`。
+
+        - id: tiered-exec
+          title: "tier-aware exec:能力抵达成本模型"
+          primary:
+            file: sketch/worker_v2/execution/tier_aware_iter.rs
+            range:
+              start_line: 49
+              end_line: 72
+          explanation: |
+            **`TierAwareIterExecution<M>` 证明 Root ② 修复:一个 `IterModelExecution<K>` impl 现在能升级到 KV 能力视图,与 `IterAdmission<K>` 对称。** 它把 arch-input lowering 委托给内层 `UnifiedIterExecution`(不重复那段 group 循环),只加一件事:在 `build_iteration_input` 里读 [`TieredKvView`](code-ref:kv-tiered-cap2) 的 fast/slow 切分,`evaluate_iteration` 里对 slow 部分加 offload 附加费。impl bound 是 `K: IterWorkerKv + TieredKvView` —— 配 `FullAttnKv` 会在配方处编译报错,而**不是**逼 `FullAttnKv` 长一个 dummy 方法,这正是[修复关闭的那处不对称](code-ref:root2-note2)。
+          related:
+            - id: kv-tiered-cap2
+              title: "TieredKvView —— 它读的能力视图"
+              location:
+                file: sketch/worker_v2/kv/mod.rs
+                range:
+                  start_line: 200
+                  end_line: 220
+            - id: root2-note2
+              title: "IterModelExecution 模块注释:不对称与修复"
+              location:
+                file: sketch/worker_v2/execution/mod.rs
+                range:
+                  start_line: 8
+                  end_line: 17
+
+        - id: attn-exec
+          title: "AttentionLayerExecution:逐层执行面"
+          primary:
+            file: sketch/worker_v2/execution/mod.rs
+            range:
+              start_line: 64
+              end_line: 85
+          explanation: |
+            **`AttentionLayerExecution` 是 AFD-attn 家族的执行面:逐层(`evaluate_attention_layer` 每注意力层一次)而非整迭代,`build_iteration_input` 拿请求 `AdvanceScope` + `SlotPipelineKv` 而非 partition + `IterWorkerKv`。** shell 拥有"哪些请求在一个 slot 里",KV 只按 id 答 `current_kv`;`build_iteration_input` 返回该 batch 的 query token 数,供 shell 算 attn→ffn 交接字节大小(`Input` 对 shell 不透明)。
+
+        - id: ffn-exec
+          title: "最纯的 exec 退化掉两根轴"
+          primary:
+            file: sketch/worker_v2/execution/mod.rs
+            range:
+              start_line: 96
+              end_line: 116
+          explanation: |
+            **`FfnTaskExecution` 是最纯的 exec —— 无 KV、无 store,只吃 token 数 —— 这就是 AFD-ffn worker 能 [`<E>`-only 组合](code-ref:ffn-census) 的根。** L6 把预先组好的 `FfnTask` 交给它,于是三根轴退化掉两根:它只把 token 总数按 DP shard 切分,再跑某个 task 覆盖的 Bootstrap/Bridge/Terminal section。
+          related:
+            - id: ffn-census
+              title: "census 里的 <E>-only 断言"
+              location:
+                file: sketch/worker_v2/census.rs
+                range:
+                  start_line: 177
+                  end_line: 179
+
+    - id: shell-chapter
+      title: "第 6 章 · Worker —— 从 family 到所有 concrete kind"
+
+      steps:
+        - id: worker-family-layout
+          title: "先找 worker:family 是目录"
+          primary:
+            file: sketch/worker_v2/workers/mod.rs
+            range:
+              start_line: 1
+              end_line: 25
+          explanation: |
+            **`workers/` 不再是一摞平铺文件:一级目录就是 cadence family。** `iter/`、`pd_decode/`、`afd_attention/`、`afd_ffn/` 各自拥有本家的 worker/FSM;顶层 `mod.rs` 只做两件事:声明 family,再把可供 L6/factory 使用的 worker type、message type 与 `build_*` recipe 统一 re-export。调用方因此不需要知道内部文件布局,而维护者一眼就能判断某段 cadence 属于哪个 family。
+          key_points:
+            - "`worker_v2` 是版本/实验根,不是 family;真正的 family 边界在 `workers/<family>/`。"
+            - "新增 server recipe 时先进入已有 family,不要先造新 worker type。"
+            - "只有 cadence/event ownership 真变了,才新增 family 目录。"
+
+        - id: iter-family-inventory
+          title: "family 内:worker 与 recipe 分开"
+          primary:
+            file: sketch/worker_v2/workers/iter/mod.rs
+            range:
+              start_line: 1
+              end_line: 26
+          explanation: |
+            **`iter/` 展示了 family 目录的完整形状:** `iter_batch_worker.rs` 只放 shell/FSM;每个公开 `build_*` 都有同名文件;重复的机械构造材料放进 `unified_iter_build_essentials.rs`。每个 build 文件显式 import 自己的 K/A/E 与外部依赖,不通过 glob prelude 隐藏 recipe。`mod.rs` 是 inventory,不是实现垃圾桶 —— 看这 26 行就能知道 iter family 支持哪些构造 recipe,却不用穿过 FSM。
+          key_points:
+            - "worker 文件回答“运行时怎样 tick”。"
+            - "build 文件回答“这一种 server 选哪组 K/A/E 与 config”。"
+            - "helper 文件只能抽 family-private 的机械 wiring,不能吞掉具体 recipe 的语义差异。"
+
+        - id: iter-fsm-as-data
+          title: "FSM 是数据,不是轴"
+          primary:
+            file: sketch/worker_v2/workers/iter/iter_batch_worker.rs
+            range:
+              start_line: 17
+              end_line: 35
+          explanation: |
+            **FSM **不是**通用轴 —— 每个 shell 以纯数据持有自己的 cadence。** `IterBatchWorker` 把 `IterationFsm`(worker/batch FSM + iter 计数器)作为结构体字段持有,自己编排三根轴,而不是把 cadence 委托给某个可换组件。family == cadence,shell 就是把一个家族的节奏写清楚的地方。
+
+        - id: batch-iter-tick
+          title: "tick:把三轴按序缝起来"
+          primary:
+            file: sketch/worker_v2/workers/iter/iter_batch_worker.rs
+            range:
+              start_line: 78
+              end_line: 120
+          explanation: |
+            **`tick` 是把三根轴按 cadence 缝起来的主循环:Idle 态调 [`admission.form_batch`](code-ref:formbatch-ref),Active/NotStarted 调 `execution` 建 input 并 evaluate 算 `compute_end`,到点后 Done 调 `admission.complete_iteration`。** 这段循环把"准入是谁的事、成本是谁的事、收尾是谁的事"讲得一清二楚 —— shell 只做时序,三轴各管各的语义。`start_iteration` 里 `execution.build_iteration_input` + `execution.evaluate_iteration` 就是成本查询的两步。
+          related:
+            - id: formbatch-ref
+              title: "form_batch —— 被 tick 调用的准入"
+              location:
+                file: sketch/worker_v2/admission/local_prefill_decode_admission.rs
+                range:
+                  start_line: 108
+                  end_line: 153
+
+        - id: worker-construction-boundary
+          title: "from_components:builder 与 worker 的缝"
+          primary:
+            file: sketch/worker_v2/workers/iter/iter_batch_worker.rs
+            range:
+              start_line: 37
+              end_line: 71
+          explanation: |
+            **`IterBatchWorker::from_components` 是构造 recipe 与运行时 shell 的唯一窄缝。** builder 负责准备 `WorkerContext`、具体 `K`、具体 `A`、具体 `E`;worker 只接收已经构造好的四件东西,初始化自己的 scratch input 与 `IterationFsm`。它不知道 GPU 怎么 allocate、KV capacity 怎么换算、policy 为什么选 FIFO —— 那些是 recipe;builder 也不碰 tick cursor —— 那些是 worker。`pub(super)` 把这条缝限制在 `iter` family 内。
+
+    - id: iter-worker-kinds
+      title: "第 7 章 · Iter family —— 从基线逐个派生"
+
+      steps:
+        - id: barebone-worker
+          title: "基线:barebone 是完整 recipe"
+          primary:
+            file: sketch/worker_v2/workers/iter/build_barebone_worker.rs
+            range:
+              start_line: 15
+              end_line: 62
+          explanation: |
+            **从 `build_barebone_worker` 建立阅读基线:** 它调用 family-private deployment helper 准备公共资源,再明确组装 `⟨FullAttnKv, LocalPrefillDecodeAdmission<FifoOrder>, UnifiedIterExecution<M>⟩`。build 文件现在只留下这个 kind 的语义选择;后面的所有 iter kind 都用“相对这条基线换了什么”来读,而不是当成彼此无关的 worker。
+          key_points:
+            - "barebone = 1 partition + FIFO + 本地 prefill→decode + unified execution。"
+            - "它是一个 concrete server recipe,不是一个独有 cadence family。"
+
+        - id: iter-builder-common-wiring
+          title: "共享 wiring,不合并 recipe"
+          primary:
+            file: sketch/worker_v2/workers/iter/unified_iter_build_essentials.rs
+            range:
+              start_line: 15
+              end_line: 85
+          explanation: |
+            **独立 build 文件不等于复制所有 boilerplate。** `prepare_unified_iter_build_essentials` 只收敛统一执行 recipe 共有的机械步骤:allocate GPU、由 bytes/token 换算 partition capacity、注册静态容量、打开 sampler/cost buffers、构造 context 与 `UnifiedIterExecution`。它刻意不构造 K wrapper 或 admission,所以 `build_shortest_job_worker`、`build_chunked_prefill_worker`、`build_prefix_cache_worker` 等仍在自己的文件里显式决定具体 recipe。`BuildEssentials` 只指单 worker 的构造材料,不指 L6 deployment。
+          key_points:
+            - "可复用的是 component preparation,不是具体 server 的名字和意图。"
+            - "返回 deployment record 后仍由具体 builder 构造 K/A 并调用 `from_components`。"
+
+        - id: hp-worker
+          title: "HP/DP:同 type,partition 数变了"
+          primary:
+            file: sketch/worker_v2/workers/iter/build_hp_worker.rs
+            range:
+              start_line: 15
+              end_line: 68
+          explanation: |
+            **HP/DP worker 相对 barebone 只把 `N=1` 扩成 `N=model.num_attn_dp_groups()`,并让 placement 在这些 partition 间负载均衡。** K/A/E 的 concrete type 完全相同,因此 census 里 barebone 与 HP 只需要一条 type assertion。这里最重要的区分是:partition count 和 `LoadBalance` 是 construction config,不会凭空产生新的 worker type,更不是新的 cadence。
+
+        - id: shortest-job-worker
+          title: "SJF:只换 selection policy"
+          primary:
+            file: sketch/worker_v2/workers/iter/build_shortest_job_worker.rs
+            range:
+              start_line: 16
+              end_line: 66
+          explanation: |
+            **latency-scheduled worker 只把 `FifoOrder` 换成 `ShortestJobFirst`;shell、KV、lifecycle、execution 全部保持基线。** 这次确实产生了新的 concrete Rust type,因为 `P` 是 admission 的类型参数;但它仍是同一个 iter family。builder 复用 common wiring,只在 admission 那一行暴露排序差异,正好证明 selection 是 lifecycle 内的纯子轴。
+
+        - id: speculative-worker
+          title: "Speculative:S6 draft/verify cadence"
+          primary:
+            file: sketch/worker_v2/workers/draft_verify/build_speculative_decode_worker.rs
+            range:
+              start_line: 16
+              end_line: 43
+          explanation: |
+            **builder 的数字现在是 proposal width,不是预先承诺的 accepted length;真正结果由 `AcceptanceOracle` 每请求、每迭代产生。** recipe 构造 `DraftVerifyExecution` 与独立 `DraftVerifyWorker`;后者在 [compute 开始时创建 tentative proposals并保留 outcome](code-ref:draft-verify-start),完成时经 [SpeculativeKv capability](code-ref:speculative-kv-capability) commit accepted prefix、discard rejected suffix。spec 与 spec-DP 仍共享同一个 S6 recipe,但不再与普通 `IterBatchWorker` 混为同一 cadence。
+          related:
+            - id: draft-verify-start
+              title: "proposal 与 outcome 跨 compute window"
+              location:
+                file: sketch/worker_v2/workers/draft_verify/draft_verify_worker.rs
+                range:
+                  start_line: 128
+                  end_line: 148
+            - id: speculative-kv-capability
+              title: "tentative KV 生命周期"
+              location:
+                file: sketch/worker_v2/kv/mod.rs
+                range:
+                  start_line: 93
+                  end_line: 112
+
+        - id: chunked-worker
+          title: "Chunked prefill:第一次真正换 lifecycle"
+          primary:
+            file: sketch/worker_v2/workers/iter/build_chunked_prefill_worker.rs
+            range:
+              start_line: 16
+              end_line: 64
+          explanation: |
+            **chunked-prefill worker 保留 `IterBatchWorker + FullAttnKv + UnifiedIterExecution`,只把本地 lifecycle 换成 `ChunkedPrefillAdmission<FifoOrder>`。** 这不是 config:它改变了 pending→active 的状态机,引入 chunk budget 与“多个 prefill 同轮参与、至多一个跨轮 active chunk”的语义。仍然不需要新 shell,因为外层 cadence 还是 form batch → evaluate iteration → complete iteration。
+          related:
+            - id: chunked-sjf-kind
+              title: "同一 chunk lifecycle 的 SJF type"
+              location:
+                file: sketch/worker_v2/census.rs
+                range:
+                  start_line: 75
+                  end_line: 85
+
+        - id: pd-prefill-worker
+          title: "PD prefill:iter shell 输出 handoff"
+          primary:
+            file: sketch/worker_v2/workers/iter/build_pd_prefill_worker.rs
+            range:
+              start_line: 14
+              end_line: 68
+          explanation: |
+            **PD prefill 仍复用 iter cadence,但 lifecycle 变成 `PrefillHandoffAdmission`:prefill 完成后 hold KV、发 `PrefillDone`,等待 decode 侧 pull 完再收 `ReleaseKv`。** builder 额外注册 KV send comm group,并把 endpoint 交给 admission。`A::Msg/A::Event` 的关联类型让 PD-specific protocol 穿过同一个 `IterBatchWorker`,无需把 PD 分支写进 shell。
+
+        - id: prefix-cache-worker
+          title: "Prefix cache:KV 与 lifecycle 成对升级"
+          primary:
+            file: sketch/worker_v2/workers/iter/build_prefix_cache_worker.rs
+            range:
+              start_line: 14
+              end_line: 66
+          explanation: |
+            **prefix-cache worker 同时换 K 与 A:** `ModeledPrefixCacheKv` 提供 partition-local prefix probe,`PrefixPrefillDecodeAdmission` 比较可行 placement 并把选中的 partition sticky 到 decode。shell 与 unified execution 不变。dense/DP 只是 partition 数不同;再把 FIFO 换成 SJF 又得到一个 policy variant,都无需新增 cadence。
+          related:
+            - id: prefix-policy-kinds
+              title: "prefix FIFO/SJF 两种 concrete type"
+              location:
+                file: sketch/worker_v2/census.rs
+                range:
+                  start_line: 89
+                  end_line: 104
+
+        - id: hybrid-worker
+          title: "Hybrid attention:只换 KV layout"
+          primary:
+            file: sketch/worker_v2/workers/iter/build_hybrid_kv_worker.rs
+            range:
+              start_line: 15
+              end_line: 70
+          explanation: |
+            **hybrid-attention worker 的唯一结构变化是 `FullAttnKv → HybridStateKv`:增长的 full-attention KV 与固定 recurrent state 共用容量门控,但使用同一个 local lifecycle 与 unified execution。** dense/DP 由 `num_partitions` 覆盖;FIFO/SJF 是 policy swap。mixed-layer 算术属于 model,不是 worker cadence。这个 kind 证明 KV layout 可以独立变化而不迫使 admission 或 shell 认识具体实现。
+          related:
+            - id: hybrid-policy-kinds
+              title: "hybrid FIFO/SJF 两种 concrete type"
+              location:
+                file: sketch/worker_v2/census.rs
+                range:
+                  start_line: 106
+                  end_line: 121
+
+        - id: multi-model-worker
+          title: "Multi-model:三根轴一起换,Shell 仍不换"
+          primary:
+            file: sketch/worker_v2/workers/iter/build_multi_model_worker.rs
+            range:
+              start_line: 18
+              end_line: 94
+          explanation: |
+            **multi-model co-serve 是 iter family 最强的组合例:** K 变成每模型一 partition 的 `ModelPartitionedKv`,A 变成能处理 `SwitchModel` 的 `MultiModelAdmission`,E 变成持有每模型 cost cache 的 `MultiModelIterExecution`。三轴一起变化,`IterBatchWorker` 仍原样复用,因为外层依旧是一轮一轮执行。2/4 个 co-resident model 是 config;FIFO/SJF 再形成 policy type variants。
+          related:
+            - id: multi-model-policy-kinds
+              title: "multi-model FIFO/SJF 两种 concrete type"
+              location:
+                file: sketch/worker_v2/census.rs
+                range:
+                  start_line: 123
+                  end_line: 138
+
+        - id: tiered-worker-kinds
+          title: "Tiered KV:plain cost 与 tier-aware cost"
+          primary:
+            file: sketch/worker_v2/census.rs
+            range:
+              start_line: 140
+              end_line: 159
+          explanation: |
+            **tiered family variant 目前是 census-only 的两种 concrete composition,没有公开 builder recipe:** 同一个 `TieredMemoryKv + LocalPrefillDecodeAdmission` 可以配普通 `UnifiedIterExecution`(只吃容量收益),也可以配要求 `TieredKvView` 的 `TierAwareIterExecution`(把 offload 计入成本)。这一步必须列出,否则“全部 worker kind”会漏掉唯一让 KV capability 抵达 execution 的 blind-test 类型。
+
+    - id: disaggregated-worker-kinds
+      title: "第 8 章 · Disaggregated families —— 新 cadence 从哪里来"
+
+      steps:
+        - id: decode-pull
+          title: "第四种 cadence:双时间线 PD decode"
+          primary:
+            file: sketch/worker_v2/workers/pd_decode/pull_decode_worker.rs
+            range:
+              start_line: 50
+              end_line: 76
+          explanation: |
+            **`PullDecodeWorker<K, E>` 是第四种 cadence:它有两条独立时间线 —— KV 传输 PULL 流水线与 decode 迭代 FSM —— 这是 `IterBatchWorker` 单 compute FSM 建模不了的,所以 PD decode 需要自己的 shell。** 但它**原样复用** `FullAttnKv`(K)+ `UnifiedIterExecution`(E),且 decode lifecycle 薄到可以内联(像 AFD-ffn 一样),所以这里**没有独立 admission 轴**。pull 前端(`pending_pulls` → 单在途 `submit_transfer` → backlog 门 → `pending_decodes`)全是 shell 私有的 comm seam。
+
+        - id: decode-pull-builder
+          title: "PD decode builder:容量也属于 recipe"
+          primary:
+            file: sketch/worker_v2/workers/pd_decode/build_pd_decode_worker.rs
+            range:
+              start_line: 31
+              end_line: 99
+          explanation: |
+            **`build_pd_decode_worker` 说明 builder 不只是 `new` 的别名,而是部署配置到组件的翻译层。** 它注册 KV 接收 comm group,把每 shard 总 token 容量切成“pull backlog 预算 + active decode KV”,为多 partition 修正 load balance,再构造 `FullAttnKv` 与 `UnifiedIterExecution` 交给 `PullDecodeWorker::from_components`。这些选择决定 server 怎么实例化,但不改变 pull/decode 两条时间线,所以留在独立 recipe 文件而不塞进 worker。
+
+        - id: slot-core-shared
+          title: "共享 core,而非内嵌 worker"
+          primary:
+            file: sketch/worker_v2/workers/afd_attention/attention_slot_pipeline.rs
+            range:
+              start_line: 95
+              end_line: 130
+          explanation: |
+            **AFD slot 流水线被抽成共享的 `AttentionSlotPipeline`,而不是内嵌进某个 worker。** `SlotAttentionWorker`(reserve-on-admit 入口)和 `PullSlotAttentionWorker`(KV-pull 入口)驱动这**同一套**逐层 slot FSM —— `AttentionSlotPhase` 在 `NUM_SLOTS` 个 micro-batch 上的 lockstep —— 只在 INGRESS 处不同,兑现了设计的"共享私有 core,别把一个具体 worker 嵌进另一个"。每个 slot 逐层跑 [`AttentionLayerExecution`](code-ref:attn-exec-ref)。
+          related:
+            - id: attn-exec-ref
+              title: "AttentionLayerExecution —— core 逐层驱动的 exec"
+              location:
+                file: sketch/worker_v2/execution/mod.rs
+                range:
+                  start_line: 64
+                  end_line: 85
+
+        - id: afd-attention-ingress-wrappers
+          title: "同一 core,两种薄 ingress worker"
+          primary:
+            file: sketch/worker_v2/workers/afd_attention/slot_attention_worker.rs
+            range:
+              start_line: 24
+              end_line: 80
+          explanation: |
+            **colocated AFD-attn worker 只是 `admission + core`:** `FreshRequestSlotAdmission` 做 L1 enqueue 与 L2 KV gate,获准的 request id 交给 `AttentionSlotPipeline::place_request`,随后 core 自己跑逐层 cadence。PD-for-AFD 版本则把 admission 换成 [`KvPullIngress`](code-ref:pull-ingress-wrapper),但仍把 landed request 交给同一个 core。它们是两个 worker,不是两个 slot pipeline。
+          related:
+            - id: pull-ingress-wrapper
+              title: "pull ingress + 同一 AttentionSlotPipeline"
+              location:
+                file: sketch/worker_v2/workers/afd_attention/pull_slot_attention_worker.rs
+                range:
+                  start_line: 203
+                  end_line: 253
+
+        - id: afd-attention-build-essentials
+          title: "AFD-attn 共用构造材料,recipe 只选 ingress"
+          primary:
+            file: sketch/worker_v2/workers/afd_attention/attention_build_essentials.rs
+            range:
+              start_line: 15
+              end_line: 91
+          explanation: |
+            **两个 AFD-attn kind 的 GPU allocation、comm group、KV capacity、sampler、section cost 与 context 完全相同,所以集中在 `prepare_attention_build_essentials`。** 返回 record 同时带 `FullAttnKv`、`AttentionLayerExecutionAdapter` 与 ingress 所需的 endpoint facts;它不决定 admission 还是 pull。这样共享的是单 worker 的构造材料,不是 L6 deployment,也不是把两个 concrete builder 合成一个带 mode flag 的函数。
+
+        - id: afd-attention-builders
+          title: "AFD-attn builder:换 ingress,不复制 core"
+          primary:
+            file: sketch/worker_v2/workers/afd_attention/build_afd_attention_worker.rs
+            range:
+              start_line: 19
+              end_line: 52
+          explanation: |
+            **两个 AFD-attn build 文件拥有相同的部署外壳,但明确返回不同 worker type。** colocated recipe 组装 `⟨FullAttnKv, FreshRequestSlotAdmission, AttentionLayerExecutionAdapter<M>⟩`;PD-AFD recipe[去掉 admission](code-ref:pd-afd-builder),补充 `kv_bytes_per_token` 给 pull ingress。二者都注册同类 comm/KV capacity,最终都在各自 `from_components` 内构造同一个 `AttentionSlotPipeline`。这正是“family 共享 cadence core,recipe 选择 ingress”的落点。
+          related:
+            - id: pd-afd-builder
+              title: "PD-AFD decode-attn recipe"
+              location:
+                file: sketch/worker_v2/workers/afd_attention/build_pd_afd_decode_attention_worker.rs
+                range:
+                  start_line: 19
+                  end_line: 51
+
+        - id: ffn-pipeline
+          title: "AFD-ffn 双缓冲(<E>-only)"
+          primary:
+            file: sketch/worker_v2/workers/afd_ffn/buffered_ffn_worker.rs
+            range:
+              start_line: 44
+              end_line: 58
+          explanation: |
+            **`BufferedFfnWorker<E>` 是 AFD-ffn 双缓冲壳,只对 exec 泛型 —— ffn 家族无 KV、无 admission,`<K, A, E>` 三元组退化成 `<E>`,这是本 sketch 最强的表达力检验。** 它复刻 `DisaggFfnWorker`:至多一个 task 在拉输入(`next_task`)、一个在算(`current_task`),让某 section 的 attn→ffn 输入传输叠在上一 section 的 compute 上。Terminal 的完成记账[内联在 `RequestRecord` 方法上](code-ref:ffn-emit)(和 iter 家族一样,无共享 wrapper),并盖在请求粘性的 ATTN owner 上、绕过本 ffn worker 的 `stamp_stage`。
+          related:
+            - id: ffn-emit
+              title: "Terminal 内联的 token 记账"
+              location:
+                file: sketch/worker_v2/workers/afd_ffn/buffered_ffn_worker.rs
+                range:
+                  start_line: 204
+                  end_line: 255
+
+        - id: ffn-builder
+          title: "AFD-ffn builder:退化后的最小组装"
+          primary:
+            file: sketch/worker_v2/workers/afd_ffn/build_afd_ffn_worker.rs
+            range:
+              start_line: 17
+              end_line: 54
+          explanation: |
+            **`build_afd_ffn_worker` 展示轴可选以后 builder 也随之变小。** 它只需 allocate replica、注册收发共用的 comm group、建立 section cost buffers 与 `WorkerContext`,再构造唯一组件 `FfnSectionExecutionAdapter<M>`。没有 KV capacity、没有 sampler、没有 admission;最终 recipe 是 `BufferedFfnWorker<E>` 而不是硬凑一个空的 `K/A`。
+
+    - id: worker-composition-proof
+      title: "第 9 章 · 从 worker kind 回到完整 deployment"
+
+      steps:
+        - id: pd-afd-three-pool
+          title: "PD-AFD:三个 pool,只新增一个 ingress kind"
+          primary:
+            file: sketch/worker_v2/census.rs
+            range:
+              start_line: 161
+              end_line: 179
+          explanation: |
+            **PD-AFD 不是再造一个巨型 worker:** prefill pool 复用 `build_pd_prefill_worker`;decode-attn pool 使用 `PullSlotAttentionWorker`;decode-ffn pool 复用 `BufferedFfnWorker`。真正新增的只有“KV pull 后进入既有 slot core”的 ingress kind。这个组合展示了教学顺序的终点:先识别 cadence family,再挑 K/A/E 与 ingress recipe,最后由 L6 把多个 worker 拼成 deployment。
+          related:
+            - id: pd-prefill-reused-builder
+              title: "复用的 PD-prefill recipe"
+              location:
+                file: sketch/worker_v2/workers/iter/build_pd_prefill_worker.rs
+                range:
+                  start_line: 14
+                  end_line: 68
+
+        - id: worker-census-close
+          title: "最终证明:四个 family 都满足 L6"
+          primary:
+            file: sketch/worker_v2/census.rs
+            range:
+              start_line: 161
+              end_line: 179
+          explanation: |
+            **目录和 builder 的整理没有创造新的抽象层;最终仍由 concrete worker type 接受编译证明。** `PullDecodeWorker` 满足 `IterWorker`;两个 AFD-attn ingress worker 都满足 `AfdAttnWorker` 且共享 core;`BufferedFfnWorker<E>` 再次退化为普通 `IterWorker` protocol。builder 不出现在 census 的泛型断言里,因为 builder 只负责产生这些 type 的值 —— 真正决定抽象是否成立的是 type bounds。

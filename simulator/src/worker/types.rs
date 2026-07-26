@@ -250,6 +250,15 @@ pub enum AttnWorkerMsg {
 /// an `AttnWorkerMsg::Release` to drop the KV (no ack event needed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttnWorkerEvent {
+    /// PD-for-AFD only: the initial prompt-KV pull landed on the attention
+    /// worker. The three-pool flow routes this acknowledgement back to the
+    /// originating prefill worker so it can release its held reservation. The
+    /// normal colocated AFD worker never emits this variant.
+    KvPullComplete {
+        worker: WorkerId,
+        req: RequestId,
+        prefill_worker: WorkerId,
+    },
     /// A slot reached layer-0 and is reporting the layer-(-1) start boundary for a
     /// new iteration. `reqs` may be empty; empty reports are how shards with no local
     /// tokens participate in the all-worker Bootstrap barrier. The controller
