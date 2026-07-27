@@ -211,24 +211,50 @@ fn axis_domains(manifest: &SweepManifest) -> Map<String, Value> {
 
 fn collect_member(experiment_dir: &Path, member: &SweepMember) -> Result<Value> {
     let run_dir = experiment_dir.join(&member.path);
+    let (lifecycle, metrics) = collect_run_scalars(&run_dir, true)?;
+    Ok(json!({
+        "path": member.path,
+        "coordinates": member.coordinates,
+        "labels": member.labels,
+        "lifecycle": lifecycle,
+        "metrics": metrics,
+    }))
+}
+
+pub(crate) fn collect_singleton_row(run_dir: &Path, run_id: &str) -> Result<Value> {
+    let (lifecycle, metrics) = collect_run_scalars(run_dir, false)?;
+    Ok(json!({
+        "run_id": run_id,
+        "coordinates": {},
+        "labels": {},
+        "lifecycle": lifecycle,
+        "metrics": metrics,
+    }))
+}
+
+fn collect_run_scalars(
+    run_dir: &Path,
+    require_current_subject_timing: bool,
+) -> Result<(Value, Map<String, Value>)> {
     let lifecycle = lifecycle(&run_dir);
     let summary = read_optional_json(&run_dir.join("summary.json"))?;
     let timing = read_optional_json(&run_dir.join("reports/analyzer_timing.json"))?;
-    let slo = subject_ok(timing.as_ref(), "slo-general")
+    let slo = (!require_current_subject_timing || subject_ok(timing.as_ref(), "slo-general"))
         .then(|| read_optional_json(&run_dir.join("reports/slo_general_report.json")))
         .transpose()?
         .flatten()
         .filter(report_available);
-    let throughput = subject_ok(timing.as_ref(), "throughput")
+    let throughput = (!require_current_subject_timing || subject_ok(timing.as_ref(), "throughput"))
         .then(|| read_optional_json(&run_dir.join("reports/throughput_report.json")))
         .transpose()?
         .flatten()
         .filter(report_available);
-    let utilization = subject_ok(timing.as_ref(), "utilization")
-        .then(|| read_optional_json(&run_dir.join("reports/utilization_report.json")))
-        .transpose()?
-        .flatten()
-        .filter(report_available);
+    let utilization = (!require_current_subject_timing
+        || subject_ok(timing.as_ref(), "utilization"))
+    .then(|| read_optional_json(&run_dir.join("reports/utilization_report.json")))
+    .transpose()?
+    .flatten()
+    .filter(report_available);
 
     let mut metrics = Map::new();
     for percentile in ["mean", "p50", "p90", "p99"] {
@@ -272,13 +298,7 @@ fn collect_member(experiment_dir: &Path, member: &SweepMember) -> Result<Value> 
         &["completed_req_s"],
     );
 
-    Ok(json!({
-        "path": member.path,
-        "coordinates": member.coordinates,
-        "labels": member.labels,
-        "lifecycle": lifecycle,
-        "metrics": metrics,
-    }))
+    Ok((lifecycle, metrics))
 }
 
 fn read_optional_json(path: &Path) -> Result<Option<Value>> {
@@ -339,22 +359,31 @@ fn insert_number(
     metrics.insert(name.to_owned(), value);
 }
 
-fn metric_descriptors() -> Value {
+pub(crate) fn metric_descriptors() -> Value {
     json!([
-        {"key": "tpot_mean_ms", "label": "Mean TPOT", "unit": "ms/token", "group": "tpot"},
-        {"key": "tpot_p99_ms", "label": "P99 TPOT", "unit": "ms/token", "group": "tpot"},
-        {"key": "ttft_mean_ms", "label": "Mean TTFT", "unit": "ms", "group": "ttft"},
-        {"key": "ttft_p99_ms", "label": "P99 TTFT", "unit": "ms", "group": "ttft"},
-        {"key": "total_tps", "label": "Total throughput", "unit": "tok/s", "group": "throughput"},
-        {"key": "decode_tps", "label": "Decode throughput", "unit": "tok/s", "group": "throughput"},
-        {"key": "total_tps_per_gpu", "label": "Throughput / GPU", "unit": "tok/s", "group": "throughput_per_gpu"},
-        {"key": "gpu_utilization", "label": "GPU utilization", "unit": "%", "group": "utilization"},
-        {"key": "completed_req_s", "label": "Completed requests / s", "unit": "req/s", "group": "completion"},
-        {"key": "requests_finished", "label": "Finished requests", "unit": "requests", "group": "finished"}
+        {"key": "tpot_mean_ms", "label": "Mean TPOT", "unit": "ms/token", "group": "tpot", "objective": "minimize"},
+        {"key": "tpot_p99_ms", "label": "P99 TPOT", "unit": "ms/token", "group": "tpot", "objective": "minimize"},
+        {"key": "ttft_mean_ms", "label": "Mean TTFT", "unit": "ms", "group": "ttft", "objective": "minimize"},
+        {"key": "ttft_p99_ms", "label": "P99 TTFT", "unit": "ms", "group": "ttft", "objective": "minimize"},
+        {"key": "total_tps", "label": "Total throughput", "unit": "tok/s", "group": "throughput", "objective": "maximize"},
+        {"key": "decode_tps", "label": "Decode throughput", "unit": "tok/s", "group": "throughput", "objective": "maximize"},
+        {"key": "total_tps_per_gpu", "label": "Throughput / GPU", "unit": "tok/s", "group": "throughput_per_gpu", "objective": "maximize"},
+        {"key": "gpu_utilization", "label": "GPU utilization", "unit": "%", "group": "utilization", "objective": "maximize"},
+        {"key": "completed_req_s", "label": "Completed requests / s", "unit": "req/s", "group": "completion", "objective": "maximize"},
+        {"key": "requests_finished", "label": "Finished requests", "unit": "requests", "group": "finished", "objective": "maximize"}
     ])
 }
 
-fn definitions() -> Value {
+pub(crate) fn metric_objective(key: &str) -> Option<&'static str> {
+    match key {
+        "tpot_mean_ms" | "tpot_p99_ms" | "ttft_mean_ms" | "ttft_p99_ms" => Some("minimize"),
+        "total_tps" | "decode_tps" | "total_tps_per_gpu" | "gpu_utilization"
+        | "completed_req_s" | "requests_finished" => Some("maximize"),
+        _ => None,
+    }
+}
+
+pub(crate) fn definitions() -> Value {
     json!({
         "membership": "exactly the runs listed in sweep_manifest.json; adjacent directories are not scanned",
         "axis_order": "launcher DSL declaration order; the first two axes form plot x/y and later axes form facets",

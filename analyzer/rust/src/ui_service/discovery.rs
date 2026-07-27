@@ -18,6 +18,16 @@ pub(super) struct ConfiguredRoot {
     path: PathBuf,
 }
 
+impl ConfiguredRoot {
+    pub(super) fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum StageStatus {
@@ -99,7 +109,7 @@ fn discover_runs_under_root(root: &ConfiguredRoot, runs: &mut Vec<DiscoveredRun>
             };
             if file_type.is_symlink()
                 || !file_type.is_dir()
-                || entry.file_name().to_string_lossy().starts_with('.')
+                || ignored_directory_name(&entry.file_name())
             {
                 continue;
             }
@@ -107,6 +117,10 @@ fn discover_runs_under_root(root: &ConfiguredRoot, runs: &mut Vec<DiscoveredRun>
         }
     }
     Ok(())
+}
+
+pub(super) fn ignored_directory_name(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with('.') || name == "old-logs"
 }
 
 pub(super) fn resolve_run(roots: &[ConfiguredRoot], run_id: &str) -> Result<DiscoveredRun> {

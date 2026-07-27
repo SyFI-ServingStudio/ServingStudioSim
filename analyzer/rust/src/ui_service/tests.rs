@@ -21,6 +21,7 @@ use super::optimality::{
 };
 use super::request_state::{read_request_state_payload, read_request_state_report};
 use super::slo::{read_slo_general_payload, read_slo_general_report};
+use super::sweep::{build_sweep_catalog, read_sweep_payload, resolve_sweep};
 use super::throughput::{read_throughput_payload, read_throughput_report};
 use super::topology::build_topology;
 use super::utilization::{read_utilization_payload, read_utilization_report};
@@ -65,6 +66,66 @@ fn make_run(path: &Path, complete: bool, analyzed: bool) {
     if analyzed {
         fs::create_dir_all(path.join("reports")).expect("create reports directory");
         fs::write(path.join("reports/analyzer_timing.json"), "{}").expect("write timing");
+    }
+}
+
+fn make_sweep(path: &Path, with_payload: bool) {
+    fs::create_dir_all(path).expect("create sweep directory");
+    fs::write(
+        path.join("sweep_manifest.json"),
+        r#"{
+            "schema_version": 1,
+            "axes": ["request_rate", "tensor_parallel"],
+            "runs": [{
+                "path": "rate10/tp2",
+                "coordinates": {"request_rate": 10.0, "tensor_parallel": 2},
+                "labels": {}
+            }]
+        }"#,
+    )
+    .expect("write sweep manifest");
+    make_run(&path.join("rate10/tp2"), true, true);
+    fs::write(
+        path.join("rate10/tp2/raw/params.json"),
+        r#"{
+            "deployment": "unified",
+            "workload": {"trace_files": ["logs/sweep/trace/aime_long.csv"]}
+        }"#,
+    )
+    .expect("write sweep member params");
+    if with_payload {
+        fs::create_dir_all(path.join("payloads")).expect("create sweep payload directory");
+        fs::write(
+            path.join("payloads/sweep_metrics_grid.json"),
+            r#"{
+                "schema_version": 1,
+                "meta": {
+                    "experiment_dir": "/private/logs/sweep",
+                    "num_axes": 2,
+                    "num_runs": 1
+                },
+                "axes": ["request_rate", "tensor_parallel"],
+                "domains": {
+                    "request_rate": [10.0],
+                    "tensor_parallel": [2]
+                },
+                "metrics": [{
+                    "group": "throughput",
+                    "key": "total_tps",
+                    "label": "Total throughput",
+                    "unit": "tok/s"
+                }],
+                "runs": [{
+                    "path": "rate10/tp2",
+                    "coordinates": {"request_rate": 10.0, "tensor_parallel": 2},
+                    "labels": {},
+                    "lifecycle": {"simulation": "complete", "analysis": "complete"},
+                    "metrics": {"total_tps": 42.0}
+                }],
+                "definitions": {}
+            }"#,
+        )
+        .expect("write sweep payload");
     }
 }
 
@@ -488,6 +549,7 @@ fn discovers_nested_runs_and_ignores_directory_shells() {
     let pending = temporary.path().join("sweep/tp8/simulation");
     make_run(&completed, true, true);
     make_run(&pending, false, false);
+    make_run(&temporary.path().join("old-logs/archived"), true, true);
     fs::create_dir_all(temporary.path().join("empty/folder")).expect("create shell");
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
@@ -517,6 +579,113 @@ fn discovers_nested_runs_and_ignores_directory_shells() {
     let pending_value = serde_json::to_value(pending).expect("serialize pending run");
     assert_eq!(pending_value["lifecycle"]["simulation"], "pending");
     assert_eq!(pending_value["lifecycle"]["analysis"], "not_started");
+}
+
+#[test]
+fn sweep_catalog_preserves_manifest_axes_and_pending_state() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_sweep(&temporary.path().join("ready-sweep"), true);
+    make_sweep(&temporary.path().join("pending-sweep"), false);
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+
+    let value = serde_json::to_value(build_sweep_catalog(&roots).expect("build sweep catalog"))
+        .expect("serialize sweep catalog");
+
+    assert_eq!(value["protocol_version"], 1);
+    let sweeps = value["sweeps"].as_array().expect("sweep catalog entries");
+    assert_eq!(sweeps.len(), 2);
+    let ready = sweeps
+        .iter()
+        .find(|sweep| sweep["display_name"] == "ready-sweep")
+        .expect("ready sweep");
+    assert_eq!(ready["axes"], json!(["request_rate", "tensor_parallel"]));
+    assert_eq!(ready["num_runs"], 1);
+    assert_eq!(ready["status"], "ready");
+    assert_eq!(ready["deployments"], json!(["unified"]));
+    assert_eq!(ready["traces"], json!(["aime_long.csv"]));
+    assert!(ready["sweep_id"]
+        .as_str()
+        .is_some_and(|sweep_id| sweep_id.starts_with("s_")));
+    let pending = sweeps
+        .iter()
+        .find(|sweep| sweep["display_name"] == "pending-sweep")
+        .expect("pending sweep");
+    assert_eq!(pending["status"], "pending");
+}
+
+#[test]
+fn sweep_payload_replaces_filesystem_paths_with_opaque_run_ids() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_sweep(&temporary.path().join("sweep"), true);
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let catalog = serde_json::to_value(build_sweep_catalog(&roots).expect("build sweep catalog"))
+        .expect("serialize sweep catalog");
+    let sweep_id = catalog["sweeps"][0]["sweep_id"].as_str().expect("sweep id");
+    let sweep = resolve_sweep(&roots, sweep_id).expect("resolve sweep");
+
+    let payload = read_sweep_payload(&roots, &sweep).expect("read sweep payload");
+
+    assert_eq!(payload["protocol_version"], 1);
+    assert_eq!(payload["sweep_id"], sweep_id);
+    assert!(payload["meta"].get("experiment_dir").is_none());
+    assert!(payload["runs"][0].get("path").is_none());
+    assert!(payload["runs"][0]["run_id"]
+        .as_str()
+        .is_some_and(|run_id| run_id.starts_with("r_")));
+    assert_eq!(payload["runs"][0]["metrics"]["total_tps"], 42.0);
+    assert_eq!(payload["metrics"][0]["objective"], "maximize");
+}
+
+#[test]
+fn sweep_catalog_adds_only_unclaimed_runs_as_singletons() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_sweep(&temporary.path().join("sweep"), true);
+    let standalone_path = temporary.path().join("20260725_0_standalone");
+    make_core_run(&standalone_path);
+    fs::write(
+        standalone_path.join("reports/analyzer_timing.json"),
+        r#"{"subjects": [{"name": "slo-goodput", "status": "ok"}]}"#,
+    )
+    .expect("replace timing with a later partial analysis");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let catalog = serde_json::to_value(build_sweep_catalog(&roots).expect("build sweep catalog"))
+        .expect("serialize sweep catalog");
+    let entries = catalog["sweeps"].as_array().expect("aggregate entries");
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["kind"], "singleton");
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["kind"] == "sweep")
+            .count(),
+        1
+    );
+    let singleton = entries
+        .iter()
+        .find(|entry| entry["kind"] == "singleton")
+        .expect("singleton entry");
+    assert_eq!(singleton["display_name"], "20260725_0_standalone");
+    assert_eq!(singleton["axes"], json!([]));
+    assert_eq!(singleton["num_runs"], 1);
+    assert_eq!(singleton["experiment_date"], "2026-07-25");
+    assert_eq!(singleton["deployments"], json!(["afd"]));
+    assert_eq!(singleton["traces"], json!(["workload.csv"]));
+
+    let singleton_id = singleton["sweep_id"].as_str().expect("singleton id");
+    let discovered = resolve_sweep(&roots, singleton_id).expect("resolve singleton");
+    let payload = read_sweep_payload(&roots, &discovered).expect("read singleton payload");
+    assert_eq!(payload["meta"]["num_axes"], 0);
+    assert_eq!(payload["axes"], json!([]));
+    assert_eq!(payload["domains"], json!({}));
+    assert!(payload["runs"][0]["run_id"]
+        .as_str()
+        .is_some_and(|run_id| run_id.starts_with("r_")));
+    assert_eq!(payload["runs"][0]["metrics"]["tpot_mean_ms"], 4.0);
+    assert_eq!(payload["metrics"][0]["objective"], "minimize");
 }
 
 #[test]
@@ -735,6 +904,37 @@ fn workload_resource_summarizes_configured_trace() {
 }
 
 #[test]
+fn workload_resource_accepts_launcher_experiment_trace_path() {
+    let repository = TempDir::new().expect("temporary repository");
+    let logs_root = repository.path().join("logs");
+    let run_path = repository.path().join("logs/experiment/rate90.0/tp1");
+    make_core_run(&run_path);
+    let source_path = "logs/experiment/trace/workload.csv";
+    let params_path = run_path.join("raw/params.json");
+    let params = fs::read_to_string(&params_path)
+        .expect("read params")
+        .replace("trace/workload.csv", source_path);
+    fs::write(params_path, params).expect("write launcher params");
+    fs::create_dir_all(repository.path().join("logs/experiment/trace"))
+        .expect("create experiment trace directory");
+    fs::write(
+        repository.path().join(source_path),
+        "id,input_len,output_len,arrival_time\n0,8,32,0\n1,16,64,2000\n",
+    )
+    .expect("write experiment trace");
+    let roots = configure_logs_roots(vec![logs_root.clone()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let workload = read_workload(&run, &logs_root).expect("read launcher experiment workload");
+
+    assert_eq!(workload["source_paths"], json!([source_path]));
+    assert_eq!(workload["request_count"], 2);
+}
+
+#[test]
 fn workload_resource_rejects_paths_outside_trace() {
     let temporary = TempDir::new().expect("temporary logs root");
     let run_path = temporary.path().join("simulation");
@@ -753,7 +953,7 @@ fn workload_resource_rejects_paths_outside_trace() {
 
     let error = read_workload(&run, temporary.path()).expect_err("reject path traversal");
 
-    assert!(error.to_string().contains("below trace"));
+    assert!(error.to_string().contains("inside a trace directory"));
 }
 
 #[test]

@@ -18,6 +18,7 @@ mod model;
 mod optimality;
 mod request_state;
 mod slo;
+mod sweep;
 #[cfg(test)]
 mod tests;
 mod throughput;
@@ -61,6 +62,7 @@ use optimality::{
 };
 use request_state::{read_request_state_payload, read_request_state_report};
 use slo::{read_slo_general_payload, read_slo_general_report};
+use sweep::{build_sweep_catalog, read_sweep_payload, resolve_sweep};
 use throughput::{read_throughput_payload, read_throughput_report};
 use topology::build_topology;
 use utilization::{read_utilization_payload, read_utilization_report};
@@ -94,6 +96,8 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
     let app = Router::new()
         .route("/api/v1/profile/timeline", post(profile_timeline))
         .route("/api/v1/runs", get(list_runs))
+        .route("/api/v1/sweeps", get(list_sweeps))
+        .route("/api/v1/sweeps/{sweep_id}/payload", get(get_sweep_payload))
         .route("/api/v1/runs/{run_id}/descriptor", get(get_descriptor))
         .route("/api/v1/runs/{run_id}/summary", get(get_summary))
         .route("/api/v1/runs/{run_id}/topology", get(get_topology))
@@ -226,7 +230,7 @@ pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind analyzer UI service to {bind}"))?;
-    eprintln!("[analyze] serving run catalog at http://{bind}/api/v1/runs");
+    eprintln!("[analyze] serving run and sweep catalogs at http://{bind}/api/v1/{{runs,sweeps}}");
     axum::serve(listener, app)
         .await
         .context("serve analyzer run catalog")
@@ -299,6 +303,56 @@ async fn list_runs(State(state): State<ServiceState>) -> Response {
         Ok(Ok(catalog)) => Json(catalog).into_response(),
         Ok(Err(error)) => catalog_error(error),
         Err(error) => catalog_error(anyhow::anyhow!("catalog worker failed: {error}")),
+    }
+}
+
+async fn list_sweeps(State(state): State<ServiceState>) -> Response {
+    let roots = Arc::clone(&state.roots);
+    match tokio::task::spawn_blocking(move || build_sweep_catalog(&roots)).await {
+        Ok(Ok(catalog)) => Json(catalog).into_response(),
+        Ok(Err(error)) => sweep_catalog_error(error),
+        Err(error) => sweep_catalog_error(anyhow::anyhow!("sweep catalog worker failed: {error}")),
+    }
+}
+
+async fn get_sweep_payload(
+    RoutePath(sweep_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    let roots = Arc::clone(&state.roots);
+    match tokio::task::spawn_blocking(move || {
+        let sweep = resolve_sweep(&roots, &sweep_id)?;
+        read_sweep_payload(&roots, &sweep)
+    })
+    .await
+    {
+        Ok(Ok(payload)) => Json(payload).into_response(),
+        Ok(Err(error)) if error.downcast_ref::<SweepNotFound>().is_some() => problem(
+            StatusCode::NOT_FOUND,
+            "sweep_not_found",
+            "The requested sweep is not present below the configured logs roots.",
+        ),
+        Ok(Err(error)) if error.downcast_ref::<ArtifactNotFound>().is_some() => problem(
+            StatusCode::NOT_FOUND,
+            "artifact_missing",
+            "The requested sweep payload has not been generated.",
+        ),
+        Ok(Err(error)) => {
+            eprintln!("[analyze] sweep resource failed: {error:#}");
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "The requested sweep resource could not be read.",
+            )
+        }
+        Err(error) => {
+            eprintln!("[analyze] sweep resource worker failed: {error}");
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "The requested sweep resource could not be read.",
+            )
+        }
     }
 }
 
@@ -833,6 +887,17 @@ impl std::fmt::Display for RunNotFound {
 impl std::error::Error for RunNotFound {}
 
 #[derive(Debug)]
+struct SweepNotFound;
+
+impl std::fmt::Display for SweepNotFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("sweep not found")
+    }
+}
+
+impl std::error::Error for SweepNotFound {}
+
+#[derive(Debug)]
 struct ArtifactNotFound;
 
 impl std::fmt::Display for ArtifactNotFound {
@@ -849,6 +914,15 @@ fn catalog_error(error: anyhow::Error) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         "run_discovery_failed",
         "The configured logs roots could not be scanned.",
+    )
+}
+
+fn sweep_catalog_error(error: anyhow::Error) -> Response {
+    eprintln!("[analyze] sweep discovery failed: {error:#}");
+    problem(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "sweep_discovery_failed",
+        "The configured logs roots could not be scanned for sweeps.",
     )
 }
 

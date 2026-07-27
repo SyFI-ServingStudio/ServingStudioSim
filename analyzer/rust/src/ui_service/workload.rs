@@ -30,10 +30,9 @@ pub(super) fn read_workload(run: &DiscoveredRun, repo_root: &Path) -> Result<Val
         validate_trace_path(source_path)?;
     }
 
-    let trace_root = repo_root.join("trace");
-    let canonical_root = trace_root
+    let canonical_root = repo_root
         .canonicalize()
-        .context("canonicalize trace root")?;
+        .context("canonicalize configured root")?;
     let mut entries = Vec::new();
     for source_path in &source_paths {
         let trace_path = resolve_trace_path(repo_root, &canonical_root, source_path)?;
@@ -107,28 +106,42 @@ fn resolve_trace_path(
 ) -> Result<std::path::PathBuf> {
     validate_trace_path(source_path)?;
     let relative = Path::new(source_path);
-    let trace_path = repo_root.join(relative);
-    if !regular_file(&trace_path) {
-        return Err(ArtifactNotFound.into());
+    let mut relative_candidates = vec![relative];
+    if let Some(root_name) = repo_root.file_name() {
+        if let Ok(without_root_prefix) = relative.strip_prefix(root_name) {
+            if !without_root_prefix.as_os_str().is_empty() {
+                relative_candidates.push(without_root_prefix);
+            }
+        }
     }
+    let trace_path = relative_candidates
+        .into_iter()
+        .map(|candidate| repo_root.join(candidate))
+        .find(|candidate| regular_file(candidate))
+        .ok_or(ArtifactNotFound)?;
     let canonical_trace = trace_path
         .canonicalize()
         .with_context(|| format!("canonicalize trace file {}", trace_path.display()))?;
     if !canonical_trace.starts_with(canonical_root) {
-        bail!("trace file resolves outside trace");
+        bail!("trace file resolves outside configured root");
     }
     Ok(canonical_trace)
 }
 
 fn validate_trace_path(source_path: &str) -> Result<()> {
     let relative = Path::new(source_path);
-    if relative.is_absolute()
-        || !relative.starts_with("trace")
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        bail!("trace file must be a relative path below trace");
+    let components = relative.components().collect::<Vec<_>>();
+    let is_normal_relative = !relative.is_absolute()
+        && !components.is_empty()
+        && components
+            .iter()
+            .all(|component| matches!(component, Component::Normal(_)));
+    let passes_through_trace_directory = components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .any(|component| matches!(component, Component::Normal(name) if *name == "trace"));
+    if !is_normal_relative || !passes_through_trace_directory {
+        bail!("trace file must be a relative path inside a trace directory");
     }
     Ok(())
 }

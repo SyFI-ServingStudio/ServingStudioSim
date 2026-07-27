@@ -207,6 +207,26 @@ must reject absolute paths, traversal, duplicate coordinates, missing
 coordinates, and paths that resolve outside the experiment. Different
 experiment directories are never merged automatically.
 
+A discovered run not claimed by any valid `sweep_manifest.json` is published as
+its own **singleton aggregate**. This is a one-member envelope with `kind:
+"singleton"`, zero axes, empty domains/coordinates, and the same scalar metric
+descriptors as a sweep. It is never grouped with sibling runs or promoted into
+a synthetic sweep. Runs already claimed by a manifest appear only through that
+manifest-defined experiment, not again as singleton entries.
+
+An `old-logs` directory is an archive boundary and is excluded from active run,
+sweep, and singleton discovery. Moving an experiment there removes it from UI
+catalogs without deleting its artifacts.
+
+Aggregate catalog entries also publish bounded selection metadata derived from
+their claimed runs' `raw/params.json`: the normalized experiment date from a
+leading `YYYYMMDD` log-directory component, unique deployment tags, and unique
+trace basenames. Manifest aggregates union metadata only across their declared
+members; singleton aggregates use only their one run. Missing or malformed
+params yield empty metadata instead of failing catalog discovery. The catalog
+sorts by experiment date descending, then artifact update time descending;
+entries without a dated experiment name sort after dated entries.
+
 Repeated launcher invocations may extend the manifest only when they target the
 same experiment directory and declare the same ordered axis list. The launcher
 then upserts members by relative run path. A different axis list is a different
@@ -230,6 +250,38 @@ heatmap axes and every coordinate combination of the remaining axes is a facet.
 Facet panels use a near-square row/column layout. Missing grid cells remain
 blank and are never interpolated. Constraints, verdicts, inquiry text, and
 agent state are not sweep-analysis inputs.
+
+The read-only UI service publishes sweep analysis as a separate protocol-v1
+resource family:
+
+- `GET /api/v1/sweeps` discovers experiment envelopes containing
+  `sweep_manifest.json` plus unclaimed singleton runs below the configured logs
+  roots. Each catalog entry has an opaque `sweep_id`, `kind` (`sweep` or
+  `singleton`), display name, ordered axes, member count, aggregate status,
+  experiment date, deployment/trace filter values, and payload href.
+- `GET /api/v1/sweeps/{sweep_id}/payload` projects the existing
+  `sweep_metrics_grid.json` for a manifest sweep. For a singleton it projects
+  the same bounded scalars directly from that run's existing summary and
+  analyzer reports; neither path rescans parquet.
+
+The HTTP projection never exposes `meta.experiment_dir` or member filesystem
+paths. When a manifest member resolves to a discovered run, its payload row
+contains that run's opaque `run_id`; missing members retain `run_id: null`.
+Clients may use this id for drill-down but must not infer run identity from
+labels, coordinates, or hrefs. A manifest without an aggregate payload remains
+visible as `pending`, so incomplete analysis is distinguishable from an empty
+logs root.
+
+The workload overview resolves `workload.trace_files` against the configured
+logs root. Launcher output may be either logs-root-relative (`trace/<file>`,
+`<experiment>/trace/<file>`) or workspace-relative with the logs-root basename
+as its prefix (`logs/<experiment>/trace/<file>` when `--logs-root logs`). The
+resolver tries the direct relative path first and only then strips that exact
+basename prefix. Every component must remain normal (no absolute path or
+traversal), the path must pass through a directory named `trace`, and the
+canonical regular file must remain below the configured logs root. The UI
+service must not assume that every launcher trace is under one root-level
+`trace/` directory.
 
 ## Relationship to other docs
 
