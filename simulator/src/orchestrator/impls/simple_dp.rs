@@ -258,7 +258,7 @@ where
     fn on_arrival(&mut self, req: Request) {
         let rid = req.id;
         let session = req.session;
-        self.requests.borrow_mut().insert(&req);
+        self.requests.borrow_mut().upsert(&req);
         self.dp_pool.admit_for_session(session, rid);
     }
 

@@ -193,6 +193,21 @@ impl RequestStore {
         self.records.push(RequestRecord::from_request(req));
     }
 
+    /// Insert-or-overwrite the record for `req`. Flows call this at admission:
+    /// in the default modes the store is empty at start, so this is a plain
+    /// dense `insert`; in session-dependent replay the store was pre-filled
+    /// (`TraceFrontend::preinsert_all`) because emission is out of id order, and
+    /// this overwrites the placeholder with the admission-stamped arrival facts
+    /// (the request has not run yet, so resetting working fields is a no-op).
+    pub fn upsert(&mut self, req: &Request) {
+        let slot = req.id.0 as usize;
+        if slot < self.records.len() {
+            self.records[slot] = RequestRecord::from_request(req);
+        } else {
+            self.insert(req);
+        }
+    }
+
     pub fn get(&self, id: RequestId) -> Option<&RequestRecord> {
         self.records.get(id.0 as usize)
     }
