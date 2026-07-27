@@ -14,6 +14,7 @@ at the top of its section, with its private async machinery below it.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from .exec import (
     _profile_env,
     binary_path,
     run_analysis,
+    run_sweep_analysis,
     wrap_with_perf,
 )
 from .schema import build_cli_command, log_dir_of, validate_unique_log_dirs
@@ -132,8 +134,15 @@ def run_single(
         raise TypeError("run_single requires a loaded Schema; call load_schema() first")
     return asyncio.run(
         _run_single_async(
-            params, preset, schema, build_type, refresh, profile, profile_freq,
-            analyze, analyze_subjects,
+            params,
+            preset,
+            schema,
+            build_type,
+            refresh,
+            profile,
+            profile_freq,
+            analyze,
+            analyze_subjects,
         )
     )
 
@@ -184,8 +193,14 @@ def run_sweep(
         raise TypeError("run_sweep requires a loaded Schema; call load_schema() first")
     return asyncio.run(
         _run_sweep_async(
-            param_sets, original_preset, schema, build_type, parallelism, refresh,
-            analyze, analyze_subjects,
+            param_sets,
+            original_preset,
+            schema,
+            build_type,
+            parallelism,
+            refresh,
+            analyze,
+            analyze_subjects,
         )
     )
 
@@ -205,6 +220,7 @@ async def _run_sweep_async(
 
     base_dir = _experiment_root(param_sets)
     base_dir.mkdir(parents=True, exist_ok=True)
+    sweep_manifest_path = _write_sweep_manifest(param_sets, base_dir)
     metadata.write_shared_metadata(base_dir, original_preset)
 
     # Resume (default): only prebuild + launch runs that aren't already complete.
@@ -213,9 +229,7 @@ async def _run_sweep_async(
     if refresh:
         pending = param_sets
     else:
-        pending = [
-            p for p in param_sets if not _is_complete(Path(log_dir_of(p)))
-        ]
+        pending = [p for p in param_sets if not _is_complete(Path(log_dir_of(p)))]
     skipped = len(param_sets) - len(pending)
     if skipped:
         print(
@@ -233,15 +247,19 @@ async def _run_sweep_async(
         async def _bounded(params: dict) -> bool:
             async with sem:
                 return await _launch_one(
-                    params, build_type, refresh,
-                    analyze=analyze, analyze_subjects=analyze_subjects,
+                    params,
+                    build_type,
+                    refresh,
+                    analyze=analyze,
+                    analyze_subjects=analyze_subjects,
                 )
 
         results = await asyncio.gather(*(_bounded(p) for p in pending))
     else:
         results = []
 
-    _aggregate(param_sets, base_dir, original_preset)
+    if analyze and sweep_manifest_path is not None:
+        _aggregate(base_dir, build_type)
 
     return 0 if all(results) else 1
 
@@ -279,48 +297,88 @@ def _sweep_axes(param_sets: list[dict]) -> list[str]:
     members: set[str] = set()
     for p in param_sets:
         members |= set(p.get("_compound_members", ()))
-    keys: set[str] = set()
+    # Dict insertion order is the DSL order established by expansion: independent
+    # sweep dimensions, compound groups, then derived names. Preserve it because
+    # the analyzer assigns the first two axes to x/y and later axes to facets.
+    keys: list[str] = []
+    seen_keys: set[str] = set()
     for p in param_sets:
-        keys |= set(p.get("_env", {}))
+        for key in p.get("_env", {}):
+            if key not in seen_keys:
+                seen_keys.add(key)
+                keys.append(key)
     axes = []
-    for k in sorted(keys - members):
+    for k in keys:
+        if k in members:
+            continue
         if len({_axis_value_key(p.get("_env", {}).get(k)) for p in param_sets}) > 1:
             axes.append(k)
     return axes
 
 
-def _aggregate(param_sets: list[dict], base_dir: Path, original_preset: dict) -> None:
-    """Best-effort sweep aggregation. The aggregator is analyzer-owned and may
-    not be present yet; skip silently if unavailable (design §1.2.5).
+def _manifest_member(params: dict, base_dir: Path, axes: list[str]) -> dict:
+    """One explicit experiment-relative member row for `sweep_manifest.json`."""
+    resolved_log_dir = Path(log_dir_of(params)).resolve()
+    try:
+        relative_log_dir = resolved_log_dir.relative_to(base_dir.resolve())
+    except ValueError as error:
+        raise ValueError(
+            f"sweep run {resolved_log_dir} is outside experiment root {base_dir.resolve()}"
+        ) from error
+    return {
+        "path": relative_log_dir.as_posix(),
+        "coordinates": {axis: params.get("_env", {}).get(axis) for axis in axes},
+        "labels": {
+            axis: label for axis, label in params.get("_sweep_labels", {}).items() if axis in axes
+        },
+    }
 
-    Example payload after expansion (sweep coords come from each run's `_env`):
-        run_infos = [
-            {"log_dir": "/abs/logs/tp2", "sweep": {"ptp": 2}, "labels": {}},
-            {"log_dir": "/abs/logs/tp4", "sweep": {"ptp": 4}, "labels": {}},
-        ]
-    Independent `sweep` dims form a cartesian grid; correlated columns come from a
-    `compound` group (one named axis whose members co-vary) or a `derived` name
-    moving with its inputs — both surface as ordinary `_env` axes, so no separate
-    group-zip hint is needed in the structured interface.
+
+def _write_sweep_manifest(param_sets: list[dict], base_dir: Path) -> Path | None:
+    """Persist exact sweep membership before launch.
+
+    Repeated compatible invocations in one experiment upsert by relative run
+    path. Nothing is discovered from the filesystem, so stale sibling folders
+    never become accidental members.
+    """
+    axes = _sweep_axes(param_sets)
+    if not axes:
+        # `run_sweep` is also the execution path for a batch of independent
+        # preset files. With no launcher coordinate there is no honest aggregate
+        # geometry, so keep the batch behavior and emit no sweep artifact.
+        return None
+    manifest_path = base_dir / "sweep_manifest.json"
+    new_members = [_manifest_member(params, base_dir, axes) for params in param_sets]
+    members_by_path: dict[str, dict] = {}
+    if manifest_path.is_file():
+        existing = json.loads(manifest_path.read_text())
+        if existing.get("schema_version") != 1:
+            raise ValueError(
+                f"{manifest_path} has unsupported schema_version {existing.get('schema_version')!r}"
+            )
+        if existing.get("axes") != axes:
+            raise ValueError(
+                f"{manifest_path} axes {existing.get('axes')!r} do not match "
+                f"this invocation's ordered axes {axes!r}; use another experiment folder"
+            )
+        members_by_path.update((member["path"], member) for member in existing.get("runs", []))
+    members_by_path.update((member["path"], member) for member in new_members)
+    manifest = {
+        "schema_version": 1,
+        "axes": axes,
+        "runs": list(members_by_path.values()),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str) + "\n")
+    return manifest_path
+
+
+def _aggregate(base_dir: Path, build_type: str = "debug") -> None:
+    """Best-effort Rust sweep collection + Python payload rendering.
+
+    Membership was already persisted before launch. Keep this post-run boundary
+    thin: the analyzer reads that manifest and the member reports.
     """
     try:
-        from analyze_aggregator.aggregator import aggregate_sweep
-    except Exception:
-        print("[aggregate] aggregator unavailable; skipping sweep summary")
-        return
-
-    # Each run_info is one row of the axis-coordinate → output-folder map. Use
-    # ABSOLUTE log_dir so it is unambiguous against the resolved base_dir.
-    axes = _sweep_axes(param_sets)
-    run_infos = [
-        {
-            "log_dir": str(Path(log_dir_of(p)).resolve()),
-            "sweep": {k: p.get("_env", {}).get(k) for k in axes},
-            "labels": p.get("_sweep_labels", {}),
-        }
-        for p in param_sets
-    ]
-    try:
-        aggregate_sweep(run_infos, base_dir, groups={})
+        run_sweep_analysis(base_dir, build_type)
     except Exception as exc:  # aggregation failure must not fail the sweep
         print(f"[aggregate] skipped: {exc}")

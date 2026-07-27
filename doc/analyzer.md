@@ -177,6 +177,60 @@ and then performs the normal unlocked analysis pass, so both policies are
 available to viz-ui without rerunning simulation. The final
 `analyzer_timing.json` belongs to the normal requested-subject pass.
 
+## Cross-run sweep analysis
+
+A launcher sweep is one explicit experiment envelope above ordinary run
+directories. The launcher owns its coordinates because only expansion knows
+which bindings formed the sweep; the analyzer owns collection of the already
+computed per-run scalar reports. Neither side discovers membership by scanning
+nearby directories.
+
+The launcher writes `<experiment_dir>/sweep_manifest.json` before aggregation:
+
+```json
+{
+  "schema_version": 1,
+  "axes": ["request_rate", "tp_size"],
+  "runs": [
+    {
+      "path": "rate40_tp2/simulation",
+      "coordinates": {"request_rate": 40.0, "tp_size": 2},
+      "labels": {}
+    }
+  ]
+}
+```
+
+`axes` preserves launcher-DSL declaration order. Every run path is relative to
+the experiment directory and membership is exactly the listed set; an analyzer
+must reject absolute paths, traversal, duplicate coordinates, missing
+coordinates, and paths that resolve outside the experiment. Different
+experiment directories are never merged automatically.
+
+Repeated launcher invocations may extend the manifest only when they target the
+same experiment directory and declare the same ordered axis list. The launcher
+then upserts members by relative run path. A different axis list is a different
+experiment envelope and must use another directory; silently combining the two
+would make coordinate uniqueness and plot geometry ambiguous.
+
+`analyze sweep <experiment_dir>` reads only `summary.json` plus the existing
+`slo-general`, `throughput`, and `utilization` reports from each member. It does
+not rescan parquet or invent a second definition of those metrics. Missing or
+unfinished member artifacts become explicit lifecycle states and null metric
+values rather than failing the whole sweep. Outputs use the normal analyzer
+layout at the experiment root:
+
+- `reports/sweep_summary_report.json` — one scalar row per member run;
+- `payloads/sweep_metrics_grid.json` — ordered axes, coordinate domains, rows,
+  and metric display metadata for the renderer.
+
+The renderer is dimension-generic. One axis produces line plots; two axes
+produce scalar heatmaps; with three or more axes, the first two remain the
+heatmap axes and every coordinate combination of the remaining axes is a facet.
+Facet panels use a near-square row/column layout. Missing grid cells remain
+blank and are never interpolated. Constraints, verdicts, inquiry text, and
+agent state are not sweep-analysis inputs.
+
 ## Relationship to other docs
 
 This document supersedes the archived `old-doc/analyzer.md` (kept only as design

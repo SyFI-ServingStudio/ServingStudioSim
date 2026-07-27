@@ -462,23 +462,33 @@ without building anything.
 
 ## Sweep aggregation handoff
 
-After a sweep, `sweep._aggregate` calls the analyzer-owned `aggregate_sweep`.
+After a sweep, the launcher writes `sweep_manifest.json` at the experiment root
+and invokes the analyzer-owned sweep collector. The manifest is also the durable
+membership record consumed by later UI publication.
 **Sweep axes are mechanism-agnostic**: any `sweep`/`derived` name that takes more
 than one distinct value across runs (read from each run's stashed `_env`) is an
-axis; constants are excluded. Each run is one row of an axis-coordinate →
-output-folder map:
+axis; constants are excluded. Axis order follows DSL declaration order.
+Compound members are folded into their group axis. Each run is one row of an
+axis-coordinate → output-folder map:
 
 ```python
-run_infos[i] = {
-    "log_dir": "<absolute path>",     # this run's folder
-    "sweep":   {axis: value, ...},    # its coordinate (from _env)
-    "labels":  {dim: label, ...},     # readable ticks (dict-sweep keys)
+sweep_manifest = {
+    "schema_version": 1,
+    "axes": ["<axis in DSL declaration order>", "..."],
+    "runs": [{
+        "path": "<run folder relative to experiment root>",
+        "coordinates": {axis: value, ...},
+        "labels": {dim: label, ...},
+    }],
 }
-aggregate_sweep(run_infos, base_dir, groups={})
 ```
 
-The aggregator is optional: if it is not importable the sweep still completes and
-the summary step is skipped.
+Membership is explicit: the analyzer never scans adjacent directories into a
+sweep, and never merges different experiment roots. Aggregate analysis remains
+best-effort; its failure does not fail completed simulation runs.
+Repeated invocations under the same experiment root upsert manifest members only
+when their ordered axis lists match. An axis mismatch is rejected instead of
+silently mixing incompatible sweep geometries.
 
 ## CLI
 

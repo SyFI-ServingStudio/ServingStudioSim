@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import types
 
 import pytest
 import yaml
@@ -50,6 +49,7 @@ from launcher.sweep import (
     _run_single_async,
     _run_sweep_async,
     _sweep_axes,
+    _write_sweep_manifest,
     run_single,
     run_sweep,
 )
@@ -1377,30 +1377,91 @@ def test_sweep_axes_folds_compound_members_into_group(schema):
     assert _sweep_axes(runs) == ["tp_rate"]
 
 
-def test_aggregate_passes_run_infos(monkeypatch, tmp_path):
+def test_sweep_axes_preserve_dsl_order(schema):
+    runs = [
+        {"_env": {"tp": 2, "request_rate": 40, "derived_batch": 80}},
+        {"_env": {"tp": 4, "request_rate": 60, "derived_batch": 240}},
+    ]
+    assert _sweep_axes(runs) == ["tp", "request_rate", "derived_batch"]
+
+
+def test_sweep_manifest_upserts_compatible_invocations(tmp_path):
+    first = [
+        {
+            "io": {"log_dir": str(tmp_path / "r40")},
+            "_env": {"request_rate": 40},
+            "_sweep_labels": {"request_rate": "r40"},
+        },
+        {
+            "io": {"log_dir": str(tmp_path / "r50")},
+            "_env": {"request_rate": 50},
+            "_sweep_labels": {"request_rate": "r50"},
+        },
+    ]
+    second = [
+        {
+            "io": {"log_dir": str(tmp_path / "r50")},
+            "_env": {"request_rate": 50},
+            "_sweep_labels": {"request_rate": "r50-new"},
+        },
+        {
+            "io": {"log_dir": str(tmp_path / "r60")},
+            "_env": {"request_rate": 60},
+            "_sweep_labels": {"request_rate": "r60"},
+        },
+    ]
+
+    manifest_path = _write_sweep_manifest(first, tmp_path)
+    _write_sweep_manifest(second, tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+
+    assert manifest["axes"] == ["request_rate"]
+    assert [member["path"] for member in manifest["runs"]] == ["r40", "r50", "r60"]
+    assert manifest["runs"][1]["labels"]["request_rate"] == "r50-new"
+
+
+def test_sweep_manifest_skips_multi_preset_batch_without_axes(tmp_path):
+    manifest_path = _write_sweep_manifest(
+        [
+            {"io": {"log_dir": str(tmp_path / "preset-a")}, "_env": {}},
+            {"io": {"log_dir": str(tmp_path / "preset-b")}, "_env": {}},
+        ],
+        tmp_path,
+    )
+
+    assert manifest_path is None
+    assert not (tmp_path / "sweep_manifest.json").exists()
+
+
+def test_sweep_manifest_rejects_axis_mismatch(tmp_path):
+    _write_sweep_manifest(
+        [
+            {"io": {"log_dir": str(tmp_path / "r40")}, "_env": {"rate": 40}},
+            {"io": {"log_dir": str(tmp_path / "r50")}, "_env": {"rate": 50}},
+        ],
+        tmp_path,
+    )
+    with pytest.raises(ValueError, match="do not match"):
+        _write_sweep_manifest(
+            [
+                {"io": {"log_dir": str(tmp_path / "tp2")}, "_env": {"tp": 2}},
+                {"io": {"log_dir": str(tmp_path / "tp4")}, "_env": {"tp": 4}},
+            ],
+            tmp_path,
+        )
+
+
+def test_aggregate_calls_rust_sweep_pipeline(monkeypatch, tmp_path):
     calls = []
 
-    def aggregate_sweep(run_infos, base_dir, *, groups):
-        calls.append((run_infos, base_dir, groups))
+    monkeypatch.setattr(
+        "launcher.sweep.run_sweep_analysis",
+        lambda experiment_dir, build_type: calls.append((experiment_dir, build_type)),
+    )
 
-    package = types.ModuleType("analyze_aggregator")
-    package.__path__ = []
-    module = types.ModuleType("analyze_aggregator.aggregator")
-    module.aggregate_sweep = aggregate_sweep
-    monkeypatch.setitem(sys.modules, "analyze_aggregator", package)
-    monkeypatch.setitem(sys.modules, "analyze_aggregator.aggregator", module)
+    _aggregate(tmp_path, "release")
 
-    param_sets = [
-        {"io": {"log_dir": str(tmp_path / "tp2")}, "_env": {"ptp": 2}, "_sweep_labels": {}},
-        {"io": {"log_dir": str(tmp_path / "tp4")}, "_env": {"ptp": 4}, "_sweep_labels": {}},
-    ]
-    _aggregate(param_sets, tmp_path, {})
-
-    run_infos, base_dir, groups = calls[0]
-    assert base_dir == tmp_path
-    assert groups == {}
-    assert run_infos[0]["sweep"] == {"ptp": 2}
-    assert run_infos[0]["log_dir"] == str((tmp_path / "tp2").resolve())
+    assert calls == [(tmp_path, "release")]
 
 
 # ── real subprocess plumbing (uses the built binary) ────────────────────────

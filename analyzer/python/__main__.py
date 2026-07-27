@@ -19,12 +19,13 @@ from alignment_workload import series_plot as alignment_workload_plot
 from backend import kernel_input_distribution_plot
 from batch import kernel_throughput_plot, scatter_plot
 from breakdown import kernel_time_share_plot
-from conservation import workload_plot
 from concurrency import request_state_plot
 from concurrency import series_plot as concurrency_plot
+from conservation import workload_plot
 from kv import kv_occupancy_plot
 from optimality import optimality_plot
 from request import slo_plot
+from sweep import grid_plot as sweep_plot
 from throughput import segment_plot
 from utilization import util_plot
 
@@ -48,9 +49,11 @@ RENDERERS = {
     "alignment-iteration": alignment_iteration_plot.render,
     "alignment-workload": alignment_workload_plot.render,
     "alignment-e2e": alignment_e2e_plot.render,
+    "sweep": sweep_plot.render,
 }
 ALIGNMENT_SUBJECTS = ("alignment-iteration", "alignment-workload", "alignment-e2e")
-RUN_SUBJECTS = tuple(name for name in RENDERERS if name not in ALIGNMENT_SUBJECTS)
+SWEEP_SUBJECTS = ("sweep",)
+RUN_SUBJECTS = tuple(name for name in RENDERERS if name not in ALIGNMENT_SUBJECTS + SWEEP_SUBJECTS)
 
 
 def _invoke(job: Callable[[], Path]) -> Path:
@@ -86,9 +89,12 @@ def main(argv: list[str]) -> int:
     # registry stays flat; the manifest identifies which artifact envelope this
     # directory carries, so a normal run never probes alignment-only payloads
     # and an alignment bundle never probes normal-run payloads.
-    default_subjects = (
-        ALIGNMENT_SUBJECTS if (log_dir / "alignment_manifest.json").is_file() else RUN_SUBJECTS
-    )
+    if (log_dir / "alignment_manifest.json").is_file():
+        default_subjects = ALIGNMENT_SUBJECTS
+    elif (log_dir / "sweep_manifest.json").is_file():
+        default_subjects = SWEEP_SUBJECTS
+    else:
+        default_subjects = RUN_SUBJECTS
     subjects = argv[2:] or default_subjects
     jobs: list[Callable[[], Path]] = []
     for subject in subjects:

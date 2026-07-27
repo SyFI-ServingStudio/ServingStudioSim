@@ -37,6 +37,7 @@ mod perfetto;
 mod registry;
 mod request;
 mod session;
+mod sweep;
 mod throughput;
 mod trace;
 mod ui_service;
@@ -74,6 +75,12 @@ enum Command {
         analysis_log_dir: PathBuf,
         /// Alignment subject names; empty = all alignment subjects.
         subjects: Vec<String>,
+    },
+    /// Collect scalar metrics across the explicit members of a launcher sweep.
+    Sweep {
+        /// Experiment directory containing `sweep_manifest.json`; outputs land
+        /// in its `reports/` and `payloads/` subdirectories.
+        experiment_dir: PathBuf,
     },
     /// List the available analyzer subjects and what each produces.
     List,
@@ -148,6 +155,7 @@ async fn main() -> Result<()> {
             analysis_log_dir,
             subjects,
         } => alignment(analysis_log_dir, subjects).await,
+        Command::Sweep { experiment_dir } => sweep::run(&experiment_dir),
         Command::Trace {
             log_dir,
             regions,

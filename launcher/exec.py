@@ -338,6 +338,56 @@ def run_alignment_analysis(
         print(f"[analyze] alignment render failed for {log_dir}")
 
 
+def run_sweep_analysis(experiment_dir: Path, build_type: str = "debug") -> None:
+    """Synchronously collect and render one explicit launcher sweep.
+
+    The simulation tasks and their per-run analyzers have already completed at
+    this boundary. Rust reads `sweep_manifest.json` plus their small JSON reports;
+    Python only renders the resulting experiment-level payload.
+    """
+    analyzer = analyzer_binary_path(build_type)
+    if not analyzer.exists():
+        print(f"[aggregate] {analyzer} not built; skipping sweep analysis for {experiment_dir}")
+        return
+
+    stdout_log = experiment_dir / "stdout.log"
+
+    def run_step(section: str, argv: list[str]) -> int:
+        started = time.perf_counter()
+        returncode, output = _run_capture_sync(argv)
+        elapsed_ms = (time.perf_counter() - started) * 1e3
+        with stdout_log.open("a") as stream:
+            stream.write(f"\n=== {section} [{elapsed_ms:.0f} ms] ===\n")
+            stream.write(output)
+            if output and not output.endswith("\n"):
+                stream.write("\n")
+        return returncode
+
+    if (
+        run_step(
+            "analyze sweep compute",
+            [str(analyzer), "sweep", str(experiment_dir)],
+        )
+        != 0
+    ):
+        print(f"[aggregate] sweep compute failed for {experiment_dir}")
+        return
+    if (
+        run_step(
+            "analyze sweep render",
+            [
+                sys.executable,
+                str(REPO_ROOT / "analyzer" / "python"),
+                "render",
+                str(experiment_dir),
+                "sweep",
+            ],
+        )
+        != 0
+    ):
+        print(f"[aggregate] sweep render failed for {experiment_dir}")
+
+
 async def run_iter_breakdown(log_dir: Path, build_type: str = "debug") -> None:
     """Best-effort `analyze gen-iter-breakdown` → `reports/iter_breakdown.ans`
     (human-readable cost tree). Wired ONLY into the timing-predict entry, not

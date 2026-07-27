@@ -53,6 +53,7 @@ alignment analyze ──reads completed roots + mapping
 |---|---|---|
 | `analyze run <log_dir> [--lock-batch-size] [subjects...]` | Rust | Compute subjects → `reports/` + `payloads/`, plus one complete `reports/analyzer_timing.json` run-meta sidecar. Whenever optimality is selected, the normal command emits both unlocked primary and batch-locked variant atomically. `--lock-batch-size` is the low-level locked-only recomputation path. No subjects = all applicable. |
 | `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
+| `analyze sweep <experiment_dir>` | Rust | Collect existing per-run SLO, throughput, utilization, and completion scalars listed by `sweep_manifest.json`; emit sweep report/payload JSON without rescanning parquet. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
 | `analyze serve --logs-root <dir>` | Rust | Serve the read-only viz-ui catalog, bounded worker operation windows, and exact `(worker, iter, batch, operation)` CostTrees reconstructed lazily from `cost_log` + manifest. |
 | `analyze list` | Rust | Print the subject catalog. |
@@ -175,6 +176,7 @@ python/              The render side (matplotlib over payload JSON).
                        is thread-hostile).
   request/, throughput/, utilization/, batch/, backend/, breakdown/, optimality/, conservation/, concurrency/, kv/  One renderer module per subject; returns figure "jobs".
   alignment_iteration/, alignment_e2e/, alignment_workload/  Alignment payload renderers.
+  sweep/               Cross-run 1-D line, 2-D heatmap, and N-D faceted sweep plots.
   common/              Shared plotting: payload loader + run-dir layout, figure
                        scaffolding, CDF plot, style.
 ```
