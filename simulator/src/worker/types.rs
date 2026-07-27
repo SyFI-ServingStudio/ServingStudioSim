@@ -388,7 +388,7 @@ pub struct WorkerStatus {
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub admission: KvAdmission,
     pub balance: LoadBalance,
@@ -438,6 +438,12 @@ pub struct WorkerConfig {
     pub prefix_cache_host_bytes: Option<u64>,
     /// Host-link bandwidth (GB/s) pricing host-tier prefix loads.
     pub prefix_cache_host_bw_gbps: f64,
+    /// Pin each session's rounds to one DP group (see
+    /// `IterWorkerSel::HpUnified::session_sticky_groups`).
+    pub session_sticky_groups: bool,
+    /// Pool-shared host tier handle (overrides the per-group host tiers when
+    /// set; see `IterWorkerSel::HpUnified::prefix_cache_host_shared`).
+    pub shared_host_tier: Option<crate::worker::prefix_cache::SharedHostTier>,
     /// KV offload (vLLM-style preemption swap to host memory). `Some`: when the
     /// KV gate blocks the pending head, the newest decodes are preempted and
     /// their KV swapped out to a host pool of `host_capacity_bytes`, then
@@ -471,6 +477,8 @@ impl Default for WorkerConfig {
             prefix_cache_policy: crate::worker::prefix_cache::EvictPolicy::Lru,
             prefix_cache_host_bytes: None,
             prefix_cache_host_bw_gbps: 55.0,
+            session_sticky_groups: false,
+            shared_host_tier: None,
             kv_offload: None,
         }
     }

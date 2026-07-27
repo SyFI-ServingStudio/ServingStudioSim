@@ -13,7 +13,7 @@ use crate::worker::{IterWorker, SharedGpuCluster, WorkerConfig};
 // Re-export so call sites that still import `crate::orchestrator::{GpuInfo,
 // GpuCluster}` keep working — the canonical home is `worker::gpu_cluster`,
 // which owns the merged GPU registry / transfer timing oracle.
-pub use crate::worker::{GpuInfo, GpuCluster};
+pub use crate::worker::{GpuCluster, GpuInfo};
 
 /// Deployment-level action returned to L7 each tick. Current flows only surface
 /// request completion to L7.
@@ -102,7 +102,7 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
             self.pool_tag,
             Arc::clone(&self.model),
             std::rc::Rc::clone(&self.requests),
-            self.worker_config,
+            self.worker_config.clone(),
             self.log_dir.clone(),
             pool,
             &self.gpu_name,

@@ -139,6 +139,21 @@ pub enum IterWorkerSel {
         #[serde(default = "default_host_bw_gbps")]
         #[param(default = 55.0)]
         prefix_cache_host_bw_gbps: f64,
+        /// Share ONE host tier across every worker (DP replica) of the pool
+        /// (`prefix_cache_host_gb` is then the TOTAL pool capacity, not per
+        /// group) — a coarse global KV store: any replica hits any session's
+        /// retained prefix, loading over its own group link. Removes the
+        /// cache-locality reason for sticky placement/groups.
+        #[serde(default)]
+        prefix_cache_host_shared: bool,
+        /// Route each SESSION's rounds to one DP group (first admission picks
+        /// via the balancer; later rounds stick). Aligns requests with the
+        /// per-group prefix-cache tiers: without it, session-sticky placement
+        /// pins the replica but rounds rotate across its groups, leaving stale
+        /// duplicated cache entries and depressed hit rates. Sessionless
+        /// requests keep balancer routing. Off = per-round balancer (legacy).
+        #[serde(default)]
+        session_sticky_groups: bool,
         /// KV-offload host pool (GB). `Some`: KV-blocked heads preempt the
         /// newest decodes, swapping their KV to host and back (vLLM-style swap
         /// space). `None` = no offload.

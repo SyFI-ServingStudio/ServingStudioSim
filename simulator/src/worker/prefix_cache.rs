@@ -12,7 +12,9 @@
 //! Content-level dedup across sessions (radix-tree sharing) is out of scope:
 //! the trace carries token counts, not tokens.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use serde::Deserialize;
 
@@ -219,5 +221,54 @@ mod tests {
         c.insert(1, 5000);
         assert_eq!(c.lookup_touch(1, 4000), 1000);
         assert_eq!(c.used_tokens(), 1000);
+    }
+}
+
+/// A host prefix-cache tier SHARED across workers (all DP replicas of a pool
+/// see one capacity pool — the Mooncake-style global KV store, coarse-grained).
+/// The sim thread ticks workers sequentially, so `Rc<RefCell>` suffices. The
+/// byte capacity converts to tokens lazily on first use (workers know the
+/// model's `total_kv_bytes_per_token`; every worker of a pool shares one model,
+/// so the first conversion is authoritative).
+#[derive(Debug, Clone)]
+pub struct SharedHostTier {
+    inner: Rc<RefCell<SharedHostInner>>,
+}
+
+#[derive(Debug)]
+struct SharedHostInner {
+    capacity_bytes: u64,
+    policy: EvictPolicy,
+    cache: Option<PrefixCache>,
+}
+
+impl SharedHostTier {
+    pub fn new(capacity_bytes: u64, policy: EvictPolicy) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(SharedHostInner {
+                capacity_bytes,
+                policy,
+                cache: None,
+            })),
+        }
+    }
+
+    fn with_cache<R>(&self, kv_bytes_per_token: u64, f: impl FnOnce(&mut PrefixCache) -> R) -> R {
+        let mut inner = self.inner.borrow_mut();
+        if inner.cache.is_none() {
+            let tokens = inner.capacity_bytes / kv_bytes_per_token.max(1);
+            inner.cache = Some(PrefixCache::new(tokens, inner.policy));
+        }
+        f(inner.cache.as_mut().expect("initialized above"))
+    }
+
+    /// See [`PrefixCache::lookup_touch`].
+    pub fn lookup_touch(&self, session: u32, want_prefix: u32, kv_bytes_per_token: u64) -> u32 {
+        self.with_cache(kv_bytes_per_token, |c| c.lookup_touch(session, want_prefix))
+    }
+
+    /// See [`PrefixCache::insert`].
+    pub fn insert(&self, session: u32, tokens: u64, kv_bytes_per_token: u64) {
+        self.with_cache(kv_bytes_per_token, |c| c.insert(session, tokens))
     }
 }

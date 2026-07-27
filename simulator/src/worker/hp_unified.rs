@@ -97,6 +97,10 @@ pub struct HpUnifiedWorker<M: IterwiseUnifiedModel> {
     host_tiers: Vec<PrefixCache>,
     /// Per-group host-link busy-until clock: loads serialize FIFO per group.
     host_link_free: Vec<Time>,
+    /// Session → pinned DP group (`session_sticky_groups`): first admission
+    /// routes via the balancer, later rounds reuse the pin so they land where
+    /// the session's prefix-cache entries live.
+    session_groups: HashMap<u32, u16>,
 }
 
 impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
@@ -188,6 +192,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             prefix_caches,
             host_tiers,
             host_link_free: vec![Time::ZERO; num_groups],
+            session_groups: HashMap::new(),
         }
     }
 
@@ -347,7 +352,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                         let r = &store[rid];
                         (r.prompt_len, r.decode_len, r.prefix_kv)
                     };
-                    let gid = self.runtime.balance.choose(self.batches.len()) as u16;
+                    let gid = self.route_group(rid);
                     let group_promised = self.group_promised_kv(gid);
                     // The trace-declared cached prefix occupies KV alongside the
                     // prefilled prompt, so the gate demands `p + prefix`.
@@ -381,7 +386,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                     // (its own budget or the KV gate), stop — the head waits for a
                     // later iter (the cursor has advanced, so RR tries the next
                     // group then). Naive: no cross-group re-routing within an iter.
-                    let gid = self.runtime.balance.choose(n) as u16;
+                    let gid = self.route_group(rid);
                     let g = gid as usize;
                     if !prefill_fits_budget(budget, decode_tokens[g], admitted[g], p) {
                         break;
@@ -450,26 +455,45 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                     .saturating_sub(inflight.min(cap))
             })
             .collect();
-        while let Some(&rid) = self.runtime.pending_prefills.front() {
+        // Under sticky groups a blocked request's target group is FIXED, so
+        // stopping at the first blocked head would head-of-line block requests
+        // bound for other (possibly idle) groups. Scan the whole pending queue
+        // (bounded by the closed-loop cap) and admit whatever fits its own
+        // group; without sticky groups the scan degenerates to the legacy
+        // front-first behavior after the first failure per group would anyway
+        // (balancer state advances identically per admitted request).
+        let mut idx = 0;
+        let mut blocked_groups = vec![false; n];
+        while idx < self.runtime.pending_prefills.len() {
+            let rid = self.runtime.pending_prefills[idx];
             let (p, d, prefix) = {
                 let store = self.requests.borrow();
                 let r = &store[rid];
                 (r.prompt_len, r.decode_len, r.prefix_kv)
             };
-            let gid = self.runtime.balance.choose(n) as u16;
+            let gid = self.route_group(rid);
             let g = gid as usize;
-            if left[g] == 0 {
-                break;
+            // Per-group FIFO: once a group rejects a request, don't admit a
+            // LATER request into that same group past it this iteration.
+            if blocked_groups[g] {
+                idx += 1;
+                continue;
             }
             let group_promised = self.group_promised_kv(gid);
-            if !self
-                .config
-                .admission
-                .try_admit(&self.batches[g], group_promised, p + prefix, d)
+            if left[g] == 0
+                || !self
+                    .config
+                    .admission
+                    .try_admit(&self.batches[g], group_promised, p + prefix, d)
             {
-                break;
+                blocked_groups[g] = true;
+                if !self.config.session_sticky_groups {
+                    break; // legacy front-first semantics
+                }
+                idx += 1;
+                continue;
             }
-            self.runtime.pending_prefills.pop_front();
+            self.runtime.pending_prefills.remove(idx);
             self.promise(gid, rid, p, d, prefix, now);
             left[g] = left[g].saturating_sub(p.min(left[g]));
         }
@@ -595,7 +619,9 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                         // Write-through: the host tier retains the session too,
                         // so a later GPU-tier eviction downgrades the next
                         // round to a load instead of a recompute.
-                        if let Some(tier) = self.host_tiers.get_mut(gid) {
+                        if let Some(shared) = &self.config.shared_host_tier {
+                            shared.insert(session, ctx, self.model.total_kv_bytes_per_token());
+                        } else if let Some(tier) = self.host_tiers.get_mut(gid) {
                             tier.insert(session, ctx);
                         }
                     }
@@ -693,9 +719,13 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         // request is held out of the prefill admits until the load completes.
         let mut hit = hit;
         if hit < prefix {
-            let host_hit = match (self.host_tiers.get_mut(gid as usize), r.session) {
-                (Some(tier), Some(session)) => tier.lookup_touch(session, prefix),
-                _ => 0,
+            let kv_per_tok = self.model.total_kv_bytes_per_token();
+            let host_hit = match (&self.config.shared_host_tier, r.session) {
+                (Some(shared), Some(session)) => shared.lookup_touch(session, prefix, kv_per_tok),
+                _ => match (self.host_tiers.get_mut(gid as usize), r.session) {
+                    (Some(tier), Some(session)) => tier.lookup_touch(session, prefix),
+                    _ => 0,
+                },
             };
             let loaded = host_hit.saturating_sub(hit);
             if loaded > 0 {
@@ -714,6 +744,25 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         // Whole-prefill mode runs the full target as one chunk; chunked mode
         // overwrites this in the dealing pass.
         r.active_chunk_len = r.prefill_target;
+    }
+
+    /// Group for a fresh admission: the session's pinned group when
+    /// `session_sticky_groups` is on (pinning it via the balancer on first
+    /// sight), else the balancer's per-round choice.
+    fn route_group(&mut self, rid: RequestId) -> u16 {
+        let n = self.batches.len();
+        if self.config.session_sticky_groups {
+            let session = self.requests.borrow()[rid].session;
+            if let Some(sess) = session {
+                if let Some(&g) = self.session_groups.get(&sess) {
+                    return g;
+                }
+                let g = self.runtime.balance.choose(n) as u16;
+                self.session_groups.insert(sess, g);
+                return g;
+            }
+        }
+        self.runtime.balance.choose(n) as u16
     }
 
     fn drain_promises_into_admits(&mut self, now: Time) {
@@ -943,6 +992,42 @@ mod tests {
         w.form_batch(ready);
         assert_eq!(w.batches[0].prefill_admits.len(), 1);
         assert!(w.runtime.load_ready.is_empty());
+    }
+
+    #[test]
+    fn session_sticky_groups_pin_rounds_to_one_group() {
+        // Two groups, four sessionful one-round requests: sessions 5,5,9,9.
+        // With sticky groups, both rounds of a session land on the group the
+        // session was pinned to at first admission, regardless of the RR
+        // balancer's per-round rotation.
+        let store = shared_with(&[(0, 8, 0), (1, 8, 0), (2, 8, 0), (3, 8, 0)]);
+        for (id, sess) in [(0u32, 5u32), (1, 9), (2, 5), (3, 9)] {
+            store.borrow_mut()[RequestId(id)].session = Some(sess);
+        }
+        let cfg = WorkerConfig {
+            max_batch_tokens: Some(64),
+            session_sticky_groups: true,
+            ..WorkerConfig::default()
+        };
+        let mut w = worker_cfg(store, 2, cfg);
+        for id in 0..4u32 {
+            w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        w.form_batch(Time::ZERO);
+        let group_of = |w: &HpUnifiedWorker<FakeModel>, id: u32| {
+            *w.runtime.request_to_group.get(&RequestId(id)).unwrap()
+        };
+        assert_eq!(
+            group_of(&w, 0),
+            group_of(&w, 2),
+            "session 5 split across groups"
+        );
+        assert_eq!(
+            group_of(&w, 1),
+            group_of(&w, 3),
+            "session 9 split across groups"
+        );
+        assert_ne!(group_of(&w, 0), group_of(&w, 1), "sessions should spread");
     }
 
     #[test]
