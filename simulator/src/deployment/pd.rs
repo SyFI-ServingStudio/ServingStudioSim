@@ -177,10 +177,79 @@ impl Deployment for PdDeployment {
                     cost,
                 ))
             }
+            // MoE PD: both pools run the qwen3 MoE DP-attn/EP-ffn arch (each
+            // with its own attn_tp/ep layout). Same weights either side; the KV
+            // is logically one tensor re-sharded across the handoff.
+            (
+                IterArchSel::Qwen3MoeDpAttnEpFfn {
+                    attn_tp_size: p_tp,
+                    ep_size: p_ep,
+                    hp_size: p_hp,
+                    nvl_num_gpu: p_nvl,
+                    routing: p_routing,
+                    routing_seed: p_seed,
+                    ..
+                },
+                IterArchSel::Qwen3MoeDpAttnEpFfn {
+                    attn_tp_size: d_tp,
+                    ep_size: d_ep,
+                    hp_size: d_hp,
+                    nvl_num_gpu: d_nvl,
+                    routing: d_routing,
+                    routing_seed: d_seed,
+                    ..
+                },
+            ) => {
+                let prefill_model = {
+                    let _scope =
+                        bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
+                    Arc::new(arch_build::qwen3_moe(
+                        pg.arch.model(),
+                        *p_tp,
+                        *p_ep,
+                        *p_hp,
+                        *p_nvl,
+                        *p_routing,
+                        *p_seed,
+                        &pg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
+                };
+                let decode_model = {
+                    let _scope =
+                        bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
+                    Arc::new(arch_build::qwen3_moe(
+                        dg.arch.model(),
+                        *d_tp,
+                        *d_ep,
+                        *d_hp,
+                        *d_nvl,
+                        *d_routing,
+                        *d_seed,
+                        &dg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
+                };
+                Ok(assemble_pd_flow(
+                    prefill_model,
+                    decode_model,
+                    store,
+                    prefill_wc,
+                    decode_wc,
+                    log_dir,
+                    pg.gpu.clone(),
+                    dg.gpu.clone(),
+                    prefill_cfg,
+                    decode_cfg,
+                    cost,
+                ))
+            }
             (p, d) => bail!(
                 "pd: unsupported prefill/decode arch pairing \
                  (got prefill={p:?}, decode={d:?}); wired pairs: \
-                 dense_tp→dense_tp, dense_tp→dp_attn_tp_ffn"
+                 dense_tp→dense_tp, dense_tp→dp_attn_tp_ffn, qwen3_moe→qwen3_moe"
             ),
         }
     }
@@ -220,23 +289,38 @@ fn worker_config(
     log_output_token_times: bool,
     kv_log_stride: u32,
 ) -> WorkerConfig {
-    let (attn_gpu_memory_gb, gpu_time_multiplier) = match worker {
-        IterWorkerSel::PdPrefill {
-            attn_gpu_memory_gb,
-            gpu_time_multiplier,
-        }
-        | IterWorkerSel::PdDecode {
-            attn_gpu_memory_gb,
-            gpu_time_multiplier,
-        } => (*attn_gpu_memory_gb, *gpu_time_multiplier),
-        // ensure_* gates the worker tag before this is reached.
-        _ => (80.0, 1.0),
-    };
+    let (attn_gpu_memory_gb, gpu_time_multiplier, prefix_cache_gb, prefix_cache_policy) =
+        match worker {
+            IterWorkerSel::PdPrefill {
+                attn_gpu_memory_gb,
+                gpu_time_multiplier,
+                prefix_cache_gb,
+                prefix_cache_policy,
+            } => (
+                *attn_gpu_memory_gb,
+                *gpu_time_multiplier,
+                *prefix_cache_gb,
+                *prefix_cache_policy,
+            ),
+            IterWorkerSel::PdDecode {
+                attn_gpu_memory_gb,
+                gpu_time_multiplier,
+            } => (
+                *attn_gpu_memory_gb,
+                *gpu_time_multiplier,
+                None,
+                Default::default(),
+            ),
+            // ensure_* gates the worker tag before this is reached.
+            _ => (80.0, 1.0, None, Default::default()),
+        };
     WorkerConfig {
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
         kv_log_stride,
         gpu_time_multiplier,
+        prefix_cache_bytes: prefix_cache_gb.map(|gb| (gb * 1e9) as u64),
+        prefix_cache_policy,
         ..WorkerConfig::default()
     }
 }

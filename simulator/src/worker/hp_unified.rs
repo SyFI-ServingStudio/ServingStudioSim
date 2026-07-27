@@ -42,6 +42,10 @@ struct HpRuntime {
     host_used_bytes: u64,
     /// Swap transfer time accrued since last iteration start (see barebone).
     pending_transfer: Time,
+    /// Promised requests whose host-tier prefix load has not finished: rid →
+    /// load-completion time. Gated out of `drain_promises_into_admits` until
+    /// then (their KV reservation already counts via `promised`).
+    load_ready: HashMap<RequestId, Time>,
     iter_counter: u32,
     iter_compute_start: Time,
     worker_fsm_state: WorkerFsmState,
@@ -58,6 +62,7 @@ impl HpRuntime {
             swapped: (0..num_groups).map(|_| VecDeque::new()).collect(),
             host_used_bytes: 0,
             pending_transfer: Time::ZERO,
+            load_ready: HashMap::new(),
             iter_counter: 0,
             iter_compute_start: Time::ZERO,
             worker_fsm_state: WorkerFsmState::Idle,
@@ -86,6 +91,12 @@ pub struct HpUnifiedWorker<M: IterwiseUnifiedModel> {
     /// Session-scoped prefix-cache model, one per DP group (each shard retains
     /// its own sessions' KV); empty when disabled = legacy always-hit replay.
     prefix_caches: Vec<PrefixCache>,
+    /// Host (CPU-DRAM) prefix-cache tier, one per DP group; empty = disabled.
+    /// Sessions write through on completion; a GPU-tier shortfall served here
+    /// is LOADED over the group's host link instead of recomputed.
+    host_tiers: Vec<PrefixCache>,
+    /// Per-group host-link busy-until clock: loads serialize FIFO per group.
+    host_link_free: Vec<Time>,
 }
 
 impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
@@ -150,7 +161,18 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         let prefix_caches = match config.prefix_cache_bytes {
             Some(b) => {
                 let tokens = b / model.total_kv_bytes_per_token().max(1);
-                (0..num_groups).map(|_| PrefixCache::new(tokens)).collect()
+                (0..num_groups)
+                    .map(|_| PrefixCache::new(tokens, config.prefix_cache_policy))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        let host_tiers = match config.prefix_cache_host_bytes {
+            Some(b) => {
+                let tokens = b / model.total_kv_bytes_per_token().max(1);
+                (0..num_groups)
+                    .map(|_| PrefixCache::new(tokens, config.prefix_cache_policy))
+                    .collect()
             }
             None => Vec::new(),
         };
@@ -164,6 +186,8 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             cost,
             kv,
             prefix_caches,
+            host_tiers,
+            host_link_free: vec![Time::ZERO; num_groups],
         }
     }
 
@@ -175,7 +199,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         loop {
             match self.runtime.worker_fsm_state {
                 Idle => {
-                    if !self.form_batch() {
+                    if !self.form_batch(now) {
                         break;
                     }
                     self.runtime.worker_fsm_state = Active;
@@ -301,10 +325,10 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         }
     }
 
-    fn form_batch(&mut self) -> bool {
+    fn form_batch(&mut self, now: Time) -> bool {
         self.drive_kv_offload();
         if let Some(cap) = self.config.chunk_prefill_tokens {
-            return self.form_batch_chunked(cap);
+            return self.form_batch_chunked(cap, now);
         }
         let had_decode = self
             .batches
@@ -334,7 +358,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                         d,
                     ) {
                         self.runtime.pending_prefills.pop_front();
-                        self.promise(gid, rid, p, d, prefix);
+                        self.promise(gid, rid, p, d, prefix, now);
                     }
                 }
             }
@@ -372,14 +396,14 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                         break;
                     }
                     self.runtime.pending_prefills.pop_front();
-                    self.promise(gid, rid, p, d, prefix);
+                    self.promise(gid, rid, p, d, prefix, now);
                     admitted[g] += p;
                 }
             }
         }
 
         // Phase B: drain ready promises into their group's prefill_admits.
-        self.drain_promises_into_admits();
+        self.drain_promises_into_admits(now);
         let had_prefill = self.batches.iter().any(|b| !b.prefill_admits.is_empty());
 
         if !had_decode && !had_prefill {
@@ -394,7 +418,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
     /// each), dealt FIFO to in-flight partial prefills then fresh admissions
     /// (RR-routed to a group, KV-gated on the full context). See the barebone
     /// `form_batch_chunked` for the single-group semantics this mirrors.
-    fn form_batch_chunked(&mut self, cap: u32) -> bool {
+    fn form_batch_chunked(&mut self, cap: u32, now: Time) -> bool {
         let had_decode = self
             .batches
             .iter()
@@ -446,10 +470,10 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
                 break;
             }
             self.runtime.pending_prefills.pop_front();
-            self.promise(gid, rid, p, d, prefix);
+            self.promise(gid, rid, p, d, prefix, now);
             left[g] = left[g].saturating_sub(p.min(left[g]));
         }
-        self.drain_promises_into_admits();
+        self.drain_promises_into_admits(now);
 
         // Deal chunks FIFO per group (partials first — retained in admission
         // order across iterations). Force-deal one chunk on an otherwise-empty
@@ -558,14 +582,22 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             // (d) emit + release completed requests; retain the freed context in
             // the group's session prefix cache.
             for rid in completed {
-                if let Some(cache) = self.prefix_caches.get_mut(gid) {
+                {
                     let store = self.requests.borrow();
                     let r = &store[rid];
                     if let Some(session) = r.session {
                         let ctx = u64::from(r.prefill_target)
                             + u64::from(r.prefix_kv)
                             + u64::from(r.tokens_emitted);
-                        cache.insert(session, ctx);
+                        if let Some(cache) = self.prefix_caches.get_mut(gid) {
+                            cache.insert(session, ctx);
+                        }
+                        // Write-through: the host tier retains the session too,
+                        // so a later GPU-tier eviction downgrades the next
+                        // round to a load instead of a recompute.
+                        if let Some(tier) = self.host_tiers.get_mut(gid) {
+                            tier.insert(session, ctx);
+                        }
                     }
                 }
                 let current_kv = self.batches[gid]
@@ -639,7 +671,7 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
 
     // ── lifecycle helpers (gid-aware; same as barebone) ─────────────────────────
 
-    fn promise(&mut self, gid: u16, rid: RequestId, p: u32, d: u32, prefix: u32) {
+    fn promise(&mut self, gid: u16, rid: RequestId, p: u32, d: u32, prefix: u32, now: Time) {
         self.runtime
             .promised
             .insert(rid, (gid, (p + prefix + d) as u64));
@@ -655,6 +687,28 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
             (Some(_), None) => 0,
             (None, _) => prefix,
         };
+        // Host tier (two-level cache): the GPU-tier shortfall is served from
+        // the host tier when resident there — those tokens are LOADED over the
+        // group's host link (FIFO-serialized) instead of recomputed. The
+        // request is held out of the prefill admits until the load completes.
+        let mut hit = hit;
+        if hit < prefix {
+            let host_hit = match (self.host_tiers.get_mut(gid as usize), r.session) {
+                (Some(tier), Some(session)) => tier.lookup_touch(session, prefix),
+                _ => 0,
+            };
+            let loaded = host_hit.saturating_sub(hit);
+            if loaded > 0 {
+                let bytes = u64::from(loaded).saturating_mul(self.model.total_kv_bytes_per_token());
+                let dur_ms = bytes as f64 / (self.config.prefix_cache_host_bw_gbps * 1e9) * 1e3;
+                let g = gid as usize;
+                let start = self.host_link_free[g].max(now);
+                let ready = start + Time::from_ms(dur_ms);
+                self.host_link_free[g] = ready;
+                self.runtime.load_ready.insert(rid, ready);
+                hit += loaded;
+            }
+        }
         r.prefix_kv = hit;
         r.prefill_target = p + (prefix - hit);
         // Whole-prefill mode runs the full target as one chunk; chunked mode
@@ -662,15 +716,24 @@ impl<M: IterwiseUnifiedModel> HpUnifiedWorker<M> {
         r.active_chunk_len = r.prefill_target;
     }
 
-    fn drain_promises_into_admits(&mut self) {
+    fn drain_promises_into_admits(&mut self, now: Time) {
+        // A promised request whose host-tier prefix load is still in flight
+        // stays promised (KV reserved) until the load completes.
         let drained: Vec<(u16, RequestId)> = self
             .runtime
             .promised
             .iter()
+            .filter(|(rid, _)| {
+                self.runtime
+                    .load_ready
+                    .get(rid)
+                    .is_none_or(|ready| now >= *ready)
+            })
             .map(|(&rid, &(gid, _))| (gid, rid))
             .collect();
         for (gid, rid) in drained {
             self.runtime.promised.remove(&rid);
+            self.runtime.load_ready.remove(&rid);
             self.batches[gid as usize].prefill_admits.push(rid);
         }
     }
@@ -834,6 +897,55 @@ mod tests {
     }
 
     #[test]
+    fn host_tier_serves_gpu_miss_as_gated_load() {
+        // One group; a session resident in the HOST tier only. The request's
+        // declared 100-token prefix must (a) hit via the host tier (no
+        // recompute: prefill_target stays at the prompt), and (b) hold the
+        // request out of prefill_admits until the load completes on the
+        // modeled host link, then admit it.
+        let store = shared_with(&[(0, 8, 2)]);
+        {
+            let mut s = store.borrow_mut();
+            let r = &mut s[RequestId(0)];
+            r.prefix_kv = 100;
+            r.prefill_target = 8;
+            // session 7, declared prefix 100
+        }
+        store.borrow_mut()[RequestId(0)].session = Some(7);
+        let cfg = WorkerConfig {
+            prefix_cache_bytes: Some(0), // GPU tier present but empty-capacity
+            prefix_cache_host_bytes: Some(1_000_000),
+            prefix_cache_host_bw_gbps: 55.0,
+            ..WorkerConfig::default()
+        };
+        let mut w = worker_cfg(store, 1, cfg);
+        // FakeModel's total_kv_bytes_per_token sizes the tier; make session 7
+        // resident host-side with 100 retained tokens.
+        w.host_tiers[0].insert(7, 100);
+        w.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        w.form_batch(Time::ZERO);
+        // Load in flight at t=0: promised, not yet admitted.
+        assert_eq!(w.batches[0].prefill_admits.len(), 0);
+        assert_eq!(w.runtime.promised.len(), 1);
+        let ready = *w
+            .runtime
+            .load_ready
+            .get(&RequestId(0))
+            .expect("load scheduled");
+        assert!(ready > Time::ZERO);
+        // Host hit covered the whole prefix: nothing recomputed.
+        {
+            let s = w.requests.borrow();
+            assert_eq!(s[RequestId(0)].prefix_kv, 100);
+            assert_eq!(s[RequestId(0)].prefill_target, 8);
+        }
+        // After the load completes, the next formation admits it.
+        w.form_batch(ready);
+        assert_eq!(w.batches[0].prefill_admits.len(), 1);
+        assert!(w.runtime.load_ready.is_empty());
+    }
+
+    #[test]
     fn per_dp_budget_admits_independently_per_group() {
         // Two groups, budget 16 PER group, six 8-token prefills. RoundRobin
         // spreads them, so one form_batch fills each group to 16 (two prefills)
@@ -855,7 +967,7 @@ mod tests {
         for id in 0..6u32 {
             w.enqueue(WorkerMsgCommon::Request(RequestId(id)));
         }
-        w.form_batch();
+        w.form_batch(Time::ZERO);
         assert_eq!(w.batches[0].prefill_admits.len(), 2);
         assert_eq!(w.batches[1].prefill_admits.len(), 2);
         assert_eq!(w.runtime.pending_prefills.len(), 2);

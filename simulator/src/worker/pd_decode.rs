@@ -23,8 +23,8 @@ use std::sync::Arc;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::log::{KvSampler, KvSubmit};
-use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::admission_helpers::{Batch, LoadBalance};
+use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::types::{
@@ -178,15 +178,14 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
         // these). KV bytes are summed across the `num_attn_shards` GPUs that
         // make up one shard set, so dividing by the model-level
         // `total_kv_bytes_per_token` yields shard capacity in tokens.
-        let group_kv_bytes =
-            config.attn_kv_bytes.saturating_mul(model.num_attn_shards().max(1) as u64);
-        let total_shard_tokens =
-            (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
+        let group_kv_bytes = config
+            .attn_kv_bytes
+            .saturating_mul(model.num_attn_shards().max(1) as u64);
+        let total_shard_tokens = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
         // Carve the backlog slice out of the active-decode budget so the two
         // accounts don't double-spend the same KV: `pull_budget_tokens` is the
         // backlog cap; `Batch` sees only the complement.
-        let pull_budget_tokens =
-            ((total_shard_tokens as f64 * PULL_BUDGET_FRAC) as u64).max(1);
+        let pull_budget_tokens = ((total_shard_tokens as f64 * PULL_BUDGET_FRAC) as u64).max(1);
         let kv_capacity = total_shard_tokens.saturating_sub(pull_budget_tokens).max(1);
         let batches: Vec<Batch> = (0..num_groups)
             .map(|g| Batch::new(g as u16, kv_capacity))
@@ -213,8 +212,13 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             LoadBalance::Single if num_groups > 1 => LoadBalance::RoundRobin { next: 0 },
             other => other,
         };
-        let cost =
-            CostBuffers::new_iter(cost_log_dir, pool_tag, id, model.as_ref(), config.gpu_time_multiplier);
+        let cost = CostBuffers::new_iter(
+            cost_log_dir,
+            pool_tag,
+            id,
+            model.as_ref(),
+            config.gpu_time_multiplier,
+        );
         Self {
             id,
             model,
@@ -407,7 +411,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             let (prompt_kv, remaining) = {
                 let store = self.requests.borrow();
                 let r = &store[rid];
-                let prompt_kv = (r.prompt_len + r.prefix_kv) as u64;
+                let prompt_kv = (r.prefill_target + r.prefix_kv) as u64;
                 let remaining = r.decode_len.saturating_sub(r.tokens_emitted);
                 (prompt_kv, remaining)
             };
@@ -427,8 +431,10 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
                 // Drain this request's tokens from the backlog counter: it
                 // moved from `pending_decodes` into an active `Batch`, where
                 // `KvPool` admission tracks it now.
-                self.runtime.pending_decodes_tokens =
-                    self.runtime.pending_decodes_tokens.saturating_sub(prompt_kv);
+                self.runtime.pending_decodes_tokens = self
+                    .runtime
+                    .pending_decodes_tokens
+                    .saturating_sub(prompt_kv);
                 self.batches[gid as usize].finalize_to_decode(rid, prompt_kv, remaining);
                 self.runtime.request_to_group.insert(rid, gid);
             }
@@ -541,7 +547,7 @@ impl<M: IterwiseUnifiedModel> PdDecodeWorker<M> {
             let tokens = {
                 let store = self.requests.borrow();
                 let r = &store[rid];
-                r.prompt_len as u64 + r.prefix_kv as u64
+                r.prefill_target as u64 + r.prefix_kv as u64
             };
             self.runtime.pending_decodes_tokens =
                 self.runtime.pending_decodes_tokens.saturating_sub(tokens);
@@ -572,7 +578,7 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
                 let tokens = {
                     let store = self.requests.borrow();
                     let r = &store[rid];
-                    r.prompt_len as u64 + r.prefix_kv as u64
+                    r.prefill_target as u64 + r.prefix_kv as u64
                 };
                 self.runtime.pending_decodes.push_back(rid);
                 self.runtime.pending_decodes_tokens += tokens;
@@ -583,7 +589,12 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdDecodeWorker<M> {
             // happens at the next `tick_inner` (no `now` available here);
             // `advance_pulls` then routes it to the cluster or, cluster-free,
             // straight to `pending_decodes`.
-            PdDecodeMsg::Handoff { req, send_gid, tokens, prefill_worker } => {
+            PdDecodeMsg::Handoff {
+                req,
+                send_gid,
+                tokens,
+                prefill_worker,
+            } => {
                 self.runtime.pending_pulls.push_back((
                     req,
                     TransferPlan {
@@ -738,9 +749,15 @@ mod tests {
         let mut w = PdDecodeWorker::new(
             WorkerId(0),
             "decode",
-            Arc::new(FakeModel { ms: 1.0, dp_groups: 1 }),
+            Arc::new(FakeModel {
+                ms: 1.0,
+                dp_groups: 1,
+            }),
             Rc::clone(&store),
-            WorkerConfig { attn_kv_bytes: 1000, ..WorkerConfig::default() },
+            WorkerConfig {
+                attn_kv_bytes: 1000,
+                ..WorkerConfig::default()
+            },
             None,
             PoolId(0),
             "test-gpu",
@@ -780,9 +797,15 @@ mod tests {
         let mut w = PdDecodeWorker::new(
             WorkerId(0),
             "decode",
-            Arc::new(FakeModel { ms: 1.0, dp_groups: 1 }),
+            Arc::new(FakeModel {
+                ms: 1.0,
+                dp_groups: 1,
+            }),
             Rc::clone(&store),
-            WorkerConfig { attn_kv_bytes: 1000, ..WorkerConfig::default() },
+            WorkerConfig {
+                attn_kv_bytes: 1000,
+                ..WorkerConfig::default()
+            },
             None,
             PoolId(0),
             "test-gpu",
