@@ -48,7 +48,9 @@ use batch::{read_batch_payload, read_batch_report};
 use catalog::build_catalog;
 use concurrency::{read_concurrency_payload, read_concurrency_report};
 use core::{build_descriptor, read_summary};
-use discovery::{configure_logs_roots, resolve_run, ConfiguredRoot, DiscoveredRun};
+use discovery::{
+    configure_logs_roots, configure_workspace_registry, resolve_run, ConfiguredRoot, DiscoveredRun,
+};
 use kernel_input_distribution::{
     read_kernel_input_distribution_payload, read_kernel_input_distribution_report,
 };
@@ -80,16 +82,47 @@ static NEXT_WORKER_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct ServiceState {
-    roots: Arc<Vec<ConfiguredRoot>>,
+    root_source: Arc<RootSource>,
     repo_root: Arc<PathBuf>,
     operation_indexes: Arc<OperationIndexCache>,
 }
 
-pub(crate) async fn serve(bind: SocketAddr, logs_roots: Vec<PathBuf>) -> Result<()> {
-    let roots = configure_logs_roots(logs_roots)?;
+#[derive(Clone)]
+enum RootSource {
+    Static(Arc<Vec<ConfiguredRoot>>),
+    WorkspaceRegistry(PathBuf),
+}
+
+impl RootSource {
+    fn load(&self) -> Result<Vec<ConfiguredRoot>> {
+        match self {
+            Self::Static(roots) => Ok(roots.as_ref().clone()),
+            Self::WorkspaceRegistry(path) => configure_workspace_registry(path),
+        }
+    }
+}
+
+impl ServiceState {
+    fn resolve_run(&self, run_id: &str) -> Result<DiscoveredRun> {
+        resolve_run(&self.root_source.load()?, run_id)
+    }
+}
+
+pub(crate) async fn serve(
+    bind: SocketAddr,
+    logs_roots: Vec<PathBuf>,
+    workspace_registry: Option<PathBuf>,
+) -> Result<()> {
+    let root_source = if let Some(path) = workspace_registry {
+        // Validate once at startup, then reload on every request.
+        configure_workspace_registry(&path)?;
+        RootSource::WorkspaceRegistry(path)
+    } else {
+        RootSource::Static(Arc::new(configure_logs_roots(logs_roots)?))
+    };
     let repo_root = std::env::current_dir().context("resolve analyzer repository root")?;
     let state = ServiceState {
-        roots: Arc::new(roots),
+        root_source: Arc::new(root_source),
         repo_root: Arc::new(repo_root),
         operation_indexes: Arc::new(OperationIndexCache::default()),
     };
@@ -298,8 +331,13 @@ fn timeline_profile_log_line(
 }
 
 async fn list_runs(State(state): State<ServiceState>) -> Response {
-    let roots = Arc::clone(&state.roots);
-    match tokio::task::spawn_blocking(move || build_catalog(&roots)).await {
+    let root_source = Arc::clone(&state.root_source);
+    match tokio::task::spawn_blocking(move || {
+        let roots = root_source.load()?;
+        build_catalog(&roots)
+    })
+    .await
+    {
         Ok(Ok(catalog)) => Json(catalog).into_response(),
         Ok(Err(error)) => catalog_error(error),
         Err(error) => catalog_error(anyhow::anyhow!("catalog worker failed: {error}")),
@@ -307,8 +345,13 @@ async fn list_runs(State(state): State<ServiceState>) -> Response {
 }
 
 async fn list_sweeps(State(state): State<ServiceState>) -> Response {
-    let roots = Arc::clone(&state.roots);
-    match tokio::task::spawn_blocking(move || build_sweep_catalog(&roots)).await {
+    let root_source = Arc::clone(&state.root_source);
+    match tokio::task::spawn_blocking(move || {
+        let roots = root_source.load()?;
+        build_sweep_catalog(&roots)
+    })
+    .await
+    {
         Ok(Ok(catalog)) => Json(catalog).into_response(),
         Ok(Err(error)) => sweep_catalog_error(error),
         Err(error) => sweep_catalog_error(anyhow::anyhow!("sweep catalog worker failed: {error}")),
@@ -319,8 +362,9 @@ async fn get_sweep_payload(
     RoutePath(sweep_id): RoutePath<String>,
     State(state): State<ServiceState>,
 ) -> Response {
-    let roots = Arc::clone(&state.roots);
+    let root_source = Arc::clone(&state.root_source);
     match tokio::task::spawn_blocking(move || {
+        let roots = root_source.load()?;
         let sweep = resolve_sweep(&roots, &sweep_id)?;
         read_sweep_payload(&roots, &sweep)
     })
@@ -611,7 +655,7 @@ async fn get_worker_operations(
         "[worker-prof] request_id={request_id} endpoint=operations event=enter run_id={run_id} worker={pool_tag}/{worker_id} offset={} limit={}",
         query.offset, query.limit
     );
-    let run = match resolve_run(&state.roots, &run_id) {
+    let run = match state.resolve_run(&run_id) {
         Ok(run) => run,
         Err(error) => {
             eprintln!(
@@ -653,7 +697,7 @@ async fn seek_worker_operation(
         "[worker-prof] request_id={request_id} endpoint=operation_seek event=enter run_id={run_id} worker={pool_tag}/{worker_id} at_ms={}",
         query.at_ms
     );
-    let run = match resolve_run(&state.roots, &run_id) {
+    let run = match state.resolve_run(&run_id) {
         Ok(run) => run,
         Err(error) => {
             eprintln!(
@@ -689,7 +733,7 @@ async fn get_iteration_optimality_kernel_ladder(
     Query(query): Query<OptimalityModeQuery>,
     State(state): State<ServiceState>,
 ) -> Response {
-    let run = match resolve_run(&state.roots, &run_id) {
+    let run = match state.resolve_run(&run_id) {
         Ok(run) => run,
         Err(error) => return worker_resource_error(error),
     };
@@ -713,7 +757,7 @@ async fn get_iteration_optimality_waterfall(
     Query(query): Query<OptimalityModeQuery>,
     State(state): State<ServiceState>,
 ) -> Response {
-    let run = match resolve_run(&state.roots, &run_id) {
+    let run = match state.resolve_run(&run_id) {
         Ok(run) => run,
         Err(error) => return worker_resource_error(error),
     };
@@ -748,7 +792,7 @@ async fn get_worker_cost_tree(
     eprintln!(
         "[worker-prof] request_id={request_id} endpoint=cost_tree event=enter run_id={run_id} worker={pool_tag}/{worker_id} iter_id={iter_id} batch_id={batch_id} operation_id={operation_id}"
     );
-    let run = match resolve_run(&state.roots, &run_id) {
+    let run = match state.resolve_run(&run_id) {
         Ok(run) => run,
         Err(error) => {
             eprintln!(
@@ -787,7 +831,7 @@ async fn get_kernel_throughput_analysis(
     State(state): State<ServiceState>,
 ) -> Response {
     let request_id = NEXT_WORKER_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    let run = match resolve_run(&state.roots, &run_id) {
+    let run = match state.resolve_run(&run_id) {
         Ok(run) => run,
         Err(error) => return worker_resource_error(error),
     };
@@ -838,8 +882,9 @@ async fn read_run_resource(
     run_id: String,
     read: impl FnOnce(DiscoveredRun) -> Result<Value> + Send + 'static,
 ) -> Response {
-    let roots = Arc::clone(&state.roots);
+    let root_source = Arc::clone(&state.root_source);
     match tokio::task::spawn_blocking(move || {
+        let roots = root_source.load()?;
         let run = resolve_run(&roots, &run_id)?;
         read(run)
     })

@@ -7,20 +7,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::RunNotFound;
 
 #[derive(Clone, Debug)]
 pub(super) struct ConfiguredRoot {
-    ordinal: usize,
+    workspace_id: String,
     path: PathBuf,
 }
 
 impl ConfiguredRoot {
-    pub(super) fn ordinal(&self) -> usize {
-        self.ordinal
+    pub(super) fn workspace_id(&self) -> &str {
+        &self.workspace_id
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -45,6 +45,7 @@ pub(super) struct Lifecycle {
 
 #[derive(Clone, Debug)]
 pub(super) struct DiscoveredRun {
+    pub(super) workspace_id: String,
     pub(super) run_id: String,
     pub(super) display_name: String,
     pub(super) path: PathBuf,
@@ -64,10 +65,84 @@ pub(super) fn configure_logs_roots(logs_roots: Vec<PathBuf>) -> Result<Vec<Confi
         }
         if seen.insert(path.clone()) {
             roots.push(ConfiguredRoot {
-                ordinal: roots.len(),
+                workspace_id: format!("root_{}", roots.len()),
                 path,
             });
         }
+    }
+    Ok(roots)
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceRegistry {
+    schema_version: u32,
+    workspaces: Vec<WorkspaceRegistryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceRegistryEntry {
+    workspace_id: String,
+    state: String,
+    logs_root: PathBuf,
+}
+
+/// Load the dynamic workspace registry on every catalog/resource request.
+///
+/// Workspace identity, not registry order, is part of each opaque ID. Adding or
+/// reordering roots therefore cannot invalidate a previously emitted URL.
+pub(super) fn configure_workspace_registry(path: &Path) -> Result<Vec<ConfiguredRoot>> {
+    let bytes =
+        fs::read(path).with_context(|| format!("read workspace registry {}", path.display()))?;
+    let registry: WorkspaceRegistry = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse workspace registry {}", path.display()))?;
+    if registry.schema_version != 1 {
+        anyhow::bail!(
+            "unsupported workspace registry schema_version {}",
+            registry.schema_version
+        );
+    }
+    let registry_dir = path
+        .parent()
+        .context("workspace registry path has no parent directory")?;
+    let mut seen_ids = HashSet::new();
+    let mut seen_paths = HashSet::new();
+    let mut roots = Vec::new();
+    for entry in registry.workspaces {
+        if entry.state == "archived" {
+            continue;
+        }
+        if entry.state != "active" {
+            anyhow::bail!(
+                "workspace {} has unsupported state {:?}",
+                entry.workspace_id,
+                entry.state
+            );
+        }
+        validate_workspace_id(&entry.workspace_id)?;
+        if !seen_ids.insert(entry.workspace_id.clone()) {
+            anyhow::bail!("duplicate workspace id in registry: {}", entry.workspace_id);
+        }
+        let requested = if entry.logs_root.is_absolute() {
+            entry.logs_root
+        } else {
+            registry_dir.join(entry.logs_root)
+        };
+        let canonical = requested
+            .canonicalize()
+            .with_context(|| format!("canonicalize logs root {}", requested.display()))?;
+        if !canonical.is_dir() {
+            anyhow::bail!("logs root is not a directory: {}", canonical.display());
+        }
+        if !seen_paths.insert(canonical.clone()) {
+            anyhow::bail!(
+                "multiple active workspaces point at logs root {}",
+                canonical.display()
+            );
+        }
+        roots.push(ConfiguredRoot {
+            workspace_id: entry.workspace_id,
+            path: canonical,
+        });
     }
     Ok(roots)
 }
@@ -88,7 +163,8 @@ fn discover_runs_under_root(root: &ConfiguredRoot, runs: &mut Vec<DiscoveredRun>
                 .strip_prefix(&root.path)
                 .expect("discovery only queues paths below its configured root");
             runs.push(DiscoveredRun {
-                run_id: opaque_run_id(root.ordinal, relative),
+                workspace_id: root.workspace_id.clone(),
+                run_id: opaque_run_id(&root.workspace_id, relative),
                 display_name: display_name(&root.path, relative),
                 lifecycle: run_lifecycle(&directory),
                 updated_time: run_updated_at(&directory),
@@ -175,13 +251,25 @@ fn run_updated_at(run: &Path) -> SystemTime {
     .unwrap_or(UNIX_EPOCH)
 }
 
-fn opaque_run_id(root_ordinal: usize, relative: &Path) -> String {
+fn opaque_run_id(workspace_id: &str, relative: &Path) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"vibesim-analyzer-run-id-v1\0");
-    hasher.update((root_ordinal as u64).to_be_bytes());
+    hasher.update(b"vibesim-analyzer-run-id-v2\0");
+    hasher.update(workspace_id.as_bytes());
     hasher.update(b"\0");
     hasher.update(relative.as_os_str().as_encoded_bytes());
     format!("r_{:x}", hasher.finalize())
+}
+
+fn validate_workspace_id(workspace_id: &str) -> Result<()> {
+    if !workspace_id.starts_with("w_")
+        || workspace_id.len() > 66
+        || !workspace_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        anyhow::bail!("invalid workspace id in registry: {workspace_id:?}");
+    }
+    Ok(())
 }
 
 fn display_name(root: &Path, relative: &Path) -> String {

@@ -17,6 +17,7 @@ pub(super) struct RunCatalog {
 
 #[derive(Debug, Serialize)]
 pub(super) struct RunCatalogEntry {
+    workspace_id: String,
     pub(super) run_id: String,
     kind: &'static str,
     pub(super) display_name: String,
@@ -37,6 +38,7 @@ pub(super) fn build_catalog(roots: &[ConfiguredRoot]) -> Result<RunCatalog> {
         .into_iter()
         .map(|run| RunCatalogEntry {
             descriptor_href: format!("runs/{}/descriptor", run.run_id),
+            workspace_id: run.workspace_id,
             run_id: run.run_id,
             kind: "simulation",
             display_name: run.display_name,

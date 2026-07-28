@@ -31,6 +31,7 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
         .context("raw/params.json has no supported deployment")?;
     let mut descriptor = json!({
         "protocol_version": PROTOCOL_VERSION,
+        "workspace_id": run.workspace_id,
         "run_id": run.run_id,
         "kind": "simulation",
         "display_name": run.display_name,

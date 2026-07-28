@@ -32,6 +32,7 @@ from .exec import (
 )
 from .schema import build_cli_command, log_dir_of, validate_unique_log_dirs
 from .schema.loader import Registry
+from .managed_run import ManagedRun, prepare_experiment
 
 # Resume marker (INV-5): the launcher writes this into a run's log_dir only
 # after a zero-exit run. On the default resume path a run whose log_dir already
@@ -58,6 +59,7 @@ async def _launch_one(
     profile_freq: int = 499,
     analyze: bool = True,
     analyze_subjects: list[str] | None = None,
+    managed_run: ManagedRun | None = None,
 ) -> bool:
     """Metadata-then-spawn for a single (already normalized) param set. On resume
     (the default) a run whose log_dir already has a `.complete` marker is skipped;
@@ -106,6 +108,8 @@ async def _launch_one(
                 f"`perf report -i {log_dir.resolve() / 'perf.data'} --stdio` (not cat)"
             )
         if analyze:
+            if managed_run is not None:
+                managed_run.report("analysis_running")
             await run_analysis(log_dir, build_type, analyze_subjects)
     return ok
 
@@ -159,15 +163,37 @@ async def _run_single_async(
     analyze_subjects: list[str] | None = None,
 ) -> bool:
     log_dir = Path(log_dir_of(params))
+    managed_run = prepare_experiment(log_dir, run_count=1, axes=[])
     if not refresh and _is_complete(log_dir):
         print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
+        if managed_run is not None:
+            managed_run.report("ready")
         return True
-    metadata.write_shared_metadata(log_dir, preset or params)
-    if not await prebuild_caches([params], schema, build_type, base_dir=log_dir):
-        return False
-    return await _launch_one(
-        params, build_type, refresh, profile, profile_freq, analyze, analyze_subjects
-    )
+    try:
+        if managed_run is not None:
+            managed_run.report("running")
+        metadata.write_shared_metadata(log_dir, preset or params)
+        if not await prebuild_caches([params], schema, build_type, base_dir=log_dir):
+            if managed_run is not None:
+                managed_run.report("failed")
+            return False
+        ok = await _launch_one(
+            params,
+            build_type,
+            refresh,
+            profile,
+            profile_freq,
+            analyze,
+            analyze_subjects,
+            managed_run,
+        )
+        if managed_run is not None:
+            managed_run.report("ready" if ok else "failed")
+        return ok
+    except BaseException:
+        if managed_run is not None:
+            managed_run.report("interrupted")
+        raise
 
 
 # ── sweep flow ─────────────────────────────────────────────────────────────
@@ -219,7 +245,14 @@ async def _run_sweep_async(
         return 2
 
     base_dir = _experiment_root(param_sets)
-    base_dir.mkdir(parents=True, exist_ok=True)
+    axes = _sweep_axes(param_sets)
+    managed_run = prepare_experiment(
+        base_dir,
+        run_count=len(param_sets),
+        axes=axes,
+    )
+    if managed_run is not None:
+        managed_run.report("running")
     sweep_manifest_path = _write_sweep_manifest(param_sets, base_dir)
     metadata.write_shared_metadata(base_dir, original_preset)
 
@@ -252,6 +285,7 @@ async def _run_sweep_async(
                     refresh,
                     analyze=analyze,
                     analyze_subjects=analyze_subjects,
+                    managed_run=managed_run,
                 )
 
         results = await asyncio.gather(*(_bounded(p) for p in pending))
@@ -259,9 +293,14 @@ async def _run_sweep_async(
         results = []
 
     if analyze and sweep_manifest_path is not None:
+        if managed_run is not None:
+            managed_run.report("analysis_running")
         _aggregate(base_dir, build_type)
 
-    return 0 if all(results) else 1
+    succeeded = all(results)
+    if managed_run is not None:
+        managed_run.report("ready" if succeeded else "failed")
+    return 0 if succeeded else 1
 
 
 def _experiment_root(param_sets: list[dict]) -> Path:

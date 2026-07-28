@@ -22,6 +22,7 @@ use super::{ArtifactNotFound, SweepNotFound, PROTOCOL_VERSION};
 use crate::sweep::{collect_singleton_row, definitions, metric_descriptors, metric_objective};
 
 const MANIFEST_NAME: &str = "sweep_manifest.json";
+const EXPERIMENT_METADATA_NAME: &str = "experiment.meta.json";
 const PAYLOAD_RELATIVE_PATH: &str = "payloads/sweep_metrics_grid.json";
 
 #[derive(Debug, Deserialize)]
@@ -36,8 +37,15 @@ struct SweepManifestMember {
     path: PathBuf,
 }
 
+#[derive(Debug, Deserialize)]
+struct ExperimentMetadata {
+    schema_version: u32,
+    experiment_id: String,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct DiscoveredSweep {
+    workspace_id: String,
     sweep_id: String,
     kind: AggregateKind,
     display_name: String,
@@ -80,6 +88,7 @@ pub(super) struct SweepCatalog {
 
 #[derive(Debug, Serialize)]
 struct SweepCatalogEntry {
+    workspace_id: String,
     sweep_id: String,
     kind: AggregateKind,
     display_name: String,
@@ -106,6 +115,7 @@ pub(super) fn build_sweep_catalog(roots: &[ConfiguredRoot]) -> Result<SweepCatal
         .into_iter()
         .map(|sweep| SweepCatalogEntry {
             payload_href: format!("sweeps/{}/payload", sweep.sweep_id),
+            workspace_id: sweep.workspace_id,
             sweep_id: sweep.sweep_id,
             kind: sweep.kind,
             display_name: sweep.display_name,
@@ -153,6 +163,7 @@ fn read_singleton_payload(sweep: &DiscoveredSweep, run: &DiscoveredRun) -> Resul
     Ok(serde_json::json!({
         "protocol_version": PROTOCOL_VERSION,
         "schema_version": 1,
+        "workspace_id": sweep.workspace_id,
         "sweep_id": sweep.sweep_id,
         "display_name": sweep.display_name,
         "meta": {"num_axes": 0, "num_runs": 1},
@@ -182,6 +193,10 @@ fn read_manifest_payload(
         .as_object_mut()
         .context("sweep payload root must be an object")?;
     payload_object.insert("protocol_version".to_owned(), Value::from(PROTOCOL_VERSION));
+    payload_object.insert(
+        "workspace_id".to_owned(),
+        Value::String(sweep.workspace_id.clone()),
+    );
     payload_object.insert("sweep_id".to_owned(), Value::String(sweep.sweep_id.clone()));
     payload_object.insert(
         "display_name".to_owned(),
@@ -283,7 +298,9 @@ fn discover_sweeps(roots: &[ConfiguredRoot]) -> Result<Vec<DiscoveredSweep>> {
                 let display_name = display_name(root_path, relative);
                 let payload_path = directory.join(PAYLOAD_RELATIVE_PATH);
                 sweeps.push(DiscoveredSweep {
-                    sweep_id: opaque_sweep_id(root.ordinal(), relative),
+                    workspace_id: root.workspace_id().to_owned(),
+                    sweep_id: experiment_id(&directory)?
+                        .unwrap_or_else(|| opaque_sweep_id(root.workspace_id(), relative)),
                     kind: AggregateKind::Sweep,
                     experiment_date: experiment_date(&display_name),
                     display_name,
@@ -329,7 +346,8 @@ fn discover_sweeps(roots: &[ConfiguredRoot]) -> Result<Vec<DiscoveredSweep>> {
         }
         let metadata = aggregate_metadata([run.path.clone()]);
         sweeps.push(DiscoveredSweep {
-            sweep_id: opaque_singleton_id(&run.run_id),
+            workspace_id: run.workspace_id.clone(),
+            sweep_id: experiment_id(&run.path)?.unwrap_or_else(|| opaque_singleton_id(&run.run_id)),
             kind: AggregateKind::Singleton,
             experiment_date: experiment_date(&run.display_name),
             display_name: run.display_name.clone(),
@@ -472,13 +490,49 @@ fn latest_modified(paths: &[&Path]) -> SystemTime {
         .unwrap_or(UNIX_EPOCH)
 }
 
-fn opaque_sweep_id(root_ordinal: usize, relative: &Path) -> String {
+fn opaque_sweep_id(workspace_id: &str, relative: &Path) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"vibesim-analyzer-sweep-id-v1\0");
-    hasher.update((root_ordinal as u64).to_be_bytes());
+    hasher.update(b"vibesim-analyzer-sweep-id-v2\0");
+    hasher.update(workspace_id.as_bytes());
     hasher.update(b"\0");
     hasher.update(relative.as_os_str().as_encoded_bytes());
     format!("s_{:x}", hasher.finalize())
+}
+
+fn experiment_id(directory: &Path) -> Result<Option<String>> {
+    let metadata_path = directory.join(EXPERIMENT_METADATA_NAME);
+    if !regular_file(&metadata_path) {
+        return Ok(None);
+    }
+    let metadata: ExperimentMetadata = serde_json::from_slice(
+        &fs::read(&metadata_path)
+            .with_context(|| format!("read experiment metadata {}", metadata_path.display()))?,
+    )
+    .with_context(|| format!("parse experiment metadata {}", metadata_path.display()))?;
+    if metadata.schema_version != 1 {
+        bail!(
+            "unsupported experiment metadata schema_version {} in {}",
+            metadata.schema_version,
+            metadata_path.display()
+        );
+    }
+    if !valid_experiment_id(&metadata.experiment_id) {
+        bail!(
+            "invalid experiment_id {:?} in {}",
+            metadata.experiment_id,
+            metadata_path.display()
+        );
+    }
+    Ok(Some(metadata.experiment_id))
+}
+
+fn valid_experiment_id(experiment_id: &str) -> bool {
+    let mut characters = experiment_id.chars();
+    characters.next() == Some('e')
+        && characters.next() == Some('_')
+        && characters.next().is_some()
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        && experiment_id.len() <= 80
 }
 
 fn opaque_singleton_id(run_id: &str) -> String {

@@ -8,7 +8,7 @@ use super::batch::{read_batch_payload, read_batch_report};
 use super::catalog::build_catalog;
 use super::concurrency::{read_concurrency_payload, read_concurrency_report};
 use super::core::{build_descriptor, read_summary};
-use super::discovery::{configure_logs_roots, discover_runs};
+use super::discovery::{configure_logs_roots, configure_workspace_registry, discover_runs};
 use super::kernel_input_distribution::{
     read_kernel_input_distribution_payload, read_kernel_input_distribution_report,
 };
@@ -543,6 +543,90 @@ fn empty_logs_root_has_empty_protocol_v1_catalog() {
 }
 
 #[test]
+fn workspace_registry_ids_are_stable_across_reordering_and_archives() {
+    let temporary = TempDir::new().expect("temporary registry root");
+    let first_logs = temporary.path().join("first/logs");
+    let second_logs = temporary.path().join("second/logs");
+    make_run(&first_logs.join("experiment/run"), true, true);
+    make_run(&second_logs.join("experiment/run"), true, true);
+    let registry_path = temporary.path().join("registry.json");
+    let write_registry = |entries: Value| {
+        fs::write(
+            &registry_path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "workspaces": entries,
+            }))
+            .expect("serialize registry"),
+        )
+        .expect("write registry");
+    };
+    write_registry(json!([
+        {
+            "workspace_id": "w_first",
+            "display_name": "First",
+            "state": "active",
+            "logs_root": "first/logs"
+        },
+        {
+            "workspace_id": "w_second",
+            "display_name": "Second",
+            "state": "active",
+            "logs_root": "second/logs"
+        }
+    ]));
+    let initial_roots = configure_workspace_registry(&registry_path).expect("configure registry");
+    let initial_runs = discover_runs(&initial_roots).expect("discover initial runs");
+    let initial_ids = initial_runs
+        .iter()
+        .map(|run| (run.workspace_id.clone(), run.run_id.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    write_registry(json!([
+        {
+            "workspace_id": "w_second",
+            "display_name": "Second",
+            "state": "active",
+            "logs_root": "second/logs"
+        },
+        {
+            "workspace_id": "w_first",
+            "display_name": "First",
+            "state": "active",
+            "logs_root": "first/logs"
+        }
+    ]));
+    let reordered_roots =
+        configure_workspace_registry(&registry_path).expect("reload reordered registry");
+    let reordered_runs = discover_runs(&reordered_roots).expect("discover reordered runs");
+    let reordered_ids = reordered_runs
+        .iter()
+        .map(|run| (run.workspace_id.clone(), run.run_id.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(initial_ids, reordered_ids);
+
+    write_registry(json!([
+        {
+            "workspace_id": "w_second",
+            "display_name": "Second",
+            "state": "archived",
+            "logs_root": "second/logs"
+        },
+        {
+            "workspace_id": "w_first",
+            "display_name": "First",
+            "state": "active",
+            "logs_root": "first/logs"
+        }
+    ]));
+    let active_roots =
+        configure_workspace_registry(&registry_path).expect("reload archived registry");
+    let active_runs = discover_runs(&active_roots).expect("discover active runs");
+    assert_eq!(active_runs.len(), 1);
+    assert_eq!(active_runs[0].workspace_id, "w_first");
+}
+
+#[test]
 fn discovers_nested_runs_and_ignores_directory_shells() {
     let temporary = TempDir::new().expect("temporary logs root");
     let completed = temporary.path().join("sweep/tp4/simulation");
@@ -612,6 +696,32 @@ fn sweep_catalog_preserves_manifest_axes_and_pending_state() {
         .find(|sweep| sweep["display_name"] == "pending-sweep")
         .expect("pending sweep");
     assert_eq!(pending["status"], "pending");
+}
+
+#[test]
+fn sweep_catalog_uses_launcher_experiment_identity_when_present() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let sweep_path = temporary.path().join("managed-sweep");
+    make_sweep(&sweep_path, true);
+    fs::write(
+        sweep_path.join("experiment.meta.json"),
+        r#"{
+            "schema_version": 1,
+            "experiment_id": "e_managed_test",
+            "origin": {"kind": "managed"}
+        }"#,
+    )
+    .expect("write experiment metadata");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+
+    let catalog = serde_json::to_value(build_sweep_catalog(&roots).expect("build sweep catalog"))
+        .expect("serialize sweep catalog");
+
+    assert_eq!(catalog["sweeps"][0]["sweep_id"], "e_managed_test");
+    let sweep = resolve_sweep(&roots, "e_managed_test").expect("resolve managed identity");
+    let payload = read_sweep_payload(&roots, &sweep).expect("read managed sweep");
+    assert_eq!(payload["sweep_id"], "e_managed_test");
 }
 
 #[test]
