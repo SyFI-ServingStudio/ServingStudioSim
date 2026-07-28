@@ -1,0 +1,29 @@
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/smoke.csv
+  run_to_end: true
+
+io:
+  log_dir: logs/unified_kimi_k3_smoke
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: kimi_k3_kda_mla
+          model_config: model/config/kimi_k3.json
+          # Pure DP attention: attn_tp is pinned to 1 (MLA MQA decode has one
+          # shared compressed KV head) → num_dp_groups = ep_size = 8 Batches.
+          # experts_per_gpu = 896 / 8 = 112.
+          attn_tp_size: 1
+          ep_size: 8
+          hp_size: 1
+          nvl_num_gpu: 8
+          fp8: false
+        worker:
+          type: hp_unified
+          attn_gpu_memory_gb: 80.0

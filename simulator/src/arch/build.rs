@@ -15,15 +15,16 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
+use crate::arch::kimi_model_cfg::KimiModelCfg;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen3_attn_layerwise,
+    kimi_k3_kda_mla, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen3_attn_layerwise,
     qwen3_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn, AttnLayerwiseModel, DenseParallel,
     DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, IterwiseUnifiedModel,
-    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen3AttnLayerwiseModel,
-    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
-    Qwen3MoeParallel,
+    KimiK3KdaMlaModel, KimiK3Parallel, Llama3DenseModel, Llama3DenseTpModel,
+    Llama3DpAttnTpFfnModel, Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel,
+    Qwen3FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeParallel,
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::PerfApiBridge;
@@ -156,6 +157,54 @@ pub fn qwen3_moe(
         .context("building Qwen3-MoE DP-attn EP-ffn model (often a missing profile.db row)")
 }
 
+/// `ModelSpec` → [`KimiModelCfg`] (Kimi-K3 hybrid KDA+MLA configs carry the MLA
+/// LoRA dims, the KDA conv width, and the MoE `routed_expert_hidden_size`). The
+/// layer-count override scales the MLA/KDA split proportionally.
+pub fn kimi_model_cfg(model_spec: &ModelSpec) -> Result<KimiModelCfg> {
+    let mut cfg = KimiModelCfg::from_json(Path::new(&model_spec.model_config))?;
+    if let Some(n) = model_spec.sim_num_layers.or(model_spec.num_layers) {
+        cfg = cfg.with_num_layers(n);
+    }
+    Ok(cfg.with_fp8(model_spec.fp8))
+}
+
+/// Build the Kimi-K3 hybrid KDA+MLA DP-attention + EP-FFN model.
+#[allow(clippy::too_many_arguments)]
+pub fn kimi_k3(
+    model_spec: &ModelSpec,
+    attn_tp_size: u16,
+    ep_size: u16,
+    hp_size: u16,
+    nvl_num_gpu: u16,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<KimiK3KdaMlaModel> {
+    if attn_tp_size != 1 {
+        bail!(
+            "kimi_k3_kda_mla: attn_tp_size must be 1 — MLA absorbed-weight decode has ONE \
+             shared compressed KV head (MQA), which cannot be TP-split; use DP attention \
+             (got attn_tp_size={attn_tp_size})"
+        );
+    }
+    let model_cfg = kimi_model_cfg(model_spec)?;
+    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts);
+    let parallel = KimiK3Parallel {
+        attn_tp_size,
+        ep_size,
+        hp_size,
+        nvl_num_gpu,
+        gpu_name: gpu.to_string(),
+    };
+    let resolved = kimi_k3_kda_mla::resolve_configs(&kimi_k3_kda_mla::build_configs(
+        &model_cfg, &parallel, &routing,
+    ));
+    kimi_k3_kda_mla::build(name.to_string(), resolved, bridge)
+        .context("building Kimi-K3 KDA+MLA model (often a missing profile.db row)")
+}
+
 /// Build the AFD attn-side (layer-wise) Qwen3-MoE model — attention only, for ONE
 /// DP shard (`attn_tp_size` head-parallel ranks). The attn pool runs one of these
 /// per DP shard (its `replicas`). Pairs with [`qwen3_ffn_moe`].
@@ -171,10 +220,9 @@ pub fn qwen3_attn(
         attn_tp_size,
         gpu_name: gpu.to_string(),
     };
-    let resolved =
-        qwen3_attn_layerwise::resolve_configs(&qwen3_attn_layerwise::build_configs(
-            &model_cfg, &parallel,
-        ));
+    let resolved = qwen3_attn_layerwise::resolve_configs(&qwen3_attn_layerwise::build_configs(
+        &model_cfg, &parallel,
+    ));
     qwen3_attn_layerwise::build(name.to_string(), resolved, bridge)
         .context("building Qwen3 AFD attn-side model (often a missing profile.db row)")
 }
@@ -202,11 +250,9 @@ pub fn qwen3_ffn_moe(
         nvl_num_gpu,
         gpu_name: gpu.to_string(),
     };
-    let resolved = qwen3_ffn_moe_layerwise::resolve_configs(&qwen3_ffn_moe_layerwise::build_configs(
-        &model_cfg,
-        &parallel,
-        &routing,
-    ));
+    let resolved = qwen3_ffn_moe_layerwise::resolve_configs(
+        &qwen3_ffn_moe_layerwise::build_configs(&model_cfg, &parallel, &routing),
+    );
     qwen3_ffn_moe_layerwise::build(name.to_string(), resolved, bridge)
         .context("building Qwen3 AFD ffn-side model (often a missing profile.db row)")
 }
@@ -249,6 +295,26 @@ pub fn build_iter_model(
             routing,
             routing_seed,
         } => Box::new(qwen3_moe(
+            model,
+            *attn_tp_size,
+            *ep_size,
+            *hp_size,
+            *nvl_num_gpu,
+            *routing,
+            *routing_seed,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::KimiK3KdaMla {
+            model,
+            attn_tp_size,
+            ep_size,
+            hp_size,
+            nvl_num_gpu,
+            routing,
+            routing_seed,
+        } => Box::new(kimi_k3(
             model,
             *attn_tp_size,
             *ep_size,
@@ -415,7 +481,10 @@ mod tests {
             &routing,
         );
         // Symmetric QKV-projection handoff at fp8.
-        assert_eq!(ffn_cfgs.ffn_to_attn_bytes_per_token, (q_dim + 2 * kv_dim) * 1);
+        assert_eq!(
+            ffn_cfgs.ffn_to_attn_bytes_per_token,
+            (q_dim + 2 * kv_dim) * 1
+        );
         // GEMM roles fp8+deepgemm; RMSNorm roles stay bf16.
         assert_eq!(ffn_cfgs.pre_attn.compute_dtype, DType::Fp8E4m3);
         assert_eq!(ffn_cfgs.pre_attn.dtype, DType::Bf16); // input_norm stays bf16
@@ -423,11 +492,14 @@ mod tests {
         assert_eq!(ffn_cfgs.post_attn.compute_dtype, DType::Fp8E4m3);
         assert_eq!(ffn_cfgs.post_attn.dtype, DType::Bf16); // post_norm stays bf16
         assert_eq!(ffn_cfgs.moe_expert_compute.dtype, DType::Fp8E4m3); // no norm inside
-        assert_eq!(ffn_cfgs.moe_expert_compute.grouped_gemm_backends, vec!["deepgemm"]);
+        assert_eq!(
+            ffn_cfgs.moe_expert_compute.grouped_gemm_backends,
+            vec!["deepgemm"]
+        );
         assert_eq!(ffn_cfgs.lm_head.dtype, DType::Fp8E4m3);
         assert_eq!(ffn_cfgs.lm_head.backends, vec!["deepgemm"]);
         assert_eq!(ffn_cfgs.final_norm.dtype, DType::Bf16); // final_norm stays bf16
-        // dispatch/combine ship the hidden activation fp8.
+                                                            // dispatch/combine ship the hidden activation fp8.
         assert_eq!(ffn_cfgs.moe_dispatch.dtype, DType::Fp8E4m3);
         assert_eq!(ffn_cfgs.moe_combine.dtype, DType::Fp8E4m3);
     }

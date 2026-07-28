@@ -297,6 +297,38 @@ impl Deployment for UnifiedDeployment {
                     HpUnifiedWorker::new,
                 ))
             }
+            IterArchSel::KimiK3KdaMla {
+                attn_tp_size,
+                ep_size,
+                hp_size,
+                nvl_num_gpu,
+                routing,
+                routing_seed,
+                ..
+            } => {
+                ensure_hp_unified(&g.worker)?;
+                let model = Arc::new(arch_build::kimi_k3(
+                    model_spec,
+                    *attn_tp_size,
+                    *ep_size,
+                    *hp_size,
+                    *nvl_num_gpu,
+                    *routing,
+                    *routing_seed,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    HpUnifiedWorker::new,
+                ))
+            }
         }
     }
 }

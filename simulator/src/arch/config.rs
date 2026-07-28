@@ -129,6 +129,38 @@ pub enum IterArchSel {
         #[serde(default)]
         routing_seed: Option<u64>,
     },
+    /// Kimi-K3-style hybrid: 24 MLA (compressed-KV) + 69 KDA (gated linear
+    /// attention) layers, each with an 896-expert top-16 MoE FFN + 2 shared
+    /// experts. Attention is pure DP (`attn_tp_size` must stay 1 — MLA MQA
+    /// decode has one shared compressed KV head); GPUs per replica = `ep_size`.
+    KimiK3KdaMla {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Attention tensor-parallelism size. MUST be 1 (MLA MQA decode cannot
+        /// TP-split its single compressed KV head); the build bails otherwise.
+        /// Kept as an explicit param so a misconfiguration fails loudly.
+        #[param(default = 1, cache_key)]
+        attn_tp_size: u16,
+        /// Expert-parallelism size (spans the whole replica);
+        /// `num_dp_groups = ep_size` (attn_tp is fixed at 1).
+        #[param(default = 8, cache_key)]
+        ep_size: u16,
+        /// `ReplicatedHeadParallel` residing-group size on the FFN side.
+        #[param(default = 1, cache_key)]
+        hp_size: u16,
+        /// NVLink-domain size — partitions `ep_size` ranks into NVL domains
+        /// for the intra/inter split of MoE dispatch/combine.
+        #[param(default = 8, cache_key)]
+        nvl_num_gpu: u16,
+        /// Expert routing distribution: `uniform` (default) or `random`
+        /// (seeded by `routing_seed`).
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        /// Seed for `routing = random` (ignored for `uniform`).
+        #[serde(default)]
+        routing_seed: Option<u64>,
+    },
 }
 
 impl IterArchSel {
@@ -138,7 +170,8 @@ impl IterArchSel {
             Self::Llama3Dense { model }
             | Self::Llama3DenseTp { model, .. }
             | Self::Llama3DpAttnTpFfn { model, .. }
-            | Self::Qwen3MoeDpAttnEpFfn { model, .. } => model,
+            | Self::Qwen3MoeDpAttnEpFfn { model, .. }
+            | Self::KimiK3KdaMla { model, .. } => model,
         }
     }
 }

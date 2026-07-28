@@ -7,6 +7,7 @@ pub mod flashinfer_attn_decode;
 pub mod flashinfer_attn_prefill;
 pub mod flashinfer_attn_rect;
 pub mod grouped_gemm;
+pub mod kda_scan;
 pub mod kv_cache_append;
 pub mod p2p_inter;
 pub mod p2p_intra;
@@ -33,6 +34,7 @@ pub use flashinfer_attn_rect::{
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
 };
+pub use kda_scan::{KdaScanKernel, KdaScanKernelConfig, KdaScanKernelInput, KdaScanSpec};
 pub use kv_cache_append::{
     KvCacheAppendKernel, KvCacheAppendKernelConfig, KvCacheAppendKernelInput, KvCacheAppendSpec,
 };
