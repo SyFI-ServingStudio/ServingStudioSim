@@ -127,9 +127,20 @@ pub(super) fn configure_workspace_registry(path: &Path) -> Result<Vec<Configured
         } else {
             registry_dir.join(entry.logs_root)
         };
-        let canonical = requested
-            .canonicalize()
-            .with_context(|| format!("canonicalize logs root {}", requested.display()))?;
+        let canonical = match requested.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A workspace exists before its first simulation creates
+                // repo/logs. Registry reloads are request-scoped, so omitting
+                // this root now makes it discoverable automatically once the
+                // Launcher creates the directory.
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("canonicalize logs root {}", requested.display()));
+            }
+        };
         if !canonical.is_dir() {
             anyhow::bail!("logs root is not a directory: {}", canonical.display());
         }

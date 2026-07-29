@@ -627,6 +627,48 @@ fn workspace_registry_ids_are_stable_across_reordering_and_archives() {
 }
 
 #[test]
+fn workspace_registry_defers_active_workspaces_without_logs() {
+    let temporary = TempDir::new().expect("temporary registry root");
+    let ready_logs = temporary.path().join("ready/logs");
+    let pending_logs = temporary.path().join("pending/logs");
+    make_run(&ready_logs.join("experiment/run"), true, true);
+    let registry_path = temporary.path().join("registry.json");
+    fs::write(
+        &registry_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "workspaces": [
+                {
+                    "workspace_id": "w_ready",
+                    "display_name": "Ready",
+                    "state": "active",
+                    "logs_root": "ready/logs"
+                },
+                {
+                    "workspace_id": "w_pending",
+                    "display_name": "Pending",
+                    "state": "active",
+                    "logs_root": "pending/logs"
+                }
+            ],
+        }))
+        .expect("serialize registry"),
+    )
+    .expect("write registry");
+
+    let initial_roots = configure_workspace_registry(&registry_path).expect("configure registry");
+    assert_eq!(initial_roots.len(), 1);
+    assert_eq!(initial_roots[0].workspace_id(), "w_ready");
+
+    make_run(&pending_logs.join("new-experiment/run"), true, true);
+    let reloaded_roots = configure_workspace_registry(&registry_path).expect("reload registry");
+    assert_eq!(reloaded_roots.len(), 2);
+    assert!(reloaded_roots
+        .iter()
+        .any(|root| root.workspace_id() == "w_pending"));
+}
+
+#[test]
 fn discovers_nested_runs_and_ignores_directory_shells() {
     let temporary = TempDir::new().expect("temporary logs root");
     let completed = temporary.path().join("sweep/tp4/simulation");
