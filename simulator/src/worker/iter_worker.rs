@@ -4,15 +4,13 @@
 //! those construction details. `WorkerFactory<W>` stamps concrete workers and
 //! `SimpleDpFlow<W>` drives only this trait.
 //!
-//! Construction stays OFF the trait: each worker keeps its own `new(...)` (all
-//! sharing the same signature), and the factory is handed that `new` as a plain
-//! function pointer — so the trait carries only the per-tick driving methods.
+//! Construction stays OFF the trait: family-local `build_*_worker` recipes choose
+//! the concrete composition, while factories/controllers keep only that builder
+//! call. The trait therefore carries only per-tick driving methods.
 
-use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{Time, WorkerId};
+use crate::worker::types::WorkerStatus;
 use crate::worker::types::{AttnWorkerEvent, AttnWorkerMsg, FfnWorkerEvent, FfnWorkerMsg};
-use crate::worker::types::{WorkerEventCommon, WorkerMsgCommon, WorkerStatus};
-use crate::worker::unified::BareboneWorker;
 
 /// The surface L6 drives an iter-wise worker through each tick: read its id (for
 /// GPU inventory + placement), hand it work (`enqueue`), advance its FSM while
@@ -25,9 +23,8 @@ use crate::worker::unified::BareboneWorker;
 ///
 /// Each worker carries its own `Msg` / `Event` associated types — so adding a
 /// new worker with role-specific traffic never forces a change in existing
-/// workers. Barebone / HP use the shared `WorkerMsgCommon` / `WorkerEventCommon`
-/// (only `Request` / `RequestComplete`); PD prefill / decode have their own
-/// enums that wrap the common base via a `Common(...)` variant.
+/// workers. Barebone / HP use `WorkerMsgCommon` / `WorkerEventCommon`; PD and
+/// AFD use their own flat, role-specific enums.
 ///
 /// The shared `GpuCluster` is not part of this trait — every worker takes a
 /// `SharedGpuCluster` at construction (used by PD workers for runtime
@@ -65,23 +62,3 @@ where
 pub trait AfdFfnWorker: IterWorker<Msg = FfnWorkerMsg, Event = FfnWorkerEvent> {}
 
 impl<T> AfdFfnWorker for T where T: IterWorker<Msg = FfnWorkerMsg, Event = FfnWorkerEvent> {}
-
-/// Barebone worker (§3.4) plugs in by delegating to its existing inherent methods
-/// — its bodies are unchanged; this only exposes them through the trait.
-impl<M: IterwiseUnifiedModel> IterWorker for BareboneWorker<M> {
-    type Msg = WorkerMsgCommon;
-    type Event = WorkerEventCommon;
-
-    fn id(&self) -> WorkerId {
-        self.id
-    }
-    fn enqueue(&mut self, msg: Self::Msg) {
-        BareboneWorker::enqueue(self, msg)
-    }
-    fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time> {
-        BareboneWorker::tick(self, now, events)
-    }
-    fn status(&self) -> WorkerStatus {
-        BareboneWorker::status(self)
-    }
-}

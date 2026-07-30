@@ -20,8 +20,8 @@
 use crate::arch::contract::FfnLayerwiseModel;
 use crate::common::{PoolId, SharedRequests, Time};
 use crate::worker::{
-    AfdFfnWorker, DisaggFfnWorker, FfnTask, FfnWorkerEvent, FfnWorkerMsg, SharedGpuCluster,
-    WorkerConfig,
+    build_afd_ffn_worker, AfdFfnWorker, DisaggFfnWorker, FfnTask, FfnWorkerEvent, FfnWorkerMsg,
+    SharedGpuCluster, WorkerConfig,
 };
 
 /// Sentinel for a quiescent worker (mirrors `simple_dp`): `NO_WAKEUP_TIME` means
@@ -57,7 +57,7 @@ impl<M: FfnLayerwiseModel> AfdFfnPoolController<DisaggFfnWorker<M>> {
         assert!(num_workers > 0, "afd ffn pool needs at least one worker");
         let workers: Vec<DisaggFfnWorker<M>> = (0..num_workers)
             .map(|i| {
-                DisaggFfnWorker::new(
+                build_afd_ffn_worker(
                     crate::common::WorkerId(i),
                     std::sync::Arc::clone(&model),
                     std::rc::Rc::clone(&requests),

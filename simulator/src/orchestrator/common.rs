@@ -22,10 +22,9 @@ pub enum OrchAction {
     Complete { req: RequestId },
 }
 
-/// Constructor signature shared by every iter-wise worker (`BareboneWorker::new`,
-/// `HpUnifiedWorker::new`, …). The factory is handed the chosen worker's `new` as
-/// a plain function pointer, so it can stamp the concrete `W` without `W::new`
-/// living on the [`IterWorker`] trait. `pool_tag` is the deployment-set pool name
+/// Builder signature shared by every iter-wise worker. The factory is handed one
+/// family-local `build_*_worker` function, so concrete composition stays out of
+/// both L6 and the [`IterWorker`] trait. `pool_tag` is the deployment-set pool name
 /// ("main" / "prefill" / "decode" / …) — it disambiguates `cost_log` filenames
 /// across pools, since `WorkerId` is per-pool (every pool starts at 0).
 ///
@@ -61,8 +60,9 @@ pub trait WorkerFactory<W: IterWorker> {
 
 /// Builds identical unified workers for a DP pool, each sharing the one
 /// `SharedRequests` handle and an `Arc` of the model. The worker sizes its own
-/// `KvPool` from `worker_config.attn_kv_bytes`. Specialized constructors use
-/// their own factory structs and implement [`WorkerFactory`] directly.
+/// KV partition capacity from `worker_config.attn_kv_bytes`. Specialized
+/// constructors use their own factory structs and implement [`WorkerFactory`]
+/// directly.
 pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel, W: IterWorker> {
     pub model: Arc<M>,
     pub requests: SharedRequests,
@@ -78,8 +78,8 @@ pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel, W: IterWorker> {
     /// Pool name handed to every worker so each `cost_log` file is unique
     /// across pools (`worker_<pool_tag>_<id>.parquet`).
     pub pool_tag: &'static str,
-    /// The concrete worker's `new`, supplied by the deployment after it picks the
-    /// (arch, worker) pair.
+    /// The concrete worker recipe, supplied after deployment selects the
+    /// `(arch, worker)` pair.
     build_fn: WorkerBuildFn<M, W>,
 }
 

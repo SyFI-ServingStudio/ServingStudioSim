@@ -54,8 +54,8 @@ use std::sync::Arc;
 use crate::arch::contract::AttnLayerwiseModel;
 use crate::common::{IdMap, PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::worker::{
-    AfdAttnWorker, AttnWorkerEvent, AttnWorkerMsg, DisaggAttnWorker, FfnPullSource, FfnTask,
-    FfnTaskKind, FfnWorkerEvent, SharedGpuCluster, WorkerConfig,
+    build_afd_attention_worker, AfdAttnWorker, AttnWorkerEvent, AttnWorkerMsg, DisaggAttnWorker,
+    FfnPullSource, FfnTask, FfnTaskKind, FfnWorkerEvent, SharedGpuCluster, WorkerConfig,
 };
 
 /// Pipeline depth — matches the worker's `NUM_SLOTS`. Cross-worker alignment is by
@@ -186,7 +186,7 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<DisaggAttnWorker<M>> {
         let num_layers = model.num_layers() as u16;
         let workers: Vec<DisaggAttnWorker<M>> = (0..num_workers)
             .map(|i| {
-                DisaggAttnWorker::new(
+                build_afd_attention_worker(
                     WorkerId(i),
                     Arc::clone(&model),
                     std::rc::Rc::clone(&requests),

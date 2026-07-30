@@ -91,7 +91,8 @@ stopped.
 `dry-run` / `list-params` / `kernel-query`) is the entry: parse the structured
 `RunConfig` → `deployment::build_flow` to get the `Box<dyn Flow>` →
 `TraceFrontend::load` → `LoggerSession::open` → write `raw/run_meta.json` (the
-flow's `GpuInventory`) → `run_sim` → serialize `summary.json`. The launcher
+registry/KV/comm facts borrowed from `flow.cluster()`) → `run_sim` → serialize
+`summary.json`. The launcher
 spawns this binary (see `launcher/README.md`).
 
 ## Up / down

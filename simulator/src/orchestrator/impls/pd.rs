@@ -198,7 +198,10 @@ mod tests {
     use crate::common::{RequestId, RequestStore};
     use crate::orchestrator::DpPlacementPolicy;
     use crate::test_helpers::FakeModel;
-    use crate::worker::{PdDecodeWorker, PdPrefillWorker, WorkerConfig};
+    use crate::worker::{
+        build_pd_decode_worker, build_pd_prefill_worker, PdDecodeWorker, PdPrefillWorker,
+        WorkerConfig,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -215,7 +218,7 @@ mod tests {
             None,
             "test-gpu".to_string(),
             "prefill",
-            PdPrefillWorker::<FakeModel>::new,
+            build_pd_prefill_worker::<FakeModel>,
         );
         let decode_factory = UnifiedWorkerFactory::new(
             Arc::new(FakeModel::for_ms(1.0)),
@@ -224,7 +227,7 @@ mod tests {
             None,
             "test-gpu".to_string(),
             "decode",
-            PdDecodeWorker::<FakeModel>::new,
+            build_pd_decode_worker::<FakeModel>,
         );
         let prefill_cfg = SimpleDpPoolConfig {
             pool: PD_PREFILL_POOL,

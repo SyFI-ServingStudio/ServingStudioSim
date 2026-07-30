@@ -1,104 +1,211 @@
-# L5 Worker — the per-worker FSM
+# L5 Worker — composition and cadence
 
-A **worker** models one serving worker (one GPU's worth of execution). It owns
-the request lifecycle: admit queued requests under a KV-memory budget, form a
-batch, ask the L4 model how long the batch's iteration costs, advance the clock,
-then book-keep tokens and KV until requests finish. It is the first layer that
-holds **mutable sim state**; everything below it (L4→L1) is a pure cost query.
+L5 models one serving worker replica. A worker may own one GPU or a multi-GPU
+parallel group. It turns L6 messages into model-cost queries, advances request
+and KV state, emits typed events, and reports its next wakeup.
 
-This is the practical, code-matching reference; the code is the ground truth.
-For the layer overview see `doc/detailed_design/L5.md`.
+The canonical ownership, compatibility, and extension rules live in
+`doc/detailed_design/L5.md`; this README is the production source-tree guide.
 
-## What's in the tree
+The production implementation is single-track. There is no old/v2 runtime
+selector: deployments construct the composed types under `workers/` directly.
+L6 still sees only `IterWorker` (plus the narrow AFD capabilities).
 
-Iter-wise workers currently include `BareboneWorker` (single-group unified),
-`HpUnifiedWorker` (one batch per attention-DP shard), and the PD pair
-`PdPrefillWorker` / `PdDecodeWorker`. `WorkerConfig` is their construction tier
-(KV budget plus hot-path logging controls; `Default` = 80 GB). Shared admission
-primitives live beside them. `chunked_prefill` and the AFD attn/ffn workers parse
-and are advertised in the schema, but their deployments still bail for now
-(`config.rs`).
+## Read the tree in this order
 
-## The L6-facing surface (event-driven)
+1. `iter_worker.rs` — the stable L6-facing protocol.
+2. `shared/` — facts shared by components (`WorkerContext`, `AdvanceScope`).
+3. `kv/` — resource ownership and request membership.
+4. `admission/` — lifecycle and selection.
+5. `execution/` — model input construction and cost evaluation.
+6. `workers/` — cadence shells and one `build_*_worker.rs` recipe per concrete
+   production worker.
 
-The L6 pool drives a worker through three methods. Events are pushed into a
-caller-owned sink; `tick` returns the worker's next wakeup so L6 can skip sleeping
-workers on the fixed global clock:
+The organizing equation is:
 
-| Method | Role |
-|---|---|
-| `enqueue(WorkerMsg::Request(rid))` | hand the worker an admitted request |
-| `tick(now, events) -> Option<Time>` | advance the FSM as far as it can at time `now`, pushing self-tagged events and returning the next wakeup (`None` = quiescent) |
-| `status() -> WorkerStatus` | queued + active request counts (for the pool's load view) |
+```text
+Worker = <KV, Admission<Selection>, Execution> × Shell(cadence)
+```
 
-`complete_iter` pushes `WorkerEvent::RequestComplete { worker, req }` into the
-caller-provided event sink, rather than returning a `Vec`. The request slab is the shared
-`RequestStore` (`SharedRequests`), injected at construction and borrowed
-transiently inside each method. `release_request(rid, current_kv)` is the
-external cancellation entry point — it cleans the request out of wherever it sits
-(queue, promise, or live batch) and frees its KV.
+The three components are reusable axes. The shell is deliberately concrete:
+whole-iteration, pull+decode, layer-slot pipeline, and FFN double buffer have
+different timelines and should not be hidden behind one giant FSM abstraction.
 
-## The tick FSM
+## Production compositions
 
-State = `WorkerFsmState {Idle, Active}` × the batch cursor `BatchFsmState`
-(`cursor: IterCursor {NotStarted, Computing, Done}` + `compute_end`). `tick` is a
-state-forwarding loop over three stages:
+| Worker selector | KV | Admission | Execution | Shell |
+|---|---|---|---|---|
+| `barebone` | `FullAttnKv` | `LocalPrefillDecodeAdmission<FifoOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
+| `hp_unified` | `FullAttnKv` with N partitions | `LocalPrefillDecodeAdmission<FifoOrder>` with RR placement | `UnifiedIterExecution` | `IterBatchWorker` |
+| `pd_prefill` | `FullAttnKv` with held-KV ledger | `PrefillHandoffAdmission<FifoOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
+| `pd_decode` | `FullAttnKv` | thin inline landed-request ingress | `UnifiedIterExecution` | `PullDecodeWorker` |
+| `disagg_attn` | `FullAttnKv` | `FreshRequestSlotAdmission<FifoOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
+| `disagg_ffn` | none | none; L6 sends complete tasks | `FfnSectionExecutionAdapter` | `BufferedFfnWorker` |
 
-1. **`form_batch`** (Idle) — Phase A admits one fresh prefill from the queue if
-   `KvAdmission::try_admit` passes the KV-memory check; Phase B drains ready
-   promises into the iteration's `prefill_admits`. Returns false (stay Idle) when
-   nothing is admitted and no decode is in flight.
-2. **`start_iter`** (Active/NotStarted) — build the `UnifiedArchInput` for the
-   batch, run **one CostTree eval pass** on the L4 model
-   (`model.eval_iter(&input, &mut cost_slots, &mut cost_scratch)`), and arm `compute_end = now +
-   cost_time` (`agg.m.time_ms` is the clock). The cursor goes NotStarted →
-   Computing; the worker waits until `now >= compute_end`, then Computing → Done.
-3. **`complete_iter`** (Active/Done) — advance decode tokens, transition admitted
-   prefills to decoding, release finished requests' KV, and emit
-   `RequestComplete { worker, req }`. Back to Idle to form the next batch.
+Aliases such as `BareboneWorker<M>` and `DisaggAttnWorker<M>` name these concrete
+generic compositions. They are not wrapper runtimes.
 
-## Admission & batching primitives (`admission_helpers.rs`)
+## L6-facing surface
 
-- **`KvPool`** — the worker's KV-cache memory budget. The worker sizes its own
-  pool at construction: `attn_kv_bytes / model.kv_bytes_per_token` (L5 owns the
-  division; the arch owns the per-token footprint). `projected_peak` estimates
-  peak KV until all live decodes drain: the peak always lands *at* a decode-exit
-  step, so it evaluates `KV(t)` only at those steps — all of them for `n < 8`, a
-  sampled (front-dense + evenly-spaced) subset otherwise, making it a heuristic
-  admission guard rather than an exact bound.
-- **`Batch`** — the in-flight request group: this iter's `prefill_admits` plus the
-  set of decoding requests (`DecodeReqState`), with projected-peak-KV accounting.
-- **`KvAdmission`** (`Strict`) — `try_admit(batch, promised, prompt, decode)`: the
-  go/no-go that keeps a batch within its projected peak KV.
-- **`LoadBalance`** — which group a request lands in (`Single` in barebone).
+Every worker implements:
 
-## cost_log (optional, per-iteration)
+```rust
+trait IterWorker {
+    type Msg;
+    type Event;
 
-When a `log_dir` is supplied, the worker opens a `CostLogger` against the model's
-`cost_log_manifest()`. `start_iter` always fills the reused `cost_slots` buffer
-(the eval pass materializes it anyway); when logging is active it also captures
-per-leaf typed inputs (`cost_slot_inputs`) and writes one `CostLogEntry` per
-iteration (per-slot `slot_time_ms` / `slot_coverage`, the group input section, the
-aggregate time/energy). A failed open disables logging with a warning, never
-aborts the sim. The worker no longer allocates per-row `Vec`s for those variable
-sections: it hands `cost_slots`, `cost_groups`, and `cost_slot_inputs` to
-`CostLogger::record`, which appends them into reused chunk-level flat buffers.
+    fn id(&self) -> WorkerId;
+    fn enqueue(&mut self, msg: Self::Msg);
+    fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time>;
+    fn status(&self) -> WorkerStatus;
+}
+```
 
-## Up / down
+`tick` advances to a local fixpoint at `now` and returns the next useful
+timestamp. `None` means quiescent. Events are pushed into the L6-owned sink and
+carry their source worker id.
 
-- **Below (required):** the L4 model via the `IterwiseUnifiedModel` contract —
-  `eval_iter` / `eval_iter_with_inputs` (the per-iter CostTree eval),
-  `kv_bytes_per_token`, `cost_log_manifest`. The worker holds it as `Arc<M>`.
-- **Above (consumer):** the L6 orchestrator pool (`orchestrator::simple_dp`)
-  enqueues requests, ticks due workers, and receives self-tagged events through
-  the shared event sink.
+AFD adds only protocol-specific views:
 
-## Config selectors (`config.rs`)
+- `AfdAttnWorker::estimated_peak_kv` for sticky least-KV placement.
+- `AfdFfnWorker` as a type-level guarantee of the FFN task/event pair.
 
-Worker selectors are serde tagged enums (`#[serde(tag = "type")]`), the symmetric
-sibling of the arch selector, co-located with the workers they pick:
-`IterWorkerSel` (`barebone` / `hp_unified` wired for `unified`,
-`pd_prefill` / `pd_decode` wired for `pd`, `chunked_prefill` parses but bails),
-`AttnWorkerSel` / `FfnWorkerSel` (the AFD layer-wise contract; config-only today).
-`#[derive(ProviderSchema)]` emits each selector's `(tag, params)` rows for the
-launcher's `list-params` schema.
+Construction remains outside these traits. L6 passes family-local
+`build_*_worker` recipes; it does not select KV/admission/execution components
+itself.
+
+## KV axis
+
+`KvStore` owns the common resource lifecycle:
+
+```text
+footprint → fits → reserve → commit_resident → advance → release
+```
+
+`FullAttnKv` owns:
+
+- one private `FullAttnPartitionState` per independent KV partition;
+- the promised reservation ledger;
+- the PD-prefill held-KV ledger;
+- sticky request→partition ownership;
+- strict admission and KV sampling.
+
+Family capabilities expose only the views their cadence needs:
+
+- `IterWorkerKv` — prefill admits and live decode membership.
+- `SlotPipelineKv` — per-request current KV, reservation membership, and
+  projected peak.
+- `HandoffKv` — hold/drop semantics for PD prefill.
+
+Iteration and slot input builders consume borrowed membership visitors/slices,
+so composition does not require cloning the live batch on the hot path.
+
+The partition-local implementation is split by ownership: resident decode state
+and capacity live in `kv/full_attn_partition.rs`, while `FullAttnKv::fits`
+directly owns the only strict capacity gate. Partition placement and the prefill
+token gate belong to admission (`admission/placement.rs` and
+`admission/token_budget.rs`); there is no mixed `admission_helpers` module or
+one-variant capacity-policy seam.
+
+## Admission axis
+
+Admission owns lifecycle gates, not pending membership, KV arithmetic, or model
+input. Its `PendingOrderPolicy` type parameter owns the pending set and exposes
+one stable head through `peek`/`pop`:
+
+- `LocalPrefillDecodeAdmission<P>` admits local prefills and completes the
+  prefill→decode→done lifecycle.
+- `PrefillHandoffAdmission<P>` completes prefill, holds KV until decode acks the
+  pull, and emits the handoff.
+- `FreshRequestSlotAdmission<P>` implements AFD's two-level admission: enqueue
+  into `P` first, then reserve fitting heads and hand them to the slot shell.
+
+The lifecycle freezes `AdmissionCandidate` facts once at enqueue. `FifoOrder`
+uses `VecDeque`; `ShortestJobFirst` maintains a `BinaryHeap` incrementally and
+uses a per-admission monotonic enqueue sequence for deterministic equal-work
+ties. The current production builders explicitly choose `FifoOrder`; the SJF
+type is available as a composition seam but is not a deployment selector yet.
+Queues that represent active cadence state—PD pull/decode timelines, AFD slot
+work, and FFN tasks—remain in their shells and are not selection policies.
+
+The AFD FFN family has no admission component because L6 already gives it a
+complete `FfnTask`.
+
+## Execution axis
+
+Execution owns the model, reusable input buffer shape, and `CostBuffers`:
+
+- `UnifiedIterExecution` builds one `UnifiedArchInput` group per KV partition.
+- `AttentionLayerExecutionAdapter` builds one slot's `AttnArchInput` and costs
+  one attention layer.
+- `FfnSectionExecutionAdapter` splits token counts across FFN DP groups and
+  costs Bootstrap/Bridge/Terminal sections.
+
+The shell treats `E::Input` as opaque. Transfer submission stays in the shell
+because it is part of cadence overlap, not model math.
+
+## Four production cadence families
+
+### 1. Whole iteration: `workers/iter/`
+
+`IterBatchWorker` runs:
+
+```text
+form_batch → build/evaluate iteration → complete_iteration → repeat
+```
+
+Barebone, HP, and PD-prefill differ only in their build recipe. HP changes the
+number of KV partitions and placement; PD-prefill changes admission and adds a
+send comm group.
+
+### 2. Pull plus decode: `workers/pd_decode/`
+
+`PullDecodeWorker` coordinates two timelines:
+
+- one serialized KV pull with a bounded landed/in-transit backlog;
+- one whole-iteration decode FSM.
+
+A request enters the decode partition only after its prompt KV lands. Pull
+completion acks the exact prefill worker that still holds the source capacity.
+
+### 3. Layer-slot attention: `workers/afd_attention/`
+
+`SlotAttentionWorker` combines fresh-request admission with a private
+three-slot pipeline. Each slot walks:
+
+```text
+Wait → WaitComplete → Pull → PullComplete → Compute → AwaitFlush
+```
+
+At most one slot pulls and one computes. `AwaitFlush` is released by L6's
+all-worker layer barrier, keeping empty shards in lockstep. The KV partition is
+shared across slots; slot identity is cadence, not a KV partition.
+
+### 4. Buffered FFN: `workers/afd_ffn/`
+
+`BufferedFfnWorker` has no KV/admission axes. It overlaps one incoming gather
+with one current section compute:
+
+```text
+incoming → pulling_task → computing_task → SectionReady / IterComplete
+```
+
+Terminal owns token emission and completion but preserves the sticky attention
+worker as the request's recorded location.
+
+## Construction and deployment wiring
+
+Every concrete recipe is isolated in a `build_*_worker.rs` file. Repeated
+allocation/capacity/sampler/cost setup lives in a family-neutral or
+family-private essentials helper, while the recipe visibly selects its concrete
+KV, admission, execution, and shell.
+
+Deployments and pool controllers only call those recipes:
+
+- unified → `build_barebone_worker` / `build_hp_worker`
+- PD → `build_pd_prefill_worker` / `build_pd_decode_worker`
+- AFD attention → `build_afd_attention_worker`
+- AFD FFN → `build_afd_ffn_worker`
+
+Message/event enums, pool behavior, and flow barriers remain L6 contracts; the
+composition refactor does not create a second deployment layer.

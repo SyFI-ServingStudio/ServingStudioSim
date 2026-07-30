@@ -1,7 +1,7 @@
 # L7 — 多样请求类型的延展性设计(L7_diverse_request)
 
-- **状态:design analysis(未实现)**。当前里程碑只有**单轮 text**;本文是"未来请求类型越来越多(带 session history / SLO·priority 标签 / 图像 / 触发执行图 / 音频…)时,怎么装进系统而不撑爆 worker"的前瞻设计与判据。它对 request 抽象做的事,正是 [L5_redesign.md](L5_redesign.md) 对 worker 抽象做的事(把 model/modality-specific 的东西关进各自那根轴,共享结构保持 agnostic)。
-- **现状事实源**:[L7.md](L7.md)(frontend / run loop / store 的 as-built 事实)。代码锚点:`simulator/src/common/request.rs`(`Request` / `RequestRecord` / `RequestStore`)、`simulator/src/sim/frontend.rs`(唯一 ingress)、`sketch/worker_v2/shared/context.rs`(`WorkerContext` 隔离墙)。
+- **状态:design analysis(未实现)**。当前里程碑只有**单轮 text**;本文是"未来请求类型越来越多(带 session history / SLO·priority 标签 / 图像 / 触发执行图 / 音频…)时,怎么装进系统而不撑爆 worker"的前瞻设计与判据。它对 request 抽象做的事,正是 [L5.md](L5.md) 对 worker 抽象做的事(把 model/modality-specific 的东西关进各自那根轴,共享结构保持 agnostic)。
+- **现状事实源**:[L7.md](L7.md)(frontend / run loop / store 的 as-built 事实)。代码锚点:`simulator/src/common/request.rs`(`Request` / `RequestRecord` / `RequestStore`)、`simulator/src/sim/frontend.rs`(唯一 ingress)、`simulator/src/worker/shared/context.rs`(`WorkerContext` 隔离墙)。
 - **一句话**:请求类型会爆炸,但**它们不在同一层**;按"执行形状"而非"modality 名字"分类,多数是加法,只有非自回归输出越界成新 family。request 的充实走一条纪律 —— **agnostic 核 + 类型化、对 worker 不透明、各自只被一根轴读的侧结构**。
 
 > 阅读顺序:决策者读 Part 0 + IV + VIII;想改 `RequestRecord` 的实现者读 Part I + V;想扩 frontend/schema 的读 Part VI;关心 agent/多步编排的读 Part VII。
@@ -34,13 +34,13 @@ trace CSV ──► [frontend.rs:143] ──► Request ──► RequestRecord 
  arrival}                              arrival}
 ```
 
-`RequestRecord`(`request.rs:42`)= arrival 事实(不可变)+ FSM 工作字段 + 输出记账。worker(`unified.rs` / `pd_*.rs` / `disagg_*.rs`,以及 `sketch/worker_v2`)从 record **只**读这些:
+`RequestRecord`(`request.rs:42`)= arrival 事实(不可变)+ FSM 工作字段 + 输出记账。生产 worker(`simulator/src/worker/workers/`)从 record **只**读这些:
 
 - `(prompt_len, decode_len)` → 准入 gate(`try_admit`)+ KV footprint
 - `(prefix_kv, active_chunk_len)` → cost model 的 `prefill_chunk_pairs` → ArchInput
 - `tokens_emitted` vs `decode_len` → 完成判定(`is_complete()`,`request.rs:133`)
 
-**关键事实:worker 眼里的 request 已经是纯数字 token 计数,它从不知道"文本"这回事。** 请求面对 worker 的整个表面就是 `(prompt_len, decode_len, prefix_kv, active_chunk_len): u32`。这跟 [L5_redesign.md](L5_redesign.md) 里"KvStore 不知道 role"是同一条原理的延伸——延伸到"不知道 modality"。
+**关键事实:worker 眼里的 request 已经是纯数字 token 计数,它从不知道"文本"这回事。** 请求面对 worker 的整个表面就是 `(prompt_len, decode_len, prefix_kv, active_chunk_len): u32`。这跟 [L5.md](L5.md) 里"KvStore 不知道 role"是同一条原理的延伸——延伸到"不知道 modality"。
 
 **唯一一处 text 假设**:`is_complete() = tokens_emitted >= decode_len`(自回归、逐 token)。焊在 `RequestRecord::is_complete` + serving shell 的 `record_token`。记住它,Part III 会撞上。
 

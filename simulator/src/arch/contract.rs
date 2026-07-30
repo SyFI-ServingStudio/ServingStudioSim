@@ -141,7 +141,7 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// token's KV (what a PD handoff transfers across the comm group); it is
     /// *not* per-GPU.
     ///
-    /// To size a worker's `KvPool` for one attn shard, the worker reads
+    /// To size one worker KV partition for an attention shard, the worker reads
     /// `attn_kv_bytes` (per-GPU budget), multiplies by `num_attn_shards()` (the
     /// GPUs in one attn shard set), and divides by this total to get capacity
     /// in tokens. To compute a PD transfer size, the prefill worker multiplies
@@ -157,9 +157,10 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     fn gpus_per_replica(&self) -> u16;
 
     /// Number of independent attention DP shards (HP groups) the worker must
-    /// maintain — one `Batch` per shard, each seeing a different slice of the
-    /// batch (L4 §3.3 fan-out). Iter-wise archs with a single attention TP group
-    /// return 1 (the default); a DP-attention arch returns `ffn_tp / attn_tp`.
+    /// maintain — one KV partition state per shard, each seeing a different slice
+    /// of the iteration batch (L4 §3.3 fan-out). Iter-wise archs with a single
+    /// attention TP group return 1 (the default); a DP-attention arch returns
+    /// `ffn_tp / attn_tp`.
     fn num_attn_dp_groups(&self) -> u16 {
         1
     }
@@ -232,8 +233,9 @@ pub struct FfnArchInput {
 pub trait AttnLayerwiseModel: Send + Sync + 'static {
     fn num_layers(&self) -> u32;
 
-    /// Independent attention DP shards (one `Batch` per shard). A single attn-TP
-    /// group returns 1 (default); a DP-attention arch returns `ep_size / attn_tp`.
+    /// Independent attention DP shards (one KV partition state per shard). A
+    /// single attn-TP group returns 1 (default); a DP-attention arch returns
+    /// `ep_size / attn_tp`.
     fn num_attn_dp_groups(&self) -> u16 {
         1
     }
@@ -247,8 +249,8 @@ pub trait AttnLayerwiseModel: Send + Sync + 'static {
     }
 
     /// **Total** KV-cache bytes one token occupies (all layers / KV heads / attn
-    /// ranks). Sizes the attn worker's `KvPool` (same definition as the iter-wise
-    /// `total_kv_bytes_per_token`).
+    /// ranks). Sizes the attention worker's KV partition capacity (same
+    /// definition as the iter-wise `total_kv_bytes_per_token`).
     fn total_kv_bytes_per_token(&self) -> u64;
 
     /// Bytes the attn side emits per token to the ffn side after a layer's

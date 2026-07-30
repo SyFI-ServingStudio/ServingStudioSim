@@ -70,11 +70,17 @@ layer above or below. They are grouped by where they bite.
 - **One worker = one physical GPU group (G2).** A worker maps to a single physical
   GPU group; parallelism within that group is the arch's concern, not the
   orchestrator's.
+- **L5 state has one owner per axis.** KV owns resource accounting; the selection
+  policy owns not-yet-started pending membership; execution owns L4 input
+  lowering; the concrete shell owns cadence, overlap, and completion.
+- **Request-to-KV-partition placement is sticky.** A request does not rotate
+  between attention-DP partitions during its KV lifetime; cadence slots are not
+  KV partitions.
 - **The pool boundary is L6's only abstraction.** Routing distinguishes pool-local
   (L6a) from inter-pool (L6b); the pool is the single unit the orchestrator reasons
   about, and a deployment binds one orchestrator.
 - **One sim thread, one global clock.** The simulation runs single-threaded on one
   clock via a single tick loop; there is no concurrent mutation of sim state.
 - **`Flow` is the only object L7 holds.** The deployment is erased behind the `Flow`
-  trait (`on_arrival` / `tick` / `inventory`) at a single `dyn` dispatch point, so
+  trait (`on_arrival` / `tick` / `cluster`) at a single `dyn` dispatch point, so
   the tick loop is deployment-agnostic.

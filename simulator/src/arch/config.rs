@@ -9,7 +9,7 @@
 //!
 //! Iter-wise `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, and
 //! `qwen3_moe_dp_attn_ep_ffn` build today. The MoE variant pairs with the same
-//! `hp_unified` worker as the DP-attn dense variant (one `Batch` per
+//! `hp_unified` worker as the DP-attn dense variant (one KV partition state per
 //! attn-DP shard); its FFN is the L2 MoE dispatch/combine compound.
 //!
 //! NOTE (serde): `#[serde(deny_unknown_fields)]` is silently ignored on
@@ -143,7 +143,7 @@ impl IterArchSel {
     }
 }
 
-// ── layer-wise attn / ffn contract (afd) — config types only, build() bails ──
+// ── layer-wise attn / ffn contract (AFD) ────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]

@@ -333,9 +333,8 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
     let mut bytes_builder = ListBuilder::new(Float32Builder::new())
         .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
     // Selected backend per slot, slot-aligned to `time_builder` (same cursor).
-    let mut backend_builder = ListBuilder::new(UInt8Builder::new()).with_field(Arc::new(
-        Field::new("item", DataType::UInt8, false),
-    ));
+    let mut backend_builder = ListBuilder::new(UInt8Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::UInt8, false)));
     // Per-slot input JSON, serialized HERE on the writer thread (the sim thread
     // only handed over the inline `SlotInput` enums). One (possibly empty) list per row.
     let mut input_builder = ListBuilder::new(StringBuilder::new())
@@ -460,7 +459,7 @@ pub struct KvSnapshotEntry {
     /// Peak committed KV over the throttle window (the "current size").
     pub active_kv: u64,
     /// Peak KV the currently-admitted set will reach as it drains
-    /// (`Batch::projected_peak_kv`) — the "future estimate".
+    /// (the full-attention partition's projected-peak cache) — the "future estimate".
     pub projected_peak: u64,
     /// Admitted-but-not-yet-realized tokens (the `promised` ledger).
     pub promised_kv: u64,
@@ -469,7 +468,10 @@ pub struct KvSnapshotEntry {
 /// `pool_tag` is the whole chunk's stream tag (one worker owns one `KvSampler`),
 /// so it is passed once here rather than duplicated into every [`KvSnapshotEntry`]
 /// — mirrors how `cost_to_record_batch` takes `CostLogChunk::pool_tag`.
-pub(crate) fn kv_to_record_batch(pool_tag: &str, entries: &[KvSnapshotEntry]) -> Result<RecordBatch> {
+pub(crate) fn kv_to_record_batch(
+    pool_tag: &str,
+    entries: &[KvSnapshotEntry],
+) -> Result<RecordBatch> {
     let pool: Vec<&str> = entries.iter().map(|_| pool_tag).collect();
     let worker_id: Vec<u16> = entries.iter().map(|e| e.worker_id).collect();
     let group_id: Vec<u16> = entries.iter().map(|e| e.group_id).collect();
@@ -553,8 +555,11 @@ pub(crate) fn slo_to_record_batch(
         .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
     let mut stage_codes_b = ListBuilder::new(UInt16Builder::new())
         .with_field(Arc::new(Field::new("item", DataType::UInt16, false)));
-    let mut stage_pool_b = ListBuilder::new(UInt16Builder::new())
-        .with_field(Arc::new(Field::new("item", DataType::UInt16, false)));
+    let mut stage_pool_b = ListBuilder::new(UInt16Builder::new()).with_field(Arc::new(Field::new(
+        "item",
+        DataType::UInt16,
+        false,
+    )));
     let mut stage_worker_b = ListBuilder::new(UInt16Builder::new())
         .with_field(Arc::new(Field::new("item", DataType::UInt16, false)));
     for e in entries {
@@ -965,12 +970,20 @@ mod tests {
         assert_eq!(list(16).len(), 3);
         let codes = list(14);
         assert_eq!(
-            codes.as_any().downcast_ref::<UInt16Array>().unwrap().values(),
+            codes
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap()
+                .values(),
             &[0, 1, 2]
         );
         let workers = list(16);
         assert_eq!(
-            workers.as_any().downcast_ref::<UInt16Array>().unwrap().values(),
+            workers
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap()
+                .values(),
             &[3, 3, 7],
             "worker_id disambiguates same-code stages across pools"
         );
@@ -983,7 +996,11 @@ mod tests {
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .unwrap();
-            assert_eq!(l.value(0).len(), 0, "stage column {col} must be empty when gated off");
+            assert_eq!(
+                l.value(0).len(),
+                0,
+                "stage column {col} must be empty when gated off"
+            );
         }
     }
 }

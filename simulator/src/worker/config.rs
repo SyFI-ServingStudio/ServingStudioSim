@@ -3,8 +3,9 @@
 //!
 //! Each selector is a serde tagged enum (`#[serde(tag = "type")]`), the symmetric
 //! sibling of the arch selector. `barebone` / `hp_unified` are wired for
-//! `unified`; `pd_prefill` / `pd_decode` are wired for `pd`; `chunked_prefill`
-//! and the AFD selectors parse + are advertised but their deployments bail.
+//! `unified`; `pd_prefill` / `pd_decode` are wired for `pd`; the AFD selectors
+//! are wired for `afd`. `chunked_prefill` parses + is advertised, but its
+//! deployment still bails until that lifecycle is implemented.
 //!
 //! `#[derive(ProviderSchema)]` emits each selector's `SCHEMA` of `(tag, params)`
 //! rows for the launcher; `schema::dump::list_params` aggregates them.
@@ -56,7 +57,8 @@ pub enum IterWorkerSel {
         gpu_time_multiplier: f64,
         /// Optional per-iteration token budget. When set, admission reserves the
         /// budget for the live decodes (1 tok/req) first, then admits whole
-        /// prefills (FIFO) until the remaining budget is exhausted; a single
+        /// prefills (the production builder injects `FifoOrder`) until the
+        /// remaining budget is exhausted; a single
         /// over-long prefill is still force-admitted when the group holds budget
         /// but nothing yet. None = legacy one-prefill/iter. (Distinct from
         /// `ChunkedPrefill::max_batch_tokens`, which is a hard cap that chunks
@@ -64,9 +66,9 @@ pub enum IterWorkerSel {
         #[serde(default)]
         max_batch_tokens: Option<u32>,
     },
-    /// Multi-group HP/DP worker: maintains one `Batch` per attention DP shard
-    /// (count comes from the arch's `num_attn_dp_groups`). Pairs with a DP-attention
-    /// arch such as `llama3_dp_attn_tp_ffn`.
+    /// Multi-group HP/DP worker: maintains one KV partition state per attention
+    /// DP shard (count comes from the arch's `num_attn_dp_groups`). Pairs with a
+    /// DP-attention arch such as `llama3_dp_attn_tp_ffn`.
     HpUnified {
         /// GPU memory for the worker (GB; primarily KV cache budget). Sizes each
         /// DP shard's KV pool.
@@ -122,7 +124,7 @@ pub enum IterWorkerSel {
     },
 }
 
-// ── layer-wise attn / ffn contract (afd) — config types only, build() bails ──
+// ── layer-wise attn / ffn contract (afd) ────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]

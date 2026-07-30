@@ -47,8 +47,8 @@ macro_rules! define_id {
 
 /// A fast, deterministic hasher for the small-integer newtype ids. std `HashMap`
 /// defaults to SipHash (DoS-resistant, ~ns per hash) — overkill for a dense
-/// `u32`/`u16` id looked up on the per-token sim hot path (e.g. `Batch`'s decode
-/// index, `promised` / `request_to_slot`). This is a single Fibonacci multiply,
+/// `u32`/`u16` id looked up on the per-token sim hot path (e.g. a KV partition's
+/// decode index, `promised` / `request_to_slot`). This is a single Fibonacci multiply,
 /// std-only (no external crate). It is also *more* deterministic than the default
 /// (whose `RandomState` seed is per-map random), which only helps the sim's
 /// run-to-run reproducibility. Only ever used for by-id `get`/`insert`/`remove` —
