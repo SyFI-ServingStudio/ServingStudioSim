@@ -2,6 +2,7 @@
 
 pub mod all_reduce;
 pub mod all_reduce_residual_rms_norm;
+pub mod batched_gemm;
 pub mod elementwise;
 pub mod engine;
 pub mod flashinfer_attn_decode;
@@ -23,6 +24,9 @@ pub use all_reduce::{AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInpu
 pub use all_reduce_residual_rms_norm::{
     AllReduceResidualRmsNormKernel, AllReduceResidualRmsNormKernelConfig,
     AllReduceResidualRmsNormKernelInput, AllReduceResidualRmsNormSpec,
+};
+pub use batched_gemm::{
+    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, BatchedGemmSpec,
 };
 pub use elementwise::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ElementwiseSpec,
