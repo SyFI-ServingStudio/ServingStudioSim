@@ -19,8 +19,7 @@ use crate::timing::kernels::{
     FlashinferAttnDecodeKernelInput, FlashinferAttnRectKernelInput, Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemmKernelInput, Fp8PerTokenGroupQuantKernelInput, GroupedGemmKernelInput,
     KvCacheAppendKernelInput, MoeFinalizeRoutingKernelInput, P2pInterKernelInput,
-    P2pIntraKernelInput, RmsNormKernelInput,
-    SingleGemmKernelInput,
+    P2pIntraKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput, SingleGemmKernelInput,
 };
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -54,6 +53,7 @@ log_inputs! {
     Gemm        => SingleGemmKernelInput,
     GroupedGemm => GroupedGemmKernelInput,
     RmsNorm     => RmsNormKernelInput,
+    ResidualRmsNorm => ResidualRmsNormKernelInput,
     Elementwise => ElementwiseKernelInput,
     Fp8BlockQuant => Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemm => Fp8BlockscaleGroupedGemmKernelInput,
