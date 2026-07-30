@@ -1,8 +1,10 @@
-"""Torch profiler for GLM-5.2's paged-decode DSA MQA logits.
+"""Profilers for GLM-5.2's paged-decode DSA MQA logits.
 
-The timed callable is the complete semantic Torch composite, not DeepGEMM.
-Accounting follows the production schedule's block-rounded context while
-excluding Torch intermediates and physical cache/TMA transactions.
+The Torch backend times the complete semantic composite. The production-aligned
+backend times only DeepGEMM's fused main kernel; metadata construction and JIT
+setup stay outside timing. Accounting follows the production schedule's
+block-rounded context and describes logical traffic, not physical TMA/cache
+transactions or Torch intermediates.
 """
 
 from __future__ import annotations
@@ -29,6 +31,8 @@ _CONTEXT_MODE = "uniform"
 _PAGE_MAPPING = "unique_scattered"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
 _REQUIRED_GPU = "NVIDIA H200"
+_REQUIRED_H200_SMS = 132
+_DEEPGEMM_KERNEL_NAME = "sm90_fp8_paged_mqa_logits"
 
 
 @dataclass(frozen=True)
@@ -178,6 +182,63 @@ def _validate_cuda_device(torch: Any) -> None:
         raise ProfilerNotImplemented(
             f"torch dsa_paged_mqa_logits_decode is verified only on {_REQUIRED_GPU}, got {gpu_name}"
         )
+
+
+def _validate_deepgemm_cuda_device(torch: Any) -> int:
+    """Validate the exact H200 deployment identity and return its SM count."""
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented(
+            "CUDA is required for the dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 backend"
+        )
+    device = torch.cuda.current_device()
+    gpu_name = str(torch.cuda.get_device_name(device))
+    if gpu_name != _REQUIRED_GPU:
+        raise ProfilerNotImplemented(
+            "dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 is verified only on "
+            f"{_REQUIRED_GPU}, got {gpu_name}"
+        )
+    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    if num_sms != _REQUIRED_H200_SMS:
+        raise ProfilerNotImplemented(
+            "dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 requires the verified "
+            f"{_REQUIRED_H200_SMS}-SM H200 schedule, got {num_sms} SMs"
+        )
+    return num_sms
+
+
+def _load_deepgemm_backend() -> tuple[Any, Any]:
+    """Load vLLM's serving wrapper only inside the selected worker process."""
+    try:
+        import torch
+        from vllm.utils import deep_gemm
+    except (ImportError, OSError) as exc:
+        raise ProfilerNotImplemented(
+            "the instrumented vLLM/DeepGEMM environment is required for "
+            "dsa_paged_mqa_logits_decode:vllm_deepgemm_fp8"
+        ) from exc
+
+    support_api = getattr(deep_gemm, "is_deep_gemm_supported", None)
+    if not callable(support_api):
+        raise ProfilerNotImplemented("vllm.utils.deep_gemm.is_deep_gemm_supported is unavailable")
+    try:
+        supported = support_api()
+    except (RuntimeError, OSError) as exc:
+        raise ProfilerNotImplemented(
+            "DeepGEMM support could not be initialized for "
+            "dsa_paged_mqa_logits_decode:vllm_deepgemm_fp8"
+        ) from exc
+    if not supported:
+        raise ProfilerNotImplemented(
+            "DeepGEMM is unavailable or unsupported for "
+            "dsa_paged_mqa_logits_decode:vllm_deepgemm_fp8"
+        )
+    for api_name in (
+        "get_paged_mqa_logits_metadata",
+        "fp8_paged_mqa_logits",
+    ):
+        if not callable(getattr(deep_gemm, api_name, None)):
+            raise ProfilerNotImplemented(f"vllm.utils.deep_gemm.{api_name} is unavailable")
+    return torch, deep_gemm
 
 
 def _stable_values(torch: Any, shape: tuple[int, ...], *, phase: int, device: str) -> Any:
@@ -390,6 +451,37 @@ def _logical_scheduled_bytes(
     )
 
 
+def _prepare_deepgemm_call(
+    deep_gemm: Any,
+    operands: _DsaPagedMqaLogitsDecodeOperands,
+    *,
+    block_size: int,
+    num_sms: int,
+    max_model_len: int,
+) -> tuple[Any, Any, Any]:
+    """Adapt pinned contexts and build metadata before returning the timed call."""
+    runnable_context_lens = operands.context_lens[:, 0].contiguous()
+    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+        runnable_context_lens,
+        block_size=block_size,
+        num_sms=num_sms,
+    )
+
+    def kernel() -> Any:
+        return deep_gemm.fp8_paged_mqa_logits(
+            operands.q,
+            operands.cache,
+            operands.weights,
+            runnable_context_lens,
+            operands.block_table,
+            schedule_metadata,
+            max_model_len,
+            clean_logits=False,
+        )
+
+    return runnable_context_lens, schedule_metadata, kernel
+
+
 def profile_dsa_paged_mqa_logits_decode_torch(
     batch_size: int,
     context_len: int,
@@ -505,4 +597,124 @@ def profile_dsa_paged_mqa_logits_decode_torch(
             energy_j=float(energy_j),
         )
     except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(
+    batch_size: int,
+    context_len: int,
+    next_n: int,
+    max_model_len: int,
+    num_heads: int,
+    head_dim: int,
+    block_size: int,
+    q_dtype: DType | str,
+    cache_dtype: DType | str,
+    scale_dtype: DType | str,
+    weight_dtype: DType | str,
+    output_dtype: DType | str,
+    context_mode: str,
+    page_mapping: str,
+    cache_format: str,
+    clean_logits: bool,
+) -> ComputeMetrics:
+    """Profile vLLM's production-aligned fused DeepGEMM decode kernel."""
+    (
+        batch_size,
+        context_len,
+        next_n,
+        max_model_len,
+        num_heads,
+        head_dim,
+        block_size,
+        _q_dtype,
+        _cache_dtype,
+        _scale_dtype,
+        _weight_dtype,
+        _output_dtype,
+        _context_mode,
+        _page_mapping,
+        _cache_format,
+        _clean_logits,
+    ) = _validate_args(
+        batch_size,
+        context_len,
+        next_n,
+        max_model_len,
+        num_heads,
+        head_dim,
+        block_size,
+        q_dtype,
+        cache_dtype,
+        scale_dtype,
+        weight_dtype,
+        output_dtype,
+        context_mode,
+        page_mapping,
+        cache_format,
+        clean_logits,
+    )
+    torch, deep_gemm = _load_deepgemm_backend()
+    num_sms = _validate_deepgemm_cuda_device(torch)
+
+    try:
+        operands = _build_operands(
+            torch,
+            batch_size=batch_size,
+            context_len=context_len,
+            next_n=next_n,
+            max_model_len=max_model_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            device="cuda",
+        )
+        _runnable_context_lens, _schedule_metadata, kernel = _prepare_deepgemm_call(
+            deep_gemm,
+            operands,
+            block_size=block_size,
+            num_sms=num_sms,
+            max_model_len=max_model_len,
+        )
+
+        # Compile and initialize the exact shape before formal CUPTI timing.
+        kernel()
+        torch.cuda.synchronize()
+        time_ms = Timer.cupti(
+            kernel,
+            kernel_name=_DEEPGEMM_KERNEL_NAME,
+        )
+        energy_j = Energy.perf(
+            kernel,
+            warmup=5,
+            per_iter_time_ms=time_ms,
+        )
+        _logical_pages, _scheduled_cells, nominal_flops = _scheduled_work(
+            batch_size=batch_size,
+            context_len=context_len,
+            next_n=next_n,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+        )
+        # This models the block-rounded DeepGEMM schedule. Metadata construction,
+        # JIT work, physical TMA/cache transactions, and intermediates are excluded.
+        logical_bytes = _logical_scheduled_bytes(
+            batch_size=batch_size,
+            context_len=context_len,
+            next_n=next_n,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+        )
+        elapsed_seconds = time_ms / 1000.0
+        tflops = nominal_flops / elapsed_seconds / 1e12 if elapsed_seconds > 0 else 0.0
+        bandwidth_gbps = logical_bytes / elapsed_seconds / 1e9 if elapsed_seconds > 0 else 0.0
+        return ComputeMetrics(
+            time_ms=float(time_ms),
+            tflops=float(tflops),
+            memory_bandwidth_gbps=float(bandwidth_gbps),
+            energy_j=float(energy_j),
+        )
+    except (RuntimeError, OSError) as exc:
         raise KernelLaunchFailed(str(exc)) from exc
