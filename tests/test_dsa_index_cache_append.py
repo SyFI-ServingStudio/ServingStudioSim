@@ -25,6 +25,7 @@ from profiling.runners.attention.dsa_index_cache_append_reference import (
 from profiling.runners.exceptions import ProfilerNotImplemented
 
 _BACKEND = "torch"
+_VLLM_BACKEND = "vllm_cuda"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
 
 
@@ -68,7 +69,7 @@ def test_kind_table_backend_runner_and_support_contract():
     spec = find_kernel_profiler_spec(KIND, _BACKEND)
 
     assert KIND == "dsa_index_cache_append"
-    assert known_backends(KIND) == [_BACKEND]
+    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND
     assert spec.args_schema is DsaIndexCacheAppendArgs
@@ -99,6 +100,47 @@ def test_kind_table_backend_runner_and_support_contract():
     )
 
 
+def test_vllm_cuda_registration_reuses_kind_table_args_and_facades():
+    torch_spec = find_kernel_profiler_spec(KIND, _BACKEND)
+    vllm_spec = find_kernel_profiler_spec(KIND, _VLLM_BACKEND)
+
+    assert vllm_spec.kernel_kind == KIND
+    assert vllm_spec.table_name == torch_spec.table_name == KIND
+    assert vllm_spec.args_schema is torch_spec.args_schema is DsaIndexCacheAppendArgs
+    assert vllm_spec.metric_family is torch_spec.metric_family is MetricFamily.COMPUTE
+    assert vllm_spec.batch_outlier_policy == BatchOutlierPolicy()
+    assert vllm_spec.subprocess_env == "vllm_env"
+    assert vllm_spec.runner_ref.module_name == (
+        "profiling.runners.attention.dsa_index_cache_append"
+    )
+    assert vllm_spec.runner_ref.function_name == "profile_dsa_index_cache_append_vllm_cuda"
+
+
+def test_vllm_cuda_support_is_bf16_fp8_e4m3_h200_only():
+    support = find_kernel_profiler_spec(KIND, _VLLM_BACKEND).supports
+
+    assert support.allows(
+        DType.BF16,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA H200",
+    )
+    assert not support.allows(
+        DType.FP16,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA H200",
+    )
+    assert not support.allows(
+        DType.BF16,
+        kv_dtype=DType.FP16,
+        gpu="NVIDIA H200",
+    )
+    assert not support.allows(
+        DType.BF16,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA H100",
+    )
+
+
 def test_registry_barrel_import_is_lazy():
     completed = subprocess.run(
         [
@@ -107,6 +149,7 @@ def test_registry_barrel_import_is_lazy():
             (
                 "import sys; import profiling.kernels; "
                 "print('torch' in sys.modules); "
+                "print('vllm' in sys.modules); "
                 "print("
                 "'profiling.runners.attention.dsa_index_cache_append' "
                 "in sys.modules"
@@ -117,10 +160,10 @@ def test_registry_barrel_import_is_lazy():
         capture_output=True,
         text=True,
     )
-    assert completed.stdout.splitlines() == ["False", "False"]
+    assert completed.stdout.splitlines() == ["False", "False", "False"]
 
 
-def test_runner_ref_resolves_without_importing_torch():
+def test_runner_refs_resolve_without_importing_torch_or_vllm():
     completed = subprocess.run(
         [
             sys.executable,
@@ -130,9 +173,14 @@ def test_runner_ref_resolves_without_importing_torch():
                 "from profiling.db.registry import find_kernel_profiler_spec; "
                 "runner = find_kernel_profiler_spec("
                 "'dsa_index_cache_append', 'torch').runner_ref.load(); "
+                "vllm_runner = find_kernel_profiler_spec("
+                "'dsa_index_cache_append', 'vllm_cuda').runner_ref.load(); "
                 "print(runner.__module__); "
                 "print(runner.__name__); "
-                "print('torch' in sys.modules)"
+                "print(vllm_runner.__module__); "
+                "print(vllm_runner.__name__); "
+                "print('torch' in sys.modules); "
+                "print('vllm' in sys.modules)"
             ),
         ],
         check=True,
@@ -142,6 +190,9 @@ def test_runner_ref_resolves_without_importing_torch():
     assert completed.stdout.splitlines() == [
         "profiling.runners.attention.dsa_index_cache_append",
         "profile_dsa_index_cache_append_torch",
+        "profiling.runners.attention.dsa_index_cache_append",
+        "profile_dsa_index_cache_append_vllm_cuda",
+        "False",
         "False",
     ]
 
@@ -323,6 +374,59 @@ def test_profile_entry_rejects_invalid_args_before_torch_import():
     for overrides, match in invalid_cases:
         with pytest.raises(ValueError, match=match):
             profile_dsa_index_cache_append_torch(**(valid | overrides))
+
+
+def test_vllm_profile_entry_rejects_invalid_args_before_framework_imports():
+    from profiling.runners.attention.dsa_index_cache_append import (
+        profile_dsa_index_cache_append_vllm_cuda,
+    )
+
+    valid = {
+        "num_tokens": 1,
+        "index_dim": 128,
+        "block_size": 64,
+        "quant_block_size": 128,
+        "input_dtype": DType.BF16,
+        "cache_dtype": DType.FP8_E4M3,
+        "scale_format": "ue8m0",
+        "cache_format": _CACHE_FORMAT,
+    }
+    invalid_cases = [
+        ({"num_tokens": 0}, "must be > 0"),
+        ({"index_dim": 256}, r"== \(128, 64, 128\)"),
+        ({"block_size": 32}, r"== \(128, 64, 128\)"),
+        ({"quant_block_size": 64}, r"== \(128, 64, 128\)"),
+        ({"input_dtype": DType.FP16}, "input_dtype=bf16"),
+        ({"cache_dtype": DType.FP16}, "cache_dtype=fp8_e4m3"),
+        ({"scale_format": "float32"}, "scale_format='ue8m0'"),
+        ({"cache_format": "plain"}, "cache_format='page_planar"),
+    ]
+    for overrides, match in invalid_cases:
+        with pytest.raises(ValueError, match=match):
+            profile_dsa_index_cache_append_vllm_cuda(**(valid | overrides))
+
+
+def test_vllm_runner_rejects_missing_cuda_and_unverified_gpu():
+    from profiling.runners.attention.dsa_index_cache_append import (
+        _validate_vllm_cuda_device,
+    )
+
+    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
+        _validate_vllm_cuda_device(no_cuda)
+
+    h100 = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: "NVIDIA H100",
+        )
+    )
+    with pytest.raises(
+        ProfilerNotImplemented,
+        match="verified only on NVIDIA H200, got NVIDIA H100",
+    ):
+        _validate_vllm_cuda_device(h100)
 
 
 def test_operand_constructor_matches_glm_page_planar_layout():

@@ -48,3 +48,24 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
     )
 )
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cuda",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.FP8_E4M3}),
+            gpus=frozenset({"NVIDIA H200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_index_cache_append",
+            function_name="profile_dsa_index_cache_append_vllm_cuda",
+        ),
+        table_name=KIND,
+        args_schema=DsaIndexCacheAppendArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+    )
+)

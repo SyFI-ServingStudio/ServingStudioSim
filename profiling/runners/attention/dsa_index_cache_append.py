@@ -20,6 +20,7 @@ _CACHE_DTYPE = DType.FP8_E4M3
 _SCALE_FORMAT = "ue8m0"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
 _REQUIRED_GPU = "NVIDIA H200"
+_VLLM_KERNEL_NAME = "indexer_k_quant_and_cache_kernel"
 _FP8_E4M3_MAX = 448.0
 _AMAX_FLOOR = 1e-4
 
@@ -106,6 +107,18 @@ def _validate_cuda_device(torch: Any) -> None:
     if gpu_name != _REQUIRED_GPU:
         raise ProfilerNotImplemented(
             f"torch dsa_index_cache_append is verified only on {_REQUIRED_GPU}, got {gpu_name}"
+        )
+
+
+def _validate_vllm_cuda_device(torch: Any) -> None:
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented(
+            "CUDA is required for the dsa_index_cache_append vllm_cuda backend"
+        )
+    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
+    if gpu_name != _REQUIRED_GPU:
+        raise ProfilerNotImplemented(
+            f"dsa_index_cache_append vllm_cuda is verified only on {_REQUIRED_GPU}, got {gpu_name}"
         )
 
 
@@ -286,6 +299,96 @@ def profile_dsa_index_cache_append_torch(
             warmup=5,
             per_iter_time_ms=time_ms,
         )
+        logical_bytes = _logical_bytes(
+            num_tokens=num_tokens,
+            index_dim=index_dim,
+            quant_block_size=quant_block_size,
+            input_dtype=input_dtype,
+            cache_dtype=cache_dtype,
+        )
+        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+        return ComputeMetrics(
+            time_ms=float(time_ms),
+            tflops=0.0,
+            memory_bandwidth_gbps=float(bandwidth_gbps),
+            energy_j=float(energy_j),
+        )
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_dsa_index_cache_append_vllm_cuda(
+    num_tokens: int,
+    index_dim: int,
+    block_size: int,
+    quant_block_size: int,
+    input_dtype: DType | str,
+    cache_dtype: DType | str,
+    scale_format: str,
+    cache_format: str,
+) -> ComputeMetrics:
+    """Profile vLLM's one-launch fused DSA index-key cache append."""
+    (
+        num_tokens,
+        index_dim,
+        block_size,
+        quant_block_size,
+        input_dtype,
+        cache_dtype,
+        scale_format,
+        _cache_format,
+    ) = _validate_args(
+        num_tokens,
+        index_dim,
+        block_size,
+        quant_block_size,
+        input_dtype,
+        cache_dtype,
+        scale_format,
+        cache_format,
+    )
+    try:
+        import torch
+        from vllm import _custom_ops as ops
+    except ImportError as exc:
+        raise ProfilerNotImplemented(
+            "the instrumented vLLM environment is required for "
+            "the dsa_index_cache_append vllm_cuda backend"
+        ) from exc
+
+    _validate_vllm_cuda_device(torch)
+
+    try:
+        operands = _build_operands(
+            torch,
+            num_tokens=num_tokens,
+            index_dim=index_dim,
+            block_size=block_size,
+            quant_block_size=quant_block_size,
+            torch_dtype=input_dtype.torch(),
+            device="cuda",
+        )
+
+        def kernel() -> None:
+            ops.indexer_k_quant_and_cache(
+                operands.k,
+                operands.cache,
+                operands.slot_mapping,
+                quant_block_size,
+                scale_format,
+            )
+
+        # Allocation and page-layout construction stay outside timing. The
+        # filter selects only vLLM's one fused CUDA launch.
+        time_ms = Timer.cupti(kernel, kernel_name=_VLLM_KERNEL_NAME)
+        energy_j = Energy.perf(
+            kernel,
+            warmup=5,
+            per_iter_time_ms=time_ms,
+        )
+
+        # This is semantic traffic, not the fused kernel's physical memory
+        # transactions or cache-line traffic.
         logical_bytes = _logical_bytes(
             num_tokens=num_tokens,
             index_dim=index_dim,
