@@ -52,3 +52,24 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
     )
 )
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_deepgemm_fp8",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            kv=frozenset({DType.FP8_E4M3}),
+            gpus=frozenset({"NVIDIA H200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_mqa_logits_prefill",
+            function_name="profile_dsa_mqa_logits_prefill_vllm_deepgemm_fp8",
+        ),
+        table_name=KIND,
+        args_schema=DsaMqaLogitsPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+    )
+)
