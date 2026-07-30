@@ -13,6 +13,7 @@ pub mod fp8_blockscale_grouped_gemm;
 pub mod fp8_per_token_group_quant;
 pub mod grouped_gemm;
 pub mod kv_cache_append;
+pub mod mla_cache_append;
 pub mod moe_finalize_routing;
 pub mod p2p_inter;
 pub mod p2p_intra;
@@ -60,6 +61,9 @@ pub use grouped_gemm::{
 };
 pub use kv_cache_append::{
     KvCacheAppendKernel, KvCacheAppendKernelConfig, KvCacheAppendKernelInput, KvCacheAppendSpec,
+};
+pub use mla_cache_append::{
+    MlaCacheAppendKernel, MlaCacheAppendKernelConfig, MlaCacheAppendKernelInput, MlaCacheAppendSpec,
 };
 pub use moe_finalize_routing::{
     MoeFinalizeRoutingKernel, MoeFinalizeRoutingKernelConfig, MoeFinalizeRoutingKernelInput,

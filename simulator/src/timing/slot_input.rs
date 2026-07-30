@@ -19,8 +19,9 @@ use crate::timing::kernels::{
     ElementwiseKernelInput,
     FlashinferAttnDecodeKernelInput, FlashinferAttnRectKernelInput, Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemmKernelInput, Fp8PerTokenGroupQuantKernelInput, GroupedGemmKernelInput,
-    KvCacheAppendKernelInput, MoeFinalizeRoutingKernelInput, P2pInterKernelInput,
-    P2pIntraKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput, SingleGemmKernelInput,
+    KvCacheAppendKernelInput, MlaCacheAppendKernelInput, MoeFinalizeRoutingKernelInput,
+    P2pInterKernelInput, P2pIntraKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput,
+    SingleGemmKernelInput,
 };
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -65,6 +66,7 @@ log_inputs! {
     AttnDecode  => FlashinferAttnDecodeKernelInput,
     AttnRect    => FlashinferAttnRectKernelInput,
     KvCacheAppend => KvCacheAppendKernelInput,
+    MlaCacheAppend => MlaCacheAppendKernelInput,
     AllReduce   => AllReduceKernelInput,
     AllReduceResidualRmsNorm => AllReduceResidualRmsNormKernelInput,
     P2pIntra    => P2pIntraKernelInput,
