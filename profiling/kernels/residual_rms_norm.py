@@ -1,11 +1,11 @@
 """Residual-add RMSNorm kernel kind.
 
-This module owns the ``residual_rms_norm`` wire string, its Args schema, and
-the minimal Torch semantic backend registration. The backend profiles the
-multi-launch Torch reference, not vLLM's fused implementation.
+This module owns the ``residual_rms_norm`` wire string, its Args schema, the
+multi-launch Torch semantic backend, and the production-aligned fused vLLM CUDA
+backend.
 
-The runner is referenced lazily so importing the registry does not import
-Torch or CUDA runtime code.
+Both runners are referenced lazily so importing the registry does not import
+Torch, vLLM, or CUDA runtime code.
 """
 
 from __future__ import annotations
@@ -45,5 +45,25 @@ register(
         args_schema=ResidualRmsNormArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cuda",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16, DType.FP16}),
+            gpus=frozenset({"NVIDIA H200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.norm.residual_rms_norm_vllm_cuda",
+            function_name="profile_residual_rms_norm_vllm_cuda",
+        ),
+        table_name=KIND,
+        args_schema=ResidualRmsNormArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
     )
 )
