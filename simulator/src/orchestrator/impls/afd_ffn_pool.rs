@@ -20,8 +20,8 @@
 use crate::arch::contract::FfnLayerwiseModel;
 use crate::common::{PoolId, SharedRequests, Time};
 use crate::worker::{
-    DisaggFfnWorker, FfnTask, FfnWorkerEvent, FfnWorkerMsg, IterWorker, SharedGpuCluster,
-    WorkerConfig,
+    build_afd_ffn_worker, AfdFfnWorker, DisaggFfnWorker, FfnTask, FfnWorkerEvent, FfnWorkerMsg,
+    SharedGpuCluster, WorkerConfig,
 };
 
 /// Sentinel for a quiescent worker (mirrors `simple_dp`): `NO_WAKEUP_TIME` means
@@ -29,15 +29,15 @@ use crate::worker::{
 /// time it may progress.
 const NO_WAKEUP_TIME: Time = Time::from_ns(u64::MAX);
 
-pub struct AfdFfnPoolController<M: FfnLayerwiseModel> {
-    workers: Vec<DisaggFfnWorker<M>>,
+pub struct AfdFfnPoolController<W: AfdFfnWorker> {
+    workers: Vec<W>,
     /// Hot wakeup filter, parallel to `workers` (same scheme as `simple_dp`).
     worker_wakeup_times: Vec<Time>,
     /// Round-robin cursor for `submit` (tasks are independent; any worker can take one).
     rr_next: usize,
 }
 
-impl<M: FfnLayerwiseModel> AfdFfnPoolController<M> {
+impl<M: FfnLayerwiseModel> AfdFfnPoolController<DisaggFfnWorker<M>> {
     // ── Construction ──────────────────────────────────────────────────────────
     /// Build the ffn pool's `num_workers` workers, each handed the shared `cluster`
     /// so it self-registers its GPU block + comm group, plus the run's `cost_log_dir`
@@ -57,7 +57,7 @@ impl<M: FfnLayerwiseModel> AfdFfnPoolController<M> {
         assert!(num_workers > 0, "afd ffn pool needs at least one worker");
         let workers: Vec<DisaggFfnWorker<M>> = (0..num_workers)
             .map(|i| {
-                DisaggFfnWorker::new(
+                build_afd_ffn_worker(
                     crate::common::WorkerId(i),
                     std::sync::Arc::clone(&model),
                     std::rc::Rc::clone(&requests),
@@ -70,6 +70,18 @@ impl<M: FfnLayerwiseModel> AfdFfnPoolController<M> {
                 )
             })
             .collect();
+        Self::from_workers(workers)
+    }
+}
+
+impl<W: AfdFfnWorker> AfdFfnPoolController<W> {
+    /// Assemble the task router around independently-built FFN workers.  This
+    /// keeps L6 coupled to the FFN protocol, not a production concrete type.
+    pub fn from_workers(workers: Vec<W>) -> Self {
+        assert!(
+            !workers.is_empty(),
+            "afd ffn pool needs at least one worker"
+        );
         Self {
             worker_wakeup_times: vec![NO_WAKEUP_TIME; workers.len()],
             workers,
@@ -114,7 +126,7 @@ mod tests {
     use crate::worker::{FfnTaskKind, FfnWorkerEvent};
     use std::sync::Arc;
 
-    fn pool(store: SharedRequests) -> AfdFfnPoolController<FakeFfn> {
+    fn pool(store: SharedRequests) -> AfdFfnPoolController<DisaggFfnWorker<FakeFfn>> {
         AfdFfnPoolController::new(
             1,
             Arc::new(FakeFfn { ms: 1.0, layers: 2 }),

@@ -26,7 +26,9 @@ use crate::orchestrator::{
     UnifiedWorkerFactory,
 };
 use crate::timing::PerfApiBridge;
-use crate::worker::{BareboneWorker, HpUnifiedWorker, IterWorker, IterWorkerSel, WorkerConfig};
+use crate::worker::{
+    build_barebone_worker, build_hp_worker, IterWorker, IterWorkerSel, WorkerConfig,
+};
 
 use super::Deployment;
 
@@ -56,7 +58,7 @@ impl Deployment for UnifiedDeployment {
         // archs read `ModelCfg`, the MoE arch reads `MoeModelCfg`.
         let model_spec = g.arch.model();
 
-        // L5 worker env: `attn_kv_bytes` sizes the worker's KvPool, and
+        // L5 worker env: `attn_kv_bytes` sizes the worker's KV partitions, and
         // `log_output_token_times` controls request_slo detail logging. The
         // worker *type* is matched against the arch in the arms below.
         // chunked_prefill is not wired yet.
@@ -109,11 +111,13 @@ impl Deployment for UnifiedDeployment {
         // the offline `timing-predict` path use), validates the paired worker
         // tag, and erases via assemble_flow. dense / dense_tp run on the
         // single-group barebone worker; the DP-attn / MoE archs run on the
-        // multi-group hp_unified worker (one Batch per DP shard).
+        // multi-group hp_unified worker (one KV partition state per DP shard).
         match &g.arch {
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
-                let model = Arc::new(arch_build::dense(model_spec, &gpu_name, MODEL_NAME, bridge)?);
+                let model = Arc::new(arch_build::dense(
+                    model_spec, &gpu_name, MODEL_NAME, bridge,
+                )?);
                 Ok(assemble_flow(
                     model,
                     store,
@@ -121,7 +125,7 @@ impl Deployment for UnifiedDeployment {
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    BareboneWorker::new,
+                    build_barebone_worker,
                 ))
             }
             IterArchSel::Llama3DenseTp { tp_size, .. } => {
@@ -136,7 +140,7 @@ impl Deployment for UnifiedDeployment {
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    BareboneWorker::new,
+                    build_barebone_worker,
                 ))
             }
             IterArchSel::Llama3DpAttnTpFfn {
@@ -160,7 +164,7 @@ impl Deployment for UnifiedDeployment {
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    HpUnifiedWorker::new,
+                    build_hp_worker,
                 ))
             }
             IterArchSel::Qwen3MoeDpAttnEpFfn {
@@ -192,7 +196,7 @@ impl Deployment for UnifiedDeployment {
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    HpUnifiedWorker::new,
+                    build_hp_worker,
                 ))
             }
         }

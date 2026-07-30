@@ -18,9 +18,11 @@
 //! shared notification queues, just the two event vectors the flow threads between
 //! the controllers each tick.
 
-use crate::arch::contract::{AttnLayerwiseModel, FfnLayerwiseModel};
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time};
-use crate::worker::{AttnWorkerEvent, FfnTask, FfnWorkerEvent, SharedGpuCluster};
+use crate::worker::{
+    AfdAttnWorker, AfdFfnWorker, AttnWorkerEvent, AttnWorkerMsg, FfnTask, FfnWorkerEvent,
+    SharedGpuCluster,
+};
 
 use super::super::{Flow, OrchAction};
 use super::afd_attn_pool::AfdAttnPoolController;
@@ -31,10 +33,15 @@ pub const AFD_ATTN_POOL: PoolId = PoolId(0);
 /// The ffn pool's GPU/pool id.
 pub const AFD_FFN_POOL: PoolId = PoolId(1);
 
-pub struct AfdFlow<MA: AttnLayerwiseModel, MF: FfnLayerwiseModel> {
+pub struct AfdFlow<WA, WF>
+where
+    WA: AfdAttnWorker,
+    WA::Msg: From<AttnWorkerMsg>,
+    WF: AfdFfnWorker,
+{
     requests: SharedRequests,
-    attn: AfdAttnPoolController<MA>,
-    ffn: AfdFfnPoolController<MF>,
+    attn: AfdAttnPoolController<WA>,
+    ffn: AfdFfnPoolController<WF>,
     /// Shared GPU registry + attn↔ffn transfer oracle (both pools' workers
     /// self-registered into it at construction; L7 serializes its `gpus`).
     cluster: SharedGpuCluster,
@@ -45,15 +52,20 @@ pub struct AfdFlow<MA: AttnLayerwiseModel, MF: FfnLayerwiseModel> {
     completed: Vec<RequestId>,
 }
 
-impl<MA: AttnLayerwiseModel, MF: FfnLayerwiseModel> AfdFlow<MA, MF> {
+impl<WA, WF> AfdFlow<WA, WF>
+where
+    WA: AfdAttnWorker,
+    WA::Msg: From<AttnWorkerMsg>,
+    WF: AfdFfnWorker,
+{
     /// Assemble the flow from the two already-built controllers and the shared
     /// cluster they were built into. The caller (the deployment) creates the cluster
     /// first, builds the attn pool then the ffn pool into it (so GPU ids continue
     /// across pools), and hands all three here.
     pub fn new(
         requests: SharedRequests,
-        attn: AfdAttnPoolController<MA>,
-        ffn: AfdFfnPoolController<MF>,
+        attn: AfdAttnPoolController<WA>,
+        ffn: AfdFfnPoolController<WF>,
         cluster: SharedGpuCluster,
     ) -> Self {
         Self {
@@ -69,7 +81,12 @@ impl<MA: AttnLayerwiseModel, MF: FfnLayerwiseModel> AfdFlow<MA, MF> {
     }
 }
 
-impl<MA: AttnLayerwiseModel, MF: FfnLayerwiseModel> Flow for AfdFlow<MA, MF> {
+impl<WA, WF> Flow for AfdFlow<WA, WF>
+where
+    WA: AfdAttnWorker,
+    WA::Msg: From<AttnWorkerMsg>,
+    WF: AfdFfnWorker,
+{
     fn on_arrival(&mut self, req: Request) {
         let rid = req.id;
         self.requests.borrow_mut().insert(&req);
@@ -123,7 +140,7 @@ mod tests {
     use super::*;
     use crate::common::{RequestId, RequestStore};
     use crate::test_helpers::{test_cluster, FakeAttn, FakeFfn};
-    use crate::worker::WorkerConfig;
+    use crate::worker::{DisaggAttnWorker, WorkerConfig};
     use std::cell::RefCell;
     use std::sync::Arc;
 
@@ -138,7 +155,7 @@ mod tests {
     fn flow(
         attn_workers: u16,
         store: SharedRequests,
-    ) -> AfdFlow<FakeAttn, FakeFfn> {
+    ) -> AfdFlow<DisaggAttnWorker<FakeAttn>, crate::worker::DisaggFfnWorker<FakeFfn>> {
         let cluster = test_cluster();
         let attn = AfdAttnPoolController::new(
             attn_workers,
@@ -163,10 +180,12 @@ mod tests {
         AfdFlow::new(store, attn, ffn, cluster)
     }
 
-    fn drive<MA: AttnLayerwiseModel, MF: FfnLayerwiseModel>(
-        flow: &mut AfdFlow<MA, MF>,
-        steps: u64,
-    ) -> Vec<RequestId> {
+    fn drive<WA, WF>(flow: &mut AfdFlow<WA, WF>, steps: u64) -> Vec<RequestId>
+    where
+        WA: AfdAttnWorker,
+        WA::Msg: From<AttnWorkerMsg>,
+        WF: AfdFfnWorker,
+    {
         let mut completed = Vec::new();
         for step in 0..steps {
             for a in flow.tick(Time::from_ms(step as f64)) {
@@ -203,7 +222,11 @@ mod tests {
         f.on_arrival(Request::new(RequestId(1), 8, 2, Time::ZERO));
         let mut completed = drive(&mut f, 4000);
         completed.sort_by_key(|r| r.0);
-        assert_eq!(completed, vec![RequestId(0), RequestId(1)], "both complete once");
+        assert_eq!(
+            completed,
+            vec![RequestId(0), RequestId(1)],
+            "both complete once"
+        );
         assert_eq!(store.borrow()[RequestId(0)].tokens_emitted, 2);
         assert_eq!(store.borrow()[RequestId(1)].tokens_emitted, 2);
     }
@@ -219,7 +242,12 @@ mod tests {
         for step in 0..6000u64 {
             if step < 6 {
                 let id = step as u32;
-                f.on_arrival(Request::new(RequestId(id), 8, 2, Time::from_ms(step as f64)));
+                f.on_arrival(Request::new(
+                    RequestId(id),
+                    8,
+                    2,
+                    Time::from_ms(step as f64),
+                ));
             }
             for a in f.tick(Time::from_ms(step as f64)) {
                 let OrchAction::Complete { req } = a;
@@ -227,6 +255,10 @@ mod tests {
             }
         }
         completed.sort_by_key(|r| r.0);
-        assert_eq!(completed, (0..6).map(RequestId).collect::<Vec<_>>(), "all six complete");
+        assert_eq!(
+            completed,
+            (0..6).map(RequestId).collect::<Vec<_>>(),
+            "all six complete"
+        );
     }
 }

@@ -33,7 +33,7 @@ stream that never produces a row leaves no file behind.
 ## Directory map
 
 ```
-schemas.rs        Arrow schemas for the five streams + ALL_STREAMS. The cost_log
+schemas.rs        Arrow schemas for the streams + ALL_STREAMS. The cost_log
                   envelope (universal columns) vs. the full cost_log schema
                   (envelope + per-group input_section + per-slot breakdown lists).
 rows.rs           Per-table row types (RequestStateEntry, RequestSloEntry,
@@ -45,6 +45,8 @@ session.rs        LoggerSession — the per-REQUEST streams (request_state +
                   request_slo). Opened by the L7 run loop.
 cost_logger.rs    CostLogger — the per-ITERATION cost_log stream, standalone so it
                   doesn't perturb the per-request streams. Owned by each L5 worker.
+kv_sampler.rs     KvSampler — per-worker KV occupancy sampling and parquet writer.
+network_logger.rs NetworkLogger — the shared GpuCluster transfer stream writer.
 run_meta.rs       write_run_meta — the run_meta.json GPU-facts sidecar (plain
                   serde_json, not parquet / not threaded).
 ```
@@ -57,10 +59,12 @@ run_meta.rs       write_run_meta — the run_meta.json GPU-facts sidecar (plain
 | `request_state.parquet` | `LoggerSession` | L7 `run_sim` | periodic dense snapshot over the admitted set |
 | `cost_log/worker_<pool_tag>_<worker_id>.parquet` | `CostLogger` | each L5 worker | one row per iteration: envelope + per-group `input_section` + the CostTree per-slot breakdown |
 | `cost_manifest/worker_<pool_tag>_<worker_id>.json` | `CostLogger` | each L5 worker | the matching `CostManifest` (slots + flat aggregation nodes) written once at open |
-| `run_meta.json` | `run_meta` | L7 (pre-loop) | `schema_version: 1` + the run's `GpuInventory` (per-GPU id/name/pool/worker + worker→gpu grouping) |
+| `kv_snapshot/worker_<pool_tag>_<worker_id>.parquet` | `KvSampler` | each KV-owning L5 worker | throttled per-partition occupancy/projected-peak series |
+| `gpu_cluster.parquet` | `NetworkLogger` | shared `GpuCluster` for PD/AFD | one resolved cross-worker transfer with both endpoints and timing window |
+| `run_meta.json` | `run_meta` | L7 (pre-loop) | GPU registry, worker grouping, KV capacities, comm groups, and stage vocabulary |
 
-`kv_snapshot` and `network_event` have schemas in `schemas.rs` and appear in
-`ALL_STREAMS`, but no writer is wired yet.
+`network_event` remains a reserved schema with no writer; production transfer
+logging uses the richer `gpu_cluster` stream.
 
 ## cost_log & the manifest (INV-5)
 
@@ -83,8 +87,9 @@ path), with a `"null"` fallback if serialization fails — never panicking the r
 
 ## Up / down
 
-- **Above (writers):** the L7 `sim` loop (`LoggerSession` + `run_meta`) and each
-  L5 `worker` (`CostLogger`, built from the L4 model's `cost_log_manifest`).
+- **Above (writers):** the L7 `sim` loop (`LoggerSession` + `run_meta`), each
+  KV-owning L5 worker (`CostLogger` + `KvSampler`), and the shared `GpuCluster`
+  (`NetworkLogger` for PD/AFD transfers).
 - **Below (used):** Arrow / parquet (`arrow_array`, `arrow_schema`, `parquet`
   with ZSTD).
 - **Consumer (downstream):** the standalone `analyzer` crate reads these parquet

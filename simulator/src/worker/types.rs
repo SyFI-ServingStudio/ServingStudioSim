@@ -3,14 +3,12 @@
 //! (`BareboneWorker`, `HpUnifiedWorker`, `PdPrefillWorker`, `PdDecodeWorker`) and
 //! the [`IterWorker`](crate::worker::iter_worker::IterWorker) trait.
 //!
-//! These used to live in `unified.rs` (the barebone worker file) for historical
-//! reasons — barebone was the first worker, so the shared types were defined
-//! alongside it and later workers imported from there. They are pulled out here so
-//! the vocabulary has a neutral home and no single worker "owns" it. `unified.rs`
-//! now holds only `BareboneWorker`.
+//! These used to live in the former monolithic barebone worker file. They have a
+//! neutral home here so no concrete cadence shell owns the shared protocol
+//! vocabulary.
 
 use crate::common::{RequestId, Time, WorkerId};
-use crate::worker::admission_helpers::{KvAdmission, LoadBalance};
+use crate::worker::admission::LoadBalance;
 
 // ── FSM types ────────────────────────────────────────────────────────────────
 
@@ -250,6 +248,15 @@ pub enum AttnWorkerMsg {
 /// an `AttnWorkerMsg::Release` to drop the KV (no ack event needed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttnWorkerEvent {
+    /// PD-for-AFD only: the initial prompt-KV pull landed on the attention
+    /// worker. The three-pool flow routes this acknowledgement back to the
+    /// originating prefill worker so it can release its held reservation. The
+    /// normal colocated AFD worker never emits this variant.
+    KvPullComplete {
+        worker: WorkerId,
+        req: RequestId,
+        prefill_worker: WorkerId,
+    },
     /// A slot reached layer-0 and is reporting the layer-(-1) start boundary for a
     /// new iteration. `reqs` may be empty; empty reports are how shards with no local
     /// tokens participate in the all-worker Bootstrap barrier. The controller
@@ -390,11 +397,11 @@ pub struct WorkerStatus {
 
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerConfig {
-    pub admission: KvAdmission,
     pub balance: LoadBalance,
     /// This worker's KV-cache memory allowance in bytes (its GPU's attention
     /// budget). Same per-worker tier as `gpu_name`; the worker divides it by the
-    /// model's `kv_bytes_per_token` to size its `KvPool`.
+    /// model's `total_kv_bytes_per_token` and attention shard count to size each
+    /// full-attention KV partition.
     pub attn_kv_bytes: u64,
     /// Mirror of `io.log_output_token_times`: when off, decodes do not build the
     /// per-token timestamp array (the hot-path cost on saturated runs). Threaded
@@ -420,14 +427,13 @@ pub struct WorkerConfig {
     /// then fills the remainder with whole prefills, force-admitting one
     /// over-long prefill when the group holds budget but nothing yet. `None`:
     /// legacy one-prefill/iter. For the multi-group worker the budget is applied
-    /// per DP group. See [`crate::worker::admission_helpers::prefill_fits_budget`].
+    /// per DP group. See [`crate::worker::admission::prefill_fits_budget`].
     pub max_batch_tokens: Option<u32>,
 }
 
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            admission: KvAdmission::Strict,
             balance: LoadBalance::Single,
             attn_kv_bytes: 80_000_000_000, // 80 GB
             log_output_token_times: false,

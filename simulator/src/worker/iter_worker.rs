@@ -1,17 +1,16 @@
-//! `IterWorker` — the L6-facing surface shared by every iter-wise
-//! `IterwiseUnifiedModel`-backed worker (barebone, HP/DP, PD prefill/decode).
-//! Factored into a trait so the orchestrator's worker-stamping infra
-//! (`UnifiedWorkerFactory`) and DP flow (`SimpleDpFlow`) are generic over the
-//! concrete worker type, not pinned to one.
+//! `IterWorker` — the L6-facing surface shared by every iter-wise worker.
+//! A worker may be backed by `IterwiseUnifiedModel`, a paired model-specific
+//! input contract, or multiple resident models; L6 deliberately sees none of
+//! those construction details. `WorkerFactory<W>` stamps concrete workers and
+//! `SimpleDpFlow<W>` drives only this trait.
 //!
-//! Construction stays OFF the trait: each worker keeps its own `new(...)` (all
-//! sharing the same signature), and the factory is handed that `new` as a plain
-//! function pointer — so the trait carries only the per-tick driving methods.
+//! Construction stays OFF the trait: family-local `build_*_worker` recipes choose
+//! the concrete composition, while factories/controllers keep only that builder
+//! call. The trait therefore carries only per-tick driving methods.
 
 use crate::common::{Time, WorkerId};
-use crate::worker::types::{WorkerEventCommon, WorkerMsgCommon, WorkerStatus};
-use crate::worker::unified::BareboneWorker;
-use crate::arch::contract::IterwiseUnifiedModel;
+use crate::worker::types::WorkerStatus;
+use crate::worker::types::{AttnWorkerEvent, AttnWorkerMsg, FfnWorkerEvent, FfnWorkerMsg};
 
 /// The surface L6 drives an iter-wise worker through each tick: read its id (for
 /// GPU inventory + placement), hand it work (`enqueue`), advance its FSM while
@@ -24,9 +23,8 @@ use crate::arch::contract::IterwiseUnifiedModel;
 ///
 /// Each worker carries its own `Msg` / `Event` associated types — so adding a
 /// new worker with role-specific traffic never forces a change in existing
-/// workers. Barebone / HP use the shared `WorkerMsgCommon` / `WorkerEventCommon`
-/// (only `Request` / `RequestComplete`); PD prefill / decode have their own
-/// enums that wrap the common base via a `Common(...)` variant.
+/// workers. Barebone / HP use `WorkerMsgCommon` / `WorkerEventCommon`; PD and
+/// AFD use their own flat, role-specific enums.
 ///
 /// The shared `GpuCluster` is not part of this trait — every worker takes a
 /// `SharedGpuCluster` at construction (used by PD workers for runtime
@@ -45,22 +43,22 @@ pub trait IterWorker {
     fn status(&self) -> WorkerStatus;
 }
 
-/// Barebone worker (§3.4) plugs in by delegating to its existing inherent methods
-/// — its bodies are unchanged; this only exposes them through the trait.
-impl<M: IterwiseUnifiedModel> IterWorker for BareboneWorker<M> {
-    type Msg = WorkerMsgCommon;
-    type Event = WorkerEventCommon;
-
-    fn id(&self) -> WorkerId {
-        self.id
-    }
-    fn enqueue(&mut self, msg: Self::Msg) {
-        BareboneWorker::enqueue(self, msg)
-    }
-    fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time> {
-        BareboneWorker::tick(self, now, events)
-    }
-    fn status(&self) -> WorkerStatus {
-        BareboneWorker::status(self)
-    }
+/// Extra L6-facing capability required by the AFD attention pool.
+///
+/// The pool constructs the common slot/barrier messages through `From` and
+/// balances new requests by the worker-owned projected KV peak. A PD-for-AFD
+/// variant may use a wider message enum (for example, adding a prefill handoff)
+/// while still accepting the common AFD control protocol.
+pub trait AfdAttnWorker: IterWorker<Event = AttnWorkerEvent>
+where
+    Self::Msg: From<AttnWorkerMsg>,
+{
+    fn estimated_peak_kv(&self) -> u64;
 }
+
+/// L6-facing capability for an AFD FFN executor.  Unlike attention there is no
+/// placement metric: a FFN worker consumes independent aggregated tasks, so its
+/// complete contract is the typed `IterWorker` message/event surface.
+pub trait AfdFfnWorker: IterWorker<Msg = FfnWorkerMsg, Event = FfnWorkerEvent> {}
+
+impl<T> AfdFfnWorker for T where T: IterWorker<Msg = FfnWorkerMsg, Event = FfnWorkerEvent> {}

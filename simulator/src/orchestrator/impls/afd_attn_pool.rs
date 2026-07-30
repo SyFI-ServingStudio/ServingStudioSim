@@ -54,8 +54,8 @@ use std::sync::Arc;
 use crate::arch::contract::AttnLayerwiseModel;
 use crate::common::{IdMap, PoolId, RequestId, SharedRequests, Time, WorkerId};
 use crate::worker::{
-    AttnWorkerEvent, AttnWorkerMsg, DisaggAttnWorker, FfnPullSource, FfnTask, FfnTaskKind,
-    FfnWorkerEvent, IterWorker, SharedGpuCluster, WorkerConfig,
+    build_afd_attention_worker, AfdAttnWorker, AttnWorkerEvent, AttnWorkerMsg, DisaggAttnWorker,
+    FfnPullSource, FfnTask, FfnTaskKind, FfnWorkerEvent, SharedGpuCluster, WorkerConfig,
 };
 
 /// Pipeline depth — matches the worker's `NUM_SLOTS`. Cross-worker alignment is by
@@ -149,8 +149,12 @@ impl SlotSched {
     }
 }
 
-pub struct AfdAttnPoolController<M: AttnLayerwiseModel> {
-    workers: Vec<DisaggAttnWorker<M>>,
+pub struct AfdAttnPoolController<W>
+where
+    W: AfdAttnWorker,
+    W::Msg: From<AttnWorkerMsg>,
+{
+    workers: Vec<W>,
     /// Hot wakeup filter, parallel to `workers` (same scheme as `simple_dp`).
     worker_wakeup_times: Vec<Time>,
     /// Layer count — the barrier flushes `Bridge{L}` for `L < num_layers - 1` and
@@ -161,7 +165,7 @@ pub struct AfdAttnPoolController<M: AttnLayerwiseModel> {
     req_worker: IdMap<RequestId, WorkerId>,
 }
 
-impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
+impl<M: AttnLayerwiseModel> AfdAttnPoolController<DisaggAttnWorker<M>> {
     // ── Construction ──────────────────────────────────────────────────────────
     /// Build the attn pool's `num_workers` workers (one DP shard each), each handed
     /// the shared `cluster` so it self-registers its GPU block + comm group. The
@@ -182,7 +186,7 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
         let num_layers = model.num_layers() as u16;
         let workers: Vec<DisaggAttnWorker<M>> = (0..num_workers)
             .map(|i| {
-                DisaggAttnWorker::new(
+                build_afd_attention_worker(
                     WorkerId(i),
                     Arc::clone(&model),
                     std::rc::Rc::clone(&requests),
@@ -195,6 +199,24 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
                 )
             })
             .collect();
+        Self::from_workers(num_layers, workers)
+    }
+}
+
+impl<W> AfdAttnPoolController<W>
+where
+    W: AfdAttnWorker,
+    W::Msg: From<AttnWorkerMsg>,
+{
+    /// Assemble the AFD aggregator around already-built workers. This is the
+    /// construction seam for protocol variants whose worker needs additional
+    /// runtime state (for example, an initial PD KV-pull FSM).
+    pub fn from_workers(num_layers: u16, workers: Vec<W>) -> Self {
+        assert!(
+            !workers.is_empty(),
+            "afd attn pool needs at least one worker"
+        );
+        assert!(num_layers > 0, "afd attn pool needs at least one layer");
         let n = workers.len();
         Self {
             // Start due once so every worker can publish its layer-(-1) boundary for
@@ -214,9 +236,16 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
     /// its whole life) and admit it there with a pure `Admit`. The worker reserves
     /// the KV, picks a local slot, and announces the iteration itself via `IterStart`.
     pub fn admit(&mut self, req: RequestId) {
+        self.admit_msg(req, AttnWorkerMsg::Admit { req }.into());
+    }
+
+    /// Pin a request using the normal KV-local placement, but deliver a
+    /// variant-specific message. PD-for-AFD uses this to send a handoff instead
+    /// of the fresh-request `Admit` message.
+    pub fn admit_msg(&mut self, req: RequestId, msg: W::Msg) {
         let idx = self.least_kv_loaded_worker();
         self.req_worker.insert(req, WorkerId(idx as u16));
-        self.workers[idx].enqueue(AttnWorkerMsg::Admit { req });
+        self.workers[idx].enqueue(msg);
         self.wake(idx);
     }
 
@@ -295,12 +324,15 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
         let n = self.workers.len();
         let per_worker = split_by_token_share(out_bytes, &self.slots[slot].scatter_weights, n);
         for idx in 0..n {
-            self.workers[idx].enqueue(AttnWorkerMsg::ReadyNotification {
-                slot: slot as u8,
-                layer,
-                send_gid,
-                bytes: per_worker[idx],
-            });
+            self.workers[idx].enqueue(
+                AttnWorkerMsg::ReadyNotification {
+                    slot: slot as u8,
+                    layer,
+                    send_gid,
+                    bytes: per_worker[idx],
+                }
+                .into(),
+            );
             self.wake(idx);
         }
     }
@@ -322,7 +354,7 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
         for &req in done {
             if let Some(w) = self.req_worker.remove(&req) {
                 let idx = w.0 as usize;
-                self.workers[idx].enqueue(AttnWorkerMsg::Release { req });
+                self.workers[idx].enqueue(AttnWorkerMsg::Release { req }.into());
                 self.wake(idx);
                 // No controller-side load counter to decrement: the worker drops the
                 // request's KV on `Release`, and the pool reads `estimated_peak_kv`
@@ -338,10 +370,13 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
         // requests, so a worker emptied by it wraps to a dormant layer-0 slot.
         let last = self.num_layers - 1;
         for idx in 0..self.workers.len() {
-            self.workers[idx].enqueue(AttnWorkerMsg::SlotFlushed {
-                slot: slot as u8,
-                layer: last,
-            });
+            self.workers[idx].enqueue(
+                AttnWorkerMsg::SlotFlushed {
+                    slot: slot as u8,
+                    layer: last,
+                }
+                .into(),
+            );
             self.wake(idx);
         }
     }
@@ -355,6 +390,9 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
     pub fn aggregate(&mut self, events: &[AttnWorkerEvent], tasks: &mut Vec<FfnTask>) {
         for ev in events {
             match ev {
+                // PD-for-AFD flow consumes this side-band ack before calling
+                // `aggregate`; it has no effect on the AFD layer barriers.
+                AttnWorkerEvent::KvPullComplete { .. } => {}
                 AttnWorkerEvent::IterStart { worker, slot, reqs } => {
                     self.on_iter_start(*slot as usize, *worker, reqs, tasks);
                 }
@@ -510,10 +548,13 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<M> {
     /// completes, so this fans `SlotFlushed` to all of them.
     fn flush_slot_layer(&mut self, slot: usize, layer: u16) {
         for idx in 0..self.workers.len() {
-            self.workers[idx].enqueue(AttnWorkerMsg::SlotFlushed {
-                slot: slot as u8,
-                layer,
-            });
+            self.workers[idx].enqueue(
+                AttnWorkerMsg::SlotFlushed {
+                    slot: slot as u8,
+                    layer,
+                }
+                .into(),
+            );
             self.wake(idx);
         }
     }
@@ -559,7 +600,10 @@ mod tests {
     use crate::test_helpers::{prefilled_store, test_cluster, FakeAttn};
     use std::rc::Rc;
 
-    fn pool(num_workers: u16, store: SharedRequests) -> AfdAttnPoolController<FakeAttn> {
+    fn pool(
+        num_workers: u16,
+        store: SharedRequests,
+    ) -> AfdAttnPoolController<DisaggAttnWorker<FakeAttn>> {
         AfdAttnPoolController::new(
             num_workers,
             Arc::new(FakeAttn { ms: 1.0, layers: 2 }),
@@ -573,7 +617,11 @@ mod tests {
     }
 
     /// One drive step: tick the workers, then aggregate their events into ffn tasks.
-    fn step(p: &mut AfdAttnPoolController<FakeAttn>, now: Time, tasks: &mut Vec<FfnTask>) {
+    fn step(
+        p: &mut AfdAttnPoolController<DisaggAttnWorker<FakeAttn>>,
+        now: Time,
+        tasks: &mut Vec<FfnTask>,
+    ) {
         let mut events = Vec::new();
         p.tick_collect(now, &mut events);
         p.aggregate(&events, tasks);
@@ -593,7 +641,7 @@ mod tests {
     /// in — and are released from — `AwaitFlush`. `upstream` is the ffn task whose output
     /// feeds this layer (`Bootstrap → 0`, `Bridge{u} → u+1`). Returns the flushed tasks.
     fn run_layer(
-        p: &mut AfdAttnPoolController<FakeAttn>,
+        p: &mut AfdAttnPoolController<DisaggAttnWorker<FakeAttn>>,
         slot: usize,
         upstream: FfnTaskKind,
         t0: u64,

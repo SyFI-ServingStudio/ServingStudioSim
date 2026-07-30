@@ -126,7 +126,7 @@ struct PredictGroup {
 impl PredictGroup {
     /// Lower to an [`ArchGroupInput`], deriving `batch_tokens` / `prefill_tokens`
     /// / `total_kv_len` exactly as the worker does in
-    /// `worker/unified.rs::build_arch_input`, so a predicted iteration costs
+    /// `worker/execution/unified_iter_execution.rs::build_input`, so a predicted iteration costs
     /// identically to the same shape inside a real run.
     fn into_arch_group(self) -> Result<ArchGroupInput> {
         // decode source: exact list xor uniform shorthand xor neither.

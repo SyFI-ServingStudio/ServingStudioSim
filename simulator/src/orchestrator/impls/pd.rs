@@ -47,8 +47,8 @@ where
     WD: IterWorker<Msg = PdDecodeMsg, Event = PdDecodeEvent>,
 {
     requests: SharedRequests,
-    prefill_pool: SimpleDpPoolController<MP, WP>,
-    decode_pool: SimpleDpPoolController<MD, WD>,
+    prefill_pool: SimpleDpPoolController<WP>,
+    decode_pool: SimpleDpPoolController<WD>,
     /// Shared run-level GPU cluster — both the registry (workers `allocate`
     /// their own block into it at construction) and the transfer oracle (PD
     /// decode workers retain a handle for `submit_transfer`). One object, two
@@ -60,6 +60,10 @@ where
     /// compile-time fact rather than a silent ignore arm.
     prefill_events: Vec<PdPrefillEvent>,
     decode_events: Vec<PdDecodeEvent>,
+    /// Models are construction-time factory details. Keep these type markers
+    /// only to preserve `PdFlow`'s public concrete type while the pool itself
+    /// stays correctly generic over workers alone.
+    _models: std::marker::PhantomData<(MP, MD)>,
 }
 
 impl<MP, WP, MD, WD> PdFlow<MP, WP, MD, WD>
@@ -93,6 +97,7 @@ where
             cluster,
             prefill_events: Vec::new(),
             decode_events: Vec::new(),
+            _models: std::marker::PhantomData,
         }
     }
 }
@@ -128,7 +133,12 @@ where
                 PdPrefillEvent::RequestComplete { req, .. } => {
                     actions.push(OrchAction::Complete { req });
                 }
-                PdPrefillEvent::PrefillDone { worker, req, send_gid, kv_tokens } => {
+                PdPrefillEvent::PrefillDone {
+                    worker,
+                    req,
+                    send_gid,
+                    kv_tokens,
+                } => {
                     // Carry the prefill worker id through so the decode side can
                     // later ack it (`ReleaseKv`) and let it drop the held KV
                     // reservation. The send-side comm group alone is not enough
@@ -158,7 +168,11 @@ where
                 // worker to drop its held reservation. Targeted route (by
                 // `prefill_worker` id), *not* placement-chosen: only that
                 // worker tracks this request's held KV.
-                PdDecodeEvent::PullComplete { req, prefill_worker, .. } => {
+                PdDecodeEvent::PullComplete {
+                    req,
+                    prefill_worker,
+                    ..
+                } => {
                     self.prefill_pool
                         .route_msg_to(prefill_worker, PdPrefillMsg::ReleaseKv { req });
                 }
@@ -184,7 +198,10 @@ mod tests {
     use crate::common::{RequestId, RequestStore};
     use crate::orchestrator::DpPlacementPolicy;
     use crate::test_helpers::FakeModel;
-    use crate::worker::{PdDecodeWorker, PdPrefillWorker, WorkerConfig};
+    use crate::worker::{
+        build_pd_decode_worker, build_pd_prefill_worker, PdDecodeWorker, PdPrefillWorker,
+        WorkerConfig,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -201,7 +218,7 @@ mod tests {
             None,
             "test-gpu".to_string(),
             "prefill",
-            PdPrefillWorker::<FakeModel>::new,
+            build_pd_prefill_worker::<FakeModel>,
         );
         let decode_factory = UnifiedWorkerFactory::new(
             Arc::new(FakeModel::for_ms(1.0)),
@@ -210,7 +227,7 @@ mod tests {
             None,
             "test-gpu".to_string(),
             "decode",
-            PdDecodeWorker::<FakeModel>::new,
+            build_pd_decode_worker::<FakeModel>,
         );
         let prefill_cfg = SimpleDpPoolConfig {
             pool: PD_PREFILL_POOL,

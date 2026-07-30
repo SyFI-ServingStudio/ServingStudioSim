@@ -460,7 +460,7 @@ mod tests {
     };
     use crate::sim::frontend::TraceFrontend;
     use crate::test_helpers::FakeModel;
-    use crate::worker::{BareboneWorker, WorkerConfig};
+    use crate::worker::{build_barebone_worker, WorkerConfig};
     use std::cell::RefCell;
     use std::io::Write;
     use std::path::PathBuf;
@@ -513,7 +513,7 @@ mod tests {
             None,
             "test-gpu".to_string(),
             "main",
-            BareboneWorker::<FakeModel>::new,
+            build_barebone_worker::<FakeModel>,
         );
         let cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
@@ -573,7 +573,7 @@ mod tests {
             None,
             "test-gpu".to_string(),
             "main",
-            BareboneWorker::<FakeModel>::new,
+            build_barebone_worker::<FakeModel>,
         );
         let cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {

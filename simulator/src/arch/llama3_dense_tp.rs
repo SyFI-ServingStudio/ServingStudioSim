@@ -77,7 +77,7 @@ pub struct Llama3DenseTpModel {
     pub num_layers: u32,
     pub tp_size: u16,
     /// Symbolic KV footprint per token (folds to bytes only at the worker's
-    /// KvPool seam). See `llama3_dense`.
+    /// KV partition-capacity seam). See `llama3_dense`.
     pub total_kv_bytes_per_token: Dim,
     pub attn_block: AttnBlockTpWorklet,
     pub mlp_block: MlpBlockTpWorklet,

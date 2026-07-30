@@ -1,37 +1,40 @@
 //! `worker` (L5) — per-worker FSM that turns admitted requests into iter cost
 //! queries and drives request lifecycle. See doc/detailed_design/L5.md.
 //!
-//! Current set: barebone and HP/DP unified workers, the PD prefill/decode pair,
-//! the `IterWorker` trait they share, selector/config types, and the shared
-//! admission primitives (§2).
+//! Production workers are statically composed under `workers/<cadence-family>/`:
+//! whole-iteration barebone/HP/PD-prefill, pull+decode PD-decode, slot-pipelined
+//! AFD attention, and double-buffered AFD FFN. L6 sees their existing typed
+//! message/event traits; it does not see the components.
 
-pub mod admission_helpers;
+pub(crate) mod admission;
 pub mod config;
 pub mod cost_buffers;
-pub mod disagg_attn;
-pub mod disagg_ffn;
+pub(crate) mod execution;
 pub mod gpu_cluster;
-pub mod hp_unified;
 pub mod iter_worker;
-pub mod pd_decode;
-pub mod pd_prefill;
+pub(crate) mod kv;
+pub(crate) mod shared;
 pub mod types;
-pub mod unified;
+pub(crate) mod workers;
 
-pub use admission_helpers::{Batch, DecodeReqState, KvAdmission, KvPool, LoadBalance};
+pub use admission::{
+    AdmissionCandidate, FifoOrder, LoadBalance, PendingOrderPolicy, ShortestJobFirst,
+};
 pub use config::{AttnWorkerSel, BatchPolicy, FfnWorkerSel, IterWorkerSel};
 pub use cost_buffers::CostBuffers;
-pub use disagg_attn::DisaggAttnWorker;
-pub use disagg_ffn::DisaggFfnWorker;
 pub use gpu_cluster::{CostSource, GpuCluster, GpuInfo, SharedGpuCluster};
-pub use hp_unified::HpUnifiedWorker;
-pub use iter_worker::IterWorker;
-pub use pd_decode::PdDecodeWorker;
-pub use pd_prefill::PdPrefillWorker;
+pub use iter_worker::{AfdAttnWorker, AfdFfnWorker, IterWorker};
 pub use types::{
     AttnWorkerEvent, AttnWorkerMsg, BatchFsmState, FfnPullSource, FfnTask, FfnTaskKind,
     FfnWorkerEvent, FfnWorkerMsg, IterCursor, IterEndState, PdDecodeEvent, PdDecodeMsg,
     PdPrefillEvent, PdPrefillMsg, TransferPlan, WorkerConfig, WorkerEventCommon, WorkerFsmState,
     WorkerMsgCommon, WorkerStatus,
 };
-pub use unified::BareboneWorker;
+pub(crate) use workers::afd_attention::build_afd_attention_worker;
+pub use workers::afd_attention::DisaggAttnWorker;
+pub(crate) use workers::afd_ffn::build_afd_ffn_worker;
+pub use workers::afd_ffn::DisaggFfnWorker;
+pub(crate) use workers::iter::{build_barebone_worker, build_hp_worker, build_pd_prefill_worker};
+pub use workers::iter::{BareboneWorker, HpUnifiedWorker, PdPrefillWorker};
+pub(crate) use workers::pd_decode::build_pd_decode_worker;
+pub use workers::pd_decode::PdDecodeWorker;

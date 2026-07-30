@@ -28,7 +28,7 @@ the deserialized config to its deployment's `build`:
 |---|---|
 | `unified` | **wired** — `UnifiedDeployment::build` |
 | `pd` | **wired** — `PdDeployment::build` for the supported prefill/decode arch pairings |
-| `afd` | parses (so `list-params` advertises it), then errors cleanly until wired |
+| `afd` | **wired** — `AfdDeployment::build` for Qwen3 attention/FFN disaggregation |
 
 ## The config shape (`config.rs`)
 
@@ -67,10 +67,11 @@ embeds the run-global specs and fixes which **pool roles** exist:
    for `unified`; `ChunkedPrefill` parses but bails (`not wired yet`), and the PD
    worker tags are rejected here because they belong to the `pd` deployment.
 4. **Select the arch by its explicit tag** — the wired unified arms are
-   `Llama3Dense`, `Llama3DenseTp`, and `Llama3DpAttnTpFfn`; `DeepseekMoe` parses
-   but bails. Dispatch is provider-first, *not* a `tp_size` dispatch. Each wired
-   arm runs the L4 cascade `build_configs → resolve_configs → build` with the
-   right `ParallelCfg`, producing a concrete model type `M`.
+   `Llama3Dense`, `Llama3DenseTp`, `Llama3DpAttnTpFfn`, and
+   `Qwen3MoeDpAttnEpFfn`. Dispatch is provider-first, *not* a `tp_size`
+   dispatch. Each arm runs the L4 cascade
+   `build_configs → resolve_configs → build` with its resolved parallel layout,
+   producing a concrete model type `M`.
 5. `assemble_flow::<M>` wraps the `Arc<M>` in a `UnifiedWorkerFactory` (threading
    `gpu_name` + `model.gpus_per_replica()` for the GPU inventory) and a
    `SimpleDpFlow`, erasing to `Box<dyn Flow>`.
@@ -92,9 +93,22 @@ arch pairings are:
 Each side builds its own concrete model (so TP/layout may differ), then
 `assemble_pd_flow` builds a `PdFlow` with one `UnifiedWorkerFactory` per pool.
 
+## The build cascade (`AfdDeployment`)
+
+`afd` has an attention pool and an FFN pool. The wired arch pair is
+`qwen3_attn_tp -> qwen3_ffn_moe`; the attention pool uses `disagg_attn` and the
+FFN pool uses `disagg_ffn`.
+
+The deployment validates the shared model config, builds each pool's
+layer-wise L4 model under its own backend overrides, builds the profiled
+attention↔FFN transfer cost once, and assembles an `AfdFlow`. Attention replicas
+are independent sticky request/KV shards. FFN replicas receive complete
+section tasks from the AFD pool controller; L6 owns the cross-pool layer barrier
+and routing.
+
 ## Up / down
 
 - **Above (consumer):** the L7 sim driver calls `build_flow` to get the `Flow`,
   and reads `workload` / `io` off the `RunConfig` to drive the run.
-- **Below (assembled):** the L4 arch model build cascade, the L5 `WorkerConfig`,
-  and the L6 orchestrator (`SimpleDpFlow` + `UnifiedWorkerFactory`).
+- **Below (assembled):** the L4 arch model build cascade, L5 worker recipes and
+  `WorkerConfig`, and the matching L6 flow/pool controllers.

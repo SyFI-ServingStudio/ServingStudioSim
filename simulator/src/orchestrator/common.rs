@@ -13,7 +13,7 @@ use crate::worker::{IterWorker, SharedGpuCluster, WorkerConfig};
 // Re-export so call sites that still import `crate::orchestrator::{GpuInfo,
 // GpuCluster}` keep working — the canonical home is `worker::gpu_cluster`,
 // which owns the merged GPU registry / transfer timing oracle.
-pub use crate::worker::{GpuInfo, GpuCluster};
+pub use crate::worker::{GpuCluster, GpuInfo};
 
 /// Deployment-level action returned to L7 each tick. Current flows only surface
 /// request completion to L7.
@@ -22,10 +22,9 @@ pub enum OrchAction {
     Complete { req: RequestId },
 }
 
-/// Constructor signature shared by every iter-wise worker (`BareboneWorker::new`,
-/// `HpUnifiedWorker::new`, …). The factory is handed the chosen worker's `new` as
-/// a plain function pointer, so it can stamp the concrete `W` without `W::new`
-/// living on the [`IterWorker`] trait. `pool_tag` is the deployment-set pool name
+/// Builder signature shared by every iter-wise worker. The factory is handed one
+/// family-local `build_*_worker` function, so concrete composition stays out of
+/// both L6 and the [`IterWorker`] trait. `pool_tag` is the deployment-set pool name
 /// ("main" / "prefill" / "decode" / …) — it disambiguates `cost_log` filenames
 /// across pools, since `WorkerId` is per-pool (every pool starts at 0).
 ///
@@ -47,10 +46,23 @@ pub type WorkerBuildFn<M, W> = fn(
     SharedGpuCluster,
 ) -> W;
 
+/// The construction surface consumed by an L6 pool.
+///
+/// L6 owns routing and worker instances; it does not need to know whether a
+/// factory carries one iter-wise model, several resident models, or additional
+/// runtime policy. Keeping that distinction behind this trait lets specialized
+/// L5 workers reuse the normal pool/flow path without teaching L6 their model
+/// contract.
+pub trait WorkerFactory<W: IterWorker> {
+    fn requests(&self) -> &SharedRequests;
+    fn build(&self, idx: u16, pool: PoolId, cluster: &SharedGpuCluster) -> W;
+}
+
 /// Builds identical unified workers for a DP pool, each sharing the one
 /// `SharedRequests` handle and an `Arc` of the model. The worker sizes its own
-/// `KvPool` from `worker_config.attn_kv_bytes`. (L7 will generalize this into a
-/// trait; for now a concrete generic struct is enough.)
+/// KV partition capacity from `worker_config.attn_kv_bytes`. Specialized
+/// constructors use their own factory structs and implement [`WorkerFactory`]
+/// directly.
 pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel, W: IterWorker> {
     pub model: Arc<M>,
     pub requests: SharedRequests,
@@ -66,8 +78,8 @@ pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel, W: IterWorker> {
     /// Pool name handed to every worker so each `cost_log` file is unique
     /// across pools (`worker_<pool_tag>_<id>.parquet`).
     pub pool_tag: &'static str,
-    /// The concrete worker's `new`, supplied by the deployment after it picks the
-    /// (arch, worker) pair.
+    /// The concrete worker recipe, supplied after deployment selects the
+    /// `(arch, worker)` pair.
     build_fn: WorkerBuildFn<M, W>,
 }
 
@@ -108,5 +120,15 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
             &self.gpu_name,
             std::rc::Rc::clone(cluster),
         )
+    }
+}
+
+impl<M: IterwiseUnifiedModel, W: IterWorker> WorkerFactory<W> for UnifiedWorkerFactory<M, W> {
+    fn requests(&self) -> &SharedRequests {
+        &self.requests
+    }
+
+    fn build(&self, idx: u16, pool: PoolId, cluster: &SharedGpuCluster) -> W {
+        UnifiedWorkerFactory::build(self, idx, pool, cluster)
     }
 }

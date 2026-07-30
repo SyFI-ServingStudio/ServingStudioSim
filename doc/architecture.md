@@ -59,24 +59,25 @@ returns only metrics; it owns no simulation state.
 
 ### L4 — Model arch
 
-Wires worklets into a full model for **one worker type** and compiles its
-per-iteration CostTree **once**. A homogeneous decoder layer is folded with a
-CostTree `Scale{num_layers}` node rather than materialised N times. L4 is the
-contract L5 depends on: given a batch shape it returns one cost, and it exposes the
-per-token KV footprint the worker needs to size its pool.
+Wires worklets into a full model or one disaggregated model section and compiles
+its stable CostTree section(s) **once**. A homogeneous iter-wise decoder layer is
+folded with `Scale{num_layers}` rather than materialised N times. L4 exposes
+separate typed contracts for whole-iteration, layer-wise attention, and
+layer-wise FFN cost queries, plus the topology/KV/transfer facts L5 needs.
 
 *Sees:* worklets, the model config, the parallel config.
 *Doesn't see:* the KV pool, admission, or the clock — those are the worker's.
 
 ### L5 — Worker
 
-The first stateful layer: a per-GPU-group finite-state machine that admits requests
-under a **KV budget**, forms a batch, asks its bound L4 arch for that batch's cost,
-and advances its local clock. The KV pool is sized from the arch's per-token KV
-footprint. Each worker binds exactly one model arch (many workers to one arch) and
-maps to exactly one physical GPU group.
+The first stateful layer. A worker composition is
+`<KV, Admission<Selection>, Execution> × Shell(cadence)`. KV owns resource
+lifecycle; selection policy is the sole owner of fresh pending membership;
+execution lowers state into a typed L4 input; the concrete shell owns cadence,
+overlap, and completion. Production shells cover whole-iteration, pull+decode,
+layer-slot attention, and buffered FFN timelines.
 
-*Sees:* one arch, one KV pool, its own request queue and clock.
+*Sees:* one arch contract, its selected components, request state, and local clock.
 *Doesn't see:* other workers, or how requests reach it.
 
 ### L6 — Orchestrator
@@ -114,8 +115,8 @@ standalone crate.
 | `simulator/src/timing/` | L1 (Rust) | Kernel caches, the PyO3 bridge, and the CostTree (`compile`/`eval`, flatten/aggregate). |
 | `simulator/src/op/` | L2 | Atomic `Op<K>` (no file) and compound ops (`attention/flashinfer.rs`); stubs for `comm`/`moe`/`ssm`. |
 | `simulator/src/worklet/` | L3 | Per-module sync sections (`pre_attn_local`, `attn_block_tp`, `mlp_block_tp`, …). |
-| `simulator/src/arch/` | L4 | Full-model wiring per worker type (`llama3_dense`, `llama3_dense_tp`); CostTree build + `Scale` fold. |
-| `simulator/src/worker/` | L5 | The tick FSM, the KV pool, per-worker cost logging. |
+| `simulator/src/arch/` | L4 | Iter-wise and layer-wise model assembly for Llama3/Qwen3; compiled CostTree sections and model contracts. |
+| `simulator/src/worker/` | L5 | KV/admission/execution components, concrete cadence shells, build recipes, and per-worker logging. |
 | `simulator/src/orchestrator/` | L6 | Deployment → pool → group → worker hierarchy; the `Flow` trait; pool-local vs inter-pool routing. |
 | `simulator/src/deployment/` | L6/L7 seam | The `Deployment` trait + `build_flow` dispatch — the single `dyn` erasure point. |
 | `simulator/src/sim/` | L7 | `run_sim` tick loop, the trace frontend, the run summary. |

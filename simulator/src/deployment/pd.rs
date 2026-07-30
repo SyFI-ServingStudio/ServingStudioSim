@@ -28,7 +28,10 @@ use crate::orchestrator::{
 };
 use crate::timing::kernels::{P2pInterKernel, P2pInterKernelConfig};
 use crate::timing::PerfApiBridge;
-use crate::worker::{CostSource, IterWorkerSel, PdDecodeWorker, PdPrefillWorker, WorkerConfig};
+use crate::worker::{
+    build_pd_decode_worker, build_pd_prefill_worker, CostSource, IterWorkerSel, PdDecodeWorker,
+    PdPrefillWorker, WorkerConfig,
+};
 
 use super::Deployment;
 
@@ -66,8 +69,20 @@ impl Deployment for PdDeployment {
         let prefill_cfg = pool_cfg(PD_PREFILL_POOL, pg.replicas, cfg.pools.prefill.placement);
         let decode_cfg = pool_cfg(PD_DECODE_POOL, dg.replicas, cfg.pools.decode.placement);
 
-        let prefill_wc = worker_config(&pg.worker, &cfg.io.log_dir, cfg.io.log_output_token_times, cfg.io.log_stage_transitions, cfg.io.kv_log_stride);
-        let decode_wc = worker_config(&dg.worker, &cfg.io.log_dir, cfg.io.log_output_token_times, cfg.io.log_stage_transitions, cfg.io.kv_log_stride);
+        let prefill_wc = worker_config(
+            &pg.worker,
+            &cfg.io.log_dir,
+            cfg.io.log_output_token_times,
+            cfg.io.log_stage_transitions,
+            cfg.io.kv_log_stride,
+        );
+        let decode_wc = worker_config(
+            &dg.worker,
+            &cfg.io.log_dir,
+            cfg.io.log_output_token_times,
+            cfg.io.log_stage_transitions,
+            cfg.io.kv_log_stride,
+        );
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
 
         // The KV-transfer cost source: the profiled inter-node p2p curve, keyed
@@ -84,12 +99,26 @@ impl Deployment for PdDeployment {
                 IterArchSel::Llama3DenseTp { tp_size: dtp, .. },
             ) => {
                 let prefill_model = {
-                    let _scope = bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
-                    Arc::new(arch_build::dense_tp(pg.arch.model(), *ptp, &pg.gpu, MODEL_NAME, bridge)?)
+                    let _scope =
+                        bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
+                    Arc::new(arch_build::dense_tp(
+                        pg.arch.model(),
+                        *ptp,
+                        &pg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
                 };
                 let decode_model = {
-                    let _scope = bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
-                    Arc::new(arch_build::dense_tp(dg.arch.model(), *dtp, &dg.gpu, MODEL_NAME, bridge)?)
+                    let _scope =
+                        bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
+                    Arc::new(arch_build::dense_tp(
+                        dg.arch.model(),
+                        *dtp,
+                        &dg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
                 };
                 Ok(assemble_pd_flow(
                     prefill_model,
@@ -117,11 +146,19 @@ impl Deployment for PdDeployment {
                 },
             ) => {
                 let prefill_model = {
-                    let _scope = bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
-                    Arc::new(arch_build::dense_tp(pg.arch.model(), *ptp, &pg.gpu, MODEL_NAME, bridge)?)
+                    let _scope =
+                        bridge.with_backend_overrides("prefill", cfg.backends.get("prefill"));
+                    Arc::new(arch_build::dense_tp(
+                        pg.arch.model(),
+                        *ptp,
+                        &pg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
                 };
                 let decode_model = {
-                    let _scope = bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
+                    let _scope =
+                        bridge.with_backend_overrides("decode", cfg.backends.get("decode"));
                     Arc::new(arch_build::dp_attn_tp_ffn(
                         dg.arch.model(),
                         *attn_tp_size,
@@ -254,7 +291,7 @@ where
         log_dir.clone(),
         prefill_gpu_name,
         "prefill",
-        PdPrefillWorker::<MP>::new as WorkerBuildFn<MP, PdPrefillWorker<MP>>,
+        build_pd_prefill_worker::<MP> as WorkerBuildFn<MP, PdPrefillWorker<MP>>,
     );
     let decode_factory: UnifiedWorkerFactory<MD, PdDecodeWorker<MD>> = UnifiedWorkerFactory::new(
         decode_model,
@@ -263,7 +300,7 @@ where
         log_dir,
         decode_gpu_name,
         "decode",
-        PdDecodeWorker::<MD>::new as WorkerBuildFn<MD, PdDecodeWorker<MD>>,
+        build_pd_decode_worker::<MD> as WorkerBuildFn<MD, PdDecodeWorker<MD>>,
     );
     let flow = PdFlow::new(
         &prefill_cfg,

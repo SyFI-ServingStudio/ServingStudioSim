@@ -71,7 +71,7 @@ pub struct Llama3DenseModel {
     pub num_layers: u32,
     /// KV footprint per token, kept SYMBOLIC (`2*num_kv_heads*head_dim*kv_bytes
     /// *num_layers`); folds to bytes only at the `IterwiseUnifiedModel` boundary
-    /// where a worker sizes its `KvPool`.
+    /// where a worker sizes its KV partition capacity.
     pub total_kv_bytes_per_token: Dim,
     pub pre_attn: PreAttnLocalWorklet,
     pub attn: AttnLocalWorklet,
@@ -340,7 +340,7 @@ impl Llama3DenseModel {
 impl IterwiseUnifiedModel for Llama3DenseModel {
     fn total_kv_bytes_per_token(&self) -> u64 {
         // Seam B: collapse the symbolic KV footprint to bytes for the worker's
-        // KvPool sizing.
+        // KV partition-capacity sizing.
         self.total_kv_bytes_per_token.get() as u64
     }
 

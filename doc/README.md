@@ -21,10 +21,9 @@ Two ideas make that fast and honest:
   iteration just evaluates leaves and folds them to one total.
 
 A **deployment** (unified, prefill/decode-disaggregated, attention/FFN-
-disaggregated, …) is a **bundle of code** — a model arch, a worker FSM, and an
-orchestrator — **not a configuration flag**. Adding a serving shape means adding
-code at the right layer, which keeps every concrete deployment easy to open and
-read in isolation.
+disaggregated, …) is a typed composition of model arch, worker recipe, and
+orchestrator protocol. Its serde tag selects that code path; it is not a mode
+flag interpreted throughout the stack.
 
 ## The seven layers
 
@@ -36,8 +35,8 @@ question and hides the layer below it.
 | **L1** | Kernel / Profiling | Measure one kernel on one GPU; serve the time from a cache. The only layer that produces a number. |
 | **L2** | Op | Name one or more kernels into an operation (`attn`, `o_proj`) with a fixed internal composition. |
 | **L3** | Worklet | Compose ops into one model-module sync section, deriving the per-rank parallel partition. |
-| **L4** | Model arch | Wire worklets into a full model for one worker type; compile its per-iteration CostTree once. |
-| **L5** | Worker | The stateful per-GPU FSM: admit under a KV budget, form a batch, ask L4 for its cost, advance the clock. |
+| **L4** | Model arch | Wire worklets into a full model or disaggregated section; compile stable CostTree sections once. |
+| **L5** | Worker | Compose KV, admission/selection, and execution under a concrete cadence shell; own mutable lifecycle and clock state. |
 | **L6** | Orchestrator | Route a deployment's requests across pools of workers. |
 | **L7** | Sim infrastructure | The deployment-agnostic tick loop, trace frontend, logging, and the launcher. |
 

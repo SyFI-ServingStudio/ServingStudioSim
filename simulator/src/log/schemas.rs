@@ -157,7 +157,7 @@ pub fn kv_snapshot_schema() -> Arc<Schema> {
         // `active_kv`: peak committed KV over the throttle window (a running max,
         // so decimated sampling never hides an occupancy spike) — the "current
         // size". `projected_peak`: the max KV the currently-admitted set will reach
-        // as it drains (`Batch::projected_peak_kv`) — the "future estimate".
+        // as it drains (the partition projected-peak cache) — the "future estimate".
         // `promised_kv`: admitted-but-not-yet-realized tokens.
         Field::new("active_kv", DataType::UInt64, false),
         Field::new("projected_peak", DataType::UInt64, false),
