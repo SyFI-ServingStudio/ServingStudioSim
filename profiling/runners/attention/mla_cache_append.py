@@ -1,8 +1,8 @@
-"""Torch profiling runner for GLM-5.2's plain MLA cache append.
+"""Profiling runners for GLM-5.2's plain MLA cache append.
 
-The timed callable contains only the two indexed writes that concatenate a
-512-wide latent row and 64-wide RoPE row in one paged cache entry.  It is a
-semantic composite, not vLLM's fused ``concat_and_cache_mla_kernel``.
+The Torch timed callable contains only the two indexed writes that implement
+the semantic composite. The production-aligned vLLM callable is its single
+fused ``concat_and_cache_mla_kernel`` launch.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ _ROPE_DIM = 64
 _BLOCK_SIZE = 64
 _CACHE_FORMAT = "plain"
 _REQUIRED_GPU = "NVIDIA H200"
+_VLLM_KERNEL_NAME = "concat_and_cache_mla_kernel"
+_VLLM_CACHE_DTYPE = "auto"
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,19 @@ def _validate_cuda_device(torch: Any) -> None:
     if gpu_name != _REQUIRED_GPU:
         raise ProfilerNotImplemented(
             "torch mla_cache_append is verified only on "
+            f"{_REQUIRED_GPU}, got {gpu_name}"
+        )
+
+
+def _validate_vllm_cuda_device(torch: Any) -> None:
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented(
+            "CUDA is required for the mla_cache_append vllm_cuda backend"
+        )
+    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
+    if gpu_name != _REQUIRED_GPU:
+        raise ProfilerNotImplemented(
+            "mla_cache_append vllm_cuda is verified only on "
             f"{_REQUIRED_GPU}, got {gpu_name}"
         )
 
@@ -260,6 +275,97 @@ def profile_mla_cache_append_torch(
             warmup=5,
             per_iter_time_ms=time_ms,
         )
+        logical_bytes = _logical_bytes(
+            num_tokens=num_tokens,
+            kv_lora_rank=kv_lora_rank,
+            rope_dim=rope_dim,
+            input_dtype=input_dtype,
+            kv_dtype=kv_dtype,
+        )
+        bandwidth_gbps = (
+            logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+        )
+        return ComputeMetrics(
+            time_ms=float(time_ms),
+            tflops=0.0,
+            memory_bandwidth_gbps=float(bandwidth_gbps),
+            energy_j=float(energy_j),
+        )
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_mla_cache_append_vllm_cuda(
+    num_tokens: int,
+    kv_lora_rank: int,
+    rope_dim: int,
+    block_size: int,
+    input_dtype: DType | str,
+    kv_dtype: DType | str,
+    cache_format: str,
+) -> ComputeMetrics:
+    """Profile vLLM's one-launch fused plain MLA cache append."""
+    (
+        num_tokens,
+        kv_lora_rank,
+        rope_dim,
+        block_size,
+        input_dtype,
+        kv_dtype,
+        _cache_format,
+    ) = _validate_args(
+        num_tokens,
+        kv_lora_rank,
+        rope_dim,
+        block_size,
+        input_dtype,
+        kv_dtype,
+        cache_format,
+    )
+    try:
+        import torch
+        from vllm import _custom_ops as ops
+    except ImportError as exc:
+        raise ProfilerNotImplemented(
+            "the instrumented vLLM environment is required for "
+            "the mla_cache_append vllm_cuda backend"
+        ) from exc
+
+    _validate_vllm_cuda_device(torch)
+
+    try:
+        operands = _build_operands(
+            torch,
+            num_tokens=num_tokens,
+            kv_lora_rank=kv_lora_rank,
+            rope_dim=rope_dim,
+            block_size=block_size,
+            torch_dtype=input_dtype.torch(),
+            device="cuda",
+        )
+        scale = torch.ones((), dtype=torch.float32, device="cuda")
+
+        def kernel() -> None:
+            ops.concat_and_cache_mla(
+                operands.kv_c,
+                operands.k_pe,
+                operands.cache,
+                operands.slot_mapping,
+                _VLLM_CACHE_DTYPE,
+                scale,
+            )
+
+        # Allocation and layout setup stay outside the callable. The CUPTI
+        # filter selects only vLLM's one fused device launch.
+        time_ms = Timer.cupti(kernel, kernel_name=_VLLM_KERNEL_NAME)
+        energy_j = Energy.perf(
+            kernel,
+            warmup=5,
+            per_iter_time_ms=time_ms,
+        )
+
+        # Logical traffic describes semantic reads/writes, not physical memory
+        # transactions performed by the fused CUDA implementation.
         logical_bytes = _logical_bytes(
             num_tokens=num_tokens,
             kv_lora_rank=kv_lora_rank,
