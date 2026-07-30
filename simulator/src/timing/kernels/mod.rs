@@ -3,6 +3,7 @@
 pub mod all_reduce;
 pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
+pub mod dsa_index_cache_append;
 pub mod elementwise;
 pub mod engine;
 pub mod flashinfer_attn_decode;
@@ -28,6 +29,10 @@ pub use all_reduce_residual_rms_norm::{
 };
 pub use batched_gemm::{
     BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, BatchedGemmSpec,
+};
+pub use dsa_index_cache_append::{
+    DsaIndexCacheAppendKernel, DsaIndexCacheAppendKernelConfig, DsaIndexCacheAppendKernelInput,
+    DsaIndexCacheAppendSpec,
 };
 pub use elementwise::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ElementwiseSpec,
