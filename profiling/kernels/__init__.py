@@ -25,6 +25,7 @@ from profiling.kernels import (
     moe_finalize_routing,  # noqa: F401
     p2p_inter,  # noqa: F401
     p2p_intra,  # noqa: F401
+    residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
     single_gemm,  # noqa: F401
 )
