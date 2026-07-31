@@ -1,0 +1,538 @@
+"""Torch composite profiler for GLM-5.2 selected sparse MLA attention.
+
+The composite reproduces the semantic boundary of FlashMLA's sparse attention
+callable. Query concatenation, index remapping, cache conversion, and any other
+setup launches remain outside this profiler kind.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from profiling.db.args import DType
+from profiling.profilers.energy import Energy
+from profiling.profilers.timer import Timer
+from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
+from profiling.runners.metrics import ComputeMetrics
+
+_NUM_HEADS = 64
+_NUM_KV_HEADS = 1
+_SELECTED_K = 2048
+_LATENT_DIM = 512
+_ROPE_DIM = 64
+_SCORE_DIM = _LATENT_DIM + _ROPE_DIM
+_VALUE_DIM = 512
+_SOFTMAX_SCALE = 0.0625
+_CACHE_LAYOUT = "token_major_mqa_bf16_latent_rope"
+_QUERY_CHUNK_SIZE = 8
+_CACHE_TEMPLATE_ROWS = 64
+
+_UINT = r"(?:0|[1-9][0-9]*)"
+_UNIFORM_RE = re.compile(rf"u:({_UINT})x({_UINT})\Z")
+_RAMP_RE = re.compile(rf"r:({_UINT})\.\.({_UINT})\Z")
+_CLIPPED_RE = re.compile(rf"c:({_UINT})\.\.({_UINT})@({_UINT})\Z")
+_GROUP_RE = re.compile(rf"g:\((?P<group>{_UINT}(?:,{_UINT})*)\)x(?P<groups>{_UINT})\Z")
+
+_INDEX_DISTRIBUTIONS = frozenset(
+    {
+        "recent_contiguous",
+        "unique_scattered_pages",
+        "clustered_pages",
+        "uniform_stride",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _ValidatedArgs:
+    num_queries: int
+    num_cache_tokens: int
+    valid_counts: tuple[int, ...]
+    index_distribution: str
+
+
+@dataclass(frozen=True)
+class _Operands:
+    q: Any
+    cache: Any
+    selected_indices: Any
+
+
+def _encode_valid_counts(counts: Sequence[int], *, selected_k: int, num_cache_tokens: int) -> str:
+    """Return the unique canonical encoding for a flattened count vector."""
+    values = tuple(counts)
+    if not values:
+        raise ValueError("valid_counts must contain at least one row")
+    limit = min(selected_k, num_cache_tokens)
+    if any(type(value) is not int for value in values):
+        raise TypeError("valid_counts values must be integers")
+    if any(value < 0 or value > limit for value in values):
+        raise ValueError(f"valid_counts values must be in 0..{limit}")
+
+    if all(value == values[0] for value in values):
+        return f"u:{values[0]}x{len(values)}"
+
+    if all(values[index] == values[0] + index for index in range(len(values))):
+        return f"r:{values[0]}..{values[-1]}"
+
+    unclipped_last = values[0] + len(values) - 1
+    clipped = tuple(min(values[0] + index, selected_k) for index in range(len(values)))
+    if values[0] < selected_k < unclipped_last <= num_cache_tokens and values == clipped:
+        return f"c:{values[0]}..{unclipped_last}@{selected_k}"
+
+    period = len(values)
+    for candidate in range(1, len(values) + 1):
+        if len(values) % candidate:
+            continue
+        if all(values[index] == values[index % candidate] for index in range(len(values))):
+            period = candidate
+            break
+    group = ",".join(str(value) for value in values[:period])
+    return f"g:({group})x{len(values) // period}"
+
+
+def _decode_valid_counts(
+    encoded: str,
+    *,
+    num_queries: int,
+    selected_k: int,
+    num_cache_tokens: int,
+) -> tuple[int, ...]:
+    """Parse and validate the canonical flattened count-vector syntax."""
+    if not isinstance(encoded, str):
+        raise TypeError("valid_counts must be a string")
+    if not encoded.isascii():
+        raise ValueError("valid_counts must use ASCII compact syntax")
+
+    values: tuple[int, ...]
+    if match := _UNIFORM_RE.fullmatch(encoded):
+        count, rows = (int(value) for value in match.groups())
+        if rows <= 0:
+            raise ValueError("valid_counts uniform row count must be positive")
+        if rows != num_queries:
+            raise ValueError(f"valid_counts expands to {rows} rows, expected {num_queries}")
+        values = (count,) * rows
+    elif match := _RAMP_RE.fullmatch(encoded):
+        first, last = (int(value) for value in match.groups())
+        if first >= last:
+            raise ValueError("valid_counts ramp must be a strict +1 ramp")
+        rows = last - first + 1
+        if rows != num_queries:
+            raise ValueError(f"valid_counts expands to {rows} rows, expected {num_queries}")
+        values = tuple(range(first, last + 1))
+    elif match := _CLIPPED_RE.fullmatch(encoded):
+        first, last, cap = (int(value) for value in match.groups())
+        if cap != selected_k:
+            raise ValueError("valid_counts clipped-ramp cap must equal selected_k")
+        if not first < selected_k < last <= num_cache_tokens:
+            raise ValueError(
+                "valid_counts clipped ramp requires first < selected_k < last <= num_cache_tokens"
+            )
+        rows = last - first + 1
+        if rows != num_queries:
+            raise ValueError(f"valid_counts expands to {rows} rows, expected {num_queries}")
+        values = tuple(min(value, selected_k) for value in range(first, last + 1))
+    elif match := _GROUP_RE.fullmatch(encoded):
+        group = tuple(int(value) for value in match.group("group").split(","))
+        groups = int(match.group("groups"))
+        if groups <= 0:
+            raise ValueError("valid_counts tuple repetition must be positive")
+        rows = len(group) * groups
+        if rows != num_queries:
+            raise ValueError(f"valid_counts expands to {rows} rows, expected {num_queries}")
+        values = group * groups
+    else:
+        raise ValueError("valid_counts must be canonical u:, r:, c:, or g: compact syntax")
+
+    if len(values) != num_queries:
+        raise ValueError(f"valid_counts expands to {len(values)} rows, expected {num_queries}")
+    limit = min(selected_k, num_cache_tokens)
+    if any(value > limit for value in values):
+        raise ValueError(f"valid_counts values must be in 0..{limit}")
+
+    canonical = _encode_valid_counts(
+        values, selected_k=selected_k, num_cache_tokens=num_cache_tokens
+    )
+    if canonical != encoded:
+        raise ValueError(f"valid_counts is noncanonical; canonical encoding is {canonical!r}")
+    return values
+
+
+def _validate_args(
+    *,
+    num_queries: int,
+    num_cache_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    selected_k: int,
+    latent_dim: int,
+    rope_dim: int,
+    value_dim: int,
+    softmax_scale: float,
+    q_dtype: DType | str,
+    cache_dtype: DType | str,
+    index_dtype: str,
+    output_dtype: DType | str,
+    valid_counts: str,
+    index_distribution: str,
+    cache_layout: str,
+) -> _ValidatedArgs:
+    integers = {
+        "num_queries": num_queries,
+        "num_cache_tokens": num_cache_tokens,
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "selected_k": selected_k,
+        "latent_dim": latent_dim,
+        "rope_dim": rope_dim,
+        "value_dim": value_dim,
+    }
+    for name, value in integers.items():
+        if type(value) is not int:
+            raise TypeError(f"{name} must be an integer")
+
+    if not 1 <= num_queries <= 4096:
+        raise ProfilerNotImplemented("num_queries must be in 1..4096")
+    if not 1 <= num_cache_tokens <= 131072:
+        raise ProfilerNotImplemented("num_cache_tokens must be in 1..131072")
+    expected = {
+        "num_heads": (num_heads, _NUM_HEADS),
+        "num_kv_heads": (num_kv_heads, _NUM_KV_HEADS),
+        "selected_k": (selected_k, _SELECTED_K),
+        "latent_dim": (latent_dim, _LATENT_DIM),
+        "rope_dim": (rope_dim, _ROPE_DIM),
+        "value_dim": (value_dim, _VALUE_DIM),
+    }
+    for name, (actual, required) in expected.items():
+        if actual != required:
+            raise ProfilerNotImplemented(f"{name} must be {required}, got {actual}")
+    if type(softmax_scale) not in {int, float} or isinstance(softmax_scale, bool):
+        raise TypeError("softmax_scale must be a real number")
+    if float(softmax_scale) != _SOFTMAX_SCALE:
+        raise ProfilerNotImplemented(
+            f"softmax_scale must be exactly {_SOFTMAX_SCALE}, got {softmax_scale}"
+        )
+    if DType.from_value(q_dtype) is not DType.BF16:
+        raise ProfilerNotImplemented("q_dtype must be bf16")
+    if DType.from_value(cache_dtype) is not DType.BF16:
+        raise ProfilerNotImplemented("cache_dtype must be bf16")
+    if index_dtype != "int32":
+        raise ProfilerNotImplemented("index_dtype must be int32")
+    if DType.from_value(output_dtype) is not DType.BF16:
+        raise ProfilerNotImplemented("output_dtype must be bf16")
+    if cache_layout != _CACHE_LAYOUT:
+        raise ProfilerNotImplemented(f"cache_layout must be {_CACHE_LAYOUT!r}")
+    if index_distribution not in _INDEX_DISTRIBUTIONS:
+        modes = ", ".join(sorted(_INDEX_DISTRIBUTIONS))
+        raise ProfilerNotImplemented(f"index_distribution must be one of: {modes}")
+
+    counts = _decode_valid_counts(
+        valid_counts,
+        num_queries=num_queries,
+        selected_k=selected_k,
+        num_cache_tokens=num_cache_tokens,
+    )
+    return _ValidatedArgs(
+        num_queries=num_queries,
+        num_cache_tokens=num_cache_tokens,
+        valid_counts=counts,
+        index_distribution=index_distribution,
+    )
+
+
+def _require_h200(torch: Any) -> None:
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented("CUDA is required for dsa_sparse_mla_attention:torch")
+    gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+    if gpu_name != "NVIDIA H200":
+        raise ProfilerNotImplemented(
+            f"dsa_sparse_mla_attention:torch requires NVIDIA H200, got {gpu_name!r}"
+        )
+
+
+def _coprime_stride(size: int, preferred: int) -> int:
+    if size <= 1:
+        return 1
+    stride = preferred % size or 1
+    while math.gcd(stride, size) != 1:
+        stride += 1
+    return stride
+
+
+def _row_indices(
+    torch: Any,
+    *,
+    row: int,
+    count: int,
+    num_cache_tokens: int,
+    distribution: str,
+    device: Any,
+) -> Any:
+    if count == 0:
+        return torch.empty((0,), dtype=torch.int64, device=device)
+    positions = torch.arange(count, dtype=torch.int64, device=device)
+    if distribution == "recent_contiguous":
+        return positions + (num_cache_tokens - count)
+    if distribution == "uniform_stride":
+        return torch.div(positions * num_cache_tokens, count, rounding_mode="floor")
+    if distribution == "unique_scattered_pages":
+        stride = _coprime_stride(num_cache_tokens, 4099 + 2 * row)
+        return (positions * stride + 17 * row) % num_cache_tokens
+
+    page_size = 64
+    num_pages = (num_cache_tokens + page_size - 1) // page_size
+    page_stride = _coprime_stride(num_pages, 17 + 2 * row)
+    values: list[int] = []
+    for page_offset in range(num_pages):
+        page = (row * 11 + page_offset * page_stride) % num_pages
+        base = page * page_size
+        for offset in range(page_size):
+            index = base + (offset + row * 7) % page_size
+            if index < num_cache_tokens:
+                values.append(index)
+                if len(values) == count:
+                    return torch.tensor(values, dtype=torch.int64, device=device)
+    raise AssertionError("clustered index construction did not produce enough indices")
+
+
+def _build_operands(torch: Any, validated: _ValidatedArgs, *, device: Any) -> _Operands:
+    q = torch.empty(
+        (validated.num_queries, _NUM_HEADS, _SCORE_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    cache = torch.empty(
+        (validated.num_cache_tokens, _NUM_KV_HEADS, _SCORE_DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    selected_indices = torch.full(
+        (validated.num_queries, _NUM_KV_HEADS, _SELECTED_K),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    feature = torch.linspace(-0.875, 0.875, _SCORE_DIM, device=device)
+    heads = (torch.arange(_NUM_HEADS, dtype=torch.float32, device=device) - 31.5) / 256.0
+    rows = (torch.arange(_QUERY_CHUNK_SIZE, dtype=torch.float32, device=device) - 3.5) / 128.0
+    q_template = (rows[:, None, None] + heads[None, :, None] + feature).to(torch.bfloat16)
+    for start in range(0, validated.num_queries, _QUERY_CHUNK_SIZE):
+        stop = min(start + _QUERY_CHUNK_SIZE, validated.num_queries)
+        q[start:stop].copy_(q_template[: stop - start])
+
+    cache_rows = (
+        torch.arange(_CACHE_TEMPLATE_ROWS, dtype=torch.float32, device=device) - 31.5
+    ) / 192.0
+    cache_template = (cache_rows[:, None] + feature[None, :]).to(torch.bfloat16)
+    for start in range(0, validated.num_cache_tokens, _CACHE_TEMPLATE_ROWS):
+        stop = min(start + _CACHE_TEMPLATE_ROWS, validated.num_cache_tokens)
+        phase = ((start // _CACHE_TEMPLATE_ROWS) % 17 - 8) / 128.0
+        cache[start:stop, 0].copy_(
+            (cache_template[: stop - start].float() + phase).to(torch.bfloat16)
+        )
+
+    for row, count in enumerate(validated.valid_counts):
+        indices = _row_indices(
+            torch,
+            row=row,
+            count=count,
+            num_cache_tokens=validated.num_cache_tokens,
+            distribution=validated.index_distribution,
+            device=device,
+        )
+        selected_indices[row, 0, :count].copy_(indices.to(torch.int32))
+    return _Operands(q=q, cache=cache, selected_indices=selected_indices)
+
+
+def _torch_composite(
+    torch: Any,
+    q: Any,
+    cache: Any,
+    selected_indices: Any,
+    *,
+    softmax_scale: float,
+    query_chunk_size: int = _QUERY_CHUNK_SIZE,
+) -> Any:
+    outputs: list[Any] = []
+    cache_2d = cache[:, 0, :]
+    num_cache_tokens = cache.shape[0]
+    for start in range(0, q.shape[0], query_chunk_size):
+        stop = min(start + query_chunk_size, q.shape[0])
+        indices = selected_indices[start:stop, 0, :].to(torch.int64)
+        valid = (indices >= 0) & (indices < num_cache_tokens)
+        safe = torch.where(valid, indices, torch.zeros_like(indices))
+        gathered = cache_2d.index_select(0, safe.reshape(-1)).reshape(
+            stop - start, _SELECTED_K, _SCORE_DIM
+        )
+        gathered = torch.where(valid[..., None], gathered, torch.zeros_like(gathered))
+
+        scores = torch.einsum("qhd,qkd->qhk", q[start:stop].float(), gathered.float())
+        scores.mul_(softmax_scale)
+        scores.masked_fill_(~valid[:, None, :], float("-inf"))
+        all_invalid = ~valid.any(dim=-1)
+        if all_invalid.any():
+            scores[all_invalid] = 0.0
+        probabilities = torch.softmax(scores, dim=-1)
+        probabilities = torch.where(
+            valid[:, None, :], probabilities, torch.zeros_like(probabilities)
+        )
+        output = torch.einsum("qhk,qkv->qhv", probabilities, gathered[..., :_VALUE_DIM].float())
+        outputs.append(output.to(torch.bfloat16))
+    return torch.cat(outputs, dim=0)
+
+
+def _check_correctness(
+    torch: Any,
+    operands: _Operands,
+    *,
+    softmax_scale: float,
+) -> None:
+    from profiling.runners.attention.dsa_sparse_mla_attention_reference import (
+        dsa_sparse_mla_attention_reference,
+    )
+
+    q_before = operands.q.clone()
+    cache_before = operands.cache.clone()
+    indices_before = operands.selected_indices.clone()
+    expected = dsa_sparse_mla_attention_reference(
+        operands.q,
+        operands.cache,
+        operands.selected_indices,
+        softmax_scale=softmax_scale,
+    )
+    actual = _torch_composite(
+        torch,
+        operands.q,
+        operands.cache,
+        operands.selected_indices,
+        softmax_scale=softmax_scale,
+    )
+
+    if actual.shape != (operands.q.shape[0], _NUM_HEADS, _VALUE_DIM):
+        raise AssertionError(f"unexpected output shape {tuple(actual.shape)}")
+    if actual.dtype is not torch.bfloat16 or not torch.isfinite(actual).all():
+        raise AssertionError("Torch composite output must be finite BF16")
+    torch.testing.assert_close(actual.float(), expected.float(), atol=8e-4, rtol=3.01 / 128)
+    numerator = 2.0 * torch.sum(actual.float() * expected.float()).item()
+    denominator = (
+        torch.sum(actual.float().square()).item() + torch.sum(expected.float().square()).item()
+    )
+    cosine_difference = 0.0 if denominator == 0.0 else 1.0 - numerator / denominator
+    if abs(cosine_difference) > 7e-6:
+        raise AssertionError(f"cosine difference {cosine_difference} exceeds 7e-6")
+
+    if not torch.equal(operands.q, q_before):
+        raise AssertionError("Torch composite mutated q")
+    if not torch.equal(operands.cache, cache_before):
+        raise AssertionError("Torch composite mutated cache")
+    if not torch.equal(operands.selected_indices, indices_before):
+        raise AssertionError("Torch composite mutated selected_indices")
+    for source in (operands.q, operands.cache, operands.selected_indices):
+        if actual.untyped_storage().data_ptr() == source.untyped_storage().data_ptr():
+            raise AssertionError("Torch composite output aliases an input")
+
+
+def _logical_flops(*, num_queries: int, num_heads: int, selected_k: int) -> int:
+    return 2 * num_queries * num_heads * selected_k * (_SCORE_DIM + _VALUE_DIM)
+
+
+def _logical_bytes(
+    *,
+    num_queries: int,
+    num_heads: int,
+    selected_k: int,
+    valid_counts: Sequence[int],
+) -> int:
+    q_read = 2 * num_queries * num_heads * _SCORE_DIM
+    index_read = 4 * num_queries * selected_k
+    cache_read = 2 * sum(valid_counts) * _SCORE_DIM
+    output_write = 2 * num_queries * num_heads * _VALUE_DIM
+    max_lse_write = 8 * num_queries * num_heads
+    return q_read + index_read + cache_read + output_write + max_lse_write
+
+
+def profile_dsa_sparse_mla_attention_torch(
+    *,
+    num_queries: int,
+    num_cache_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    selected_k: int,
+    latent_dim: int,
+    rope_dim: int,
+    value_dim: int,
+    softmax_scale: float,
+    q_dtype: DType | str,
+    cache_dtype: DType | str,
+    index_dtype: str,
+    output_dtype: DType | str,
+    valid_counts: str,
+    index_distribution: str,
+    cache_layout: str,
+) -> ComputeMetrics:
+    """Profile the complete Torch semantic composite on an NVIDIA H200."""
+    validated = _validate_args(
+        num_queries=num_queries,
+        num_cache_tokens=num_cache_tokens,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        selected_k=selected_k,
+        latent_dim=latent_dim,
+        rope_dim=rope_dim,
+        value_dim=value_dim,
+        softmax_scale=softmax_scale,
+        q_dtype=q_dtype,
+        cache_dtype=cache_dtype,
+        index_dtype=index_dtype,
+        output_dtype=output_dtype,
+        valid_counts=valid_counts,
+        index_distribution=index_distribution,
+        cache_layout=cache_layout,
+    )
+
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise ProfilerNotImplemented("PyTorch is unavailable") from exc
+
+    try:
+        _require_h200(torch)
+        device = torch.device("cuda", torch.cuda.current_device())
+        operands = _build_operands(torch, validated, device=device)
+        _check_correctness(torch, operands, softmax_scale=float(softmax_scale))
+
+        def kernel() -> Any:
+            return _torch_composite(
+                torch,
+                operands.q,
+                operands.cache,
+                operands.selected_indices,
+                softmax_scale=float(softmax_scale),
+            )
+
+        time_ms = Timer.cupti(kernel)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except ProfilerNotImplemented:
+        raise
+    except Exception as exc:
+        raise KernelLaunchFailed("dsa_sparse_mla_attention:torch composite failed") from exc
+
+    flops = _logical_flops(num_queries=num_queries, num_heads=num_heads, selected_k=selected_k)
+    logical_bytes = _logical_bytes(
+        num_queries=num_queries,
+        num_heads=num_heads,
+        selected_k=selected_k,
+        valid_counts=validated.valid_counts,
+    )
+    seconds = time_ms / 1000.0
+    return ComputeMetrics(
+        time_ms=time_ms,
+        energy_j=energy_j,
+        tflops=flops / seconds / 1e12,
+        memory_bandwidth_gbps=logical_bytes / seconds / 1e9,
+    )
