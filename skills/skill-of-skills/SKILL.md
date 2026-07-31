@@ -82,6 +82,7 @@ operate-profile-existing-kernel - query or fill registered profiler rows
 dev-create-worktree - create an VibeSim development worktree
 dev-orchestrate-parallel-subagents - isolate concurrent writing subagents
 dev-run-tests - select and run VibeSim test tiers
+dev-compose-worker - plan, estimate, implement, compose, and review production L5 workers against the four-axis ownership rules
 dev-file-design-review - review one file against docs and contracts
 dev-present-changes-for-review - organize a diff for human review
 dev-llm-serving - implement or review real LLM/multimodal serving framework code using the copied models/algorithms/backends/frameworks/hardware/engines/tooling reference library
