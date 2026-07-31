@@ -23,7 +23,7 @@ from profiling.kernels.dsa_sparse_mla_attention import (
 from profiling.runners.attention.dsa_sparse_mla_attention_reference import (
     dsa_sparse_mla_attention_reference,
 )
-from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
+from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 
 _BASE_SPEC = {
     "num_queries": 1,
@@ -86,21 +86,29 @@ def test_args_field_order_and_coercion() -> None:
 
 
 def test_registration_support_family_environment_and_facades() -> None:
-    spec = find_kernel_profiler_spec(KIND, "torch")
+    torch_spec = find_kernel_profiler_spec(KIND, "torch")
+    flashmla_spec = find_kernel_profiler_spec(KIND, "vllm_flashmla_bf16")
 
     assert KIND == "dsa_sparse_mla_attention"
-    assert known_backends(KIND) == ["torch"]
-    assert spec.kernel_kind == spec.table_name == KIND
-    assert spec.args_schema is DsaSparseMlaAttentionArgs
-    assert spec.metric_family is MetricFamily.COMPUTE
-    assert spec.batch_outlier_policy == BatchOutlierPolicy()
-    assert spec.subprocess_env is None
-    assert spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.FP32, DType.BF16, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.BF16, DType.FP32, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA H100")
-    assert spec.runner_ref.module_name == ("profiling.runners.attention.dsa_sparse_mla_attention")
-    assert spec.runner_ref.function_name == "profile_dsa_sparse_mla_attention_torch"
+    assert known_backends(KIND) == ["torch", "vllm_flashmla_bf16"]
+    for spec in (torch_spec, flashmla_spec):
+        assert spec.kernel_kind == spec.table_name == KIND
+        assert spec.args_schema is DsaSparseMlaAttentionArgs
+        assert spec.metric_family is MetricFamily.COMPUTE
+        assert spec.batch_outlier_policy == BatchOutlierPolicy()
+        assert spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA H200")
+        assert not spec.supports.allows(DType.FP32, DType.BF16, gpu="NVIDIA H200")
+        assert not spec.supports.allows(DType.BF16, DType.FP32, gpu="NVIDIA H200")
+        assert not spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA H100")
+        assert spec.runner_ref.module_name == (
+            "profiling.runners.attention.dsa_sparse_mla_attention"
+        )
+    assert torch_spec.subprocess_env is None
+    assert torch_spec.runner_ref.function_name == "profile_dsa_sparse_mla_attention_torch"
+    assert flashmla_spec.subprocess_env == "vllm_env"
+    assert flashmla_spec.runner_ref.function_name == (
+        "profile_dsa_sparse_mla_attention_vllm_flashmla_bf16"
+    )
     assert hasattr(perf_api, "get_dsa_sparse_mla_attention_times")
     assert hasattr(perf_api, "count_missing_dsa_sparse_mla_attention")
 
@@ -113,9 +121,12 @@ def test_registry_and_runner_ref_imports_are_lazy() -> None:
             (
                 "import sys; import profiling.kernels; "
                 "from profiling.db.registry import find_kernel_profiler_spec; "
-                "runner = find_kernel_profiler_spec("
+                "torch_runner = find_kernel_profiler_spec("
                 "'dsa_sparse_mla_attention', 'torch').runner_ref.load(); "
-                "print(runner.__module__); print(runner.__name__); "
+                "flash_runner = find_kernel_profiler_spec("
+                "'dsa_sparse_mla_attention', 'vllm_flashmla_bf16').runner_ref.load(); "
+                "print(torch_runner.__module__); print(torch_runner.__name__); "
+                "print(flash_runner.__module__); print(flash_runner.__name__); "
                 "print('torch' in sys.modules); print('vllm' in sys.modules)"
             ),
         ],
@@ -126,6 +137,8 @@ def test_registry_and_runner_ref_imports_are_lazy() -> None:
     assert completed.stdout.splitlines() == [
         "profiling.runners.attention.dsa_sparse_mla_attention",
         "profile_dsa_sparse_mla_attention_torch",
+        "profiling.runners.attention.dsa_sparse_mla_attention",
+        "profile_dsa_sparse_mla_attention_vllm_flashmla_bf16",
         "False",
         "False",
     ]
@@ -321,6 +334,192 @@ def test_cuda_and_gpu_support_failures_are_typed() -> None:
     )
     with pytest.raises(ProfilerNotImplemented, match="requires NVIDIA H200"):
         _require_h200(h100)
+
+
+def test_flashmla_loader_is_lazy_and_typed(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    def sentinel():
+        return None
+
+    monkeypatch.setattr(
+        runner.importlib,
+        "import_module",
+        lambda name: (
+            SimpleNamespace(flash_mla_sparse_fwd=sentinel)
+            if name == "vllm.v1.attention.ops.flashmla"
+            else None
+        ),
+    )
+    assert runner._load_flashmla_sparse_fwd() is sentinel
+
+    def unavailable(_name):
+        raise ModuleNotFoundError("vllm")
+
+    monkeypatch.setattr(runner.importlib, "import_module", unavailable)
+    with pytest.raises(ProfilerNotImplemented, match="vllm_env with packaged FlashMLA"):
+        runner._load_flashmla_sparse_fwd()
+
+    monkeypatch.setattr(runner.importlib, "import_module", lambda _name: SimpleNamespace())
+    with pytest.raises(ProfilerNotImplemented, match="flash_mla_sparse_fwd"):
+        runner._load_flashmla_sparse_fwd()
+
+
+def test_flashmla_layout_validator_accepts_production_aligned_views() -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    q_backing = torch.empty((2, 64, 600), dtype=torch.bfloat16)
+    cache_backing = torch.empty((2049, 1, 600), dtype=torch.bfloat16)
+    indices_backing = torch.empty((2, 1, 2051), dtype=torch.int32)
+    operands = runner._Operands(
+        q=q_backing[..., 8:584],
+        cache=cache_backing[..., 8:584],
+        selected_indices=indices_backing[..., 3:2051],
+    )
+    assert operands.q.data_ptr() % 16 == operands.cache.data_ptr() % 16 == 0
+    assert operands.selected_indices.data_ptr() % 16 == 12
+    assert all(stride * operands.q.element_size() % 16 == 0 for stride in operands.q.stride()[:-1])
+    assert all(
+        stride * operands.cache.element_size() % 16 == 0 for stride in operands.cache.stride()[:-1]
+    )
+    assert operands.selected_indices.stride(0) * operands.selected_indices.element_size() % 16
+    runner._validate_flashmla_layouts(operands)
+
+    contiguous = runner._Operands(
+        q=torch.empty((2, 64, 576), dtype=torch.bfloat16),
+        cache=torch.empty((2049, 1, 576), dtype=torch.bfloat16),
+        selected_indices=torch.empty((2, 1, 2048), dtype=torch.int32),
+    )
+    runner._validate_flashmla_layouts(contiguous)
+
+
+@pytest.mark.parametrize("operand_name", ["q", "cache"])
+def test_flashmla_layout_validator_rejects_misaligned_base(operand_name) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    q = torch.empty((2, 64, 584), dtype=torch.bfloat16)[..., 1:577]
+    cache = torch.empty((2049, 1, 584), dtype=torch.bfloat16)[..., 1:577]
+    operands = runner._Operands(
+        q=q if operand_name == "q" else torch.empty((2, 64, 576), dtype=torch.bfloat16),
+        cache=(
+            cache if operand_name == "cache" else torch.empty((2049, 1, 576), dtype=torch.bfloat16)
+        ),
+        selected_indices=torch.empty((2, 1, 2048), dtype=torch.int32),
+    )
+    with pytest.raises(KernelLaunchFailed, match=rf"{operand_name} base address"):
+        runner._validate_flashmla_layouts(operands)
+
+
+@pytest.mark.parametrize("operand_name", ["q", "cache"])
+def test_flashmla_layout_validator_rejects_non_tma_outer_stride(operand_name) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    operands = runner._Operands(
+        q=(
+            torch.empty((2, 64, 577), dtype=torch.bfloat16)[..., :576]
+            if operand_name == "q"
+            else torch.empty((2, 64, 576), dtype=torch.bfloat16)
+        ),
+        cache=(
+            torch.empty((2049, 1, 577), dtype=torch.bfloat16)[..., :576]
+            if operand_name == "cache"
+            else torch.empty((2049, 1, 576), dtype=torch.bfloat16)
+        ),
+        selected_indices=torch.empty((2, 1, 2048), dtype=torch.int32),
+    )
+    with pytest.raises(KernelLaunchFailed, match=rf"{operand_name} outer byte stride"):
+        runner._validate_flashmla_layouts(operands)
+
+
+def test_flashmla_layout_validator_rejects_noncontiguous_indices_inner_stride() -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    operands = runner._Operands(
+        q=torch.empty((2, 64, 576), dtype=torch.bfloat16),
+        cache=torch.empty((2049, 1, 576), dtype=torch.bfloat16),
+        selected_indices=torch.empty((2, 1, 4096), dtype=torch.int32)[..., ::2],
+    )
+    with pytest.raises(KernelLaunchFailed, match="selected_indices final stride"):
+        runner._validate_flashmla_layouts(operands)
+
+
+def test_flashmla_correctness_checks_tuple_diagnostics_and_exact_forwarding(
+    monkeypatch,
+) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    monkeypatch.setattr(runner, "_NUM_HEADS", 2)
+    q = torch.linspace(-0.5, 0.5, 3 * 2 * 576).reshape(3, 2, 576).to(torch.bfloat16)
+    cache = torch.linspace(-0.6, 0.7, 5 * 576).reshape(5, 1, 576).to(torch.bfloat16)
+    indices = torch.tensor(
+        [[[-1, -2, 5, 99]], [[0, -1, -1, -1]], [[0, 1, 2, 3]]],
+        dtype=torch.int32,
+    )
+    operands = runner._Operands(q=q, cache=cache, selected_indices=indices)
+    calls: list[tuple] = []
+
+    def fake_flash(*args):
+        calls.append(args)
+        output = dsa_sparse_mla_attention_reference(q, cache, indices, softmax_scale=0.0625)
+        max_logits = torch.zeros((3, 2), dtype=torch.float32)
+        lse = torch.zeros((3, 2), dtype=torch.float32)
+        max_logits[0] = float("-inf")
+        lse[0] = float("inf")
+        return output, max_logits, lse
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    runner._check_flashmla_correctness(torch, fake_flash, operands, softmax_scale=0.0625)
+    assert len(calls) == 2
+    for call in calls:
+        assert call == (q, cache, indices, 0.0625, 512, None, None)
+
+
+def test_flashmla_correctness_rejects_bad_all_invalid_diagnostics(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    monkeypatch.setattr(runner, "_NUM_HEADS", 1)
+    q = torch.zeros((1, 1, 576), dtype=torch.bfloat16)
+    cache = torch.zeros((1, 1, 576), dtype=torch.bfloat16)
+    indices = torch.full((1, 1, 4), -1, dtype=torch.int32)
+    operands = runner._Operands(q=q, cache=cache, selected_indices=indices)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    def bad_diagnostics(*_args):
+        return (
+            torch.zeros((1, 1, 512), dtype=torch.bfloat16),
+            torch.zeros((1, 1), dtype=torch.float32),
+            torch.zeros((1, 1), dtype=torch.float32),
+        )
+
+    with pytest.raises(AssertionError, match="max_logits=-inf"):
+        runner._check_flashmla_correctness(torch, bad_diagnostics, operands, softmax_scale=0.0625)
+
+
+def test_flashmla_correctness_rejects_output_input_alias(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+    from profiling.runners.attention import dsa_sparse_mla_attention_reference as reference
+
+    monkeypatch.setattr(runner, "_NUM_HEADS", 1)
+    q = torch.zeros((1, 1, 576), dtype=torch.bfloat16)
+    cache = torch.zeros((1, 1, 576), dtype=torch.bfloat16)
+    indices = torch.zeros((1, 1, 4), dtype=torch.int32)
+    operands = runner._Operands(q=q, cache=cache, selected_indices=indices)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        reference,
+        "dsa_sparse_mla_attention_reference",
+        lambda *_args, **_kwargs: q[..., :512],
+    )
+
+    def aliasing_native(*_args):
+        return (
+            q[..., :512],
+            torch.zeros((1, 1), dtype=torch.float32),
+            torch.zeros((1, 1), dtype=torch.float32),
+        )
+
+    with pytest.raises(AssertionError, match="aliases an input"):
+        runner._check_flashmla_correctness(torch, aliasing_native, operands, softmax_scale=0.0625)
 
 
 @pytest.mark.parametrize(
@@ -543,3 +742,146 @@ def test_profile_translates_runtime_failures(monkeypatch) -> None:
     with pytest.raises(KernelLaunchFailed, match="composite failed") as exc_info:
         runner.profile_dsa_sparse_mla_attention_torch(**_BASE_SPEC)
     assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_flashmla_profile_times_only_native_callable_and_reuses_accounting(
+    monkeypatch,
+) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    operands = runner._Operands(q=object(), cache=object(), selected_indices=object())
+    returned = (object(), object(), object())
+    calls: list[object] = []
+
+    def fake_flash(*args):
+        calls.append(("flash", args))
+        return returned
+
+    monkeypatch.setattr(runner, "_require_h200", lambda *_args, **_kwargs: calls.append("gpu"))
+    monkeypatch.setattr(
+        runner, "_load_flashmla_sparse_fwd", lambda: calls.append("load") or fake_flash
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        runner, "_build_operands", lambda *_args, **_kwargs: calls.append("build") or operands
+    )
+    monkeypatch.setattr(
+        runner, "_validate_flashmla_layouts", lambda value: calls.append(("layout", value))
+    )
+    monkeypatch.setattr(
+        runner,
+        "_check_flashmla_correctness",
+        lambda *_args, **_kwargs: calls.append("correctness"),
+    )
+
+    def fake_timer(callable_, *, kernel_name):
+        calls.append(("timer", kernel_name))
+        assert callable_() is returned
+        return 2.0
+
+    def fake_energy(callable_, *, warmup, per_iter_time_ms):
+        calls.append(("energy", warmup, per_iter_time_ms))
+        assert callable_() is returned
+        return 0.25
+
+    monkeypatch.setattr(runner.Timer, "cupti", fake_timer)
+    monkeypatch.setattr(runner.Energy, "perf", fake_energy)
+    metrics = runner.profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(**_BASE_SPEC)
+
+    assert metrics.time_ms == 2.0
+    assert metrics.energy_j == 0.25
+    assert (
+        metrics.tflops
+        == runner._logical_flops(num_queries=1, num_heads=64, selected_k=2048) / 0.002 / 1e12
+    )
+    assert (
+        metrics.memory_bandwidth_gbps
+        == runner._logical_bytes(
+            num_queries=1,
+            num_heads=64,
+            selected_k=2048,
+            valid_counts=(2048,),
+        )
+        / 0.002
+        / 1e9
+    )
+    assert calls[:6] == [
+        "gpu",
+        "load",
+        "build",
+        ("layout", operands),
+        "correctness",
+        (
+            "timer",
+            "sparse_attn_fwd_kernel",
+        ),
+    ]
+    flash_calls = [entry for entry in calls if isinstance(entry, tuple) and entry[0] == "flash"]
+    assert len(flash_calls) == 2
+    for _, args in flash_calls:
+        assert args == (
+            operands.q,
+            operands.cache,
+            operands.selected_indices,
+            0.0625,
+            512,
+            None,
+            None,
+        )
+    assert ("energy", 5, 2.0) in calls
+
+
+def test_flashmla_profile_typed_failures(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    monkeypatch.setattr(runner, "_require_h200", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    def unavailable():
+        raise ProfilerNotImplemented("requires vllm_env")
+
+    monkeypatch.setattr(runner, "_load_flashmla_sparse_fwd", unavailable)
+    with pytest.raises(ProfilerNotImplemented, match="vllm_env"):
+        runner.profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(**_BASE_SPEC)
+
+    monkeypatch.setattr(runner, "_load_flashmla_sparse_fwd", lambda: object())
+    monkeypatch.setattr(
+        runner,
+        "_build_operands",
+        lambda *_args, **_kwargs: runner._Operands(
+            q=object(), cache=object(), selected_indices=object()
+        ),
+    )
+
+    def bad_layout(_operands):
+        raise KernelLaunchFailed("q base address divisible by 16")
+
+    monkeypatch.setattr(runner, "_validate_flashmla_layouts", bad_layout)
+    with pytest.raises(KernelLaunchFailed, match="q base address"):
+        runner.profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(**_BASE_SPEC)
+
+    monkeypatch.setattr(runner, "_validate_flashmla_layouts", lambda _operands: None)
+
+    def native_failure(*_args, **_kwargs):
+        raise RuntimeError("native synchronization failed")
+
+    monkeypatch.setattr(runner, "_check_flashmla_correctness", native_failure)
+    with pytest.raises(KernelLaunchFailed, match="native callable failed") as exc_info:
+        runner.profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(**_BASE_SPEC)
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
+def test_flashmla_profile_preserves_typed_oom(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    monkeypatch.setattr(runner, "_require_h200", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "_load_flashmla_sparse_fwd", lambda: object())
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    def out_of_memory(*_args, **_kwargs):
+        raise torch.OutOfMemoryError("capacity")
+
+    monkeypatch.setattr(runner, "_build_operands", out_of_memory)
+    with pytest.raises(OOMError, match="ran out of GPU memory") as exc_info:
+        runner.profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(**_BASE_SPEC)
+    assert isinstance(exc_info.value.__cause__, torch.OutOfMemoryError)

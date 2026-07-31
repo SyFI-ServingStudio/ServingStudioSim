@@ -7,6 +7,7 @@ setup launches remain outside this profiler kind.
 
 from __future__ import annotations
 
+import importlib
 import math
 import re
 from collections.abc import Sequence
@@ -16,7 +17,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
+from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _NUM_HEADS = 64
@@ -30,6 +31,11 @@ _SOFTMAX_SCALE = 0.0625
 _CACHE_LAYOUT = "token_major_mqa_bf16_latent_rope"
 _QUERY_CHUNK_SIZE = 8
 _CACHE_TEMPLATE_ROWS = 64
+_FLASHMLA_BACKEND = "dsa_sparse_mla_attention:vllm_flashmla_bf16"
+_FLASHMLA_KERNEL_NAME = "sparse_attn_fwd_kernel"
+_FLASHMLA_ATOL = 8e-4
+_FLASHMLA_RTOL = 3.01 / 128
+_FLASHMLA_COSINE_LIMIT = 7e-6
 
 _UINT = r"(?:0|[1-9][0-9]*)"
 _UNIFORM_RE = re.compile(rf"u:({_UINT})x({_UINT})\Z")
@@ -244,14 +250,28 @@ def _validate_args(
     )
 
 
-def _require_h200(torch: Any) -> None:
+def _require_h200(torch: Any, *, backend: str = "dsa_sparse_mla_attention:torch") -> None:
     if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for dsa_sparse_mla_attention:torch")
+        raise ProfilerNotImplemented(f"CUDA is required for {backend}")
     gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
     if gpu_name != "NVIDIA H200":
+        raise ProfilerNotImplemented(f"{backend} requires NVIDIA H200, got {gpu_name!r}")
+
+
+def _load_flashmla_sparse_fwd() -> Any:
+    """Load the packaged FlashMLA callable only inside a vllm_env worker."""
+    try:
+        module = importlib.import_module("vllm.v1.attention.ops.flashmla")
+    except (ImportError, ModuleNotFoundError) as exc:
         raise ProfilerNotImplemented(
-            f"dsa_sparse_mla_attention:torch requires NVIDIA H200, got {gpu_name!r}"
+            f"{_FLASHMLA_BACKEND} requires vllm_env with packaged FlashMLA"
+        ) from exc
+    callable_ = getattr(module, "flash_mla_sparse_fwd", None)
+    if not callable(callable_):
+        raise ProfilerNotImplemented(
+            f"{_FLASHMLA_BACKEND} requires vllm.v1.attention.ops.flashmla.flash_mla_sparse_fwd"
         )
+    return callable_
 
 
 def _coprime_stride(size: int, preferred: int) -> int:
@@ -437,6 +457,147 @@ def _check_correctness(
             raise AssertionError("Torch composite output aliases an input")
 
 
+def _validate_flashmla_layouts(operands: _Operands) -> None:
+    """Reject layouts that violate the SM90 TMA/cp.async address contract."""
+
+    for name, tensor in (("q", operands.q), ("cache", operands.cache)):
+        if tensor.data_ptr() % 16:
+            raise KernelLaunchFailed(
+                f"{_FLASHMLA_BACKEND} requires {name} base address divisible by 16"
+            )
+        if tensor.stride(-1) != 1:
+            raise KernelLaunchFailed(f"{_FLASHMLA_BACKEND} requires {name} final stride to equal 1")
+        outer_byte_strides = tuple(
+            stride * tensor.element_size() for stride in tensor.stride()[:-1]
+        )
+        if any(stride % 16 for stride in outer_byte_strides):
+            raise KernelLaunchFailed(
+                f"{_FLASHMLA_BACKEND} requires every {name} outer byte stride "
+                f"to be divisible by 16, got {outer_byte_strides}"
+            )
+
+    indices = operands.selected_indices
+    if indices.stride(-1) != 1:
+        raise KernelLaunchFailed(
+            f"{_FLASHMLA_BACKEND} requires selected_indices final stride to equal 1"
+        )
+    if indices.data_ptr() % indices.element_size():
+        raise KernelLaunchFailed(
+            f"{_FLASHMLA_BACKEND} requires ordinary int32 alignment for selected_indices"
+        )
+
+
+def _check_flashmla_correctness(
+    torch: Any,
+    flash_mla_sparse_fwd: Any,
+    operands: _Operands,
+    *,
+    softmax_scale: float,
+) -> None:
+    """Validate the packaged one-launch BF16 callable before formal timing."""
+    from profiling.runners.attention.dsa_sparse_mla_attention_reference import (
+        dsa_sparse_mla_attention_reference,
+    )
+
+    snapshots = (
+        operands.q.clone(),
+        operands.cache.clone(),
+        operands.selected_indices.clone(),
+    )
+    input_pointers = {
+        operands.q.untyped_storage().data_ptr(),
+        operands.cache.untyped_storage().data_ptr(),
+        operands.selected_indices.untyped_storage().data_ptr(),
+    }
+
+    def invoke() -> tuple[Any, Any, Any]:
+        returned = flash_mla_sparse_fwd(
+            operands.q,
+            operands.cache,
+            operands.selected_indices,
+            softmax_scale,
+            _VALUE_DIM,
+            None,
+            None,
+        )
+        torch.cuda.synchronize()
+        if not isinstance(returned, (tuple, list)) or len(returned) != 3:
+            raise AssertionError("FlashMLA sparse forward must return output, max_logits, lse")
+        return returned[0], returned[1], returned[2]
+
+    output, max_logits, lse = invoke()
+    expected = dsa_sparse_mla_attention_reference(
+        operands.q,
+        operands.cache,
+        operands.selected_indices,
+        softmax_scale=softmax_scale,
+    )
+    expected_output_shape = (operands.q.shape[0], _NUM_HEADS, _VALUE_DIM)
+    expected_diagnostic_shape = (operands.q.shape[0], _NUM_HEADS)
+    if tuple(output.shape) != expected_output_shape or output.dtype is not torch.bfloat16:
+        raise AssertionError(
+            f"FlashMLA output must be BF16 {expected_output_shape}, "
+            f"got {output.dtype} {tuple(output.shape)}"
+        )
+    for name, tensor in (("max_logits", max_logits), ("lse", lse)):
+        if tuple(tensor.shape) != expected_diagnostic_shape or tensor.dtype is not torch.float32:
+            raise AssertionError(
+                f"FlashMLA {name} must be FP32 {expected_diagnostic_shape}, "
+                f"got {tensor.dtype} {tuple(tensor.shape)}"
+            )
+    if not torch.isfinite(output).all():
+        raise AssertionError("FlashMLA output must be finite for supported finite operands")
+    torch.testing.assert_close(
+        output.float(),
+        expected.float(),
+        atol=_FLASHMLA_ATOL,
+        rtol=_FLASHMLA_RTOL,
+    )
+    numerator = 2.0 * torch.sum(output.float() * expected.float()).item()
+    denominator = (
+        torch.sum(output.float().square()).item() + torch.sum(expected.float().square()).item()
+    )
+    cosine_difference = 0.0 if denominator == 0.0 else 1.0 - numerator / denominator
+    if abs(cosine_difference) > _FLASHMLA_COSINE_LIMIT:
+        raise AssertionError(
+            f"FlashMLA cosine difference {cosine_difference} exceeds {_FLASHMLA_COSINE_LIMIT}"
+        )
+
+    valid = (operands.selected_indices >= 0) & (operands.selected_indices < operands.cache.shape[0])
+    all_invalid = ~valid.any(dim=-1).squeeze(1)
+    if all_invalid.any():
+        if torch.count_nonzero(output[all_invalid]).item() != 0:
+            raise AssertionError("FlashMLA all-invalid rows must return exact zero output")
+        if not torch.isneginf(max_logits[all_invalid]).all():
+            raise AssertionError("FlashMLA all-invalid rows must return max_logits=-inf")
+        if not torch.isposinf(lse[all_invalid]).all():
+            raise AssertionError("FlashMLA all-invalid rows must return lse=+inf")
+    nonempty = ~all_invalid
+    if nonempty.any() and not (
+        torch.isfinite(max_logits[nonempty]).all() and torch.isfinite(lse[nonempty]).all()
+    ):
+        raise AssertionError("FlashMLA diagnostics must be finite for nonempty finite rows")
+
+    repeated = invoke()
+    if not all(
+        torch.equal(first, second)
+        for first, second in zip((output, max_logits, lse), repeated, strict=True)
+    ):
+        raise AssertionError("FlashMLA repeated calls must be deterministic")
+    for name, tensor, snapshot in zip(
+        ("q", "cache", "selected_indices"),
+        (operands.q, operands.cache, operands.selected_indices),
+        snapshots,
+        strict=True,
+    ):
+        if not torch.equal(tensor, snapshot):
+            raise AssertionError(f"FlashMLA mutated {name}")
+    outputs = (output, max_logits, lse, *repeated)
+    output_pointers = [tensor.untyped_storage().data_ptr() for tensor in outputs]
+    if input_pointers.intersection(output_pointers):
+        raise AssertionError("FlashMLA output aliases an input")
+
+
 def _logical_flops(*, num_queries: int, num_heads: int, selected_k: int) -> int:
     return 2 * num_queries * num_heads * selected_k * (_SCORE_DIM + _VALUE_DIM)
 
@@ -521,6 +682,107 @@ def profile_dsa_sparse_mla_attention_torch(
         raise
     except Exception as exc:
         raise KernelLaunchFailed("dsa_sparse_mla_attention:torch composite failed") from exc
+
+    flops = _logical_flops(num_queries=num_queries, num_heads=num_heads, selected_k=selected_k)
+    logical_bytes = _logical_bytes(
+        num_queries=num_queries,
+        num_heads=num_heads,
+        selected_k=selected_k,
+        valid_counts=validated.valid_counts,
+    )
+    seconds = time_ms / 1000.0
+    return ComputeMetrics(
+        time_ms=time_ms,
+        energy_j=energy_j,
+        tflops=flops / seconds / 1e12,
+        memory_bandwidth_gbps=logical_bytes / seconds / 1e9,
+    )
+
+
+def profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(
+    *,
+    num_queries: int,
+    num_cache_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    selected_k: int,
+    latent_dim: int,
+    rope_dim: int,
+    value_dim: int,
+    softmax_scale: float,
+    q_dtype: DType | str,
+    cache_dtype: DType | str,
+    index_dtype: str,
+    output_dtype: DType | str,
+    valid_counts: str,
+    index_distribution: str,
+    cache_layout: str,
+) -> ComputeMetrics:
+    """Profile the packaged one-launch FlashMLA BF16 sparse forward callable."""
+    validated = _validate_args(
+        num_queries=num_queries,
+        num_cache_tokens=num_cache_tokens,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        selected_k=selected_k,
+        latent_dim=latent_dim,
+        rope_dim=rope_dim,
+        value_dim=value_dim,
+        softmax_scale=softmax_scale,
+        q_dtype=q_dtype,
+        cache_dtype=cache_dtype,
+        index_dtype=index_dtype,
+        output_dtype=output_dtype,
+        valid_counts=valid_counts,
+        index_distribution=index_distribution,
+        cache_layout=cache_layout,
+    )
+
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise ProfilerNotImplemented(f"{_FLASHMLA_BACKEND} requires PyTorch in vllm_env") from exc
+
+    try:
+        _require_h200(torch, backend=_FLASHMLA_BACKEND)
+        flash_mla_sparse_fwd = _load_flashmla_sparse_fwd()
+        device = torch.device("cuda", torch.cuda.current_device())
+        operands = _build_operands(torch, validated, device=device)
+        # q is consumed through SM90 TMA and cache through 16-byte cp.async;
+        # the profiler constructs aligned storage and never realigns in timing.
+        _validate_flashmla_layouts(operands)
+        _check_flashmla_correctness(
+            torch,
+            flash_mla_sparse_fwd,
+            operands,
+            softmax_scale=float(softmax_scale),
+        )
+
+        latest_native_tuple: tuple[Any, Any, Any] | list[Any] | None = None
+
+        def kernel() -> Any:
+            nonlocal latest_native_tuple
+            latest_native_tuple = flash_mla_sparse_fwd(
+                operands.q,
+                operands.cache,
+                operands.selected_indices,
+                float(softmax_scale),
+                _VALUE_DIM,
+                None,
+                None,
+            )
+            return latest_native_tuple
+
+        time_ms = Timer.cupti(kernel, kernel_name=_FLASHMLA_KERNEL_NAME)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except ProfilerNotImplemented:
+        raise
+    except KernelLaunchFailed:
+        raise
+    except torch.OutOfMemoryError as exc:
+        raise OOMError(f"{_FLASHMLA_BACKEND} ran out of GPU memory") from exc
+    except Exception as exc:
+        raise KernelLaunchFailed(f"{_FLASHMLA_BACKEND} native callable failed") from exc
 
     flops = _logical_flops(num_queries=num_queries, num_heads=num_heads, selected_k=selected_k)
     logical_bytes = _logical_bytes(
