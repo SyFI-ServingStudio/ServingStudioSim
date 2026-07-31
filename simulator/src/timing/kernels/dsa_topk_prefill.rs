@@ -1,11 +1,12 @@
 //! GLM-5.2 DSA prefill top-k kernel.
 //!
-//! The first cache stays on physical `(num_queries, num_keys)` coordinates and
+//! The cache stays on physical `(num_queries, num_keys)` coordinates and
 //! brackets the observed row-wave, work-tile, and semantic top-k boundaries.
-//! Python's `logits_row_stride` is derived from `num_keys` during enumeration:
-//! this preserves the public physical query while reproducing the padded
-//! DeepGEMM-logits layout consumed by the production top-k kernel. R.4 will
-//! determine whether this conservative physical grid needs remediation.
+//! Measured R.4 evidence added the shared 1448 diagonal, paired M=2047 with the
+//! existing N=2047 point, and extended N to 131072 to bound the tested key-axis
+//! extrapolation. This changes neither the cache algorithm nor the public query
+//! contract. Python's `logits_row_stride` remains derived from `num_keys` during
+//! enumeration to reproduce the padded DeepGEMM-logits layout.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -44,11 +45,11 @@ impl KernelSpec for DsaTopkPrefillSpec {
         SweepGrid::new(vec![
             Axis::values([
                 1, 2, 4, 8, 16, 32, 64, 127, 128, 129, 131, 132, 133, 255, 256, 257, 512, 1024,
-                2048, 4096,
+                1448, 2047, 2048, 4096,
             ]),
             Axis::values([
-                1, 2, 4, 8, 16, 32, 64, 128, 255, 256, 257, 512, 1024, 2047, 2048, 2049, 4096,
-                8192, 16384, 32768, 65536,
+                1, 2, 4, 8, 16, 32, 64, 128, 255, 256, 257, 512, 1024, 1448, 2047, 2048, 2049,
+                4096, 8192, 16384, 32768, 65536, 131072,
             ]),
         ])
     }
@@ -107,11 +108,11 @@ mod tests {
     const VLLM_BACKEND: &str = "vllm_cuda";
     const QUERY_AXIS: &[f64] = &[
         1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 127.0, 128.0, 129.0, 131.0, 132.0, 133.0, 255.0,
-        256.0, 257.0, 512.0, 1024.0, 2048.0, 4096.0,
+        256.0, 257.0, 512.0, 1024.0, 1448.0, 2047.0, 2048.0, 4096.0,
     ];
     const KEY_AXIS: &[f64] = &[
-        1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 255.0, 256.0, 257.0, 512.0, 1024.0, 2047.0,
-        2048.0, 2049.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0,
+        1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 255.0, 256.0, 257.0, 512.0, 1024.0, 1448.0,
+        2047.0, 2048.0, 2049.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0,
     ];
 
     fn config() -> DsaTopkPrefillKernelConfig {
@@ -183,20 +184,22 @@ mod tests {
         assert_eq!(axes.len(), 2);
         assert_eq!(axes[0], QUERY_AXIS);
         assert_eq!(axes[1], KEY_AXIS);
-        assert_eq!(axes[0].len(), 20);
-        assert_eq!(axes[1].len(), 21);
+        assert_eq!(axes[0].len(), 22);
+        assert_eq!(axes[1].len(), 23);
         assert!(axes[0].windows(2).all(|pair| pair[0] < pair[1]));
         assert!(axes[1].windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(&axes[0][7..10], &[127.0, 128.0, 129.0]);
         assert_eq!(&axes[0][10..13], &[131.0, 132.0, 133.0]);
         assert_eq!(&axes[0][13..16], &[255.0, 256.0, 257.0]);
+        assert_eq!(&axes[0][17..21], &[1024.0, 1448.0, 2047.0, 2048.0]);
         assert_eq!(&axes[1][8..11], &[255.0, 256.0, 257.0]);
-        assert_eq!(&axes[1][13..16], &[2047.0, 2048.0, 2049.0]);
+        assert_eq!(&axes[1][12..17], &[1024.0, 1448.0, 2047.0, 2048.0, 2049.0]);
+        assert_eq!(&axes[1][21..23], &[65536.0, 131072.0]);
         assert_eq!(axes[0].first(), Some(&1.0));
         assert_eq!(axes[0].last(), Some(&4096.0));
         assert_eq!(axes[1].first(), Some(&1.0));
-        assert_eq!(axes[1].last(), Some(&65536.0));
-        assert_eq!(axes[0].len() * axes[1].len(), 420);
+        assert_eq!(axes[1].last(), Some(&131072.0));
+        assert_eq!(axes[0].len() * axes[1].len(), 506);
     }
 
     #[test]
@@ -206,9 +209,9 @@ mod tests {
         let mask = DsaTopkPrefillSpec::infeasible_mask(&cfg, &grid);
         let key_count = grid.axes()[1].len();
 
-        assert_eq!(mask.len(), 420);
-        assert_eq!(mask.iter().filter(|&&masked| masked).count(), 147);
-        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 273);
+        assert_eq!(mask.len(), 506);
+        assert_eq!(mask.iter().filter(|&&masked| masked).count(), 176);
+        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 330);
 
         let masked = |m: f64, n: f64| {
             let i = grid.axes()[0].iter().position(|&value| value == m).unwrap();
@@ -218,7 +221,13 @@ mod tests {
         assert!(!masked(1.0, 1.0));
         assert!(!masked(128.0, 128.0));
         assert!(!masked(128.0, 2048.0));
+        assert!(masked(1448.0, 1024.0));
+        assert!(!masked(1448.0, 1448.0));
+        assert!(!masked(1448.0, 2047.0));
+        assert!(masked(2047.0, 1448.0));
+        assert!(!masked(2047.0, 2047.0));
         assert!(!masked(4096.0, 65536.0));
+        assert!(!masked(4096.0, 131072.0));
         assert!(masked(2.0, 1.0));
         assert!(masked(129.0, 128.0));
         assert!(masked(4096.0, 2049.0));
@@ -244,6 +253,7 @@ mod tests {
         assert_eq!(logits_row_stride(4096), 4352);
         assert_eq!(logits_row_stride(8192), 8448);
         assert_eq!(logits_row_stride(65536), 65792);
+        assert_eq!(logits_row_stride(131072), 131328);
     }
 
     #[test]
@@ -252,7 +262,7 @@ mod tests {
         let grid = DsaTopkPrefillSpec::sweep_grid(&cfg);
         let payloads = DsaTopkPrefillSpec::enumerate(&cfg, &grid, VLLM_BACKEND);
 
-        assert_eq!(payloads.len(), 420);
+        assert_eq!(payloads.len(), 506);
         let expected_names = [
             "backend",
             "index_dtype",
@@ -292,7 +302,21 @@ mod tests {
             8192,
             8448,
         );
-        assert_payload(payloads.last().unwrap(), VLLM_BACKEND, 4096, 65536, 65792);
+        assert_payload(
+            payload_for(&payloads, &grid, 1448, 1448),
+            VLLM_BACKEND,
+            1448,
+            1448,
+            1792,
+        );
+        assert_payload(
+            payload_for(&payloads, &grid, 2047, 2047),
+            VLLM_BACKEND,
+            2047,
+            2047,
+            2304,
+        );
+        assert_payload(payloads.last().unwrap(), VLLM_BACKEND, 4096, 131072, 131328);
     }
 
     fn payload_for<'a>(
