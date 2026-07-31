@@ -5,6 +5,7 @@ pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
 pub mod dsa_index_cache_append;
 pub mod dsa_mqa_logits_prefill;
+pub mod dsa_paged_mqa_logits_decode;
 pub mod elementwise;
 pub mod engine;
 pub mod flashinfer_attn_decode;
@@ -38,6 +39,10 @@ pub use dsa_index_cache_append::{
 pub use dsa_mqa_logits_prefill::{
     DsaMqaLogitsPrefillKernel, DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput,
     DsaMqaLogitsPrefillSpec,
+};
+pub use dsa_paged_mqa_logits_decode::{
+    DsaPagedMqaLogitsDecodeKernel, DsaPagedMqaLogitsDecodeKernelConfig,
+    DsaPagedMqaLogitsDecodeKernelInput, DsaPagedMqaLogitsDecodeSpec,
 };
 pub use elementwise::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ElementwiseSpec,
