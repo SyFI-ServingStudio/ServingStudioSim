@@ -1,9 +1,10 @@
 //! GLM-5.2 DSA prefill MQA-logits kernel.
 //!
 //! The cache stays on the physical `(num_queries, num_keys)` coordinates for
-//! the first implementation. DeepGEMM's two-query and 256-key schedule may
-//! create interpolation boundaries within that space; the adjacent sweep
-//! points below preserve those boundaries for the later fidelity gate.
+//! the first implementation. The measured R.4 gate missed at `(363, 363)`
+//! (cache/truth ratio 0.85575) and `(363, 2896)` (ratio 0.73969), so the shared
+//! 363 boundary below targets both the masked diagonal and interior M=363 miss
+//! without changing the public query contract or cache algorithm.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -47,11 +48,11 @@ impl KernelSpec for DsaMqaLogitsPrefillSpec {
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
         SweepGrid::new(vec![
             Axis::values([
-                1, 2, 3, 4, 8, 16, 32, 64, 127, 128, 129, 255, 256, 257, 512, 1024, 2048, 4096,
+                1, 2, 3, 4, 8, 16, 32, 64, 127, 128, 129, 255, 256, 257, 363, 512, 1024, 2048, 4096,
             ]),
             Axis::values([
-                1, 2, 4, 8, 16, 32, 64, 128, 255, 256, 257, 512, 1024, 2048, 4096, 8192, 16384,
-                32768, 65536,
+                1, 2, 4, 8, 16, 32, 64, 128, 255, 256, 257, 363, 512, 1024, 2048, 4096, 8192,
+                16384, 32768, 65536,
             ]),
         ])
     }
@@ -107,12 +108,12 @@ mod tests {
     const TORCH_BACKEND: &str = "torch";
     const DEEPGEMM_BACKEND: &str = "vllm_deepgemm_fp8";
     const QUERY_AXIS: &[f64] = &[
-        1.0, 2.0, 3.0, 4.0, 8.0, 16.0, 32.0, 64.0, 127.0, 128.0, 129.0, 255.0, 256.0, 257.0, 512.0,
-        1024.0, 2048.0, 4096.0,
+        1.0, 2.0, 3.0, 4.0, 8.0, 16.0, 32.0, 64.0, 127.0, 128.0, 129.0, 255.0, 256.0, 257.0, 363.0,
+        512.0, 1024.0, 2048.0, 4096.0,
     ];
     const KEY_AXIS: &[f64] = &[
-        1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 255.0, 256.0, 257.0, 512.0, 1024.0, 2048.0,
-        4096.0, 8192.0, 16384.0, 32768.0, 65536.0,
+        1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 255.0, 256.0, 257.0, 363.0, 512.0, 1024.0,
+        2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0,
     ];
 
     fn config() -> DsaMqaLogitsPrefillKernelConfig {
@@ -210,17 +211,19 @@ mod tests {
         assert_eq!(axes.len(), 2);
         assert_eq!(axes[0], QUERY_AXIS);
         assert_eq!(axes[1], KEY_AXIS);
-        assert_eq!(axes[0].len(), 18);
-        assert_eq!(axes[1].len(), 19);
+        assert_eq!(axes[0].len(), 19);
+        assert_eq!(axes[1].len(), 20);
         assert!(axes[0].windows(2).all(|pair| pair[0] < pair[1]));
         assert!(axes[1].windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(&axes[0][..3], &[1.0, 2.0, 3.0]);
         assert_eq!(&axes[0][8..11], &[127.0, 128.0, 129.0]);
         assert_eq!(&axes[0][11..14], &[255.0, 256.0, 257.0]);
         assert_eq!(&axes[1][8..11], &[255.0, 256.0, 257.0]);
+        assert_eq!(&axes[0][13..16], &[257.0, 363.0, 512.0]);
+        assert_eq!(&axes[1][10..13], &[257.0, 363.0, 512.0]);
         assert_eq!(axes[0].last(), Some(&4096.0));
         assert_eq!(axes[1].last(), Some(&65536.0));
-        assert_eq!(axes[0].len() * axes[1].len(), 342);
+        assert_eq!(axes[0].len() * axes[1].len(), 380);
     }
 
     #[test]
@@ -230,9 +233,9 @@ mod tests {
         let mask = DsaMqaLogitsPrefillSpec::infeasible_mask(&cfg, &grid);
         let key_count = grid.axes()[1].len();
 
-        assert_eq!(mask.len(), 342);
-        assert_eq!(mask.iter().filter(|&&masked| masked).count(), 122);
-        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 220);
+        assert_eq!(mask.len(), 380);
+        assert_eq!(mask.iter().filter(|&&masked| masked).count(), 137);
+        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 243);
 
         let masked = |m: f64, n: f64| {
             let i = grid.axes()[0].iter().position(|&value| value == m).unwrap();
@@ -243,6 +246,10 @@ mod tests {
         assert!(!masked(128.0, 128.0));
         assert!(!masked(128.0, 4096.0));
         assert!(masked(2.0, 1.0));
+        assert!(masked(363.0, 257.0));
+        assert!(!masked(363.0, 363.0));
+        assert!(!masked(363.0, 512.0));
+        assert!(masked(512.0, 363.0));
         assert!(masked(4096.0, 2048.0));
     }
 
@@ -264,7 +271,7 @@ mod tests {
         let grid = DsaMqaLogitsPrefillSpec::sweep_grid(&cfg);
         let payloads = DsaMqaLogitsPrefillSpec::enumerate(&cfg, &grid, DEEPGEMM_BACKEND);
 
-        assert_eq!(payloads.len(), 342);
+        assert_eq!(payloads.len(), 380);
         let expected_names = [
             "backend",
             "clean_logits",
