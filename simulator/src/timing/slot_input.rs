@@ -17,7 +17,7 @@ use serde::Serialize;
 use crate::timing::kernels::{
     AllReduceKernelInput, AllReduceResidualRmsNormKernelInput, BatchedGemmKernelInput,
     DsaIndexCacheAppendKernelInput, DsaMqaLogitsPrefillKernelInput,
-    DsaPagedMqaLogitsDecodeKernelInput, ElementwiseKernelInput,
+    DsaPagedMqaLogitsDecodeKernelInput, DsaTopkPrefillKernelInput, ElementwiseKernelInput,
     FlashinferAttnDecodeKernelInput, FlashinferAttnRectKernelInput, Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemmKernelInput, Fp8PerTokenGroupQuantKernelInput, GroupedGemmKernelInput,
     KvCacheAppendKernelInput, MlaCacheAppendKernelInput, MoeFinalizeRoutingKernelInput,
@@ -71,6 +71,7 @@ log_inputs! {
     DsaIndexCacheAppend => DsaIndexCacheAppendKernelInput,
     DsaMqaLogitsPrefill => DsaMqaLogitsPrefillKernelInput,
     DsaPagedMqaLogitsDecode => DsaPagedMqaLogitsDecodeKernelInput,
+    DsaTopkPrefill => DsaTopkPrefillKernelInput,
     AllReduce   => AllReduceKernelInput,
     AllReduceResidualRmsNorm => AllReduceResidualRmsNormKernelInput,
     P2pIntra    => P2pIntraKernelInput,
