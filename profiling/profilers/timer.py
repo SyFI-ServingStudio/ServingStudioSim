@@ -27,9 +27,11 @@ _MIN_PER_ITER_MS = 1e-4
 # Duration-sized CUPTI defaults (see Timer.cupti). Ten real launches estimate
 # the formal count; one uninterrupted capture then records the full active-time
 # budget so capture restarts do not reset the workload's power/clock state.
+# The maximum is a real execution cap for ultra-short kernels, not an overflow
+# condition: reaching it trades active-window length for bounded profiling cost.
 _CUPTI_ESTIMATE_ITERS = 10
 _CUPTI_MIN_ITER = 20
-_CUPTI_MAX_ITER = 5_000_000
+_CUPTI_MAX_ITER = 50_000
 _CUPTI_MIN_DURATION_MS = 2_000
 
 
@@ -202,7 +204,8 @@ class Timer:
         in one uninterrupted formal capture. With ``clear_l2=True`` (default),
         a read-only 64 MiB reduction displaces L2 before every logical launch;
         its CUPTI records are excluded from the returned callable time.
-        ``min_rep`` is a launch-count floor and ``max_rep`` is a hard safety cap.
+        ``min_rep`` is a launch-count floor and ``max_rep`` caps the formal
+        launch count when the active-time estimate asks for more repetitions.
         Pass ``rep`` for the fixed-count median-of-three path instead.
 
         When a ``MeasureContext`` is active (only ever set by ``python -m profiling

@@ -200,7 +200,7 @@ def test_timer_cupti_default_estimates_then_captures_one_duration_window(
         True,
         2_000,
         20,
-        5_000_000,
+        50_000,
     )
     assert c["kernel_name_contains"] == "rmsnorm"
 
@@ -448,7 +448,7 @@ def test_cupti_duration_path_estimates_count_then_uses_one_formal_window(
     assert summary.mean_ms == 110.0
 
 
-def test_cupti_duration_path_rejects_estimated_count_above_cap(
+def test_cupti_duration_path_clamps_estimated_count_to_cap(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from profiling.profilers import cupti_kernel_profiler as cupti
@@ -456,25 +456,27 @@ def test_cupti_duration_path_rejects_estimated_count_above_cap(
     monkeypatch.setattr(cupti, "_require_torch", lambda: SimpleNamespace())
     pattern = cupti._LaunchPattern(callable_kernel_names=("gemm",), clear_kernel_names=())
     monkeypatch.setattr(cupti, "_prepare_launch_pattern", lambda *args, **kwargs: pattern)
-    monkeypatch.setattr(
-        cupti,
-        "_capture_launch_unit",
-        lambda *args, launches_per_run, **kwargs: (
-            [0.1] * launches_per_run,
-            {"gemm"},
-            [1] * launches_per_run,
-        ),
-    )
+    launch_counts: list[int] = []
+
+    def capture_unit(*args, launches_per_run, **kwargs):
+        del args, kwargs
+        launch_counts.append(launches_per_run)
+        return [0.1] * launches_per_run, {"gemm"}, [1] * launches_per_run
+
+    monkeypatch.setattr(cupti, "_capture_launch_unit", capture_unit)
     profiler = SimpleNamespace(clear_l2_bytes=0)
-    with pytest.raises(RuntimeError, match="exceeds max_iter"):
-        cupti.CuptiKernelProfiler.profile_for_duration(
-            profiler,
-            lambda: None,
-            estimate_iter=10,
-            min_duration_ms=2_000,
-            min_iter=20,
-            max_iter=100,
-        )
+    summary = cupti.CuptiKernelProfiler.profile_for_duration(
+        profiler,
+        lambda: None,
+        estimate_iter=10,
+        min_duration_ms=2_000,
+        min_iter=20,
+        max_iter=100,
+    )
+
+    assert launch_counts == [10, 100]
+    assert summary.num_iter == 100
+    assert summary.launches_per_run == 100
 
 
 def test_timer_cupti_rep_uses_fixed_path(monkeypatch: pytest.MonkeyPatch):

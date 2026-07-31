@@ -393,9 +393,7 @@ def split_launch_series(
                 "end_ns": max(record.end_ns for record in matched),
                 "duration_ms": sum(record.duration_ns for record in matched) / 1e6,
                 "kernel_count": len(matched),
-                "kernel_names": " | ".join(
-                    dict.fromkeys(record.name for record in matched)
-                ),
+                "kernel_names": " | ".join(dict.fromkeys(record.name for record in matched)),
             }
         )
 
@@ -662,7 +660,7 @@ class CuptiKernelProfiler:
         estimate_iter: int = 10,
         min_duration_ms: int = 2_000,
         min_iter: int = 20,
-        max_iter: int = 5_000_000,
+        max_iter: int = 50_000,
         clear_l2_before_run: bool = True,
         clear_l2_between_launches: bool = True,
         kernel_name_contains: str | None = None,
@@ -723,25 +721,22 @@ class CuptiKernelProfiler:
         if estimate_mean_ms <= 0:
             raise RuntimeError(f"CUPTI duration estimate must be positive, got {estimate_mean_ms}")
 
-        formal_iter = max(ceil(min_duration_ms / estimate_mean_ms), min_iter)
-        if formal_iter > max_iter:
-            raise RuntimeError(
-                "CUPTI estimated launch count exceeds max_iter: "
-                f"estimate_mean_ms={estimate_mean_ms:.9f}, "
-                f"min_duration_ms={min_duration_ms}, "
-                f"formal_iter={formal_iter}, max_iter={max_iter}"
-            )
+        estimated_iter = max(ceil(min_duration_ms / estimate_mean_ms), min_iter)
+        # ``max_iter`` is an execution-budget cap, not an error threshold. Very
+        # short kernels can otherwise turn a modest active-time target into
+        # millions of cold-L2 launches and CUPTI records. The capped sample is
+        # still a valid per-launch mean; it simply stops before exhausting the
+        # requested active-time budget.
+        formal_iter = min(estimated_iter, max_iter)
 
-        per_iter_ms, matched_kernel_names, matched_kernel_count_per_run = (
-            _capture_launch_unit(
-                self,
-                fn,
-                launches_per_run=formal_iter,
-                clear_l2_before_run=clear_l2_before_run,
-                clear_l2_between_launches=clear_l2_between_launches,
-                kernel_name_contains=kernel_name_contains,
-                launch_pattern=launch_pattern,
-            )
+        per_iter_ms, matched_kernel_names, matched_kernel_count_per_run = _capture_launch_unit(
+            self,
+            fn,
+            launches_per_run=formal_iter,
+            clear_l2_before_run=clear_l2_before_run,
+            clear_l2_between_launches=clear_l2_between_launches,
+            kernel_name_contains=kernel_name_contains,
+            launch_pattern=launch_pattern,
         )
         return KernelProfileSummary(
             matched_kernel_names=sorted(matched_kernel_names),
@@ -809,9 +804,7 @@ class CuptiKernelProfiler:
         )
         estimate_mean_ms = fmean(estimate_ms)
         if estimate_mean_ms <= 0:
-            raise RuntimeError(
-                f"CUPTI duration estimate must be positive, got {estimate_mean_ms}"
-            )
+            raise RuntimeError(f"CUPTI duration estimate must be positive, got {estimate_mean_ms}")
 
         duration_ms = duration_s * 1000.0
         formal_iter = max(ceil(duration_ms / estimate_mean_ms), min_iter)
@@ -854,9 +847,7 @@ class CuptiKernelProfiler:
             "clear_l2_before_run": clear_l2_before_run,
             "clear_l2_between_launches": clear_l2_between_launches,
             "clear_l2_bytes": self.clear_l2_bytes,
-            "gpu_kernel_span_s": (
-                cast(int, series[-1]["end_ns"]) - first_start_ns
-            ) / 1e9,
+            "gpu_kernel_span_s": (cast(int, series[-1]["end_ns"]) - first_start_ns) / 1e9,
         }
         return series, metadata
 
@@ -925,7 +916,7 @@ def profile_kernel_for_duration(
     estimate_iter: int = 10,
     min_duration_ms: int = 2_000,
     min_iter: int = 20,
-    max_iter: int = 5_000_000,
+    max_iter: int = 50_000,
     clear_l2_bytes: int | None = None,
     clear_l2_before_run: bool = True,
     clear_l2_between_launches: bool = True,

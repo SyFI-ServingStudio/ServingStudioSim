@@ -58,8 +58,10 @@ This is why `KernelKind` strings must match exactly across the boundary (below).
 first records 10 real callable launches, computes
 `ceil(min_duration_ms / estimate_mean_ms)`, then records exactly that many
 launches in one uninterrupted CUPTI activity window. The default budget is
-2000 ms; `min_rep` floors the formal launch count and `max_rep` is a hard safety
-cap. By default, both passes run a read-only reduction over a 64 MiB (or
+2000 ms; `min_rep` floors the formal launch count and `max_rep` caps it when the
+active-time estimate requests more launches. The default cap is 50,000 launches.
+By default, both passes run a
+read-only reduction over a 64 MiB (or
 `2 × reported L2`, whichever is larger) FP32 tensor before every logical
 callable launch. The reduction's CUPTI records validate ordering but are
 excluded from the callable time. This clean-line displacement avoids the dirty
