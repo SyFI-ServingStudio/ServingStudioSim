@@ -269,6 +269,36 @@ def _page_views(
     return key_view, scale_view
 
 
+def _cache_page_templates(
+    torch: Any,
+    *,
+    block_size: int,
+    head_dim: int,
+    device: str,
+) -> tuple[Any, Any]:
+    """Build deterministic page contents with storage independent of page count."""
+    key_template = _stable_values(
+        torch,
+        (block_size, head_dim),
+        phase=5,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    scale_template = (
+        0.75
+        + (
+            _stable_values(
+                torch,
+                (block_size,),
+                phase=13,
+                device=device,
+            )
+            + 0.5
+        )
+        / 4.0
+    )
+    return key_template, scale_template
+
+
 def _build_operands(
     torch: Any,
     *,
@@ -331,26 +361,17 @@ def _build_operands(
         block_size=block_size,
         head_dim=head_dim,
     )
-    key_view.copy_(
-        _stable_values(
-            torch,
-            (num_pages, block_size, head_dim),
-            phase=5,
-            device=device,
-        ).to(torch.float8_e4m3fn)
+    key_template, scale_template = _cache_page_templates(
+        torch,
+        block_size=block_size,
+        head_dim=head_dim,
+        device=device,
     )
-    scale_view.copy_(
-        0.75
-        + (
-            torch.arange(
-                num_pages * block_size,
-                dtype=torch.float32,
-                device=device,
-            ).reshape(num_pages, block_size)
-            % 7
-        )
-        / 16.0
-    )
+    # Page counts reach O(10^6) at the largest grid points. Never construct
+    # page-sized int64/FP32 initialization ramps; copy_ broadcasts these small
+    # templates directly into the exact production cache allocation.
+    key_view.copy_(key_template)
+    scale_view.copy_(scale_template)
 
     return _DsaPagedMqaLogitsDecodeOperands(
         q=q,

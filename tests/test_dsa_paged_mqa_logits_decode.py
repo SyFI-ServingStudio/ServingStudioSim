@@ -601,6 +601,54 @@ def test_operand_construction_exact_layout_and_scattered_pages(context_len):
     assert bool(torch.all(operands.scale_view > 0))
 
 
+def test_cache_initialization_uses_only_page_independent_templates(monkeypatch):
+    from profiling.runners.attention import dsa_paged_mqa_logits_decode as runner
+
+    stable_value_shapes = []
+    real_stable_values = runner._stable_values
+
+    def record_stable_values(torch_module, shape, *, phase, device):
+        stable_value_shapes.append(shape)
+        return real_stable_values(
+            torch_module,
+            shape,
+            phase=phase,
+            device=device,
+        )
+
+    monkeypatch.setattr(runner, "_stable_values", record_stable_values)
+    operands = runner._build_operands(
+        torch,
+        batch_size=3,
+        context_len=65,
+        next_n=1,
+        max_model_len=128,
+        num_heads=64,
+        head_dim=128,
+        block_size=64,
+        device="cpu",
+    )
+
+    num_pages = operands.cache.shape[0]
+    assert num_pages == 256
+    assert stable_value_shapes == [
+        (3, 1, 64, 128),
+        (3, 64),
+        (64, 128),
+        (64,),
+    ]
+    assert all(num_pages not in shape for shape in stable_value_shapes)
+
+    for page in [1, 17, num_pages - 1]:
+        assert torch.equal(operands.key_view[page], operands.key_view[0])
+        assert torch.equal(operands.scale_view[page], operands.scale_view[0])
+    assert bool(torch.any(operands.key_view[0].float() < 0))
+    assert bool(torch.any(operands.key_view[0].float() > 0))
+    assert bool(torch.isfinite(operands.scale_view).all())
+    assert bool(torch.all(operands.scale_view > 0))
+    assert operands.scale_view[0].unique().numel() > 1
+
+
 def test_page_plane_raw_byte_offsets():
     from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
         _build_operands,
