@@ -34,6 +34,7 @@ from .exec import (
     run_analysis,
     run_iter_breakdown,
 )
+from .managed_job import prepare_managed_job
 
 
 def _load_config(path: Path) -> dict:
@@ -79,6 +80,32 @@ def _snapshot_inputs(config_path: Path, cfg: dict, log_dir: Path) -> None:
         print(f"[warn] failed to snapshot predict inputs into {log_dir}: {e}", file=sys.stderr)
 
 
+def _predict_descriptor(config_path: Path, cfg: dict) -> dict:
+    """Build the small catalog descriptor without interpreting case semantics."""
+    arch = cfg.get("arch")
+    selector = next(iter(arch)) if isinstance(arch, dict) and len(arch) == 1 else None
+    descriptor = {
+        "selector": selector,
+        "configName": config_path.name,
+        "caseCount": _predict_case_count(config_path, cfg),
+    }
+    return {key: value for key, value in descriptor.items() if value is not None}
+
+
+def _predict_case_count(config_path: Path, cfg: dict) -> int | None:
+    cases_file = cfg.get("cases_file")
+    if not isinstance(cases_file, str) or not cases_file:
+        return None
+    cases_path = Path(cases_file)
+    if not cases_path.is_absolute():
+        cases_path = config_path.parent / cases_path
+    try:
+        payload = _load_config(cases_path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return len(payload) if isinstance(payload, list) else None
+
+
 async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
     """Run one already-built predictor config.
 
@@ -92,21 +119,47 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         # launcher-side log_dir to the same root so stdout.log + analysis line up.
         log_dir = REPO_ROOT / log_dir
 
-    _snapshot_inputs(config_path, cfg, log_dir)
+    descriptor = _predict_descriptor(config_path, cfg)
+    managed_job = prepare_managed_job(
+        "timing_predict",
+        log_dir,
+        descriptor=descriptor,
+    )
 
-    binary = binary_path(build_type)
-    argv = [str(binary), "timing-predict", str(config_path)]
-    runner = SimulationRunner(argv=argv, log_dir=log_dir, env=_build_subprocess_env())
-    ok = await runner.run()
-    if ok and analyze:
-        # Best-effort: `analyze trace` (the Perfetto tree) + `analyze run`. Cost
-        # subjects apply; request/throughput subjects self-skip on a predict dir.
-        await run_analysis(log_dir, build_type)
-        # Predict-only: the human-readable cost tree (reports/iter_breakdown.ans).
-        # Not in the shared run_analysis — a real run's thousands of iters would
-        # make that file enormous; a predict dir has only a few cases.
-        await run_iter_breakdown(log_dir, build_type)
-    return ok
+    try:
+        if managed_job is not None:
+            managed_job.report("running")
+        _snapshot_inputs(config_path, cfg, log_dir)
+
+        binary = binary_path(build_type)
+        argv = [str(binary), "timing-predict", str(config_path)]
+        runner = SimulationRunner(argv=argv, log_dir=log_dir, env=_build_subprocess_env())
+        ok = await runner.run()
+        if not ok:
+            if managed_job is not None:
+                managed_job.report("failed")
+            return False
+        if analyze:
+            if managed_job is not None:
+                managed_job.report("analysis_running")
+            # Best-effort: `analyze trace` (the Perfetto tree) + `analyze run`. Cost
+            # subjects apply; request/throughput subjects self-skip on a predict dir.
+            await run_analysis(log_dir, build_type)
+            # Predict-only: the human-readable cost tree (reports/iter_breakdown.ans).
+            # Not in the shared run_analysis — a real run's thousands of iters would
+            # make that file enormous; a predict dir has only a few cases.
+            await run_iter_breakdown(log_dir, build_type)
+        if managed_job is not None:
+            managed_job.report("ready", summary=descriptor)
+        return True
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        if managed_job is not None:
+            managed_job.report("interrupted")
+        raise
+    except Exception:
+        if managed_job is not None:
+            managed_job.report("failed")
+        raise
 
 
 def main(argv: list[str]) -> int:

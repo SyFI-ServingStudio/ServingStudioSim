@@ -16,15 +16,25 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from launcher.managed_job import ManagedJob
 from profiling import perf_api
+from profiling.artifacts import (
+    PROFILE_CURVE_FILENAME,
+    complete_profile_artifacts,
+    prepare_profile_artifacts,
+)
 from profiling.db.args import KernelArgs
 from profiling.db.registry import KernelProfilerSpec, iter_kernel_profiler_specs
 from profiling.db.table import MissingEntry
 from profiling.runners.metrics import CommMetrics, ComputeMetrics, Metrics
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    prog: str = "python -m profiling",
+) -> int:
+    parser = build_parser(prog=prog)
     args = parser.parse_args(argv)
     try:
         return int(args.command_fn(args))
@@ -36,9 +46,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m profiling",
+        prog=prog,
         description="Run/query existing VibeSim L1 profile entries through profiling.perf_api.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -59,6 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
                 "--force",
                 action="store_true",
                 help="Refresh all specs even when profile.db already has rows.",
+            )
+            command_parser.add_argument(
+                "--output-dir",
+                type=Path,
+                help=(
+                    "Write an immutable request/results/curve snapshot here. "
+                    "Required when invoked from a managed Agent turn."
+                ),
             )
         command_parser.set_defaults(
             command_fn={
@@ -173,25 +191,109 @@ def _cmd_run(args: argparse.Namespace) -> int:
     specs = _load_specs(args.spec, args.specs)
     _set_db_path(args.db)
     mode = "force-refresh" if args.force else "jit-fill"
-    get_fn = _get_facade(args.table)
+    profiler_spec = _resolve_profiler_spec(args.table, args.backend)
+    output_dir = args.output_dir.resolve() if args.output_dir is not None else None
+    managed_job = ManagedJob.from_environment("kernel_profile")
+    if managed_job is not None and output_dir is None:
+        raise ValueError("managed kernel-profile run requires --output-dir")
 
-    if args.force:
-        results = get_fn(specs, backend=args.backend, gpu_name=args.gpu_name, force=True)
-    else:
-        perf_api.enable_jit_profiling()
-        try:
-            results = get_fn(specs, backend=args.backend, gpu_name=args.gpu_name, force=False)
-        finally:
-            perf_api.disable_jit_profiling()
+    descriptor = {
+        "table": args.table,
+        "kernelKind": str(profiler_spec.kernel_kind),
+        "backend": args.backend,
+        "metricFamily": profiler_spec.metric_family.value,
+        "pointCount": len(specs),
+    }
+    if managed_job is not None:
+        assert output_dir is not None
+        managed_job.register(output_dir, descriptor=descriptor)
 
-    missing_count = _count_facade(args.table)(specs, backend=args.backend, gpu_name=args.gpu_name)
-    payload = _result_payload(args, specs, results, mode=mode, missing_count=missing_count)
-    command_ok = missing_count == 0
-    if args.json:
-        print(json.dumps({"ok": command_ok, **payload}, indent=2, sort_keys=True))
-    else:
-        _print_result_payload(payload)
-    return 0 if command_ok else 1
+    try:
+        if managed_job is not None:
+            managed_job.report("running")
+        if output_dir is not None:
+            prepare_profile_artifacts(
+                output_dir,
+                request_payload={
+                    "schemaVersion": 1,
+                    "jobKind": "kernel_profile",
+                    "mode": mode,
+                    **_base_payload(args, specs),
+                },
+                job_metadata=_profile_job_metadata(managed_job, descriptor),
+            )
+
+        get_fn = _get_facade(args.table)
+        if args.force:
+            results = get_fn(
+                specs,
+                backend=args.backend,
+                gpu_name=args.gpu_name,
+                force=True,
+            )
+        else:
+            perf_api.enable_jit_profiling()
+            try:
+                results = get_fn(
+                    specs,
+                    backend=args.backend,
+                    gpu_name=args.gpu_name,
+                    force=False,
+                )
+            finally:
+                perf_api.disable_jit_profiling()
+
+        missing_count = _count_facade(args.table)(
+            specs,
+            backend=args.backend,
+            gpu_name=args.gpu_name,
+        )
+        payload = _result_payload(
+            args,
+            specs,
+            results,
+            mode=mode,
+            missing_count=missing_count,
+        )
+        if output_dir is not None:
+            if managed_job is not None:
+                managed_job.report("analysis_running")
+            curve_payload = complete_profile_artifacts(
+                output_dir,
+                profiler_spec=profiler_spec,
+                specs=specs,
+                result_payload=payload,
+            )
+            payload["artifact_root"] = str(output_dir)
+            payload["curve_path"] = str(output_dir / PROFILE_CURVE_FILENAME)
+        else:
+            curve_payload = None
+
+        command_ok = missing_count == 0
+        if managed_job is not None:
+            managed_job.report(
+                "ready" if command_ok else "failed",
+                summary=descriptor
+                | {
+                    "missingCount": missing_count,
+                    "axes": [axis["key"] for axis in (curve_payload or {}).get("axes", [])],
+                },
+            )
+        if args.json:
+            print(json.dumps({"ok": command_ok, **payload}, indent=2, sort_keys=True))
+        else:
+            _print_result_payload(payload)
+            if output_dir is not None:
+                print(f"curve: {output_dir / PROFILE_CURVE_FILENAME}")
+        return 0 if command_ok else 1
+    except KeyboardInterrupt:
+        if managed_job is not None:
+            managed_job.report("interrupted")
+        raise
+    except Exception:
+        if managed_job is not None:
+            managed_job.report("failed")
+        raise
 
 
 def _cmd_measure(args: argparse.Namespace) -> int:
@@ -199,16 +301,42 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     if len(specs) != 1:
         raise ValueError(f"measure takes exactly one spec, got {len(specs)}")
     output_dir = args.output_dir or Path(f"measure_{args.table}_{args.backend}")
-    result = perf_api.measure_kernel(
-        args.table,
-        specs[0],
-        backend=args.backend,
-        gpu_name=args.gpu_name,
-        output_dir=output_dir,
-        duration_s=args.duration_s,
-        telemetry_hz=args.telemetry_hz,
-        clear_l2=args.clear_l2,
-    )
+    output_dir = output_dir.resolve()
+    descriptor = {
+        "table": args.table,
+        "backend": args.backend,
+        "pointCount": 1,
+        "durationSeconds": args.duration_s,
+        "clearL2": args.clear_l2,
+    }
+    managed_job = ManagedJob.from_environment("kernel_measure")
+    if managed_job is not None:
+        managed_job.register(output_dir, descriptor=descriptor)
+        managed_job.report("running")
+    try:
+        result = perf_api.measure_kernel(
+            args.table,
+            specs[0],
+            backend=args.backend,
+            gpu_name=args.gpu_name,
+            output_dir=output_dir,
+            duration_s=args.duration_s,
+            telemetry_hz=args.telemetry_hz,
+            clear_l2=args.clear_l2,
+        )
+    except KeyboardInterrupt:
+        if managed_job is not None:
+            managed_job.report("interrupted")
+        raise
+    except Exception:
+        if managed_job is not None:
+            managed_job.report("failed")
+        raise
+    if managed_job is not None:
+        managed_job.report(
+            "ready",
+            summary=descriptor | {"timeMs": result.get("time_ms")},
+        )
     if args.json:
         print(json.dumps({"ok": True, **result}, indent=2, sort_keys=True))
     else:
@@ -303,9 +431,49 @@ def _validate_table_name(table_name: str) -> str:
     known_tables = {profiler_spec.table_name for profiler_spec in iter_kernel_profiler_specs()}
     if table_name in known_tables:
         return table_name
-    raise ValueError(
-        f"unknown profiler table {table_name!r}; known tables: {sorted(known_tables)}"
+    raise ValueError(f"unknown profiler table {table_name!r}; known tables: {sorted(known_tables)}")
+
+
+def _resolve_profiler_spec(table_name: str, backend: str) -> KernelProfilerSpec:
+    matches = [
+        profiler_spec
+        for profiler_spec in iter_kernel_profiler_specs()
+        if profiler_spec.table_name == table_name and profiler_spec.backend == backend
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    known_backends = sorted(
+        profiler_spec.backend
+        for profiler_spec in iter_kernel_profiler_specs()
+        if profiler_spec.table_name == table_name
     )
+    if known_backends:
+        raise ValueError(
+            f"unknown backend {backend!r} for {table_name!r}; known backends: {known_backends}"
+        )
+    _validate_table_name(table_name)
+    raise AssertionError("validated profiler table did not resolve")
+
+
+def _profile_job_metadata(
+    managed_job: ManagedJob | None,
+    descriptor: dict[str, Any],
+) -> dict[str, Any]:
+    origin: dict[str, Any]
+    if managed_job is None:
+        origin = {"kind": "development"}
+    else:
+        origin = {
+            "kind": "managed",
+            "jobId": managed_job.job_id,
+            "resourceId": managed_job.resource_id,
+        }
+    return {
+        "schemaVersion": 1,
+        "jobKind": "kernel_profile",
+        "descriptor": descriptor,
+        "origin": origin,
+    }
 
 
 def _profiler_spec_summary(profiler_spec: KernelProfilerSpec) -> dict[str, str]:

@@ -4,6 +4,7 @@ Modes:
 
     python -m launcher PRESET.{yaml,yml,json} [MORE_PRESETS ...] [run options]
     python -m launcher timing-predict CONFIG.{yaml,yml,json} [MORE_CONFIGS ...]
+    python -m launcher kernel-profile {list,query,count-missing,run,measure} ...
     python -m launcher alignment {sim,profile,timing-predict,analyze} ...
     python -m launcher list-params [--human] [--build-type PROFILE]
 
@@ -58,6 +59,7 @@ def _build_argparse():
         epilog=(
             "Other modes:\n"
             "  python -m launcher timing-predict CONFIG.yaml|json [...]\n"
+            "  python -m launcher kernel-profile {list,query,count-missing,run,measure} ...\n"
             "  python -m launcher alignment {sim,profile,timing-predict,analyze} ...\n"
             "  python -m launcher list-params [--human]"
         ),
@@ -346,7 +348,7 @@ def _expand_manifest(
             file=sys.stderr,
         )
         return None
-    (axis, branches), = variants.items()
+    ((axis, branches),) = variants.items()
     if not (isinstance(axis, str) and axis.isidentifier()):
         print(
             f"[invalid] {source}: variants axis name {axis!r} must be a string "
@@ -364,8 +366,7 @@ def _expand_manifest(
 
     merged: list[dict] = []
     for label, ref_path in branches.items():
-        if not (isinstance(label, str) and label and "/" not in label
-                and label not in (".", "..")):
+        if not (isinstance(label, str) and label and "/" not in label and label not in (".", "..")):
             print(
                 f"[invalid] {source}: variants.{axis} label {label!r} must be a "
                 "non-empty path-safe string (it prefixes each run's log_dir)",
@@ -419,6 +420,16 @@ def main(argv: list[str] | None = None) -> int:
 
         return run_timing_predict(argv[1:])
 
+    # Keep L1 profiling ownership in ``profiling.cli`` while exposing one
+    # operator-facing VibeSim command surface alongside timing-predict and sim.
+    if argv and argv[0] == "kernel-profile":
+        from profiling.cli import main as run_kernel_profile
+
+        return run_kernel_profile(
+            argv[1:],
+            prog="python -m launcher kernel-profile",
+        )
+
     # `list-params` subcommand short-circuits before any preset handling.
     if argv and argv[0] == "list-params":
         human = "--human" in argv[1:]
@@ -436,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.presets:
         sys.exit(
             "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
-            "(or choose timing-predict, alignment, or list-params)"
+            "(or choose timing-predict, kernel-profile, alignment, or list-params)"
         )
 
     # INV-8 / design §1.2.3: the single shared build per batch. Building also

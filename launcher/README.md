@@ -500,6 +500,7 @@ python -m launcher <preset.yaml|json> [<preset2.yaml|json> ...]
                    [--no-analyze] [--emit-backends [FILE]]
 python -m launcher timing-predict <config.yaml|json> [<config2.yaml|json> ...]
                    [--build-type <cargo-profile>] [--no-analyze]
+python -m launcher kernel-profile {list,query,count-missing,run,measure} ...
 python -m launcher list-params [--human] [--build-type ...]
 python -m launcher alignment sim <simulation.yaml|json> [simulation options]
 python -m launcher alignment profile <profile.yaml|json> [--dry-run]
@@ -522,6 +523,12 @@ python -m launcher alignment analyze <analyze.yaml|json> [--build-type ...]
 - `--profile` wraps a single run with `perf record` (skill `operate-profile-sim-speed`).
 - `timing-predict` evaluates explicit batch shapes without a workload, scheduler,
   clock, or discrete-event simulation; its config is not a deployment preset.
+- `kernel-profile` is the operator-facing L1 profiling entry. It dispatches to
+  `profiling.cli`, which remains the owner of registry, DB, GPU execution, and
+  artifact semantics. `python -m profiling ...` is a compatible developer entry.
+- `kernel-profile run --output-dir DIR` snapshots the exact request, results,
+  and ordered-axis curve payload under `DIR`; reopening that job reads its own
+  result snapshot rather than a later mutable `profile.db` state.
 - `list-params` dumps the Rust-authoritative schema (`--human` for a table).
 
 ### Staged simulation ↔ real profiling alignment

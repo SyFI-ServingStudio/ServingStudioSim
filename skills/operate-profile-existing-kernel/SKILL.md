@@ -1,12 +1,12 @@
 ---
 name: operate-profile-existing-kernel
-description: Use when asked to list, query, count missing rows for, JIT-fill, force-refresh, validate, or run the `measure` NVML/CUPTI telemetry diagnostic for an existing VibeSim L1 profiler entry through `uv run python -m profiling`. Applies only to registered KernelProfilerSpec table/backend pairs and batched specs.
+description: Use when asked to list, query, count missing rows for, JIT-fill, force-refresh, validate, visualize, or run the `measure` NVML/CUPTI telemetry diagnostic for an existing VibeSim L1 profiler entry through `uv run python -m launcher kernel-profile`. Applies only to registered KernelProfilerSpec table/backend pairs and batched specs.
 ---
 
 # Profile Run Existing Kernel
 
 Use this skill only when the requested profiler already exists in
-`profiling.db.registry.REGISTRY`. If `python -m profiling list` does not show
+`profiling.db.registry.REGISTRY`. If `launcher kernel-profile list` does not show
 the requested table/backend pair, stop and switch to the add-kernel workflow or
 ask before changing code.
 
@@ -24,11 +24,16 @@ Read these before running or editing:
 The supported CLI is:
 
 ```bash
-uv run python -m profiling list [--json]
-uv run python -m profiling count-missing <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db PATH] [--json]
-uv run python -m profiling query <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db PATH] [--json]
-uv run python -m profiling run <table> --backend <backend> (--spec JSON | --specs PATH) [--force] [--gpu-name NAME] [--db PATH] [--json]
+uv run python -m launcher kernel-profile list [--json]
+uv run python -m launcher kernel-profile count-missing <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db PATH] [--json]
+uv run python -m launcher kernel-profile query <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db PATH] [--json]
+uv run python -m launcher kernel-profile run <table> --backend <backend> (--spec JSON | --specs PATH) [--force] [--output-dir DIR] [--gpu-name NAME] [--db PATH] [--json]
 ```
+
+`python -m profiling ...` remains a compatibility/developer entry and calls the
+same `profiling.cli` implementation. Skills and managed Agent runs use the
+launcher form so simulation, timing prediction, alignment, and kernel profiling
+share one VibeSim command surface.
 
 Spec input rules:
 
@@ -49,6 +54,10 @@ Important semantics:
   missing specs are profiled, then results are queried.
 - `run --force` refreshes every provided spec through `perf_api` even if rows
   already exist.
+- `run --output-dir DIR` writes immutable `request.json`, `results.json`,
+  `curve.json`, and `job.meta.json`. A managed Agent run requires this option;
+  put it below the workspace `logs/` root. Direct development calls may omit it
+  when no durable visualization artifact is wanted.
 - `--gpu-name` is the DB key/filter used by `perf_api`; it is not a CUDA device
   selector. The standard CLI does not expose a `--gpus` hardware-selection flag.
 - The CLI is a wrapper over generated `perf_api` functions. Do not call runners
@@ -58,14 +67,14 @@ Important semantics:
 
 ## The `measure` diagnostic (NVML telemetry, out of the cache path)
 
-`python -m profiling` has a fifth verb, `measure`, that the four cache verbs
+`launcher kernel-profile` has a fifth verb, `measure`, that the four cache verbs
 above do not cover. It is the sustained per-launch CUPTI trend + NVML telemetry
 instrument (the ~10 s window): run it to inspect power / SM-clock / mem-clock /
 util / temp / throttle drift for one kernel spec, **not** to fill or refresh
 `profile.db`.
 
 ```bash
-uv run python -m profiling measure <table> --backend <backend> --spec JSON \
+uv run python -m launcher kernel-profile measure <table> --backend <backend> --spec JSON \
   [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2] [--gpu-name NAME] [--db PATH] [--json]
 ```
 
@@ -98,7 +107,7 @@ Copy this checklist before starting. Keep each item as `[]`; change to `[x]`
 only after doing the exact action, or write `N/A: reason`.
 
 - [] Read the required docs listed above.
-- [] Run `uv run python -m profiling list --json` and confirm the requested
+- [] Run `uv run python -m launcher kernel-profile list --json` and confirm the requested
   `<table>` and `--backend` exist.
 - [] Record the listed `kernel_kind`, `args`, `metric_family`,
   `subprocess_env`, generated `get_fn`, and generated `count_fn`.
@@ -106,12 +115,16 @@ only after doing the exact action, or write `N/A: reason`.
   fields and no routing-only fields such as `backend`.
 - [] Decide spec input form: repeated `--spec`, JSON list, `{"specs": [...]}`,
   or JSONL file. Record the spec count.
-- [] Decide DB path. Use `--db /tmp/...` for validation-only runs; use the
+- [] Decide DB path. Use a task-scoped DB under `/workspace/tmp/` for
+  validation-only runs; use the
   default/shared DB only when the user explicitly wants to update it.
 - [] Decide whether `--gpu-name` is needed. Use it for a known DB key or to
   avoid CUDA name auto-resolution. Do not describe it as selecting a physical
   GPU.
 - [] Choose the command mode: `count-missing`, `query`, `run`, or `run --force`.
+- [] For `run` / `run --force`, choose a fresh `--output-dir` below `logs/` when
+  the result must appear in the managed UI. Never reuse an artifact directory
+  containing an existing immutable snapshot.
 - [] For a real profiling run, first confirm CUDA availability with an explicit
   environment check such as `uv run python -c "import torch; print(torch.cuda.is_available())"`.
 - [] If `uv run` warns that `VIRTUAL_ENV` points at another workspace, note it
@@ -136,6 +149,9 @@ only after doing the exact action, or write `N/A: reason`.
 - [] For compute rows, check `time_ms > 0`, `energy_j >= 0`, and optionally
   report implied watts as `energy_j / (time_ms / 1000)`.
 - [] Report to the user using the required report format below.
+- [] For a snapshotted run, inspect `curve.json`: varying axes follow
+  `KernelArgs` declaration order, constants are in `fixedArgs`, the first two
+  axes are x/y, and remaining axes are facets.
 
 ## Validation Checklist
 
@@ -173,6 +189,8 @@ Always report:
   `status` and metric columns, e.g. `m`, `n`, `k`, `dtype`, `status`,
   `time_ms`, `tflops`, `energy_j` for `single_gemm`.
 - Validation: commands run and pass/fail status.
+- Artifacts: `--output-dir`, `request.json`, `results.json`, and `curve.json`
+  when the run was snapshotted; identify the plotted axes and fixed args.
 - Caveats: unresolved missing rows, no GPU available, shared DB not updated, or
   any reason a command was not run.
 
@@ -181,7 +199,9 @@ Always report:
 Repeated inline specs:
 
 ```bash
-uv run python -m profiling run single_gemm --backend torch --force --db /tmp/profile.db --json \
+uv run python -m launcher kernel-profile run single_gemm --backend torch --force \
+  --db tmp/single-gemm/profile.db \
+  --output-dir logs/20260731_0_single_gemm_profile --json \
   --spec '{"m":128,"n":8192,"k":8192,"dtype":"bf16"}' \
   --spec '{"m":256,"n":8192,"k":8192,"dtype":"bf16"}'
 ```
@@ -189,6 +209,6 @@ uv run python -m profiling run single_gemm --backend torch --force --db /tmp/pro
 JSON/JSONL file batch:
 
 ```bash
-uv run python -m profiling count-missing single_gemm --backend torch --gpu-name "H100" --specs specs.json --db /tmp/profile.db --json
-uv run python -m profiling query single_gemm --backend torch --gpu-name "H100" --specs specs.jsonl --db /tmp/profile.db --json
+uv run python -m launcher kernel-profile count-missing single_gemm --backend torch --gpu-name "H100" --specs specs.json --db tmp/single-gemm/profile.db --json
+uv run python -m launcher kernel-profile query single_gemm --backend torch --gpu-name "H100" --specs specs.jsonl --db tmp/single-gemm/profile.db --json
 ```

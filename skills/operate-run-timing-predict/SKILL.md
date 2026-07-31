@@ -121,6 +121,15 @@ count, don't guess a formula.
    pass). There is **no** `--dry-run` / `--override` — those are run-only.
 5. Read the results (below) and report.
 
+When the conversation runtime injects a managed-job capability, the launcher
+registers one `timing_predict` job per config/log directory before writing new
+artifacts. It reports `running`, `analysis_running`, and `ready` (or
+`failed`/`interrupted`) to the conversation backend. If one launcher call names
+both AFD configs, the UI therefore receives two independently addressable jobs,
+one for `attn` and one for `ffn`. JIT profile fills triggered internally by a
+cold timing-predict cache remain activity of that timing-predict job; they do
+not create nested kernel-profile jobs.
+
 ## Output
 
 Each `log_dir` gets the **same artifacts a real run writes** (one worker,
@@ -132,6 +141,11 @@ Each `log_dir` gets the **same artifacts a real run writes** (one worker,
   would make it enormous). This is where the headline per-iteration µs numbers are.
 - `traces/<exp>.pftrace.gz` (Perfetto), `plots/` (batch_scatter, kernel tflops/gbps,
   utilization), and a snapshot of the config + cases file.
+
+Managed timing-predict artifacts are cataloged as `timing_predict`, not as a
+deployment simulation. Request/throughput/SLO panels remain inapplicable; cost,
+kernel throughput, batch-shape, and utilization evidence can link back to the
+conversation job.
 
 Request/throughput/SLO analyzer subjects self-skip on a predict dir (no requests);
 cost subjects apply. Read `iter_breakdown.ans` with ANSI stripped
