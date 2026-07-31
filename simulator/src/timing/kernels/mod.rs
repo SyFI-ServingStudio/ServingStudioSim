@@ -6,6 +6,7 @@ pub mod batched_gemm;
 pub mod dsa_index_cache_append;
 pub mod dsa_mqa_logits_prefill;
 pub mod dsa_paged_mqa_logits_decode;
+pub mod dsa_persistent_topk_decode;
 pub mod dsa_topk_prefill;
 pub mod elementwise;
 pub mod engine;
@@ -44,6 +45,10 @@ pub use dsa_mqa_logits_prefill::{
 pub use dsa_paged_mqa_logits_decode::{
     DsaPagedMqaLogitsDecodeKernel, DsaPagedMqaLogitsDecodeKernelConfig,
     DsaPagedMqaLogitsDecodeKernelInput, DsaPagedMqaLogitsDecodeSpec,
+};
+pub use dsa_persistent_topk_decode::{
+    DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
+    DsaPersistentTopkDecodeKernelInput, DsaPersistentTopkDecodeSpec,
 };
 pub use dsa_topk_prefill::{
     DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig, DsaTopkPrefillKernelInput, DsaTopkPrefillSpec,
