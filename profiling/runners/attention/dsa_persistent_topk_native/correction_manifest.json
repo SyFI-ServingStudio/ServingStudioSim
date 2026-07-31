@@ -1,0 +1,64 @@
+{
+  "format_version": 1,
+  "correction_id": "all-cooperative-radix-with-radix-iteration-v1",
+  "upstream_commit": "0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665",
+  "rationale": "Pinned fixed-capacity short, medium, and FilteredTopK paths silently truncate valid clustered candidates. All nontrivial rows use the bundled cooperative radix path, and radix_iter advances only for radix rows so triple-buffer rotation remains correct when trivial and radix rows alternate.",
+  "targets": [
+    {
+      "local_path": "upstream/topk.cu",
+      "input_sha256": "2c90ef9391e1d6bd6ca65c05841597569cf629451f25a1ed4446aa5b34f1d917",
+      "result_sha256": "937bece0a889b353b1c2e9148a55f00c37a1791cd1d5e6f05bb7fb98da675084",
+      "operations": [
+        {
+          "kind": "exact_utf8_replacement",
+          "before": "  if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {",
+          "after": "  // Corrected v0.23-derived build: fixed-capacity FilteredTopK is unreachable.\n  // Every nontrivial row uses cooperative radix.\n  if (false) {",
+          "expected_occurrences": 1
+        },
+        {
+          "kind": "exact_utf8_replacement",
+          "before": "    // The cooperative spin-wait barrier only runs when at least one row hits\n    // the radix path (seq_len > RADIX_THRESHOLD). Below that, non-CTA-0 CTAs\n    // early-exit, so oversubscription can't deadlock and headroom is wasted.\n    const bool needs_cooperative =\n        static_cast<uint32_t>(max_seq_len) > P::RADIX_THRESHOLD;",
+          "after": "    // The cooperative spin-wait barrier runs for every nontrivial row.\n    const bool needs_cooperative =\n        static_cast<uint32_t>(max_seq_len) > static_cast<uint32_t>(TopK);",
+          "expected_occurrences": 1
+        },
+        {
+          "kind": "exact_utf8_replacement",
+          "before": "    // If the cooperative launch wouldn't fit, fall back to FilteredTopK\n    // instead of deadlocking. Only relevant when needs_cooperative.\n    if (needs_cooperative && total_ctas > hw_resident_cap) {\n      STD_TORCH_CHECK(\n          max_smem_per_block >= 128 * 1024,\n          \"persistent_topk would oversubscribe and the FilteredTopK \"\n          \"fallback requires >=128KB smem per block (have \",\n          max_smem_per_block, \"). total_ctas=\", total_ctas,\n          \" > num_sms*occupancy=\", hw_resident_cap, \" (TopK=\", TopK,\n          \", vec_size=\", vec_size, \", ctas_per_group=\", ctas_per_group,\n          \", smem=\", smem_size, \").\");\n      cudaError_t status =\n          vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(\n              logits.const_data_ptr<float>(),\n              output.mutable_data_ptr<int32_t>(),\n              lengths.const_data_ptr<int32_t>(),\n              static_cast<uint32_t>(num_rows), static_cast<uint32_t>(TopK),\n              static_cast<uint32_t>(stride), stream);\n      STD_TORCH_CHECK(status == cudaSuccess, \"FilteredTopK fallback failed: \",\n                      cudaGetErrorString(status));\n      return;\n    }",
+          "after": "    STD_TORCH_CHECK(\n        !needs_cooperative || total_ctas <= hw_resident_cap,\n        \"corrected persistent_topk cooperative launch would oversubscribe: \"\n        \"total_ctas=\", total_ctas, \" > num_sms*occupancy=\", hw_resident_cap,\n        \" (TopK=\", TopK, \", vec_size=\", vec_size,\n        \", ctas_per_group=\", ctas_per_group, \", smem=\", smem_size, \").\");",
+          "expected_occurrences": 1
+        }
+      ]
+    },
+    {
+      "local_path": "upstream/persistent_topk.cuh",
+      "input_sha256": "1d92c234493599e4d57d793eda2cf3b8efa246415425dd2ac881935b25b950ee",
+      "result_sha256": "e0aeea8a0bb7d4be12c45b7d643c24489054d8410aa0e07648cb291050411a94",
+      "operations": [
+        {
+          "kind": "exact_utf8_replacement",
+          "before": "  // Early exit: non-CTA-0 threads are never needed if no large rows exist\n  if (cta_in_group != 0 && params.max_seq_len <= RADIX_THRESHOLD) return;",
+          "after": "  // Non-CTA-0 threads are unnecessary only when every row is trivial.\n  if (cta_in_group != 0 && params.max_seq_len <= TopK) return;",
+          "expected_occurrences": 1
+        },
+        {
+          "kind": "exact_utf8_replacement",
+          "before": "  int barrier_phase = 0;\n  const uint32_t total_iters = (params.num_rows + num_groups - 1) / num_groups;",
+          "after": "  int barrier_phase = 0;\n  uint32_t radix_iter = 0;\n  const uint32_t total_iters = (params.num_rows + num_groups - 1) / num_groups;",
+          "expected_occurrences": 1
+        },
+        {
+          "kind": "exact_utf8_replacement",
+          "before": "    if (seq_len <= RADIX_THRESHOLD) {\n      if (cta_in_group == 0) {\n        if (seq_len <= static_cast<uint32_t>(TopK)) {\n          // Trivial case: seq_len <= TopK\n          for (uint32_t i = tx; i < static_cast<uint32_t>(TopK);\n               i += kThreadsPerBlock) {\n            row_output[i] = (i < seq_len) ? static_cast<int32_t>(i) : -1;\n          }\n        } else if (seq_len <= static_cast<uint32_t>(HIST2048_THRESHOLD)) {\n          histogram_2048_topk<TopK>(row_input, row_output, seq_len);\n        } else {\n          histogram_256_topk<TopK>(row_input, row_output, 0, seq_len);\n        }\n      }\n      continue;\n    }",
+          "after": "    if (seq_len <= static_cast<uint32_t>(TopK)) {\n      if (cta_in_group == 0) {\n        for (uint32_t i = tx; i < static_cast<uint32_t>(TopK);\n             i += kThreadsPerBlock) {\n          row_output[i] = (i < seq_len) ? static_cast<int32_t>(i) : -1;\n        }\n      }\n      continue;\n    }",
+          "expected_occurrences": 1
+        },
+        {
+          "kind": "exact_utf8_replacement",
+          "before": "        cta_in_group, ctas_per_group, barrier_phase, iter, tx);",
+          "after": "        cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx);\n    radix_iter++;",
+          "expected_occurrences": 1
+        }
+      ]
+    }
+  ]
+}

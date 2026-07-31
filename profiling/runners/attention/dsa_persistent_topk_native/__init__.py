@@ -1,8 +1,8 @@
-"""Lazy build support for the pinned vLLM persistent top-k CUDA op.
+"""Lazy build support for the corrected vLLM persistent top-k CUDA op.
 
 Importing this package is deliberately inert. The worker-only loader imports
-Torch, validates the vendored source, and builds the extension only when the
-production profiler entry point is invoked.
+Torch, validates the pinned assets and correction overlay, and derives/builds
+the extension only when the production profiler entry point is invoked.
 """
 
 from .loader import (

@@ -1,10 +1,11 @@
 """Profilers for GLM-5.2 persistent decode DSA top-k.
 
 The Torch backend times the complete vectorized semantic composite. The
-production backend packages and times pinned vLLM v0.23.0 ``persistent_topk``:
-flattened rows ``<=32`` include its workspace memset and persistent kernel,
-while rows ``>32`` dispatch one FilteredTopK kernel. Both write all ``top_k``
-slots. The indexer's separate outer global index-buffer fill remains excluded.
+production backend packages a corrected vLLM v0.23-derived
+``persistent_topk``: lengths through ``top_k`` retain the pinned natural-index
+writer, while every longer row uses the bundled cooperative radix path. Its
+workspace memset and one persistent kernel write all ``top_k`` slots. The
+indexer's separate outer global index-buffer fill remains excluded.
 """
 
 from __future__ import annotations
@@ -354,7 +355,7 @@ def _native_call(
     top_k: int,
     max_seq_len: int,
 ) -> None:
-    """Invoke exactly the private pinned vLLM callable."""
+    """Invoke only the private corrected v0.23-derived callable."""
     return op(
         operands.logits,
         operands.lengths,
@@ -373,7 +374,7 @@ def _validate_native_semantics(
     top_k: int,
     max_seq_len: int,
 ) -> None:
-    """Compare pinned CUDA output with the committed semantic reference."""
+    """Compare corrected native output with the committed semantic reference."""
     from profiling.runners.attention.dsa_persistent_topk_decode_reference import (
         dsa_persistent_topk_decode_reference,
     )
@@ -573,7 +574,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
     index_dtype: str,
     context_mode: str,
 ) -> ComputeMetrics:
-    """Profile the complete pinned vLLM persistent/FilteredTopK callable."""
+    """Profile the complete corrected v0.23-derived persistent callable."""
     (
         batch_size,
         context_len,

@@ -184,11 +184,23 @@ def test_native_source_manifest_and_required_hashes_are_enforced() -> None:
         "repository": "https://github.com/vllm-project/vllm",
         "license": "Apache-2.0",
     }
+    assert manifest["implementation"] == {
+        "kind": "corrected_v0_23_derived",
+        "correction_id": "all-cooperative-radix-with-radix-iteration-v1",
+        "correction_manifest": "correction_manifest.json",
+        "description": (
+            "The loader preserves byte-identical upstream assets and compiles "
+            "deterministic corrected copies in its worker-local cache."
+        ),
+    }
     assert verified["upstream/topk.cu"] == (
         "2c90ef9391e1d6bd6ca65c05841597569cf629451f25a1ed4446aa5b34f1d917"
     )
     assert verified["upstream/persistent_topk.cuh"] == (
         "1d92c234493599e4d57d793eda2cf3b8efa246415425dd2ac881935b25b950ee"
+    )
+    assert verified["correction_manifest.json"] == (
+        "a6e00159afa31b110950e1fbfcbe3118df8c549bf56f01052f7eeb99c549d001"
     )
     assert set(verified) == {record["local_path"] for record in manifest["files"]}
     for relative, expected in verified.items():
@@ -204,6 +216,133 @@ def test_native_source_hash_failure_is_clear_and_precedes_build(tmp_path) -> Non
         handle.write(b"\n// tampered\n")
     with pytest.raises(loader.NativeExtensionLoadError, match="source hash mismatch.*topk.cu"):
         loader.verify_vendored_sources(copied)
+
+
+def test_native_correction_derivation_is_deterministic_and_preserves_upstream(
+    tmp_path,
+) -> None:
+    from profiling.runners.attention.dsa_persistent_topk_native import loader
+
+    asset_root = Path(loader.__file__).resolve().parent
+    upstream_hashes = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (asset_root / "upstream").iterdir()
+    }
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    expected = {
+        "binding.cpp": "ea1b70c6f70fd2ce683706e5ea0f444a8d57b97747b07609fce74f3497839d6d",
+        "persistent_topk.cuh": ("e0aeea8a0bb7d4be12c45b7d643c24489054d8410aa0e07648cb291050411a94"),
+        "topk.cu": "937bece0a889b353b1c2e9148a55f00c37a1791cd1d5e6f05bb7fb98da675084",
+        "torch_utils.h": "f619e1943039a67a3254f7e0679e1f3e0faa9d8fccae795f3b20df9e91a8a429",
+    }
+
+    assert loader._derive_corrected_sources(first) == expected
+    assert loader._derive_corrected_sources(second) == expected
+    assert {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (asset_root / "upstream").iterdir()
+    } == upstream_hashes
+    assert (first / "topk.cu").read_bytes() == (second / "topk.cu").read_bytes()
+    assert (first / "persistent_topk.cuh").read_bytes() == (
+        second / "persistent_topk.cuh"
+    ).read_bytes()
+
+
+def test_corrected_source_encodes_all_radix_and_radix_iteration_invariants(
+    tmp_path,
+) -> None:
+    from profiling.runners.attention.dsa_persistent_topk_native import loader
+
+    source_dir = tmp_path / "corrected"
+    loader._derive_corrected_sources(source_dir)
+    host = (source_dir / "topk.cu").read_text(encoding="utf-8")
+    kernel = (source_dir / "persistent_topk.cuh").read_text(encoding="utf-8")
+
+    assert "if (num_rows > 32 && max_smem_per_block >= 128 * 1024)" not in host
+    assert "static_cast<uint32_t>(max_seq_len) > static_cast<uint32_t>(TopK)" in host
+    assert "FilteredTopK fallback failed" not in host
+    assert "if (cta_in_group != 0 && params.max_seq_len <= TopK) return;" in kernel
+    assert "uint32_t radix_iter = 0;" in kernel
+    assert "barrier_phase, radix_iter, tx);" in kernel
+    assert "radix_iter++;" in kernel
+    assert "barrier_phase, iter, tx);" not in kernel
+    dispatch = kernel[
+        kernel.index("for (uint32_t iter = 0;") : kernel.index("}  // namespace persistent")
+    ]
+    assert "histogram_2048_topk<TopK>" not in dispatch
+    assert "histogram_256_topk<TopK>" not in dispatch
+
+
+def test_native_correction_and_derived_source_tampering_fail(tmp_path) -> None:
+    from profiling.runners.attention.dsa_persistent_topk_native import loader
+
+    asset_root = Path(loader.__file__).resolve().parent
+    copied = tmp_path / "native"
+    shutil.copytree(asset_root, copied)
+    correction_path = copied / "correction_manifest.json"
+    correction_path.write_text(correction_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(
+        loader.NativeExtensionLoadError,
+        match="source hash mismatch for correction_manifest.json",
+    ):
+        loader.verify_vendored_sources(copied)
+
+    source_dir = tmp_path / "derived"
+    expected = loader._derive_corrected_sources(source_dir)
+    with (source_dir / "persistent_topk.cuh").open("ab") as handle:
+        handle.write(b"\n// tampered\n")
+    with pytest.raises(loader.NativeExtensionLoadError, match="build-source mismatch"):
+        loader._verify_derived_sources(source_dir, expected)
+
+
+def test_native_fingerprint_and_marker_include_correction_identity(tmp_path) -> None:
+    from profiling.runners.attention.dsa_persistent_topk_native import loader
+
+    fake_torch = SimpleNamespace(
+        __version__="2.10.0+cu128",
+        version=SimpleNamespace(cuda="12.8"),
+    )
+    source_hashes = loader.verify_vendored_sources()
+    correction = loader._read_correction_manifest()
+    fingerprint = loader._build_fingerprint(fake_torch, source_hashes, correction)
+    assert fingerprint == loader._build_fingerprint(fake_torch, source_hashes, correction)
+
+    source_dir = tmp_path / "corrected_source"
+    derived = loader._derive_corrected_sources(source_dir)
+    artifact = tmp_path / "extension.so"
+    artifact.write_bytes(b"synthetic extension")
+    marker = tmp_path / "complete.json"
+    loader._write_complete_marker(
+        marker,
+        artifact=artifact,
+        fingerprint=fingerprint,
+        source_hashes=source_hashes,
+        derived_source_hashes=derived,
+        correction=correction,
+    )
+    loader._validate_complete_marker(
+        marker,
+        artifact=artifact,
+        fingerprint=fingerprint,
+        source_hashes=source_hashes,
+        derived_source_hashes=derived,
+        correction=correction,
+        source_dir=source_dir,
+    )
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    payload["correction"]["id"] = "tampered"
+    marker.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(loader.NativeExtensionLoadError, match="correction mismatch"):
+        loader._validate_complete_marker(
+            marker,
+            artifact=artifact,
+            fingerprint=fingerprint,
+            source_hashes=source_hashes,
+            derived_source_hashes=derived,
+            correction=correction,
+            source_dir=source_dir,
+        )
 
 
 def test_native_build_lock_serializes_concurrent_workers(tmp_path) -> None:
@@ -241,6 +380,51 @@ def test_native_build_lock_serializes_concurrent_workers(tmp_path) -> None:
     assert not first_thread.is_alive()
     assert not second_thread.is_alive()
     assert order == ["first-enter", "first-exit", "second-enter"]
+
+
+def test_native_corrected_cache_builds_once_and_reuses_marker(monkeypatch, tmp_path) -> None:
+    from profiling.runners.attention.dsa_persistent_topk_native import loader
+
+    fake_torch = SimpleNamespace(
+        __version__="2.10.0+cu128",
+        version=SimpleNamespace(cuda="12.8"),
+    )
+    state: dict[str, object | None] = {"op": None}
+    build_count = 0
+    load_count = 0
+
+    monkeypatch.setattr(loader, "_cache_root", lambda: tmp_path / "cache")
+    monkeypatch.setattr(loader, "_validate_runtime", lambda _torch: None)
+    monkeypatch.setattr(loader, "_registered_op", lambda _torch: state["op"])
+
+    def fake_build(_torch, *, build_dir, source_dir, extension_name):
+        nonlocal build_count
+        build_count += 1
+        assert source_dir.is_dir()
+        artifact = build_dir / f"{extension_name}.so"
+        artifact.write_bytes(b"corrected native extension")
+        state["op"] = object()
+        return artifact
+
+    def fake_load(_torch, artifact):
+        nonlocal load_count
+        load_count += 1
+        assert artifact.read_bytes() == b"corrected native extension"
+        state["op"] = object()
+        return state["op"]
+
+    monkeypatch.setattr(loader, "_build_library", fake_build)
+    monkeypatch.setattr(loader, "_load_library", fake_load)
+
+    first = loader.load_persistent_topk_op(fake_torch)
+    assert first is state["op"]
+    state["op"] = None  # Model a fresh worker loading the completed cache.
+    second = loader.load_persistent_topk_op(fake_torch)
+    assert second is state["op"]
+    assert first is not second
+    assert build_count == 1
+    assert load_count == 1
+    assert len(list((tmp_path / "cache").glob("*/complete.json"))) == 1
 
 
 @pytest.mark.parametrize(

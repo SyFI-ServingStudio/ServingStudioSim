@@ -9,6 +9,12 @@
     "repository": "https://github.com/vllm-project/vllm",
     "license": "Apache-2.0"
   },
+  "implementation": {
+    "kind": "corrected_v0_23_derived",
+    "correction_id": "all-cooperative-radix-with-radix-iteration-v1",
+    "correction_manifest": "correction_manifest.json",
+    "description": "The loader preserves byte-identical upstream assets and compiles deterministic corrected copies in its worker-local cache."
+  },
   "verified_runtime": {
     "torch": "2.10.0+cu128",
     "cuda_toolkit": "12.8",
@@ -39,7 +45,14 @@
       "kind": "torch_2_10_private_registration_shim",
       "upstream_path": null,
       "sha256": "ea1b70c6f70fd2ce683706e5ea0f444a8d57b97747b07609fce74f3497839d6d",
-      "purpose": "Register the unchanged pinned implementation in the private _C_pinned_topk namespace without linking the Torch-2.11-only remainder of vLLM's stable extension."
+      "purpose": "Register the corrected v0.23-derived implementation in the private _C_pinned_topk namespace without linking the Torch-2.11-only remainder of vLLM's stable extension."
+    },
+    {
+      "local_path": "correction_manifest.json",
+      "kind": "vibesim_correctness_overlay",
+      "upstream_path": null,
+      "sha256": "a6e00159afa31b110950e1fbfcbe3118df8c549bf56f01052f7eeb99c549d001",
+      "purpose": "Route every nontrivial row through cooperative radix and advance triple-buffer rotation only after radix rows."
     }
   ]
 }
