@@ -73,7 +73,11 @@ If the user did not give a name, ask for one before proceeding.
 7. Edit the copied preset's internal `io.log_dir` to land under
    `logs/<experiment-name>`, preserving any template tail / placeholders (see
    log_dir Rewrite). Encode the requested variations in the `sweep` /
-   `compound` / `derived` control blocks (see Sweeps below).
+   `compound` / `derived` control blocks (see Sweeps below). Unless the user
+   explicitly requests an analyzer subset, remove any inherited
+   `analyze_subjects` key from the copied preset or variants manifest so the
+   launcher runs every applicable analyzer subject. Do not add `--no-analyze`
+   to the launch command by default.
 8. **Dry-run first** — validate + expand without launching, and inspect the run
    plan and per-run `log_dir`s:
    ```bash
@@ -214,8 +218,17 @@ into `reports/` (numbers JSON), `payloads/` (plot JSON), and `plots/` (PNG) unde
 its `log_dir`. The full list of analysis **subjects** a run produces and what each
 one reads and emits is the canonical Subjects catalog in
 `analyzer/README.md` — point there instead of guessing metric names. Selection is
-the optional preset key `analyze_subjects` (omit = all applicable); `--no-analyze`
-skips analysis for one launch.
+the optional preset key `analyze_subjects`.
+
+**Default invariant: run all applicable subjects.** Omit `analyze_subjects`
+(preferred; an empty list has the same launcher meaning) and do not pass
+`--no-analyze`. “All” means every registered subject whose applicability gate
+accepts that run; it does not mean forcing deployment-incompatible subjects.
+Do not inherit a narrow `analyze_subjects` list from the source preset merely
+because it was present there. Keep or create a subset only when the user
+explicitly requests specific subjects. If one subject fails, report that
+best-effort analysis failure rather than silently rerunning with a narrower
+list.
 
 ## Output
 
@@ -225,3 +238,5 @@ After setup and launch, report:
 - copied preset path
 - the `--dry-run` plan summary (run count)
 - exact launcher command used
+- analysis selection (`all applicable` by default, or the user-requested subset)
+- any analyzer subjects that failed best-effort post-run analysis

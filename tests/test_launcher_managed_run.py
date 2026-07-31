@@ -10,6 +10,7 @@ from launcher.managed_run import (
     EXPERIMENT_METADATA_FILENAME,
     MANAGED_CONTEXT_ENV,
     ManagedRun,
+    managed_analysis_subjects,
     prepare_experiment,
 )
 
@@ -122,3 +123,19 @@ def test_status_updates_are_idempotent(monkeypatch) -> None:
     managed_run.report("ready")
 
     assert statuses == ["running", "ready"]
+
+
+def test_managed_analysis_completes_narrow_selection_for_aggregate() -> None:
+    managed_run = ManagedRun(
+        backend_url="http://backend.test",
+        capability_token="secret",
+    )
+
+    assert managed_analysis_subjects(managed_run, ["throughput"]) == [
+        "throughput",
+        "slo-general",
+        "utilization",
+    ]
+    assert managed_analysis_subjects(managed_run, None) is None
+    assert managed_analysis_subjects(managed_run, []) == []
+    assert managed_analysis_subjects(None, ["throughput"]) == ["throughput"]

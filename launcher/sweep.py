@@ -30,9 +30,9 @@ from .exec import (
     run_sweep_analysis,
     wrap_with_perf,
 )
+from .managed_run import ManagedRun, managed_analysis_subjects, prepare_experiment
 from .schema import build_cli_command, log_dir_of, validate_unique_log_dirs
 from .schema.loader import Registry
-from .managed_run import ManagedRun, prepare_experiment
 
 # Resume marker (INV-5): the launcher writes this into a run's log_dir only
 # after a zero-exit run. On the default resume path a run whose log_dir already
@@ -164,6 +164,7 @@ async def _run_single_async(
 ) -> bool:
     log_dir = Path(log_dir_of(params))
     managed_run = prepare_experiment(log_dir, run_count=1, axes=[])
+    analyze_subjects = managed_analysis_subjects(managed_run, analyze_subjects)
     if not refresh and _is_complete(log_dir):
         print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
         if managed_run is not None:
@@ -251,6 +252,7 @@ async def _run_sweep_async(
         run_count=len(param_sets),
         axes=axes,
     )
+    analyze_subjects = managed_analysis_subjects(managed_run, analyze_subjects)
     if managed_run is not None:
         managed_run.report("running")
     sweep_manifest_path = _write_sweep_manifest(param_sets, base_dir)

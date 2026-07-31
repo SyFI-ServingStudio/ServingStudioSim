@@ -21,6 +21,21 @@ from typing import Any
 
 MANAGED_CONTEXT_ENV = "VIBESIM_MANAGED_RUN_CONTEXT"
 EXPERIMENT_METADATA_FILENAME = "experiment.meta.json"
+MANAGED_AGGREGATE_SUBJECTS = ("slo-general", "throughput", "utilization")
+
+
+def managed_analysis_subjects(
+    managed_run: ManagedRun | None,
+    requested_subjects: list[str] | None,
+) -> list[str] | None:
+    """Complete a narrowed managed run with the Analyzer's baseline panels.
+
+    ``None`` and ``[]`` already mean all applicable subjects, while direct CLI
+    runs must preserve the user's exact selection.
+    """
+    if managed_run is None or not requested_subjects:
+        return requested_subjects
+    return list(dict.fromkeys([*requested_subjects, *MANAGED_AGGREGATE_SUBJECTS]))
 
 
 def _read_json(path: Path) -> dict[str, Any]:
