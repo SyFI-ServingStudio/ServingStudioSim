@@ -17,6 +17,7 @@ from profiling.kernels import (
     dsa_index_cache_append,  # noqa: F401
     dsa_mqa_logits_prefill,  # noqa: F401
     dsa_paged_mqa_logits_decode,  # noqa: F401
+    dsa_topk_prefill,  # noqa: F401
     elementwise,  # noqa: F401
     flashinfer_attn_decode,  # noqa: F401
     flashinfer_attn_prefill,  # noqa: F401
