@@ -1,9 +1,10 @@
-"""Torch profiler for GLM-5.2 persistent decode DSA top-k semantics.
+"""Profilers for GLM-5.2 persistent decode DSA top-k.
 
-The timed callable is the complete vectorized semantic composite. It writes all
-``top_k`` output slots per row, including ``-1`` padding for short rows. The
-pinned CUDA backend's scratch-workspace reset/dispatch and the indexer's outer
-global index-buffer fill are separate launches and are not modeled here.
+The Torch backend times the complete vectorized semantic composite. The
+production backend packages and times pinned vLLM v0.23.0 ``persistent_topk``:
+flattened rows ``<=32`` include its workspace memset and persistent kernel,
+while rows ``>32`` dispatch one FilteredTopK kernel. Both write all ``top_k``
+slots. The indexer's separate outer global index-buffer fill remains excluded.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _CONTEXT_MODE = "uniform"
 _REQUIRED_GPU = "NVIDIA H200"
+_WORKSPACE_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,16 @@ class _DsaPersistentTopkDecodeOperands:
     valid_mask: Any
     natural_output: Any
     long_row_indices: Any
+
+
+@dataclass(frozen=True)
+class _DsaPersistentTopkDecodeNativeOperands:
+    logits_backing: Any
+    logits: Any
+    lengths: Any
+    flat_lengths: Any
+    out: Any
+    workspace: Any
 
 
 def _validate_args(
@@ -119,19 +131,20 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any) -> None:
+def _validate_cuda_device(torch: Any, *, backend: str = "torch") -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(
-            "CUDA is required for the torch dsa_persistent_topk_decode backend"
+            f"CUDA is required for the {backend} dsa_persistent_topk_decode backend"
         )
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
     if gpu_name != _REQUIRED_GPU:
         raise ProfilerNotImplemented(
-            f"torch dsa_persistent_topk_decode is verified only on {_REQUIRED_GPU}, got {gpu_name}"
+            f"{backend} dsa_persistent_topk_decode is verified only on "
+            f"{_REQUIRED_GPU}, got {gpu_name}"
         )
 
 
-def _build_operands(
+def _build_common_operands(
     torch: Any,
     *,
     batch_size: int,
@@ -141,16 +154,16 @@ def _build_operands(
     top_k: int,
     logits_row_stride: int,
     device: str,
-) -> _DsaPersistentTopkDecodeOperands:
-    """Build exact padded logits and pinned row-major decode lengths."""
+) -> tuple[Any, Any, Any, Any, Any]:
+    """Build exact logits/length/output storage without row-scaled sources."""
     num_rows = batch_size * next_n
     logits_backing = torch.empty(
         (num_rows, logits_row_stride),
         dtype=torch.float32,
         device=device,
     )
-    # A single small row template broadcasts into the padded backing without a
-    # second allocation proportional to B. Its values are signed and non-tied.
+    # One row-sized template broadcasts into the exact padded production
+    # allocation. Never materialize a second [B*next_n, row_stride] source.
     column_template = torch.linspace(
         -1.0,
         1.0,
@@ -170,6 +183,31 @@ def _build_operands(
     lengths = per_request_lengths.unsqueeze(0).expand(batch_size, next_n).contiguous()
     flat_lengths = lengths.view(-1)
     out = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    return logits_backing, logits, lengths, flat_lengths, out
+
+
+def _build_operands(
+    torch: Any,
+    *,
+    batch_size: int,
+    context_len: int,
+    next_n: int,
+    max_model_len: int,
+    top_k: int,
+    logits_row_stride: int,
+    device: str,
+) -> _DsaPersistentTopkDecodeOperands:
+    """Build exact padded logits and pinned row-major decode lengths."""
+    logits_backing, logits, lengths, flat_lengths, out = _build_common_operands(
+        torch,
+        batch_size=batch_size,
+        context_len=context_len,
+        next_n=next_n,
+        max_model_len=max_model_len,
+        top_k=top_k,
+        logits_row_stride=logits_row_stride,
+        device=device,
+    )
 
     key_positions = torch.arange(max_model_len, dtype=torch.int32, device=device)
     valid_mask = key_positions.unsqueeze(0) < flat_lengths.unsqueeze(1)
@@ -189,6 +227,39 @@ def _build_operands(
         valid_mask=valid_mask,
         natural_output=natural_output,
         long_row_indices=long_row_indices,
+    )
+
+
+def _build_native_operands(
+    torch: Any,
+    *,
+    batch_size: int,
+    context_len: int,
+    next_n: int,
+    max_model_len: int,
+    top_k: int,
+    logits_row_stride: int,
+    device: str,
+) -> _DsaPersistentTopkDecodeNativeOperands:
+    """Build production operands without Torch-composite mask/top-k tensors."""
+    logits_backing, logits, lengths, flat_lengths, out = _build_common_operands(
+        torch,
+        batch_size=batch_size,
+        context_len=context_len,
+        next_n=next_n,
+        max_model_len=max_model_len,
+        top_k=top_k,
+        logits_row_stride=logits_row_stride,
+        device=device,
+    )
+    workspace = torch.empty((_WORKSPACE_BYTES,), dtype=torch.uint8, device=device)
+    return _DsaPersistentTopkDecodeNativeOperands(
+        logits_backing=logits_backing,
+        logits=logits,
+        lengths=lengths,
+        flat_lengths=flat_lengths,
+        out=out,
+        workspace=workspace,
     )
 
 
@@ -274,6 +345,99 @@ def _validate_semantics(
     for tensor in (operands.logits, operands.lengths):
         if torch._C._overlaps(operands.out, tensor):
             raise RuntimeError("Torch composite output aliases an input")
+
+
+def _native_call(
+    op: Any,
+    operands: _DsaPersistentTopkDecodeNativeOperands,
+    *,
+    top_k: int,
+    max_seq_len: int,
+) -> None:
+    """Invoke exactly the private pinned vLLM callable."""
+    return op(
+        operands.logits,
+        operands.lengths,
+        operands.out,
+        operands.workspace,
+        top_k,
+        max_seq_len,
+    )
+
+
+def _validate_native_semantics(
+    torch: Any,
+    op: Any,
+    operands: _DsaPersistentTopkDecodeNativeOperands,
+    *,
+    top_k: int,
+    max_seq_len: int,
+) -> None:
+    """Compare pinned CUDA output with the committed semantic reference."""
+    from profiling.runners.attention.dsa_persistent_topk_decode_reference import (
+        dsa_persistent_topk_decode_reference,
+    )
+
+    logits_before = operands.logits_backing.clone()
+    lengths_before = operands.lengths.clone()
+    expected = torch.empty_like(operands.out)
+    out_storage = operands.out.untyped_storage().data_ptr()
+    workspace_storage = operands.workspace.untyped_storage().data_ptr()
+    returned = _native_call(
+        op,
+        operands,
+        top_k=top_k,
+        max_seq_len=max_seq_len,
+    )
+    dsa_persistent_topk_decode_reference(
+        operands.logits,
+        operands.lengths,
+        expected,
+        top_k=top_k,
+        max_seq_len=max_seq_len,
+    )
+
+    short_rows = torch.nonzero(
+        operands.flat_lengths <= top_k,
+        as_tuple=False,
+    ).flatten()
+    if short_rows.numel() and not torch.equal(
+        operands.out.index_select(0, short_rows),
+        expected.index_select(0, short_rows),
+    ):
+        raise RuntimeError("pinned CUDA disagrees with natural/-1 reference rows")
+
+    long_rows = torch.nonzero(operands.flat_lengths > top_k, as_tuple=False).flatten()
+    if long_rows.numel():
+        actual_long = operands.out.index_select(0, long_rows).to(torch.int64)
+        expected_long = expected.index_select(0, long_rows).to(torch.int64)
+        if not torch.equal(
+            actual_long.sort(dim=1).values,
+            expected_long.sort(dim=1).values,
+        ):
+            raise RuntimeError("pinned CUDA disagrees with long-row reference selections")
+        long_logits = operands.logits.index_select(0, long_rows)
+        actual_values = long_logits.gather(1, actual_long)
+        expected_values = long_logits.gather(1, expected_long)
+        if not torch.equal(
+            actual_values.sort(dim=1).values,
+            expected_values.sort(dim=1).values,
+        ):
+            raise RuntimeError("pinned CUDA disagrees with long-row reference values")
+
+    if returned is not None:
+        raise RuntimeError("pinned persistent_topk must return None")
+    if operands.out.untyped_storage().data_ptr() != out_storage:
+        raise RuntimeError("pinned CUDA did not preserve caller-owned output storage")
+    if operands.workspace.untyped_storage().data_ptr() != workspace_storage:
+        raise RuntimeError("pinned CUDA did not preserve caller-owned workspace storage")
+    if not torch.equal(operands.logits_backing, logits_before):
+        raise RuntimeError("pinned CUDA mutated logits")
+    if not torch.equal(operands.lengths, lengths_before):
+        raise RuntimeError("pinned CUDA mutated lengths")
+    for tensor in (operands.logits, operands.lengths, operands.workspace):
+        if torch._C._overlaps(operands.out, tensor):
+            raise RuntimeError("pinned CUDA output aliases another operand")
 
 
 def _logical_bytes(
@@ -365,6 +529,117 @@ def profile_dsa_persistent_topk_decode_torch(
         # Logical traffic counts valid FP32 logits, one int32 length per row,
         # and all int32 output slots. It excludes padded columns, persistent
         # scratch workspace, Torch intermediates, and physical transactions.
+        logical_bytes = _logical_bytes(
+            batch_size=batch_size,
+            context_len=context_len,
+            next_n=next_n,
+            top_k=top_k,
+        )
+        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+        return ComputeMetrics(
+            time_ms=float(time_ms),
+            tflops=0.0,
+            memory_bandwidth_gbps=float(bandwidth_gbps),
+            energy_j=float(energy_j),
+        )
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def _load_native_op(torch: Any) -> Any:
+    from profiling.runners.attention.dsa_persistent_topk_native import (
+        NativeExtensionBuildError,
+        NativeExtensionLoadError,
+        NativeExtensionUnsupported,
+        load_persistent_topk_op,
+    )
+
+    try:
+        return load_persistent_topk_op(torch)
+    except NativeExtensionUnsupported as exc:
+        raise ProfilerNotImplemented(str(exc)) from exc
+    except (NativeExtensionBuildError, NativeExtensionLoadError) as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_dsa_persistent_topk_decode_vllm_cuda(
+    batch_size: int,
+    context_len: int,
+    next_n: int,
+    max_model_len: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    context_mode: str,
+) -> ComputeMetrics:
+    """Profile the complete pinned vLLM persistent/FilteredTopK callable."""
+    (
+        batch_size,
+        context_len,
+        next_n,
+        max_model_len,
+        top_k,
+        logits_row_stride,
+        _logits_dtype,
+        _index_dtype,
+        _context_mode,
+    ) = _validate_args(
+        batch_size,
+        context_len,
+        next_n,
+        max_model_len,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        context_mode,
+    )
+    try:
+        import torch
+    except ImportError as exc:
+        raise ProfilerNotImplemented(
+            "torch is required for the vllm_cuda dsa_persistent_topk_decode backend"
+        ) from exc
+
+    _validate_cuda_device(torch, backend="vllm_cuda")
+    op = _load_native_op(torch)
+
+    try:
+        operands = _build_native_operands(
+            torch,
+            batch_size=batch_size,
+            context_len=context_len,
+            next_n=next_n,
+            max_model_len=max_model_len,
+            top_k=top_k,
+            logits_row_stride=logits_row_stride,
+            device="cuda",
+        )
+        _validate_native_semantics(
+            torch,
+            op,
+            operands,
+            top_k=top_k,
+            max_seq_len=context_len,
+        )
+
+        def kernel() -> None:
+            return _native_call(
+                op,
+                operands,
+                top_k=top_k,
+                max_seq_len=context_len,
+            )
+
+        # Correctness above is the exact-shape first launch. Synchronize before
+        # formal timing so source verification, build/load, and setup are absent.
+        torch.cuda.synchronize()
+        time_ms = Timer.cuda_event(kernel, warmup=5)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+        # Logical traffic counts valid FP32 logits, one int32 length per row,
+        # and all int32 output slots. It excludes the 1 MiB scratch workspace,
+        # padded logits, intermediates, and physical memory transactions.
         logical_bytes = _logical_bytes(
             batch_size=batch_size,
             context_len=context_len,
