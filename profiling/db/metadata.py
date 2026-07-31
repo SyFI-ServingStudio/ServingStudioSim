@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from profiling.db.migrate import SCHEMA_HASH, SCHEMA_VERSION, migrate
+from profiling.db.migrate import SCHEMA_HASH, SCHEMA_VERSION
 from profiling.db.registry import iter_kernel_profiler_specs
 
 
@@ -25,8 +25,12 @@ class ProfilerVersion:
 
 
 def get_db_metadata(db_path: Path | str) -> DbMetadata:
-    migrate(db_path)
-    with sqlite3.connect(db_path) as conn:
+    conn = _connect_read_only(db_path)
+    if conn is None:
+        return DbMetadata(schema_version=SCHEMA_VERSION, schema_hash=SCHEMA_HASH)
+    with conn:
+        if not _table_exists(conn, "_db_metadata"):
+            return DbMetadata(schema_version=SCHEMA_VERSION, schema_hash=SCHEMA_HASH)
         rows = dict(conn.execute("SELECT key, value FROM _db_metadata").fetchall())
     return DbMetadata(
         schema_version=int(rows.get("schema_version", SCHEMA_VERSION)),
@@ -40,10 +44,12 @@ def get_profiler_versions(
     db_path: Path | str,
     used_op_families: list[str] | None = None,
 ) -> list[ProfilerVersion]:
-    migrate(db_path)
+    conn = _connect_read_only(db_path)
+    if conn is None:
+        return []
     selected = set(used_op_families or [])
     versions: set[tuple[str, str]] = set()
-    with sqlite3.connect(db_path) as conn:
+    with conn:
         for profiler_spec in iter_kernel_profiler_specs():
             op_family = profiler_spec.kernel_kind
             if selected and op_family not in selected and profiler_spec.table_name not in selected:
@@ -68,6 +74,15 @@ def get_profiler_versions(
         ProfilerVersion(op_family=op_family, profiler_git_hash=profiler_git_hash)
         for op_family, profiler_git_hash in sorted(versions)
     ]
+
+
+def _connect_read_only(db_path: Path | str) -> sqlite3.Connection | None:
+    path = Path(db_path)
+    if not path.is_file():
+        return None
+    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    conn.execute("PRAGMA query_only = ON")
+    return conn
 
 
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:

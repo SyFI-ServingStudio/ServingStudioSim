@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import subprocess
@@ -26,6 +27,7 @@ from profiling.db import (
     known_backends,
     run_profile_batch,
 )
+from profiling.db.metadata import get_db_metadata, get_profiler_versions
 from profiling.db.table import MissingEntry
 from profiling.exec import (
     ENV_REGISTRY,
@@ -768,6 +770,42 @@ def test_single_gemm_perf_api_query_path(tmp_path: Path, monkeypatch: pytest.Mon
     assert versions[0].op_family == "single_gemm"
 
 
+def test_profile_db_read_paths_do_not_mutate_existing_database(tmp_path: Path):
+    db_path = tmp_path / "profile.db"
+    profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
+    table = Table(profiler_spec, db_path)
+    args = SingleGemmArgs(m=8, n=8, k=8, dtype=DType.FP16)
+    table.insert(
+        [
+            ProfileRow(
+                args=args,
+                metrics=ComputeMetrics(
+                    time_ms=1.0,
+                    tflops=0.1,
+                    memory_bandwidth_gbps=0.2,
+                    energy_j=0.0,
+                ),
+                gpu_name="FakeGPU",
+                backend="torch",
+            )
+        ]
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE _db_metadata SET value = '2000-01-01 00:00:00' WHERE key = 'last_migrated_at'"
+        )
+
+    checksum_before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    table.query([args], backend="torch", gpu_name="FakeGPU")
+    table.exists([args], backend="torch", gpu_name="FakeGPU")
+    table.metadata()
+    get_db_metadata(db_path)
+    get_profiler_versions(db_path, ["single_gemm"])
+    checksum_after = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+    assert checksum_after == checksum_before
+
+
 def test_perf_api_force_refreshes_cached_rows_with_jit_disabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -834,7 +872,21 @@ def test_run_profile_batch_uses_gpu_pool_and_saves_table(tmp_path: Path):
 def test_table_schema_uses_metric_family_columns(tmp_path: Path):
     profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, tmp_path / "profile.db")
-    table.metadata()
+    table.insert(
+        [
+            ProfileRow(
+                args=SingleGemmArgs(m=8, n=8, k=8, dtype=DType.FP16),
+                metrics=ComputeMetrics(
+                    time_ms=1.0,
+                    tflops=0.1,
+                    memory_bandwidth_gbps=0.2,
+                    energy_j=0.0,
+                ),
+                gpu_name="FakeGPU",
+                backend="torch",
+            )
+        ]
+    )
 
     with sqlite3.connect(tmp_path / "profile.db") as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(single_gemm)")}
@@ -881,7 +933,21 @@ def test_table_schema_drops_metric_columns_from_other_family(tmp_path: Path):
 
     profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     table = Table(profiler_spec, db_path)
-    table.metadata()
+    table.insert(
+        [
+            ProfileRow(
+                args=SingleGemmArgs(m=8, n=8, k=8, dtype=DType.FP16),
+                metrics=ComputeMetrics(
+                    time_ms=1.0,
+                    tflops=0.1,
+                    memory_bandwidth_gbps=0.2,
+                    energy_j=0.0,
+                ),
+                gpu_name="FakeGPU",
+                backend="torch",
+            )
+        ]
+    )
 
     with sqlite3.connect(db_path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(single_gemm)")}
@@ -1049,8 +1115,7 @@ def test_table_replacement_policy_overwrites_same_profile_point(tmp_path: Path):
 
 def test_run_profile_batch_balances_specs_across_chunks(tmp_path: Path):
     specs = [
-        {"m": m, "n": 8, "k": 16, "dtype": "torch.float16", "backend": "torch"}
-        for m in range(1, 6)
+        {"m": m, "n": 8, "k": 16, "dtype": "torch.float16", "backend": "torch"} for m in range(1, 6)
     ]
     recording_chunks = [RecordingGpuChunk("FakeGPU0"), RecordingGpuChunk("FakeGPU1")]
     pool = RecordingPool(recording_chunks)
@@ -1085,9 +1150,7 @@ def test_run_profile_batch_balances_specs_across_chunks(tmp_path: Path):
 
 
 def test_local_gpu_pool_yields_non_overlapping_chunks():
-    reserved_chunks = list(
-        LocalGpuPool(gpus=[0, 1, 2, 3, 4]).acquire_chunks(2, max_concurrent=3)
-    )
+    reserved_chunks = list(LocalGpuPool(gpus=[0, 1, 2, 3, 4]).acquire_chunks(2, max_concurrent=3))
 
     assert [chunk.gpus for chunk in reserved_chunks] == [[0, 1], [2, 3]]
 
@@ -1102,10 +1165,11 @@ def test_find_idle_gpus_respects_parent_cuda_visible_devices(
         "<utilization><gpu_util>0 %</gpu_util></utilization>"
         "</gpu>"
     )
-    xml = "<nvidia_smi_log>" + "".join(
-        gpu_xml.format(uuid=f"GPU-{gpu_index}")
-        for gpu_index in range(4)
-    ) + "</nvidia_smi_log>"
+    xml = (
+        "<nvidia_smi_log>"
+        + "".join(gpu_xml.format(uuid=f"GPU-{gpu_index}") for gpu_index in range(4))
+        + "</nvidia_smi_log>"
+    )
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
     monkeypatch.setattr(
@@ -1170,14 +1234,11 @@ def test_single_gemm_perf_api_example_profile_cuda(
     set_default_pool(LocalGpuPool(gpus=[_first_visible_gpu_index()]))
     perf_api.disable_jit_profiling()
     try:
-        assert (
-            perf_api.count_missing_single_gemm(
-                profile_specs,
-                backend="torch",
-                gpu_name=gpu_name,
-            )
-            == len(profile_specs)
-        )
+        assert perf_api.count_missing_single_gemm(
+            profile_specs,
+            backend="torch",
+            gpu_name=gpu_name,
+        ) == len(profile_specs)
 
         perf_api.enable_jit_profiling()
         profile_results = perf_api.get_single_gemm_times(
@@ -1371,7 +1432,5 @@ def _first_visible_gpu_index() -> int:
     if not first_visible_device:
         return 0
     if not first_visible_device.isdecimal():
-        pytest.skip(
-            "perf_api GEMM profiling example needs a numeric CUDA_VISIBLE_DEVICES mask"
-        )
+        pytest.skip("perf_api GEMM profiling example needs a numeric CUDA_VISIBLE_DEVICES mask")
     return int(first_visible_device)

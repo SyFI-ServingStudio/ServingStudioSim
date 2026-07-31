@@ -14,6 +14,7 @@ def _json_stdout(capsys):
 
 
 def test_cli_count_missing_json_uses_perf_api_read_only(tmp_path, capsys):
+    db_path = tmp_path / "profile.db"
     exit_code = cli.main(
         [
             "count-missing",
@@ -23,7 +24,7 @@ def test_cli_count_missing_json_uses_perf_api_read_only(tmp_path, capsys):
             "--gpu-name",
             "FakeGPU",
             "--db",
-            str(tmp_path / "profile.db"),
+            str(db_path),
             "--spec",
             '{"m": 8, "n": 8, "k": 8, "dtype": "fp16"}',
             "--json",
@@ -35,6 +36,7 @@ def test_cli_count_missing_json_uses_perf_api_read_only(tmp_path, capsys):
     assert payload["ok"] is True
     assert payload["missing_count"] == 1
     assert payload["spec_count"] == 1
+    assert not db_path.exists()
 
 
 def test_cli_query_json_reads_existing_row(tmp_path, capsys):
@@ -148,8 +150,7 @@ def test_cli_run_accepts_batched_specs_from_flags_and_file(
 ):
     specs_path = tmp_path / "specs.jsonl"
     specs_path.write_text(
-        '{"m": 16, "n": 8, "k": 8, "dtype": "fp16"}\n'
-        '{"m": 32, "n": 8, "k": 8, "dtype": "fp16"}\n',
+        '{"m": 16, "n": 8, "k": 8, "dtype": "fp16"}\n{"m": 32, "n": 8, "k": 8, "dtype": "fp16"}\n',
         encoding="utf-8",
     )
     captured_specs = []

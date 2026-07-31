@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime
 from enum import Enum
@@ -15,7 +17,7 @@ from typing import Any, get_origin, get_type_hints
 
 from profiling.db.args import KernelArgs
 from profiling.db.kind import KernelKind
-from profiling.db.migrate import SCHEMA_HASH, migrate
+from profiling.db.migrate import SCHEMA_HASH, migrate_connection
 from profiling.db.registry import KernelProfilerSpec, MetricFamily
 from profiling.runners.metrics import CommMetrics, ComputeMetrics, Metrics
 
@@ -123,7 +125,6 @@ class Table:
     def insert(self, rows: list[ProfileRow]) -> None:
         if not rows:
             return
-        self._ensure_schema()
         metric_columns = self._metric_columns()
         self._validate_row_metric_family(rows)
         columns = [
@@ -138,16 +139,14 @@ class Table:
         # measurement/provenance columns and marks the row as freshly
         # verified/non-outlier. Key columns are not updated.
         replace_columns = [*STANDARD_COLUMNS[2:], *metric_columns]
-        updates = ", ".join(
-            f"{column}=excluded.{column}" for column in replace_columns
-        )
+        updates = ", ".join(f"{column}=excluded.{column}" for column in replace_columns)
         sql = f"""
             INSERT INTO {self.name} ({", ".join(columns)})
             VALUES ({placeholders})
             ON CONFLICT(gpu_name, backend, {", ".join(self.args_columns)})
             DO UPDATE SET {updates}, is_outlier=0, retry_count=0, outlier_reason=NULL
         """
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             conn.executemany(sql, [self._row_values(row, metric_columns) for row in rows])
 
     def query(
@@ -158,9 +157,13 @@ class Table:
         gpu_name: str,
         include_outliers: bool = False,
     ) -> list[Metrics | MissingEntry]:
-        self._ensure_schema()
         backend = backend or self.profiler_spec.backend
-        with self._connect() as conn:
+        conn = self._connect_read_only()
+        if conn is None:
+            return [self._missing_entry(args, backend, gpu_name) for args in args_list]
+        with conn:
+            if not self._table_exists(conn):
+                return [self._missing_entry(args, backend, gpu_name) for args in args_list]
             return [
                 self._query_one(conn, args, backend, gpu_name, include_outliers)
                 for args in args_list
@@ -173,14 +176,22 @@ class Table:
         backend: str | None = None,
         gpu_name: str,
     ) -> list[bool]:
-        self._ensure_schema()
         backend = backend or self.profiler_spec.backend
-        with self._connect() as conn:
+        conn = self._connect_read_only()
+        if conn is None:
+            return [False for _ in args_list]
+        with conn:
+            if not self._table_exists(conn):
+                return [False for _ in args_list]
             return [self._exists_one(conn, args, backend, gpu_name) for args in args_list]
 
     def metadata(self) -> TableMetadata:
-        self._ensure_schema()
-        with self._connect() as conn:
+        conn = self._connect_read_only()
+        if conn is None:
+            return self._empty_metadata()
+        with conn:
+            if not self._table_exists(conn):
+                return self._empty_metadata()
             row = conn.execute(f"SELECT COUNT(*) AS n FROM {self.name}").fetchone()
             hashes = conn.execute(
                 f"""
@@ -197,54 +208,92 @@ class Table:
             profiler_git_hashes=tuple(str(hash_row["profiler_git_hash"]) for hash_row in hashes),
         )
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+    @contextmanager
+    def _write_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Own schema preparation and persistence as one write transaction."""
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            migrate_connection(conn)
+            self._ensure_schema(conn)
+            yield conn
+
+    def _connect_read_only(self) -> sqlite3.Connection | None:
+        """Open a physically read-only connection without creating the DB."""
+        if not self.db_path.is_file():
+            return None
+        conn = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
         return conn
 
-    def _ensure_schema(self) -> None:
-        migrate(self.db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        """Prepare this table inside an already-open write transaction."""
         type_hints = get_type_hints(self.profiler_spec.args_schema)
         arg_defs = ",\n                ".join(
             f"{field.name} {_sqlite_type(type_hints[field.name])} NOT NULL"
             for field in fields(self.profiler_spec.args_schema)
         )
         metric_defs = ",\n                    ".join(
-            f"{column} {column_def}"
-            for column, column_def in self._metric_create_defs().items()
+            f"{column} {column_def}" for column, column_def in self._metric_create_defs().items()
         )
         unique_args = ", ".join(self.args_columns)
-        with self._connect() as conn:
-            conn.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {self.name} (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    gpu_name TEXT NOT NULL,
-                    backend TEXT NOT NULL,
-                    {arg_defs},
-                    profiler_git_hash TEXT NOT NULL,
-                    profiler_run_at TEXT NOT NULL,
-                    cuda_version TEXT,
-                    driver_version TEXT,
-                    backend_version TEXT,
-                    verified INTEGER NOT NULL DEFAULT 0,
-                    {metric_defs},
-                    is_outlier INTEGER NOT NULL DEFAULT 0,
-                    retry_count INTEGER NOT NULL DEFAULT 0,
-                    outlier_reason TEXT,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(gpu_name, backend, {unique_args})
-                )
-                """
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                gpu_name TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                {arg_defs},
+                profiler_git_hash TEXT NOT NULL,
+                profiler_run_at TEXT NOT NULL,
+                cuda_version TEXT,
+                driver_version TEXT,
+                backend_version TEXT,
+                verified INTEGER NOT NULL DEFAULT 0,
+                {metric_defs},
+                is_outlier INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                outlier_reason TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(gpu_name, backend, {unique_args})
             )
-            self._ensure_standard_columns(conn)
-            self._ensure_metric_columns(conn)
+            """
+        )
+        self._ensure_standard_columns(conn)
+        self._ensure_metric_columns(conn)
+
+    def _table_exists(self, conn: sqlite3.Connection) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            (self.name,),
+        ).fetchone()
+        return row is not None
+
+    def _empty_metadata(self) -> TableMetadata:
+        return TableMetadata(
+            name=self.name,
+            row_count=0,
+            schema_hash=SCHEMA_HASH,
+            profiler_git_hashes=(),
+        )
+
+    def _missing_entry(
+        self,
+        args: KernelArgs,
+        backend: str,
+        gpu_name: str,
+    ) -> MissingEntry:
+        return MissingEntry(
+            kernel_kind=self.profiler_spec.kernel_kind,
+            backend=backend,
+            gpu_name=gpu_name,
+            args=args,
+        )
 
     def _ensure_standard_columns(self, conn: sqlite3.Connection) -> None:
         existing = {
-            row["name"]
-            for row in conn.execute(f"PRAGMA table_info({self.name})").fetchall()
+            row["name"] for row in conn.execute(f"PRAGMA table_info({self.name})").fetchall()
         }
         alter_defs = {
             "profiler_git_hash": "TEXT DEFAULT 'unknown'",
@@ -260,8 +309,7 @@ class Table:
 
     def _ensure_metric_columns(self, conn: sqlite3.Connection) -> None:
         existing = {
-            row["name"]
-            for row in conn.execute(f"PRAGMA table_info({self.name})").fetchall()
+            row["name"] for row in conn.execute(f"PRAGMA table_info({self.name})").fetchall()
         }
         metric_columns = set(self._metric_columns())
         for column, column_def in METRIC_ALTER_DEFS_BY_FAMILY[
