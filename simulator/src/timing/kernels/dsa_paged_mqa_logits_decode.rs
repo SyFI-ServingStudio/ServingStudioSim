@@ -2,8 +2,9 @@
 //!
 //! The first cache stays on the physical `(batch_size, context_len)` coordinates.
 //! Its boundary points bracket the block-64 page seams, the 256-token DeepGEMM
-//! scheduler segments, and the H200's 132-SM batch wave. R.4 must establish
-//! whether physical bilinear interpolation is sufficient before any re-axis.
+//! scheduler segments, and the H200's 132-SM batch wave. Measured R.4 misses add
+//! batches 130/185 for interior interpolation, context 5793 for the diagonal
+//! interaction, and batches 384/512 to bound the tested extrapolation domain.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -50,9 +51,12 @@ impl KernelSpec for DsaPagedMqaLogitsDecodeSpec {
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
         SweepGrid::new(vec![
-            Axis::values([1, 2, 4, 8, 16, 32, 64, 127, 128, 129, 131, 132, 133, 256]),
             Axis::values([
-                1, 63, 64, 65, 128, 255, 256, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+                1, 2, 4, 8, 16, 32, 64, 127, 128, 129, 130, 131, 132, 133, 185, 256, 384, 512,
+            ]),
+            Axis::values([
+                1, 63, 64, 65, 128, 255, 256, 257, 512, 1024, 2048, 4096, 5793, 8192, 16384, 32768,
+                65536,
             ]),
         ])
     }
@@ -111,11 +115,12 @@ mod tests {
     const TORCH_BACKEND: &str = "torch";
     const DEEPGEMM_BACKEND: &str = "vllm_deepgemm_fp8";
     const BATCH_AXIS: &[f64] = &[
-        1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 127.0, 128.0, 129.0, 131.0, 132.0, 133.0, 256.0,
+        1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 127.0, 128.0, 129.0, 130.0, 131.0, 132.0, 133.0,
+        185.0, 256.0, 384.0, 512.0,
     ];
     const CONTEXT_AXIS: &[f64] = &[
-        1.0, 63.0, 64.0, 65.0, 128.0, 255.0, 256.0, 257.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
-        16384.0, 32768.0, 65536.0,
+        1.0, 63.0, 64.0, 65.0, 128.0, 255.0, 256.0, 257.0, 512.0, 1024.0, 2048.0, 4096.0, 5793.0,
+        8192.0, 16384.0, 32768.0, 65536.0,
     ];
 
     fn config(max_model_len: u32) -> DsaPagedMqaLogitsDecodeKernelConfig {
@@ -232,19 +237,23 @@ mod tests {
         assert_eq!(axes.len(), 2);
         assert_eq!(axes[0], BATCH_AXIS);
         assert_eq!(axes[1], CONTEXT_AXIS);
-        assert_eq!(axes[0].len(), 14);
-        assert_eq!(axes[1].len(), 16);
+        assert_eq!(axes[0].len(), 18);
+        assert_eq!(axes[1].len(), 17);
         assert!(axes[0].windows(2).all(|pair| pair[0] < pair[1]));
         assert!(axes[1].windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(&axes[0][7..10], &[127.0, 128.0, 129.0]);
-        assert_eq!(&axes[0][10..13], &[131.0, 132.0, 133.0]);
+        assert_eq!(&axes[0][9..12], &[129.0, 130.0, 131.0]);
+        assert_eq!(&axes[0][11..14], &[131.0, 132.0, 133.0]);
+        assert_eq!(&axes[0][13..16], &[133.0, 185.0, 256.0]);
+        assert_eq!(&axes[0][15..18], &[256.0, 384.0, 512.0]);
         assert_eq!(&axes[1][1..4], &[63.0, 64.0, 65.0]);
         assert_eq!(&axes[1][5..8], &[255.0, 256.0, 257.0]);
+        assert_eq!(&axes[1][11..14], &[4096.0, 5793.0, 8192.0]);
         assert_eq!(axes[0].first(), Some(&1.0));
-        assert_eq!(axes[0].last(), Some(&256.0));
+        assert_eq!(axes[0].last(), Some(&512.0));
         assert_eq!(axes[1].first(), Some(&1.0));
         assert_eq!(axes[1].last(), Some(&65536.0));
-        assert_eq!(axes[0].len() * axes[1].len(), 224);
+        assert_eq!(axes[0].len() * axes[1].len(), 306);
     }
 
     #[test]
@@ -252,18 +261,18 @@ mod tests {
         let large_cfg = config(131072);
         let grid = DsaPagedMqaLogitsDecodeSpec::sweep_grid(&large_cfg);
         let unbounded_mask = DsaPagedMqaLogitsDecodeSpec::infeasible_mask(&large_cfg, &grid);
-        assert_eq!(unbounded_mask.len(), 224);
+        assert_eq!(unbounded_mask.len(), 306);
         assert_eq!(unbounded_mask.iter().filter(|&&masked| masked).count(), 0);
         assert_eq!(
             unbounded_mask.iter().filter(|&&masked| !masked).count(),
-            224
+            306
         );
 
         let bounded_cfg = config(256);
         let bounded_mask = DsaPagedMqaLogitsDecodeSpec::infeasible_mask(&bounded_cfg, &grid);
-        assert_eq!(bounded_mask.len(), 224);
-        assert_eq!(bounded_mask.iter().filter(|&&masked| masked).count(), 126);
-        assert_eq!(bounded_mask.iter().filter(|&&masked| !masked).count(), 98);
+        assert_eq!(bounded_mask.len(), 306);
+        assert_eq!(bounded_mask.iter().filter(|&&masked| masked).count(), 180);
+        assert_eq!(bounded_mask.iter().filter(|&&masked| !masked).count(), 126);
 
         let context_count = grid.axes()[1].len();
         let masked = |batch_size: f64, context_len: f64| {
@@ -277,10 +286,11 @@ mod tests {
                 .unwrap();
             bounded_mask[i * context_count + j]
         };
-        for batch_size in [1.0, 132.0, 256.0] {
+        for batch_size in [1.0, 130.0, 132.0, 185.0, 384.0, 512.0] {
             assert!(!masked(batch_size, 255.0));
             assert!(!masked(batch_size, 256.0));
             assert!(masked(batch_size, 257.0));
+            assert!(masked(batch_size, 5793.0));
         }
     }
 
@@ -302,7 +312,7 @@ mod tests {
         let grid = DsaPagedMqaLogitsDecodeSpec::sweep_grid(&cfg);
         let payloads = DsaPagedMqaLogitsDecodeSpec::enumerate(&cfg, &grid, DEEPGEMM_BACKEND);
 
-        assert_eq!(payloads.len(), 224);
+        assert_eq!(payloads.len(), 306);
         let expected_names = [
             "backend",
             "batch_size",
@@ -329,9 +339,12 @@ mod tests {
         }
 
         assert_payload(&payloads[0], DEEPGEMM_BACKEND, 1, 1);
-        assert_payload(&payloads[15], DEEPGEMM_BACKEND, 1, 65536);
-        assert_payload(&payloads[16], DEEPGEMM_BACKEND, 2, 1);
-        assert_payload(payloads.last().unwrap(), DEEPGEMM_BACKEND, 256, 65536);
+        assert_payload(&payloads[16], DEEPGEMM_BACKEND, 1, 65536);
+        assert_payload(&payloads[17], DEEPGEMM_BACKEND, 2, 1);
+        assert_payload(&payloads[178], DEEPGEMM_BACKEND, 130, 512);
+        assert_payload(&payloads[250], DEEPGEMM_BACKEND, 185, 5793);
+        assert_payload(&payloads[280], DEEPGEMM_BACKEND, 384, 512);
+        assert_payload(payloads.last().unwrap(), DEEPGEMM_BACKEND, 512, 65536);
     }
 
     fn assert_payload(
