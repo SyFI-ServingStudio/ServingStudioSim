@@ -1,12 +1,9 @@
 //! GLM-5.2 DSA persistent decode top-k kernel.
 //!
 //! The cache stays on physical `(batch_size, context_len)` coordinates. Measured
-//! R.4 evidence added context 2046 for the pre-K interpolation miss and batches
-//! 12, 46/48, 92/96, and 130 for batch-axis and interaction cliffs. The corrected
-//! backend now uses cooperative radix for every nontrivial row, so B31/32/33 and
-//! B15/16/17 remain conservative sampling boundaries rather than production
-//! dispatch transitions. Existing common-batch, H200-wave, and context points
-//! remain unchanged. This changes neither the cache algorithm nor the public
+//! next_n=2 R.4 failures added B23/B24/B39 and C256/C2050/C2897/C5792 to repair
+//! speculative interpolation while retaining all prior next_n=1 and production-
+//! boundary samples. This changes neither the cache algorithm nor the public
 //! physical query contract.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
@@ -47,12 +44,12 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
         SweepGrid::new(vec![
             Axis::values([
-                1, 2, 4, 8, 12, 15, 16, 17, 31, 32, 33, 46, 48, 64, 65, 66, 67, 92, 96, 127, 128,
-                129, 130, 131, 132, 133, 197, 198, 199, 255, 256,
+                1, 2, 4, 8, 12, 15, 16, 17, 23, 24, 31, 32, 33, 39, 46, 48, 64, 65, 66, 67, 92, 96,
+                127, 128, 129, 130, 131, 132, 133, 197, 198, 199, 255, 256,
             ]),
             Axis::values([
-                0, 1, 2, 128, 512, 1024, 2046, 2047, 2048, 2049, 4096, 8191, 8192, 8193, 16384,
-                32767, 32768, 32769, 65536, 131072,
+                0, 1, 2, 128, 256, 512, 1024, 2046, 2047, 2048, 2049, 2050, 2897, 4096, 5792, 8191,
+                8192, 8193, 16384, 32767, 32768, 32769, 65536, 131072,
             ]),
         ])
     }
@@ -107,13 +104,14 @@ mod tests {
     const TORCH_BACKEND: &str = "torch";
     const VLLM_BACKEND: &str = "vllm_cuda";
     const BATCH_AXIS: &[f64] = &[
-        1.0, 2.0, 4.0, 8.0, 12.0, 15.0, 16.0, 17.0, 31.0, 32.0, 33.0, 46.0, 48.0, 64.0, 65.0, 66.0,
-        67.0, 92.0, 96.0, 127.0, 128.0, 129.0, 130.0, 131.0, 132.0, 133.0, 197.0, 198.0, 199.0,
-        255.0, 256.0,
+        1.0, 2.0, 4.0, 8.0, 12.0, 15.0, 16.0, 17.0, 23.0, 24.0, 31.0, 32.0, 33.0, 39.0, 46.0, 48.0,
+        64.0, 65.0, 66.0, 67.0, 92.0, 96.0, 127.0, 128.0, 129.0, 130.0, 131.0, 132.0, 133.0, 197.0,
+        198.0, 199.0, 255.0, 256.0,
     ];
     const CONTEXT_AXIS: &[f64] = &[
-        0.0, 1.0, 2.0, 128.0, 512.0, 1024.0, 2046.0, 2047.0, 2048.0, 2049.0, 4096.0, 8191.0,
-        8192.0, 8193.0, 16384.0, 32767.0, 32768.0, 32769.0, 65536.0, 131072.0,
+        0.0, 1.0, 2.0, 128.0, 256.0, 512.0, 1024.0, 2046.0, 2047.0, 2048.0, 2049.0, 2050.0, 2897.0,
+        4096.0, 5792.0, 8191.0, 8192.0, 8193.0, 16384.0, 32767.0, 32768.0, 32769.0, 65536.0,
+        131072.0,
     ];
 
     fn config(next_n: u32) -> DsaPersistentTopkDecodeKernelConfig {
@@ -213,29 +211,34 @@ mod tests {
         assert_eq!(axes.len(), 2);
         assert_eq!(axes[0], BATCH_AXIS);
         assert_eq!(axes[1], CONTEXT_AXIS);
-        assert_eq!(axes[0].len(), 31);
-        assert_eq!(axes[1].len(), 20);
+        assert_eq!(axes[0].len(), 34);
+        assert_eq!(axes[1].len(), 24);
         assert!(axes[0].windows(2).all(|pair| pair[0] < pair[1]));
         assert!(axes[1].windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(&axes[0][3..6], &[8.0, 12.0, 15.0]);
         assert_eq!(&axes[0][5..8], &[15.0, 16.0, 17.0]);
-        assert_eq!(&axes[0][8..11], &[31.0, 32.0, 33.0]);
-        assert_eq!(&axes[0][10..14], &[33.0, 46.0, 48.0, 64.0]);
-        assert_eq!(&axes[0][14..17], &[65.0, 66.0, 67.0]);
-        assert_eq!(&axes[0][16..20], &[67.0, 92.0, 96.0, 127.0]);
-        assert_eq!(&axes[0][19..22], &[127.0, 128.0, 129.0]);
-        assert_eq!(&axes[0][21..24], &[129.0, 130.0, 131.0]);
-        assert_eq!(&axes[0][23..26], &[131.0, 132.0, 133.0]);
-        assert_eq!(&axes[0][26..29], &[197.0, 198.0, 199.0]);
-        assert_eq!(&axes[1][5..10], &[1024.0, 2046.0, 2047.0, 2048.0, 2049.0]);
-        assert_eq!(&axes[1][7..10], &[2047.0, 2048.0, 2049.0]);
-        assert_eq!(&axes[1][11..14], &[8191.0, 8192.0, 8193.0]);
-        assert_eq!(&axes[1][15..18], &[32767.0, 32768.0, 32769.0]);
+        assert_eq!(&axes[0][7..11], &[17.0, 23.0, 24.0, 31.0]);
+        assert_eq!(&axes[0][10..13], &[31.0, 32.0, 33.0]);
+        assert_eq!(&axes[0][12..15], &[33.0, 39.0, 46.0]);
+        assert_eq!(&axes[0][13..17], &[39.0, 46.0, 48.0, 64.0]);
+        assert_eq!(&axes[0][17..20], &[65.0, 66.0, 67.0]);
+        assert_eq!(&axes[0][19..23], &[67.0, 92.0, 96.0, 127.0]);
+        assert_eq!(&axes[0][22..25], &[127.0, 128.0, 129.0]);
+        assert_eq!(&axes[0][24..27], &[129.0, 130.0, 131.0]);
+        assert_eq!(&axes[0][26..29], &[131.0, 132.0, 133.0]);
+        assert_eq!(&axes[0][29..32], &[197.0, 198.0, 199.0]);
+        assert_eq!(&axes[1][3..6], &[128.0, 256.0, 512.0]);
+        assert_eq!(&axes[1][6..11], &[1024.0, 2046.0, 2047.0, 2048.0, 2049.0]);
+        assert_eq!(&axes[1][8..11], &[2047.0, 2048.0, 2049.0]);
+        assert_eq!(&axes[1][9..14], &[2048.0, 2049.0, 2050.0, 2897.0, 4096.0]);
+        assert_eq!(&axes[1][13..16], &[4096.0, 5792.0, 8191.0]);
+        assert_eq!(&axes[1][15..18], &[8191.0, 8192.0, 8193.0]);
+        assert_eq!(&axes[1][19..22], &[32767.0, 32768.0, 32769.0]);
         assert_eq!(axes[0].first(), Some(&1.0));
         assert_eq!(axes[0].last(), Some(&256.0));
         assert_eq!(axes[1].first(), Some(&0.0));
         assert_eq!(axes[1].last(), Some(&131072.0));
-        assert_eq!(axes[0].len() * axes[1].len(), 620);
+        assert_eq!(axes[0].len() * axes[1].len(), 816);
     }
 
     #[test]
@@ -243,15 +246,18 @@ mod tests {
         let next_one = config(1);
         let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&next_one);
         let next_one_mask = DsaPersistentTopkDecodeSpec::infeasible_mask(&next_one, &grid);
-        assert_eq!(next_one_mask.len(), 620);
+        assert_eq!(next_one_mask.len(), 816);
         assert_eq!(next_one_mask.iter().filter(|&&masked| masked).count(), 0);
-        assert_eq!(next_one_mask.iter().filter(|&&masked| !masked).count(), 620);
+        let next_one_feasible = next_one_mask.iter().filter(|&&masked| !masked).count();
+        assert_eq!(next_one_feasible, 816);
 
         let next_two = config(2);
         let next_two_mask = DsaPersistentTopkDecodeSpec::infeasible_mask(&next_two, &grid);
-        assert_eq!(next_two_mask.len(), 620);
-        assert_eq!(next_two_mask.iter().filter(|&&masked| masked).count(), 31);
-        assert_eq!(next_two_mask.iter().filter(|&&masked| !masked).count(), 589);
+        assert_eq!(next_two_mask.len(), 816);
+        assert_eq!(next_two_mask.iter().filter(|&&masked| masked).count(), 34);
+        let next_two_feasible = next_two_mask.iter().filter(|&&masked| !masked).count();
+        assert_eq!(next_two_feasible, 782);
+        assert_eq!(next_one_feasible + next_two_feasible, 1598);
 
         let context_count = grid.axes()[1].len();
         let masked = |batch_size: f64, context_len: f64| {
@@ -270,7 +276,7 @@ mod tests {
             assert!(!masked(*batch_size, 1.0));
             assert!(!masked(*batch_size, 131072.0));
         }
-        for batch_size in [12.0, 46.0, 48.0, 92.0, 96.0, 130.0] {
+        for batch_size in [12.0, 23.0, 24.0, 39.0, 46.0, 48.0, 92.0, 96.0, 130.0] {
             assert!(masked(batch_size, 0.0));
             assert!(!masked(batch_size, 1.0));
             assert!(!masked(batch_size, 131072.0));
@@ -296,7 +302,7 @@ mod tests {
             let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&cfg);
             let payloads = DsaPersistentTopkDecodeSpec::enumerate(&cfg, &grid, VLLM_BACKEND);
 
-            assert_eq!(payloads.len(), 620);
+            assert_eq!(payloads.len(), 816);
             let expected_names = [
                 "backend",
                 "batch_size",
@@ -331,11 +337,29 @@ mod tests {
                 2049,
                 next_n,
             );
-            for batch_size in [12, 46, 48, 92, 96, 130] {
+            for batch_size in [12, 23, 24, 39, 46, 48, 92, 96, 130] {
                 assert_payload(
                     payload_for(&payloads, &grid, batch_size, 2046),
                     batch_size,
                     2046,
+                    next_n,
+                );
+            }
+            for (batch_size, context_len) in [
+                (23, 4096),
+                (24, 131072),
+                (32, 2897),
+                (39, 5792),
+                (39, 65536),
+                (64, 2050),
+                (66, 256),
+                (128, 2050),
+                (256, 2050),
+            ] {
+                assert_payload(
+                    payload_for(&payloads, &grid, batch_size, context_len),
+                    batch_size,
+                    context_len,
                     next_n,
                 );
             }
