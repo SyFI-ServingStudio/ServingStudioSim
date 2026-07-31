@@ -22,6 +22,7 @@ from profiling.runners.attention.dsa_topk_prefill_reference import (
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 
 _BACKEND = "torch"
+_VLLM_BACKEND = "vllm_cuda"
 _BASE_SPEC = {
     "num_queries": 128,
     "num_keys": 8192,
@@ -62,7 +63,7 @@ def test_registration_support_and_facades() -> None:
     spec = find_kernel_profiler_spec(KIND, _BACKEND)
 
     assert KIND == "dsa_topk_prefill"
-    assert known_backends(KIND) == [_BACKEND]
+    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.args_schema is DsaTopkPrefillArgs
     assert spec.metric_family is MetricFamily.COMPUTE
@@ -78,6 +79,28 @@ def test_registration_support_and_facades() -> None:
     assert hasattr(perf_api, "count_missing_dsa_topk_prefill")
 
 
+def test_vllm_registration_reuses_schema_table_family_support_and_facades() -> None:
+    torch_spec = find_kernel_profiler_spec(KIND, _BACKEND)
+    vllm_spec = find_kernel_profiler_spec(KIND, _VLLM_BACKEND)
+
+    assert vllm_spec.kernel_kind == torch_spec.kernel_kind == KIND
+    assert vllm_spec.table_name == torch_spec.table_name == KIND
+    assert vllm_spec.args_schema is torch_spec.args_schema is DsaTopkPrefillArgs
+    assert vllm_spec.metric_family is torch_spec.metric_family is MetricFamily.COMPUTE
+    assert vllm_spec.batch_outlier_policy == torch_spec.batch_outlier_policy
+    assert vllm_spec.batch_outlier_policy == BatchOutlierPolicy()
+    assert torch_spec.subprocess_env is None
+    assert vllm_spec.subprocess_env == "vllm_env"
+    assert vllm_spec.supports.kv is None
+    assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
+    assert not vllm_spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
+    assert not vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+    assert vllm_spec.runner_ref.module_name == ("profiling.runners.attention.dsa_topk_prefill")
+    assert vllm_spec.runner_ref.function_name == ("profile_dsa_topk_prefill_vllm_cuda")
+    assert hasattr(perf_api, "get_dsa_topk_prefill_times")
+    assert hasattr(perf_api, "count_missing_dsa_topk_prefill")
+
+
 def test_registry_barrel_import_is_lazy() -> None:
     completed = subprocess.run(
         [
@@ -86,6 +109,7 @@ def test_registry_barrel_import_is_lazy() -> None:
             (
                 "import sys; import profiling.kernels; "
                 "print('torch' in sys.modules); "
+                "print('vllm' in sys.modules); "
                 "print('profiling.runners.attention.dsa_topk_prefill' in sys.modules)"
             ),
         ],
@@ -93,7 +117,7 @@ def test_registry_barrel_import_is_lazy() -> None:
         capture_output=True,
         text=True,
     )
-    assert completed.stdout.splitlines() == ["False", "False"]
+    assert completed.stdout.splitlines() == ["False", "False", "False"]
 
 
 def test_runner_ref_resolves_without_importing_torch() -> None:
@@ -105,8 +129,11 @@ def test_runner_ref_resolves_without_importing_torch() -> None:
                 "import sys; from profiling.db.registry import "
                 "find_kernel_profiler_spec; runner = find_kernel_profiler_spec("
                 "'dsa_topk_prefill', 'torch').runner_ref.load(); "
+                "vllm_runner = find_kernel_profiler_spec("
+                "'dsa_topk_prefill', 'vllm_cuda').runner_ref.load(); "
                 "print(runner.__module__); print(runner.__name__); "
-                "print('torch' in sys.modules)"
+                "print(vllm_runner.__module__); print(vllm_runner.__name__); "
+                "print('torch' in sys.modules); print('vllm' in sys.modules)"
             ),
         ],
         check=True,
@@ -116,6 +143,9 @@ def test_runner_ref_resolves_without_importing_torch() -> None:
     assert completed.stdout.splitlines() == [
         "profiling.runners.attention.dsa_topk_prefill",
         "profile_dsa_topk_prefill_torch",
+        "profiling.runners.attention.dsa_topk_prefill",
+        "profile_dsa_topk_prefill_vllm_cuda",
+        "False",
         "False",
     ]
 
@@ -168,6 +198,83 @@ def test_rejects_missing_cuda_and_unverified_gpu() -> None:
     )
     with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
         _validate_cuda_device(h100)
+
+
+def test_vllm_rejects_missing_cuda_and_unverified_gpu() -> None:
+    from profiling.runners.attention.dsa_topk_prefill import (
+        _validate_vllm_cuda_device,
+    )
+
+    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
+        _validate_vllm_cuda_device(no_cuda)
+
+    h100 = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: "NVIDIA H100",
+        )
+    )
+    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
+        _validate_vllm_cuda_device(h100)
+
+
+def test_vllm_rejects_common_and_backend_specific_args_before_loading(
+    monkeypatch,
+) -> None:
+    from profiling.runners.attention import dsa_topk_prefill as runner
+
+    loaded = False
+
+    def fail_if_loaded():
+        nonlocal loaded
+        loaded = True
+        raise AssertionError("vLLM loader must not run")
+
+    monkeypatch.setattr(runner, "_load_vllm_cuda_backend", fail_if_loaded)
+    invalid_cases = [
+        ({"num_queries": 0}, "must be > 0"),
+        ({"num_keys": 0}, "must be > 0"),
+        ({"num_queries": 129, "num_keys": 128}, "must be <= num_keys"),
+        ({"num_sequences": 2}, "num_sequences=1"),
+        ({"top_k": 1024}, "top_k=2048"),
+        ({"logits_row_stride": 0}, "positive and >= num_keys"),
+        ({"logits_row_stride": 4095}, "positive and >= num_keys"),
+        ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
+        ({"index_dtype": "int64"}, "index_dtype='int32'"),
+        ({"span_mode": "ragged"}, "single_causal_tail"),
+        ({"num_queries": 4097}, "num_queries <= 4096"),
+    ]
+    for overrides, match in invalid_cases:
+        kwargs = dict(_BASE_SPEC)
+        kwargs.update(overrides)
+        with pytest.raises(ValueError, match=match):
+            runner.profile_dsa_topk_prefill_vllm_cuda(**kwargs)
+    assert not loaded
+
+
+def test_vllm_op_resolution_requires_registered_callable() -> None:
+    from profiling.runners.attention.dsa_topk_prefill import (
+        _resolve_vllm_prefill_op,
+    )
+
+    missing_namespace = SimpleNamespace(ops=SimpleNamespace())
+    with pytest.raises(ProfilerNotImplemented, match="torch.ops._C is unavailable"):
+        _resolve_vllm_prefill_op(missing_namespace)
+
+    missing_op = SimpleNamespace(ops=SimpleNamespace(_C=SimpleNamespace()))
+    with pytest.raises(
+        ProfilerNotImplemented,
+        match="top_k_per_row_prefill is unavailable",
+    ):
+        _resolve_vllm_prefill_op(missing_op)
+
+    noncallable = SimpleNamespace(
+        ops=SimpleNamespace(_C=SimpleNamespace(top_k_per_row_prefill=object()))
+    )
+    with pytest.raises(ProfilerNotImplemented, match="is not callable"):
+        _resolve_vllm_prefill_op(noncallable)
 
 
 def test_operand_layout_and_causal_tail_spans() -> None:
@@ -321,3 +428,87 @@ def test_profile_translates_runtime_failure(monkeypatch) -> None:
     )
     with pytest.raises(KernelLaunchFailed, match="synthetic failure"):
         runner.profile_dsa_topk_prefill_torch(**_BASE_SPEC)
+
+
+def test_vllm_profile_forwards_exact_operands_and_arguments(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_topk_prefill as runner
+
+    operands = runner._build_operands(
+        torch,
+        num_queries=1,
+        num_keys=2048,
+        top_k=2048,
+        logits_row_stride=2304,
+        device="cpu",
+    )
+    calls = []
+
+    def fake_op(*args):
+        calls.append(args)
+        return None
+
+    fake_torch = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda: None))
+    monkeypatch.setattr(
+        runner,
+        "_load_vllm_cuda_backend",
+        lambda: (fake_torch, fake_op),
+    )
+    monkeypatch.setattr(runner, "_validate_vllm_cuda_device", lambda _torch: None)
+    monkeypatch.setattr(runner, "_build_operands", lambda *args, **kwargs: operands)
+
+    def fake_cupti(kernel, *, kernel_name):
+        assert kernel_name == "topKPerRowPrefill"
+        assert kernel() is None
+        return 0.5
+
+    monkeypatch.setattr(runner.Timer, "cupti", fake_cupti)
+    monkeypatch.setattr(runner.Energy, "perf", lambda *args, **kwargs: 0.25)
+
+    metrics = runner.profile_dsa_topk_prefill_vllm_cuda(
+        **(_BASE_SPEC | {"num_queries": 1, "num_keys": 2048, "logits_row_stride": 2304})
+    )
+
+    assert len(calls) == 2  # exact-shape warmup, then the timed callable
+    for call in calls:
+        assert call == (
+            operands.logits,
+            operands.row_starts,
+            operands.row_ends,
+            operands.out,
+            1,
+            2304,
+            1,
+            2048,
+        )
+    assert metrics.time_ms == 0.5
+    assert metrics.energy_j == 0.25
+    assert metrics.tflops == 0.0
+    assert metrics.memory_bandwidth_gbps > 0
+
+
+def test_vllm_profile_translates_runtime_failure(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_topk_prefill as runner
+
+    fake_torch = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda: None))
+
+    def fail_launch(*args):
+        raise RuntimeError("synthetic vLLM launch failure")
+
+    monkeypatch.setattr(
+        runner,
+        "_load_vllm_cuda_backend",
+        lambda: (fake_torch, fail_launch),
+    )
+    monkeypatch.setattr(runner, "_validate_vllm_cuda_device", lambda _torch: None)
+    monkeypatch.setattr(
+        runner,
+        "_build_operands",
+        lambda *args, **kwargs: SimpleNamespace(
+            logits=SimpleNamespace(stride=lambda dim: (8448, 1)[dim]),
+            row_starts=object(),
+            row_ends=object(),
+            out=object(),
+        ),
+    )
+    with pytest.raises(KernelLaunchFailed, match="synthetic vLLM launch failure"):
+        runner.profile_dsa_topk_prefill_vllm_cuda(**_BASE_SPEC)

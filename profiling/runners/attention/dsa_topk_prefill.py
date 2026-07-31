@@ -24,6 +24,8 @@ _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _SPAN_MODE = "single_causal_tail"
 _REQUIRED_GPU = "NVIDIA H200"
+_VLLM_MAX_QUERIES = 4096
+_VLLM_KERNEL_NAME = "topKPerRowPrefill"
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,72 @@ def _validate_cuda_device(torch: Any) -> None:
         raise ProfilerNotImplemented(
             f"torch dsa_topk_prefill is verified only on {_REQUIRED_GPU}, got {gpu_name}"
         )
+
+
+def _validate_vllm_args(
+    num_queries: int,
+    num_keys: int,
+    num_sequences: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    span_mode: str,
+) -> tuple[int, int, int, int, int, DType, str, str]:
+    """Validate the production backend's one-launch milestone."""
+    validated = _validate_args(
+        num_queries,
+        num_keys,
+        num_sequences,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        span_mode,
+    )
+    if validated[0] > _VLLM_MAX_QUERIES:
+        raise ValueError(
+            "dsa_topk_prefill:vllm_cuda requires num_queries <= 4096 "
+            f"for the verified one-launch chunk domain, got {validated[0]}"
+        )
+    return validated
+
+
+def _validate_vllm_cuda_device(torch: Any) -> None:
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented("CUDA is required for the dsa_topk_prefill vllm_cuda backend")
+    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
+    if gpu_name != _REQUIRED_GPU:
+        raise ProfilerNotImplemented(
+            f"dsa_topk_prefill vllm_cuda is verified only on {_REQUIRED_GPU}, got {gpu_name}"
+        )
+
+
+def _resolve_vllm_prefill_op(torch: Any) -> Any:
+    namespace = getattr(torch.ops, "_C", None)
+    if namespace is None:
+        raise ProfilerNotImplemented("torch.ops._C is unavailable in the vLLM environment")
+    try:
+        op = namespace.top_k_per_row_prefill
+    except AttributeError as exc:
+        raise ProfilerNotImplemented("torch.ops._C.top_k_per_row_prefill is unavailable") from exc
+    if not callable(op):
+        raise ProfilerNotImplemented("torch.ops._C.top_k_per_row_prefill is not callable")
+    return op
+
+
+def _load_vllm_cuda_backend() -> tuple[Any, Any]:
+    """Load Torch and vLLM's extension only inside the selected worker."""
+    try:
+        import torch
+        from vllm import _custom_ops as custom_ops
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise ProfilerNotImplemented(
+            "the instrumented vLLM CUDA environment is required for dsa_topk_prefill:vllm_cuda"
+        ) from exc
+
+    del custom_ops  # Importing the extension registers the torch.ops._C schema.
+    return torch, _resolve_vllm_prefill_op(torch)
 
 
 def _build_operands(
@@ -265,4 +333,86 @@ def profile_dsa_topk_prefill_torch(
             energy_j=float(energy_j),
         )
     except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_dsa_topk_prefill_vllm_cuda(
+    num_queries: int,
+    num_keys: int,
+    num_sequences: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    span_mode: str,
+) -> ComputeMetrics:
+    """Profile vLLM's one-launch production prefill DSA top-k kernel."""
+    (
+        num_queries,
+        num_keys,
+        _num_sequences,
+        top_k,
+        logits_row_stride,
+        _logits_dtype,
+        _index_dtype,
+        _span_mode,
+    ) = _validate_vllm_args(
+        num_queries,
+        num_keys,
+        num_sequences,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        span_mode,
+    )
+    torch, top_k_per_row_prefill = _load_vllm_cuda_backend()
+    _validate_vllm_cuda_device(torch)
+
+    try:
+        operands = _build_operands(
+            torch,
+            num_queries=num_queries,
+            num_keys=num_keys,
+            top_k=top_k,
+            logits_row_stride=logits_row_stride,
+            device="cuda",
+        )
+
+        def kernel() -> None:
+            top_k_per_row_prefill(
+                operands.logits,
+                operands.row_starts,
+                operands.row_ends,
+                operands.out,
+                num_queries,
+                operands.logits.stride(0),
+                operands.logits.stride(1),
+                top_k,
+            )
+
+        # Compile/initialize the exact shape before the formal kernel-only
+        # capture. The callable itself contains only the custom-op invocation.
+        kernel()
+        torch.cuda.synchronize()
+        time_ms = Timer.cupti(kernel, kernel_name=_VLLM_KERNEL_NAME)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+
+        # Same semantic accounting as the Torch backend: valid FP32 logits,
+        # two int32 span values per row, and all int32 output slots. Padded
+        # columns, the excluded outer fill, and physical transactions are not
+        # logical traffic for this launch.
+        logical_bytes = _logical_bytes(
+            num_queries=num_queries,
+            num_keys=num_keys,
+            top_k=top_k,
+        )
+        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+        return ComputeMetrics(
+            time_ms=float(time_ms),
+            tflops=0.0,
+            memory_bandwidth_gbps=float(bandwidth_gbps),
+            energy_j=float(energy_j),
+        )
+    except (RuntimeError, OSError) as exc:
         raise KernelLaunchFailed(str(exc)) from exc

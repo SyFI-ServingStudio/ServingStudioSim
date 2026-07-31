@@ -47,3 +47,23 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
     )
 )
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cuda",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP32}),
+            gpus=frozenset({"NVIDIA H200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_topk_prefill",
+            function_name="profile_dsa_topk_prefill_vllm_cuda",
+        ),
+        table_name=KIND,
+        args_schema=DsaTopkPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+    )
+)
