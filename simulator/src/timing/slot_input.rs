@@ -41,6 +41,13 @@ pub struct DsaSparseMlaPrefillLog {
     pub prefill_query_cache_pairs: Vec<(u32, u32)>,
 }
 
+/// DSA indexer prefill fan-in: every request-local `(Q, N)` cell aggregated by
+/// cache gather, logits, or top-k into its corresponding fixed leaf slot.
+#[derive(Clone, Serialize)]
+pub struct DsaIndexerPrefillLog {
+    pub prefill_query_key_pairs: Vec<(u32, u32)>,
+}
+
 /// Declare the `SlotInput` enum + a `From<Input>` per variant from one central
 /// list. `#[serde(untagged)]` so each variant serializes as just its inner input
 /// object (e.g. `{"m":512}`) — the slot's kernel kind is recovered from the
@@ -72,6 +79,7 @@ log_inputs! {
     Fp8PerTokenGroupQuant => Fp8PerTokenGroupQuantKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
     AttnPrefill => AttnPrefillLog,
+    DsaIndexerPrefill => DsaIndexerPrefillLog,
     DsaSparseMlaPrefill => DsaSparseMlaPrefillLog,
     AttnDecode  => FlashinferAttnDecodeKernelInput,
     AttnRect    => FlashinferAttnRectKernelInput,
