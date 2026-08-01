@@ -68,8 +68,8 @@ embeds the run-global specs and fixes which **pool roles** exist:
    worker tags are rejected here because they belong to the `pd` deployment.
 4. **Select the arch by its explicit tag** — the wired unified arms are
    `Llama3Dense`, `Llama3DenseTp`, `Llama3DpAttnTpFfn`, and
-   `Qwen3MoeDpAttnEpFfn`. Dispatch is provider-first, *not* a `tp_size`
-   dispatch. Each arm runs the L4 cascade
+   `Qwen3MoeDpAttnEpFfn`, and `Glm52DsaMoe`. Dispatch is provider-first, *not* a
+   `tp_size` dispatch. Each arm runs the L4 cascade
    `build_configs → resolve_configs → build` with its resolved parallel layout,
    producing a concrete model type `M`.
 5. `assemble_flow::<M>` wraps the `Arc<M>` in a `UnifiedWorkerFactory` (threading
@@ -78,6 +78,13 @@ embeds the run-global specs and fixes which **pool roles** exist:
 
 That `Box<dyn Flow>` is the **single `dyn` erasure point** — each concrete model
 monomorphizes its own flow, so the per-iter cost path stays `dyn`-free.
+
+GLM-5.2 pairs with the existing `hp_unified` recipe. Its attention is TP1 local,
+so the L4 model reports one attention-DP group per EP rank; `FullAttnKv` creates
+one independent sticky KV partition for each group and `UnifiedIterExecution`
+emits one matching `ArchGroupInput`. The worker shell, admission and selection
+policy, request lifecycle, event ownership, and `SimpleDpFlow` remain the same as
+for the existing multi-partition DP-attention/MoE families.
 
 ## The build cascade (`PdDeployment`)
 

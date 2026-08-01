@@ -194,8 +194,8 @@ pub enum IterArchSel {
         expert_popularity_file: Option<String>,
     },
     /// GLM-5.2's exact heterogeneous 78-layer DSA/MoE schedule. Attention is
-    /// local (TP1) on every EP rank; no compatible L5 worker is wired yet, but
-    /// the selector is available to the offline iter timing predictor.
+    /// local (TP1) on every EP rank and pairs with `hp_unified`, whose KV/input
+    /// partitions correspond one-for-one with the EP ranks.
     Glm52DsaMoe {
         #[serde(flatten)]
         model: ModelSpec,

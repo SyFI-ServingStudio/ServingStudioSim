@@ -671,9 +671,9 @@ pub fn qwen3_vllm_moe(
         .context("building vLLM-aligned FP8 Qwen3-MoE model")
 }
 
-/// Build the GLM-5.2 local-attention + EP-MoE model. This concrete path is
-/// currently consumed by offline timing prediction; deployment wiring rejects
-/// it until a GLM-aware L5 worker exists.
+/// Build the GLM-5.2 local-attention + EP-MoE model. Both offline timing
+/// prediction and the unified `hp_unified` deployment consume this concrete
+/// path.
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_dsa_moe(
     model_spec: &ModelSpec,
