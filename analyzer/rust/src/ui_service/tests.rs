@@ -1151,6 +1151,33 @@ fn sweep_catalog_preserves_manifest_axes_and_pending_state() {
     assert_eq!(pending["status"], "pending");
 }
 
+#[tokio::test]
+async fn sweep_catalog_supports_bounded_ready_discovery_and_latest_alias() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_sweep(&temporary.path().join("20260803_0_pending"), false);
+    make_sweep(&temporary.path().join("20260802_0_latest_ready"), true);
+    make_sweep(&temporary.path().join("20260801_0_older_ready"), true);
+    let router = prediction_test_router(temporary.path());
+
+    let (status, catalog) = get_json(router.clone(), "/api/v1/sweeps?status=ready&limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(catalog["sweeps"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        catalog["sweeps"][0]["display_name"],
+        "20260802_0_latest_ready"
+    );
+    assert_eq!(catalog["sweeps"][0]["status"], "ready");
+
+    let (status, latest) = get_json(router.clone(), "/api/v1/sweeps/latest").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(latest["sweeps"].as_array().map(Vec::len), Some(1));
+    assert_eq!(latest["sweeps"][0], catalog["sweeps"][0]);
+
+    let (status, problem) = get_json(router, "/api/v1/sweeps?limit=0").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(problem["code"], "invalid_sweep_catalog_limit");
+}
+
 #[test]
 fn sweep_catalog_uses_launcher_experiment_identity_when_present() {
     let temporary = TempDir::new().expect("temporary logs root");

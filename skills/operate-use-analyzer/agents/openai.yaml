@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use VibeSim Analyzer"
+  short_description: "Read and cite Analyzer-owned VibeSim results"
+  default_prompt: "Use $operate-use-analyzer to inspect and cite this VibeSim result."

@@ -171,6 +171,13 @@ items as `[x]` only when complete.
 
 ## Required User Report
 
+Before interpreting a snapshotted managed result, read
+`skills/operate-use-analyzer/SKILL.md`. Use the stable Analyzer profile or
+measurement resource ID to read its descriptor, curve/summary, declared plots,
+and hardware limits. The job row and CLI summary are lifecycle/provenance only.
+Profile/measurement citations are not yet part of the aggregate `exp.*` DSL, so
+do not invent inline tokens; navigation uses the typed result card.
+
 Always report:
 
 - Instruction files used: include concrete paths, especially `AGENTS.md` and

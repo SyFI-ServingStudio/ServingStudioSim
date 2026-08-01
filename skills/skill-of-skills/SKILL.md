@@ -73,6 +73,7 @@ top-compose-real-framework-from-sim - actively build a real serving framework fr
 
 operate-run-simulation - run deployment simulations from presets (DES, workload trace)
 operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
+operate-use-analyzer - select, read, interpret, and cite Analyzer-owned simulation, prediction, profile, and measurement results
 operate-run-alignment - run the phased measured VibeSim-to-vLLM alignment pipeline (profile, timing-predict, kernel-align, sim with auto-injected multiplier, e2e-align) and label folded kernel positions (evaluate the result via top-align-with-framework)
 operate-gpu-spec - query or update the GPU spec catalog
 operate-profile-sim-speed - profile simulator wallclock speed

@@ -72,11 +72,17 @@ enum AggregateKind {
     Singleton,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum SweepStatus {
+pub(super) enum SweepStatus {
     Ready,
     Pending,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SweepCatalogFilter {
+    pub status: Option<SweepStatus>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,7 +108,15 @@ struct SweepCatalogEntry {
     updated_at: String,
 }
 
+#[cfg(test)]
 pub(super) fn build_sweep_catalog(roots: &[ConfiguredRoot]) -> Result<SweepCatalog> {
+    build_filtered_sweep_catalog(roots, SweepCatalogFilter::default())
+}
+
+pub(super) fn build_filtered_sweep_catalog(
+    roots: &[ConfiguredRoot],
+    filter: SweepCatalogFilter,
+) -> Result<SweepCatalog> {
     let mut sweeps = discover_sweeps(roots)?;
     sweeps.sort_by(|left, right| {
         right
@@ -113,6 +127,8 @@ pub(super) fn build_sweep_catalog(roots: &[ConfiguredRoot]) -> Result<SweepCatal
     });
     let sweeps = sweeps
         .into_iter()
+        .filter(|sweep| filter.status.is_none_or(|status| sweep.status == status))
+        .take(filter.limit.unwrap_or(usize::MAX))
         .map(|sweep| SweepCatalogEntry {
             payload_href: format!("sweeps/{}/payload", sweep.sweep_id),
             workspace_id: sweep.workspace_id,

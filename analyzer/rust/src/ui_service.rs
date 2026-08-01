@@ -83,7 +83,10 @@ use prediction::{
 };
 use request_state::{read_request_state_payload, read_request_state_report};
 use slo::{read_slo_general_payload, read_slo_general_report};
-use sweep::{build_sweep_catalog, read_sweep_payload, resolve_sweep};
+use sweep::{
+    build_filtered_sweep_catalog, read_sweep_payload, resolve_sweep, SweepCatalogFilter,
+    SweepStatus,
+};
 use throughput::{read_throughput_payload, read_throughput_report};
 use topology::build_topology;
 use utilization::{read_utilization_payload, read_utilization_report};
@@ -237,6 +240,7 @@ fn service_router(state: ServiceState) -> Router {
         .route("/api/v1/hardware/gpus", get(get_hardware_gpus))
         .route("/api/v1/runs", get(list_runs))
         .route("/api/v1/sweeps", get(list_sweeps))
+        .route("/api/v1/sweeps/latest", get(get_latest_sweep))
         .route("/api/v1/sweeps/{sweep_id}/payload", get(get_sweep_payload))
         .route("/api/v1/runs/{run_id}/descriptor", get(get_descriptor))
         .route("/api/v1/runs/{run_id}/summary", get(get_summary))
@@ -799,11 +803,60 @@ async fn list_runs(State(state): State<ServiceState>) -> Response {
     }
 }
 
-async fn list_sweeps(State(state): State<ServiceState>) -> Response {
+const MAX_SWEEP_CATALOG_LIMIT: usize = 100;
+
+#[derive(Debug, Default, Deserialize)]
+struct SweepCatalogQuery {
+    status: Option<SweepStatus>,
+    limit: Option<usize>,
+}
+
+impl SweepCatalogQuery {
+    fn filter(self) -> std::result::Result<SweepCatalogFilter, Response> {
+        if self
+            .limit
+            .is_some_and(|limit| limit == 0 || limit > MAX_SWEEP_CATALOG_LIMIT)
+        {
+            return Err(problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_sweep_catalog_limit",
+                "Sweep catalog limit must be between 1 and 100.",
+            ));
+        }
+        Ok(SweepCatalogFilter {
+            status: self.status,
+            limit: self.limit,
+        })
+    }
+}
+
+async fn list_sweeps(
+    Query(query): Query<SweepCatalogQuery>,
+    State(state): State<ServiceState>,
+) -> Response {
+    let filter = match query.filter() {
+        Ok(filter) => filter,
+        Err(response) => return response,
+    };
+    sweep_catalog_response(state, filter).await
+}
+
+async fn get_latest_sweep(State(state): State<ServiceState>) -> Response {
+    sweep_catalog_response(
+        state,
+        SweepCatalogFilter {
+            status: Some(SweepStatus::Ready),
+            limit: Some(1),
+        },
+    )
+    .await
+}
+
+async fn sweep_catalog_response(state: ServiceState, filter: SweepCatalogFilter) -> Response {
     let root_source = Arc::clone(&state.root_source);
     match tokio::task::spawn_blocking(move || {
         let roots = root_source.load()?;
-        build_sweep_catalog(&roots)
+        build_filtered_sweep_catalog(&roots, filter)
     })
     .await
     {

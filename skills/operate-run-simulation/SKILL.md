@@ -240,3 +240,11 @@ After setup and launch, report:
 - exact launcher command used
 - analysis selection (`all applicable` by default, or the user-requested subset)
 - any analyzer subjects that failed best-effort post-run analysis
+
+When the result reaches `ready`, switch to
+`skills/operate-use-analyzer/SKILL.md` before interpreting or reporting result
+values. Use the stable Analyzer experiment ID returned by this managed run; do
+not rediscover a different similarly named sweep unless this ID is unavailable.
+Read the exact Analyzer resource in the current turn and copy its value-adjacent
+citation tokens into the answer. Launcher output and artifact paths establish
+execution provenance, but they are not substitutes for Analyzer result values.

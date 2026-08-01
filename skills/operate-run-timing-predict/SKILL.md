@@ -153,3 +153,11 @@ cost subjects apply. Read `iter_breakdown.ans` with ANSI stripped
 
 After running, report: the selector(s) used, the experiment name(s) / `log_dir`(s),
 the launcher command, per-case predicted totals, and the path to `iter_breakdown.ans`.
+
+When the managed prediction reaches `ready`, use
+`skills/operate-use-analyzer/SKILL.md` for every user-visible result value. Read
+the prediction descriptor/cases/CostTree and hardware limits through Analyzer
+using the stable `analyzer_resource_id`; do not reconstruct totals from the
+conversation job or implementer summary. Prediction citations are not yet part
+of the aggregate `exp.*` DSL, so never invent an inline token—use the typed
+prediction result card for navigation and report the resource ID and provenance.
