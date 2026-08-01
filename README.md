@@ -1,55 +1,105 @@
-# VibeSim — main
+# VibeSim Core
 
-Implementation tree for VibeSim. The current design docs live in `doc/` — start at
-`doc/README.md`, and see `doc/architecture.md` for the module→layer map. The
-original design record is archived under `old-doc/` (a read-only symlink into the
-legacy MoESim repo via `../ref/`).
+VibeSim is a discrete-event simulator and performance-modeling toolkit for LLM
+serving systems. This repository contains the Rust simulator, Rust Analyzer,
+Python launcher, kernel profiler, model/deployment definitions, and the
+repository-local Agent skills that operate them.
 
-See `../README.md` for workspace-level context (ref/, worktrees, milestones).
+For the complete browser + Agent + Analyzer deployment, use the
+[`VibeSimWorkspace`](https://github.com/serendipity-zk/VibeSimWorkspace)
+meta-repository. It pins compatible revisions of this repository, VibeSimAgent,
+and VibeSimUI and provides the tested `reproduce.md` and root `justfile`.
 
-## Quick start
+## Requirements
+
+- Python 3.12 managed by `uv`
+- Rust stable
+- NVIDIA driver/CUDA stack for profiling and GPU-backed predictions
+- A writable, large-capacity `TMPDIR`
+
+Do not run Python or install packages with the system interpreter. Use
+`uv run ...` and `uv add ...` from the repository root.
+
+## Build and inspect
 
 ```bash
-# Rust simulator
-cargo check                      # verify scaffold compiles
-cargo run -- list-params         # emit deployment schema JSON
-cargo run -- run <run_config.yaml>
+uv sync
+cargo build --release
 
-# Python side
-uv sync                          # install default dev + profiling deps
-uv run ruff check .              # lint
+# Rust-authoritative deployment schema and Launcher-rendered human view
+cargo run --release -- list-params
+uv run python -m launcher list-params --human
 
-# Python profiling stack (Torch/Triton/NVML; needed for real CUDA profiling)
-uv run python -c "import torch, triton, pynvml; print(torch.__version__)"
-uv run python -m profiling list
-uv run python -m profiling count-missing single_gemm --backend torch --gpu-name H100 --spec '{"m":4096,"n":8192,"k":8192,"dtype":"bf16"}'
-uv run python -m profiling run single_gemm --backend torch --force --specs specs.json --db /tmp/profile.db
+# Launcher and Analyzer surfaces
+uv run python -m launcher --help
+cargo run -p analyzer --release -- --help
 ```
 
-`dev`, `profiling`, `launcher`, and `analyze` are default uv groups for this
-repo, so use plain `uv run ...` for tests, lint, profiler, launcher, and renderer
-entry points. The execution backend selects `main/.venv/bin/python` but does not
-install missing packages at profile time. The initial lockfile tracks the
-reference CUDA 12.8-era stack
-(`torch 2.10.x`, `triton 3.6.x`) until the cluster driver/runtime target is
-validated for a newer stack.
+The launcher is the supported run boundary. It builds/discovers the simulator
+schema, validates presets, expands sweep/compound/variant axes, prebuilds kernel
+cache rows, records provenance, starts simulations, and triggers requested
+Analyzer subjects.
 
-## Layout
+```bash
+# Inspect the expanded plan before launching
+uv run python -m launcher presets/unified_aime.yaml --dry-run
 
-- `simulator/src/` — Rust crate (L1 timing → L7 sim/log/schema/deployment).
-  Top-level `main.rs` is the clap binary entry; `lib.rs` re-exports layer
-  modules.
-- `profiling/` — Python L1a runners + L1b db + exec backend.
-- `launcher/` — Python L7-α launcher.
-- `analyzer/` — Rust `analyze` binary + Python plot renderer.
-- `model/config/`, `gpu/`, `trace/`, `tests/` — data + tests.
-- `doc/` — the current, git-tracked design docs (thesis, architecture, invariants,
-  per-layer detail).
-- `old-doc/` → `../ref/next_gen_design/` (symlink; the archived original design,
-  read-only here).
+# Launch the preset
+uv run python -m launcher presets/unified_aime.yaml
 
-## First milestone
+# Offline timing and existing-kernel profiling entry points
+uv run python -m launcher timing-predict --help
+uv run python -m launcher kernel-profile --help
+```
 
-Llama3-8B dense, local single-server, no parallel, single-round trace.
-See `../README.md` for the layer-by-layer slice. Build order is L1 → L2 → L3
-→ L4 → L5 → L6 → L7, with each layer's vertical slice driven by the next.
+Use a task-scoped directory under `$TMPDIR` for scratch databases or generated
+inputs. Production and managed runs write durable artifacts beneath their
+declared workspace `logs/` roots.
+
+## Analyzer
+
+Analyzer is the read-only resource authority for simulation runs and sweeps,
+timing predictions, kernel profiles, kernel measurements, rendered plots, and
+GPU hardware limits.
+
+```bash
+cargo build -p analyzer --release
+target/release/analyze serve \
+  --bind 127.0.0.1:8787 \
+  --workspace-registry ../agent-workspaces/registry.json
+```
+
+The workspace registry is maintained by VibeSimAgent. Analyzer discovers
+approved workspace roots through that registry; it does not own conversation or
+job-lifecycle state.
+
+## Repository map
+
+```text
+simulator/        Rust L1-L7 simulator and deployment schema
+profiling/        Python kernel registry, runners, execution backend, and cache
+launcher/         preset, sweep, managed-run, timing-predict, and profile CLI
+analyzer/         Rust read API and Python plot renderer
+model/            model configurations and operation definitions
+gpu/              hardware specification catalog
+trace/            trace generators and checked-in samples
+presets/          runnable deployment/prediction configurations
+skills/           canonical VibeSim Agent workflows
+tests/            CPU, GPU, binary, database, and Agent test tiers
+doc/              current architecture and detailed design
+old-doc/          archived legacy design symlink
+```
+
+Start with [`doc/README.md`](doc/README.md) and
+[`doc/architecture.md`](doc/architecture.md). Operational details live beside
+their implementation, especially [`launcher/README.md`](launcher/README.md) and
+[`profiling/README.md`](profiling/README.md).
+
+## Validation
+
+The repository test tiers intentionally separate CPU-only checks from GPU,
+built-binary, warm-database, and Agent-runtime checks. Use the repository
+`dev-run-tests` skill or inspect `just --list` before selecting a tier.
+
+For focused changes, format and test only the touched files. Do not run
+workspace-wide formatters over unrelated worktrees or generated artifacts.
