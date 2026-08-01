@@ -17,6 +17,7 @@ pub mod fp8_pre_attn_proj_tp;
 pub mod glm52_dense_ffn_local;
 pub mod glm52_dsa_attn_local;
 pub mod glm52_moe_router_local;
+pub mod glm52_shared_expert_local;
 pub mod mlp_block_tp;
 pub mod moe_expert_compute_local;
 pub mod native_fp8_moe_router_local;
@@ -60,6 +61,10 @@ pub use glm52_dsa_attn_local::{
 pub use glm52_moe_router_local::{
     Glm52MoeRouterLocalWorklet, Glm52MoeRouterLocalWorkletConfig, Glm52MoeRouterLocalWorkletInput,
     Glm52MoeRouterLocalWorkletResolved,
+};
+pub use glm52_shared_expert_local::{
+    Glm52SharedExpertLocalWorklet, Glm52SharedExpertLocalWorkletConfig,
+    Glm52SharedExpertLocalWorkletInput, Glm52SharedExpertLocalWorkletResolved,
 };
 pub use mlp_block_tp::{
     MlpBlockTpWorklet, MlpBlockTpWorkletConfig, MlpBlockTpWorkletInput, MlpBlockTpWorkletResolved,
