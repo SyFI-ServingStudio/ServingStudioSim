@@ -34,6 +34,13 @@ pub struct AttnPrefillLog {
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
 }
 
+/// Sparse-MLA prefill aggregating leaf input: every request-local `(Q, S)` cell
+/// whose metrics were summed into the one fixed prefill slot.
+#[derive(Clone, Serialize)]
+pub struct DsaSparseMlaPrefillLog {
+    pub prefill_query_cache_pairs: Vec<(u32, u32)>,
+}
+
 /// Declare the `SlotInput` enum + a `From<Input>` per variant from one central
 /// list. `#[serde(untagged)]` so each variant serializes as just its inner input
 /// object (e.g. `{"m":512}`) — the slot's kernel kind is recovered from the
@@ -65,6 +72,7 @@ log_inputs! {
     Fp8PerTokenGroupQuant => Fp8PerTokenGroupQuantKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
     AttnPrefill => AttnPrefillLog,
+    DsaSparseMlaPrefill => DsaSparseMlaPrefillLog,
     AttnDecode  => FlashinferAttnDecodeKernelInput,
     AttnRect    => FlashinferAttnRectKernelInput,
     KvCacheAppend => KvCacheAppendKernelInput,
