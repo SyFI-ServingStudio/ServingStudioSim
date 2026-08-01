@@ -6,7 +6,9 @@
 //! dispatch — provider-first, new-interface-design §4). Wired arms are
 //! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
 //! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
-//! `hp_unified`. Each arm monomorphizes its concrete model/worker pair and
+//! `hp_unified`. `glm52_dsa_moe` is selectable for timing prediction but bails
+//! here until its local-attention/EP-aware worker lands. Each wired arm
+//! monomorphizes its concrete model/worker pair and
 //! erases to `Box<dyn Flow>` — the single `dyn` point (the cost path is
 //! `dyn`-free, L4 §4.1).
 
@@ -269,12 +271,17 @@ impl Deployment for UnifiedDeployment {
                     build_hp_worker,
                 ))
             }
+            IterArchSel::Glm52DsaMoe { .. } => glm52_worker_unavailable(),
         }
     }
 }
 
 /// The model's dotted-leaf prefix for this deployment (e.g. `unified.embedding`).
 const MODEL_NAME: &str = "unified";
+
+fn glm52_worker_unavailable<T>() -> anyhow::Result<T> {
+    bail!("unified: glm52_dsa_moe requires a GLM-aware local-attention/EP worker, not wired yet")
+}
 
 /// The dense / dense_tp archs run on the single-group barebone worker.
 fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
@@ -327,5 +334,19 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glm52_deployment_blocker_names_the_missing_worker() {
+        let error = glm52_worker_unavailable::<()>().unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "unified: glm52_dsa_moe requires a GLM-aware local-attention/EP worker, not wired yet"
+        );
     }
 }

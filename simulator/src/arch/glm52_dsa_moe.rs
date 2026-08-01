@@ -364,7 +364,8 @@ fn parse_model_json(text: &str) -> Result<Glm52ModelCfg> {
 
 /// MTP execution identity. The current unified input is non-speculative, so
 /// production callers use `Off`; the other variants model a future proposer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Glm52MtpMode {
     #[default]
     Off,
