@@ -73,6 +73,30 @@ state of sustained GEMMs. Fixed `rep` remains the explicit median-of-three
 escape hatch. This is distinct from `Energy.perf`'s 500 ms minimum
 wall-clock/NVML window.
 
+## First-class Analyzer resources
+
+`python -m profiling run ... --output-dir X` and `... measure ... --output-dir X`
+generate first-class Analyzer resources without requiring any conversation backend:
+direct development runs write the same `kernel-profile.meta.json` (`kp_<uuid>`) /
+`kernel-measurement.meta.json` (`km_<uuid>`) resource identity. A managed kernel
+job registers with `analyzerResourceId` before any official artifact is written; the
+Analyzer later reads the metadata as its discovery source of truth.
+
+GPU provenance is owned by the execution layer (`local_worker` → `ChunkResult`):
+the worker reports the physical GPU it ran on; the requested cache key keys the DB
+row. When a worker actually ran, the job verifies the requested cache key and the
+observed physical GPU resolve to the same catalog SKU (gpu/spec.json exact
+name/aliases) and fails otherwise. A cached-only job keeps its cache key and records
+`provenance.source = cache_key` without fabricating an observed GPU. The metadata
+records schema version, resource id, kernel kind/table/backend, metric family, GPU
+cache key + observed physical name + count, mode, created time, and artifact
+declarations. `get_<kind>_times` return types and the Metrics schema are
+unchanged. GPU provenance is a typed per-invocation result: the internal funnel
+`profiling.db.batch.execute_profile_batch` returns a `ProfileBatchOutcome`, and
+the CLI reads results + provenance from the shared `facade.run_kind_times`
+entry — never a process-global side channel. The legacy `run_profile_batch`
+remains a thin wrapper for existing callers.
+
 ## Directory map
 
 ```
@@ -113,6 +137,18 @@ profilers/         Low-level timing/energy primitives used by runners
 
 measure.py         `python -m profiling measure` driver: spawns the worker with a
                    measure block, collects artifacts. Cache-free; never writes DB.
+                   The worker's observed physical GPU is kept as provenance
+                   (never dropped) and stamped into the measurement metadata.
+
+artifacts.py       Immutable per-job snapshots: request/results/curve/job.meta.json
+                   plus the Analyzer discovery metadata files
+                   kernel-profile.meta.json (kp_<uuid>) and
+                   kernel-measurement.meta.json (km_<uuid>).
+gpu_catalog.py     Read-only gpu/spec.json resolution (exact case-insensitive
+                   name/aliases → canonical SKU); used to fail a measured job
+                   whose requested cache key vs observed physical GPU mismatch, and
+                   to stamp resolved canonical names into metadata. NOT on the
+                   timing path.
 
 exec/              How a runner actually runs. GpuPool/GpuChunk contracts,
   pool.py            LocalGpuPool (spawns a worker subprocess per chunk),
@@ -145,7 +181,10 @@ Everything flows through `perf_api`. There are exactly two internal paths.
    `CUDA_VISIBLE_DEVICES`, and spawns `python -m profiling.exec.local_worker` in
    the spec's `ProfileEnv`. The worker lazy-loads the registered runner via
    `RunnerRef`, executes each spec, and writes JSON results back.
-5. Persist successful results as `ProfileRow`s through `Table.insert`.
+5. Require every successful worker result to report its observed physical GPU,
+   validate all observations against the requested cache key, then persist the
+   rows through `Table.insert`. Cached-only provenance is produced only by a DB
+   hit for which no worker ran.
 
 The main/simulator process therefore **never imports torch or a runner**: the
 registry holds lazy `RunnerRef`s, and the heavy import only happens in the worker

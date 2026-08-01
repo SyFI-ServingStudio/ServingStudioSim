@@ -11,7 +11,14 @@ Agent note:
 """
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.batch import args_to_spec, coerce_args, run_profile_batch
+from profiling.db.batch import (
+    ProfileBatchOutcome,
+    ProfileProvenance,
+    args_to_spec,
+    coerce_args,
+    execute_profile_batch,
+    run_profile_batch,
+)
 from profiling.db.kind import KernelKind
 from profiling.db.metadata import (
     DbMetadata,
@@ -44,6 +51,8 @@ __all__ = [
     "KernelKind",
     "MetricFamily",
     "MissingEntry",
+    "ProfileBatchOutcome",
+    "ProfileProvenance",
     "ProfilerVersion",
     "ProfileRow",
     "RunnerRef",
@@ -53,6 +62,7 @@ __all__ = [
     "TableMetadata",
     "args_to_spec",
     "coerce_args",
+    "execute_profile_batch",
     "find_args_schema",
     "find_kernel_profiler_spec",
     "find_table",

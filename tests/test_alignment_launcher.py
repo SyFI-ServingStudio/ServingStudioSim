@@ -508,6 +508,59 @@ def test_timing_predict_snapshot_accepts_inputs_already_in_output_root(tmp_path,
     assert json.loads(config_path.read_text()) == config
 
 
+def test_timing_predict_publishes_stable_analyzer_resource_metadata(tmp_path):
+    config_path = tmp_path / "timing_predict_config.json"
+    cases_path = tmp_path / "timing_predict_cases.json"
+    cases_path.write_text("[]")
+    config = {
+        "arch": {"iter": {"type": "llama3_dense"}},
+        "gpu": "NVIDIA H200",
+        "log_dir": str(tmp_path),
+        "cases_file": str(cases_path),
+    }
+    config_path.write_text(json.dumps(config))
+
+    prediction_id = timing_predict_launcher._prediction_id(tmp_path)
+    timing_predict_launcher._write_prediction_metadata(
+        config_path,
+        config,
+        tmp_path,
+        prediction_id,
+    )
+
+    assert prediction_id.startswith("p_")
+    assert timing_predict_launcher._prediction_id(tmp_path) == prediction_id
+    assert json.loads((tmp_path / "prediction.meta.json").read_text()) == {
+        "schema_version": 1,
+        "prediction_id": prediction_id,
+        "selector": "iter",
+        "arch_type": "llama3_dense",
+        "gpu": "NVIDIA H200",
+        "gpu_count": 1,
+        "config_file": config_path.name,
+        "cases_file": "prediction.cases.json",
+        "case_count": 0,
+    }
+    assert json.loads((tmp_path / "prediction.cases.json").read_text()) == []
+    assert timing_predict_launcher._predict_descriptor(config_path, config) == {
+        "selector": "iter",
+        "configName": config_path.name,
+        "caseCount": 0,
+    }
+
+
+def test_timing_predict_does_not_reuse_noncanonical_prediction_id(tmp_path):
+    (tmp_path / "prediction.meta.json").write_text(
+        json.dumps({"prediction_id": "p_"}),
+        encoding="utf-8",
+    )
+
+    prediction_id = timing_predict_launcher._prediction_id(tmp_path)
+
+    assert prediction_id.startswith("p_")
+    assert prediction_id != "p_"
+
+
 def test_alignment_analysis_calls_only_selected_subjects(tmp_path, monkeypatch):
     analyzer = tmp_path / "analyze"
     analyzer.touch()

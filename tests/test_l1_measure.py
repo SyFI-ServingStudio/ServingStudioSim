@@ -8,6 +8,7 @@ end-to-end smoke run that asserts the artifact set lands on disk.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -20,8 +21,8 @@ from profiling.profilers.measure_context import (
     set_measure_context,
 )
 
-
 # ── CPU tier: measure context is inert unless explicitly set ─────────────────
+
 
 def test_measure_context_defaults_inert():
     clear_measure_context()
@@ -42,6 +43,7 @@ def test_measure_context_set_get_clear_roundtrip(tmp_path):
 
 
 # ── CPU tier: pure summaries over synthetic samples ──────────────────────────
+
 
 def _synthetic_series(count: int = 60) -> list[dict[str, object]]:
     return [
@@ -108,6 +110,7 @@ def test_summarize_telemetry_shape_without_pynvml():
 
 
 # ── CPU tier: per-launch record splitting (no GPU; fabricated records) ───────
+
 
 def _record(name: str, start_ns: int, duration_ns: int, correlation_id: int):
     from profiling.profilers.cupti_kernel_profiler import KernelRecord
@@ -188,14 +191,21 @@ def test_split_launch_series_multi_kernel_callable_sums_duration():
 
 # ── CPU tier: CLI wiring (perf_api facade monkeypatched) ──────────────────────
 
-def _fake_measure_result() -> dict:
+
+def _fake_measure_result(output_dir) -> dict:
+    output_path = Path(output_dir)
     return {
         "kernel_kind": "single_gemm",
         "backend": "torch_linear",
         "gpu_index": 0,
-        "output_dir": "/tmp/out",
+        "gpu_name": None,
+        "observed_gpu_name": "NVIDIA H200",
+        "output_dir": str(output_path),
         "time_ms": 1.23,
-        "artifacts": ["/tmp/out/runtimes.csv"],
+        "artifacts": [
+            str((output_path / "runtimes.csv").resolve()),
+            str((output_path / "summary.json").resolve()),
+        ],
         "metrics": None,
         "runner_error": None,
     }
@@ -208,7 +218,7 @@ def test_cli_measure_forwards_defaults(monkeypatch, tmp_path, capsys):
         calls["kernel_kind"] = kernel_kind
         calls["spec"] = spec
         calls["kwargs"] = kwargs
-        return _fake_measure_result()
+        return _fake_measure_result(kwargs["output_dir"])
 
     monkeypatch.setattr(perf_api, "measure_kernel", fake_measure)
     exit_code = cli.main(
@@ -237,14 +247,15 @@ def test_cli_measure_forwards_defaults(monkeypatch, tmp_path, capsys):
     assert payload["time_ms"] == 1.23
 
 
-def test_cli_measure_no_clear_l2_flag(monkeypatch, capsys):
+def test_cli_measure_no_clear_l2_flag(monkeypatch, tmp_path, capsys):
     calls = {}
 
     def fake_measure(kernel_kind, spec, **kwargs):
         calls["kwargs"] = kwargs
-        return _fake_measure_result()
+        return _fake_measure_result(kwargs["output_dir"])
 
     monkeypatch.setattr(perf_api, "measure_kernel", fake_measure)
+    monkeypatch.chdir(tmp_path)
     exit_code = cli.main(
         [
             "measure",
@@ -262,14 +273,15 @@ def test_cli_measure_no_clear_l2_flag(monkeypatch, capsys):
     assert calls["kwargs"]["clear_l2"] is False
 
 
-def test_cli_measure_default_output_dir(monkeypatch, capsys):
+def test_cli_measure_default_output_dir(monkeypatch, tmp_path, capsys):
     calls = {}
 
     def fake_measure(kernel_kind, spec, **kwargs):
         calls["kwargs"] = kwargs
-        return _fake_measure_result()
+        return _fake_measure_result(kwargs["output_dir"])
 
     monkeypatch.setattr(perf_api, "measure_kernel", fake_measure)
+    monkeypatch.chdir(tmp_path)
     cli.main(
         [
             "measure",
@@ -285,7 +297,11 @@ def test_cli_measure_default_output_dir(monkeypatch, capsys):
 
 
 def test_cli_measure_rejects_multiple_specs(monkeypatch, capsys):
-    monkeypatch.setattr(perf_api, "measure_kernel", lambda *a, **k: _fake_measure_result())
+    monkeypatch.setattr(
+        perf_api,
+        "measure_kernel",
+        lambda *args, **kwargs: _fake_measure_result(kwargs["output_dir"]),
+    )
     exit_code = cli.main(
         [
             "measure",
@@ -303,6 +319,7 @@ def test_cli_measure_rejects_multiple_specs(monkeypatch, capsys):
 
 
 # ── GPU tier: real end-to-end smoke ──────────────────────────────────────────
+
 
 @pytest.mark.gpu
 def test_measure_kernel_writes_artifacts_end_to_end(tmp_path):

@@ -62,7 +62,7 @@ class SingleResultChunk(GpuChunk):
                     memory_bandwidth_gbps=0.2,
                     energy_j=0.0,
                 ),
-                gpu_name="FakeGPU",
+                observed_gpu_name="NVIDIA H200",
             )
             for _ in specs
         ]
@@ -82,8 +82,8 @@ class ExplodingPool(GpuPool):
 
 
 class RecordingGpuChunk(GpuChunk):
-    def __init__(self, gpu_name: str):
-        self.gpu_name = gpu_name
+    def __init__(self, observed_gpu_name: str):
+        self.observed_gpu_name = observed_gpu_name
         self.received_spec_batches: list[list[dict]] = []
 
     def run(self, kernel_kind: KernelKind, specs: list[dict]) -> list[ChunkResult]:
@@ -97,7 +97,7 @@ class RecordingGpuChunk(GpuChunk):
                     memory_bandwidth_gbps=float(spec["k"]),
                     energy_j=0.0,
                 ),
-                gpu_name=self.gpu_name,
+                observed_gpu_name=self.observed_gpu_name,
             )
             for spec in specs
         ]
@@ -785,7 +785,7 @@ def test_profile_db_read_paths_do_not_mutate_existing_database(tmp_path: Path):
                     memory_bandwidth_gbps=0.2,
                     energy_j=0.0,
                 ),
-                gpu_name="FakeGPU",
+                gpu_name="NVIDIA H200",
                 backend="torch",
             )
         ]
@@ -836,7 +836,7 @@ def test_perf_api_force_refreshes_cached_rows_with_jit_disabled(
         result = perf_api.get_single_gemm_times(
             [spec],
             backend="torch",
-            gpu_name="FakeGPU",
+            gpu_name="NVIDIA H200",
             force=True,
         )[0]
     finally:
@@ -845,7 +845,7 @@ def test_perf_api_force_refreshes_cached_rows_with_jit_disabled(
 
     assert isinstance(result, ComputeMetrics)
     assert result.time_ms == 2.0
-    cached = perf_api.get_single_gemm_times([spec], backend="torch", gpu_name="FakeGPU")[0]
+    cached = perf_api.get_single_gemm_times([spec], backend="torch", gpu_name="NVIDIA H200")[0]
     assert cached == result
 
 
@@ -863,7 +863,7 @@ def test_run_profile_batch_uses_gpu_pool_and_saves_table(tmp_path: Path):
     saved = table.query(
         [SingleGemmArgs(m=8, n=8, k=8, dtype=DType.FP16)],
         backend="torch",
-        gpu_name="FakeGPU",
+        gpu_name="NVIDIA H200",
     )[0]
     assert isinstance(saved, ComputeMetrics)
     assert saved.time_ms == 2.0
@@ -1117,7 +1117,7 @@ def test_run_profile_batch_balances_specs_across_chunks(tmp_path: Path):
     specs = [
         {"m": m, "n": 8, "k": 16, "dtype": "torch.float16", "backend": "torch"} for m in range(1, 6)
     ]
-    recording_chunks = [RecordingGpuChunk("FakeGPU0"), RecordingGpuChunk("FakeGPU1")]
+    recording_chunks = [RecordingGpuChunk("NVIDIA H200"), RecordingGpuChunk("H200")]
     pool = RecordingPool(recording_chunks)
 
     results = run_profile_batch(

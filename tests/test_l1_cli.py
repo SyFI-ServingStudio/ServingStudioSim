@@ -4,7 +4,9 @@ import json
 
 from profiling import cli, perf_api
 from profiling.db import DType, ProfileRow, Table
+from profiling.db.batch import ProfileProvenance
 from profiling.db.registry import find_kernel_profiler_spec
+from profiling.facade import KindTimesResult
 from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.metrics import ComputeMetrics
 
@@ -84,25 +86,38 @@ def test_cli_query_json_reads_existing_row(tmp_path, capsys):
     assert payload["results"][0]["metrics"]["energy_j"] == 0.3
 
 
-def test_cli_run_force_calls_generated_perf_api(monkeypatch, tmp_path, capsys):
+def test_cli_run_force_calls_shared_internal_facade_op(monkeypatch, tmp_path, capsys):
     calls = {}
 
-    def fake_get(specs, *, backend: str, gpu_name: str | None = None, force: bool = False):
+    def fake_run_kind_times(
+        kernel_kind,
+        specs,
+        *,
+        backend: str,
+        gpu_name: str | None = None,
+        db_path,
+        jit_enabled: bool,
+        force: bool = False,
+    ):
+        del jit_enabled
         calls["get"] = {
             "specs": specs,
             "backend": backend,
             "gpu_name": gpu_name,
             "force": force,
-            "db_path": str(perf_api.DB_PATH),
+            "db_path": str(db_path),
         }
-        return [
-            ComputeMetrics(
-                time_ms=1.0,
-                tflops=2.0,
-                memory_bandwidth_gbps=3.0,
-                energy_j=4.0,
-            )
-        ]
+        return KindTimesResult(
+            results=[
+                ComputeMetrics(
+                    time_ms=1.0,
+                    tflops=2.0,
+                    memory_bandwidth_gbps=3.0,
+                    energy_j=4.0,
+                )
+            ],
+            provenance=ProfileProvenance(source="cache_key", requested_gpu_name=gpu_name),
+        )
 
     def fake_count(specs, *, backend: str, gpu_name: str | None = None):
         calls["count"] = {
@@ -112,7 +127,7 @@ def test_cli_run_force_calls_generated_perf_api(monkeypatch, tmp_path, capsys):
         }
         return 0
 
-    monkeypatch.setattr(perf_api, "get_single_gemm_times", fake_get)
+    monkeypatch.setattr(cli, "run_kind_times", fake_run_kind_times)
     monkeypatch.setattr(perf_api, "count_missing_single_gemm", fake_count)
 
     exit_code = cli.main(
@@ -155,24 +170,36 @@ def test_cli_run_accepts_batched_specs_from_flags_and_file(
     )
     captured_specs = []
 
-    def fake_get(specs, *, backend: str, gpu_name: str | None = None, force: bool = False):
-        del backend, gpu_name, force
+    def fake_get(
+        kernel_kind,
+        specs,
+        *,
+        backend: str,
+        gpu_name: str | None = None,
+        db_path,
+        jit_enabled: bool,
+        force: bool = False,
+    ):
+        del kernel_kind, backend, gpu_name, db_path, jit_enabled, force
         captured_specs.extend(specs)
-        return [
-            ComputeMetrics(
-                time_ms=float(spec["m"]),
-                tflops=2.0,
-                memory_bandwidth_gbps=3.0,
-                energy_j=4.0,
-            )
-            for spec in specs
-        ]
+        return KindTimesResult(
+            results=[
+                ComputeMetrics(
+                    time_ms=float(spec["m"]),
+                    tflops=2.0,
+                    memory_bandwidth_gbps=3.0,
+                    energy_j=4.0,
+                )
+                for spec in specs
+            ],
+            provenance=ProfileProvenance(source="cache_key", requested_gpu_name=None),
+        )
 
     def fake_count(specs, *, backend: str, gpu_name: str | None = None):
         del specs, backend, gpu_name
         return 0
 
-    monkeypatch.setattr(perf_api, "get_single_gemm_times", fake_get)
+    monkeypatch.setattr(cli, "run_kind_times", fake_get)
     monkeypatch.setattr(perf_api, "count_missing_single_gemm", fake_count)
 
     exit_code = cli.main(
@@ -207,22 +234,34 @@ def test_cli_run_accepts_batched_specs_from_flags_and_file(
 
 
 def test_cli_run_returns_nonzero_when_rows_remain_missing(monkeypatch, tmp_path, capsys):
-    def fake_get(specs, *, backend: str, gpu_name: str | None = None, force: bool = False):
-        del specs, backend, gpu_name, force
-        return [
-            ComputeMetrics(
-                time_ms=1.0,
-                tflops=2.0,
-                memory_bandwidth_gbps=3.0,
-                energy_j=4.0,
-            )
-        ]
+    def fake_get(
+        kernel_kind,
+        specs,
+        *,
+        backend: str,
+        gpu_name: str | None = None,
+        db_path,
+        jit_enabled: bool,
+        force: bool = False,
+    ):
+        del kernel_kind, specs, backend, gpu_name, db_path, jit_enabled, force
+        return KindTimesResult(
+            results=[
+                ComputeMetrics(
+                    time_ms=1.0,
+                    tflops=2.0,
+                    memory_bandwidth_gbps=3.0,
+                    energy_j=4.0,
+                )
+            ],
+            provenance=ProfileProvenance(source="cache_key", requested_gpu_name=None),
+        )
 
     def fake_count(specs, *, backend: str, gpu_name: str | None = None):
         del specs, backend, gpu_name
         return 1
 
-    monkeypatch.setattr(perf_api, "get_single_gemm_times", fake_get)
+    monkeypatch.setattr(cli, "run_kind_times", fake_get)
     monkeypatch.setattr(perf_api, "count_missing_single_gemm", fake_count)
 
     exit_code = cli.main(

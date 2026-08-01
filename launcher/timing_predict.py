@@ -23,6 +23,7 @@ import asyncio
 import json
 import shutil
 import sys
+import uuid
 from pathlib import Path
 
 from .exec import (
@@ -80,6 +81,90 @@ def _snapshot_inputs(config_path: Path, cfg: dict, log_dir: Path) -> None:
         print(f"[warn] failed to snapshot predict inputs into {log_dir}: {e}", file=sys.stderr)
 
 
+def _prediction_id(log_dir: Path) -> str:
+    """Preserve an existing prediction identity across a same-directory rerun."""
+    metadata_path = log_dir / "prediction.meta.json"
+    try:
+        metadata = json.loads(metadata_path.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        metadata = None
+    if isinstance(metadata, dict):
+        existing_id = metadata.get("prediction_id")
+        if _valid_prediction_id(existing_id):
+            return existing_id
+    return f"p_{uuid.uuid4().hex}"
+
+
+def _valid_prediction_id(value: object) -> bool:
+    if not isinstance(value, str) or not value.startswith("p_"):
+        return False
+    suffix = value.removeprefix("p_")
+    return (
+        1 <= len(suffix) <= 64
+        and suffix.isascii()
+        and all(
+            character.islower() or character.isdigit() or character == "_"
+            for character in suffix
+        )
+    )
+
+
+def _resolve_cases(config_path: Path, cfg: dict) -> list:
+    cases_file = cfg.get("cases_file")
+    if not isinstance(cases_file, str) or not cases_file:
+        raise ValueError("timing-predict config requires cases_file")
+    cases_path = Path(cases_file)
+    if not cases_path.is_absolute():
+        cases_path = config_path.parent / cases_path
+    cases = _load_config(cases_path)
+    if not isinstance(cases, list):
+        raise ValueError("timing-predict cases_file must contain a list")
+    return cases
+
+
+def _write_prediction_metadata(
+    config_path: Path,
+    cfg: dict,
+    log_dir: Path,
+    prediction_id: str,
+) -> None:
+    """Publish the first-class Analyzer discovery marker atomically."""
+    arch = cfg.get("arch")
+    selector = next(iter(arch)) if isinstance(arch, dict) and len(arch) == 1 else None
+    arch_config = arch.get(selector) if isinstance(selector, str) else None
+    arch_type = arch_config.get("type") if isinstance(arch_config, dict) else None
+    gpu_name = cfg.get("gpu")
+    cases = _resolve_cases(config_path, cfg)
+    cases_name = "prediction.cases.json"
+    metadata = {
+        "schema_version": 1,
+        "prediction_id": prediction_id,
+        "selector": selector,
+        "arch_type": arch_type,
+        "gpu": gpu_name,
+        "gpu_count": 1,
+        "config_file": config_path.name,
+        "cases_file": cases_name,
+        "case_count": len(cases),
+    }
+    if not isinstance(selector, str) or not isinstance(arch_type, str):
+        raise ValueError("timing-predict metadata requires one typed arch selector")
+    if not isinstance(gpu_name, str) or not gpu_name:
+        raise ValueError("timing-predict metadata requires gpu")
+    cases_temporary_path = log_dir / ".prediction.cases.json.tmp"
+    cases_temporary_path.write_text(
+        json.dumps(cases, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    cases_temporary_path.replace(log_dir / cases_name)
+    temporary_path = log_dir / ".prediction.meta.json.tmp"
+    temporary_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(log_dir / "prediction.meta.json")
+
+
 def _predict_descriptor(config_path: Path, cfg: dict) -> dict:
     """Build the small catalog descriptor without interpreting case semantics."""
     arch = cfg.get("arch")
@@ -119,17 +204,20 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         # launcher-side log_dir to the same root so stdout.log + analysis line up.
         log_dir = REPO_ROOT / log_dir
 
+    prediction_id = _prediction_id(log_dir)
     descriptor = _predict_descriptor(config_path, cfg)
     managed_job = prepare_managed_job(
         "timing_predict",
         log_dir,
         descriptor=descriptor,
+        analyzer_resource_id=prediction_id,
     )
 
     try:
         if managed_job is not None:
             managed_job.report("running")
         _snapshot_inputs(config_path, cfg, log_dir)
+        _write_prediction_metadata(config_path, cfg, log_dir, prediction_id)
 
         binary = binary_path(build_type)
         argv = [str(binary), "timing-predict", str(config_path)]

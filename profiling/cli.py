@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, fields, is_dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -19,13 +21,21 @@ from typing import Any
 from launcher.managed_job import ManagedJob
 from profiling import perf_api
 from profiling.artifacts import (
+    MEASUREMENT_METADATA_FILENAME,
     PROFILE_CURVE_FILENAME,
+    PROFILE_METADATA_FILENAME,
     complete_profile_artifacts,
+    measurement_artifact_names,
     prepare_profile_artifacts,
+    write_measurement_metadata,
+    write_profile_metadata,
 )
 from profiling.db.args import KernelArgs
+from profiling.db.batch import ProfileProvenance
 from profiling.db.registry import KernelProfilerSpec, iter_kernel_profiler_specs
 from profiling.db.table import MissingEntry
+from profiling.facade import run_kind_times
+from profiling.gpu_catalog import resolve_gpu_spec
 from profiling.runners.metrics import CommMetrics, ComputeMetrics, Metrics
 
 
@@ -99,12 +109,18 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
     measure_parser.add_argument("--duration-s", type=float, default=10.0)
     measure_parser.add_argument("--telemetry-hz", type=float, default=20.0)
     measure_parser.add_argument(
+        "--no-telemetry",
+        dest="telemetry",
+        action="store_false",
+        help="Capture launch durations only (no NVML telemetry).",
+    )
+    measure_parser.add_argument(
         "--no-clear-l2",
         dest="clear_l2",
         action="store_false",
         help="Warm continuous window (no per-launch L2 displacement); reveals power/clock drift.",
     )
-    measure_parser.set_defaults(command_fn=_cmd_measure, clear_l2=True)
+    measure_parser.set_defaults(command_fn=_cmd_measure, clear_l2=True, telemetry=True)
     return parser
 
 
@@ -197,6 +213,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if managed_job is not None and output_dir is None:
         raise ValueError("managed kernel-profile run requires --output-dir")
 
+    # Resource identity is generated before registration so the managed job carries
+    # the Analyzer resource id, and before artifacts so the job can never outlive its
+    # discovery identity. Direct development runs without a managed context still write
+    # the same metadata (origin kind=development) — Analyzer discovery never depends on
+    # a conversation backend.
+    create_time = _utc_now()
+    profile_id = _profile_id(output_dir)
     descriptor = {
         "table": args.table,
         "kernelKind": str(profiler_spec.kernel_kind),
@@ -206,7 +229,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     }
     if managed_job is not None:
         assert output_dir is not None
-        managed_job.register(output_dir, descriptor=descriptor)
+        managed_job.register(
+            output_dir,
+            descriptor=descriptor,
+            analyzer_resource_id=profile_id,
+        )
 
     try:
         if managed_job is not None:
@@ -217,31 +244,39 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 request_payload={
                     "schemaVersion": 1,
                     "jobKind": "kernel_profile",
+                    "resourceId": profile_id,
                     "mode": mode,
                     **_base_payload(args, specs),
                 },
-                job_metadata=_profile_job_metadata(managed_job, descriptor),
+                job_metadata=_profile_job_metadata(managed_job, descriptor, profile_id),
             )
 
-        get_fn = _get_facade(args.table)
         if args.force:
-            results = get_fn(
+            outcome = run_kind_times(
+                profiler_spec.kernel_kind,
                 specs,
                 backend=args.backend,
                 gpu_name=args.gpu_name,
+                db_path=perf_api.DB_PATH,
+                jit_enabled=False,
                 force=True,
             )
         else:
             perf_api.enable_jit_profiling()
             try:
-                results = get_fn(
+                outcome = run_kind_times(
+                    profiler_spec.kernel_kind,
                     specs,
                     backend=args.backend,
                     gpu_name=args.gpu_name,
+                    db_path=perf_api.DB_PATH,
+                    jit_enabled=True,
                     force=False,
                 )
             finally:
                 perf_api.disable_jit_profiling()
+        results = outcome.results
+        run_provenance = outcome.provenance
 
         missing_count = _count_facade(args.table)(
             specs,
@@ -264,8 +299,31 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 specs=specs,
                 result_payload=payload,
             )
+            request_identifier, observed_gpu, _gpu_count = _outcome_provenance(
+                run_provenance, args.gpu_name, forced=args.force
+            )
+            _validate_measured_gpu_identity(request_identifier, observed_gpu)
+            resolved_canonical = (
+                resolve_gpu_spec(request_identifier).canonical_name
+                if request_identifier and resolve_gpu_spec(request_identifier) is not None
+                else None
+            )
+            _ = write_profile_metadata(
+                output_dir,
+                profile_id=profile_id,
+                profiler_spec=profiler_spec,
+                specs=specs,
+                requested_gpu_name=request_identifier,
+                observed_gpu_name=observed_gpu,
+                provenance_source="measurement" if observed_gpu else "cache_key",
+                resolved_canonical_name=resolved_canonical,
+                mode=mode,
+                created_at=create_time,
+            )
+            payload["resource_id"] = profile_id
             payload["artifact_root"] = str(output_dir)
             payload["curve_path"] = str(output_dir / PROFILE_CURVE_FILENAME)
+            payload["metadata_path"] = str(output_dir / PROFILE_METADATA_FILENAME)
         else:
             curve_payload = None
 
@@ -275,6 +333,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 "ready" if command_ok else "failed",
                 summary=descriptor
                 | {
+                    "resourceId": profile_id,
                     "missingCount": missing_count,
                     "axes": [axis["key"] for axis in (curve_payload or {}).get("axes", [])],
                 },
@@ -284,6 +343,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         else:
             _print_result_payload(payload)
             if output_dir is not None:
+                print(f"profile: {output_dir / PROFILE_METADATA_FILENAME}")
                 print(f"curve: {output_dir / PROFILE_CURVE_FILENAME}")
         return 0 if command_ok else 1
     except KeyboardInterrupt:
@@ -301,7 +361,9 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     if len(specs) != 1:
         raise ValueError(f"measure takes exactly one spec, got {len(specs)}")
     output_dir = args.output_dir or Path(f"measure_{args.table}_{args.backend}")
-    output_dir = output_dir.resolve()
+    profiler_spec = _resolve_profiler_spec(args.table, args.backend)
+    create_time = _utc_now()
+    measurement_id = _measurement_id(output_dir)
     descriptor = {
         "table": args.table,
         "backend": args.backend,
@@ -311,7 +373,11 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     }
     managed_job = ManagedJob.from_environment("kernel_measure")
     if managed_job is not None:
-        managed_job.register(output_dir, descriptor=descriptor)
+        managed_job.register(
+            output_dir,
+            descriptor=descriptor,
+            analyzer_resource_id=measurement_id,
+        )
         managed_job.report("running")
     try:
         result = perf_api.measure_kernel(
@@ -322,8 +388,47 @@ def _cmd_measure(args: argparse.Namespace) -> int:
             output_dir=output_dir,
             duration_s=args.duration_s,
             telemetry_hz=args.telemetry_hz,
+            telemetry=args.telemetry,
             clear_l2=args.clear_l2,
         )
+        observed_gpu = result.get("observed_gpu_name")
+        if not observed_gpu:
+            raise ValueError("kernel measurement did not report an observed physical GPU")
+        _validate_measured_gpu_identity(args.gpu_name, observed_gpu)
+        artifacts = list(result.get("artifacts", []))
+        artifact_names = measurement_artifact_names(output_dir, artifacts)
+        summary_file = "summary.json"
+        if summary_file not in artifact_names:
+            raise ValueError("kernel measurement did not produce summary.json")
+        resolved_plots = sorted(
+            name
+            for name in artifact_names
+            if name in ("runtime_trend.png", "runtime_telemetry.png")
+        )
+        _ = write_measurement_metadata(
+            output_dir,
+            measurement_id=measurement_id,
+            profiler_spec=profiler_spec,
+            shape=_strip_render_kwargs(specs[0]),
+            requested_gpu_name=args.gpu_name,
+            observed_gpu_name=observed_gpu,
+            gpu_count=_spec_gpu_count(profiler_spec, specs),
+            duration_s=args.duration_s,
+            telemetry=args.telemetry,
+            created_at=create_time,
+            summary_file=summary_file,
+            plots=resolved_plots,
+            artifacts=artifact_names,
+        )
+        if managed_job is not None:
+            managed_job.report(
+                "ready",
+                summary=descriptor
+                | {
+                    "resourceId": measurement_id,
+                    "timeMs": result.get("time_ms"),
+                },
+            )
     except KeyboardInterrupt:
         if managed_job is not None:
             managed_job.report("interrupted")
@@ -332,15 +437,12 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         if managed_job is not None:
             managed_job.report("failed")
         raise
-    if managed_job is not None:
-        managed_job.report(
-            "ready",
-            summary=descriptor | {"timeMs": result.get("time_ms")},
-        )
     if args.json:
-        print(json.dumps({"ok": True, **result}, indent=2, sort_keys=True))
+        payload = {"ok": True, **result, "resource_id": measurement_id}
+        print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         _print_measure_result(result)
+        print(f"measurement: {output_dir / MEASUREMENT_METADATA_FILENAME}")
     return 0
 
 
@@ -458,6 +560,7 @@ def _resolve_profiler_spec(table_name: str, backend: str) -> KernelProfilerSpec:
 def _profile_job_metadata(
     managed_job: ManagedJob | None,
     descriptor: dict[str, Any],
+    profile_id: str,
 ) -> dict[str, Any]:
     origin: dict[str, Any]
     if managed_job is None:
@@ -466,14 +569,126 @@ def _profile_job_metadata(
         origin = {
             "kind": "managed",
             "jobId": managed_job.job_id,
-            "resourceId": managed_job.resource_id,
+            "jobResourceId": managed_job.resource_id or profile_id,
         }
     return {
         "schemaVersion": 1,
         "jobKind": "kernel_profile",
+        "resourceId": profile_id,
         "descriptor": descriptor,
         "origin": origin,
     }
+
+
+def _outcome_provenance(
+    provenance: ProfileProvenance,
+    requested_gpu_name: str | None,
+    *,
+    forced: bool = False,
+) -> tuple[str | None, str | None, int | None]:
+    """Project one typed per-invocation ``ProfileProvenance`` onto the artifact
+    fields. Observed GPU is reported only for a genuine measurement (``source ==
+    "measurement"``); a forced measurement that produced no physical GPU
+    observation must fail loudly rather than silently downgrade to cache-only."""
+    if forced and provenance.source != "measurement":
+        raise ValueError(
+            "force-refresh produced no worker-observed physical GPU; "
+            "refusing to stamp cache-only provenance for a forced measurement"
+        )
+    requested = provenance.requested_gpu_name or requested_gpu_name
+    if provenance.source == "measurement":
+        if provenance.observed_gpu_name is None:
+            raise ValueError(
+                "measured batch recorded no worker-observed physical GPU; cannot stamp "
+                "measurement provenance for the artifact"
+            )
+        return requested, provenance.observed_gpu_name, provenance.gpu_count
+    return requested, None, None
+
+
+def _validate_measured_gpu_identity(
+    requested_gpu_name: str | None,
+    observed_gpu_name: str | None,
+) -> None:
+    """Fail a measured job when the requested cache key and the worker-observed
+    physical GPU cannot be canonicalized to the same SKU via ``gpu/spec.json`` —
+    never infer a default GPU. Cache-only jobs (no observed GPU) skip validation."""
+    if not requested_gpu_name or not observed_gpu_name:
+        return
+    if requested_gpu_name == observed_gpu_name:
+        return
+    from profiling.gpu_catalog import same_canonical_sku
+
+    if not same_canonical_sku(requested_gpu_name, observed_gpu_name):
+        raise ValueError(
+            f"GPU identity mismatch: requested cache key {requested_gpu_name!r} and "
+            f"observed physical GPU {observed_gpu_name!r} do not resolve to the same "
+            "canonical SKU in gpu/spec.json"
+        )
+
+
+def _profile_id(output_dir: Path | None) -> str:
+    """Stable ``kp_<uuid>`` identity for a profile artifact: reuses an existing
+    valid id so re-runs never rotate identity behind a live resource."""
+    if output_dir is not None:
+        metadata_path = output_dir / PROFILE_METADATA_FILENAME
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            metadata = None
+        if isinstance(metadata, dict) and _valid_profile_id(metadata.get("profile_id")):
+            return metadata["profile_id"]
+    return f"kp_{uuid.uuid4().hex}"
+
+
+def _measurement_id(output_dir: Path | None) -> str:
+    """Stable ``km_<uuid>`` identity for a measurement artifact."""
+    if output_dir is not None:
+        metadata_path = output_dir / MEASUREMENT_METADATA_FILENAME
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            metadata = None
+        if isinstance(metadata, dict) and _valid_measurement_id(metadata.get("measurement_id")):
+            return metadata["measurement_id"]
+    return f"km_{uuid.uuid4().hex}"
+
+
+def _valid_profile_id(value: object) -> bool:
+    return _valid_resource_id(value, "kp_")
+
+
+def _valid_measurement_id(value: object) -> bool:
+    return _valid_resource_id(value, "km_")
+
+
+def _valid_resource_id(value: object, prefix: str) -> bool:
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return False
+    suffix = value.removeprefix(prefix)
+    return (
+        1 <= len(suffix) <= 64
+        and suffix.isascii()
+        and all(
+            character.islower() or character.isdigit() or character == "_" for character in suffix
+        )
+    )
+
+
+def _spec_gpu_count(profiler_spec: KernelProfilerSpec, specs: list[dict[str, Any]]) -> int:
+    if profiler_spec.gpu_count_fn is None:
+        return 1
+    counts = {int(profiler_spec.gpu_count_fn(spec)) for spec in specs}
+    return max(counts) if counts and 0 not in counts else 1
+
+
+def _strip_render_kwargs(spec: dict[str, Any]) -> dict[str, Any]:
+    """The measurement metadata ``shape`` excludes routing-only keys like ``backend``."""
+    return {key: value for key, value in spec.items() if key != "backend"}
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 def _profiler_spec_summary(profiler_spec: KernelProfilerSpec) -> dict[str, str]:

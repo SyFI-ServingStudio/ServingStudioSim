@@ -28,6 +28,7 @@ mod breakdown;
 mod cdf;
 mod concurrency;
 mod conservation;
+mod hardware;
 mod io;
 mod kernel_query;
 mod kv;

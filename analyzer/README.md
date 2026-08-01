@@ -55,7 +55,7 @@ alignment analyze ──reads completed roots + mapping
 | `analyze alignment <analysis_log_dir> [subjects...]` | Rust | Read the alignment manifest and compute iteration/E2E/workload subjects into this analysis root. No subjects = all alignment subjects. |
 | `analyze sweep <experiment_dir>` | Rust | Collect existing per-run SLO, throughput, utilization, and completion scalars listed by `sweep_manifest.json`; emit sweep report/payload JSON without rescanning parquet. |
 | `analyze trace <log_dir>` | Rust | Export a Perfetto per-kernel timeline from `cost_log/` + `cost_manifest/` → `traces/<prefix>.pftrace.gz`. |
-| `analyze serve --logs-root <dir>` | Rust | Serve the read-only viz-ui catalog, bounded worker operation windows, and exact `(worker, iter, batch, operation)` CostTrees reconstructed lazily from `cost_log` + manifest. |
+| `analyze serve --logs-root <dir>` | Rust | Serve the read-only viz-ui catalog, bounded worker operation windows, exact `(worker, iter, batch, operation)` CostTrees reconstructed lazily from `cost_log` + manifest, first-class `prediction`, `kernel_profile`, `kernel_measurement`, and `hardware/gpus` resources, and cross-run sweep aggregates. |
 | `analyze list` | Rust | Print the subject catalog. |
 | `python analyzer/python render <log_dir> [subjects...]` | Python | Payloads → PNG plots, including sampled alignment breakdowns. No subjects = all renderers. |
 
@@ -169,6 +169,11 @@ rust/                The `analyze` binary (DataFusion compute side).
   src/alignment_workload/   Measured-vs-sim scheduler batch shapes by iteration id and elapsed time.
   src/alignment_input.rs    Shared alignment manifest/path contract.
   src/trace/           Perfetto trace export from per-worker cost logs.
+  src/ui_service/       Read-only HTTP resources; beyond runs/sweeps/predictions it
+                       owns hardware.rs (gpu/spec.json canonical name/aliases +
+                       dense peaks + HBM + one-way/bidir interconnect), kernel_profile.rs
+                       (discovery, descriptor, enriched curve), and kernel_measurement.rs
+                       (discovery, descriptor, summary, declared-plot serving).
 
 python/              The render side (matplotlib over payload JSON).
   __main__.py          `render <log_dir> [subjects]`; maps subject → renderer,
@@ -180,6 +185,25 @@ python/              The render side (matplotlib over payload JSON).
   common/              Shared plotting: payload loader + run-dir layout, figure
                        scaffolding, CDF plot, style.
 ```
+
+## First-class non-run resources
+
+Beyond runs, the read-only service publishes `prediction`, `kernel_profile`,
+`kernel_measurement`, and `hardware/gpus` resources (see `doc/analyzer.md` for
+the full protocol). Kernel resources are produced by the Python profiling CLI
+(`python -m profiling run ... --output-dir`, `... measure ...`) and are
+discoverable without any conversation backend:
+
+- `GET /api/v1/kernel-profiles`, `.../kernel-profiles/{id}/descriptor`, `.../curve`;
+- `GET /api/v1/kernel-measurements`, `.../kernel-measurements/{id}/descriptor`,
+  `.../summary`, `.../plots/{plot}`;
+- `GET /api/v1/hardware/gpus?name=<gpu_name>`.
+
+Guards: every discovery is workspace-aware, ignores `old-logs`, and rejects
+duplicate/invalid ids; plot paths accept only declared basenames; curve
+enrichment resolves the catalog by exact case-insensitive name/aliases and never
+fabricates a line for a missing dtype/GPU. Legacy snapshots are discovered as
+`kp_legacy_<hash>` / `km_legacy_<hash>` with no hardware limits.
 
 ## Subjects (the unit of analysis)
 

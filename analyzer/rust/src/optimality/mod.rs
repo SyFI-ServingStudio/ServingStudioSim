@@ -70,7 +70,9 @@ mod prepare;
 mod run;
 mod spec;
 
-pub(crate) use iteration::{iteration_kernel_ladder, iteration_waterfall};
+pub(crate) use iteration::{
+    iteration_kernel_ladder, iteration_waterfall, prediction_kernel_ladder, prediction_waterfall,
+};
 pub use run::run_optimality;
 
 /// Waterfall segment order (top of the Real bar → the irreducible floor).

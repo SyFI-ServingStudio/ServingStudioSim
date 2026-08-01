@@ -277,6 +277,67 @@ labels, coordinates, or hrefs. A manifest without an aggregate payload remains
 visible as `pending`, so incomplete analysis is distinguishable from an empty
 logs root.
 
+## Timing-prediction resources
+
+Offline timing prediction is a first-class Analyzer resource, not a simulation
+run with invented deployment topology. The launcher writes
+`prediction.meta.json` beside the snapshotted prediction config and cases file:
+
+```json
+{
+  "schema_version": 1,
+  "prediction_id": "p_...",
+  "selector": "iter",
+  "arch_type": "llama3_dense",
+  "gpu": "NVIDIA H200",
+  "gpu_count": 1,
+  "config_file": "predict_llama3_8b_iter.json",
+  "cases_file": "prediction.cases.json",
+  "case_count": 2
+}
+```
+
+`prediction_id` is created before execution and remains stable for that artifact.
+A managed launcher reports the same id to the conversation backend; a direct
+launcher invocation still writes it, so Analyzer discovery never depends on a
+conversation or on a filesystem path exposed to the browser.
+
+The public hierarchy is:
+
+```text
+prediction -> case/iteration -> operation -> CostTree -> kernel
+```
+
+It deliberately has no deployment, pool, or worker resource. The predictor's
+parquet and manifest still contain one physical cost-log source because exact
+CostTree replay needs a matched log/manifest pair. Analyzer discovery requires
+exactly one such source for a prediction artifact and treats it as an internal
+`CostLogSource`; it must not publish the source's simulator-facing pool/worker
+labels or manufacture topology from them. Simulation worker routes construct the
+same internal source from their real selected worker. This is the only shared
+boundary between the two resource families.
+
+The read-only protocol is:
+
+- `GET /api/v1/predictions` lists bounded prediction descriptors by opaque id.
+- `GET /api/v1/predictions/{prediction_id}/descriptor` returns selector,
+  architecture/GPU provenance, lifecycle, and detail hrefs.
+- `GET /api/v1/predictions/{prediction_id}/cases?offset=&limit=` pages the
+  snapshotted case inputs together with their exact operation summaries.
+- `GET /api/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/cost-tree`
+  reconstructs one exact tree.
+- Kernel-throughput and exact-iteration optimality routes hang below the same
+  selected case/operation identity. Prediction-level kernel-input-distribution
+  remains a bounded Analyzer subject.
+
+The case index is the only prediction selector. When a case contains one
+operation, the UI selects it automatically; a future multi-operation case may
+show an operation selector without changing CostTree identity. The UI reuses the
+same CostTree canvas, kernel inspector, throughput, input-distribution,
+critical-path breakdown, and optimality views as a simulation run. It does not
+reuse or render simulation topology, worker aggregate metrics, or the global
+wall-clock timeline.
+
 Agent consumers reuse this same read-only protocol rather than receiving a
 second metric API. A generic Analyzer MCP adapter may expose GET access below
 `/api/v1/`, but it must accept only relative Analyzer paths, reject traversal
@@ -337,6 +398,86 @@ traversal), the path must pass through a directory named `trace`, and the
 canonical regular file must remain below the configured logs root. The UI
 service must not assume that every launcher trace is under one root-level
 `trace/` directory.
+
+## Kernel profiling and measurement resources
+
+L1 kernel profiling and trend measurements are first-class Analyzer resources,
+peer to runs, sweeps, and timing predictions. The read-only protocol is:
+
+- `GET /api/v1/kernel-profiles` discovers `kernel_profile` artifacts by opaque
+  id (`kp_<uuid>`), workspace-aware, ignoring `old-logs`, rejecting duplicate or
+  invalid ids.
+- `GET /api/v1/kernel-profiles/{profile_id}/descriptor` returns kernel
+  kind/table/backend/metric family, explicit GPU provenance (requested DB cache
+  key, worker-observed physical GPU, `measurement` vs `cache_key` source),
+  lifecycle, and the curve href.
+- `GET /api/v1/kernel-profiles/{profile_id}/curve` serves the immutable
+  `curve.json` enriched with per-row hardware ceilings (see below); the artifact
+  file is never rewritten.
+- `GET /api/v1/kernel-measurements` discovers `kernel_measurement` artifacts
+  (`km_<uuid>`), workspace-aware with the same id hygiene.
+- `GET /api/v1/kernel-measurements/{measurement_id}/descriptor` exposes the
+  declared shape, duration, telemetry, GPU provenance, and summary/plot hrefs.
+- `GET /api/v1/kernel-measurements/{measurement_id}/summary` serves the existing
+  `summary.json` artifact (`schema_version` 1, passthrough).
+- `GET /api/v1/kernel-measurements/{measurement_id}/plots/{plot_name}` serves a
+  declared image. The plot path accepts exactly one normal component and only a name
+  the resource declares, so traversal and undeclared files are impossible.
+- `GET /api/v1/hardware/gpus?name=<gpu_name>` resolves the GPU spec catalog.
+
+The Python profiling artifact path owns the metadata and never depends on a
+conversation backend (direct development runs also write resource identity).
+Managed kernel jobs register before any official artifact is written, carrying
+`analyzerResourceId` so the backend owns only lifecycle/ownership. Metadata is the
+Analyzer discovery source of truth; `kernel-profile.meta.json` declares
+`schema_version`, `profile_id`, kernel provenance, GPU cache key / observed
+physical name / count, provenance source, mode, args, `created_at`, and artifact
+file declarations. `kernel-measurement.meta.json` additionally declares
+`summary_file`, `plots`, and the written artifacts.
+
+### GPU provenance contract
+
+GPU identity belongs to the execution layer (`local_worker` → `ChunkResult`
+boundary); runners still return only `ComputeMetrics` / `CommMetrics`. The worker
+reports the physical GPU it ran on; the requested cache key keys the DB row. A
+measured job fails when the requested cache key and the observed physical GPU cannot be
+resolved to the same canonical SKU through `gpu/spec.json` exact name/aliases. A
+cached-only job keeps its cache key and records `provenance.source = cache_key`
+without fabricating an observed GPU.
+
+### Hardware contract
+
+`gpu/spec.json` is the only source, matched by exact case-insensitive `name` /
+`aliases` — no fuzzy lookup, no web fallback, and unknown GPUs are explicitly
+`unmatched`/`unavailable`, never defaulted to a SKU. It is NOT on the timing
+path. Bandwidths are bytes/s and `interconnect_bandwidth_gbps` is
+BIDIRECTIONAL; the derived one-way rate is exactly half. TFLOPS are DENSE (no
+2:4 sparsity). H200 BF16 resolves to dense 990 TFLOP/s, HBM 4800 GB/s, NVLink
+4.0 900 GB/s bidirectional and 450 GB/s one-way.
+
+### Curve hardware bindings
+
+The curve endpoint enriches (does not modify) `curve.json` rows/series:
+
+- compute `tflops` rows use that row's dtype dense peak; `memory_bandwidth_gbps`
+  rows use the HBM peak; `time_ms` and `energy_j` have no universal theory line
+  and are `unavailable`.
+- point-to-point comm (`p2p_*`) `algbw_gbps`/`busbw_gbps` use the one-way
+  interconnect peak; collective comm `busbw_gbps` uses the bidirectional peak while
+  collective `algbw_gbps`, `time_ms`, and `energy_j` stay `unavailable`.
+- dtype and GPU are resolved from `gpu/spec.json` exact case-insensitive
+  `name`/`aliases`. A `None`/unmatched dtype or GPU yields an explicit `reason`,
+  never a fabricated line; because dtype may be a sweep axis, limits vary per row.
+
+### Legacy migration
+
+Legacy snapshot dirs with the old `job.meta.json` + `curve.json` (no new
+metadata) stay discovered as `kp_legacy_<hash>` where the hash is a normalized
+sha256 of `workspaceId + relative artifact path`. Old measurements are discovered as
+`km_legacy_<hash>` only when `summary.json` has a complete, verifiable signature.
+Legacy results lacking a reliable GPU still display their data with
+`gpu_provenance: unavailable` and no hardware limits; the current host is never
+inferred.
 
 ## Relationship to other docs
 

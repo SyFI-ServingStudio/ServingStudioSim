@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::mem::size_of;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -66,6 +66,68 @@ const INDEX_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 pub(super) struct OperationRange {
     pub(super) offset: usize,
     pub(super) limit: usize,
+}
+
+/// One matched cost-log/manifest pair. UI resource families resolve this
+/// internal source independently, so exact CostTree replay does not depend on
+/// simulation-run topology.
+#[derive(Clone, Debug)]
+pub(super) struct CostLogSource {
+    artifact_root: PathBuf,
+    pool_tag: String,
+    worker_id: u16,
+}
+
+impl CostLogSource {
+    pub(super) fn simulation_worker(run: &DiscoveredRun, pool_tag: &str, worker_id: u16) -> Self {
+        Self {
+            artifact_root: run.path.clone(),
+            pool_tag: pool_tag.to_owned(),
+            worker_id,
+        }
+    }
+
+    pub(super) fn unique_prediction_source(artifact_root: &Path) -> Result<Self> {
+        let manifests = read_cost_manifests(artifact_root)?;
+        if manifests.len() != 1 {
+            bail!(
+                "timing prediction requires exactly one cost-log source, found {}",
+                manifests.len()
+            );
+        }
+        let ((pool_tag, worker_id), _) = manifests
+            .into_iter()
+            .next()
+            .context("timing prediction cost manifest is empty")?;
+        let source = Self {
+            artifact_root: artifact_root.to_path_buf(),
+            pool_tag,
+            worker_id,
+        };
+        if !regular_file(&source.cost_path()) {
+            bail!("timing prediction cost log is missing");
+        }
+        Ok(source)
+    }
+
+    pub(super) fn pool_tag(&self) -> &str {
+        &self.pool_tag
+    }
+
+    pub(super) fn worker_id(&self) -> u16 {
+        self.worker_id
+    }
+
+    pub(super) fn artifact_root(&self) -> &std::path::Path {
+        &self.artifact_root
+    }
+
+    fn cost_path(&self) -> PathBuf {
+        resolve_artifact_path(&self.artifact_root, "cost_log").join(format!(
+            "worker_{}_{}.parquet",
+            self.pool_tag, self.worker_id
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -148,8 +210,9 @@ pub(super) async fn operation_range(
     range: OperationRange,
     request_id: u64,
 ) -> Result<Value> {
+    let source = CostLogSource::simulation_worker(run, pool_tag, worker_id);
     let started = Instant::now();
-    let index = cached_operation_index(cache, run, pool_tag, worker_id, request_id).await?;
+    let index = cached_operation_index(cache, &source, request_id).await?;
     let value = index.range_json(pool_tag, worker_id, range);
     prof(request_id, "operation_range event=complete", started);
     Ok(value)
@@ -163,11 +226,12 @@ pub(super) async fn operation_seek(
     at_ms: f64,
     request_id: u64,
 ) -> Result<Value> {
+    let source = CostLogSource::simulation_worker(run, pool_tag, worker_id);
     let started = Instant::now();
     if !at_ms.is_finite() {
         bail!("operation seek time must be finite");
     }
-    let index = cached_operation_index(cache, run, pool_tag, worker_id, request_id).await?;
+    let index = cached_operation_index(cache, &source, request_id).await?;
     let compute_started = Instant::now();
     let hit_ordinals = index.matching_ordinals(at_ms);
     let (anchor_ordinal, anchor_kind) = if let Some(ordinal) = hit_ordinals.first().copied() {
@@ -204,6 +268,78 @@ pub(super) async fn operation_seek(
     });
     prof(request_id, "operation_seek event=complete", started);
     Ok(value)
+}
+
+/// Project one predictor case from the shared operation index without exposing
+/// the predictor's internal cost-log worker key.
+pub(super) async fn prediction_case_summary(
+    cache: &OperationIndexCache,
+    source: &CostLogSource,
+    case_id: u64,
+    request_id: u64,
+) -> Result<Value> {
+    let index = cached_operation_index(cache, source, request_id).await?;
+    let matching = index
+        .operations
+        .iter()
+        .filter(|operation| operation.iter_id == case_id)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        bail!("prediction case {case_id} has no cost-log operations");
+    }
+    let total_time_ms = matching
+        .iter()
+        .map(|operation| operation.end_ms - operation.start_ms)
+        .sum::<f64>();
+    let operations = matching
+        .into_iter()
+        .enumerate()
+        .map(|(public_operation_id, operation)| {
+            json!({
+                "operation_id": public_operation_id.to_string(),
+                "section": index.section_names[usize::from(operation.section_id)],
+                "layer": operation.layer,
+                "time_ms": operation.end_ms - operation.start_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "case_id": case_id.to_string(),
+        "total_time_ms": total_time_ms,
+        "operations": operations,
+    }))
+}
+
+pub(super) async fn prediction_operation_cost_tree(
+    cache: &OperationIndexCache,
+    source: &CostLogSource,
+    prediction_id: &str,
+    case_id: u64,
+    public_operation_id: usize,
+    request_id: u64,
+) -> Result<Value> {
+    let index = cached_operation_index(cache, source, request_id).await?;
+    let operation = index
+        .operations
+        .iter()
+        .filter(|operation| operation.iter_id == case_id)
+        .nth(public_operation_id)
+        .with_context(|| {
+            format!("prediction operation {public_operation_id} is absent from case {case_id}")
+        })?;
+    exact_source_cost_tree(
+        source,
+        operation.iter_id,
+        operation.batch_id,
+        u64::from(operation.operation_id),
+        json!({
+            "prediction_id": prediction_id,
+            "case_id": case_id.to_string(),
+            "operation_id": public_operation_id.to_string(),
+        }),
+        request_id,
+    )
+    .await
 }
 
 fn centered_offset(anchor: usize, limit: usize, total: usize) -> usize {
@@ -302,12 +438,10 @@ impl WorkerOperationIndex {
 
 async fn cached_operation_index(
     cache: &OperationIndexCache,
-    run: &DiscoveredRun,
-    pool_tag: &str,
-    worker_id: u16,
+    source: &CostLogSource,
     request_id: u64,
 ) -> Result<Arc<WorkerOperationIndex>> {
-    let path = worker_cost_path(run, pool_tag, worker_id);
+    let path = source.cost_path();
     if let Some(index) = cache.get(&path, request_id)? {
         eprintln!("[worker-prof] request_id={request_id} operation_index cache=hit");
         return Ok(index);
@@ -325,7 +459,7 @@ async fn cached_operation_index(
     }
     eprintln!("[worker-prof] request_id={request_id} operation_index cache=miss event=build_start");
     let started = Instant::now();
-    let built = Arc::new(build_operation_index(run, pool_tag, worker_id, request_id).await?);
+    let built = Arc::new(build_operation_index(source, request_id).await?);
     prof(request_id, "operation_index event=build_end", started);
     cache.insert(path, built, request_id)
 }
@@ -392,9 +526,7 @@ impl OperationIndexCache {
 }
 
 async fn build_operation_index(
-    run: &DiscoveredRun,
-    pool_tag: &str,
-    worker_id: u16,
+    source: &CostLogSource,
     request_id: u64,
 ) -> Result<WorkerOperationIndex> {
     let started = Instant::now();
@@ -402,15 +534,8 @@ async fn build_operation_index(
         .with_target_partitions(1)
         .with_repartition_file_scans(false);
     let serial_ctx = SessionContext::new_with_config(serial_config);
-    let (ctx, manifest) = open_worker_in_session(
-        serial_ctx,
-        run,
-        pool_tag,
-        worker_id,
-        request_id,
-        "operation_index",
-    )
-    .await?;
+    let (ctx, manifest) =
+        open_source_in_session(serial_ctx, source, request_id, "operation_index").await?;
     require_columns(&ctx, TABLE, INDEX_COLUMNS).await?;
     let sql = "SELECT iter_id, batch_id, CAST(section AS VARCHAR) AS section, layer, \
                       wall_start_ms, total_time_ms FROM worker_cost";
@@ -607,9 +732,34 @@ pub(super) async fn exact_operation_cost_tree(
     operation_id: u64,
     request_id: u64,
 ) -> Result<Value> {
+    let source = CostLogSource::simulation_worker(run, pool_tag, worker_id);
+    exact_source_cost_tree(
+        &source,
+        iter_id,
+        batch_id,
+        operation_id,
+        json!({
+            "pool_tag": pool_tag,
+            "worker_id": worker_id,
+            "iter_id": iter_id.to_string(),
+            "batch_id": batch_id.to_string(),
+            "operation_id": operation_id.to_string(),
+        }),
+        request_id,
+    )
+    .await
+}
+
+async fn exact_source_cost_tree(
+    source: &CostLogSource,
+    iter_id: u64,
+    batch_id: u64,
+    operation_id: u64,
+    mut public_identity: Value,
+    request_id: u64,
+) -> Result<Value> {
     let started = Instant::now();
-    let (ctx, manifest_doc) =
-        open_worker(run, pool_tag, worker_id, request_id, "cost_tree").await?;
+    let (ctx, manifest_doc) = open_source(source, request_id, "cost_tree").await?;
     let require_started = Instant::now();
     require_columns(&ctx, TABLE, TREE_COLUMNS).await?;
     let optional = optional_columns(&ctx).await?;
@@ -660,17 +810,14 @@ pub(super) async fn exact_operation_cost_tree(
         .section(&row.section)
         .with_context(|| format!("worker manifest has no section {:?}", row.section))?;
     let tree = tree_json(manifest, row, 0)?;
+    let identity = public_identity
+        .as_object_mut()
+        .context("cost-tree public identity must be an object")?;
+    identity.insert("section".to_owned(), json!(row.section));
+    identity.insert("layer".to_owned(), json!(row.layer));
     let value = json!({
         "schema_version": 1,
-        "identity": {
-            "pool_tag": pool_tag,
-            "worker_id": worker_id,
-            "iter_id": iter_id.to_string(),
-            "batch_id": batch_id.to_string(),
-            "operation_id": operation_id.to_string(),
-            "section": row.section,
-            "layer": row.layer,
-        },
+        "identity": public_identity,
         "interval": {"start_ms": row.wall_start_ms, "end_ms": end_ms},
         "inputs": [{
             "section": row.section,
@@ -706,46 +853,44 @@ fn sort_exact_operations(rows: &mut [ExactRow], iter_id: u64, batch_id: u64) -> 
     Ok(())
 }
 
-async fn open_worker(
-    run: &DiscoveredRun,
-    pool_tag: &str,
-    worker_id: u16,
+async fn open_source(
+    source: &CostLogSource,
     request_id: u64,
     purpose: &str,
 ) -> Result<(SessionContext, ManifestDoc)> {
-    open_worker_in_session(
-        build_session(),
-        run,
-        pool_tag,
-        worker_id,
-        request_id,
-        purpose,
-    )
-    .await
+    open_source_in_session(build_session(), source, request_id, purpose).await
 }
 
-async fn open_worker_in_session(
+async fn open_source_in_session(
     ctx: SessionContext,
-    run: &DiscoveredRun,
-    pool_tag: &str,
-    worker_id: u16,
+    source: &CostLogSource,
     request_id: u64,
     purpose: &str,
 ) -> Result<(SessionContext, ManifestDoc)> {
     let started = Instant::now();
     let manifest_started = Instant::now();
-    let manifests = read_cost_manifests(&run.path)?;
+    let manifests = read_cost_manifests(source.artifact_root())?;
     let manifest = manifests
-        .get(&(pool_tag.to_owned(), worker_id))
+        .get(&(source.pool_tag().to_owned(), source.worker_id()))
         .cloned()
-        .with_context(|| format!("unknown worker {pool_tag}/{worker_id}"))?;
+        .with_context(|| {
+            format!(
+                "unknown cost-log source {}/{}",
+                source.pool_tag(),
+                source.worker_id()
+            )
+        })?;
     eprintln!(
         "[worker-prof] request_id={request_id} open_worker purpose={purpose} event=manifest_read manifests={} elapsed_ms={:.3}",
         manifests.len(), manifest_started.elapsed().as_secs_f64() * 1000.0
     );
-    let path = worker_cost_path(run, pool_tag, worker_id);
+    let path = source.cost_path();
     if !regular_file(&path) {
-        bail!("cost log missing for worker {pool_tag}/{worker_id}");
+        bail!(
+            "cost log missing for source {}/{}",
+            source.pool_tag(),
+            source.worker_id()
+        );
     }
     let register_started = Instant::now();
     register_if_exists(&ctx, TABLE, path).await?;
@@ -767,11 +912,6 @@ fn prof(request_id: u64, event: &str, started: Instant) {
         "[worker-prof] request_id={request_id} {event} elapsed_ms={:.3}",
         started.elapsed().as_secs_f64() * 1000.0
     );
-}
-
-fn worker_cost_path(run: &DiscoveredRun, pool_tag: &str, worker_id: u16) -> PathBuf {
-    resolve_artifact_path(&run.path, "cost_log")
-        .join(format!("worker_{pool_tag}_{worker_id}.parquet"))
 }
 
 fn has_section(manifest: &ManifestDoc, section: &str) -> bool {

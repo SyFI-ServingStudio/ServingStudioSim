@@ -78,14 +78,18 @@ class ManagedJob:
         artifact_root: Path,
         *,
         descriptor: dict[str, Any],
+        analyzer_resource_id: str | None = None,
     ) -> None:
+        request_payload: dict[str, Any] = {
+            "jobKind": self.job_kind,
+            "artifactRoot": str(artifact_root),
+            "descriptor": descriptor,
+        }
+        if analyzer_resource_id is not None:
+            request_payload["analyzerResourceId"] = analyzer_resource_id
         response = self._request(
             "/api/internal/managed-jobs/register",
-            {
-                "jobKind": self.job_kind,
-                "artifactRoot": str(artifact_root),
-                "descriptor": descriptor,
-            },
+            request_payload,
         )
         self.job_id = _required_string(response, "jobId")
         self.approved_root = _required_string(response, "approvedRoot")
@@ -150,11 +154,16 @@ def prepare_managed_job(
     artifact_root: Path,
     *,
     descriptor: dict[str, Any],
+    analyzer_resource_id: str | None = None,
 ) -> ManagedJob | None:
     """Register before the caller creates any official job artifacts."""
     managed_job = ManagedJob.from_environment(job_kind)
     if managed_job is not None:
-        managed_job.register(artifact_root, descriptor=descriptor)
+        managed_job.register(
+            artifact_root,
+            descriptor=descriptor,
+            analyzer_resource_id=analyzer_resource_id,
+        )
     return managed_job
 
 

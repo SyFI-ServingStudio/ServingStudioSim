@@ -41,6 +41,9 @@ prost-build = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+arrow-schema = { version = "54", default-features = false }
+parquet = { version = "54", default-features = false, features = ["arrow"] }
 
 # Build profiles (release / maxperf) come from the workspace root Cargo.toml and
 # apply to every member — defining them here would be ignored (cargo warns).

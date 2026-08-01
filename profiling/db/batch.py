@@ -18,12 +18,44 @@ from profiling.db.args import DType, KernelArgs
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec, resolve_spec_backend
 from profiling.db.table import ProfileRow, Table
+from profiling.gpu_catalog import resolve_gpu_spec
 from profiling.runners.metrics import Metrics
 
 if TYPE_CHECKING:
+    from profiling.db.registry import KernelProfilerSpec
     from profiling.exec.pool import ChunkResult, GpuChunk, GpuPool
 
 GpuCountFn = Callable[[dict[str, Any]], int]
+
+
+@dataclass(frozen=True)
+class ProfileProvenance:
+    """GPU provenance recorded by the profiling execution layer.
+
+    Owned by ``run_profile_batch``: the worker reports the physical GPU it ran on
+    (``observed_gpu_name``), which is provenance only — it never becomes a DB cache
+    key. ``requested_gpu_name`` is the DB cache key the batch was told to write
+    under (None = the backend fell back to the observed name). ``gpu_count`` is the
+    largest reserved chunk across the executed specs.
+    """
+
+    source: str
+    requested_gpu_name: str | None
+    observed_gpu_name: str | None = None
+    gpu_count: int | None = None
+
+
+@dataclass(frozen=True)
+class ProfileBatchOutcome:
+    """Typed result of one profiling batch: results + per-invocation provenance.
+
+    ``execute_profile_batch`` returns this so public facade and CLI share one
+    core call without an ambient side channel. The legacy ``run_profile_batch``
+    wrapper returns only ``results`` for compatibility.
+    """
+
+    results: list[Metrics | None]
+    provenance: ProfileProvenance
 
 
 @dataclass(frozen=True)
@@ -57,11 +89,54 @@ def run_profile_batch(
     pool: GpuPool | None = None,
     gpu_count_fn: GpuCountFn | None = None,
     db_path: Path | None = None,
+    gpu_name: str | None = None,
+    provenance: dict[str, Any] | None = None,
 ) -> list[Metrics | None]:
-    """Run profiling specs through the registry-selected runner.
+    """Backward-compatible thin wrapper over ``execute_profile_batch``.
 
-    Runners are executed through the selected ``GpuPool``. The default is
-    ``LocalGpuPool``; callers may inject ``RemoteGpuPool`` or another backend.
+    ``gpu_name`` is the requested DB cache key (``None`` uses the validated
+    worker-observed name). Callers that need GPU provenance should call
+    ``execute_profile_batch`` directly and read the typed ``ProfileBatchOutcome``;
+    this wrapper keeps the historical ``list[Metrics | None]`` return and, when a
+    ``provenance`` dict is still passed, fills it for older callers.
+    """
+
+    outcome = execute_profile_batch(
+        kernel_kind,
+        specs,
+        pool=pool,
+        gpu_count_fn=gpu_count_fn,
+        db_path=db_path,
+        gpu_name=gpu_name,
+    )
+    if provenance is not None:
+        batch_provenance = outcome.provenance
+        provenance["source"] = batch_provenance.source
+        provenance["requested_gpu_name"] = batch_provenance.requested_gpu_name
+        provenance["observed_gpu_name"] = batch_provenance.observed_gpu_name
+        provenance["gpu_count"] = batch_provenance.gpu_count
+    return outcome.results
+
+
+def execute_profile_batch(
+    kernel_kind: KernelKind,
+    specs: list[dict[str, Any]],
+    *,
+    pool: GpuPool | None = None,
+    gpu_count_fn: GpuCountFn | None = None,
+    db_path: Path | None = None,
+    gpu_name: str | None = None,
+) -> ProfileBatchOutcome:
+    """Internal profiling funnel: validate specs, run chunks, then persist.
+
+    This is the single measured-row camera. Every successful row is inserted under the
+    requested cache key only after GPU identity validation; a failed mismatch raises
+    before ``Table.insert`` so no row is left under the requested key. Runners
+    still return only ``Metrics``; physical GPU observations come from the execution
+    layer (``ChunkResult.observed_gpu_name``). A successful execution without that
+    observation is invalid; cached-only provenance exists only in the facade when
+    no worker runs. ``gpu_name`` is the requested DB cache key; ``None`` uses the
+    validated worker-observed name.
     """
 
     prepared_specs = _prepare_specs(kernel_kind, specs, gpu_count_fn)
@@ -75,16 +150,21 @@ def run_profile_batch(
 
     # Same backend shares one profiler spec/env; same GPU count shares one
     # acquired chunk shape.
-    classified_by_backend_gpu_count: dict[
-        tuple[str, int], list[_PreparedProfileSpec]
-    ] = defaultdict(list)
+    classified_by_backend_gpu_count: dict[tuple[str, int], list[_PreparedProfileSpec]] = (
+        defaultdict(list)
+    )
     for prepared_spec in prepared_specs:
-        classified_by_backend_gpu_count[
-            (prepared_spec.backend, prepared_spec.gpu_count)
-        ].append(prepared_spec)
+        classified_by_backend_gpu_count[(prepared_spec.backend, prepared_spec.gpu_count)].append(
+            prepared_spec
+        )
 
     results: list[Metrics | None] = [None] * len(specs)
+    observed_names: list[str] = []
+    pending_groups: list[tuple[KernelProfilerSpec, list[tuple[_PreparedProfileSpec, Metrics]]]] = []
+    largest_gpu_count = 0
 
+    # Run every group first, collecting rows plus every successful worker observation.
+    # Identity validation happens once after all chunks finish, before any insert.
     for (backend, gpu_count), classified_specs in classified_by_backend_gpu_count.items():
         profiler_spec = find_kernel_profiler_spec(kernel_kind, backend)
         reserved_chunks = list(
@@ -94,11 +174,10 @@ def run_profile_batch(
             )
         )
         if not reserved_chunks:
-            raise RuntimeError(
-                f"pool returned no chunks for {backend} with {gpu_count} GPU(s)"
-            )
+            raise RuntimeError(f"pool returned no chunks for {backend} with {gpu_count} GPU(s)")
 
-        profile_rows: list[ProfileRow] = []
+        largest_gpu_count = max(largest_gpu_count, gpu_count)
+        successful_profiles: list[tuple[_PreparedProfileSpec, Metrics]] = []
         for prepared_spec, chunk_result in _run_specs_across_chunks(
             kernel_kind,
             classified_specs,
@@ -106,21 +185,103 @@ def run_profile_batch(
         ):
             metrics = chunk_result.metrics
             results[prepared_spec.input_index] = metrics
-            if metrics is not None and db_path is not None:
-                if chunk_result.gpu_name is None:
-                    raise RuntimeError("execution backend did not report gpu_name for saved row")
-                profile_rows.append(
+            if metrics is None:
+                continue
+            observed = chunk_result.observed_gpu_name
+            if not observed:
+                raise RuntimeError(
+                    "successful profiling execution did not report observed_gpu_name"
+                )
+            if observed not in observed_names:
+                observed_names.append(observed)
+            successful_profiles.append((prepared_spec, metrics))
+        if successful_profiles:
+            pending_groups.append((profiler_spec, successful_profiles))
+
+    if pending_groups:
+        effective_cache_key, observed_after_validation = _validated_gpu_identity(
+            gpu_name, observed_names
+        )
+        if db_path is not None:
+            for profiler_spec, successful_profiles in pending_groups:
+                profile_rows = [
                     ProfileRow(
                         args=prepared_spec.kernel_args,
                         metrics=metrics,
-                        gpu_name=chunk_result.gpu_name,
-                        backend=backend,
+                        gpu_name=effective_cache_key,
+                        backend=prepared_spec.backend,
                     )
-                )
-        if db_path is not None and profile_rows:
-            Table(profiler_spec, db_path).insert(profile_rows)
+                    for prepared_spec, metrics in successful_profiles
+                ]
+                Table(profiler_spec, db_path).insert(profile_rows)
+    else:
+        effective_cache_key, observed_after_validation = gpu_name, None
 
-    return results
+    if observed_after_validation is None:
+        return ProfileBatchOutcome(
+            results=results,
+            provenance=ProfileProvenance(
+                source="cache_key",
+                requested_gpu_name=effective_cache_key,
+            ),
+        )
+    return ProfileBatchOutcome(
+        results=results,
+        provenance=ProfileProvenance(
+            source="measurement",
+            requested_gpu_name=effective_cache_key,
+            observed_gpu_name=observed_after_validation,
+            gpu_count=largest_gpu_count,
+        ),
+    )
+
+
+def _validated_gpu_identity(
+    requested_gpu_name: str | None,
+    observed_names: list[str],
+) -> tuple[str, str]:
+    """Validate GPU identity before any ``Table.insert``.
+
+    Returns ``(effective_cache_key, observed_name)``. Every observed name must
+    canonicalize via ``gpu/spec.json`` and all must share the requested key's
+    canonical SKU. Missing observations are rejected while collecting successful
+    results, before this helper and before any insert.
+    """
+    if not observed_names:
+        raise RuntimeError("measured profiling batch has no observed GPU identity")
+
+    observed_resolutions = [resolve_gpu_spec(name) for name in observed_names]
+    if any(resolution is None for resolution in observed_resolutions):
+        unmatched = [
+            name
+            for name, resolution in zip(observed_names, observed_resolutions, strict=True)
+            if resolution is None
+        ]
+        raise ValueError(
+            "worker-observed GPU(s) not in gpu/spec.json: "
+            + ", ".join(repr(name) for name in unmatched)
+        )
+    observed_canonical_skus = {resolution.canonical_name for resolution in observed_resolutions}
+    if len(observed_canonical_skus) > 1:
+        raise ValueError(
+            "workers observed different physical GPU SKUs: "
+            + ", ".join(sorted(observed_canonical_skus))
+        )
+    single_observed_name = observed_names[0]
+    if requested_gpu_name is not None:
+        requested_resolution = resolve_gpu_spec(requested_gpu_name)
+        if requested_resolution is None:
+            raise ValueError(f"requested cache key {requested_gpu_name!r} is not in gpu/spec.json")
+        if requested_resolution.canonical_name not in observed_canonical_skus:
+            raise ValueError(
+                f"GPU identity mismatch: requested cache key {requested_gpu_name!r} "
+                f"and observed physical GPU {single_observed_name!r} do not resolve to "
+                "the same canonical SKU in gpu/spec.json"
+            )
+        return requested_gpu_name, single_observed_name
+    # With no requested DB identity, use the agreed physical name consistently for
+    # both provenance and every inserted row.
+    return single_observed_name, single_observed_name
 
 
 def _run_specs_across_chunks(
@@ -178,10 +339,7 @@ def _run_chunk_assignment(
     kernel_kind: KernelKind,
     chunk_assignment: _ChunkAssignment,
 ) -> list[tuple[_PreparedProfileSpec, ChunkResult]]:
-    chunk_specs = [
-        prepared_spec.chunk_spec
-        for prepared_spec in chunk_assignment.assigned_specs
-    ]
+    chunk_specs = [prepared_spec.chunk_spec for prepared_spec in chunk_assignment.assigned_specs]
     chunk_results = chunk_assignment.chunk.run(kernel_kind, chunk_specs)
     if len(chunk_results) != len(chunk_assignment.assigned_specs):
         raise RuntimeError(

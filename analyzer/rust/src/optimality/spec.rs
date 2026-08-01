@@ -4,19 +4,20 @@
 //! peak. Unlocked analysis reuses R3's grid regime; locked-batch analysis uses
 //! the leaf's current operating-point regime. The R4→R5 gap is therefore the
 //! profiled↔hardware maturity gap under the chosen batching assumption.
-//! `gpu/spec.json` is a flat list of GPU dicts (`fp8_tflops`, `bf16_tflops`,
-//! `mem_bandwidth_gbps`, …), each carrying an explicit `aliases` list — the
-//! authoritative set of names a run's `gpu_name` might use (`"NVIDIA H200"`,
-//! `"H200"`, …) for the canonical SKU (`"H200-SXM-141GB"`). Matching is a
-//! case-insensitive exact lookup against `name` ∪ `aliases`; no fuzzy guessing.
 //!
-//! That alias table is meant to be the single GPU-name canonicalization source for
-//! the whole system (this hardware ceiling today; preset parsing / profile.db key matching
-//! later), so extending coverage is one JSON edit, not a code change here.
+//! The catalog JSON is parsed in exactly one place: [`crate::hardware::resolve_gpu`].
+//! This module is a thin adapter that maps the shared `ResolvedGpu` (Option fields)
+//! onto the `GpuSpec` shape the fold needs. Adapter semantics are explicit here:
+//!
+//! - `gpu/spec.json` JSON `null` (unsupported dtype for that GPU) maps to `0.0`,
+//!   meaning "no hardware ceiling, R5 leaf degrades to R4".
+//! - `peak_tflops` falls back to bf16 for an unrecognized dtype (the common
+//!   training/inference default) — the UI resolver, by contrast, keeps `None` for
+//!   unknown dtypes and never defaulted GPUs.
 
 use std::path::Path;
 
-use serde_json::Value;
+use crate::hardware::resolve_gpu;
 
 /// The peak rates the R5 ceiling needs for one GPU model.
 #[derive(Clone, Copy, Debug, Default)]
@@ -51,49 +52,22 @@ impl GpuSpec {
     }
 }
 
-/// Resolve the run's `gpu_name` to a `gpu/spec.json` entry via its explicit
-/// `name`/`aliases`. Returns the matched canonical spec name (for the report, so
-/// the resolution is auditable) + its peaks. `None` when the file is
-/// absent/unparseable or no alias matches — R5 then collapses onto R4 (no
+/// Resolve the run's `gpu_name` to a `gpu/spec.json` entry via the shared
+/// exact `name`/`aliases` resolver. Returns the matched canonical spec name (for
+/// the report, so the resolution is auditable) + its peaks. `None` when the
+/// file is absent/unparseable or no alias matches — R5 then collapses onto R4 (no
 /// hardware-gap bucket) with a logged caveat pointing at the missing alias.
 pub(crate) fn load_gpu_spec(repo_root: &Path, gpu_name: &str) -> Option<(String, GpuSpec)> {
-    let text = std::fs::read_to_string(repo_root.join("gpu/spec.json")).ok()?;
-    let doc: Value = serde_json::from_str(&text).ok()?;
-    let gpus = doc.get("gpus")?.as_array()?;
-
-    let target = gpu_name.trim().to_ascii_lowercase();
-    if target.is_empty() {
-        return None;
-    }
-    for gpu in gpus {
-        let name = gpu.get("name").and_then(Value::as_str).unwrap_or("");
-        let matches = std::iter::once(name)
-            .chain(
-                gpu.get("aliases")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str),
-            )
-            .any(|candidate| candidate.trim().to_ascii_lowercase() == target);
-        if matches {
-            let spec = GpuSpec {
-                fp8_tflops: field(gpu, "fp8_tflops"),
-                bf16_tflops: field(gpu, "bf16_tflops"),
-                fp16_tflops: field(gpu, "fp16_tflops"),
-                fp32_tflops: field(gpu, "fp32_tflops"),
-                int8_tops: field(gpu, "int8_tops"),
-                mem_bandwidth_gbps: field(gpu, "mem_bandwidth_gbps"),
-            };
-            return Some((name.to_string(), spec));
-        }
-    }
-    None
-}
-
-/// A spec field, treating JSON `null` (unsupported dtype for that GPU) as `0.0`.
-fn field(gpu: &Value, key: &str) -> f64 {
-    gpu.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+    let resolved = resolve_gpu(repo_root, gpu_name)?;
+    let spec = GpuSpec {
+        fp8_tflops: resolved.fp8_tflops.unwrap_or(0.0),
+        bf16_tflops: resolved.bf16_tflops.unwrap_or(0.0),
+        fp16_tflops: resolved.fp16_tflops.unwrap_or(0.0),
+        fp32_tflops: resolved.fp32_tflops.unwrap_or(0.0),
+        int8_tops: resolved.int8_tops.unwrap_or(0.0),
+        mem_bandwidth_gbps: resolved.mem_bandwidth_gbps.unwrap_or(0.0),
+    };
+    Some((resolved.canonical_name, spec))
 }
 
 #[cfg(test)]

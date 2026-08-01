@@ -8,11 +8,14 @@ from profiling import cli
 from profiling.artifacts import (
     PROFILE_CURVE_FILENAME,
     PROFILE_JOB_METADATA_FILENAME,
+    PROFILE_METADATA_FILENAME,
     PROFILE_REQUEST_FILENAME,
     PROFILE_RESULTS_FILENAME,
     build_curve_payload,
 )
+from profiling.db.batch import ProfileProvenance
 from profiling.db.registry import iter_kernel_profiler_specs
+from profiling.facade import KindTimesResult
 from profiling.runners.metrics import ComputeMetrics
 
 
@@ -64,11 +67,20 @@ def test_profile_run_writes_immutable_snapshot(monkeypatch, tmp_path: Path) -> N
     monkeypatch.delenv("VIBESIM_MANAGED_JOB_CONTEXT", raising=False)
     monkeypatch.delenv("VIBESIM_MANAGED_RUN_CONTEXT", raising=False)
     monkeypatch.setattr(cli, "_set_db_path", lambda _path: None)
-    monkeypatch.setattr(
-        cli,
-        "_get_facade",
-        lambda _table: (
-            lambda specs, **_kwargs: [
+
+    def fake_run_kind_times(
+        kernel_kind,
+        specs,
+        *,
+        backend: str,
+        gpu_name: str | None = None,
+        db_path,
+        jit_enabled: bool,
+        force: bool = False,
+    ):
+        del kernel_kind, backend, gpu_name, db_path, jit_enabled, force
+        return KindTimesResult(
+            results=[
                 ComputeMetrics(
                     time_ms=float(index + 1),
                     tflops=1.0,
@@ -76,9 +88,11 @@ def test_profile_run_writes_immutable_snapshot(monkeypatch, tmp_path: Path) -> N
                     energy_j=0.1,
                 )
                 for index, _spec in enumerate(specs)
-            ]
-        ),
-    )
+            ],
+            provenance=ProfileProvenance(source="cache_key", requested_gpu_name="NVIDIA H200"),
+        )
+
+    monkeypatch.setattr(cli, "run_kind_times", fake_run_kind_times)
     monkeypatch.setattr(cli, "_count_facade", lambda _table: lambda *_args, **_kwargs: 0)
     output_dir = tmp_path / "profile-artifact"
     args = SimpleNamespace(
@@ -91,7 +105,7 @@ def test_profile_run_writes_immutable_snapshot(monkeypatch, tmp_path: Path) -> N
         specs=None,
         db=None,
         gpu_name="NVIDIA H200",
-        force=True,
+        force=False,
         output_dir=output_dir,
         json=True,
     )
@@ -103,10 +117,26 @@ def test_profile_run_writes_immutable_snapshot(monkeypatch, tmp_path: Path) -> N
         PROFILE_RESULTS_FILENAME,
         PROFILE_CURVE_FILENAME,
         PROFILE_JOB_METADATA_FILENAME,
+        PROFILE_METADATA_FILENAME,
     }
     curve = json.loads((output_dir / PROFILE_CURVE_FILENAME).read_text())
     assert [axis["key"] for axis in curve["axes"]] == ["m"]
     assert curve["rows"][1]["metrics"]["time_ms"] == 2.0
+    metadata = json.loads((output_dir / PROFILE_METADATA_FILENAME).read_text())
+    assert metadata["profile_id"].startswith("kp_")
+    assert metadata["kernel"] == {
+        "kind": "single_gemm",
+        "table": "single_gemm",
+        "backend": "torch",
+        "metric_family": "compute",
+    }
+    assert metadata["gpu"] == {"cache_key": "NVIDIA H200", "observed_name": None, "count": 1}
+    assert metadata["provenance"]["source"] == "cache_key"
+    assert metadata["mode"] == "jit-fill"
+    assert metadata["args"] == [
+        {"m": 1, "n": 128, "k": 64, "dtype": "bfloat16"},
+        {"m": 2, "n": 128, "k": 64, "dtype": "bfloat16"},
+    ]
 
 
 def test_launcher_kernel_profile_dispatch_uses_shared_cli(monkeypatch) -> None:

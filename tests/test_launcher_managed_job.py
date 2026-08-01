@@ -93,6 +93,49 @@ def test_typed_job_registration_and_status(monkeypatch, tmp_path: Path) -> None:
     ]
 
 
+def test_timing_job_registration_carries_analyzer_resource_id(monkeypatch, tmp_path: Path) -> None:
+    artifact_root = tmp_path / "logs" / "predict"
+    context_path = tmp_path / "managed-job.json"
+    context_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "backend_url": "http://backend.test",
+                "capability_token": "secret",
+            }
+        )
+    )
+    monkeypatch.setenv(MANAGED_JOB_CONTEXT_ENV, str(context_path))
+    captured: list[request.Request] = []
+
+    def fake_urlopen(http_request: request.Request, timeout: int):
+        captured.append(http_request)
+        assert timeout == 15
+        return FakeResponse(
+            {
+                "jobId": "j_predict",
+                "resourceId": "tp_predict",
+                "approvedRoot": str(artifact_root),
+            }
+        )
+
+    monkeypatch.setattr(request, "urlopen", fake_urlopen)
+    managed_job = prepare_managed_job(
+        "timing_predict",
+        artifact_root,
+        descriptor={"selector": "iter"},
+        analyzer_resource_id="p_prediction_test",
+    )
+
+    assert managed_job is not None
+    assert json.loads(captured[0].data or b"{}") == {
+        "jobKind": "timing_predict",
+        "artifactRoot": str(artifact_root),
+        "descriptor": {"selector": "iter"},
+        "analyzerResourceId": "p_prediction_test",
+    }
+
+
 def test_legacy_managed_run_context_remains_accepted(monkeypatch, tmp_path: Path) -> None:
     context_path = tmp_path / "managed-run.json"
     context_path.write_text(

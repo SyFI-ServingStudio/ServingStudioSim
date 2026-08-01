@@ -54,7 +54,15 @@ def chunk_result_from_payload(result_payload: dict[str, Any]) -> ChunkResult:
         metrics = CommMetrics(**metrics_payload)
     else:
         raise ValueError(f"unknown metrics payload kind {kind!r}")
-    return ChunkResult(metrics=metrics, gpu_name=result_payload.get("gpu_name"))
+    # The worker's ``gpu_name`` is the physical GPU it observed. That is
+    # provenance (``observed_gpu_name``), not the DB cache key; the requested
+    # cache key is supplied by the controller/executor and set by
+    # the batch controller. When no explicit key was requested, the validated
+    # observed name becomes the key.
+    return ChunkResult(
+        metrics=metrics,
+        observed_gpu_name=result_payload.get("gpu_name"),
+    )
 
 
 __all__ = [

@@ -48,8 +48,9 @@ def measure_kernel(
 ) -> dict[str, Any]:
     """Run one trend+telemetry capture for ``spec`` and return the artifact summary."""
 
-    del gpu_name  # measure selects a physical GPU by idleness, not by DB key.
-
+    # ``gpu_name`` is the requested cache key for the measurement metadata (may be
+    # None). The physical GPU is selected by idleness, not by DB key; the
+    # worker-observed physical name is carried back separately as provenance.
     spec = dict(spec)
     if backend is not None:
         spec["backend"] = backend
@@ -100,6 +101,11 @@ def measure_kernel(
         "kernel_kind": kernel_kind,
         "backend": resolved_backend,
         "gpu_index": gpu_index,
+        "gpu_name": gpu_name,
+        # The worker already reports the physical GPU (torch device-0 name); keep
+        # it as provenance instead of dropping it, so the measurement metadata can
+        # state precisely what hardware observed the capture.
+        "observed_gpu_name": first.get("gpu_name") if runner_ok else None,
         "output_dir": str(resolved_output_dir),
         "time_ms": measure_result.get("time_ms"),
         "artifacts": measure_result.get("artifacts", []),

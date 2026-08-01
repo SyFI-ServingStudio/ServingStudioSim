@@ -1,16 +1,33 @@
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
+use arrow_array::{ArrayRef, Float64Array, Int16Array, RecordBatch, StringArray, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use axum::Router;
+use parquet::arrow::ArrowWriter;
 use serde_json::{json, Value};
 use tempfile::TempDir;
+use tower::ServiceExt;
 
 use super::batch::{read_batch_payload, read_batch_report};
 use super::catalog::build_catalog;
 use super::concurrency::{read_concurrency_payload, read_concurrency_report};
 use super::core::{build_descriptor, read_summary};
 use super::discovery::{configure_logs_roots, configure_workspace_registry, discover_runs};
+use super::hardware::{hardware_gpu_response, resolve_gpu};
 use super::kernel_input_distribution::{
     read_kernel_input_distribution_payload, read_kernel_input_distribution_report,
+};
+use super::kernel_measurement::{
+    build_kernel_measurement_catalog, discover_kernel_measurements, measurement_descriptor,
+    measurement_plot, measurement_summary, resolve_kernel_measurement,
+};
+use super::kernel_profile::{
+    build_kernel_profile_catalog, discover_kernel_profiles, profile_curve, profile_descriptor,
+    resolve_kernel_profile,
 };
 use super::kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
 use super::kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
@@ -18,6 +35,9 @@ use super::model::read_model;
 use super::optimality::{
     read_locked_optimality_payload, read_locked_optimality_report, read_optimality_payload,
     read_optimality_report,
+};
+use super::prediction::{
+    build_prediction_catalog, discover_predictions, prediction_descriptor, resolve_prediction,
 };
 use super::request_state::{read_request_state_payload, read_request_state_report};
 use super::slo::{read_slo_general_payload, read_slo_general_report};
@@ -29,7 +49,10 @@ use super::workload::read_workload;
 use super::workload_conservation::{
     read_workload_conservation_payload, read_workload_conservation_report,
 };
-use super::{timeline_profile_log_line, TimelineProfileEvent};
+use super::{
+    service_router, timeline_profile_log_line, OperationIndexCache, RootSource, ServiceState,
+    TimelineProfileEvent,
+};
 
 #[test]
 fn timeline_profile_log_has_fixed_fields_and_rejects_non_finite_time() {
@@ -127,6 +150,295 @@ fn make_sweep(path: &Path, with_payload: bool) {
         )
         .expect("write sweep payload");
     }
+}
+
+fn make_prediction(path: &Path, prediction_id: &str) {
+    fs::create_dir_all(path).expect("create prediction directory");
+    fs::write(path.join("predict.json"), "{}").expect("write prediction config snapshot");
+    fs::write(
+        path.join("prediction.cases.json"),
+        r#"[{"groups":[{"decode_count":8,"average_decode_length":128}]}]"#,
+    )
+    .expect("write normalized prediction cases");
+    fs::write(
+        path.join("prediction.meta.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "prediction_id": prediction_id,
+            "selector": "iter",
+            "arch_type": "llama3_dense",
+            "gpu": "NVIDIA H200",
+            "gpu_count": 1,
+            "config_file": "predict.json",
+            "cases_file": "prediction.cases.json",
+            "case_count": 1,
+        }))
+        .expect("serialize prediction metadata"),
+    )
+    .expect("write prediction metadata");
+}
+
+fn make_prediction_cost_source(path: &Path) {
+    let cost_log_directory = path.join("raw/cost_log");
+    let cost_manifest_directory = path.join("raw/cost_manifest");
+    fs::create_dir_all(&cost_log_directory).expect("create prediction cost-log directory");
+    fs::create_dir_all(&cost_manifest_directory)
+        .expect("create prediction cost-manifest directory");
+    fs::write(
+        cost_manifest_directory.join("worker_predict_0.json"),
+        r#"{
+            "sections": [{
+                "section": "iter",
+                "slots": [{
+                    "name": "post_norm",
+                    "kind": "rms_norm",
+                    "kernel_config": {"hidden": 4096, "backends": ["flashinfer"]}
+                }],
+                "nodes": [{"Leaf": 0}],
+                "node_labels": [null]
+            }]
+        }"#,
+    )
+    .expect("write prediction cost manifest");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("iter_id", DataType::UInt64, false),
+        Field::new("batch_id", DataType::UInt64, false),
+        Field::new("section", DataType::Utf8, false),
+        Field::new("layer", DataType::Int16, false),
+        Field::new("wall_start_ms", DataType::Float64, false),
+        Field::new("total_time_ms", DataType::Float64, false),
+    ]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(vec![0])),
+        Arc::new(UInt64Array::from(vec![0])),
+        Arc::new(StringArray::from(vec!["iter"])),
+        Arc::new(Int16Array::from(vec![-1])),
+        Arc::new(Float64Array::from(vec![0.0])),
+        Arc::new(Float64Array::from(vec![4.75])),
+    ];
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+        .expect("build prediction cost-log batch");
+    let file = fs::File::create(cost_log_directory.join("worker_predict_0.parquet"))
+        .expect("create prediction cost-log parquet");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("create parquet writer");
+    writer.write(&batch).expect("write prediction cost-log row");
+    writer.close().expect("close prediction cost-log parquet");
+}
+
+fn write_gpu_spec_fixture(repo_root: &Path) {
+    fs::create_dir_all(repo_root.join("gpu")).expect("create gpu catalog directory");
+    fs::write(
+        repo_root.join("gpu/spec.json"),
+        r#"{"gpus": [
+            {
+                "name": "H200-SXM-141GB",
+                "aliases": ["NVIDIA H200", "H200", "H200-SXM"],
+                "mem_bandwidth_gbps": 4800,
+                "fp16_tflops": 990,
+                "bf16_tflops": 990,
+                "fp8_tflops": 1979,
+                "fp32_tflops": 67,
+                "int8_tops": 1979,
+                "interconnect": "NVLink 4.0",
+                "interconnect_bandwidth_gbps": 900,
+                "nvl_domain_size": 8
+            },
+            {
+                "name": "H100-SXM5-80GB",
+                "aliases": ["NVIDIA H100", "H100"],
+                "mem_bandwidth_gbps": 3350,
+                "fp16_tflops": 989,
+                "bf16_tflops": 989,
+                "fp8_tflops": 1979,
+                "fp32_tflops": 67,
+                "int8_tops": 1979,
+                "interconnect": "NVLink 4.0",
+                "interconnect_bandwidth_gbps": 900,
+                "nvl_domain_size": 8
+            }
+        ]}"#,
+    )
+    .expect("write gpu spec fixture");
+}
+
+fn make_curve_file(path: &Path, kind: &str, family: &str, dtypes: &[&str]) {
+    let series_comm = r#"[
+        {"metric": "time_ms", "unit": "ms", "lowerIsBetter": true},
+        {"metric": "algbw_gbps", "unit": "GB/s", "lowerIsBetter": false},
+        {"metric": "busbw_gbps", "unit": "GB/s", "lowerIsBetter": false},
+        {"metric": "energy_j", "unit": "J", "lowerIsBetter": true}
+    ]"#;
+    let series_compute = r#"[
+        {"metric": "time_ms", "unit": "ms", "lowerIsBetter": true},
+        {"metric": "tflops", "unit": "TFLOP/s", "lowerIsBetter": false},
+        {"metric": "memory_bandwidth_gbps", "unit": "GB/s", "lowerIsBetter": false},
+        {"metric": "energy_j", "unit": "J", "lowerIsBetter": true}
+    ]"#;
+    let rows = dtypes
+        .iter()
+        .enumerate()
+        .map(|(index, dtype)| {
+            json!({
+                "index": index,
+                "coordinates": {"m": index as u64 + 1},
+                "args": {"m": index as u64 + 1, "k": 64, "dtype": dtype, "backend": "torch"},
+                "status": "ok",
+                "metrics": {"time_ms": 1.0, "tflops": 2.0, "memory_bandwidth_gbps": 3.0, "energy_j": 0.1}
+            })
+        })
+        .collect::<Vec<_>>();
+    fs::create_dir_all(path).expect("create curve directory");
+    fs::write(
+        path.join("curve.json"),
+        serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "resourceKind": "kernel_profile_curve",
+            "kernelKind": kind,
+            "table": kind,
+            "backend": "torch",
+            "metricFamily": family,
+            "axes": [{"key": "m", "values": [1, 2]}],
+            "fixedArgs": {"k": 64},
+            "layout": {"xAxis": "m", "yAxis": null, "facets": []},
+            "series": serde_json::from_str::<Value>(if family == "comm" { series_comm } else { series_compute })
+                .expect("series"),
+            "rows": rows,
+        }))
+        .expect("serialize curve"),
+    )
+    .expect("write curve");
+}
+
+fn make_kernel_profile(path: &Path, profile_id: &str, observed: Option<&str>) {
+    fs::create_dir_all(path).expect("create kernel profile directory");
+    make_curve_file(path, "single_gemm", "compute", &["bf16", "fp16"]);
+    fs::write(
+        path.join("job.meta.json"),
+        serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "jobKind": "kernel_profile",
+            "resourceId": profile_id,
+            "descriptor": {"table": "single_gemm", "kernelKind": "single_gemm", "backend": "torch", "metricFamily": "compute"},
+            "origin": {"kind": "development"}
+        }))
+        .expect("serialize profile job metadata"),
+    )
+    .expect("write profile job metadata");
+    fs::write(
+        path.join("kernel-profile.meta.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "profile_id": profile_id,
+            "kernel": {"kind": "single_gemm", "table": "single_gemm", "backend": "torch", "metric_family": "compute"},
+            "gpu": {"cache_key": "NVIDIA H200", "observed_name": observed, "count": 1},
+            "provenance": {"source": if observed.is_some() { "measurement" } else { "cache_key" }, "resolved_canonical_name": "H200-SXM-141GB"},
+            "mode": "force-refresh",
+            "args": [{"m": 1, "k": 64, "dtype": "bf16"}],
+            "created_at": "2026-07-02T00:00:00Z",
+            "artifacts": {"request": "request.json", "results": "results.json", "curve": "curve.json", "job_metadata": "job.meta.json"}
+        }))
+        .expect("serialize profile metadata"),
+    )
+    .expect("write profile metadata");
+}
+
+fn make_legacy_kernel_profile(path: &Path) {
+    fs::create_dir_all(path).expect("create legacy kernel profile directory");
+    make_curve_file(path, "single_gemm", "compute", &["bf16"]);
+    fs::write(
+        path.join("job.meta.json"),
+        serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "jobKind": "kernel_profile",
+            "descriptor": {"table": "single_gemm", "kernelKind": "single_gemm", "backend": "torch", "metricFamily": "compute"},
+            "origin": {"kind": "development"}
+        }))
+        .expect("serialize legacy job metadata"),
+    )
+    .expect("write legacy job metadata");
+}
+
+fn valid_summary_json() -> &'static str {
+    r#"{
+        "schema_version": 1,
+        "measurement": "one continuous CUPTI activity window",
+        "label": "single_gemm:torch",
+        "shape": {},
+        "metadata": {},
+        "runtime_ms": {"mean": 1.0, "median": 1.0, "min": 0.5, "max": 1.5, "p10": 0.6, "p90": 1.4, "p99": 1.5, "first_1s_mean": 1.0, "last_1s_mean": 1.0, "linear_slope_ms_per_s": 0.0}
+    }"#
+}
+
+fn make_kernel_measurement(path: &Path, measurement_id: &str) {
+    fs::create_dir_all(path).expect("create kernel measurement directory");
+    fs::write(path.join("summary.json"), valid_summary_json()).expect("write measurement summary");
+    fs::write(
+        path.join("runtimes.csv"),
+        "start_s,duration_ms\\n0.0,1.0\\n",
+    )
+    .expect("write csv");
+    let png = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    fs::write(path.join("runtime_trend.png"), png).expect("write trend png");
+    fs::write(path.join("runtime_telemetry.png"), png).expect("write telemetry png");
+    fs::write(
+        path.join("kernel-measurement.meta.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "measurement_id": measurement_id,
+            "kernel": {"kind": "single_gemm", "table": "single_gemm", "backend": "torch", "metric_family": "compute"},
+            "gpu": {"cache_key": "NVIDIA H200", "observed_name": "NVIDIA H200", "count": 1},
+            "shape": {"m": 8, "n": 8, "k": 8},
+            "duration_s": 10.0,
+            "telemetry": true,
+            "created_at": "2026-07-02T00:00:00Z",
+            "summary_file": "summary.json",
+            "plots": ["runtime_trend.png", "runtime_telemetry.png"],
+            "artifacts": ["runtimes.csv", "telemetry.csv", "summary.json", "runtime_trend.png", "runtime_telemetry.png"]
+        }))
+        .expect("serialize measurement metadata"),
+    )
+    .expect("write measurement metadata");
+}
+
+fn make_legacy_kernel_measurement(path: &Path) {
+    fs::create_dir_all(path).expect("create legacy kernel measurement directory");
+    fs::write(path.join("summary.json"), valid_summary_json()).expect("write legacy summary");
+    fs::write(
+        path.join("runtimes.csv"),
+        "start_s,duration_ms\\n0.0,1.0\\n",
+    )
+    .expect("write csv");
+    let png = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    fs::write(path.join("runtime_trend.png"), png).expect("write trend png");
+}
+
+fn prediction_test_router(logs_root: &Path) -> Router {
+    let roots = configure_logs_roots(vec![logs_root.to_path_buf()])
+        .expect("configure prediction test logs root");
+    service_router(ServiceState {
+        root_source: Arc::new(RootSource::Static(Arc::new(roots))),
+        repo_root: Arc::new(logs_root.to_path_buf()),
+        operation_indexes: Arc::new(OperationIndexCache::default()),
+    })
+}
+
+async fn get_json(router: Router, uri: &str) -> (StatusCode, Value) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("build HTTP test request"),
+        )
+        .await
+        .expect("route HTTP test request");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read HTTP test response body");
+    let value = serde_json::from_slice(&body).expect("decode HTTP test response JSON");
+    (status, value)
 }
 
 fn make_core_run(path: &Path) {
@@ -540,6 +852,105 @@ fn empty_logs_root_has_empty_protocol_v1_catalog() {
     assert_eq!(value["protocol_version"], 1);
     assert_eq!(value["runs"], Value::Array(Vec::new()));
     assert!(value["generated_at"].as_str().is_some());
+}
+
+#[test]
+fn prediction_catalog_is_first_class_and_does_not_create_a_run() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_prediction(&temporary.path().join("predict-llama"), "p_test");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+
+    let catalog =
+        serde_json::to_value(build_prediction_catalog(&roots).expect("build prediction catalog"))
+            .expect("serialize prediction catalog");
+    assert_eq!(catalog["protocol_version"], 1);
+    assert_eq!(catalog["predictions"][0]["prediction_id"], "p_test");
+    assert_eq!(catalog["predictions"][0]["kind"], "timing_predict");
+    assert_eq!(catalog["predictions"][0]["status"], "pending");
+    assert!(discover_runs(&roots).expect("discover runs").is_empty());
+
+    let prediction = resolve_prediction(&roots, "p_test").expect("resolve prediction");
+    let descriptor = prediction_descriptor(&prediction);
+    assert_eq!(descriptor["arch"]["type"], "llama3_dense");
+    assert_eq!(
+        descriptor["gpu"],
+        json!({"name": "NVIDIA H200", "count": 1})
+    );
+    assert!(descriptor.get("worker").is_none());
+    assert!(descriptor.get("deployment").is_none());
+}
+
+#[tokio::test]
+async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_json() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let prediction_path = temporary.path().join("predict-llama");
+    make_prediction(&prediction_path, "p_http_test");
+    make_prediction_cost_source(&prediction_path);
+    let router = prediction_test_router(temporary.path());
+
+    let (catalog_status, catalog) = get_json(router.clone(), "/api/v1/predictions").await;
+    assert_eq!(catalog_status, StatusCode::OK);
+    assert_eq!(catalog["predictions"][0]["prediction_id"], "p_http_test");
+    assert_eq!(catalog["predictions"][0]["status"], "ready");
+
+    let (descriptor_status, descriptor) =
+        get_json(router.clone(), "/api/v1/predictions/p_http_test/descriptor").await;
+    assert_eq!(descriptor_status, StatusCode::OK);
+    assert_eq!(descriptor["kind"], "timing_predict");
+    assert_eq!(descriptor["lifecycle"]["prediction"], "complete");
+    assert!(descriptor.get("worker").is_none());
+    assert!(descriptor.get("deployment").is_none());
+
+    let (cases_status, cases) = get_json(
+        router.clone(),
+        "/api/v1/predictions/p_http_test/cases?offset=0&limit=10",
+    )
+    .await;
+    assert_eq!(cases_status, StatusCode::OK);
+    assert_eq!(cases["prediction_id"], "p_http_test");
+    assert_eq!(cases["range"]["total"], 1);
+    assert_eq!(cases["cases"][0]["case_id"], "0");
+    assert_eq!(cases["cases"][0]["total_time_ms"], 4.75);
+    assert_eq!(cases["cases"][0]["operations"][0]["section"], "iter");
+    assert_eq!(
+        cases["cases"][0]["input"],
+        json!({"groups": [{"decode_count": 8, "average_decode_length": 128}]})
+    );
+    assert!(cases["cases"][0].get("worker").is_none());
+
+    let (missing_status, missing) =
+        get_json(router, "/api/v1/predictions/p_absent/descriptor").await;
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    assert_eq!(missing["code"], "prediction_not_found");
+    assert!(missing["detail"]
+        .as_str()
+        .is_some_and(|detail| !detail.contains(temporary.path().to_string_lossy().as_ref())));
+}
+
+#[test]
+fn prediction_discovery_rejects_duplicate_ids_and_ignores_old_logs() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_prediction(&temporary.path().join("first"), "p_duplicate");
+    make_prediction(&temporary.path().join("second"), "p_duplicate");
+    make_prediction(&temporary.path().join("old-logs/archived"), "p_archived");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+
+    assert!(discover_predictions(&roots).is_err());
+}
+
+#[test]
+fn prediction_discovery_rejects_noncanonical_resource_ids() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_prediction(&temporary.path().join("empty"), "p_");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    assert!(discover_predictions(&roots).is_err());
+
+    fs::remove_dir_all(temporary.path().join("empty")).expect("remove invalid prediction");
+    make_prediction(&temporary.path().join("unicode"), "p_预测");
+    assert!(discover_predictions(&roots).is_err());
 }
 
 #[test]
@@ -1590,4 +2001,620 @@ fn does_not_follow_directory_symlinks() {
     let catalog = build_catalog(&roots).expect("build catalog");
 
     assert!(catalog.runs.is_empty());
+}
+
+async fn get_bytes(router: Router, uri: &str) -> (StatusCode, axum::body::Bytes) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("build HTTP test request"),
+        )
+        .await
+        .expect("route HTTP test request");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read HTTP test response body");
+    (status, body)
+}
+
+#[test]
+fn kernel_profiles_and_measurements_are_first_class_and_do_not_create_runs() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let logs = temporary.path();
+    make_kernel_profile(&logs.join("profiles/one"), "kp_test", Some("NVIDIA H200"));
+    make_kernel_measurement(&logs.join("measure-1"), "km_test");
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+
+    let profile_catalog = serde_json::to_value(
+        build_kernel_profile_catalog(&roots).expect("build kernel profile catalog"),
+    )
+    .expect("serialize profile catalog");
+    assert_eq!(profile_catalog["protocol_version"], 1);
+    assert_eq!(
+        profile_catalog["kernel_profiles"][0]["profile_id"],
+        "kp_test"
+    );
+    assert_eq!(
+        profile_catalog["kernel_profiles"][0]["kind"],
+        "kernel_profile"
+    );
+    assert_eq!(
+        profile_catalog["kernel_profiles"][0]["provenance_source"],
+        "measurement"
+    );
+    assert_eq!(profile_catalog["kernel_profiles"][0]["status"], "ready");
+    assert!(discover_runs(&roots).expect("discover runs").is_empty());
+
+    let measurement_catalog = serde_json::to_value(
+        build_kernel_measurement_catalog(&roots).expect("build measurement catalog"),
+    )
+    .expect("serialize measurement catalog");
+    assert_eq!(measurement_catalog["protocol_version"], 1);
+    assert_eq!(
+        measurement_catalog["kernel_measurements"][0]["measurement_id"],
+        "km_test"
+    );
+    assert_eq!(
+        measurement_catalog["kernel_measurements"][0]["kind"],
+        "kernel_measurement"
+    );
+}
+
+#[tokio::test]
+async fn kernel_profile_http_routes_publish_descriptor_and_enriched_curve() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let logs = temporary.path();
+    make_kernel_profile(
+        &logs.join("profiles/one"),
+        "kp_http_test",
+        Some("NVIDIA H200"),
+    );
+    write_gpu_spec_fixture(logs);
+    let router = prediction_test_router(logs);
+
+    let (status, catalog) = get_json(router.clone(), "/api/v1/kernel-profiles").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(catalog["kernel_profiles"][0]["profile_id"], "kp_http_test");
+
+    let (status, descriptor) = get_json(
+        router.clone(),
+        "/api/v1/kernel-profiles/kp_http_test/descriptor",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(descriptor["kind"], "kernel_profile");
+    assert_eq!(descriptor["workspace_id"], "root_0");
+    assert_eq!(descriptor["kernel"]["metric_family"], "compute");
+    assert_eq!(descriptor["gpu"]["cache_key"], "NVIDIA H200");
+    assert_eq!(descriptor["gpu"]["observed_name"], "NVIDIA H200");
+    assert_eq!(descriptor["gpu_provenance"]["source"], "measurement");
+    assert_eq!(descriptor["lifecycle"]["profile"], "complete");
+    assert_eq!(
+        descriptor["resources"]["curve_href"],
+        "kernel-profiles/kp_http_test/curve"
+    );
+
+    let (status, curve) = get_json(router, "/api/v1/kernel-profiles/kp_http_test/curve").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(curve["schemaVersion"], 1);
+    assert_eq!(curve["hardware"]["matched"], true);
+    assert_eq!(curve["hardware"]["gpu"]["canonical_name"], "H200-SXM-141GB");
+    assert_eq!(curve["hardware"]["gpu"]["matched_alias"], "NVIDIA H200");
+    // Per-row dtype-aware limits: bf16 row reaches the dense 990 TFLOP/s peak.
+    assert_eq!(curve["rows"][0]["hardware"]["tflops_limit"]["limit"], 990.0);
+    assert_eq!(curve["rows"][1]["hardware"]["tflops_limit"]["limit"], 990.0);
+    // HBM H200 4.8 TB/s; time/energy have no theoretical line.
+    assert_eq!(
+        curve["rows"][0]["hardware"]["memory_bandwidth_gbps_limit"]["limit"],
+        4800.0
+    );
+    assert_eq!(
+        curve["hardware"]["metrics"]["memory_bandwidth_gbps"]["limit"],
+        4800.0
+    );
+    assert_eq!(
+        curve["hardware"]["metrics"]["time_ms"]["reason"],
+        "no_theoretical_line"
+    );
+    assert_eq!(curve["rows"][0]["status"], "ok");
+}
+
+#[tokio::test]
+async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let logs = temporary.path();
+    make_kernel_measurement(&logs.join("measure-1"), "km_http_test");
+    let router = prediction_test_router(logs);
+
+    let (status, descriptor) = get_json(
+        router.clone(),
+        "/api/v1/kernel-measurements/km_http_test/descriptor",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(descriptor["kind"], "kernel_measurement");
+    assert_eq!(descriptor["workspace_id"], "root_0");
+    assert_eq!(descriptor["gpu"]["observed_name"], "NVIDIA H200");
+    assert_eq!(descriptor["gpu_provenance"]["source"], "measurement");
+    assert_eq!(descriptor["duration_s"], 10.0);
+    assert_eq!(descriptor["shape"]["k"], 8);
+    assert_eq!(
+        descriptor["resources"]["summary_href"],
+        "kernel-measurements/km_http_test/summary"
+    );
+    let plots = descriptor["resources"]["plots"].as_array().expect("plots");
+    assert_eq!(plots.len(), 2);
+    assert!(plots
+        .iter()
+        .any(|p| p.as_str() == Some("kernel-measurements/km_http_test/plots/runtime_trend.png")));
+
+    let (status, summary) = get_json(
+        router.clone(),
+        "/api/v1/kernel-measurements/km_http_test/summary",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(summary["schema_version"], 1);
+    assert_eq!(summary["runtime_ms"]["median"], 1.0);
+
+    let (status, bytes) = get_bytes(
+        router.clone(),
+        "/api/v1/kernel-measurements/km_http_test/plots/runtime_trend.png",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        bytes.as_ref(),
+        &[0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    );
+
+    // A traversal-shaped request never resolves to OS files (route mismatch → 4xx).
+    let (status, bytes) = get_bytes(
+        router.clone(),
+        "/api/v1/kernel-measurements/km_http_test/plots/../curve.json",
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK);
+    let _ = bytes;
+    // Undeclared names are rejected with the artifact_missing problem body.
+    let (status, error) = get_json(
+        router,
+        "/api/v1/kernel-measurements/km_http_test/plots/summary.json",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(error["code"], "artifact_missing");
+    let _ = error;
+}
+
+#[tokio::test]
+async fn kernel_measurement_plot_path_rejects_traversal_and_undeclared_files() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let logs = temporary.path();
+    make_kernel_measurement(&logs.join("measure-1"), "km_traverse");
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+    let measurement = resolve_kernel_measurement(&roots, "km_traverse").expect("resolve");
+    let png = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    // Exact declared basenames serve the declared image bytes.
+    assert_eq!(
+        measurement_plot(&measurement, "runtime_trend.png").unwrap(),
+        png
+    );
+    // `..` escapes, sub-paths, and undeclared files are all rejected.
+    assert!(measurement_plot(&measurement, "../kernel-measurement.meta.json").is_err());
+    assert!(measurement_plot(&measurement, "sub/curve.json").is_err());
+    assert!(measurement_plot(&measurement, "summary.json").is_err());
+    assert!(measurement_plot(&measurement, "runtimes.csv").is_err());
+    assert!(measurement_plot(&measurement, ".hidden").is_err());
+    assert!(measurement_plot(&measurement, "").is_err());
+}
+
+#[test]
+fn kernel_discovery_is_workspace_aware_and_ignores_old_logs() {
+    let temporary = TempDir::new().expect("temporary registry root");
+    let first_logs = temporary.path().join("first/logs");
+    let second_logs = temporary.path().join("second/logs");
+    make_kernel_profile(
+        &first_logs.join("experiment/one"),
+        "kp_w1",
+        Some("NVIDIA H200"),
+    );
+    make_kernel_profile(
+        &first_logs.join("old-logs/archived"),
+        "kp_archive",
+        Some("NVIDIA H200"),
+    );
+    make_kernel_measurement(&second_logs.join("measurement-2"), "km_w2");
+    let registry_path = temporary.path().join("registry.json");
+    fs::write(
+        &registry_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "workspaces": [
+                {"workspace_id": "w_first", "display_name": "First", "state": "active", "logs_root": "first/logs"},
+                {"workspace_id": "w_second", "display_name": "Second", "state": "active", "logs_root": "second/logs"}
+            ]
+        }))
+        .expect("serialize registry"),
+    )
+    .expect("write registry");
+    let roots = configure_workspace_registry(&registry_path).expect("configure registry");
+
+    let profile_catalog = build_kernel_profile_catalog(&roots).expect("build catalogs");
+    assert_eq!(profile_catalog.kernel_profiles.len(), 1);
+    assert_eq!(profile_catalog.kernel_profiles[0].profile_id, "kp_w1");
+    assert_eq!(profile_catalog.kernel_profiles[0].workspace_id, "w_first");
+
+    let measurement_catalog =
+        build_kernel_measurement_catalog(&roots).expect("build measurement catalog");
+    assert_eq!(measurement_catalog.kernel_measurements.len(), 1);
+    assert_eq!(
+        measurement_catalog.kernel_measurements[0].workspace_id,
+        "w_second"
+    );
+    // The old-logs archive boundary never surfaces as a kernel resource.
+    assert!(!profile_catalog
+        .kernel_profiles
+        .iter()
+        .any(|entry| entry.display_name.contains("old-logs")));
+}
+
+#[test]
+fn kernel_discovery_rejects_duplicate_and_invalid_ids() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let logs = temporary.path();
+    make_kernel_profile(&logs.join("first"), "kp_dup", None);
+    make_kernel_profile(&logs.join("second"), "kp_dup", None);
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+    assert!(discover_kernel_profiles(&roots).is_err());
+
+    fs::remove_dir_all(logs.join("first")).expect("remove first");
+    fs::remove_dir_all(logs.join("second")).expect("remove second");
+    fs::create_dir_all(logs.join("invalid")).expect("create invalid");
+    fs::write(
+        logs.join("invalid/kernel-profile.meta.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "profile_id": "not-an-id",
+            "kernel": {"kind": "single_gemm", "table": "single_gemm", "backend": "torch", "metric_family": "compute"},
+            "gpu": {"cache_key": "NVIDIA H200", "observed_name": null, "count": 1},
+            "provenance": {"source": "cache_key", "resolved_canonical_name": "H200-SXM-141GB"}
+        }))
+        .expect("serialize invalid metadata"),
+    )
+    .expect("write invalid metadata");
+    assert!(discover_kernel_profiles(&roots).is_err());
+
+    fs::remove_dir_all(logs.join("invalid")).expect("remove invalid");
+
+    // Legacy ids are stable hashes of workspace + relative path.
+    let legacy_a = logs.join("legacy");
+    make_legacy_kernel_profile(&legacy_a);
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+    let found = resolve_kernel_profile(&roots, "kp_absent").unwrap_err();
+    assert!(found.to_string().contains("not found"));
+    let resolved = resolve_kernel_profile(
+        &roots,
+        &discover_kernel_profiles(&roots).unwrap()[0].profile_id,
+    )
+    .expect("resolve legacy");
+    assert!(resolved.profile_id.starts_with("kp_legacy_"));
+    assert!(resolved.legacy);
+}
+
+#[test]
+fn kernel_measurement_discovery_rejects_duplicate_and_incomplete_legacy() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let logs = temporary.path();
+    make_kernel_measurement(&logs.join("first"), "km_dup");
+    make_kernel_measurement(&logs.join("second"), "km_dup");
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+    assert!(discover_kernel_measurements(&roots).is_err());
+
+    fs::remove_dir_all(logs.join("first")).expect("remove first");
+    fs::remove_dir_all(logs.join("second")).expect("remove second");
+    // An empty/incomplete summary has no verifiable signature → not discovered.
+    fs::create_dir_all(logs.join("incomplete")).expect("create dir");
+    fs::write(logs.join("incomplete/summary.json"), "{}").expect("write incomplete summary");
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+    assert!(discover_kernel_measurements(&roots)
+        .expect("discover")
+        .is_empty());
+
+    make_legacy_kernel_measurement(&logs.join("legacy-measure"));
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+    let measurements = discover_kernel_measurements(&roots).expect("discover legacy");
+    assert_eq!(measurements.len(), 1);
+    assert!(measurements[0].legacy);
+    assert!(measurements[0].measurement_id.starts_with("km_legacy_"));
+    let descriptor = measurement_descriptor(&measurements[0]);
+    assert_eq!(descriptor["gpu_provenance"]["source"], "unavailable");
+    assert!(
+        descriptor["resources"]["plots"]
+            .as_array()
+            .expect("plots")
+            .len()
+            == 1
+    );
+}
+
+#[test]
+fn measurement_descriptor_is_pending_when_declared_summary_is_absent() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let logs = temporary.path();
+    let dir = logs.join("measure-1");
+    make_kernel_measurement(&dir, "km_no_summary");
+    fs::remove_file(dir.join("summary.json")).expect("remove declared summary");
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+    let measurement = resolve_kernel_measurement(&roots, "km_no_summary").expect("resolve");
+    let descriptor = measurement_descriptor(&measurement);
+    // A description must never report complete while its declared summary is absent.
+    assert_eq!(descriptor["lifecycle"]["measurement"], "pending");
+    // Summary serving still fails cleanly for the missing artifact.
+    assert!(measurement_summary(&measurement).is_err());
+}
+
+#[test]
+fn kernel_measurement_metadata_rejects_traversal_artifacts() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let logs = temporary.path();
+    let dir = logs.join("measure-1");
+    make_kernel_measurement(&dir, "km_traverse");
+    fs::write(
+        dir.join("kernel-measurement.meta.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "measurement_id": "km_traverse",
+            "kernel": {"kind": "single_gemm", "table": "single_gemm", "backend": "torch", "metric_family": "compute"},
+            "gpu": {"cache_key": "NVIDIA H200", "observed_name": "NVIDIA H200", "count": 1},
+            "duration_s": 10.0,
+            "summary_file": "summary.json",
+            "plots": ["runtime_trend.png"],
+            "artifacts": ["../escaped.png"]
+        }))
+        .expect("serialize"),
+    )
+    .expect("write metadata");
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+    // Validation is lexical (basenames only), so a traversal entry is rejected at
+    // discovery without any filesystem membership check.
+    assert!(discover_kernel_measurements(&roots).is_err());
+}
+
+#[test]
+fn kernel_profile_rejects_path_like_artifact_declarations() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let logs = temporary.path();
+    let dir = logs.join("profiles/one");
+    make_kernel_profile(&dir, "kp_traverse", Some("NVIDIA H200"));
+    fs::write(
+        dir.join("kernel-profile.meta.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "profile_id": "kp_traverse",
+            "kernel": {"kind": "single_gemm", "table": "single_gemm", "backend": "torch", "metric_family": "compute"},
+            "gpu": {"cache_key": "NVIDIA H200", "observed_name": "NVIDIA H200", "count": 1},
+            "provenance": {"source": "measurement", "resolved_canonical_name": "H200-SXM-141GB"},
+            "artifacts": {"curve": "sub/dir/curve.json"}
+        }))
+        .expect("serialize"),
+    )
+    .expect("write metadata");
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+    assert!(discover_kernel_profiles(&roots).is_err());
+}
+
+#[test]
+fn hardware_api_resolves_aliases_and_reports_unmatched_explicitly() {
+    let temporary = TempDir::new().expect("temporary repo");
+    write_gpu_spec_fixture(temporary.path());
+
+    let h200 = resolve_gpu(temporary.path(), "NVIDIA H200")
+        .expect("resolve")
+        .expect("matched");
+    assert_eq!(h200.canonical_name, "H200-SXM-141GB");
+    assert_eq!(h200.matched_alias, "NVIDIA H200");
+    assert_eq!(h200.dense_tflops("bf16"), Some(990.0));
+    assert_eq!(h200.dense_tflops("fp8_e4m3"), Some(1979.0));
+    assert_eq!(h200.mem_bandwidth_gbps, Some(4800.0));
+    assert_eq!(h200.interconnect_bandwidth_gbps, Some(900.0));
+    assert_eq!(h200.one_way_gbps(), Some(450.0));
+    assert_eq!(h200.dense_tflops("made-up-dtype"), None);
+
+    let response = hardware_gpu_response("NVIDIA H200", Some(&h200));
+    assert_eq!(response["matched"], true);
+    assert_eq!(response["canonical_name"], "H200-SXM-141GB");
+    assert_eq!(response["interconnect"]["bidirectional_gbps"], 900.0);
+    assert_eq!(response["interconnect"]["one_way_gbps"], 450.0);
+    assert_eq!(response["peaks"]["bf16_tflops"], 990.0);
+    assert_eq!(response["hbm_bandwidth_gbps"], 4800.0);
+
+    let unknown = resolve_gpu(temporary.path(), "Totally Made Up GPU").expect("resolve unknown");
+    assert!(unknown.is_none());
+    let response = hardware_gpu_response("Totally Made Up GPU", unknown.as_ref());
+    assert_eq!(response["matched"], false);
+    assert_eq!(response["available"], false);
+    assert!(response["reason"]
+        .as_str()
+        .is_some_and(|r| r.contains("unmatched")));
+    assert!(response.get("canonical_name").is_none());
+    assert!(response.get("peaks").is_none());
+    assert!(response.get("hbm_bandwidth_gbps").is_none());
+}
+
+#[tokio::test]
+async fn hardware_gpus_http_route_resolves_and_requires_name() {
+    let temporary = TempDir::new().expect("temporary repo");
+    write_gpu_spec_fixture(temporary.path());
+    let router = prediction_test_router(temporary.path());
+
+    let (status, value) =
+        get_json(router.clone(), "/api/v1/hardware/gpus?name=NVIDIA%20H200").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["matched"], true);
+    assert_eq!(value["canonical_name"], "H200-SXM-141GB");
+    assert_eq!(value["interconnect"]["name"], "NVLink 4.0");
+    assert_eq!(value["interconnect"]["bidirectional_gbps"], 900.0);
+    assert_eq!(value["interconnect"]["one_way_gbps"], 450.0);
+    // H200 BF16 must resolve to dense 990 TFLOP/s; HBM 4800 GB/s.
+    assert_eq!(value["peaks"]["bf16_tflops"], 990.0);
+    assert_eq!(value["hbm_bandwidth_gbps"], 4800.0);
+
+    let (status, value) = get_json(router.clone(), "/api/v1/hardware/gpus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "gpu_name_required");
+}
+
+#[test]
+fn curve_hardware_bindings_follow_dtype_and_interconnect_direction() {
+    let temporary = TempDir::new().expect("temporary repo");
+    let logs = temporary.path();
+    write_gpu_spec_fixture(logs);
+    // Computed bf16 row + a made-up dtype row (must have no fake line).
+    fs::create_dir_all(logs.join("profiles/compute")).expect("create dir");
+    make_curve_file(
+        &logs.join("profiles/compute"),
+        "single_gemm",
+        "compute",
+        &["bf16", "made-up"],
+    );
+    fs::write(
+        logs.join("profiles/compute/kernel-profile.meta.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "profile_id": "kp_limits",
+            "kernel": {"kind": "single_gemm", "table": "single_gemm", "backend": "torch", "metric_family": "compute"},
+            "gpu": {"cache_key": "H200-SXM-141GB", "observed_name": null, "count": 1},
+            "provenance": {"source": "cache_key", "resolved_canonical_name": "H200-SXM-141GB"},
+            "mode": "jit-fill"
+        }))
+        .expect("serialize"),
+    )
+    .expect("write metadata");
+    // P2P collective curve: algbw/busbw use the one-way peak.
+    fs::create_dir_all(logs.join("profiles/p2p")).expect("create p2p dir");
+    make_curve_file(&logs.join("profiles/p2p"), "p2p_intra", "comm", &[]);
+    fs::write(
+        logs.join("profiles/p2p/kernel-profile.meta.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "profile_id": "kp_p2p",
+            "kernel": {"kind": "p2p_intra", "table": "p2p_intra", "backend": "torch", "metric_family": "comm"},
+            "gpu": {"cache_key": "NVIDIA H200", "observed_name": null, "count": 1},
+            "provenance": {"source": "cache_key", "resolved_canonical_name": "H200-SXM-141GB"},
+            "mode": "jit-fill"
+        }))
+        .expect("serialize p2p"),
+    )
+    .expect("write p2p metadata");
+    // Collective curve: busbw uses the bidirectional peak, algbw has no generic line.
+    fs::create_dir_all(logs.join("profiles/ar")).expect("create ar dir");
+    make_curve_file(&logs.join("profiles/ar"), "all_reduce", "comm", &[]);
+    fs::write(
+        logs.join("profiles/ar/kernel-profile.meta.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "profile_id": "kp_ar",
+            "kernel": {"kind": "all_reduce", "table": "all_reduce", "backend": "torch", "metric_family": "comm"},
+            "gpu": {"cache_key": "NVIDIA H200", "observed_name": null, "count": 1},
+            "provenance": {"source": "cache_key", "resolved_canonical_name": "H200-SXM-141GB"},
+            "mode": "jit-fill"
+        }))
+        .expect("serialize ar"),
+    )
+    .expect("write ar metadata");
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+
+    let compute_curve = profile_curve(
+        &resolve_kernel_profile(&roots, "kp_limits").expect("resolve"),
+        logs,
+    )
+    .expect("compute curve");
+    assert_eq!(compute_curve["hardware"]["matched"], true);
+    assert_eq!(
+        compute_curve["rows"][0]["hardware"]["tflops_limit"]["limit"],
+        990.0
+    );
+    // Made-up dtype → no fabricated line, explicit reason.
+    assert_eq!(
+        compute_curve["rows"][1]["hardware"]["tflops_limit"]["available"],
+        false
+    );
+    assert_eq!(
+        compute_curve["rows"][1]["hardware"]["tflops_limit"]["reason"],
+        "no_peak_for_dtype_or_device"
+    );
+    assert_eq!(
+        compute_curve["rows"][0]["hardware"]["memory_bandwidth_gbps_limit"]["limit"],
+        4800.0
+    );
+
+    let p2p_curve = profile_curve(
+        &resolve_kernel_profile(&roots, "kp_p2p").expect("resolve"),
+        logs,
+    )
+    .expect("p2p curve");
+    assert_eq!(
+        p2p_curve["hardware"]["metrics"]["algbw_gbps"]["limit"],
+        450.0
+    );
+    assert_eq!(
+        p2p_curve["hardware"]["metrics"]["busbw_gbps"]["limit"],
+        450.0
+    );
+
+    let ar_curve = profile_curve(
+        &resolve_kernel_profile(&roots, "kp_ar").expect("resolve"),
+        logs,
+    )
+    .expect("all-reduce curve");
+    assert_eq!(
+        ar_curve["hardware"]["metrics"]["busbw_gbps"]["limit"],
+        900.0
+    );
+    assert_eq!(
+        ar_curve["hardware"]["metrics"]["algbw_gbps"]["available"],
+        false
+    );
+    assert_eq!(
+        ar_curve["hardware"]["metrics"]["time_ms"]["available"],
+        false
+    );
+}
+
+#[test]
+fn legacy_profile_has_data_but_no_hardware_limits() {
+    let temporary = TempDir::new().expect("temporary repo");
+    let logs = temporary.path();
+    make_legacy_kernel_profile(&logs.join("legacy-profile"));
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+
+    let profile = resolve_kernel_profile(
+        &roots,
+        &discover_kernel_profiles(&roots).expect("discover")[0].profile_id,
+    )
+    .expect("resolve legacy");
+    let descriptor = profile_descriptor(&profile);
+    assert_eq!(descriptor["legacy"], true);
+    assert_eq!(descriptor["gpu_provenance"]["source"], "unavailable");
+    assert!(descriptor["gpu"].is_null());
+
+    let curve = profile_curve(&profile, logs).expect("legacy curve");
+    // Data rows survive, but hardware limits are never synthesized.
+    assert_eq!(curve["rows"][0]["status"], "ok");
+    assert_eq!(curve["hardware"]["available"], false);
+    assert_eq!(curve["hardware"]["matched"], false);
+    assert_eq!(curve["hardware"]["reason"], "gpu_provenance_unavailable");
+    assert_eq!(
+        curve["rows"][0]["hardware"]["reason"],
+        "gpu_provenance_unavailable"
+    );
+    assert_eq!(
+        curve["rows"][0]["hardware"]["tflops_limit"]["available"],
+        false
+    );
 }

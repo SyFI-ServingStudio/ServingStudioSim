@@ -71,7 +71,8 @@ def test_to_payload_success_round_trips_through_chunk_result():
     }
     chunk = chunk_result_from_payload(payload)
     assert chunk.metrics == metrics
-    assert chunk.gpu_name == "NVIDIA H100"
+    # The worker's reported name is physical-GPU provenance, not the DB cache key.
+    assert chunk.observed_gpu_name == "NVIDIA H100"
     assert chunk.error is None
 
 

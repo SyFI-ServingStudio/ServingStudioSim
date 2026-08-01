@@ -61,6 +61,60 @@ pub(crate) async fn iteration_kernel_ladder(
     iter_id: u64,
     lock_batch_size: bool,
 ) -> Result<Value> {
+    iteration_kernel_ladder_with_gpu(
+        repo_root,
+        log_dir,
+        pool_tag,
+        worker_id,
+        iter_id,
+        lock_batch_size,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prediction_kernel_ladder(
+    repo_root: &Path,
+    log_dir: &Path,
+    pool_tag: &str,
+    worker_id: u16,
+    prediction_id: &str,
+    case_id: u64,
+    gpu_name: &str,
+    gpu_count: usize,
+    lock_batch_size: bool,
+) -> Result<Value> {
+    let mut value = iteration_kernel_ladder_with_gpu(
+        repo_root,
+        log_dir,
+        pool_tag,
+        worker_id,
+        case_id,
+        lock_batch_size,
+        Some((gpu_name, gpu_count)),
+    )
+    .await?;
+    let object = value
+        .as_object_mut()
+        .context("kernel ladder response must be an object")?;
+    object.remove("worker");
+    object.remove("iter_id");
+    object.insert("prediction_id".to_owned(), json!(prediction_id));
+    object.insert("case_id".to_owned(), json!(case_id.to_string()));
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn iteration_kernel_ladder_with_gpu(
+    repo_root: &Path,
+    log_dir: &Path,
+    pool_tag: &str,
+    worker_id: u16,
+    iter_id: u64,
+    lock_batch_size: bool,
+    gpu_override: Option<(&str, usize)>,
+) -> Result<Value> {
     let mut analysis = analyze_exact_iteration(
         repo_root,
         log_dir,
@@ -68,6 +122,7 @@ pub(crate) async fn iteration_kernel_ladder(
         worker_id,
         iter_id,
         lock_batch_size,
+        gpu_override,
     )
     .await?;
     let mut caveats = analysis.label_caveats.clone();
@@ -137,6 +192,67 @@ pub(crate) async fn iteration_waterfall(
     iter_id: u64,
     lock_batch_size: bool,
 ) -> Result<Value> {
+    iteration_waterfall_with_gpu(
+        repo_root,
+        log_dir,
+        pool_tag,
+        worker_id,
+        iter_id,
+        lock_batch_size,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prediction_waterfall(
+    repo_root: &Path,
+    log_dir: &Path,
+    pool_tag: &str,
+    worker_id: u16,
+    prediction_id: &str,
+    case_id: u64,
+    gpu_name: &str,
+    gpu_count: usize,
+    lock_batch_size: bool,
+) -> Result<Value> {
+    let mut value = iteration_waterfall_with_gpu(
+        repo_root,
+        log_dir,
+        pool_tag,
+        worker_id,
+        case_id,
+        lock_batch_size,
+        Some((gpu_name, gpu_count)),
+    )
+    .await?;
+    let object = value
+        .as_object_mut()
+        .context("waterfall response must be an object")?;
+    object.remove("worker");
+    object.remove("iter_id");
+    object.insert("prediction_id".to_owned(), json!(prediction_id));
+    object.insert("case_id".to_owned(), json!(case_id.to_string()));
+    if let Some(level) = object.get_mut("level").and_then(Value::as_object_mut) {
+        level.insert(
+            "key".to_owned(),
+            json!(format!("{prediction_id}/{case_id}")),
+        );
+        level.insert("label".to_owned(), json!(format!("case {case_id}")));
+    }
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn iteration_waterfall_with_gpu(
+    repo_root: &Path,
+    log_dir: &Path,
+    pool_tag: &str,
+    worker_id: u16,
+    iter_id: u64,
+    lock_batch_size: bool,
+    gpu_override: Option<(&str, usize)>,
+) -> Result<Value> {
     let analysis = analyze_exact_iteration(
         repo_root,
         log_dir,
@@ -144,6 +260,7 @@ pub(crate) async fn iteration_waterfall(
         worker_id,
         iter_id,
         lock_batch_size,
+        gpu_override,
     )
     .await?;
     let iteration_floor = analysis.label.as_ref().map(|label| label.floors);
@@ -184,6 +301,7 @@ async fn analyze_exact_iteration(
     worker_id: u16,
     iter_id: u64,
     lock_batch_size: bool,
+    gpu_override: Option<(&str, usize)>,
 ) -> Result<ExactIterationAnalysis> {
     let context = build_session();
     if !register_cost_log(&context, log_dir).await? {
@@ -198,6 +316,7 @@ async fn analyze_exact_iteration(
         worker_id,
         iter_id,
         lock_batch_size,
+        gpu_override,
     )
     .await?;
     let replication_factor = necessary_work_replication_factor(lock_batch_size);
@@ -235,6 +354,7 @@ async fn fold_exact_iteration(
     worker_id: u16,
     iter_id: u64,
     lock_batch_size: bool,
+    gpu_override: Option<(&str, usize)>,
 ) -> Result<ExactIterationFold> {
     // The UI chooses the same explicit variant for the aggregate payload and
     // this exact fold. Do not infer mode from a mutable report file: both
@@ -246,16 +366,21 @@ async fn fold_exact_iteration(
         .with_context(|| format!("cost manifest missing for worker {pool_tag}/{worker_id}"))?;
     let manifests_by_worker = BTreeMap::from([(worker_key.clone(), manifest)]);
 
-    let worker_gpu_counts = read_worker_gpu_counts(log_dir).unwrap_or_default();
-    let gpu_count = worker_gpu_counts
+    let discovered_gpu_count = read_worker_gpu_counts(log_dir)
+        .unwrap_or_default()
         .into_iter()
         .find_map(|(candidate_pool, candidate_worker, count)| {
             (candidate_pool == pool_tag && candidate_worker == worker_id).then_some(count)
         })
         .unwrap_or(1)
-        .max(1) as f64;
-
-    let (_num_gpus, gpu_name) = read_run_meta(log_dir).unwrap_or((1, String::new()));
+        .max(1);
+    let discovered_gpu_name = read_run_meta(log_dir)
+        .map(|(_num_gpus, gpu_name)| gpu_name)
+        .unwrap_or_default();
+    let (gpu_name, gpu_count) = gpu_override
+        .map(|(gpu_name, gpu_count)| (gpu_name.to_owned(), gpu_count.max(1)))
+        .unwrap_or((discovered_gpu_name, discovered_gpu_count));
+    let gpu_count = gpu_count as f64;
     let (gpu_spec_matched, gpu_spec) = spec::load_gpu_spec(repo_root, &gpu_name)
         .map(|(name, spec)| (Some(name), spec))
         .unwrap_or((None, GpuSpec::default()));
