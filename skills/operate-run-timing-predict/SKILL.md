@@ -158,6 +158,8 @@ When the managed prediction reaches `ready`, use
 `skills/operate-use-analyzer/SKILL.md` for every user-visible result value. Read
 the prediction descriptor/cases/CostTree and hardware limits through Analyzer
 using the stable `analyzer_resource_id`; do not reconstruct totals from the
-conversation job or implementer summary. Prediction citations are not yet part
-of the aggregate `exp.*` DSL, so never invent an inline token—use the typed
-prediction result card for navigation and report the resource ID and provenance.
+conversation job or implementer summary. Exact prediction reads return a
+complete `pred.*` citation token beside the result. Copy that token unchanged as
+Markdown inline code beside the supported claim so the frontend can resolve it
+to the prediction panel. Never derive a token from a case, operation, CostTree
+leaf, metric name, or resource ID.

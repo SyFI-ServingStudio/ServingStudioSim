@@ -59,11 +59,30 @@ Important semantics:
   put it below the workspace `logs/` root. Direct development calls may omit it
   when no durable visualization artifact is wanted.
 - `--gpu-name` is the DB key/filter used by `perf_api`; it is not a CUDA device
-  selector. The standard CLI does not expose a `--gpus` hardware-selection flag.
+  selector. The configured GPU pool establishes worker device visibility; the
+  standard CLI does not expose a `--gpus` hardware-selection flag.
 - The CLI is a wrapper over generated `perf_api` functions. Do not call runners
   or `run_profile_batch` directly for this workflow.
 - A fifth verb, `measure`, is **not** a cache operation — it is a cache-free
   NVML/CUPTI telemetry diagnostic. See "The `measure` diagnostic" below.
+
+### Automatic work submission
+
+For one homogeneous table/backend/GPU-count request, generate the complete
+intended spec set and submit it in one public `profiling run --specs ...` call.
+Do not manually split that set across CLI calls for concurrency, GPU selection,
+JIT amortization, memory heuristics, or failure localization.
+
+`run_profile_batch` and the configured GPU pool own idle-device discovery and
+reservation, work distribution, concurrent worker processes, and per-worker
+multi-spec execution. The implementation anchors are `profiling/db/batch.py`
+and `profiling/exec/local.py`; callers should use the public CLI rather than
+reimplementing this scheduling. After the complete submission, retry only specs
+reported missing or errored.
+
+Manually shard only when the user explicitly requests it, a retained-allocation
+or OOM issue has been diagnosed, or an execution backend has a documented
+payload limit. Report the exception and its evidence.
 
 ## The `measure` diagnostic (NVML telemetry, out of the cache path)
 
@@ -111,11 +130,14 @@ only after doing the exact action, or write `N/A: reason`.
   `<table>` and `--backend` exist.
 - [] Record the listed `kernel_kind`, `args`, `metric_family`,
   `subprocess_env`, generated `get_fn`, and generated `count_fn`.
-- [] Build the spec batch. Confirm every spec has exactly the listed `args`
-  fields and no routing-only fields such as `backend`.
-- [] Decide spec input form: repeated `--spec`, JSON list, `{"specs": [...]}`,
-  or JSONL file. Record the spec count.
-- [] Decide DB path. Use a task-scoped DB under `/workspace/tmp/` for
+- [] Build the complete intended spec set. Confirm every spec has exactly the
+  listed `args` fields and no routing-only fields such as `backend`.
+- [] For a homogeneous multi-spec profiling request, write the complete set to
+  one `--specs` input and record its count. Do not pre-shard it into multiple
+  `run` calls.
+- [] For a single spec, use `--spec`; for a multi-spec set, choose JSON list,
+  `{"specs": [...]}`, or JSONL as the one `--specs` input.
+- [] Decide DB path. Use a task-scoped DB under `<workspace>/tmp/` for
   validation-only runs; use the
   default/shared DB only when the user explicitly wants to update it.
 - [] Decide whether `--gpu-name` is needed. Use it for a known DB key or to
@@ -133,6 +155,9 @@ only after doing the exact action, or write `N/A: reason`.
 - [] Run the CLI with `--json` unless the user asked for human table output.
 - [] Capture the command exit code. For `run`, nonzero means rows remained
   missing or the command failed; do not treat that as success.
+- [] After the complete `run` submission, retry only specs reported missing or
+  errored. If manual sharding was required, record the allowed exception and
+  supporting evidence.
 - [] For `run` or `run --force`, run `count-missing` again on the same
   table/backend/specs/DB/gpu-name to verify persistence.
 - [] For `query` or completed `run`, verify the JSON result count equals the
@@ -159,9 +184,13 @@ Copy this checklist when the task involves more than a read-only query. Mark
 items as `[x]` only when complete.
 
 - [] `list --json` showed the intended table/backend pair.
-- [] The spec count used by the CLI matches the intended batch size.
+- [] The spec count used by the CLI matches the complete intended spec set.
+- [] One complete public `run --specs` submission was used for a homogeneous
+  multi-spec request, or an allowed manual-sharding exception is documented
+  with evidence.
 - [] `count-missing` was run before profiling, or skipped with a stated reason.
 - [] `run` or `run --force` completed with exit code 0.
+- [] Any retry contained only specs previously reported missing or errored.
 - [] Post-run `count-missing` returned 0, or every remaining miss is listed.
 - [] `query` or run output returned one result per input spec.
 - [] No result has `status: "missing"` unless the final answer explicitly
@@ -175,8 +204,12 @@ Before interpreting a snapshotted managed result, read
 `skills/operate-use-analyzer/SKILL.md`. Use the stable Analyzer profile or
 measurement resource ID to read its descriptor, curve/summary, declared plots,
 and hardware limits. The job row and CLI summary are lifecycle/provenance only.
-Profile/measurement citations are not yet part of the aggregate `exp.*` DSL, so
-do not invent inline tokens; navigation uses the typed result card.
+Kernel profile and measurement reads return a compact result plus a `citations`
+map keyed by the metric, panel, or plot represented in that result. Copy the
+matching complete `kprof.*` or `kmeasure.*` token unchanged as Markdown inline
+code beside the supported claim so the frontend can resolve it to that typed
+resource. Never derive a token from the table, backend, axes, metric, plot, or
+resource ID.
 
 Always report:
 
@@ -187,6 +220,8 @@ Always report:
   `--force` when used.
 - Scope: table, backend, spec count, DB path, and whether DB path was temporary
   or shared.
+- Submission: confirm one complete `run --specs` call, or report the allowed
+  manual-sharding exception and evidence; list any missing/error-only retry.
 - GPU context: requested `--gpu-name`, resolved GPU DB key when available, and
   whether the command relied on CUDA device-name auto-resolution.
 - Mode: read-only query, count-missing, JIT-fill, or force refresh.
@@ -203,19 +238,19 @@ Always report:
 
 ## Examples
 
-Repeated inline specs:
+Single-spec run:
 
 ```bash
 uv run python -m launcher kernel-profile run single_gemm --backend torch --force \
   --db tmp/single-gemm/profile.db \
   --output-dir logs/20260731_0_single_gemm_profile --json \
-  --spec '{"m":128,"n":8192,"k":8192,"dtype":"bf16"}' \
-  --spec '{"m":256,"n":8192,"k":8192,"dtype":"bf16"}'
+  --spec '{"m":128,"n":8192,"k":8192,"dtype":"bf16"}'
 ```
 
-JSON/JSONL file batch:
+Complete JSON/JSONL spec set:
 
 ```bash
+uv run python -m launcher kernel-profile run single_gemm --backend torch --gpu-name "H100" --specs specs.json --db tmp/single-gemm/profile.db --output-dir logs/20260731_0_single_gemm_profile --json
 uv run python -m launcher kernel-profile count-missing single_gemm --backend torch --gpu-name "H100" --specs specs.json --db tmp/single-gemm/profile.db --json
 uv run python -m launcher kernel-profile query single_gemm --backend torch --gpu-name "H100" --specs specs.jsonl --db tmp/single-gemm/profile.db --json
 ```

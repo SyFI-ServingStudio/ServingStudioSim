@@ -1,6 +1,6 @@
 ---
 name: operate-use-analyzer
-description: Use when selecting, reading, comparing, interpreting, or citing an existing VibeSim Analyzer result, including simulation sweeps/singletons, timing predictions, kernel profiles, and kernel measurements. Makes Analyzer the numerical authority, selects an exact resource from explicit UI context, a just-created managed result, or the recent catalog, and copies exact citation tokens returned beside sweep values. Not for producing the result itself; use the matching operate-run-* or operate-profile-* skill first.
+description: Use when selecting, reading, comparing, interpreting, or citing an existing VibeSim Analyzer result, including simulation sweeps/singletons, timing predictions, kernel profiles, and kernel measurements. Makes Analyzer the numerical authority, selects an exact resource from explicit UI context, a just-created managed result, or the recent catalog, and copies exact citation tokens returned beside result values. Not for producing the result itself; use the matching operate-run-* or operate-profile-* skill first.
 ---
 
 # Use VibeSim Analyzer
@@ -42,10 +42,15 @@ Use the `read_analyzer_resource` MCP tool. Set:
   workspace.
 
 `source` selects the data location; it does not change workspace ownership.
-After selecting a sweep ID, read exactly:
+After selecting a resource ID, read its exact typed endpoint. Common endpoints
+include:
 
 ```text
 /api/v1/sweeps/{sweep_id}/payload
+/api/v1/runs/{run_id}/...
+/api/v1/predictions/{prediction_id}/...
+/api/v1/kernel-profiles/{profile_id}/...
+/api/v1/kernel-measurements/{measurement_id}/...
 ```
 
 In a managed UI turn this returns one compact evidence block:
@@ -76,7 +81,13 @@ In a managed UI turn this returns one compact evidence block:
 }
 ```
 
-The compact block is the user-visible numerical authority. Do not replace it
+The compact block is the user-visible numerical authority. Exact run and
+prediction reads return their citation beside the result. Kernel profile and
+measurement reads return one compact result plus a `citations` map keyed by
+the metric, panel, or plot represented in that result. Their published token
+namespaces are respectively `run.*`, `pred.*`, `kprof.*`, and `kmeasure.*`.
+
+Do not replace an Analyzer result
 with `/api/jobs`, launcher status text, an implementer summary, or direct report
 file parsing when the Analyzer resource is ready.
 
@@ -103,17 +114,25 @@ At TP2 and 20 req/s, simulated throughput is 30,124.2 tok/s.
 `exp.tp2.rate20.throughput`
 ```
 
-## Follow-up turns and unsupported resources
+## Follow-up turns and typed resources
 
 Re-read the exact Analyzer resource in every turn that reports its numbers.
 This registers a current citation dictionary while historical messages keep
 their already-frozen targets.
 
-Timing predictions, kernel profiles, and kernel measurements are also
-Analyzer-owned, but do not invent `exp.*` tokens for a resource family whose
-citation contract is not yet defined. Read its documented descriptor, cases,
-curve, summary, plot, and hardware endpoints; rely on its typed result card for
-navigation and report the resource ID plus provenance.
+Sweeps, individual runs, timing predictions, kernel profiles, and kernel
+measurements all have first-class citation contracts. Use the token returned by
+the exact endpoint being interpreted:
+
+- sweep aggregate: `exp.*`;
+- individual simulation run: `run.*`;
+- timing prediction: `pred.*`;
+- kernel profile: `kprof.*`;
+- kernel measurement: `kmeasure.*`.
+
+These examples identify namespaces only. Never derive the remainder of a token
+from a metric name, slot, curve, or plot. Copy the complete token returned by
+Analyzer beside that exact result.
 
 If a resource is missing, pending, failed, ambiguous, or lacks the requested
 metric/coordinate, say exactly that. Do not estimate a replacement value.
