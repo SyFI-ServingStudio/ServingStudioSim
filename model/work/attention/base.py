@@ -17,9 +17,26 @@ protocol in a new file; every FFN combination then works unchanged.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 from ..core import MatmulGroup, Workload
+
+
+@dataclass(frozen=True)
+class AttentionSemantic:
+    """One non-matmul attention row with an independent CostTree identity.
+
+    Most attention families have one fused ``attn`` row per phase. MLA/DSA has
+    two persistent caches and a separately scheduled indexer, so it needs a few
+    more stable semantic rows while still sharing the generic Model fold.
+    """
+
+    name: str
+    bucket: str = "attn_internal"
+    byte_kind: str = "kv"
+    flops: float = 0.0
+    bytes: float = 0.0
 
 
 class AttentionSpec(Protocol):
@@ -32,3 +49,7 @@ class AttentionSpec(Protocol):
     def kv_bytes(self, wl: Workload) -> float: ...
 
     def cache_write_bytes(self, wl: Workload) -> float: ...
+
+    # Optional: a spec may expose more than the historical one fused attention
+    # row. Model.label uses getattr so existing specs remain source-compatible.
+    def semantic_segments(self, wl: Workload) -> list[AttentionSemantic]: ...

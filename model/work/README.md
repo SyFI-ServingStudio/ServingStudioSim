@@ -60,9 +60,10 @@ core.py            physics: Workload, AttnInteraction, MatmulGroup, Segment, Wor
 attention/base.py  AttentionSpec protocol      ffn/base.py    FFNSpec protocol
 attention/gqa.py   MHA / MQA / GQA (+gate)     ffn/dense.py   dense SwiGLU
 attention/linear.py  Gated DeltaNet (O(T))     ffn/moe.py     router + routed/shared experts
-                   (future: mla, swa)                        (future: fine-grained experts)
+attention/glm52_dsa.py  GLM MLA/DSA             (future: fine-grained experts)
 models/llama3.py     compose(GQA, dense)       models/qwen3_moe.py  compose(GQA, MoE)
 models/qwen3_6.py    hybrid [GDN×3, GQA×1] + dense    registry.py  architectures[0] -> builder
+models/glm52.py      dense/full-index + sparse/index-share stacks + shared MoE
 ```
 
 - **New attention (MLA/SWA/SSM)** → one new `attention/*.py`; every FFN combination is free.
@@ -92,6 +93,13 @@ Two attention mechanisms therefore coexist, and their cost models differ in kind
   blow-up. `kv_bytes` is a **fixed** recurrent state (`num_v_heads·d_k·d_v` per sequence,
   read+write each step) that does **not** grow with context — so at long context the labeler
   shows the 48 linear layers' state flat while the 16 full layers' KV cache dominates.
+
+GLM-5.2 MLA/DSA uses the optional multi-row attention contract: each full-index
+stack emits indexer prefill/decode rows plus sparse-MLA rows and separate BF16
+MLA-cache / FP8-index-cache append rows; index-share stacks omit the indexer rows
+and index-cache writes while retaining the MLA cache write. Its q_absorb and v_up groups are the per-head W_UK/W_UV views of the
+single learned `kv_b_proj` matrix, so the accountant preserves both execution
+work and exact parameter totals.
 
 The only currency between a spec and `core.py` is
 `MatmulGroup(name, n, k, activated_mult, total_count, bucket)`; `core.py` applies
