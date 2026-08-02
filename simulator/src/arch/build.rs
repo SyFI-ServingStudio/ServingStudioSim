@@ -67,11 +67,6 @@ pub fn glm52_model_cfg(model_spec: &ModelSpec) -> Result<Glm52ModelCfg> {
 }
 
 fn ensure_glm52_model_spec(model_spec: &ModelSpec) -> Result<()> {
-    if model_spec.fp8 {
-        bail!(
-            "glm52_dsa_moe does not support fp8=true; its accepted base/main MLA identity is BF16"
-        );
-    }
     if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
         bail!(
             "glm52_dsa_moe rejects num_layers/sim_num_layers overrides; the exact heterogeneous 78-layer schedule is required"
@@ -693,8 +688,14 @@ pub fn glm52_dsa_moe(
         nvl_num_gpu,
         gpu_name: gpu.to_string(),
     };
-    let configs = glm52_dsa_moe::build_configs(&model_cfg, &parallel, &routing, mtp_mode)
-        .context("expanding GLM-5.2 architecture configs")?;
+    let configs = glm52_dsa_moe::build_configs(
+        &model_cfg,
+        &parallel,
+        &routing,
+        model_spec.fp8,
+        mtp_mode,
+    )
+    .context("expanding GLM-5.2 architecture configs")?;
     let resolved = glm52_dsa_moe::resolve_configs(&configs);
     glm52_dsa_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.2 DSA-MoE model (often a missing profile.db row)")
@@ -1118,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn glm52_model_spec_loads_exact_identity_and_rejects_all_overrides() {
+    fn glm52_model_spec_loads_exact_identity_and_rejects_layer_overrides() {
         let model = glm52_model_cfg(&glm52_model_spec()).unwrap();
         assert_eq!(model.num_layers, 78);
         assert_eq!(model.num_experts.get(), 256);
@@ -1126,10 +1127,7 @@ mod tests {
 
         let mut fp8 = glm52_model_spec();
         fp8.fp8 = true;
-        assert!(glm52_model_cfg(&fp8)
-            .unwrap_err()
-            .to_string()
-            .contains("fp8=true"));
+        assert_eq!(glm52_model_cfg(&fp8).unwrap().dtype, model.dtype);
         for (num_layers, sim_num_layers) in [(Some(78), None), (None, Some(78))] {
             let mut overridden = glm52_model_spec();
             overridden.num_layers = num_layers;
@@ -1155,7 +1153,14 @@ mod tests {
                 gpu_name: "NVIDIA H200".to_string(),
             };
             let routing = resolve_routing(RoutingKind::Random, Some(19), 256);
-            let configs = glm52_dsa_moe::build_configs(&model, &parallel, &routing, mode).unwrap();
+            let configs = glm52_dsa_moe::build_configs(
+                &model,
+                &parallel,
+                &routing,
+                false,
+                mode,
+            )
+            .unwrap();
             assert_eq!(configs.parallel.ep_size, 16);
             assert_eq!(configs.parallel.nvl_num_gpu, 8);
             assert_eq!(configs.moe_dispatch.routing, routing);

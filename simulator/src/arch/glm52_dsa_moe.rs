@@ -96,6 +96,8 @@ const INDEX_LOGITS_BACKENDS: &[&str] = &["vllm_deepgemm_fp8"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["vllm_flashmla_bf16"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const P2P_BACKENDS: &[&str] = &["nccl"];
+const FP8_GROUPED_GEMM_BACKENDS: &[&str] = &["deepgemm"];
+const FP8_P2P_BACKENDS: &[&str] = &["nvshmem"];
 
 // Leaf counts are properties of the accepted L2/L3 sections. `build` verifies
 // the compiled tree against these formulas, so drift cannot be hidden by a
@@ -500,6 +502,7 @@ pub fn build_configs(
     model: &Glm52ModelCfg,
     parallel: &Glm52DsaMoeParallel,
     routing: &RoutingDistribution,
+    fp8: bool,
     mtp_mode: Glm52MtpMode,
 ) -> Result<Glm52DsaMoeConfigs, BuildError> {
     validate_model_cfg(model).map_err(fit_failed)?;
@@ -532,8 +535,17 @@ pub fn build_configs(
     let initial_shared_attention = attention_config(model, parallel, false);
     let cycle_full_attention = attention_config(model, parallel, true);
     let cycle_shared_attention = attention_config(model, parallel, false);
+    let (expert_dtype, expert_backends, p2p_backends) = if fp8 {
+        (
+            DType::Fp8E4m3,
+            FP8_GROUPED_GEMM_BACKENDS,
+            FP8_P2P_BACKENDS,
+        )
+    } else {
+        (DType::Bf16, GROUPED_GEMM_BACKENDS, P2P_BACKENDS)
+    };
     let moe_net = MoeNetConfig {
-        backends: P2P_BACKENDS.to_vec(),
+        backends: p2p_backends.to_vec(),
         gpu_name: gpu.clone(),
         dtype: DType::Bf16,
         intra_fabric: Fabric::Nvlink,
@@ -625,10 +637,10 @@ pub fn build_configs(
             moe_intermediate: model.moe_intermediate_dim.clone(),
             num_experts: model.num_experts.clone(),
             ep_size: parallel.ep_size,
-            dtype: DType::Bf16,
+            dtype: expert_dtype,
             gpu_name: gpu.clone(),
             act_backends: ELEMENTWISE_BACKENDS.to_vec(),
-            grouped_gemm_backends: GROUPED_GEMM_BACKENDS.to_vec(),
+            grouped_gemm_backends: expert_backends.to_vec(),
             local_ppm,
         },
         moe_combine: moe_net,
@@ -1733,8 +1745,14 @@ mod tests {
     #[test]
     fn build_configs_is_bridge_free_and_bakes_every_backend_and_shape() {
         let routing = RoutingDistribution::uniform(NUM_EXPERTS);
-        let cfg =
-            build_configs(&model(), &parallel(8), &routing, Glm52MtpMode::IndexShare).unwrap();
+        let cfg = build_configs(
+            &model(),
+            &parallel(8),
+            &routing,
+            false,
+            Glm52MtpMode::IndexShare,
+        )
+        .unwrap();
         assert_eq!(cfg.parallel.ep_size, 8);
         assert!(cfg.dense_full_index_attention.include_indexer);
         assert!(!cfg.initial_shared_attention.include_indexer);
@@ -1761,7 +1779,19 @@ mod tests {
             cfg.dense_full_index_attention.index_prefill_logits_backends,
             vec!["vllm_deepgemm_fp8"]
         );
+        assert_eq!(cfg.moe_expert_compute.dtype, DType::Bf16);
         assert_eq!(cfg.moe_expert_compute.grouped_gemm_backends, vec!["torch"]);
+        assert_eq!(cfg.moe_dispatch.backends, vec!["nccl"]);
+        assert_eq!(cfg.moe_combine.backends, vec!["nccl"]);
+        assert_eq!(cfg.moe_dispatch.dtype, DType::Bf16);
+        assert_eq!(cfg.moe_combine.dtype, DType::Bf16);
+        assert_eq!(cfg.moe_dispatch.net_params().hidden_bytes, HIDDEN_DIM * 2);
+        assert_eq!(cfg.moe_combine.net_params().hidden_bytes, HIDDEN_DIM * 2);
+        assert_eq!(cfg.sparse_router.base_dtype, DType::Bf16);
+        assert_eq!(cfg.sparse_router.router_semantic_dtype, DType::Fp32);
+        assert_eq!(cfg.shared_expert.dtype, DType::Bf16);
+        assert_eq!(cfg.final_norm.dtype, DType::Bf16);
+        assert_eq!(cfg.lm_head.dtype, DType::Bf16);
         assert_eq!(cfg.moe_dispatch.placement, Placement::RoundRobin);
         assert_eq!(cfg.moe_dispatch.intra_fabric, Fabric::Nvlink);
         assert_eq!(cfg.moe_dispatch.inter_fabric, Fabric::Infiniband);
@@ -1773,6 +1803,50 @@ mod tests {
         assert_eq!(cfg.lm_head.k, HIDDEN_DIM);
         assert!(cfg.mtp_prelude.is_some());
         assert!(!cfg.mtp_attention.as_ref().unwrap().include_indexer);
+    }
+
+    #[test]
+    fn fp8_only_changes_routed_experts_and_moe_network_backend() {
+        let cfg = build_configs(
+            &model(),
+            &parallel(8),
+            &RoutingDistribution::uniform(NUM_EXPERTS),
+            true,
+            Glm52MtpMode::IndexShare,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.moe_expert_compute.dtype, DType::Fp8E4m3);
+        assert_eq!(cfg.moe_expert_compute.grouped_gemm_backends, vec!["deepgemm"]);
+        assert_eq!(cfg.moe_dispatch.backends, vec!["nvshmem"]);
+        assert_eq!(cfg.moe_combine.backends, vec!["nvshmem"]);
+        assert_eq!(cfg.moe_dispatch.dtype, DType::Bf16);
+        assert_eq!(cfg.moe_combine.dtype, DType::Bf16);
+        assert_eq!(cfg.moe_dispatch.net_params().hidden_bytes, HIDDEN_DIM * 2);
+        assert_eq!(cfg.moe_combine.net_params().hidden_bytes, HIDDEN_DIM * 2);
+
+        let resolved = resolve_configs(&cfg);
+        assert_eq!(
+            resolved.moe_expert_compute.gate_up.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(resolved.moe_expert_compute.down.dtype, DType::Fp8E4m3);
+
+        // The expert-only selector does not spill into attention, router
+        // semantics, shared expert, final norm, LM head, or MTP roles.
+        assert_eq!(cfg.dense_full_index_attention.base_dtype, DType::Bf16);
+        assert_eq!(cfg.dense_ffn.dtype, DType::Bf16);
+        assert_eq!(cfg.sparse_router.base_dtype, DType::Bf16);
+        assert_eq!(cfg.sparse_router.router_semantic_dtype, DType::Fp32);
+        assert_eq!(cfg.shared_expert.dtype, DType::Bf16);
+        assert_eq!(cfg.final_norm.dtype, DType::Bf16);
+        assert_eq!(cfg.lm_head.dtype, DType::Bf16);
+        assert_eq!(cfg.mtp_prelude.as_ref().unwrap().dtype, DType::Bf16);
+        assert_eq!(
+            cfg.mtp_attention.as_ref().unwrap().base_dtype,
+            DType::Bf16
+        );
+        assert_eq!(cfg.mtp_head.as_ref().unwrap().dtype, DType::Bf16);
     }
 
     #[test]
@@ -1795,12 +1869,13 @@ mod tests {
                 gpu_name: "NVIDIA H200".into(),
             },
         ] {
-            assert!(build_configs(&model(), &p, &routing, Glm52MtpMode::Off).is_err());
+            assert!(build_configs(&model(), &p, &routing, false, Glm52MtpMode::Off).is_err());
         }
         assert!(build_configs(
             &model(),
             &parallel(8),
             &RoutingDistribution::uniform(128),
+            false,
             Glm52MtpMode::Off
         )
         .is_err());
@@ -1812,6 +1887,7 @@ mod tests {
             &model(),
             &parallel(8),
             &RoutingDistribution::uniform(NUM_EXPERTS),
+            false,
             Glm52MtpMode::FullIndex,
         )
         .unwrap();
@@ -2176,6 +2252,7 @@ mod tests {
             &model(),
             &parallel(8),
             &RoutingDistribution::uniform(NUM_EXPERTS),
+            false,
             Glm52MtpMode::Off,
         )
         .unwrap();
