@@ -6,7 +6,8 @@
 //! (`optimality::grid_peaks`, the `peak` op). Both need the exact same
 //! launcher-owned PyO3 environment and simulator-binary discovery, so that lives
 //! here once rather than duplicated per caller. Kernel semantics stay in the
-//! simulator; this module only locates the binary + venv and forwards JSON.
+//! simulator; this module only locates the binary + launcher project and forwards
+//! JSON through the repository's `uv`-managed Python environment.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,12 +19,13 @@ use serde_json::Value;
 /// The VibeSim repo root the launcher env + built binaries live under. The
 /// analyzer is launched from the repo (directly or via `python -m launcher`), so
 /// the current working directory is the honest default; `run_kernel_query`
-/// resolves `.venv/bin/python` and the launcher module against it.
+/// resolves the launcher module against that project with `uv run`.
 pub(crate) fn repo_root() -> Result<PathBuf> {
     std::env::current_dir().context("resolve analyzer repository root (current dir)")
 }
 
-/// Locate a built `simulator` binary carrying the same PyO3 ABI as `.venv`.
+/// Locate a built `simulator` binary carrying the same PyO3 ABI as the launcher's
+/// `uv` environment.
 /// Prefers the launcher-built release, then a sibling of the running `analyze`
 /// binary, then a debug build.
 pub(crate) fn simulator_binary(repo_root: &Path) -> Result<PathBuf> {
@@ -52,19 +54,22 @@ pub(crate) fn run_kernel_query(
     simulator: &Path,
     request: Value,
 ) -> Result<Value> {
-    let python = repo_root.join(".venv/bin/python");
-    if !python.is_file() {
-        bail!("launcher Python is absent at {}", python.display());
-    }
-    let mut child = Command::new(&python)
-        .args(["-m", "launcher.kernel_query", "--simulator"])
+    let mut child = Command::new("uv")
+        .args(["run", "--project"])
+        .arg(repo_root)
+        .args(["python", "-m", "launcher.kernel_query", "--simulator"])
         .arg(simulator)
         .current_dir(repo_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("start launcher kernel-query via {}", python.display()))?;
+        .with_context(|| {
+            format!(
+                "start launcher kernel-query via uv run --project {}",
+                repo_root.display()
+            )
+        })?;
     serde_json::to_writer(
         child
             .stdin

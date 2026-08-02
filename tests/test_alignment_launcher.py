@@ -508,6 +508,41 @@ def test_timing_predict_snapshot_accepts_inputs_already_in_output_root(tmp_path,
     assert json.loads(config_path.read_text()) == config
 
 
+def test_timing_predict_snapshots_private_labeler_params(tmp_path):
+    config_path = tmp_path / "timing_predict_config.json"
+    cases_path = tmp_path / "timing_predict_cases.json"
+    cases_path.write_text("[]")
+    config = {
+        "arch": {
+            "iter": {
+                "type": "glm52_dsa_moe",
+                "model_config": "model/config/glm52.json",
+                "fp8": False,
+                "ep_size": 8,
+            }
+        },
+        "gpu": "NVIDIA H200",
+        "log_dir": str(tmp_path),
+        "cases_file": str(cases_path),
+    }
+    config_path.write_text(json.dumps(config))
+
+    timing_predict_launcher._snapshot_inputs(config_path, config, tmp_path)
+
+    assert json.loads((tmp_path / "raw" / "params.json").read_text()) == {
+        "pools": {
+            "predict": {
+                "groups": [
+                    {
+                        "arch": config["arch"]["iter"],
+                        "gpu": "NVIDIA H200",
+                    }
+                ]
+            }
+        }
+    }
+
+
 def test_timing_predict_publishes_stable_analyzer_resource_metadata(tmp_path):
     config_path = tmp_path / "timing_predict_config.json"
     cases_path = tmp_path / "timing_predict_cases.json"

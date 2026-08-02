@@ -523,6 +523,9 @@ python -m launcher alignment analyze <analyze.yaml|json> [--build-type ...]
 - `--profile` wraps a single run with `perf record` (skill `operate-profile-sim-speed`).
 - `timing-predict` evaluates explicit batch shapes without a workload, scheduler,
   clock, or discrete-event simulation; its config is not a deployment preset.
+  The launcher snapshots a private `raw/params.json` model/GPU projection so the
+  necessary-work labeler can run; Analyzer does not expose that projection as
+  prediction topology.
 - `kernel-profile` is the operator-facing L1 profiling entry. It dispatches to
   `profiling.cli`, which remains the owner of registry, DB, GPU execution, and
   artifact semantics. `python -m profiling ...` is a compatible developer entry.

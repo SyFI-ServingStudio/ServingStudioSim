@@ -14,7 +14,10 @@ arch, or one half of an AFD split (attn / ffn), each costed independently.
 
 Unlike a real `run` (whose launcher snapshots the expanded config into `log_dir`),
 the predict path previously left no provenance behind; we now copy the config + its
-cases file into `log_dir` so a predict result is self-describing.
+cases file into `log_dir` so a predict result is self-describing. It also snapshots
+the selected model/GPU as an internal `raw/params.json` compatibility input for
+the model-aware necessary-work labeler; this does not create a public deployment
+or pool resource for the prediction.
 """
 
 from __future__ import annotations
@@ -38,6 +41,12 @@ from .exec import (
 from .managed_job import prepare_managed_job
 
 
+# The simulator's offline writer uses this physical stream tag. The prediction
+# API keeps it private, but the semantic labeler needs one stable key to match
+# the CostTree worker while it reads the launcher-owned compatibility snapshot.
+PREDICTION_POOL_TAG = "predict"
+
+
 def _load_config(path: Path) -> dict:
     """Parse the minimal predict config (JSON or YAML) — only `log_dir` /
     `cases_file` are needed launcher-side; the binary re-parses the whole thing."""
@@ -49,11 +58,43 @@ def _load_config(path: Path) -> dict:
     return yaml.safe_load(text)
 
 
+def _prediction_labeler_params(cfg: dict) -> dict | None:
+    """Project a predict config into the labeler's narrow params contract.
+
+    Timing-predict intentionally has no deployment topology. The R6/R7 model
+    labeler nevertheless needs the selected architecture, dtype, GPU, and the
+    physical CostTree stream key. Keep this projection private to
+    ``raw/params.json``; Analyzer discovery continues to use ``prediction.meta``
+    and never publishes this synthetic stream as a pool/worker hierarchy.
+    """
+    architecture = cfg.get("arch")
+    if not isinstance(architecture, dict) or len(architecture) != 1:
+        return None
+    _selector, architecture_config = next(iter(architecture.items()))
+    if not isinstance(architecture_config, dict):
+        return None
+    model_config = architecture_config.get("model_config")
+    gpu_name = cfg.get("gpu")
+    if not isinstance(model_config, str) or not model_config:
+        return None
+    if not isinstance(gpu_name, str) or not gpu_name:
+        return None
+    return {
+        "pools": {
+            PREDICTION_POOL_TAG: {
+                "groups": [{"arch": dict(architecture_config), "gpu": gpu_name}]
+            }
+        }
+    }
+
+
 def _snapshot_inputs(config_path: Path, cfg: dict, log_dir: Path) -> None:
     """Copy the predict config + its cases file into `log_dir` for provenance, so a
     predict result is self-describing (mirrors a real run's config snapshot). The
     cases file is resolved relative to the config's directory, the same way the
-    binary resolves it. Best-effort: a copy failure warns but does not fail the run.
+    binary resolves it. Also write the private model/GPU projection consumed by
+    ``model.work.floors``. Best-effort: a snapshot failure warns but does not fail
+    the prediction itself; the analyzer will report the unavailable labeler stage.
     """
     log_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -79,6 +120,24 @@ def _snapshot_inputs(config_path: Path, cfg: dict, log_dir: Path) -> None:
                 )
     except OSError as e:
         print(f"[warn] failed to snapshot predict inputs into {log_dir}: {e}", file=sys.stderr)
+
+    labeler_params = _prediction_labeler_params(cfg)
+    if labeler_params is None:
+        return
+    try:
+        raw_dir = log_dir / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        temporary_path = raw_dir / ".params.json.tmp"
+        temporary_path.write_text(
+            json.dumps(labeler_params, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(raw_dir / "params.json")
+    except OSError as error:
+        print(
+            f"[warn] failed to snapshot predict labeler params into {log_dir}: {error}",
+            file=sys.stderr,
+        )
 
 
 def _prediction_id(log_dir: Path) -> str:

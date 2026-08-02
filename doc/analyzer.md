@@ -317,6 +317,11 @@ labels or manufacture topology from them. Simulation worker routes construct the
 same internal source from their real selected worker. This is the only shared
 boundary between the two resource families.
 
+The launcher may also write `raw/params.json` for a prediction. That file is a
+private compatibility projection containing only the selected model/GPU needed
+by the model-aware necessary-work labeler; it is not a deployment snapshot and
+must not be used to publish a prediction pool or worker hierarchy.
+
 The read-only protocol is:
 
 - `GET /api/v1/predictions` lists bounded prediction descriptors by opaque id.
