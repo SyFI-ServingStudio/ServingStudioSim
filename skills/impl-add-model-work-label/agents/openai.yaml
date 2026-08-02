@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Model Work Label"
+  short_description: "Add independent necessary-work support for a model"
+  default_prompt: "Use $impl-add-model-work-label to add model.work labeling and validate R6/R7 readiness."

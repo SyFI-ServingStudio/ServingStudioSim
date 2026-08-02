@@ -176,4 +176,4 @@ convention, so `params["activated"]` exposes **all** of them rather than picking
 Derive the matmul inventory + attention/KV math from the **model's true architecture**
 (HF modeling code / paper — route through `top-split-model-into-kernels`), *not* by copying
 VibeSim's arch shapes. Add/compose the specs, register the `architectures[0]` string, add a
-golden. The forthcoming `dev-add-model-work-label` skill formalizes this.
+golden. The `impl-add-model-work-label` skill formalizes this.

@@ -38,7 +38,7 @@ def build_model(raw_config: dict) -> Model:
     if builder is None:
         raise UnknownArchitecture(
             f"{architecture} has no min-work builder; add one under work/models/ and "
-            f"register it in work/registry.py (see skill dev-add-model-work-label)"
+            f"register it in work/registry.py (see skill impl-add-model-work-label)"
         )
     return builder(raw_config)
 

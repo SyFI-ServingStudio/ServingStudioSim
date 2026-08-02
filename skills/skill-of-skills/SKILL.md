@@ -38,7 +38,8 @@ top-add-new-arch - add a whole model architecture end to end (explore → split 
 ├── impl-compose-op - compose kernels into L2 ops
 ├── impl-compose-worklet - compose ops into L3 sync-section worklets
 ├── impl-compose-arch - wire worklets into the L4 model_arch cost file
-└── impl-wire-new-arch - integrate the arch into dispatch/build/timing-predict/deployment (Phase 3, before Validate)
+├── impl-wire-new-arch - integrate the arch into dispatch/build/timing-predict/deployment (Phase 3)
+└── impl-add-model-work-label - add the independent model.work label and semantic location maps for R6/R7 (Phase 4, before Validate)
 
 top-add-kernel - add an L1 kernel end to end
 ├── orchestrator-add-kernel-to-python-profile - plan and verify Python profiling

@@ -3,8 +3,9 @@ name: top-add-new-arch
 description: >-
   Use as the top entry point when the user wants to add a whole new model
   architecture to VibeSim end to end — explore it, split its forward into kernels,
-  categorize every element into L1/L2/L3/L4, and build the kernels, ops,
-  worklets, and model_arch. The one criterion running through every layer is the
+  categorize every element into L1/L2/L3/L4, build the kernels, ops, worklets,
+  and model_arch, then add an independent model.work necessary-work label. The
+  one criterion running through the timing layers is the
   timing-prediction wiring — where each element's timing comes from: L1 is the
   only layer that MEASURES a number (profile.db); L2/L3/L4 only COMPOSE measured
   L1 timings. This is a routing/sequencing skill; it delegates each phase to a
@@ -112,11 +113,29 @@ every arch kind.
 
 Most sites are **compiler-forced** (exhaustive matches) — adding the selector
 variant breaks the build until each arm exists, so the compiler is the checklist.
-Done when timing-predict runs green on the new arch (the Phase 4 proof). This is
+Done when timing-predict runs green on the new arch (the Phase 5 proof). This is
 the point where "where does the timing come from?" becomes *observable* — the
 composed L1→L4 cost is now evaluable without a worker or a DES run.
 
-## Phase 4 — Validate
+## Phase 4 — Add the independent necessary-work label
+
+Route to `impl-add-model-work-label` after the L4 arch and its exact location
+names are stable. This phase gives Optimality an independent denominator for R6
+necessary-work coverage and R7 redundancy:
+
+- derive the model's compulsory FLOPs/bytes from the true architecture and
+  workload, never from the simulator's timing tree;
+- compose/register the `model.work` builder and add hand-derived parameter/FLOP
+  goldens;
+- map stable semantic work rows to every exact non-communication CostTree
+  location for each supported deployment.
+
+The architecture evidence comes from Phase 1; the location names come from the
+finished Phase 2/3 wiring. Those inputs have different roles and must not be
+mixed: simulator shapes may identify where semantic work lands, but never define
+how much minimum work exists.
+
+## Phase 5 — Validate
 
 Confirm the wired arch predicts sane timing **before** standing up a full
 deployment — you do not need a workload / pools / trace to check the cost model.
@@ -140,4 +159,5 @@ verify its closeout before moving up a layer. Stop and return to the user betwee
 phases whenever a design decision surfaces — a new args schema, a boundary call,
 or a deviation from the design docs — rather than deciding it silently. The build
 is complete only when every element from the Phase 1 table has a home at its
-correct layer, the arch is wired (Phase 3), and the Phase 4 checks pass.
+correct layer, the arch is wired (Phase 3), `model.work` support and the intended
+deployment maps are complete (Phase 4), and the Phase 5 checks pass.
