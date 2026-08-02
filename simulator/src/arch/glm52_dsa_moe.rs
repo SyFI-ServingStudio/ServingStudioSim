@@ -875,29 +875,34 @@ impl Glm52SparseBody {
     }
 
     fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        let attention = max_node(
+        let attention = labeled_max(
+            format!("{}.attention [Max over attention-DP groups]", self.name),
             (0..self.ep_size)
                 .map(|_| self.attention.compile(builder))
                 .collect(),
         );
-        let router = max_node(
+        let router = labeled_max(
+            format!("{}.moe.router [Max over home groups]", self.name),
             (0..self.ep_size)
                 .map(|_| self.router.compile(builder))
                 .collect(),
         );
         let dispatch = self.dispatch.compile(builder);
-        let experts = max_node(
+        let experts = labeled_max(
+            format!("{}.moe.routed_experts [Max over EP ranks]", self.name),
             (0..self.ep_size)
                 .map(|_| self.expert_compute.compile(builder))
                 .collect(),
         );
         let combine = self.combine.compile(builder);
-        let shared = max_node(
+        let shared = labeled_max(
+            format!("{}.moe.shared_expert [Max over home groups]", self.name),
             (0..self.ep_size)
                 .map(|_| self.shared_expert.compile(builder))
                 .collect(),
         );
-        let finalization = max_node(
+        let finalization = labeled_max(
+            format!("{}.moe.finalization [Max over home groups]", self.name),
             (0..self.ep_size)
                 .map(|_| self.finalization.compile(builder))
                 .collect(),
@@ -1117,17 +1122,29 @@ pub fn build(
 impl Glm52DsaMoeModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
-        let embedding = max_node(
+        let embedding = labeled_max(
+            format!(
+                "{}.main.embedding [Max over attention-DP groups]",
+                self.name
+            ),
             (0..self.ep_size)
                 .map(|_| self.embedding.compile(&mut builder))
                 .collect(),
         );
-        let dense_attention = max_node(
+        let dense_attention = labeled_max(
+            format!(
+                "{}.body.dense_full_index.attention [Max over attention-DP groups]",
+                self.name
+            ),
             (0..self.ep_size)
                 .map(|_| self.dense_full_index_attention.compile(&mut builder))
                 .collect(),
         );
-        let dense_ffn = max_node(
+        let dense_ffn = labeled_max(
+            format!(
+                "{}.body.dense_full_index.ffn [Max over attention-DP/home groups]",
+                self.name
+            ),
             (0..self.ep_size)
                 .map(|_| self.dense_ffn.compile(&mut builder))
                 .collect(),
@@ -1159,25 +1176,35 @@ impl Glm52DsaMoeModel {
                 ])),
             }),
         };
-        let final_norm = max_node(
+        let final_norm = labeled_max(
+            format!(
+                "{}.main.final_residual_rms_norm [Max over attention-DP/home groups]",
+                self.name
+            ),
             (0..self.ep_size)
                 .map(|_| self.final_norm.compile(&mut builder))
                 .collect(),
         );
-        let lm_head = max_node(
+        let lm_head = labeled_max(
+            format!(
+                "{}.main.lm_head [Max over attention-DP/home groups]",
+                self.name
+            ),
             (0..self.ep_size)
                 .map(|_| self.lm_head.compile(&mut builder))
                 .collect(),
         );
         let mut children = vec![embedding, dense, initial_shared, cycle, final_norm, lm_head];
         if let Some(mtp) = &self.mtp {
-            let prelude = max_node(
+            let prelude = labeled_max(
+                format!("{}.mtp.prelude [Max over attention-DP groups]", self.name),
                 (0..self.ep_size)
                     .map(|_| mtp.prelude.compile(&mut builder))
                     .collect(),
             );
             let decoder = mtp.decoder.compile(&mut builder);
-            let head = max_node(
+            let head = labeled_max(
+                format!("{}.mtp.head [Max over attention-DP/home groups]", self.name),
                 (0..self.ep_size)
                     .map(|_| mtp.head.compile(&mut builder))
                     .collect(),
@@ -1485,10 +1512,13 @@ fn normalize_input(
     })
 }
 
-fn max_node(children: Vec<CostNode>) -> CostNode {
-    CostNode::Max {
-        overlap: 1.0,
-        children,
+fn labeled_max(label: String, children: Vec<CostNode>) -> CostNode {
+    CostNode::Labeled {
+        label,
+        child: Box::new(CostNode::Max {
+            overlap: 1.0,
+            children,
+        }),
     }
 }
 
@@ -1590,6 +1620,7 @@ fn state_bytes_per_token(mtp_mode: Glm52MtpMode) -> std::result::Result<u64, Bui
 mod tests {
     use super::*;
     use crate::arch::contract::ArchGroupInput;
+    use std::collections::HashSet;
 
     fn exact_json_value() -> serde_json::Value {
         let full: Vec<&str> = (0..NUM_LAYERS)
@@ -1828,6 +1859,197 @@ mod tests {
                 160 * usize::from(ep) + 24
             );
         }
+    }
+
+    fn max_label_inventory(mtp_mode: Glm52MtpMode) -> Vec<String> {
+        let mut labels = vec![
+            "unified.main.embedding [Max over attention-DP groups]".to_string(),
+            "unified.body.dense_full_index.attention [Max over attention-DP groups]".to_string(),
+            "unified.body.dense_full_index.ffn [Max over attention-DP/home groups]".to_string(),
+        ];
+        for body in [
+            "unified.body.sparse_initial_index_share",
+            "unified.body.sparse_cycle_full_index",
+            "unified.body.sparse_cycle_index_share",
+        ] {
+            labels.extend([
+                format!("{body}.attention [Max over attention-DP groups]"),
+                format!("{body}.moe.router [Max over home groups]"),
+                format!("{body}.moe.routed_experts [Max over EP ranks]"),
+                format!("{body}.moe.shared_expert [Max over home groups]"),
+                format!("{body}.moe.finalization [Max over home groups]"),
+            ]);
+        }
+        labels.extend([
+            "unified.main.final_residual_rms_norm [Max over attention-DP/home groups]".to_string(),
+            "unified.main.lm_head [Max over attention-DP/home groups]".to_string(),
+        ]);
+        if mtp_mode != Glm52MtpMode::Off {
+            labels.push("unified.mtp.prelude [Max over attention-DP groups]".to_string());
+            let body = "unified.mtp.decoder_sparse";
+            labels.extend([
+                format!("{body}.attention [Max over attention-DP groups]"),
+                format!("{body}.moe.router [Max over home groups]"),
+                format!("{body}.moe.routed_experts [Max over EP ranks]"),
+                format!("{body}.moe.shared_expert [Max over home groups]"),
+                format!("{body}.moe.finalization [Max over home groups]"),
+            ]);
+            labels.push("unified.mtp.head [Max over attention-DP/home groups]".to_string());
+        }
+        labels
+    }
+
+    fn compile_max_label_inventory(mtp_mode: Glm52MtpMode) -> CostManifest {
+        let mut builder = CostTreeBuilder::new();
+        let nodes = max_label_inventory(mtp_mode)
+            .into_iter()
+            .map(|label| {
+                let leaf = builder.leaf(label.clone(), "test", serde_json::json!({}));
+                labeled_max(label, vec![leaf])
+            })
+            .collect();
+        builder.finish(CostNode::Sum(nodes)).manifest()
+    }
+
+    #[test]
+    fn every_l4_max_has_a_unique_semantic_manifest_label_in_every_mtp_mode() {
+        for (mode, expected_slots, expected_maxes) in [
+            (Glm52MtpMode::Off, 1_026, 20),
+            (Glm52MtpMode::FullIndex, 1_424, 27),
+            (Glm52MtpMode::IndexShare, 1_304, 27),
+        ] {
+            let manifest = compile_max_label_inventory(mode);
+            let max_labels: Vec<&str> = manifest
+                .nodes
+                .iter()
+                .zip(&manifest.node_labels)
+                .filter_map(|(node, label)| {
+                    matches!(node, FlatCostNode::Max { .. }).then(|| {
+                        label
+                            .as_deref()
+                            .expect("every GLM L4 Max must have a manifest label")
+                    })
+                })
+                .collect();
+            assert_eq!(expected_slot_count(8, mode), expected_slots);
+            assert_eq!(max_labels.len(), expected_maxes);
+            assert!(max_labels.iter().all(|label| label.contains("[Max over ")));
+            let unique: HashSet<&str> = max_labels.iter().copied().collect();
+            assert_eq!(unique.len(), max_labels.len(), "Max labels must be unique");
+
+            for expected in [
+                "unified.main.embedding [Max over attention-DP groups]",
+                "unified.body.dense_full_index.attention [Max over attention-DP groups]",
+                "unified.body.dense_full_index.ffn [Max over attention-DP/home groups]",
+                "unified.body.sparse_initial_index_share.attention [Max over attention-DP groups]",
+                "unified.body.sparse_cycle_full_index.moe.router [Max over home groups]",
+                "unified.body.sparse_cycle_full_index.moe.routed_experts [Max over EP ranks]",
+                "unified.body.sparse_cycle_index_share.moe.shared_expert [Max over home groups]",
+                "unified.body.sparse_cycle_index_share.moe.finalization [Max over home groups]",
+                "unified.main.final_residual_rms_norm [Max over attention-DP/home groups]",
+                "unified.main.lm_head [Max over attention-DP/home groups]",
+            ] {
+                assert!(
+                    max_labels.contains(&expected),
+                    "missing Max label {expected}"
+                );
+            }
+            if mode == Glm52MtpMode::Off {
+                assert!(max_labels.iter().all(|label| !label.contains(".mtp.")));
+            } else {
+                for expected in [
+                    "unified.mtp.prelude [Max over attention-DP groups]",
+                    "unified.mtp.decoder_sparse.attention [Max over attention-DP groups]",
+                    "unified.mtp.decoder_sparse.moe.router [Max over home groups]",
+                    "unified.mtp.decoder_sparse.moe.routed_experts [Max over EP ranks]",
+                    "unified.mtp.decoder_sparse.moe.shared_expert [Max over home groups]",
+                    "unified.mtp.decoder_sparse.moe.finalization [Max over home groups]",
+                    "unified.mtp.head [Max over attention-DP/home groups]",
+                ] {
+                    assert!(
+                        max_labels.contains(&expected),
+                        "missing Max label {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_l4_uses_only_the_labeled_max_constructor() {
+        let production = include_str!("glm52_dsa_moe.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source precedes tests");
+        assert_eq!(
+            production.matches("CostNode::Max {").count(),
+            1,
+            "the only production Max constructor must be inside labeled_max"
+        );
+        assert!(!production.contains("max_node("));
+    }
+
+    #[test]
+    fn labeled_max_is_flattening_and_cost_transparent() {
+        fn tree(labeled: bool) -> CostTree {
+            let mut builder = CostTreeBuilder::new();
+            let max_children = vec![
+                builder.leaf("a", "test", serde_json::json!({})),
+                builder.leaf("b", "test", serde_json::json!({})),
+            ];
+            let max = if labeled {
+                labeled_max("semantic [Max over groups]".to_string(), max_children)
+            } else {
+                CostNode::Max {
+                    overlap: 1.0,
+                    children: max_children,
+                }
+            };
+            let serial = CostNode::Sum(vec![builder.leaf("c", "test", serde_json::json!({}))]);
+            builder.finish(CostNode::Sum(vec![max, serial]))
+        }
+
+        let plain = tree(false);
+        let labeled = tree(true);
+        assert_eq!(labeled.n_slots(), plain.n_slots());
+        let plain_flat = plain.flatten();
+        let labeled_flat = labeled.flatten();
+        assert_eq!(labeled_flat.len(), plain_flat.len());
+        for predicate in [
+            |node: &FlatCostNode| matches!(node, FlatCostNode::Leaf(_)),
+            |node: &FlatCostNode| matches!(node, FlatCostNode::Sum { .. }),
+            |node: &FlatCostNode| matches!(node, FlatCostNode::Max { .. }),
+            |node: &FlatCostNode| matches!(node, FlatCostNode::Scale { .. }),
+        ] {
+            assert_eq!(
+                labeled_flat.iter().filter(|node| predicate(node)).count(),
+                plain_flat.iter().filter(|node| predicate(node)).count()
+            );
+        }
+        let mut slots = vec![LeafMetrics::ZERO; 3];
+        slots[0].m.time_ms = 2.0;
+        slots[1].m.time_ms = 3.0;
+        slots[2].m.time_ms = 5.0;
+        let mut plain_scratch = Vec::new();
+        let mut labeled_scratch = Vec::new();
+        let labeled_total = CostTree::aggregate(&labeled_flat, &slots, &mut labeled_scratch);
+        let plain_total = CostTree::aggregate(&plain_flat, &slots, &mut plain_scratch);
+        assert_eq!(labeled_total.m.time_ms, plain_total.m.time_ms);
+        assert_eq!(labeled_total.m.flops, plain_total.m.flops);
+        assert_eq!(labeled_total.m.bytes, plain_total.m.bytes);
+        assert_eq!(labeled_total.m.energy_j, plain_total.m.energy_j);
+        assert_eq!(labeled_total.coverage, plain_total.coverage);
+        assert_eq!(labeled_total.backend_index, plain_total.backend_index);
+        assert_eq!(
+            labeled
+                .manifest()
+                .node_labels
+                .iter()
+                .flatten()
+                .next()
+                .map(String::as_str),
+            Some("semantic [Max over groups]")
+        );
     }
 
     #[test]
