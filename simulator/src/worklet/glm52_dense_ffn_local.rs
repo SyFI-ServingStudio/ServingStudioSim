@@ -41,7 +41,9 @@ pub struct Glm52DenseFfnLocalWorkletConfig {
     pub gpu_name: String,
     pub hidden_dim: Dim,
     pub intermediate_dim: Dim,
+    /// Base activation/norm dtype. GEMM leaves use `gemm_dtype`.
     pub dtype: DType,
+    pub gemm_dtype: DType,
 }
 
 /// Pure resolved data with every atomic child config fully baked.
@@ -103,7 +105,7 @@ impl Glm52DenseFfnLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: gate_up_n.into(),
                 k: cfg.hidden_dim.clone(),
-                dtype: cfg.dtype,
+                dtype: cfg.gemm_dtype,
             },
             silu_and_mul: ElementwiseKernelConfig {
                 backends: cfg.elementwise_backends.clone(),
@@ -116,7 +118,7 @@ impl Glm52DenseFfnLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.hidden_dim.clone(),
                 k: cfg.intermediate_dim.clone(),
-                dtype: cfg.dtype,
+                dtype: cfg.gemm_dtype,
             },
             raw_cfg: cfg.clone(),
         }
@@ -221,6 +223,14 @@ fn validate_config(cfg: &Glm52DenseFfnLocalWorkletConfig) -> Result<(), String> 
             cfg.dtype.as_str()
         ));
     }
+    if !matches!(cfg.gemm_dtype, DType::Bf16 | DType::Fp8E4m3) {
+        return Err(format!(
+            "gemm_dtype must be {} or {}, got {}",
+            DType::Bf16.as_str(),
+            DType::Fp8E4m3.as_str(),
+            cfg.gemm_dtype.as_str()
+        ));
+    }
     Ok(())
 }
 
@@ -294,6 +304,7 @@ mod tests {
             hidden_dim: Dim::param("hidden_dim", HIDDEN_DIM),
             intermediate_dim: Dim::param("intermediate_dim", INTERMEDIATE_DIM),
             dtype: DType::Bf16,
+            gemm_dtype: DType::Bf16,
         }
     }
 

@@ -89,6 +89,7 @@ const RMS_NORM_BACKENDS: &[&str] = &["flashinfer"];
 const SINGLE_GEMM_BACKENDS: &[&str] = &["torch_linear"];
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 const GROUPED_GEMM_BACKENDS: &[&str] = &["torch"];
+const FP8_SINGLE_GEMM_BACKENDS: &[&str] = &["deepgemm"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm52"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm52"];
 const INDEX_CACHE_AND_TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
@@ -439,16 +440,22 @@ fn attention_config(
     model: &Glm52ModelCfg,
     parallel: &Glm52DsaMoeParallel,
     include_indexer: bool,
+    fp8: bool,
 ) -> Glm52DsaAttnLocalWorkletConfig {
+    let (gemm_dtype, gemm_backends) = if fp8 {
+        (DType::Fp8E4m3, FP8_SINGLE_GEMM_BACKENDS)
+    } else {
+        (DType::Bf16, SINGLE_GEMM_BACKENDS)
+    };
     Glm52DsaAttnLocalWorkletConfig {
         include_indexer,
         residual_rms_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
         rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
-        single_gemm_backends: SINGLE_GEMM_BACKENDS.to_vec(),
+        single_gemm_backends: gemm_backends.to_vec(),
         elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         q_absorb_backends: Q_ABSORB_BACKENDS.to_vec(),
         v_up_backends: V_UP_BACKENDS.to_vec(),
-        indexer_gemm_backends: SINGLE_GEMM_BACKENDS.to_vec(),
+        indexer_gemm_backends: gemm_backends.to_vec(),
         indexer_elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         index_cache_append_backends: INDEX_CACHE_AND_TOPK_BACKENDS.to_vec(),
         index_prefill_logits_backends: INDEX_LOGITS_BACKENDS.to_vec(),
@@ -477,6 +484,7 @@ fn attention_config(
         quant_block_size: QUANT_BLOCK_SIZE,
         softmax_scale_denominator: SOFTMAX_SCALE_DENOMINATOR,
         base_dtype: DType::Bf16,
+        gemm_dtype,
         index_cache_dtype: DType::Fp8E4m3,
         index_q_dtype: DType::Fp8E4m3,
         scale_dtype: DType::Fp32,
@@ -530,11 +538,6 @@ pub fn build_configs(
             routing.num_experts()
         )));
     }
-    let gpu = parallel.gpu_name.clone();
-    let dense_full_index_attention = attention_config(model, parallel, true);
-    let initial_shared_attention = attention_config(model, parallel, false);
-    let cycle_full_attention = attention_config(model, parallel, true);
-    let cycle_shared_attention = attention_config(model, parallel, false);
     let (expert_dtype, expert_backends, p2p_backends) = if fp8 {
         (
             DType::Fp8E4m3,
@@ -544,10 +547,20 @@ pub fn build_configs(
     } else {
         (DType::Bf16, GROUPED_GEMM_BACKENDS, P2P_BACKENDS)
     };
+    let (gemm_dtype, gemm_backends) = if fp8 {
+        (DType::Fp8E4m3, FP8_SINGLE_GEMM_BACKENDS)
+    } else {
+        (DType::Bf16, SINGLE_GEMM_BACKENDS)
+    };
+    let gpu = parallel.gpu_name.clone();
+    let dense_full_index_attention = attention_config(model, parallel, true, fp8);
+    let initial_shared_attention = attention_config(model, parallel, false, fp8);
+    let cycle_full_attention = attention_config(model, parallel, true, fp8);
+    let cycle_shared_attention = attention_config(model, parallel, false, fp8);
     let moe_net = MoeNetConfig {
         backends: p2p_backends.to_vec(),
         gpu_name: gpu.clone(),
-        dtype: DType::Bf16,
+        dtype: if fp8 { DType::Fp8E4m3 } else { DType::Bf16 },
         intra_fabric: Fabric::Nvlink,
         inter_fabric: Fabric::Infiniband,
         ep_size: u32::from(parallel.ep_size),
@@ -570,28 +583,30 @@ pub fn build_configs(
 
     let mtp_attention = match mtp_mode {
         Glm52MtpMode::Off => None,
-        Glm52MtpMode::FullIndex => Some(attention_config(model, parallel, true)),
-        Glm52MtpMode::IndexShare => Some(attention_config(model, parallel, false)),
+        Glm52MtpMode::FullIndex => Some(attention_config(model, parallel, true, fp8)),
+        Glm52MtpMode::IndexShare => Some(attention_config(model, parallel, false, fp8)),
     };
     let mtp_prelude = (mtp_mode != Glm52MtpMode::Off).then(|| Glm52MtpPreludeLocalWorkletConfig {
         elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
-        gemm_backends: SINGLE_GEMM_BACKENDS.to_vec(),
+        gemm_backends: gemm_backends.to_vec(),
         gpu_name: gpu.clone(),
         hidden_dim: model.hidden_dim.clone(),
         vocab_size: model.vocab_size.clone(),
         dtype: DType::Bf16,
+        gemm_dtype,
         token_id_bytes: 8,
         position_bytes: 8,
     });
     let mtp_head = (mtp_mode != Glm52MtpMode::Off).then(|| Glm52MtpHeadLocalWorkletConfig {
         elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
-        gemm_backends: SINGLE_GEMM_BACKENDS.to_vec(),
+        gemm_backends: gemm_backends.to_vec(),
         gpu_name: gpu.clone(),
         hidden_dim: model.hidden_dim.clone(),
         vocab_size: model.vocab_size.clone(),
         dtype: DType::Bf16,
+        gemm_dtype,
     });
 
     Ok(Glm52DsaMoeConfigs {
@@ -601,12 +616,13 @@ pub fn build_configs(
         dense_full_index_attention,
         dense_ffn: Glm52DenseFfnLocalWorkletConfig {
             residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
-            gemm_backends: SINGLE_GEMM_BACKENDS.to_vec(),
+            gemm_backends: gemm_backends.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
             hidden_dim: model.hidden_dim.clone(),
             intermediate_dim: model.dense_intermediate_dim.clone(),
             dtype: DType::Bf16,
+            gemm_dtype,
         },
         initial_shared_attention,
         cycle_full_attention,
@@ -614,7 +630,7 @@ pub fn build_configs(
         sparse_router: Glm52MoeRouterLocalWorkletConfig {
             residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
-            proxy_gemm_backends: SINGLE_GEMM_BACKENDS.to_vec(),
+            proxy_gemm_backends: gemm_backends.to_vec(),
             gpu_name: gpu.clone(),
             hidden_dim: model.hidden_dim.clone(),
             num_experts: model.num_experts.clone(),
@@ -623,7 +639,7 @@ pub fn build_configs(
             topk_group: 1,
             base_dtype: DType::Bf16,
             router_semantic_dtype: DType::Fp32,
-            proxy_gemm_dtype: DType::Bf16,
+            proxy_gemm_dtype: gemm_dtype,
             index_dtype: "int32".to_string(),
             scoring_func: "sigmoid".to_string(),
             topk_method: "noaux_tc".to_string(),
@@ -638,6 +654,7 @@ pub fn build_configs(
             num_experts: model.num_experts.clone(),
             ep_size: parallel.ep_size,
             dtype: expert_dtype,
+            activation_dtype: DType::Bf16,
             gpu_name: gpu.clone(),
             act_backends: ELEMENTWISE_BACKENDS.to_vec(),
             grouped_gemm_backends: expert_backends.to_vec(),
@@ -645,13 +662,14 @@ pub fn build_configs(
         },
         moe_combine: moe_net,
         shared_expert: Glm52SharedExpertLocalWorkletConfig {
-            gemm_backends: SINGLE_GEMM_BACKENDS.to_vec(),
+            gemm_backends: gemm_backends.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
             hidden_dim: model.hidden_dim.clone(),
             moe_intermediate_dim: model.moe_intermediate_dim.clone(),
             n_shared_experts: model.num_shared_experts,
             dtype: DType::Bf16,
+            gemm_dtype,
         },
         sparse_finalization: ElementwiseKernelConfig {
             backends: ELEMENTWISE_BACKENDS.to_vec(),
@@ -672,11 +690,11 @@ pub fn build_configs(
             dtype: DType::Bf16,
         },
         lm_head: SingleGemmKernelConfig {
-            backends: SINGLE_GEMM_BACKENDS.to_vec(),
+            backends: gemm_backends.to_vec(),
             gpu_name: gpu,
             n: model.vocab_size.clone(),
             k: model.hidden_dim.clone(),
-            dtype: DType::Bf16,
+            dtype: gemm_dtype,
         },
         mtp_prelude,
         mtp_attention,
@@ -1764,6 +1782,10 @@ mod tests {
             vec!["torch_linear"]
         );
         assert_eq!(
+            cfg.dense_full_index_attention.gemm_dtype,
+            DType::Bf16
+        );
+        assert_eq!(
             cfg.dense_full_index_attention.q_absorb_backends,
             vec!["torch_mla_q_absorb_glm52"]
         );
@@ -1790,8 +1812,10 @@ mod tests {
         assert_eq!(cfg.sparse_router.base_dtype, DType::Bf16);
         assert_eq!(cfg.sparse_router.router_semantic_dtype, DType::Fp32);
         assert_eq!(cfg.shared_expert.dtype, DType::Bf16);
+        assert_eq!(cfg.shared_expert.gemm_dtype, DType::Bf16);
         assert_eq!(cfg.final_norm.dtype, DType::Bf16);
         assert_eq!(cfg.lm_head.dtype, DType::Bf16);
+        assert_eq!(cfg.lm_head.backends, vec!["torch_linear"]);
         assert_eq!(cfg.moe_dispatch.placement, Placement::RoundRobin);
         assert_eq!(cfg.moe_dispatch.intra_fabric, Fabric::Nvlink);
         assert_eq!(cfg.moe_dispatch.inter_fabric, Fabric::Infiniband);
@@ -1806,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn fp8_only_changes_routed_experts_and_moe_network_backend() {
+    fn fp8_selects_generic_glm_gemms_and_network_without_spilling_into_holdouts() {
         let cfg = build_configs(
             &model(),
             &parallel(8),
@@ -1817,13 +1841,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(cfg.moe_expert_compute.dtype, DType::Fp8E4m3);
+        assert_eq!(cfg.moe_expert_compute.activation_dtype, DType::Bf16);
         assert_eq!(cfg.moe_expert_compute.grouped_gemm_backends, vec!["deepgemm"]);
         assert_eq!(cfg.moe_dispatch.backends, vec!["nvshmem"]);
         assert_eq!(cfg.moe_combine.backends, vec!["nvshmem"]);
-        assert_eq!(cfg.moe_dispatch.dtype, DType::Bf16);
-        assert_eq!(cfg.moe_combine.dtype, DType::Bf16);
-        assert_eq!(cfg.moe_dispatch.net_params().hidden_bytes, HIDDEN_DIM * 2);
-        assert_eq!(cfg.moe_combine.net_params().hidden_bytes, HIDDEN_DIM * 2);
+        assert_eq!(cfg.moe_dispatch.dtype, DType::Fp8E4m3);
+        assert_eq!(cfg.moe_combine.dtype, DType::Fp8E4m3);
+        assert_eq!(cfg.moe_dispatch.net_params().hidden_bytes, HIDDEN_DIM);
+        assert_eq!(cfg.moe_combine.net_params().hidden_bytes, HIDDEN_DIM);
+
+        for attention in [
+            &cfg.dense_full_index_attention,
+            &cfg.initial_shared_attention,
+            &cfg.cycle_full_attention,
+            &cfg.cycle_shared_attention,
+            cfg.mtp_attention.as_ref().unwrap(),
+        ] {
+            assert_eq!(attention.single_gemm_backends, vec!["deepgemm"]);
+            assert_eq!(attention.indexer_gemm_backends, vec!["deepgemm"]);
+            assert_eq!(attention.gemm_dtype, DType::Fp8E4m3);
+            assert_eq!(attention.base_dtype, DType::Bf16);
+            assert_eq!(attention.q_absorb_backends, vec!["torch_mla_q_absorb_glm52"]);
+            assert_eq!(attention.v_up_backends, vec!["torch_mla_v_up_glm52"]);
+        }
 
         let resolved = resolve_configs(&cfg);
         assert_eq!(
@@ -1831,22 +1871,51 @@ mod tests {
             DType::Fp8E4m3
         );
         assert_eq!(resolved.moe_expert_compute.down.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.moe_expert_compute.act.input_bytes_per_token, 2 * MOE_INTERMEDIATE_DIM * 2);
+        assert_eq!(resolved.dense_ffn.gate_up_proj.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.dense_ffn.down_proj.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.dense_ffn.post_attn_add_rms_norm.dtype, DType::Bf16);
+        assert_eq!(resolved.dense_ffn.silu_and_mul.input_bytes_per_token, 2 * DENSE_INTERMEDIATE_DIM * 2);
+        assert_eq!(resolved.sparse_router.router_gemm_bf16_proxy.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.sparse_router.post_attn_add_rms_norm.dtype, DType::Bf16);
+        assert_eq!(resolved.sparse_router.raw_cfg.router_semantic_dtype, DType::Fp32);
+        assert_eq!(resolved.shared_expert.gate_up_proj.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.shared_expert.down_proj.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.shared_expert.silu_and_mul.input_bytes_per_token, 2 * MOE_INTERMEDIATE_DIM * 2);
+        assert_eq!(resolved.lm_head.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.lm_head.backends, vec!["deepgemm"]);
+        assert_eq!(resolved.dense_full_index_attention.fused_qkv_a_proj.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.dense_full_index_attention.q_b_proj.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.dense_full_index_attention.o_proj.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.dense_full_index_attention.q_absorb.dtype, DType::Bf16);
+        assert_eq!(resolved.dense_full_index_attention.v_up.dtype, DType::Bf16);
+        let indexer = resolved.dense_full_index_attention.indexer.as_ref().unwrap();
+        assert_eq!(indexer.input_dtype, DType::Bf16);
+        assert_eq!(indexer.gemm_dtype, DType::Fp8E4m3);
+        assert_eq!(indexer.cache_dtype, DType::Fp8E4m3);
+        assert_eq!(indexer.q_dtype, DType::Fp8E4m3);
 
-        // The expert-only selector does not spill into attention, router
-        // semantics, shared expert, final norm, LM head, or MTP roles.
+        // Elementwise, norm, cache, and semantic holdouts stay on their
+        // independent BF16/FP32 contracts even when their neighboring GEMM is
+        // FP8.
         assert_eq!(cfg.dense_full_index_attention.base_dtype, DType::Bf16);
         assert_eq!(cfg.dense_ffn.dtype, DType::Bf16);
         assert_eq!(cfg.sparse_router.base_dtype, DType::Bf16);
         assert_eq!(cfg.sparse_router.router_semantic_dtype, DType::Fp32);
         assert_eq!(cfg.shared_expert.dtype, DType::Bf16);
         assert_eq!(cfg.final_norm.dtype, DType::Bf16);
-        assert_eq!(cfg.lm_head.dtype, DType::Bf16);
         assert_eq!(cfg.mtp_prelude.as_ref().unwrap().dtype, DType::Bf16);
+        assert_eq!(cfg.mtp_prelude.as_ref().unwrap().gemm_dtype, DType::Fp8E4m3);
         assert_eq!(
             cfg.mtp_attention.as_ref().unwrap().base_dtype,
             DType::Bf16
         );
         assert_eq!(cfg.mtp_head.as_ref().unwrap().dtype, DType::Bf16);
+        assert_eq!(cfg.mtp_head.as_ref().unwrap().gemm_dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.mtp_prelude.as_ref().unwrap().eh_proj.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.mtp_prelude.as_ref().unwrap().embedding_rms_norm.dtype, DType::Bf16);
+        assert_eq!(resolved.mtp_head.as_ref().unwrap().lm_head.dtype, DType::Fp8E4m3);
+        assert_eq!(resolved.mtp_head.as_ref().unwrap().shared_head_rms_norm.dtype, DType::Bf16);
     }
 
     #[test]

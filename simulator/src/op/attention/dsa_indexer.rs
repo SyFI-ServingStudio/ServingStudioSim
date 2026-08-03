@@ -86,6 +86,9 @@ pub struct DsaIndexerConfig {
     pub cache_block_size: u32,
     pub quant_block_size: u32,
     pub input_dtype: DType,
+    /// Dtype used by the two generic indexer projection GEMMs. The input and
+    /// all cache/quantization semantics remain governed by their own fields.
+    pub gemm_dtype: DType,
     pub cache_dtype: DType,
     pub q_dtype: DType,
     pub scale_dtype: DType,
@@ -412,14 +415,14 @@ fn subkernel_configs(cfg: &DsaIndexerConfig) -> Result<SubkernelConfigs, BuildEr
             gpu_name: cfg.gpu_name.clone(),
             n: cfg.model_num_index_heads.clone() * cfg.index_head_dim.clone(),
             k: cfg.q_lora_rank.clone(),
-            dtype: cfg.input_dtype,
+            dtype: cfg.gemm_dtype,
         },
         wk_weights_proj: SingleGemmKernelConfig {
             backends: cfg.gemm_backends.clone(),
             gpu_name: cfg.gpu_name.clone(),
             n: cfg.index_head_dim.clone() + cfg.model_num_index_heads.clone(),
             k: cfg.hidden_dim.clone(),
-            dtype: cfg.input_dtype,
+            dtype: cfg.gemm_dtype,
         },
         k_layernorm: elementwise.k_layernorm,
         rope: elementwise.rope,
@@ -548,6 +551,14 @@ fn validate_config(cfg: &DsaIndexerConfig) -> Result<(), BuildError> {
                 actual.as_str()
             )));
         }
+    }
+    if !matches!(cfg.gemm_dtype, DType::Bf16 | DType::Fp8E4m3) {
+        return Err(fit_failed(format!(
+            "gemm_dtype must be {} or {}, got {}",
+            DType::Bf16.as_str(),
+            DType::Fp8E4m3.as_str(),
+            cfg.gemm_dtype.as_str()
+        )));
     }
     if cfg.index_dtype != "int32" {
         return Err(fit_failed(format!(
@@ -784,6 +795,7 @@ mod tests {
             cache_block_size: 64,
             quant_block_size: 128,
             input_dtype: DType::Bf16,
+            gemm_dtype: DType::Bf16,
             cache_dtype: DType::Fp8E4m3,
             q_dtype: DType::Fp8E4m3,
             scale_dtype: DType::Fp32,

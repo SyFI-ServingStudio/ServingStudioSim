@@ -116,6 +116,9 @@ pub struct Glm52DsaAttnLocalWorkletConfig {
     pub quant_block_size: u32,
     pub softmax_scale_denominator: u32,
     pub base_dtype: DType,
+    /// Dtype used only by generic projection SingleGemm leaves. Specialized
+    /// MLA/indexer kernels retain their explicit dtype fields below.
+    pub gemm_dtype: DType,
     pub index_cache_dtype: DType,
     pub index_q_dtype: DType,
     pub scale_dtype: DType,
@@ -221,6 +224,7 @@ impl Glm52DsaAttnLocalWorklet {
             cache_block_size: cfg.cache_block_size,
             quant_block_size: cfg.quant_block_size,
             input_dtype: cfg.base_dtype,
+            gemm_dtype: cfg.gemm_dtype,
             cache_dtype: cfg.index_cache_dtype,
             q_dtype: cfg.index_q_dtype,
             scale_dtype: cfg.scale_dtype,
@@ -247,7 +251,7 @@ impl Glm52DsaAttnLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: fused_qkv_a_n,
                 k: cfg.hidden_dim.clone(),
-                dtype: cfg.base_dtype,
+                dtype: cfg.gemm_dtype,
             },
             q_a_rms_norm: RmsNormKernelConfig {
                 backends: cfg.rms_norm_backends.clone(),
@@ -260,7 +264,7 @@ impl Glm52DsaAttnLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: q_b_n,
                 k: cfg.q_lora_rank.clone(),
-                dtype: cfg.base_dtype,
+                dtype: cfg.gemm_dtype,
             },
             kv_a_rms_norm: RmsNormKernelConfig {
                 backends: cfg.rms_norm_backends.clone(),
@@ -316,7 +320,7 @@ impl Glm52DsaAttnLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.hidden_dim.clone(),
                 k: cfg.num_attention_heads.clone() * cfg.v_head_dim.clone(),
-                dtype: cfg.base_dtype,
+                dtype: cfg.gemm_dtype,
             },
             raw_cfg: cfg.clone(),
         }
@@ -606,6 +610,14 @@ fn validate_config(cfg: &Glm52DsaAttnLocalWorkletConfig) -> Result<(), String> {
             ));
         }
     }
+    if !matches!(cfg.gemm_dtype, DType::Bf16 | DType::Fp8E4m3) {
+        return Err(format!(
+            "gemm_dtype must be {} or {}, got {}",
+            DType::Bf16.as_str(),
+            DType::Fp8E4m3.as_str(),
+            cfg.gemm_dtype.as_str()
+        ));
+    }
     if cfg.index_dtype != "int32" {
         return Err(format!(
             "index_dtype must be int32, got {:?}",
@@ -826,6 +838,7 @@ mod tests {
             quant_block_size: 128,
             softmax_scale_denominator: 16,
             base_dtype: DType::Bf16,
+            gemm_dtype: DType::Bf16,
             index_cache_dtype: DType::Fp8E4m3,
             index_q_dtype: DType::Fp8E4m3,
             scale_dtype: DType::Fp32,

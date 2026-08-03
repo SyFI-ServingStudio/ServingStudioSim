@@ -41,7 +41,10 @@ pub struct MoeExpertComputeLocalWorkletConfig {
     pub moe_intermediate: Dim,
     pub num_experts: Dim,
     pub ep_size: u16,
+    /// Dtype of the grouped gate/up/down GEMMs.
     pub dtype: DType,
+    /// Dtype of the SwiGLU activation traffic between the GEMMs.
+    pub activation_dtype: DType,
     pub gpu_name: String,
     pub act_backends: Vec<&'static str>,
     pub grouped_gemm_backends: Vec<&'static str>,
@@ -102,8 +105,8 @@ impl MoeExpertComputeLocalWorklet {
             cfg.local_ppm.len(),
             experts_per_gpu.get(),
         );
-        let dtype_bytes = cfg.dtype.size_bytes();
-        let bytes = Dim::param("bytes", dtype_bytes);
+        let activation_dtype_bytes = cfg.activation_dtype.size_bytes();
+        let bytes = Dim::param("activation_bytes", activation_dtype_bytes);
         MoeExpertComputeLocalWorkletResolved {
             gate_up: GroupedGemmKernelConfig {
                 backends: cfg.grouped_gemm_backends.clone(),
@@ -130,7 +133,7 @@ impl MoeExpertComputeLocalWorklet {
                 local_ppm: cfg.local_ppm.clone(),
             },
             experts_per_gpu,
-            dtype_bytes,
+            dtype_bytes: activation_dtype_bytes,
             raw_cfg: cfg.clone(),
         }
     }
@@ -239,6 +242,7 @@ mod tests {
             num_experts: num_experts.into(),
             ep_size,
             dtype: DType::Bf16,
+            activation_dtype: DType::Bf16,
             gpu_name: "H100".to_string(),
             act_backends: vec!["triton"],
             grouped_gemm_backends: vec!["deepgemm"],

@@ -37,6 +37,7 @@ pub struct Glm52MtpHeadLocalWorkletConfig {
     pub hidden_dim: Dim,
     pub vocab_size: Dim,
     pub dtype: DType,
+    pub gemm_dtype: DType,
 }
 
 /// Pure resolved data with all three atomic child configs fully baked.
@@ -97,7 +98,7 @@ impl Glm52MtpHeadLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.vocab_size.clone(),
                 k: cfg.hidden_dim.clone(),
-                dtype: cfg.dtype,
+                dtype: cfg.gemm_dtype,
             },
             raw_cfg: cfg.clone(),
         }
@@ -187,6 +188,14 @@ fn validate_config(cfg: &Glm52MtpHeadLocalWorkletConfig) -> Result<(), String> {
             cfg.dtype.as_str()
         ));
     }
+    if !matches!(cfg.gemm_dtype, DType::Bf16 | DType::Fp8E4m3) {
+        return Err(format!(
+            "gemm_dtype must be {} or {}, got {}",
+            DType::Bf16.as_str(),
+            DType::Fp8E4m3.as_str(),
+            cfg.gemm_dtype.as_str()
+        ));
+    }
     Ok(())
 }
 
@@ -260,6 +269,7 @@ mod tests {
             hidden_dim: Dim::param("hidden_dim", HIDDEN_DIM),
             vocab_size: Dim::param("vocab_size", VOCAB_SIZE),
             dtype: DType::Bf16,
+            gemm_dtype: DType::Bf16,
         }
     }
 

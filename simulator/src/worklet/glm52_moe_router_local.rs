@@ -1,11 +1,12 @@
 //! GLM-5.2 local sparse-MoE router worklet.
 //!
 //! This single-GPU section preserves the checkpoint's FP32 router semantics:
-//! BF16 activations are cast to FP32 before the router GEMM, then sigmoid,
-//! correction bias, grouped top-8 selection, normalization, and 5/2 scaling
-//! produce routed weights and expert indices. VibeSim has no measured FP32
-//! `single_gemm` backend for this shape, so `router_gemm_bf16_proxy` is an
-//! explicitly labeled BF16 timing proxy. It is not production-exact.
+//! base-dtype activations are cast to FP32 before the router GEMM, then
+//! sigmoid, correction bias, grouped top-8 selection, normalization, and 5/2
+//! scaling produce routed weights and expert indices. VibeSim has no measured
+//! FP32 `single_gemm` backend for this shape, so `router_gemm_bf16_proxy` is an
+//! explicitly labeled timing proxy: BF16 by default and FP8 in the bounded
+//! GLM FP8 selector. It is not production-exact in either mode.
 //!
 //! Dispatch, routed/shared expert computation, combine, and communication are
 //! subsequent sections and are deliberately absent here.
@@ -56,6 +57,7 @@ pub struct Glm52MoeRouterLocalWorkletConfig {
     pub topk_group: u32,
     pub base_dtype: DType,
     pub router_semantic_dtype: DType,
+    /// Timing-proxy GEMM dtype only; router scoring remains FP32 semantic work.
     pub proxy_gemm_dtype: DType,
     pub index_dtype: String,
     pub scoring_func: String,
@@ -274,7 +276,6 @@ fn validate_config(cfg: &Glm52MoeRouterLocalWorkletConfig) -> Result<(), String>
             cfg.router_semantic_dtype,
             DType::Fp32,
         ),
-        ("proxy_gemm_dtype", cfg.proxy_gemm_dtype, DType::Bf16),
     ] {
         if actual != required {
             return Err(format!(
@@ -283,6 +284,14 @@ fn validate_config(cfg: &Glm52MoeRouterLocalWorkletConfig) -> Result<(), String>
                 actual.as_str()
             ));
         }
+    }
+    if !matches!(cfg.proxy_gemm_dtype, DType::Bf16 | DType::Fp8E4m3) {
+        return Err(format!(
+            "proxy_gemm_dtype must be {} or {}, got {}",
+            DType::Bf16.as_str(),
+            DType::Fp8E4m3.as_str(),
+            cfg.proxy_gemm_dtype.as_str()
+        ));
     }
     if cfg.index_dtype != "int32" {
         return Err(format!(

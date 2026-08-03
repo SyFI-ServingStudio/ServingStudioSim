@@ -47,6 +47,7 @@ pub struct Glm52MtpPreludeLocalWorkletConfig {
     pub hidden_dim: Dim,
     pub vocab_size: Dim,
     pub dtype: DType,
+    pub gemm_dtype: DType,
     pub token_id_bytes: u32,
     pub position_bytes: u32,
 }
@@ -147,7 +148,7 @@ impl Glm52MtpPreludeLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.hidden_dim.clone(),
                 k: concat_width.into(),
-                dtype: cfg.dtype,
+                dtype: cfg.gemm_dtype,
             },
             raw_cfg: cfg.clone(),
         }
@@ -277,6 +278,14 @@ fn validate_config(cfg: &Glm52MtpPreludeLocalWorkletConfig) -> Result<(), String
             cfg.dtype.as_str()
         ));
     }
+    if !matches!(cfg.gemm_dtype, DType::Bf16 | DType::Fp8E4m3) {
+        return Err(format!(
+            "gemm_dtype must be {} or {}, got {}",
+            DType::Bf16.as_str(),
+            DType::Fp8E4m3.as_str(),
+            cfg.gemm_dtype.as_str()
+        ));
+    }
     Ok(())
 }
 
@@ -365,6 +374,7 @@ mod tests {
             hidden_dim: Dim::param("hidden_dim", HIDDEN_DIM),
             vocab_size: Dim::param("vocab_size", VOCAB_SIZE),
             dtype: DType::Bf16,
+            gemm_dtype: DType::Bf16,
             token_id_bytes: TOKEN_ID_BYTES,
             position_bytes: POSITION_BYTES,
         }

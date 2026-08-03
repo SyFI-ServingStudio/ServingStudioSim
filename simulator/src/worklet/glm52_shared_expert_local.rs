@@ -37,6 +37,7 @@ pub struct Glm52SharedExpertLocalWorkletConfig {
     pub moe_intermediate_dim: Dim,
     pub n_shared_experts: u32,
     pub dtype: DType,
+    pub gemm_dtype: DType,
 }
 
 /// Pure resolved data with the three atomic child configs fully baked.
@@ -95,7 +96,7 @@ impl Glm52SharedExpertLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: gate_up_n.into(),
                 k: cfg.hidden_dim.clone(),
-                dtype: cfg.dtype,
+                dtype: cfg.gemm_dtype,
             },
             silu_and_mul: ElementwiseKernelConfig {
                 backends: cfg.elementwise_backends.clone(),
@@ -108,7 +109,7 @@ impl Glm52SharedExpertLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.hidden_dim.clone(),
                 k: shared_width.into(),
-                dtype: cfg.dtype,
+                dtype: cfg.gemm_dtype,
             },
             raw_cfg: cfg.clone(),
         }
@@ -198,6 +199,14 @@ fn validate_config(cfg: &Glm52SharedExpertLocalWorkletConfig) -> Result<(), Stri
             cfg.dtype.as_str()
         ));
     }
+    if !matches!(cfg.gemm_dtype, DType::Bf16 | DType::Fp8E4m3) {
+        return Err(format!(
+            "gemm_dtype must be {} or {}, got {}",
+            DType::Bf16.as_str(),
+            DType::Fp8E4m3.as_str(),
+            cfg.gemm_dtype.as_str()
+        ));
+    }
     Ok(())
 }
 
@@ -275,6 +284,7 @@ mod tests {
             moe_intermediate_dim: Dim::param("moe_intermediate_dim", MOE_INTERMEDIATE_DIM),
             n_shared_experts: N_SHARED_EXPERTS,
             dtype: DType::Bf16,
+            gemm_dtype: DType::Bf16,
         }
     }
 
