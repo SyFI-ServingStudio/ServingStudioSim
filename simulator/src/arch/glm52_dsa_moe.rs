@@ -90,6 +90,7 @@ const SINGLE_GEMM_BACKENDS: &[&str] = &["torch_linear"];
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 const GROUPED_GEMM_BACKENDS: &[&str] = &["torch"];
 const FP8_SINGLE_GEMM_BACKENDS: &[&str] = &["deepgemm"];
+const FP8_QUANT_BACKENDS: &[&str] = &["flashinfer_trtllm"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm52"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm52"];
 const INDEX_CACHE_AND_TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
@@ -657,6 +658,7 @@ pub fn build_configs(
             activation_dtype: DType::Bf16,
             gpu_name: gpu.clone(),
             act_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            fp8_quant_backends: FP8_QUANT_BACKENDS.to_vec(),
             grouped_gemm_backends: expert_backends.to_vec(),
             local_ppm,
         },
@@ -1116,6 +1118,7 @@ pub fn build(
     };
 
     let total_state_bytes_per_token = state_bytes_per_token(mtp_mode)?;
+    let fp8 = resolved.raw_cfg.moe_expert_compute.dtype == DType::Fp8E4m3;
     let mut model = Glm52DsaMoeModel {
         name,
         mtp_mode,
@@ -1137,7 +1140,7 @@ pub fn build(
         n_slots: 0,
     };
     let tree = model.cost_tree();
-    let expected = expected_slot_count(ep_size, mtp_mode);
+    let expected = expected_slot_count(ep_size, fp8, mtp_mode);
     if tree.n_slots() != expected {
         return Err(fit_failed(format!(
             "compiled slot count {} differs from frozen formula {expected}",
@@ -1604,11 +1607,20 @@ fn eval_expert_or_zero(
     ev.push(LeafMetrics::ZERO, || grouped.into());
 }
 
-fn expected_slot_count(ep_size: u16, mtp_mode: Glm52MtpMode) -> usize {
+fn expected_slot_count(ep_size: u16, fp8: bool, mtp_mode: Glm52MtpMode) -> usize {
     let ep = usize::from(ep_size);
+    // Each FP8 routed-expert worklet adds one BF16→FP8 block-quant leaf before
+    // gate/up and one before down. The three main sparse archetypes and the
+    // optional MTP sparse decoder all reuse this worklet, so keep the selector
+    // at the L4 formula seam rather than hard-coding FP8 counts.
+    let expert_slots = EXPERT_SLOTS + usize::from(fp8) * 2;
     let dense = ep * (ATTN_FULL_SLOTS + DENSE_FFN_SLOTS);
     let sparse_shared = ep
-        * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + EXPERT_SLOTS + SHARED_EXPERT_SLOTS + FINALIZE_SLOTS)
+        * (ATTN_SHARED_SLOTS
+            + ROUTER_SLOTS
+            + expert_slots
+            + SHARED_EXPERT_SLOTS
+            + FINALIZE_SLOTS)
         + DISPATCH_SLOTS
         + COMBINE_SLOTS;
     let sparse_full = sparse_shared + ep * (ATTN_FULL_SLOTS - ATTN_SHARED_SLOTS);
@@ -1867,10 +1879,13 @@ mod tests {
 
         let resolved = resolve_configs(&cfg);
         assert_eq!(
-            resolved.moe_expert_compute.gate_up.dtype,
+            resolved.moe_expert_compute.gate_up_fp8.as_ref().unwrap().gemm.dtype,
             DType::Fp8E4m3
         );
-        assert_eq!(resolved.moe_expert_compute.down.dtype, DType::Fp8E4m3);
+        assert_eq!(
+            resolved.moe_expert_compute.down_fp8.as_ref().unwrap().gemm.dtype,
+            DType::Fp8E4m3
+        );
         assert_eq!(resolved.moe_expert_compute.act.input_bytes_per_token, 2 * MOE_INTERMEDIATE_DIM * 2);
         assert_eq!(resolved.dense_ffn.gate_up_proj.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.dense_ffn.down_proj.dtype, DType::Fp8E4m3);
@@ -1987,21 +2002,31 @@ mod tests {
         assert_eq!(3 + 3 + 18 * (1 + 3), 78);
         assert_eq!(FULL_INDEX_LAYERS.len(), 21);
         assert_eq!(78 - FULL_INDEX_LAYERS.len(), 57);
-        assert_eq!(expected_slot_count(8, Glm52MtpMode::Off), 1_026);
-        assert_eq!(expected_slot_count(8, Glm52MtpMode::FullIndex), 1_424);
-        assert_eq!(expected_slot_count(8, Glm52MtpMode::IndexShare), 1_304);
-        for ep in [1, 2, 4, 8, 16] {
+        assert_eq!(expected_slot_count(8, false, Glm52MtpMode::Off), 1_026);
+        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::Off), 1_074);
+        assert_eq!(expected_slot_count(8, false, Glm52MtpMode::FullIndex), 1_424);
+        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::FullIndex), 1_488);
+        assert_eq!(expected_slot_count(8, false, Glm52MtpMode::IndexShare), 1_304);
+        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::IndexShare), 1_368);
+        for ep in [1_u16, 2, 4, 8, 16] {
+            let ep = usize::from(ep);
+            assert_eq!(expected_slot_count(ep as u16, false, Glm52MtpMode::Off), 126 * ep + 18);
+            assert_eq!(expected_slot_count(ep as u16, true, Glm52MtpMode::Off), 132 * ep + 18);
             assert_eq!(
-                expected_slot_count(ep, Glm52MtpMode::Off),
-                126 * usize::from(ep) + 18
+                expected_slot_count(ep as u16, false, Glm52MtpMode::FullIndex),
+                175 * ep + 24
             );
             assert_eq!(
-                expected_slot_count(ep, Glm52MtpMode::FullIndex),
-                175 * usize::from(ep) + 24
+                expected_slot_count(ep as u16, true, Glm52MtpMode::FullIndex),
+                183 * ep + 24
             );
             assert_eq!(
-                expected_slot_count(ep, Glm52MtpMode::IndexShare),
-                160 * usize::from(ep) + 24
+                expected_slot_count(ep as u16, false, Glm52MtpMode::IndexShare),
+                160 * ep + 24
+            );
+            assert_eq!(
+                expected_slot_count(ep as u16, true, Glm52MtpMode::IndexShare),
+                168 * ep + 24
             );
         }
     }
@@ -2076,7 +2101,7 @@ mod tests {
                     })
                 })
                 .collect();
-            assert_eq!(expected_slot_count(8, mode), expected_slots);
+            assert_eq!(expected_slot_count(8, false, mode), expected_slots);
             assert_eq!(max_labels.len(), expected_maxes);
             assert!(max_labels.iter().all(|label| label.contains("[Max over ")));
             let unique: HashSet<&str> = max_labels.iter().copied().collect();
