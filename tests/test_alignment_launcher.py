@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from alignment.load_generator import runner as load_runner
+from alignment.profiler import vllm_server
 from alignment.timing_predict_input import BuildRequest, build_inputs
 from launcher import alignment as alignment_launcher
 from launcher import exec as launcher_exec
@@ -182,14 +183,33 @@ def _write_completed_inputs(tmp_path: Path) -> tuple[Path, Path, dict]:
     params_path.write_text(json.dumps(params))
 
     parsed = profile / "parsed.json"
+    metrics = profile / "metrics.jsonl"
     replay = profile / "load_generator" / "replay.jsonl"
     parsed.parent.mkdir(parents=True)
     replay.parent.mkdir()
     parsed.write_text(json.dumps(_parsed_iteration()))
+    metrics.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "input_adapter": "vllm_text",
+                "iteration_index": 34,
+                "observed_start_monotonic_ns": 1_000_000,
+                "observed_end_monotonic_ns": 2_000_000,
+                "observed_elapsed_ms": 1.0,
+                "prefill_tokens": 0,
+                "decode_requests": 1,
+                "decode_tokens_scheduled": 1,
+                "prefill_chunk_pairs": [],
+                "decode_kv_lens": [100],
+            }
+        )
+    )
     replay.write_text("")
     result = {
         "log_dir": str(profile),
         "parsed_nsys": str(parsed),
+        "metrics_jsonl": str(metrics),
         "replay_result": str(replay),
         "server_tp_size": 1,
         "drive_summary": {
@@ -224,9 +244,7 @@ def _parsed_iteration() -> dict:
 def _write_timing_artifacts(tmp_path: Path) -> Path:
     _, profile, profile_result = _write_completed_inputs(tmp_path)
     output = tmp_path / "timing_predict_run"
-    timing_config = alignment_launcher.load_timing_predict_config(
-        tmp_path / "timing_predict.yaml"
-    )
+    timing_config = alignment_launcher.load_timing_predict_config(tmp_path / "timing_predict.yaml")
     result = build_inputs(
         BuildRequest(
             simulation_preset=timing_config.simulation_preset,
@@ -277,9 +295,7 @@ def test_alignment_sim_auto_injects_kernel_align_multiplier(tmp_path, monkeypatc
         )
         == 0
     )
-    assert calls[0][1]["overrides"] == [
-        "pools.main.groups.0.worker.gpu_time_multiplier=1.329"
-    ]
+    assert calls[0][1]["overrides"] == ["pools.main.groups.0.worker.gpu_time_multiplier=1.329"]
 
 
 def test_alignment_sim_rejects_below_unity_multiplier(tmp_path, monkeypatch, capsys):
@@ -361,6 +377,128 @@ def test_profile_fork_python_preserves_virtualenv_symlink(tmp_path):
     assert Path(config.fork_python).resolve() == target
 
 
+def test_profile_config_counts_tp_times_dp_visible_devices(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["cuda_visible_devices"] = "2,5"
+    raw["server"]["tp_size"] = 1
+    raw["server"]["dp_size"] = 2
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    config = load_profile_config(paths["profile"])
+
+    assert config.server.tp_size == 1
+    assert config.server.dp_size == 2
+
+
+def test_profile_server_env_drops_inherited_vllm_api_key(tmp_path, monkeypatch):
+    fork_python = tmp_path / "venv" / "bin" / "python"
+    fork_python.parent.mkdir(parents=True)
+    fork_python.write_text("")
+    monkeypatch.setenv("VLLM_API_KEY", "unrelated-shell-key")
+    monkeypatch.setenv("PATH", "/ambient/bin")
+
+    server_env = vllm_server.build_server_env(str(fork_python), "2,5")
+
+    assert "VLLM_API_KEY" not in server_env
+    assert server_env["CUDA_VISIBLE_DEVICES"] == "2,5"
+    assert server_env["PATH"] == f"{fork_python.parent}:/ambient/bin"
+
+
+def test_profile_server_argv_enables_prompt_token_details_once():
+    server_config = vllm_server.ServerConfig(
+        model_path="model",
+        extra_args=["--enable-prompt-tokens-details", "--trust-remote-code"],
+    )
+
+    server_argv = vllm_server.build_server_argv("fork-python", server_config)
+
+    assert server_argv.count("--enable-prompt-tokens-details") == 1
+    assert "--trust-remote-code" in server_argv
+
+
+def test_extract_expert_popularity_aggregates_logical_counts(tmp_path):
+    server_log = tmp_path / "server.log"
+    records = [
+        {
+            "schema_version": 2,
+            "model": "moe/model",
+            "eplb_step": 10,
+            "expert_parallel_size": 2,
+            "experts_per_token": 2,
+            "logical_expert_counts": [[1, 3], [2, 2]],
+        },
+        {
+            "schema_version": 2,
+            "model": "moe/model",
+            "eplb_step": 11,
+            "expert_parallel_size": 2,
+            "experts_per_token": 2,
+            "logical_expert_counts": [[4, 0], [1, 3]],
+        },
+    ]
+    server_log.write_text(
+        "\n".join(f"INFO VibeSimAlignmentExpertLoad {json.dumps(record)}" for record in records)
+    )
+    raw_path = tmp_path / "expert_load.jsonl"
+    summary_path = tmp_path / "expert_popularity.json"
+
+    count = vllm_server.extract_expert_popularity(
+        server_log,
+        raw_path,
+        summary_path,
+        expert_parallel_size=2,
+    )
+    summary = json.loads(summary_path.read_text())
+    schema_path = Path(__file__).parents[1] / "alignment/schema/expert_popularity_v2.schema.json"
+    schema = json.loads(schema_path.read_text())
+
+    assert count == 2
+    assert set(summary) == set(schema["required"]) == set(schema["properties"])
+    assert set(summary["aggregation"]) == set(schema["properties"]["aggregation"]["required"])
+    assert set(summary["expert_partitioning"]) == set(
+        schema["properties"]["expert_partitioning"]["required"]
+    )
+    assert summary["schema_version"] == 2
+    assert summary["expert_parallel_size"] == 2
+    assert summary["experts_per_rank"] == 1
+    assert summary["experts_per_token"] == 2
+    assert summary["count_semantics"] == "logical_routed_token_assignments"
+    assert summary["aggregation"] == {
+        "scope": "all_captured_eplb_steps",
+        "observed_eplb_step_min": 10,
+        "observed_eplb_step_max": 11,
+        "record_count": 2,
+    }
+    assert summary["expert_partitioning"] == {
+        "kind": "contiguous_logical_expert_ids",
+        "layout": "rank_major",
+    }
+    assert summary["counts_by_layer"] == [[5, 3], [3, 5]]
+    assert summary["counts_all_layers"] == [8, 8]
+    assert summary["probabilities_all_layers"] == [0.5, 0.5]
+
+
+def test_extract_expert_popularity_rejects_partition_mismatch(tmp_path):
+    server_log = tmp_path / "server.log"
+    record = {
+        "schema_version": 1,
+        "model": "moe/model",
+        "eplb_step": 10,
+        "logical_expert_counts": [[1, 2, 3]],
+    }
+    server_log.write_text(f"INFO VibeSimAlignmentExpertLoad {json.dumps(record)}\n")
+
+    with pytest.raises(ValueError, match="must be divisible"):
+        vllm_server.extract_expert_popularity(
+            server_log,
+            tmp_path / "raw.jsonl",
+            tmp_path / "summary.json",
+            expert_parallel_size=2,
+            experts_per_token=2,
+        )
+
+
 def test_analyze_rejects_removed_kernel_mapping_field(tmp_path):
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["analyze_kernel"].read_text())
@@ -415,9 +553,7 @@ def test_timing_predict_preserves_simulation_backend_policy(tmp_path, monkeypatc
     predict_config = json.loads(
         (tmp_path / "timing_predict_run" / "timing_predict_config.json").read_text()
     )
-    assert predict_config["backends"] == {
-        "main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}
-    }
+    assert predict_config["backends"] == {"main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}}
 
 
 def test_timing_predict_warns_on_trace_mismatch(tmp_path, monkeypatch, capsys):
@@ -446,7 +582,7 @@ def test_analyze_kernel_align_writes_kernel_only_manifest(tmp_path, monkeypatch)
     assert alignment_launcher.main(["analyze", str(paths["analyze_kernel"])]) == 0
     analysis = tmp_path / "analysis_kernel_run"
     manifest = json.loads((analysis / "alignment_manifest.json").read_text())
-    assert manifest["schema_version"] == 6
+    assert manifest["schema_version"] == 8
     assert manifest["labeled_kernel_sequences"] == str(analysis / "kernel_sequences_labeled.json")
     assert manifest["predict_log_dir"] == str(tmp_path / "timing_predict_run")
     # kernel-align names no simulation, replay, or subject-enabled bookkeeping.
@@ -471,8 +607,10 @@ def test_analyze_e2e_align_writes_simulation_manifest_without_labels(tmp_path, m
     assert alignment_launcher.main(["analyze", str(paths["analyze_e2e"])]) == 0
     analysis = tmp_path / "analysis_e2e_run"
     manifest = json.loads((analysis / "alignment_manifest.json").read_text())
-    assert manifest["schema_version"] == 6
+    assert manifest["schema_version"] == 8
     assert manifest["simulation_log_dir"] == str(tmp_path / "simulation_run")
+    assert manifest["workload_profile_log_dir"] == str(tmp_path / "profile_run")
+    assert manifest["metrics_jsonl"] == str(tmp_path / "profile_run" / "metrics.jsonl")
     assert manifest["throughput_bins"] == 20
     # e2e-align names no timing-predict labels or per-subject flags.
     assert "labeled_kernel_sequences" not in manifest
@@ -483,6 +621,40 @@ def test_analyze_e2e_align_writes_simulation_manifest_without_labels(tmp_path, m
             {"build_type": "release", "subjects": ["alignment-workload", "alignment-e2e"]},
         )
     ]
+
+
+def test_analyze_e2e_uses_distinct_full_run_workload_profile(tmp_path, monkeypatch):
+    paths = _phase_configs(tmp_path)
+    _write_timing_artifacts(tmp_path)
+    workload_profile = tmp_path / "workload_profile_run"
+    workload_profile.mkdir()
+    metrics = workload_profile / "metrics.jsonl"
+    replay = workload_profile / "replay.jsonl"
+    metrics.write_text("{}\n")
+    replay.write_text("")
+    base_profile = json.loads((tmp_path / "profile_run" / "profile_result.json").read_text())
+    workload_result = {
+        **base_profile,
+        "profile_kind": "workload_metrics",
+        "log_dir": str(workload_profile),
+        "metrics_jsonl": str(metrics),
+        "replay_result": str(replay),
+    }
+    (workload_profile / "profile_result.json").write_text(json.dumps(workload_result))
+    analyze_raw = yaml.safe_load(paths["analyze_e2e"].read_text())
+    analyze_raw["workload_profile_log_dir"] = "./workload_profile_run"
+    analyze_raw.pop("timing_predict_log_dir")
+    paths["analyze_e2e"].write_text(yaml.safe_dump(analyze_raw))
+    monkeypatch.setattr(
+        alignment_launcher, "_launch_alignment_analysis", lambda *args, **kwargs: True
+    )
+
+    assert alignment_launcher.main(["analyze", str(paths["analyze_e2e"])]) == 0
+
+    manifest = json.loads((tmp_path / "analysis_e2e_run" / "alignment_manifest.json").read_text())
+    assert manifest["workload_profile_log_dir"] == str(workload_profile)
+    assert manifest["metrics_jsonl"] == str(metrics)
+    assert manifest["replay_result"] == str(replay)
 
 
 def test_analyze_rejects_all_subjects_disabled(tmp_path, capsys):

@@ -19,7 +19,7 @@ from ..load_generator.config import LoadGeneratorConfig
 
 @dataclass
 class ServerConfig:
-    """How to launch one vLLM server for one tensor-parallel replica."""
+    """How to launch one vLLM server for one TP x DP replica group."""
 
     model_path: str
     host: str = "127.0.0.1"
@@ -29,6 +29,10 @@ class ServerConfig:
     enable_iteration_metrics: bool = True  # → --enable-logging-iteration-details
     gpu_memory_utilization: float = 0.85
     tp_size: int = 1
+    # Data-parallel ranks may also form the expert-parallel group.  Keep this
+    # explicit instead of hiding it in ``extra_args`` because it determines the
+    # visible-device and normalized-profile population contracts.
+    dp_size: int = 1
     served_model_name: str | None = None
     startup_timeout: float = 900.0
     # `--enforce-eager`: disable CUDA graphs so every kernel is a normal launch.
@@ -36,14 +40,6 @@ class ServerConfig:
     # kernels only at graph-capture time (no per-op busy time during serving);
     # eager sidesteps that but changes the kernel set (torch.compile fusion off).
     enforce_eager: bool = False
-    # `--distributed-executor-backend ray --ray-workers-use-nsight`: run the model
-    # worker as a Ray actor that Ray launches *under nsys* (its runtime_env sets
-    # `cuda-graph-trace=node`). This is the only way to capture CUDA-graph *replay*
-    # per-node kernels (the reference's method) — nsys attaches to the worker
-    # process directly, so serving-time graph replays record kernels with
-    # graphNodeId + correlationId inside the forward NVTX ranges. Mutually
-    # exclusive with the external-nsys capture path in `alignment.runner.run_profile`.
-    use_ray_nsight: bool = False
     # vLLM CUDA-graph capture ceiling; for a trace-derived chunk budget it must
     # cover chunk_size, else prefill iters fall back to a different path.
     max_cudagraph_capture_size: int | None = None
@@ -73,18 +69,28 @@ class NsysConfig:
     enabled and node tracing exposes their replayed kernels.
     """
 
+    # Exact executable path. When omitted, the runner requires NSYS_BIN. It never
+    # guesses from PATH or machine-specific installation directories because
+    # profiler version is part of an alignment run's provenance.
+    executable: str | None = None
     # "cuda_profiler_api" (worker-owned), "nvtx" (range trigger), or "full".
     capture_mode: str = "cuda_profiler_api"
-    # NVTX range whose push starts the capture. Stock vLLM: "gpu_model_runner: forward";
-    # the fork's indexed form: f"vllm_iteration({trigger_iteration}): forward".
+    # Exact NVTX range whose push starts the capture. Stock vLLM commonly uses
+    # "gpu_model_runner: forward"; indexed fork ranges can be supplied directly.
     nvtx_trigger: str = "gpu_model_runner: forward"
-    trigger_iteration: int = 8  # only used when nvtx_trigger embeds an index
     # Analysis window [start, end] over the (sequential, per-worker) forward index.
     analyze_iteration_start: int = 24
     analyze_iteration_end: int = 48
+    # Stop CUPTI after a bounded serving window while the replay continues.
+    # Long graph-node captures can perturb or deadlock multi-rank collectives;
+    # request TTFT/TPOT logging remains active after capture stops.
+    capture_duration_seconds: float | None = None
     sample: str = "none"
     cpuctxsw: str = "none"
     cuda_graph_trace: str = "node"
+    # Nsight 2025.1 device-side event tracing caused Xid 32 with FlashInfer's
+    # multi-GPU NVLink all-to-all. Keep the safe default explicit and configurable.
+    cuda_event_trace: bool = False
 
     def validate(self) -> None:
         allowed = {"cuda_profiler_api", "nvtx", "full"}
@@ -92,6 +98,13 @@ class NsysConfig:
             raise ValueError(
                 f"nsys.capture_mode must be one of {sorted(allowed)}, got {self.capture_mode!r}"
             )
+        if self.capture_duration_seconds is not None:
+            if self.capture_mode != "cuda_profiler_api":
+                raise ValueError(
+                    "nsys.capture_duration_seconds requires capture_mode=cuda_profiler_api"
+                )
+            if self.capture_duration_seconds <= 0:
+                raise ValueError("nsys.capture_duration_seconds must be positive")
 
 
 @dataclass
@@ -103,6 +116,12 @@ class ProfileConfig:
     log_dir: str
     gpu: str  # DB/display GPU name, e.g. "NVIDIA H200"
     cuda_visible_devices: str = "0"  # comma-separated physical GPUs; count equals tp_size
+
+    # ``nsys`` is the timing/segment capture consumed by kernel alignment.
+    # ``workload_metrics`` is a clean full-run scheduler/request timing pass.
+    # ``expert_popularity`` is a separate, deliberately unprofiled pass whose
+    # synchronization and D2H logging overhead must not contaminate timing.
+    profile_kind: str = "nsys"
 
     # --- vLLM side ---
     fork_python: str = ""  # abs path to the instrumented-fork venv python

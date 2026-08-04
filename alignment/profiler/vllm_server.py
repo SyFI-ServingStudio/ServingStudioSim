@@ -55,18 +55,21 @@ def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
         str(cfg.port),
         "--tensor-parallel-size",
         str(cfg.tp_size),
+        "--data-parallel-size",
+        str(cfg.dp_size),
         "--max-num-batched-tokens",
         str(cfg.chunk_size),
         "--enable-chunked-prefill",
+        # TraceLab's mandatory prefix-cache preflight reads
+        # usage.prompt_tokens_details.cached_tokens. Keep the paired server
+        # observable by default instead of requiring every experiment preset
+        # to repeat this transport-level flag.
+        "--enable-prompt-tokens-details",
         "--gpu-memory-utilization",
         str(cfg.gpu_memory_utilization),
     ]
     if cfg.enforce_eager:
         argv.append("--enforce-eager")  # no CUDA graphs → clean per-kernel nsys records
-    if cfg.use_ray_nsight:
-        # Ray launches the model worker under nsys (runtime_env nsight,
-        # cuda-graph-trace=node) — captures CUDA-graph replay per-op kernels.
-        argv += ["--distributed-executor-backend", "ray", "--ray-workers-use-nsight"]
     if cfg.enable_server_load_tracking:
         argv.append("--enable-server-load-tracking")  # /load endpoint for idle checks
     if cfg.enable_iteration_metrics:
@@ -75,7 +78,11 @@ def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
         argv += ["--max-cudagraph-capture-size", str(cfg.max_cudagraph_capture_size)]
     if cfg.served_model_name:
         argv += ["--served-model-name", cfg.served_model_name]
-    argv += cfg.extra_args
+    # Historical presets may still carry the now-default flag. Preserve their
+    # semantics without emitting a duplicate CLI option in launch metadata.
+    argv += [
+        argument for argument in cfg.extra_args if argument != "--enable-prompt-tokens-details"
+    ]
     return argv
 
 
@@ -247,18 +254,21 @@ def build_server_env(fork_python: str, cuda_visible_devices: str) -> dict[str, s
     third-party dependencies still come from the selected venv.
     """
     env = dict(os.environ)
-    for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"):
+    # The profiler owns an unauthenticated loopback server and its paired load
+    # generator. An unrelated shell-level VLLM_API_KEY would otherwise make
+    # every replay preflight fail with HTTP 401; auth is not part of this local
+    # measurement boundary.
+    for key in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "VIRTUAL_ENV",
+        "UV_PROJECT_ENVIRONMENT",
+        "VLLM_API_KEY",
+    ):
         env.pop(key, None)
 
     venv_bin = str(Path(fork_python).parent)
-    # Prepend the venv bin *and* the CUDA bin dir so Ray's nsight plugin finds
-    # `nsys` on PATH (it shells out to `nsys profile ... python` for each worker).
-    path_parts = [venv_bin]
-    for cuda_bin in ("/usr/local/cuda-12.8/bin", "/usr/local/cuda/bin"):
-        if Path(cuda_bin, "nsys").exists():
-            path_parts.append(cuda_bin)
-            break
-    env["PATH"] = ":".join([*path_parts, env.get("PATH", "")])
+    env["PATH"] = os.pathsep.join([venv_bin, env.get("PATH", "")])
     env["PYTHONPATH"] = str(VLLM_SOURCE_ROOT)
     env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     env["VLLM_NVTX_SCOPES_FOR_PROFILING"] = "1"
@@ -297,10 +307,12 @@ def _git_info(repo: Path) -> dict | None:
 
 def write_launch_metadata(
     path: Path,
-    argv: list[str],
+    launch_argv: list[str],
+    server_argv: list[str],
     env: dict,
     cfg: ProfileConfig,
     fork_python: str,
+    profiler_provenance: dict[str, str] | None,
 ) -> None:
     """Persist argv + selected env + fork git state next to the server log.
 
@@ -317,10 +329,12 @@ def write_launch_metadata(
     metadata = {
         "schema_version": 1,
         "name": cfg.name,
-        "argv": argv,
+        "argv": launch_argv,
+        "server_argv": server_argv,
         "env": {k: env[k] for k in keep if k in env},
         "server_config": cfg.server.__dict__,
         "nsys_config": cfg.nsys.__dict__,
+        "nsys_profiler": profiler_provenance,
         "fork_python": fork_python,
         "fork_git": _git_info(VLLM_SOURCE_ROOT),
     }
@@ -394,11 +408,25 @@ def extract_metrics_jsonl(server_log: Path, out_jsonl: Path) -> int:
             missing = required - set(row)
             if missing:
                 raise ValueError(f"alignment iteration record missing fields {sorted(missing)}")
-            if row["schema_version"] != 1 or row["input_adapter"] != "vllm_text":
+            if row["schema_version"] not in {1, 2} or row["input_adapter"] != "vllm_text":
                 raise ValueError(
                     "unsupported alignment iteration record "
                     f"schema={row['schema_version']!r} adapter={row['input_adapter']!r}"
                 )
+            if row["schema_version"] == 2:
+                timing_fields = {
+                    "observed_start_monotonic_ns",
+                    "observed_end_monotonic_ns",
+                    "observed_elapsed_ms",
+                }
+                missing_timing = timing_fields - set(row)
+                if missing_timing:
+                    raise ValueError(
+                        "alignment iteration schema-v2 record missing fields "
+                        f"{sorted(missing_timing)}"
+                    )
+                if row["observed_end_monotonic_ns"] < row["observed_start_monotonic_ns"]:
+                    raise ValueError("alignment iteration observation ends before it starts")
             out.write(json.dumps(row) + "\n")
             n += 1
     return n

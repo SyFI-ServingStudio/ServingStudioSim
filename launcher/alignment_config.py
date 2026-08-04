@@ -73,7 +73,8 @@ class AnalyzePhaseConfig:
 
     simulation_log_dir: Path | None
     profile_log_dir: Path
-    timing_predict_log_dir: Path
+    workload_profile_log_dir: Path
+    timing_predict_log_dir: Path | None
     log_dir: Path
     iteration: IterationAnalysisPolicy
     workload: WorkloadAnalysisPolicy
@@ -132,13 +133,21 @@ def load_profile_config(path: Path) -> ProfileConfig:
     _require_nonempty(config.gpu, "gpu")
     if config.server.tp_size <= 0:
         raise ValueError("invalid profile config: server.tp_size must be > 0")
+    if config.server.dp_size <= 0:
+        raise ValueError("invalid profile config: server.dp_size must be > 0")
+    if config.profile_kind not in {"nsys", "expert_popularity", "workload_metrics"}:
+        raise ValueError(
+            "invalid profile config: profile_kind must be 'nsys', "
+            f"'expert_popularity', or 'workload_metrics', got {config.profile_kind!r}"
+        )
     visible_devices = [
         device.strip() for device in config.cuda_visible_devices.split(",") if device.strip()
     ]
-    if len(visible_devices) != config.server.tp_size:
+    world_size = config.server.tp_size * config.server.dp_size
+    if len(visible_devices) != world_size:
         raise ValueError(
             "invalid profile config: cuda_visible_devices must contain exactly "
-            f"server.tp_size={config.server.tp_size} devices; found {visible_devices}"
+            f"tp_size * dp_size={world_size} devices; found {visible_devices}"
         )
     if len(set(visible_devices)) != len(visible_devices):
         raise ValueError("invalid profile config: cuda_visible_devices contains duplicates")
@@ -163,9 +172,7 @@ def load_timing_predict_config(path: Path) -> TimingPredictPhaseConfig:
         builder = VllmTextInputSpec(**builder_raw)
         builder.validate()
         config = TimingPredictPhaseConfig(
-            simulation_preset=_config_path(
-                base, raw.pop("simulation_preset"), "simulation_preset"
-            ),
+            simulation_preset=_config_path(base, raw.pop("simulation_preset"), "simulation_preset"),
             profile_log_dir=_config_path(base, raw.pop("profile_log_dir"), "profile_log_dir"),
             log_dir=_config_path(base, raw.pop("log_dir"), "log_dir"),
             input_builder=builder,
@@ -232,11 +239,26 @@ def load_analyze_config(path: Path) -> AnalyzePhaseConfig:
             if simulation_raw is not None
             else None
         )
+        profile_log_dir = _config_path(base, raw.pop("profile_log_dir"), "profile_log_dir")
+        workload_profile_raw = raw.pop("workload_profile_log_dir", None)
+        workload_profile_log_dir = (
+            _config_path(base, workload_profile_raw, "workload_profile_log_dir")
+            if workload_profile_raw is not None
+            else profile_log_dir
+        )
+        timing_predict_raw = raw.pop("timing_predict_log_dir", None)
+        if iteration.enabled and timing_predict_raw is None:
+            raise ValueError(
+                "timing_predict_log_dir is required when the iteration subject is enabled"
+            )
         config = AnalyzePhaseConfig(
             simulation_log_dir=simulation_log_dir,
-            profile_log_dir=_config_path(base, raw.pop("profile_log_dir"), "profile_log_dir"),
-            timing_predict_log_dir=_config_path(
-                base, raw.pop("timing_predict_log_dir"), "timing_predict_log_dir"
+            profile_log_dir=profile_log_dir,
+            workload_profile_log_dir=workload_profile_log_dir,
+            timing_predict_log_dir=(
+                _config_path(base, timing_predict_raw, "timing_predict_log_dir")
+                if timing_predict_raw is not None
+                else None
             ),
             log_dir=_config_path(base, raw.pop("log_dir"), "log_dir"),
             iteration=iteration,
@@ -250,9 +272,12 @@ def load_analyze_config(path: Path) -> AnalyzePhaseConfig:
         raise ValueError("invalid analyze config: at least one analysis subject must be enabled")
     distinct = {
         "profile_log_dir": config.profile_log_dir,
-        "timing_predict_log_dir": config.timing_predict_log_dir,
         "log_dir": config.log_dir,
     }
+    if config.workload_profile_log_dir != config.profile_log_dir:
+        distinct["workload_profile_log_dir"] = config.workload_profile_log_dir
+    if config.timing_predict_log_dir is not None:
+        distinct["timing_predict_log_dir"] = config.timing_predict_log_dir
     if config.simulation_log_dir is not None:
         distinct["simulation_log_dir"] = config.simulation_log_dir
     _require_distinct(distinct)
@@ -407,9 +432,7 @@ def _validate_labeled_kernel(
     # and unmapped labels; the analyzer consumes it independently of mapping.
     cross_rank = label.get("cross_rank")
     if cross_rank is not None and cross_rank not in {"synchronizing", "independent"}:
-        raise ValueError(
-            f"{context}.label.cross_rank must be synchronizing or independent"
-        )
+        raise ValueError(f"{context}.label.cross_rank must be synchronizing or independent")
     mapping_keys = set(label) - {"cross_rank"}
     if label["status"] == "unmapped":
         if mapping_keys != {"status"}:
