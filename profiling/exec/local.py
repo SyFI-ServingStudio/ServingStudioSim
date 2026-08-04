@@ -12,7 +12,7 @@ from pathlib import Path
 
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec
-from profiling.exec.env import resolve_profile_env
+from profiling.exec.env import compose_library_path, compose_pythonpath, resolve_profile_env
 from profiling.exec.payload import chunk_result_from_payload, resolve_chunk_backend
 from profiling.exec.pool import ChunkResult, GpuChunk, GpuPool
 
@@ -53,7 +53,7 @@ class LocalGpuChunk(GpuChunk):
         backend = resolve_chunk_backend(kernel_kind, chunk_specs)
         profiler_spec = find_kernel_profiler_spec(kernel_kind, backend)
         profiler_env = resolve_profile_env(profiler_spec.subprocess_env)
-        profiler_env.validate_python_executable()
+        profiler_env.validate()
 
         with tempfile.TemporaryDirectory(prefix="vibesim-profile-") as tmp:
             input_path = Path(tmp) / "input.json"
@@ -69,7 +69,15 @@ class LocalGpuChunk(GpuChunk):
             )
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in self.gpus)
-            env["PYTHONPATH"] = _with_project_pythonpath(env.get("PYTHONPATH"))
+            env["PYTHONPATH"] = compose_pythonpath(
+                profiler_env,
+                env.get("PYTHONPATH"),
+            )
+            if profiler_env.additional_library_paths:
+                env["LD_LIBRARY_PATH"] = compose_library_path(
+                    profiler_env,
+                    env.get("LD_LIBRARY_PATH"),
+                )
 
             # One worker process handles the whole chunk payload, so Python,
             # imports, CUDA context, and runner JIT setup are amortized per
@@ -154,10 +162,3 @@ def _cuda_visible_gpu_order(root: ET.Element, raw_visible_devices: str | None) -
         if gpu_index is not None and gpu_index not in visible_gpu_order:
             visible_gpu_order.append(gpu_index)
     return visible_gpu_order
-
-
-def _with_project_pythonpath(existing: str | None) -> str:
-    root = Path(__file__).resolve().parents[2]
-    if not existing:
-        return str(root)
-    return os.pathsep.join([str(root), existing])

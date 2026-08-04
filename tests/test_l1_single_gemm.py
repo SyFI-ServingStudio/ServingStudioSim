@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import profiling.exec.env as exec_env
 from profiling import perf_api
 from profiling.db import (
     SCHEMA_HASH,
@@ -36,6 +37,7 @@ from profiling.exec import (
     GpuPool,
     LocalGpuPool,
     ProfileEnv,
+    register_profile_env,
     resolve_profile_env,
     set_default_pool,
 )
@@ -163,13 +165,52 @@ def test_registry_does_not_import_runner_modules_eagerly():
     assert completed.stdout.strip() == "False"
 
 
-def test_profile_env_errors_are_explicit(tmp_path: Path):
+def test_profile_env_errors_are_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     with pytest.raises(ValueError, match="unknown profiling env 'missing_env'"):
         resolve_profile_env("missing_env")
+
+    working_python = Path(sys.executable)
+    legacy_env = ProfileEnv("legacy_env", working_python)
+    assert legacy_env.additional_python_paths == ()
+    assert legacy_env.additional_library_paths == ()
+    legacy_env.validate_python_executable()
+
+    configured_env = ProfileEnv("configured_env", working_python, [tmp_path])
+    assert configured_env.additional_python_paths == (tmp_path,)
+    configured_env.validate()
+
+    monkeypatch.setattr(exec_env, "ENV_REGISTRY", {})
+    register_profile_env("legacy_registered_env", working_python)
+    assert exec_env.ENV_REGISTRY["legacy_registered_env"] == ProfileEnv(
+        "legacy_registered_env",
+        working_python,
+    )
 
     missing_python = tmp_path / "env" / "bin" / "python"
     with pytest.raises(FileNotFoundError, match="profiling env 'broken_env'"):
         ProfileEnv("broken_env", missing_python).validate_python_executable()
+
+    missing_import_root = tmp_path / "missing-site-packages"
+    with pytest.raises(
+        FileNotFoundError,
+        match="profiling env 'broken_imports' additional Python path does not exist",
+    ):
+        ProfileEnv(
+            "broken_imports",
+            working_python,
+            (missing_import_root,),
+        ).validate()
+
+    import_file = tmp_path / "not-a-directory"
+    import_file.write_text("", encoding="utf-8")
+    with pytest.raises(
+        NotADirectoryError,
+        match="profiling env 'invalid_imports' additional Python path is not a directory",
+    ):
+        ProfileEnv("invalid_imports", working_python, (import_file,)).validate()
 
 
 def test_energy_perf_uses_total_energy_counter(monkeypatch: pytest.MonkeyPatch):
@@ -1311,6 +1352,12 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
     fake_python.parent.mkdir(parents=True)
     fake_python.write_text("#!/bin/sh\n", encoding="utf-8")
     fake_python.chmod(0o755)
+    first_import_root = tmp_path / "external_env" / "site-packages"
+    second_import_root = tmp_path / "external_env" / "source"
+    library_root = tmp_path / "external_env" / "lib"
+    first_import_root.mkdir()
+    second_import_root.mkdir()
+    library_root.mkdir()
 
     profiler_spec = find_kernel_profiler_spec("single_gemm", "torch")
     external_profiler_spec = replace(profiler_spec, subprocess_env="external_env")
@@ -1322,7 +1369,12 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
 
     def fake_resolve_profile_env(name: str | None) -> ProfileEnv:
         assert name == "external_env"
-        return ProfileEnv("external_env", fake_python)
+        return ProfileEnv(
+            "external_env",
+            fake_python,
+            (first_import_root, second_import_root),
+            (library_root,),
+        )
 
     captured: dict[str, object] = {}
 
@@ -1347,6 +1399,9 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
     )
     monkeypatch.setattr("profiling.exec.local.resolve_profile_env", fake_resolve_profile_env)
     monkeypatch.setattr("profiling.exec.local.subprocess.run", fake_subprocess_run)
+    existing_pythonpath = os.pathsep.join(["/existing/first", "/existing/second"])
+    monkeypatch.setenv("PYTHONPATH", existing_pythonpath)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
 
     results = LocalGpuChunk([2]).run(
         "single_gemm",
@@ -1361,7 +1416,17 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
     captured_env = captured["env"]
     assert isinstance(captured_env, dict)
     assert captured_env["CUDA_VISIBLE_DEVICES"] == "2"
-    assert Path(captured_env["PYTHONPATH"].split(os.pathsep)[0]) == Path(__file__).parents[1]
+    assert captured_env["PYTHONPATH"] == os.pathsep.join(
+        [
+            str(Path(__file__).parents[1]),
+            str(first_import_root),
+            str(second_import_root),
+            existing_pythonpath,
+        ]
+    )
+    assert captured_env["LD_LIBRARY_PATH"] == os.pathsep.join(
+        [str(library_root), "/existing/lib"]
+    )
     assert isinstance(results[0].metrics, ComputeMetrics)
 
 
@@ -1387,6 +1452,27 @@ def test_documented_profile_env_registry_complete():
         ENV_REGISTRY["flashinfer_pip_env"].python_executable
         == ENV_REGISTRY["default_env"].python_executable
     )
+    vllm_env = ENV_REGISTRY["vllm_env"]
+    assert vllm_env.python_executable == ENV_REGISTRY["default_env"].python_executable
+    worker_python_dir = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    vllm_site_packages = (
+        Path(__file__).parents[1]
+        / "alignment"
+        / "profiler"
+        / "vllm"
+        / ".venv"
+        / "lib"
+        / worker_python_dir
+        / "site-packages"
+    )
+    assert vllm_env.additional_python_paths == (
+        vllm_site_packages,
+        Path(__file__).parents[1] / "alignment" / "profiler" / "vllm",
+    )
+    assert vllm_env.additional_library_paths == (
+        vllm_site_packages / "torch" / "lib",
+    )
+    vllm_env.validate()
 
 
 def test_comm_launcher_interfaces_exist():

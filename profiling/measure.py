@@ -26,8 +26,13 @@ from profiling.db.registry import (
     find_kernel_profiler_spec,
     resolve_spec_backend,
 )
-from profiling.exec.env import resolve_profile_env
-from profiling.exec.local import _with_project_pythonpath, find_idle_gpus
+from profiling.exec.env import (
+    ProfileEnv,
+    compose_library_path,
+    compose_pythonpath,
+    resolve_profile_env,
+)
+from profiling.exec.local import find_idle_gpus
 
 
 class MeasureError(RuntimeError):
@@ -71,13 +76,13 @@ def measure_kernel(
     gpu_index = idle_gpus[0]
 
     profiler_env = resolve_profile_env(profiler_spec.subprocess_env)
-    profiler_env.validate_python_executable()
+    profiler_env.validate()
 
     response = _run_worker(
         kernel_kind=kernel_kind,
         spec=spec,
         gpu_index=gpu_index,
-        python_executable=profiler_env.python_executable,
+        profiler_env=profiler_env,
         measure_block={
             "output_dir": str(resolved_output_dir),
             "duration_s": duration_s,
@@ -119,7 +124,7 @@ def _run_worker(
     kernel_kind: KernelKind,
     spec: dict[str, Any],
     gpu_index: int,
-    python_executable: Path,
+    profiler_env: ProfileEnv,
     measure_block: dict[str, Any],
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="vibesim-measure-") as tmp:
@@ -137,9 +142,17 @@ def _run_worker(
         )
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
-        env["PYTHONPATH"] = _with_project_pythonpath(env.get("PYTHONPATH"))
+        env["PYTHONPATH"] = compose_pythonpath(
+            profiler_env,
+            env.get("PYTHONPATH"),
+        )
+        if profiler_env.additional_library_paths:
+            env["LD_LIBRARY_PATH"] = compose_library_path(
+                profiler_env,
+                env.get("LD_LIBRARY_PATH"),
+            )
         cmd = [
-            str(python_executable),
+            str(profiler_env.python_executable),
             "-m",
             "profiling.exec.local_worker",
             "--worker-input",
