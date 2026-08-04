@@ -265,24 +265,6 @@ mod iter_tests {
         ))
     }
 
-    fn parse_qwen(extra: &str) -> Result<IterArchSel, serde_json::Error> {
-        serde_json::from_str(&format!(
-            r#"{{"type":"qwen3_moe_dp_attn_ep_ffn","model_config":"model/config/qwen3_235b.json","fp8":false{extra}}}"#
-        ))
-    }
-
-    fn parse_fp8_qwen(extra: &str) -> Result<IterArchSel, serde_json::Error> {
-        serde_json::from_str(&format!(
-            r#"{{"type":"qwen3_moe_fp8_dp_attn_ep_ffn","model_config":"model/config/qwen3_235b.json","fp8":true{extra}}}"#
-        ))
-    }
-
-    fn parse_vllm_qwen(extra: &str) -> Result<IterArchSel, serde_json::Error> {
-        serde_json::from_str(&format!(
-            r#"{{"type":"qwen3_vllm_moe_dp_attn_ep_ffn","model_config":"model/config/qwen3_235b.json","fp8":true{extra}}}"#
-        ))
-    }
-
     #[test]
     fn qwen_selector_parses_profile_path_and_marks_it_cache_relevant() {
         let parsed = parse_qwen(
@@ -436,74 +418,6 @@ mod iter_tests {
             serde_json::json!(["off", "full_index", "index_share"])
         );
         assert_eq!(mtp["affects_cache"], true);
-    }
-
-    #[test]
-    fn qwen_selector_parses_profile_path_and_marks_it_cache_relevant() {
-        let parsed = parse_qwen(
-            r#","attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"expert_popularity_file":"profile_expert_popularity/expert_popularity.json""#,
-        )
-        .expect("qwen selector with popularity profile parses");
-        let IterArchSel::Qwen3MoeDpAttnEpFfn {
-            attn_tp_size,
-            ep_size,
-            expert_popularity_file,
-            ..
-        } = parsed
-        else {
-            panic!("expected qwen3_moe_dp_attn_ep_ffn")
-        };
-        assert_eq!(attn_tp_size, 4);
-        assert_eq!(ep_size, 4);
-        assert_eq!(
-            expert_popularity_file.as_deref(),
-            Some("profile_expert_popularity/expert_popularity.json")
-        );
-
-        let (_, params) = IterArchSel::SCHEMA
-            .iter()
-            .find(|(tag, _)| *tag == "qwen3_moe_dp_attn_ep_ffn")
-            .expect("qwen selector schema row");
-        let params = serde_json::to_value(params).unwrap();
-        let popularity = params
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|param| param["name"] == "expert_popularity_file")
-            .expect("expert popularity schema parameter");
-        assert_eq!(popularity["affects_cache"], true);
-    }
-
-    #[test]
-    fn vllm_qwen_selector_is_a_distinct_public_arch_with_the_same_parallel_contract() {
-        assert!(matches!(
-            parse_fp8_qwen(r#", "attn_tp_size":4,"ep_size":8,"hp_size":1,"nvl_num_gpu":8"#,)
-                .unwrap(),
-            IterArchSel::Qwen3MoeFp8DpAttnEpFfn { .. }
-        ));
-        let parsed = parse_vllm_qwen(
-            r#", "attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"expert_popularity_file":"expert_popularity.json""#,
-        )
-        .expect("vLLM-alignment Qwen selector parses");
-        assert!(matches!(
-            parsed,
-            IterArchSel::Qwen3VllmMoeDpAttnEpFfn {
-                attn_tp_size: 4,
-                ep_size: 4,
-                hp_size: 1,
-                nvl_num_gpu: 4,
-                expert_popularity_file: Some(ref path),
-                ..
-            } if path == "expert_popularity.json"
-        ));
-
-        let tags = IterArchSel::SCHEMA
-            .iter()
-            .map(|(tag, _)| *tag)
-            .collect::<Vec<_>>();
-        assert!(tags.contains(&"qwen3_moe_dp_attn_ep_ffn"));
-        assert!(tags.contains(&"qwen3_moe_fp8_dp_attn_ep_ffn"));
-        assert!(tags.contains(&"qwen3_vllm_moe_dp_attn_ep_ffn"));
     }
 }
 // ── layer-wise attn / ffn contract (AFD) ────────────────────────────────────
