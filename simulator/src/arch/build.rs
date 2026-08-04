@@ -75,10 +75,10 @@ fn ensure_glm52_model_spec(model_spec: &ModelSpec) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the synthetic MoE routing distribution the L2 MoE op samples against from the
-/// selector's [`RoutingKind`]: `uniform` spreads load evenly over `num_experts`;
-/// `random` draws a `seed`-seeded deterministic skew (0 when unset). Profile-backed
-/// Qwen builds use [`resolve_routing_source`] below.
+/// Resolve the synthetic MoE routing distribution the L2 MoE op samples against
+/// from the selector's [`RoutingKind`]: `uniform` spreads load evenly over
+/// `num_experts`; `random` draws a `seed`-seeded deterministic skew (0 when
+/// unset). Profile-backed Qwen builds use [`resolve_routing_source`] below.
 pub fn resolve_routing(
     kind: RoutingKind,
     seed: Option<u64>,
@@ -1116,6 +1116,131 @@ mod tests {
             sim_num_layers: None,
             fp8: false,
         }
+    }
+
+    #[test]
+    fn expert_popularity_profile_replaces_uniform_routing_and_preserves_ppm_sum() {
+        let mut profile_file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            profile_file,
+            r#"{{
+                "schema_version": 1,
+                "num_logical_experts": 4,
+                "probabilities_all_layers": [0.7, 0.2, 0.09, 0.01],
+                "counts_all_layers": [70, 20, 9, 1]
+            }}"#
+        )
+        .unwrap();
+        let profile_path = profile_file.path().to_str().unwrap();
+        let routing =
+            resolve_routing_source(RoutingKind::Uniform, None, 4, 2, 2, 2, Some(profile_path))
+                .unwrap();
+        assert_eq!(routing.num_experts(), 4);
+        assert_eq!(
+            routing.ppm().iter().sum::<u32>(),
+            RoutingDistribution::TOTAL_PPM
+        );
+        assert!(routing.ppm()[0] > routing.ppm()[1]);
+        assert!(resolve_routing_source(
+            RoutingKind::Random,
+            Some(7),
+            4,
+            2,
+            2,
+            2,
+            Some(profile_path),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn layerwise_expert_popularity_sorts_ep_ranks_and_experts_before_adding() {
+        let mut profile_file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            profile_file,
+            r#"{{
+                "schema_version": 1,
+                "num_logical_experts": 4,
+                "counts_by_layer": [
+                    [9, 2, 5, 5],
+                    [2, 2, 0, 8]
+                ],
+                "counts_all_layers": [11, 4, 5, 13]
+            }}"#
+        )
+        .unwrap();
+
+        let routing = resolve_routing_source(
+            RoutingKind::Uniform,
+            None,
+            4,
+            2,
+            2,
+            2,
+            profile_file.path().to_str(),
+        )
+        .unwrap();
+
+        // Layer 0 canonicalizes to [[9, 2], [5, 5]], layer 1 to
+        // [[8, 0], [2, 2]], and equal slots add to [17, 2, 7, 7]. The first
+        // canonical rank therefore carries sum(layer-wise max rank) = 19.
+        assert_eq!(routing.ppm(), &[515_152, 60_606, 212_121, 212_121]);
+        assert_eq!(routing.ppm()[..2].iter().sum::<u32>(), 575_758);
+    }
+
+    #[test]
+    fn expert_popularity_v2_validates_full_model_and_partition_contract() {
+        let profile = serde_json::json!({
+            "schema_version": 2,
+            "model": "Qwen/test",
+            "num_moe_layers": 2,
+            "num_logical_experts": 4,
+            "expert_parallel_size": 2,
+            "experts_per_rank": 2,
+            "experts_per_token": 2,
+            "count_semantics": "logical_routed_token_assignments",
+            "aggregation": {
+                "scope": "all_captured_eplb_steps",
+                "observed_eplb_step_min": 10,
+                "observed_eplb_step_max": 11,
+                "record_count": 2
+            },
+            "expert_partitioning": {
+                "kind": "contiguous_logical_expert_ids",
+                "layout": "rank_major"
+            },
+            "counts_by_layer": [[9, 2, 5, 5], [2, 2, 0, 8]],
+            "probabilities_by_layer": [
+                [9.0 / 21.0, 2.0 / 21.0, 5.0 / 21.0, 5.0 / 21.0],
+                [2.0 / 12.0, 2.0 / 12.0, 0.0, 8.0 / 12.0]
+            ],
+            "counts_all_layers": [11, 4, 5, 13],
+            "probabilities_all_layers": [11.0 / 33.0, 4.0 / 33.0, 5.0 / 33.0, 13.0 / 33.0]
+        });
+        let mut profile_file = tempfile::NamedTempFile::new().unwrap();
+        write!(profile_file, "{profile}").unwrap();
+        let profile_path = profile_file.path().to_str().unwrap();
+
+        let routing =
+            resolve_routing_source(RoutingKind::Uniform, None, 4, 2, 2, 2, Some(profile_path))
+                .unwrap();
+        assert_eq!(routing.ppm(), &[515_152, 60_606, 212_121, 212_121]);
+
+        let mut unknown_field_profile = profile;
+        unknown_field_profile["unregulated"] = serde_json::json!(true);
+        let mut invalid_file = tempfile::NamedTempFile::new().unwrap();
+        write!(invalid_file, "{unknown_field_profile}").unwrap();
+        let error = resolve_routing_source(
+            RoutingKind::Uniform,
+            None,
+            4,
+            2,
+            2,
+            2,
+            invalid_file.path().to_str(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field"));
     }
 
     #[test]
