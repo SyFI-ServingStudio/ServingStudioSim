@@ -111,7 +111,6 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseTpParallel) -> Llama3Dens
             num_kv_heads: model.num_kv_heads.clone(),
             head_dim: model.head_dim.clone(),
             dtype: model.dtype,
-            fp8: false,
             tp_size: parallel.tp_size,
             tp_name: "tp",
             allreduce_fabric: TP_FABRIC,

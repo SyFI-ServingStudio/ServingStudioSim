@@ -26,7 +26,6 @@ pub struct AllReduceResidualRmsNormKernelConfig {
     pub fabric: Fabric,
     pub strategy: String,
     pub launch_with_pdl: bool,
-    pub trigger_completion_at_end: bool,
     pub fp32_acc: bool,
 }
 
@@ -38,8 +37,11 @@ pub struct AllReduceResidualRmsNormKernelInput {
 pub struct AllReduceResidualRmsNormSpec;
 
 impl AllReduceResidualRmsNormSpec {
-    /// vLLM's SM90 `FI_ALLREDUCE_FUSION_MAX_SIZE_MB` policy. The alignment
-    /// target is H200 (SM90); another GPU must get its own validated policy.
+    /// Effective vLLM H200 fusion boundary for the compiled shape ranges used
+    /// by the alignment target. The TP4 workspace itself can hold 4 MiB, but
+    /// vLLM compiles ranges `(1, 256)` and `(257, 8192)` and only fuses a range
+    /// when its end fits the workspace; therefore the observable TP4 boundary
+    /// is 256 BF16 x 4096 tokens (2 MiB), not the raw 512-token capacity.
     fn max_fused_bytes(num_gpus: u32) -> u64 {
         match num_gpus {
             2 => 64 * 1024 * 1024,
@@ -49,7 +51,12 @@ impl AllReduceResidualRmsNormSpec {
         }
     }
 
-    fn max_fused_tokens(config: &AllReduceResidualRmsNormKernelConfig) -> u32 {
+    /// Largest token count for which vLLM selects the fused SM90 recipe.
+    ///
+    /// L3 uses the same policy to choose between this fused leaf and the
+    /// unfused all-reduce + RMSNorm fallback. Keeping the threshold here makes
+    /// the runtime branch and this kernel's profiling grid share one owner.
+    pub fn max_fused_tokens(config: &AllReduceResidualRmsNormKernelConfig) -> u32 {
         let bytes_per_token = (config.hidden_dim as u64) * (config.dtype.size_bytes() as u64);
         (Self::max_fused_bytes(config.num_gpus) / bytes_per_token) as u32
     }
@@ -91,10 +98,7 @@ impl KernelSpec for AllReduceResidualRmsNormSpec {
                 .with("fabric", config.fabric.as_str())
                 .with("strategy", config.strategy.as_str())
                 .with("launch_with_pdl", config.launch_with_pdl)
-                .with(
-                    "trigger_completion_at_end",
-                    config.trigger_completion_at_end,
-                )
+                .with("trigger_completion_at_end", num_tokens as u32 > 16)
                 .with("fp32_acc", config.fp32_acc)
         })
     }
@@ -119,7 +123,6 @@ mod tests {
             fabric: Fabric::Nvlink,
             strategy: "auto".to_string(),
             launch_with_pdl: true,
-            trigger_completion_at_end: true,
             fp32_acc: true,
         }
     }
@@ -176,6 +179,16 @@ mod tests {
         assert_eq!(fields.get("launch_with_pdl"), Some(&Value::from(true)));
         assert_eq!(
             fields.get("trigger_completion_at_end"),
+            Some(&Value::from(false))
+        );
+        let thirty_two =
+            &AllReduceResidualRmsNormSpec::enumerate(&config, &grid, "flashinfer_trtllm")[5];
+        assert_eq!(
+            thirty_two.fields().get("num_tokens"),
+            Some(&Value::from(32_u32))
+        );
+        assert_eq!(
+            thirty_two.fields().get("trigger_completion_at_end"),
             Some(&Value::from(true))
         );
         assert_eq!(fields.get("fp32_acc"), Some(&Value::from(true)));

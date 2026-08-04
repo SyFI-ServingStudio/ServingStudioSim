@@ -31,7 +31,7 @@ def test_registry_contract_and_capability_gate():
     spec = find_kernel_profiler_spec(KIND, "flashinfer_trtllm")
     assert spec.table_name == KIND
     assert spec.args_schema is AllReduceResidualRmsNormArgs
-    assert spec.subprocess_env == "vllm_env"
+    assert spec.subprocess_env == "flashinfer_pip_env"
     assert spec.list_native is True
     assert spec.gpu_count_fn is not None
     assert spec.gpu_count_fn({"num_gpus": 4}) == 4

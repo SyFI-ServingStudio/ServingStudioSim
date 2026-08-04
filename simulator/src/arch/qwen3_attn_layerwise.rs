@@ -28,17 +28,16 @@
 
 use crate::arch::contract::{AttnArchInput, AttnLayerwiseModel};
 use crate::arch::moe_model_cfg::MoeModelCfg;
-use crate::common::Fabric;
-use crate::op::attention::{FlashInferAttentionInput, FlashInferAttentionOp};
+use crate::op::attention::{
+    FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp,
+};
 use crate::timing::{
     BuildError, CostManifestDoc, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
 };
-use crate::worklet::{AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWorkletResolved};
 
 // Backend / fabric policy for this arch's attention block. Local copy — the AFD
 // archs are self-contained (no shared arch-level config).
-const NORM_BACKENDS: &[&str] = &["flashinfer"];
 // GEMM backends (qkv/o_proj) are chosen by dtype via
 // `model.single_gemm_backends()`.
 // (torch / deepgemm). NOTE: only the `.attn` sub-kernel of the resolved block is
@@ -48,37 +47,32 @@ const NORM_BACKENDS: &[&str] = &["flashinfer"];
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];
 // nccl + nvshmem: the cost engine evals both and keeps the faster per op
 // (best-of-N), so listing both models whichever the real deployment would use.
-const ALLREDUCE_BACKENDS: &[&str] = &["nccl", "nvshmem"];
-const TP_FABRIC: Fabric = Fabric::Nvlink;
 
 /// Build this arch's attention-block config from the model dims + `attn_tp_size`.
 /// Only the attention sub-kernel of the resolved block is used by this arch; the
 /// norm/gemm/allreduce fields feed `AttnBlockTpWorklet`'s head-split resolve and
 /// are otherwise unused here.
-fn attn_block_config(
+fn attention_config(
     model: &MoeModelCfg,
     attn_tp_size: u16,
     gpu_name: &str,
-) -> AttnBlockTpWorkletConfig {
-    AttnBlockTpWorkletConfig {
-        hidden: model.hidden.clone(),
-        num_qo_heads: model.num_qo_heads.clone(),
-        num_kv_heads: model.num_kv_heads.clone(),
+) -> FlashInferAttentionConfig {
+    let tp_size = u32::from(attn_tp_size);
+    assert!(tp_size > 0, "attn_tp_size must be non-zero");
+    assert_eq!(model.num_qo_heads.get() % tp_size, 0);
+    assert_eq!(model.num_kv_heads.get() % tp_size, 0);
+    FlashInferAttentionConfig {
+        backends: ATTN_BACKENDS.to_vec(),
+        gpu_name: gpu_name.to_string(),
+        num_qo_heads: model.num_qo_heads.clone() / Dim::param("attn_tp", tp_size),
+        num_kv_heads: model.num_kv_heads.clone() / Dim::param("attn_tp", tp_size),
         head_dim: model.head_dim.clone(),
         dtype: model.dtype,
         fp8: model.fp8,
-        tp_size: attn_tp_size,
-        tp_name: "attn_tp",
-        allreduce_fabric: TP_FABRIC,
-        gpu_name: gpu_name.to_string(),
-        norm_backends: NORM_BACKENDS.to_vec(),
-        gemm_backends: model.single_gemm_backends(),
-        attn_backends: ATTN_BACKENDS.to_vec(),
         kv_cache_append_backends: vec!["vllm_cuda"],
         kv_cache_block_size: 16,
         kv_cache_layout: "NHD".to_string(),
         kv_scale_granularity: "tensor".to_string(),
-        allreduce_backends: ALLREDUCE_BACKENDS.to_vec(),
     }
 }
 
@@ -94,7 +88,7 @@ pub struct Qwen3AttnParallel {
 
 /// Raw config: the (shared) attn-block config + scalars the cost/comm path needs.
 pub struct Qwen3AttnLayerwiseConfigs {
-    pub attn_block: AttnBlockTpWorkletConfig,
+    pub attn: FlashInferAttentionConfig,
     pub num_layers: u32,
     pub attn_tp_size: u16,
     pub total_kv_bytes_per_token: Dim,
@@ -104,7 +98,7 @@ pub struct Qwen3AttnLayerwiseConfigs {
 /// Post-resolve aggregate: the attn-block partition (only `.attn` is built) +
 /// scalars carried through unchanged.
 pub struct Qwen3AttnLayerwiseResolved {
-    pub attn_block: AttnBlockTpWorkletResolved,
+    pub attn: FlashInferAttentionConfig,
     pub num_layers: u32,
     pub attn_tp_size: u16,
     pub total_kv_bytes_per_token: Dim,
@@ -135,7 +129,7 @@ pub fn build_configs(
     let dtype_bytes = model.compute_dtype().size_bytes();
     let bytes = Dim::param("bytes", dtype_bytes);
     Qwen3AttnLayerwiseConfigs {
-        attn_block: attn_block_config(model, parallel.attn_tp_size, &parallel.gpu_name),
+        attn: attention_config(model, parallel.attn_tp_size, &parallel.gpu_name),
         num_layers: model.num_layers,
         attn_tp_size: parallel.attn_tp_size,
         // Total KV bytes per token: 2 (k+v) × kv_heads × head_dim × kv_dtype × layers.
@@ -155,7 +149,7 @@ pub fn build_configs(
 
 pub fn resolve_configs(cfgs: &Qwen3AttnLayerwiseConfigs) -> Qwen3AttnLayerwiseResolved {
     Qwen3AttnLayerwiseResolved {
-        attn_block: AttnBlockTpWorklet::resolve_config(&cfgs.attn_block),
+        attn: cfgs.attn.clone(),
         num_layers: cfgs.num_layers,
         attn_tp_size: cfgs.attn_tp_size,
         total_kv_bytes_per_token: cfgs.total_kv_bytes_per_token.clone(),
@@ -168,11 +162,7 @@ pub fn build(
     resolved: Qwen3AttnLayerwiseResolved,
     bridge: &PerfApiBridge,
 ) -> Result<Qwen3AttnLayerwiseModel, BuildError> {
-    let attn = FlashInferAttentionOp::build(
-        format!("{model_name}.attn"),
-        resolved.attn_block.attn.clone(),
-        bridge,
-    )?;
+    let attn = FlashInferAttentionOp::build(format!("{model_name}.attn"), resolved.attn, bridge)?;
     let mut model = Qwen3AttnLayerwiseModel {
         name: model_name,
         num_layers: resolved.num_layers,

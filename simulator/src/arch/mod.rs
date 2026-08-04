@@ -5,6 +5,7 @@
 //! build/cost model. See doc/detailed_design/L4.md.
 
 pub mod build;
+pub mod config;
 pub mod contract;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
@@ -13,9 +14,12 @@ pub mod model_cfg;
 pub mod moe_model_cfg;
 pub mod qwen3_attn_layerwise;
 pub mod qwen3_ffn_moe_layerwise;
+pub mod qwen3_fp8_ffn_moe_layerwise;
 pub mod qwen3_moe_dp_attn_ep_ffn;
-pub mod config;
+pub mod qwen3_moe_fp8_dp_attn_ep_ffn;
+pub mod qwen3_vllm_moe_dp_attn_ep_ffn;
 
+pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 pub use contract::{
     ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
     IterwiseUnifiedModel, UnifiedArchInput,
@@ -27,5 +31,7 @@ pub use model_cfg::ModelCfg;
 pub use moe_model_cfg::MoeModelCfg;
 pub use qwen3_attn_layerwise::{Qwen3AttnLayerwiseModel, Qwen3AttnParallel};
 pub use qwen3_ffn_moe_layerwise::{Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel};
+pub use qwen3_fp8_ffn_moe_layerwise::{Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel};
 pub use qwen3_moe_dp_attn_ep_ffn::{Qwen3MoeDpAttnEpFfnModel, Qwen3MoeParallel};
-pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
+pub use qwen3_moe_fp8_dp_attn_ep_ffn::{Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel};
+pub use qwen3_vllm_moe_dp_attn_ep_ffn::{Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel};

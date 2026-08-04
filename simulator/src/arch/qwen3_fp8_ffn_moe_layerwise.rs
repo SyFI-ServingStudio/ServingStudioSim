@@ -3,10 +3,10 @@
 //! `qwen3_moe_dp_attn_ep_ffn` split: it owns everything EXCEPT the attention
 //! kernel. Composed of two TP worklets plus the EP-MoE ops and the iteration
 //! embed / final_norm / lm_head:
-//!   - [`PreAttnProjTpWorklet`]  = input_norm + qkv          (pre-attn)
-//!   - [`PostAttnRouterTpWorklet`] = o_proj + [tp_allreduce] + post_norm + router
+//!   - [`Fp8PreAttnProjTpWorklet`]  = input_norm + qkv          (pre-attn)
+//!   - [`Fp8PostAttnRouterTpWorklet`] = o_proj + [tp_allreduce] + post_norm + router
 //!     (post-attn dense tail + MoE gate; the post_norm + router are a composed
-//!     [`NativeMoeRouterLocalWorklet`], shared with the unified native arch)
+//!     [`NativeFp8MoeRouterLocalWorklet`], shared with the unified native-FP8 arch)
 //! The attention itself is the attn side (`qwen3_attn_layerwise`).
 //!
 //! Per-layer cost is split at the attn boundary into two groups plus an iteration
@@ -20,7 +20,7 @@
 //!   - `epilogue_cost`           = Sum(final_norm, lm_head)
 //!
 //! where
-//!   post_attn = `Max{1.0}( PostAttnRouterTpWorklet × num_dp )`,
+//!   post_attn = `Max{1.0}( Fp8PostAttnRouterTpWorklet × num_dp )`,
 //!   MoE       = `Sum( dispatch, Max{1.0}(expert × ep), Max{1.0}(local_reduce × num_dp), combine )`.
 //!
 //! The `× num_dp_groups` MAX nodes (pre_attn, post_attn, local_reduce) are the
@@ -41,19 +41,22 @@
 //! Comm: this side emits `ffn_to_attn_bytes_per_token` (the QKV projection output,
 //! `(q_dim + 2·kv_dim) · bpe`) per token to the attn side.
 //!
-//! [`NativeMoeRouterLocalWorklet`]: crate::worklet::NativeMoeRouterLocalWorklet
+//! [`NativeFp8MoeRouterLocalWorklet`]: crate::worklet::NativeFp8MoeRouterLocalWorklet
 
 use std::sync::Arc;
 
 use crate::arch::contract::{FfnArchInput, FfnLayerwiseModel};
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::common::Fabric;
+use crate::op::gemm::{
+    SingleFp8GemmWithQuantConfig, SingleFp8GemmWithQuantInput, SingleFp8GemmWithQuantOp,
+};
 use crate::op::moe::{MoeCombineOp, MoeDispatchOp, MoeNetConfig, MoeNetInput, Placement};
 use crate::op::Op;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, RmsNormKernel,
-    RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
+    Fp8PerTokenGroupQuantKernelConfig, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
+    SingleGemmKernelConfig,
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::{
@@ -61,15 +64,14 @@ use crate::timing::{
     LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{
-    uniform_local_ppm, NativeMoeExpertComputeLocalWorklet,
-    NativeMoeExpertComputeLocalWorkletConfig, NativeMoeExpertComputeLocalWorkletInput,
-    NativeMoeExpertComputeLocalWorkletResolved, PostAttnRouterTpWorklet,
-    PostAttnRouterTpWorkletConfig, PostAttnRouterTpWorkletInput, PostAttnRouterTpWorkletResolved,
-    PreAttnProjTpWorklet, PreAttnProjTpWorkletConfig, PreAttnProjTpWorkletInput,
-    PreAttnProjTpWorkletResolved,
+    uniform_local_ppm, Fp8PostAttnRouterTpWorklet, Fp8PostAttnRouterTpWorkletConfig,
+    Fp8PostAttnRouterTpWorkletInput, Fp8PostAttnRouterTpWorkletResolved, Fp8PreAttnProjTpWorklet,
+    Fp8PreAttnProjTpWorkletConfig, Fp8PreAttnProjTpWorkletInput, Fp8PreAttnProjTpWorkletResolved,
+    NativeMoeExpertComputeLocalWorklet, NativeMoeExpertComputeLocalWorkletConfig,
+    NativeMoeExpertComputeLocalWorkletInput, NativeMoeExpertComputeLocalWorkletResolved,
 };
 
-pub struct Qwen3FfnMoeLayerwiseModel {
+pub struct Qwen3Fp8FfnMoeLayerwiseModel {
     pub name: String,
     pub num_layers: u32,
     pub ep_size: u16,
@@ -81,8 +83,8 @@ pub struct Qwen3FfnMoeLayerwiseModel {
     // split is internal to each worklet's resolve_config):
     //   pre_attn  = input_norm + qkv
     //   post_attn = o_proj + [tp_allreduce] + post_norm + router
-    pre_attn: PreAttnProjTpWorklet,
-    post_attn: PostAttnRouterTpWorklet,
+    pre_attn: Fp8PreAttnProjTpWorklet,
+    post_attn: Fp8PostAttnRouterTpWorklet,
     // MoE + iteration ops — identical to the iter-wise arch (minus the router,
     // which lives inside `post_attn`).
     moe_dispatch: MoeDispatchOp,
@@ -91,7 +93,7 @@ pub struct Qwen3FfnMoeLayerwiseModel {
     moe_combine: MoeCombineOp,
     embed: Op<ElementwiseKernel>,
     final_norm: Op<RmsNormKernel>,
-    lm_head: Op<SingleGemmKernel>,
+    lm_head: SingleFp8GemmWithQuantOp,
     // Compiled cost trees (one per cost method; `post` has a mid-layer variant
     // that bills the fused pre(L+1) and a last-layer variant that does not).
     pre_flat: Vec<FlatCostNode>,
@@ -112,6 +114,7 @@ const NORM_BACKENDS: &[&str] = &["flashinfer"];
 // GEMM backends are dtype-driven, not a flat const: fp8 uses DeepGEMM; bf16
 // dense GEMMs compare both Torch layouts while grouped experts stay `torch`.
 const ACT_BACKENDS: &[&str] = &["triton"];
+const DENSE_FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 // nccl + nvshmem for the collective/p2p ops: the cost engine evals both and
 // keeps the faster per op (best-of-N). MoE dispatch/combine (p2p_intra) and the
 // router TP all-reduce both benefit — real EP deployments run these over NVSHMEM.
@@ -128,7 +131,7 @@ const MOE_INTER_FABRIC: Fabric = Fabric::Infiniband;
 /// them; `ep_size` is the expert-parallel width; `nvl_num_gpu` partitions the EP
 /// ranks into NVL domains.
 #[derive(Clone, Debug)]
-pub struct Qwen3FfnMoeParallel {
+pub struct Qwen3Fp8FfnMoeParallel {
     pub attn_tp_size: u16,
     pub ep_size: u16,
     pub nvl_num_gpu: u16,
@@ -137,16 +140,16 @@ pub struct Qwen3FfnMoeParallel {
 
 /// Raw worklet/op configs for the ffn side. `num_dp_groups = ep_size / attn_tp_size`
 /// is carried for the per-DP-shard fan-out (pre_attn / post_attn / local_reduce).
-pub struct Qwen3FfnMoeConfigs {
-    pub pre_attn: PreAttnProjTpWorkletConfig,
-    pub post_attn: PostAttnRouterTpWorkletConfig,
+pub struct Qwen3Fp8FfnMoeConfigs {
+    pub pre_attn: Fp8PreAttnProjTpWorkletConfig,
+    pub post_attn: Fp8PostAttnRouterTpWorkletConfig,
     pub moe_dispatch: MoeNetConfig,
     pub moe_expert_compute: NativeMoeExpertComputeLocalWorkletConfig,
     pub moe_local_reduce: ElementwiseKernelConfig,
     pub moe_combine: MoeNetConfig,
     pub embed: ElementwiseKernelConfig,
     pub final_norm: RmsNormKernelConfig,
-    pub lm_head: SingleGemmKernelConfig,
+    pub lm_head: SingleFp8GemmWithQuantConfig,
     pub num_layers: u32,
     pub ep_size: u16,
     pub num_dp_groups: u16,
@@ -157,16 +160,16 @@ pub struct Qwen3FfnMoeConfigs {
 /// Post-resolve aggregate; the atomic ops (embed / final_norm / lm_head /
 /// moe_local_reduce) carry their kernel config through unchanged (only the
 /// worklets have a resolve step).
-pub struct Qwen3FfnMoeResolved {
-    pub pre_attn: PreAttnProjTpWorkletResolved,
-    pub post_attn: PostAttnRouterTpWorkletResolved,
+pub struct Qwen3Fp8FfnMoeResolved {
+    pub pre_attn: Fp8PreAttnProjTpWorkletResolved,
+    pub post_attn: Fp8PostAttnRouterTpWorkletResolved,
     pub moe_dispatch: MoeNetConfig,
     pub moe_expert_compute: NativeMoeExpertComputeLocalWorkletResolved,
     pub moe_local_reduce: ElementwiseKernelConfig,
     pub moe_combine: MoeNetConfig,
     pub embed: ElementwiseKernelConfig,
     pub final_norm: RmsNormKernelConfig,
-    pub lm_head: SingleGemmKernelConfig,
+    pub lm_head: SingleFp8GemmWithQuantConfig,
     pub num_layers: u32,
     pub ep_size: u16,
     pub num_dp_groups: u16,
@@ -176,10 +179,10 @@ pub struct Qwen3FfnMoeResolved {
 
 pub fn build_configs(
     model: &MoeModelCfg,
-    parallel: &Qwen3FfnMoeParallel,
+    parallel: &Qwen3Fp8FfnMoeParallel,
     routing: &RoutingDistribution,
-) -> Qwen3FfnMoeConfigs {
-    assert!(!model.fp8, "BF16 AFD FFN arch rejects fp8=true");
+) -> Qwen3Fp8FfnMoeConfigs {
+    assert!(model.fp8, "FP8 AFD FFN arch requires fp8=true");
     let gpu = &parallel.gpu_name;
     // Byte-transfer widths (handoffs, dispatch/combine, local reduce, embed) use
     // the compute dtype: fp8 halves the wire size, bf16 leaves it unchanged. The
@@ -247,38 +250,40 @@ pub fn build_configs(
         k: model.hidden.clone(),
         dtype: model.compute_dtype(),
     };
-    Qwen3FfnMoeConfigs {
+    Qwen3Fp8FfnMoeConfigs {
         // pre-attn: input_norm + column-parallel qkv (head split over attn_tp).
-        pre_attn: PreAttnProjTpWorkletConfig {
+        pre_attn: Fp8PreAttnProjTpWorkletConfig {
             hidden: model.hidden.clone(),
             num_qo_heads: model.num_qo_heads.clone(),
             num_kv_heads: model.num_kv_heads.clone(),
             head_dim: model.head_dim.clone(),
-            dtype: model.dtype,
+            activation_dtype: model.dtype,
             tp_size: parallel.attn_tp_size,
             tp_name: "attn_tp",
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
             gemm_backends: model.single_gemm_backends(),
+            fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
         },
         // post-attn: row-parallel o_proj + optional tp_allreduce + post_norm + router.
-        post_attn: PostAttnRouterTpWorkletConfig {
+        post_attn: Fp8PostAttnRouterTpWorkletConfig {
             hidden: model.hidden.clone(),
             num_qo_heads: model.num_qo_heads.clone(),
             head_dim: model.head_dim.clone(),
             num_experts: model.num_experts.clone(),
-            dtype: model.dtype,
+            activation_dtype: model.dtype,
             tp_size: parallel.attn_tp_size,
             tp_name: "attn_tp",
             allreduce_fabric: TP_FABRIC,
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
             gemm_backends: model.single_gemm_backends(),
+            fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
             allreduce_backends: ALLREDUCE_BACKENDS.to_vec(),
         },
         moe_dispatch: moe_net.clone(),
-        // The BF16/native provider uses the direct grouped-GEMM graph. Precision
-        // and backend alternatives belong to sibling L3/L4 providers.
+        // Native FP8 expert compute keeps the direct DeepGEMM grouped-GEMM
+        // graph; dense projections use the explicit quant+GEMM compound ops.
         moe_expert_compute: NativeMoeExpertComputeLocalWorkletConfig {
             hidden: model.hidden.clone(),
             moe_intermediate: model.moe_intermediate.clone(),
@@ -311,7 +316,17 @@ pub fn build_configs(
             hidden: model.hidden.clone(),
             dtype: model.dtype,
         },
-        lm_head: lm_head_gemm,
+        lm_head: SingleFp8GemmWithQuantConfig {
+            quant: Fp8PerTokenGroupQuantKernelConfig {
+                backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
+                gpu_name: gpu.clone(),
+                hidden_size: model.hidden.clone(),
+                group_size: 128,
+                input_dtype: model.dtype,
+                scale_format: "ue8m0_column_major".to_string(),
+            },
+            gemm: lm_head_gemm,
+        },
         num_layers: model.num_layers,
         ep_size: parallel.ep_size,
         num_dp_groups,
@@ -320,10 +335,10 @@ pub fn build_configs(
     }
 }
 
-pub fn resolve_configs(cfgs: &Qwen3FfnMoeConfigs) -> Qwen3FfnMoeResolved {
-    Qwen3FfnMoeResolved {
-        pre_attn: PreAttnProjTpWorklet::resolve_config(&cfgs.pre_attn),
-        post_attn: PostAttnRouterTpWorklet::resolve_config(&cfgs.post_attn),
+pub fn resolve_configs(cfgs: &Qwen3Fp8FfnMoeConfigs) -> Qwen3Fp8FfnMoeResolved {
+    Qwen3Fp8FfnMoeResolved {
+        pre_attn: Fp8PreAttnProjTpWorklet::resolve_config(&cfgs.pre_attn),
+        post_attn: Fp8PostAttnRouterTpWorklet::resolve_config(&cfgs.post_attn),
         moe_dispatch: cfgs.moe_dispatch.clone(),
         moe_expert_compute: NativeMoeExpertComputeLocalWorklet::resolve_config(
             &cfgs.moe_expert_compute,
@@ -347,9 +362,9 @@ pub fn resolve_configs(cfgs: &Qwen3FfnMoeConfigs) -> Qwen3FfnMoeResolved {
 /// dependency on the unified `qwen3_moe_dp_attn_ep_ffn` arch.
 pub fn build(
     model_name: String,
-    resolved: Qwen3FfnMoeResolved,
+    resolved: Qwen3Fp8FfnMoeResolved,
     bridge: &PerfApiBridge,
-) -> Result<Qwen3FfnMoeLayerwiseModel, BuildError> {
+) -> Result<Qwen3Fp8FfnMoeLayerwiseModel, BuildError> {
     let num_layers = resolved.num_layers;
     let ep_size = resolved.ep_size;
     let num_dp_groups = resolved.num_dp_groups;
@@ -357,9 +372,12 @@ pub fn build(
     let ffn_to_attn_bytes_per_token = resolved.ffn_to_attn_bytes_per_token;
 
     // Dense attn-adjacent worklets.
-    let pre_attn =
-        PreAttnProjTpWorklet::build(format!("{model_name}.pre_attn"), resolved.pre_attn, bridge)?;
-    let post_attn = PostAttnRouterTpWorklet::build(
+    let pre_attn = Fp8PreAttnProjTpWorklet::build(
+        format!("{model_name}.pre_attn"),
+        resolved.pre_attn,
+        bridge,
+    )?;
+    let post_attn = Fp8PostAttnRouterTpWorklet::build(
         format!("{model_name}.post_attn"),
         resolved.post_attn,
         bridge,
@@ -409,16 +427,9 @@ pub fn build(
         )?),
     );
     let lm_head_name = format!("{model_name}.lm_head");
-    let lm_head = Op::new(
-        lm_head_name.clone(),
-        Arc::new(SingleGemmKernel::build(
-            lm_head_name,
-            resolved.lm_head,
-            bridge,
-        )?),
-    );
+    let lm_head = SingleFp8GemmWithQuantOp::build(lm_head_name, resolved.lm_head, bridge)?;
 
-    let mut model = Qwen3FfnMoeLayerwiseModel {
+    let mut model = Qwen3Fp8FfnMoeLayerwiseModel {
         name: model_name,
         num_layers,
         ep_size,
@@ -484,7 +495,7 @@ pub fn build(
     Ok(model)
 }
 
-impl Qwen3FfnMoeLayerwiseModel {
+impl Qwen3Fp8FfnMoeLayerwiseModel {
     // ── compile: each node mints slots in the order its eval helper fills them ──
 
     /// Pre-attn section: `Max{1.0}( pre_attn × num_dp_groups )` — one input_norm +
@@ -621,14 +632,14 @@ impl Qwen3FfnMoeLayerwiseModel {
     fn eval_pre(&self, batch: &FfnArchInput, ev: &mut Evaluator) {
         for &batch_tokens in &batch.tokens_per_group {
             self.pre_attn
-                .eval(&PreAttnProjTpWorkletInput { batch_tokens }, ev);
+                .eval(&Fp8PreAttnProjTpWorkletInput { batch_tokens }, ev);
         }
     }
 
     fn eval_post_attn(&self, batch: &FfnArchInput, ev: &mut Evaluator) {
         for &batch_tokens in &batch.tokens_per_group {
             self.post_attn
-                .eval(&PostAttnRouterTpWorkletInput { batch_tokens }, ev);
+                .eval(&Fp8PostAttnRouterTpWorkletInput { batch_tokens }, ev);
         }
     }
 
@@ -787,7 +798,8 @@ impl Qwen3FfnMoeLayerwiseModel {
         // (Max collapses to the slowest shard). Order matches `compile_epilogue_tree`.
         for &m in &batch.tokens_per_group {
             self.final_norm.eval(&RmsNormKernelInput { m }, &mut ev);
-            self.lm_head.eval(&SingleGemmKernelInput { m }, &mut ev);
+            self.lm_head
+                .eval(&SingleFp8GemmWithQuantInput { num_tokens: m }, &mut ev);
         }
         debug_assert_eq!(
             ev.filled(),
@@ -798,7 +810,7 @@ impl Qwen3FfnMoeLayerwiseModel {
     }
 }
 
-impl FfnLayerwiseModel for Qwen3FfnMoeLayerwiseModel {
+impl FfnLayerwiseModel for Qwen3Fp8FfnMoeLayerwiseModel {
     fn num_layers(&self) -> u32 {
         self.num_layers
     }

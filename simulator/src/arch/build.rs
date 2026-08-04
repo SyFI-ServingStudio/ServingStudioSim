@@ -21,11 +21,14 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
     llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen3_attn_layerwise,
-    qwen3_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn, AttnLayerwiseModel, DenseParallel,
+    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
+    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel, DenseParallel,
     DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, IterwiseUnifiedModel,
-    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen3AttnLayerwiseModel,
-    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
-    Qwen3MoeParallel,
+    Llama3DenseModel, Llama3DenseTpModel,
+    Llama3DpAttnTpFfnModel, Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel,
+    Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel,
+    Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::PerfApiBridge;
@@ -538,12 +541,21 @@ pub fn qwen3_moe(
     nvl_num_gpu: u16,
     routing_kind: RoutingKind,
     routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
 ) -> Result<Qwen3MoeDpAttnEpFfnModel> {
     let model_cfg = moe_model_cfg(model_spec)?;
-    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts.get());
+    let routing = resolve_routing_source(
+        routing_kind,
+        routing_seed,
+        model_cfg.num_experts.get(),
+        ep_size,
+        model_cfg.num_layers,
+        model_cfg.top_k,
+        expert_popularity_file,
+    )?;
     let parallel = Qwen3MoeParallel {
         attn_tp_size,
         ep_size,
@@ -555,7 +567,85 @@ pub fn qwen3_moe(
         &qwen3_moe_dp_attn_ep_ffn::build_configs(&model_cfg, &parallel, &routing),
     );
     qwen3_moe_dp_attn_ep_ffn::build(name.to_string(), resolved, bridge)
-        .context("building Qwen3-MoE DP-attn EP-ffn model (often a missing profile.db row)")
+        .context("building native BF16 Qwen3-MoE model")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn qwen3_moe_fp8(
+    model_spec: &ModelSpec,
+    attn_tp_size: u16,
+    ep_size: u16,
+    hp_size: u16,
+    nvl_num_gpu: u16,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen3MoeFp8DpAttnEpFfnModel> {
+    let model_cfg = moe_model_cfg(model_spec)?;
+    let routing = resolve_routing_source(
+        routing_kind,
+        routing_seed,
+        model_cfg.num_experts.get(),
+        ep_size,
+        model_cfg.num_layers,
+        model_cfg.top_k,
+        expert_popularity_file,
+    )?;
+    let parallel = Qwen3MoeFp8Parallel {
+        attn_tp_size,
+        ep_size,
+        hp_size,
+        nvl_num_gpu,
+        gpu_name: gpu.to_string(),
+    };
+    let resolved = qwen3_moe_fp8_dp_attn_ep_ffn::resolve_configs(
+        &qwen3_moe_fp8_dp_attn_ep_ffn::build_configs(&model_cfg, &parallel, &routing),
+    );
+    qwen3_moe_fp8_dp_attn_ep_ffn::build(name.to_string(), resolved, bridge)
+        .context("building native FP8 Qwen3-MoE model")
+}
+
+/// Build the vLLM-alignment Qwen recipe while sharing model dimensions and
+/// partitioning with the generic Qwen arch.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen3_vllm_moe(
+    model_spec: &ModelSpec,
+    attn_tp_size: u16,
+    ep_size: u16,
+    hp_size: u16,
+    nvl_num_gpu: u16,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen3VllmMoeDpAttnEpFfnModel> {
+    let model_cfg = moe_model_cfg(model_spec)?;
+    let routing = resolve_routing_source(
+        routing_kind,
+        routing_seed,
+        model_cfg.num_experts.get(),
+        ep_size,
+        model_cfg.num_layers,
+        model_cfg.top_k,
+        expert_popularity_file,
+    )?;
+    let parallel = Qwen3VllmMoeParallel {
+        attn_tp_size,
+        ep_size,
+        hp_size,
+        nvl_num_gpu,
+        gpu_name: gpu.to_string(),
+    };
+    let resolved = qwen3_vllm_moe_dp_attn_ep_ffn::resolve_configs(
+        &qwen3_vllm_moe_dp_attn_ep_ffn::build_configs(&model_cfg, &parallel, &routing),
+    );
+    qwen3_vllm_moe_dp_attn_ep_ffn::build(name.to_string(), resolved, bridge)
+        .context("building vLLM-aligned FP8 Qwen3-MoE model")
 }
 
 /// Build the AFD attn-side (layer-wise) Qwen3-MoE model — attention only, for ONE
@@ -573,10 +663,9 @@ pub fn qwen3_attn(
         attn_tp_size,
         gpu_name: gpu.to_string(),
     };
-    let resolved =
-        qwen3_attn_layerwise::resolve_configs(&qwen3_attn_layerwise::build_configs(
-            &model_cfg, &parallel,
-        ));
+    let resolved = qwen3_attn_layerwise::resolve_configs(&qwen3_attn_layerwise::build_configs(
+        &model_cfg, &parallel,
+    ));
     qwen3_attn_layerwise::build(name.to_string(), resolved, bridge)
         .context("building Qwen3 AFD attn-side model (often a missing profile.db row)")
 }
@@ -604,13 +693,38 @@ pub fn qwen3_ffn_moe(
         nvl_num_gpu,
         gpu_name: gpu.to_string(),
     };
-    let resolved = qwen3_ffn_moe_layerwise::resolve_configs(&qwen3_ffn_moe_layerwise::build_configs(
-        &model_cfg,
-        &parallel,
-        &routing,
-    ));
+    let resolved = qwen3_ffn_moe_layerwise::resolve_configs(
+        &qwen3_ffn_moe_layerwise::build_configs(&model_cfg, &parallel, &routing),
+    );
     qwen3_ffn_moe_layerwise::build(name.to_string(), resolved, bridge)
         .context("building Qwen3 AFD ffn-side model (often a missing profile.db row)")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn qwen3_fp8_ffn_moe(
+    model_spec: &ModelSpec,
+    attn_tp_size: u16,
+    ep_size: u16,
+    nvl_num_gpu: u16,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen3Fp8FfnMoeLayerwiseModel> {
+    let model_cfg = moe_model_cfg(model_spec)?;
+    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts.get());
+    let parallel = Qwen3Fp8FfnMoeParallel {
+        attn_tp_size,
+        ep_size,
+        nvl_num_gpu,
+        gpu_name: gpu.to_string(),
+    };
+    let resolved = qwen3_fp8_ffn_moe_layerwise::resolve_configs(
+        &qwen3_fp8_ffn_moe_layerwise::build_configs(&model_cfg, &parallel, &routing),
+    );
+    qwen3_fp8_ffn_moe_layerwise::build(name.to_string(), resolved, bridge)
+        .context("building native FP8 Qwen3 AFD ffn-side model")
 }
 
 /// Build ONE iter-wise arch model from its selector, boxed as `dyn`. The
@@ -650,6 +764,7 @@ pub fn build_iter_model(
             nvl_num_gpu,
             routing,
             routing_seed,
+            expert_popularity_file,
         } => Box::new(qwen3_moe(
             model,
             *attn_tp_size,
@@ -658,6 +773,51 @@ pub fn build_iter_model(
             *nvl_num_gpu,
             *routing,
             *routing_seed,
+            expert_popularity_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Qwen3MoeFp8DpAttnEpFfn {
+            model,
+            attn_tp_size,
+            ep_size,
+            hp_size,
+            nvl_num_gpu,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+        } => Box::new(qwen3_moe_fp8(
+            model,
+            *attn_tp_size,
+            *ep_size,
+            *hp_size,
+            *nvl_num_gpu,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Qwen3VllmMoeDpAttnEpFfn {
+            model,
+            attn_tp_size,
+            ep_size,
+            hp_size,
+            nvl_num_gpu,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+        } => Box::new(qwen3_vllm_moe(
+            model,
+            *attn_tp_size,
+            *ep_size,
+            *hp_size,
+            *nvl_num_gpu,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
             gpu,
             name,
             bridge,
@@ -719,9 +879,27 @@ pub fn build_ffn_model(
             name,
             bridge,
         )?),
+        FfnArchSel::Qwen3Fp8FfnMoe {
+            model,
+            attn_tp_size,
+            ep_size,
+            nvl_num_gpu,
+            routing,
+            routing_seed,
+        } => Box::new(qwen3_fp8_ffn_moe(
+            model,
+            *attn_tp_size,
+            *ep_size,
+            *nvl_num_gpu,
+            *routing,
+            *routing_seed,
+            gpu,
+            name,
+            bridge,
+        )?),
         FfnArchSel::DeepseekFfnMoe { .. } => bail!(
-            "timing-predict ffn: only the qwen3_ffn_moe arch has a layer-wise \
-             predict path (got deepseek_ffn_moe)"
+            "timing-predict ffn: only qwen3_ffn_moe and qwen3_fp8_ffn_moe have \
+             layer-wise predict paths (got deepseek_ffn_moe)"
         ),
     })
 }
@@ -875,7 +1053,10 @@ mod tests {
             },
         );
         // attn→ffn outgoing bytes: the attention output, q_dim·bpe.
-        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64, q_dim * bpe);
+        assert_eq!(
+            attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64,
+            q_dim * bpe
+        );
         // total KV bytes: 2 (k+v) × kv_heads × head_dim × kv_dtype × layers.
         assert_eq!(
             attn_cfgs.total_kv_bytes_per_token.get() as u64,
@@ -919,23 +1100,26 @@ mod tests {
             },
         );
         // Handoff + KV at fp8 = 1 byte/elem.
-        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64, q_dim * 1);
+        assert_eq!(
+            attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64,
+            q_dim * 1
+        );
         assert_eq!(
             attn_cfgs.total_kv_bytes_per_token.get() as u64,
-            2 * model.num_kv_heads.get() as u64 * model.head_dim.get() as u64 * 1 * model.num_layers as u64
+            2 * model.num_kv_heads.get() as u64
+                * model.head_dim.get() as u64
+                * 1
+                * model.num_layers as u64
         );
-        // The attn block carries the base dtype + fp8 flag (op owns the preset);
-        // its GEMMs use deepgemm, KV cache reads fp8.
-        assert_eq!(attn_cfgs.attn_block.dtype, DType::Bf16);
-        assert!(attn_cfgs.attn_block.fp8);
-        assert_eq!(attn_cfgs.attn_block.gemm_backends, vec!["deepgemm"]);
-        assert_eq!(attn_cfgs.attn_block.kv_dtype(), DType::Fp8E4m3);
+        assert_eq!(attn_cfgs.attn.dtype, DType::Bf16);
+        assert!(attn_cfgs.attn.fp8);
+        assert_eq!(attn_cfgs.attn.kv_dtype(), DType::Fp8E4m3);
 
         // --- ffn side ---
         let routing = RoutingDistribution::uniform(model.num_experts.get());
-        let ffn_cfgs = crate::arch::qwen3_ffn_moe_layerwise::build_configs(
+        let ffn_cfgs = crate::arch::qwen3_fp8_ffn_moe_layerwise::build_configs(
             &model,
-            &crate::arch::qwen3_ffn_moe_layerwise::Qwen3FfnMoeParallel {
+            &crate::arch::qwen3_fp8_ffn_moe_layerwise::Qwen3Fp8FfnMoeParallel {
                 attn_tp_size: 4,
                 ep_size: 8,
                 nvl_num_gpu: 8,
@@ -943,20 +1127,28 @@ mod tests {
             },
             &routing,
         );
+        let ffn_resolved = crate::arch::qwen3_fp8_ffn_moe_layerwise::resolve_configs(&ffn_cfgs);
         // Symmetric QKV-projection handoff at fp8.
-        assert_eq!(ffn_cfgs.ffn_to_attn_bytes_per_token.get() as u64, (q_dim + 2 * kv_dim) * 1);
+        assert_eq!(
+            ffn_cfgs.ffn_to_attn_bytes_per_token.get() as u64,
+            (q_dim + 2 * kv_dim) * 1
+        );
         // GEMM roles fp8+deepgemm; RMSNorm roles stay bf16.
-        assert_eq!(ffn_cfgs.pre_attn.compute_dtype, DType::Fp8E4m3);
-        assert_eq!(ffn_cfgs.pre_attn.dtype, DType::Bf16); // input_norm stays bf16
+        assert_eq!(ffn_cfgs.pre_attn.activation_dtype, DType::Bf16);
         assert_eq!(ffn_cfgs.pre_attn.gemm_backends, vec!["deepgemm"]);
-        assert_eq!(ffn_cfgs.post_attn.compute_dtype, DType::Fp8E4m3);
-        assert_eq!(ffn_cfgs.post_attn.dtype, DType::Bf16); // post_norm stays bf16
+        assert_eq!(ffn_resolved.pre_attn.qkv.gemm.dtype, DType::Fp8E4m3);
+        assert_eq!(ffn_cfgs.post_attn.activation_dtype, DType::Bf16);
+        assert_eq!(ffn_resolved.post_attn.o_proj.gemm.dtype, DType::Fp8E4m3);
         assert_eq!(ffn_cfgs.moe_expert_compute.dtype, DType::Fp8E4m3); // no norm inside
-        assert_eq!(ffn_cfgs.moe_expert_compute.grouped_gemm_backends, vec!["deepgemm"]);
-        assert_eq!(ffn_cfgs.lm_head.dtype, DType::Fp8E4m3);
-        assert_eq!(ffn_cfgs.lm_head.backends, vec!["deepgemm"]);
+        assert_eq!(
+            ffn_cfgs.moe_expert_compute.grouped_gemm_backends,
+            vec!["deepgemm"]
+        );
+        assert_eq!(ffn_cfgs.lm_head.gemm.dtype, DType::Fp8E4m3);
+        assert_eq!(ffn_cfgs.lm_head.gemm.backends, vec!["deepgemm"]);
+        assert_eq!(ffn_cfgs.lm_head.quant.hidden_size, 4096);
         assert_eq!(ffn_cfgs.final_norm.dtype, DType::Bf16); // final_norm stays bf16
-        // dispatch/combine ship the hidden activation fp8.
+                                                            // dispatch/combine ship the hidden activation fp8.
         assert_eq!(ffn_cfgs.moe_dispatch.dtype, DType::Fp8E4m3);
         assert_eq!(ffn_cfgs.moe_combine.dtype, DType::Fp8E4m3);
     }
@@ -980,12 +1172,11 @@ mod tests {
                 gpu_name: "H200".to_string(),
             },
         );
-        assert_eq!(attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64, q_dim * 2);
-        assert!(!attn_cfgs.attn_block.fp8);
         assert_eq!(
-            attn_cfgs.attn_block.gemm_backends,
-            vec!["torch", "torch_linear"]
+            attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64,
+            q_dim * 2
         );
-        assert_eq!(attn_cfgs.attn_block.kv_dtype(), DType::Bf16);
+        assert!(!attn_cfgs.attn.fp8);
+        assert_eq!(attn_cfgs.attn.kv_dtype(), DType::Bf16);
     }
 }

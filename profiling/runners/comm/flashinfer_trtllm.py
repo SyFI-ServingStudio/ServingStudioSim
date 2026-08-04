@@ -8,6 +8,7 @@ FlashInfer IPC workspace; the timed device work is FlashInfer's fused kernel.
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 
 from profiling.db.args import DType
@@ -142,15 +143,34 @@ def _profile_one_shape(
     for _ in range(warmup):
         launch()
     torch.cuda.synchronize()
-    dist.barrier()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(rep):
-        launch()
-    end.record()
+
+    # Match vLLM's official fused-collective benchmark and the serving path:
+    # FlashInfer's PDL-enabled collective runs inside a CUDA graph. Eager
+    # back-to-back timing measures rank launch skew, while inserting an event
+    # around every PDL launch changes its dependency behavior.
+    operations_per_graph = 10
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(operations_per_graph):
+            launch()
     torch.cuda.synchronize()
-    time_ms = start.elapsed_time(end) / rep
+
+    for _ in range(max(1, warmup // operations_per_graph)):
+        graph.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+    start_time = time.perf_counter()
+    for _ in range(rep // operations_per_graph):
+        graph.replay()
+    torch.cuda.synchronize()
+    local_time_ms = ((time.perf_counter() - start_time) / rep) * 1000.0
+    slowest_rank_time_ms = torch.tensor(
+        local_time_ms,
+        dtype=torch.float32,
+        device=input_tensor.device,
+    )
+    dist.all_reduce(slowest_rank_time_ms, op=dist.ReduceOp.MAX)
+    time_ms = slowest_rank_time_ms.item()
 
     element_size = torch.tensor([], dtype=torch_dtype).element_size()
     message_size_bytes = num_tokens * hidden_dim * element_size

@@ -54,7 +54,11 @@ register(
         args_schema=AllReduceResidualRmsNormArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
-        subprocess_env="vllm_env",
+        # FlashInfer 0.6.11 in the project environment implements the same
+        # TRT-LLM fused kernel contract and boots its IPC workspace reliably.
+        # The vLLM Torch 2.11 environment currently fails during the symmetric
+        # workspace bootstrap before the kernel can launch.
+        subprocess_env="flashinfer_pip_env",
         gpu_count_fn=lambda spec: int(spec["num_gpus"]),
         list_native=True,
     )

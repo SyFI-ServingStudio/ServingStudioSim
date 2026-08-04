@@ -134,7 +134,6 @@ pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3
             num_kv_heads: model.num_kv_heads.clone(),
             head_dim: model.head_dim.clone(),
             dtype: model.dtype,
-            fp8: false,
             tp_size: parallel.attn_tp_size,
             tp_name: "attn_tp",
             allreduce_fabric: TP_FABRIC,

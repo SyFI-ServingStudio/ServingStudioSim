@@ -174,6 +174,7 @@ impl Deployment for UnifiedDeployment {
                 nvl_num_gpu,
                 routing,
                 routing_seed,
+                expert_popularity_file,
                 ..
             } => {
                 ensure_hp_unified(&g.worker)?;
@@ -185,6 +186,75 @@ impl Deployment for UnifiedDeployment {
                     *nvl_num_gpu,
                     *routing,
                     *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_hp_worker,
+                ))
+            }
+            IterArchSel::Qwen3MoeFp8DpAttnEpFfn {
+                attn_tp_size,
+                ep_size,
+                hp_size,
+                nvl_num_gpu,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                ..
+            } => {
+                ensure_hp_unified(&g.worker)?;
+                let model = Arc::new(arch_build::qwen3_moe_fp8(
+                    model_spec,
+                    *attn_tp_size,
+                    *ep_size,
+                    *hp_size,
+                    *nvl_num_gpu,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_hp_worker,
+                ))
+            }
+            IterArchSel::Qwen3VllmMoeDpAttnEpFfn {
+                attn_tp_size,
+                ep_size,
+                hp_size,
+                nvl_num_gpu,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                ..
+            } => {
+                ensure_hp_unified(&g.worker)?;
+                let model = Arc::new(arch_build::qwen3_vllm_moe(
+                    model_spec,
+                    *attn_tp_size,
+                    *ep_size,
+                    *hp_size,
+                    *nvl_num_gpu,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

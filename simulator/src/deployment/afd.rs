@@ -8,8 +8,10 @@
 //! The attn↔ffn QKV transfer cost reuses the profiled `p2p_inter` curve (same as
 //! PD's KV handoff); `build_transfer_cost` wires it, keyed on the ffn (aggregation
 //! receiver) GPU. v1 uses one curve for both directions — a faithful per-direction
-//! split is a later calibration item. Wired pairing is `qwen3_attn` → `qwen3_ffn_moe`;
-//! the two sides' `attn_tp_size` may differ (they shard different work and the
+//! split is a later calibration item. Wired pairings are `qwen3_attn` →
+//! `qwen3_ffn_moe` for BF16 and `qwen3_attn` → `qwen3_fp8_ffn_moe` for FP8;
+//! both sides must agree on `ModelSpec.fp8`. Their `attn_tp_size` may differ
+//! (they shard different work and the
 //! handoff is TP-agnostic — see the `assemble` note); other pairings bail until an
 //! experiment needs them.
 
@@ -62,8 +64,16 @@ impl Deployment for AfdDeployment {
         // group. NOTE: the round-robin cursor is slot-agnostic, so it can break a
         // worker's per-slot double-buffer pull/compute locality — the overlap model is
         // optimistic under scatter until the route is made slot-affine / least-queued.
-        ensure!(ag.replicas >= 1, "afd: attn pool needs ≥1 replica (got {})", ag.replicas);
-        ensure!(fg.replicas >= 1, "afd: ffn pool needs ≥1 replica (got {})", fg.replicas);
+        ensure!(
+            ag.replicas >= 1,
+            "afd: attn pool needs ≥1 replica (got {})",
+            ag.replicas
+        );
+        ensure!(
+            fg.replicas >= 1,
+            "afd: ffn pool needs ≥1 replica (got {})",
+            fg.replicas
+        );
         // Attn and ffn must share the same model_config — the QKV they exchange is
         // one logical tensor split across the attn/ffn boundary.
         ensure!(
@@ -117,6 +127,12 @@ impl Deployment for AfdDeployment {
                     routing_seed,
                 },
             ) => {
+                ensure!(
+                    !am.fp8 && !fm.fp8,
+                    "afd: qwen3_ffn_moe is the BF16 provider, so both paired models must set fp8=false (attn={}, ffn={})",
+                    am.fp8,
+                    fm.fp8,
+                );
                 // Each pool's build is scoped by a single per-pool call: it
                 // activates that pool's backend overrides (run) and tags it for the
                 // enumerate walk (emit), and the guard restores both on drop — so
@@ -125,7 +141,9 @@ impl Deployment for AfdDeployment {
                 // is deployment-level, not part of either pool.
                 let attn_model = {
                     let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
-                    Arc::new(arch_build::qwen3_attn(am, *a_tp, &ag.gpu, MODEL_NAME, bridge)?)
+                    Arc::new(arch_build::qwen3_attn(
+                        am, *a_tp, &ag.gpu, MODEL_NAME, bridge,
+                    )?)
                 };
                 let ffn_model = {
                     let _scope = bridge.with_backend_overrides("ffn", cfg.backends.get("ffn"));
@@ -165,9 +183,67 @@ impl Deployment for AfdDeployment {
                     Some(cfg.io.log_dir.clone()),
                 ))
             }
+            (
+                AttnArchSel::Qwen3AttnTp {
+                    model: am,
+                    attn_tp_size: a_tp,
+                },
+                FfnArchSel::Qwen3Fp8FfnMoe {
+                    model: fm,
+                    attn_tp_size: f_tp,
+                    ep_size,
+                    nvl_num_gpu,
+                    routing,
+                    routing_seed,
+                },
+            ) => {
+                ensure!(
+                    am.fp8 && fm.fp8,
+                    "afd: qwen3_fp8_ffn_moe is the FP8 provider, so both paired models must set fp8=true (attn={}, ffn={})",
+                    am.fp8,
+                    fm.fp8,
+                );
+                let attn_model = {
+                    let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
+                    Arc::new(arch_build::qwen3_attn(
+                        am, *a_tp, &ag.gpu, MODEL_NAME, bridge,
+                    )?)
+                };
+                let ffn_model = {
+                    let _scope = bridge.with_backend_overrides("ffn", cfg.backends.get("ffn"));
+                    Arc::new(arch_build::qwen3_fp8_ffn_moe(
+                        fm,
+                        *f_tp,
+                        *ep_size,
+                        *nvl_num_gpu,
+                        *routing,
+                        *routing_seed,
+                        &fg.gpu,
+                        MODEL_NAME,
+                        bridge,
+                    )?)
+                };
+                ensure!(
+                    crate::arch::contract::AttnLayerwiseModel::num_layers(&*attn_model) >= 1,
+                    "afd: model must have ≥1 layer"
+                );
+                Ok(assemble_afd_flow(
+                    attn_model,
+                    ffn_model,
+                    store,
+                    attn_wc,
+                    ffn_wc,
+                    ag.gpu.clone(),
+                    fg.gpu.clone(),
+                    ag.replicas,
+                    fg.replicas,
+                    cost,
+                    Some(cfg.io.log_dir.clone()),
+                ))
+            }
             (a, f) => bail!(
                 "afd: unsupported attn/ffn arch pairing (got attn={a:?}, ffn={f:?}); \
-                 wired pair: qwen3_attn→qwen3_ffn_moe"
+                 wired pairs: qwen3_attn→qwen3_ffn_moe or qwen3_fp8_ffn_moe"
             ),
         }
     }
@@ -201,19 +277,26 @@ fn ensure_disagg_ffn(worker: &FfnWorkerSel) -> anyhow::Result<()> {
 
 fn attn_gpu_memory_gb(worker: &AttnWorkerSel) -> f64 {
     match worker {
-        AttnWorkerSel::DisaggAttn { attn_gpu_memory_gb, .. } => *attn_gpu_memory_gb,
+        AttnWorkerSel::DisaggAttn {
+            attn_gpu_memory_gb, ..
+        } => *attn_gpu_memory_gb,
     }
 }
 
 fn attn_gpu_time_multiplier(worker: &AttnWorkerSel) -> f64 {
     match worker {
-        AttnWorkerSel::DisaggAttn { gpu_time_multiplier, .. } => *gpu_time_multiplier,
+        AttnWorkerSel::DisaggAttn {
+            gpu_time_multiplier,
+            ..
+        } => *gpu_time_multiplier,
     }
 }
 
 fn ffn_gpu_time_multiplier(worker: &FfnWorkerSel) -> f64 {
     match worker {
-        FfnWorkerSel::DisaggFfn { gpu_time_multiplier } => *gpu_time_multiplier,
+        FfnWorkerSel::DisaggFfn {
+            gpu_time_multiplier,
+        } => *gpu_time_multiplier,
     }
 }
 
