@@ -11,13 +11,21 @@
 
 pub mod attn_block_tp;
 pub mod attn_local;
+pub mod fp8_attn_block_tp;
+pub mod fp8_post_attn_router_tp;
+pub mod fp8_pre_attn_proj_tp;
 pub mod mlp_block_tp;
 pub mod moe_expert_compute_local;
-pub mod moe_router_local;
+pub mod native_fp8_moe_router_local;
+pub mod native_moe_expert_compute_local;
+pub mod native_moe_router_local;
 pub mod post_attn_local;
 pub mod post_attn_router_tp;
 pub mod pre_attn_local;
 pub mod pre_attn_proj_tp;
+pub mod vllm_fp8_attn_block_tp;
+pub mod vllm_fp8_moe_expert_compute_local;
+pub mod vllm_fp8_moe_router_local;
 
 pub use attn_block_tp::{
     AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWorkletInput,
@@ -26,16 +34,36 @@ pub use attn_block_tp::{
 pub use attn_local::{
     AttnLocalWorklet, AttnLocalWorkletConfig, AttnLocalWorkletInput, AttnLocalWorkletResolved,
 };
+pub use fp8_attn_block_tp::{
+    Fp8AttnBlockTpWorklet, Fp8AttnBlockTpWorkletConfig, Fp8AttnBlockTpWorkletInput,
+    Fp8AttnBlockTpWorkletResolved,
+};
+pub use fp8_post_attn_router_tp::{
+    Fp8PostAttnRouterTpWorklet, Fp8PostAttnRouterTpWorkletConfig, Fp8PostAttnRouterTpWorkletInput,
+    Fp8PostAttnRouterTpWorkletResolved,
+};
+pub use fp8_pre_attn_proj_tp::{
+    Fp8PreAttnProjTpWorklet, Fp8PreAttnProjTpWorkletConfig, Fp8PreAttnProjTpWorkletInput,
+    Fp8PreAttnProjTpWorkletResolved,
+};
 pub use mlp_block_tp::{
     MlpBlockTpWorklet, MlpBlockTpWorkletConfig, MlpBlockTpWorkletInput, MlpBlockTpWorkletResolved,
 };
 pub use moe_expert_compute_local::{
-    MoeExpertComputeLocalWorklet, MoeExpertComputeLocalWorkletConfig,
-    MoeExpertComputeLocalWorkletInput, MoeExpertComputeLocalWorkletResolved, uniform_local_ppm,
+    uniform_local_ppm, MoeExpertComputeLocalWorklet, MoeExpertComputeLocalWorkletConfig,
+    MoeExpertComputeLocalWorkletInput, MoeExpertComputeLocalWorkletResolved,
 };
-pub use moe_router_local::{
-    MoeRouterLocalWorklet, MoeRouterLocalWorkletConfig, MoeRouterLocalWorkletInput,
-    MoeRouterLocalWorkletResolved,
+pub use native_fp8_moe_router_local::{
+    NativeFp8MoeRouterLocalWorklet, NativeFp8MoeRouterLocalWorkletConfig,
+    NativeFp8MoeRouterLocalWorkletInput, NativeFp8MoeRouterLocalWorkletResolved,
+};
+pub use native_moe_expert_compute_local::{
+    NativeMoeExpertComputeLocalWorklet, NativeMoeExpertComputeLocalWorkletConfig,
+    NativeMoeExpertComputeLocalWorkletInput, NativeMoeExpertComputeLocalWorkletResolved,
+};
+pub use native_moe_router_local::{
+    NativeMoeRouterLocalWorklet, NativeMoeRouterLocalWorkletConfig,
+    NativeMoeRouterLocalWorkletInput, NativeMoeRouterLocalWorkletResolved,
 };
 pub use post_attn_local::{
     PostAttnLocalWorklet, PostAttnLocalWorkletConfig, PostAttnLocalWorkletInput,
@@ -52,4 +80,16 @@ pub use pre_attn_local::{
 pub use pre_attn_proj_tp::{
     PreAttnProjTpWorklet, PreAttnProjTpWorkletConfig, PreAttnProjTpWorkletInput,
     PreAttnProjTpWorkletResolved,
+};
+pub use vllm_fp8_attn_block_tp::{
+    VllmFp8AttnBlockTpWorklet, VllmFp8AttnBlockTpWorkletConfig, VllmFp8AttnBlockTpWorkletInput,
+    VllmFp8AttnBlockTpWorkletResolved,
+};
+pub use vllm_fp8_moe_expert_compute_local::{
+    VllmFp8MoeExpertComputeLocalWorklet, VllmFp8MoeExpertComputeLocalWorkletConfig,
+    VllmFp8MoeExpertComputeLocalWorkletInput, VllmFp8MoeExpertComputeLocalWorkletResolved,
+};
+pub use vllm_fp8_moe_router_local::{
+    VllmFp8MoeRouterLocalWorklet, VllmFp8MoeRouterLocalWorkletConfig,
+    VllmFp8MoeRouterLocalWorkletInput, VllmFp8MoeRouterLocalWorkletResolved,
 };

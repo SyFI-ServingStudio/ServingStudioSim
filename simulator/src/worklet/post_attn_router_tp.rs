@@ -10,15 +10,16 @@
 //! the attention output, the ffn pool projects it back (o_proj) + re-syncs (all-
 //! reduce) + normalizes + routes, producing the per-token expert scores that feed
 //! the MoE dispatch all-to-all (the next sync section, owned by the arch). The
-//! post_norm + router are delegated to a composed [`MoeRouterLocalWorklet`] so
-//! the two archs share one routing cost definition.
+//! post_norm + router are delegated to the concrete BF16/native
+//! [`NativeMoeRouterLocalWorklet`] so the AFD and unified native archs share one
+//! routing cost definition without a runtime precision/backend branch.
 //!
 //! o_proj is the row-parallel partition of [`AttnBlockTpWorklet`]'s tail (input
 //! `k = num_qo_heads/tp · head_dim`, output `n = hidden`); `tp_size == 1`
 //! degenerates (full shapes, no collective).
 //!
 //! [`AttnBlockTpWorklet`]: crate::worklet::AttnBlockTpWorklet
-//! [`MoeRouterLocalWorklet`]: crate::worklet::MoeRouterLocalWorklet
+//! [`NativeMoeRouterLocalWorklet`]: crate::worklet::NativeMoeRouterLocalWorklet
 
 use std::sync::Arc;
 
@@ -31,9 +32,9 @@ use crate::timing::kernels::{
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
-use super::moe_router_local::{
-    MoeRouterLocalWorklet, MoeRouterLocalWorkletConfig, MoeRouterLocalWorkletInput,
-    MoeRouterLocalWorkletResolved,
+use super::native_moe_router_local::{
+    NativeMoeRouterLocalWorklet, NativeMoeRouterLocalWorkletConfig,
+    NativeMoeRouterLocalWorkletInput, NativeMoeRouterLocalWorkletResolved,
 };
 
 /// Raw global config + TP degree + the collective fabric/backends. The o_proj
@@ -46,9 +47,6 @@ pub struct PostAttnRouterTpWorkletConfig {
     pub num_experts: Dim,
     /// Base (16-bit) dtype — the post-attention RMSNorm keeps it.
     pub dtype: DType,
-    /// Compute dtype (fp8 in an fp8 run, else == `dtype`) — o_proj / router GEMMs
-    /// and the row-parallel all-reduce message width use it.
-    pub compute_dtype: DType,
     pub tp_size: u16,
     /// Symbol name for `tp_size` in the derivation formula (`attn_tp`/`tp`) — the
     /// arch owns which sharding degree this worklet's `tp` is.
@@ -67,7 +65,7 @@ pub struct PostAttnRouterTpWorkletResolved {
     pub raw_cfg: PostAttnRouterTpWorkletConfig,
     pub o_proj: SingleGemmKernelConfig,
     pub tp_ar: Option<AllReduceKernelConfig>, // tp_size == 1 → None
-    pub router: MoeRouterLocalWorkletResolved,
+    pub router: NativeMoeRouterLocalWorkletResolved,
     pub num_qo_heads_per_rank: Dim,
     pub dtype_bytes: u32,
 }
@@ -83,7 +81,7 @@ pub struct PostAttnRouterTpWorklet {
     pub name: String,
     pub o_proj: Op<SingleGemmKernel>,
     pub tp_ar: Option<Op<AllReduceKernel>>,
-    pub router: MoeRouterLocalWorklet,
+    pub router: NativeMoeRouterLocalWorklet,
     resolved: PostAttnRouterTpWorkletResolved,
 }
 
@@ -99,15 +97,16 @@ impl PostAttnRouterTpWorklet {
             tp
         );
         let qo_pr = cfg.num_qo_heads.clone() / Dim::param(cfg.tp_name, tp);
+        let o_proj_gemm = SingleGemmKernelConfig {
+            backends: cfg.gemm_backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            n: cfg.hidden.clone(),
+            k: qo_pr.clone() * cfg.head_dim.clone(),
+            dtype: cfg.dtype,
+        };
         PostAttnRouterTpWorkletResolved {
             // row-parallel o_proj: input k = per-rank Q heads × head_dim; output n = hidden.
-            o_proj: SingleGemmKernelConfig {
-                backends: cfg.gemm_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                n: cfg.hidden.clone(),
-                k: qo_pr.clone() * cfg.head_dim.clone(),
-                dtype: cfg.compute_dtype,
-            },
+            o_proj: o_proj_gemm,
             tp_ar: (cfg.tp_size > 1).then(|| AllReduceKernelConfig {
                 // Comm is size-keyed: the all-reduce reads the fp8-width message
                 // bytes (`dtype_bytes` below) off a dtype-agnostic curve.
@@ -116,17 +115,18 @@ impl PostAttnRouterTpWorklet {
                 num_gpus: cfg.tp_size as u32,
                 fabric: cfg.allreduce_fabric,
             }),
-            router: MoeRouterLocalWorklet::resolve_config(&MoeRouterLocalWorkletConfig {
-                hidden: cfg.hidden.clone(),
-                num_experts: cfg.num_experts.clone(),
-                dtype: cfg.dtype,
-                compute_dtype: cfg.compute_dtype,
-                gpu_name: cfg.gpu_name.clone(),
-                norm_backends: cfg.norm_backends.clone(),
-                gemm_backends: cfg.gemm_backends.clone(),
-            }),
+            router: NativeMoeRouterLocalWorklet::resolve_config(
+                &NativeMoeRouterLocalWorkletConfig {
+                    hidden: cfg.hidden.clone(),
+                    num_experts: cfg.num_experts.clone(),
+                    dtype: cfg.dtype,
+                    gpu_name: cfg.gpu_name.clone(),
+                    norm_backends: cfg.norm_backends.clone(),
+                    gemm_backends: cfg.gemm_backends.clone(),
+                },
+            ),
             num_qo_heads_per_rank: qo_pr,
-            dtype_bytes: cfg.compute_dtype.size_bytes(),
+            dtype_bytes: cfg.dtype.size_bytes(),
             raw_cfg: cfg.clone(),
         }
     }
@@ -139,7 +139,11 @@ impl PostAttnRouterTpWorklet {
         let o_name = format!("{name}.o_proj");
         let o_proj = Op::new(
             o_name.clone(),
-            Arc::new(SingleGemmKernel::build(o_name, resolved.o_proj.clone(), bridge)?),
+            Arc::new(SingleGemmKernel::build(
+                o_name,
+                resolved.o_proj.clone(),
+                bridge,
+            )?),
         );
         let tp_ar = match &resolved.tp_ar {
             Some(ar_cfg) => {
@@ -151,8 +155,11 @@ impl PostAttnRouterTpWorklet {
             }
             None => None,
         };
-        let router =
-            MoeRouterLocalWorklet::build(format!("{name}.moe_router"), resolved.router.clone(), bridge)?;
+        let router = NativeMoeRouterLocalWorklet::build(
+            format!("{name}.moe_router"),
+            resolved.router.clone(),
+            bridge,
+        )?;
         Ok(Self {
             name,
             o_proj,
@@ -193,12 +200,13 @@ impl PostAttnRouterTpWorklet {
         self.o_proj.eval(&SingleGemmKernelInput { m }, ev);
         if let Some(tp_ar) = &self.tp_ar {
             // All-reduce the FULL [tokens × hidden] o_proj partial-sum.
-            let message_size_bytes =
-                (m as u64) * (self.resolved.raw_cfg.hidden.get() as u64) * (self.resolved.dtype_bytes as u64);
+            let message_size_bytes = (m as u64)
+                * (self.resolved.raw_cfg.hidden.get() as u64)
+                * (self.resolved.dtype_bytes as u64);
             tp_ar.eval(&AllReduceKernelInput { message_size_bytes }, ev);
         }
         self.router
-            .eval(&MoeRouterLocalWorkletInput { batch_tokens: m }, ev);
+            .eval(&NativeMoeRouterLocalWorkletInput { batch_tokens: m }, ev);
     }
 }
 
@@ -213,7 +221,6 @@ mod tests {
             head_dim: 128.into(),
             num_experts: 128.into(),
             dtype: DType::Bf16,
-            compute_dtype: DType::Bf16,
             tp_size,
             tp_name: "tp",
             allreduce_fabric: Fabric::Nvlink,
@@ -257,22 +264,5 @@ mod tests {
     fn tp_indivisible_qo_heads_panics() {
         // 32 qo heads, tp=5 → 32 % 5 != 0.
         let _ = PostAttnRouterTpWorklet::resolve_config(&cfg(5));
-    }
-
-    #[test]
-    fn fp8_moves_gemms_and_allreduce_to_compute_dtype_but_norm_stays_base() {
-        let mut c = cfg(4);
-        c.compute_dtype = DType::Fp8E4m3;
-        c.gemm_backends = vec!["deepgemm"];
-        let r = PostAttnRouterTpWorklet::resolve_config(&c);
-        // o_proj + router GEMMs and the all-reduce message width go fp8; both
-        // norms (composed post-attention RMSNorm) keep the base bf16. The
-        // all-reduce config itself is dtype-agnostic (size-keyed comm), so the
-        // fp8-ness rides on `dtype_bytes` (the message width), not a config dtype.
-        assert_eq!(r.o_proj.dtype, DType::Fp8E4m3);
-        assert_eq!(r.router.router.dtype, DType::Fp8E4m3);
-        assert_eq!(r.dtype_bytes, DType::Fp8E4m3.size_bytes());
-        assert_eq!(r.router.post_norm.dtype, DType::Bf16);
-        assert!(r.tp_ar.is_some(), "tp>1 must add an all-reduce");
     }
 }

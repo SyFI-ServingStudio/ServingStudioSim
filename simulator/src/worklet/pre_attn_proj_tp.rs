@@ -34,8 +34,6 @@ pub struct PreAttnProjTpWorkletConfig {
     pub head_dim: Dim,
     /// Base (16-bit) dtype — the input RMSNorm keeps it.
     pub dtype: DType,
-    /// Compute dtype (fp8 in an fp8 run, else == `dtype`) — the QKV GEMM uses it.
-    pub compute_dtype: DType,
     pub tp_size: u16,
     /// Symbol name for `tp_size` in the derivation formula (`attn_tp`/`ffn_tp`/
     /// `tp`) — the arch owns which sharding degree this worklet's `tp` is.
@@ -94,6 +92,13 @@ impl PreAttnProjTpWorklet {
         let tp_dim = Dim::param(cfg.tp_name, tp);
         let qo_pr = cfg.num_qo_heads.clone() / tp_dim.clone();
         let kv_pr = cfg.num_kv_heads.clone() / tp_dim;
+        let qkv_gemm = SingleGemmKernelConfig {
+            backends: cfg.gemm_backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            n: (qo_pr.clone() + 2 * kv_pr.clone()) * cfg.head_dim.clone(),
+            k: cfg.hidden.clone(),
+            dtype: cfg.dtype,
+        };
         PreAttnProjTpWorkletResolved {
             input_norm: RmsNormKernelConfig {
                 backends: cfg.norm_backends.clone(),
@@ -101,14 +106,7 @@ impl PreAttnProjTpWorklet {
                 hidden: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
-            // column-parallel fused QKV: per-rank output = (qo + 2·kv)/tp heads.
-            qkv: SingleGemmKernelConfig {
-                backends: cfg.gemm_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                n: (qo_pr.clone() + 2 * kv_pr.clone()) * cfg.head_dim.clone(),
-                k: cfg.hidden.clone(),
-                dtype: cfg.compute_dtype,
-            },
+            qkv: qkv_gemm,
             num_qo_heads_per_rank: qo_pr,
             num_kv_heads_per_rank: kv_pr,
             raw_cfg: cfg.clone(),
@@ -124,11 +122,19 @@ impl PreAttnProjTpWorklet {
         let qkv_name = format!("{name}.qkv_proj");
         let input_norm = Op::new(
             norm_name.clone(),
-            Arc::new(RmsNormKernel::build(norm_name, resolved.input_norm.clone(), bridge)?),
+            Arc::new(RmsNormKernel::build(
+                norm_name,
+                resolved.input_norm.clone(),
+                bridge,
+            )?),
         );
         let qkv = Op::new(
             qkv_name.clone(),
-            Arc::new(SingleGemmKernel::build(qkv_name, resolved.qkv.clone(), bridge)?),
+            Arc::new(SingleGemmKernel::build(
+                qkv_name,
+                resolved.qkv.clone(),
+                bridge,
+            )?),
         );
         Ok(Self {
             name,
@@ -177,7 +183,6 @@ mod tests {
             num_kv_heads: 8.into(),
             head_dim: 128.into(),
             dtype: DType::Bf16,
-            compute_dtype: DType::Bf16,
             tp_size,
             tp_name: "tp",
             gpu_name: "H100".to_string(),
@@ -209,16 +214,5 @@ mod tests {
     #[should_panic(expected = "num_kv_heads")]
     fn tp_indivisible_kv_heads_panics() {
         let _ = PreAttnProjTpWorklet::resolve_config(&cfg(16));
-    }
-
-    #[test]
-    fn fp8_moves_qkv_to_compute_dtype_but_norm_stays_base() {
-        let mut c = cfg(4);
-        c.compute_dtype = DType::Fp8E4m3;
-        c.gemm_backends = vec!["deepgemm"];
-        let r = PreAttnProjTpWorklet::resolve_config(&c);
-        // QKV GEMM goes fp8; the input RMSNorm keeps the base bf16.
-        assert_eq!(r.qkv.dtype, DType::Fp8E4m3);
-        assert_eq!(r.input_norm.dtype, DType::Bf16);
     }
 }
