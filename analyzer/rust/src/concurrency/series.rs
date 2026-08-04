@@ -184,9 +184,13 @@ fn build_series(events: &[Event], max_points: usize) -> Result<Option<Concurrenc
             }
         })
         .collect::<Vec<_>>();
+    let peak_as_float = peak as f64;
     let active = active_area
         .iter()
-        .map(|area| area / bin_width)
+        // A bin mean is mathematically bounded by the exact event-sweep peak.
+        // Clamp division roundoff at that ownership boundary so downstream
+        // schema validators do not mistake 64.000000000003 for a real breach.
+        .map(|area| (area / bin_width).clamp(0.0, peak_as_float))
         .collect::<Vec<_>>();
     let mean = active_area.iter().sum::<f64>() / span_ms;
     Ok(Some(ConcurrencySeries {
@@ -308,6 +312,30 @@ mod tests {
         assert_eq!(series.active, vec![1.0 / 3.0, 1.0]);
         assert_eq!(series.peak, 1);
         assert_eq!(series.mean, 2.0 / 3.0);
+    }
+
+    #[test]
+    fn saturated_bin_means_do_not_exceed_exact_peak_after_roundoff() {
+        let span_ms = 573_941.5;
+        let series = build_series(
+            &[
+                Event {
+                    time_ms: 0.0,
+                    delta: 64,
+                },
+                Event {
+                    time_ms: span_ms,
+                    delta: -64,
+                },
+            ],
+            449,
+        )
+        .expect("build series")
+        .expect("positive span");
+
+        assert_eq!(series.peak, 64);
+        assert!(series.active.iter().all(|value| *value <= 64.0));
+        assert!(series.active.iter().all(|value| *value == 64.0));
     }
 
     #[test]

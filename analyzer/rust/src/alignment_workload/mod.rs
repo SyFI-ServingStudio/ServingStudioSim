@@ -38,6 +38,24 @@ struct ParsedNsys {
     iteration_details: Vec<MeasuredIteration>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct FullMeasuredMetrics {
+    schema_version: u32,
+    input_adapter: String,
+    iteration_index: u64,
+    prefill_tokens: u64,
+    #[serde(default)]
+    decode_kv_lens: Vec<u64>,
+    #[serde(default)]
+    prefill_chunk_pairs: Vec<(u64, u64)>,
+    #[serde(default)]
+    observed_start_monotonic_ns: Option<u64>,
+    #[serde(default)]
+    observed_end_monotonic_ns: Option<u64>,
+    #[serde(default)]
+    observed_elapsed_ms: Option<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct MeasuredIteration {
     iteration: u64,
@@ -74,15 +92,18 @@ struct WorkloadPoint {
     prefill_tokens: u64,
     decode_batch_size: u64,
     scheduled_kv_tokens: u64,
+    /// EngineCore's observed result-wait/sampling interval. This is retained
+    /// for audit and is distinct from the adjacent-start cadence above.
+    observed_elapsed_ms: Option<f64>,
 }
 
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read_e2e_align(log_dir)?;
     let simulation_log_dir = input.simulation_log_dir.as_path();
-    let measured = read_measured_points(&input.parsed_nsys)?;
+    let measured = read_measured_points(&input.metrics_jsonl, &input.parsed_nsys)?;
     ensure!(
         !measured.is_empty(),
-        "parsed NSYS contains no iterations with both scheduler metrics and kernels"
+        "full-run vLLM metrics contain no workload iterations"
     );
 
     if !register_cost_log(ctx, simulation_log_dir).await? {
@@ -104,7 +125,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
+            "workload_profile_log_dir": input.workload_profile_log_dir.display().to_string(),
             "simulation_log_dir": simulation_log_dir.display().to_string(),
+            "measured_timeline_source": "full_run_engine_observation",
             "measured_iterations": measured.len(),
             "simulated_iterations": simulated.len(),
             "measured_span_ms": measured.last().map(|point| point.time_ms),
@@ -126,6 +149,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 |point| point.scheduled_kv_tokens,
             ),
             "iteration_cycle_ms": paired_cycle_stats(&measured, &simulated),
+            "observed_elapsed_ms": measured_optional_stats(
+                &measured,
+                |point| point.observed_elapsed_ms,
+            ),
         },
         "definitions": definitions.clone(),
     });
@@ -134,7 +161,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
+            "workload_profile_log_dir": input.workload_profile_log_dir.display().to_string(),
             "simulation_log_dir": simulation_log_dir.display().to_string(),
+            "measured_timeline_source": "full_run_engine_observation",
         },
         "available": true,
         "measured": point_series(&measured),
@@ -144,7 +173,129 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     Ok((report, payload))
 }
 
-fn read_measured_points(path: &Path) -> Result<Vec<WorkloadPoint>> {
+fn read_measured_points(
+    metrics_path: &Path,
+    parsed_nsys_path: &Path,
+) -> Result<Vec<WorkloadPoint>> {
+    let parsed_text = fs::read_to_string(parsed_nsys_path)
+        .with_context(|| format!("read {}", parsed_nsys_path.display()))?;
+    let parsed: ParsedNsys = serde_json::from_str(&parsed_text)
+        .with_context(|| format!("parse {}", parsed_nsys_path.display()))?;
+    let captured_iteration_ids: HashSet<u64> = parsed
+        .iteration_details
+        .iter()
+        .map(|detail| detail.iteration)
+        .collect();
+
+    let metrics_text = fs::read_to_string(metrics_path)
+        .with_context(|| format!("read {}", metrics_path.display()))?;
+    let mut records = Vec::new();
+    for (line_index, line) in metrics_text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: FullMeasuredMetrics = serde_json::from_str(line)
+            .with_context(|| format!("parse {} line {}", metrics_path.display(), line_index + 1))?;
+        ensure!(
+            record.input_adapter == "vllm_text",
+            "unsupported full-run metrics input_adapter {:?} at iteration {}",
+            record.input_adapter,
+            record.iteration_index
+        );
+        ensure!(
+            matches!(record.schema_version, 1 | 2),
+            "unsupported full-run metrics schema_version {} at iteration {}",
+            record.schema_version,
+            record.iteration_index
+        );
+        records.push(record);
+    }
+    ensure!(
+        !records.is_empty(),
+        "{} contains no iteration records",
+        metrics_path.display()
+    );
+
+    // Prefix-cache preflight requests run before the measured replay and use
+    // the same logger. Their iteration ids form short, disjoint runs (for
+    // example 0 and 3). Select the unique contiguous run containing the NSYS
+    // window, which is guaranteed to sit inside the actual replay.
+    let mut contiguous_runs: Vec<Vec<FullMeasuredMetrics>> = Vec::new();
+    for record in records {
+        let continues_last = contiguous_runs
+            .last()
+            .and_then(|run| run.last())
+            .is_some_and(|previous| previous.iteration_index + 1 == record.iteration_index);
+        if !continues_last {
+            contiguous_runs.push(Vec::new());
+        }
+        contiguous_runs.last_mut().unwrap().push(record);
+    }
+    let mut matching_runs = contiguous_runs.into_iter().filter(|run| {
+        let run_ids: HashSet<u64> = run.iter().map(|record| record.iteration_index).collect();
+        !captured_iteration_ids.is_empty() && captured_iteration_ids.is_subset(&run_ids)
+    });
+    let selected = matching_runs.next().with_context(|| {
+        format!(
+            "no contiguous full-run metrics segment contains all {} NSYS iterations",
+            captured_iteration_ids.len()
+        )
+    })?;
+    ensure!(
+        matching_runs.next().is_none(),
+        "multiple full-run metrics segments contain the NSYS iteration window"
+    );
+
+    if selected.iter().any(|record| record.schema_version == 1) {
+        ensure!(
+            selected.iter().all(|record| record.schema_version == 1),
+            "full-run metrics segment mixes schema-v1 and schema-v2 records"
+        );
+        return read_measured_points_from_nsys(parsed_nsys_path);
+    }
+
+    let origin_ns = selected[0]
+        .observed_start_monotonic_ns
+        .context("schema-v2 full-run metrics omit observed_start_monotonic_ns")?;
+    let mut points = Vec::with_capacity(selected.len());
+    for record in selected {
+        let start_ns = record
+            .observed_start_monotonic_ns
+            .context("schema-v2 full-run metrics omit observed_start_monotonic_ns")?;
+        let end_ns = record
+            .observed_end_monotonic_ns
+            .context("schema-v2 full-run metrics omit observed_end_monotonic_ns")?;
+        let observed_elapsed_ms = record
+            .observed_elapsed_ms
+            .context("schema-v2 full-run metrics omit observed_elapsed_ms")?;
+        ensure!(
+            end_ns >= start_ns,
+            "full-run metrics iteration {} ends before it starts",
+            record.iteration_index
+        );
+        ensure!(
+            observed_elapsed_ms.is_finite() && observed_elapsed_ms >= 0.0,
+            "full-run metrics iteration {} has invalid observed_elapsed_ms {}",
+            record.iteration_index,
+            observed_elapsed_ms
+        );
+        let scheduled_kv_tokens =
+            scheduled_kv_tokens(&record.decode_kv_lens, &record.prefill_chunk_pairs);
+        points.push(WorkloadPoint {
+            iteration_id: record.iteration_index,
+            time_ms: start_ns.saturating_sub(origin_ns) as f64 / 1e6,
+            iteration_cycle_ms: None,
+            prefill_tokens: record.prefill_tokens,
+            decode_batch_size: record.decode_kv_lens.len() as u64,
+            scheduled_kv_tokens,
+            observed_elapsed_ms: Some(observed_elapsed_ms),
+        });
+    }
+    assign_iteration_cycles(&mut points);
+    Ok(points)
+}
+
+fn read_measured_points_from_nsys(path: &Path) -> Result<Vec<WorkloadPoint>> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let parsed: ParsedNsys =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
@@ -168,12 +319,8 @@ fn read_measured_points(path: &Path) -> Result<Vec<WorkloadPoint>> {
                 detail.iteration
             )
         })?;
-        let scheduled_kv_tokens = metrics.decode_kv_lens.iter().copied().sum::<u64>()
-            + metrics
-                .prefill_chunk_pairs
-                .iter()
-                .map(|(prefix, append)| prefix + append)
-                .sum::<u64>();
+        let scheduled_kv_tokens =
+            scheduled_kv_tokens(&metrics.decode_kv_lens, &metrics.prefill_chunk_pairs);
         raw.push((
             first_kernel_ns,
             detail.iteration,
@@ -195,6 +342,7 @@ fn read_measured_points(path: &Path) -> Result<Vec<WorkloadPoint>> {
                 prefill_tokens: metrics.prefill_tokens,
                 decode_batch_size: metrics.decode_kv_lens.len() as u64,
                 scheduled_kv_tokens,
+                observed_elapsed_ms: None,
             },
         )
         .collect();
@@ -260,6 +408,7 @@ async fn read_simulated_points(ctx: &SessionContext) -> Result<Vec<WorkloadPoint
                 prefill_tokens,
                 decode_batch_size,
                 scheduled_kv_tokens,
+                observed_elapsed_ms: None,
             });
         }
     }
@@ -280,14 +429,33 @@ async fn read_simulated_points(ctx: &SessionContext) -> Result<Vec<WorkloadPoint
     Ok(raw)
 }
 
-/// Derive actual iteration cycles from adjacent execution boundaries. On the
-/// measured side `time_ms` comes from first GPU-kernel starts; on the simulation
-/// side it is the worker's actual `wall_start_ms`, after `gpu_time_multiplier`
-/// and tick scheduling have already affected the clock.
+fn scheduled_kv_tokens(decode_kv_lens: &[u64], prefill_chunk_pairs: &[(u64, u64)]) -> u64 {
+    decode_kv_lens.iter().copied().sum::<u64>()
+        + prefill_chunk_pairs
+            .iter()
+            .map(|(prefix, append)| prefix + append)
+            .sum::<u64>()
+}
+
+/// Derive actual iteration cadence from adjacent execution boundaries. On the
+/// measured schema-v2 path `time_ms` comes from full-run EngineCore observation
+/// starts; schema-v1 archives fall back to NSYS first-kernel starts. Simulation
+/// uses worker `wall_start_ms`, after multiplier and tick scheduling.
 fn assign_iteration_cycles(points: &mut [WorkloadPoint]) {
     for index in 0..points.len().saturating_sub(1) {
         points[index].iteration_cycle_ms = Some(points[index + 1].time_ms - points[index].time_ms);
     }
+}
+
+fn measured_optional_stats<F>(measured: &[WorkloadPoint], select: F) -> Value
+where
+    F: Fn(&WorkloadPoint) -> Option<f64>,
+{
+    let measured_values: Vec<f64> = measured.iter().filter_map(select).collect();
+    json!({
+        "measured": stats(&clean_nonnegative_sorted(&measured_values)),
+        "simulated": Value::Null,
+    })
 }
 
 fn paired_stats<F>(measured: &[WorkloadPoint], simulated: &[WorkloadPoint], select: F) -> Value
@@ -325,6 +493,10 @@ fn point_series(points: &[WorkloadPoint]) -> Value {
             .iter()
             .map(|point| point.iteration_cycle_ms)
             .collect::<Vec<_>>(),
+        "observed_elapsed_ms": points
+            .iter()
+            .map(|point| point.observed_elapsed_ms)
+            .collect::<Vec<_>>(),
         "prefill_tokens": points.iter().map(|point| point.prefill_tokens).collect::<Vec<_>>(),
         "decode_batch_size": points
             .iter()
@@ -342,12 +514,13 @@ fn definitions() -> Value {
         "grain": "one scheduler iteration; measured and simulated series keep their own iteration ids",
         "plot_axis": "recorded iteration_id on each side; ids are not renumbered or paired",
         "iteration_cycle_ms": {
-            "measured": "first kernel start of this NSYS iteration to first kernel start of the next valid iteration",
+            "measured": "this EngineCore observation start to the next observation start over the full replay; includes intervening update, scheduling, submission, and queue gaps",
             "simulated": "this actual top-level iter cost_log wall_start_ms to the next; includes gpu_time_multiplier, tick quantization, and any scheduler gap",
             "last_iteration": "null because no next boundary exists",
         },
+        "observed_elapsed_ms": "vLLM EngineCore result-wait plus sampling observation recorded for every iteration; retained separately from adjacent-start cadence",
         "time_axis": {
-            "measured": "first kernel launch of an NSYS iteration minus the first captured iteration's first kernel launch",
+            "measured": "EngineCore observation start minus the full replay's first observation start; independent of the bounded NSYS window",
             "simulated": "top-level iter cost_log wall_start_ms minus the first simulated iteration's wall_start_ms; this includes simulator gpu_time_multiplier effects",
         },
         "prefill_tokens": "number of prompt/chunk tokens scheduled in the iteration",

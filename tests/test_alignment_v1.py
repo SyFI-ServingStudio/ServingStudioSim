@@ -19,13 +19,52 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_cuda_profiler_api_nsys_prefix_targets_spawned_worker(tmp_path):
+    executable = nsys_capture.ResolvedNsysExecutable(
+        path=tmp_path / "nsys",
+        version="NVIDIA Nsight Systems version 2025.1",
+    )
     prefix = nsys_capture.build_nsys_prefix(
-        NsysConfig(capture_mode="cuda_profiler_api"), tmp_path / "profile"
+        executable,
+        NsysConfig(capture_mode="cuda_profiler_api"),
+        tmp_path / "profile",
     )
 
+    assert prefix[0] == str(executable.path)
     assert "--trace-fork-before-exec=true" in prefix
+    assert "--cuda-event-trace=false" in prefix
     assert "--capture-range=cudaProfilerApi" in prefix
     assert "--capture-range-end=stop" in prefix
+
+
+def test_nsys_executable_requires_explicit_absolute_path(monkeypatch):
+    monkeypatch.delenv("NSYS_BIN", raising=False)
+    with pytest.raises(ValueError, match="NSYS executable is not configured"):
+        nsys_capture.resolve_nsys_executable(None)
+    with pytest.raises(ValueError, match="must be an absolute path"):
+        nsys_capture.resolve_nsys_executable("nsys")
+
+
+def test_nsys_executable_records_resolved_path_and_version(tmp_path, monkeypatch):
+    executable_path = tmp_path / "nsys"
+    executable_path.write_text("#!/bin/sh\nprintf 'Nsight Systems 2025.1\\n'\n")
+    executable_path.chmod(0o755)
+    monkeypatch.setenv("NSYS_BIN", str(executable_path))
+
+    executable = nsys_capture.resolve_nsys_executable(None)
+
+    assert executable.provenance() == {
+        "executable": str(executable_path.resolve()),
+        "version": "Nsight Systems 2025.1",
+    }
+
+
+def test_bounded_nsys_capture_requires_positive_cuda_profiler_window():
+    NsysConfig(capture_duration_seconds=30.0).validate()
+
+    with pytest.raises(ValueError, match="must be positive"):
+        NsysConfig(capture_duration_seconds=0.0).validate()
+    with pytest.raises(ValueError, match="requires capture_mode=cuda_profiler_api"):
+        NsysConfig(capture_mode="full", capture_duration_seconds=30.0).validate()
 
 
 def test_structured_vllm_iteration_record_is_the_only_metrics_contract(tmp_path):
@@ -45,6 +84,28 @@ def test_structured_vllm_iteration_record_is_the_only_metrics_contract(tmp_path)
         "2 generation requests, 2 generation tokens\n"
         f"INFO VibeSimAlignmentIteration {json.dumps(record)}\n"
     )
+    output = tmp_path / "metrics.jsonl"
+
+    assert vllm_server.extract_metrics_jsonl(server_log, output) == 1
+    assert json.loads(output.read_text()) == record
+
+
+def test_structured_vllm_iteration_v2_requires_observed_timing(tmp_path):
+    record = {
+        "schema_version": 2,
+        "input_adapter": "vllm_text",
+        "iteration_index": 7,
+        "observed_start_monotonic_ns": 1_000_000,
+        "observed_end_monotonic_ns": 2_500_000,
+        "observed_elapsed_ms": 1.5,
+        "prefill_tokens": 0,
+        "decode_requests": 2,
+        "decode_tokens_scheduled": 2,
+        "prefill_chunk_pairs": [],
+        "decode_kv_lens": [100, 120],
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(f"INFO VibeSimAlignmentIteration {json.dumps(record)}\n")
     output = tmp_path / "metrics.jsonl"
 
     assert vllm_server.extract_metrics_jsonl(server_log, output) == 1
@@ -387,6 +448,29 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     }
     parsed_path = profile / "parsed.json"
     parsed_path.write_text(json.dumps(parsed))
+    metrics_path = profile / "metrics.jsonl"
+    metrics_path.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "input_adapter": "vllm_text",
+                    "iteration_index": iteration,
+                    "observed_start_monotonic_ns": start_ns,
+                    "observed_end_monotonic_ns": start_ns + 3_000_000,
+                    "observed_elapsed_ms": 3.0,
+                    "prefill_tokens": 0,
+                    "decode_requests": 1,
+                    "decode_tokens_scheduled": 1,
+                    "prefill_chunk_pairs": [],
+                    "decode_kv_lens": [100 + offset],
+                }
+            )
+            for offset, (iteration, start_ns) in enumerate(
+                [(34, 1_000_000_000), (35, 1_010_000_000)]
+            )
+        )
+    )
     case_map = predict / "timing_predict_case_map.json"
     case_map.write_text(
         json.dumps(
@@ -529,11 +613,13 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     (analysis / "alignment_manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": 6,
+                "schema_version": 8,
                 "profile_log_dir": str(profile),
+                "workload_profile_log_dir": str(profile),
                 "simulation_log_dir": str(sim),
                 "analysis_log_dir": str(analysis),
                 "parsed_nsys": str(parsed_path),
+                "metrics_jsonl": str(metrics_path),
                 "replay_result": str(replay),
                 "request_timings_result": str(request_timings),
                 "predict_log_dir": str(predict),
@@ -625,16 +711,10 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     assert e2e_report["latency"]["client_ttft"]["measured_ms"]["mean"] == 40.0
     assert e2e_report["latency"]["server_ttft"]["measured_ms"]["mean"] == 32.5
     assert e2e_report["latency"]["server_tpot"]["measured_ms"]["mean"] == 22.5
-    assert e2e_report["throughput"]["measured_client_completion_tps"] == pytest.approx(
-        20 / 0.3
-    )
+    assert e2e_report["throughput"]["measured_client_completion_tps"] == pytest.approx(20 / 0.3)
     assert e2e_report["throughput"]["measured_server_gpu_span_ms"] == 13.8
-    assert e2e_report["throughput"]["measured_server_gpu_span_tps"] == pytest.approx(
-        20 / 0.0138
-    )
-    e2e_payload = json.loads(
-        (analysis / "payloads" / "alignment_e2e_series.json").read_text()
-    )
+    assert e2e_report["throughput"]["measured_server_gpu_span_tps"] == pytest.approx(20 / 0.0138)
+    e2e_payload = json.loads((analysis / "payloads" / "alignment_e2e_series.json").read_text())
     assert e2e_payload["throughput_summary"] == e2e_report["throughput"]
     assert (analysis / "plots" / "alignment_iteration_overview.png").is_file()
     assert (analysis / "plots" / "alignment_iteration_gpu_cycle_overview.png").is_file()

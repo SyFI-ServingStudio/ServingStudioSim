@@ -206,6 +206,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
+            "workload_profile_log_dir": input.workload_profile_log_dir.display().to_string(),
             "simulation_log_dir": simulation_log_dir.display().to_string(),
             "measured_successful_requests": measured.len(),
             "server_measured_requests": server_timings.as_ref().map(|timings| timings.request_count),
@@ -236,6 +237,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
+            "workload_profile_log_dir": input.workload_profile_log_dir.display().to_string(),
             "throughput_bins": input.throughput_bins,
         },
         "throughput": throughput["series"],

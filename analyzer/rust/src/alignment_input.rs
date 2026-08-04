@@ -10,8 +10,10 @@
 //!   `alignment-e2e`) compares the measured run against a completed DES
 //!   simulation, so the simulation and client replay are mandatory.
 //!
-//! The two share only the measured-profile anchor (`profile_log_dir`,
-//! `parsed_nsys`) and the envelope bookkeeping. Path/schema parsing lives here;
+//! The two share the bounded NSYS anchor (`profile_log_dir`, `parsed_nsys`) and
+//! the envelope bookkeeping. E2E additionally names the full-run workload
+//! profile so bounded CUPTI capture cannot truncate scheduler/client metrics.
+//! Path/schema parsing lives here;
 //! metric formulas stay in the category modules.
 
 use std::fs;
@@ -22,7 +24,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 /// Manifest schema the launcher writes and every subject expects.
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 8;
 
 /// kernel-align inputs: measured kernels vs timing-predict totals. No
 /// simulation is involved, so every field is mandatory once the phase runs.
@@ -43,7 +45,11 @@ pub struct E2eAlignManifest {
     pub schema_version: u32,
     pub analysis_log_dir: PathBuf,
     pub profile_log_dir: PathBuf,
+    pub workload_profile_log_dir: PathBuf,
     pub parsed_nsys: PathBuf,
+    /// Full-run structured EngineCore iteration records. Unlike parsed NSYS,
+    /// this stream continues after the bounded CUPTI window closes.
+    pub metrics_jsonl: PathBuf,
     pub simulation_log_dir: PathBuf,
     pub replay_result: PathBuf,
     /// vLLM engine-core per-request timing JSONL. Absent on captures taken
