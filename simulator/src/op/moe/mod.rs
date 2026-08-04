@@ -12,6 +12,7 @@
 
 pub mod combine;
 pub mod dispatch;
+pub mod grouped_fp8_gemm;
 pub mod sim;
 
 use crate::common::Fabric;
@@ -23,6 +24,9 @@ use crate::timing::routing::RoutingDistribution;
 
 pub use combine::MoeCombineOp;
 pub use dispatch::MoeDispatchOp;
+pub use grouped_fp8_gemm::{
+    GroupedFp8GemmWithQuantConfig, GroupedFp8GemmWithQuantInput, GroupedFp8GemmWithQuantOp,
+};
 pub use sim::simulate_moe_comm;
 
 /// Op-level identity shared by [`MoeDispatchOp`] and [`MoeCombineOp`]. The two
