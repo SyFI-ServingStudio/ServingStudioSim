@@ -112,10 +112,11 @@ applies to every expansion — exactly one nested `label`: `{"status":
   component of one operation and the chosen slots jointly own that work.
 - **Many-to-one is fine.** Cache update, attention mainloop, and combine may share
   one operation/slot when the CostTree models them as one leaf.
-- **One-to-many only for additive workload.** The analyzer counts the measured
-  duration once and sums the selected leaf workloads — not overlap-aware wall time
-  under `Max`. If the slots are separate operations or need an unjustified split,
-  leave the row unresolved.
+- **One-to-many follows CostTree attribution.** The analyzer counts the measured
+  duration once and attributes selected leaves through `Sum` / `Scale` / `Max`;
+  parallel siblings contribute only through the critical child, while raw
+  folded workload remains a mapping-coverage audit. If the slots are separate
+  operations or need an unjustified split, leave the row unresolved.
 - **Keep helpers explicit.** Mark bookkeeping, alloc/fill/copy, launch prep, and
   sampling `unmapped`; never attach them to a nearby op for coverage.
 - **Keep simulator-only work visible.** A simulated leaf with no measured

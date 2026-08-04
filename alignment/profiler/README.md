@@ -4,6 +4,12 @@ The alignment ground truth comes from the **vLLM submodule in this directory**,
 which adds `vllm_iteration(N): <phase>` NVTX scopes and a versioned
 `VibeSimAlignmentIteration {json}` model-input record. It also emits one
 `VibeSimAlignmentRequestTiming {json}` record when each request completes. The
+MoE popularity pass additionally emits `VibeSimAlignmentExpertLoad {json}` only
+when EPLB balancedness logging is explicitly enabled. Each record contains the
+EP-reduced per-layer token counts mapped back to logical expert ids; the launcher
+aggregates these into `expert_popularity.json`. This pass runs without NSYS and
+must be separate from the timing pass because the reduction and D2H conversion
+are deliberate measurement overhead.
 record contains both first-token and decode-span timing. The fork source is
 already vendored (as a git submodule) at:
 
@@ -50,7 +56,8 @@ present under `$HF_HOME/hub/models--meta-llama--Meta-Llama-3-8B`.
 Verify end to end before a real capture:
 
 ```bash
-nsys --version                     # /usr/local/cuda-12.8/bin/nsys
+export NSYS_BIN=/absolute/path/to/nsys
+"$NSYS_BIN" --version
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader   # pick an idle GPU
 ```
 
@@ -86,17 +93,34 @@ capture can retain all child NVTX ranges and graph-creation metadata while
 silently recording zero replay kernels. Keep `capture_mode: nvtx` only as an
 explicit diagnostic fallback.
 
+The runner never searches `PATH` or machine-specific CUDA/Nsight installation
+directories. Set `nsys.executable` in the profile config or export `NSYS_BIN`
+with an absolute executable path. That exact resolved path and its reported
+version are reused for capture and SQLite export and persisted in launch/result
+provenance.
+
 Unpaired markers such as `gpu_model_runner: ModelRunnerOutput` remain because
 they describe separate output/bookkeeping work. `execute_context_C(CT)_generation_G(GT)`
 remains a diagnostic annotation. The human `Iteration(N): ...` line is not an
 analyzer API: the separate `VibeSimAlignmentIteration {json}` line is the
-authoritative request/token shape and stage source. It carries exact
+authoritative request/token shape, stage, and full-run EngineCore observation
+source. Schema v2 carries `observed_start_monotonic_ns`,
+`observed_end_monotonic_ns`, and `observed_elapsed_ms`. Adjacent starts measure
+the complete cadence including the intervening scheduler/bookkeeping gap;
+start-to-end preserves the narrower historical result-wait/sampling elapsed
+time. These host-clock fields continue after bounded CUPTI capture stops and do
+not replace NSYS GPU timestamps for kernel attribution. The record carries exact
 `prefill_chunk_pairs` as `[prefix_len, append_len]` and exact
 `decode_kv_lens`; the extractor does not parse historical prose formats. The parser
 accepts only indexed iteration ranges and attributes kernels by
 `kernel.correlationId → runtime.correlationId → indexed phase`. CUDA-graph
 profiles must also use `--cuda-graph-trace=node` and verify non-null
-`graphNodeId` rows.
+`graphNodeId` rows. The launcher defaults Nsight's optional device-side CUDA
+Event completion tracing to `--cuda-event-trace=false`: it is not needed for
+kernel/NVTX attribution and can trigger cross-stream false dependencies and
+Xid 32 faults with multi-GPU NVLink all-to-all backends. The explicit
+`nsys.cuda_event_trace` field can override that default for a controlled
+diagnostic capture.
 
 Request TTFT/TPOT instrumentation reuses vLLM's native EngineCore events and clock:
 `QUEUED` is recorded when `Scheduler.add_request` appends the request to its
@@ -117,11 +141,31 @@ for older captures.
 The extractor removes vLLM completions' `cmpl-<X-Request-Id>-0` envelope into
 the canonical TraceLab `request_id` and retains the raw `engine_request_id` for
 audit.
-The profile runner extracts these lines to
+The NSYS profile runner extracts these lines to
 `profile/vllm/<name>_request_timings.jsonl` and records that path in
-`profile_result.json`. These engine-core metrics exclude HTTP/frontend ingress,
+`profile_result.json`. The full scheduler metrics JSONL is likewise retained in
+`profile_result.metrics_jsonl`; e2e workload analysis consumes it directly and
+uses the NSYS iteration IDs only to identify the measured replay's contiguous
+segment. These engine-core metrics exclude HTTP/frontend ingress,
 tokenization, detokenization, SSE return, `[DONE]`, and client post-processing;
 TraceLab's fields remain the client-observed latency measurements.
+
+The separate `expert_popularity` pass sets
+`VLLM_NVTX_SCOPES_FOR_PROFILING=0`, so it neither emits nor requires this
+request-timing artifact. Its only model-side ground truth is the expert-load
+record stream described above; timing evidence always comes from the NSYS pass.
+The resulting summary follows
+[`alignment/schema/expert_popularity_v2.schema.json`](../schema/expert_popularity_v2.schema.json):
+`counts_by_layer[layer][logical_expert]` is authoritative, while EP degree,
+top-k, aggregation scope, and the simulator's rank-major logical partition are
+explicit provenance rather than implicit loader assumptions.
+
+For long multi-GPU workloads, set `nsys.capture_duration_seconds` with
+`capture_mode: cuda_profiler_api`. The launcher stops CUPTI at that deadline but
+does not stop the replay: the bounded window supplies representative kernel
+segments while all requests still finish and emit EngineCore TTFT/TPOT. This
+also avoids letting graph-node tracing perturb multi-rank collectives for the
+entire benchmark.
 
 NSYS exports the CUPTI runtime and kernel tables without lookup indexes. Before
 attribution, the parser adds persistent `vibesim_` indexes on
@@ -212,6 +256,17 @@ server: ...
 nsys: ...
 workload: ...
 ```
+
+The launcher removes an inherited `VLLM_API_KEY` from the local vLLM server
+subprocess. The paired TraceLab replay client intentionally targets an
+unauthenticated loopback endpoint; ambient shell credentials must not turn that
+private measurement boundary into an authenticated API and fail preflight with
+HTTP 401.
+
+The same launch boundary enables vLLM prompt-token details by default. TraceLab
+performs a mandatory two-request prefix-cache preflight and reads
+`usage.prompt_tokens_details.cached_tokens`; experiment presets do not need to
+repeat `--enable-prompt-tokens-details` in `server.extra_args`.
 
 The simulation preset independently uses `io.log_dir`. Paths in `profile.yaml`
 are resolved relative to that file.

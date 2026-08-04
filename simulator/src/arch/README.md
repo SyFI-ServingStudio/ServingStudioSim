@@ -102,9 +102,9 @@ variant's parameters.
 
 | Contract | Wired selectors | Explicitly unsupported selectors |
 |---|---|---|
-| `IterArchSel` | `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn` | none |
+| `IterArchSel` | `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn` | none |
 | `AttnArchSel` | `qwen3_attn_tp` | `llama3_attn_tp` |
-| `FfnArchSel` | `qwen3_ffn_moe` | `deepseek_ffn_moe` |
+| `FfnArchSel` | `qwen3_ffn_moe`, `qwen3_fp8_ffn_moe` | `deepseek_ffn_moe` |
 
 `ModelSpec` is flattened into every tag and carries `model_config`, layer
 controls, and `fp8`. `ParamStruct`/`ProviderSchema` generate the launcher
@@ -115,12 +115,13 @@ schema; no second hand-maintained config union belongs here.
 - unified:
   - Llama3 dense/TP → `barebone`
   - Llama3 DP-attention/TP-FFN → `hp_unified`
-  - Qwen3 MoE DP-attention/EP-FFN → `hp_unified`
+  - Qwen3 MoE DP-attention/EP-FFN (native BF16, native FP8, or vLLM-aligned FP8) → `hp_unified`
 - PD:
   - Llama3 TP prefill → Llama3 TP decode
   - Llama3 TP prefill → Llama3 DP-attention/TP-FFN decode
 - AFD:
-  - `qwen3_attn_tp` → `qwen3_ffn_moe`
+  - Qwen3 BF16 attention + `qwen3_ffn_moe`
+  - Qwen3 FP8 attention + `qwen3_fp8_ffn_moe`
 
 ## Authoring
 

@@ -29,6 +29,12 @@ is the smallest example; the rest scale it up:
 `resolve_config`; `*Input` is pure shape. Backend strings pass straight through to
 L1 (config-level polymorphism) — a worklet never selects a backend.
 
+When precision or framework recipe changes the op graph, use sibling worklets.
+For Qwen this means separate native BF16, native FP8, and vLLM-aligned attention,
+router, and expert worklets; AFD also separates its BF16 and FP8 projection/router
+TP worklets. Keep `Option<Op<_>>` only for a genuine topology/runtime boundary
+(for example, no TP all-reduce at `tp_size == 1`), not as a recipe selector.
+
 The `Labeled` wrapper is render-only: it tags the composite subtree (e.g.
 `"m.attn (AttnBlockTpWorklet) [tp=4; ...]"`) for the per-worker `CostManifest`
 so an analyzer can find a worklet's subtree structurally, and it is dropped from

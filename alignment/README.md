@@ -75,6 +75,8 @@ server:
   model_path: meta-llama/Meta-Llama-3-8B
   tp_size: 1
 nsys:
+  # Or export NSYS_BIN with the exact executable path before launching.
+  executable: /path/to/nsys
   capture_mode: cuda_profiler_api
 workload:
   frontend:
@@ -85,13 +87,63 @@ workload:
   max_concurrency: 64
 ```
 
-It writes the replay log, server log, NSYS report/SQLite, `parsed.json`, the
-folded label-ready `kernel_sequences.json`, engine-core per-request TTFT/TPOT in
-`vllm/<name>_request_timings.jsonl`, and `profile_result.json` beneath
-`profile/`. `profile_result.replay_result` identifies the TraceLab per-request
-JSONL used later for client-observed E2E comparison, while
-`profile_result.request_timings_jsonl` identifies the vLLM engine-core timing
-records. It has no timing-predict or analysis fields.
+For MoE alignment, profiling may use three explicit passes with identical model,
+topology, backend, and workload settings:
+
+- `profile_kind: expert_popularity` runs vLLM without NSYS, enables EPLB load
+  accounting, and writes `expert_popularity.json` containing aggregated logical
+  expert counts/probabilities by layer. Its synchronization and D2H logging
+  overhead is intentionally excluded from timing evidence.
+- `profile_kind: nsys` (default) is the ordinary timing/segment capture consumed
+  by timing-predict and alignment analysis. It must disable popularity logging.
+- `profile_kind: workload_metrics` runs the instrumented vLLM server without
+  NSYS or popularity logging. It records the complete structured scheduler
+  timeline and per-request timing without profiler capture/flush pauses. Use
+  this pass for full-run batch composition and observed iteration-time analysis;
+  keep the bounded NSYS pass as kernel/segment evidence.
+
+`server.dp_size` is explicit. The visible device population is
+`server.tp_size * server.dp_size`; with expert parallel enabled, the EP group is
+formed by vLLM from those parallel ranks. Do not hide DP in `extra_args` because
+the device/rank population is part of artifact provenance.
+
+The NSYS pass writes the replay log, server log, NSYS report/SQLite,
+`parsed.json`, the folded label-ready `kernel_sequences.json`, the full-run
+structured scheduler timeline in `vllm/<name>_metrics.jsonl`, engine-core
+per-request TTFT/TPOT in `vllm/<name>_request_timings.jsonl`, and
+`profile_result.json` beneath `profile/`. `profile_result.replay_result`
+identifies the TraceLab per-request JSONL used later for client-observed E2E
+comparison, while `profile_result.request_timings_jsonl` identifies the vLLM
+engine-core timing records. The expert-popularity pass writes its replay/server
+logs, raw expert-load JSONL, aggregated `expert_popularity.json`, and its own
+`profile_result.json`; it deliberately emits no request-timing artifact because
+the shared profiling instrumentation is disabled for that pass. Neither pass
+has timing-predict or analysis fields.
+
+### Expert-popularity artifact contract
+
+New captures write schema v2, formally described by
+[`alignment/schema/expert_popularity_v2.schema.json`](schema/expert_popularity_v2.schema.json).
+The authoritative tensor is `counts_by_layer[layer][logical_expert]`; each value
+is a nonnegative count of routed token-expert assignments, so one input token
+normally contributes `experts_per_token` assignments per MoE layer. Derived
+probability and all-layer vectors must agree with that tensor.
+
+The artifact also pins `num_moe_layers`, `num_logical_experts`,
+`expert_parallel_size`, `experts_per_rank`, `experts_per_token`, and the captured
+EPLB-step range. `expert_partitioning.kind = contiguous_logical_expert_ids` with
+`layout = rank_major` names the simulator projection explicitly: logical expert
+ids `[rank * experts_per_rank, (rank + 1) * experts_per_rank)` form one EP-rank
+shard before rank/expert identities are canonicalized. It is a modeling
+partition, not a claim about a potentially rearranged physical EPLB placement.
+
+The Rust consumer treats v2 as a closed contract and rejects unknown fields or
+cross-field inconsistencies. Schema v1 remains read-only compatibility for
+existing run directories; the profiler no longer generates it.
+The instrumented vLLM raw record is also version 2 and supplies
+`expert_parallel_size` and `experts_per_token` from the running EPLB state;
+the summary extractor verifies that these values remain constant across the
+capture rather than inferring them from a local checkpoint path.
 
 ### `timing_predict.yaml`
 
@@ -149,10 +201,13 @@ cp profile/kernel_sequences.json kernel_sequences_labeled.json
 Every occurrence must carry either `{"label": {"status": "unmapped"}}` or a
 complete mapped label with `operation`, `type`, `role`, and a non-empty
 `simulated_slots` list. One measured operation may own multiple simulated leaf
-slots; the analyzer counts its measured kernels once and sums the selected
-folded leaf workloads. This is an operation-workload comparison, not an
-overlap-aware wall-clock sum when the slots sit under `Max` branches. Conversely
-one simulated slot may be owned by several operations (a fused aggregate boundary
+slots. The analyzer counts its measured kernels once and attributes selected
+simulated leaves through the exact CostTree: `Sum` forwards every child,
+`Scale` multiplies its child, and `Max` forwards only its critical child (an
+exact tie deterministically selects the first child). Therefore per-operation
+and per-kernel simulated segments add up to `total_time_ms`; raw folded leaf
+workload remains a separate mapping-coverage audit field. Conversely one
+simulated slot may be owned by several operations (a fused aggregate boundary
 and an unfused split boundary sharing one `tp_allreduce` slot); the analyzer
 resolves the per-iteration owner from the operations present. One *operation*
 still keeps a single consistent `type`/`role`/`simulated_slots`.
@@ -188,8 +243,8 @@ iteration:
 # analyze_e2e.yaml — e2e-align; consumes the completed sim
 schema_version: 1
 simulation_log_dir: ./simulation
-profile_log_dir: ./profile
-timing_predict_log_dir: ./timing_predict
+profile_log_dir: ./profile_nsys
+workload_profile_log_dir: ./profile_workload_metrics
 log_dir: ./analysis_e2e
 workload:
   enabled: true
@@ -202,14 +257,25 @@ One analyze config is exactly one phase: enable `iteration` (kernel-align) or
 `workload`/`e2e` (e2e-align), never both — the two write distinct typed manifests
 and mixing them is rejected. Every subject defaults to disabled, so a phase is
 opted into by naming only its block; `simulation_log_dir` is required only for
-the e2e-align phase. Workload
+the e2e-align phase. `profile_log_dir` supplies the bounded NSYS kernel/GPU
+anchor. `workload_profile_log_dir` optionally supplies a separate
+`profile_kind: workload_metrics` run for full scheduler and request timelines;
+it defaults to `profile_log_dir` for older captures. E2E analysis does not
+consume timing-predict output. Workload
 analysis plots each side against its recorded iteration ids and emits fine-grained
 prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle
 series. It also plots decode batch size against each side's independently
-normalized elapsed time. vLLM cycle time is first-kernel to next-first-kernel;
-simulation cycle time is one actual `wall_start_ms` to the next, so it already
-includes the worker's `gpu_time_multiplier`, tick quantization, and scheduler
-gaps. Scheduled KV
+normalized elapsed time. The workload subject reads the complete structured
+metrics stream, not the bounded NSYS intersection. It selects the unique
+contiguous iteration-id segment containing the NSYS window, which excludes
+prefix-cache preflight steps without guessing a numeric cutoff. Schema-v2 vLLM
+records carry monotonic observation start/end timestamps: adjacent starts define
+the full EngineCore cadence, while start-to-end retains the historical observed
+result-wait/sampling duration. Simulation cycle time is one actual
+`wall_start_ms` to the next, so it already includes the worker's
+`gpu_time_multiplier`, tick quantization, and scheduler gaps. The kernel-align
+GPU cycle remains the separate NSYS first-kernel-to-next-first-kernel quantity.
+Scheduled KV
 workload is `sum(decode_kv_lens) + sum(prefill_prefix_len +
 prefill_append_len)`. It is deliberately not resident KV-pool occupancy. A
 labeled folded inventory is required only when iteration analysis is enabled.

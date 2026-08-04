@@ -178,8 +178,9 @@ Everything flows through `perf_api`. There are exactly two internal paths.
 3. Ask the `GpuPool` (default `LocalGpuPool`) for chunks; round-robin specs onto
    them; run chunks (threads coordinate the blocking subprocesses).
 4. `LocalGpuChunk.run` writes the chunk payload to a temp JSON, sets
-   `CUDA_VISIBLE_DEVICES`, and spawns `python -m profiling.exec.local_worker` in
-   the spec's `ProfileEnv`. The worker lazy-loads the registered runner via
+   `CUDA_VISIBLE_DEVICES`, applies the selected `ProfileEnv`'s ordered Python
+   and shared-library paths, and spawns `python -m profiling.exec.local_worker`
+   in that environment. The worker lazy-loads the registered runner via
    `RunnerRef`, executes each spec, and writes JSON results back.
 5. Require every successful worker result to report its observed physical GPU,
    validate all observations against the requested cache key, then persist the

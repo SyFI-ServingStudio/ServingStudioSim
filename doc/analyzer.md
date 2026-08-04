@@ -88,7 +88,7 @@ categories:
 | `kv` | a KV pool over time | `kv_snapshot` + `run_meta` capacity |
 | `alignment-iteration` | one measured iteration joined to one predict case | normalized NSYS + predict `cost_log`/manifest + mapping |
 | `alignment-e2e` | one measured/simulated latency distribution | TraceLab replay JSONL + optional vLLM EngineCore request-timing JSONL + sim `request_slo` |
-| `alignment-workload` | one scheduler iteration by recorded iteration id | normalized NSYS iteration metrics + sim `cost_log` |
+| `alignment-workload` | one scheduler iteration by recorded iteration id | full-run vLLM structured iteration metrics (NSYS window anchors the replay segment) + sim `cost_log` |
 
 For a symmetric tensor-parallel alignment, one measured iteration contains one
 range set per rank. The analyzer reduces each measured occurrence across its
@@ -121,6 +121,13 @@ kernel sequence is identical across all participating devices.
 
 The alignment trio is separate not by deployment but by **source scope** (see
 below): it reads an alignment manifest instead of a plain run directory.
+
+The simulated side of `alignment-iteration` uses the same CostTree semantics as
+the headline prediction. `Sum` forwards attribution to every child, `Scale`
+multiplies its child, and `Max` forwards only the critical child; an exact tie
+deterministically selects the first child. Per-kernel and per-operation
+simulated contributions therefore sum to `total_time_ms`, not to the raw sum of
+every parallel leaf. The latter remains only as a mapping-coverage audit value.
 
 ## Applicability, scope, and intent
 
