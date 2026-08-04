@@ -99,6 +99,7 @@ const SPARSE_ATTN_BACKENDS: &[&str] = &["vllm_flashmla_bf16"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const P2P_BACKENDS: &[&str] = &["nccl"];
 const FP8_GROUPED_GEMM_BACKENDS: &[&str] = &["deepgemm"];
+const FP8_PRODUCTION_GROUPED_GEMM_BACKENDS: &[&str] = &["flashinfer_trtllm"];
 const FP8_P2P_BACKENDS: &[&str] = &["nvshmem"];
 
 // Leaf counts are properties of the accepted L2/L3 sections. `build` verifies
@@ -654,12 +655,15 @@ pub fn build_configs(
             moe_intermediate: model.moe_intermediate_dim.clone(),
             num_experts: model.num_experts.clone(),
             ep_size: parallel.ep_size,
+            top_k: model.router_top_k,
             dtype: expert_dtype,
             activation_dtype: DType::Bf16,
             gpu_name: gpu.clone(),
             act_backends: ELEMENTWISE_BACKENDS.to_vec(),
             fp8_quant_backends: FP8_QUANT_BACKENDS.to_vec(),
             grouped_gemm_backends: expert_backends.to_vec(),
+            fp8_grouped_gemm_backends: FP8_PRODUCTION_GROUPED_GEMM_BACKENDS.to_vec(),
+            use_fp8_blockscale_grouped_gemm: true,
             local_ppm,
         },
         moe_combine: moe_net,
@@ -1855,6 +1859,10 @@ mod tests {
         assert_eq!(cfg.moe_expert_compute.dtype, DType::Fp8E4m3);
         assert_eq!(cfg.moe_expert_compute.activation_dtype, DType::Bf16);
         assert_eq!(cfg.moe_expert_compute.grouped_gemm_backends, vec!["deepgemm"]);
+        assert_eq!(
+            cfg.moe_expert_compute.fp8_grouped_gemm_backends,
+            vec!["flashinfer_trtllm"]
+        );
         assert_eq!(cfg.moe_dispatch.backends, vec!["nvshmem"]);
         assert_eq!(cfg.moe_combine.backends, vec!["nvshmem"]);
         assert_eq!(cfg.moe_dispatch.dtype, DType::Fp8E4m3);
