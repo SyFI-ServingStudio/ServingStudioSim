@@ -88,6 +88,26 @@ class KernelArgs:
 
 
 @dataclass(frozen=True)
+class Fp8BlockscaleGroupedGemmArgs(KernelArgs):
+    """Exact TRT-LLM GroupedWithOffset gate-up GEMM cache identity.
+
+    ``num_input_tokens`` and ``experts_per_token`` are recipe/capacity axes in
+    addition to the final EP-local distribution.  They must not be collapsed
+    into ``sum(per_group_batches)`` because TensorRT-LLM selects the DeepGEMM
+    recipe from the global input-token count and allocates for the routed
+    ``num_input_tokens * experts_per_token`` capacity.
+    """
+
+    n: int
+    k: int
+    dtype: DType
+    num_local_experts: int
+    num_input_tokens: int
+    experts_per_token: int
+    per_group_batches: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class KvCacheAppendArgs(KernelArgs):
     num_kv_heads: int
     head_dim: int
