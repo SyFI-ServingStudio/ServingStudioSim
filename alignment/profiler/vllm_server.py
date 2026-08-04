@@ -37,6 +37,7 @@ HEALTH_ENDPOINTS = ("/health", "/v1/models")
 # its wording is vLLM UI, while this JSON is the versioned analyzer contract.
 _ALIGNMENT_ITERATION_RE = re.compile(r"VibeSimAlignmentIteration\s+(\{.*\})\s*$")
 _ALIGNMENT_REQUEST_TIMING_RE = re.compile(r"VibeSimAlignmentRequestTiming\s+(\{.*\})\s*$")
+_ALIGNMENT_EXPERT_LOAD_RE = re.compile(r"VibeSimAlignmentExpertLoad\s+(\{.*\})\s*$")
 _COMPLETION_ENGINE_REQUEST_RE = re.compile(r"^cmpl-(.+)-0$")
 
 
@@ -76,6 +77,163 @@ def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
         argv += ["--served-model-name", cfg.served_model_name]
     argv += cfg.extra_args
     return argv
+
+
+def extract_expert_popularity(
+    server_log: Path,
+    out_jsonl: Path,
+    out_json: Path,
+    *,
+    expert_parallel_size: int | None = None,
+    experts_per_token: int | None = None,
+) -> int:
+    """Extract and aggregate rank-synchronized logical-expert token counts.
+
+    The vLLM fork emits one record per model step only when EPLB balancedness
+    logging is explicitly enabled.  Counts are already reduced across the EP
+    group and mapped from physical replicas back to logical expert ids.
+    """
+    if expert_parallel_size is not None and expert_parallel_size <= 0:
+        raise ValueError("expert_parallel_size must be positive")
+    if experts_per_token is not None and experts_per_token <= 0:
+        raise ValueError("experts_per_token must be positive")
+
+    records: list[dict] = []
+    expected_shape: tuple[int, int] | None = None
+    expected_model: str | None = None
+    aggregate_counts: list[list[int]] | None = None
+    with Path(out_jsonl).open("w") as output_file:
+        for line in Path(server_log).read_text(errors="replace").splitlines():
+            match = _ALIGNMENT_EXPERT_LOAD_RE.search(line)
+            if match is None:
+                continue
+            record = json.loads(match.group(1))
+            required = {
+                "schema_version",
+                "model",
+                "eplb_step",
+                "logical_expert_counts",
+            }
+            missing = required - set(record)
+            if missing:
+                raise ValueError(f"alignment expert-load record missing {sorted(missing)}")
+            if record["schema_version"] not in {1, 2}:
+                raise ValueError(
+                    f"unsupported alignment expert-load schema {record['schema_version']!r}"
+                )
+            if record["schema_version"] == 2:
+                for field_name in ("expert_parallel_size", "experts_per_token"):
+                    value = record.get(field_name)
+                    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                        raise ValueError(
+                            f"alignment expert-load {field_name} must be a positive integer"
+                        )
+                record_ep_size = record["expert_parallel_size"]
+                record_top_k = record["experts_per_token"]
+                if expert_parallel_size is None:
+                    expert_parallel_size = record_ep_size
+                elif record_ep_size != expert_parallel_size:
+                    raise ValueError(
+                        "expert-load expert_parallel_size changed from "
+                        f"{expert_parallel_size} to {record_ep_size}"
+                    )
+                if experts_per_token is None:
+                    experts_per_token = record_top_k
+                elif record_top_k != experts_per_token:
+                    raise ValueError(
+                        "expert-load experts_per_token changed from "
+                        f"{experts_per_token} to {record_top_k}"
+                    )
+            model = record["model"]
+            if not isinstance(model, str) or not model:
+                raise ValueError("alignment expert-load model must be a non-empty string")
+            if expected_model is None:
+                expected_model = model
+            elif model != expected_model:
+                raise ValueError(f"expert-load model changed from {expected_model!r} to {model!r}")
+            eplb_step = record["eplb_step"]
+            if isinstance(eplb_step, bool) or not isinstance(eplb_step, int) or eplb_step < 0:
+                raise ValueError("alignment expert-load eplb_step must be a nonnegative integer")
+            counts = record["logical_expert_counts"]
+            if (
+                not isinstance(counts, list)
+                or not counts
+                or not all(
+                    isinstance(layer_counts, list) and layer_counts for layer_counts in counts
+                )
+            ):
+                raise ValueError("logical_expert_counts must be a non-empty 2D array")
+            shape = (len(counts), len(counts[0]))
+            if any(len(layer_counts) != shape[1] for layer_counts in counts):
+                raise ValueError("logical_expert_counts must be rectangular")
+            if expected_shape is None:
+                expected_shape = shape
+                aggregate_counts = [[0] * shape[1] for _ in range(shape[0])]
+            elif shape != expected_shape:
+                raise ValueError(f"expert-load shape changed from {expected_shape} to {shape}")
+            assert aggregate_counts is not None
+            for layer_index, layer_counts in enumerate(counts):
+                for expert_index, count in enumerate(layer_counts):
+                    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                        raise ValueError("expert-load counts must be nonnegative integers")
+                    aggregate_counts[layer_index][expert_index] += count
+            output_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+            records.append(record)
+
+    if not records or expected_shape is None or aggregate_counts is None:
+        raise ValueError("no VibeSimAlignmentExpertLoad records found in server log")
+    if expert_parallel_size is None or experts_per_token is None:
+        raise ValueError(
+            "schema-v1 expert-load records require explicit expert_parallel_size "
+            "and experts_per_token fallbacks"
+        )
+    if expected_shape[1] % expert_parallel_size != 0:
+        raise ValueError(
+            f"num_logical_experts {expected_shape[1]} must be divisible by "
+            f"expert_parallel_size {expert_parallel_size}"
+        )
+    if experts_per_token > expected_shape[1]:
+        raise ValueError(
+            f"experts_per_token {experts_per_token} exceeds num_logical_experts {expected_shape[1]}"
+        )
+
+    def normalize(counts: list[int]) -> list[float]:
+        total = sum(counts)
+        return [count / total for count in counts] if total else [0.0] * len(counts)
+
+    all_layer_counts = [
+        sum(layer[expert] for layer in aggregate_counts) for expert in range(expected_shape[1])
+    ]
+    summary = {
+        "schema_version": 2,
+        "model": expected_model,
+        "num_moe_layers": expected_shape[0],
+        "num_logical_experts": expected_shape[1],
+        "expert_parallel_size": expert_parallel_size,
+        "experts_per_rank": expected_shape[1] // expert_parallel_size,
+        "experts_per_token": experts_per_token,
+        "count_semantics": "logical_routed_token_assignments",
+        "aggregation": {
+            "scope": "all_captured_eplb_steps",
+            "observed_eplb_step_min": min(record["eplb_step"] for record in records),
+            "observed_eplb_step_max": max(record["eplb_step"] for record in records),
+            "record_count": len(records),
+        },
+        # The current simulator projects logical expert ids onto contiguous EP
+        # rank shards before removing rank/expert identity. Name that modeling
+        # assumption explicitly; this is not claimed to be an observed EPLB
+        # physical placement map.
+        "expert_partitioning": {
+            "kind": "contiguous_logical_expert_ids",
+            "layout": "rank_major",
+        },
+        "counts_by_layer": aggregate_counts,
+        "probabilities_by_layer": [normalize(layer) for layer in aggregate_counts],
+        "counts_all_layers": all_layer_counts,
+        "probabilities_all_layers": normalize(all_layer_counts),
+    }
+    Path(out_json).write_text(json.dumps(summary, indent=2))
+    return len(records)
 
 
 def build_server_env(fork_python: str, cuda_visible_devices: str) -> dict[str, str]:

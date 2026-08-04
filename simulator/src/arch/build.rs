@@ -10,9 +10,11 @@
 //! caller supplies `name` — the model's dotted-leaf prefix (`"unified"` / `"pd"`)
 //! — so each deployment's cost manifests read naturally.
 
+use std::fs::File;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 use crate::arch::model_cfg::ModelCfg;
@@ -52,11 +54,10 @@ pub fn moe_model_cfg(model_spec: &ModelSpec) -> Result<MoeModelCfg> {
     Ok(cfg.with_fp8(model_spec.fp8))
 }
 
-/// Resolve the MoE routing distribution the L2 MoE op samples against from the
-/// selector's [`RoutingKind`]: `uniform` spreads load evenly over `num_experts`;
-/// `random` draws a `seed`-seeded deterministic skew (0 when unset). Infallible —
-/// both kinds are valid for any `num_experts`. The model layer's `power_law` /
-/// explicit `from_profile` are not yet wired to config.
+/// Resolve the synthetic MoE routing distribution the L2 MoE op samples against
+/// from the selector's [`RoutingKind`]: `uniform` spreads load evenly over
+/// `num_experts`; `random` draws a `seed`-seeded deterministic skew (0 when
+/// unset). Profile-backed Qwen builds use [`resolve_routing_source`] below.
 pub fn resolve_routing(
     kind: RoutingKind,
     seed: Option<u64>,
@@ -66,6 +67,407 @@ pub fn resolve_routing(
         RoutingKind::Uniform => RoutingDistribution::uniform(num_experts),
         RoutingKind::Random => RoutingDistribution::random(num_experts, seed.unwrap_or(0)),
     }
+}
+
+/// Legacy schema-v1 subset. Keep this permissive reader only so existing
+/// alignment artifacts remain usable; every newly generated profile is v2.
+#[derive(Debug, Deserialize)]
+struct ExpertPopularityProfileV1 {
+    #[serde(rename = "schema_version")]
+    _schema_version: u32,
+    num_logical_experts: u32,
+    #[serde(default)]
+    counts_by_layer: Vec<Vec<u64>>,
+    #[serde(default)]
+    probabilities_all_layers: Vec<f64>,
+    #[serde(default)]
+    counts_all_layers: Vec<u64>,
+}
+
+/// Schema v2 is deliberately closed: producer and consumer must change the
+/// version when adding or reinterpreting fields. Cross-field dimensions are
+/// validated after serde because JSON Schema cannot express them all.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpertPopularityProfileV2 {
+    schema_version: u32,
+    model: String,
+    num_moe_layers: u32,
+    num_logical_experts: u32,
+    expert_parallel_size: u16,
+    experts_per_rank: u32,
+    experts_per_token: u32,
+    count_semantics: String,
+    aggregation: ExpertPopularityAggregationV2,
+    expert_partitioning: ExpertPopularityPartitioningV2,
+    counts_by_layer: Vec<Vec<u64>>,
+    probabilities_by_layer: Vec<Vec<f64>>,
+    counts_all_layers: Vec<u64>,
+    probabilities_all_layers: Vec<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpertPopularityAggregationV2 {
+    scope: String,
+    observed_eplb_step_min: u64,
+    observed_eplb_step_max: u64,
+    record_count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpertPopularityPartitioningV2 {
+    kind: String,
+    layout: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpertPopularityVersion {
+    schema_version: u32,
+}
+
+/// Canonicalize layerwise EP load before the L4 `Scale{num_layers}` fold.
+///
+/// Expert ids and EP rank ids are irrelevant to local expert-compute cost. For
+/// every layer, sort experts within each physical rank by descending load, then
+/// sort ranks by descending total load. Adding equal canonical slots across
+/// layers makes canonical rank 0 carry `sum(layer-wise max rank)` instead of the
+/// biased `max(rank-wise sum over layers)`. Ties use the sorted expert vector,
+/// keeping the transformation deterministic without restoring physical ids.
+fn canonicalize_layerwise_expert_counts(
+    counts_by_layer: &[Vec<u64>],
+    expected_num_experts: u32,
+    ep_size: u16,
+    path: &str,
+) -> Result<Vec<f32>> {
+    anyhow::ensure!(ep_size > 0, "ep_size must be non-zero");
+    anyhow::ensure!(
+        expected_num_experts % u32::from(ep_size) == 0,
+        "expert popularity profile {} cannot partition {} experts across ep_size {}",
+        path,
+        expected_num_experts,
+        ep_size
+    );
+    let experts_per_rank = expected_num_experts as usize / usize::from(ep_size);
+    let mut canonical_counts = vec![0u64; expected_num_experts as usize];
+
+    for (layer_index, layer_counts) in counts_by_layer.iter().enumerate() {
+        anyhow::ensure!(
+            layer_counts.len() == expected_num_experts as usize,
+            "expert popularity profile {} layer {} has {} experts, expected {}",
+            path,
+            layer_index,
+            layer_counts.len(),
+            expected_num_experts
+        );
+        let mut rank_counts = layer_counts
+            .chunks_exact(experts_per_rank)
+            .map(|physical_rank_counts| {
+                let mut sorted_expert_counts = physical_rank_counts.to_vec();
+                sorted_expert_counts.sort_unstable_by(|left, right| right.cmp(left));
+                let rank_total = sorted_expert_counts.iter().try_fold(0u64, |total, count| {
+                    total.checked_add(*count).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "expert popularity profile {} layer {} rank count overflow",
+                            path,
+                            layer_index
+                        )
+                    })
+                })?;
+                Ok((rank_total, sorted_expert_counts))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        rank_counts.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1))
+        });
+
+        for (canonical_rank, (_, sorted_expert_counts)) in rank_counts.iter().enumerate() {
+            let canonical_start = canonical_rank * experts_per_rank;
+            for (expert_slot, count) in sorted_expert_counts.iter().enumerate() {
+                let canonical_slot = canonical_start + expert_slot;
+                canonical_counts[canonical_slot] = canonical_counts[canonical_slot]
+                    .checked_add(*count)
+                    .with_context(|| {
+                        format!(
+                            "expert popularity profile {path} canonical count overflow at slot {canonical_slot}"
+                        )
+                    })?;
+            }
+        }
+    }
+
+    Ok(canonical_counts
+        .into_iter()
+        .map(|count| count as f32)
+        .collect())
+}
+
+fn load_expert_popularity(
+    path: &str,
+    expected_num_experts: u32,
+    ep_size: u16,
+    expected_num_moe_layers: u32,
+    expected_experts_per_token: u32,
+) -> Result<RoutingDistribution> {
+    let profile_file =
+        File::open(path).with_context(|| format!("opening expert popularity profile {path}"))?;
+    let profile_value: serde_json::Value = serde_json::from_reader(profile_file)
+        .with_context(|| format!("parsing expert popularity profile {path}"))?;
+    let version: ExpertPopularityVersion = serde_json::from_value(profile_value.clone())
+        .with_context(|| format!("reading expert popularity schema_version from {path}"))?;
+
+    let (num_logical_experts, counts_by_layer, legacy_ratios) = match version.schema_version {
+        1 => {
+            let profile: ExpertPopularityProfileV1 = serde_json::from_value(profile_value)
+                .with_context(|| format!("parsing legacy expert popularity v1 profile {path}"))?;
+            let ratios = if profile.counts_by_layer.is_empty()
+                && profile.probabilities_all_layers.len() == expected_num_experts as usize
+            {
+                Some(
+                    profile
+                        .probabilities_all_layers
+                        .into_iter()
+                        .map(|ratio| {
+                            anyhow::ensure!(
+                                ratio.is_finite() && ratio >= 0.0,
+                                "expert popularity profile {} contains invalid probability {}",
+                                path,
+                                ratio
+                            );
+                            Ok(ratio as f32)
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            } else if profile.counts_by_layer.is_empty()
+                && profile.counts_all_layers.len() == expected_num_experts as usize
+            {
+                Some(
+                    profile
+                        .counts_all_layers
+                        .into_iter()
+                        .map(|count| count as f32)
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            (profile.num_logical_experts, profile.counts_by_layer, ratios)
+        }
+        2 => {
+            let profile: ExpertPopularityProfileV2 = serde_json::from_value(profile_value)
+                .with_context(|| format!("parsing strict expert popularity v2 profile {path}"))?;
+            validate_expert_popularity_v2(
+                &profile,
+                expected_num_experts,
+                ep_size,
+                expected_num_moe_layers,
+                expected_experts_per_token,
+                path,
+            )?;
+            (profile.num_logical_experts, profile.counts_by_layer, None)
+        }
+        other => bail!(
+            "unsupported expert popularity schema_version {} in {} (supported: 1 legacy, 2)",
+            other,
+            path
+        ),
+    };
+    anyhow::ensure!(
+        num_logical_experts == expected_num_experts,
+        "expert popularity profile {} has {} experts, model requires {}",
+        path,
+        num_logical_experts,
+        expected_num_experts
+    );
+
+    let ratios: Vec<f32> = if !counts_by_layer.is_empty() {
+        canonicalize_layerwise_expert_counts(&counts_by_layer, expected_num_experts, ep_size, path)?
+    } else if let Some(ratios) = legacy_ratios {
+        ratios
+    } else {
+        bail!(
+            "legacy expert popularity profile {} must contain counts_by_layer or {} probabilities_all_layers/counts_all_layers entries",
+            path,
+            expected_num_experts
+        );
+    };
+    anyhow::ensure!(
+        ratios.iter().any(|ratio| *ratio > 0.0),
+        "expert popularity profile {} has zero total routing mass",
+        path
+    );
+    Ok(RoutingDistribution::from_profile(&ratios))
+}
+
+fn validate_expert_popularity_v2(
+    profile: &ExpertPopularityProfileV2,
+    expected_num_experts: u32,
+    expected_ep_size: u16,
+    expected_num_moe_layers: u32,
+    expected_experts_per_token: u32,
+    path: &str,
+) -> Result<()> {
+    anyhow::ensure!(profile.schema_version == 2, "internal v2 version mismatch");
+    anyhow::ensure!(
+        !profile.model.is_empty(),
+        "expert popularity profile {path} has empty model"
+    );
+    anyhow::ensure!(
+        profile.num_logical_experts == expected_num_experts,
+        "expert popularity profile {path} has {} experts, model requires {expected_num_experts}",
+        profile.num_logical_experts
+    );
+    anyhow::ensure!(
+        profile.num_moe_layers == expected_num_moe_layers,
+        "expert popularity profile {path} has {} MoE layers, model requires {expected_num_moe_layers}",
+        profile.num_moe_layers
+    );
+    anyhow::ensure!(
+        profile.expert_parallel_size == expected_ep_size,
+        "expert popularity profile {path} has ep_size {}, run requires {expected_ep_size}",
+        profile.expert_parallel_size
+    );
+    anyhow::ensure!(
+        profile.experts_per_rank * u32::from(profile.expert_parallel_size)
+            == profile.num_logical_experts,
+        "expert popularity profile {path} has inconsistent experts_per_rank"
+    );
+    anyhow::ensure!(
+        profile.experts_per_token == expected_experts_per_token,
+        "expert popularity profile {path} has top_k {}, model requires {expected_experts_per_token}",
+        profile.experts_per_token
+    );
+    anyhow::ensure!(
+        profile.count_semantics == "logical_routed_token_assignments",
+        "expert popularity profile {path} has unsupported count_semantics {:?}",
+        profile.count_semantics
+    );
+    anyhow::ensure!(
+        profile.aggregation.scope == "all_captured_eplb_steps"
+            && profile.aggregation.record_count > 0
+            && profile.aggregation.observed_eplb_step_min
+                <= profile.aggregation.observed_eplb_step_max,
+        "expert popularity profile {path} has invalid aggregation metadata"
+    );
+    anyhow::ensure!(
+        profile.expert_partitioning.kind == "contiguous_logical_expert_ids"
+            && profile.expert_partitioning.layout == "rank_major",
+        "expert popularity profile {path} has unsupported expert_partitioning"
+    );
+    anyhow::ensure!(
+        profile.counts_by_layer.len() == expected_num_moe_layers as usize,
+        "expert popularity profile {path} counts_by_layer has {} layers, expected {expected_num_moe_layers}",
+        profile.counts_by_layer.len()
+    );
+    anyhow::ensure!(
+        profile.probabilities_by_layer.len() == profile.counts_by_layer.len(),
+        "expert popularity profile {path} probabilities_by_layer layer count mismatch"
+    );
+    anyhow::ensure!(
+        profile.counts_all_layers.len() == expected_num_experts as usize
+            && profile.probabilities_all_layers.len() == expected_num_experts as usize,
+        "expert popularity profile {path} all-layer vector width mismatch"
+    );
+    let mut derived_all_layer_counts = vec![0u64; expected_num_experts as usize];
+    for (layer_index, (counts, probabilities)) in profile
+        .counts_by_layer
+        .iter()
+        .zip(&profile.probabilities_by_layer)
+        .enumerate()
+    {
+        anyhow::ensure!(
+            counts.len() == expected_num_experts as usize
+                && probabilities.len() == expected_num_experts as usize,
+            "expert popularity profile {path} layer {layer_index} width mismatch"
+        );
+        anyhow::ensure!(
+            probabilities
+                .iter()
+                .all(|value| value.is_finite() && *value >= 0.0),
+            "expert popularity profile {path} layer {layer_index} has invalid probability"
+        );
+        ensure_normalized_probabilities(
+            counts,
+            probabilities,
+            path,
+            &format!("layer {layer_index}"),
+        )?;
+        for (expert_index, count) in counts.iter().enumerate() {
+            derived_all_layer_counts[expert_index] = derived_all_layer_counts[expert_index]
+                .checked_add(*count)
+                .with_context(|| {
+                    format!(
+                        "expert popularity profile {path} all-layer count overflow at expert {expert_index}"
+                    )
+                })?;
+        }
+    }
+    anyhow::ensure!(
+        profile.counts_all_layers == derived_all_layer_counts,
+        "expert popularity profile {path} counts_all_layers is not the sum of counts_by_layer"
+    );
+    ensure_normalized_probabilities(
+        &profile.counts_all_layers,
+        &profile.probabilities_all_layers,
+        path,
+        "all layers",
+    )?;
+    Ok(())
+}
+
+fn ensure_normalized_probabilities(
+    counts: &[u64],
+    probabilities: &[f64],
+    path: &str,
+    scope: &str,
+) -> Result<()> {
+    let total = counts.iter().try_fold(0u64, |sum, count| {
+        sum.checked_add(*count).ok_or_else(|| {
+            anyhow::anyhow!("expert popularity profile {path} {scope} count overflow")
+        })
+    })?;
+    for (expert_index, (count, probability)) in counts.iter().zip(probabilities).enumerate() {
+        let expected = if total == 0 {
+            0.0
+        } else {
+            *count as f64 / total as f64
+        };
+        anyhow::ensure!(
+            probability.is_finite() && (*probability - expected).abs() <= 1e-9,
+            "expert popularity profile {path} {scope} probability {expert_index} is {probability}, expected {expected}"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the Qwen routing source. An explicit popularity profile is a
+/// complete routing snapshot, so combining it with the synthetic `random`
+/// selector is rejected instead of silently choosing one policy.
+pub fn resolve_routing_source(
+    kind: RoutingKind,
+    seed: Option<u64>,
+    num_experts: u32,
+    ep_size: u16,
+    num_moe_layers: u32,
+    experts_per_token: u32,
+    expert_popularity_file: Option<&str>,
+) -> Result<RoutingDistribution> {
+    if let Some(path) = expert_popularity_file {
+        anyhow::ensure!(
+            kind == RoutingKind::Uniform,
+            "expert_popularity_file cannot be combined with routing={:?}; omit the profile or use routing=uniform",
+            kind
+        );
+        return load_expert_popularity(
+            path,
+            num_experts,
+            ep_size,
+            num_moe_layers,
+            experts_per_token,
+        );
+    }
+    Ok(resolve_routing(kind, seed, num_experts))
 }
 
 /// Build the dense (single-GPU) Llama3 model.
@@ -326,7 +728,134 @@ pub fn build_ffn_model(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
+
+    #[test]
+    fn expert_popularity_profile_replaces_uniform_routing_and_preserves_ppm_sum() {
+        let mut profile_file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            profile_file,
+            r#"{{
+                "schema_version": 1,
+                "num_logical_experts": 4,
+                "probabilities_all_layers": [0.7, 0.2, 0.09, 0.01],
+                "counts_all_layers": [70, 20, 9, 1]
+            }}"#
+        )
+        .unwrap();
+        let profile_path = profile_file.path().to_str().unwrap();
+        let routing =
+            resolve_routing_source(RoutingKind::Uniform, None, 4, 2, 2, 2, Some(profile_path))
+                .unwrap();
+        assert_eq!(routing.num_experts(), 4);
+        assert_eq!(
+            routing.ppm().iter().sum::<u32>(),
+            RoutingDistribution::TOTAL_PPM
+        );
+        assert!(routing.ppm()[0] > routing.ppm()[1]);
+        assert!(resolve_routing_source(
+            RoutingKind::Random,
+            Some(7),
+            4,
+            2,
+            2,
+            2,
+            Some(profile_path),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn layerwise_expert_popularity_sorts_ep_ranks_and_experts_before_adding() {
+        let mut profile_file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            profile_file,
+            r#"{{
+                "schema_version": 1,
+                "num_logical_experts": 4,
+                "counts_by_layer": [
+                    [9, 2, 5, 5],
+                    [2, 2, 0, 8]
+                ],
+                "counts_all_layers": [11, 4, 5, 13]
+            }}"#
+        )
+        .unwrap();
+
+        let routing = resolve_routing_source(
+            RoutingKind::Uniform,
+            None,
+            4,
+            2,
+            2,
+            2,
+            profile_file.path().to_str(),
+        )
+        .unwrap();
+
+        // Layer 0 canonicalizes to [[9, 2], [5, 5]], layer 1 to
+        // [[8, 0], [2, 2]], and equal slots add to [17, 2, 7, 7]. The first
+        // canonical rank therefore carries sum(layer-wise max rank) = 19.
+        assert_eq!(routing.ppm(), &[515_152, 60_606, 212_121, 212_121]);
+        assert_eq!(routing.ppm()[..2].iter().sum::<u32>(), 575_758);
+    }
+
+    #[test]
+    fn expert_popularity_v2_validates_full_model_and_partition_contract() {
+        let profile = serde_json::json!({
+            "schema_version": 2,
+            "model": "Qwen/test",
+            "num_moe_layers": 2,
+            "num_logical_experts": 4,
+            "expert_parallel_size": 2,
+            "experts_per_rank": 2,
+            "experts_per_token": 2,
+            "count_semantics": "logical_routed_token_assignments",
+            "aggregation": {
+                "scope": "all_captured_eplb_steps",
+                "observed_eplb_step_min": 10,
+                "observed_eplb_step_max": 11,
+                "record_count": 2
+            },
+            "expert_partitioning": {
+                "kind": "contiguous_logical_expert_ids",
+                "layout": "rank_major"
+            },
+            "counts_by_layer": [[9, 2, 5, 5], [2, 2, 0, 8]],
+            "probabilities_by_layer": [
+                [9.0 / 21.0, 2.0 / 21.0, 5.0 / 21.0, 5.0 / 21.0],
+                [2.0 / 12.0, 2.0 / 12.0, 0.0, 8.0 / 12.0]
+            ],
+            "counts_all_layers": [11, 4, 5, 13],
+            "probabilities_all_layers": [11.0 / 33.0, 4.0 / 33.0, 5.0 / 33.0, 13.0 / 33.0]
+        });
+        let mut profile_file = tempfile::NamedTempFile::new().unwrap();
+        write!(profile_file, "{profile}").unwrap();
+        let profile_path = profile_file.path().to_str().unwrap();
+
+        let routing =
+            resolve_routing_source(RoutingKind::Uniform, None, 4, 2, 2, 2, Some(profile_path))
+                .unwrap();
+        assert_eq!(routing.ppm(), &[515_152, 60_606, 212_121, 212_121]);
+
+        let mut unknown_field_profile = profile;
+        unknown_field_profile["unregulated"] = serde_json::json!(true);
+        let mut invalid_file = tempfile::NamedTempFile::new().unwrap();
+        write!(invalid_file, "{unknown_field_profile}").unwrap();
+        let error = resolve_routing_source(
+            RoutingKind::Uniform,
+            None,
+            4,
+            2,
+            2,
+            2,
+            invalid_file.path().to_str(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field"));
+    }
 
     /// The moesim-faithful comm sizes (`ref/moesim-rs/.../standard_moe.rs`): attn→ffn
     /// is the attention output `q_dim·bpe`; ffn→attn is the QKV projection

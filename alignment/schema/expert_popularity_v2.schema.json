@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vibesim.local/schema/expert_popularity_v2.schema.json",
+  "title": "VibeSim expert popularity profile",
+  "description": "Aggregated logical routed-token assignments consumed by the simulator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "model",
+    "num_moe_layers",
+    "num_logical_experts",
+    "expert_parallel_size",
+    "experts_per_rank",
+    "experts_per_token",
+    "count_semantics",
+    "aggregation",
+    "expert_partitioning",
+    "counts_by_layer",
+    "probabilities_by_layer",
+    "counts_all_layers",
+    "probabilities_all_layers"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "model": {"type": "string", "minLength": 1},
+    "num_moe_layers": {"type": "integer", "minimum": 1},
+    "num_logical_experts": {"type": "integer", "minimum": 1},
+    "expert_parallel_size": {"type": "integer", "minimum": 1},
+    "experts_per_rank": {"type": "integer", "minimum": 1},
+    "experts_per_token": {"type": "integer", "minimum": 1},
+    "count_semantics": {"const": "logical_routed_token_assignments"},
+    "aggregation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "observed_eplb_step_min", "observed_eplb_step_max", "record_count"],
+      "properties": {
+        "scope": {"const": "all_captured_eplb_steps"},
+        "observed_eplb_step_min": {"type": "integer", "minimum": 0},
+        "observed_eplb_step_max": {"type": "integer", "minimum": 0},
+        "record_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "expert_partitioning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "layout"],
+      "properties": {
+        "kind": {"const": "contiguous_logical_expert_ids"},
+        "layout": {"const": "rank_major"}
+      }
+    },
+    "counts_by_layer": {"$ref": "#/$defs/nonnegativeIntegerMatrix"},
+    "probabilities_by_layer": {"$ref": "#/$defs/nonnegativeNumberMatrix"},
+    "counts_all_layers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "integer", "minimum": 0}
+    },
+    "probabilities_all_layers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "number", "minimum": 0, "maximum": 1}
+    }
+  },
+  "$defs": {
+    "nonnegativeIntegerMatrix": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "array",
+        "minItems": 1,
+        "items": {"type": "integer", "minimum": 0}
+      }
+    },
+    "nonnegativeNumberMatrix": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "array",
+        "minItems": 1,
+        "items": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    }
+  }
+}

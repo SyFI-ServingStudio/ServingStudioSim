@@ -33,19 +33,19 @@
 //! *replicated* on every rank of a shard (the full hidden is replicated across
 //! the shard's `attn_tp_size` ranks after the o_proj all-reduce), so each
 //! shard's cost is its own token slice — NOT `m_total / ep_size`. The
-//! `× ep_size` MAX on `expert_compute` is the EP fan-out: under skewed routing
-//! each EP rank's `local_ppm` shard yields a distinct grouped-GEMM kernel cache
-//! (L1 grouped gemm is distribution-sensitive). For v1 uniform routing the
-//! fan-out children are identical and the MAX degenerates numerically — the
-//! structure stays ready for the future skew (`MoeExpertComputeLocalWorklet`
-//! instances can be minted with distinct `local_ppm` per EP rank without
-//! touching the arch shape).
+//! `× ep_size` MAX on `expert_compute` is the EP fan-out: each EP rank owns one
+//! `local_ppm` shard, so a measured or synthetic skew yields a distinct
+//! grouped-GEMM kernel cache (L1 grouped GEMM is distribution-sensitive). The
+//! uniform baseline still produces identical children, but the rank fan-out is
+//! kept explicit so the same CostTree shape handles a profile without a second
+//! arch implementation.
 //!
 //! v1 deviations (carried over from `llama3_dp_attn_tp_ffn`, plus MoE-specific):
 //!   - embed / final_norm / lm_head are replicated full shapes on the pooled
 //!     token total (no vocab-parallel split);
-//!   - routing distribution is uniform across experts (`uniform_local_ppm`);
-//!     hot-expert skew effects on grouped GEMM are NOT modeled at this layer.
+//!   - one routing snapshot is used for all homogeneous MoE layers. A profile
+//!     JSON is therefore reduced to its all-layer expert totals at the L4 build
+//!     seam; layer-by-layer CostTree materialisation is intentionally deferred.
 
 use std::sync::Arc;
 
@@ -61,14 +61,16 @@ use crate::timing::kernels::{
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::{
-    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
-    LeafMetrics, PerfApiBridge, SlotInput,
+    BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, DType, Dim, Evaluator,
+    FlatCostNode, LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{
-    uniform_local_ppm, AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWorkletInput,
-    AttnBlockTpWorkletResolved, MoeExpertComputeLocalWorklet, MoeExpertComputeLocalWorkletConfig,
-    MoeExpertComputeLocalWorkletInput, MoeExpertComputeLocalWorkletResolved, MoeRouterLocalWorklet,
-    MoeRouterLocalWorkletConfig, MoeRouterLocalWorkletInput, MoeRouterLocalWorkletResolved,
+    AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWorkletInput,
+    AttnBlockTpWorkletResolved, NativeMoeExpertComputeLocalWorklet,
+    NativeMoeExpertComputeLocalWorkletConfig, NativeMoeExpertComputeLocalWorkletInput,
+    NativeMoeExpertComputeLocalWorkletResolved, NativeMoeRouterLocalWorklet,
+    NativeMoeRouterLocalWorkletConfig, NativeMoeRouterLocalWorkletInput,
+    NativeMoeRouterLocalWorkletResolved,
 };
 
 const NORM_BACKENDS: &[&str] = &["flashinfer"];
@@ -78,11 +80,11 @@ const NORM_BACKENDS: &[&str] = &["flashinfer"];
 const ACT_BACKENDS: &[&str] = &["triton"];
 // See llama3_dense: FlashInfer impls registered under fa2/fa3, not "flashinfer".
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];
-const ALLREDUCE_BACKENDS: &[&str] = &["nccl"];
-// p2p backend for both MoE dispatch (inter+intra) and combine. nccl is the
-// portable choice; nvshmem (DeepEP) can be plugged via this constant once its
-// L1 kernel is wired everywhere this arch runs.
-const P2P_BACKENDS: &[&str] = &["nccl"];
+// This alignment target pins every network leaf to NVSHMEM. Keep the TP
+// all-reduce and MoE p2p policies together so a future backend change cannot
+// silently produce a mixed-network model.
+const ALLREDUCE_BACKENDS: &[&str] = &["nvshmem"];
+const P2P_BACKENDS: &[&str] = &["nvshmem"];
 // v1 fabric choices: NVLink for the attn-TP allreduce AND the MoE intra leg;
 // Infiniband for the MoE inter leg.
 const TP_FABRIC: Fabric = Fabric::Nvlink;
@@ -109,9 +111,12 @@ pub struct Qwen3MoeParallel {
 /// L4 cost fan-out loop.
 pub struct Qwen3MoeDpAttnEpFfnConfigs {
     pub attn_block: AttnBlockTpWorkletConfig,
-    pub moe_router: MoeRouterLocalWorkletConfig,
+    pub moe_router: NativeMoeRouterLocalWorkletConfig,
     pub moe_dispatch: MoeNetConfig,
-    pub moe_expert_compute: MoeExpertComputeLocalWorkletConfig,
+    /// One distribution-sensitive expert worklet per EP rank. Keeping the
+    /// vector at L4 makes the rank `Max` explicit and preserves each rank's
+    /// raw `local_ppm` cache identity.
+    pub moe_expert_compute: Vec<NativeMoeExpertComputeLocalWorkletConfig>,
     pub moe_local_reduce: ElementwiseKernelConfig,
     pub moe_combine: MoeNetConfig,
     pub embed: ElementwiseKernelConfig,
@@ -133,9 +138,9 @@ pub struct Qwen3MoeDpAttnEpFfnConfigs {
 /// moe_local_reduce) carry their kernel config through unchanged.
 pub struct Qwen3MoeDpAttnEpFfnResolved {
     pub attn_block: AttnBlockTpWorkletResolved,
-    pub moe_router: MoeRouterLocalWorkletResolved,
+    pub moe_router: NativeMoeRouterLocalWorkletResolved,
     pub moe_dispatch: MoeNetConfig,
-    pub moe_expert_compute: MoeExpertComputeLocalWorkletResolved,
+    pub moe_expert_compute: Vec<NativeMoeExpertComputeLocalWorkletResolved>,
     pub moe_local_reduce: ElementwiseKernelConfig,
     pub moe_combine: MoeNetConfig,
     pub embed: ElementwiseKernelConfig,
@@ -165,9 +170,9 @@ pub struct Qwen3MoeDpAttnEpFfnModel {
     /// Symbolic KV footprint per token (folds to bytes at the worker seam).
     pub total_kv_bytes_per_token: Dim,
     pub attn_block: AttnBlockTpWorklet,
-    pub moe_router: MoeRouterLocalWorklet,
+    pub moe_router: NativeMoeRouterLocalWorklet,
     pub moe_dispatch: MoeDispatchOp,
-    pub moe_expert_compute: MoeExpertComputeLocalWorklet,
+    pub moe_expert_compute: Vec<NativeMoeExpertComputeLocalWorklet>,
     pub moe_local_reduce: Op<ElementwiseKernel>,
     pub moe_combine: MoeCombineOp,
     pub embed: Op<ElementwiseKernel>,
@@ -192,7 +197,6 @@ fn attn_block_config(
         num_kv_heads: model.num_kv_heads.clone(),
         head_dim: model.head_dim.clone(),
         dtype: model.dtype,
-        fp8: model.fp8,
         tp_size: attn_tp_size,
         tp_name: "attn_tp",
         allreduce_fabric: TP_FABRIC,
@@ -213,6 +217,11 @@ pub fn build_configs(
     parallel: &Qwen3MoeParallel,
     routing: &RoutingDistribution,
 ) -> Qwen3MoeDpAttnEpFfnConfigs {
+    assert!(!model.fp8, "native BF16 Qwen L4 rejects fp8=true");
+    assert!(
+        !model.fp8,
+        "native BF16 Qwen L4 rejects fp8=true; select qwen3_moe_fp8_dp_attn_ep_ffn"
+    );
     let gpu = &parallel.gpu_name;
     // Byte-transfer widths (local reduce, embed) use the compute dtype: fp8 halves
     // the wire size, bf16 leaves it unchanged. The RMSNorm ops keep `model.dtype`.
@@ -255,18 +264,16 @@ pub fn build_configs(
         routing.num_experts(),
         model.num_experts,
     );
-    // `routing` drives the L2 MoE dispatch/combine `BottleneckCurve` simulation
-    // — non-uniform routing produces different per-rank send/recv profiles and
-    // hence different curves. The L3 grouped-GEMM `local_ppm` stays uniform
-    // (v1 deviation, see agent-trace): per-rank `local_ppm` skew on the FFN
-    // compute side is a deferred follow-up.
-    let local_ppm = uniform_local_ppm(model.num_experts.get(), parallel.ep_size);
+    // `routing` drives both the L2 MoE dispatch/combine `BottleneckCurve` and
+    // the L3 grouped-GEMM cache identities. The L3 helper owns the full-ppm →
+    // contiguous rank-shard partition; L4 only places those rank worklets in
+    // the EP `Max` fan-out below.
     let moe_net = MoeNetConfig {
         backends: P2P_BACKENDS.to_vec(),
         gpu_name: gpu.clone(),
-        // dispatch/combine ship the hidden activation → compute dtype (fp8 halves
-        // the all-to-all payload).
-        dtype: model.compute_dtype(),
+        // Dispatch/combine move activation/output tensors, not packed expert
+        // weights. Pin the wire payload to BF16 even when expert GEMMs use FP8.
+        dtype: DType::Bf16,
         intra_fabric: MOE_INTRA_FABRIC,
         inter_fabric: MOE_INTER_FABRIC,
         ep_size: u32::from(parallel.ep_size),
@@ -279,31 +286,44 @@ pub fn build_configs(
             hp_size: u32::from(parallel.hp_size),
         },
     };
+    let lm_head_gemm = SingleGemmKernelConfig {
+        backends: model.single_gemm_backends(),
+        gpu_name: gpu.clone(),
+        n: model.vocab.clone(),
+        k: model.hidden.clone(),
+        dtype: model.compute_dtype(),
+    };
+    let moe_expert_compute = NativeMoeExpertComputeLocalWorkletConfig::split_for_ep(
+        NativeMoeExpertComputeLocalWorkletConfig {
+            hidden: model.hidden.clone(),
+            moe_intermediate: model.moe_intermediate.clone(),
+            num_experts: model.num_experts.clone(),
+            ep_size: parallel.ep_size,
+            top_k: model.top_k,
+            dtype: model.compute_dtype(),
+            activation_dtype: model.dtype,
+            gpu_name: gpu.clone(),
+            act_backends: ACT_BACKENDS.to_vec(),
+            grouped_gemm_backends: model.grouped_gemm_backends(),
+            local_ppm: Vec::new(),
+        },
+        routing.ppm(),
+    );
     Qwen3MoeDpAttnEpFfnConfigs {
         attn_block: attn_block_config(model, parallel.attn_tp_size, gpu),
-        moe_router: MoeRouterLocalWorkletConfig {
+        moe_router: NativeMoeRouterLocalWorkletConfig {
             hidden: model.hidden.clone(),
             num_experts: model.num_experts.clone(),
             dtype: model.dtype,
-            compute_dtype: model.compute_dtype(),
             gpu_name: gpu.clone(),
             norm_backends: NORM_BACKENDS.to_vec(),
             gemm_backends: model.single_gemm_backends(),
         },
         moe_dispatch: moe_net.clone(),
-        // MoE expert compute is all-fp8 in an fp8 run (grouped GEMMs + SwiGLU act);
-        // no RMSNorm inside, so the whole worklet takes the compute dtype.
-        moe_expert_compute: MoeExpertComputeLocalWorkletConfig {
-            hidden: model.hidden.clone(),
-            moe_intermediate: model.moe_intermediate.clone(),
-            num_experts: model.num_experts.clone(),
-            ep_size: parallel.ep_size,
-            dtype: model.compute_dtype(),
-            gpu_name: gpu.clone(),
-            act_backends: ACT_BACKENDS.to_vec(),
-            grouped_gemm_backends: model.grouped_gemm_backends(),
-            local_ppm,
-        },
+        // FP8 runs quantize each BF16 activation immediately before the two
+        // grouped GEMMs. Their outputs and the SwiGLU intermediate remain in
+        // the model activation dtype.
+        moe_expert_compute,
         // Conservative v1 model: per home-rank token, read+write one full hidden
         // vector of partials. Refinement to top_k-weighted partial reads is
         // deferred until we model expert-redundancy at home-rank reduction.
@@ -328,14 +348,9 @@ pub fn build_configs(
             hidden: model.hidden.clone(),
             dtype: model.dtype,
         },
-        // Replicated full lm_head for v1 (vocab-parallel split deferred).
-        lm_head: SingleGemmKernelConfig {
-            backends: model.single_gemm_backends(),
-            gpu_name: gpu.clone(),
-            n: model.vocab.clone(),
-            k: model.hidden.clone(),
-            dtype: model.compute_dtype(),
-        },
+        // Replicated full lm_head for v1 (vocab-parallel split deferred). FP8
+        // consumes the same L2 quant+GEMM compound op as other dense linears.
+        lm_head: lm_head_gemm,
         num_layers: model.num_layers,
         attn_tp_size: parallel.attn_tp_size,
         ep_size: parallel.ep_size,
@@ -363,9 +378,13 @@ fn total_kv_bytes_per_token(resolved: &Qwen3MoeDpAttnEpFfnResolved) -> Dim {
 pub fn resolve_configs(cfgs: &Qwen3MoeDpAttnEpFfnConfigs) -> Qwen3MoeDpAttnEpFfnResolved {
     Qwen3MoeDpAttnEpFfnResolved {
         attn_block: AttnBlockTpWorklet::resolve_config(&cfgs.attn_block),
-        moe_router: MoeRouterLocalWorklet::resolve_config(&cfgs.moe_router),
+        moe_router: NativeMoeRouterLocalWorklet::resolve_config(&cfgs.moe_router),
         moe_dispatch: cfgs.moe_dispatch.clone(),
-        moe_expert_compute: MoeExpertComputeLocalWorklet::resolve_config(&cfgs.moe_expert_compute),
+        moe_expert_compute: cfgs
+            .moe_expert_compute
+            .iter()
+            .map(NativeMoeExpertComputeLocalWorklet::resolve_config)
+            .collect(),
         moe_local_reduce: cfgs.moe_local_reduce.clone(),
         moe_combine: cfgs.moe_combine.clone(),
         embed: cfgs.embed.clone(),
@@ -417,7 +436,7 @@ pub fn build(
         bridge,
     )?;
 
-    let moe_router = MoeRouterLocalWorklet::build(
+    let moe_router = NativeMoeRouterLocalWorklet::build(
         format!("{model_name}.moe_router"),
         resolved.moe_router,
         bridge,
@@ -429,11 +448,21 @@ pub fn build(
         bridge,
     )?;
 
-    let moe_expert_compute = MoeExpertComputeLocalWorklet::build(
-        format!("{model_name}.moe_expert_compute"),
-        resolved.moe_expert_compute,
-        bridge,
-    )?;
+    let moe_expert_compute = resolved
+        .moe_expert_compute
+        .into_iter()
+        .map(|expert_compute| {
+            // Keep the same dotted slot names for every rank. The repeated
+            // slots are the EP fan-out positions in the CostTree and existing
+            // analyzer label mappings intentionally identify them by operation
+            // name rather than synthetic rank suffixes.
+            NativeMoeExpertComputeLocalWorklet::build(
+                format!("{model_name}.moe_expert_compute"),
+                expert_compute,
+                bridge,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let moe_local_reduce = Op::new(
         local_reduce_name.clone(),
@@ -443,7 +472,6 @@ pub fn build(
             bridge,
         )?),
     );
-
     let moe_combine = MoeCombineOp::build(
         format!("{model_name}.moe_combine"),
         resolved.moe_combine,
@@ -508,10 +536,11 @@ pub fn build(
 impl Qwen3MoeDpAttnEpFfnModel {
     /// Compile the per-iteration cost STRUCTURE once: Sum(embed,
     /// Scale{num_layers}(Sum(attn_max, moe_router, dispatch, expert_max,
-    /// local_reduce, combine)), final_norm, lm_head). Both `Max` nodes mint
-    /// their children by repeated `compile` calls on the same worklet — each
-    /// call mints fresh slots, so `eval_into` fills them per child in the same
-    /// order.
+    /// local_reduce, combine)), final_norm, lm_head). The DP `Max` children
+    /// reuse one worklet because their shapes are identical; the EP `Max`
+    /// children use the rank-specific worklets because their `local_ppm` cache
+    /// identities may differ. Every compile call mints fresh slots, so
+    /// `eval_into` fills them in the same order.
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let embed = self.embed.compile(&mut b);
@@ -539,26 +568,34 @@ impl Qwen3MoeDpAttnEpFfnModel {
         };
         let moe_dispatch = self.moe_dispatch.compile(&mut b);
 
-        // EP fan-out — one expert_compute subtree per EP rank. Identical local_ppm
-        // under v1 uniform → numerically degenerate Max; ready for skew.
-        let expert_groups: Vec<CostNode> = (0..self.ep_size)
-            .map(|_| self.moe_expert_compute.compile(&mut b))
+        // EP fan-out — one expert_compute subtree per EP rank. A uniform
+        // snapshot makes this Max numerically degenerate; popularity gives each
+        // child a distinct grouped-GEMM cache/config and exposes imbalance.
+        assert_eq!(
+            self.moe_expert_compute.len(),
+            usize::from(self.ep_size),
+            "expert worklet count must equal ep_size"
+        );
+        let expert_groups: Vec<CostNode> = self
+            .moe_expert_compute
+            .iter()
+            .map(|expert_compute| expert_compute.compile(&mut b))
             .collect();
         let expert_fanout = CostNode::Max {
             overlap: 1.0,
             children: expert_groups,
         };
 
-        // Home-reduce fan-out — the combine returns each token to its home DP
-        // shard, so the reduce runs per shard on the shard's own tokens.
-        let reduce_groups: Vec<CostNode> = (0..self.num_dp_groups)
+        let reduce_groups = (0..self.num_dp_groups)
             .map(|_| self.moe_local_reduce.compile(&mut b))
             .collect();
-        let reduce_fanout = CostNode::Max {
-            overlap: 1.0,
-            children: reduce_groups,
-        };
-        let moe_combine = self.moe_combine.compile(&mut b);
+        let combine_nodes = vec![
+            CostNode::Max {
+                overlap: 1.0,
+                children: reduce_groups,
+            },
+            self.moe_combine.compile(&mut b),
+        ];
 
         let layer = CostNode::Labeled {
             label: "layer".to_string(),
@@ -569,8 +606,7 @@ impl Qwen3MoeDpAttnEpFfnModel {
                     router_fanout,
                     moe_dispatch,
                     expert_fanout,
-                    reduce_fanout,
-                    moe_combine,
+                    CostNode::Sum(combine_nodes),
                 ])),
             }),
         };
@@ -601,8 +637,9 @@ impl Qwen3MoeDpAttnEpFfnModel {
     /// per DP shard, each with its own batch_tokens), then `num_dp_groups`
     /// moe_router evals (post_norm + router, replicated per DP shard on the
     /// shard's own batch_tokens), then moe_dispatch (2 leaves on global token
-    /// count), then `ep_size` moe_expert_compute evals (one per EP rank, uniform
-    /// v1 → same input), then `num_dp_groups` moe_local_reduce evals (home
+    /// count), then `ep_size` moe_expert_compute evals (one per EP rank, each
+    /// with its own local routing shard), then `num_dp_groups` moe_local_reduce
+    /// evals (home
     /// reduce, per DP shard), then moe_combine (4 leaves on global token count).
     /// The `Scale{num_layers}` fold multiplies one layer body. Finally,
     /// final_norm runs on pooled tokens and lm_head on pooled requests.
@@ -634,7 +671,7 @@ impl Qwen3MoeDpAttnEpFfnModel {
         // Router fan-out: replicated per DP shard on the shard's own tokens.
         for g in &batch.groups {
             self.moe_router.eval(
-                &MoeRouterLocalWorkletInput {
+                &NativeMoeRouterLocalWorkletInput {
                     batch_tokens: g.batch_tokens,
                 },
                 ev,
@@ -648,26 +685,25 @@ impl Qwen3MoeDpAttnEpFfnModel {
             ev,
         );
 
-        // EP fan-out: identical input per child under v1 uniform routing.
-        for _ in 0..self.ep_size {
-            self.moe_expert_compute.eval(
-                &MoeExpertComputeLocalWorkletInput {
+        // EP fan-out: the global selection count is shared, while each worklet
+        // derives its local routed count from its own `local_ppm` shard.
+        for expert_compute in &self.moe_expert_compute {
+            expert_compute.eval(
+                &NativeMoeExpertComputeLocalWorkletInput {
                     global_expert_selections,
                 },
                 ev,
             );
         }
 
-        // Home-reduce fan-out: per DP shard on the shard's own tokens.
-        for g in &batch.groups {
+        for group in &batch.groups {
             self.moe_local_reduce.eval(
                 &ElementwiseKernelInput {
-                    num_tokens: g.batch_tokens,
+                    num_tokens: group.batch_tokens,
                 },
                 ev,
             );
         }
-
         self.moe_combine.eval(
             &MoeNetInput {
                 tokens: tokens_for_comm,
@@ -754,139 +790,18 @@ impl IterwiseUnifiedModel for Qwen3MoeDpAttnEpFfnModel {
 mod tests {
     use super::*;
 
-    fn parallel(attn_tp: u16, ep: u16, hp: u16, nvl: u16) -> Qwen3MoeParallel {
-        Qwen3MoeParallel {
-            attn_tp_size: attn_tp,
-            ep_size: ep,
-            hp_size: hp,
-            nvl_num_gpu: nvl,
-            gpu_name: "H100".to_string(),
-        }
-    }
-
-    fn uniform_routing_for(model: &MoeModelCfg) -> RoutingDistribution {
-        RoutingDistribution::uniform(model.num_experts.get())
-    }
-
     #[test]
-    fn build_configs_threads_split_attn_tp_ep_and_derives_dp() {
+    fn native_bf16_graph_has_p2p_combine_only() {
         let model = MoeModelCfg::qwen3_235b();
-        let cfgs = build_configs(&model, &parallel(4, 8, 2, 8), &uniform_routing_for(&model));
-        assert_eq!(cfgs.attn_tp_size, 4);
-        assert_eq!(cfgs.ep_size, 8);
-        // dp = ep / attn_tp.
-        assert_eq!(cfgs.num_dp_groups, 2);
-        assert_eq!(cfgs.hp_size, 2);
-        // attn worklet sees attn_tp; expert_compute sees ep_size.
-        assert_eq!(cfgs.attn_block.tp_size, 4);
-        assert_eq!(cfgs.moe_expert_compute.ep_size, 8);
-        // router gemm: n=num_experts, k=hidden.
-        assert_eq!(cfgs.moe_router.num_experts, 128);
-        assert_eq!(cfgs.moe_router.hidden, 4096);
-        // MoE L2 net config carries placement + ep + nvl.
-        assert_eq!(cfgs.moe_dispatch.ep_size, 8);
-        assert_eq!(cfgs.moe_dispatch.nvl_num_gpu, 8);
-        assert_eq!(cfgs.moe_dispatch.top_k, 8);
-        // Both legs share the same MoeNetConfig (dispatch == combine).
-        assert_eq!(cfgs.moe_dispatch.ep_size, cfgs.moe_combine.ep_size);
-        assert_eq!(cfgs.moe_dispatch.h, cfgs.moe_combine.h);
-        // lm_head replicated full (vocab-parallel deferred).
-        assert_eq!(cfgs.lm_head.n, 152064);
-        assert_eq!(cfgs.lm_head.k, 4096);
-    }
-
-    #[test]
-    fn resolve_shards_attn_heads_by_attn_tp_and_moe_intermediate_unchanged() {
-        let model = MoeModelCfg::qwen3_235b();
-        let r = resolve_configs(&build_configs(
-            &model,
-            &parallel(4, 8, 2, 8),
-            &uniform_routing_for(&model),
-        ));
-        // attention per-rank under attn_tp=4: qo 64/4=16, kv 4/4=1.
-        assert_eq!(r.attn_block.num_qo_heads_per_rank, 16);
-        assert_eq!(r.attn_block.num_kv_heads_per_rank, 1);
-        // MoE expert compute: 128 experts / ep=8 → 16 experts per GPU.
-        assert_eq!(r.moe_expert_compute.experts_per_gpu, 16);
-        // grouped_gemm dims unchanged by EP (moe_intermediate NOT sharded across EP).
-        assert_eq!(r.moe_expert_compute.gate_up.n, 2 * 3072);
-        assert_eq!(r.moe_expert_compute.gate_up.k, 4096);
-        assert_eq!(r.moe_expert_compute.down.n, 4096);
-        assert_eq!(r.moe_expert_compute.down.k, 3072);
-    }
-
-    #[test]
-    fn total_kv_bytes_per_token_sums_across_attn_ranks_all_layers() {
-        let model = MoeModelCfg::qwen3_235b();
-        let r = resolve_configs(&build_configs(
-            &model,
-            &parallel(4, 8, 2, 8),
-            &uniform_routing_for(&model),
-        ));
-        // 2 (kv) × 4 kv_heads × 128 head_dim × 2 (bf16) × 94 layers.
-        assert_eq!(total_kv_bytes_per_token(&r), 2 * 4 * 128 * 2 * 94);
-    }
-
-    #[test]
-    fn attn_tp_equal_ep_is_single_dp_group() {
-        // attn_tp == ep → no attn-DP replication (one group). Qwen3-235B has
-        // num_kv_heads=4, so attn_tp must be ≤ 4: pick attn_tp=ep=4.
-        let model = MoeModelCfg::qwen3_235b();
-        let cfgs = build_configs(&model, &parallel(4, 4, 2, 4), &uniform_routing_for(&model));
-        assert_eq!(cfgs.num_dp_groups, 1);
-    }
-
-    #[test]
-    fn non_uniform_routing_threads_into_moe_net_config() {
-        // A skewed profile (hot top-2 experts, cold tail) reaches MoeNetConfig
-        // verbatim; the L2 dispatch/combine sim consumes it. The L3 worklet's
-        // `local_ppm` stays uniform regardless (v1 limitation).
-        let model = MoeModelCfg::qwen3_235b();
-        let mut weights = vec![0.1f32; model.num_experts.get() as usize];
-        weights[0] = 5.0;
-        weights[1] = 3.0;
-        let skewed = RoutingDistribution::from_profile(&weights);
-        let cfgs = build_configs(&model, &parallel(4, 8, 1, 8), &skewed);
-        assert_eq!(cfgs.moe_dispatch.routing, skewed);
-        assert_eq!(cfgs.moe_combine.routing, skewed);
-        // local_ppm still uniform: every entry equals TOTAL_PPM / num_experts.
-        let per_expert = RoutingDistribution::TOTAL_PPM / model.num_experts.get();
-        assert!(
-            cfgs.moe_expert_compute
-                .local_ppm
-                .iter()
-                .all(|&v| v == per_expert),
-            "local_ppm must stay uniform in v1"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "must be a multiple of attn_tp_size")]
-    fn ep_not_multiple_of_attn_tp_panics() {
-        let model = MoeModelCfg::qwen3_235b();
-        let _ = build_configs(&model, &parallel(3, 8, 2, 8), &uniform_routing_for(&model));
-    }
-
-    #[test]
-    #[should_panic(expected = "hp_size")]
-    fn hp_not_dividing_ep_panics() {
-        let model = MoeModelCfg::qwen3_235b();
-        let _ = build_configs(&model, &parallel(4, 8, 3, 8), &uniform_routing_for(&model));
-    }
-
-    #[test]
-    #[should_panic(expected = "num_experts")]
-    fn ep_not_dividing_num_experts_panics() {
-        // num_experts=128, ep=7 → 128 % 7 != 0.
-        let model = MoeModelCfg::qwen3_235b();
-        let _ = build_configs(&model, &parallel(7, 7, 1, 7), &uniform_routing_for(&model));
-    }
-
-    #[test]
-    #[should_panic(expected = "routing distribution has")]
-    fn routing_distribution_expert_count_mismatch_panics() {
-        let model = MoeModelCfg::qwen3_235b();
-        let wrong = RoutingDistribution::uniform(model.num_experts.get() + 1);
-        let _ = build_configs(&model, &parallel(4, 8, 2, 8), &wrong);
+        let parallel = Qwen3MoeParallel {
+            attn_tp_size: 4,
+            ep_size: 8,
+            hp_size: 1,
+            nvl_num_gpu: 8,
+            gpu_name: "NVIDIA H200".into(),
+        };
+        let cfg = build_configs(&model, &parallel, &RoutingDistribution::uniform(128));
+        assert_eq!(cfg.moe_combine.ep_size, 8);
+        assert_eq!(cfg.lm_head.dtype, DType::Bf16);
     }
 }
