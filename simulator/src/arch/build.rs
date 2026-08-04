@@ -688,14 +688,9 @@ pub fn glm52_dsa_moe(
         nvl_num_gpu,
         gpu_name: gpu.to_string(),
     };
-    let configs = glm52_dsa_moe::build_configs(
-        &model_cfg,
-        &parallel,
-        &routing,
-        model_spec.fp8,
-        mtp_mode,
-    )
-    .context("expanding GLM-5.2 architecture configs")?;
+    let configs =
+        glm52_dsa_moe::build_configs(&model_cfg, &parallel, &routing, model_spec.fp8, mtp_mode)
+            .context("expanding GLM-5.2 architecture configs")?;
     let resolved = glm52_dsa_moe::resolve_configs(&configs);
     glm52_dsa_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.2 DSA-MoE model (often a missing profile.db row)")
@@ -1278,14 +1273,8 @@ mod tests {
                 gpu_name: "NVIDIA H200".to_string(),
             };
             let routing = resolve_routing(RoutingKind::Random, Some(19), 256);
-            let configs = glm52_dsa_moe::build_configs(
-                &model,
-                &parallel,
-                &routing,
-                false,
-                mode,
-            )
-            .unwrap();
+            let configs =
+                glm52_dsa_moe::build_configs(&model, &parallel, &routing, false, mode).unwrap();
             assert_eq!(configs.parallel.ep_size, 16);
             assert_eq!(configs.parallel.nvl_num_gpu, 8);
             assert_eq!(configs.moe_dispatch.routing, routing);
