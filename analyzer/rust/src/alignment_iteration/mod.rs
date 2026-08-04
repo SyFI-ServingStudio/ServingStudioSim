@@ -3,8 +3,9 @@
 //! The launcher has already normalized the vLLM input into timing-predict cases.
 //! This subject owns the actual comparison: join case indices to measured
 //! iteration ids, expand the user-labeled folded inventory across every measured
-//! phase, fold sim leaf multiplicities from the CostTree, and emit totals,
-//! operation errors, kernel inventory, and plot arrays.
+//! phase, attribute sim leaves through the exact CostTree critical path, and
+//! emit totals, operation errors, kernel inventory, and plot arrays. Raw folded
+//! leaf workload remains separate for mapping-coverage audit.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -357,6 +358,15 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         let mut simulated_kernels = Vec::new();
         let mut phase_summaries = Vec::new();
         let mut iteration_unmapped_simulated_ms = 0.0;
+        let critical_path_ms_by_slot = critical_path_leaf_ms(manifest, &sim.slot_ms)?;
+        let attributed_simulated_ms: f64 = critical_path_ms_by_slot.iter().sum();
+        ensure!(
+            (attributed_simulated_ms - sim.total_ms).abs() <= (sim.total_ms.abs() * 1e-3).max(1e-6),
+            "case {}: attributed critical path {:.6} ms != row total {:.6} ms",
+            joined.case_index,
+            attributed_simulated_ms,
+            sim.total_ms,
+        );
 
         let mut ranges_by_device_phase: BTreeMap<(i64, &str), Vec<&MeasuredRange>> =
             BTreeMap::new();
@@ -552,10 +562,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         // Operations that actually appear in this iteration's measured kernels.
         // A sim slot declared by several operations (fused aggregate vs unfused
         // split) resolves to whichever of them is present this iteration.
-        let present_operations: BTreeSet<&str> =
-            measured_ops.keys().map(String::as_str).collect();
+        let present_operations: BTreeSet<&str> = measured_ops.keys().map(String::as_str).collect();
         for (index, (slot, time_ms)) in manifest.slots.iter().zip(&sim.slot_ms).enumerate() {
             let folded_ms = *time_ms * scales[index] as f64;
+            let critical_path_ms = critical_path_ms_by_slot[index];
             simulated_workload_ms += folded_ms;
             let operation = match inventory.simulated_slots.get(&slot.name) {
                 Some(declaring) => {
@@ -576,7 +586,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 None => None,
             };
             if let Some(operation) = operation {
-                *sim_ops.entry(operation.operation.clone()).or_default() += folded_ms;
+                *sim_ops.entry(operation.operation.clone()).or_default() += critical_path_ms;
                 simulated_mapped_ms += folded_ms;
             } else {
                 iteration_unmapped_simulated_ms += folded_ms;
@@ -592,6 +602,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "multiplicity": scales[index],
                 "unit_ms": time_ms,
                 "folded_ms": folded_ms,
+                "critical_path_ms": critical_path_ms,
             }));
         }
 
@@ -631,6 +642,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         let simulated_leaf_workload_ms = simulated_kernels
             .iter()
             .filter_map(|row| row["folded_ms"].as_f64())
+            .sum::<f64>();
+        let simulated_critical_path_ms = simulated_kernels
+            .iter()
+            .filter_map(|row| row["critical_path_ms"].as_f64())
             .sum::<f64>();
 
         // Headline totals use the critical-path sum, so per-operation rows and
@@ -672,6 +687,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "operation_summary": operation_rows,
             "measured_kernel_sum_ms": measured_kernel_sum_ms,
             "simulated_leaf_workload_ms": simulated_leaf_workload_ms,
+            "simulated_critical_path_ms": simulated_critical_path_ms,
             "unmapped_measured_ms": iteration_unmapped_measured_ms,
             "unmapped_simulated_ms": iteration_unmapped_simulated_ms,
         }));
@@ -941,6 +957,110 @@ fn leaf_scales(manifest: &Manifest) -> Result<Vec<u64>> {
         .enumerate()
         .map(|(index, value)| value.with_context(|| format!("manifest slot {index} unreachable")))
         .collect()
+}
+
+/// Attribute one prediction row back to leaf slots while exactly preserving
+/// the CostTree root. A `Max` selects its slowest child; exact ties retain the
+/// first child, which is the stable rank-0 branch for EP fan-out trees.
+fn critical_path_leaf_ms(manifest: &Manifest, slot_ms: &[f64]) -> Result<Vec<f64>> {
+    const TIME_EPSILON_MS: f64 = 1e-12;
+
+    ensure!(!manifest.nodes.is_empty(), "cost manifest has no root node");
+    ensure!(
+        slot_ms.len() == manifest.slots.len(),
+        "slot_time_ms length {} != manifest slot count {}",
+        slot_ms.len(),
+        manifest.slots.len(),
+    );
+
+    let mut node_times = vec![0.0; manifest.nodes.len()];
+    for index in (0..manifest.nodes.len()).rev() {
+        node_times[index] = match &manifest.nodes[index] {
+            FlatCostNode::Leaf(slot) => {
+                let value = *slot_ms.get(*slot).with_context(|| {
+                    format!("cost-tree leaf node {index} references missing slot {slot}")
+                })?;
+                ensure!(
+                    value.is_finite() && value >= 0.0,
+                    "slot {slot} has invalid time {value}"
+                );
+                value
+            }
+            FlatCostNode::Sum { children } => {
+                validate_child_range(manifest, index, children, "Sum")?;
+                children.clone().map(|child| node_times[child]).sum()
+            }
+            FlatCostNode::Max { overlap, children } => {
+                validate_child_range(manifest, index, children, "Max")?;
+                let critical_child = first_max_child(children.clone(), &node_times);
+                node_times[critical_child] / f64::from(*overlap).max(TIME_EPSILON_MS)
+            }
+            FlatCostNode::Scale { n, children } => {
+                validate_child_range(manifest, index, children, "Scale")?;
+                ensure!(
+                    children.len() == 1,
+                    "Scale node {index} must own exactly one child"
+                );
+                f64::from(*n) * node_times[children.start]
+            }
+        };
+    }
+
+    let mut node_weights = vec![0.0; manifest.nodes.len()];
+    let mut leaf_ms = vec![0.0; slot_ms.len()];
+    node_weights[0] = 1.0;
+    for index in 0..manifest.nodes.len() {
+        let weight = node_weights[index];
+        if weight == 0.0 {
+            continue;
+        }
+        match &manifest.nodes[index] {
+            FlatCostNode::Leaf(slot) => leaf_ms[*slot] += slot_ms[*slot] * weight,
+            FlatCostNode::Sum { children } => {
+                for child in children.clone() {
+                    node_weights[child] += weight;
+                }
+            }
+            FlatCostNode::Scale { n, children } => {
+                node_weights[children.start] += weight * f64::from(*n);
+            }
+            FlatCostNode::Max { overlap, children } => {
+                let critical_child = first_max_child(children.clone(), &node_times);
+                node_weights[critical_child] += weight / f64::from(*overlap).max(TIME_EPSILON_MS);
+            }
+        }
+    }
+
+    let attributed_ms: f64 = leaf_ms.iter().sum();
+    ensure!(
+        (attributed_ms - node_times[0]).abs() <= (node_times[0].abs() * 1e-9).max(1e-9),
+        "critical-path leaf attribution {attributed_ms:.9} ms != root {:.9} ms",
+        node_times[0],
+    );
+    Ok(leaf_ms)
+}
+
+fn validate_child_range(
+    manifest: &Manifest,
+    index: usize,
+    children: &std::ops::Range<usize>,
+    kind: &str,
+) -> Result<()> {
+    ensure!(
+        !children.is_empty() && children.start > index && children.end <= manifest.nodes.len(),
+        "{kind} node {index} has invalid children {children:?}"
+    );
+    Ok(())
+}
+
+fn first_max_child(children: std::ops::Range<usize>, node_times: &[f64]) -> usize {
+    let mut critical_child = children.start;
+    for child in children.start + 1..children.end {
+        if node_times[child] > node_times[critical_child] {
+            critical_child = child;
+        }
+    }
+    critical_child
 }
 
 impl CompiledInventory {
@@ -1323,10 +1443,11 @@ fn definitions() -> Value {
         "simulated_gpu_cycle_ms": "timing-predict total_time_ms multiplied by recommended_gpu_time_multiplier (the measured pooled duty-cycle correction), i.e. the kernel-only prediction scaled up to wall-clock",
         "gpu_cycle_relative_diff_pct": "(scaled timing-predict GPU cycle - measured GPU cycle) / measured GPU cycle * 100; positive means overprediction",
         "operation_measured_ms": "sum over the operation's occurrences of each occurrence's cross-rank reduction (independent = slowest rank duration; synchronizing = max(end) - max(start)); arrival wait is dropped, not attributed to the collective",
-        "operation_simulated_ms": "sum of mapped sim leaf times after CostTree Scale multiplicity; workload time, not additive wall time when Max/overlap exists",
+        "operation_simulated_ms": "mapped sim leaf contribution after exact CostTree Sum/Scale/Max/overlap attribution; operation contributions plus unmapped critical-path leaves add to total_simulated_ms",
         "measured_kernel_duration_ms": "one occurrence's cross-rank critical-path contribution per the cross_rank class: independent = max over ranks of (end-start); synchronizing collective = max(end) - max(start). rank_launches counts raw launches; replica_calls divides symmetric launches by captured device count",
         "cross_rank": "the mapping table's per-kernel reduction class: synchronizing (a collective barrier) or independent; the analyzer applies min/max from this, never from a category or name",
         "simulated_kernel_folded_ms": "one L1 leaf slot time multiplied by its exact CostTree Scale multiplicity",
+        "simulated_kernel_critical_path_ms": "the leaf's contribution to timing-predict total_time_ms after exact CostTree Sum/Scale/Max/overlap attribution; an exact Max tie selects the first child",
         "mapping_coverage": "duration/workload fraction assigned by embedded labels; unmatched entries stay explicit and are never filled with zero",
     })
 }
@@ -1334,6 +1455,65 @@ fn definitions() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::manifest::LeafDesc;
+
+    fn test_leaf(name: &str) -> LeafDesc {
+        LeafDesc {
+            name: name.into(),
+            kind: "test".into(),
+            kernel_config: json!({"backends": []}),
+        }
+    }
+
+    #[test]
+    fn critical_path_leaf_ms_preserves_sum_scale_and_max() {
+        let manifest = Manifest {
+            slots: vec![test_leaf("a"), test_leaf("b"), test_leaf("c")],
+            // Sum(Leaf a, Scale{2}(Max(Leaf b, Leaf c))).
+            nodes: vec![
+                FlatCostNode::Sum { children: 1..3 },
+                FlatCostNode::Leaf(0),
+                FlatCostNode::Scale {
+                    n: 2,
+                    children: 3..4,
+                },
+                FlatCostNode::Max {
+                    overlap: 2.0,
+                    children: 4..6,
+                },
+                FlatCostNode::Leaf(1),
+                FlatCostNode::Leaf(2),
+            ],
+            node_labels: vec![None; 6],
+        };
+
+        // Root = 4 + 2 * (max(6, 10) / 2) = 14. Only c is critical.
+        assert_eq!(
+            critical_path_leaf_ms(&manifest, &[4.0, 6.0, 10.0]).unwrap(),
+            vec![4.0, 0.0, 10.0]
+        );
+    }
+
+    #[test]
+    fn critical_path_leaf_ms_breaks_exact_max_tie_to_first_child() {
+        let manifest = Manifest {
+            slots: vec![test_leaf("rank0"), test_leaf("rank1")],
+            nodes: vec![
+                FlatCostNode::Max {
+                    overlap: 1.0,
+                    children: 1..3,
+                },
+                FlatCostNode::Leaf(0),
+                FlatCostNode::Leaf(1),
+            ],
+            node_labels: vec![None; 3],
+        };
+
+        assert_eq!(
+            critical_path_leaf_ms(&manifest, &[5.0, 5.0]).unwrap(),
+            vec![5.0, 0.0]
+        );
+    }
 
     #[test]
     fn interval_union_merges_overlap_across_phases() {
@@ -1456,7 +1636,10 @@ mod tests {
             operations["attention"].simulated_slots,
             ["attention.main", "attention.combine"]
         );
-        assert_eq!(slots["attention.main"], BTreeSet::from(["attention".to_string()]));
+        assert_eq!(
+            slots["attention.main"],
+            BTreeSet::from(["attention".to_string()])
+        );
         assert_eq!(
             slots["attention.combine"],
             BTreeSet::from(["attention".to_string()])

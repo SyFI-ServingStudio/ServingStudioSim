@@ -48,7 +48,7 @@ def test_mapping_center_pairs_keeps_one_to_many_simulated_slots() -> None:
     ]
 
 
-def test_simulated_width_cumulative_error_steps_use_slot_workload_widths() -> None:
+def test_simulated_width_cumulative_error_steps_use_critical_path_widths() -> None:
     measured = [
         {
             "phase": "forward",
@@ -64,13 +64,13 @@ def test_simulated_width_cumulative_error_steps_use_slot_workload_widths() -> No
         },
     ]
     simulated = [
-        {"name": "prefill", "operation": "layer.attention", "folded_ms": 0.4},
-        {"name": "decode", "operation": "layer.attention", "folded_ms": 0.6},
-        {"name": "sim-only", "operation": None, "folded_ms": 0.3},
+        {"name": "prefill", "operation": "layer.attention", "critical_path_ms": 0.4},
+        {"name": "decode", "operation": "layer.attention", "critical_path_ms": 0.6},
+        {"name": "sim-only", "operation": None, "critical_path_ms": 0.3},
     ]
 
-    baseline_ms, edges_ms, cumulative_errors_ms = (
-        _simulated_width_cumulative_error_steps(measured, simulated)
+    baseline_ms, edges_ms, cumulative_errors_ms = _simulated_width_cumulative_error_steps(
+        measured, simulated
     )
 
     assert baseline_ms == -0.2

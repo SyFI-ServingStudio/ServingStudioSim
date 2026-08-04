@@ -251,7 +251,7 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
     simulated = [
         item
         for item in row.get("simulated_kernels") or []
-        if float(item.get("folded_ms", 0.0)) > 1e-12
+        if float(item.get("critical_path_ms", 0.0)) > 1e-12
     ]
     key_rows = len(measured) + len(simulated)
     fig_height = max(10.2, 7.3 + 0.16 * math.ceil(key_rows / 2))
@@ -283,7 +283,7 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
         simulated,
         y=0.0,
         prefix="S",
-        value_key="folded_ms",
+        value_key="critical_path_ms",
         colors=simulated_colors,
         label=_simulated_key,
     )
@@ -308,8 +308,8 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
         )
 
     measured_sum = float(row.get("measured_kernel_sum_ms", 0.0))
-    simulated_sum = float(row.get("simulated_leaf_workload_ms", 0.0))
-    _draw_cumulative_workload_error(
+    simulated_sum = float(row.get("simulated_critical_path_ms", 0.0))
+    _draw_cumulative_critical_path_error(
         cumulative_ax,
         measured,
         simulated,
@@ -317,20 +317,20 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
         measured_sum_ms=measured_sum,
         simulated_sum_ms=simulated_sum,
     )
-    shared_workload_limit_ms = max(measured_sum, simulated_sum) * 1.03
-    if shared_workload_limit_ms <= 1e-12:
-        shared_workload_limit_ms = 1.0
-    ax.set_xlim(0.0, shared_workload_limit_ms)
-    cumulative_ax.set_xlim(0.0, shared_workload_limit_ms)
+    shared_path_limit_ms = max(measured_sum, simulated_sum) * 1.03
+    if shared_path_limit_ms <= 1e-12:
+        shared_path_limit_ms = 1.0
+    ax.set_xlim(0.0, shared_path_limit_ms)
+    cumulative_ax.set_xlim(0.0, shared_path_limit_ms)
     ax.set_yticks([1.0, 0.0])
     ax.set_yticklabels(
         [
             f"Nsight measured\n{measured_sum:.3f} ms replica path",
-            f"Timing-predict\n{simulated_sum:.3f} ms folded leaves",
+            f"Timing-predict\n{simulated_sum:.3f} ms CostTree path",
         ]
     )
     ax.set_ylim(-0.65, 1.65)
-    ax.set_xlabel("critical-path contribution / folded leaf workload (ms)")
+    ax.set_xlabel("replica critical-path contribution (ms)")
     ax.set_title(
         f"{run_label}\nIteration {row['iteration_id']} · "
         f"{row.get('stage', '')} per-kernel replica critical-path breakdown"
@@ -340,7 +340,8 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
         0.0,
         -0.28,
         "Measured = per-occurrence cross-rank reduction (independent: slowest-rank duration; "
-        "synchronizing collective: last-arrival→done), summed. Simulated = leaf time × CostTree Scale. "
+        "synchronizing collective: last-arrival→done), summed. Simulated = exact CostTree "
+        "Sum/Scale/Max attribution. "
         "Collective arrival-wait is excluded here and lives in the GPU-cycle correction.",
         transform=ax.transAxes,
         fontsize=9,
@@ -470,7 +471,7 @@ def _simulated_width_cumulative_error_steps(
     for item in simulated:
         operation = item.get("operation")
         if operation:
-            simulated_by_operation[operation] += float(item["folded_ms"])
+            simulated_by_operation[operation] += float(item["critical_path_ms"])
 
     unmatched_measured_ms += sum(
         duration_ms
@@ -481,15 +482,13 @@ def _simulated_width_cumulative_error_steps(
     cumulative_errors_ms: list[float] = []
     cumulative_error_ms = -unmatched_measured_ms
     for item in simulated:
-        simulated_ms = float(item["folded_ms"])
+        simulated_ms = float(item["critical_path_ms"])
         operation = item.get("operation")
         measured_share_ms = 0.0
         if operation:
             operation_simulated_ms = simulated_by_operation[operation]
             measured_share_ms = (
-                measured_by_operation.get(operation, 0.0)
-                * simulated_ms
-                / operation_simulated_ms
+                measured_by_operation.get(operation, 0.0) * simulated_ms / operation_simulated_ms
             )
         cumulative_error_ms += simulated_ms - measured_share_ms
         edges_ms.append(edges_ms[-1] + simulated_ms)
@@ -497,7 +496,7 @@ def _simulated_width_cumulative_error_steps(
     return -unmatched_measured_ms, edges_ms, cumulative_errors_ms
 
 
-def _draw_cumulative_workload_error(
+def _draw_cumulative_critical_path_error(
     ax,
     measured: list[dict],
     simulated: list[dict],
@@ -507,15 +506,13 @@ def _draw_cumulative_workload_error(
     simulated_sum_ms: float,
 ) -> None:
     """Draw a compact cumulative-error row aligned to simulated slot widths."""
-    baseline_ms, edges_ms, cumulative_errors_ms = (
-        _simulated_width_cumulative_error_steps(measured, simulated)
+    baseline_ms, edges_ms, cumulative_errors_ms = _simulated_width_cumulative_error_steps(
+        measured, simulated
     )
     if not simulated:
         return
 
-    for index, (item, color) in enumerate(
-        zip(simulated, simulated_colors, strict=True), start=1
-    ):
+    for index, (item, color) in enumerate(zip(simulated, simulated_colors, strict=True), start=1):
         left_ms = edges_ms[index - 1]
         right_ms = edges_ms[index]
         ax.axvspan(left_ms, right_ms, color=color, alpha=0.18, linewidth=0.0)
@@ -549,18 +546,14 @@ def _draw_cumulative_workload_error(
     ax.scatter(edges_ms[1:], cumulative_errors_ms, color="#6941C6", s=9, zorder=3)
     ax.axhline(0.0, color="#667085", linewidth=0.9, linestyle="--")
     ax.set_ylabel("cumulative\nsim − measured (ms)", fontsize=8)
-    ax.set_xlabel("simulated cumulative folded workload (ms)", fontsize=8)
+    ax.set_xlabel("simulated cumulative critical-path contribution (ms)", fontsize=8)
     ax.grid(True, axis="y", alpha=0.35)
 
     total_delta_ms = simulated_sum_ms - measured_sum_ms
     relative_diff_pct = (
-        total_delta_ms / measured_sum_ms * 100.0
-        if measured_sum_ms > 1e-12
-        else math.nan
+        total_delta_ms / measured_sum_ms * 100.0 if measured_sum_ms > 1e-12 else math.nan
     )
-    relative_label = (
-        f"{relative_diff_pct:+.1f}%" if math.isfinite(relative_diff_pct) else "n/a"
-    )
+    relative_label = f"{relative_diff_pct:+.1f}%" if math.isfinite(relative_diff_pct) else "n/a"
     ax.text(
         edges_ms[-1],
         cumulative_errors_ms[-1],
@@ -648,7 +641,7 @@ def _simulated_key(segment_id: str, item: dict) -> str:
     operation = item.get("operation") or "unmapped"
     return (
         f"{segment_id} {_short_kernel_name(item['name'])} [{item['kind']}] · "
-        f"×{item['multiplicity']} · {float(item['folded_ms']):.3f} ms · {operation}"
+        f"×{item['multiplicity']} · {float(item['critical_path_ms']):.3f} ms · {operation}"
     )
 
 
