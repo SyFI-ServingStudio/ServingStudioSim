@@ -1,21 +1,42 @@
-//! Isolated GLM-5.2 iter-wise architecture.
+//! `glm52_vllm_dsa_moe` — GLM-5.2 iter-wise architecture in **vLLM kernel
+//! granularity**, for VibeSim-vs-vLLM alignment.
 //!
-//! Attention is TP1 and independently replicated over the EP ranks. Decoder
-//! layers 0--2 execute the dense FFN and a full DSA indexer. Layers 3--5 reuse
-//! the layer-2 index, then layers 6--77 repeat a four-layer cadence containing
-//! one full-index layer and three IndexShare layers. Sparse-MoE communication
-//! uses pure EP (`Placement::RoundRobin`). Shared-expert compute is conservatively
-//! serialized with routed-expert work; no auxiliary-stream overlap is claimed.
+//! Structurally identical to [`super::glm52_dsa_moe`]: attention is TP1 and
+//! independently replicated over the EP ranks; decoder layers 0--2 execute the
+//! dense FFN and a full DSA indexer; layers 3--5 reuse the layer-2 index; layers
+//! 6--77 repeat a four-layer cadence containing one full-index layer and three
+//! IndexShare layers; sparse-MoE communication is pure EP
+//! (`Placement::RoundRobin`); shared-expert compute is conservatively serialized
+//! with routed-expert work.
+//!
+//! This is a **separate static graph**, not a flag on the native arch -- the same
+//! split Qwen uses (`qwen3_moe_dp_attn_ep_ffn` / `_fp8_` /
+//! `qwen3_vllm_moe_dp_attn_ep_ffn`). The two files diverge only in leaf
+//! granularity, and keeping them apart is what stops either graph from growing
+//! `if measuring_vllm` branches.
+//!
+//! Divergences from the native graph, each traced to measured evidence recorded
+//! in `doc/alignment/glm52_dp8_ep8_report.md`:
+//!   - **fp8 activation quantisation is an explicit leaf.** vLLM launches
+//!     `scale_1x128_kernel<bf16, fp8_e4m3, float>` before every dense fp8 GEMM
+//!     (411 launches/iteration, 0.758 ms/iteration = 1.9% of measured forward
+//!     kernel time). The native graph has no such leaf, because its L1 GEMM
+//!     runner quantises outside the timed closure
+//!     (`profiling/runners/gemm/deepgemm.py`) -- so the cost is simply absent
+//!     there, not folded in.
+//!
+//! The checkpoint identity (`Glm52ModelCfg`) and MTP identity (`Glm52MtpMode`)
+//! are shared with the native graph rather than re-parsed here: they describe the
+//! checkpoint, which does not change with the measurement viewpoint.
 //!
 //! The checkpoint advertises a 1,048,576-token context. The accepted L1 timing
-//! domain is deliberately capped at 131,072 tokens in this v1 architecture.
+//! domain is deliberately capped at 131,072 tokens, as in the native graph.
 
-use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{ensure, Context, Result};
-use serde::Deserialize;
+use anyhow::Result;
 
+use crate::arch::glm52_dsa_moe::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::Fabric;
 use crate::op::moe::{MoeCombineOp, MoeDispatchOp, MoeNetConfig, MoeNetInput, Placement};
@@ -32,22 +53,22 @@ use crate::timing::{
     LeafMetrics, PerfApiBridge, Probe, SlotInput,
 };
 use crate::worklet::{
-    Glm52DenseFfnLocalWorklet, Glm52DenseFfnLocalWorkletConfig,
-    Glm52DenseFfnLocalWorkletInput, Glm52DenseFfnLocalWorkletResolved,
-    Glm52DsaAttnLocalDecodeInput, Glm52DsaAttnLocalWorklet, Glm52DsaAttnLocalWorkletConfig,
-    Glm52DsaAttnLocalWorkletInput, Glm52DsaAttnLocalWorkletResolved, Glm52MoeRouterLocalWorklet,
+    VllmGlm52DenseFfnLocalWorklet, VllmGlm52DenseFfnLocalWorkletConfig,
+    VllmGlm52DenseFfnLocalWorkletInput, VllmGlm52DenseFfnLocalWorkletResolved,
+    VllmGlm52DsaAttnLocalDecodeInput, VllmGlm52DsaAttnLocalWorklet, VllmGlm52DsaAttnLocalWorkletConfig,
+    VllmGlm52DsaAttnLocalWorkletInput, VllmGlm52DsaAttnLocalWorkletResolved, Glm52MoeRouterLocalWorklet,
     Glm52MoeRouterLocalWorkletConfig, Glm52MoeRouterLocalWorkletInput,
     Glm52MoeRouterLocalWorkletResolved, Glm52MtpHeadLocalWorklet, Glm52MtpHeadLocalWorkletConfig,
     Glm52MtpHeadLocalWorkletInput, Glm52MtpHeadLocalWorkletResolved, Glm52MtpPreludeLocalWorklet,
     Glm52MtpPreludeLocalWorkletConfig, Glm52MtpPreludeLocalWorkletInput,
-    Glm52MtpPreludeLocalWorkletResolved, Glm52SharedExpertLocalWorklet,
-    Glm52SharedExpertLocalWorkletConfig, Glm52SharedExpertLocalWorkletInput,
-    Glm52SharedExpertLocalWorkletResolved, MoeExpertComputeLocalWorklet,
+    Glm52MtpPreludeLocalWorkletResolved, VllmGlm52SharedExpertLocalWorklet,
+    VllmGlm52SharedExpertLocalWorkletConfig, VllmGlm52SharedExpertLocalWorkletInput,
+    VllmGlm52SharedExpertLocalWorkletResolved, MoeExpertComputeLocalWorklet,
     MoeExpertComputeLocalWorkletConfig, MoeExpertComputeLocalWorkletInput,
     MoeExpertComputeLocalWorkletResolved,
 };
 
-const ARCH_KIND: &str = "glm52_dsa_moe";
+const ARCH_KIND: &str = "glm52_vllm_dsa_moe";
 const TIMING_MAX_MODEL_LEN: u32 = 131_072;
 const NUM_LAYERS: u32 = 78;
 const NUM_DENSE_LAYERS: u32 = 3;
@@ -117,286 +138,23 @@ const FINALIZE_SLOTS: usize = 1;
 const MTP_PRELUDE_SLOTS: usize = 6;
 const MTP_HEAD_SLOTS: usize = 3;
 
-/// Parsed and validated GLM-5.2 checkpoint identity.
 #[derive(Clone, Debug)]
-pub struct Glm52ModelCfg {
-    pub hidden_dim: Dim,
-    pub dense_intermediate_dim: Dim,
-    pub num_attention_heads: Dim,
-    pub raw_num_kv_heads: Dim,
-    pub q_lora_rank: Dim,
-    pub kv_lora_rank: Dim,
-    pub qk_nope_head_dim: Dim,
-    pub rope_dim: Dim,
-    pub v_head_dim: Dim,
-    pub model_num_index_heads: Dim,
-    pub index_head_dim: Dim,
-    pub index_top_k: u32,
-    pub max_context: Dim,
-    pub num_experts: Dim,
-    pub router_top_k: u32,
-    pub moe_intermediate_dim: Dim,
-    pub num_shared_experts: u32,
-    pub vocab_size: Dim,
-    pub num_layers: u32,
-    pub num_mtp_layers: u32,
-    pub dtype: DType,
-    pub router_semantic_dtype: DType,
-    pub full_index_layers: Vec<u32>,
-    pub indexer_types: Vec<String>,
-    pub mlp_layer_types: Vec<String>,
-    pub index_share_for_mtp_iteration: bool,
-}
-
-impl Glm52ModelCfg {
-    pub fn from_json(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading GLM-5.2 config {}", path.display()))?;
-        parse_model_json(&text)
-            .with_context(|| format!("validating GLM-5.2 config {}", path.display()))
-    }
-}
-
-#[derive(Deserialize)]
-struct JsonGlm52Config {
-    architectures: Vec<String>,
-    model_type: String,
-    dtype: String,
-    hidden_size: u32,
-    intermediate_size: u32,
-    num_hidden_layers: u32,
-    first_k_dense_replace: u32,
-    mlp_layer_types: Vec<String>,
-    num_attention_heads: u32,
-    num_key_value_heads: u32,
-    head_dim: u32,
-    q_lora_rank: u32,
-    kv_lora_rank: u32,
-    qk_head_dim: u32,
-    qk_nope_head_dim: u32,
-    qk_rope_head_dim: u32,
-    v_head_dim: u32,
-    index_n_heads: u32,
-    index_head_dim: u32,
-    index_topk: u32,
-    index_skip_topk_offset: u32,
-    index_topk_freq: u32,
-    index_topk_pattern: Option<String>,
-    indexer_types: Vec<String>,
-    index_share_for_mtp_iteration: bool,
-    indexer_rope_interleave: bool,
-    rope_interleave: bool,
-    max_position_embeddings: u32,
-    n_routed_experts: u32,
-    num_experts_per_tok: u32,
-    moe_intermediate_size: u32,
-    n_shared_experts: u32,
-    moe_layer_freq: u32,
-    moe_router_dtype: String,
-    scoring_func: String,
-    topk_method: String,
-    n_group: u32,
-    topk_group: u32,
-    norm_topk_prob: bool,
-    routed_scaling_factor: f64,
-    vocab_size: u32,
-    num_nextn_predict_layers: u32,
-}
-
-/// Shared with `glm52_vllm_dsa_moe`: the checkpoint identity does not change
-/// with the measurement viewpoint, so both graphs parse it here.
-pub(super) fn parse_model_json(text: &str) -> Result<Glm52ModelCfg> {
-    let raw: JsonGlm52Config = serde_json::from_str(text).context("parsing JSON")?;
-    ensure!(
-        raw.architectures == ["GlmMoeDsaForCausalLM"],
-        "architectures must be [GlmMoeDsaForCausalLM]"
-    );
-    ensure!(
-        raw.model_type == "glm_moe_dsa",
-        "model_type must be glm_moe_dsa"
-    );
-    ensure!(raw.dtype == "bfloat16", "dtype must be bfloat16");
-    for (name, actual, required) in [
-        ("hidden_size", raw.hidden_size, HIDDEN_DIM),
-        (
-            "intermediate_size",
-            raw.intermediate_size,
-            DENSE_INTERMEDIATE_DIM,
-        ),
-        ("num_hidden_layers", raw.num_hidden_layers, NUM_LAYERS),
-        (
-            "first_k_dense_replace",
-            raw.first_k_dense_replace,
-            NUM_DENSE_LAYERS,
-        ),
-        (
-            "num_attention_heads",
-            raw.num_attention_heads,
-            NUM_ATTN_HEADS,
-        ),
-        (
-            "num_key_value_heads",
-            raw.num_key_value_heads,
-            RAW_NUM_KV_HEADS,
-        ),
-        ("head_dim", raw.head_dim, QK_NOPE_HEAD_DIM),
-        ("q_lora_rank", raw.q_lora_rank, Q_LORA_RANK),
-        ("kv_lora_rank", raw.kv_lora_rank, KV_LORA_RANK),
-        ("qk_head_dim", raw.qk_head_dim, QK_NOPE_HEAD_DIM + ROPE_DIM),
-        ("qk_nope_head_dim", raw.qk_nope_head_dim, QK_NOPE_HEAD_DIM),
-        ("qk_rope_head_dim", raw.qk_rope_head_dim, ROPE_DIM),
-        ("v_head_dim", raw.v_head_dim, V_HEAD_DIM),
-        ("index_n_heads", raw.index_n_heads, MODEL_INDEX_HEADS),
-        ("index_head_dim", raw.index_head_dim, INDEX_HEAD_DIM),
-        ("index_topk", raw.index_topk, INDEX_TOP_K),
-        ("index_skip_topk_offset", raw.index_skip_topk_offset, 3),
-        ("index_topk_freq", raw.index_topk_freq, 4),
-        (
-            "max_position_embeddings",
-            raw.max_position_embeddings,
-            CHECKPOINT_MAX_CONTEXT,
-        ),
-        ("n_routed_experts", raw.n_routed_experts, NUM_EXPERTS),
-        ("num_experts_per_tok", raw.num_experts_per_tok, ROUTER_TOP_K),
-        (
-            "moe_intermediate_size",
-            raw.moe_intermediate_size,
-            MOE_INTERMEDIATE_DIM,
-        ),
-        ("n_shared_experts", raw.n_shared_experts, NUM_SHARED_EXPERTS),
-        ("moe_layer_freq", raw.moe_layer_freq, 1),
-        ("n_group", raw.n_group, 1),
-        ("topk_group", raw.topk_group, 1),
-        ("vocab_size", raw.vocab_size, VOCAB_SIZE),
-        (
-            "num_nextn_predict_layers",
-            raw.num_nextn_predict_layers,
-            NUM_MTP_LAYERS,
-        ),
-    ] {
-        ensure!(
-            actual == required,
-            "{name} must be {required}, got {actual}"
-        );
-    }
-    ensure!(
-        raw.index_topk_pattern.is_none(),
-        "index_topk_pattern must be null"
-    );
-    ensure!(
-        raw.index_share_for_mtp_iteration,
-        "index_share_for_mtp_iteration must be enabled"
-    );
-    ensure!(
-        raw.indexer_rope_interleave,
-        "indexer_rope_interleave must be enabled"
-    );
-    ensure!(raw.rope_interleave, "rope_interleave must be enabled");
-    ensure!(
-        raw.moe_router_dtype == "float32",
-        "moe_router_dtype must be float32"
-    );
-    ensure!(
-        raw.scoring_func == "sigmoid",
-        "scoring_func must be sigmoid"
-    );
-    ensure!(
-        raw.topk_method == "noaux_tc",
-        "topk_method must be noaux_tc"
-    );
-    ensure!(raw.norm_topk_prob, "norm_topk_prob must be enabled");
-    ensure!(
-        raw.routed_scaling_factor == 2.5,
-        "routed_scaling_factor must be 2.5"
-    );
-
-    let expected_mlp: Vec<String> = (0..NUM_LAYERS)
-        .map(|layer| {
-            if layer < NUM_DENSE_LAYERS {
-                "dense"
-            } else {
-                "sparse"
-            }
-            .to_string()
-        })
-        .collect();
-    ensure!(
-        raw.mlp_layer_types == expected_mlp,
-        "mlp_layer_types must be dense for layers 0..2 and sparse for 3..77"
-    );
-    let expected_indexers: Vec<String> = (0..NUM_LAYERS)
-        .map(|layer| {
-            if FULL_INDEX_LAYERS.contains(&layer) {
-                "full"
-            } else {
-                "shared"
-            }
-            .to_string()
-        })
-        .collect();
-    ensure!(
-        raw.indexer_types == expected_indexers,
-        "indexer_types do not match the GLM-5.2 21-full/57-shared schedule"
-    );
-
-    Ok(Glm52ModelCfg {
-        hidden_dim: Dim::param("hidden_size", raw.hidden_size),
-        dense_intermediate_dim: Dim::param("intermediate_size", raw.intermediate_size),
-        num_attention_heads: Dim::param("num_attention_heads", raw.num_attention_heads),
-        raw_num_kv_heads: Dim::param("num_key_value_heads", raw.num_key_value_heads),
-        q_lora_rank: Dim::param("q_lora_rank", raw.q_lora_rank),
-        kv_lora_rank: Dim::param("kv_lora_rank", raw.kv_lora_rank),
-        qk_nope_head_dim: Dim::param("qk_nope_head_dim", raw.qk_nope_head_dim),
-        rope_dim: Dim::param("qk_rope_head_dim", raw.qk_rope_head_dim),
-        v_head_dim: Dim::param("v_head_dim", raw.v_head_dim),
-        model_num_index_heads: Dim::param("index_n_heads", raw.index_n_heads),
-        index_head_dim: Dim::param("index_head_dim", raw.index_head_dim),
-        index_top_k: raw.index_topk,
-        max_context: Dim::param("max_position_embeddings", raw.max_position_embeddings),
-        num_experts: Dim::param("n_routed_experts", raw.n_routed_experts),
-        router_top_k: raw.num_experts_per_tok,
-        moe_intermediate_dim: Dim::param("moe_intermediate_size", raw.moe_intermediate_size),
-        num_shared_experts: raw.n_shared_experts,
-        vocab_size: Dim::param("vocab_size", raw.vocab_size),
-        num_layers: raw.num_hidden_layers,
-        num_mtp_layers: raw.num_nextn_predict_layers,
-        dtype: DType::Bf16,
-        router_semantic_dtype: DType::Fp32,
-        full_index_layers: FULL_INDEX_LAYERS.to_vec(),
-        indexer_types: raw.indexer_types,
-        mlp_layer_types: raw.mlp_layer_types,
-        index_share_for_mtp_iteration: raw.index_share_for_mtp_iteration,
-    })
-}
-
-/// MTP execution identity. The current unified input is non-speculative, so
-/// production callers use `Off`; the other variants model a future proposer.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Glm52MtpMode {
-    #[default]
-    Off,
-    FullIndex,
-    IndexShare,
-}
-
-#[derive(Clone, Debug)]
-pub struct Glm52DsaMoeParallel {
+pub struct Glm52VllmDsaMoeParallel {
     pub ep_size: u16,
     pub nvl_num_gpu: u16,
     pub gpu_name: String,
 }
 
 #[derive(Clone, Debug)]
-pub struct Glm52DsaMoeConfigs {
+pub struct Glm52VllmDsaMoeConfigs {
     pub model: Glm52ModelCfg,
-    pub parallel: Glm52DsaMoeParallel,
+    pub parallel: Glm52VllmDsaMoeParallel,
     pub mtp_mode: Glm52MtpMode,
-    pub dense_full_index_attention: Glm52DsaAttnLocalWorkletConfig,
-    pub dense_ffn: Glm52DenseFfnLocalWorkletConfig,
-    pub initial_shared_attention: Glm52DsaAttnLocalWorkletConfig,
-    pub cycle_full_attention: Glm52DsaAttnLocalWorkletConfig,
-    pub cycle_shared_attention: Glm52DsaAttnLocalWorkletConfig,
+    pub dense_full_index_attention: VllmGlm52DsaAttnLocalWorkletConfig,
+    pub dense_ffn: VllmGlm52DenseFfnLocalWorkletConfig,
+    pub initial_shared_attention: VllmGlm52DsaAttnLocalWorkletConfig,
+    pub cycle_full_attention: VllmGlm52DsaAttnLocalWorkletConfig,
+    pub cycle_shared_attention: VllmGlm52DsaAttnLocalWorkletConfig,
     pub sparse_router: Glm52MoeRouterLocalWorkletConfig,
     pub moe_dispatch: MoeNetConfig,
     /// One config per EP rank. The rank axis is what makes the routed-expert
@@ -407,35 +165,35 @@ pub struct Glm52DsaMoeConfigs {
     /// `ep_size` identical entries, so the slot layout never changes.
     pub moe_expert_compute: Vec<MoeExpertComputeLocalWorkletConfig>,
     pub moe_combine: MoeNetConfig,
-    pub shared_expert: Glm52SharedExpertLocalWorkletConfig,
+    pub shared_expert: VllmGlm52SharedExpertLocalWorkletConfig,
     pub sparse_finalization: ElementwiseKernelConfig,
     pub embedding: ElementwiseKernelConfig,
     pub final_norm: ResidualRmsNormKernelConfig,
     pub lm_head: SingleGemmKernelConfig,
     pub mtp_prelude: Option<Glm52MtpPreludeLocalWorkletConfig>,
-    pub mtp_attention: Option<Glm52DsaAttnLocalWorkletConfig>,
+    pub mtp_attention: Option<VllmGlm52DsaAttnLocalWorkletConfig>,
     pub mtp_head: Option<Glm52MtpHeadLocalWorkletConfig>,
 }
 
 #[derive(Clone, Debug)]
-pub struct Glm52DsaMoeResolved {
-    pub raw_cfg: Glm52DsaMoeConfigs,
-    pub dense_full_index_attention: Glm52DsaAttnLocalWorkletResolved,
-    pub dense_ffn: Glm52DenseFfnLocalWorkletResolved,
-    pub initial_shared_attention: Glm52DsaAttnLocalWorkletResolved,
-    pub cycle_full_attention: Glm52DsaAttnLocalWorkletResolved,
-    pub cycle_shared_attention: Glm52DsaAttnLocalWorkletResolved,
+pub struct Glm52VllmDsaMoeResolved {
+    pub raw_cfg: Glm52VllmDsaMoeConfigs,
+    pub dense_full_index_attention: VllmGlm52DsaAttnLocalWorkletResolved,
+    pub dense_ffn: VllmGlm52DenseFfnLocalWorkletResolved,
+    pub initial_shared_attention: VllmGlm52DsaAttnLocalWorkletResolved,
+    pub cycle_full_attention: VllmGlm52DsaAttnLocalWorkletResolved,
+    pub cycle_shared_attention: VllmGlm52DsaAttnLocalWorkletResolved,
     pub sparse_router: Glm52MoeRouterLocalWorkletResolved,
     pub moe_dispatch: MoeNetConfig,
     pub moe_expert_compute: Vec<MoeExpertComputeLocalWorkletResolved>,
     pub moe_combine: MoeNetConfig,
-    pub shared_expert: Glm52SharedExpertLocalWorkletResolved,
+    pub shared_expert: VllmGlm52SharedExpertLocalWorkletResolved,
     pub sparse_finalization: ElementwiseKernelConfig,
     pub embedding: ElementwiseKernelConfig,
     pub final_norm: ResidualRmsNormKernelConfig,
     pub lm_head: SingleGemmKernelConfig,
     pub mtp_prelude: Option<Glm52MtpPreludeLocalWorkletResolved>,
-    pub mtp_attention: Option<Glm52DsaAttnLocalWorkletResolved>,
+    pub mtp_attention: Option<VllmGlm52DsaAttnLocalWorkletResolved>,
     pub mtp_head: Option<Glm52MtpHeadLocalWorkletResolved>,
 }
 
@@ -448,16 +206,17 @@ fn fit_failed(reason: impl Into<String>) -> BuildError {
 
 fn attention_config(
     model: &Glm52ModelCfg,
-    parallel: &Glm52DsaMoeParallel,
+    parallel: &Glm52VllmDsaMoeParallel,
     include_indexer: bool,
     fp8: bool,
-) -> Glm52DsaAttnLocalWorkletConfig {
+) -> VllmGlm52DsaAttnLocalWorkletConfig {
     let (gemm_dtype, gemm_backends) = if fp8 {
         (DType::Fp8E4m3, FP8_SINGLE_GEMM_BACKENDS)
     } else {
         (DType::Bf16, SINGLE_GEMM_BACKENDS)
     };
-    Glm52DsaAttnLocalWorkletConfig {
+    VllmGlm52DsaAttnLocalWorkletConfig {
+        fp8_quant_backends: FP8_QUANT_BACKENDS.to_vec(),
         include_indexer,
         residual_rms_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
         rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
@@ -518,11 +277,11 @@ fn attention_config(
 
 pub fn build_configs(
     model: &Glm52ModelCfg,
-    parallel: &Glm52DsaMoeParallel,
+    parallel: &Glm52VllmDsaMoeParallel,
     routing: &RoutingDistribution,
     fp8: bool,
     mtp_mode: Glm52MtpMode,
-) -> Result<Glm52DsaMoeConfigs, BuildError> {
+) -> Result<Glm52VllmDsaMoeConfigs, BuildError> {
     validate_model_cfg(model).map_err(fit_failed)?;
     if parallel.ep_size == 0 {
         return Err(fit_failed("ep_size must be positive"));
@@ -618,12 +377,13 @@ pub fn build_configs(
         gemm_dtype,
     });
 
-    Ok(Glm52DsaMoeConfigs {
+    Ok(Glm52VllmDsaMoeConfigs {
         model: model.clone(),
         parallel: parallel.clone(),
         mtp_mode,
         dense_full_index_attention,
-        dense_ffn: Glm52DenseFfnLocalWorkletConfig {
+        dense_ffn: VllmGlm52DenseFfnLocalWorkletConfig {
+            fp8_quant_backends: FP8_QUANT_BACKENDS.to_vec(),
             residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
             gemm_backends: gemm_backends.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
@@ -681,8 +441,9 @@ pub fn build_configs(
             routing.ppm(),
         ),
         moe_combine: moe_net,
-        shared_expert: Glm52SharedExpertLocalWorkletConfig {
+        shared_expert: VllmGlm52SharedExpertLocalWorkletConfig {
             gemm_backends: gemm_backends.to_vec(),
+            fp8_quant_backends: FP8_QUANT_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
             hidden_dim: model.hidden_dim.clone(),
@@ -819,17 +580,17 @@ fn validate_model_cfg(model: &Glm52ModelCfg) -> std::result::Result<(), String> 
     Ok(())
 }
 
-pub fn resolve_configs(cfgs: &Glm52DsaMoeConfigs) -> Glm52DsaMoeResolved {
-    Glm52DsaMoeResolved {
-        dense_full_index_attention: Glm52DsaAttnLocalWorklet::resolve_config(
+pub fn resolve_configs(cfgs: &Glm52VllmDsaMoeConfigs) -> Glm52VllmDsaMoeResolved {
+    Glm52VllmDsaMoeResolved {
+        dense_full_index_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
             &cfgs.dense_full_index_attention,
         ),
-        dense_ffn: Glm52DenseFfnLocalWorklet::resolve_config(&cfgs.dense_ffn),
-        initial_shared_attention: Glm52DsaAttnLocalWorklet::resolve_config(
+        dense_ffn: VllmGlm52DenseFfnLocalWorklet::resolve_config(&cfgs.dense_ffn),
+        initial_shared_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
             &cfgs.initial_shared_attention,
         ),
-        cycle_full_attention: Glm52DsaAttnLocalWorklet::resolve_config(&cfgs.cycle_full_attention),
-        cycle_shared_attention: Glm52DsaAttnLocalWorklet::resolve_config(
+        cycle_full_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(&cfgs.cycle_full_attention),
+        cycle_shared_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
             &cfgs.cycle_shared_attention,
         ),
         sparse_router: Glm52MoeRouterLocalWorklet::resolve_config(&cfgs.sparse_router),
@@ -840,7 +601,7 @@ pub fn resolve_configs(cfgs: &Glm52DsaMoeConfigs) -> Glm52DsaMoeResolved {
             .map(MoeExpertComputeLocalWorklet::resolve_config)
             .collect(),
         moe_combine: cfgs.moe_combine.clone(),
-        shared_expert: Glm52SharedExpertLocalWorklet::resolve_config(&cfgs.shared_expert),
+        shared_expert: VllmGlm52SharedExpertLocalWorklet::resolve_config(&cfgs.shared_expert),
         sparse_finalization: cfgs.sparse_finalization.clone(),
         embedding: cfgs.embedding.clone(),
         final_norm: cfgs.final_norm.clone(),
@@ -852,7 +613,7 @@ pub fn resolve_configs(cfgs: &Glm52DsaMoeConfigs) -> Glm52DsaMoeResolved {
         mtp_attention: cfgs
             .mtp_attention
             .as_ref()
-            .map(Glm52DsaAttnLocalWorklet::resolve_config),
+            .map(VllmGlm52DsaAttnLocalWorklet::resolve_config),
         mtp_head: cfgs
             .mtp_head
             .as_ref()
@@ -863,13 +624,13 @@ pub fn resolve_configs(cfgs: &Glm52DsaMoeConfigs) -> Glm52DsaMoeResolved {
 
 struct Glm52SparseBody {
     name: String,
-    attention: Glm52DsaAttnLocalWorklet,
+    attention: VllmGlm52DsaAttnLocalWorklet,
     router: Glm52MoeRouterLocalWorklet,
     dispatch: MoeDispatchOp,
     /// One per EP rank, in rank order.
     expert_compute: Vec<MoeExpertComputeLocalWorklet>,
     combine: MoeCombineOp,
-    shared_expert: Glm52SharedExpertLocalWorklet,
+    shared_expert: VllmGlm52SharedExpertLocalWorklet,
     finalization: Op<ElementwiseKernel>,
     ep_size: u16,
     top_k: u32,
@@ -878,12 +639,12 @@ struct Glm52SparseBody {
 impl Glm52SparseBody {
     fn build(
         name: String,
-        attention: Glm52DsaAttnLocalWorkletResolved,
-        common: &Glm52DsaMoeResolved,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        common: &Glm52VllmDsaMoeResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
         let attention =
-            Glm52DsaAttnLocalWorklet::build(format!("{name}.attention"), attention, bridge)?;
+            VllmGlm52DsaAttnLocalWorklet::build(format!("{name}.attention"), attention, bridge)?;
         let router = Glm52MoeRouterLocalWorklet::build(
             format!("{name}.moe.router"),
             common.sparse_router.clone(),
@@ -913,7 +674,7 @@ impl Glm52SparseBody {
             common.moe_combine.clone(),
             bridge,
         )?;
-        let shared_expert = Glm52SharedExpertLocalWorklet::build(
+        let shared_expert = VllmGlm52SharedExpertLocalWorklet::build(
             format!("{name}.moe.shared_expert"),
             common.shared_expert.clone(),
             bridge,
@@ -1023,7 +784,7 @@ impl Glm52SparseBody {
         );
         for group in &batch.groups {
             self.shared_expert.eval(
-                &Glm52SharedExpertLocalWorkletInput {
+                &VllmGlm52SharedExpertLocalWorkletInput {
                     batch_tokens: group.batch_tokens,
                 },
                 ev,
@@ -1048,7 +809,7 @@ struct Glm52MtpSection {
     head: Glm52MtpHeadLocalWorklet,
 }
 
-pub struct Glm52DsaMoeModel {
+pub struct Glm52VllmDsaMoeModel {
     pub name: String,
     pub mtp_mode: Glm52MtpMode,
     pub ep_size: u16,
@@ -1057,8 +818,8 @@ pub struct Glm52DsaMoeModel {
     pub num_attn_shards: u16,
     pub total_state_bytes_per_token: u64,
     pub embedding: Op<ElementwiseKernel>,
-    pub dense_full_index_attention: Glm52DsaAttnLocalWorklet,
-    pub dense_ffn: Glm52DenseFfnLocalWorklet,
+    pub dense_full_index_attention: VllmGlm52DsaAttnLocalWorklet,
+    pub dense_ffn: VllmGlm52DenseFfnLocalWorklet,
     initial_shared_sparse: Glm52SparseBody,
     cycle_full_sparse: Glm52SparseBody,
     cycle_shared_sparse: Glm52SparseBody,
@@ -1071,9 +832,9 @@ pub struct Glm52DsaMoeModel {
 
 pub fn build(
     name: String,
-    resolved: Glm52DsaMoeResolved,
+    resolved: Glm52VllmDsaMoeResolved,
     bridge: &PerfApiBridge,
-) -> Result<Glm52DsaMoeModel, BuildError> {
+) -> Result<Glm52VllmDsaMoeModel, BuildError> {
     let ep_size = resolved.raw_cfg.parallel.ep_size;
     let nvl_num_gpu = resolved.raw_cfg.parallel.nvl_num_gpu;
     let mtp_mode = resolved.raw_cfg.mtp_mode;
@@ -1083,12 +844,12 @@ pub fn build(
         ElementwiseKernel::build,
         bridge,
     )?;
-    let dense_full_index_attention = Glm52DsaAttnLocalWorklet::build(
+    let dense_full_index_attention = VllmGlm52DsaAttnLocalWorklet::build(
         format!("{name}.body.dense_full_index.attention"),
         resolved.dense_full_index_attention.clone(),
         bridge,
     )?;
-    let dense_ffn = Glm52DenseFfnLocalWorklet::build(
+    let dense_ffn = VllmGlm52DenseFfnLocalWorklet::build(
         format!("{name}.body.dense_full_index.ffn"),
         resolved.dense_ffn.clone(),
         bridge,
@@ -1152,7 +913,7 @@ pub fn build(
 
     let total_state_bytes_per_token = state_bytes_per_token(mtp_mode)?;
     let fp8 = resolved.raw_cfg.moe_expert_compute[0].dtype == DType::Fp8E4m3;
-    let mut model = Glm52DsaMoeModel {
+    let mut model = Glm52VllmDsaMoeModel {
         name,
         mtp_mode,
         ep_size,
@@ -1185,7 +946,7 @@ pub fn build(
     Ok(model)
 }
 
-impl Glm52DsaMoeModel {
+impl Glm52VllmDsaMoeModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let embedding = labeled_max(
@@ -1282,7 +1043,7 @@ impl Glm52DsaMoeModel {
         }
         let root = CostNode::Labeled {
             label: format!(
-                "{} (Glm52DsaMoeModel) [EP{}; attention TP1/DP{}; MTP={:?}; timing_context<=131072]",
+                "{} (Glm52VllmDsaMoeModel) [EP{}; attention TP1/DP{}; MTP={:?}; timing_context<=131072]",
                 self.name, self.ep_size, self.num_attn_dp_groups, self.mtp_mode
             ),
             child: Box::new(CostNode::Sum(children)),
@@ -1292,7 +1053,7 @@ impl Glm52DsaMoeModel {
 
     fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
         let batch = normalize_input(input, self.ep_size)
-            .unwrap_or_else(|reason| panic!("invalid Glm52DsaMoeModel input: {reason}"));
+            .unwrap_or_else(|reason| panic!("invalid Glm52VllmDsaMoeModel input: {reason}"));
 
         for group in &batch.groups {
             eval_atomic_or_zero(
@@ -1310,7 +1071,7 @@ impl Glm52DsaMoeModel {
         }
         for group in &batch.groups {
             self.dense_ffn.eval(
-                &Glm52DenseFfnLocalWorkletInput {
+                &VllmGlm52DenseFfnLocalWorkletInput {
                     batch_tokens: group.batch_tokens,
                 },
                 ev,
@@ -1363,7 +1124,7 @@ impl Glm52DsaMoeModel {
     }
 }
 
-impl IterwiseUnifiedModel for Glm52DsaMoeModel {
+impl IterwiseUnifiedModel for Glm52VllmDsaMoeModel {
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_state_bytes_per_token
     }
@@ -1434,7 +1195,7 @@ struct NormalizedGroup {
     decode_tokens: u32,
     request_count: u32,
     decode_context: Option<u32>,
-    attention_input: Glm52DsaAttnLocalWorkletInput,
+    attention_input: VllmGlm52DsaAttnLocalWorkletInput,
 }
 
 #[derive(Clone, Debug)]
@@ -1454,12 +1215,12 @@ impl NormalizedBatch {
                 decode_tokens: group.decode_tokens,
                 request_count: group.decode_tokens,
                 decode_context: group.decode_context,
-                attention_input: Glm52DsaAttnLocalWorkletInput {
+                attention_input: VllmGlm52DsaAttnLocalWorkletInput {
                     num_new_tokens: group.decode_tokens,
                     prefill_query_cache_pairs: Vec::new(),
                     decode: group
                         .decode_context
-                        .map(|context_len| Glm52DsaAttnLocalDecodeInput {
+                        .map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
                             batch_size: group.decode_tokens,
                             context_len,
                             requires_padding: false,
@@ -1557,10 +1318,10 @@ fn normalize_input(
             decode_tokens,
             request_count,
             decode_context,
-            attention_input: Glm52DsaAttnLocalWorkletInput {
+            attention_input: VllmGlm52DsaAttnLocalWorkletInput {
                 num_new_tokens: batch_tokens,
                 prefill_query_cache_pairs,
-                decode: decode_context.map(|context_len| Glm52DsaAttnLocalDecodeInput {
+                decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
                     batch_size: decode_tokens,
                     context_len,
                     requires_padding: false,
@@ -1647,16 +1408,24 @@ fn expected_slot_count(ep_size: u16, fp8: bool, mtp_mode: Glm52MtpMode) -> usize
     // optional MTP sparse decoder all reuse this worklet, so keep the selector
     // at the L4 formula seam rather than hard-coding FP8 counts.
     let expert_slots = EXPERT_SLOTS + usize::from(fp8) * 2;
-    let dense = ep * (ATTN_FULL_SLOTS + DENSE_FFN_SLOTS);
+    // vLLM granularity: one activation-quantisation leaf per dense FP8 GEMM.
+    // Attention contributes three everywhere (fused_qkv_a_proj, q_b_proj,
+    // o_proj) plus a fourth on a full-index layer, for the indexer's q_proj.
+    // The dense FFN and the shared expert contribute two each.
+    let attn_full_slots = ATTN_FULL_SLOTS + usize::from(fp8) * 4;
+    let attn_shared_slots = ATTN_SHARED_SLOTS + usize::from(fp8) * 3;
+    let dense_ffn_slots = DENSE_FFN_SLOTS + usize::from(fp8) * 2;
+    let shared_expert_slots = SHARED_EXPERT_SLOTS + usize::from(fp8) * 2;
+    let dense = ep * (attn_full_slots + dense_ffn_slots);
     let sparse_shared = ep
-        * (ATTN_SHARED_SLOTS
+        * (attn_shared_slots
             + ROUTER_SLOTS
             + expert_slots
-            + SHARED_EXPERT_SLOTS
+            + shared_expert_slots
             + FINALIZE_SLOTS)
         + DISPATCH_SLOTS
         + COMBINE_SLOTS;
-    let sparse_full = sparse_shared + ep * (ATTN_FULL_SLOTS - ATTN_SHARED_SLOTS);
+    let sparse_full = sparse_shared + ep * (attn_full_slots - attn_shared_slots);
     let main = ep + dense + sparse_shared + sparse_full + sparse_shared + ep + ep;
     match mtp_mode {
         Glm52MtpMode::Off => main,
@@ -1738,11 +1507,11 @@ mod tests {
     }
 
     fn model() -> Glm52ModelCfg {
-        parse_model_json(&exact_json_value().to_string()).unwrap()
+        crate::arch::glm52_dsa_moe::parse_model_json(&exact_json_value().to_string()).unwrap()
     }
 
-    fn parallel(ep_size: u16) -> Glm52DsaMoeParallel {
-        Glm52DsaMoeParallel {
+    fn parallel(ep_size: u16) -> Glm52VllmDsaMoeParallel {
+        Glm52VllmDsaMoeParallel {
             ep_size,
             nvl_num_gpu: ep_size.min(8),
             gpu_name: "NVIDIA H200".to_string(),
@@ -1750,59 +1519,61 @@ mod tests {
     }
 
     #[test]
-    fn parser_accepts_only_the_exact_checkpoint_and_public_from_json_works() {
-        let parsed = model();
-        assert_eq!(parsed.hidden_dim, 6144);
-        assert_eq!(parsed.raw_num_kv_heads, 64);
-        assert_eq!(parsed.full_index_layers, FULL_INDEX_LAYERS);
-        assert_eq!(parsed.full_index_layers.len(), 21);
-        assert_eq!(
-            parsed
-                .indexer_types
-                .iter()
-                .filter(|kind| *kind == "shared")
-                .count(),
-            57
-        );
-        assert_eq!(
-            parsed
-                .mlp_layer_types
-                .iter()
-                .filter(|kind| *kind == "dense")
-                .count(),
-            3
-        );
-        assert_eq!(parsed.max_context, CHECKPOINT_MAX_CONTEXT);
-        assert_eq!(parsed.router_semantic_dtype, DType::Fp32);
+    fn routed_expert_shards_carry_the_routing_skew_per_ep_rank() {
+        let ep_size = 8_u16;
+        let experts_per_rank = (NUM_EXPERTS / u32::from(ep_size)) as usize;
 
-        let path = std::env::temp_dir().join(format!("glm52_exact_{}.json", std::process::id()));
-        std::fs::write(&path, exact_json_value().to_string()).unwrap();
-        let from_file = Glm52ModelCfg::from_json(&path).unwrap();
-        std::fs::remove_file(path).ok();
-        assert_eq!(from_file.full_index_layers, FULL_INDEX_LAYERS);
-    }
-
-    #[test]
-    fn parser_rejects_dimension_schedule_dtype_and_mtp_indexshare_drift() {
-        for (field, bad) in [
-            ("hidden_size", serde_json::json!(4096)),
-            ("dtype", serde_json::json!("float16")),
-            ("num_nextn_predict_layers", serde_json::json!(2)),
-            ("index_share_for_mtp_iteration", serde_json::json!(false)),
-        ] {
-            let mut value = exact_json_value();
-            value[field] = bad;
-            assert!(
-                parse_model_json(&value.to_string()).is_err(),
-                "field {field}"
-            );
+        // Uniform: 1e6 ppm does not divide 256 evenly, so `uniform` hands the
+        // 64-ppm remainder to the first 64 experts — ranks 0-1 carry 3907 and
+        // ranks 2-7 carry 3906. Each rank is internally flat, and the ±1 ppm
+        // is far below the resolution of `to_per_expert_counts`, so this only
+        // means two grouped-GEMM cache keys instead of one.
+        let uniform = build_configs(
+            &model(),
+            &parallel(ep_size),
+            &RoutingDistribution::uniform(NUM_EXPERTS),
+            true,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        assert_eq!(uniform.moe_expert_compute.len(), usize::from(ep_size));
+        for shard in &uniform.moe_expert_compute {
+            assert_eq!(shard.local_ppm.len(), experts_per_rank);
+            assert!(shard.local_ppm.iter().all(|ppm| *ppm == shard.local_ppm[0]));
+            assert!((3906..=3907).contains(&shard.local_ppm[0]));
         }
-        let mut indexers = exact_json_value();
-        indexers["indexer_types"][6] = serde_json::json!("shared");
-        assert!(parse_model_json(&indexers.to_string()).is_err());
-        let mut mlp = exact_json_value();
-        mlp["mlp_layer_types"][3] = serde_json::json!("dense");
-        assert!(parse_model_json(&mlp.to_string()).is_err());
+        assert_eq!(uniform.moe_expert_compute[0].local_ppm[0], 3907);
+        assert_eq!(uniform.moe_expert_compute[7].local_ppm[0], 3906);
+
+        // A profile that loads the first rank's experts twice as heavily as the
+        // last rank's must reach the grouped-GEMM cache key, not just the
+        // dispatch/combine byte counts.
+        let mut ratios = vec![0.5_f32; NUM_EXPERTS as usize];
+        ratios[..experts_per_rank].fill(1.5);
+        let skewed = build_configs(
+            &model(),
+            &parallel(ep_size),
+            &RoutingDistribution::from_profile(&ratios),
+            true,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        let shard_totals: Vec<u32> = skewed
+            .moe_expert_compute
+            .iter()
+            .map(|shard| shard.local_ppm.iter().sum())
+            .collect();
+        assert!(
+            shard_totals[0] > 2 * shard_totals[usize::from(ep_size) - 1],
+            "heaviest EP rank must dominate the lightest, got {shard_totals:?}"
+        );
+        assert_ne!(
+            skewed.moe_expert_compute[0].local_ppm,
+            uniform.moe_expert_compute[0].local_ppm
+        );
+        // The skew must NOT leak into the dispatch/combine byte model's own
+        // copy of the distribution being the only place it lands.
+        assert_eq!(skewed.moe_dispatch.routing.ppm().len(), NUM_EXPERTS as usize);
     }
 
     #[test]
@@ -1974,17 +1745,17 @@ mod tests {
     fn parallel_and_routing_validation_is_explicit() {
         let routing = RoutingDistribution::uniform(NUM_EXPERTS);
         for p in [
-            Glm52DsaMoeParallel {
+            Glm52VllmDsaMoeParallel {
                 ep_size: 0,
                 nvl_num_gpu: 1,
                 gpu_name: "NVIDIA H200".into(),
             },
-            Glm52DsaMoeParallel {
+            Glm52VllmDsaMoeParallel {
                 ep_size: 7,
                 nvl_num_gpu: 1,
                 gpu_name: "NVIDIA H200".into(),
             },
-            Glm52DsaMoeParallel {
+            Glm52VllmDsaMoeParallel {
                 ep_size: 8,
                 nvl_num_gpu: 3,
                 gpu_name: "NVIDIA H200".into(),
@@ -2034,28 +1805,83 @@ mod tests {
         assert!(resolved.mtp_attention.as_ref().unwrap().indexer.is_some());
     }
 
+    /// The falsifiable acceptance condition from
+    /// `doc/alignment/glm52_dp8_ep8_report.md` section 4.3: every measured
+    /// `scale_1x128_kernel<bf16, fp8_e4m3, float>` launch has exactly one
+    /// simulated quant leaf, and none is invented. 411 launches/iteration were
+    /// decoded there by their successor GEMM's (N, K).
+    #[test]
+    fn fp8_quant_leaves_reproduce_the_measured_launch_census() {
+        // Per layer variant: attention 3 (fused_qkv_a_proj, q_b_proj, o_proj)
+        // + FFN 2 (gate_up, down) + 1 more where an indexer runs (its q_proj).
+        let dense = 3 + 1 + 2; // dense layer: indexer + dense FFN
+        let sparse_full = 3 + 1 + 2; // full-index sparse: indexer + shared expert
+        let sparse_share = 3 + 2; // IndexShare sparse: shared expert only
+        let measured = NUM_DENSE_LAYERS as usize * dense
+            + FULL_INDEX_LAYERS
+                .iter()
+                .filter(|layer| **layer >= NUM_DENSE_LAYERS)
+                .count()
+                * sparse_full
+            + (NUM_LAYERS as usize
+                - NUM_DENSE_LAYERS as usize
+                - FULL_INDEX_LAYERS
+                    .iter()
+                    .filter(|layer| **layer >= NUM_DENSE_LAYERS)
+                    .count())
+                * sparse_share;
+        assert_eq!(measured, 411, "measured quant-launch census per iteration");
+
+        // Read the same census off the slot formula. The FP8-minus-BF16 delta
+        // is every quant leaf in the graph, which splits exactly as the two
+        // measured kernel templates do:
+        //   22 per EP rank -- this graph's new dense-GEMM quants (the 411
+        //      `scale_1x128<bf16, fp8_e4m3, float>` launches);
+        //    6 per EP rank -- the routed grouped-GEMM quants the native graph
+        //      already models (the 150 `scale_1x128<(bool)0, ...>` launches),
+        //      contributed by `expert_slots` in the three sparse variants.
+        let dense_gemm_quants_per_rank = dense + sparse_full + sparse_share + sparse_share;
+        let routed_quants_per_rank = 3 * 2;
+        assert_eq!(dense_gemm_quants_per_rank, 22);
+        for ep in [1_u16, 2, 4, 8] {
+            let delta = expected_slot_count(ep, true, Glm52MtpMode::Off)
+                - expected_slot_count(ep, false, Glm52MtpMode::Off);
+            assert_eq!(
+                delta,
+                (dense_gemm_quants_per_rank + routed_quants_per_rank) * usize::from(ep)
+            );
+        }
+    }
+
     #[test]
     fn schedule_and_slot_formulas_match_the_composed_leaf_contracts() {
         assert_eq!(3 + 3 + 18 * (1 + 3), 78);
         assert_eq!(FULL_INDEX_LAYERS.len(), 21);
         assert_eq!(78 - FULL_INDEX_LAYERS.len(), 57);
+        // BF16 counts match the native graph exactly: with no FP8 GEMM there
+        // is nothing to quantise, so this graph adds no leaves.
         assert_eq!(expected_slot_count(8, false, Glm52MtpMode::Off), 1_026);
-        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::Off), 1_074);
         assert_eq!(expected_slot_count(8, false, Glm52MtpMode::FullIndex), 1_424);
-        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::FullIndex), 1_488);
         assert_eq!(expected_slot_count(8, false, Glm52MtpMode::IndexShare), 1_304);
-        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::IndexShare), 1_368);
+        // FP8 adds the vLLM activation-quantisation leaves: five per layer
+        // variant (attention 3 + FFN 2), plus a sixth on the two variants that
+        // run an indexer (its q_proj). That is 22 x ep = 176 more than the
+        // native graph's 1_074. See `doc/alignment/glm52_dp8_ep8_report.md`
+        // section 4.3, which decodes each measured launch by its GEMM shape.
+        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::Off), 1_074 + 176);
+        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::FullIndex), 1_488 + 224);
+        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::IndexShare), 1_368 + 216);
         for ep in [1_u16, 2, 4, 8, 16] {
             let ep = usize::from(ep);
             assert_eq!(expected_slot_count(ep as u16, false, Glm52MtpMode::Off), 126 * ep + 18);
-            assert_eq!(expected_slot_count(ep as u16, true, Glm52MtpMode::Off), 132 * ep + 18);
+            assert_eq!(expected_slot_count(ep as u16, true, Glm52MtpMode::Off), 154 * ep + 18);
             assert_eq!(
                 expected_slot_count(ep as u16, false, Glm52MtpMode::FullIndex),
                 175 * ep + 24
             );
             assert_eq!(
                 expected_slot_count(ep as u16, true, Glm52MtpMode::FullIndex),
-                183 * ep + 24
+                211 * ep + 24
             );
             assert_eq!(
                 expected_slot_count(ep as u16, false, Glm52MtpMode::IndexShare),
@@ -2063,7 +1889,7 @@ mod tests {
             );
             assert_eq!(
                 expected_slot_count(ep as u16, true, Glm52MtpMode::IndexShare),
-                168 * ep + 24
+                195 * ep + 24
             );
         }
     }

@@ -20,11 +20,12 @@ use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, Routi
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    glm52_dsa_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen3_attn_layerwise,
+    glm52_dsa_moe, glm52_vllm_dsa_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen3_attn_layerwise,
     qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
     qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel, DenseParallel,
     DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52DsaMoeModel, Glm52DsaMoeParallel,
-    Glm52ModelCfg, Glm52MtpMode, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
+    Glm52ModelCfg, Glm52MtpMode, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
+    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
     Llama3DpAttnTpFfnModel, Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel,
     Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel,
     Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
@@ -61,6 +62,16 @@ pub fn moe_model_cfg(model_spec: &ModelSpec) -> Result<MoeModelCfg> {
 /// homogeneous dense/MoE helpers, this architecture cannot truncate or scale a
 /// representative subset of layers: its full-index and dense/sparse schedules
 /// are tied to exact layer numbers.
+/// Sparse (MoE) decoder layers, read off the checkpoint's own layer schedule
+/// rather than assumed. An expert-popularity profile is keyed by this count.
+fn num_sparse_layers(model_cfg: &Glm52ModelCfg) -> u32 {
+    model_cfg
+        .mlp_layer_types
+        .iter()
+        .filter(|kind| kind.as_str() == "sparse")
+        .count() as u32
+}
+
 pub fn glm52_model_cfg(model_spec: &ModelSpec) -> Result<Glm52ModelCfg> {
     ensure_glm52_model_spec(model_spec)?;
     Glm52ModelCfg::from_json(Path::new(&model_spec.model_config))
@@ -677,12 +688,24 @@ pub fn glm52_dsa_moe(
     routing_kind: RoutingKind,
     routing_seed: Option<u64>,
     mtp_mode: Glm52MtpMode,
+    expert_popularity_file: Option<&str>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
 ) -> Result<Glm52DsaMoeModel> {
     let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 model config")?;
-    let routing = resolve_routing(routing_kind, routing_seed, 256);
+    let routing = resolve_routing_source(
+        routing_kind,
+        routing_seed,
+        model_cfg.num_experts.get(),
+        ep_size,
+        // GLM's first three decoder layers are dense, so the MoE-layer count a
+        // popularity profile is keyed by is NOT `num_layers` (unlike Qwen,
+        // where every layer is sparse).
+        num_sparse_layers(&model_cfg),
+        model_cfg.router_top_k,
+        expert_popularity_file,
+    )?;
     let parallel = Glm52DsaMoeParallel {
         ep_size,
         nvl_num_gpu,
@@ -694,6 +717,48 @@ pub fn glm52_dsa_moe(
     let resolved = glm52_dsa_moe::resolve_configs(&configs);
     glm52_dsa_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.2 DSA-MoE model (often a missing profile.db row)")
+}
+
+/// Build the GLM-5.2 model in vLLM kernel granularity. Same topology and
+/// parameters as [`glm52_dsa_moe`]; only the leaf cuts differ, so the two share
+/// the checkpoint identity and the layer-override refusal.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_vllm_dsa_moe(
+    model_spec: &ModelSpec,
+    ep_size: u16,
+    nvl_num_gpu: u16,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    mtp_mode: Glm52MtpMode,
+    expert_popularity_file: Option<&str>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmDsaMoeModel> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 model config")?;
+    let routing = resolve_routing_source(
+        routing_kind,
+        routing_seed,
+        model_cfg.num_experts.get(),
+        ep_size,
+        // GLM's first three decoder layers are dense, so the MoE-layer count a
+        // popularity profile is keyed by is NOT `num_layers` (unlike Qwen,
+        // where every layer is sparse).
+        num_sparse_layers(&model_cfg),
+        model_cfg.router_top_k,
+        expert_popularity_file,
+    )?;
+    let parallel = Glm52VllmDsaMoeParallel {
+        ep_size,
+        nvl_num_gpu,
+        gpu_name: gpu.to_string(),
+    };
+    let configs =
+        glm52_vllm_dsa_moe::build_configs(&model_cfg, &parallel, &routing, model_spec.fp8, mtp_mode)
+            .context("expanding vLLM-granularity GLM-5.2 architecture configs")?;
+    let resolved = glm52_vllm_dsa_moe::resolve_configs(&configs);
+    glm52_vllm_dsa_moe::build(name.to_string(), resolved, bridge)
+        .context("building vLLM-granularity GLM-5.2 model (often a missing profile.db row)")
 }
 
 /// Build the AFD attn-side (layer-wise) Qwen3-MoE model — attention only, for ONE
@@ -877,6 +942,7 @@ pub fn build_iter_model(
             routing,
             routing_seed,
             mtp_mode,
+            expert_popularity_file,
         } => Box::new(glm52_dsa_moe(
             model,
             *ep_size,
@@ -884,6 +950,27 @@ pub fn build_iter_model(
             *routing,
             *routing_seed,
             *mtp_mode,
+            expert_popularity_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Glm52VllmDsaMoe {
+            model,
+            ep_size,
+            nvl_num_gpu,
+            routing,
+            routing_seed,
+            mtp_mode,
+            expert_popularity_file,
+        } => Box::new(glm52_vllm_dsa_moe(
+            model,
+            *ep_size,
+            *nvl_num_gpu,
+            *routing,
+            *routing_seed,
+            *mtp_mode,
+            expert_popularity_file.as_deref(),
             gpu,
             name,
             bridge,
@@ -1111,6 +1198,15 @@ mod tests {
             sim_num_layers: None,
             fp8: false,
         }
+    }
+
+    #[test]
+    fn glm52_sparse_layer_count_matches_the_checkpoint_schedule() {
+        // A popularity profile is keyed by MoE layers, not decoder layers.
+        // GLM's first three are dense, so these must differ by exactly three.
+        let model = glm52_model_cfg(&glm52_model_spec()).unwrap();
+        assert_eq!(model.num_layers, 78);
+        assert_eq!(num_sparse_layers(&model), 75);
     }
 
     #[test]

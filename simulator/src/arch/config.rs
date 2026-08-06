@@ -193,6 +193,39 @@ pub enum IterArchSel {
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
     },
+    /// The same GLM-5.2 schedule as `glm52_dsa_moe`, expressed in vLLM's kernel
+    /// granularity for framework alignment. Same parameters, same topology; the
+    /// graphs differ only in how leaves are cut. See
+    /// `arch/glm52_vllm_dsa_moe.rs` for the itemised divergences.
+    Glm52VllmDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Expert-parallel ranks and independent local-attention DP groups.
+        #[serde(default = "default_glm52_parallel_size")]
+        #[param(default = 8, cache_key)]
+        ep_size: u16,
+        /// NVLink-domain size for the MoE dispatch/combine split.
+        #[serde(default = "default_glm52_parallel_size")]
+        #[param(default = 8, cache_key)]
+        nvl_num_gpu: u16,
+        /// Expert routing distribution used by dispatch/combine.
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        /// Seed for `routing = random`; ignored for uniform routing.
+        #[serde(default)]
+        routing_seed: Option<u64>,
+        /// Optional MTP proposer work: off, full-index step 0, or a later
+        /// IndexShare step.
+        #[serde(default)]
+        #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
+        mtp_mode: Glm52MtpMode,
+        /// Measured per-expert popularity from a profile pass. Requires
+        /// `routing = uniform`; the profile replaces the synthetic distribution.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+    },
     /// GLM-5.2's exact heterogeneous 78-layer DSA/MoE schedule. Attention is
     /// local (TP1) on every EP rank and pairs with `hp_unified`, whose KV/input
     /// partitions correspond one-for-one with the EP ranks.
@@ -219,6 +252,11 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
         mtp_mode: Glm52MtpMode,
+        /// Measured per-expert popularity from a profile pass. Requires
+        /// `routing = uniform`; the profile replaces the synthetic distribution.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
     },
 }
 
@@ -232,7 +270,8 @@ impl IterArchSel {
             | Self::Qwen3MoeDpAttnEpFfn { model, .. }
             | Self::Qwen3MoeFp8DpAttnEpFfn { model, .. }
             | Self::Qwen3VllmMoeDpAttnEpFfn { model, .. }
-            | Self::Glm52DsaMoe { model, .. } => model,
+            | Self::Glm52DsaMoe { model, .. }
+            | Self::Glm52VllmDsaMoe { model, .. } => model,
         }
     }
 }
@@ -334,6 +373,73 @@ mod iter_tests {
     }
 
     #[test]
+    fn glm52_vllm_selector_is_registered_and_shares_the_glm_parameter_surface() {
+        let parsed: IterArchSel = serde_json::from_str(
+            r#"{"type":"glm52_vllm_dsa_moe","model_config":"model/config/glm52.json","fp8":true}"#,
+        )
+        .expect("vLLM-granularity GLM selector parses");
+        let IterArchSel::Glm52VllmDsaMoe {
+            model,
+            ep_size,
+            nvl_num_gpu,
+            routing,
+            routing_seed,
+            mtp_mode,
+            expert_popularity_file,
+        } = &parsed
+        else {
+            panic!("expected glm52_vllm_dsa_moe")
+        };
+        assert_eq!(model.model_config, "model/config/glm52.json");
+        assert!(model.fp8);
+        assert_eq!(*ep_size, 8);
+        assert_eq!(*nvl_num_gpu, 8);
+        assert_eq!(*routing, RoutingKind::Uniform);
+        assert_eq!(*routing_seed, None);
+        assert_eq!(*mtp_mode, Glm52MtpMode::Off);
+        assert_eq!(*expert_popularity_file, None);
+        assert_eq!(parsed.model().model_config, model.model_config);
+
+        let tags = IterArchSel::SCHEMA
+            .iter()
+            .map(|(tag, _)| *tag)
+            .collect::<Vec<_>>();
+        assert!(tags.contains(&"glm52_vllm_dsa_moe"));
+    }
+
+    #[test]
+    fn glm52_selector_accepts_a_measured_expert_popularity_profile() {
+        // The GLM graphs previously had no way to consume a measured expert
+        // distribution, so a DP+EP alignment run could only assume uniform
+        // routing -- a silent confound on exactly the grouped-GEMM operations
+        // that deviate most. Same field and same semantics as the Qwen
+        // variants: the profile replaces the synthetic distribution and is
+        // rejected outright if a non-uniform `routing` is also requested.
+        for tag in ["glm52_dsa_moe", "glm52_vllm_dsa_moe"] {
+            let parsed: IterArchSel = serde_json::from_str(&format!(
+                r#"{{"type":"{tag}","model_config":"model/config/glm52.json","fp8":true,
+                     "expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}}"#
+            ))
+            .expect("GLM selector accepts an expert-popularity profile");
+            let file = match &parsed {
+                IterArchSel::Glm52DsaMoe {
+                    expert_popularity_file,
+                    ..
+                }
+                | IterArchSel::Glm52VllmDsaMoe {
+                    expert_popularity_file,
+                    ..
+                } => expert_popularity_file.clone(),
+                _ => panic!("expected a GLM arch"),
+            };
+            assert_eq!(
+                file.as_deref(),
+                Some("profile_expert_popularity/expert_popularity.json")
+            );
+        }
+    }
+
+    #[test]
     fn glm52_selector_defaults_and_model_are_exact() {
         let parsed = parse("").expect("default GLM selector parses");
         let IterArchSel::Glm52DsaMoe {
@@ -343,6 +449,7 @@ mod iter_tests {
             routing,
             routing_seed,
             mtp_mode,
+            expert_popularity_file,
         } = &parsed
         else {
             panic!("expected glm52_dsa_moe")
@@ -354,6 +461,7 @@ mod iter_tests {
         assert_eq!(*routing, RoutingKind::Uniform);
         assert_eq!(*routing_seed, None);
         assert_eq!(*mtp_mode, Glm52MtpMode::Off);
+        assert_eq!(*expert_popularity_file, None);
         assert!(std::ptr::eq(parsed.model(), model));
     }
 

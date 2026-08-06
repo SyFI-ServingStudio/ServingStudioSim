@@ -15,11 +15,14 @@ pub mod fp8_attn_block_tp;
 pub mod fp8_post_attn_router_tp;
 pub mod fp8_pre_attn_proj_tp;
 pub mod glm52_dense_ffn_local;
+pub mod vllm_glm52_dense_ffn_local;
 pub mod glm52_dsa_attn_local;
+pub mod vllm_glm52_dsa_attn_local;
 pub mod glm52_moe_router_local;
 pub mod glm52_mtp_head_local;
 pub mod glm52_mtp_prelude_local;
 pub mod glm52_shared_expert_local;
+pub mod vllm_glm52_shared_expert_local;
 pub mod mlp_block_tp;
 pub mod moe_expert_compute_local;
 pub mod native_fp8_moe_router_local;
@@ -56,9 +59,18 @@ pub use glm52_dense_ffn_local::{
     Glm52DenseFfnLocalWorklet, Glm52DenseFfnLocalWorkletConfig, Glm52DenseFfnLocalWorkletInput,
     Glm52DenseFfnLocalWorkletResolved,
 };
+pub use vllm_glm52_dense_ffn_local::{
+    VllmGlm52DenseFfnLocalWorklet, VllmGlm52DenseFfnLocalWorkletConfig,
+    VllmGlm52DenseFfnLocalWorkletInput, VllmGlm52DenseFfnLocalWorkletResolved,
+};
 pub use glm52_dsa_attn_local::{
     Glm52DsaAttnLocalDecodeInput, Glm52DsaAttnLocalWorklet, Glm52DsaAttnLocalWorkletConfig,
     Glm52DsaAttnLocalWorkletInput, Glm52DsaAttnLocalWorkletResolved,
+};
+pub use vllm_glm52_dsa_attn_local::{
+    VllmGlm52DsaAttnLocalDecodeInput, VllmGlm52DsaAttnLocalWorklet,
+    VllmGlm52DsaAttnLocalWorkletConfig, VllmGlm52DsaAttnLocalWorkletInput,
+    VllmGlm52DsaAttnLocalWorkletResolved,
 };
 pub use glm52_moe_router_local::{
     Glm52MoeRouterLocalWorklet, Glm52MoeRouterLocalWorkletConfig, Glm52MoeRouterLocalWorkletInput,
@@ -75,6 +87,10 @@ pub use glm52_mtp_prelude_local::{
 pub use glm52_shared_expert_local::{
     Glm52SharedExpertLocalWorklet, Glm52SharedExpertLocalWorkletConfig,
     Glm52SharedExpertLocalWorkletInput, Glm52SharedExpertLocalWorkletResolved,
+};
+pub use vllm_glm52_shared_expert_local::{
+    VllmGlm52SharedExpertLocalWorklet, VllmGlm52SharedExpertLocalWorkletConfig,
+    VllmGlm52SharedExpertLocalWorkletInput, VllmGlm52SharedExpertLocalWorkletResolved,
 };
 pub use mlp_block_tp::{
     MlpBlockTpWorklet, MlpBlockTpWorkletConfig, MlpBlockTpWorkletInput, MlpBlockTpWorkletResolved,
