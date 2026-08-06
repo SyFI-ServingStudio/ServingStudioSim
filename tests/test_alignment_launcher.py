@@ -538,6 +538,20 @@ def test_timing_predict_uses_one_phase_config_and_no_labeled_inventory(tmp_path,
     assert not (output / "kernel_sequences_labeled.json").exists()
 
 
+def test_timing_predict_launcher_keeps_post_run_analysis_enabled(tmp_path, monkeypatch):
+    config_path = tmp_path / "timing_predict_config.json"
+    config_path.write_text("{}")
+    launched = []
+    monkeypatch.setattr(
+        timing_predict_launcher,
+        "main",
+        lambda argv: launched.append(argv) or 0,
+    )
+
+    assert alignment_launcher._launch_timing_predict(config_path, build_type="release") == 0
+    assert launched == [[str(config_path), "--build-type", "release"]]
+
+
 def test_timing_predict_preserves_simulation_backend_policy(tmp_path, monkeypatch):
     paths = _phase_configs(tmp_path)
     _write_completed_inputs(tmp_path)

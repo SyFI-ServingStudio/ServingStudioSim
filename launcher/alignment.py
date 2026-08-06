@@ -396,7 +396,10 @@ def _launch_timing_predict(config_path: Path, *, build_type: str) -> int:
     from .timing_predict import main as timing_predict_main
 
     try:
-        return timing_predict_main([str(config_path), "--build-type", build_type, "--no-analyze"])
+        # A prediction is not complete until Analyzer has materialized its cost
+        # subjects. In particular, unlocked optimality needs the cached grid-peak
+        # sidecar; skipping analysis silently collapses R3 onto R2 in the UI.
+        return timing_predict_main([str(config_path), "--build-type", build_type])
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
 
