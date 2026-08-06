@@ -85,6 +85,10 @@ class AnalyzePhaseConfig:
         selected = []
         if self.iteration.enabled:
             selected.append("alignment-iteration")
+            # Same inputs, same measured reduction; it keeps the per-kernel
+            # timestamps `alignment-iteration` reduces away, so the two lanes can
+            # be drawn on one axis. Never useful without its sibling.
+            selected.append("alignment-timeline")
         if self.workload.enabled:
             selected.append("alignment-workload")
         if self.e2e.enabled:

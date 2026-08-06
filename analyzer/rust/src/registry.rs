@@ -295,6 +295,17 @@ pub const SUBJECTS: &[Subject] = &[
         scope: Scope::Alignment,
     },
     Subject {
+        name: "alignment-timeline",
+        category: Category::AlignmentIteration,
+        description: "Representative measured iterations with every rank's per-kernel timestamps kept, \
+                      plus the matching simulated cost tree, so the two can be drawn on one time axis \
+                      with GPU bubbles explicit.",
+        report_name: "alignment_timeline_report.json",
+        payload_name: "alignment_timeline.json",
+        applies: Applies::All,
+        scope: Scope::Alignment,
+    },
+    Subject {
         name: "alignment-workload",
         category: Category::AlignmentWorkload,
         description: "Measured-vs-sim scheduler workload by iteration id: prefill tokens, decode batch size, and scheduled KV tokens.",
@@ -385,6 +396,7 @@ pub async fn run_subject(
         "workload-conservation" => conservation::workload::run_workload(ctx, dir).await,
         "kv-occupancy" => kv::occupancy::run_kv_occupancy(ctx, dir).await,
         "alignment-iteration" => alignment_iteration::run(ctx, dir).await,
+        "alignment-timeline" => alignment_iteration::timeline::run(ctx, dir).await,
         "alignment-workload" => alignment_workload::run(ctx, dir).await,
         "alignment-e2e" => alignment_e2e::run(ctx, dir).await,
         other => bail!("unknown analyzer subject {other:?}"),

@@ -9,7 +9,12 @@ from functools import partial
 from pathlib import Path
 
 from common.figure import add_legend
-from common.layout import load_payload, plot_output_path, resolve_artifact
+from common.layout import (
+    load_payload,
+    plot_output_path,
+    read_sharded_records,
+    resolve_artifact,
+)
 from common.style import ACCENT, CURVE, MARKER, plt, save_plot
 from matplotlib.patches import ConnectionPatch, Patch
 
@@ -48,7 +53,13 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
             gpu_time_multiplier=float(payload["meta"]["recommended_gpu_time_multiplier"]),
         ),
     ]
-    sampled_breakdowns = _evenly_sample_breakdowns(payload.get("breakdowns") or [])
+    # Sample first, read second. The breakdowns live in a byte-range-addressed
+    # shard precisely so that rendering 128 of 2,040 iterations does not have to
+    # parse the other 1,912.
+    sampled_ids = _evenly_sample_iteration_ids(iterations)
+    sampled_breakdowns = read_sharded_records(
+        log_dir, payload["breakdown_detail"], sampled_ids
+    )
     breakdown_specs: list[tuple[dict, Path]] = []
     for offset in range(0, len(sampled_breakdowns), BREAKDOWN_PLOTS_PER_DIR):
         breakdown_group = sampled_breakdowns[offset : offset + BREAKDOWN_PLOTS_PER_DIR]
@@ -82,11 +93,11 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
     return jobs
 
 
-def _evenly_sample_breakdowns(
-    breakdowns: list[dict],
+def _evenly_sample_iteration_ids(
+    iterations: list[dict],
     limit: int = MAX_BREAKDOWN_PLOTS,
-) -> list[dict]:
-    """Keep at most ``limit`` rows, evenly spanning raw iteration order.
+) -> list[int]:
+    """Keep at most ``limit`` iteration ids, evenly spanning raw iteration order.
 
     Sampling affects image generation only: the Rust payload and reports retain
     every iteration.  Sorting by the raw id makes filenames, directory ranges,
@@ -94,7 +105,7 @@ def _evenly_sample_breakdowns(
     order later.
     """
     assert limit > 0
-    ordered = sorted(breakdowns, key=lambda row: int(row["iteration_id"]))
+    ordered = sorted(int(row["iteration_id"]) for row in iterations)
     if len(ordered) <= limit:
         return ordered
     if limit == 1:

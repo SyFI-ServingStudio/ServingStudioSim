@@ -283,7 +283,7 @@ fn validate_workspace_id(workspace_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn display_name(root: &Path, relative: &Path) -> String {
+pub(super) fn display_name(root: &Path, relative: &Path) -> String {
     let components = relative
         .components()
         .filter_map(|component| match component {

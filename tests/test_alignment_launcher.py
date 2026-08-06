@@ -589,8 +589,19 @@ def test_analyze_kernel_align_writes_kernel_only_manifest(tmp_path, monkeypatch)
     assert "simulation_log_dir" not in manifest
     assert "replay_result" not in manifest
     assert "iteration" not in manifest and "workload" not in manifest and "e2e" not in manifest
+    # The capture predates the host sidecar, so the manifest names none — and
+    # says so explicitly rather than omitting the key.
+    assert manifest["host_timeline"] is None
+    # `alignment-timeline` reads exactly what `alignment-iteration` reads and is
+    # never useful without it, so kernel-align runs the pair.
     assert calls == [
-        (analysis.resolve(), {"build_type": "release", "subjects": ["alignment-iteration"]})
+        (
+            analysis.resolve(),
+            {
+                "build_type": "release",
+                "subjects": ["alignment-iteration", "alignment-timeline"],
+            },
+        )
     ]
 
 

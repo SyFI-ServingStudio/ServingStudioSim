@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -10,12 +11,16 @@ from alignment.nsys.parse import (
     RangeStats,
     Worker,
     _parse_label,
+    build_host_timeline,
     build_iteration_details,
     build_kernel_name_index,
     build_parser,
     ensure_query_indexes,
     iteration_kind,
+    load_host_threads,
     load_ranges,
+    owning_global_pid,
+    parsed_window_ns,
 )
 from alignment.nsys.sequence import build_kernel_sequences, expand_program
 
@@ -126,6 +131,7 @@ def test_iteration_details_preserve_complete_kernel_launch_record():
         name="full_demangled_kernel_name",
         category="attention",
         stream_id=3,
+        correlation_id=42,
     )
     item = RangeStats(
         iteration=34,
@@ -158,6 +164,7 @@ def test_iteration_details_preserve_complete_kernel_launch_record():
         "start_ns": 120,
         "end_ns": 180,
         "stream_id": 3,
+        "correlation_id": 42,
     }
 
 
@@ -314,3 +321,189 @@ def test_tp_sequence_inventory_rejects_asymmetric_ranks():
 
     with pytest.raises(ValueError, match="not symmetric"):
         build_kernel_sequences(details, {1: "rank0", 2: "rank1"})
+
+
+def test_idle_is_measured_against_the_kernel_span_not_the_nvtx_range():
+    """Under CUDA graphs an NVTX range can close before its own kernels finish.
+
+    The old definition was `nvtx_window_ms - busy_ms`, so in exactly that case
+    the `max(0.0, ...)` clamped a real stall to zero. Idle is now the gap inside
+    the correlated kernel span, which stays honest whatever the host did.
+    """
+    worker = Worker(global_pid=10, pid=20, name="VLLM::Worker", device_id=0)
+    item = RangeStats(
+        iteration=7,
+        phase="forward",
+        stage="decode",
+        worker=worker,
+        # The range opens at 100 and closes at 300, but the last kernel does not
+        # end until 900 — the graph replay outlives its own marker.
+        start=100,
+        end=300,
+        intervals=[(200, 400), (700, 900)],
+    )
+
+    assert item.nvtx_window_ms == pytest.approx(200 / 1e6)
+    assert item.kernel_span_ms == pytest.approx(700 / 1e6)
+    assert item.busy_ms == pytest.approx(400 / 1e6)
+    # The 300 ns hole between the two kernels, which the old formula reported as
+    # zero because busy (400) already exceeded the 200 ns window.
+    assert item.idle_ms == pytest.approx(300 / 1e6)
+
+
+def test_a_range_with_no_kernels_has_no_span_and_no_idle():
+    worker = Worker(global_pid=10, pid=20, name="VLLM::Worker", device_id=0)
+    item = RangeStats(
+        iteration=7, phase="bookkeep", stage="decode", worker=worker, start=100, end=300
+    )
+
+    assert item.kernel_span_ms == 0.0
+    assert item.idle_ms == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Host (CPU) sidecar
+# ---------------------------------------------------------------------------
+
+# nsys packs a globalTid as `globalPid | thread_id` with the process id in the
+# high bits, so these fixtures keep the low 24 bits of every globalPid clear.
+WORKER_GLOBAL_PID = 1 << 24
+SCHEDULER_GLOBAL_PID = 2 << 24
+WORKER_MAIN_TID = WORKER_GLOBAL_PID + 7
+WORKER_HELPER_TID = WORKER_GLOBAL_PID + 8
+SCHEDULER_TID = SCHEDULER_GLOBAL_PID + 9
+
+
+def host_capture() -> sqlite3.Connection:
+    """A minimal capture with all three kinds of host thread on it."""
+    con = sqlite3.connect(":memory:")
+    con.executescript(
+        f"""
+        CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE PROCESSES (globalPid INTEGER, pid INTEGER, name TEXT);
+        CREATE TABLE NVTX_EVENTS (
+            start INTEGER, end INTEGER, globalTid INTEGER, text TEXT, textId INTEGER
+        );
+        CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (
+            globalPid INTEGER, deviceId INTEGER, correlationId INTEGER, start INTEGER
+        );
+        CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (
+            globalTid INTEGER, start INTEGER, end INTEGER,
+            nameId INTEGER, correlationId INTEGER
+        );
+
+        INSERT INTO StringIds VALUES (1, 'cudaLaunchKernel_v7000');
+        INSERT INTO StringIds VALUES (2, 'cudaStreamSynchronize_v3020');
+
+        INSERT INTO PROCESSES VALUES ({WORKER_GLOBAL_PID}, 7, 'VLLM::Worker0');
+        INSERT INTO PROCESSES VALUES ({SCHEDULER_GLOBAL_PID}, 9, 'VLLM::EngineCor');
+
+        -- Only the worker process ever put a kernel on a device.
+        INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES ({WORKER_GLOBAL_PID}, 3, 1, 1000);
+
+        INSERT INTO NVTX_EVENTS VALUES (1000, 2000, {WORKER_MAIN_TID}, 'vllm_iteration(7): forward', NULL);
+        INSERT INTO NVTX_EVENTS VALUES (1100, 1500, {WORKER_MAIN_TID}, 'execute_context_0', NULL);
+        INSERT INTO NVTX_EVENTS VALUES (900, 2100, {SCHEDULER_TID}, 'schedule', NULL);
+        -- A mark the capture never closed.
+        INSERT INTO NVTX_EVENTS VALUES (1200, NULL, {WORKER_MAIN_TID}, 'step', NULL);
+        -- Entirely before the window.
+        INSERT INTO NVTX_EVENTS VALUES (10, 20, {WORKER_MAIN_TID}, 'warmup', NULL);
+
+        INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES ({WORKER_MAIN_TID}, 1100, 1180, 1, 1);
+        INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES ({WORKER_MAIN_TID}, 1200, 1900, 2, 2);
+        INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES ({WORKER_HELPER_TID}, 1300, 1310, 1, 3);
+        -- Entirely before the window.
+        INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES ({WORKER_MAIN_TID}, 10, 20, 1, 4);
+        """
+    )
+    return con
+
+
+def test_host_threads_separate_worker_main_helper_and_scheduler():
+    """The scheduler thread is the reason the sidecar exists.
+
+    It owns no device, so nothing on the kernel side can see its host time —
+    and that is exactly where an iteration's unexplained wall clock hides.
+    """
+    threads = load_host_threads(host_capture())
+
+    assert [(item.global_tid, item.role, item.device_id) for item in threads] == [
+        (SCHEDULER_TID, "scheduler thread", None),
+        (WORKER_MAIN_TID, "worker main thread", 3),
+        (WORKER_HELPER_TID, "worker helper thread", 3),
+    ]
+    assert [item.process for item in threads] == [
+        "VLLM::EngineCor",
+        "VLLM::Worker0",
+        "VLLM::Worker0",
+    ]
+
+
+def test_owning_global_pid_inverts_the_nsys_thread_packing():
+    assert owning_global_pid(WORKER_HELPER_TID) == WORKER_GLOBAL_PID
+    assert owning_global_pid(SCHEDULER_TID) == SCHEDULER_GLOBAL_PID
+
+
+def test_host_timeline_keeps_the_runtime_call_bounds_attribution_throws_away():
+    """Kernel attribution reads the same rows for `correlationId` alone.
+
+    Keeping `(start, end, nameId)` is the whole of tier 2: it turns "a kernel
+    belongs to this phase" into "the host spent 700 ns blocked in this call".
+    """
+    host = build_host_timeline(host_capture(), Path("trace.sqlite"), 1000, 2000)
+
+    threads = [item["global_tid"] for item in host["threads"]]
+    calls = [
+        (threads[index], start, end, host["strings"][name], correlation_id)
+        for index, start, end, name, correlation_id in host["api_calls"]
+    ]
+    assert calls == [
+        (WORKER_MAIN_TID, 1100, 1180, "cudaLaunchKernel_v7000", 1),
+        (WORKER_MAIN_TID, 1200, 1900, "cudaStreamSynchronize_v3020", 2),
+        (WORKER_HELPER_TID, 1300, 1310, "cudaLaunchKernel_v7000", 3),
+    ]
+
+
+def test_host_timeline_keeps_every_nvtx_thread_not_just_iteration_markers():
+    """`load_ranges` keeps only `vllm_iteration(N)` on device-owning workers.
+
+    The host lane needs the nested ranges and the scheduler's marks too, or the
+    time between phases has no name at all.
+    """
+    host = build_host_timeline(host_capture(), Path("trace.sqlite"), 1000, 2000)
+
+    labels = sorted(host["strings"][name] for _index, _start, _end, name in host["nvtx_ranges"])
+    assert labels == ["execute_context_0", "schedule", "vllm_iteration(7): forward"]
+
+
+def test_host_timeline_counts_unclosed_marks_rather_than_dropping_them():
+    host = build_host_timeline(host_capture(), Path("trace.sqlite"), 1000, 2000)
+
+    assert host["unclosed_nvtx_marks"] == 1
+
+
+def test_host_timeline_excludes_events_outside_the_parsed_window():
+    """The sidecar accompanies one parse, so warmup and shutdown are not in it."""
+    host = build_host_timeline(host_capture(), Path("trace.sqlite"), 1000, 2000)
+
+    assert all(end >= 1000 for _index, _start, end, _name in host["nvtx_ranges"])
+    assert all(
+        start < 2000
+        for _index, start, _end, _name, _correlation_id in host["api_calls"]
+    )
+    assert "warmup" not in host["strings"]
+
+
+def test_parsed_window_spans_every_serialized_range():
+    parsed = {
+        "iteration_details": [
+            {"ranges": [{"start_ns": 500, "end_ns": 900}, {"start_ns": 400, "end_ns": 700}]},
+            {"ranges": [{"start_ns": 950, "end_ns": 1400}]},
+        ]
+    }
+
+    assert parsed_window_ns(parsed) == (400, 1400)
+
+
+def test_parsed_window_of_an_empty_parse_is_empty():
+    assert parsed_window_ns({"iteration_details": []}) == (0, 0)

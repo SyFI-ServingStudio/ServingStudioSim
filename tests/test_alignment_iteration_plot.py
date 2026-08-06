@@ -9,8 +9,9 @@ import pytest
 ANALYZER_PYTHON = Path(__file__).resolve().parents[1] / "analyzer" / "python"
 sys.path.insert(0, str(ANALYZER_PYTHON))
 
+from common.layout import read_sharded_records  # noqa: E402
 from alignment_iteration.series_plot import (  # noqa: E402
-    _evenly_sample_breakdowns,
+    _evenly_sample_iteration_ids,
     _mapping_center_pairs,
     _output_is_current,
     _remove_stale_breakdown_outputs,
@@ -18,12 +19,11 @@ from alignment_iteration.series_plot import (  # noqa: E402
 )
 
 
-def test_evenly_sample_breakdowns_caps_and_keeps_raw_endpoints() -> None:
+def test_evenly_sample_iteration_ids_caps_and_keeps_raw_endpoints() -> None:
     rows = [{"iteration_id": iteration_id} for iteration_id in range(6, 2471)]
 
-    sampled = _evenly_sample_breakdowns(rows)
+    sampled_ids = _evenly_sample_iteration_ids(rows)
 
-    sampled_ids = [row["iteration_id"] for row in sampled]
     assert len(sampled_ids) == 128
     assert sampled_ids[0] == 6
     assert sampled_ids[-1] == 2470
@@ -32,10 +32,35 @@ def test_evenly_sample_breakdowns_caps_and_keeps_raw_endpoints() -> None:
     assert max(gaps) - min(gaps) <= 1
 
 
-def test_evenly_sample_breakdowns_sorts_and_keeps_small_inputs() -> None:
+def test_evenly_sample_iteration_ids_sorts_and_keeps_small_inputs() -> None:
     rows = [{"iteration_id": 9}, {"iteration_id": 3}, {"iteration_id": 7}]
 
-    assert [row["iteration_id"] for row in _evenly_sample_breakdowns(rows)] == [3, 7, 9]
+    assert _evenly_sample_iteration_ids(rows) == [3, 7, 9]
+
+
+def test_sharded_records_are_read_by_byte_range_in_the_order_asked_for(tmp_path) -> None:
+    """A renderer sampling 2 of 4 iterations must not parse the other 2."""
+    import json
+
+    payloads = tmp_path / "payloads"
+    payloads.mkdir()
+    records = [{"iteration_id": iteration_id, "payload": "x" * iteration_id}
+               for iteration_id in (3, 7, 9, 11)]
+    byte_ranges, blob = {}, b""
+    for record in records:
+        line = json.dumps(record).encode()
+        byte_ranges[str(record["iteration_id"])] = [len(blob), len(line)]
+        blob += line + b"\n"
+    (payloads / "shard.jsonl").write_bytes(blob)
+
+    read = read_sharded_records(
+        tmp_path, {"file": "shard.jsonl", "byte_ranges": byte_ranges}, [9, 3, 999]
+    )
+
+    # Order follows the request, and an id the index does not know is skipped
+    # rather than raising: a payload written before its shard is a missing
+    # figure, not a crash.
+    assert [record["iteration_id"] for record in read] == [9, 3]
 
 
 def test_mapping_center_pairs_keeps_one_to_many_simulated_slots() -> None:

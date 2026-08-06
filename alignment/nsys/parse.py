@@ -23,6 +23,13 @@ This module stops at the nsys-source boundary: it resolves process/range/kernel
 ownership and emits JSON-ready records. Cross-source statistics, reports, and
 plots belong to the repository-level `analyzer/`.
 
+`--host-timeline-output` additionally writes the **host** side of the same
+capture — every NVTX range and every CUDA runtime call, on every thread that
+carries either — as a separate sidecar. It is deliberately lossless and
+un-interpreted: absolute nsys nanoseconds, no iteration windows, no nesting
+depth, no call classification. Those are all anchoring decisions, and anchoring
+belongs to the analyzer that already owns the anchor rule.
+
 SQLite tables read: `StringIds`, `PROCESSES`, `NVTX_EVENTS`,
 `CUPTI_ACTIVITY_KIND_KERNEL`, `CUPTI_ACTIVITY_KIND_RUNTIME`.
 """
@@ -85,6 +92,7 @@ class KernelEvent:
     name: str
     category: str
     stream_id: int
+    correlation_id: int | None = None
 
     @property
     def duration_ns(self) -> int:
@@ -108,7 +116,14 @@ class RangeStats:
     kernel_events: list[KernelEvent] = field(default_factory=list)
 
     @property
-    def window_ms(self) -> float:
+    def nvtx_window_ms(self) -> float:
+        """Length of the NVTX range, which is a HOST fact.
+
+        Named for what it is, because it reads like a GPU quantity and is not.
+        Under CUDA graphs the range routinely closes before its own kernels
+        finish -- on this capture's decode iterations the correlated GPU busy
+        time reaches 149% of it -- so it bounds nothing on the device.
+        """
         return (self.end - self.start) / 1e6
 
     @property
@@ -120,8 +135,25 @@ class RangeStats:
         return merge_duration_ns(self.intervals) / 1e6
 
     @property
+    def kernel_span_ms(self) -> float:
+        """First kernel start to last kernel end: the correlated GPU span.
+
+        This, not the NVTX window, is what idle has to be measured against.
+        """
+        if not self.intervals:
+            return 0.0
+        span_ns = max(end for _, end in self.intervals) - min(start for start, _ in self.intervals)
+        return span_ns / 1e6
+
+    @property
     def idle_ms(self) -> float:
-        return max(0.0, self.window_ms - self.busy_ms)
+        """GPU time inside the kernel span with no kernel on it.
+
+        Was `nvtx_window_ms - busy_ms`, where the `max(0.0, ...)` silently
+        clamped to zero exactly when busy exceeded the range -- so the reported
+        idle of a CUDA-graph capture was zero no matter how much the GPU stalled.
+        """
+        return max(0.0, self.kernel_span_ms - self.busy_ms)
 
 
 def merge_duration_ns(intervals: list[tuple[int, int]]) -> int:
@@ -223,13 +255,14 @@ def ensure_query_indexes(con: sqlite3.Connection) -> None:
     con.commit()
 
 
-def load_workers(con: sqlite3.Connection) -> dict[int, Worker]:
-    """Map Nsight globalTid (globalPid + pid of the Python main thread) → Worker.
+def load_device_by_global_pid(con: sqlite3.Connection) -> dict[int, int]:
+    """globalPid → the device its kernels ran on.
 
-    Devices come from the min CUPTI kernel deviceId per globalPid; workers are the
-    `VLLM::Worker` (or sglang) processes, falling back to bare `python` procs.
+    nsys only traces CUDA for the launched process tree, so this is already
+    narrowed to *this* run's kernel-launching processes even though PROCESSES
+    lists every process on the box.
     """
-    device_by_pid = {
+    return {
         int(global_pid): int(device_id)
         for global_pid, device_id in con.execute(
             """
@@ -239,19 +272,31 @@ def load_workers(con: sqlite3.Connection) -> dict[int, Worker]:
             """
         )
     }
-    process_rows = [
+
+
+def load_process_rows(con: sqlite3.Connection) -> list[tuple[int, int, str]]:
+    """(globalPid, pid, name) for every named process in the capture."""
+    return [
         (int(global_pid), int(pid), str(name))
         for global_pid, pid, name in con.execute("SELECT globalPid, pid, name FROM PROCESSES")
         if name is not None
     ]
 
+
+def load_workers(con: sqlite3.Connection) -> dict[int, Worker]:
+    """Map Nsight globalTid (globalPid + pid of the Python main thread) → Worker.
+
+    Devices come from the min CUPTI kernel deviceId per globalPid; workers are the
+    `VLLM::Worker` (or sglang) processes, falling back to bare `python` procs.
+    """
+    device_by_pid = load_device_by_global_pid(con)
+    process_rows = load_process_rows(con)
+
     workers: dict[int, Worker] = {}
-    # nsys only traces CUDA for the launched process tree, so `device_by_pid` is
-    # already narrowed to *this* run's kernel-launching processes even though
-    # PROCESSES lists every process on the box. Prefer the named vLLM/sglang
-    # workers, then python interpreters, then — since a process that launched CUDA
-    # kernels in our own capture IS a worker regardless of its (setproctitle-
-    # truncated, e.g. "VLLM::EngineCor") comm — any process with a device.
+    # Prefer the named vLLM/sglang workers, then python interpreters, then —
+    # since a process that launched CUDA kernels in our own capture IS a worker
+    # regardless of its (setproctitle-truncated, e.g. "VLLM::EngineCor") comm —
+    # any process with a device.
     on_device = [row for row in process_rows if row[0] in device_by_pid]
     candidate_rows = [
         row
@@ -396,7 +441,8 @@ def attach_kernels_by_correlation(
                 k.start,
                 k.end,
                 k.demangledName,
-                k.streamId
+                k.streamId,
+                k.correlationId
             FROM CUPTI_ACTIVITY_KIND_KERNEL k
             WHERE k.globalPid = ?
               AND k.correlationId IN ({placeholders})
@@ -407,6 +453,7 @@ def attach_kernels_by_correlation(
             end,
             name,
             stream_id,
+            correlation_id,
         ) in con.execute(query, params):
             kernel_rows += 1
             start = int(start)
@@ -427,6 +474,9 @@ def attach_kernels_by_correlation(
                     name=kernel_name,
                     category=category,
                     stream_id=int(stream_id),
+                    correlation_id=(
+                        None if correlation_id is None else int(correlation_id)
+                    ),
                 )
             )
     return kernel_rows
@@ -471,6 +521,7 @@ def build_iteration_details(
                         "start_ns": event.start,
                         "end_ns": event.end,
                         "stream_id": event.stream_id,
+                        "correlation_id": event.correlation_id,
                     }
                 )
             serialized_ranges.append(
@@ -528,7 +579,8 @@ def summarize_devices(ranges: list[RangeStats], top_n: int = 12) -> dict:
     """Per-device, per-category kernel busy time averaged over the iterations.
 
     Returns a dict keyed by device_id string, each with `category_ms_per_iter`
-    (the gap-table input), the merged `busy_ms`/`window_ms`/`idle_ms` means, the
+    (the gap-table input), the merged `busy_ms`/`kernel_span_ms`/`idle_ms` means
+    (plus `nvtx_window_ms_mean`, kept separately because it is a host fact), the
     iteration count, and `top_kernels` (name → ms/iter) for residual naming.
     """
     out: dict[str, dict] = {}
@@ -546,7 +598,8 @@ def summarize_devices(ranges: list[RangeStats], top_n: int = 12) -> dict:
         out[str(device_id)] = {
             "n_iters": n_iters,
             "n_ranges": len(items),
-            "window_ms_mean": sum(r.window_ms for r in items) / len(items),
+            "nvtx_window_ms_mean": sum(r.nvtx_window_ms for r in items) / len(items),
+            "kernel_span_ms_mean": sum(r.kernel_span_ms for r in items) / len(items),
             "busy_ms_mean": sum(r.busy_ms for r in items) / len(items),
             "idle_ms_mean": sum(r.idle_ms for r in items) / len(items),
             "category_ms_per_iter": {
@@ -562,6 +615,226 @@ def summarize_devices(ranges: list[RangeStats], top_n: int = 12) -> dict:
             ],
         }
     return out
+
+
+# ---------------------------------------------------------------------------
+# Host (CPU) side
+#
+# Everything above answers "which kernel belongs to which iteration". This
+# section answers "what was the CPU doing meanwhile", and deliberately stops
+# there: it emits absolute nanoseconds on named threads and leaves iteration
+# windows, nesting depth, and call classification to the analyzer that already
+# owns the anchor rule. Interpreting here would fork that rule in two places.
+# ---------------------------------------------------------------------------
+
+# An nsys globalTid is `globalPid | thread_id` and every globalPid in PROCESSES
+# has its low 24 bits clear, so masking recovers the owning process exactly
+# rather than by proximity search.
+_THREAD_ID_MASK = (1 << 24) - 1
+
+
+def owning_global_pid(global_tid: int) -> int:
+    return global_tid & ~_THREAD_ID_MASK
+
+
+@dataclass(frozen=True)
+class HostThread:
+    global_tid: int
+    global_pid: int
+    device_id: int | None
+    process: str
+    role: str
+    is_main: bool
+
+
+def load_host_threads(con: sqlite3.Connection) -> list[HostThread]:
+    """Every thread that carries an NVTX mark or a CUDA runtime call.
+
+    Three roles, and the third is the reason this is worth emitting: a thread
+    owning no device at all is the engine core's scheduler, whose host time is
+    invisible in any device-side view.
+    """
+    device_by_global_pid = load_device_by_global_pid(con)
+    process_rows = load_process_rows(con)
+    name_by_global_pid = {global_pid: name for global_pid, _pid, name in process_rows}
+    main_thread_owner = {global_pid + pid: global_pid for global_pid, pid, _name in process_rows}
+
+    threads = []
+    for (global_tid,) in con.execute(
+        """
+        SELECT DISTINCT globalTid FROM CUPTI_ACTIVITY_KIND_RUNTIME
+        UNION
+        SELECT DISTINCT globalTid FROM NVTX_EVENTS
+        """
+    ):
+        global_tid = int(global_tid)
+        global_pid = owning_global_pid(global_tid)
+        device_id = device_by_global_pid.get(global_pid)
+        is_main = main_thread_owner.get(global_tid) == global_pid
+        if device_id is None:
+            role = "scheduler thread"
+        elif is_main:
+            role = "worker main thread"
+        else:
+            role = "worker helper thread"
+        threads.append(
+            HostThread(
+                global_tid=global_tid,
+                global_pid=global_pid,
+                device_id=device_id,
+                process=name_by_global_pid.get(global_pid, "unknown"),
+                role=role,
+                is_main=is_main,
+            )
+        )
+    # Scheduler first, then each device's main thread ahead of its helpers. This
+    # is the lane order a host timeline reads top-to-bottom in.
+    threads.sort(
+        key=lambda thread: (
+            thread.device_id is not None,
+            thread.device_id if thread.device_id is not None else -1,
+            not thread.is_main,
+            thread.global_tid,
+        )
+    )
+    return threads
+
+
+def parsed_window_ns(parsed: dict) -> tuple[int, int]:
+    """The absolute [start, end) the parsed iteration ranges cover.
+
+    The host sidecar accompanies one parse, so it carries the same window: a
+    capture's warmup and shutdown are not part of the iterations being aligned.
+    """
+    starts = [
+        range_row["start_ns"]
+        for detail in parsed["iteration_details"]
+        for range_row in detail["ranges"]
+    ]
+    ends = [
+        range_row["end_ns"] for detail in parsed["iteration_details"] for range_row in detail["ranges"]
+    ]
+    if not starts:
+        return (0, 0)
+    return (min(starts), max(ends))
+
+
+def build_host_timeline(
+    con: sqlite3.Connection,
+    sqlite_path: Path,
+    window_start_ns: int,
+    window_end_ns: int,
+) -> dict:
+    """Collect the host events overlapping the window, interned and unsorted-free.
+
+    Rows reference threads by index into `threads`, so a consumer cannot read an
+    event without also reading whose thread it was on.
+    """
+    string_ids = load_string_ids(con)
+    threads = load_host_threads(con)
+    thread_index = {thread.global_tid: index for index, thread in enumerate(threads)}
+
+    string_pool: list[str] = []
+    string_index: dict[str, int] = {}
+
+    def intern(value: str) -> int:
+        if value not in string_index:
+            string_index[value] = len(string_pool)
+            string_pool.append(value)
+        return string_index[value]
+
+    nvtx_ranges: list[list[int]] = []
+    unclosed_nvtx = 0
+    for global_tid, start, end, label in con.execute(
+        """
+        SELECT n.globalTid, n.start, n.end, COALESCE(n.text, s.value)
+        FROM NVTX_EVENTS n
+        LEFT JOIN StringIds s ON n.textId = s.id
+        WHERE n.start < ?
+        """,
+        (window_end_ns,),
+    ):
+        index = thread_index.get(int(global_tid))
+        if index is None or label is None:
+            continue
+        if end is None:
+            # An instantaneous mark or a range the capture cut off. Counted
+            # rather than dropped silently, so a shrunken lane is explainable.
+            if int(start) >= window_start_ns:
+                unclosed_nvtx += 1
+            continue
+        if int(end) < window_start_ns:
+            continue
+        nvtx_ranges.append([index, int(start), int(end), intern(str(label))])
+
+    api_calls: list[list[int | None]] = []
+    for global_tid, start, end, name_id, correlation_id in con.execute(
+        """
+        SELECT globalTid, start, end, nameId, correlationId
+        FROM CUPTI_ACTIVITY_KIND_RUNTIME
+        WHERE start < ? AND end >= ?
+        """,
+        (window_end_ns, window_start_ns),
+    ):
+        index = thread_index.get(int(global_tid))
+        if index is None:
+            continue
+        name = string_ids.get(int(name_id), str(name_id))
+        api_calls.append(
+            [
+                index,
+                int(start),
+                int(end),
+                intern(name),
+                None if correlation_id is None else int(correlation_id),
+            ]
+        )
+
+    nvtx_ranges.sort()
+    api_calls.sort()
+    return {
+        "schema_version": 1,
+        "sqlite": str(sqlite_path),
+        "window_start_ns": window_start_ns,
+        "window_end_ns": window_end_ns,
+        "time_base": "absolute nsys nanoseconds, as stored in the capture",
+        "row_format": {
+            "nvtx_ranges": ["thread_index", "start_ns", "end_ns", "string_id"],
+            "api_calls": [
+                "thread_index",
+                "start_ns",
+                "end_ns",
+                "string_id",
+                "correlation_id",
+            ],
+        },
+        "unclosed_nvtx_marks": unclosed_nvtx,
+        "threads": [
+            {
+                "global_tid": thread.global_tid,
+                "global_pid": thread.global_pid,
+                "device_id": thread.device_id,
+                "process": thread.process,
+                "role": thread.role,
+                "main": thread.is_main,
+            }
+            for thread in threads
+        ],
+        "strings": string_pool,
+        "nvtx_ranges": nvtx_ranges,
+        "api_calls": api_calls,
+    }
+
+
+def parse_host_timeline(
+    sqlite_path: Path, window_start_ns: int, window_end_ns: int
+) -> dict:
+    """Open the capture and extract the host sidecar for one parsed window."""
+    con = sqlite3.connect(str(sqlite_path))
+    try:
+        return build_host_timeline(con, sqlite_path, window_start_ns, window_end_ns)
+    finally:
+        con.close()
 
 
 def parse_trace(
@@ -665,6 +938,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Also write the exact unique full-sequence catalog here",
     )
+    parser.add_argument(
+        "--host-timeline-output",
+        type=Path,
+        default=None,
+        help="Also write the host-side NVTX ranges and CUDA runtime calls here",
+    )
     return parser
 
 
@@ -719,6 +998,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.sequences_output:
         write_kernel_sequences(args.sequences_output, result, args.output)
         print(f"wrote {args.sequences_output}")
+    if args.host_timeline_output:
+        window_start_ns, window_end_ns = parsed_window_ns(result)
+        host = parse_host_timeline(args.sqlite, window_start_ns, window_end_ns)
+        Path(args.host_timeline_output).write_text(json.dumps(host, separators=(",", ":")))
+        print(
+            f"wrote {args.host_timeline_output} "
+            f"({len(host['threads'])} threads, {len(host['nvtx_ranges'])} nvtx, "
+            f"{len(host['api_calls'])} api)"
+        )
     return 0
 
 

@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from .load_generator import runner as load_generator
-from .nsys.parse import parse_trace, write_kernel_sequences
+from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
 from .profiler import nsys_capture, vllm_server
 from .profiler.config import ProfileConfig
 
@@ -298,6 +298,19 @@ def run_profile(cfg: ProfileConfig) -> dict:
         f"{parsed['scanned_kernel_rows']} kernel row(s) → {parsed_path.name}"
     )
 
+    # The host side of the same window. Written as a sidecar rather than into
+    # parsed.json because no kernel-attribution consumer reads a single row of
+    # it, and it is comparable in size to parsed.json itself.
+    host_timeline_path = log_dir / "host_timeline.json"
+    window_start_ns, window_end_ns = parsed_window_ns(parsed)
+    host_timeline = parse_host_timeline(sqlite_path, window_start_ns, window_end_ns)
+    host_timeline_path.write_text(json.dumps(host_timeline, separators=(",", ":")))
+    print(
+        f"[profile] host {len(host_timeline['threads'])} thread(s), "
+        f"{len(host_timeline['nvtx_ranges'])} nvtx range(s), "
+        f"{len(host_timeline['api_calls'])} api call(s) → {host_timeline_path.name}"
+    )
+
     result = {
         "profile_kind": cfg.profile_kind,
         # Resolved artifact root is the launcher→analyzer handoff. Keep it in the
@@ -309,6 +322,7 @@ def run_profile(cfg: ProfileConfig) -> dict:
         "request_timing_count": n_request_timings,
         "parsed_nsys": str(parsed_path),
         "kernel_sequences": str(kernel_sequences_path),
+        "host_timeline": str(host_timeline_path),
         "server_log": str(server_log),
         "gpu": cfg.gpu,
         "server_tp_size": cfg.server.tp_size,

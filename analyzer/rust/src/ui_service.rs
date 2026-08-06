@@ -4,6 +4,7 @@
 //! resources live in separate modules so later subjects do not grow one service
 //! file into a second analyzer.
 
+mod alignment;
 mod artifact;
 mod batch;
 mod catalog;
@@ -32,15 +33,17 @@ mod worker_detail;
 mod workload;
 mod workload_conservation;
 
+use std::collections::HashMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Path as RoutePath, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -49,6 +52,12 @@ use serde_json::{json, Value};
 
 use crate::optimality::{
     iteration_kernel_ladder, iteration_waterfall, prediction_kernel_ladder, prediction_waterfall,
+};
+use alignment::{
+    alignment_artifact_bytes, alignment_descriptor,
+    alignment_detail_index as build_alignment_detail_index, build_alignment_catalog,
+    discover_alignments, operation_split_projection, read_alignment_iteration_detail,
+    reference_lane_projection, AlignmentDetailIndex, DiscoveredAlignment,
 };
 use artifact::read_json;
 use batch::{read_batch_payload, read_batch_report};
@@ -101,6 +110,11 @@ use workload_conservation::{
 
 const PROTOCOL_VERSION: u32 = 1;
 const TIMELINE_PROFILE_BODY_LIMIT: usize = 16 * 1024;
+/// Directory discovery and shard-index parsing are process-local caches. A
+/// one-second TTL still made a user click after a short pause repeat the full
+/// workspace walk, so keep one page's repeated cycle selection hot while
+/// allowing newly generated alignment bundles to appear without a restart.
+const ALIGNMENT_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(60);
 static NEXT_WORKER_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -108,6 +122,18 @@ struct ServiceState {
     root_source: Arc<RootSource>,
     repo_root: Arc<PathBuf>,
     operation_indexes: Arc<OperationIndexCache>,
+    alignment_discovery: Arc<Mutex<Option<CachedAlignmentDiscovery>>>,
+    alignment_detail_indexes: Arc<Mutex<HashMap<(String, String), CachedAlignmentDetailIndex>>>,
+}
+
+struct CachedAlignmentDiscovery {
+    loaded_at: Instant,
+    alignments: Vec<DiscoveredAlignment>,
+}
+
+struct CachedAlignmentDetailIndex {
+    loaded_at: Instant,
+    index: Arc<AlignmentDetailIndex>,
 }
 
 #[derive(Clone)]
@@ -132,6 +158,78 @@ impl ServiceState {
 
     fn resolve_prediction(&self, prediction_id: &str) -> Result<DiscoveredPrediction> {
         resolve_prediction(&self.root_source.load()?, prediction_id)
+    }
+
+    fn resolve_alignment(&self, alignment_id: &str) -> Result<DiscoveredAlignment> {
+        let mut cache = self
+            .alignment_discovery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache
+            .as_ref()
+            .is_some_and(|value| value.loaded_at.elapsed() < ALIGNMENT_DISCOVERY_CACHE_TTL)
+        {
+            return cache
+                .as_ref()
+                .and_then(|value| {
+                    value
+                        .alignments
+                        .iter()
+                        .find(|alignment| alignment.alignment_id == alignment_id)
+                        .cloned()
+                })
+                .ok_or_else(|| AlignmentNotFound.into());
+        }
+
+        // Hold the lock through the scan. Several page sections issue their
+        // first request together; serializing only this cache fill prevents
+        // every request from recursively walking the same workspace tree.
+        let roots = self.root_source.load()?;
+        let alignments = discover_alignments(&roots)?;
+        let found = alignments
+            .iter()
+            .find(|alignment| alignment.alignment_id == alignment_id)
+            .cloned();
+        *cache = Some(CachedAlignmentDiscovery {
+            loaded_at: Instant::now(),
+            alignments,
+        });
+        found.ok_or_else(|| AlignmentNotFound.into())
+    }
+
+    /// Parse the small `byte_ranges` document once for each subject while it
+    /// is being used by a page. The old path reparsed this index for every
+    /// selected iteration, even though the following shard read only needs a
+    /// single `(offset, length)` pair.
+    fn alignment_detail_index(
+        &self,
+        alignment_id: &str,
+        alignment: &DiscoveredAlignment,
+        subject: &str,
+    ) -> Result<Arc<AlignmentDetailIndex>> {
+        let key = (alignment_id.to_owned(), subject.to_owned());
+        let mut cache = self
+            .alignment_detail_indexes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.get(&key) {
+            if cached.loaded_at.elapsed() < ALIGNMENT_DISCOVERY_CACHE_TTL {
+                return Ok(Arc::clone(&cached.index));
+            }
+        }
+
+        // Keep the mutex held through construction just like discovery above:
+        // concurrent timeline requests for the same subject should share one
+        // index parse, not all perform the same JSON read.
+        let index = Arc::new(build_alignment_detail_index(alignment, subject)?);
+        cache.insert(
+            key,
+            CachedAlignmentDetailIndex {
+                loaded_at: Instant::now(),
+                index: Arc::clone(&index),
+            },
+        );
+        Ok(index)
     }
 
     fn resolve_kernel_profile(
@@ -166,13 +264,15 @@ pub(crate) async fn serve(
         root_source: Arc::new(root_source),
         repo_root: Arc::new(repo_root),
         operation_indexes: Arc::new(OperationIndexCache::default()),
+        alignment_discovery: Arc::new(Mutex::new(None)),
+        alignment_detail_indexes: Arc::new(Mutex::new(HashMap::new())),
     };
     let app = service_router(state);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind analyzer UI service to {bind}"))?;
     eprintln!(
-        "[analyze] serving run, sweep, prediction, kernel-profile, kernel-measurement, and hardware catalogs at http://{bind}/api/v1/{{runs,sweeps,predictions,kernel-profiles,kernel-measurements,hardware}}"
+        "[analyze] serving run, sweep, prediction, alignment, kernel-profile, kernel-measurement, and hardware catalogs at http://{bind}/api/v1/{{runs,sweeps,predictions,alignments,kernel-profiles,kernel-measurements,hardware}}"
     );
     axum::serve(listener, app)
         .await
@@ -186,6 +286,23 @@ pub(crate) async fn serve(
 fn service_router(state: ServiceState) -> Router {
     Router::new()
         .route("/api/v1/profile/timeline", post(profile_timeline))
+        .route("/api/v1/alignments", get(list_alignments))
+        .route(
+            "/api/v1/alignments/{alignment_id}/descriptor",
+            get(get_alignment_descriptor),
+        )
+        .route(
+            "/api/v1/alignments/{alignment_id}/subjects/{subject}/report",
+            get(get_alignment_report),
+        )
+        .route(
+            "/api/v1/alignments/{alignment_id}/subjects/{subject}/payload",
+            get(get_alignment_payload),
+        )
+        .route(
+            "/api/v1/alignments/{alignment_id}/subjects/{subject}/iterations/{iteration_id}",
+            get(get_alignment_iteration),
+        )
         .route("/api/v1/predictions", get(list_predictions))
         .route(
             "/api/v1/predictions/{prediction_id}/descriptor",
@@ -432,6 +549,134 @@ fn timeline_profile_log_line(
         "detail": event.detail,
     }))
     .map_err(|_| "timeline profile event could not be encoded")
+}
+
+async fn list_alignments(State(state): State<ServiceState>) -> Response {
+    let root_source = Arc::clone(&state.root_source);
+    match tokio::task::spawn_blocking(move || {
+        let roots = root_source.load()?;
+        build_alignment_catalog(&roots)
+    })
+    .await
+    {
+        Ok(Ok(catalog)) => Json(catalog).into_response(),
+        Ok(Err(error)) => alignment_resource_error(error),
+        Err(error) => alignment_resource_error(anyhow::anyhow!(error)),
+    }
+}
+
+async fn get_alignment_descriptor(
+    RoutePath(alignment_id): RoutePath<String>,
+    State(state): State<ServiceState>,
+) -> Response {
+    match state.resolve_alignment(&alignment_id) {
+        Ok(alignment) => Json(alignment_descriptor(&alignment)).into_response(),
+        Err(error) => alignment_resource_error(error),
+    }
+}
+
+async fn get_alignment_report(
+    RoutePath((alignment_id, subject)): RoutePath<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<ServiceState>,
+) -> Response {
+    match state
+        .resolve_alignment(&alignment_id)
+        .and_then(|alignment| alignment_artifact_bytes(&alignment, &subject, false))
+    {
+        Ok(bytes) => alignment_json_bytes_response(bytes, Some(&headers)),
+        Err(error) => alignment_resource_error(error),
+    }
+}
+
+async fn get_alignment_payload(
+    RoutePath((alignment_id, subject)): RoutePath<(String, String)>,
+    headers: HeaderMap,
+    State(state): State<ServiceState>,
+) -> Response {
+    match state
+        .resolve_alignment(&alignment_id)
+        .and_then(|alignment| alignment_artifact_bytes(&alignment, &subject, true))
+    {
+        Ok(bytes) => alignment_json_bytes_response(bytes, Some(&headers)),
+        Err(error) => alignment_resource_error(error),
+    }
+}
+
+/// One iteration of one subject, straight out of the shard.
+///
+/// The bytes are already the JSON object the client wants, so they are returned
+/// unparsed — the point of the byte-range layout is that no request touches more
+/// than one iteration's worth of the file.
+async fn get_alignment_iteration(
+    RoutePath((alignment_id, subject, iteration_id)): RoutePath<(String, String, String)>,
+    Query(query): Query<AlignmentIterationQuery>,
+    headers: HeaderMap,
+    State(state): State<ServiceState>,
+) -> Response {
+    let detail = state
+        .resolve_alignment(&alignment_id)
+        .and_then(|alignment| {
+            let index = state.alignment_detail_index(&alignment_id, &alignment, &subject)?;
+            let bytes = read_alignment_iteration_detail(&index, &iteration_id)?;
+            if query.projection.as_deref() == Some("reference-lane") && subject == "timeline" {
+                reference_lane_projection(&index, bytes)
+            } else if query.projection.as_deref() == Some("operation-split")
+                && subject == "iteration"
+            {
+                operation_split_projection(bytes)
+            } else {
+                Ok(bytes)
+            }
+        });
+    match detail {
+        Ok(bytes) => alignment_json_bytes_response(bytes, Some(&headers)),
+        Err(error) => alignment_resource_error(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AlignmentIterationQuery {
+    projection: Option<String>,
+}
+
+/// Serve analyzer-owned JSON verbatim, using gzip when the browser accepts it.
+///
+/// The alignment artifacts are repetitive (kernel names, operation labels and
+/// host rows), so compression reduces the large timeline/report transfer while
+/// leaving the on-disk shard and its byte offsets unchanged. `None` means the
+/// caller is an artifact endpoint whose route has no need to inspect request
+/// headers yet; it still gets the raw canonical bytes.
+fn alignment_json_bytes_response(bytes: Vec<u8>, headers: Option<&HeaderMap>) -> Response {
+    let accepts_gzip = headers
+        .and_then(|headers| headers.get(header::ACCEPT_ENCODING))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|encoding| {
+                encoding
+                    .trim()
+                    .split(';')
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("gzip"))
+            })
+        });
+    if accepts_gzip {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        if encoder.write_all(&bytes).is_ok() {
+            if let Ok(compressed) = encoder.finish() {
+                return (
+                    [
+                        (header::CONTENT_TYPE, "application/json"),
+                        (header::CONTENT_ENCODING, "gzip"),
+                        (header::VARY, "Accept-Encoding"),
+                    ],
+                    compressed,
+                )
+                    .into_response();
+            }
+        }
+    }
+    ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
 
 async fn list_predictions(State(state): State<ServiceState>) -> Response {
@@ -1484,6 +1729,17 @@ impl std::fmt::Display for SweepNotFound {
 impl std::error::Error for SweepNotFound {}
 
 #[derive(Debug)]
+struct AlignmentNotFound;
+
+impl std::fmt::Display for AlignmentNotFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("alignment not found")
+    }
+}
+
+impl std::error::Error for AlignmentNotFound {}
+
+#[derive(Debug)]
 struct ArtifactNotFound;
 
 impl std::fmt::Display for ArtifactNotFound {
@@ -1546,6 +1802,32 @@ fn kernel_measurement_resource_error(error: anyhow::Error) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         "kernel_measurement_resource_failed",
         "The requested kernel-measurement resource could not be reconstructed.",
+    )
+}
+
+fn alignment_resource_error(error: anyhow::Error) -> Response {
+    if error.downcast_ref::<AlignmentNotFound>().is_some() {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "alignment_not_found",
+            "The requested alignment bundle is not present below the configured logs roots.",
+        );
+    }
+    if error.downcast_ref::<ArtifactNotFound>().is_some() {
+        // Also the answer for an unknown subject name and for an iteration the
+        // payload index does not carry: from outside, all three are "that is not
+        // a thing here", and distinguishing them would describe the layout.
+        return problem(
+            StatusCode::NOT_FOUND,
+            "artifact_missing",
+            "The requested alignment artifact has not been generated.",
+        );
+    }
+    eprintln!("[analyze] alignment resource failed: {error:#}");
+    problem(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "alignment_resource_failed",
+        "The requested alignment resource could not be reconstructed.",
     )
 }
 

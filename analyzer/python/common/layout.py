@@ -30,6 +30,33 @@ def load_payload(log_dir: Path, name: str) -> dict:
     return json.loads(resolve_artifact(log_dir, name).read_text())
 
 
+def read_sharded_records(log_dir: Path, shard: dict, keys: list) -> list[dict]:
+    """Read named records out of a payload's byte-range-addressed sibling.
+
+    A subject whose per-iteration detail runs to hundreds of megabytes ships an
+    index plus a `.jsonl`, and the index carries each record's `[offset, length]`
+    (see the Rust `iteration_detail` / `breakdown_detail` sections). Reading only
+    the wanted records is the point of that layout: a renderer that samples 128
+    of 2,040 iterations must not parse the other 1,912.
+
+    Returns records in the order of `keys`; a key the index does not know is
+    skipped, because a payload written before its shard existed is a missing
+    figure, not a crash.
+    """
+    byte_ranges = shard.get("byte_ranges") or {}
+    path = resolve_artifact(log_dir, shard["file"])
+    records = []
+    with path.open("rb") as handle:
+        for key in keys:
+            location = byte_ranges.get(str(key))
+            if location is None:
+                continue
+            offset, length = location
+            handle.seek(offset)
+            records.append(json.loads(handle.read(length)))
+    return records
+
+
 def plot_output_path(log_dir: Path, name: str) -> Path:
     path = log_dir / PLOTS_DIR / name
     path.parent.mkdir(parents=True, exist_ok=True)

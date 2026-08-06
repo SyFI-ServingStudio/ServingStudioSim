@@ -37,6 +37,20 @@ pub struct KernelAlignManifest {
     pub predict_log_dir: PathBuf,
     pub timing_predict_case_map: PathBuf,
     pub labeled_kernel_sequences: PathBuf,
+    /// Which measured iterations `alignment-timeline` should draw. Absent — the
+    /// normal case — means the subject picks representatives itself; naming them
+    /// is how you pin a specific iteration for a demo or a bug report. Optional
+    /// with a `#[serde(default)]`, so every existing schema-6 manifest stays
+    /// valid and the launcher needs no change.
+    #[serde(default)]
+    pub timeline_iterations: Option<Vec<u64>>,
+    /// The host-side sidecar `alignment/nsys/parse.py --host-timeline-output`
+    /// writes beside `parsed.json`. Absent on captures parsed before it existed,
+    /// in which case `alignment-timeline` draws the device lane alone — the view
+    /// it always drew. Optional with a `#[serde(default)]` for the same reason
+    /// `timeline_iterations` is: every existing schema-6 manifest stays valid.
+    #[serde(default)]
+    pub host_timeline: Option<PathBuf>,
 }
 
 /// e2e-align inputs: the measured run vs a completed DES simulation.

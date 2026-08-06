@@ -179,6 +179,26 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
     return True
 
 
+def cargo_build_analyzer(build_type: str = "debug") -> bool:
+    """Build only the standalone analyzer used by post-run analysis.
+
+    Alignment analysis consumes existing profile/prediction/simulation roots and
+    does not need the simulator binary or deployment schema. Keeping this build
+    boundary separate means `alignment analyze` cannot be blocked by unrelated
+    simulator source drift.
+    """
+    analyzer_cmd = ["cargo", "build", "-p", "analyzer"]
+    if build_type == "release":
+        analyzer_cmd.append("--release")
+    elif build_type != "debug":
+        analyzer_cmd.extend(["--profile", build_type])
+    return subprocess.run(
+        analyzer_cmd,
+        cwd=REPO_ROOT,
+        env=_cargo_build_env(),
+    ).returncode == 0
+
+
 async def _run_capture(argv: list[str]) -> tuple[int, str]:
     """Spawn `argv` (cwd=REPO_ROOT), await it, return (returncode, combined
     stdout+stderr). Async so the sweep's event loop keeps pumping other runs while
@@ -312,6 +332,7 @@ def run_alignment_analysis(
 
     selected = subjects or [
         "alignment-iteration",
+        "alignment-timeline",
         "alignment-workload",
         "alignment-e2e",
     ]

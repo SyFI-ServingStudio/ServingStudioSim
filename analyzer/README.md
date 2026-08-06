@@ -165,6 +165,10 @@ rust/                The `analyze` binary (DataFusion compute side).
   src/concurrency/     In-flight concurrency and hierarchical request-stage populations over simulated wall-clock time.
   src/kv/              Per-pool KV-cache occupancy over time.
   src/alignment_iteration/  Per-iteration total/operation/kernel comparison.
+                       mod.rs owns the measured reduction and the `alignment-iteration`
+                       report; timeline.rs reuses that reduction to emit
+                       `alignment-timeline` with the timestamps kept; host.rs anchors
+                       the optional CPU-side sidecar onto the same axis.
   src/alignment_e2e/        Paired request latency + completion throughput.
   src/alignment_workload/   Measured-vs-sim scheduler batch shapes by iteration id and elapsed time.
   src/alignment_input.rs    Shared alignment manifest/path contract.
@@ -181,6 +185,9 @@ python/              The render side (matplotlib over payload JSON).
                        is thread-hostile).
   request/, throughput/, utilization/, batch/, backend/, breakdown/, optimality/, conservation/, concurrency/, kv/  One renderer module per subject; returns figure "jobs".
   alignment_iteration/, alignment_e2e/, alignment_workload/  Alignment payload renderers.
+                       (`alignment-timeline` has no matplotlib renderer: its payload exists to be
+                        panned and zoomed, and a static PNG of it would only restate the sibling's
+                        stacks. Its consumers are `viz-ui/smoke/align/` and the app's alignment view.)
   sweep/               Cross-run 1-D line, 2-D heatmap, and N-D faceted sweep plots.
   common/              Shared plotting: payload loader + run-dir layout, figure
                        scaffolding, CDF plot, style.
@@ -232,9 +239,22 @@ Current catalog:
 | `request-state` | concurrency | `request_slo.parquet` stage-transition lists + `run_meta.json` stage vocab/worker roster | exact category/pending peaks and means / 200-bin cluster and request-owner-worker open-category stacks plus owner-pool aggregate/average/worker pending series; execution-only pools (AFD FFN) are omitted; unavailable when stage logging is off |
 | `workload-conservation` | conservation | `cost_log` actuals + `request_slo.parquet` per-request expected | run-wide prefill/decode/FFN/KV work accounting, pass/fail / `workload_conservation_checks` |
 | `kv-occupancy` | kv | `kv_snapshot` stream + `run_meta.json` capacity | per-pool KV occupancy (active / projected-peak / promised tokens, and as a fraction of capacity) over time / `kv_occupancy_series` |
+| `alignment-timeline` | alignment-iteration | the same inputs as `alignment-iteration`, but keeping every rank's per-kernel `(start_ns, end_ns)`, plus the optional host sidecar (`host_timeline` in the alignment manifest) | EVERY iteration, as an index plus a byte-range-addressed `alignment_timeline_iterations.jsonl`: raw measured intervals, per-slot UNIT sim times, the cost manifest verbatim, and — when the sidecar is present — per-thread NVTX and CUDA-runtime host lanes, so a client can draw the GPU, the sim and the CPU on ONE time axis. At most 32 iterations carry a distinguishing `selected_as`; the report writes up those. / reference-rank per-phase span/busy/idle + largest gaps named by the operations either side |
 | `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping (no simulation) | kernel/mapping error stats + self-derived `recommended_gpu_time_multiplier` (`Σ measured_gpu_cycle_ms / Σ measured_ms`) / separate kernel-busy and measured first-kernel-to-next-first-kernel GPU-cycle overviews + per-iteration mapped stacks |
 | `alignment-e2e` | alignment-e2e | TraceLab replay JSONL + parsed NSYS GPU timeline + optional vLLM engine-core request timing JSONL + sim `request_slo.parquet` | independent client-TTFT/sim, optional server-TTFT/sim, client-TPOT/sim, optional server-TPOT/sim, E2E stats, client-completion throughput, and server GPU-span throughput / available raw latency CDF overlays + client/sim completion series annotated with all aggregate rates |
 | `alignment-workload` | alignment-workload | normalized NSYS iteration metrics + sim `cost_log.groups`/`wall_start_ms` | per-side workload summaries / fine prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle series by iteration id, plus decode batch size by elapsed time |
+
+`alignment-timeline` runs with `alignment-iteration` in the kernel-align phase; it
+reads exactly what its sibling reads, so it needs no new artifact.
+
+Both of them shard. A real 2,040-iteration capture holds hundreds of megabytes of
+per-kernel detail — past what a browser can parse as one string, for views that
+draw one iteration at a time. So each payload is an INDEX (one summary row per
+iteration, plus what every iteration shares) naming a sibling `.jsonl` and the
+byte range of each iteration inside it. A reader seeks; it never loads the file.
+On the reference capture that is 544 MB -> 2.96 MB for
+`alignment_iteration_series.json` and 2.0 MB of index beside a 249 MB seekable
+shard for `alignment_timeline.json`.
 
 The alignment-iteration payload and report retain every paired iteration, but
 the Python renderer evenly samples at most 128 per-iteration breakdown PNGs.

@@ -12,6 +12,10 @@ use serde_json::{json, Value};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+use super::alignment::{
+    alignment_descriptor, alignment_iteration_detail, alignment_payload, alignment_report,
+    build_alignment_catalog, discover_alignments, resolve_alignment,
+};
 use super::batch::{read_batch_payload, read_batch_report};
 use super::catalog::build_catalog;
 use super::concurrency::{read_concurrency_payload, read_concurrency_report};
@@ -420,6 +424,8 @@ fn prediction_test_router(logs_root: &Path) -> Router {
         root_source: Arc::new(RootSource::Static(Arc::new(roots))),
         repo_root: Arc::new(logs_root.to_path_buf()),
         operation_indexes: Arc::new(OperationIndexCache::default()),
+        alignment_discovery: Arc::new(std::sync::Mutex::new(None)),
+        alignment_detail_indexes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     })
 }
 
@@ -1202,6 +1208,46 @@ fn sweep_catalog_uses_launcher_experiment_identity_when_present() {
     let sweep = resolve_sweep(&roots, "e_managed_test").expect("resolve managed identity");
     let payload = read_sweep_payload(&roots, &sweep).expect("read managed sweep");
     assert_eq!(payload["sweep_id"], "e_managed_test");
+}
+
+#[test]
+fn sweep_catalog_chooses_one_canonical_copy_for_a_reused_experiment_identity() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let older_path = temporary.path().join("20260803_0_copied/simulation");
+    let newer_path = temporary.path().join("20260805_0_canonical/simulation");
+    make_core_run(&older_path);
+    make_core_run(&newer_path);
+    let shared_metadata = r#"{
+        "schema_version": 1,
+        "experiment_id": "e_shared_copy",
+        "origin": {"kind": "development"}
+    }"#;
+    fs::write(older_path.join("experiment.meta.json"), shared_metadata)
+        .expect("write older experiment metadata");
+    fs::write(newer_path.join("experiment.meta.json"), shared_metadata)
+        .expect("write newer experiment metadata");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let newer_run_id = discover_runs(&roots)
+        .expect("discover copied runs")
+        .into_iter()
+        .find(|run| run.display_name == "20260805_0_canonical/simulation")
+        .expect("newer copied run")
+        .run_id;
+
+    let catalog = serde_json::to_value(build_sweep_catalog(&roots).expect("build sweep catalog"))
+        .expect("serialize sweep catalog");
+
+    let entries = catalog["sweeps"].as_array().expect("aggregate entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["sweep_id"], "e_shared_copy");
+    assert_eq!(
+        entries[0]["display_name"],
+        "20260805_0_canonical/simulation"
+    );
+    let sweep = resolve_sweep(&roots, "e_shared_copy").expect("resolve canonical copy");
+    let payload = read_sweep_payload(&roots, &sweep).expect("read canonical payload");
+    assert_eq!(payload["runs"][0]["run_id"], newer_run_id);
 }
 
 #[test]
@@ -2644,4 +2690,179 @@ fn legacy_profile_has_data_but_no_hardware_limits() {
         curve["rows"][0]["hardware"]["tflops_limit"]["available"],
         false
     );
+}
+
+// ---------------------------------------------------------------------------
+// alignment bundles
+// ---------------------------------------------------------------------------
+
+/// A bundle with the kernel half analysed and the e2e half only configured.
+///
+/// The two halves are independent on purpose: a capture is routinely aligned at
+/// the kernel level long before a simulation exists to compare end-to-end.
+fn write_alignment_bundle(root: &Path) -> (Vec<u8>, [usize; 2]) {
+    let bundle = root.join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    let kernel = bundle.join("analysis_kernel");
+    fs::create_dir_all(kernel.join("reports")).expect("kernel reports");
+    fs::create_dir_all(kernel.join("payloads")).expect("kernel payloads");
+    fs::write(kernel.join("alignment_manifest.json"), "{}").expect("kernel manifest");
+    fs::write(
+        kernel.join("reports/alignment_timeline_report.json"),
+        json!({"iterations": [{"iteration_id": 8}]}).to_string(),
+    )
+    .expect("timeline report");
+
+    let first = json!({"iteration_id": 8, "measured": "eight"}).to_string();
+    let second = json!({"iteration_id": 9, "measured": "nine"}).to_string();
+    let mut shard = Vec::new();
+    let ranges = [[shard.len(), first.len()], {
+        shard.extend_from_slice(first.as_bytes());
+        shard.push(b'\n');
+        [shard.len(), second.len()]
+    }];
+    shard.extend_from_slice(second.as_bytes());
+    shard.push(b'\n');
+    fs::write(
+        kernel.join("payloads/alignment_timeline_iterations.jsonl"),
+        &shard,
+    )
+    .expect("timeline shard");
+    fs::write(
+        kernel.join("payloads/alignment_timeline.json"),
+        json!({
+            "iterations": [{"iteration_id": 8}, {"iteration_id": 9}],
+            "iteration_detail": {
+                "file": "alignment_timeline_iterations.jsonl",
+                "byte_ranges": {"8": ranges[0], "9": ranges[1]},
+            },
+        })
+        .to_string(),
+    )
+    .expect("timeline payload");
+
+    // Configured but never run: manifest present, no report.
+    let e2e = bundle.join("analysis_e2e");
+    fs::create_dir_all(&e2e).expect("e2e dir");
+    fs::write(e2e.join("alignment_manifest.json"), "{}").expect("e2e manifest");
+
+    // Sibling directories a bundle owns; discovery must not descend into them
+    // and find a second bundle.
+    fs::create_dir_all(bundle.join("profile/nsys")).expect("profile dir");
+    fs::create_dir_all(bundle.join("simulation")).expect("simulation dir");
+    (first.into_bytes(), [ranges[0][0], ranges[1][0]])
+}
+
+#[test]
+fn alignment_catalog_reports_each_analysis_half_separately() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+
+    let catalog = serde_json::to_value(build_alignment_catalog(&roots).expect("catalog"))
+        .expect("serialize catalog");
+    let entries = catalog["alignments"].as_array().expect("entries");
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["kind"], "alignment");
+    assert_eq!(
+        entries[0]["display_name"],
+        "20260720_0_llama3_8b_tp_alignment/tp4/rate32"
+    );
+    // A manifest with a report is complete; a manifest without one is pending.
+    assert_eq!(entries[0]["kernel_analysis"], "complete");
+    assert_eq!(entries[0]["e2e_analysis"], "pending");
+    assert!(entries[0]["alignment_id"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("al_")));
+}
+
+#[test]
+fn the_bundle_is_the_analysis_parent_and_discovery_stops_there() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+
+    let discovered = discover_alignments(&roots).expect("discover");
+
+    assert_eq!(discovered.len(), 1);
+    // The bundle owns the capture and the prediction both halves point at, so it
+    // is the parent of `analysis_kernel/`, not that directory itself.
+    assert!(discovered[0].path.join("analysis_kernel").is_dir());
+    assert!(discovered[0].path.join("profile").is_dir());
+}
+
+#[test]
+fn an_ungenerated_subject_is_named_but_offers_no_href() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let alignment = &discover_alignments(&roots).expect("discover")[0];
+
+    let descriptor = alignment_descriptor(alignment);
+
+    assert_eq!(descriptor["subjects"]["timeline"]["status"], "ready");
+    assert!(descriptor["subjects"]["timeline"]["payload_href"].is_string());
+    // Missing is a state, not an absence: the client must be able to say "not
+    // generated" rather than infer it from a key that is not there.
+    assert_eq!(descriptor["subjects"]["e2e"]["status"], "not_generated");
+    assert!(descriptor["subjects"]["e2e"]["payload_href"].is_null());
+    // Only the sharded subjects offer a per-iteration href.
+    assert!(descriptor["subjects"]["timeline"]["iteration_href"].is_string());
+    assert!(descriptor["subjects"]["e2e"]["iteration_href"].is_null());
+}
+
+#[test]
+fn one_iteration_is_read_by_byte_range_not_by_parsing_the_shard() {
+    let temporary = TempDir::new().expect("temp dir");
+    let (expected_first, offsets) = write_alignment_bundle(temporary.path());
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let alignment = &discover_alignments(&roots).expect("discover")[0];
+
+    let first = alignment_iteration_detail(alignment, "timeline", "8").expect("iteration 8");
+    let second = alignment_iteration_detail(alignment, "timeline", "9").expect("iteration 9");
+
+    // Bytes, verbatim — the shard already holds the JSON the client wants.
+    assert_eq!(first, expected_first);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&second).expect("json")["measured"],
+        "nine"
+    );
+    // The second record really starts after the first, so the range is a seek
+    // and not a full scan that happened to work.
+    assert!(offsets[1] > offsets[0]);
+}
+
+#[test]
+fn an_unknown_subject_or_iteration_is_a_missing_artifact_not_a_path() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let alignment = &discover_alignments(&roots).expect("discover")[0];
+
+    for subject in ["../../etc/passwd", "nonsense"] {
+        assert!(alignment_report(alignment, subject).is_err(), "{subject}");
+        assert!(alignment_payload(alignment, subject).is_err(), "{subject}");
+    }
+    // A subject that exists but was never run, and an iteration the index does
+    // not carry, are both "not here" rather than an error about the layout.
+    assert!(alignment_report(alignment, "e2e").is_err());
+    assert!(alignment_iteration_detail(alignment, "timeline", "999").is_err());
+    assert!(alignment_iteration_detail(alignment, "workload", "8").is_err());
+}
+
+#[test]
+fn an_unknown_alignment_id_resolves_to_not_found() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+
+    assert!(resolve_alignment(&roots, "al_nope").is_err());
+    let known = &discover_alignments(&roots).expect("discover")[0].alignment_id;
+    assert!(resolve_alignment(&roots, known).is_ok());
 }

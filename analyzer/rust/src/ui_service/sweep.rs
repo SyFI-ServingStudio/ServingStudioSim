@@ -117,14 +117,7 @@ pub(super) fn build_filtered_sweep_catalog(
     roots: &[ConfiguredRoot],
     filter: SweepCatalogFilter,
 ) -> Result<SweepCatalog> {
-    let mut sweeps = discover_sweeps(roots)?;
-    sweeps.sort_by(|left, right| {
-        right
-            .experiment_date
-            .cmp(&left.experiment_date)
-            .then_with(|| right.updated_time.cmp(&left.updated_time))
-            .then_with(|| left.sweep_id.cmp(&right.sweep_id))
-    });
+    let sweeps = canonical_sweeps(roots)?;
     let sweeps = sweeps
         .into_iter()
         .filter(|sweep| filter.status.is_none_or(|status| sweep.status == status))
@@ -151,8 +144,37 @@ pub(super) fn build_filtered_sweep_catalog(
     })
 }
 
+/** Resolve launcher metadata aliases once, before catalog filtering or payload
+ * lookup. A copied experiment directory may intentionally retain its opaque
+ * experiment id; exposing both copies would violate the route identity
+ * contract. The normal catalog priority chooses the canonical copy, and both
+ * discovery and payload lookup consume that same ordered set. */
+fn canonical_sweeps(roots: &[ConfiguredRoot]) -> Result<Vec<DiscoveredSweep>> {
+    let mut sweeps = discover_sweeps(roots)?;
+    sweeps.sort_by(|left, right| {
+        right
+            .experiment_date
+            .cmp(&left.experiment_date)
+            .then_with(|| right.updated_time.cmp(&left.updated_time))
+            .then_with(|| left.sweep_id.cmp(&right.sweep_id))
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.workspace_id.cmp(&right.workspace_id))
+            .then_with(|| aggregate_source_path(left).cmp(aggregate_source_path(right)))
+    });
+    let mut seen_sweep_ids = HashSet::new();
+    sweeps.retain(|sweep| seen_sweep_ids.insert(sweep.sweep_id.clone()));
+    Ok(sweeps)
+}
+
+fn aggregate_source_path(sweep: &DiscoveredSweep) -> &Path {
+    match &sweep.source {
+        AggregateSource::Manifest(path) => path,
+        AggregateSource::Singleton(run) => &run.path,
+    }
+}
+
 pub(super) fn resolve_sweep(roots: &[ConfiguredRoot], sweep_id: &str) -> Result<DiscoveredSweep> {
-    discover_sweeps(roots)?
+    canonical_sweeps(roots)?
         .into_iter()
         .find(|sweep| sweep.sweep_id == sweep_id)
         .ok_or_else(|| SweepNotFound.into())

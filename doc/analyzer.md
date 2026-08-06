@@ -219,6 +219,15 @@ must reject absolute paths, traversal, duplicate coordinates, missing
 coordinates, and paths that resolve outside the experiment. Different
 experiment directories are never merged automatically.
 
+If copied experiment directories retain the same launcher-issued
+`experiment_id`, the service treats them as aliases of one opaque aggregate
+identity rather than publishing an invalid duplicate route. It keeps the first
+entry under the normal catalog priority (newer experiment date, then newer
+artifact update time), with stable workspace/name/path tie-breakers. Catalog
+discovery and `GET /api/v1/sweeps/{sweep_id}/payload` resolve through this same
+canonical entry. The directories are not merged and their members are not
+combined.
+
 A discovered run not claimed by any valid `sweep_manifest.json` is published as
 its own **singleton aggregate**. This is a one-member envelope with `kind:
 "singleton"`, zero axes, empty domains/coordinates, and the same scalar metric

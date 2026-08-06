@@ -326,6 +326,9 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
         sequences = load_labeled_kernel_sequences(config.iteration.labeled_kernel_sequences_file)
         labeled_sequences = config.log_dir / "kernel_sequences_labeled.json"
         labeled_sequences.write_text(json.dumps(sequences, indent=2))
+        # Captures taken before the host sidecar existed simply have no host
+        # lane; the subject degrades to the device-only view it always drew.
+        host_timeline = _optional_profile_artifact(profile_result, "host_timeline")
         manifest = {
             **common,
             "parsed_nsys": str(_manifest_path(input_manifest, "parsed_nsys")),
@@ -334,6 +337,7 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
                 _manifest_path(input_manifest, "timing_predict_case_map")
             ),
             "labeled_kernel_sequences": str(labeled_sequences),
+            "host_timeline": str(host_timeline) if host_timeline else None,
         }
     else:
         assert config.simulation_log_dir is not None  # enforced by load_analyze_config
@@ -398,9 +402,9 @@ def _launch_timing_predict(config_path: Path, *, build_type: str) -> int:
 
 
 def _launch_alignment_analysis(log_dir: Path, *, build_type: str, subjects: list[str]) -> bool:
-    from .exec import analyzer_binary_path, cargo_build, run_alignment_analysis
+    from .exec import analyzer_binary_path, cargo_build_analyzer, run_alignment_analysis
 
-    if not cargo_build(build_type, build_analyzer=True):
+    if not cargo_build_analyzer(build_type):
         return False
     if not analyzer_binary_path(build_type).is_file():
         print("[alignment] analyzer build failed", file=sys.stderr)
