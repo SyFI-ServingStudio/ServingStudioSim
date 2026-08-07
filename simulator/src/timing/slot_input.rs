@@ -21,9 +21,10 @@ use crate::timing::kernels::{
     DsaSparseMlaAttentionKernelInput, DsaTopkPrefillKernelInput, ElementwiseKernelInput,
     FlashinferAttnDecodeKernelInput, FlashinferAttnRectKernelInput, Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemmKernelInput, Fp8PerTokenGroupQuantKernelInput, GroupedGemmKernelInput,
-    KvCacheAppendKernelInput, MlaCacheAppendKernelInput, MoeFinalizeRoutingKernelInput,
-    P2pInterKernelInput, P2pIntraKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput,
-    SingleGemmKernelInput,
+    KvCacheAppendKernelInput, MlaCacheAppendKernelInput, MoeAlltoallKernelInput,
+    MoeAlltoallPrepareKernelInput, MoeFinalizeRoutingKernelInput, P2pInterKernelInput,
+    P2pIntraKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput, SingleGemmKernelInput,
+    VllmMlaRopeKernelInput,
 };
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -78,6 +79,8 @@ log_inputs! {
     Fp8BlockscaleGroupedGemm => Fp8BlockscaleGroupedGemmKernelInput,
     Fp8PerTokenGroupQuant => Fp8PerTokenGroupQuantKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
+    MoeAlltoall => MoeAlltoallKernelInput,
+    MoeAlltoallPrepare => MoeAlltoallPrepareKernelInput,
     AttnPrefill => AttnPrefillLog,
     DsaIndexerPrefill => DsaIndexerPrefillLog,
     DsaSparseMlaPrefill => DsaSparseMlaPrefillLog,
@@ -91,6 +94,7 @@ log_inputs! {
     DsaPersistentTopkDecode => DsaPersistentTopkDecodeKernelInput,
     DsaSparseMlaAttention => DsaSparseMlaAttentionKernelInput,
     DsaTopkPrefill => DsaTopkPrefillKernelInput,
+    VllmMlaRope => VllmMlaRopeKernelInput,
     AllReduce   => AllReduceKernelInput,
     AllReduceResidualRmsNorm => AllReduceResidualRmsNormKernelInput,
     P2pIntra    => P2pIntraKernelInput,

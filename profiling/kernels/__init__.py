@@ -31,10 +31,13 @@ from profiling.kernels import (
     grouped_gemm,  # noqa: F401
     kv_cache_append,  # noqa: F401
     mla_cache_append,  # noqa: F401
+    moe_alltoall,  # noqa: F401
+    moe_alltoall_prepare,  # noqa: F401
     moe_finalize_routing,  # noqa: F401
     p2p_inter,  # noqa: F401
     p2p_intra,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
     single_gemm,  # noqa: F401
+    vllm_mla_rope,  # noqa: F401
 )
