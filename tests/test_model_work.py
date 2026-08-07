@@ -10,6 +10,7 @@ vocab=128256, bf16 (2 B), lm_head untied.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -364,6 +365,203 @@ def test_unknown_architecture_errors():
 # --------------------------------------------------------------------------- #
 
 QWEN36 = Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_6_27b.json"
+
+GLM52 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm52.json"
+
+# GLM-5.2 hand-derived geometry. q_absorb and v_up partition kv_b_proj's learned
+# matrix into the W_UK and W_UV per-head views, so their total parameters equal
+# heads * (kv_lora * qk_nope + v_head * kv_lora).
+GLM_LAYERS = 78
+GLM_HIDDEN = 6144
+GLM_HEADS = 64
+GLM_Q_LORA = 2048
+GLM_KV_LORA = 512
+GLM_QK_NOPE = 192
+GLM_QK_ROPE = 64
+GLM_V_HEAD = 256
+GLM_INDEX_HEADS = 32
+GLM_INDEX_DIM = 128
+GLM_INDEX_TOPK = 2048
+GLM_VOCAB = 154880
+GLM_ROUTED_EXPERTS = 256
+GLM_TOPK = 8
+GLM_MOE_INTERMEDIATE = 2048
+GLM_DENSE_INTERMEDIATE = 12288
+GLM_BF16_BYTES = 2
+
+GLM_ATTN_PARAMS = (
+    (GLM_Q_LORA + GLM_KV_LORA + GLM_QK_ROPE) * GLM_HIDDEN
+    + GLM_HEADS * (GLM_QK_NOPE + GLM_QK_ROPE) * GLM_Q_LORA
+    + GLM_HEADS * GLM_KV_LORA * GLM_QK_NOPE
+    + GLM_HEADS * GLM_V_HEAD * GLM_KV_LORA
+    + GLM_HIDDEN * GLM_HEADS * GLM_V_HEAD
+)
+GLM_INDEX_PARAMS = (
+    GLM_INDEX_HEADS * GLM_INDEX_DIM * GLM_Q_LORA
+    + (GLM_INDEX_DIM + GLM_INDEX_HEADS) * GLM_HIDDEN
+)
+GLM_DENSE_FFN_PARAMS = 3 * GLM_DENSE_INTERMEDIATE * GLM_HIDDEN
+GLM_ROUTER_PARAMS = GLM_ROUTED_EXPERTS * GLM_HIDDEN
+GLM_EXPERT_PARAMS = GLM_ROUTED_EXPERTS * (
+    2 * GLM_MOE_INTERMEDIATE * GLM_HIDDEN + GLM_HIDDEN * GLM_MOE_INTERMEDIATE
+)
+GLM_SHARED_PARAMS = 3 * GLM_MOE_INTERMEDIATE * GLM_HIDDEN
+GLM_NORM_PARAMS = (
+    (GLM_HIDDEN + GLM_Q_LORA + GLM_KV_LORA + GLM_HIDDEN) * GLM_LAYERS
+    + GLM_INDEX_DIM * 21
+    + GLM_HIDDEN
+)
+
+
+def test_glm52_schedule_and_attention_holdouts():
+    model = load_model(GLM52)
+    assert model.num_layers == 78
+    stacks = {stack.tag: stack for stack in model.layers}
+    assert [(stack.tag, stack.count) for stack in model.layers] == [
+        ("dense_full_index", 3),
+        ("sparse_initial_index_share", 3),
+        ("sparse_cycle_full_index", 18),
+        ("sparse_cycle_index_share", 54),
+    ]
+    assert stacks["dense_full_index"].ffn.__class__.__name__ == "DenseSwiGLU"
+    assert stacks["sparse_initial_index_share"].ffn.__class__.__name__ == "MoE"
+    assert stacks["dense_full_index"].attn.full_index is True
+    assert stacks["sparse_initial_index_share"].attn.full_index is False
+    assert stacks["sparse_cycle_full_index"].attn.full_index is True
+    assert stacks["sparse_cycle_index_share"].attn.full_index is False
+    assert stacks["dense_full_index"].attn.mla_cache_dtype_bytes == GLM_BF16_BYTES
+    assert stacks["dense_full_index"].attn.index_cache_dtype_bytes == 1
+
+    full_names = {group.name for group in stacks["dense_full_index"].attn.matmul_groups()}
+    shared_names = {
+        group.name for group in stacks["sparse_initial_index_share"].attn.matmul_groups()
+    }
+    assert {"indexer.q_proj", "indexer.wk", "indexer.weights_proj"} <= full_names
+    assert not any(name.startswith("indexer.") for name in shared_names)
+    assert {"q_absorb", "v_up", "o_proj"} <= shared_names
+
+
+def test_glm52_hand_derived_params_and_decode_goldens():
+    label = load_model(GLM52).label(Workload.causal_lm(decode=[4096], sampled=1))
+    dense_full = GLM_ATTN_PARAMS + GLM_INDEX_PARAMS + GLM_DENSE_FFN_PARAMS
+    sparse_share = GLM_ATTN_PARAMS + GLM_ROUTER_PARAMS + GLM_EXPERT_PARAMS + GLM_SHARED_PARAMS
+    sparse_full = sparse_share + GLM_INDEX_PARAMS
+    expected_total = (
+        3 * dense_full
+        + 3 * sparse_share
+        + 18 * sparse_full
+        + 54 * sparse_share
+        + GLM_NORM_PARAMS
+        + 2 * GLM_VOCAB * GLM_HIDDEN
+    )
+    expected_active_layers = (
+        3 * (GLM_ATTN_PARAMS + GLM_INDEX_PARAMS + GLM_DENSE_FFN_PARAMS)
+        + 3 * GLM_ATTN_PARAMS
+        + 18 * (GLM_ATTN_PARAMS + GLM_INDEX_PARAMS)
+        + 54 * GLM_ATTN_PARAMS
+        + 75
+        * (
+            GLM_ROUTER_PARAMS
+            + GLM_TOPK
+            * (2 * GLM_MOE_INTERMEDIATE * GLM_HIDDEN + GLM_HIDDEN * GLM_MOE_INTERMEDIATE)
+            + GLM_SHARED_PARAMS
+        )
+        + GLM_NORM_PARAMS
+    )
+    assert label.params["total"] == expected_total == 743_376_998_016
+    assert label.params["activated"]["layers"] == expected_active_layers == 39_347_342_976
+    assert label.params["activated"]["with_embed_head"] == 41_250_508_416
+    assert label.params["breakdown"] == {
+        "embedding": GLM_VOCAB * GLM_HIDDEN,
+        "norm": GLM_NORM_PARAMS,
+        "attn": GLM_ATTN_PARAMS * 78 + GLM_INDEX_PARAMS * 21,
+        "ffn": GLM_DENSE_FFN_PARAMS * 3,
+        "experts": GLM_EXPERT_PARAMS * 75,
+        "shared": GLM_SHARED_PARAMS * 75,
+        "router": GLM_ROUTER_PARAMS * 75,
+        "lm_head": GLM_VOCAB * GLM_HIDDEN,
+    }
+
+    # Decode: 4096 causal pairs, 2048 selected keys, and 4095 cached keys.
+    expected_proj = 2 * GLM_ATTN_PARAMS * 78 + 2 * GLM_INDEX_PARAMS * 21
+    expected_internal = (
+        2 * GLM_HEADS * (GLM_KV_LORA + GLM_QK_ROPE + GLM_KV_LORA) * GLM_INDEX_TOPK * 78
+        + 2 * GLM_INDEX_HEADS * GLM_INDEX_DIM * 4096 * 21
+    )
+    expected_ffn = 2 * (
+        GLM_DENSE_FFN_PARAMS * 3
+        + GLM_TOPK
+        * (2 * GLM_MOE_INTERMEDIATE * GLM_HIDDEN + GLM_HIDDEN * GLM_MOE_INTERMEDIATE)
+        * 75
+        + GLM_SHARED_PARAMS * 75
+    )
+    expected_router = 2 * GLM_ROUTER_PARAMS * 75
+    assert label.flops["attn_proj"] == expected_proj == 26_136_674_304
+    assert label.flops["attn_internal"] == expected_internal == 22_951_231_488
+    assert label.flops["ffn"] == expected_ffn == 52_319_748_096
+    assert label.flops["router"] == expected_router == 235_929_600
+    assert label.flops["lm_head"] == 2 * GLM_HIDDEN * GLM_VOCAB
+    assert label.bytes["kv"] == 195_469_056
+
+
+def test_glm52_segments_holdouts_and_unified_map_are_complete():
+    model = load_model(GLM52)
+    label = model.label(
+        Workload.causal_lm(prefill=[(8, 0)], decode=[4096], sampled=2)
+    )
+    names = {segment.name for segment in label.segments}
+    assert {
+        "dense_full_index.indexer.prefill",
+        "dense_full_index.indexer.decode",
+        "dense_full_index.attn.prefill",
+        "dense_full_index.attn.decode",
+        "dense_full_index.index_cache_append",
+        "dense_full_index.mla_cache_append",
+    } <= names
+    assert not any(
+        "indexer." in segment.name for segment in label.segments if "index_share" in segment.name
+    )
+    assert not any(segment.name.endswith(".kv_cache_append") for segment in label.segments)
+    assert sum(segment.flops_total for segment in label.segments) == pytest.approx(
+        label.flops_total
+    )
+    assert sum(segment.bytes_total for segment in label.segments) == pytest.approx(
+        label.bytes_total
+    )
+
+    prefill = model.label(Workload.causal_lm(prefill=[(8, 0)], sampled=1))
+    # The empty-prefix causal triangle is 8*9/2 = 36 pairs. The selected-key
+    # count is the same short triangle because index_topk is 2048.
+    assert prefill.flops["attn_internal"] == (
+        2 * GLM_INDEX_HEADS * GLM_INDEX_DIM * 36 * 21
+        + 2 * GLM_HEADS * (GLM_KV_LORA + GLM_QK_ROPE + GLM_KV_LORA) * 36 * 78
+    ) == 397_246_464
+    assert prefill.bytes["kv"] == (
+        36 * (GLM_KV_LORA + GLM_QK_ROPE) * GLM_BF16_BYTES * 78
+        + 8 * (GLM_KV_LORA + GLM_QK_ROPE) * GLM_BF16_BYTES * 78
+        + 8 * (GLM_INDEX_DIM + 4) * 21
+    ) == 3_975_840
+
+    map_path = (
+        Path(__file__).resolve().parents[1]
+        / "model"
+        / "work"
+        / "location_maps"
+        / "glm52_dsa_moe_unified.json"
+    )
+    location_map = json.loads(map_path.read_text())
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    assert location_map["schema_version"] == 1
+    assert location_map["arch_types"] == ["glm52_dsa_moe"]
+    assert len(location_map["locations"]) == len(
+        {row["location"] for row in location_map["locations"]}
+    ) == 126
+    assert len(mapped) == len(set(mapped))
+    assert set(mapped) == names
+    assert all(
+        ".dispatch." not in row["location"] and ".combine." not in row["location"]
+        for row in location_map["locations"]
+    )
 
 # Real Qwen3.6-27B text_config: L=64, hidden=5120, intermediate=17408, vocab=248320,
 # head_dim=256, num_qo=24, num_kv=4, attn_output_gate; GDN: v_heads=48, k_heads=16,

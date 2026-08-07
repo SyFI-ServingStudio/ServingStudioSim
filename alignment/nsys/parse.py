@@ -44,7 +44,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .sequence import build_symmetric_device_kernel_sequences
+from .sequence import build_device_kernel_sequences
 
 # Alignment traces require inline, indexed iteration markers. Stage information
 # comes from the same iteration index in the metrics JSONL.
@@ -209,11 +209,17 @@ def kernel_category(name: str) -> str:
     return "other"
 
 
-def load_metrics(path: Path | None) -> dict[int, dict]:
-    """iteration_index → vLLM per-iteration metrics row (from the metrics jsonl)."""
+def load_metrics(path: Path | None) -> dict[tuple[int, int], dict]:
+    """(dp_rank, iteration_index) → vLLM per-iteration metrics row.
+
+    Under data parallelism each rank owns an independent scheduler and numbers
+    its own iterations, so several rows share one `iteration_index`. Keying on
+    the rank as well keeps every rank's batch shape; a capture without rank
+    provenance (`dp_rank` absent) is a single-EngineCore run and lands on rank 0.
+    """
     if path is None:
         return {}
-    metrics: dict[int, dict] = {}
+    metrics: dict[tuple[int, int], dict] = {}
     with Path(path).open() as fh:
         for line in fh:
             if not line.strip():
@@ -222,8 +228,57 @@ def load_metrics(path: Path | None) -> dict[int, dict]:
             iteration = row.get("iteration_index", row.get("iteration_num"))
             if iteration is None:
                 continue
-            metrics[int(iteration)] = row
+            key = (int(row.get("dp_rank", 0)), int(iteration))
+            if key in metrics:
+                raise ValueError(
+                    f"duplicate metrics record for dp_rank {key[0]} iteration {key[1]}"
+                )
+            metrics[key] = row
     return metrics
+
+
+def fold_rank_metrics(rows: list[dict], iteration_index: int) -> dict:
+    """One replica batch shape out of the per-rank rows of ONE wall-clock step.
+
+    The rows must already be the ranks of the same step. Which rows those are is
+    not a question this function can answer: ranks number their own iterations
+    (see `align_ranges_into_steps`), so the answer comes from the measured
+    timeline, not from the index.
+    """
+    adapters = {row.get("input_adapter") for row in rows}
+    if len(adapters) > 1:
+        raise ValueError(f"iteration {iteration_index} mixes input adapters {sorted(adapters)}")
+    return {
+        "schema_version": min(int(row.get("schema_version", 1)) for row in rows),
+        "input_adapter": next(iter(adapters)),
+        "iteration_index": iteration_index,
+        "dp_ranks": [int(row.get("dp_rank", 0)) for row in rows],
+        "prefill_tokens": sum(int(row.get("prefill_tokens", 0)) for row in rows),
+        "decode_requests": sum(int(row.get("decode_requests", 0)) for row in rows),
+        "decode_tokens_scheduled": sum(int(row.get("decode_tokens_scheduled", 0)) for row in rows),
+        "prefill_chunk_pairs": [
+            pair for row in rows for pair in row.get("prefill_chunk_pairs", [])
+        ],
+        "decode_kv_lens": [kv_len for row in rows for kv_len in row.get("decode_kv_lens", [])],
+    }
+
+
+def aggregate_metrics_by_iteration(rank_metrics: dict[tuple[int, int], dict]) -> dict[int, dict]:
+    """Fold the ranks that share an `iteration_index` into one batch shape.
+
+    Index-keyed, and therefore only correct when every rank numbers its steps
+    alike — a single-EngineCore run, or a capture whose ranks never diverged.
+    Under data parallelism they do diverge (a rank that runs a prefill chunk
+    alone advances its counter while its peers run uncounted dummy steps), and
+    the wall-clock grouping in `align_ranges_into_steps` is what pairs the ranks
+    there. This stays for the replica-level, timeline-free views.
+    """
+    grouped: dict[int, list[dict]] = defaultdict(list)
+    for (_, iteration), row in sorted(rank_metrics.items()):
+        grouped[iteration].append(row)
+    return {
+        iteration: fold_rank_metrics(rows, iteration) for iteration, rows in grouped.items()
+    }
 
 
 def load_string_ids(con: sqlite3.Connection) -> dict[int, str]:
@@ -322,6 +377,44 @@ def load_workers(con: sqlite3.Connection) -> dict[int, Worker]:
     return workers
 
 
+def window_rows_by_reference_rank(
+    parsed_rows: list[list], iteration_start: int, iteration_end: int
+) -> list[list]:
+    """Keep the reference rank's numbered window, and its peers by overlap.
+
+    `parsed_rows` is `[iteration, phase, worker, start_ns, end_ns]`. The
+    reference rank is the lowest device id present — the same choice
+    `align_ranges_into_steps` makes, so the two agree on whose clock the capture
+    is described in.
+    """
+    devices = {row[2].device_id for row in parsed_rows if row[2].device_id is not None}
+    if not devices:
+        return [row for row in parsed_rows if iteration_start <= row[0] <= iteration_end]
+    reference_device_id = min(devices)
+    reference_rows = [
+        row
+        for row in parsed_rows
+        if row[2].device_id == reference_device_id and iteration_start <= row[0] <= iteration_end
+    ]
+    if not reference_rows:
+        return []
+    span_start = min(row[3] for row in reference_rows)
+    span_end = max(row[4] for row in reference_rows)
+
+    def mostly_inside(row: list) -> bool:
+        # More than half of the range inside the span, not merely touching it:
+        # the step before the window ends where the window begins, so a
+        # touch-anywhere rule admits it on a nanosecond of overlap.
+        overlap = min(row[4], span_end) - max(row[3], span_start)
+        return overlap * 2 > max(row[4] - row[3], 1)
+
+    return reference_rows + [
+        row
+        for row in parsed_rows
+        if row[2].device_id != reference_device_id and mostly_inside(row)
+    ]
+
+
 def load_ranges(
     con: sqlite3.Connection,
     workers_by_gtid: dict[int, Worker],
@@ -331,11 +424,20 @@ def load_ranges(
     range_mode: str,
     default_stage: str = "all",
 ) -> list[RangeStats]:
-    """Extract per-worker NVTX iteration ranges in [iteration_start, iteration_end].
+    """Extract the NVTX iteration ranges of the window `[iteration_start, iteration_end]`.
 
     Only inline, indexed `vllm_iteration(N): <phase>` and
     `sglang_iteration(N): <phase>` markers are valid inputs. A trace without
     this contract is rejected naturally by producing no ranges.
+
+    The window is an interval of the REFERENCE rank's iteration numbers, and the
+    other ranks join it by measured time. Applying the same numeric interval to
+    every rank looks equivalent and is not: a rank numbers its own scheduled
+    steps, and in the GLM-5.2 DP8 capture the ranks that step together at
+    t=15.67 s call it iteration 11, 7 and 6. Filtering each rank on its own
+    number would then drop seven of the eight ranks from the first steps of the
+    window and leave a step that looks like one rank running alone — which is
+    what happened, and what this rule exists to prevent.
 
     `range_mode="forward"` keeps only the forward phase (the usual alignment
     target); "phases" keeps every phase; "envelope" merges an iteration's phases.
@@ -367,7 +469,7 @@ def load_ranges(
     def resolve_stage(iteration: int) -> str:
         return iteration_kind(metrics.get(iteration), default_stage)
 
-    windowed = [r for r in parsed_rows if iteration_start <= r[0] <= iteration_end]
+    windowed = window_rows_by_reference_rank(parsed_rows, iteration_start, iteration_end)
 
     if range_mode in ("forward", "phases"):
         return [
@@ -482,31 +584,252 @@ def attach_kernels_by_correlation(
     return kernel_rows
 
 
+def resolve_dp_rank_by_device(
+    workers: dict[int, Worker],
+    worker_ranks: dict[int, int],
+    tp_size: int,
+) -> dict[int, int]:
+    """CUDA device → data-parallel rank, joining nsys pids with the server log.
+
+    nsys knows which pid ran on which device; vLLM's startup banner states which
+    pid holds which global rank. A replica lays its ranks out as
+    `global_rank = dp_rank * tp_size + tp_rank`, so the DP rank is the global
+    rank divided by the TP degree. With no banner (single-process capture) every
+    observed device belongs to rank 0.
+    """
+    if not worker_ranks:
+        return {
+            worker.device_id: 0 for worker in workers.values() if worker.device_id is not None
+        }
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+
+    dp_rank_by_device: dict[int, int] = {}
+    for worker in workers.values():
+        if worker.device_id is None:
+            continue
+        global_rank = worker_ranks.get(worker.pid)
+        if global_rank is None:
+            raise ValueError(
+                f"nsys worker pid {worker.pid} (device {worker.device_id}) has no rank banner "
+                "in the server log; the capture and the log do not describe the same run"
+            )
+        dp_rank = global_rank // tp_size
+        existing = dp_rank_by_device.setdefault(worker.device_id, dp_rank)
+        if existing != dp_rank:
+            raise ValueError(
+                f"device {worker.device_id} maps to DP ranks {existing} and {dp_rank}"
+            )
+    return dp_rank_by_device
+
+
+@dataclass
+class DeviceStepWindow:
+    """One device's own step: every phase it ran under one of ITS iteration ids."""
+
+    device_id: int | None
+    iteration: int
+    start: int
+    end: int
+    items: list[RangeStats]
+
+
+@dataclass
+class AlignedStep:
+    """One wall-clock step, and which of each device's own iterations it is.
+
+    `iteration` is the reference device's index and remains the step's identity
+    downstream — a case index, a labeled sequence occurrence and an analyzer row
+    all address a step by it. `index_by_device` is the provenance that makes the
+    identity honest: under data parallelism the same step is iteration 153 on
+    device 0 and 149 on device 1.
+    """
+
+    iteration: int
+    reference_device_id: int | None
+    windows: list[DeviceStepWindow]
+
+    @property
+    def index_by_device(self) -> dict[int | None, int]:
+        return {window.device_id: window.iteration for window in self.windows}
+
+
+def _device_step_windows(ranges: list[RangeStats]) -> dict[int | None, list[DeviceStepWindow]]:
+    """Each device's own iterations, in time order, phases folded into one span."""
+    grouped: dict[tuple[int | None, int], list[RangeStats]] = defaultdict(list)
+    for item in ranges:
+        grouped[(item.worker.device_id, item.iteration)].append(item)
+    by_device: dict[int | None, list[DeviceStepWindow]] = defaultdict(list)
+    for (device_id, iteration), items in grouped.items():
+        by_device[device_id].append(
+            DeviceStepWindow(
+                device_id=device_id,
+                iteration=iteration,
+                start=min(item.start for item in items),
+                end=max(item.end for item in items),
+                items=sorted(items, key=lambda item: (item.start, item.phase)),
+            )
+        )
+    for windows in by_device.values():
+        windows.sort(key=lambda window: (window.start, window.iteration))
+    return by_device
+
+
+def _pair_by_overlap(
+    reference: list[DeviceStepWindow], peer: list[DeviceStepWindow]
+) -> tuple[dict[int, DeviceStepWindow], list[DeviceStepWindow]]:
+    """Match a peer device's steps to the reference's, one to one, by overlap.
+
+    A merge join rather than nearest-index: the two lists are each in time order
+    and internally non-overlapping, so one forward pass assigns every peer window
+    to the reference window it shares the most time with. Peer windows that match
+    nothing are returned rather than dropped — they are steps the reference was
+    not running, which is a fact about the capture, not noise to swallow.
+    """
+    matched: dict[int, DeviceStepWindow] = {}
+    unpaired: list[DeviceStepWindow] = []
+    reference_index = 0
+    peer_index = 0
+
+    def overlap(left: DeviceStepWindow, right: DeviceStepWindow) -> int:
+        return min(left.end, right.end) - max(left.start, right.start)
+
+    while reference_index < len(reference) and peer_index < len(peer):
+        reference_window = reference[reference_index]
+        peer_window = peer[peer_index]
+        if peer_window.end <= reference_window.start:
+            unpaired.append(peer_window)
+            peer_index += 1
+            continue
+        if reference_window.end <= peer_window.start:
+            reference_index += 1
+            continue
+        # They overlap. Take the next peer instead when it overlaps this
+        # reference step more, so a peer step straddling two reference steps
+        # lands on the one it actually shares its time with.
+        if peer_index + 1 < len(peer) and overlap(reference_window, peer[peer_index + 1]) > overlap(
+            reference_window, peer_window
+        ):
+            unpaired.append(peer_window)
+            peer_index += 1
+            continue
+        matched[reference_window.iteration] = peer_window
+        reference_index += 1
+        peer_index += 1
+    unpaired.extend(peer[peer_index:])
+    return matched, unpaired
+
+
+def align_ranges_into_steps(ranges: list[RangeStats]) -> tuple[list[AlignedStep], dict[int, int]]:
+    """Group the devices' ranges into wall-clock steps, NOT by iteration index.
+
+    Every rank's `iteration_index` counts that rank's own scheduled steps. Under
+    data parallelism the counters diverge and stay diverged: in the GLM-5.2 DP8
+    capture device 0 ran four prefill chunks alone at the head of the window
+    while its peers ran dummy batches that participate in the expert-parallel
+    collectives but are not scheduled iterations, so from then on device 0 was
+    permanently four to five ahead. Index 9 is a 1,927 ms prefill on device 0 and
+    a 20 ms decode on device 1, six seconds later.
+
+    Grouping by index therefore reduces kernels from different steps together —
+    a per-position `max` across ranks over events that never coexisted. This
+    groups by measured time instead: the lowest device is the reference clock and
+    each peer's step joins the reference step it overlaps most.
+
+    Returns the steps plus, per device, how many of its steps found no reference
+    step to join (reported in provenance; never silently dropped).
+    """
+    by_device = _device_step_windows(ranges)
+    if not by_device:
+        return [], {}
+    reference_device_id = sorted(by_device, key=lambda device: (device is None, device))[0]
+    reference = by_device[reference_device_id]
+
+    joined: dict[int, list[DeviceStepWindow]] = {
+        window.iteration: [window] for window in reference
+    }
+    unpaired_by_device: dict[int, int] = {}
+    for device_id, windows in by_device.items():
+        if device_id == reference_device_id:
+            continue
+        matched, unpaired = _pair_by_overlap(reference, windows)
+        for iteration, window in matched.items():
+            joined[iteration].append(window)
+        if unpaired:
+            unpaired_by_device[device_id] = len(unpaired)
+
+    steps = [
+        AlignedStep(
+            iteration=window.iteration,
+            reference_device_id=reference_device_id,
+            windows=sorted(
+                joined[window.iteration],
+                key=lambda joined_window: (
+                    joined_window.device_id if joined_window.device_id is not None else -1
+                ),
+            ),
+        )
+        for window in reference
+    ]
+    steps.sort(key=lambda step: step.iteration)
+    return steps, unpaired_by_device
+
+
 def build_iteration_details(
     ranges: list[RangeStats],
     metrics: dict[int, dict],
     kernel_name_ids: dict[str, int],
+    rank_metrics: dict[tuple[int, int], dict] | None = None,
+    dp_rank_by_device: dict[int, int] | None = None,
 ) -> list[dict]:
-    """Serialize every owned kernel in launch order, grouped by iteration.
+    """Serialize every owned kernel in launch order, grouped by wall-clock step.
 
     Summary categories are convenient analyzer inputs, but this list is the
     lossless ground-truth artifact. Kernel names are never truncated here.
+
+    A step is the set of per-device ranges that overlap in measured time, not
+    the set that shares an `iteration_index` — see `align_ranges_into_steps` for
+    why those are different things under data parallelism. Each serialized range
+    therefore carries `iteration_index`: the id its OWN rank gave the step, which
+    is the key its metrics row is under. A rank that scheduled nothing emits no
+    record, so its range metrics are `None` — an expected dummy step, never an
+    error — and a rank with no overlapping range at all is named in
+    `devices_absent` rather than left to be inferred from a short `ranges` list.
+
+    `metrics` is the index-keyed replica aggregate, used only as the fallback for
+    a capture with no per-rank rows; when those rows exist the step's shape is
+    folded from the ranks this step actually joined.
     """
-    by_iteration: dict[int, list[RangeStats]] = defaultdict(list)
-    for item in ranges:
-        by_iteration[item.iteration].append(item)
+    rank_metrics = rank_metrics or {}
+    dp_rank_by_device = dp_rank_by_device or {}
+    steps, _ = align_ranges_into_steps(ranges)
+    all_devices = sorted(
+        {item.worker.device_id for item in ranges if item.worker.device_id is not None}
+    )
 
     details = []
-    for iteration in sorted(by_iteration):
-        items = sorted(
-            by_iteration[iteration],
+    for step in steps:
+        items = [item for window in step.windows for item in window.items]
+        items.sort(
             key=lambda item: (
                 item.worker.device_id if item.worker.device_id is not None else -1,
                 item.start,
                 item.phase,
-            ),
+            )
         )
-        metric = metrics.get(iteration)
+        index_by_device = step.index_by_device
+        step_rows = [
+            rank_metrics[(dp_rank_by_device[device_id], iteration)]
+            for device_id, iteration in sorted(
+                ((device, index) for device, index in index_by_device.items() if device is not None)
+            )
+            if (dp_rank_by_device.get(device_id), iteration) in rank_metrics
+        ]
+        metric = (
+            fold_rank_metrics(step_rows, step.iteration)
+            if step_rows
+            else metrics.get(step.iteration)
+        )
         iteration_type = iteration_kind(metric, items[0].stage)
 
         serialized_ranges = []
@@ -524,9 +847,17 @@ def build_iteration_details(
                         "correlation_id": event.correlation_id,
                     }
                 )
+            range_dp_rank = dp_rank_by_device.get(item.worker.device_id)
             serialized_ranges.append(
                 {
                     "device_id": item.worker.device_id,
+                    "dp_rank": range_dp_rank,
+                    "iteration_index": item.iteration,
+                    "metrics": (
+                        rank_metrics.get((range_dp_rank, item.iteration))
+                        if range_dp_rank is not None
+                        else None
+                    ),
                     "worker": {
                         "name": item.worker.name,
                         "pid": item.worker.pid,
@@ -543,12 +874,33 @@ def build_iteration_details(
                 }
             )
 
+        present_devices = {device for device in index_by_device if device is not None}
         details.append(
             {
-                "iteration": iteration,
+                "iteration": step.iteration,
                 "iteration_type": iteration_type,
                 "stage": items[0].stage,
+                "reference_device_id": step.reference_device_id,
+                "iteration_index_by_device": {
+                    str(device): index
+                    for device, index in sorted(index_by_device.items())
+                    if device is not None
+                },
+                "devices_absent": [
+                    device for device in all_devices if device not in present_devices
+                ],
                 "metrics": metric,
+                "metrics_by_dp_rank": {
+                    str(dp_rank_by_device[device_id]): rank_metrics[
+                        (dp_rank_by_device[device_id], iteration)
+                    ]
+                    for device_id, iteration in sorted(
+                        (device, index)
+                        for device, index in index_by_device.items()
+                        if device is not None
+                    )
+                    if (dp_rank_by_device.get(device_id), iteration) in rank_metrics
+                },
                 "ranges": serialized_ranges,
             }
         )
@@ -712,7 +1064,9 @@ def parsed_window_ns(parsed: dict) -> tuple[int, int]:
         for range_row in detail["ranges"]
     ]
     ends = [
-        range_row["end_ns"] for detail in parsed["iteration_details"] for range_row in detail["ranges"]
+        range_row["end_ns"]
+        for detail in parsed["iteration_details"]
+        for range_row in detail["ranges"]
     ]
     if not starts:
         return (0, 0)
@@ -846,6 +1200,8 @@ def parse_trace(
     range_mode: str = "phases",
     default_stage: str = "all",
     top_n: int = 12,
+    worker_ranks: dict[int, int] | None = None,
+    tp_size: int = 1,
 ) -> dict:
     """Top-level parse: nsys sqlite → per-device per-category busy time / iter.
 
@@ -853,11 +1209,16 @@ def parse_trace(
     ("mixed"/"decode") so a prefill target and a decode target can be selected
     independently from one capture. `default_stage` tags ranges with no
     label/metrics stage (use "decode" for a pure-decode capture window).
+
+    `worker_ranks` (worker pid → global rank, from the server log) and `tp_size`
+    resolve which DP rank ran on which device. Without them the capture is read
+    as a single-rank run.
     """
     con = sqlite3.connect(str(sqlite_path))
     try:
         ensure_query_indexes(con)
-        metrics = load_metrics(metrics_jsonl)
+        rank_metrics = load_metrics(metrics_jsonl)
+        metrics = aggregate_metrics_by_iteration(rank_metrics)
         string_ids = load_string_ids(con)
         workers = load_workers(con)
         ranges = load_ranges(
@@ -872,6 +1233,8 @@ def parse_trace(
         kernel_rows = attach_kernels_by_correlation(con, string_ids, ranges)
     finally:
         con.close()
+
+    dp_rank_by_device = resolve_dp_rank_by_device(workers, worker_ranks or {}, tp_size)
 
     iterations = sorted({r.iteration for r in ranges})
     stages = sorted({r.stage for r in ranges})
@@ -893,12 +1256,27 @@ def parse_trace(
             },
             "all": summarize_devices(phase_ranges, top_n),
         }
-    iteration_details = build_iteration_details(ranges, metrics, kernel_name_ids)
-    kernel_sequences, device_ids, representative_device_id = (
-        build_symmetric_device_kernel_sequences(iteration_details, kernel_names)
+    iteration_details = build_iteration_details(
+        ranges, metrics, kernel_name_ids, rank_metrics, dp_rank_by_device
     )
+    aligned_steps, unpaired_by_device = align_ranges_into_steps(ranges)
+    kernel_sequences, device_ids = build_device_kernel_sequences(iteration_details, kernel_names)
     return {
-        "schema_version": 2,
+        "schema_version": 4,
+        # How the devices' ranges were grouped into steps. Recorded because the
+        # obvious rule — same `iteration_index` — is wrong under data
+        # parallelism, and a reader of this file has no way to tell which rule
+        # produced it otherwise.
+        "step_alignment": {
+            "rule": "wall_clock_overlap",
+            "reference_device_id": (
+                aligned_steps[0].reference_device_id if aligned_steps else None
+            ),
+            "steps": len(aligned_steps),
+            "unpaired_steps_by_device": {
+                str(device): count for device, count in sorted(unpaired_by_device.items())
+            },
+        },
         "sqlite": str(sqlite_path),
         "iteration_start": iteration_start,
         "iteration_end": iteration_end,
@@ -910,7 +1288,10 @@ def parse_trace(
         "kernel_names": kernel_names,
         "iteration_details": iteration_details,
         "device_ids": device_ids,
-        "representative_device_id": representative_device_id,
+        "dp_rank_by_device": {
+            str(device): rank for device, rank in sorted(dp_rank_by_device.items())
+        },
+        "tp_size": tp_size,
         "kernel_sequences": kernel_sequences,
         "by_phase": by_phase,
         "by_stage": by_stage,
@@ -931,6 +1312,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="stage for ranges lacking a label/metrics stage (e.g. 'decode' for a decode window)",
     )
     parser.add_argument("--top-n", type=int, default=12)
+    parser.add_argument(
+        "--server-log",
+        type=Path,
+        default=None,
+        help="vLLM server log; supplies the worker pid → rank banner that maps devices to DP ranks",
+    )
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="tensor-parallel degree, used to fold global ranks into DP ranks",
+    )
     parser.add_argument("--output", type=Path, default=None, help="Write JSON here (else stdout)")
     parser.add_argument(
         "--sequences-output",
@@ -950,16 +1343,17 @@ def build_parser() -> argparse.ArgumentParser:
 def write_kernel_sequences(path: Path, parsed: dict, source_parsed: Path | None) -> None:
     """Write the folded, label-ready sequence inventory separately from parsed.json."""
     document = {
-        "schema_version": 3,
+        "schema_version": 4,
         "encoding": "folded-v1",
         "source_parsed": str(source_parsed) if source_parsed is not None else None,
         "device_ids": parsed["device_ids"],
-        "representative_device_id": parsed["representative_device_id"],
         "folding_policy": {
             "kind": "exact_contiguous_repeat",
             "match_fields": ["name", "suggested_category"],
             "row_identity": "sequence_id:expanded_ordinal",
-            "rank_policy": "one representative after exact cross-device equality",
+            "rank_policy": (
+                "union across devices; each sequence lists its (device, iteration) occurrences"
+            ),
         },
         "phases": parsed["kernel_sequences"],
     }
@@ -980,6 +1374,14 @@ def _format_sequence_document(document: dict) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # Imported lazily: this module is the nsys-source boundary and must stay
+    # usable without the vLLM launcher package present.
+    if args.server_log is not None:
+        from ..profiler.vllm_server import extract_worker_device_ranks
+
+        worker_ranks = extract_worker_device_ranks(args.server_log)
+    else:
+        worker_ranks = {}
     result = parse_trace(
         args.sqlite,
         args.metrics,
@@ -988,6 +1390,8 @@ def main(argv: list[str] | None = None) -> int:
         range_mode=args.range_mode,
         default_stage=args.default_stage,
         top_n=args.top_n,
+        worker_ranks=worker_ranks,
+        tp_size=args.tp_size,
     )
     text = json.dumps(result, indent=2)
     if args.output:

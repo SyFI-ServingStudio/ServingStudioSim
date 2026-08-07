@@ -70,6 +70,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     profile.add_argument("config", type=Path, help="Profile phase YAML/JSON")
     profile.add_argument("--dry-run", action="store_true", help="Validate only.")
+    profile.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Reuse the existing capture and redo only record extraction, NSYS "
+            "normalization, and the result manifest. Use after a post-capture "
+            "failure so the GPU capture is never repeated."
+        ),
+    )
 
     predict = commands.add_parser(
         "timing-predict",
@@ -443,8 +452,8 @@ def _run_profile(args: argparse.Namespace) -> int:
         print(f"[alignment] profile validated: {args.config} (log_dir={config.log_dir})")
         return 0
     _snapshot_config(args.config, Path(config.log_dir), "profile")
-    print(f"[alignment] profiling: {args.config}")
-    result = run_profile(config)
+    print(f"[alignment] {'resuming' if args.resume else 'profiling'}: {args.config}")
+    result = run_profile(config, resume=args.resume)
     if result.get("profile_kind", "nsys") == "nsys":
         print(
             f"[alignment] profiling complete: {result['parsed_nsys']}\n"

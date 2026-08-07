@@ -543,35 +543,49 @@ class Model:
                 breakdown[_PARAM_BUCKET[group.bucket]] += group.total_params * stack.count
 
             # Attention semantic phases remain independent of simulator shapes.
-            # Tagged causal workloads split prefill/decode so a versioned map can
-            # assign them to distinct locations; untagged workloads retain `attn`.
-            attention_phases = (
-                wl.attention_phases() if stack.attn.split_attention_phases else [(None, wl)]
-            )
-            for phase, phase_workload in attention_phases:
-                phase_suffix = f".{phase}" if phase is not None else ""
-                segments.append(
-                    Segment(
-                        name=f"{prefix}attn{phase_suffix}",
-                        bucket="attn_internal",
-                        byte_kind="kv",
-                        flops=stack.attn.internal_flops(phase_workload),
-                        bytes=stack.attn.kv_bytes(phase_workload),
-                        count=stack.count,
+            # MLA/DSA exposes several rows (indexer, sparse attention, and two
+            # cache writes); older specs retain the historical fused rows.
+            custom_semantics = getattr(stack.attn, "semantic_segments", None)
+            if custom_semantics is not None:
+                for semantic in custom_semantics(wl):
+                    segments.append(
+                        Segment(
+                            name=f"{prefix}{semantic.name}",
+                            bucket=semantic.bucket,
+                            byte_kind=semantic.byte_kind,
+                            flops=semantic.flops,
+                            bytes=semantic.bytes,
+                            count=stack.count,
+                        )
                     )
+            else:
+                attention_phases = (
+                    wl.attention_phases() if stack.attn.split_attention_phases else [(None, wl)]
                 )
-            cache_write_bytes = stack.attn.cache_write_bytes(wl)
-            if cache_write_bytes > 0.0:
-                segments.append(
-                    Segment(
-                        name=f"{prefix}kv_cache_append",
-                        bucket="embedding",
-                        byte_kind="kv",
-                        flops=0.0,
-                        bytes=cache_write_bytes,
-                        count=stack.count,
+                for phase, phase_workload in attention_phases:
+                    phase_suffix = f".{phase}" if phase is not None else ""
+                    segments.append(
+                        Segment(
+                            name=f"{prefix}attn{phase_suffix}",
+                            bucket="attn_internal",
+                            byte_kind="kv",
+                            flops=stack.attn.internal_flops(phase_workload),
+                            bytes=stack.attn.kv_bytes(phase_workload),
+                            count=stack.count,
+                        )
                     )
-                )
+                cache_write_bytes = stack.attn.cache_write_bytes(wl)
+                if cache_write_bytes > 0.0:
+                    segments.append(
+                        Segment(
+                            name=f"{prefix}kv_cache_append",
+                            bucket="embedding",
+                            byte_kind="kv",
+                            flops=0.0,
+                            bytes=cache_write_bytes,
+                            count=stack.count,
+                        )
+                    )
 
         # Normalization activations can stay on-chip across a globally fused path,
         # but learned scale vectors are compulsory model weights. They intentionally

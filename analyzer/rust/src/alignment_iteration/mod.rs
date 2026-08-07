@@ -62,9 +62,20 @@ struct FoldedPhase {
 #[derive(Deserialize)]
 struct FoldedSequence {
     sequence_id: String,
-    iterations: Vec<u64>,
+    /// Schema 2/3: the sequence applies to every measured device. Schema 4
+    /// replaces this with `occurrences`, which carries the device axis.
+    #[serde(default)]
+    iterations: Option<Vec<u64>>,
+    #[serde(default)]
+    occurrences: Option<Vec<FoldedOccurrence>>,
     expanded_kernel_count: usize,
     program: Vec<ProgramNode>,
+}
+
+#[derive(Deserialize)]
+struct FoldedOccurrence {
+    device_id: i64,
+    iterations: Vec<u64>,
 }
 
 #[derive(Deserialize)]
@@ -170,11 +181,17 @@ struct CompiledInventory {
     simulated_slots: BTreeMap<String, BTreeSet<String>>,
     device_ids: Option<BTreeSet<i64>>,
     representative_device_id: Option<i64>,
+    /// Schema 4: sequences carry a device axis and ranks may diverge.
+    is_union_catalog: bool,
 }
 
 struct PhaseInventory {
     sequences: Vec<ExpandedSequence>,
-    sequence_by_iteration: BTreeMap<u64, usize>,
+    /// `(device, iteration) -> sequence`. A `None` device is the schema-2/3
+    /// shape: one labeling decision that every measured device shares. Schema 4
+    /// (data-parallel captures) names the device, because ranks schedule their
+    /// own batches and so can run different kernel sequences in the same step.
+    sequence_by_position: BTreeMap<(Option<i64>, u64), usize>,
 }
 
 struct ExpandedSequence {
@@ -220,6 +237,7 @@ struct KernelLaunch {
 #[derive(Default)]
 struct IterationKernelAggregate {
     phase: String,
+    sequence_id: String,
     row_id: String,
     name: String,
     name_id: u64,
@@ -419,24 +437,37 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         }
 
         // Reduce every measured occurrence across its ranks into one replica
-        // critical-path contribution, then roll those up. Mapped contributions
-        // become the operation baseline; their sum is the headline measured_ms.
-        let mut measured_ops: BTreeMap<String, f64> = BTreeMap::new();
-        let mut iteration_mapped_ms = 0.0;
-        let mut iteration_unmapped_measured_ms = 0.0;
+        // critical-path contribution, then roll those up. Occurrences merge only
+        // the ranks that ran the same kernel sequence, so under data parallelism
+        // a step's rows are split across disjoint rank sets. Those sets run
+        // concurrently and must not be summed. Charge every reduced occurrence
+        // back to each rank that raised it, sum along each rank's own timeline,
+        // then take the slowest rank. With every rank on one sequence each rank
+        // accumulates the identical series in the identical order, so this is
+        // arithmetically identical to the flat sum it replaces.
+        let mut device_ops: BTreeMap<i64, BTreeMap<String, f64>> = BTreeMap::new();
+        let mut device_mapped_ms: BTreeMap<i64, f64> = BTreeMap::new();
+        let mut device_unmapped_ms: BTreeMap<i64, f64> = BTreeMap::new();
         let mut measured_kernel_rows = Vec::with_capacity(measurement.kernels.len());
         for (_, item) in &measurement.kernels {
             let device_count = item.device_ids.len().max(1);
             let duration_ms = occurrence_ns(&item.launches, item.synchronizing) as f64 / 1e6;
-            match &item.operation {
-                Some(operation) => {
-                    *measured_ops.entry(operation.clone()).or_default() += duration_ms;
-                    iteration_mapped_ms += duration_ms;
+            for device_id in &item.device_ids {
+                match &item.operation {
+                    Some(operation) => {
+                        *device_ops
+                            .entry(*device_id)
+                            .or_default()
+                            .entry(operation.clone())
+                            .or_default() += duration_ms;
+                        *device_mapped_ms.entry(*device_id).or_default() += duration_ms;
+                    }
+                    None => *device_unmapped_ms.entry(*device_id).or_default() += duration_ms,
                 }
-                None => iteration_unmapped_measured_ms += duration_ms,
             }
             measured_kernel_rows.push(json!({
                 "phase": item.phase,
+                "sequence_id": item.sequence_id,
                 "row_id": item.row_id,
                 "name": item.name,
                 "category": item.category,
@@ -450,6 +481,16 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "device_ids": item.device_ids,
             }));
         }
+        let mut measured_ops: BTreeMap<String, f64> = BTreeMap::new();
+        for operations in device_ops.values() {
+            for (operation, device_ms) in operations {
+                let slowest = measured_ops.entry(operation.clone()).or_default();
+                *slowest = slowest.max(*device_ms);
+            }
+        }
+        let iteration_mapped_ms = device_mapped_ms.values().copied().fold(0.0f64, f64::max);
+        let iteration_unmapped_measured_ms =
+            device_unmapped_ms.values().copied().fold(0.0f64, f64::max);
         let measured_kernel_sum_ms = iteration_mapped_ms + iteration_unmapped_measured_ms;
         let measured_critical_path_ms = measured_kernel_sum_ms;
         // Feed the pooled duty-cycle multiplier. Only iterations that have a
@@ -859,13 +900,27 @@ fn measure_iteration(
     );
     let device_ids: BTreeSet<_> = ranges.iter().filter_map(|range| range.device_id).collect();
     if let Some(expected_devices) = &inventory.device_ids {
-        ensure!(
-            &device_ids == expected_devices,
-            "measured iteration {} devices {:?} != labeled inventory devices {:?}",
-            measured_iter.iteration,
-            device_ids,
-            expected_devices
-        );
+        // A data-parallel rank can sit out a step entirely (it has no work to
+        // schedule), so under the union catalog the measured devices are a
+        // non-empty SUBSET of the labeled population, not necessarily all of it.
+        // Symmetric captures still demand every rank every step.
+        if inventory.is_union_catalog {
+            ensure!(
+                device_ids.is_subset(expected_devices),
+                "measured iteration {} devices {:?} are not all in the labeled inventory {:?}",
+                measured_iter.iteration,
+                device_ids,
+                expected_devices
+            );
+        } else {
+            ensure!(
+                &device_ids == expected_devices,
+                "measured iteration {} devices {:?} != labeled inventory devices {:?}",
+                measured_iter.iteration,
+                device_ids,
+                expected_devices
+            );
+        }
     } else {
         ensure!(
             device_ids.len() <= 1,
@@ -919,12 +974,20 @@ fn measure_iteration(
             .phases
             .get(phase)
             .with_context(|| format!("labeled inventory has no phase {phase:?}"))?;
+        // Prefer this device's own labeling decision (schema 4); fall back to
+        // the device-agnostic one that schema 2/3 records for all ranks.
         let sequence_index = phase_inventory
-            .sequence_by_iteration
-            .get(&measured_iter.iteration)
+            .sequence_by_position
+            .get(&(Some(device_id), measured_iter.iteration))
+            .or_else(|| {
+                phase_inventory
+                    .sequence_by_position
+                    .get(&(None, measured_iter.iteration))
+            })
             .with_context(|| {
                 format!(
-                    "phase {phase:?} has no sequence for measured iteration {}",
+                    "phase {phase:?} has no sequence for measured iteration {} on device \
+                     {device_id}",
                     measured_iter.iteration
                 )
             })?;
@@ -1264,10 +1327,26 @@ impl CompiledInventory {
 
     /// The folded sequence a phase ran for one iteration — the identity that makes
     /// two iterations comparable (same kernel program, different measurements).
+    ///
+    /// Schema 2/3 records one device-agnostic decision per iteration. Schema 4
+    /// records one per device, and data-parallel ranks may diverge within a
+    /// step; this returns the LOWEST device's sequence so the identity stays
+    /// deterministic. Two iterations that agree on rank 0 but differ on a higher
+    /// rank therefore share an identity — acceptable for the timeline's
+    /// comparability grouping, but not a claim that every rank matched.
     fn sequence_id(&self, phase: &str, iteration: u64) -> Option<&str> {
         let phase_inventory = self.phases.get(phase)?;
-        let index = *phase_inventory.sequence_by_iteration.get(&iteration)?;
-        Some(phase_inventory.sequences[index].sequence_id.as_str())
+        let index = phase_inventory
+            .sequence_by_position
+            .get(&(None, iteration))
+            .or_else(|| {
+                phase_inventory
+                    .sequence_by_position
+                    .iter()
+                    .find(|((_, sequence_iteration), _)| *sequence_iteration == iteration)
+                    .map(|(_, index)| index)
+            })?;
+        Some(phase_inventory.sequences[*index].sequence_id.as_str())
     }
 
     fn validate_slots(&self, manifest: &Manifest) -> Result<()> {
@@ -1291,10 +1370,13 @@ impl CompiledInventory {
 }
 
 fn load_inventory(path: &Path) -> Result<CompiledInventory> {
-    let doc: FoldedSequenceDoc = read_json(path)?;
+    compile_inventory(read_json(path)?)
+}
+
+fn compile_inventory(doc: FoldedSequenceDoc) -> Result<CompiledInventory> {
     ensure!(
-        matches!(doc.schema_version, 2 | 3),
-        "labeled kernel sequences schema_version must be 2 or 3"
+        matches!(doc.schema_version, 2 | 3 | 4),
+        "labeled kernel sequences schema_version must be 2, 3 or 4"
     );
     ensure!(
         doc.encoding == "folded-v1",
@@ -1318,6 +1400,17 @@ fn load_inventory(path: &Path) -> Result<CompiledInventory> {
             doc.representative_device_id == ids.first().copied(),
             "schema-v3 representative_device_id must be the smallest device id"
         );
+    } else if doc.schema_version == 4 {
+        let ids = device_ids
+            .as_ref()
+            .context("schema-v4 labeled inventory requires device_ids")?;
+        ensure!(!ids.is_empty(), "schema-v4 device_ids cannot be empty");
+        // Schema 4 is a union catalog: no device is representative, because
+        // ranks may run different sequences in the same iteration.
+        ensure!(
+            doc.representative_device_id.is_none(),
+            "schema-v4 labeled inventory cannot declare a representative device"
+        );
     } else {
         ensure!(
             device_ids.is_none() && doc.representative_device_id.is_none(),
@@ -1334,7 +1427,7 @@ fn load_inventory(path: &Path) -> Result<CompiledInventory> {
             "phase {phase_name:?} has no sequences"
         );
         let mut sequences = Vec::new();
-        let mut sequence_by_iteration = BTreeMap::new();
+        let mut sequence_by_position = BTreeMap::new();
         for sequence in phase.unique_sequences {
             let kernels = expand_nodes(&sequence.program)?;
             ensure!(
@@ -1358,12 +1451,58 @@ fn load_inventory(path: &Path) -> Result<CompiledInventory> {
                 });
             }
             let sequence_index = sequences.len();
-            for iteration in sequence.iterations {
+            let positions: Vec<(Option<i64>, u64)> = if doc.schema_version == 4 {
                 ensure!(
-                    sequence_by_iteration
-                        .insert(iteration, sequence_index)
+                    sequence.iterations.is_none(),
+                    "schema-v4 sequence {:?} must carry occurrences, not iterations",
+                    sequence.sequence_id
+                );
+                let occurrences = sequence.occurrences.as_ref().with_context(|| {
+                    format!(
+                        "schema-v4 sequence {:?} has no occurrences",
+                        sequence.sequence_id
+                    )
+                })?;
+                ensure!(
+                    !occurrences.is_empty(),
+                    "schema-v4 sequence {:?} has an empty occurrence list",
+                    sequence.sequence_id
+                );
+                occurrences
+                    .iter()
+                    .flat_map(|occurrence| {
+                        occurrence
+                            .iterations
+                            .iter()
+                            .map(|iteration| (Some(occurrence.device_id), *iteration))
+                    })
+                    .collect()
+            } else {
+                ensure!(
+                    sequence.occurrences.is_none(),
+                    "schema-v{} sequence {:?} cannot carry occurrences",
+                    doc.schema_version,
+                    sequence.sequence_id
+                );
+                let iterations = sequence.iterations.as_ref().with_context(|| {
+                    format!("sequence {:?} has no iterations", sequence.sequence_id)
+                })?;
+                iterations
+                    .iter()
+                    .map(|iteration| (None, *iteration))
+                    .collect()
+            };
+            for position in positions {
+                ensure!(
+                    sequence_by_position
+                        .insert(position, sequence_index)
                         .is_none(),
-                    "phase {phase_name:?} assigns iteration {iteration} twice"
+                    "phase {phase_name:?} assigns iteration {} twice{}",
+                    position.1,
+                    position
+                        .0
+                        .map(|device| format!(" on device {device}"))
+                        .unwrap_or_default()
                 );
             }
             sequences.push(ExpandedSequence {
@@ -1377,7 +1516,7 @@ fn load_inventory(path: &Path) -> Result<CompiledInventory> {
                     phase_name,
                     PhaseInventory {
                         sequences,
-                        sequence_by_iteration,
+                        sequence_by_position,
                     },
                 )
                 .is_none(),
@@ -1390,6 +1529,7 @@ fn load_inventory(path: &Path) -> Result<CompiledInventory> {
         simulated_slots,
         device_ids,
         representative_device_id: doc.representative_device_id,
+        is_union_catalog: doc.schema_version == 4,
     })
 }
 
@@ -1648,7 +1788,7 @@ fn definitions() -> Value {
         "recommended_gpu_time_multiplier": "pooled duty-cycle correction = Σ measured_gpu_cycle_ms / Σ measured_ms over iterations that have a measured cycle. Applying it as simulated_gpu_cycle = simulated_ms × this makes the pooled GPU-cycle gap equal the pooled kernel gap by construction. Derived from the measured side only (no simulation input); the aligned simulation worker should bake this value into its clock",
         "simulated_gpu_cycle_ms": "timing-predict total_time_ms multiplied by recommended_gpu_time_multiplier (the measured pooled duty-cycle correction), i.e. the kernel-only prediction scaled up to wall-clock",
         "gpu_cycle_relative_diff_pct": "(scaled timing-predict GPU cycle - measured GPU cycle) / measured GPU cycle * 100; positive means overprediction",
-        "operation_measured_ms": "sum over the operation's occurrences of each occurrence's cross-rank reduction (independent = slowest rank duration; synchronizing = max(end) - max(start)); arrival wait is dropped, not attributed to the collective",
+        "operation_measured_ms": "each occurrence is first reduced across the ranks that raised it (independent = slowest rank duration; synchronizing = max(end) - max(start)); arrival wait is dropped, not attributed to the collective. Those reduced durations are then summed along each rank's own timeline and the slowest rank is taken, so ranks that ran different kernel sequences (data parallelism) combine concurrently rather than serially. When every rank runs one sequence this is exactly the flat sum over occurrences",
         "operation_simulated_ms": "mapped sim leaf contribution after exact CostTree Sum/Scale/Max/overlap attribution; operation contributions plus unmapped critical-path leaves add to total_simulated_ms",
         "measured_kernel_duration_ms": "one occurrence's cross-rank critical-path contribution per the cross_rank class: independent = max over ranks of (end-start); synchronizing collective = max(end) - max(start). rank_launches counts raw launches; replica_calls divides symmetric launches by captured device count",
         "cross_rank": "the mapping table's per-kernel reduction class: synchronizing (a collective barrier) or independent; the analyzer applies min/max from this, never from a category or name",
@@ -1866,6 +2006,148 @@ mod tests {
         assert_eq!(
             slots["attention.combine"],
             BTreeSet::from(["attention".to_string()])
+        );
+    }
+    /// One-kernel `forward` sequence carrying an unmapped label, which is
+    /// enough to exercise the inventory's device/iteration bookkeeping.
+    fn folded_sequence(sequence_id: &str, assignment: serde_json::Value) -> serde_json::Value {
+        let mut sequence = json!({
+            "sequence_id": sequence_id,
+            "expanded_kernel_count": 1,
+            "program": [{"kernels": [{
+                "name": format!("{sequence_id}_kernel"),
+                "suggested_category": "compute",
+                "label": {"status": "unmapped"},
+            }]}],
+        });
+        let object = sequence.as_object_mut().unwrap();
+        for (key, value) in assignment.as_object().unwrap() {
+            object.insert(key.clone(), value.clone());
+        }
+        sequence
+    }
+
+    fn inventory_doc(
+        schema_version: u32,
+        device_metadata: serde_json::Value,
+        sequences: Vec<serde_json::Value>,
+    ) -> FoldedSequenceDoc {
+        let mut doc = json!({
+            "schema_version": schema_version,
+            "encoding": "folded-v1",
+            "phases": {"forward": {"unique_sequences": sequences}},
+        });
+        let object = doc.as_object_mut().unwrap();
+        for (key, value) in device_metadata.as_object().unwrap() {
+            object.insert(key.clone(), value.clone());
+        }
+        serde_json::from_value(doc).unwrap()
+    }
+
+    #[test]
+    fn schema_four_keeps_each_device_on_its_own_sequence() {
+        // Data parallelism: device 0 and device 1 run different kernel
+        // sequences in the same iteration. Both labeling decisions survive.
+        let inventory = compile_inventory(inventory_doc(
+            4,
+            json!({"device_ids": [0, 1]}),
+            vec![
+                folded_sequence(
+                    "sequence_aaa",
+                    json!({"occurrences": [{"device_id": 0, "iterations": [7]}]}),
+                ),
+                folded_sequence(
+                    "sequence_bbb",
+                    json!({"occurrences": [{"device_id": 1, "iterations": [7]}]}),
+                ),
+            ],
+        ))
+        .unwrap();
+
+        let phase = &inventory.phases["forward"];
+        assert_eq!(
+            phase.sequences[phase.sequence_by_position[&(Some(0), 7)]].sequence_id,
+            "sequence_aaa"
+        );
+        assert_eq!(
+            phase.sequences[phase.sequence_by_position[&(Some(1), 7)]].sequence_id,
+            "sequence_bbb"
+        );
+        assert_eq!(inventory.representative_device_id, None);
+    }
+
+    #[test]
+    fn schema_three_labels_stay_device_agnostic() {
+        // The pre-DP shape: one decision per iteration, shared by every rank.
+        let inventory = compile_inventory(inventory_doc(
+            3,
+            json!({"device_ids": [0, 1], "representative_device_id": 0}),
+            vec![folded_sequence("sequence_aaa", json!({"iterations": [7]}))],
+        ))
+        .unwrap();
+
+        let phase = &inventory.phases["forward"];
+        assert_eq!(phase.sequence_by_position.get(&(Some(0), 7)), None);
+        assert_eq!(phase.sequence_by_position[&(None, 7)], 0);
+    }
+
+    #[test]
+    fn schema_four_rejects_a_representative_device() {
+        // A union catalog has no representative: ranks may disagree.
+        let error = compile_inventory(inventory_doc(
+            4,
+            json!({"device_ids": [0, 1], "representative_device_id": 0}),
+            vec![folded_sequence(
+                "sequence_aaa",
+                json!({"occurrences": [{"device_id": 0, "iterations": [7]}]}),
+            )],
+        ))
+        .map(|_| ())
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("representative device"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn schema_four_rejects_device_agnostic_iterations() {
+        let error = compile_inventory(inventory_doc(
+            4,
+            json!({"device_ids": [0]}),
+            vec![folded_sequence("sequence_aaa", json!({"iterations": [7]}))],
+        ))
+        .map(|_| ())
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("must carry occurrences"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn schema_four_rejects_two_sequences_for_one_device_iteration() {
+        let error = compile_inventory(inventory_doc(
+            4,
+            json!({"device_ids": [0]}),
+            vec![
+                folded_sequence(
+                    "sequence_aaa",
+                    json!({"occurrences": [{"device_id": 0, "iterations": [7]}]}),
+                ),
+                folded_sequence(
+                    "sequence_bbb",
+                    json!({"occurrences": [{"device_id": 0, "iterations": [7]}]}),
+                ),
+            ],
+        ))
+        .map(|_| ())
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("assigns iteration 7 twice on device 0"),
+            "unexpected error: {error}"
         );
     }
 }

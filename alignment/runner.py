@@ -65,35 +65,45 @@ def _resolve_fork_python(cfg: ProfileConfig) -> str:
     return str(fork)
 
 
-def run_profile(cfg: ProfileConfig) -> dict:
-    """Run one explicit measured pass: NSYS, workload timing, or popularity."""
+def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
+    """Run one explicit measured pass: NSYS, workload timing, or popularity.
+
+    `resume=True` reuses an existing capture and redoes only the cheap
+    post-capture work (record extraction, NSYS normalization, artifact
+    manifest). The GPU capture is the expensive, non-reproducible part of this
+    pipeline; a failure in extraction or parsing must never cost a re-capture.
+    """
     log_dir = Path(cfg.log_dir)
     if not log_dir.is_absolute():
         log_dir = REPO_ROOT / log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
-    # Build and normalize before nsys starts. This avoids capturing Rust compile
-    # work and ensures a bad trace fails before allocating vLLM GPU memory.
-    load_generator.build_session_runner()
     prepared_replay = load_generator.prepare_replay(cfg.workload, log_dir)
-    fork_python = _resolve_fork_python(cfg)
+    if not resume:
+        # Build and normalize before nsys starts. This avoids capturing Rust
+        # compile work and ensures a bad trace fails before allocating vLLM GPU
+        # memory.
+        load_generator.build_session_runner()
     vllm_dir = log_dir / "vllm"
     nsys_dir = log_dir / "nsys"
     vllm_dir.mkdir(parents=True, exist_ok=True)
     nsys_dir.mkdir(parents=True, exist_ok=True)
 
-    server_argv = vllm_server.build_server_argv(fork_python, cfg.server)
+    # A resumed pass never launches vLLM, so it must not require the fork venv
+    # either — the capture it reuses is the evidence.
+    fork_python = None if resume else _resolve_fork_python(cfg)
+    server_argv = [] if resume else vllm_server.build_server_argv(fork_python, cfg.server)
     is_expert_popularity = cfg.profile_kind == "expert_popularity"
     is_workload_metrics = cfg.profile_kind == "workload_metrics"
     is_nsys = cfg.profile_kind == "nsys"
     if not (is_nsys or is_expert_popularity or is_workload_metrics):
         raise ValueError(f"unsupported profile_kind: {cfg.profile_kind!r}")
-    if is_nsys and cfg.nsys.capture_mode == "cuda_profiler_api":
+    if is_nsys and cfg.nsys.capture_mode == "cuda_profiler_api" and not resume:
         # This enables vLLM's /start_profile and /stop_profile routes. Those
         # routes fan CUDA profiler control into the actual GPU worker, which is
         # the reliable targeted-capture boundary for the spawned EngineCore.
         server_argv.append("--profiler-config.profiler=cuda")
-    env = vllm_server.build_server_env(fork_python, cfg.cuda_visible_devices)
-    if is_expert_popularity:
+    env = {} if resume else vllm_server.build_server_env(fork_python, cfg.cuda_visible_devices)
+    if is_expert_popularity and not resume:
         # This pass measures routing counts, not phase timing.  NVTX construction
         # and NSYS are disabled so its deliberate EPLB all-reduce/D2H logging
         # overhead cannot be confused with the timing pass.
@@ -101,7 +111,40 @@ def run_profile(cfg: ProfileConfig) -> dict:
     # Only the timing pass runs under NSYS. The other passes launch the same
     # server argv bare so profiler lifecycle work cannot enter their evidence.
     out_rep = nsys_dir / cfg.name
-    nsys_executable = nsys_capture.resolve_nsys_executable(cfg.nsys.executable) if is_nsys else None
+    nsys_executable = (
+        nsys_capture.resolve_nsys_executable(cfg.nsys.executable)
+        if is_nsys and not resume
+        else None
+    )
+    server_log = vllm_dir / f"{cfg.name}_server.log"
+
+    if resume:
+        if not server_log.is_file():
+            raise FileNotFoundError(
+                f"cannot resume: server log not found: {server_log}; run the capture first"
+            )
+        # Rebuilt from the config and the prepared replay, exactly as the live
+        # path derives it. `reached_idle` is a liveness observation of the
+        # finished server and is deliberately left out rather than invented.
+        drive_summary = {
+            "source_trace": str(prepared_replay.trace_path.resolve()),
+            "frontend_type": cfg.workload.frontend.type,
+            "log_path": str(prepared_replay.log_path),
+            "summary_path": str(prepared_replay.summary_path),
+            "resumed_from_existing_capture": True,
+        }
+        print(f"[profile] resuming from existing capture (log: {server_log})")
+        return _finalize_profile(
+            cfg,
+            log_dir=log_dir,
+            vllm_dir=vllm_dir,
+            server_log=server_log,
+            out_rep=out_rep,
+            prepared_replay=prepared_replay,
+            drive_summary=drive_summary,
+            nsys_executable=None,
+        )
+
     full_argv = (
         nsys_capture.build_nsys_prefix(nsys_executable, cfg.nsys, out_rep) + server_argv
         if nsys_executable is not None
@@ -117,7 +160,6 @@ def run_profile(cfg: ProfileConfig) -> dict:
         nsys_executable.provenance() if nsys_executable is not None else None,
     )
 
-    server_log = vllm_dir / f"{cfg.name}_server.log"
     base_url = f"http://{cfg.server.host}:{cfg.server.port}"
     model = cfg.server.served_model_name or cfg.server.model_path
 
@@ -193,8 +235,42 @@ def run_profile(cfg: ProfileConfig) -> dict:
                     pass
             _shutdown(proc)
 
+    return _finalize_profile(
+        cfg,
+        log_dir=log_dir,
+        vllm_dir=vllm_dir,
+        server_log=server_log,
+        out_rep=out_rep,
+        prepared_replay=prepared_replay,
+        drive_summary=drive_summary,
+        nsys_executable=nsys_executable,
+    )
+
+
+def _finalize_profile(
+    cfg: ProfileConfig,
+    *,
+    log_dir: Path,
+    vllm_dir: Path,
+    server_log: Path,
+    out_rep: Path,
+    prepared_replay,
+    drive_summary: dict,
+    nsys_executable,
+) -> dict:
+    """Turn a finished capture into normalized artifacts and the result manifest.
+
+    Split out of `run_profile` so a resume can redo exactly this — every step
+    here reads only files the capture already wrote, so it is cheap and
+    repeatable, unlike the capture itself.
+    """
+    is_expert_popularity = cfg.profile_kind == "expert_popularity"
+    is_workload_metrics = cfg.profile_kind == "workload_metrics"
+
     metrics_jsonl = vllm_dir / f"{cfg.name}_metrics.jsonl"
-    n_metrics = vllm_server.extract_metrics_jsonl(server_log, metrics_jsonl)
+    n_metrics = vllm_server.extract_metrics_jsonl(
+        server_log, metrics_jsonl, dp_size=cfg.server.dp_size
+    )
 
     if is_expert_popularity:
         # This pass deliberately disables VLLM_NVTX_SCOPES_FOR_PROFILING, which
@@ -262,10 +338,20 @@ def run_profile(cfg: ProfileConfig) -> dict:
         )
         return result
 
-    assert nsys_executable is not None
     rep_alt = out_rep.with_suffix(".nsys-rep")
     rep = rep_alt if rep_alt.exists() else out_rep
-    sqlite_path = nsys_capture.export_sqlite(nsys_executable, rep)
+    exported_sqlite = rep.with_suffix(".sqlite")
+    if nsys_executable is None:
+        # Resume path: the SQLite export is a pure function of the immutable
+        # `.nsys-rep`, so an existing one is reused rather than re-derived.
+        if not exported_sqlite.is_file():
+            raise FileNotFoundError(
+                f"cannot resume: no SQLite export beside {rep}; re-run `alignment profile` "
+                "without --resume, or export it with `nsys export --type sqlite`"
+            )
+        sqlite_path = exported_sqlite
+    else:
+        sqlite_path = nsys_capture.export_sqlite(nsys_executable, rep)
     validation = nsys_capture.validate_export(sqlite_path)
     print(
         f"[profile] export ok: sqlite={sqlite_path.name} "
@@ -276,12 +362,17 @@ def run_profile(cfg: ProfileConfig) -> dict:
         print("[warn] export validation failed — capture window may have missed target iterations")
 
     parsed_path = log_dir / "parsed.json"
+    # The server log is the only source of the worker pid ↔ global rank identity
+    # that turns nsys's per-device kernels into per-DP-rank evidence.
+    worker_ranks = vllm_server.extract_worker_device_ranks(server_log)
     parsed = parse_trace(
         sqlite_path,
         metrics_jsonl,
         cfg.nsys.analyze_iteration_start,
         cfg.nsys.analyze_iteration_end,
         range_mode="phases",
+        worker_ranks=worker_ranks,
+        tp_size=cfg.server.tp_size,
     )
     expected_device_count = cfg.server.tp_size * cfg.server.dp_size
     if len(parsed["device_ids"]) != expected_device_count:
@@ -289,6 +380,12 @@ def run_profile(cfg: ProfileConfig) -> dict:
             "normalized NSYS device population does not match server parallelism: "
             f"devices={parsed['device_ids']} tp_size={cfg.server.tp_size} "
             f"dp_size={cfg.server.dp_size}"
+        )
+    observed_dp_ranks = sorted(set(parsed["dp_rank_by_device"].values()))
+    if observed_dp_ranks != list(range(cfg.server.dp_size)):
+        raise RuntimeError(
+            "normalized NSYS DP-rank population does not match server parallelism: "
+            f"dp_ranks={observed_dp_ranks} dp_size={cfg.server.dp_size}"
         )
     parsed_path.write_text(json.dumps(parsed, indent=2))
     kernel_sequences_path = log_dir / "kernel_sequences.json"
@@ -329,13 +426,31 @@ def run_profile(cfg: ProfileConfig) -> dict:
         "server_dp_size": cfg.server.dp_size,
         "cuda_visible_devices": cfg.cuda_visible_devices,
         "parsed_device_ids": parsed["device_ids"],
+        "parsed_dp_rank_by_device": parsed["dp_rank_by_device"],
         "replay_result": str(prepared_replay.log_path.resolve()),
         "drive_summary": drive_summary,
         "validation": validation,
-        "nsys_profiler": nsys_executable.provenance(),
+        # The profiler that produced the capture, never the one this process can
+        # see. A resume reads it back from the capture's own launch metadata and
+        # reports null when that capture predates the field — an unrecorded fact
+        # is left unrecorded rather than back-filled from the current host.
+        "nsys_profiler": (
+            nsys_executable.provenance()
+            if nsys_executable is not None
+            else _captured_nsys_provenance(vllm_dir / f"{cfg.name}_launch.json")
+        ),
     }
     (log_dir / "profile_result.json").write_text(json.dumps(result, indent=2))
     return result
+
+
+def _captured_nsys_provenance(launch_metadata: Path) -> dict | None:
+    """The NSYS provenance recorded when the capture ran, if it recorded any."""
+    if not launch_metadata.is_file():
+        return None
+    metadata = json.loads(launch_metadata.read_text())
+    provenance = metadata.get("nsys_profiler")
+    return provenance if isinstance(provenance, dict) else None
 
 
 def _shutdown(proc: subprocess.Popen) -> None:

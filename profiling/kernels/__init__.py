@@ -13,6 +13,14 @@ kernel kind owns its Python wire format and registry presence.
 from profiling.kernels import (
     all_reduce,  # noqa: F401
     all_reduce_residual_rms_norm,  # noqa: F401
+    batched_gemm,  # noqa: F401
+    dsa_index_cache_append,  # noqa: F401
+    dsa_mqa_logits_prefill,  # noqa: F401
+    dsa_paged_mqa_logits_decode,  # noqa: F401
+    dsa_persistent_topk_decode,  # noqa: F401
+    dsa_sparse_index_remap,  # noqa: F401
+    dsa_sparse_mla_attention,  # noqa: F401
+    dsa_topk_prefill,  # noqa: F401
     elementwise,  # noqa: F401
     flashinfer_attn_decode,  # noqa: F401
     flashinfer_attn_prefill,  # noqa: F401
@@ -22,9 +30,14 @@ from profiling.kernels import (
     fp8_per_token_group_quant,  # noqa: F401
     grouped_gemm,  # noqa: F401
     kv_cache_append,  # noqa: F401
+    mla_cache_append,  # noqa: F401
+    moe_alltoall,  # noqa: F401
+    moe_alltoall_prepare,  # noqa: F401
     moe_finalize_routing,  # noqa: F401
     p2p_inter,  # noqa: F401
     p2p_intra,  # noqa: F401
+    residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
     single_gemm,  # noqa: F401
+    vllm_mla_rope,  # noqa: F401
 )

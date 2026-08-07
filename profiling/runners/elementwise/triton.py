@@ -30,6 +30,7 @@ from profiling.runners.metrics import ComputeMetrics
 # @triton.jit function names below and with ref TARGET_KERNEL_NAMES.
 _FAN_KERNEL_NAME = "elementwise_fan_kernel"
 _ZERO_KERNEL_NAME = "elementwise_zero_kernel"
+_INT32_MAX = 2_147_483_647
 
 try:
     import triton
@@ -50,15 +51,29 @@ try:
         output_ptr,
         OUTPUT_SIZE: tl.constexpr,
         FAN_IN: tl.constexpr,
+        USE_INT64: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < OUTPUT_SIZE
+        if USE_INT64:
+            # SM address arithmetic must not wrap at signed int32 for wide
+            # buffers. Only the pointer-index width changes on this path.
+            pid = pid.to(tl.int64)
+            block_size = tl.full((), BLOCK_SIZE, tl.int64)
+            output_size = tl.full((), OUTPUT_SIZE, tl.int64)
+            offsets = pid * block_size + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+            mask = offsets < output_size
+        else:
+            offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < OUTPUT_SIZE
         acc = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
         for fan_idx in tl.range(0, FAN_IN):
+            if USE_INT64:
+                fan_offset = fan_idx.to(tl.int64) * output_size
+            else:
+                fan_offset = fan_idx * OUTPUT_SIZE
             values = tl.load(
-                input_ptr + fan_idx * OUTPUT_SIZE + offsets,
+                input_ptr + fan_offset + offsets,
                 mask=mask,
                 other=0,
             ).to(tl.int32)
@@ -70,11 +85,20 @@ try:
     def _elementwise_zero_kernel(
         output_ptr,
         OUTPUT_SIZE: tl.constexpr,
+        USE_INT64: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < OUTPUT_SIZE
+        if USE_INT64:
+            # Match the fan kernel's wide-pointer contract for zero-fill.
+            pid = pid.to(tl.int64)
+            block_size = tl.full((), BLOCK_SIZE, tl.int64)
+            output_size = tl.full((), OUTPUT_SIZE, tl.int64)
+            offsets = pid * block_size + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+            mask = offsets < output_size
+        else:
+            offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < OUTPUT_SIZE
         tl.store(output_ptr + offsets, tl.zeros((BLOCK_SIZE,), dtype=tl.uint8), mask=mask)
 
     _TRITON_IMPORT_ERROR: ImportError | None = None
@@ -84,6 +108,16 @@ except ImportError as exc:  # pragma: no cover - exercised only without triton
 
 def _rounded_fan_in(input_size_bytes: int, output_size_bytes: int) -> int:
     return max(1, int(input_size_bytes / output_size_bytes + 0.5))
+
+
+def _requires_int64_offsets(input_size_bytes: int, output_size_bytes: int) -> bool:
+    """Whether the launched buffers cross Triton's signed-int32 index range."""
+    effective_input = (
+        _rounded_fan_in(input_size_bytes, output_size_bytes) * output_size_bytes
+        if input_size_bytes > 0
+        else 0
+    )
+    return max(effective_input, output_size_bytes) > _INT32_MAX
 
 
 def profile_elementwise(
@@ -105,9 +139,7 @@ def profile_elementwise(
     try:
         import torch
     except ImportError as exc:
-        raise ProfilerNotImplemented(
-            "torch is required for the triton elementwise runner"
-        ) from exc
+        raise ProfilerNotImplemented("torch is required for the triton elementwise runner") from exc
 
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented("CUDA is required for the triton elementwise runner")
@@ -123,19 +155,25 @@ def profile_elementwise(
             effective_input = fan_in * output_size_bytes
             kernel_name = _FAN_KERNEL_NAME
         input_tensor = torch.empty(effective_input, dtype=torch.uint8, device="cuda")
+        use_int64 = _requires_int64_offsets(input_size_bytes, output_size_bytes)
 
         def grid(meta):
             return (triton.cdiv(output_size_bytes, meta["BLOCK_SIZE"]),)
 
         def run_once():
             if fan_in == 0:
-                _elementwise_zero_kernel[grid](output_tensor, OUTPUT_SIZE=output_size_bytes)
+                _elementwise_zero_kernel[grid](
+                    output_tensor,
+                    OUTPUT_SIZE=output_size_bytes,
+                    USE_INT64=use_int64,
+                )
             else:
                 _elementwise_fan_kernel[grid](
                     input_tensor,
                     output_tensor,
                     OUTPUT_SIZE=output_size_bytes,
                     FAN_IN=fan_in,
+                    USE_INT64=use_int64,
                 )
 
         # The @autotune'd Triton kernel benchmarks every config on its FIRST

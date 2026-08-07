@@ -18,21 +18,31 @@ KernelOccurrence = dict[str, str]
 def build_kernel_sequences(
     iteration_details: list[dict[str, Any]], kernel_names: dict[int, str]
 ) -> dict[str, dict[str, Any]]:
-    """Build one canonical catalog after proving TP-rank sequence symmetry.
-
-    A tensor-parallel replica executes rank-local kernels concurrently. Folding
-    ranges from several devices into one phase sequence would serialize those
-    ranks and double/quadruple the apparent model work. Keep one representative
-    device only after every participating device has the exact same catalog.
-    """
-    catalogs, _, _ = build_symmetric_device_kernel_sequences(iteration_details, kernel_names)
+    """Build the union catalog of every device's phase sequences."""
+    catalogs, _ = build_device_kernel_sequences(iteration_details, kernel_names)
     return catalogs
 
 
-def build_symmetric_device_kernel_sequences(
+def build_device_kernel_sequences(
     iteration_details: list[dict[str, Any]], kernel_names: dict[int, str]
-) -> tuple[dict[str, dict[str, Any]], list[int], int]:
-    """Return the representative catalog and its validated device population."""
+) -> tuple[dict[str, dict[str, Any]], list[int]]:
+    """Build one catalog holding the union of every device's phase sequences.
+
+    Each device is folded independently — merging several devices' ranges into
+    one sequence would serialize concurrent ranks and multiply the apparent model
+    work. The per-device catalogs are then unioned: `sequence_id` is a hash of
+    the ordered kernel names, so devices that ran the identical sequence collapse
+    onto one entry and one labeling decision, while devices that genuinely
+    diverge each keep their own entry.
+
+    Divergence is normal, not a defect. Tensor-parallel ranks are symmetric and
+    collapse to a single entry; data-parallel ranks each schedule their own batch
+    and routinely differ on the steps where one rank has a prefill chunk and
+    another does not.
+
+    Every entry records `occurrences` — which (device, iteration) pairs executed
+    it — so a label applies to exactly the positions it was derived from.
+    """
     device_ids = sorted(
         {
             int(range_row["device_id"])
@@ -52,20 +62,51 @@ def build_symmetric_device_kernel_sequences(
     if not device_ids:
         raise ValueError("kernel sequence inventory has no kernel-bearing device")
 
-    catalogs_by_device = {
-        device_id: _build_device_kernel_sequences(iteration_details, kernel_names, device_id)
-        for device_id in device_ids
-    }
-    representative_device_id = device_ids[0]
-    representative = catalogs_by_device[representative_device_id]
-    for device_id in device_ids[1:]:
-        if catalogs_by_device[device_id] != representative:
-            raise ValueError(
-                "tensor-parallel kernel sequences are not symmetric: "
-                f"device {device_id} differs from representative device "
-                f"{representative_device_id}"
+    merged: dict[str, dict[str, dict[str, Any]]] = {}
+    for device_id in device_ids:
+        catalog = _build_device_kernel_sequences(iteration_details, kernel_names, device_id)
+        for phase, phase_catalog in catalog.items():
+            phase_merged = merged.setdefault(phase, {})
+            for sequence in phase_catalog["unique_sequences"]:
+                sequence_id = sequence["sequence_id"]
+                existing = phase_merged.get(sequence_id)
+                occurrence = {
+                    "device_id": device_id,
+                    "iterations": sequence["iterations"],
+                }
+                if existing is None:
+                    phase_merged[sequence_id] = {
+                        "sequence_id": sequence_id,
+                        "occurrences": [occurrence],
+                        "expanded_kernel_count": sequence["expanded_kernel_count"],
+                        "program": sequence["program"],
+                    }
+                    continue
+                # Same id means the same ordered (name, category) sequence, so the
+                # folded program is identical by construction; assert rather than
+                # trust, because a mismatch would silently mislabel a device.
+                if existing["program"] != sequence["program"]:
+                    raise ValueError(
+                        f"sequence {sequence_id!r} folds differently on device {device_id}"
+                    )
+                existing["occurrences"].append(occurrence)
+
+    catalogs: dict[str, dict[str, Any]] = {}
+    for phase, phase_merged in merged.items():
+        catalogs[phase] = {
+            "unique_sequences": sorted(
+                phase_merged.values(),
+                key=lambda sequence: (
+                    min(
+                        iteration
+                        for occurrence in sequence["occurrences"]
+                        for iteration in occurrence["iterations"]
+                    ),
+                    sequence["sequence_id"],
+                ),
             )
-    return representative, device_ids, representative_device_id
+        }
+    return catalogs, device_ids
 
 
 def _build_device_kernel_sequences(

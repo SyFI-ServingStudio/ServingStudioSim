@@ -7,6 +7,8 @@
 pub mod build;
 pub mod config;
 pub mod contract;
+pub mod glm52_dsa_moe;
+pub mod glm52_vllm_dsa_moe;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
 pub mod llama3_dp_attn_tp_ffn;
@@ -23,6 +25,14 @@ pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 pub use contract::{
     ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
     IterwiseUnifiedModel, UnifiedArchInput,
+};
+pub use glm52_dsa_moe::{
+    Glm52DsaMoeConfigs, Glm52DsaMoeModel, Glm52DsaMoeParallel, Glm52DsaMoeResolved, Glm52ModelCfg,
+    Glm52MtpMode,
+};
+pub use glm52_vllm_dsa_moe::{
+    Glm52VllmDsaMoeConfigs, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
+    Glm52VllmDsaMoeResolved,
 };
 pub use llama3_dense::{DenseParallel, Llama3DenseModel};
 pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};

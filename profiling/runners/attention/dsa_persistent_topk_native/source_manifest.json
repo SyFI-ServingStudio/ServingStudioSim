@@ -1,0 +1,58 @@
+{
+  "format_version": 1,
+  "asset": "dsa_persistent_topk_decode",
+  "private_torch_namespace": "_C_pinned_topk",
+  "upstream": {
+    "project": "vLLM",
+    "version": "v0.23.0",
+    "commit": "0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665",
+    "repository": "https://github.com/vllm-project/vllm",
+    "license": "Apache-2.0"
+  },
+  "implementation": {
+    "kind": "corrected_v0_23_derived",
+    "correction_id": "all-cooperative-radix-with-radix-iteration-v1",
+    "correction_manifest": "correction_manifest.json",
+    "description": "The loader preserves byte-identical upstream assets and compiles deterministic corrected copies in its worker-local cache."
+  },
+  "verified_runtime": {
+    "torch": "2.10.0+cu128",
+    "cuda_toolkit": "12.8",
+    "gpu": "NVIDIA H200",
+    "compute_capability": "9.0"
+  },
+  "files": [
+    {
+      "local_path": "upstream/topk.cu",
+      "kind": "byte_identical_upstream",
+      "upstream_path": "csrc/libtorch_stable/topk.cu",
+      "sha256": "2c90ef9391e1d6bd6ca65c05841597569cf629451f25a1ed4446aa5b34f1d917"
+    },
+    {
+      "local_path": "upstream/persistent_topk.cuh",
+      "kind": "byte_identical_upstream",
+      "upstream_path": "csrc/libtorch_stable/persistent_topk.cuh",
+      "sha256": "1d92c234493599e4d57d793eda2cf3b8efa246415425dd2ac881935b25b950ee"
+    },
+    {
+      "local_path": "upstream/torch_utils.h",
+      "kind": "byte_identical_upstream",
+      "upstream_path": "csrc/libtorch_stable/torch_utils.h",
+      "sha256": "f619e1943039a67a3254f7e0679e1f3e0faa9d8fccae795f3b20df9e91a8a429"
+    },
+    {
+      "local_path": "binding.cpp",
+      "kind": "torch_2_10_private_registration_shim",
+      "upstream_path": null,
+      "sha256": "ea1b70c6f70fd2ce683706e5ea0f444a8d57b97747b07609fce74f3497839d6d",
+      "purpose": "Register the corrected v0.23-derived implementation in the private _C_pinned_topk namespace without linking the Torch-2.11-only remainder of vLLM's stable extension."
+    },
+    {
+      "local_path": "correction_manifest.json",
+      "kind": "vibesim_correctness_overlay",
+      "upstream_path": null,
+      "sha256": "a6e00159afa31b110950e1fbfcbe3118df8c549bf56f01052f7eeb99c549d001",
+      "purpose": "Route every nontrivial row through cooperative radix and advance triple-buffer rotation only after radix rows."
+    }
+  ]
+}

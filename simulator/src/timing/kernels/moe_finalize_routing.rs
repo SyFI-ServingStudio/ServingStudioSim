@@ -34,6 +34,19 @@ pub struct MoeFinalizeRoutingKernelInput {
     pub token_count: u32,
 }
 
+/// Rows of this EP rank's expanded expert output for a given global token
+/// count: the rank's popularity shard apportions the `token_count x top_k`
+/// global selections. Shared by the sweep bound and the wire payload so the
+/// grid can never claim a shape the payload then contradicts.
+fn local_routed_token_count(token_count: u32, config: &MoeFinalizeRoutingKernelConfig) -> u32 {
+    let global_expert_selections = token_count
+        .checked_mul(config.top_k)
+        .expect("token_count * top_k must fit u32");
+    RoutingDistribution::to_per_expert_counts(global_expert_selections, &config.local_ppm)
+        .into_iter()
+        .sum()
+}
+
 pub struct MoeFinalizeRoutingSpec;
 
 impl KernelSpec for MoeFinalizeRoutingSpec {
@@ -42,18 +55,27 @@ impl KernelSpec for MoeFinalizeRoutingSpec {
 
     const KIND: KernelKind = "moe_finalize_routing";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        // Decode needs points below the shared token curve. Prefill alignment
-        // currently needs at most 8192 input tokens; cap the first contract
-        // there because the runner allocates the expanded routed rows.
-        let token_axis_through_8192 = Axis::token_axis()
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        // Decode needs points below the shared token curve. The upper end is
+        // bounded by the runner, which allocates the expanded routed rows plus
+        // the unpermuted output — so the bound belongs in bytes, not in a token
+        // count. It was a flat 8192 tokens while every caller was a
+        // single-replica prefill; a DP8 replica schedules eight 8k prefills in
+        // ONE step, which asks this leaf for 65,520 tokens and would otherwise
+        // extrapolate the curve 8x past its last profiled point.
+        const EXPANDED_ROW_BUDGET_BYTES: f64 = 2.0 * 1024.0 * 1024.0 * 1024.0;
+        let row_bytes = f64::from(config.hidden_size.get())
+            * f64::from(config.dtype.size_bytes())
+            // The kernel reads the expanded rows and writes the reduced ones.
+            * 2.0;
+        let affordable = Axis::token_axis()
             .into_iter()
-            .filter(|&token_count| token_count <= 8192.0)
+            .filter(|&token_count| {
+                let local_rows = local_routed_token_count(token_count as u32, config);
+                f64::from(local_rows) * row_bytes <= EXPANDED_ROW_BUDGET_BYTES
+            })
             .collect::<Vec<_>>();
-        SweepGrid::new(vec![Axis::chain([
-            Axis::values([1, 4, 8, 16]),
-            token_axis_through_8192,
-        ])])
+        SweepGrid::new(vec![Axis::chain([Axis::values([1, 4, 8, 16]), affordable])])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -72,15 +94,7 @@ impl KernelSpec for MoeFinalizeRoutingSpec {
         );
         grid.expand_1d(|token_count| {
             let token_count = token_count as u32;
-            let global_expert_selections = token_count
-                .checked_mul(config.top_k)
-                .expect("token_count * top_k must fit u32");
-            let local_routed_token_count: u32 = RoutingDistribution::to_per_expert_counts(
-                global_expert_selections,
-                &config.local_ppm,
-            )
-            .into_iter()
-            .sum();
+            let local_routed_token_count = local_routed_token_count(token_count, config);
 
             ArgsPayload::new()
                 .with("backend", backend)
@@ -104,6 +118,7 @@ mod tests {
     use crate::timing::bridge::DType;
     use crate::timing::cache::CacheKind;
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
+    use crate::timing::sweep::Axis;
     use crate::timing::{SlotInput, SweepCoords, SweepGrid};
     use serde_json::Value;
 
@@ -189,17 +204,93 @@ mod tests {
     }
 
     #[test]
-    fn grid_covers_decode_and_prefill_without_exceeding_alignment_cap() {
+    fn grid_covers_decode_and_prefill_up_to_the_runner_allocation_budget() {
+        // This config expands two rows per token (top-8 into a quarter shard)
+        // of 4096 bf16 elements, so 65,536 tokens land exactly on the 2 GiB
+        // budget and stay in.
         let grid = MoeFinalizeRoutingSpec::sweep_grid(&config());
         assert_eq!(grid.axes().len(), 1);
         assert_eq!(&grid.axes()[0][..5], &[1.0, 4.0, 8.0, 16.0, 32.0]);
         assert!(grid.axes()[0].contains(&64.0));
         assert!(grid.axes()[0].contains(&4096.0));
-        assert_eq!(grid.axes()[0].last().copied(), Some(8192.0));
+        assert_eq!(grid.axes()[0].last().copied(), Some(65536.0));
         assert_eq!(
             MoeFinalizeRoutingSpec::cache_kind("flashinfer_trtllm"),
             CacheKind::Cache1DLinear
         );
+    }
+
+    #[test]
+    fn raising_the_bound_left_every_previously_profiled_point_in_place() {
+        // The bound used to be a flat 8192 tokens. Widening it must only ADD
+        // points past that mark: every existing caller (the Qwen vLLM arch, the
+        // recorded goldens) looks up below it, and a changed point there would
+        // move an interpolated cost that nothing asked to change.
+        let grid = MoeFinalizeRoutingSpec::sweep_grid(&config());
+        let previous = Axis::chain([
+            Axis::values([1, 4, 8, 16]),
+            Axis::token_axis()
+                .into_iter()
+                .filter(|&token_count| token_count <= 8192.0)
+                .collect(),
+        ]);
+        assert_eq!(&grid.axes()[0][..previous.len()], &previous[..]);
+        assert!(grid.axes()[0].len() > previous.len());
+    }
+
+    #[test]
+    fn every_deployed_shape_keeps_its_whole_pre_widening_axis() {
+        // The symmetric-regression point for widening the bound: only two archs
+        // build this config — `qwen3_vllm_moe_dp_attn_ep_ffn` (Qwen3-235B, hidden
+        // 4096, 128 experts, top-8) and `glm52_vllm_dsa_moe` (hidden 6144, 256
+        // experts, top-8). Qwen is the one that must not move: it was already
+        // recorded against the flat 8192 bound. A byte budget CAN cut a grid
+        // shorter than a token bound would — that is the failure this pins shut,
+        // across both models and every EP split they are run at.
+        let previous_bound = Axis::token_axis()
+            .into_iter()
+            .filter(|&token_count| token_count <= 8192.0)
+            .collect::<Vec<_>>();
+        for (label, hidden_size, expert_count) in
+            [("qwen3_235b", 4096, 128_u32), ("glm52", 6144, 256)]
+        {
+            for ep_size in [1_u32, 2, 4, 8, 16, 32] {
+                let experts_per_rank = expert_count / ep_size;
+                let mut deployed = config();
+                deployed.hidden_size = hidden_size.into();
+                deployed.num_experts_per_rank = experts_per_rank;
+                // Uniform popularity over this rank's shard; the exact split does
+                // not matter here, the row count it implies does.
+                deployed.local_ppm =
+                    vec![1_000_000 / expert_count; experts_per_rank as usize];
+
+                let grid = MoeFinalizeRoutingSpec::sweep_grid(&deployed);
+                let tail = &grid.axes()[0][4..]; // past the fixed [1, 4, 8, 16] head
+                assert!(
+                    tail.len() >= previous_bound.len(),
+                    "{label} ep{ep_size}: byte budget cut the axis shorter than the \
+                     8192-token bound it replaced ({} < {} points)",
+                    tail.len(),
+                    previous_bound.len()
+                );
+                assert_eq!(
+                    &tail[..previous_bound.len()],
+                    &previous_bound[..],
+                    "{label} ep{ep_size}: a point at or below 8192 tokens moved"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wider_hidden_stops_the_grid_where_the_runner_would_run_out_of_memory() {
+        // Four times the row bytes of `config()`, so the affordable token count
+        // drops by the same factor rather than the axis being a fixed constant.
+        let mut wide = config();
+        wide.hidden_size = 16_384.into();
+        let grid = MoeFinalizeRoutingSpec::sweep_grid(&wide);
+        assert_eq!(grid.axes()[0].last().copied(), Some(16384.0));
+        assert!(!grid.axes()[0].contains(&32768.0));
     }
 
     #[test]

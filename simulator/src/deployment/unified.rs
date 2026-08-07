@@ -6,7 +6,10 @@
 //! dispatch — provider-first, new-interface-design §4). Wired arms are
 //! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
 //! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
-//! `hp_unified`. Each arm monomorphizes its concrete model/worker pair and
+//! `hp_unified`, and `glm52_dsa_moe` + `hp_unified`. GLM's TP1 local attention
+//! uses one independent KV/input partition per EP rank; the existing HP shell
+//! and mutable request/KV lifecycle are unchanged. Each wired arm
+//! monomorphizes its concrete model/worker pair and
 //! erases to `Box<dyn Flow>` — the single `dyn` point (the cost path is
 //! `dyn`-free, L4 §4.1).
 
@@ -269,6 +272,70 @@ impl Deployment for UnifiedDeployment {
                     build_hp_worker,
                 ))
             }
+            IterArchSel::Glm52VllmDsaMoe {
+                ep_size,
+                nvl_num_gpu,
+                routing,
+                routing_seed,
+                mtp_mode,
+                expert_popularity_file,
+                ..
+            } => {
+                ensure_hp_unified(&g.worker)?;
+                let model = Arc::new(arch_build::glm52_vllm_dsa_moe(
+                    model_spec,
+                    *ep_size,
+                    *nvl_num_gpu,
+                    *routing,
+                    *routing_seed,
+                    *mtp_mode,
+                    expert_popularity_file.as_deref(),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_hp_worker,
+                ))
+            }
+            IterArchSel::Glm52DsaMoe {
+                ep_size,
+                nvl_num_gpu,
+                routing,
+                routing_seed,
+                mtp_mode,
+                expert_popularity_file,
+                ..
+            } => {
+                ensure_hp_unified(&g.worker)?;
+                let model = Arc::new(arch_build::glm52_dsa_moe(
+                    model_spec,
+                    *ep_size,
+                    *nvl_num_gpu,
+                    *routing,
+                    *routing_seed,
+                    *mtp_mode,
+                    expert_popularity_file.as_deref(),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_hp_worker,
+                ))
+            }
         }
     }
 }
@@ -284,12 +351,12 @@ fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
     }
 }
 
-/// The DP-attention arch runs on the multi-group hp_unified worker.
+/// DP-attention and MoE archs run on the multi-group hp_unified worker.
 fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
         IterWorkerSel::HpUnified { .. } => Ok(()),
         other => {
-            bail!("unified: llama3_dp_attn_tp_ffn requires worker `hp_unified`, got {other:?}")
+            bail!("unified: this DP-attention/MoE arch requires worker `hp_unified`, got {other:?}")
         }
     }
 }
@@ -327,5 +394,104 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::Glm52DsaMoeModel;
+    use crate::common::RequestId;
+    use crate::worker::{HpUnifiedWorker, WorkerEventCommon};
+
+    fn hp_worker() -> IterWorkerSel {
+        IterWorkerSel::HpUnified {
+            attn_gpu_memory_gb: 80.0,
+            gpu_time_multiplier: 1.0,
+            max_batch_tokens: None,
+        }
+    }
+
+    fn barebone_worker() -> IterWorkerSel {
+        IterWorkerSel::Barebone {
+            attn_gpu_memory_gb: 80.0,
+            gpu_time_multiplier: 1.0,
+            max_batch_tokens: None,
+        }
+    }
+
+    fn assert_iter_worker_contract<W>()
+    where
+        W: IterWorker<Event = WorkerEventCommon> + 'static,
+        W::Msg: From<RequestId>,
+    {
+    }
+
+    #[test]
+    fn glm52_hp_unified_pair_satisfies_the_iter_worker_contract() {
+        assert_iter_worker_contract::<HpUnifiedWorker<Glm52DsaMoeModel>>();
+        ensure_hp_unified(&hp_worker()).expect("GLM accepts hp_unified");
+    }
+
+    #[test]
+    fn glm52_rejects_non_hp_iter_workers_with_an_actionable_error() {
+        let error = ensure_hp_unified(&barebone_worker())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("DP-attention/MoE arch requires worker `hp_unified`"));
+        assert!(error.contains("Barebone"));
+
+        let pd_prefill = IterWorkerSel::PdPrefill {
+            attn_gpu_memory_gb: 80.0,
+            gpu_time_multiplier: 1.0,
+        };
+        let error = ensure_hp_unified(&pd_prefill).unwrap_err().to_string();
+        assert!(error.contains("worker `hp_unified`"));
+        assert!(error.contains("PdPrefill"));
+    }
+
+    #[test]
+    fn glm52_unified_config_preserves_ep8_hp_pairing() {
+        let yaml = r#"
+deployment: unified
+workload: { trace_files: ["trace/smoke.csv"], duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
+io: { log_dir: "logs/test", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }
+pools:
+  main:
+    placement: least-queued
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: glm52_dsa_moe
+          model_config: model/config/glm52.json
+          fp8: false
+          ep_size: 8
+          nvl_num_gpu: 8
+          routing: uniform
+          mtp_mode: off
+        worker:
+          type: hp_unified
+          attn_gpu_memory_gb: 80.0
+          gpu_time_multiplier: 1.0
+"#;
+        let cfg: crate::deployment::RunConfig =
+            serde_yaml::from_str(yaml).expect("GLM hp_unified config parses");
+        let crate::deployment::RunConfig::Unified(cfg) = cfg else {
+            panic!("expected unified config")
+        };
+        let group = &cfg.pools.main.groups[0];
+        let IterArchSel::Glm52DsaMoe {
+            ep_size,
+            nvl_num_gpu,
+            mtp_mode,
+            ..
+        } = &group.arch
+        else {
+            panic!("expected GLM arch")
+        };
+        assert_eq!((*ep_size, *nvl_num_gpu), (8, 8));
+        assert_eq!(*mtp_mode, crate::arch::Glm52MtpMode::Off);
+        ensure_hp_unified(&group.worker).expect("GLM hp_unified pairing is accepted");
     }
 }

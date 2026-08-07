@@ -15,12 +15,16 @@
 use serde::Serialize;
 
 use crate::timing::kernels::{
-    AllReduceKernelInput, AllReduceResidualRmsNormKernelInput, ElementwiseKernelInput,
+    AllReduceKernelInput, AllReduceResidualRmsNormKernelInput, BatchedGemmKernelInput,
+    DsaIndexCacheAppendKernelInput, DsaMqaLogitsPrefillKernelInput,
+    DsaPagedMqaLogitsDecodeKernelInput, DsaPersistentTopkDecodeKernelInput,
+    DsaSparseMlaAttentionKernelInput, DsaTopkPrefillKernelInput, ElementwiseKernelInput,
     FlashinferAttnDecodeKernelInput, FlashinferAttnRectKernelInput, Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemmKernelInput, Fp8PerTokenGroupQuantKernelInput, GroupedGemmKernelInput,
-    KvCacheAppendKernelInput, MoeFinalizeRoutingKernelInput, P2pInterKernelInput,
-    P2pIntraKernelInput, RmsNormKernelInput,
-    SingleGemmKernelInput,
+    KvCacheAppendKernelInput, MlaCacheAppendKernelInput, MoeAlltoallKernelInput,
+    MoeAlltoallPrepareKernelInput, MoeFinalizeRoutingKernelInput, P2pInterKernelInput,
+    P2pIntraKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput, SingleGemmKernelInput,
+    VllmMlaRopeKernelInput,
 };
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -29,6 +33,20 @@ use crate::timing::kernels::{
 #[derive(Clone, Serialize)]
 pub struct AttnPrefillLog {
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
+}
+
+/// Sparse-MLA prefill aggregating leaf input: every request-local `(Q, S)` cell
+/// whose metrics were summed into the one fixed prefill slot.
+#[derive(Clone, Serialize)]
+pub struct DsaSparseMlaPrefillLog {
+    pub prefill_query_cache_pairs: Vec<(u32, u32)>,
+}
+
+/// DSA indexer prefill fan-in: every request-local `(Q, N)` cell aggregated by
+/// cache gather, logits, or top-k into its corresponding fixed leaf slot.
+#[derive(Clone, Serialize)]
+pub struct DsaIndexerPrefillLog {
+    pub prefill_query_key_pairs: Vec<(u32, u32)>,
 }
 
 /// Declare the `SlotInput` enum + a `From<Input>` per variant from one central
@@ -52,17 +70,31 @@ macro_rules! log_inputs {
 
 log_inputs! {
     Gemm        => SingleGemmKernelInput,
+    BatchedGemm => BatchedGemmKernelInput,
     GroupedGemm => GroupedGemmKernelInput,
     RmsNorm     => RmsNormKernelInput,
+    ResidualRmsNorm => ResidualRmsNormKernelInput,
     Elementwise => ElementwiseKernelInput,
     Fp8BlockQuant => Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemm => Fp8BlockscaleGroupedGemmKernelInput,
     Fp8PerTokenGroupQuant => Fp8PerTokenGroupQuantKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
+    MoeAlltoall => MoeAlltoallKernelInput,
+    MoeAlltoallPrepare => MoeAlltoallPrepareKernelInput,
     AttnPrefill => AttnPrefillLog,
+    DsaIndexerPrefill => DsaIndexerPrefillLog,
+    DsaSparseMlaPrefill => DsaSparseMlaPrefillLog,
     AttnDecode  => FlashinferAttnDecodeKernelInput,
     AttnRect    => FlashinferAttnRectKernelInput,
     KvCacheAppend => KvCacheAppendKernelInput,
+    MlaCacheAppend => MlaCacheAppendKernelInput,
+    DsaIndexCacheAppend => DsaIndexCacheAppendKernelInput,
+    DsaMqaLogitsPrefill => DsaMqaLogitsPrefillKernelInput,
+    DsaPagedMqaLogitsDecode => DsaPagedMqaLogitsDecodeKernelInput,
+    DsaPersistentTopkDecode => DsaPersistentTopkDecodeKernelInput,
+    DsaSparseMlaAttention => DsaSparseMlaAttentionKernelInput,
+    DsaTopkPrefill => DsaTopkPrefillKernelInput,
+    VllmMlaRope => VllmMlaRopeKernelInput,
     AllReduce   => AllReduceKernelInput,
     AllReduceResidualRmsNorm => AllReduceResidualRmsNormKernelInput,
     P2pIntra    => P2pIntraKernelInput,

@@ -31,7 +31,15 @@ else:
 
 THIS_DIR = Path(__file__).resolve().parent
 EXT_SOURCE = THIS_DIR / "csrc" / "cupti_activity_profiler.cpp"
-BUILD_DIR = Path(os.environ.get("MOESIM_CUPTI_BUILD_DIR", "/tmp/moesim_cupti_ext"))
+# Honour TMPDIR before falling back to /tmp. A hardcoded /tmp assumes the root
+# filesystem has room for a JIT-compiled extension, and on a box where it does
+# not the failure is both late and unreadable: the build dies on
+# `OSError: [Errno 28] No space left on device: '/tmp/.../lock'` from inside a
+# spawned profiling rank, and the runner surfaces it only as `status: missing`.
+BUILD_DIR = Path(
+    os.environ.get("MOESIM_CUPTI_BUILD_DIR")
+    or Path(os.environ.get("TMPDIR") or "/tmp") / "moesim_cupti_ext"
+)
 
 
 @dataclass(frozen=True)
