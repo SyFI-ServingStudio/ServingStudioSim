@@ -72,7 +72,7 @@ impl<MA: AttnLayerwiseModel, MF: FfnLayerwiseModel> AfdFlow<MA, MF> {
 impl<MA: AttnLayerwiseModel, MF: FfnLayerwiseModel> Flow for AfdFlow<MA, MF> {
     fn on_arrival(&mut self, req: Request) {
         let rid = req.id;
-        self.requests.borrow_mut().insert(&req);
+        self.requests.borrow_mut().upsert(&req);
         self.attn.admit(rid);
     }
 
@@ -135,10 +135,7 @@ mod tests {
 
     /// Build an AFD flow with `attn_workers` attn shards + 1 ffn replica over a
     /// shared test cluster, all on the 2-layer fakes.
-    fn flow(
-        attn_workers: u16,
-        store: SharedRequests,
-    ) -> AfdFlow<FakeAttn, FakeFfn> {
+    fn flow(attn_workers: u16, store: SharedRequests) -> AfdFlow<FakeAttn, FakeFfn> {
         let cluster = test_cluster();
         let attn = AfdAttnPoolController::new(
             attn_workers,
@@ -203,7 +200,11 @@ mod tests {
         f.on_arrival(Request::new(RequestId(1), 8, 2, Time::ZERO));
         let mut completed = drive(&mut f, 4000);
         completed.sort_by_key(|r| r.0);
-        assert_eq!(completed, vec![RequestId(0), RequestId(1)], "both complete once");
+        assert_eq!(
+            completed,
+            vec![RequestId(0), RequestId(1)],
+            "both complete once"
+        );
         assert_eq!(store.borrow()[RequestId(0)].tokens_emitted, 2);
         assert_eq!(store.borrow()[RequestId(1)].tokens_emitted, 2);
     }
@@ -219,7 +220,12 @@ mod tests {
         for step in 0..6000u64 {
             if step < 6 {
                 let id = step as u32;
-                f.on_arrival(Request::new(RequestId(id), 8, 2, Time::from_ms(step as f64)));
+                f.on_arrival(Request::new(
+                    RequestId(id),
+                    8,
+                    2,
+                    Time::from_ms(step as f64),
+                ));
             }
             for a in f.tick(Time::from_ms(step as f64)) {
                 let OrchAction::Complete { req } = a;
@@ -227,6 +233,10 @@ mod tests {
             }
         }
         completed.sort_by_key(|r| r.0);
-        assert_eq!(completed, (0..6).map(RequestId).collect::<Vec<_>>(), "all six complete");
+        assert_eq!(
+            completed,
+            (0..6).map(RequestId).collect::<Vec<_>>(),
+            "all six complete"
+        );
     }
 }

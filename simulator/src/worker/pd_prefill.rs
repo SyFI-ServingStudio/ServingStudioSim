@@ -24,6 +24,7 @@ use crate::worker::admission_helpers::Batch;
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
+use crate::worker::prefix_cache::PrefixCache;
 use crate::worker::types::{
     BatchFsmState, IterCursor, PdPrefillEvent, PdPrefillMsg, WorkerConfig, WorkerFsmState,
     WorkerStatus,
@@ -34,14 +35,15 @@ struct PrefillRuntime {
     promised: HashMap<RequestId, (u16, u64)>,
     request_to_group: HashMap<RequestId, u16>,
     /// Requests whose prefill is done and whose KV is still resident here
-    /// pending the decode side's pull. Each entry's KV-token count counts
-    /// against the worker's admission budget so the prefill side doesn't
-    /// over-commit beyond what its physical KV can actually hold. Drained
-    /// when the decode worker acks via `PdPrefillMsg::ReleaseKv`.
-    held: HashMap<RequestId, u64>,
-    /// Running sum of `held` values — kept incrementally so `try_admit`
-    /// stays O(1). Always equals `held.values().sum()`.
-    held_kv_tokens: u64,
+    /// pending the decode side's pull, tagged with their group. Each entry's
+    /// KV-token count counts against that group's admission budget so the
+    /// prefill side doesn't over-commit beyond what its physical KV can
+    /// actually hold. Drained when the decode worker acks via
+    /// `PdPrefillMsg::ReleaseKv`.
+    held: HashMap<RequestId, (u16, u64)>,
+    /// Per-group running sums of `held` values — kept incrementally so
+    /// `try_admit` stays O(1).
+    held_kv: Vec<u64>,
     iter_counter: u32,
     iter_compute_start: Time,
     worker_fsm_state: WorkerFsmState,
@@ -49,13 +51,13 @@ struct PrefillRuntime {
 }
 
 impl PrefillRuntime {
-    fn new() -> Self {
+    fn new(num_groups: usize) -> Self {
         Self {
             pending_prefills: VecDeque::new(),
             promised: HashMap::new(),
             request_to_group: HashMap::new(),
             held: HashMap::new(),
-            held_kv_tokens: 0,
+            held_kv: vec![0; num_groups],
             iter_counter: 0,
             iter_compute_start: Time::ZERO,
             worker_fsm_state: WorkerFsmState::Idle,
@@ -83,6 +85,10 @@ pub struct PdPrefillWorker<M: IterwiseUnifiedModel> {
     /// Stamped into every emitted `PrefillDone`; the cluster knows the underlying
     /// link count and free-time, the worker keeps only this opaque id.
     send_gid: u16,
+    /// Session prefix caches retained on the PREFILL side, one per attention
+    /// DP group (Mooncake-style: the prefill pool keeps the KV image after
+    /// handoff). Empty = always-hit.
+    prefix_caches: Vec<PrefixCache>,
 }
 
 impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
@@ -115,16 +121,22 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             .attn_kv_bytes
             .saturating_mul(model.num_attn_shards().max(1) as u64);
         let kv_capacity = (group_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
-        // Report the pool's static capacity to the run-meta registry (single group),
-        // and open the sampler (borrow `cost_log_dir` before `CostBuffers` moves it).
-        cluster
-            .borrow_mut()
-            .register_kv_capacity(pool_tag, pool.0, id.0, 0, kv_capacity);
+        // One batch per attention DP shard (mirrors pd_decode / hp_unified);
+        // dense/tp archs have one group, DP-attention archs several.
+        let num_groups = model.num_attn_dp_groups().max(1) as usize;
+        // Report each shard's static capacity to the run-meta registry, and
+        // open the sampler (borrow `cost_log_dir` before `CostBuffers` moves it).
+        {
+            let mut c = cluster.borrow_mut();
+            for g in 0..num_groups {
+                c.register_kv_capacity(pool_tag, pool.0, id.0, g as u16, kv_capacity);
+            }
+        }
         let kv = KvSampler::open_opt(
             cost_log_dir.as_deref(),
             pool_tag,
             id,
-            1,
+            num_groups,
             config.kv_log_stride,
         );
         let cost = CostBuffers::new_iter(
@@ -139,11 +151,22 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         // authoritative for shard count.
         Self {
             id,
+            prefix_caches: match config.prefix_cache_bytes {
+                Some(b) => {
+                    let tokens = b / model.total_kv_bytes_per_token().max(1);
+                    (0..num_groups)
+                        .map(|_| PrefixCache::new(tokens, config.prefix_cache_policy))
+                        .collect()
+                }
+                None => Vec::new(),
+            },
             model,
             requests,
             config,
-            runtime: PrefillRuntime::new(),
-            batches: vec![Batch::new(0, kv_capacity)],
+            runtime: PrefillRuntime::new(num_groups),
+            batches: (0..num_groups)
+                .map(|g| Batch::new(g as u16, kv_capacity))
+                .collect(),
             cost,
             kv,
             send_gid,
@@ -211,7 +234,9 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
     // ── Stage 1: form_batch — admit one fresh prefill by prompt KV only ─────────
 
     fn form_batch(&mut self) -> bool {
-        if let Some(&rid) = self.runtime.pending_prefills.front() {
+        // Admit pending prefills FIFO, each to the least-loaded DP group; stop
+        // at the first head that fits nowhere (order-preserving backpressure).
+        while let Some(&rid) = self.runtime.pending_prefills.front() {
             // PD prefill admits by PROMPT only: the request hands off after prefill
             // and never decodes locally (its local KvPool stays empty), so its peak
             // KV occupancy here is the prompt — the decode budget is the decode
@@ -227,18 +252,24 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
             // Held KV physically occupies the worker's KV cache, so it must
             // gate new admissions just like a promised one. A trace-declared
             // cached prefix occupies KV alongside the prefilled prompt.
-            let group_promised = self.group_promised_kv(0) + self.runtime.held_kv_tokens;
-            if self
-                .config
-                .admission
-                .try_admit(&self.batches[0], group_promised, p + prefix, 0)
-            {
+            let gid = (0..self.batches.len())
+                .min_by_key(|&g| self.group_promised_kv(g as u16) + self.runtime.held_kv[g])
+                .unwrap_or(0) as u16;
+            let group_promised = self.group_promised_kv(gid) + self.runtime.held_kv[gid as usize];
+            if self.config.admission.try_admit(
+                &self.batches[gid as usize],
+                group_promised,
+                p + prefix,
+                0,
+            ) {
                 self.runtime.pending_prefills.pop_front();
-                self.promise(0, rid, p, 0, prefix);
+                self.promise(gid, rid, p, 0, prefix);
+            } else {
+                break;
             }
         }
         self.drain_promises_into_admits();
-        let had_prefill = !self.batches[0].prefill_admits.is_empty();
+        let had_prefill = self.batches.iter().any(|b| !b.prefill_admits.is_empty());
         if !had_prefill {
             return false;
         }
@@ -277,40 +308,49 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         // are disjoint fields, so split-borrows let us read+write per-record
         // and remove `request_to_group` in the same loop without a scratch Vec.
         let mut store = self.requests.borrow_mut();
-        let n = self.batches[0].prefill_admits.len();
-        for i in 0..n {
-            let rid = self.batches[0].prefill_admits[i];
-            let r = &mut store[rid];
-            r.prefill_processed = r.prompt_len;
-            r.record_first_token(now, log_tokens);
-            // Hand off in tokens — KvPool's native unit. The decode worker
-            // multiplies by its arch's `total_kv_bytes_per_token` only when
-            // calling `cluster.submit_transfer`; bytes are a wire-level concern.
-            let kv_tokens = (r.prompt_len + r.prefix_kv) as u64;
-            let complete = r.is_complete();
-            // r is unused below — NLL releases the borrow on `store`.
-            self.runtime.request_to_group.remove(&rid);
-            if complete {
-                events.push(PdPrefillEvent::RequestComplete {
-                    worker: worker_id,
-                    req: rid,
-                });
-            } else {
-                // KV stays resident on this worker until the decode side acks
-                // the pull via `PdPrefillMsg::ReleaseKv`. Tracking it in `held`
-                // keeps it gating future admissions.
-                self.runtime.held.insert(rid, kv_tokens);
-                self.runtime.held_kv_tokens += kv_tokens;
-                events.push(PdPrefillEvent::PrefillDone {
-                    worker: worker_id,
-                    req: rid,
-                    send_gid,
-                    kv_tokens,
-                });
+        for gid in 0..self.batches.len() {
+            let n = self.batches[gid].prefill_admits.len();
+            for i in 0..n {
+                let rid = self.batches[gid].prefill_admits[i];
+                let r = &mut store[rid];
+                r.prefill_processed = r.prefill_target;
+                r.record_first_token(now, log_tokens);
+                // Hand off in tokens — KvPool's native unit. The decode worker
+                // multiplies by its arch's `total_kv_bytes_per_token` only when
+                // calling `cluster.submit_transfer`; bytes are a wire-level concern.
+                let kv_tokens = (r.prefill_target + r.prefix_kv) as u64;
+                let session = r.session;
+                let complete = r.is_complete();
+                // r is unused below — NLL releases the borrow on `store`.
+                self.runtime.request_to_group.remove(&rid);
+                // Retain the prefilled context image in the session prefix cache
+                // (prefill-side residency; decode output lands on the decode pool
+                // and is not part of this pool's retained image).
+                if let (Some(cache), Some(sess)) = (self.prefix_caches.get_mut(gid), session) {
+                    cache.insert(sess, kv_tokens);
+                }
+                if complete {
+                    events.push(PdPrefillEvent::RequestComplete {
+                        worker: worker_id,
+                        req: rid,
+                    });
+                } else {
+                    // KV stays resident on this worker until the decode side acks
+                    // the pull via `PdPrefillMsg::ReleaseKv`. Tracking it in `held`
+                    // keeps it gating future admissions.
+                    self.runtime.held.insert(rid, (gid as u16, kv_tokens));
+                    self.runtime.held_kv[gid] += kv_tokens;
+                    events.push(PdPrefillEvent::PrefillDone {
+                        worker: worker_id,
+                        req: rid,
+                        send_gid,
+                        kv_tokens,
+                    });
+                }
             }
+            self.batches[gid].prefill_admits.clear();
         }
         drop(store);
-        self.batches[0].prefill_admits.clear();
 
         // Sample this iteration's KV occupancy. A prefill worker's local KvPool
         // stays empty (it never finalizes a decode); its real resident KV is the
@@ -318,13 +358,15 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         // decode drain, so `projected_peak` equals the held total. `promised_kv` is
         // the admitted-but-not-yet-prefilled reservation.
         if self.kv.is_some() {
-            let held = self.runtime.held_kv_tokens;
-            let submit = KvSubmit {
-                active_kv: held,
-                projected_peak: held,
-                promised_kv: self.group_promised_kv(0),
-            };
-            self.kv.as_mut().unwrap().submit(0, submit, now);
+            for g in 0..self.batches.len() {
+                let held = self.runtime.held_kv[g];
+                let submit = KvSubmit {
+                    active_kv: held,
+                    projected_peak: held,
+                    promised_kv: self.group_promised_kv(g as u16),
+                };
+                self.kv.as_mut().unwrap().submit(g as u16, submit, now);
+            }
         }
     }
 
@@ -333,33 +375,36 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
     /// missing entry is silently ignored — possible if the request was
     /// already cancelled via `release_request` before the ack arrived.
     fn drop_held(&mut self, rid: RequestId) {
-        if let Some(tokens) = self.runtime.held.remove(&rid) {
-            self.runtime.held_kv_tokens = self.runtime.held_kv_tokens.saturating_sub(tokens);
+        if let Some((gid, tokens)) = self.runtime.held.remove(&rid) {
+            let slot = &mut self.runtime.held_kv[gid as usize];
+            *slot = slot.saturating_sub(tokens);
         }
     }
 
     // ── build_arch_input — one group, prefill-only (no decodes on a prefill worker)
 
     fn build_arch_input(&self) -> UnifiedArchInput {
-        let b = &self.batches[0];
         let store = self.requests.borrow();
-        let mut prefill_chunk_pairs = Vec::new();
-        let mut prefill_tokens = 0u32;
-        for &rid in &b.prefill_admits {
-            let r = &store[rid];
-            prefill_chunk_pairs.push((r.prefix_kv, r.active_chunk_len));
-            prefill_tokens += r.active_chunk_len;
+        let mut groups = Vec::with_capacity(self.batches.len());
+        for b in &self.batches {
+            let mut prefill_chunk_pairs = Vec::new();
+            let mut prefill_tokens = 0u32;
+            for &rid in &b.prefill_admits {
+                let r = &store[rid];
+                prefill_chunk_pairs.push((r.prefix_kv, r.active_chunk_len));
+                prefill_tokens += r.active_chunk_len;
+            }
+            groups.push(ArchGroupInput {
+                batch_tokens: prefill_tokens,
+                prefill_tokens,
+                decode_tokens: 0,
+                prefill_chunk_pairs,
+                decode_kv_lens: Vec::new(),
+                total_kv_len: 0,
+            });
         }
-        let group = ArchGroupInput {
-            batch_tokens: prefill_tokens,
-            prefill_tokens,
-            decode_tokens: 0,
-            prefill_chunk_pairs,
-            decode_kv_lens: Vec::new(),
-            total_kv_len: 0,
-        };
         UnifiedArchInput {
-            groups: vec![group],
+            groups,
             tokens_per_source_rank: Vec::new(),
         }
     }
@@ -374,8 +419,17 @@ impl<M: IterwiseUnifiedModel> PdPrefillWorker<M> {
         let mut store = self.requests.borrow_mut();
         store.mark_admitted(rid);
         let r = &mut store[rid];
-        r.active_chunk_len = p;
-        r.prefix_kv = prefix;
+        // Prefix-cache model (prefill side): the declared prefix only hits up
+        // to what this session left resident here; the shortfall is recomputed.
+        // See the HP worker's `promise`.
+        let hit = match (self.prefix_caches.get_mut(gid as usize), r.session) {
+            (Some(cache), Some(session)) => cache.lookup_touch(session, prefix),
+            (Some(_), None) => 0,
+            (None, _) => prefix,
+        };
+        r.prefix_kv = hit;
+        r.prefill_target = p + (prefix - hit);
+        r.active_chunk_len = r.prefill_target;
     }
 
     fn drain_promises_into_admits(&mut self) {
@@ -441,8 +495,12 @@ impl<M: IterwiseUnifiedModel> IterWorker for PdPrefillWorker<M> {
     }
 
     fn status(&self) -> WorkerStatus {
-        let active =
-            self.runtime.promised.len() as u32 + self.batches[0].prefill_admits.len() as u32;
+        let active = self.runtime.promised.len() as u32
+            + self
+                .batches
+                .iter()
+                .map(|b| b.prefill_admits.len() as u32)
+                .sum::<u32>();
         WorkerStatus {
             queued_requests: self.runtime.pending_prefills.len() as u32,
             active_requests: active,

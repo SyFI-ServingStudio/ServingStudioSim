@@ -134,9 +134,12 @@ impl<M: IterwiseUnifiedModel> BareboneWorker<M> {
             model.as_ref(),
             config.gpu_time_multiplier,
         );
-        let prefix_cache = config
-            .prefix_cache_bytes
-            .map(|b| PrefixCache::new(b / model.total_kv_bytes_per_token().max(1)));
+        let prefix_cache = config.prefix_cache_bytes.map(|b| {
+            PrefixCache::new(
+                b / model.total_kv_bytes_per_token().max(1),
+                config.prefix_cache_policy,
+            )
+        });
         Self {
             id,
             model,

@@ -25,7 +25,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PARALLELISM = 200
+# Concurrent sweep runs. Override with VIBESIM_SWEEP_PARALLELISM to be polite
+# on shared hosts (each run is one single-threaded simulator process).
+DEFAULT_PARALLELISM = int(os.environ.get("VIBESIM_SWEEP_PARALLELISM", "200"))
 
 
 def binary_path(build_type: str = "debug") -> Path:

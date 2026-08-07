@@ -77,6 +77,13 @@ pub struct WorkloadSpec {
     /// = open-loop arrival-time replay.
     #[serde(default)]
     pub max_concurrency: Option<u32>,
+    /// Closed-loop session-dependent admission: round N+1 of a session becomes
+    /// eligible only after round N completes (a real agent cannot issue its
+    /// next call before receiving the previous response). Requires
+    /// `max_concurrency`; admission is ready-queue order (non-FIFO across
+    /// sessions), and think time between rounds is not modeled.
+    #[serde(default)]
+    pub session_dependent: bool,
     /// Fixed simulation tick step (µs) — the time quantum the loop advances by
     /// each iteration. Finer ticks mean less TTFT/TPOT quantization (and smaller
     /// inter-slice gaps in the trace) at ~no throughput cost, since per-tick work
@@ -295,7 +302,9 @@ pools:
     fn backends_overrides_parse_and_default_empty() {
         // Absent `backends:` → empty map (serde default), i.e. no overrides.
         let cfg: RunConfig = serde_yaml::from_str(UNIFIED_YAML).unwrap();
-        let RunConfig::Unified(u) = &cfg else { unreachable!() };
+        let RunConfig::Unified(u) = &cfg else {
+            unreachable!()
+        };
         assert!(u.backends.is_empty());
 
         // Present → `pool → role → candidate backends`, the shape the launcher
@@ -308,7 +317,9 @@ pools:
              \"unified.mlp.down\": [torch]\n"
         );
         let cfg: RunConfig = serde_yaml::from_str(&with).expect("parse backends block");
-        let RunConfig::Unified(u) = &cfg else { unreachable!() };
+        let RunConfig::Unified(u) = &cfg else {
+            unreachable!()
+        };
         assert_eq!(u.backends["main"]["unified.attn.qkv"], vec!["fa2", "fa3"]);
         assert_eq!(u.backends["main"]["unified.mlp.down"], vec!["torch"]);
     }
@@ -317,7 +328,9 @@ pools:
     fn num_layers_omittable() {
         // num_layers / sim_num_layers absent → None (genuine optionality).
         let cfg: RunConfig = serde_yaml::from_str(UNIFIED_YAML).unwrap();
-        let RunConfig::Unified(u) = &cfg else { unreachable!() };
+        let RunConfig::Unified(u) = &cfg else {
+            unreachable!()
+        };
         assert!(u.pools.main.groups[0].arch.model().num_layers.is_none());
     }
 
@@ -351,7 +364,9 @@ pools:
       - { gpu: "H200", replicas: 4, arch: {type: llama3_dense_tp, model_config: "m.json", fp8: false, tp_size: 2}, worker: {type: barebone, attn_gpu_memory_gb: 80.0} }
 "#;
         let cfg: RunConfig = serde_yaml::from_str(yaml).expect("parse pd");
-        let RunConfig::Pd(p) = &cfg else { panic!("expected pd") };
+        let RunConfig::Pd(p) = &cfg else {
+            panic!("expected pd")
+        };
         assert_eq!(p.pools.prefill.groups[0].replicas, 2);
         assert_eq!(p.pools.decode.groups[0].replicas, 4);
     }
@@ -375,7 +390,9 @@ pools:
       - { gpu: "H200", replicas: 1, arch: {type: qwen3_ffn_moe, model_config: "m.json", fp8: false, attn_tp_size: 4, ep_size: 8, nvl_num_gpu: 8}, worker: {type: disagg_ffn} }
 "#;
         let cfg: RunConfig = serde_yaml::from_str(yaml).expect("parse afd");
-        let RunConfig::Afd(a) = &cfg else { panic!("expected afd") };
+        let RunConfig::Afd(a) = &cfg else {
+            panic!("expected afd")
+        };
         assert_eq!(a.pools.attn.groups[0].replicas, 8);
         assert_eq!(a.pools.ffn.groups[0].replicas, 1);
         match &a.pools.attn.groups[0].arch {

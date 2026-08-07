@@ -67,6 +67,10 @@ impl Deployment for UnifiedDeployment {
             max_batch_tokens,
             chunk_prefill_tokens,
             prefix_cache_gb,
+            prefix_cache_policy,
+            prefix_cache_host,
+            prefix_cache_host_shared,
+            session_sticky_groups,
             kv_offload,
         ) = match &g.worker {
             IterWorkerSel::Barebone {
@@ -74,6 +78,7 @@ impl Deployment for UnifiedDeployment {
                 gpu_time_multiplier,
                 max_batch_tokens,
                 prefix_cache_gb,
+                prefix_cache_policy,
                 kv_offload_host_gb,
                 kv_offload_bw_gbps,
             } => (
@@ -82,6 +87,10 @@ impl Deployment for UnifiedDeployment {
                 *max_batch_tokens,
                 None,
                 *prefix_cache_gb,
+                *prefix_cache_policy,
+                (None, 55.0),
+                false,
+                false,
                 kv_offload_host_gb.map(|gb| KvOffloadConfig {
                     host_capacity_bytes: (gb * 1e9) as u64,
                     host_bw_gbps: *kv_offload_bw_gbps,
@@ -93,6 +102,11 @@ impl Deployment for UnifiedDeployment {
                 max_batch_tokens,
                 chunk_prefill_tokens,
                 prefix_cache_gb,
+                prefix_cache_policy,
+                prefix_cache_host_gb,
+                prefix_cache_host_bw_gbps,
+                prefix_cache_host_shared,
+                session_sticky_groups,
                 kv_offload_host_gb,
                 kv_offload_bw_gbps,
             } => {
@@ -106,6 +120,10 @@ impl Deployment for UnifiedDeployment {
                     *max_batch_tokens,
                     *chunk_prefill_tokens,
                     *prefix_cache_gb,
+                    *prefix_cache_policy,
+                    (*prefix_cache_host_gb, *prefix_cache_host_bw_gbps),
+                    *prefix_cache_host_shared,
+                    *session_sticky_groups,
                     kv_offload_host_gb.map(|gb| KvOffloadConfig {
                         host_capacity_bytes: (gb * 1e9) as u64,
                         host_bw_gbps: *kv_offload_bw_gbps,
@@ -117,6 +135,7 @@ impl Deployment for UnifiedDeployment {
                 max_batch_tokens,
                 batch_policy,
                 prefix_cache_gb,
+                prefix_cache_policy,
                 gpu_time_multiplier,
             } => {
                 ensure!(
@@ -129,6 +148,10 @@ impl Deployment for UnifiedDeployment {
                     None,
                     Some(*max_batch_tokens),
                     *prefix_cache_gb,
+                    *prefix_cache_policy,
+                    (None, 55.0),
+                    false,
+                    false,
                     None,
                 )
             }
@@ -144,6 +167,23 @@ impl Deployment for UnifiedDeployment {
             max_batch_tokens,
             chunk_prefill_tokens,
             prefix_cache_bytes: prefix_cache_gb.map(|gb| (gb * 1e9) as u64),
+            prefix_cache_policy,
+            // Shared scope: ONE tier for the whole pool (gb = total capacity),
+            // built here and cloned into every worker; per-group tiers off.
+            prefix_cache_host_bytes: (!prefix_cache_host_shared)
+                .then_some(prefix_cache_host.0.map(|gb| (gb * 1e9) as u64))
+                .flatten(),
+            prefix_cache_host_bw_gbps: prefix_cache_host.1,
+            session_sticky_groups,
+            shared_host_tier: prefix_cache_host_shared
+                .then(|| prefix_cache_host.0)
+                .flatten()
+                .map(|gb| {
+                    crate::worker::prefix_cache::SharedHostTier::new(
+                        (gb * 1e9) as u64,
+                        prefix_cache_policy,
+                    )
+                }),
             kv_offload,
             ..WorkerConfig::default()
         };

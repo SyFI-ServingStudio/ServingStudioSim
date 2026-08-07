@@ -188,7 +188,7 @@ pub fn run_sim(
         //    row. `request_state` is a periodic table (2b), not written here.
         for action in flow.tick(clock) {
             let OrchAction::Complete { req } = action;
-            frontend.record_completion();
+            frontend.record_completion(req);
             let s = store.borrow();
             logger.record_request_slo(slo_entry(req, clock, &s[req]))?;
         }
@@ -492,7 +492,7 @@ mod tests {
             },
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
-        let mut frontend = TraceFrontend::load(&[trace], 1.0, None).unwrap();
+        let mut frontend = TraceFrontend::load(&[trace], 1.0, None, false).unwrap();
         let mut logger = LoggerSession::open(dir.path(), true).unwrap();
 
         let summary = run_sim(

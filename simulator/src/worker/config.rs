@@ -13,6 +13,8 @@ use serde::Deserialize;
 
 use schema_derive::ProviderSchema;
 
+use crate::worker::prefix_cache::EvictPolicy;
+
 /// Batch-composition policy for the chunked-prefill worker. Closed set → serde
 /// enum (kebab-case matches the historical CLI spelling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -28,6 +30,8 @@ const BATCH_POLICY_CHOICES: [&str; 3] = [
     "separate-prefill-priority",
     "separate-prefill-priority-no-interleave",
 ];
+
+const EVICT_POLICY_CHOICES: [&str; 4] = ["lru", "fifo", "lfu", "largest-first"];
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
@@ -74,6 +78,10 @@ pub enum IterWorkerSel {
         /// always-hit replay.
         #[serde(default)]
         prefix_cache_gb: Option<f64>,
+        /// Prefix-cache eviction policy (read with `prefix_cache_gb`).
+        #[serde(default)]
+        #[param(string, default = "lru", choices = EVICT_POLICY_CHOICES)]
+        prefix_cache_policy: EvictPolicy,
         /// KV-offload host pool (GB). `Some`: KV-blocked heads preempt the
         /// newest decodes, swapping their KV to host and back (vLLM-style swap
         /// space). `None` = no offload.
@@ -115,6 +123,37 @@ pub enum IterWorkerSel {
         /// always-hit replay.
         #[serde(default)]
         prefix_cache_gb: Option<f64>,
+        /// Prefix-cache eviction policy (read with `prefix_cache_gb`).
+        #[serde(default)]
+        #[param(string, default = "lru", choices = EVICT_POLICY_CHOICES)]
+        prefix_cache_policy: EvictPolicy,
+        /// Host (CPU-DRAM) prefix-cache TIER budget (GB, per DP group).
+        /// `Some`: sessions write through to a second, host-resident tier;
+        /// on a GPU-tier miss the host tier serves the prefix by LOADING the
+        /// KV over the host link (priced at `prefix_cache_host_bw_gbps`,
+        /// serialized per group) instead of recomputing it. `None` = misses
+        /// past the GPU tier recompute (LMCache-style tiering off).
+        #[serde(default)]
+        prefix_cache_host_gb: Option<f64>,
+        /// Host-link bandwidth (GB/s) pricing host-tier prefix loads.
+        #[serde(default = "default_host_bw_gbps")]
+        #[param(default = 55.0)]
+        prefix_cache_host_bw_gbps: f64,
+        /// Share ONE host tier across every worker (DP replica) of the pool
+        /// (`prefix_cache_host_gb` is then the TOTAL pool capacity, not per
+        /// group) — a coarse global KV store: any replica hits any session's
+        /// retained prefix, loading over its own group link. Removes the
+        /// cache-locality reason for sticky placement/groups.
+        #[serde(default)]
+        prefix_cache_host_shared: bool,
+        /// Route each SESSION's rounds to one DP group (first admission picks
+        /// via the balancer; later rounds stick). Aligns requests with the
+        /// per-group prefix-cache tiers: without it, session-sticky placement
+        /// pins the replica but rounds rotate across its groups, leaving stale
+        /// duplicated cache entries and depressed hit rates. Sessionless
+        /// requests keep balancer routing. Off = per-round balancer (legacy).
+        #[serde(default)]
+        session_sticky_groups: bool,
         /// KV-offload host pool (GB). `Some`: KV-blocked heads preempt the
         /// newest decodes, swapping their KV to host and back (vLLM-style swap
         /// space). `None` = no offload.
@@ -141,6 +180,10 @@ pub enum IterWorkerSel {
         /// always-hit replay.
         #[serde(default)]
         prefix_cache_gb: Option<f64>,
+        /// Prefix-cache eviction policy (read with `prefix_cache_gb`).
+        #[serde(default)]
+        #[param(string, default = "lru", choices = EVICT_POLICY_CHOICES)]
+        prefix_cache_policy: EvictPolicy,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
@@ -157,6 +200,16 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
+        /// Session-scoped prefix-cache budget (GB) on the PREFILL side (the KV
+        /// image retained after handoff, Mooncake-style). `Some`: a request's
+        /// trace-declared `prefix_kv` only hits up to what its session left
+        /// resident on this pool; misses are recomputed. `None` = always-hit.
+        #[serde(default)]
+        prefix_cache_gb: Option<f64>,
+        /// Prefix-cache eviction policy (read with `prefix_cache_gb`).
+        #[serde(default)]
+        #[param(string, default = "lru", choices = EVICT_POLICY_CHOICES)]
+        prefix_cache_policy: EvictPolicy,
     },
     /// PD decode half: admits already-prefilled requests straight into decode.
     PdDecode {

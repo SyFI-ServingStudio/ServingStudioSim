@@ -88,9 +88,11 @@ fn load_config(path: &Path) -> Result<RunConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading run config {}", path.display()))?;
     let cfg = if path.extension().and_then(|e| e.to_str()) == Some("json") {
-        serde_json::from_str(&text).with_context(|| format!("parsing JSON config {}", path.display()))?
+        serde_json::from_str(&text)
+            .with_context(|| format!("parsing JSON config {}", path.display()))?
     } else {
-        serde_yaml::from_str(&text).with_context(|| format!("parsing YAML config {}", path.display()))?
+        serde_yaml::from_str(&text)
+            .with_context(|| format!("parsing YAML config {}", path.display()))?
     };
     Ok(cfg)
 }
@@ -106,7 +108,13 @@ impl tracing_subscriber::fmt::time::FormatTime for CompactTime {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         let secs = now.as_secs();
-        write!(w, "[{:02}:{:02}.{:03}]", (secs / 60) % 60, secs % 60, now.subsec_millis())
+        write!(
+            w,
+            "[{:02}:{:02}.{:03}]",
+            (secs / 60) % 60,
+            secs % 60,
+            now.subsec_millis()
+        )
     }
 }
 
@@ -167,8 +175,19 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
         &workload.trace_files,
         workload.request_rate,
         workload.max_concurrency.map(|n| n as usize),
+        workload.session_dependent,
     )?;
-    let tick_cfg = TickCfg::new(workload.duration_ms, workload.run_to_end, workload.tick_dt_us);
+    let tick_cfg = TickCfg::new(
+        workload.duration_ms,
+        workload.run_to_end,
+        workload.tick_dt_us,
+    );
+    // Session-dependent replay emits out of id order, which the store's dense
+    // in-order insert can't accept at admission — pre-fill it here; flows then
+    // upsert the admission-stamped record over the placeholder.
+    if frontend.session_dependent() {
+        frontend.preinsert_all(&store);
+    }
 
     let mut flow = build_flow(&cfg, &bridge, Rc::clone(&store))?;
 

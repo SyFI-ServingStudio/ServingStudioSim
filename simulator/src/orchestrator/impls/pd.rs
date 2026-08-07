@@ -107,7 +107,7 @@ where
 {
     fn on_arrival(&mut self, req: Request) {
         let rid = req.id;
-        self.requests.borrow_mut().insert(&req);
+        self.requests.borrow_mut().upsert(&req);
         self.prefill_pool.admit(rid);
     }
 
@@ -128,7 +128,12 @@ where
                 PdPrefillEvent::RequestComplete { req, .. } => {
                     actions.push(OrchAction::Complete { req });
                 }
-                PdPrefillEvent::PrefillDone { worker, req, send_gid, kv_tokens } => {
+                PdPrefillEvent::PrefillDone {
+                    worker,
+                    req,
+                    send_gid,
+                    kv_tokens,
+                } => {
                     // Carry the prefill worker id through so the decode side can
                     // later ack it (`ReleaseKv`) and let it drop the held KV
                     // reservation. The send-side comm group alone is not enough
@@ -158,7 +163,11 @@ where
                 // worker to drop its held reservation. Targeted route (by
                 // `prefill_worker` id), *not* placement-chosen: only that
                 // worker tracks this request's held KV.
-                PdDecodeEvent::PullComplete { req, prefill_worker, .. } => {
+                PdDecodeEvent::PullComplete {
+                    req,
+                    prefill_worker,
+                    ..
+                } => {
                     self.prefill_pool
                         .route_msg_to(prefill_worker, PdPrefillMsg::ReleaseKv { req });
                 }
