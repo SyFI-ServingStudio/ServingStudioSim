@@ -17,8 +17,8 @@ use std::sync::Arc;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, Fp8BlockQuantKernel,
-    Fp8BlockQuantKernelConfig, Fp8BlockQuantKernelInput, ResidualRmsNormKernel,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, Fp8PerTokenGroupQuantKernel,
+    Fp8PerTokenGroupQuantKernelConfig, Fp8PerTokenGroupQuantKernelInput, ResidualRmsNormKernel,
     ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
@@ -64,10 +64,10 @@ pub struct VllmGlm52DenseFfnLocalWorkletResolved {
     pub raw_cfg: VllmGlm52DenseFfnLocalWorkletConfig,
     pub post_attn_add_rms_norm: ResidualRmsNormKernelConfig,
     /// `Some` exactly when `gemm_dtype` is FP8.
-    pub gate_up_input_quant: Option<Fp8BlockQuantKernelConfig>,
+    pub gate_up_input_quant: Option<Fp8PerTokenGroupQuantKernelConfig>,
     pub gate_up_proj: SingleGemmKernelConfig,
     pub silu_and_mul: ElementwiseKernelConfig,
-    pub down_input_quant: Option<Fp8BlockQuantKernelConfig>,
+    pub down_input_quant: Option<Fp8PerTokenGroupQuantKernelConfig>,
     pub down_proj: SingleGemmKernelConfig,
 }
 
@@ -79,10 +79,10 @@ pub struct VllmGlm52DenseFfnLocalWorkletInput {
 pub struct VllmGlm52DenseFfnLocalWorklet {
     pub name: String,
     pub post_attn_add_rms_norm: Op<ResidualRmsNormKernel>,
-    pub gate_up_input_quant: Option<Op<Fp8BlockQuantKernel>>,
+    pub gate_up_input_quant: Option<Op<Fp8PerTokenGroupQuantKernel>>,
     pub gate_up_proj: Op<SingleGemmKernel>,
     pub silu_and_mul: Op<ElementwiseKernel>,
-    pub down_input_quant: Option<Op<Fp8BlockQuantKernel>>,
+    pub down_input_quant: Option<Op<Fp8PerTokenGroupQuantKernel>>,
     pub down_proj: Op<SingleGemmKernel>,
     resolved: VllmGlm52DenseFfnLocalWorkletResolved,
 }
@@ -111,15 +111,19 @@ impl VllmGlm52DenseFfnLocalWorklet {
         .expect("validated GLM-5.2 SiLU output byte rate must fit u32");
 
         // One activation quantisation per dense FP8 GEMM: the hidden row
-        // feeding gate_up, then the SiLU output feeding down. A dense
-        // projection is one problem, unlike a routed grouped GEMM.
+        // feeding gate_up, then the SiLU output feeding down.
+        //
+        // Dense linears go through vLLM's `per_token_group_quant_8bit_kernel`;
+        // only the routed grouped GEMM uses TensorRT-LLM's `scale_1x128_kernel`
+        // (see the sibling shared-expert worklet for the measurement).
         let quant_config = |hidden_size: Dim| {
-            (cfg.gemm_dtype == DType::Fp8E4m3).then(|| Fp8BlockQuantKernelConfig {
+            (cfg.gemm_dtype == DType::Fp8E4m3).then(|| Fp8PerTokenGroupQuantKernelConfig {
                 backends: cfg.fp8_quant_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 hidden_size,
-                num_problems: Dim::from(1),
+                group_size: 128,
                 input_dtype: cfg.dtype,
+                scale_format: "ue8m0_column_major".to_string(),
             })
         };
 
@@ -176,7 +180,7 @@ impl VllmGlm52DenseFfnLocalWorklet {
                     &name,
                     "gate_up_input_quant",
                     config,
-                    Fp8BlockQuantKernel::build,
+                    Fp8PerTokenGroupQuantKernel::build,
                     bridge,
                 )
             })
@@ -203,7 +207,7 @@ impl VllmGlm52DenseFfnLocalWorklet {
                     &name,
                     "down_input_quant",
                     config,
-                    Fp8BlockQuantKernel::build,
+                    Fp8PerTokenGroupQuantKernel::build,
                     bridge,
                 )
             })
@@ -277,7 +281,7 @@ struct WorkInputs {
     post_attn_add_rms_norm: ResidualRmsNormKernelInput,
     /// Both quant leaves take the same row count; only the config's
     /// `hidden_size` differs.
-    input_quant: Fp8BlockQuantKernelInput,
+    input_quant: Fp8PerTokenGroupQuantKernelInput,
     gate_up_proj: SingleGemmKernelInput,
     silu_and_mul: ElementwiseKernelInput,
     down_proj: SingleGemmKernelInput,
@@ -325,7 +329,7 @@ fn checked_product(name: &str, factors: &[u32]) -> Result<u32, String> {
 fn work_inputs(batch_tokens: u32) -> WorkInputs {
     WorkInputs {
         post_attn_add_rms_norm: ResidualRmsNormKernelInput { m: batch_tokens },
-        input_quant: Fp8BlockQuantKernelInput {
+        input_quant: Fp8PerTokenGroupQuantKernelInput {
             num_tokens: batch_tokens,
         },
         gate_up_proj: SingleGemmKernelInput { m: batch_tokens },

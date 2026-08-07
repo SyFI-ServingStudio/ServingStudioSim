@@ -5,9 +5,22 @@
 //! independently replicated over the EP ranks; decoder layers 0--2 execute the
 //! dense FFN and a full DSA indexer; layers 3--5 reuse the layer-2 index; layers
 //! 6--77 repeat a four-layer cadence containing one full-index layer and three
-//! IndexShare layers; sparse-MoE communication is pure EP
-//! (`Placement::RoundRobin`); shared-expert compute is conservatively serialized
-//! with routed-expert work.
+//! IndexShare layers; shared-expert compute is conservatively serialized with
+//! routed-expert work.
+//!
+//! Sparse-MoE communication is pure EP and is priced by the **profiled**
+//! flashinfer MNNVL all-to-all (`moe_alltoall`, plus `moe_alltoall_prepare` for
+//! the metadata pass), not by the simulated `p2p_intra`/`p2p_inter` byte model
+//! the native graph uses. That buys the real kernel's fan-out and contention.
+//!
+//! The transfer leaf is keyed by two row counts, `(max_send_rows,
+//! max_recv_rows)`, so both imbalances reach it: how the tokens are spread over
+//! DP groups sets what leaves the busiest sender, and how expert popularity is
+//! spread over EP ranks sets what arrives at the busiest receiver. `local_ppm`
+//! therefore moves the transfer as well as the routed grouped GEMMs and
+//! `finalizeMoeRoutingKernel`. What is still priced flat is `moe_alltoall_prepare`,
+//! whose key is the token count alone; a uniformly-drawn benchmark under-reads a
+//! real skewed layer there by ~9%, which is ~3% of the MoE communication budget.
 //!
 //! This is a **separate static graph**, not a flag on the native arch -- the same
 //! split Qwen uses (`qwen3_moe_dp_attn_ep_ffn` / `_fp8_` /
@@ -39,11 +52,13 @@ use anyhow::Result;
 use crate::arch::glm52_dsa_moe::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::Fabric;
-use crate::op::moe::{MoeCombineOp, MoeDispatchOp, MoeNetConfig, MoeNetInput, Placement};
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, GroupedGemmKernelInput,
+    MoeAlltoallDirection, MoeAlltoallKernel, MoeAlltoallKernelConfig, MoeAlltoallKernelInput,
+    MoeAlltoallPrepareKernel, MoeAlltoallPrepareKernelConfig, MoeAlltoallPrepareKernelInput,
+    MoeFinalizeRoutingKernel, MoeFinalizeRoutingKernelConfig, MoeFinalizeRoutingKernelInput,
     ResidualRmsNormKernel, ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput,
     SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
@@ -109,19 +124,32 @@ const RESIDUAL_NORM_BACKENDS: &[&str] = &["vllm_cuda"];
 const RMS_NORM_BACKENDS: &[&str] = &["flashinfer"];
 const SINGLE_GEMM_BACKENDS: &[&str] = &["torch_linear"];
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
+// The MLA query RoPE is not a streaming pointwise leaf: vLLM feeds the roped
+// q straight back into the attention op, so inductor fuses it into a kernel
+// that rewrites all of q. Its own L1 kind measures that fusion.
+const MAIN_ROPE_BACKENDS: &[&str] = &["vllm_inductor"];
 const GROUPED_GEMM_BACKENDS: &[&str] = &["torch"];
 const FP8_SINGLE_GEMM_BACKENDS: &[&str] = &["deepgemm"];
-const FP8_QUANT_BACKENDS: &[&str] = &["flashinfer_trtllm"];
+// vLLM quantises dense and routed activations with two different kernels.
+// Dense linears call its own `per_token_group_quant_8bit_kernel` (backend
+// `vllm_cuda`); only the routed grouped GEMM reaches TensorRT-LLM's
+// `scale_1x128_kernel` (backend `flashinfer_trtllm`). Both appear in the same
+// nsys iteration, so this is not a shape or a backend preference -- feeding the
+// dense leaves the routed curve over-predicted them ~2.05x at prefill.
+const DENSE_FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
+const ROUTED_FP8_QUANT_BACKENDS: &[&str] = &["flashinfer_trtllm"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm52"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm52"];
 const INDEX_CACHE_AND_TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_LOGITS_BACKENDS: &[&str] = &["vllm_deepgemm_fp8"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["vllm_flashmla_bf16"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
-const P2P_BACKENDS: &[&str] = &["nccl"];
+// The MoE transfer does not vary with the expert dtype: vLLM defers activation
+// quantisation past the all-to-all, so both the bf16 and the fp8 deployment send
+// bf16 rows through the same flashinfer MNNVL kernel.
+const MOE_ALLTOALL_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
 const FP8_GROUPED_GEMM_BACKENDS: &[&str] = &["deepgemm"];
 const FP8_PRODUCTION_GROUPED_GEMM_BACKENDS: &[&str] = &["flashinfer_trtllm"];
-const FP8_P2P_BACKENDS: &[&str] = &["nvshmem"];
 
 // Leaf counts are properties of the accepted L2/L3 sections. `build` verifies
 // the compiled tree against these formulas, so drift cannot be hidden by a
@@ -130,9 +158,17 @@ const ATTN_FULL_SLOTS: usize = 29;
 const ATTN_SHARED_SLOTS: usize = 14;
 const DENSE_FFN_SLOTS: usize = 4;
 const ROUTER_SLOTS: usize = 4;
+/// `moe.dispatch.prepare` + `moe.dispatch`. Both are collectives over the whole
+/// EP group, so they are one leaf each, not one per rank.
 const DISPATCH_SLOTS: usize = 2;
+/// `expandInputRows`, one per EP rank: the gather is rank-local work whose size
+/// follows that rank's popularity shard.
+const EXPAND_INPUT_ROWS_SLOTS: usize = 1;
 const EXPERT_SLOTS: usize = 3;
-const COMBINE_SLOTS: usize = 4;
+/// The zero fill, the profiled transfer, and the top-k reduction. Three leaves
+/// because the wrapper is three launches over two different quantities — see
+/// the `moe_combine_output_fill` field's doc comment.
+const COMBINE_SLOTS: usize = 3;
 const SHARED_EXPERT_SLOTS: usize = 3;
 const FINALIZE_SLOTS: usize = 1;
 const MTP_PRELUDE_SLOTS: usize = 6;
@@ -156,7 +192,13 @@ pub struct Glm52VllmDsaMoeConfigs {
     pub cycle_full_attention: VllmGlm52DsaAttnLocalWorkletConfig,
     pub cycle_shared_attention: VllmGlm52DsaAttnLocalWorkletConfig,
     pub sparse_router: Glm52MoeRouterLocalWorkletConfig,
-    pub moe_dispatch: MoeNetConfig,
+    /// `mnnvl_moe_alltoallv_prepare_without_allgather`: five index kernels that
+    /// decide, from the router's expert ids alone, which rows go to which rank.
+    /// A profiled kind of its own because it is atomics- and exchange-bound, not
+    /// bandwidth-bound — 0.33 ms/layer to move a quarter of a megabyte, which
+    /// any byte-rate model would price at roughly zero.
+    pub moe_dispatch_prepare: MoeAlltoallPrepareKernelConfig,
+    pub moe_dispatch: MoeAlltoallKernelConfig,
     /// One config per EP rank. The rank axis is what makes the routed-expert
     /// grouped GEMMs distribution-sensitive: each rank owns its own
     /// `local_ppm` shard, so a measured or synthetic skew yields a distinct
@@ -164,9 +206,29 @@ pub struct Glm52VllmDsaMoeConfigs {
     /// the genuinely heaviest one. A uniform distribution still produces
     /// `ep_size` identical entries, so the slot layout never changes.
     pub moe_expert_compute: Vec<MoeExpertComputeLocalWorkletConfig>,
-    pub moe_combine: MoeNetConfig,
+    /// `expandInputRows`: the receiving rank gathers the rows it was sent into
+    /// one contiguous block per local expert, so the grouped GEMM sees a dense
+    /// batch. A pure bandwidth mover (read a row, write a row) — the byte-rate
+    /// elementwise curve is the right primitive, and at 8k prefill tokens this
+    /// is 42 ms/iteration that had no slot at all.
+    pub moe_expand_input_rows: ElementwiseKernelConfig,
+    /// `mnnvl_moe_alltoallv_combine` zeroes its `token_count x top_k` output
+    /// before the transfer writes into it — the trace's `FillFunctor` launch,
+    /// 805 MB per layer at 8k tokens, comparable to the transfer beside it.
+    /// It is its own leaf because it scales with the token count while the
+    /// transfer scales with rows; folding it into the profiled call would have
+    /// forced a third axis onto that kernel's cache.
+    pub moe_combine_output_fill: ElementwiseKernelConfig,
+    /// The return leg proper: `moe_comm`, and nothing else in the wrapper.
+    pub moe_combine: MoeAlltoallKernelConfig,
+    /// The `torch.sum` that folds the `token_count x top_k` staging buffer back
+    /// down to one row per token. Same reasoning as the fill.
+    pub moe_combine_reduce: ElementwiseKernelConfig,
     pub shared_expert: VllmGlm52SharedExpertLocalWorkletConfig,
-    pub sparse_finalization: ElementwiseKernelConfig,
+    /// One config per EP rank, sharing the routed experts' popularity shards:
+    /// `finalizeMoeRoutingKernel` runs where the expert GEMMs ran and reduces
+    /// exactly the rows they produced, so a skewed rank finalizes more.
+    pub sparse_finalization: Vec<MoeFinalizeRoutingKernelConfig>,
     pub embedding: ElementwiseKernelConfig,
     pub final_norm: ResidualRmsNormKernelConfig,
     pub lm_head: SingleGemmKernelConfig,
@@ -184,11 +246,15 @@ pub struct Glm52VllmDsaMoeResolved {
     pub cycle_full_attention: VllmGlm52DsaAttnLocalWorkletResolved,
     pub cycle_shared_attention: VllmGlm52DsaAttnLocalWorkletResolved,
     pub sparse_router: Glm52MoeRouterLocalWorkletResolved,
-    pub moe_dispatch: MoeNetConfig,
+    pub moe_dispatch_prepare: MoeAlltoallPrepareKernelConfig,
+    pub moe_dispatch: MoeAlltoallKernelConfig,
     pub moe_expert_compute: Vec<MoeExpertComputeLocalWorkletResolved>,
-    pub moe_combine: MoeNetConfig,
+    pub moe_expand_input_rows: ElementwiseKernelConfig,
+    pub moe_combine_output_fill: ElementwiseKernelConfig,
+    pub moe_combine: MoeAlltoallKernelConfig,
+    pub moe_combine_reduce: ElementwiseKernelConfig,
     pub shared_expert: VllmGlm52SharedExpertLocalWorkletResolved,
-    pub sparse_finalization: ElementwiseKernelConfig,
+    pub sparse_finalization: Vec<MoeFinalizeRoutingKernelConfig>,
     pub embedding: ElementwiseKernelConfig,
     pub final_norm: ResidualRmsNormKernelConfig,
     pub lm_head: SingleGemmKernelConfig,
@@ -216,12 +282,12 @@ fn attention_config(
         (DType::Bf16, SINGLE_GEMM_BACKENDS)
     };
     VllmGlm52DsaAttnLocalWorkletConfig {
-        fp8_quant_backends: FP8_QUANT_BACKENDS.to_vec(),
+        fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
         include_indexer,
         residual_rms_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
         rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
         single_gemm_backends: gemm_backends.to_vec(),
-        elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+        main_rope_backends: MAIN_ROPE_BACKENDS.to_vec(),
         q_absorb_backends: Q_ABSORB_BACKENDS.to_vec(),
         v_up_backends: V_UP_BACKENDS.to_vec(),
         indexer_gemm_backends: gemm_backends.to_vec(),
@@ -248,6 +314,7 @@ fn attention_config(
         index_head_dim: model.index_head_dim.clone(),
         selected_k: model.index_top_k,
         max_model_len: Dim::param("timing_max_model_len", TIMING_MAX_MODEL_LEN),
+        rope_max_position: model.max_context.clone(),
         logits_row_stride: Dim::param("logits_row_stride", LOGITS_ROW_STRIDE),
         cache_block_size: CACHE_BLOCK_SIZE,
         quant_block_size: QUANT_BLOCK_SIZE,
@@ -265,6 +332,7 @@ fn attention_config(
         index_prefill_span_mode: "single_causal_tail".to_string(),
         index_decode_context_mode: "uniform".to_string(),
         index_decode_page_mapping: "unique_scattered".to_string(),
+        rope_is_neox_style: false,
         index_clean_logits: false,
         // Production selected indices are top-k ordered and page-local; this is
         // the smallest supported deterministic profiling identity.
@@ -307,14 +375,10 @@ pub fn build_configs(
             routing.num_experts()
         )));
     }
-    let (expert_dtype, expert_backends, p2p_backends) = if fp8 {
-        (
-            DType::Fp8E4m3,
-            FP8_GROUPED_GEMM_BACKENDS,
-            FP8_P2P_BACKENDS,
-        )
+    let (expert_dtype, expert_backends) = if fp8 {
+        (DType::Fp8E4m3, FP8_GROUPED_GEMM_BACKENDS)
     } else {
-        (DType::Bf16, GROUPED_GEMM_BACKENDS, P2P_BACKENDS)
+        (DType::Bf16, GROUPED_GEMM_BACKENDS)
     };
     let (gemm_dtype, gemm_backends) = if fp8 {
         (DType::Fp8E4m3, FP8_SINGLE_GEMM_BACKENDS)
@@ -326,29 +390,35 @@ pub fn build_configs(
     let initial_shared_attention = attention_config(model, parallel, false, fp8);
     let cycle_full_attention = attention_config(model, parallel, true, fp8);
     let cycle_shared_attention = attention_config(model, parallel, false, fp8);
-    let moe_net = MoeNetConfig {
-        backends: p2p_backends.to_vec(),
-        gpu_name: gpu.clone(),
-        dtype: if fp8 { DType::Fp8E4m3 } else { DType::Bf16 },
-        intra_fabric: Fabric::Nvlink,
-        inter_fabric: Fabric::Infiniband,
-        ep_size: u32::from(parallel.ep_size),
-        nvl_num_gpu: u32::from(parallel.nvl_num_gpu),
-        h: HIDDEN_DIM,
-        top_k: ROUTER_TOP_K,
-        routing: routing.clone(),
-        placement: Placement::RoundRobin,
-    };
     let hidden_bytes = HIDDEN_DIM
         .checked_mul(DType::Bf16.size_bytes())
         .ok_or_else(|| fit_failed("hidden byte width overflows u32"))?;
+    // The all-to-all moves activations, not packed expert weights, and vLLM
+    // sends them UNQUANTISED: the flashinfer two-sided path takes the
+    // `defer_input_quant` branch for a block-scale fp8 MoE, so the wire payload
+    // is bf16 and `scale_1x128_kernel` runs on the receiving rank after
+    // `expandInputRows`. The measured launch order says the same thing
+    // (alltoall -> expand -> quant -> fp8 gemm). Pinning this to the expert
+    // dtype halved every dispatch/combine byte count. Same rule, same reason,
+    // as `qwen3_vllm_moe_dp_attn_ep_ffn`.
+    let moe_alltoall = |direction| MoeAlltoallKernelConfig {
+        backends: MOE_ALLTOALL_BACKENDS.to_vec(),
+        gpu_name: gpu.clone(),
+        ep_size: u32::from(parallel.ep_size),
+        top_k: ROUTER_TOP_K,
+        // No EPLB redundancy in this deployment: one slot per expert.
+        slot_count: NUM_EXPERTS,
+        hidden_bytes: hidden_bytes.into(),
+        direction,
+        fabric: Fabric::Nvlink,
+    };
+    // Combine stages one row per (token, selected expert) before reducing.
+    let top_k_hidden_bytes = hidden_bytes
+        .checked_mul(ROUTER_TOP_K)
+        .ok_or_else(|| fit_failed("combine staging byte width overflows u32"))?;
     let embedding_input = hidden_bytes
         .checked_add(8)
         .ok_or_else(|| fit_failed("embedding input byte rate overflows u32"))?;
-    let finalization_input = 9_u32
-        .checked_mul(hidden_bytes)
-        .ok_or_else(|| fit_failed("MoE finalization input byte rate overflows u32"))?;
-
     let mtp_attention = match mtp_mode {
         Glm52MtpMode::Off => None,
         Glm52MtpMode::FullIndex => Some(attention_config(model, parallel, true, fp8)),
@@ -377,13 +447,54 @@ pub fn build_configs(
         gemm_dtype,
     });
 
+    // `split_for_ep` hands rank *r* the contiguous expert range
+    // `[r * experts_per_rank, (r + 1) * experts_per_rank)`. That is the shard
+    // the routed grouped GEMMs are keyed by; the `RoundRobin` in `MoeNetConfig`
+    // above only governs which peer a token is sent to. It is hoisted out of
+    // the struct literal because finalize-routing reduces exactly the rows
+    // these GEMMs produce and must be keyed by the same shards.
+    let moe_expert_compute = MoeExpertComputeLocalWorkletConfig::split_for_ep(
+        MoeExpertComputeLocalWorkletConfig {
+            hidden: model.hidden_dim.clone(),
+            moe_intermediate: model.moe_intermediate_dim.clone(),
+            num_experts: model.num_experts.clone(),
+            ep_size: parallel.ep_size,
+            top_k: model.router_top_k,
+            dtype: expert_dtype,
+            activation_dtype: DType::Bf16,
+            gpu_name: gpu.clone(),
+            act_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            fp8_quant_backends: ROUTED_FP8_QUANT_BACKENDS.to_vec(),
+            grouped_gemm_backends: expert_backends.to_vec(),
+            fp8_grouped_gemm_backends: FP8_PRODUCTION_GROUPED_GEMM_BACKENDS.to_vec(),
+            use_fp8_blockscale_grouped_gemm: true,
+            local_ppm: Vec::new(),
+        },
+        routing.ppm(),
+    );
+    let experts_per_rank = NUM_EXPERTS / u32::from(parallel.ep_size);
+    let sparse_finalization: Vec<MoeFinalizeRoutingKernelConfig> = moe_expert_compute
+        .iter()
+        .map(|expert_config| MoeFinalizeRoutingKernelConfig {
+            backends: FP8_PRODUCTION_GROUPED_GEMM_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            hidden_size: model.hidden_dim.clone(),
+            top_k: model.router_top_k,
+            num_experts_per_rank: experts_per_rank,
+            local_ppm: expert_config.local_ppm.clone(),
+            // The routed GEMMs emit bf16 no matter how the weights are stored,
+            // and this kernel reduces those outputs.
+            dtype: DType::Bf16,
+        })
+        .collect();
+
     Ok(Glm52VllmDsaMoeConfigs {
         model: model.clone(),
         parallel: parallel.clone(),
         mtp_mode,
         dense_full_index_attention,
         dense_ffn: VllmGlm52DenseFfnLocalWorkletConfig {
-            fp8_quant_backends: FP8_QUANT_BACKENDS.to_vec(),
+            fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
             residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
             gemm_backends: gemm_backends.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
@@ -416,34 +527,43 @@ pub fn build_configs(
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
         },
-        moe_dispatch: moe_net.clone(),
-        // `split_for_ep` hands rank *r* the contiguous expert range
-        // `[r * experts_per_rank, (r + 1) * experts_per_rank)`. That is the
-        // shard the routed grouped GEMMs are keyed by; the `RoundRobin` in
-        // `MoeNetConfig` above only governs which peer a token is sent to.
-        moe_expert_compute: MoeExpertComputeLocalWorkletConfig::split_for_ep(
-            MoeExpertComputeLocalWorkletConfig {
-                hidden: model.hidden_dim.clone(),
-                moe_intermediate: model.moe_intermediate_dim.clone(),
-                num_experts: model.num_experts.clone(),
-                ep_size: parallel.ep_size,
-                top_k: model.router_top_k,
-                dtype: expert_dtype,
-                activation_dtype: DType::Bf16,
-                gpu_name: gpu.clone(),
-                act_backends: ELEMENTWISE_BACKENDS.to_vec(),
-                fp8_quant_backends: FP8_QUANT_BACKENDS.to_vec(),
-                grouped_gemm_backends: expert_backends.to_vec(),
-                fp8_grouped_gemm_backends: FP8_PRODUCTION_GROUPED_GEMM_BACKENDS.to_vec(),
-                use_fp8_blockscale_grouped_gemm: true,
-                local_ppm: Vec::new(),
-            },
-            routing.ppm(),
-        ),
-        moe_combine: moe_net,
+        moe_dispatch_prepare: MoeAlltoallPrepareKernelConfig {
+            backends: MOE_ALLTOALL_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            ep_size: u32::from(parallel.ep_size),
+            top_k: ROUTER_TOP_K,
+            slot_count: NUM_EXPERTS,
+            fabric: Fabric::Nvlink,
+        },
+        moe_dispatch: moe_alltoall(MoeAlltoallDirection::Dispatch),
+        moe_expert_compute: moe_expert_compute.clone(),
+        // One received row in, one permuted row out.
+        moe_expand_input_rows: ElementwiseKernelConfig {
+            backends: ELEMENTWISE_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            input_bytes_per_token: hidden_bytes.into(),
+            output_bytes_per_token: hidden_bytes.into(),
+        },
+        // `torch.zeros(token_count * top_k, hidden)`: no reads, `top_k` rows
+        // written per token.
+        moe_combine_output_fill: ElementwiseKernelConfig {
+            backends: ELEMENTWISE_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            input_bytes_per_token: 0.into(),
+            output_bytes_per_token: top_k_hidden_bytes.into(),
+        },
+        moe_combine: moe_alltoall(MoeAlltoallDirection::Combine),
+        // `torch.sum` over the top-k axis: reads what the fill wrote, writes one
+        // row per token.
+        moe_combine_reduce: ElementwiseKernelConfig {
+            backends: ELEMENTWISE_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            input_bytes_per_token: top_k_hidden_bytes.into(),
+            output_bytes_per_token: hidden_bytes.into(),
+        },
         shared_expert: VllmGlm52SharedExpertLocalWorkletConfig {
             gemm_backends: gemm_backends.to_vec(),
-            fp8_quant_backends: FP8_QUANT_BACKENDS.to_vec(),
+            fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
             hidden_dim: model.hidden_dim.clone(),
@@ -452,12 +572,7 @@ pub fn build_configs(
             dtype: DType::Bf16,
             gemm_dtype,
         },
-        sparse_finalization: ElementwiseKernelConfig {
-            backends: ELEMENTWISE_BACKENDS.to_vec(),
-            gpu_name: gpu.clone(),
-            input_bytes_per_token: finalization_input.into(),
-            output_bytes_per_token: hidden_bytes.into(),
-        },
+        sparse_finalization,
         embedding: ElementwiseKernelConfig {
             backends: ELEMENTWISE_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
@@ -470,12 +585,21 @@ pub fn build_configs(
             hidden: model.hidden_dim.clone(),
             dtype: DType::Bf16,
         },
+        // lm_head is NOT quantised. The GLM-5.2-FP8 checkpoint lists `lm_head`
+        // and `model.embed_tokens` in `quantization_config.modules_to_not_convert`,
+        // and the safetensors header confirms `lm_head.weight` is BF16
+        // [154880, 6144]. It therefore has no input_quant leaf and runs the
+        // plain BF16 GEMM (`nvjet_tst_*`, cuBLASLt) in the trace.
+        //
+        // Following `fp8` here priced 0.886 GiB of weights instead of 1.77 GiB:
+        // 232.25 us against 463.46 us measured, a ratio of 0.5011. The BF16 DRAM
+        // floor alone is ~396 us, so the FP8 value was not even reachable.
         lm_head: SingleGemmKernelConfig {
-            backends: gemm_backends.to_vec(),
+            backends: SINGLE_GEMM_BACKENDS.to_vec(),
             gpu_name: gpu,
             n: model.vocab_size.clone(),
             k: model.hidden_dim.clone(),
-            dtype: gemm_dtype,
+            dtype: DType::Bf16,
         },
         mtp_prelude,
         mtp_attention,
@@ -594,13 +718,17 @@ pub fn resolve_configs(cfgs: &Glm52VllmDsaMoeConfigs) -> Glm52VllmDsaMoeResolved
             &cfgs.cycle_shared_attention,
         ),
         sparse_router: Glm52MoeRouterLocalWorklet::resolve_config(&cfgs.sparse_router),
+        moe_dispatch_prepare: cfgs.moe_dispatch_prepare.clone(),
         moe_dispatch: cfgs.moe_dispatch.clone(),
         moe_expert_compute: cfgs
             .moe_expert_compute
             .iter()
             .map(MoeExpertComputeLocalWorklet::resolve_config)
             .collect(),
+        moe_expand_input_rows: cfgs.moe_expand_input_rows.clone(),
+        moe_combine_output_fill: cfgs.moe_combine_output_fill.clone(),
         moe_combine: cfgs.moe_combine.clone(),
+        moe_combine_reduce: cfgs.moe_combine_reduce.clone(),
         shared_expert: VllmGlm52SharedExpertLocalWorklet::resolve_config(&cfgs.shared_expert),
         sparse_finalization: cfgs.sparse_finalization.clone(),
         embedding: cfgs.embedding.clone(),
@@ -626,14 +754,31 @@ struct Glm52SparseBody {
     name: String,
     attention: VllmGlm52DsaAttnLocalWorklet,
     router: Glm52MoeRouterLocalWorklet,
-    dispatch: MoeDispatchOp,
+    /// The three collective leaves. Each is one kernel over the whole EP group,
+    /// so none of them is wrapped in a `Max` over ranks the way the rank-local
+    /// work is — every rank is inside the same transfer.
+    dispatch_prepare: Op<MoeAlltoallPrepareKernel>,
+    dispatch: Op<MoeAlltoallKernel>,
+    expand_input_rows: Op<ElementwiseKernel>,
     /// One per EP rank, in rank order.
     expert_compute: Vec<MoeExpertComputeLocalWorklet>,
-    combine: MoeCombineOp,
+    combine_output_fill: Op<ElementwiseKernel>,
+    combine: Op<MoeAlltoallKernel>,
+    combine_reduce: Op<ElementwiseKernel>,
     shared_expert: VllmGlm52SharedExpertLocalWorklet,
-    finalization: Op<ElementwiseKernel>,
+    /// One per EP rank, in rank order — same shards as `expert_compute`.
+    finalization: Vec<Op<MoeFinalizeRoutingKernel>>,
+    /// Each EP rank's shard of the routing distribution, in rank order. The
+    /// expert worklets own the same shards; they are carried again here because
+    /// `expandInputRows` moves exactly the rows the grouped GEMM then reads, so
+    /// its token count is that rank's apportioned selection count.
+    local_ppms: Vec<Vec<u32>>,
     ep_size: u16,
     top_k: u32,
+    /// `destinations_per_token` for this deployment's routing recipe, resolved
+    /// once at build: it turns a token count into the wire rows the transfer
+    /// actually moves. Static, because `ep_size`/`top_k`/`slot_count` are.
+    rows_per_token: f64,
 }
 
 impl Glm52SparseBody {
@@ -650,9 +795,16 @@ impl Glm52SparseBody {
             common.sparse_router.clone(),
             bridge,
         )?;
-        let dispatch = MoeDispatchOp::build(
+        let dispatch_prepare = build_atomic(
+            format!("{name}.moe.dispatch.prepare"),
+            common.moe_dispatch_prepare.clone(),
+            MoeAlltoallPrepareKernel::build,
+            bridge,
+        )?;
+        let dispatch = build_atomic(
             format!("{name}.moe.dispatch"),
             common.moe_dispatch.clone(),
+            MoeAlltoallKernel::build,
             bridge,
         )?;
         // Every rank keeps the same slot name: the rank axis already shows up
@@ -669,9 +821,28 @@ impl Glm52SparseBody {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let combine = MoeCombineOp::build(
+        let expand_input_rows = build_atomic(
+            format!("{name}.moe.expand_input_rows"),
+            common.moe_expand_input_rows.clone(),
+            ElementwiseKernel::build,
+            bridge,
+        )?;
+        let combine_output_fill = build_atomic(
+            format!("{name}.moe.combine.output_fill"),
+            common.moe_combine_output_fill.clone(),
+            ElementwiseKernel::build,
+            bridge,
+        )?;
+        let combine = build_atomic(
             format!("{name}.moe.combine"),
             common.moe_combine.clone(),
+            MoeAlltoallKernel::build,
+            bridge,
+        )?;
+        let combine_reduce = build_atomic(
+            format!("{name}.moe.combine.reduce"),
+            common.moe_combine_reduce.clone(),
+            ElementwiseKernel::build,
             bridge,
         )?;
         let shared_expert = VllmGlm52SharedExpertLocalWorklet::build(
@@ -679,23 +850,45 @@ impl Glm52SparseBody {
             common.shared_expert.clone(),
             bridge,
         )?;
-        let finalization = build_atomic(
-            format!("{name}.moe.finalization"),
-            common.sparse_finalization.clone(),
-            ElementwiseKernel::build,
-            bridge,
-        )?;
+        // Every rank keeps the same slot name, for the reason spelled out at
+        // `expert_compute` above.
+        let finalization = common
+            .sparse_finalization
+            .iter()
+            .map(|rank_config| {
+                build_atomic(
+                    format!("{name}.moe.finalization"),
+                    rank_config.clone(),
+                    MoeFinalizeRoutingKernel::build,
+                    bridge,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             name,
             attention,
             router,
+            dispatch_prepare,
             dispatch,
+            expand_input_rows,
             expert_compute,
+            combine_output_fill,
             combine,
+            combine_reduce,
             shared_expert,
             finalization,
+            local_ppms: common
+                .moe_expert_compute
+                .iter()
+                .map(|rank_resolved| rank_resolved.raw_cfg.local_ppm.clone())
+                .collect(),
             ep_size: common.raw_cfg.parallel.ep_size,
             top_k: common.raw_cfg.model.router_top_k,
+            rows_per_token: destinations_per_token(
+                u32::from(common.raw_cfg.parallel.ep_size),
+                common.raw_cfg.model.router_top_k,
+                common.moe_dispatch.slot_count,
+            ),
         })
     }
 
@@ -712,7 +905,14 @@ impl Glm52SparseBody {
                 .map(|_| self.router.compile(builder))
                 .collect(),
         );
+        let dispatch_prepare = self.dispatch_prepare.compile(builder);
         let dispatch = self.dispatch.compile(builder);
+        let expand = labeled_max(
+            format!("{}.moe.expand_input_rows [Max over EP ranks]", self.name),
+            (0..self.ep_size)
+                .map(|_| self.expand_input_rows.compile(builder))
+                .collect(),
+        );
         let experts = labeled_max(
             format!("{}.moe.routed_experts [Max over EP ranks]", self.name),
             self.expert_compute
@@ -720,17 +920,23 @@ impl Glm52SparseBody {
                 .map(|rank_expert| rank_expert.compile(builder))
                 .collect(),
         );
+        // Leaves are numbered in the order they are declared here, and `eval`
+        // must push in the same order — so these statements follow the measured
+        // launch order, which is also the order the `Sum` below lists them in.
+        let finalization = labeled_max(
+            format!("{}.moe.finalization [Max over EP ranks]", self.name),
+            self.finalization
+                .iter()
+                .map(|rank_finalize| rank_finalize.compile(builder))
+                .collect(),
+        );
+        let combine_output_fill = self.combine_output_fill.compile(builder);
         let combine = self.combine.compile(builder);
+        let combine_reduce = self.combine_reduce.compile(builder);
         let shared = labeled_max(
             format!("{}.moe.shared_expert [Max over home groups]", self.name),
             (0..self.ep_size)
                 .map(|_| self.shared_expert.compile(builder))
-                .collect(),
-        );
-        let finalization = labeled_max(
-            format!("{}.moe.finalization [Max over home groups]", self.name),
-            (0..self.ep_size)
-                .map(|_| self.finalization.compile(builder))
                 .collect(),
         );
         CostNode::Labeled {
@@ -741,14 +947,18 @@ impl Glm52SparseBody {
             child: Box::new(CostNode::Sum(vec![
                 attention,
                 CostNode::Labeled {
-                    label: format!("{}.moe [router -> dispatch -> routed experts -> combine -> shared expert -> finalization]", self.name),
+                    label: format!("{}.moe [router -> dispatch prepare -> dispatch -> expand -> routed experts -> finalization -> combine (fill -> transfer -> reduce) -> shared expert]", self.name),
                     child: Box::new(CostNode::Sum(vec![
                         router,
+                        dispatch_prepare,
                         dispatch,
+                        expand,
                         experts,
-                        combine,
-                        shared,
                         finalization,
+                        combine_output_fill,
+                        combine,
+                        combine_reduce,
+                        shared,
                     ])),
                 },
             ])),
@@ -767,19 +977,112 @@ impl Glm52SparseBody {
                 ev,
             );
         }
-        self.dispatch.eval(
-            &MoeNetInput {
-                tokens: u64::from(batch.total_tokens),
+        // vLLM sizes every rank's transfer buffers by `max(global_num_tokens)`
+        // — one all-gathered scalar, so the busiest DP rank sets the shape of
+        // the collective for everyone. That maximum, not the replica total, is
+        // this leaf's axis.
+        let max_tokens_per_rank = batch
+            .groups
+            .iter()
+            .map(|group| group.batch_tokens)
+            .max()
+            .unwrap_or(0);
+        eval_atomic_or_zero(
+            &self.dispatch_prepare,
+            MoeAlltoallPrepareKernelInput {
+                tokens_per_rank: max_tokens_per_rank,
             },
+            max_tokens_per_rank == 0,
             ev,
         );
+        // The transfer's two axes are row counts, and the two sides of it are
+        // loaded by different things. What leaves a rank is set by how the
+        // tokens are spread over DP groups: one row per (token, distinct
+        // destination rank), so a group's token count times the fan-out. What
+        // arrives at a rank is set by how the experts are spread over EP ranks
+        // — that rank's apportioned share of the global selections, deduplicated
+        // by the same fan-out (a token picking two experts on one rank still
+        // crosses the wire once).
+        let max_send_rows = batch
+            .groups
+            .iter()
+            .map(|group| rows_from_tokens(group.batch_tokens, self.rows_per_token))
+            .max()
+            .unwrap_or(0);
+        let max_recv_rows = self
+            .local_ppms
+            .iter()
+            .map(|local_ppm| {
+                let selections = rows_for_rank(batch.routed_selections, local_ppm);
+                rows_from_tokens(selections, self.rows_per_token / f64::from(self.top_k))
+            })
+            .max()
+            .unwrap_or(0);
+        eval_atomic_or_zero(
+            &self.dispatch,
+            MoeAlltoallKernelInput {
+                max_send_rows,
+                max_recv_rows,
+            },
+            max_tokens_per_rank == 0,
+            ev,
+        );
+        // `expandInputRows` moves the rows this rank was sent into the dense
+        // per-expert batch the grouped GEMM reads, so its row count is that
+        // rank's apportioned share of the global selections — the same quantity
+        // the expert worklet derives internally from the same shard.
+        for local_ppm in &self.local_ppms {
+            let rank_rows = rows_for_rank(batch.routed_selections, local_ppm);
+            eval_atomic_or_zero(
+                &self.expand_input_rows,
+                ElementwiseKernelInput {
+                    num_tokens: rank_rows,
+                },
+                rank_rows == 0,
+                ev,
+            );
+        }
         for rank_expert in &self.expert_compute {
             eval_expert_or_zero(rank_expert, batch.routed_selections, ev);
         }
-        self.combine.eval(
-            &MoeNetInput {
-                tokens: u64::from(batch.total_tokens),
+        // The kernel's own axis is the GLOBAL token count; it re-derives this
+        // rank's row share from the same popularity shard, so passing the
+        // replica total here is what makes a skewed rank finalize more.
+        for rank_finalize in &self.finalization {
+            eval_atomic_or_zero(
+                rank_finalize,
+                MoeFinalizeRoutingKernelInput {
+                    token_count: batch.total_tokens,
+                },
+                batch.total_tokens == 0,
+                ev,
+            );
+        }
+        // The return leg is the dispatch transposed — what an EP rank received
+        // it now sends back — so the same two numbers swap places.
+        eval_atomic_or_zero(
+            &self.combine_output_fill,
+            ElementwiseKernelInput {
+                num_tokens: max_tokens_per_rank,
             },
+            max_tokens_per_rank == 0,
+            ev,
+        );
+        eval_atomic_or_zero(
+            &self.combine,
+            MoeAlltoallKernelInput {
+                max_send_rows: max_recv_rows,
+                max_recv_rows: max_send_rows,
+            },
+            max_tokens_per_rank == 0,
+            ev,
+        );
+        eval_atomic_or_zero(
+            &self.combine_reduce,
+            ElementwiseKernelInput {
+                num_tokens: max_tokens_per_rank,
+            },
+            max_tokens_per_rank == 0,
             ev,
         );
         for group in &batch.groups {
@@ -787,16 +1090,6 @@ impl Glm52SparseBody {
                 &VllmGlm52SharedExpertLocalWorkletInput {
                     batch_tokens: group.batch_tokens,
                 },
-                ev,
-            );
-        }
-        for group in &batch.groups {
-            eval_atomic_or_zero(
-                &self.finalization,
-                ElementwiseKernelInput {
-                    num_tokens: group.batch_tokens,
-                },
-                group.batch_tokens == 0,
                 ev,
             );
         }
@@ -1378,6 +1671,49 @@ where
     ev.push(metrics, || input.clone().into());
 }
 
+/// This EP rank's share of the global `(token, expert)` selections, apportioned
+/// by its own popularity shard. Same expression the expert worklet uses, so the
+/// row counts of `expandInputRows`, the grouped GEMMs and `finalizeMoeRouting`
+/// cannot drift apart.
+/// Expected distinct destination ranks one token reaches.
+///
+/// A token picks `top_k` distinct slots out of `slot_count`; a rank owns
+/// `slot_count / ep_size` of them and is missed only when all `top_k` picks fall
+/// outside its shard. For GLM-5.2 (ep 8, top-8, 256 slots) that is 5.29 of 8 —
+/// so a rank sends ~5.3 rows per token, not 8, and not 1.
+///
+/// This must stay the same formula the profiling runner uses to size its
+/// dispatch send buffer (`_destinations_per_token` in
+/// `profiling/runners/moe/flashinfer_mnnvl_alltoall.py`); the two are the model
+/// and the measurement of one quantity.
+fn destinations_per_token(ep_size: u32, top_k: u32, slot_count: u32) -> f64 {
+    let experts_per_rank = slot_count / ep_size;
+    let mut miss = 1.0_f64;
+    for i in 0..top_k {
+        let remaining_outside = i64::from(slot_count) - i64::from(experts_per_rank) - i64::from(i);
+        if remaining_outside <= 0 {
+            return f64::from(ep_size);
+        }
+        miss *= remaining_outside as f64 / f64::from(slot_count - i);
+    }
+    f64::from(ep_size) * (1.0 - miss)
+}
+
+/// Wire rows for `tokens` tokens at `rows_per_token`, never rounding a live
+/// transfer down to nothing.
+fn rows_from_tokens(tokens: u32, rows_per_token: f64) -> u32 {
+    if tokens == 0 {
+        return 0;
+    }
+    ((f64::from(tokens) * rows_per_token).round() as u32).max(1)
+}
+
+fn rows_for_rank(global_expert_selections: u32, local_ppm: &[u32]) -> u32 {
+    RoutingDistribution::to_per_expert_counts(global_expert_selections, local_ppm)
+        .into_iter()
+        .sum()
+}
+
 fn eval_expert_or_zero(
     expert: &MoeExpertComputeLocalWorklet,
     global_expert_selections: u32,
@@ -1420,6 +1756,7 @@ fn expected_slot_count(ep_size: u16, fp8: bool, mtp_mode: Glm52MtpMode) -> usize
     let sparse_shared = ep
         * (attn_shared_slots
             + ROUTER_SLOTS
+            + EXPAND_INPUT_ROWS_SLOTS
             + expert_slots
             + shared_expert_slots
             + FINALIZE_SLOTS)
@@ -1465,6 +1802,68 @@ mod tests {
     use super::*;
     use crate::arch::contract::ArchGroupInput;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_token_reaches_fewer_ranks_than_it_picks_experts() {
+        // GLM-5.2: 8 picks out of 256 slots over 8 ranks collide often enough
+        // that a token crosses the wire ~5.3 times, not 8. Using top_k here
+        // would over-count the transfer by 1.5x.
+        let glm = destinations_per_token(8, ROUTER_TOP_K, NUM_EXPERTS);
+        assert!(
+            (glm - 5.2947).abs() < 1e-3,
+            "expected ~5.2947 destinations per token, got {glm}"
+        );
+        assert!(glm < f64::from(ROUTER_TOP_K));
+
+        // The two degenerate ends are exact, not approximated.
+        assert_eq!(destinations_per_token(8, 1, 256), 1.0);
+        assert_eq!(destinations_per_token(8, 256, 256), 8.0);
+        // Wider groups fan out further at the same top_k.
+        assert!(destinations_per_token(16, 8, 256) > destinations_per_token(4, 8, 256));
+    }
+
+    #[test]
+    fn a_live_transfer_never_rounds_down_to_no_rows() {
+        assert_eq!(rows_from_tokens(0, 5.29), 0);
+        // One token still crosses the wire even if the rate rounds below 1.
+        assert_eq!(rows_from_tokens(1, 0.4), 1);
+        assert_eq!(rows_from_tokens(1_024, 5.2947), 5_422);
+    }
+
+    #[test]
+    fn the_two_transfer_axes_agree_on_a_balanced_batch_and_split_on_a_skewed_one() {
+        // Balanced: `ep_size` DP groups of equal size against a uniform
+        // popularity shard must land on the diagonal, because every row one rank
+        // sends is a row another rank receives and nothing breaks the symmetry.
+        let ep_size = 8_u32;
+        let tokens_per_group = 1_024_u32;
+        let rows_per_token = destinations_per_token(ep_size, ROUTER_TOP_K, NUM_EXPERTS);
+        let send = rows_from_tokens(tokens_per_group, rows_per_token);
+
+        let selections = tokens_per_group * ep_size * ROUTER_TOP_K;
+        let uniform_ppm = vec![1_000_000 / NUM_EXPERTS; (NUM_EXPERTS / ep_size) as usize];
+        let recv = rows_from_tokens(
+            rows_for_rank(selections, &uniform_ppm),
+            rows_per_token / f64::from(ROUTER_TOP_K),
+        );
+        let drift = (f64::from(send) - f64::from(recv)).abs() / f64::from(send);
+        assert!(drift < 0.01, "balanced batch should be on the diagonal: {send} vs {recv}");
+
+        // A hot shard pulls the receive side up without touching the send side.
+        let mut skewed_ppm = uniform_ppm.clone();
+        skewed_ppm[0] *= 4;
+        let skewed_recv = rows_from_tokens(
+            rows_for_rank(selections, &skewed_ppm),
+            rows_per_token / f64::from(ROUTER_TOP_K),
+        );
+        assert!(
+            skewed_recv > recv,
+            "a hotter shard must receive more rows: {skewed_recv} vs {recv}"
+        );
+        // ...and the pair stays inside what conservation allows, which is what
+        // the kernel's `infeasible_mask` strips from the grid.
+        assert!(f64::from(skewed_recv) <= f64::from(send) * f64::from(ep_size));
+    }
 
     fn exact_json_value() -> serde_json::Value {
         let full: Vec<&str> = (0..NUM_LAYERS)
@@ -1571,9 +1970,13 @@ mod tests {
             skewed.moe_expert_compute[0].local_ppm,
             uniform.moe_expert_compute[0].local_ppm
         );
-        // The skew must NOT leak into the dispatch/combine byte model's own
-        // copy of the distribution being the only place it lands.
-        assert_eq!(skewed.moe_dispatch.routing.ppm().len(), NUM_EXPERTS as usize);
+        // The transfer leaf is profiled under uniform routing and keyed by shape
+        // alone, so the skew must be invisible there — it lands on the expert
+        // and finalize shards, which is where the measured asymmetry actually
+        // shows up.
+        assert_eq!(skewed.moe_dispatch, uniform.moe_dispatch);
+        assert_eq!(skewed.moe_combine, uniform.moe_combine);
+        assert_eq!(skewed.moe_dispatch_prepare, uniform.moe_dispatch_prepare);
     }
 
     #[test]
@@ -1619,12 +2022,21 @@ mod tests {
         );
         assert_eq!(cfg.moe_expert_compute[0].dtype, DType::Bf16);
         assert_eq!(cfg.moe_expert_compute[0].grouped_gemm_backends, vec!["torch"]);
-        assert_eq!(cfg.moe_dispatch.backends, vec!["nccl"]);
-        assert_eq!(cfg.moe_combine.backends, vec!["nccl"]);
-        assert_eq!(cfg.moe_dispatch.dtype, DType::Bf16);
-        assert_eq!(cfg.moe_combine.dtype, DType::Bf16);
-        assert_eq!(cfg.moe_dispatch.net_params().hidden_bytes, HIDDEN_DIM * 2);
-        assert_eq!(cfg.moe_combine.net_params().hidden_bytes, HIDDEN_DIM * 2);
+        // The transfer is the profiled flashinfer MNNVL all-to-all, keyed by the
+        // bf16 wire width vLLM actually sends (quantisation is deferred past it).
+        assert_eq!(cfg.moe_dispatch.backends, vec!["flashinfer_mnnvl"]);
+        assert_eq!(cfg.moe_combine.backends, vec!["flashinfer_mnnvl"]);
+        assert_eq!(cfg.moe_dispatch.direction, MoeAlltoallDirection::Dispatch);
+        assert_eq!(cfg.moe_combine.direction, MoeAlltoallDirection::Combine);
+        assert_eq!(cfg.moe_dispatch.hidden_bytes.get(), HIDDEN_DIM * 2);
+        assert_eq!(cfg.moe_combine.hidden_bytes.get(), HIDDEN_DIM * 2);
+        assert_eq!(cfg.moe_dispatch.ep_size, 8);
+        assert_eq!(cfg.moe_dispatch.top_k, ROUTER_TOP_K);
+        // No EPLB redundancy: one slot per expert.
+        assert_eq!(cfg.moe_dispatch.slot_count, NUM_EXPERTS);
+        assert_eq!(cfg.moe_dispatch_prepare.backends, vec!["flashinfer_mnnvl"]);
+        assert_eq!(cfg.moe_dispatch_prepare.ep_size, 8);
+        assert_eq!(cfg.moe_dispatch_prepare.slot_count, NUM_EXPERTS);
         assert_eq!(cfg.sparse_router.base_dtype, DType::Bf16);
         assert_eq!(cfg.sparse_router.router_semantic_dtype, DType::Fp32);
         assert_eq!(cfg.shared_expert.dtype, DType::Bf16);
@@ -1632,13 +2044,24 @@ mod tests {
         assert_eq!(cfg.final_norm.dtype, DType::Bf16);
         assert_eq!(cfg.lm_head.dtype, DType::Bf16);
         assert_eq!(cfg.lm_head.backends, vec!["torch_linear"]);
-        assert_eq!(cfg.moe_dispatch.placement, Placement::RoundRobin);
-        assert_eq!(cfg.moe_dispatch.intra_fabric, Fabric::Nvlink);
-        assert_eq!(cfg.moe_dispatch.inter_fabric, Fabric::Infiniband);
+        assert_eq!(cfg.moe_dispatch.fabric, Fabric::Nvlink);
+        assert_eq!(cfg.moe_combine.fabric, Fabric::Nvlink);
+        assert_eq!(cfg.moe_dispatch_prepare.fabric, Fabric::Nvlink);
         assert_eq!(cfg.embedding.input_bytes_per_token, 12_296);
         assert_eq!(cfg.embedding.output_bytes_per_token, 12_288);
-        assert_eq!(cfg.sparse_finalization.input_bytes_per_token, 110_592);
-        assert_eq!(cfg.sparse_finalization.output_bytes_per_token, 12_288);
+        // Finalize-routing is the profiled TensorRT-LLM kernel, one config per
+        // EP rank carrying that rank's popularity shard.
+        assert_eq!(cfg.sparse_finalization.len(), 8);
+        assert_eq!(cfg.sparse_finalization[0].num_experts_per_rank, 32);
+        assert_eq!(cfg.sparse_finalization[0].local_ppm.len(), 32);
+        assert_eq!(cfg.sparse_finalization[0].dtype, DType::Bf16);
+        assert_eq!(
+            cfg.sparse_finalization[0].local_ppm,
+            cfg.moe_expert_compute[0].local_ppm
+        );
+        // One row in, one row out — the gather that feeds the grouped GEMM.
+        assert_eq!(cfg.moe_expand_input_rows.input_bytes_per_token, 12_288);
+        assert_eq!(cfg.moe_expand_input_rows.output_bytes_per_token, 12_288);
         assert_eq!(cfg.lm_head.n, VOCAB_SIZE);
         assert_eq!(cfg.lm_head.k, HIDDEN_DIM);
         assert!(cfg.mtp_prelude.is_some());
@@ -1663,12 +2086,15 @@ mod tests {
             cfg.moe_expert_compute[0].fp8_grouped_gemm_backends,
             vec!["flashinfer_trtllm"]
         );
-        assert_eq!(cfg.moe_dispatch.backends, vec!["nvshmem"]);
-        assert_eq!(cfg.moe_combine.backends, vec!["nvshmem"]);
-        assert_eq!(cfg.moe_dispatch.dtype, DType::Fp8E4m3);
-        assert_eq!(cfg.moe_combine.dtype, DType::Fp8E4m3);
-        assert_eq!(cfg.moe_dispatch.net_params().hidden_bytes, HIDDEN_DIM);
-        assert_eq!(cfg.moe_combine.net_params().hidden_bytes, HIDDEN_DIM);
+        // fp8 expert weights do NOT make the all-to-all payload fp8: vLLM's
+        // flashinfer two-sided path defers the activation quant until after the
+        // transfer, so the wire stays bf16 no matter how the experts are stored
+        // — and the transfer therefore keeps the same backend and the same key
+        // as the bf16 deployment.
+        assert_eq!(cfg.moe_dispatch.backends, vec!["flashinfer_mnnvl"]);
+        assert_eq!(cfg.moe_combine.backends, vec!["flashinfer_mnnvl"]);
+        assert_eq!(cfg.moe_dispatch.hidden_bytes.get(), HIDDEN_DIM * 2);
+        assert_eq!(cfg.moe_combine.hidden_bytes.get(), HIDDEN_DIM * 2);
 
         for attention in [
             &cfg.dense_full_index_attention,
@@ -1705,8 +2131,10 @@ mod tests {
         assert_eq!(resolved.shared_expert.gate_up_proj.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.shared_expert.down_proj.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.shared_expert.silu_and_mul.input_bytes_per_token, 2 * MOE_INTERMEDIATE_DIM * 2);
-        assert_eq!(resolved.lm_head.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.lm_head.backends, vec!["deepgemm"]);
+        // lm_head stays BF16 even under `fp8`: the checkpoint's
+        // `modules_to_not_convert` excludes it, so it never reaches the FP8 GEMM.
+        assert_eq!(resolved.lm_head.dtype, DType::Bf16);
+        assert_eq!(resolved.lm_head.backends, vec!["torch_linear"]);
         assert_eq!(resolved.dense_full_index_attention.fused_qkv_a_proj.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.dense_full_index_attention.q_b_proj.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.dense_full_index_attention.o_proj.dtype, DType::Fp8E4m3);
@@ -1860,36 +2288,58 @@ mod tests {
         assert_eq!(78 - FULL_INDEX_LAYERS.len(), 57);
         // BF16 counts match the native graph exactly: with no FP8 GEMM there
         // is nothing to quantise, so this graph adds no leaves.
-        assert_eq!(expected_slot_count(8, false, Glm52MtpMode::Off), 1_026);
-        assert_eq!(expected_slot_count(8, false, Glm52MtpMode::FullIndex), 1_424);
-        assert_eq!(expected_slot_count(8, false, Glm52MtpMode::IndexShare), 1_304);
+        // Each sparse-layer variant carries two leaves the native graph has no
+        // equivalent of: combine's zero fill and its top-k reduction, split out
+        // of the profiled transfer so that leaf's cache stays two-dimensional.
+        // Three sparse variants without MTP, four with it.
+        assert_eq!(expected_slot_count(8, false, Glm52MtpMode::Off), 1_041 + 3 * 2);
+        assert_eq!(
+            expected_slot_count(8, false, Glm52MtpMode::FullIndex),
+            1_444 + 4 * 2
+        );
+        assert_eq!(
+            expected_slot_count(8, false, Glm52MtpMode::IndexShare),
+            1_324 + 4 * 2
+        );
         // FP8 adds the vLLM activation-quantisation leaves: five per layer
         // variant (attention 3 + FFN 2), plus a sixth on the two variants that
         // run an indexer (its q_proj). That is 22 x ep = 176 more than the
         // native graph's 1_074. See `doc/alignment/glm52_dp8_ep8_report.md`
         // section 4.3, which decodes each measured launch by its GEMM shape.
-        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::Off), 1_074 + 176);
-        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::FullIndex), 1_488 + 224);
-        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::IndexShare), 1_368 + 216);
+        assert_eq!(
+            expected_slot_count(8, true, Glm52MtpMode::Off),
+            1_074 + 176 + 15 + 3 * 2
+        );
+        assert_eq!(
+            expected_slot_count(8, true, Glm52MtpMode::FullIndex),
+            1_488 + 224 + 20 + 4 * 2
+        );
+        assert_eq!(
+            expected_slot_count(8, true, Glm52MtpMode::IndexShare),
+            1_368 + 216 + 20 + 4 * 2
+        );
         for ep in [1_u16, 2, 4, 8, 16] {
             let ep = usize::from(ep);
-            assert_eq!(expected_slot_count(ep as u16, false, Glm52MtpMode::Off), 126 * ep + 18);
-            assert_eq!(expected_slot_count(ep as u16, true, Glm52MtpMode::Off), 154 * ep + 18);
+            // The `+ 15` / `+ 20` are the rank-independent collectives: each
+            // sparse variant contributes `DISPATCH_SLOTS + COMBINE_SLOTS` = 5,
+            // over three variants without MTP and four with it.
+            assert_eq!(expected_slot_count(ep as u16, false, Glm52MtpMode::Off), 129 * ep + 15);
+            assert_eq!(expected_slot_count(ep as u16, true, Glm52MtpMode::Off), 157 * ep + 15);
             assert_eq!(
                 expected_slot_count(ep as u16, false, Glm52MtpMode::FullIndex),
-                175 * ep + 24
+                179 * ep + 20
             );
             assert_eq!(
                 expected_slot_count(ep as u16, true, Glm52MtpMode::FullIndex),
-                211 * ep + 24
+                215 * ep + 20
             );
             assert_eq!(
                 expected_slot_count(ep as u16, false, Glm52MtpMode::IndexShare),
-                160 * ep + 24
+                164 * ep + 20
             );
             assert_eq!(
                 expected_slot_count(ep as u16, true, Glm52MtpMode::IndexShare),
-                195 * ep + 24
+                199 * ep + 20
             );
         }
     }
@@ -1947,9 +2397,9 @@ mod tests {
     #[test]
     fn every_l4_max_has_a_unique_semantic_manifest_label_in_every_mtp_mode() {
         for (mode, expected_slots, expected_maxes) in [
-            (Glm52MtpMode::Off, 1_026, 20),
-            (Glm52MtpMode::FullIndex, 1_424, 27),
-            (Glm52MtpMode::IndexShare, 1_304, 27),
+            (Glm52MtpMode::Off, 1_041 + 3 * 2, 20),
+            (Glm52MtpMode::FullIndex, 1_444 + 4 * 2, 27),
+            (Glm52MtpMode::IndexShare, 1_324 + 4 * 2, 27),
         ] {
             let manifest = compile_max_label_inventory(mode);
             let max_labels: Vec<&str> = manifest
@@ -2216,7 +2666,7 @@ mod tests {
         assert_eq!(cfg.parallel.ep_size, 8);
         assert_eq!(cfg.dense_full_index_attention.num_attention_heads, 64);
         assert_eq!(cfg.dense_full_index_attention.num_kv_heads, 1);
-        assert_eq!(cfg.moe_dispatch.placement, Placement::RoundRobin);
+        assert_eq!(cfg.moe_dispatch.ep_size, 8);
         for forbidden in [
             "all_reduce",
             "sampler",

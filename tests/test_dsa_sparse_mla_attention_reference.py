@@ -5,6 +5,7 @@ import math
 import subprocess
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,6 +16,12 @@ import profiling.runners.attention.dsa_sparse_mla_attention_reference as referen
 from profiling.runners.attention.dsa_sparse_mla_attention_reference import (
     dsa_sparse_mla_attention_reference,
 )
+
+# The subprocess must import `profiling` the way a caller outside pytest would:
+# from the checkout root, not from whatever directory the test happens to run
+# in. This was a hardcoded `/workspace`, which only exists in the container the
+# test was written in.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 _SCORE_DIM = 576
 _VALUE_DIM = 512
@@ -530,7 +537,7 @@ print(json.dumps({
         check=True,
         capture_output=True,
         text=True,
-        cwd="/workspace",
+        cwd=_REPO_ROOT,
     )
     evidence = json.loads(completed.stdout)
 

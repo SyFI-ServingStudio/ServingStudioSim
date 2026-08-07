@@ -21,8 +21,8 @@ use std::sync::Arc;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, Fp8BlockQuantKernel,
-    Fp8BlockQuantKernelConfig, Fp8BlockQuantKernelInput, SingleGemmKernel,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, Fp8PerTokenGroupQuantKernel,
+    Fp8PerTokenGroupQuantKernelConfig, Fp8PerTokenGroupQuantKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
@@ -65,10 +65,10 @@ pub struct VllmGlm52SharedExpertLocalWorkletConfig {
 #[derive(Clone, Debug)]
 pub struct VllmGlm52SharedExpertLocalWorkletResolved {
     pub raw_cfg: VllmGlm52SharedExpertLocalWorkletConfig,
-    pub gate_up_input_quant: Option<Fp8BlockQuantKernelConfig>,
+    pub gate_up_input_quant: Option<Fp8PerTokenGroupQuantKernelConfig>,
     pub gate_up_proj: SingleGemmKernelConfig,
     pub silu_and_mul: ElementwiseKernelConfig,
-    pub down_input_quant: Option<Fp8BlockQuantKernelConfig>,
+    pub down_input_quant: Option<Fp8PerTokenGroupQuantKernelConfig>,
     pub down_proj: SingleGemmKernelConfig,
 }
 
@@ -79,10 +79,10 @@ pub struct VllmGlm52SharedExpertLocalWorkletInput {
 
 pub struct VllmGlm52SharedExpertLocalWorklet {
     pub name: String,
-    pub gate_up_input_quant: Option<Op<Fp8BlockQuantKernel>>,
+    pub gate_up_input_quant: Option<Op<Fp8PerTokenGroupQuantKernel>>,
     pub gate_up_proj: Op<SingleGemmKernel>,
     pub silu_and_mul: Op<ElementwiseKernel>,
-    pub down_input_quant: Option<Op<Fp8BlockQuantKernel>>,
+    pub down_input_quant: Option<Op<Fp8PerTokenGroupQuantKernel>>,
     pub down_proj: Op<SingleGemmKernel>,
     resolved: VllmGlm52SharedExpertLocalWorkletResolved,
 }
@@ -116,15 +116,21 @@ impl VllmGlm52SharedExpertLocalWorklet {
         .expect("validated GLM-5.2 shared SiLU output byte rate must fit u32");
 
         // vLLM quantises the activation once per dense FP8 GEMM: the hidden
-        // row feeding gate_up, then the SiLU output feeding down. A dense
-        // projection is one problem, unlike the routed grouped GEMM.
+        // row feeding gate_up, then the SiLU output feeding down.
+        //
+        // The dense path runs vLLM's own `per_token_group_quant_8bit_kernel`,
+        // NOT the TensorRT-LLM `scale_1x128_kernel` that the routed grouped
+        // GEMM uses -- the nsys trace shows both kernels side by side in the
+        // same iteration. Pricing this leaf off the routed curve over-predicted
+        // it by ~2.05x at prefill and ~40% at decode.
         let quant_config = |hidden_size: Dim| {
-            (cfg.gemm_dtype == DType::Fp8E4m3).then(|| Fp8BlockQuantKernelConfig {
+            (cfg.gemm_dtype == DType::Fp8E4m3).then(|| Fp8PerTokenGroupQuantKernelConfig {
                 backends: cfg.fp8_quant_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 hidden_size,
-                num_problems: Dim::from(1),
+                group_size: 128,
                 input_dtype: cfg.dtype,
+                scale_format: "ue8m0_column_major".to_string(),
             })
         };
 
@@ -168,7 +174,7 @@ impl VllmGlm52SharedExpertLocalWorklet {
                     &name,
                     "gate_up_input_quant",
                     config,
-                    Fp8BlockQuantKernel::build,
+                    Fp8PerTokenGroupQuantKernel::build,
                     bridge,
                 )
             })
@@ -195,7 +201,7 @@ impl VllmGlm52SharedExpertLocalWorklet {
                     &name,
                     "down_input_quant",
                     config,
-                    Fp8BlockQuantKernel::build,
+                    Fp8PerTokenGroupQuantKernel::build,
                     bridge,
                 )
             })
@@ -260,7 +266,7 @@ impl VllmGlm52SharedExpertLocalWorklet {
 struct WorkInputs {
     /// Both quant leaves take the same row count; only the config's
     /// `hidden_size` differs.
-    input_quant: Fp8BlockQuantKernelInput,
+    input_quant: Fp8PerTokenGroupQuantKernelInput,
     gate_up_proj: SingleGemmKernelInput,
     silu_and_mul: ElementwiseKernelInput,
     down_proj: SingleGemmKernelInput,
@@ -308,7 +314,7 @@ fn checked_product(name: &str, factors: &[u32]) -> Result<u32, String> {
 
 fn work_inputs(batch_tokens: u32) -> WorkInputs {
     WorkInputs {
-        input_quant: Fp8BlockQuantKernelInput {
+        input_quant: Fp8PerTokenGroupQuantKernelInput {
             num_tokens: batch_tokens,
         },
         gate_up_proj: SingleGemmKernelInput { m: batch_tokens },

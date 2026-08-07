@@ -124,9 +124,21 @@ def test_grouped_launch_policy_selects_binary_search_only_for_small_m():
 def test_missing_flashinfer_jit_is_typed(monkeypatch):
     from profiling.runners.elementwise import fp8_block_quant as runner
 
-    monkeypatch.setitem(sys.modules, "flashinfer", None)
-    with pytest.raises(runner.ProfilerNotImplemented, match="FlashInfer"):
-        runner._load_flashinfer_grouped_quantizer()
+    # Blanking the top-level package alone is not enough to simulate a wheel
+    # without JIT support: `from flashinfer.jit import env` is served straight
+    # out of `sys.modules["flashinfer.jit"]` when some earlier test in the
+    # session already imported it, never consulting the `None` parent. Blank
+    # every module the loader actually names, and drop the memoized success a
+    # previous caller may have left behind, so the test states its condition
+    # rather than depending on what ran before it.
+    for module_name in ("flashinfer", "flashinfer.jit", "flashinfer.jit.core"):
+        monkeypatch.setitem(sys.modules, module_name, None)
+    runner._load_flashinfer_grouped_quantizer.cache_clear()
+    try:
+        with pytest.raises(runner.ProfilerNotImplemented, match="FlashInfer"):
+            runner._load_flashinfer_grouped_quantizer()
+    finally:
+        runner._load_flashinfer_grouped_quantizer.cache_clear()
 
 
 def test_profile_calls_exact_flashinfer_binding_and_reports_logical_bytes(monkeypatch):

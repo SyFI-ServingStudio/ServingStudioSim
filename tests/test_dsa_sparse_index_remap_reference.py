@@ -773,7 +773,7 @@ print(json.dumps({
 }))
 """
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = "/workspace"
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     completed = subprocess.run(
         [sys.executable, "-c", script],

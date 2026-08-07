@@ -590,8 +590,19 @@ fn elementwise_configs(cfg: &DsaIndexerConfig) -> Result<ElementwiseConfigs, Bui
     let fp32_weight = cfg.weight_dtype.size_bytes();
 
     let k_layernorm = checked_product("k_layernorm bytes", &[head_dim, bf16])?;
+    // The indexer RoPE leaf is not rope-slice sized: torch.compile fuses the
+    // `torch.cat` that rebuilds q and k right after it (vllm deepseek_v2.py
+    // :713-726), which is why the traced kernel is named
+    // `triton_poi_fused_add_cat_index_select_mul_slice_split_split_with_sizes_stack_...`.
+    // Both halves of q are read and the full q is written back, so the kernel
+    // moves head_dim per head, not rope_dim. Charging rope_dim alone put this
+    // leaf at -41% on decode.
     let rope_heads = checked_add("rope head count", model_heads, 1)?;
-    let rope = checked_product("rope bytes", &[rope_heads, rope_dim, bf16])?;
+    let rope_qk = checked_product("rope q/k bytes", &[rope_heads, head_dim, bf16])?;
+    // cos/sin gathered by index_select, one pair per rope element.
+    let rope_table = checked_product("rope cos/sin bytes", &[rope_dim, 2, bf16])?;
+    let rope_input = checked_add("rope input bytes", rope_qk, rope_table)?;
+    let rope_output = rope_qk;
     let q_quant_input = checked_product("q_quant input bytes", &[model_heads, head_dim, bf16])?;
     let q_quant_per_head = checked_add(
         "q_quant output bytes per head",
@@ -638,7 +649,7 @@ fn elementwise_configs(cfg: &DsaIndexerConfig) -> Result<ElementwiseConfigs, Bui
     };
     Ok(ElementwiseConfigs {
         k_layernorm: make(k_layernorm, k_layernorm),
-        rope: make(rope, rope),
+        rope: make(rope_input, rope_output),
         q_quant: make(q_quant_input, q_quant_output),
         weight_scale: make(weight_scale_input, weight_scale_output),
         topk_buffer_fill: make(0, topk_bytes),
@@ -902,7 +913,9 @@ mod tests {
             )
         };
         assert_eq!(bytes(&e.k_layernorm), (256, 256));
-        assert_eq!(bytes(&e.rope), (4_224, 4_224));
+        // Fused with the `torch.cat` that rebuilds q/k, so it moves head_dim
+        // per head (33 * 128 * 2 = 8448) plus the gathered cos/sin table.
+        assert_eq!(bytes(&e.rope), (8_704, 8_448));
         assert_eq!(bytes(&e.q_quant), (8_192, 4_224));
         assert_eq!(bytes(&e.weight_scale), (192, 128));
         assert_eq!(bytes(&e.topk_buffer_fill), (0, 8_192));

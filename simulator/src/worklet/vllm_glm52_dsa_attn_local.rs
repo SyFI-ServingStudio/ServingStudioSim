@@ -28,11 +28,12 @@ use crate::op::attention::{
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, ElementwiseKernel,
-    ElementwiseKernelConfig, ElementwiseKernelInput, Fp8BlockQuantKernel,
-    Fp8BlockQuantKernelConfig, Fp8BlockQuantKernelInput, ResidualRmsNormKernel,
+    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput,
+    Fp8PerTokenGroupQuantKernel,
+    Fp8PerTokenGroupQuantKernelConfig, Fp8PerTokenGroupQuantKernelInput, ResidualRmsNormKernel,
     ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig,
     RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    VllmMlaRopeKernel, VllmMlaRopeKernelConfig, VllmMlaRopeKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
@@ -103,7 +104,11 @@ pub struct VllmGlm52DsaAttnLocalWorkletConfig {
     pub residual_rms_norm_backends: Vec<&'static str>,
     pub rms_norm_backends: Vec<&'static str>,
     pub single_gemm_backends: Vec<&'static str>,
-    pub elementwise_backends: Vec<&'static str>,
+    /// Backend for the inductor-fused query RoPE -- the worklet's only
+    /// pointwise leaf, and not an `elementwise` one: it is a compiled vLLM
+    /// fusion that rewrites all of q, not a streaming kernel over the rope
+    /// slice. The indexer and sparse-MLA ops keep their own roles below.
+    pub main_rope_backends: Vec<&'static str>,
     pub q_absorb_backends: Vec<&'static str>,
     pub v_up_backends: Vec<&'static str>,
     pub indexer_gemm_backends: Vec<&'static str>,
@@ -130,6 +135,11 @@ pub struct VllmGlm52DsaAttnLocalWorkletConfig {
     pub index_head_dim: Dim,
     pub selected_k: u32,
     pub max_model_len: Dim,
+    /// Row count of the RoPE cos/sin table, i.e. the checkpoint's
+    /// `max_position_embeddings` -- NOT the runtime `max_model_len`. vLLM
+    /// builds the table from the model config at `deepseek_v2.py:503`, so a
+    /// shorter serving context does not shrink it.
+    pub rope_max_position: Dim,
     pub logits_row_stride: Dim,
     pub cache_block_size: u32,
     pub quant_block_size: u32,
@@ -149,6 +159,9 @@ pub struct VllmGlm52DsaAttnLocalWorkletConfig {
     pub index_prefill_span_mode: String,
     pub index_decode_context_mode: String,
     pub index_decode_page_mapping: String,
+    /// GLM-5.2 rotates the MLA query half-and-half (GPT-J style), so this is
+    /// `false`; vLLM passes the same literal at `deepseek_v2.py:505`.
+    pub rope_is_neox_style: bool,
     pub index_clean_logits: bool,
     pub sparse_index_distribution: String,
     pub sparse_cache_layout: String,
@@ -163,22 +176,22 @@ pub struct VllmGlm52DsaAttnLocalWorkletResolved {
     pub raw_cfg: VllmGlm52DsaAttnLocalWorkletConfig,
     pub input_add_rms_norm: ResidualRmsNormKernelConfig,
     /// `Some` exactly when `gemm_dtype` is FP8.
-    pub fused_qkv_a_proj_input_quant: Option<Fp8BlockQuantKernelConfig>,
+    pub fused_qkv_a_proj_input_quant: Option<Fp8PerTokenGroupQuantKernelConfig>,
     pub fused_qkv_a_proj: SingleGemmKernelConfig,
     pub q_a_rms_norm: RmsNormKernelConfig,
     /// `Some` exactly when `gemm_dtype` is FP8.
-    pub q_b_proj_input_quant: Option<Fp8BlockQuantKernelConfig>,
+    pub q_b_proj_input_quant: Option<Fp8PerTokenGroupQuantKernelConfig>,
     pub q_b_proj: SingleGemmKernelConfig,
     pub kv_a_rms_norm: RmsNormKernelConfig,
-    pub main_rope: ElementwiseKernelConfig,
+    pub main_rope: VllmMlaRopeKernelConfig,
     /// `Some` only when this layer runs an indexer AND `gemm_dtype` is FP8.
-    pub indexer_q_proj_input_quant: Option<Fp8BlockQuantKernelConfig>,
+    pub indexer_q_proj_input_quant: Option<Fp8PerTokenGroupQuantKernelConfig>,
     pub indexer: Option<DsaIndexerConfig>,
     pub q_absorb: BatchedGemmKernelConfig,
     pub sparse_mla: DsaSparseMlaAttentionConfig,
     pub v_up: BatchedGemmKernelConfig,
     /// `Some` exactly when `gemm_dtype` is FP8.
-    pub o_proj_input_quant: Option<Fp8BlockQuantKernelConfig>,
+    pub o_proj_input_quant: Option<Fp8PerTokenGroupQuantKernelConfig>,
     pub o_proj: SingleGemmKernelConfig,
 }
 
@@ -199,19 +212,19 @@ pub struct VllmGlm52DsaAttnLocalWorkletInput {
 pub struct VllmGlm52DsaAttnLocalWorklet {
     pub name: String,
     pub input_add_rms_norm: Op<ResidualRmsNormKernel>,
-    pub fused_qkv_a_proj_input_quant: Option<Op<Fp8BlockQuantKernel>>,
+    pub fused_qkv_a_proj_input_quant: Option<Op<Fp8PerTokenGroupQuantKernel>>,
     pub fused_qkv_a_proj: Op<SingleGemmKernel>,
     pub q_a_rms_norm: Op<RmsNormKernel>,
-    pub q_b_proj_input_quant: Option<Op<Fp8BlockQuantKernel>>,
+    pub q_b_proj_input_quant: Option<Op<Fp8PerTokenGroupQuantKernel>>,
     pub q_b_proj: Op<SingleGemmKernel>,
     pub kv_a_rms_norm: Op<RmsNormKernel>,
-    pub main_rope: Op<ElementwiseKernel>,
-    pub indexer_q_proj_input_quant: Option<Op<Fp8BlockQuantKernel>>,
+    pub main_rope: Op<VllmMlaRopeKernel>,
+    pub indexer_q_proj_input_quant: Option<Op<Fp8PerTokenGroupQuantKernel>>,
     pub indexer: Option<DsaIndexerOp>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub sparse_mla: DsaSparseMlaAttentionOp,
     pub v_up: Op<BatchedGemmKernel>,
-    pub o_proj_input_quant: Option<Op<Fp8BlockQuantKernel>>,
+    pub o_proj_input_quant: Option<Op<Fp8PerTokenGroupQuantKernel>>,
     pub o_proj: Op<SingleGemmKernel>,
     resolved: VllmGlm52DsaAttnLocalWorkletResolved,
 }
@@ -229,9 +242,6 @@ impl VllmGlm52DsaAttnLocalWorklet {
             cfg.q_lora_rank.clone() + cfg.kv_lora_rank.clone() + cfg.rope_dim.clone();
         let q_b_n =
             cfg.num_attention_heads.clone() * (cfg.qk_nope_head_dim.clone() + cfg.rope_dim.clone());
-        let main_rope_bytes = (cfg.num_attention_heads.clone() + cfg.num_kv_heads.clone())
-            * cfg.rope_dim.clone()
-            * cfg.base_dtype.size_bytes();
 
         let indexer = cfg.include_indexer.then(|| DsaIndexerConfig {
             gemm_backends: cfg.indexer_gemm_backends.clone(),
@@ -271,27 +281,23 @@ impl VllmGlm52DsaAttnLocalWorklet {
         });
 
         // One activation quantisation per dense FP8 GEMM, keyed by that GEMM's
-
-        // K axis (the row width being quantised). A dense projection is one
-
-        // problem, unlike a routed grouped GEMM.
-
+        // K axis (the row width being quantised).
+        //
+        // vLLM's dense linears call `per_token_group_quant_8bit_kernel`, its own
+        // CUDA kernel; only the routed grouped GEMM reaches TensorRT-LLM's
+        // `scale_1x128_kernel`. The nsys trace shows both in one iteration, so
+        // this is a kernel-identity split, not a shape difference: pricing the
+        // dense leaves off the routed curve made them ~2.05x too slow at
+        // prefill (o_proj alone +27.5 ms) and ~40% too slow at decode.
         let quant_config = |hidden_size: Dim| {
-
-            (cfg.gemm_dtype == DType::Fp8E4m3).then(|| Fp8BlockQuantKernelConfig {
-
+            (cfg.gemm_dtype == DType::Fp8E4m3).then(|| Fp8PerTokenGroupQuantKernelConfig {
                 backends: cfg.fp8_quant_backends.clone(),
-
                 gpu_name: cfg.gpu_name.clone(),
-
                 hidden_size,
-
-                num_problems: Dim::from(1),
-
+                group_size: 128,
                 input_dtype: cfg.base_dtype,
-
+                scale_format: "ue8m0_column_major".to_string(),
             })
-
         };
 
 
@@ -330,11 +336,20 @@ impl VllmGlm52DsaAttnLocalWorklet {
                 hidden: cfg.kv_lora_rank.clone(),
                 dtype: cfg.base_dtype,
             },
-            main_rope: ElementwiseKernelConfig {
-                backends: cfg.elementwise_backends.clone(),
+            // Not an elementwise leaf: vLLM feeds the rope-mutated q back
+            // into `self.attn`, so functionalized inductor materialises a whole
+            // new q and the fused kernel reads and writes all
+            // `qk_nope + rope` columns to change the rope ones. Pricing it as
+            // rope-sized streaming bytes made it 74% too fast at prefill.
+            main_rope: VllmMlaRopeKernelConfig {
+                backends: cfg.main_rope_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                input_bytes_per_token: main_rope_bytes.clone(),
-                output_bytes_per_token: main_rope_bytes,
+                num_heads: cfg.num_attention_heads.clone(),
+                qk_nope_head_dim: cfg.qk_nope_head_dim.clone(),
+                rope_dim: cfg.rope_dim.clone(),
+                max_position: cfg.rope_max_position.clone(),
+                is_neox_style: cfg.rope_is_neox_style,
+                input_dtype: cfg.base_dtype,
             },
             indexer_q_proj_input_quant: cfg
                 .include_indexer
@@ -409,7 +424,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
                     &name,
                     "fused_qkv_a_proj_input_quant",
                     config,
-                    Fp8BlockQuantKernel::build,
+                    Fp8PerTokenGroupQuantKernel::build,
                     bridge,
                 )
             })
@@ -436,7 +451,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
                     &name,
                     "q_b_proj_input_quant",
                     config,
-                    Fp8BlockQuantKernel::build,
+                    Fp8PerTokenGroupQuantKernel::build,
                     bridge,
                 )
             })
@@ -459,7 +474,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
             &name,
             "main_rope",
             resolved.main_rope.clone(),
-            ElementwiseKernel::build,
+            VllmMlaRopeKernel::build,
             bridge,
         )?;
         let indexer_q_proj_input_quant = resolved
@@ -470,7 +485,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
                     &name,
                     "indexer_q_proj_input_quant",
                     config,
-                    Fp8BlockQuantKernel::build,
+                    Fp8PerTokenGroupQuantKernel::build,
                     bridge,
                 )
             })
@@ -507,7 +522,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
                     &name,
                     "o_proj_input_quant",
                     config,
-                    Fp8BlockQuantKernel::build,
+                    Fp8PerTokenGroupQuantKernel::build,
                     bridge,
                 )
             })
@@ -603,7 +618,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
             ev,
         );
         if let Some(quant) = &self.fused_qkv_a_proj_input_quant {
-            eval_atomic_or_zero(quant, Fp8BlockQuantKernelInput { num_tokens: rows }, rows == 0, ev);
+            eval_atomic_or_zero(quant, Fp8PerTokenGroupQuantKernelInput { num_tokens: rows }, rows == 0, ev);
         }
         eval_atomic_or_zero(
             &self.fused_qkv_a_proj,
@@ -618,7 +633,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
             ev,
         );
         if let Some(quant) = &self.q_b_proj_input_quant {
-            eval_atomic_or_zero(quant, Fp8BlockQuantKernelInput { num_tokens: rows }, rows == 0, ev);
+            eval_atomic_or_zero(quant, Fp8PerTokenGroupQuantKernelInput { num_tokens: rows }, rows == 0, ev);
         }
         eval_atomic_or_zero(
             &self.q_b_proj,
@@ -634,7 +649,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
         );
         eval_atomic_or_zero(
             &self.main_rope,
-            ElementwiseKernelInput { num_tokens: rows },
+            VllmMlaRopeKernelInput { num_tokens: rows },
             rows == 0,
             ev,
         );
@@ -643,7 +658,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
         if let Some(quant) = &self.indexer_q_proj_input_quant {
             eval_atomic_or_zero(
                 quant,
-                Fp8BlockQuantKernelInput { num_tokens: rows },
+                Fp8PerTokenGroupQuantKernelInput { num_tokens: rows },
                 rows == 0,
                 ev,
             );
@@ -680,7 +695,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
             ev,
         );
         if let Some(quant) = &self.o_proj_input_quant {
-            eval_atomic_or_zero(quant, Fp8BlockQuantKernelInput { num_tokens: rows }, rows == 0, ev);
+            eval_atomic_or_zero(quant, Fp8PerTokenGroupQuantKernelInput { num_tokens: rows }, rows == 0, ev);
         }
         eval_atomic_or_zero(
             &self.o_proj,
@@ -965,7 +980,7 @@ mod tests {
             residual_rms_norm_backends: vec!["vllm_cuda"],
             rms_norm_backends: vec!["flashinfer"],
             single_gemm_backends: vec!["torch"],
-            elementwise_backends: vec!["triton"],
+            main_rope_backends: vec!["vllm_inductor"],
             q_absorb_backends: vec!["torch_mla_q_absorb_glm52"],
             v_up_backends: vec!["torch_mla_v_up_glm52"],
             indexer_gemm_backends: vec!["torch_indexer"],
@@ -992,6 +1007,7 @@ mod tests {
             index_head_dim: Dim::param("index_head_dim", 128),
             selected_k: 2048,
             max_model_len: Dim::param("max_model_len", 131072),
+            rope_max_position: Dim::param("max_position_embeddings", 1_048_576),
             logits_row_stride: Dim::param("logits_row_stride", 131072),
             cache_block_size: 64,
             quant_block_size: 128,
@@ -1009,6 +1025,7 @@ mod tests {
             index_prefill_span_mode: "single_causal_tail".to_string(),
             index_decode_context_mode: "uniform".to_string(),
             index_decode_page_mapping: "unique_scattered".to_string(),
+            rope_is_neox_style: false,
             index_clean_logits: false,
             sparse_index_distribution: "recent_contiguous".to_string(),
             sparse_cache_layout: "token_major_mqa_bf16_latent_rope".to_string(),
@@ -1048,8 +1065,12 @@ mod tests {
         assert_eq!(r.q_b_proj.n, 16384);
         assert_eq!(r.q_b_proj.k, 2048);
         assert_eq!(r.kv_a_rms_norm.hidden, 512);
-        assert_eq!(r.main_rope.input_bytes_per_token, 8320);
-        assert_eq!(r.main_rope.output_bytes_per_token, 8320);
+        // The fused rope leaf carries the full q row width, not the rope
+        // slice: the inductor fusion rewrites every one of q's columns.
+        assert_eq!(r.main_rope.num_heads, 64);
+        assert_eq!(r.main_rope.qk_nope_head_dim, 192);
+        assert_eq!(r.main_rope.rope_dim, 64);
+        assert!(!r.main_rope.is_neox_style);
         assert_eq!(r.q_absorb.num_batches, 64);
         assert_eq!(r.q_absorb.n, 512);
         assert_eq!(r.q_absorb.k, 192);
@@ -1075,7 +1096,7 @@ mod tests {
         assert_eq!(r.input_add_rms_norm.backends, vec!["vllm_cuda"]);
         assert_eq!(r.q_a_rms_norm.backends, vec!["flashinfer"]);
         assert_eq!(r.fused_qkv_a_proj.backends, vec!["torch"]);
-        assert_eq!(r.main_rope.backends, vec!["triton"]);
+        assert_eq!(r.main_rope.backends, vec!["vllm_inductor"]);
         assert_eq!(r.q_absorb.backends, vec!["torch_mla_q_absorb_glm52"]);
         assert_eq!(r.v_up.backends, vec!["torch_mla_v_up_glm52"]);
         assert_eq!(r.sparse_mla.elementwise_backends, vec!["triton_sparse"]);
