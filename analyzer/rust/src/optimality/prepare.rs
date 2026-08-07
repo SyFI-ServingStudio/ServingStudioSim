@@ -192,6 +192,15 @@ fn compute_dtype(config: &Value) -> String {
 }
 
 /// Collective / point-to-point leaves — dropped at R4 ("ignore network") and R5.
+///
+/// `moe_alltoall` is here because it is the MoE expert-parallel exchange itself:
+/// leaving it out of this list makes R4 "ignore network" treat hundreds of
+/// milliseconds of MNNVL traffic as optimizable local compute.
+///
+/// `moe_alltoall_prepare` deliberately stays on the compute side. Its time is
+/// dominated by the local atomics/index kernels that build the send layout
+/// (`computeCountAndIndice` and friends); it only wraps a tiny metadata exchange,
+/// so classifying it as communication would erase real local work.
 fn is_communication_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -199,6 +208,7 @@ fn is_communication_kind(kind: &str) -> bool {
             | "all_gather"
             | "reduce_scatter"
             | "all_to_all"
+            | "moe_alltoall"
             | "broadcast"
             | "gather"
             | "scatter"
@@ -211,7 +221,13 @@ fn is_communication_kind(kind: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::r3_uses_compute_throughput;
+    use super::{is_communication_kind, r3_uses_compute_throughput};
+
+    #[test]
+    fn moe_exchange_is_communication_but_its_local_prepare_is_not() {
+        assert!(is_communication_kind("moe_alltoall"));
+        assert!(!is_communication_kind("moe_alltoall_prepare"));
+    }
 
     #[test]
     fn r3_basis_follows_whether_the_grid_crosses_the_hardware_ridge() {

@@ -38,9 +38,51 @@ non-communication location. An empty semantic list means that location has zero
 minimum under the cross-leaf-fusion convention. The mapping never derives
 minimum work from simulator shapes.
 
+One arch type needs one map, and two arch types that model the same model still
+need one each: `glm52_dsa_moe_unified.json` (126 locations) and
+`glm52_vllm_dsa_moe_unified.json` (166) share all 82 semantic rows, because the
+vLLM decomposition only cuts the same work into finer leaves — the 40 extra rows
+are quantize / gather / fill leaves with zero minimum, and its 6 `moe_alltoall`
+leaves are communication and never appear in a map.
+
 Learned normalization scales are compulsory model weights and therefore remain
 in the minimum at their norm locations. Only the intermediate norm/activation
 tensor traffic is fusible away; norm and activation compute remain unpinned.
+
+## Mixed precision comes from the checkpoint, not from a flag
+
+A quantized checkpoint declares its own precision. HF FP8 repos keep the master
+`dtype` at `bfloat16` and add one `quantization_config` key, so the two configs
+for one model differ by exactly that key — `glm52.json` / `glm52_fp8.json`,
+`qwen3_235b.json` / `qwen3_235b_fp8.json`. Both sides are verbatim downloads;
+`tests/test_model_work.py` asserts they stay one key apart. **Point
+`model_config` at the config the run actually served.** A run whose arch says
+`fp8: true` while its config says nothing is rejected by `floors.py` — labeling
+FP8 weights at two bytes reports a "minimum" larger than the traffic that moved,
+which silently drives redundancy below 1 and is undetectable downstream.
+
+Precision is then per segment, never global, because a real checkpoint is mixed:
+
+- `quantization_config.modules_to_not_convert` is the authority for weights.
+  `MatmulGroup.module` carries each matrix's layer-relative checkpoint path so it
+  can be matched. For GLM-5.2 and Qwen3-235B only `mlp.gate` (the router) and
+  GLM's `self_attn.indexers_proj` stay at the master dtype.
+- The list is an exclusion over the **Linear** modules the quantizer walks, so it
+  says nothing about the embedding table — which is never converted. `lm_head`
+  *is* listed by both checkpoints and is honored.
+- A converted matrix also reads its FP32 block scale
+  (`ceil(n/128)·ceil(k/128)·4` bytes), which is compulsory traffic.
+- A mechanism can fix its own precision independently of the weights:
+  `AttentionSemantic.compute_dtype` pins GLM's DSA index logits to FP8 (the index
+  cache is FP8 by construction) and its sparse MLA to BF16 (vLLM's FlashMLA
+  kernel), under either checkpoint.
+
+Each `Segment` therefore carries a `compute_dtype`, and both roofline floors
+divide segment by segment. Fusing every leaf into one kernel still cannot fuse
+across precisions, so even the global fused floor sums `flops_seg / peak_seg`.
+On GLM-5.2 FP8 that is not a rounding detail: ~20% of the FLOPs stay on the BF16
+tensor cores, and H200's FP8 peak is twice its BF16 peak, so a single global FP8
+peak understates the compute floor by a fifth.
 
 ```
 uv run python -m model.work model/config/llama3_8b.json --decode 256x4096

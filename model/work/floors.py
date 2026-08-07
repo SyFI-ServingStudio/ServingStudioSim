@@ -82,6 +82,10 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
 
     One group per pool assumed (PD/unified dense today); multi-group EP/HP needs
     the same per-group revisit as the rest of the analyzer.
+
+    ``dtype`` is only the fallback for segments that make no precision claim; the
+    real per-segment precisions come from the model config's own
+    ``quantization_config``. The two must agree — see :func:`_check_precision`.
     """
     params = json.loads((log_dir / "raw" / "params.json").read_text())
     specs: dict[str, dict] = {}
@@ -92,10 +96,31 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
             "config": arch["model_config"],
             # `gpu` is a group-level field (the arch block carries model/tp/fp8).
             "gpu": group["gpu"],
-            # fp8 halves the roofline compute peak; else the model's native bf16.
+            "arch_fp8": bool(arch.get("fp8")),
             "dtype": "fp8" if arch.get("fp8") else "bf16",
         }
     return specs
+
+
+def _check_precision(model, spec: dict) -> None:
+    """Refuse to label a run whose arch precision contradicts its model config.
+
+    A run served from an FP8 checkpoint but labeled against the BF16 config
+    reports weight bytes at 2x the traffic that actually moved — a "minimum"
+    larger than the measured value, which silently turns redundancy into a number
+    below 1. It is not detectable downstream, so it is rejected here.
+    """
+    config_is_quantized = model.quant is not None
+    if spec["arch_fp8"] and not config_is_quantized:
+        raise ValueError(
+            f"arch declares fp8 but {spec['config']} has no quantization_config; "
+            "point `model_config` at the checkpoint's FP8 config (e.g. glm52_fp8.json)"
+        )
+    if config_is_quantized and not spec["arch_fp8"]:
+        raise ValueError(
+            f"{spec['config']} declares a {model.quant.compute_dtype} quantization_config "
+            "but the arch does not set fp8; the run and the accountant disagree on precision"
+        )
 
 
 def _spec_for_level(level_key: str, pool_specs: dict[str, dict]) -> dict:
@@ -160,41 +185,77 @@ def _aggregate_workload(totals: dict) -> Workload:
     )
 
 
+def _peak_resolver(spec: dict):
+    """Memoized dtype -> peak TFLOP/s for this spec's GPU.
+
+    ``spec["dtype"]`` is only the fallback for a segment that makes no precision
+    claim; a mixed-precision checkpoint names its own dtype per segment.
+    """
+    peak_by_dtype: dict[str, float] = {}
+
+    def peak(compute_dtype: str | None) -> float:
+        key = compute_dtype or spec["dtype"]
+        if key not in peak_by_dtype:
+            peak_by_dtype[key] = gpu_peak_tflops(spec["gpu"], key)
+        return peak_by_dtype[key]
+
+    return peak
+
+
+def _segment_dtypes(model, totals: dict, default_dtype: str) -> dict[str, str]:
+    """Segment name -> compute dtype. Independent of workload size, but the set of
+    segment names is not, so it is resolved for the same totals as the work."""
+    label = model.label(_aggregate_workload(totals))
+    return {
+        segment.name: segment.compute_dtype or default_dtype for segment in label.segments
+    }
+
+
 def _label_payload(model, totals: dict, spec: dict) -> dict:
     """Serialize one workload label, including each semantic's own roofline."""
-    peak_tflops = gpu_peak_tflops(spec["gpu"], spec["dtype"])
+    peak = _peak_resolver(spec)
     bandwidth_gbps = gpu_mem_bandwidth_gbps(spec["gpu"])
     label = model.label(_aggregate_workload(totals))
     segment_work = {
         segment.name: (segment.flops_total, segment.bytes_total) for segment in label.segments
     }
-    return _payload_from_segment_work(segment_work, peak_tflops, bandwidth_gbps)
+    segment_dtypes = {
+        segment.name: segment.compute_dtype or spec["dtype"] for segment in label.segments
+    }
+    return _payload_from_segment_work(segment_work, segment_dtypes, peak, bandwidth_gbps)
 
 
 def _payload_from_segment_work(
-    segment_work: dict[str, tuple[float, float]], peak_tflops: float, bandwidth_gbps: float
+    segment_work: dict[str, tuple[float, float]],
+    segment_dtypes: dict[str, str],
+    peak,
+    bandwidth_gbps: float,
 ) -> dict:
     segments = []
-    total_flops = 0.0
+    total_compute_seconds = 0.0
     total_bytes = 0.0
     for name in sorted(segment_work):
         flops, bytes_ = segment_work[name]
-        compute_seconds = flops / (peak_tflops * 1e12)
+        compute_dtype = segment_dtypes[name]
+        compute_seconds = flops / (peak(compute_dtype) * 1e12)
         memory_seconds = bytes_ / (bandwidth_gbps * 1e9)
         segments.append(
             {
                 "name": name,
                 "flops": flops,
                 "bytes": bytes_,
+                "compute_dtype": compute_dtype,
                 "necessary": max(compute_seconds, memory_seconds),
             }
         )
-        total_flops += flops
+        # Fusing every segment into one kernel still cannot fuse across precisions,
+        # so the fused compute term sums per-segment seconds instead of dividing one
+        # global FLOP total by one peak.
+        total_compute_seconds += compute_seconds
         total_bytes += bytes_
-    compute_seconds = total_flops / (peak_tflops * 1e12)
     memory_seconds = total_bytes / (bandwidth_gbps * 1e9)
     return {
-        "necessary": max(compute_seconds, memory_seconds),
+        "necessary": max(total_compute_seconds, memory_seconds),
         "segmented": sum(segment["necessary"] for segment in segments),
         "segments": segments,
     }
@@ -321,6 +382,7 @@ def _validated_basis(
     totals: dict,
     has_routed_matmul: bool,
     basis_cache: dict[tuple[int | None, bool], dict | None],
+    default_dtype: str,
 ) -> dict | None:
     """Build and independently validate one basis before any batch reduction."""
     basis_key = _basis_key(model, totals, has_routed_matmul)
@@ -328,14 +390,20 @@ def _validated_basis(
         candidate = _workload_basis(model, totals, has_routed_matmul)
         reconstructed = _reconstruct_segment_work(candidate, totals)
         direct = _segment_work(model, totals)
-        basis_cache[basis_key] = candidate if _segment_work_matches(reconstructed, direct) else None
+        if _segment_work_matches(reconstructed, direct):
+            # Validation just proved the basis spans exactly the direct label's
+            # segment names, so one label at these totals resolves every dtype.
+            candidate["dtypes"] = _segment_dtypes(model, totals, default_dtype)
+            basis_cache[basis_key] = candidate
+        else:
+            basis_cache[basis_key] = None
     return basis_cache[basis_key]
 
 
 def _reduce_affine_group(
     basis: dict,
     weighted_shapes: list[dict],
-    peak_tflops: float,
+    peak,
     bandwidth_gbps: float,
 ) -> tuple[float, float, dict[str, dict]]:
     """Evaluate all shapes sharing one basis as dense array operations."""
@@ -380,16 +448,22 @@ def _reduce_affine_group(
         [int(weighted_shape["occurrences"]) for weighted_shape in weighted_shapes],
         dtype=np.float64,
     )
+    # One peak per segment: a mixed-precision checkpoint runs some rows on the FP8
+    # tensor cores and others (router, sparse MLA) at the master dtype.
+    segment_peaks = np.asarray(
+        [peak(basis["dtypes"][name]) for name in segment_names], dtype=np.float64
+    )
+
     segment_flops = workload_deltas @ coefficient_flops + base_flops
     segment_bytes = workload_deltas @ coefficient_bytes + base_bytes
-    compute_seconds = segment_flops / (peak_tflops * 1e12)
+    compute_seconds = segment_flops / (segment_peaks * 1e12)
     memory_seconds = segment_bytes / (bandwidth_gbps * 1e9)
     segment_necessary = np.maximum(compute_seconds, memory_seconds)
 
     fused_seconds = float(
         occurrences
         @ np.maximum(
-            segment_flops.sum(axis=1) / (peak_tflops * 1e12),
+            compute_seconds.sum(axis=1),
             segment_bytes.sum(axis=1) / (bandwidth_gbps * 1e9),
         )
     )
@@ -402,6 +476,7 @@ def _reduce_affine_group(
             "name": name,
             "flops": float(aggregate_flops[index]),
             "bytes": float(aggregate_bytes[index]),
+            "compute_dtype": basis["dtypes"][name],
             "necessary": float(aggregate_necessary[index]),
         }
         for index, name in enumerate(segment_names)
@@ -422,22 +497,40 @@ def _reduce_direct_group(
         fused_seconds += payload["necessary"] * occurrences
         segmented_seconds += payload["segmented"] * occurrences
         for segment in payload["segments"]:
-            aggregate = segments_by_name.setdefault(
-                segment["name"],
-                {"name": segment["name"], "flops": 0.0, "bytes": 0.0, "necessary": 0.0},
-            )
+            aggregate = _empty_aggregate(segments_by_name, segment)
             aggregate["flops"] += segment["flops"] * occurrences
             aggregate["bytes"] += segment["bytes"] * occurrences
             aggregate["necessary"] += segment["necessary"] * occurrences
     return fused_seconds, segmented_seconds, segments_by_name
 
 
-def _merge_segment_totals(target: dict[str, dict], source: dict[str, dict]) -> None:
-    for name, segment in source.items():
-        aggregate = target.setdefault(
-            name,
-            {"name": name, "flops": 0.0, "bytes": 0.0, "necessary": 0.0},
+def _empty_aggregate(target: dict[str, dict], segment: dict) -> dict:
+    """Get-or-create the accumulator for one segment name, pinning its dtype.
+
+    A segment name that arrived at two different precisions would make the summed
+    compute floor meaningless, so the disagreement is raised rather than merged.
+    """
+    aggregate = target.setdefault(
+        segment["name"],
+        {
+            "name": segment["name"],
+            "flops": 0.0,
+            "bytes": 0.0,
+            "compute_dtype": segment["compute_dtype"],
+            "necessary": 0.0,
+        },
+    )
+    if aggregate["compute_dtype"] != segment["compute_dtype"]:
+        raise ValueError(
+            f"segment {segment['name']!r} reported both {aggregate['compute_dtype']!r} "
+            f"and {segment['compute_dtype']!r} as its compute dtype"
         )
+    return aggregate
+
+
+def _merge_segment_totals(target: dict[str, dict], source: dict[str, dict]) -> None:
+    for segment in source.values():
+        aggregate = _empty_aggregate(target, segment)
         aggregate["flops"] += segment["flops"]
         aggregate["bytes"] += segment["bytes"]
         aggregate["necessary"] += segment["necessary"]
@@ -451,6 +544,7 @@ def compute_floors(log_dir: Path, levels: dict[str, dict]) -> dict[str, dict]:
         try:
             spec = _spec_for_level(level_key, pool_specs)
             model = _model(spec["config"])
+            _check_precision(model, spec)
             out[level_key] = _label_payload(model, totals, spec)
         except Exception as error:  # noqa: BLE001 - isolate independent batch rows
             # One heterogeneous or unsupported scope must not discard valid
@@ -473,6 +567,7 @@ def compute_locked_compositions(log_dir: Path, compositions: dict[str, list[dict
         try:
             spec = _spec_for_level(level_key, pool_specs)
             model = _model(spec["config"])
+            _check_precision(model, spec)
             fused_seconds = 0.0
             segmented_seconds = 0.0
             segments_by_name: dict[str, dict] = {}
@@ -487,11 +582,15 @@ def compute_locked_compositions(log_dir: Path, compositions: dict[str, list[dict
                 shapes_by_basis[
                     _basis_key(model, weighted_shape["totals"], has_routed_matmul)
                 ].append(weighted_shape)
-            peak_tflops = gpu_peak_tflops(spec["gpu"], spec["dtype"])
+            peak = _peak_resolver(spec)
             bandwidth_gbps = gpu_mem_bandwidth_gbps(spec["gpu"])
             for basis_shapes in shapes_by_basis.values():
                 basis = _validated_basis(
-                    model, basis_shapes[0]["totals"], has_routed_matmul, basis_cache
+                    model,
+                    basis_shapes[0]["totals"],
+                    has_routed_matmul,
+                    basis_cache,
+                    spec["dtype"],
                 )
                 if basis is None:
                     group_fused, group_segmented, group_segments = _reduce_direct_group(
@@ -499,7 +598,7 @@ def compute_locked_compositions(log_dir: Path, compositions: dict[str, list[dict
                     )
                 else:
                     group_fused, group_segmented, group_segments = _reduce_affine_group(
-                        basis, basis_shapes, peak_tflops, bandwidth_gbps
+                        basis, basis_shapes, peak, bandwidth_gbps
                     )
                 fused_seconds += group_fused
                 segmented_seconds += group_segmented

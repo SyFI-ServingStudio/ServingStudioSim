@@ -26,6 +26,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .quantization import QuantScheme
+
 if TYPE_CHECKING:
     from .attention.base import AttentionSpec
     from .ffn.base import FFNSpec
@@ -59,6 +61,26 @@ def dtype_bytes(dtype: str) -> float:
     if key not in _DTYPE_BYTES:
         raise KeyError(f"unknown dtype {dtype!r}; extend _DTYPE_BYTES in core.py")
     return _DTYPE_BYTES[key]
+
+
+# HF/torch spellings -> the short names gpu/spec.json and the analyzer wire use.
+_CANONICAL_DTYPE = {
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "half": "fp16",
+    "float32": "fp32",
+    "f32": "fp32",
+    "float8": "fp8",
+    "float8_e4m3fn": "fp8",
+    "float8_e5m2": "fp8",
+    "f8": "fp8",
+}
+
+
+def canonical_dtype(dtype: str) -> str:
+    """One spelling per precision, so a segment's dtype is comparable everywhere."""
+    key = dtype.lower().removeprefix("torch.")
+    return _CANONICAL_DTYPE.get(key, key)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +275,12 @@ class MatmulGroup:
     experts, 1 otherwise) — drives FLOPs and activated params. ``total_count`` = all
     instances that exist (``num_experts`` for experts, 1 otherwise) — drives total
     params. ``bucket`` names the FLOP/param category (see ``_FLOPS_BUCKET``).
+
+    ``module`` is this matrix's layer-relative checkpoint path (``mlp.gate``,
+    ``self_attn.o_proj``). It is what a quantized config's
+    ``modules_to_not_convert`` is matched against, so a model whose config
+    declares a ``quantization_config`` must fill it on every group — see
+    :meth:`Model.weight_bytes_per_instance`.
     """
 
     name: str
@@ -262,6 +290,7 @@ class MatmulGroup:
     total_count: int = 1
     bucket: str = "dense_ffn"
     routed: bool = False  # weights are routed experts -> only the hit subset is loaded
+    module: str | None = None
 
     @property
     def activated_params(self) -> int:
@@ -315,6 +344,12 @@ class Segment:
     A per-segment roofline (max of its own compute and memory time) summed over all
     segments is a tighter, more realistic lower bound than the fully-fused global one,
     because separate kernels run sequentially and cannot overlap each other's work.
+
+    ``compute_dtype`` is the precision this segment's math actually runs at, which
+    selects its peak-TFLOP/s. A real model is mixed — an FP8 checkpoint still keeps
+    its router, norms, and (for GLM-5.2 DSA) its BF16 sparse-MLA kernel at the master
+    dtype — so a single global dtype cannot describe it. ``None`` means the segment
+    makes no claim and inherits whatever default the caller passes.
     """
 
     name: str
@@ -323,6 +358,7 @@ class Segment:
     flops: float
     bytes: float
     count: int
+    compute_dtype: str | None = None
 
     @property
     def flops_total(self) -> float:
@@ -371,13 +407,45 @@ class WorkLabel:
         """Achieved GB/s if this minimum work ran in ``seconds``."""
         return self.bytes_total / seconds / 1e9
 
+    def segment_peaks(
+        self, gpu: str, dtype: str, num_gpus: int, spec_path: str | Path | None = None
+    ) -> list[float]:
+        """Per-segment peak TFLOP/s (already multiplied by ``num_gpus``).
+
+        ``dtype`` is only the **default** for segments that make no precision claim
+        of their own; a mixed-precision model overrides it segment by segment.
+        """
+        peak_by_dtype: dict[str, float] = {}
+        peaks = []
+        for segment in self.segments:
+            key = segment.compute_dtype or dtype
+            if key not in peak_by_dtype:
+                peak_by_dtype[key] = gpu_peak_tflops(gpu, key, spec_path) * num_gpus
+            peaks.append(peak_by_dtype[key])
+        return peaks
+
     def roofline_ms(
         self, gpu: str, dtype: str = "bf16", num_gpus: int = 1, spec_path: str | Path | None = None
     ) -> tuple[float, float, str]:
-        """Compute-bound and memory-bound time floors (ms) and which one binds."""
-        peak_tflops = gpu_peak_tflops(gpu, dtype, spec_path)
+        """Compute-bound and memory-bound time floors (ms) and which one binds.
+
+        Fusing every segment into one kernel still cannot fuse across precisions, so
+        the compute floor is ``Σ_seg flops_seg / peak(dtype_seg)`` rather than one
+        division of the global FLOP total.
+        """
         bandwidth_gbps = gpu_mem_bandwidth_gbps(gpu, spec_path)
-        compute_ms = self.flops_total / (peak_tflops * 1e12 * num_gpus) * 1e3
+        if self.segments:
+            peaks = self.segment_peaks(gpu, dtype, num_gpus, spec_path)
+            compute_ms = (
+                sum(
+                    segment.flops_total / (peak * 1e12)
+                    for segment, peak in zip(self.segments, peaks, strict=True)
+                )
+                * 1e3
+            )
+        else:
+            peak_tflops = gpu_peak_tflops(gpu, dtype, spec_path) * num_gpus
+            compute_ms = self.flops_total / (peak_tflops * 1e12) * 1e3
         memory_ms = self.bytes_total / (bandwidth_gbps * 1e9 * num_gpus) * 1e3
         bound = "compute" if compute_ms >= memory_ms else "memory"
         return compute_ms, memory_ms, bound
@@ -391,15 +459,18 @@ class WorkLabel:
         (larger) than the fully-fused :meth:`roofline_ms` global floor — but still a
         valid lower bound on real time (it counts only necessary work per segment).
         """
-        peak = gpu_peak_tflops(gpu, dtype, spec_path) * num_gpus
+        peaks = self.segment_peaks(gpu, dtype, num_gpus, spec_path)
         bandwidth = gpu_mem_bandwidth_gbps(gpu, spec_path) * num_gpus
-        return sum(seg.time_ms(peak, bandwidth) for seg in self.segments)
+        return sum(
+            seg.time_ms(peak, bandwidth)
+            for seg, peak in zip(self.segments, peaks, strict=True)
+        )
 
     def segment_rows(
         self, gpu: str, dtype: str = "bf16", num_gpus: int = 1, spec_path: str | Path | None = None
     ) -> list[dict]:
-        """Per-segment {name, count, flops, bytes, bound, ms} for display/inspection."""
-        peak = gpu_peak_tflops(gpu, dtype, spec_path) * num_gpus
+        """Per-segment {name, count, flops, bytes, dtype, bound, ms} for inspection."""
+        peaks = self.segment_peaks(gpu, dtype, num_gpus, spec_path)
         bandwidth = gpu_mem_bandwidth_gbps(gpu, spec_path) * num_gpus
         return [
             {
@@ -407,10 +478,11 @@ class WorkLabel:
                 "count": seg.count,
                 "flops": seg.flops_total,
                 "bytes": seg.bytes_total,
+                "compute_dtype": seg.compute_dtype or dtype,
                 "bound": seg.instance_bound(peak, bandwidth),
                 "ms": seg.time_ms(peak, bandwidth),
             }
-            for seg in self.segments
+            for seg, peak in zip(self.segments, peaks, strict=True)
         ]
 
     def work_efficiency(self, achieved_flops: float) -> float:
@@ -483,10 +555,49 @@ class Model:
     tie_word_embeddings: bool
     layers: list[LayerStack]
     norm_weights: list[NormWeightGroup] = field(default_factory=list)
+    #: The checkpoint's master dtype — what an unquantized (or not-converted)
+    #: matrix is stored and computed in.
+    master_dtype: str = "bf16"
+    #: What the checkpoint's ``quantization_config`` declared, if anything. None
+    #: means every weight is stored and computed at ``master_dtype``.
+    quant: QuantScheme | None = None
+
+    def __post_init__(self) -> None:
+        # Builders pass the config's own spelling ("bfloat16"); segments and the
+        # analyzer wire compare dtypes as strings, so normalize once here.
+        self.master_dtype = canonical_dtype(self.master_dtype)
 
     @property
     def num_layers(self) -> int:
         return sum(stack.count for stack in self.layers)
+
+    def weight_bytes_per_instance(self, group: MatmulGroup) -> float:
+        """HBM bytes for ONE instance of ``group``'s matrix, at its stored precision.
+
+        A converted FP8 matrix also carries an FP32 scale per quantization block,
+        which is read alongside it — omitting the scale would understate the
+        compulsory traffic of exactly the path that dominates a quantized MoE.
+        """
+        elements = float(group.n) * float(group.k)
+        if self.quant is None or not self._is_converted(group):
+            return elements * self.weight_dtype_bytes
+        return elements * self.quant.bytes_per_weight + self.quant.scale_bytes(group.n, group.k)
+
+    def matmul_compute_dtype(self, group: MatmulGroup) -> str:
+        """Precision ``group``'s matmul executes at (selects its peak TFLOP/s)."""
+        if self.quant is None or not self._is_converted(group):
+            return self.master_dtype
+        return self.quant.compute_dtype
+
+    def _is_converted(self, group: MatmulGroup) -> bool:
+        if group.module is None:
+            raise ValueError(
+                f"{self.name}: matmul group {group.name!r} has no `module`, so it cannot be "
+                "matched against the config's modules_to_not_convert; fill MatmulGroup.module "
+                "in the per-model builder before using a quantized config"
+            )
+        assert self.quant is not None
+        return self.quant.is_converted(group.module)
 
     @classmethod
     def uniform(
@@ -500,6 +611,8 @@ class Model:
         weight_dtype_bytes: float,
         tie_word_embeddings: bool,
         norm_weights: list[NormWeightGroup] | None = None,
+        master_dtype: str = "bf16",
+        quant: QuantScheme | None = None,
     ) -> Model:
         """A model whose every layer is the same (attn, ffn) archetype."""
         return cls(
@@ -510,6 +623,8 @@ class Model:
             tie_word_embeddings=tie_word_embeddings,
             layers=[LayerStack(attn=attn, ffn=ffn, count=num_layers)],
             norm_weights=norm_weights or [],
+            master_dtype=master_dtype,
+            quant=quant,
         )
 
     def label(self, wl: Workload) -> WorkLabel:
@@ -534,8 +649,9 @@ class Model:
                         bucket=_FLOPS_BUCKET[group.bucket],
                         byte_kind="weights",
                         flops=2.0 * tokens * group.activated_mult * group.n * group.k,
-                        bytes=loaded * group.n * group.k * self.weight_dtype_bytes,
+                        bytes=loaded * self.weight_bytes_per_instance(group),
                         count=stack.count,
+                        compute_dtype=self.matmul_compute_dtype(group),
                     )
                 )
                 activated_params += group.activated_params * stack.count
@@ -556,6 +672,10 @@ class Model:
                             flops=semantic.flops,
                             bytes=semantic.bytes,
                             count=stack.count,
+                            # A row that names no precision runs at the master
+                            # dtype: quantizing the weights does not move the
+                            # attention kernels onto the FP8 tensor cores.
+                            compute_dtype=semantic.compute_dtype or self.master_dtype,
                         )
                     )
             else:
@@ -572,6 +692,7 @@ class Model:
                             flops=stack.attn.internal_flops(phase_workload),
                             bytes=stack.attn.kv_bytes(phase_workload),
                             count=stack.count,
+                            compute_dtype=self.master_dtype,
                         )
                     )
                 cache_write_bytes = stack.attn.cache_write_bytes(wl)
@@ -584,12 +705,16 @@ class Model:
                             flops=0.0,
                             bytes=cache_write_bytes,
                             count=stack.count,
+                            compute_dtype=self.master_dtype,
                         )
                     )
 
         # Normalization activations can stay on-chip across a globally fused path,
         # but learned scale vectors are compulsory model weights. They intentionally
         # carry zero FLOPs here: only matmul/attention math is pinned as irreducible.
+        # Norms stay at the master dtype under every scheme we support: block-wise
+        # FP8 quantizes 2-D matrices, and both GLM-5.2-FP8 and Qwen3-235B-FP8 list
+        # every layernorm in `modules_to_not_convert`.
         for norm_weight in self.norm_weights:
             segments.append(
                 Segment(
@@ -599,6 +724,7 @@ class Model:
                     flops=0.0,
                     bytes=norm_weight.elements * self.weight_dtype_bytes,
                     count=norm_weight.count,
+                    compute_dtype=self.master_dtype,
                 )
             )
             norm_params = norm_weight.elements * norm_weight.count
@@ -615,6 +741,11 @@ class Model:
         embedding_params = self.vocab * self.hidden
         breakdown["embedding"] += embedding_params
         total_params += embedding_params
+        # The embedding table always stays at the master dtype: FP8 quantizers walk
+        # the Linear modules, and an `nn.Embedding` is not one. `modules_to_not_convert`
+        # is therefore silent about it in some checkpoints (Qwen3-235B-FP8 omits it,
+        # GLM-5.2-FP8 lists it) — but neither one's index carries a
+        # `model.embed_tokens.weight_scale_inv`, so the list is not the authority here.
         segments.append(
             Segment(
                 name="embedding",
@@ -623,6 +754,7 @@ class Model:
                 flops=0.0,
                 bytes=min(tokens, self.vocab) * self.hidden * self.weight_dtype_bytes,
                 count=1,
+                compute_dtype=self.master_dtype,
             )
         )
 
@@ -630,14 +762,18 @@ class Model:
         lm_head_params = 0 if self.tie_word_embeddings else self.vocab * self.hidden
         breakdown["lm_head"] += lm_head_params
         total_params += lm_head_params
+        lm_head_group = MatmulGroup(
+            "lm_head", n=self.vocab, k=self.hidden, bucket="dense_ffn", module="lm_head"
+        )
         segments.append(
             Segment(
                 name="lm_head",
                 bucket="lm_head",
                 byte_kind="weights",
                 flops=2.0 * wl.head_positions * self.hidden * self.vocab,
-                bytes=self.hidden * self.vocab * self.weight_dtype_bytes,
+                bytes=self.weight_bytes_per_instance(lm_head_group),
                 count=1,
+                compute_dtype=self.matmul_compute_dtype(lm_head_group),
             )
         )
 
@@ -703,9 +839,7 @@ _TFLOPS_FIELD = {
 
 def gpu_peak_tflops(name: str, dtype: str, spec_path: str | Path | None = None) -> float:
     """Dense peak TFLOP/s for ``dtype`` on ``name`` from gpu/spec.json (DENSE, not sparse)."""
-    key = dtype.lower().removeprefix("torch.")
-    key = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(key, key)
-    field_name = _TFLOPS_FIELD.get(key)
+    field_name = _TFLOPS_FIELD.get(canonical_dtype(dtype))
     if field_name is None:
         raise KeyError(f"no peak-TFLOPS field for dtype {dtype!r}")
     entry = _find_gpu(name, spec_path)

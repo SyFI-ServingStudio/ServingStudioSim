@@ -59,6 +59,10 @@ pub(super) struct SemanticWork {
     pub(super) flops: f64,
     pub(super) bytes: f64,
     pub(super) necessary_gpu_s: f64,
+    /// Precision this row's math runs at. The labeler decides it per row because a
+    /// checkpoint is mixed — an FP8 MoE still keeps its router and its BF16
+    /// FlashMLA kernel off the FP8 tensor cores.
+    pub(super) compute_dtype: String,
 }
 
 pub(super) struct IterationLabel {
@@ -371,6 +375,11 @@ fn parse_labels(response: &Value) -> Result<ParsedLabels> {
                         .get("necessary")
                         .and_then(Value::as_f64)
                         .context("semantic segment missing necessary roofline")?,
+                    compute_dtype: segment
+                        .get("compute_dtype")
+                        .and_then(Value::as_str)
+                        .context("semantic segment missing compute_dtype")?
+                        .to_string(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -538,6 +547,7 @@ mod tests {
                         "name": "gemm",
                         "flops": 4.0,
                         "bytes": 5.0,
+                        "compute_dtype": "fp8",
                         "necessary": 0.5
                     }],
                     "composition": {
@@ -555,6 +565,7 @@ mod tests {
         assert_eq!(parsed.labels["main/0"].floors.fused, 2.0);
         assert_eq!(parsed.labels["main/0"].segments[0].name, "gemm");
         assert_eq!(parsed.labels["main/0"].segments[0].necessary_gpu_s, 0.5);
+        assert_eq!(parsed.labels["main/0"].segments[0].compute_dtype, "fp8");
         let stats = parsed.composition_stats["main/0"];
         assert_eq!(stats.unique_shapes, 3);
         assert_eq!(stats.iterations, 9);

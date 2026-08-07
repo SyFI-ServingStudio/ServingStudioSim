@@ -12,6 +12,7 @@ from ..attention.glm52_dsa import Glm52DsaAttention
 from ..core import LayerStack, Model, NormWeightGroup, dtype_bytes
 from ..ffn.dense import DenseSwiGLU
 from ..ffn.moe import MoE
+from ..quantization import parse_quantization_config
 
 
 def _require_schedule(raw_config: dict) -> tuple[int, int, int, int]:
@@ -146,4 +147,6 @@ def build(raw_config: dict) -> Model:
         tie_word_embeddings=raw_config.get("tie_word_embeddings", False),
         layers=layers,
         norm_weights=norm_weights,
+        master_dtype=raw_config.get("dtype") or raw_config.get("torch_dtype", "bfloat16"),
+        quant=parse_quantization_config(raw_config),
     )

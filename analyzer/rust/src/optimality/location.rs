@@ -51,13 +51,10 @@ struct GroupParams {
 struct ArchParams {
     #[serde(rename = "type")]
     arch_type: String,
-    #[serde(default)]
-    fp8: bool,
 }
 
 struct PoolModelSpec {
     arch_type: String,
-    compute_dtype: &'static str,
 }
 
 /// Run-scoped semantic attribution inputs. Params and every mapping file are
@@ -76,6 +73,9 @@ struct NecessaryWork {
     flops: f64,
     bytes: f64,
     roofline_gpu_s: f64,
+    /// Already divided by each row's own peak, because the rows behind one
+    /// location need not share a precision.
+    compute_gpu_s: f64,
 }
 
 impl LocationCatalog {
@@ -90,11 +90,13 @@ impl LocationCatalog {
                 .into_iter()
                 .next()
                 .with_context(|| format!("params has no group for pool {pool_tag:?}"))?;
+            // The pool's precision is deliberately NOT read from `arch.fp8` here:
+            // the labeler reports a compute dtype per semantic row, which is the
+            // only description that survives a mixed-precision checkpoint.
             pool_specs.insert(
                 pool_tag,
                 PoolModelSpec {
                     arch_type: group.arch.arch_type,
-                    compute_dtype: if group.arch.fp8 { "fp8" } else { "bf16" },
                 },
             );
         }
@@ -194,13 +196,9 @@ impl LocationCatalog {
             .get(pool_tag)
             .with_context(|| format!("semantic attribution missing pool {pool_tag:?}"))?;
         let location_map = select_location_map(&self.maps, &pool_spec.arch_type, kernel_locations)?;
-        let peak_tflops = gpu_spec.peak_tflops(pool_spec.compute_dtype);
         let bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
-        if peak_tflops <= 0.0 || bandwidth_gbps <= 0.0 {
-            bail!(
-                "GPU spec lacks positive {} compute peak or memory bandwidth",
-                pool_spec.compute_dtype
-            );
+        if bandwidth_gbps <= 0.0 {
+            bail!("GPU spec lacks positive memory bandwidth");
         }
 
         let kind_by_location: BTreeMap<&str, &str> = kernel_locations
@@ -218,16 +216,25 @@ impl LocationCatalog {
                 .segments
                 .iter()
                 .map(|segment| {
-                    (
+                    let peak_tflops = gpu_spec.peak_tflops(&segment.compute_dtype);
+                    if peak_tflops <= 0.0 {
+                        bail!(
+                            "GPU spec lacks a positive {} compute peak, needed by semantic row {:?}",
+                            segment.compute_dtype,
+                            segment.name
+                        );
+                    }
+                    Ok((
                         segment.name.as_str(),
                         NecessaryWork {
                             flops: segment.flops,
                             bytes: segment.bytes,
                             roofline_gpu_s: segment.necessary_gpu_s,
+                            compute_gpu_s: segment.flops / (peak_tflops * 1e12),
                         },
-                    )
+                    ))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             for rule in &location_map.locations {
                 let work = rule.semantics.iter().try_fold(
                     NecessaryWork::default(),
@@ -238,6 +245,7 @@ impl LocationCatalog {
                         total.flops += row.flops;
                         total.bytes += row.bytes;
                         total.roofline_gpu_s += row.roofline_gpu_s;
+                        total.compute_gpu_s += row.compute_gpu_s;
                         Ok::<_, anyhow::Error>(total)
                     },
                 )?;
@@ -245,7 +253,7 @@ impl LocationCatalog {
                     rule.semantics.iter().cloned(),
                     work.flops,
                     work.bytes,
-                    peak_tflops,
+                    work.compute_gpu_s,
                     bandwidth_gbps,
                     work.roofline_gpu_s,
                     gpu_count,
@@ -440,6 +448,7 @@ mod tests {
             flops: 1.0,
             bytes: 2.0,
             necessary_gpu_s: 2.0,
+            compute_dtype: "bf16".to_string(),
         }
     }
 

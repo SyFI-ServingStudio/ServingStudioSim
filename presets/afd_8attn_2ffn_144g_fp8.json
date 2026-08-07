@@ -19,7 +19,7 @@
      "replicas": 8,
      "arch": {
       "type": "qwen3_attn_tp",
-      "model_config": "model/config/qwen3_235b.json",
+      "model_config": "model/config/qwen3_235b_fp8.json",
       "attn_tp_size": 4,
       "fp8": true
      },
@@ -37,7 +37,7 @@
      "replicas": 2,
      "arch": {
       "type": "qwen3_ffn_moe",
-      "model_config": "model/config/qwen3_235b.json",
+      "model_config": "model/config/qwen3_235b_fp8.json",
       "attn_tp_size": 4,
       "ep_size": 8,
       "nvl_num_gpu": 8,

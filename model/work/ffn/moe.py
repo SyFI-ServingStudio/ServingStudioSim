@@ -21,10 +21,22 @@ class MoE:
     num_experts: int
     top_k: int
     shared_intermediate: int = 0  # 0 = no shared expert
+    # Checkpoint name of the shared-expert submodule. DeepSeek/GLM use the plural
+    # `shared_experts`; Qwen2-MoE uses `shared_expert`. Only matters for matching a
+    # quantized config's modules_to_not_convert.
+    shared_module: str = "shared_experts"
 
     def matmul_groups(self) -> list[MatmulGroup]:
         groups = [
-            MatmulGroup("router", n=self.num_experts, k=self.hidden, bucket="router"),
+            # `mlp.gate` is the router matrix, and both GLM-5.2-FP8 and
+            # Qwen3-235B-FP8 leave it at the master dtype.
+            MatmulGroup(
+                "router",
+                n=self.num_experts,
+                k=self.hidden,
+                bucket="router",
+                module="mlp.gate",
+            ),
             MatmulGroup(
                 "expert_gate_up",
                 n=2 * self.moe_intermediate,
@@ -33,6 +45,7 @@ class MoE:
                 total_count=self.num_experts,
                 bucket="expert",
                 routed=True,
+                module="mlp.experts.gate_up_proj",
             ),
             MatmulGroup(
                 "expert_down",
@@ -42,6 +55,7 @@ class MoE:
                 total_count=self.num_experts,
                 bucket="expert",
                 routed=True,
+                module="mlp.experts.down_proj",
             ),
         ]
         if self.shared_intermediate > 0:
@@ -51,11 +65,16 @@ class MoE:
                     n=2 * self.shared_intermediate,
                     k=self.hidden,
                     bucket="shared_expert",
+                    module=f"mlp.{self.shared_module}.gate_up_proj",
                 )
             )
             groups.append(
                 MatmulGroup(
-                    "shared_down", n=self.hidden, k=self.shared_intermediate, bucket="shared_expert"
+                    "shared_down",
+                    n=self.hidden,
+                    k=self.shared_intermediate,
+                    bucket="shared_expert",
+                    module=f"mlp.{self.shared_module}.down_proj",
                 )
             )
         return groups

@@ -35,8 +35,20 @@ class GQA:
         if self.output_gate:
             qkv_out += self.num_qo_heads * self.head_dim
         return [
-            MatmulGroup("qkv", n=qkv_out, k=self.hidden, bucket="attn_proj"),
-            MatmulGroup("o", n=self.hidden, k=self.attn_dim, bucket="attn_proj"),
+            MatmulGroup(
+                "qkv",
+                n=qkv_out,
+                k=self.hidden,
+                bucket="attn_proj",
+                module="self_attn.qkv_proj",
+            ),
+            MatmulGroup(
+                "o",
+                n=self.hidden,
+                k=self.attn_dim,
+                bucket="attn_proj",
+                module="self_attn.o_proj",
+            ),
         ]
 
     def internal_flops(self, wl: Workload) -> float:

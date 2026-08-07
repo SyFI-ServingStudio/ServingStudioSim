@@ -37,6 +37,10 @@ class AttentionSemantic:
     byte_kind: str = "kv"
     flops: float = 0.0
     bytes: float = 0.0
+    #: Precision this row's math runs at, when the mechanism fixes it independently
+    #: of the checkpoint's weight quantization (DSA computes index logits in FP8 but
+    #: the sparse MLA kernel in BF16). ``None`` inherits the caller's default.
+    compute_dtype: str | None = None
 
 
 class AttentionSpec(Protocol):

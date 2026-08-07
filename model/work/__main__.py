@@ -116,16 +116,20 @@ def _print_human(raw_config: dict, model, workload: Workload, label, gpu: str, d
     rows = label.segment_rows(gpu, dtype, num_gpus)
     tokens = workload.matmul_tokens
 
-    print(f"\n── roofline ({gpu}, {dtype}, {num_gpus} GPU) ──")
+    # Each segment names its own precision; `dtype` only fills in for the ones
+    # that do not, so print what was actually used rather than the fallback.
+    used_dtypes = sorted({row["compute_dtype"] for row in rows})
+    print(f"\n── roofline ({gpu}, {'+'.join(used_dtypes)}, {num_gpus} GPU) ──")
     print(f"  global floor (full fusion)  {global_floor:9.4f} ms   [{bound}-bound]")
     print(f"  segmented lower bound       {segmented:9.4f} ms   <- realistic (Σ per-op)")
     if segmented > 0 and tokens > 0:
         print(f"  ceiling throughput          {tokens / segmented * 1e3:>12,.0f} tok/s")
 
-    print(f"\n    {'op':<12}{'FLOPs':>10}{'bytes':>12}{'bound':>9}{'ms':>10}")
+    print(f"\n    {'op':<12}{'FLOPs':>10}{'bytes':>12}{'dtype':>7}{'bound':>9}{'ms':>10}")
     for row in rows:
         print(f"    {row['name']:<12}{_fmt_count(row['flops']):>10}"
-              f"{_fmt_bytes(row['bytes']):>12}{row['bound']:>9}{row['ms']:>10.4f}")
+              f"{_fmt_bytes(row['bytes']):>12}{row['compute_dtype']:>7}"
+              f"{row['bound']:>9}{row['ms']:>10.4f}")
 
 
 def main(argv: list[str] | None = None) -> None:

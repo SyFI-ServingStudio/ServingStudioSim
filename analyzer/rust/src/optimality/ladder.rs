@@ -196,17 +196,22 @@ pub(super) struct KernelNecessaryWork {
 }
 
 impl KernelNecessaryWork {
+    /// Roll several semantic rows up into one location.
+    ///
+    /// `compute_gpu_s` arrives already summed by the caller rather than being
+    /// derived here from one peak: a model is mixed-precision, so the rows behind
+    /// one location can divide by different peaks (an FP8 GEMM and the BF16
+    /// FlashMLA kernel next to it).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_rates_with_roofline(
         semantics: impl IntoIterator<Item = String>,
         min_flops: f64,
         min_bytes: f64,
-        peak_tflops: f64,
+        compute_gpu_s: f64,
         bandwidth_gbps: f64,
         roofline_gpu_s: f64,
         gpu_count: f64,
     ) -> Self {
-        let compute_gpu_s = min_flops / (peak_tflops * 1e12);
         let memory_gpu_s = min_bytes / (bandwidth_gbps * 1e9);
         Self::from_gpu_seconds(
             semantics,

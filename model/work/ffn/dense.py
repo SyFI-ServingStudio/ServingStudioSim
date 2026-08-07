@@ -14,6 +14,18 @@ class DenseSwiGLU:
 
     def matmul_groups(self) -> list[MatmulGroup]:
         return [
-            MatmulGroup("gate_up", n=2 * self.intermediate, k=self.hidden, bucket="dense_ffn"),
-            MatmulGroup("down", n=self.hidden, k=self.intermediate, bucket="dense_ffn"),
+            MatmulGroup(
+                "gate_up",
+                n=2 * self.intermediate,
+                k=self.hidden,
+                bucket="dense_ffn",
+                module="mlp.gate_up_proj",
+            ),
+            MatmulGroup(
+                "down",
+                n=self.hidden,
+                k=self.intermediate,
+                bucket="dense_ffn",
+                module="mlp.down_proj",
+            ),
         ]

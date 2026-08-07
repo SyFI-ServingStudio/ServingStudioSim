@@ -74,8 +74,13 @@ def test_parameter_count_subprocess_contract():
 
 def test_floor_batch_isolates_one_heterogeneous_level(monkeypatch, model):
     pool_specs = {
-        "main": {"config": str(CONFIG), "gpu": "H200", "dtype": "bf16"},
-        "other": {"config": "different-model.json", "gpu": "H200", "dtype": "bf16"},
+        "main": {"config": str(CONFIG), "gpu": "H200", "dtype": "bf16", "arch_fp8": False},
+        "other": {
+            "config": "different-model.json",
+            "gpu": "H200",
+            "dtype": "bf16",
+            "arch_fp8": False,
+        },
     }
     monkeypatch.setattr(work_floors, "_pool_specs", lambda _log_dir: pool_specs)
     monkeypatch.setattr(work_floors, "_model", lambda _config_path: model)
@@ -100,7 +105,7 @@ def test_floor_batch_isolates_one_heterogeneous_level(monkeypatch, model):
 def test_locked_composition_evaluates_each_shape_before_addition(
     monkeypatch, model, force_direct_fallback
 ):
-    spec = {"config": str(CONFIG), "gpu": "H200", "dtype": "bf16"}
+    spec = {"config": str(CONFIG), "gpu": "H200", "dtype": "bf16", "arch_fp8": False}
     monkeypatch.setattr(work_floors, "_pool_specs", lambda _log_dir: {"main": spec})
     monkeypatch.setattr(work_floors, "_model", lambda _config_path: model)
     if force_direct_fallback:
@@ -683,3 +688,226 @@ def test_gated_attention_doubles_q_projection():
     qkv_gated = next(g for g in gated.matmul_groups() if g.name == "qkv")
     assert qkv_plain.n == (24 + 2 * 4) * 256  # 8192
     assert qkv_gated.n == qkv_plain.n + 24 * 256  # + output gate on the q side = 14336
+
+
+# --------------------------------------------------------------------------- #
+# Mixed precision: a quantized checkpoint's weight bytes and per-segment peaks
+# --------------------------------------------------------------------------- #
+
+GLM52_FP8 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm52_fp8.json"
+QWEN3_235B = (
+    Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b_thinking_2507.json"
+)
+QWEN3_235B_FP8 = (
+    Path(__file__).resolve().parents[1]
+    / "model"
+    / "config"
+    / "qwen3_235b_thinking_2507_fp8.json"
+)
+QWEN3_235B_A22B = Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b.json"
+QWEN3_235B_A22B_FP8 = (
+    Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b_fp8.json"
+)
+
+# Enough tokens that balls-in-bins loads every routed expert, so weight bytes are
+# the whole checkpoint rather than the hit subset.
+FULL_LOAD = Workload.causal_lm(prefill=[(1_000_000, 0)], sampled=1)
+
+
+@pytest.mark.parametrize(
+    ("bf16_path", "fp8_path"),
+    [
+        (GLM52, GLM52_FP8),
+        (QWEN3_235B, QWEN3_235B_FP8),
+        (QWEN3_235B_A22B, QWEN3_235B_A22B_FP8),
+    ],
+)
+def test_fp8_config_differs_from_its_bf16_twin_by_exactly_one_key(bf16_path, fp8_path):
+    """Both files are verbatim HF downloads; the FP8 repo adds only the quant block.
+
+    If either side is ever hand-edited, or upstream changes one and not the other,
+    this drifts and the pair no longer describes the same model.
+    """
+    bf16 = json.loads(bf16_path.read_text())
+    fp8 = json.loads(fp8_path.read_text())
+    quantization = fp8.pop("quantization_config")
+    assert fp8 == bf16
+    assert quantization["quant_method"] == "fp8"
+    assert quantization["fmt"] == "e4m3"
+    assert quantization["weight_block_size"] == [128, 128]
+
+
+def test_glm52_fp8_weight_bytes_are_half_the_bf16_checkpoint():
+    """The strongest independent check: predict the FP8 byte total from scratch.
+
+    741.35e9 converted weights at one byte + their FP32 block scales + the 2.03e9
+    parameters the checkpoint declines to convert at two bytes. Cross-checked
+    against the published `total_size` of 755,617,140,416 bytes minus the MTP
+    layer model.work does not build (~9.96e9) = 745.7e9.
+    """
+    fp8 = load_model(GLM52_FP8)
+    bf16 = load_model(GLM52)
+    fp8_label = fp8.label(FULL_LOAD)
+    bf16_label = bf16.label(FULL_LOAD)
+
+    converted = not_converted = 0
+    for stack in fp8.layers:
+        for group in (*stack.attn.matmul_groups(), *stack.ffn.matmul_groups()):
+            params = group.total_params * stack.count
+            if fp8.quant.is_converted(group.module):
+                converted += params
+            else:
+                not_converted += params
+    norm_params = sum(norm.elements * norm.count for norm in fp8.norm_weights)
+    embed_and_head = 2 * GLM_VOCAB * GLM_HIDDEN
+    predicted = (
+        converted
+        + converted / (128 * 128) * 4  # one FP32 scale per 128x128 block
+        + (not_converted + norm_params + embed_and_head) * GLM_BF16_BYTES
+    )
+    assert fp8_label.bytes["weights"] == pytest.approx(predicted)
+    assert fp8_label.bytes["weights"] == pytest.approx(745.58e9, rel=1e-3)
+    fp8_ratio = fp8_label.bytes["weights"] / bf16_label.bytes["weights"]
+    assert fp8_ratio == pytest.approx(0.5015, abs=1e-4)
+
+    # Quantization changes stored bytes, never parameter counts or FLOPs.
+    assert fp8_label.params == bf16_label.params
+    assert fp8_label.flops == bf16_label.flops
+    assert fp8_label.bytes["kv"] == bf16_label.bytes["kv"]
+
+
+def test_glm52_fp8_leaves_router_and_indexer_weights_at_the_master_dtype():
+    """Exactly two matmul families sit in the checkpoint's modules_to_not_convert."""
+    model = load_model(GLM52_FP8)
+    unconverted = {
+        group.name
+        for stack in model.layers
+        for group in (*stack.attn.matmul_groups(), *stack.ffn.matmul_groups())
+        if not model.quant.is_converted(group.module)
+    }
+    assert unconverted == {"router", "indexer.weights_proj"}
+    # `mlp.gate` must not swallow the dense layers' `mlp.gate_up_proj`.
+    assert model.quant.is_converted("mlp.gate_up_proj")
+    assert not model.quant.is_converted("mlp.gate")
+    assert not model.quant.is_converted("mlp.gate.e_score_correction_bias")
+
+
+def test_glm52_fp8_compute_floor_is_mixed_not_globally_fp8():
+    """~20% of the FLOPs stay on the BF16 tensor cores, so one global peak is wrong.
+
+    Sparse MLA runs vLLM's BF16 FlashMLA kernel, and the router / lm_head /
+    indexer weight projection are unconverted. H200's FP8 peak is 1979 against
+    990 BF16, so the mixed compute floor exceeds the naive all-FP8 one by exactly
+    `bf16_share * (1979/990 - 1)` — a fifth on the alignment run's prefill shape,
+    not a rounding detail.
+    """
+    model = load_model(GLM52_FP8)
+    for workload, expected_bf16_share in (
+        (Workload.causal_lm(prefill=[(8192, 0)], sampled=1), 0.1994),
+        (Workload.causal_lm(decode=[4096] * 64, sampled=64), 0.2356),
+    ):
+        label = model.label(workload)
+        flops_by_dtype: dict[str, float] = {}
+        for segment in label.segments:
+            flops_by_dtype[segment.compute_dtype] = (
+                flops_by_dtype.get(segment.compute_dtype, 0.0) + segment.flops_total
+            )
+        assert set(flops_by_dtype) == {"fp8", "bf16"}
+        bf16_share = flops_by_dtype["bf16"] / sum(flops_by_dtype.values())
+        assert bf16_share == pytest.approx(expected_bf16_share, abs=1e-4)
+
+        mixed_compute_ms, _memory_ms, _bound = label.roofline_ms("H200", "fp8")
+        naive_fp8_ms = label.flops_total / (1979.0 * 1e12) * 1e3
+        penalty = bf16_share * (1979.0 / 990.0 - 1.0)
+        assert mixed_compute_ms / naive_fp8_ms == pytest.approx(1.0 + penalty, rel=1e-9)
+
+    # The BF16 twin makes no fp8 claim on its matmuls, but the DSA index logits
+    # are FP8 by construction of the mechanism, not of the checkpoint.
+    bf16_dtypes = {
+        segment.compute_dtype for segment in load_model(GLM52).label(FULL_LOAD).segments
+    }
+    assert bf16_dtypes == {"bf16", "fp8"}
+
+
+def test_floors_refuses_a_run_whose_arch_precision_contradicts_its_config():
+    fp8_spec = {"config": str(GLM52_FP8), "gpu": "H200", "dtype": "fp8", "arch_fp8": True}
+    bf16_spec = {"config": str(GLM52), "gpu": "H200", "dtype": "bf16", "arch_fp8": False}
+    work_floors._check_precision(load_model(GLM52_FP8), fp8_spec)
+    work_floors._check_precision(load_model(GLM52), bf16_spec)
+    with pytest.raises(ValueError, match="no quantization_config"):
+        work_floors._check_precision(load_model(GLM52), {**bf16_spec, "arch_fp8": True})
+    with pytest.raises(ValueError, match="does not set fp8"):
+        work_floors._check_precision(load_model(GLM52_FP8), {**fp8_spec, "arch_fp8": False})
+
+
+def test_vllm_location_map_covers_every_non_communication_leaf():
+    """Same semantic rows as the native map, over vLLM's finer leaf decomposition."""
+    names = {
+        segment.name
+        for segment in load_model(GLM52_FP8)
+        .label(Workload.causal_lm(prefill=[(8, 0)], decode=[4096], sampled=2))
+        .segments
+    }
+    maps_dir = Path(__file__).resolve().parents[1] / "model" / "work" / "location_maps"
+    location_map = json.loads((maps_dir / "glm52_vllm_dsa_moe_unified.json").read_text())
+    assert location_map["schema_version"] == 1
+    assert location_map["arch_types"] == ["glm52_vllm_dsa_moe"]
+    locations = [row["location"] for row in location_map["locations"]]
+    assert len(locations) == len(set(locations)) == 166
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    assert len(mapped) == len(set(mapped))
+    assert set(mapped) == names
+    # The MoE exchange itself is communication and must not appear as a location.
+    assert not any(
+        location.endswith((".moe.dispatch", ".moe.combine")) for location in locations
+    )
+    # vLLM splits each routed-expert projection into a quantize and a grouped GEMM;
+    # only the GEMM carries the semantic weight work.
+    native = json.loads((maps_dir / "glm52_dsa_moe_unified.json").read_text())
+    native_semantics = {
+        row["location"]: row["semantics"] for row in native["locations"]
+    }
+    vllm_semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    for tag in (
+        "sparse_initial_index_share",
+        "sparse_cycle_full_index",
+        "sparse_cycle_index_share",
+    ):
+        for projection in ("gate_up", "down"):
+            native_name = f"unified.body.{tag}.moe.routed_experts.{projection}"
+            assert vllm_semantics[f"{native_name}.gemm"] == native_semantics[native_name]
+            assert vllm_semantics[f"{native_name}.input_quant"] == []
+
+
+def test_qwen3_moe_fp8_quantizes_experts_but_not_the_router():
+    """The shared MoE/GQA specs carry checkpoint module names, so Qwen quantizes too."""
+    fp8 = load_model(QWEN3_235B_A22B_FP8)
+    bf16 = load_model(QWEN3_235B_A22B)
+    unconverted = {
+        group.name
+        for stack in fp8.layers
+        for group in (*stack.attn.matmul_groups(), *stack.ffn.matmul_groups())
+        if not fp8.quant.is_converted(group.module)
+    }
+    assert unconverted == {"router"}
+
+    workload = Workload.causal_lm(prefill=[(1_000_000, 0)], sampled=1)
+    fp8_label, bf16_label = fp8.label(workload), bf16.label(workload)
+    assert fp8_label.params == bf16_label.params
+    assert fp8_label.flops == bf16_label.flops
+    # lm_head and the embedding table stay BF16 in this checkpoint too, so the
+    # ratio sits just above the 0.5 a fully converted model would reach.
+    ratio = fp8_label.bytes["weights"] / bf16_label.bytes["weights"]
+    assert 0.50 < ratio < 0.52
+
+    # modules_to_not_convert is an exclusion list over the Linear modules the
+    # quantizer walks, so it is silent about the embedding table here while GLM
+    # lists it explicitly. Neither checkpoint stores a
+    # `model.embed_tokens.weight_scale_inv`, so both must price it at BF16.
+    assert fp8.quant.is_converted("embed_tokens")
+    assert not load_model(GLM52_FP8).quant.is_converted("embed_tokens")
+    for model, label in ((fp8, fp8_label), (load_model(GLM52_FP8), None)):
+        label = label or model.label(FULL_LOAD)
+        embedding = next(seg for seg in label.segments if seg.name == "embedding")
+        assert embedding.compute_dtype == "bf16"
+        assert embedding.bytes == min(1_000_000, model.vocab) * model.hidden * 2
