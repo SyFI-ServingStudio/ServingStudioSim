@@ -36,6 +36,7 @@ use super::artifact::read_json;
 use super::discovery::{
     display_name, ignored_directory_name, regular_file, timestamp, ConfiguredRoot,
 };
+use super::prediction::{prediction_at, DiscoveredPrediction};
 use super::{AlignmentNotFound, ArtifactNotFound, PROTOCOL_VERSION};
 
 /// The manifest each analysis half writes. Its presence is what makes a
@@ -114,6 +115,25 @@ impl DiscoveredAlignment {
 
     fn subject_href(&self, subject: &str, leaf: &str) -> String {
         format!("alignments/{}/subjects/{subject}/{leaf}", self.alignment_id)
+    }
+
+    /// The timing prediction this bundle's modelled side came out of.
+    ///
+    /// Only the kernel manifest names it, because the modelled side is a
+    /// kernel-half artifact, and it names it as a DIRECTORY — that is what the
+    /// analysis was pointed at. A bundle routinely holds several
+    /// `timing_predict*` directories from re-analyses of the same capture, so
+    /// which one produced these numbers cannot be recovered from the bundle's
+    /// layout; it has to be read out of the manifest that recorded the choice.
+    ///
+    /// A prediction under a different workspace is dropped: the alignment's
+    /// resources are addressed within one workspace, and a cross-workspace id
+    /// would resolve against the wrong root.
+    fn paired_prediction(&self, roots: &[ConfiguredRoot]) -> Option<DiscoveredPrediction> {
+        let manifest = read_json(&self.analysis_dir(KERNEL_ANALYSIS_DIR).join(MANIFEST_FILE)).ok()?;
+        let predict_log_dir = manifest.get("predict_log_dir")?.as_str()?;
+        prediction_at(roots, Path::new(predict_log_dir))
+            .filter(|prediction| prediction.workspace_id == self.workspace_id)
     }
 }
 
@@ -257,7 +277,10 @@ pub(super) fn resolve_alignment(
         .ok_or_else(|| AlignmentNotFound.into())
 }
 
-pub(super) fn alignment_descriptor(alignment: &DiscoveredAlignment) -> Value {
+pub(super) fn alignment_descriptor(
+    alignment: &DiscoveredAlignment,
+    roots: &[ConfiguredRoot],
+) -> Value {
     let subjects: serde_json::Map<String, Value> = SUBJECTS
         .iter()
         .map(|(subject, directory, report)| {
@@ -281,6 +304,7 @@ pub(super) fn alignment_descriptor(alignment: &DiscoveredAlignment) -> Value {
             )
         })
         .collect();
+    let prediction = alignment.paired_prediction(roots);
     json!({
         "schema_version": 1,
         "alignment_id": alignment.alignment_id,
@@ -290,6 +314,14 @@ pub(super) fn alignment_descriptor(alignment: &DiscoveredAlignment) -> Value {
             "kernel_analysis": alignment.half_status(KERNEL_ANALYSIS_DIR),
             "e2e_analysis": alignment.half_status(E2E_ANALYSIS_DIR),
         },
+        // Null is a state, not an absence: a bundle analysed before the
+        // manifest carried the prediction path, or one whose prediction this
+        // service does not serve, must be distinguishable from one whose
+        // prediction is simply not looked up yet.
+        "prediction": prediction.map(|prediction| json!({
+            "prediction_id": prediction.prediction_id(),
+            "display_name": prediction.display_name,
+        })),
         "subjects": subjects,
     })
 }

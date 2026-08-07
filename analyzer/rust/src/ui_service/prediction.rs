@@ -179,6 +179,54 @@ pub(super) fn discover_predictions(roots: &[ConfiguredRoot]) -> Result<Vec<Disco
     Ok(predictions)
 }
 
+/// Recognize the prediction that lives in `directory`, if one does.
+///
+/// This is [`discover_predictions`]'s test applied to a directory another
+/// resource already names, rather than to one a walk arrived at. An alignment
+/// bundle records the timing prediction it was paired against by path — that is
+/// what its analysis was pointed at — and the client needs the opaque id the
+/// prediction routes are addressed by. Walking every root again to translate one
+/// known path would make a bundle's descriptor pay for the whole tree.
+///
+/// `None` means the directory is not a prediction this service would serve, and
+/// the caller must then offer nothing: the walk that populates the catalog would
+/// not have reached it either, so its id would resolve nowhere.
+pub(super) fn prediction_at(
+    roots: &[ConfiguredRoot],
+    directory: &Path,
+) -> Option<DiscoveredPrediction> {
+    // The recorded path was written by an analysis, while roots are canonical.
+    // Compare them in the same form or a root reached through a symlink never
+    // matches the absolute path its own artifacts name.
+    let directory = directory.canonicalize().ok()?;
+    if !regular_file(&directory.join(METADATA_FILE)) {
+        return None;
+    }
+    let (root, relative) = roots.iter().find_map(|root| {
+        let relative = directory.strip_prefix(root.path()).ok()?;
+        Some((root, relative))
+    })?;
+    // Discovery descends into neither dotted directories nor `old-logs`, so a
+    // prediction under one is not servable however directly it is named.
+    if !relative.components().all(|component| match component {
+        Component::Normal(part) => !ignored_directory_name(part),
+        Component::CurDir => true,
+        _ => false,
+    }) {
+        return None;
+    }
+    let metadata: PredictionMetadata =
+        serde_json::from_value(read_json(&directory.join(METADATA_FILE)).ok()?).ok()?;
+    validate_metadata(&metadata).ok()?;
+    Some(DiscoveredPrediction {
+        workspace_id: root.workspace_id().to_owned(),
+        display_name: display_name(root.path(), relative),
+        updated_time: prediction_updated_at(&directory),
+        path: directory,
+        metadata,
+    })
+}
+
 pub(super) fn resolve_prediction(
     roots: &[ConfiguredRoot],
     prediction_id: &str,

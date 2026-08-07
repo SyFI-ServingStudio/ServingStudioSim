@@ -569,8 +569,13 @@ async fn get_alignment_descriptor(
     RoutePath(alignment_id): RoutePath<String>,
     State(state): State<ServiceState>,
 ) -> Response {
-    match state.resolve_alignment(&alignment_id) {
-        Ok(alignment) => Json(alignment_descriptor(&alignment)).into_response(),
+    // The descriptor names the timing prediction the bundle was paired against,
+    // and that name is only servable relative to the configured roots.
+    match state
+        .resolve_alignment(&alignment_id)
+        .and_then(|alignment| Ok((alignment, state.root_source.load()?)))
+    {
+        Ok((alignment, roots)) => Json(alignment_descriptor(&alignment, &roots)).into_response(),
         Err(error) => alignment_resource_error(error),
     }
 }

@@ -2705,7 +2705,15 @@ fn write_alignment_bundle(root: &Path) -> (Vec<u8>, [usize; 2]) {
     let kernel = bundle.join("analysis_kernel");
     fs::create_dir_all(kernel.join("reports")).expect("kernel reports");
     fs::create_dir_all(kernel.join("payloads")).expect("kernel payloads");
-    fs::write(kernel.join("alignment_manifest.json"), "{}").expect("kernel manifest");
+    // Two prediction directories, as a re-analysed capture really has, so the
+    // descriptor cannot pass by picking whichever one the layout offers first.
+    make_prediction(&bundle.join("timing_predict"), "p_paired");
+    make_prediction(&bundle.join("timing_predict_second_pass"), "p_unused");
+    fs::write(
+        kernel.join("alignment_manifest.json"),
+        json!({"predict_log_dir": bundle.join("timing_predict")}).to_string(),
+    )
+    .expect("kernel manifest");
     fs::write(
         kernel.join("reports/alignment_timeline_report.json"),
         json!({"iterations": [{"iteration_id": 8}]}).to_string(),
@@ -2801,7 +2809,7 @@ fn an_ungenerated_subject_is_named_but_offers_no_href() {
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
     let alignment = &discover_alignments(&roots).expect("discover")[0];
 
-    let descriptor = alignment_descriptor(alignment);
+    let descriptor = alignment_descriptor(alignment, &roots);
 
     assert_eq!(descriptor["subjects"]["timeline"]["status"], "ready");
     assert!(descriptor["subjects"]["timeline"]["payload_href"].is_string());
@@ -2812,6 +2820,77 @@ fn an_ungenerated_subject_is_named_but_offers_no_href() {
     // Only the sharded subjects offer a per-iteration href.
     assert!(descriptor["subjects"]["timeline"]["iteration_href"].is_string());
     assert!(descriptor["subjects"]["e2e"]["iteration_href"].is_null());
+}
+
+#[test]
+fn the_descriptor_names_the_prediction_the_kernel_half_was_paired_against() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let alignment = &discover_alignments(&roots).expect("discover")[0];
+
+    let descriptor = alignment_descriptor(alignment, &roots);
+
+    // The manifest recorded which of the bundle's two prediction directories
+    // produced these numbers. Anything that reads the layout instead would be
+    // free to answer `p_unused`.
+    assert_eq!(
+        descriptor["prediction"]["prediction_id"],
+        "p_paired",
+        "the descriptor must name the prediction the manifest recorded"
+    );
+    assert_eq!(
+        descriptor["prediction"]["display_name"],
+        "20260720_0_llama3_8b_tp_alignment/tp4/rate32/timing_predict"
+    );
+}
+
+#[test]
+fn a_bundle_whose_manifest_names_no_prediction_offers_none() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let bundle = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    // As every bundle analysed before the manifest carried the path looks.
+    fs::write(bundle.join("analysis_kernel/alignment_manifest.json"), "{}")
+        .expect("rewrite kernel manifest");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let alignment = &discover_alignments(&roots).expect("discover")[0];
+
+    let descriptor = alignment_descriptor(alignment, &roots);
+
+    // Null, not absent: the client distinguishes "no prediction to offer" from
+    // "this service is too old to say".
+    assert!(descriptor.get("prediction").is_some());
+    assert!(descriptor["prediction"].is_null());
+}
+
+#[test]
+fn a_prediction_directory_outside_the_served_roots_is_not_offered() {
+    let temporary = TempDir::new().expect("temp dir");
+    let elsewhere = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    // A prediction that exists on disk but that no walk of the configured roots
+    // would reach. Naming its id would hand the client a link to a 404.
+    make_prediction(&elsewhere.path().join("timing_predict"), "p_unreachable");
+    let bundle = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    fs::write(
+        bundle.join("analysis_kernel/alignment_manifest.json"),
+        json!({"predict_log_dir": elsewhere.path().join("timing_predict")}).to_string(),
+    )
+    .expect("rewrite kernel manifest");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let alignment = &discover_alignments(&roots).expect("discover")[0];
+
+    let descriptor = alignment_descriptor(alignment, &roots);
+
+    assert!(descriptor["prediction"].is_null());
 }
 
 #[test]
