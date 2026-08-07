@@ -12,6 +12,9 @@ from .vllm_text import build_cases
 INPUT_MANIFEST_NAME = "timing_predict_input_manifest.json"
 
 
+GROUP_ASSIGNMENTS = ("single", "per_dp_rank")
+
+
 @dataclass(frozen=True)
 class VllmTextInputSpec:
     """One concrete measured-vLLM-text → iter-wise predictor conversion.
@@ -26,8 +29,11 @@ class VllmTextInputSpec:
     def validate(self) -> None:
         if not self.measured_phase.strip():
             raise ValueError("input_builder.measured_phase must be non-empty")
-        if self.group_assignment != "single":
-            raise ValueError("input_builder.group_assignment must be 'single' in v1")
+        if self.group_assignment not in GROUP_ASSIGNMENTS:
+            raise ValueError(
+                "input_builder.group_assignment must be one of "
+                f"{list(GROUP_ASSIGNMENTS)}, got {self.group_assignment!r}"
+            )
 
     def to_mapping(self) -> dict[str, str]:
         return {
@@ -77,7 +83,11 @@ def build_inputs(request: BuildRequest) -> BuildResult:
     parsed = json.loads(request.parsed_nsys.read_text())
     if not isinstance(parsed, dict):
         raise ValueError(f"parsed NSYS root must be a JSON object: {request.parsed_nsys}")
-    cases, case_map, excluded = build_cases(parsed, request.input_spec.measured_phase)
+    cases, case_map, excluded = build_cases(
+        parsed,
+        request.input_spec.measured_phase,
+        request.input_spec.group_assignment,
+    )
 
     output_dir = request.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)

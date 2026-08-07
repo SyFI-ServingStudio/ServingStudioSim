@@ -288,6 +288,55 @@ def load_analyze_config(path: Path) -> AnalyzePhaseConfig:
     return config
 
 
+def _validate_iteration_list(value: Any, context: str) -> list[int]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, int) and item >= 0 for item in value)
+    ):
+        raise ValueError(f"{context} must be a non-empty list of non-negative integers")
+    return value
+
+
+def _labeled_sequence_positions(
+    sequence: dict[str, Any], context: str, schema_version: int
+) -> set[tuple[int | None, int]]:
+    """The measured positions one labeled sequence claims.
+
+    Schema 4 stores a union catalog, so a sequence names the exact devices that
+    executed it; earlier schemas stored one representative sequence covering
+    every device, leaving the iteration as the whole position.
+    """
+    if schema_version != 4:
+        return {
+            (None, iteration)
+            for iteration in _validate_iteration_list(
+                sequence["iterations"], f"{context}.iterations"
+            )
+        }
+
+    occurrences = sequence["occurrences"]
+    if not isinstance(occurrences, list) or not occurrences:
+        raise ValueError(f"{context}.occurrences must be a non-empty list")
+    positions: set[tuple[int | None, int]] = set()
+    seen_devices: set[int] = set()
+    for occurrence_index, occurrence in enumerate(occurrences):
+        occurrence_context = f"{context}.occurrences[{occurrence_index}]"
+        if not isinstance(occurrence, dict) or set(occurrence) != {"device_id", "iterations"}:
+            raise ValueError(f"{occurrence_context} must hold only device_id and iterations")
+        device_id = occurrence["device_id"]
+        if not isinstance(device_id, int) or device_id < 0:
+            raise ValueError(f"{occurrence_context}.device_id must be a non-negative integer")
+        if device_id in seen_devices:
+            raise ValueError(f"{occurrence_context} repeats device {device_id}")
+        seen_devices.add(device_id)
+        for iteration in _validate_iteration_list(
+            occurrence["iterations"], f"{occurrence_context}.iterations"
+        ):
+            positions.add((device_id, iteration))
+    return positions
+
+
 def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
     """Validate the self-contained folded inventory before snapshotting it."""
     path = Path(path)
@@ -298,6 +347,8 @@ def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
     required = {"schema_version", "encoding", "source_parsed", "folding_policy", "phases"}
     if schema_version == 3:
         required.update({"device_ids", "representative_device_id"})
+    if schema_version == 4:
+        required.add("device_ids")
     extra = set(raw) - required
     missing = required - set(raw)
     if extra or missing:
@@ -305,13 +356,12 @@ def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
             "labeled kernel sequence keys mismatch: "
             f"missing={sorted(missing)} extra={sorted(extra)}"
         )
-    if schema_version not in {2, 3} or raw["encoding"] != "folded-v1":
+    if schema_version not in {2, 3, 4} or raw["encoding"] != "folded-v1":
         raise ValueError(
-            "labeled kernel sequences require schema_version 2 or 3 encoding folded-v1"
+            "labeled kernel sequences require schema_version 2, 3 or 4 encoding folded-v1"
         )
-    if schema_version == 3:
+    if schema_version in {3, 4}:
         device_ids = raw["device_ids"]
-        representative_device_id = raw["representative_device_id"]
         if (
             not isinstance(device_ids, list)
             or not device_ids
@@ -319,11 +369,11 @@ def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
             or len(set(device_ids)) != len(device_ids)
             or device_ids != sorted(device_ids)
         ):
-            raise ValueError("schema-v3 device_ids must be sorted unique nonnegative integers")
-        if representative_device_id != device_ids[0]:
             raise ValueError(
-                "schema-v3 representative_device_id must be the first device_ids entry"
+                f"schema-v{schema_version} device_ids must be sorted unique nonnegative integers"
             )
+    if schema_version == 3 and raw["representative_device_id"] != raw["device_ids"][0]:
+        raise ValueError("schema-v3 representative_device_id must be the first device_ids entry")
     phases = raw["phases"]
     if not isinstance(phases, dict) or not phases:
         raise ValueError("labeled kernel sequences phases must be a non-empty mapping")
@@ -338,12 +388,18 @@ def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
         if not isinstance(sequences, list) or not sequences:
             raise ValueError(f"phase {phase_name!r} unique_sequences must be non-empty")
         sequence_ids: set[str] = set()
-        assigned_iterations: set[int] = set()
+        # One measured position — a (device, iteration) pair — executes exactly one
+        # sequence, so it may be claimed once. Before schema 4 the inventory held a
+        # single representative sequence applied to every device, so the position
+        # was the iteration alone.
+        assigned_positions: set[tuple[int | None, int]] = set()
+        position_label = "(device, iteration) pairs" if schema_version == 4 else "iterations"
+        occurrence_key = "occurrences" if schema_version == 4 else "iterations"
         for index, sequence in enumerate(sequences):
             context = f"phases.{phase_name}.unique_sequences[{index}]"
             if not isinstance(sequence, dict) or set(sequence) != {
                 "sequence_id",
-                "iterations",
+                occurrence_key,
                 "expanded_kernel_count",
                 "program",
             }:
@@ -353,19 +409,13 @@ def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
             if sequence_id in sequence_ids:
                 raise ValueError(f"{context} duplicates sequence_id {sequence_id!r}")
             sequence_ids.add(sequence_id)
-            iterations = sequence["iterations"]
-            if (
-                not isinstance(iterations, list)
-                or not iterations
-                or not all(isinstance(value, int) and value >= 0 for value in iterations)
-            ):
-                raise ValueError(f"{context}.iterations must be non-negative integers")
-            overlap = assigned_iterations.intersection(iterations)
+            positions = _labeled_sequence_positions(sequence, context, schema_version)
+            overlap = assigned_positions.intersection(positions)
             if overlap:
                 raise ValueError(
-                    f"phase {phase_name!r} assigns iterations twice: {sorted(overlap)}"
+                    f"phase {phase_name!r} assigns {position_label} twice: {sorted(overlap)}"
                 )
-            assigned_iterations.update(iterations)
+            assigned_positions.update(positions)
             expanded = _validate_labeled_program(
                 sequence["program"], context, operation_signatures, slots
             )

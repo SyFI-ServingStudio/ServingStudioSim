@@ -318,16 +318,19 @@ def test_alignment_sim_rejects_below_unity_multiplier(tmp_path, monkeypatch, cap
 def test_profile_config_is_profile_only_and_config_relative(tmp_path, monkeypatch):
     paths = _phase_configs(tmp_path)
     profiled = []
+    resumed = []
     monkeypatch.setattr(
         alignment_launcher,
         "run_profile",
-        lambda config: (
+        lambda config, *, resume=False: (
             profiled.append(config)
+            or resumed.append(resume)
             or {"parsed_nsys": str(tmp_path / "profile_run" / "parsed.json")}
         ),
     )
 
     assert alignment_launcher.main(["profile", str(paths["profile"])]) == 0
+    assert resumed == [False]
     config = profiled[0]
     assert not hasattr(config, "analysis")
     assert not hasattr(config, "output_dirs")
@@ -846,3 +849,20 @@ def test_launcher_main_dispatches_alignment_subcommand(monkeypatch):
     monkeypatch.setattr(alignment_launcher, "main", lambda argv: received.append(argv) or 0)
     assert launcher_main.main(["alignment", "profile", "profile.yaml"]) == 0
     assert received == [["profile", "profile.yaml"]]
+
+
+def test_profile_resume_flag_reaches_the_runner(tmp_path, monkeypatch):
+    """A post-capture failure must be recoverable without re-running the GPU."""
+    paths = _phase_configs(tmp_path)
+    resumed = []
+    monkeypatch.setattr(
+        alignment_launcher,
+        "run_profile",
+        lambda config, *, resume=False: (
+            resumed.append(resume)
+            or {"parsed_nsys": str(tmp_path / "profile_run" / "parsed.json")}
+        ),
+    )
+
+    assert alignment_launcher.main(["profile", str(paths["profile"]), "--resume"]) == 0
+    assert resumed == [True]

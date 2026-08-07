@@ -40,6 +40,21 @@ _ALIGNMENT_REQUEST_TIMING_RE = re.compile(r"VibeSimAlignmentRequestTiming\s+(\{.
 _ALIGNMENT_EXPERT_LOAD_RE = re.compile(r"VibeSimAlignmentExpertLoad\s+(\{.*\})\s*$")
 _COMPLETION_ENGINE_REQUEST_RE = re.compile(r"^cmpl-(.+)-0$")
 
+# Data-parallel provenance recovered from vLLM's multiproc log prefixes rather
+# than from the record body. Every DP rank runs its own EngineCore with its own
+# independent scheduler and its own iteration numbering, so a bare iteration
+# index is ambiguous once `dp_size > 1` — a rank tag is mandatory to join a
+# measured batch shape to the device that executed it. Recovering it from the
+# prefix (instead of adding a record field) keeps one code path that works on
+# every capture ever taken, including the ones that predate this change.
+_ENGINE_CORE_PREFIX_RE = re.compile(r"^\(EngineCore(?:_DP(\d+))?\s+pid=(\d+)\)")
+# vLLM's parallel-state banner, emitted once per worker process at startup. It
+# is the only place the worker pid ↔ global rank identity is stated; nsys knows
+# pid ↔ CUDA device, so the two together give rank ↔ device.
+_WORKER_RANK_RE = re.compile(
+    r"^\(Worker[^)]*\s+pid=(\d+)\).*\bworld_size=(\d+)\s+rank=(\d+)\s+local_rank=(\d+)"
+)
+
 
 def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
     """The `python -m vllm.entrypoints.openai.api_server ...` argv."""
@@ -381,12 +396,48 @@ def wait_for_ready(base_url: str, process: subprocess.Popen, timeout: float) -> 
     raise TimeoutError(f"vLLM server not ready within {timeout}s")
 
 
-def extract_metrics_jsonl(server_log: Path, out_jsonl: Path) -> int:
+def extract_worker_device_ranks(server_log: Path) -> dict[int, int]:
+    """worker pid → global rank, from vLLM's per-worker parallel-state banner.
+
+    The caller pairs this with nsys's pid → CUDA device mapping to learn which
+    device executed which rank. Returned empty when the log carries no banner
+    (single-process captures), which the parser treats as "one rank on device 0".
+    """
+    ranks: dict[int, int] = {}
+    world_sizes: set[int] = set()
+    for line in Path(server_log).read_text(errors="replace").splitlines():
+        match = _WORKER_RANK_RE.match(line)
+        if not match:
+            continue
+        pid, world_size, rank = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        previous = ranks.setdefault(pid, rank)
+        if previous != rank:
+            raise ValueError(f"worker pid {pid} reports two ranks: {previous} and {rank}")
+        world_sizes.add(world_size)
+    if len(world_sizes) > 1:
+        raise ValueError(f"workers disagree on world_size: {sorted(world_sizes)}")
+    if ranks and len(set(ranks.values())) != len(ranks):
+        raise ValueError(f"worker ranks are not unique: {sorted(ranks.items())}")
+    if world_sizes and len(ranks) != next(iter(world_sizes)):
+        raise ValueError(
+            f"found {len(ranks)} worker rank banners but world_size={next(iter(world_sizes))}"
+        )
+    return ranks
+
+
+def extract_metrics_jsonl(server_log: Path, out_jsonl: Path, *, dp_size: int = 1) -> int:
     """Extract canonical structured iteration records into a metrics JSONL.
 
     The fork emits one `VibeSimAlignmentIteration {json}` line per model step.
     Exact prefill/decode shapes are retained for the typed timing-predict input
     adapter; `nsys_parse` also uses `prefill_tokens` for stage tagging.
+
+    Each row is stamped with the `dp_rank` of the EngineCore that emitted it.
+    Under data parallelism every rank schedules an independent batch and numbers
+    its own iterations, so `(dp_rank, iteration_index)` — not `iteration_index`
+    alone — is the identity of one measured batch shape. A `dp_size > 1` capture
+    therefore *requires* the rank tag and fails without it, while a single
+    EngineCore needs no prefix and lands on rank 0.
     """
     required = {
         "schema_version",
@@ -404,7 +455,24 @@ def extract_metrics_jsonl(server_log: Path, out_jsonl: Path) -> int:
             m = _ALIGNMENT_ITERATION_RE.search(line)
             if not m:
                 continue
+            prefix = _ENGINE_CORE_PREFIX_RE.match(line)
+            if prefix is None or prefix.group(1) is None:
+                if dp_size > 1:
+                    raise ValueError(
+                        "alignment iteration record carries no EngineCore_DP<k> log prefix, so "
+                        f"its DP rank cannot be established in a dp_size={dp_size} capture: "
+                        f"{line[:120]!r}"
+                    )
+                dp_rank = 0
+            else:
+                dp_rank = int(prefix.group(1))
             row = json.loads(m.group(1))
+            if row.get("dp_rank", dp_rank) != dp_rank:
+                raise ValueError(
+                    f"alignment iteration record claims dp_rank {row['dp_rank']} but was "
+                    f"emitted by EngineCore_DP{dp_rank}"
+                )
+            row["dp_rank"] = dp_rank
             missing = required - set(row)
             if missing:
                 raise ValueError(f"alignment iteration record missing fields {sorted(missing)}")

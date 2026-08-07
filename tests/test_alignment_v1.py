@@ -87,7 +87,8 @@ def test_structured_vllm_iteration_record_is_the_only_metrics_contract(tmp_path)
     output = tmp_path / "metrics.jsonl"
 
     assert vllm_server.extract_metrics_jsonl(server_log, output) == 1
-    assert json.loads(output.read_text()) == record
+    # A single-EngineCore capture needs no rank prefix and lands on rank 0.
+    assert json.loads(output.read_text()) == {**record, "dp_rank": 0}
 
 
 def test_structured_vllm_iteration_v2_requires_observed_timing(tmp_path):
@@ -109,7 +110,72 @@ def test_structured_vllm_iteration_v2_requires_observed_timing(tmp_path):
     output = tmp_path / "metrics.jsonl"
 
     assert vllm_server.extract_metrics_jsonl(server_log, output) == 1
-    assert json.loads(output.read_text()) == record
+    # A single-EngineCore capture needs no rank prefix and lands on rank 0.
+    assert json.loads(output.read_text()) == {**record, "dp_rank": 0}
+
+
+def _dp_iteration_record(iteration: int, prefill_tokens: int) -> dict:
+    return {
+        "schema_version": 1,
+        "input_adapter": "vllm_text",
+        "iteration_index": iteration,
+        "prefill_tokens": prefill_tokens,
+        "decode_requests": 1,
+        "decode_tokens_scheduled": 1,
+        "prefill_chunk_pairs": [[0, prefill_tokens]] if prefill_tokens else [],
+        "decode_kv_lens": [64],
+    }
+
+
+def test_data_parallel_iteration_records_are_stamped_with_their_engine_rank(tmp_path):
+    """Two ranks reuse one iteration index; only the rank tag keeps them apart."""
+    rank0 = _dp_iteration_record(4, prefill_tokens=8)
+    rank1 = _dp_iteration_record(4, prefill_tokens=0)
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        f"(EngineCore_DP0 pid=11) INFO VibeSimAlignmentIteration {json.dumps(rank0)}\n"
+        f"(EngineCore_DP1 pid=12) INFO VibeSimAlignmentIteration {json.dumps(rank1)}\n"
+    )
+    output = tmp_path / "metrics.jsonl"
+
+    assert vllm_server.extract_metrics_jsonl(server_log, output, dp_size=2) == 2
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert rows == [{**rank0, "dp_rank": 0}, {**rank1, "dp_rank": 1}]
+
+
+def test_data_parallel_capture_rejects_untagged_iteration_records(tmp_path):
+    """Silently folding every rank onto rank 0 would destroy dp_size-1 of the data."""
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        f"INFO VibeSimAlignmentIteration {json.dumps(_dp_iteration_record(4, 8))}\n"
+    )
+
+    with pytest.raises(ValueError, match="no EngineCore_DP<k> log prefix"):
+        vllm_server.extract_metrics_jsonl(server_log, tmp_path / "metrics.jsonl", dp_size=2)
+
+
+def test_worker_rank_banner_supplies_the_pid_to_rank_join(tmp_path):
+    """nsys gives pid → device; this banner gives pid → rank. Together: rank → device."""
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "(Worker pid=101) INFO [parallel_state.py:1568] world_size=2 rank=1 local_rank=1 "
+        "distributed_init_method=tcp://127.0.0.1:1 backend=nccl\n"
+        "(Worker pid=100) INFO [parallel_state.py:1568] world_size=2 rank=0 local_rank=0 "
+        "distributed_init_method=tcp://127.0.0.1:1 backend=nccl\n"
+    )
+
+    assert vllm_server.extract_worker_device_ranks(server_log) == {100: 0, 101: 1}
+
+
+def test_worker_rank_banner_rejects_an_incomplete_population(tmp_path):
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "(Worker pid=100) INFO [parallel_state.py:1568] world_size=2 rank=0 local_rank=0 "
+        "distributed_init_method=tcp://127.0.0.1:1 backend=nccl\n"
+    )
+
+    with pytest.raises(ValueError, match="world_size=2"):
+        vllm_server.extract_worker_device_ranks(server_log)
 
 
 def test_structured_vllm_request_timing_is_extracted_separately(tmp_path):
@@ -234,6 +300,91 @@ def test_vllm_text_adapter_preserves_exact_shape_and_join():
     ]
     assert case_map == [{"case_index": 0, "measured_iteration": 34, "stage": "mixed"}]
     assert excluded == []
+
+
+def _rank_record(prefill_tokens: int, decode_kv_lens: list[int]) -> dict:
+    return {
+        "schema_version": 1,
+        "input_adapter": "vllm_text",
+        "prefill_tokens": prefill_tokens,
+        "decode_requests": len(decode_kv_lens),
+        "decode_tokens_scheduled": len(decode_kv_lens),
+        "prefill_chunk_pairs": [[0, prefill_tokens]] if prefill_tokens else [],
+        "decode_kv_lens": decode_kv_lens,
+    }
+
+
+def _dp_parsed(metrics_by_dp_rank: dict[str, dict], aggregate: dict) -> dict:
+    return {
+        "dp_rank_by_device": {"0": 0, "1": 1, "2": 2},
+        "iteration_details": [
+            {
+                "iteration": 34,
+                "metrics": aggregate,
+                "metrics_by_dp_rank": metrics_by_dp_rank,
+                "ranges": [{"phase": "forward", "kernel_count": 2}],
+            }
+        ],
+    }
+
+
+def test_per_dp_rank_groups_keep_each_ranks_own_batch():
+    """One synchronized step runs a different batch on every rank; one pooled
+    group would model a batch that no rank ever executed."""
+    parsed = _dp_parsed(
+        {
+            "0": _rank_record(8, [100]),
+            "1": _rank_record(0, [120, 130]),
+            "2": _rank_record(4, []),
+        },
+        aggregate=_rank_record(12, [100, 120, 130]),
+    )
+
+    cases, case_map, excluded = build_cases(parsed, "forward", "per_dp_rank")
+
+    assert cases == [
+        {
+            "groups": [
+                {"prefill_chunk_pairs": [[0, 8]], "decode_kv_lens": [100]},
+                {"prefill_chunk_pairs": [], "decode_kv_lens": [120, 130]},
+                {"prefill_chunk_pairs": [[0, 4]], "decode_kv_lens": []},
+            ]
+        }
+    ]
+    assert case_map == [{"case_index": 0, "measured_iteration": 34, "stage": "mixed"}]
+    assert excluded == []
+
+
+def test_per_dp_rank_gives_an_idle_rank_an_empty_group():
+    """A rank that scheduled nothing still runs a forward pass to keep the EP
+    collectives in lockstep, so its group is empty rather than absent."""
+    parsed = _dp_parsed(
+        {"0": _rank_record(0, [100]), "2": _rank_record(0, [140])},
+        aggregate=_rank_record(0, [100, 140]),
+    )
+
+    cases, _, _ = build_cases(parsed, "forward", "per_dp_rank")
+
+    assert cases[0]["groups"] == [
+        {"prefill_chunk_pairs": [], "decode_kv_lens": [100]},
+        {"prefill_chunk_pairs": [], "decode_kv_lens": []},
+        {"prefill_chunk_pairs": [], "decode_kv_lens": [140]},
+    ]
+
+
+def test_per_dp_rank_requires_a_dp_aware_parse():
+    parsed = {
+        "iteration_details": [
+            {
+                "iteration": 34,
+                "metrics": _rank_record(8, [100]),
+                "ranges": [{"phase": "forward", "kernel_count": 2}],
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="no dp_rank_by_device map"):
+        build_cases(parsed, "forward", "per_dp_rank")
 
 
 def _labeled_doc(phases: dict | None = None) -> dict:
@@ -664,7 +815,12 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
         3.8 * recommended
     )
     assert iteration_report["iterations"][1]["measured_gpu_cycle_ms"] is None
-    breakdown = iteration_payload["breakdowns"][0]
+    # Per-iteration detail lives in a byte-range-addressed shard so a client can
+    # read one iteration without parsing the rest; the payload carries the index.
+    detail = iteration_payload["breakdown_detail"]
+    shard = (analysis / "payloads" / detail["file"]).read_bytes()
+    offset, length = detail["byte_ranges"][str(iteration_report["iterations"][0]["iteration_id"])]
+    breakdown = json.loads(shard[offset : offset + length])
     assert "operations" not in breakdown
     assert [kernel["name"] for kernel in breakdown["measured_kernels"]] == [
         "nvjet_qkv",
@@ -740,6 +896,8 @@ def _measured_iteration(
             {
                 "device_id": 0,
                 "phase": "forward",
+                "start_ns": start_ns,
+                "end_ns": start_ns + gemm_ns + attention_ns,
                 "kernel_busy_union_ns": gemm_ns + attention_ns,
                 "kernels": [
                     {
@@ -759,6 +917,8 @@ def _measured_iteration(
             {
                 "device_id": 0,
                 "phase": "postprocess",
+                "start_ns": start_ns + gemm_ns + attention_ns,
+                "end_ns": start_ns + gemm_ns + attention_ns + lm_head_ns,
                 "kernels": [
                     {
                         "name_id": 3,

@@ -236,6 +236,18 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     );
 
     let reference_device_id = inventory.representative_device_id;
+    // Under a union catalog there is no representative device — eight DP ranks
+    // each run their own sequence — so the reference lane falls back to the
+    // lowest measured device, which is the rule `reference_span` and
+    // `build_iteration` already apply per iteration. The meta reports the
+    // device the lanes are actually drawn from; reporting null instead leaves a
+    // consumer unable to label the lane it is being shown.
+    let reported_reference_device_id = reference_device_id.or_else(|| {
+        inventory
+            .device_ids
+            .as_ref()
+            .and_then(|device_ids| device_ids.iter().copied().min())
+    });
 
     // The host lane attributes a million API rows to every window they overlap,
     // which is one pass over the events against all the windows at once — so
@@ -363,7 +375,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "profile_log_dir": input.profile_log_dir.display().to_string(),
         "predict_log_dir": input.predict_log_dir.display().to_string(),
         "measured_device_ids": inventory.device_ids,
-        "reference_device_id": reference_device_id,
+        "reference_device_id": reported_reference_device_id,
         // Kernel-only sim time scaled by this is wall-clock GPU time, which is
         // what the sim lane's `x duty` bar draws against the measured GPU cycle.
         "recommended_gpu_time_multiplier": gpu_time_multiplier,

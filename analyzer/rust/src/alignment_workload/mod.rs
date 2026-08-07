@@ -5,11 +5,12 @@
 //! current KV lengths plus every scheduled prefill request's `(prefix + append)`
 //! length.  Resident cache state belongs to the normal `kv-occupancy` subject.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use datafusion::prelude::SessionContext;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -48,6 +49,8 @@ struct FullMeasuredMetrics {
     decode_kv_lens: Vec<u64>,
     #[serde(default)]
     prefill_chunk_pairs: Vec<(u64, u64)>,
+    #[serde(default)]
+    dp_rank: Option<u64>,
     #[serde(default)]
     observed_start_monotonic_ns: Option<u64>,
     #[serde(default)]
@@ -216,6 +219,13 @@ fn read_measured_points(
         metrics_path.display()
     );
 
+    // Data-parallel ranks each log the same step, so one step appears as several
+    // records. Fold them into the replica's batch shape (the union of the ranks'
+    // local batches) before anything reads a step's workload, and before the
+    // contiguity scan below — several ranks' records are the same step, not a
+    // break in the sequence.
+    let records = fold_data_parallel_ranks(records)?;
+
     // Prefix-cache preflight requests run before the measured replay and use
     // the same logger. Their iteration ids form short, disjoint runs (for
     // example 0 and 3). Select the unique contiguous run containing the NSYS
@@ -293,6 +303,208 @@ fn read_measured_points(
     }
     assign_iteration_cycles(&mut points);
     Ok(points)
+}
+
+/// Fold every data-parallel rank's record for one step into the replica's batch
+/// shape. DP ranks execute one step in lockstep behind the expert-parallel
+/// collectives, so the replica's workload for that step is the union of the
+/// ranks' local batches.
+///
+/// What identifies "one step" is the question this function used to get wrong.
+/// `iteration_index` counts a single EngineCore's own scheduled steps, and the
+/// ranks do not start counting together: in the GLM-5.2 DP8 capture the very
+/// same wall-clock step is iteration 11 on rank 0, 7 on ranks 1-4 and 6 on
+/// ranks 5-7. Folding by index therefore merged eight *different* steps, and
+/// the mixed prefill steps it produced were pure fiction. When the records
+/// carry engine-observed timestamps (schema 2) the fold pairs ranks by
+/// wall-clock overlap against a reference rank, exactly as `alignment/nsys/
+/// parse.py` does for the kernel side.
+///
+/// Schema-1 records have no timestamps, so there is nothing to pair on and the
+/// index fold is kept — its result only feeds the preflight-vs-replay segment
+/// scan, after which schema-1 captures fall back to the NSYS timeline entirely.
+/// A single-rank capture passes through unchanged either way.
+fn fold_data_parallel_ranks(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasuredMetrics>> {
+    let observed = records
+        .iter()
+        .all(|record| record.observed_start_monotonic_ns.is_some())
+        && records.iter().all(|record| record.dp_rank.is_some());
+    if observed {
+        fold_by_wall_clock(records)
+    } else {
+        fold_by_iteration_index(records)
+    }
+}
+
+/// Merge one rank's record into the step being built.
+fn merge_rank_record(merged: &mut FullMeasuredMetrics, record: FullMeasuredMetrics) -> Result<()> {
+    ensure!(
+        merged.schema_version == record.schema_version,
+        "step at iteration {} mixes full-run metrics schema versions {} and {}",
+        merged.iteration_index,
+        merged.schema_version,
+        record.schema_version
+    );
+    ensure!(
+        merged.input_adapter == record.input_adapter,
+        "step at iteration {} mixes input adapters {:?} and {:?}",
+        merged.iteration_index,
+        merged.input_adapter,
+        record.input_adapter
+    );
+    merged.prefill_tokens += record.prefill_tokens;
+    merged.decode_kv_lens.extend(record.decode_kv_lens);
+    merged
+        .prefill_chunk_pairs
+        .extend(record.prefill_chunk_pairs);
+    // The step spans from the earliest rank's start to the latest rank's end;
+    // its duration is the slowest rank's, since the collectives make every rank
+    // wait for it.
+    merged.observed_start_monotonic_ns = match (
+        merged.observed_start_monotonic_ns,
+        record.observed_start_monotonic_ns,
+    ) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    };
+    merged.observed_end_monotonic_ns = match (
+        merged.observed_end_monotonic_ns,
+        record.observed_end_monotonic_ns,
+    ) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    };
+    merged.observed_elapsed_ms = match (merged.observed_elapsed_ms, record.observed_elapsed_ms) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    };
+    Ok(())
+}
+
+fn fold_by_iteration_index(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasuredMetrics>> {
+    let mut order: Vec<u64> = Vec::new();
+    let mut folded: HashMap<u64, FullMeasuredMetrics> = HashMap::new();
+    for record in records {
+        match folded.entry(record.iteration_index) {
+            Entry::Vacant(slot) => {
+                order.push(record.iteration_index);
+                slot.insert(record);
+            }
+            Entry::Occupied(mut slot) => merge_rank_record(slot.get_mut(), record)?,
+        }
+    }
+    Ok(order
+        .into_iter()
+        .map(|iteration| folded.remove(&iteration).expect("iteration was inserted"))
+        .collect())
+}
+
+/// The observed window of a record, which the caller has already checked exists.
+fn observed_window(record: &FullMeasuredMetrics) -> (u64, u64) {
+    let start = record
+        .observed_start_monotonic_ns
+        .expect("caller checked observed_start_monotonic_ns");
+    let end = record.observed_end_monotonic_ns.unwrap_or(start);
+    (start, end.max(start))
+}
+
+/// Pair ranks by wall-clock overlap against the lowest-numbered rank.
+///
+/// The reference rank defines the steps; every other rank's record joins the
+/// reference step it overlaps most. A peer record that overlaps no reference
+/// step *inside* the reference's span is refused rather than dropped or given a
+/// step of its own — it would mean the ranks are not stepping together, which
+/// invalidates the union the fold is built on, and that deserves to be read by a
+/// person rather than averaged away.
+///
+/// The two RAGGED ENDS are a different thing and are dropped with a count. Data
+/// parallel ranks do not start or retire on the same step: in the GLM-5.2 DP8
+/// run the ranks began 0.0-1.6 s apart and ran 6154..6159 iterations each, so
+/// rank 3's last step opened 1.09 ms after rank 0 had finished for good. Exactly
+/// one peer record of 43,091 fell outside, at the very end, with zero misses
+/// inside the span — and refusing on it withheld the whole subject. That is the
+/// wrong trade: this is the one view that compares SCHEDULED WORK per step, and
+/// it is what would have shown the simulator serialising its prefills across DP
+/// groups (one group prefilling per iteration where vLLM ran all eight), a bug
+/// that instead went unseen until the e2e throughput was traced by hand.
+///
+/// A record in a gap BETWEEN reference steps still bails: that is a real desync,
+/// not an edge.
+fn fold_by_wall_clock(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasuredMetrics>> {
+    let reference_rank = records
+        .iter()
+        .filter_map(|record| record.dp_rank)
+        .min()
+        .expect("caller checked dp_rank");
+    let (reference_records, peer_records): (Vec<_>, Vec<_>) = records
+        .into_iter()
+        .partition(|record| record.dp_rank == Some(reference_rank));
+    let mut steps: Vec<FullMeasuredMetrics> = reference_records;
+    steps.sort_by_key(|record| observed_window(record).0);
+    let mut windows: Vec<(u64, u64)> = steps.iter().map(observed_window).collect();
+
+    let mut peers = peer_records;
+    peers.sort_by_key(|record| observed_window(record).0);
+    // The reference's own span. Anything wholly outside it is a ragged end.
+    let (span_start, span_end) = match (windows.first(), windows.last()) {
+        (Some(first), Some(last)) => (first.0, last.1),
+        _ => bail!("reference rank {reference_rank} contributed no steps"),
+    };
+    let mut dropped_before = 0usize;
+    let mut dropped_after = 0usize;
+    let mut cursor = 0usize;
+    for peer in peers {
+        let (peer_start, peer_end) = observed_window(&peer);
+        if peer_end <= span_start {
+            dropped_before += 1;
+            continue;
+        }
+        if peer_start >= span_end {
+            dropped_after += 1;
+            continue;
+        }
+        // The reference windows are sorted and disjoint, so a peer that starts
+        // after this one ends can never match an earlier step: the cursor only
+        // moves forward across the whole pass.
+        while cursor + 1 < windows.len() && windows[cursor].1 <= peer_start {
+            cursor += 1;
+        }
+        let best = (cursor..windows.len())
+            .take_while(|&index| windows[index].0 < peer_end)
+            .max_by_key(|&index| {
+                windows[index]
+                    .1
+                    .min(peer_end)
+                    .saturating_sub(windows[index].0.max(peer_start))
+            })
+            .filter(|&index| windows[index].1.min(peer_end) > windows[index].0.max(peer_start));
+        let Some(index) = best else {
+            // Inside the reference's span, so not a ragged end: the peer landed
+            // in a gap BETWEEN two reference steps, which is a real desync.
+            bail!(
+                "full-run metrics rank {:?} iteration {} falls between steps of reference rank \
+                 {} (inside its {:.3} s span); the data-parallel ranks are not stepping together",
+                peer.dp_rank,
+                peer.iteration_index,
+                reference_rank,
+                (span_end - span_start) as f64 / 1e9,
+            );
+        };
+        merge_rank_record(&mut steps[index], peer)?;
+        windows[index] = observed_window(&steps[index]);
+    }
+    if dropped_before + dropped_after > 0 {
+        eprintln!(
+            "[alignment-workload] dropped {} peer record(s) outside reference rank {}'s span \
+             ({} before its first step, {} after its last): data-parallel ranks do not start or \
+             retire on the same step",
+            dropped_before + dropped_after,
+            reference_rank,
+            dropped_before,
+            dropped_after,
+        );
+    }
+    Ok(steps)
 }
 
 fn read_measured_points_from_nsys(path: &Path) -> Result<Vec<WorkloadPoint>> {
@@ -550,4 +762,227 @@ fn unavailable_pair(log_dir: &Path, reason: &str) -> (Value, Value) {
         "definitions": definitions(),
     });
     (report, payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rank_record(
+        iteration_index: u64,
+        prefill_tokens: u64,
+        decode_kv_lens: Vec<u64>,
+        observed: Option<(u64, u64, f64)>,
+    ) -> FullMeasuredMetrics {
+        FullMeasuredMetrics {
+            schema_version: if observed.is_some() { 2 } else { 1 },
+            input_adapter: "vllm_text".to_string(),
+            iteration_index,
+            prefill_tokens,
+            decode_kv_lens,
+            prefill_chunk_pairs: Vec::new(),
+            dp_rank: None,
+            observed_start_monotonic_ns: observed.map(|(start, _, _)| start),
+            observed_end_monotonic_ns: observed.map(|(_, end, _)| end),
+            observed_elapsed_ms: observed.map(|(_, _, elapsed)| elapsed),
+        }
+    }
+
+    /// The same record, attributed to a data-parallel rank. Only records that
+    /// carry both a rank and a timestamp can be paired by wall clock.
+    fn ranked_record(
+        dp_rank: u64,
+        iteration_index: u64,
+        prefill_tokens: u64,
+        decode_kv_lens: Vec<u64>,
+        observed: (u64, u64, f64),
+    ) -> FullMeasuredMetrics {
+        FullMeasuredMetrics {
+            dp_rank: Some(dp_rank),
+            ..rank_record(
+                iteration_index,
+                prefill_tokens,
+                decode_kv_lens,
+                Some(observed),
+            )
+        }
+    }
+
+    #[test]
+    fn a_single_rank_capture_passes_through_unchanged() {
+        let folded = fold_data_parallel_ranks(vec![
+            rank_record(7, 4, vec![10], None),
+            rank_record(8, 0, vec![11, 12], None),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            folded
+                .iter()
+                .map(|record| (record.iteration_index, record.prefill_tokens))
+                .collect::<Vec<_>>(),
+            vec![(7, 4), (8, 0)]
+        );
+    }
+
+    #[test]
+    fn data_parallel_ranks_fold_into_the_replica_batch() {
+        // Two ranks log the same step. The replica's batch is their union, and
+        // the step spans the earliest start to the latest end.
+        let folded = fold_data_parallel_ranks(vec![
+            rank_record(7, 4, vec![10], Some((100, 300, 2.0))),
+            rank_record(7, 6, vec![11, 12], Some((110, 350, 2.4))),
+        ])
+        .unwrap();
+
+        assert_eq!(folded.len(), 1);
+        let step = &folded[0];
+        assert_eq!(step.iteration_index, 7);
+        assert_eq!(step.prefill_tokens, 10);
+        assert_eq!(step.decode_kv_lens, vec![10, 11, 12]);
+        assert_eq!(step.observed_start_monotonic_ns, Some(100));
+        assert_eq!(step.observed_end_monotonic_ns, Some(350));
+        assert_eq!(step.observed_elapsed_ms, Some(2.4));
+    }
+
+    #[test]
+    fn folding_keeps_a_repeated_index_from_breaking_the_contiguity_scan() {
+        // The DP shape that used to split every step into its own segment:
+        // 8 records per iteration means the raw `+1` scan never continues.
+        let records: Vec<_> = (7..=9)
+            .flat_map(|iteration| (0..8).map(move |_| rank_record(iteration, 1, vec![5], None)))
+            .collect();
+
+        let folded = fold_data_parallel_ranks(records).unwrap();
+
+        assert_eq!(
+            folded
+                .iter()
+                .map(|record| record.iteration_index)
+                .collect::<Vec<_>>(),
+            vec![7, 8, 9]
+        );
+        assert!(folded
+            .windows(2)
+            .all(|pair| pair[0].iteration_index + 1 == pair[1].iteration_index));
+    }
+
+    #[test]
+    fn mixed_schema_versions_within_one_step_are_rejected() {
+        let error = fold_data_parallel_ranks(vec![
+            rank_record(7, 4, vec![10], None),
+            rank_record(7, 6, vec![11], Some((100, 200, 1.0))),
+        ])
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("mixes full-run metrics schema"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn ranks_that_count_their_own_steps_still_fold_by_wall_clock() {
+        // The GLM-5.2 DP8 shape, minimised: one wall-clock step is iteration 11
+        // on the reference rank and 7 on its peer, and the next step is 12/8.
+        // Folding by index would pair 11 with the peer's *later* step.
+        let folded = fold_data_parallel_ranks(vec![
+            ranked_record(0, 11, 4, vec![10], (100, 300, 2.0)),
+            ranked_record(0, 12, 5, vec![20], (400, 600, 2.0)),
+            ranked_record(3, 7, 6, vec![11], (110, 310, 2.4)),
+            ranked_record(3, 8, 7, vec![21], (405, 615, 2.5)),
+        ])
+        .unwrap();
+
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].iteration_index, 11);
+        assert_eq!(folded[0].prefill_tokens, 10);
+        assert_eq!(folded[0].decode_kv_lens, vec![10, 11]);
+        assert_eq!(folded[0].observed_start_monotonic_ns, Some(100));
+        assert_eq!(folded[0].observed_end_monotonic_ns, Some(310));
+        assert_eq!(folded[1].iteration_index, 12);
+        assert_eq!(folded[1].prefill_tokens, 12);
+        assert_eq!(folded[1].decode_kv_lens, vec![20, 21]);
+    }
+
+    #[test]
+    fn a_peer_step_in_a_gap_between_reference_steps_is_refused_rather_than_averaged_away() {
+        // Two reference steps with 300..400 empty between them, and a peer that
+        // lives entirely in that hole. Inside the span and matching nothing is a
+        // real desync: the union the fold is built on does not hold, and that
+        // must reach a person instead of being averaged in.
+        let error = fold_data_parallel_ranks(vec![
+            ranked_record(0, 11, 4, vec![10], (100, 300, 2.0)),
+            ranked_record(0, 12, 5, vec![20], (400, 600, 2.0)),
+            ranked_record(3, 7, 6, vec![11], (310, 390, 0.8)),
+        ])
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("not stepping together"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("falls between steps"),
+            "the message must say WHERE it fell, or the ragged-end case reads the \
+             same as a desync: {error}"
+        );
+    }
+
+    #[test]
+    fn a_peer_step_past_the_reference_span_is_a_ragged_end_and_is_dropped() {
+        // Data-parallel ranks do not retire on the same step. In the GLM-5.2 DP8
+        // run the ranks ran 6154..6159 iterations each and rank 3's last step
+        // opened 1.09 ms after rank 0 had finished for good -- one peer record of
+        // 43,091, with zero misses inside the span. Refusing on that withheld the
+        // whole scheduler-shape subject, which is the one view that compares
+        // scheduled work per step.
+        let folded = fold_data_parallel_ranks(vec![
+            ranked_record(0, 11, 4, vec![10], (100, 300, 2.0)),
+            ranked_record(3, 7, 6, vec![11], (110, 310, 2.4)),
+            ranked_record(3, 8, 7, vec![21], (900, 1000, 1.0)),
+        ])
+        .expect("a ragged end must not withhold the subject");
+
+        // The overlapping peer still folded; only the trailing one went.
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].iteration_index, 11);
+        assert_eq!(folded[0].decode_kv_lens, vec![10, 11]);
+        assert_eq!(folded[0].prefill_tokens, 10);
+    }
+
+    #[test]
+    fn a_peer_step_before_the_reference_span_is_dropped_the_same_way() {
+        // The other end: ranks do not start together either (0.0..1.6 s apart in
+        // the measured run), so the reference rank may open after a peer.
+        let folded = fold_data_parallel_ranks(vec![
+            ranked_record(0, 11, 4, vec![10], (100, 300, 2.0)),
+            ranked_record(3, 6, 9, vec![9], (1, 50, 0.5)),
+            ranked_record(3, 7, 6, vec![11], (110, 310, 2.4)),
+        ])
+        .expect("a ragged start must not withhold the subject either");
+
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].decode_kv_lens, vec![10, 11]);
+    }
+
+    #[test]
+    fn records_without_timestamps_keep_the_index_fold() {
+        // Schema 1 has nothing to pair on. The index fold is what feeds the
+        // preflight-vs-replay segment scan, so it must survive untouched.
+        let folded = fold_data_parallel_ranks(vec![
+            FullMeasuredMetrics {
+                dp_rank: Some(0),
+                ..rank_record(7, 4, vec![10], None)
+            },
+            FullMeasuredMetrics {
+                dp_rank: Some(3),
+                ..rank_record(7, 6, vec![11], None)
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].prefill_tokens, 10);
+    }
 }

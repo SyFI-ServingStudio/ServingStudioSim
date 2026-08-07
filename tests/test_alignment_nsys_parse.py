@@ -12,6 +12,7 @@ from alignment.nsys.parse import (
     Worker,
     _parse_label,
     build_host_timeline,
+    aggregate_metrics_by_iteration,
     build_iteration_details,
     build_kernel_name_index,
     build_parser,
@@ -21,6 +22,8 @@ from alignment.nsys.parse import (
     load_ranges,
     owning_global_pid,
     parsed_window_ns,
+    load_metrics,
+    resolve_dp_rank_by_device,
 )
 from alignment.nsys.sequence import build_kernel_sequences, expand_program
 
@@ -209,7 +212,7 @@ def test_full_sequence_folds_exact_repetition_losslessly():
         "same_impl",
         "other_impl",
     ]
-    assert sequence["iterations"] == [3]
+    assert sequence["occurrences"] == [{"device_id": 0, "iterations": [3]}]
     assert "iteration_assignments" not in catalog
 
 
@@ -228,7 +231,9 @@ def test_sequence_unique_ignores_iteration_semantic_labels():
     catalog = build_kernel_sequences(details, {1: "kernel"})["forward"]
 
     assert len(catalog["unique_sequences"]) == 1
-    assert catalog["unique_sequences"][0]["iterations"] == [1, 2]
+    assert catalog["unique_sequences"][0]["occurrences"] == [
+        {"device_id": 0, "iterations": [1, 2]}
+    ]
 
 
 def test_fold_prefers_layer_aligned_repeat_with_final_suffix():
@@ -273,7 +278,8 @@ def test_fold_prefers_layer_aligned_repeat_with_final_suffix():
     ]
 
 
-def test_tp_sequence_inventory_keeps_one_validated_rank():
+def test_symmetric_ranks_collapse_to_one_labeling_decision():
+    """Identical ranks share a sequence id, so they cost one label, not N."""
     rank_kernels = [
         {"name_id": 1, "category": "other"},
         {"name_id": 2, "category": "nccl_collective"},
@@ -291,15 +297,25 @@ def test_tp_sequence_inventory_keeps_one_validated_rank():
 
     catalog = build_kernel_sequences(details, {1: "gemm", 2: "nccl"})["forward"]
 
+    assert len(catalog["unique_sequences"]) == 1
     sequence = catalog["unique_sequences"][0]
     assert sequence["expanded_kernel_count"] == 2
     assert [row["name"] for row in expand_program(sequence["program"])] == [
         "gemm",
         "nccl",
     ]
+    assert sequence["occurrences"] == [
+        {"device_id": 0, "iterations": [7]},
+        {"device_id": 1, "iterations": [7]},
+    ]
 
 
-def test_tp_sequence_inventory_rejects_asymmetric_ranks():
+def test_asymmetric_ranks_each_keep_their_own_sequence():
+    """Data-parallel ranks schedule independent batches, so divergence is normal.
+
+    Each device keeps the sequence it actually ran; nothing is merged across
+    devices and nothing is dropped in favour of a representative.
+    """
     details = [
         {
             "iteration": 7,
@@ -319,8 +335,19 @@ def test_tp_sequence_inventory_rejects_asymmetric_ranks():
         }
     ]
 
-    with pytest.raises(ValueError, match="not symmetric"):
-        build_kernel_sequences(details, {1: "rank0", 2: "rank1"})
+    catalog = build_kernel_sequences(details, {1: "rank0", 2: "rank1"})["forward"]
+
+    sequences = catalog["unique_sequences"]
+    assert len(sequences) == 2
+    assert {
+        expand_program(sequence["program"])[0]["name"]: sequence["occurrences"]
+        for sequence in sequences
+    } == {
+        "rank0": [{"device_id": 0, "iterations": [7]}],
+        "rank1": [{"device_id": 1, "iterations": [7]}],
+    }
+
+
 
 
 def test_idle_is_measured_against_the_kernel_span_not_the_nvtx_range():
@@ -507,3 +534,217 @@ def test_parsed_window_spans_every_serialized_range():
 
 def test_parsed_window_of_an_empty_parse_is_empty():
     assert parsed_window_ns({"iteration_details": []}) == (0, 0)
+
+def _metrics_line(dp_rank: int, iteration: int, prefill_tokens: int, decode_kv_lens: list[int]):
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "input_adapter": "vllm_text",
+            "iteration_index": iteration,
+            "dp_rank": dp_rank,
+            "prefill_tokens": prefill_tokens,
+            "decode_requests": len(decode_kv_lens),
+            "decode_tokens_scheduled": len(decode_kv_lens),
+            "prefill_chunk_pairs": [[0, prefill_tokens]] if prefill_tokens else [],
+            "decode_kv_lens": decode_kv_lens,
+        }
+    )
+
+
+def test_metrics_are_keyed_by_rank_and_iteration(tmp_path):
+    """Every DP rank reuses the same iteration indices; keying on the index alone
+    would keep only the last rank's batch shape."""
+    path = tmp_path / "metrics.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                _metrics_line(0, 4, prefill_tokens=8, decode_kv_lens=[10]),
+                _metrics_line(1, 4, prefill_tokens=0, decode_kv_lens=[20, 30]),
+            ]
+        )
+        + "\n"
+    )
+
+    metrics = load_metrics(path)
+
+    assert set(metrics) == {(0, 4), (1, 4)}
+    assert metrics[(0, 4)]["prefill_tokens"] == 8
+    assert metrics[(1, 4)]["decode_kv_lens"] == [20, 30]
+
+
+def test_metrics_reject_a_repeated_rank_iteration_pair(tmp_path):
+    path = tmp_path / "metrics.jsonl"
+    path.write_text(
+        _metrics_line(0, 4, 8, [10]) + "\n" + _metrics_line(0, 4, 8, [10]) + "\n"
+    )
+
+    with pytest.raises(ValueError, match="duplicate metrics record"):
+        load_metrics(path)
+
+
+def test_iteration_aggregate_is_the_union_of_the_ranks_batches():
+    """DP ranks step in lockstep behind the EP collectives, so the replica's
+    workload for one step is the union of its ranks' local batches."""
+    rank_metrics = {
+        (0, 4): json.loads(_metrics_line(0, 4, prefill_tokens=8, decode_kv_lens=[10])),
+        (1, 4): json.loads(_metrics_line(1, 4, prefill_tokens=0, decode_kv_lens=[20, 30])),
+    }
+
+    aggregate = aggregate_metrics_by_iteration(rank_metrics)[4]
+
+    assert aggregate["prefill_tokens"] == 8
+    assert aggregate["decode_requests"] == 3
+    assert aggregate["prefill_chunk_pairs"] == [[0, 8]]
+    assert aggregate["decode_kv_lens"] == [10, 20, 30]
+    assert aggregate["dp_ranks"] == [0, 1]
+    # One rank prefilling while another only decodes is a mixed replica step.
+    assert iteration_kind(aggregate) == "mixed"
+
+
+def test_dp_rank_by_device_folds_global_ranks_by_the_tp_degree():
+    workers = {
+        1: Worker(global_pid=10, pid=100, name="VLLM::Worker", device_id=0),
+        2: Worker(global_pid=20, pid=101, name="VLLM::Worker", device_id=1),
+        3: Worker(global_pid=30, pid=102, name="VLLM::Worker", device_id=2),
+        4: Worker(global_pid=40, pid=103, name="VLLM::Worker", device_id=3),
+    }
+    worker_ranks = {100: 0, 101: 1, 102: 2, 103: 3}
+
+    assert resolve_dp_rank_by_device(workers, worker_ranks, tp_size=1) == {0: 0, 1: 1, 2: 2, 3: 3}
+    assert resolve_dp_rank_by_device(workers, worker_ranks, tp_size=2) == {0: 0, 1: 0, 2: 1, 3: 1}
+    # No banner at all is the historical single-process capture.
+    assert resolve_dp_rank_by_device(workers, {}, tp_size=1) == {0: 0, 1: 0, 2: 0, 3: 0}
+
+
+def test_dp_rank_by_device_rejects_a_device_with_no_rank_banner():
+    workers = {1: Worker(global_pid=10, pid=100, name="VLLM::Worker", device_id=0)}
+
+    with pytest.raises(ValueError, match="no rank banner"):
+        resolve_dp_rank_by_device(workers, {999: 0}, tp_size=1)
+
+
+# ---- wall-clock step alignment --------------------------------------------
+#
+# A data-parallel rank numbers its OWN scheduled steps. When one rank runs a
+# prefill chunk alone its peers run dummy batches that join the expert-parallel
+# collectives but are not scheduled iterations, so they never advance their
+# counters and the ranks stay offset for the rest of the capture. Grouping by
+# `iteration_index` then reduces kernels from steps that never coexisted.
+
+
+def _window(device_id: int, iteration: int, start: int, end: int, phase: str = "forward"):
+    return RangeStats(
+        iteration=iteration,
+        phase=phase,
+        stage="decode",
+        worker=Worker(global_pid=device_id, pid=100 + device_id, name="W", device_id=device_id),
+        start=start,
+        end=end,
+        intervals=[(start, end)],
+        kernel_count=1,
+        sum_ns=end - start,
+    )
+
+
+def test_steps_group_by_measured_time_not_by_iteration_index():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    ranges = [
+        _window(0, 5, 0, 10),
+        _window(0, 6, 10, 20),
+        _window(0, 7, 20, 30),
+        # Device 1 is two steps behind on the counter but runs at the same time.
+        _window(1, 3, 1, 11),
+        _window(1, 4, 11, 21),
+        _window(1, 5, 21, 31),
+    ]
+    steps, unpaired = align_ranges_into_steps(ranges)
+
+    assert [step.iteration for step in steps] == [5, 6, 7]
+    assert [step.index_by_device for step in steps] == [{0: 5, 1: 3}, {0: 6, 1: 4}, {0: 7, 1: 5}]
+    assert unpaired == {}
+
+
+def test_a_step_only_one_rank_ran_keeps_that_rank_and_names_the_absent_ones():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    ranges = [
+        # Device 0 alone for the first two steps — the prefill chunks.
+        _window(0, 8, 0, 100),
+        _window(0, 9, 100, 200),
+        _window(0, 10, 200, 210),
+        _window(1, 8, 201, 211),
+    ]
+    steps, _ = align_ranges_into_steps(ranges)
+
+    assert [step.index_by_device for step in steps] == [{0: 8}, {0: 9}, {0: 10, 1: 8}]
+
+    name_ids, _ = build_kernel_name_index(ranges)
+    details = build_iteration_details(ranges, {}, name_ids, {}, {0: 0, 1: 1})
+    assert [detail["devices_absent"] for detail in details] == [[1], [1], []]
+    assert details[0]["iteration_index_by_device"] == {"0": 8}
+    assert details[2]["iteration_index_by_device"] == {"0": 10, "1": 8}
+
+
+def test_each_range_carries_its_own_index_and_its_own_ranks_metrics():
+    from alignment.nsys.parse import align_ranges_into_steps  # noqa: F401
+
+    ranges = [_window(0, 5, 0, 10), _window(1, 3, 1, 11)]
+    rank_metrics = {
+        (0, 5): {"input_adapter": "vllm_text", "prefill_tokens": 8189, "decode_requests": 3},
+        (1, 3): {"input_adapter": "vllm_text", "prefill_tokens": 0, "decode_requests": 7},
+        # The peer's row under the STEP's id belongs to a different step and must
+        # not be picked up.
+        (1, 5): {"input_adapter": "vllm_text", "prefill_tokens": 0, "decode_requests": 99},
+    }
+    name_ids, _ = build_kernel_name_index(ranges)
+    (detail,) = build_iteration_details(ranges, {}, name_ids, rank_metrics, {0: 0, 1: 1})
+
+    assert [(row["device_id"], row["iteration_index"]) for row in detail["ranges"]] == [
+        (0, 5),
+        (1, 3),
+    ]
+    assert detail["ranges"][1]["metrics"]["decode_requests"] == 7
+    assert detail["metrics"]["prefill_tokens"] == 8189
+    assert detail["metrics"]["decode_requests"] == 10
+    assert detail["iteration_type"] == "mixed"
+
+
+def test_a_peer_step_with_no_reference_counterpart_is_counted_not_dropped():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    ranges = [
+        _window(0, 5, 100, 110),
+        # Device 1 ran a step before the reference's window opens at all.
+        _window(1, 1, 0, 10),
+        _window(1, 2, 101, 111),
+    ]
+    steps, unpaired = align_ranges_into_steps(ranges)
+
+    assert [step.index_by_device for step in steps] == [{0: 5, 1: 2}]
+    assert unpaired == {1: 1}
+
+
+def test_the_window_follows_the_reference_rank_and_peers_join_by_time():
+    """A peer numbering the same step lower must not be filtered out of it.
+
+    In the GLM-5.2 DP8 capture the ranks that step together at t=15.67 s call it
+    iteration 11, 7 and 6. A numeric window applied to every rank drops the peers
+    from the first steps of the window and leaves one rank apparently running
+    alone.
+    """
+    from alignment.nsys.parse import window_rows_by_reference_rank
+
+    reference = Worker(global_pid=1, pid=1, name="W", device_id=0)
+    peer = Worker(global_pid=2, pid=2, name="W", device_id=1)
+    rows = [
+        [7, "forward", reference, 0, 10],
+        [8, "forward", reference, 10, 20],
+        [9, "forward", reference, 20, 30],
+        [3, "forward", peer, 1, 11],  # same step as the reference's 7 — before the window
+        [4, "forward", peer, 11, 21],  # same step as the reference's 8
+        [5, "forward", peer, 21, 31],  # same step as the reference's 9
+    ]
+    kept = window_rows_by_reference_rank(rows, 8, 9)
+
+    assert sorted((row[0], row[2].device_id) for row in kept) == [(4, 1), (5, 1), (8, 0), (9, 0)]
