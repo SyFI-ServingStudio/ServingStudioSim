@@ -3,6 +3,11 @@
 Discrete-event simulator for ML serving/training workloads. Rust core
 (`simulator/`) + Python L1 profiling/launcher, bridged via PyO3. Answer user questions using Chinese. Draft plans also in Chinese. Write code comments in English.
 
+`doc/README.md` is the current design record — the seven-layer stack, one
+document per layer, the invariants, and the analyzer contract. `old-doc/` is the
+archived rationale and cost math, not the current picture. Per-module `README.md`
+files sit next to the code and win over `doc/` when they disagree.
+
 ## Environment (read first)
 
 - **Initialize the env with `just sync`** (install `just` via `cargo install just`).
@@ -40,8 +45,14 @@ just test-gpu     # gpu tier (throughput regression, cupti). Needs a CUDA device
                   #   the launcher builds the binary + warms profile.db itself.
 just test-all     # cpu + gpu — the usual "did my refactor break anything".
 just test-bench   # opt-in: sim-speed median + Rust --ignored microbenches.
+just test-agent   # opt-in, expensive: Codex runner+judge skill cases.
 just update-golden # re-record per-GPU goldens after an INTENTIONAL cost change.
 ```
+
+A stale `target/` bites here: `just test-cpu` builds the simulator lib, but a few
+tests shell out to the `analyze` binary and use whatever is already built. After
+switching branches, `uv run cargo build -p analyzer --bin analyze` first, or a
+green tree can fail on artifacts the old binary wrote.
 
 After a refactor: `just test-all`. Modeled throughput is bit-identical run-to-run,
 so the throughput regression test **warns at ±1%** — if it warns, the refactor

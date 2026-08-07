@@ -86,7 +86,7 @@ Routes a deployment's requests across **pools** of workers. The deployment forms
 hierarchy — deployment → pool → group → worker — and the **pool boundary is L6's
 only abstraction**: routing above the pool (L6b, inter-pool) is separate from
 routing within a pool (L6a, pool-local). L6 exposes a single object to the layer
-above: the `Flow` trait (`on_arrival` / `tick` / `inventory`).
+above: the `Flow` trait (`on_arrival` / `tick` / `cluster`).
 
 *Sees:* pools of workers, the request stream.
 *Doesn't see:* the tick loop, the clock, or trace I/O — it is driven by L7.
@@ -113,9 +113,9 @@ standalone crate.
 |---|---|---|
 | `profiling/` | L1 (Python) | Kernel runners + `profile.db` + the `perf_api` facade; the only source of measured numbers. |
 | `simulator/src/timing/` | L1 (Rust) | Kernel caches, the PyO3 bridge, and the CostTree (`compile`/`eval`, flatten/aggregate). |
-| `simulator/src/op/` | L2 | Atomic `Op<K>` (no file) and compound ops (`attention/flashinfer.rs`); stubs for `comm`/`moe`/`ssm`. |
+| `simulator/src/op/` | L2 | Atomic `Op<K>` (no file) and compound ops: `attention/` (FlashInfer, DSA indexer, sparse MLA), `moe/` (dispatch, combine, grouped FP8 GEMM), `gemm/`; `comm/` and `ssm/` are still module-header stubs. |
 | `simulator/src/worklet/` | L3 | Per-module sync sections (`pre_attn_local`, `attn_block_tp`, `mlp_block_tp`, …). |
-| `simulator/src/arch/` | L4 | Iter-wise and layer-wise model assembly for Llama3/Qwen3; compiled CostTree sections and model contracts. |
+| `simulator/src/arch/` | L4 | Iter-wise and layer-wise model assembly (Llama3, Qwen3-MoE, GLM-5.2 DSA/MoE); compiled CostTree sections and model contracts. |
 | `simulator/src/worker/` | L5 | KV/admission/execution components, concrete cadence shells, build recipes, and per-worker logging. |
 | `simulator/src/orchestrator/` | L6 | Deployment → pool → group → worker hierarchy; the `Flow` trait; pool-local vs inter-pool routing. |
 | `simulator/src/deployment/` | L6/L7 seam | The `Deployment` trait + `build_flow` dispatch — the single `dyn` erasure point. |
@@ -124,7 +124,15 @@ standalone crate.
 | `simulator/src/schema/` | cross-cutting | The preset/config schema shared across layers. |
 | `simulator/src/common/`, `introspect/` | cross-cutting | Shared helpers; the kernel-query / introspection subcommands. |
 | `launcher/` (top level) | L7 run interface | Builds the release binary + PyO3 env, prewarms the cache, expands sweeps, validates presets. |
+| `gpu/spec.json` (top level) | cross-cutting | Per-GPU peaks, bandwidth, and the alias table every component normalizes GPU names against. |
+| `model/` (top level) | outside the stack | HF `config/*.json` (verbatim downloads) plus `work/`, an **independent** necessary-work accountant: theoretical-minimum FLOPs/bytes derived from a model config alone. |
 | `analyzer/` (top level) | post-run | Standalone crate (no PyO3): Rust computes analysis subjects, Python renders them. |
+| `alignment/` (top level) | validation | Profiles a real vLLM server under nsys and reconciles the measured kernel timeline against the simulator's, kernel by kernel. |
+
+The last three sit **outside** the seven layers on purpose. `analyzer/` and
+`alignment/` read a finished run's artifacts rather than participating in it, and
+`model/work/` never reads the simulator's kernel tree — a lower bound derived
+from the sim's own decomposition could not detect the sim doing redundant work.
 
 ## The spine: build once, evaluate per iteration
 

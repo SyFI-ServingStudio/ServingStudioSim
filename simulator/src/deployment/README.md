@@ -67,8 +67,9 @@ embeds the run-global specs and fixes which **pool roles** exist:
    for `unified`; `ChunkedPrefill` parses but bails (`not wired yet`), and the PD
    worker tags are rejected here because they belong to the `pd` deployment.
 4. **Select the arch by its explicit tag** — the wired unified arms are
-   `Llama3Dense`, `Llama3DenseTp`, `Llama3DpAttnTpFfn`, and
-   `Qwen3MoeDpAttnEpFfn`, and `Glm52DsaMoe`. Dispatch is provider-first, *not* a
+   `Llama3Dense`, `Llama3DenseTp`, `Llama3DpAttnTpFfn`, `Qwen3MoeDpAttnEpFfn`,
+   `Qwen3MoeFp8DpAttnEpFfn`, `Qwen3VllmMoeDpAttnEpFfn`, `Glm52DsaMoe`, and
+   `Glm52VllmDsaMoe`. Dispatch is provider-first, *not* a
    `tp_size` dispatch. Each arm runs the L4 cascade
    `build_configs → resolve_configs → build` with its resolved parallel layout,
    producing a concrete model type `M`.
@@ -102,9 +103,10 @@ Each side builds its own concrete model (so TP/layout may differ), then
 
 ## The build cascade (`AfdDeployment`)
 
-`afd` has an attention pool and an FFN pool. The wired arch pair is
-`qwen3_attn_tp -> qwen3_ffn_moe`; the attention pool uses `disagg_attn` and the
-FFN pool uses `disagg_ffn`.
+`afd` has an attention pool and an FFN pool. The wired arch pairs are
+`qwen3_attn_tp -> qwen3_ffn_moe` (BF16) and `qwen3_attn_tp -> qwen3_fp8_ffn_moe`
+(native FP8); both pool model specs must select the same precision. The attention
+pool uses `disagg_attn` and the FFN pool uses `disagg_ffn`.
 
 The deployment validates the shared model config, builds each pool's
 layer-wise L4 model under its own backend overrides, builds the profiled

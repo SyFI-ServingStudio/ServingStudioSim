@@ -71,8 +71,10 @@ Two TP invariants that are easy to miss:
 
 ## Up / down
 
-- **Below (required):** L2 ops — atomic `Op<K>` (norm/gemm/activation/all-reduce)
-  and the compound `FlashInferAttentionOp`. A worklet holds them as fields and
+- **Below (required):** L2 ops — atomic `Op<K>` (norm/gemm/activation/quantize/
+  all-reduce) and the compound ops (`FlashInferAttentionOp`, `DsaIndexerOp`,
+  `DsaSparseMlaAttentionOp`, `SingleFp8GemmWithQuantOp`, `MoeDispatchOp` /
+  `MoeCombineOp`, `GroupedFp8GemmWithQuantOp`). A worklet holds them as fields and
   calls their `compile`/`eval`.
 - **Above (consumer):** L4 model/arch assembles worklets into a full model,
   repeating the homogeneous decoder layer via a CostTree `Scale{n}` fold rather
@@ -80,10 +82,26 @@ Two TP invariants that are easy to miss:
 
 ## Current set
 
-`pre_attn_local`, `attn_local`, `post_attn_local` (the dense `arch::llama3_dense`
-layer); `attn_block_tp`, `mlp_block_tp` (the tensor-parallel `arch::llama3_dense_tp`
-layer). Each module re-exports its `{Worklet, Config, Input, Resolved}` quartet
-through `mod.rs`.
+Each module re-exports its `{Worklet, Config, Input, Resolved}` quartet through
+`mod.rs`. The families, by the arch that assembles them:
+
+| Consuming arch | Modules |
+|---|---|
+| `llama3_dense` | `pre_attn_local`, `attn_local`, `post_attn_local` |
+| `llama3_dense_tp`, `llama3_dp_attn_tp_ffn` | `attn_block_tp`, `mlp_block_tp` |
+| `qwen3_moe_dp_attn_ep_ffn` (BF16) | `attn_block_tp`, `native_moe_router_local`, `native_moe_expert_compute_local` |
+| `qwen3_moe_fp8_dp_attn_ep_ffn` | `fp8_attn_block_tp`, `native_fp8_moe_router_local`, `native_moe_expert_compute_local` |
+| `qwen3_vllm_moe_dp_attn_ep_ffn` | `vllm_fp8_attn_block_tp`, `vllm_fp8_moe_router_local`, `vllm_fp8_moe_expert_compute_local` |
+| AFD `qwen3_attn_layerwise` | `attn_block_tp` |
+| AFD `qwen3_ffn_moe_layerwise` | `pre_attn_proj_tp`, `post_attn_router_tp`, `native_moe_router_local`, `native_moe_expert_compute_local` |
+| AFD `qwen3_fp8_ffn_moe_layerwise` | `fp8_pre_attn_proj_tp`, `fp8_post_attn_router_tp`, `native_fp8_moe_router_local`, `native_moe_expert_compute_local` |
+| `glm52_dsa_moe` | `glm52_dsa_attn_local`, `glm52_dense_ffn_local`, `glm52_moe_router_local`, `glm52_shared_expert_local`, `moe_expert_compute_local`, `glm52_mtp_prelude_local`, `glm52_mtp_head_local` |
+| `glm52_vllm_dsa_moe` | `vllm_glm52_dsa_attn_local`, `vllm_glm52_dense_ffn_local`, `vllm_glm52_shared_expert_local`, plus the four GLM sections it shares unchanged with the native arch |
+
+A `vllm_*` module is the **same sync section** as its sibling, cut into the leaves
+vLLM actually launches (quantize split out from its GEMM, dispatch/combine split
+into exchange and index/fill), so a measured nsys timeline can be reconciled leaf
+by leaf. It is a second granularity, not a second model.
 
 ## Authoring
 

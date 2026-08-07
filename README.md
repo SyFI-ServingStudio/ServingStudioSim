@@ -80,7 +80,9 @@ simulator/        Rust L1-L7 simulator and deployment schema
 profiling/        Python kernel registry, runners, execution backend, and cache
 launcher/         preset, sweep, managed-run, timing-predict, and profile CLI
 analyzer/         Rust read API and Python plot renderer
-model/            model configurations and operation definitions
+alignment/        vLLM-under-nsys profiling and measured-vs-simulated reconciliation
+model/            model configurations, and model/work/ the independent
+                  theoretical-minimum FLOP/byte labeler
 gpu/              hardware specification catalog
 trace/            trace generators and checked-in samples
 presets/          runnable deployment/prediction configurations

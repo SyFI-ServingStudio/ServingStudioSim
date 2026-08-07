@@ -57,13 +57,32 @@ infrastructure.
 - **[analyzer.md](analyzer.md)** — the post-run analyzer's design contract (the
   Rust-computes / Python-renders split, the report/payload envelope, the flat
   subject registry, applicability/scope, and the speed budget).
+- **[components/](components/)** — one document per cross-layer component that is
+  too large to fold into a layer document. Currently
+  [`optimal_analyze.md`](components/optimal_analyze.md): the R0–R5 optimality
+  ladder, and how the independent necessary-work labeler under `model/work/`
+  feeds it.
 
 Two companion sources sit alongside this folder:
 
-- **Per-module `README.md` files** live next to the code (`simulator/src/*/README.md`,
-  `profiling/README.md`, `launcher/README.md`, `analyzer/README.md`). They are the
-  finest-grained, code-matching reference; when a README disagrees with these docs,
-  the code — and the README next to it — wins.
+- **Per-module `README.md` files** live next to the code
+  (`simulator/src/*/README.md`, `profiling/`, `launcher/`, `analyzer/`,
+  `model/work/`, `alignment/`). They are the finest-grained, code-matching
+  reference; when a README disagrees with these docs, the code — and the README
+  next to it — wins.
 - **`old-doc/`** is the archived design record (deep cost-math derivations, design
   rationale, discussions, and forward-looking plans). This `doc/` folder is the
   clean, current picture; `old-doc/` is where the history and the math live.
+
+## What sits outside the seven layers
+
+Three top-level directories deliberately do not belong to a layer, because each
+one has to stay independent of the thing it measures:
+
+- **`analyzer/`** reads a finished run's artifacts, never participates in one.
+- **`model/work/`** derives a theoretical-minimum FLOP/byte floor from a model
+  `config.json` alone. It never reads the simulator's kernel tree — a bound
+  derived from the sim's own decomposition could not detect the sim doing
+  redundant work.
+- **`alignment/`** profiles a real vLLM server under nsys and reconciles the
+  measured kernel timeline against the simulator's, kernel by kernel.

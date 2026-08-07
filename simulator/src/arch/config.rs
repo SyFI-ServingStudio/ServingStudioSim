@@ -7,11 +7,14 @@
 //! consumes them), so every arch variant flattens [`ModelSpec`]. arch and worker
 //! are symmetric sibling providers (not nested).
 //!
-//! Iter-wise Llama selectors and three Qwen3-MoE execution graphs build today:
-//! native BF16, native FP8, and vLLM-aligned FP8. Each Qwen graph has a distinct
-//! selector and L4 implementation; precision/backend selection is therefore not
-//! hidden behind an in-arch recipe branch. They pair with the same `hp_unified`
-//! worker as the DP-attn dense variant (one KV partition state per attn-DP shard).
+//! Iter-wise Llama selectors, three Qwen3-MoE execution graphs (native BF16,
+//! native FP8, vLLM-aligned FP8), and two GLM-5.2 DSA/MoE graphs (native and
+//! vLLM-aligned) build today. Each has a distinct selector and L4
+//! implementation; precision/backend selection is therefore not hidden behind an
+//! in-arch recipe branch, and a `_vllm_` variant differs from its sibling only in
+//! how finely it cuts the same work into leaves, so a measured nsys timeline can
+//! be reconciled leaf by leaf. They pair with the same `hp_unified` worker as the
+//! DP-attn dense variant (one KV partition state per attn-DP shard).
 //!
 //! NOTE (serde): `#[serde(deny_unknown_fields)]` is silently ignored on
 //! internally-tagged enum variants, so a typo inside an arch payload is NOT
@@ -374,8 +377,11 @@ mod iter_tests {
 
     #[test]
     fn glm52_vllm_selector_is_registered_and_shares_the_glm_parameter_surface() {
+        // `fp8: true` pairs with the FP8 checkpoint's config, not the BF16 one:
+        // `model/work/floors.py` rejects the mismatched combination, and this
+        // literal is what gets copied into new presets.
         let parsed: IterArchSel = serde_json::from_str(
-            r#"{"type":"glm52_vllm_dsa_moe","model_config":"model/config/glm52.json","fp8":true}"#,
+            r#"{"type":"glm52_vllm_dsa_moe","model_config":"model/config/glm52_fp8.json","fp8":true}"#,
         )
         .expect("vLLM-granularity GLM selector parses");
         let IterArchSel::Glm52VllmDsaMoe {
@@ -390,7 +396,7 @@ mod iter_tests {
         else {
             panic!("expected glm52_vllm_dsa_moe")
         };
-        assert_eq!(model.model_config, "model/config/glm52.json");
+        assert_eq!(model.model_config, "model/config/glm52_fp8.json");
         assert!(model.fp8);
         assert_eq!(*ep_size, 8);
         assert_eq!(*nvl_num_gpu, 8);
@@ -417,7 +423,7 @@ mod iter_tests {
         // rejected outright if a non-uniform `routing` is also requested.
         for tag in ["glm52_dsa_moe", "glm52_vllm_dsa_moe"] {
             let parsed: IterArchSel = serde_json::from_str(&format!(
-                r#"{{"type":"{tag}","model_config":"model/config/glm52.json","fp8":true,
+                r#"{{"type":"{tag}","model_config":"model/config/glm52_fp8.json","fp8":true,
                      "expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}}"#
             ))
             .expect("GLM selector accepts an expert-popularity profile");

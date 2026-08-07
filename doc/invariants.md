@@ -26,9 +26,10 @@ layer above or below. They are grouped by where they bite.
 - **INV-4 — only Scale and Max touch time.** `flops` / `bytes` / `energy` always
   sum; `time` is only rescaled by a `Scale{n}` fold or overlapped by a `Max`. A
   plain `Sum` adds time; nothing else rewrites it.
-- **`Scale{n}` folds only provably-identical subtrees.** Repeating a homogeneous
-  decoder layer with `Scale{num_layers}` is valid only because every folded layer
-  has bit-identical structure; a heterogeneous layer may not be folded.
+- **INV-3 — `Scale{n}` folds only provably-identical subtrees.** Repeating a
+  homogeneous decoder layer with `Scale{num_layers}` is valid only because every
+  folded layer has bit-identical structure; a heterogeneous fan-out (uneven EP, a
+  hybrid layer schedule) expands instead.
 - **INV-5 — names live only in the manifest.** The hot-path flat tree and the log
   rows carry no names; the `CostManifest` sidecar holds the taxonomy, and render-only
   `Labeled` nodes are dropped from the flat tree.

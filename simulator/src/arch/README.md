@@ -13,7 +13,7 @@ The canonical layer contract is
 2. `model_cfg.rs` / `moe_model_cfg.rs` — dense and MoE model dimensions.
 3. `config.rs` — serde selector surfaces.
 4. `build.rs` — shared selector-to-concrete-model builders.
-5. `llama3_*.rs` / `qwen3_*.rs` — concrete model composition.
+5. `llama3_*.rs` / `qwen3_*.rs` / `glm52_*.rs` — concrete model composition.
 
 ## Contracts (`contract.rs`)
 
@@ -85,8 +85,11 @@ reimplement model assembly.
 ## Dimensions and parallel layout
 
 - `ModelCfg` loads dense-decoder dimensions.
-- `MoeModelCfg` extends those facts with MoE dimensions.
-- `ParallelCfg` and the Qwen3 family-specific parallel structs resolve TP, EP,
+- `MoeModelCfg` extends those facts with MoE dimensions. GLM-5.2's DSA/MoE
+  dimensions live in `Glm52ModelCfg` (`glm52_dsa_moe.rs`), because its
+  heterogeneous 78-layer schedule and indexer dimensions are not a `MoeModelCfg`
+  extension.
+- `ParallelCfg` and the family-specific parallel structs resolve TP, EP,
   attention-DP/HP, NVLink-domain, and GPU facts.
 - `num_layers` / `sim_num_layers` truncation is applied before
   `build_configs`.
@@ -102,7 +105,7 @@ variant's parameters.
 
 | Contract | Wired selectors | Explicitly unsupported selectors |
 |---|---|---|
-| `IterArchSel` | `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn` | none |
+| `IterArchSel` | `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `glm52_dsa_moe`, `glm52_vllm_dsa_moe` | none |
 | `AttnArchSel` | `qwen3_attn_tp` | `llama3_attn_tp` |
 | `FfnArchSel` | `qwen3_ffn_moe`, `qwen3_fp8_ffn_moe` | `deepseek_ffn_moe` |
 
@@ -116,6 +119,7 @@ schema; no second hand-maintained config union belongs here.
   - Llama3 dense/TP → `barebone`
   - Llama3 DP-attention/TP-FFN → `hp_unified`
   - Qwen3 MoE DP-attention/EP-FFN (native BF16, native FP8, or vLLM-aligned FP8) → `hp_unified`
+  - GLM-5.2 DSA/MoE (native or vLLM-aligned) → `hp_unified`
 - PD:
   - Llama3 TP prefill → Llama3 TP decode
   - Llama3 TP prefill → Llama3 DP-attention/TP-FFN decode

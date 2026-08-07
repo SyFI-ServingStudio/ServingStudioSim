@@ -122,7 +122,9 @@ db/                L1b core: cache, registry, schema, scheduling.
 
 kernels/           One file per kernel kind. Each declares KIND + <Kind>Args and
                    calls register(...) at import. __init__ is the barrel that
-                   imports them all. Mirror of simulator/src/timing/kernels/.
+                   imports them all. Mirrors simulator/src/timing/kernels/ for
+                   every kind the simulator consumes; a kind may exist here
+                   alone while it is still only being measured.
 
 runners/           L1a measurement. Subpackage per op family (gemm, attention,
   metrics.py         comm, norm, elementwise, idle). Return ComputeMetrics or

@@ -80,7 +80,20 @@ kernels/          One file per kernel kind + the generic engine.
                     and the `register_kernel!` inventory hook (no central enum).
   single_gemm.rs    Example kind: declares Config/Input, KIND, sweep_grid,
   rms_norm.rs       cache_kind, enumerate. All the generic machinery is in engine.
-  elementwise.rs  · flashinfer_attn_{prefill,rect,decode}.rs · all_reduce.rs
+                    ~28 kinds today, by family:
+                    gemm       single_gemm · batched_gemm · grouped_gemm ·
+                               fp8_blockscale_grouped_gemm
+                    quantize   fp8_block_quant · fp8_per_token_group_quant
+                    norm       rms_norm · residual_rms_norm ·
+                               all_reduce_residual_rms_norm · elementwise
+                    attention  flashinfer_attn_{prefill,rect,decode} ·
+                               kv_cache_append · mla_cache_append · vllm_mla_rope
+                    DSA        dsa_index_cache_append · dsa_mqa_logits_prefill ·
+                               dsa_paged_mqa_logits_decode · dsa_topk_prefill ·
+                               dsa_persistent_topk_decode · dsa_sparse_mla_attention
+                    MoE        moe_alltoall · moe_alltoall_prepare ·
+                               moe_finalize_routing
+                    comm       all_reduce · p2p_intra · p2p_inter
 
 cache/            Fit profiled samples → an interpolating cache; eval off-grid.
   mod.rs            Cache trait, CacheKind enum, build_cache dispatch, OutlierWarning.

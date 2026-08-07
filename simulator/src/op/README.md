@@ -62,15 +62,24 @@ One attention call over a sim batch dispatches to three L1 kernels
 
 This **v1 cost model** (per-request prefill sum + decode collapse) is exact when
 a step has ≤1 prefill request — the common continuous-batching case — and
-over-estimates only when several small-q prefills are batched. See
+over-estimates only when several small-q prefills are batched. The fidelity
+measurement behind that claim lives in the workspace-level (out-of-repo)
 `agent-trace/attention_cache_fidelity.md`.
 
 ## What's in the tree
 
-- **Live:** `Op<K>` (atomic) and `FlashInferAttentionOp` (compound).
-- **Stubs:** `op/comm`, `op/moe`, `op/ssm` are one-line module headers. The
-  compound ops they will hold (e.g. an MoE dispatch op, comm ops, SSM) are
-  specified in `doc/detailed_design/L2.md`.
+- **`Op<K>`** — the atomic wrapper, used everywhere; it has no file.
+- **`op/attention/`** — `FlashInferAttentionOp` (dense MHA/GQA),
+  `DsaIndexerOp` and `DsaSparseMlaAttentionOp` (GLM-5.2's DSA: the sparse
+  index selection and the sparse MLA that consumes its top-k).
+- **`op/gemm/`** — `SingleFp8GemmWithQuantOp`: the activation quantize kernel
+  and the FP8 GEMM as one named operation.
+- **`op/moe/`** — `MoeDispatchOp` / `MoeCombineOp`, both leaf views over the one
+  `sim::simulate_moe_comm` realization that prices all six network stages, plus
+  `GroupedFp8GemmWithQuantOp` for the expert FFN.
+- **Stubs:** `op/comm` and `op/ssm` are still one-line module headers. Dense
+  collectives are atomic `Op<K>` over the `all_reduce*` kernels today; the
+  compound comm/SSM ops are specified in `doc/detailed_design/L2.md`.
 
 ## Up / down
 

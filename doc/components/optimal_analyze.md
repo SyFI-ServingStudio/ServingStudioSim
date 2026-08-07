@@ -217,7 +217,17 @@ t4_l = t3_l   otherwise
 ```
 
 Communication kinds include the named collectives and point-to-point operations
-in `prepare.rs`, plus kinds prefixed by `p2p`, `nccl`, or `comm`.
+in `prepare.rs`, plus kinds prefixed by `p2p`, `nccl`, or `comm`. `moe_alltoall`
+is on that list: it is the expert-parallel exchange itself, and omitting it made
+R4 count hundreds of milliseconds of fabric traffic as optimizable local compute.
+Its sibling `moe_alltoall_prepare` is deliberately **not** — its time is the
+local atomics/index kernels that build the send layout, wrapped around a tiny
+metadata exchange, so classifying it as communication would erase real local
+work.
+
+A leaf whose kind is not on that list but which is genuinely a collective will be
+silently misclassified, so a new comm kind must be added there in the same change
+that introduces it.
 
 The `R3 - R4` difference is the modeled communication cost under the R3 batching
 assumption.
@@ -261,12 +271,22 @@ semantic FLOPs and bytes for the model.
 For semantic segment `s` inside one allowed composition boundary:
 
 ```text
-C_s = min_FLOPs_s / hardware_peak_FLOP/s
+C_s = min_FLOPs_s / hardware_peak_FLOP/s(dtype_s)
 M_s = min_bytes_s / hardware_HBM_byte/s
 N_s = max(C_s, M_s)
 
 R6_boundary = Σ_s N_s
 ```
+
+`dtype_s` is **per segment**, reported by the labeler on the wire, not one dtype
+for the whole pool. A checkpoint is mixed: an FP8 MoE still keeps its router,
+its norms, and (for GLM-5.2 DSA) its BF16 FlashMLA kernel off the FP8 tensor
+cores. The labeler resolves each segment's precision from the model config's own
+`quantization_config` — matched per weight matrix against `modules_to_not_convert`
+— and from mechanism facts that are independent of the checkpoint. Note this is a
+different question from R5's `dtype`, which comes from the *measured leaf's*
+config in the manifest; R6 asks what the minimum work would run at, not what the
+run happened to launch.
 
 Thus R6 keeps semantic operations segmented and pays a separate roofline for each
 one. It removes work present in the simulator/kernel accounting but absent from
@@ -288,14 +308,16 @@ composition boundary:
 
 ```text
 R7_boundary = max(
-  Σ_s min_FLOPs_s / hardware_peak_FLOP/s,
+  Σ_s min_FLOPs_s / hardware_peak_FLOP/s(dtype_s),
   Σ_s min_bytes_s / hardware_HBM_byte/s
 )
 ```
 
 It is the lowest and most permissive bound: compute-bound semantic work may
 offset memory-bound semantic work as if the boundary were fully fused or
-overlapped. In batch-unlocked mode the boundary can be the worker, pool, or
+overlapped. The compute term still sums *per segment* rather than dividing one
+global FLOP total by one peak — fusing every leaf into a single kernel does not
+fuse precisions. In batch-unlocked mode the boundary can be the worker, pool, or
 cluster workload. In batch-locked mode the boundary remains each fixed iteration,
 and the scope R7 is the occurrence-weighted sum of those per-iteration results.
 The `R6 - R7` difference is fusion/overlap opportunity within that policy.
