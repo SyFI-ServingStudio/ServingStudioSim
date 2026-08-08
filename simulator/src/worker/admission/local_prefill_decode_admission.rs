@@ -4,7 +4,7 @@
 //! token/KV gates and prefill/decode/done transitions. Candidate facts are frozen
 //! once at enqueue, so batch formation never re-reads the request store.
 
-use crate::common::{RequestId, Time, UnifiedStage};
+use crate::common::{PrefixInput, RequestId, Time, UnifiedStage};
 use crate::worker::admission::{
     prefill_fits_budget, AdmissionCandidate, EnqueueSequence, IterAdmission, LoadBalance,
     PendingOrderPolicy,
@@ -81,7 +81,8 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         match self.max_batch_tokens {
             None => {
                 if let Some(candidate) = self.policy.peek() {
-                    let partition = self.balance.choose(num_partitions) as u16;
+                    let partition =
+                        self.choose_prefill_partition(kv_store, candidate.prefix, num_partitions);
                     let resolution =
                         kv_store.plan_prefix(partition, candidate.prompt, candidate.prefix);
                     let footprint = kv_store.footprint(
@@ -181,7 +182,8 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         let mut admitted_tokens = vec![0; num_partitions];
 
         while let Some(candidate) = self.policy.peek() {
-            let partition = self.balance.choose(num_partitions) as u16;
+            let partition =
+                self.choose_prefill_partition(kv_store, candidate.prefix, num_partitions);
             let partition_index = partition as usize;
             let resolution = kv_store.plan_prefix(partition, candidate.prompt, candidate.prefix);
             let prefill_compute_tokens = resolution.prefill_compute_tokens();
@@ -215,6 +217,20 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
             );
             admitted_tokens[partition_index] += prefill_compute_tokens;
         }
+    }
+
+    /// Retained session KV is a hard worker-local affinity. Round-robin is
+    /// consulted only for a cold or evicted session, so a blocked cache owner
+    /// waits instead of creating another copy on a different partition.
+    fn choose_prefill_partition<K: PrefixKv>(
+        &mut self,
+        kv_store: &K,
+        prefix: PrefixInput,
+        num_partitions: usize,
+    ) -> u16 {
+        kv_store
+            .retained_prefix_partition(prefix)
+            .unwrap_or_else(|| self.balance.choose(num_partitions) as u16)
     }
 
     fn admit<K: PrefixKv>(

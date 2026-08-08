@@ -98,6 +98,10 @@ pub trait KvStore {
 /// that exact plan. The simulator is single-threaded, so no cache mutation can
 /// occur between those two calls. Runtime hit/miss facts remain in this store.
 pub trait PrefixKv: KvStore {
+    /// Locate reusable retained prefix KV before admission applies its fallback
+    /// placement policy. Active requests are deliberately excluded because a
+    /// destructive cache lease does not permit inter-request sharing.
+    fn retained_prefix_partition(&self, prefix: PrefixInput) -> Option<PartitionId>;
     fn plan_prefix(
         &self,
         partition: PartitionId,

@@ -36,7 +36,7 @@ different timelines and should not be hidden behind one giant FSM abstraction.
 | Worker selector | KV | Admission | Execution | Shell |
 |---|---|---|---|---|
 | `barebone` | `FullAttnKv` | `LocalPrefillDecodeAdmission<FifoOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
-| `hp_unified` | `FullAttnKv` with N partitions | `LocalPrefillDecodeAdmission<FifoOrder>` with RR placement | `UnifiedIterExecution` | `IterBatchWorker` |
+| `hp_unified` | `FullAttnKv` with N partitions | `LocalPrefillDecodeAdmission<FifoOrder>` with prefix affinity then RR misses | `UnifiedIterExecution` | `IterBatchWorker` |
 | `pd_prefill` | `FullAttnKv` with held-KV ledger | `PrefillHandoffAdmission<FifoOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
 | `pd_decode` | `FullAttnKv` | thin inline landed-request ingress | `UnifiedIterExecution` | `PullDecodeWorker` |
 | `disagg_attn` | `FullAttnKv` | `FreshRequestSlotAdmission<FifoOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
@@ -88,6 +88,7 @@ footprint → fits → reserve → commit_resident → advance → release
 - the promised reservation ledger;
 - the PD-prefill held-KV ledger;
 - runtime session-prefix resolution and one retained-prefix cache per partition;
+- worker-local retained-prefix partition lookup;
 - sticky request→partition ownership;
 - strict admission and KV sampling.
 
@@ -110,9 +111,11 @@ token gate belong to admission (`admission/placement.rs` and
 one-variant capacity-policy seam.
 
 `PrefixInput` remains an immutable request declaration. Admission asks
-`PrefixKv` to resolve the local partition's retained hit, gates the actual
-compute `fresh + declared - resident`, and reserves the full context
-`fresh + declared`. Execution reads that resolution from KV; request progress
+`PrefixKv` to locate the best retained match before fallback placement, resolve
+that partition's hit, gate the actual compute
+`fresh + declared - resident`, and reserve the full context `fresh + declared`.
+An HP request waits when its retained owner is full; only a cold or evicted
+session advances RR. Execution reads the resolution from KV; request progress
 records processed prefill work, not cache residency.
 
 Retained prefix KV is evictable occupancy inside the same total attention

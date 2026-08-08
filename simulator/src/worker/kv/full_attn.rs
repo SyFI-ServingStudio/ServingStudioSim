@@ -144,6 +144,30 @@ impl HandoffKv for FullAttnKv {
 }
 
 impl PrefixKv for FullAttnKv {
+    fn retained_prefix_partition(&self, prefix: PrefixInput) -> Option<PartitionId> {
+        let PrefixInput::Session {
+            session_id,
+            declared_prefix_tokens,
+        } = prefix
+        else {
+            return None;
+        };
+
+        let mut best_partition = None;
+        let mut best_resident_tokens = 0;
+        for (partition_index, prefix_cache) in self.prefix_caches.iter().enumerate() {
+            let resident_tokens = prefix_cache.peek(session_id, declared_prefix_tokens);
+            if resident_tokens > best_resident_tokens {
+                best_resident_tokens = resident_tokens;
+                best_partition = Some(
+                    PartitionId::try_from(partition_index)
+                        .expect("FullAttnKv partition count must fit PartitionId"),
+                );
+            }
+        }
+        best_partition
+    }
+
     fn plan_prefix(
         &self,
         partition: PartitionId,
@@ -583,6 +607,30 @@ mod tests {
         assert_eq!(resolution.resident_prefix_tokens(), 0);
         assert_eq!(resolution.prefill_compute_tokens(), 120);
         assert_eq!(resolution.initial_context_tokens(), 120);
+    }
+
+    #[test]
+    fn retained_prefix_partition_prefers_the_largest_hit_then_lower_partition() {
+        let mut kv_store = FullAttnKv::with_prefix_cache(3, 100, 100, PrefixCachePolicy::Lru, None);
+        kv_store.prefix_caches[1].insert(7, 50, 100, None);
+        kv_store.prefix_caches[2].insert(7, 80, 100, None);
+
+        assert_eq!(
+            kv_store.retained_prefix_partition(PrefixInput::Session {
+                session_id: 7,
+                declared_prefix_tokens: 60,
+            }),
+            Some(2)
+        );
+        assert_eq!(
+            kv_store.retained_prefix_partition(PrefixInput::Session {
+                session_id: 7,
+                declared_prefix_tokens: 40,
+            }),
+            Some(1),
+            "equal reusable lengths keep the lowest partition deterministic"
+        );
+        assert_eq!(kv_store.retained_prefix_partition(PrefixInput::None), None);
     }
 
     #[test]

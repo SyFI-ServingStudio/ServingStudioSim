@@ -218,6 +218,7 @@ mod tests {
     use crate::common::{PoolId, PrefixInput, SharedRequests};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::admission::ShortestJobFirst;
+    use crate::worker::kv::PrefixKv;
     use crate::worker::types::{WorkerConfig, WorkerEventCommon, WorkerMsgCommon};
     use crate::worker::workers::iter::{build_barebone_worker, build_hp_worker};
 
@@ -470,6 +471,47 @@ mod tests {
         let first_partition = worker.kv_store.decode_members(0).count();
         let second_partition = worker.kv_store.decode_members(1).count();
         assert_eq!((first_partition, second_partition), (1, 1));
+    }
+
+    #[test]
+    fn hp_same_session_returns_to_its_retained_prefix_partition() {
+        for max_batch_tokens in [None, Some(256)] {
+            let store = shared_with(&[(0, 20, 1), (1, 30, 1)]);
+            {
+                let mut requests = store.borrow_mut();
+                for request in [RequestId(0), RequestId(1)] {
+                    requests[request].request.definition.prefix = PrefixInput::Session {
+                        session_id: 7,
+                        declared_prefix_tokens: 100,
+                    };
+                }
+            }
+            let config = WorkerConfig {
+                attn_kv_bytes: 1_000,
+                prefix_cache_capacity_bytes: 1_000,
+                max_batch_tokens,
+                ..WorkerConfig::default()
+            };
+            let mut worker = hp_worker(Rc::clone(&store), 2, config);
+
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+            let events = run_to_quiescence(&mut worker, 100);
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                store.borrow()[RequestId(0)]
+                    .progress
+                    .prefill_tokens_processed,
+                120
+            );
+
+            // The cold request advanced RR to partition 1. A cache-unaware
+            // placement would therefore send this request away from its prefix.
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+            assert!(worker.form_batch(Time::from_ms(100.0)));
+            assert_eq!(worker.kv_store.prefill_admits(0).count(), 1);
+            assert_eq!(worker.kv_store.prefill_admits(1).count(), 0);
+            assert_eq!(worker.kv_store.prefill_compute_tokens(RequestId(1)), 30);
+        }
     }
 
     #[test]
