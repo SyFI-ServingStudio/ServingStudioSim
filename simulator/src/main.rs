@@ -22,7 +22,7 @@ use simulator::common::{RequestStore, SharedRequests};
 use simulator::deployment::{build_flow, RunConfig};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
-use simulator::sim::{run_sim, TickCfg, TraceFrontend};
+use simulator::sim::{run_sim, LoadedTrace, ReplayMode, TickCfg, TraceDeclaration};
 use simulator::timing::PerfApiBridge;
 
 // Heap profiling (opt-in, `--features dhat-heap`): dhat's allocator only
@@ -153,23 +153,32 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// `run` — strict bridge (JIT off → fail-fast on missing `profile.db` rows),
-/// build the deployment Flow, load the trace, drive the tick loop, log parquet.
+/// `run` — load and type-check the trace, then start the strict bridge (JIT off),
+/// build the deployment Flow, drive the tick loop, and log parquet.
 fn cmd_run(config: &Path) -> anyhow::Result<()> {
     let cfg = load_config(config)?;
-    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
-    let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
 
-    // Cheap fail-fast: load the trace + tick config before the expensive L4
-    // build, so a bad trace path errors without first running the cascade.
+    // Parse into a concrete request family and narrow to the currently
+    // supported text path before starting the bridge or building L4.
     let workload = cfg.workload();
-    let mut frontend = TraceFrontend::load(
-        &workload.trace_files,
+    let declaration = TraceDeclaration::parse(&workload.trace_kind, &workload.trace_tags)?;
+    let mode = ReplayMode::parse(
+        &workload.replay_mode,
         workload.request_rate,
         workload.max_concurrency.map(|n| n as usize),
     )?;
-    let tick_cfg = TickCfg::new(workload.duration_ms, workload.run_to_end, workload.tick_dt_us);
+    let loaded_trace = LoadedTrace::load(&workload.trace_files, &declaration, mode)?;
+    let mut frontend = loaded_trace.into_current_text_frontend()?;
+    let tick_cfg = TickCfg::new(
+        workload.duration_ms,
+        workload.run_to_end,
+        workload.tick_dt_us,
+    );
+    let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+    // Reserve empty id slots; no fake request exists before replay releases it.
+    store.borrow_mut().reserve_slots(frontend.expected_count());
 
+    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     let mut flow = build_flow(&cfg, &bridge, Rc::clone(&store))?;
 
     let log_dir = &cfg.io().log_dir;

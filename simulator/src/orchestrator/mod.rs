@@ -17,14 +17,14 @@ pub use impls::{
     AFD_FFN_POOL, PD_DECODE_POOL, PD_PREFILL_POOL,
 };
 
-use crate::common::{Request, Time};
+use crate::common::{Request, RequestDefinition, TextGenerationDefinition, Time};
 use crate::worker::SharedGpuCluster;
 
 /// L6b deployment flow — the only object L7 calls. `on_arrival` takes the full
 /// `Request` (the flow inserts its facts into the shared store, then admits the
 /// id); `tick` drives the pools and surfaces deployment actions.
-pub trait Flow {
-    fn on_arrival(&mut self, req: Request);
+pub trait Flow<Definition: RequestDefinition = TextGenerationDefinition> {
+    fn on_arrival(&mut self, req: Request<Definition>);
     fn tick(&mut self, now: Time) -> Vec<OrchAction>;
     /// The shared GPU cluster — both the run's GPU registry (the `gpus` field is
     /// what L7 serializes into `raw/run_meta.json`) and the inter-worker

@@ -111,8 +111,8 @@ where
     WP::Msg: From<RequestId>,
 {
     fn on_arrival(&mut self, req: Request) {
-        let rid = req.id;
-        self.requests.borrow_mut().insert(&req);
+        let rid = req.core.id;
+        self.requests.borrow_mut().insert(req);
         self.prefill_pool.admit(rid);
     }
 
@@ -197,7 +197,7 @@ mod tests {
     use super::*;
     use crate::common::{RequestId, RequestStore};
     use crate::orchestrator::DpPlacementPolicy;
-    use crate::test_helpers::FakeModel;
+    use crate::test_helpers::{text_request, FakeModel};
     use crate::worker::{
         build_pd_decode_worker, build_pd_prefill_worker, PdDecodeWorker, PdPrefillWorker,
         WorkerConfig,
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn request_prefills_then_decodes_to_completion() {
         let (mut flow, store) = build_flow();
-        flow.on_arrival(Request::new(RequestId(0), 16, 3, Time::ZERO));
+        flow.on_arrival(text_request(RequestId(0), 16, 3, Time::ZERO));
         let mut completed = Vec::new();
         for step in 0..500u64 {
             for a in flow.tick(Time::from_ms(step as f64)) {
@@ -265,14 +265,17 @@ mod tests {
         assert_eq!(completed, vec![RequestId(0)]);
         let s = store.borrow();
         let r = &s[RequestId(0)];
-        assert!(r.completed);
-        assert_eq!(r.tokens_emitted, 3, "1 prefill token + 2 decode tokens");
+        assert!(r.lifecycle.completed);
+        assert_eq!(
+            r.progress.output_tokens_emitted, 3,
+            "1 prefill token + 2 decode tokens"
+        );
     }
 
     #[test]
     fn single_token_request_completes_at_prefill() {
         let (mut flow, _store) = build_flow();
-        flow.on_arrival(Request::new(RequestId(0), 16, 1, Time::ZERO));
+        flow.on_arrival(text_request(RequestId(0), 16, 1, Time::ZERO));
         let mut completed = Vec::new();
         for step in 0..100u64 {
             for a in flow.tick(Time::from_ms(step as f64)) {

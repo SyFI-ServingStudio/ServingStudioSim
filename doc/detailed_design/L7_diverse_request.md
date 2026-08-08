@@ -1,165 +1,180 @@
-# L7 — 多样请求类型的延展性设计(L7_diverse_request)
+# L7 — 多样请求类型的 typed frontend
 
-- **状态:design analysis(未实现)**。当前里程碑只有**单轮 text**;本文是"未来请求类型越来越多(带 session history / SLO·priority 标签 / 图像 / 触发执行图 / 音频…)时,怎么装进系统而不撑爆 worker"的前瞻设计与判据。它对 request 抽象做的事,正是 [L5.md](L5.md) 对 worker 抽象做的事(把 model/modality-specific 的东西关进各自那根轴,共享结构保持 agnostic)。
-- **现状事实源**:[L7.md](L7.md)(frontend / run loop / store 的 as-built 事实)。代码锚点:`simulator/src/common/request.rs`(`Request` / `RequestRecord` / `RequestStore`)、`simulator/src/sim/frontend.rs`(唯一 ingress)、`simulator/src/worker/shared/context.rs`(`WorkerContext` 隔离墙)。
-- **一句话**:请求类型会爆炸,但**它们不在同一层**;按"执行形状"而非"modality 名字"分类,多数是加法,只有非自回归输出越界成新 family。request 的充实走一条纪律 —— **agnostic 核 + 类型化、对 worker 不透明、各自只被一根轴读的侧结构**。
+- **状态：request/frontend 类型接缝已实现；非 text worker family 尚未实现。**
+- **事实源：** `simulator/src/common/request.rs`、
+  `simulator/src/common/request_family/`、`simulator/src/sim/frontend/`、
+  `simulator/src/orchestrator/mod.rs`。
+- **核心裁决：** 请求 family 是 Rust 类型参数，不是贯穿运行路径的 enum。
+  runtime kind dispatch 只允许存在于启动期的 `LoadedTrace`；进入 L6/L5 后，
+  frontend、`Flow`、`RequestStore`、worker 必须共享同一个 `Definition` 类型。
 
-> 阅读顺序:决策者读 Part 0 + IV + VIII;想改 `RequestRecord` 的实现者读 Part I + V;想扩 frontend/schema 的读 Part VI;关心 agent/多步编排的读 Part VII。
+## 1. Request 的四层结构
 
----
+```text
+Request<Definition>
+├── RequestCore                 # id / actual arrival / scheduling contract
+└── Definition                  # immutable family-specific requested work
 
-# Part 0 — 背景与问题
-
-未来要支持的请求类型(用户列的问题空间):
-
-1. text
-2. text + prefix / session history(多轮)
-3. text + 任意 SLO / priority 标签
-4. images(图生文 VLM/ITT、文生图 TTI)
-5. text 但含**执行路径**(可能触发图生、可能触发文生 —— 本质是系统图遍历)
-6. audio 及其它多模态
-
-三个问题:**(a)** 怎么装进系统?**(b)** 会不会 break 已定稿的四轴 worker?**(c)** 怎么把 frontend 隔离出来,不让请求类型的变化顺着接口漏进 worker?
-
-放松条件(用户明确):**有些类型需要新 worker、甚至独立 KV 管理 / 准入,完全 OK**;能共享更好,但不强求。于是真正的问题不是"会不会 break",而是**每类落在栈的哪一层、能不能共享、共享哪根轴**。
-
----
-
-# Part I — 现状数据流与 worker 的窄读点
-
-```
-trace CSV ──► [frontend.rs:143] ──► Request ──► RequestRecord ──► worker 读点
-{id,input_len,   TraceEntry→Request   {prompt_len,   {+FSM 字段}     (只读数字)
- output_len,     唯一 ingress          decode_len,
- arrival}                              arrival}
+ActiveRequest<Definition>
+├── request                     # core + immutable definition
+├── progress: Definition::Progress
+├── lifecycle                   # admitted / completed / stage state
+└── telemetry                   # first/last/per-output observations
 ```
 
-`RequestRecord`(`request.rs:42`)= arrival 事实(不可变)+ FSM 工作字段 + 输出记账。生产 worker(`simulator/src/worker/workers/`)从 record **只**读这些:
+`RequestDefinition` 关联自己的 `Progress` 和完成判据。因此 text generation 的
+`output_tokens_emitted >= target_output_tokens` 不会被误用到 diffusion/TTS；这些
+family 的定义分别使用 generation-step progress。
 
-- `(prompt_len, decode_len)` → 准入 gate(`try_admit`)+ KV footprint
-- `(prefix_kv, active_chunk_len)` → cost model 的 `prefill_chunk_pairs` → ArchInput
-- `tokens_emitted` vs `decode_len` → 完成判定(`is_complete()`,`request.rs:133`)
+`Request::new(RequestCore, Definition)` 只是 generic storage constructor：它接收已经
+由 replay 解析完成的 core 与 typed definition，不解析 trace，也不提供某个 family 的
+positional convenience API。legacy 四列 text trace 的默认 prefix/decoding/scheduling
+完全属于 frontend schema；测试需要默认 text request 时使用 test-only helper。
 
-**关键事实:worker 眼里的 request 已经是纯数字 token 计数,它从不知道"文本"这回事。** 请求面对 worker 的整个表面就是 `(prompt_len, decode_len, prefix_kv, active_chunk_len): u32`。这跟 [L5.md](L5.md) 里"KvStore 不知道 role"是同一条原理的延伸——延伸到"不知道 modality"。
+公共 `RequestCore` 只放真正跨 family 的事实：
 
-**唯一一处 text 假设**:`is_complete() = tokens_emitted >= decode_len`(自回归、逐 token)。焊在 `RequestRecord::is_complete` + serving shell 的 `record_token`。记住它,Part III 会撞上。
+- `RequestId`
+- 实际 release 后的 `arrival_time`
+- `SchedulingContract { priority, completion_deadline }`
 
----
+prompt/output token 数不在 core。它们属于 `TextGenerationDefinition`。directional
+family 使用 `ImageExtent`、`VideoExtent`、`AudioExtent` 具体类型，因此
+image-to-video 的消费者不需要 match 无关的 audio variant。只有原生 omni family
+内部使用 segment enum，因为“同一个 request 的有序输入/输出确实可异构”就是它的
+业务契约，而不是为了绕过 family 类型系统。
 
-# Part II — 按执行形状分类(不是按 modality 名字)
+## 2. 当前 concrete families
 
-modality 的名字会误导;决定能不能塞进现有抽象的是**执行形状**,只有三档:
+frontend schema 已能产生这些互不兼容的类型：
 
-| 档 | 例子 | 输入 | 输出 | 对现有抽象 |
-|---|---|---|---|---|
-| **A. 自回归-out,输入即 token 计数** | text、text+session history、audio-in、VLM/ITT | 折成 prompt token 数 | 逐 token | **已经装得下** |
-| **B. 自回归-out,输入需先编码** | 图生文(image→N visual tokens) | 非 token,需 vision encoder | 逐 token | **加法扩展** |
-| **C. 非自回归-out** | 文生图 TTI(diffusion)、TTS | text token | N 步去噪 / 非 token | **越界(新 family)** |
+| trace kind | concrete definition | completion unit |
+|---|---|---|
+| `text_generation` | `TextGenerationDefinition` | output token |
+| `image_to_text` | `ImageToTextDefinition` | output token |
+| `video_to_text` | `VideoToTextDefinition` | output token |
+| `audio_to_text` | `AudioToTextDefinition` | output token |
+| `text_to_image` | `TextToImageDefinition` | generation step |
+| `text_to_video` | `TextToVideoDefinition` | generation step |
+| `text_to_speech` | `TextToSpeechDefinition` | generation step |
+| `image_to_video` | `ImageToVideoDefinition` | generation step |
+| `omni_generation` | `OmniGenerationDefinition` | per-output codec/token count |
 
-- **A**:`session history` = 就是 `prefix_kv`(已建模);VLM 的 visual token 一旦在 frontend 折成数,对 worker 就是更长的 `prompt_len`。**零改动**。
-- **B**:图片 → vision encoder → N 个 visual token。(a) KV/准入在乎吗?**不在乎**——visual token 就是占 KV 的 prompt token。(b) cost 在乎吗?**在乎**——encoder 是额外算力,成本依赖分辨率/patch 数,而 `RequestRecord` 没有这些。→ 归 **IterModelExecution** + 一段 encoder stage(deferred 的 `EncoderPipeline` shell,blind test #4 验过这个形状)+ request 携带图像事实。
-- **C**:完成判定不再是 `tokens_emitted >= decode_len` 而是"N 步去噪完了";KV 可能根本不自回归增长。跟 training 一样是**另一个 family**。
+这些 family 各自在 `common/request_family/` 的同名文件中定义；共享的
+autoregressive request vocabulary、durable family progress、generated-media progress
+和 concrete extent 才放在小型公共模块中。runtime KV residency 属于 L5 `KvStore`，
+future chunked-prefill 的 active chunk 属于 Admission lifecycle；两者都不能复制进
+request-family progress。旧的 concrete 名称（例如 `VideoGenerationDefinition`）继续
+兼容，同时公开方向明确的 `TextToVideoDefinition` alias；frontend/config vocabulary
+使用 `text_to_video`。
 
----
+`OmniGenerationDefinition` 是特意保留的一个宽 family：
 
-# Part III — 会不会 break worker(三读点逐点判定)
+```text
+input:  Vec<OmniInputSegment>  # text/image/audio/video，可重复、可混排
+output: Vec<OmniOutputSpec>    # text/image/audio/video，可同时要求多个结果
+```
 
-| 读点 | A(text/history) | B(VLM/ITT) | C(TTI/diffusion) |
-|---|---|---|---|
-| **准入/KV**(数字 token 数) | ✅ 不碰 | ✅ 不碰(visual token 就是数) | ✅ 不碰(text 侧仍是数) |
-| **cost model**(读 prefix_kv 等) | ✅ 不碰 | ⚠️ 需 encoder 成本 + 图像事实 | ⚠️ 去噪成本 |
-| **完成判定** `emitted≥decode_len` | ✅ 成立 | ✅ 成立(仍逐 token out) | ❌ **崩**(步数,非 token) |
+其中媒体输出的 completion unit 是模型/codec token。diffusion 式
+text-to-image、text-to-video、image-to-video 仍是独立的 step-based family；不能把
+`denoise_steps` 假装成 omni token，也不能因为两者都输出 video 就强行共用 worker。
 
-- **A/B 不 break worker**——纯加法:新 IterModelExecution(懂 vision 成本)+ 可选 encoder shell + request 挂一个侧 blob。四轴一个 modality match 都不长。
-- **C break**,且崩在**跟 training 完全一样的地方**(那唯一一处 text 假设)。→ 归 family 边界,用**兄弟 family/shell(自带 completion)**接,不是做 serving worker 的 variant。这与 L5 的裁决一致:"完成/cadence 是 shell 自持的,不是通用轴" —— TTI 只是又一个 cadence。
+这不等于所有 family 已可执行。当前 unified、HP、PD、AFD worker 都只实现
+`TextGenerationDefinition`。`LoadedTrace::into_current_text_frontend` 是显式能力门：
+其他 family 会在 PyO3 bridge/L4 build 前失败，不会先降级成 text token 数后假装支持。
 
----
+## 3. Typed frontend 与 replay 的正交边界
 
-# Part IV — 6 类问题空间 × 4 层(核心地图)
+schema 根据 config 的 `trace_kind` 选择 concrete parser，然后直接产出：
 
-这 6 类**不在同一层**;按层归位后,"会不会 break worker"大半自己消失,因为多数根本不是 worker 的事。
+```text
+ScheduledRequest<TextGenerationDefinition>
+ScheduledRequest<ImageTextGenerationDefinition>
+ScheduledRequest<VideoGenerationDefinition>
+ScheduledRequest<ImageToVideoDefinition>
+ScheduledRequest<OmniGenerationDefinition>
+...
+```
 
-| # | 类别 | 落在哪层 / 哪根轴 | 共享判决 | 难度 |
-|---|---|---|---|---|
-| 1 | text | 基准(全共享) | — | — |
-| 2 | text + prefix/session history | **KV 轴** + frontend 多轮链接 | **共享 worker**:`PrefixCacheKv` 能力(乘法叠)+ `prefix_kv`(已建模)+ `PrefixPrefillDecodeAdmission` lifecycle | LOW |
-| 3 | text + 任意 SLO/priority | **Admission 轴(仅此)** | **共享 worker/KV/exec/shell**;只换 `PendingOrderPolicy`。`AdmissionCandidate.deadline` 已在(policy/mod.rs:24) | **最便宜** |
-| 4a | image-in → text-out(VLM/ITT) | **IterModelExecution + encoder shell + payload** | **共享 KV+准入**;IterModelExecution 新 + `EncoderPipeline` shell(deferred) | MODERATE,加法 |
-| 4b | image-out(TTI/diffusion) | **新 family/worker** | **新 worker**:完成 ≠ token、KV ≠ 自回归 | 新 worker(OK) |
-| 5 | text 含执行路径(图遍历) | **Orchestrator/Flow 层(worker *之上*)** | **既不 break worker 也不碰 request struct**;是 `Flow` 的事 | 另一个抽象(Part VII) |
-| 6 | audio 等 | in = 同 4a;out/TTS = 同 4b | in 共享、out 新 worker | 同 4 |
+每个文件仍是单一 kind，header 必须与声明的 exact schema 完全一致；不会从列名
+猜 kind，也不允许每行携带 kind union。
 
-**#3 的关键点**:SLO/priority 不是 modality,是**贯穿性标签**——一个文本请求和一个图像请求都能带 priority。它住在 request 的 agnostic 核,**只被 admission 一根轴读**,KV/exec/shell 全不碰;换 policy 是**最便宜的轴**(纯 type-param swap)。
+`ScheduledRequest<Definition>` 拆成三部分：
 
-**正交性收束**:这 6 类归约成 **4 个正交扩展方向**,各打不同层:
+- `definition`：family-specific immutable work
+- `scheduling`：priority 和相对 completion deadline
+- `release`：`ReleaseMetadata { request_id, trace_arrival_time, session }`
 
-1. **贯穿标签**(SLO/priority)→ agnostic 核 + **Admission** 轴
-2. **输入编码/状态**(image/audio-in、history)→ **Frontend** + (**KV 能力** | **IterModelExecution + encoder**)
-3. **输出形状**(image/audio-out)→ **新 family/worker**
-4. **控制流**(执行图)→ **Orchestrator/Flow** 层
+`ReplayScheduler` 的 API 只接受 `ReleaseMetadata` slice，所以 pacing 无法读取或
+match request definition。open-loop、closed-loop、session-chain 与 modality 正交。
+release 时，frontend 才把相对 deadline 解成 absolute simulated deadline，并构造
+`Request<Definition>`。这也是 production 唯一调用 generic `Request::new` 的位置；
+四列 schema 与带 session/SLO/speculative tags 的 schema 最终共享同一个 storage seam。
 
-因为正交、且落在不同层,**N 种请求类型 ≠ N 种 worker**。最坏例子——"高优先级、带 session history 的 VLM 请求,输出触发一次图生":priority→Admission 换 policy;history→KV 加 `PrefixCacheKv`;VLM-in→IterModelExecution+encoder shell;触发图生→**Flow** 派生子请求给 TTI worker = **四根独立轴各碰一下 + 一个新 worker(TTI)**,全是加法,无叉乘。这跟 L5 四轴分析同一个结论(正交轴组合不组合爆炸),现在在**请求类型**上再次成立。
+## 4. trace tags 的真实 owner
 
----
+tags 仍可独立组合，但 parser 会把字段送到实际 owner，而不是保留一个宽
+`ArrivalTags` bag：
 
-# Part V — 结构决定(request 怎么充实)
+| tag | parsed destination | 当前 consumer 状态 |
+|---|---|---|
+| `session` | release chain + definition 的 `PrefixInput` | chain 已消费；prefix KV 只携带、尚未消费 |
+| `slo` | `RequestCore.scheduling` | current admission 尚未读取 |
+| `speculative` | text definition 的 `DecodingStrategy` | current execution 尚未读取 |
 
-**request 的充实走一条纪律:agnostic 核 + 类型化、对 worker 不透明、且各自只被一根轴读的侧结构。**
+frontend 只负责 exact-schema parsing、typed family construction 和 replay，不再声称能
+判断某个实际 deployment/worker composition 是否消费这些字段。除 session release chain
+外，当前 worker 尚未实现上述可选语义；在真实 consumer 与 capability contract 落地前，
+这些字段只是被保真存储，不能据此声称模拟已经执行相应策略。
 
-- **agnostic 核**(留在 `RequestRecord`,共享):token 计数(prompt/decode/prefix)、FSM 工作字段、**完成判据归 shell**。KV / Admission / 完成读这半,保持扁平共享。
-- **差异化侧 blob**(类型化,worker 不透明,各自单轴读):
-  - `SloSpec` → 只被 **Admission**(`PendingOrderPolicy`)读(`AdmissionCandidate.deadline` 已是接缝)
-  - `ModalityInput`(图像分辨率 / patch 数 / 去噪步表 / encoder token 数)→ 只被 **IterModelExecution** 读(和 `IterModelExecution::Input` 同套路)
-  - 执行图 → 归 **Orchestrator/Flow** 层(Part VII)
+## 5. RequestStore 与到达语义
 
-**反模式(必须现在就守的边界)**:`RequestRecord`(`request.rs:42`)是**每个 worker 都读的扁平大结构**。若按 modality/priority 一个个加扁平字段(`image_patches`、`diffusion_steps`、`num_frames`、`priority_tier`…),就退化成"共享结构越加越宽"——每个 worker 的结构体膨胀,modality-blindness 被侵蚀。正确形状 = **agnostic 核 + 类型化 payload,payload 对 worker 不透明**。
+`RequestStore<Definition>` 把直接寻址和集合迭代拆成两种结构：
 
-**完成判据**:今天焊死在 `RequestRecord::is_complete` + serving shell。非自回归 family 必须让它可变 —— 做成 **per-family(shell 自持)**,和 L5"FSM 不是通用轴、每个 shell 自持 cadence"一致。所以 TTI 不是"加宽 RequestRecord",是"新 family/shell"。
+- `Vec<Option<ActiveRequest<Definition>>>` 保留 O(1) dense id lookup；
+- startup 用 `reserve_slots(count)` 只预留 dense id slot；
+- `None` 表示 request 尚未 release；
+- Flow 收到 typed request 后以 owned `insert(request)` 填入 slot；
+- `arrived_ids` 按 release 顺序只记录 present slot，使 `len` 为 O(1)、
+  `iter_arrived` 为 O(arrived)；
+- `admitted_ids` 按首次 admission 顺序只记录 admitted request，使
+  `num_admitted` 为 O(1)、`iter_admitted` 为 O(admitted)；重复 admission 不会重复入账；
+- 不再构造假 arrival record，也不再由后到请求 `upsert` 覆盖占位数据。
 
-设计已埋好扩展点(边界是"还没建/故意简化",不是"设计错"):`request.rs:5` 头注释("Multi-round fields land alongside future L7 lifecycle work")、`frontend.rs:180` 对 `round_idx` 的显式 bail、以及旧 interfaces 文档早假设过的 `RequestFacts` + `SloSpec` 分离。
+这使 session-chain 的乱序 release 保留 O(1) id indexing，同时 arrival/lifecycle
+含义保持真实，也不会让大批尚未 release 的预留空槽进入周期性 snapshot 扫描。
 
----
+## 6. 当前 worker 边界
 
-# Part VI — Frontend 隔离(那道墙)
+现有 worker 的字段访问已经显式落到四层：
 
-**frontend 就是 modality 边界,而且它已经站在对的位置**(`frontend.rs:143` 一行 `TraceEntry → Request`):它今天已经在把外部 workload 解析成数字请求事实。扩展 = 保持这个方向。
+- admission requested-work 输入：`record.request.definition.*`
+- durable prefill/decode 进度：`record.progress.*`
+- stage/completion：`record.lifecycle.*`
+- TTFT/TPOT 日志：`record.telemetry.*`
 
-两条规则(与 worker 的"IterModelExecution 拥有 model-specific Input"完全同构):
+当前 text worker 没有 prefix-aware KV 或 chunked prefill：完整 fresh prompt 直接从
+definition lowering，KV membership/residency 只从 `KvStore` 读取。未来实现这些能力时，
+必须通过对应 L5 owner 的窄 capability 交给 Execution，不能把 runtime 状态塞回
+`TextGenerationProgress`。
 
-1. **modality 在 ingress 就地解析成两半**:agnostic token 事实(KV/Admission/完成读)+ opaque modality payload(只 frontend 填、只 IterModelExecution 读)。KV/Admission 永不碰 payload。
-2. **`RequestKind` 枚举住在 frontend,不住在 worker**。"这是 text 还是 image 还是 TTI"的判别发生在 ingress;worker 下游只见数字 + 不透明 payload。tokenizer / chat template / vision preprocessor 全在 frontend 或更上游。
+barebone、HP、PD prefill/decode、AFD attention/FFN 的 cadence、KV、admission、
+execution 语义没有改变；这次只重塑 shared request seam。默认类型参数仍指向
+`TextGenerationDefinition`，但类型参数贯穿 `Flow`、`SharedRequests`、store，未来
+family 不需要把当前 worker 扩成 variant。
 
-**为什么这道墙成立(和 `WorkerContext` 的关系)**:worker 看请求**只**通过 `WorkerContext.requests`(`ctx.rs:15`,`SharedRequests → RequestStore → RequestRecord`),且每个读点都是窄数字事实。所以只要把 `SloSpec` / `ModalityInput` 挂在 record 上、由**唯一那根轴**去读,worker 四轴一个 modality/priority 的 match 都不用长——`WorkerContext` 这层薄接口就是隔离墙。
+## 7. 新 family 的实现检查表
 
-**trace schema 扩展**是 frontend/schema 的事,加法:新列(modality、image_tokens、diffusion_steps、round_idx)。今天对多轮(`round_idx`)的显式拒绝(`frontend.rs:180`)正是标记 session-history 扩展点的占位。
-
----
-
-# Part VII — #5 执行图:不是 worker/request 的问题,是 Flow 的问题
-
-[L6 orchestrator README](../../simulator/src/orchestrator/README.md) 已替我们裁决(Invariant 1):**"Everything above the worker is routing; everything at or below it is cost + lifecycle."** 一个"触发图生 / 再触发文生"的请求 = 一张**动态多节点 Flow 图**:
-
-- **节点** = 一条 leaf 请求,由某个 worker 执行(text-leg→text worker,image-leg→TTI worker)——worker 照旧 modality-blind,一次只跑一条腿;
-- **边** = Flow 的路由决策(spawn 子请求 / gather 汇聚 / 选下一跳)。
-
-`PdFlow`("`PrefillDone` → decode 准入")和 AFD gather 就是**静态 2 节点特例**。#5 = 把 `Flow` 从"固定 2 段管线"推广成"动态 DAG",需要:子请求派生、依赖/join、逐节点选 worker。**这些全落在 `Flow` trait,worker 四轴一根都不动。** 换言之,#5 不撑爆 worker,它撑的是**另一个抽象(Flow/orchestrator),值得像我们对 worker、对 request 那样单独做一次表达力压测**(未来工作)。
-
----
-
-# Part VIII — 裁决 + 现在该锁的一条原则 + 待办
-
-**裁决(robust / boundary / comfort)**:
-- **Robust?** 对整个**自回归-serving 家族**(text、session-history、VLM/ITT、audio-in)——**是**。worker 读请求走纯数字 token 接口,天生 modality-blind;多模态-in 是加法(frontend 折成 token + 一个 IterModelExecution payload)。
-- **Boundary?** **非自回归输出**(TTI/diffusion、TTS)。唯一一处 text 假设 `tokens_emitted >= decode_len`,是 family 边界(和 training 同类),用兄弟 family 接,不是 variant。
-- **Comfort?** 对看得见的扩展(VLM、session-history)——**高**,前提是现在锁一条原则。
-
-**现在就锁的一条原则**(便宜的保险,代码今天不用改——单轮 text 是当前里程碑):
-
-> modality/priority 永远不变成 `RequestRecord` 的扁平字段、也永远不变成 worker 可见的 match;它在 frontend 就地解析成 token 计数 + 一个对 worker 不透明、只被一根轴读的 payload(`SloSpec`→Admission、`ModalityInput`→IterModelExecution、执行图→Flow);完成判据归 workers/family,不 pan-worker 焊死。
-
-**待办(未来里程碑)**:
-1. `RequestRecord` 拆分:agnostic 核 + 一个类型化 payload 接缝(与 `IterModelExecution::Input` 同套路)。可先只为 `SloSpec` 开一条,验证接缝。
-2. frontend 引入 `RequestKind` + trace schema 扩展(round_idx / modality 列),`frontend.rs:180` 的 bail 改成分派。
-3. `EncoderPipeline` shell(B 档 VLM/ITT 的编码 stage),对齐 blind test #4 的形状。
-4. TTI/TTS 作为**兄弟 family**(自带 completion cadence),不进 serving worker variant。
-5. `Flow` 的动态 DAG 表达力压测(#5),独立于 worker/request 抽象(Part VII)。
+1. 在 `common/request_family/<direction>.rs` 定义 concrete `Definition`、`Progress`
+   和完成判据；只把真正跨 family 的 vocabulary 放入 shared primitive module，
+   不要把 family 字段重新堆回 `common/request.rs`。
+2. 在 `frontend/schema.rs` 增加 exact columns 和 `TraceDefinition` parser；每个 row
+   直接生成 concrete `ScheduledRequest<Definition>`。
+3. 在 `LoadedTrace` 增加启动期 dispatch variant。
+4. 实现接受同一 `Definition` 的 L5 worker family、L6 `Flow<Definition>`、typed
+   `SharedRequests<Definition>`。
+5. 第 4 步完成后，把 `LoadedTrace` variant 窄化到 matching typed execution path；当前
+   `into_current_text_frontend` 仍会拒绝所有 non-text family。
+6. 若只是增加 pacing discipline，只改 `ReplayMode`/`ReplayScheduler`；若只是增加
+   scheduling policy，只改 admission consumer。不要让它们与 request family 叉乘。
+7. 只有当一个 model/worker 原生接受异构有序 segment 时才建 omni family；不要用
+   `OmniInputSegment` 取代能由方向类型表达的 specialized request。

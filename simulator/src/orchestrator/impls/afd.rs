@@ -88,8 +88,8 @@ where
     WF: AfdFfnWorker,
 {
     fn on_arrival(&mut self, req: Request) {
-        let rid = req.id;
-        self.requests.borrow_mut().insert(&req);
+        let rid = req.core.id;
+        self.requests.borrow_mut().insert(req);
         self.attn.admit(rid);
     }
 
@@ -139,7 +139,7 @@ where
 mod tests {
     use super::*;
     use crate::common::{RequestId, RequestStore};
-    use crate::test_helpers::{test_cluster, FakeAttn, FakeFfn};
+    use crate::test_helpers::{test_cluster, text_request, FakeAttn, FakeFfn};
     use crate::worker::{DisaggAttnWorker, WorkerConfig};
     use std::cell::RefCell;
     use std::sync::Arc;
@@ -203,11 +203,14 @@ mod tests {
     fn single_request_prefill_then_decode_completes() {
         let store = empty_store();
         let mut f = flow(1, std::rc::Rc::clone(&store));
-        f.on_arrival(Request::new(RequestId(0), 8, 3, Time::ZERO));
+        f.on_arrival(text_request(RequestId(0), 8, 3, Time::ZERO));
         let completed = drive(&mut f, 3000);
         assert_eq!(completed, vec![RequestId(0)], "exactly one completion");
-        assert_eq!(store.borrow()[RequestId(0)].tokens_emitted, 3);
-        assert!(store.borrow()[RequestId(0)].completed);
+        assert_eq!(
+            store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+            3
+        );
+        assert!(store.borrow()[RequestId(0)].lifecycle.completed);
     }
 
     /// Aggregation end-to-end: two requests placed on two attn shards (KV locality)
@@ -218,8 +221,8 @@ mod tests {
     fn two_shards_aggregate_and_both_complete() {
         let store = empty_store();
         let mut f = flow(2, std::rc::Rc::clone(&store));
-        f.on_arrival(Request::new(RequestId(0), 8, 2, Time::ZERO));
-        f.on_arrival(Request::new(RequestId(1), 8, 2, Time::ZERO));
+        f.on_arrival(text_request(RequestId(0), 8, 2, Time::ZERO));
+        f.on_arrival(text_request(RequestId(1), 8, 2, Time::ZERO));
         let mut completed = drive(&mut f, 4000);
         completed.sort_by_key(|r| r.0);
         assert_eq!(
@@ -227,8 +230,14 @@ mod tests {
             vec![RequestId(0), RequestId(1)],
             "both complete once"
         );
-        assert_eq!(store.borrow()[RequestId(0)].tokens_emitted, 2);
-        assert_eq!(store.borrow()[RequestId(1)].tokens_emitted, 2);
+        assert_eq!(
+            store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+            2
+        );
+        assert_eq!(
+            store.borrow()[RequestId(1)].progress.output_tokens_emitted,
+            2
+        );
     }
 
     /// Many requests staggered in time still all complete (no deadlock when slots
@@ -242,7 +251,7 @@ mod tests {
         for step in 0..6000u64 {
             if step < 6 {
                 let id = step as u32;
-                f.on_arrival(Request::new(
+                f.on_arrival(text_request(
                     RequestId(id),
                     8,
                     2,

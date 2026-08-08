@@ -8,6 +8,8 @@ deployment: unified
 workload:
   trace_files:
     - trace/aime_long.csv
+  trace_kind: text_generation
+  replay_mode: open_loop
   request_rate: 150.0
   run_to_end: false
   duration_ms: 20000000.0

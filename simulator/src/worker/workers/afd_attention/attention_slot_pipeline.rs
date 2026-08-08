@@ -258,8 +258,12 @@ where
             let store = context.requests.borrow();
             let record = &store[request];
             (
-                (record.prompt_len + record.prefix_kv) as u64,
-                record.decode_len.saturating_sub(record.tokens_emitted),
+                record.request.definition.prompt_tokens as u64,
+                record
+                    .request
+                    .definition
+                    .target_output_tokens
+                    .saturating_sub(record.progress.output_tokens_emitted),
             )
         };
         self.kv_store

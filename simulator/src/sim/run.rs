@@ -192,19 +192,19 @@ pub fn run_sim(
         //    row. `request_state` is a periodic table (2b), not written here.
         for action in flow.tick(clock) {
             let OrchAction::Complete { req } = action;
-            frontend.record_completion();
+            frontend.record_completion(req, clock);
             let s = store.borrow();
             logger.record_request_slo(slo_entry(req, clock, &s[req]))?;
         }
 
         // 2b. Periodic `request_state` snapshot — one AGGREGATE row per tick over
-        //     the *admitted* set (`iter_admitted`, the `records[0..=admitted_hi]`
-        //     prefix). The analyzer only ever needs `Σ completed_input_len` /
-        //     `Σ completed_output_len` per tick (it diffs consecutive ticks for
-        //     per-segment throughput), so the sum is computed here instead of
-        //     emitting one row per request. The never-admitted pending tail has
-        //     zero processed tokens and is skipped — but even on a saturated run,
-        //     where prefill admits ~the whole trace, this is one row, not ~150k.
+        //     the *admitted* set (`iter_admitted`). The analyzer only ever needs
+        //     `Σ completed_input_len` / `Σ completed_output_len` per tick (it
+        //     diffs consecutive ticks for per-segment throughput), so the sum is
+        //     computed here instead of emitting one row per request. Requests no
+        //     worker has touched have zero processed tokens and are skipped —
+        //     but even on a saturated run, where prefill admits ~the whole
+        //     trace, this is one row, not ~150k.
         if snapshot.fire() {
             let s = store.borrow();
             logger.record_request_state(state_agg(&s, clock))?;
@@ -214,10 +214,10 @@ pub fn run_sim(
         // 2c. Periodic heartbeat. `fire()` runs first so the gate advances every
         //     tick regardless. `submitted`/`completed` are the frontend's ledger
         //     counts; `admitted` (requests that have started prefill = "touched")
-        //     is the O(1) store watermark, read only on a heartbeat tick (no
+        //     is the O(1) store counter, read only on a heartbeat tick (no
         //     scan). `processing` = admitted - completed (touched but not done).
         if heartbeat.fire() && tracing::enabled!(tracing::Level::INFO) {
-            let admitted = store.borrow().admitted_watermark();
+            let admitted = store.borrow().num_admitted();
             let completed = frontend.num_completed();
             tracing::info!(
                 "t={:.0}ms: completed={} submitted={} admitted={} processing={}",
@@ -241,13 +241,13 @@ pub fn run_sim(
         }
 
         // 3b. Stuck watchdog — O(1), no store scan. Progress means a request
-        //     completed OR a new request was admitted (the highest-id admitted
-        //     watermark advanced) since the last sample. Both are monotonic, so
-        //     their sum advances iff one did. A full sample window with neither
-        //     advancing (trace already drained, work still in flight) is a
-        //     deadlock. Only checked post-exhaustion, where Stuck can occur.
+        //     completed OR a new request was admitted since the last sample.
+        //     Both are monotonic, so their sum advances iff one did. A full
+        //     sample window with neither advancing (trace already drained, work
+        //     still in flight) is a deadlock. Only checked post-exhaustion,
+        //     where Stuck can occur.
         if exhausted && in_flight > 0 && watchdog.fire() {
-            let progress = frontend.num_completed() + store.borrow().admitted_watermark();
+            let progress = frontend.num_completed() + store.borrow().num_admitted();
             if progress > prev_progress {
                 prev_progress = progress;
                 idle_for = Time::ZERO;
@@ -275,10 +275,19 @@ pub fn run_sim(
     let num_gpus = flow.cluster().borrow().num_gpus();
     let summary = {
         let s = store.borrow();
-        let total = s.iter().count() as u64;
-        let completed = s.iter().filter(|(_, r)| r.completed).count() as u64;
-        let prefill_tok: u64 = s.iter().map(|(_, r)| r.prefill_processed as u64).sum();
-        let decode_tok: u64 = s.iter().map(|(_, r)| r.tokens_emitted as u64).sum();
+        let total = s.len() as u64;
+        let completed = s
+            .iter_arrived()
+            .filter(|(_, record)| record.lifecycle.completed)
+            .count() as u64;
+        let prefill_tok: u64 = s
+            .iter_arrived()
+            .map(|(_, record)| record.progress.prefill_tokens_processed as u64)
+            .sum();
+        let decode_tok: u64 = s
+            .iter_arrived()
+            .map(|(_, record)| record.progress.output_tokens_emitted as u64)
+            .sum();
         let all_tok = prefill_tok + decode_tok;
         // Throughput is the *modeled* serving rate: tokens / requests per second
         // of SIMULATED time (what the modeled cluster achieves), not per wall
@@ -364,8 +373,8 @@ fn finalize(
     if !census_already_written {
         logger.record_request_state(state_agg(&s, clock))?;
     }
-    for (id, rec) in s.iter() {
-        if !rec.completed {
+    for (id, rec) in s.iter_arrived() {
+        if !rec.lifecycle.completed {
             logger.record_request_slo(slo_entry(id, clock, rec))?;
         }
     }
@@ -374,18 +383,19 @@ fn finalize(
 
 /// Aggregate the admitted set into one `request_state` row: cumulative prefill /
 /// decode tokens (the analyzer diffs these between ticks for per-segment
-/// throughput) plus admitted/completed counts (diagnostics). O(admitted) — the
-/// only per-tick scan the snapshot needs now that rows are not per-request.
+/// throughput) plus admitted/completed counts (diagnostics). O(admitted) via
+/// the store's compact admitted-id index — the only per-tick scan the snapshot
+/// needs now that rows are not per-request.
 fn state_agg(store: &RequestStore, now: Time) -> RequestStateEntry {
     let mut prefill_tokens_cum = 0u64;
     let mut decode_tokens_cum = 0u64;
     let mut n_admitted = 0u64;
     let mut n_completed = 0u64;
     for (_id, rec) in store.iter_admitted() {
-        prefill_tokens_cum += rec.prefill_processed as u64;
-        decode_tokens_cum += rec.tokens_emitted as u64;
+        prefill_tokens_cum += rec.progress.prefill_tokens_processed as u64;
+        decode_tokens_cum += rec.progress.output_tokens_emitted as u64;
         n_admitted += 1;
-        if rec.completed {
+        if rec.lifecycle.completed {
             n_completed += 1;
         }
     }
@@ -404,30 +414,32 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
     // always-tracked first/last token times + count, so they survive the array
     // being off.
     let times_ms: Vec<f32> = rec
-        .output_token_times
+        .telemetry
+        .output_times
         .iter()
         .map(|t| t.as_ms() as f32)
         .collect();
-    let first_ms = rec.first_token_time.map(|t| t.as_ms());
-    let last_ms = rec.last_token_time.map(|t| t.as_ms());
-    let ttft_ms = first_ms.map(|f| (f - rec.arrival_time.as_ms()) as f32);
+    let first_ms = rec.telemetry.first_output_time.map(|time| time.as_ms());
+    let last_ms = rec.telemetry.last_output_time.map(|time| time.as_ms());
+    let ttft_ms =
+        first_ms.map(|first_time| (first_time - rec.request.core.arrival_time.as_ms()) as f32);
     let finish_decode_time_ms = last_ms.map(|l| l as f32);
     // Mean inter-token gap = total decode span / number of gaps (tokens − 1).
     let tpot_mean_ms = match (first_ms, last_ms) {
-        (Some(f), Some(l)) if rec.tokens_emitted > 1 => {
-            Some(((l - f) / (rec.tokens_emitted - 1) as f64) as f32)
-        }
+        (Some(first_time), Some(last_time)) if rec.progress.output_tokens_emitted > 1 => Some(
+            ((last_time - first_time) / (rec.progress.output_tokens_emitted - 1) as f64) as f32,
+        ),
         _ => None,
     };
-    // Stage-transition timeline → four parallel arrays. `rec.stage_log` is empty
+    // Stage-transition timeline → four parallel arrays. `rec.lifecycle.stage_log` is empty
     // when `io.log_stage_transitions` is off (`record_stage` never appended), so
     // this is a no-op unpack in that case.
-    let n_stages = rec.stage_log.len();
+    let n_stages = rec.lifecycle.stage_log.len();
     let mut stage_times_ms = Vec::with_capacity(n_stages);
     let mut stage_codes = Vec::with_capacity(n_stages);
     let mut stage_pool_ids = Vec::with_capacity(n_stages);
     let mut stage_worker_ids = Vec::with_capacity(n_stages);
-    for ev in &rec.stage_log {
+    for ev in &rec.lifecycle.stage_log {
         stage_times_ms.push(ev.time.as_ms() as f32);
         stage_codes.push(ev.code);
         stage_pool_ids.push(ev.pool.0);
@@ -436,14 +448,14 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
     RequestSloEntry {
         request_id: id.0,
         logging_time_ms: now.as_ms(),
-        completed: rec.completed,
-        arrival_time_ms: rec.arrival_time.as_ms(),
+        completed: rec.lifecycle.completed,
+        arrival_time_ms: rec.request.core.arrival_time.as_ms(),
         output_token_times_ms: times_ms,
         ttft_ms,
-        num_output_tokens: rec.tokens_emitted,
+        num_output_tokens: rec.progress.output_tokens_emitted,
         tpot_mean_ms,
         finish_decode_time_ms,
-        prefill_processed: rec.prefill_processed,
+        prefill_processed: rec.progress.prefill_tokens_processed,
         stage_times_ms,
         stage_codes,
         stage_pool_ids,
@@ -454,12 +466,13 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{PoolId, Request, RequestStore, UnifiedStage, WorkerId};
+    use crate::common::{PoolId, RequestStore, UnifiedStage, WorkerId};
     use crate::orchestrator::{
         DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
     };
     use crate::sim::frontend::TraceFrontend;
-    use crate::test_helpers::FakeModel;
+    use crate::sim::frontend::{ReplayMode, TraceDeclaration};
+    use crate::test_helpers::{text_request, FakeModel};
     use crate::worker::{build_barebone_worker, WorkerConfig};
     use std::cell::RefCell;
     use std::io::Write;
@@ -523,7 +536,12 @@ mod tests {
             },
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
-        let mut frontend = TraceFrontend::load(&[trace], 1.0, None).unwrap();
+        let mut frontend = TraceFrontend::load(
+            &[trace],
+            &TraceDeclaration::text(),
+            ReplayMode::OpenLoop { request_rate: 1.0 },
+        )
+        .unwrap();
         let mut logger = LoggerSession::open(dir.path(), true, false).unwrap();
 
         let summary = run_sim(
@@ -546,9 +564,9 @@ mod tests {
         let s = store.borrow();
         for id in 0..4u32 {
             let r = &s[RequestId(id)];
-            assert!(r.completed, "req {id} should complete");
-            assert_eq!(r.tokens_emitted, 3);
-            assert_eq!(r.output_token_times.len(), 3);
+            assert!(r.lifecycle.completed, "req {id} should complete");
+            assert_eq!(r.progress.output_tokens_emitted, 3);
+            assert_eq!(r.telemetry.output_times.len(), 3);
         }
         drop(s);
 
@@ -583,7 +601,12 @@ mod tests {
             },
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
-        let mut frontend = TraceFrontend::load(&[trace], 1.0, None).unwrap();
+        let mut frontend = TraceFrontend::load(
+            &[trace],
+            &TraceDeclaration::text(),
+            ReplayMode::OpenLoop { request_rate: 1.0 },
+        )
+        .unwrap();
         let mut logger = LoggerSession::open(dir.path(), false, false).unwrap();
 
         let summary = run_sim(
@@ -596,7 +619,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(summary.requests_finished, 1);
-        assert!(store.borrow()[RequestId(0)].completed);
+        assert!(store.borrow()[RequestId(0)].lifecycle.completed);
         assert_eq!(
             parquet_rows(&dir.path().join("raw/request_slo.parquet")),
             1,
@@ -613,7 +636,7 @@ mod tests {
         let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
         {
             let mut s = store.borrow_mut();
-            s.insert(&Request::new(RequestId(0), 8, 2, Time::ZERO));
+            s.insert(text_request(RequestId(0), 8, 2, Time::ZERO));
             s[RequestId(0)].record_stage(
                 Time::ZERO,
                 UnifiedStage::Pending as u16,
@@ -622,7 +645,7 @@ mod tests {
                 true,
             );
         }
-        assert_eq!(store.borrow().admitted_watermark(), 0);
+        assert_eq!(store.borrow().num_admitted(), 0);
 
         let mut logger = LoggerSession::open(dir.path(), false, true).unwrap();
         finalize(&store, &mut logger, Time::from_ms(10.0), None).unwrap();

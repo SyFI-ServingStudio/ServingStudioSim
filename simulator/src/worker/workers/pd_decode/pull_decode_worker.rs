@@ -171,13 +171,13 @@ where
         let tokens = {
             let store = self.context.requests.borrow();
             let record = &store[request];
-            (record.prompt_len + record.prefix_kv) as u64
+            record.request.definition.prompt_tokens as u64
         };
         self.pull_pipeline.pending_decodes.push_back(request);
         self.pull_pipeline.pending_decode_tokens += tokens;
 
         let mut store = self.context.requests.borrow_mut();
-        let arrival = store[request].arrival_time;
+        let arrival = store[request].request.core.arrival_time;
         self.context
             .stamp_stage(&mut store[request], arrival, PdStage::PendingDecode as u16);
     }
@@ -317,8 +317,12 @@ where
                 let store = self.context.requests.borrow();
                 let record = &store[request];
                 (
-                    (record.prompt_len + record.prefix_kv) as u64,
-                    record.decode_len.saturating_sub(record.tokens_emitted),
+                    record.request.definition.prompt_tokens as u64,
+                    record
+                        .request
+                        .definition
+                        .target_output_tokens
+                        .saturating_sub(record.progress.output_tokens_emitted),
                 )
             };
             let partition = self.balance.choose(num_partitions) as u16;
@@ -449,7 +453,7 @@ where
             let tokens = {
                 let store = self.context.requests.borrow();
                 let record = &store[request];
-                (record.prompt_len + record.prefix_kv) as u64
+                record.request.definition.prompt_tokens as u64
             };
             self.pull_pipeline.pending_decode_tokens = self
                 .pull_pipeline
@@ -515,8 +519,8 @@ mod tests {
         );
         let store = store.borrow();
         let record = &store[RequestId(0)];
-        assert!(record.completed);
-        assert_eq!(record.tokens_emitted, 3);
+        assert!(record.lifecycle.completed);
+        assert_eq!(record.progress.output_tokens_emitted, 3);
     }
 
     #[test]
@@ -534,7 +538,7 @@ mod tests {
         let store = store.borrow();
         for request in 0..3 {
             assert!(
-                store[RequestId(request)].completed,
+                store[RequestId(request)].lifecycle.completed,
                 "request {request} should complete"
             );
         }
@@ -662,7 +666,7 @@ mod tests {
         let store = store.borrow();
         for request in 0..4u32 {
             assert!(
-                store[RequestId(request)].completed,
+                store[RequestId(request)].lifecycle.completed,
                 "request {request} should complete"
             );
         }

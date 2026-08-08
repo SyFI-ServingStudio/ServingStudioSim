@@ -10,7 +10,10 @@ use std::rc::Rc;
 use crate::arch::contract::{
     AttnArchInput, AttnLayerwiseModel, FfnArchInput, IterwiseUnifiedModel, UnifiedArchInput,
 };
-use crate::common::{Request, RequestId, RequestStore, SharedRequests, Time};
+use crate::common::{
+    DecodingStrategy, PrefixInput, Request, RequestCore, RequestId, RequestStore,
+    SchedulingContract, SharedRequests, TextGenerationDefinition, Time,
+};
 use crate::timing::cache::interp::{CoverageFlags, Metrics4};
 use crate::timing::LeafMetrics;
 use crate::worker::gpu_cluster::{CostSource, GpuCluster, SharedGpuCluster};
@@ -35,6 +38,33 @@ pub(crate) fn lm(ms: f64) -> LeafMetrics {
 /// that don't transfer never observe the cost source value.
 pub(crate) fn test_cluster() -> SharedGpuCluster {
     Rc::new(RefCell::new(GpuCluster::new(CostSource::analytic(1.0))))
+}
+
+/// Build the default text request used by worker/orchestrator tests. Legacy
+/// four-column trace compatibility is tested in the frontend parser; this
+/// helper is deliberately test-only and does not define a production API.
+pub(crate) const fn text_request(
+    request_id: RequestId,
+    prompt_tokens: u32,
+    target_output_tokens: u32,
+    arrival_time: Time,
+) -> Request<TextGenerationDefinition> {
+    Request::new(
+        RequestCore {
+            id: request_id,
+            arrival_time,
+            scheduling: SchedulingContract {
+                priority: 0,
+                completion_deadline: None,
+            },
+        },
+        TextGenerationDefinition {
+            prompt_tokens,
+            target_output_tokens,
+            prefix: PrefixInput::None,
+            decoding: DecodingStrategy::Standard,
+        },
+    )
 }
 
 /// Fixed-cost stand-in for an L4 model. `eval_iter` returns `time_ms = ms`
@@ -185,7 +215,7 @@ pub(crate) fn shared_with(reqs: &[(u32, u32, u32)]) -> SharedRequests {
     for &(id, prompt, decode) in reqs {
         store
             .borrow_mut()
-            .insert(&Request::new(RequestId(id), prompt, decode, Time::ZERO));
+            .insert(text_request(RequestId(id), prompt, decode, Time::ZERO));
     }
     store
 }
@@ -199,10 +229,10 @@ pub(crate) fn prefilled_store(reqs: &[(u32, u32, u32)]) -> SharedRequests {
         let mut s = store.borrow_mut();
         for &(id, prompt, _decode) in reqs {
             let rec = &mut s[RequestId(id)];
-            rec.prefill_processed = prompt;
-            rec.tokens_emitted = 1;
-            rec.first_token_time = Some(Time::ZERO);
-            rec.last_token_time = Some(Time::ZERO);
+            rec.progress.prefill_tokens_processed = prompt;
+            rec.progress.output_tokens_emitted = 1;
+            rec.telemetry.first_output_time = Some(Time::ZERO);
+            rec.telemetry.last_output_time = Some(Time::ZERO);
         }
     }
     store

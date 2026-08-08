@@ -64,11 +64,13 @@ impl<M: AttnLayerwiseModel> AttentionLayerExecution for AttentionLayerExecutionA
         for &request in request_ids {
             if store[request].is_prefill() {
                 let record = &store[request];
+                // The current AFD path lowers one complete fresh prompt; the
+                // frontend rejects reusable-prefix requirements before build.
                 group
                     .prefill_chunk_pairs
-                    .push((record.prefix_kv, record.prompt_len));
-                group.prefill_tokens += record.prompt_len;
-                group.batch_tokens += record.prompt_len;
+                    .push((0, record.request.definition.prompt_tokens));
+                group.prefill_tokens += record.request.definition.prompt_tokens;
+                group.batch_tokens += record.request.definition.prompt_tokens;
             } else {
                 let current_kv = kv_store.current_kv(0, request).unwrap_or(0) as u32;
                 group.decode_kv_lens.push(current_kv);

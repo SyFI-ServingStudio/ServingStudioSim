@@ -12,13 +12,17 @@ For the layer overview see `doc/detailed_design/L7.md`.
 
 ## Two parts
 
-- **`frontend.rs` (L7-γ) — `TraceFrontend`.** Loads single-round workload CSV(s)
-  once at startup into an immutable, arrival-ordered queue
-  (`id,input_len,output_len,arrival_time`). Two replay modes:
+- **`frontend/` (L7-γ) — `TraceFrontend<Definition>`.** Loads a declared exact
+  CSV schema into one concrete request family. `LoadedTrace` performs startup
+  dispatch only; the tick loop receives the statically narrowed text frontend.
+  Family definitions live one-per-file under `common/request_family/`; the
+  directional text/media families remain distinct, while `omni_generation`
+  alone accepts ordered mixed text/image/audio/video segment vectors.
+  `ReplayScheduler` reads a separate `ReleaseMetadata` projection and supports:
   - **Open-loop** (default): `drain_due(now, emit)` emits every `Request` whose
     **effective** arrival time `≤ now`, where effective time =
     `arrival_time / request_rate` (a higher rate compresses the timeline).
-  - **Closed-loop** (`workload.max_concurrency` set): the CSV arrival timeline /
+  - **Closed-loop** (`replay_mode: closed_loop`): the CSV arrival timeline /
     `request_rate` are **ignored**; the frontend keeps at most N requests in
     flight, admitting the next the instant a slot frees and stamping its arrival
     with the admission clock. Mirrors the alignment load-generator's
@@ -26,8 +30,16 @@ For the layer overview see `doc/detailed_design/L7.md`.
     (`cursor` emitted − `completed` fed back via `record_completion`); the tick
     loop is a pure consumer of `submitted`/`in_flight`/`num_completed`.
 
+  - **Session-chain** (`replay_mode: session_chain`): session heads follow the
+    trace timeline; each successor waits for predecessor completion plus
+    `tool_wait_after_ms`.
+
   The drain loop lives here so a caller can't under-drain by polling once per
-  tick. Multi-round traces are rejected (deferred).
+  tick. The text schema remains the four legacy columns and is declared as
+  `trace_kind: text_generation`. `RequestStore::reserve_slots` creates empty
+  `Option` slots; requests are inserted only when the scheduler releases them.
+  Compact arrived/admitted id indexes keep lifecycle scans proportional to the
+  relevant live set rather than the full reserved trace.
 - **`run.rs` (L7-β) — `run_sim`.** The single tick loop. Returns
   `anyhow::Result<RunSummary>`.
 
@@ -90,8 +102,9 @@ stopped.
 
 `main.rs` is the L7 CLI that wires this core. `Run` (and `build-cache-only` /
 `dry-run` / `list-params` / `kernel-query`) is the entry: parse the structured
-`RunConfig` → `deployment::build_flow` to get the `Box<dyn Flow>` →
-`TraceFrontend::load` → `LoggerSession::open` → write `raw/run_meta.json` (the
+`RunConfig` → `LoadedTrace::load` → narrow to the current text family → reserve
+empty store slots → `deployment::build_flow` to get the `Box<dyn Flow>` →
+`LoggerSession::open` → write `raw/run_meta.json` (the
 registry/KV/comm facts borrowed from `flow.cluster()`) → `run_sim` → serialize
 `summary.json`. The launcher
 spawns this binary (see `launcher/README.md`).

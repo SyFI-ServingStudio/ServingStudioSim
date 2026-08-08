@@ -39,10 +39,12 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
             group.clear();
             kv_store.visit_prefill_admits(partition, |request| {
                 let record = &store[request];
-                group
-                    .prefill_chunk_pairs
-                    .push((record.prefix_kv, record.active_chunk_len));
-                group.prefill_tokens += record.active_chunk_len;
+                let prompt_tokens = record.request.definition.prompt_tokens;
+                // The current text worker admits one complete fresh prompt.
+                // Prefix residency and future chunk state belong to KV and
+                // Admission respectively, not to request-family progress.
+                group.prefill_chunk_pairs.push((0, prompt_tokens));
+                group.prefill_tokens += prompt_tokens;
             });
             kv_store.visit_decode_members(partition, |_, current_kv| {
                 group.decode_kv_lens.push(current_kv as u32);

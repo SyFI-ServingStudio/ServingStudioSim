@@ -219,8 +219,8 @@ where
     W::Msg: From<RequestId>,
 {
     fn on_arrival(&mut self, req: Request) {
-        let rid = req.id;
-        self.requests.borrow_mut().insert(&req);
+        let rid = req.core.id;
+        self.requests.borrow_mut().insert(req);
         self.dp_pool.admit(rid);
     }
 
@@ -247,7 +247,7 @@ mod tests {
     use super::*;
     use crate::common::RequestStore;
     use crate::orchestrator::UnifiedWorkerFactory;
-    use crate::test_helpers::FakeModel;
+    use crate::test_helpers::{text_request, FakeModel};
     use crate::worker::{build_barebone_worker, BareboneWorker, WorkerConfig};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -281,7 +281,7 @@ mod tests {
     fn all_arrivals_complete() {
         let (mut flow, _store) = build_flow(2, DpPlacementPolicy::RoundRobin);
         for id in 0..5u32 {
-            flow.on_arrival(Request::new(RequestId(id), 8, 2, Time::ZERO));
+            flow.on_arrival(text_request(RequestId(id), 8, 2, Time::ZERO));
         }
         let mut completed = Vec::new();
         for step in 0..500u64 {
@@ -304,7 +304,7 @@ mod tests {
         // internals directly, but all must still complete (smoke for placement).
         let (mut flow, _store) = build_flow(2, DpPlacementPolicy::RoundRobin);
         for id in 0..4u32 {
-            flow.on_arrival(Request::new(RequestId(id), 4, 1, Time::ZERO));
+            flow.on_arrival(text_request(RequestId(id), 4, 1, Time::ZERO));
         }
         let mut n = 0;
         for step in 0..200u64 {

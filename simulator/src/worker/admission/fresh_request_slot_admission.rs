@@ -50,16 +50,22 @@ where
             !self.policy.contains(request),
             "AFD Admit is once-per-request; duplicate pending request {request:?}"
         );
-        let (prompt_kv, remaining) = {
+        let (prompt_tokens, remaining) = {
             let mut store = context.requests.borrow_mut();
             let record = &mut store[request];
-            let prompt_kv = record.prompt_len + record.prefix_kv;
-            let remaining = record.decode_len.saturating_sub(record.tokens_emitted);
-            let arrival = record.arrival_time;
+            let prompt_tokens = record.request.definition.prompt_tokens;
+            let remaining = record
+                .request
+                .definition
+                .target_output_tokens
+                .saturating_sub(record.progress.output_tokens_emitted);
+            let arrival = record.request.core.arrival_time;
             context.stamp_stage(record, arrival, AfdStage::Pending as u16);
-            (prompt_kv, remaining)
+            (prompt_tokens, remaining)
         };
-        let candidate = self.enqueue_sequence.freeze(request, prompt_kv, remaining);
+        let candidate = self
+            .enqueue_sequence
+            .freeze(request, prompt_tokens, remaining);
         self.policy.push(candidate, &mut self.policy_context);
     }
 

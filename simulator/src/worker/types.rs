@@ -86,8 +86,9 @@ pub enum PdPrefillEvent {
     /// A PD prefill worker finished a request's prefill; L6 hands it off to a
     /// decode pool. `send_gid` is the sender's comm-group id (registered at
     /// prefill worker construction); `kv_tokens` is the request's KV token
-    /// count (`prompt_len + prefix_kv`). Together they let L6 build the
-    /// matching `PdDecodeMsg::Handoff` without re-deriving the model.
+    /// count produced by prefill (`prompt_tokens` in the current fresh-prompt
+    /// path). Together they let L6 build the matching `PdDecodeMsg::Handoff`
+    /// without re-deriving the model.
     PrefillDone {
         worker: WorkerId,
         req: RequestId,
@@ -113,9 +114,10 @@ pub enum PdDecodeMsg {
         req: RequestId,
         /// Sender's comm-group id (registered at prefill worker construction).
         send_gid: u16,
-        /// Total KV **tokens** to transfer (the request's `prompt_len + prefix_kv`).
-        /// The decode side multiplies by its arch's `total_kv_bytes_per_token`
-        /// when calling `cluster.submit_transfer` to recover wire bytes.
+        /// Total KV **tokens** produced by prefill and transferred for this
+        /// request. The decode side multiplies by its arch's
+        /// `total_kv_bytes_per_token` when calling `cluster.submit_transfer` to
+        /// recover wire bytes.
         tokens: u64,
         /// The prefill worker that holds this request's KV until the pull
         /// completes. Carried through the decode worker's pending-pull → in-
@@ -205,14 +207,16 @@ pub struct TransferPlan {
 /// pipeline via `ReadyNotification` (layer-0 QKV from the prolog and every later
 /// layer's QKV are the SAME slot-addressed message). An empty slot stays dormant at
 /// layer 0 (no `ReadyNotification`, no churn) until requests are admitted into it.
-/// L6 passes ids only — the worker reads the shared store for per-request facts
-/// (prompt/decode/prefix, token counts) and tracks its own KV.
+/// L6 passes ids only — the worker reads the shared store for requested
+/// prompt/output work and durable token progress, while its `KvStore` tracks
+/// runtime KV state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttnWorkerMsg {
     /// KV-admit: the attn pool placed `req` on this worker (KV locality); the worker
     /// reserves its KV and picks a local slot. Per-request (admitted once). Pure —
     /// it carries NO QKV (the prolog is attn-initiated via `IterStart`). The worker
-    /// reads `prompt_len` / `decode_len` / `prefix_kv` from the store — hence id only.
+    /// reads `prompt_tokens` / `target_output_tokens` from the typed request —
+    /// hence id only.
     Admit { req: RequestId },
     /// ffn→attn per-layer handshake and the worker's ONLY compute entry: layer
     /// `layer`'s QKV for the micro-batch in slot `slot` is ready to pull from

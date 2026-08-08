@@ -43,8 +43,6 @@ impl<P: PendingOrderPolicy> PrefillHandoffAdmission<P> {
         let mut store = context.requests.borrow_mut();
         store.mark_admitted(candidate.request);
         let record = &mut store[candidate.request];
-        record.active_chunk_len = candidate.prompt;
-        record.prefix_kv = 0;
         context.stamp_stage(record, now, PdStage::Prefill as u16);
     }
 
@@ -76,8 +74,8 @@ where
                 let prompt = {
                     let mut store = context.requests.borrow_mut();
                     let record = &mut store[request];
-                    let prompt = record.prompt_len;
-                    let arrival = record.arrival_time;
+                    let prompt = record.request.definition.prompt_tokens;
+                    let arrival = record.request.core.arrival_time;
                     context.stamp_stage(record, arrival, PdStage::PendingPrefill as u16);
                     prompt
                 };
@@ -115,9 +113,9 @@ where
             let mut store = context.requests.borrow_mut();
             kv_store.visit_prefill_admits(partition, |request| {
                 let record = &mut store[request];
-                record.prefill_processed = record.prompt_len;
+                record.progress.prefill_tokens_processed = record.request.definition.prompt_tokens;
                 record.record_first_token(now, context.log_tokens());
-                let kv_tokens = (record.prompt_len + record.prefix_kv) as u64;
+                let kv_tokens = record.request.definition.prompt_tokens as u64;
                 let complete = record.is_complete();
                 context.stamp_stage(
                     record,

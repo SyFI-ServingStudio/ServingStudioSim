@@ -60,23 +60,43 @@ pub enum LogLevel {
 pub struct WorkloadSpec {
     /// Trace CSV files to simulate (runs sequentially).
     pub trace_files: Vec<PathBuf>,
+    /// What every file in `trace_files` is. Declared, never inferred from the
+    /// header: the frontend computes the exact column set this implies and
+    /// rejects any header that differs. One family per run; a native omni model
+    /// uses `omni_generation`, whose rows may themselves contain mixed ordered
+    /// modality segments.
+    #[param(choices = simulator::sim::TraceKind::CHOICES)]
+    pub trace_kind: String,
+    /// Cross-cutting disciplines those files also carry (`session`, `slo`,
+    /// `speculative`). Each adds its own required columns to the expected set.
+    #[serde(default)]
+    #[param(choices = simulator::sim::TraceTag::CHOICES)]
+    pub trace_tags: Vec<String>,
     /// Simulation duration (ms); minimum window when run_to_end is set.
     #[param(default = 5000.0)]
     pub duration_ms: f64,
     /// Keep ticking past duration_ms until every request completes.
     pub run_to_end: bool,
-    /// Request arrival rate (requests/s). Ignored under closed-loop
-    /// (`max_concurrency` set).
+    /// Request arrival rate (requests/s). Read by `open_loop` and
+    /// `session_chain`; ignored by `closed_loop`.
     #[param(default = 10.0)]
     pub request_rate: f64,
     /// Closed-loop concurrency cap. When set, the frontend IGNORES CSV
     /// arrival_time / request_rate and instead keeps at most this many requests
     /// in flight, admitting a new one the instant a slot frees — mirroring the
     /// alignment load-generator's --max-concurrency (a tokio Semaphore of N
-    /// permits acquired *after* arrival, held until completion). Absent (default)
-    /// = open-loop arrival-time replay.
+    /// permits acquired *after* arrival, held until completion). Required by
+    /// `closed_loop`; must be absent for the other replay modes.
     #[serde(default)]
     pub max_concurrency: Option<u32>,
+    /// How arrivals are paced: `open_loop` (replay the trace timeline),
+    /// `closed_loop` (cap in-flight, needs `max_concurrency`), or
+    /// `session_chain` (hold each later round of a conversation until its
+    /// predecessor completes plus that round's `tool_wait_after_ms`; needs the
+    /// `session` trace tag). Declared, never derived from which other field
+    /// happens to be set.
+    #[param(choices = simulator::sim::ReplayMode::CHOICES)]
+    pub replay_mode: String,
     /// Fixed simulation tick step (µs) — the time quantum the loop advances by
     /// each iteration. Finer ticks mean less TTFT/TPOT quantization (and smaller
     /// inter-slice gaps in the trace) at ~no throughput cost, since per-tick work
@@ -255,7 +275,7 @@ mod tests {
     // (G8) — model_config sits flat alongside tp_size under `arch`.
     const UNIFIED_YAML: &str = r#"
 deployment: unified
-workload: { trace_files: ["trace/smoke.csv"], duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
+workload: { trace_files: ["trace/smoke.csv"], trace_kind: text_generation, replay_mode: open_loop, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
 io: { log_dir: "logs/smoke", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   main:
@@ -302,7 +322,7 @@ pools:
         // YAML is a JSON superset; the equivalent JSON must parse identically.
         let json = serde_json::json!({
             "deployment": "unified",
-            "workload": {"trace_files": ["t.csv"], "duration_ms": 5000.0, "run_to_end": true, "request_rate": 10.0},
+            "workload": {"trace_files": ["t.csv"], "trace_kind": "text_generation", "replay_mode": "open_loop", "duration_ms": 5000.0, "run_to_end": true, "request_rate": 10.0},
             "io": {"log_dir": "logs", "log_level": "info", "quiet": false, "force_cache_build": false, "log_output_token_times": false},
             "pools": {"main": {"placement": "least-queued", "groups": [
                 {"gpu": "H200", "replicas": 1,
@@ -324,7 +344,9 @@ pools:
     fn backends_overrides_parse_and_default_empty() {
         // Absent `backends:` → empty map (serde default), i.e. no overrides.
         let cfg: RunConfig = serde_yaml::from_str(UNIFIED_YAML).unwrap();
-        let RunConfig::Unified(u) = &cfg else { unreachable!() };
+        let RunConfig::Unified(u) = &cfg else {
+            unreachable!()
+        };
         assert!(u.backends.is_empty());
 
         // Present → `pool → role → candidate backends`, the shape the launcher
@@ -337,7 +359,9 @@ pools:
              \"unified.mlp.down\": [torch]\n"
         );
         let cfg: RunConfig = serde_yaml::from_str(&with).expect("parse backends block");
-        let RunConfig::Unified(u) = &cfg else { unreachable!() };
+        let RunConfig::Unified(u) = &cfg else {
+            unreachable!()
+        };
         assert_eq!(u.backends["main"]["unified.attn.qkv"], vec!["fa2", "fa3"]);
         assert_eq!(u.backends["main"]["unified.mlp.down"], vec!["torch"]);
     }
@@ -346,7 +370,9 @@ pools:
     fn num_layers_omittable() {
         // num_layers / sim_num_layers absent → None (genuine optionality).
         let cfg: RunConfig = serde_yaml::from_str(UNIFIED_YAML).unwrap();
-        let RunConfig::Unified(u) = &cfg else { unreachable!() };
+        let RunConfig::Unified(u) = &cfg else {
+            unreachable!()
+        };
         assert!(u.pools.main.groups[0].arch.model().num_layers.is_none());
     }
 
@@ -367,7 +393,7 @@ pools:
     fn pd_two_pools_parse() {
         let yaml = r#"
 deployment: pd
-workload: { trace_files: ["t.csv"], duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_mode: open_loop, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   prefill:
@@ -380,7 +406,9 @@ pools:
       - { gpu: "H200", replicas: 4, arch: {type: llama3_dense_tp, model_config: "m.json", fp8: false, tp_size: 2}, worker: {type: barebone, attn_gpu_memory_gb: 80.0} }
 "#;
         let cfg: RunConfig = serde_yaml::from_str(yaml).expect("parse pd");
-        let RunConfig::Pd(p) = &cfg else { panic!("expected pd") };
+        let RunConfig::Pd(p) = &cfg else {
+            panic!("expected pd")
+        };
         assert_eq!(p.pools.prefill.groups[0].replicas, 2);
         assert_eq!(p.pools.decode.groups[0].replicas, 4);
     }
@@ -391,7 +419,7 @@ pools:
         // aggregated replica, qwen3_ffn_moe). Mirrors `pd_two_pools_parse`.
         let yaml = r#"
 deployment: afd
-workload: { trace_files: ["t.csv"], duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_mode: open_loop, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   attn:
@@ -404,7 +432,9 @@ pools:
       - { gpu: "H200", replicas: 1, arch: {type: qwen3_ffn_moe, model_config: "m.json", fp8: false, attn_tp_size: 4, ep_size: 8, nvl_num_gpu: 8}, worker: {type: disagg_ffn} }
 "#;
         let cfg: RunConfig = serde_yaml::from_str(yaml).expect("parse afd");
-        let RunConfig::Afd(a) = &cfg else { panic!("expected afd") };
+        let RunConfig::Afd(a) = &cfg else {
+            panic!("expected afd")
+        };
         assert_eq!(a.pools.attn.groups[0].replicas, 8);
         assert_eq!(a.pools.ffn.groups[0].replicas, 1);
         match &a.pools.attn.groups[0].arch {
@@ -433,7 +463,7 @@ pools:
         // DP-attention arch carries two TP degrees; pairs with the hp_unified worker.
         let yaml = r#"
 deployment: unified
-workload: { trace_files: ["t.csv"], duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_mode: open_loop, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   main:

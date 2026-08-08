@@ -96,7 +96,10 @@ mod tests {
                 kv_tokens: 16,
             }]
         );
-        assert_eq!(store.borrow()[RequestId(0)].tokens_emitted, 1);
+        assert_eq!(
+            store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+            1
+        );
     }
 
     #[test]
@@ -125,6 +128,6 @@ mod tests {
                 req: RequestId(0),
             }]
         );
-        assert!(store.borrow()[RequestId(0)].completed);
+        assert!(store.borrow()[RequestId(0)].lifecycle.completed);
     }
 }

@@ -1,9 +1,10 @@
-//! Single-round inference request representation + the worker-facing request
-//! store.
+//! Family-agnostic request containers and the shared worker-facing store.
 //!
-//! The current lifecycle is single-round and shared by unified, HP unified, and
-//! PD workers. Multi-round fields (`round_idx`, `preserved_prefix_kv`, ...) land
-//! alongside future L7 lifecycle work.
+//! Concrete definitions live one-per-file under `common::request_family`.
+//! [`ActiveRequest`] composes one of them with family-specific progress,
+//! common lifecycle, and telemetry. The store remains generic over the
+//! definition, so a text-only worker cannot receive a media-generation request
+//! through this seam.
 
 use std::cell::RefCell;
 use std::ops::{Index, IndexMut};
@@ -12,93 +13,111 @@ use std::rc::Rc;
 use serde::{Deserialize, Serialize};
 
 use super::id::{PoolId, RequestId, WorkerId};
+use super::request_family::{RequestDefinition, TextGenerationDefinition};
 use super::request_stage::StageEvent;
 use super::time::Time;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Request {
-    pub id: RequestId,
-    pub prompt_len: u32,
-    pub decode_len: u32,
-    pub arrival_time: Time,
+/// Scheduling facts whose meaning is shared by every request family.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SchedulingContract {
+    /// Higher values rank ahead when the selected admission policy supports it.
+    pub priority: i32,
+    /// Absolute simulated completion deadline, resolved when the request is
+    /// released. `None` means that the request declares no deadline.
+    pub completion_deadline: Option<Time>,
 }
 
-impl Request {
-    pub const fn new(id: RequestId, prompt_len: u32, decode_len: u32, arrival_time: Time) -> Self {
-        Self {
-            id,
-            prompt_len,
-            decode_len,
-            arrival_time,
-        }
+/// Stable facts carried by every live request.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RequestCore {
+    pub id: RequestId,
+    /// Actual time the replay scheduler released the request into L6.
+    pub arrival_time: Time,
+    pub scheduling: SchedulingContract,
+}
+
+/// One concrete request whose definition fixes its family at the type level.
+///
+/// ```compile_fail
+/// use simulator::common::{
+///     ImageExtent, ImageGenerationDefinition, Request, RequestCore, RequestId,
+///     SchedulingContract, TextGenerationDefinition, Time,
+/// };
+/// fn accepts_text(_: Request<TextGenerationDefinition>) {}
+/// let image = Request::new(
+///     RequestCore {
+///         id: RequestId(0),
+///         arrival_time: Time::ZERO,
+///         scheduling: SchedulingContract::default(),
+///     },
+///     ImageGenerationDefinition {
+///         text_prompt_tokens: 8,
+///         target_generation_steps: 20,
+///         extent: ImageExtent { width: 1024, height: 1024 },
+///     },
+/// );
+/// accepts_text(image);
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct Request<Definition = TextGenerationDefinition> {
+    pub core: RequestCore,
+    pub definition: Definition,
+}
+
+impl<Definition> Request<Definition> {
+    /// Compose already-resolved cross-family facts with one typed definition.
+    /// Trace parsing and replay pacing stay outside this storage constructor.
+    pub const fn new(core: RequestCore, definition: Definition) -> Self {
+        Self { core, definition }
     }
 }
 
-/// The full lifecycle record for one request: arrival facts (immutable),
-/// the worker's FSM working fields, and output-token bookkeeping. This is the
-/// `RequestVec` entry of L5 design.md §3.4; it lives in the shared store so a
-/// pool's workers and the L7 logger all read one source of truth.
+/// Common lifecycle state. Slot presence in [`RequestStore`] is the arrived
+/// fact, so no placeholder `arrived` boolean is needed.
 #[derive(Clone, Debug)]
-pub struct RequestRecord {
-    // ── arrival facts (immutable) ──
-    pub prompt_len: u32,
-    pub decode_len: u32,
-    pub arrival_time: Time,
-
-    // ── FSM working fields (mutated by the worker) ──
-    /// Prefill tokens already processed; `== prompt_len` once prefill is done.
-    pub prefill_processed: u32,
-    /// KV (tokens) already present from prior rounds this request builds on.
-    pub prefix_kv: u32,
-    /// Tokens this request contributes to the current iter (prefill chunk len
-    /// while prefilling, 1 while decoding).
-    pub active_chunk_len: u32,
-
-    // ── output bookkeeping ──
-    pub first_token_time: Option<Time>,
-    pub last_token_time: Option<Time>,
-    /// Absolute sim-time of every output token (first token + each decode step).
-    /// Feeds the `request_slo` per-token timing column; `len() == tokens_emitted`.
-    pub output_token_times: Vec<Time>,
-    pub tokens_emitted: u32,
+pub struct RequestLifecycle {
+    pub admitted: bool,
     pub completed: bool,
-
-    // ── location / stage timeline ──
-    /// Current location: the last stage/worker this request transitioned to.
-    /// Always maintained (a cheap value copy) so "where is request X now" is
-    /// an O(1) read even when the timeline below is not logged.
     pub current_stage: StageEvent,
-    /// Full stage-transition timeline; only allocated/appended when
-    /// `io.log_stage_transitions` is on. Drained into the `request_slo` row's
-    /// stage list columns at terminal time.
     pub stage_log: Vec<StageEvent>,
 }
 
-impl RequestRecord {
-    pub fn from_request(req: &Request) -> Self {
+/// Observations collected without changing request-family semantics.
+#[derive(Clone, Debug, Default)]
+pub struct RequestTelemetry {
+    pub first_output_time: Option<Time>,
+    pub last_output_time: Option<Time>,
+    pub output_times: Vec<Time>,
+}
+
+/// One live request: immutable definition + progress + lifecycle + telemetry.
+#[derive(Clone, Debug)]
+pub struct ActiveRequest<Definition: RequestDefinition = TextGenerationDefinition> {
+    pub request: Request<Definition>,
+    pub progress: Definition::Progress,
+    pub lifecycle: RequestLifecycle,
+    pub telemetry: RequestTelemetry,
+}
+
+pub type RequestRecord = ActiveRequest<TextGenerationDefinition>;
+
+impl<Definition: RequestDefinition> ActiveRequest<Definition> {
+    pub fn from_request(request: Request<Definition>) -> Self {
+        let progress = request.definition.initial_progress();
+        let arrival_time = request.core.arrival_time;
         Self {
-            prompt_len: req.prompt_len,
-            decode_len: req.decode_len,
-            arrival_time: req.arrival_time,
-            prefill_processed: 0,
-            prefix_kv: 0,
-            active_chunk_len: 0,
-            first_token_time: None,
-            last_token_time: None,
-            output_token_times: Vec::new(),
-            tokens_emitted: 0,
-            completed: false,
-            current_stage: StageEvent::unset(req.arrival_time),
-            stage_log: Vec::new(),
+            request,
+            progress,
+            lifecycle: RequestLifecycle {
+                admitted: false,
+                completed: false,
+                current_stage: StageEvent::unset(arrival_time),
+                stage_log: Vec::new(),
+            },
+            telemetry: RequestTelemetry::default(),
         }
     }
 
-    /// Record a location/stage transition: at `now` the request moved to stage
-    /// `code` on `(pool, worker)`. `log` mirrors `io.log_stage_transitions`:
-    /// when off, the timeline `Vec` is never appended (`current_stage` is still
-    /// updated for the live "where is this request" query). A repeat of the
-    /// current `(code, pool, worker)` is dropped so the timeline holds only real
-    /// moves.
     pub fn record_stage(
         &mut self,
         now: Time,
@@ -108,199 +127,238 @@ impl RequestRecord {
         log: bool,
     ) {
         if (
-            self.current_stage.code,
-            self.current_stage.pool,
-            self.current_stage.worker,
+            self.lifecycle.current_stage.code,
+            self.lifecycle.current_stage.pool,
+            self.lifecycle.current_stage.worker,
         ) == (code, pool, worker)
         {
             return;
         }
-        self.current_stage = StageEvent {
+        self.lifecycle.current_stage = StageEvent {
             time: now,
             code,
             pool,
             worker,
         };
         if log {
-            self.stage_log.push(self.current_stage);
+            self.lifecycle.stage_log.push(self.lifecycle.current_stage);
         }
-    }
-
-    pub fn is_prefill(&self) -> bool {
-        self.prefill_processed < self.prompt_len
     }
 
     pub fn is_complete(&self) -> bool {
-        self.tokens_emitted >= self.decode_len
+        self.request.definition.is_complete(&self.progress)
     }
+}
 
-    /// Prefill resolved → first output token emitted. `log_tokens` mirrors
-    /// `io.log_output_token_times`: when off, the per-token array is never
-    /// allocated or appended (the scalars below feed `slo-general` regardless).
-    pub fn record_first_token(&mut self, now: Time, log_tokens: bool) {
-        self.tokens_emitted = 1;
-        self.first_token_time = Some(now);
-        self.last_token_time = Some(now);
-        // Token emission owns the completion invariant. In particular, workers
-        // must not need a separate decode_len == 1 branch just to keep the
-        // lifecycle flag consistent with `is_complete()`.
-        self.completed = self.is_complete();
-        if log_tokens {
-            // The full decode length is known up front, so size the per-token
-            // buffer exactly once here (only for requests that actually start
-            // decoding) — the alternative is ~log2(decode_len) doubling reallocs
-            // per request, each memcpy'ing the growing array.
-            self.output_token_times.reserve_exact(self.decode_len as usize);
-            self.output_token_times.push(now);
-        }
-    }
+/// Dense id-indexed slots plus compact lifecycle indexes.
+///
+/// `records[id]` keeps direct request lookup O(1); `None` means the trace
+/// reserved the id but the replay scheduler has not released that request yet.
+/// The id vectors avoid scanning every reserved slot for arrived/admitted views.
+#[derive(Debug)]
+pub struct RequestStore<Definition: RequestDefinition = TextGenerationDefinition> {
+    records: Vec<Option<ActiveRequest<Definition>>>,
+    /// Request ids in release order. Every present record occurs exactly once.
+    arrived_ids: Vec<RequestId>,
+    /// Request ids in first-admission order. Every admitted record occurs once.
+    admitted_ids: Vec<RequestId>,
+}
 
-    /// One decode step produced a token. `log_tokens`: see `record_first_token`.
-    pub fn record_token(&mut self, now: Time, log_tokens: bool) {
-        self.tokens_emitted += 1;
-        self.last_token_time = Some(now);
-        if log_tokens {
-            self.output_token_times.push(now);
-        }
-        if self.is_complete() {
-            self.completed = true;
+impl<Definition: RequestDefinition> Default for RequestStore<Definition> {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            arrived_ids: Vec::new(),
+            admitted_ids: Vec::new(),
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn first_token_completes_single_token_request() {
-        let req = Request::new(RequestId(0), 8, 1, Time::ZERO);
-        let mut rec = RequestRecord::from_request(&req);
-
-        rec.record_first_token(Time::from_ms(1.0), false);
-
-        assert_eq!(rec.tokens_emitted, 1);
-        assert!(rec.is_complete());
-        assert!(rec.completed);
-    }
-}
-
-/// Authoritative slab of all arrived requests, keyed by id. Conceptually an L7
-/// object (arrival frontend fills it, the logger reads it); for L5/L6 it is
-/// created by the owner and shared via [`SharedRequests`].
-#[derive(Default, Debug)]
-pub struct RequestStore {
-    /// Dense, id-indexed: `records[id.0]` is request `id`. The trace frontend
-    /// validates ids as sequential `0..N` and emits them in arrival order, so a
-    /// `Vec` replaces a per-tick hash lookup with a plain array index (the tick
-    /// loop indexes the store on every active request, every tick).
-    records: Vec<RequestRecord>,
-    /// Highest id ever admitted to a worker (i.e. that started prefill), or
-    /// `None` before the first admission. Because requests arrive id-dense in
-    /// arrival order. Workers may admit non-FIFO, but the high-watermark remains
-    /// monotonic: `iter_admitted` may transiently include zero-workload gaps, and
-    /// never drops a real admitted request. Dense `request_state` snapshots skip
-    /// the never-admitted pending tail.
-    admitted_hi: Option<u32>,
-}
-
-impl RequestStore {
+impl<Definition: RequestDefinition> RequestStore<Definition> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Insert a freshly arrived request's record (arrival facts; working fields
-    /// zeroed). Ids must arrive dense + in order so `records[id.0]` holds.
-    pub fn insert(&mut self, req: &Request) {
-        debug_assert_eq!(
-            req.id.0 as usize,
-            self.records.len(),
-            "RequestStore expects dense, in-order ids (got id={}, next slot={})",
-            req.id.0,
-            self.records.len(),
+    /// Reserve dense ids without constructing fake requests.
+    pub fn reserve_slots(&mut self, count: usize) {
+        assert!(
+            self.records.is_empty(),
+            "request slots may only be reserved once, before arrivals are inserted"
         );
-        self.records.push(RequestRecord::from_request(req));
+        self.records.resize_with(count, || None);
     }
 
-    pub fn get(&self, id: RequestId) -> Option<&RequestRecord> {
-        self.records.get(id.0 as usize)
+    /// Insert one released request. A reserved slot must be empty; without
+    /// pre-sizing, ids must still append densely.
+    pub fn insert(&mut self, request: Request<Definition>) {
+        let request_id = request.core.id;
+        let slot = request_id.0 as usize;
+        if slot == self.records.len() {
+            self.records
+                .push(Some(ActiveRequest::from_request(request)));
+            self.arrived_ids.push(request_id);
+            return;
+        }
+        let Some(record_slot) = self.records.get_mut(slot) else {
+            panic!(
+                "RequestStore::insert past the end (id={}, next slot={})",
+                slot,
+                self.records.len()
+            );
+        };
+        assert!(record_slot.is_none(), "request id {slot} inserted twice");
+        *record_slot = Some(ActiveRequest::from_request(request));
+        self.arrived_ids.push(request_id);
     }
 
-    pub fn get_mut(&mut self, id: RequestId) -> Option<&mut RequestRecord> {
-        self.records.get_mut(id.0 as usize)
+    pub fn get(&self, id: RequestId) -> Option<&ActiveRequest<Definition>> {
+        self.records.get(id.0 as usize).and_then(Option::as_ref)
+    }
+
+    pub fn get_mut(&mut self, id: RequestId) -> Option<&mut ActiveRequest<Definition>> {
+        self.records.get_mut(id.0 as usize).and_then(Option::as_mut)
     }
 
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.arrived_ids.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.arrived_ids.is_empty()
     }
 
-    /// Iterate `(id, record)` over every request seen so far (incl. the unserved
-    /// pending tail). Used by the end-of-run summary, which counts all arrivals.
-    pub fn iter(&self) -> impl Iterator<Item = (RequestId, &RequestRecord)> {
-        self.records
-            .iter()
-            .enumerate()
-            .map(|(i, r)| (RequestId(i as u32), r))
+    pub fn iter_arrived(&self) -> impl Iterator<Item = (RequestId, &ActiveRequest<Definition>)> {
+        self.arrived_ids.iter().copied().map(|request_id| {
+            let record = self
+                .get(request_id)
+                .expect("arrived request id must reference a present record");
+            (request_id, record)
+        })
     }
 
-    /// Record that `id` has been admitted to a worker (started prefill),
-    /// advancing the admitted-prefix watermark. Worker admission/promise helpers
-    /// call this for barebone, HP, and PD prefill paths. `max` keeps the watermark
-    /// monotonic under non-FIFO placement.
     pub fn mark_admitted(&mut self, id: RequestId) {
-        self.admitted_hi = Some(self.admitted_hi.map_or(id.0, |hi| hi.max(id.0)));
+        let newly_admitted = {
+            let record = self
+                .get_mut(id)
+                .unwrap_or_else(|| panic!("request {} admitted before arrival", id.0));
+            if record.lifecycle.admitted {
+                false
+            } else {
+                record.lifecycle.admitted = true;
+                true
+            }
+        };
+        if newly_admitted {
+            self.admitted_ids.push(id);
+        }
     }
 
-    /// Monotonic, O(1) admission watermark: `admitted_hi + 1`, or `0` before any
-    /// admission. Strictly increases whenever a new highest-id request starts
-    /// prefill, so the stuck-watchdog can detect "a new request was admitted"
-    /// without scanning the store.
-    pub fn admitted_watermark(&self) -> u64 {
-        self.admitted_hi.map_or(0, |hi| hi as u64 + 1)
+    pub fn num_admitted(&self) -> u64 {
+        self.admitted_ids.len() as u64
     }
 
-    /// Iterate `(id, record)` over admitted requests only — the prefix
-    /// `records[0..=admitted_hi]`. Empty until the first admission. Dense
-    /// `request_state` snapshots use this instead of `iter` so the never-admitted
-    /// pending tail is skipped (see `admitted_hi`).
-    pub fn iter_admitted(&self) -> impl Iterator<Item = (RequestId, &RequestRecord)> {
-        let upto = self.admitted_hi.map_or(0, |hi| hi as usize + 1);
-        self.records[..upto]
-            .iter()
-            .enumerate()
-            .map(|(i, r)| (RequestId(i as u32), r))
+    pub fn iter_admitted(&self) -> impl Iterator<Item = (RequestId, &ActiveRequest<Definition>)> {
+        self.admitted_ids.iter().copied().map(|request_id| {
+            let record = self
+                .get(request_id)
+                .expect("admitted request id must reference a present record");
+            debug_assert!(record.lifecycle.admitted);
+            (request_id, record)
+        })
     }
 
-    /// Every inserted request has completed. O(n); not on the per-tick path —
-    /// `run_sim` tracks arrival/completion counters for termination.
     pub fn all_complete(&self) -> bool {
-        self.records.iter().all(|r| r.completed)
+        self.iter_arrived()
+            .all(|(_, record)| record.lifecycle.completed)
     }
 
-    /// Count of inserted-but-not-yet-completed requests. O(n); diagnostic helper.
     pub fn in_flight(&self) -> usize {
-        self.records.iter().filter(|r| !r.completed).count()
+        self.iter_arrived()
+            .filter(|(_, record)| !record.lifecycle.completed)
+            .count()
     }
 }
 
-impl Index<RequestId> for RequestStore {
-    type Output = RequestRecord;
-    fn index(&self, id: RequestId) -> &RequestRecord {
-        &self.records[id.0 as usize]
+impl<Definition: RequestDefinition> Index<RequestId> for RequestStore<Definition> {
+    type Output = ActiveRequest<Definition>;
+
+    fn index(&self, id: RequestId) -> &Self::Output {
+        self.get(id)
+            .unwrap_or_else(|| panic!("request {} has not arrived", id.0))
     }
 }
 
-impl IndexMut<RequestId> for RequestStore {
-    fn index_mut(&mut self, id: RequestId) -> &mut RequestRecord {
-        &mut self.records[id.0 as usize]
+impl<Definition: RequestDefinition> IndexMut<RequestId> for RequestStore<Definition> {
+    fn index_mut(&mut self, id: RequestId) -> &mut Self::Output {
+        self.get_mut(id)
+            .unwrap_or_else(|| panic!("request {} has not arrived", id.0))
     }
 }
 
-/// Shared handle injected at construction into the flow → pool → workers. The
-/// sim thread ticks workers sequentially, so `Rc<RefCell<>>` is enough; writer
-/// threads receive row copies and do not access the store.
-pub type SharedRequests = Rc<RefCell<RequestStore>>;
+pub type SharedRequests<Definition = TextGenerationDefinition> =
+    Rc<RefCell<RequestStore<Definition>>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::text_request;
+
+    #[test]
+    fn first_token_completes_single_token_request() {
+        let request = text_request(RequestId(0), 8, 1, Time::ZERO);
+        let mut record = ActiveRequest::from_request(request);
+
+        record.record_first_token(Time::from_ms(1.0), false);
+
+        assert_eq!(record.progress.output_tokens_emitted, 1);
+        assert!(record.is_complete());
+        assert!(record.lifecycle.completed);
+    }
+
+    #[test]
+    fn reserved_slots_do_not_create_arrived_requests() {
+        let mut store = RequestStore::new();
+        store.reserve_slots(2);
+        store.insert(text_request(RequestId(1), 8, 2, Time::ZERO));
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store
+                .iter_arrived()
+                .map(|(request_id, _)| request_id)
+                .collect::<Vec<_>>(),
+            vec![RequestId(1)]
+        );
+        assert!(store.get(RequestId(0)).is_none());
+        assert!(store.get(RequestId(1)).is_some());
+    }
+
+    #[test]
+    fn compact_indexes_follow_release_and_first_admission_order() {
+        let mut store = RequestStore::new();
+        store.reserve_slots(4);
+        store.insert(text_request(RequestId(3), 8, 2, Time::ZERO));
+        store.insert(text_request(RequestId(1), 8, 2, Time::ZERO));
+
+        assert_eq!(
+            store
+                .iter_arrived()
+                .map(|(request_id, _)| request_id)
+                .collect::<Vec<_>>(),
+            vec![RequestId(3), RequestId(1)]
+        );
+
+        store.mark_admitted(RequestId(1));
+        store.mark_admitted(RequestId(1));
+        store.mark_admitted(RequestId(3));
+
+        assert_eq!(store.num_admitted(), 2);
+        assert_eq!(
+            store
+                .iter_admitted()
+                .map(|(request_id, _)| request_id)
+                .collect::<Vec<_>>(),
+            vec![RequestId(1), RequestId(3)]
+        );
+    }
+}

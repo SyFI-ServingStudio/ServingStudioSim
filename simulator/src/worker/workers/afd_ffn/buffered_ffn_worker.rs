@@ -187,7 +187,7 @@ impl<E: FfnTaskExecution> BufferedFfnWorker<E> {
             .map(|&request| {
                 let record = &store[request];
                 if record.is_prefill() {
-                    record.prompt_len as u64
+                    record.request.definition.prompt_tokens as u64
                 } else {
                     1
                 }
@@ -203,9 +203,13 @@ impl<E: FfnTaskExecution> BufferedFfnWorker<E> {
                     let mut store = self.context.requests.borrow_mut();
                     for &request in &task.reqs {
                         let record = &mut store[request];
-                        let owner = (record.current_stage.pool, record.current_stage.worker);
-                        if record.tokens_emitted == 0 {
-                            record.prefill_processed = record.prompt_len;
+                        let owner = (
+                            record.lifecycle.current_stage.pool,
+                            record.lifecycle.current_stage.worker,
+                        );
+                        if record.progress.output_tokens_emitted == 0 {
+                            record.progress.prefill_tokens_processed =
+                                record.request.definition.prompt_tokens;
                             record.record_first_token(now, self.context.log_output_token_times);
                             record.record_stage(
                                 now,
@@ -354,8 +358,9 @@ mod tests {
             worker.tick(Time::from_ms(step as f64), &mut events);
         }
         let store = store.borrow();
-        assert!(store[RequestId(0)].completed);
+        assert!(store[RequestId(0)].lifecycle.completed);
         assert!(store[RequestId(0)]
+            .lifecycle
             .stage_log
             .iter()
             .all(|stage| { (stage.pool, stage.worker) == (attention_pool, attention_worker) }));

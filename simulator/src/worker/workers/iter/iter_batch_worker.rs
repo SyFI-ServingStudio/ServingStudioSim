@@ -292,9 +292,9 @@ mod tests {
         );
         let store = store.borrow();
         let record = &store[RequestId(0)];
-        assert!(record.completed);
-        assert_eq!(record.tokens_emitted, 3);
-        assert!(record.first_token_time.is_some());
+        assert!(record.lifecycle.completed);
+        assert_eq!(record.progress.output_tokens_emitted, 3);
+        assert!(record.telemetry.first_output_time.is_some());
     }
 
     #[test]
@@ -320,7 +320,7 @@ mod tests {
         let store = store.borrow();
         for request in [0, 1, 2] {
             assert!(
-                store[RequestId(request)].completed,
+                store[RequestId(request)].lifecycle.completed,
                 "req {request} should complete"
             );
         }

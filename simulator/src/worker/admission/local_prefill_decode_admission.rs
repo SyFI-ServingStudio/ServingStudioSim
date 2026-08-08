@@ -47,9 +47,10 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         let (prompt, decode) = {
             let mut store = context.requests.borrow_mut();
             let record = &mut store[request];
-            let prompt = record.prompt_len;
-            let decode = record.decode_len;
-            context.stamp_stage(record, record.arrival_time, UnifiedStage::Pending as u16);
+            let prompt = record.request.definition.prompt_tokens;
+            let decode = record.request.definition.target_output_tokens;
+            let arrival_time = record.request.core.arrival_time;
+            context.stamp_stage(record, arrival_time, UnifiedStage::Pending as u16);
             (prompt, decode)
         };
         let candidate = self.enqueue_sequence.freeze(request, prompt, decode);
@@ -169,8 +170,6 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         let mut store = context.requests.borrow_mut();
         store.mark_admitted(candidate.request);
         let record = &mut store[candidate.request];
-        record.active_chunk_len = candidate.prompt;
-        record.prefix_kv = 0;
         context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
     }
 
@@ -212,14 +211,19 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
                 let mut store = context.requests.borrow_mut();
                 kv_store.visit_prefill_admits(partition, |request| {
                     let record = &mut store[request];
-                    record.prefill_processed = record.prompt_len;
+                    record.progress.prefill_tokens_processed =
+                        record.request.definition.prompt_tokens;
                     record.record_first_token(now, context.log_tokens());
                     if record.is_complete() {
                         context.stamp_stage(record, now, UnifiedStage::Done as u16);
                         completed.push(request);
                     } else {
-                        let initial_kv = (record.prompt_len + record.prefix_kv) as u64;
-                        let remaining = record.decode_len.saturating_sub(record.tokens_emitted);
+                        let initial_kv = record.request.definition.prompt_tokens as u64;
+                        let remaining = record
+                            .request
+                            .definition
+                            .target_output_tokens
+                            .saturating_sub(record.progress.output_tokens_emitted);
                         context.stamp_stage(record, now, UnifiedStage::Decode as u16);
                         to_finalize.push((request, initial_kv, remaining));
                     }
