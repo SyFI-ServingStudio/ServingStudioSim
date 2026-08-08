@@ -9,7 +9,7 @@ use crate::common::{AfdStage, RequestId, Time};
 use crate::worker::admission::{
     AdmissionCandidate, EnqueueSequence, PendingOrderPolicy, SlotPipelineAdmission,
 };
-use crate::worker::kv::KvStore;
+use crate::worker::kv::PrefixKv;
 use crate::worker::shared::context::WorkerContext;
 
 pub struct FreshRequestSlotAdmission<P: PendingOrderPolicy> {
@@ -43,14 +43,14 @@ impl<P: PendingOrderPolicy> FreshRequestSlotAdmission<P> {
 impl<P, K> SlotPipelineAdmission<K> for FreshRequestSlotAdmission<P>
 where
     P: PendingOrderPolicy,
-    K: KvStore,
+    K: PrefixKv,
 {
     fn enqueue_fresh_request(&mut self, request: RequestId, context: &WorkerContext) {
         debug_assert!(
             !self.policy.contains(request),
             "AFD Admit is once-per-request; duplicate pending request {request:?}"
         );
-        let (prompt_tokens, remaining) = {
+        let (prompt_tokens, remaining, prefix) = {
             let mut store = context.requests.borrow_mut();
             let record = &mut store[request];
             let prompt_tokens = record.request.definition.prompt_tokens;
@@ -59,13 +59,14 @@ where
                 .definition
                 .target_output_tokens
                 .saturating_sub(record.progress.output_tokens_emitted);
+            let prefix = record.request.definition.prefix;
             let arrival = record.request.core.arrival_time;
             context.stamp_stage(record, arrival, AfdStage::Pending as u16);
-            (prompt_tokens, remaining)
+            (prompt_tokens, remaining, prefix)
         };
         let candidate = self
             .enqueue_sequence
-            .freeze(request, prompt_tokens, remaining);
+            .freeze(request, prompt_tokens, remaining, prefix);
         self.policy.push(candidate, &mut self.policy_context);
     }
 
@@ -81,13 +82,17 @@ where
                 self.pop_selected(candidate);
                 continue;
             }
-            let footprint =
-                kv_store.footprint(candidate.request, candidate.prompt, candidate.decode);
+            let resolution = kv_store.plan_prefix(0, candidate.prompt, candidate.prefix);
+            let footprint = kv_store.footprint(
+                candidate.request,
+                resolution.initial_context_tokens(),
+                candidate.decode,
+            );
             if !kv_store.fits(0, &footprint) {
                 break;
             }
             self.pop_selected(candidate);
-            kv_store.reserve(candidate.request, 0, footprint);
+            kv_store.reserve_prefix(candidate.request, 0, resolution, footprint);
 
             {
                 let mut store = context.requests.borrow_mut();

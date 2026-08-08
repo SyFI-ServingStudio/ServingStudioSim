@@ -110,6 +110,7 @@ impl PendingOrderPolicy for ShortestJobFirst {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::PrefixInput;
 
     fn candidate(
         request: u32,
@@ -122,6 +123,7 @@ mod tests {
             enqueue_sequence,
             prompt,
             decode,
+            prefix: PrefixInput::None,
             deadline: None,
             matched_tokens: 0,
         }

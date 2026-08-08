@@ -1,7 +1,7 @@
 //! Model input construction and cost-evaluation axis.
 
 use crate::common::{SharedRequests, Time};
-use crate::worker::kv::{IterWorkerKv, SlotPipelineKv};
+use crate::worker::kv::{IterWorkerKv, PrefixKv, SlotPipelineKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
 
 mod attention_layer_execution;
@@ -33,7 +33,7 @@ pub trait AttentionLayerExecution {
     fn num_layers(&self) -> u16;
     fn model_kv_layout(&self) -> ModelKvLayout;
     fn attn_to_ffn_bytes_per_token(&self) -> u64;
-    fn build_slot_input<K: SlotPipelineKv>(
+    fn build_slot_input<K: SlotPipelineKv + PrefixKv>(
         &self,
         scope: AdvanceScope<'_>,
         kv_store: &K,

@@ -2,16 +2,16 @@
 //!
 //! This family has no KV store and no admission lifecycle: L6 sends complete
 //! `FfnTask`s. The shell overlaps at most one attention→FFN pull with at most one
-//! FFN compute, queues excess tasks, derives Bootstrap token counts from the
-//! shared request store, and owns Terminal token/completion bookkeeping. `E`
-//! alone owns DP input construction and model-section cost evaluation.
+//! FFN compute, queues excess tasks, consumes controller-aggregated task token
+//! counts, and owns Terminal token/completion bookkeeping. `E` alone owns DP
+//! input construction and model-section cost evaluation.
 //!
 //! Reading order: types → construction → `IterWorker` message dispatch → message
 //! handler → double-buffer tick loop → pull/compute/completion helpers → wakeup.
 
 use std::collections::VecDeque;
 
-use crate::common::{AfdStage, RequestId, Time, WorkerId};
+use crate::common::{AfdStage, Time, WorkerId};
 use crate::worker::execution::{FfnSectionExecutionAdapter, FfnTaskExecution};
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::iter_worker::IterWorker;
@@ -156,14 +156,13 @@ impl<E: FfnTaskExecution> BufferedFfnWorker<E> {
         PullingTask { task, pull_end }
     }
 
-    fn start_compute(&mut self, mut task: FfnTask, now: Time) -> ComputingTask {
+    fn start_compute(&mut self, task: FfnTask, now: Time) -> ComputingTask {
         let slot = task.slot as usize;
         if matches!(task.kind, FfnTaskKind::Bootstrap) {
             if slot >= self.iteration_by_slot.len() {
                 self.iteration_by_slot.resize(slot + 1, 0);
             }
             self.iteration_by_slot[slot] += 1;
-            task.tokens = self.task_query_tokens(&task.reqs);
         }
         let iteration = self.iteration_by_slot.get(slot).copied().unwrap_or(0);
         let duration = if task.reqs.is_empty() {
@@ -180,21 +179,6 @@ impl<E: FfnTaskExecution> BufferedFfnWorker<E> {
         }
     }
 
-    fn task_query_tokens(&self, request_ids: &[RequestId]) -> u64 {
-        let store = self.context.requests.borrow();
-        request_ids
-            .iter()
-            .map(|&request| {
-                let record = &store[request];
-                if record.is_prefill() {
-                    record.request.definition.prompt_tokens as u64
-                } else {
-                    1
-                }
-            })
-            .sum()
-    }
-
     fn complete_task(&mut self, task: FfnTask, now: Time, events: &mut Vec<FfnWorkerEvent>) {
         match task.kind {
             FfnTaskKind::Terminal => {
@@ -208,8 +192,6 @@ impl<E: FfnTaskExecution> BufferedFfnWorker<E> {
                             record.lifecycle.current_stage.worker,
                         );
                         if record.progress.output_tokens_emitted == 0 {
-                            record.progress.prefill_tokens_processed =
-                                record.request.definition.prompt_tokens;
                             record.record_first_token(now, self.context.log_output_token_times);
                             record.record_stage(
                                 now,
@@ -278,7 +260,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::common::{PoolId, SharedRequests};
+    use crate::common::{PoolId, RequestId, SharedRequests};
     use crate::test_helpers::{shared_with, test_cluster, FakeFfn};
     use crate::worker::build_afd_ffn_worker;
     use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -313,7 +295,7 @@ mod tests {
             slot: 0,
             reqs: vec![RequestId(0)],
             pull_sources: Vec::new(),
-            tokens: 0,
+            tokens: 8,
         }));
         let mut events = Vec::new();
         for step in 0..10 {
@@ -351,7 +333,7 @@ mod tests {
             slot: 0,
             reqs: vec![RequestId(0)],
             pull_sources: Vec::new(),
-            tokens: 0,
+            tokens: 8,
         }));
         let mut events = Vec::new();
         for step in 0..10 {
@@ -400,7 +382,7 @@ mod tests {
             slot: 0,
             reqs: vec![RequestId(0)],
             pull_sources: Vec::new(),
-            tokens: 0,
+            tokens: 8,
         }));
         worker.enqueue(FfnWorkerMsg::Task(FfnTask {
             kind: FfnTaskKind::Bridge { upstream: 0 },
@@ -410,7 +392,7 @@ mod tests {
                 send_gid: sender_group_id,
                 bytes: 4096,
             }],
-            tokens: 0,
+            tokens: 8,
         }));
         let mut events = Vec::new();
         assert!(worker.tick(Time::ZERO, &mut events).is_some());

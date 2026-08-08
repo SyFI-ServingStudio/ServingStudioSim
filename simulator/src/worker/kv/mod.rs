@@ -5,13 +5,73 @@
 //! exposed through generic visitors, not owned snapshots, so abstraction does
 //! not add hot-path allocation or leak `FullAttnPartitionState`.
 
-use crate::common::{RequestId, Time};
+use crate::common::{PrefixInput, RequestId, Time};
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
+
+use self::prefix_cache::PrefixCacheLease;
 
 mod full_attn;
 mod full_attn_partition;
+mod prefix_cache;
 
 pub use full_attn::FullAttnKv;
+pub use prefix_cache::PrefixCachePolicy;
+
+/// KV-owned runtime resolution of one immutable prefix declaration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefixResolution {
+    session_id: Option<u32>,
+    resident_prefix_tokens: u32,
+    prefill_compute_tokens: u32,
+    initial_context_tokens: u32,
+    cache_lease: Option<PrefixCacheLease>,
+}
+
+impl PrefixResolution {
+    pub(crate) fn new(
+        prefix: PrefixInput,
+        resident_prefix_tokens: u32,
+        fresh_prompt_tokens: u32,
+    ) -> Self {
+        let declared_prefix_tokens = prefix.declared_prefix_tokens();
+        debug_assert!(resident_prefix_tokens <= declared_prefix_tokens);
+        let recomputed_prefix_tokens = declared_prefix_tokens - resident_prefix_tokens;
+        let prefill_compute_tokens = fresh_prompt_tokens
+            .checked_add(recomputed_prefix_tokens)
+            .expect("resolved prefill token count overflow");
+        let initial_context_tokens = resident_prefix_tokens
+            .checked_add(prefill_compute_tokens)
+            .expect("resolved initial context token count overflow");
+        Self {
+            session_id: prefix.session_id(),
+            resident_prefix_tokens,
+            prefill_compute_tokens,
+            initial_context_tokens,
+            cache_lease: None,
+        }
+    }
+
+    pub fn resident_prefix_tokens(self) -> u32 {
+        self.resident_prefix_tokens
+    }
+
+    pub fn prefill_compute_tokens(self) -> u32 {
+        self.prefill_compute_tokens
+    }
+
+    pub fn initial_context_tokens(self) -> u32 {
+        self.initial_context_tokens
+    }
+
+    fn with_cache_lease(mut self, cache_lease: Option<PrefixCacheLease>) -> Self {
+        self.cache_lease = cache_lease;
+        self
+    }
+
+    fn cache_lease(self) -> Option<PrefixCacheLease> {
+        self.cache_lease
+    }
+}
 
 pub trait KvStore {
     type Footprint;
@@ -30,6 +90,45 @@ pub trait KvStore {
     fn advance(&mut self, scope: AdvanceScope<'_>, steps: u32);
     fn release(&mut self, request: RequestId, partition: PartitionId);
     fn sample_submit(&mut self, partition: PartitionId, now: Time);
+}
+
+/// Prefix-aware refinement of the same KV owner.
+///
+/// Admission first obtains a pure plan, applies its token/KV gates, then reserves
+/// that exact plan. The simulator is single-threaded, so no cache mutation can
+/// occur between those two calls. Runtime hit/miss facts remain in this store.
+pub trait PrefixKv: KvStore {
+    fn plan_prefix(
+        &self,
+        partition: PartitionId,
+        fresh_prompt_tokens: u32,
+        prefix: PrefixInput,
+    ) -> PrefixResolution;
+    fn reserve_prefix(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        resolution: PrefixResolution,
+        footprint: Self::Footprint,
+    );
+    fn prefix_resolution(&self, request: RequestId) -> PrefixResolution;
+    fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId);
+
+    fn prefill_pair(&self, request: RequestId) -> (u32, u32) {
+        let resolution = self.prefix_resolution(request);
+        (
+            resolution.resident_prefix_tokens(),
+            resolution.prefill_compute_tokens(),
+        )
+    }
+
+    fn prefill_compute_tokens(&self, request: RequestId) -> u32 {
+        self.prefix_resolution(request).prefill_compute_tokens()
+    }
+
+    fn initial_context_tokens(&self, request: RequestId) -> u64 {
+        u64::from(self.prefix_resolution(request).initial_context_tokens())
+    }
 }
 
 pub trait IterWorkerKv: KvStore {
@@ -59,5 +158,5 @@ pub trait SlotPipelineKv: KvStore {
 /// Additional KV lifecycle required by a PD prefill worker.
 pub trait HandoffKv: IterWorkerKv {
     fn hold(&mut self, partition: PartitionId, request: RequestId, kv_tokens: u64);
-    fn drop_held(&mut self, request: RequestId);
+    fn complete_handoff(&mut self, request: RequestId);
 }

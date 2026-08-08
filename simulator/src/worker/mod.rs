@@ -24,6 +24,7 @@ pub use config::{AttnWorkerSel, BatchPolicy, FfnWorkerSel, IterWorkerSel};
 pub use cost_buffers::CostBuffers;
 pub use gpu_cluster::{CostSource, GpuCluster, GpuInfo, SharedGpuCluster};
 pub use iter_worker::{AfdAttnWorker, AfdFfnWorker, IterWorker};
+pub use kv::PrefixCachePolicy;
 pub use types::{
     AttnWorkerEvent, AttnWorkerMsg, BatchFsmState, FfnPullSource, FfnTask, FfnTaskKind,
     FfnWorkerEvent, FfnWorkerMsg, IterCursor, IterEndState, PdDecodeEvent, PdDecodeMsg,

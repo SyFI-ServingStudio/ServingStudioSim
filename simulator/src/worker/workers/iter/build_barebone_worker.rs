@@ -12,7 +12,8 @@ use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{BareboneWorker, IterBatchWorker};
 use crate::worker::workers::unified_iter_build_essentials::{
-    full_attention_token_capacity, prepare_unified_iter_build_essentials,
+    full_attention_token_capacity, prefix_cache_token_capacity,
+    prepare_unified_iter_build_essentials,
 };
 
 /// Selects the production barebone composition without changing the L6-facing
@@ -30,6 +31,7 @@ pub(crate) fn build_barebone_worker<M: IterwiseUnifiedModel>(
     cluster: SharedGpuCluster,
 ) -> BareboneWorker<M> {
     let kv_capacity = full_attention_token_capacity(model.as_ref(), &config);
+    let prefix_cache_capacity = prefix_cache_token_capacity(model.as_ref(), &config);
     let essentials = prepare_unified_iter_build_essentials(
         id,
         pool_tag,
@@ -43,7 +45,13 @@ pub(crate) fn build_barebone_worker<M: IterwiseUnifiedModel>(
         kv_capacity,
         1,
     );
-    let kv_store = FullAttnKv::new(1, essentials.kv_capacity, essentials.sampler);
+    let kv_store = FullAttnKv::with_prefix_cache(
+        1,
+        essentials.kv_capacity,
+        prefix_cache_capacity,
+        config.prefix_cache_policy,
+        essentials.sampler,
+    );
     let admission = LocalPrefillDecodeAdmission::new(
         FifoOrder::new(),
         (),

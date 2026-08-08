@@ -11,6 +11,25 @@ pub enum PrefixInput {
     },
 }
 
+impl PrefixInput {
+    pub const fn session_id(self) -> Option<u32> {
+        match self {
+            Self::None => None,
+            Self::Session { session_id, .. } => Some(session_id),
+        }
+    }
+
+    pub const fn declared_prefix_tokens(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Session {
+                declared_prefix_tokens,
+                ..
+            } => declared_prefix_tokens,
+        }
+    }
+}
+
 /// Decode behavior requested by an autoregressive request.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum DecodingStrategy {

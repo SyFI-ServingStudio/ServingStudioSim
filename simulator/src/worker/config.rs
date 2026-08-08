@@ -14,6 +14,8 @@ use serde::Deserialize;
 
 use schema_derive::ProviderSchema;
 
+use super::kv::PrefixCachePolicy;
+
 /// Batch-composition policy for the chunked-prefill worker. Closed set → serde
 /// enum (kebab-case matches the historical CLI spelling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -29,6 +31,8 @@ const BATCH_POLICY_CHOICES: [&str; 3] = [
     "separate-prefill-priority",
     "separate-prefill-priority-no-interleave",
 ];
+
+const PREFIX_CACHE_POLICY_CHOICES: [&str; 4] = ["lru", "fifo", "lfu", "largest-first"];
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
@@ -65,6 +69,14 @@ pub enum IterWorkerSel {
         /// prefills to fit; this budget is soft — one whole prefill may exceed it.)
         #[serde(default)]
         max_batch_tokens: Option<u32>,
+        /// Maximum part of `attn_gpu_memory_gb` used for retained session KV.
+        /// It is a sub-budget of the same attention space, not extra memory.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        prefix_cache_gpu_memory_gb: f64,
+        #[serde(default)]
+        #[param(string, default = "lru", choices = PREFIX_CACHE_POLICY_CHOICES)]
+        prefix_cache_policy: PrefixCachePolicy,
     },
     /// Multi-group HP/DP worker: maintains one KV partition state per attention
     /// DP shard (count comes from the arch's `num_attn_dp_groups`). Pairs with a
@@ -84,6 +96,14 @@ pub enum IterWorkerSel {
         /// `Barebone::max_batch_tokens`. None = legacy one-prefill/iter.
         #[serde(default)]
         max_batch_tokens: Option<u32>,
+        /// Per attention-DP partition retained-prefix ceiling inside the same
+        /// `attn_gpu_memory_gb` physical budget.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        prefix_cache_gpu_memory_gb: f64,
+        #[serde(default)]
+        #[param(string, default = "lru", choices = PREFIX_CACHE_POLICY_CHOICES)]
+        prefix_cache_policy: PrefixCachePolicy,
     },
     ChunkedPrefill {
         /// GPU memory for the worker (GB; primarily KV cache budget).
@@ -110,6 +130,13 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
+        /// Retained session KV ceiling inside this worker's attention budget.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        prefix_cache_gpu_memory_gb: f64,
+        #[serde(default)]
+        #[param(string, default = "lru", choices = PREFIX_CACHE_POLICY_CHOICES)]
+        prefix_cache_policy: PrefixCachePolicy,
     },
     /// PD decode half: admits already-prefilled requests straight into decode.
     PdDecode {
@@ -138,6 +165,14 @@ pub enum AttnWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
+        /// Retained session KV ceiling inside the attention worker's total KV
+        /// space; active/promise/held KV may evict it.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        prefix_cache_gpu_memory_gb: f64,
+        #[serde(default)]
+        #[param(string, default = "lru", choices = PREFIX_CACHE_POLICY_CHOICES)]
+        prefix_cache_policy: PrefixCachePolicy,
     },
 }
 

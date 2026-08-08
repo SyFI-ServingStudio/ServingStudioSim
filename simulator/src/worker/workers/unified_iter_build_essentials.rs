@@ -36,6 +36,19 @@ pub(super) fn full_attention_token_capacity<M: IterwiseUnifiedModel>(
     (partition_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1)
 }
 
+/// Retained-prefix ceiling in tokens. The byte config is a sub-budget of the
+/// same attention memory used by `full_attention_token_capacity`; `FullAttnKv`
+/// enforces the combined physical occupancy dynamically.
+pub(super) fn prefix_cache_token_capacity<M: IterwiseUnifiedModel>(
+    model: &M,
+    config: &WorkerConfig,
+) -> u64 {
+    let partition_prefix_bytes = config
+        .prefix_cache_capacity_bytes
+        .saturating_mul(model.num_attn_shards().max(1) as u64);
+    partition_prefix_bytes / model.total_kv_bytes_per_token().max(1)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_unified_iter_build_essentials<M: IterwiseUnifiedModel>(
     id: WorkerId,

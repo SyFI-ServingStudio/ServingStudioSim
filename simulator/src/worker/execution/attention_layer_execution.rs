@@ -6,7 +6,7 @@ use crate::arch::contract::{ArchGroupInput, AttnArchInput, AttnLayerwiseModel};
 use crate::common::{RequestId, SharedRequests, Time};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::execution::{AttentionLayerExecution, ModelKvLayout};
-use crate::worker::kv::SlotPipelineKv;
+use crate::worker::kv::{PrefixKv, SlotPipelineKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
 
 pub struct AttentionLayerExecutionAdapter<M: AttnLayerwiseModel> {
@@ -38,11 +38,11 @@ impl<M: AttnLayerwiseModel> AttentionLayerExecution for AttentionLayerExecutionA
         self.model.attn_to_ffn_bytes_per_token()
     }
 
-    fn build_slot_input<K: SlotPipelineKv>(
+    fn build_slot_input<K: SlotPipelineKv + PrefixKv>(
         &self,
         scope: AdvanceScope<'_>,
         kv_store: &K,
-        requests: &SharedRequests,
+        _requests: &SharedRequests,
         output: &mut Self::Input,
     ) -> u64 {
         let request_ids: &[RequestId] = match scope {
@@ -60,17 +60,15 @@ impl<M: AttnLayerwiseModel> AttentionLayerExecution for AttentionLayerExecutionA
         let group = &mut output.groups[0];
         group.clear();
 
-        let store = requests.borrow();
         for &request in request_ids {
-            if store[request].is_prefill() {
-                let record = &store[request];
-                // The current AFD path lowers one complete fresh prompt; the
-                // frontend rejects reusable-prefix requirements before build.
+            if kv_store.has_reservation(request) {
+                let (resident_prefix_tokens, prefill_compute_tokens) =
+                    kv_store.prefill_pair(request);
                 group
                     .prefill_chunk_pairs
-                    .push((0, record.request.definition.prompt_tokens));
-                group.prefill_tokens += record.request.definition.prompt_tokens;
-                group.batch_tokens += record.request.definition.prompt_tokens;
+                    .push((resident_prefix_tokens, prefill_compute_tokens));
+                group.prefill_tokens += prefill_compute_tokens;
+                group.batch_tokens += prefill_compute_tokens;
             } else {
                 let current_kv = kv_store.current_kv(0, request).unwrap_or(0) as u32;
                 group.decode_kv_lens.push(current_kv);

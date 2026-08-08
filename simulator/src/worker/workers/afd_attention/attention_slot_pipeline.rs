@@ -8,7 +8,7 @@
 use crate::common::{IdMap, RequestId, Time};
 use crate::worker::execution::AttentionLayerExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
-use crate::worker::kv::SlotPipelineKv;
+use crate::worker::kv::{PrefixKv, SlotPipelineKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::AttnWorkerEvent;
@@ -69,7 +69,7 @@ impl AttentionSlot {
 
 pub(super) struct AttentionSlotPipeline<K, E>
 where
-    K: SlotPipelineKv,
+    K: SlotPipelineKv + PrefixKv,
     E: AttentionLayerExecution,
 {
     kv_store: K,
@@ -84,7 +84,7 @@ where
 
 impl<K, E> AttentionSlotPipeline<K, E>
 where
-    K: SlotPipelineKv,
+    K: SlotPipelineKv + PrefixKv,
     E: AttentionLayerExecution,
 {
     pub(super) fn from_components(
@@ -177,7 +177,7 @@ where
         let Some(slot) = self.request_to_slot.remove(&request) else {
             return false;
         };
-        self.kv_store.release(request, 0);
+        self.kv_store.release_retaining_prefix(request, 0);
         let slot_state = &mut self.slots[slot];
         slot_state.request_ids.retain(|&member| member != request);
         slot_state
@@ -238,10 +238,22 @@ where
                 }
                 self.slots[slot].input_valid = false;
             }
+            let tokens = self.slots[slot]
+                .request_ids
+                .iter()
+                .map(|&request| {
+                    if self.request_is_prefill(context, request) {
+                        u64::from(self.kv_store.prefill_compute_tokens(request))
+                    } else {
+                        1
+                    }
+                })
+                .sum();
             events.push(AttnWorkerEvent::IterStart {
                 worker: context.id,
                 slot: slot as u8,
                 reqs: self.slots[slot].request_ids.clone(),
+                tokens,
             });
             self.slots[slot].iteration_announced = true;
             progressed = true;
@@ -250,21 +262,26 @@ where
     }
 
     fn request_is_prefill(&self, context: &WorkerContext, request: RequestId) -> bool {
-        context.requests.borrow()[request].is_prefill()
+        context.requests.borrow()[request]
+            .progress
+            .output_tokens_emitted
+            == 0
     }
 
     fn begin_decode(&mut self, context: &WorkerContext, request: RequestId) {
-        let (initial_kv, remaining) = {
-            let store = context.requests.borrow();
-            let record = &store[request];
-            (
-                record.request.definition.prompt_tokens as u64,
-                record
-                    .request
-                    .definition
-                    .target_output_tokens
-                    .saturating_sub(record.progress.output_tokens_emitted),
-            )
+        let initial_kv = self.kv_store.initial_context_tokens(request);
+        let remaining = {
+            let mut store = context.requests.borrow_mut();
+            let record = &mut store[request];
+            if record.progress.output_tokens_emitted == 0 {
+                record.progress.prefill_tokens_processed =
+                    self.kv_store.prefill_compute_tokens(request);
+            }
+            record
+                .request
+                .definition
+                .target_output_tokens
+                .saturating_sub(record.progress.output_tokens_emitted)
         };
         self.kv_store
             .commit_resident(request, 0, initial_kv, remaining);

@@ -75,14 +75,14 @@ impl Deployment for PdDeployment {
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
-        );
+        )?;
         let decode_wc = worker_config(
             &dg.worker,
             &cfg.io.log_dir,
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
-        );
+        )?;
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
 
         // The KV-transfer cost source: the profiled inter-node p2p curve, keyed
@@ -225,27 +225,47 @@ fn worker_config(
     log_output_token_times: bool,
     log_stage_transitions: bool,
     kv_log_stride: u32,
-) -> WorkerConfig {
-    let (attn_gpu_memory_gb, gpu_time_multiplier) = match worker {
-        IterWorkerSel::PdPrefill {
-            attn_gpu_memory_gb,
-            gpu_time_multiplier,
-        }
-        | IterWorkerSel::PdDecode {
-            attn_gpu_memory_gb,
-            gpu_time_multiplier,
-        } => (*attn_gpu_memory_gb, *gpu_time_multiplier),
-        // ensure_* gates the worker tag before this is reached.
-        _ => (80.0, 1.0),
-    };
-    WorkerConfig {
+) -> anyhow::Result<WorkerConfig> {
+    let (attn_gpu_memory_gb, gpu_time_multiplier, prefix_cache_gpu_memory_gb, prefix_cache_policy) =
+        match worker {
+            IterWorkerSel::PdPrefill {
+                attn_gpu_memory_gb,
+                gpu_time_multiplier,
+                prefix_cache_gpu_memory_gb,
+                prefix_cache_policy,
+            } => (
+                *attn_gpu_memory_gb,
+                *gpu_time_multiplier,
+                *prefix_cache_gpu_memory_gb,
+                *prefix_cache_policy,
+            ),
+            IterWorkerSel::PdDecode {
+                attn_gpu_memory_gb,
+                gpu_time_multiplier,
+            } => (
+                *attn_gpu_memory_gb,
+                *gpu_time_multiplier,
+                0.0,
+                crate::worker::PrefixCachePolicy::Lru,
+            ),
+            // ensure_* gates the worker tag before this is reached.
+            _ => (80.0, 1.0, 0.0, crate::worker::PrefixCachePolicy::Lru),
+        };
+    ensure!(
+        (0.0..=attn_gpu_memory_gb).contains(&prefix_cache_gpu_memory_gb),
+        "pd: prefix_cache_gpu_memory_gb must be within the total attention budget \
+         [0, {attn_gpu_memory_gb}], got {prefix_cache_gpu_memory_gb}"
+    );
+    Ok(WorkerConfig {
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
         log_stage_transitions,
         kv_log_stride,
         gpu_time_multiplier,
+        prefix_cache_capacity_bytes: (prefix_cache_gpu_memory_gb * 1e9) as u64,
+        prefix_cache_policy,
         ..WorkerConfig::default()
-    }
+    })
 }
 
 fn pool_cfg(

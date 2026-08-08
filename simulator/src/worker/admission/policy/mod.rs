@@ -4,7 +4,7 @@
 //! immutable ranking facts once, at enqueue time, then use `peek` to test the
 //! selected request against token/KV gates. A rejected head stays queued.
 
-use crate::common::{RequestId, Time};
+use crate::common::{PrefixInput, RequestId, Time};
 
 mod fifo;
 mod shortest_job_first;
@@ -23,6 +23,7 @@ pub struct AdmissionCandidate {
     pub enqueue_sequence: u64,
     pub prompt: u32,
     pub decode: u32,
+    pub prefix: PrefixInput,
     pub deadline: Option<Time>,
     pub matched_tokens: u32,
 }
@@ -30,7 +31,9 @@ pub struct AdmissionCandidate {
 impl AdmissionCandidate {
     #[inline]
     pub fn queued_kv_tokens(self) -> u64 {
-        u64::from(self.prompt) + u64::from(self.decode)
+        u64::from(self.prompt)
+            + u64::from(self.prefix.declared_prefix_tokens())
+            + u64::from(self.decode)
     }
 }
 
@@ -46,6 +49,7 @@ impl EnqueueSequence {
         request: RequestId,
         prompt: u32,
         decode: u32,
+        prefix: PrefixInput,
     ) -> AdmissionCandidate {
         let enqueue_sequence = self.next;
         self.next = self
@@ -57,6 +61,7 @@ impl EnqueueSequence {
             enqueue_sequence,
             prompt,
             decode,
+            prefix,
             deadline: None,
             matched_tokens: 0,
         }

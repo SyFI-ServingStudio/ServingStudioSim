@@ -117,14 +117,15 @@ tags 仍可独立组合，但 parser 会把字段送到实际 owner，而不是�
 
 | tag | parsed destination | 当前 consumer 状态 |
 |---|---|---|
-| `session` | release chain + definition 的 `PrefixInput` | chain 已消费；prefix KV 只携带、尚未消费 |
+| `session` | release chain + definition 的 `PrefixInput` | chain 与 L5 prefix KV 均已消费 |
 | `slo` | `RequestCore.scheduling` | current admission 尚未读取 |
 | `speculative` | text definition 的 `DecodingStrategy` | current execution 尚未读取 |
 
 frontend 只负责 exact-schema parsing、typed family construction 和 replay，不再声称能
 判断某个实际 deployment/worker composition 是否消费这些字段。除 session release chain
-外，当前 worker 尚未实现上述可选语义；在真实 consumer 与 capability contract 落地前，
-这些字段只是被保真存储，不能据此声称模拟已经执行相应策略。
+外，text worker 的 `PrefixKv` 现在也消费 prefix declaration；SLO selection 与
+speculative execution 仍只是被保真存储，在真实 consumer 与 capability contract
+落地前不能据此声称模拟已经执行相应策略。
 
 ## 5. RequestStore 与到达语义
 
@@ -152,15 +153,35 @@ frontend 只负责 exact-schema parsing、typed family construction 和 replay�
 - stage/completion：`record.lifecycle.*`
 - TTFT/TPOT 日志：`record.telemetry.*`
 
-当前 text worker 没有 prefix-aware KV 或 chunked prefill：完整 fresh prompt 直接从
-definition lowering，KV membership/residency 只从 `KvStore` 读取。未来实现这些能力时，
-必须通过对应 L5 owner 的窄 capability 交给 Execution，不能把 runtime 状态塞回
-`TextGenerationProgress`。
+当前 text worker 已通过 L5 `PrefixKv` 实现 prefix-aware KV，chunked prefill 仍未实现。
+`TextGenerationDefinition.prompt_tokens` 只表示本次 fresh suffix；
+`PrefixInput::Session.declared_prefix_tokens` 是 immutable requirement，不是 observed hit。
+`FullAttnKv` 在目标 attention partition 上解析：
 
-barebone、HP、PD prefill/decode、AFD attention/FFN 的 cadence、KV、admission、
-execution 语义没有改变；这次只重塑 shared request seam。默认类型参数仍指向
-`TextGenerationDefinition`，但类型参数贯穿 `Flow`、`SharedRequests`、store，未来
-family 不需要把当前 worker 扩成 variant。
+```text
+resident = min(local retained session KV, declared prefix)
+prefill_compute = fresh prompt + declared prefix - resident
+initial_context = fresh prompt + declared prefix
+```
+
+runtime resolution 只存于 `FullAttnKv`。Execution 从 `PrefixKv` 读取
+`(resident, prefill_compute)`；`TextGenerationProgress` 仍只保存真实 processed prefill
+work 与 emitted output tokens。cache disabled/evicted/placement miss 都会重算缺失 prefix，
+不会把 declaration 当成 guaranteed hit。
+
+retained prefix 与 normal active/promised/PD-held KV 共享同一个 total attention capacity；
+`prefix_cache_gpu_memory_gb` 只是其中可用于 completed-session KV 的 ceiling。新 reservation
+可驱逐 retained prefix。一次 hit 会把整个 session entry 的所有权移出 cache，request
+完成后再把 physically resident KV 放回，因此当前不模拟 inter-request sharing、radix
+dedup 或 ref-counted pages。PD prefill 在 handoff 后继续把 source KV 记为 held，直到 decode
+pull ack 才转成 retained prefix；handoff 携带 full initial-context token count，decode 不从
+request definition 重新推导。
+
+barebone、HP、PD prefill 与 AFD attention 都接通该 capability；PD decode 消费 prefill
+传来的 exact KV 数，但不另外维护 session prefix cache。默认 cache ceiling 为 0，所以旧
+presets 保持无 retained reuse、声明 prefix 全量重算。默认类型参数仍指向
+`TextGenerationDefinition`，且类型参数继续贯穿 `Flow`、`SharedRequests` 与 store；prefix
+support 没有把 current worker 扩成 request-family variant。
 
 ## 7. 新 family 的实现检查表
 

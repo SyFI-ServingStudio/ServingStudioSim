@@ -138,7 +138,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{RequestId, RequestStore};
+    use crate::common::{PrefixInput, RequestId, RequestStore};
     use crate::test_helpers::{test_cluster, text_request, FakeAttn, FakeFfn};
     use crate::worker::{DisaggAttnWorker, WorkerConfig};
     use std::cell::RefCell;
@@ -156,12 +156,20 @@ mod tests {
         attn_workers: u16,
         store: SharedRequests,
     ) -> AfdFlow<DisaggAttnWorker<FakeAttn>, crate::worker::DisaggFfnWorker<FakeFfn>> {
+        flow_with_attn_config(attn_workers, store, WorkerConfig::default())
+    }
+
+    fn flow_with_attn_config(
+        attn_workers: u16,
+        store: SharedRequests,
+        attn_config: WorkerConfig,
+    ) -> AfdFlow<DisaggAttnWorker<FakeAttn>, crate::worker::DisaggFfnWorker<FakeFfn>> {
         let cluster = test_cluster();
         let attn = AfdAttnPoolController::new(
             attn_workers,
             Arc::new(FakeAttn { ms: 1.0, layers: 2 }),
             std::rc::Rc::clone(&store),
-            WorkerConfig::default(),
+            attn_config,
             AFD_ATTN_POOL,
             "attn-gpu",
             &cluster,
@@ -237,6 +245,59 @@ mod tests {
         assert_eq!(
             store.borrow()[RequestId(1)].progress.output_tokens_emitted,
             2
+        );
+    }
+
+    #[test]
+    fn afd_reuses_completed_session_kv_for_the_next_request() {
+        let store = empty_store();
+        let attn_config = WorkerConfig {
+            attn_kv_bytes: 1_000,
+            prefix_cache_capacity_bytes: 1_000,
+            ..WorkerConfig::default()
+        };
+        let mut flow = flow_with_attn_config(1, std::rc::Rc::clone(&store), attn_config);
+
+        let mut first = text_request(RequestId(0), 8, 2, Time::ZERO);
+        first.definition.prefix = PrefixInput::Session {
+            session_id: 7,
+            declared_prefix_tokens: 12,
+        };
+        flow.on_arrival(first);
+        let mut completed = Vec::new();
+        for step in 0..3_000 {
+            for action in flow.tick(Time::from_ms(step as f64)) {
+                let OrchAction::Complete { req } = action;
+                completed.push(req);
+            }
+        }
+        assert_eq!(completed, vec![RequestId(0)]);
+        assert_eq!(
+            store.borrow()[RequestId(0)]
+                .progress
+                .prefill_tokens_processed,
+            20
+        );
+
+        let mut second = text_request(RequestId(1), 5, 2, Time::from_ms(3_000.0));
+        second.definition.prefix = PrefixInput::Session {
+            session_id: 7,
+            declared_prefix_tokens: 12,
+        };
+        flow.on_arrival(second);
+        for step in 3_000..6_000 {
+            for action in flow.tick(Time::from_ms(step as f64)) {
+                let OrchAction::Complete { req } = action;
+                completed.push(req);
+            }
+        }
+
+        assert_eq!(completed, vec![RequestId(0), RequestId(1)]);
+        assert_eq!(
+            store.borrow()[RequestId(1)]
+                .progress
+                .prefill_tokens_processed,
+            5
         );
     }
 

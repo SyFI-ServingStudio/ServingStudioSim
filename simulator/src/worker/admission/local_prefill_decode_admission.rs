@@ -9,10 +9,18 @@ use crate::worker::admission::{
     prefill_fits_budget, AdmissionCandidate, EnqueueSequence, IterAdmission, LoadBalance,
     PendingOrderPolicy,
 };
-use crate::worker::kv::{IterWorkerKv, KvStore};
+use crate::worker::kv::{IterWorkerKv, PrefixKv, PrefixResolution};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{WorkerEventCommon, WorkerMsgCommon};
+
+/// Prefix resolution and its matching full-context KV footprint must be
+/// reserved together; keeping them paired prevents admission from mixing facts
+/// produced by different cache snapshots.
+struct PlannedReservation<Footprint> {
+    resolution: PrefixResolution,
+    footprint: Footprint,
+}
 
 pub struct LocalPrefillDecodeAdmission<P: PendingOrderPolicy> {
     policy: P,
@@ -44,22 +52,25 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
             !self.policy.contains(request),
             "local admission is once-per-request; duplicate pending request {request:?}"
         );
-        let (prompt, decode) = {
+        let (prompt, decode, prefix) = {
             let mut store = context.requests.borrow_mut();
             let record = &mut store[request];
             let prompt = record.request.definition.prompt_tokens;
             let decode = record.request.definition.target_output_tokens;
+            let prefix = record.request.definition.prefix;
             let arrival_time = record.request.core.arrival_time;
             context.stamp_stage(record, arrival_time, UnifiedStage::Pending as u16);
-            (prompt, decode)
+            (prompt, decode, prefix)
         };
-        let candidate = self.enqueue_sequence.freeze(request, prompt, decode);
+        let candidate = self
+            .enqueue_sequence
+            .freeze(request, prompt, decode, prefix);
         self.policy.push(candidate, &mut self.policy_context);
     }
 
     pub(crate) fn form_batch(
         &mut self,
-        kv_store: &mut impl IterWorkerKv,
+        kv_store: &mut (impl IterWorkerKv + PrefixKv),
         context: &WorkerContext,
         now: Time,
     ) -> bool {
@@ -71,11 +82,26 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
             None => {
                 if let Some(candidate) = self.policy.peek() {
                     let partition = self.balance.choose(num_partitions) as u16;
-                    let footprint =
-                        kv_store.footprint(candidate.request, candidate.prompt, candidate.decode);
+                    let resolution =
+                        kv_store.plan_prefix(partition, candidate.prompt, candidate.prefix);
+                    let footprint = kv_store.footprint(
+                        candidate.request,
+                        resolution.initial_context_tokens(),
+                        candidate.decode,
+                    );
                     if kv_store.fits(partition, &footprint) {
                         self.pop_selected(candidate);
-                        self.admit(kv_store, context, candidate, partition, footprint, now);
+                        self.admit(
+                            kv_store,
+                            context,
+                            candidate,
+                            partition,
+                            PlannedReservation {
+                                resolution,
+                                footprint,
+                            },
+                            now,
+                        );
                     }
                 }
             }
@@ -94,7 +120,7 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
     }
 
     /// Preserve the old barebone worker's scalar, allocation-free budget path.
-    fn fill_single_partition_budget<K: IterWorkerKv>(
+    fn fill_single_partition_budget<K: IterWorkerKv + PrefixKv>(
         &mut self,
         kv_store: &mut K,
         context: &WorkerContext,
@@ -105,23 +131,43 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         let decode_tokens = kv_store.live_decode_count(partition);
         let mut admitted_tokens = 0;
         while let Some(candidate) = self.policy.peek() {
-            if !prefill_fits_budget(budget, decode_tokens, admitted_tokens, candidate.prompt) {
+            let resolution = kv_store.plan_prefix(partition, candidate.prompt, candidate.prefix);
+            let prefill_compute_tokens = resolution.prefill_compute_tokens();
+            if !prefill_fits_budget(
+                budget,
+                decode_tokens,
+                admitted_tokens,
+                prefill_compute_tokens,
+            ) {
                 break;
             }
-            let footprint =
-                kv_store.footprint(candidate.request, candidate.prompt, candidate.decode);
+            let footprint = kv_store.footprint(
+                candidate.request,
+                resolution.initial_context_tokens(),
+                candidate.decode,
+            );
             if !kv_store.fits(partition, &footprint) {
                 break;
             }
             self.pop_selected(candidate);
-            self.admit(kv_store, context, candidate, partition, footprint, now);
-            admitted_tokens += candidate.prompt;
+            self.admit(
+                kv_store,
+                context,
+                candidate,
+                partition,
+                PlannedReservation {
+                    resolution,
+                    footprint,
+                },
+                now,
+            );
+            admitted_tokens += prefill_compute_tokens;
         }
     }
 
     /// Preserve HP's per-partition token budgets and advancing round-robin
     /// cursor, including cursor movement when the selected head is blocked.
-    fn fill_partitioned_budget<K: IterWorkerKv>(
+    fn fill_partitioned_budget<K: IterWorkerKv + PrefixKv>(
         &mut self,
         kv_store: &mut K,
         context: &WorkerContext,
@@ -137,35 +183,55 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         while let Some(candidate) = self.policy.peek() {
             let partition = self.balance.choose(num_partitions) as u16;
             let partition_index = partition as usize;
+            let resolution = kv_store.plan_prefix(partition, candidate.prompt, candidate.prefix);
+            let prefill_compute_tokens = resolution.prefill_compute_tokens();
             if !prefill_fits_budget(
                 budget,
                 decode_tokens[partition_index],
                 admitted_tokens[partition_index],
-                candidate.prompt,
+                prefill_compute_tokens,
             ) {
                 break;
             }
-            let footprint =
-                kv_store.footprint(candidate.request, candidate.prompt, candidate.decode);
+            let footprint = kv_store.footprint(
+                candidate.request,
+                resolution.initial_context_tokens(),
+                candidate.decode,
+            );
             if !kv_store.fits(partition, &footprint) {
                 break;
             }
             self.pop_selected(candidate);
-            self.admit(kv_store, context, candidate, partition, footprint, now);
-            admitted_tokens[partition_index] += candidate.prompt;
+            self.admit(
+                kv_store,
+                context,
+                candidate,
+                partition,
+                PlannedReservation {
+                    resolution,
+                    footprint,
+                },
+                now,
+            );
+            admitted_tokens[partition_index] += prefill_compute_tokens;
         }
     }
 
-    fn admit<K: KvStore>(
+    fn admit<K: PrefixKv>(
         &self,
         kv_store: &mut K,
         context: &WorkerContext,
         candidate: AdmissionCandidate,
         partition: u16,
-        footprint: K::Footprint,
+        reservation: PlannedReservation<K::Footprint>,
         now: Time,
     ) {
-        kv_store.reserve(candidate.request, partition, footprint);
+        kv_store.reserve_prefix(
+            candidate.request,
+            partition,
+            reservation.resolution,
+            reservation.footprint,
+        );
 
         let mut store = context.requests.borrow_mut();
         store.mark_admitted(candidate.request);
@@ -184,7 +250,7 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
 
     pub(crate) fn complete_iteration(
         &mut self,
-        kv_store: &mut impl IterWorkerKv,
+        kv_store: &mut (impl IterWorkerKv + PrefixKv),
         context: &WorkerContext,
         events: &mut Vec<WorkerEventCommon>,
         now: Time,
@@ -212,13 +278,13 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
                 kv_store.visit_prefill_admits(partition, |request| {
                     let record = &mut store[request];
                     record.progress.prefill_tokens_processed =
-                        record.request.definition.prompt_tokens;
+                        kv_store.prefill_compute_tokens(request);
                     record.record_first_token(now, context.log_tokens());
                     if record.is_complete() {
                         context.stamp_stage(record, now, UnifiedStage::Done as u16);
                         completed.push(request);
                     } else {
-                        let initial_kv = record.request.definition.prompt_tokens as u64;
+                        let initial_kv = kv_store.initial_context_tokens(request);
                         let remaining = record
                             .request
                             .definition
@@ -235,7 +301,7 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
             kv_store.clear_prefill_admits(partition);
 
             for request in completed {
-                kv_store.release(request, partition);
+                kv_store.release_retaining_prefix(request, partition);
                 events.push(WorkerEventCommon::RequestComplete {
                     worker: context.id,
                     req: request,
@@ -259,7 +325,7 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
 impl<P, K> IterAdmission<K> for LocalPrefillDecodeAdmission<P>
 where
     P: PendingOrderPolicy,
-    K: IterWorkerKv,
+    K: IterWorkerKv + PrefixKv,
 {
     type Msg = WorkerMsgCommon;
     type Event = WorkerEventCommon;

@@ -83,9 +83,18 @@ impl Deployment for AfdDeployment {
             fg.arch.model().model_config,
         );
 
+        let attn_gpu_memory_gb = attn_gpu_memory_gb(&ag.worker);
+        let prefix_cache_gpu_memory_gb = attn_prefix_cache_gpu_memory_gb(&ag.worker);
+        ensure!(
+            (0.0..=attn_gpu_memory_gb).contains(&prefix_cache_gpu_memory_gb),
+            "afd: prefix_cache_gpu_memory_gb must be within the total attention budget \
+             [0, {attn_gpu_memory_gb}], got {prefix_cache_gpu_memory_gb}"
+        );
         let attn_wc = worker_config(
-            attn_gpu_memory_gb(&ag.worker),
+            attn_gpu_memory_gb,
             attn_gpu_time_multiplier(&ag.worker),
+            prefix_cache_gpu_memory_gb,
+            attn_prefix_cache_policy(&ag.worker),
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
@@ -93,6 +102,8 @@ impl Deployment for AfdDeployment {
         let ffn_wc = worker_config(
             80.0, // ffn has no KV
             ffn_gpu_time_multiplier(&fg.worker),
+            0.0,
+            crate::worker::PrefixCachePolicy::Lru,
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
@@ -292,6 +303,24 @@ fn attn_gpu_time_multiplier(worker: &AttnWorkerSel) -> f64 {
     }
 }
 
+fn attn_prefix_cache_gpu_memory_gb(worker: &AttnWorkerSel) -> f64 {
+    match worker {
+        AttnWorkerSel::DisaggAttn {
+            prefix_cache_gpu_memory_gb,
+            ..
+        } => *prefix_cache_gpu_memory_gb,
+    }
+}
+
+fn attn_prefix_cache_policy(worker: &AttnWorkerSel) -> crate::worker::PrefixCachePolicy {
+    match worker {
+        AttnWorkerSel::DisaggAttn {
+            prefix_cache_policy,
+            ..
+        } => *prefix_cache_policy,
+    }
+}
+
 fn ffn_gpu_time_multiplier(worker: &FfnWorkerSel) -> f64 {
     match worker {
         FfnWorkerSel::DisaggFfn {
@@ -303,6 +332,8 @@ fn ffn_gpu_time_multiplier(worker: &FfnWorkerSel) -> f64 {
 fn worker_config(
     attn_gpu_memory_gb: f64,
     gpu_time_multiplier: f64,
+    prefix_cache_gpu_memory_gb: f64,
+    prefix_cache_policy: crate::worker::PrefixCachePolicy,
     log_output_token_times: bool,
     log_stage_transitions: bool,
     kv_log_stride: u32,
@@ -313,6 +344,8 @@ fn worker_config(
         log_stage_transitions,
         kv_log_stride,
         gpu_time_multiplier,
+        prefix_cache_capacity_bytes: (prefix_cache_gpu_memory_gb * 1e9) as u64,
+        prefix_cache_policy,
         ..WorkerConfig::default()
     }
 }
@@ -321,7 +354,6 @@ fn worker_config(
 /// builds the attn pool then the ffn pool into it (so GPU ids continue across
 /// pools), and wires the flow. The returned `Box<dyn Flow>` is the only `dyn`
 /// erasure point.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn assemble_afd_flow<MA, MF>(
     attn_model: Arc<MA>,

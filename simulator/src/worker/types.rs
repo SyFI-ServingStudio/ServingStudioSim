@@ -86,9 +86,9 @@ pub enum PdPrefillEvent {
     /// A PD prefill worker finished a request's prefill; L6 hands it off to a
     /// decode pool. `send_gid` is the sender's comm-group id (registered at
     /// prefill worker construction); `kv_tokens` is the request's KV token
-    /// count produced by prefill (`prompt_tokens` in the current fresh-prompt
-    /// path). Together they let L6 build the matching `PdDecodeMsg::Handoff`
-    /// without re-deriving the model.
+    /// count produced by prefill (resident prefix plus recomputed prefix/fresh
+    /// prompt). Together they let L6 build the matching `PdDecodeMsg::Handoff`
+    /// without re-deriving it from the request definition.
     PrefillDone {
         worker: WorkerId,
         req: RequestId,
@@ -272,6 +272,9 @@ pub enum AttnWorkerEvent {
         worker: WorkerId,
         slot: u8,
         reqs: Vec<RequestId>,
+        /// Query tokens for this worker's slot: resolved prefill compute for a
+        /// fresh request, otherwise one token per decode request.
+        tokens: u64,
     },
     /// This micro-batch finished `layer`'s attention; the ffn side pulls `bytes`
     /// (= `attn_to_ffn_bytes_per_token × tokens`, producer-computed here) from
@@ -280,8 +283,8 @@ pub enum AttnWorkerEvent {
     /// handshake slot-addressed) and `reqs` (so L6 aggregates whose output is ready;
     /// empty for an empty slot's lockstep completion). Batch-granular.
     ///
-    /// `tokens` is this shard's query-token count for the batch (prefill = `prompt_len`,
-    /// decode = 1 per request; 0 for an empty lockstep slot) — the same
+    /// `tokens` is this shard's query-token count for the batch (prefill = resolved
+    /// compute tokens, decode = 1 per request; 0 for an empty lockstep slot) — the same
     /// `batch_query_tokens` the compute cost is keyed off. L6 uses it to split the
     /// ffn→attn QKV scatter by each shard's token share (the exact dual of the summed
     /// attn→ffn `bytes` pull), so the split is by tokens directly, not by the
@@ -327,10 +330,9 @@ pub struct FfnPullSource {
 
 /// One unit of ffn work: a micro-batch's section for one layer step. `reqs` is the
 /// **total** workload — the flat request set, NOT pre-grouped. The worker (L5) owns
-/// the DP-shard partition: it round-robins `reqs` across `num_dp_groups`, reads the
-/// store for each request's token count, and builds the L4 `FfnArchInput` itself.
-/// L6 only hands over the workload — it never groups, never counts tokens, never
-/// constructs arch vocabulary (the only L5↔L4 bridge is the worker).
+/// the DP-shard partition and builds the L4 `FfnArchInput` itself. `tokens` is an
+/// L5-produced query count that L6 only sums while aggregating attention shards;
+/// L6 never re-derives it from the request store or constructs arch vocabulary.
 /// `pull_sources` are the source chunks for the attn→ffn input pull (empty for
 /// Bootstrap, whose input is local). `slot` is the pipeline slot the controller
 /// aggregated this batch from; the worker echoes it back on the resulting event so
@@ -341,15 +343,12 @@ pub struct FfnTask {
     pub slot: u8,
     pub reqs: Vec<RequestId>,
     pub pull_sources: Vec<FfnPullSource>,
-    /// Total query tokens for this batch (prefill = prompt_len, decode = 1 each) —
-    /// the workload size that drives the FFN cost and the ffn→attn handoff bytes.
-    /// Threaded from the attn side rather than re-derived from the store per layer:
-    /// for a Bridge/Terminal the pool sums the per-shard counts the attn workers
-    /// already reported in `AttnLayerOutputsReady` (identical to a fresh
-    /// `workload_tokens(reqs)` scan, since the shards partition `reqs` and
-    /// `is_prefill` is iteration-constant). A Bootstrap opens the pass before any
-    /// attn layer-output exists, so the pool leaves this `0` and the worker fills it
-    /// once from the store at `start_compute` (see [`super::disagg_ffn`]).
+    /// Total query tokens for this batch (prefill = resolved compute tokens,
+    /// decode = 1 each) — the workload size that drives the FFN cost and the
+    /// ffn→attn handoff bytes. `IterStart` supplies the Bootstrap count;
+    /// `AttnLayerOutputsReady` supplies Bridge/Terminal counts. The controller
+    /// only aggregates those L5 facts, so the FFN worker never guesses a prefix
+    /// hit or re-reads prompt lengths from the request store.
     pub tokens: u64,
 }
 
@@ -433,6 +432,10 @@ pub struct WorkerConfig {
     /// legacy one-prefill/iter. For the multi-group worker the budget is applied
     /// per DP group. See [`crate::worker::admission::prefill_fits_budget`].
     pub max_batch_tokens: Option<u32>,
+    /// Maximum bytes of `attn_kv_bytes` that may hold evictable completed-session
+    /// prefix KV. This is a sub-budget, never additional GPU memory.
+    pub prefix_cache_capacity_bytes: u64,
+    pub prefix_cache_policy: crate::worker::kv::PrefixCachePolicy,
 }
 
 impl Default for WorkerConfig {
@@ -445,6 +448,8 @@ impl Default for WorkerConfig {
             kv_log_stride: 8,
             gpu_time_multiplier: 1.0,
             max_batch_tokens: None,
+            prefix_cache_capacity_bytes: 0,
+            prefix_cache_policy: crate::worker::kv::PrefixCachePolicy::Lru,
         }
     }
 }

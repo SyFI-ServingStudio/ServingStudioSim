@@ -150,7 +150,7 @@ mod tests {
             slot: 0,
             reqs: vec![RequestId(0)],
             pull_sources: Vec::new(),
-            tokens: 0,
+            tokens: 8,
         });
         let mut events = Vec::new();
         for step in 0..10u64 {

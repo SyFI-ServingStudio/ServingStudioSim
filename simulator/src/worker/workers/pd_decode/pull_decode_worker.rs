@@ -39,7 +39,7 @@ struct InFlightPull {
 
 struct PullPipeline {
     /// KV is resident locally but has not entered a decode partition.
-    pending_decodes: VecDeque<RequestId>,
+    pending_decodes: VecDeque<(RequestId, u64)>,
     /// O(1) token sum paired with every `pending_decodes` push/pop.
     pending_decode_tokens: u64,
     /// Handoffs not yet submitted; these tokens do not occupy local KV.
@@ -173,7 +173,9 @@ where
             let record = &store[request];
             record.request.definition.prompt_tokens as u64
         };
-        self.pull_pipeline.pending_decodes.push_back(request);
+        self.pull_pipeline
+            .pending_decodes
+            .push_back((request, tokens));
         self.pull_pipeline.pending_decode_tokens += tokens;
 
         let mut store = self.context.requests.borrow_mut();
@@ -229,7 +231,9 @@ where
                 if now < pull.pull_end {
                     return;
                 }
-                self.pull_pipeline.pending_decodes.push_back(pull.request);
+                self.pull_pipeline
+                    .pending_decodes
+                    .push_back((pull.request, pull.tokens));
                 self.pull_pipeline.pending_decode_tokens += pull.tokens;
                 self.pull_pipeline.in_flight = None;
 
@@ -248,7 +252,7 @@ where
                 });
             }
 
-            let Some(&(_, ref next_transfer)) = self.pull_pipeline.pending_pulls.front() else {
+            let Some((_, next_transfer)) = self.pull_pipeline.pending_pulls.front() else {
                 return;
             };
             let head_tokens = next_transfer.tokens;
@@ -312,18 +316,15 @@ where
         let had_decode =
             (0..num_partitions as u16).any(|partition| self.kv_store.has_live_decode(partition));
 
-        if let Some(&request) = self.pull_pipeline.pending_decodes.front() {
-            let (prompt_kv, remaining) = {
+        if let Some(&(request, prompt_kv)) = self.pull_pipeline.pending_decodes.front() {
+            let remaining = {
                 let store = self.context.requests.borrow();
                 let record = &store[request];
-                (
-                    record.request.definition.prompt_tokens as u64,
-                    record
-                        .request
-                        .definition
-                        .target_output_tokens
-                        .saturating_sub(record.progress.output_tokens_emitted),
-                )
+                record
+                    .request
+                    .definition
+                    .target_output_tokens
+                    .saturating_sub(record.progress.output_tokens_emitted)
             };
             let partition = self.balance.choose(num_partitions) as u16;
             let footprint = self
@@ -447,14 +448,13 @@ where
             .pull_pipeline
             .pending_decodes
             .iter()
-            .position(|&pending| pending == request)
+            .position(|&(pending, _)| pending == request)
         {
-            self.pull_pipeline.pending_decodes.remove(position);
-            let tokens = {
-                let store = self.context.requests.borrow();
-                let record = &store[request];
-                record.request.definition.prompt_tokens as u64
-            };
+            let (_, tokens) = self
+                .pull_pipeline
+                .pending_decodes
+                .remove(position)
+                .expect("position came from the same pending-decode queue");
             self.pull_pipeline.pending_decode_tokens = self
                 .pull_pipeline
                 .pending_decode_tokens

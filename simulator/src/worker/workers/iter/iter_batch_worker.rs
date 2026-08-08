@@ -215,7 +215,7 @@ mod tests {
 
     use super::*;
     use crate::arch::contract::IterwiseUnifiedModel;
-    use crate::common::{PoolId, SharedRequests};
+    use crate::common::{PoolId, PrefixInput, SharedRequests};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::admission::ShortestJobFirst;
     use crate::worker::types::{WorkerConfig, WorkerEventCommon, WorkerMsgCommon};
@@ -324,6 +324,52 @@ mod tests {
                 "req {request} should complete"
             );
         }
+    }
+
+    #[test]
+    fn completed_session_kv_is_reused_without_exceeding_total_attention_capacity() {
+        let store = shared_with(&[(0, 20, 2), (1, 30, 2)]);
+        {
+            let mut requests = store.borrow_mut();
+            for request in [RequestId(0), RequestId(1)] {
+                requests[request].request.definition.prefix = PrefixInput::Session {
+                    session_id: 7,
+                    declared_prefix_tokens: 100,
+                };
+            }
+        }
+        let config = WorkerConfig {
+            attn_kv_bytes: 1_000,
+            prefix_cache_capacity_bytes: 1_000,
+            ..WorkerConfig::default()
+        };
+        let mut worker = worker_with(Rc::clone(&store), config);
+        let mut events = Vec::new();
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        for step in 0..100 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        assert_eq!(
+            store.borrow()[RequestId(0)]
+                .progress
+                .prefill_tokens_processed,
+            120,
+            "a cold session recomputes its declared prefix"
+        );
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        for step in 100..200 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        assert_eq!(
+            store.borrow()[RequestId(1)]
+                .progress
+                .prefill_tokens_processed,
+            30,
+            "the same session consumes retained KV and computes only fresh prompt tokens"
+        );
+        assert_eq!(events.len(), 2);
     }
 
     fn config_with_budget(max_batch_tokens: u32) -> WorkerConfig {

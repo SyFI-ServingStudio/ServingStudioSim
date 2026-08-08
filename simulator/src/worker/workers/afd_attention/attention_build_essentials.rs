@@ -48,6 +48,10 @@ pub(super) fn prepare_attention_build_essentials<M: AttnLayerwiseModel>(
         .attn_kv_bytes
         .saturating_mul(model.num_attn_shards().max(1) as u64);
     let kv_capacity = (shard_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
+    let prefix_cache_bytes = config
+        .prefix_cache_capacity_bytes
+        .saturating_mul(model.num_attn_shards().max(1) as u64);
+    let prefix_cache_capacity = prefix_cache_bytes / model.total_kv_bytes_per_token().max(1);
     cluster
         .borrow_mut()
         .register_kv_capacity(pool_tag, pool.0, id.0, 0, kv_capacity);
@@ -75,7 +79,13 @@ pub(super) fn prepare_attention_build_essentials<M: AttnLayerwiseModel>(
 
     AttentionBuildEssentials {
         context,
-        kv_store: FullAttnKv::new(1, kv_capacity, sampler),
+        kv_store: FullAttnKv::with_prefix_cache(
+            1,
+            kv_capacity,
+            prefix_cache_capacity,
+            config.prefix_cache_policy,
+            sampler,
+        ),
         execution: AttentionLayerExecutionAdapter::new(model, cost),
         cluster,
         receive_group_id,

@@ -14,7 +14,7 @@ use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::{FifoOrder, FreshRequestSlotAdmission, SlotPipelineAdmission};
 use crate::worker::execution::{AttentionLayerExecution, AttentionLayerExecutionAdapter};
 use crate::worker::iter_worker::{AfdAttnWorker, IterWorker};
-use crate::worker::kv::{FullAttnKv, SlotPipelineKv};
+use crate::worker::kv::{FullAttnKv, PrefixKv, SlotPipelineKv};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{AttnWorkerEvent, AttnWorkerMsg, WorkerStatus};
 
@@ -22,7 +22,7 @@ use super::attention_slot_pipeline::AttentionSlotPipeline;
 
 pub struct SlotAttentionWorker<K, A, E>
 where
-    K: SlotPipelineKv,
+    K: SlotPipelineKv + PrefixKv,
     A: SlotPipelineAdmission<K>,
     E: AttentionLayerExecution,
 {
@@ -40,7 +40,7 @@ pub type DisaggAttnWorker<M> = SlotAttentionWorker<
 
 impl<K, A, E> SlotAttentionWorker<K, A, E>
 where
-    K: SlotPipelineKv,
+    K: SlotPipelineKv + PrefixKv,
     A: SlotPipelineAdmission<K>,
     E: AttentionLayerExecution,
 {
@@ -67,7 +67,7 @@ where
 
 impl<K, A, E> IterWorker for SlotAttentionWorker<K, A, E>
 where
-    K: SlotPipelineKv,
+    K: SlotPipelineKv + PrefixKv,
     A: SlotPipelineAdmission<K>,
     E: AttentionLayerExecution,
 {
@@ -108,7 +108,7 @@ where
 
 impl<K, A, E> AfdAttnWorker for SlotAttentionWorker<K, A, E>
 where
-    K: SlotPipelineKv,
+    K: SlotPipelineKv + PrefixKv,
     A: SlotPipelineAdmission<K>,
     E: AttentionLayerExecution,
 {
@@ -119,7 +119,7 @@ where
 
 impl<K, A, E> SlotAttentionWorker<K, A, E>
 where
-    K: SlotPipelineKv,
+    K: SlotPipelineKv + PrefixKv,
     A: SlotPipelineAdmission<K>,
     E: AttentionLayerExecution,
 {

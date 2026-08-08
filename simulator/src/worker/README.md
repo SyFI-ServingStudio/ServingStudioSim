@@ -87,15 +87,17 @@ footprint → fits → reserve → commit_resident → advance → release
 - one private `FullAttnPartitionState` per independent KV partition;
 - the promised reservation ledger;
 - the PD-prefill held-KV ledger;
+- runtime session-prefix resolution and one retained-prefix cache per partition;
 - sticky request→partition ownership;
 - strict admission and KV sampling.
 
 Family capabilities expose only the views their cadence needs:
 
 - `IterWorkerKv` — prefill admits and live decode membership.
+- `PrefixKv` — resolved resident/recomputed prefix work and retained-session release.
 - `SlotPipelineKv` — per-request current KV, reservation membership, and
   projected peak.
-- `HandoffKv` — hold/drop semantics for PD prefill.
+- `HandoffKv` — hold/complete semantics for PD prefill.
 
 Iteration and slot input builders consume borrowed membership visitors/slices,
 so composition does not require cloning the live batch on the hot path.
@@ -106,6 +108,21 @@ directly owns the only strict capacity gate. Partition placement and the prefill
 token gate belong to admission (`admission/placement.rs` and
 `admission/token_budget.rs`); there is no mixed `admission_helpers` module or
 one-variant capacity-policy seam.
+
+`PrefixInput` remains an immutable request declaration. Admission asks
+`PrefixKv` to resolve the local partition's retained hit, gates the actual
+compute `fresh + declared - resident`, and reserves the full context
+`fresh + declared`. Execution reads that resolution from KV; request progress
+records processed prefill work, not cache residency.
+
+Retained prefix KV is evictable occupancy inside the same total attention
+capacity as active, promised, and PD-held KV. `prefix_cache_capacity_bytes` is
+only a cache ceiling: active reservations shrink/evict retained entries to
+preserve the physical capacity invariant. A hit transfers ownership out of the
+cache until completion, so there is no inter-request sharing. PD prefill returns
+held KV to the cache only after decode acknowledges the pull. The implementation
+lives in `kv/prefix_cache.rs`; `kv/full_attn.rs` owns the combined ledger and
+capacity gate.
 
 ## Admission axis
 

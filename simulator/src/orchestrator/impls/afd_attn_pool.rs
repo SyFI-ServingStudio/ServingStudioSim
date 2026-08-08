@@ -108,7 +108,7 @@ struct LayerBarrier {
 /// empty union is a legal no-op iteration.
 #[derive(Default)]
 struct StartBarrier {
-    reported: Vec<WorkerId>,
+    reported: Vec<(WorkerId, u64)>,
     reqs: Vec<RequestId>,
 }
 
@@ -323,17 +323,17 @@ where
         };
         let n = self.workers.len();
         let per_worker = split_by_token_share(out_bytes, &self.slots[slot].scatter_weights, n);
-        for idx in 0..n {
-            self.workers[idx].enqueue(
+        for (worker_index, bytes) in per_worker.into_iter().enumerate() {
+            self.workers[worker_index].enqueue(
                 AttnWorkerMsg::ReadyNotification {
                     slot: slot as u8,
                     layer,
                     send_gid,
-                    bytes: per_worker[idx],
+                    bytes,
                 }
                 .into(),
             );
-            self.wake(idx);
+            self.wake(worker_index);
         }
     }
 
@@ -393,8 +393,13 @@ where
                 // PD-for-AFD flow consumes this side-band ack before calling
                 // `aggregate`; it has no effect on the AFD layer barriers.
                 AttnWorkerEvent::KvPullComplete { .. } => {}
-                AttnWorkerEvent::IterStart { worker, slot, reqs } => {
-                    self.on_iter_start(*slot as usize, *worker, reqs, tasks);
+                AttnWorkerEvent::IterStart {
+                    worker,
+                    slot,
+                    reqs,
+                    tokens,
+                } => {
+                    self.on_iter_start(*slot as usize, *worker, reqs, *tokens, tasks);
                 }
                 AttnWorkerEvent::AttnLayerOutputsReady {
                     worker,
@@ -434,6 +439,7 @@ where
         slot: usize,
         worker: WorkerId,
         reqs: &[RequestId],
+        tokens: u64,
         tasks: &mut Vec<FfnTask>,
     ) -> bool {
         let n = self.workers.len();
@@ -450,18 +456,22 @@ where
         // lockstep violation that cannot happen in a valid run. Assert in debug; skip
         // the O(workers) scan in release (O(workers²) per iteration per slot at scale).
         debug_assert!(
-            !s.start.reported.contains(&worker),
+            !s.start
+                .reported
+                .iter()
+                .any(|&(reported_worker, _)| reported_worker == worker),
             "worker {worker:?} reported slot {slot}'s start twice"
         );
-        s.start.reported.push(worker);
+        s.start.reported.push((worker, tokens));
         s.start.reqs.extend_from_slice(reqs);
         if s.start.reported.len() != n {
             return false;
         }
 
         let reqs = std::mem::take(&mut s.start.reqs);
+        let total_tokens = s.start.reported.iter().map(|&(_, tokens)| tokens).sum();
         s.start.reported.clear();
-        self.fire_bootstrap(slot, reqs, tasks);
+        self.fire_bootstrap(slot, reqs, total_tokens, tasks);
         true
     }
 
@@ -564,7 +574,13 @@ where
     /// and resets the layer barrier. Membership was already locked worker-side when each
     /// worker emitted its `IterStart`; the prolog's layer-0 QKV returns via `scatter` to
     /// ALL workers.
-    fn fire_bootstrap(&mut self, slot: usize, reqs: Vec<RequestId>, tasks: &mut Vec<FfnTask>) {
+    fn fire_bootstrap(
+        &mut self,
+        slot: usize,
+        reqs: Vec<RequestId>,
+        tokens: u64,
+        tasks: &mut Vec<FfnTask>,
+    ) {
         debug_assert!(
             !self.slots[slot].in_flight,
             "double Bootstrap for slot {slot}"
@@ -580,9 +596,7 @@ where
             slot: slot as u8,
             reqs,
             pull_sources: Vec::new(),
-            // A Bootstrap precedes any attn layer-output, so no per-shard count exists
-            // yet; the worker fills `tokens` from the store once at `start_compute`.
-            tokens: 0,
+            tokens,
         });
     }
 
@@ -711,14 +725,15 @@ mod tests {
         let mut p = pool(2, Rc::clone(&store));
         let mut tasks = Vec::new();
 
-        assert!(!p.on_iter_start(0, WorkerId(0), &[RequestId(0)], &mut tasks));
+        assert!(!p.on_iter_start(0, WorkerId(0), &[RequestId(0)], 1, &mut tasks));
         assert!(tasks.is_empty(), "start barrier waits for worker 1");
-        assert!(p.on_iter_start(0, WorkerId(1), &[], &mut tasks));
+        assert!(p.on_iter_start(0, WorkerId(1), &[], 0, &mut tasks));
 
         assert_eq!(tasks.len(), 1);
         assert!(matches!(tasks[0].kind, FfnTaskKind::Bootstrap));
         assert_eq!(tasks[0].slot, 0);
         assert_eq!(tasks[0].reqs, vec![RequestId(0)]);
+        assert_eq!(tasks[0].tokens, 1);
         assert!(p.slots[0].in_flight);
     }
 
@@ -730,8 +745,8 @@ mod tests {
         let mut p = pool(2, Rc::clone(&store));
         let mut tasks = Vec::new();
 
-        assert!(!p.on_iter_start(0, WorkerId(0), &[], &mut tasks));
-        assert!(p.on_iter_start(0, WorkerId(1), &[], &mut tasks));
+        assert!(!p.on_iter_start(0, WorkerId(0), &[], 0, &mut tasks));
+        assert!(p.on_iter_start(0, WorkerId(1), &[], 0, &mut tasks));
 
         assert_eq!(tasks.len(), 1);
         assert!(matches!(tasks[0].kind, FfnTaskKind::Bootstrap));

@@ -10,7 +10,7 @@ use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInp
 use crate::common::{SharedRequests, Time};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::execution::{IterModelExecution, ModelKvLayout};
-use crate::worker::kv::IterWorkerKv;
+use crate::worker::kv::{IterWorkerKv, PrefixKv};
 
 pub struct UnifiedIterExecution<M: IterwiseUnifiedModel> {
     model: Arc<M>,
@@ -22,13 +22,12 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
         Self { model, cost }
     }
 
-    fn build_input<K: IterWorkerKv>(
+    fn build_input<K: IterWorkerKv + PrefixKv>(
         &self,
         kv_store: &K,
-        requests: &SharedRequests,
+        _requests: &SharedRequests,
         out: &mut UnifiedArchInput,
     ) {
-        let store = requests.borrow();
         let num_partitions = kv_store.num_partitions();
         out.groups
             .resize_with(num_partitions, ArchGroupInput::default);
@@ -38,13 +37,12 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
             let group = &mut out.groups[partition as usize];
             group.clear();
             kv_store.visit_prefill_admits(partition, |request| {
-                let record = &store[request];
-                let prompt_tokens = record.request.definition.prompt_tokens;
-                // The current text worker admits one complete fresh prompt.
-                // Prefix residency and future chunk state belong to KV and
-                // Admission respectively, not to request-family progress.
-                group.prefill_chunk_pairs.push((0, prompt_tokens));
-                group.prefill_tokens += prompt_tokens;
+                let (resident_prefix_tokens, prefill_compute_tokens) =
+                    kv_store.prefill_pair(request);
+                group
+                    .prefill_chunk_pairs
+                    .push((resident_prefix_tokens, prefill_compute_tokens));
+                group.prefill_tokens += prefill_compute_tokens;
             });
             kv_store.visit_decode_members(partition, |_, current_kv| {
                 group.decode_kv_lens.push(current_kv as u32);
@@ -70,7 +68,7 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
 impl<M, K> IterModelExecution<K> for UnifiedIterExecution<M>
 where
     M: IterwiseUnifiedModel,
-    K: IterWorkerKv,
+    K: IterWorkerKv + PrefixKv,
 {
     type Input = UnifiedArchInput;
 

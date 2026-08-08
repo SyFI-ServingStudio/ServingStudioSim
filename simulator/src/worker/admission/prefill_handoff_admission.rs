@@ -4,7 +4,7 @@ use crate::common::{PdStage, RequestId, Time};
 use crate::worker::admission::{
     AdmissionCandidate, EnqueueSequence, IterAdmission, PendingOrderPolicy,
 };
-use crate::worker::kv::{HandoffKv, KvStore};
+use crate::worker::kv::{HandoffKv, PrefixKv, PrefixResolution};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{PdPrefillEvent, PdPrefillMsg};
 
@@ -29,16 +29,17 @@ impl<P: PendingOrderPolicy> PrefillHandoffAdmission<P> {
         }
     }
 
-    fn admit<K: KvStore>(
+    fn admit<K: PrefixKv>(
         &self,
         kv_store: &mut K,
         context: &WorkerContext,
         candidate: AdmissionCandidate,
+        resolution: PrefixResolution,
         footprint: K::Footprint,
         now: Time,
     ) {
         let partition = 0;
-        kv_store.reserve(candidate.request, partition, footprint);
+        kv_store.reserve_prefix(candidate.request, partition, resolution, footprint);
 
         let mut store = context.requests.borrow_mut();
         store.mark_admitted(candidate.request);
@@ -59,7 +60,7 @@ impl<P: PendingOrderPolicy> PrefillHandoffAdmission<P> {
 impl<P, K> IterAdmission<K> for PrefillHandoffAdmission<P>
 where
     P: PendingOrderPolicy,
-    K: HandoffKv,
+    K: HandoffKv + PrefixKv,
 {
     type Msg = PdPrefillMsg;
     type Event = PdPrefillEvent;
@@ -71,28 +72,31 @@ where
                     !self.policy.contains(request),
                     "PD prefill admission is once-per-request; duplicate pending request {request:?}"
                 );
-                let prompt = {
+                let (prompt, prefix) = {
                     let mut store = context.requests.borrow_mut();
                     let record = &mut store[request];
                     let prompt = record.request.definition.prompt_tokens;
+                    let prefix = record.request.definition.prefix;
                     let arrival = record.request.core.arrival_time;
                     context.stamp_stage(record, arrival, PdStage::PendingPrefill as u16);
-                    prompt
+                    (prompt, prefix)
                 };
-                let candidate = self.enqueue_sequence.freeze(request, prompt, 0);
+                let candidate = self.enqueue_sequence.freeze(request, prompt, 0, prefix);
                 self.policy.push(candidate, &mut self.policy_context);
             }
-            PdPrefillMsg::ReleaseKv { req } => kv_store.drop_held(req),
+            PdPrefillMsg::ReleaseKv { req } => kv_store.complete_handoff(req),
         }
     }
 
     fn form_batch(&mut self, kv_store: &mut K, context: &WorkerContext, now: Time) -> bool {
         let partition = 0;
         if let Some(candidate) = self.policy.peek() {
-            let footprint = kv_store.footprint(candidate.request, candidate.prompt, 0);
+            let resolution = kv_store.plan_prefix(partition, candidate.prompt, candidate.prefix);
+            let footprint =
+                kv_store.footprint(candidate.request, resolution.initial_context_tokens(), 0);
             if kv_store.fits(partition, &footprint) {
                 self.pop_selected(candidate);
-                self.admit(kv_store, context, candidate, footprint, now);
+                self.admit(kv_store, context, candidate, resolution, footprint, now);
             }
         }
 
@@ -113,9 +117,9 @@ where
             let mut store = context.requests.borrow_mut();
             kv_store.visit_prefill_admits(partition, |request| {
                 let record = &mut store[request];
-                record.progress.prefill_tokens_processed = record.request.definition.prompt_tokens;
+                record.progress.prefill_tokens_processed = kv_store.prefill_compute_tokens(request);
                 record.record_first_token(now, context.log_tokens());
-                let kv_tokens = record.request.definition.prompt_tokens as u64;
+                let kv_tokens = kv_store.initial_context_tokens(request);
                 let complete = record.is_complete();
                 context.stamp_stage(
                     record,
@@ -132,7 +136,7 @@ where
 
         for &(request, kv_tokens, complete) in &self.transitions {
             if complete {
-                kv_store.release(request, partition);
+                kv_store.release_retaining_prefix(request, partition);
                 events.push(PdPrefillEvent::RequestComplete {
                     worker: context.id,
                     req: request,

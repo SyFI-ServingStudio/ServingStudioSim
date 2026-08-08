@@ -73,7 +73,7 @@ impl PendingOrderPolicy for FifoOrder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::RequestId;
+    use crate::common::PrefixInput;
 
     fn candidate(request: u32, prompt: u32, decode: u32) -> AdmissionCandidate {
         AdmissionCandidate {
@@ -81,6 +81,7 @@ mod tests {
             enqueue_sequence: u64::from(request),
             prompt,
             decode,
+            prefix: PrefixInput::None,
             deadline: None,
             matched_tokens: 0,
         }
