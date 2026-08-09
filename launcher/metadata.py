@@ -6,19 +6,21 @@ Output layout (design §1.3.2):
     run log_dir: manifest.json + raw/params.json + raw/command.txt
     run subdirs: raw/ + plots/ + reports/ + payloads/ + traces/
 
-The rust binary owns everything after spawn; the launcher writes nothing more
-once the subprocess starts.
+This module finishes before spawn. Runtime stage state and completion evidence
+are written separately by ``launcher.process.journal``.
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .process import ProcessSpec, ProcessSupervisor
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
+_PROCESS_SUPERVISOR = ProcessSupervisor()
 GIT_SNAPSHOT_MAX_CHANGED_LINES_PER_FILE = 10_000
 RAW_DIR = "raw"
 PLOTS_DIR = "plots"
@@ -72,27 +74,28 @@ def save_command_log(log_dir: Path, cmd: list[str]) -> None:
 
 
 def _git(cmd: list[str]) -> str:
-    result = subprocess.run(
-        cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, cwd=REPO_ROOT
+    result = _PROCESS_SUPERVISOR.run_sync(
+        ProcessSpec(argv=cmd, cwd=REPO_ROOT, capture_output=True, name="git-metadata")
     )
-    return result.stdout.strip() if result.returncode == 0 else "N/A"
+    return result.output.strip() if result.succeeded else "N/A"
 
 
 def _git_diff_capped(max_lines: int) -> str:
     """`git diff HEAD`, skipping files whose change count exceeds `max_lines`."""
-    result = subprocess.run(
-        ["git", "diff", "--numstat", "HEAD"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        cwd=REPO_ROOT,
+    result = _PROCESS_SUPERVISOR.run_sync(
+        ProcessSpec(
+            argv=["git", "diff", "--numstat", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            name="git-numstat",
+        )
     )
-    if result.returncode != 0:
+    if not result.succeeded:
         return "N/A"
 
     included: list[str] = []
     skipped: list[tuple[str, int]] = []
-    for line in result.stdout.splitlines():
+    for line in result.output.splitlines():
         parts = line.split("\t", 2)
         if len(parts) < 3:
             continue

@@ -31,14 +31,19 @@ from pathlib import Path
 
 from .exec import (
     REPO_ROOT,
-    SimulationRunner,
     _build_subprocess_env,
     binary_path,
     cargo_build,
     run_analysis,
     run_iter_breakdown,
+    run_logged_process,
 )
 from .managed_job import prepare_managed_job
+from .process.artifacts import ArtifactValidationError, validate_timing_prediction_artifacts
+from .process.journal import RunJournal, StageState
+from .process.leases import LauncherLeases
+
+_LAUNCHER_LEASES = LauncherLeases(REPO_ROOT)
 
 
 # The simulator's offline writer uses this physical stream tag. The prediction
@@ -272,7 +277,10 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         analyzer_resource_id=prediction_id,
     )
 
+    run_directory_lease = None
     try:
+        run_directory_lease = _LAUNCHER_LEASES.run_directory(log_dir)
+        await run_directory_lease.acquire()
         if managed_job is not None:
             managed_job.report("running")
         _snapshot_inputs(config_path, cfg, log_dir)
@@ -280,12 +288,52 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
 
         binary = binary_path(build_type)
         argv = [str(binary), "timing-predict", str(config_path)]
-        runner = SimulationRunner(argv=argv, log_dir=log_dir, env=_build_subprocess_env())
-        ok = await runner.run()
-        if not ok:
+        journal = RunJournal(log_dir)
+        async with _LAUNCHER_LEASES.profile_database(write=True):
+            journal.update(
+                "timing_predict",
+                StageState.RUNNING,
+                resources=["profile-db:exclusive"],
+            )
+            try:
+                result = await run_logged_process(
+                    argv,
+                    log_dir,
+                    env=_build_subprocess_env(),
+                    name="timing_predict",
+                )
+            except asyncio.CancelledError:
+                journal.update("timing_predict", StageState.CANCELLED)
+                raise
+        if not result.succeeded:
+            journal.update(
+                "timing_predict",
+                StageState.FAILED,
+                result=result,
+                error="predictor failed or left process-group descendants",
+            )
             if managed_job is not None:
                 managed_job.report("failed")
             return False
+        journal.update("timing_predict", StageState.VALIDATING, result=result)
+        try:
+            validation = validate_timing_prediction_artifacts(log_dir)
+        except ArtifactValidationError as error:
+            journal.update(
+                "timing_predict",
+                StageState.FAILED,
+                result=result,
+                error=str(error),
+            )
+            if managed_job is not None:
+                managed_job.report("failed")
+            return False
+        journal.update(
+            "timing_predict",
+            StageState.SUCCEEDED,
+            result=result,
+            artifacts=validation.paths,
+        )
         if analyze:
             if managed_job is not None:
                 managed_job.report("analysis_running")
@@ -307,6 +355,9 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         if managed_job is not None:
             managed_job.report("failed")
         raise
+    finally:
+        if run_directory_lease is not None:
+            run_directory_lease.release()
 
 
 def main(argv: list[str]) -> int:

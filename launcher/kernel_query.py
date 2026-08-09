@@ -9,8 +9,7 @@ other launcher-owned simulator subprocesses and forwards stdin/stdout/stderr.
 from __future__ import annotations
 
 import argparse
-import subprocess
-import sys
+import os
 
 from .exec import _build_subprocess_env
 
@@ -19,16 +18,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m launcher.kernel_query")
     parser.add_argument("--simulator", required=True)
     args = parser.parse_args(argv)
-    completed = subprocess.run(
+    # This transport adds no launcher stage of its own. Replacing the process
+    # preserves stdin/stdout/stderr exactly and avoids creating an unsupervised
+    # child solely to forward bytes.
+    os.execve(
+        args.simulator,
         [args.simulator, "kernel-query"],
-        input=sys.stdin.buffer.read(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_build_subprocess_env(),
+        _build_subprocess_env(),
     )
-    sys.stdout.buffer.write(completed.stdout)
-    sys.stderr.buffer.write(completed.stderr)
-    return completed.returncode
+    raise AssertionError("os.execve returned unexpectedly")
 
 
 if __name__ == "__main__":

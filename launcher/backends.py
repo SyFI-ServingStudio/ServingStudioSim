@@ -21,7 +21,6 @@ annotation is derived from `config`.
 from __future__ import annotations
 
 import json
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +30,10 @@ import yaml
 from profiling.db.args import DType
 from profiling.db.registry import backend_supports, known_backends, supported_backends
 
-from .exec import _build_subprocess_env, binary_path
+from .exec import REPO_ROOT, _build_subprocess_env, binary_path
+from .process import ProcessSpec, ProcessSupervisor
+
+_PROCESS_SUPERVISOR = ProcessSupervisor()
 
 # describe_config tokens that are NOT geometry: the candidate set, the GPU
 # identity, the dtype columns (surfaced separately as `dtype=…`), and the
@@ -147,15 +149,18 @@ def enumerate_kernels(config: dict, build_type: str = "debug") -> list[dict]:
         stripped["io"] = io
         cfg_path = Path(td) / "emit.yaml"
         cfg_path.write_text(yaml.safe_dump(stripped, default_flow_style=False, sort_keys=False))
-        proc = subprocess.run(
-            [str(binary), "emit-backends", str(cfg_path)],
-            capture_output=True,
-            text=True,
-            env=_build_subprocess_env(),
+        result = _PROCESS_SUPERVISOR.run_sync(
+            ProcessSpec(
+                argv=[str(binary), "emit-backends", str(cfg_path)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                env=_build_subprocess_env(),
+                name="emit-backends",
+            )
         )
-    if proc.returncode != 0:
-        raise BackendEnumError(proc.stderr.strip() or "emit-backends failed")
-    return json.loads(proc.stdout)
+    if not result.succeeded:
+        raise BackendEnumError(result.output.strip() or "emit-backends failed")
+    return json.loads(result.output)
 
 
 def _merge_role_variants(variants: list[tuple[str, list[Role]]]) -> list[Role]:

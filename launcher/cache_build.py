@@ -21,12 +21,20 @@ prebuild passes; under-tagging reintroduces the contention bug).
 
 from __future__ import annotations
 
-import subprocess
+import asyncio
+import re
 from pathlib import Path
 
-from .exec import SimulationRunner, _build_subprocess_env, binary_path
+from .exec import REPO_ROOT, _build_subprocess_env, binary_path
+from .process import ProcessSpec, ProcessSupervisor
+from .process.journal import RunJournal, StageState
+from .process.leases import LauncherLeases
 from .schema import build_cli_command, log_dir_of
 from .schema.loader import Registry, iter_slots
+
+_MISSING_TOTAL = re.compile(r"total:\s+(\d+)\s+/\s+\d+\s+specs missing")
+_PROCESS_SUPERVISOR = ProcessSupervisor()
+_LAUNCHER_LEASES = LauncherLeases(REPO_ROOT)
 
 
 def cache_key(config: dict, registry: Registry) -> tuple:
@@ -68,14 +76,24 @@ def report_cache_coverage(
     binary = binary_path(build_type)
     env = _build_subprocess_env()
     rc = 0
-    for config in _unique_by_cache_key(param_sets, registry):
-        cfg_dir = _prebuild_log_dir(_cache_report_base(param_sets), config)
-        argv = build_cli_command(
-            config, binary, cfg_dir / "run_config.yaml", subcommand="dry-run"
-        )
-        result = subprocess.run(argv, env=env)
-        if result.returncode != 0:
-            rc = result.returncode
+    with _LAUNCHER_LEASES.profile_database(write=False):
+        for config in _unique_by_cache_key(param_sets, registry):
+            cfg_dir = _prebuild_log_dir(_cache_report_base(param_sets), config)
+            argv = build_cli_command(
+                config, binary, cfg_dir / "run_config.yaml", subcommand="dry-run"
+            )
+            result = _PROCESS_SUPERVISOR.run_sync(
+                ProcessSpec(
+                    argv=argv,
+                    cwd=REPO_ROOT,
+                    env=env,
+                    capture_output=True,
+                    name="cache-report",
+                )
+            )
+            print(result.output, end="" if result.output.endswith("\n") else "\n")
+            if not result.succeeded:
+                rc = result.exit_code if result.exit_code != 0 else 1
     return rc
 
 
@@ -123,12 +141,145 @@ async def prebuild_caches(
     binary = binary_path(build_type)
     env = _build_subprocess_env()
 
-    for config in _unique_by_cache_key(param_sets, registry):
-        cfg_dir = _prebuild_log_dir(base_dir, config)
-        argv = build_cli_command(
-            config, binary, cfg_dir / "run_config.yaml", subcommand="build-cache-only"
-        )
-        runner = SimulationRunner(argv=argv, log_dir=cfg_dir, env=env)
-        if not await runner.run():
-            return False
+    async with _LAUNCHER_LEASES.profile_database(write=True):
+        for config in _unique_by_cache_key(param_sets, registry):
+            cfg_dir = _prebuild_log_dir(base_dir, config)
+            config_path = cfg_dir / "run_config.yaml"
+            build_argv = build_cli_command(
+                config, binary, config_path, subcommand="build-cache-only"
+            )
+            probe_argv = [str(binary), "dry-run", str(config_path)]
+            journal = RunJournal(cfg_dir)
+
+            # Recheck under the exclusive cross-launcher lease. A second launcher
+            # waiting on the same cache observes the first launcher's committed DB
+            # rows and skips the GPU/JIT stage entirely.
+            missing_before = await _probe_missing(
+                probe_argv,
+                cfg_dir,
+                env,
+                journal,
+                "cache_probe_before",
+            )
+            if missing_before is None:
+                return False
+            if missing_before == 0:
+                journal.update(
+                    "ensure_cache",
+                    StageState.SUCCEEDED,
+                    resources=["profile-db:exclusive"],
+                )
+                continue
+
+            build_spec = ProcessSpec(
+                argv=build_argv,
+                cwd=REPO_ROOT,
+                env=env,
+                log_path=cfg_dir / "stdout.log",
+                append_log=True,
+                name="ensure_cache",
+            )
+            journal.update(
+                "ensure_cache",
+                StageState.RUNNING,
+                spec=build_spec,
+                resources=["profile-db:exclusive"],
+            )
+            try:
+                build_result = await _PROCESS_SUPERVISOR.run(build_spec)
+            except asyncio.CancelledError:
+                journal.update(
+                    "ensure_cache",
+                    StageState.CANCELLED,
+                    spec=build_spec,
+                )
+                raise
+            journal.update(
+                "ensure_cache",
+                StageState.EXITED,
+                spec=build_spec,
+                result=build_result,
+            )
+            if not build_result.succeeded:
+                journal.update(
+                    "ensure_cache",
+                    StageState.FAILED,
+                    spec=build_spec,
+                    result=build_result,
+                    error="cache builder failed or left process-group descendants",
+                )
+                return False
+
+            missing_after = await _probe_missing(
+                probe_argv,
+                cfg_dir,
+                env,
+                journal,
+                "cache_probe_after",
+            )
+            if missing_after != 0:
+                journal.update(
+                    "ensure_cache",
+                    StageState.FAILED,
+                    spec=build_spec,
+                    result=build_result,
+                    error=f"cache verification still reports {missing_after} missing specs",
+                )
+                return False
+            journal.update(
+                "ensure_cache",
+                StageState.SUCCEEDED,
+                spec=build_spec,
+                result=build_result,
+                resources=["profile-db:exclusive"],
+            )
     return True
+
+
+async def _probe_missing(
+    argv: list[str],
+    log_dir: Path,
+    env: dict[str, str],
+    journal: RunJournal,
+    stage: str,
+) -> int | None:
+    spec = ProcessSpec(
+        argv=argv,
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        name=stage,
+    )
+    journal.update(stage, StageState.RUNNING, spec=spec)
+    try:
+        result = await _PROCESS_SUPERVISOR.run(spec)
+    except asyncio.CancelledError:
+        journal.update(stage, StageState.CANCELLED, spec=spec)
+        raise
+    with (log_dir / "stdout.log").open("a", encoding="utf-8") as stream:
+        stream.write(f"\n=== {stage} ===\n")
+        stream.write(result.output)
+        if result.output and not result.output.endswith("\n"):
+            stream.write("\n")
+    if not result.succeeded:
+        journal.update(
+            stage,
+            StageState.FAILED,
+            spec=spec,
+            result=result,
+            error="cache coverage probe failed or left process-group descendants",
+        )
+        return None
+    match = _MISSING_TOTAL.search(result.output)
+    if match is None:
+        journal.update(
+            stage,
+            StageState.FAILED,
+            spec=spec,
+            result=result,
+            error="cache coverage probe did not emit a parseable total",
+        )
+        return None
+    missing = int(match.group(1))
+    journal.update(stage, StageState.SUCCEEDED, spec=spec, result=result)
+    return missing

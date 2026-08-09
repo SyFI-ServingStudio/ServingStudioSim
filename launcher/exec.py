@@ -1,12 +1,11 @@
-"""Execution engine — cargo build + schema discovery, and the async subprocess
-wrapper that runs the rust binary.
+"""Execution wiring for build, simulator, and analyzer stages.
 
 Per design §1.2.3 / §1.2.7:
 - `cargo_build` is the single shared build per batch; on success it immediately
   runs `simulator list-params` and writes `deployment_schema.json` (INV-8:
   schema discovery is part of the build, not a separate step).
-- `SimulationRunner` spawns one `run` / `build-cache-only` subprocess, streams
-  stdout to `stdout.log`, and supports cooperative `cancel()` across a sweep.
+- Every child process enters through ``ProcessSupervisor``. Output is written to
+  regular files and completion follows the reaped root PID, never pipe EOF.
 - `_build_subprocess_env` wires the PyO3-embedded interpreter (the rust binary
   embeds Python to query profile.db) — ported unchanged from the reference
   launcher, the one piece design §1.2.3 says "survives unchanged".
@@ -14,21 +13,27 @@ Per design §1.2.3 / §1.2.7:
 
 from __future__ import annotations
 
-import asyncio
 import os
 import shutil
-import subprocess
 import sys
 import sysconfig
-import tempfile
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
+
+from .process import ProcessResult, ProcessSpec, ProcessSupervisor
+from .process.artifacts import (
+    ArtifactValidationError,
+    validate_json_outputs,
+    validate_render_artifacts,
+    validate_trace_artifacts,
+)
+from .process.journal import RunJournal, StageState
+from .process.leases import LauncherLeases
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARALLELISM = 200
-_PROCESS_POLL_INTERVAL_SECONDS = 0.05
-_PROCESS_TERMINATE_GRACE_SECONDS = 1.0
+_PROCESS_SUPERVISOR = ProcessSupervisor()
+_LAUNCHER_LEASES = LauncherLeases(REPO_ROOT)
 
 
 def binary_path(build_type: str = "debug") -> Path:
@@ -149,37 +154,54 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
     elif build_type != "debug":
         cmd.extend(["--profile", build_type])
     build_env = _cargo_build_env()
-    if subprocess.run(cmd, cwd=REPO_ROOT, env=build_env).returncode != 0:
-        return False
+    with _LAUNCHER_LEASES.build(build_type):
+        build_result = _PROCESS_SUPERVISOR.run_sync(
+            ProcessSpec(argv=cmd, cwd=REPO_ROOT, env=build_env, name="build-simulator")
+        )
+        if not build_result.succeeded:
+            return False
 
-    # Schema discovery: list-params → deployment_schema.json.
-    binary = binary_path(build_type)
-    result = subprocess.run(
-        [str(binary), "list-params"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        env=_build_subprocess_env(),
-    )
-    if result.returncode != 0:
-        sys.stderr.write(f"schema discovery failed:\n{result.stderr}")
-        return False
-    schema_json_path(build_type).write_text(result.stdout)
+        # Schema discovery: list-params → deployment_schema.json.
+        binary = binary_path(build_type)
+        schema_result = _PROCESS_SUPERVISOR.run_sync(
+            ProcessSpec(
+                argv=[str(binary), "list-params"],
+                cwd=REPO_ROOT,
+                env=_build_subprocess_env(),
+                capture_output=True,
+                name="discover-schema",
+            )
+        )
+        if not schema_result.succeeded:
+            sys.stderr.write(f"schema discovery failed:\n{schema_result.output}")
+            return False
+        schema_path = schema_json_path(build_type)
+        temporary_schema = schema_path.with_name(
+            f".{schema_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            temporary_schema.write_text(schema_result.output)
+            os.replace(temporary_schema, schema_path)
+        finally:
+            temporary_schema.unlink(missing_ok=True)
 
-    if not build_analyzer:
+        if not build_analyzer:
+            return True
+
+        # The analyzer is a standalone workspace crate (not a sim dep), so the
+        # build above doesn't produce it. It remains best-effort.
+        analyzer_cmd = _analyzer_build_command(build_type)
+        analyzer_result = _PROCESS_SUPERVISOR.run_sync(
+            ProcessSpec(
+                argv=analyzer_cmd,
+                cwd=REPO_ROOT,
+                env=build_env,
+                name="build-analyzer",
+            )
+        )
+        if not analyzer_result.succeeded:
+            sys.stderr.write("[warn] analyzer build failed; runs will skip post-run analysis\n")
         return True
-
-    # The analyzer is a standalone workspace crate (not a sim dep), so the build
-    # above doesn't produce it — build it explicitly. Best-effort: a missing
-    # analyzer must not block runs (the post-run analysis step is also optional).
-    analyzer_cmd = ["cargo", "build", "-p", "analyzer"]
-    if build_type == "release":
-        analyzer_cmd.append("--release")
-    elif build_type != "debug":
-        analyzer_cmd.extend(["--profile", build_type])
-    if subprocess.run(analyzer_cmd, cwd=REPO_ROOT, env=build_env).returncode != 0:
-        sys.stderr.write("[warn] analyzer build failed; runs will skip post-run analysis\n")
-    return True
 
 
 def cargo_build_analyzer(build_type: str = "debug") -> bool:
@@ -190,89 +212,73 @@ def cargo_build_analyzer(build_type: str = "debug") -> bool:
     boundary separate means `alignment analyze` cannot be blocked by unrelated
     simulator source drift.
     """
+    analyzer_cmd = _analyzer_build_command(build_type)
+
+    with _LAUNCHER_LEASES.build(build_type):
+        return _PROCESS_SUPERVISOR.run_sync(
+            ProcessSpec(
+                argv=analyzer_cmd,
+                cwd=REPO_ROOT,
+                env=_cargo_build_env(),
+                name="build-analyzer",
+            )
+        ).succeeded
+
+
+def _analyzer_build_command(build_type: str) -> list[str]:
     analyzer_cmd = ["cargo", "build", "-p", "analyzer"]
     if build_type == "release":
         analyzer_cmd.append("--release")
     elif build_type != "debug":
         analyzer_cmd.extend(["--profile", build_type])
-    return subprocess.run(
-        analyzer_cmd,
-        cwd=REPO_ROOT,
-        env=_cargo_build_env(),
-    ).returncode == 0
+    return analyzer_cmd
 
 
 async def _run_capture(argv: list[str]) -> tuple[int, str]:
-    """Run one analysis stage without asyncio's subprocess transport.
+    """Capture through a regular temp file under the shared supervisor."""
 
-    Analysis stages run concurrently across a sweep, and the renderer forks its
-    own process pool. Capturing those stages through ``asyncio`` pipes makes
-    completion depend on both pipe EOF and child-watcher delivery; either can
-    leave the launcher waiting after the child has already produced its artifact.
-
-    Spawn on the event-loop thread, capture into an anonymous temporary file
-    (``tempfile`` honors ``TMPDIR``), and poll the concrete PID instead. Polling
-    keeps other sweep runs moving without introducing a worker-thread fork.
-    """
-    with tempfile.TemporaryFile(prefix="vibesim-analysis-") as capture_file:
-        process = subprocess.Popen(
-            argv,
-            cwd=REPO_ROOT,
-            stdout=capture_file,
-            stderr=subprocess.STDOUT,
-        )
-        try:
-            while process.poll() is None:
-                await asyncio.sleep(_PROCESS_POLL_INTERVAL_SECONDS)
-        except asyncio.CancelledError:
-            await _terminate_process(process)
-            raise
-
-        capture_file.seek(0)
-        output = capture_file.read().decode(errors="replace")
-    return process.returncode, output
-
-
-async def _terminate_process(process: subprocess.Popen[bytes]) -> None:
-    """Bound cancellation cleanup without blocking the launcher's event loop."""
-    if process.poll() is not None:
-        return
-    try:
-        process.terminate()
-    except ProcessLookupError:
-        process.poll()
-        return
-    deadline = asyncio.get_running_loop().time() + _PROCESS_TERMINATE_GRACE_SECONDS
-    while process.poll() is None and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(_PROCESS_POLL_INTERVAL_SECONDS)
-    if process.poll() is None:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            process.poll()
-            return
-        while process.poll() is None:
-            await asyncio.sleep(_PROCESS_POLL_INTERVAL_SECONDS)
+    result = await _PROCESS_SUPERVISOR.run(
+        ProcessSpec(argv=argv, cwd=REPO_ROOT, capture_output=True, name="capture")
+    )
+    return _effective_exit_code(result), result.output
 
 
 def _run_capture_sync(argv: list[str]) -> tuple[int, str]:
-    """Run one sequential launcher stage and capture its combined output.
+    """Synchronous capture through the same root-PID completion contract."""
 
-    Alignment analysis is a one-shot compute -> render pipeline, not a sweep.
-    Keep it outside the async subprocess machinery: the renderer creates its own
-    process pool, and nesting that pool under ``asyncio`` pipe/child-watcher
-    bookkeeping can leave the one-shot CLI waiting after every child has exited.
-    Simulation sweeps continue to use :func:`_run_capture` and
-    :class:`SimulationRunner` for their required concurrency.
-    """
-    result = subprocess.run(
-        argv,
-        cwd=REPO_ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
+    result = _PROCESS_SUPERVISOR.run_sync(
+        ProcessSpec(argv=argv, cwd=REPO_ROOT, capture_output=True, name="capture")
     )
-    return result.returncode, result.stdout.decode(errors="replace")
+    return _effective_exit_code(result), result.output
+
+
+def _effective_exit_code(result: ProcessResult) -> int:
+    if result.succeeded:
+        return 0
+    return result.exit_code if result.exit_code != 0 else 1
+
+
+async def run_logged_process(
+    argv: list[str],
+    log_dir: Path,
+    *,
+    env: dict[str, str] | None = None,
+    name: str,
+    append_log: bool = False,
+) -> ProcessResult:
+    """Run a stage with combined output written directly to ``stdout.log``."""
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return await _PROCESS_SUPERVISOR.run(
+        ProcessSpec(
+            argv=argv,
+            cwd=REPO_ROOT,
+            env=env,
+            log_path=log_dir / "stdout.log",
+            append_log=append_log,
+            name=name,
+        )
+    )
 
 
 async def run_analysis(
@@ -295,6 +301,7 @@ async def run_analysis(
     labeled section, keeping the full run record in one file."""
     analyzer = analyzer_binary_path(build_type)
     stdout_log = log_dir / "stdout.log"
+    journal = RunJournal(log_dir)
 
     def _append(section: str, text: str, elapsed_ms: float) -> None:
         # Stamp each stage's wall time in the section header. `analyze run` also
@@ -306,11 +313,60 @@ async def run_analysis(
             if text and not text.endswith("\n"):
                 fh.write("\n")
 
-    async def _timed_step(section: str, argv: list[str]) -> int:
+    async def _timed_step(
+        stage: str,
+        section: str,
+        argv: list[str],
+        validate_artifacts=None,
+    ) -> int:
+        spec = ProcessSpec(
+            argv=argv,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            name=stage,
+        )
+        journal.update(stage, StageState.RUNNING, spec=spec)
         t0 = time.perf_counter()
-        rc, out = await _run_capture(argv)
-        _append(section, out, (time.perf_counter() - t0) * 1e3)
-        return rc
+        try:
+            result = await _PROCESS_SUPERVISOR.run(spec)
+        except BaseException:
+            journal.update(stage, StageState.CANCELLED, spec=spec)
+            raise
+        _append(section, result.output, (time.perf_counter() - t0) * 1e3)
+        journal.update(stage, StageState.EXITED, spec=spec, result=result)
+        if not result.succeeded:
+            journal.update(
+                stage,
+                StageState.FAILED,
+                spec=spec,
+                result=result,
+                error="process failed or left process-group descendants",
+            )
+            return _effective_exit_code(result)
+        if validate_artifacts is not None:
+            journal.update(stage, StageState.VALIDATING, spec=spec, result=result)
+            try:
+                validation = validate_artifacts()
+            except ArtifactValidationError as error:
+                journal.update(
+                    stage,
+                    StageState.FAILED,
+                    spec=spec,
+                    result=result,
+                    error=str(error),
+                )
+                _append(f"{section} artifact validation", str(error), 0.0)
+                return 1
+            journal.update(
+                stage,
+                StageState.SUCCEEDED,
+                spec=spec,
+                result=result,
+                artifacts=validation.paths,
+            )
+        else:
+            journal.update(stage, StageState.SUCCEEDED, spec=spec, result=result)
+        return 0
 
     if not analyzer.exists():
         print(f"[analyze] {analyzer} not built; skipping analysis for {log_dir}")
@@ -318,11 +374,20 @@ async def run_analysis(
     subjects = subjects or []
     # The analyzer owns variant completeness: a normal invocation generates both
     # unlocked and batch-locked optimality in one timing/report transaction.
-    if await _timed_step("analyze compute", [str(analyzer), "run", str(log_dir), *subjects]) != 0:
+    if (
+        await _timed_step(
+            "analyze_compute",
+            "analyze compute",
+            [str(analyzer), "run", str(log_dir), *subjects],
+            lambda: validate_json_outputs(log_dir / "reports"),
+        )
+        != 0
+    ):
         print(f"[analyze] compute failed for {log_dir}")
         return
     if (
         await _timed_step(
+            "render",
             "analyze render",
             [
                 sys.executable,
@@ -331,6 +396,7 @@ async def run_analysis(
                 str(log_dir),
                 *subjects,
             ],
+            lambda: validate_render_artifacts(log_dir),
         )
         != 0
     ):
@@ -340,7 +406,15 @@ async def run_analysis(
     # A standalone verb, not a subject (different output contract: a binary trace
     # for ui.perfetto.dev, not report/payload JSON), so it runs here with CLI
     # defaults rather than through the subject catalog. Best-effort like the rest.
-    if await _timed_step("analyze trace", [str(analyzer), "trace", str(log_dir)]) != 0:
+    if (
+        await _timed_step(
+            "trace",
+            "analyze trace",
+            [str(analyzer), "trace", str(log_dir)],
+            lambda: validate_trace_artifacts(log_dir),
+        )
+        != 0
+    ):
         print(f"[analyze] trace failed for {log_dir}")
 
 
@@ -472,36 +546,3 @@ async def run_iter_breakdown(log_dir: Path, build_type: str = "debug") -> None:
                 fh.write("\n")
     if rc != 0:
         print(f"[analyze] gen-iter-breakdown failed for {log_dir}:\n{out}")
-
-
-@dataclass
-class SimulationRunner:
-    """One subprocess run. `argv` comes from `schema.build_cli_command`."""
-
-    argv: list[str]
-    log_dir: Path
-    env: dict[str, str] = field(default_factory=_build_subprocess_env)
-    _proc: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
-
-    async def run(self) -> bool:
-        """Spawn, stream stdout/stderr to `stdout.log`, return success."""
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        stdout_log = self.log_dir / "stdout.log"
-        self._proc = await asyncio.create_subprocess_exec(
-            *self.argv,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=REPO_ROOT,
-            env=self.env,
-        )
-        assert self._proc.stdout is not None
-        with stdout_log.open("w") as fh:
-            async for line_bytes in self._proc.stdout:
-                fh.write(line_bytes.decode(errors="replace"))
-                fh.flush()
-        return await self._proc.wait() == 0
-
-    def cancel(self) -> None:
-        if self._proc and self._proc.returncode is None:
-            self._proc.kill()

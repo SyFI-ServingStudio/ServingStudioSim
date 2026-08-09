@@ -21,13 +21,15 @@ import yaml
 from launcher import metadata
 from launcher.cache_build import cache_key
 from launcher.exec import (
-    SimulationRunner,
     _build_subprocess_env,
     _cargo_build_env,
     _run_capture,
     binary_path,
     run_analysis,
+    run_logged_process,
 )
+from launcher.process import ProcessResult
+from launcher.process.artifacts import ArtifactValidation
 from launcher.schema import (
     _format_log_dir,
     build_cli_command,
@@ -202,12 +204,28 @@ def test_run_analysis_delegates_both_optimality_modes_to_analyzer(monkeypatch, t
     (log_dir / "stdout.log").write_text("")
     captured_commands: list[list[str]] = []
 
-    async def capture_command(command):
-        captured_commands.append([str(argument) for argument in command])
-        return 0, ""
+    async def supervise(spec):
+        command = [str(argument) for argument in spec.argv]
+        captured_commands.append(command)
+        return ProcessResult(
+            argv=tuple(command),
+            pid=1,
+            process_group_id=1,
+            exit_code=0,
+            elapsed_seconds=0.0,
+        )
 
     monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
-    monkeypatch.setattr("launcher.exec._run_capture", capture_command)
+    monkeypatch.setattr("launcher.exec._PROCESS_SUPERVISOR.run", supervise)
+    monkeypatch.setattr(
+        "launcher.exec.validate_json_outputs", lambda _path: ArtifactValidation(())
+    )
+    monkeypatch.setattr(
+        "launcher.exec.validate_render_artifacts", lambda _path: ArtifactValidation(())
+    )
+    monkeypatch.setattr(
+        "launcher.exec.validate_trace_artifacts", lambda _path: ArtifactValidation(())
+    )
 
     asyncio.run(run_analysis(log_dir, subjects=["optimality"]))
 
@@ -1503,7 +1521,7 @@ def test_cargo_build_env_pins_launcher_python_and_drops_runtime_paths(
     assert "PYTHONPATH" not in env
 
 
-def test_simulation_runner_captures_stdout(tmp_path):
+def test_logged_process_captures_stdout(tmp_path):
     binary = binary_path("debug")
     if not binary.is_file():
         pytest.skip("simulator not built")
@@ -1547,26 +1565,36 @@ def test_simulation_runner_captures_stdout(tmp_path):
         )
     )
     argv = [str(binary), "run", str(cfg)]
-    runner = SimulationRunner(argv=argv, log_dir=tmp_path, env=_build_subprocess_env())
-    ok = asyncio.run(runner.run())
-    assert ok is False
+    result = asyncio.run(
+        run_logged_process(
+            argv,
+            tmp_path,
+            env=_build_subprocess_env(),
+            name="test-simulator",
+        )
+    )
+    assert result.succeeded is False
     assert (tmp_path / "stdout.log").read_text().strip()
 
 
 # ── resume / --refresh (.complete marker, INV-5) ────────────────────────────
 
 
-def test_complete_marker_roundtrip(tmp_path):
+def test_complete_marker_requires_validated_artifacts(tmp_path):
     assert not _is_complete(tmp_path)
     _mark_complete(tmp_path)
-    assert _is_complete(tmp_path)
     assert (tmp_path / COMPLETE_MARKER).is_file()
+    assert not _is_complete(tmp_path)
 
 
-def test_resume_skips_completed_run(tmp_path, schema):
+def test_resume_skips_completed_run(tmp_path, schema, monkeypatch):
     log_dir = tmp_path / "run"
     log_dir.mkdir()
     _mark_complete(log_dir)
+    monkeypatch.setattr(
+        "launcher.sweep.validate_simulation_artifacts",
+        lambda _log_dir: ArtifactValidation(()),
+    )
     params = normalize_params(_base(log_dir=str(log_dir)), schema)
     assert asyncio.run(_run_single_async(params, None, schema, "debug")) is True
 
@@ -1594,6 +1622,35 @@ def test_failed_run_leaves_no_marker(tmp_path, schema):
     # No trace file on disk → run fails; marker must not be written.
     assert asyncio.run(_launch_one(params, "debug")) is False
     assert not _is_complete(log_dir)
+
+
+def test_zero_exit_without_required_artifacts_fails_stage(
+    tmp_path, schema, monkeypatch
+):
+    log_dir = tmp_path / "run"
+    params = normalize_params(_base(log_dir=str(log_dir)), schema)
+
+    async def successful_process_without_artifacts(*_arguments, **_keyword_arguments):
+        return ProcessResult(
+            argv=("simulator", "run"),
+            pid=123,
+            process_group_id=123,
+            exit_code=0,
+            elapsed_seconds=0.01,
+        )
+
+    monkeypatch.setattr(
+        "launcher.sweep.run_logged_process",
+        successful_process_without_artifacts,
+    )
+
+    assert asyncio.run(_launch_one(params, "debug", analyze=False)) is False
+    stage = json.loads(
+        (log_dir / ".launcher/stages/validate_raw_artifacts.json").read_text()
+    )
+    assert stage["state"] == "FAILED"
+    assert "summary.json" in stage["error"]
+    assert not (log_dir / COMPLETE_MARKER).exists()
 
 
 # ── --override parsing (dotted-path into the tree) ──────────────────────────

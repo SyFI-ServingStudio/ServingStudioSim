@@ -62,14 +62,26 @@ schema/        The single source of param truth on the Python side. Per-param
   argv.py        Concrete config tree → config file on disk + [binary, sub, path].
 
 exec.py        cargo_build (+ schema discovery, INV-8), the PyO3 subprocess env,
-               async `SimulationRunner`, `run_analysis`, and the measured-profile
+               supervised stage adapters, `run_analysis`, and the measured-profile
                `run_alignment_analysis` handoff.
 sweep.py       Top-level flow: `run_single` / `run_sweep`. Resume markers,
-               parallel launch under a semaphore, sweep-axis aggregation contract.
+               resource-scheduled parallel launch, sweep-axis aggregation contract.
 cache_build.py Prebuild profile.db per unique cache key, sequentially (INV-3),
                so parallel runs don't race the GPU / SQLite. `--cache-report`.
 metadata.py    Repro metadata written BEFORE spawn (INV-2): preset.json,
                git_snapshot/, raw/params.json, command.txt, manifest.json.
+
+process/       The only child-process lifecycle implementation.
+  spec.py        Typed process input/result; root exit is distinct from stage success.
+  supervisor.py  New-session spawn, pidfd root wait, process-group cancellation,
+                 regular-file output, leaked-descendant detection.
+  leases.py      Cross-launcher shared/exclusive resource leases (`flock`).
+  journal.py     Atomic `.launcher/` stage state and process identity records.
+  artifacts.py   JSON/parquet/render/trace completion contracts.
+
+workflow/      Explicit stage topology and in-process resource scheduling.
+  plan.py        Stage DAG; `--no-analyze` removes optional analysis nodes.
+  scheduler.py   Separate simulation and analysis concurrency budgets.
 ```
 
 ## The pipeline (one batch, start to finish)
@@ -90,15 +102,73 @@ metadata.py    Repro metadata written BEFORE spawn (INV-2): preset.json,
    (`validate_unique_log_dirs`).
 5. **Branch:** `--dry-run` prints the expanded configs and stops; `--cache-report`
    probes coverage and stops; otherwise hand off to `sweep`.
-6. **Run** (`sweep.run_single` / `run_sweep`): prebuild caches → write metadata →
-   spawn the binary → mark `.complete` → best-effort analyze. A sweep does this
-   across many configs in parallel under a semaphore.
+6. **Run** (`sweep.run_single` / `run_sweep`): ensure cache → simulate → validate
+   raw artifacts → optional analyzer compute/render/trace → finalize. A sweep
+   schedules simulations and analysis independently instead of making one
+   semaphore own every kind of work.
 
-Per-run analysis keeps that cross-run concurrency without using asyncio's
-subprocess pipe/child-watcher transport: each stage captures into an anonymous
-temporary file and polls its concrete PID. This is required because the Python
-renderer forks its own process pool; completion must not depend on pipe EOF or a
-child-watcher callback after the analyzer has already written its artifact.
+### Process and stage completion
+
+Every launcher-owned child enters through `process.ProcessSupervisor`; there is
+no simulator-specific runner or analyzer-specific reaper. One stage gets one new
+session/process group. Its stdin is `/dev/null` unless explicit bytes are supplied,
+and combined output is inherited or written directly to a regular file. A pipe is
+never the stage's output sink.
+
+The completion terms are intentionally separate:
+
+1. **Process exited:** the root PID became readable through Linux `pidfd` and was
+   reaped (a centralized root-PID poll is the portability fallback).
+2. **Process group settled:** no descendant remains in the stage's process group.
+   A remaining descendant is terminated and makes the stage fail, even when the
+   root returned zero.
+3. **Stage succeeded:** root exit zero, no leaked descendant, and the stage's
+   artifact contract passes.
+4. **Run completed:** every required stage succeeded and `Finalize` atomically
+   wrote `.complete`. Analyzer stages remain best-effort, but their own journal
+   records still say `SUCCEEDED` or `FAILED` truthfully.
+
+This makes a renderer grandchild inheriting stdout harmless to root completion,
+while still detecting that the child tree did not shut down cleanly. Cancellation
+and timeout send `SIGTERM` to the entire process group, then bounded `SIGKILL`.
+
+### Stage graph, resources, and crash state
+
+The per-run graph is
+
+```text
+EnsureCache → Simulate → ValidateRawArtifacts
+                              ├→ AnalyzeCompute → Render
+                              └→ AnalyzeCompute → Trace
+                                      Render + Trace → Finalize
+```
+
+`--no-analyze` removes `AnalyzeCompute`, `Render`, and `Trace`, after which
+`ValidateRawArtifacts → Finalize`. BuildSimulator and BuildAnalyzer are batch
+stages before this per-run graph.
+
+Two concurrency mechanisms have different ownership:
+
+| Resource | Lease | Meaning |
+|---|---|---|
+| Cargo target | exclusive | all build profiles share one target/build lease |
+| `profiling/profile.db` | exclusive for cache/predict, shared for simulation | no JIT/SQLite writer races; warm simulations may overlap |
+| concrete `log_dir` | exclusive | two launcher instances never write one run concurrently |
+| simulation slot | in-process semaphore | bounds active simulator roots |
+| analysis slot | independent in-process semaphore | renderer/trace load does not consume simulation capacity |
+
+Cross-launcher leases use `fcntl.flock`; lock-file presence is never treated as
+ownership, so kernel cleanup after a crash is authoritative. Per-holder JSON is
+diagnostic only. Cache prebuild re-runs the read-only missing-row probe *after*
+acquiring the exclusive DB lease; a waiting launcher skips `build-cache-only` if
+the first launcher has already filled the rows.
+
+Each run persists `.launcher/run_state.json` plus
+`.launcher/stages/<stage>.json` using same-filesystem temp+replace. A stage record
+contains attempt/state timestamps, launcher PID/host, root PID/PGID, argv,
+resources, exit code, descendant-leak flag, validated artifacts, and an error.
+States are `PENDING`, `WAITING_RESOURCE`, `RUNNING`, `EXITED`, `VALIDATING`,
+`SUCCEEDED`, `FAILED`, or `CANCELLED`.
 
 ## Preset shape (matches the code, not the old flat format)
 
@@ -444,8 +514,12 @@ this needs `min` / `max` on the Rust-owned ParamDef; not currently modeled.
 
 A cache-miss run JIT-profiles a kernel and writes `profile.db`; N parallel runs
 sharing a missing key would race the GPU (wrong timings) and the SQLite writer
-(lock errors). So before any parallel launch, `cache_build.prebuild_caches` runs
-`build-cache-only` **once per unique cache key, sequentially** (INV-3).
+(lock errors). So before any parallel launch, `cache_build.prebuild_caches`
+handles every unique key **sequentially under the cross-launcher exclusive DB
+lease** (INV-3). For each key it runs `dry-run`; only a non-zero missing count
+runs `build-cache-only`, followed by a second `dry-run` that must report zero.
+This is both the artifact contract for cache construction and the cross-process
+singleflight check.
 
 **Which params form the key is Rust-authoritative**: `cache_key` walks the tree
 and collects every leaf whose ParamDef is tagged `affects_cache`. Runs differing
@@ -455,14 +529,16 @@ without building anything.
 
 ## Resume & output layout
 
-- **Resume (default):** a zero-exit run writes a `.complete` marker into its
-  `log_dir`; re-invoking the same preset skips runs already marked complete (a
-  crash leaves no marker → retried). `--refresh` re-runs everything. Aggregation
-  still spans the whole sweep.
+- **Resume (default):** `.complete` is only a finalize commit, not proof by
+  presence. Resume also parses `summary.json` and `raw/run_meta.json`, and checks
+  the applicable request parquet schemas. Missing, truncated, or incompatible
+  artifacts make the run pending again. `--refresh` re-runs everything.
+  Aggregation still spans the whole sweep.
 - **Metadata before spawn (INV-2):** so a crashed run still has triage info.
   Single run → `<log_dir>/` with `preset.json`, `git_snapshot/`, `manifest.json`,
   `raw/{params.json,command.txt,run_config.yaml}`, the buckets `raw/ plots/
-  reports/ payloads/ traces/`, `stdout.log`, and the `.complete` marker. Sweep →
+  reports/ payloads/ traces/`, `stdout.log`, `.launcher/`, and the `.complete`
+  marker. Sweep →
   an experiment root holding the shared `preset.json` / `git_snapshot/` and one
   subdir per run (run subdirs carry only run-specific files, no repeated copies).
 

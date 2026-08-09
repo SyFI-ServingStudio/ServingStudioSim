@@ -15,6 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import tempfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -22,33 +26,68 @@ from . import metadata
 from .cache_build import prebuild_caches
 from .exec import (
     DEFAULT_PARALLELISM,
-    SimulationRunner,
     _build_subprocess_env,
     _profile_env,
     binary_path,
     run_analysis,
+    run_logged_process,
     run_sweep_analysis,
     wrap_with_perf,
 )
 from .managed_run import ManagedRun, managed_analysis_subjects, prepare_experiment
+from .process import ProcessSpec
+from .process.artifacts import ArtifactValidationError, validate_simulation_artifacts
+from .process.journal import RunJournal, StageState
+from .process.leases import LauncherLeases
 from .schema import build_cli_command, log_dir_of, validate_unique_log_dirs
 from .schema.loader import Registry
+from .workflow import ResourceScheduler, StageKind, simulation_workflow
 
 # Resume marker (INV-5): the launcher writes this into a run's log_dir only
 # after a zero-exit run. On the default resume path a run whose log_dir already
 # carries it is skipped; `--refresh` ignores it and re-runs.
 COMPLETE_MARKER = ".complete"
+_LAUNCHER_LEASES = LauncherLeases(Path(__file__).resolve().parents[1])
 
 
 # ── shared helpers (resume markers) ─────────────────────────────────────────
 
 
 def _is_complete(log_dir: Path) -> bool:
-    return (log_dir / COMPLETE_MARKER).is_file()
+    if not (log_dir / COMPLETE_MARKER).is_file():
+        return False
+    try:
+        validate_simulation_artifacts(log_dir)
+    except ArtifactValidationError:
+        return False
+    return True
 
 
 def _mark_complete(log_dir: Path) -> None:
-    (log_dir / COMPLETE_MARKER).write_text(datetime.now(UTC).isoformat() + "\n")
+    marker = log_dir / COMPLETE_MARKER
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{COMPLETE_MARKER}.", suffix=".tmp", dir=log_dir
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(datetime.now(UTC).isoformat() + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, marker)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+@asynccontextmanager
+async def _run_directory_lease(
+    log_dir: Path, already_held: bool
+) -> AsyncIterator[None]:
+    if already_held:
+        yield
+        return
+    async with _LAUNCHER_LEASES.run_directory(log_dir):
+        yield
 
 
 async def _launch_one(
@@ -60,6 +99,8 @@ async def _launch_one(
     analyze: bool = True,
     analyze_subjects: list[str] | None = None,
     managed_run: ManagedRun | None = None,
+    scheduler: ResourceScheduler | None = None,
+    run_directory_lease_held: bool = False,
 ) -> bool:
     """Metadata-then-spawn for a single (already normalized) param set. On resume
     (the default) a run whose log_dir already has a `.complete` marker is skipped;
@@ -74,44 +115,129 @@ async def _launch_one(
     a successful run; best-effort, so analysis failures never fail the run.
     `analyze_subjects` narrows which subjects run (None/empty = all applicable)."""
     log_dir = Path(log_dir_of(params))
+    scheduler = scheduler or ResourceScheduler(1)
+    workflow = simulation_workflow(analyze=analyze)
+    journal = RunJournal(log_dir)
 
-    if not refresh and _is_complete(log_dir):
-        print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
-        return True
+    async with _run_directory_lease(log_dir, run_directory_lease_held):
+        if not refresh and _is_complete(log_dir):
+            print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
+            return True
+        journal.begin_attempts(
+            [
+                node.kind.value
+                for node in workflow.nodes
+                if node.kind != StageKind.ENSURE_CACHE
+            ]
+        )
 
-    binary = binary_path(build_type)
-    # The concrete config the binary reads lives alongside the run's metadata.
-    argv = build_cli_command(
-        params, binary, metadata.raw_dir(log_dir) / "run_config.yaml", subcommand="run"
-    )
+        binary = binary_path(build_type)
+        # The concrete config the binary reads lives alongside the run's metadata.
+        argv = build_cli_command(
+            params, binary, metadata.raw_dir(log_dir) / "run_config.yaml", subcommand="run"
+        )
 
-    # INV-2: all metadata lands before the subprocess starts (record the bare run
-    # argv, before any perf wrapping, so metadata reflects the simulated run).
-    metadata.write_run_metadata(log_dir, params, argv)
-    # Clear any stale marker so a crash mid-run never leaves a false 'complete'.
-    (log_dir / COMPLETE_MARKER).unlink(missing_ok=True)
+        # INV-2: all metadata lands before the subprocess starts (record the bare
+        # run argv, before any perf wrapping).
+        metadata.write_run_metadata(log_dir, params, argv)
+        (log_dir / COMPLETE_MARKER).unlink(missing_ok=True)
 
-    env = _build_subprocess_env()
-    if profile:
-        # perf runs with cwd=REPO_ROOT, so write to an absolute path.
-        perf_data = log_dir.resolve() / "perf.data"
-        argv = wrap_with_perf(argv, perf_data, profile_freq)
-        env = _profile_env()
+        env = _build_subprocess_env()
+        if profile:
+            perf_data = log_dir.resolve() / "perf.data"
+            argv = wrap_with_perf(argv, perf_data, profile_freq)
+            env = _profile_env()
 
-    runner = SimulationRunner(argv=argv, log_dir=log_dir, env=env)
-    ok = await runner.run()
-    if ok:
-        _mark_complete(log_dir)
+        simulate_spec = ProcessSpec(
+            argv=argv,
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            log_path=log_dir / "stdout.log",
+            name=StageKind.SIMULATE.value,
+        )
+        journal.update(
+            StageKind.SIMULATE.value,
+            StageState.WAITING_RESOURCE,
+            spec=simulate_spec,
+            resources=["simulation-slot", "profile-db:shared"],
+        )
+        async with scheduler.simulation_slot():
+            async with _LAUNCHER_LEASES.profile_database(write=False):
+                journal.update(
+                    StageKind.SIMULATE.value,
+                    StageState.RUNNING,
+                    spec=simulate_spec,
+                    resources=["simulation-slot", "profile-db:shared"],
+                )
+                try:
+                    result = await run_logged_process(
+                        argv,
+                        log_dir,
+                        env=env,
+                        name=StageKind.SIMULATE.value,
+                    )
+                except asyncio.CancelledError:
+                    journal.update(
+                        StageKind.SIMULATE.value,
+                        StageState.CANCELLED,
+                        spec=simulate_spec,
+                    )
+                    raise
+        journal.update(
+            StageKind.SIMULATE.value,
+            StageState.EXITED,
+            spec=simulate_spec,
+            result=result,
+        )
+        if not result.succeeded:
+            journal.update(
+                StageKind.SIMULATE.value,
+                StageState.FAILED,
+                spec=simulate_spec,
+                result=result,
+                error="simulator failed or left process-group descendants",
+            )
+            return False
+        journal.update(
+            StageKind.SIMULATE.value,
+            StageState.SUCCEEDED,
+            spec=simulate_spec,
+            result=result,
+        )
+
+        validation_stage = StageKind.VALIDATE_RAW_ARTIFACTS.value
+        journal.update(validation_stage, StageState.VALIDATING)
+        try:
+            validation = validate_simulation_artifacts(log_dir)
+        except ArtifactValidationError as error:
+            journal.update(validation_stage, StageState.FAILED, error=str(error))
+            with (log_dir / "stdout.log").open("a", encoding="utf-8") as stream:
+                stream.write(f"\n=== artifact validation failed ===\n{error}\n")
+            return False
+        journal.update(
+            validation_stage,
+            StageState.SUCCEEDED,
+            artifacts=validation.paths,
+        )
+
         if profile:
             print(
                 f"[profile] wrote {log_dir.resolve() / 'perf.data'} — read with "
                 f"`perf report -i {log_dir.resolve() / 'perf.data'} --stdio` (not cat)"
             )
-        if analyze:
+        if workflow.contains(StageKind.ANALYZE_COMPUTE):
             if managed_run is not None:
                 managed_run.report("analysis_running")
-            await run_analysis(log_dir, build_type, analyze_subjects)
-    return ok
+            async with scheduler.analysis_slot():
+                await run_analysis(log_dir, build_type, analyze_subjects)
+
+        _mark_complete(log_dir)
+        journal.update(
+            StageKind.FINALIZE.value,
+            StageState.SUCCEEDED,
+            artifacts=[log_dir / COMPLETE_MARKER],
+        )
+        return True
 
 
 # ── single-run flow ──────────────────────────────────────────────────────────
@@ -163,14 +289,17 @@ async def _run_single_async(
     analyze_subjects: list[str] | None = None,
 ) -> bool:
     log_dir = Path(log_dir_of(params))
-    managed_run = prepare_experiment(log_dir, run_count=1, axes=[])
-    analyze_subjects = managed_analysis_subjects(managed_run, analyze_subjects)
-    if not refresh and _is_complete(log_dir):
-        print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
-        if managed_run is not None:
-            managed_run.report("ready")
-        return True
+    run_directory_lease = _LAUNCHER_LEASES.run_directory(log_dir)
+    managed_run = None
+    await run_directory_lease.acquire()
     try:
+        managed_run = prepare_experiment(log_dir, run_count=1, axes=[])
+        analyze_subjects = managed_analysis_subjects(managed_run, analyze_subjects)
+        if not refresh and _is_complete(log_dir):
+            print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
+            if managed_run is not None:
+                managed_run.report("ready")
+            return True
         if managed_run is not None:
             managed_run.report("running")
         metadata.write_shared_metadata(log_dir, preset or params)
@@ -178,6 +307,11 @@ async def _run_single_async(
             if managed_run is not None:
                 managed_run.report("failed")
             return False
+        RunJournal(log_dir).update(
+            StageKind.ENSURE_CACHE.value,
+            StageState.SUCCEEDED,
+            resources=["profile-db:exclusive"],
+        )
         ok = await _launch_one(
             params,
             build_type,
@@ -187,6 +321,8 @@ async def _run_single_async(
             analyze,
             analyze_subjects,
             managed_run,
+            ResourceScheduler(1),
+            True,
         )
         if managed_run is not None:
             managed_run.report("ready" if ok else "failed")
@@ -195,6 +331,8 @@ async def _run_single_async(
         if managed_run is not None:
             managed_run.report("interrupted")
         raise
+    finally:
+        run_directory_lease.release()
 
 
 # ── sweep flow ─────────────────────────────────────────────────────────────
@@ -247,40 +385,53 @@ async def _run_sweep_async(
 
     base_dir = _experiment_root(param_sets)
     axes = _sweep_axes(param_sets)
-    managed_run = prepare_experiment(
-        base_dir,
-        run_count=len(param_sets),
-        axes=axes,
-    )
-    analyze_subjects = managed_analysis_subjects(managed_run, analyze_subjects)
-    if managed_run is not None:
-        managed_run.report("running")
-    sweep_manifest_path = _write_sweep_manifest(param_sets, base_dir)
-    metadata.write_shared_metadata(base_dir, original_preset)
-
-    # Resume (default): only prebuild + launch runs that aren't already complete.
-    # `--refresh` re-runs everything. Aggregation still spans all runs so the
-    # summary covers previously-completed ones too.
-    if refresh:
-        pending = param_sets
-    else:
-        pending = [p for p in param_sets if not _is_complete(Path(log_dir_of(p)))]
-    skipped = len(param_sets) - len(pending)
-    if skipped:
-        print(
-            f"[resume] {skipped} run(s) already complete; {len(pending)} to run "
-            "(use --refresh to force all)"
+    experiment_directory_lease = _LAUNCHER_LEASES.run_directory(base_dir)
+    await experiment_directory_lease.acquire()
+    try:
+        managed_run = prepare_experiment(
+            base_dir,
+            run_count=len(param_sets),
+            axes=axes,
         )
+        analyze_subjects = managed_analysis_subjects(managed_run, analyze_subjects)
+        if managed_run is not None:
+            managed_run.report("running")
+        sweep_manifest_path = _write_sweep_manifest(param_sets, base_dir)
+        metadata.write_shared_metadata(base_dir, original_preset)
 
-    if pending:
-        if not await prebuild_caches(pending, schema, build_type, base_dir=base_dir):
-            print("[error] cache prebuild failed; aborting sweep")
-            return 1
+        # Resume (default): only prebuild + launch runs that are not complete.
+        # Aggregation still spans the full explicit manifest.
+        if refresh:
+            pending = param_sets
+        else:
+            pending = [
+                params
+                for params in param_sets
+                if not _is_complete(Path(log_dir_of(params)))
+            ]
+        skipped = len(param_sets) - len(pending)
+        if skipped:
+            print(
+                f"[resume] {skipped} run(s) already complete; {len(pending)} to run "
+                "(use --refresh to force all)"
+            )
 
-        sem = asyncio.Semaphore(parallelism)
+        if pending:
+            if not await prebuild_caches(
+                pending, schema, build_type, base_dir=base_dir
+            ):
+                print("[error] cache prebuild failed; aborting sweep")
+                return 1
 
-        async def _bounded(params: dict) -> bool:
-            async with sem:
+            scheduler = ResourceScheduler(parallelism)
+            for params in pending:
+                RunJournal(Path(log_dir_of(params))).update(
+                    StageKind.ENSURE_CACHE.value,
+                    StageState.SUCCEEDED,
+                    resources=["profile-db:exclusive"],
+                )
+
+            async def launch_bounded(params: dict) -> bool:
                 return await _launch_one(
                     params,
                     build_type,
@@ -288,21 +439,26 @@ async def _run_sweep_async(
                     analyze=analyze,
                     analyze_subjects=analyze_subjects,
                     managed_run=managed_run,
+                    scheduler=scheduler,
                 )
 
-        results = await asyncio.gather(*(_bounded(p) for p in pending))
-    else:
-        results = []
+            results = await asyncio.gather(
+                *(launch_bounded(params) for params in pending)
+            )
+        else:
+            results = []
 
-    if analyze and sweep_manifest_path is not None:
+        if analyze and sweep_manifest_path is not None:
+            if managed_run is not None:
+                managed_run.report("analysis_running")
+            _aggregate(base_dir, build_type)
+
+        succeeded = all(results)
         if managed_run is not None:
-            managed_run.report("analysis_running")
-        _aggregate(base_dir, build_type)
-
-    succeeded = all(results)
-    if managed_run is not None:
-        managed_run.report("ready" if succeeded else "failed")
-    return 0 if succeeded else 1
+            managed_run.report("ready" if succeeded else "failed")
+        return 0 if succeeded else 1
+    finally:
+        experiment_directory_lease.release()
 
 
 def _experiment_root(param_sets: list[dict]) -> Path:
