@@ -27,7 +27,7 @@ pub use arrival::{
     ReleaseMetadata, ScheduledRequest, SchedulingDeclaration, SessionReleaseMetadata,
 };
 pub use release::{ReplayPacing, SessionDependency};
-pub use schema::{TraceDeclaration, TraceKind, TraceTag};
+pub use schema::{SourceIdentities, SourceSchema, TraceDeclaration, TraceKind, TraceTag};
 
 /// Typed immutable requests plus a definition-blind replay scheduler.
 #[derive(Debug)]
@@ -37,6 +37,91 @@ pub struct TraceFrontend<Definition: RequestDefinition = TextGenerationDefinitio
     emitted: usize,
     completed: u64,
     replay_scheduler: ReplayScheduler,
+    /// Source-to-dense identifier mapping, kept so a run can be reported in the
+    /// trace's own names rather than in this simulator's storage ordinals.
+    source_identities: SourceIdentities,
+}
+
+impl<Definition: RequestDefinition> TraceFrontend<Definition> {
+    pub fn source_identities(&self) -> &SourceIdentities {
+        &self.source_identities
+    }
+}
+
+/// One row of the normalized plan, in the source's own identifiers.
+///
+/// This is the artifact a differential test compares against TraceLab's export.
+/// It is deliberately stated in source ids and resolved causal links rather than
+/// in dense storage ordinals: dense ids are this simulator's private choice,
+/// while the plan is the thing both systems must agree on.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PlanRow {
+    pub request_id: String,
+    pub session_id: String,
+    pub round_idx: usize,
+    pub session_arrival_time_ms: String,
+    pub predecessor_request_id: Option<String>,
+    pub prefix_len: u32,
+    pub input_len: u32,
+    pub output_len: u32,
+    pub tool_wait_after_ms: String,
+}
+
+impl TraceFrontend<TextGenerationDefinition> {
+    /// Project the loaded trace into its normalized plan, preserving row order.
+    ///
+    /// Round indices and predecessors are recovered from session membership in
+    /// row order rather than read back from a column, so the plan reflects the
+    /// chain this simulator will actually execute.
+    pub fn plan_rows(&self) -> Vec<PlanRow> {
+        let mut rounds_seen: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+        let mut rows = Vec::with_capacity(self.scheduled_requests.len());
+        for request in &self.scheduled_requests {
+            let release = &request.release;
+            let session_id = release
+                .session
+                .map(|session| session.session_id)
+                .unwrap_or(u32::MAX);
+            let round_idx = *rounds_seen
+                .entry(session_id)
+                .and_modify(|count| *count += 1)
+                .or_insert(0);
+            let source_session_id = self
+                .source_identities
+                .session_source_ids()
+                .get(session_id as usize)
+                .cloned()
+                .unwrap_or_else(|| session_id.to_string());
+            let source_request_id = self
+                .source_identities
+                .request_source_ids()
+                .get(release.request_id.0 as usize)
+                .cloned()
+                .unwrap_or_else(|| release.request_id.0.to_string());
+            let predecessor_request_id = round_idx
+                .checked_sub(1)
+                .map(|previous| format!("{source_session_id}_round_{previous:06}"));
+            rows.push(PlanRow {
+                request_id: source_request_id,
+                session_id: source_session_id,
+                round_idx,
+                session_arrival_time_ms: format!("{:.6}", release.trace_arrival_time_ms),
+                predecessor_request_id,
+                prefix_len: request.definition.session.declared_prefix_tokens(),
+                input_len: request.definition.prompt_tokens,
+                output_len: request.definition.target_output_tokens,
+                tool_wait_after_ms: format!(
+                    "{:.6}",
+                    release
+                        .session
+                        .map(|session| session.tool_wait_after.as_ms())
+                        .unwrap_or(0.0)
+                ),
+            });
+        }
+        rows
+    }
 }
 
 impl TraceFrontend<TextGenerationDefinition> {
@@ -183,11 +268,13 @@ fn load_typed<Definition: TraceDefinition>(
     validate_replay(pacing, session_dependency, declaration)?;
     let mut scheduled_requests = Vec::new();
     let mut session_start_times = std::collections::HashMap::new();
+    let mut source_identities = schema::SourceIdentities::default();
     for file in files {
         schema::load_file(
             file,
             declaration,
             &mut session_start_times,
+            &mut source_identities,
             &mut scheduled_requests,
         )?;
     }
@@ -206,6 +293,7 @@ fn load_typed<Definition: TraceDefinition>(
         emitted: 0,
         completed: 0,
         replay_scheduler,
+        source_identities,
     })
 }
 
@@ -311,6 +399,121 @@ mod tests {
             .unwrap();
         writer.flush().unwrap();
         path
+    }
+
+    /// Write the canonical TraceLab execution trace used by the v2 tests.
+    ///
+    /// Session `b` arrives first and has two rounds; session `a` arrives later.
+    /// The identifiers are opaque strings whose lexicographic order disagrees
+    /// with their arrival order, so a loader that sorted by id would be caught.
+    fn write_execution_v2(dir: &std::path::Path) -> PathBuf {
+        let path = dir.join("session-execution-v2.csv");
+        std::fs::write(
+            &path,
+            "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms\n\
+             b_round_000000,b,0,0.000000,0,512,64,100.000000\n\
+             b_round_000001,b,1,0.000000,576,0,64,0.000000\n\
+             a_round_000000,a,0,250.000000,0,400,48,0.000000\n",
+        )
+        .unwrap();
+        path
+    }
+
+    fn declare_execution_v2() -> TraceDeclaration {
+        TraceDeclaration::parse_with_schema("text_generation", &[], "session-execution-v2").unwrap()
+    }
+
+    #[test]
+    fn execution_v2_maps_opaque_ids_to_dense_ids_in_row_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_execution_v2(dir.path());
+
+        let frontend = TraceFrontend::load(
+            &[path],
+            &declare_execution_v2(),
+            open_loop(1.0),
+            SessionDependency::Chained,
+        )
+        .unwrap();
+
+        // Row order, not identifier order: `b` arrives first and gets dense 0.
+        assert_eq!(
+            frontend.source_identities().session_source_ids(),
+            &["b".to_string(), "a".to_string()]
+        );
+        assert_eq!(
+            frontend.source_identities().request_source_ids(),
+            &[
+                "b_round_000000".to_string(),
+                "b_round_000001".to_string(),
+                "a_round_000000".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn execution_v2_feeds_prefix_and_fresh_input_straight_into_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_execution_v2(dir.path());
+
+        let frontend = TraceFrontend::load(
+            &[path],
+            &declare_execution_v2(),
+            open_loop(1.0),
+            SessionDependency::Chained,
+        )
+        .unwrap();
+        let plan = frontend.plan_rows();
+
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].prefix_len, 0);
+        assert_eq!(plan[0].input_len, 512);
+        assert_eq!(plan[0].tool_wait_after_ms, "100.000000");
+        // A round that appends nothing still re-sends its whole conversation.
+        assert_eq!(plan[1].prefix_len, 576);
+        assert_eq!(plan[1].input_len, 0);
+        assert_eq!(
+            plan[1].predecessor_request_id.as_deref(),
+            Some("b_round_000000")
+        );
+        assert_eq!(plan[2].session_id, "a");
+        assert_eq!(plan[2].session_arrival_time_ms, "250.000000");
+        assert_eq!(plan[2].predecessor_request_id, None);
+    }
+
+    #[test]
+    fn execution_v2_rejects_a_prefix_on_a_first_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.csv");
+        std::fs::write(
+            &path,
+            "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms\n\
+             a_round_000000,a,0,0.000000,128,512,64,0.000000\n",
+        )
+        .unwrap();
+
+        let error = TraceFrontend::load(
+            &[path],
+            &declare_execution_v2(),
+            open_loop(1.0),
+            SessionDependency::Chained,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("no previous context"), "{error}");
+    }
+
+    #[test]
+    fn native_traces_still_reject_a_round_index_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native.csv");
+        std::fs::write(&path, "id,input_len,output_len,arrival_time,round_idx\n0,4,4,0.0,0\n")
+            .unwrap();
+
+        let error = load_text(&[path], 1.0).unwrap_err().to_string();
+
+        assert!(error.contains("round_idx"), "{error}");
     }
 
     fn declare(kind: &str, tags: &[&str]) -> TraceDeclaration {

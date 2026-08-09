@@ -155,10 +155,55 @@ impl TraceTag {
     }
 }
 
+/// Which wire format a trace file is written in.
+///
+/// Orthogonal to [`TraceKind`], which says what a row *is*. A source schema says
+/// what the columns are called and, for the canonical form, that the numbers
+/// have already been resolved upstream. Declared, never sniffed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SourceSchema {
+    /// This simulator's own column vocabulary.
+    #[default]
+    Native,
+    /// TraceLab's canonical, already-materialized session execution trace. The
+    /// same bytes drive a measured replay, so nothing here may be reinterpreted:
+    /// `prefix_len` is the eligible prefix and `input_len` the fresh suffix,
+    /// exactly as the generator resolved them.
+    SessionExecutionV2,
+}
+
+impl SourceSchema {
+    pub const CHOICES: &'static [&'static str] = &["native", "session-execution-v2"];
+
+    pub fn parse(name: &str) -> Result<Self> {
+        Ok(match name {
+            "native" => Self::Native,
+            "session-execution-v2" => Self::SessionExecutionV2,
+            other => bail!(
+                "unknown trace source schema {other:?} (expected one of {:?})",
+                Self::CHOICES
+            ),
+        })
+    }
+}
+
+/// Columns of a canonical `session-execution-v2` file, in canonical order.
+const EXECUTION_V2_COLUMNS: &[&str] = &[
+    "request_id",
+    "session_id",
+    "round_idx",
+    "arrival_time_ms",
+    "prefix_len",
+    "input_len",
+    "output_len",
+    "tool_wait_after_ms",
+];
+
 #[derive(Clone, Debug)]
 pub struct TraceDeclaration {
     pub kind: TraceKind,
     pub tags: Vec<TraceTag>,
+    pub source_schema: SourceSchema,
 }
 
 impl TraceDeclaration {
@@ -175,13 +220,44 @@ impl TraceDeclaration {
         Ok(Self {
             kind,
             tags: parsed_tags,
+            source_schema: SourceSchema::Native,
         })
+    }
+
+    /// Parse a declaration that also names its wire format.
+    ///
+    /// The canonical schema implies its own kind and tag, because the format
+    /// exists for exactly one shape of workload; declaring anything else is a
+    /// configuration mistake worth naming rather than silently overriding.
+    pub fn parse_with_schema(kind: &str, tags: &[String], schema: &str) -> Result<Self> {
+        let source_schema = SourceSchema::parse(schema)?;
+        let mut declaration = Self::parse(kind, tags)?;
+        if source_schema == SourceSchema::SessionExecutionV2 {
+            if declaration.kind != TraceKind::TextGeneration {
+                bail!(
+                    "session-execution-v2 is a text-generation session format; \
+                     trace_kind {:?} cannot be read from it",
+                    declaration.kind
+                );
+            }
+            if !declaration.tags.is_empty() && declaration.tags != [TraceTag::Session] {
+                bail!(
+                    "session-execution-v2 already declares its session columns; \
+                     drop trace_tags {:?}",
+                    declaration.tags
+                );
+            }
+            declaration.tags = vec![TraceTag::Session];
+        }
+        declaration.source_schema = source_schema;
+        Ok(declaration)
     }
 
     pub fn text() -> Self {
         Self {
             kind: TraceKind::TextGeneration,
             tags: Vec::new(),
+            source_schema: SourceSchema::Native,
         }
     }
 
@@ -190,6 +266,9 @@ impl TraceDeclaration {
     }
 
     fn expected_columns(&self) -> Vec<&'static str> {
+        if self.source_schema == SourceSchema::SessionExecutionV2 {
+            return EXECUTION_V2_COLUMNS.to_vec();
+        }
         let mut columns = RELEASE_COLUMNS.to_vec();
         columns.extend(self.kind.definition_columns());
         for tag in &self.tags {
@@ -199,7 +278,9 @@ impl TraceDeclaration {
     }
 
     fn verify_header(&self, index: &HeaderIndex, path: &Path) -> Result<()> {
-        if index.has(FOREIGN_MULTI_ROUND) {
+        // A canonical trace carries round indices by design; they are the chain
+        // this simulator is meant to replay, not a foreign column.
+        if self.source_schema == SourceSchema::Native && index.has(FOREIGN_MULTI_ROUND) {
             bail!(
                 "{}: multi-round traces (round_idx column) are not supported yet; \
                  declare the session trace tag and group rows with session_id",
@@ -316,6 +397,18 @@ pub(super) trait TraceDefinition: RequestDefinition + Sized {
         tags: ParsedTags,
         session_start_time: Option<Time>,
     ) -> Result<Self>;
+
+    /// Build this definition from a canonical `session-execution-v2` row.
+    ///
+    /// Defaults to a refusal rather than a best-effort mapping: the canonical
+    /// format describes a text session, and quietly accepting it for another
+    /// request family would invent fields the file never carried.
+    fn parse_execution_v2(_row: &Row<'_>, _session: SessionInput) -> Result<Self> {
+        bail!(
+            "{:?} traces cannot be read from a session-execution-v2 file",
+            Self::KIND
+        )
+    }
 }
 
 impl TraceDefinition for TextGenerationDefinition {
@@ -331,6 +424,22 @@ impl TraceDefinition for TextGenerationDefinition {
             target_output_tokens: positive_u32(row, "output_len")?,
             session: tags.session_input(session_start_time),
             decoding: tags.decoding,
+        })
+    }
+
+    fn parse_execution_v2(row: &Row<'_>, session: SessionInput) -> Result<Self> {
+        // `input_len` may be zero when a prefix exists: a round that appends
+        // nothing still re-sends its whole conversation, and still prefills
+        // whatever part of that prefix is no longer resident.
+        let prompt_tokens: u32 = row.cell("input_len")?;
+        if prompt_tokens == 0 && session.declared_prefix_tokens() == 0 {
+            bail!("{}: input_len=0 with no prefix is an empty prompt", row.at());
+        }
+        Ok(Self {
+            prompt_tokens,
+            target_output_tokens: positive_u32(row, "output_len")?,
+            session,
+            decoding: DecodingStrategy::Standard,
         })
     }
 }
@@ -508,6 +617,64 @@ fn parse_release(row: &Row<'_>, tags: ParsedTags) -> Result<ReleaseMetadata> {
         request_id: RequestId(row.cell("id")?),
         trace_arrival_time_ms,
         session: tags.release_session(),
+    })
+}
+
+/// Turn one canonical row into a scheduled request.
+///
+/// Deliberately its own path rather than a remapping onto the native columns:
+/// the canonical format differs from the native one in identity *type*, not
+/// just in column names, and hiding that behind an alias table would be the
+/// kind of silent reinterpretation this format exists to prevent.
+fn parse_execution_v2_row<Definition: TraceDefinition>(
+    row: &Row<'_>,
+    session_start_times: &mut HashMap<u32, Time>,
+    identities: &mut SourceIdentities,
+) -> Result<ScheduledRequest<Definition>> {
+    let source_request_id = row.raw("request_id")?;
+    let source_session_id = row.raw("session_id")?;
+    if source_request_id.is_empty() || source_session_id.is_empty() {
+        bail!("{}: request_id and session_id must be non-empty", row.at());
+    }
+
+    let trace_arrival_time_ms: f64 = row.cell("arrival_time_ms")?;
+    require_nonnegative_finite(row, "arrival_time_ms", trace_arrival_time_ms)?;
+    let tool_wait_ms: f64 = row.cell("tool_wait_after_ms")?;
+    require_nonnegative_finite(row, "tool_wait_after_ms", tool_wait_ms)?;
+
+    let session_id = identities.intern_session(source_session_id);
+    let request_id = identities.intern_request(source_request_id);
+    let declared_prefix_tokens: u32 = row.cell("prefix_len")?;
+    let round_idx: u32 = row.cell("round_idx")?;
+    if round_idx == 0 && declared_prefix_tokens != 0 {
+        bail!(
+            "{}: round_idx=0 declares prefix_len={declared_prefix_tokens}, but a session's \
+             first round has no previous context to reuse",
+            row.at()
+        );
+    }
+
+    let session_start_time = *session_start_times
+        .entry(session_id)
+        .or_insert_with(|| Time::from_ms(trace_arrival_time_ms));
+
+    let release = ReleaseMetadata {
+        request_id,
+        trace_arrival_time_ms,
+        session: Some(SessionReleaseMetadata {
+            session_id,
+            tool_wait_after: Time::from_ms(tool_wait_ms),
+        }),
+    };
+    let session = SessionInput::Session {
+        session_id,
+        session_start_time,
+        declared_prefix_tokens,
+    };
+    Ok(ScheduledRequest {
+        release,
+        scheduling: SchedulingDeclaration::default(),
+        definition: Definition::parse_execution_v2(row, session)?,
     })
 }
 
@@ -769,10 +936,53 @@ impl Row<'_> {
     }
 }
 
+/// Opaque source identifiers mapped to this simulator's dense internal ids.
+///
+/// Dense ids are an internal storage choice, so the canonical format is not
+/// asked to carry them. Assignment follows canonical row order — the order the
+/// file already fixes — because tie-breaking downstream is by dense id, and any
+/// other assignment order would make the two systems agree only by coincidence.
+/// The mapping is kept so a run can be explained in the source's own names.
+#[derive(Debug, Default)]
+pub struct SourceIdentities {
+    sessions: HashMap<String, u32>,
+    session_order: Vec<String>,
+    requests: Vec<String>,
+}
+
+impl SourceIdentities {
+    fn intern_session(&mut self, source_id: &str) -> u32 {
+        if let Some(dense) = self.sessions.get(source_id) {
+            return *dense;
+        }
+        let dense = self.session_order.len() as u32;
+        self.sessions.insert(source_id.to_string(), dense);
+        self.session_order.push(source_id.to_string());
+        dense
+    }
+
+    fn intern_request(&mut self, source_id: &str) -> RequestId {
+        let dense = self.requests.len() as u32;
+        self.requests.push(source_id.to_string());
+        RequestId(dense)
+    }
+
+    /// Source session ids in dense-id order.
+    pub fn session_source_ids(&self) -> &[String] {
+        &self.session_order
+    }
+
+    /// Source request ids in dense-id order.
+    pub fn request_source_ids(&self) -> &[String] {
+        &self.requests
+    }
+}
+
 pub(super) fn load_file<Definition: TraceDefinition>(
     path: &Path,
     declaration: &TraceDeclaration,
     session_start_times: &mut HashMap<u32, Time>,
+    identities: &mut SourceIdentities,
     output: &mut Vec<ScheduledRequest<Definition>>,
 ) -> Result<()> {
     if declaration.kind != Definition::KIND {
@@ -800,6 +1010,14 @@ pub(super) fn load_file<Definition: TraceDefinition>(
             path,
             line: record_index + 2,
         };
+        if declaration.source_schema == SourceSchema::SessionExecutionV2 {
+            output.push(parse_execution_v2_row::<Definition>(
+                &row,
+                session_start_times,
+                identities,
+            )?);
+            continue;
+        }
         let tags = declaration.parse_tags(&row)?;
         let release = parse_release(&row, tags)?;
         // Global arrival-order validation runs after all files are concatenated,

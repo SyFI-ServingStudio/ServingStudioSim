@@ -55,6 +55,10 @@ pub enum LogLevel {
 }
 
 /// Run-global workload / trace inputs.
+fn default_trace_source_schema() -> String {
+    "native".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize, ParamStruct)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadSpec {
@@ -72,6 +76,14 @@ pub struct WorkloadSpec {
     #[serde(default)]
     #[param(choices = simulator::sim::TraceTag::CHOICES)]
     pub trace_tags: Vec<String>,
+    /// Wire format of those files. `native` is this simulator's own column
+    /// vocabulary; `session-execution-v2` is TraceLab's canonical, already
+    /// materialized execution trace, whose bytes also drive a measured replay.
+    /// The canonical schema implies `text_generation` + the `session` tag and
+    /// rejects any other declaration rather than overriding it.
+    #[serde(default = "default_trace_source_schema")]
+    #[param(choices = simulator::sim::SourceSchema::CHOICES, default = "native")]
+    pub trace_source_schema: String,
     /// Simulation duration (ms); minimum window when run_to_end is set.
     #[param(default = 5000.0)]
     pub duration_ms: f64,

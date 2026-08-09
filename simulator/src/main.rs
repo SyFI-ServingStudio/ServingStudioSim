@@ -163,7 +163,11 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // Parse into a concrete request family and narrow to the currently
     // supported text path before starting the bridge or building L4.
     let workload = cfg.workload();
-    let declaration = TraceDeclaration::parse(&workload.trace_kind, &workload.trace_tags)?;
+    let declaration = TraceDeclaration::parse_with_schema(
+        &workload.trace_kind,
+        &workload.trace_tags,
+        &workload.trace_source_schema,
+    )?;
     let pacing = ReplayPacing::parse(
         &workload.replay_pacing,
         workload.request_rate,
