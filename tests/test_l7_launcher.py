@@ -24,6 +24,7 @@ from launcher.exec import (
     SimulationRunner,
     _build_subprocess_env,
     _cargo_build_env,
+    _run_capture,
     binary_path,
     run_analysis,
 )
@@ -214,6 +215,27 @@ def test_run_analysis_delegates_both_optimality_modes_to_analyzer(monkeypatch, t
         command for command in captured_commands if len(command) > 1 and command[1] == "run"
     ]
     assert analyzer_run_commands == [[str(analyzer_path), "run", str(log_dir), "optimality"]]
+
+
+def test_run_capture_avoids_asyncio_subprocess_transport(monkeypatch):
+    async def reject_asyncio_subprocess(*_arguments, **_keyword_arguments):
+        raise AssertionError("analysis capture must not use the asyncio subprocess transport")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", reject_asyncio_subprocess)
+
+    return_code, output = asyncio.run(
+        _run_capture(
+            [
+                sys.executable,
+                "-c",
+                "import sys; print('captured stdout'); print('captured stderr', file=sys.stderr)",
+            ]
+        )
+    )
+
+    assert return_code == 0
+    assert "captured stdout" in output
+    assert "captured stderr" in output
 
 
 # ── validation ──────────────────────────────────────────────────────────────

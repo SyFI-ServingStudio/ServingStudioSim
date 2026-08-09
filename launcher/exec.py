@@ -20,12 +20,15 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARALLELISM = 200
+_PROCESS_POLL_INTERVAL_SECONDS = 0.05
+_PROCESS_TERMINATE_GRACE_SECONDS = 1.0
 
 
 def binary_path(build_type: str = "debug") -> Path:
@@ -200,17 +203,56 @@ def cargo_build_analyzer(build_type: str = "debug") -> bool:
 
 
 async def _run_capture(argv: list[str]) -> tuple[int, str]:
-    """Spawn `argv` (cwd=REPO_ROOT), await it, return (returncode, combined
-    stdout+stderr). Async so the sweep's event loop keeps pumping other runs while
-    this one's analysis runs — unlike a blocking `subprocess.run`."""
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=REPO_ROOT,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    out, _ = await proc.communicate()
-    return proc.returncode, out.decode(errors="replace")
+    """Run one analysis stage without asyncio's subprocess transport.
+
+    Analysis stages run concurrently across a sweep, and the renderer forks its
+    own process pool. Capturing those stages through ``asyncio`` pipes makes
+    completion depend on both pipe EOF and child-watcher delivery; either can
+    leave the launcher waiting after the child has already produced its artifact.
+
+    Spawn on the event-loop thread, capture into an anonymous temporary file
+    (``tempfile`` honors ``TMPDIR``), and poll the concrete PID instead. Polling
+    keeps other sweep runs moving without introducing a worker-thread fork.
+    """
+    with tempfile.TemporaryFile(prefix="vibesim-analysis-") as capture_file:
+        process = subprocess.Popen(
+            argv,
+            cwd=REPO_ROOT,
+            stdout=capture_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            while process.poll() is None:
+                await asyncio.sleep(_PROCESS_POLL_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            await _terminate_process(process)
+            raise
+
+        capture_file.seek(0)
+        output = capture_file.read().decode(errors="replace")
+    return process.returncode, output
+
+
+async def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    """Bound cancellation cleanup without blocking the launcher's event loop."""
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        process.poll()
+        return
+    deadline = asyncio.get_running_loop().time() + _PROCESS_TERMINATE_GRACE_SECONDS
+    while process.poll() is None and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(_PROCESS_POLL_INTERVAL_SECONDS)
+    if process.poll() is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            process.poll()
+            return
+        while process.poll() is None:
+            await asyncio.sleep(_PROCESS_POLL_INTERVAL_SECONDS)
 
 
 def _run_capture_sync(argv: list[str]) -> tuple[int, str]:

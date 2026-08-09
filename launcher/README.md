@@ -94,6 +94,12 @@ metadata.py    Repro metadata written BEFORE spawn (INV-2): preset.json,
    spawn the binary → mark `.complete` → best-effort analyze. A sweep does this
    across many configs in parallel under a semaphore.
 
+Per-run analysis keeps that cross-run concurrency without using asyncio's
+subprocess pipe/child-watcher transport: each stage captures into an anonymous
+temporary file and polls its concrete PID. This is required because the Python
+renderer forks its own process pool; completion must not depend on pipe EOF or a
+child-watcher callback after the analyzer has already written its artifact.
+
 ## Preset shape (matches the code, not the old flat format)
 
 A preset is a **nested config tree** plus up to three launcher control blocks.
