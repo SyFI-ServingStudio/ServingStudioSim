@@ -111,8 +111,21 @@ ScheduledRequest<OmniGenerationDefinition>
 - `scheduling`：priority 和相对 completion deadline
 - `release`：`ReleaseMetadata { request_id, trace_arrival_time, session }`
 
-`ReplayScheduler` 的 API 只接受 `ReleaseMetadata` slice，所以 pacing 无法读取或
-match request definition。open-loop、closed-loop、session-chain 与 modality 正交。
+`ReplayScheduler` 的 API 只接受 `ReleaseMetadata` slice，所以 release scheduling
+无法读取或 match request definition。它组合两个独立类型：
+
+```rust
+ReplayPacing::OpenLoop { request_rate }
+ReplayPacing::ClosedLoop { max_concurrency }
+
+SessionDependency::Independent
+SessionDependency::Chained
+```
+
+`ReplayPacing` 决定 workload pressure 何时允许 release；`SessionDependency` 决定一行
+是否必须等待同 session predecessor completion + `tool_wait_after_ms`。四种组合都合法，
+尤其 `closed_loop + chained` 同时执行全局 in-flight cap 与 session causality；不再用一个
+单一 cross-product enum 把二者错误地设成互斥。
 release 时，frontend 才把相对 deadline 解成 absolute simulated deadline，并构造
 `Request<Definition>`。这也是 production 唯一调用 generic `Request::new` 的位置；
 四列 schema 与带 session/SLO/speculative tags 的 schema 最终共享同一个 storage seam。
@@ -211,7 +224,8 @@ prefix support 没有把 current worker 扩成 request-family variant。
    `SharedRequests<Definition>`。
 5. 第 4 步完成后，把 `LoadedTrace` variant 窄化到 matching typed execution path；当前
    `into_current_text_frontend` 仍会拒绝所有 non-text family。
-6. 若只是增加 pacing discipline，只改 `ReplayMode`/`ReplayScheduler`；若只是增加
-   scheduling policy，只改 admission consumer。不要让它们与 request family 叉乘。
+6. 若只是增加 workload pacing，只改 `ReplayPacing`/`ReplayScheduler`；若只是增加
+   session causality，只改 `SessionDependency`/`ReplayScheduler`；若只是增加 scheduling
+   policy，只改 admission consumer。不要让这些轴与 request family 叉乘。
 7. 只有当一个 model/worker 原生接受异构有序 segment 时才建 omni family；不要用
    `OmniInputSegment` 取代能由方向类型表达的 specialized request。

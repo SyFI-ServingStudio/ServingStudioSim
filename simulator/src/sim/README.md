@@ -18,21 +18,24 @@ For the layer overview see `doc/detailed_design/L7.md`.
   Family definitions live one-per-file under `common/request_family/`; the
   directional text/media families remain distinct, while `omni_generation`
   alone accepts ordered mixed text/image/audio/video segment vectors.
-  `ReplayScheduler` reads a separate `ReleaseMetadata` projection and supports:
-  - **Open-loop** (default): `drain_due(now, emit)` emits every `Request` whose
+  `ReplayScheduler` reads a separate `ReleaseMetadata` projection and composes
+  two axes:
+  - **Replay pacing** — `replay_pacing: open_loop | closed_loop`.
+    Open-loop `drain_due(now, emit)` emits every `Request` whose
     **effective** arrival time `≤ now`, where effective time =
-    `arrival_time / request_rate` (a higher rate compresses the timeline).
-  - **Closed-loop** (`replay_mode: closed_loop`): the CSV arrival timeline /
-    `request_rate` are **ignored**; the frontend keeps at most N requests in
-    flight, admitting the next the instant a slot frees and stamping its arrival
-    with the admission clock. Mirrors the alignment load-generator's
-    `--max-concurrency`. To gate this, the frontend **owns the in-flight ledger**
-    (`cursor` emitted − `completed` fed back via `record_completion`); the tick
-    loop is a pure consumer of `submitted`/`in_flight`/`num_completed`.
+    `arrival_time / request_rate`. Closed-loop ignores the CSV timeline and
+    `request_rate`; it keeps at most `max_concurrency` requests in flight and
+    stamps each release with the current admission clock.
+  - **Session dependency** —
+    `session_dependency: independent | chained`. Independent rows have no causal
+    gate. Chained session heads follow the selected pacing, while each successor
+    waits for predecessor completion plus `tool_wait_after_ms`.
 
-  - **Session-chain** (`replay_mode: session_chain`): session heads follow the
-    trace timeline; each successor waits for predecessor completion plus
-    `tool_wait_after_ms`.
+  The axes form four valid combinations. In particular, `closed_loop + chained`
+  applies the global in-flight cap while preserving per-session causality. The
+  frontend owns the in-flight ledger (`emitted − completed` fed back via
+  `record_completion`); the tick loop is a pure consumer of
+  `submitted`/`in_flight`/`num_completed`.
 
   The drain loop lives here so a caller can't under-drain by polling once per
   tick. The text schema remains the four legacy columns and is declared as

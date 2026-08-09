@@ -40,7 +40,11 @@ def _phase_configs(tmp_path: Path, suffix: str = ".yaml") -> dict[str, Path]:
         paths["simulation"],
         {
             "deployment": "unified",
-            "workload": {"trace_files": [str(trace)]},
+            "workload": {
+                "trace_files": [str(trace)],
+                "replay_pacing": "open_loop",
+                "session_dependency": "independent",
+            },
             "io": {"log_dir": str(tmp_path / "simulation_run")},
             "pools": {
                 "main": {
@@ -165,7 +169,11 @@ def _write_completed_inputs(tmp_path: Path) -> tuple[Path, Path, dict]:
     profile = tmp_path / "profile_run"
     params = {
         "deployment": "unified",
-        "workload": {"trace_files": [str(tmp_path / "trace" / "shared.csv")]},
+        "workload": {
+            "trace_files": [str(tmp_path / "trace" / "shared.csv")],
+            "replay_pacing": "open_loop",
+            "session_dependency": "independent",
+        },
         "pools": {
             "main": {
                 "groups": [

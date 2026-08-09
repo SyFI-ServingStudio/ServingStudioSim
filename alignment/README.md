@@ -54,6 +54,8 @@ This is the normal simulation preset. Its output remains `io.log_dir`:
 deployment: unified
 workload:
   trace_files: [trace/requests.csv]
+  replay_pacing: open_loop
+  session_dependency: independent
 io:
   log_dir: logs/<experiment>/simulation
 pools: ...

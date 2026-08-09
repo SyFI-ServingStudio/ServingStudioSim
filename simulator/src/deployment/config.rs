@@ -77,8 +77,8 @@ pub struct WorkloadSpec {
     pub duration_ms: f64,
     /// Keep ticking past duration_ms until every request completes.
     pub run_to_end: bool,
-    /// Request arrival rate (requests/s). Read by `open_loop` and
-    /// `session_chain`; ignored by `closed_loop`.
+    /// Request arrival rate (requests/s). Read by `open_loop`; ignored by
+    /// `closed_loop`.
     #[param(default = 10.0)]
     pub request_rate: f64,
     /// Closed-loop concurrency cap. When set, the frontend IGNORES CSV
@@ -86,17 +86,18 @@ pub struct WorkloadSpec {
     /// in flight, admitting a new one the instant a slot frees — mirroring the
     /// alignment load-generator's --max-concurrency (a tokio Semaphore of N
     /// permits acquired *after* arrival, held until completion). Required by
-    /// `closed_loop`; must be absent for the other replay modes.
+    /// `closed_loop`; must be absent for `open_loop`.
     #[serde(default)]
     pub max_concurrency: Option<u32>,
-    /// How arrivals are paced: `open_loop` (replay the trace timeline),
-    /// `closed_loop` (cap in-flight, needs `max_concurrency`), or
-    /// `session_chain` (hold each later round of a conversation until its
-    /// predecessor completes plus that round's `tool_wait_after_ms`; needs the
-    /// `session` trace tag). Declared, never derived from which other field
-    /// happens to be set.
-    #[param(choices = simulator::sim::ReplayMode::CHOICES)]
-    pub replay_mode: String,
+    /// How workload pressure releases eligible requests. Session causality is
+    /// selected independently by `session_dependency`.
+    #[param(choices = simulator::sim::ReplayPacing::CHOICES)]
+    pub replay_pacing: String,
+    /// Whether every trace row is independently eligible or later rounds wait
+    /// for predecessor completion plus `tool_wait_after_ms`. `chained` requires
+    /// the `session` trace tag and composes with either replay pacing.
+    #[param(choices = simulator::sim::SessionDependency::CHOICES)]
+    pub session_dependency: String,
     /// Fixed simulation tick step (µs) — the time quantum the loop advances by
     /// each iteration. Finer ticks mean less TTFT/TPOT quantization (and smaller
     /// inter-slice gaps in the trace) at ~no throughput cost, since per-tick work
@@ -275,7 +276,7 @@ mod tests {
     // (G8) — model_config sits flat alongside tp_size under `arch`.
     const UNIFIED_YAML: &str = r#"
 deployment: unified
-workload: { trace_files: ["trace/smoke.csv"], trace_kind: text_generation, replay_mode: open_loop, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
+workload: { trace_files: ["trace/smoke.csv"], trace_kind: text_generation, replay_pacing: open_loop, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
 io: { log_dir: "logs/smoke", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   main:
@@ -315,6 +316,17 @@ pools:
         assert_eq!(cfg.io().log_level, LogLevel::Info);
         assert!(cfg.io().log_stage_transitions);
         assert_eq!(cfg.workload().request_rate, 10.0);
+        assert_eq!(cfg.workload().replay_pacing, "open_loop");
+        assert_eq!(cfg.workload().session_dependency, "independent");
+    }
+
+    #[test]
+    fn legacy_replay_mode_is_not_accepted() {
+        let legacy = UNIFIED_YAML
+            .replace("replay_pacing: open_loop", "replay_mode: open_loop")
+            .replace(", session_dependency: independent", "");
+        let error = serde_yaml::from_str::<RunConfig>(&legacy).unwrap_err();
+        assert!(error.to_string().contains("replay_mode"), "{error}");
     }
 
     #[test]
@@ -322,7 +334,7 @@ pools:
         // YAML is a JSON superset; the equivalent JSON must parse identically.
         let json = serde_json::json!({
             "deployment": "unified",
-            "workload": {"trace_files": ["t.csv"], "trace_kind": "text_generation", "replay_mode": "open_loop", "duration_ms": 5000.0, "run_to_end": true, "request_rate": 10.0},
+            "workload": {"trace_files": ["t.csv"], "trace_kind": "text_generation", "replay_pacing": "open_loop", "session_dependency": "independent", "duration_ms": 5000.0, "run_to_end": true, "request_rate": 10.0},
             "io": {"log_dir": "logs", "log_level": "info", "quiet": false, "force_cache_build": false, "log_output_token_times": false},
             "pools": {"main": {"placement": "least-queued", "groups": [
                 {"gpu": "H200", "replicas": 1,
@@ -393,7 +405,7 @@ pools:
     fn pd_two_pools_parse() {
         let yaml = r#"
 deployment: pd
-workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_mode: open_loop, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_pacing: open_loop, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   prefill:
@@ -419,7 +431,7 @@ pools:
         // aggregated replica, qwen3_ffn_moe). Mirrors `pd_two_pools_parse`.
         let yaml = r#"
 deployment: afd
-workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_mode: open_loop, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_pacing: open_loop, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   attn:
@@ -463,7 +475,7 @@ pools:
         // DP-attention arch carries two TP degrees; pairs with the hp_unified worker.
         let yaml = r#"
 deployment: unified
-workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_mode: open_loop, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_pacing: open_loop, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   main:

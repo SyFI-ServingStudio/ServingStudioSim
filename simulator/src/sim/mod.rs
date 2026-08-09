@@ -7,7 +7,8 @@ pub mod repro;
 pub mod run;
 
 pub use frontend::{
-    LoadedTrace, ReleaseMetadata, ReplayMode, ScheduledRequest, SchedulingDeclaration,
-    SessionReleaseMetadata, TraceDeclaration, TraceFrontend, TraceKind, TraceTag,
+    LoadedTrace, ReleaseMetadata, ReplayPacing, ScheduledRequest, SchedulingDeclaration,
+    SessionDependency, SessionReleaseMetadata, TraceDeclaration, TraceFrontend, TraceKind,
+    TraceTag,
 };
 pub use run::{run_sim, RunSummary, TerminationCause, TickCfg};

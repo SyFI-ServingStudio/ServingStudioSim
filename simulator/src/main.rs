@@ -22,7 +22,9 @@ use simulator::common::{RequestStore, SharedRequests};
 use simulator::deployment::{build_flow, RunConfig};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
-use simulator::sim::{run_sim, LoadedTrace, ReplayMode, TickCfg, TraceDeclaration};
+use simulator::sim::{
+    run_sim, LoadedTrace, ReplayPacing, SessionDependency, TickCfg, TraceDeclaration,
+};
 use simulator::timing::PerfApiBridge;
 
 // Heap profiling (opt-in, `--features dhat-heap`): dhat's allocator only
@@ -162,12 +164,18 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // supported text path before starting the bridge or building L4.
     let workload = cfg.workload();
     let declaration = TraceDeclaration::parse(&workload.trace_kind, &workload.trace_tags)?;
-    let mode = ReplayMode::parse(
-        &workload.replay_mode,
+    let pacing = ReplayPacing::parse(
+        &workload.replay_pacing,
         workload.request_rate,
         workload.max_concurrency.map(|n| n as usize),
     )?;
-    let loaded_trace = LoadedTrace::load(&workload.trace_files, &declaration, mode)?;
+    let session_dependency = SessionDependency::parse(&workload.session_dependency)?;
+    let loaded_trace = LoadedTrace::load(
+        &workload.trace_files,
+        &declaration,
+        pacing,
+        session_dependency,
+    )?;
     let mut frontend = loaded_trace.into_current_text_frontend()?;
     let tick_cfg = TickCfg::new(
         workload.duration_ms,

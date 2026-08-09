@@ -180,6 +180,8 @@ from the Rust schema.
 deployment: unified              # required; selects which pool roles exist
 workload:                        # run-global workload params
   trace_files: ["trace/smoke.csv"]
+  replay_pacing: open_loop
+  session_dependency: independent
 io:                              # run-global output + logging
   log_dir: "logs/tp{tensor_parallel}"   # {name} drops a sweep value into the path
 pools:
@@ -329,6 +331,8 @@ deployment: pd
 workload:
   trace_files:
     - trace/aime_long.csv
+  replay_pacing: open_loop
+  session_dependency: independent
   duration_ms: 20000.0
   run_to_end: true
   request_rate: 12.0

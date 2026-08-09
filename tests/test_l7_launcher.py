@@ -146,9 +146,30 @@ _FIXTURE = {
     "common": {
         "workload": [
             {"name": "trace_files", "type": "path_list", "required": True, "description": ""},
+            {
+                "name": "trace_tags",
+                "type": "string_list",
+                "required": False,
+                "choices": ["session", "slo", "speculative"],
+                "description": "",
+            },
             {"name": "duration_ms", "type": "float", "default": 5000.0, "description": ""},
             {"name": "run_to_end", "type": "bool", "default": False, "description": ""},
             {"name": "request_rate", "type": "float", "default": 10.0, "description": ""},
+            {
+                "name": "replay_pacing",
+                "type": "string",
+                "required": True,
+                "choices": ["open_loop", "closed_loop"],
+                "description": "",
+            },
+            {
+                "name": "session_dependency",
+                "type": "string",
+                "required": True,
+                "choices": ["independent", "chained"],
+                "description": "",
+            },
         ],
         "io": [
             {"name": "log_dir", "type": "path", "default": "logs", "description": ""},
@@ -180,7 +201,11 @@ def _base(*, arch=None, worker=None, log_dir="logs/x", **extra):
     worker_node.update(worker or {})
     preset = {
         "deployment": "unified",
-        "workload": {"trace_files": ["t.csv"]},
+        "workload": {
+            "trace_files": ["t.csv"],
+            "replay_pacing": "open_loop",
+            "session_dependency": "independent",
+        },
         "io": {"log_dir": log_dir},
         "pools": {
             "main": {
@@ -266,6 +291,21 @@ def test_validate_ok(schema):
 def test_validate_unknown_root_key(schema):
     errs = validate_params(_base(bogus=1), schema)
     assert any("'bogus'" in e for e in errs)
+
+
+def test_validate_rejects_legacy_replay_mode(schema):
+    preset = _base()
+    preset["workload"]["replay_mode"] = preset["workload"].pop("replay_pacing")
+    errs = validate_params(preset, schema)
+    assert any("workload.replay_mode" in error and "unknown" in error for error in errs)
+
+
+@pytest.mark.parametrize("axis", ["replay_pacing", "session_dependency"])
+def test_validate_requires_both_replay_axes(schema, axis):
+    preset = _base()
+    del preset["workload"][axis]
+    errs = validate_params(preset, schema)
+    assert any(axis in error and "required" in error for error in errs)
 
 
 def test_validate_unknown_arch_payload_key(schema):
@@ -355,6 +395,16 @@ def test_validate_batch_policy_choices(schema):
         schema,
     )
     assert any("batch_policy" in e and "not one of" in e for e in errs)
+
+
+def test_validate_list_choices_apply_to_each_element(schema):
+    preset = _base()
+    preset["workload"]["trace_tags"] = ["session", "slo"]
+    assert validate_params(preset, schema) == []
+
+    preset["workload"]["trace_tags"] = ["session", "unknown"]
+    errs = validate_params(preset, schema)
+    assert any("trace_tags[1]='unknown'" in error and "not one of" in error for error in errs)
 
 
 def test_v1_v2_derived_collides_with_sweep(schema):
@@ -1161,7 +1211,11 @@ def test_readme_worked_example(schema):
 
     preset = {
         "deployment": "pd",
-        "workload": {"trace_files": ["trace/aime_long.csv"]},
+        "workload": {
+            "trace_files": ["trace/aime_long.csv"],
+            "replay_pacing": "open_loop",
+            "session_dependency": "independent",
+        },
         "io": {"log_dir": "logs/pd_{prefill_tp}_d{decode_tp}tp_r{decode_replicas}_{batch}"},
         "pools": {
             "prefill": {
@@ -1537,6 +1591,8 @@ def test_logged_process_captures_stdout(tmp_path):
                     "duration_ms": 5000.0,
                     "run_to_end": False,
                     "request_rate": 10.0,
+                    "replay_pacing": "open_loop",
+                    "session_dependency": "independent",
                 },
                 "io": {
                     "log_dir": str(tmp_path),

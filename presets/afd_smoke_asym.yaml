@@ -9,7 +9,8 @@ workload:
   trace_files:
     - trace/smoke.csv
   trace_kind: text_generation
-  replay_mode: open_loop
+  replay_pacing: open_loop
+  session_dependency: independent
   run_to_end: true
 
 io:

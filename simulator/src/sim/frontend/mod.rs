@@ -26,7 +26,7 @@ use schema::TraceDefinition;
 pub use arrival::{
     ReleaseMetadata, ScheduledRequest, SchedulingDeclaration, SessionReleaseMetadata,
 };
-pub use release::ReplayMode;
+pub use release::{ReplayPacing, SessionDependency};
 pub use schema::{TraceDeclaration, TraceKind, TraceTag};
 
 /// Typed immutable requests plus a definition-blind replay scheduler.
@@ -44,9 +44,10 @@ impl TraceFrontend<TextGenerationDefinition> {
     pub fn load(
         files: &[PathBuf],
         declaration: &TraceDeclaration,
-        mode: ReplayMode,
+        pacing: ReplayPacing,
+        session_dependency: SessionDependency,
     ) -> Result<Self> {
-        load_typed(files, declaration, mode)
+        load_typed(files, declaration, pacing, session_dependency)
     }
 }
 
@@ -111,21 +112,36 @@ impl LoadedTrace {
     pub fn load(
         files: &[PathBuf],
         declaration: &TraceDeclaration,
-        mode: ReplayMode,
+        pacing: ReplayPacing,
+        session_dependency: SessionDependency,
     ) -> Result<Self> {
         Ok(match declaration.kind {
             TraceKind::TextGeneration => {
-                Self::TextGeneration(load_typed(files, declaration, mode)?)
+                Self::TextGeneration(load_typed(files, declaration, pacing, session_dependency)?)
             }
-            TraceKind::ImageToText => Self::ImageToText(load_typed(files, declaration, mode)?),
-            TraceKind::VideoToText => Self::VideoToText(load_typed(files, declaration, mode)?),
-            TraceKind::AudioToText => Self::AudioToText(load_typed(files, declaration, mode)?),
-            TraceKind::TextToImage => Self::TextToImage(load_typed(files, declaration, mode)?),
-            TraceKind::TextToVideo => Self::TextToVideo(load_typed(files, declaration, mode)?),
-            TraceKind::TextToSpeech => Self::TextToSpeech(load_typed(files, declaration, mode)?),
-            TraceKind::ImageToVideo => Self::ImageToVideo(load_typed(files, declaration, mode)?),
+            TraceKind::ImageToText => {
+                Self::ImageToText(load_typed(files, declaration, pacing, session_dependency)?)
+            }
+            TraceKind::VideoToText => {
+                Self::VideoToText(load_typed(files, declaration, pacing, session_dependency)?)
+            }
+            TraceKind::AudioToText => {
+                Self::AudioToText(load_typed(files, declaration, pacing, session_dependency)?)
+            }
+            TraceKind::TextToImage => {
+                Self::TextToImage(load_typed(files, declaration, pacing, session_dependency)?)
+            }
+            TraceKind::TextToVideo => {
+                Self::TextToVideo(load_typed(files, declaration, pacing, session_dependency)?)
+            }
+            TraceKind::TextToSpeech => {
+                Self::TextToSpeech(load_typed(files, declaration, pacing, session_dependency)?)
+            }
+            TraceKind::ImageToVideo => {
+                Self::ImageToVideo(load_typed(files, declaration, pacing, session_dependency)?)
+            }
             TraceKind::OmniGeneration => {
-                Self::OmniGeneration(load_typed(files, declaration, mode)?)
+                Self::OmniGeneration(load_typed(files, declaration, pacing, session_dependency)?)
             }
         })
     }
@@ -158,12 +174,13 @@ fn unsupported_family<Definition>(kind: &str) -> Result<Definition> {
 fn load_typed<Definition: TraceDefinition>(
     files: &[PathBuf],
     declaration: &TraceDeclaration,
-    mode: ReplayMode,
+    pacing: ReplayPacing,
+    session_dependency: SessionDependency,
 ) -> Result<TraceFrontend<Definition>> {
     if files.is_empty() {
         bail!("no trace files given (--trace-files)");
     }
-    validate_mode(mode, declaration)?;
+    validate_replay(pacing, session_dependency, declaration)?;
     let mut scheduled_requests = Vec::new();
     let mut session_start_times = std::collections::HashMap::new();
     for file in files {
@@ -182,7 +199,7 @@ fn load_typed<Definition: TraceDefinition>(
         .iter()
         .map(|request| request.release)
         .collect::<Vec<_>>();
-    let replay_scheduler = ReplayScheduler::new(mode, &releases);
+    let replay_scheduler = ReplayScheduler::new(pacing, session_dependency, &releases);
     Ok(TraceFrontend {
         scheduled_requests,
         releases,
@@ -194,28 +211,30 @@ fn load_typed<Definition: TraceDefinition>(
 
 /// Reject a pacing request that cannot run, before any file is read.
 ///
-/// Takes the declaration too, because one mode's precondition is about the data
+/// Takes the declaration too, because one axis's precondition is about the data
 /// rather than its own payload: chaining rounds is meaningless on a trace that
 /// declares no sessions. Checking it here rather than at the config call site
 /// means every caller is covered, tests included.
-fn validate_mode(mode: ReplayMode, declaration: &TraceDeclaration) -> Result<()> {
-    match mode {
-        ReplayMode::OpenLoop { request_rate } => require_rate(request_rate)?,
-        ReplayMode::SessionChain { request_rate } => {
-            require_rate(request_rate)?;
-            if !declaration.tags.contains(&TraceTag::Session) {
-                bail!(
-                    "replay_mode: session_chain needs the `session` trace tag — \
-                     without session columns there are no rounds to chain, and \
-                     chaining would silently degrade to open-loop replay"
-                );
-            }
-        }
-        ReplayMode::ClosedLoop { cap } => {
-            if cap == 0 {
+fn validate_replay(
+    pacing: ReplayPacing,
+    session_dependency: SessionDependency,
+    declaration: &TraceDeclaration,
+) -> Result<()> {
+    match pacing {
+        ReplayPacing::OpenLoop { request_rate } => require_rate(request_rate)?,
+        ReplayPacing::ClosedLoop { max_concurrency } => {
+            if max_concurrency == 0 {
                 bail!("max_concurrency must be greater than 0 (got 0)");
             }
         }
+    }
+    if session_dependency == SessionDependency::Chained
+        && !declaration.tags.contains(&TraceTag::Session)
+    {
+        bail!(
+            "session_dependency: chained needs the `session` trace tag — without \
+             session columns there are no rounds to chain"
+        );
     }
     Ok(())
 }
@@ -299,13 +318,18 @@ mod tests {
         TraceDeclaration::parse(kind, &tags).unwrap()
     }
 
-    fn open_loop(rate: f64) -> ReplayMode {
-        ReplayMode::OpenLoop { request_rate: rate }
+    fn open_loop(rate: f64) -> ReplayPacing {
+        ReplayPacing::OpenLoop { request_rate: rate }
     }
 
     /// Load a plain text trace open-loop — the shape most tests want.
     fn load_text(paths: &[PathBuf], rate: f64) -> Result<TraceFrontend> {
-        TraceFrontend::load(paths, &TraceDeclaration::text(), open_loop(rate))
+        TraceFrontend::load(
+            paths,
+            &TraceDeclaration::text(),
+            open_loop(rate),
+            SessionDependency::Independent,
+        )
     }
 
     fn drain_at(fe: &mut TraceFrontend, now_ms: f64) -> Vec<RequestId> {
@@ -443,7 +467,8 @@ mod tests {
         let mut fe = TraceFrontend::load(
             &[path],
             &TraceDeclaration::text(),
-            ReplayMode::ClosedLoop { cap: 2 },
+            ReplayPacing::ClosedLoop { max_concurrency: 2 },
+            SessionDependency::Independent,
         )
         .unwrap();
         assert_eq!(
@@ -483,7 +508,8 @@ mod tests {
         let err = TraceFrontend::load(
             &[path],
             &TraceDeclaration::text(),
-            ReplayMode::ClosedLoop { cap: 0 },
+            ReplayPacing::ClosedLoop { max_concurrency: 0 },
+            SessionDependency::Independent,
         )
         .unwrap_err();
         assert!(err.to_string().contains("max_concurrency"));
@@ -513,7 +539,8 @@ mod tests {
         let mut fe = TraceFrontend::load(
             &[path],
             &declare("text_generation", &["session"]),
-            ReplayMode::SessionChain { request_rate: 1.0 },
+            ReplayPacing::OpenLoop { request_rate: 1.0 },
+            SessionDependency::Chained,
         )
         .unwrap();
 
@@ -547,7 +574,8 @@ mod tests {
         let mut fe = TraceFrontend::load(
             &[path],
             &declare("text_generation", &["session"]),
-            ReplayMode::SessionChain { request_rate: 1.0 },
+            ReplayPacing::OpenLoop { request_rate: 1.0 },
+            SessionDependency::Chained,
         )
         .unwrap();
         assert_eq!(
@@ -565,11 +593,60 @@ mod tests {
         );
     }
 
+    /// Pacing and causality compose: the global cap still applies while each
+    /// session waits for its own predecessor and tool wait. A not-yet-due
+    /// successor does not prevent an independent session head from using a
+    /// free closed-loop slot.
+    #[test]
+    fn closed_loop_chaining_caps_in_flight_without_blocking_other_heads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_csv(
+            dir.path(),
+            "closed-chain.csv",
+            &format!(
+                "{SESSION_HEADER}\
+                 0,8,2,100.0,7,0,5.0\n\
+                 1,8,2,200.0,9,0,0.0\n\
+                 2,8,2,300.0,7,64,0.0\n\
+                 3,8,2,400.0,,,\n\
+                 4,8,2,500.0,9,64,0.0\n"
+            ),
+        );
+        let mut frontend = TraceFrontend::load(
+            &[path],
+            &declare("text_generation", &["session"]),
+            ReplayPacing::ClosedLoop { max_concurrency: 2 },
+            SessionDependency::Chained,
+        )
+        .unwrap();
+
+        // Closed-loop ignores every trace timestamp and fills exactly two slots.
+        assert_eq!(
+            drain_pairs(&mut frontend, 0.0),
+            vec![(RequestId(0), 0.0), (RequestId(1), 0.0)]
+        );
+        assert_eq!(frontend.in_flight(), 2);
+
+        // Session 7's successor is unlocked but waits until t=15. The standalone
+        // row is an eligible head and uses the slot at t=10 instead.
+        frontend.record_completion(RequestId(0), Time::from_ms(10.0));
+        assert_eq!(drain_pairs(&mut frontend, 10.0), vec![(RequestId(3), 10.0)]);
+        assert_eq!(frontend.in_flight(), 2);
+
+        frontend.record_completion(RequestId(3), Time::from_ms(15.0));
+        assert_eq!(drain_pairs(&mut frontend, 15.0), vec![(RequestId(2), 15.0)]);
+        assert_eq!(frontend.in_flight(), 2);
+
+        frontend.record_completion(RequestId(1), Time::from_ms(20.0));
+        assert_eq!(drain_pairs(&mut frontend, 20.0), vec![(RequestId(4), 20.0)]);
+        assert!(frontend.exhausted());
+    }
+
     /// A trace that declares sessions but whose rows all opt out is *data* with
     /// no conversations, not a misconfiguration: every row is a head, so
     /// chaining degenerates to open-loop replay exactly.
     #[test]
-    fn session_chain_with_no_session_rows_is_open_loop() {
+    fn chained_dependency_with_no_session_rows_matches_open_loop() {
         let dir = tempfile::tempdir().unwrap();
         let chained = write_csv(
             dir.path(),
@@ -593,7 +670,8 @@ mod tests {
         let mut chained = TraceFrontend::load(
             &[chained],
             &declare("text_generation", &["session"]),
-            ReplayMode::SessionChain { request_rate: 1.0 },
+            ReplayPacing::OpenLoop { request_rate: 1.0 },
+            SessionDependency::Chained,
         )
         .unwrap();
         let mut open = load_text(&[open], 1.0).unwrap();
@@ -606,7 +684,7 @@ mod tests {
     /// Asking for chaining on a trace that declares no sessions is a hard error,
     /// not a silent degrade — the run would look like it chained and would not.
     #[test]
-    fn rejects_session_chain_without_the_session_tag() {
+    fn rejects_chained_dependency_without_the_session_tag() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_csv(
             dir.path(),
@@ -616,33 +694,39 @@ mod tests {
         let err = TraceFrontend::load(
             &[path],
             &TraceDeclaration::text(),
-            ReplayMode::SessionChain { request_rate: 1.0 },
+            ReplayPacing::OpenLoop { request_rate: 1.0 },
+            SessionDependency::Chained,
         )
         .unwrap_err();
         assert!(err.to_string().contains("`session` trace tag"));
     }
 
-    // ---- declared replay mode ----------------------------------------------
+    // ---- declared replay axes ----------------------------------------------
 
-    /// The flat config puts `max_concurrency` beside the mode name, so a payload
-    /// the declared mode would ignore is rejected rather than left dead.
+    /// The flat config puts `max_concurrency` beside the pacing name, so a
+    /// payload the declared pacing would ignore is rejected rather than left
+    /// dead.
     #[test]
-    fn replay_mode_rejects_a_payload_its_mode_ignores() {
-        for name in ["open_loop", "session_chain"] {
-            let err = ReplayMode::parse(name, 1.0, Some(4)).unwrap_err();
-            assert!(err.to_string().contains("max_concurrency"), "{name}");
-        }
-        let err = ReplayMode::parse("closed_loop", 1.0, None).unwrap_err();
+    fn replay_pacing_rejects_a_payload_it_ignores() {
+        let err = ReplayPacing::parse("open_loop", 1.0, Some(4)).unwrap_err();
+        assert!(err.to_string().contains("max_concurrency"));
+        let err = ReplayPacing::parse("closed_loop", 1.0, None).unwrap_err();
         assert!(err.to_string().contains("needs workload.max_concurrency"));
     }
 
     #[test]
-    fn every_advertised_replay_mode_parses() {
-        for name in ReplayMode::CHOICES {
-            let cap = (*name == "closed_loop").then_some(4);
-            ReplayMode::parse(name, 1.0, cap).unwrap();
+    fn every_advertised_replay_axis_value_parses() {
+        for name in ReplayPacing::CHOICES {
+            let max_concurrency = (*name == "closed_loop").then_some(4);
+            ReplayPacing::parse(name, 1.0, max_concurrency).unwrap();
         }
-        assert!(ReplayMode::parse("teleport", 1.0, None).is_err());
+        for name in SessionDependency::CHOICES {
+            SessionDependency::parse(name).unwrap();
+        }
+        assert!(ReplayPacing::parse("teleport", 1.0, None).is_err());
+        assert!(ReplayPacing::parse("session_chain", 1.0, None).is_err());
+        assert!(SessionDependency::parse("causal-ish").is_err());
+        assert!(SessionDependency::parse("session_chain").is_err());
     }
 
     // ---- declared schema ----------------------------------------------------
@@ -691,6 +775,7 @@ mod tests {
             &[path],
             &declare("text_generation", &["session", "slo", "speculative"]),
             open_loop(1.0),
+            SessionDependency::Independent,
         )
         .unwrap();
         let scheduled_request = &fe.scheduled_requests[0];
@@ -745,6 +830,7 @@ mod tests {
             &[image_path],
             &declare("image_to_text", &[]),
             open_loop(1.0),
+            SessionDependency::Independent,
         )
         .unwrap();
         assert!(loaded
@@ -772,6 +858,7 @@ mod tests {
             &[path],
             &declare("text_generation", &["session", "slo"]),
             open_loop(1.0),
+            SessionDependency::Independent,
         )
         .unwrap();
         assert!(fe.scheduled_requests[0].release.session.is_none());
@@ -800,9 +887,13 @@ mod tests {
              0,40,16,0.0,1024,1024,1024\n\
              1,40,16,1.0,512,512,256\n",
         );
-        let LoadedTrace::ImageToText(mut frontend) =
-            LoadedTrace::load(&[path], &declare("image_to_text", &[]), open_loop(1.0)).unwrap()
-        else {
+        let LoadedTrace::ImageToText(mut frontend) = LoadedTrace::load(
+            &[path],
+            &declare("image_to_text", &[]),
+            open_loop(1.0),
+            SessionDependency::Independent,
+        )
+        .unwrap() else {
             panic!("expected image-to-text frontend");
         };
         assert_eq!(
@@ -834,9 +925,13 @@ mod tests {
              encoded_tokens\n\
              0,8,32,0.0,12.5,16000,625\n",
         );
-        let LoadedTrace::AudioToText(frontend) =
-            LoadedTrace::load(&[path], &declare("audio_to_text", &[]), open_loop(1.0)).unwrap()
-        else {
+        let LoadedTrace::AudioToText(frontend) = LoadedTrace::load(
+            &[path],
+            &declare("audio_to_text", &[]),
+            open_loop(1.0),
+            SessionDependency::Independent,
+        )
+        .unwrap() else {
             panic!("expected audio-to-text frontend");
         };
         assert_eq!(
@@ -864,9 +959,13 @@ mod tests {
              media_fps,denoise_steps\n\
              0,64,0.0,1280,720,5.0,24,50\n",
         );
-        let LoadedTrace::TextToVideo(mut frontend) =
-            LoadedTrace::load(&[path], &declare("text_to_video", &[]), open_loop(1.0)).unwrap()
-        else {
+        let LoadedTrace::TextToVideo(mut frontend) = LoadedTrace::load(
+            &[path],
+            &declare("text_to_video", &[]),
+            open_loop(1.0),
+            SessionDependency::Independent,
+        )
+        .unwrap() else {
             panic!("expected text-to-video frontend");
         };
         assert_eq!(
@@ -899,9 +998,13 @@ mod tests {
              input_media_height,media_width,media_height,media_duration_s,media_fps\n\
              0,32,0.0,48,256,1024,768,1280,720,5.0,24\n",
         );
-        let LoadedTrace::ImageToVideo(frontend) =
-            LoadedTrace::load(&[path], &declare("image_to_video", &[]), open_loop(1.0)).unwrap()
-        else {
+        let LoadedTrace::ImageToVideo(frontend) = LoadedTrace::load(
+            &[path],
+            &declare("image_to_video", &[]),
+            open_loop(1.0),
+            SessionDependency::Independent,
+        )
+        .unwrap() else {
             panic!("expected image-to-video frontend");
         };
         let definition = &frontend.scheduled_requests[0].definition;
@@ -975,9 +1078,13 @@ mod tests {
         ];
         let path = write_omni_csv(directory.path(), "omni.csv", &input, &output);
 
-        let LoadedTrace::OmniGeneration(frontend) =
-            LoadedTrace::load(&[path], &declare("omni_generation", &[]), open_loop(1.0)).unwrap()
-        else {
+        let LoadedTrace::OmniGeneration(frontend) = LoadedTrace::load(
+            &[path],
+            &declare("omni_generation", &[]),
+            open_loop(1.0),
+            SessionDependency::Independent,
+        )
+        .unwrap() else {
             panic!("expected omni-generation frontend");
         };
         let definition = &frontend.scheduled_requests[0].definition;
@@ -994,8 +1101,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let output = vec![OmniOutputSpec::Text { target_tokens: 1 }];
         let path = write_omni_csv(directory.path(), "empty-input.csv", &[], &output);
-        let error = LoadedTrace::load(&[path], &declare("omni_generation", &[]), open_loop(1.0))
-            .unwrap_err();
+        let error = LoadedTrace::load(
+            &[path],
+            &declare("omni_generation", &[]),
+            open_loop(1.0),
+            SessionDependency::Independent,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("input_segments"));
     }
 
@@ -1051,6 +1163,7 @@ mod tests {
             &[path],
             &declare("text_generation", &["slo"]),
             open_loop(1.0),
+            SessionDependency::Independent,
         )
         .unwrap_err();
         let message = err.to_string();
@@ -1070,8 +1183,13 @@ mod tests {
              media_fps,denoise_steps\n\
              0,64,1,0.0,1280,720,5.0,24,50\n",
         );
-        let err =
-            LoadedTrace::load(&[path], &declare("text_to_image", &[]), open_loop(1.0)).unwrap_err();
+        let err = LoadedTrace::load(
+            &[path],
+            &declare("text_to_image", &[]),
+            open_loop(1.0),
+            SessionDependency::Independent,
+        )
+        .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("unexpected"), "{message}");
         assert!(message.contains("media_fps"), "{message}");
@@ -1102,8 +1220,13 @@ mod tests {
              media_fps,denoise_steps\n\
              0,64,0.0,1280,720,0.0,24,50\n",
         );
-        let err =
-            LoadedTrace::load(&[path], &declare("text_to_video", &[]), open_loop(1.0)).unwrap_err();
+        let err = LoadedTrace::load(
+            &[path],
+            &declare("text_to_video", &[]),
+            open_loop(1.0),
+            SessionDependency::Independent,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("must be in 1..=u64::MAX"));
     }
 

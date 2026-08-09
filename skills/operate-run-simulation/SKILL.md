@@ -180,6 +180,8 @@ deployment: unified
 workload:
   trace_files:
     - trace/aime_long.csv
+  replay_pacing: open_loop
+  session_dependency: independent
   request_rate: 150.0
   duration_ms: 20000000.0
   run_to_end: false

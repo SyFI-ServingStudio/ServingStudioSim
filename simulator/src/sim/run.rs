@@ -474,7 +474,7 @@ mod tests {
         DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
     };
     use crate::sim::frontend::TraceFrontend;
-    use crate::sim::frontend::{ReplayMode, TraceDeclaration};
+    use crate::sim::frontend::{ReplayPacing, SessionDependency, TraceDeclaration};
     use crate::test_helpers::{text_request, FakeModel};
     use crate::worker::{build_barebone_worker, WorkerConfig};
     use std::cell::RefCell;
@@ -542,7 +542,8 @@ mod tests {
         let mut frontend = TraceFrontend::load(
             &[trace],
             &TraceDeclaration::text(),
-            ReplayMode::OpenLoop { request_rate: 1.0 },
+            ReplayPacing::OpenLoop { request_rate: 1.0 },
+            SessionDependency::Independent,
         )
         .unwrap();
         let mut logger = LoggerSession::open(dir.path(), true, false).unwrap();
@@ -607,7 +608,8 @@ mod tests {
         let mut frontend = TraceFrontend::load(
             &[trace],
             &TraceDeclaration::text(),
-            ReplayMode::OpenLoop { request_rate: 1.0 },
+            ReplayPacing::OpenLoop { request_rate: 1.0 },
+            SessionDependency::Independent,
         )
         .unwrap();
         let mut logger = LoggerSession::open(dir.path(), false, false).unwrap();

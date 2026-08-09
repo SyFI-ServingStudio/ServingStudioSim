@@ -72,10 +72,7 @@ def _is_identifier(name: Any) -> bool:
 def _is_safe_label(label: Any) -> bool:
     """A label that may become a log_dir path segment: a non-empty string with no
     path separator or `.`/`..` traversal."""
-    return (
-        isinstance(label, str) and bool(label)
-        and "/" not in label and label not in (".", "..")
-    )
+    return isinstance(label, str) and bool(label) and "/" not in label and label not in (".", "..")
 
 
 def _sweep_names(preset: dict) -> set[str]:
@@ -206,9 +203,7 @@ def validate_params(preset: dict, registry: Registry) -> list[str]:
     return errors
 
 
-def _check_leaves(
-    candidate: dict, registry: Registry, *, defer_placeholders: bool
-) -> list[str]:
+def _check_leaves(candidate: dict, registry: Registry, *, defer_placeholders: bool) -> list[str]:
     """Per-leaf type / choices / required checks over every expected slot.
 
     Walks a deep copy with `create=True` so a wholly-absent skeleton container
@@ -229,8 +224,7 @@ def _check_leaves(
                 if defer_placeholders:
                     continue
                 errors.append(
-                    f"{path} still holds an unresolved placeholder {slot.value!r} "
-                    "after expansion"
+                    f"{path} still holds an unresolved placeholder {slot.value!r} after expansion"
                 )
                 continue
             ptype = slot.pdef["type"]
@@ -238,8 +232,14 @@ def _check_leaves(
                 errors.append(f"{path}={slot.value!r} is not a valid {ptype}")
                 continue
             choices = slot.pdef.get("choices")
-            if choices and slot.value not in choices:
-                errors.append(f"{path}={slot.value!r} is not one of {choices}")
+            if choices:
+                values = slot.value if ptype.endswith("_list") else [slot.value]
+                for index, value in enumerate(values):
+                    if _is_placeholder(value) and defer_placeholders:
+                        continue
+                    if value not in choices:
+                        value_path = f"{path}[{index}]" if ptype.endswith("_list") else path
+                        errors.append(f"{value_path}={value!r} is not one of {choices}")
         else:
             required = slot.pdef.get("required", False)
             has_default = "default" in slot.pdef
@@ -248,9 +248,7 @@ def _check_leaves(
     return errors
 
 
-def _check_structure(
-    errors: list[str], preset: dict, registry: Registry, deployment: str
-) -> None:
+def _check_structure(errors: list[str], preset: dict, registry: Registry, deployment: str) -> None:
     """Required roles present, each pool a non-empty `groups` list of mappings,
     each group's arch/worker a tag advertised for the pool's contract."""
     # `workload` / `io` must be mappings when present — a non-dict (`io: []` /
@@ -281,10 +279,12 @@ def _check_structure(
             if not isinstance(group, dict):
                 errors.append(f"{where} must be a mapping")
                 continue
-            _check_provider_tag(errors, group.get("arch"), "arch",
-                                registry.arch_tags(contract), where)
-            _check_provider_tag(errors, group.get("worker"), "worker",
-                                registry.worker_tags(contract), where)
+            _check_provider_tag(
+                errors, group.get("arch"), "arch", registry.arch_tags(contract), where
+            )
+            _check_provider_tag(
+                errors, group.get("worker"), "worker", registry.worker_tags(contract), where
+            )
 
 
 def _check_provider_tag(
@@ -337,16 +337,12 @@ def _check_compound_semantics(
                 f"members seen across rows: {sorted(union)}"
             )
         if group in sweep_names or group in derived_names:
-            errors.append(
-                f"compound group {group!r} collides with a sweep/derived name"
-            )
+            errors.append(f"compound group {group!r} collides with a sweep/derived name")
         for m in sorted(union):
             if m == group or m in compound:
                 errors.append(f"compound member {m!r} collides with a group name")
             if m in sweep_names or m in derived_names:
-                errors.append(
-                    f"compound member {m!r} collides with a sweep/derived name"
-                )
+                errors.append(f"compound member {m!r} collides with a sweep/derived name")
             if m in member_owner and member_owner[m] != group:
                 errors.append(
                     f"compound member {m!r} appears in both groups "
@@ -369,14 +365,12 @@ def _validate_control_blocks(preset: dict) -> list[str]:
     sweep_raw = preset.get("sweep")
     if sweep_raw is not None and not isinstance(sweep_raw, dict):
         shape_errors.append(
-            f"`sweep` must be a mapping of {{name: values}}, got "
-            f"{type(sweep_raw).__name__}"
+            f"`sweep` must be a mapping of {{name: values}}, got {type(sweep_raw).__name__}"
         )
     derived_raw = preset.get("derived")
     if derived_raw is not None and not isinstance(derived_raw, dict):
         shape_errors.append(
-            f"`derived` must be a mapping of {{name: expression}}, got "
-            f"{type(derived_raw).__name__}"
+            f"`derived` must be a mapping of {{name: expression}}, got {type(derived_raw).__name__}"
         )
     constraints_raw = preset.get("constraints")
     if constraints_raw is not None and not isinstance(constraints_raw, list):
@@ -388,8 +382,7 @@ def _validate_control_blocks(preset: dict) -> list[str]:
         for i, expr in enumerate(constraints_raw):
             if not isinstance(expr, str):
                 shape_errors.append(
-                    f"constraints[{i}] must be a string expression, got "
-                    f"{type(expr).__name__}"
+                    f"constraints[{i}] must be a string expression, got {type(expr).__name__}"
                 )
     compound_raw = preset.get("compound")
     if compound_raw is not None and not isinstance(compound_raw, dict):
@@ -433,9 +426,7 @@ def _validate_control_blocks(preset: dict) -> list[str]:
     if isinstance(compound_raw, dict):
         for group, rows in compound_raw.items():
             if not _is_identifier(group):
-                shape_errors.append(
-                    f"compound group name {group!r} must be a string identifier"
-                )
+                shape_errors.append(f"compound group name {group!r} must be a string identifier")
             if isinstance(rows, dict):
                 for label, row in rows.items():
                     if not _is_safe_label(label):
@@ -447,8 +438,7 @@ def _validate_control_blocks(preset: dict) -> list[str]:
                         for member in row:
                             if not _is_identifier(member):
                                 shape_errors.append(
-                                    f"compound member name {member!r} must be a "
-                                    "string identifier"
+                                    f"compound member name {member!r} must be a string identifier"
                                 )
     if shape_errors:
         return shape_errors  # don't interpret blocks of the wrong shape
@@ -517,9 +507,7 @@ def _validate_control_blocks(preset: dict) -> list[str]:
             continue
         missing = _expr_names(str(expr)) - resolved
         if missing:
-            errors.append(
-                f"constraint {expr!r} references undefined names {sorted(missing)}"
-            )
+            errors.append(f"constraint {expr!r} references undefined names {sorted(missing)}")
 
     # The reference universe: everywhere a sweep/derived name can legitimately be
     # used — a tree placeholder, a log_dir template field, or an expression input.

@@ -492,7 +492,7 @@ mod tests {
     fn glm52_unified_config_preserves_ep8_hp_pairing() {
         let yaml = r#"
 deployment: unified
-workload: { trace_files: ["trace/smoke.csv"], trace_kind: text_generation, replay_mode: open_loop, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
+workload: { trace_files: ["trace/smoke.csv"], trace_kind: text_generation, replay_pacing: open_loop, session_dependency: independent, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
 io: { log_dir: "logs/test", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }
 pools:
   main:

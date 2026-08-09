@@ -134,6 +134,31 @@ mod tests {
     }
 
     #[test]
+    fn workload_schema_exposes_orthogonal_replay_axes() {
+        let schema = list_params();
+        let workload = schema["common"]["workload"]
+            .as_array()
+            .expect("workload params are an array");
+        let replay_pacing = workload
+            .iter()
+            .find(|param| param["name"] == "replay_pacing")
+            .expect("replay_pacing is exposed");
+        assert_eq!(
+            replay_pacing["choices"],
+            json!(["open_loop", "closed_loop"])
+        );
+        let session_dependency = workload
+            .iter()
+            .find(|param| param["name"] == "session_dependency")
+            .expect("session_dependency is exposed");
+        assert_eq!(
+            session_dependency["choices"],
+            json!(["independent", "chained"])
+        );
+        assert!(workload.iter().all(|param| param["name"] != "replay_mode"));
+    }
+
+    #[test]
     fn attention_workers_expose_prefix_cache_mode_policy_and_optional_ceiling() {
         let schema = list_params();
         for params in [
