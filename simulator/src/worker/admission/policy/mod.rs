@@ -4,12 +4,14 @@
 //! immutable ranking facts once, at enqueue time, then use `peek` to test the
 //! selected request against token/KV gates. A rejected head stays queued.
 
-use crate::common::{PrefixInput, RequestId, Time};
+use crate::common::{RequestId, SessionInput, Time};
 
 mod fifo;
+mod session_start;
 mod shortest_job_first;
 
 pub use fifo::FifoOrder;
+pub use session_start::SessionStartOrder;
 pub use shortest_job_first::ShortestJobFirst;
 
 /// Immutable facts available to a pending-order policy.
@@ -19,21 +21,22 @@ pub use shortest_job_first::ShortestJobFirst;
 /// still require a deterministic FIFO tie-break.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdmissionCandidate {
-    pub request: RequestId,
+    pub request_id: RequestId,
     pub enqueue_sequence: u64,
-    pub prompt: u32,
-    pub decode: u32,
-    pub prefix: PrefixInput,
-    pub deadline: Option<Time>,
-    pub matched_tokens: u32,
+    pub fresh_prompt_tokens: u32,
+    pub remaining_output_tokens: u32,
+    pub session_input: SessionInput,
+    /// Trace-declared session start, or actual arrival when this request is a
+    /// standalone one-request conversation.
+    pub conversation_start_time: Time,
 }
 
 impl AdmissionCandidate {
     #[inline]
     pub fn queued_kv_tokens(self) -> u64 {
-        u64::from(self.prompt)
-            + u64::from(self.prefix.declared_prefix_tokens())
-            + u64::from(self.decode)
+        u64::from(self.fresh_prompt_tokens)
+            + u64::from(self.session_input.declared_prefix_tokens())
+            + u64::from(self.remaining_output_tokens)
     }
 }
 
@@ -46,10 +49,11 @@ pub(crate) struct EnqueueSequence {
 impl EnqueueSequence {
     pub(crate) fn freeze(
         &mut self,
-        request: RequestId,
-        prompt: u32,
-        decode: u32,
-        prefix: PrefixInput,
+        request_id: RequestId,
+        fresh_prompt_tokens: u32,
+        remaining_output_tokens: u32,
+        session_input: SessionInput,
+        conversation_start_time: Time,
     ) -> AdmissionCandidate {
         let enqueue_sequence = self.next;
         self.next = self
@@ -57,13 +61,12 @@ impl EnqueueSequence {
             .checked_add(1)
             .expect("admission enqueue sequence overflow");
         AdmissionCandidate {
-            request,
+            request_id,
             enqueue_sequence,
-            prompt,
-            decode,
-            prefix,
-            deadline: None,
-            matched_tokens: 0,
+            fresh_prompt_tokens,
+            remaining_output_tokens,
+            session_input,
+            conversation_start_time,
         }
     }
 }

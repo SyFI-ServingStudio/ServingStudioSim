@@ -18,13 +18,15 @@ pub mod types;
 pub(crate) mod workers;
 
 pub use admission::{
-    AdmissionCandidate, FifoOrder, LoadBalance, PendingOrderPolicy, ShortestJobFirst,
+    AdmissionCandidate, FifoOrder, LoadBalance, PendingOrderPolicy, SessionStartOrder,
+    ShortestJobFirst,
 };
+pub(crate) use config::resolve_prefix_cache_config;
 pub use config::{AttnWorkerSel, BatchPolicy, FfnWorkerSel, IterWorkerSel};
 pub use cost_buffers::CostBuffers;
 pub use gpu_cluster::{CostSource, GpuCluster, GpuInfo, SharedGpuCluster};
 pub use iter_worker::{AfdAttnWorker, AfdFfnWorker, IterWorker};
-pub use kv::PrefixCachePolicy;
+pub use kv::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub use types::{
     AttnWorkerEvent, AttnWorkerMsg, BatchFsmState, FfnPullSource, FfnTask, FfnTaskKind,
     FfnWorkerEvent, FfnWorkerMsg, IterCursor, IterEndState, PdDecodeEvent, PdDecodeMsg,

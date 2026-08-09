@@ -62,13 +62,13 @@ impl<M: AttnLayerwiseModel> AttentionLayerExecution for AttentionLayerExecutionA
 
         for &request in request_ids {
             if kv_store.has_reservation(request) {
-                let (resident_prefix_tokens, prefill_compute_tokens) =
-                    kv_store.prefill_pair(request);
-                group
-                    .prefill_chunk_pairs
-                    .push((resident_prefix_tokens, prefill_compute_tokens));
-                group.prefill_tokens += prefill_compute_tokens;
-                group.batch_tokens += prefill_compute_tokens;
+                let resolved_prefill = kv_store.resolved_prefill_context(request);
+                group.prefill_chunk_pairs.push((
+                    resolved_prefill.resident_prefix_tokens(),
+                    resolved_prefill.prefill_tokens_to_compute(),
+                ));
+                group.prefill_tokens += resolved_prefill.prefill_tokens_to_compute();
+                group.batch_tokens += resolved_prefill.prefill_tokens_to_compute();
             } else {
                 let current_kv = kv_store.current_kv(0, request).unwrap_or(0) as u32;
                 group.decode_kv_lens.push(current_kv);

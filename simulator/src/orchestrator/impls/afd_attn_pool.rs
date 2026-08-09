@@ -282,7 +282,12 @@ where
     /// records their completion in `completed` (the flow surfaces them to L7). Runs
     /// before the attn workers tick, so the scattered notifications / releases are in
     /// hand when they next advance.
-    pub fn apply_ffn_events(&mut self, events: &[FfnWorkerEvent], completed: &mut Vec<RequestId>) {
+    pub fn apply_ffn_events(
+        &mut self,
+        events: &[FfnWorkerEvent],
+        completed: &mut Vec<RequestId>,
+        now: Time,
+    ) {
         for ev in events {
             match ev {
                 FfnWorkerEvent::SectionReady {
@@ -296,7 +301,7 @@ where
                     slot,
                     completed: done,
                     ..
-                } => self.finish_iteration(*slot as usize, done, completed),
+                } => self.finish_iteration(*slot as usize, done, completed, now),
             }
         }
     }
@@ -350,11 +355,12 @@ where
         slot: usize,
         done: &[RequestId],
         completed: &mut Vec<RequestId>,
+        now: Time,
     ) {
         for &req in done {
             if let Some(w) = self.req_worker.remove(&req) {
                 let idx = w.0 as usize;
-                self.workers[idx].enqueue(AttnWorkerMsg::Release { req }.into());
+                self.workers[idx].enqueue(AttnWorkerMsg::Release { req, at: now }.into());
                 self.wake(idx);
                 // No controller-side load counter to decrement: the worker drops the
                 // request's KV on `Release`, and the pool reads `estimated_peak_kv`
@@ -835,6 +841,7 @@ mod tests {
                 completed: vec![RequestId(0)],
             }],
             &mut completed,
+            Time::from_ms(100.0),
         );
         assert_eq!(completed, vec![RequestId(0)]);
         assert!(!p.slots[0].in_flight, "slot freed after completion");

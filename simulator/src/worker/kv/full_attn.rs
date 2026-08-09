@@ -7,25 +7,31 @@
 
 use std::collections::HashMap;
 
-use crate::common::{PrefixInput, RequestId, Time};
-use crate::log::{KvSampler, KvSubmit};
+use crate::common::{RequestId, SessionInput, Time};
+use crate::log::{
+    KvSampler, KvSubmit, PrefixCacheActivation, PrefixCacheEvent, PrefixCacheEventKind,
+    PrefixCacheEvictionReason, PrefixCacheLogger, PrefixCacheRetentionReason,
+};
 use crate::worker::kv::{
-    HandoffKv, IterWorkerKv, KvStore, PrefixCachePolicy, PrefixKv, PrefixResolution, SlotPipelineKv,
+    HandoffKv, IterWorkerKv, KvStore, PrefixCachePolicy, PrefixCacheTokenConfig, PrefixKv,
+    ResolvedPrefillContext, SlotPipelineKv,
 };
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
 
 use super::full_attn_partition::FullAttnPartitionState;
-use super::prefix_cache::{PrefixCache, PrefixCacheLease};
+use super::prefix_cache::{
+    PrefixCache, PrefixCacheMutation, PrefixCacheMutationKind, PrefixCacheReturnMetadata,
+};
 
 pub struct FullAttentionKvFootprint {
-    initial_context: u32,
-    decode: u32,
+    post_prefill_context_tokens: u32,
+    remaining_output_tokens: u32,
 }
 
 impl FullAttentionKvFootprint {
     #[inline]
     fn reserved_tokens(&self) -> u64 {
-        u64::from(self.initial_context) + u64::from(self.decode)
+        u64::from(self.post_prefill_context_tokens) + u64::from(self.remaining_output_tokens)
     }
 }
 
@@ -37,12 +43,13 @@ pub struct FullAttnKv {
     held: HashMap<RequestId, (PartitionId, u64)>,
     held_tokens_by_partition: Vec<u64>,
     request_to_partition: HashMap<RequestId, PartitionId>,
-    /// Runtime prefix resolution stays beside request placement and residency;
+    /// Runtime prefill context stays beside request placement and residency;
     /// the shared request record carries only the immutable declaration.
-    prefix_resolutions: HashMap<RequestId, PrefixResolution>,
+    resolved_prefill_contexts: HashMap<RequestId, ResolvedPrefillContext>,
     /// Evictable completed-session KV, local to each attention partition.
     prefix_caches: Vec<PrefixCache>,
     sampler: Option<KvSampler>,
+    prefix_cache_logger: Option<PrefixCacheLogger>,
 }
 
 impl KvStore for FullAttnKv {
@@ -52,26 +59,48 @@ impl KvStore for FullAttnKv {
         FullAttnKv::num_partitions(self)
     }
 
-    fn footprint(&self, request: RequestId, prompt: u32, decode: u32) -> Self::Footprint {
-        FullAttnKv::footprint(self, request, prompt, decode)
+    fn footprint(
+        &self,
+        request: RequestId,
+        post_prefill_context_tokens: u32,
+        remaining_output_tokens: u32,
+    ) -> Self::Footprint {
+        FullAttnKv::footprint(
+            self,
+            request,
+            post_prefill_context_tokens,
+            remaining_output_tokens,
+        )
     }
 
     fn fits(&self, partition: PartitionId, footprint: &Self::Footprint) -> bool {
         FullAttnKv::fits(self, partition, footprint)
     }
 
-    fn reserve(&mut self, request: RequestId, partition: PartitionId, footprint: Self::Footprint) {
-        FullAttnKv::reserve(self, request, partition, footprint);
+    fn reserve(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        footprint: Self::Footprint,
+        now: Time,
+    ) {
+        FullAttnKv::reserve(self, request, partition, footprint, now);
     }
 
     fn commit_resident(
         &mut self,
         request: RequestId,
         partition: PartitionId,
-        initial_kv: u64,
-        remaining: u32,
+        post_prefill_context_tokens: u64,
+        remaining_output_tokens: u32,
     ) {
-        FullAttnKv::commit_resident(self, request, partition, initial_kv, remaining);
+        FullAttnKv::commit_resident(
+            self,
+            request,
+            partition,
+            post_prefill_context_tokens,
+            remaining_output_tokens,
+        );
     }
 
     fn advance(&mut self, scope: AdvanceScope<'_>, steps: u32) {
@@ -138,17 +167,18 @@ impl HandoffKv for FullAttnKv {
         FullAttnKv::hold(self, partition, request, kv_tokens);
     }
 
-    fn complete_handoff(&mut self, request: RequestId) {
-        FullAttnKv::complete_handoff(self, request);
+    fn complete_handoff(&mut self, request: RequestId, now: Time) {
+        FullAttnKv::complete_handoff(self, request, now);
     }
 }
 
 impl PrefixKv for FullAttnKv {
-    fn retained_prefix_partition(&self, prefix: PrefixInput) -> Option<PartitionId> {
-        let PrefixInput::Session {
+    fn retained_prefix_partition(&self, session_input: SessionInput) -> Option<PartitionId> {
+        let SessionInput::Session {
             session_id,
             declared_prefix_tokens,
-        } = prefix
+            ..
+        } = session_input
         else {
             return None;
         };
@@ -168,54 +198,72 @@ impl PrefixKv for FullAttnKv {
         best_partition
     }
 
-    fn plan_prefix(
+    fn preview_prefill_context(
         &self,
         partition: PartitionId,
         fresh_prompt_tokens: u32,
-        prefix: PrefixInput,
-    ) -> PrefixResolution {
-        let resident_prefix_tokens = match prefix {
-            PrefixInput::None => 0,
-            PrefixInput::Session {
+        session_input: SessionInput,
+    ) -> ResolvedPrefillContext {
+        let resident_prefix_tokens = match session_input {
+            SessionInput::Standalone => 0,
+            SessionInput::Session {
                 session_id,
                 declared_prefix_tokens,
+                ..
             } => self.prefix_caches[partition as usize].peek(session_id, declared_prefix_tokens),
         };
-        PrefixResolution::new(prefix, resident_prefix_tokens, fresh_prompt_tokens)
+        ResolvedPrefillContext::new(session_input, resident_prefix_tokens, fresh_prompt_tokens)
     }
 
-    fn reserve_prefix(
+    fn reserve_prefill_context(
         &mut self,
         request: RequestId,
         partition: PartitionId,
-        mut resolution: PrefixResolution,
+        mut resolved_prefill: ResolvedPrefillContext,
         footprint: Self::Footprint,
+        now: Time,
     ) {
-        if let Some(session_id) = resolution
-            .session_id
-            .filter(|_| resolution.resident_prefix_tokens > 0)
-        {
-            let (consumed, cache_lease) = self.prefix_caches[partition as usize]
-                .take(session_id, resolution.resident_prefix_tokens);
+        if let Some(session_id) = resolved_prefill.session_id {
+            let take_result = self.prefix_caches[partition as usize]
+                .take(session_id, resolved_prefill.declared_prefix_tokens);
             debug_assert_eq!(
-                consumed, resolution.resident_prefix_tokens,
-                "prefix plan changed between preview and reservation"
+                take_result.hit_tokens, resolved_prefill.resident_prefix_tokens,
+                "prefill context changed between preview and reservation"
             );
-            resolution = resolution.with_cache_lease(cache_lease);
+            self.record_prefix_cache_event(PrefixCacheEvent {
+                partition_id: partition,
+                time: now,
+                request_id: request,
+                session_id,
+                kind: PrefixCacheEventKind::Activate(if take_result.hit_tokens > 0 {
+                    PrefixCacheActivation::Hit
+                } else {
+                    PrefixCacheActivation::Miss
+                }),
+                entry_tokens_before: take_result.entry_tokens,
+                entry_tokens_after: 0,
+                cache_used_before: take_result.cache_used_before,
+                cache_used_after: take_result.cache_used_after,
+                requested_tokens: u64::from(resolved_prefill.declared_prefix_tokens),
+                hit_tokens: u64::from(take_result.hit_tokens),
+            });
+            resolved_prefill =
+                resolved_prefill.with_cache_return_metadata(take_result.return_metadata);
         }
-        self.prefix_resolutions.insert(request, resolution);
-        self.reserve(request, partition, footprint);
+        self.resolved_prefill_contexts
+            .insert(request, resolved_prefill);
+        self.reserve(request, partition, footprint, now);
     }
 
-    fn prefix_resolution(&self, request: RequestId) -> PrefixResolution {
+    fn resolved_prefill_context(&self, request: RequestId) -> ResolvedPrefillContext {
         *self
-            .prefix_resolutions
+            .resolved_prefill_contexts
             .get(&request)
-            .expect("prefix resolution must exist for an admitted fresh request")
+            .expect("resolved prefill context must exist for an admitted fresh request")
     }
 
-    fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId) {
-        FullAttnKv::release_retaining_prefix(self, request, partition);
+    fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time) {
+        FullAttnKv::release_retaining_prefix(self, request, partition, now);
     }
 }
 
@@ -251,22 +299,29 @@ impl SlotPipelineKv for FullAttnKv {
 }
 
 impl FullAttnKv {
-    pub(crate) fn new(num_partitions: usize, kv_capacity: u64, sampler: Option<KvSampler>) -> Self {
+    pub(crate) fn without_prefix_cache(
+        num_partitions: usize,
+        kv_capacity: u64,
+        sampler: Option<KvSampler>,
+    ) -> Self {
         Self::with_prefix_cache(
             num_partitions,
             kv_capacity,
-            0,
-            PrefixCachePolicy::Lru,
+            PrefixCacheTokenConfig {
+                max_retained_tokens: 0,
+                policy: PrefixCachePolicy::Lru,
+            },
             sampler,
+            None,
         )
     }
 
     pub(crate) fn with_prefix_cache(
         num_partitions: usize,
         kv_capacity: u64,
-        prefix_cache_capacity: u64,
-        prefix_cache_policy: PrefixCachePolicy,
+        prefix_cache: PrefixCacheTokenConfig,
         sampler: Option<KvSampler>,
+        prefix_cache_logger: Option<PrefixCacheLogger>,
     ) -> Self {
         Self {
             partitions: (0..num_partitions)
@@ -276,13 +331,17 @@ impl FullAttnKv {
             held: HashMap::new(),
             held_tokens_by_partition: vec![0; num_partitions],
             request_to_partition: HashMap::new(),
-            prefix_resolutions: HashMap::new(),
+            resolved_prefill_contexts: HashMap::new(),
             prefix_caches: (0..num_partitions)
                 .map(|_| {
-                    PrefixCache::new(prefix_cache_capacity.min(kv_capacity), prefix_cache_policy)
+                    PrefixCache::new(
+                        prefix_cache.max_retained_tokens.min(kv_capacity),
+                        prefix_cache.policy,
+                    )
                 })
                 .collect(),
             sampler,
+            prefix_cache_logger,
         }
     }
 
@@ -295,12 +354,12 @@ impl FullAttnKv {
     pub(crate) fn footprint(
         &self,
         _request: RequestId,
-        initial_context: u32,
-        decode: u32,
+        post_prefill_context_tokens: u32,
+        remaining_output_tokens: u32,
     ) -> FullAttentionKvFootprint {
         FullAttentionKvFootprint {
-            initial_context,
-            decode,
+            post_prefill_context_tokens,
+            remaining_output_tokens,
         }
     }
 
@@ -324,11 +383,22 @@ impl FullAttnKv {
         request: RequestId,
         partition: PartitionId,
         footprint: FullAttentionKvFootprint,
+        now: Time,
     ) {
         self.promised
             .insert(request, (partition, footprint.reserved_tokens()));
         self.request_to_partition.insert(request, partition);
-        self.trim_prefix_cache_to_physical_slack(partition);
+        let evictions = self.trim_prefix_cache_to_physical_slack(partition);
+        for eviction in evictions {
+            self.record_prefix_cache_mutation(
+                request,
+                partition,
+                now,
+                eviction,
+                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
+                0,
+            );
+        }
     }
 
     /// Local full-attention KV is immediately ready. Preserve the existing
@@ -349,14 +419,18 @@ impl FullAttnKv {
         &mut self,
         request: RequestId,
         partition: PartitionId,
-        initial_kv: u64,
-        remaining: u32,
+        post_prefill_context_tokens: u64,
+        remaining_output_tokens: u32,
     ) {
         // Iter-prefill already drained this reservation; pull-decode commits
         // directly after reserve, so clearing here keeps both lifecycles on the
         // same KV-owned request→partition ledger.
         self.promised.remove(&request);
-        self.partitions[partition as usize].begin_decode(request, initial_kv, remaining);
+        self.partitions[partition as usize].begin_decode(
+            request,
+            post_prefill_context_tokens,
+            remaining_output_tokens,
+        );
     }
 
     pub(crate) fn advance(&mut self, scope: AdvanceScope<'_>, steps: u32) {
@@ -388,20 +462,36 @@ impl FullAttnKv {
             .unwrap_or(0);
         self.partitions[partition as usize].release_decode(request, current_kv);
         self.request_to_partition.remove(&request);
-        self.prefix_resolutions.remove(&request);
+        self.resolved_prefill_contexts.remove(&request);
     }
 
-    pub(crate) fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId) {
-        let resolution = self.prefix_resolutions.get(&request).copied();
+    pub(crate) fn release_retaining_prefix(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        now: Time,
+    ) {
+        let resolved_prefill = self.resolved_prefill_contexts.get(&request).copied();
         let retained_tokens = self.partitions[partition as usize]
             .decode_current_kv(request)
-            .or_else(|| resolution.map(|value| u64::from(value.initial_context_tokens())))
+            .or_else(|| {
+                resolved_prefill.map(|value| u64::from(value.post_prefill_context_tokens()))
+            })
             .unwrap_or(0);
-        let session_id = resolution.and_then(|value| value.session_id);
-        let cache_lease = resolution.and_then(PrefixResolution::cache_lease);
+        let session_id = resolved_prefill.and_then(|value| value.session_id);
+        let cache_return_metadata =
+            resolved_prefill.and_then(ResolvedPrefillContext::cache_return_metadata);
         self.release(request, partition);
         if let Some(session_id) = session_id {
-            self.retain_prefix(partition, session_id, retained_tokens, cache_lease);
+            self.retain_prefix(
+                request,
+                partition,
+                session_id,
+                retained_tokens,
+                cache_return_metadata,
+                now,
+                PrefixCacheRetentionReason::RequestComplete,
+            );
         }
     }
 
@@ -414,14 +504,14 @@ impl FullAttnKv {
     ) -> Option<PartitionId> {
         let Some(partition) = self.request_to_partition.remove(&request) else {
             self.discard_held(request);
-            self.prefix_resolutions.remove(&request);
+            self.resolved_prefill_contexts.remove(&request);
             return None;
         };
         let partition_state = &mut self.partitions[partition as usize];
         partition_state.release_decode(request, current_kv);
         partition_state.remove_prefill_admit(request);
         self.promised.remove(&request);
-        self.prefix_resolutions.remove(&request);
+        self.resolved_prefill_contexts.remove(&request);
         Some(partition)
     }
 
@@ -443,31 +533,46 @@ impl FullAttnKv {
         }
     }
 
-    pub(crate) fn complete_handoff(&mut self, request: RequestId) {
+    pub(crate) fn complete_handoff(&mut self, request: RequestId, now: Time) {
         let Some((partition, kv_tokens)) = self.held.remove(&request) else {
             return;
         };
         let total = &mut self.held_tokens_by_partition[partition as usize];
         *total = total.saturating_sub(kv_tokens);
-        let resolution = self.prefix_resolutions.remove(&request);
-        let session_id = resolution.and_then(|value| value.session_id);
-        let cache_lease = resolution.and_then(PrefixResolution::cache_lease);
+        let resolved_prefill = self.resolved_prefill_contexts.remove(&request);
+        let session_id = resolved_prefill.and_then(|value| value.session_id);
+        let cache_return_metadata =
+            resolved_prefill.and_then(ResolvedPrefillContext::cache_return_metadata);
         if let Some(session_id) = session_id {
-            self.retain_prefix(partition, session_id, kv_tokens, cache_lease);
+            self.retain_prefix(
+                request,
+                partition,
+                session_id,
+                kv_tokens,
+                cache_return_metadata,
+                now,
+                PrefixCacheRetentionReason::HandoffComplete,
+            );
         }
+        // A pull acknowledgement can be the prefill worker's final activity.
+        // Submit here so `kv_snapshot` observes both the held-KV release and any
+        // retained-prefix insertion instead of ending at the pre-ack state.
+        self.sample_submit(partition, now);
     }
 
     pub(crate) fn sample_submit(&mut self, partition: PartitionId, now: Time) {
         if self.sampler.is_none() {
             return;
         }
+        let retained_prefix_kv = self.prefix_caches[partition as usize].used_tokens();
         let submit = KvSubmit {
             active_kv: self.partitions[partition as usize].resident_tokens()
                 + self.held_tokens_by_partition[partition as usize]
-                + self.prefix_caches[partition as usize].used_tokens(),
+                + retained_prefix_kv,
+            retained_prefix_kv,
             projected_peak: self.partitions[partition as usize].projected_peak_kv()
                 + self.held_tokens_by_partition[partition as usize]
-                + self.prefix_caches[partition as usize].used_tokens(),
+                + retained_prefix_kv,
             promised_kv: self.partition_promised(partition),
         };
         self.sampler
@@ -545,25 +650,98 @@ impl FullAttnKv {
             .saturating_sub(self.non_cache_peak(partition))
     }
 
-    fn trim_prefix_cache_to_physical_slack(&mut self, partition: PartitionId) {
+    fn trim_prefix_cache_to_physical_slack(
+        &mut self,
+        partition: PartitionId,
+    ) -> Vec<PrefixCacheMutation> {
         let physical_limit = self.prefix_cache_physical_limit(partition);
-        self.prefix_caches[partition as usize].shrink_to(physical_limit);
+        self.prefix_caches[partition as usize].shrink_to(physical_limit)
     }
 
     fn retain_prefix(
         &mut self,
+        request: RequestId,
         partition: PartitionId,
         session_id: u32,
         tokens: u64,
-        cache_lease: Option<PrefixCacheLease>,
+        cache_return_metadata: Option<PrefixCacheReturnMetadata>,
+        now: Time,
+        retain_reason: PrefixCacheRetentionReason,
     ) {
         let physical_limit = self.prefix_cache_physical_limit(partition);
-        self.prefix_caches[partition as usize].insert(
+        let insert_result = self.prefix_caches[partition as usize].insert(
             session_id,
             tokens,
             physical_limit,
-            cache_lease,
+            cache_return_metadata,
         );
+        for mutation in insert_result.mutations {
+            let event_kind = match mutation.kind {
+                PrefixCacheMutationKind::SameSessionReplacement => {
+                    PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::SameSessionReplacement)
+                }
+                PrefixCacheMutationKind::CapacityEviction => {
+                    PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::RetentionCapacity)
+                }
+                PrefixCacheMutationKind::ReplacementPolicyEviction => {
+                    PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ReplacementPolicy)
+                }
+                PrefixCacheMutationKind::Retain => PrefixCacheEventKind::Retain(retain_reason),
+            };
+            self.record_prefix_cache_mutation(
+                request, partition, now, mutation, event_kind, tokens,
+            );
+        }
+        if insert_result.retained_tokens == 0 {
+            let cache_used = self.prefix_caches[partition as usize].used_tokens();
+            self.record_prefix_cache_event(PrefixCacheEvent {
+                partition_id: partition,
+                time: now,
+                request_id: request,
+                session_id,
+                kind: PrefixCacheEventKind::Retain(PrefixCacheRetentionReason::NoCacheCapacity),
+                entry_tokens_before: 0,
+                entry_tokens_after: 0,
+                cache_used_before: cache_used,
+                cache_used_after: cache_used,
+                requested_tokens: tokens,
+                hit_tokens: 0,
+            });
+        }
+    }
+
+    fn record_prefix_cache_mutation(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        now: Time,
+        mutation: PrefixCacheMutation,
+        event_kind: PrefixCacheEventKind,
+        retain_requested_tokens: u64,
+    ) {
+        self.record_prefix_cache_event(PrefixCacheEvent {
+            partition_id: partition,
+            time: now,
+            request_id: request,
+            session_id: mutation.session_id,
+            kind: event_kind,
+            entry_tokens_before: mutation.entry_tokens_before,
+            entry_tokens_after: mutation.entry_tokens_after,
+            cache_used_before: mutation.cache_used_before,
+            cache_used_after: mutation.cache_used_after,
+            requested_tokens: if mutation.kind == PrefixCacheMutationKind::Retain {
+                retain_requested_tokens
+            } else {
+                0
+            },
+            hit_tokens: 0,
+        });
+    }
+
+    fn record_prefix_cache_event(&mut self, event: PrefixCacheEvent) {
+        if let Some(logger) = &mut self.prefix_cache_logger {
+            logger.record(event);
+        }
     }
 
     #[inline]
@@ -580,68 +758,102 @@ impl FullAttnKv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::PrefixInput;
+    use std::fs::File;
+
+    use arrow_array::{StringArray, UInt64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use tempfile::tempdir;
+
+    use crate::common::SessionInput;
+
+    fn capped_prefix_cache(
+        max_retained_tokens: u64,
+        policy: PrefixCachePolicy,
+    ) -> PrefixCacheTokenConfig {
+        PrefixCacheTokenConfig {
+            max_retained_tokens,
+            policy,
+        }
+    }
 
     #[test]
     fn strict_capacity_gate_counts_promised_tokens() {
-        let mut kv_store = FullAttnKv::new(1, 100, None);
+        let mut kv_store = FullAttnKv::without_prefix_cache(1, 100, None);
         let candidate = kv_store.footprint(RequestId(0), 60, 30);
         assert!(kv_store.fits(0, &candidate));
 
         let reservation = kv_store.footprint(RequestId(1), 10, 10);
-        kv_store.reserve(RequestId(1), 0, reservation);
+        kv_store.reserve(RequestId(1), 0, reservation, Time::ZERO);
         assert!(!kv_store.fits(0, &candidate));
     }
 
     #[test]
     fn disabled_prefix_cache_recomputes_the_declared_prefix() {
-        let kv_store = FullAttnKv::new(1, 1_000, None);
-        let resolution = kv_store.plan_prefix(
+        let kv_store = FullAttnKv::without_prefix_cache(1, 1_000, None);
+        let resolved_prefill = kv_store.preview_prefill_context(
             0,
             20,
-            PrefixInput::Session {
+            SessionInput::Session {
                 session_id: 7,
+                session_start_time: Time::ZERO,
                 declared_prefix_tokens: 100,
             },
         );
-        assert_eq!(resolution.resident_prefix_tokens(), 0);
-        assert_eq!(resolution.prefill_compute_tokens(), 120);
-        assert_eq!(resolution.initial_context_tokens(), 120);
+        assert_eq!(resolved_prefill.resident_prefix_tokens(), 0);
+        assert_eq!(resolved_prefill.prefill_tokens_to_compute(), 120);
+        assert_eq!(resolved_prefill.post_prefill_context_tokens(), 120);
     }
 
     #[test]
     fn retained_prefix_partition_prefers_the_largest_hit_then_lower_partition() {
-        let mut kv_store = FullAttnKv::with_prefix_cache(3, 100, 100, PrefixCachePolicy::Lru, None);
+        let mut kv_store = FullAttnKv::with_prefix_cache(
+            3,
+            100,
+            capped_prefix_cache(100, PrefixCachePolicy::Lru),
+            None,
+            None,
+        );
         kv_store.prefix_caches[1].insert(7, 50, 100, None);
         kv_store.prefix_caches[2].insert(7, 80, 100, None);
 
         assert_eq!(
-            kv_store.retained_prefix_partition(PrefixInput::Session {
+            kv_store.retained_prefix_partition(SessionInput::Session {
                 session_id: 7,
+                session_start_time: Time::ZERO,
                 declared_prefix_tokens: 60,
             }),
             Some(2)
         );
         assert_eq!(
-            kv_store.retained_prefix_partition(PrefixInput::Session {
+            kv_store.retained_prefix_partition(SessionInput::Session {
                 session_id: 7,
+                session_start_time: Time::ZERO,
                 declared_prefix_tokens: 40,
             }),
             Some(1),
             "equal reusable lengths keep the lowest partition deterministic"
         );
-        assert_eq!(kv_store.retained_prefix_partition(PrefixInput::None), None);
+        assert_eq!(
+            kv_store.retained_prefix_partition(SessionInput::Standalone),
+            None
+        );
     }
 
     #[test]
     fn active_reservation_evicts_prefix_cache_within_one_total_capacity() {
-        let mut kv_store = FullAttnKv::with_prefix_cache(1, 100, 100, PrefixCachePolicy::Lru, None);
+        let mut kv_store = FullAttnKv::with_prefix_cache(
+            1,
+            100,
+            capped_prefix_cache(100, PrefixCachePolicy::Lru),
+            None,
+            None,
+        );
         kv_store.prefix_caches[0].insert(1, 80, 100, None);
         assert_eq!(kv_store.prefix_caches[0].used_tokens(), 80);
 
         let footprint = kv_store.footprint(RequestId(0), 60, 30);
         assert!(kv_store.fits(0, &footprint));
-        kv_store.reserve(RequestId(0), 0, footprint);
+        kv_store.reserve(RequestId(0), 0, footprint, Time::ZERO);
 
         assert_eq!(kv_store.partition_promised(0), 90);
         assert_eq!(kv_store.prefix_caches[0].used_tokens(), 0);
@@ -649,27 +861,118 @@ mod tests {
     }
 
     #[test]
+    fn direct_reservation_logs_active_kv_pressure_eviction() {
+        let log_directory = tempdir().unwrap();
+        let prefix_cache_logger =
+            PrefixCacheLogger::open(log_directory.path(), "main", crate::common::WorkerId(0))
+                .unwrap();
+        let mut kv_store = FullAttnKv::with_prefix_cache(
+            1,
+            100,
+            capped_prefix_cache(100, PrefixCachePolicy::Lru),
+            None,
+            Some(prefix_cache_logger),
+        );
+        let session_input = SessionInput::Session {
+            session_id: 7,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens: 0,
+        };
+        let resolved_prefill = kv_store.preview_prefill_context(0, 80, session_input);
+        let session_footprint = kv_store.footprint(RequestId(0), 80, 0);
+        kv_store.reserve_prefill_context(
+            RequestId(0),
+            0,
+            resolved_prefill,
+            session_footprint,
+            Time::ZERO,
+        );
+        kv_store.drain_ready();
+        kv_store.clear_prefill_admits(0);
+        kv_store.release_retaining_prefix(RequestId(0), 0, Time::from_ms(1.0));
+
+        let active_footprint = kv_store.footprint(RequestId(1), 60, 30);
+        assert!(kv_store.fits(0, &active_footprint));
+        kv_store.reserve(RequestId(1), 0, active_footprint, Time::from_ms(2.0));
+        drop(kv_store);
+
+        let path = log_directory
+            .path()
+            .join("raw/prefix_cache_event/worker_main_0.parquet");
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        let operations = batch
+            .column_by_name("operation")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let reasons = batch
+            .column_by_name("reason")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            (0..3).map(|row| operations.value(row)).collect::<Vec<_>>(),
+            ["activate", "retain", "evict"]
+        );
+        assert_eq!(
+            (0..3).map(|row| reasons.value(row)).collect::<Vec<_>>(),
+            ["miss", "request-complete", "active-kv-pressure"]
+        );
+
+        let cache_used_before = batch
+            .column_by_name("cache_used_before")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let cache_used_after = batch
+            .column_by_name("cache_used_after")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(cache_used_before.values(), &[0, 0, 80]);
+        assert_eq!(cache_used_after.values(), &[0, 80, 0]);
+    }
+
+    #[test]
     fn prefix_hit_moves_cache_ownership_to_the_request_then_returns_on_release() {
-        let mut kv_store = FullAttnKv::with_prefix_cache(1, 100, 100, PrefixCachePolicy::Lru, None);
+        let mut kv_store = FullAttnKv::with_prefix_cache(
+            1,
+            100,
+            capped_prefix_cache(100, PrefixCachePolicy::Lru),
+            None,
+            None,
+        );
         kv_store.prefix_caches[0].insert(7, 60, 100, None);
-        let resolution = kv_store.plan_prefix(
+        let resolved_prefill = kv_store.preview_prefill_context(
             0,
             10,
-            PrefixInput::Session {
+            SessionInput::Session {
                 session_id: 7,
+                session_start_time: Time::ZERO,
                 declared_prefix_tokens: 50,
             },
         );
-        assert_eq!(resolution.resident_prefix_tokens(), 50);
-        assert_eq!(resolution.prefill_compute_tokens(), 10);
+        assert_eq!(resolved_prefill.resident_prefix_tokens(), 50);
+        assert_eq!(resolved_prefill.prefill_tokens_to_compute(), 10);
+        assert_eq!(resolved_prefill.post_prefill_context_tokens(), 60);
 
         let footprint = kv_store.footprint(RequestId(0), 60, 10);
         assert!(kv_store.fits(0, &footprint));
-        kv_store.reserve_prefix(RequestId(0), 0, resolution, footprint);
+        kv_store.reserve_prefill_context(RequestId(0), 0, resolved_prefill, footprint, Time::ZERO);
         assert_eq!(kv_store.prefix_caches[0].used_tokens(), 0);
 
         kv_store.drain_ready();
-        kv_store.release_retaining_prefix(RequestId(0), 0);
+        kv_store.release_retaining_prefix(RequestId(0), 0, Time::from_ms(1.0));
         assert_eq!(kv_store.prefix_caches[0].peek(7, 60), 60);
         assert_eq!(kv_store.prefix_caches[0].used_tokens(), 60);
     }

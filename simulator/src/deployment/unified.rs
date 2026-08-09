@@ -30,7 +30,8 @@ use crate::orchestrator::{
 };
 use crate::timing::PerfApiBridge;
 use crate::worker::{
-    build_barebone_worker, build_hp_worker, IterWorker, IterWorkerSel, WorkerConfig,
+    build_barebone_worker, build_hp_worker, resolve_prefix_cache_config, IterWorker, IterWorkerSel,
+    WorkerConfig,
 };
 
 use super::Deployment;
@@ -69,28 +70,32 @@ impl Deployment for UnifiedDeployment {
             attn_gpu_memory_gb,
             gpu_time_multiplier,
             max_batch_tokens,
-            prefix_cache_gpu_memory_gb,
+            prefix_cache_mode,
             prefix_cache_policy,
+            prefix_cache_max_gpu_memory_gb,
         ) = match &g.worker {
             IterWorkerSel::Barebone {
                 attn_gpu_memory_gb,
                 gpu_time_multiplier,
                 max_batch_tokens,
-                prefix_cache_gpu_memory_gb,
+                prefix_cache_mode,
                 prefix_cache_policy,
+                prefix_cache_max_gpu_memory_gb,
             }
             | IterWorkerSel::HpUnified {
                 attn_gpu_memory_gb,
                 gpu_time_multiplier,
                 max_batch_tokens,
-                prefix_cache_gpu_memory_gb,
+                prefix_cache_mode,
                 prefix_cache_policy,
+                prefix_cache_max_gpu_memory_gb,
             } => (
                 *attn_gpu_memory_gb,
                 *gpu_time_multiplier,
                 *max_batch_tokens,
-                *prefix_cache_gpu_memory_gb,
+                *prefix_cache_mode,
                 *prefix_cache_policy,
+                *prefix_cache_max_gpu_memory_gb,
             ),
             IterWorkerSel::ChunkedPrefill { .. } => {
                 bail!("unified: chunked_prefill worker not wired yet")
@@ -99,11 +104,13 @@ impl Deployment for UnifiedDeployment {
                 bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
             }
         };
-        ensure!(
-            (0.0..=attn_gpu_memory_gb).contains(&prefix_cache_gpu_memory_gb),
-            "unified: prefix_cache_gpu_memory_gb must be within the total attention budget \
-             [0, {attn_gpu_memory_gb}], got {prefix_cache_gpu_memory_gb}"
-        );
+        let prefix_cache = resolve_prefix_cache_config(
+            "unified",
+            prefix_cache_mode,
+            prefix_cache_policy,
+            prefix_cache_max_gpu_memory_gb,
+            attn_gpu_memory_gb,
+        )?;
         let worker_config = WorkerConfig {
             attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
             log_output_token_times: cfg.io.log_output_token_times,
@@ -111,8 +118,7 @@ impl Deployment for UnifiedDeployment {
             kv_log_stride: cfg.io.kv_log_stride,
             gpu_time_multiplier,
             max_batch_tokens,
-            prefix_cache_capacity_bytes: (prefix_cache_gpu_memory_gb * 1e9) as u64,
-            prefix_cache_policy,
+            prefix_cache,
             ..WorkerConfig::default()
         };
 
@@ -432,8 +438,9 @@ mod tests {
             attn_gpu_memory_gb: 80.0,
             gpu_time_multiplier: 1.0,
             max_batch_tokens: None,
-            prefix_cache_gpu_memory_gb: 0.0,
+            prefix_cache_mode: crate::worker::PrefixCacheMode::Opportunistic,
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
+            prefix_cache_max_gpu_memory_gb: None,
         }
     }
 
@@ -442,8 +449,9 @@ mod tests {
             attn_gpu_memory_gb: 80.0,
             gpu_time_multiplier: 1.0,
             max_batch_tokens: None,
-            prefix_cache_gpu_memory_gb: 0.0,
+            prefix_cache_mode: crate::worker::PrefixCacheMode::Opportunistic,
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
+            prefix_cache_max_gpu_memory_gb: None,
         }
     }
 
@@ -471,8 +479,9 @@ mod tests {
         let pd_prefill = IterWorkerSel::PdPrefill {
             attn_gpu_memory_gb: 80.0,
             gpu_time_multiplier: 1.0,
-            prefix_cache_gpu_memory_gb: 0.0,
+            prefix_cache_mode: crate::worker::PrefixCacheMode::Opportunistic,
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
+            prefix_cache_max_gpu_memory_gb: None,
         };
         let error = ensure_hp_unified(&pd_prefill).unwrap_err().to_string();
         assert!(error.contains("worker `hp_unified`"));

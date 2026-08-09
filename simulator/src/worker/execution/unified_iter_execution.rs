@@ -37,12 +37,12 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
             let group = &mut out.groups[partition as usize];
             group.clear();
             kv_store.visit_prefill_admits(partition, |request| {
-                let (resident_prefix_tokens, prefill_compute_tokens) =
-                    kv_store.prefill_pair(request);
-                group
-                    .prefill_chunk_pairs
-                    .push((resident_prefix_tokens, prefill_compute_tokens));
-                group.prefill_tokens += prefill_compute_tokens;
+                let resolved_prefill = kv_store.resolved_prefill_context(request);
+                group.prefill_chunk_pairs.push((
+                    resolved_prefill.resident_prefix_tokens(),
+                    resolved_prefill.prefill_tokens_to_compute(),
+                ));
+                group.prefill_tokens += resolved_prefill.prefill_tokens_to_compute();
             });
             kv_store.visit_decode_members(partition, |_, current_kv| {
                 group.decode_kv_lens.push(current_kv as u32);

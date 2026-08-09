@@ -88,6 +88,10 @@ pub struct RequestTelemetry {
     pub first_output_time: Option<Time>,
     pub last_output_time: Option<Time>,
     pub output_times: Vec<Time>,
+    /// Prefix tokens physically found when this request was admitted. `None`
+    /// means admission never resolved a prefix context; `Some(0)` is a real
+    /// cold/disabled-cache result rather than missing telemetry.
+    pub prefix_cache_hit_tokens: Option<u32>,
 }
 
 /// One live request: immutable definition + progress + lifecycle + telemetry.
@@ -147,6 +151,28 @@ impl<Definition: RequestDefinition> ActiveRequest<Definition> {
 
     pub fn is_complete(&self) -> bool {
         self.request.definition.is_complete(&self.progress)
+    }
+}
+
+impl ActiveRequest<TextGenerationDefinition> {
+    /// Persist the one worker-local cache observation made at admission.
+    /// Request progress remains compute-only; the immutable declaration stays
+    /// in `definition.session` for comparison in request-level logs.
+    pub fn record_prefix_cache_hit_tokens(&mut self, prefix_cache_hit_tokens: u32) {
+        let declared_prefix_tokens = self.request.definition.session.declared_prefix_tokens();
+        assert!(
+            prefix_cache_hit_tokens <= declared_prefix_tokens,
+            "request {} hit {} prefix tokens but declared only {}",
+            self.request.core.id.0,
+            prefix_cache_hit_tokens,
+            declared_prefix_tokens,
+        );
+        assert!(
+            self.telemetry.prefix_cache_hit_tokens.is_none(),
+            "request {} recorded prefix-cache hit tokens more than once",
+            self.request.core.id.0,
+        );
+        self.telemetry.prefix_cache_hit_tokens = Some(prefix_cache_hit_tokens);
     }
 }
 

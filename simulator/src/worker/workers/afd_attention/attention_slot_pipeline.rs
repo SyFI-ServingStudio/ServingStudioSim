@@ -173,11 +173,15 @@ where
         self.advance_slot_layer(slot);
     }
 
-    pub(super) fn release_slotted_request(&mut self, request: RequestId) -> bool {
+    pub(super) fn release_slotted_request(&mut self, request: RequestId, now: Time) -> bool {
         let Some(slot) = self.request_to_slot.remove(&request) else {
             return false;
         };
-        self.kv_store.release_retaining_prefix(request, 0);
+        self.kv_store.release_retaining_prefix(request, 0, now);
+        // FFN Terminal release is asynchronous with respect to attention-layer
+        // sampling and may be this worker's final activity. Capture the post-
+        // release active/retained composition at the same lifecycle boundary.
+        self.kv_store.sample_submit(0, now);
         let slot_state = &mut self.slots[slot];
         slot_state.request_ids.retain(|&member| member != request);
         slot_state
@@ -243,7 +247,7 @@ where
                 .iter()
                 .map(|&request| {
                     if self.request_is_prefill(context, request) {
-                        u64::from(self.kv_store.prefill_compute_tokens(request))
+                        u64::from(self.kv_store.prefill_tokens_to_compute(request))
                     } else {
                         1
                     }
@@ -269,13 +273,13 @@ where
     }
 
     fn begin_decode(&mut self, context: &WorkerContext, request: RequestId) {
-        let initial_kv = self.kv_store.initial_context_tokens(request);
-        let remaining = {
+        let post_prefill_context_tokens = self.kv_store.post_prefill_context_tokens(request);
+        let remaining_output_tokens = {
             let mut store = context.requests.borrow_mut();
             let record = &mut store[request];
             if record.progress.output_tokens_emitted == 0 {
                 record.progress.prefill_tokens_processed =
-                    self.kv_store.prefill_compute_tokens(request);
+                    self.kv_store.prefill_tokens_to_compute(request);
             }
             record
                 .request
@@ -283,8 +287,12 @@ where
                 .target_output_tokens
                 .saturating_sub(record.progress.output_tokens_emitted)
         };
-        self.kv_store
-            .commit_resident(request, 0, initial_kv, remaining);
+        self.kv_store.commit_resident(
+            request,
+            0,
+            post_prefill_context_tokens,
+            remaining_output_tokens,
+        );
     }
 
     fn advance_completions(

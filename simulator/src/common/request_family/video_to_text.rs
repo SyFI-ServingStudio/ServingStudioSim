@@ -1,7 +1,7 @@
 use crate::common::request::Request;
 
 use super::{
-    DecodingStrategy, PrefixInput, RequestDefinition, TextGenerationProgress, VideoExtent,
+    DecodingStrategy, RequestDefinition, SessionInput, TextGenerationProgress, VideoExtent,
 };
 
 /// Video-and-text in, autoregressive-text-out request definition.
@@ -11,7 +11,7 @@ pub struct VideoTextGenerationDefinition {
     pub encoded_input_tokens: u32,
     pub target_output_tokens: u32,
     pub extent: VideoExtent,
-    pub prefix: PrefixInput,
+    pub session: SessionInput,
     pub decoding: DecodingStrategy,
 }
 

@@ -29,8 +29,9 @@ use crate::orchestrator::{
 use crate::timing::kernels::{P2pInterKernel, P2pInterKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
-    build_pd_decode_worker, build_pd_prefill_worker, CostSource, IterWorkerSel, PdDecodeWorker,
-    PdPrefillWorker, WorkerConfig,
+    build_pd_decode_worker, build_pd_prefill_worker, resolve_prefix_cache_config, CostSource,
+    IterWorkerSel, PdDecodeWorker, PdPrefillWorker, PrefixCacheMode, PrefixCachePolicy,
+    WorkerConfig,
 };
 
 use super::Deployment;
@@ -226,44 +227,58 @@ fn worker_config(
     log_stage_transitions: bool,
     kv_log_stride: u32,
 ) -> anyhow::Result<WorkerConfig> {
-    let (attn_gpu_memory_gb, gpu_time_multiplier, prefix_cache_gpu_memory_gb, prefix_cache_policy) =
-        match worker {
-            IterWorkerSel::PdPrefill {
-                attn_gpu_memory_gb,
-                gpu_time_multiplier,
-                prefix_cache_gpu_memory_gb,
-                prefix_cache_policy,
-            } => (
-                *attn_gpu_memory_gb,
-                *gpu_time_multiplier,
-                *prefix_cache_gpu_memory_gb,
+    let (attn_gpu_memory_gb, gpu_time_multiplier, prefix_cache) = match worker {
+        IterWorkerSel::PdPrefill {
+            attn_gpu_memory_gb,
+            gpu_time_multiplier,
+            prefix_cache_mode,
+            prefix_cache_policy,
+            prefix_cache_max_gpu_memory_gb,
+        } => (
+            *attn_gpu_memory_gb,
+            *gpu_time_multiplier,
+            resolve_prefix_cache_config(
+                "pd prefill",
+                *prefix_cache_mode,
                 *prefix_cache_policy,
-            ),
-            IterWorkerSel::PdDecode {
-                attn_gpu_memory_gb,
-                gpu_time_multiplier,
-            } => (
+                *prefix_cache_max_gpu_memory_gb,
                 *attn_gpu_memory_gb,
-                *gpu_time_multiplier,
-                0.0,
-                crate::worker::PrefixCachePolicy::Lru,
-            ),
-            // ensure_* gates the worker tag before this is reached.
-            _ => (80.0, 1.0, 0.0, crate::worker::PrefixCachePolicy::Lru),
-        };
-    ensure!(
-        (0.0..=attn_gpu_memory_gb).contains(&prefix_cache_gpu_memory_gb),
-        "pd: prefix_cache_gpu_memory_gb must be within the total attention budget \
-         [0, {attn_gpu_memory_gb}], got {prefix_cache_gpu_memory_gb}"
-    );
+            )?,
+        ),
+        IterWorkerSel::PdDecode {
+            attn_gpu_memory_gb,
+            gpu_time_multiplier,
+        } => (
+            *attn_gpu_memory_gb,
+            *gpu_time_multiplier,
+            resolve_prefix_cache_config(
+                "pd decode",
+                PrefixCacheMode::Disabled,
+                PrefixCachePolicy::Lru,
+                None,
+                *attn_gpu_memory_gb,
+            )?,
+        ),
+        // ensure_* gates the worker tag before this is reached.
+        _ => (
+            80.0,
+            1.0,
+            resolve_prefix_cache_config(
+                "pd",
+                PrefixCacheMode::Disabled,
+                PrefixCachePolicy::Lru,
+                None,
+                80.0,
+            )?,
+        ),
+    };
     Ok(WorkerConfig {
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
         log_stage_transitions,
         kv_log_stride,
         gpu_time_multiplier,
-        prefix_cache_capacity_bytes: (prefix_cache_gpu_memory_gb * 1e9) as u64,
-        prefix_cache_policy,
+        prefix_cache,
         ..WorkerConfig::default()
     })
 }

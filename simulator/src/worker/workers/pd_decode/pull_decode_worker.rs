@@ -338,7 +338,7 @@ where
                     .saturating_sub(prompt_kv);
                 // `reserve` makes the KV partition sticky; `commit_resident`
                 // immediately clears the transient promise and enters decode.
-                self.kv_store.reserve(request, partition, footprint);
+                self.kv_store.reserve(request, partition, footprint, now);
                 self.kv_store
                     .commit_resident(request, partition, prompt_kv, remaining);
 
@@ -476,6 +476,7 @@ mod tests {
     use crate::worker::gpu_cluster::SharedGpuCluster;
     use crate::worker::types::WorkerConfig;
     use crate::worker::workers::pd_decode::build_pd_decode_worker;
+    use tempfile::tempdir;
 
     fn worker(store: SharedRequests) -> PdDecodeWorker<FakeModel> {
         worker_with_partitions(store, 1)
@@ -548,6 +549,25 @@ mod tests {
     fn builds_one_decode_partition_per_dp_shard() {
         let worker = worker_with_partitions(prefilled_store(&[]), 2);
         assert_eq!(worker.kv_store.num_partitions(), 2);
+    }
+
+    #[test]
+    fn decode_recipe_does_not_open_a_prefix_cache_event_stream() {
+        let log_directory = tempdir().unwrap();
+        let worker = build_pd_decode_worker(
+            WorkerId(0),
+            "decode",
+            Arc::new(FakeModel::for_ms(1.0)),
+            prefilled_store(&[]),
+            WorkerConfig::default(),
+            Some(log_directory.path().to_path_buf()),
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        drop(worker);
+
+        assert!(!log_directory.path().join("raw/prefix_cache_event").exists());
     }
 
     #[test]

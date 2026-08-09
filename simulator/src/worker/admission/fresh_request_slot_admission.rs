@@ -50,23 +50,33 @@ where
             !self.policy.contains(request),
             "AFD Admit is once-per-request; duplicate pending request {request:?}"
         );
-        let (prompt_tokens, remaining, prefix) = {
+        let (fresh_prompt_tokens, remaining_output_tokens, session_input, conversation_start_time) = {
             let mut store = context.requests.borrow_mut();
             let record = &mut store[request];
-            let prompt_tokens = record.request.definition.prompt_tokens;
-            let remaining = record
+            let fresh_prompt_tokens = record.request.definition.prompt_tokens;
+            let remaining_output_tokens = record
                 .request
                 .definition
                 .target_output_tokens
                 .saturating_sub(record.progress.output_tokens_emitted);
-            let prefix = record.request.definition.prefix;
-            let arrival = record.request.core.arrival_time;
-            context.stamp_stage(record, arrival, AfdStage::Pending as u16);
-            (prompt_tokens, remaining, prefix)
+            let session_input = record.request.definition.session;
+            let arrival_time = record.request.core.arrival_time;
+            let conversation_start_time = session_input.session_start_or(arrival_time);
+            context.stamp_stage(record, arrival_time, AfdStage::Pending as u16);
+            (
+                fresh_prompt_tokens,
+                remaining_output_tokens,
+                session_input,
+                conversation_start_time,
+            )
         };
-        let candidate = self
-            .enqueue_sequence
-            .freeze(request, prompt_tokens, remaining, prefix);
+        let candidate = self.enqueue_sequence.freeze(
+            request,
+            fresh_prompt_tokens,
+            remaining_output_tokens,
+            session_input,
+            conversation_start_time,
+        );
         self.policy.push(candidate, &mut self.policy_context);
     }
 
@@ -78,28 +88,40 @@ where
     ) -> &'a [RequestId] {
         self.admitted_requests.clear();
         while let Some(candidate) = self.policy.peek() {
-            if candidate.decode == 0 {
+            if candidate.remaining_output_tokens == 0 {
                 self.pop_selected(candidate);
                 continue;
             }
-            let resolution = kv_store.plan_prefix(0, candidate.prompt, candidate.prefix);
+            let resolved_prefill = kv_store.preview_prefill_context(
+                0,
+                candidate.fresh_prompt_tokens,
+                candidate.session_input,
+            );
             let footprint = kv_store.footprint(
-                candidate.request,
-                resolution.initial_context_tokens(),
-                candidate.decode,
+                candidate.request_id,
+                resolved_prefill.post_prefill_context_tokens(),
+                candidate.remaining_output_tokens,
             );
             if !kv_store.fits(0, &footprint) {
                 break;
             }
             self.pop_selected(candidate);
-            kv_store.reserve_prefix(candidate.request, 0, resolution, footprint);
+            kv_store.reserve_prefill_context(
+                candidate.request_id,
+                0,
+                resolved_prefill,
+                footprint,
+                now,
+            );
 
             {
                 let mut store = context.requests.borrow_mut();
-                store.mark_admitted(candidate.request);
-                context.stamp_stage(&mut store[candidate.request], now, AfdStage::Prefill as u16);
+                store.mark_admitted(candidate.request_id);
+                let record = &mut store[candidate.request_id];
+                record.record_prefix_cache_hit_tokens(resolved_prefill.resident_prefix_tokens());
+                context.stamp_stage(record, now, AfdStage::Prefill as u16);
             }
-            self.admitted_requests.push(candidate.request);
+            self.admitted_requests.push(candidate.request_id);
         }
         &self.admitted_requests
     }

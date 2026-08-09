@@ -1,27 +1,54 @@
-/// Session/prefix declaration attached to an autoregressive request.
+use crate::common::Time;
+
+/// Conversation context declared for one autoregressive request.
+///
+/// A session's identity, trace-declared start, and reusable-prefix requirement
+/// stay in one variant so downstream code cannot observe only a subset.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PrefixInput {
+pub enum SessionInput {
     #[default]
-    None,
+    Standalone,
     Session {
         session_id: u32,
+        /// The first `arrival_time` declared for this session in the trace.
+        session_start_time: Time,
         /// Trace-declared reusable KV. This is a requirement, not an observed
         /// cache hit; a prefix-capable KV implementation must resolve it.
         declared_prefix_tokens: u32,
     },
 }
 
-impl PrefixInput {
+impl SessionInput {
     pub const fn session_id(self) -> Option<u32> {
         match self {
-            Self::None => None,
+            Self::Standalone => None,
             Self::Session { session_id, .. } => Some(session_id),
+        }
+    }
+
+    pub const fn session_start_time(self) -> Option<Time> {
+        match self {
+            Self::Standalone => None,
+            Self::Session {
+                session_start_time, ..
+            } => Some(session_start_time),
+        }
+    }
+
+    /// Oldest-session-first key, with a standalone request treated as its own
+    /// one-request conversation.
+    pub const fn session_start_or(self, standalone_arrival_time: Time) -> Time {
+        match self {
+            Self::Standalone => standalone_arrival_time,
+            Self::Session {
+                session_start_time, ..
+            } => session_start_time,
         }
     }
 
     pub const fn declared_prefix_tokens(self) -> u32 {
         match self {
-            Self::None => 0,
+            Self::Standalone => 0,
             Self::Session {
                 declared_prefix_tokens,
                 ..

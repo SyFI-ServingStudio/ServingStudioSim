@@ -17,7 +17,7 @@ use arrow_schema::{DataType, Field};
 
 use crate::log::schemas::{
     cost_log_schema, gpu_cluster_schema, group_input_fields, kv_snapshot_schema,
-    request_slo_schema, request_state_schema,
+    prefix_cache_event_schema, request_slo_schema, request_state_schema,
 };
 use crate::timing::SlotInput;
 
@@ -62,10 +62,10 @@ pub struct RequestSloEntry {
     /// Absolute sim-time (ms) of the final output token (= `last_token_time`),
     /// so E2E = `finish - arrival` survives `log_output_token_times` off.
     pub finish_decode_time_ms: Option<f32>,
-    /// Terminal prefill length (`= RequestRecord::prefill_processed`): the `p` in
-    /// the `workload_conservation` expected-work closed forms (`num_output_tokens`
-    /// is the matching `d`). Full prompt for a completed request, partial for a
-    /// sim-end-flush still in prefill.
+    /// Terminal prefill compute (`= RequestRecord::prefill_processed`): fresh
+    /// prompt plus any declared-prefix miss, but never a resident cache hit.
+    /// This is complete compute work after the first output token, or partial
+    /// work for a sim-end-flush request still in prefill.
     pub prefill_processed: u32,
     /// Per-request stage/location transition timeline: four parallel, equal-length
     /// arrays (`stage_times_ms[i]` the request entered stage `stage_codes[i]` on
@@ -77,7 +77,18 @@ pub struct RequestSloEntry {
     pub stage_codes: Vec<u16>,
     pub stage_pool_ids: Vec<u16>,
     pub stage_worker_ids: Vec<u16>,
-    // Multi-round / session columns are deliberately NOT carried here today.
+    /// Immutable reusable-prefix requirement from the request definition.
+    pub declared_prefix_tokens: u32,
+    /// Prefix tokens physically found at admission. `None` means the request
+    /// never reached prefix resolution; `Some(0)` records an actual miss.
+    pub prefix_cache_hit_tokens: Option<u32>,
+    /// Immutable fresh suffix requested by this text-generation request. Kept
+    /// independently from runtime prefill work so conservation can verify
+    /// `hit + computed = fresh + declared` instead of deriving its own input.
+    pub fresh_prompt_tokens: u32,
+    // Multi-round identity/grouping columns are deliberately NOT carried here
+    // today. The prefix fields above are per-request requirement/observation
+    // facts and do not imply a multi-round lifecycle.
     // The current request lifecycle is single-round, so `session_id`,
     // `round_idx`, `total_rounds`,
     // `tool_wait_after_ms`, `session_arrival_time_ms`, `preserved_prefix_kv`,
@@ -458,6 +469,8 @@ pub struct KvSnapshotEntry {
     pub time_ms: f64,
     /// Peak committed KV over the throttle window (the "current size").
     pub active_kv: u64,
+    /// Prefix-cache component captured at the same submit that set `active_kv`.
+    pub retained_prefix_kv: u64,
     /// Peak KV the currently-admitted set will reach as it drains
     /// (the full-attention partition's projected-peak cache) — the "future estimate".
     pub projected_peak: u64,
@@ -477,6 +490,7 @@ pub(crate) fn kv_to_record_batch(
     let group_id: Vec<u16> = entries.iter().map(|e| e.group_id).collect();
     let time_ms: Vec<f64> = entries.iter().map(|e| e.time_ms).collect();
     let active: Vec<u64> = entries.iter().map(|e| e.active_kv).collect();
+    let retained_prefix: Vec<u64> = entries.iter().map(|e| e.retained_prefix_kv).collect();
     let peak: Vec<u64> = entries.iter().map(|e| e.projected_peak).collect();
     let promised: Vec<u64> = entries.iter().map(|e| e.promised_kv).collect();
 
@@ -488,8 +502,125 @@ pub(crate) fn kv_to_record_batch(
             Arc::new(UInt16Array::from(group_id)),
             Arc::new(Float64Array::from(time_ms)),
             Arc::new(UInt64Array::from(active)),
+            Arc::new(UInt64Array::from(retained_prefix)),
             Arc::new(UInt64Array::from(peak)),
             Arc::new(UInt64Array::from(promised)),
+        ],
+    )?)
+}
+
+/// One exact prefix-cache ownership transition. Rows are ordered by `sequence`
+/// within a `(pool_tag, worker_id)` file; token before/after fields make the
+/// stream independently replayable without consulting sampled occupancy.
+#[derive(Clone, Copy, Debug)]
+pub struct PrefixCacheEventEntry {
+    pub worker_id: u16,
+    pub partition_id: u16,
+    pub sequence: u64,
+    pub time_ms: f64,
+    pub request_id: u32,
+    pub session_id: u32,
+    pub operation: &'static str,
+    pub reason: &'static str,
+    pub entry_tokens_before: u64,
+    pub entry_tokens_after: u64,
+    pub cache_used_before: u64,
+    pub cache_used_after: u64,
+    pub requested_tokens: u64,
+    pub hit_tokens: u64,
+}
+
+pub(crate) fn prefix_cache_event_to_record_batch(
+    pool_tag: &str,
+    entries: &[PrefixCacheEventEntry],
+) -> Result<RecordBatch> {
+    Ok(RecordBatch::try_new(
+        prefix_cache_event_schema(),
+        vec![
+            Arc::new(StringArray::from(
+                entries.iter().map(|_| pool_tag).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt16Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.worker_id)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt16Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.partition_id)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.sequence)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.time_ms)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.request_id)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.session_id)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.operation)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                entries.iter().map(|entry| entry.reason).collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.entry_tokens_before)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.entry_tokens_after)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.cache_used_before)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.cache_used_after)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.requested_tokens)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                entries
+                    .iter()
+                    .map(|entry| entry.hit_tokens)
+                    .collect::<Vec<_>>(),
+            )),
         ],
     )?)
 }
@@ -514,6 +645,11 @@ pub(crate) fn slo_to_record_batch(
     // which is empty when `log_output_token_times` is off).
     let num_tokens: Vec<u32> = entries.iter().map(|e| e.num_output_tokens).collect();
     let prefill_processed: Vec<u32> = entries.iter().map(|e| e.prefill_processed).collect();
+    let declared_prefix_tokens: Vec<u32> =
+        entries.iter().map(|e| e.declared_prefix_tokens).collect();
+    let prefix_cache_hit_tokens: Vec<Option<u32>> =
+        entries.iter().map(|e| e.prefix_cache_hit_tokens).collect();
+    let fresh_prompt_tokens: Vec<u32> = entries.iter().map(|e| e.fresh_prompt_tokens).collect();
     let ttft: Vec<Option<f32>> = entries.iter().map(|e| e.ttft_ms).collect();
     let finish_decode: Vec<Option<f32>> = entries.iter().map(|e| e.finish_decode_time_ms).collect();
     let tpot_mean: Vec<Option<f32>> = entries.iter().map(|e| e.tpot_mean_ms).collect();
@@ -607,6 +743,9 @@ pub(crate) fn slo_to_record_batch(
             Arc::new(stage_codes_col),
             Arc::new(stage_pool_ids),
             Arc::new(stage_worker_ids),
+            Arc::new(UInt32Array::from(declared_prefix_tokens)),
+            Arc::new(UInt32Array::from(prefix_cache_hit_tokens)),
+            Arc::new(UInt32Array::from(fresh_prompt_tokens)),
         ],
     )?)
 }
@@ -714,6 +853,9 @@ mod tests {
             stage_codes: Vec::new(),
             stage_pool_ids: Vec::new(),
             stage_worker_ids: Vec::new(),
+            declared_prefix_tokens: 0,
+            prefix_cache_hit_tokens: Some(0),
+            fresh_prompt_tokens: 0,
         }
     }
 
@@ -942,6 +1084,48 @@ mod tests {
             .downcast_ref::<Float32Array>()
             .unwrap();
         assert_eq!(finish.value(0), 5.0, "E2E scalar survives array-off");
+    }
+
+    #[test]
+    fn slo_prefix_columns_distinguish_unresolved_miss_and_hit() {
+        let mut unresolved = slo_entry(0, Vec::new());
+        unresolved.declared_prefix_tokens = 100;
+        unresolved.prefix_cache_hit_tokens = None;
+        unresolved.fresh_prompt_tokens = 24;
+        let mut miss = slo_entry(1, Vec::new());
+        miss.declared_prefix_tokens = 100;
+        miss.prefix_cache_hit_tokens = Some(0);
+        miss.fresh_prompt_tokens = 24;
+        let mut partial_hit = slo_entry(2, Vec::new());
+        partial_hit.declared_prefix_tokens = 100;
+        partial_hit.prefix_cache_hit_tokens = Some(60);
+        partial_hit.fresh_prompt_tokens = 24;
+
+        let batch = slo_to_record_batch(&[unresolved, miss, partial_hit], false, false).unwrap();
+        let declared = batch
+            .column_by_name("declared_prefix_tokens")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let hit = batch
+            .column_by_name("prefix_cache_hit_tokens")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let fresh = batch
+            .column_by_name("fresh_prompt_tokens")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+
+        assert_eq!(declared.values(), &[100, 100, 100]);
+        assert_eq!(fresh.values(), &[24, 24, 24]);
+        assert!(hit.is_null(0), "never-resolved admission must remain null");
+        assert_eq!(hit.value(1), 0, "a resolved cold cache is a real miss");
+        assert_eq!(hit.value(2), 60, "partial hits preserve the token count");
     }
 
     #[test]

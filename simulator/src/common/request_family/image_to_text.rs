@@ -1,7 +1,7 @@
 use crate::common::request::Request;
 
 use super::{
-    DecodingStrategy, ImageExtent, PrefixInput, RequestDefinition, TextGenerationProgress,
+    DecodingStrategy, ImageExtent, RequestDefinition, SessionInput, TextGenerationProgress,
 };
 
 /// Image-and-text in, autoregressive-text-out request definition.
@@ -11,7 +11,7 @@ pub struct ImageTextGenerationDefinition {
     pub encoded_input_tokens: u32,
     pub target_output_tokens: u32,
     pub extent: ImageExtent,
-    pub prefix: PrefixInput,
+    pub session: SessionInput,
     pub decoding: DecodingStrategy,
 }
 

@@ -59,7 +59,11 @@ pub(crate) fn build_pd_decode_worker<M: IterwiseUnifiedModel>(
         LoadBalance::Single if num_partitions > 1 => LoadBalance::RoundRobin { next: 0 },
         configured => configured,
     };
-    let kv_store = FullAttnKv::new(num_partitions, essentials.kv_capacity, essentials.sampler);
+    let kv_store = FullAttnKv::without_prefix_cache(
+        num_partitions,
+        essentials.kv_capacity,
+        essentials.sampler,
+    );
 
     PullDecodeWorker::from_components(
         essentials.context,

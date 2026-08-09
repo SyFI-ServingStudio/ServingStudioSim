@@ -15,7 +15,9 @@ pub use fresh_request_slot_admission::FreshRequestSlotAdmission;
 pub use local_prefill_decode_admission::LocalPrefillDecodeAdmission;
 pub use placement::LoadBalance;
 pub(crate) use policy::EnqueueSequence;
-pub use policy::{AdmissionCandidate, FifoOrder, PendingOrderPolicy, ShortestJobFirst};
+pub use policy::{
+    AdmissionCandidate, FifoOrder, PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
+};
 pub use prefill_handoff_admission::PrefillHandoffAdmission;
 pub(crate) use token_budget::prefill_fits_budget;
 

@@ -460,13 +460,16 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         stage_codes,
         stage_pool_ids,
         stage_worker_ids,
+        declared_prefix_tokens: rec.request.definition.session.declared_prefix_tokens(),
+        prefix_cache_hit_tokens: rec.telemetry.prefix_cache_hit_tokens,
+        fresh_prompt_tokens: rec.request.definition.prompt_tokens,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{PoolId, RequestStore, UnifiedStage, WorkerId};
+    use crate::common::{PoolId, RequestStore, SessionInput, UnifiedStage, WorkerId};
     use crate::orchestrator::{
         DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
     };
@@ -636,7 +639,13 @@ mod tests {
         let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
         {
             let mut s = store.borrow_mut();
-            s.insert(text_request(RequestId(0), 8, 2, Time::ZERO));
+            let mut request = text_request(RequestId(0), 8, 2, Time::ZERO);
+            request.definition.session = SessionInput::Session {
+                session_id: 7,
+                session_start_time: Time::ZERO,
+                declared_prefix_tokens: 100,
+            };
+            s.insert(request);
             s[RequestId(0)].record_stage(
                 Time::ZERO,
                 UnifiedStage::Pending as u16,
@@ -668,6 +677,30 @@ mod tests {
             .downcast_ref::<UInt32Array>()
             .unwrap();
         assert_eq!(request_ids.value(0), 0);
+        let declared_prefix_tokens = batch
+            .column_by_name("declared_prefix_tokens")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(declared_prefix_tokens.value(0), 100);
+        let fresh_prompt_tokens = batch
+            .column_by_name("fresh_prompt_tokens")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(fresh_prompt_tokens.value(0), 8);
+        let prefix_cache_hit_tokens = batch
+            .column_by_name("prefix_cache_hit_tokens")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert!(
+            prefix_cache_hit_tokens.is_null(0),
+            "a request that never reached admission has no cache observation"
+        );
         let stage_codes = batch
             .column_by_name("stage_codes")
             .unwrap()

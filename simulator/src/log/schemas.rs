@@ -1,4 +1,4 @@
-//! Arrow schema definitions for the five VibeSim parquet streams.
+//! Arrow schema definitions for the VibeSim parquet streams.
 //!
 //! Modeled on `ref/moesim-rs/src/logging/schemas.rs` — each stream gets a
 //! `pub fn xxx_schema() -> Arc<Schema>` returning a real
@@ -156,12 +156,38 @@ pub fn kv_snapshot_schema() -> Arc<Schema> {
         Field::new("time_ms", DataType::Float64, false),
         // `active_kv`: peak committed KV over the throttle window (a running max,
         // so decimated sampling never hides an occupancy spike) — the "current
-        // size". `projected_peak`: the max KV the currently-admitted set will reach
-        // as it drains (the partition projected-peak cache) — the "future estimate".
-        // `promised_kv`: admitted-but-not-yet-realized tokens.
+        // size". `retained_prefix_kv`: the prefix-cache component from the same
+        // submit that set the active peak. `projected_peak`: the max KV the
+        // currently-admitted set will reach as it drains (the partition
+        // projected-peak cache) — the "future estimate". `promised_kv`:
+        // admitted-but-not-yet-realized tokens.
         Field::new("active_kv", DataType::UInt64, false),
+        Field::new("retained_prefix_kv", DataType::UInt64, false),
         Field::new("projected_peak", DataType::UInt64, false),
         Field::new("promised_kv", DataType::UInt64, false),
+    ]))
+}
+
+/// `prefix_cache_event` — an exact per-worker replay of retained-prefix cache
+/// ownership transitions. Unlike the throttled `kv_snapshot`, every row is a
+/// real cache operation and `sequence` totally orders equal-time mutations.
+pub fn prefix_cache_event_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("pool_tag", DataType::Utf8, false),
+        Field::new("worker_id", DataType::UInt16, false),
+        Field::new("partition_id", DataType::UInt16, false),
+        Field::new("sequence", DataType::UInt64, false),
+        Field::new("time_ms", DataType::Float64, false),
+        Field::new("request_id", DataType::UInt32, false),
+        Field::new("session_id", DataType::UInt32, false),
+        Field::new("operation", DataType::Utf8, false),
+        Field::new("reason", DataType::Utf8, false),
+        Field::new("entry_tokens_before", DataType::UInt64, false),
+        Field::new("entry_tokens_after", DataType::UInt64, false),
+        Field::new("cache_used_before", DataType::UInt64, false),
+        Field::new("cache_used_after", DataType::UInt64, false),
+        Field::new("requested_tokens", DataType::UInt64, false),
+        Field::new("hit_tokens", DataType::UInt64, false),
     ]))
 }
 
@@ -309,6 +335,12 @@ pub fn request_slo_schema() -> Arc<Schema> {
             DataType::List(Arc::new(Field::new("item", DataType::UInt16, false))),
             false,
         ),
+        // Immutable prefix/fresh request facts and the worker-local observation
+        // made at admission. A nullable hit distinguishes never-resolved from a
+        // real zero-token miss. Appended last to keep the schema append-only.
+        Field::new("declared_prefix_tokens", DataType::UInt32, false),
+        Field::new("prefix_cache_hit_tokens", DataType::UInt32, true),
+        Field::new("fresh_prompt_tokens", DataType::UInt32, false),
     ]))
 }
 
@@ -319,6 +351,7 @@ pub const ALL_STREAMS: &[&str] = &[
     "gpu_cluster",
     "kv_snapshot",
     "network_event",
+    "prefix_cache_event",
     "request_state",
     "request_slo",
 ];

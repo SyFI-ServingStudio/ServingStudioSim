@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::arch::contract::AttnLayerwiseModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
-use crate::worker::admission::{FifoOrder, FreshRequestSlotAdmission};
+use crate::worker::admission::{FreshRequestSlotAdmission, SessionStartOrder};
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::types::WorkerConfig;
 
@@ -38,7 +38,7 @@ pub(crate) fn build_afd_attention_worker<M: AttnLayerwiseModel>(
     SlotAttentionWorker::from_components(
         essentials.context,
         essentials.kv_store,
-        FreshRequestSlotAdmission::new(FifoOrder::new(), ()),
+        FreshRequestSlotAdmission::new(SessionStartOrder::new(), ()),
         essentials.execution,
         essentials.cluster,
         essentials.receive_group_id,

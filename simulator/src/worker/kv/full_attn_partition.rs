@@ -229,8 +229,14 @@ impl FullAttnPartitionState {
     ///
     /// This is the partition-local implementation of
     /// `KvStore::commit_resident`.
-    pub(super) fn begin_decode(&mut self, request: RequestId, initial_kv: u64, decode_budget: u32) {
-        self.capacity.add_resident_tokens(initial_kv);
+    pub(super) fn begin_decode(
+        &mut self,
+        request: RequestId,
+        post_prefill_context_tokens: u64,
+        decode_budget: u32,
+    ) {
+        self.capacity
+            .add_resident_tokens(post_prefill_context_tokens);
         debug_assert!(
             !self.decode_index.contains_key(&request),
             "begin_decode: {request:?} already resident — decode ids are unique"
@@ -239,7 +245,7 @@ impl FullAttnPartitionState {
         self.decodes.push((
             request,
             ResidentDecodeState {
-                current_kv: initial_kv,
+                current_kv: post_prefill_context_tokens,
                 remaining_decode: decode_budget,
             },
         ));

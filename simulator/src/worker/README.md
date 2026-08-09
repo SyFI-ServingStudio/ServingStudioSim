@@ -35,11 +35,11 @@ different timelines and should not be hidden behind one giant FSM abstraction.
 
 | Worker selector | KV | Admission | Execution | Shell |
 |---|---|---|---|---|
-| `barebone` | `FullAttnKv` | `LocalPrefillDecodeAdmission<FifoOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
-| `hp_unified` | `FullAttnKv` with N partitions | `LocalPrefillDecodeAdmission<FifoOrder>` with prefix affinity then RR misses | `UnifiedIterExecution` | `IterBatchWorker` |
-| `pd_prefill` | `FullAttnKv` with held-KV ledger | `PrefillHandoffAdmission<FifoOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
+| `barebone` | `FullAttnKv` | `LocalPrefillDecodeAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
+| `hp_unified` | `FullAttnKv` with N partitions | `LocalPrefillDecodeAdmission<SessionStartOrder>` with prefix affinity then RR misses | `UnifiedIterExecution` | `IterBatchWorker` |
+| `pd_prefill` | `FullAttnKv` with held-KV ledger | `PrefillHandoffAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
 | `pd_decode` | `FullAttnKv` | thin inline landed-request ingress | `UnifiedIterExecution` | `PullDecodeWorker` |
-| `disagg_attn` | `FullAttnKv` | `FreshRequestSlotAdmission<FifoOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
+| `disagg_attn` | `FullAttnKv` | `FreshRequestSlotAdmission<SessionStartOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
 | `disagg_ffn` | none | none; L6 sends complete tasks | `FfnSectionExecutionAdapter` | `BufferedFfnWorker` |
 
 Aliases such as `BareboneWorker<M>` and `DisaggAttnWorker<M>` name these concrete
@@ -87,7 +87,7 @@ footprint → fits → reserve → commit_resident → advance → release
 - one private `FullAttnPartitionState` per independent KV partition;
 - the promised reservation ledger;
 - the PD-prefill held-KV ledger;
-- runtime session-prefix resolution and one retained-prefix cache per partition;
+- resolved request-prefill contexts and one retained-prefix cache per partition;
 - worker-local retained-prefix partition lookup;
 - sticky request→partition ownership;
 - strict admission and KV sampling.
@@ -110,22 +110,46 @@ token gate belong to admission (`admission/placement.rs` and
 `admission/token_budget.rs`); there is no mixed `admission_helpers` module or
 one-variant capacity-policy seam.
 
-`PrefixInput` remains an immutable request declaration. Admission asks
+`SessionInput` remains one closed immutable request declaration: either
+`Standalone`, or a session id plus its first trace arrival and declared reusable
+prefix. Admission asks
 `PrefixKv` to locate the best retained match before fallback placement, resolve
 that partition's hit, gate the actual compute
-`fresh + declared - resident`, and reserve the full context `fresh + declared`.
+`fresh + declared - resident`, and reserve the post-prefill context
+`fresh + declared`.
 An HP request waits when its retained owner is full; only a cold or evicted
-session advances RR. Execution reads the resolution from KV; request progress
-records processed prefill work, not cache residency.
+session advances RR. Execution reads `ResolvedPrefillContext` from KV; request
+progress records processed prefill work, not cache residency. At successful
+admission, the resolved resident count is copied once to
+`RequestTelemetry.prefix_cache_hit_tokens`; L7 writes that nullable observation
+beside the immutable declaration in `request_slo` (`None` = never resolved,
+`Some(0)` = resolved miss).
 
 Retained prefix KV is evictable occupancy inside the same total attention
-capacity as active, promised, and PD-held KV. `prefix_cache_capacity_bytes` is
-only a cache ceiling: active reservations shrink/evict retained entries to
-preserve the physical capacity invariant. A hit transfers ownership out of the
-cache until completion, so there is no inter-request sharing. PD prefill returns
-held KV to the cache only after decode acknowledges the pull. The implementation
-lives in `kv/prefix_cache.rs`; `kv/full_attn.rs` owns the combined ledger and
-capacity gate.
+capacity as active, promised, and PD-held KV. `WorkerConfig::prefix_cache` is a
+validated typed contract: `Opportunistic` uses all dynamically available slack
+by default and may carry an optional retained-byte ceiling; `Disabled` is the
+explicit no-reuse baseline. Active reservations shrink/evict retained entries
+to preserve the physical capacity invariant. A hit transfers ownership out of
+the cache until completion, so there is no inter-request sharing. PD prefill
+returns held KV to the cache only after decode acknowledges the pull. The
+implementation lives in `kv/prefix_cache.rs`; `kv/full_attn.rs` owns the
+combined ledger and capacity gate.
+
+The same combined accounting feeds `kv_snapshot`: `active_kv` remains total
+committed attention KV, while `retained_prefix_kv` exposes its retained-cache
+component. The sampler keeps both values from the same throttle-window peak
+submit, so their difference is a valid non-prefix occupancy rather than a
+difference between unrelated maxima.
+
+Every prefix-capable KV worker also owns one sparse `PrefixCacheLogger`. It
+writes `prefix_cache_event` from mutation receipts returned by
+`kv/prefix_cache.rs`: admission-time ownership transfer (`activate`), exact
+victim removal and reason (`evict`), and completion/PD-ack return (`retain`). A
+worker-local sequence orders equal-time mutations, and entry/cache before/after
+counts make the stream replayable. The logger is an observer of the same
+`FullAttnKv`; it does not infer operations from `kv_snapshot` or maintain shadow
+residency.
 
 ## Admission axis
 
@@ -140,11 +164,12 @@ one stable head through `peek`/`pop`:
 - `FreshRequestSlotAdmission<P>` implements AFD's two-level admission: enqueue
   into `P` first, then reserve fitting heads and hand them to the slot shell.
 
-The lifecycle freezes `AdmissionCandidate` facts once at enqueue. `FifoOrder`
-uses `VecDeque`; `ShortestJobFirst` maintains a `BinaryHeap` incrementally and
-uses a per-admission monotonic enqueue sequence for deterministic equal-work
-ties. The current production builders explicitly choose `FifoOrder`; the SJF
-type is available as a composition seam but is not a deployment selector yet.
+The lifecycle freezes `AdmissionCandidate` facts once at enqueue. Its
+`conversation_start_time` is a session's first trace-declared arrival, or the
+standalone request's own release. Production builders choose `SessionStartOrder`,
+which ranks that key oldest-first and uses the per-admission monotonic enqueue
+sequence for ties. `FifoOrder` and `ShortestJobFirst` remain available as
+explicit composition seams.
 Queues that represent active cadence state—PD pull/decode timelines, AFD slot
 work, and FFN tasks—remain in their shells and are not selection policies.
 

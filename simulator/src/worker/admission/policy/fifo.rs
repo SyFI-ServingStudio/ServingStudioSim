@@ -43,7 +43,7 @@ impl PendingOrderPolicy for FifoOrder {
         let position = self
             .queue
             .iter()
-            .position(|candidate| candidate.request == request)?;
+            .position(|candidate| candidate.request_id == request)?;
         let candidate = self
             .queue
             .remove(position)
@@ -56,7 +56,7 @@ impl PendingOrderPolicy for FifoOrder {
     fn contains(&self, request: RequestId) -> bool {
         self.queue
             .iter()
-            .any(|candidate| candidate.request == request)
+            .any(|candidate| candidate.request_id == request)
     }
 
     #[inline]
@@ -73,17 +73,20 @@ impl PendingOrderPolicy for FifoOrder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::PrefixInput;
+    use crate::common::{SessionInput, Time};
 
-    fn candidate(request: u32, prompt: u32, decode: u32) -> AdmissionCandidate {
+    fn candidate(
+        request_id: u32,
+        fresh_prompt_tokens: u32,
+        remaining_output_tokens: u32,
+    ) -> AdmissionCandidate {
         AdmissionCandidate {
-            request: RequestId(request),
-            enqueue_sequence: u64::from(request),
-            prompt,
-            decode,
-            prefix: PrefixInput::None,
-            deadline: None,
-            matched_tokens: 0,
+            request_id: RequestId(request_id),
+            enqueue_sequence: u64::from(request_id),
+            fresh_prompt_tokens,
+            remaining_output_tokens,
+            session_input: SessionInput::Standalone,
+            conversation_start_time: Time::from_ms_u64(u64::from(request_id)),
         }
     }
 
@@ -93,9 +96,9 @@ mod tests {
         policy.push(candidate(0, 10, 2), &mut ());
         policy.push(candidate(1, 4, 1), &mut ());
 
-        assert_eq!(policy.peek().unwrap().request, RequestId(0));
+        assert_eq!(policy.peek().unwrap().request_id, RequestId(0));
         assert_eq!(policy.queued_kv_tokens(), 17);
-        assert_eq!(policy.pop(&mut ()).unwrap().request, RequestId(0));
+        assert_eq!(policy.pop(&mut ()).unwrap().request_id, RequestId(0));
         assert_eq!(policy.queued_kv_tokens(), 5);
     }
 
@@ -105,7 +108,10 @@ mod tests {
         policy.push(candidate(0, 10, 2), &mut ());
         policy.push(candidate(1, 4, 1), &mut ());
 
-        assert_eq!(policy.remove(RequestId(1)).unwrap().request, RequestId(1));
+        assert_eq!(
+            policy.remove(RequestId(1)).unwrap().request_id,
+            RequestId(1)
+        );
         assert!(!policy.contains(RequestId(1)));
         assert_eq!(policy.queued_kv_tokens(), 12);
     }

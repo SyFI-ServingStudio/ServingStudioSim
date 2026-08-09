@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::arch::contract::AttnLayerwiseModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
-use crate::log::KvSampler;
+use crate::log::{KvSampler, PrefixCacheLogger};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::execution::AttentionLayerExecutionAdapter;
 use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -48,10 +48,11 @@ pub(super) fn prepare_attention_build_essentials<M: AttnLayerwiseModel>(
         .attn_kv_bytes
         .saturating_mul(model.num_attn_shards().max(1) as u64);
     let kv_capacity = (shard_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
-    let prefix_cache_bytes = config
-        .prefix_cache_capacity_bytes
-        .saturating_mul(model.num_attn_shards().max(1) as u64);
-    let prefix_cache_capacity = prefix_cache_bytes / model.total_kv_bytes_per_token().max(1);
+    let prefix_cache = config.prefix_cache.resolve_tokens(
+        kv_capacity,
+        model.total_kv_bytes_per_token(),
+        model.num_attn_shards(),
+    );
     cluster
         .borrow_mut()
         .register_kv_capacity(pool_tag, pool.0, id.0, 0, kv_capacity);
@@ -62,6 +63,7 @@ pub(super) fn prepare_attention_build_essentials<M: AttnLayerwiseModel>(
         1,
         config.kv_log_stride,
     );
+    let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let cost = CostBuffers::new(
         cost_log_dir,
         pool_tag,
@@ -82,9 +84,9 @@ pub(super) fn prepare_attention_build_essentials<M: AttnLayerwiseModel>(
         kv_store: FullAttnKv::with_prefix_cache(
             1,
             kv_capacity,
-            prefix_cache_capacity,
-            config.prefix_cache_policy,
+            prefix_cache,
             sampler,
+            prefix_cache_logger,
         ),
         execution: AttentionLayerExecutionAdapter::new(model, cost),
         cluster,

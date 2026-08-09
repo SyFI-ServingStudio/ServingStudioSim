@@ -21,7 +21,7 @@ pub use request_family::{
     ImageGenerationDefinition, ImageGenerationRequest, ImageTextGenerationDefinition,
     ImageTextGenerationRequest, ImageToTextDefinition, ImageToTextRequest, ImageToVideoDefinition,
     ImageToVideoRequest, OmniGenerationDefinition, OmniGenerationProgress, OmniGenerationRequest,
-    OmniInputSegment, OmniOutputSpec, PrefixInput, RequestDefinition, SpeechGenerationDefinition,
+    OmniInputSegment, OmniOutputSpec, RequestDefinition, SessionInput, SpeechGenerationDefinition,
     SpeechGenerationRequest, TextGenerationDefinition, TextGenerationProgress,
     TextGenerationRequest, TextToImageDefinition, TextToImageRequest, TextToSpeechDefinition,
     TextToSpeechRequest, TextToVideoDefinition, TextToVideoRequest, VideoExtent,

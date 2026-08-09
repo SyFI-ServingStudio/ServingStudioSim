@@ -3,8 +3,9 @@
 //! Two independent computation paths must agree:
 //!   - **actual**: summed from `cost_log` `groups` (what the cost model was
 //!     actually asked to compute).
-//!   - **expected**: closed forms over each request's terminal `(p, d)` in
-//!     `request_slo` (`p = prefill_processed`, `d = num_output_tokens`).
+//!   - **expected**: closed forms over each request's immutable fresh/declared
+//!     prefill contract plus its terminal computed/hit/decode observations in
+//!     `request_slo`.
 //!
 //! `request_slo` covers every arrived request (completed rows at their completion
 //! tick + sim-end-flush partial rows for incomplete reqs). Never-admitted rows
@@ -12,26 +13,40 @@
 //! allowance, which applies only after a request has emitted its first token and
 //! may therefore have one uncommitted decode pass at sim-end.
 //!
-//! Checks for iter-wise deployments (single-round today, so preserved-prefix
-//! `pre = 0`):
+//! For one context-ready request, let `fresh` be its new suffix, `declared` its
+//! reusable-prefix requirement, `hit` the resident prefix found at admission,
+//! `p` the prefill tokens actually computed, and `d` the emitted output tokens.
+//! Prefix-aware requests must conserve `hit + p = fresh + declared`; the common
+//! logical context after prefill is therefore `context = hit + p` regardless of
+//! the dynamic cache result.
+//!
+//! Checks for iter-wise deployments:
 //!   1. `prefill_tokens`        Σ prefill_tokens            vs Σ p
-//!   2. `decode_passes`         Σ decode_request_count      vs Σ max(d-1, 0)
+//!   2. prefix telemetry presence, `hit <= declared`, and both aggregate and
+//!      per-request forms of `hit + p = fresh + declared`
+//!   3. `decode_passes`         Σ decode_request_count      vs Σ max(d-1, 0)
 //!      (the first output token is produced by the prefill pass, not a decode
 //!      pass, so a request incurs `d-1` decode forward passes)
-//!   3. `ffn_token_pass`        Σ batch_tokens              vs Σ [p + max(d-1,0)]
-//!   4. `prefill_causal_attn_work`
-//!         Σ_chunks [a·prefix + a(a+1)/2]                   vs Σ p(p+1)/2
+//!   4. `ffn_token_pass`        Σ batch_tokens              vs Σ [p + max(d-1,0)]
+//!   5. `prefill_causal_attn_work`
+//!         Σ_chunks [a·prefix + a(a+1)/2]
+//!             vs Σ [p·hit + p(p+1)/2]
 //!      The causal per-chunk work telescopes to the single-shot value
-//!      `p·pre + p(p+1)/2` regardless of how prefill is chunked (the `Σ aᵢ²`
+//!      `p·hit + p(p+1)/2` regardless of how prefill is chunked (the `Σ aᵢ²`
 //!      terms cancel) — so this is exact even with `ChunkedPrefill`. NOTE: this
 //!      is the *causal* count (≈ p²/2), NOT the dense `a·kv_len` (= p²) the ref
 //!      moesim validator uses; ref gets away with dense only because it never
 //!      sub-chunks a prefill.
-//!   5. `decode_kv_sum`         Σ decode_kv_total
-//!         vs Σ [m·p + m(m-1)/2], m = max(d-1, 0)
-//!      (decode step reading context p, p+1, …, p+m-1 — a single query over the
-//!      full KV each step, so no causal /2 here.)
-//!   6. `cost_log_batch_self_consistency`  Σ batch_tokens vs Σ(prefill_tokens +
+//!   6. `prefill_cold_equivalent_work` adds the causally skipped prefix triangle
+//!      `hit(hit+1)/2` back to actual work and compares against the cold
+//!      `context(context+1)/2` baseline. `context = fresh + declared` for a
+//!      context-ready request; a sim-end partial prefill uses only its observed
+//!      `hit + p` context so unfinished future work is not invented.
+//!   7. `decode_kv_sum`         Σ decode_kv_total
+//!         vs Σ [m·context + m(m-1)/2], m = max(d-1, 0)
+//!      (decode reads the full post-prefill context, independent of how much of
+//!      that context was a cache hit.)
+//!   8. `cost_log_batch_self_consistency`  Σ batch_tokens vs Σ(prefill_tokens +
 //!      decode_request_count) — a cost_log-internal invariant (no request side).
 //!
 //! AFD logs attention once per layer and FFN once per section. For
@@ -63,10 +78,17 @@ use crate::session::{
 
 /// cost_log columns this subject depends on (drift guard).
 const COST_COLS: &[&str] = &["pool_tag", "section", "layer", "groups"];
-/// request_slo columns this subject depends on (drift guard). `prefill_processed`
-/// exists only on runs logged after it was added; an older run fails the guard
-/// loudly rather than silently mis-computing the expected side.
-const SLO_COLS: &[&str] = &["completed", "prefill_processed", "num_output_tokens"];
+/// request_slo columns this subject depends on (drift guard). Older logs that
+/// predate the independent prefix/fresh observations fail the guard loudly
+/// rather than silently reverting to a no-prefix expected-work formula.
+const SLO_COLS: &[&str] = &[
+    "completed",
+    "fresh_prompt_tokens",
+    "declared_prefix_tokens",
+    "prefix_cache_hit_tokens",
+    "prefill_processed",
+    "num_output_tokens",
+];
 
 /// |unexplained Δ| ≤ this fraction of expected ⇒ OK; ≤ [`WARN_PCT`] ⇒ WARN; else
 /// FAIL. Every quantity is integer-exact when the sim is correct, so OK is
@@ -111,7 +133,7 @@ struct Actual {
     num_layers: usize,
 }
 
-/// Run-wide expecteds from per-request `(p, d)` in `request_slo`.
+/// Run-wide expecteds and request-contract violations from `request_slo`.
 #[derive(Default)]
 struct Expected {
     prefill_tokens: f64,
@@ -119,7 +141,15 @@ struct Expected {
     batch_tokens: f64,
     decode_kv: f64,
     causal: f64,
+    saved_causal: f64,
+    cold_causal: f64,
+    prefix_token_balance_actual: f64,
+    prefix_token_balance_expected: f64,
+    missing_prefix_resolution_requests: usize,
+    prefix_hit_bound_violations: usize,
+    prefix_token_balance_violations: usize,
     requests: usize,
+    context_ready_requests: usize,
     incomplete_requests: usize,
     boundary_decode_requests: usize,
     max_context_len: f64,
@@ -162,6 +192,7 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
             "num_iterations": actual.iters,
             "num_layers": actual.num_layers,
             "num_requests": expected.requests,
+            "num_context_ready_requests": expected.context_ready_requests,
             "num_incomplete_requests": expected.incomplete_requests,
             "num_boundary_decode_requests": expected.boundary_decode_requests,
             "max_context_len": expected.max_context_len,
@@ -224,6 +255,34 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
             0.0,
         ),
         (
+            "prefix_resolution_presence",
+            "context-ready requests missing an admission-time prefix-cache observation vs 0",
+            expected.missing_prefix_resolution_requests as f64,
+            0.0,
+            0.0,
+        ),
+        (
+            "prefix_hit_bounds",
+            "requests whose prefix_cache_hit_tokens exceeds declared_prefix_tokens vs 0",
+            expected.prefix_hit_bound_violations as f64,
+            0.0,
+            0.0,
+        ),
+        (
+            "prefix_token_balance",
+            "context-ready token balance: Σ(hit + computed) vs Σ(fresh + declared)",
+            expected.prefix_token_balance_actual,
+            expected.prefix_token_balance_expected,
+            0.0,
+        ),
+        (
+            "prefix_token_balance_violations",
+            "context-ready requests violating hit + computed = fresh + declared vs 0",
+            expected.prefix_token_balance_violations as f64,
+            0.0,
+            0.0,
+        ),
+        (
             "decode_passes",
             match mode {
                 WorkloadMode::Iterwise => {
@@ -255,10 +314,10 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
             "prefill_causal_attn_work",
             match mode {
                 WorkloadMode::Iterwise => {
-                    "causal prefill attn work: Σ [a·prefix + a(a+1)/2] vs Σ p(p+1)/2"
+                    "causal prefill attn work: Σ [a·prefix + a(a+1)/2] vs Σ [p·hit + p(p+1)/2]"
                 }
                 WorkloadMode::Afd => {
-                    "AFD attention-layer causal prefill work: Σ [a·prefix + a(a+1)/2] vs Σ p(p+1)/2 × layers"
+                    "AFD attention-layer causal prefill work: Σ [a·prefix + a(a+1)/2] vs Σ [p·hit + p(p+1)/2] × layers"
                 }
             },
             actual.causal,
@@ -266,13 +325,27 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
             0.0,
         ),
         (
+            "prefill_cold_equivalent_work",
+            match mode {
+                WorkloadMode::Iterwise => {
+                    "cold-equivalent causal prefill work: actual + Σ hit(hit+1)/2 vs Σ (fresh+declared)(fresh+declared+1)/2"
+                }
+                WorkloadMode::Afd => {
+                    "AFD cold-equivalent causal prefill work: actual + saved prefix triangle vs immutable cold baseline × layers"
+                }
+            },
+            actual.causal + expected.saved_causal,
+            expected.cold_causal,
+            0.0,
+        ),
+        (
             "decode_kv_sum",
             match mode {
                 WorkloadMode::Iterwise => {
-                    "decode KV read: Σ cost_log decode_kv_total vs Σ [m·p + m(m-1)/2], m=max(d-1,0)"
+                    "decode KV read: Σ cost_log decode_kv_total vs Σ [m·(hit+p) + m(m-1)/2], m=max(d-1,0)"
                 }
                 WorkloadMode::Afd => {
-                    "AFD attention-layer decode KV read: Σ attn cost_log decode_kv_total vs Σ [m·p + m(m-1)/2] × layers"
+                    "AFD attention-layer decode KV read: Σ attn cost_log decode_kv_total vs Σ [m·(hit+p) + m(m-1)/2] × layers"
                 }
             },
             actual.decode_kv,
@@ -807,7 +880,87 @@ fn u32_values<'a>(arr: &'a arrow_array::ArrayRef, field: &str) -> Result<&'a UIn
         .ok_or_else(|| anyhow!("`{field}` items are not UInt32"))
 }
 
-/// Per-request expected work from `request_slo` `(prefill_processed, num_output_tokens)`.
+#[derive(Clone, Copy, Debug)]
+struct RequestSloWorkInput {
+    completed: bool,
+    fresh_prompt_tokens: f64,
+    declared_prefix_tokens: f64,
+    prefix_cache_hit_tokens: Option<f64>,
+    prefill_tokens_processed: f64,
+    num_output_tokens: f64,
+}
+
+impl Expected {
+    fn add_request(&mut self, mode: WorkloadMode, num_layers: usize, input: RequestSloWorkInput) {
+        self.requests += 1;
+        if !input.completed {
+            self.incomplete_requests += 1;
+        }
+        if contributes_boundary_allowance(input.completed, input.num_output_tokens) {
+            self.boundary_decode_requests += 1;
+        }
+
+        if input
+            .prefix_cache_hit_tokens
+            .is_some_and(|hit_tokens| hit_tokens > input.declared_prefix_tokens)
+        {
+            self.prefix_hit_bound_violations += 1;
+        }
+
+        let context_ready = input.num_output_tokens > 0.0;
+        let prefix_cache_hit_tokens = input.prefix_cache_hit_tokens.unwrap_or(0.0);
+        let logical_context_tokens = prefix_cache_hit_tokens + input.prefill_tokens_processed;
+        if context_ready {
+            self.context_ready_requests += 1;
+            if input.prefix_cache_hit_tokens.is_none() {
+                self.missing_prefix_resolution_requests += 1;
+            }
+            let requested_context_tokens = input.fresh_prompt_tokens + input.declared_prefix_tokens;
+            self.prefix_token_balance_actual += logical_context_tokens;
+            self.prefix_token_balance_expected += requested_context_tokens;
+            if logical_context_tokens != requested_context_tokens {
+                self.prefix_token_balance_violations += 1;
+            }
+        }
+
+        let layer_multiplier = match mode {
+            WorkloadMode::Iterwise => 1.0,
+            WorkloadMode::Afd => num_layers as f64,
+        };
+        let ffn_multiplier = match mode {
+            WorkloadMode::Iterwise => 1.0,
+            WorkloadMode::Afd => num_layers as f64 + 3.0,
+        };
+        let decode_forward_passes = (input.num_output_tokens - 1.0).max(0.0);
+        self.max_context_len = self
+            .max_context_len
+            .max(logical_context_tokens + input.num_output_tokens);
+        self.prefill_tokens += input.prefill_tokens_processed * layer_multiplier;
+        self.decode_passes += decode_forward_passes * layer_multiplier;
+        self.batch_tokens +=
+            (input.prefill_tokens_processed + decode_forward_passes) * ffn_multiplier;
+        self.decode_kv += (decode_forward_passes * logical_context_tokens
+            + decode_forward_passes * (decode_forward_passes - 1.0) / 2.0)
+            * layer_multiplier;
+        self.causal += (input.prefill_tokens_processed * prefix_cache_hit_tokens
+            + triangular(input.prefill_tokens_processed))
+            * layer_multiplier;
+
+        self.saved_causal += triangular(prefix_cache_hit_tokens) * layer_multiplier;
+        let cold_equivalent_context_tokens = if context_ready {
+            input.fresh_prompt_tokens + input.declared_prefix_tokens
+        } else {
+            logical_context_tokens
+        };
+        self.cold_causal += triangular(cold_equivalent_context_tokens) * layer_multiplier;
+    }
+}
+
+fn triangular(tokens: f64) -> f64 {
+    tokens * (tokens + 1.0) / 2.0
+}
+
+/// Per-request expected work from immutable request facts plus runtime observations.
 async fn collect_expected(
     ctx: &SessionContext,
     mode: WorkloadMode,
@@ -815,46 +968,45 @@ async fn collect_expected(
 ) -> Result<Expected> {
     let batches = collect(
         ctx,
-        "SELECT completed, prefill_processed, num_output_tokens FROM slo",
+        "SELECT completed, fresh_prompt_tokens, declared_prefix_tokens, \
+         prefix_cache_hit_tokens, prefill_processed, num_output_tokens FROM slo",
     )
     .await?;
-    let mut e = Expected::default();
-    let layer_multiplier = match mode {
-        WorkloadMode::Iterwise => 1.0,
-        WorkloadMode::Afd => num_layers as f64,
-    };
-    let ffn_multiplier = match mode {
-        WorkloadMode::Iterwise => 1.0,
-        WorkloadMode::Afd => num_layers as f64 + 3.0,
-    };
+    let mut expected = Expected::default();
     for batch in &batches {
         let completed = col(batch, "completed")?
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| anyhow!("`completed` is not a Boolean array"))?;
-        let p_arr = col(batch, "prefill_processed")?;
-        let d_arr = col(batch, "num_output_tokens")?;
+        let fresh_prompt_tokens =
+            u32_values(col(batch, "fresh_prompt_tokens")?, "fresh_prompt_tokens")?;
+        let declared_prefix_tokens = u32_values(
+            col(batch, "declared_prefix_tokens")?,
+            "declared_prefix_tokens",
+        )?;
+        let prefix_cache_hit_tokens = u32_values(
+            col(batch, "prefix_cache_hit_tokens")?,
+            "prefix_cache_hit_tokens",
+        )?;
+        let prefill_tokens_processed = col(batch, "prefill_processed")?;
+        let num_output_tokens = col(batch, "num_output_tokens")?;
         for row in 0..batch.num_rows() {
-            e.requests += 1;
-            let p = value_f64(p_arr, row)?;
-            let d = value_f64(d_arr, row)?;
-            let is_completed = completed.value(row);
-            if !is_completed {
-                e.incomplete_requests += 1;
-            }
-            if contributes_boundary_allowance(is_completed, d) {
-                e.boundary_decode_requests += 1;
-            }
-            e.max_context_len = e.max_context_len.max(p + d);
-            let m = (d - 1.0).max(0.0); // decode forward passes (first token from prefill)
-            e.prefill_tokens += p * layer_multiplier;
-            e.decode_passes += m * layer_multiplier;
-            e.batch_tokens += (p + m) * ffn_multiplier;
-            e.decode_kv += (m * p + m * (m - 1.0) / 2.0) * layer_multiplier;
-            e.causal += p * (p + 1.0) / 2.0 * layer_multiplier;
+            expected.add_request(
+                mode,
+                num_layers,
+                RequestSloWorkInput {
+                    completed: completed.value(row),
+                    fresh_prompt_tokens: fresh_prompt_tokens.value(row) as f64,
+                    declared_prefix_tokens: declared_prefix_tokens.value(row) as f64,
+                    prefix_cache_hit_tokens: (!prefix_cache_hit_tokens.is_null(row))
+                        .then(|| prefix_cache_hit_tokens.value(row) as f64),
+                    prefill_tokens_processed: value_f64(prefill_tokens_processed, row)?,
+                    num_output_tokens: value_f64(num_output_tokens, row)?,
+                },
+            );
         }
     }
-    Ok(e)
+    Ok(expected)
 }
 
 fn contributes_boundary_allowance(completed: bool, num_output_tokens: f64) -> bool {
@@ -864,10 +1016,14 @@ fn contributes_boundary_allowance(completed: bool, num_output_tokens: f64) -> bo
 fn definitions() -> Value {
     json!({
         "scope": "whole run — cost_log actuals vs request_slo per-request expected",
-        "p": "request_slo.prefill_processed (terminal prefill length)",
+        "fresh": "request_slo.fresh_prompt_tokens (immutable new suffix)",
+        "declared": "request_slo.declared_prefix_tokens (immutable reusable-prefix requirement)",
+        "hit": "request_slo.prefix_cache_hit_tokens (nullable admission-time resident-prefix observation)",
+        "p": "request_slo.prefill_processed (tokens actually computed by prefill)",
         "d": "request_slo.num_output_tokens (terminal decode length)",
-        "preserved_prefix": "assumed 0 (single-round today); add when multi-round lands",
+        "context": "hit + p = fresh + declared after prefill completes",
         "status": "OK |unexplained Δ%| <= tolerance_pct; WARN <= warn_pct; FAIL otherwise",
+        "prefix_scope_note": "a request with d > 0 has completed prefill and must have a non-null hit observation plus exact hit+p=fresh+declared balance; never-admitted and sim-end prefill-only rows are partial observations and are excluded from that full-context equation",
         "boundary_allowance_note": "positive-only allowance for DurationReached pipeline tails: \
                                    an incomplete request that has emitted at least one output \
                                    token may have at most one additional decode token partially \
@@ -876,8 +1032,8 @@ fn definitions() -> Value {
         "afd_note": "for deployment=afd, attention actuals are summed from pool_tag=attn, \
                      section=attn and multiplied by observed layer count; FFN actuals are \
                      summed from pool_tag=ffn section rows and expected as Σ[p+m]×(layers+3)",
-        "causal_note": "prefill work is the causal count (~p^2/2), chunk-invariant; \
-                        NOT the dense a*kv_len (=p^2)",
+        "causal_note": "cache-aware prefill work is p*hit+p(p+1)/2 and remains chunk-invariant; adding the saved hit(hit+1)/2 triangle recovers the cold baseline. For context-ready rows that baseline is the immutable (fresh+declared)(fresh+declared+1)/2; sim-end partial-prefill rows use only their observed hit+p context so unfinished work is not invented. This is causal work, not dense a*kv_len",
+        "decode_kv_note": "each decode pass reads the full logical post-prefill context hit+p, so m passes consume m(hit+p)+m(m-1)/2 KV-token reads where m=max(d-1,0)",
         "decode_boundary_note": "a positive Δ on decode_passes / decode_kv_sum can be the \
                                  sim-end truncation boundary: an in-flight request's final \
                                  decode iteration is counted in cost_log but its token \
@@ -936,6 +1092,132 @@ mod tests {
 
         assert_eq!(decode["positive_boundary_allowance"], 1.0);
         assert_eq!(ffn["positive_boundary_allowance"], 1.0);
+    }
+
+    #[test]
+    fn prefix_hit_conserves_tokens_and_attention_work() {
+        let mut expected = Expected::default();
+        expected.add_request(
+            WorkloadMode::Iterwise,
+            0,
+            RequestSloWorkInput {
+                completed: true,
+                fresh_prompt_tokens: 32.0,
+                declared_prefix_tokens: 64.0,
+                prefix_cache_hit_tokens: Some(64.0),
+                prefill_tokens_processed: 32.0,
+                num_output_tokens: 4.0,
+            },
+        );
+
+        assert_eq!(expected.context_ready_requests, 1);
+        assert_eq!(expected.prefix_token_balance_actual, 96.0);
+        assert_eq!(expected.prefix_token_balance_expected, 96.0);
+        assert_eq!(expected.missing_prefix_resolution_requests, 0);
+        assert_eq!(expected.prefix_hit_bound_violations, 0);
+        assert_eq!(expected.prefix_token_balance_violations, 0);
+        assert_eq!(expected.prefill_tokens, 32.0);
+        assert_eq!(expected.decode_passes, 3.0);
+        assert_eq!(expected.batch_tokens, 35.0);
+        assert_eq!(expected.causal, 2_576.0);
+        assert_eq!(expected.saved_causal, 2_080.0);
+        assert_eq!(expected.cold_causal, 4_656.0);
+        assert_eq!(
+            expected.causal + expected.saved_causal,
+            expected.cold_causal
+        );
+
+        assert_eq!(expected.decode_kv, 291.0);
+
+        let actual = Actual {
+            prefill_tokens: 32.0,
+            decode_passes: 3.0,
+            attn_batch_tokens: 35.0,
+            batch_tokens: 35.0,
+            decode_kv: 291.0,
+            causal: 2_576.0,
+            ..Actual::default()
+        };
+        let checks = checks_for_mode(WorkloadMode::Iterwise, &actual, &expected);
+        assert_eq!(checks.len(), 11);
+        assert!(checks.iter().all(|check| check["status"] == "OK"));
+    }
+
+    #[test]
+    fn prefix_contract_violations_are_counted_per_request() {
+        let mut expected = Expected::default();
+        expected.add_request(
+            WorkloadMode::Iterwise,
+            0,
+            RequestSloWorkInput {
+                completed: true,
+                fresh_prompt_tokens: 32.0,
+                declared_prefix_tokens: 64.0,
+                prefix_cache_hit_tokens: Some(65.0),
+                prefill_tokens_processed: 32.0,
+                num_output_tokens: 1.0,
+            },
+        );
+        expected.add_request(
+            WorkloadMode::Iterwise,
+            0,
+            RequestSloWorkInput {
+                completed: true,
+                fresh_prompt_tokens: 16.0,
+                declared_prefix_tokens: 0.0,
+                prefix_cache_hit_tokens: None,
+                prefill_tokens_processed: 16.0,
+                num_output_tokens: 1.0,
+            },
+        );
+
+        assert_eq!(expected.context_ready_requests, 2);
+        assert_eq!(expected.prefix_hit_bound_violations, 1);
+        assert_eq!(expected.missing_prefix_resolution_requests, 1);
+        assert_eq!(expected.prefix_token_balance_violations, 1);
+    }
+
+    #[test]
+    fn prefill_only_partial_request_does_not_claim_full_context_balance() {
+        let mut expected = Expected::default();
+        expected.add_request(
+            WorkloadMode::Iterwise,
+            0,
+            RequestSloWorkInput {
+                completed: false,
+                fresh_prompt_tokens: 32.0,
+                declared_prefix_tokens: 64.0,
+                prefix_cache_hit_tokens: Some(64.0),
+                prefill_tokens_processed: 8.0,
+                num_output_tokens: 0.0,
+            },
+        );
+
+        assert_eq!(expected.requests, 1);
+        assert_eq!(expected.incomplete_requests, 1);
+        assert_eq!(expected.context_ready_requests, 0);
+        assert_eq!(expected.missing_prefix_resolution_requests, 0);
+        assert_eq!(expected.prefix_token_balance_actual, 0.0);
+        assert_eq!(expected.prefix_token_balance_expected, 0.0);
+        assert_eq!(expected.prefix_token_balance_violations, 0);
+        assert_eq!(expected.prefill_tokens, 8.0);
+        assert_eq!(expected.causal, 548.0);
+        assert_eq!(expected.saved_causal, 2_080.0);
+        assert_eq!(expected.cold_causal, 2_628.0);
+        assert_eq!(
+            expected.causal + expected.saved_causal,
+            expected.cold_causal
+        );
+
+        let actual = Actual {
+            prefill_tokens: 8.0,
+            attn_batch_tokens: 8.0,
+            batch_tokens: 8.0,
+            causal: 548.0,
+            ..Actual::default()
+        };
+        let checks = checks_for_mode(WorkloadMode::Iterwise, &actual, &expected);
+        assert!(checks.iter().all(|check| check["status"] == "OK"));
     }
 
     #[test]

@@ -1,14 +1,14 @@
 use crate::common::request::{ActiveRequest, Request};
 use crate::common::Time;
 
-use super::{DecodingStrategy, PrefixInput, RequestDefinition, TextGenerationProgress};
+use super::{DecodingStrategy, RequestDefinition, SessionInput, TextGenerationProgress};
 
 /// Text-in, autoregressive-token-out request definition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextGenerationDefinition {
     pub prompt_tokens: u32,
     pub target_output_tokens: u32,
-    pub prefix: PrefixInput,
+    pub session: SessionInput,
     pub decoding: DecodingStrategy,
 }
 

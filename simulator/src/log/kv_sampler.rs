@@ -13,6 +13,8 @@
 //! what becomes a row:
 //!   - a **running max** of `active_kv` over each throttle window, so decimated
 //!     sampling never hides the true occupancy peak (the "current size");
+//!     `retained_prefix_kv` is captured from the same submit that set that peak,
+//!     preserving it as a component of `active_kv` rather than an unrelated max;
 //!   - a **stride throttle** — one row per `stride` submits — plus a baseline row
 //!     on the first submit (a t≈0 anchor) and a tail row at [`flush_all`] (the
 //!     endpoint), so the series always has both ends;
@@ -38,25 +40,29 @@ use crate::log::schemas::kv_snapshot_schema;
 const STREAM_FLUSH_ROWS: usize = 8_192;
 const CHANNEL_CAP: usize = 64;
 
-/// The three occupancy figures a worker hands the sampler each iteration, all in
-/// tokens. `active_kv` is the committed KV *now*; `projected_peak` is the max the
+/// The occupancy figures a worker hands the sampler each iteration, all in tokens.
+/// `active_kv` is the committed KV *now*, including retained prefix-cache entries;
+/// `retained_prefix_kv` is that prefix component. `projected_peak` is the max the
 /// currently-admitted set will reach as it drains; `promised_kv` is admitted-but-
 /// not-yet-realized. See [`KvSampler::submit`].
 #[derive(Clone, Copy, Debug)]
 pub struct KvSubmit {
     pub active_kv: u64,
+    pub retained_prefix_kv: u64,
     pub projected_peak: u64,
     pub promised_kv: u64,
 }
 
 /// Per-group sampling accumulator. `window_count` is the stride counter (submits
 /// since the last emitted row); `peak_active` is the running max of `active_kv`
-/// over that window; the `last_*` fields hold the most recent submit so
-/// [`KvSampler::flush_all`] can emit a tail row at the true endpoint.
+/// over that window and `retained_prefix_at_peak_active` is the prefix component
+/// captured at the same submit. The `last_*` fields hold the most recent submit
+/// so [`KvSampler::flush_all`] can emit a tail row at the true endpoint.
 #[derive(Clone, Copy, Default)]
 struct Slot {
     window_count: u32,
     peak_active: u64,
+    retained_prefix_at_peak_active: u64,
     emitted_any: bool,
     /// Un-emitted window data is buffered (a tail row is owed at flush).
     pending: bool,
@@ -118,7 +124,10 @@ impl KvSampler {
     ) -> Result<Self> {
         let kv_dir = log_dir.join("raw").join("kv_snapshot");
         std::fs::create_dir_all(&kv_dir)?;
-        let path = kv_dir.join(format!("{}.parquet", cost_artifact_stem(pool_tag, worker_id)));
+        let path = kv_dir.join(format!(
+            "{}.parquet",
+            cost_artifact_stem(pool_tag, worker_id)
+        ));
         let mut writer = StreamingParquetWriter::new(path, kv_snapshot_schema());
         let (tx, rx) = sync_channel::<Vec<KvSnapshotEntry>>(CHANNEL_CAP);
         let handle = std::thread::Builder::new()
@@ -147,16 +156,27 @@ impl KvSampler {
     /// `stride`th submit (its `active_kv` is the window running max). A downstream
     /// writer failure is logged once and disables further logging rather than
     /// propagating into the sim FSM.
-    pub fn submit(&mut self, group_id: u16, s: KvSubmit, now: Time) {
+    pub fn submit(&mut self, group_id: u16, occupancy: KvSubmit, now: Time) {
         if self.closed {
             return;
         }
+        debug_assert!(
+            occupancy.retained_prefix_kv <= occupancy.active_kv,
+            "retained prefix KV must be a component of active KV"
+        );
         let stride = self.stride;
         let slot = &mut self.slots[group_id as usize];
-        slot.peak_active = slot.peak_active.max(s.active_kv);
+        // Keep the prefix component paired with the active sample. Independent
+        // maxima could fabricate a composition that never existed. On equal
+        // active peaks, retain the later composition so the emitted point is as
+        // close as possible to the window endpoint.
+        if slot.window_count == 0 || occupancy.active_kv >= slot.peak_active {
+            slot.peak_active = occupancy.active_kv;
+            slot.retained_prefix_at_peak_active = occupancy.retained_prefix_kv;
+        }
         slot.last_time_ms = now.as_ms();
-        slot.last_projected_peak = s.projected_peak;
-        slot.last_promised = s.promised_kv;
+        slot.last_projected_peak = occupancy.projected_peak;
+        slot.last_promised = occupancy.promised_kv;
         slot.window_count += 1;
         // Baseline anchors the series at the first submit; afterwards emit once the
         // window fills `stride` submits.
@@ -170,12 +190,14 @@ impl KvSampler {
             group_id,
             time_ms: slot.last_time_ms,
             active_kv: slot.peak_active,
+            retained_prefix_kv: slot.retained_prefix_at_peak_active,
             projected_peak: slot.last_projected_peak,
             promised_kv: slot.last_promised,
         };
         slot.emitted_any = true;
         slot.window_count = 0;
         slot.peak_active = 0;
+        slot.retained_prefix_at_peak_active = 0;
         slot.pending = false;
         self.push_row(row);
     }
@@ -255,6 +277,7 @@ impl KvSampler {
                 group_id: gid as u16,
                 time_ms: slot.last_time_ms,
                 active_kv: slot.peak_active,
+                retained_prefix_kv: slot.retained_prefix_at_peak_active,
                 projected_peak: slot.last_projected_peak,
                 promised_kv: slot.last_promised,
             })
@@ -277,12 +300,17 @@ mod tests {
 
     use std::fs::File;
 
-    use arrow_array::{UInt64Array, UInt16Array};
+    use arrow_array::{UInt16Array, UInt64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use tempfile::tempdir;
 
-    fn sub(active: u64) -> KvSubmit {
-        KvSubmit { active_kv: active, projected_peak: active, promised_kv: 0 }
+    fn sub(active_kv: u64, retained_prefix_kv: u64) -> KvSubmit {
+        KvSubmit {
+            active_kv,
+            retained_prefix_kv,
+            projected_peak: active_kv,
+            promised_kv: 0,
+        }
     }
 
     /// baseline + stride throttle + running-max + tail, end to end through the
@@ -293,10 +321,19 @@ mod tests {
     fn throttle_running_max_baseline_and_tail() {
         let dir = tempdir().unwrap();
         let mut kv = KvSampler::open(dir.path(), "main", WorkerId(0), 1, 3).unwrap();
-        // #1 baseline → row @10; #2/#3 accumulate (peak 50); #4 fills stride → row
-        // @50 (running max over {50,20,30}); #5 pending → tail @5.
-        for (i, active) in [10u64, 50, 20, 30, 5].iter().enumerate() {
-            kv.submit(0, sub(*active), Time::from_ms(i as f64));
+        // #1 baseline → row @10; #2/#3 accumulate; #4 fills stride → row @50.
+        // The equal active peak at #4 replaces #2's prefix component, proving the
+        // two columns remain paired. #5 pending → tail @5.
+        for (submit_index, (active_kv, retained_prefix_kv)) in
+            [(10u64, 1u64), (50, 7), (20, 9), (50, 11), (5, 2)]
+                .iter()
+                .enumerate()
+        {
+            kv.submit(
+                0,
+                sub(*active_kv, *retained_prefix_kv),
+                Time::from_ms(submit_index as f64),
+            );
         }
         kv.flush_all().unwrap();
 
@@ -313,7 +350,21 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
-        assert_eq!(active.values(), &[10, 50, 5], "window running max preserved");
+        assert_eq!(
+            active.values(),
+            &[10, 50, 5],
+            "window running max preserved"
+        );
+        let retained_prefix = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(
+            retained_prefix.values(),
+            &[1, 11, 2],
+            "prefix occupancy must come from the active-peak submit"
+        );
         // group_id column (index 2) is all group 0.
         let gid = batch
             .column(2)
@@ -329,7 +380,7 @@ mod tests {
     fn single_submit_is_one_baseline_row() {
         let dir = tempdir().unwrap();
         let mut kv = KvSampler::open(dir.path(), "decode", WorkerId(2), 1, 8).unwrap();
-        kv.submit(0, sub(7), Time::from_ms(1.0));
+        kv.submit(0, sub(7, 3), Time::from_ms(1.0));
         kv.flush_all().unwrap();
 
         let path = dir.path().join("raw/kv_snapshot/worker_decode_2.parquet");
@@ -338,6 +389,10 @@ mod tests {
             .build()
             .unwrap();
         let batch = reader.next().unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 1, "baseline only; tail must not duplicate it");
+        assert_eq!(
+            batch.num_rows(),
+            1,
+            "baseline only; tail must not duplicate it"
+        );
     }
 }

@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
-use crate::worker::admission::{FifoOrder, PrefillHandoffAdmission};
+use crate::log::PrefixCacheLogger;
+use crate::worker::admission::{PrefillHandoffAdmission, SessionStartOrder};
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{IterBatchWorker, PdPrefillWorker};
 use crate::worker::workers::unified_iter_build_essentials::{
-    full_attention_token_capacity, prefix_cache_token_capacity,
-    prepare_unified_iter_build_essentials,
+    full_attention_token_capacity, prepare_unified_iter_build_essentials,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -28,9 +28,14 @@ pub(crate) fn build_pd_prefill_worker<M: IterwiseUnifiedModel>(
     gpu_name: &str,
     cluster: SharedGpuCluster,
 ) -> PdPrefillWorker<M> {
+    let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let num_attn_shards = model.num_attn_shards().max(1);
     let kv_capacity = full_attention_token_capacity(model.as_ref(), &config);
-    let prefix_cache_capacity = prefix_cache_token_capacity(model.as_ref(), &config);
+    let prefix_cache = config.prefix_cache.resolve_tokens(
+        kv_capacity,
+        model.total_kv_bytes_per_token(),
+        model.num_attn_shards(),
+    );
     let essentials = prepare_unified_iter_build_essentials(
         id,
         pool_tag,
@@ -53,11 +58,11 @@ pub(crate) fn build_pd_prefill_worker<M: IterwiseUnifiedModel>(
     let kv_store = FullAttnKv::with_prefix_cache(
         1,
         essentials.kv_capacity,
-        prefix_cache_capacity,
-        config.prefix_cache_policy,
+        prefix_cache,
         essentials.sampler,
+        prefix_cache_logger,
     );
-    let admission = PrefillHandoffAdmission::new(FifoOrder::new(), (), send_group_id);
+    let admission = PrefillHandoffAdmission::new(SessionStartOrder::new(), (), send_group_id);
 
     IterBatchWorker::from_components(
         essentials.context,
@@ -69,10 +74,15 @@ pub(crate) fn build_pd_prefill_worker<M: IterwiseUnifiedModel>(
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::rc::Rc;
 
+    use arrow_array::{StringArray, UInt32Array, UInt64Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use tempfile::tempdir;
+
     use super::*;
-    use crate::common::{PrefixInput, RequestId, Time};
+    use crate::common::{RequestId, SessionInput, Time};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::types::{PdPrefillEvent, PdPrefillMsg};
 
@@ -113,8 +123,9 @@ mod tests {
     #[test]
     fn cold_prefix_is_recomputed_and_handoff_carries_the_full_context() {
         let store = shared_with(&[(0, 16, 3)]);
-        store.borrow_mut()[RequestId(0)].request.definition.prefix = PrefixInput::Session {
+        store.borrow_mut()[RequestId(0)].request.definition.session = SessionInput::Session {
             session_id: 7,
+            session_start_time: Time::ZERO,
             declared_prefix_tokens: 100,
         };
         let mut worker = build_pd_prefill_worker(
@@ -153,19 +164,20 @@ mod tests {
 
     #[test]
     fn handoff_ack_returns_session_kv_to_the_prefill_cache() {
+        let log_directory = tempdir().unwrap();
         let store = shared_with(&[(0, 16, 3), (1, 20, 3)]);
         {
             let mut requests = store.borrow_mut();
             for request in [RequestId(0), RequestId(1)] {
-                requests[request].request.definition.prefix = PrefixInput::Session {
+                requests[request].request.definition.session = SessionInput::Session {
                     session_id: 7,
+                    session_start_time: Time::ZERO,
                     declared_prefix_tokens: 100,
                 };
             }
         }
         let config = WorkerConfig {
             attn_kv_bytes: 1_000,
-            prefix_cache_capacity_bytes: 1_000,
             ..WorkerConfig::default()
         };
         let mut worker = build_pd_prefill_worker(
@@ -174,7 +186,7 @@ mod tests {
             Arc::new(FakeModel::for_ms(1.0)),
             Rc::clone(&store),
             config,
-            None,
+            Some(log_directory.path().to_path_buf()),
             PoolId(0),
             "test-gpu",
             test_cluster(),
@@ -185,7 +197,10 @@ mod tests {
         for step in 0..20 {
             worker.tick(Time::from_ms(step as f64), &mut events);
         }
-        worker.enqueue(PdPrefillMsg::ReleaseKv { req: RequestId(0) });
+        worker.enqueue(PdPrefillMsg::ReleaseKv {
+            req: RequestId(0),
+            at: Time::from_ms(20.0),
+        });
         worker.enqueue(PdPrefillMsg::Request(RequestId(1)));
         for step in 20..40 {
             worker.tick(Time::from_ms(step as f64), &mut events);
@@ -213,6 +228,70 @@ mod tests {
                 .progress
                 .prefill_tokens_processed,
             20
+        );
+        assert_eq!(
+            store.borrow()[RequestId(0)]
+                .telemetry
+                .prefix_cache_hit_tokens,
+            Some(0)
+        );
+        assert_eq!(
+            store.borrow()[RequestId(1)]
+                .telemetry
+                .prefix_cache_hit_tokens,
+            Some(100)
+        );
+
+        drop(worker);
+        let path = log_directory
+            .path()
+            .join("raw/prefix_cache_event/worker_prefill_0.parquet");
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        let operations = batch
+            .column_by_name("operation")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let reasons = batch
+            .column_by_name("reason")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let requests = batch
+            .column_by_name("request_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let sequence = batch
+            .column_by_name("sequence")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(
+            (0..3).map(|row| operations.value(row)).collect::<Vec<_>>(),
+            ["activate", "retain", "activate"]
+        );
+        assert_eq!(
+            (0..3).map(|row| reasons.value(row)).collect::<Vec<_>>(),
+            ["miss", "handoff-complete", "hit"]
+        );
+        assert_eq!(
+            (0..3).map(|row| requests.value(row)).collect::<Vec<_>>(),
+            [0, 0, 1]
+        );
+        assert_eq!(
+            (0..3).map(|row| sequence.value(row)).collect::<Vec<_>>(),
+            [0, 1, 2]
         );
     }
 

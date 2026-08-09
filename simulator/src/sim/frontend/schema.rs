@@ -18,8 +18,8 @@ use super::arrival::{
 use crate::common::{
     AudioExtent, AudioTextGenerationDefinition, DecodingStrategy, ImageExtent,
     ImageGenerationDefinition, ImageTextGenerationDefinition, ImageToVideoDefinition,
-    OmniGenerationDefinition, OmniInputSegment, OmniOutputSpec, PrefixInput, RequestDefinition,
-    RequestId, SpeechGenerationDefinition, TextGenerationDefinition, Time, VideoExtent,
+    OmniGenerationDefinition, OmniInputSegment, OmniOutputSpec, RequestDefinition, RequestId,
+    SessionInput, SpeechGenerationDefinition, TextGenerationDefinition, Time, VideoExtent,
     VideoGenerationDefinition, VideoTextGenerationDefinition,
 };
 
@@ -268,12 +268,16 @@ pub(super) struct ParsedTags {
 }
 
 impl ParsedTags {
-    fn prefix(self) -> PrefixInput {
-        self.session
-            .map_or(PrefixInput::None, |session| PrefixInput::Session {
+    fn session_input(self, session_start_time: Option<Time>) -> SessionInput {
+        match (self.session, session_start_time) {
+            (None, None) => SessionInput::Standalone,
+            (Some(session), Some(session_start_time)) => SessionInput::Session {
                 session_id: session.session_id,
+                session_start_time,
                 declared_prefix_tokens: session.declared_prefix_tokens,
-            })
+            },
+            _ => unreachable!("parsed session and resolved session start must agree"),
+        }
     }
 
     fn release_session(self) -> Option<SessionReleaseMetadata> {
@@ -307,17 +311,25 @@ impl ParsedTags {
 pub(super) trait TraceDefinition: RequestDefinition + Sized {
     const KIND: TraceKind;
 
-    fn parse_definition(row: &Row<'_>, tags: ParsedTags) -> Result<Self>;
+    fn parse_definition(
+        row: &Row<'_>,
+        tags: ParsedTags,
+        session_start_time: Option<Time>,
+    ) -> Result<Self>;
 }
 
 impl TraceDefinition for TextGenerationDefinition {
     const KIND: TraceKind = TraceKind::TextGeneration;
 
-    fn parse_definition(row: &Row<'_>, tags: ParsedTags) -> Result<Self> {
+    fn parse_definition(
+        row: &Row<'_>,
+        tags: ParsedTags,
+        session_start_time: Option<Time>,
+    ) -> Result<Self> {
         Ok(Self {
             prompt_tokens: positive_u32(row, "input_len")?,
             target_output_tokens: positive_u32(row, "output_len")?,
-            prefix: tags.prefix(),
+            session: tags.session_input(session_start_time),
             decoding: tags.decoding,
         })
     }
@@ -328,13 +340,17 @@ macro_rules! impl_encoded_definition {
         impl TraceDefinition for $definition {
             const KIND: TraceKind = $kind;
 
-            fn parse_definition(row: &Row<'_>, tags: ParsedTags) -> Result<Self> {
+            fn parse_definition(
+                row: &Row<'_>,
+                tags: ParsedTags,
+                session_start_time: Option<Time>,
+            ) -> Result<Self> {
                 Ok(Self {
                     text_prompt_tokens: positive_u32(row, "input_len")?,
                     encoded_input_tokens: positive_u32(row, "encoded_tokens")?,
                     target_output_tokens: positive_u32(row, "output_len")?,
                     extent: $extent(row)?,
-                    prefix: tags.prefix(),
+                    session: tags.session_input(session_start_time),
                     decoding: tags.decoding,
                 })
             }
@@ -363,7 +379,11 @@ macro_rules! impl_generated_definition {
         impl TraceDefinition for $definition {
             const KIND: TraceKind = $kind;
 
-            fn parse_definition(row: &Row<'_>, tags: ParsedTags) -> Result<Self> {
+            fn parse_definition(
+                row: &Row<'_>,
+                tags: ParsedTags,
+                _session_start_time: Option<Time>,
+            ) -> Result<Self> {
                 tags.reject_autoregressive_only_tags(row)?;
                 Ok(Self {
                     text_prompt_tokens: positive_u32(row, "input_len")?,
@@ -394,7 +414,11 @@ impl_generated_definition!(
 impl TraceDefinition for ImageToVideoDefinition {
     const KIND: TraceKind = TraceKind::ImageToVideo;
 
-    fn parse_definition(row: &Row<'_>, tags: ParsedTags) -> Result<Self> {
+    fn parse_definition(
+        row: &Row<'_>,
+        tags: ParsedTags,
+        _session_start_time: Option<Time>,
+    ) -> Result<Self> {
         tags.reject_autoregressive_only_tags(row)?;
         Ok(Self {
             text_prompt_tokens: positive_u32(row, "input_len")?,
@@ -409,7 +433,11 @@ impl TraceDefinition for ImageToVideoDefinition {
 impl TraceDefinition for OmniGenerationDefinition {
     const KIND: TraceKind = TraceKind::OmniGeneration;
 
-    fn parse_definition(row: &Row<'_>, tags: ParsedTags) -> Result<Self> {
+    fn parse_definition(
+        row: &Row<'_>,
+        tags: ParsedTags,
+        session_start_time: Option<Time>,
+    ) -> Result<Self> {
         let input: Vec<OmniInputSegment> = json_cell(row, "input_segments")?;
         let output: Vec<OmniOutputSpec> = json_cell(row, "output_segments")?;
         validate_omni_input(row, &input)?;
@@ -417,7 +445,7 @@ impl TraceDefinition for OmniGenerationDefinition {
         Ok(Self {
             input,
             output,
-            prefix: tags.prefix(),
+            session: tags.session_input(session_start_time),
             decoding: tags.decoding,
         })
     }
@@ -744,6 +772,7 @@ impl Row<'_> {
 pub(super) fn load_file<Definition: TraceDefinition>(
     path: &Path,
     declaration: &TraceDeclaration,
+    session_start_times: &mut HashMap<u32, Time>,
     output: &mut Vec<ScheduledRequest<Definition>>,
 ) -> Result<()> {
     if declaration.kind != Definition::KIND {
@@ -772,10 +801,18 @@ pub(super) fn load_file<Definition: TraceDefinition>(
             line: record_index + 2,
         };
         let tags = declaration.parse_tags(&row)?;
+        let release = parse_release(&row, tags)?;
+        // Global arrival-order validation runs after all files are concatenated,
+        // so the first occurrence is the session's first declared arrival.
+        let session_start_time = release.session.map(|session| {
+            *session_start_times
+                .entry(session.session_id)
+                .or_insert_with(|| Time::from_ms(release.trace_arrival_time_ms))
+        });
         output.push(ScheduledRequest {
-            release: parse_release(&row, tags)?,
+            release,
             scheduling: tags.scheduling,
-            definition: Definition::parse_definition(&row, tags)?,
+            definition: Definition::parse_definition(&row, tags, session_start_time)?,
         });
     }
     Ok(())

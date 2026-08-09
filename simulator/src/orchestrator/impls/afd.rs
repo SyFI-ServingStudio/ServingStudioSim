@@ -108,7 +108,7 @@ where
         // FFN first (ref tick order): produce this tick's QKV + tokens.
         self.ffn.tick_collect(now, &mut ffn_events);
         // Scatter QKV back to attn participants + release/complete finished requests.
-        self.attn.apply_ffn_events(&ffn_events, &mut completed);
+        self.attn.apply_ffn_events(&ffn_events, &mut completed, now);
         // Attn workers run: consume the scattered notifications / releases, emit
         // IterStart / AttnLayerOutputsReady.
         self.attn.tick_collect(now, &mut attn_events);
@@ -138,7 +138,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{PrefixInput, RequestId, RequestStore};
+    use crate::common::{RequestId, RequestStore, SessionInput};
     use crate::test_helpers::{test_cluster, text_request, FakeAttn, FakeFfn};
     use crate::worker::{DisaggAttnWorker, WorkerConfig};
     use std::cell::RefCell;
@@ -253,14 +253,14 @@ mod tests {
         let store = empty_store();
         let attn_config = WorkerConfig {
             attn_kv_bytes: 1_000,
-            prefix_cache_capacity_bytes: 1_000,
             ..WorkerConfig::default()
         };
         let mut flow = flow_with_attn_config(1, std::rc::Rc::clone(&store), attn_config);
 
         let mut first = text_request(RequestId(0), 8, 2, Time::ZERO);
-        first.definition.prefix = PrefixInput::Session {
+        first.definition.session = SessionInput::Session {
             session_id: 7,
+            session_start_time: Time::ZERO,
             declared_prefix_tokens: 12,
         };
         flow.on_arrival(first);
@@ -278,10 +278,17 @@ mod tests {
                 .prefill_tokens_processed,
             20
         );
+        assert_eq!(
+            store.borrow()[RequestId(0)]
+                .telemetry
+                .prefix_cache_hit_tokens,
+            Some(0)
+        );
 
         let mut second = text_request(RequestId(1), 5, 2, Time::from_ms(3_000.0));
-        second.definition.prefix = PrefixInput::Session {
+        second.definition.session = SessionInput::Session {
             session_id: 7,
+            session_start_time: Time::ZERO,
             declared_prefix_tokens: 12,
         };
         flow.on_arrival(second);
@@ -298,6 +305,12 @@ mod tests {
                 .progress
                 .prefill_tokens_processed,
             5
+        );
+        assert_eq!(
+            store.borrow()[RequestId(1)]
+                .telemetry
+                .prefix_cache_hit_tokens,
+            Some(12)
         );
     }
 

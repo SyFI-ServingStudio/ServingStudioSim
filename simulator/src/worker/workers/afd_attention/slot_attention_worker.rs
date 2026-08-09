@@ -11,7 +11,9 @@
 //! handlers → tick integration → placement/status helpers.
 
 use crate::common::{RequestId, Time, WorkerId};
-use crate::worker::admission::{FifoOrder, FreshRequestSlotAdmission, SlotPipelineAdmission};
+use crate::worker::admission::{
+    FreshRequestSlotAdmission, SessionStartOrder, SlotPipelineAdmission,
+};
 use crate::worker::execution::{AttentionLayerExecution, AttentionLayerExecutionAdapter};
 use crate::worker::iter_worker::{AfdAttnWorker, IterWorker};
 use crate::worker::kv::{FullAttnKv, PrefixKv, SlotPipelineKv};
@@ -34,7 +36,7 @@ where
 /// Compatibility name retained at the L6 controller surface.
 pub type DisaggAttnWorker<M> = SlotAttentionWorker<
     FullAttnKv,
-    FreshRequestSlotAdmission<FifoOrder>,
+    FreshRequestSlotAdmission<SessionStartOrder>,
     AttentionLayerExecutionAdapter<M>,
 >;
 
@@ -81,7 +83,7 @@ where
     fn enqueue(&mut self, msg: Self::Msg) {
         match msg {
             AttnWorkerMsg::Admit { req } => self.on_msg_admit(req),
-            AttnWorkerMsg::Release { req } => self.on_msg_release(req),
+            AttnWorkerMsg::Release { req, at } => self.on_msg_release(req, at),
             AttnWorkerMsg::ReadyNotification {
                 slot,
                 layer,
@@ -127,8 +129,8 @@ where
         self.admission.enqueue_fresh_request(request, &self.context);
     }
 
-    fn on_msg_release(&mut self, request: RequestId) {
-        if !self.pipeline.release_slotted_request(request) {
+    fn on_msg_release(&mut self, request: RequestId, now: Time) {
+        if !self.pipeline.release_slotted_request(request, now) {
             debug_assert!(
                 !self.admission.cancel_pending(request),
                 "a pending AFD request cannot complete before slot placement"
@@ -175,7 +177,7 @@ mod tests {
     use super::*;
     use crate::common::{PoolId, SharedRequests};
     use crate::test_helpers::{prefilled_store, shared_with, test_cluster, FakeAttn};
-    use crate::worker::admission::ShortestJobFirst;
+    use crate::worker::admission::{FifoOrder, ShortestJobFirst};
     use crate::worker::build_afd_attention_worker;
     use crate::worker::gpu_cluster::SharedGpuCluster;
     use crate::worker::types::WorkerConfig;
@@ -296,7 +298,10 @@ mod tests {
         assert_eq!(worker.status().queued_requests, 1);
         assert_eq!(worker.pipeline.current_kv(RequestId(1)), None);
 
-        worker.enqueue(AttnWorkerMsg::Release { req: RequestId(0) });
+        worker.enqueue(AttnWorkerMsg::Release {
+            req: RequestId(0),
+            at: Time::from_ms(1.0),
+        });
         worker.tick(Time::from_ms(1.0), &mut events);
         assert_eq!(worker.status().queued_requests, 0);
         assert_eq!(worker.pipeline.current_kv(RequestId(1)), Some(8));
@@ -326,7 +331,10 @@ mod tests {
         worker.enqueue(AttnWorkerMsg::Admit { req: RequestId(0) });
         let mut events = Vec::new();
         worker.tick(Time::ZERO, &mut events);
-        worker.enqueue(AttnWorkerMsg::Release { req: RequestId(0) });
+        worker.enqueue(AttnWorkerMsg::Release {
+            req: RequestId(0),
+            at: Time::from_ms(1.0),
+        });
         assert_eq!(worker.pipeline.current_kv(RequestId(0)), None);
         assert_eq!(worker.pipeline.request_slot(RequestId(0)), None);
         assert_eq!(worker.status().active_requests, 0);

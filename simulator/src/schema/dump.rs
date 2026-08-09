@@ -87,10 +87,12 @@ mod tests {
         assert_eq!(tp["type"], "int");
         assert_eq!(tp["affects_cache"], true);
         // llama3_dense (no sharding) has no params.
-        assert!(schema["providers"]["arch"]["iter_wise"]["llama3_dense"]["params"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(
+            schema["providers"]["arch"]["iter_wise"]["llama3_dense"]["params"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -121,7 +123,53 @@ mod tests {
     #[test]
     fn deployments_grammar_maps_roles_to_contracts() {
         let schema = list_params();
-        assert_eq!(schema["deployments"]["unified"]["pools"]["main"], "iter_wise");
-        assert_eq!(schema["deployments"]["afd"]["pools"]["attn"], "layer_wise_attn");
+        assert_eq!(
+            schema["deployments"]["unified"]["pools"]["main"],
+            "iter_wise"
+        );
+        assert_eq!(
+            schema["deployments"]["afd"]["pools"]["attn"],
+            "layer_wise_attn"
+        );
+    }
+
+    #[test]
+    fn attention_workers_expose_prefix_cache_mode_policy_and_optional_ceiling() {
+        let schema = list_params();
+        for params in [
+            &schema["providers"]["worker"]["iter_wise"]["barebone"]["params"],
+            &schema["providers"]["worker"]["iter_wise"]["hp_unified"]["params"],
+            &schema["providers"]["worker"]["iter_wise"]["pd_prefill"]["params"],
+            &schema["providers"]["worker"]["layer_wise_attn"]["disagg_attn"]["params"],
+        ] {
+            let params = params.as_array().expect("worker params are an array");
+            let mode = params
+                .iter()
+                .find(|param| param["name"] == "prefix_cache_mode")
+                .expect("prefix_cache_mode is exposed");
+            assert_eq!(mode["default"], "opportunistic");
+            assert_eq!(mode["choices"], json!(["disabled", "opportunistic"]));
+
+            let policy = params
+                .iter()
+                .find(|param| param["name"] == "prefix_cache_policy")
+                .expect("prefix_cache_policy is exposed");
+            assert_eq!(policy["default"], "lru");
+
+            let ceiling = params
+                .iter()
+                .find(|param| param["name"] == "prefix_cache_max_gpu_memory_gb")
+                .expect("optional prefix cache ceiling is exposed");
+            assert_eq!(ceiling["type"], "float");
+            assert_eq!(ceiling["required"], false);
+        }
+
+        let pd_decode = schema["providers"]["worker"]["iter_wise"]["pd_decode"]["params"]
+            .as_array()
+            .expect("pd_decode params are an array");
+        assert!(pd_decode.iter().all(|param| !param["name"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("prefix_cache_")));
     }
 }

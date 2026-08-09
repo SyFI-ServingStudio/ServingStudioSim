@@ -5,15 +5,15 @@ use std::sync::Arc;
 
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
-use crate::worker::admission::{FifoOrder, LocalPrefillDecodeAdmission};
+use crate::log::PrefixCacheLogger;
+use crate::worker::admission::{LocalPrefillDecodeAdmission, SessionStartOrder};
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{BareboneWorker, IterBatchWorker};
 use crate::worker::workers::unified_iter_build_essentials::{
-    full_attention_token_capacity, prefix_cache_token_capacity,
-    prepare_unified_iter_build_essentials,
+    full_attention_token_capacity, prepare_unified_iter_build_essentials,
 };
 
 /// Selects the production barebone composition without changing the L6-facing
@@ -30,8 +30,13 @@ pub(crate) fn build_barebone_worker<M: IterwiseUnifiedModel>(
     gpu_name: &str,
     cluster: SharedGpuCluster,
 ) -> BareboneWorker<M> {
+    let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let kv_capacity = full_attention_token_capacity(model.as_ref(), &config);
-    let prefix_cache_capacity = prefix_cache_token_capacity(model.as_ref(), &config);
+    let prefix_cache = config.prefix_cache.resolve_tokens(
+        kv_capacity,
+        model.total_kv_bytes_per_token(),
+        model.num_attn_shards(),
+    );
     let essentials = prepare_unified_iter_build_essentials(
         id,
         pool_tag,
@@ -48,12 +53,12 @@ pub(crate) fn build_barebone_worker<M: IterwiseUnifiedModel>(
     let kv_store = FullAttnKv::with_prefix_cache(
         1,
         essentials.kv_capacity,
-        prefix_cache_capacity,
-        config.prefix_cache_policy,
+        prefix_cache,
         essentials.sampler,
+        prefix_cache_logger,
     );
     let admission = LocalPrefillDecodeAdmission::new(
-        FifoOrder::new(),
+        SessionStartOrder::new(),
         (),
         config.max_batch_tokens,
         config.balance,

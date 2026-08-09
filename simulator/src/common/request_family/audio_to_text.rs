@@ -1,7 +1,7 @@
 use crate::common::request::Request;
 
 use super::{
-    AudioExtent, DecodingStrategy, PrefixInput, RequestDefinition, TextGenerationProgress,
+    AudioExtent, DecodingStrategy, RequestDefinition, SessionInput, TextGenerationProgress,
 };
 
 /// Audio-and-text in, autoregressive-text-out request definition.
@@ -11,7 +11,7 @@ pub struct AudioTextGenerationDefinition {
     pub encoded_input_tokens: u32,
     pub target_output_tokens: u32,
     pub extent: AudioExtent,
-    pub prefix: PrefixInput,
+    pub session: SessionInput,
     pub decoding: DecodingStrategy,
 }
 

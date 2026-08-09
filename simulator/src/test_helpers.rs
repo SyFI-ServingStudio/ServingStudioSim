@@ -11,8 +11,8 @@ use crate::arch::contract::{
     AttnArchInput, AttnLayerwiseModel, FfnArchInput, IterwiseUnifiedModel, UnifiedArchInput,
 };
 use crate::common::{
-    DecodingStrategy, PrefixInput, Request, RequestCore, RequestId, RequestStore,
-    SchedulingContract, SharedRequests, TextGenerationDefinition, Time,
+    DecodingStrategy, Request, RequestCore, RequestId, RequestStore, SchedulingContract,
+    SessionInput, SharedRequests, TextGenerationDefinition, Time,
 };
 use crate::timing::cache::interp::{CoverageFlags, Metrics4};
 use crate::timing::LeafMetrics;
@@ -61,7 +61,7 @@ pub(crate) const fn text_request(
         TextGenerationDefinition {
             prompt_tokens,
             target_output_tokens,
-            prefix: PrefixInput::None,
+            session: SessionInput::Standalone,
             decoding: DecodingStrategy::Standard,
         },
     )

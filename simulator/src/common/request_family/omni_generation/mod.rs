@@ -11,14 +11,14 @@ pub use progress::OmniGenerationProgress;
 
 use crate::common::request::Request;
 
-use super::{DecodingStrategy, PrefixInput, RequestDefinition};
+use super::{DecodingStrategy, RequestDefinition, SessionInput};
 
 /// Heterogeneous input and output plans accepted by one omni worker family.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OmniGenerationDefinition {
     pub input: Vec<OmniInputSegment>,
     pub output: Vec<OmniOutputSpec>,
-    pub prefix: PrefixInput,
+    pub session: SessionInput,
     pub decoding: DecodingStrategy,
 }
 
@@ -62,7 +62,7 @@ mod tests {
                     target_tokens: 4,
                 },
             ],
-            prefix: PrefixInput::None,
+            session: SessionInput::Standalone,
             decoding: DecodingStrategy::Standard,
         };
         let mut progress = definition.initial_progress();

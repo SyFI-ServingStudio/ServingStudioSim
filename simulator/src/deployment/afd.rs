@@ -32,7 +32,8 @@ use crate::orchestrator::{
 use crate::timing::kernels::{P2pInterKernel, P2pInterKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
-    AttnWorkerSel, CostSource, FfnWorkerSel, GpuCluster, SharedGpuCluster, WorkerConfig,
+    resolve_prefix_cache_config, AttnWorkerSel, CostSource, FfnWorkerSel, GpuCluster,
+    PrefixCacheConfig, SharedGpuCluster, WorkerConfig,
 };
 
 use super::Deployment;
@@ -84,17 +85,17 @@ impl Deployment for AfdDeployment {
         );
 
         let attn_gpu_memory_gb = attn_gpu_memory_gb(&ag.worker);
-        let prefix_cache_gpu_memory_gb = attn_prefix_cache_gpu_memory_gb(&ag.worker);
-        ensure!(
-            (0.0..=attn_gpu_memory_gb).contains(&prefix_cache_gpu_memory_gb),
-            "afd: prefix_cache_gpu_memory_gb must be within the total attention budget \
-             [0, {attn_gpu_memory_gb}], got {prefix_cache_gpu_memory_gb}"
-        );
+        let prefix_cache = resolve_prefix_cache_config(
+            "afd attention",
+            attn_prefix_cache_mode(&ag.worker),
+            attn_prefix_cache_policy(&ag.worker),
+            attn_prefix_cache_max_gpu_memory_gb(&ag.worker),
+            attn_gpu_memory_gb,
+        )?;
         let attn_wc = worker_config(
             attn_gpu_memory_gb,
             attn_gpu_time_multiplier(&ag.worker),
-            prefix_cache_gpu_memory_gb,
-            attn_prefix_cache_policy(&ag.worker),
+            prefix_cache,
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
@@ -102,8 +103,7 @@ impl Deployment for AfdDeployment {
         let ffn_wc = worker_config(
             80.0, // ffn has no KV
             ffn_gpu_time_multiplier(&fg.worker),
-            0.0,
-            crate::worker::PrefixCachePolicy::Lru,
+            PrefixCacheConfig::Disabled,
             cfg.io.log_output_token_times,
             cfg.io.log_stage_transitions,
             cfg.io.kv_log_stride,
@@ -303,12 +303,11 @@ fn attn_gpu_time_multiplier(worker: &AttnWorkerSel) -> f64 {
     }
 }
 
-fn attn_prefix_cache_gpu_memory_gb(worker: &AttnWorkerSel) -> f64 {
+fn attn_prefix_cache_mode(worker: &AttnWorkerSel) -> crate::worker::PrefixCacheMode {
     match worker {
         AttnWorkerSel::DisaggAttn {
-            prefix_cache_gpu_memory_gb,
-            ..
-        } => *prefix_cache_gpu_memory_gb,
+            prefix_cache_mode, ..
+        } => *prefix_cache_mode,
     }
 }
 
@@ -318,6 +317,15 @@ fn attn_prefix_cache_policy(worker: &AttnWorkerSel) -> crate::worker::PrefixCach
             prefix_cache_policy,
             ..
         } => *prefix_cache_policy,
+    }
+}
+
+fn attn_prefix_cache_max_gpu_memory_gb(worker: &AttnWorkerSel) -> Option<f64> {
+    match worker {
+        AttnWorkerSel::DisaggAttn {
+            prefix_cache_max_gpu_memory_gb,
+            ..
+        } => *prefix_cache_max_gpu_memory_gb,
     }
 }
 
@@ -332,8 +340,7 @@ fn ffn_gpu_time_multiplier(worker: &FfnWorkerSel) -> f64 {
 fn worker_config(
     attn_gpu_memory_gb: f64,
     gpu_time_multiplier: f64,
-    prefix_cache_gpu_memory_gb: f64,
-    prefix_cache_policy: crate::worker::PrefixCachePolicy,
+    prefix_cache: PrefixCacheConfig,
     log_output_token_times: bool,
     log_stage_transitions: bool,
     kv_log_stride: u32,
@@ -344,8 +351,7 @@ fn worker_config(
         log_stage_transitions,
         kv_log_stride,
         gpu_time_multiplier,
-        prefix_cache_capacity_bytes: (prefix_cache_gpu_memory_gb * 1e9) as u64,
-        prefix_cache_policy,
+        prefix_cache,
         ..WorkerConfig::default()
     }
 }

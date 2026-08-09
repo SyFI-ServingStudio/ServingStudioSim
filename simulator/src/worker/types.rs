@@ -71,7 +71,7 @@ pub enum PdPrefillMsg {
     /// L6 from a `PdDecodeEvent::PullComplete` to the originating prefill
     /// worker by `WorkerId` (*not* placement-chosen) — only that worker
     /// holds the request's KV slot.
-    ReleaseKv { req: RequestId },
+    ReleaseKv { req: RequestId, at: Time },
 }
 
 /// PD prefill worker's full event set: the universal `RequestComplete`
@@ -242,7 +242,7 @@ pub enum AttnWorkerMsg {
     SlotFlushed { slot: u8, layer: u16 },
     /// Drop `req`'s KV (the ffn Terminal completed it; the flow routes the release
     /// here). Per-request; the worker tracks its own KV count.
-    Release { req: RequestId },
+    Release { req: RequestId, at: Time },
 }
 
 /// Attn worker events. The attn worker is a pure attention+KV engine — it has NO
@@ -428,14 +428,14 @@ pub struct WorkerConfig {
     /// Optional per-iteration prefill token budget (from the worker selector).
     /// `Some(n)`: admission reserves the budget for live decodes (1 tok/req)
     /// then fills the remainder with whole prefills, force-admitting one
-    /// over-long prefill when the group holds budget but nothing yet. `None`:
-    /// legacy one-prefill/iter. For the multi-group worker the budget is applied
-    /// per DP group. See [`crate::worker::admission::prefill_fits_budget`].
+    /// over-long prefill when the group holds budget but nothing yet. `None`
+    /// means unbounded (`u32::MAX` internally). For the multi-group worker the
+    /// budget is applied per DP group. See
+    /// [`crate::worker::admission::prefill_fits_budget`].
     pub max_batch_tokens: Option<u32>,
-    /// Maximum bytes of `attn_kv_bytes` that may hold evictable completed-session
-    /// prefix KV. This is a sub-budget, never additional GPU memory.
-    pub prefix_cache_capacity_bytes: u64,
-    pub prefix_cache_policy: crate::worker::kv::PrefixCachePolicy,
+    /// Whether and how completed-session KV uses the dynamically available
+    /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
+    pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
 }
 
 impl Default for WorkerConfig {
@@ -448,8 +448,7 @@ impl Default for WorkerConfig {
             kv_log_stride: 8,
             gpu_time_multiplier: 1.0,
             max_batch_tokens: None,
-            prefix_cache_capacity_bytes: 0,
-            prefix_cache_policy: crate::worker::kv::PrefixCachePolicy::Lru,
+            prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
         }
     }
 }

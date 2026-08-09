@@ -165,8 +165,14 @@ fn load_typed<Definition: TraceDefinition>(
     }
     validate_mode(mode, declaration)?;
     let mut scheduled_requests = Vec::new();
+    let mut session_start_times = std::collections::HashMap::new();
     for file in files {
-        schema::load_file(file, declaration, &mut scheduled_requests)?;
+        schema::load_file(
+            file,
+            declaration,
+            &mut session_start_times,
+            &mut scheduled_requests,
+        )?;
     }
     if scheduled_requests.is_empty() {
         bail!("trace files contained no rows");
@@ -255,8 +261,8 @@ fn validate_arrival_order<Definition: RequestDefinition>(
 mod tests {
     use super::*;
     use crate::common::{
-        AudioExtent, DecodingStrategy, ImageExtent, OmniInputSegment, OmniOutputSpec, PrefixInput,
-        RequestId, VideoExtent,
+        AudioExtent, DecodingStrategy, ImageExtent, OmniInputSegment, OmniOutputSpec, RequestId,
+        SessionInput, VideoExtent,
     };
     use std::io::Write;
     use std::path::Path;
@@ -318,6 +324,25 @@ mod tests {
         out
     }
 
+    fn drain_session_facts(
+        frontend: &mut TraceFrontend,
+        now_ms: f64,
+    ) -> Vec<(RequestId, f64, Option<f64>)> {
+        let mut released = Vec::new();
+        frontend.drain_due(Time::from_ms(now_ms), |request| {
+            released.push((
+                request.core.id,
+                request.core.arrival_time.as_ms(),
+                request
+                    .definition
+                    .session
+                    .session_start_time()
+                    .map(Time::as_ms),
+            ));
+        });
+        released
+    }
+
     // ---- open / closed loop replay -----------------------------------------
 
     #[test]
@@ -336,7 +361,10 @@ mod tests {
         assert_eq!(fe.expected_count(), 3);
 
         // At t=0 only req 0 is due; a second drain at t=0 yields nothing.
-        assert_eq!(drain_at(&mut fe, 0.0), vec![RequestId(0)]);
+        assert_eq!(
+            drain_session_facts(&mut fe, 0.0),
+            vec![(RequestId(0), 0.0, None)]
+        );
         assert_eq!(drain_at(&mut fe, 0.0), vec![]);
 
         // At t=5 both remaining drain in one call, in row order.
@@ -522,14 +550,18 @@ mod tests {
             ReplayMode::SessionChain { request_rate: 1.0 },
         )
         .unwrap();
-        assert_eq!(drain_at(&mut fe, 0.0), vec![RequestId(0)]);
+        assert_eq!(
+            drain_session_facts(&mut fe, 0.0),
+            vec![(RequestId(0), 0.0, Some(0.0))]
+        );
 
         // Round 0 completes at 100ms, but declares a 250ms tool wait after it.
         fe.record_completion(RequestId(0), Time::from_ms(100.0));
         assert_eq!(drain_at(&mut fe, 349.0), vec![]);
         assert_eq!(
-            drain_pairs(&mut fe, 350.0),
-            vec![(RequestId(1), 350.0)] // release clock, not the CSV's 0.0
+            drain_session_facts(&mut fe, 350.0),
+            // Arrival is the successor's release clock; session start stays at round 0.
+            vec![(RequestId(1), 350.0, Some(0.0))]
         );
     }
 
@@ -630,7 +662,10 @@ mod tests {
         assert_eq!(scheduled_request.release.request_id, RequestId(0));
         assert_eq!(scheduled_request.definition.prompt_tokens, 8);
         assert_eq!(scheduled_request.definition.target_output_tokens, 2);
-        assert_eq!(scheduled_request.definition.prefix, PrefixInput::None);
+        assert_eq!(
+            scheduled_request.definition.session,
+            SessionInput::Standalone
+        );
         assert_eq!(
             scheduled_request.definition.decoding,
             DecodingStrategy::Standard
@@ -650,7 +685,7 @@ mod tests {
             "stacked.csv",
             "id,input_len,output_len,arrival_time,session_id,prefix_kv,tool_wait_after_ms,\
              deadline_ms,priority,accept_rate\n\
-             0,8,2,0.0,7,512,250.0,1200.0,3,0.75\n",
+             0,8,2,4.0,7,512,250.0,1200.0,3,0.75\n",
         );
         let fe = TraceFrontend::load(
             &[path],
@@ -667,9 +702,10 @@ mod tests {
             })
         );
         assert_eq!(
-            scheduled_request.definition.prefix,
-            PrefixInput::Session {
+            scheduled_request.definition.session,
+            SessionInput::Session {
                 session_id: 7,
+                session_start_time: Time::from_ms(4.0),
                 declared_prefix_tokens: 512,
             }
         );
@@ -688,6 +724,11 @@ mod tests {
         assert_eq!(
             realized_request.core.scheduling.completion_deadline,
             Some(Time::from_ms(1210.0))
+        );
+        assert_eq!(
+            realized_request.definition.session.session_start_time(),
+            Some(Time::from_ms(4.0)),
+            "replay release time must not rewrite the trace-declared session start"
         );
     }
 

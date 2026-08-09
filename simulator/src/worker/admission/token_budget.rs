@@ -11,7 +11,9 @@ pub(crate) fn prefill_fits_budget(
     next_prefill_tokens: u32,
 ) -> bool {
     let prefill_budget = budget.saturating_sub(decode_tokens);
-    let fits = admitted_tokens.saturating_add(next_prefill_tokens) <= prefill_budget;
+    let fits = admitted_tokens
+        .checked_add(next_prefill_tokens)
+        .is_some_and(|total_prefill_tokens| total_prefill_tokens <= prefill_budget);
     let force_first =
         admitted_tokens == 0 && prefill_budget > 0 && next_prefill_tokens > prefill_budget;
     fits || force_first
@@ -44,5 +46,10 @@ mod tests {
     fn force_admits_only_the_first_overlong_prefill() {
         assert!(prefill_fits_budget(4, 0, 0, 10));
         assert!(!prefill_fits_budget(4, 0, 10, 10));
+    }
+
+    #[test]
+    fn rejects_accumulated_token_overflow_at_unbounded_sentinel() {
+        assert!(!prefill_fits_budget(u32::MAX, 0, u32::MAX - 1, 2));
     }
 }

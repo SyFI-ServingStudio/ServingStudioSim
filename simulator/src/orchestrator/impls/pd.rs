@@ -174,7 +174,7 @@ where
                     ..
                 } => {
                     self.prefill_pool
-                        .route_msg_to(prefill_worker, PdPrefillMsg::ReleaseKv { req });
+                        .route_msg_to(prefill_worker, PdPrefillMsg::ReleaseKv { req, at: now });
                 }
             }
         }
