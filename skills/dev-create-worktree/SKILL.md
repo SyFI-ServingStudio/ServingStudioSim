@@ -20,10 +20,13 @@ needs are therefore missing in a fresh worktree:
    kernel rows into it without committing). The worktree would get the stale
    committed `profile.db` and re-profile on the next GPU run — slow and needs a
    GPU. Copy the working copy over.
-2. **Untracked traces** — large workload CSVs like `trace/aime_long.csv`
-   (~5 MB) are deliberately **not** committed, so they never reach a new
-   worktree. Presets that reference them (`presets/*_aime*.yaml`) fail without
-   them. Copy them over.
+2. **Untracked traces** — large workload CSVs are deliberately **not**
+   committed, so they never reach a new worktree: `trace/aime_long.csv` (~5 MB)
+   and the full-dataset TraceLab traces `trace/tracelab_reported.csv` /
+   `trace/tracelab_preserving.csv` (~23 MB each). Presets that reference them
+   (`presets/*_aime*.yaml`) fail without them. Copy them over. Their committed
+   `*.manifest.json` sidecars say which policy produced each file, so a worktree
+   missing the CSV still records what it is supposed to contain.
 
 Everything else a run needs (`.venv/`, `target/`, `Cargo.lock`, `__pycache__`)
 is git-ignored and rebuilt on demand: the first `uv run` / launcher call does
@@ -87,8 +90,9 @@ commit of the primary tree's kernel cache.)
 ### 3. Provision untracked traces
 
 `rsync` the whole `trace/` dir — tracked files already match, so this only adds
-the untracked ones (`aime_long.csv`, any others). Untracked files are not swept
-by `git commit -am`, so no extra guarding is needed:
+the untracked ones (`aime_long.csv`, the `tracelab_*.csv` pair, any others).
+Untracked files are not swept by `git commit -am`, so no extra guarding is
+needed:
 
 ```bash
 rsync -a "$MAIN/trace/" "$WT/trace/"

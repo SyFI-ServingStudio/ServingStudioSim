@@ -14,8 +14,13 @@ __pycache__/
 *.pftrace
 profile.db-journal
 logs/
-# Large workload trace: provisioned per-worktree, not tracked (see create-worktree)
+# Large workload traces: provisioned per-worktree, not tracked (see create-worktree).
+# The full-dataset TraceLab traces are ~23 MB each; their manifests ARE committed
+# beside them, so the repo still records what policy produced each file and how
+# much prefix that policy folded into fresh input.
 trace/aime_long.csv
+trace/tracelab_reported.csv
+trace/tracelab_preserving.csv
 
 # Editor / OS
 .vscode/
