@@ -9,7 +9,7 @@
 //! enumeration to reproduce the padded DeepGEMM-logits layout.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
+use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
@@ -55,7 +55,9 @@ impl KernelSpec for DsaTopkPrefillSpec {
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
-        CacheKind::Cache2DLinear
+        // Top-k runs over the `num_queries x num_keys` logits matrix, so the
+        // axes are the two factors of the work.
+        CacheKind::Cache2DLinear(Extrapolation::Product)
     }
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
@@ -116,7 +118,7 @@ mod tests {
         DsaTopkPrefillSpec,
     };
     use crate::timing::bridge::DType;
-    use crate::timing::cache::CacheKind;
+    use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::{SlotInput, SweepCoords};
     use serde_json::Value;
@@ -262,11 +264,11 @@ mod tests {
     fn both_backends_use_physical_bilinear_cache() {
         assert_eq!(
             DsaTopkPrefillSpec::cache_kind(TORCH_BACKEND),
-            CacheKind::Cache2DLinear
+            CacheKind::Cache2DLinear(Extrapolation::Product)
         );
         assert_eq!(
             DsaTopkPrefillSpec::cache_kind(VLLM_BACKEND),
-            CacheKind::Cache2DLinear
+            CacheKind::Cache2DLinear(Extrapolation::Product)
         );
     }
 

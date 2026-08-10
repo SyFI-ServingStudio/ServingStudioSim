@@ -10,7 +10,7 @@
 //! unchanged.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
+use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
@@ -93,7 +93,11 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
-        CacheKind::Cache2DLinear
+        // Sparse attention reads `selected_k` tokens per query, and `selected_k`
+        // is a Config field, not an axis. Work is therefore ~linear in
+        // `num_queries`; `num_cache_tokens` sets the gather footprint the
+        // indices point into, not how many of them are read.
+        CacheKind::Cache2DLinear(Extrapolation::Weighted)
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
@@ -205,7 +209,7 @@ mod tests {
         UNIFORM_QUERY_AXIS,
     };
     use crate::timing::bridge::{ArgsPayload, DType};
-    use crate::timing::cache::CacheKind;
+    use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::{Dim, SlotInput, SweepCoords};
     use serde_json::Value;
@@ -465,11 +469,11 @@ mod tests {
     fn both_backends_use_the_existing_physical_bilinear_cache() {
         assert_eq!(
             DsaSparseMlaAttentionSpec::cache_kind(TORCH_BACKEND),
-            CacheKind::Cache2DLinear
+            CacheKind::Cache2DLinear(Extrapolation::Weighted)
         );
         assert_eq!(
             DsaSparseMlaAttentionSpec::cache_kind(FLASHMLA_BACKEND),
-            CacheKind::Cache2DLinear
+            CacheKind::Cache2DLinear(Extrapolation::Weighted)
         );
     }
 

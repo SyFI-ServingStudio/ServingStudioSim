@@ -20,7 +20,7 @@
 //! up to 4M). Two monotonic axes -> `Cache2DLinear` + `grid.expand_2d`.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
+use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
@@ -61,7 +61,11 @@ impl KernelSpec for FlashinferAttnDecodeSpec {
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
-        CacheKind::Cache2DLinear
+        // `total_tokens` is ALREADY the product (total KV across the batch), so
+        // the two axes must not be multiplied again: doubling `batch_size` at a
+        // fixed `total_tokens` re-slices the same KV read, it does not double it.
+        // Time follows the tokens; batch only moves parallelism and launch cost.
+        CacheKind::Cache2DLinear(Extrapolation::Weighted)
     }
 
     fn enumerate(
@@ -92,7 +96,7 @@ mod tests {
         FlashinferAttnDecodeKernelConfig, FlashinferAttnDecodeKernelInput, FlashinferAttnDecodeSpec,
     };
     use crate::timing::bridge::DType;
-    use crate::timing::cache::CacheKind;
+    use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::SweepCoords;
     use serde_json::Value;
@@ -149,7 +153,7 @@ mod tests {
     fn cache_kind_is_two_dimensional_linear() {
         assert_eq!(
             FlashinferAttnDecodeSpec::cache_kind("fa2"),
-            CacheKind::Cache2DLinear
+            CacheKind::Cache2DLinear(Extrapolation::Weighted)
         );
     }
 

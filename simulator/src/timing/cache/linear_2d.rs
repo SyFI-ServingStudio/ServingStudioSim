@@ -1,7 +1,142 @@
 use crate::timing::bridge::KernelMetrics;
-use crate::timing::cache::interp::{locate, CoverageFlags, LeafMetrics, Metrics4, MONOTONICITY_TOLERANCE};
-use crate::timing::cache::{peak_over_cells, Cache, OutlierKind, OutlierWarning, PeakRates};
+use crate::timing::cache::interp::{
+    locate, CoverageFlags, LeafMetrics, Metrics4, MONOTONICITY_TOLERANCE,
+};
+use crate::timing::cache::{
+    peak_over_cells, Cache, Extrapolation, OutlierKind, OutlierWarning, PeakRates,
+};
 use crate::timing::sweep::SweepGrid;
+
+/// Fraction of each axis's maximum below which a cell is dropped from the
+/// [`Weighted`](Extrapolation::Weighted) slope fit. The small-shape end of a
+/// profile grid is a flat launch-overhead plateau whose slope is meaningless;
+/// fitting through it drags the far-field slope toward zero. A quarter of each
+/// axis is where `moe_alltoall`'s measured curve has left the plateau on both
+/// axes.
+const SLOPE_BAND_FRACTION: f32 = 0.25;
+
+/// Per-axis slopes for [`Extrapolation::Weighted`], fitted once at build time by
+/// ordinary least squares over the grid's top band.
+///
+/// `eval` uses these for the *increment* past the grid boundary, never as the
+/// value itself: the fitted intercept is discarded, so a real measurement is
+/// never displaced and the surface stays continuous where the table ends. One
+/// slope per metric per axis — `time_ms` alone would leave an extrapolated leaf
+/// with a boundary-valued FLOP count, which the optimality roofline then divides
+/// by an extrapolated time.
+#[derive(Clone, Copy, Debug)]
+struct AxisSlopes {
+    per_axis: [Metrics4; 2],
+}
+
+/// Least-squares fit of `metric = a + b0·x0 + b1·x1` over the grid's top band,
+/// one line per metric, keeping only the two slopes.
+///
+/// Returns `None` when the band cannot pin both slopes down — fewer than three
+/// finite cells, or every cell sharing one axis coordinate (a degenerate normal
+/// matrix). The caller then falls back to holding the boundary, which is the
+/// point: a policy that cannot be fitted must not be guessed.
+fn fit_axis_slopes(
+    xs0: &[f32],
+    xs1: &[f32],
+    cells: &[Metrics4],
+    valid: &[bool],
+) -> Option<AxisSlopes> {
+    let columns = xs1.len();
+    let floor0 = xs0[xs0.len() - 1] * SLOPE_BAND_FRACTION;
+    let floor1 = xs1[columns - 1] * SLOPE_BAND_FRACTION;
+
+    let mut band: Vec<(f64, f64, Metrics4)> = Vec::new();
+    for (i, &x0) in xs0.iter().enumerate() {
+        if x0 < floor0 {
+            continue;
+        }
+        for (j, &x1) in xs1.iter().enumerate() {
+            if x1 < floor1 || !valid[i * columns + j] {
+                continue;
+            }
+            band.push((f64::from(x0), f64::from(x1), cells[i * columns + j]));
+        }
+    }
+    if band.len() < 3 {
+        return None;
+    }
+
+    // Normal equations for the 3-parameter design [1, x0, x1]. Solved by
+    // Cramer's rule on the symmetric 3x3 — small, fixed size, no allocation.
+    let count = band.len() as f64;
+    let (mut sum0, mut sum1) = (0.0, 0.0);
+    let (mut sum00, mut sum11, mut sum01) = (0.0, 0.0, 0.0);
+    for &(x0, x1, _) in &band {
+        sum0 += x0;
+        sum1 += x1;
+        sum00 += x0 * x0;
+        sum11 += x1 * x1;
+        sum01 += x0 * x1;
+    }
+    let normal = [
+        [count, sum0, sum1],
+        [sum0, sum00, sum01],
+        [sum1, sum01, sum11],
+    ];
+    let determinant = determinant_3x3(&normal);
+    // The scale-free comparison: a degenerate band gives a determinant that is
+    // negligible against the magnitude its entries could support.
+    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON * count * sum00 * sum11 {
+        return None;
+    }
+
+    let mut per_axis = [Metrics4::ZERO; 2];
+    for metric in 0..4 {
+        let value = |cell: &Metrics4| -> f64 {
+            f64::from(match metric {
+                0 => cell.time_ms,
+                1 => cell.flops,
+                2 => cell.bytes,
+                _ => cell.energy_j,
+            })
+        };
+        let mut rhs = [0.0; 3];
+        for (x0, x1, cell) in &band {
+            let observed = value(cell);
+            rhs[0] += observed;
+            rhs[1] += x0 * observed;
+            rhs[2] += x1 * observed;
+        }
+        // Slope along axis-k is the k-th unknown; substitute `rhs` into that
+        // column. The intercept (column 0) is deliberately not read: `lookup`
+        // anchors on a measured boundary value instead.
+        for (axis, column) in [(0usize, 1usize), (1, 2)] {
+            let mut substituted = normal;
+            for row in 0..3 {
+                substituted[row][column] = rhs[row];
+            }
+            let slope = (determinant_3x3(&substituted) / determinant) as f32;
+            let slot = &mut per_axis[axis];
+            let field = match metric {
+                0 => &mut slot.time_ms,
+                1 => &mut slot.flops,
+                2 => &mut slot.bytes,
+                _ => &mut slot.energy_j,
+            };
+            // A negative slope would make a bigger shape cheaper off-grid. The
+            // grid's own monotonicity scan already warns about that in-grid; out
+            // here it is silently floored, so extrapolation can only add work.
+            *field = if slope.is_finite() {
+                slope.max(0.0)
+            } else {
+                0.0
+            };
+        }
+    }
+    Some(AxisSlopes { per_axis })
+}
+
+fn determinant_3x3(m: &[[f64; 3]; 3]) -> f64 {
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+}
 
 /// Bilinear interpolation over a rectangular 2D profile grid. Both axes are
 /// expected monotonic-in-time (bigger coordinate ⇒ more work ⇒ more time), e.g.
@@ -29,10 +164,58 @@ pub struct Cache2DLinear {
     /// `valid.iter().any()` — false ⇒ the whole grid was dropped, so `eval`
     /// returns `NoCoverage` rather than a silent zero.
     any_valid: bool,
+    /// How lookups past the last grid point continue. Never consulted inside the
+    /// grid, where all policies agree.
+    extrapolation: Extrapolation,
+    /// The fitted per-axis slopes for `Weighted`. `None` for `Product` (which
+    /// extends the bilinear surface itself) and for `Clamp`, and also when the
+    /// top band held too few finite cells to fit — in which case `Weighted`
+    /// degrades to `Clamp` rather than inventing a slope.
+    slopes: Option<AxisSlopes>,
 }
 
 impl Cache for Cache2DLinear {
+    /// The trait entry point carries no policy, so it builds the historical
+    /// `Product` surface. `build_cache` never comes through here — it calls
+    /// [`Cache2DLinear::from_samples_with`] with the kernel's declared policy —
+    /// so this is the path for tests and for any generic `Cache` construction.
     fn from_samples(grid: &SweepGrid, samples: &[KernelMetrics]) -> (Self, Vec<OutlierWarning>) {
+        Self::from_samples_with(grid, samples, Extrapolation::Product)
+    }
+
+    fn eval(&self, sweep: &[f64]) -> LeafMetrics {
+        assert_eq!(
+            sweep.len(),
+            2,
+            "Cache2DLinear lookup requires two coordinates"
+        );
+        let (x0, x1) = (sweep[0], sweep[1]);
+        if x0.is_nan() || x1.is_nan() || !self.any_valid {
+            return LeafMetrics::MISS;
+        }
+        let (cell, extrapolated) = self.lookup(x0 as f32, x1 as f32);
+        LeafMetrics {
+            m: cell.clamped(),
+            coverage: if extrapolated {
+                CoverageFlags::EXTRAPOLATED
+            } else {
+                CoverageFlags::EMPTY
+            },
+            backend_index: LeafMetrics::NO_BACKEND,
+        }
+    }
+
+    fn peak_rates(&self) -> PeakRates {
+        peak_over_cells(self.cells.iter().copied())
+    }
+}
+
+impl Cache2DLinear {
+    pub fn from_samples_with(
+        grid: &SweepGrid,
+        samples: &[KernelMetrics],
+        extrapolation: Extrapolation,
+    ) -> (Self, Vec<OutlierWarning>) {
         assert_eq!(grid.axes().len(), 2, "Cache2DLinear requires a 2D grid");
         let axis0 = &grid.axes()[0];
         let axis1 = &grid.axes()[1];
@@ -127,6 +310,11 @@ impl Cache for Cache2DLinear {
             }
         }
 
+        let slopes = match extrapolation {
+            Extrapolation::Weighted => fit_axis_slopes(&xs0, &xs1, &cells, &valid),
+            Extrapolation::Product | Extrapolation::Clamp => None,
+        };
+
         (
             Self {
                 xs0,
@@ -135,39 +323,47 @@ impl Cache for Cache2DLinear {
                 valid,
                 all_finite,
                 any_valid,
+                extrapolation,
+                slopes,
             },
             warnings,
         )
     }
 
-    fn eval(&self, sweep: &[f64]) -> LeafMetrics {
-        assert_eq!(
-            sweep.len(),
-            2,
-            "Cache2DLinear lookup requires two coordinates"
-        );
-        let (x0, x1) = (sweep[0], sweep[1]);
-        if x0.is_nan() || x1.is_nan() || !self.any_valid {
-            return LeafMetrics::MISS;
+    /// Bilinear inside the grid; outside, whatever this cache's
+    /// [`Extrapolation`] says. `Product` runs the historical path — the bilinear
+    /// weights themselves carry `t` past `[0,1]`. The other two evaluate at the
+    /// clamped coordinates (a point that is always inside the grid, so the four
+    /// corners are real measurements) and then add the policy's increment, which
+    /// is zero on the boundary and therefore continuous with the table.
+    fn lookup(&self, x0: f32, x1: f32) -> (Metrics4, bool) {
+        if let Extrapolation::Product = self.extrapolation {
+            return self.interpolate_cell(x0, x1);
         }
-        let (cell, extrapolated) = self.interpolate_cell(x0 as f32, x1 as f32);
-        LeafMetrics {
-            m: cell.clamped(),
-            coverage: if extrapolated {
-                CoverageFlags::EXTRAPOLATED
-            } else {
-                CoverageFlags::EMPTY
-            },
-            backend_index: LeafMetrics::NO_BACKEND,
+        let lo0 = self.xs0[0];
+        let hi0 = self.xs0[self.xs0.len() - 1];
+        let lo1 = self.xs1[0];
+        let hi1 = self.xs1[self.xs1.len() - 1];
+        let clamped0 = x0.clamp(lo0, hi0);
+        let clamped1 = x1.clamp(lo1, hi1);
+        let outside = clamped0 != x0 || clamped1 != x1;
+        let (mut cell, _) = self.interpolate_cell(clamped0, clamped1);
+        if !outside {
+            return (cell, false);
         }
+        if let Some(slopes) = self.slopes {
+            // Only overshoot *above* the grid is priced, and each axis is priced
+            // on its own — no cross term, so two overshoots add where the
+            // bilinear form would have multiplied them. Undershoot below the
+            // first grid point is left clamped: these slopes describe the far
+            // field, and the near field is a launch-overhead plateau where
+            // subtracting a far-field slope would run the value to zero.
+            cell.add_scaled(slopes.per_axis[0], (x0 - hi0).max(0.0));
+            cell.add_scaled(slopes.per_axis[1], (x1 - hi1).max(0.0));
+        }
+        (cell, true)
     }
 
-    fn peak_rates(&self) -> PeakRates {
-        peak_over_cells(self.cells.iter().copied())
-    }
-}
-
-impl Cache2DLinear {
     /// Locate the 2D bracketing cell once (one branchless `locate` per axis),
     /// then bilinear-blend all four metrics of the (up to) four corners in a
     /// single pass — the corner cells and their weights are computed once and
@@ -188,8 +384,7 @@ impl Cache2DLinear {
             t0 * (1.0 - t1),
             t0 * t1,
         );
-        let (idx00, idx01, idx10, idx11) =
-            (i0 * c + j0, i0 * c + j1, i1 * c + j0, i1 * c + j1);
+        let (idx00, idx01, idx10, idx11) = (i0 * c + j0, i0 * c + j1, i1 * c + j0, i1 * c + j1);
 
         // Hot path: the grid has no dropped cells, so blend all four corners
         // unconditionally — four aligned `Metrics4` loads and a weighted sum the
@@ -277,7 +472,7 @@ impl Cache2DLinear {
 mod tests {
     use crate::timing::bridge::KernelMetrics;
     use crate::timing::cache::interp::CoverageFlags;
-    use crate::timing::cache::{Cache, Cache2DLinear, OutlierKind};
+    use crate::timing::cache::{Cache, Cache2DLinear, Extrapolation, OutlierKind};
     use crate::timing::sweep::SweepGrid;
 
     fn sample(time_ms: f64) -> KernelMetrics {
@@ -524,9 +719,7 @@ mod tests {
         run("interpolate_cell (4 fields)", &|a, b| {
             cache.interpolate_cell(a, b).0.time_ms
         });
-        run("eval", &|a, b| {
-            cache.eval(&[a as f64, b as f64]).m.time_ms
-        });
+        run("eval", &|a, b| cache.eval(&[a as f64, b as f64]).m.time_ms);
     }
 
     /// 2x2 grid, axis0 = [1,2], axis1 = [10,20], times row-major:
@@ -660,5 +853,160 @@ mod tests {
         assert_eq!(cache.eval(&[1.5, 15.0]).m.time_ms, 2.5);
         assert_eq!(cache.eval(&[1.0, 10.0]).m.time_ms, 1.0);
         assert_eq!(cache.eval(&[2.0, 20.0]).m.time_ms, 4.0);
+    }
+
+    /// A synthetic profile grid plus the closed-form truth it was sampled from,
+    /// so a test can score extrapolation against the surface rather than against
+    /// another interpolation of it.
+    type SyntheticGrid = (SweepGrid, Vec<KernelMetrics>, fn(f64, f64) -> f64);
+
+    /// A 16x16 grid over an additive truth `1 + x0/100 + x1/1000`, i.e. axis-0
+    /// costs ten times axis-1 per unit — the shape of every collective and every
+    /// kernel whose second axis is a footprint rather than a workload.
+    fn additive_grid(scale1: f32) -> SyntheticGrid {
+        let axis: Vec<f64> = (1..=16).map(|k| f64::from(k) * 64.0).collect();
+        let grid = SweepGrid::new(vec![axis.clone(), axis.clone()]);
+        let scale1 = f64::from(scale1);
+        let mut samples = Vec::with_capacity(axis.len() * axis.len());
+        for &x0 in &axis {
+            for &x1 in &axis {
+                samples.push(sample(1.0 + x0 / 100.0 + x1 * scale1));
+            }
+        }
+        (grid, samples, |x0, x1| 1.0 + x0 / 100.0 + x1 / 1000.0)
+    }
+
+    #[test]
+    fn product_policy_is_the_unchanged_bilinear_surface() {
+        let (grid, samples, _) = additive_grid(0.001);
+        let (product, _) =
+            Cache2DLinear::from_samples_with(&grid, &samples, Extrapolation::Product);
+        // `from_samples` (the trait entry point) must be the same surface, and
+        // both must agree with the raw bilinear blend everywhere, on-grid and off.
+        let (default, _) = Cache2DLinear::from_samples(&grid, &samples);
+        for &(x0, x1) in &[(300.0, 700.0), (1024.0, 1024.0), (4096.0, 4096.0)] {
+            let expected = product.interpolate_cell(x0 as f32, x1 as f32).0.time_ms;
+            assert_eq!(product.eval(&[x0, x1]).m.time_ms, expected);
+            assert_eq!(default.eval(&[x0, x1]).m.time_ms, expected);
+        }
+    }
+
+    /// The same additive truth, but with the single top corner sampled 3% high —
+    /// the measurement noise (or boundary curvature) any real grid carries.
+    ///
+    /// A perfectly additive surface has `f00 - f01 - f10 + f11 == 0`, so its
+    /// bilinear cross term is exactly zero and even wild extrapolation of it is
+    /// exact. It takes an *interaction* in the boundary cell for `t0*t1` to have
+    /// anything to amplify — which is why the real `moe_alltoall` grid, whose
+    /// axes measurably interact in-grid, blew up while a clean additive model
+    /// would not have shown the bug at all.
+    fn additive_grid_with_perturbed_corner() -> SyntheticGrid {
+        let axis: Vec<f64> = (1..=16).map(|k| f64::from(k) * 64.0).collect();
+        let top = *axis.last().expect("non-empty axis");
+        let grid = SweepGrid::new(vec![axis.clone(), axis.clone()]);
+        let truth = |x0: f64, x1: f64| 1.0 + x0 / 100.0 + x1 / 1000.0;
+        let mut samples = Vec::with_capacity(axis.len() * axis.len());
+        for &x0 in &axis {
+            for &x1 in &axis {
+                let value = truth(x0, x1);
+                let value = if x0 == top && x1 == top {
+                    value * 1.03
+                } else {
+                    value
+                };
+                samples.push(sample(value));
+            }
+        }
+        (grid, samples, |x0, x1| 1.0 + x0 / 100.0 + x1 / 1000.0)
+    }
+
+    #[test]
+    fn product_amplifies_boundary_noise_that_weighted_ignores() {
+        let (grid, samples, truth) = additive_grid_with_perturbed_corner();
+        let (weighted, _) =
+            Cache2DLinear::from_samples_with(&grid, &samples, Extrapolation::Weighted);
+        let (product, _) =
+            Cache2DLinear::from_samples_with(&grid, &samples, Extrapolation::Product);
+
+        // Sixteen axis maxima out on BOTH axes — the shape that made
+        // `moe_alltoall` over-predict by 78x in a real run.
+        let (x0, x1) = (16_384.0, 16_384.0);
+        let expected = truth(x0, x1);
+        let weighted_ratio = f64::from(weighted.eval(&[x0, x1]).m.time_ms) / expected;
+        let product_ratio = f64::from(product.eval(&[x0, x1]).m.time_ms) / expected;
+        assert!(
+            (weighted_ratio - 1.0).abs() < 0.02,
+            "weighted extrapolation should track the additive truth, got {weighted_ratio}x"
+        );
+        assert!(
+            product_ratio > 50.0,
+            "3% of corner noise must reach two orders of magnitude through the \
+             t0*t1 weight — that is the bug under test; got {product_ratio}x"
+        );
+        assert!(weighted
+            .eval(&[x0, x1])
+            .coverage
+            .contains(CoverageFlags::EXTRAPOLATED));
+
+        // One axis off-grid is the mild case for both policies: there is no
+        // product of overshoots, so bilinear stays within a small factor.
+        let single_axis = f64::from(product.eval(&[x0, 1024.0]).m.time_ms) / truth(x0, 1024.0);
+        assert!(
+            single_axis < 2.0,
+            "one-axis extrapolation should not blow up; got {single_axis}x"
+        );
+    }
+
+    #[test]
+    fn weighted_policy_adds_the_two_overshoots_instead_of_multiplying_them() {
+        let (grid, samples, _) = additive_grid(0.001);
+        let (cache, _) = Cache2DLinear::from_samples_with(&grid, &samples, Extrapolation::Weighted);
+        let top = 1024.0;
+        let boundary = f64::from(cache.eval(&[top, top]).m.time_ms);
+        let one_axis = f64::from(cache.eval(&[top + 4096.0, top]).m.time_ms) - boundary;
+        let other_axis = f64::from(cache.eval(&[top, top + 4096.0]).m.time_ms) - boundary;
+        let both = f64::from(cache.eval(&[top + 4096.0, top + 4096.0]).m.time_ms) - boundary;
+        assert!(
+            (both - (one_axis + other_axis)).abs() < 1e-3,
+            "two overshoots must add ({one_axis} + {other_axis}), got {both}"
+        );
+    }
+
+    #[test]
+    fn weighted_policy_gives_a_cost_free_axis_no_slope() {
+        // `dsa_sparse_mla_attention` measures 0.96x across a millionfold change
+        // in its second axis, and `flashinfer_attn_decode` 0.90x across 256x of
+        // batch: an axis can be pure footprint. Extrapolating along it must not
+        // add time (and a mildly negative measured slope must not subtract any).
+        let (grid, samples, _) = additive_grid(0.0);
+        let (cache, _) = Cache2DLinear::from_samples_with(&grid, &samples, Extrapolation::Weighted);
+        let top = 1024.0;
+        let boundary = cache.eval(&[top, top]).m.time_ms;
+        assert_eq!(cache.eval(&[top, 65_536.0]).m.time_ms, boundary);
+    }
+
+    #[test]
+    fn clamp_policy_holds_the_boundary_and_still_flags() {
+        let (grid, samples, _) = additive_grid(0.001);
+        let (cache, _) = Cache2DLinear::from_samples_with(&grid, &samples, Extrapolation::Clamp);
+        let boundary = cache.eval(&[1024.0, 1024.0]);
+        let beyond = cache.eval(&[65_536.0, 65_536.0]);
+        assert_eq!(beyond.m.time_ms, boundary.m.time_ms);
+        assert!(beyond.coverage.contains(CoverageFlags::EXTRAPOLATED));
+        assert!(boundary.coverage.is_empty());
+    }
+
+    #[test]
+    fn weighted_policy_falls_back_to_the_boundary_when_the_band_cannot_be_fitted() {
+        // Only `100.0` clears axis-0's band floor (25% of 100), so every band
+        // cell shares one axis-0 coordinate and that slope is unidentifiable.
+        // The fit must decline rather than solve a near-singular system.
+        let grid = SweepGrid::new(vec![vec![1.0, 100.0], vec![10.0, 20.0, 30.0, 40.0]]);
+        let samples = (1..=8).map(|k| sample(f64::from(k))).collect::<Vec<_>>();
+        let (cache, _) = Cache2DLinear::from_samples_with(&grid, &samples, Extrapolation::Weighted);
+        assert!(cache.slopes.is_none());
+        let beyond = cache.eval(&[1000.0, 400.0]);
+        assert_eq!(beyond.m.time_ms, cache.eval(&[100.0, 40.0]).m.time_ms);
+        assert!(beyond.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
 }

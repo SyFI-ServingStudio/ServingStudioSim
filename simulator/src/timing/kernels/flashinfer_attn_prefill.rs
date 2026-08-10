@@ -31,7 +31,7 @@
 //! `timing/sweep.rs`.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
+use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
@@ -103,7 +103,9 @@ impl KernelSpec for FlashinferAttnPrefillSpec {
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
-        CacheKind::Cache2DLinear
+        // The (A, B) re-axis above exists precisely so causal work is `A*B`, so
+        // the bilinear cross term is this kernel's physics and extends correctly.
+        CacheKind::Cache2DLinear(Extrapolation::Product)
     }
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
@@ -151,7 +153,7 @@ mod tests {
         FlashinferAttnPrefillSpec,
     };
     use crate::timing::bridge::DType;
-    use crate::timing::cache::CacheKind;
+    use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::SweepCoords;
     use serde_json::Value;
@@ -247,7 +249,7 @@ mod tests {
     fn cache_kind_is_two_dimensional_linear() {
         assert_eq!(
             FlashinferAttnPrefillSpec::cache_kind("fa2"),
-            CacheKind::Cache2DLinear
+            CacheKind::Cache2DLinear(Extrapolation::Product)
         );
     }
 

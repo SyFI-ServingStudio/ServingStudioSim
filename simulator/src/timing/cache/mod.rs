@@ -97,11 +97,57 @@ pub(crate) fn peak_over_cells(cells: impl IntoIterator<Item = Metrics4>) -> Peak
     peak
 }
 
+/// How a 2D cache continues past its last grid point.
+///
+/// Inside the grid every variant behaves identically — the stored corners are
+/// measurements and bilinear blending between them is what the table is for.
+/// This only governs the region where the table has nothing left to say, and it
+/// is declared per kernel because the right answer is a property of the kernel's
+/// physics *expressed in its own cache axes*, not of the interpolator.
+///
+/// The failure this exists to prevent: bilinear weights are
+/// `(1-t0)(1-t1), (1-t0)t1, t0(1-t1), t0·t1`, and extrapolation feeds them `t`
+/// outside `[0,1]`. Two axes far off-grid make the `t0·t1` corner weight the
+/// product of both overshoots, so any curvature in the boundary cell is
+/// amplified by that product. Measured on `moe_alltoall` at 16x past the grid on
+/// both axes: 78x over the true time, and non-monotonic (more rows, less time)
+/// in the band before that.
+/// A kernel declares only the *form*; every number in it is fitted from that
+/// cache's own samples, so no variant carries a payload and none of them needs
+/// the kernel's Config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Extrapolation {
+    /// The axes were chosen so that `axis0 · axis1` *is* the work, so the
+    /// bilinear cross term is the physics and extending it is correct. See
+    /// `flashinfer_attn_prefill`'s `A = k + q/2, B = q` re-axis, where causal
+    /// work is exactly `A·B`.
+    Product,
+    /// The axes are independent loads that add rather than multiply. The cache
+    /// fits one slope per axis over its own top band and extends with those.
+    ///
+    /// The slopes are fitted rather than declared on purpose. A declared ratio
+    /// would have to come from the kernel's Config (for `moe_alltoall`, fan-in
+    /// spread over `ep_size` senders makes a received row ~1/8 the cost of a
+    /// sent one), which is model-parallel knowledge that has no business
+    /// reaching L1 — and which the grid cannot check, since in-grid the two
+    /// slopes measure 1.02:1 while the far field is 8:1. Fitting keeps the
+    /// policy honest about what the samples actually support: measured against
+    /// off-grid ground truth 16x past the grid it lands 0.63x-1.04x, i.e. it
+    /// under-predicts rather than inventing a number.
+    Weighted,
+    /// No defensible asymptote in these axes. Hold the boundary value.
+    /// Deliberately wrong-but-bounded: a flat line is easier to spot in a
+    /// coverage report than a plausible curve, and it cannot explode.
+    Clamp,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheKind {
     Cache1DLinear,
     Cache1DDirect,
-    Cache2DLinear,
+    /// Bilinear over a rectangular grid. The payload is the off-grid policy —
+    /// there is no default, so every 2D kernel has to state its asymptote.
+    Cache2DLinear(Extrapolation),
     Cache2DLog,
     Cache2DCliff,
 }
@@ -145,8 +191,8 @@ pub fn build_cache(
             let (cache, warnings) = Cache1DDirect::from_samples(grid, samples);
             Ok((Box::new(cache), warnings))
         }
-        CacheKind::Cache2DLinear => {
-            let (cache, warnings) = Cache2DLinear::from_samples(grid, samples);
+        CacheKind::Cache2DLinear(extrapolation) => {
+            let (cache, warnings) = Cache2DLinear::from_samples_with(grid, samples, extrapolation);
             Ok((Box::new(cache), warnings))
         }
         CacheKind::Cache2DLog | CacheKind::Cache2DCliff => Err(BuildError::FitFailed {

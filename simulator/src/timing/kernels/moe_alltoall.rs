@@ -72,7 +72,7 @@
 
 use crate::common::Fabric;
 use crate::timing::bridge::{de_backends, ArgsPayload, KernelKind};
-use crate::timing::cache::CacheKind;
+use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
@@ -180,7 +180,14 @@ impl KernelSpec for MoeAlltoallSpec {
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
-        CacheKind::Cache2DLinear
+        // A rank is loaded from two sides at once and the loads ADD: rows it
+        // sends and rows it receives are separate traffic, not a product. The
+        // per-axis weights are fitted, not declared — in-grid the two slopes
+        // measure 1.02:1 while off-grid ground truth is ~8:1 (fan-in arrives
+        // from `ep_size` senders in parallel, egress leaves one GPU), and that
+        // ratio is not identifiable from the grid. Fitting under-predicts the
+        // far field; the bilinear cross term over-predicted it by 78x.
+        CacheKind::Cache2DLinear(Extrapolation::Weighted)
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
@@ -234,7 +241,7 @@ mod tests {
         MoeAlltoallDirection, MoeAlltoallKernelConfig, MoeAlltoallKernelInput, MoeAlltoallSpec,
     };
     use crate::common::Fabric;
-    use crate::timing::cache::CacheKind;
+    use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::{SlotInput, SweepCoords, SweepGrid};
     use serde_json::Value;
@@ -314,7 +321,7 @@ mod tests {
         assert_eq!(grid.axes()[0].last().copied(), Some(65_536.0));
         assert_eq!(
             MoeAlltoallSpec::cache_kind("flashinfer_mnnvl"),
-            CacheKind::Cache2DLinear
+            CacheKind::Cache2DLinear(Extrapolation::Weighted)
         );
     }
 
@@ -351,8 +358,9 @@ mod tests {
         // And the ladder still brackets the DP8 8k-prefill point tightly in both
         // axes: (43374, 54441) is what the arch asks for at 8192 tokens/rank.
         let brackets = |value: f64| {
-            axis.windows(2)
-                .any(|window| window[0] <= value && value <= window[1] && window[1] / window[0] < 1.3)
+            axis.windows(2).any(|window| {
+                window[0] <= value && value <= window[1] && window[1] / window[0] < 1.3
+            })
         };
         assert!(brackets(43_374.0) && brackets(54_441.0));
     }
@@ -411,7 +419,10 @@ mod tests {
         let mask = MoeAlltoallSpec::infeasible_mask(&wide, &grid);
         let axis = &grid.axes()[0];
         let top = axis.len() - 1;
-        assert!(mask[top * axis.len() + top], "the top corner must be stripped");
+        assert!(
+            mask[top * axis.len() + top],
+            "the top corner must be stripped"
+        );
         // ...while a shape the runner can hold survives.
         let small = axis.iter().position(|&v| v == 1_024.0).unwrap();
         assert!(!mask[small * axis.len() + small]);

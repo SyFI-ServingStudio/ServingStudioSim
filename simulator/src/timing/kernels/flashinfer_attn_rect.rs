@@ -13,7 +13,7 @@
 //! Both axes are independent token curves -> `Cache2DLinear` + `grid.expand_2d`.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
+use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
@@ -54,7 +54,9 @@ impl KernelSpec for FlashinferAttnRectSpec {
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
-        CacheKind::Cache2DLinear
+        // Non-causal work is `q_len * kv_len` — every query row reads every key.
+        // The axes are the two factors, so the cross term is the work itself.
+        CacheKind::Cache2DLinear(Extrapolation::Product)
     }
 
     fn enumerate(
@@ -85,7 +87,7 @@ mod tests {
         FlashinferAttnRectKernelConfig, FlashinferAttnRectKernelInput, FlashinferAttnRectSpec,
     };
     use crate::timing::bridge::DType;
-    use crate::timing::cache::CacheKind;
+    use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::SweepCoords;
     use serde_json::Value;
@@ -143,7 +145,7 @@ mod tests {
     fn cache_kind_is_two_dimensional_linear() {
         assert_eq!(
             FlashinferAttnRectSpec::cache_kind("fa2"),
-            CacheKind::Cache2DLinear
+            CacheKind::Cache2DLinear(Extrapolation::Product)
         );
     }
 

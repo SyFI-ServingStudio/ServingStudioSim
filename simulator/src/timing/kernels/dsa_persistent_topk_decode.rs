@@ -7,7 +7,7 @@
 //! physical query contract.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
+use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
@@ -64,7 +64,9 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
-        CacheKind::Cache2DLinear
+        // Top-k runs over `batch_size` rows of `context_len` logits each, so the
+        // work is the product of the axes.
+        CacheKind::Cache2DLinear(Extrapolation::Product)
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
@@ -114,7 +116,7 @@ mod tests {
         DsaPersistentTopkDecodeSpec,
     };
     use crate::timing::bridge::DType;
-    use crate::timing::cache::CacheKind;
+    use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::{Dim, SlotInput, SweepCoords};
     use serde_json::Value;
@@ -313,11 +315,11 @@ mod tests {
     fn both_backends_use_physical_bilinear_cache() {
         assert_eq!(
             DsaPersistentTopkDecodeSpec::cache_kind(TORCH_BACKEND),
-            CacheKind::Cache2DLinear
+            CacheKind::Cache2DLinear(Extrapolation::Product)
         );
         assert_eq!(
             DsaPersistentTopkDecodeSpec::cache_kind(VLLM_BACKEND),
-            CacheKind::Cache2DLinear
+            CacheKind::Cache2DLinear(Extrapolation::Product)
         );
     }
 
