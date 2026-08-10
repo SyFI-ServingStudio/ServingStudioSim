@@ -45,8 +45,16 @@ pub(super) fn read_workload(run: &DiscoveredRun, repo_root: &Path) -> Result<Val
         .and_then(Value::as_f64)
         .filter(|rate| rate.is_finite() && *rate > 0.0)
         .context("raw/params.json workload.request_rate must be finite and positive")?;
-    let closed_loop = params.pointer("/workload/max_concurrency").is_some();
-    let arrival_scale = if closed_loop { 1.0 } else { request_rate };
+    // Read the arrival axis, not the capacity one. A cap bounds how many units
+    // run at once; it says nothing about where release times come from, and a
+    // capped trace-timed run still rescales the recorded timeline by
+    // `request_rate`. Inferring one axis from the other reported the source
+    // trace's raw arrivals for every capped run.
+    let saturated = params
+        .pointer("/workload/arrival_mode")
+        .and_then(Value::as_str)
+        == Some("saturated");
+    let arrival_scale = if saturated { 1.0 } else { request_rate };
     let request_count = entries.len() as f64;
     let average_input_tokens = entries
         .iter()
@@ -69,7 +77,7 @@ pub(super) fn read_workload(run: &DiscoveredRun, repo_root: &Path) -> Result<Val
         "request_count": entries.len(),
         "average_input_tokens": average_input_tokens,
         "average_output_tokens": average_output_tokens,
-        "arrival_basis": if closed_loop { "source_trace" } else { "effective_open_loop" },
+        "arrival_basis": if saturated { "source_trace" } else { "effective_trace_timed" },
         "request_rate": request_rate,
         "token_lengths": token_lengths,
         "input_density": input_density,

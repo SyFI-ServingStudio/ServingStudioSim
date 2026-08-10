@@ -1526,7 +1526,7 @@ fn workload_resource_summarizes_configured_trace() {
     assert_eq!(workload["request_count"], 3);
     assert!((workload["average_input_tokens"].as_f64().unwrap() - 56.0 / 3.0).abs() < 1e-9);
     assert!((workload["average_output_tokens"].as_f64().unwrap() - 224.0 / 3.0).abs() < 1e-9);
-    assert_eq!(workload["arrival_basis"], "effective_open_loop");
+    assert_eq!(workload["arrival_basis"], "effective_trace_timed");
     let arrival_seconds = workload["arrival_seconds"]
         .as_array()
         .expect("arrival seconds");
@@ -1537,6 +1537,48 @@ fn workload_resource_summarizes_configured_trace() {
     assert_eq!(workload["arrivals"], json!([1, 1, 1]));
     assert_eq!(workload["peak_to_mean"], 1.0);
     assert_eq!(workload["token_lengths"].as_array().map(Vec::len), Some(72));
+}
+
+#[test]
+fn workload_arrival_basis_reads_the_arrival_axis_not_the_capacity_cap() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let run_path = temporary.path().join("simulation");
+    make_core_run(&run_path);
+    // A capped run is still trace-timed unless it says otherwise, so the
+    // recorded timeline must stay rescaled by request_rate.
+    let params = fs::read_to_string(run_path.join("raw/params.json")).expect("read params");
+    fs::write(
+        run_path.join("raw/params.json"),
+        params.replace(
+            r#""request_rate": 2.0"#,
+            r#""request_rate": 2.0, "max_concurrency": 2, "arrival_mode": "trace_timed""#,
+        ),
+    )
+    .expect("write params");
+    let repo = TempDir::new().expect("temporary repository");
+    fs::create_dir_all(repo.path().join("trace")).expect("create trace directory");
+    fs::write(
+        repo.path().join("trace/workload.csv"),
+        "id,input_len,output_len,arrival_time\n\
+         0,8,32,0\n\
+         1,16,64,2000\n\
+         2,32,128,4000\n",
+    )
+    .expect("write trace");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let workload = read_workload(&run, repo.path()).expect("read workload resource");
+
+    assert_eq!(workload["arrival_basis"], "effective_trace_timed");
+    let arrival_seconds = workload["arrival_seconds"]
+        .as_array()
+        .expect("arrival seconds");
+    assert!((arrival_seconds[1].as_f64().unwrap() - 1.0).abs() < 1e-9);
 }
 
 #[test]
@@ -2836,8 +2878,7 @@ fn the_descriptor_names_the_prediction_the_kernel_half_was_paired_against() {
     // produced these numbers. Anything that reads the layout instead would be
     // free to answer `p_unused`.
     assert_eq!(
-        descriptor["prediction"]["prediction_id"],
-        "p_paired",
+        descriptor["prediction"]["prediction_id"], "p_paired",
         "the descriptor must name the prediction the manifest recorded"
     );
     assert_eq!(
