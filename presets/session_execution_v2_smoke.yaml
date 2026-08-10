@@ -11,7 +11,7 @@ workload:
     - trace/session_execution_v2_smoke.csv
   trace_kind: text_generation
   trace_source_schema: session-execution-v2
-  replay_pacing: open_loop
+  arrival_mode: trace_timed
   session_dependency: chained
   run_to_end: true
   request_rate: 1.0

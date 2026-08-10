@@ -157,10 +157,10 @@ _FIXTURE = {
             {"name": "run_to_end", "type": "bool", "default": False, "description": ""},
             {"name": "request_rate", "type": "float", "default": 10.0, "description": ""},
             {
-                "name": "replay_pacing",
+                "name": "arrival_mode",
                 "type": "string",
                 "required": True,
-                "choices": ["open_loop", "closed_loop"],
+                "choices": ["trace_timed", "saturated"],
                 "description": "",
             },
             {
@@ -203,7 +203,7 @@ def _base(*, arch=None, worker=None, log_dir="logs/x", **extra):
         "deployment": "unified",
         "workload": {
             "trace_files": ["t.csv"],
-            "replay_pacing": "open_loop",
+            "arrival_mode": "trace_timed",
             "session_dependency": "independent",
         },
         "io": {"log_dir": log_dir},
@@ -295,12 +295,12 @@ def test_validate_unknown_root_key(schema):
 
 def test_validate_rejects_legacy_replay_mode(schema):
     preset = _base()
-    preset["workload"]["replay_mode"] = preset["workload"].pop("replay_pacing")
+    preset["workload"]["replay_mode"] = preset["workload"].pop("arrival_mode")
     errs = validate_params(preset, schema)
     assert any("workload.replay_mode" in error and "unknown" in error for error in errs)
 
 
-@pytest.mark.parametrize("axis", ["replay_pacing", "session_dependency"])
+@pytest.mark.parametrize("axis", ["arrival_mode", "session_dependency"])
 def test_validate_requires_both_replay_axes(schema, axis):
     preset = _base()
     del preset["workload"][axis]
@@ -1213,7 +1213,7 @@ def test_readme_worked_example(schema):
         "deployment": "pd",
         "workload": {
             "trace_files": ["trace/aime_long.csv"],
-            "replay_pacing": "open_loop",
+            "arrival_mode": "trace_timed",
             "session_dependency": "independent",
         },
         "io": {"log_dir": "logs/pd_{prefill_tp}_d{decode_tp}tp_r{decode_replicas}_{batch}"},
@@ -1591,7 +1591,7 @@ def test_logged_process_captures_stdout(tmp_path):
                     "duration_ms": 5000.0,
                     "run_to_end": False,
                     "request_rate": 10.0,
-                    "replay_pacing": "open_loop",
+                    "arrival_mode": "trace_timed",
                     "session_dependency": "independent",
                 },
                 "io": {

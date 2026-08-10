@@ -55,7 +55,7 @@ _UNIFIED_PRESET_TEMPLATE = """
 deployment: unified
 workload:
   request_rate: 150.0
-  replay_pacing: open_loop
+  arrival_mode: trace_timed
   session_dependency: independent
   run_to_end: true
 pools:
@@ -75,7 +75,7 @@ _PD_1P32D_PRESET_TEMPLATE = """
 deployment: pd
 workload:
   request_rate: 150.0
-  replay_pacing: open_loop
+  arrival_mode: trace_timed
   session_dependency: independent
   run_to_end: true
 pools:

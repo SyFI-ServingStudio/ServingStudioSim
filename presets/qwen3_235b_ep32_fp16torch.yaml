@@ -9,7 +9,7 @@ workload:
   trace_files:
     - trace/aime_long.csv
   trace_kind: text_generation
-  replay_pacing: open_loop
+  arrival_mode: trace_timed
   session_dependency: independent
   request_rate: 150.0
   run_to_end: false
