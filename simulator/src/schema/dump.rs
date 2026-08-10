@@ -139,13 +139,18 @@ mod tests {
         let workload = schema["common"]["workload"]
             .as_array()
             .expect("workload params are an array");
-        let replay_pacing = workload
+        let arrival_mode = workload
             .iter()
-            .find(|param| param["name"] == "replay_pacing")
-            .expect("replay_pacing is exposed");
-        assert_eq!(
-            replay_pacing["choices"],
-            json!(["open_loop", "closed_loop"])
+            .find(|param| param["name"] == "arrival_mode")
+            .expect("arrival_mode is exposed");
+        assert_eq!(arrival_mode["choices"], json!(["trace_timed", "saturated"]));
+        // Capacity is its own field, not a payload of the arrival mode: every
+        // combination of the two must be expressible.
+        assert!(
+            workload
+                .iter()
+                .any(|param| param["name"] == "max_concurrency"),
+            "max_concurrency is exposed independently of arrival_mode"
         );
         let session_dependency = workload
             .iter()

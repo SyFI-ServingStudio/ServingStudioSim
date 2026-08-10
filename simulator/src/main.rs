@@ -23,7 +23,7 @@ use simulator::deployment::{build_flow, RunConfig};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
 use simulator::sim::{
-    run_sim, LoadedTrace, ReplayPacing, SessionDependency, TickCfg, TraceDeclaration,
+    run_sim, ArrivalMode, CapacityLimit, LoadedTrace, SessionDependency, TickCfg, TraceDeclaration,
 };
 use simulator::timing::PerfApiBridge;
 
@@ -90,9 +90,11 @@ fn load_config(path: &Path) -> Result<RunConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading run config {}", path.display()))?;
     let cfg = if path.extension().and_then(|e| e.to_str()) == Some("json") {
-        serde_json::from_str(&text).with_context(|| format!("parsing JSON config {}", path.display()))?
+        serde_json::from_str(&text)
+            .with_context(|| format!("parsing JSON config {}", path.display()))?
     } else {
-        serde_yaml::from_str(&text).with_context(|| format!("parsing YAML config {}", path.display()))?
+        serde_yaml::from_str(&text)
+            .with_context(|| format!("parsing YAML config {}", path.display()))?
     };
     Ok(cfg)
 }
@@ -108,7 +110,13 @@ impl tracing_subscriber::fmt::time::FormatTime for CompactTime {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         let secs = now.as_secs();
-        write!(w, "[{:02}:{:02}.{:03}]", (secs / 60) % 60, secs % 60, now.subsec_millis())
+        write!(
+            w,
+            "[{:02}:{:02}.{:03}]",
+            (secs / 60) % 60,
+            secs % 60,
+            now.subsec_millis()
+        )
     }
 }
 
@@ -168,16 +176,14 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
         &workload.trace_tags,
         &workload.trace_source_schema,
     )?;
-    let pacing = ReplayPacing::parse(
-        &workload.replay_pacing,
-        workload.request_rate,
-        workload.max_concurrency.map(|n| n as usize),
-    )?;
+    let arrival = ArrivalMode::parse(&workload.arrival_mode, workload.request_rate)?;
+    let capacity = CapacityLimit::parse(workload.max_concurrency.map(|n| n as usize))?;
     let session_dependency = SessionDependency::parse(&workload.session_dependency)?;
     let loaded_trace = LoadedTrace::load(
         &workload.trace_files,
         &declaration,
-        pacing,
+        arrival,
+        capacity,
         session_dependency,
     )?;
     let mut frontend = loaded_trace.into_current_text_frontend()?;

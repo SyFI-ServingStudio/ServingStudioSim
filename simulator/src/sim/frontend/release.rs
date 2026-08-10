@@ -1,63 +1,95 @@
 //! WHEN a loaded arrival is allowed to enter the system.
 //!
-//! Release has two orthogonal axes over the same immutable arrival list:
-//! [`ReplayPacing`] decides when workload pressure permits another release, and
+//! Release has three orthogonal axes over the same immutable arrival list:
+//! [`ArrivalMode`] decides when a new top-level unit becomes *eligible*,
+//! [`CapacityLimit`] decides how many units may be *active* at once, and
 //! [`SessionDependency`] decides whether a row is independent or waits for the
-//! preceding round of its session. Keeping them separate permits all four
-//! combinations without growing a cross-product enum.
+//! preceding round of its session. Keeping them separate permits every
+//! combination without growing a cross-product enum.
+//!
+//! Arrival and capacity used to be one axis, which made two of the four
+//! combinations unrepresentable: a timeline replay could not be capped, and a
+//! capped run had to discard the timeline. TraceLab has always composed them —
+//! it waits for a session's arrival and *then* acquires a permit — so the weld
+//! was also the reason a measured run and a simulated run could not be said to
+//! release work the same way.
 
 use anyhow::{bail, Result};
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use super::ReleaseMetadata;
 use crate::common::{RequestId, Time};
 
-/// Workload-pressure discipline, independent of session causality.
+/// When a new top-level unit becomes eligible to enter.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ReplayPacing {
-    /// Replay the trace's own arrival timeline.
-    OpenLoop { request_rate: f64 },
-    /// Ignore the timeline; keep at most `max_concurrency` requests in flight.
-    ClosedLoop { max_concurrency: usize },
+pub enum ArrivalMode {
+    /// Replay the trace's own arrival timeline: a unit cannot enter before its
+    /// materialized arrival, rescaled by `request_rate`.
+    TraceTimed { request_rate: f64 },
+    /// Ignore the timeline: every unit is eligible from the start, so the only
+    /// thing pacing the run is capacity and completion.
+    Saturated,
 }
 
-impl ReplayPacing {
-    pub const CHOICES: &'static [&'static str] = &["open_loop", "closed_loop"];
+impl ArrivalMode {
+    pub const CHOICES: &'static [&'static str] = &["trace_timed", "saturated"];
 
-    /// Build from the declared name plus the payload fields the flat config
-    /// carries alongside it.
-    ///
-    /// A flat config cannot nest a payload under its variant, so `request_rate`
-    /// and optional `max_concurrency` sit beside the name. This boundary erases
-    /// the unrelated payload from the resulting enum and rejects a supplied
-    /// `max_concurrency` under `open_loop` instead of leaving it silently dead.
-    pub fn parse(name: &str, request_rate: f64, max_concurrency: Option<usize>) -> Result<Self> {
-        let unused_max_concurrency = |pacing: &str| -> anyhow::Error {
-            anyhow::anyhow!(
-                "workload.max_concurrency is set but replay_pacing is {pacing:?}, which \
-                 replays the trace's arrival timeline and would ignore it — either \
-                 drop max_concurrency or declare replay_pacing: closed_loop"
-            )
-        };
+    /// Build from the declared name plus the payload the flat config carries
+    /// beside it. `request_rate` is read by `trace_timed` and ignored by
+    /// `saturated`, which has no timeline to rescale.
+    pub fn parse(name: &str, request_rate: f64) -> Result<Self> {
         Ok(match name {
-            "open_loop" => match max_concurrency {
-                Some(_) => return Err(unused_max_concurrency(name)),
-                None => Self::OpenLoop { request_rate },
-            },
-            "closed_loop" => match max_concurrency {
-                Some(max_concurrency) => Self::ClosedLoop { max_concurrency },
-                None => bail!(
-                    "replay_pacing: closed_loop needs workload.max_concurrency — the \
-                     cap is the whole discipline"
-                ),
-            },
+            "trace_timed" => Self::TraceTimed { request_rate },
+            "saturated" => Self::Saturated,
+            "open_loop" | "closed_loop" => bail!(
+                "replay_pacing {name:?} has been replaced: arrival and capacity are now \
+                 separate axes. Use arrival_mode: trace_timed (was open_loop), or \
+                 arrival_mode: saturated with max_concurrency (was closed_loop). The \
+                 combination they could not express — replaying the timeline under a \
+                 concurrency cap — is now available."
+            ),
             other => bail!(
-                "unknown replay_pacing {other:?} (expected one of {:?})",
+                "unknown arrival_mode {other:?} (expected one of {:?})",
                 Self::CHOICES
             ),
         })
+    }
+}
+
+/// How many top-level units may be active at once.
+///
+/// A *unit* is a session when the trace declares sessions and rounds are
+/// chained, and a request otherwise. That distinction is the whole point: a
+/// session owns its slot from the moment its first round is released until its
+/// last round completes, including across every tool wait in between. A cap of
+/// two therefore means two conversations, not two requests — matching the
+/// permit TraceLab holds for the lifetime of a session task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct CapacityLimit {
+    max_active_units: Option<usize>,
+}
+
+impl CapacityLimit {
+    pub fn unlimited() -> Self {
+        Self {
+            max_active_units: None,
+        }
+    }
+
+    pub fn parse(max_active_units: Option<usize>) -> Result<Self> {
+        if max_active_units == Some(0) {
+            bail!("workload.max_concurrency must be greater than 0");
+        }
+        Ok(Self { max_active_units })
+    }
+
+    fn admits(self, active_units: u64) -> bool {
+        match self.max_active_units {
+            None => true,
+            Some(limit) => active_units < limit as u64,
+        }
     }
 }
 
@@ -85,8 +117,99 @@ impl SessionDependency {
 
 #[derive(Debug)]
 pub(super) struct ReplayScheduler {
-    pacing: ReplayPacing,
+    arrival: ArrivalMode,
+    capacity: CapacityLimit,
     dependency: SessionDependencyState,
+    active: ActiveUnits,
+    /// Whether the previous call turned away a unit that had already arrived,
+    /// purely for lack of a slot.
+    ///
+    /// It decides which instant a head is stamped with. Normally that is the
+    /// unit's own trace arrival, deliberately, so the tick granularity of the
+    /// drain loop never leaks into arrival times. But a unit the cap held back
+    /// did not arrive when the trace says: the measured runner acquires its
+    /// permit *after* waiting for the arrival and only then sends, so its clock
+    /// starts at the permit. Stamping the trace time instead would charge the
+    /// simulated request for a wait the measured one never reports.
+    capacity_deferred: bool,
+}
+
+/// Which top-level units currently hold a capacity slot.
+///
+/// Under [`SessionDependency::Independent`] a unit is a request, and the count
+/// the frontend already maintains — emitted minus completed — is exactly right.
+///
+/// Under [`SessionDependency::Chained`] it is not. A session between rounds has
+/// no request in flight but is still very much active: it is sitting in a tool
+/// wait, and its next round is already scheduled. Counting requests would hand
+/// its slot to a different conversation and then let both run, so a cap of two
+/// would admit three sessions. This ledger counts the conversation instead.
+#[derive(Debug)]
+enum ActiveUnits {
+    /// Delegated to the caller's in-flight count.
+    Requests,
+    Sessions {
+        /// Sessions whose head has been released and whose final round has not
+        /// completed. Held across tool waits.
+        open_sessions: HashSet<u32>,
+        /// Rows declaring no session at all; each is its own unit while in
+        /// flight, exactly as an independent request would be.
+        standalone_in_flight: u64,
+    },
+}
+
+impl ActiveUnits {
+    fn count(&self, in_flight: u64) -> u64 {
+        match self {
+            Self::Requests => in_flight,
+            Self::Sessions {
+                open_sessions,
+                standalone_in_flight,
+            } => open_sessions.len() as u64 + standalone_in_flight,
+        }
+    }
+
+    /// Record that `release` just entered the system.
+    ///
+    /// A later round is deliberately not counted again: its session was already
+    /// admitted when its head was released and has held the slot ever since.
+    fn on_release(&mut self, release: &ReleaseMetadata, has_predecessor: bool) {
+        let Self::Sessions {
+            open_sessions,
+            standalone_in_flight,
+        } = self
+        else {
+            return;
+        };
+        match release.session {
+            Some(session) => {
+                if !has_predecessor {
+                    open_sessions.insert(session.session_id);
+                }
+            }
+            None => *standalone_in_flight += 1,
+        }
+    }
+
+    /// Record that `release` completed. A session frees its slot only when its
+    /// *last* round finishes.
+    fn on_completion(&mut self, release: &ReleaseMetadata, has_successor: bool) {
+        let Self::Sessions {
+            open_sessions,
+            standalone_in_flight,
+        } = self
+        else {
+            return;
+        };
+        match release.session {
+            Some(session) => {
+                if !has_successor {
+                    open_sessions.remove(&session.session_id);
+                }
+            }
+            None => *standalone_in_flight = standalone_in_flight.saturating_sub(1),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -122,23 +245,39 @@ enum SessionDependencyState {
 
 impl ReplayScheduler {
     pub(super) fn new(
-        pacing: ReplayPacing,
+        arrival: ArrivalMode,
+        capacity: CapacityLimit,
         dependency: SessionDependency,
         releases: &[ReleaseMetadata],
     ) -> Self {
-        let dependency = match dependency {
-            SessionDependency::Independent => SessionDependencyState::Independent { cursor: 0 },
+        let (dependency, active) = match dependency {
+            SessionDependency::Independent => (
+                SessionDependencyState::Independent { cursor: 0 },
+                ActiveUnits::Requests,
+            ),
             SessionDependency::Chained => {
                 let (successor, has_predecessor) = build_chains(releases);
-                SessionDependencyState::Chained {
-                    successor,
-                    has_predecessor,
-                    cursor: 0,
-                    ready: BinaryHeap::new(),
-                }
+                (
+                    SessionDependencyState::Chained {
+                        successor,
+                        has_predecessor,
+                        cursor: 0,
+                        ready: BinaryHeap::new(),
+                    },
+                    ActiveUnits::Sessions {
+                        open_sessions: HashSet::new(),
+                        standalone_in_flight: 0,
+                    },
+                )
             }
         };
-        Self { pacing, dependency }
+        Self {
+            arrival,
+            capacity,
+            dependency,
+            active,
+            capacity_deferred: false,
+        }
     }
 
     /// The next arrival that may enter right now: its index into `arrivals` plus
@@ -155,15 +294,17 @@ impl ReplayScheduler {
         in_flight: u64,
         now: Time,
     ) -> Option<(usize, Time)> {
-        if !self.pacing.has_capacity(in_flight) {
-            return None;
-        }
+        let admits_new_unit = self.capacity.admits(self.active.count(in_flight));
 
-        match &mut self.dependency {
+        let (index, mut release_time) = match &mut self.dependency {
             SessionDependencyState::Independent { cursor } => {
                 let release = releases.get(*cursor)?;
-                let release_time = self.pacing.release_time(release, now)?;
-                Some((take(cursor), release_time))
+                let release_time = self.arrival.release_time(release, now)?;
+                if !admits_new_unit {
+                    self.capacity_deferred = true;
+                    return None;
+                }
+                (take(cursor), release_time)
             }
             SessionDependencyState::Chained {
                 has_predecessor,
@@ -175,26 +316,62 @@ impl ReplayScheduler {
                 // elapsed is already mid-session, so it outranks starting a new
                 // one. Stamped with `now`, not its trace time — the release
                 // instant is its real arrival.
+                //
+                // Capacity is not consulted here, and that is the contract, not
+                // an oversight: its session was admitted when its head was
+                // released and has held the slot through the tool wait. Gating
+                // it again would deadlock a full run, since the only thing that
+                // frees a slot is the completion of a session this very branch
+                // has to release.
                 if let Some(&Reverse((due, index))) = ready.peek() {
                     if due <= now {
                         ready.pop();
-                        return Some((index as usize, now));
+                        return self.admit(releases, index as usize, now);
                     }
                 }
-                // Otherwise the next session head due by its own trace arrival.
-                // Rows already spoken for by a chain are stepped over; they enter
+                // Otherwise the next session head due by its own arrival. Rows
+                // already spoken for by a chain are stepped over; they enter
                 // through `ready` and must not be released twice.
+                let mut head = None;
                 while let Some(release) = releases.get(*cursor) {
                     if has_predecessor[*cursor] {
                         *cursor += 1;
                         continue;
                     }
-                    let release_time = self.pacing.release_time(release, now)?;
-                    return Some((take(cursor), release_time));
+                    // Arrival is checked before capacity so that a unit that has
+                    // not arrived yet is never recorded as capacity-deferred.
+                    let release_time = self.arrival.release_time(release, now)?;
+                    if !admits_new_unit {
+                        self.capacity_deferred = true;
+                        return None;
+                    }
+                    head = Some((take(cursor), release_time));
+                    break;
                 }
-                None
+                head?
             }
+        };
+        if std::mem::take(&mut self.capacity_deferred) {
+            release_time = release_time.max(now);
         }
+        self.admit(releases, index, release_time)
+    }
+
+    /// Book a release into the ledger and hand it back to the drain loop.
+    fn admit(
+        &mut self,
+        releases: &[ReleaseMetadata],
+        index: usize,
+        release_time: Time,
+    ) -> Option<(usize, Time)> {
+        let has_predecessor = match &self.dependency {
+            SessionDependencyState::Chained {
+                has_predecessor, ..
+            } => has_predecessor[index],
+            SessionDependencyState::Independent { .. } => false,
+        };
+        self.active.on_release(&releases[index], has_predecessor);
+        Some((index, release_time))
     }
 
     /// A request finished at `now`. Only chaining reacts: it unlocks that round's
@@ -212,7 +389,10 @@ impl ReplayScheduler {
             return;
         };
         let finished = request.0 as usize;
-        let Some(next) = successor.get(finished).copied().flatten() else {
+        let next = successor.get(finished).copied().flatten();
+        self.active
+            .on_completion(&releases[finished], next.is_some());
+        let Some(next) = next else {
             return;
         };
         let tool_wait_after = releases[finished]
@@ -222,21 +402,14 @@ impl ReplayScheduler {
     }
 }
 
-impl ReplayPacing {
-    fn has_capacity(self, in_flight: u64) -> bool {
-        match self {
-            Self::OpenLoop { .. } => true,
-            Self::ClosedLoop { max_concurrency } => in_flight < max_concurrency as u64,
-        }
-    }
-
+impl ArrivalMode {
     fn release_time(self, release: &ReleaseMetadata, now: Time) -> Option<Time> {
         match self {
-            Self::OpenLoop { request_rate } => {
+            Self::TraceTimed { request_rate } => {
                 let due = effective_arrival(release.trace_arrival_time_ms, request_rate);
                 (due <= now).then_some(due)
             }
-            Self::ClosedLoop { .. } => Some(now),
+            Self::Saturated => Some(now),
         }
     }
 }

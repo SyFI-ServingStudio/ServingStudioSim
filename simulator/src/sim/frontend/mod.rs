@@ -26,7 +26,7 @@ use schema::TraceDefinition;
 pub use arrival::{
     ReleaseMetadata, ScheduledRequest, SchedulingDeclaration, SessionReleaseMetadata,
 };
-pub use release::{ReplayPacing, SessionDependency};
+pub use release::{ArrivalMode, CapacityLimit, SessionDependency};
 pub use schema::{SourceIdentities, SourceSchema, TraceDeclaration, TraceKind, TraceTag};
 
 /// Typed immutable requests plus a definition-blind replay scheduler.
@@ -129,10 +129,11 @@ impl TraceFrontend<TextGenerationDefinition> {
     pub fn load(
         files: &[PathBuf],
         declaration: &TraceDeclaration,
-        pacing: ReplayPacing,
+        arrival: ArrivalMode,
+        capacity: CapacityLimit,
         session_dependency: SessionDependency,
     ) -> Result<Self> {
-        load_typed(files, declaration, pacing, session_dependency)
+        load_typed(files, declaration, arrival, capacity, session_dependency)
     }
 }
 
@@ -197,37 +198,74 @@ impl LoadedTrace {
     pub fn load(
         files: &[PathBuf],
         declaration: &TraceDeclaration,
-        pacing: ReplayPacing,
+        arrival: ArrivalMode,
+        capacity: CapacityLimit,
         session_dependency: SessionDependency,
     ) -> Result<Self> {
         Ok(match declaration.kind {
-            TraceKind::TextGeneration => {
-                Self::TextGeneration(load_typed(files, declaration, pacing, session_dependency)?)
-            }
-            TraceKind::ImageToText => {
-                Self::ImageToText(load_typed(files, declaration, pacing, session_dependency)?)
-            }
-            TraceKind::VideoToText => {
-                Self::VideoToText(load_typed(files, declaration, pacing, session_dependency)?)
-            }
-            TraceKind::AudioToText => {
-                Self::AudioToText(load_typed(files, declaration, pacing, session_dependency)?)
-            }
-            TraceKind::TextToImage => {
-                Self::TextToImage(load_typed(files, declaration, pacing, session_dependency)?)
-            }
-            TraceKind::TextToVideo => {
-                Self::TextToVideo(load_typed(files, declaration, pacing, session_dependency)?)
-            }
-            TraceKind::TextToSpeech => {
-                Self::TextToSpeech(load_typed(files, declaration, pacing, session_dependency)?)
-            }
-            TraceKind::ImageToVideo => {
-                Self::ImageToVideo(load_typed(files, declaration, pacing, session_dependency)?)
-            }
-            TraceKind::OmniGeneration => {
-                Self::OmniGeneration(load_typed(files, declaration, pacing, session_dependency)?)
-            }
+            TraceKind::TextGeneration => Self::TextGeneration(load_typed(
+                files,
+                declaration,
+                arrival,
+                capacity,
+                session_dependency,
+            )?),
+            TraceKind::ImageToText => Self::ImageToText(load_typed(
+                files,
+                declaration,
+                arrival,
+                capacity,
+                session_dependency,
+            )?),
+            TraceKind::VideoToText => Self::VideoToText(load_typed(
+                files,
+                declaration,
+                arrival,
+                capacity,
+                session_dependency,
+            )?),
+            TraceKind::AudioToText => Self::AudioToText(load_typed(
+                files,
+                declaration,
+                arrival,
+                capacity,
+                session_dependency,
+            )?),
+            TraceKind::TextToImage => Self::TextToImage(load_typed(
+                files,
+                declaration,
+                arrival,
+                capacity,
+                session_dependency,
+            )?),
+            TraceKind::TextToVideo => Self::TextToVideo(load_typed(
+                files,
+                declaration,
+                arrival,
+                capacity,
+                session_dependency,
+            )?),
+            TraceKind::TextToSpeech => Self::TextToSpeech(load_typed(
+                files,
+                declaration,
+                arrival,
+                capacity,
+                session_dependency,
+            )?),
+            TraceKind::ImageToVideo => Self::ImageToVideo(load_typed(
+                files,
+                declaration,
+                arrival,
+                capacity,
+                session_dependency,
+            )?),
+            TraceKind::OmniGeneration => Self::OmniGeneration(load_typed(
+                files,
+                declaration,
+                arrival,
+                capacity,
+                session_dependency,
+            )?),
         })
     }
 
@@ -259,13 +297,14 @@ fn unsupported_family<Definition>(kind: &str) -> Result<Definition> {
 fn load_typed<Definition: TraceDefinition>(
     files: &[PathBuf],
     declaration: &TraceDeclaration,
-    pacing: ReplayPacing,
+    arrival: ArrivalMode,
+    capacity: CapacityLimit,
     session_dependency: SessionDependency,
 ) -> Result<TraceFrontend<Definition>> {
     if files.is_empty() {
         bail!("no trace files given (--trace-files)");
     }
-    validate_replay(pacing, session_dependency, declaration)?;
+    validate_replay(arrival, session_dependency, declaration)?;
     let mut scheduled_requests = Vec::new();
     let mut session_start_times = std::collections::HashMap::new();
     let mut source_identities = schema::SourceIdentities::default();
@@ -286,7 +325,7 @@ fn load_typed<Definition: TraceDefinition>(
         .iter()
         .map(|request| request.release)
         .collect::<Vec<_>>();
-    let replay_scheduler = ReplayScheduler::new(pacing, session_dependency, &releases);
+    let replay_scheduler = ReplayScheduler::new(arrival, capacity, session_dependency, &releases);
     Ok(TraceFrontend {
         scheduled_requests,
         releases,
@@ -297,24 +336,19 @@ fn load_typed<Definition: TraceDefinition>(
     })
 }
 
-/// Reject a pacing request that cannot run, before any file is read.
+/// Reject a release configuration that cannot run, before any file is read.
 ///
 /// Takes the declaration too, because one axis's precondition is about the data
 /// rather than its own payload: chaining rounds is meaningless on a trace that
 /// declares no sessions. Checking it here rather than at the config call site
 /// means every caller is covered, tests included.
 fn validate_replay(
-    pacing: ReplayPacing,
+    arrival: ArrivalMode,
     session_dependency: SessionDependency,
     declaration: &TraceDeclaration,
 ) -> Result<()> {
-    match pacing {
-        ReplayPacing::OpenLoop { request_rate } => require_rate(request_rate)?,
-        ReplayPacing::ClosedLoop { max_concurrency } => {
-            if max_concurrency == 0 {
-                bail!("max_concurrency must be greater than 0 (got 0)");
-            }
-        }
+    if let ArrivalMode::TraceTimed { request_rate } = arrival {
+        require_rate(request_rate)?;
     }
     if session_dependency == SessionDependency::Chained
         && !declaration.tags.contains(&TraceTag::Session)
@@ -327,7 +361,7 @@ fn validate_replay(
     Ok(())
 }
 
-/// Shared by the two modes that replay the trace's own timeline.
+/// Guards the only payload `trace_timed` carries.
 fn require_rate(request_rate: f64) -> Result<()> {
     if !(request_rate.is_finite() && request_rate > 0.0) {
         bail!("request_rate must be finite and > 0 (got {request_rate})");
@@ -432,6 +466,7 @@ mod tests {
             &[path],
             &declare_execution_v2(),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Chained,
         )
         .unwrap();
@@ -460,6 +495,7 @@ mod tests {
             &[path],
             &declare_execution_v2(),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Chained,
         )
         .unwrap();
@@ -496,6 +532,7 @@ mod tests {
             &[path],
             &declare_execution_v2(),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Chained,
         )
         .unwrap_err()
@@ -508,8 +545,11 @@ mod tests {
     fn native_traces_still_reject_a_round_index_column() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("native.csv");
-        std::fs::write(&path, "id,input_len,output_len,arrival_time,round_idx\n0,4,4,0.0,0\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "id,input_len,output_len,arrival_time,round_idx\n0,4,4,0.0,0\n",
+        )
+        .unwrap();
 
         let error = load_text(&[path], 1.0).unwrap_err().to_string();
 
@@ -521,8 +561,17 @@ mod tests {
         TraceDeclaration::parse(kind, &tags).unwrap()
     }
 
-    fn open_loop(rate: f64) -> ReplayPacing {
-        ReplayPacing::OpenLoop { request_rate: rate }
+    fn open_loop(rate: f64) -> ArrivalMode {
+        ArrivalMode::TraceTimed { request_rate: rate }
+    }
+
+    /// No cap — the shape most tests want, where only arrival paces the run.
+    fn uncapped() -> CapacityLimit {
+        CapacityLimit::unlimited()
+    }
+
+    fn capped(max_active_units: usize) -> CapacityLimit {
+        CapacityLimit::parse(Some(max_active_units)).unwrap()
     }
 
     /// Load a plain text trace open-loop — the shape most tests want.
@@ -531,6 +580,7 @@ mod tests {
             paths,
             &TraceDeclaration::text(),
             open_loop(rate),
+            uncapped(),
             SessionDependency::Independent,
         )
     }
@@ -670,7 +720,8 @@ mod tests {
         let mut fe = TraceFrontend::load(
             &[path],
             &TraceDeclaration::text(),
-            ReplayPacing::ClosedLoop { max_concurrency: 2 },
+            ArrivalMode::Saturated,
+            capped(2),
             SessionDependency::Independent,
         )
         .unwrap();
@@ -702,20 +753,8 @@ mod tests {
 
     #[test]
     fn rejects_zero_max_concurrency() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_csv(
-            dir.path(),
-            "z.csv",
-            "id,input_len,output_len,arrival_time\n0,8,2,0.0\n",
-        );
-        let err = TraceFrontend::load(
-            &[path],
-            &TraceDeclaration::text(),
-            ReplayPacing::ClosedLoop { max_concurrency: 0 },
-            SessionDependency::Independent,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("max_concurrency"));
+        let err = CapacityLimit::parse(Some(0)).unwrap_err();
+        assert!(err.to_string().contains("max_concurrency"), "{err}");
     }
 
     // ---- session chaining ---------------------------------------------------
@@ -742,7 +781,8 @@ mod tests {
         let mut fe = TraceFrontend::load(
             &[path],
             &declare("text_generation", &["session"]),
-            ReplayPacing::OpenLoop { request_rate: 1.0 },
+            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            uncapped(),
             SessionDependency::Chained,
         )
         .unwrap();
@@ -777,7 +817,8 @@ mod tests {
         let mut fe = TraceFrontend::load(
             &[path],
             &declare("text_generation", &["session"]),
-            ReplayPacing::OpenLoop { request_rate: 1.0 },
+            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            uncapped(),
             SessionDependency::Chained,
         )
         .unwrap();
@@ -801,7 +842,7 @@ mod tests {
     /// successor does not prevent an independent session head from using a
     /// free closed-loop slot.
     #[test]
-    fn closed_loop_chaining_caps_in_flight_without_blocking_other_heads() {
+    fn a_session_holds_its_slot_across_tool_waits() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_csv(
             dir.path(),
@@ -818,31 +859,137 @@ mod tests {
         let mut frontend = TraceFrontend::load(
             &[path],
             &declare("text_generation", &["session"]),
-            ReplayPacing::ClosedLoop { max_concurrency: 2 },
+            ArrivalMode::Saturated,
+            capped(2),
             SessionDependency::Chained,
         )
         .unwrap();
 
-        // Closed-loop ignores every trace timestamp and fills exactly two slots.
+        // Saturated arrival ignores every trace timestamp and fills both slots.
         assert_eq!(
             drain_pairs(&mut frontend, 0.0),
             vec![(RequestId(0), 0.0), (RequestId(1), 0.0)]
         );
-        assert_eq!(frontend.in_flight(), 2);
 
-        // Session 7's successor is unlocked but waits until t=15. The standalone
-        // row is an eligible head and uses the slot at t=10 instead.
+        // Session 7's round completes at t=10 and it enters a 5 ms tool wait.
+        // It has no request in flight, but the conversation is not over, so it
+        // keeps its slot: the standalone row must NOT slip in. This is the whole
+        // point of counting sessions rather than requests — the measured runner
+        // holds its permit for the lifetime of the session task.
         frontend.record_completion(RequestId(0), Time::from_ms(10.0));
-        assert_eq!(drain_pairs(&mut frontend, 10.0), vec![(RequestId(3), 10.0)]);
-        assert_eq!(frontend.in_flight(), 2);
+        assert_eq!(drain_pairs(&mut frontend, 10.0), vec![]);
+        assert_eq!(frontend.in_flight(), 1);
 
-        frontend.record_completion(RequestId(3), Time::from_ms(15.0));
+        // At t=15 the wait elapses and the same session continues, still on the
+        // slot it never gave up.
         assert_eq!(drain_pairs(&mut frontend, 15.0), vec![(RequestId(2), 15.0)]);
-        assert_eq!(frontend.in_flight(), 2);
 
-        frontend.record_completion(RequestId(1), Time::from_ms(20.0));
-        assert_eq!(drain_pairs(&mut frontend, 20.0), vec![(RequestId(4), 20.0)]);
+        // Only when a whole session ends does a new unit start.
+        frontend.record_completion(RequestId(2), Time::from_ms(20.0));
+        assert_eq!(drain_pairs(&mut frontend, 20.0), vec![(RequestId(3), 20.0)]);
+
+        frontend.record_completion(RequestId(1), Time::from_ms(25.0));
+        assert_eq!(drain_pairs(&mut frontend, 25.0), vec![(RequestId(4), 25.0)]);
         assert!(frontend.exhausted());
+    }
+
+    /// The exit evidence named in the alignment plan: with a cap of two,
+    /// sessions A and B hold both slots across their tool waits, and session C
+    /// cannot start until one of them terminates entirely.
+    #[test]
+    fn a_third_session_waits_for_a_whole_session_to_terminate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_csv(
+            dir.path(),
+            "three-sessions.csv",
+            &format!(
+                "{SESSION_HEADER}\
+                 0,8,2,0.0,1,0,50.0\n\
+                 1,8,2,0.0,2,0,50.0\n\
+                 2,8,2,0.0,3,0,0.0\n\
+                 3,8,2,0.0,1,64,0.0\n\
+                 4,8,2,0.0,2,64,0.0\n"
+            ),
+        );
+        let mut frontend = TraceFrontend::load(
+            &[path],
+            &declare("text_generation", &["session"]),
+            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            capped(2),
+            SessionDependency::Chained,
+        )
+        .unwrap();
+
+        // Sessions 1 and 2 take the two slots. Session 3's head is eligible by
+        // arrival — every row arrives at 0 — but there is no capacity for it.
+        assert_eq!(
+            drain_pairs(&mut frontend, 0.0),
+            vec![(RequestId(0), 0.0), (RequestId(1), 0.0)]
+        );
+
+        // Both finish their first round and sit in a 50 ms tool wait. Nothing is
+        // in flight at all, yet session 3 still cannot start.
+        frontend.record_completion(RequestId(0), Time::from_ms(10.0));
+        frontend.record_completion(RequestId(1), Time::from_ms(10.0));
+        assert_eq!(frontend.in_flight(), 0);
+        assert_eq!(drain_pairs(&mut frontend, 10.0), vec![]);
+
+        // Their second rounds resume on the slots they held throughout.
+        assert_eq!(
+            drain_pairs(&mut frontend, 60.0),
+            vec![(RequestId(3), 60.0), (RequestId(4), 60.0)]
+        );
+        assert_eq!(drain_pairs(&mut frontend, 60.0), vec![]);
+
+        // Session 1 ends. Its slot — not merely its in-flight request — frees,
+        // and session 3 finally starts.
+        frontend.record_completion(RequestId(3), Time::from_ms(70.0));
+        assert_eq!(drain_pairs(&mut frontend, 70.0), vec![(RequestId(2), 70.0)]);
+        assert!(frontend.exhausted());
+    }
+
+    /// The combination the old single axis could not express: replay the trace's
+    /// timeline *and* cap how many conversations run at once.
+    #[test]
+    fn trace_timed_arrival_composes_with_a_capacity_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_csv(
+            dir.path(),
+            "timed-capped.csv",
+            &format!(
+                "{SESSION_HEADER}\
+                 0,8,2,0.0,1,0,0.0\n\
+                 1,8,2,100.0,2,0,0.0\n\
+                 2,8,2,200.0,3,0,0.0\n"
+            ),
+        );
+        let mut frontend = TraceFrontend::load(
+            &[path],
+            &declare("text_generation", &["session"]),
+            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            capped(1),
+            SessionDependency::Chained,
+        )
+        .unwrap();
+
+        // Arrival still gates: session 2 has not arrived at t=0.
+        assert_eq!(drain_pairs(&mut frontend, 0.0), vec![(RequestId(0), 0.0)]);
+        // Capacity also gates: session 2 has arrived by t=100 but session 1 is
+        // still running. It is stamped with the instant the slot opened, not its
+        // trace arrival — the measured runner starts its clock at the permit.
+        assert_eq!(drain_pairs(&mut frontend, 100.0), vec![]);
+        frontend.record_completion(RequestId(0), Time::from_ms(150.0));
+        assert_eq!(
+            drain_pairs(&mut frontend, 150.0),
+            vec![(RequestId(1), 150.0)]
+        );
+        // A head the cap never touched keeps its own arrival, so tick
+        // granularity stays out of arrival times.
+        frontend.record_completion(RequestId(1), Time::from_ms(160.0));
+        assert_eq!(
+            drain_pairs(&mut frontend, 250.0),
+            vec![(RequestId(2), 200.0)]
+        );
     }
 
     /// A trace that declares sessions but whose rows all opt out is *data* with
@@ -873,7 +1020,8 @@ mod tests {
         let mut chained = TraceFrontend::load(
             &[chained],
             &declare("text_generation", &["session"]),
-            ReplayPacing::OpenLoop { request_rate: 1.0 },
+            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            uncapped(),
             SessionDependency::Chained,
         )
         .unwrap();
@@ -897,7 +1045,8 @@ mod tests {
         let err = TraceFrontend::load(
             &[path],
             &TraceDeclaration::text(),
-            ReplayPacing::OpenLoop { request_rate: 1.0 },
+            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            uncapped(),
             SessionDependency::Chained,
         )
         .unwrap_err();
@@ -906,28 +1055,35 @@ mod tests {
 
     // ---- declared replay axes ----------------------------------------------
 
-    /// The flat config puts `max_concurrency` beside the pacing name, so a
-    /// payload the declared pacing would ignore is rejected rather than left
-    /// dead.
+    /// The retired names must not silently mean something new: `open_loop`
+    /// forbade a cap and `closed_loop` discarded the timeline, so mapping them
+    /// onto the new axes by guesswork would change a run's meaning without
+    /// changing its config.
     #[test]
-    fn replay_pacing_rejects_a_payload_it_ignores() {
-        let err = ReplayPacing::parse("open_loop", 1.0, Some(4)).unwrap_err();
-        assert!(err.to_string().contains("max_concurrency"));
-        let err = ReplayPacing::parse("closed_loop", 1.0, None).unwrap_err();
-        assert!(err.to_string().contains("needs workload.max_concurrency"));
+    fn retired_pacing_names_are_rejected_with_their_replacement() {
+        for retired in ["open_loop", "closed_loop"] {
+            let err = ArrivalMode::parse(retired, 1.0).unwrap_err().to_string();
+            assert!(err.contains("arrival_mode"), "{err}");
+            assert!(err.contains("separate axes"), "{err}");
+        }
     }
 
     #[test]
     fn every_advertised_replay_axis_value_parses() {
-        for name in ReplayPacing::CHOICES {
-            let max_concurrency = (*name == "closed_loop").then_some(4);
-            ReplayPacing::parse(name, 1.0, max_concurrency).unwrap();
+        for name in ArrivalMode::CHOICES {
+            ArrivalMode::parse(name, 1.0).unwrap();
         }
         for name in SessionDependency::CHOICES {
             SessionDependency::parse(name).unwrap();
         }
-        assert!(ReplayPacing::parse("teleport", 1.0, None).is_err());
-        assert!(ReplayPacing::parse("session_chain", 1.0, None).is_err());
+        // A cap is optional under either arrival mode, and composes with both.
+        assert_eq!(
+            CapacityLimit::parse(None).unwrap(),
+            CapacityLimit::unlimited()
+        );
+        assert!(CapacityLimit::parse(Some(4)).is_ok());
+        assert!(ArrivalMode::parse("teleport", 1.0).is_err());
+        assert!(ArrivalMode::parse("session_chain", 1.0).is_err());
         assert!(SessionDependency::parse("causal-ish").is_err());
         assert!(SessionDependency::parse("session_chain").is_err());
     }
@@ -978,6 +1134,7 @@ mod tests {
             &[path],
             &declare("text_generation", &["session", "slo", "speculative"]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap();
@@ -1033,6 +1190,7 @@ mod tests {
             &[image_path],
             &declare("image_to_text", &[]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap();
@@ -1061,6 +1219,7 @@ mod tests {
             &[path],
             &declare("text_generation", &["session", "slo"]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap();
@@ -1094,6 +1253,7 @@ mod tests {
             &[path],
             &declare("image_to_text", &[]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap() else {
@@ -1132,6 +1292,7 @@ mod tests {
             &[path],
             &declare("audio_to_text", &[]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap() else {
@@ -1166,6 +1327,7 @@ mod tests {
             &[path],
             &declare("text_to_video", &[]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap() else {
@@ -1205,6 +1367,7 @@ mod tests {
             &[path],
             &declare("image_to_video", &[]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap() else {
@@ -1285,6 +1448,7 @@ mod tests {
             &[path],
             &declare("omni_generation", &[]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap() else {
@@ -1308,6 +1472,7 @@ mod tests {
             &[path],
             &declare("omni_generation", &[]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap_err();
@@ -1366,6 +1531,7 @@ mod tests {
             &[path],
             &declare("text_generation", &["slo"]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap_err();
@@ -1390,6 +1556,7 @@ mod tests {
             &[path],
             &declare("text_to_image", &[]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap_err();
@@ -1427,6 +1594,7 @@ mod tests {
             &[path],
             &declare("text_to_video", &[]),
             open_loop(1.0),
+            uncapped(),
             SessionDependency::Independent,
         )
         .unwrap_err();

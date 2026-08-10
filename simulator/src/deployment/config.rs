@@ -93,18 +93,20 @@ pub struct WorkloadSpec {
     /// `closed_loop`.
     #[param(default = 10.0)]
     pub request_rate: f64,
-    /// Closed-loop concurrency cap. When set, the frontend IGNORES CSV
-    /// arrival_time / request_rate and instead keeps at most this many requests
-    /// in flight, admitting a new one the instant a slot frees — mirroring the
+    /// Cap on active top-level units. A unit is a *session* when rounds are
+    /// chained and a request otherwise, so a session holds its slot across
+    /// every round and tool wait until its last round completes — mirroring the
     /// alignment load-generator's --max-concurrency (a tokio Semaphore of N
-    /// permits acquired *after* arrival, held until completion). Required by
-    /// `closed_loop`; must be absent for `open_loop`.
+    /// permits acquired *after* arrival, held until completion). Composes with
+    /// either arrival mode; omit for no cap.
     #[serde(default)]
     pub max_concurrency: Option<u32>,
-    /// How workload pressure releases eligible requests. Session causality is
-    /// selected independently by `session_dependency`.
-    #[param(choices = simulator::sim::ReplayPacing::CHOICES)]
-    pub replay_pacing: String,
+    /// When a new top-level unit becomes eligible: `trace_timed` replays the
+    /// trace's own arrival timeline, `saturated` makes every unit eligible at
+    /// once. Independent of `max_concurrency`, which caps how many may be
+    /// active, and of `session_dependency`, which decides what a unit is.
+    #[param(choices = simulator::sim::ArrivalMode::CHOICES)]
+    pub arrival_mode: String,
     /// Whether every trace row is independently eligible or later rounds wait
     /// for predecessor completion plus `tool_wait_after_ms`. `chained` requires
     /// the `session` trace tag and composes with either replay pacing.
@@ -288,7 +290,7 @@ mod tests {
     // (G8) — model_config sits flat alongside tp_size under `arch`.
     const UNIFIED_YAML: &str = r#"
 deployment: unified
-workload: { trace_files: ["trace/smoke.csv"], trace_kind: text_generation, replay_pacing: open_loop, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
+workload: { trace_files: ["trace/smoke.csv"], trace_kind: text_generation, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
 io: { log_dir: "logs/smoke", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   main:
@@ -328,14 +330,14 @@ pools:
         assert_eq!(cfg.io().log_level, LogLevel::Info);
         assert!(cfg.io().log_stage_transitions);
         assert_eq!(cfg.workload().request_rate, 10.0);
-        assert_eq!(cfg.workload().replay_pacing, "open_loop");
+        assert_eq!(cfg.workload().arrival_mode, "trace_timed");
         assert_eq!(cfg.workload().session_dependency, "independent");
     }
 
     #[test]
     fn legacy_replay_mode_is_not_accepted() {
         let legacy = UNIFIED_YAML
-            .replace("replay_pacing: open_loop", "replay_mode: open_loop")
+            .replace("arrival_mode: trace_timed", "replay_mode: open_loop")
             .replace(", session_dependency: independent", "");
         let error = serde_yaml::from_str::<RunConfig>(&legacy).unwrap_err();
         assert!(error.to_string().contains("replay_mode"), "{error}");
@@ -346,7 +348,7 @@ pools:
         // YAML is a JSON superset; the equivalent JSON must parse identically.
         let json = serde_json::json!({
             "deployment": "unified",
-            "workload": {"trace_files": ["t.csv"], "trace_kind": "text_generation", "replay_pacing": "open_loop", "session_dependency": "independent", "duration_ms": 5000.0, "run_to_end": true, "request_rate": 10.0},
+            "workload": {"trace_files": ["t.csv"], "trace_kind": "text_generation", "arrival_mode": "trace_timed", "session_dependency": "independent", "duration_ms": 5000.0, "run_to_end": true, "request_rate": 10.0},
             "io": {"log_dir": "logs", "log_level": "info", "quiet": false, "force_cache_build": false, "log_output_token_times": false},
             "pools": {"main": {"placement": "least-queued", "groups": [
                 {"gpu": "H200", "replicas": 1,
@@ -417,7 +419,7 @@ pools:
     fn pd_two_pools_parse() {
         let yaml = r#"
 deployment: pd
-workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_pacing: open_loop, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], trace_kind: text_generation, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   prefill:
@@ -443,7 +445,7 @@ pools:
         // aggregated replica, qwen3_ffn_moe). Mirrors `pd_two_pools_parse`.
         let yaml = r#"
 deployment: afd
-workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_pacing: open_loop, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], trace_kind: text_generation, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   attn:
@@ -487,7 +489,7 @@ pools:
         // DP-attention arch carries two TP degrees; pairs with the hp_unified worker.
         let yaml = r#"
 deployment: unified
-workload: { trace_files: ["t.csv"], trace_kind: text_generation, replay_pacing: open_loop, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], trace_kind: text_generation, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   main:

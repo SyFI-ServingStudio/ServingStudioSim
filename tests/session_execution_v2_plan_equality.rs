@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use simulator::sim::frontend::{
-    ReplayPacing, SessionDependency, TraceDeclaration, TraceFrontend,
+    ArrivalMode, CapacityLimit, SessionDependency, TraceDeclaration, TraceFrontend,
 };
 
 /// TraceLab's exported plan row. Deserialized rather than compared as raw JSON so
@@ -57,7 +57,8 @@ fn simulator_plan_matches_tracelab_plan_for_the_same_canonical_trace() {
     let frontend = TraceFrontend::load(
         &[trace_path],
         &declaration,
-        ReplayPacing::OpenLoop { request_rate: 1.0 },
+        ArrivalMode::TraceTimed { request_rate: 1.0 },
+        CapacityLimit::unlimited(),
         SessionDependency::Chained,
     )
     .expect("canonical trace loads");
