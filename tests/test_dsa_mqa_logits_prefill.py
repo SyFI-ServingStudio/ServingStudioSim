@@ -355,6 +355,39 @@ def test_deepgemm_loader_rejects_missing_support(monkeypatch):
         runner._load_deepgemm_backend()
 
 
+@pytest.mark.parametrize("logits_api", ["fp8_mqa_logits", "fp8_fp4_mqa_logits"])
+def test_deepgemm_loader_accepts_either_entry_point(monkeypatch, logits_api):
+    """The fork renamed the entry point when it unified FP8 and MXFP4 dispatch
+    behind a tuple-typed `q`. Either name must load; only their joint absence
+    is an error."""
+    from profiling.runners.attention import dsa_mqa_logits_prefill as runner
+
+    fake_deepgemm = SimpleNamespace(is_deep_gemm_supported=lambda: True)
+    setattr(fake_deepgemm, logits_api, lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.utils",
+        SimpleNamespace(deep_gemm=fake_deepgemm),
+    )
+    _, loaded = runner._load_deepgemm_backend()
+    assert runner._mqa_logits_entry_point(loaded) is getattr(fake_deepgemm, logits_api)
+
+
+def test_deepgemm_loader_rejects_both_entry_points_missing(monkeypatch):
+    from profiling.runners.attention import dsa_mqa_logits_prefill as runner
+
+    fake_deepgemm = SimpleNamespace(is_deep_gemm_supported=lambda: True)
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.utils",
+        SimpleNamespace(deep_gemm=fake_deepgemm),
+    )
+    with pytest.raises(ProfilerNotImplemented, match="neither fp8_mqa_logits"):
+        runner._load_deepgemm_backend()
+
+
 def test_deepgemm_loader_rejects_missing_framework(monkeypatch):
     from profiling.runners.attention import dsa_mqa_logits_prefill as runner
 

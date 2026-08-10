@@ -244,7 +244,6 @@ def test_vllm_rejects_common_and_backend_specific_args_before_loading(
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
         ({"index_dtype": "int64"}, "index_dtype='int32'"),
         ({"span_mode": "ragged"}, "single_causal_tail"),
-        ({"num_queries": 4097}, "num_queries <= 4096"),
     ]
     for overrides, match in invalid_cases:
         kwargs = dict(_BASE_SPEC)

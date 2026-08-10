@@ -232,13 +232,27 @@ def _load_deepgemm_backend() -> tuple[Any, Any]:
             "DeepGEMM is unavailable or unsupported for "
             "dsa_paged_mqa_logits_decode:vllm_deepgemm_fp8"
         )
-    for api_name in (
-        "get_paged_mqa_logits_metadata",
-        "fp8_paged_mqa_logits",
-    ):
-        if not callable(getattr(deep_gemm, api_name, None)):
-            raise ProfilerNotImplemented(f"vllm.utils.deep_gemm.{api_name} is unavailable")
+    if not callable(getattr(deep_gemm, "get_paged_mqa_logits_metadata", None)):
+        raise ProfilerNotImplemented(
+            "vllm.utils.deep_gemm.get_paged_mqa_logits_metadata is unavailable"
+        )
+    if _paged_mqa_logits_entry_point(deep_gemm) is None:
+        raise ProfilerNotImplemented(
+            "vllm.utils.deep_gemm exposes neither fp8_paged_mqa_logits nor "
+            "fp8_fp4_paged_mqa_logits"
+        )
     return torch, deep_gemm
+
+
+def _paged_mqa_logits_entry_point(deep_gemm: Any) -> Any:
+    """The fork renamed `fp8_paged_mqa_logits` to `fp8_fp4_paged_mqa_logits`
+    when it unified the FP8 and MXFP4 dispatch behind a tuple-typed `q`. Both
+    names reach the same paged DeepGEMM kernel on the FP8 path."""
+    for name in ("fp8_paged_mqa_logits", "fp8_fp4_paged_mqa_logits"):
+        entry_point = getattr(deep_gemm, name, None)
+        if callable(entry_point):
+            return entry_point
+    return None
 
 
 def _stable_values(torch: Any, shape: tuple[int, ...], *, phase: int, device: str) -> Any:
@@ -481,7 +495,20 @@ def _prepare_deepgemm_call(
     max_model_len: int,
 ) -> tuple[Any, Any, Any]:
     """Adapt pinned contexts and build metadata before returning the timed call."""
-    runnable_context_lens = operands.context_lens[:, 0].contiguous()
+    entry_point = _paged_mqa_logits_entry_point(deep_gemm)
+    # The unified entry point takes `q = (values, scales_or_None)`; the FP8 path
+    # passes None because the per-token scale is folded into `weights`.
+    unified = getattr(entry_point, "__name__", "") == "fp8_fp4_paged_mqa_logits"
+    query = (operands.q, None) if unified else operands.q
+    # The unified DeepGEMM API asserts `context_lens.dim() == 2`
+    # (csrc/apis/attention.hpp), and vLLM's indexer unsqueezes to (B, 1) before
+    # calling both this and the metadata builder. The older entry point took the
+    # flat (B,) view. Feed each the layout it was built for.
+    runnable_context_lens = (
+        operands.context_lens.contiguous()
+        if unified
+        else operands.context_lens[:, 0].contiguous()
+    )
     schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
         runnable_context_lens,
         block_size=block_size,
@@ -489,8 +516,8 @@ def _prepare_deepgemm_call(
     )
 
     def kernel() -> Any:
-        return deep_gemm.fp8_paged_mqa_logits(
-            operands.q,
+        return entry_point(
+            query,
             operands.cache,
             operands.weights,
             runnable_context_lens,

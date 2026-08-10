@@ -24,7 +24,6 @@ _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _SPAN_MODE = "single_causal_tail"
 _REQUIRED_GPU = "NVIDIA H200"
-_VLLM_MAX_QUERIES = 4096
 _VLLM_KERNEL_NAME = "topKPerRowPrefill"
 
 
@@ -110,7 +109,15 @@ def _validate_vllm_args(
     index_dtype: str,
     span_mode: str,
 ) -> tuple[int, int, int, int, int, DType, str, str]:
-    """Validate the production backend's one-launch milestone."""
+    """Validate the production backend's argument identity.
+
+    There is deliberately no `num_queries` ceiling: `top_k_per_row_prefill`
+    launches one block per row and falls back to a second radix pass beyond
+    12,288 rows, so any row count is a shape the production kernel handles. What
+    a caller must not do is ask for an operand that will not fit — that bound
+    belongs to the sweep grid's `infeasible_mask`, which sizes the padded logits
+    block, not to per-spec validation here.
+    """
     validated = _validate_args(
         num_queries,
         num_keys,
@@ -121,11 +128,6 @@ def _validate_vllm_args(
         index_dtype,
         span_mode,
     )
-    if validated[0] > _VLLM_MAX_QUERIES:
-        raise ValueError(
-            "dsa_topk_prefill:vllm_cuda requires num_queries <= 4096 "
-            f"for the verified one-launch chunk domain, got {validated[0]}"
-        )
     return validated
 
 

@@ -39,8 +39,12 @@ const ROPE_DIM: u32 = 64;
 const HIDDEN_DIM: u32 = 6144;
 const Q_LORA_RANK: u32 = 2048;
 const TOP_K: u32 = 2048;
-const MAX_MODEL_LEN: u32 = 131072;
-const LOGITS_ROW_STRIDE: u32 = 131072;
+/// The v1 DSA indexer is frozen to one measured shape family, so the accepted
+/// context is an equality check rather than a bound. It must move together with
+/// `TIMING_MAX_MODEL_LEN` in the GLM-5.2 arch files and with the same constants
+/// in the L3 DSA attention worklets — three deliberate copies, one domain.
+const MAX_MODEL_LEN: u32 = 1_048_576;
+const LOGITS_ROW_STRIDE: u32 = 1_048_576;
 const CACHE_BLOCK_SIZE: u32 = 64;
 const QUANT_BLOCK_SIZE: u32 = 128;
 
@@ -777,7 +781,7 @@ fn push_prefill_log(ev: &mut Evaluator, metrics: LeafMetrics, pairs: &[(u32, u32
 mod tests {
     use super::{
         elementwise_configs, normalize_input, subkernel_configs, validate_config, DsaIndexerConfig,
-        DsaIndexerDecodeInput, DsaIndexerInput, SLOT_SUFFIXES,
+        DsaIndexerDecodeInput, DsaIndexerInput, LOGITS_ROW_STRIDE, MAX_MODEL_LEN, SLOT_SUFFIXES,
     };
     use crate::timing::bridge::DType;
     use crate::timing::slot_input::DsaIndexerPrefillLog;
@@ -800,9 +804,9 @@ mod tests {
             index_head_dim: Dim::param("index_head_dim", 128),
             rope_dim: Dim::param("rope_dim", 64),
             next_n,
-            max_model_len: Dim::param("max_model_len", 131072),
+            max_model_len: Dim::param("max_model_len", MAX_MODEL_LEN),
             top_k: 2048,
-            logits_row_stride: Dim::param("logits_row_stride", 131072),
+            logits_row_stride: Dim::param("logits_row_stride", LOGITS_ROW_STRIDE),
             cache_block_size: 64,
             quant_block_size: 128,
             input_dtype: DType::Bf16,
@@ -886,8 +890,8 @@ mod tests {
         assert_eq!(configs.prefill_topk.span_mode, "single_causal_tail");
         assert!(!configs.prefill_logits.clean_logits);
         assert_eq!(configs.decode_topk.top_k, 2048);
-        assert_eq!(configs.decode_topk.logits_row_stride, 131072);
-        assert_eq!(configs.decode_logits.max_model_len, 131072);
+        assert_eq!(configs.decode_topk.logits_row_stride, LOGITS_ROW_STRIDE);
+        assert_eq!(configs.decode_logits.max_model_len, MAX_MODEL_LEN);
         assert_eq!(configs.decode_logits.block_size, 64);
         assert_eq!(configs.decode_logits.q_dtype, DType::Fp8E4m3);
         assert_eq!(configs.decode_logits.cache_dtype, DType::Fp8E4m3);
@@ -986,7 +990,7 @@ mod tests {
                 requires_padding: true,
             }),
         };
-        let normalized = normalize_input(&input, 2, 131072).unwrap();
+        let normalized = normalize_input(&input, 2, MAX_MODEL_LEN).unwrap();
         assert_eq!(normalized.active_query_rows, 48);
         assert_eq!(normalized.padded_decode_rows, 24);
         assert_eq!(normalized.decode_logits.as_ref().unwrap().batch_size, 12);
@@ -995,14 +999,14 @@ mod tests {
 
         let mut unpadded = input;
         unpadded.decode.as_mut().unwrap().requires_padding = false;
-        let normalized = normalize_input(&unpadded, 2, 131072).unwrap();
+        let normalized = normalize_input(&unpadded, 2, MAX_MODEL_LEN).unwrap();
         assert_eq!(normalized.active_query_rows, 48);
         assert_eq!(normalized.padded_decode_rows, 0);
     }
 
     #[test]
     fn absent_decode_and_empty_prefill_are_zero_work() {
-        let normalized = normalize_input(&DsaIndexerInput::default(), 1, 131072).unwrap();
+        let normalized = normalize_input(&DsaIndexerInput::default(), 1, MAX_MODEL_LEN).unwrap();
         assert_eq!(normalized.active_query_rows, 0);
         assert_eq!(normalized.padded_decode_rows, 0);
         assert!(normalized.decode_logits.is_none());
@@ -1016,9 +1020,9 @@ mod tests {
                 prefill_query_key_pairs: vec![pair],
                 ..Default::default()
             };
-            assert!(normalize_input(&input, 1, 131072).is_err());
+            assert!(normalize_input(&input, 1, MAX_MODEL_LEN).is_err());
         }
-        for (batch_size, context_len) in [(0, 1), (1, 0), (1, 131073)] {
+        for (batch_size, context_len) in [(0, 1), (1, 0), (1, MAX_MODEL_LEN + 1)] {
             let input = DsaIndexerInput {
                 decode: Some(DsaIndexerDecodeInput {
                     batch_size,
@@ -1027,7 +1031,7 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            assert!(normalize_input(&input, 2, 131072).is_err());
+            assert!(normalize_input(&input, 2, MAX_MODEL_LEN).is_err());
         }
         let overflow = DsaIndexerInput {
             decode: Some(DsaIndexerDecodeInput {
@@ -1037,7 +1041,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(normalize_input(&overflow, 2, 131072)
+        assert!(normalize_input(&overflow, 2, MAX_MODEL_LEN)
             .err()
             .expect("decode multiplication must overflow")
             .contains("overflows u32"));
@@ -1046,7 +1050,7 @@ mod tests {
             prefill_query_key_pairs: vec![(u32::MAX, u32::MAX), (1, 1)],
             ..Default::default()
         };
-        assert!(normalize_input(&active_overflow, 1, 131072)
+        assert!(normalize_input(&active_overflow, 1, MAX_MODEL_LEN)
             .err()
             .expect("active-row sum must overflow")
             .contains("overflows u32"));

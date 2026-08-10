@@ -24,7 +24,7 @@ _ASSET_ROOT = Path(__file__).resolve().parent
 _MANIFEST_PATH = _ASSET_ROOT / "source_manifest.json"
 _CORRECTION_MANIFEST_PATH = _ASSET_ROOT / "correction_manifest.json"
 _CACHE_ENV = "VIBESIM_DSA_PERSISTENT_TOPK_CACHE_DIR"
-_EXPECTED_TORCH = "2.10.0+cu128"
+_EXPECTED_TORCH = "2.11.0+cu128"
 _EXPECTED_CUDA = "12.8"
 _SCHEMA = (
     "_C_pinned_topk::persistent_topk(Tensor logits, Tensor lengths, "
@@ -46,7 +46,7 @@ _CFLAGS = (
     "-O3",
     "-std=c++20",
     "-DPy_LIMITED_API=3",
-    "-DTORCH_TARGET_VERSION=0x020A000000000000",
+    "-DTORCH_TARGET_VERSION=0x020B000000000000",
     "-DUSE_CUDA",
 )
 _CUDA_CFLAGS = (*_CFLAGS, "-gencode=arch=compute_90,code=sm_90")

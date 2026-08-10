@@ -41,8 +41,11 @@ const MODEL_INDEX_HEADS: u32 = 32;
 const PROFILE_INDEX_HEADS: u32 = 64;
 const INDEX_HEAD_DIM: u32 = 128;
 const SELECTED_K: u32 = 2048;
-const MAX_MODEL_LEN: u32 = 131072;
-const LOGITS_ROW_STRIDE: u32 = 131072;
+/// Frozen with the arch's `TIMING_MAX_MODEL_LEN`: this worklet accepts exactly
+/// one GLM-5.2 identity, so the two must be raised together or `validate_config`
+/// rejects every arch-built config.
+const MAX_MODEL_LEN: u32 = 1_048_576;
+const LOGITS_ROW_STRIDE: u32 = 1_048_576;
 const CACHE_BLOCK_SIZE: u32 = 64;
 const QUANT_BLOCK_SIZE: u32 = 128;
 const SOFTMAX_SCALE_DENOMINATOR: u32 = 16;
@@ -832,8 +835,8 @@ mod tests {
             profile_num_index_heads: Dim::param("profile_num_index_heads", 64),
             index_head_dim: Dim::param("index_head_dim", 128),
             selected_k: 2048,
-            max_model_len: Dim::param("max_model_len", 131072),
-            logits_row_stride: Dim::param("logits_row_stride", 131072),
+            max_model_len: Dim::param("max_model_len", MAX_MODEL_LEN),
+            logits_row_stride: Dim::param("logits_row_stride", LOGITS_ROW_STRIDE),
             cache_block_size: 64,
             quant_block_size: 128,
             softmax_scale_denominator: 16,
@@ -972,7 +975,7 @@ mod tests {
                 requires_padding: true,
             }),
         };
-        let n = normalize_input(&input, 2, 131072).unwrap();
+        let n = normalize_input(&input, 2, MAX_MODEL_LEN).unwrap();
         assert_eq!(n.active_rows, 48);
         assert_eq!(n.sparse_decode, Some((24, 8192)));
         let decode = n.indexer_decode.unwrap();
@@ -983,7 +986,8 @@ mod tests {
 
     #[test]
     fn zero_case_and_num_new_token_equality_are_enforced() {
-        let zero = normalize_input(&Glm52DsaAttnLocalWorkletInput::default(), 1, 131072).unwrap();
+        let zero =
+            normalize_input(&Glm52DsaAttnLocalWorkletInput::default(), 1, MAX_MODEL_LEN).unwrap();
         assert_eq!(zero.active_rows, 0);
         assert!(zero.indexer_decode.is_none());
         assert!(zero.sparse_decode.is_none());
@@ -993,7 +997,7 @@ mod tests {
             prefill_query_cache_pairs: vec![(8, 8)],
             decode: None,
         };
-        assert!(normalize_input(&mismatched, 1, 131072)
+        assert!(normalize_input(&mismatched, 1, MAX_MODEL_LEN)
             .unwrap_err()
             .contains("must equal active query rows"));
     }
@@ -1005,7 +1009,7 @@ mod tests {
                 prefill_query_cache_pairs: vec![pair],
                 ..Default::default()
             };
-            assert!(normalize_input(&input, 1, 131072).is_err());
+            assert!(normalize_input(&input, 1, MAX_MODEL_LEN).is_err());
         }
         for (batch_size, context_len) in [(0, 1), (1, 0), (1, 131073)] {
             let input = Glm52DsaAttnLocalWorkletInput {
@@ -1016,7 +1020,7 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            assert!(normalize_input(&input, 2, 131072).is_err());
+            assert!(normalize_input(&input, 2, MAX_MODEL_LEN).is_err());
         }
         let multiply_overflow = Glm52DsaAttnLocalWorkletInput {
             decode: Some(Glm52DsaAttnLocalDecodeInput {
@@ -1026,7 +1030,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(normalize_input(&multiply_overflow, 2, 131072)
+        assert!(normalize_input(&multiply_overflow, 2, MAX_MODEL_LEN)
             .unwrap_err()
             .contains("overflows u32"));
 
@@ -1035,7 +1039,7 @@ mod tests {
             prefill_query_cache_pairs: vec![(u32::MAX, u32::MAX), (1, 1)],
             decode: None,
         };
-        assert!(normalize_input(&sum_overflow, 1, 131072)
+        assert!(normalize_input(&sum_overflow, 1, MAX_MODEL_LEN)
             .unwrap_err()
             .contains("overflows u32"));
     }

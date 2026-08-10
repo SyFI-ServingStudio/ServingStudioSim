@@ -3,8 +3,8 @@
 //! The cache stays on physical `(num_queries, num_keys)` coordinates and
 //! brackets the observed row-wave, work-tile, and semantic top-k boundaries.
 //! Measured R.4 evidence added the shared 1448 diagonal, paired M=2047 with the
-//! existing N=2047 point, and extended N to 131072 to bound the tested key-axis
-//! extrapolation. This changes neither the cache algorithm nor the public query
+//! existing N=2047 point, and extended N to 1048576 to cover the arch's full
+//! timing domain. This changes neither the cache algorithm nor the public query
 //! contract. Python's `logits_row_stride` remains derived from `num_keys` during
 //! enumeration to reproduce the padded DeepGEMM-logits layout.
 
@@ -45,11 +45,11 @@ impl KernelSpec for DsaTopkPrefillSpec {
         SweepGrid::new(vec![
             Axis::values([
                 1, 2, 4, 8, 16, 32, 64, 127, 128, 129, 131, 132, 133, 255, 256, 257, 512, 1024,
-                1448, 2047, 2048, 4096,
+                1448, 2047, 2048, 4096, 8192, 16384, 32768, 65536,
             ]),
             Axis::values([
                 1, 2, 4, 8, 16, 32, 64, 128, 255, 256, 257, 512, 1024, 1448, 2047, 2048, 2049,
-                4096, 8192, 16384, 32768, 65536, 131072,
+                4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576,
             ]),
         ])
     }
@@ -61,7 +61,12 @@ impl KernelSpec for DsaTopkPrefillSpec {
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         // The production backend requires 0 < num_queries <= num_keys. Keep the
         // rectangular interpolation grid, but never profile its invalid M>N corner.
-        grid.expand_2d(|num_queries, num_keys| num_queries > num_keys)
+        grid.expand_2d(|num_queries, num_keys| {
+            let padded_logits_bytes = num_queries
+                * f64::from(logits_row_stride(num_keys as u32))
+                * f64::from(DType::Fp32.size_bytes());
+            num_queries > num_keys || padded_logits_bytes > MAX_PROFILE_ALLOCATION_BYTES
+        })
     }
 
     fn enumerate(
@@ -84,6 +89,18 @@ impl KernelSpec for DsaTopkPrefillSpec {
         })
     }
 }
+
+/// Largest single profiling allocation this kernel may ask a GPU for, in bytes.
+///
+/// Raising the DSA context domain to 1,048,576 tokens makes the grid's far
+/// corner physically unprofilable — not because the shape is invalid, but
+/// because its operand would not fit on any card. The bound is a staircase
+/// rather than a per-axis cap: a large query count is fine against a short
+/// context and vice versa, which is exactly how the real workload is shaped
+/// (a session's big fresh input lands on round 0, when its context is still
+/// empty). Cells it drops are stored non-finite and `Cache2DLinear`
+/// renormalizes over the surviving corners, so the grid stays rectangular.
+const MAX_PROFILE_ALLOCATION_BYTES: f64 = 32.0 * 1024.0 * 1024.0 * 1024.0;
 
 /// DeepGEMM logits pad N to 256 and retain one additional 256-column tile.
 fn logits_row_stride(num_keys: u32) -> u32 {
@@ -108,11 +125,13 @@ mod tests {
     const VLLM_BACKEND: &str = "vllm_cuda";
     const QUERY_AXIS: &[f64] = &[
         1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 127.0, 128.0, 129.0, 131.0, 132.0, 133.0, 255.0,
-        256.0, 257.0, 512.0, 1024.0, 1448.0, 2047.0, 2048.0, 4096.0,
+        256.0, 257.0, 512.0, 1024.0, 1448.0, 2047.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0,
+        65536.0,
     ];
     const KEY_AXIS: &[f64] = &[
         1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 255.0, 256.0, 257.0, 512.0, 1024.0, 1448.0,
-        2047.0, 2048.0, 2049.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0,
+        2047.0, 2048.0, 2049.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0,
+        524288.0, 1048576.0,
     ];
 
     fn config() -> DsaTopkPrefillKernelConfig {
@@ -184,8 +203,8 @@ mod tests {
         assert_eq!(axes.len(), 2);
         assert_eq!(axes[0], QUERY_AXIS);
         assert_eq!(axes[1], KEY_AXIS);
-        assert_eq!(axes[0].len(), 22);
-        assert_eq!(axes[1].len(), 23);
+        assert_eq!(axes[0].len(), 26);
+        assert_eq!(axes[1].len(), 26);
         assert!(axes[0].windows(2).all(|pair| pair[0] < pair[1]));
         assert!(axes[1].windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(&axes[0][7..10], &[127.0, 128.0, 129.0]);
@@ -196,10 +215,11 @@ mod tests {
         assert_eq!(&axes[1][12..17], &[1024.0, 1448.0, 2047.0, 2048.0, 2049.0]);
         assert_eq!(&axes[1][21..23], &[65536.0, 131072.0]);
         assert_eq!(axes[0].first(), Some(&1.0));
-        assert_eq!(axes[0].last(), Some(&4096.0));
+        assert_eq!(axes[0].last(), Some(&65536.0));
         assert_eq!(axes[1].first(), Some(&1.0));
-        assert_eq!(axes[1].last(), Some(&131072.0));
-        assert_eq!(axes[0].len() * axes[1].len(), 506);
+        // The key axis reaches the arch's full 1,048,576-token timing domain.
+        assert_eq!(axes[1].last(), Some(&1_048_576.0));
+        assert_eq!(axes[0].len() * axes[1].len(), 676);
     }
 
     #[test]
@@ -209,9 +229,9 @@ mod tests {
         let mask = DsaTopkPrefillSpec::infeasible_mask(&cfg, &grid);
         let key_count = grid.axes()[1].len();
 
-        assert_eq!(mask.len(), 506);
-        assert_eq!(mask.iter().filter(|&&masked| masked).count(), 176);
-        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 330);
+        assert_eq!(mask.len(), 676);
+        assert_eq!(mask.iter().filter(|&&masked| masked).count(), 264);
+        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 412);
 
         let masked = |m: f64, n: f64| {
             let i = grid.axes()[0].iter().position(|&value| value == m).unwrap();
@@ -231,6 +251,11 @@ mod tests {
         assert!(masked(2.0, 1.0));
         assert!(masked(129.0, 128.0));
         assert!(masked(4096.0, 2049.0));
+        // The padded-logits allocation staircase. This kernel's operand is
+        // `num_queries * logits_row_stride`, so the far corner is dropped for
+        // its query count, not its context: 4096 rows survive a 1M context.
+        assert!(!masked(4096.0, 1_048_576.0));
+        assert!(masked(65536.0, 1_048_576.0));
     }
 
     #[test]
@@ -254,6 +279,7 @@ mod tests {
         assert_eq!(logits_row_stride(8192), 8448);
         assert_eq!(logits_row_stride(65536), 65792);
         assert_eq!(logits_row_stride(131072), 131328);
+        assert_eq!(logits_row_stride(1_048_576), 1_048_832);
     }
 
     #[test]
@@ -262,7 +288,7 @@ mod tests {
         let grid = DsaTopkPrefillSpec::sweep_grid(&cfg);
         let payloads = DsaTopkPrefillSpec::enumerate(&cfg, &grid, VLLM_BACKEND);
 
-        assert_eq!(payloads.len(), 506);
+        assert_eq!(payloads.len(), 676);
         let expected_names = [
             "backend",
             "index_dtype",
@@ -316,7 +342,13 @@ mod tests {
             2047,
             2304,
         );
-        assert_payload(payloads.last().unwrap(), VLLM_BACKEND, 4096, 131072, 131328);
+        assert_payload(
+            payloads.last().unwrap(),
+            VLLM_BACKEND,
+            65536,
+            1_048_576,
+            1_048_832,
+        );
     }
 
     fn payload_for<'a>(

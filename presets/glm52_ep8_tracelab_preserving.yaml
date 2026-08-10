@@ -1,0 +1,57 @@
+# Real coding-agent sessions on GLM-5.2, EP8, under a session-concurrency cap.
+#
+# The workload is the public syfi coding-agent dataset materialized by TraceLab's
+# `tracegen` under the prefix-preserving policy: 4,281 sessions, 357,161 rounds,
+# contexts up to ~1M tokens. GLM-5.2 is the model that can actually hold it —
+# a 1,048,576 context window and DSA's compressed KV. Llama3-8B cannot: 47% of
+# these rounds exceed its 131,072 window outright.
+#
+# The trace CSV is gitignored (~23 MB); provision it per the create-worktree
+# skill. Its committed manifest records the policy and the fold accounting.
+#
+# `max_concurrency: 16` caps active *sessions*, not requests: a session holds its
+# slot across every round and every tool wait until the conversation ends. With
+# ~1 session/s arriving and sessions living for tens of minutes of tool wait, the
+# cap binds hard — it is what makes the run finite.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/tracelab_preserving.csv
+  trace_kind: text_generation
+  trace_source_schema: session-execution-v2
+  arrival_mode: trace_timed
+  session_dependency: chained
+  max_concurrency: 16
+  request_rate: 1.0
+  run_to_end: false
+  # One simulated day. The 600 s probe only reached round 298 of 357,161 and
+  # spent most of it below the cap; a day is the shortest window that holds
+  # `max_concurrency: 16` saturated long enough for the KV pressure and the
+  # achieved prefix hit rate to mean anything.
+  duration_ms: 86400000.0
+
+io:
+  log_dir: logs/glm52_ep8_tracelab_preserving
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: glm52_vllm_dsa_moe
+          model_config: model/config/glm52_fp8.json
+          fp8: true
+          ep_size: 8
+          nvl_num_gpu: 8
+          routing: uniform
+          mtp_mode: "off"   # quoted: bare off is YAML false
+        worker:
+          type: hp_unified
+          # The trace's longest round holds 1,006,146 tokens of context, and
+          # GLM-5.2's compressed DSA state is 92,628 B/token, so a shard needs
+          # ~93 GB to admit it at all. Anything smaller does not merely evict —
+          # admission blocks on the queue head forever and the run stalls
+          # silently.
+          attn_gpu_memory_gb: 95.0

@@ -41,6 +41,18 @@ pub struct DsaPagedMqaLogitsDecodeKernelInput {
     pub context_len: u32,
 }
 
+/// Largest single profiling allocation this kernel may ask a GPU for, in bytes.
+///
+/// Raising the DSA context domain to 1,048,576 tokens makes the grid's far
+/// corner physically unprofilable — not because the shape is invalid, but
+/// because its operand would not fit on any card. Cells this drops are stored
+/// non-finite and `Cache2DLinear` renormalizes over the surviving corners, so
+/// the grid stays rectangular.
+const MAX_PROFILE_ALLOCATION_BYTES: f64 = 32.0 * 1024.0 * 1024.0 * 1024.0;
+
+/// Each cached index token carries one fp32 scale beside its key bytes.
+const SCALE_BYTES_PER_TOKEN: u32 = 4;
+
 pub struct DsaPagedMqaLogitsDecodeSpec;
 
 impl KernelSpec for DsaPagedMqaLogitsDecodeSpec {
@@ -56,7 +68,7 @@ impl KernelSpec for DsaPagedMqaLogitsDecodeSpec {
             ]),
             Axis::values([
                 1, 63, 64, 65, 128, 255, 256, 257, 512, 1024, 2048, 4096, 5793, 8192, 16384, 32768,
-                65536,
+                65536, 131072, 262144, 524288, 1048576,
             ]),
         ])
     }
@@ -67,7 +79,15 @@ impl KernelSpec for DsaPagedMqaLogitsDecodeSpec {
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         let max_model_len = config.max_model_len.get() as f64;
-        grid.expand_2d(|_batch_size, context_len| context_len > max_model_len)
+        // The paged index cache is one page set per sequence, so its size grows
+        // with batch x context. At a 1M context the far corner would ask for
+        // tens of terabytes; bound it rather than hand the profiler a shape no
+        // card can hold.
+        let cache_bytes_per_token = f64::from(config.head_dim.get() + SCALE_BYTES_PER_TOKEN);
+        grid.expand_2d(|batch_size, context_len| {
+            context_len > max_model_len
+                || batch_size * context_len * cache_bytes_per_token > MAX_PROFILE_ALLOCATION_BYTES
+        })
     }
 
     fn enumerate(
@@ -120,8 +140,11 @@ mod tests {
     ];
     const CONTEXT_AXIS: &[f64] = &[
         1.0, 63.0, 64.0, 65.0, 128.0, 255.0, 256.0, 257.0, 512.0, 1024.0, 2048.0, 4096.0, 5793.0,
-        8192.0, 16384.0, 32768.0, 65536.0,
+        8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 524288.0, 1048576.0,
     ];
+
+    /// The arch's full DSA timing domain — the context the grid now reaches.
+    const FULL_MAX_MODEL_LEN: u32 = 1_048_576;
 
     fn config(max_model_len: u32) -> DsaPagedMqaLogitsDecodeKernelConfig {
         DsaPagedMqaLogitsDecodeKernelConfig {
@@ -231,14 +254,14 @@ mod tests {
 
     #[test]
     fn sweep_grid_has_the_frozen_physical_axes_and_boundaries() {
-        let grid = DsaPagedMqaLogitsDecodeSpec::sweep_grid(&config(131072));
+        let grid = DsaPagedMqaLogitsDecodeSpec::sweep_grid(&config(FULL_MAX_MODEL_LEN));
         let axes = grid.axes();
 
         assert_eq!(axes.len(), 2);
         assert_eq!(axes[0], BATCH_AXIS);
         assert_eq!(axes[1], CONTEXT_AXIS);
         assert_eq!(axes[0].len(), 18);
-        assert_eq!(axes[1].len(), 17);
+        assert_eq!(axes[1].len(), 21);
         assert!(axes[0].windows(2).all(|pair| pair[0] < pair[1]));
         assert!(axes[1].windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(&axes[0][7..10], &[127.0, 128.0, 129.0]);
@@ -252,30 +275,30 @@ mod tests {
         assert_eq!(axes[0].first(), Some(&1.0));
         assert_eq!(axes[0].last(), Some(&512.0));
         assert_eq!(axes[1].first(), Some(&1.0));
-        assert_eq!(axes[1].last(), Some(&65536.0));
-        assert_eq!(axes[0].len() * axes[1].len(), 306);
+        assert_eq!(axes[1].last(), Some(&1_048_576.0));
+        assert_eq!(axes[0].len() * axes[1].len(), 378);
     }
 
     #[test]
     fn infeasible_mask_respects_max_model_len_and_its_boundary() {
-        let large_cfg = config(131072);
-        let grid = DsaPagedMqaLogitsDecodeSpec::sweep_grid(&large_cfg);
-        let unbounded_mask = DsaPagedMqaLogitsDecodeSpec::infeasible_mask(&large_cfg, &grid);
-        assert_eq!(unbounded_mask.len(), 306);
-        assert_eq!(unbounded_mask.iter().filter(|&&masked| masked).count(), 0);
-        assert_eq!(
-            unbounded_mask.iter().filter(|&&masked| !masked).count(),
-            306
-        );
+        let full_cfg = config(FULL_MAX_MODEL_LEN);
+        let grid = DsaPagedMqaLogitsDecodeSpec::sweep_grid(&full_cfg);
+        let full_mask = DsaPagedMqaLogitsDecodeSpec::infeasible_mask(&full_cfg, &grid);
+        // Over the full domain nothing is dropped for exceeding the model
+        // length; the only four dropped cells are the batch x context corners
+        // whose paged index cache would not fit on a card.
+        assert_eq!(full_mask.len(), 378);
+        assert_eq!(full_mask.iter().filter(|&&masked| masked).count(), 4);
+        assert_eq!(full_mask.iter().filter(|&&masked| !masked).count(), 374);
 
         let bounded_cfg = config(256);
         let bounded_mask = DsaPagedMqaLogitsDecodeSpec::infeasible_mask(&bounded_cfg, &grid);
-        assert_eq!(bounded_mask.len(), 306);
-        assert_eq!(bounded_mask.iter().filter(|&&masked| masked).count(), 180);
+        assert_eq!(bounded_mask.len(), 378);
+        assert_eq!(bounded_mask.iter().filter(|&&masked| masked).count(), 252);
         assert_eq!(bounded_mask.iter().filter(|&&masked| !masked).count(), 126);
 
         let context_count = grid.axes()[1].len();
-        let masked = |batch_size: f64, context_len: f64| {
+        let cell = |mask: &[bool], batch_size: f64, context_len: f64| {
             let i = grid.axes()[0]
                 .iter()
                 .position(|&value| value == batch_size)
@@ -284,14 +307,22 @@ mod tests {
                 .iter()
                 .position(|&value| value == context_len)
                 .unwrap();
-            bounded_mask[i * context_count + j]
+            mask[i * context_count + j]
         };
         for batch_size in [1.0, 130.0, 132.0, 185.0, 384.0, 512.0] {
-            assert!(!masked(batch_size, 255.0));
-            assert!(!masked(batch_size, 256.0));
-            assert!(masked(batch_size, 257.0));
-            assert!(masked(batch_size, 5793.0));
+            assert!(!cell(&bounded_mask, batch_size, 255.0));
+            assert!(!cell(&bounded_mask, batch_size, 256.0));
+            assert!(cell(&bounded_mask, batch_size, 257.0));
+            assert!(cell(&bounded_mask, batch_size, 5793.0));
         }
+        // The allocation staircase over the full domain: a 1M context is
+        // profilable at small batch and only drops once the page set does not
+        // fit, and a large batch is fine at every shorter context.
+        assert!(!cell(&full_mask, 1.0, 1_048_576.0));
+        assert!(!cell(&full_mask, 128.0, 1_048_576.0));
+        assert!(cell(&full_mask, 256.0, 1_048_576.0));
+        assert!(cell(&full_mask, 512.0, 524_288.0));
+        assert!(!cell(&full_mask, 512.0, 262_144.0));
     }
 
     #[test]
@@ -308,11 +339,11 @@ mod tests {
 
     #[test]
     fn enumerate_matches_the_full_python_wire_schema_before_masking() {
-        let cfg = config(131072);
+        let cfg = config(FULL_MAX_MODEL_LEN);
         let grid = DsaPagedMqaLogitsDecodeSpec::sweep_grid(&cfg);
         let payloads = DsaPagedMqaLogitsDecodeSpec::enumerate(&cfg, &grid, DEEPGEMM_BACKEND);
 
-        assert_eq!(payloads.len(), 306);
+        assert_eq!(payloads.len(), 378);
         let expected_names = [
             "backend",
             "batch_size",
@@ -339,12 +370,12 @@ mod tests {
         }
 
         assert_payload(&payloads[0], DEEPGEMM_BACKEND, 1, 1);
-        assert_payload(&payloads[16], DEEPGEMM_BACKEND, 1, 65536);
-        assert_payload(&payloads[17], DEEPGEMM_BACKEND, 2, 1);
-        assert_payload(&payloads[178], DEEPGEMM_BACKEND, 130, 512);
-        assert_payload(&payloads[250], DEEPGEMM_BACKEND, 185, 5793);
-        assert_payload(&payloads[280], DEEPGEMM_BACKEND, 384, 512);
-        assert_payload(payloads.last().unwrap(), DEEPGEMM_BACKEND, 512, 65536);
+        assert_payload(&payloads[20], DEEPGEMM_BACKEND, 1, 1_048_576);
+        assert_payload(&payloads[21], DEEPGEMM_BACKEND, 2, 1);
+        assert_payload(&payloads[218], DEEPGEMM_BACKEND, 130, 512);
+        assert_payload(&payloads[306], DEEPGEMM_BACKEND, 185, 5793);
+        assert_payload(&payloads[344], DEEPGEMM_BACKEND, 384, 512);
+        assert_payload(payloads.last().unwrap(), DEEPGEMM_BACKEND, 512, 1_048_576);
     }
 
     fn assert_payload(
@@ -358,7 +389,10 @@ mod tests {
         assert_eq!(fields.get("batch_size"), Some(&Value::from(batch_size)));
         assert_eq!(fields.get("context_len"), Some(&Value::from(context_len)));
         assert_eq!(fields.get("next_n"), Some(&Value::from(1_u32)));
-        assert_eq!(fields.get("max_model_len"), Some(&Value::from(131072_u32)));
+        assert_eq!(
+            fields.get("max_model_len"),
+            Some(&Value::from(FULL_MAX_MODEL_LEN))
+        );
         assert_eq!(fields.get("num_heads"), Some(&Value::from(64_u32)));
         assert_eq!(fields.get("head_dim"), Some(&Value::from(128_u32)));
         assert_eq!(fields.get("block_size"), Some(&Value::from(64_u32)));

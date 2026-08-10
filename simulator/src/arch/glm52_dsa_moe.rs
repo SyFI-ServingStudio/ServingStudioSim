@@ -32,13 +32,13 @@ use crate::timing::{
     LeafMetrics, PerfApiBridge, Probe, SlotInput,
 };
 use crate::worklet::{
-    Glm52DenseFfnLocalWorklet, Glm52DenseFfnLocalWorkletConfig,
-    Glm52DenseFfnLocalWorkletInput, Glm52DenseFfnLocalWorkletResolved,
-    Glm52DsaAttnLocalDecodeInput, Glm52DsaAttnLocalWorklet, Glm52DsaAttnLocalWorkletConfig,
-    Glm52DsaAttnLocalWorkletInput, Glm52DsaAttnLocalWorkletResolved, Glm52MoeRouterLocalWorklet,
-    Glm52MoeRouterLocalWorkletConfig, Glm52MoeRouterLocalWorkletInput,
-    Glm52MoeRouterLocalWorkletResolved, Glm52MtpHeadLocalWorklet, Glm52MtpHeadLocalWorkletConfig,
-    Glm52MtpHeadLocalWorkletInput, Glm52MtpHeadLocalWorkletResolved, Glm52MtpPreludeLocalWorklet,
+    Glm52DenseFfnLocalWorklet, Glm52DenseFfnLocalWorkletConfig, Glm52DenseFfnLocalWorkletInput,
+    Glm52DenseFfnLocalWorkletResolved, Glm52DsaAttnLocalDecodeInput, Glm52DsaAttnLocalWorklet,
+    Glm52DsaAttnLocalWorkletConfig, Glm52DsaAttnLocalWorkletInput,
+    Glm52DsaAttnLocalWorkletResolved, Glm52MoeRouterLocalWorklet, Glm52MoeRouterLocalWorkletConfig,
+    Glm52MoeRouterLocalWorkletInput, Glm52MoeRouterLocalWorkletResolved, Glm52MtpHeadLocalWorklet,
+    Glm52MtpHeadLocalWorkletConfig, Glm52MtpHeadLocalWorkletInput,
+    Glm52MtpHeadLocalWorkletResolved, Glm52MtpPreludeLocalWorklet,
     Glm52MtpPreludeLocalWorkletConfig, Glm52MtpPreludeLocalWorkletInput,
     Glm52MtpPreludeLocalWorkletResolved, Glm52SharedExpertLocalWorklet,
     Glm52SharedExpertLocalWorkletConfig, Glm52SharedExpertLocalWorkletInput,
@@ -48,7 +48,12 @@ use crate::worklet::{
 };
 
 const ARCH_KIND: &str = "glm52_dsa_moe";
-const TIMING_MAX_MODEL_LEN: u32 = 131_072;
+/// Accepted L1 timing domain, in tokens. The checkpoint advertises 1,048,576 and
+/// the profiled DSA grids now reach it, so a full-context coding-agent session
+/// replays without an extrapolated attention slot. It is a hard bound, not a
+/// hint: a request past it bails rather than silently reading off the end of the
+/// measured surface.
+const TIMING_MAX_MODEL_LEN: u32 = 1_048_576;
 const NUM_LAYERS: u32 = 78;
 const NUM_DENSE_LAYERS: u32 = 3;
 const NUM_INITIAL_SHARED_LAYERS: u32 = 3;
@@ -78,7 +83,10 @@ const NUM_MTP_LAYERS: u32 = 1;
 const CACHE_BLOCK_SIZE: u32 = 64;
 const QUANT_BLOCK_SIZE: u32 = 128;
 const SOFTMAX_SCALE_DENOMINATOR: u32 = 16;
-const LOGITS_ROW_STRIDE: u32 = 131_072;
+/// Padded logits row width, mirroring production's `max_model_len`-sized
+/// allocation. It tracks [`TIMING_MAX_MODEL_LEN`] and is part of the topk
+/// kernels' cache identity, so changing either invalidates their profiled rows.
+const LOGITS_ROW_STRIDE: u32 = 1_048_576;
 
 const FULL_INDEX_LAYERS: [u32; 21] = [
     0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74,
@@ -549,11 +557,7 @@ pub fn build_configs(
         )));
     }
     let (expert_dtype, expert_backends, p2p_backends) = if fp8 {
-        (
-            DType::Fp8E4m3,
-            FP8_GROUPED_GEMM_BACKENDS,
-            FP8_P2P_BACKENDS,
-        )
+        (DType::Fp8E4m3, FP8_GROUPED_GEMM_BACKENDS, FP8_P2P_BACKENDS)
     } else {
         (DType::Bf16, GROUPED_GEMM_BACKENDS, P2P_BACKENDS)
     };
@@ -1282,8 +1286,13 @@ impl Glm52DsaMoeModel {
         }
         let root = CostNode::Labeled {
             label: format!(
-                "{} (Glm52DsaMoeModel) [EP{}; attention TP1/DP{}; MTP={:?}; timing_context<=131072]",
-                self.name, self.ep_size, self.num_attn_dp_groups, self.mtp_mode
+                "{} (Glm52DsaMoeModel) [EP{}; attention TP1/DP{}; MTP={:?}; \
+                 timing_context<={}]",
+                self.name,
+                self.ep_size,
+                self.num_attn_dp_groups,
+                self.mtp_mode,
+                TIMING_MAX_MODEL_LEN
             ),
             child: Box::new(CostNode::Sum(children)),
         };
@@ -1649,11 +1658,7 @@ fn expected_slot_count(ep_size: u16, fp8: bool, mtp_mode: Glm52MtpMode) -> usize
     let expert_slots = EXPERT_SLOTS + usize::from(fp8) * 2;
     let dense = ep * (ATTN_FULL_SLOTS + DENSE_FFN_SLOTS);
     let sparse_shared = ep
-        * (ATTN_SHARED_SLOTS
-            + ROUTER_SLOTS
-            + expert_slots
-            + SHARED_EXPERT_SLOTS
-            + FINALIZE_SLOTS)
+        * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + expert_slots + SHARED_EXPERT_SLOTS + FINALIZE_SLOTS)
         + DISPATCH_SLOTS
         + COMBINE_SLOTS;
     let sparse_full = sparse_shared + ep * (ATTN_FULL_SLOTS - ATTN_SHARED_SLOTS);
@@ -1826,10 +1831,7 @@ mod tests {
             cfg.dense_full_index_attention.single_gemm_backends,
             vec!["torch_linear"]
         );
-        assert_eq!(
-            cfg.dense_full_index_attention.gemm_dtype,
-            DType::Bf16
-        );
+        assert_eq!(cfg.dense_full_index_attention.gemm_dtype, DType::Bf16);
         assert_eq!(
             cfg.dense_full_index_attention.q_absorb_backends,
             vec!["torch_mla_q_absorb_glm52"]
@@ -1847,7 +1849,10 @@ mod tests {
             vec!["vllm_deepgemm_fp8"]
         );
         assert_eq!(cfg.moe_expert_compute[0].dtype, DType::Bf16);
-        assert_eq!(cfg.moe_expert_compute[0].grouped_gemm_backends, vec!["torch"]);
+        assert_eq!(
+            cfg.moe_expert_compute[0].grouped_gemm_backends,
+            vec!["torch"]
+        );
         assert_eq!(cfg.moe_dispatch.backends, vec!["nccl"]);
         assert_eq!(cfg.moe_combine.backends, vec!["nccl"]);
         assert_eq!(cfg.moe_dispatch.dtype, DType::Bf16);
@@ -1887,7 +1892,10 @@ mod tests {
 
         assert_eq!(cfg.moe_expert_compute[0].dtype, DType::Fp8E4m3);
         assert_eq!(cfg.moe_expert_compute[0].activation_dtype, DType::Bf16);
-        assert_eq!(cfg.moe_expert_compute[0].grouped_gemm_backends, vec!["deepgemm"]);
+        assert_eq!(
+            cfg.moe_expert_compute[0].grouped_gemm_backends,
+            vec!["deepgemm"]
+        );
         assert_eq!(
             cfg.moe_expert_compute[0].fp8_grouped_gemm_backends,
             vec!["flashinfer_trtllm"]
@@ -1910,38 +1918,85 @@ mod tests {
             assert_eq!(attention.indexer_gemm_backends, vec!["deepgemm"]);
             assert_eq!(attention.gemm_dtype, DType::Fp8E4m3);
             assert_eq!(attention.base_dtype, DType::Bf16);
-            assert_eq!(attention.q_absorb_backends, vec!["torch_mla_q_absorb_glm52"]);
+            assert_eq!(
+                attention.q_absorb_backends,
+                vec!["torch_mla_q_absorb_glm52"]
+            );
             assert_eq!(attention.v_up_backends, vec!["torch_mla_v_up_glm52"]);
         }
 
         let resolved = resolve_configs(&cfg);
         assert_eq!(
-            resolved.moe_expert_compute[0].gate_up_fp8.as_ref().unwrap().gemm.dtype,
+            resolved.moe_expert_compute[0]
+                .gate_up_fp8
+                .as_ref()
+                .unwrap()
+                .gemm
+                .dtype,
             DType::Fp8E4m3
         );
         assert_eq!(
-            resolved.moe_expert_compute[0].down_fp8.as_ref().unwrap().gemm.dtype,
+            resolved.moe_expert_compute[0]
+                .down_fp8
+                .as_ref()
+                .unwrap()
+                .gemm
+                .dtype,
             DType::Fp8E4m3
         );
-        assert_eq!(resolved.moe_expert_compute[0].act.input_bytes_per_token, 2 * MOE_INTERMEDIATE_DIM * 2);
+        assert_eq!(
+            resolved.moe_expert_compute[0].act.input_bytes_per_token,
+            2 * MOE_INTERMEDIATE_DIM * 2
+        );
         assert_eq!(resolved.dense_ffn.gate_up_proj.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.dense_ffn.down_proj.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.dense_ffn.post_attn_add_rms_norm.dtype, DType::Bf16);
-        assert_eq!(resolved.dense_ffn.silu_and_mul.input_bytes_per_token, 2 * DENSE_INTERMEDIATE_DIM * 2);
-        assert_eq!(resolved.sparse_router.router_gemm_bf16_proxy.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.sparse_router.post_attn_add_rms_norm.dtype, DType::Bf16);
-        assert_eq!(resolved.sparse_router.raw_cfg.router_semantic_dtype, DType::Fp32);
+        assert_eq!(
+            resolved.dense_ffn.silu_and_mul.input_bytes_per_token,
+            2 * DENSE_INTERMEDIATE_DIM * 2
+        );
+        assert_eq!(
+            resolved.sparse_router.router_gemm_bf16_proxy.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved.sparse_router.post_attn_add_rms_norm.dtype,
+            DType::Bf16
+        );
+        assert_eq!(
+            resolved.sparse_router.raw_cfg.router_semantic_dtype,
+            DType::Fp32
+        );
         assert_eq!(resolved.shared_expert.gate_up_proj.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.shared_expert.down_proj.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.shared_expert.silu_and_mul.input_bytes_per_token, 2 * MOE_INTERMEDIATE_DIM * 2);
+        assert_eq!(
+            resolved.shared_expert.silu_and_mul.input_bytes_per_token,
+            2 * MOE_INTERMEDIATE_DIM * 2
+        );
         assert_eq!(resolved.lm_head.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.lm_head.backends, vec!["deepgemm"]);
-        assert_eq!(resolved.dense_full_index_attention.fused_qkv_a_proj.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.dense_full_index_attention.q_b_proj.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.dense_full_index_attention.o_proj.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.dense_full_index_attention.q_absorb.dtype, DType::Bf16);
+        assert_eq!(
+            resolved.dense_full_index_attention.fused_qkv_a_proj.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved.dense_full_index_attention.q_b_proj.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved.dense_full_index_attention.o_proj.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved.dense_full_index_attention.q_absorb.dtype,
+            DType::Bf16
+        );
         assert_eq!(resolved.dense_full_index_attention.v_up.dtype, DType::Bf16);
-        let indexer = resolved.dense_full_index_attention.indexer.as_ref().unwrap();
+        let indexer = resolved
+            .dense_full_index_attention
+            .indexer
+            .as_ref()
+            .unwrap();
         assert_eq!(indexer.input_dtype, DType::Bf16);
         assert_eq!(indexer.gemm_dtype, DType::Fp8E4m3);
         assert_eq!(indexer.cache_dtype, DType::Fp8E4m3);
@@ -1958,16 +2013,35 @@ mod tests {
         assert_eq!(cfg.final_norm.dtype, DType::Bf16);
         assert_eq!(cfg.mtp_prelude.as_ref().unwrap().dtype, DType::Bf16);
         assert_eq!(cfg.mtp_prelude.as_ref().unwrap().gemm_dtype, DType::Fp8E4m3);
-        assert_eq!(
-            cfg.mtp_attention.as_ref().unwrap().base_dtype,
-            DType::Bf16
-        );
+        assert_eq!(cfg.mtp_attention.as_ref().unwrap().base_dtype, DType::Bf16);
         assert_eq!(cfg.mtp_head.as_ref().unwrap().dtype, DType::Bf16);
         assert_eq!(cfg.mtp_head.as_ref().unwrap().gemm_dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.mtp_prelude.as_ref().unwrap().eh_proj.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.mtp_prelude.as_ref().unwrap().embedding_rms_norm.dtype, DType::Bf16);
-        assert_eq!(resolved.mtp_head.as_ref().unwrap().lm_head.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.mtp_head.as_ref().unwrap().shared_head_rms_norm.dtype, DType::Bf16);
+        assert_eq!(
+            resolved.mtp_prelude.as_ref().unwrap().eh_proj.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved
+                .mtp_prelude
+                .as_ref()
+                .unwrap()
+                .embedding_rms_norm
+                .dtype,
+            DType::Bf16
+        );
+        assert_eq!(
+            resolved.mtp_head.as_ref().unwrap().lm_head.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved
+                .mtp_head
+                .as_ref()
+                .unwrap()
+                .shared_head_rms_norm
+                .dtype,
+            DType::Bf16
+        );
     }
 
     #[test]
@@ -2041,14 +2115,29 @@ mod tests {
         assert_eq!(78 - FULL_INDEX_LAYERS.len(), 57);
         assert_eq!(expected_slot_count(8, false, Glm52MtpMode::Off), 1_026);
         assert_eq!(expected_slot_count(8, true, Glm52MtpMode::Off), 1_074);
-        assert_eq!(expected_slot_count(8, false, Glm52MtpMode::FullIndex), 1_424);
+        assert_eq!(
+            expected_slot_count(8, false, Glm52MtpMode::FullIndex),
+            1_424
+        );
         assert_eq!(expected_slot_count(8, true, Glm52MtpMode::FullIndex), 1_488);
-        assert_eq!(expected_slot_count(8, false, Glm52MtpMode::IndexShare), 1_304);
-        assert_eq!(expected_slot_count(8, true, Glm52MtpMode::IndexShare), 1_368);
+        assert_eq!(
+            expected_slot_count(8, false, Glm52MtpMode::IndexShare),
+            1_304
+        );
+        assert_eq!(
+            expected_slot_count(8, true, Glm52MtpMode::IndexShare),
+            1_368
+        );
         for ep in [1_u16, 2, 4, 8, 16] {
             let ep = usize::from(ep);
-            assert_eq!(expected_slot_count(ep as u16, false, Glm52MtpMode::Off), 126 * ep + 18);
-            assert_eq!(expected_slot_count(ep as u16, true, Glm52MtpMode::Off), 132 * ep + 18);
+            assert_eq!(
+                expected_slot_count(ep as u16, false, Glm52MtpMode::Off),
+                126 * ep + 18
+            );
+            assert_eq!(
+                expected_slot_count(ep as u16, true, Glm52MtpMode::Off),
+                132 * ep + 18
+            );
             assert_eq!(
                 expected_slot_count(ep as u16, false, Glm52MtpMode::FullIndex),
                 175 * ep + 24

@@ -270,10 +270,10 @@ def test_valid_counts_rejects_ambiguous_or_nonminimal_encodings(
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"num_queries": 0}, "1..4096"),
-        ({"num_queries": 4097}, "1..4096"),
-        ({"num_cache_tokens": 0}, "1..131072"),
-        ({"num_cache_tokens": 131073}, "1..131072"),
+        ({"num_queries": 0}, "num_queries must be >= 1"),
+        ({"num_queries": -1}, "num_queries must be >= 1"),
+        ({"num_cache_tokens": 0}, "num_cache_tokens must be >= 1"),
+        ({"num_cache_tokens": -1}, "num_cache_tokens must be >= 1"),
         ({"num_heads": 63}, "num_heads must be 64"),
         ({"num_kv_heads": 2}, "num_kv_heads must be 1"),
         ({"selected_k": 1024}, "selected_k must be 2048"),

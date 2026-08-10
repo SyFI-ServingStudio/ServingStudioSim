@@ -201,10 +201,14 @@ def _validate_args(
         if type(value) is not int:
             raise TypeError(f"{name} must be an integer")
 
-    if not 1 <= num_queries <= 4096:
-        raise ProfilerNotImplemented("num_queries must be in 1..4096")
-    if not 1 <= num_cache_tokens <= 131072:
-        raise ProfilerNotImplemented("num_cache_tokens must be in 1..131072")
+    # Positivity is the only shape law here. The former 4,096 / 131,072 ceilings
+    # recorded where the accuracy test had been run, not what the kernel accepts,
+    # and every context extension had to chase them. Operand size is bounded by
+    # the sweep grid's `infeasible_mask` instead.
+    if num_queries < 1:
+        raise ProfilerNotImplemented(f"num_queries must be >= 1, got {num_queries}")
+    if num_cache_tokens < 1:
+        raise ProfilerNotImplemented(f"num_cache_tokens must be >= 1, got {num_cache_tokens}")
     expected = {
         "num_heads": (num_heads, _NUM_HEADS),
         "num_kv_heads": (num_kv_heads, _NUM_KV_HEADS),

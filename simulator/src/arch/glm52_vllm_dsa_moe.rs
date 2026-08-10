@@ -49,8 +49,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::arch::glm52_dsa_moe::{Glm52ModelCfg, Glm52MtpMode};
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::glm52_dsa_moe::{Glm52ModelCfg, Glm52MtpMode};
 use crate::common::Fabric;
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -68,23 +68,28 @@ use crate::timing::{
     LeafMetrics, PerfApiBridge, Probe, SlotInput,
 };
 use crate::worklet::{
-    VllmGlm52DenseFfnLocalWorklet, VllmGlm52DenseFfnLocalWorkletConfig,
-    VllmGlm52DenseFfnLocalWorkletInput, VllmGlm52DenseFfnLocalWorkletResolved,
-    VllmGlm52DsaAttnLocalDecodeInput, VllmGlm52DsaAttnLocalWorklet, VllmGlm52DsaAttnLocalWorkletConfig,
-    VllmGlm52DsaAttnLocalWorkletInput, VllmGlm52DsaAttnLocalWorkletResolved, Glm52MoeRouterLocalWorklet,
-    Glm52MoeRouterLocalWorkletConfig, Glm52MoeRouterLocalWorkletInput,
+    Glm52MoeRouterLocalWorklet, Glm52MoeRouterLocalWorkletConfig, Glm52MoeRouterLocalWorkletInput,
     Glm52MoeRouterLocalWorkletResolved, Glm52MtpHeadLocalWorklet, Glm52MtpHeadLocalWorkletConfig,
     Glm52MtpHeadLocalWorkletInput, Glm52MtpHeadLocalWorkletResolved, Glm52MtpPreludeLocalWorklet,
     Glm52MtpPreludeLocalWorkletConfig, Glm52MtpPreludeLocalWorkletInput,
-    Glm52MtpPreludeLocalWorkletResolved, VllmGlm52SharedExpertLocalWorklet,
-    VllmGlm52SharedExpertLocalWorkletConfig, VllmGlm52SharedExpertLocalWorkletInput,
-    VllmGlm52SharedExpertLocalWorkletResolved, MoeExpertComputeLocalWorklet,
+    Glm52MtpPreludeLocalWorkletResolved, MoeExpertComputeLocalWorklet,
     MoeExpertComputeLocalWorkletConfig, MoeExpertComputeLocalWorkletInput,
-    MoeExpertComputeLocalWorkletResolved,
+    MoeExpertComputeLocalWorkletResolved, VllmGlm52DenseFfnLocalWorklet,
+    VllmGlm52DenseFfnLocalWorkletConfig, VllmGlm52DenseFfnLocalWorkletInput,
+    VllmGlm52DenseFfnLocalWorkletResolved, VllmGlm52DsaAttnLocalDecodeInput,
+    VllmGlm52DsaAttnLocalWorklet, VllmGlm52DsaAttnLocalWorkletConfig,
+    VllmGlm52DsaAttnLocalWorkletInput, VllmGlm52DsaAttnLocalWorkletResolved,
+    VllmGlm52SharedExpertLocalWorklet, VllmGlm52SharedExpertLocalWorkletConfig,
+    VllmGlm52SharedExpertLocalWorkletInput, VllmGlm52SharedExpertLocalWorkletResolved,
 };
 
 const ARCH_KIND: &str = "glm52_vllm_dsa_moe";
-const TIMING_MAX_MODEL_LEN: u32 = 131_072;
+/// Accepted L1 timing domain, in tokens. The checkpoint advertises 1,048,576 and
+/// the profiled DSA grids now reach it, so a full-context coding-agent session
+/// replays without an extrapolated attention slot. It is a hard bound, not a
+/// hint: a request past it bails rather than silently reading off the end of the
+/// measured surface.
+const TIMING_MAX_MODEL_LEN: u32 = 1_048_576;
 const NUM_LAYERS: u32 = 78;
 const NUM_DENSE_LAYERS: u32 = 3;
 const NUM_INITIAL_SHARED_LAYERS: u32 = 3;
@@ -114,7 +119,10 @@ const NUM_MTP_LAYERS: u32 = 1;
 const CACHE_BLOCK_SIZE: u32 = 64;
 const QUANT_BLOCK_SIZE: u32 = 128;
 const SOFTMAX_SCALE_DENOMINATOR: u32 = 16;
-const LOGITS_ROW_STRIDE: u32 = 131_072;
+/// Padded logits row width, mirroring production's `max_model_len`-sized
+/// allocation. It tracks [`TIMING_MAX_MODEL_LEN`] and is part of the topk
+/// kernels' cache identity, so changing either invalidates their profiled rows.
+const LOGITS_ROW_STRIDE: u32 = 1_048_576;
 
 const FULL_INDEX_LAYERS: [u32; 21] = [
     0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74,
@@ -713,7 +721,9 @@ pub fn resolve_configs(cfgs: &Glm52VllmDsaMoeConfigs) -> Glm52VllmDsaMoeResolved
         initial_shared_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
             &cfgs.initial_shared_attention,
         ),
-        cycle_full_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(&cfgs.cycle_full_attention),
+        cycle_full_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
+            &cfgs.cycle_full_attention,
+        ),
         cycle_shared_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
             &cfgs.cycle_shared_attention,
         ),
@@ -1336,8 +1346,13 @@ impl Glm52VllmDsaMoeModel {
         }
         let root = CostNode::Labeled {
             label: format!(
-                "{} (Glm52VllmDsaMoeModel) [EP{}; attention TP1/DP{}; MTP={:?}; timing_context<=131072]",
-                self.name, self.ep_size, self.num_attn_dp_groups, self.mtp_mode
+                "{} (Glm52VllmDsaMoeModel) [EP{}; attention TP1/DP{}; MTP={:?}; \
+                 timing_context<={}]",
+                self.name,
+                self.ep_size,
+                self.num_attn_dp_groups,
+                self.mtp_mode,
+                TIMING_MAX_MODEL_LEN
             ),
             child: Box::new(CostNode::Sum(children)),
         };
@@ -1511,13 +1526,13 @@ impl NormalizedBatch {
                 attention_input: VllmGlm52DsaAttnLocalWorkletInput {
                     num_new_tokens: group.decode_tokens,
                     prefill_query_cache_pairs: Vec::new(),
-                    decode: group
-                        .decode_context
-                        .map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
+                    decode: group.decode_context.map(|context_len| {
+                        VllmGlm52DsaAttnLocalDecodeInput {
                             batch_size: group.decode_tokens,
                             context_len,
                             requires_padding: false,
-                        }),
+                        }
+                    }),
                 },
             })
             .collect();
@@ -1847,7 +1862,10 @@ mod tests {
             rows_per_token / f64::from(ROUTER_TOP_K),
         );
         let drift = (f64::from(send) - f64::from(recv)).abs() / f64::from(send);
-        assert!(drift < 0.01, "balanced batch should be on the diagonal: {send} vs {recv}");
+        assert!(
+            drift < 0.01,
+            "balanced batch should be on the diagonal: {send} vs {recv}"
+        );
 
         // A hot shard pulls the receive side up without touching the send side.
         let mut skewed_ppm = uniform_ppm.clone();
@@ -2000,10 +2018,7 @@ mod tests {
             cfg.dense_full_index_attention.single_gemm_backends,
             vec!["torch_linear"]
         );
-        assert_eq!(
-            cfg.dense_full_index_attention.gemm_dtype,
-            DType::Bf16
-        );
+        assert_eq!(cfg.dense_full_index_attention.gemm_dtype, DType::Bf16);
         assert_eq!(
             cfg.dense_full_index_attention.q_absorb_backends,
             vec!["torch_mla_q_absorb_glm52"]
@@ -2021,7 +2036,10 @@ mod tests {
             vec!["vllm_deepgemm_fp8"]
         );
         assert_eq!(cfg.moe_expert_compute[0].dtype, DType::Bf16);
-        assert_eq!(cfg.moe_expert_compute[0].grouped_gemm_backends, vec!["torch"]);
+        assert_eq!(
+            cfg.moe_expert_compute[0].grouped_gemm_backends,
+            vec!["torch"]
+        );
         // The transfer is the profiled flashinfer MNNVL all-to-all, keyed by the
         // bf16 wire width vLLM actually sends (quantisation is deferred past it).
         assert_eq!(cfg.moe_dispatch.backends, vec!["flashinfer_mnnvl"]);
@@ -2081,7 +2099,10 @@ mod tests {
 
         assert_eq!(cfg.moe_expert_compute[0].dtype, DType::Fp8E4m3);
         assert_eq!(cfg.moe_expert_compute[0].activation_dtype, DType::Bf16);
-        assert_eq!(cfg.moe_expert_compute[0].grouped_gemm_backends, vec!["deepgemm"]);
+        assert_eq!(
+            cfg.moe_expert_compute[0].grouped_gemm_backends,
+            vec!["deepgemm"]
+        );
         assert_eq!(
             cfg.moe_expert_compute[0].fp8_grouped_gemm_backends,
             vec!["flashinfer_trtllm"]
@@ -2107,40 +2128,87 @@ mod tests {
             assert_eq!(attention.indexer_gemm_backends, vec!["deepgemm"]);
             assert_eq!(attention.gemm_dtype, DType::Fp8E4m3);
             assert_eq!(attention.base_dtype, DType::Bf16);
-            assert_eq!(attention.q_absorb_backends, vec!["torch_mla_q_absorb_glm52"]);
+            assert_eq!(
+                attention.q_absorb_backends,
+                vec!["torch_mla_q_absorb_glm52"]
+            );
             assert_eq!(attention.v_up_backends, vec!["torch_mla_v_up_glm52"]);
         }
 
         let resolved = resolve_configs(&cfg);
         assert_eq!(
-            resolved.moe_expert_compute[0].gate_up_fp8.as_ref().unwrap().gemm.dtype,
+            resolved.moe_expert_compute[0]
+                .gate_up_fp8
+                .as_ref()
+                .unwrap()
+                .gemm
+                .dtype,
             DType::Fp8E4m3
         );
         assert_eq!(
-            resolved.moe_expert_compute[0].down_fp8.as_ref().unwrap().gemm.dtype,
+            resolved.moe_expert_compute[0]
+                .down_fp8
+                .as_ref()
+                .unwrap()
+                .gemm
+                .dtype,
             DType::Fp8E4m3
         );
-        assert_eq!(resolved.moe_expert_compute[0].act.input_bytes_per_token, 2 * MOE_INTERMEDIATE_DIM * 2);
+        assert_eq!(
+            resolved.moe_expert_compute[0].act.input_bytes_per_token,
+            2 * MOE_INTERMEDIATE_DIM * 2
+        );
         assert_eq!(resolved.dense_ffn.gate_up_proj.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.dense_ffn.down_proj.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.dense_ffn.post_attn_add_rms_norm.dtype, DType::Bf16);
-        assert_eq!(resolved.dense_ffn.silu_and_mul.input_bytes_per_token, 2 * DENSE_INTERMEDIATE_DIM * 2);
-        assert_eq!(resolved.sparse_router.router_gemm_bf16_proxy.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.sparse_router.post_attn_add_rms_norm.dtype, DType::Bf16);
-        assert_eq!(resolved.sparse_router.raw_cfg.router_semantic_dtype, DType::Fp32);
+        assert_eq!(
+            resolved.dense_ffn.silu_and_mul.input_bytes_per_token,
+            2 * DENSE_INTERMEDIATE_DIM * 2
+        );
+        assert_eq!(
+            resolved.sparse_router.router_gemm_bf16_proxy.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved.sparse_router.post_attn_add_rms_norm.dtype,
+            DType::Bf16
+        );
+        assert_eq!(
+            resolved.sparse_router.raw_cfg.router_semantic_dtype,
+            DType::Fp32
+        );
         assert_eq!(resolved.shared_expert.gate_up_proj.dtype, DType::Fp8E4m3);
         assert_eq!(resolved.shared_expert.down_proj.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.shared_expert.silu_and_mul.input_bytes_per_token, 2 * MOE_INTERMEDIATE_DIM * 2);
+        assert_eq!(
+            resolved.shared_expert.silu_and_mul.input_bytes_per_token,
+            2 * MOE_INTERMEDIATE_DIM * 2
+        );
         // lm_head stays BF16 even under `fp8`: the checkpoint's
         // `modules_to_not_convert` excludes it, so it never reaches the FP8 GEMM.
         assert_eq!(resolved.lm_head.dtype, DType::Bf16);
         assert_eq!(resolved.lm_head.backends, vec!["torch_linear"]);
-        assert_eq!(resolved.dense_full_index_attention.fused_qkv_a_proj.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.dense_full_index_attention.q_b_proj.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.dense_full_index_attention.o_proj.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.dense_full_index_attention.q_absorb.dtype, DType::Bf16);
+        assert_eq!(
+            resolved.dense_full_index_attention.fused_qkv_a_proj.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved.dense_full_index_attention.q_b_proj.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved.dense_full_index_attention.o_proj.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved.dense_full_index_attention.q_absorb.dtype,
+            DType::Bf16
+        );
         assert_eq!(resolved.dense_full_index_attention.v_up.dtype, DType::Bf16);
-        let indexer = resolved.dense_full_index_attention.indexer.as_ref().unwrap();
+        let indexer = resolved
+            .dense_full_index_attention
+            .indexer
+            .as_ref()
+            .unwrap();
         assert_eq!(indexer.input_dtype, DType::Bf16);
         assert_eq!(indexer.gemm_dtype, DType::Fp8E4m3);
         assert_eq!(indexer.cache_dtype, DType::Fp8E4m3);
@@ -2157,16 +2225,35 @@ mod tests {
         assert_eq!(cfg.final_norm.dtype, DType::Bf16);
         assert_eq!(cfg.mtp_prelude.as_ref().unwrap().dtype, DType::Bf16);
         assert_eq!(cfg.mtp_prelude.as_ref().unwrap().gemm_dtype, DType::Fp8E4m3);
-        assert_eq!(
-            cfg.mtp_attention.as_ref().unwrap().base_dtype,
-            DType::Bf16
-        );
+        assert_eq!(cfg.mtp_attention.as_ref().unwrap().base_dtype, DType::Bf16);
         assert_eq!(cfg.mtp_head.as_ref().unwrap().dtype, DType::Bf16);
         assert_eq!(cfg.mtp_head.as_ref().unwrap().gemm_dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.mtp_prelude.as_ref().unwrap().eh_proj.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.mtp_prelude.as_ref().unwrap().embedding_rms_norm.dtype, DType::Bf16);
-        assert_eq!(resolved.mtp_head.as_ref().unwrap().lm_head.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.mtp_head.as_ref().unwrap().shared_head_rms_norm.dtype, DType::Bf16);
+        assert_eq!(
+            resolved.mtp_prelude.as_ref().unwrap().eh_proj.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved
+                .mtp_prelude
+                .as_ref()
+                .unwrap()
+                .embedding_rms_norm
+                .dtype,
+            DType::Bf16
+        );
+        assert_eq!(
+            resolved.mtp_head.as_ref().unwrap().lm_head.dtype,
+            DType::Fp8E4m3
+        );
+        assert_eq!(
+            resolved
+                .mtp_head
+                .as_ref()
+                .unwrap()
+                .shared_head_rms_norm
+                .dtype,
+            DType::Bf16
+        );
     }
 
     #[test]
@@ -2292,7 +2379,10 @@ mod tests {
         // equivalent of: combine's zero fill and its top-k reduction, split out
         // of the profiled transfer so that leaf's cache stays two-dimensional.
         // Three sparse variants without MTP, four with it.
-        assert_eq!(expected_slot_count(8, false, Glm52MtpMode::Off), 1_041 + 3 * 2);
+        assert_eq!(
+            expected_slot_count(8, false, Glm52MtpMode::Off),
+            1_041 + 3 * 2
+        );
         assert_eq!(
             expected_slot_count(8, false, Glm52MtpMode::FullIndex),
             1_444 + 4 * 2
@@ -2323,8 +2413,14 @@ mod tests {
             // The `+ 15` / `+ 20` are the rank-independent collectives: each
             // sparse variant contributes `DISPATCH_SLOTS + COMBINE_SLOTS` = 5,
             // over three variants without MTP and four with it.
-            assert_eq!(expected_slot_count(ep as u16, false, Glm52MtpMode::Off), 129 * ep + 15);
-            assert_eq!(expected_slot_count(ep as u16, true, Glm52MtpMode::Off), 157 * ep + 15);
+            assert_eq!(
+                expected_slot_count(ep as u16, false, Glm52MtpMode::Off),
+                129 * ep + 15
+            );
+            assert_eq!(
+                expected_slot_count(ep as u16, true, Glm52MtpMode::Off),
+                157 * ep + 15
+            );
             assert_eq!(
                 expected_slot_count(ep as u16, false, Glm52MtpMode::FullIndex),
                 179 * ep + 20

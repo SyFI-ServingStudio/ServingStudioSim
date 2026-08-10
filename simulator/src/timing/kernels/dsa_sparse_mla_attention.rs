@@ -15,28 +15,30 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
-const UNIFORM_QUERY_AXIS: [u32; 23] = [
+const UNIFORM_QUERY_AXIS: [u32; 27] = [
     1, 2, 4, 8, 16, 32, 64, 127, 128, 129, 131, 132, 133, 255, 256, 257, 263, 264, 265, 512, 1024,
-    2048, 4096,
+    2048, 4096, 8192, 16384, 32768, 65536,
 ];
-const UNIFORM_CACHE_AXIS: [u32; 27] = [
+const UNIFORM_CACHE_AXIS: [u32; 30] = [
     1, 2, 4, 6, 8, 11, 16, 32, 63, 64, 65, 91, 127, 128, 129, 256, 512, 1024, 2047, 2048, 2049,
-    4096, 8192, 16384, 32768, 65536, 131072,
+    4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576,
 ];
-const CAUSAL_QUERY_AXIS: [u32; 33] = [
+const CAUSAL_QUERY_AXIS: [u32; 37] = [
     1, 2, 3, 4, 6, 8, 11, 16, 23, 32, 45, 64, 90, 127, 128, 129, 130, 131, 132, 133, 200, 254, 255,
-    256, 257, 258, 263, 264, 265, 512, 1024, 2048, 4096,
+    256, 257, 258, 263, 264, 265, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
 ];
-const CAUSAL_CACHE_AXIS: [u32; 38] = [
+const CAUSAL_CACHE_AXIS: [u32; 41] = [
     1, 2, 3, 4, 6, 8, 11, 16, 23, 32, 45, 63, 64, 65, 90, 127, 128, 129, 130, 182, 200, 255, 256,
     260, 511, 512, 513, 724, 1024, 2047, 2048, 2049, 4096, 8192, 16384, 32768, 65536, 131072,
+    262144, 524288, 1048576,
 ];
-const SPECULATIVE_QUERY_AXIS: [u32; 16] = [
-    2, 4, 8, 16, 32, 64, 128, 132, 134, 256, 264, 266, 512, 1024, 2048, 4096,
+const SPECULATIVE_QUERY_AXIS: [u32; 20] = [
+    2, 4, 8, 16, 32, 64, 128, 132, 134, 256, 264, 266, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+    65536,
 ];
-const SPECULATIVE_CACHE_AXIS: [u32; 28] = [
+const SPECULATIVE_CACHE_AXIS: [u32; 31] = [
     1, 2, 3, 4, 8, 16, 23, 32, 45, 63, 64, 65, 127, 128, 129, 182, 256, 512, 1024, 2047, 2048,
-    2049, 4096, 8192, 16384, 32768, 65536, 131072,
+    2049, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576,
 ];
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -306,15 +308,23 @@ mod tests {
             "uniform_full",
             &UNIFORM_QUERY_AXIS,
             &UNIFORM_CACHE_AXIS,
-            621,
+            810,
         );
-        assert_grid("causal_tail", &CAUSAL_QUERY_AXIS, &CAUSAL_CACHE_AXIS, 1_254);
+        assert_grid("causal_tail", &CAUSAL_QUERY_AXIS, &CAUSAL_CACHE_AXIS, 1_517);
         assert_grid(
             "speculative_pairs",
             &SPECULATIVE_QUERY_AXIS,
             &SPECULATIVE_CACHE_AXIS,
-            448,
+            620,
         );
+
+        // Every pattern's cache axis now reaches the arch's full 1,048,576-token
+        // timing domain, and every query axis reaches 65,536.
+        for pattern in ["uniform_full", "causal_tail", "speculative_pairs"] {
+            let grid = DsaSparseMlaAttentionSpec::sweep_grid(&config(pattern));
+            assert_eq!(grid.axes()[0].last(), Some(&65536.0));
+            assert_eq!(grid.axes()[1].last(), Some(&1_048_576.0));
+        }
 
         let uniform = DsaSparseMlaAttentionSpec::sweep_grid(&config("uniform_full"));
         assert_contiguous(&uniform.axes()[0], &[127, 128, 129]);
@@ -347,11 +357,11 @@ mod tests {
     fn masks_match_each_frozen_pattern_domain() {
         let uniform_grid = DsaSparseMlaAttentionSpec::sweep_grid(&config("uniform_full"));
         let uniform = mask_for("uniform_full", &uniform_grid);
-        assert_mask_split(&uniform, 621, 0);
+        assert_mask_split(&uniform, 810, 0);
 
         let causal_grid = DsaSparseMlaAttentionSpec::sweep_grid(&config("causal_tail"));
         let causal = mask_for("causal_tail", &causal_grid);
-        assert_mask_split(&causal, 733, 521);
+        assert_mask_split(&causal, 858, 659);
         assert!(!masked(&causal, &causal_grid, 3, 3));
         assert!(!masked(&causal, &causal_grid, 3, 4));
         assert!(masked(&causal, &causal_grid, 3, 2));
@@ -360,15 +370,18 @@ mod tests {
         assert!(!masked(&causal, &causal_grid, 255, 255));
         assert!(masked(&causal, &causal_grid, 256, 255));
         assert!(!masked(&causal, &causal_grid, 4096, 131072));
+        assert!(!masked(&causal, &causal_grid, 65536, 1_048_576));
+        assert!(masked(&causal, &causal_grid, 65536, 32768));
 
         let speculative_grid = DsaSparseMlaAttentionSpec::sweep_grid(&config("speculative_pairs"));
         let speculative = mask_for("speculative_pairs", &speculative_grid);
-        assert_mask_split(&speculative, 448, 0);
+        assert_mask_split(&speculative, 620, 0);
         assert!(!masked(&speculative, &speculative_grid, 2, 1));
         assert!(!masked(&speculative, &speculative_grid, 32, 2048));
         assert!(!masked(&speculative, &speculative_grid, 134, 65536));
         assert!(!masked(&speculative, &speculative_grid, 266, 65536));
         assert!(!masked(&speculative, &speculative_grid, 4096, 131072));
+        assert!(!masked(&speculative, &speculative_grid, 65536, 1_048_576));
     }
 
     #[test]
@@ -463,9 +476,9 @@ mod tests {
     #[test]
     fn enumeration_emits_backend_plus_the_exact_python_schema() {
         for (pattern, expected_payloads) in [
-            ("uniform_full", 621),
-            ("causal_tail", 1_254),
-            ("speculative_pairs", 448),
+            ("uniform_full", 810),
+            ("causal_tail", 1_517),
+            ("speculative_pairs", 620),
         ] {
             let cfg = config(pattern);
             let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
@@ -517,11 +530,13 @@ mod tests {
                 2049,
                 canonical_valid_counts(pattern, 128, 2049, 2048),
             );
+            let last_q = *grid.axes()[0].last().unwrap() as u32;
+            let last_s = *grid.axes()[1].last().unwrap() as u32;
             assert_payload(
                 payloads.last().unwrap(),
-                4096,
-                131072,
-                canonical_valid_counts(pattern, 4096, 131072, 2048),
+                last_q,
+                last_s,
+                canonical_valid_counts(pattern, last_q, last_s, 2048),
             );
         }
 
@@ -573,18 +588,18 @@ mod tests {
             let causal = feasible_payload_keys("causal_tail", distribution);
             let speculative = feasible_payload_keys("speculative_pairs", distribution);
 
-            assert_eq!(uniform.len(), 621);
-            assert_eq!(causal.len(), 733);
-            assert_eq!(speculative.len(), 448);
-            assert_eq!(uniform.intersection(&causal).count(), 158);
-            assert_eq!(uniform.intersection(&speculative).count(), 98);
-            assert_eq!(causal.intersection(&speculative).count(), 104);
+            assert_eq!(uniform.len(), 810);
+            assert_eq!(causal.len(), 858);
+            assert_eq!(speculative.len(), 620);
+            assert_eq!(uniform.intersection(&causal).count(), 249);
+            assert_eq!(uniform.intersection(&speculative).count(), 180);
+            assert_eq!(causal.intersection(&speculative).count(), 168);
             assert_eq!(
                 uniform
                     .intersection(&causal)
                     .filter(|payload| speculative.contains(*payload))
                     .count(),
-                84
+                148
             );
 
             memberships += uniform.len() + causal.len() + speculative.len();
@@ -593,12 +608,12 @@ mod tests {
                 .chain(causal)
                 .chain(speculative)
                 .collect();
-            assert_eq!(per_distribution.len(), 1_526);
+            assert_eq!(per_distribution.len(), 1_839);
             all_distributions.extend(per_distribution);
         }
 
-        assert_eq!(memberships, 7_208);
-        assert_eq!(all_distributions.len(), 6_104);
+        assert_eq!(memberships, 9_152);
+        assert_eq!(all_distributions.len(), 7_356);
     }
 
     fn rich_dim(name: &str, value: u32) -> Value {

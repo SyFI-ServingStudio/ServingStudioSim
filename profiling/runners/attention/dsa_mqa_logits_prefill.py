@@ -168,9 +168,23 @@ def _load_deepgemm_backend() -> tuple[Any, Any]:
         raise ProfilerNotImplemented(
             "DeepGEMM is unavailable or unsupported for dsa_mqa_logits_prefill:vllm_deepgemm_fp8"
         )
-    if not callable(getattr(deep_gemm, "fp8_mqa_logits", None)):
-        raise ProfilerNotImplemented("vllm.utils.deep_gemm.fp8_mqa_logits is unavailable")
+    if _mqa_logits_entry_point(deep_gemm) is None:
+        raise ProfilerNotImplemented(
+            "vllm.utils.deep_gemm exposes neither fp8_mqa_logits nor fp8_fp4_mqa_logits"
+        )
     return torch, deep_gemm
+
+
+def _mqa_logits_entry_point(deep_gemm: Any) -> Any:
+    """The fork renamed `fp8_mqa_logits` to `fp8_fp4_mqa_logits` when it unified
+    the FP8 and MXFP4 dispatch behind a tuple-typed `q`. Both names reach the
+    same `sm90_fp8_mqa_logits` kernel on the FP8 path, so accept either and let
+    the caller adapt the argument shape."""
+    for name in ("fp8_mqa_logits", "fp8_fp4_mqa_logits"):
+        entry_point = getattr(deep_gemm, name, None)
+        if callable(entry_point):
+            return entry_point
+    return None
 
 
 def _stable_values(torch: Any, shape: tuple[int, ...], *, phase: int, device: str) -> Any:
@@ -452,9 +466,15 @@ def profile_dsa_mqa_logits_prefill_vllm_deepgemm_fp8(
             device="cuda",
         )
 
+        entry_point = _mqa_logits_entry_point(deep_gemm)
+        # The unified entry point takes `q = (values, scales_or_None)`; on the
+        # FP8 path the per-token scale is already folded into `weights`.
+        unified = getattr(entry_point, "__name__", "") == "fp8_fp4_mqa_logits"
+        query = (operands.q, None) if unified else operands.q
+
         def kernel() -> Any:
-            return deep_gemm.fp8_mqa_logits(
-                operands.q,
+            return entry_point(
+                query,
                 (operands.k, operands.k_scale),
                 operands.weights,
                 operands.k_start,

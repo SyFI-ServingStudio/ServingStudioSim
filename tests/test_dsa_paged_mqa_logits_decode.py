@@ -401,7 +401,6 @@ def test_deepgemm_loader_rejects_missing_framework_support_and_apis(monkeypatch)
     [
         "is_deep_gemm_supported",
         "get_paged_mqa_logits_metadata",
-        "fp8_paged_mqa_logits",
     ],
 )
 def test_deepgemm_loader_rejects_each_missing_api(monkeypatch, missing_api):
@@ -420,6 +419,47 @@ def test_deepgemm_loader_rejects_each_missing_api(monkeypatch, missing_api):
         SimpleNamespace(deep_gemm=fake_deepgemm),
     )
     with pytest.raises(ProfilerNotImplemented, match=f"{missing_api} is unavailable"):
+        runner._load_deepgemm_backend()
+
+
+@pytest.mark.parametrize(
+    "paged_api",
+    ["fp8_paged_mqa_logits", "fp8_fp4_paged_mqa_logits"],
+)
+def test_deepgemm_loader_accepts_either_paged_entry_point(monkeypatch, paged_api):
+    """The fork renamed the paged entry point when it unified FP8 and MXFP4
+    dispatch. Either name must load; only their joint absence is an error."""
+    from profiling.runners.attention import dsa_paged_mqa_logits_decode as runner
+
+    fake_deepgemm = SimpleNamespace(
+        is_deep_gemm_supported=lambda: True,
+        get_paged_mqa_logits_metadata=lambda *args, **kwargs: None,
+    )
+    setattr(fake_deepgemm, paged_api, lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.utils",
+        SimpleNamespace(deep_gemm=fake_deepgemm),
+    )
+    _, loaded = runner._load_deepgemm_backend()
+    assert runner._paged_mqa_logits_entry_point(loaded) is getattr(fake_deepgemm, paged_api)
+
+
+def test_deepgemm_loader_rejects_both_paged_entry_points_missing(monkeypatch):
+    from profiling.runners.attention import dsa_paged_mqa_logits_decode as runner
+
+    fake_deepgemm = SimpleNamespace(
+        is_deep_gemm_supported=lambda: True,
+        get_paged_mqa_logits_metadata=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.utils",
+        SimpleNamespace(deep_gemm=fake_deepgemm),
+    )
+    with pytest.raises(ProfilerNotImplemented, match="neither fp8_paged_mqa_logits"):
         runner._load_deepgemm_backend()
 
 

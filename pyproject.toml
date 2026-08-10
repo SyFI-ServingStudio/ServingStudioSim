@@ -50,10 +50,16 @@ profiling = [
     "flashinfer-python>=0.6.4,<0.7; sys_platform == 'linux'",
     "flashinfer-cubin>=0.6.4,<0.7; sys_platform == 'linux'",
     "nvshmem4py-cu12>=0.3.0",
-    # DeepGEMM FP8 grouped-GEMM kernel (grouped_gemm `deepgemm` backend). Pinned
-    # to the moesim reference fork+commit for reproducibility; built with
+    # DeepGEMM FP8 grouped-GEMM kernel (grouped_gemm `deepgemm` backend) and the
+    # DSA MQA-logits kernels. The commit is the one the instrumented vLLM fork
+    # pins in cmake/external_projects/deepgemm.cmake, so this package and the
+    # fork's `vllm.utils.deep_gemm` wrapper stay in lockstep — that wrapper now
+    # only re-exports `fp8_fp4_mqa_logits`, which older DeepGEMM does not define.
+    # The previous pin carried one local fix (hold the smxx layout tensors by
+    # value instead of by const reference); upstream has since made the same
+    # change, so nothing is lost by moving onto it. Built with
     # no-build-isolation (see [tool.uv]) since its setup.py needs env torch.
-    "deep-gemm @ git+https://github.com/serendipity-zk/DeepGEMM.git@b3f7b56e1402b95118e49db2cf1a730afeee3316",
+    "deep-gemm @ git+https://github.com/serendipity-zk/DeepGEMM.git@891d57b4db1071624b5c8fa0d1e51cb317fa709f",
 ]
 
 [tool.pytest.ini_options]

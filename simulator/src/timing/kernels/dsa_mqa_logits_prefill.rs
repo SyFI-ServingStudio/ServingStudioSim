@@ -37,6 +37,21 @@ pub struct DsaMqaLogitsPrefillKernelInput {
     pub num_keys: u32,
 }
 
+/// Largest single profiling allocation this kernel may ask a GPU for, in bytes.
+///
+/// Raising the DSA context domain to 1,048,576 tokens makes the grid's far
+/// corner physically unprofilable — not because the shape is invalid, but
+/// because its operand would not fit on any card. The bound is a staircase
+/// rather than a per-axis cap: a large query count is fine against a short
+/// context and vice versa, which is exactly how the real workload is shaped
+/// (a session's big fresh input lands on round 0, when its context is still
+/// empty). Cells it drops are stored non-finite and `Cache2DLinear`
+/// renormalizes over the surviving corners, so the grid stays rectangular.
+const MAX_PROFILE_ALLOCATION_BYTES: f64 = 32.0 * 1024.0 * 1024.0 * 1024.0;
+
+/// One fp32 logit plus one bool validity flag per (query, key) pair.
+const DENSE_PAIR_BYTES_PER_ELEMENT: f64 = 5.0;
+
 pub struct DsaMqaLogitsPrefillSpec;
 
 impl KernelSpec for DsaMqaLogitsPrefillSpec {
@@ -48,11 +63,12 @@ impl KernelSpec for DsaMqaLogitsPrefillSpec {
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
         SweepGrid::new(vec![
             Axis::values([
-                1, 2, 3, 4, 8, 16, 32, 64, 127, 128, 129, 255, 256, 257, 363, 512, 1024, 2048, 4096,
+                1, 2, 3, 4, 8, 16, 32, 64, 127, 128, 129, 255, 256, 257, 363, 512, 1024, 2048,
+                4096, 8192, 16384, 32768, 65536,
             ]),
             Axis::values([
                 1, 2, 4, 8, 16, 32, 64, 128, 255, 256, 257, 363, 512, 1024, 2048, 4096, 8192,
-                16384, 32768, 65536,
+                16384, 32768, 65536, 131072, 262144, 524288, 1048576,
             ]),
         ])
     }
@@ -65,7 +81,12 @@ impl KernelSpec for DsaMqaLogitsPrefillSpec {
         // The Python contract requires 0 < num_queries <= num_keys. Preserve
         // the full rectangular cache grid, but never ask the profiler for its
         // physically invalid M>N corner.
-        grid.expand_2d(|num_queries, num_keys| num_queries > num_keys)
+        grid.expand_2d(|num_queries, num_keys| {
+            // The runner materializes a dense [queries, keys] validity mask
+            // alongside the fp32 logits, so the operand grows with the product.
+            let dense_pair_bytes = num_queries * num_keys * DENSE_PAIR_BYTES_PER_ELEMENT;
+            num_queries > num_keys || dense_pair_bytes > MAX_PROFILE_ALLOCATION_BYTES
+        })
     }
 
     fn enumerate(
@@ -109,11 +130,11 @@ mod tests {
     const DEEPGEMM_BACKEND: &str = "vllm_deepgemm_fp8";
     const QUERY_AXIS: &[f64] = &[
         1.0, 2.0, 3.0, 4.0, 8.0, 16.0, 32.0, 64.0, 127.0, 128.0, 129.0, 255.0, 256.0, 257.0, 363.0,
-        512.0, 1024.0, 2048.0, 4096.0,
+        512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0,
     ];
     const KEY_AXIS: &[f64] = &[
         1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 255.0, 256.0, 257.0, 363.0, 512.0, 1024.0,
-        2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0,
+        2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 524288.0, 1048576.0,
     ];
 
     fn config() -> DsaMqaLogitsPrefillKernelConfig {
@@ -211,8 +232,8 @@ mod tests {
         assert_eq!(axes.len(), 2);
         assert_eq!(axes[0], QUERY_AXIS);
         assert_eq!(axes[1], KEY_AXIS);
-        assert_eq!(axes[0].len(), 19);
-        assert_eq!(axes[1].len(), 20);
+        assert_eq!(axes[0].len(), 23);
+        assert_eq!(axes[1].len(), 24);
         assert!(axes[0].windows(2).all(|pair| pair[0] < pair[1]));
         assert!(axes[1].windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(&axes[0][..3], &[1.0, 2.0, 3.0]);
@@ -221,9 +242,12 @@ mod tests {
         assert_eq!(&axes[1][8..11], &[255.0, 256.0, 257.0]);
         assert_eq!(&axes[0][13..16], &[257.0, 363.0, 512.0]);
         assert_eq!(&axes[1][10..13], &[257.0, 363.0, 512.0]);
-        assert_eq!(axes[0].last(), Some(&4096.0));
-        assert_eq!(axes[1].last(), Some(&65536.0));
-        assert_eq!(axes[0].len() * axes[1].len(), 380);
+        // Both axes reach the arch's 1,048,576-token timing domain on the key
+        // side; the query side stops at 65,536, past which a single padded
+        // logits block no longer fits on a card.
+        assert_eq!(axes[0].last(), Some(&65536.0));
+        assert_eq!(axes[1].last(), Some(&1_048_576.0));
+        assert_eq!(axes[0].len() * axes[1].len(), 552);
     }
 
     #[test]
@@ -233,9 +257,9 @@ mod tests {
         let mask = DsaMqaLogitsPrefillSpec::infeasible_mask(&cfg, &grid);
         let key_count = grid.axes()[1].len();
 
-        assert_eq!(mask.len(), 380);
-        assert_eq!(mask.iter().filter(|&&masked| masked).count(), 137);
-        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 243);
+        assert_eq!(mask.len(), 552);
+        assert_eq!(mask.iter().filter(|&&masked| masked).count(), 217);
+        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 335);
 
         let masked = |m: f64, n: f64| {
             let i = grid.axes()[0].iter().position(|&value| value == m).unwrap();
@@ -251,6 +275,10 @@ mod tests {
         assert!(!masked(363.0, 512.0));
         assert!(masked(512.0, 363.0));
         assert!(masked(4096.0, 2048.0));
+        // The allocation staircase: a wide query block is fine against a short
+        // context and dropped against the longest one.
+        assert!(!masked(4096.0, 65536.0));
+        assert!(masked(65536.0, 1_048_576.0));
     }
 
     #[test]
@@ -271,7 +299,7 @@ mod tests {
         let grid = DsaMqaLogitsPrefillSpec::sweep_grid(&cfg);
         let payloads = DsaMqaLogitsPrefillSpec::enumerate(&cfg, &grid, DEEPGEMM_BACKEND);
 
-        assert_eq!(payloads.len(), 380);
+        assert_eq!(payloads.len(), 552);
         let expected_names = [
             "backend",
             "clean_logits",
@@ -294,7 +322,7 @@ mod tests {
         }
 
         assert_payload(&payloads[0], DEEPGEMM_BACKEND, 1, 1);
-        assert_payload(payloads.last().unwrap(), DEEPGEMM_BACKEND, 4096, 65536);
+        assert_payload(payloads.last().unwrap(), DEEPGEMM_BACKEND, 65536, 1_048_576);
     }
 
     fn assert_payload(

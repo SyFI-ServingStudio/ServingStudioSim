@@ -33,6 +33,15 @@ pub struct DsaPersistentTopkDecodeKernelInput {
     pub context_len: u32,
 }
 
+/// Largest single profiling allocation this kernel may ask a GPU for, in bytes.
+///
+/// Raising the DSA context domain to 1,048,576 tokens makes the grid's far
+/// corner physically unprofilable — not because the shape is invalid, but
+/// because its operand would not fit on any card. Cells this drops are stored
+/// non-finite and `Cache2DLinear` renormalizes over the surviving corners, so
+/// the grid stays rectangular.
+const MAX_PROFILE_ALLOCATION_BYTES: f64 = 32.0 * 1024.0 * 1024.0 * 1024.0;
+
 pub struct DsaPersistentTopkDecodeSpec;
 
 impl KernelSpec for DsaPersistentTopkDecodeSpec {
@@ -49,7 +58,7 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
             ]),
             Axis::values([
                 0, 1, 2, 128, 256, 512, 1024, 2046, 2047, 2048, 2049, 2050, 2897, 4096, 5792, 8191,
-                8192, 8193, 16384, 32767, 32768, 32769, 65536, 131072,
+                8192, 8193, 16384, 32767, 32768, 32769, 65536, 131072, 262144, 524288, 1048576,
             ]),
         ])
     }
@@ -61,8 +70,17 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         let min_context_len = f64::from(config.next_n.saturating_sub(1));
         let max_model_len = f64::from(config.max_model_len.get());
-        grid.expand_2d(|_batch_size, context_len| {
-            context_len < min_context_len || context_len > max_model_len
+        // The runner allocates the full padded logits block, whose row width is
+        // `logits_row_stride` regardless of the context actually used — so the
+        // cost is set by the batch, and raising the stride to 1M raises it
+        // everywhere on the grid.
+        let padded_row_bytes = f64::from(config.logits_row_stride.get())
+            * f64::from(DType::Fp32.size_bytes())
+            * f64::from(config.next_n);
+        grid.expand_2d(|batch_size, context_len| {
+            context_len < min_context_len
+                || context_len > max_model_len
+                || batch_size * padded_row_bytes > MAX_PROFILE_ALLOCATION_BYTES
         })
     }
 
@@ -111,17 +129,21 @@ mod tests {
     const CONTEXT_AXIS: &[f64] = &[
         0.0, 1.0, 2.0, 128.0, 256.0, 512.0, 1024.0, 2046.0, 2047.0, 2048.0, 2049.0, 2050.0, 2897.0,
         4096.0, 5792.0, 8191.0, 8192.0, 8193.0, 16384.0, 32767.0, 32768.0, 32769.0, 65536.0,
-        131072.0,
+        131072.0, 262144.0, 524288.0, 1048576.0,
     ];
+
+    /// The arch's full DSA timing domain, which is also the padded logits row
+    /// width the production config carries.
+    const FULL_MAX_MODEL_LEN: u32 = 1_048_576;
 
     fn config(next_n: u32) -> DsaPersistentTopkDecodeKernelConfig {
         DsaPersistentTopkDecodeKernelConfig {
             backends: vec![TORCH_BACKEND, VLLM_BACKEND],
             gpu_name: "NVIDIA H200".to_string(),
             next_n,
-            max_model_len: Dim::param("max_model_len", 131072),
+            max_model_len: Dim::param("max_model_len", FULL_MAX_MODEL_LEN),
             top_k: 2048,
-            logits_row_stride: Dim::param("logits_row_stride", 131072),
+            logits_row_stride: Dim::param("logits_row_stride", FULL_MAX_MODEL_LEN),
             logits_dtype: DType::Fp32,
             index_dtype: "int32".to_string(),
             context_mode: "uniform".to_string(),
@@ -144,9 +166,9 @@ mod tests {
             assert_eq!(cfg.backends(), &[TORCH_BACKEND, VLLM_BACKEND]);
             assert_eq!(cfg.gpu_name(), "NVIDIA H200");
             assert_eq!(cfg.next_n, next_n);
-            assert_eq!(cfg.max_model_len, 131072);
+            assert_eq!(cfg.max_model_len, FULL_MAX_MODEL_LEN);
             assert_eq!(cfg.top_k, 2048);
-            assert_eq!(cfg.logits_row_stride, 131072);
+            assert_eq!(cfg.logits_row_stride, FULL_MAX_MODEL_LEN);
             assert_eq!(cfg.logits_dtype, DType::Fp32);
             assert_eq!(cfg.index_dtype, "int32");
             assert_eq!(cfg.context_mode, "uniform");
@@ -162,15 +184,15 @@ mod tests {
                 "gpu_name": "NVIDIA H200",
                 "next_n": 2,
                 "max_model_len": {
-                    "value": 131072,
+                    "value": 1048576,
                     "expression": "max_model_len",
-                    "bindings": {"max_model_len": 131072},
+                    "bindings": {"max_model_len": 1048576},
                 },
                 "top_k": 2048,
                 "logits_row_stride": {
-                    "value": 131072,
+                    "value": 1048576,
                     "expression": "logits_row_stride",
-                    "bindings": {"logits_row_stride": 131072},
+                    "bindings": {"logits_row_stride": 1048576},
                 },
                 "logits_dtype": "fp32",
                 "index_dtype": "int32",
@@ -212,7 +234,7 @@ mod tests {
         assert_eq!(axes[0], BATCH_AXIS);
         assert_eq!(axes[1], CONTEXT_AXIS);
         assert_eq!(axes[0].len(), 34);
-        assert_eq!(axes[1].len(), 24);
+        assert_eq!(axes[1].len(), 27);
         assert!(axes[0].windows(2).all(|pair| pair[0] < pair[1]));
         assert!(axes[1].windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(&axes[0][3..6], &[8.0, 12.0, 15.0]);
@@ -237,8 +259,8 @@ mod tests {
         assert_eq!(axes[0].first(), Some(&1.0));
         assert_eq!(axes[0].last(), Some(&256.0));
         assert_eq!(axes[1].first(), Some(&0.0));
-        assert_eq!(axes[1].last(), Some(&131072.0));
-        assert_eq!(axes[0].len() * axes[1].len(), 816);
+        assert_eq!(axes[1].last(), Some(&1_048_576.0));
+        assert_eq!(axes[0].len() * axes[1].len(), 918);
     }
 
     #[test]
@@ -246,18 +268,18 @@ mod tests {
         let next_one = config(1);
         let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&next_one);
         let next_one_mask = DsaPersistentTopkDecodeSpec::infeasible_mask(&next_one, &grid);
-        assert_eq!(next_one_mask.len(), 816);
+        assert_eq!(next_one_mask.len(), 918);
         assert_eq!(next_one_mask.iter().filter(|&&masked| masked).count(), 0);
         let next_one_feasible = next_one_mask.iter().filter(|&&masked| !masked).count();
-        assert_eq!(next_one_feasible, 816);
+        assert_eq!(next_one_feasible, 918);
 
         let next_two = config(2);
         let next_two_mask = DsaPersistentTopkDecodeSpec::infeasible_mask(&next_two, &grid);
-        assert_eq!(next_two_mask.len(), 816);
+        assert_eq!(next_two_mask.len(), 918);
         assert_eq!(next_two_mask.iter().filter(|&&masked| masked).count(), 34);
         let next_two_feasible = next_two_mask.iter().filter(|&&masked| !masked).count();
-        assert_eq!(next_two_feasible, 782);
-        assert_eq!(next_one_feasible + next_two_feasible, 1598);
+        assert_eq!(next_two_feasible, 884);
+        assert_eq!(next_one_feasible + next_two_feasible, 1802);
 
         let context_count = grid.axes()[1].len();
         let masked = |batch_size: f64, context_len: f64| {
@@ -275,6 +297,10 @@ mod tests {
             assert!(masked(*batch_size, 0.0));
             assert!(!masked(*batch_size, 1.0));
             assert!(!masked(*batch_size, 131072.0));
+            // The padded logits block is `batch x logits_row_stride`, so even a
+            // 1M stride at the largest batch on this axis stays under the
+            // allocation budget: nothing here is dropped for size.
+            assert!(!masked(*batch_size, 1_048_576.0));
         }
         for batch_size in [12.0, 23.0, 24.0, 39.0, 46.0, 48.0, 92.0, 96.0, 130.0] {
             assert!(masked(batch_size, 0.0));
@@ -302,7 +328,7 @@ mod tests {
             let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&cfg);
             let payloads = DsaPersistentTopkDecodeSpec::enumerate(&cfg, &grid, VLLM_BACKEND);
 
-            assert_eq!(payloads.len(), 816);
+            assert_eq!(payloads.len(), 918);
             let expected_names = [
                 "backend",
                 "batch_size",
@@ -370,7 +396,7 @@ mod tests {
                 next_n,
             );
             assert_payload(payload_for(&payloads, &grid, 199, 8192), 199, 8192, next_n);
-            assert_payload(payloads.last().unwrap(), 256, 131072, next_n);
+            assert_payload(payloads.last().unwrap(), 256, 1_048_576, next_n);
         }
     }
 
@@ -402,11 +428,14 @@ mod tests {
         assert_eq!(fields.get("batch_size"), Some(&Value::from(batch_size)));
         assert_eq!(fields.get("context_len"), Some(&Value::from(context_len)));
         assert_eq!(fields.get("next_n"), Some(&Value::from(next_n)));
-        assert_eq!(fields.get("max_model_len"), Some(&Value::from(131072_u32)));
+        assert_eq!(
+            fields.get("max_model_len"),
+            Some(&Value::from(FULL_MAX_MODEL_LEN))
+        );
         assert_eq!(fields.get("top_k"), Some(&Value::from(2048_u32)));
         assert_eq!(
             fields.get("logits_row_stride"),
-            Some(&Value::from(131072_u32))
+            Some(&Value::from(FULL_MAX_MODEL_LEN))
         );
         assert_eq!(fields.get("logits_dtype"), Some(&Value::from("fp32")));
         assert_eq!(fields.get("index_dtype"), Some(&Value::from("int32")));

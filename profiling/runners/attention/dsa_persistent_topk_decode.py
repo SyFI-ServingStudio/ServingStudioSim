@@ -22,9 +22,7 @@ from profiling.runners.metrics import ComputeMetrics
 _MIN_BATCH_SIZE = 1
 _MAX_BATCH_SIZE = 256
 _SUPPORTED_NEXT_N = frozenset({1, 2})
-_MAX_MODEL_LEN = 131072
 _TOP_K = 2048
-_LOGITS_ROW_STRIDE = 131072
 _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _CONTEXT_MODE = "uniform"
@@ -88,10 +86,13 @@ def _validate_args(
             "context_len must be >= next_n - 1 so every speculative row length is "
             f"nonnegative, got context_len={context_len}, next_n={next_n}"
         )
-    if max_model_len != _MAX_MODEL_LEN:
-        raise ValueError(
-            f"dsa_persistent_topk_decode requires max_model_len=131072, got {max_model_len}"
-        )
+    # `max_model_len` and `logits_row_stride` are KernelConfig fields, i.e. part
+    # of the profile.db cache key, so a different value is a different row family
+    # rather than an invalid request. They used to be pinned to one measured
+    # value; that recorded coverage, not a kernel law, and every context-domain
+    # change had to chase the literal. The real laws are kept below.
+    if max_model_len <= 0:
+        raise ValueError(f"max_model_len must be > 0, got {max_model_len}")
     if context_len > max_model_len:
         raise ValueError(
             f"context_len must be <= max_model_len, got {context_len} and {max_model_len}"
@@ -102,10 +103,6 @@ def _validate_args(
         raise ValueError(
             "logits_row_stride must be positive and >= max_model_len, "
             f"got {logits_row_stride} for max_model_len={max_model_len}"
-        )
-    if logits_row_stride != _LOGITS_ROW_STRIDE:
-        raise ValueError(
-            f"dsa_persistent_topk_decode requires logits_row_stride=131072, got {logits_row_stride}"
         )
     if logits_dtype is not _LOGITS_DTYPE:
         raise ValueError(
