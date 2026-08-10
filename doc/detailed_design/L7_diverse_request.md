@@ -112,20 +112,30 @@ ScheduledRequest<OmniGenerationDefinition>
 - `release`：`ReleaseMetadata { request_id, trace_arrival_time, session }`
 
 `ReplayScheduler` 的 API 只接受 `ReleaseMetadata` slice，所以 release scheduling
-无法读取或 match request definition。它组合两个独立类型：
+无法读取或 match request definition。它组合三个独立类型：
 
 ```rust
-ReplayPacing::OpenLoop { request_rate }
-ReplayPacing::ClosedLoop { max_concurrency }
+ArrivalMode::TraceTimed { request_rate }
+ArrivalMode::Saturated
+
+CapacityLimit { max_active_units: Option<usize> }
 
 SessionDependency::Independent
 SessionDependency::Chained
 ```
 
-`ReplayPacing` 决定 workload pressure 何时允许 release；`SessionDependency` 决定一行
-是否必须等待同 session predecessor completion + `tool_wait_after_ms`。四种组合都合法，
-尤其 `closed_loop + chained` 同时执行全局 in-flight cap 与 session causality；不再用一个
-单一 cross-product enum 把二者错误地设成互斥。
+`ArrivalMode` 决定 release time 从哪来；`CapacityLimit` 决定同时能有几个 unit 活着；
+`SessionDependency` 决定一行是否必须等待同 session predecessor completion +
+`tool_wait_after_ms`。三轴全组合合法 —— 尤其 `trace_timed + max_concurrency`：
+按录制时间线回放、同时限制并发，这是真实 workload，此前被熔在一起的
+`ReplayPacing` 表达不了。
+
+**cap 的单位是 unit，不是 request**：`chained` 下一个 session 在 head release 时占住
+slot，直到最后一轮完成才释放，**tool wait 期间照占**（此时它一个 in-flight request
+都没有）。所以 successor 不再过 capacity 门 —— 它所属 session 早已持有 slot，重复
+gate 会直接死锁（唯一能释放 slot 的正是这条 successor 通向的 session completion）。
+被 cap 挡住的 head 用「slot 开放的瞬间」打时间戳而非 trace arrival，与实测端
+TraceLab「先等 arrival、再拿 permit、然后才发请求」的时钟起点一致。
 release 时，frontend 才把相对 deadline 解成 absolute simulated deadline，并构造
 `Request<Definition>`。这也是 production 唯一调用 generic `Request::new` 的位置；
 四列 schema 与带 session/SLO/speculative tags 的 schema 最终共享同一个 storage seam。

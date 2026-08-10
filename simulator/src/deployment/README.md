@@ -37,7 +37,7 @@ embeds the run-global specs and fixes which **pool roles** exist:
 
 ```jsonc
 { "deployment": "unified",
-  "workload": { trace_files, replay_pacing, session_dependency,
+  "workload": { trace_files, arrival_mode, session_dependency,
                 duration_ms, run_to_end, request_rate, max_concurrency },
   "io":       { log_dir, log_level, quiet, force_cache_build },
   "pools":    { "main": { placement, groups: [ { gpu, replicas, arch, worker } ] } } }

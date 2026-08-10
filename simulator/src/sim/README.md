@@ -19,21 +19,35 @@ For the layer overview see `doc/detailed_design/L7.md`.
   directional text/media families remain distinct, while `omni_generation`
   alone accepts ordered mixed text/image/audio/video segment vectors.
   `ReplayScheduler` reads a separate `ReleaseMetadata` projection and composes
-  two axes:
-  - **Replay pacing** — `replay_pacing: open_loop | closed_loop`.
-    Open-loop `drain_due(now, emit)` emits every `Request` whose
-    **effective** arrival time `≤ now`, where effective time =
-    `arrival_time / request_rate`. Closed-loop ignores the CSV timeline and
-    `request_rate`; it keeps at most `max_concurrency` requests in flight and
-    stamps each release with the current admission clock.
+  three independent axes:
+  - **Arrival mode** — `arrival_mode: trace_timed | saturated`. Trace-timed
+    `drain_due(now, emit)` emits every `Request` whose **effective** arrival
+    time `≤ now`, where effective time = `arrival_time / request_rate`.
+    Saturated ignores the CSV timeline and `request_rate`: every unit is
+    eligible from the start.
+  - **Capacity** — `max_concurrency: N`, optional and independent of arrival
+    mode. It caps active *units*, and a unit is a session when chained and a
+    request otherwise. A unit that the cap held back is stamped with the instant
+    its slot opened, not its trace arrival, so it is not charged for a wait the
+    measured runner does not report either.
   - **Session dependency** —
     `session_dependency: independent | chained`. Independent rows have no causal
-    gate. Chained session heads follow the selected pacing, while each successor
-    waits for predecessor completion plus `tool_wait_after_ms`.
+    gate. Chained session heads follow the arrival mode and the cap, while each
+    successor waits for predecessor completion plus `tool_wait_after_ms`.
 
-  The axes form four valid combinations. In particular, `closed_loop + chained`
-  applies the global in-flight cap while preserving per-session causality. The
-  frontend owns the in-flight ledger (`emitted − completed` fed back via
+  All combinations are valid; the axes were deliberately split apart because a
+  capped replay of a recorded timeline is a real workload and a single fused
+  enum could not express it.
+
+  Under `chained`, a session takes its slot when its head is released and holds
+  it until its final round completes — **including across tool waits**, when it
+  has no request in flight at all. This is why the cap cannot be served by the
+  in-flight count: that would hand the slot to another conversation and let
+  both run. A successor therefore bypasses the capacity check entirely; its
+  session already owns a slot, and re-gating it would deadlock, since the only
+  thing that frees a slot is the session completion that successor leads to.
+
+  The frontend owns the in-flight ledger (`emitted − completed` fed back via
   `record_completion`); the tick loop is a pure consumer of
   `submitted`/`in_flight`/`num_completed`.
 
