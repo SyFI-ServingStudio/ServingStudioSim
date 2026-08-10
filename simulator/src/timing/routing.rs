@@ -193,7 +193,9 @@ pub fn balanced_expert_counts(num_experts: u32, buckets: u32) -> Vec<u32> {
     }
     let base = num_experts / buckets;
     let rem = num_experts % buckets;
-    (0..buckets).map(|idx| base + u32::from(idx < rem)).collect()
+    (0..buckets)
+        .map(|idx| base + u32::from(idx < rem))
+        .collect()
 }
 
 /// Deterministic splitmix64 — the RNG for build-time Monte-Carlo routing. No

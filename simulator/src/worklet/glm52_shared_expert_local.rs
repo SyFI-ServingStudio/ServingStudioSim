@@ -351,35 +351,27 @@ mod tests {
     fn unsupported_glm_identity_fails_during_pure_resolution() {
         let mut bad_hidden = cfg();
         bad_hidden.hidden_dim = 4096.into();
-        assert!(
-            validate_config(&bad_hidden)
-                .unwrap_err()
-                .contains("hidden_dim must be 6144")
-        );
+        assert!(validate_config(&bad_hidden)
+            .unwrap_err()
+            .contains("hidden_dim must be 6144"));
 
         let mut bad_intermediate = cfg();
         bad_intermediate.moe_intermediate_dim = 4096.into();
-        assert!(
-            validate_config(&bad_intermediate)
-                .unwrap_err()
-                .contains("moe_intermediate_dim must be 2048")
-        );
+        assert!(validate_config(&bad_intermediate)
+            .unwrap_err()
+            .contains("moe_intermediate_dim must be 2048"));
 
         let mut bad_shared_count = cfg();
         bad_shared_count.n_shared_experts = 2;
-        assert!(
-            validate_config(&bad_shared_count)
-                .unwrap_err()
-                .contains("n_shared_experts must be 1")
-        );
+        assert!(validate_config(&bad_shared_count)
+            .unwrap_err()
+            .contains("n_shared_experts must be 1"));
 
         let mut bad_dtype = cfg();
         bad_dtype.dtype = DType::Fp16;
-        assert!(
-            validate_config(&bad_dtype)
-                .unwrap_err()
-                .contains("dtype must be bf16")
-        );
+        assert!(validate_config(&bad_dtype)
+            .unwrap_err()
+            .contains("dtype must be bf16"));
     }
 
     #[test]
@@ -388,11 +380,9 @@ mod tests {
         assert_eq!(checked_product("gate n", &[2, 2048]).unwrap(), 4096);
         assert_eq!(checked_product("input", &[2, 2048, 2]).unwrap(), 8192);
         assert_eq!(checked_product("output", &[2048, 2]).unwrap(), 4096);
-        assert!(
-            checked_product("overflow", &[u32::MAX, 2])
-                .unwrap_err()
-                .contains("overflows u32")
-        );
+        assert!(checked_product("overflow", &[u32::MAX, 2])
+            .unwrap_err()
+            .contains("overflows u32"));
     }
 
     #[test]

@@ -31,8 +31,7 @@ pub use glm52_dsa_moe::{
     Glm52MtpMode,
 };
 pub use glm52_vllm_dsa_moe::{
-    Glm52VllmDsaMoeConfigs, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
-    Glm52VllmDsaMoeResolved,
+    Glm52VllmDsaMoeConfigs, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmDsaMoeResolved,
 };
 pub use llama3_dense::{DenseParallel, Llama3DenseModel};
 pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};

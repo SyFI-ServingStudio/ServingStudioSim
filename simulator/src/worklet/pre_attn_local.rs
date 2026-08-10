@@ -55,7 +55,8 @@ pub struct PreAttnLocalWorklet {
 impl PreAttnLocalWorklet {
     pub fn resolve_config(cfg: &PreAttnLocalWorkletConfig) -> PreAttnLocalWorkletResolved {
         // Fused QKV output dim: q heads + 2× kv heads (GQA), each `head_dim` wide.
-        let qkv_n = (cfg.num_qo_heads.clone() + 2 * cfg.num_kv_heads.clone()) * cfg.head_dim.clone();
+        let qkv_n =
+            (cfg.num_qo_heads.clone() + 2 * cfg.num_kv_heads.clone()) * cfg.head_dim.clone();
         PreAttnLocalWorkletResolved {
             input_norm: RmsNormKernelConfig {
                 backends: cfg.norm_backends.clone(),
@@ -91,7 +92,11 @@ impl PreAttnLocalWorklet {
         );
         let qkv = Op::new(
             qkv_name.clone(),
-            Arc::new(SingleGemmKernel::build(qkv_name, resolved.qkv.clone(), bridge)?),
+            Arc::new(SingleGemmKernel::build(
+                qkv_name,
+                resolved.qkv.clone(),
+                bridge,
+            )?),
         );
         Ok(Self {
             name,

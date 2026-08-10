@@ -115,23 +115,43 @@ impl PostAttnLocalWorklet {
 
         let o_proj = Op::new(
             o_name.clone(),
-            Arc::new(SingleGemmKernel::build(o_name, resolved.o_proj.clone(), bridge)?),
+            Arc::new(SingleGemmKernel::build(
+                o_name,
+                resolved.o_proj.clone(),
+                bridge,
+            )?),
         );
         let post_norm = Op::new(
             pn_name.clone(),
-            Arc::new(RmsNormKernel::build(pn_name, resolved.post_norm.clone(), bridge)?),
+            Arc::new(RmsNormKernel::build(
+                pn_name,
+                resolved.post_norm.clone(),
+                bridge,
+            )?),
         );
         let up_gate = Op::new(
             ug_name.clone(),
-            Arc::new(SingleGemmKernel::build(ug_name, resolved.up_gate.clone(), bridge)?),
+            Arc::new(SingleGemmKernel::build(
+                ug_name,
+                resolved.up_gate.clone(),
+                bridge,
+            )?),
         );
         let act = Op::new(
             act_name.clone(),
-            Arc::new(ElementwiseKernel::build(act_name, resolved.act.clone(), bridge)?),
+            Arc::new(ElementwiseKernel::build(
+                act_name,
+                resolved.act.clone(),
+                bridge,
+            )?),
         );
         let down = Op::new(
             down_name.clone(),
-            Arc::new(SingleGemmKernel::build(down_name, resolved.down.clone(), bridge)?),
+            Arc::new(SingleGemmKernel::build(
+                down_name,
+                resolved.down.clone(),
+                bridge,
+            )?),
         );
         Ok(Self {
             name,

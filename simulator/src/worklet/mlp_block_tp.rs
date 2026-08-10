@@ -142,19 +142,35 @@ impl MlpBlockTpWorklet {
 
         let post_norm = Op::new(
             pn_name.clone(),
-            Arc::new(RmsNormKernel::build(pn_name, resolved.post_norm.clone(), bridge)?),
+            Arc::new(RmsNormKernel::build(
+                pn_name,
+                resolved.post_norm.clone(),
+                bridge,
+            )?),
         );
         let up_gate = Op::new(
             ug_name.clone(),
-            Arc::new(SingleGemmKernel::build(ug_name, resolved.up_gate.clone(), bridge)?),
+            Arc::new(SingleGemmKernel::build(
+                ug_name,
+                resolved.up_gate.clone(),
+                bridge,
+            )?),
         );
         let act = Op::new(
             act_name.clone(),
-            Arc::new(ElementwiseKernel::build(act_name, resolved.act.clone(), bridge)?),
+            Arc::new(ElementwiseKernel::build(
+                act_name,
+                resolved.act.clone(),
+                bridge,
+            )?),
         );
         let down = Op::new(
             down_name.clone(),
-            Arc::new(SingleGemmKernel::build(down_name, resolved.down.clone(), bridge)?),
+            Arc::new(SingleGemmKernel::build(
+                down_name,
+                resolved.down.clone(),
+                bridge,
+            )?),
         );
         let tp_ar = match &resolved.tp_ar {
             Some(ar_cfg) => {
@@ -183,10 +199,7 @@ impl MlpBlockTpWorklet {
         let r = &self.resolved;
         let label = format!(
             "{} (MlpBlockTpWorklet) [tp={}; {:?} (replicated), {:?}]",
-            self.name,
-            r.raw_cfg.tp_size,
-            r.raw_cfg.hidden,
-            r.intermediate_per_rank,
+            self.name, r.raw_cfg.tp_size, r.raw_cfg.hidden, r.intermediate_per_rank,
         );
         let mut parts = vec![
             self.post_norm.compile(builder),

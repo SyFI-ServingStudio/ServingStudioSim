@@ -377,27 +377,21 @@ mod tests {
     fn unsupported_glm_identity_fails_during_pure_resolution() {
         let mut bad_hidden = cfg();
         bad_hidden.hidden_dim = 4096.into();
-        assert!(
-            validate_config(&bad_hidden)
-                .unwrap_err()
-                .contains("hidden_dim must be 6144")
-        );
+        assert!(validate_config(&bad_hidden)
+            .unwrap_err()
+            .contains("hidden_dim must be 6144"));
 
         let mut bad_intermediate = cfg();
         bad_intermediate.intermediate_dim = 14336.into();
-        assert!(
-            validate_config(&bad_intermediate)
-                .unwrap_err()
-                .contains("intermediate_dim must be 12288")
-        );
+        assert!(validate_config(&bad_intermediate)
+            .unwrap_err()
+            .contains("intermediate_dim must be 12288"));
 
         let mut bad_dtype = cfg();
         bad_dtype.dtype = DType::Fp16;
-        assert!(
-            validate_config(&bad_dtype)
-                .unwrap_err()
-                .contains("dtype must be bf16")
-        );
+        assert!(validate_config(&bad_dtype)
+            .unwrap_err()
+            .contains("dtype must be bf16"));
     }
 
     #[test]
@@ -405,11 +399,9 @@ mod tests {
         assert_eq!(checked_product("gate", &[2, 12288]).unwrap(), 24576);
         assert_eq!(checked_product("input", &[2, 12288, 2]).unwrap(), 49152);
         assert_eq!(checked_product("output", &[12288, 2]).unwrap(), 24576);
-        assert!(
-            checked_product("overflow", &[u32::MAX, 2])
-                .unwrap_err()
-                .contains("overflows u32")
-        );
+        assert!(checked_product("overflow", &[u32::MAX, 2])
+            .unwrap_err()
+            .contains("overflows u32"));
     }
 
     #[test]

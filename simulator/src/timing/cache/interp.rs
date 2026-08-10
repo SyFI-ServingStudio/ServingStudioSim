@@ -257,7 +257,12 @@ mod tests {
 
     fn leaf(time_ms: f32, backend: u8) -> LeafMetrics {
         LeafMetrics {
-            m: Metrics4 { time_ms, flops: 0.0, bytes: 0.0, energy_j: 0.0 },
+            m: Metrics4 {
+                time_ms,
+                flops: 0.0,
+                bytes: 0.0,
+                energy_j: 0.0,
+            },
             coverage: CoverageFlags::EMPTY,
             backend_index: backend,
         }

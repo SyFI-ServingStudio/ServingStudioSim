@@ -147,7 +147,10 @@ fn price_token(
     let residents_in_domain = |domain: usize| -> (u16, u16) {
         let domain_start = layout.first_rank(domain);
         let domain_end = domain_start + layout.domain_size(domain) as u16;
-        (residing_start.max(domain_start), residing_end.min(domain_end))
+        (
+            residing_start.max(domain_start),
+            residing_end.min(domain_end),
+        )
     };
     // Rotate among `window_size` residents by the token index — spreads gateway
     // / bcast-landing duty so the bottleneck doesn't pile on one rank.
@@ -262,7 +265,8 @@ pub fn simulate_moe_comm(
     seed: u64,
 ) -> [BottleneckCurve; 6] {
     let n = f64::from(trials.max(1));
-    let mut points: [Vec<(u32, f64)>; 6] = std::array::from_fn(|_| Vec::with_capacity(t_grid.len()));
+    let mut points: [Vec<(u32, f64)>; 6] =
+        std::array::from_fn(|_| Vec::with_capacity(t_grid.len()));
     for &t in t_grid {
         let mut acc = [0.0f64; 6];
         for trial in 0..trials.max(1) {
@@ -316,7 +320,14 @@ mod tests {
     #[test]
     fn produces_six_named_tiered_stages() {
         let dist = RoutingDistribution::uniform(64);
-        let steps = simulate_once(dist.ppm(), 8, &params(), Placement::RoundRobin, 4096, 0xABCD);
+        let steps = simulate_once(
+            dist.ppm(),
+            8,
+            &params(),
+            Placement::RoundRobin,
+            4096,
+            0xABCD,
+        );
         let expect = [
             ("moe_dispatch_inter", P2pTier::InterDomain),
             ("moe_dispatch_intra", P2pTier::IntraDomain),
@@ -339,9 +350,20 @@ mod tests {
         // mirrors, so dispatch_inter total bytes == combine_inter_reduce total,
         // and dispatch_intra total == combine_intra_reduce total.
         let dist = RoutingDistribution::power_law(64, 1.0);
-        let steps = simulate_once(dist.ppm(), 4, &params(), Placement::RoundRobin, 8192, 0x1234);
+        let steps = simulate_once(
+            dist.ppm(),
+            4,
+            &params(),
+            Placement::RoundRobin,
+            8192,
+            0x1234,
+        );
         let total = |s: &MoeStep| -> u64 { s.send_bytes.iter().sum::<u64>() };
-        assert_eq!(total(&steps[0]), total(&steps[3]), "inter dispatch vs reduce");
+        assert_eq!(
+            total(&steps[0]),
+            total(&steps[3]),
+            "inter dispatch vs reduce"
+        );
         assert_eq!(total(&steps[1]), total(&steps[2]), "intra fan vs reduce");
     }
 
@@ -362,7 +384,11 @@ mod tests {
         let dist = RoutingDistribution::uniform(64);
         let hp = Placement::ReplicatedHeadParallel { hp_size: 4 };
         let steps = simulate_once(dist.ppm(), 8, &params(), hp, 4096, 0x71);
-        assert_eq!(steps[4].bottleneck_bytes(), 0, "inter_bcast (single target domain)");
+        assert_eq!(
+            steps[4].bottleneck_bytes(),
+            0,
+            "inter_bcast (single target domain)"
+        );
         assert!(steps[5].bottleneck_bytes() > 0, "intra_fanout should fire");
     }
 
@@ -373,7 +399,10 @@ mod tests {
         let dist = RoutingDistribution::uniform(64);
         let hp = Placement::ReplicatedHeadParallel { hp_size: 8 }; // ep8/nvl4 → 2 domains
         let steps = simulate_once(dist.ppm(), 8, &params(), hp, 4096, 0x72);
-        assert!(steps[4].bottleneck_bytes() > 0, "inter_bcast should fire across domains");
+        assert!(
+            steps[4].bottleneck_bytes() > 0,
+            "inter_bcast should fire across domains"
+        );
         assert!(steps[5].bottleneck_bytes() > 0, "intra_fanout should fire");
     }
 
@@ -389,17 +418,21 @@ mod tests {
         // (E, ep, nvl, k, hp). hp=1 ≡ RoundRobin; hp=nvl single-domain HP;
         // hp=2·nvl multi-domain HP (inter_bcast fires); hp=ep ≡ full replication.
         let configs = [
-            (64u32, 8u32, 4u32, 8u32, 1u32),  // RoundRobin
-            (128, 16, 8, 8, 8),               // HP one domain
-            (64, 8, 4, 8, 8),                 // HP == ep (zero dispatch)
-            (128, 16, 8, 8, 16),              // HP spans 2 domains (inter_bcast fires)
+            (64u32, 8u32, 4u32, 8u32, 1u32), // RoundRobin
+            (128, 16, 8, 8, 8),              // HP one domain
+            (64, 8, 4, 8, 8),                // HP == ep (zero dispatch)
+            (128, 16, 8, 8, 16),             // HP spans 2 domains (inter_bcast fires)
         ];
         let hidden_bytes = 4096 * 2;
         let n_tokens = 30_000u32;
 
         for &(e, ep, nvl, k, hp) in &configs {
             let dist = RoutingDistribution::uniform(e);
-            let params = MoeNetParams { ep_size: ep, nvl_num_gpu: nvl, hidden_bytes };
+            let params = MoeNetParams {
+                ep_size: ep,
+                nvl_num_gpu: nvl,
+                hidden_bytes,
+            };
             let placement = if hp == 1 {
                 Placement::RoundRobin
             } else {
@@ -426,7 +459,10 @@ mod tests {
             for (stage_name, stage) in exact_stages {
                 let (sim, rf) = (sim_copies[stage], ref_copies[stage]);
                 if rf < 1e-9 {
-                    assert!(sim.abs() < 1e-9, "{label} {stage_name}: ref=0 but sim={sim}");
+                    assert!(
+                        sim.abs() < 1e-9,
+                        "{label} {stage_name}: ref=0 but sim={sim}"
+                    );
                     continue;
                 }
                 let rel = (sim - rf) / rf * 100.0;
@@ -468,15 +504,42 @@ mod tests {
     #[test]
     fn hand_calc_golden_cross_domain_skew() {
         let dist = RoutingDistribution::from_profile(&[1.0, 0.0, 0.0, 0.0]);
-        let params = MoeNetParams { ep_size: 2, nvl_num_gpu: 1, hidden_bytes: 100 };
+        let params = MoeNetParams {
+            ep_size: 2,
+            nvl_num_gpu: 1,
+            hidden_bytes: 100,
+        };
         let n_tokens = 1_000u32;
-        let steps = simulate_once(dist.ppm(), 1, &params, Placement::RoundRobin, n_tokens, 0xDEAD);
+        let steps = simulate_once(
+            dist.ppm(),
+            1,
+            &params,
+            Placement::RoundRobin,
+            n_tokens,
+            0xDEAD,
+        );
 
         let cross_hop = u64::from(n_tokens / 2) * u64::from(params.hidden_bytes);
-        assert_eq!(steps[0].send_bytes, vec![0, cross_hop], "dispatch_inter send");
-        assert_eq!(steps[0].recv_bytes, vec![cross_hop, 0], "dispatch_inter recv");
-        assert_eq!(steps[3].send_bytes, vec![cross_hop, 0], "combine_inter_reduce send");
-        assert_eq!(steps[3].recv_bytes, vec![0, cross_hop], "combine_inter_reduce recv");
+        assert_eq!(
+            steps[0].send_bytes,
+            vec![0, cross_hop],
+            "dispatch_inter send"
+        );
+        assert_eq!(
+            steps[0].recv_bytes,
+            vec![cross_hop, 0],
+            "dispatch_inter recv"
+        );
+        assert_eq!(
+            steps[3].send_bytes,
+            vec![cross_hop, 0],
+            "combine_inter_reduce send"
+        );
+        assert_eq!(
+            steps[3].recv_bytes,
+            vec![0, cross_hop],
+            "combine_inter_reduce recv"
+        );
         for stage in [1usize, 2, 4, 5] {
             assert_eq!(steps[stage].send_bytes, vec![0, 0], "stage {stage} send");
             assert_eq!(steps[stage].recv_bytes, vec![0, 0], "stage {stage} recv");
@@ -499,15 +562,42 @@ mod tests {
     #[test]
     fn hand_calc_golden_intra_domain_skew() {
         let dist = RoutingDistribution::from_profile(&[0.0, 0.0, 1.0, 0.0]);
-        let params = MoeNetParams { ep_size: 2, nvl_num_gpu: 2, hidden_bytes: 100 };
+        let params = MoeNetParams {
+            ep_size: 2,
+            nvl_num_gpu: 2,
+            hidden_bytes: 100,
+        };
         let n_tokens = 1_000u32;
-        let steps = simulate_once(dist.ppm(), 1, &params, Placement::RoundRobin, n_tokens, 0xBEEF);
+        let steps = simulate_once(
+            dist.ppm(),
+            1,
+            &params,
+            Placement::RoundRobin,
+            n_tokens,
+            0xBEEF,
+        );
 
         let intra_hop = u64::from(n_tokens / 2) * u64::from(params.hidden_bytes);
-        assert_eq!(steps[1].send_bytes, vec![intra_hop, 0], "dispatch_intra send");
-        assert_eq!(steps[1].recv_bytes, vec![0, intra_hop], "dispatch_intra recv");
-        assert_eq!(steps[2].send_bytes, vec![0, intra_hop], "combine_intra_reduce send");
-        assert_eq!(steps[2].recv_bytes, vec![intra_hop, 0], "combine_intra_reduce recv");
+        assert_eq!(
+            steps[1].send_bytes,
+            vec![intra_hop, 0],
+            "dispatch_intra send"
+        );
+        assert_eq!(
+            steps[1].recv_bytes,
+            vec![0, intra_hop],
+            "dispatch_intra recv"
+        );
+        assert_eq!(
+            steps[2].send_bytes,
+            vec![0, intra_hop],
+            "combine_intra_reduce send"
+        );
+        assert_eq!(
+            steps[2].recv_bytes,
+            vec![intra_hop, 0],
+            "combine_intra_reduce recv"
+        );
         for stage in [0usize, 3, 4, 5] {
             assert_eq!(steps[stage].send_bytes, vec![0, 0], "stage {stage} send");
             assert_eq!(steps[stage].recv_bytes, vec![0, 0], "stage {stage} recv");
@@ -521,7 +611,14 @@ mod tests {
         // less than the single-home (RoundRobin) case, which fans within the home
         // domain too.
         let dist = RoutingDistribution::uniform(64);
-        let rr = simulate_once(dist.ppm(), 8, &params(), Placement::RoundRobin, 40_000, 0x73);
+        let rr = simulate_once(
+            dist.ppm(),
+            8,
+            &params(),
+            Placement::RoundRobin,
+            40_000,
+            0x73,
+        );
         let hp = simulate_once(
             dist.ppm(),
             8,
@@ -570,9 +667,20 @@ mod tests {
         // Uniform popularity + round-robin homes → per-rank dispatch_intra load is
         // nearly flat (small cv): the regime where skew-blind models would agree.
         let dist = RoutingDistribution::uniform(64);
-        let steps = simulate_once(dist.ppm(), 8, &params(), Placement::RoundRobin, 40_000, 0x1234);
+        let steps = simulate_once(
+            dist.ppm(),
+            8,
+            &params(),
+            Placement::RoundRobin,
+            40_000,
+            0x1234,
+        );
         let loads: Vec<u64> = (0..8).map(|r| load(&steps[1], r)).collect();
-        assert!(cv(&loads) < 0.05, "uniform load not flat: cv={}", cv(&loads));
+        assert!(
+            cv(&loads) < 0.05,
+            "uniform load not flat: cv={}",
+            cv(&loads)
+        );
     }
 
     #[test]
@@ -585,19 +693,47 @@ mod tests {
             *r = 1.0;
         }
         let dist = RoutingDistribution::from_profile(&ratios);
-        let steps = simulate_once(dist.ppm(), 8, &params(), Placement::RoundRobin, 40_000, 0x55);
+        let steps = simulate_once(
+            dist.ppm(),
+            8,
+            &params(),
+            Placement::RoundRobin,
+            40_000,
+            0x55,
+        );
         let dom0: u64 = (0..4).map(|r| load(&steps[2], r)).sum();
         let dom1: u64 = (4..8).map(|r| load(&steps[2], r)).sum();
-        assert!(dom0 > dom1, "hot domain reduce {dom0} should exceed cold {dom1}");
+        assert!(
+            dom0 > dom1,
+            "hot domain reduce {dom0} should exceed cold {dom1}"
+        );
         let loads: Vec<u64> = (0..8).map(|r| load(&steps[2], r)).collect();
-        assert!(cv(&loads) > 0.1, "skew should make load uneven: cv={}", cv(&loads));
+        assert!(
+            cv(&loads) > 0.1,
+            "skew should make load uneven: cv={}",
+            cv(&loads)
+        );
     }
 
     #[test]
     fn deterministic_for_fixed_seed() {
         let dist = RoutingDistribution::power_law(64, 1.0);
-        let a = simulate_once(dist.ppm(), 4, &params(), Placement::RoundRobin, 8192, 0x9E37);
-        let b = simulate_once(dist.ppm(), 4, &params(), Placement::RoundRobin, 8192, 0x9E37);
+        let a = simulate_once(
+            dist.ppm(),
+            4,
+            &params(),
+            Placement::RoundRobin,
+            8192,
+            0x9E37,
+        );
+        let b = simulate_once(
+            dist.ppm(),
+            4,
+            &params(),
+            Placement::RoundRobin,
+            8192,
+            0x9E37,
+        );
         for i in 0..6 {
             assert_eq!(a[i].send_bytes, b[i].send_bytes);
             assert_eq!(a[i].recv_bytes, b[i].recv_bytes);
@@ -608,7 +744,15 @@ mod tests {
     fn curve_has_one_point_per_grid_and_is_increasing() {
         let dist = RoutingDistribution::uniform(64);
         let grid = [128u32, 512, 2_048, 8_192];
-        let curves = simulate_moe_comm(dist.ppm(), 8, &params(), Placement::RoundRobin, &grid, 16, 0xC0FFEE);
+        let curves = simulate_moe_comm(
+            dist.ppm(),
+            8,
+            &params(),
+            Placement::RoundRobin,
+            &grid,
+            16,
+            0xC0FFEE,
+        );
         for stage in [0usize, 1, 2, 3] {
             let pts = &curves[stage].points;
             assert_eq!(pts.len(), grid.len());
@@ -691,8 +835,10 @@ mod tests {
             // placement averaged over which rank is the single home).
             let experts_per_rank = crate::timing::routing::balanced_expert_counts(e, ep);
             let ranks_per_domain = crate::timing::routing::ranks_per_nvl_domain(ep, nvl);
-            let rank_hit_prob: Vec<f64> =
-                experts_per_rank.iter().map(|&c| hit_prob(e, c, k)).collect();
+            let rank_hit_prob: Vec<f64> = experts_per_rank
+                .iter()
+                .map(|&c| hit_prob(e, c, k))
+                .collect();
             let mut domain_starts = Vec::with_capacity(ranks_per_domain.len());
             let mut domain_start_acc = 0usize;
             for &domain_size in &ranks_per_domain {
@@ -737,12 +883,10 @@ mod tests {
             // ours subtracts only the fixed rail-aligned gateway's own
             // `rank_hit_prob[gateway]` (DeepEP rail alignment). So
             //     predicted_intra = ref_intra + Σ(q_domain − q_gateway).
-            let (mut ref_inter, mut ref_intra, mut predicted_intra) =
-                (0.0f64, 0.0f64, 0.0f64);
+            let (mut ref_inter, mut ref_intra, mut predicted_intra) = (0.0f64, 0.0f64, 0.0f64);
             for owner in 0..ep as usize {
                 let owner_domain = domain_of_rank(owner);
-                let remote_domains =
-                    || (0..ranks_per_domain.len()).filter(|&d| d != owner_domain);
+                let remote_domains = || (0..ranks_per_domain.len()).filter(|&d| d != owner_domain);
                 let owner_inter: f64 = remote_domains().map(|d| domain_hit_prob[d]).sum();
                 let home_domain_intra =
                     expected_hits_per_domain[owner_domain] - rank_hit_prob[owner];
@@ -779,7 +923,14 @@ mod tests {
                 inter_max = inter_max.max(rel.abs());
                 println!(
                     "{:<8} {:>20} {:>4} {:>4} {:>4}   {:>12.4} {:>12.4} {:>+8.2}",
-                    format!("E{e}"), stage_name, ep, nvl, k, sim, ref_inter, rel
+                    format!("E{e}"),
+                    stage_name,
+                    ep,
+                    nvl,
+                    k,
+                    sim,
+                    ref_inter,
+                    rel
                 );
             }
             let intra_rows = [
@@ -808,7 +959,10 @@ mod tests {
         assert!(inter_max < 1.0, "inter vs ref diverged by {inter_max:.2}%");
         // Intra stages: must match OUR closed-form prediction to MC noise — this
         // proves the gap vs ref is fully explained by the rail-alignment term.
-        assert!(intra_max < 1.0, "intra vs our closed form diverged by {intra_max:.2}%");
+        assert!(
+            intra_max < 1.0,
+            "intra vs our closed form diverged by {intra_max:.2}%"
+        );
     }
 
     // ── Eval: HP-replicated case vs ref's ReplicatedAcrossHeadParallel ───────
@@ -842,8 +996,10 @@ mod tests {
             domain_starts.push(domain_start_acc);
             domain_start_acc += domain_size as usize;
         }
-        let rank_hit_prob: Vec<f64> =
-            experts_per_rank.iter().map(|&c| hit_prob(e, c, k)).collect();
+        let rank_hit_prob: Vec<f64> = experts_per_rank
+            .iter()
+            .map(|&c| hit_prob(e, c, k))
+            .collect();
         let expected_hits_per_domain: Vec<f64> = ranks_per_domain
             .iter()
             .enumerate()
@@ -865,10 +1021,9 @@ mod tests {
             .map(|&c| hit_prob(e, c, k))
             .collect();
         let expected_hit_domains: f64 = domain_hit_prob.iter().sum();
-        let is_in_residing_group =
-            |rank: usize, group_start: usize, group_end: usize| {
-                rank >= group_start && rank < group_end
-            };
+        let is_in_residing_group = |rank: usize, group_start: usize, group_end: usize| {
+            rank >= group_start && rank < group_end
+        };
 
         let mut copies_per_stage = [0.0f64; 6];
         for owner in 0..ep {
@@ -906,13 +1061,10 @@ mod tests {
                 } else {
                     target_domain_count += 1;
                     target_domain_experts += experts_per_domain[domain];
-                    let target_rank_experts: u32 = target_ranks_here
-                        .iter()
-                        .map(|&r| experts_per_rank[r])
-                        .sum();
+                    let target_rank_experts: u32 =
+                        target_ranks_here.iter().map(|&r| experts_per_rank[r]).sum();
                     let q_target_rank_overlap = hit_prob(e, target_rank_experts, k);
-                    copies_per_stage[2] +=
-                        expected_hits_per_domain[domain] - q_target_rank_overlap;
+                    copies_per_stage[2] += expected_hits_per_domain[domain] - q_target_rank_overlap;
                     copies_per_stage[5] += (target_ranks_here.len() - 1) as f64;
                 }
             }
@@ -948,7 +1100,11 @@ mod tests {
         let mut exact_max = 0.0f64; // dispatch_inter, inter_bcast, intra_fanout
         for &(e, ep, nvl, k, hp) in &shapes {
             let dist = RoutingDistribution::uniform(e);
-            let params = MoeNetParams { ep_size: ep, nvl_num_gpu: nvl, hidden_bytes };
+            let params = MoeNetParams {
+                ep_size: ep,
+                nvl_num_gpu: nvl,
+                hidden_bytes,
+            };
             let placement = Placement::ReplicatedHeadParallel { hp_size: hp };
             let steps = simulate_once(dist.ppm(), k, &params, placement, n_tokens, 0x4850_5F56);
             let hidden_f = f64::from(hidden_bytes);
@@ -971,8 +1127,8 @@ mod tests {
                     f64::INFINITY
                 };
                 let agreement = match stage {
-                    0 | 4 | 5 => "EXACT",                  // inter dispatch + placement-only delivery
-                    3 if single_target_domain => "EXACT",  // inter_reduce exact when 1 target domain
+                    0 | 4 | 5 => "EXACT", // inter dispatch + placement-only delivery
+                    3 if single_target_domain => "EXACT", // inter_reduce exact when 1 target domain
                     1 | 2 => "rail-gap",
                     _ => "root-gap",
                 };
@@ -985,9 +1141,14 @@ mod tests {
                 );
             }
         }
-        println!("\nEXACT-class stages max|rel| = {exact_max:.2}%  (dispatch_inter, inter_bcast,\n\
-                  intra_fanout, and inter_reduce@1-domain — same formula in both models)");
-        assert!(exact_max < 1.0, "an EXACT-class stage diverged from ref by {exact_max:.2}%");
+        println!(
+            "\nEXACT-class stages max|rel| = {exact_max:.2}%  (dispatch_inter, inter_bcast,\n\
+                  intra_fanout, and inter_reduce@1-domain — same formula in both models)"
+        );
+        assert!(
+            exact_max < 1.0,
+            "an EXACT-class stage diverged from ref by {exact_max:.2}%"
+        );
     }
 
     // ── Eval: prebuilt curve interp vs per-T routing truth ───────────────────
@@ -1004,9 +1165,18 @@ mod tests {
     fn eval_moe_comm_sim_vs_truth() {
         let dists: Vec<(&str, Box<dyn Fn(u32) -> RoutingDistribution>)> = vec![
             ("uniform", Box::new(RoutingDistribution::uniform)),
-            ("powerlaw_a0.5", Box::new(|e| RoutingDistribution::power_law(e, 0.5))),
-            ("powerlaw_a1.0", Box::new(|e| RoutingDistribution::power_law(e, 1.0))),
-            ("powerlaw_a1.5", Box::new(|e| RoutingDistribution::power_law(e, 1.5))),
+            (
+                "powerlaw_a0.5",
+                Box::new(|e| RoutingDistribution::power_law(e, 0.5)),
+            ),
+            (
+                "powerlaw_a1.0",
+                Box::new(|e| RoutingDistribution::power_law(e, 1.0)),
+            ),
+            (
+                "powerlaw_a1.5",
+                Box::new(|e| RoutingDistribution::power_law(e, 1.5)),
+            ),
             (
                 "hot8",
                 Box::new(|e| {
@@ -1039,8 +1209,15 @@ mod tests {
                     nvl_num_gpu: nvl,
                     hidden_bytes,
                 };
-                let curves =
-                    simulate_moe_comm(dist.ppm(), k, &p, Placement::RoundRobin, &grid, build_trials, 0xC0FFEE);
+                let curves = simulate_moe_comm(
+                    dist.ppm(),
+                    k,
+                    &p,
+                    Placement::RoundRobin,
+                    &grid,
+                    build_trials,
+                    0xC0FFEE,
+                );
 
                 println!("\n[{dname}] E={e} ep={ep} nvl={nvl} k={k}  (model = interp(curve, T))");
                 for &t in &t_values {
@@ -1050,7 +1227,8 @@ mod tests {
                         let seed = 0x5151_2727u64
                             .wrapping_mul(t as u64 + 1)
                             .wrapping_add(u64::from(trial));
-                        let steps = simulate_once(dist.ppm(), k, &p, Placement::RoundRobin, t, seed);
+                        let steps =
+                            simulate_once(dist.ppm(), k, &p, Placement::RoundRobin, t, seed);
                         for (i, tr) in truth.iter_mut().enumerate() {
                             *tr += steps[i].bottleneck_bytes() as f64;
                         }
@@ -1074,14 +1252,20 @@ mod tests {
                             rel
                         );
                         if rel.abs() > worst.1 {
-                            worst = (format!("{dname} E{e} ep{ep} k{k} T{t} {}", stage_names[stage]), rel.abs());
+                            worst = (
+                                format!("{dname} E{e} ep{ep} k{k} T{t} {}", stage_names[stage]),
+                                rel.abs(),
+                            );
                         }
                         gate_max = gate_max.max(rel.abs());
                     }
                 }
             }
         }
-        println!("\nGATE max|rel| over all stages/shapes/T = {gate_max:.2}%   worst: {} -> {:.2}%", worst.0, worst.1);
+        println!(
+            "\nGATE max|rel| over all stages/shapes/T = {gate_max:.2}%   worst: {} -> {:.2}%",
+            worst.0, worst.1
+        );
         assert!(
             gate_max < 5.0,
             "sim-as-model bottleneck (curve interp) diverged from routing truth by {gate_max:.2}%"

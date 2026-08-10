@@ -467,43 +467,33 @@ mod tests {
     fn unsupported_glm_identity_fails_during_pure_resolution() {
         let mut bad_hidden = cfg();
         bad_hidden.hidden_dim = 4096.into();
-        assert!(
-            validate_config(&bad_hidden)
-                .unwrap_err()
-                .contains("hidden_dim must be 6144")
-        );
+        assert!(validate_config(&bad_hidden)
+            .unwrap_err()
+            .contains("hidden_dim must be 6144"));
 
         let mut bad_vocab = cfg();
         bad_vocab.vocab_size = 32000.into();
-        assert!(
-            validate_config(&bad_vocab)
-                .unwrap_err()
-                .contains("vocab_size must be 154880")
-        );
+        assert!(validate_config(&bad_vocab)
+            .unwrap_err()
+            .contains("vocab_size must be 154880"));
 
         let mut bad_dtype = cfg();
         bad_dtype.dtype = DType::Fp16;
-        assert!(
-            validate_config(&bad_dtype)
-                .unwrap_err()
-                .contains("dtype must be bf16")
-        );
+        assert!(validate_config(&bad_dtype)
+            .unwrap_err()
+            .contains("dtype must be bf16"));
 
         let mut bad_token_id = cfg();
         bad_token_id.token_id_bytes = 4;
-        assert!(
-            validate_config(&bad_token_id)
-                .unwrap_err()
-                .contains("token_id_bytes must be 8")
-        );
+        assert!(validate_config(&bad_token_id)
+            .unwrap_err()
+            .contains("token_id_bytes must be 8"));
 
         let mut bad_position = cfg();
         bad_position.position_bytes = 4;
-        assert!(
-            validate_config(&bad_position)
-                .unwrap_err()
-                .contains("position_bytes must be 8")
-        );
+        assert!(validate_config(&bad_position)
+            .unwrap_err()
+            .contains("position_bytes must be 8"));
     }
 
     #[test]
@@ -512,16 +502,12 @@ mod tests {
         assert_eq!(checked_sum("embedding", &[12288, 8]).unwrap(), 12296);
         assert_eq!(checked_product("concat", &[2, 12288]).unwrap(), 24576);
         assert_eq!(checked_product("eh k", &[2, 6144]).unwrap(), 12288);
-        assert!(
-            checked_product("product overflow", &[u32::MAX, 2])
-                .unwrap_err()
-                .contains("overflows u32")
-        );
-        assert!(
-            checked_sum("sum overflow", &[u32::MAX, 1])
-                .unwrap_err()
-                .contains("overflows u32")
-        );
+        assert!(checked_product("product overflow", &[u32::MAX, 2])
+            .unwrap_err()
+            .contains("overflows u32"));
+        assert!(checked_sum("sum overflow", &[u32::MAX, 1])
+            .unwrap_err()
+            .contains("overflows u32"));
     }
 
     #[test]

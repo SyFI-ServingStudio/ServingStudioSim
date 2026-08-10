@@ -16,7 +16,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::timing::bridge::DType;
@@ -87,7 +87,11 @@ impl MoeModelCfg {
     /// The compute dtype for GEMMs and prefill attention q/kv: FP8 in an FP8 run,
     /// else the model's base `dtype`. In a non-FP8 run `compute_dtype() == dtype`.
     pub fn compute_dtype(&self) -> DType {
-        if self.fp8 { DType::Fp8E4m3 } else { self.dtype }
+        if self.fp8 {
+            DType::Fp8E4m3
+        } else {
+            self.dtype
+        }
     }
 
     /// Turn FP8 on/off. FP8 moves the KV cache to FP8; the base `dtype` is left

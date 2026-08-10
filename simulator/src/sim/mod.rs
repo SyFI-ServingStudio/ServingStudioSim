@@ -8,8 +8,7 @@ pub mod run;
 
 pub use frontend::{
     ArrivalMode, CapacityLimit, LoadedTrace, ReleaseMetadata, ScheduledRequest,
-    SchedulingDeclaration,
-    SessionDependency, SessionReleaseMetadata, SourceIdentities, SourceSchema, TraceDeclaration,
-    TraceFrontend, TraceKind, TraceTag,
+    SchedulingDeclaration, SessionDependency, SessionReleaseMetadata, SourceIdentities,
+    SourceSchema, TraceDeclaration, TraceFrontend, TraceKind, TraceTag,
 };
 pub use run::{run_sim, RunSummary, TerminationCause, TickCfg};

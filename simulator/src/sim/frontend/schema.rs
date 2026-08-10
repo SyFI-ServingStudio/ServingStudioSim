@@ -433,7 +433,10 @@ impl TraceDefinition for TextGenerationDefinition {
         // whatever part of that prefix is no longer resident.
         let prompt_tokens: u32 = row.cell("input_len")?;
         if prompt_tokens == 0 && session.declared_prefix_tokens() == 0 {
-            bail!("{}: input_len=0 with no prefix is an empty prompt", row.at());
+            bail!(
+                "{}: input_len=0 with no prefix is an empty prompt",
+                row.at()
+            );
         }
         Ok(Self {
             prompt_tokens,

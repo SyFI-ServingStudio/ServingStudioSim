@@ -13,7 +13,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
-fn writer_properties(dictionary_enabled: bool, statistics_enabled: bool) -> Result<WriterProperties> {
+fn writer_properties(
+    dictionary_enabled: bool,
+    statistics_enabled: bool,
+) -> Result<WriterProperties> {
     Ok(WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         // Dictionary encoding dedups each cell against a per-column dictionary via a
@@ -175,8 +178,7 @@ mod tests {
     }
 
     fn count_rows(path: &Path) -> Result<usize> {
-        let reader =
-            ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.build()?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.build()?;
         let mut total = 0;
         for b in reader {
             total += b?.num_rows();

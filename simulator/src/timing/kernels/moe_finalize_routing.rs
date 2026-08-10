@@ -261,8 +261,7 @@ mod tests {
                 deployed.num_experts_per_rank = experts_per_rank;
                 // Uniform popularity over this rank's shard; the exact split does
                 // not matter here, the row count it implies does.
-                deployed.local_ppm =
-                    vec![1_000_000 / expert_count; experts_per_rank as usize];
+                deployed.local_ppm = vec![1_000_000 / expert_count; experts_per_rank as usize];
 
                 let grid = MoeFinalizeRoutingSpec::sweep_grid(&deployed);
                 let tail = &grid.axes()[0][4..]; // past the fixed [1, 4, 8, 16] head

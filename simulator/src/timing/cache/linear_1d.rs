@@ -1,5 +1,7 @@
 use crate::timing::bridge::KernelMetrics;
-use crate::timing::cache::interp::{locate, CoverageFlags, LeafMetrics, Metrics4, MONOTONICITY_TOLERANCE};
+use crate::timing::cache::interp::{
+    locate, CoverageFlags, LeafMetrics, Metrics4, MONOTONICITY_TOLERANCE,
+};
 use crate::timing::cache::{peak_over_cells, Cache, OutlierKind, OutlierWarning, PeakRates};
 use crate::timing::sweep::SweepGrid;
 

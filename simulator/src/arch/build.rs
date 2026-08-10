@@ -20,12 +20,12 @@ use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, Routi
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    glm52_dsa_moe, glm52_vllm_dsa_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen3_attn_layerwise,
-    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
-    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel, DenseParallel,
-    DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52DsaMoeModel, Glm52DsaMoeParallel,
-    Glm52ModelCfg, Glm52MtpMode, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
-    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
+    glm52_dsa_moe, glm52_vllm_dsa_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
+    qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
+    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
+    AttnLayerwiseModel, DenseParallel, DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel,
+    Glm52DsaMoeModel, Glm52DsaMoeParallel, Glm52ModelCfg, Glm52MtpMode, Glm52VllmDsaMoeModel,
+    Glm52VllmDsaMoeParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
     Llama3DpAttnTpFfnModel, Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel,
     Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel,
     Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
@@ -753,9 +753,14 @@ pub fn glm52_vllm_dsa_moe(
         nvl_num_gpu,
         gpu_name: gpu.to_string(),
     };
-    let configs =
-        glm52_vllm_dsa_moe::build_configs(&model_cfg, &parallel, &routing, model_spec.fp8, mtp_mode)
-            .context("expanding vLLM-granularity GLM-5.2 architecture configs")?;
+    let configs = glm52_vllm_dsa_moe::build_configs(
+        &model_cfg,
+        &parallel,
+        &routing,
+        model_spec.fp8,
+        mtp_mode,
+    )
+    .context("expanding vLLM-granularity GLM-5.2 architecture configs")?;
     let resolved = glm52_vllm_dsa_moe::resolve_configs(&configs);
     glm52_vllm_dsa_moe::build(name.to_string(), resolved, bridge)
         .context("building vLLM-granularity GLM-5.2 model (often a missing profile.db row)")

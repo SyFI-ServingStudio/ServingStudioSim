@@ -91,7 +91,9 @@ pub enum CostSource {
 impl CostSource {
     /// Analytic source from a per-link bandwidth in GB/s (`1 GB/s = 1e6 bytes/ms`).
     pub fn analytic(gbps: f64) -> Self {
-        CostSource::Analytic { bytes_per_ms: (gbps * 1e6).max(f64::MIN_POSITIVE) }
+        CostSource::Analytic {
+            bytes_per_ms: (gbps * 1e6).max(f64::MIN_POSITIVE),
+        }
     }
 
     /// Time for one link to carry `message_size_bytes`.
@@ -125,7 +127,6 @@ impl CostSource {
             }
         }
     }
-
 }
 
 /// One NCCL-style communication group: the contiguous block of GPU ids whose
@@ -228,7 +229,14 @@ impl GpuCluster {
     /// dense `0..total` id space across all pools. Every worker calls this exactly
     /// once at construction, so stamping `pool_tag` here is what makes each worker's
     /// role tag reach `run_meta.json` independent of KV / comm-group registration.
-    pub fn allocate(&mut self, pool: u16, worker_id: u16, n: u16, name: &str, pool_tag: &str) -> u16 {
+    pub fn allocate(
+        &mut self,
+        pool: u16,
+        worker_id: u16,
+        n: u16,
+        name: &str,
+        pool_tag: &str,
+    ) -> u16 {
         let base = self.gpus.len() as u16;
         for offset in 0..n {
             self.gpus.push(GpuInfo {
@@ -257,7 +265,8 @@ impl GpuCluster {
         group_id: u16,
         capacity: u64,
     ) {
-        self.kv_caps.push((pool_tag, pool, worker_id, group_id, capacity));
+        self.kv_caps
+            .push((pool_tag, pool, worker_id, group_id, capacity));
     }
 
     /// Register one comm group covering `[base, base+count)`, owned by worker
@@ -457,7 +466,8 @@ impl GpuCluster {
         }
         // The receiver drains the aggregate byte total across its links.
         let recv_per_link = (total_bytes as f64 / r.count as f64).round() as u64;
-        let recv_xfer = Time::from_ms((self.cost.link_time(recv_per_link).as_ms() - alpha_ms).max(0.0));
+        let recv_xfer =
+            Time::from_ms((self.cost.link_time(recv_per_link).as_ms() - alpha_ms).max(0.0));
         // Latency paid ONCE for the whole gather (overlapped across sources).
         let arrival = start + alpha + send_xfer_max.max(recv_xfer);
         // Bookkeeping: each sender frees after its own transmission slice (no
@@ -550,7 +560,12 @@ mod tests {
         let s8 = reg(&mut c8, 0, 8);
         let d8 = reg(&mut c8, 8, 8);
         let e8 = xfer(&mut c8, Time::ZERO, s8, d8, bytes);
-        assert!(e8.as_ms() < e4.as_ms(), "8 links should beat 4: {} vs {}", e8.as_ms(), e4.as_ms());
+        assert!(
+            e8.as_ms() < e4.as_ms(),
+            "8 links should beat 4: {} vs {}",
+            e8.as_ms(),
+            e4.as_ms()
+        );
     }
 
     #[test]
@@ -577,7 +592,11 @@ mod tests {
         let e1 = xfer(&mut c, Time::ZERO, s1, d1, bytes);
         let e2 = xfer(&mut c, Time::ZERO, s2, d2, bytes);
         assert!((e1.as_ms() - 1.0).abs() < 1e-6);
-        assert!((e2.as_ms() - 1.0).abs() < 1e-6, "disjoint groups should not queue: {}", e2.as_ms());
+        assert!(
+            (e2.as_ms() - 1.0).abs() < 1e-6,
+            "disjoint groups should not queue: {}",
+            e2.as_ms()
+        );
     }
 
     /// Regression for "fast side held by bottleneck": when the recv side is
@@ -588,10 +607,10 @@ mod tests {
     #[test]
     fn recv_bottleneck_holds_sender_too() {
         let mut c = cluster();
-        let s = reg(&mut c, 0, 8);     // 8-link sender
+        let s = reg(&mut c, 0, 8); // 8-link sender
         let r_slow = reg(&mut c, 8, 2); // 2-link receiver — bottleneck
         let r_fast = reg(&mut c, 10, 8); // 8-link receiver — fast
-        // 8MB: send_dur=1ms (8 links), recv_dur=4ms (2 links). collective=4ms.
+                                         // 8MB: send_dur=1ms (8 links), recv_dur=4ms (2 links). collective=4ms.
         let e1 = xfer(&mut c, Time::ZERO, s, r_slow, 8_000_000);
         assert!((e1.as_ms() - 4.0).abs() < 1e-6, "got {}", e1.as_ms());
         // 1MB, symmetric 8-link both sides: send_dur=recv_dur=0.125ms. But the
@@ -661,7 +680,9 @@ mod tests {
         // arrival = max(1,2) = 2ms. Four serialized transfers would cost 4ms.
         let mut c = cluster();
         let d = reg(&mut c, 0, 2);
-        let srcs: Vec<(u16, u64)> = (0..4).map(|i| (reg(&mut c, 10 + i, 1), 1_000_000)).collect();
+        let srcs: Vec<(u16, u64)> = (0..4)
+            .map(|i| (reg(&mut c, 10 + i, 1), 1_000_000))
+            .collect();
         let end = gather(&mut c, Time::ZERO, &srcs, d);
         assert!((end.as_ms() - 2.0).abs() < 1e-6, "got {}", end.as_ms());
     }
@@ -679,7 +700,11 @@ mod tests {
         let fast = reg(&mut c, 4, 1);
         let _ = gather(&mut c, Time::ZERO, &[(sa, 2_000_000), (sb, 6_000_000)], d);
         let end = xfer(&mut c, Time::ZERO, sa, fast, 1_000_000);
-        assert!((end.as_ms() - 3.0).abs() < 1e-6, "A should free at 2ms, got end {}", end.as_ms());
+        assert!(
+            (end.as_ms() - 3.0).abs() < 1e-6,
+            "A should free at 2ms, got end {}",
+            end.as_ms()
+        );
     }
 
     #[test]

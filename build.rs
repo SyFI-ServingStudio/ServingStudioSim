@@ -17,7 +17,10 @@ fn main() {
     let python = std::env::var("PYO3_PYTHON").unwrap_or_else(|_| "python3".to_string());
 
     let output = Command::new(&python)
-        .args(["-c", "import sysconfig; print(sysconfig.get_config_var('LIBDIR') or '')"])
+        .args([
+            "-c",
+            "import sysconfig; print(sysconfig.get_config_var('LIBDIR') or '')",
+        ])
         .output();
 
     match output {

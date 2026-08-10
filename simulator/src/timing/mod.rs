@@ -15,14 +15,14 @@ pub use bridge::{
 };
 pub use cache::interp::{CoverageFlags, LeafMetrics, Metrics4};
 pub use cache::PeakRates;
-pub use dims::Dim;
 pub use cost_tree::{
     CostManifest, CostManifestDoc, CostManifestSection, CostNode, CostTree, CostTreeBuilder,
     Evaluator, FlatCostNode, LeafDesc,
 };
-pub use slot_input::{AttnPrefillLog, SlotInput};
+pub use dims::Dim;
 pub use kernels::engine::KernelConfig;
 pub use result::{CacheProbe, Probe};
+pub use slot_input::{AttnPrefillLog, SlotInput};
 pub use sweep::{Axis, Coords, SweepCoords, SweepGrid};
 // Re-export derive macros under the same names as their traits so users only
 // import `crate::timing::{SweepCoords, KernelConfig}` once for both `impl`

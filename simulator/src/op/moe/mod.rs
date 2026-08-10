@@ -393,7 +393,11 @@ mod tests {
         };
         // Zero at every probed T (on-grid, off-grid, and extrapolated).
         for t in [0u64, 1, 8_192, 50_000] {
-            assert_eq!(curve.bottleneck(t), 0, "absent-stage curve must be 0 at T={t}");
+            assert_eq!(
+                curve.bottleneck(t),
+                0,
+                "absent-stage curve must be 0 at T={t}"
+            );
         }
     }
 }

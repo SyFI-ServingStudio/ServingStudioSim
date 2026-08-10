@@ -115,7 +115,10 @@ pub(crate) fn intern_backend(s: &str) -> &'static str {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
     static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
-    let mut set = POOL.get_or_init(|| Mutex::new(HashSet::new())).lock().unwrap();
+    let mut set = POOL
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap();
     if let Some(&existing) = set.get(s) {
         return existing;
     }

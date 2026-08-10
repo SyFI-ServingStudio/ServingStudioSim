@@ -505,11 +505,9 @@ mod tests {
         assert_eq!(checked_product("cast output", &[6144, 4]).unwrap(), 24576);
         assert_eq!(checked_product("select input", &[2, 256, 4]).unwrap(), 2048);
         assert_eq!(checked_product("select output", &[8, 8]).unwrap(), 64);
-        assert!(
-            checked_product("overflow", &[u32::MAX, 2])
-                .unwrap_err()
-                .contains("overflows u32")
-        );
+        assert!(checked_product("overflow", &[u32::MAX, 2])
+            .unwrap_err()
+            .contains("overflows u32"));
     }
 
     #[test]
@@ -567,10 +565,8 @@ mod tests {
         }
         let mut zero_denominator = cfg();
         zero_denominator.routed_scaling_denominator = 0;
-        assert!(
-            validate_config(&zero_denominator)
-                .unwrap_err()
-                .contains("must be nonzero")
-        );
+        assert!(validate_config(&zero_denominator)
+            .unwrap_err()
+            .contains("must be nonzero"));
     }
 }
