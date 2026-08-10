@@ -37,7 +37,20 @@ impl ResolvedPrefillContext {
     ) -> Self {
         let declared_prefix_tokens = session_input.declared_prefix_tokens();
         debug_assert!(resident_prefix_tokens <= declared_prefix_tokens);
-        let missing_prefix_tokens = declared_prefix_tokens - resident_prefix_tokens;
+        let mut missing_prefix_tokens = declared_prefix_tokens - resident_prefix_tokens;
+        let mut resident_prefix_tokens = resident_prefix_tokens;
+        // A prompt whose prefix is entirely resident still has to run one token
+        // through the model: the last position is what produces the first output
+        // logits, and no engine can emit a token it never computed. Real serving
+        // stacks recompute that last token rather than serving a zero-length
+        // prefill, and the coding-agent trace does contain such rounds (a
+        // resumed turn that adds nothing new). Borrow the token from the
+        // resident prefix instead of adding one on top, so
+        // `hit + computed == fresh + declared` still holds exactly.
+        if fresh_prompt_tokens == 0 && missing_prefix_tokens == 0 && resident_prefix_tokens > 0 {
+            resident_prefix_tokens -= 1;
+            missing_prefix_tokens = 1;
+        }
         let prefill_tokens_to_compute = fresh_prompt_tokens
             .checked_add(missing_prefix_tokens)
             .expect("resolved prefill token count overflow");
@@ -141,6 +154,20 @@ pub trait PrefixKv: KvStore {
     );
     fn resolved_prefill_context(&self, request: RequestId) -> ResolvedPrefillContext;
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time);
+
+    /// How much of `session_input`'s declared prefix is resident *right now*,
+    /// wherever it lives. This is what a cache-aware pending order ranks by;
+    /// `declared_prefix_tokens` is only its upper bound. A session with no
+    /// retained partition has nothing to reuse and scores zero.
+    ///
+    /// Two hash lookups, no mutation — cheap enough for the admission hot path.
+    fn resident_prefix_tokens(&self, fresh_prompt_tokens: u32, session_input: SessionInput) -> u32 {
+        let Some(partition) = self.retained_prefix_partition(session_input) else {
+            return 0;
+        };
+        self.preview_prefill_context(partition, fresh_prompt_tokens, session_input)
+            .resident_prefix_tokens()
+    }
 
     fn prefill_tokens_to_compute(&self, request: RequestId) -> u32 {
         self.resolved_prefill_context(request)

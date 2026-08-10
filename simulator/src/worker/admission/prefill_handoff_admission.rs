@@ -95,6 +95,7 @@ where
                     0,
                     session_input,
                     conversation_start_time,
+                    kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input),
                 );
                 self.policy.push(candidate, &mut self.policy_context);
             }

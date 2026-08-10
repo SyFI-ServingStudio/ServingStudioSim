@@ -126,7 +126,8 @@ where
     E: AttentionLayerExecution,
 {
     fn on_msg_admit(&mut self, request: RequestId) {
-        self.admission.enqueue_fresh_request(request, &self.context);
+        self.admission
+            .enqueue_fresh_request(self.pipeline.kv(), request, &self.context);
     }
 
     fn on_msg_release(&mut self, request: RequestId, now: Time) {

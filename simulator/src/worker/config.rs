@@ -15,6 +15,7 @@ use serde::Deserialize;
 
 use schema_derive::ProviderSchema;
 
+use super::admission::PendingOrderKind;
 use super::kv::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 
 /// Batch-composition policy for the chunked-prefill worker. Closed set → serde
@@ -31,6 +32,13 @@ const BATCH_POLICY_CHOICES: [&str; 3] = [
     "mix",
     "separate-prefill-priority",
     "separate-prefill-priority-no-interleave",
+];
+
+const PENDING_ORDER_CHOICES: [&str; 4] = [
+    "session-start",
+    "fifo",
+    "shortest-job-first",
+    "longest-prefix-match",
 ];
 
 const PREFIX_CACHE_POLICY_CHOICES: [&str; 4] = ["lru", "fifo", "lfu", "largest-first"];
@@ -63,7 +71,7 @@ pub enum IterWorkerSel {
         gpu_time_multiplier: f64,
         /// Optional per-iteration token budget. When set, admission reserves the
         /// budget for the live decodes (1 tok/req) first, then admits whole
-        /// prefills (the production builder injects `SessionStartOrder`) until the
+        /// prefills (in `pending_order`) until the
         /// remaining budget is exhausted; a single over-long prefill is still
         /// force-admitted when the group holds budget but nothing yet. None =
         /// unbounded (`u32::MAX` internally). (Distinct from
@@ -71,6 +79,10 @@ pub enum IterWorkerSel {
         /// prefills to fit; this budget is soft — one whole prefill may exceed it.)
         #[serde(default)]
         max_batch_tokens: Option<u32>,
+        /// Order in which queued requests are offered to the admission gates.
+        #[serde(default)]
+        #[param(string, default = "session-start", choices = PENDING_ORDER_CHOICES)]
+        pending_order: PendingOrderKind,
         /// Whether completed-session KV may reuse currently idle attention KV.
         #[serde(default)]
         #[param(string, default = "opportunistic", choices = PREFIX_CACHE_MODE_CHOICES)]
@@ -103,6 +115,12 @@ pub enum IterWorkerSel {
         /// internally).
         #[serde(default)]
         max_batch_tokens: Option<u32>,
+        /// Order in which queued requests are offered to the admission gates.
+        /// `session-start` favours long-lived conversations (and so the largest
+        /// retained prefixes); `fifo` is plain request arrival order.
+        #[serde(default)]
+        #[param(string, default = "session-start", choices = PENDING_ORDER_CHOICES)]
+        pending_order: PendingOrderKind,
         /// Whether completed-session KV may reuse each partition's idle KV.
         #[serde(default)]
         #[param(string, default = "opportunistic", choices = PREFIX_CACHE_MODE_CHOICES)]

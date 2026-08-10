@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
-use crate::worker::admission::{PrefillHandoffAdmission, SessionStartOrder};
+use crate::worker::admission::{PendingOrder, PrefillHandoffAdmission};
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
 use crate::worker::types::WorkerConfig;
@@ -62,7 +62,8 @@ pub(crate) fn build_pd_prefill_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
-    let admission = PrefillHandoffAdmission::new(SessionStartOrder::new(), (), send_group_id);
+    let admission =
+        PrefillHandoffAdmission::new(PendingOrder::new(config.pending_order), (), send_group_id);
 
     IterBatchWorker::from_components(
         essentials.context,

@@ -18,8 +18,8 @@ pub mod types;
 pub(crate) mod workers;
 
 pub use admission::{
-    AdmissionCandidate, FifoOrder, LoadBalance, PendingOrderPolicy, SessionStartOrder,
-    ShortestJobFirst,
+    AdmissionCandidate, FifoOrder, LoadBalance, LongestPrefixMatch, PendingOrder, PendingOrderKind,
+    PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
 pub(crate) use config::resolve_prefix_cache_config;
 pub use config::{AttnWorkerSel, BatchPolicy, FfnWorkerSel, IterWorkerSel};

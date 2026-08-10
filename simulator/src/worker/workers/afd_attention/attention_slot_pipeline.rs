@@ -110,6 +110,10 @@ where
         &mut self.kv_store
     }
 
+    pub(super) fn kv(&self) -> &K {
+        &self.kv_store
+    }
+
     pub(super) fn place_request(&mut self, request: RequestId) {
         let slot = self.choose_least_kv_slot();
         self.slots[slot].pending_request_ids.push(request);

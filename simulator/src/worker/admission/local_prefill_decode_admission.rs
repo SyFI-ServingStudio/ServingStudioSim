@@ -58,7 +58,12 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         }
     }
 
-    pub(crate) fn accept_message(&mut self, msg: WorkerMsgCommon, context: &WorkerContext) {
+    pub(crate) fn accept_message(
+        &mut self,
+        kv_store: &impl PrefixKv,
+        msg: WorkerMsgCommon,
+        context: &WorkerContext,
+    ) {
         let WorkerMsgCommon::Request(request) = msg;
         debug_assert!(
             !self.policy.contains(request),
@@ -86,6 +91,7 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
             remaining_output_tokens,
             session_input,
             conversation_start_time,
+            kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input),
         );
         self.policy.push(candidate, &mut self.policy_context);
     }
@@ -109,7 +115,19 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
                 }),
             );
 
-        while let Some(candidate) = self.policy.peek() {
+        loop {
+            // Bring the head back in line with what the prefix cache holds right
+            // now. No-op for every enqueue-time-frozen policy; O(1) amortized for
+            // a cache-aware one, which reconciles only the head (see
+            // `LongestPrefixMatch`). Re-run each pass because admitting can
+            // evict, which invalidates the next head.
+            self.policy.refresh_head(&mut |candidate| {
+                kv_store
+                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
+            });
+            let Some(candidate) = self.policy.peek() else {
+                break;
+            };
             let partition =
                 self.choose_prefill_partition(kv_store, candidate.session_input, num_partitions);
             let partition_index = usize::from(partition);
@@ -299,8 +317,8 @@ where
     type Msg = WorkerMsgCommon;
     type Event = WorkerEventCommon;
 
-    fn accept_message(&mut self, _kv_store: &mut K, msg: Self::Msg, context: &WorkerContext) {
-        LocalPrefillDecodeAdmission::accept_message(self, msg, context);
+    fn accept_message(&mut self, kv_store: &mut K, msg: Self::Msg, context: &WorkerContext) {
+        LocalPrefillDecodeAdmission::accept_message(self, &*kv_store, msg, context);
     }
 
     fn form_batch(&mut self, kv_store: &mut K, context: &WorkerContext, now: Time) -> bool {

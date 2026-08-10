@@ -45,7 +45,7 @@ where
     P: PendingOrderPolicy,
     K: PrefixKv,
 {
-    fn enqueue_fresh_request(&mut self, request: RequestId, context: &WorkerContext) {
+    fn enqueue_fresh_request(&mut self, kv_store: &K, request: RequestId, context: &WorkerContext) {
         debug_assert!(
             !self.policy.contains(request),
             "AFD Admit is once-per-request; duplicate pending request {request:?}"
@@ -76,6 +76,7 @@ where
             remaining_output_tokens,
             session_input,
             conversation_start_time,
+            kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input),
         );
         self.policy.push(candidate, &mut self.policy_context);
     }

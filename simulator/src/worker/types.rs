@@ -433,6 +433,10 @@ pub struct WorkerConfig {
     /// budget is applied per DP group. See
     /// [`crate::worker::admission::prefill_fits_budget`].
     pub max_batch_tokens: Option<u32>,
+    /// Queue discipline the admission lifecycle uses to pick the head it gates
+    /// (from the worker selector). Only the iter-wise local-prefill/decode and
+    /// prefill-handoff lifecycles read it today.
+    pub pending_order: crate::worker::admission::PendingOrderKind,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -448,6 +452,7 @@ impl Default for WorkerConfig {
             kv_log_stride: 8,
             gpu_time_multiplier: 1.0,
             max_batch_tokens: None,
+            pending_order: crate::worker::admission::PendingOrderKind::default(),
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
         }
     }

@@ -87,6 +87,7 @@ mod tests {
             remaining_output_tokens,
             session_input: SessionInput::Standalone,
             conversation_start_time: Time::from_ms_u64(u64::from(request_id)),
+            resident_prefix_tokens: 0,
         }
     }
 

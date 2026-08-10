@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
-use crate::worker::admission::{LocalPrefillDecodeAdmission, SessionStartOrder};
+use crate::worker::admission::{LocalPrefillDecodeAdmission, PendingOrder};
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
 use crate::worker::types::WorkerConfig;
@@ -58,7 +58,7 @@ pub(crate) fn build_barebone_worker<M: IterwiseUnifiedModel>(
         prefix_cache_logger,
     );
     let admission = LocalPrefillDecodeAdmission::new(
-        SessionStartOrder::new(),
+        PendingOrder::new(config.pending_order),
         (),
         config.max_batch_tokens,
         config.balance,

@@ -1,18 +1,136 @@
 //! Pending-request selection policy.
 //!
 //! A policy owns queue membership and ordering. Admission lifecycles freeze the
-//! immutable ranking facts once, at enqueue time, then use `peek` to test the
-//! selected request against token/KV gates. A rejected head stays queued.
+//! ranking facts once, at enqueue time, then use `peek` to test the selected
+//! request against token/KV gates. A rejected head stays queued.
+//!
+//! One fact — `resident_prefix_tokens` — decays while a request waits. Rather
+//! than re-measure the whole pending set (O(n) on the per-iteration hot path),
+//! the lifecycle offers `refresh_head`, and a policy that ranks on it keeps the
+//! frozen value as an upper bound and reconciles only its head. See
+//! [`LongestPrefixMatch`].
+
+use serde::Deserialize;
 
 use crate::common::{RequestId, SessionInput, Time};
 
 mod fifo;
+mod longest_prefix_match;
 mod session_start;
 mod shortest_job_first;
 
 pub use fifo::FifoOrder;
+pub use longest_prefix_match::LongestPrefixMatch;
 pub use session_start::SessionStartOrder;
 pub use shortest_job_first::ShortestJobFirst;
+
+/// Preset-facing queue discipline selector. Carries no state — it names which
+/// of the existing policies a worker should instantiate.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PendingOrderKind {
+    /// Oldest conversation first (the historical hardcoded behavior).
+    #[default]
+    SessionStart,
+    /// Plain request arrival order.
+    Fifo,
+    /// Smallest remaining work first.
+    ShortestJobFirst,
+    /// Most already-resident prefix KV first, so a batch recomputes as few
+    /// evicted tokens as possible.
+    LongestPrefixMatch,
+}
+
+/// Runtime-selectable pending order, so the queue discipline is a preset knob
+/// rather than a constant baked into a worker recipe.
+///
+/// This defines no ordering of its own: every method forwards to the policy the
+/// variant holds. A single concrete type keeps the worker aliases
+/// (`BareboneWorker<M>` and friends) monomorphic — making them generic over the
+/// policy would fan every downstream alias and factory out by three. The cost is
+/// one branch per queue operation, against a heap push or a deque rotation.
+pub enum PendingOrder {
+    /// Oldest conversation first. Favours long-lived sessions, which are also
+    /// the ones holding the largest prefixes.
+    SessionStart(SessionStartOrder),
+    /// Plain arrival order over requests, ignoring which conversation they
+    /// belong to.
+    Fifo(FifoOrder),
+    /// Smallest remaining work first.
+    ShortestJobFirst(ShortestJobFirst),
+    /// Most already-resident prefix KV first.
+    LongestPrefixMatch(LongestPrefixMatch),
+}
+
+impl PendingOrder {
+    pub fn new(kind: PendingOrderKind) -> Self {
+        match kind {
+            PendingOrderKind::SessionStart => Self::SessionStart(SessionStartOrder::new()),
+            PendingOrderKind::Fifo => Self::Fifo(FifoOrder::new()),
+            PendingOrderKind::ShortestJobFirst => Self::ShortestJobFirst(ShortestJobFirst::new()),
+            PendingOrderKind::LongestPrefixMatch => {
+                Self::LongestPrefixMatch(LongestPrefixMatch::new())
+            }
+        }
+    }
+}
+
+/// Forward one `&self` / `&mut self` method to whichever variant is live.
+macro_rules! dispatch {
+    ($self:ident, $inner:ident => $call:expr) => {
+        match $self {
+            PendingOrder::SessionStart($inner) => $call,
+            PendingOrder::Fifo($inner) => $call,
+            PendingOrder::ShortestJobFirst($inner) => $call,
+            PendingOrder::LongestPrefixMatch($inner) => $call,
+        }
+    };
+}
+
+impl PendingOrderPolicy for PendingOrder {
+    /// Every variant carries `Context = ()`, so the enum can too. A variant that
+    /// needed real context would have to widen this to a matching enum.
+    type Context = ();
+
+    #[inline]
+    fn push(&mut self, candidate: AdmissionCandidate, context: &mut Self::Context) {
+        dispatch!(self, inner => inner.push(candidate, context))
+    }
+
+    #[inline]
+    fn refresh_head(&mut self, resident_prefix_tokens: &mut dyn FnMut(AdmissionCandidate) -> u32) {
+        dispatch!(self, inner => inner.refresh_head(resident_prefix_tokens))
+    }
+
+    #[inline]
+    fn peek(&self) -> Option<AdmissionCandidate> {
+        dispatch!(self, inner => inner.peek())
+    }
+
+    #[inline]
+    fn pop(&mut self, context: &mut Self::Context) -> Option<AdmissionCandidate> {
+        dispatch!(self, inner => inner.pop(context))
+    }
+
+    fn remove(&mut self, request: RequestId) -> Option<AdmissionCandidate> {
+        dispatch!(self, inner => inner.remove(request))
+    }
+
+    #[inline]
+    fn contains(&self, request: RequestId) -> bool {
+        dispatch!(self, inner => inner.contains(request))
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        dispatch!(self, inner => inner.len())
+    }
+
+    #[inline]
+    fn queued_kv_tokens(&self) -> u64 {
+        dispatch!(self, inner => inner.queued_kv_tokens())
+    }
+}
 
 /// Immutable facts available to a pending-order policy.
 ///
@@ -29,6 +147,15 @@ pub struct AdmissionCandidate {
     /// Trace-declared session start, or actual arrival when this request is a
     /// standalone one-request conversation.
     pub conversation_start_time: Time,
+    /// How much of the declared prefix was resident in KV at enqueue — the real
+    /// reuse this request would get, not the `declared_prefix_tokens` it claims.
+    ///
+    /// Frozen like every other field here, but unlike them it can go out of date:
+    /// the prefix may be evicted while the request waits. It only ever shrinks
+    /// (the session's own predecessor returned its KV before this request was
+    /// enqueued), so it stays an upper bound, which is what lets
+    /// [`PendingOrderPolicy::refresh_head`] reconcile just the head.
+    pub resident_prefix_tokens: u32,
 }
 
 impl AdmissionCandidate {
@@ -54,6 +181,7 @@ impl EnqueueSequence {
         remaining_output_tokens: u32,
         session_input: SessionInput,
         conversation_start_time: Time,
+        resident_prefix_tokens: u32,
     ) -> AdmissionCandidate {
         let enqueue_sequence = self.next;
         self.next = self
@@ -67,6 +195,7 @@ impl EnqueueSequence {
             remaining_output_tokens,
             session_input,
             conversation_start_time,
+            resident_prefix_tokens,
         }
     }
 }
@@ -76,6 +205,16 @@ pub trait PendingOrderPolicy {
     type Context;
 
     fn push(&mut self, candidate: AdmissionCandidate, context: &mut Self::Context);
+
+    /// Reconcile the head with live KV state before the lifecycle reads it.
+    /// `resident_prefix_tokens` re-answers what `AdmissionCandidate` froze at
+    /// enqueue, which decays as the prefix cache evicts.
+    ///
+    /// Default no-op: a policy ranking on facts that cannot go stale pays
+    /// nothing, and the lifecycle calls this unconditionally.
+    fn refresh_head(&mut self, _resident_prefix_tokens: &mut dyn FnMut(AdmissionCandidate) -> u32) {
+    }
+
     fn peek(&self) -> Option<AdmissionCandidate>;
     fn pop(&mut self, context: &mut Self::Context) -> Option<AdmissionCandidate>;
     fn remove(&mut self, request: RequestId) -> Option<AdmissionCandidate>;

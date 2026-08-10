@@ -16,7 +16,8 @@ pub use local_prefill_decode_admission::LocalPrefillDecodeAdmission;
 pub use placement::LoadBalance;
 pub(crate) use policy::EnqueueSequence;
 pub use policy::{
-    AdmissionCandidate, FifoOrder, PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
+    AdmissionCandidate, FifoOrder, LongestPrefixMatch, PendingOrder, PendingOrderKind,
+    PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
 pub use prefill_handoff_admission::PrefillHandoffAdmission;
 pub(crate) use token_budget::prefill_fits_budget;
@@ -39,7 +40,7 @@ pub trait IterAdmission<K: KvStore> {
 }
 
 pub trait SlotPipelineAdmission<K: KvStore> {
-    fn enqueue_fresh_request(&mut self, request: RequestId, context: &WorkerContext);
+    fn enqueue_fresh_request(&mut self, kv_store: &K, request: RequestId, context: &WorkerContext);
     fn reserve_fitting_requests<'a>(
         &'a mut self,
         kv_store: &mut K,

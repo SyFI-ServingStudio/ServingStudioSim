@@ -5,7 +5,7 @@
 
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::{
-    IterAdmission, LocalPrefillDecodeAdmission, PrefillHandoffAdmission, SessionStartOrder,
+    IterAdmission, LocalPrefillDecodeAdmission, PendingOrder, PrefillHandoffAdmission,
 };
 use crate::worker::execution::{IterModelExecution, UnifiedIterExecution};
 use crate::worker::iter_worker::IterWorker;
@@ -47,18 +47,17 @@ where
 }
 
 /// Compatibility name retained for L6 factories and deployment selectors.
-pub type BareboneWorker<M> = IterBatchWorker<
-    FullAttnKv,
-    LocalPrefillDecodeAdmission<SessionStartOrder>,
-    UnifiedIterExecution<M>,
->;
+///
+/// The pending order is `PendingOrder` (a runtime dispatcher) rather than a
+/// concrete policy so the queue discipline stays a preset knob without fanning
+/// this alias — and every alias below it — out by one type per policy. The
+/// policy axis is still static: see `pending_policy_is_a_composition_axis_for_iter_lifecycles`.
+pub type BareboneWorker<M> =
+    IterBatchWorker<FullAttnKv, LocalPrefillDecodeAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 /// Multi-partition HP/DP recipe uses the same whole-iteration shell.
 pub type HpUnifiedWorker<M> = BareboneWorker<M>;
-pub type PdPrefillWorker<M> = IterBatchWorker<
-    FullAttnKv,
-    PrefillHandoffAdmission<SessionStartOrder>,
-    UnifiedIterExecution<M>,
->;
+pub type PdPrefillWorker<M> =
+    IterBatchWorker<FullAttnKv, PrefillHandoffAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 
 impl<K, A, E> IterBatchWorker<K, A, E>
 where

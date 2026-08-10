@@ -125,6 +125,7 @@ mod tests {
             remaining_output_tokens,
             session_input: SessionInput::Standalone,
             conversation_start_time: Time::ZERO,
+            resident_prefix_tokens: 0,
         }
     }
 
