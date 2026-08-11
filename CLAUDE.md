@@ -40,7 +40,8 @@ auto-skips what the host can't run. Use the `just` recipes (install: `cargo
 install just`) — they encode the env gotchas:
 
 ```bash
-just test-cpu     # Rust --lib + mocked pytest. Fast, no GPU. The default gate.
+just test-cpu     # Rust --lib + mocked pytest, xdist-parallel (~19 s). The default gate.
+                  #   `just test-cpu workers=4` on a smaller host.
 just test-gpu     # gpu tier (throughput regression, cupti). Needs a CUDA device;
                   #   the launcher builds the binary + warms profile.db itself.
 just test-all     # cpu + gpu — the usual "did my refactor break anything".
@@ -48,6 +49,12 @@ just test-bench   # opt-in: sim-speed median + Rust --ignored microbenches.
 just test-agent   # opt-in, expensive: Codex runner+judge skill cases.
 just update-golden # re-record per-GPU goldens after an INTENTIONAL cost change.
 ```
+
+`-n` lives in the recipe, not in `addopts`, so it is opt-in per caller: a bare
+`uv run pytest` stays serial (right for `-x`/`--pdb`, and the gpu tier must not
+fan out onto one device). The torch thread cap that keeps the CPU reference
+kernels off a 256-way pool *is* in `tests/conftest.py`, so it applies to every
+caller.
 
 A stale `target/` bites here: `just test-cpu` builds the simulator lib, but a few
 tests shell out to the `analyze` binary and use whatever is already built. After

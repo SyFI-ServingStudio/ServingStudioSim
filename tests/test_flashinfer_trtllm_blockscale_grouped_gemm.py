@@ -172,6 +172,9 @@ def _gpu_skip_reason() -> str | None:
     return None
 
 
+# The marker puts this in the gpu tier; `_gpu_skip_reason` is the finer gate on
+# top of it (SM90 specifically, CUDA >= 12.8, FlashInfer importable).
+@pytest.mark.gpu
 def test_sm90_direct_grouped_gemm_matches_per_expert_torch(monkeypatch):
     skip_reason = _gpu_skip_reason()
     if skip_reason is not None:
