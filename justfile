@@ -26,9 +26,13 @@ sync:
     uv sync
 
 # cpu tier — Rust unit tests + deterministic mocked pytest. No GPU/binary.
-test-cpu:
+# `workers` is the xdist worker count. Not `auto`: that means one worker per core,
+# and each worker pays ~9 s importing torch + flashinfer, so a big host spends
+# more on startup than it saves. 16 is the measured knee here (17 s, against 19 s
+# at 8 and 24); override on a smaller machine with `just test-cpu workers=4`.
+test-cpu workers="16":
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run cargo test -p simulator --lib
-    uv run pytest -m "not gpu and not agent and not bench"
+    uv run pytest -m "not gpu and not agent and not bench" -n {{workers}}
 
 # gpu tier — needs a CUDA device. Auto-includes needs_binary/needs_db tests when
 # present; the perf_api bridge / launcher set their own subprocess env.

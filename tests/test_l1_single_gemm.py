@@ -1254,6 +1254,7 @@ def test_perf_api_rejects_spec_backend_mismatch(tmp_path: Path, monkeypatch: pyt
         )
 
 
+@pytest.mark.gpu
 def test_single_gemm_perf_api_example_profile_cuda(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1484,6 +1485,7 @@ def test_comm_launcher_interfaces_exist():
         TorchMpLauncher(0)
 
 
+@pytest.mark.gpu
 def test_single_gemm_exec_smoke_cuda(tmp_path: Path):
     torch = pytest.importorskip("torch")
     pytest.importorskip("triton")

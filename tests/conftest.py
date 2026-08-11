@@ -21,12 +21,40 @@ Run under ``uv`` so torch / the venv interpreter resolve (see
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
 from launcher.exec import binary_path
+
+#: Intra-op threads the CPU reference kernels are allowed. Torch otherwise sizes
+#: its pool from the core count, and on a many-core host the fan-out/join cost
+#: dwarfs these small reference GEMMs: on a 256-core box the same three files
+#: took 18 s and 63 s on two back-to-back runs, against a flat 13 s once capped.
+#: Any small cap behaves the same (4, 8 and 32 all measured within noise), so
+#: this only bounds the pathology — it is not a tuned value.
+_TEST_INTRA_OP_THREADS = 8
+
+
+def _cap_cpu_thread_pools() -> None:
+    """Bound the thread pools before any test module imports torch.
+
+    Set as a default only: an explicit ``OMP_NUM_THREADS`` in the environment
+    still wins, so a run can be widened by hand.
+    """
+    for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(variable, str(_TEST_INTRA_OP_THREADS))
+    # A plugin may have imported torch already, in which case the OpenMP pool is
+    # sized and only the runtime setter still bites.
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        torch.set_num_threads(_TEST_INTRA_OP_THREADS)
+
+
+_cap_cpu_thread_pools()
 
 _TIER_MARKERS = {
     "gpu": "requires a CUDA device",
