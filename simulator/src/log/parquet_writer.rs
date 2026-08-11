@@ -12,12 +12,22 @@ use arrow_schema::Schema;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::schema::types::ColumnPath;
 
 fn writer_properties(
     dictionary_enabled: bool,
     statistics_enabled: bool,
+    no_dictionary_columns: &[ColumnPath],
+    no_statistics_columns: &[ColumnPath],
 ) -> Result<WriterProperties> {
-    Ok(WriterProperties::builder()
+    let mut builder = WriterProperties::builder();
+    for column in no_dictionary_columns {
+        builder = builder.set_column_dictionary_enabled(column.clone(), false);
+    }
+    for column in no_statistics_columns {
+        builder = builder.set_column_statistics_enabled(column.clone(), EnabledStatistics::None);
+    }
+    Ok(builder
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         // Dictionary encoding dedups each cell against a per-column dictionary via a
         // hash + `memcmp` (`Interner::intern`). For a column with a handful of
@@ -56,6 +66,12 @@ pub struct StreamingParquetWriter {
     /// off via [`Self::with_statistics_enabled`] to drop the per-cell `memcmp` its
     /// (unused) string-column min/max tracking costs.
     statistics_enabled: bool,
+    /// Leaf columns whose dictionary is disabled individually. See
+    /// [`Self::with_column_dictionary_disabled`].
+    no_dictionary_columns: Vec<ColumnPath>,
+    /// Leaf columns whose min/max statistics are disabled individually. See
+    /// [`Self::with_column_statistics_disabled`].
+    no_statistics_columns: Vec<ColumnPath>,
 }
 
 impl StreamingParquetWriter {
@@ -67,6 +83,8 @@ impl StreamingParquetWriter {
             rows_written: 0,
             dictionary_enabled: true,
             statistics_enabled: true,
+            no_dictionary_columns: Vec::new(),
+            no_statistics_columns: Vec::new(),
         }
     }
 
@@ -81,6 +99,52 @@ impl StreamingParquetWriter {
     /// field docs). Must be set before the first `write` opens the file.
     pub fn with_statistics_enabled(mut self, enabled: bool) -> Self {
         self.statistics_enabled = enabled;
+        self
+    }
+
+    /// Disable dictionary encoding for individual leaf columns, leaving the rest
+    /// of the stream's default alone.
+    ///
+    /// Dictionary is per *cell*: a hash plus a `memcmp` against the interner. It
+    /// earns that back only where the column's cardinality is small enough for the
+    /// dictionary to stand in for the data. Measured on a real 8h run's cost log
+    /// (975,624 rows x 1,271 slots), per column, compressed:
+    ///
+    /// | column | with dictionary | without |
+    /// |---|---|---|
+    /// | `slot_time_ms` / `slot_flops` / `slot_bytes` | 105.1 MB | 103.7 MB |
+    /// | `slot_input` | 120.8 MB | 119.7 MB |
+    /// | `slot_coverage` | 0.6 MB | 198.6 MB |
+    /// | `slot_backend` | 0.4 MB | 131.8 MB |
+    ///
+    /// So near-unique cells pay the interning and then overflow into PLAIN anyway
+    /// (0.99x — very slightly *worse* on disk), while a handful of distinct `u8`s
+    /// compress 322-346x through the dictionary's RLE. Disabling it blanket-wide
+    /// more than doubled this file (247 -> 572 MB); disabling it only where it does
+    /// not pay is free.
+    ///
+    /// Paths are per *leaf*, so a `List<item>` column is three parts — build them
+    /// with [`ColumnPath::new`], since `ColumnPath::from("a.list.item")` does not
+    /// split on `.` and silently matches nothing.
+    /// Must be set before the first `write` opens the file.
+    pub fn with_column_dictionary_disabled(mut self, columns: Vec<ColumnPath>) -> Self {
+        self.no_dictionary_columns = columns;
+        self
+    }
+
+    /// Disable min/max statistics for individual leaf columns, leaving the rest of
+    /// the stream's default alone.
+    ///
+    /// Also per cell, and for a list column nothing can ever read the result: a
+    /// predicate does not push down to a list element, so the page min/max is
+    /// written and never consulted. On the same run's rows, turning it off for the
+    /// six `slot_*` list columns cut the parquet encode 41% (227 -> 133 ns/cell)
+    /// with the file byte-for-byte the same size.
+    ///
+    /// Same per-leaf path rule as [`Self::with_column_dictionary_disabled`].
+    /// Must be set before the first `write` opens the file.
+    pub fn with_column_statistics_disabled(mut self, columns: Vec<ColumnPath>) -> Self {
+        self.no_statistics_columns = columns;
         self
     }
 
@@ -104,6 +168,8 @@ impl StreamingParquetWriter {
                 Some(writer_properties(
                     self.dictionary_enabled,
                     self.statistics_enabled,
+                    &self.no_dictionary_columns,
+                    &self.no_statistics_columns,
                 )?),
             )?;
             self.writer = Some(writer);
