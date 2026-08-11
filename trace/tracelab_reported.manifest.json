@@ -1,0 +1,23 @@
+{
+  "schema": "session-execution-v2",
+  "source_path": "/m-coriander/coriander/tmp/kanzhu/tracegen-audit/out/raw_all.csv",
+  "source_schema": "session-rounds-v1",
+  "source_sha256": "dc031b5e46f6163649d124cad2750ef852435baeab06cffa127fc66aa98dbf52",
+  "source_bytes": 17777607,
+  "context_policy": "trace_reported",
+  "major_compaction_min_drop_tokens": 64000,
+  "major_compaction_min_drop_ratio": 0.5,
+  "millisecond_decimals": 6,
+  "selection_rule": "first_n_by_arrival_then_source_order",
+  "max_sessions": null,
+  "sessions": 4281,
+  "rounds": 357161,
+  "folded_prefix_tokens": 63013099,
+  "folded_rounds": 4369,
+  "folded_first_rounds": 3114,
+  "major_compaction_rounds": 0,
+  "total_prompt_tokens": 54898360631,
+  "total_prefix_tokens": 52499834267,
+  "total_output_tokens": 186944028,
+  "planned_prefix_hit_rate": 0.9563096905548469
+}

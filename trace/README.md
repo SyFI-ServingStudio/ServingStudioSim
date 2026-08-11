@@ -27,7 +27,12 @@ request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,
 ```
 
 `trace/tracelab_preserving.csv` is the canonical one (4,281 sessions / 357,161
-rounds, materialized from the public syfi dataset with prefixes preserved). It is
-a TraceLab output, deterministic for a given seed, so it is **not tracked** — see
-`alignment/load_generator/tracelab/artifacts/trace_facts/csv_export/` to
-regenerate rather than expecting it in a fresh clone.
+rounds, materialized from the public syfi dataset with prefixes preserved);
+`trace/tracelab_reported.csv` is its counterpart under the reported-split policy.
+
+Both are ~23 MB deterministic TraceLab outputs, so `trace/tracelab_*.csv` is
+ignored — see `alignment/load_generator/tracelab/artifacts/trace_facts/csv_export/`
+to regenerate rather than expecting them in a fresh clone. The `.manifest.json`
+beside each one **is** tracked: it pins the source SHA-256 and the totals
+(sessions, rounds, prompt/prefix/output tokens, planned prefix hit rate) a run
+needs to confirm it is replaying the trace it thinks it is.
