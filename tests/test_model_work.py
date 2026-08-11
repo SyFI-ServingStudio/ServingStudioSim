@@ -153,11 +153,13 @@ def test_locked_composition_evaluates_each_shape_before_addition(
     assert sum(segment["necessary"] for segment in result["segments"]) == pytest.approx(
         expected_segmented
     )
+    # Two bases, not one: the pure-decode shapes and the prefill shape sit on
+    # opposite sides of the mode-presence cliff, which the basis key pins.
     assert result["composition"] == {
         "unique_shapes": 3,
         "iterations": 9,
-        "affine_bases": int(not force_direct_fallback),
-        "direct_fallback_bases": int(force_direct_fallback),
+        "affine_bases": 0 if force_direct_fallback else 2,
+        "direct_fallback_bases": 2 if force_direct_fallback else 0,
     }
 
 

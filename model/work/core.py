@@ -806,11 +806,17 @@ class Model:
 # ---------------------------------------------------------------------------
 
 
+# Resolved once at import: `Path.resolve()` is a realpath syscall walk, and the
+# default path is asked for on every peak/bandwidth lookup — which the locked
+# optimality labeler makes hundreds of thousands of times per run.
+# core.py is model/work/core.py; repo root is parents[2].
+_DEFAULT_SPEC_PATH = Path(__file__).resolve().parents[2] / "gpu" / "spec.json"
+
+
 def _spec_path(spec_path: str | Path | None) -> Path:
     if spec_path is not None:
         return Path(spec_path)
-    # core.py is model/work/core.py; repo root is parents[2].
-    return Path(__file__).resolve().parents[2] / "gpu" / "spec.json"
+    return _DEFAULT_SPEC_PATH
 
 
 @lru_cache(maxsize=8)
@@ -819,6 +825,9 @@ def _load_gpus(spec_path_str: str) -> tuple[dict, ...]:
         return tuple(json.load(handle)["gpus"])
 
 
+# Read-only lookup over a table that never changes within a process. Callers
+# only read the returned entry, so sharing one dict across calls is safe.
+@lru_cache(maxsize=64)
 def _find_gpu(name: str, spec_path: str | Path | None) -> dict:
     gpus = _load_gpus(str(_spec_path(spec_path)))
     wanted = name.lower()

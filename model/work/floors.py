@@ -271,7 +271,45 @@ _WORKLOAD_FIELDS = (
     "prefill_requests",
 )
 _LARGE_GEOMETRY_FIELDS = {"prefill_pairs", "prefill_cached", "decode_kv"}
+_PREFILL_FIELDS = frozenset(
+    {"prefill_tokens", "prefill_pairs", "prefill_cached", "prefill_requests"}
+)
+_DECODE_FIELDS = frozenset({"decode_passes", "decode_kv"})
 _GEOMETRY_PROBE = 1_048_576
+
+#: (routed matmul_tokens or None, past-vocab, prefill present, decode present) —
+#: every nonlinearity the affine secant is not allowed to span.
+_BasisKey = tuple[int | None, bool, bool, bool]
+
+
+def _mode_presence(totals: dict) -> tuple[bool, bool]:
+    """Whether this shape contains prefill / decode at all.
+
+    A workload scalar reaching zero is not the edge of the same linear piece: the
+    labeler emits no `*.attn.prefill` segments whatsoever for a pure-decode batch,
+    so a secant anchored on a prefill-carrying origin cannot reconstruct one — the
+    whole origin's prefill work survives as residue. Presence is part of the basis
+    key rather than something the secant is asked to span.
+    """
+    prefill = int(totals["prefill_pairs"]) > 0 or int(totals["prefill_tokens"]) > 0
+    decode = int(totals["decode_passes"]) > 0 or int(totals["decode_kv"]) > 0
+    return prefill, decode
+
+
+def _field_is_present(field_name: str, prefill_present: bool, decode_present: bool) -> bool:
+    """Does this workload axis vary within a group carrying these modes?
+
+    An absent mode's axes are pinned at zero for every member, so their deltas are
+    always zero and their coefficients are dead. Probing them anyway is not merely
+    wasted work: the probe materializes that mode's segments, which then enter the
+    basis's segment-name set and make every reconstruction disagree with the direct
+    label on `keys()`.
+    """
+    if field_name in _PREFILL_FIELDS:
+        return prefill_present
+    if field_name in _DECODE_FIELDS:
+        return decode_present
+    return True
 
 
 def _segment_work(model, totals: dict) -> dict[str, tuple[float, float]]:
@@ -299,11 +337,14 @@ def _has_routed_matmul(model) -> bool:
     )
 
 
-def _basis_key(model, totals: dict, has_routed_matmul: bool) -> tuple[int | None, bool]:
+def _basis_key(model, totals: dict, has_routed_matmul: bool) -> tuple[int | None, bool, bool, bool]:
     matmul_tokens = int(totals["matmul_tokens"])
+    prefill_present, decode_present = _mode_presence(totals)
     return (
         matmul_tokens if has_routed_matmul else None,
         matmul_tokens >= model.vocab,
+        prefill_present,
+        decode_present,
     )
 
 
@@ -313,11 +354,31 @@ def _workload_basis(
     """Affine semantic-work basis, with nonlinear dimensions pinned in the key.
 
     Current model specs are affine in the seven compressed workload scalars except
-    routed-expert weight loading and the embedding-table cap. Routed token counts are
-    therefore pinned exactly; dense token counts use one basis on each side of the
-    vocab cap. The first shape using a basis is independently checked below.
+    routed-expert weight loading, the embedding-table cap, and sparse attention's
+    selected-key cap. Routed token counts are therefore pinned exactly; dense token
+    counts use one basis on each side of the vocab cap. The shapes using a basis
+    are independently checked below.
+
+    The geometry origin is deliberately NOT zero, and it carries exactly the modes
+    the group carries. Two separate cliffs make a zero origin wrong:
+
+    - Saturation. A sparse-attention spec's work is `min(selected_k, pairs)`, so a
+      secant anchored at zero geometry crosses the kink and reports a slope of
+      `selected_k / probe` where the true slope past the cap is 0 — on GLM-5.2 DSA
+      (`index_topk` 2048, probe 1,048,576) that over-stated every attention segment
+      by ~3-4x. Anchoring inside the saturated regime keeps the secant in one piece.
+    - Mode presence. Probing an absent mode's axes materializes segments the group's
+      shapes do not have, so the origin only probes present modes (see
+      `_field_is_present`); presence itself is pinned in the basis key.
+
+    Shapes below the saturation cap still simply fail validation and take the exact
+    direct path, as before.
     """
+    prefill_present, decode_present = _mode_presence(totals)
     base_totals = {field_name: 0 for field_name in _WORKLOAD_FIELDS}
+    for field_name in _LARGE_GEOMETRY_FIELDS:
+        if _field_is_present(field_name, prefill_present, decode_present):
+            base_totals[field_name] = _GEOMETRY_PROBE
     matmul_tokens = int(totals["matmul_tokens"])
     if has_routed_matmul:
         base_totals["matmul_tokens"] = matmul_tokens
@@ -328,17 +389,16 @@ def _workload_basis(
     for field_name in _WORKLOAD_FIELDS:
         if has_routed_matmul and field_name == "matmul_tokens":
             continue
+        if not _field_is_present(field_name, prefill_present, decode_present):
+            continue
         probe = _GEOMETRY_PROBE if field_name in _LARGE_GEOMETRY_FIELDS else 1
         probe_totals = dict(base_totals)
         probe_totals[field_name] += probe
-        if field_name == "prefill_cached":
-            # `_aggregate_workload` materializes prefill attention only when pairs>0.
-            probe_totals["prefill_pairs"] = _GEOMETRY_PROBE
-            reference_totals = dict(base_totals, prefill_pairs=_GEOMETRY_PROBE)
-            reference = _segment_work(model, reference_totals)
-        else:
-            reference = base
-        delta = _subtract_segment_work(_segment_work(model, probe_totals), reference)
+        # `_aggregate_workload` materializes prefill attention only when pairs>0,
+        # which used to need a special reference for `prefill_cached`. The origin
+        # now carries every geometry field at the probe scale, so prefill exists
+        # in both the base and every probe and one shared reference suffices.
+        delta = _subtract_segment_work(_segment_work(model, probe_totals), base)
         coefficients[field_name] = {
             name: (flops / probe, bytes_ / probe) for name, (flops, bytes_) in delta.items()
         }
@@ -377,20 +437,43 @@ def _segment_work_matches(
     return True
 
 
+def _validation_shapes(weighted_shapes: list[dict]) -> list[dict]:
+    """The group members a basis must reproduce exactly to be accepted.
+
+    The first member, plus the argmin and argmax of every workload field. A basis
+    is a secant fitted inside one linear piece, so a piece boundary crossed by
+    this group shows up at a field extreme — checking the corners is what makes
+    accepting the basis for the interior defensible. Any member may still be
+    checked cheaply later; the corners are the ones that must be.
+    """
+    selected = {id(weighted_shapes[0]): weighted_shapes[0]}
+    for field_name in _WORKLOAD_FIELDS:
+        axis = lambda shape: int(shape["totals"][field_name])  # noqa: B023 - consumed in-loop
+        for extreme in (min(weighted_shapes, key=axis), max(weighted_shapes, key=axis)):
+            selected.setdefault(id(extreme), extreme)
+    return list(selected.values())
+
+
 def _validated_basis(
     model,
-    totals: dict,
+    weighted_shapes: list[dict],
     has_routed_matmul: bool,
-    basis_cache: dict[tuple[int | None, bool], dict | None],
+    basis_cache: dict[_BasisKey, dict | None],
     default_dtype: str,
 ) -> dict | None:
     """Build and independently validate one basis before any batch reduction."""
+    totals = weighted_shapes[0]["totals"]
     basis_key = _basis_key(model, totals, has_routed_matmul)
     if basis_key not in basis_cache:
         candidate = _workload_basis(model, totals, has_routed_matmul)
-        reconstructed = _reconstruct_segment_work(candidate, totals)
-        direct = _segment_work(model, totals)
-        if _segment_work_matches(reconstructed, direct):
+        matches = all(
+            _segment_work_matches(
+                _reconstruct_segment_work(candidate, shape["totals"]),
+                _segment_work(model, shape["totals"]),
+            )
+            for shape in _validation_shapes(weighted_shapes)
+        )
+        if matches:
             # Validation just proved the basis spans exactly the direct label's
             # segment names, so one label at these totals resolves every dtype.
             candidate["dtypes"] = _segment_dtypes(model, totals, default_dtype)
@@ -485,15 +568,30 @@ def _reduce_affine_group(
 
 
 def _reduce_direct_group(
-    model, weighted_shapes: list[dict], spec: dict
+    model, weighted_shapes: list[dict], spec: dict, peak, bandwidth_gbps: float
 ) -> tuple[float, float, dict[str, dict]]:
-    """Correct fallback for a future model whose work is not affine in a basis."""
+    """Correct fallback for a model whose work is not affine in a basis.
+
+    `peak` / `bandwidth_gbps` are passed in rather than rebuilt per shape: the
+    resolver memoizes per dtype, so constructing one per shape threw the memo
+    away and re-read the GPU spec for every row of a 170k-shape run.
+    """
     fused_seconds = 0.0
     segmented_seconds = 0.0
     segments_by_name: dict[str, dict] = {}
+    default_dtype = spec["dtype"]
     for weighted_shape in weighted_shapes:
         occurrences = int(weighted_shape["occurrences"])
-        payload = _label_payload(model, weighted_shape["totals"], spec)
+        label = model.label(_aggregate_workload(weighted_shape["totals"]))
+        payload = _payload_from_segment_work(
+            {segment.name: (segment.flops_total, segment.bytes_total) for segment in label.segments},
+            {
+                segment.name: segment.compute_dtype or default_dtype
+                for segment in label.segments
+            },
+            peak,
+            bandwidth_gbps,
+        )
         fused_seconds += payload["necessary"] * occurrences
         segmented_seconds += payload["segmented"] * occurrences
         for segment in payload["segments"]:
@@ -573,8 +671,8 @@ def compute_locked_compositions(log_dir: Path, compositions: dict[str, list[dict
             segments_by_name: dict[str, dict] = {}
             iteration_count = sum(int(shape["occurrences"]) for shape in weighted_shapes)
             has_routed_matmul = _has_routed_matmul(model)
-            basis_cache: dict[tuple[int | None, bool], dict | None] = {}
-            shapes_by_basis: dict[tuple[int | None, bool], list[dict]] = defaultdict(list)
+            basis_cache: dict[_BasisKey, dict | None] = {}
+            shapes_by_basis: dict[_BasisKey, list[dict]] = defaultdict(list)
             for weighted_shape in weighted_shapes:
                 occurrences = int(weighted_shape["occurrences"])
                 if occurrences <= 0:
@@ -587,14 +685,14 @@ def compute_locked_compositions(log_dir: Path, compositions: dict[str, list[dict
             for basis_shapes in shapes_by_basis.values():
                 basis = _validated_basis(
                     model,
-                    basis_shapes[0]["totals"],
+                    basis_shapes,
                     has_routed_matmul,
                     basis_cache,
                     spec["dtype"],
                 )
                 if basis is None:
                     group_fused, group_segmented, group_segments = _reduce_direct_group(
-                        model, basis_shapes, spec
+                        model, basis_shapes, spec, peak, bandwidth_gbps
                     )
                 else:
                     group_fused, group_segmented, group_segments = _reduce_affine_group(
