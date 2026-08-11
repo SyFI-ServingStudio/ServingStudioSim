@@ -37,8 +37,11 @@ HEALTH_ENDPOINTS = ("/health", "/v1/models")
 # its wording is vLLM UI, while this JSON is the versioned analyzer contract.
 _ALIGNMENT_ITERATION_RE = re.compile(r"VibeSimAlignmentIteration\s+(\{.*\})\s*$")
 _ALIGNMENT_REQUEST_TIMING_RE = re.compile(r"VibeSimAlignmentRequestTiming\s+(\{.*\})\s*$")
+_ALIGNMENT_API_REQUEST_TIMING_RE = re.compile(r"VibeSimAlignmentApiRequestTiming\s+(\{.*\})\s*$")
 _ALIGNMENT_EXPERT_LOAD_RE = re.compile(r"VibeSimAlignmentExpertLoad\s+(\{.*\})\s*$")
 _COMPLETION_ENGINE_REQUEST_RE = re.compile(r"^cmpl-(.+)-0$")
+_COMPLETION_API_REQUEST_RE = re.compile(r"^cmpl-(.+)$")
+_TOKENS_REQUEST_RE = re.compile(r"^generate-tokens-(.+)$")
 
 # Data-parallel provenance recovered from vLLM's multiproc log prefixes rather
 # than from the record body. Every DP rank runs its own EngineCore with its own
@@ -508,9 +511,10 @@ def extract_request_timings_jsonl(
 ) -> int:
     """Extract one complete EngineCore timing record per request.
 
-    Schema v1 contains TTFT only. Schema v2 adds first-token → last-token TPOT;
-    all boundaries use EngineCore monotonic timestamps and therefore exclude
-    HTTP/frontend ingress, SSE return, and client completion accounting.
+    Schema v1 contains TTFT only. Schema v2 adds first-token → last-token TPOT.
+    When the server log also carries API/SSE timing records, this extractor
+    joins them by request id and emits schema v3. Durations stay within their
+    originating process clock; no cross-process absolute timestamps are mixed.
     """
     ttft_duration_fields = {
         "engine_core_ttft_ms",
@@ -522,11 +526,126 @@ def extract_request_timings_jsonl(
         "engine_core_tpot_ms",
         "num_output_tokens",
     }
+    api_duration_fields = {
+        "api_frontend_prepare_ms",
+        "api_first_output_wait_ms",
+        "api_first_output_serialize_ms",
+        "api_token_output_receive_span_ms",
+        "api_token_sse_yield_span_ms",
+        "api_terminal_tail_ms",
+    }
+    api_v2_duration_fields = {
+        "api_stream_activation_ms",
+        "api_add_request_ms",
+        "api_collector_wait_ms",
+        "api_collector_wakeup_ms",
+        "api_generator_resume_ms",
+    }
+    api_v3_duration_fields = {
+        "api_engine_output_wait_ms",
+        "api_output_fanout_ms",
+    }
+    api_required = {
+        "schema_version",
+        "api_request_id",
+        "output_tokens",
+        "token_events",
+        "first_token_event_tokens",
+        "engine_core_ttft_ms",
+        "engine_core_decode_ms",
+        *api_duration_fields,
+    }
     required = {"schema_version", *ttft_duration_fields}
+    log_lines = Path(server_log).read_text(errors="replace").splitlines()
+    api_rows: dict[str, dict] = {}
+    for line in log_lines:
+        api_match = _ALIGNMENT_API_REQUEST_TIMING_RE.search(line)
+        if not api_match:
+            continue
+        api_row = json.loads(api_match.group(1))
+        missing = api_required - set(api_row)
+        if missing:
+            raise ValueError(
+                f"alignment API request timing record missing fields {sorted(missing)}"
+            )
+        api_schema_version = api_row["schema_version"]
+        if api_schema_version not in {1, 2, 3}:
+            raise ValueError(
+                f"unsupported alignment API request timing schema {api_schema_version!r}"
+            )
+        if api_schema_version >= 2:
+            missing = api_v2_duration_fields - set(api_row)
+            if missing:
+                raise ValueError(
+                    "alignment API request timing schema v2 record missing fields "
+                    f"{sorted(missing)}"
+                )
+        if api_schema_version == 3:
+            missing = api_v3_duration_fields - set(api_row)
+            if missing:
+                raise ValueError(
+                    "alignment API request timing schema v3 record missing fields "
+                    f"{sorted(missing)}"
+                )
+        api_request_id = api_row["api_request_id"]
+        if not isinstance(api_request_id, str) or not api_request_id:
+            raise ValueError("alignment API request timing api_request_id must be non-empty")
+        completion_match = _COMPLETION_API_REQUEST_RE.fullmatch(api_request_id)
+        tokens_match = _TOKENS_REQUEST_RE.fullmatch(api_request_id)
+        request_id = (
+            completion_match.group(1)
+            if completion_match is not None
+            else tokens_match.group(1)
+            if tokens_match is not None
+            else api_request_id
+        )
+        if expected_request_ids is not None and request_id not in expected_request_ids:
+            continue
+        if request_id in api_rows:
+            raise ValueError(f"duplicate alignment API request timing for {request_id!r}")
+        duration_fields = set(api_duration_fields)
+        if api_schema_version >= 2:
+            duration_fields.update(api_v2_duration_fields)
+        if api_schema_version == 3:
+            duration_fields.update(api_v3_duration_fields)
+        for field in {*duration_fields, "engine_core_ttft_ms", "engine_core_decode_ms"}:
+            value = api_row[field]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"alignment API request timing {field} must be nonnegative")
+        for field in ("output_tokens", "token_events", "first_token_event_tokens"):
+            value = api_row[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"alignment API request timing {field} must be a positive integer")
+        if api_row["token_events"] > api_row["output_tokens"]:
+            raise ValueError("alignment API token_events cannot exceed output_tokens")
+        if api_row["first_token_event_tokens"] > api_row["output_tokens"]:
+            raise ValueError("alignment API first_token_event_tokens cannot exceed output_tokens")
+        if api_schema_version >= 2:
+            first_output_wait_components_ms = sum(
+                api_row[field] for field in api_v2_duration_fields
+            )
+            if abs(api_row["api_first_output_wait_ms"] - first_output_wait_components_ms) > 1e-6:
+                raise ValueError(
+                    "alignment API first-output components do not sum to api_first_output_wait_ms"
+                )
+        if api_schema_version == 3:
+            collector_wait_components_ms = sum(api_row[field] for field in api_v3_duration_fields)
+            if abs(api_row["api_collector_wait_ms"] - collector_wait_components_ms) > 1e-6:
+                raise ValueError(
+                    "alignment API collector components do not sum to api_collector_wait_ms"
+                )
+        api_rows[request_id] = api_row
+
+    api_request_ids = set(api_rows)
     request_ids: set[str] = set()
     n = 0
     with Path(out_jsonl).open("w") as out:
-        for line in Path(server_log).read_text(errors="replace").splitlines():
+        for line in log_lines:
             match = _ALIGNMENT_REQUEST_TIMING_RE.search(line)
             if not match:
                 continue
@@ -555,8 +674,13 @@ def extract_request_timings_jsonl(
             if not isinstance(engine_request_id, str) or not engine_request_id:
                 raise ValueError("alignment request timing engine_request_id must be non-empty")
             completion_match = _COMPLETION_ENGINE_REQUEST_RE.fullmatch(engine_request_id)
+            tokens_match = _TOKENS_REQUEST_RE.fullmatch(engine_request_id)
             request_id = (
-                completion_match.group(1) if completion_match is not None else engine_request_id
+                completion_match.group(1)
+                if completion_match is not None
+                else tokens_match.group(1)
+                if tokens_match is not None
+                else engine_request_id
             )
             # vLLM may issue frontend-owned prefix-cache probes before TraceLab
             # starts the replay. The replay's successful request ids are the
@@ -629,8 +753,48 @@ def extract_request_timings_jsonl(
                             "alignment request timing engine_core_tpot_ms does not equal "
                             "engine_core_decode_ms/(num_output_tokens-1)"
                         )
+            api_row = api_rows.pop(request_id, None)
+            if api_row is not None:
+                if schema_version != 2:
+                    raise ValueError(
+                        "alignment API timing requires EngineCore request timing schema v2"
+                    )
+                if api_row["output_tokens"] != row["num_output_tokens"]:
+                    raise ValueError(
+                        "alignment API output_tokens does not match EngineCore num_output_tokens"
+                    )
+                for field in ("engine_core_ttft_ms", "engine_core_decode_ms"):
+                    if abs(api_row[field] - row[field]) > 1e-6:
+                        raise ValueError(
+                            f"alignment API {field} does not match EngineCore timing record"
+                        )
+                row["schema_version"] = 3
+                row["engine_timing_schema_version"] = 2
+                row["api_timing_schema_version"] = api_row["schema_version"]
+                row["api_request_id"] = api_row["api_request_id"]
+                row["api_token_events"] = api_row["token_events"]
+                row["api_first_token_event_tokens"] = api_row["first_token_event_tokens"]
+                for field in api_duration_fields:
+                    row[field] = api_row[field]
+                if api_row["schema_version"] >= 2:
+                    for field in api_v2_duration_fields:
+                        row[field] = api_row[field]
+                if api_row["schema_version"] == 3:
+                    for field in api_v3_duration_fields:
+                        row[field] = api_row[field]
             out.write(json.dumps(row) + "\n")
             n += 1
+    if api_rows:
+        raise ValueError(
+            "alignment API request timings have no matching EngineCore records: "
+            f"{sorted(api_rows)[:8]!r}"
+        )
+    if api_request_ids and api_request_ids != request_ids:
+        missing = sorted(request_ids - api_request_ids)
+        raise ValueError(
+            "alignment API request timing ids do not cover EngineCore timing ids: "
+            f"missing={missing[:8]!r}"
+        )
     if expected_request_ids is not None and request_ids != expected_request_ids:
         missing = sorted(expected_request_ids - request_ids)
         extra = sorted(request_ids - expected_request_ids)

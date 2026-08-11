@@ -213,6 +213,87 @@ def test_structured_vllm_request_timing_v2_includes_server_tpot(tmp_path):
     assert json.loads(output.read_text()) == {**record, "request_id": "vibesim_7"}
 
 
+def test_structured_vllm_tokens_request_timing_normalizes_native_envelope(tmp_path):
+    record = {
+        "schema_version": 2,
+        "engine_request_id": "generate-tokens-vibesim_7",
+        "engine_core_ttft_ms": 12.5,
+        "engine_queue_wait_ms": 3.0,
+        "engine_first_schedule_to_first_token_ms": 9.5,
+        "engine_core_decode_ms": 180.0,
+        "num_output_tokens": 10,
+        "engine_core_tpot_ms": 20.0,
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(f"INFO VibeSimAlignmentRequestTiming {json.dumps(record)}\n")
+    output = tmp_path / "request_timings.jsonl"
+
+    assert (
+        vllm_server.extract_request_timings_jsonl(
+            server_log, output, expected_request_ids={"vibesim_7"}
+        )
+        == 1
+    )
+    assert json.loads(output.read_text()) == {**record, "request_id": "vibesim_7"}
+
+
+def test_structured_vllm_request_timing_v3_joins_api_sse_durations(tmp_path):
+    engine_record = {
+        "schema_version": 2,
+        "engine_request_id": "cmpl-vibesim_7-0",
+        "engine_core_ttft_ms": 12.5,
+        "engine_queue_wait_ms": 3.0,
+        "engine_first_schedule_to_first_token_ms": 9.5,
+        "engine_core_decode_ms": 180.0,
+        "num_output_tokens": 10,
+        "engine_core_tpot_ms": 20.0,
+    }
+    api_record = {
+        "schema_version": 3,
+        "api_request_id": "cmpl-vibesim_7",
+        "output_tokens": 10,
+        "token_events": 9,
+        "first_token_event_tokens": 1,
+        "api_frontend_prepare_ms": 1.0,
+        "api_first_output_wait_ms": 13.0,
+        "api_stream_activation_ms": 1.0,
+        "api_add_request_ms": 1.5,
+        "api_collector_wait_ms": 9.0,
+        "api_engine_output_wait_ms": 7.0,
+        "api_output_fanout_ms": 2.0,
+        "api_collector_wakeup_ms": 0.5,
+        "api_generator_resume_ms": 1.0,
+        "api_first_output_serialize_ms": 0.1,
+        "api_token_output_receive_span_ms": 181.0,
+        "api_token_sse_yield_span_ms": 182.0,
+        "api_terminal_tail_ms": 0.2,
+        "engine_core_ttft_ms": 12.5,
+        "engine_core_decode_ms": 180.0,
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            [
+                f"INFO VibeSimAlignmentRequestTiming {json.dumps(engine_record)}",
+                f"INFO VibeSimAlignmentApiRequestTiming {json.dumps(api_record)}",
+            ]
+        )
+    )
+    output = tmp_path / "request_timings.jsonl"
+
+    assert vllm_server.extract_request_timings_jsonl(server_log, output) == 1
+    row = json.loads(output.read_text())
+    assert row["schema_version"] == 3
+    assert row["engine_timing_schema_version"] == 2
+    assert row["api_timing_schema_version"] == 3
+    assert row["request_id"] == "vibesim_7"
+    assert row["api_request_id"] == "cmpl-vibesim_7"
+    assert row["api_token_sse_yield_span_ms"] == 182.0
+    assert row["api_collector_wait_ms"] == 9.0
+    assert row["api_engine_output_wait_ms"] == 7.0
+    assert row["api_output_fanout_ms"] == 2.0
+
+
 def test_structured_vllm_request_timing_v2_rejects_inconsistent_tpot(tmp_path):
     record = {
         "schema_version": 2,
@@ -935,7 +1016,7 @@ def _measured_iteration(
 def _replay_row(request_id: str, submit: float, complete: float) -> str:
     return json.dumps(
         {
-            "source": {"type": "vibe_sim_request", "data": {"id": request_id}},
+            "source": {"type": "independent_request", "data": {"id": request_id}},
             "outcome": {
                 "status": "SUCCESS",
                 "submit_timestamp": submit,

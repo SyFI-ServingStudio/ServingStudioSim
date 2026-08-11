@@ -150,6 +150,16 @@ segment. These engine-core metrics exclude HTTP/frontend ingress,
 tokenization, detokenization, SSE return, `[DONE]`, and client post-processing;
 TraceLab's fields remain the client-observed latency measurements.
 
+When API timing instrumentation is enabled, the same request artifact also
+contains API-process durations from endpoint entry through the first token SSE
+yield. API timing schema v3 decomposes lazy generator activation,
+`AsyncLLM.add_request`, waiting for the first EngineCore output, output
+processing/fan-out to the per-request collector, collector wakeup, generator
+resume, and first-token serialization. The collector interval closes as API
+EngineCore-output wait plus output fan-out. The extractor compares durations
+within their originating clock domains and never subtracts EngineCore and API
+absolute timestamps across processes.
+
 The separate `expert_popularity` pass sets
 `VLLM_NVTX_SCOPES_FOR_PROFILING=0`, so it neither emits nor requires this
 request-timing artifact. Its only model-side ground truth is the expert-load

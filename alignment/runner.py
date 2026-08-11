@@ -65,6 +65,13 @@ def _resolve_fork_python(cfg: ProfileConfig) -> str:
     return str(fork)
 
 
+def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> None:
+    """Add backend-required vLLM flags exactly once to the persisted launch argv."""
+    for argument in cfg.workload.backend.required_server_args:
+        if argument not in server_argv:
+            server_argv.append(argument)
+
+
 def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     """Run one explicit measured pass: NSYS, workload timing, or popularity.
 
@@ -92,6 +99,8 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     # either — the capture it reuses is the evidence.
     fork_python = None if resume else _resolve_fork_python(cfg)
     server_argv = [] if resume else vllm_server.build_server_argv(fork_python, cfg.server)
+    if not resume:
+        _append_backend_server_args(server_argv, cfg)
     is_expert_popularity = cfg.profile_kind == "expert_popularity"
     is_workload_metrics = cfg.profile_kind == "workload_metrics"
     is_nsys = cfg.profile_kind == "nsys"
@@ -129,6 +138,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         drive_summary = {
             "source_trace": str(prepared_replay.trace_path.resolve()),
             "frontend_type": cfg.workload.frontend.type,
+            "backend_type": cfg.workload.backend.type,
             "log_path": str(prepared_replay.log_path),
             "summary_path": str(prepared_replay.summary_path),
             "resumed_from_existing_capture": True,

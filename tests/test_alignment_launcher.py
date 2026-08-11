@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from alignment import runner as alignment_runner
 from alignment.load_generator import runner as load_runner
 from alignment.profiler import vllm_server
 from alignment.timing_predict_input import BuildRequest, build_inputs
@@ -68,7 +69,7 @@ def _phase_configs(tmp_path: Path, suffix: str = ".yaml") -> dict[str, Path]:
             "gpu": "NVIDIA H200",
             "server": {"model_path": "model"},
             "workload": {
-                "frontend": {"type": "vibesim", "path": "./trace/shared.csv"},
+                "frontend": {"type": "independent", "path": "./trace/shared.csv"},
                 "text_file": "./trace/corpus.txt",
                 "tokenizer": "model/tokenizer.json",
                 "max_concurrency": 64,
@@ -815,11 +816,11 @@ def test_alignment_analysis_calls_only_selected_subjects(tmp_path, monkeypatch):
     assert invocations[1][-1:] == ["alignment-e2e"]
 
 
-def test_tracelab_invocation_keeps_vibesim_as_a_typed_frontend(tmp_path, monkeypatch):
-    from alignment.load_generator.config import LoadGeneratorConfig, VibeSimFrontendConfig
+def test_tracelab_invocation_keeps_independent_as_a_typed_frontend(tmp_path, monkeypatch):
+    from alignment.load_generator.config import IndependentFrontendConfig, LoadGeneratorConfig
 
     config = LoadGeneratorConfig(
-        frontend=VibeSimFrontendConfig(path="trace/smoke.csv"),
+        frontend=IndependentFrontendConfig(path="trace/smoke.csv"),
         text_file="corpus.txt",
         tokenizer="tokenizer.json",
         max_concurrency=64,
@@ -838,8 +839,221 @@ def test_tracelab_invocation_keeps_vibesim_as_a_typed_frontend(tmp_path, monkeyp
 
     load_runner.run_replay(config, prepared, base_url="http://localhost:8000", model="m")
     argv = commands[0][0]
-    assert argv[argv.index("--trace-format") + 1] == "vibesim"
+    assert argv[argv.index("--trace-format") + 1] == "independent"
+    assert argv[argv.index("--backend") + 1] == "openai"
+    assert argv[argv.index("--base-url") + 1] == "http://localhost:8000/v1"
     assert argv[argv.index("--max-concurrency") + 1] == "64"
+
+
+def test_tracelab_invocation_selects_vllm_tokens_backend(tmp_path, monkeypatch):
+    from alignment.load_generator.config import (
+        IndependentFrontendConfig,
+        LoadGeneratorConfig,
+        VllmTokensBackendConfig,
+    )
+
+    config = LoadGeneratorConfig(
+        frontend=IndependentFrontendConfig(path="trace/smoke.csv"),
+        text_file="corpus.txt",
+        tokenizer="tokenizer.json",
+        backend=VllmTokensBackendConfig(),
+    )
+    prepared = load_runner.PreparedReplay(
+        trace_path=tmp_path / "trace.csv",
+        text_file=tmp_path / "corpus.txt",
+        tokenizer="tokenizer.json",
+        log_path=tmp_path / "replay.jsonl",
+        summary_path=tmp_path / "summary.json",
+    )
+    commands = []
+    monkeypatch.setattr(
+        load_runner.subprocess, "run", lambda argv, **kwargs: commands.append((argv, kwargs))
+    )
+
+    result = load_runner.run_replay(
+        config, prepared, base_url="http://localhost:8000", model="m"
+    )
+
+    argv = commands[0][0]
+    assert argv[argv.index("--backend") + 1] == "vllm-tokens"
+    assert argv[argv.index("--base-url") + 1] == "http://localhost:8000"
+    assert result["backend_type"] == "vllm_tokens"
+
+
+def test_tracelab_invocation_selects_monotonic_session_context(tmp_path, monkeypatch):
+    from alignment.load_generator.config import (
+        LoadGeneratorConfig,
+        SessionFrontendConfig,
+        VllmTokensBackendConfig,
+    )
+
+    config = LoadGeneratorConfig(
+        frontend=SessionFrontendConfig(
+            path="trace/session.csv", context_policy="monotonic"
+        ),
+        text_file="corpus.txt",
+        tokenizer="tokenizer.json",
+        backend=VllmTokensBackendConfig(),
+    )
+    prepared = load_runner.PreparedReplay(
+        trace_path=tmp_path / "trace.csv",
+        text_file=tmp_path / "corpus.txt",
+        tokenizer="tokenizer.json",
+        log_path=tmp_path / "replay.jsonl",
+        summary_path=tmp_path / "summary.json",
+    )
+    commands = []
+    monkeypatch.setattr(
+        load_runner.subprocess, "run", lambda argv, **kwargs: commands.append((argv, kwargs))
+    )
+
+    result = load_runner.run_replay(
+        config, prepared, base_url="http://localhost:8000", model="m"
+    )
+
+    argv = commands[0][0]
+    assert argv[argv.index("--session-context-policy") + 1] == "monotonic"
+    assert result["session_context_policy"] == "monotonic"
+
+
+@pytest.mark.parametrize(
+    "config_field",
+    ["skip_when_reaching_limit", "fail_on_context_overflow"],
+)
+def test_tracelab_context_limit_skip_uses_canonical_cli_flag(
+    tmp_path, monkeypatch, config_field
+):
+    from alignment.load_generator.config import (
+        LoadGeneratorConfig,
+        SessionFrontendConfig,
+    )
+
+    config = LoadGeneratorConfig(
+        frontend=SessionFrontendConfig(path="trace/session.csv"),
+        text_file="corpus.txt",
+        tokenizer="tokenizer.json",
+        max_model_len=128,
+        **{config_field: True},
+    )
+    prepared = load_runner.PreparedReplay(
+        trace_path=tmp_path / "trace.csv",
+        text_file=tmp_path / "corpus.txt",
+        tokenizer="tokenizer.json",
+        log_path=tmp_path / "replay.jsonl",
+        summary_path=tmp_path / "summary.json",
+    )
+    commands = []
+    monkeypatch.setattr(
+        load_runner.subprocess, "run", lambda argv, **kwargs: commands.append((argv, kwargs))
+    )
+
+    load_runner.run_replay(config, prepared, base_url="http://localhost:8000", model="m")
+
+    argv = commands[0][0]
+    assert "--skip-when-reaching-limit" in argv
+    assert "--fail-on-context-overflow" not in argv
+
+
+def test_tracelab_context_limit_skip_requires_model_limit():
+    from alignment.load_generator.config import (
+        LoadGeneratorConfig,
+        SessionFrontendConfig,
+    )
+
+    with pytest.raises(ValueError, match="requires max_model_len"):
+        LoadGeneratorConfig(
+            frontend=SessionFrontendConfig(path="trace/session.csv"),
+            text_file="corpus.txt",
+            tokenizer="tokenizer.json",
+            skip_when_reaching_limit=True,
+        )
+
+
+def test_profile_config_allows_monotonic_session_context_with_openai_backend():
+    from alignment.load_generator.config import (
+        LoadGeneratorConfig,
+        OpenAIBackendConfig,
+        SessionFrontendConfig,
+    )
+
+    config = LoadGeneratorConfig.from_mapping(
+        {
+            "frontend": {
+                "type": "session",
+                "path": "trace/session.csv",
+                "context_policy": "monotonic",
+            },
+            "text_file": "corpus.txt",
+            "tokenizer": "tokenizer.json",
+        }
+    )
+
+    assert isinstance(config.frontend, SessionFrontendConfig)
+    assert config.frontend.context_policy == "monotonic"
+    assert isinstance(config.backend, OpenAIBackendConfig)
+
+
+def test_profile_config_rejects_unknown_session_context_policy():
+    from alignment.load_generator.config import LoadGeneratorConfig
+
+    with pytest.raises(ValueError, match="unsupported frontend.context_policy"):
+        LoadGeneratorConfig.from_mapping(
+            {
+                "frontend": {
+                    "type": "session",
+                    "path": "trace/session.csv",
+                    "context_policy": "guess",
+                },
+                "text_file": "corpus.txt",
+                "tokenizer": "tokenizer.json",
+            }
+        )
+
+
+def test_profile_config_loads_vllm_tokens_backend(tmp_path):
+    from alignment.load_generator.config import (
+        LoadGeneratorConfig,
+        VllmTokensBackendConfig,
+    )
+
+    config = LoadGeneratorConfig.from_mapping(
+        {
+            "frontend": {"type": "independent", "path": "trace/smoke.csv"},
+            "backend": {"type": "vllm_tokens"},
+            "text_file": "corpus.txt",
+            "tokenizer": "tokenizer.json",
+        }
+    )
+
+    assert isinstance(config.backend, VllmTokensBackendConfig)
+
+
+def test_profile_config_rejects_unknown_load_generator_backend():
+    from alignment.load_generator.config import LoadGeneratorConfig
+
+    with pytest.raises(ValueError, match="unsupported backend.type"):
+        LoadGeneratorConfig.from_mapping(
+            {
+                "frontend": {"type": "independent", "path": "trace/smoke.csv"},
+                "backend": {"type": "unknown"},
+                "text_file": "corpus.txt",
+                "tokenizer": "tokenizer.json",
+            }
+        )
+
+
+def test_vllm_tokens_backend_adds_server_flag_once(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["workload"]["backend"] = {"type": "vllm_tokens"}
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    config = load_profile_config(paths["profile"])
+    server_argv = ["python", "-m", "vllm.entrypoints.openai.api_server"]
+
+    alignment_runner._append_backend_server_args(server_argv, config)
+    alignment_runner._append_backend_server_args(server_argv, config)
+
+    assert server_argv.count("--tokens-only") == 1
 
 
 def test_launcher_main_dispatches_alignment_subcommand(monkeypatch):

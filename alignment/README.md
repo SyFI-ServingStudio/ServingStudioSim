@@ -80,12 +80,39 @@ nsys:
   capture_mode: cuda_profiler_api
 workload:
   frontend:
-    type: vibesim
+    type: independent
     path: ../../trace/requests.csv
+  # Optional; defaults to the OpenAI-compatible completions protocol.
+  # `vllm_tokens` selects vLLM's native token-in/token-out endpoint and makes
+  # the launcher add `--tokens-only` to the paired server automatically.
+  backend:
+    type: vllm_tokens
   text_file: ../../trace/prompts.txt
   tokenizer: meta-llama/Meta-Llama-3-8B
   max_concurrency: 64
 ```
+
+For session traces, the default `frontend.context_policy: trace_reported`
+replays each row's reported prefix/new-input split. To retain the complete prior
+prompt plus actual model output and grow context toward each row's total prompt
+target, select the token-ID-only monotonic policy explicitly:
+
+```yaml
+workload:
+  frontend:
+    type: session
+    path: ../../trace/sessions.csv
+    context_policy: monotonic
+  backend:
+    type: vllm_tokens
+```
+
+`monotonic` works with both configured backends. With `openai`, TraceLab requests
+vLLM's `return_token_ids` extension; with `vllm_tokens`, token output is native
+and server-side detokenization is disabled. In both cases, continuation requires
+complete server-returned token IDs and never uses text re-tokenization fallback.
+Small trace reductions retain the full context. A fresh context is constructed
+only for a reduction of at least 64,000 tokens and at least 50%.
 
 For MoE alignment, profiling may use three explicit passes with identical model,
 topology, backend, and workload settings:
@@ -286,12 +313,16 @@ manifest.
 
 E2E analysis writes two distinct TTFT overlays: TraceLab client-observed TTFT vs
 simulator TTFT, and vLLM engine-core queued-to-first-output TTFT vs the same
-simulator TTFT. It likewise keeps client-accounted TPOT and vLLM engine-core
-first-output-to-last-output TPOT as separate overlays against simulator TPOT,
-then overlays client E2E. Each measured/simulated pair is compared as independent
-distributions; no per-request latency ratio is computed. Request ids only audit
-whether either side lost requests, which matters when the two schedulers execute
-simultaneous arrivals in different orders.
+simulator TTFT. For replay schema v4 and later, client TTFT uses the first token-ID event
+(with an explicit first-text fallback population), while client TPOT uses the
+first-to-last token-ID delivery span divided by tokens delivered after the first
+event. vLLM EngineCore first-output-to-last-output TPOT remains a separate
+overlay against simulator TPOT, followed by client E2E. Schema-v1/v2 replay
+artifacts retain their legacy completion-amortized TPOT interpretation. Each
+measured/simulated pair is compared as independent distributions; no per-request
+latency ratio is computed. Request ids only audit whether either side lost
+requests, which matters when the two schedulers execute simultaneous arrivals in
+different orders.
 Throughput reports both client completion time and server GPU time. The client
 rate uses TraceLab's earliest post/submit through latest completion. The server
 GPU rate uses parsed NSYS's first observed kernel start through last observed

@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import LoadGeneratorConfig
+from .config import LoadGeneratorConfig, SessionFrontendConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TRACELAB_ROOT = Path(__file__).resolve().parent / "tracelab"
@@ -72,8 +72,13 @@ def run_replay(
     base_url: str,
     model: str,
 ) -> dict:
-    """Replay the shared trace against the ready OpenAI-compatible server."""
+    """Replay the shared trace through its explicitly selected wire backend."""
     prepared.log_path.parent.mkdir(parents=True, exist_ok=True)
+    protocol_base_url = (
+        f"{base_url.rstrip('/')}/v1"
+        if config.backend.type == "openai"
+        else base_url.rstrip("/")
+    )
     argv = [
         str(SESSION_RUNNER),
         "--trace",
@@ -85,7 +90,9 @@ def run_replay(
         "--tokenizer",
         prepared.tokenizer,
         "--base-url",
-        f"{base_url.rstrip('/')}/v1",
+        protocol_base_url,
+        "--backend",
+        config.backend.cli_value,
         "--model",
         model,
         "--log-path",
@@ -98,6 +105,7 @@ def run_replay(
     optional_args = (
         ("--max-items", config.max_items),
         ("--rate", config.rate),
+        ("--arrival-mode", config.arrival_mode),
         ("--token-pool-limit", config.token_pool_limit),
         ("--max-concurrency", config.max_concurrency),
         ("--max-model-len", config.max_model_len),
@@ -105,14 +113,27 @@ def run_replay(
     for flag, value in optional_args:
         if value is not None:
             argv.extend([flag, str(value)])
-    if config.fail_on_context_overflow:
-        argv.append("--fail-on-context-overflow")
+    if isinstance(config.frontend, SessionFrontendConfig):
+        argv.extend(
+            [
+                "--session-context-policy",
+                config.frontend.context_policy.replace("_", "-"),
+            ]
+        )
+    if config.context_limit_skip_enabled:
+        argv.append("--skip-when-reaching-limit")
     argv.extend(config.extra_args)
 
     subprocess.run(argv, cwd=REPO_ROOT, check=True)
     return {
         "source_trace": str(prepared.trace_path.resolve()),
         "frontend_type": config.frontend.type,
+        "session_context_policy": (
+            config.frontend.context_policy
+            if isinstance(config.frontend, SessionFrontendConfig)
+            else None
+        ),
+        "backend_type": config.backend.type,
         "log_path": str(prepared.log_path),
         "summary_path": str(prepared.summary_path),
     }

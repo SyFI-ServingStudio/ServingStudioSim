@@ -1,6 +1,6 @@
 //! End-to-end measured ↔ simulated request alignment.
 //!
-//! Client TTFT/TPOT/E2E and server EngineCore TTFT/TPOT are compared as
+//! Client token-event TTFT/TPOT/E2E and server EngineCore TTFT/TPOT are compared as
 //! independent raw distributions. Request ids only audit whether either run lost
 //! requests: execution order can differ even when both runs consume the same
 //! trace, so per-id latency subtraction would compare scheduler positions that
@@ -48,8 +48,9 @@ struct RequestMetrics {
 struct ServerRequestTimings {
     request_count: usize,
     ttft_ms: Vec<f64>,
-    // Schema v1 files do not carry TPOT. Schema v2 files carry Some, which may
-    // still be empty when every completed request generated exactly one token.
+    // Schema v1 files do not carry TPOT. Schema v2 and v3 files carry Some,
+    // which may still be empty when every request generated exactly one token.
+    // Schema v3 adds API/SSE durations but preserves the EngineCore fields.
     tpot_ms: Option<Vec<f64>>,
 }
 
@@ -96,7 +97,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let simulated = read_sim_requests(ctx, simulation_log_dir).await?;
     ensure!(
         !measured.is_empty(),
-        "measured replay contains no successful VibeSim requests"
+        "measured replay contains no successful independent requests"
     );
     ensure!(
         !simulated.is_empty(),
@@ -147,7 +148,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     }
     latency_cdf_comparisons.push(latency_cdf_comparison(
         "tpot",
-        "Client-accounted TPOT",
+        "Client token-delivery TPOT",
         "Client measured",
         &measured_tpot,
         &simulated_tpot,
@@ -309,7 +310,7 @@ fn read_server_request_timings(path: &Path) -> Result<ServerRequestTimings> {
             .and_then(Value::as_u64)
             .context("server request timing missing schema_version")?;
         ensure!(
-            matches!(row_schema_version, 1 | 2),
+            matches!(row_schema_version, 1 | 2 | 3),
             "unsupported server request timing schema {} at {} line {}",
             row_schema_version,
             path.display(),
@@ -344,7 +345,7 @@ fn read_server_request_timings(path: &Path) -> Result<ServerRequestTimings> {
         );
         ttft_ms.push(ttft_sample_ms);
 
-        if row_schema_version == 2 {
+        if matches!(row_schema_version, 2 | 3) {
             let num_output_tokens = value
                 .get("num_output_tokens")
                 .and_then(Value::as_u64)
@@ -391,7 +392,7 @@ fn read_server_request_timings(path: &Path) -> Result<ServerRequestTimings> {
     Ok(ServerRequestTimings {
         request_count: ttft_ms.len(),
         ttft_ms,
-        tpot_ms: (schema_version == Some(2)).then_some(tpot_ms),
+        tpot_ms: matches!(schema_version, Some(2 | 3)).then_some(tpot_ms),
     })
 }
 
@@ -405,7 +406,12 @@ fn read_measured_requests(path: &Path) -> Result<BTreeMap<String, RequestMetrics
         }
         let value: Value = serde_json::from_str(line)
             .with_context(|| format!("parse {} line {}", path.display(), line_index + 1))?;
-        if value.pointer("/source/type").and_then(Value::as_str) != Some("vibe_sim_request")
+        let source_type = value.pointer("/source/type").and_then(Value::as_str);
+        let is_independent_request = matches!(
+            source_type,
+            Some("independent_request" | "vibe_sim_request")
+        );
+        if !is_independent_request
             || value.pointer("/outcome/status").and_then(Value::as_str) != Some("SUCCESS")
         {
             continue;
@@ -424,11 +430,15 @@ fn read_measured_requests(path: &Path) -> Result<BTreeMap<String, RequestMetrics
             .or_else(|| outcome.get("submit_timestamp").and_then(Value::as_f64))
             .context("successful replay row missing submit/post timestamp")?;
         origin_s = origin_s.min(post);
-        raw.push((id, outcome.clone(), post));
+        let schema_version = value
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        raw.push((id, outcome.clone(), post, schema_version));
     }
 
     let mut requests = BTreeMap::new();
-    for (id, outcome, _post) in raw {
+    for (id, outcome, _post, schema_version) in raw {
         let complete = outcome
             .get("complete_timestamp")
             .and_then(Value::as_f64)
@@ -437,13 +447,23 @@ fn read_measured_requests(path: &Path) -> Result<BTreeMap<String, RequestMetrics
             .get("output_len_actual")
             .and_then(Value::as_u64)
             .context("successful replay row missing output_len_actual")?;
-        let ttft = outcome.get("first_token_ms").and_then(Value::as_f64);
+        let text_ttft = outcome.get("first_token_ms").and_then(Value::as_f64);
+        let ttft = outcome
+            .get("first_token_id_ms")
+            .and_then(Value::as_f64)
+            .or(text_ttft);
         let e2e = outcome.get("total_duration_ms").and_then(Value::as_f64);
-        let tpot = match (ttft, e2e) {
-            (Some(first), Some(total)) if output_tokens > 1 && total >= first => {
-                Some((total - first) / (output_tokens - 1) as f64)
+        let tpot = if schema_version >= 3 {
+            outcome
+                .get("token_delivery_tpot_ms")
+                .and_then(Value::as_f64)
+        } else {
+            match (text_ttft, e2e) {
+                (Some(first), Some(total)) if output_tokens > 1 && total >= first => {
+                    Some((total - first) / (output_tokens - 1) as f64)
+                }
+                _ => None,
             }
-            _ => None,
         };
         ensure!(
             requests
@@ -638,9 +658,9 @@ fn definitions() -> Value {
     json!({
         "request_id_audit": "TraceLab source.data.id and simulator request_slo.request_id are intersected only to detect missing requests; ids do not pair latency samples",
         "latency_comparison": "measured and simulated raw latency distributions are summarized independently and overlaid as two CDF curves; no per-request subtraction or division",
-        "client_ttft": "TraceLab client-observed first_token_ms distribution vs simulator ttft_ms distribution; includes frontend/network/tokenization and response-path overhead outside the engine",
+        "client_ttft": "TraceLab client-observed first token-ID event distribution vs simulator ttft_ms; falls back to first non-empty text only when the server returns no token IDs, and includes frontend/network response-path overhead outside EngineCore",
         "server_ttft": "vLLM EngineCore queued timestamp to first-token EngineCore output timestamp distribution vs the same simulator ttft_ms distribution; excludes client/frontend transport",
-        "tpot": "client-accounted (total_duration_ms - first_token_ms)/(output_tokens-1) distribution vs simulator tpot_mean_ms distribution; total_duration_ms includes response completion and client post-processing",
+        "tpot": "TraceLab first-to-last token-ID delivery span divided by tokens delivered after the first event, vs simulator tpot_mean_ms; schema-v1/v2 replay artifacts retain the legacy completion-amortized fallback for compatibility",
         "server_tpot": "vLLM EngineCore (last-token output timestamp - first-token output timestamp)/(num_output_tokens-1) distribution vs simulator tpot_mean_ms distribution; excludes HTTP/SSE/client completion overhead",
         "e2e": "measured total_duration_ms distribution vs simulator finish_decode_time_ms-arrival_time_ms distribution",
         "completion_throughput": "client-measured and simulated output tokens assigned to each request completion bin; not instantaneous token-production throughput",
@@ -756,6 +776,66 @@ mod tests {
         assert_eq!(timings.request_count, 1);
         assert_eq!(timings.ttft_ms, vec![12.5]);
         assert!(timings.tpot_ms.is_none());
+    }
+
+    #[test]
+    fn schema_v3_server_timing_preserves_engine_core_tpot() {
+        let path = std::env::temp_dir().join(format!(
+            "vibesim_alignment_server_timing_v3_{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"schema_version":3,"request_id":"vibesim_1","engine_core_ttft_ms":12.5,"engine_core_decode_ms":36.0,"num_output_tokens":4,"engine_core_tpot_ms":12.0,"api_frontend_prepare_ms":1.0,"api_first_output_wait_ms":13.0,"api_first_output_serialize_ms":0.1,"api_token_output_receive_span_ms":37.0,"api_token_sse_yield_span_ms":38.0,"api_terminal_tail_ms":0.2}"#,
+        )
+        .unwrap();
+
+        let timings = read_server_request_timings(&path).unwrap();
+        let _ = fs::remove_file(path);
+
+        assert_eq!(timings.request_count, 1);
+        assert_eq!(timings.ttft_ms, vec![12.5]);
+        assert_eq!(timings.tpot_ms, Some(vec![12.0]));
+    }
+
+    #[test]
+    fn replay_schema_v6_uses_token_event_ttft_and_tpot() {
+        let path = std::env::temp_dir().join(format!(
+            "independent_alignment_replay_v6_{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"schema_version":6,"source":{"type":"independent_request","data":{"id":"1"}},"outcome":{"status":"SUCCESS","post_timestamp":100.0,"complete_timestamp":101.0,"output_len_actual":4,"first_token_ms":10.0,"first_token_id_ms":12.0,"token_delivery_tpot_ms":3.0,"total_duration_ms":110.0}}"#,
+        )
+        .unwrap();
+
+        let requests = read_measured_requests(&path).unwrap();
+        let _ = fs::remove_file(path);
+        let request = &requests["1"];
+
+        assert_eq!(request.ttft_ms, Some(12.0));
+        assert_eq!(request.tpot_ms, Some(3.0));
+    }
+
+    #[test]
+    fn replay_schema_v2_keeps_legacy_completion_amortized_tpot() {
+        let path = std::env::temp_dir().join(format!(
+            "vibesim_alignment_replay_v2_{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"schema_version":2,"source":{"type":"vibe_sim_request","data":{"id":"1"}},"outcome":{"status":"SUCCESS","post_timestamp":100.0,"complete_timestamp":101.0,"output_len_actual":4,"first_token_ms":10.0,"total_duration_ms":110.0}}"#,
+        )
+        .unwrap();
+
+        let requests = read_measured_requests(&path).unwrap();
+        let _ = fs::remove_file(path);
+        let request = &requests["1"];
+
+        assert_eq!(request.ttft_ms, Some(10.0));
+        assert_eq!(request.tpot_ms, Some(100.0 / 3.0));
     }
 
     fn request_with_ttft(ttft_ms: f64) -> RequestMetrics {
