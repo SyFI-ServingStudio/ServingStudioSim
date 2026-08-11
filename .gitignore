@@ -16,6 +16,8 @@ profile.db-journal
 logs/
 # Large workload trace: provisioned per-worktree, not tracked (see create-worktree)
 trace/aime_long.csv
+# 5.2 MB tracegen output — regenerate with TraceLab rather than carry it in history
+trace/tracelab_preserving.csv
 
 # Editor / OS
 .vscode/
