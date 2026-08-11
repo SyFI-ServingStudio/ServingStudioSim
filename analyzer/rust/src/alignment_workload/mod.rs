@@ -23,6 +23,10 @@ use crate::session::{
     COST_LOG_TABLE,
 };
 
+/// The `input_adapter` tags this build knows how to read, one per instrumented
+/// serving engine. The record shape behind them is identical.
+const SUPPORTED_INPUT_ADAPTERS: &[&str] = &["vllm_text", "sglang_text"];
+
 const COST_COLUMNS: &[&str] = &[
     "pool_tag",
     "worker_id",
@@ -199,8 +203,11 @@ fn read_measured_points(
         }
         let record: FullMeasuredMetrics = serde_json::from_str(line)
             .with_context(|| format!("parse {} line {}", metrics_path.display(), line_index + 1))?;
+        // Both instrumented forks emit this record in the same shape; the tag
+        // names which one produced it. Unknown tags are still rejected -- the
+        // check is that the dialect is one this build knows, not that it is vLLM.
         ensure!(
-            record.input_adapter == "vllm_text",
+            SUPPORTED_INPUT_ADAPTERS.contains(&record.input_adapter.as_str()),
             "unsupported full-run metrics input_adapter {:?} at iteration {}",
             record.input_adapter,
             record.iteration_index

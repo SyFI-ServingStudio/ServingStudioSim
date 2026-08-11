@@ -15,7 +15,7 @@ from typing import Any
 
 from alignment.load_generator.config import LoadGeneratorConfig
 from alignment.profiler.config import IdleWaitConfig, NsysConfig, ProfileConfig, ServerConfig
-from alignment.timing_predict_input import VllmTextInputSpec
+from alignment.timing_predict_input import EngineTextInputSpec
 
 from .schema.loader import PresetError, _load_preset
 
@@ -36,7 +36,7 @@ class TimingPredictPhaseConfig:
     simulation_preset: Path
     profile_log_dir: Path
     log_dir: Path
-    input_builder: VllmTextInputSpec
+    input_builder: EngineTextInputSpec
 
 
 # Every subject defaults to disabled so a phase is opted into explicitly: a
@@ -122,6 +122,11 @@ def load_profile_config(path: Path) -> ProfileConfig:
         fork_python = raw.pop("fork_python", "")
         if fork_python:
             fork_python = str(_config_path_preserving_symlink(base, fork_python, "fork_python"))
+        driver_compat_lib_dir = raw.pop("driver_compat_lib_dir", "")
+        if driver_compat_lib_dir:
+            driver_compat_lib_dir = str(
+                _config_path(base, driver_compat_lib_dir, "driver_compat_lib_dir")
+            )
         config = ProfileConfig(
             log_dir=str(log_dir),
             server=server,
@@ -129,6 +134,7 @@ def load_profile_config(path: Path) -> ProfileConfig:
             idle=idle,
             nsys=nsys,
             fork_python=fork_python,
+            driver_compat_lib_dir=driver_compat_lib_dir,
             **raw,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -139,6 +145,10 @@ def load_profile_config(path: Path) -> ProfileConfig:
         raise ValueError("invalid profile config: server.tp_size must be > 0")
     if config.server.dp_size <= 0:
         raise ValueError("invalid profile config: server.dp_size must be > 0")
+    if config.engine not in {"vllm", "sglang"}:
+        raise ValueError(
+            f"invalid profile config: engine must be 'vllm' or 'sglang', got {config.engine!r}"
+        )
     if config.profile_kind not in {"nsys", "expert_popularity", "workload_metrics"}:
         raise ValueError(
             "invalid profile config: profile_kind must be 'nsys', "
@@ -159,6 +169,13 @@ def load_profile_config(path: Path) -> ProfileConfig:
         raise ValueError(
             f"invalid profile config: fork_python does not exist: {config.fork_python}"
         )
+    if config.driver_compat_lib_dir:
+        compat_library = Path(config.driver_compat_lib_dir) / "libcuda.so.1"
+        if not compat_library.is_file():
+            raise ValueError(
+                "invalid profile config: driver_compat_lib_dir holds no libcuda.so.1: "
+                f"{config.driver_compat_lib_dir}"
+            )
     return config
 
 
@@ -169,11 +186,14 @@ def load_timing_predict_config(path: Path) -> TimingPredictPhaseConfig:
     try:
         builder_raw = _pop_mapping(raw, "input_builder", "timing-predict")
         builder_type = builder_raw.pop("type", None)
-        if builder_type != "vllm_text":
+        # `vllm_text` is the pre-SGLang spelling of the same builder, kept so
+        # configs written against the single-engine pipeline still load.
+        if builder_type not in {"engine_text", "vllm_text"}:
             raise ValueError(
-                f"unsupported input_builder.type {builder_type!r}; available: ['vllm_text']"
+                f"unsupported input_builder.type {builder_type!r}; "
+                "available: ['engine_text'] (legacy alias: 'vllm_text')"
             )
-        builder = VllmTextInputSpec(**builder_raw)
+        builder = EngineTextInputSpec(**builder_raw)
         builder.validate()
         config = TimingPredictPhaseConfig(
             simulation_preset=_config_path(base, raw.pop("simulation_preset"), "simulation_preset"),

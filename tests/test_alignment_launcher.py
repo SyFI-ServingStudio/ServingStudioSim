@@ -10,7 +10,7 @@ import yaml
 
 from alignment import runner as alignment_runner
 from alignment.load_generator import runner as load_runner
-from alignment.profiler import vllm_server
+from alignment.profiler import record_extraction, vllm_server
 from alignment.timing_predict_input import BuildRequest, build_inputs
 from launcher import alignment as alignment_launcher
 from launcher import exec as launcher_exec
@@ -447,7 +447,7 @@ def test_extract_expert_popularity_aggregates_logical_counts(tmp_path):
     raw_path = tmp_path / "expert_load.jsonl"
     summary_path = tmp_path / "expert_popularity.json"
 
-    count = vllm_server.extract_expert_popularity(
+    count = record_extraction.extract_expert_popularity(
         server_log,
         raw_path,
         summary_path,
@@ -494,7 +494,7 @@ def test_extract_expert_popularity_rejects_partition_mismatch(tmp_path):
     server_log.write_text(f"INFO VibeSimAlignmentExpertLoad {json.dumps(record)}\n")
 
     with pytest.raises(ValueError, match="must be divisible"):
-        vllm_server.extract_expert_popularity(
+        record_extraction.extract_expert_popularity(
             server_log,
             tmp_path / "raw.jsonl",
             tmp_path / "summary.json",

@@ -1,13 +1,15 @@
-"""Configuration for one real vLLM profiling run.
+"""Configuration for one real serving-engine profiling run.
 
-`ProfileConfig` pins the vLLM launch (fork venv / model / GPU / chunk budget),
+`ProfileConfig` pins the engine launch (fork venv / model / GPU / chunk budget),
 the workload that drives it, the Nsight capture window, and this phase's single
 artifact root. YAML/JSON parsing belongs to ``launcher.alignment_config``; this
 module only defines the typed runtime values consumed by profiling code.
 
-`ServerConfig` / `IdleWaitConfig` are the launch-level knobs consumed by
-`vllm_server.py`. One profile represents one replica and may expose several
-devices when tensor parallelism is enabled.
+`ServerConfig` / `IdleWaitConfig` are the launch-level knobs consumed by the
+engine driver (`vllm_server.py` or `sglang_server.py`) selected by `engine`. The
+fields are stated in vLLM's vocabulary because that came first; each driver
+translates them into its own flag spellings. One profile represents one replica
+and may expose several devices when tensor parallelism is enabled.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from ..load_generator.config import LoadGeneratorConfig
 
 @dataclass
 class ServerConfig:
-    """How to launch one vLLM server for one TP x DP replica group."""
+    """How to launch one server for one TP x DP replica group."""
 
     model_path: str
     host: str = "127.0.0.1"
@@ -123,8 +125,19 @@ class ProfileConfig:
     # synchronization and D2H logging overhead must not contaminate timing.
     profile_kind: str = "nsys"
 
-    # --- vLLM side ---
+    # --- engine side ---
+    # Which serving engine to launch and whose records to expect. Both forks
+    # emit the identical alignment records, so this selects the launch driver
+    # and the log dialect, not the analysis that follows.
+    engine: str = "vllm"
     fork_python: str = ""  # abs path to the instrumented-fork venv python
+    # Directory holding a forward-compatible `libcuda.so.1` (an unpacked
+    # `cuda-compat-<major>-<minor>` package), prepended to the child's library
+    # path. Needed when the engine venv's torch was built against a newer CUDA
+    # than the host driver's user-mode library provides; empty means the host
+    # driver is already new enough. Recorded in launch metadata because it
+    # changes which user-mode driver produced the measurement.
+    driver_compat_lib_dir: str = ""
     server: ServerConfig = None  # type: ignore[assignment]
     idle: IdleWaitConfig = field(default_factory=IdleWaitConfig)
     nsys: NsysConfig = field(default_factory=NsysConfig)

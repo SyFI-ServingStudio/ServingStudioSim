@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .vllm_text import build_cases
+from .engine_text import build_cases
 
 INPUT_MANIFEST_NAME = "timing_predict_input_manifest.json"
 
@@ -16,7 +16,7 @@ GROUP_ASSIGNMENTS = ("single", "per_dp_rank")
 
 
 @dataclass(frozen=True)
-class VllmTextInputSpec:
+class EngineTextInputSpec:
     """One concrete measured-vLLM-text → iter-wise predictor conversion.
 
     Future multimodal or sharded variants must be sibling spec/builder types;
@@ -37,7 +37,7 @@ class VllmTextInputSpec:
 
     def to_mapping(self) -> dict[str, str]:
         return {
-            "type": "vllm_text",
+            "type": "engine_text",
             "measured_phase": self.measured_phase,
             "group_assignment": self.group_assignment,
         }
@@ -62,7 +62,7 @@ class BuildRequest:
     # normalized run's complete pool→role map so offline prediction cannot
     # silently fall back to an arch's best-of-N defaults.
     backends: dict[str, dict[str, list[str]]]
-    input_spec: VllmTextInputSpec
+    input_spec: EngineTextInputSpec
 
 
 @dataclass(frozen=True)

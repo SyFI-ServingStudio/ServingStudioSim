@@ -107,6 +107,10 @@ class RangeStats:
     worker: Worker
     start: int
     end: int
+    #: The thread that emitted the NVTX range, and therefore the thread whose
+    #: launches this range owns. Left unset by fixtures and by the envelope
+    #: path, where `launch_global_tid` falls back to the worker's main thread.
+    emitting_global_tid: int | None = None
     intervals: list[tuple[int, int]] = field(default_factory=list)
     kernel_count: int = 0
     sum_ns: int = 0
@@ -114,6 +118,19 @@ class RangeStats:
     kernel_name_ns: Counter[str] = field(default_factory=Counter)
     kernel_name_count: Counter[str] = field(default_factory=Counter)
     kernel_events: list[KernelEvent] = field(default_factory=list)
+
+    @property
+    def launch_global_tid(self) -> int:
+        """The globalTid whose CUDA runtime calls this range owns.
+
+        The recorded emitter when there is one. Otherwise the process's main
+        thread, reconstructed as globalPid + pid -- which only works when the
+        process was named in the trace's process table, so it is the fallback
+        rather than the rule.
+        """
+        if self.emitting_global_tid is not None:
+            return self.emitting_global_tid
+        return self.worker.global_pid + self.worker.pid
 
     @property
     def nvtx_window_ms(self) -> float:
@@ -343,6 +360,9 @@ def load_workers(con: sqlite3.Connection) -> dict[int, Worker]:
 
     Devices come from the min CUPTI kernel deviceId per globalPid; workers are the
     `VLLM::Worker` (or sglang) processes, falling back to bare `python` procs.
+
+    Also keyed by bare globalPid, so a range can be resolved by masking its
+    globalTid when the thread-level key misses -- see `worker_for_global_tid`.
     """
     device_by_pid = load_device_by_global_pid(con)
     process_rows = load_process_rows(con)
@@ -374,7 +394,38 @@ def load_workers(con: sqlite3.Connection) -> dict[int, Worker]:
         )
         # Nsight globalTid for the Python main thread is globalPid + pid.
         workers[worker.global_pid + worker.pid] = worker
+
+    # A process that ran kernels but has no row in the process table is still a
+    # worker: Nsight does not always record a comm for a process it only saw
+    # through CUPTI, and an SGLang capture hit exactly that. Its kernels are
+    # evidence enough, so it is admitted under its globalPid with the name left
+    # honestly unknown rather than dropped -- dropping it empties the worker set
+    # and the whole capture parses to zero ranges.
+    for global_pid, device_id in device_by_pid.items():
+        if any(worker.global_pid == global_pid for worker in workers.values()):
+            continue
+        workers[int(global_pid)] = Worker(
+            global_pid=int(global_pid),
+            pid=0,
+            name="unknown",
+            device_id=device_id,
+        )
     return workers
+
+
+def worker_for_global_tid(workers_by_gtid: dict[int, Worker], global_tid: int) -> Worker | None:
+    """Resolve the worker that emitted an NVTX range on `global_tid`.
+
+    The exact key works for a range emitted on the process's main thread, which
+    is where both forks emit theirs. The fallback masks the globalTid down to
+    its globalPid -- Nsight packs the thread id into the low 24 bits -- so a
+    range still resolves when it came from another thread of the same process,
+    or when that process is only known by its globalPid.
+    """
+    worker = workers_by_gtid.get(int(global_tid))
+    if worker is not None:
+        return worker
+    return workers_by_gtid.get((int(global_tid) >> 24) << 24)
 
 
 def window_rows_by_reference_rank(
@@ -382,7 +433,7 @@ def window_rows_by_reference_rank(
 ) -> list[list]:
     """Keep the reference rank's numbered window, and its peers by overlap.
 
-    `parsed_rows` is `[iteration, phase, worker, start_ns, end_ns]`. The
+    `parsed_rows` is `[iteration, phase, worker, start_ns, end_ns, global_tid]`. The
     reference rank is the lowest device id present — the same choice
     `align_ranges_into_steps` makes, so the two agree on whose clock the capture
     is described in.
@@ -458,10 +509,10 @@ def load_ranges(
         if parsed is None:
             continue
         iteration, phase = parsed
-        worker = workers_by_gtid.get(int(global_tid))
+        worker = worker_for_global_tid(workers_by_gtid, int(global_tid))
         if worker is None or worker.device_id is None:
             continue
-        parsed_rows.append([iteration, phase, worker, int(start), int(end)])
+        parsed_rows.append([iteration, phase, worker, int(start), int(end), int(global_tid)])
 
     if range_mode == "forward":
         parsed_rows = [r for r in parsed_rows if r[1] == "forward"]
@@ -480,13 +531,14 @@ def load_ranges(
                 worker=worker,
                 start=start,
                 end=end,
+                emitting_global_tid=global_tid,
             )
-            for iteration, phase, worker, start, end in windowed
+            for iteration, phase, worker, start, end, global_tid in windowed
         ]
 
     grouped: dict[tuple[int, int], list] = defaultdict(list)
-    for iteration, phase, worker, start, end in windowed:
-        grouped[(iteration, worker.global_pid)].append((phase, worker, start, end))
+    for iteration, phase, worker, start, end, global_tid in windowed:
+        grouped[(iteration, worker.global_pid)].append((phase, worker, start, end, global_tid))
 
     ranges = []
     for (iteration, _), items in grouped.items():
@@ -499,6 +551,7 @@ def load_ranges(
                 worker=worker,
                 start=min(item[2] for item in items),
                 end=max(item[3] for item in items),
+                emitting_global_tid=items[0][4],
             )
         )
     return ranges
@@ -511,14 +564,14 @@ def attach_kernels_by_correlation(
 ) -> int:
     """Attach kernels owned by CUDA runtime calls launched inside each NVTX range.
 
-    Ownership path: for each range, find runtime API calls on the worker's
+    Ownership path: for each range, find runtime API calls on the emitting
     globalTid within [start, end), collect their correlationIds, then pull every
     kernel with a matching correlationId on that globalPid. Robust to CUDA-graph
     kernels that execute outside the range wall-clock.
     """
     kernel_rows = 0
     for item in ranges:
-        global_tid = item.worker.global_pid + item.worker.pid
+        global_tid = item.launch_global_tid
         correlation_ids = [
             int(row[0])
             for row in con.execute(
@@ -1202,6 +1255,7 @@ def parse_trace(
     top_n: int = 12,
     worker_ranks: dict[int, int] | None = None,
     tp_size: int = 1,
+    dp_rank_by_device: dict[int, int] | None = None,
 ) -> dict:
     """Top-level parse: nsys sqlite → per-device per-category busy time / iter.
 
@@ -1213,6 +1267,12 @@ def parse_trace(
     `worker_ranks` (worker pid → global rank, from the server log) and `tp_size`
     resolve which DP rank ran on which device. Without them the capture is read
     as a single-rank run.
+
+    `dp_rank_by_device` short-circuits that: an engine whose workers state their
+    own device and rank has already answered the question, so its answer is used
+    directly rather than rederived from pids. It is checked against the devices
+    the capture actually shows — a mapping that does not cover them describes a
+    different run.
     """
     con = sqlite3.connect(str(sqlite_path))
     try:
@@ -1234,7 +1294,18 @@ def parse_trace(
     finally:
         con.close()
 
-    dp_rank_by_device = resolve_dp_rank_by_device(workers, worker_ranks or {}, tp_size)
+    if dp_rank_by_device is None:
+        dp_rank_by_device = resolve_dp_rank_by_device(workers, worker_ranks or {}, tp_size)
+    else:
+        captured_devices = {
+            worker.device_id for worker in workers.values() if worker.device_id is not None
+        }
+        unstated = sorted(captured_devices - set(dp_rank_by_device))
+        if unstated:
+            raise ValueError(
+                f"the capture ran kernels on device(s) {unstated}, which no worker record "
+                f"claims; stated devices are {sorted(dp_rank_by_device)}"
+            )
 
     iterations = sorted({r.iteration for r in ranges})
     stages = sorted({r.stage for r in ranges})
