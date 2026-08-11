@@ -59,7 +59,7 @@
 //! as `batch::composition` (sum for partition-style, pick-one for replicate-style
 //! HP) — one group today (unified dense asserts a single HP group).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 
@@ -672,18 +672,54 @@ pub(crate) async fn collect_iteration_workload(
     Ok(totals)
 }
 
-/// Collect fixed-batch workloads for a whole run in one scan and deduplicate equal
-/// iteration shapes per worker. Rows sharing an `iter_id` are summed before shape
-/// comparison, which keeps AFD/layered logs correct as well as one-row iterwise logs.
+/// One worker's labelable shape set, and what it stands for.
+pub(crate) struct WorkerShapeSample {
+    pub(crate) shapes: Vec<WeightedWorkload>,
+    /// Iterations the weights add up to — the worker's exact total, by construction.
+    pub(crate) iterations: u64,
+    /// Iterations actually drawn: every prefill-carrying one plus the sampled
+    /// decode-only ones. This is what the labeler's cost scales with.
+    pub(crate) labeled_iterations: u64,
+    /// Stride applied to the decode-only stratum (1 = that stratum is exact too).
+    pub(crate) decode_stride: u64,
+}
+
+/// Collect fixed-batch workloads for a run and deduplicate equal iteration shapes
+/// per worker. Rows sharing an `iter_id` are summed before shape comparison, which
+/// keeps AFD/layered logs correct as well as one-row iterwise logs.
+///
+/// Shapes barely deduplicate on a real run — `decode_kv` is a running sum, so the 8h
+/// GLM-5.2 trace had 911,149 distinct shapes across 978,623 iterations — which makes
+/// "label every distinct shape" cost one label per iteration. So the iterations are
+/// **stratified**, not sampled flat:
+///
+/// - **Prefill-carrying iterations are all kept.** On that run they are 0.76% of
+///   iterations but carry 70.7% of the matmul-token mass. They are also where the
+///   variance is, and they recur on a quasi-periodic schedule that an `iter_id %
+///   stride` sample aliases against: flat stride 50 moved the floors +0.37% while
+///   flat stride 19 — a *denser* sample — moved them +1.04%, because the phase, not
+///   the sample size, decided how many prefill steps were caught.
+/// - **Decode-only iterations are sampled** to about
+///   `target_sampled_decode_iterations`. They are numerous, cheap, and drift smoothly
+///   with context length, so a systematic sample tracks them closely.
+///
+/// The kept decode shapes are then reweighted so each worker's weights sum to its
+/// exact iteration count, which leaves the caller nothing to anchor.
 pub(crate) async fn collect_workload_shapes_by_worker(
     ctx: &SessionContext,
-) -> Result<HashMap<(String, u16), Vec<WeightedWorkload>>> {
+    target_sampled_decode_iterations: u64,
+) -> Result<HashMap<(String, u16), WorkerShapeSample>> {
     let batches = collect(
         ctx,
         "SELECT CAST(pool_tag AS VARCHAR) AS pool_tag, worker_id, iter_id, groups FROM cost_log",
     )
     .await?;
-    let mut totals_by_iteration: HashMap<(String, u16, u64), WorkloadTotals> = HashMap::new();
+    // Iterations are keyed on an interned pool index, not the tag itself: a run has a
+    // handful of pools and ~1e6 iterations, so a `String` per row was allocating (and
+    // hashing) the same few names a million times.
+    let mut pool_tag_by_index: Vec<String> = Vec::new();
+    let mut index_by_pool_tag: HashMap<String, u16> = HashMap::new();
+    let mut totals_by_iteration: HashMap<(u16, u16, u64), WorkloadTotals> = HashMap::new();
     for batch in &batches {
         let pool_tags = col(batch, "pool_tag")?
             .as_any()
@@ -699,12 +735,18 @@ pub(crate) async fn collect_workload_shapes_by_worker(
         let workload_columns = WorkloadGroupColumns::new(groups_struct(groups)?)?;
         for row_index in 0..batch.num_rows() {
             let iteration_id = exact_count(value_f64(iteration_ids, row_index)?, "iter_id")?;
+            let pool_tag = pool_tags.value(row_index);
+            let pool_index = match index_by_pool_tag.get(pool_tag) {
+                Some(index) => *index,
+                None => {
+                    let index = pool_tag_by_index.len() as u16;
+                    pool_tag_by_index.push(pool_tag.to_owned());
+                    index_by_pool_tag.insert(pool_tag.to_owned(), index);
+                    index
+                }
+            };
             let totals = totals_by_iteration
-                .entry((
-                    pool_tags.value(row_index).to_string(),
-                    worker_ids.value(row_index),
-                    iteration_id,
-                ))
+                .entry((pool_index, worker_ids.value(row_index), iteration_id))
                 .or_default();
             workload_columns.add_range(
                 (offsets[row_index] as usize)..(offsets[row_index + 1] as usize),
@@ -713,15 +755,54 @@ pub(crate) async fn collect_workload_shapes_by_worker(
         }
     }
 
-    let mut occurrence_by_shape: HashMap<((String, u16), WorkloadShape), u64> = HashMap::new();
-    for ((pool_tag, worker_id, _iteration_id), totals) in totals_by_iteration {
-        let shape = WorkloadShape::from_totals(totals)?;
-        *occurrence_by_shape
-            .entry(((pool_tag, worker_id), shape))
-            .or_default() += 1;
+    // Decode-only iterations per worker, so each worker's stride is sized from its
+    // own stratum rather than from whichever worker ran longest.
+    let mut decode_iterations_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
+    for ((pool_index, worker_id, _iteration_id), totals) in &totals_by_iteration {
+        if !carries_prefill(totals) {
+            *decode_iterations_by_worker
+                .entry((*pool_index, *worker_id))
+                .or_default() += 1;
+        }
     }
-    let mut shapes_by_worker: HashMap<(String, u16), Vec<WeightedWorkload>> = HashMap::new();
+    let stride_by_worker: HashMap<(u16, u16), u64> = decode_iterations_by_worker
+        .iter()
+        .map(|(worker_key, decode_iterations)| {
+            let stride = (decode_iterations / target_sampled_decode_iterations.max(1)).max(1);
+            (*worker_key, stride)
+        })
+        .collect();
+
+    let mut occurrence_by_shape: HashMap<((u16, u16), WorkloadShape), u64> = HashMap::new();
+    let mut prefill_shapes: HashSet<((u16, u16), WorkloadShape)> = HashSet::new();
+    let mut iterations_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
+    let mut sampled_decode_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
+    for ((pool_index, worker_id, iteration_id), totals) in totals_by_iteration {
+        let worker_key = (pool_index, worker_id);
+        *iterations_by_worker.entry(worker_key).or_default() += 1;
+        let prefill = carries_prefill(&totals);
+        if !prefill {
+            let stride = stride_by_worker.get(&worker_key).copied().unwrap_or(1);
+            if iteration_id % stride != 0 {
+                continue;
+            }
+            *sampled_decode_by_worker.entry(worker_key).or_default() += 1;
+        }
+        let shape = WorkloadShape::from_totals(totals)?;
+        if prefill {
+            prefill_shapes.insert((worker_key, shape));
+        }
+        *occurrence_by_shape.entry((worker_key, shape)).or_default() += 1;
+    }
+
+    let mut shapes_by_worker: HashMap<(u16, u16), Vec<WeightedWorkload>> = HashMap::new();
+    let mut prefill_flags_by_worker: HashMap<(u16, u16), Vec<bool>> = HashMap::new();
     for ((worker_key, shape), occurrences) in occurrence_by_shape {
+        let prefill = prefill_shapes.contains(&(worker_key, shape));
+        prefill_flags_by_worker
+            .entry(worker_key)
+            .or_default()
+            .push(prefill);
         shapes_by_worker
             .entry(worker_key)
             .or_default()
@@ -730,21 +811,102 @@ pub(crate) async fn collect_workload_shapes_by_worker(
                 occurrences,
             });
     }
-    for shapes in shapes_by_worker.values_mut() {
-        shapes.sort_by_key(|shape| {
-            let totals = shape.totals;
-            (
-                totals.matmul_tokens as u64,
-                totals.prefill_tokens as u64,
-                totals.decode_passes as u64,
-                totals.decode_kv as u64,
-                totals.prefill_pairs as u64,
-                totals.prefill_cached as u64,
-                totals.prefill_requests as u64,
-            )
-        });
+
+    let mut samples_by_worker = HashMap::new();
+    for (worker_key, mut shapes) in shapes_by_worker {
+        let mut prefill_flags = prefill_flags_by_worker
+            .remove(&worker_key)
+            .unwrap_or_default();
+        sort_shapes_with_flags(&mut shapes, &mut prefill_flags);
+        let decode_iterations = decode_iterations_by_worker
+            .get(&worker_key)
+            .copied()
+            .unwrap_or(0);
+        let sampled_decode = sampled_decode_by_worker
+            .get(&worker_key)
+            .copied()
+            .unwrap_or(0);
+        reweight_decode_stratum(&mut shapes, &prefill_flags, decode_iterations, sampled_decode);
+        let iterations = iterations_by_worker
+            .get(&worker_key)
+            .copied()
+            .unwrap_or_default();
+        let labeled_iterations = shapes.len() as u64;
+        let decode_stride = stride_by_worker.get(&worker_key).copied().unwrap_or(1);
+        let (pool_index, worker_id) = worker_key;
+        samples_by_worker.insert(
+            (pool_tag_by_index[pool_index as usize].clone(), worker_id),
+            WorkerShapeSample {
+                shapes,
+                iterations,
+                labeled_iterations,
+                decode_stride,
+            },
+        );
     }
-    Ok(shapes_by_worker)
+    Ok(samples_by_worker)
+}
+
+/// Did this iteration run any prefill? Any one of the three prefill scalars being
+/// non-zero is enough — they are all zero exactly on a pure-decode step.
+fn carries_prefill(totals: &WorkloadTotals) -> bool {
+    totals.prefill_tokens > 0.0 || totals.prefill_pairs > 0.0 || totals.prefill_requests > 0.0
+}
+
+/// Sort shapes into the stable order the labeler request uses, carrying each
+/// shape's prefill flag along so the two stay index-aligned.
+fn sort_shapes_with_flags(shapes: &mut [WeightedWorkload], prefill_flags: &mut [bool]) {
+    let mut order: Vec<usize> = (0..shapes.len()).collect();
+    order.sort_by_key(|&index| {
+        let totals = shapes[index].totals;
+        (
+            totals.matmul_tokens as u64,
+            totals.prefill_tokens as u64,
+            totals.decode_passes as u64,
+            totals.decode_kv as u64,
+            totals.prefill_pairs as u64,
+            totals.prefill_cached as u64,
+            totals.prefill_requests as u64,
+        )
+    });
+    let sorted_shapes: Vec<WeightedWorkload> = order.iter().map(|&index| shapes[index]).collect();
+    let sorted_flags: Vec<bool> = order.iter().map(|&index| prefill_flags[index]).collect();
+    shapes.copy_from_slice(&sorted_shapes);
+    prefill_flags.copy_from_slice(&sorted_flags);
+}
+
+/// Scale the sampled decode shapes up to the whole decode stratum, in integers.
+///
+/// Each kept decode iteration stands for `decode_iterations / sampled_decode` of
+/// them. Largest-remainder distribution over the (already sorted, so deterministic)
+/// shape list makes the weights sum to `decode_iterations` exactly, which is what
+/// lets the caller treat the returned weights as the run's true iteration counts.
+fn reweight_decode_stratum(
+    shapes: &mut [WeightedWorkload],
+    prefill_flags: &[bool],
+    decode_iterations: u64,
+    sampled_decode: u64,
+) {
+    if sampled_decode == 0 || decode_iterations == sampled_decode {
+        return;
+    }
+    let decode_indices: Vec<usize> = (0..shapes.len())
+        .filter(|&index| !prefill_flags[index])
+        .collect();
+    let mut assigned = 0u64;
+    let mut remainders: Vec<(u64, usize)> = Vec::with_capacity(decode_indices.len());
+    for &index in &decode_indices {
+        let numerator = shapes[index].occurrences * decode_iterations;
+        let weight = numerator / sampled_decode;
+        remainders.push((numerator % sampled_decode, index));
+        shapes[index].occurrences = weight;
+        assigned += weight;
+    }
+    // Hand the shortfall to the largest fractional parts; ties break on shape order.
+    remainders.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    for (_, index) in remainders.iter().take((decode_iterations - assigned) as usize) {
+        shapes[*index].occurrences += 1;
+    }
 }
 
 /// Typed, once-per-record-batch view of the fields needed by `model.work`.

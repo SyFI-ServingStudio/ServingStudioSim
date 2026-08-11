@@ -108,6 +108,9 @@ def test_locked_composition_evaluates_each_shape_before_addition(
     spec = {"config": str(CONFIG), "gpu": "H200", "dtype": "bf16", "arch_fp8": False}
     monkeypatch.setattr(work_floors, "_pool_specs", lambda _log_dir: {"main": spec})
     monkeypatch.setattr(work_floors, "_model", lambda _config_path: model)
+    # Let group size out of the decision so this case is purely about the two
+    # reduction paths; `_MIN_BASIS_GROUP` has its own test below.
+    monkeypatch.setattr(work_floors, "_MIN_BASIS_GROUP", 1)
     if force_direct_fallback:
         monkeypatch.setattr(work_floors, "_segment_work_matches", lambda *_values: False)
     decode_shape = {
@@ -161,6 +164,44 @@ def test_locked_composition_evaluates_each_shape_before_addition(
         "affine_bases": 0 if force_direct_fallback else 2,
         "direct_fallback_bases": 2 if force_direct_fallback else 0,
     }
+
+
+def test_small_group_skips_the_basis_it_cannot_pay_for(monkeypatch, model):
+    """A group below `_MIN_BASIS_GROUP` takes the direct path, same numbers.
+
+    Fitting a basis costs ~22 `model.label` calls to then evaluate the group as
+    array math, so on a handful of shapes it is strictly more work than labeling
+    each one — and routed models make near-singleton prefill groups routine.
+    """
+    spec = {"config": str(CONFIG), "gpu": "H200", "dtype": "bf16", "arch_fp8": False}
+    monkeypatch.setattr(work_floors, "_pool_specs", lambda _log_dir: {"main": spec})
+    monkeypatch.setattr(work_floors, "_model", lambda _config_path: model)
+    shapes = [
+        {
+            "occurrences": 1,
+            "totals": {
+                "matmul_tokens": 1,
+                "prefill_tokens": 0,
+                "decode_passes": 1,
+                "prefill_pairs": 0,
+                "prefill_cached": 0,
+                "decode_kv": kv,
+                "prefill_requests": 0,
+            },
+        }
+        for kv in (4096, 8192, 16384)
+    ]
+
+    monkeypatch.setattr(work_floors, "_MIN_BASIS_GROUP", 24)
+    small = work_floors.compute_locked_compositions(Path("unused"), {"main/0": shapes})["main/0"]
+    monkeypatch.setattr(work_floors, "_MIN_BASIS_GROUP", 1)
+    affine = work_floors.compute_locked_compositions(Path("unused"), {"main/0": shapes})["main/0"]
+
+    assert small["composition"]["affine_bases"] == 0
+    assert small["composition"]["direct_fallback_bases"] == 1
+    assert affine["composition"]["affine_bases"] == 1
+    assert small["necessary"] == pytest.approx(affine["necessary"])
+    assert small["segmented"] == pytest.approx(affine["segmented"])
 
 
 def test_decode_flop_buckets(model):

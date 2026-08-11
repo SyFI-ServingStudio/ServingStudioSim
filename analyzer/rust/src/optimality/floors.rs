@@ -104,8 +104,13 @@ pub(super) struct RunLabels {
     pub(super) floors: FloorsByLevel,
     pub(super) workers: HashMap<(String, u16), WorkerComposition>,
     pub(super) errors: HashMap<String, String>,
+    /// Distinct shapes in the *sample* that was labeled.
     pub(super) batch_locked_unique_shapes: Option<usize>,
+    /// Iterations the floors describe: the exact run total the sample is anchored to.
     pub(super) batch_locked_iterations: Option<u64>,
+    /// Iterations actually labeled, before anchoring.
+    pub(super) batch_locked_sampled_iterations: Option<u64>,
+    pub(super) batch_locked_sample_stride: Option<u64>,
     pub(super) batch_locked_affine_bases: Option<u64>,
     pub(super) batch_locked_direct_fallback_bases: Option<u64>,
 }
@@ -174,20 +179,34 @@ pub(super) async fn compute_saturated_run_labels(
         errors,
         batch_locked_unique_shapes: None,
         batch_locked_iterations: None,
+        batch_locked_sampled_iterations: None,
+        batch_locked_sample_stride: None,
         batch_locked_affine_bases: None,
         batch_locked_direct_fallback_bases: None,
     })
 }
 
-/// Label every distinct observed iteration shape once and compose the results while
+/// Label every distinct sampled iteration shape once and compose the results while
 /// preserving iteration boundaries. Equal shapes are weighted by occurrence count;
 /// no weights are amortized across separate batches. Worker floors then add into
 /// pool/cluster floors only when that whole scope is available.
+///
+/// The shapes come stratified — every prefill-carrying iteration, plus a sampled
+/// slice of the decode-only ones, reweighted so the weights already sum to the
+/// worker's exact iteration count. See
+/// [`collect_workload_shapes_by_worker`] for why a flat sample is the wrong shape of
+/// approximation here.
 pub(super) async fn compute_batch_locked_run_labels(
     ctx: &SessionContext,
     log_dir: &Path,
+    target_sampled_decode_iterations: u64,
 ) -> Result<RunLabels> {
-    let shapes_by_worker = collect_workload_shapes_by_worker(ctx).await?;
+    let samples_by_worker =
+        collect_workload_shapes_by_worker(ctx, target_sampled_decode_iterations).await?;
+    let shapes_by_worker: HashMap<(String, u16), Vec<WeightedWorkload>> = samples_by_worker
+        .iter()
+        .map(|(worker_key, sample)| (worker_key.clone(), sample.shapes.clone()))
+        .collect();
     if shapes_by_worker.is_empty() {
         return Err(anyhow!("no cost_log iteration workloads to label"));
     }
@@ -195,11 +214,19 @@ pub(super) async fn compute_batch_locked_run_labels(
     let mut worker_keys: Vec<(String, u16)> = shapes_by_worker.keys().cloned().collect();
     worker_keys.sort();
     let batch_locked_unique_shapes = shapes_by_worker.values().map(Vec::len).sum();
-    let batch_locked_iterations = shapes_by_worker
+    let batch_locked_iterations = samples_by_worker
         .values()
-        .flatten()
-        .map(|shape| shape.occurrences)
+        .map(|sample| sample.iterations)
         .sum();
+    let batch_locked_labeled_iterations = samples_by_worker
+        .values()
+        .map(|sample| sample.labeled_iterations)
+        .sum();
+    let batch_locked_decode_stride = samples_by_worker
+        .values()
+        .map(|sample| sample.decode_stride)
+        .max()
+        .unwrap_or(1);
     let request = build_locked_request(&shapes_by_worker);
     let response = run_labeler_request(log_dir, request)?;
     let ParsedLabels {
@@ -239,6 +266,7 @@ pub(super) async fn compute_batch_locked_run_labels(
         returned_stats.iterations += stats.iterations;
         returned_stats.affine_bases += stats.affine_bases;
         returned_stats.direct_fallback_bases += stats.direct_fallback_bases;
+
         workers.insert(
             worker_key.clone(),
             WorkerComposition {
@@ -257,6 +285,8 @@ pub(super) async fn compute_batch_locked_run_labels(
         errors,
         batch_locked_unique_shapes: Some(batch_locked_unique_shapes),
         batch_locked_iterations: Some(batch_locked_iterations),
+        batch_locked_sampled_iterations: Some(batch_locked_labeled_iterations),
+        batch_locked_sample_stride: Some(batch_locked_decode_stride),
         batch_locked_affine_bases: Some(returned_stats.affine_bases),
         batch_locked_direct_fallback_bases: Some(returned_stats.direct_fallback_bases),
     })

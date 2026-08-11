@@ -25,7 +25,7 @@
 //! `model.work` labeler adds segmented and scope-fused bounds below R5 and splits
 //! `hw-optimal` into `[excess-over-necessary | fusion | hardware-necessary]`.
 //! Unlocked run aggregation may fuse additive work into a saturated batch. Locked
-//! aggregation evaluates each observed iteration's rooflines first, then adds them
+//! aggregation evaluates each sampled iteration's rooflines first, then adds them
 //! through worker / pool / cluster without rebatching. An exact iteration waterfall
 //! uses the same distinction: locked labels the exact batch, while unlocked labels
 //! 10,000 independent copies and normalizes back to one iteration. Exact and run kernel ladders append
@@ -41,6 +41,16 @@
 //! linear, so each rung factors into a precomputed per-leaf weight `α` times that
 //! leaf's value — one dot product per row, and the same `α` gives the additive
 //! per-kernel attribution for the kernel-level bars.
+//!
+//! The locked R6/R7 floors are **stratified**, not exact. They used to label every
+//! iteration, which only looked affordable because equal shapes deduplicate — and
+//! they barely do: `decode_kv` is a running sum, so the 8h GLM-5.2 trace had 911,149
+//! distinct shapes across 978,623 iterations, one label per iteration. Every
+//! prefill-carrying iteration is still labeled (0.76% of iterations, 70.7% of the
+//! matmul-token mass, and all of the variance); the decode-only remainder is sampled
+//! to `FLOORS_TARGET_SAMPLED_ITERS` per worker and reweighted in integers so each
+//! worker's weights still sum to its exact iteration count. See
+//! `conservation::workload::collect_workload_shapes_by_worker`.
 //!
 //! ## Files
 //!
@@ -138,6 +148,17 @@ pub(crate) const KERNEL_RUNG_KEYS: [&str; 4] = [
 pub(crate) const MAX_STRIDE: u64 = 50;
 pub(crate) const TARGET_SAMPLED_ITERS: u64 = 80;
 
+/// How many **decode-only** iterations the locked R6/R7 floors draw per worker.
+/// Deliberately its own target, three orders of magnitude above
+/// `TARGET_SAMPLED_ITERS`: that one sizes a sample of per-location *rates*, which are
+/// near-constant across a run, whereas a workload *shape* drifts as context grows.
+/// Prefill-carrying iterations are not sampled at all (see
+/// `collect_workload_shapes_by_worker`); the labeler costs roughly 0.06 ms per
+/// distinct shape, so 50,000 keeps this stage at a few seconds against the ~49 s the
+/// rest of the subject takes. No upper clamp on the resulting stride: a longer run
+/// samples harder rather than labeling more.
+pub(crate) const FLOORS_TARGET_SAMPLED_ITERS: u64 = 50_000;
+
 /// Top-N kernels drawn as individual bars at the kernel level; the rest fold into
 /// an `other` bar so the figure stays legible on a many-location deployment.
 pub(crate) const TOP_KERNELS: usize = 16;
@@ -147,8 +168,9 @@ pub(crate) const TOP_KERNELS: usize = 16;
 /// scaled additive totals).
 pub(crate) const UNLOCKED_ITERATION_REPLICATION_FACTOR: u32 = 10_000;
 
-/// R5 is stride-sampled while R6 uses exact workload groups. Preserve their raw
-/// difference, but do not classify sampling-scale noise as missing simulator work.
+/// R5 and R6 read the same stride sample but reduce it differently (α-weighted leaf
+/// fold vs per-shape roofline). Preserve their raw difference, but do not classify
+/// sampling-scale noise as missing simulator work.
 pub(crate) const UNDER_ACCOUNTED_RELATIVE_TOLERANCE: f64 = 0.005;
 
 pub(crate) fn under_accounted_difference(

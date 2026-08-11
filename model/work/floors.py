@@ -454,6 +454,15 @@ def _validation_shapes(weighted_shapes: list[dict]) -> list[dict]:
     return list(selected.values())
 
 
+#: Below this many members, fitting a basis costs more labels than it saves.
+#: Building one is 1 base + up to 6 probes + up to 15 validation shapes (~22
+#: `model.label` calls) to then evaluate the group as array math; the direct path
+#: is exactly one call per shape. Routed models pin `matmul_tokens` in the basis
+#: key, so prefill groups are near-singletons — on the 8h GLM-5.2 run, 7,441
+#: prefill shapes spread over ~2,400 groups and paid for a basis apiece.
+_MIN_BASIS_GROUP = 24
+
+
 def _validated_basis(
     model,
     weighted_shapes: list[dict],
@@ -464,6 +473,10 @@ def _validated_basis(
     """Build and independently validate one basis before any batch reduction."""
     totals = weighted_shapes[0]["totals"]
     basis_key = _basis_key(model, totals, has_routed_matmul)
+    if len(weighted_shapes) < _MIN_BASIS_GROUP:
+        # Counted with the validation failures: both mean "this group was reduced
+        # one shape at a time".
+        basis_cache[basis_key] = None
     if basis_key not in basis_cache:
         candidate = _workload_basis(model, totals, has_routed_matmul)
         matches = all(
