@@ -16,10 +16,12 @@ profile.db-journal
 logs/
 # Large workload trace: provisioned per-worktree, not tracked (see create-worktree)
 trace/aime_long.csv
-# TraceLab session traces, ~23 MB each. Deterministic output, so regenerate them
-# rather than carry them in history; the committed .manifest.json beside each one
-# records the source hash and the totals a run needs to check itself against.
-trace/tracelab_*.csv
+# TraceLab session traces: ~23 MB per CSV and ~114 MB per plan sidecar, all
+# deterministic output of one `tracegen` run, so regenerate them rather than
+# carry them in history. The .manifest.json beside each one stays tracked: it
+# records the source hash, the policy, and the totals a run checks itself against.
+trace/tracelab_*
+!trace/tracelab_*.manifest.json
 
 # Editor / OS
 .vscode/
