@@ -234,20 +234,14 @@ impl KernelNecessaryWork {
         roofline_gpu_s: f64,
         gpu_count: f64,
     ) -> Self {
-        // Per-kernel GPU·seconds are published in the same footing as the ladder's
-        // per-rank rungs: the labeler labels the WHOLE model on one GPU, while each
-        // worker contributes F/(G·peak) GPU·seconds. Normalize compute/memory/
-        // roofline by the worker's GPU count so per-kernel necessary == hardware
-        // limit; min_flops/min_bytes keep the whole-model scale as information.
-        let gpus = gpu_count.max(1.0);
         Self {
             semantics: semantics.into_iter().collect(),
             min_flops,
             min_bytes,
-            compute_gpu_s: compute_gpu_s / gpus,
-            memory_gpu_s: memory_gpu_s / gpus,
-            roofline_gpu_s: roofline_gpu_s / gpus,
-            wall_s: Some(roofline_gpu_s / gpus),
+            compute_gpu_s,
+            memory_gpu_s,
+            roofline_gpu_s,
+            wall_s: Some(roofline_gpu_s / gpu_count.max(1.0)),
         }
     }
 
@@ -751,25 +745,6 @@ mod tests {
         };
         ladder.finalize_necessary_work(policy, None).unwrap();
         ladder
-    }
-
-    #[test]
-    fn per_kernel_necessary_is_normalized_by_gpu_count() {
-        // The labeler labels the whole model on one GPU; per-kernel GPU·seconds
-        // must be divided by the worker GPU count to match the per-rank rungs.
-        let work = KernelNecessaryWork::from_gpu_seconds(
-            ["qkv".to_string()],
-            1.0,
-            1.0,
-            2.0,
-            1.0,
-            2.0,
-            4.0,
-        );
-        assert_eq!(work.compute_gpu_s, 0.5);
-        assert_eq!(work.memory_gpu_s, 0.25);
-        assert_eq!(work.necessary_gpu_s(), 0.5);
-        assert_eq!(work.wall_s, Some(0.5));
     }
 
     #[test]
