@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from . import metadata
+from .artifact_kind import ArtifactKind, write_artifact_kind
 from .cache_build import prebuild_caches
 from .exec import (
     DEFAULT_PARALLELISM,
@@ -131,6 +132,7 @@ async def _launch_one(
             ]
         )
 
+        write_artifact_kind(log_dir, ArtifactKind.SIMULATION_RUN)
         binary = binary_path(build_type)
         # The concrete config the binary reads lives alongside the run's metadata.
         argv = build_cli_command(
@@ -545,6 +547,7 @@ def _write_sweep_manifest(param_sets: list[dict], base_dir: Path) -> Path | None
         # geometry, so keep the batch behavior and emit no sweep artifact.
         return None
     manifest_path = base_dir / "sweep_manifest.json"
+    write_artifact_kind(base_dir, ArtifactKind.SIMULATION_SWEEP)
     new_members = [_manifest_member(params, base_dir, axes) for params in param_sets]
     members_by_path: dict[str, dict] = {}
     if manifest_path.is_file():

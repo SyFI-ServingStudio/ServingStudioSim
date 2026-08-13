@@ -1,15 +1,21 @@
-"""Alignment workload generation; TraceLab is the authoritative implementation."""
+"""Alignment workload generation; req-frontend is the authoritative implementation."""
 
 from .config import (
+    BackendConfig,
     FrontendConfig,
+    IndependentFrontendConfig,
     LoadGeneratorConfig,
+    OpenAIBackendConfig,
     SessionFrontendConfig,
-    VibeSimFrontendConfig,
+    VllmTokensBackendConfig,
 )
 
 __all__ = [
+    "BackendConfig",
     "FrontendConfig",
+    "IndependentFrontendConfig",
     "LoadGeneratorConfig",
+    "OpenAIBackendConfig",
     "SessionFrontendConfig",
-    "VibeSimFrontendConfig",
+    "VllmTokensBackendConfig",
 ]

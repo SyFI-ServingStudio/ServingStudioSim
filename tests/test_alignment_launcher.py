@@ -8,8 +8,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+from alignment import runner as alignment_runner
 from alignment.load_generator import runner as load_runner
-from alignment.profiler import vllm_server
+from alignment.profiler import record_extraction, vllm_server
 from alignment.timing_predict_input import BuildRequest, build_inputs
 from launcher import alignment as alignment_launcher
 from launcher import exec as launcher_exec
@@ -72,7 +73,7 @@ def _phase_configs(tmp_path: Path, suffix: str = ".yaml") -> dict[str, Path]:
             "gpu": "NVIDIA H200",
             "server": {"model_path": "model"},
             "workload": {
-                "frontend": {"type": "vibesim", "path": "./trace/shared.csv"},
+                "frontend": {"type": "independent", "path": "./trace/shared.csv"},
                 "text_file": "./trace/corpus.txt",
                 "tokenizer": "model/tokenizer.json",
                 "max_concurrency": 64,
@@ -282,6 +283,18 @@ def test_alignment_sim_runs_only_existing_simulation(tmp_path, monkeypatch):
     assert alignment_launcher.main(["sim", str(paths["simulation"])]) == 0
     assert calls[0][0] == paths["simulation"]
     assert calls[0][1]["overrides"] == []
+    assert json.loads((tmp_path / "artifact.meta.json").read_text()) == {
+        "schema_version": 1,
+        "artifact_kind": "alignment_bundle",
+    }
+
+
+def test_alignment_sim_dry_run_does_not_publish_bundle_marker(tmp_path, monkeypatch):
+    paths = _phase_configs(tmp_path)
+    monkeypatch.setattr(alignment_launcher, "_launch_simulation", lambda *args, **kwargs: 0)
+
+    assert alignment_launcher.main(["sim", str(paths["simulation"]), "--dry-run"]) == 0
+    assert not (tmp_path / "artifact.meta.json").exists()
 
 
 def test_alignment_sim_auto_injects_kernel_align_multiplier(tmp_path, monkeypatch):
@@ -454,7 +467,7 @@ def test_extract_expert_popularity_aggregates_logical_counts(tmp_path):
     raw_path = tmp_path / "expert_load.jsonl"
     summary_path = tmp_path / "expert_popularity.json"
 
-    count = vllm_server.extract_expert_popularity(
+    count = record_extraction.extract_expert_popularity(
         server_log,
         raw_path,
         summary_path,
@@ -501,7 +514,7 @@ def test_extract_expert_popularity_rejects_partition_mismatch(tmp_path):
     server_log.write_text(f"INFO VibeSimAlignmentExpertLoad {json.dumps(record)}\n")
 
     with pytest.raises(ValueError, match="must be divisible"):
-        vllm_server.extract_expert_popularity(
+        record_extraction.extract_expert_popularity(
             server_log,
             tmp_path / "raw.jsonl",
             tmp_path / "summary.json",
@@ -762,6 +775,17 @@ def test_timing_predict_publishes_stable_analyzer_resource_metadata(tmp_path):
         "cases_file": str(cases_path),
     }
     config_path.write_text(json.dumps(config))
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "prediction_provenance.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "gpu_name": "NVIDIA H200",
+                "gpu_count": 4,
+            }
+        )
+    )
 
     prediction_id = timing_predict_launcher._prediction_id(tmp_path)
     timing_predict_launcher._write_prediction_metadata(
@@ -779,7 +803,7 @@ def test_timing_predict_publishes_stable_analyzer_resource_metadata(tmp_path):
         "selector": "iter",
         "arch_type": "llama3_dense",
         "gpu": "NVIDIA H200",
-        "gpu_count": 1,
+        "gpu_count": 4,
         "config_file": config_path.name,
         "cases_file": "prediction.cases.json",
         "case_count": 0,
@@ -823,11 +847,11 @@ def test_alignment_analysis_calls_only_selected_subjects(tmp_path, monkeypatch):
     assert invocations[1][-1:] == ["alignment-e2e"]
 
 
-def test_tracelab_invocation_keeps_vibesim_as_a_typed_frontend(tmp_path, monkeypatch):
-    from alignment.load_generator.config import LoadGeneratorConfig, VibeSimFrontendConfig
+def test_req_frontend_invocation_keeps_independent_as_a_typed_frontend(tmp_path, monkeypatch):
+    from alignment.load_generator.config import IndependentFrontendConfig, LoadGeneratorConfig
 
     config = LoadGeneratorConfig(
-        frontend=VibeSimFrontendConfig(path="trace/smoke.csv"),
+        frontend=IndependentFrontendConfig(path="trace/smoke.csv"),
         text_file="corpus.txt",
         tokenizer="tokenizer.json",
         max_concurrency=64,
@@ -846,8 +870,222 @@ def test_tracelab_invocation_keeps_vibesim_as_a_typed_frontend(tmp_path, monkeyp
 
     load_runner.run_replay(config, prepared, base_url="http://localhost:8000", model="m")
     argv = commands[0][0]
-    assert argv[argv.index("--trace-format") + 1] == "vibesim"
+    assert argv[argv.index("--trace-format") + 1] == "independent"
+    assert argv[argv.index("--backend") + 1] == "openai"
+    assert argv[argv.index("--base-url") + 1] == "http://localhost:8000/v1"
     assert argv[argv.index("--max-concurrency") + 1] == "64"
+
+
+def test_req_frontend_invocation_selects_vllm_tokens_backend(tmp_path, monkeypatch):
+    from alignment.load_generator.config import (
+        IndependentFrontendConfig,
+        LoadGeneratorConfig,
+        VllmTokensBackendConfig,
+    )
+
+    config = LoadGeneratorConfig(
+        frontend=IndependentFrontendConfig(path="trace/smoke.csv"),
+        text_file="corpus.txt",
+        tokenizer="tokenizer.json",
+        backend=VllmTokensBackendConfig(),
+    )
+    prepared = load_runner.PreparedReplay(
+        trace_path=tmp_path / "trace.csv",
+        text_file=tmp_path / "corpus.txt",
+        tokenizer="tokenizer.json",
+        log_path=tmp_path / "replay.jsonl",
+        summary_path=tmp_path / "summary.json",
+    )
+    commands = []
+    monkeypatch.setattr(
+        load_runner.subprocess, "run", lambda argv, **kwargs: commands.append((argv, kwargs))
+    )
+
+    result = load_runner.run_replay(
+        config, prepared, base_url="http://localhost:8000", model="m"
+    )
+
+    argv = commands[0][0]
+    assert argv[argv.index("--backend") + 1] == "vllm-tokens"
+    assert argv[argv.index("--base-url") + 1] == "http://localhost:8000"
+    assert result["backend_type"] == "vllm_tokens"
+
+
+def test_req_frontend_invocation_passes_no_context_policy(tmp_path, monkeypatch):
+    """A session run selects a materialized trace, not a rule for materializing one.
+
+    The replay binary has no context-policy flag: the split was resolved by
+    `tracegen` and is recorded in the manifest beside the trace.
+    """
+    from alignment.load_generator.config import (
+        LoadGeneratorConfig,
+        SessionFrontendConfig,
+        VllmTokensBackendConfig,
+    )
+
+    config = LoadGeneratorConfig(
+        frontend=SessionFrontendConfig(path="trace/execution.csv"),
+        text_file="corpus.txt",
+        tokenizer="tokenizer.json",
+        backend=VllmTokensBackendConfig(),
+    )
+    prepared = load_runner.PreparedReplay(
+        trace_path=tmp_path / "trace.csv",
+        text_file=tmp_path / "corpus.txt",
+        tokenizer="tokenizer.json",
+        log_path=tmp_path / "replay.jsonl",
+        summary_path=tmp_path / "summary.json",
+    )
+    commands = []
+    monkeypatch.setattr(
+        load_runner.subprocess, "run", lambda argv, **kwargs: commands.append((argv, kwargs))
+    )
+
+    result = load_runner.run_replay(
+        config, prepared, base_url="http://localhost:8000", model="m"
+    )
+
+    argv = commands[0][0]
+    assert argv[argv.index("--trace-format") + 1] == "session"
+    assert "--session-context-policy" not in argv
+    assert "session_context_policy" not in result
+
+
+@pytest.mark.parametrize(
+    "config_field",
+    ["skip_when_reaching_limit", "fail_on_context_overflow"],
+)
+def test_req_frontend_context_limit_skip_uses_canonical_cli_flag(
+    tmp_path, monkeypatch, config_field
+):
+    from alignment.load_generator.config import (
+        LoadGeneratorConfig,
+        SessionFrontendConfig,
+    )
+
+    config = LoadGeneratorConfig(
+        frontend=SessionFrontendConfig(path="trace/session.csv"),
+        text_file="corpus.txt",
+        tokenizer="tokenizer.json",
+        max_model_len=128,
+        **{config_field: True},
+    )
+    prepared = load_runner.PreparedReplay(
+        trace_path=tmp_path / "trace.csv",
+        text_file=tmp_path / "corpus.txt",
+        tokenizer="tokenizer.json",
+        log_path=tmp_path / "replay.jsonl",
+        summary_path=tmp_path / "summary.json",
+    )
+    commands = []
+    monkeypatch.setattr(
+        load_runner.subprocess, "run", lambda argv, **kwargs: commands.append((argv, kwargs))
+    )
+
+    load_runner.run_replay(config, prepared, base_url="http://localhost:8000", model="m")
+
+    argv = commands[0][0]
+    assert "--skip-when-reaching-limit" in argv
+    assert "--fail-on-context-overflow" not in argv
+
+
+def test_req_frontend_context_limit_skip_requires_model_limit():
+    from alignment.load_generator.config import (
+        LoadGeneratorConfig,
+        SessionFrontendConfig,
+    )
+
+    with pytest.raises(ValueError, match="requires max_model_len"):
+        LoadGeneratorConfig(
+            frontend=SessionFrontendConfig(path="trace/session.csv"),
+            text_file="corpus.txt",
+            tokenizer="tokenizer.json",
+            skip_when_reaching_limit=True,
+        )
+
+
+def test_profile_config_accepts_a_session_frontend_with_openai_backend():
+    from alignment.load_generator.config import (
+        LoadGeneratorConfig,
+        OpenAIBackendConfig,
+        SessionFrontendConfig,
+    )
+
+    config = LoadGeneratorConfig.from_mapping(
+        {
+            "frontend": {"type": "session", "path": "trace/execution.csv"},
+            "text_file": "corpus.txt",
+            "tokenizer": "tokenizer.json",
+        }
+    )
+
+    assert isinstance(config.frontend, SessionFrontendConfig)
+    assert config.frontend.path == "trace/execution.csv"
+    assert isinstance(config.backend, OpenAIBackendConfig)
+
+
+def test_profile_config_rejects_a_stale_context_policy_key():
+    """An older config must fail loudly rather than have the key ignored."""
+    from alignment.load_generator.config import LoadGeneratorConfig
+
+    with pytest.raises(ValueError, match="context_policy"):
+        LoadGeneratorConfig.from_mapping(
+            {
+                "frontend": {
+                    "type": "session",
+                    "path": "trace/execution.csv",
+                    "context_policy": "monotonic",
+                },
+                "text_file": "corpus.txt",
+                "tokenizer": "tokenizer.json",
+            }
+        )
+
+
+def test_profile_config_loads_vllm_tokens_backend(tmp_path):
+    from alignment.load_generator.config import (
+        LoadGeneratorConfig,
+        VllmTokensBackendConfig,
+    )
+
+    config = LoadGeneratorConfig.from_mapping(
+        {
+            "frontend": {"type": "independent", "path": "trace/smoke.csv"},
+            "backend": {"type": "vllm_tokens"},
+            "text_file": "corpus.txt",
+            "tokenizer": "tokenizer.json",
+        }
+    )
+
+    assert isinstance(config.backend, VllmTokensBackendConfig)
+
+
+def test_profile_config_rejects_unknown_load_generator_backend():
+    from alignment.load_generator.config import LoadGeneratorConfig
+
+    with pytest.raises(ValueError, match="unsupported backend.type"):
+        LoadGeneratorConfig.from_mapping(
+            {
+                "frontend": {"type": "independent", "path": "trace/smoke.csv"},
+                "backend": {"type": "unknown"},
+                "text_file": "corpus.txt",
+                "tokenizer": "tokenizer.json",
+            }
+        )
+
+
+def test_vllm_tokens_backend_adds_server_flag_once(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["workload"]["backend"] = {"type": "vllm_tokens"}
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    config = load_profile_config(paths["profile"])
+    server_argv = ["python", "-m", "vllm.entrypoints.openai.api_server"]
+
+    alignment_runner._append_backend_server_args(server_argv, config)
+    alignment_runner._append_backend_server_args(server_argv, config)
+
+    assert server_argv.count("--tokens-only") == 1
 
 
 def test_launcher_main_dispatches_alignment_subcommand(monkeypatch):

@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::arch::build::{build_attn_model, build_ffn_model, build_iter_model};
 use crate::arch::contract::{
@@ -63,6 +63,18 @@ const UNIFIED_MODEL_NAME: &str = "unified";
 /// All predict streams write under one writer/file tag; the building block is the
 /// per-row `section` field, NOT the pool tag (which only names pool/worker identity).
 const PREDICT_POOL_TAG: &str = "predict";
+/// Narrow execution provenance consumed by the launcher when publishing the
+/// first-class prediction resource. Timing-predict has no L5 worker allocation,
+/// so it must not manufacture `run_meta.json`; L4 remains authoritative for the
+/// physical GPU extent of the model replica being costed.
+const PREDICTION_PROVENANCE_FILE: &str = "prediction_provenance.json";
+
+#[derive(Serialize)]
+struct PredictionProvenance<'a> {
+    schema_version: u32,
+    gpu_name: &'a str,
+    gpu_count: u16,
+}
 
 /// Which arch to predict. Externally tagged so the config selects exactly one of
 /// the three families by key: `{ iter: {...} } | { attn: {...} } | { ffn: {...} }`.
@@ -201,7 +213,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
     // not assume a shared shape: iter/attn take the attention-shaped [`PredictCase`];
     // ffn takes [`FfnArchInput`] itself (token counts only), which rejects the
     // attention vocabulary the ffn cost never reads.
-    let num_cases = match &cfg.arch {
+    let (num_cases, gpu_count) = match &cfg.arch {
         PredictArchSel::Iter(sel) => {
             let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
             let model = build_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
@@ -209,7 +221,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_iter_cases(&*model, cases, &cfg.log_dir)?;
-            n
+            (n, model.gpus_per_replica())
         }
         PredictArchSel::Attn(sel) => {
             let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
@@ -217,7 +229,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_attn_cases(&*model, cases, &cfg.log_dir)?;
-            n
+            (n, model.gpus_per_replica())
         }
         PredictArchSel::Ffn(sel) => {
             let _scope = bridge.with_backend_overrides("ffn", cfg.backends.get("ffn"));
@@ -225,15 +237,66 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             let cases: Vec<FfnArchInput> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_ffn_cases(&*model, cases, &cfg.log_dir)?;
-            n
+            (n, model.gpus_per_replica())
         }
     };
+    write_prediction_provenance(&cfg.log_dir, &cfg.gpu, gpu_count)?;
 
     tracing::info!(
         log_dir = %cfg.log_dir.display(),
         "timing-predict wrote {num_cases} case(s)"
     );
     Ok(())
+}
+
+fn write_prediction_provenance(log_dir: &Path, gpu_name: &str, gpu_count: u16) -> Result<()> {
+    ensure!(gpu_count > 0, "timing-predict model has no physical GPUs");
+    let raw_dir = log_dir.join("raw");
+    fs::create_dir_all(&raw_dir)
+        .with_context(|| format!("creating prediction raw directory {}", raw_dir.display()))?;
+    let output_path = raw_dir.join(PREDICTION_PROVENANCE_FILE);
+    let temporary_path = raw_dir.join(format!(".{PREDICTION_PROVENANCE_FILE}.tmp"));
+    let bytes = serde_json::to_vec_pretty(&PredictionProvenance {
+        schema_version: 1,
+        gpu_name,
+        gpu_count,
+    })?;
+    fs::write(&temporary_path, bytes)
+        .with_context(|| format!("writing prediction provenance {}", temporary_path.display()))?;
+    fs::rename(&temporary_path, &output_path)
+        .with_context(|| format!("publishing prediction provenance {}", output_path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use serde_json::Value;
+    use tempfile::tempdir;
+
+    use super::{write_prediction_provenance, PREDICTION_PROVENANCE_FILE};
+
+    #[test]
+    fn prediction_provenance_preserves_l4_gpu_extent() {
+        let directory = tempdir().expect("temporary prediction directory");
+
+        write_prediction_provenance(directory.path(), "NVIDIA H200", 4)
+            .expect("write prediction provenance");
+
+        let provenance: Value = serde_json::from_slice(
+            &std::fs::read(
+                directory
+                    .path()
+                    .join("raw")
+                    .join(PREDICTION_PROVENANCE_FILE),
+            )
+            .expect("read prediction provenance"),
+        )
+        .expect("parse prediction provenance");
+        assert_eq!(provenance["schema_version"], 1);
+        assert_eq!(provenance["gpu_name"], "NVIDIA H200");
+        assert_eq!(provenance["gpu_count"], 4);
+        assert!(!directory.path().join("raw/run_meta.json").exists());
+    }
 }
 
 /// Offline what-if bridge: JIT-fill missing `profile.db` rows on build (like

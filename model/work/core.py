@@ -679,11 +679,15 @@ class Model:
                         )
                     )
             else:
+                phase_compute_dtype = getattr(stack.attn, "phase_compute_dtype", None)
                 attention_phases = (
                     wl.attention_phases() if stack.attn.split_attention_phases else [(None, wl)]
                 )
                 for phase, phase_workload in attention_phases:
                     phase_suffix = f".{phase}" if phase is not None else ""
+                    mechanism_dtype = (
+                        phase_compute_dtype(phase) if phase_compute_dtype is not None else None
+                    )
                     segments.append(
                         Segment(
                             name=f"{prefix}attn{phase_suffix}",
@@ -692,7 +696,8 @@ class Model:
                             flops=stack.attn.internal_flops(phase_workload),
                             bytes=stack.attn.kv_bytes(phase_workload),
                             count=stack.count,
-                            compute_dtype=self.master_dtype,
+                            # A row that names no precision runs at the master dtype.
+                            compute_dtype=mechanism_dtype or self.master_dtype,
                         )
                     )
                 cache_write_bytes = stack.attn.cache_write_bytes(wl)

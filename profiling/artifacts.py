@@ -12,6 +12,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
+from launcher.artifact_kind import ArtifactKind, write_artifact_kind
 from profiling.db.registry import KernelProfilerSpec
 
 PROFILE_REQUEST_FILENAME = "request.json"
@@ -42,7 +43,7 @@ def prepare_profile_artifacts(
     existing = [name for name in protected_names if (output_dir / name).exists()]
     if existing:
         raise FileExistsError(f"profile artifact root already contains immutable files: {existing}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    write_artifact_kind(output_dir, ArtifactKind.KERNEL_PROFILE)
     _write_json_atomic(output_dir / PROFILE_REQUEST_FILENAME, request_payload)
     _write_json_atomic(output_dir / PROFILE_JOB_METADATA_FILENAME, job_metadata)
 
@@ -243,6 +244,7 @@ def build_measurement_metadata(
 def write_measurement_metadata(output_dir: Path, **fields_kwargs: Any) -> dict[str, Any]:
     """Atomically persist ``kernel-measurement.meta.json`` after a capture, before
     the managed job reports ready."""
+    write_artifact_kind(output_dir, ArtifactKind.KERNEL_MEASUREMENT)
     metadata = build_measurement_metadata(**fields_kwargs)
     _write_json_atomic(output_dir / MEASUREMENT_METADATA_FILENAME, metadata)
     return metadata

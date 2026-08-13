@@ -592,6 +592,7 @@ python -m launcher alignment sim <simulation.yaml|json> [simulation options]
 python -m launcher alignment profile <profile.yaml|json> [--dry-run]
 python -m launcher alignment timing-predict <timing_predict.yaml|json> [--build-type ...]
 python -m launcher alignment analyze <analyze.yaml|json> [--build-type ...]
+python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
 ```
 
 - Simulation presets, timing-predict configs, and all alignment stage inputs
@@ -611,7 +612,19 @@ python -m launcher alignment analyze <analyze.yaml|json> [--build-type ...]
   clock, or discrete-event simulation; its config is not a deployment preset.
   The launcher snapshots a private `raw/params.json` model/GPU projection so the
   necessary-work labeler can run; Analyzer does not expose that projection as
-  prediction topology.
+  prediction topology. Rust separately publishes
+  `raw/prediction_provenance.json` from the concrete L4 model, and the launcher
+  uses its authoritative `gpus_per_replica()` value in `prediction.meta.json`;
+  timing-predict does not create simulation `run_meta.json`.
+- Every first-class output root gets `artifact.meta.json` with one explicit kind:
+  `simulation_run`, `simulation_sweep`, `timing_prediction`, `alignment_bundle`,
+  `kernel_profile`, or `kernel_measurement`. Analyzer uses this marker as its only
+  artifact-type discriminator; it never decides simulation vs. timing prediction
+  from `raw/run_meta.json` or another incidental file.
+- `migrate-artifact-kinds` is the one-shot legacy conversion surface. `--apply`
+  scans registry roots plus managed-workspace descriptors, rejects the whole batch
+  on any ambiguous/mismatched artifact, then atomically publishes missing markers.
+  `--check` must report `missing_markers=0` before strict discovery is deployed.
 - `kernel-profile` is the operator-facing L1 profiling entry. It dispatches to
   `profiling.cli`, which remains the owner of registry, DB, GPU execution, and
   artifact semantics. `python -m profiling ...` is a compatible developer entry.
@@ -628,7 +641,8 @@ It exposes four explicit stages with four independent configs:
 - `alignment sim` passes the simulation config through the ordinary
   build → validate → expand → cache → run pipeline.
 - `alignment profile` uses the profiling config to launch the instrumented vLLM
-  server, NSYS capture, and TraceLab frontend, ending at normalized `parsed.json`.
+  server, NSYS capture, and the req-frontend load generator, ending at
+  normalized `parsed.json`.
 - `alignment timing-predict` pairs those completed artifacts, generates exact
   predictor cases, and runs the offline predictor. Its arch, GPU, and complete
   per-role backend policy come from the simulation run's normalized
@@ -652,8 +666,8 @@ the analysis root.
 The simulation's `workload.trace_files` should contain exactly the profiling
 config's `workload.frontend.path`. The check happens when `timing-predict` pairs
 the artifacts; a mismatch prints `[warn] alignment trace mismatch` but is
-non-fatal. The profiling workload selects a typed TraceLab
-frontend (`frontend.type: session` or `vibesim`) and supplies the current
+non-fatal. The profiling workload selects a typed req-frontend
+frontend (`frontend.type: session` or `independent`) and supplies the current
 synthetic-text inputs directly as `text_file` and `tokenizer`. A request-builder
 tag should be introduced only when another construction path has real runtime
 dispatch; unrelated trace schemas are not normalized into one sparse row.

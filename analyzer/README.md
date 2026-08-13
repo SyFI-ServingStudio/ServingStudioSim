@@ -74,6 +74,8 @@ publishes locked optimality as `variants.batch_locked` for interactive switching
 **Required from below** — `analyze run` consumes a run directory written by the
 sim/L7, containing:
 
+- `artifact.meta.json` — explicit first-class root identity. UI discovery accepts
+  `simulation_run` here and does not infer the resource type from any file below.
 - `raw/request_slo.parquet` and `raw/request_state.parquet` — subject inputs.
 - `raw/cost_log/worker_<pool_tag>_<worker_id>.parquet` plus matching
   `raw/cost_manifest/worker_<pool_tag>_<worker_id>.json` — trace inputs.
@@ -82,8 +84,10 @@ sim/L7, containing:
   Alignment iteration analysis needs no completed simulation: it derives the
   GPU-cycle multiplier from measured quantities alone (`Σ measured_gpu_cycle_ms /
   Σ measured_ms`) and applies it to the timing-predict totals itself.
-- `raw/run_meta.json` — sim-written sidecar (`num_gpus`, `gpu_name`); the
-  throughput subject reads it to normalize per-GPU. Absent → treated as 1 GPU.
+- `raw/run_meta.json` — simulation-only sidecar (`num_gpus`, `gpu_name`); the
+  throughput subject reads it to normalize per-GPU. Its presence or absence never
+  selects the artifact kind. Timing predictions instead carry their physical L4
+  extent in `prediction.meta.json.gpu_count` and do not create this sidecar.
 
 The UI model resource preserves the raw config and enriches it with optional
 `model.work` parameter counts (`total`, model-card-style `active`, and
@@ -129,7 +133,7 @@ additive work under its saturated-batch policy. The detail meta records the mode
 replication factor.
 The alignment path reads `<analysis_log_dir>/alignment_manifest.json`, which
 points to normalized NSYS JSON in the profile root, timing-predict cost
-parquet/manifest, the profile's `replay_result` TraceLab JSONL, its optional
+parquet/manifest, the profile's `replay_result` req-frontend JSONL, its optional
 engine-core `request_timings_result` JSONL, sim request-SLO parquet, and exact
 sequence-row-to-operation labels. An operation may own one
 or more simulated leaf slots; its measured kernel durations are counted once
@@ -241,7 +245,7 @@ Current catalog:
 | `kv-occupancy` | kv | `kv_snapshot` stream + `run_meta.json` capacity | per-pool KV occupancy (active total / retained-prefix component / projected-peak / promised tokens, and as a fraction of capacity) over time; old streams remain readable with the missing prefix breakdown marked unavailable / `kv_occupancy_series` |
 | `alignment-timeline` | alignment-iteration | the same inputs as `alignment-iteration`, but keeping every rank's per-kernel `(start_ns, end_ns)`, plus the optional host sidecar (`host_timeline` in the alignment manifest) | EVERY iteration, as an index plus a byte-range-addressed `alignment_timeline_iterations.jsonl`: raw measured intervals, per-slot UNIT sim times, the cost manifest verbatim, and — when the sidecar is present — per-thread NVTX and CUDA-runtime host lanes, so a client can draw the GPU, the sim and the CPU on ONE time axis. At most 32 iterations carry a distinguishing `selected_as`; the report writes up those. / reference-rank per-phase span/busy/idle + largest gaps named by the operations either side |
 | `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping (no simulation) | kernel/mapping error stats + self-derived `recommended_gpu_time_multiplier` (`Σ measured_gpu_cycle_ms / Σ measured_ms`) / separate kernel-busy and measured first-kernel-to-next-first-kernel GPU-cycle overviews + per-iteration mapped stacks |
-| `alignment-e2e` | alignment-e2e | TraceLab replay JSONL + parsed NSYS GPU timeline + optional vLLM engine-core request timing JSONL + sim `request_slo.parquet` | independent client-TTFT/sim, optional server-TTFT/sim, client-TPOT/sim, optional server-TPOT/sim, E2E stats, client-completion throughput, and server GPU-span throughput / available raw latency CDF overlays + client/sim completion series annotated with all aggregate rates |
+| `alignment-e2e` | alignment-e2e | req-frontend replay JSONL + parsed NSYS GPU timeline + optional vLLM engine-core request timing JSONL + sim `request_slo.parquet` | independent client-TTFT/sim, optional server-TTFT/sim, client-TPOT/sim, optional server-TPOT/sim, E2E stats, client-completion throughput, and server GPU-span throughput / available raw latency CDF overlays + client/sim completion series annotated with all aggregate rates |
 | `alignment-workload` | alignment-workload | normalized NSYS iteration metrics + sim `cost_log.groups`/`wall_start_ms` | per-side workload summaries / fine prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle series by iteration id, plus decode batch size by elapsed time |
 
 `alignment-timeline` runs with `alignment-iteration` in the kernel-align phase; it

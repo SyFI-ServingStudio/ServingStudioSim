@@ -1,9 +1,15 @@
-"""Coordinate one measured alignment run across TraceLab, vLLM, and Nsight.
+"""Coordinate one measured alignment run across req-frontend, a serving engine, and Nsight.
 
 The explicit `launcher alignment profile <profiling-config>` command calls this
-module. It prepares TraceLab, launches one instrumented-fork vLLM server under
-nsys, drives the workload, and exports the trace into the profiling config's
+module. It prepares req-frontend, launches one instrumented-fork server under nsys,
+drives the workload, and exports the trace into the profiling config's
 `log_dir`. It does not generate timing-predict inputs or run comparison analysis.
+
+`cfg.engine` picks the launch driver -- `vllm_server` or `sglang_server`. Both
+expose the same module-level surface (argv, env, launch metadata, ready/profile/
+idle polling, worker ranks), and both forks emit the identical alignment records,
+so everything after the capture is shared: this module names no engine below the
+point where the driver and its `EngineRecords` descriptor are chosen.
 
 The server is spawned in its own session so a SIGINT to the group lets nsys
 finalize the `.nsys-rep` cleanly on shutdown.
@@ -21,14 +27,26 @@ from pathlib import Path
 
 from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
-from .profiler import nsys_capture, vllm_server
+from .profiler import nsys_capture, record_extraction, sglang_server, vllm_server
 from .profiler.config import ProfileConfig
+from .profiler.engine_records import SGLANG_RECORDS, VLLM_RECORDS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# One entry per supported engine: the launch driver, the log dialect its records
+# arrive in, and the venv python a config that names no `fork_python` defaults to.
+_ENGINES = {
+    "vllm": (vllm_server, VLLM_RECORDS, "alignment/profiler/vllm/.venv/bin/python"),
+    "sglang": (
+        sglang_server,
+        SGLANG_RECORDS,
+        "alignment/profiler/sglang/python/.venv-sglang/bin/python",
+    ),
+}
+
 
 def _successful_replay_request_ids(replay_jsonl: Path) -> set[str]:
-    """Return the exact TraceLab request ids submitted successfully to vLLM."""
+    """Return the exact req-frontend request ids submitted successfully to vLLM."""
     request_ids: set[str] = set()
     for line_number, line in enumerate(replay_jsonl.read_text().splitlines(), start=1):
         if not line.strip():
@@ -48,9 +66,19 @@ def _successful_replay_request_ids(replay_jsonl: Path) -> set[str]:
     return request_ids
 
 
+def _engine(cfg: ProfileConfig):
+    """The launch driver, record dialect, and default venv for `cfg.engine`."""
+    try:
+        return _ENGINES[cfg.engine]
+    except KeyError:
+        raise ValueError(
+            f"unsupported engine: {cfg.engine!r}; expected one of {sorted(_ENGINES)}"
+        ) from None
+
+
 def _resolve_fork_python(cfg: ProfileConfig) -> str:
-    default_fork = REPO_ROOT / "alignment/profiler/vllm/.venv/bin/python"
-    fork = Path(cfg.fork_python) if cfg.fork_python else default_fork
+    _, _, default_relative = _engine(cfg)
+    fork = Path(cfg.fork_python) if cfg.fork_python else REPO_ROOT / default_relative
     if not fork.is_absolute():
         fork = REPO_ROOT / fork
     # normpath (not resolve) so the venv's python symlink is kept — resolving it
@@ -58,11 +86,18 @@ def _resolve_fork_python(cfg: ProfileConfig) -> str:
     fork = Path(os.path.normpath(fork))
     if not fork.exists():
         raise FileNotFoundError(
-            f"vLLM python not found: {fork}\n"
-            "Point `fork_python` at a vLLM venv, or build one — "
+            f"{cfg.engine} python not found: {fork}\n"
+            f"Point `fork_python` at a {cfg.engine} venv, or build one — "
             "see alignment/profiler/README.md."
         )
     return str(fork)
+
+
+def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> None:
+    """Add backend-required server flags exactly once to the persisted launch argv."""
+    for argument in cfg.workload.backend.required_server_args:
+        if argument not in server_argv:
+            server_argv.append(argument)
 
 
 def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
@@ -73,6 +108,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     manifest). The GPU capture is the expensive, non-reproducible part of this
     pipeline; a failure in extraction or parsing must never cost a re-capture.
     """
+    driver, _, _ = _engine(cfg)
     log_dir = Path(cfg.log_dir)
     if not log_dir.is_absolute():
         log_dir = REPO_ROOT / log_dir
@@ -83,31 +119,40 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         # compile work and ensures a bad trace fails before allocating vLLM GPU
         # memory.
         load_generator.build_session_runner()
-    vllm_dir = log_dir / "vllm"
+    engine_dir = log_dir / cfg.engine
     nsys_dir = log_dir / "nsys"
-    vllm_dir.mkdir(parents=True, exist_ok=True)
+    engine_dir.mkdir(parents=True, exist_ok=True)
     nsys_dir.mkdir(parents=True, exist_ok=True)
 
-    # A resumed pass never launches vLLM, so it must not require the fork venv
-    # either — the capture it reuses is the evidence.
+    # A resumed pass never launches the engine, so it must not require the fork
+    # venv either — the capture it reuses is the evidence.
     fork_python = None if resume else _resolve_fork_python(cfg)
-    server_argv = [] if resume else vllm_server.build_server_argv(fork_python, cfg.server)
+    server_argv = [] if resume else driver.build_server_argv(fork_python, cfg.server)
+    if not resume:
+        _append_backend_server_args(server_argv, cfg)
     is_expert_popularity = cfg.profile_kind == "expert_popularity"
     is_workload_metrics = cfg.profile_kind == "workload_metrics"
     is_nsys = cfg.profile_kind == "nsys"
     if not (is_nsys or is_expert_popularity or is_workload_metrics):
         raise ValueError(f"unsupported profile_kind: {cfg.profile_kind!r}")
+    if is_nsys and not resume:
+        server_argv += list(driver.NSYS_CAPTURE_SERVER_ARGS)
     if is_nsys and cfg.nsys.capture_mode == "cuda_profiler_api" and not resume:
-        # This enables vLLM's /start_profile and /stop_profile routes. Those
-        # routes fan CUDA profiler control into the actual GPU worker, which is
-        # the reliable targeted-capture boundary for the spawned EngineCore.
-        server_argv.append("--profiler-config.profiler=cuda")
-    env = {} if resume else vllm_server.build_server_env(fork_python, cfg.cuda_visible_devices)
+        server_argv += list(driver.CUDA_PROFILER_SERVER_ARGS)
+    env = (
+        {}
+        if resume
+        else driver.build_server_env(
+            fork_python,
+            cfg.cuda_visible_devices,
+            driver_compat_lib_dir=cfg.driver_compat_lib_dir,
+        )
+    )
     if is_expert_popularity and not resume:
         # This pass measures routing counts, not phase timing.  NVTX construction
         # and NSYS are disabled so its deliberate EPLB all-reduce/D2H logging
         # overhead cannot be confused with the timing pass.
-        env["VLLM_NVTX_SCOPES_FOR_PROFILING"] = "0"
+        env.update(driver.TIMING_INSTRUMENTATION_OFF_ENV)
     # Only the timing pass runs under NSYS. The other passes launch the same
     # server argv bare so profiler lifecycle work cannot enter their evidence.
     out_rep = nsys_dir / cfg.name
@@ -116,7 +161,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         if is_nsys and not resume
         else None
     )
-    server_log = vllm_dir / f"{cfg.name}_server.log"
+    server_log = engine_dir / f"{cfg.name}_server.log"
 
     if resume:
         if not server_log.is_file():
@@ -129,6 +174,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         drive_summary = {
             "source_trace": str(prepared_replay.trace_path.resolve()),
             "frontend_type": cfg.workload.frontend.type,
+            "backend_type": cfg.workload.backend.type,
             "log_path": str(prepared_replay.log_path),
             "summary_path": str(prepared_replay.summary_path),
             "resumed_from_existing_capture": True,
@@ -137,7 +183,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         return _finalize_profile(
             cfg,
             log_dir=log_dir,
-            vllm_dir=vllm_dir,
+            engine_dir=engine_dir,
             server_log=server_log,
             out_rep=out_rep,
             prepared_replay=prepared_replay,
@@ -150,8 +196,8 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         if nsys_executable is not None
         else server_argv
     )
-    vllm_server.write_launch_metadata(
-        vllm_dir / f"{cfg.name}_launch.json",
+    driver.write_launch_metadata(
+        engine_dir / f"{cfg.name}_launch.json",
         full_argv,
         server_argv,
         env,
@@ -185,9 +231,9 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         capture_timer: threading.Thread | None = None
         capture_timer_errors: list[BaseException] = []
         try:
-            vllm_server.wait_for_ready(base_url, proc, cfg.server.startup_timeout)
+            driver.wait_for_ready(base_url, proc, cfg.server.startup_timeout)
             if is_nsys and cfg.nsys.capture_mode == "cuda_profiler_api":
-                vllm_server.set_cuda_profile(base_url, active=True)
+                driver.set_cuda_profile(base_url, active=True)
                 cuda_profile_active = True
                 if cfg.nsys.capture_duration_seconds is not None:
 
@@ -196,7 +242,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
                         if capture_timer_cancelled.wait(cfg.nsys.capture_duration_seconds):
                             return
                         try:
-                            vllm_server.set_cuda_profile(base_url, active=False)
+                            driver.set_cuda_profile(base_url, active=False)
                         except BaseException as error:
                             capture_timer_errors.append(error)
                         else:
@@ -216,10 +262,10 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
                 capture_timer.join()
             if capture_timer_errors:
                 raise RuntimeError("bounded NSYS capture stop failed") from capture_timer_errors[0]
-            drive_summary["reached_idle"] = vllm_server.wait_for_idle(base_url, cfg.idle)
+            drive_summary["reached_idle"] = driver.wait_for_idle(base_url, cfg.idle)
             print(f"[profile] workload done: {drive_summary}")
             if cuda_profile_active:
-                vllm_server.set_cuda_profile(base_url, active=False)
+                driver.set_cuda_profile(base_url, active=False)
                 cuda_profile_active = False
             time.sleep(2)  # let the last iterations' kernels flush into the trace
         finally:
@@ -230,7 +276,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
                 # Preserve the original workload error if the emergency stop
                 # also fails; `_shutdown` still lets nsys finalize its report.
                 try:
-                    vllm_server.set_cuda_profile(base_url, active=False)
+                    driver.set_cuda_profile(base_url, active=False)
                 except RuntimeError:
                     pass
             _shutdown(proc)
@@ -238,7 +284,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     return _finalize_profile(
         cfg,
         log_dir=log_dir,
-        vllm_dir=vllm_dir,
+        engine_dir=engine_dir,
         server_log=server_log,
         out_rep=out_rep,
         prepared_replay=prepared_replay,
@@ -251,7 +297,7 @@ def _finalize_profile(
     cfg: ProfileConfig,
     *,
     log_dir: Path,
-    vllm_dir: Path,
+    engine_dir: Path,
     server_log: Path,
     out_rep: Path,
     prepared_replay,
@@ -266,10 +312,11 @@ def _finalize_profile(
     """
     is_expert_popularity = cfg.profile_kind == "expert_popularity"
     is_workload_metrics = cfg.profile_kind == "workload_metrics"
+    driver, records, _ = _engine(cfg)
 
-    metrics_jsonl = vllm_dir / f"{cfg.name}_metrics.jsonl"
-    n_metrics = vllm_server.extract_metrics_jsonl(
-        server_log, metrics_jsonl, dp_size=cfg.server.dp_size
+    metrics_jsonl = engine_dir / f"{cfg.name}_metrics.jsonl"
+    n_metrics = record_extraction.extract_metrics_jsonl(
+        server_log, metrics_jsonl, dp_size=cfg.server.dp_size, records=records
     )
 
     if is_expert_popularity:
@@ -277,17 +324,19 @@ def _finalize_profile(
         # gates both NVTX ranges and EngineCore request timing records in the
         # instrumented fork. Request timing belongs to the clean NSYS pass;
         # requiring it here would reject an otherwise valid popularity capture.
-        expert_load_jsonl = vllm_dir / f"{cfg.name}_expert_load.jsonl"
+        expert_load_jsonl = engine_dir / f"{cfg.name}_expert_load.jsonl"
         expert_popularity_json = log_dir / "expert_popularity.json"
         expert_parallel_size = cfg.server.tp_size * cfg.server.dp_size
-        expert_record_count = vllm_server.extract_expert_popularity(
+        expert_record_count = record_extraction.extract_expert_popularity(
             server_log,
             expert_load_jsonl,
             expert_popularity_json,
             expert_parallel_size=expert_parallel_size,
+            records=records,
         )
         result = {
             "profile_kind": cfg.profile_kind,
+            "engine": cfg.engine,
             "log_dir": str(log_dir),
             "metrics_jsonl": str(metrics_jsonl),
             "expert_load_jsonl": str(expert_load_jsonl),
@@ -308,17 +357,19 @@ def _finalize_profile(
         )
         return result
 
-    request_timings_jsonl = vllm_dir / f"{cfg.name}_request_timings.jsonl"
+    request_timings_jsonl = engine_dir / f"{cfg.name}_request_timings.jsonl"
     successful_request_ids = _successful_replay_request_ids(prepared_replay.log_path)
-    n_request_timings = vllm_server.extract_request_timings_jsonl(
+    n_request_timings = record_extraction.extract_request_timings_jsonl(
         server_log,
         request_timings_jsonl,
         expected_request_ids=successful_request_ids,
+        records=records,
     )
 
     if is_workload_metrics:
         result = {
             "profile_kind": cfg.profile_kind,
+            "engine": cfg.engine,
             "log_dir": str(log_dir),
             "metrics_jsonl": str(metrics_jsonl),
             "request_timings_jsonl": str(request_timings_jsonl),
@@ -362,9 +413,11 @@ def _finalize_profile(
         print("[warn] export validation failed — capture window may have missed target iterations")
 
     parsed_path = log_dir / "parsed.json"
-    # The server log is the only source of the worker pid ↔ global rank identity
-    # that turns nsys's per-device kernels into per-DP-rank evidence.
-    worker_ranks = vllm_server.extract_worker_device_ranks(server_log)
+    # Which device ran which DP rank. Engines say this two ways: some state it
+    # outright per worker, the rest state pid ↔ rank and leave nsys's pid ↔
+    # device knowledge to complete the join. Prefer the direct statement.
+    dp_rank_by_device = record_extraction.extract_dp_rank_by_device(server_log, records=records)
+    worker_ranks = driver.extract_worker_device_ranks(server_log)
     parsed = parse_trace(
         sqlite_path,
         metrics_jsonl,
@@ -373,6 +426,7 @@ def _finalize_profile(
         range_mode="phases",
         worker_ranks=worker_ranks,
         tp_size=cfg.server.tp_size,
+        dp_rank_by_device=dp_rank_by_device,
     )
     expected_device_count = cfg.server.tp_size * cfg.server.dp_size
     if len(parsed["device_ids"]) != expected_device_count:
@@ -410,6 +464,7 @@ def _finalize_profile(
 
     result = {
         "profile_kind": cfg.profile_kind,
+        "engine": cfg.engine,
         # Resolved artifact root is the launcher→analyzer handoff. Keep it in the
         # result instead of making the launcher duplicate relative-path semantics.
         "log_dir": str(log_dir),
@@ -437,7 +492,7 @@ def _finalize_profile(
         "nsys_profiler": (
             nsys_executable.provenance()
             if nsys_executable is not None
-            else _captured_nsys_provenance(vllm_dir / f"{cfg.name}_launch.json")
+            else _captured_nsys_provenance(engine_dir / f"{cfg.name}_launch.json")
         ),
     }
     (log_dir / "profile_result.json").write_text(json.dumps(result, indent=2))

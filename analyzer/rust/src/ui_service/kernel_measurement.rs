@@ -1,10 +1,10 @@
 //! First-class ``kernel_measurement`` resource discovery, descriptor, summary, and
 //! plot serving.
 //!
-//! ``kernel-measurement.meta.json`` (written by ``python -m profiling measure``) is
-//! the discovery source of truth and declares the summary file + plot basenames. A
-//! legacy measurement dir (summary.json with a complete, verifiable signature, no new
-//! metadata) is discovered as ``km_legacy_<hash>``. Plot paths are validated to a
+//! ``artifact.meta.json`` is the discovery source of truth. Modern metadata declares
+//! the summary file + plot basenames. A marked legacy measurement dir (summary.json
+//! with a complete, verifiable signature, no new metadata) remains readable as
+//! ``km_legacy_<hash>``. Plot paths are validated to a
 //! single component that must be exactly a declared plot name, so traversal or
 //! undeclared files are impossible.
 
@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::artifact::read_json;
+use super::artifact_kind::{read_artifact_kind, ArtifactKind};
 use super::discovery::{ignored_directory_name, regular_file, timestamp, ConfiguredRoot};
 use super::{ArtifactNotFound, KernelMeasurementNotFound, PROTOCOL_VERSION};
 
@@ -189,7 +190,19 @@ pub(super) fn discover_kernel_measurements(
     for root in roots {
         let mut pending = vec![root.path().to_path_buf()];
         while let Some(directory) = pending.pop() {
-            if regular_file(&directory.join(METADATA_FILE)) {
+            let artifact_kind = match read_artifact_kind(&directory) {
+                Ok(artifact_kind) => artifact_kind,
+                Err(error) => {
+                    eprintln!(
+                        "warning: ignore invalid artifact marker under {}: {error:#}",
+                        directory.display()
+                    );
+                    continue;
+                }
+            };
+            if artifact_kind == Some(ArtifactKind::KernelMeasurement)
+                && regular_file(&directory.join(METADATA_FILE))
+            {
                 let metadata: MeasurementMetadata =
                     serde_json::from_value(read_json(&directory.join(METADATA_FILE))?)
                         .with_context(|| {
@@ -218,7 +231,9 @@ pub(super) fn discover_kernel_measurements(
             }
             // Legacy measure dirs are discovered only when the summary signature is
             // complete and verifiable — never guessed from the host or a stray file.
-            if summary_signature_complete(&directory.join(SUMMARY_FILE)) {
+            if artifact_kind == Some(ArtifactKind::KernelMeasurement)
+                && summary_signature_complete(&directory.join(SUMMARY_FILE))
+            {
                 let relative = directory
                     .strip_prefix(root.path())
                     .expect("kernel measurement discovery stays below its configured root");
@@ -235,6 +250,9 @@ pub(super) fn discover_kernel_measurements(
                     metadata: None,
                     legacy: true,
                 });
+                continue;
+            }
+            if artifact_kind.is_some_and(|kind| !kind.can_contain_resources()) {
                 continue;
             }
             let mut children = fs::read_dir(&directory)

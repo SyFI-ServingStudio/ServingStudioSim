@@ -139,7 +139,7 @@ divided by `num_output_tokens - 1`. A one-token request records a null TPOT
 because it has no inter-token interval. The v1 TTFT-only record remains readable
 for older captures.
 The extractor removes vLLM completions' `cmpl-<X-Request-Id>-0` envelope into
-the canonical TraceLab `request_id` and retains the raw `engine_request_id` for
+the canonical req-frontend `request_id` and retains the raw `engine_request_id` for
 audit.
 The NSYS profile runner extracts these lines to
 `profile/vllm/<name>_request_timings.jsonl` and records that path in
@@ -148,7 +148,17 @@ The NSYS profile runner extracts these lines to
 uses the NSYS iteration IDs only to identify the measured replay's contiguous
 segment. These engine-core metrics exclude HTTP/frontend ingress,
 tokenization, detokenization, SSE return, `[DONE]`, and client post-processing;
-TraceLab's fields remain the client-observed latency measurements.
+req-frontend's fields remain the client-observed latency measurements.
+
+When API timing instrumentation is enabled, the same request artifact also
+contains API-process durations from endpoint entry through the first token SSE
+yield. API timing schema v3 decomposes lazy generator activation,
+`AsyncLLM.add_request`, waiting for the first EngineCore output, output
+processing/fan-out to the per-request collector, collector wakeup, generator
+resume, and first-token serialization. The collector interval closes as API
+EngineCore-output wait plus output fan-out. The extractor compares durations
+within their originating clock domains and never subtracts EngineCore and API
+absolute timestamps across processes.
 
 The separate `expert_popularity` pass sets
 `VLLM_NVTX_SCOPES_FOR_PROFILING=0`, so it neither emits nor requires this
@@ -244,7 +254,7 @@ uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml \
   --gpu-time-multiplier-from logs/<experiment>/analysis_kernel
 ```
 
-`profile.yaml` is only the vLLM/TraceLab/NSYS run input. It owns one artifact
+`profile.yaml` is only the vLLM/req-frontend/NSYS run input. It owns one artifact
 root and contains no timing-predict or analyzer policy:
 
 ```yaml
@@ -258,12 +268,12 @@ workload: ...
 ```
 
 The launcher removes an inherited `VLLM_API_KEY` from the local vLLM server
-subprocess. The paired TraceLab replay client intentionally targets an
+subprocess. The paired req-frontend replay client intentionally targets an
 unauthenticated loopback endpoint; ambient shell credentials must not turn that
 private measurement boundary into an authenticated API and fail preflight with
 HTTP 401.
 
-The same launch boundary enables vLLM prompt-token details by default. TraceLab
+The same launch boundary enables vLLM prompt-token details by default. req-frontend
 performs a mandatory two-request prefix-cache preflight and reads
 `usage.prompt_tokens_details.cached_tokens`; experiment presets do not need to
 repeat `--enable-prompt-tokens-details` in `server.extra_args`.
@@ -273,8 +283,9 @@ are resolved relative to that file.
 
 The profiling config's `workload.frontend.path` should equal the simulation
 config's sole `workload.trace_files` entry. `workload.frontend.type` selects a
-typed TraceLab frontend: `vibesim` for `id,input_len,output_len,arrival_time`, or
-`session` for TraceLab's round/prefix/tool-wait schema. Request construction is
+typed req-frontend trace format: `independent` for
+`id,input_len,output_len,arrival_time`, or `session` for the canonical
+round/prefix/tool-wait schema. Request construction is
 currently synthetic text and reads `workload.text_file` plus
 `workload.tokenizer` directly. Add a tagged request-builder config only when
 another implementation has real runtime dispatch. No missing fields are filled

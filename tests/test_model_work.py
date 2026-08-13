@@ -204,6 +204,18 @@ def test_small_group_skips_the_basis_it_cannot_pay_for(monkeypatch, model):
     assert small["segmented"] == pytest.approx(affine["segmented"])
 
 
+def test_qwen3_235b_fp8_prefills_precision_is_fp8():
+    """The FP8 recipe serves prefill (FA3) with FP8 Q/KV, so its necessary math
+    must be labeled at the FP8 tensor-core peak; decode QK stays BF16. A bf16
+    pin here re-inflates R6 above R5 and hides every quant/norm excess."""
+    from pathlib import Path
+    qwen = load_model(str(Path("model/config/qwen3_235b_thinking_2507_fp8.json")))
+    label = qwen.label(Workload.causal_lm(prefill=[(16384, 0)], sampled=1))
+    dtype = {s.name: s.compute_dtype for s in label.segments}
+    assert dtype["attn.prefill"] == "fp8"
+    assert dtype["attn.decode"] != "fp8"  # decode QK in the FP8 recipe is BF16
+
+
 def test_decode_flop_buckets(model):
     # 1 decode token at kv_len=4096: matmul_tokens=1, causal pairs = kv = 4096.
     label = model.label(Workload.causal_lm(decode=[4096], sampled=1))

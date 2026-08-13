@@ -20,13 +20,20 @@ def build(raw_config: dict) -> Model:
     head_dim = raw_config.get("head_dim", hidden // num_qo_heads)
     master_dtype = raw_config.get("dtype") or raw_config.get("torch_dtype", "bfloat16")
     weight_bytes = dtype_bytes(master_dtype)
-
+    quant = parse_quantization_config(raw_config)
+    # The FP8 recipe serves the prefill (FA3) forward with FP8 Q and FP8 KV, so the
+    # necessary attention math must be labeled at the FP8 tensor-core peak; decode
+    # QK stays at the master dtype. Builders keep ``None`` (master dtype) otherwise.
+    prefill_compute_dtype = (
+        "fp8" if quant is not None and quant.compute_dtype == "fp8" else None
+    )
     attn = GQA(
         hidden=hidden,
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         kv_dtype_bytes=weight_bytes,
+        prefill_compute_dtype=prefill_compute_dtype,
     )
     ffn = MoE(
         hidden=hidden,

@@ -84,7 +84,21 @@ fn timeline_profile_log_has_fixed_fields_and_rejects_non_finite_time() {
     assert!(timeline_profile_log_line(&invalid).is_err());
 }
 
+fn write_artifact_marker(path: &Path, artifact_kind: &str) {
+    fs::create_dir_all(path).expect("create artifact directory");
+    fs::write(
+        path.join("artifact.meta.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "artifact_kind": artifact_kind,
+        }))
+        .expect("serialize artifact marker"),
+    )
+    .expect("write artifact marker");
+}
+
 fn make_run(path: &Path, complete: bool, analyzed: bool) {
+    write_artifact_marker(path, "simulation_run");
     fs::create_dir_all(path.join("raw")).expect("create raw directory");
     fs::write(path.join("raw/params.json"), "{}").expect("write params");
     if complete {
@@ -97,7 +111,7 @@ fn make_run(path: &Path, complete: bool, analyzed: bool) {
 }
 
 fn make_sweep(path: &Path, with_payload: bool) {
-    fs::create_dir_all(path).expect("create sweep directory");
+    write_artifact_marker(path, "simulation_sweep");
     fs::write(
         path.join("sweep_manifest.json"),
         r#"{
@@ -157,7 +171,7 @@ fn make_sweep(path: &Path, with_payload: bool) {
 }
 
 fn make_prediction(path: &Path, prediction_id: &str) {
-    fs::create_dir_all(path).expect("create prediction directory");
+    write_artifact_marker(path, "timing_prediction");
     fs::write(path.join("predict.json"), "{}").expect("write prediction config snapshot");
     fs::write(
         path.join("prediction.cases.json"),
@@ -315,7 +329,7 @@ fn make_curve_file(path: &Path, kind: &str, family: &str, dtypes: &[&str]) {
 }
 
 fn make_kernel_profile(path: &Path, profile_id: &str, observed: Option<&str>) {
-    fs::create_dir_all(path).expect("create kernel profile directory");
+    write_artifact_marker(path, "kernel_profile");
     make_curve_file(path, "single_gemm", "compute", &["bf16", "fp16"]);
     fs::write(
         path.join("job.meta.json"),
@@ -348,7 +362,7 @@ fn make_kernel_profile(path: &Path, profile_id: &str, observed: Option<&str>) {
 }
 
 fn make_legacy_kernel_profile(path: &Path) {
-    fs::create_dir_all(path).expect("create legacy kernel profile directory");
+    write_artifact_marker(path, "kernel_profile");
     make_curve_file(path, "single_gemm", "compute", &["bf16"]);
     fs::write(
         path.join("job.meta.json"),
@@ -375,7 +389,7 @@ fn valid_summary_json() -> &'static str {
 }
 
 fn make_kernel_measurement(path: &Path, measurement_id: &str) {
-    fs::create_dir_all(path).expect("create kernel measurement directory");
+    write_artifact_marker(path, "kernel_measurement");
     fs::write(path.join("summary.json"), valid_summary_json()).expect("write measurement summary");
     fs::write(
         path.join("runtimes.csv"),
@@ -406,7 +420,7 @@ fn make_kernel_measurement(path: &Path, measurement_id: &str) {
 }
 
 fn make_legacy_kernel_measurement(path: &Path) {
-    fs::create_dir_all(path).expect("create legacy kernel measurement directory");
+    write_artifact_marker(path, "kernel_measurement");
     fs::write(path.join("summary.json"), valid_summary_json()).expect("write legacy summary");
     fs::write(
         path.join("runtimes.csv"),
@@ -448,6 +462,7 @@ async fn get_json(router: Router, uri: &str) -> (StatusCode, Value) {
 }
 
 fn make_core_run(path: &Path) {
+    write_artifact_marker(path, "simulation_run");
     fs::create_dir_all(path.join("raw")).expect("create raw directory");
     fs::create_dir_all(path.join("reports")).expect("create reports directory");
     fs::write(
@@ -863,7 +878,14 @@ fn empty_logs_root_has_empty_protocol_v1_catalog() {
 #[test]
 fn prediction_catalog_is_first_class_and_does_not_create_a_run() {
     let temporary = TempDir::new().expect("temporary logs root");
-    make_prediction(&temporary.path().join("predict-llama"), "p_test");
+    let prediction_path = temporary.path().join("predict-llama");
+    make_prediction(&prediction_path, "p_test");
+    fs::create_dir_all(prediction_path.join("raw")).expect("create prediction raw dir");
+    fs::write(
+        prediction_path.join("raw/params.json"),
+        json!({"pools": {"predict": {"groups": []}}}).to_string(),
+    )
+    .expect("write private prediction labeler params");
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
 
@@ -935,7 +957,7 @@ async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_jso
 }
 
 #[test]
-fn prediction_discovery_rejects_duplicate_ids_and_ignores_old_logs() {
+fn prediction_discovery_skips_duplicate_ids_and_ignores_old_logs() {
     let temporary = TempDir::new().expect("temporary logs root");
     make_prediction(&temporary.path().join("first"), "p_duplicate");
     make_prediction(&temporary.path().join("second"), "p_duplicate");
@@ -943,20 +965,39 @@ fn prediction_discovery_rejects_duplicate_ids_and_ignores_old_logs() {
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
 
-    assert!(discover_predictions(&roots).is_err());
+    // One malformed/duplicate directory must never abort the whole catalog: it
+    // is skipped with a warning, the valid prediction survives, and old-logs is
+    // ignored as before.
+    let predictions = discover_predictions(&roots).expect("catalog must not fail");
+    let mut ids: Vec<_> = predictions
+        .iter()
+        .map(|prediction| prediction.prediction_id())
+        .collect();
+    ids.sort_unstable();
+    // old-logs is ignored, so only the first (kept) duplicate remains.
+    assert_eq!(ids, vec!["p_duplicate"]);
 }
 
 #[test]
-fn prediction_discovery_rejects_noncanonical_resource_ids() {
+fn prediction_discovery_skips_noncanonical_resource_ids() {
     let temporary = TempDir::new().expect("temporary logs root");
     make_prediction(&temporary.path().join("empty"), "p_");
+    let valid = make_prediction(&temporary.path().join("valid"), "p_valid");
+    let _ = valid;
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
-    assert!(discover_predictions(&roots).is_err());
+    // A non-canonical id ("p_") is skipped, not fatal; the valid one is kept.
+    let predictions = discover_predictions(&roots).expect("catalog must not fail");
+    let ids: Vec<_> = predictions
+        .iter()
+        .map(|prediction| prediction.prediction_id())
+        .collect();
+    assert_eq!(ids, vec!["p_valid"]);
 
-    fs::remove_dir_all(temporary.path().join("empty")).expect("remove invalid prediction");
+    fs::remove_dir_all(temporary.path().join("valid")).expect("remove valid prediction");
     make_prediction(&temporary.path().join("unicode"), "p_预测");
-    assert!(discover_predictions(&roots).is_err());
+    let predictions = discover_predictions(&roots).expect("catalog must not fail");
+    assert!(predictions.is_empty());
 }
 
 #[test]
@@ -1122,6 +1163,63 @@ fn discovers_nested_runs_and_ignores_directory_shells() {
     let pending_value = serde_json::to_value(pending).expect("serialize pending run");
     assert_eq!(pending_value["lifecycle"]["simulation"], "pending");
     assert_eq!(pending_value["lifecycle"]["analysis"], "not_started");
+}
+
+#[test]
+fn legacy_file_shapes_without_explicit_markers_are_not_discovered() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let logs = temporary.path();
+
+    let run = logs.join("run");
+    make_run(&run, true, true);
+    fs::remove_file(run.join("artifact.meta.json")).expect("remove run marker");
+
+    let prediction = logs.join("prediction");
+    make_prediction(&prediction, "p_unmarked");
+    fs::remove_file(prediction.join("artifact.meta.json")).expect("remove prediction marker");
+
+    let profile = logs.join("profile");
+    make_kernel_profile(&profile, "kp_unmarked", None);
+    fs::remove_file(profile.join("artifact.meta.json")).expect("remove profile marker");
+
+    let measurement = logs.join("measurement");
+    make_kernel_measurement(&measurement, "km_unmarked");
+    fs::remove_file(measurement.join("artifact.meta.json")).expect("remove measurement marker");
+
+    let sweep = logs.join("sweep");
+    fs::create_dir_all(&sweep).expect("create sweep shell");
+    fs::write(
+        sweep.join("sweep_manifest.json"),
+        r#"{"schema_version":1,"axes":[],"runs":[]}"#,
+    )
+    .expect("write unmarked sweep manifest");
+
+    let alignment = logs.join("alignment");
+    fs::create_dir_all(alignment.join("analysis_kernel")).expect("create analysis half");
+    fs::write(
+        alignment.join("analysis_kernel/alignment_manifest.json"),
+        "{}",
+    )
+    .expect("write unmarked alignment manifest");
+
+    let roots = configure_logs_roots(vec![logs.to_path_buf()]).expect("configure logs root");
+    assert!(discover_runs(&roots).expect("discover runs").is_empty());
+    assert!(discover_predictions(&roots)
+        .expect("discover predictions")
+        .is_empty());
+    assert!(discover_kernel_profiles(&roots)
+        .expect("discover profiles")
+        .is_empty());
+    assert!(discover_kernel_measurements(&roots)
+        .expect("discover measurements")
+        .is_empty());
+    assert!(discover_alignments(&roots)
+        .expect("discover alignments")
+        .is_empty());
+    let sweep_catalog =
+        serde_json::to_value(build_sweep_catalog(&roots).expect("build sweep catalog"))
+            .expect("serialize sweep catalog");
+    assert_eq!(sweep_catalog["sweeps"], json!([]));
 }
 
 #[test]
@@ -2389,7 +2487,7 @@ fn kernel_discovery_rejects_duplicate_and_invalid_ids() {
 
     fs::remove_dir_all(logs.join("first")).expect("remove first");
     fs::remove_dir_all(logs.join("second")).expect("remove second");
-    fs::create_dir_all(logs.join("invalid")).expect("create invalid");
+    write_artifact_marker(&logs.join("invalid"), "kernel_profile");
     fs::write(
         logs.join("invalid/kernel-profile.meta.json"),
         serde_json::to_vec(&json!({
@@ -2590,7 +2688,7 @@ fn curve_hardware_bindings_follow_dtype_and_interconnect_direction() {
     let logs = temporary.path();
     write_gpu_spec_fixture(logs);
     // Computed bf16 row + a made-up dtype row (must have no fake line).
-    fs::create_dir_all(logs.join("profiles/compute")).expect("create dir");
+    write_artifact_marker(&logs.join("profiles/compute"), "kernel_profile");
     make_curve_file(
         &logs.join("profiles/compute"),
         "single_gemm",
@@ -2611,7 +2709,7 @@ fn curve_hardware_bindings_follow_dtype_and_interconnect_direction() {
     )
     .expect("write metadata");
     // P2P collective curve: algbw/busbw use the one-way peak.
-    fs::create_dir_all(logs.join("profiles/p2p")).expect("create p2p dir");
+    write_artifact_marker(&logs.join("profiles/p2p"), "kernel_profile");
     make_curve_file(&logs.join("profiles/p2p"), "p2p_intra", "comm", &[]);
     fs::write(
         logs.join("profiles/p2p/kernel-profile.meta.json"),
@@ -2627,7 +2725,7 @@ fn curve_hardware_bindings_follow_dtype_and_interconnect_direction() {
     )
     .expect("write p2p metadata");
     // Collective curve: busbw uses the bidirectional peak, algbw has no generic line.
-    fs::create_dir_all(logs.join("profiles/ar")).expect("create ar dir");
+    write_artifact_marker(&logs.join("profiles/ar"), "kernel_profile");
     make_curve_file(&logs.join("profiles/ar"), "all_reduce", "comm", &[]);
     fs::write(
         logs.join("profiles/ar/kernel-profile.meta.json"),
@@ -2744,6 +2842,7 @@ fn legacy_profile_has_data_but_no_hardware_limits() {
 /// the kernel level long before a simulation exists to compare end-to-end.
 fn write_alignment_bundle(root: &Path) -> (Vec<u8>, [usize; 2]) {
     let bundle = root.join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    write_artifact_marker(&bundle, "alignment_bundle");
     let kernel = bundle.join("analysis_kernel");
     fs::create_dir_all(kernel.join("reports")).expect("kernel reports");
     fs::create_dir_all(kernel.join("payloads")).expect("kernel payloads");

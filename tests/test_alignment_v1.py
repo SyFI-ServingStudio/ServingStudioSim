@@ -10,9 +10,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from alignment.profiler import nsys_capture, vllm_server
+from alignment.profiler import engine_records, nsys_capture, record_extraction, vllm_server
 from alignment.profiler.config import NsysConfig
-from alignment.timing_predict_input.vllm_text import build_cases
+from alignment.timing_predict_input.engine_text import build_cases
 from launcher.alignment_config import load_labeled_kernel_sequences
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -86,7 +86,7 @@ def test_structured_vllm_iteration_record_is_the_only_metrics_contract(tmp_path)
     )
     output = tmp_path / "metrics.jsonl"
 
-    assert vllm_server.extract_metrics_jsonl(server_log, output) == 1
+    assert record_extraction.extract_metrics_jsonl(server_log, output) == 1
     # A single-EngineCore capture needs no rank prefix and lands on rank 0.
     assert json.loads(output.read_text()) == {**record, "dp_rank": 0}
 
@@ -109,7 +109,7 @@ def test_structured_vllm_iteration_v2_requires_observed_timing(tmp_path):
     server_log.write_text(f"INFO VibeSimAlignmentIteration {json.dumps(record)}\n")
     output = tmp_path / "metrics.jsonl"
 
-    assert vllm_server.extract_metrics_jsonl(server_log, output) == 1
+    assert record_extraction.extract_metrics_jsonl(server_log, output) == 1
     # A single-EngineCore capture needs no rank prefix and lands on rank 0.
     assert json.loads(output.read_text()) == {**record, "dp_rank": 0}
 
@@ -138,7 +138,7 @@ def test_data_parallel_iteration_records_are_stamped_with_their_engine_rank(tmp_
     )
     output = tmp_path / "metrics.jsonl"
 
-    assert vllm_server.extract_metrics_jsonl(server_log, output, dp_size=2) == 2
+    assert record_extraction.extract_metrics_jsonl(server_log, output, dp_size=2) == 2
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     assert rows == [{**rank0, "dp_rank": 0}, {**rank1, "dp_rank": 1}]
 
@@ -151,7 +151,7 @@ def test_data_parallel_capture_rejects_untagged_iteration_records(tmp_path):
     )
 
     with pytest.raises(ValueError, match="no EngineCore_DP<k> log prefix"):
-        vllm_server.extract_metrics_jsonl(server_log, tmp_path / "metrics.jsonl", dp_size=2)
+        record_extraction.extract_metrics_jsonl(server_log, tmp_path / "metrics.jsonl", dp_size=2)
 
 
 def test_worker_rank_banner_supplies_the_pid_to_rank_join(tmp_path):
@@ -190,7 +190,7 @@ def test_structured_vllm_request_timing_is_extracted_separately(tmp_path):
     server_log.write_text(f"INFO VibeSimAlignmentRequestTiming {json.dumps(record)}\n")
     output = tmp_path / "request_timings.jsonl"
 
-    assert vllm_server.extract_request_timings_jsonl(server_log, output) == 1
+    assert record_extraction.extract_request_timings_jsonl(server_log, output) == 1
     assert json.loads(output.read_text()) == {**record, "request_id": "vibesim_7"}
 
 
@@ -209,8 +209,276 @@ def test_structured_vllm_request_timing_v2_includes_server_tpot(tmp_path):
     server_log.write_text(f"INFO VibeSimAlignmentRequestTiming {json.dumps(record)}\n")
     output = tmp_path / "request_timings.jsonl"
 
-    assert vllm_server.extract_request_timings_jsonl(server_log, output) == 1
+    assert record_extraction.extract_request_timings_jsonl(server_log, output) == 1
     assert json.loads(output.read_text()) == {**record, "request_id": "vibesim_7"}
+
+
+def test_structured_vllm_tokens_request_timing_normalizes_native_envelope(tmp_path):
+    record = {
+        "schema_version": 2,
+        "engine_request_id": "generate-tokens-vibesim_7",
+        "engine_core_ttft_ms": 12.5,
+        "engine_queue_wait_ms": 3.0,
+        "engine_first_schedule_to_first_token_ms": 9.5,
+        "engine_core_decode_ms": 180.0,
+        "num_output_tokens": 10,
+        "engine_core_tpot_ms": 20.0,
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(f"INFO VibeSimAlignmentRequestTiming {json.dumps(record)}\n")
+    output = tmp_path / "request_timings.jsonl"
+
+    assert (
+        record_extraction.extract_request_timings_jsonl(
+            server_log, output, expected_request_ids={"vibesim_7"}
+        )
+        == 1
+    )
+    assert json.loads(output.read_text()) == {**record, "request_id": "vibesim_7"}
+
+
+def test_structured_vllm_request_timing_v3_joins_api_sse_durations(tmp_path):
+    engine_record = {
+        "schema_version": 2,
+        "engine_request_id": "cmpl-vibesim_7-0",
+        "engine_core_ttft_ms": 12.5,
+        "engine_queue_wait_ms": 3.0,
+        "engine_first_schedule_to_first_token_ms": 9.5,
+        "engine_core_decode_ms": 180.0,
+        "num_output_tokens": 10,
+        "engine_core_tpot_ms": 20.0,
+    }
+    api_record = {
+        "schema_version": 3,
+        "api_request_id": "cmpl-vibesim_7",
+        "output_tokens": 10,
+        "token_events": 9,
+        "first_token_event_tokens": 1,
+        "api_frontend_prepare_ms": 1.0,
+        "api_first_output_wait_ms": 13.0,
+        "api_stream_activation_ms": 1.0,
+        "api_add_request_ms": 1.5,
+        "api_collector_wait_ms": 9.0,
+        "api_engine_output_wait_ms": 7.0,
+        "api_output_fanout_ms": 2.0,
+        "api_collector_wakeup_ms": 0.5,
+        "api_generator_resume_ms": 1.0,
+        "api_first_output_serialize_ms": 0.1,
+        "api_token_output_receive_span_ms": 181.0,
+        "api_token_sse_yield_span_ms": 182.0,
+        "api_terminal_tail_ms": 0.2,
+        "engine_core_ttft_ms": 12.5,
+        "engine_core_decode_ms": 180.0,
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            [
+                f"INFO VibeSimAlignmentRequestTiming {json.dumps(engine_record)}",
+                f"INFO VibeSimAlignmentApiRequestTiming {json.dumps(api_record)}",
+            ]
+        )
+    )
+    output = tmp_path / "request_timings.jsonl"
+
+    assert record_extraction.extract_request_timings_jsonl(server_log, output) == 1
+    row = json.loads(output.read_text())
+    assert row["schema_version"] == 3
+    assert row["engine_timing_schema_version"] == 2
+    assert row["api_timing_schema_version"] == 3
+    assert row["request_id"] == "vibesim_7"
+    assert row["api_request_id"] == "cmpl-vibesim_7"
+    assert row["api_token_sse_yield_span_ms"] == 182.0
+    assert row["api_collector_wait_ms"] == 9.0
+    assert row["api_engine_output_wait_ms"] == 7.0
+    assert row["api_output_fanout_ms"] == 2.0
+
+
+def _worker_record(**overrides) -> dict:
+    row = {
+        "schema_version": 1,
+        "input_adapter": "sglang_text",
+        "pid": 100,
+        "device_id": 0,
+        "visible_devices": "4,5",
+        "tp_rank": 0,
+        "dp_rank": 0,
+        "pp_rank": 0,
+        "tp_size": 1,
+        "dp_size": 2,
+    }
+    row.update(overrides)
+    return row
+
+
+def _worker_log(tmp_path, rows) -> Path:
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(f"INFO VibeSimAlignmentWorker {json.dumps(row)}" for row in rows)
+    )
+    return server_log
+
+
+def test_sglang_worker_records_state_the_device_to_dp_rank_mapping(tmp_path):
+    """The direct statement replaces the pid join, for the engine that makes it."""
+    server_log = _worker_log(
+        tmp_path,
+        [
+            _worker_record(pid=100, device_id=0, dp_rank=0),
+            _worker_record(pid=101, device_id=1, dp_rank=1),
+        ],
+    )
+
+    mapping = record_extraction.extract_dp_rank_by_device(
+        server_log, records=engine_records.SGLANG_RECORDS
+    )
+
+    assert mapping == {0: 0, 1: 1}
+
+
+def test_vllm_reads_no_worker_records_even_when_the_log_has_them(tmp_path):
+    """`None` means "this engine states it elsewhere", not "no ranks found".
+
+    vLLM's mapping comes from the pid banner, and returning an empty dict here
+    would read downstream as a stated mapping covering no devices.
+    """
+    server_log = _worker_log(tmp_path, [_worker_record()])
+
+    assert record_extraction.extract_dp_rank_by_device(server_log) is None
+
+
+def test_sglang_worker_records_reject_per_process_visible_devices(tmp_path):
+    """Two ranks each seeing one device both call it device 0.
+
+    `gpu_id` is an index into the process's visible set. When the sets differ the
+    ids are not comparable, and the mapping would silently fold both ranks onto
+    device 0 instead of failing.
+    """
+    server_log = _worker_log(
+        tmp_path,
+        [
+            _worker_record(pid=100, device_id=0, dp_rank=0, visible_devices="4"),
+            _worker_record(pid=101, device_id=0, dp_rank=1, visible_devices="5"),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="do not share one CUDA_VISIBLE_DEVICES"):
+        record_extraction.extract_dp_rank_by_device(
+            server_log, records=engine_records.SGLANG_RECORDS
+        )
+
+
+def test_sglang_worker_records_reject_a_partial_rank_population(tmp_path):
+    """A log missing a rank describes half a run, and would attribute it whole."""
+    server_log = _worker_log(tmp_path, [_worker_record(pid=100, device_id=0, dp_rank=0)])
+
+    with pytest.raises(ValueError, match="not the full 0..1"):
+        record_extraction.extract_dp_rank_by_device(
+            server_log, records=engine_records.SGLANG_RECORDS
+        )
+
+
+def test_sglang_worker_records_reject_two_ranks_claiming_one_device(tmp_path):
+    """Whichever won would take the other rank's kernels with it."""
+    server_log = _worker_log(
+        tmp_path,
+        [
+            _worker_record(pid=100, device_id=0, dp_rank=0),
+            _worker_record(pid=101, device_id=0, dp_rank=1),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="claimed by DP ranks"):
+        record_extraction.extract_dp_rank_by_device(
+            server_log, records=engine_records.SGLANG_RECORDS
+        )
+
+
+def _sglang_v3_records(**api_overrides):
+    """One SGLang engine+API record pair, in the shape a live server emits."""
+    engine_record = {
+        "schema_version": 2,
+        "input_adapter": "sglang_text",
+        "engine_request_id": "vibesim_7",
+        "engine_core_ttft_ms": 12.5,
+        "engine_queue_wait_ms": 3.0,
+        "engine_first_schedule_to_first_token_ms": 9.5,
+        "engine_core_decode_ms": 180.0,
+        "num_output_tokens": 10,
+        "engine_core_tpot_ms": 20.0,
+    }
+    api_record = {
+        "schema_version": 3,
+        "input_adapter": "sglang_text",
+        "api_request_id": "vibesim_7",
+        "output_tokens": 10,
+        "api_frontend_prepare_ms": 1.0,
+        # The parent span, with the two dispatch phases nested inside it and no
+        # name for the remainder: SGLang cannot split its own IPC handoff.
+        "api_first_output_wait_ms": 13.0,
+        "api_stream_activation_ms": 1.0,
+        "api_add_request_ms": 1.5,
+        "api_token_output_receive_span_ms": 181.0,
+        "api_terminal_tail_ms": 0.2,
+    }
+    api_record.update(api_overrides)
+    return engine_record, api_record
+
+
+def _write_records(server_log, engine_record, api_record):
+    server_log.write_text(
+        "\n".join(
+            [
+                f"INFO VibeSimAlignmentRequestTiming {json.dumps(engine_record)}",
+                f"INFO VibeSimAlignmentApiRequestTiming {json.dumps(api_record)}",
+            ]
+        )
+    )
+
+
+def test_sglang_request_timing_v3_accepts_a_partially_split_first_output_wait(tmp_path):
+    """An engine that names only some phases inside the span is still valid.
+
+    SGLang reports the dispatch phases and the parent wait but not vLLM's
+    collector/generator split, so requiring the parts to sum to the whole -- as
+    the check did when vLLM was the only engine -- would reject every truthful
+    SGLang row.
+    """
+    engine_record, api_record = _sglang_v3_records()
+    server_log = tmp_path / "server.log"
+    _write_records(server_log, engine_record, api_record)
+    output = tmp_path / "request_timings.jsonl"
+
+    assert (
+        record_extraction.extract_request_timings_jsonl(
+            server_log, output, records=engine_records.SGLANG_RECORDS
+        )
+        == 1
+    )
+    row = json.loads(output.read_text())
+    assert row["schema_version"] == 3
+    assert row["request_id"] == "vibesim_7"
+    assert row["api_first_output_wait_ms"] == 13.0
+    # vLLM-only plumbing must not be invented for an engine that has none.
+    assert "api_collector_wait_ms" not in row
+
+
+def test_sglang_request_timing_v3_rejects_dispatch_phases_exceeding_the_wait(tmp_path):
+    """Containment is still a real check, not a check that was dropped.
+
+    A phase boundary stamped in the wrong place shows up as dispatch phases that
+    do not fit inside the span they are nested in.
+    """
+    engine_record, api_record = _sglang_v3_records(api_add_request_ms=99.0)
+    server_log = tmp_path / "server.log"
+    _write_records(server_log, engine_record, api_record)
+
+    with pytest.raises(ValueError, match="do not fit inside"):
+        record_extraction.extract_request_timings_jsonl(
+            server_log,
+            tmp_path / "request_timings.jsonl",
+            records=engine_records.SGLANG_RECORDS,
+        )
 
 
 def test_structured_vllm_request_timing_v2_rejects_inconsistent_tpot(tmp_path):
@@ -228,7 +496,9 @@ def test_structured_vllm_request_timing_v2_rejects_inconsistent_tpot(tmp_path):
     server_log.write_text(f"INFO VibeSimAlignmentRequestTiming {json.dumps(record)}\n")
 
     with pytest.raises(ValueError, match="does not equal"):
-        vllm_server.extract_request_timings_jsonl(server_log, tmp_path / "request_timings.jsonl")
+        record_extraction.extract_request_timings_jsonl(
+            server_log, tmp_path / "request_timings.jsonl"
+        )
 
 
 def test_request_timing_extraction_filters_frontend_preflight_requests(tmp_path):
@@ -255,7 +525,7 @@ def test_request_timing_extraction_filters_frontend_preflight_requests(tmp_path)
     output = tmp_path / "request_timings.jsonl"
 
     assert (
-        vllm_server.extract_request_timings_jsonl(
+        record_extraction.extract_request_timings_jsonl(
             server_log,
             output,
             expected_request_ids={"vibesim_7", "vibesim_8"},
@@ -935,7 +1205,7 @@ def _measured_iteration(
 def _replay_row(request_id: str, submit: float, complete: float) -> str:
     return json.dumps(
         {
-            "source": {"type": "vibe_sim_request", "data": {"id": request_id}},
+            "source": {"type": "independent_request", "data": {"id": request_id}},
             "outcome": {
                 "status": "SUCCESS",
                 "submit_timestamp": submit,

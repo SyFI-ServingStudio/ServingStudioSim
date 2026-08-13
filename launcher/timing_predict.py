@@ -29,6 +29,7 @@ import sys
 import uuid
 from pathlib import Path
 
+from .artifact_kind import ArtifactKind, write_artifact_kind
 from .exec import (
     REPO_ROOT,
     _build_subprocess_env,
@@ -45,11 +46,11 @@ from .process.leases import LauncherLeases
 
 _LAUNCHER_LEASES = LauncherLeases(REPO_ROOT)
 
-
 # The simulator's offline writer uses this physical stream tag. The prediction
 # API keeps it private, but the semantic labeler needs one stable key to match
 # the CostTree worker while it reads the launcher-owned compatibility snapshot.
 PREDICTION_POOL_TAG = "predict"
+PREDICTION_PROVENANCE_FILE = "prediction_provenance.json"
 
 
 def _load_config(path: Path) -> dict:
@@ -197,7 +198,13 @@ def _write_prediction_metadata(
     selector = next(iter(arch)) if isinstance(arch, dict) and len(arch) == 1 else None
     arch_config = arch.get(selector) if isinstance(selector, str) else None
     arch_type = arch_config.get("type") if isinstance(arch_config, dict) else None
-    gpu_name = cfg.get("gpu")
+    gpu_name, gpu_count = _read_prediction_provenance(log_dir)
+    configured_gpu_name = cfg.get("gpu")
+    if gpu_name != configured_gpu_name:
+        raise ValueError(
+            "timing-predict provenance GPU does not match the requested GPU: "
+            f"{gpu_name!r} != {configured_gpu_name!r}"
+        )
     cases = _resolve_cases(config_path, cfg)
     cases_name = "prediction.cases.json"
     metadata = {
@@ -206,7 +213,7 @@ def _write_prediction_metadata(
         "selector": selector,
         "arch_type": arch_type,
         "gpu": gpu_name,
-        "gpu_count": 1,
+        "gpu_count": gpu_count,
         "config_file": config_path.name,
         "cases_file": cases_name,
         "case_count": len(cases),
@@ -227,6 +234,25 @@ def _write_prediction_metadata(
         encoding="utf-8",
     )
     temporary_path.replace(log_dir / "prediction.meta.json")
+
+
+def _read_prediction_provenance(log_dir: Path) -> tuple[str, int]:
+    """Read the Rust model's physical GPU extent without deriving parallelism.
+
+    The predictor constructs the concrete L4 model and is therefore the only
+    timing-predict component that can authoritatively call ``gpus_per_replica``.
+    """
+    provenance_path = log_dir / "raw" / PREDICTION_PROVENANCE_FILE
+    provenance = json.loads(provenance_path.read_text("utf-8"))
+    gpu_name = provenance.get("gpu_name")
+    gpu_count = provenance.get("gpu_count")
+    if provenance.get("schema_version") != 1:
+        raise ValueError("unsupported timing-predict provenance schema")
+    if not isinstance(gpu_name, str) or not gpu_name:
+        raise ValueError("timing-predict provenance requires gpu_name")
+    if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count <= 0:
+        raise ValueError("timing-predict provenance requires positive gpu_count")
+    return gpu_name, gpu_count
 
 
 def _predict_descriptor(config_path: Path, cfg: dict) -> dict:
@@ -283,9 +309,7 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         await run_directory_lease.acquire()
         if managed_job is not None:
             managed_job.report("running")
-        _snapshot_inputs(config_path, cfg, log_dir)
-        _write_prediction_metadata(config_path, cfg, log_dir, prediction_id)
-
+        write_artifact_kind(log_dir, ArtifactKind.TIMING_PREDICTION)
         binary = binary_path(build_type)
         argv = [str(binary), "timing-predict", str(config_path)]
         journal = RunJournal(log_dir)
@@ -328,6 +352,13 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
             if managed_job is not None:
                 managed_job.report("failed")
             return False
+        # Publish private labeler inputs and the first-class resource only after
+        # Rust has emitted authoritative L4 GPU provenance, and only once that
+        # output has passed validation. The explicit type marker exists from
+        # launch, but the catalog requires prediction.meta.json too, so an
+        # in-flight prediction is not published and can never masquerade as a run.
+        _snapshot_inputs(config_path, cfg, log_dir)
+        _write_prediction_metadata(config_path, cfg, log_dir, prediction_id)
         journal.update(
             "timing_predict",
             StageState.SUCCEEDED,

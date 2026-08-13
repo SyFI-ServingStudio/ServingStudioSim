@@ -33,11 +33,14 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::artifact::read_json;
+use super::artifact_kind::{read_artifact_kind, ArtifactKind};
 use super::discovery::{
     display_name, ignored_directory_name, regular_file, timestamp, ConfiguredRoot,
 };
 use super::prediction::{prediction_at, DiscoveredPrediction};
-use super::{AlignmentNotFound, ArtifactNotFound, PROTOCOL_VERSION};
+#[cfg(test)]
+use super::AlignmentNotFound;
+use super::{ArtifactNotFound, PROTOCOL_VERSION};
 
 /// The manifest each analysis half writes. Its presence is what makes a
 /// directory an analysis, and its parent a bundle.
@@ -130,7 +133,8 @@ impl DiscoveredAlignment {
     /// resources are addressed within one workspace, and a cross-workspace id
     /// would resolve against the wrong root.
     fn paired_prediction(&self, roots: &[ConfiguredRoot]) -> Option<DiscoveredPrediction> {
-        let manifest = read_json(&self.analysis_dir(KERNEL_ANALYSIS_DIR).join(MANIFEST_FILE)).ok()?;
+        let manifest =
+            read_json(&self.analysis_dir(KERNEL_ANALYSIS_DIR).join(MANIFEST_FILE)).ok()?;
         let predict_log_dir = manifest.get("predict_log_dir")?.as_str()?;
         prediction_at(roots, Path::new(predict_log_dir))
             .filter(|prediction| prediction.workspace_id == self.workspace_id)
@@ -184,7 +188,7 @@ pub(super) fn build_alignment_catalog(roots: &[ConfiguredRoot]) -> Result<Alignm
     })
 }
 
-/// Walk each configured root for directories holding an analysis half.
+/// Walk each configured root for explicitly typed alignment bundles.
 ///
 /// The bundle is the analysis directory's PARENT, because that is what owns the
 /// capture and the prediction both halves point at. Descent stops at a bundle
@@ -195,7 +199,20 @@ pub(super) fn discover_alignments(roots: &[ConfiguredRoot]) -> Result<Vec<Discov
     for root in roots {
         let mut pending = vec![root.path().to_path_buf()];
         while let Some(directory) = pending.pop() {
-            if is_alignment_bundle(&directory) {
+            let artifact_kind = match read_artifact_kind(&directory) {
+                Ok(artifact_kind) => artifact_kind,
+                Err(error) => {
+                    eprintln!(
+                        "warning: ignore invalid artifact marker under {}: {error:#}",
+                        directory.display()
+                    );
+                    continue;
+                }
+            };
+            if artifact_kind == Some(ArtifactKind::AlignmentBundle) {
+                if !alignment_has_analysis_half(&directory) {
+                    continue;
+                }
                 let relative = directory
                     .strip_prefix(root.path())
                     .expect("alignment discovery stays below its configured root");
@@ -209,6 +226,9 @@ pub(super) fn discover_alignments(roots: &[ConfiguredRoot]) -> Result<Vec<Discov
                         path: directory,
                     });
                 }
+                continue;
+            }
+            if artifact_kind.is_some_and(|kind| !kind.can_contain_resources()) {
                 continue;
             }
             let Ok(entries) = fs::read_dir(&directory) else {
@@ -233,7 +253,7 @@ pub(super) fn discover_alignments(roots: &[ConfiguredRoot]) -> Result<Vec<Discov
     Ok(alignments)
 }
 
-fn is_alignment_bundle(directory: &Path) -> bool {
+fn alignment_has_analysis_half(directory: &Path) -> bool {
     [KERNEL_ANALYSIS_DIR, E2E_ANALYSIS_DIR]
         .iter()
         .any(|half| regular_file(&directory.join(half).join(MANIFEST_FILE)))

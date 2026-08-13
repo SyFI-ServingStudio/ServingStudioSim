@@ -1,23 +1,36 @@
-"""Convert canonical instrumented-vLLM text records into predictor cases."""
+"""Convert canonical instrumented-engine text records into predictor cases.
+
+The record is the same shape from either instrumented fork -- the `input_adapter`
+tag is the only thing that differs -- so one adapter reads both. The tag is still
+required and still checked: a record that names no engine, or names one this
+build does not know, is a capture defect rather than something to assume about.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
 SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+SUPPORTED_INPUT_ADAPTERS = frozenset({"vllm_text", "sglang_text"})
 
 
-def _validated_shape(metric: dict[str, Any], context: str) -> tuple[list[list[int]], list[int], int]:
+def _validated_shape(
+    metric: dict[str, Any], context: str
+) -> tuple[list[list[int]], list[int], int]:
     """Check one record's batch shape and return (chunk pairs, kv lens, tokens).
 
     The record is the measurement; a malformed one is a capture defect, never
     something to repair silently.
     """
-    if metric.get("input_adapter") != "vllm_text":
-        raise ValueError(f"{context}: expected a vllm_text record")
+    if metric.get("input_adapter") not in SUPPORTED_INPUT_ADAPTERS:
+        raise ValueError(
+            f"{context}: expected one of {sorted(SUPPORTED_INPUT_ADAPTERS)}, "
+            f"got input_adapter {metric.get('input_adapter')!r}"
+        )
     if metric.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
         raise ValueError(
-            f"{context}: unsupported vllm_text schema_version {metric.get('schema_version')!r}"
+            f"{context}: unsupported engine-text schema_version "
+            f"{metric.get('schema_version')!r}"
         )
 
     pairs = metric.get("prefill_chunk_pairs")

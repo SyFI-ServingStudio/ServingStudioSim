@@ -2,7 +2,7 @@
 
 Use this for load-generator capacity tests where shape variance would obscure
 the offered-load boundary. Arrival times are milliseconds, matching the L7 and
-TraceLab VibeSim frontend contract.
+req-frontend `independent` frontend contract.
 """
 
 from __future__ import annotations

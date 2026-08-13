@@ -234,6 +234,17 @@ fn level_entry_json(
         bucket_obj.insert("hardware_necessary".into(), json!(fused));
         rung_obj.insert("segmented_necessary".into(), json!(segmented));
         rung_obj.insert("hardware_necessary".into(), json!(fused));
+        // Truth-tell when the independent necessary-work floor exceeds the
+        // measured hardware limit R5: the clamp to [0, R5] would otherwise read
+        // as zero excess, which is not "necessary-optimal" but an under-accounted
+        // floor. Surface the raw shortfall so the waterfall can't misreport.
+        if floor.segmented > green_s {
+            bucket_obj.insert(
+                "under_accounted_gpu_s".into(),
+                json!((floor.segmented - green_s).max(0.0)),
+            );
+            rung_obj.insert("floor_under_accounted".into(), json!(true));
+        }
         Some(ratio(fused, ms_to_s(total)))
     } else {
         bucket_obj.insert("hardware_optimal".into(), json!(green_s));
@@ -306,6 +317,14 @@ pub(super) fn rung_report_json(rungs: &BaseRungs, floor: Option<Floors>) -> Valu
         buckets["excess_over_necessary"] = bucket_s(green_s - segmented);
         buckets["fusion"] = bucket_s(segmented - fused);
         buckets["hardware_necessary"] = bucket_s(fused);
+        // Truth-tell when the independent necessary-work floor exceeds the
+        // measured hardware limit R5: the clamp to [0, R5] would otherwise read
+        // as zero excess, which is not "necessary-optimal" but an under-accounted
+        // floor. Surface the raw shortfall explicitly.
+        if (floor.segmented - green_s) > 0.0 {
+            report["under_accounted_gpu_s"] = json!((floor.segmented - green_s).max(0.0));
+            report["floor_under_accounted"] = json!(true);
+        }
     } else {
         buckets["hardware_optimal"] = bucket_ms(rungs.hardware_limit);
     }
