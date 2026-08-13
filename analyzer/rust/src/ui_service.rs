@@ -87,8 +87,7 @@ use optimality::{
     read_optimality_report,
 };
 use prediction::{
-    build_prediction_catalog, normalize_prediction_necessary, prediction_cases, prediction_descriptor,
-    prediction_worker_gpus, resolve_prediction,
+    build_prediction_catalog, prediction_cases, prediction_descriptor, resolve_prediction,
     DiscoveredPrediction,
 };
 use request_state::{read_request_state_payload, read_request_state_report};
@@ -848,10 +847,7 @@ async fn get_prediction_optimality_kernel_ladder(
     )
     .await
     {
-        Ok(mut value) => {
-            normalize_prediction_necessary(&mut value, prediction.gpu_count(), prediction_worker_gpus(&prediction.path));
-            Json(value).into_response()
-        }
+        Ok(value) => Json(value).into_response(),
         Err(error) => prediction_resource_error(error),
     }
 }
@@ -882,10 +878,7 @@ async fn get_prediction_optimality_waterfall(
     )
     .await
     {
-        Ok(mut value) => {
-            normalize_prediction_necessary(&mut value, prediction.gpu_count(), prediction_worker_gpus(&prediction.path));
-            Json(value).into_response()
-        }
+        Ok(value) => Json(value).into_response(),
         Err(error) => prediction_resource_error(error),
     }
 }
