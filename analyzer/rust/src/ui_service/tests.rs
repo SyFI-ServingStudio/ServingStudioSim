@@ -935,7 +935,7 @@ async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_jso
 }
 
 #[test]
-fn prediction_discovery_rejects_duplicate_ids_and_ignores_old_logs() {
+fn prediction_discovery_skips_duplicate_ids_and_ignores_old_logs() {
     let temporary = TempDir::new().expect("temporary logs root");
     make_prediction(&temporary.path().join("first"), "p_duplicate");
     make_prediction(&temporary.path().join("second"), "p_duplicate");
@@ -943,20 +943,40 @@ fn prediction_discovery_rejects_duplicate_ids_and_ignores_old_logs() {
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
 
-    assert!(discover_predictions(&roots).is_err());
+    // One malformed/duplicate directory must never abort the whole catalog: it
+    // is skipped with a warning, the valid prediction survives, and old-logs is
+    // ignored as before.
+    let predictions = discover_predictions(&roots).expect("catalog must not fail");
+    let mut ids: Vec<_> = predictions
+        .iter()
+        .map(|prediction| prediction.prediction_id())
+        .collect();
+    ids.sort_unstable();
+    // old-logs is ignored, so only the first (kept) duplicate remains.
+    assert_eq!(ids, vec!["p_duplicate"]);
 }
 
 #[test]
-fn prediction_discovery_rejects_noncanonical_resource_ids() {
+fn prediction_discovery_skips_noncanonical_resource_ids() {
     let temporary = TempDir::new().expect("temporary logs root");
     make_prediction(&temporary.path().join("empty"), "p_");
+    let valid = make_prediction(&temporary.path().join("valid"), "p_valid");
+    let _ = valid;
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
-    assert!(discover_predictions(&roots).is_err());
+    // A non-canonical id ("p_") is skipped, not fatal; the valid one is kept.
+    let predictions = discover_predictions(&roots).expect("catalog must not fail");
+    let ids: Vec<_> = predictions
+        .iter()
+        .map(|prediction| prediction.prediction_id())
+        .collect();
+    assert_eq!(ids, vec!["p_valid"]);
 
-    fs::remove_dir_all(temporary.path().join("empty")).expect("remove invalid prediction");
+    fs::remove_dir_all(temporary.path().join("valid"))
+        .expect("remove valid prediction");
     make_prediction(&temporary.path().join("unicode"), "p_预测");
-    assert!(discover_predictions(&roots).is_err());
+    let predictions = discover_predictions(&roots).expect("catalog must not fail");
+    assert!(predictions.is_empty());
 }
 
 #[test]

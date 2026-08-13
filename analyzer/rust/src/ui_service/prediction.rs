@@ -136,14 +136,32 @@ pub(super) fn discover_predictions(roots: &[ConfiguredRoot]) -> Result<Vec<Disco
         let mut pending = vec![root.path().to_path_buf()];
         while let Some(directory) = pending.pop() {
             if regular_file(&directory.join(METADATA_FILE)) {
-                let metadata: PredictionMetadata =
-                    serde_json::from_value(read_json(&directory.join(METADATA_FILE))?)
-                        .with_context(|| {
-                            format!("decode {METADATA_FILE} under {}", directory.display())
-                        })?;
-                validate_metadata(&metadata)?;
+                // A malformed metadata file (e.g. a stray pytest fixture) must
+                // never abort the whole predictions catalog. Skip it with a warning
+                // so one bad directory cannot hide every other prediction in every root.
+                let parse = (|| -> Result<PredictionMetadata> {
+                    let raw = read_json(&directory.join(METADATA_FILE))?;
+                    let metadata: PredictionMetadata = serde_json::from_value(raw)?;
+                    validate_metadata(&metadata)?;
+                    Ok(metadata)
+                })();
+                let metadata = match parse {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        eprintln!(
+                            "[analyze] skipping malformed {METADATA_FILE} under {}: {error:#}",
+                            directory.display()
+                        );
+                        continue;
+                    }
+                };
                 if !prediction_ids.insert(metadata.prediction_id.clone()) {
-                    bail!("duplicate prediction id: {}", metadata.prediction_id);
+                    eprintln!(
+                        "[analyze] skipping duplicate prediction id {} under {}",
+                        metadata.prediction_id,
+                        directory.display()
+                    );
+                    continue;
                 }
                 let relative = directory
                     .strip_prefix(root.path())
