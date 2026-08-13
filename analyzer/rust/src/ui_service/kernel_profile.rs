@@ -1,8 +1,8 @@
 //! First-class ``kernel_profile`` resource discovery, descriptor, and curve.
 //!
-//! ``kernel-profile.meta.json`` (written by ``python -m profiling run ...``) is the
-//! discovery source of truth. Legacy snapshot dirs without that file but with the old
-//! ``job.meta.json`` + ``curve.json`` pair remain discoverable as
+//! ``artifact.meta.json`` is the discovery source of truth. A marked legacy snapshot
+//! without modern metadata but with the old ``job.meta.json`` + ``curve.json`` pair remains
+//! readable as
 //! ``kp_legacy_<hash>``. The curve endpoint enriches the immutable curve JSON with
 //! GPU hardware ceiling lines (per-row, dtype-aware) instead of rewriting the
 //! artifact, and never infers a missing GPU from the current host.
@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::artifact::read_json;
+use super::artifact_kind::{read_artifact_kind, ArtifactKind};
 use super::discovery::{ignored_directory_name, regular_file, timestamp, ConfiguredRoot};
 use super::hardware::{resolve_gpu, ResolvedGpu};
 use super::{KernelProfileNotFound, PROTOCOL_VERSION};
@@ -247,7 +248,19 @@ pub(super) fn discover_kernel_profiles(
     for root in roots {
         let mut pending = vec![root.path().to_path_buf()];
         while let Some(directory) = pending.pop() {
-            if regular_file(&directory.join(METADATA_FILE)) {
+            let artifact_kind = match read_artifact_kind(&directory) {
+                Ok(artifact_kind) => artifact_kind,
+                Err(error) => {
+                    eprintln!(
+                        "warning: ignore invalid artifact marker under {}: {error:#}",
+                        directory.display()
+                    );
+                    continue;
+                }
+            };
+            if artifact_kind == Some(ArtifactKind::KernelProfile)
+                && regular_file(&directory.join(METADATA_FILE))
+            {
                 let metadata: ProfileMetadata =
                     serde_json::from_value(read_json(&directory.join(METADATA_FILE))?)
                         .with_context(|| {
@@ -271,7 +284,8 @@ pub(super) fn discover_kernel_profiles(
                 });
                 continue;
             }
-            if regular_file(&directory.join(LEGACY_JOB_METADATA_FILE))
+            if artifact_kind == Some(ArtifactKind::KernelProfile)
+                && regular_file(&directory.join(LEGACY_JOB_METADATA_FILE))
                 && regular_file(&directory.join(CURVE_FILE))
             {
                 let relative = directory
@@ -290,6 +304,9 @@ pub(super) fn discover_kernel_profiles(
                     metadata: None,
                     legacy: true,
                 });
+                continue;
+            }
+            if artifact_kind.is_some_and(|kind| !kind.can_contain_resources()) {
                 continue;
             }
             let mut children = fs::read_dir(&directory)

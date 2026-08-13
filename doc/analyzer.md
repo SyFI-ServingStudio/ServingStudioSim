@@ -66,6 +66,27 @@ registration unit — the registry is deliberately flat, so adding a metric is o
 per-category dispatch. The live per-subject list lives in
 [`analyzer/README.md`](../analyzer/README.md) (the Subjects catalog).
 
+## Explicit artifact identity
+
+Every first-class artifact root carries an immutable `artifact.meta.json`:
+
+```json
+{"schema_version": 1, "artifact_kind": "timing_prediction"}
+```
+
+The allowed kinds are `simulation_run`, `simulation_sweep`,
+`timing_prediction`, `alignment_bundle`, `kernel_profile`, and
+`kernel_measurement`. This marker is the sole Analyzer discovery type source;
+runtime code does not infer a type from `raw/run_meta.json`, `raw/params.json`,
+or a subject-specific metadata filename. Container kinds (`simulation_sweep`
+and `alignment_bundle`) may contain other explicitly marked resources.
+
+Launchers publish the marker before starting artifact work. Catalog inclusion
+still requires that kind's own descriptor/manifest, so an in-flight directory
+is not prematurely exposed. Historical roots are converted only by the
+one-shot `python -m launcher migrate-artifact-kinds --apply`; its legacy-shape
+inference is deliberately isolated from runtime discovery.
+
 ## Categories: grain plus source
 
 A category is defined by its **analytical grain** (the unit of analysis) and its
@@ -317,6 +338,12 @@ run with invented deployment topology. The launcher writes
 A managed launcher reports the same id to the conversation backend; a direct
 launcher invocation still writes it, so Analyzer discovery never depends on a
 conversation or on a filesystem path exposed to the browser.
+
+The Rust predictor also writes `raw/prediction_provenance.json` with the selected
+GPU name and the concrete L4 model's `gpus_per_replica()`. The launcher copies
+that physical extent into `prediction.meta.json`; it never derives the value from
+TP/DP/EP fields and never manufactures simulation `run_meta.json` for a
+prediction.
 
 The public hierarchy is:
 

@@ -18,6 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from launcher.artifact_kind import ArtifactKind, write_artifact_kind
 from launcher.managed_job import ManagedJob
 from profiling import perf_api
 from profiling.artifacts import (
@@ -380,6 +381,7 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         )
         managed_job.report("running")
     try:
+        write_artifact_kind(output_dir, ArtifactKind.KERNEL_MEASUREMENT)
         result = perf_api.measure_kernel(
             args.table,
             specs[0],

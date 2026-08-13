@@ -259,6 +259,12 @@ python -m profiling measure       <table> --backend <b> --spec '{...}' [--output
 `run` enables JIT for the call (or uses `force=True`), so it is the one CLI verb
 that can launch real GPU work; `query`/`count-missing` are read-only.
 
+Artifact-producing `run --output-dir` and `measure --output-dir` publish
+`artifact.meta.json` as `kernel_profile` and `kernel_measurement`, respectively,
+before GPU execution. Analyzer discovery requires that explicit kind in addition
+to the resource metadata/legacy payload; it never guesses a profiling resource
+from `curve.json`, `summary.json`, or managed-job metadata.
+
 `single_gemm` uses a GEMM-local extension of the shared token axis: measured
 points `m=1,2,4,8,16` precede the common `m=32..65536` grid. Dense decode must
 therefore use direct/interior small-batch samples rather than extrapolating the

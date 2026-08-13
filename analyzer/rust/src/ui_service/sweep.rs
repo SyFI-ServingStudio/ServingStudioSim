@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::artifact_kind::{read_artifact_kind, ArtifactKind};
 use super::discovery::{
     discover_runs, ignored_directory_name, regular_file, timestamp, ConfiguredRoot, DiscoveredRun,
 };
@@ -315,8 +316,19 @@ fn discover_sweeps(roots: &[ConfiguredRoot]) -> Result<Vec<DiscoveredSweep>> {
         let root_path = configured_root_path(root);
         let mut pending = vec![root_path.to_path_buf()];
         while let Some(directory) = pending.pop() {
+            let artifact_kind = match read_artifact_kind(&directory) {
+                Ok(artifact_kind) => artifact_kind,
+                Err(error) => {
+                    eprintln!(
+                        "warning: ignore invalid artifact marker under {}: {error:#}",
+                        directory.display()
+                    );
+                    continue;
+                }
+            };
             let manifest_path = directory.join(MANIFEST_NAME);
-            if regular_file(&manifest_path) {
+            if artifact_kind == Some(ArtifactKind::SimulationSweep) && regular_file(&manifest_path)
+            {
                 let manifest: SweepManifest =
                     serde_json::from_slice(&fs::read(&manifest_path).with_context(|| {
                         format!("read sweep manifest {}", manifest_path.display())
@@ -356,7 +368,7 @@ fn discover_sweeps(roots: &[ConfiguredRoot]) -> Result<Vec<DiscoveredSweep>> {
                 });
             }
 
-            if regular_file(&directory.join("raw/params.json")) {
+            if artifact_kind.is_some_and(|kind| !kind.can_contain_resources()) {
                 continue;
             }
             let mut children = fs::read_dir(&directory)

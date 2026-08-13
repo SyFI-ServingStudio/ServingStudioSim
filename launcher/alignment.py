@@ -27,6 +27,7 @@ from .alignment_config import (
     load_profile_config,
     load_timing_predict_config,
 )
+from .artifact_kind import ArtifactKind, write_artifact_kind
 from .schema.loader import PresetError, _load_preset
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -426,7 +427,7 @@ def _launch_alignment_analysis(log_dir: Path, *, build_type: str, subjects: list
 
 
 def _run_sim(args: argparse.Namespace) -> int:
-    _load_simulation_preset(args.config)
+    preset = _load_simulation_preset(args.config)
     overrides: list[str] = []
     if args.gpu_time_multiplier_from is not None:
         multiplier = _read_recommended_multiplier(args.gpu_time_multiplier_from)
@@ -436,6 +437,15 @@ def _run_sim(args: argparse.Namespace) -> int:
             f"from kernel-align {args.gpu_time_multiplier_from}"
         )
     print(f"[alignment] simulation: {args.config}")
+    if not args.dry_run:
+        io_config = preset.get("io")
+        log_dir = io_config.get("log_dir") if isinstance(io_config, dict) else None
+        if not isinstance(log_dir, str) or not log_dir:
+            raise ValueError("alignment simulation preset requires io.log_dir")
+        simulation_log_dir = Path(log_dir)
+        if not simulation_log_dir.is_absolute():
+            simulation_log_dir = REPO_ROOT / simulation_log_dir
+        write_artifact_kind(simulation_log_dir.parent, ArtifactKind.ALIGNMENT_BUNDLE)
     return _launch_simulation(
         args.config,
         dry_run=args.dry_run,
@@ -451,6 +461,7 @@ def _run_profile(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(f"[alignment] profile validated: {args.config} (log_dir={config.log_dir})")
         return 0
+    write_artifact_kind(Path(config.log_dir).parent, ArtifactKind.ALIGNMENT_BUNDLE)
     _snapshot_config(args.config, Path(config.log_dir), "profile")
     print(f"[alignment] {'resuming' if args.resume else 'profiling'}: {args.config}")
     result = run_profile(config, resume=args.resume)
@@ -469,6 +480,7 @@ def _run_profile(args: argparse.Namespace) -> int:
 
 def _run_timing_predict(args: argparse.Namespace) -> int:
     config: TimingPredictPhaseConfig = load_timing_predict_config(args.config)
+    write_artifact_kind(config.log_dir.parent, ArtifactKind.ALIGNMENT_BUNDLE)
     # Read the sim *preset* (not a completed run): timing-predict is kernel-only,
     # so it needs the gpu / arch / backends but never a finished simulation. This
     # lets it run before the sim, so kernel-align can derive the multiplier the
@@ -500,6 +512,7 @@ def _run_timing_predict(args: argparse.Namespace) -> int:
 
 def _run_analyze(args: argparse.Namespace) -> int:
     config = load_analyze_config(args.config)
+    write_artifact_kind(config.log_dir.parent, ArtifactKind.ALIGNMENT_BUNDLE)
     manifest = _write_analysis_manifest(config)
     _snapshot_config(args.config, config.log_dir, "analyze")
     print(f"[alignment] analyzer manifest: {manifest}")

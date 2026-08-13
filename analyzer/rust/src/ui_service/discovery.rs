@@ -10,6 +10,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::artifact_kind::{read_artifact_kind, ArtifactKind};
+
 use super::RunNotFound;
 
 #[derive(Clone, Debug)]
@@ -169,7 +171,20 @@ pub(super) fn discover_runs(roots: &[ConfiguredRoot]) -> Result<Vec<DiscoveredRu
 fn discover_runs_under_root(root: &ConfiguredRoot, runs: &mut Vec<DiscoveredRun>) -> Result<()> {
     let mut pending = vec![root.path.clone()];
     while let Some(directory) = pending.pop() {
-        if is_run_directory(&directory) {
+        let artifact_kind = match read_artifact_kind(&directory) {
+            Ok(artifact_kind) => artifact_kind,
+            Err(error) => {
+                eprintln!(
+                    "[analyze] skipping invalid artifact marker under {}: {error:#}",
+                    directory.display()
+                );
+                continue;
+            }
+        };
+        if artifact_kind == Some(ArtifactKind::SimulationRun) {
+            if !regular_file(&directory.join("raw/params.json")) {
+                continue;
+            }
             let relative = directory
                 .strip_prefix(&root.path)
                 .expect("discovery only queues paths below its configured root");
@@ -182,6 +197,9 @@ fn discover_runs_under_root(root: &ConfiguredRoot, runs: &mut Vec<DiscoveredRun>
                 path: directory,
             });
             // Run-owned raw and generated trees are not nested experiment roots.
+            continue;
+        }
+        if artifact_kind.is_some_and(|kind| !kind.can_contain_resources()) {
             continue;
         }
 
@@ -215,12 +233,6 @@ pub(super) fn resolve_run(roots: &[ConfiguredRoot], run_id: &str) -> Result<Disc
         .into_iter()
         .find(|run| run.run_id == run_id)
         .ok_or_else(|| RunNotFound.into())
-}
-
-fn is_run_directory(directory: &Path) -> bool {
-    fs::symlink_metadata(directory.join("raw/params.json"))
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false)
 }
 
 fn run_lifecycle(run: &Path) -> Lifecycle {

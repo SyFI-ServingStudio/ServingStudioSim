@@ -430,6 +430,11 @@ def main(argv: list[str] | None = None) -> int:
             prog="python -m launcher kernel-profile",
         )
 
+    if argv and argv[0] == "migrate-artifact-kinds":
+        from .migrate_artifact_kinds import main as migrate_artifact_kinds
+
+        return migrate_artifact_kinds(argv[1:])
+
     # `list-params` subcommand short-circuits before any preset handling.
     if argv and argv[0] == "list-params":
         human = "--human" in argv[1:]

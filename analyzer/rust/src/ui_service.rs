@@ -6,6 +6,7 @@
 
 mod alignment;
 mod artifact;
+mod artifact_kind;
 mod batch;
 mod catalog;
 mod concurrency;

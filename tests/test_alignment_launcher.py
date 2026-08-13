@@ -275,6 +275,18 @@ def test_alignment_sim_runs_only_existing_simulation(tmp_path, monkeypatch):
     assert alignment_launcher.main(["sim", str(paths["simulation"])]) == 0
     assert calls[0][0] == paths["simulation"]
     assert calls[0][1]["overrides"] == []
+    assert json.loads((tmp_path / "artifact.meta.json").read_text()) == {
+        "schema_version": 1,
+        "artifact_kind": "alignment_bundle",
+    }
+
+
+def test_alignment_sim_dry_run_does_not_publish_bundle_marker(tmp_path, monkeypatch):
+    paths = _phase_configs(tmp_path)
+    monkeypatch.setattr(alignment_launcher, "_launch_simulation", lambda *args, **kwargs: 0)
+
+    assert alignment_launcher.main(["sim", str(paths["simulation"]), "--dry-run"]) == 0
+    assert not (tmp_path / "artifact.meta.json").exists()
 
 
 def test_alignment_sim_auto_injects_kernel_align_multiplier(tmp_path, monkeypatch):
@@ -755,6 +767,17 @@ def test_timing_predict_publishes_stable_analyzer_resource_metadata(tmp_path):
         "cases_file": str(cases_path),
     }
     config_path.write_text(json.dumps(config))
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "prediction_provenance.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "gpu_name": "NVIDIA H200",
+                "gpu_count": 4,
+            }
+        )
+    )
 
     prediction_id = timing_predict_launcher._prediction_id(tmp_path)
     timing_predict_launcher._write_prediction_metadata(
@@ -772,7 +795,7 @@ def test_timing_predict_publishes_stable_analyzer_resource_metadata(tmp_path):
         "selector": "iter",
         "arch_type": "llama3_dense",
         "gpu": "NVIDIA H200",
-        "gpu_count": 1,
+        "gpu_count": 4,
         "config_file": config_path.name,
         "cases_file": "prediction.cases.json",
         "case_count": 0,

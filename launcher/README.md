@@ -506,6 +506,7 @@ python -m launcher alignment sim <simulation.yaml|json> [simulation options]
 python -m launcher alignment profile <profile.yaml|json> [--dry-run]
 python -m launcher alignment timing-predict <timing_predict.yaml|json> [--build-type ...]
 python -m launcher alignment analyze <analyze.yaml|json> [--build-type ...]
+python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
 ```
 
 - Simulation presets, timing-predict configs, and all alignment stage inputs
@@ -525,7 +526,19 @@ python -m launcher alignment analyze <analyze.yaml|json> [--build-type ...]
   clock, or discrete-event simulation; its config is not a deployment preset.
   The launcher snapshots a private `raw/params.json` model/GPU projection so the
   necessary-work labeler can run; Analyzer does not expose that projection as
-  prediction topology.
+  prediction topology. Rust separately publishes
+  `raw/prediction_provenance.json` from the concrete L4 model, and the launcher
+  uses its authoritative `gpus_per_replica()` value in `prediction.meta.json`;
+  timing-predict does not create simulation `run_meta.json`.
+- Every first-class output root gets `artifact.meta.json` with one explicit kind:
+  `simulation_run`, `simulation_sweep`, `timing_prediction`, `alignment_bundle`,
+  `kernel_profile`, or `kernel_measurement`. Analyzer uses this marker as its only
+  artifact-type discriminator; it never decides simulation vs. timing prediction
+  from `raw/run_meta.json` or another incidental file.
+- `migrate-artifact-kinds` is the one-shot legacy conversion surface. `--apply`
+  scans registry roots plus managed-workspace descriptors, rejects the whole batch
+  on any ambiguous/mismatched artifact, then atomically publishes missing markers.
+  `--check` must report `missing_markers=0` before strict discovery is deployed.
 - `kernel-profile` is the operator-facing L1 profiling entry. It dispatches to
   `profiling.cli`, which remains the owner of registry, DB, GPU execution, and
   artifact semantics. `python -m profiling ...` is a compatible developer entry.

@@ -74,6 +74,8 @@ publishes locked optimality as `variants.batch_locked` for interactive switching
 **Required from below** — `analyze run` consumes a run directory written by the
 sim/L7, containing:
 
+- `artifact.meta.json` — explicit first-class root identity. UI discovery accepts
+  `simulation_run` here and does not infer the resource type from any file below.
 - `raw/request_slo.parquet` and `raw/request_state.parquet` — subject inputs.
 - `raw/cost_log/worker_<pool_tag>_<worker_id>.parquet` plus matching
   `raw/cost_manifest/worker_<pool_tag>_<worker_id>.json` — trace inputs.
@@ -82,8 +84,10 @@ sim/L7, containing:
   Alignment iteration analysis needs no completed simulation: it derives the
   GPU-cycle multiplier from measured quantities alone (`Σ measured_gpu_cycle_ms /
   Σ measured_ms`) and applies it to the timing-predict totals itself.
-- `raw/run_meta.json` — sim-written sidecar (`num_gpus`, `gpu_name`); the
-  throughput subject reads it to normalize per-GPU. Absent → treated as 1 GPU.
+- `raw/run_meta.json` — simulation-only sidecar (`num_gpus`, `gpu_name`); the
+  throughput subject reads it to normalize per-GPU. Its presence or absence never
+  selects the artifact kind. Timing predictions instead carry their physical L4
+  extent in `prediction.meta.json.gpu_count` and do not create this sidecar.
 
 The UI model resource preserves the raw config and enriches it with optional
 `model.work` parameter counts (`total`, model-card-style `active`, and

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::artifact::read_json;
+use super::artifact_kind::{read_artifact_kind, ArtifactKind};
 use super::discovery::{ignored_directory_name, regular_file, timestamp, ConfiguredRoot};
 use super::worker_detail::{prediction_case_summary, CostLogSource, OperationIndexCache};
 use super::{PredictionNotFound, PROTOCOL_VERSION};
@@ -135,7 +136,20 @@ pub(super) fn discover_predictions(roots: &[ConfiguredRoot]) -> Result<Vec<Disco
     for root in roots {
         let mut pending = vec![root.path().to_path_buf()];
         while let Some(directory) = pending.pop() {
-            if regular_file(&directory.join(METADATA_FILE)) {
+            let artifact_kind = match read_artifact_kind(&directory) {
+                Ok(artifact_kind) => artifact_kind,
+                Err(error) => {
+                    eprintln!(
+                        "[analyze] skipping invalid artifact marker under {}: {error:#}",
+                        directory.display()
+                    );
+                    continue;
+                }
+            };
+            if artifact_kind == Some(ArtifactKind::TimingPrediction) {
+                if !regular_file(&directory.join(METADATA_FILE)) {
+                    continue;
+                }
                 // A malformed metadata file (e.g. a stray pytest fixture) must
                 // never abort the whole predictions catalog. Skip it with a warning
                 // so one bad directory cannot hide every other prediction in every root.
@@ -173,6 +187,9 @@ pub(super) fn discover_predictions(roots: &[ConfiguredRoot]) -> Result<Vec<Disco
                     path: directory,
                     metadata,
                 });
+                continue;
+            }
+            if artifact_kind.is_some_and(|kind| !kind.can_contain_resources()) {
                 continue;
             }
             let mut children = fs::read_dir(&directory)
@@ -217,7 +234,9 @@ pub(super) fn prediction_at(
     // Compare them in the same form or a root reached through a symlink never
     // matches the absolute path its own artifacts name.
     let directory = directory.canonicalize().ok()?;
-    if !regular_file(&directory.join(METADATA_FILE)) {
+    if read_artifact_kind(&directory).ok().flatten() != Some(ArtifactKind::TimingPrediction)
+        || !regular_file(&directory.join(METADATA_FILE))
+    {
         return None;
     }
     let (root, relative) = roots.iter().find_map(|root| {
