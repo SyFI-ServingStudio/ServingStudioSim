@@ -567,7 +567,7 @@ The simulation's `workload.trace_files` should contain exactly the profiling
 config's `workload.frontend.path`. The check happens when `timing-predict` pairs
 the artifacts; a mismatch prints `[warn] alignment trace mismatch` but is
 non-fatal. The profiling workload selects a typed TraceLab
-frontend (`frontend.type: session` or `vibesim`) and supplies the current
+frontend (`frontend.type: session` or `independent`) and supplies the current
 synthetic-text inputs directly as `text_file` and `tokenizer`. A request-builder
 tag should be introduced only when another construction path has real runtime
 dispatch; unrelated trace schemas are not normalized into one sparse row.

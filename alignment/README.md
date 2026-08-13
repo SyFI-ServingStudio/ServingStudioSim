@@ -92,27 +92,35 @@ workload:
   max_concurrency: 64
 ```
 
-For session traces, the default `frontend.context_policy: trace_reported`
-replays each row's reported prefix/new-input split. To retain the complete prior
-prompt plus actual model output and grow context toward each row's total prompt
-target, select the token-ID-only monotonic policy explicitly:
+A session frontend selects a canonical `session-execution-v2` trace, whose
+prefix/new-input split per row is already materialized:
 
 ```yaml
 workload:
   frontend:
     type: session
-    path: ../../trace/sessions.csv
-    context_policy: monotonic
+    path: ../../trace/execution.csv
   backend:
     type: vllm_tokens
 ```
 
-`monotonic` works with both configured backends. With `openai`, TraceLab requests
-vLLM's `return_token_ids` extension; with `vllm_tokens`, token output is native
-and server-side detokenization is disabled. In both cases, continuation requires
-complete server-returned token IDs and never uses text re-tokenization fallback.
-Small trace reductions retain the full context. A fresh context is constructed
-only for a reduction of at least 64,000 tokens and at least 50%.
+There is no context-policy setting. Which split the file carries — the source's
+own reported one (`trace-reported`) or the longest prefix the conversation can
+really supply (`monotonic`) — is chosen once when the trace is generated, and is
+recorded in the `.manifest.json` beside it. Read that manifest before quoting a
+cache number. To ask the other question, generate the other trace:
+
+```bash
+cargo run --release --manifest-path replay/Cargo.toml --bin tracegen -- \
+  --source raw_sessions.csv --policy monotonic --out trace/execution.csv
+```
+
+Both backends carry the model's real output token IDs forward. With `openai`
+TraceLab requests vLLM's `return_token_ids` extension; with `vllm_tokens` token
+output is native and server-side detokenization is disabled. A server that
+supplies neither leaves continuation to re-encoded output text, which is not
+guaranteed to reproduce the ids the server cached — prefer `vllm_tokens` when a
+prefix-cache number matters.
 
 For MoE alignment, profiling may use three explicit passes with identical model,
 topology, backend, and workload settings:

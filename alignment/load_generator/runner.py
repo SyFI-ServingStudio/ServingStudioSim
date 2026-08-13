@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import LoadGeneratorConfig, SessionFrontendConfig
+from .config import LoadGeneratorConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TRACELAB_ROOT = Path(__file__).resolve().parent / "tracelab"
@@ -113,13 +113,6 @@ def run_replay(
     for flag, value in optional_args:
         if value is not None:
             argv.extend([flag, str(value)])
-    if isinstance(config.frontend, SessionFrontendConfig):
-        argv.extend(
-            [
-                "--session-context-policy",
-                config.frontend.context_policy.replace("_", "-"),
-            ]
-        )
     if config.context_limit_skip_enabled:
         argv.append("--skip-when-reaching-limit")
     argv.extend(config.extra_args)
@@ -128,11 +121,6 @@ def run_replay(
     return {
         "source_trace": str(prepared.trace_path.resolve()),
         "frontend_type": config.frontend.type,
-        "session_context_policy": (
-            config.frontend.context_policy
-            if isinstance(config.frontend, SessionFrontendConfig)
-            else None
-        ),
         "backend_type": config.backend.type,
         "log_path": str(prepared.log_path),
         "summary_path": str(prepared.summary_path),

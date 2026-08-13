@@ -880,7 +880,12 @@ def test_tracelab_invocation_selects_vllm_tokens_backend(tmp_path, monkeypatch):
     assert result["backend_type"] == "vllm_tokens"
 
 
-def test_tracelab_invocation_selects_monotonic_session_context(tmp_path, monkeypatch):
+def test_tracelab_invocation_passes_no_context_policy(tmp_path, monkeypatch):
+    """A session run selects a materialized trace, not a rule for materializing one.
+
+    The replay binary has no context-policy flag: the split was resolved by
+    `tracegen` and is recorded in the manifest beside the trace.
+    """
     from alignment.load_generator.config import (
         LoadGeneratorConfig,
         SessionFrontendConfig,
@@ -888,9 +893,7 @@ def test_tracelab_invocation_selects_monotonic_session_context(tmp_path, monkeyp
     )
 
     config = LoadGeneratorConfig(
-        frontend=SessionFrontendConfig(
-            path="trace/session.csv", context_policy="monotonic"
-        ),
+        frontend=SessionFrontendConfig(path="trace/execution.csv"),
         text_file="corpus.txt",
         tokenizer="tokenizer.json",
         backend=VllmTokensBackendConfig(),
@@ -912,8 +915,9 @@ def test_tracelab_invocation_selects_monotonic_session_context(tmp_path, monkeyp
     )
 
     argv = commands[0][0]
-    assert argv[argv.index("--session-context-policy") + 1] == "monotonic"
-    assert result["session_context_policy"] == "monotonic"
+    assert argv[argv.index("--trace-format") + 1] == "session"
+    assert "--session-context-policy" not in argv
+    assert "session_context_policy" not in result
 
 
 @pytest.mark.parametrize(
@@ -969,7 +973,7 @@ def test_tracelab_context_limit_skip_requires_model_limit():
         )
 
 
-def test_profile_config_allows_monotonic_session_context_with_openai_backend():
+def test_profile_config_accepts_a_session_frontend_with_openai_backend():
     from alignment.load_generator.config import (
         LoadGeneratorConfig,
         OpenAIBackendConfig,
@@ -978,31 +982,28 @@ def test_profile_config_allows_monotonic_session_context_with_openai_backend():
 
     config = LoadGeneratorConfig.from_mapping(
         {
-            "frontend": {
-                "type": "session",
-                "path": "trace/session.csv",
-                "context_policy": "monotonic",
-            },
+            "frontend": {"type": "session", "path": "trace/execution.csv"},
             "text_file": "corpus.txt",
             "tokenizer": "tokenizer.json",
         }
     )
 
     assert isinstance(config.frontend, SessionFrontendConfig)
-    assert config.frontend.context_policy == "monotonic"
+    assert config.frontend.path == "trace/execution.csv"
     assert isinstance(config.backend, OpenAIBackendConfig)
 
 
-def test_profile_config_rejects_unknown_session_context_policy():
+def test_profile_config_rejects_a_stale_context_policy_key():
+    """An older config must fail loudly rather than have the key ignored."""
     from alignment.load_generator.config import LoadGeneratorConfig
 
-    with pytest.raises(ValueError, match="unsupported frontend.context_policy"):
+    with pytest.raises(ValueError, match="context_policy"):
         LoadGeneratorConfig.from_mapping(
             {
                 "frontend": {
                     "type": "session",
-                    "path": "trace/session.csv",
-                    "context_policy": "guess",
+                    "path": "trace/execution.csv",
+                    "context_policy": "monotonic",
                 },
                 "text_file": "corpus.txt",
                 "tokenizer": "tokenizer.json",

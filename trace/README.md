@@ -27,12 +27,16 @@ request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,
 ```
 
 `trace/tracelab_preserving.csv` is the canonical one (4,281 sessions / 357,161
-rounds, materialized from the public syfi dataset with prefixes preserved);
-`trace/tracelab_reported.csv` is its counterpart under the reported-split policy.
+rounds, materialized from the public syfi dataset under the `monotonic` context
+policy — the file name predates that policy's rename from `prefix-preserving`);
+`trace/tracelab_reported.csv` is its counterpart under `trace-reported`.
 
 Both are ~23 MB deterministic TraceLab outputs, so `trace/tracelab_*.csv` is
-ignored — see `alignment/load_generator/tracelab/artifacts/trace_facts/csv_export/`
-to regenerate rather than expecting them in a fresh clone. The `.manifest.json`
-beside each one **is** tracked: it pins the source SHA-256 and the totals
-(sessions, rounds, prompt/prefix/output tokens, planned prefix hit rate) a run
-needs to confirm it is replaying the trace it thinks it is.
+ignored rather than expected in a fresh clone. Regenerating takes two steps:
+export the raw session rounds with
+`alignment/load_generator/tracelab/artifacts/trace_facts/csv_export/convert.py`,
+then materialize them with `tracegen --policy {trace-reported,monotonic}`. The
+`.manifest.json` beside each one **is** tracked: it pins the source SHA-256, the
+policy that was applied, and the totals (sessions, rounds, prompt/prefix/output
+tokens, planned prefix hit rate) a run needs to confirm it is replaying the trace
+it thinks it is.
