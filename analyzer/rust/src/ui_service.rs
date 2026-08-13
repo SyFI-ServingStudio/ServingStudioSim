@@ -87,8 +87,8 @@ use optimality::{
     read_optimality_report,
 };
 use prediction::{
-    build_prediction_catalog, prediction_cases, prediction_descriptor, prediction_worker_gpus,
-    resolve_prediction, DiscoveredPrediction,
+    build_prediction_catalog, prediction_cases, prediction_descriptor, resolve_prediction,
+    DiscoveredPrediction,
 };
 use request_state::{read_request_state_payload, read_request_state_report};
 use slo::{read_slo_general_payload, read_slo_general_report};
@@ -842,7 +842,7 @@ async fn get_prediction_optimality_kernel_ladder(
         prediction.prediction_id(),
         case_id,
         prediction.gpu_name(),
-        prediction_worker_gpus(&prediction),
+        prediction.gpu_count(),
         matches!(query.mode, Some(OptimalityMode::BatchLocked)),
     )
     .await
@@ -873,7 +873,7 @@ async fn get_prediction_optimality_waterfall(
         prediction.prediction_id(),
         case_id,
         prediction.gpu_name(),
-        prediction_worker_gpus(&prediction),
+        prediction.gpu_count(),
         matches!(query.mode, Some(OptimalityMode::BatchLocked)),
     )
     .await

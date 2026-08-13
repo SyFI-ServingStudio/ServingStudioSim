@@ -387,34 +387,6 @@ fn prediction_updated_at(path: &Path) -> SystemTime {
     .unwrap_or(UNIX_EPOCH)
 }
 
-
-/// Effective parallelism of the real CostTree's one worker, for the per-kernel
-/// necessary-work normalization. A prediction's meta reports the replica count (1),
-/// not the TP/EP split the per-rank tree actually models (TP4/EP4 -> 4). Read the
-/// arch's `attn_tp_size`/`ep_size` from raw/params so per-kernel necessary lands
-/// on the same per-rank GPU·seconds footing as the hardware-limit rung.
-pub(super) fn prediction_worker_gpus(prediction: &DiscoveredPrediction) -> usize {
-    let params = serde_json::from_str(
-        &std::fs::read_to_string(prediction.path.join("raw/params.json")).unwrap_or_default(),
-    )
-    .unwrap_or(serde_json::Value::Null);
-    let mut gpus = prediction.gpu_count();
-    if let Some(arch) = params
-        .get("pools")
-        .and_then(|pools| pools.as_object())
-        .and_then(|pools| pools.values().next())
-        .and_then(|pool| pool.get("groups"))
-        .and_then(|groups| groups.as_array())
-        .and_then(|groups| groups.first())
-        .and_then(|group| group.get("arch"))
-    {
-        let attn = arch.get("attn_tp_size").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
-        let ep = arch.get("ep_size").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
-        gpus = attn.max(ep) as usize;
-    }
-    gpus.max(1)
-}
-
 fn display_name(root: &Path, relative: &Path) -> String {
     let components = relative
         .components()
