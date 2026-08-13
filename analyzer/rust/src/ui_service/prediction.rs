@@ -375,6 +375,68 @@ fn validate_snapshot_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+
+/// Prediction-only normalization: the per-kernel ladder's rungs are anchored by
+/// the worker replica count (meta gpu_count, usually 1 -> per-rank GPU·s), but the
+/// labeler's per-kernel necessary work is whole-model-on-one-GPU. Scale every kernel
+/// necessary_work by `gpu_count / arch_gpus` so per-kernel necessary == hardware
+/// limit (TP4/EP4 -> 52.2 == 52.2) instead of reporting a bogus 4x under-account.
+/// Runs, whose rung anchor already matches their labeler scope, are untouched.
+/// Effective TP/EP parallelism of the per-rank CostTree a prediction models, from
+/// raw/params (e.g. attn_tp=4/ep=4 -> 4). Distinct from the meta replica count.
+pub(super) fn prediction_worker_gpus(path: &Path) -> usize {
+    let params = serde_json::from_str(
+        &std::fs::read_to_string(path.join("raw/params.json")).unwrap_or_default(),
+    )
+    .unwrap_or(serde_json::Value::Null);
+    let mut gpus = 1usize;
+    if let Some(arch) = params
+        .get("pools")
+        .and_then(|p| p.as_object())
+        .and_then(|pools| pools.values().next())
+        .and_then(|pool| pool.get("groups"))
+        .and_then(|groups| groups.as_array())
+        .and_then(|groups| groups.first())
+        .and_then(|group| group.get("arch"))
+    {
+        let attn = arch.get("attn_tp_size").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
+        let ep = arch.get("ep_size").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
+        gpus = (attn.max(ep) as usize).max(1);
+    }
+    gpus
+}
+
+
+pub(super) fn normalize_prediction_necessary(value: &mut Value, gpu_count: usize, arch_gpus: usize) {
+    let factor = if arch_gpus > 0 && gpu_count != arch_gpus {
+        gpu_count as f64 / arch_gpus as f64
+    } else {
+        1.0
+    };
+    if factor == 1.0 {
+        return;
+    }
+    let Some(kernels) = value.get_mut("kernels").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for kernel in kernels {
+        let Some(work) = kernel.get_mut("necessary_work").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for key in ["min_flops", "min_bytes", "redundant_gpu_s", "compute_gpu_s", "memory_gpu_s", "necessary_gpu_s", "wall_s"] {
+            if let Some(n) = work.get(key).and_then(Value::as_f64) {
+                if key.starts_with("min_") {
+                    continue;
+                }
+                work.insert(key.to_string(), json!(n * factor));
+            }
+        }
+        if let Some(Value::Number(roofline)) = work.get("necessary_gpu_s") {
+            let _ = roofline;
+        }
+    }
+}
+
 fn prediction_updated_at(path: &Path) -> SystemTime {
     [
         METADATA_FILE,
