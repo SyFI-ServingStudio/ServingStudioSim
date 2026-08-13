@@ -1,4 +1,4 @@
-"""Build and invoke TraceLab's typed trace frontend for a profiling run."""
+"""Build and invoke req-frontend's typed trace frontend for a profiling run."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ from pathlib import Path
 from .config import LoadGeneratorConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TRACELAB_ROOT = Path(__file__).resolve().parent / "tracelab"
-REPLAY_MANIFEST = TRACELAB_ROOT / "replay" / "Cargo.toml"
-SESSION_RUNNER = TRACELAB_ROOT / "replay" / "target" / "release" / "session_runner"
+REQ_FRONTEND_ROOT = Path(__file__).resolve().parent / "req-frontend"
+REPLAY_MANIFEST = REQ_FRONTEND_ROOT / "Cargo.toml"
+SESSION_RUNNER = REQ_FRONTEND_ROOT / "target" / "release" / "session_runner"
 
 
 @dataclass(frozen=True)
 class PreparedReplay:
-    """Resolved TraceLab invocation inputs prepared before vLLM starts."""
+    """Resolved req-frontend invocation inputs prepared before vLLM starts."""
 
     trace_path: Path
     text_file: Path
@@ -31,7 +31,7 @@ def _repo_path(value: str) -> Path:
 
 
 def build_session_runner() -> Path:
-    """Build TraceLab before starting vLLM so compilation is outside nsys."""
+    """Build req-frontend before starting vLLM so compilation is outside nsys."""
     subprocess.run(
         [
             "cargo",
@@ -55,7 +55,7 @@ def prepare_replay(config: LoadGeneratorConfig, log_dir: Path) -> PreparedReplay
         raise FileNotFoundError(f"profiling trace not found: {trace_path}")
     text_file = _repo_path(config.text_file)
     if not text_file.is_file():
-        raise FileNotFoundError(f"TraceLab text corpus not found: {text_file}")
+        raise FileNotFoundError(f"replay text corpus not found: {text_file}")
     return PreparedReplay(
         trace_path=trace_path,
         text_file=text_file,

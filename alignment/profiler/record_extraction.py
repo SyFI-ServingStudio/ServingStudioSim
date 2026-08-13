@@ -263,7 +263,7 @@ def extract_request_timings_jsonl(
                         f"{sorted(missing)}"
                     )
             # The vLLM OpenAI completions frontend wraps X-Request-Id before
-            # enqueueing it as `cmpl-<source-id>-0`. TraceLab sends one prompt
+            # enqueueing it as `cmpl-<source-id>-0`. req-frontend sends one prompt
             # per request, so index 0 is the only supported alignment shape.
             # `request_id` was the raw field name in the first instrumented run;
             # accept it so an in-flight capture remains extractable.
@@ -271,7 +271,7 @@ def extract_request_timings_jsonl(
             if not isinstance(engine_request_id, str) or not engine_request_id:
                 raise ValueError("alignment request timing engine_request_id must be non-empty")
             request_id = records.unwrap_request_id(engine_request_id)
-            # vLLM may issue frontend-owned prefix-cache probes before TraceLab
+            # vLLM may issue frontend-owned prefix-cache probes before req-frontend
             # starts the replay. The replay's successful request ids are the
             # authoritative experiment population; unrelated timing records are
             # intentionally excluded instead of relying on a fixed probe count.

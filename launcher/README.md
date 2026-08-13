@@ -542,7 +542,8 @@ It exposes four explicit stages with four independent configs:
 - `alignment sim` passes the simulation config through the ordinary
   build → validate → expand → cache → run pipeline.
 - `alignment profile` uses the profiling config to launch the instrumented vLLM
-  server, NSYS capture, and TraceLab frontend, ending at normalized `parsed.json`.
+  server, NSYS capture, and the req-frontend load generator, ending at
+  normalized `parsed.json`.
 - `alignment timing-predict` pairs those completed artifacts, generates exact
   predictor cases, and runs the offline predictor. Its arch, GPU, and complete
   per-role backend policy come from the simulation run's normalized
@@ -566,7 +567,7 @@ the analysis root.
 The simulation's `workload.trace_files` should contain exactly the profiling
 config's `workload.frontend.path`. The check happens when `timing-predict` pairs
 the artifacts; a mismatch prints `[warn] alignment trace mismatch` but is
-non-fatal. The profiling workload selects a typed TraceLab
+non-fatal. The profiling workload selects a typed req-frontend
 frontend (`frontend.type: session` or `independent`) and supplies the current
 synthetic-text inputs directly as `text_file` and `tokenizer`. A request-builder
 tag should be introduced only when another construction path has real runtime

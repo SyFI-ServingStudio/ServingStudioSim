@@ -24,7 +24,7 @@ are resolved relative to the declaring config file.
 ```text
 alignment/
   runner.py                 measured profile controller
-  load_generator/           thin TraceLab invocation adapter
+  load_generator/           thin req-frontend invocation adapter
   profiler/                 vLLM lifecycle and NSYS capture
   nsys/                     NSYS SQLite normalization and sequence catalog
   timing_predict_input/     measured iteration → generic predictor inputs
@@ -61,7 +61,7 @@ pools: ...
 
 ### `profile.yaml`
 
-This file owns only the real vLLM/TraceLab/NSYS run:
+This file owns only the real vLLM/req-frontend/NSYS run:
 
 ```yaml
 schema_version: 1
@@ -116,7 +116,7 @@ cargo run --release --manifest-path replay/Cargo.toml --bin tracegen -- \
 ```
 
 Both backends carry the model's real output token IDs forward. With `openai`
-TraceLab requests vLLM's `return_token_ids` extension; with `vllm_tokens` token
+req-frontend requests vLLM's `return_token_ids` extension; with `vllm_tokens` token
 output is native and server-side detokenization is disabled. A server that
 supplies neither leaves continuation to re-encoded output text, which is not
 guaranteed to reproduce the ids the server cached — prefer `vllm_tokens` when a
@@ -147,7 +147,7 @@ The NSYS pass writes the replay log, server log, NSYS report/SQLite,
 structured scheduler timeline in `vllm/<name>_metrics.jsonl`, engine-core
 per-request TTFT/TPOT in `vllm/<name>_request_timings.jsonl`, and
 `profile_result.json` beneath `profile/`. `profile_result.replay_result`
-identifies the TraceLab per-request JSONL used later for client-observed E2E
+identifies the req-frontend per-request JSONL used later for client-observed E2E
 comparison, while `profile_result.request_timings_jsonl` identifies the vLLM
 engine-core timing records. The expert-popularity pass writes its replay/server
 logs, raw expert-load JSONL, aggregated `expert_popularity.json`, and its own
@@ -319,7 +319,7 @@ losslessly expands all captured phases, validates names/categories against
 `parsed.json`, and validates mapped slots against the timing-predict cost
 manifest.
 
-E2E analysis writes two distinct TTFT overlays: TraceLab client-observed TTFT vs
+E2E analysis writes two distinct TTFT overlays: req-frontend client-observed TTFT vs
 simulator TTFT, and vLLM engine-core queued-to-first-output TTFT vs the same
 simulator TTFT. For replay schema v4 and later, client TTFT uses the first token-ID event
 (with an explicit first-text fallback population), while client TPOT uses the
@@ -332,7 +332,7 @@ latency ratio is computed. Request ids only audit whether either side lost
 requests, which matters when the two schedulers execute simultaneous arrivals in
 different orders.
 Throughput reports both client completion time and server GPU time. The client
-rate uses TraceLab's earliest post/submit through latest completion. The server
+rate uses req-frontend's earliest post/submit through latest completion. The server
 GPU rate uses parsed NSYS's first observed kernel start through last observed
 kernel end, so it includes inter-iteration gaps and the terminal iteration that
 first-kernel-to-next-first-kernel cycle sums omit. The per-bin plot remains a

@@ -1,4 +1,4 @@
-"""Alignment workload generation; TraceLab is the authoritative implementation."""
+"""Alignment workload generation; req-frontend is the authoritative implementation."""
 
 from .config import (
     BackendConfig,

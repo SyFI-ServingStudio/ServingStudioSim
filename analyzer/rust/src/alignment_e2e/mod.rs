@@ -4,7 +4,7 @@
 //! independent raw distributions. Request ids only audit whether either run lost
 //! requests: execution order can differ even when both runs consume the same
 //! trace, so per-id latency subtraction would compare scheduler positions that
-//! are not equivalent. Completion throughput is intentionally named: TraceLab
+//! are not equivalent. Completion throughput is intentionally named: req-frontend
 //! does not log every token timestamp, so both sides assign a request's output
 //! tokens to its completion bin rather than pretending to have an instantaneous
 //! token-production trace. The report also carries a server GPU-span aggregate:
@@ -656,15 +656,15 @@ fn finite(value: f64) -> Option<f64> {
 
 fn definitions() -> Value {
     json!({
-        "request_id_audit": "TraceLab source.data.id and simulator request_slo.request_id are intersected only to detect missing requests; ids do not pair latency samples",
+        "request_id_audit": "req-frontend source.data.id and simulator request_slo.request_id are intersected only to detect missing requests; ids do not pair latency samples",
         "latency_comparison": "measured and simulated raw latency distributions are summarized independently and overlaid as two CDF curves; no per-request subtraction or division",
-        "client_ttft": "TraceLab client-observed first token-ID event distribution vs simulator ttft_ms; falls back to first non-empty text only when the server returns no token IDs, and includes frontend/network response-path overhead outside EngineCore",
+        "client_ttft": "req-frontend client-observed first token-ID event distribution vs simulator ttft_ms; falls back to first non-empty text only when the server returns no token IDs, and includes frontend/network response-path overhead outside EngineCore",
         "server_ttft": "vLLM EngineCore queued timestamp to first-token EngineCore output timestamp distribution vs the same simulator ttft_ms distribution; excludes client/frontend transport",
-        "tpot": "TraceLab first-to-last token-ID delivery span divided by tokens delivered after the first event, vs simulator tpot_mean_ms; schema-v1/v2 replay artifacts retain the legacy completion-amortized fallback for compatibility",
+        "tpot": "req-frontend first-to-last token-ID delivery span divided by tokens delivered after the first event, vs simulator tpot_mean_ms; schema-v1/v2 replay artifacts retain the legacy completion-amortized fallback for compatibility",
         "server_tpot": "vLLM EngineCore (last-token output timestamp - first-token output timestamp)/(num_output_tokens-1) distribution vs simulator tpot_mean_ms distribution; excludes HTTP/SSE/client completion overhead",
         "e2e": "measured total_duration_ms distribution vs simulator finish_decode_time_ms-arrival_time_ms distribution",
         "completion_throughput": "client-measured and simulated output tokens assigned to each request completion bin; not instantaneous token-production throughput",
-        "client_completion_throughput": "all measured output tokens divided by TraceLab's earliest post/submit to latest client completion span; includes response and client completion overhead",
+        "client_completion_throughput": "all measured output tokens divided by req-frontend's earliest post/submit to latest client completion span; includes response and client completion overhead",
         "server_gpu_span_throughput": "all measured output tokens divided by parsed NSYS first-kernel-start to last-kernel-end span; includes inter-iteration no-kernel gaps and the final iteration, but excludes queue time before the first GPU kernel and client completion overhead",
         "simulated_completion_throughput": "all simulated output tokens divided by earliest arrival to latest finish_decode_time span",
     })

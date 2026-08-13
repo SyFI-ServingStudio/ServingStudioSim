@@ -16,7 +16,7 @@ subcommands; this package's CLI is
 artifact inspection only. The
 heavy runtime deps (vLLM / torch / CUDA) never enter this package's interpreter:
 `profiler/vllm_server.py` shells out to the fork venv, mirroring how `profiling`
-never imports vLLM. TraceLab under `load_generator/` owns typed trace frontends
+never imports vLLM. req-frontend under `load_generator/` owns typed trace frontends
 and replay. Alignment-local code stops at artifact normalization; Rust computes
 statistics and the analyzer's Python half renders payload JSON.
 """

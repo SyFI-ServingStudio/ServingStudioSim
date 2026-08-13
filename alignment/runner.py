@@ -1,7 +1,7 @@
-"""Coordinate one measured alignment run across TraceLab, a serving engine, and Nsight.
+"""Coordinate one measured alignment run across req-frontend, a serving engine, and Nsight.
 
 The explicit `launcher alignment profile <profiling-config>` command calls this
-module. It prepares TraceLab, launches one instrumented-fork server under nsys,
+module. It prepares req-frontend, launches one instrumented-fork server under nsys,
 drives the workload, and exports the trace into the profiling config's
 `log_dir`. It does not generate timing-predict inputs or run comparison analysis.
 
@@ -46,7 +46,7 @@ _ENGINES = {
 
 
 def _successful_replay_request_ids(replay_jsonl: Path) -> set[str]:
-    """Return the exact TraceLab request ids submitted successfully to vLLM."""
+    """Return the exact req-frontend request ids submitted successfully to vLLM."""
     request_ids: set[str] = set()
     for line_number, line in enumerate(replay_jsonl.read_text().splitlines(), start=1):
         if not line.strip():

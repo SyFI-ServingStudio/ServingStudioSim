@@ -816,7 +816,7 @@ def test_alignment_analysis_calls_only_selected_subjects(tmp_path, monkeypatch):
     assert invocations[1][-1:] == ["alignment-e2e"]
 
 
-def test_tracelab_invocation_keeps_independent_as_a_typed_frontend(tmp_path, monkeypatch):
+def test_req_frontend_invocation_keeps_independent_as_a_typed_frontend(tmp_path, monkeypatch):
     from alignment.load_generator.config import IndependentFrontendConfig, LoadGeneratorConfig
 
     config = LoadGeneratorConfig(
@@ -845,7 +845,7 @@ def test_tracelab_invocation_keeps_independent_as_a_typed_frontend(tmp_path, mon
     assert argv[argv.index("--max-concurrency") + 1] == "64"
 
 
-def test_tracelab_invocation_selects_vllm_tokens_backend(tmp_path, monkeypatch):
+def test_req_frontend_invocation_selects_vllm_tokens_backend(tmp_path, monkeypatch):
     from alignment.load_generator.config import (
         IndependentFrontendConfig,
         LoadGeneratorConfig,
@@ -880,7 +880,7 @@ def test_tracelab_invocation_selects_vllm_tokens_backend(tmp_path, monkeypatch):
     assert result["backend_type"] == "vllm_tokens"
 
 
-def test_tracelab_invocation_passes_no_context_policy(tmp_path, monkeypatch):
+def test_req_frontend_invocation_passes_no_context_policy(tmp_path, monkeypatch):
     """A session run selects a materialized trace, not a rule for materializing one.
 
     The replay binary has no context-policy flag: the split was resolved by
@@ -924,7 +924,7 @@ def test_tracelab_invocation_passes_no_context_policy(tmp_path, monkeypatch):
     "config_field",
     ["skip_when_reaching_limit", "fail_on_context_overflow"],
 )
-def test_tracelab_context_limit_skip_uses_canonical_cli_flag(
+def test_req_frontend_context_limit_skip_uses_canonical_cli_flag(
     tmp_path, monkeypatch, config_field
 ):
     from alignment.load_generator.config import (
@@ -958,7 +958,7 @@ def test_tracelab_context_limit_skip_uses_canonical_cli_flag(
     assert "--fail-on-context-overflow" not in argv
 
 
-def test_tracelab_context_limit_skip_requires_model_limit():
+def test_req_frontend_context_limit_skip_requires_model_limit():
     from alignment.load_generator.config import (
         LoadGeneratorConfig,
         SessionFrontendConfig,

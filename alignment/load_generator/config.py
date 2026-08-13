@@ -1,4 +1,4 @@
-"""Typed TraceLab configuration embedded in a YAML/JSON profiling config.
+"""Typed req-frontend configuration embedded in a YAML/JSON profiling config.
 
 Trace frontends are a tagged union because session and independent-request
 traces already have distinct runtime behavior. Request construction currently
@@ -78,7 +78,7 @@ def _load_tagged_config(value: dict, registry: dict, field_name: str):
 
 @dataclass
 class LoadGeneratorConfig:
-    """TraceLab frontend, synthetic-text inputs, and replay policy."""
+    """Trace frontend, synthetic-text inputs, and replay policy."""
 
     frontend: FrontendConfig
     text_file: str

@@ -92,7 +92,7 @@ def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
         str(cfg.chunk_size),
         "--mem-fraction-static",
         str(cfg.gpu_memory_utilization),
-        # TraceLab's mandatory prefix-cache preflight reads
+        # req-frontend's mandatory prefix-cache preflight reads
         # usage.prompt_tokens_details.cached_tokens, which SGLang only fills in
         # behind this flag. vLLM's counterpart is --enable-prompt-tokens-details.
         "--enable-cache-report",

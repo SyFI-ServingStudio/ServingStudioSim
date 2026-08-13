@@ -12,7 +12,7 @@ The fork (`alignment/profiler/vllm`, branch `moesim-profile`) adds the
 and a versioned `VibeSimAlignmentIteration {json}` record containing the exact
 model input shape consumed by the typed predictor adapter. Per-request
 `VibeSimAlignmentRequestTiming {json}` records expose EngineCore TTFT and TPOT
-separately from TraceLab's client-observed latency accounting. Reading those
+separately from req-frontend's client-observed latency accounting. Reading those
 records back is engine-independent and lives in `record_extraction.py`; what
 stays here is only what is specific to launching vLLM.
 """
@@ -76,7 +76,7 @@ def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
         "--max-num-batched-tokens",
         str(cfg.chunk_size),
         "--enable-chunked-prefill",
-        # TraceLab's mandatory prefix-cache preflight reads
+        # req-frontend's mandatory prefix-cache preflight reads
         # usage.prompt_tokens_details.cached_tokens. Keep the paired server
         # observable by default instead of requiring every experiment preset
         # to repeat this transport-level flag.

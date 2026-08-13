@@ -142,5 +142,5 @@ class ProfileConfig:
     idle: IdleWaitConfig = field(default_factory=IdleWaitConfig)
     nsys: NsysConfig = field(default_factory=NsysConfig)
 
-    # --- workload: TraceLab consumes the same source trace as the simulator ---
+    # --- workload: req-frontend consumes the same source trace as the simulator ---
     workload: LoadGeneratorConfig = None  # type: ignore[assignment]

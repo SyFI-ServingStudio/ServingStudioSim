@@ -87,7 +87,7 @@ categories:
 | `concurrency` | system, pool, or worker request populations over lifecycle time | `request_slo` arrival/terminal events and optional stage-transition timelines |
 | `kv` | a KV pool over time | `kv_snapshot` + `run_meta` capacity |
 | `alignment-iteration` | one measured iteration joined to one predict case | normalized NSYS + predict `cost_log`/manifest + mapping |
-| `alignment-e2e` | one measured/simulated latency distribution | TraceLab replay JSONL + optional vLLM EngineCore request-timing JSONL + sim `request_slo` |
+| `alignment-e2e` | one measured/simulated latency distribution | req-frontend replay JSONL + optional vLLM EngineCore request-timing JSONL + sim `request_slo` |
 | `alignment-workload` | one scheduler iteration by recorded iteration id | full-run vLLM structured iteration metrics (NSYS window anchors the replay segment) + sim `cost_log` |
 
 For a symmetric tensor-parallel alignment, one measured iteration contains one
