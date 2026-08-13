@@ -21,6 +21,19 @@ class GQA:
     head_dim: int
     kv_dtype_bytes: float
     output_gate: bool = False  # Qwen3.5/3.6 "gated attention": q_proj also emits a gate
+    #: A recipe that runs the prefill (FA3) forward on the FP8 tensor cores (q and
+    #: kv both FP8) must label its necessary attention math at the FP8 peak too,
+    #: otherwise the necessary floor lands above the measured hardware limit and all
+    #: mechanical (quant/norm/…) overhead masquerades as zero excess. ``None`` keeps
+    #: the master dtype (decode QK stays BF16 in the FP8 recipe, so decode is not
+    #: covered by this pin). Builders that serve an FP8 prefill set this to fp8.
+    prefill_compute_dtype: str | None = None
+
+    def phase_compute_dtype(self, phase: str | None) -> str | None:
+        """Mechanism-fixed precision for one attention phase, if the recipe pins it."""
+        if phase == "prefill":
+            return self.prefill_compute_dtype
+        return None
 
     @property
     def attn_dim(self) -> int:

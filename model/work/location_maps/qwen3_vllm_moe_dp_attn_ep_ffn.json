@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "mapping_id": "qwen3-vllm-moe-dp-attn-ep-ffn-v1",
+  "arch_types": ["qwen3_vllm_moe_dp_attn_ep_ffn"],
+  "locations": [
+    {"location": "unified.embedding", "semantics": ["embedding"]},
+    {"location": "unified.attn_block.input_norm", "semantics": []},
+    {"location": "unified.attn_block.qkv_proj.input_quant", "semantics": []},
+    {"location": "unified.attn_block.qkv_proj.gemm", "semantics": ["qkv"]},
+    {"location": "unified.attn_block.attn.kv_cache_append", "semantics": ["kv_cache_append"]},
+    {"location": "unified.attn_block.attn.prefill", "semantics": ["attn.prefill"]},
+    {"location": "unified.attn_block.attn.decode", "semantics": ["attn.decode"]},
+    {"location": "unified.attn_block.o_proj.input_quant", "semantics": []},
+    {"location": "unified.attn_block.o_proj.gemm", "semantics": ["o"]},
+    {"location": "unified.attn_block.tp_allreduce_residual_norm", "semantics": []},
+    {"location": "unified.attn_block.tp_allreduce_fallback_norm", "semantics": []},
+    {"location": "unified.moe_router.router_gemm.input_quant", "semantics": []},
+    {"location": "unified.moe_router.router_gemm.gemm", "semantics": ["router"]},
+    {"location": "unified.moe_expert_compute.gate_up.input_quant", "semantics": []},
+    {"location": "unified.moe_expert_compute.gate_up.gemm", "semantics": ["expert_gate_up"]},
+    {"location": "unified.moe_expert_compute.activation", "semantics": []},
+    {"location": "unified.moe_expert_compute.down.input_quant", "semantics": []},
+    {"location": "unified.moe_expert_compute.down.gemm", "semantics": ["expert_down"]},
+    {"location": "unified.moe_finalize", "semantics": []},
+    {"location": "unified.moe_combine_allreduce_residual_norm", "semantics": []},
+    {"location": "unified.lm_head.gemm", "semantics": ["lm_head"]},
+    {"location": "unified.final_norm", "semantics": []},
+    {"location": "unified.lm_head.input_quant", "semantics": []}
+  ]
+}
