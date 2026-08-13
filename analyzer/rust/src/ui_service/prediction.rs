@@ -416,45 +416,23 @@ pub(super) fn normalize_prediction_necessary(value: &mut Value, gpu_count: usize
     if factor == 1.0 {
         return;
     }
-    if let Some(kernels) = value.get_mut("kernels").and_then(Value::as_array_mut) {
-        for kernel in kernels {
-            let Some(work) = kernel.get_mut("necessary_work").and_then(Value::as_object_mut) else {
-                continue;
-            };
-            for key in ["min_flops", "min_bytes", "redundant_gpu_s", "compute_gpu_s", "memory_gpu_s", "necessary_gpu_s", "wall_s"] {
+    let Some(kernels) = value.get_mut("kernels").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for kernel in kernels {
+        let Some(work) = kernel.get_mut("necessary_work").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for key in ["min_flops", "min_bytes", "redundant_gpu_s", "compute_gpu_s", "memory_gpu_s", "necessary_gpu_s", "wall_s"] {
+            if let Some(n) = work.get(key).and_then(Value::as_f64) {
                 if key.starts_with("min_") {
                     continue;
                 }
-                if let Some(n) = work.get(key).and_then(Value::as_f64) {
-                    work.insert(key.to_string(), json!(n * factor));
-                }
+                work.insert(key.to_string(), json!(n * factor));
             }
         }
-    }
-    // Iteration/level waterfall: the labeler's floor is WHOLE-model; scale it to the
-    // per-rank rung footing so R6<R5 surfaces the real excess instead of clamping to
-    // R5 (which reads as zero waste while R7 renders at the full iteration).
-    if let Some(level) = value.get_mut("level").and_then(Value::as_object_mut) {
-        if let Some(rungs) = level.get_mut("rungs").and_then(Value::as_object_mut) {
-            for key in ["segmented_necessary", "hardware_necessary"] {
-                if let Some(n) = rungs.get(key).and_then(Value::as_f64) {
-                    rungs.insert(key.to_string(), json!((n * factor).max(0.0)));
-                }
-            }
-        }
-        let r5 = level.get("rungs").and_then(|r| r.get("hardware_limit")).and_then(Value::as_f64).unwrap_or(0.0);
-        let seg = level.get("rungs").and_then(|r| r.get("segmented_necessary")).and_then(Value::as_f64).unwrap_or(0.0);
-        let fus = level.get("rungs").and_then(|r| r.get("hardware_necessary")).and_then(Value::as_f64).unwrap_or(0.0);
-        if let Some(buckets) = level.get_mut("buckets").and_then(Value::as_object_mut) {
-            if let Some(k) = buckets.get_mut("excess_over_necessary").and_then(Value::as_object_mut) {
-                k.insert("gpu_s".to_string(), json!((r5 - seg).max(0.0)));
-            }
-            if let Some(k) = buckets.get_mut("fusion").and_then(Value::as_object_mut) {
-                k.insert("gpu_s".to_string(), json!((seg - fus).max(0.0)));
-            }
-            if let Some(k) = buckets.get_mut("hardware_necessary").and_then(Value::as_object_mut) {
-                k.insert("gpu_s".to_string(), json!(fus.max(0.0)));
-            }
+        if let Some(Value::Number(roofline)) = work.get("necessary_gpu_s") {
+            let _ = roofline;
         }
     }
 }
