@@ -57,15 +57,11 @@ impl SessionInput {
     }
 }
 
-/// Decode behavior requested by an autoregressive request.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub enum DecodingStrategy {
-    #[default]
-    Standard,
-    Speculative {
-        accept_rate: f32,
-    },
-}
+/// Decode behaviour requested by an autoregressive request.
+///
+/// Defined in the shared trace crate: it is what the `accept_rate` column means,
+/// and the file says it rather than this simulator deciding it.
+pub use req_frontend::schema::media::DecodingStrategy;
 
 /// Mutable progress shared by autoregressive token-output families.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -1,21 +1,7 @@
-use serde::{Deserialize, Serialize};
+//! Physical media shapes.
+//!
+//! Defined in the shared trace crate, because a generator writing these columns
+//! and this simulator reading them must mean the same thing by them. Re-exported
+//! here so a family consumer still finds them beside the families that use them.
 
-/// Physical input/output shapes remain concrete so a family consumer never
-/// handles unrelated media variants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageExtent {
-    pub width: u32,
-    pub height: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VideoExtent {
-    pub width: u32,
-    pub height: u32,
-    pub frames: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AudioExtent {
-    pub samples: u64,
-}
+pub use req_frontend::schema::media::{AudioExtent, ImageExtent, VideoExtent};

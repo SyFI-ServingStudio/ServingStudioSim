@@ -9,7 +9,7 @@ use std::fmt::Display;
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 
 use super::arrival::{
@@ -23,315 +23,51 @@ use crate::common::{
     VideoGenerationDefinition, VideoTextGenerationDefinition,
 };
 
-const RELEASE_COLUMNS: &[&str] = &["id", "arrival_time"];
-const AUTOREGRESSIVE_COLUMNS: &[&str] = &["input_len", "output_len"];
-const GENERATED_MEDIA_COLUMNS: &[&str] = &["input_len", "denoise_steps"];
-const ENCODED_INPUT_COLUMNS: &[&str] = &["encoded_tokens"];
-const IMAGE_COLUMNS: &[&str] = &["media_width", "media_height"];
-const VIDEO_COLUMNS: &[&str] = &[
-    "media_width",
-    "media_height",
-    "media_duration_s",
-    "media_fps",
-];
-const AUDIO_COLUMNS: &[&str] = &["media_duration_s", "media_sample_rate_hz"];
-const INPUT_IMAGE_COLUMNS: &[&str] = &["input_media_width", "input_media_height"];
-const OMNI_COLUMNS: &[&str] = &["input_segments", "output_segments"];
-const FOREIGN_MULTI_ROUND: &str = "round_idx";
 const DEFAULT_PRIORITY: i32 = 0;
 
-/// One statically selected request schema per trace file family.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TraceKind {
-    TextGeneration,
-    ImageToText,
-    VideoToText,
-    AudioToText,
-    TextToImage,
-    TextToVideo,
-    TextToSpeech,
-    ImageToVideo,
-    OmniGeneration,
-}
-
-impl TraceKind {
-    pub const CHOICES: &'static [&'static str] = &[
-        "text_generation",
-        "image_to_text",
-        "video_to_text",
-        "audio_to_text",
-        "text_to_image",
-        "text_to_video",
-        "text_to_speech",
-        "image_to_video",
-        "omni_generation",
-    ];
-
-    pub fn parse(name: &str) -> Result<Self> {
-        Ok(match name {
-            "text_generation" => Self::TextGeneration,
-            "image_to_text" => Self::ImageToText,
-            "video_to_text" => Self::VideoToText,
-            "audio_to_text" => Self::AudioToText,
-            "text_to_image" => Self::TextToImage,
-            "text_to_video" => Self::TextToVideo,
-            "text_to_speech" => Self::TextToSpeech,
-            "image_to_video" => Self::ImageToVideo,
-            "omni_generation" => Self::OmniGeneration,
-            other => bail!(
-                "unknown trace_kind {other:?} (expected one of {:?})",
-                Self::CHOICES
-            ),
-        })
-    }
-
-    fn definition_columns(self) -> Vec<&'static str> {
-        let mut columns = match self {
-            Self::TextGeneration | Self::ImageToText | Self::VideoToText | Self::AudioToText => {
-                AUTOREGRESSIVE_COLUMNS.to_vec()
-            }
-            Self::TextToImage | Self::TextToVideo | Self::TextToSpeech => {
-                GENERATED_MEDIA_COLUMNS.to_vec()
-            }
-            Self::ImageToVideo => {
-                let mut columns = GENERATED_MEDIA_COLUMNS.to_vec();
-                columns.extend_from_slice(ENCODED_INPUT_COLUMNS);
-                columns.extend_from_slice(INPUT_IMAGE_COLUMNS);
-                columns
-            }
-            Self::OmniGeneration => OMNI_COLUMNS.to_vec(),
-        };
-        match self {
-            Self::TextGeneration | Self::OmniGeneration => {}
-            Self::ImageToText => {
-                columns.extend_from_slice(ENCODED_INPUT_COLUMNS);
-                columns.extend_from_slice(IMAGE_COLUMNS);
-            }
-            Self::VideoToText => {
-                columns.extend_from_slice(ENCODED_INPUT_COLUMNS);
-                columns.extend_from_slice(VIDEO_COLUMNS);
-            }
-            Self::AudioToText => {
-                columns.extend_from_slice(ENCODED_INPUT_COLUMNS);
-                columns.extend_from_slice(AUDIO_COLUMNS);
-            }
-            Self::TextToImage => columns.extend_from_slice(IMAGE_COLUMNS),
-            Self::TextToVideo | Self::ImageToVideo => columns.extend_from_slice(VIDEO_COLUMNS),
-            Self::TextToSpeech => columns.extend_from_slice(AUDIO_COLUMNS),
-        }
-        columns
-    }
-}
-
-/// Orthogonal declarations whose values are routed into their actual owners.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TraceTag {
-    Session,
-    Slo,
-    Speculative,
-}
-
-impl TraceTag {
-    pub const CHOICES: &'static [&'static str] = &["session", "slo", "speculative"];
-
-    pub fn parse(name: &str) -> Result<Self> {
-        Ok(match name {
-            "session" => Self::Session,
-            "slo" => Self::Slo,
-            "speculative" => Self::Speculative,
-            other => bail!(
-                "unknown trace_tag {other:?} (expected one of {:?})",
-                Self::CHOICES
-            ),
-        })
-    }
-
-    fn columns(self) -> &'static [&'static str] {
-        match self {
-            Self::Session => &["session_id", "prefix_kv", "tool_wait_after_ms"],
-            Self::Slo => &["deadline_ms", "priority"],
-            Self::Speculative => &["accept_rate"],
-        }
-    }
-}
-
-/// Which wire format a trace file is written in.
+/// The taxonomy itself is defined once, in the crate this simulator and the
+/// replay client share: which kinds exist, which tags may be declared on them,
+/// and which columns each combination obliges a file to carry. A trace this
+/// simulator accepts is then exactly a trace the client accepts, because there
+/// is only one rule and neither side wrote its own copy of it.
 ///
-/// Orthogonal to [`TraceKind`], which says what a row *is*. A source schema says
-/// what the columns are called and, for the canonical form, that the numbers
-/// have already been resolved upstream. Declared, never sniffed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum SourceSchema {
-    /// This simulator's own column vocabulary.
-    #[default]
-    Native,
-    /// TraceLab's canonical, already-materialized session execution trace. The
-    /// same bytes drive a measured replay, so nothing here may be reinterpreted:
-    /// `prefix_len` is the eligible prefix and `input_len` the fresh suffix,
-    /// exactly as the generator resolved them.
-    SessionExecutionV2,
+/// What stays here is how *this* program reads such a file: the CSV plumbing
+/// below, and the typed parse targets those columns produce.
+pub use req_frontend::schema::{SourceSchema, TraceDeclaration, TraceKind, TraceTag};
+
+/// Check a file's header against its declaration, naming the file.
+///
+/// The path is formatted into the message rather than attached as context: an
+/// anyhow context becomes the outermost message, which would leave a caller
+/// reading `to_string()` with a filename and no reason.
+fn verify_header(declaration: &TraceDeclaration, index: &HeaderIndex, path: &Path) -> Result<()> {
+    declaration
+        .verify_header(index.names())
+        .map_err(|mismatch| anyhow!("{}: {mismatch}", path.display()))
 }
 
-impl SourceSchema {
-    pub const CHOICES: &'static [&'static str] = &["native", "session-execution-v2"];
-
-    pub fn parse(name: &str) -> Result<Self> {
-        Ok(match name {
-            "native" => Self::Native,
-            "session-execution-v2" => Self::SessionExecutionV2,
-            other => bail!(
-                "unknown trace source schema {other:?} (expected one of {:?})",
-                Self::CHOICES
-            ),
-        })
-    }
-}
-
-/// Columns of a canonical `session-execution-v2` file, in canonical order.
-const EXECUTION_V2_COLUMNS: &[&str] = &[
-    "request_id",
-    "session_id",
-    "round_idx",
-    "arrival_time_ms",
-    "prefix_len",
-    "input_len",
-    "output_len",
-    "tool_wait_after_ms",
-];
-
-#[derive(Clone, Debug)]
-pub struct TraceDeclaration {
-    pub kind: TraceKind,
-    pub tags: Vec<TraceTag>,
-    pub source_schema: SourceSchema,
-}
-
-impl TraceDeclaration {
-    pub fn parse(kind: &str, tags: &[String]) -> Result<Self> {
-        let kind = TraceKind::parse(kind)?;
-        let mut parsed_tags = Vec::with_capacity(tags.len());
-        for tag_name in tags {
-            let tag = TraceTag::parse(tag_name)?;
-            if parsed_tags.contains(&tag) {
-                bail!("trace_tags lists {tag:?} more than once");
-            }
-            parsed_tags.push(tag);
-        }
-        Ok(Self {
-            kind,
-            tags: parsed_tags,
-            source_schema: SourceSchema::Native,
-        })
-    }
-
-    /// Parse a declaration that also names its wire format.
-    ///
-    /// The canonical schema implies its own kind and tag, because the format
-    /// exists for exactly one shape of workload; declaring anything else is a
-    /// configuration mistake worth naming rather than silently overriding.
-    pub fn parse_with_schema(kind: &str, tags: &[String], schema: &str) -> Result<Self> {
-        let source_schema = SourceSchema::parse(schema)?;
-        let mut declaration = Self::parse(kind, tags)?;
-        if source_schema == SourceSchema::SessionExecutionV2 {
-            if declaration.kind != TraceKind::TextGeneration {
-                bail!(
-                    "session-execution-v2 is a text-generation session format; \
-                     trace_kind {:?} cannot be read from it",
-                    declaration.kind
-                );
-            }
-            if !declaration.tags.is_empty() && declaration.tags != [TraceTag::Session] {
-                bail!(
-                    "session-execution-v2 already declares its session columns; \
-                     drop trace_tags {:?}",
-                    declaration.tags
-                );
-            }
-            declaration.tags = vec![TraceTag::Session];
-        }
-        declaration.source_schema = source_schema;
-        Ok(declaration)
-    }
-
-    pub fn text() -> Self {
-        Self {
-            kind: TraceKind::TextGeneration,
-            tags: Vec::new(),
-            source_schema: SourceSchema::Native,
-        }
-    }
-
-    fn carries(&self, tag: TraceTag) -> bool {
-        self.tags.contains(&tag)
-    }
-
-    fn expected_columns(&self) -> Vec<&'static str> {
-        if self.source_schema == SourceSchema::SessionExecutionV2 {
-            return EXECUTION_V2_COLUMNS.to_vec();
-        }
-        let mut columns = RELEASE_COLUMNS.to_vec();
-        columns.extend(self.kind.definition_columns());
-        for tag in &self.tags {
-            columns.extend_from_slice(tag.columns());
-        }
-        columns
-    }
-
-    fn verify_header(&self, index: &HeaderIndex, path: &Path) -> Result<()> {
-        // A canonical trace carries round indices by design; they are the chain
-        // this simulator is meant to replay, not a foreign column.
-        if self.source_schema == SourceSchema::Native && index.has(FOREIGN_MULTI_ROUND) {
-            bail!(
-                "{}: multi-round traces (round_idx column) are not supported yet; \
-                 declare the session trace tag and group rows with session_id",
-                path.display()
-            );
-        }
-        let expected = self.expected_columns();
-        let missing: Vec<&str> = expected
-            .iter()
-            .copied()
-            .filter(|column| !index.has(column))
-            .collect();
-        let unexpected: Vec<&str> = index
-            .names()
-            .filter(|column| !expected.contains(column))
-            .collect();
-        if missing.is_empty() && unexpected.is_empty() {
-            return Ok(());
-        }
-        bail!(
-            "{}: header does not match the declared trace (kind={:?}, tags={:?})\n  \
-             missing: {missing:?}\n  unexpected: {unexpected:?}\n  \
-             expected exactly: {expected:?}",
-            path.display(),
-            self.kind,
-            self.tags,
-        )
-    }
-
-    fn parse_tags(&self, row: &Row<'_>) -> Result<ParsedTags> {
-        let session = if self.carries(TraceTag::Session) {
-            parse_session(row)?
-        } else {
-            None
-        };
-        let scheduling = if self.carries(TraceTag::Slo) {
-            parse_scheduling(row)?
-        } else {
-            SchedulingDeclaration::default()
-        };
-        let decoding = if self.carries(TraceTag::Speculative) {
-            parse_decoding(row)?
-        } else {
-            DecodingStrategy::Standard
-        };
-        Ok(ParsedTags {
-            session,
-            scheduling,
-            decoding,
-        })
-    }
+/// Parse whichever tag columns the declaration says are present.
+fn parse_declared_tags(declaration: &TraceDeclaration, row: &Row<'_>) -> Result<ParsedTags> {
+    let session = if declaration.carries(TraceTag::Session) {
+        parse_session(row)?
+    } else {
+        None
+    };
+    let scheduling = if declaration.carries(TraceTag::Slo) {
+        parse_scheduling(row)?
+    } else {
+        SchedulingDeclaration::default()
+    };
+    let decoding = if declaration.carries(TraceTag::Speculative) {
+        parse_decoding(row)?
+    } else {
+        DecodingStrategy::Standard
+    };
+    Ok(ParsedTags {
+        session,
+        scheduling,
+        decoding,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -880,10 +616,6 @@ impl HeaderIndex {
         Ok(Self(positions))
     }
 
-    fn has(&self, column: &str) -> bool {
-        self.0.contains_key(column)
-    }
-
     fn names(&self) -> impl Iterator<Item = &str> {
         self.0.keys().map(String::as_str)
     }
@@ -1002,7 +734,7 @@ pub(super) fn load_file<Definition: TraceDefinition>(
         .with_context(|| format!("reading header of {}", path.display()))?
         .clone();
     let index = HeaderIndex::build(&headers, path)?;
-    declaration.verify_header(&index, path)?;
+    verify_header(declaration, &index, path)?;
 
     for (record_index, record) in reader.records().enumerate() {
         let record = record
@@ -1021,7 +753,7 @@ pub(super) fn load_file<Definition: TraceDefinition>(
             )?);
             continue;
         }
-        let tags = declaration.parse_tags(&row)?;
+        let tags = parse_declared_tags(declaration, &row)?;
         let release = parse_release(&row, tags)?;
         // Global arrival-order validation runs after all files are concatenated,
         // so the first occurrence is the session's first declared arrival.

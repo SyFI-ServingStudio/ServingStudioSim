@@ -28,6 +28,17 @@ anyhow = "1"
 thiserror = "2"
 pyo3 = { version = "0.20", features = ["auto-initialize"] }
 
+# The trace taxonomy: which request kinds exist, which columns each obliges a
+# file to carry, and the canonical session-execution-v2 schema. Shared with the
+# replay client rather than reimplemented here -- a measured run and a simulated
+# run reading the same bytes must not be able to disagree about what those bytes
+# are. `default-features = false` takes the schemas without the client's HTTP
+# stack and tokenizer.
+#
+# Vendored as a git submodule, so a Rust build of this repository now requires
+# `git submodule update --init`.
+req-frontend = { path = "alignment/load_generator/req-frontend", default-features = false }
+
 # Link-time distributed registry: each kernel registers a `KernelQueryEntry` so
 # the `kernel-query` subcommand maps a runtime `kind` -> builder with no central
 # match (see timing/kernels/engine.rs `register_kernel!`).
@@ -115,3 +126,7 @@ opt-level = 2
 
 [workspace]
 members = ["simulator/timing-kernel-derive", "simulator/schema-derive", "analyzer/rust"]
+# req-frontend declares its own workspace so it can also be built standalone.
+# Nested workspace roots are an error unless the outer one excludes them; the
+# path dependency above still resolves.
+exclude = ["alignment/load_generator/req-frontend"]
