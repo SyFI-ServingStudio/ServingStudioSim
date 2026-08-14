@@ -391,7 +391,7 @@ mod tests {
     use super::*;
     use crate::common::{
         AudioExtent, DecodingStrategy, ImageExtent, OmniInputSegment, OmniOutputSpec, RequestId,
-        SessionInput, VideoExtent,
+        SessionInput, SloContract, VideoExtent,
     };
     use std::io::Write;
     use std::path::Path;
@@ -534,7 +534,7 @@ mod tests {
     /// The canonical format spells its own session columns, which is why it
     /// implies that tag — but a tag it knows nothing about is the file's own
     /// declaration, and a v2 path that read the column and dropped it would let
-    /// a trace set deadlines that the replay client it is compared against
+    /// a trace set service bounds that the replay client it is compared against
     /// honoured and the simulator did not.
     #[test]
     fn execution_v2_carries_the_orthogonal_tags_it_declares() {
@@ -542,14 +542,14 @@ mod tests {
         let path = dir.path().join("tagged.csv");
         std::fs::write(
             &path,
-            "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms,deadline_ms,priority\n\
-             a_round_000000,a,0,0.000000,0,512,64,0.000000,2000,3\n\
-             a_round_000001,a,1,0.000000,576,0,64,0.000000,,0\n",
+            "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms,ttft_slo_ms,tpot_slo_ms,e2e_slo_ms,priority\n\
+             a_round_000000,a,0,0.000000,0,512,64,0.000000,500,20,2000,3\n\
+             a_round_000001,a,1,0.000000,576,0,64,0.000000,,,,0\n",
         )
         .unwrap();
         let declaration = TraceDeclaration::parse_with_schema(
             "text_generation",
-            &["slo".to_string()],
+            &["slo".to_string(), "priority".to_string()],
             "session-execution-v2",
         )
         .unwrap();
@@ -564,13 +564,12 @@ mod tests {
         .unwrap();
 
         let scheduled = &frontend.scheduled_requests;
-        assert_eq!(
-            scheduled[0].scheduling.relative_completion_deadline,
-            Some(Time::from_ms(2000.0))
-        );
+        assert_eq!(scheduled[0].slo.ttft_slo, Some(Time::from_ms(500.0)));
+        assert_eq!(scheduled[0].slo.tpot_slo, Some(Time::from_ms(20.0)));
+        assert_eq!(scheduled[0].slo.e2e_slo, Some(Time::from_ms(2000.0)));
         assert_eq!(scheduled[0].scheduling.priority, 3);
-        // A blank cell declares no deadline; it is not a deadline of zero.
-        assert_eq!(scheduled[1].scheduling.relative_completion_deadline, None);
+        // Blank cells declare no metric bounds; they are not zero-valued SLOs.
+        assert_eq!(scheduled[1].slo, SloContract::default());
 
         // And the same file without the declaration is refused rather than
         // parsed with two columns nobody reads.
@@ -583,7 +582,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("deadline_ms"), "{error}");
+        assert!(error.contains("ttft_slo_ms"), "{error}");
     }
 
     #[test]
@@ -1165,6 +1164,7 @@ mod tests {
             scheduled_request.scheduling,
             SchedulingDeclaration::default()
         );
+        assert_eq!(scheduled_request.slo, SloContract::default());
     }
 
     /// Tags are declared as a set and stack: three disciplines, one file.
@@ -1175,12 +1175,15 @@ mod tests {
             dir.path(),
             "stacked.csv",
             "id,input_len,output_len,arrival_time,session_id,prefix_kv,tool_wait_after_ms,\
-             deadline_ms,priority,accept_rate\n\
-             0,8,2,4.0,7,512,250.0,1200.0,3,0.75\n",
+             ttft_slo_ms,tpot_slo_ms,e2e_slo_ms,priority,accept_rate\n\
+             0,8,2,4.0,7,512,250.0,300.0,25.0,1200.0,3,0.75\n",
         );
         let fe = TraceFrontend::load(
             &[path],
-            &declare("text_generation", &["session", "slo", "speculative"]),
+            &declare(
+                "text_generation",
+                &["session", "slo", "priority", "speculative"],
+            ),
             open_loop(1.0),
             uncapped(),
             SessionDependency::Independent,
@@ -1204,9 +1207,14 @@ mod tests {
         );
         assert_eq!(
             scheduled_request.scheduling,
-            SchedulingDeclaration {
-                priority: 3,
-                relative_completion_deadline: Some(Time::from_ms(1200.0)),
+            SchedulingDeclaration { priority: 3 }
+        );
+        assert_eq!(
+            scheduled_request.slo,
+            SloContract {
+                ttft_slo: Some(Time::from_ms(300.0)),
+                tpot_slo: Some(Time::from_ms(25.0)),
+                e2e_slo: Some(Time::from_ms(1200.0)),
             }
         );
         assert_eq!(
@@ -1214,10 +1222,7 @@ mod tests {
             DecodingStrategy::Speculative { accept_rate: 0.75 }
         );
         let realized_request = scheduled_request.realize_at(Time::from_ms(10.0));
-        assert_eq!(
-            realized_request.core.scheduling.completion_deadline,
-            Some(Time::from_ms(1210.0))
-        );
+        assert_eq!(realized_request.core.slo, scheduled_request.slo);
         assert_eq!(
             realized_request.definition.session.session_start_time(),
             Some(Time::from_ms(4.0)),
@@ -1250,8 +1255,8 @@ mod tests {
     }
 
     /// A declared tag is still per-row optional: a blank `session_id` means this
-    /// one request belongs to no conversation, and a blank `deadline_ms` means
-    /// the workload ranks by priority without an absolute time target.
+    /// one request belongs to no conversation, and blank SLO cells mean that
+    /// request declares no metric-specific service bound.
     #[test]
     fn blank_cell_opts_one_row_out_of_a_declared_tag() {
         let dir = tempfile::tempdir().unwrap();
@@ -1259,30 +1264,49 @@ mod tests {
             dir.path(),
             "sparse.csv",
             "id,input_len,output_len,arrival_time,session_id,prefix_kv,tool_wait_after_ms,\
-             deadline_ms,priority\n\
-             0,8,2,0.0,,,,,\n\
-             1,8,2,1.0,4,64,0.0,900.0,1\n",
+             ttft_slo_ms,tpot_slo_ms,e2e_slo_ms,priority\n\
+             0,8,2,0.0,,,,,,,\n\
+             1,8,2,1.0,4,64,0.0,,,900.0,1\n",
         );
         let fe = TraceFrontend::load(
             &[path],
-            &declare("text_generation", &["session", "slo"]),
+            &declare("text_generation", &["session", "slo", "priority"]),
             open_loop(1.0),
             uncapped(),
             SessionDependency::Independent,
         )
         .unwrap();
         assert!(fe.scheduled_requests[0].release.session.is_none());
-        assert_eq!(
-            fe.scheduled_requests[0]
-                .scheduling
-                .relative_completion_deadline,
-            None
-        );
+        assert_eq!(fe.scheduled_requests[0].slo, SloContract::default());
         assert_eq!(fe.scheduled_requests[0].scheduling.priority, 0);
         assert_eq!(
             fe.scheduled_requests[1].release.session.unwrap().session_id,
             4
         );
+    }
+
+    #[test]
+    fn metric_specific_slo_must_be_positive_when_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_csv(
+            dir.path(),
+            "invalid-slo.csv",
+            "id,input_len,output_len,arrival_time,ttft_slo_ms,tpot_slo_ms,e2e_slo_ms\n\
+             0,8,2,0.0,0,,\n",
+        );
+
+        let error = TraceFrontend::load(
+            &[path],
+            &declare("text_generation", &["slo"]),
+            open_loop(1.0),
+            uncapped(),
+            SessionDependency::Independent,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("ttft_slo_ms"), "{error}");
+        assert!(error.contains("greater than zero"), "{error}");
     }
 
     /// Encoded media stays explicit in its typed definition instead of being
@@ -1585,7 +1609,7 @@ mod tests {
         .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("missing"), "{message}");
-        assert!(message.contains("deadline_ms"), "{message}");
+        assert!(message.contains("ttft_slo_ms"), "{message}");
     }
 
     /// Declaring the wrong media kind fails on the columns, so a video trace can

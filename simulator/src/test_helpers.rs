@@ -12,7 +12,7 @@ use crate::arch::contract::{
 };
 use crate::common::{
     DecodingStrategy, Request, RequestCore, RequestId, RequestStore, SchedulingContract,
-    SessionInput, SharedRequests, TextGenerationDefinition, Time,
+    SessionInput, SharedRequests, SloContract, TextGenerationDefinition, Time,
 };
 use crate::timing::cache::interp::{CoverageFlags, Metrics4};
 use crate::timing::LeafMetrics;
@@ -53,10 +53,12 @@ pub(crate) const fn text_request(
         RequestCore {
             id: request_id,
             arrival_time,
-            scheduling: SchedulingContract {
-                priority: 0,
-                completion_deadline: None,
+            slo: SloContract {
+                ttft_slo: None,
+                tpot_slo: None,
+                e2e_slo: None,
             },
+            scheduling: SchedulingContract { priority: 0 },
         },
         TextGenerationDefinition {
             prompt_tokens,

@@ -49,6 +49,11 @@ pub struct RequestSloEntry {
     pub logging_time_ms: f64,
     pub completed: bool,
     pub arrival_time_ms: f64,
+    /// Immutable per-request metric bounds declared by the trace. Nullable
+    /// independently because a request may owe only a subset of the metrics.
+    pub declared_ttft_slo_ms: Option<f32>,
+    pub declared_tpot_slo_ms: Option<f32>,
+    pub declared_e2e_slo_ms: Option<f32>,
     /// Per-token output timestamps (ms). Only populated when
     /// `io.log_output_token_times` is on; feeds `slo-detailed` ITL. The scalars
     /// below (`slo-general`) are computed sim-side and do NOT depend on it.
@@ -641,6 +646,12 @@ pub(crate) fn slo_to_record_batch(
     let logging_time: Vec<f64> = entries.iter().map(|e| e.logging_time_ms).collect();
     let completed: Vec<bool> = entries.iter().map(|e| e.completed).collect();
     let arrival: Vec<f64> = entries.iter().map(|e| e.arrival_time_ms).collect();
+    let declared_ttft_slo: Vec<Option<f32>> =
+        entries.iter().map(|e| e.declared_ttft_slo_ms).collect();
+    let declared_tpot_slo: Vec<Option<f32>> =
+        entries.iter().map(|e| e.declared_tpot_slo_ms).collect();
+    let declared_e2e_slo: Vec<Option<f32>> =
+        entries.iter().map(|e| e.declared_e2e_slo_ms).collect();
     // `slo-general` scalars are sim-computed (independent of the per-token array,
     // which is empty when `log_output_token_times` is off).
     let num_tokens: Vec<u32> = entries.iter().map(|e| e.num_output_tokens).collect();
@@ -746,6 +757,9 @@ pub(crate) fn slo_to_record_batch(
             Arc::new(UInt32Array::from(declared_prefix_tokens)),
             Arc::new(UInt32Array::from(prefix_cache_hit_tokens)),
             Arc::new(UInt32Array::from(fresh_prompt_tokens)),
+            Arc::new(Float32Array::from(declared_ttft_slo)),
+            Arc::new(Float32Array::from(declared_tpot_slo)),
+            Arc::new(Float32Array::from(declared_e2e_slo)),
         ],
     )?)
 }
@@ -843,6 +857,9 @@ mod tests {
             logging_time_ms: 100.0,
             completed: true,
             arrival_time_ms: 0.0,
+            declared_ttft_slo_ms: None,
+            declared_tpot_slo_ms: None,
+            declared_e2e_slo_ms: None,
             output_token_times_ms: times,
             ttft_ms: Some(1.0),
             num_output_tokens: num,
@@ -1126,6 +1143,31 @@ mod tests {
         assert!(hit.is_null(0), "never-resolved admission must remain null");
         assert_eq!(hit.value(1), 0, "a resolved cold cache is a real miss");
         assert_eq!(hit.value(2), 60, "partial hits preserve the token count");
+    }
+
+    #[test]
+    fn slo_columns_preserve_each_requests_metric_specific_bounds() {
+        let mut bounded = slo_entry(0, Vec::new());
+        bounded.declared_ttft_slo_ms = Some(300.0);
+        bounded.declared_tpot_slo_ms = Some(25.0);
+        bounded.declared_e2e_slo_ms = Some(1200.0);
+        let unbounded = slo_entry(1, Vec::new());
+
+        let batch = slo_to_record_batch(&[bounded, unbounded], false, false).unwrap();
+        for (column, expected) in [
+            ("declared_ttft_slo_ms", 300.0),
+            ("declared_tpot_slo_ms", 25.0),
+            ("declared_e2e_slo_ms", 1200.0),
+        ] {
+            let values = batch
+                .column_by_name(column)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+            assert_eq!(values.value(0), expected);
+            assert!(values.is_null(1), "blank {column} must remain null");
+        }
     }
 
     #[test]

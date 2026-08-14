@@ -12,7 +12,7 @@
 
 ```text
 Request<Definition>
-├── RequestCore                 # id / actual arrival / scheduling contract
+├── RequestCore                 # id / actual arrival / SLO / scheduling policy
 └── Definition                  # immutable family-specific requested work
 
 ActiveRequest<Definition>
@@ -35,7 +35,8 @@ positional convenience API。legacy 四列 text trace 的默认 prefix/decoding/
 
 - `RequestId`
 - 实际 release 后的 `arrival_time`
-- `SchedulingContract { priority, completion_deadline }`
+- `SloContract { ttft_slo, tpot_slo, e2e_slo }`
+- `SchedulingContract { priority }`
 
 Session-capable definition（当前 autoregressive directional families 与 omni）的
 `SessionInput` 在一个 enum variant 内同时保存
@@ -105,10 +106,11 @@ ScheduledRequest<OmniGenerationDefinition>
 每个文件仍是单一 kind，header 必须与声明的 exact schema 完全一致；不会从列名
 猜 kind，也不允许每行携带 kind union。
 
-`ScheduledRequest<Definition>` 拆成三部分：
+`ScheduledRequest<Definition>` 拆成四部分：
 
 - `definition`：family-specific immutable work
-- `scheduling`：priority 和相对 completion deadline
+- `slo`：每个 metric 独立可选的 TTFT / TPOT / E2E duration bound
+- `scheduling`：独立的 priority policy
 - `release`：`ReleaseMetadata { request_id, trace_arrival_time, session }`
 
 `ReplayScheduler` 的 API 只接受 `ReleaseMetadata` slice，所以 release scheduling
@@ -137,9 +139,10 @@ slot，直到最后一轮完成才释放，**tool wait 期间照占**（此时�
 gate 会直接死锁（唯一能释放 slot 的正是这条 successor 通向的 session completion）。
 被 cap 挡住的 head 用「slot 开放的瞬间」打时间戳而非 trace arrival，与实测端
 TraceLab「先等 arrival、再拿 permit、然后才发请求」的时钟起点一致。
-release 时，frontend 才把相对 deadline 解成 absolute simulated deadline，并构造
-`Request<Definition>`。这也是 production 唯一调用 generic `Request::new` 的位置；
-四列 schema 与带 session/SLO/speculative tags 的 schema 最终共享同一个 storage seam。
+release 时，frontend 把 metric-specific duration 原样写入 `RequestCore.slo`，并构造
+`Request<Definition>`。SLO 不是绝对时间，也不进入 scheduling policy。这也是 production
+唯一调用 generic `Request::new` 的位置；
+四列 schema 与带 session/SLO/priority/speculative tags 的 schema 最终共享同一个 storage seam。
 
 ## 4. trace tags 的真实 owner
 
@@ -149,7 +152,8 @@ tags 仍可独立组合，但 parser 会把字段送到实际 owner，而不是�
 | tag | parsed destination | 当前 consumer 状态 |
 |---|---|---|
 | `session` | release chain + definition 的 `SessionInput` | chain、session-age admission 与 L5 prefix KV 均已消费 |
-| `slo` | `RequestCore.scheduling` | current admission 尚未读取 |
+| `slo` | `RequestCore.slo` 的 TTFT / TPOT / E2E bounds | `request_slo` 已持久化，current admission 不读取 |
+| `priority` | `RequestCore.scheduling.priority` | current admission policy 尚未读取 |
 | `speculative` | text definition 的 `DecodingStrategy` | current execution 尚未读取 |
 
 frontend 只负责 exact-schema parsing、typed family construction 和 replay，不再声称能
@@ -205,6 +209,10 @@ work 与 emitted output tokens。cache disabled/evicted/placement miss 都会重
 token 数与 hit rate 由 declaration/hit 推导。已经产出首 token 的 request 必须满足
 `hit + prefill_processed = fresh_prompt_tokens + declared_prefix_tokens`，使 Analyzer 能在
 动态 hit rate 下检查 token、causal-attention 与 decode-KV 三层守恒。
+
+`request_slo` 同时原样持久化 nullable 的 `declared_ttft_slo_ms`、
+`declared_tpot_slo_ms`、`declared_e2e_slo_ms`。每列只描述对应 metric；某列为 `NULL`
+表示该 request 没有声明该项 obligation，不可解释成零，也不可由另一项 SLO 推导。
 
 retained prefix 与 normal active/promised/PD-held KV 共享同一个 total attention capacity。
 默认 `prefix_cache_mode: opportunistic`，completed-session KV 可以使用当下全部空闲 attention

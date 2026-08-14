@@ -19,8 +19,8 @@ use crate::common::{
     AudioExtent, AudioTextGenerationDefinition, DecodingStrategy, ImageExtent,
     ImageGenerationDefinition, ImageTextGenerationDefinition, ImageToVideoDefinition,
     OmniGenerationDefinition, OmniInputSegment, OmniOutputSpec, RequestDefinition, RequestId,
-    SessionInput, SpeechGenerationDefinition, TextGenerationDefinition, Time, VideoExtent,
-    VideoGenerationDefinition, VideoTextGenerationDefinition,
+    SessionInput, SloContract, SpeechGenerationDefinition, TextGenerationDefinition, Time,
+    VideoExtent, VideoGenerationDefinition, VideoTextGenerationDefinition,
 };
 
 const DEFAULT_PRIORITY: i32 = 0;
@@ -53,7 +53,12 @@ fn parse_declared_tags(declaration: &TraceDeclaration, row: &Row<'_>) -> Result<
     } else {
         None
     };
-    let scheduling = if declaration.carries(TraceTag::Slo) {
+    let slo = if declaration.carries(TraceTag::Slo) {
+        parse_slo(row)?
+    } else {
+        SloContract::default()
+    };
+    let scheduling = if declaration.carries(TraceTag::Priority) {
         parse_scheduling(row)?
     } else {
         SchedulingDeclaration::default()
@@ -65,6 +70,7 @@ fn parse_declared_tags(declaration: &TraceDeclaration, row: &Row<'_>) -> Result<
     };
     Ok(ParsedTags {
         session,
+        slo,
         scheduling,
         decoding,
     })
@@ -80,6 +86,7 @@ struct ParsedSession {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ParsedTags {
     session: Option<ParsedSession>,
+    slo: SloContract,
     scheduling: SchedulingDeclaration,
     decoding: DecodingStrategy,
 }
@@ -333,18 +340,33 @@ fn parse_session(row: &Row<'_>) -> Result<Option<ParsedSession>> {
     }))
 }
 
-fn parse_scheduling(row: &Row<'_>) -> Result<SchedulingDeclaration> {
-    let relative_completion_deadline = row
-        .optional_cell::<f64>("deadline_ms")
+fn parse_slo(row: &Row<'_>) -> Result<SloContract> {
+    Ok(SloContract {
+        ttft_slo: parse_positive_duration(row, "ttft_slo_ms")?,
+        tpot_slo: parse_positive_duration(row, "tpot_slo_ms")?,
+        e2e_slo: parse_positive_duration(row, "e2e_slo_ms")?,
+    })
+}
+
+fn parse_positive_duration(row: &Row<'_>, column: &str) -> Result<Option<Time>> {
+    row.optional_cell::<f64>(column)
         .transpose()?
-        .map(|deadline_ms| {
-            require_nonnegative_finite(row, "deadline_ms", deadline_ms)?;
-            Ok::<Time, anyhow::Error>(Time::from_ms(deadline_ms))
+        .map(|milliseconds| {
+            if !milliseconds.is_finite() || milliseconds <= 0.0 {
+                bail!(
+                    "{}: {column}={} must be finite and greater than zero",
+                    row.at(),
+                    milliseconds
+                );
+            }
+            Ok(Time::from_ms(milliseconds))
         })
-        .transpose()?;
+        .transpose()
+}
+
+fn parse_scheduling(row: &Row<'_>) -> Result<SchedulingDeclaration> {
     Ok(SchedulingDeclaration {
         priority: row.cell_or("priority", DEFAULT_PRIORITY)?,
-        relative_completion_deadline,
     })
 }
 
@@ -426,9 +448,14 @@ fn parse_execution_v2_row<Definition: TraceDefinition>(
     };
     // The canonical format supplies the session tag itself, but the orthogonal
     // ones are the file's own declaration and must be read here too. Reading a
-    // column and dropping it would let a trace set deadlines that the run it is
-    // compared against silently ignored.
-    let scheduling = if declaration.carries(TraceTag::Slo) {
+    // column and dropping it would let a trace set service bounds or priority
+    // that the run it is compared against silently ignored.
+    let slo = if declaration.carries(TraceTag::Slo) {
+        parse_slo(row)?
+    } else {
+        SloContract::default()
+    };
+    let scheduling = if declaration.carries(TraceTag::Priority) {
         parse_scheduling(row)?
     } else {
         SchedulingDeclaration::default()
@@ -440,6 +467,7 @@ fn parse_execution_v2_row<Definition: TraceDefinition>(
     };
     Ok(ScheduledRequest {
         release,
+        slo,
         scheduling,
         definition: Definition::parse_execution_v2(row, session, decoding)?,
     })
@@ -793,6 +821,7 @@ pub(super) fn load_file<Definition: TraceDefinition>(
         });
         output.push(ScheduledRequest {
             release,
+            slo: tags.slo,
             scheduling: tags.scheduling,
             definition: Definition::parse_definition(&row, tags, session_start_time)?,
         });

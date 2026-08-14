@@ -13,7 +13,7 @@ pub use fabric::Fabric;
 pub use id::{BatchId, ExpertId, GroupId, IdMap, PoolId, RequestId, WorkerId};
 pub use request::{
     ActiveRequest, Request, RequestCore, RequestLifecycle, RequestRecord, RequestStore,
-    RequestTelemetry, SchedulingContract, SharedRequests,
+    RequestTelemetry, SchedulingContract, SharedRequests, SloContract,
 };
 pub use request_family::{
     AudioExtent, AudioTextGenerationDefinition, AudioTextGenerationRequest, AudioToTextDefinition,

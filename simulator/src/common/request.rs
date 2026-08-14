@@ -22,9 +22,18 @@ use super::time::Time;
 pub struct SchedulingContract {
     /// Higher values rank ahead when the selected admission policy supports it.
     pub priority: i32,
-    /// Absolute simulated completion deadline, resolved when the request is
-    /// released. `None` means that the request declares no deadline.
-    pub completion_deadline: Option<Time>,
+}
+
+/// Metric-specific service bounds declared by one request.
+///
+/// These are durations, not absolute timestamps. Keeping them separate from
+/// [`SchedulingContract`] prevents a latency obligation from becoming an
+/// admission-policy knob merely because both arrived on the same trace row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SloContract {
+    pub ttft_slo: Option<Time>,
+    pub tpot_slo: Option<Time>,
+    pub e2e_slo: Option<Time>,
 }
 
 /// Stable facts carried by every live request.
@@ -33,6 +42,7 @@ pub struct RequestCore {
     pub id: RequestId,
     /// Actual time the replay scheduler released the request into L6.
     pub arrival_time: Time,
+    pub slo: SloContract,
     pub scheduling: SchedulingContract,
 }
 
@@ -41,13 +51,14 @@ pub struct RequestCore {
 /// ```compile_fail
 /// use simulator::common::{
 ///     ImageExtent, ImageGenerationDefinition, Request, RequestCore, RequestId,
-///     SchedulingContract, TextGenerationDefinition, Time,
+///     SchedulingContract, SloContract, TextGenerationDefinition, Time,
 /// };
 /// fn accepts_text(_: Request<TextGenerationDefinition>) {}
 /// let image = Request::new(
 ///     RequestCore {
 ///         id: RequestId(0),
 ///         arrival_time: Time::ZERO,
+///         slo: SloContract::default(),
 ///         scheduling: SchedulingContract::default(),
 ///     },
 ///     ImageGenerationDefinition {

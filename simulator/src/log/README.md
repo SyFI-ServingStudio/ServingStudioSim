@@ -58,7 +58,7 @@ run_meta.rs       write_run_meta — the run_meta.json GPU-facts sidecar (plain
 
 | File | Writer | Opened by | Content |
 |---|---|---|---|
-| `request_slo.parquet` | `LoggerSession` | L7 `run_sim` | one terminal row per completed request, or one sim-end partial row per incomplete arrived request; includes declared prefix tokens and nullable admission-time cache-hit tokens |
+| `request_slo.parquet` | `LoggerSession` | L7 `run_sim` | one terminal row per completed request, or one sim-end partial row per incomplete arrived request; includes the request's nullable TTFT/TPOT/E2E SLOs, declared prefix tokens, and nullable admission-time cache-hit tokens |
 | `request_state.parquet` | `LoggerSession` | L7 `run_sim` | periodic dense snapshot over the admitted set |
 | `cost_log/worker_<pool_tag>_<worker_id>.parquet` | `CostLogger` | each L5 worker | one row per iteration: envelope + per-group `input_section` + the CostTree per-slot breakdown |
 | `cost_manifest/worker_<pool_tag>_<worker_id>.json` | `CostLogger` | each L5 worker | the matching `CostManifest` (slots + flat aggregation nodes) written once at open |
@@ -80,6 +80,11 @@ the immutable new suffix, while `prefill_processed` records work actually done.
 Once a request has produced its first output token, conservation therefore has
 the exact request-level invariant
 `prefix_cache_hit_tokens + prefill_processed = fresh_prompt_tokens + declared_prefix_tokens`.
+
+The nullable `declared_ttft_slo_ms`, `declared_tpot_slo_ms`, and
+`declared_e2e_slo_ms` columns preserve the trace's per-request obligations.
+Null means that metric was not bounded for that request; the three columns are
+independent and scheduling priority is not an SLO column.
 
 `kv_snapshot.active_kv` is total committed attention KV and therefore already
 includes retained prefix-cache entries. `retained_prefix_kv` exposes that component

@@ -5,7 +5,9 @@
 //! sees `ScheduledRequest<TextGenerationDefinition>` and the Rust type system
 //! prevents it from becoming a generated-media request.
 
-use crate::common::{Request, RequestCore, RequestDefinition, RequestId, SchedulingContract, Time};
+use crate::common::{
+    Request, RequestCore, RequestDefinition, RequestId, SchedulingContract, SloContract, Time,
+};
 
 /// Session facts used only to order releases. Prefix requirements live in the
 /// concrete request definition, not in this pacing metadata.
@@ -24,18 +26,17 @@ pub struct ReleaseMetadata {
     pub session: Option<SessionReleaseMetadata>,
 }
 
-/// Scheduling requirements resolved when the request is released.
+/// Scheduling policy declared by the trace.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SchedulingDeclaration {
     pub priority: i32,
-    /// Completion deadline relative to the actual release time.
-    pub relative_completion_deadline: Option<Time>,
 }
 
 /// One parsed row with a statically known request definition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScheduledRequest<Definition: RequestDefinition> {
     pub release: ReleaseMetadata,
+    pub slo: SloContract,
     pub scheduling: SchedulingDeclaration,
     pub definition: Definition,
 }
@@ -47,12 +48,9 @@ impl<Definition: RequestDefinition> ScheduledRequest<Definition> {
             RequestCore {
                 id: self.release.request_id,
                 arrival_time,
+                slo: self.slo,
                 scheduling: SchedulingContract {
                     priority: self.scheduling.priority,
-                    completion_deadline: self
-                        .scheduling
-                        .relative_completion_deadline
-                        .map(|deadline| arrival_time + deadline),
                 },
             },
             self.definition.clone(),

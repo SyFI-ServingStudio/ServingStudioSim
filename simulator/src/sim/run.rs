@@ -450,6 +450,19 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         logging_time_ms: now.as_ms(),
         completed: rec.lifecycle.completed,
         arrival_time_ms: rec.request.core.arrival_time.as_ms(),
+        declared_ttft_slo_ms: rec
+            .request
+            .core
+            .slo
+            .ttft_slo
+            .map(|time| time.as_ms() as f32),
+        declared_tpot_slo_ms: rec
+            .request
+            .core
+            .slo
+            .tpot_slo
+            .map(|time| time.as_ms() as f32),
+        declared_e2e_slo_ms: rec.request.core.slo.e2e_slo.map(|time| time.as_ms() as f32),
         output_token_times_ms: times_ms,
         ttft_ms,
         num_output_tokens: rec.progress.output_tokens_emitted,
@@ -469,7 +482,7 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::{PoolId, RequestStore, SessionInput, UnifiedStage, WorkerId};
+    use crate::common::{PoolId, RequestStore, SessionInput, SloContract, UnifiedStage, WorkerId};
     use crate::orchestrator::{
         DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
     };
@@ -638,7 +651,7 @@ mod tests {
 
     #[test]
     fn finalize_preserves_never_admitted_request_stage_log() {
-        use arrow_array::{Array, ListArray, UInt16Array, UInt32Array};
+        use arrow_array::{Array, Float32Array, ListArray, UInt16Array, UInt32Array};
         use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         let dir = tempfile::tempdir().unwrap();
@@ -650,6 +663,11 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 100,
+            };
+            request.core.slo = SloContract {
+                ttft_slo: Some(Time::from_ms(300.0)),
+                tpot_slo: None,
+                e2e_slo: Some(Time::from_ms(1200.0)),
             };
             s.insert(request);
             s[RequestId(0)].record_stage(
@@ -697,6 +715,27 @@ mod tests {
             .downcast_ref::<UInt32Array>()
             .unwrap();
         assert_eq!(fresh_prompt_tokens.value(0), 8);
+        let declared_ttft_slo = batch
+            .column_by_name("declared_ttft_slo_ms")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let declared_tpot_slo = batch
+            .column_by_name("declared_tpot_slo_ms")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let declared_e2e_slo = batch
+            .column_by_name("declared_e2e_slo_ms")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(declared_ttft_slo.value(0), 300.0);
+        assert!(declared_tpot_slo.is_null(0));
+        assert_eq!(declared_e2e_slo.value(0), 1200.0);
         let prefix_cache_hit_tokens = batch
             .column_by_name("prefix_cache_hit_tokens")
             .unwrap()

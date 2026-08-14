@@ -341,6 +341,11 @@ pub fn request_slo_schema() -> Arc<Schema> {
         Field::new("declared_prefix_tokens", DataType::UInt32, false),
         Field::new("prefix_cache_hit_tokens", DataType::UInt32, true),
         Field::new("fresh_prompt_tokens", DataType::UInt32, false),
+        // Immutable metric-specific service bounds from the trace. Appended so
+        // existing positional columns retain their meaning.
+        Field::new("declared_ttft_slo_ms", DataType::Float32, true),
+        Field::new("declared_tpot_slo_ms", DataType::Float32, true),
+        Field::new("declared_e2e_slo_ms", DataType::Float32, true),
     ]))
 }
 
