@@ -541,6 +541,63 @@ mod tests {
         assert!(error.contains("no previous context"), "{error}");
     }
 
+    /// A canonical trace may carry the orthogonal tags, and they must land.
+    ///
+    /// The canonical format spells its own session columns, which is why it
+    /// implies that tag — but a tag it knows nothing about is the file's own
+    /// declaration, and a v2 path that read the column and dropped it would let
+    /// a trace set deadlines that the replay client it is compared against
+    /// honoured and the simulator did not.
+    #[test]
+    fn execution_v2_carries_the_orthogonal_tags_it_declares() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tagged.csv");
+        std::fs::write(
+            &path,
+            "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms,deadline_ms,priority\n\
+             a_round_000000,a,0,0.000000,0,512,64,0.000000,2000,3\n\
+             a_round_000001,a,1,0.000000,576,0,64,0.000000,,0\n",
+        )
+        .unwrap();
+        let declaration = TraceDeclaration::parse_with_schema(
+            "text_generation",
+            &["slo".to_string()],
+            "session-execution-v2",
+        )
+        .unwrap();
+
+        let frontend = TraceFrontend::load(
+            std::slice::from_ref(&path),
+            &declaration,
+            open_loop(1.0),
+            uncapped(),
+            SessionDependency::Chained,
+        )
+        .unwrap();
+
+        let scheduled = &frontend.scheduled_requests;
+        assert_eq!(
+            scheduled[0].scheduling.relative_completion_deadline,
+            Some(Time::from_ms(2000.0))
+        );
+        assert_eq!(scheduled[0].scheduling.priority, 3);
+        // A blank cell declares no deadline; it is not a deadline of zero.
+        assert_eq!(scheduled[1].scheduling.relative_completion_deadline, None);
+
+        // And the same file without the declaration is refused rather than
+        // parsed with two columns nobody reads.
+        let error = TraceFrontend::load(
+            &[path],
+            &declare_execution_v2(),
+            open_loop(1.0),
+            uncapped(),
+            SessionDependency::Chained,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("deadline_ms"), "{error}");
+    }
+
     #[test]
     fn native_traces_still_reject_a_round_index_column() {
         let dir = tempfile::tempdir().unwrap();

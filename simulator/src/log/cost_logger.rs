@@ -18,15 +18,19 @@ use crate::common::WorkerId;
 use crate::log::parquet_writer::StreamingParquetWriter;
 use crate::log::rows::{cost_to_record_batch, CostLogChunk, CostLogEntry, GroupInputLog};
 use crate::log::schemas::cost_log_schema;
-use parquet::schema::types::ColumnPath;
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
+use parquet::schema::types::ColumnPath;
 
 const STREAM_FLUSH_ROWS: usize = 8_192;
 const CHANNEL_CAP: usize = 64;
 
 /// Parquet *leaf* path of one per-slot list column.
 fn slot_list_column(column: &str) -> ColumnPath {
-    ColumnPath::new(vec![column.to_owned(), "list".to_owned(), "item".to_owned()])
+    ColumnPath::new(vec![
+        column.to_owned(),
+        "list".to_owned(),
+        "item".to_owned(),
+    ])
 }
 
 /// Every per-slot list column. One row carries ~1,271 slots on a GLM-5.2-class
@@ -293,8 +297,7 @@ mod tests {
         use crate::timing::AttnPrefillLog;
 
         let slots = rows * BENCH_SLOTS_PER_ROW;
-        let mut chunk =
-            CostLogChunk::with_capacity("main", rows, 0, slots, slots);
+        let mut chunk = CostLogChunk::with_capacity("main", rows, 0, slots, slots);
         for row in 0..rows {
             chunk.entries.push(CostLogEntry {
                 worker_id: 0,
@@ -431,7 +434,9 @@ mod tests {
 
         let keep = std::env::var("VIBESIM_COST_LOG_BENCH_OUT").ok();
         let dir = tempdir().unwrap();
-        let out_dir = keep.as_deref().map_or_else(|| dir.path().to_path_buf(), std::path::PathBuf::from);
+        let out_dir = keep
+            .as_deref()
+            .map_or_else(|| dir.path().to_path_buf(), std::path::PathBuf::from);
         std::fs::create_dir_all(&out_dir).unwrap();
         let mut report = vec![("cost_to_record_batch".to_owned(), convert_s, 0u64)];
         let all_slot_columns = |input: bool| -> Vec<ColumnPath> {
@@ -441,10 +446,16 @@ mod tests {
             }
             columns
         };
-        let (stats_only, both_off, keep_input_dict) =
-            (all_slot_columns(true), all_slot_columns(true), all_slot_columns(false));
+        let (stats_only, both_off, keep_input_dict) = (
+            all_slot_columns(true),
+            all_slot_columns(true),
+            all_slot_columns(false),
+        );
         let slot_input_for_stats = slot_input_column.clone();
-        let variants: Vec<(&str, Box<dyn Fn(WriterPropertiesBuilder) -> WriterPropertiesBuilder>)> = vec![
+        let variants: Vec<(
+            &str,
+            Box<dyn Fn(WriterPropertiesBuilder) -> WriterPropertiesBuilder>,
+        )> = vec![
             ("dict=on  stats=on   (current)", Box::new(|b| b)),
             (
                 "dict=off stats=on",
@@ -456,7 +467,10 @@ mod tests {
             ),
             (
                 "dict=off stats=off",
-                Box::new(|b| b.set_dictionary_enabled(false).set_statistics_enabled(EnabledStatistics::None)),
+                Box::new(|b| {
+                    b.set_dictionary_enabled(false)
+                        .set_statistics_enabled(EnabledStatistics::None)
+                }),
             ),
             (
                 "dict=on  stats=chunk",
@@ -655,7 +669,10 @@ mod tests {
         }
         // The overrides are per column, not a stream-wide switch: scalars keep both.
         let iter_id = column("iter_id");
-        assert!(iter_id.statistics().is_some(), "iter_id should keep statistics");
+        assert!(
+            iter_id.statistics().is_some(),
+            "iter_id should keep statistics"
+        );
         assert!(
             iter_id.dictionary_page_offset().is_some(),
             "iter_id should keep its dictionary"

@@ -136,10 +136,19 @@ pub(super) trait TraceDefinition: RequestDefinition + Sized {
 
     /// Build this definition from a canonical `session-execution-v2` row.
     ///
+    /// `decoding` comes from whichever orthogonal tags the file declared. The
+    /// canonical format spells its own session columns, but a tag is something a
+    /// file carries *in addition* to its format, so a declared one must reach
+    /// the definition here exactly as it does on the native path.
+    ///
     /// Defaults to a refusal rather than a best-effort mapping: the canonical
     /// format describes a text session, and quietly accepting it for another
     /// request family would invent fields the file never carried.
-    fn parse_execution_v2(_row: &Row<'_>, _session: SessionInput) -> Result<Self> {
+    fn parse_execution_v2(
+        _row: &Row<'_>,
+        _session: SessionInput,
+        _decoding: DecodingStrategy,
+    ) -> Result<Self> {
         bail!(
             "{:?} traces cannot be read from a session-execution-v2 file",
             Self::KIND
@@ -163,7 +172,11 @@ impl TraceDefinition for TextGenerationDefinition {
         })
     }
 
-    fn parse_execution_v2(row: &Row<'_>, session: SessionInput) -> Result<Self> {
+    fn parse_execution_v2(
+        row: &Row<'_>,
+        session: SessionInput,
+        decoding: DecodingStrategy,
+    ) -> Result<Self> {
         // `input_len` may be zero when a prefix exists: a round that appends
         // nothing still re-sends its whole conversation, and still prefills
         // whatever part of that prefix is no longer resident.
@@ -178,7 +191,7 @@ impl TraceDefinition for TextGenerationDefinition {
             prompt_tokens,
             target_output_tokens: positive_u32(row, "output_len")?,
             session,
-            decoding: DecodingStrategy::Standard,
+            decoding,
         })
     }
 }
@@ -367,6 +380,7 @@ fn parse_release(row: &Row<'_>, tags: ParsedTags) -> Result<ReleaseMetadata> {
 /// kind of silent reinterpretation this format exists to prevent.
 fn parse_execution_v2_row<Definition: TraceDefinition>(
     row: &Row<'_>,
+    declaration: &TraceDeclaration,
     session_start_times: &mut HashMap<u32, Time>,
     identities: &mut SourceIdentities,
 ) -> Result<ScheduledRequest<Definition>> {
@@ -410,10 +424,24 @@ fn parse_execution_v2_row<Definition: TraceDefinition>(
         session_start_time,
         declared_prefix_tokens,
     };
+    // The canonical format supplies the session tag itself, but the orthogonal
+    // ones are the file's own declaration and must be read here too. Reading a
+    // column and dropping it would let a trace set deadlines that the run it is
+    // compared against silently ignored.
+    let scheduling = if declaration.carries(TraceTag::Slo) {
+        parse_scheduling(row)?
+    } else {
+        SchedulingDeclaration::default()
+    };
+    let decoding = if declaration.carries(TraceTag::Speculative) {
+        parse_decoding(row)?
+    } else {
+        DecodingStrategy::Standard
+    };
     Ok(ScheduledRequest {
         release,
-        scheduling: SchedulingDeclaration::default(),
-        definition: Definition::parse_execution_v2(row, session)?,
+        scheduling,
+        definition: Definition::parse_execution_v2(row, session, decoding)?,
     })
 }
 
@@ -748,6 +776,7 @@ pub(super) fn load_file<Definition: TraceDefinition>(
         if declaration.source_schema == SourceSchema::SessionExecutionV2 {
             output.push(parse_execution_v2_row::<Definition>(
                 &row,
+                declaration,
                 session_start_times,
                 identities,
             )?);
