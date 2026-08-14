@@ -23,7 +23,8 @@ use simulator::deployment::{build_flow, RunConfig};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
 use simulator::sim::{
-    run_sim, ArrivalMode, CapacityLimit, LoadedTrace, SessionDependency, TickCfg, TraceDeclaration,
+    run_sim, ArrivalSchedule, CapacityLimit, LoadedTrace, SessionDependency, TickCfg,
+    TraceDeclaration,
 };
 use simulator::timing::PerfApiBridge;
 
@@ -176,7 +177,7 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
         &workload.trace_tags,
         &workload.trace_source_schema,
     )?;
-    let arrival = ArrivalMode::parse(&workload.arrival_mode, workload.request_rate)?;
+    let arrival = ArrivalSchedule::parse(&workload.arrival_mode, workload.request_rate)?;
     let capacity = CapacityLimit::parse(workload.max_concurrency.map(|n| n as usize))?;
     let session_dependency = SessionDependency::parse(&workload.session_dependency)?;
     let loaded_trace = LoadedTrace::load(

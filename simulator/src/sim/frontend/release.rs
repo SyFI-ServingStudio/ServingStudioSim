@@ -22,39 +22,41 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use super::ReleaseMetadata;
 use crate::common::{RequestId, Time};
 
-/// When a new top-level unit becomes eligible to enter.
+pub use req_frontend::release::ArrivalMode;
+
+/// VibeSim's resolved pacing input.
+///
+/// [`ArrivalMode`] is the shared cross-consumer choice. The rate stays beside
+/// it here because VibeSim stores rate-1-normalized arrivals, while the measured
+/// client rescales a trace from its observed absolute rate.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ArrivalMode {
-    /// Replay the trace's own arrival timeline: a unit cannot enter before its
-    /// materialized arrival, rescaled by `request_rate`.
-    TraceTimed { request_rate: f64 },
-    /// Ignore the timeline: every unit is eligible from the start, so the only
-    /// thing pacing the run is capacity and completion.
-    Saturated,
+pub struct ArrivalSchedule {
+    mode: ArrivalMode,
+    request_rate: f64,
 }
 
-impl ArrivalMode {
-    pub const CHOICES: &'static [&'static str] = &["trace_timed", "saturated"];
+impl ArrivalSchedule {
+    pub const CONFIG_CHOICES: &'static [&'static str] = ArrivalMode::CONFIG_CHOICES;
 
-    /// Build from the declared name plus the payload the flat config carries
-    /// beside it. `request_rate` is read by `trace_timed` and ignored by
-    /// `saturated`, which has no timeline to rescale.
     pub fn parse(name: &str, request_rate: f64) -> Result<Self> {
-        Ok(match name {
-            "trace_timed" => Self::TraceTimed { request_rate },
-            "saturated" => Self::Saturated,
-            "open_loop" | "closed_loop" => bail!(
-                "replay_pacing {name:?} has been replaced: arrival and capacity are now \
-                 separate axes. Use arrival_mode: trace_timed (was open_loop), or \
-                 arrival_mode: saturated with max_concurrency (was closed_loop). The \
-                 combination they could not express — replaying the timeline under a \
-                 concurrency cap — is now available."
-            ),
-            other => bail!(
-                "unknown arrival_mode {other:?} (expected one of {:?})",
-                Self::CHOICES
-            ),
-        })
+        let mode = ArrivalMode::parse_config(name)?;
+        if mode == ArrivalMode::TraceTimed && !(request_rate.is_finite() && request_rate > 0.0) {
+            bail!("request_rate must be finite and > 0 (got {request_rate})");
+        }
+        Ok(Self { mode, request_rate })
+    }
+
+    pub fn trace_timed(request_rate: f64) -> Result<Self> {
+        Self::parse("trace_timed", request_rate)
+    }
+
+    pub fn saturated() -> Self {
+        Self {
+            mode: ArrivalMode::Saturated,
+            // Unused in saturated mode; finite so debugging never shows a
+            // sentinel value that resembles a real arithmetic failure.
+            request_rate: 1.0,
+        }
     }
 }
 
@@ -117,7 +119,7 @@ impl SessionDependency {
 
 #[derive(Debug)]
 pub(super) struct ReplayScheduler {
-    arrival: ArrivalMode,
+    arrival: ArrivalSchedule,
     capacity: CapacityLimit,
     dependency: SessionDependencyState,
     active: ActiveUnits,
@@ -245,7 +247,7 @@ enum SessionDependencyState {
 
 impl ReplayScheduler {
     pub(super) fn new(
-        arrival: ArrivalMode,
+        arrival: ArrivalSchedule,
         capacity: CapacityLimit,
         dependency: SessionDependency,
         releases: &[ReleaseMetadata],
@@ -299,7 +301,7 @@ impl ReplayScheduler {
         let (index, mut release_time) = match &mut self.dependency {
             SessionDependencyState::Independent { cursor } => {
                 let release = releases.get(*cursor)?;
-                let release_time = self.arrival.release_time(release, now)?;
+                let release_time = release_time(self.arrival, release, now)?;
                 if !admits_new_unit {
                     self.capacity_deferred = true;
                     return None;
@@ -340,7 +342,7 @@ impl ReplayScheduler {
                     }
                     // Arrival is checked before capacity so that a unit that has
                     // not arrived yet is never recorded as capacity-deferred.
-                    let release_time = self.arrival.release_time(release, now)?;
+                    let release_time = release_time(self.arrival, release, now)?;
                     if !admits_new_unit {
                         self.capacity_deferred = true;
                         return None;
@@ -402,15 +404,13 @@ impl ReplayScheduler {
     }
 }
 
-impl ArrivalMode {
-    fn release_time(self, release: &ReleaseMetadata, now: Time) -> Option<Time> {
-        match self {
-            Self::TraceTimed { request_rate } => {
-                let due = effective_arrival(release.trace_arrival_time_ms, request_rate);
-                (due <= now).then_some(due)
-            }
-            Self::Saturated => Some(now),
+fn release_time(arrival: ArrivalSchedule, release: &ReleaseMetadata, now: Time) -> Option<Time> {
+    match arrival.mode {
+        ArrivalMode::TraceTimed => {
+            let due = effective_arrival(release.trace_arrival_time_ms, arrival.request_rate);
+            (due <= now).then_some(due)
         }
+        ArrivalMode::Saturated => Some(now),
     }
 }
 

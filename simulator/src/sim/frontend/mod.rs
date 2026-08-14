@@ -26,7 +26,7 @@ use schema::TraceDefinition;
 pub use arrival::{
     ReleaseMetadata, ScheduledRequest, SchedulingDeclaration, SessionReleaseMetadata,
 };
-pub use release::{ArrivalMode, CapacityLimit, SessionDependency};
+pub use release::{ArrivalMode, ArrivalSchedule, CapacityLimit, SessionDependency};
 pub use schema::{SourceIdentities, SourceSchema, TraceDeclaration, TraceKind, TraceTag};
 
 /// Typed immutable requests plus a definition-blind replay scheduler.
@@ -129,7 +129,7 @@ impl TraceFrontend<TextGenerationDefinition> {
     pub fn load(
         files: &[PathBuf],
         declaration: &TraceDeclaration,
-        arrival: ArrivalMode,
+        arrival: ArrivalSchedule,
         capacity: CapacityLimit,
         session_dependency: SessionDependency,
     ) -> Result<Self> {
@@ -198,7 +198,7 @@ impl LoadedTrace {
     pub fn load(
         files: &[PathBuf],
         declaration: &TraceDeclaration,
-        arrival: ArrivalMode,
+        arrival: ArrivalSchedule,
         capacity: CapacityLimit,
         session_dependency: SessionDependency,
     ) -> Result<Self> {
@@ -297,14 +297,14 @@ fn unsupported_family<Definition>(kind: &str) -> Result<Definition> {
 fn load_typed<Definition: TraceDefinition>(
     files: &[PathBuf],
     declaration: &TraceDeclaration,
-    arrival: ArrivalMode,
+    arrival: ArrivalSchedule,
     capacity: CapacityLimit,
     session_dependency: SessionDependency,
 ) -> Result<TraceFrontend<Definition>> {
     if files.is_empty() {
         bail!("no trace files given (--trace-files)");
     }
-    validate_replay(arrival, session_dependency, declaration)?;
+    validate_replay(session_dependency, declaration)?;
     let mut scheduled_requests = Vec::new();
     let mut session_start_times = std::collections::HashMap::new();
     let mut source_identities = schema::SourceIdentities::default();
@@ -343,13 +343,9 @@ fn load_typed<Definition: TraceDefinition>(
 /// declares no sessions. Checking it here rather than at the config call site
 /// means every caller is covered, tests included.
 fn validate_replay(
-    arrival: ArrivalMode,
     session_dependency: SessionDependency,
     declaration: &TraceDeclaration,
 ) -> Result<()> {
-    if let ArrivalMode::TraceTimed { request_rate } = arrival {
-        require_rate(request_rate)?;
-    }
     if session_dependency == SessionDependency::Chained
         && !declaration.tags.contains(&TraceTag::Session)
     {
@@ -357,14 +353,6 @@ fn validate_replay(
             "session_dependency: chained needs the `session` trace tag — without \
              session columns there are no rounds to chain"
         );
-    }
-    Ok(())
-}
-
-/// Guards the only payload `trace_timed` carries.
-fn require_rate(request_rate: f64) -> Result<()> {
-    if !(request_rate.is_finite() && request_rate > 0.0) {
-        bail!("request_rate must be finite and > 0 (got {request_rate})");
     }
     Ok(())
 }
@@ -618,8 +606,8 @@ mod tests {
         TraceDeclaration::parse(kind, &tags).unwrap()
     }
 
-    fn open_loop(rate: f64) -> ArrivalMode {
-        ArrivalMode::TraceTimed { request_rate: rate }
+    fn open_loop(rate: f64) -> ArrivalSchedule {
+        ArrivalSchedule::trace_timed(rate).unwrap()
     }
 
     /// No cap — the shape most tests want, where only arrival paces the run.
@@ -633,10 +621,11 @@ mod tests {
 
     /// Load a plain text trace open-loop — the shape most tests want.
     fn load_text(paths: &[PathBuf], rate: f64) -> Result<TraceFrontend> {
+        let arrival = ArrivalSchedule::trace_timed(rate)?;
         TraceFrontend::load(
             paths,
             &TraceDeclaration::text(),
-            open_loop(rate),
+            arrival,
             uncapped(),
             SessionDependency::Independent,
         )
@@ -777,7 +766,7 @@ mod tests {
         let mut fe = TraceFrontend::load(
             &[path],
             &TraceDeclaration::text(),
-            ArrivalMode::Saturated,
+            ArrivalSchedule::saturated(),
             capped(2),
             SessionDependency::Independent,
         )
@@ -838,7 +827,7 @@ mod tests {
         let mut fe = TraceFrontend::load(
             &[path],
             &declare("text_generation", &["session"]),
-            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            open_loop(1.0),
             uncapped(),
             SessionDependency::Chained,
         )
@@ -874,7 +863,7 @@ mod tests {
         let mut fe = TraceFrontend::load(
             &[path],
             &declare("text_generation", &["session"]),
-            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            open_loop(1.0),
             uncapped(),
             SessionDependency::Chained,
         )
@@ -916,7 +905,7 @@ mod tests {
         let mut frontend = TraceFrontend::load(
             &[path],
             &declare("text_generation", &["session"]),
-            ArrivalMode::Saturated,
+            ArrivalSchedule::saturated(),
             capped(2),
             SessionDependency::Chained,
         )
@@ -971,7 +960,7 @@ mod tests {
         let mut frontend = TraceFrontend::load(
             &[path],
             &declare("text_generation", &["session"]),
-            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            open_loop(1.0),
             capped(2),
             SessionDependency::Chained,
         )
@@ -1023,7 +1012,7 @@ mod tests {
         let mut frontend = TraceFrontend::load(
             &[path],
             &declare("text_generation", &["session"]),
-            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            open_loop(1.0),
             capped(1),
             SessionDependency::Chained,
         )
@@ -1077,7 +1066,7 @@ mod tests {
         let mut chained = TraceFrontend::load(
             &[chained],
             &declare("text_generation", &["session"]),
-            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            open_loop(1.0),
             uncapped(),
             SessionDependency::Chained,
         )
@@ -1102,7 +1091,7 @@ mod tests {
         let err = TraceFrontend::load(
             &[path],
             &TraceDeclaration::text(),
-            ArrivalMode::TraceTimed { request_rate: 1.0 },
+            open_loop(1.0),
             uncapped(),
             SessionDependency::Chained,
         )
@@ -1119,7 +1108,9 @@ mod tests {
     #[test]
     fn retired_pacing_names_are_rejected_with_their_replacement() {
         for retired in ["open_loop", "closed_loop"] {
-            let err = ArrivalMode::parse(retired, 1.0).unwrap_err().to_string();
+            let err = ArrivalSchedule::parse(retired, 1.0)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("arrival_mode"), "{err}");
             assert!(err.contains("separate axes"), "{err}");
         }
@@ -1127,8 +1118,8 @@ mod tests {
 
     #[test]
     fn every_advertised_replay_axis_value_parses() {
-        for name in ArrivalMode::CHOICES {
-            ArrivalMode::parse(name, 1.0).unwrap();
+        for name in ArrivalSchedule::CONFIG_CHOICES {
+            ArrivalSchedule::parse(name, 1.0).unwrap();
         }
         for name in SessionDependency::CHOICES {
             SessionDependency::parse(name).unwrap();
@@ -1139,8 +1130,8 @@ mod tests {
             CapacityLimit::unlimited()
         );
         assert!(CapacityLimit::parse(Some(4)).is_ok());
-        assert!(ArrivalMode::parse("teleport", 1.0).is_err());
-        assert!(ArrivalMode::parse("session_chain", 1.0).is_err());
+        assert!(ArrivalSchedule::parse("teleport", 1.0).is_err());
+        assert!(ArrivalSchedule::parse("session_chain", 1.0).is_err());
         assert!(SessionDependency::parse("causal-ish").is_err());
         assert!(SessionDependency::parse("session_chain").is_err());
     }

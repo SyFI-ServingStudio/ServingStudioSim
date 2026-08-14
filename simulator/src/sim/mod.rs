@@ -7,7 +7,7 @@ pub mod repro;
 pub mod run;
 
 pub use frontend::{
-    ArrivalMode, CapacityLimit, LoadedTrace, ReleaseMetadata, ScheduledRequest,
+    ArrivalMode, ArrivalSchedule, CapacityLimit, LoadedTrace, ReleaseMetadata, ScheduledRequest,
     SchedulingDeclaration, SessionDependency, SessionReleaseMetadata, SourceIdentities,
     SourceSchema, TraceDeclaration, TraceFrontend, TraceKind, TraceTag,
 };

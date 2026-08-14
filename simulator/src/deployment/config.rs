@@ -105,7 +105,7 @@ pub struct WorkloadSpec {
     /// trace's own arrival timeline, `saturated` makes every unit eligible at
     /// once. Independent of `max_concurrency`, which caps how many may be
     /// active, and of `session_dependency`, which decides what a unit is.
-    #[param(choices = simulator::sim::ArrivalMode::CHOICES)]
+    #[param(choices = simulator::sim::ArrivalMode::CONFIG_CHOICES)]
     pub arrival_mode: String,
     /// Whether every trace row is independently eligible or later rounds wait
     /// for predecessor completion plus `tool_wait_after_ms`. `chained` requires

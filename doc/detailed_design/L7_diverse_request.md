@@ -115,8 +115,8 @@ ScheduledRequest<OmniGenerationDefinition>
 无法读取或 match request definition。它组合三个独立类型：
 
 ```rust
-ArrivalMode::TraceTimed { request_rate }
-ArrivalMode::Saturated
+ArrivalSchedule::trace_timed(request_rate)
+ArrivalSchedule::saturated()
 
 CapacityLimit { max_active_units: Option<usize> }
 
@@ -124,8 +124,9 @@ SessionDependency::Independent
 SessionDependency::Chained
 ```
 
-`ArrivalMode` 决定 release time 从哪来；`CapacityLimit` 决定同时能有几个 unit 活着；
-`SessionDependency` 决定一行是否必须等待同 session predecessor completion +
+共享 crate 的 `ArrivalMode` 决定 release time 从哪来；VibeSim 的
+`ArrivalSchedule` 只额外携带 rate-1-normalized trace 所需的 `request_rate` 算术。
+`CapacityLimit` 决定同时能有几个 unit 活着；`SessionDependency` 决定一行是否必须等待同 session predecessor completion +
 `tool_wait_after_ms`。三轴全组合合法 —— 尤其 `trace_timed + max_concurrency`：
 按录制时间线回放、同时限制并发，这是真实 workload，此前被熔在一起的
 `ReplayPacing` 表达不了。
