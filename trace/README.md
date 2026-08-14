@@ -61,10 +61,10 @@ uv run python artifacts/trace_facts/csv_export/convert.py \
 #    -> sha256 f09b79435bcba218a0aeac26784d0b95cb2270e4d16907bbcbcdb649f5029c5c
 
 # 3. Materialize, from alignment/load_generator/req-frontend.
-cargo run --release --bin tracegen -- \
+cargo run --release --bin tracegen -- coding-session \
   --source "$TMPDIR/raw_rounds.csv" --policy monotonic \
   --out <repo>/trace/tracelab_preserving.csv
-cargo run --release --bin tracegen -- \
+cargo run --release --bin tracegen -- coding-session \
   --source "$TMPDIR/raw_rounds.csv" --policy trace-reported \
   --out <repo>/trace/tracelab_reported.csv
 ```

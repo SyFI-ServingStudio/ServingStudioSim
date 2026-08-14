@@ -114,7 +114,8 @@ cache number. To ask the other question, generate the other trace:
 
 ```bash
 cargo run --release --manifest-path replay/Cargo.toml --bin tracegen -- \
-  --source raw_sessions.csv --policy monotonic --out trace/execution.csv
+  coding-session --source raw_sessions.csv --policy monotonic \
+  --out trace/execution.csv
 ```
 
 Both backends carry the model's real output token IDs forward. With `openai`
