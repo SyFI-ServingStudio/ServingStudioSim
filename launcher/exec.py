@@ -16,16 +16,39 @@ from __future__ import annotations
 
 import asyncio
 import os
+import selectors
 import shutil
 import subprocess
 import sys
 import sysconfig
+import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARALLELISM = 200
+
+
+async def _run_in_polling_thread[Result](function: Callable[[], Result]) -> Result:
+    """Run blocking process work without registering an asyncio child watcher."""
+
+    result: Future[Result] = Future()
+
+    def invoke() -> None:
+        try:
+            result.set_result(function())
+        except BaseException as error:
+            result.set_exception(error)
+
+    worker_thread = threading.Thread(target=invoke, daemon=True)
+    worker_thread.start()
+    while not result.done():
+        await asyncio.sleep(0.05)
+    worker_thread.join()
+    return result.result()
 
 
 def binary_path(build_type: str = "debug") -> Path:
@@ -192,45 +215,71 @@ def cargo_build_analyzer(build_type: str = "debug") -> bool:
         analyzer_cmd.append("--release")
     elif build_type != "debug":
         analyzer_cmd.extend(["--profile", build_type])
-    return subprocess.run(
-        analyzer_cmd,
-        cwd=REPO_ROOT,
-        env=_cargo_build_env(),
-    ).returncode == 0
-
-
-async def _run_capture(argv: list[str]) -> tuple[int, str]:
-    """Spawn `argv` (cwd=REPO_ROOT), await it, return (returncode, combined
-    stdout+stderr). Async so the sweep's event loop keeps pumping other runs while
-    this one's analysis runs — unlike a blocking `subprocess.run`."""
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=REPO_ROOT,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+    return (
+        subprocess.run(
+            analyzer_cmd,
+            cwd=REPO_ROOT,
+            env=_cargo_build_env(),
+        ).returncode
+        == 0
     )
-    out, _ = await proc.communicate()
-    return proc.returncode, out.decode(errors="replace")
 
 
 def _run_capture_sync(argv: list[str]) -> tuple[int, str]:
     """Run one sequential launcher stage and capture its combined output.
 
-    Alignment analysis is a one-shot compute -> render pipeline, not a sweep.
-    Keep it outside the async subprocess machinery: the renderer creates its own
-    process pool, and nesting that pool under ``asyncio`` pipe/child-watcher
-    bookkeeping can leave the one-shot CLI waiting after every child has exited.
-    Simulation sweeps continue to use :func:`_run_capture` and
-    :class:`SimulationRunner` for their required concurrency.
+    Completion belongs to the direct child. Profiler or renderer descendants may
+    inherit stdout, so waiting for pipe EOF can hang after the requested command
+    has already exited.
     """
-    result = subprocess.run(
+    process = subprocess.Popen(
         argv,
         cwd=REPO_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        check=False,
     )
-    return result.returncode, result.stdout.decode(errors="replace")
+    captured_output = bytearray()
+    return_code = _consume_until_direct_child_exit(process, captured_output.extend)
+    return return_code, captured_output.decode(errors="replace")
+
+
+def _consume_until_direct_child_exit(
+    process: subprocess.Popen[bytes],
+    consume_chunk: Callable[[bytes], object],
+) -> int:
+    """Drain available output while treating only ``process`` as lifecycle owner."""
+
+    assert process.stdout is not None
+    output_selector = selectors.DefaultSelector()
+    output_selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        while process.poll() is None:
+            if not output_selector.get_map():
+                return process.wait()
+            for selector_key, _event_mask in output_selector.select(timeout=0.1):
+                output_chunk = os.read(selector_key.fd, 64 * 1024)
+                if output_chunk:
+                    consume_chunk(output_chunk)
+                else:
+                    output_selector.unregister(selector_key.fileobj)
+
+        # Drain bytes already queued by the direct child without waiting for an
+        # inherited descriptor to reach EOF in a descendant.
+        while output_selector.get_map():
+            ready_events = output_selector.select(timeout=0)
+            if not ready_events:
+                break
+            for selector_key, _event_mask in ready_events:
+                output_chunk = os.read(selector_key.fd, 64 * 1024)
+                if output_chunk:
+                    consume_chunk(output_chunk)
+                else:
+                    output_selector.unregister(selector_key.fileobj)
+        assert process.returncode is not None
+        return process.returncode
+    finally:
+        output_selector.close()
+        process.stdout.close()
 
 
 async def run_analysis(
@@ -266,7 +315,7 @@ async def run_analysis(
 
     async def _timed_step(section: str, argv: list[str]) -> int:
         t0 = time.perf_counter()
-        rc, out = await _run_capture(argv)
+        rc, out = await _run_in_polling_thread(lambda: _run_capture_sync(argv))
         _append(section, out, (time.perf_counter() - t0) * 1e3)
         return rc
 
@@ -421,7 +470,9 @@ async def run_iter_breakdown(log_dir: Path, build_type: str = "debug") -> None:
     if not analyzer.exists():
         print(f"[analyze] {analyzer} not built; skipping iter-breakdown for {log_dir}")
         return
-    rc, out = await _run_capture([str(analyzer), "gen-iter-breakdown", str(log_dir)])
+    rc, out = await _run_in_polling_thread(
+        lambda: _run_capture_sync([str(analyzer), "gen-iter-breakdown", str(log_dir)])
+    )
     stdout_log = log_dir / "stdout.log"
     if out:
         with stdout_log.open("a") as fh:
@@ -439,27 +490,35 @@ class SimulationRunner:
     argv: list[str]
     log_dir: Path
     env: dict[str, str] = field(default_factory=_build_subprocess_env)
-    _proc: asyncio.subprocess.Process | None = field(default=None, init=False, repr=False)
+    _proc: subprocess.Popen[bytes] | None = field(default=None, init=False, repr=False)
 
     async def run(self) -> bool:
-        """Spawn, stream stdout/stderr to `stdout.log`, return success."""
+        """Spawn and stream output while preserving sweep-level concurrency."""
+
+        return await _run_in_polling_thread(self._run_sync)
+
+    def _run_sync(self) -> bool:
+        """Own the direct simulator child and return when that child exits."""
+
         self.log_dir.mkdir(parents=True, exist_ok=True)
         stdout_log = self.log_dir / "stdout.log"
-        self._proc = await asyncio.create_subprocess_exec(
-            *self.argv,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+        self._proc = subprocess.Popen(
+            self.argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             cwd=REPO_ROOT,
             env=self.env,
         )
-        assert self._proc.stdout is not None
-        with stdout_log.open("w") as fh:
-            async for line_bytes in self._proc.stdout:
-                fh.write(line_bytes.decode(errors="replace"))
-                fh.flush()
-        return await self._proc.wait() == 0
+        with stdout_log.open("wb") as output_stream:
+
+            def write_output(output_chunk: bytes) -> None:
+                output_stream.write(output_chunk)
+                output_stream.flush()
+
+            return_code = _consume_until_direct_child_exit(self._proc, write_output)
+        return return_code == 0
 
     def cancel(self) -> None:
-        if self._proc and self._proc.returncode is None:
+        if self._proc and self._proc.poll() is None:
             self._proc.kill()

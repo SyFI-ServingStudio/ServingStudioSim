@@ -234,7 +234,7 @@ struct KernelLaunch {
     correlation_id: Option<u64>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct IterationKernelAggregate {
     phase: String,
     sequence_id: String,
@@ -268,8 +268,11 @@ struct PhaseSummary {
 /// `alignment-timeline` payload so the two can never disagree about what was
 /// measured — only about what they do with it.
 struct IterationMeasurement {
-    /// One entry per `{phase}/{row_id}`, ordered by first launch start.
+    /// Logical occurrences ordered by first launch start. Mapped rows with the
+    /// same semantic-operation ordinal are joined across folded rank sequences.
     kernels: Vec<(String, IterationKernelAggregate)>,
+    /// Exact folded-sequence rows retained for mapping and inventory audits.
+    inventory_kernels: Vec<(String, IterationKernelAggregate)>,
     phase_summaries: Vec<PhaseSummary>,
     device_ids: BTreeSet<i64>,
     /// Audit-only union across every rank and phase.
@@ -411,7 +414,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         // unmapped-kernel audit. Both are order-insensitive (their durations go
         // through `interval_union_ns`, which sorts), so folding per row here is
         // equivalent to folding per launch during the scan.
-        for (aggregate_key, item) in &measurement.kernels {
+        for (aggregate_key, item) in &measurement.inventory_kernels {
             if item.operation.is_none() {
                 let entry = unmapped_measured
                     .entry((item.phase.clone(), item.row_id.clone()))
@@ -436,15 +439,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             aggregate.operation = item.operation.clone();
         }
 
-        // Reduce every measured occurrence across its ranks into one replica
-        // critical-path contribution, then roll those up. Occurrences merge only
-        // the ranks that ran the same kernel sequence, so under data parallelism
-        // a step's rows are split across disjoint rank sets. Those sets run
-        // concurrently and must not be summed. Charge every reduced occurrence
-        // back to each rank that raised it, sum along each rank's own timeline,
-        // then take the slowest rank. With every rank on one sequence each rank
-        // accumulates the identical series in the identical order, so this is
-        // arithmetically identical to the flat sum it replaces.
+        // Reduce every measured logical occurrence across ranks, then charge it
+        // back to each participating rank. `measure_iteration` has already
+        // joined mapped rows that schema-v4 folding split by rank sequence.
         let mut device_ops: BTreeMap<i64, BTreeMap<String, f64>> = BTreeMap::new();
         let mut device_mapped_ms: BTreeMap<i64, f64> = BTreeMap::new();
         let mut device_unmapped_ms: BTreeMap<i64, f64> = BTreeMap::new();
@@ -1095,14 +1092,88 @@ fn measure_iteration(
         }
     }
 
-    let mut kernels: Vec<_> = kernels.into_iter().collect();
-    kernels.sort_by_key(|(_, item)| item.first_start_ns.unwrap_or(u64::MAX));
+    let mut inventory_kernels: Vec<_> = kernels.into_iter().collect();
+    inventory_kernels.sort_by_key(|(_, item)| item.first_start_ns.unwrap_or(u64::MAX));
+    let kernels = join_mapped_occurrences(&inventory_kernels)?;
     Ok(IterationMeasurement {
         kernels,
+        inventory_kernels,
         phase_summaries,
         device_ids,
         busy_union_ms,
     })
+}
+
+/// Reassemble mapped logical occurrences split across schema-v4 rank sequences.
+///
+/// A folded row identifies a sequence shape, not a communicator. Within each
+/// `(device, phase, operation)` timeline, the zero-based ordinal identifies the
+/// logical occurrence shared by other rank sequences. Unmapped rows remain raw
+/// because they have no semantic identity that can justify a join.
+fn join_mapped_occurrences(
+    inventory_kernels: &[(String, IterationKernelAggregate)],
+) -> Result<Vec<(String, IterationKernelAggregate)>> {
+    let mut next_ordinal: BTreeMap<(i64, String, String), usize> = BTreeMap::new();
+    let mut joined_index: BTreeMap<(String, String, usize), usize> = BTreeMap::new();
+    let mut joined = Vec::with_capacity(inventory_kernels.len());
+
+    for (aggregate_key, item) in inventory_kernels {
+        let Some(operation) = item.operation.as_ref() else {
+            joined.push((aggregate_key.clone(), item.clone()));
+            continue;
+        };
+
+        let mut occurrence_ordinal = None;
+        let mut occurrence_devices = BTreeSet::new();
+        for launch in &item.launches {
+            ensure!(
+                occurrence_devices.insert(launch.device_id),
+                "mapped row {:?} contains multiple launches on device {}",
+                item.row_id,
+                launch.device_id,
+            );
+            let next_device_ordinal = next_ordinal
+                .entry((launch.device_id, item.phase.clone(), operation.clone()))
+                .or_default();
+            let device_ordinal = *next_device_ordinal;
+            *next_device_ordinal += 1;
+            ensure!(
+                occurrence_ordinal.map_or(true, |ordinal| ordinal == device_ordinal),
+                "mapped row {:?} has inconsistent per-device occurrence ordinals",
+                item.row_id,
+            );
+            occurrence_ordinal = Some(device_ordinal);
+        }
+        let occurrence_ordinal = occurrence_ordinal.context("mapped row has no launches")?;
+        let occurrence_key = (item.phase.clone(), operation.clone(), occurrence_ordinal);
+
+        if let Some(index) = joined_index.get(&occurrence_key).copied() {
+            let existing: &mut IterationKernelAggregate = &mut joined[index].1;
+            ensure!(
+                existing.name_id == item.name_id
+                    && existing.name == item.name
+                    && existing.category == item.category
+                    && existing.synchronizing == item.synchronizing,
+                "operation {operation:?} occurrence {occurrence_ordinal} maps different kernels across rank sequences",
+            );
+            ensure!(
+                existing.device_ids.is_disjoint(&item.device_ids),
+                "operation {operation:?} occurrence {occurrence_ordinal} repeats a device across rank sequences",
+            );
+            existing.launches.extend(item.launches.iter().copied());
+            existing.device_ids.extend(item.device_ids.iter().copied());
+            existing.first_start_ns = match (existing.first_start_ns, item.first_start_ns) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (left, right) => left.or(right),
+            };
+        } else {
+            joined_index.insert(occurrence_key, joined.len());
+            joined.push((aggregate_key.clone(), item.clone()));
+        }
+    }
+
+    joined.sort_by_key(|(_, item)| item.first_start_ns.unwrap_or(u64::MAX));
+    Ok(joined)
 }
 
 async fn load_sim_cases(
@@ -1379,7 +1450,7 @@ fn compile_inventory(doc: FoldedSequenceDoc) -> Result<CompiledInventory> {
         "labeled kernel sequences schema_version must be 2, 3 or 4"
     );
     ensure!(
-        doc.encoding == "folded-v1",
+        matches!(doc.encoding.as_str(), "folded-v1" | "literal-v1"),
         "unsupported kernel sequence encoding"
     );
     ensure!(
@@ -1908,6 +1979,78 @@ mod tests {
     fn occurrence_single_rank_is_identity() {
         assert_eq!(occurrence_ns(&launches(&[(0, 10, 25)]), false), 15);
         assert_eq!(occurrence_ns(&launches(&[(0, 10, 25)]), true), 15);
+    }
+
+    fn mapped_row(
+        row_id: &str,
+        kernel_launches: &[(i64, u64, u64)],
+        synchronizing: bool,
+    ) -> (String, IterationKernelAggregate) {
+        let kernel_launches = launches(kernel_launches);
+        let device_ids = kernel_launches
+            .iter()
+            .map(|launch| launch.device_id)
+            .collect();
+        (
+            format!("forward/{row_id}"),
+            IterationKernelAggregate {
+                phase: "forward".into(),
+                row_id: row_id.into(),
+                name: "mapped_kernel".into(),
+                name_id: 7,
+                category: "test".into(),
+                operation: Some("moe.combine".into()),
+                synchronizing,
+                first_start_ns: kernel_launches.iter().map(|launch| launch.start_ns).min(),
+                launches: kernel_launches,
+                device_ids,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn synchronizing_occurrence_joins_folded_rank_sequences_before_reduction() {
+        let rows = vec![
+            mapped_row("sequence-a/0", &[(1, 0, 10), (3, 3, 10)], true),
+            mapped_row("sequence-b/0", &[(0, 0, 10), (2, 4, 10)], true),
+        ];
+
+        let joined = join_mapped_occurrences(&rows).unwrap();
+
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].1.device_ids, BTreeSet::from([0, 1, 2, 3]));
+        assert_eq!(occurrence_ns(&joined[0].1.launches, true), 6);
+    }
+
+    #[test]
+    fn independent_occurrence_joins_folded_rank_sequences_before_reduction() {
+        let rows = vec![
+            mapped_row("sequence-a/0", &[(1, 0, 10), (3, 0, 12)], false),
+            mapped_row("sequence-b/0", &[(0, 0, 9), (2, 0, 11)], false),
+        ];
+
+        let joined = join_mapped_occurrences(&rows).unwrap();
+
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].1.device_ids, BTreeSet::from([0, 1, 2, 3]));
+        assert_eq!(occurrence_ns(&joined[0].1.launches, false), 12);
+    }
+
+    #[test]
+    fn occurrence_ordinal_keeps_repeated_collectives_separate() {
+        let rows = vec![
+            mapped_row("sequence-a/0", &[(1, 0, 10), (3, 3, 10)], true),
+            mapped_row("sequence-b/0", &[(0, 0, 10), (2, 4, 10)], true),
+            mapped_row("sequence-a/1", &[(1, 20, 30), (3, 22, 30)], true),
+            mapped_row("sequence-b/1", &[(0, 20, 31), (2, 23, 31)], true),
+        ];
+
+        let joined = join_mapped_occurrences(&rows).unwrap();
+
+        assert_eq!(joined.len(), 2);
+        assert_eq!(occurrence_ns(&joined[0].1.launches, true), 6);
+        assert_eq!(occurrence_ns(&joined[1].1.launches, true), 8);
     }
 
     #[test]

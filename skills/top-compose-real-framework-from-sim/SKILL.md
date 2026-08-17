@@ -1,8 +1,7 @@
 ---
 name: top-compose-real-framework-from-sim
 description: >-
-  Build or optimize a real serving framework from VibeSim evidence through
-  repeated simulation, one measured code trial, and attribution.
+  Build or optimize a real serving framework through repeated simulation, one measured trial, and the Align framework to VibeSim side of operate-run-alignment.
 ---
 
 THIS SKILL IS MAINLY FOR ORCHESTRATOR
@@ -236,8 +235,10 @@ Work directly through existing repo-local VibeSim skills when necessary:
 - use `top-add-new-arch` when VibeSim lacks the model architecture;
 - use `top-add-kernel` when a required kernel/backend is missing;
 - use `operate-run-simulation` for a serving-workload throughput target;
-- use `operate-run-timing-predict` only for explicit fixed-shape building-block
-  comparisons.
+- use `operate-run-timing-predict` for one-iteration timing to get kernel time;
+- use the **Align framework to VibeSim** side of `operate-run-alignment` to align the
+  target with the measured baseline or trial through the same production entry
+  point used by the full model.
 
 First use the simulator to find a strong solution and establish a performance
 target. Confirm that VibeSim supports the exact architecture, kernel semantics,
@@ -349,7 +350,9 @@ the comparison contract. A real-engine limitation discovered here is a finding
 to be fixed in reality — never a reason to adjust the simulation, and never an
 experimental control to be held constant.
 
-**2. Explain from existing artifacts first.** Two causes need separating,
+**2. Explain from existing artifacts first.** Use `operate-run-alignment` to
+produce or resume the shared labeled comparison against the frozen VibeSim
+target. Two causes need separating,
 because they have different fixes and only one moves the simulated breakdown:
 
 - **Fundamental improvement** — the *modeled work itself* is off: a real
@@ -490,5 +493,7 @@ Report:
 
 ## Neighboring workflows
 
-- Techniques: `dev-llm-serving`; kernels: `dev-compose-kernel`; Probe evidence: `operate-profile-serving-run`.
+- Shared VibeSim/framework alignment: `operate-run-alignment`; techniques:
+  `dev-llm-serving`; kernels: `dev-compose-kernel`; phase-level Probe evidence:
+  `operate-profile-serving-run`.
 - Complete reduced model: `dev-build-serving-repetitive-unit`; second-engine comparison: `operate-compare-serving-performance`.

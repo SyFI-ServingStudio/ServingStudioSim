@@ -84,5 +84,6 @@ one has to stay independent of the thing it measures:
   `config.json` alone. It never reads the simulator's kernel tree — a bound
   derived from the sim's own decomposition could not detect the sim doing
   redundant work.
-- **`alignment/`** profiles a real vLLM server under nsys and reconciles the
-  measured kernel timeline against the simulator's, kernel by kernel.
+- **`alignment/`** provides a shared normalized nsys evidence boundary. One
+  direction validates simulator predictions against a real serving profile; the
+  other uses simulator predictions to attribute changes in a real framework.

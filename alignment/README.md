@@ -1,7 +1,12 @@
 # VibeSim Alignment
 
-Alignment validates VibeSim against one measured vLLM run. It is an explicit
-phased workflow; each phase has one config and one disjoint artifact root. The
+Alignment exchanges evidence in both directions: measured framework runs validate
+VibeSim predictions, while VibeSim predictions provide the reference used to
+attribute framework changes. Both directions consume the same normalized Nsight
+evidence; their comparison policies remain separate.
+
+The framework-to-simulator path is an explicit phased workflow; each phase has
+one config and one disjoint artifact root. The
 GPU-cycle duty-cycle correction (`gpu_time_multiplier`) is a pure measured
 quantity: the analyzer's **kernel-align** pass derives it before the simulation,
 and the simulation phase injects it automatically. So `analyze` splits into two
@@ -25,8 +30,8 @@ are resolved relative to the declaring config file.
 alignment/
   runner.py                 measured profile controller
   load_generator/           thin req-frontend invocation adapter
-  profiler/                 vLLM lifecycle and NSYS capture
-  nsys/                     NSYS SQLite normalization and sequence catalog
+  profiler/                 vLLM/SGLang lifecycle and NSYS capture
+  nsys/                     shared NSYS evidence; serving iteration normalization
   timing_predict_input/     measured iteration → generic predictor inputs
 
 launcher/
@@ -41,6 +46,11 @@ analyzer/
 predictor. It receives resolved artifacts from the launcher and writes only
 timing-predict inputs. The analyze launcher alone creates
 `analysis/alignment_manifest.json`.
+
+`alignment/nsys/evidence.py` owns framework-neutral process attribution, NVTX
+ranges, CUDA runtime correlation, kernel classification, and interval arithmetic.
+The serving-specific `alignment/nsys/parse.py` builds iteration semantics on top
+of that shared evidence rather than maintaining a second parser.
 
 ## Phase configs
 

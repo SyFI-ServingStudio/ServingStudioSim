@@ -44,6 +44,14 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .evidence import (
+    kernel_category,
+    load_device_by_global_pid,
+    load_process_rows,
+    load_string_ids,
+    merge_duration_ns,
+    owning_global_pid,
+)
 from .sequence import build_device_kernel_sequences
 
 # Alignment traces require inline, indexed iteration markers. Stage information
@@ -173,59 +181,6 @@ class RangeStats:
         return max(0.0, self.kernel_span_ms - self.busy_ms)
 
 
-def merge_duration_ns(intervals: list[tuple[int, int]]) -> int:
-    """Total wall time covered by a set of [start, end) intervals (union)."""
-    if not intervals:
-        return 0
-    intervals = sorted(intervals)
-    total = 0
-    cur_start, cur_end = intervals[0]
-    for start, end in intervals[1:]:
-        if start > cur_end:
-            total += cur_end - cur_start
-            cur_start, cur_end = start, end
-        elif end > cur_end:
-            cur_end = end
-    total += cur_end - cur_start
-    return total
-
-
-def kernel_category(name: str) -> str:
-    """Map a demangled kernel name to a coarse op category (reference taxonomy)."""
-    lowered = name.lower()
-    if "multimem_all_reduce" in lowered or "cross_device_reduce" in lowered:
-        return "multimem_all_reduce"
-    if "nccl" in lowered:
-        return "nccl_collective"
-    if "fused_moe_kernel" in lowered:
-        return "fused_moe"
-    if "flashattn" in lowered or "flash" in lowered:
-        return "attention"
-    if "act_and_mul" in lowered or "silu" in lowered:
-        return "activation"
-    if "fillfunctor" in lowered:
-        return "fill"
-    if (
-        "moe_align" in lowered
-        or "count_and_sort_expert" in lowered
-        or "moe_sum" in lowered
-        or "topkgating" in lowered
-    ):
-        return "moe_dispatch"
-    if (
-        "reduce_kernel" in lowered
-        or "rms" in lowered
-        or "rsqrt" in lowered
-        or "triton_red" in lowered
-    ):
-        return "norm_reduce"
-    if "nvjet" in lowered or "cutlass" in lowered:
-        return "gemm_or_cutlass"
-    if "memcpy" in lowered or "copy" in lowered:
-        return "copy_other"
-    return "other"
-
-
 def load_metrics(path: Path | None) -> dict[tuple[int, int], dict]:
     """(dp_rank, iteration_index) → vLLM per-iteration metrics row.
 
@@ -293,15 +248,7 @@ def aggregate_metrics_by_iteration(rank_metrics: dict[tuple[int, int], dict]) ->
     grouped: dict[int, list[dict]] = defaultdict(list)
     for (_, iteration), row in sorted(rank_metrics.items()):
         grouped[iteration].append(row)
-    return {
-        iteration: fold_rank_metrics(rows, iteration) for iteration, rows in grouped.items()
-    }
-
-
-def load_string_ids(con: sqlite3.Connection) -> dict[int, str]:
-    return {
-        int(row_id): str(value) for row_id, value in con.execute("SELECT id, value FROM StringIds")
-    }
+    return {iteration: fold_rank_metrics(rows, iteration) for iteration, rows in grouped.items()}
 
 
 def ensure_query_indexes(con: sqlite3.Connection) -> None:
@@ -325,34 +272,6 @@ def ensure_query_indexes(con: sqlite3.Connection) -> None:
     # SQLite DDL is transactional, so an interrupted build cannot leave a
     # partially formed index behind.
     con.commit()
-
-
-def load_device_by_global_pid(con: sqlite3.Connection) -> dict[int, int]:
-    """globalPid → the device its kernels ran on.
-
-    nsys only traces CUDA for the launched process tree, so this is already
-    narrowed to *this* run's kernel-launching processes even though PROCESSES
-    lists every process on the box.
-    """
-    return {
-        int(global_pid): int(device_id)
-        for global_pid, device_id in con.execute(
-            """
-            SELECT globalPid, MIN(deviceId)
-            FROM CUPTI_ACTIVITY_KIND_KERNEL
-            GROUP BY globalPid
-            """
-        )
-    }
-
-
-def load_process_rows(con: sqlite3.Connection) -> list[tuple[int, int, str]]:
-    """(globalPid, pid, name) for every named process in the capture."""
-    return [
-        (int(global_pid), int(pid), str(name))
-        for global_pid, pid, name in con.execute("SELECT globalPid, pid, name FROM PROCESSES")
-        if name is not None
-    ]
 
 
 def load_workers(con: sqlite3.Connection) -> dict[int, Worker]:
@@ -425,7 +344,7 @@ def worker_for_global_tid(workers_by_gtid: dict[int, Worker], global_tid: int) -
     worker = workers_by_gtid.get(int(global_tid))
     if worker is not None:
         return worker
-    return workers_by_gtid.get((int(global_tid) >> 24) << 24)
+    return workers_by_gtid.get(owning_global_pid(int(global_tid)))
 
 
 def window_rows_by_reference_rank(
@@ -460,9 +379,7 @@ def window_rows_by_reference_rank(
         return overlap * 2 > max(row[4] - row[3], 1)
 
     return reference_rows + [
-        row
-        for row in parsed_rows
-        if row[2].device_id != reference_device_id and mostly_inside(row)
+        row for row in parsed_rows if row[2].device_id != reference_device_id and mostly_inside(row)
     ]
 
 
@@ -629,9 +546,7 @@ def attach_kernels_by_correlation(
                     name=kernel_name,
                     category=category,
                     stream_id=int(stream_id),
-                    correlation_id=(
-                        None if correlation_id is None else int(correlation_id)
-                    ),
+                    correlation_id=(None if correlation_id is None else int(correlation_id)),
                 )
             )
     return kernel_rows
@@ -651,9 +566,7 @@ def resolve_dp_rank_by_device(
     observed device belongs to rank 0.
     """
     if not worker_ranks:
-        return {
-            worker.device_id: 0 for worker in workers.values() if worker.device_id is not None
-        }
+        return {worker.device_id: 0 for worker in workers.values() if worker.device_id is not None}
     if tp_size <= 0:
         raise ValueError(f"tp_size must be positive, got {tp_size}")
 
@@ -670,9 +583,7 @@ def resolve_dp_rank_by_device(
         dp_rank = global_rank // tp_size
         existing = dp_rank_by_device.setdefault(worker.device_id, dp_rank)
         if existing != dp_rank:
-            raise ValueError(
-                f"device {worker.device_id} maps to DP ranks {existing} and {dp_rank}"
-            )
+            raise ValueError(f"device {worker.device_id} maps to DP ranks {existing} and {dp_rank}")
     return dp_rank_by_device
 
 
@@ -798,9 +709,7 @@ def align_ranges_into_steps(ranges: list[RangeStats]) -> tuple[list[AlignedStep]
     reference_device_id = sorted(by_device, key=lambda device: (device is None, device))[0]
     reference = by_device[reference_device_id]
 
-    joined: dict[int, list[DeviceStepWindow]] = {
-        window.iteration: [window] for window in reference
-    }
+    joined: dict[int, list[DeviceStepWindow]] = {window.iteration: [window] for window in reference}
     unpaired_by_device: dict[int, int] = {}
     for device_id, windows in by_device.items():
         if device_id == reference_device_id:
@@ -1032,15 +941,6 @@ def summarize_devices(ranges: list[RangeStats], top_n: int = 12) -> dict:
 # owns the anchor rule. Interpreting here would fork that rule in two places.
 # ---------------------------------------------------------------------------
 
-# An nsys globalTid is `globalPid | thread_id` and every globalPid in PROCESSES
-# has its low 24 bits clear, so masking recovers the owning process exactly
-# rather than by proximity search.
-_THREAD_ID_MASK = (1 << 24) - 1
-
-
-def owning_global_pid(global_tid: int) -> int:
-    return global_tid & ~_THREAD_ID_MASK
-
 
 @dataclass(frozen=True)
 class HostThread:
@@ -1233,9 +1133,7 @@ def build_host_timeline(
     }
 
 
-def parse_host_timeline(
-    sqlite_path: Path, window_start_ns: int, window_end_ns: int
-) -> dict:
+def parse_host_timeline(sqlite_path: Path, window_start_ns: int, window_end_ns: int) -> dict:
     """Open the capture and extract the host sidecar for one parsed window."""
     con = sqlite3.connect(str(sqlite_path))
     try:

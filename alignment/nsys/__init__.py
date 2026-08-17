@@ -1,5 +1,6 @@
-"""Nsight Systems ingestion boundary for alignment ground-truth traces.
+"""Shared Nsight Systems evidence boundary for both alignment directions.
 
-Modules here may decode and normalize nsys-owned artifacts. Cross-source
+`evidence` owns framework-neutral process/range/kernel attribution. `parse` adds
+serving-engine iteration semantics for simulator-fidelity analysis. Cross-source
 statistics, report contracts, and plotting remain owned by top-level `analyzer/`.
 """

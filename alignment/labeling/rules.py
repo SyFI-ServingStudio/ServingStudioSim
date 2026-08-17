@@ -19,6 +19,9 @@ name to be disambiguated by, and no others:
     the same job where the neighbour is not labeled: every projection is
     preceded by the same quant kernel, and what separates those quant kernels
     from each other is what ran before *them*;
+  * `before_name` — a fragment of the immediately following kernel's name. It
+    distinguishes identical kernels at repeated layer and one-off model
+    boundaries;
   * `phase` — `forward` / `postprocess` / …, which is what separates the
     q_absorb batched GEMM from the lm_head that reuses the same tile.
 
@@ -54,6 +57,7 @@ class Rule:
     """Suffixes of the simulated slots this operation is compared against."""
     after: str | None = None
     after_name: str | None = None
+    before_name: str | None = None
     phase: str | None = None
     cross_rank: str = "independent"
     overwrite: bool = False
@@ -73,6 +77,7 @@ class Rule:
             "slot_suffixes",
             "after",
             "after_name",
+            "before_name",
             "phase",
             "cross_rank",
             "overwrite",
@@ -94,6 +99,7 @@ class Rule:
             slot_suffixes=tuple(record["slot_suffixes"]),
             after=record.get("after"),
             after_name=record.get("after_name"),
+            before_name=record.get("before_name"),
             phase=record.get("phase"),
             cross_rank=cross_rank,
             overwrite=bool(record.get("overwrite", False)),
@@ -109,6 +115,10 @@ class Rule:
             return False
         if self.after_name is not None and (
             position.previous_name is None or self.after_name not in position.previous_name
+        ):
+            return False
+        if self.before_name is not None and (
+            position.next_name is None or self.before_name not in position.next_name
         ):
             return False
         return True

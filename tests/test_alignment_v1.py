@@ -708,6 +708,32 @@ def test_labeled_sequences_require_explicit_status(tmp_path):
         load_labeled_kernel_sequences(path)
 
 
+def test_labeled_inventory_accepts_literal_encoding(tmp_path):
+    path = tmp_path / "labeled.json"
+    document = _labeled_doc()
+    document["encoding"] = "literal-v1"
+    document["folding_policy"] = {"kind": "none", "source": "label-initialize-unfold"}
+    path.write_text(json.dumps(document))
+
+    normalized = load_labeled_kernel_sequences(path)
+
+    assert normalized["encoding"] == "literal-v1"
+
+
+def test_labeled_inventory_requires_cross_rank_for_unmapped_decisions(tmp_path):
+    path = tmp_path / "labeled.json"
+    document = _labeled_doc()
+    label = document["phases"]["forward"]["unique_sequences"][0]["program"][0]["kernels"][0][
+        "label"
+    ]
+    label.clear()
+    label["status"] = "unmapped"
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(ValueError, match="unmapped label must declare cross_rank"):
+        load_labeled_kernel_sequences(path)
+
+
 def test_labeled_sequences_validate_embedded_operation(tmp_path):
     path = tmp_path / "kernel_sequences_labeled.json"
     doc = _labeled_doc()

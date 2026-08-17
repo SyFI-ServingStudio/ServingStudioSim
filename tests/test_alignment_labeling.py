@@ -15,12 +15,188 @@ from alignment.labeling import (
     Rule,
     apply_rules,
     check,
+    format_coverage,
     load_rules,
     read_coverage,
     slots_ending,
     transfer_labels,
     walk_kernels,
 )
+from alignment.labeling import cli as labeling_cli
+from launcher.alignment_config import load_labeled_kernel_sequences
+
+
+def test_initialize_writes_explicit_unmapped_cross_rank_labels(tmp_path):
+    source = tmp_path / "source.json"
+    output = tmp_path / "labeled.json"
+    source.write_text(
+        json.dumps(
+            {
+                "phases": {
+                    "forward": {
+                        "unique_sequences": [
+                            {
+                                "sequence_id": "sequence_test",
+                                "program": [
+                                    {
+                                        "kernels": [
+                                            {
+                                                "name": "kernel",
+                                                "suggested_category": "other",
+                                            }
+                                        ]
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+    )
+
+    assert labeling_cli.main(["initialize", str(source), str(output)]) == 0
+
+    initialized = json.loads(output.read_text())
+    assert next(walk_kernels(initialized)).label == {
+        "status": "unmapped",
+        "cross_rank": "independent",
+    }
+    assert check(initialized) == []
+
+
+def test_initialize_refuses_to_overwrite_existing_label_decisions(tmp_path):
+    source = tmp_path / "source.json"
+    output = tmp_path / "labeled.json"
+    source.write_text(
+        json.dumps(
+            {
+                "phases": {
+                    "forward": {
+                        "unique_sequences": [
+                            {
+                                "sequence_id": "sequence_test",
+                                "program": [
+                                    {
+                                        "kernels": [
+                                            {
+                                                "name": "kernel",
+                                                "suggested_category": "other",
+                                                "label": {
+                                                    "status": "unmapped",
+                                                    "cross_rank": "independent",
+                                                },
+                                            }
+                                        ]
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+    )
+
+    with pytest.raises(SystemExit):
+        labeling_cli.main(["initialize", str(source), str(output)])
+
+    assert not output.exists()
+
+
+def test_initialize_unfolds_repeats_for_occurrence_specific_boundaries(tmp_path):
+    source = tmp_path / "source.json"
+    output = tmp_path / "labeled.json"
+    source.write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "encoding": "folded-v1",
+                "source_parsed": "profile/parsed.json",
+                "device_ids": [0],
+                "folding_policy": {"kind": "exact_contiguous_repeat"},
+                "phases": {
+                    "forward": {
+                        "unique_sequences": [
+                            {
+                                "sequence_id": "sequence_test",
+                                "occurrences": [{"device_id": 0, "iterations": [7]}],
+                                "expanded_kernel_count": 4,
+                                "program": [
+                                    {
+                                        "repeat": {
+                                            "count": 2,
+                                            "body": {
+                                                "kernels": [
+                                                    {
+                                                        "name": "norm",
+                                                        "suggested_category": "other",
+                                                    },
+                                                    {
+                                                        "name": "projection",
+                                                        "suggested_category": "other",
+                                                    },
+                                                ]
+                                            },
+                                        }
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                },
+            }
+        )
+    )
+
+    assert labeling_cli.main(["initialize", str(source), str(output), "--unfold"]) == 0
+
+    unfolded = json.loads(output.read_text())
+    assert unfolded["encoding"] == "literal-v1"
+    positions = list(walk_kernels(unfolded))
+    assert len(positions) == 4
+    assert all(position.repeat == 1 for position in positions)
+    assert positions[0].next_name == "projection"
+    assert positions[2].next_name == "projection"
+    assert load_labeled_kernel_sequences(output)["encoding"] == "literal-v1"
+
+
+def test_rule_before_name_distinguishes_last_identical_boundary():
+    rule = Rule.from_mapping(
+        {
+            "name": "norm",
+            "before_name": "lm_head",
+            "operation": "main.final_norm",
+            "type": "model",
+            "role": "final norm",
+            "slot_suffixes": ["final_norm"],
+        }
+    )
+    document = {
+        "phases": {
+            "forward": {
+                "unique_sequences": [
+                    {
+                        "sequence_id": "sequence_boundary",
+                        "program": [
+                            {
+                                "kernels": [
+                                    kernel("norm"),
+                                    kernel("qkv"),
+                                    kernel("norm"),
+                                    kernel("lm_head"),
+                                ]
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+
+    positions = list(walk_kernels(document))
+    assert not rule.matches(positions[0])
+    assert rule.matches(positions[2])
 
 
 def kernel(name, label=None):
@@ -287,6 +463,7 @@ def test_coverage_aggregates_the_per_row_unmapped_lists_by_name(tmp_path):
     report.write_text(
         json.dumps(
             {
+                "meta": {"iterations": 3},
                 "mapping": {
                     "coverage": {
                         "measured_duration_fraction": 0.9548,
@@ -303,7 +480,7 @@ def test_coverage_aggregates_the_per_row_unmapped_lists_by_name(tmp_path):
                         {"slot": "a.kv_a_rms_norm", "total_ms": 232.0},
                         {"slot": "b.router_fp32_cast", "total_ms": 222.3},
                     ],
-                }
+                },
             }
         )
     )
@@ -314,7 +491,12 @@ def test_coverage_aggregates_the_per_row_unmapped_lists_by_name(tmp_path):
     ]
     assert coverage.kernels[0].total_ms == pytest.approx(303.1)
     assert coverage.measured_unmapped_ms == pytest.approx(891.0)
+    assert coverage.iteration_count == 3
     assert coverage.slots[0] == ("a.kv_a_rms_norm", 232.0)
+
+    rendered = format_coverage(coverage)
+    assert "891.000 / 19719.000 ms total across 3 iterations" in rendered
+    assert "per-iteration average 297.000 / 6573.000 ms" in rendered
 
 
 def test_transfer_moves_labels_onto_a_re_parsed_inventory_of_the_same_program(document):
@@ -339,9 +521,9 @@ def test_transfer_moves_labels_onto_a_re_parsed_inventory_of_the_same_program(do
 
 def test_transfer_refuses_an_inventory_whose_program_differs(document):
     destination = copy.deepcopy(document)
-    destination["phases"]["forward"]["unique_sequences"][0]["program"][0]["kernels"][0][
-        "name"
-    ] = "some_other_kernel"
+    destination["phases"]["forward"]["unique_sequences"][0]["program"][0]["kernels"][0]["name"] = (
+        "some_other_kernel"
+    )
 
     with pytest.raises(ValueError, match="not the same program"):
         transfer_labels(document, destination)

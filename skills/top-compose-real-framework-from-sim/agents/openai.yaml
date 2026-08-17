@@ -1,4 +1,4 @@
 interface:
   display_name: "Compose Real Framework from Simulation"
   short_description: "Build real serving code from VibeSim evidence"
-  default_prompt: "Use $top-compose-real-framework-from-sim to build and validate a real serving framework against a VibeSim-grounded target."
+  default_prompt: "Use $top-compose-real-framework-from-sim to build and validate a real serving framework against a VibeSim-grounded target, consuming shared alignment evidence from $operate-run-alignment."

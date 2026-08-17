@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import sys
+import time
 
 import pytest
 import yaml
@@ -24,8 +27,10 @@ from launcher.exec import (
     SimulationRunner,
     _build_subprocess_env,
     _cargo_build_env,
+    _run_capture_sync,
     binary_path,
     run_analysis,
+    run_iter_breakdown,
 )
 from launcher.schema import (
     _format_log_dir,
@@ -201,12 +206,12 @@ def test_run_analysis_delegates_both_optimality_modes_to_analyzer(monkeypatch, t
     (log_dir / "stdout.log").write_text("")
     captured_commands: list[list[str]] = []
 
-    async def capture_command(command):
+    def capture_command(command):
         captured_commands.append([str(argument) for argument in command])
         return 0, ""
 
     monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
-    monkeypatch.setattr("launcher.exec._run_capture", capture_command)
+    monkeypatch.setattr("launcher.exec._run_capture_sync", capture_command)
 
     asyncio.run(run_analysis(log_dir, subjects=["optimality"]))
 
@@ -214,6 +219,27 @@ def test_run_analysis_delegates_both_optimality_modes_to_analyzer(monkeypatch, t
         command for command in captured_commands if len(command) > 1 and command[1] == "run"
     ]
     assert analyzer_run_commands == [[str(analyzer_path), "run", str(log_dir), "optimality"]]
+
+
+def test_iter_breakdown_uses_direct_child_capture(monkeypatch, tmp_path):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    log_dir = tmp_path / "prediction"
+    log_dir.mkdir()
+    (log_dir / "stdout.log").write_text("")
+    captured_commands = []
+
+    def capture_command(command):
+        captured_commands.append(command)
+        return 0, "generated\n"
+
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._run_capture_sync", capture_command)
+
+    asyncio.run(run_iter_breakdown(log_dir))
+
+    assert captured_commands == [[str(analyzer_path), "gen-iter-breakdown", str(log_dir)]]
+    assert "generated" in (log_dir / "stdout.log").read_text()
 
 
 # ── validation ──────────────────────────────────────────────────────────────
@@ -1529,6 +1555,70 @@ def test_simulation_runner_captures_stdout(tmp_path):
     ok = asyncio.run(runner.run())
     assert ok is False
     assert (tmp_path / "stdout.log").read_text().strip()
+
+
+def _inherited_stdout_parent_program() -> str:
+    return """
+import pathlib
+import subprocess
+import sys
+
+descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+pathlib.Path(sys.argv[1]).write_text(str(descendant.pid))
+print(sys.argv[2], flush=True)
+"""
+
+
+def _terminate_recorded_process(process_id_path):
+    if not process_id_path.exists():
+        return
+    try:
+        os.kill(int(process_id_path.read_text()), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+def test_simulation_runner_does_not_wait_for_descendant_stdout_eof(tmp_path):
+    descendant_pid_path = tmp_path / "runner-descendant.pid"
+    runner = SimulationRunner(
+        argv=[
+            sys.executable,
+            "-c",
+            _inherited_stdout_parent_program(),
+            str(descendant_pid_path),
+            "direct child complete",
+        ],
+        log_dir=tmp_path,
+        env=os.environ.copy(),
+    )
+
+    started_at = time.monotonic()
+    try:
+        assert asyncio.run(runner.run()) is True
+        assert time.monotonic() - started_at < 5.0
+        assert (tmp_path / "stdout.log").read_text().strip() == "direct child complete"
+    finally:
+        _terminate_recorded_process(descendant_pid_path)
+
+
+def test_sync_capture_does_not_wait_for_descendant_stdout_eof(tmp_path):
+    descendant_pid_path = tmp_path / "capture-descendant.pid"
+    started_at = time.monotonic()
+    try:
+        return_code, output = _run_capture_sync(
+            [
+                sys.executable,
+                "-c",
+                _inherited_stdout_parent_program(),
+                str(descendant_pid_path),
+                "capture complete",
+            ]
+        )
+        assert return_code == 0
+        assert time.monotonic() - started_at < 5.0
+        assert output.strip() == "capture complete"
+    finally:
+        _terminate_recorded_process(descendant_pid_path)
 
 
 # ── resume / --refresh (.complete marker, INV-5) ────────────────────────────

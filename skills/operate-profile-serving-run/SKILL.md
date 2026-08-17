@@ -2,7 +2,8 @@
 name: operate-profile-serving-run
 description: >-
   Capture and attribute a bounded nsys profile of a real LLM-serving process.
-  Not for simulator wallclock, L1 profile DB rows, or the full alignment pipeline.
+  Covers vLLM, SGLang, and framework-owned engines. Not for simulator wallclock,
+  L1 profile DB rows, or the full alignment pipeline.
 ---
 
 # Operate Profile Serving Run
@@ -16,8 +17,8 @@ Three neighbours it is deliberately NOT:
 
 - `operate-profile-sim-speed` — how fast the *simulator binary* executes.
 - `operate-profile-existing-kernel` — filling L1 `profile.db` rows.
-- `operate-run-alignment` — the phased VibeSim↔vLLM alignment pipeline, which
-  measures vLLM in order to correct VibeSim. That is the opposite direction.
+- `operate-run-alignment` — the phased VibeSim↔framework alignment pipeline.
+  It reuses this evidence while keeping alignment comparison policy separate.
 
 For tool-altitude selection (torch profiler vs nsys vs ncu) read
 [`dev-llm-serving/references/tooling/profiler.md`](../dev-llm-serving/references/tooling/profiler.md)
@@ -210,6 +211,20 @@ the kernel table exists, is non-empty, and has rows whose timestamps fall
 *inside* a decode-phase range. An empty or range-disjoint kernel table means the
 capture is unusable — re-capture, do not analyze around the hole.
 
+For launcher-managed SGLang, the CUDA capture boundary and the evidence boundary
+are independent contracts. Every `profile_kind: nsys` capture mode must persist
+both `--alignment-nvtx-ranges` and `--alignment-iteration-records` in the server
+argv. The first makes kernels attributable; the second preserves the batch
+geometry used by normalization and timing-predict. Do not omit either merely
+because CUPTI starts through the profiler API rather than an NVTX trigger.
+
+Set `nsys.analyze_iteration_start/end` explicitly for a short workload and
+verify the values in launch metadata before paying checkpoint-load cost. A
+single formal request may still have reserved req-frontend preflight iterations
+before it; use the engine records to include exactly those observed indices and
+the formal request. Never inherit a long-run window for a short capture: the GPU
+capture can succeed while normalization later selects no evidence.
+
 ## Step 4 — NVTX readiness, and the instrumentation contract
 
 **The readiness test.** Open the capture and ask one question: *can this trace
@@ -286,49 +301,64 @@ Read exported numbers, not screenshots.
 "$NSYS_BIN" export --type sqlite \
   --output <artifact_dir>/steady.sqlite \
   <artifact_dir>/steady.nsys-rep
-uv run python skills/operate-profile-serving-run/scripts/aggregate_nsys.py \
+uv run python -m alignment ranges \
   <artifact_dir>/steady.sqlite \
   --range-prefix '<prefix>.' \
   > <artifact_dir>/steady-ranges.json
 ```
 
-`aggregate_nsys.py` uses only the Python standard library and opens the input
+`alignment.nsys.evidence` uses only the Python standard library and opens the input
 SQLite with `mode=ro`. It creates no tables or indexes and never modifies the
 evidence artifact. It introspects the required tables and columns before
 reading data; a schema mismatch is a hard error, not a partially populated
 report.
+
+The script under this skill remains only a compatibility entrypoint. New
+profiling workflows call `python -m alignment ranges`; do not copy or extend a
+second SQLite parser under a framework repository.
 
 The script deliberately does not assume
 `CUPTI_ACTIVITY_KIND_RUNTIME.globalPid` exists. It:
 
 1. maps each range's `globalTid` into a process namespace from `PROCESSES`
    (including the workspace export's Python-main-thread identity
-   `globalPid + pid`);
+   `globalPid + pid`); when Nsight omits a traced fork child from `PROCESSES`,
+   it accepts the namespace only if the high bits of `globalTid` exactly match
+   a `globalPid` present in the kernel table;
 2. finds runtime calls whose launch start is inside the range on that same
    `globalTid`;
 3. matches kernels by the process-qualified key
    `(resolved globalPid, correlationId)`, so equal correlation IDs from
    different workers cannot cross-join.
 
-CUDA-owning ranges on mapped non-main threads are listed explicitly in
-`thread_diagnostics`; unmapped or ambiguous threads are also listed, with
-runtime calls counted but kernels intentionally left unattributed. Never
-replace an unmapped thread with a guessed process.
+CUDA-owning ranges on mapped non-main threads and exact kernel-namespace
+fallbacks are listed explicitly in `thread_diagnostics`; unmapped or ambiguous
+threads are also listed, with runtime calls counted but kernels intentionally
+left unattributed. Never replace an unmapped thread with a guessed process: the
+fork-child fallback is valid only for an exact namespace equality already
+present in captured CUPTI kernel rows.
 
 The JSON aggregates each fixed range label by occurrence and reports:
 
 - occurrence, runtime-call, and kernel counts;
 - summed host wall time;
 - summed kernel work (individual kernel durations may overlap);
-- GPU-busy time from the **union of kernel intervals clipped to each occurrence
-  before aggregation**;
+- `host_range_kernel_coverage_ns` from the **union of kernel intervals clipped
+  to each occurrence before aggregation**;
+- the full correlated kernel busy union, first-to-last kernel span, and
+  `gpu_idle_within_kernel_span_ns`;
 - nonnegative uncovered host time and GPU-busy fraction.
 
-Because busy intervals are clipped and unioned per occurrence,
-`gpu_busy_fraction` cannot exceed 1.0. `kernel_work_ns` can exceed host wall
-time when kernels overlap or extend past the host range. NVTX labels may be
-nested, so never sum metrics across parent/child levels; compare one stable
-level at a time.
+Because host-coverage intervals are clipped and unioned per occurrence,
+`host_range_kernel_coverage_fraction` cannot exceed 1.0. `kernel_work_ns` can
+exceed host wall time when kernels overlap or extend past the host range. NVTX
+labels may be nested, so never sum metrics across parent/child levels; compare
+one stable level at a time.
+
+`uncovered_host_time_ns` and `gpu_idle_within_kernel_span_ns` answer different
+questions. The former is host range time not covered by clipped GPU execution;
+the latter is a real device bubble between the first and last correlated kernel.
+Never rename or report the former as GPU idle.
 
 For blocking synchronization specifically, aggregate the sync APIs by enclosing
 range (`cudaStreamSynchronize` / `cudaMemcpyAsync`-then-sync / `cudaEventSynchronize`
@@ -345,9 +375,10 @@ vocabulary.
 
 A report is one primary class plus:
 
-1. the evidence rows that establish it (range label, `gpu_busy_time_ns`,
-   `host_wall_time_ns`, `uncovered_host_time_ns`, and counts) — numbers, not
-   impressions;
+1. the evidence rows that establish it (range label,
+   `host_range_kernel_coverage_ns`, `kernel_busy_union_ns`,
+   `gpu_idle_within_kernel_span_ns`, `host_wall_time_ns`, and counts) — numbers,
+   not impressions;
 2. the artifact paths and the provenance block from Step 1;
 3. what remains unattributed, stated explicitly. Unattributed host time is a
    real finding; silently dropping it makes a partial picture look complete.
@@ -401,5 +432,5 @@ do not reason across the difference:
 - The workflow that calls this skill at its Probe step:
   `top-compose-real-framework-from-sim`.
 - Simulator wallclock: `operate-profile-sim-speed`. L1 kernel rows:
-  `operate-profile-existing-kernel`. VibeSim↔vLLM alignment:
+  `operate-profile-existing-kernel`. Bidirectional VibeSim/framework alignment:
   `operate-run-alignment`.

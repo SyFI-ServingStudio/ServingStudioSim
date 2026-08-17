@@ -1,4 +1,4 @@
 interface:
   display_name: "Run Alignment"
-  short_description: "Run bidirectional VibeSim and framework alignment"
-  default_prompt: "Use $operate-run-alignment to run an end-to-end VibeSim-to-framework alignment with explicit producer metadata, logical occurrence reduction, and bidirectional missing-work evidence."
+  short_description: "Produce shared two-way alignment evidence"
+  default_prompt: "Use $operate-run-alignment to produce a shared VibeSim and vLLM or SGLang alignment whose evidence can validate the simulator or guide framework optimization."

@@ -140,6 +140,13 @@ populations so rank skew is auditable, and distinguishes raw `rank_launches` fro
 folded label program is valid only when the parser has proved the exact ordered
 kernel sequence is identical across all participating devices.
 
+Schema-v4 inventories may instead assign different folded sequences to disjoint
+rank subsets in the same iteration. A row ID then identifies a sequence shape,
+not a logical occurrence. For mapped work, the analyzer joins matching
+`(phase, operation, per-device ordinal)` rows across those subsets before the
+cross-rank reduction. It retains the original rows for mapping and unmapped-work
+audits; unmapped rows are never guessed into a logical occurrence.
+
 The alignment trio is separate not by deployment but by **source scope** (see
 below): it reads an alignment manifest instead of a plain run directory.
 
