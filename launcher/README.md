@@ -180,6 +180,7 @@ from the Rust schema.
 deployment: unified              # required; selects which pool roles exist
 workload:                        # run-global workload params
   trace_files: ["trace/smoke.csv"]
+  input_file_format: text-generation-independent
   arrival_mode: trace_timed
   session_dependency: independent
 io:                              # run-global output + logging
@@ -331,6 +332,7 @@ deployment: pd
 workload:
   trace_files:
     - trace/aime_long.csv
+  input_file_format: text-generation-independent
   arrival_mode: trace_timed
   session_dependency: independent
   duration_ms: 20000.0

@@ -139,6 +139,19 @@ mod tests {
         let workload = schema["common"]["workload"]
             .as_array()
             .expect("workload params are an array");
+        let input_file_format = workload
+            .iter()
+            .find(|param| param["name"] == "input_file_format")
+            .expect("the complete input file format is exposed");
+        assert!(input_file_format["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|choice| choice == "text-generation-session-execution-v2"));
+        assert!(workload.iter().all(|param| !matches!(
+            param["name"].as_str(),
+            Some("trace_kind" | "trace_source_schema")
+        )));
         let arrival_mode = workload
             .iter()
             .find(|param| param["name"] == "arrival_mode")

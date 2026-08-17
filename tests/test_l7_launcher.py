@@ -147,10 +147,20 @@ _FIXTURE = {
         "workload": [
             {"name": "trace_files", "type": "path_list", "required": True, "description": ""},
             {
-                "name": "trace_tags",
+                "name": "input_file_format",
+                "type": "string",
+                "required": True,
+                "choices": [
+                    "text-generation-independent",
+                    "text-generation-session-execution-v2",
+                ],
+                "description": "",
+            },
+            {
+                "name": "input_file_tags",
                 "type": "string_list",
                 "required": False,
-                "choices": ["session", "slo", "speculative"],
+                "choices": ["session", "slo", "priority", "speculative"],
                 "description": "",
             },
             {"name": "duration_ms", "type": "float", "default": 5000.0, "description": ""},
@@ -203,6 +213,7 @@ def _base(*, arch=None, worker=None, log_dir="logs/x", **extra):
         "deployment": "unified",
         "workload": {
             "trace_files": ["t.csv"],
+            "input_file_format": "text-generation-independent",
             "arrival_mode": "trace_timed",
             "session_dependency": "independent",
         },
@@ -399,12 +410,15 @@ def test_validate_batch_policy_choices(schema):
 
 def test_validate_list_choices_apply_to_each_element(schema):
     preset = _base()
-    preset["workload"]["trace_tags"] = ["session", "slo"]
+    preset["workload"]["input_file_tags"] = ["session", "slo"]
     assert validate_params(preset, schema) == []
 
-    preset["workload"]["trace_tags"] = ["session", "unknown"]
+    preset["workload"]["input_file_tags"] = ["session", "unknown"]
     errs = validate_params(preset, schema)
-    assert any("trace_tags[1]='unknown'" in error and "not one of" in error for error in errs)
+    assert any(
+        "input_file_tags[1]='unknown'" in error and "not one of" in error
+        for error in errs
+    )
 
 
 def test_v1_v2_derived_collides_with_sweep(schema):
@@ -1213,6 +1227,7 @@ def test_readme_worked_example(schema):
         "deployment": "pd",
         "workload": {
             "trace_files": ["trace/aime_long.csv"],
+            "input_file_format": "text-generation-independent",
             "arrival_mode": "trace_timed",
             "session_dependency": "independent",
         },

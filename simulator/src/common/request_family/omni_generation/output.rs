@@ -3,4 +3,4 @@
 //! Defined in the shared trace crate: the JSON schema of the `output_segments`
 //! column. See [`super::input`].
 
-pub use req_frontend::schema::omni::OmniOutputSpec;
+pub use req_frontend::schema::OmniOutputSpec;

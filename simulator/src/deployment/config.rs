@@ -55,35 +55,21 @@ pub enum LogLevel {
 }
 
 /// Run-global workload / trace inputs.
-fn default_trace_source_schema() -> String {
-    "native".to_string()
-}
-
 #[derive(Debug, Clone, Deserialize, ParamStruct)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadSpec {
     /// Trace CSV files to simulate (runs sequentially).
     pub trace_files: Vec<PathBuf>,
-    /// What every file in `trace_files` is. Declared, never inferred from the
-    /// header: the frontend computes the exact column set this implies and
-    /// rejects any header that differs. One family per run; a native omni model
-    /// uses `omni_generation`, whose rows may themselves contain mixed ordered
-    /// modality segments.
-    #[param(choices = simulator::sim::TraceKind::CHOICES)]
-    pub trace_kind: String,
+    /// Complete format of every file in `trace_files`. The format fixes both
+    /// the request family and its physical row representation; neither is
+    /// inferred from the header or supplied as a second selector.
+    #[param(choices = simulator::sim::InputFileFormat::CHOICES)]
+    pub input_file_format: String,
     /// Cross-cutting disciplines those files also carry (`session`, `slo`,
     /// `speculative`). Each adds its own required columns to the expected set.
     #[serde(default)]
     #[param(choices = simulator::sim::TraceTag::CHOICES)]
-    pub trace_tags: Vec<String>,
-    /// Wire format of those files. `native` is this simulator's own column
-    /// vocabulary; `session-execution-v2` is TraceLab's canonical, already
-    /// materialized execution trace, whose bytes also drive a measured replay.
-    /// The canonical schema implies `text_generation` + the `session` tag and
-    /// rejects any other declaration rather than overriding it.
-    #[serde(default = "default_trace_source_schema")]
-    #[param(choices = simulator::sim::SourceSchema::CHOICES, default = "native")]
-    pub trace_source_schema: String,
+    pub input_file_tags: Vec<String>,
     /// Simulation duration (ms); minimum window when run_to_end is set.
     #[param(default = 5000.0)]
     pub duration_ms: f64,
@@ -290,7 +276,7 @@ mod tests {
     // (G8) — model_config sits flat alongside tp_size under `arch`.
     const UNIFIED_YAML: &str = r#"
 deployment: unified
-workload: { trace_files: ["trace/smoke.csv"], trace_kind: text_generation, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
+workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
 io: { log_dir: "logs/smoke", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   main:
@@ -348,7 +334,7 @@ pools:
         // YAML is a JSON superset; the equivalent JSON must parse identically.
         let json = serde_json::json!({
             "deployment": "unified",
-            "workload": {"trace_files": ["t.csv"], "trace_kind": "text_generation", "arrival_mode": "trace_timed", "session_dependency": "independent", "duration_ms": 5000.0, "run_to_end": true, "request_rate": 10.0},
+            "workload": {"trace_files": ["t.csv"], "input_file_format": "text-generation-independent", "arrival_mode": "trace_timed", "session_dependency": "independent", "duration_ms": 5000.0, "run_to_end": true, "request_rate": 10.0},
             "io": {"log_dir": "logs", "log_level": "info", "quiet": false, "force_cache_build": false, "log_output_token_times": false},
             "pools": {"main": {"placement": "least-queued", "groups": [
                 {"gpu": "H200", "replicas": 1,
@@ -419,7 +405,7 @@ pools:
     fn pd_two_pools_parse() {
         let yaml = r#"
 deployment: pd
-workload: { trace_files: ["t.csv"], trace_kind: text_generation, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   prefill:
@@ -445,7 +431,7 @@ pools:
         // aggregated replica, qwen3_ffn_moe). Mirrors `pd_two_pools_parse`.
         let yaml = r#"
 deployment: afd
-workload: { trace_files: ["t.csv"], trace_kind: text_generation, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   attn:
@@ -489,7 +475,7 @@ pools:
         // DP-attention arch carries two TP degrees; pairs with the hp_unified worker.
         let yaml = r#"
 deployment: unified
-workload: { trace_files: ["t.csv"], trace_kind: text_generation, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   main:

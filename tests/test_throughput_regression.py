@@ -55,7 +55,7 @@ _UNIFIED_PRESET_TEMPLATE = """
 deployment: unified
 workload:
   request_rate: 150.0
-  trace_kind: text_generation
+  input_file_format: text-generation-independent
   arrival_mode: trace_timed
   session_dependency: independent
   run_to_end: true
@@ -76,7 +76,7 @@ _PD_1P32D_PRESET_TEMPLATE = """
 deployment: pd
 workload:
   request_rate: 150.0
-  trace_kind: text_generation
+  input_file_format: text-generation-independent
   arrival_mode: trace_timed
   session_dependency: independent
   run_to_end: true

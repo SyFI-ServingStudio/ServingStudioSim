@@ -54,6 +54,7 @@ This is the normal simulation preset. Its output remains `io.log_dir`:
 deployment: unified
 workload:
   trace_files: [trace/requests.csv]
+  input_file_format: text-generation-independent
   arrival_mode: trace_timed
   session_dependency: independent
 io:

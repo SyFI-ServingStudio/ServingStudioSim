@@ -92,7 +92,8 @@ text-to-image、text-to-video、image-to-video 仍是独立的 step-based family
 
 ## 3. Typed frontend 与 replay 的正交边界
 
-schema 根据 config 的 `trace_kind` 选择 concrete parser，然后直接产出：
+config 用完整的 `input_file_format` 选择 req-frontend concrete loader，并用
+`input_file_tags` 添加正交列束；loader 验证并解析后，VibeSim adapter 直接产出：
 
 ```text
 ScheduledRequest<TextGenerationDefinition>
@@ -103,8 +104,8 @@ ScheduledRequest<OmniGenerationDefinition>
 ...
 ```
 
-每个文件仍是单一 kind，header 必须与声明的 exact schema 完全一致；不会从列名
-猜 kind，也不允许每行携带 kind union。
+每个文件仍是单一 family，family 已由完整 format 确定，header 必须与声明的 exact
+schema 完全一致；不会从列名猜 family，也不允许每行携带 family union。
 
 `ScheduledRequest<Definition>` 拆成四部分：
 

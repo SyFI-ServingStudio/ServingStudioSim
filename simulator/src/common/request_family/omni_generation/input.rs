@@ -4,4 +4,4 @@
 //! `input_segments` column, so the program that writes that column and the
 //! program that reads it cannot be allowed to disagree about it.
 
-pub use req_frontend::schema::omni::OmniInputSegment;
+pub use req_frontend::schema::OmniInputSegment;

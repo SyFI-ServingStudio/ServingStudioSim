@@ -488,7 +488,7 @@ mod tests {
     };
     use crate::sim::frontend::TraceFrontend;
     use crate::sim::frontend::{
-        ArrivalSchedule, CapacityLimit, SessionDependency, TraceDeclaration,
+        ArrivalSchedule, CapacityLimit, InputFileSchema, SessionDependency,
     };
     use crate::test_helpers::{text_request, FakeModel};
     use crate::worker::{build_barebone_worker, WorkerConfig};
@@ -556,7 +556,7 @@ mod tests {
         let mut flow = SimpleDpFlow::new(cfg, factory);
         let mut frontend = TraceFrontend::load(
             &[trace],
-            &TraceDeclaration::text(),
+            &InputFileSchema::text_generation_independent(),
             ArrivalSchedule::trace_timed(1.0).unwrap(),
             CapacityLimit::unlimited(),
             SessionDependency::Independent,
@@ -623,7 +623,7 @@ mod tests {
         let mut flow = SimpleDpFlow::new(cfg, factory);
         let mut frontend = TraceFrontend::load(
             &[trace],
-            &TraceDeclaration::text(),
+            &InputFileSchema::text_generation_independent(),
             ArrivalSchedule::trace_timed(1.0).unwrap(),
             CapacityLimit::unlimited(),
             SessionDependency::Independent,

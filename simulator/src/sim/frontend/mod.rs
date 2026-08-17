@@ -27,7 +27,7 @@ pub use arrival::{
     ReleaseMetadata, ScheduledRequest, SchedulingDeclaration, SessionReleaseMetadata,
 };
 pub use release::{ArrivalMode, ArrivalSchedule, CapacityLimit, SessionDependency};
-pub use schema::{SourceIdentities, SourceSchema, TraceDeclaration, TraceKind, TraceTag};
+pub use schema::{InputFileFormat, InputFileSchema, RequestFamily, SourceIdentities, TraceTag};
 
 /// Typed immutable requests plus a definition-blind replay scheduler.
 #[derive(Debug)]
@@ -76,6 +76,8 @@ impl TraceFrontend<TextGenerationDefinition> {
     pub fn plan_rows(&self) -> Vec<PlanRow> {
         let mut rounds_seen: std::collections::HashMap<u32, usize> =
             std::collections::HashMap::new();
+        let mut previous_request_by_session: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
         let mut rows = Vec::with_capacity(self.scheduled_requests.len());
         for request in &self.scheduled_requests {
             let release = &request.release;
@@ -99,9 +101,8 @@ impl TraceFrontend<TextGenerationDefinition> {
                 .get(release.request_id.0 as usize)
                 .cloned()
                 .unwrap_or_else(|| release.request_id.0.to_string());
-            let predecessor_request_id = round_idx
-                .checked_sub(1)
-                .map(|previous| format!("{source_session_id}_round_{previous:06}"));
+            let predecessor_request_id =
+                previous_request_by_session.insert(session_id, source_request_id.clone());
             rows.push(PlanRow {
                 request_id: source_request_id,
                 session_id: source_session_id,
@@ -128,12 +129,18 @@ impl TraceFrontend<TextGenerationDefinition> {
     /// Public typed loader for the production text family.
     pub fn load(
         files: &[PathBuf],
-        declaration: &TraceDeclaration,
+        input_file_schema: &InputFileSchema,
         arrival: ArrivalSchedule,
         capacity: CapacityLimit,
         session_dependency: SessionDependency,
     ) -> Result<Self> {
-        load_typed(files, declaration, arrival, capacity, session_dependency)
+        load_typed(
+            files,
+            input_file_schema,
+            arrival,
+            capacity,
+            session_dependency,
+        )
     }
 }
 
@@ -197,71 +204,71 @@ pub enum LoadedTrace {
 impl LoadedTrace {
     pub fn load(
         files: &[PathBuf],
-        declaration: &TraceDeclaration,
+        input_file_schema: &InputFileSchema,
         arrival: ArrivalSchedule,
         capacity: CapacityLimit,
         session_dependency: SessionDependency,
     ) -> Result<Self> {
-        Ok(match declaration.kind {
-            TraceKind::TextGeneration => Self::TextGeneration(load_typed(
+        Ok(match input_file_schema.request_family() {
+            RequestFamily::TextGeneration => Self::TextGeneration(load_typed(
                 files,
-                declaration,
+                input_file_schema,
                 arrival,
                 capacity,
                 session_dependency,
             )?),
-            TraceKind::ImageToText => Self::ImageToText(load_typed(
+            RequestFamily::ImageToText => Self::ImageToText(load_typed(
                 files,
-                declaration,
+                input_file_schema,
                 arrival,
                 capacity,
                 session_dependency,
             )?),
-            TraceKind::VideoToText => Self::VideoToText(load_typed(
+            RequestFamily::VideoToText => Self::VideoToText(load_typed(
                 files,
-                declaration,
+                input_file_schema,
                 arrival,
                 capacity,
                 session_dependency,
             )?),
-            TraceKind::AudioToText => Self::AudioToText(load_typed(
+            RequestFamily::AudioToText => Self::AudioToText(load_typed(
                 files,
-                declaration,
+                input_file_schema,
                 arrival,
                 capacity,
                 session_dependency,
             )?),
-            TraceKind::TextToImage => Self::TextToImage(load_typed(
+            RequestFamily::TextToImage => Self::TextToImage(load_typed(
                 files,
-                declaration,
+                input_file_schema,
                 arrival,
                 capacity,
                 session_dependency,
             )?),
-            TraceKind::TextToVideo => Self::TextToVideo(load_typed(
+            RequestFamily::TextToVideo => Self::TextToVideo(load_typed(
                 files,
-                declaration,
+                input_file_schema,
                 arrival,
                 capacity,
                 session_dependency,
             )?),
-            TraceKind::TextToSpeech => Self::TextToSpeech(load_typed(
+            RequestFamily::TextToSpeech => Self::TextToSpeech(load_typed(
                 files,
-                declaration,
+                input_file_schema,
                 arrival,
                 capacity,
                 session_dependency,
             )?),
-            TraceKind::ImageToVideo => Self::ImageToVideo(load_typed(
+            RequestFamily::ImageToVideo => Self::ImageToVideo(load_typed(
                 files,
-                declaration,
+                input_file_schema,
                 arrival,
                 capacity,
                 session_dependency,
             )?),
-            TraceKind::OmniGeneration => Self::OmniGeneration(load_typed(
+            RequestFamily::OmniGeneration => Self::OmniGeneration(load_typed(
                 files,
-                declaration,
+                input_file_schema,
                 arrival,
                 capacity,
                 session_dependency,
@@ -288,7 +295,7 @@ impl LoadedTrace {
 
 fn unsupported_family<Definition>(kind: &str) -> Result<Definition> {
     bail!(
-        "trace_kind {kind:?} parsed as its own request family, but current \
+        "input file format for {kind:?} parsed as its own request family, but current \
          deployments are text_generation-only; add the matching encoder/media \
          worker family before executing this trace"
     )
@@ -296,7 +303,7 @@ fn unsupported_family<Definition>(kind: &str) -> Result<Definition> {
 
 fn load_typed<Definition: TraceDefinition>(
     files: &[PathBuf],
-    declaration: &TraceDeclaration,
+    input_file_schema: &InputFileSchema,
     arrival: ArrivalSchedule,
     capacity: CapacityLimit,
     session_dependency: SessionDependency,
@@ -304,14 +311,14 @@ fn load_typed<Definition: TraceDefinition>(
     if files.is_empty() {
         bail!("no trace files given (--trace-files)");
     }
-    validate_replay(session_dependency, declaration)?;
+    validate_replay(session_dependency, input_file_schema)?;
     let mut scheduled_requests = Vec::new();
     let mut session_start_times = std::collections::HashMap::new();
     let mut source_identities = schema::SourceIdentities::default();
     for file in files {
         schema::load_file(
             file,
-            declaration,
+            input_file_schema,
             &mut session_start_times,
             &mut source_identities,
             &mut scheduled_requests,
@@ -344,10 +351,11 @@ fn load_typed<Definition: TraceDefinition>(
 /// means every caller is covered, tests included.
 fn validate_replay(
     session_dependency: SessionDependency,
-    declaration: &TraceDeclaration,
+    input_file_schema: &InputFileSchema,
 ) -> Result<()> {
     if session_dependency == SessionDependency::Chained
-        && !declaration.tags.contains(&TraceTag::Session)
+        && !input_file_schema.carries(TraceTag::Session)
+        && !input_file_schema.input_file_format.has_session_topology()
     {
         bail!(
             "session_dependency: chained needs the `session` trace tag — without \
@@ -357,7 +365,7 @@ fn validate_replay(
     Ok(())
 }
 
-/// Ids must be sequential `0..N`; `arrival_time` non-decreasing across rows.
+/// Arrival times must be non-decreasing across rows.
 ///
 /// This is a property of the concatenated *list*, not of any one schema, so it
 /// lives here rather than in [`schema`]: ids are the `RequestStore` index and
@@ -366,12 +374,6 @@ fn validate_arrival_order<Definition: RequestDefinition>(
     scheduled_requests: &[ScheduledRequest<Definition>],
 ) -> Result<()> {
     for (index, scheduled_request) in scheduled_requests.iter().enumerate() {
-        if scheduled_request.release.request_id.0 != index as u32 {
-            bail!(
-                "trace row {index} has id={}, expected sequential id={index}",
-                scheduled_request.release.request_id.0
-            );
-        }
         if index > 0
             && scheduled_request.release.trace_arrival_time_ms
                 < scheduled_requests[index - 1].release.trace_arrival_time_ms
@@ -433,16 +435,20 @@ mod tests {
         std::fs::write(
             &path,
             "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms\n\
-             b_round_000000,b,0,0.000000,0,512,64,100.000000\n\
-             b_round_000001,b,1,0.000000,576,0,64,0.000000\n\
-             a_round_000000,a,0,250.000000,0,400,48,0.000000\n",
+             session_b_round_000000,b,0,0.000000,0,512,64,100.000000\n\
+             session_b_round_000001,b,1,0.000000,576,0,64,0.000000\n\
+             session_a_round_000000,a,0,250.000000,0,400,48,0.000000\n",
         )
         .unwrap();
         path
     }
 
-    fn declare_execution_v2() -> TraceDeclaration {
-        TraceDeclaration::parse_with_schema("text_generation", &[], "session-execution-v2").unwrap()
+    fn declare_execution_v2() -> InputFileSchema {
+        InputFileSchema::new(
+            InputFileFormat::TextGenerationSessionExecutionV2,
+            Vec::new(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -467,9 +473,9 @@ mod tests {
         assert_eq!(
             frontend.source_identities().request_source_ids(),
             &[
-                "b_round_000000".to_string(),
-                "b_round_000001".to_string(),
-                "a_round_000000".to_string(),
+                "session_b_round_000000".to_string(),
+                "session_b_round_000001".to_string(),
+                "session_a_round_000000".to_string(),
             ]
         );
     }
@@ -498,7 +504,7 @@ mod tests {
         assert_eq!(plan[1].input_len, 0);
         assert_eq!(
             plan[1].predecessor_request_id.as_deref(),
-            Some("b_round_000000")
+            Some("session_b_round_000000")
         );
         assert_eq!(plan[2].session_id, "a");
         assert_eq!(plan[2].session_arrival_time_ms, "250.000000");
@@ -512,7 +518,7 @@ mod tests {
         std::fs::write(
             &path,
             "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms\n\
-             a_round_000000,a,0,0.000000,128,512,64,0.000000\n",
+             session_a_round_000000,a,0,0.000000,128,512,64,0.000000\n",
         )
         .unwrap();
 
@@ -523,8 +529,8 @@ mod tests {
             uncapped(),
             SessionDependency::Chained,
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let error = format!("{error:#}");
 
         assert!(error.contains("no previous context"), "{error}");
     }
@@ -543,14 +549,13 @@ mod tests {
         std::fs::write(
             &path,
             "request_id,session_id,round_idx,arrival_time_ms,prefix_len,input_len,output_len,tool_wait_after_ms,ttft_slo_ms,tpot_slo_ms,e2e_slo_ms,priority\n\
-             a_round_000000,a,0,0.000000,0,512,64,0.000000,500,20,2000,3\n\
-             a_round_000001,a,1,0.000000,576,0,64,0.000000,,,,0\n",
+             session_a_round_000000,a,0,0.000000,0,512,64,0.000000,500,20,2000,3\n\
+             session_a_round_000001,a,1,0.000000,576,0,64,0.000000,,,,0\n",
         )
         .unwrap();
-        let declaration = TraceDeclaration::parse_with_schema(
-            "text_generation",
-            &["slo".to_string(), "priority".to_string()],
-            "session-execution-v2",
+        let declaration = InputFileSchema::new(
+            InputFileFormat::TextGenerationSessionExecutionV2,
+            vec![TraceTag::Slo, TraceTag::Priority],
         )
         .unwrap();
 
@@ -600,9 +605,24 @@ mod tests {
         assert!(error.contains("round_idx"), "{error}");
     }
 
-    fn declare(kind: &str, tags: &[&str]) -> TraceDeclaration {
-        let tags: Vec<String> = tags.iter().map(|t| (*t).to_string()).collect();
-        TraceDeclaration::parse(kind, &tags).unwrap()
+    fn declare(kind: &str, tags: &[&str]) -> InputFileSchema {
+        let input_file_format = match kind {
+            "text_generation" => InputFileFormat::TextGenerationIndependent,
+            "image_to_text" => InputFileFormat::ImageToTextIndependent,
+            "video_to_text" => InputFileFormat::VideoToTextIndependent,
+            "audio_to_text" => InputFileFormat::AudioToTextIndependent,
+            "text_to_image" => InputFileFormat::TextToImageIndependent,
+            "text_to_video" => InputFileFormat::TextToVideoIndependent,
+            "text_to_speech" => InputFileFormat::TextToSpeechIndependent,
+            "image_to_video" => InputFileFormat::ImageToVideoIndependent,
+            "omni_generation" => InputFileFormat::OmniGenerationIndependent,
+            other => panic!("unsupported test family {other}"),
+        };
+        let tags = tags
+            .iter()
+            .map(|tag| TraceTag::parse(tag).unwrap())
+            .collect();
+        InputFileSchema::new(input_file_format, tags).unwrap()
     }
 
     fn open_loop(rate: f64) -> ArrivalSchedule {
@@ -623,7 +643,7 @@ mod tests {
         let arrival = ArrivalSchedule::trace_timed(rate)?;
         TraceFrontend::load(
             paths,
-            &TraceDeclaration::text(),
+            &InputFileSchema::text_generation_independent(),
             arrival,
             uncapped(),
             SessionDependency::Independent,
@@ -722,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_sequential_ids() {
+    fn maps_opaque_source_ids_to_dense_request_ids() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_csv(
             dir.path(),
@@ -731,7 +751,11 @@ mod tests {
              0,8,2,0.0\n\
              5,8,2,1.0\n",
         );
-        assert!(load_text(&[path], 1.0).is_err());
+        let frontend = load_text(&[path], 1.0).unwrap();
+        assert_eq!(
+            frontend.source_identities().request_source_ids(),
+            &["0".to_string(), "5".to_string()]
+        );
     }
 
     #[test]
@@ -764,7 +788,7 @@ mod tests {
         // arrival, and both are stamped with the admission clock (10ms).
         let mut fe = TraceFrontend::load(
             &[path],
-            &TraceDeclaration::text(),
+            &InputFileSchema::text_generation_independent(),
             ArrivalSchedule::saturated(),
             capped(2),
             SessionDependency::Independent,
@@ -1089,7 +1113,7 @@ mod tests {
         );
         let err = TraceFrontend::load(
             &[path],
-            &TraceDeclaration::text(),
+            &InputFileSchema::text_generation_independent(),
             open_loop(1.0),
             uncapped(),
             SessionDependency::Chained,
@@ -1193,14 +1217,14 @@ mod tests {
         assert_eq!(
             scheduled_request.release.session,
             Some(SessionReleaseMetadata {
-                session_id: 7,
+                session_id: 0,
                 tool_wait_after: Time::from_ms(250.0),
             })
         );
         assert_eq!(
             scheduled_request.definition.session,
             SessionInput::Session {
-                session_id: 7,
+                session_id: 0,
                 session_start_time: Time::from_ms(4.0),
                 declared_prefix_tokens: 512,
             }
@@ -1281,7 +1305,7 @@ mod tests {
         assert_eq!(fe.scheduled_requests[0].scheduling.priority, 0);
         assert_eq!(
             fe.scheduled_requests[1].release.session.unwrap().session_id,
-            4
+            0
         );
     }
 
@@ -1647,7 +1671,9 @@ mod tests {
              0,100,20,0.0,0,0.0,0\n",
         );
         let err = load_text(&[path], 1.0).unwrap_err();
-        assert!(err.to_string().contains("multi-round"));
+        let message = err.to_string();
+        assert!(message.contains("unexpected"), "{message}");
+        assert!(message.contains("round_idx"), "{message}");
     }
 
     /// A clip must have at least one frame; `duration × fps` rounding to zero is
@@ -1670,21 +1696,22 @@ mod tests {
             SessionDependency::Independent,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("must be in 1..=u64::MAX"));
+        assert!(err.to_string().contains("greater than zero"));
     }
 
     // ---- declaration parsing ------------------------------------------------
 
     #[test]
     fn rejects_unknown_declaration_names() {
-        assert!(TraceDeclaration::parse("hologram_output", &[]).is_err());
-        assert!(TraceDeclaration::parse("text_generation", &["vibes".to_string()]).is_err());
+        assert!(InputFileFormat::parse("hologram-output").is_err());
+        assert!(TraceTag::parse("vibes").is_err());
     }
 
     #[test]
     fn rejects_repeated_tag() {
-        let tags = ["session".to_string(), "session".to_string()];
-        let err = TraceDeclaration::parse("text_generation", &tags).unwrap_err();
+        let tags = vec![TraceTag::Session, TraceTag::Session];
+        let err =
+            InputFileSchema::new(InputFileFormat::TextGenerationIndependent, tags).unwrap_err();
         assert!(err.to_string().contains("more than once"));
     }
 
@@ -1692,8 +1719,8 @@ mod tests {
     /// exact strings to config validation.
     #[test]
     fn every_advertised_choice_parses() {
-        for kind in TraceKind::CHOICES {
-            TraceKind::parse(kind).unwrap();
+        for input_file_format in InputFileFormat::CHOICES {
+            InputFileFormat::parse(input_file_format).unwrap();
         }
         for tag in TraceTag::CHOICES {
             TraceTag::parse(tag).unwrap();

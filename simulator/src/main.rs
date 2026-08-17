@@ -23,8 +23,8 @@ use simulator::deployment::{build_flow, RunConfig};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
 use simulator::sim::{
-    run_sim, ArrivalSchedule, CapacityLimit, LoadedTrace, SessionDependency, TickCfg,
-    TraceDeclaration,
+    run_sim, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema, LoadedTrace,
+    SessionDependency, TickCfg, TraceTag,
 };
 use simulator::timing::PerfApiBridge;
 
@@ -172,17 +172,19 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // Parse into a concrete request family and narrow to the currently
     // supported text path before starting the bridge or building L4.
     let workload = cfg.workload();
-    let declaration = TraceDeclaration::parse_with_schema(
-        &workload.trace_kind,
-        &workload.trace_tags,
-        &workload.trace_source_schema,
-    )?;
+    let input_file_format = InputFileFormat::parse(&workload.input_file_format)?;
+    let input_file_tags = workload
+        .input_file_tags
+        .iter()
+        .map(|tag| TraceTag::parse(tag))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let input_file_schema = InputFileSchema::new(input_file_format, input_file_tags)?;
     let arrival = ArrivalSchedule::parse(&workload.arrival_mode, workload.request_rate)?;
     let capacity = CapacityLimit::parse(workload.max_concurrency.map(|n| n as usize))?;
     let session_dependency = SessionDependency::parse(&workload.session_dependency)?;
     let loaded_trace = LoadedTrace::load(
         &workload.trace_files,
-        &declaration,
+        &input_file_schema,
         arrival,
         capacity,
         session_dependency,

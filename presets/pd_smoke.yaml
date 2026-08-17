@@ -3,7 +3,7 @@ deployment: pd
 workload:
   trace_files:
     - trace/smoke.csv
-  trace_kind: text_generation
+  input_file_format: text-generation-independent
   arrival_mode: trace_timed
   session_dependency: independent
   run_to_end: true

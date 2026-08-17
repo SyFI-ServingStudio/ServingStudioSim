@@ -18,8 +18,7 @@ deployment: unified
 workload:
   trace_files:
     - trace/tracelab_preserving.csv
-  trace_kind: text_generation
-  trace_source_schema: session-execution-v2
+  input_file_format: text-generation-session-execution-v2
   arrival_mode: trace_timed
   session_dependency: chained
   max_concurrency: 16

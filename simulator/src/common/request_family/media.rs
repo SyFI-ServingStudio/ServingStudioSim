@@ -4,4 +4,4 @@
 //! and this simulator reading them must mean the same thing by them. Re-exported
 //! here so a family consumer still finds them beside the families that use them.
 
-pub use req_frontend::schema::media::{AudioExtent, ImageExtent, VideoExtent};
+pub use req_frontend::schema::{AudioExtent, ImageExtent, VideoExtent};

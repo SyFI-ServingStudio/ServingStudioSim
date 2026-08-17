@@ -28,12 +28,11 @@ anyhow = "1"
 thiserror = "2"
 pyo3 = { version = "0.20", features = ["auto-initialize"] }
 
-# The trace taxonomy: which request kinds exist, which columns each obliges a
-# file to carry, and the canonical session-execution-v2 schema. Shared with the
-# replay client rather than reimplemented here -- a measured run and a simulated
-# run reading the same bytes must not be able to disagree about what those bytes
-# are. `default-features = false` takes the schemas without the client's HTTP
-# stack and tokenizer.
+# Complete input-file formats, typed row loaders, and orthogonal trace tags.
+# Shared with the replay client rather than reimplemented here -- a measured run
+# and a simulated run reading the same bytes must not be able to disagree about
+# what those bytes are. `default-features = false` takes the schema/loader layer
+# without the client's HTTP stack and tokenizer.
 #
 # Vendored as a git submodule, so a Rust build of this repository now requires
 # `git submodule update --init`.
@@ -54,9 +53,6 @@ dhat = { version = "0.3", optional = true }
 arrow-schema = { version = "54", default-features = false }
 arrow-array = { version = "54", default-features = false }
 parquet = { version = "54", default-features = false, features = ["arrow", "zstd"] }
-
-# Single-round trace CSV parsing (L7-γ TraceFrontend).
-csv = "1"
 
 # Timed/leveled logging facade (matches ref/moesim-rs): sim-time heartbeats,
 # cache-build progress, end-of-run summary. `RUST_LOG` controls verbosity.
@@ -79,6 +75,8 @@ dhat-heap = ["dep:dhat"]
 [dev-dependencies]
 # Temp dirs/files for L7 frontend + tick-driver + parquet writer tests.
 tempfile = "3"
+# Test-only CSV fixture writer; production parsing belongs to req-frontend.
+csv = "1"
 # Statistical microbenchmark harness for the cache-lookup hot path
 # (benches/cache_lookup.rs). `default-features = false` drops the plotters/rayon
 # pulls; we only need the sampling + confidence-interval estimates.

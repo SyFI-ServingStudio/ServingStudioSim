@@ -61,7 +61,7 @@ impl SessionInput {
 ///
 /// Defined in the shared trace crate: it is what the `accept_rate` column means,
 /// and the file says it rather than this simulator deciding it.
-pub use req_frontend::schema::media::DecodingStrategy;
+pub use req_frontend::schema::DecodingStrategy;
 
 /// Mutable progress shared by autoregressive token-output families.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

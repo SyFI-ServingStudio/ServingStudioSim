@@ -180,6 +180,7 @@ deployment: unified
 workload:
   trace_files:
     - trace/aime_long.csv
+  input_file_format: text-generation-independent
   arrival_mode: trace_timed
   session_dependency: independent
   request_rate: 150.0
