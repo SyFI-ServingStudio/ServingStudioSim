@@ -108,18 +108,40 @@ count, don't guess a formula.
    log_dir rewrite / sweep expansion — edit the field directly), and point
    `cases_file` at your cases. Author or adjust the cases file per the grammar above.
 4. Run (the launcher builds the release + analyzer binaries and warms the cache
-   itself). Pin an idle GPU in case of a cold-cache JIT fill:
+   itself). Do **not** pin GPUs — see "GPU selection & a cold cache" below:
    ```bash
    cd /m-coriander/coriander/kanzhu/VibeSim_workspace/main
    # PD:
-   CUDA_VISIBLE_DEVICES=<idle> uv run python -m launcher timing-predict presets/<pd_iter>.json
+   uv run python -m launcher timing-predict presets/<pd_iter>.json
    # AFD (both halves in one call — multiple configs are accepted):
-   CUDA_VISIBLE_DEVICES=<idle> uv run python -m launcher timing-predict presets/<afd_attn>.json presets/<afd_ffn>.json
+   uv run python -m launcher timing-predict presets/<afd_attn>.json presets/<afd_ffn>.json
    ```
    `uv run` is mandatory (PyO3 3.12 venv pin; see memory `vibesim_pyo3_build_python_pin`).
    Flags: `--build-type <t>` (default `release`), `--no-analyze` (skip the analyzer
    pass). There is **no** `--dry-run` / `--override` — those are run-only.
 5. Read the results (below) and report.
+
+## GPU selection & a cold cache
+
+**Do not restrict how many GPUs the run may use unless there is a concrete
+reason to.** L1 owns idle-device discovery and arrangement: `find_idle_gpus`
+(`profiling/exec/local.py`) reads `nvidia-smi` and hands only genuinely idle
+devices to the GPU pool, which distributes the profiling work across them
+itself. Setting `CUDA_VISIBLE_DEVICES=<one idle gpu>` (or
+`VIBESIM_PROFILE_GPUS`) only *shrinks* the set L1 gets to choose from — it
+serializes a fill that could have run in parallel, and it hard-fails if that one
+card turns out to be busy. Launch the command bare. Pin a device only when the
+user asks for it, or when you must keep the fill off specific cards; say why
+when you do.
+
+**Do not hand-enumerate the missing profile.db rows.** Timing-predict JIT-fills
+whatever the cost tree needs on a cold cache, through the same `perf_api` path
+`kernel-profile run` uses. Do not walk the arch, guess the kernel specs, and
+issue `kernel-profile count-missing` / `run` batches to pre-fill them by hand —
+that list will not match what the compiled tree actually looks up. Just run the
+prediction (or, for a run preset, its cache build) and let the cold-cache path
+enumerate. Use `operate-profile-existing-kernel` only when the user asks about
+one specific kernel's rows, not as a pre-step for a prediction.
 
 When the conversation runtime injects a managed-job capability, the launcher
 registers one `timing_predict` job per config/log directory before writing new

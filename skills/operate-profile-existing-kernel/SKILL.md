@@ -84,6 +84,26 @@ Manually shard only when the user explicitly requests it, a retained-allocation
 or OOM issue has been diagnosed, or an execution backend has a documented
 payload limit. Report the exception and its evidence.
 
+### Do not limit how many GPUs the run may use
+
+**Do not restrict the device set unless there is a concrete reason to.** L1
+already does idle-GPU detection and arrangement automatically: `find_idle_gpus`
+(`profiling/exec/local.py`) reads `nvidia-smi` and passes only genuinely idle
+devices to `LocalGpuPool`, which then chunks the spec set across them and runs
+the chunks concurrently. Launching with `CUDA_VISIBLE_DEVICES=<one idle gpu>`,
+or forcing `VIBESIM_PROFILE_GPUS`, only *shrinks* what L1 gets to choose from:
+it serializes a batch that would have gone parallel, and it hard-fails
+(`need N idle GPU(s), found M`) when the pinned card turns out to be busy or
+when a multi-GPU spec needs more devices than you left visible. Issue the
+command bare.
+
+Narrow the device set only when the user explicitly asks, when the run must stay
+off specific cards, or when a diagnosed issue requires it — and then say so in
+the report. `VIBESIM_PROFILE_GPUS` in particular *bypasses* the idle guard and
+will profile on top of someone else's job, so use it only for GPUs you know are
+yours. Note again that `--gpu-name` is a profile.db key/filter, **not** a device
+selector — it neither adds nor removes hardware from the pool.
+
 ## The `measure` diagnostic (NVML telemetry, out of the cache path)
 
 `launcher kernel-profile` has a fifth verb, `measure`, that the four cache verbs
@@ -143,6 +163,9 @@ only after doing the exact action, or write `N/A: reason`.
 - [] Decide whether `--gpu-name` is needed. Use it for a known DB key or to
   avoid CUDA name auto-resolution. Do not describe it as selecting a physical
   GPU.
+- [] Confirm the command does not narrow the device set (no
+  `CUDA_VISIBLE_DEVICES`, no `VIBESIM_PROFILE_GPUS`) — L1 detects and arranges
+  idle GPUs itself. If it does, record the concrete reason.
 - [] Choose the command mode: `count-missing`, `query`, `run`, or `run --force`.
 - [] For `run` / `run --force`, choose a fresh `--output-dir` below `logs/` when
   the result must appear in the managed UI. Never reuse an artifact directory
@@ -223,7 +246,9 @@ Always report:
 - Submission: confirm one complete `run --specs` call, or report the allowed
   manual-sharding exception and evidence; list any missing/error-only retry.
 - GPU context: requested `--gpu-name`, resolved GPU DB key when available, and
-  whether the command relied on CUDA device-name auto-resolution.
+  whether the command relied on CUDA device-name auto-resolution. State that the
+  device set was left to L1's idle-GPU detection, or report the narrowing and
+  its concrete reason.
 - Mode: read-only query, count-missing, JIT-fill, or force refresh.
 - Result: missing count before/after when available.
 - Metrics: compact table of returned metrics, or JSON status summary for large
