@@ -127,7 +127,7 @@ standalone crate.
 | `gpu/spec.json` (top level) | cross-cutting | Per-GPU peaks, bandwidth, and the alias table every component normalizes GPU names against. |
 | `model/` (top level) | outside the stack | HF `config/*.json` (verbatim downloads) plus `work/`, an **independent** necessary-work accountant: theoretical-minimum FLOPs/bytes derived from a model config alone. |
 | `analyzer/` (top level) | post-run | Standalone crate (no PyO3): Rust computes analysis subjects, Python renders them. |
-| `alignment/` (top level) | validation | Profiles a real vLLM server under nsys and reconciles the measured kernel timeline against the simulator's, kernel by kernel. |
+| `alignment/` (top level) | validation | Normalizes shared nsys evidence for both simulator validation against real serving and simulator-guided attribution of real-framework changes. |
 
 The last three sit **outside** the seven layers on purpose. `analyzer/` and
 `alignment/` read a finished run's artifacts rather than participating in it, and

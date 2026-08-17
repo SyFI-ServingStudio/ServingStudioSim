@@ -214,6 +214,33 @@ parallel launch. That output now lands under
 experiment dir, named after the run folder — not a scattered top-level hash
 dir). Nothing to configure; just expect that `.cache_build/` subdir.
 
+**Do not hand-enumerate the missing profile.db rows.** The cache build *is* the
+mechanism for a cold cache: `build-cache-only` walks the compiled cost tree and
+JIT-profiles exactly the specs the run will look up. Do not read the preset,
+guess which kernel shapes are missing, and pre-fill them with
+`kernel-profile count-missing` / `kernel-profile run` batches — a hand-derived
+list will not match the tree's real lookups, and it duplicates work the launcher
+does for free. Just launch; if you want the coverage *before* spending GPU time,
+run `uv run python -m launcher <preset> --cache-report` (reports missing specs
+per kernel per cache key, builds nothing). Reach for
+`operate-profile-existing-kernel` only for a question about one specific
+kernel's rows, never as a pre-step for a simulation.
+
+## GPU selection
+
+**Do not restrict how many GPUs the run may use unless there is a concrete
+reason to.** L1 owns idle-device discovery and arrangement: `find_idle_gpus`
+(`profiling/exec/local.py`) reads `nvidia-smi` and hands only genuinely idle
+devices to the GPU pool, which distributes the cache-build / JIT-profiling work
+across them itself. Setting `CUDA_VISIBLE_DEVICES=<one idle gpu>` (or
+`VIBESIM_PROFILE_GPUS`) only *shrinks* the set L1 gets to choose from — it
+serializes a fill that could have run in parallel, and it hard-fails if that one
+card turns out to be busy. Launch the launcher bare. Pin devices only when the
+user asks, or when the fill must stay off specific cards; say why when you do.
+(Note this is about the *profiling* devices, not the simulated cluster — the
+modeled GPU count comes from the preset's pools, and is never inferred from the
+host.)
+
 ## Analysis output
 
 Each finished run is auto-analyzed (best-effort — a failure never fails the run)

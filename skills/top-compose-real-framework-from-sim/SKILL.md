@@ -1,11 +1,7 @@
 ---
 name: top-compose-real-framework-from-sim
 description: >-
-  Use by the orchestrator as the top entry point when VibeSim should actively
-  build a real LLM-serving framework from scratch or optimize an existing one
-  from simulation evidence, using trusted correctness and benchmark utilities
-  in a repeated Tick (simulation) / Tock (one measured code trial) / Probe
-  (attribute the outcome and decide) loop.
+  Build or optimize a real serving framework through repeated simulation, one measured trial, and the Align framework to VibeSim side of operate-run-alignment.
 ---
 
 THIS SKILL IS MAINLY FOR ORCHESTRATOR
@@ -49,9 +45,10 @@ that its actual state is compatible with that mode.
 **VibeSim is the optimization reference; the real framework is the
 implementation being improved.** Keep simulation predictions, measured framework
 results, and comparisons derived from named artifacts separate. Never fill an
-evidence gap with an estimate, and do not use `top-align-with-framework` or
-`operate-run-alignment` for this direction — those measure a real framework in
-order to correct VibeSim, which is the opposite direction.
+evidence gap with an estimate. Alignment evidence is reusable in both directions:
+it can expose simulator fidelity gaps and real-framework implementation gaps.
+Using it here must not reverse the target by copying an accidental real-engine
+limitation into VibeSim.
 
 The hard guard, applied every time a real measurement seems to contradict the
 simulated target:
@@ -138,6 +135,18 @@ decides what may change, and in which direction.
 into one of the three columns above. A field that has not been classified does
 not enter the comparison. This gate is what catches a real-engine limitation
 being smuggled in as an experimental control.
+
+#### Two comparison perspectives
+
+These are evidence perspectives, not launcher modes or CLI flags. **Baseline
+reproduction** asks whether VibeSim explains the real implementation under the
+same contract, specialization, layout, precision, topology, and workload;
+residuals are fidelity or attribution gaps. **Target exploration** changes
+declared design axes within the external contract and physical feasibility; its
+gap from the reproduced baseline is an implementation opportunity. Label each
+relaxed axis as implemented-and-measured, implementable-but-unbuilt,
+model-supported counterfactual, or speculative/unsupported. Report both views
+and never slow the target merely to improve alignment.
 
 Trusted command semantics belong to the real evidence protocol, not to an
 imaginary simulation command parity rule. Exact profiler executable, capture
@@ -226,8 +235,10 @@ Work directly through existing repo-local VibeSim skills when necessary:
 - use `top-add-new-arch` when VibeSim lacks the model architecture;
 - use `top-add-kernel` when a required kernel/backend is missing;
 - use `operate-run-simulation` for a serving-workload throughput target;
-- use `operate-run-timing-predict` only for explicit fixed-shape building-block
-  comparisons.
+- use `operate-run-timing-predict` for one-iteration timing to get kernel time;
+- use the **Align framework to VibeSim** side of `operate-run-alignment` to align the
+  target with the measured baseline or trial through the same production entry
+  point used by the full model.
 
 First use the simulator to find a strong solution and establish a performance
 target. Confirm that VibeSim supports the exact architecture, kernel semantics,
@@ -243,6 +254,13 @@ command, log directory, and reports used.
 When the simulator itself is wrong or incomplete, pause real-framework work,
 repair VibeSim through its owning top/orchestrator/impl skill, rerun the target,
 and only then resume.
+
+Search beyond the current framework's slots, graph coverage, scheduler,
+preallocated KV, cache policy, decomposition, and backend shape support; stop at
+an external contract or physical capacity boundary. In concurrency sweeps use
+enough requests for multiple complete admission waves, label an observed
+maximum rather than a theoretical bound, and report output-token throughput,
+input processing, completions, KV/cache state, and latency separately.
 
 **A Tick ends by freezing exactly one trial brief:** the hypothesis, the code
 scope, the invariants that must hold, the expected observable effect, and the
@@ -265,6 +283,31 @@ After obtaining a simulated result, inspect `/framework/name`.
 
 Use simulator analyzer artifacts for both cases. Use measured framework
 profiling to diagnose a performance gap only after a runnable baseline exists.
+
+Use `dev-build-serving-repetitive-unit` only for kernel/boundary/layer-timing
+loops. It must share the production path; only its execution plan and weights
+may shrink. Promote through the reduced model, bounded full-model integration,
+then canonical workload. Scheduler, capacity, latency, throughput, and workload
+claims require the full model; never extrapolate across layers or requests.
+
+Keep sequence consistency, downstream model accuracy, and performance as three
+separate evidence lanes. Declare whether a trial is numerically preserving or
+an intentional quality/performance tradeoff. Unexplained sequence drift blocks
+a numerically preserving trial; expected drift under an intentional numeric
+change is judged against a declared downstream-quality budget and an appropriate
+reference. Matching length or a second framework is not an accuracy verdict.
+
+Freeze numeric provenance with the performance contract: checkpoint revision,
+compute/weight/KV dtype, scale strategy, page/layout contract, backend,
+topology, and sampling policy. A numeric mismatch qualifies attribution even
+when the measurement remains useful.
+
+Use a checked-in deterministic sequence pack in the inner loop, versioned by
+token digest, invariants, numeric policy, and coverage intent. Cover only the
+active seam: representative phase shapes, graph replay, routing/skew, unusual
+layouts, and saturation/outliers. Escalate immediately on non-finite output,
+corruption, routing collapse, graph instability, or over-budget quality loss;
+otherwise defer the full suite until the win is credible and attributable.
 
 Before launching any benchmark or capture, run the preflight in
 `operate-profile-serving-run` — GPU idleness, process cleanup, provenance.
@@ -290,8 +333,6 @@ injection pointing at an engine checkout, launching an engine as a subprocess,
 linking its binaries, and vendored or line-by-line-translated source. **A hit
 voids the Tock** — it does not proceed to Probe.
 
-Correctness is mandatory.
-
 **A Tock ends at measurement.** Record the trusted accuracy result, the
 canonical benchmark result, and the artifact paths — then stop. Do not
 interpret, retain, or reject here; that is Step 4.
@@ -309,7 +350,9 @@ the comparison contract. A real-engine limitation discovered here is a finding
 to be fixed in reality — never a reason to adjust the simulation, and never an
 experimental control to be held constant.
 
-**2. Explain from existing artifacts first.** Two causes need separating,
+**2. Explain from existing artifacts first.** Use `operate-run-alignment` to
+produce or resume the shared labeled comparison against the frozen VibeSim
+target. Two causes need separating,
 because they have different fixes and only one moves the simulated breakdown:
 
 - **Fundamental improvement** — the *modeled work itself* is off: a real
@@ -366,6 +409,10 @@ band is *inconclusive* — record it that way rather than resolving it by
 preference. Preserve the VibeSim target and every available real-framework
 baseline, and record the decision before starting another trial.
 
+Do not infer a causal speedup from aggregate throughput, phase occupancy, or
+iteration counts. Require a controlled A/B or lossless occurrence-weighted
+accounting; otherwise decide `inconclusive` and name the missing experiment.
+
 ### Step 5 — Tick again: explore more simulation possibilities
 
 After every completed **Probe**, return to the simulator before choosing another
@@ -382,8 +429,8 @@ gets harder as scope widens — but **effort is not monotonic in the level numbe
 scheduling or batching *policy* knob (often just a config flag) can be the cheapest
 change of all, easier than swapping a kernel, even though it sits at a higher level.
 So weigh difficulty against leverage per candidate; don't march rigidly up the
-numbering. Each level names the matching `dev-llm-serving` tier for the technique
-menu: **this skill names the level, `dev-llm-serving` names the techniques.**
+numbering. This skill chooses the level; `dev-compose-kernel` owns kernel and
+fused-boundary trials, while `dev-llm-serving` supplies broader references.
 
 1. **Kernel** — a single hot kernel dominates. Swap it for a faster implementation or
    backend. First **look for a public solution** (a faster attention / GEMM / norm
@@ -391,11 +438,11 @@ menu: **this skill names the level, `dev-llm-serving` names the techniques.**
    **point the simulator at it** — ask VibeSim to model it, or to implement it with
    your guidance. You can also **ask VibeSim directly for a kernel suggestion** — it
    knows its own kernel catalog and what is fast on the target GPU. →
-   `dev-llm-serving`: backends / hardware / algorithms.
+   `dev-compose-kernel`, with backend references from `dev-llm-serving`.
 2. **Operation** — the cost is in *how ops are wired*, not one kernel. Fuse operations
    (norm+rope+attention, GEMM+bias+activation), drop redundant work, cut memory
-   round-trips so several small kernels become one. → `dev-llm-serving`: algorithms /
-   engines.
+   round-trips so several small kernels become one. → `dev-compose-kernel`, with
+   engine references from `dev-llm-serving`.
 3. **Architecture / parallelism** — the compute↔communication balance is off. Change
    the parallelism layout (TP / EP / CP / PP) and how the model shards across GPUs. →
    `dev-llm-serving`: frameworks / hardware.
@@ -440,10 +487,13 @@ Report:
   decision;
 - the measured noise band, where one was established;
 - any result labeled evaluator-limited;
+- the sequence-consistency, downstream-accuracy, and performance gates used;
+- the numeric provenance and every intentionally relaxed design axis;
 - retained/rejected changes and the remaining evidence gap.
 
 ## Neighboring workflows
 
-- Real serving implementation techniques and source maps: `dev-llm-serving`.
-- Capturing and attributing a real serving profile (Probe):
+- Shared VibeSim/framework alignment: `operate-run-alignment`; techniques:
+  `dev-llm-serving`; kernels: `dev-compose-kernel`; phase-level Probe evidence:
   `operate-profile-serving-run`.
+- Complete reduced model: `dev-build-serving-repetitive-unit`; second-engine comparison: `operate-compare-serving-performance`.

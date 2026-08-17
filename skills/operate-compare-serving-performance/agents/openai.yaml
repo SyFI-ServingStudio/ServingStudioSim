@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compare Serving Performance"
+  short_description: "Compare engines end to end, then explain GPU time"
+  default_prompt: "Use $operate-compare-serving-performance to compare two real serving engines by overall throughput and latency, then compare their broad GPU-time regions."

@@ -1,165 +1,95 @@
 ---
 name: operate-run-timing-predict
-description: Use when the user wants to run VibeSim's offline timing-predict mode — per-building-block cost prediction for explicit batch shapes WITHOUT the discrete-event sim (no scheduler/clock/trace, no workload). Covers the three arch selectors (iter / attn / ffn), the PD→iter and AFD→attn+ffn mapping, the minimal predict config + cases-file grammar, and the launcher entry `python -m launcher timing-predict`. NOT for a real deployment run from a workload trace (that is operate-run-simulation).
+description: >-
+  Run offline timing-predict for explicit iteration, attention, or FFN batch
+  shapes. Not for scheduler or workload simulation.
 ---
 
-# Run VibeSim Timing-Predict
+# Run Timing-Predict
 
-Offline **per-building-block timing prediction**. Same family as `dry-run` /
-`build-cache-only` / `kernel-query`: it does **not** run the discrete-event sim
-(no scheduler, no clock, no request trace, no pools/workload). It takes a batch
-of explicit batch shapes ("cases") and, for each, evaluates the compiled
-`CostTree(s)` once — predicting the cost of one iteration (or one AFD half)
-directly. A warm `profile.db` means **no GPU is needed**; a cold one JIT-profiles
-the missing rows on demand (needs a matching GPU on an idle device).
+Use timing-predict to cost explicit batch shapes without running the
+discrete-event simulator. It builds the selected model CostTree and evaluates
+each case once. There is no request trace, scheduler, simulation clock, or SLO.
 
-This is the run *workflow* for the predictor. The authoritative code is
-`launcher/timing_predict.py` (launcher entry) and `simulator/src/timing_predict.rs`
-(the `arch` selectors, config, and cases grammar) — defer to those for edge cases.
+Read `launcher/timing_predict.py` and `simulator/src/timing_predict.rs` when the
+config or cases grammar is unclear.
 
-Repo root / logs root / launcher: same as `operate-run-simulation`
-(`/m-coriander/coriander/kanzhu/VibeSim_workspace/main`, `.../logs`, run under `uv`).
+## 1. Choose the selector
 
-## When NOT to use this
+A config contains exactly one outer `arch` selector:
 
-- A **real deployment run** from a workload trace with pools/rates/SLOs →
-  `operate-run-simulation`. That path has a `RunConfig`, sweeps, `--dry-run`,
-  `--override`, and dated-dir log rewriting. Timing-predict has **none** of those.
-- Filling / querying `profile.db` rows for one kernel → `operate-profile-existing-kernel`.
-
-## The one decision: which arch selector
-
-A predict config selects **exactly one** arch family via the outer `arch` key.
-Map the user's deployment to selectors:
-
-| Deployment | Selector(s) | Why |
+| Target | Selector | Result |
 |---|---|---|
-| **PD** (prefill/decode disagg) or **unified/colocated** | `iter` (once) | Both PD workers and a unified worker each run a **whole** attn+ffn iteration. Cost one `eval_iter`; give prefill-only and/or decode-only groups in the cases to model each phase. |
-| **AFD** (attn/ffn disagg) | `attn` **and** `ffn` (run twice) | The two pools run different code. Predict each side **independently** — one config for `attn`, one for `ffn`, in one launcher call. |
+| Unified or PD worker | `iter` | Full attention + FFN iteration |
+| AFD attention pool | `attn` | Attention-side cost |
+| AFD FFN pool | `ffn` | FFN-side section costs |
 
-`iter` → one row/case (`section="iter"`). `attn` → one `attn_cost`/case. `ffn` →
-the per-section building blocks of one iteration (`prologue`, `pre_attn`,
-`post_attn`, `post_attn_last`, `epilogue`) → **5 rows per case**.
+Run both `attn` and `ffn` configs to represent an AFD deployment. Their
+cross-pool handoff is not a CostTree leaf and is not included. In-tree MoE
+dispatch and combine communication remains included in the FFN cost.
 
-> **AFD caveat.** The cross-pool attn↔ffn handoff is a `GpuCluster` transfer, not
-> a cost-tree leaf, and is **out of scope** here — timing-predict costs the two
-> compute sides only. (The MoE EP dispatch/combine comm *is* an in-tree leaf inside
-> the ffn `post_attn` section and is counted automatically.)
+## 2. Write the config and cases
 
-## The config (minimal — NOT a RunConfig)
+Start from the nearest `presets/predict_*.json` file. Set:
 
-One `arch` selector + `gpu` + `log_dir` + `cases_file`. No workload / pools / io /
-sweep. The inner selector reuses the run-side arch grammar (internally tagged on
-`type`). Canonical templates live in `presets/predict_qwen3_235b_{iter,attn,ffn}.json`.
+- one typed `arch` selector and its model parameters;
+- `gpu`;
+- a fresh `log_dir`;
+- `cases_file`, resolved relative to the config file.
 
-```jsonc
-// iter (→ PD / unified)
-{ "arch": { "iter": { "type": "qwen3_moe_dp_attn_ep_ffn",
-              "model_config": "model/config/qwen3_235b.json",
-              "attn_tp_size": 4, "ep_size": 8, "hp_size": 1, "nvl_num_gpu": 8, "fp8": false } },
-  "gpu": "NVIDIA H200", "log_dir": "logs/<exp>", "cases_file": "<name>_cases.json" }
+The cases file is a top-level JSON array:
 
-// attn (→ AFD attn side)
-{ "arch": { "attn": { "type": "qwen3_attn_tp", "model_config": "...", "attn_tp_size": 4, "fp8": false } }, ... }
+- `iter` and `attn`: each case contains `groups`, one per expected attention-DP
+  group. A group may contain `prefill_chunk_pairs` and either exact
+  `decode_kv_lens` or `decode_count` plus `average_decode_length`.
+- `ffn`: each case contains `tokens_per_group`, one value per expected DP group.
 
-// ffn (→ AFD ffn side)
-{ "arch": { "ffn": { "type": "qwen3_ffn_moe", "model_config": "...",
-              "attn_tp_size": 4, "ep_size": 8, "nvl_num_gpu": 8, "routing": "uniform", "fp8": false } }, ... }
+Do not mix exact decode lengths with the average-length shorthand. The number of
+groups must match the selected architecture; use the validation error rather
+than guessing the parallel degree.
+
+## 3. Run the launcher
+
+Run from the repository root:
+
+```bash
+uv run python -m launcher timing-predict presets/<config>.json
 ```
 
-`cases_file` is resolved **relative to the config file's directory**. Easiest
-robust layout: author the config (and its cases file, if new) under `presets/`
-next to each other, and just point `log_dir` at a dated experiment dir. The
-launcher snapshots both the config and its cases file into `log_dir` for
-provenance regardless.
+Multiple configs may be passed in one call, for example the two AFD halves.
+Supported flags are `--build-type <build-type>` (default `release`) and
+`--no-analyze`. Timing-predict does not support simulation-run flags such as
+`--dry-run` or `--override`.
 
-## The cases file (grammar differs by arch)
+Do not pin GPUs by default. A warm `profiling/profile.db` needs no GPU. On a cold
+cache, timing-predict asks the profiling layer to JIT-fill the rows it actually
+uses, and that layer selects idle GPUs. Do not precompute a guessed row list or
+restrict `CUDA_VISIBLE_DEVICES` unless the user or machine policy requires it.
 
-A top-level **array** of cases.
+If prediction or JIT profiling fails, preserve the exact error and stop. Do not
+report totals from an incomplete run. Use `operate-profile-existing-kernel` only
+when diagnosing a specific registered kernel row.
 
-- **`iter` / `attn`** — each case is `{ "groups": [ <group>, ... ] }`, one group
-  per attention-DP shard. Each group:
-  - `prefill_chunk_pairs`: list of `[prefix_len, append_len]` (fresh prefill has
-    `prefix_len = 0`; a chunked-prefill continuation has `prefix_len > 0`).
-  - decode is **EITHER** `decode_kv_lens: [k, ...]` (exact per-request KV lengths)
-    **XOR** `decode_count` + `average_decode_length` (uniform shorthand) — never both.
-  - omit both prefill and decode fields for an empty side (e.g. a decode-only or
-    prefill-only iteration).
-- **`ffn`** — each case is `FfnArchInput` itself: `{ "tokens_per_group": [t0, t1, ...] }`
-  (token counts only, one entry per DP group). It rejects the attention vocabulary
-  the ffn cost never reads.
+## 4. Check the result
 
-**Group / entry count must match the model's expected DP degree.** `attn` wants
-exactly **one** group (one model instance = one DP shard); `iter` / `ffn` want
-`num_(attn_)dp_groups` entries. A mismatch is a hard error
-(`case has N group(s) but the model expects M`) — read the message and fix the
-count, don't guess a formula.
+A successful prediction exits zero and writes `prediction.meta.json` plus its
+cost artifacts under `log_dir`. Important outputs include:
 
-## Workflow
+- `prediction.cases.json`: snapshotted cases;
+- `raw/cost_log/worker_predict_0.parquet` and its manifest;
+- `reports/iter_breakdown.ans`: per-case CostTree totals and leaves when analysis
+  was enabled;
+- trace and plot artifacts produced by the normal analysis path.
 
-1. Pick the selector(s) from the table above (PD → 1 iter config; AFD → 1 attn +
-   1 ffn config).
-2. Name the experiment `YYYYMMDD_N_<short-name>` and pick a free per-day index by
-   scanning `logs/` (same rule as `operate-run-simulation`; ask if unnamed).
-   For AFD, use one index for both halves (e.g. `..._1_predict_afd_attn` +
-   `..._1_predict_afd_ffn`).
-3. Copy a `predict_qwen3_235b_*` template into `presets/` (or edit one), set its
-   `arch` params + `gpu`, set `log_dir` to `logs/<exp>` (there is **no** launcher
-   log_dir rewrite / sweep expansion — edit the field directly), and point
-   `cases_file` at your cases. Author or adjust the cases file per the grammar above.
-4. Run (the launcher builds the release + analyzer binaries and warms the cache
-   itself). Pin an idle GPU in case of a cold-cache JIT fill:
-   ```bash
-   cd /m-coriander/coriander/kanzhu/VibeSim_workspace/main
-   # PD:
-   CUDA_VISIBLE_DEVICES=<idle> uv run python -m launcher timing-predict presets/<pd_iter>.json
-   # AFD (both halves in one call — multiple configs are accepted):
-   CUDA_VISIBLE_DEVICES=<idle> uv run python -m launcher timing-predict presets/<afd_attn>.json presets/<afd_ffn>.json
-   ```
-   `uv run` is mandatory (PyO3 3.12 venv pin; see memory `vibesim_pyo3_build_python_pin`).
-   Flags: `--build-type <t>` (default `release`), `--no-analyze` (skip the analyzer
-   pass). There is **no** `--dry-run` / `--override` — those are run-only.
-5. Read the results (below) and report.
+A timing-predict directory is explicitly cataloged as `timing_predict`; it does
+not contain simulation `run_meta.json`, requests, throughput, or SLO results.
+Use `operate-use-analyzer` to read user-visible prediction values after analysis
+completes.
 
-When the conversation runtime injects a managed-job capability, the launcher
-registers one `timing_predict` job per config/log directory before writing new
-artifacts. It reports `running`, `analysis_running`, and `ready` (or
-`failed`/`interrupted`) to the conversation backend. If one launcher call names
-both AFD configs, the UI therefore receives two independently addressable jobs,
-one for `attn` and one for `ffn`. JIT profile fills triggered internally by a
-cold timing-predict cache remain activity of that timing-predict job; they do
-not create nested kernel-profile jobs.
+Report the selector, config and cases paths, command, `log_dir`, per-case totals,
+and any profiling failure. For AFD, report attention and FFN results separately.
 
-## Output
+## Boundaries
 
-Each `log_dir` gets the **same artifacts a real run writes** (one worker,
-`iter_id` = case index):
-- `raw/cost_log/worker_predict_0.parquet` + `raw/cost_manifest/worker_predict_0.json`
-  — one row per case (iter/attn) or per section (ffn), byte-compatible with a run.
-- `reports/iter_breakdown.ans` — the human-readable cost tree (per-case total +
-  per-leaf breakdown); the predict-only report (a real run's thousands of iters
-  would make it enormous). This is where the headline per-iteration µs numbers are.
-- `traces/<exp>.pftrace.gz` (Perfetto), `plots/` (batch_scatter, kernel tflops/gbps,
-  utilization), and a snapshot of the config + cases file.
-
-Managed timing-predict artifacts are cataloged as `timing_predict`, not as a
-deployment simulation. Request/throughput/SLO panels remain inapplicable; cost,
-kernel throughput, batch-shape, and utilization evidence can link back to the
-conversation job.
-
-Request/throughput/SLO analyzer subjects self-skip on a predict dir (no requests);
-cost subjects apply. Read `iter_breakdown.ans` with ANSI stripped
-(`sed -r 's/\x1b\[[0-9;]*m//g'`) to pull the `total: N us` line per case.
-
-After running, report: the selector(s) used, the experiment name(s) / `log_dir`(s),
-the launcher command, per-case predicted totals, and the path to `iter_breakdown.ans`.
-
-When the managed prediction reaches `ready`, use
-`skills/operate-use-analyzer/SKILL.md` for every user-visible result value. Read
-the prediction descriptor/cases/CostTree and hardware limits through Analyzer
-using the stable `analyzer_resource_id`; do not reconstruct totals from the
-conversation job or implementer summary. Exact prediction reads return a
-complete `pred.*` citation token beside the result. Copy that token unchanged as
-Markdown inline code beside the supported claim so the frontend can resolve it
-to the prediction panel. Never derive a token from a case, operation, CostTree
-leaf, metric name, or resource ID.
+- Workload/scheduler simulation: `operate-run-simulation`.
+- Querying or filling one registered kernel: `operate-profile-existing-kernel`.

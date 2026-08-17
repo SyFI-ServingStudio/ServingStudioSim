@@ -16,6 +16,7 @@ and its slots are the same list twice.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -47,6 +48,10 @@ class KernelPosition:
     serves several roles and what ran just before it is what tells them apart.
     None at a body's first kernel and after any unmapped kernel — an unmapped
     neighbour carries no evidence and must not be silently skipped over."""
+    next_name: str | None = None
+    """The immediately following kernel in the same body. This distinguishes
+    an implementation-identical repeated layer boundary from a one-off model
+    boundary such as the final norm."""
 
     @property
     def operation(self) -> str | None:
@@ -76,6 +81,31 @@ def segment_repeat(segment: dict) -> int:
     return 1 if "kernels" in segment else int(segment["repeat"]["count"])
 
 
+def unfold_inventory(document: dict) -> None:
+    """Expand every repeat into one literal program node, losslessly in place.
+
+    Folding remains the compact default. Full-model boundary labeling is the
+    exception: the last occurrence of an identical layer kernel can own a
+    different CostTree slot and therefore must remain individually addressable.
+    """
+    for phase in document["phases"].values():
+        for sequence in phase["unique_sequences"]:
+            expanded: list[dict] = []
+            for segment in sequence["program"]:
+                body = segment_body(segment)
+                for _ in range(segment_repeat(segment)):
+                    expanded.extend(copy.deepcopy(body))
+            expected_count = int(sequence["expanded_kernel_count"])
+            if len(expanded) != expected_count:
+                raise ValueError(
+                    f"sequence {sequence['sequence_id']!r} unfolded to {len(expanded)} "
+                    f"kernels, expected {expected_count}"
+                )
+            sequence["program"] = [{"kernels": expanded}]
+    document["encoding"] = "literal-v1"
+    document["folding_policy"] = {"kind": "none", "source": "label-initialize-unfold"}
+
+
 def walk_kernels(document: dict) -> Iterator[KernelPosition]:
     """Every kernel in program order, phase by phase and sequence by sequence.
 
@@ -94,7 +124,8 @@ def walk_kernels(document: dict) -> Iterator[KernelPosition]:
                 repeat = segment_repeat(segment)
                 previous_name: str | None = None
                 previous_operation: str | None = None
-                for offset, kernel in enumerate(segment_body(segment)):
+                body = segment_body(segment)
+                for offset, kernel in enumerate(body):
                     label = kernel.setdefault("label", {})
                     yield KernelPosition(
                         phase=phase,
@@ -106,6 +137,7 @@ def walk_kernels(document: dict) -> Iterator[KernelPosition]:
                         label=label,
                         previous_name=previous_name,
                         previous_operation=previous_operation,
+                        next_name=body[offset + 1]["name"] if offset + 1 < len(body) else None,
                     )
                     previous_operation = (
                         label.get("operation") if label.get("status") == "mapped" else None

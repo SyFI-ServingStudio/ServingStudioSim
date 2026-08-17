@@ -1,22 +1,14 @@
 ---
 name: top-align-with-framework
 description: >-
-  Use as the top entry point when the user wants to evaluate how well VibeSim
-  matches a real serving framework (vLLM today) — judging alignment quality from
-  one measured alignment run, not just producing it. Covers the three evaluation
-  levels from tightest to loosest: per-iteration kernel-only timing (per-kernel
-  deviation and missing large-chunk coverage, with cause diagnosis — different
-  kernel vs thermal/clock artifact), GPU duty-cycle / kernel-GPU-ratio
-  correctness, and end-to-end TTFT/TPOT (where a small sim-faster TTFT gap is
-  expected from vLLM's async scheduler). This is a routing/judgment skill; it
-  delegates the actual running to operate-run-alignment and cost-model fixes to
-  the kernel skills, and does not run phases or edit code itself.
+  Align VibeSim to a real framework across kernel timing, GPU duty cycle, and TTFT/TPOT.
+  Routes execution and fixes; does not run phases or edit code.
 ---
 
 # Top Align With Framework
 
 Top-level skill for **judging** whether VibeSim is well aligned to a real serving
-framework (vLLM today), from one measured alignment run. `operate-run-alignment`
+framework (vLLM or SGLang), from one measured alignment run. `operate-run-alignment`
 *produces* the comparison; this skill *interprets* it — what to compare, what a
 healthy gap looks like, and how to diagnose a bad one. You route and judge here;
 you do not run phases or edit cost code from this skill.
@@ -27,6 +19,8 @@ Alignment is judged at three levels of aggregation, and you must work from the
 tightest to the loosest — a failure at a tight level explains the loose ones, so
 diagnosing loose-level gaps first wastes effort:
 
+0. **Request/correctness eligibility** — did both sides execute the same prompt
+   population successfully, with explicit output-evidence provenance?
 1. **Per-iteration kernel-only timing** — is each individual modeled kernel close
    to the measured kernel, and is any large kernel missing entirely? (tightest,
    most diagnostic)
@@ -40,7 +34,7 @@ async), not the cost model.
 
 ## Step 0 — Run the alignment
 
-Route to `operate-run-alignment` for the phases. It produces the artifacts every
+Route to the **Align VibeSim to framework** side of `operate-run-alignment`. It produces the artifacts every
 check below reads: the per-iteration labeled kernel breakdown (measured duration
 vs simulated CostTree slot per mapped operation) plus the kernel-align pass's
 `recommended_gpu_time_multiplier` (in `alignment_iteration_report.json` meta), and
@@ -73,6 +67,22 @@ folded position, and label — route back to `operate-run-alignment`'s
 once the classification and mapping are confirmed correct. Small unmapped helpers
 (bookkeeping, alloc/fill/copy, launch prep, sampling) are expected and fine; a
 large unmapped duration is a signal to *audit the labels first*, then the model.
+
+Before scoring timing, require the same request population, prompt-token
+identity, successful execution, and explicit output-evidence provenance. This
+is an eligibility check, not a claim that simulator output establishes
+downstream task accuracy.
+
+For every material unmapped semantic family, make one explicit disposition:
+
+- label an existing simulated owner;
+- add a missing simulator decomposition;
+- remove or fuse framework-only plumbing;
+- retain a justified noise tail.
+
+Rank these families by logical critical-path contribution, not raw cross-rank
+duration sum. Route label/decomposition repairs to their owners; this top skill
+chooses the disposition but does not edit the artifacts or implementation.
 
 **Then, per-kernel deviation — and judge the cause.** Flag any operation whose
 modeled time deviates a lot from measured, and attribute it:
@@ -128,11 +138,26 @@ and expect one structural gap.
   close it. A **large** TTFT gap, or the **wrong direction** (sim slower), is a
   real signal: trace it back to prefill kernels (Check 1) or to scheduling.
 
+Use phase transitions as falsification evidence. If a final pure-decode drain
+retains the gap after new prefills stop, the fact that most total time was in
+mixed iterations cannot support a scheduling-only explanation.
+
+Keep overall and kernel conclusions separate. Per-kernel deviation is reliable
+only for iterations with equivalent phase, shapes, specialization, numeric
+contract, and graph mode. If framework and simulator scheduling produce
+different iteration populations, do not force their kernel occurrences to sum
+to the E2E gap or call the remainder host overhead. Compare matched strata,
+report unmatched work and scheduling structure separately, and leave causal
+percentages unresolved without a controlled A/B. Mixed-region occupancy is not
+attribution. Backend, scale strategy, and other numeric differences qualify the
+conclusion but do not prove a throughput cause.
+
 ## Delegation boundary
 
 You judge; you do not run or fix from here. Diagnose in the tight → loose order:
-coverage (no missing large kernel) → per-kernel deviation + cause → duty-cycle
-ratio → TTFT/TPOT. Then route the fix:
+request/correctness eligibility → coverage (no missing large kernel) →
+per-kernel/collective deviation + cause → duty-cycle ratio → iteration wall →
+TTFT/TPOT/throughput. Then route the fix:
 
 - rerun, resume, or re-label a capture → `operate-run-alignment`;
 - a wrong-shape or missing kernel cost → `impl-validate-kernel-cache` /

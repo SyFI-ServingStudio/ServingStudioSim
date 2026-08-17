@@ -135,13 +135,22 @@ minimal predict config (see `operate-run-timing-predict`; templates in
 
 ```bash
 cd /m-coriander/coriander/kanzhu/VibeSim_workspace/main
-CUDA_VISIBLE_DEVICES=<idle> uv run python -m launcher timing-predict presets/<new_arch_predict>.json
+uv run python -m launcher timing-predict presets/<new_arch_predict>.json
 ```
+
+Run it bare — **do not** pin `CUDA_VISIBLE_DEVICES` / `VIBESIM_PROFILE_GPUS` to
+limit the device set unless you have a concrete reason. L1 does idle-GPU
+detection and arrangement itself (`find_idle_gpus` in `profiling/exec/local.py`);
+narrowing the set only serializes a fill that could have gone parallel and
+hard-fails when the pinned card is busy. Likewise, do not hand-enumerate the
+missing `profile.db` rows for the new arch with `kernel-profile count-missing` /
+`run` — the prediction's own cold-cache path enumerates exactly what the compiled
+cost tree looks up.
 
 Read `logs/<dir>/reports/iter_breakdown.ans`: every element from the Phase-1
 decision table must appear as a leaf with a non-zero, plausibly-scaled timing (no
-missing kernel, no zero, no absurd µs). A cold `profile.db` JIT-fills on the idle
-GPU; a warm one needs none.
+missing kernel, no zero, no absurd µs). A cold `profile.db` JIT-fills on whatever
+idle GPUs L1 picks; a warm one needs none.
 
 ## Report Back
 

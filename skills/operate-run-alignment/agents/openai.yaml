@@ -1,4 +1,4 @@
 interface:
   display_name: "Run Alignment"
-  short_description: "Run VibeSim and vLLM alignment end to end"
-  default_prompt: "Use $operate-run-alignment to run an end-to-end VibeSim-to-vLLM alignment experiment."
+  short_description: "Produce shared two-way alignment evidence"
+  default_prompt: "Use $operate-run-alignment to produce a shared VibeSim and vLLM or SGLang alignment whose evidence can validate the simulator or guide framework optimization."

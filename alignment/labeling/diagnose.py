@@ -61,6 +61,7 @@ class UnmappedKernel:
 
 @dataclass(frozen=True)
 class Coverage:
+    iteration_count: int
     measured_fraction: float
     simulated_fraction: float
     measured_total_ms: float
@@ -97,6 +98,7 @@ def read_coverage(report_path: Path) -> Coverage:
         key=lambda pair: -pair[1],
     )
     return Coverage(
+        iteration_count=int(report["meta"]["iterations"]),
         measured_fraction=totals["measured_duration_fraction"],
         simulated_fraction=totals["simulated_workload_fraction"],
         measured_total_ms=totals["measured_total_kernel_ms"],
@@ -107,14 +109,19 @@ def read_coverage(report_path: Path) -> Coverage:
 
 
 def format_coverage(coverage: Coverage, limit: int = 20) -> str:
+    measured_unmapped_average_ms = coverage.measured_unmapped_ms / coverage.iteration_count
+    measured_total_average_ms = coverage.measured_total_ms / coverage.iteration_count
     lines = [
         f"measured coverage {coverage.measured_fraction * 100:6.2f}%"
         f"   simulated coverage {coverage.simulated_fraction * 100:6.2f}%",
-        f"unmapped measured {coverage.measured_unmapped_ms:.0f} ms"
-        f" of {coverage.measured_total_ms:.0f} ms",
+        f"unmapped measured {coverage.measured_unmapped_ms:.3f} /"
+        f" {coverage.measured_total_ms:.3f} ms total across"
+        f" {coverage.iteration_count} iterations",
+        f"per-iteration average {measured_unmapped_average_ms:.3f} /"
+        f" {measured_total_average_ms:.3f} ms",
         "",
         f"unmapped measured kernels ({len(coverage.kernels)} names)",
-        f"{'ms':>9} {'rows':>5} {'calls':>8}  name",
+        f"{'total ms':>9} {'rows':>5} {'calls':>8}  name",
     ]
     for kernel in coverage.kernels[:limit]:
         lines.append(
@@ -124,7 +131,11 @@ def format_coverage(coverage: Coverage, limit: int = 20) -> str:
     if len(coverage.kernels) > limit:
         lines.append(f"{'':9} … {len(coverage.kernels) - limit} more names")
 
-    lines += ["", f"unmapped simulated slots ({len(coverage.slots)})", f"{'ms':>9}  slot"]
+    lines += [
+        "",
+        f"unmapped simulated slots ({len(coverage.slots)})",
+        f"{'total ms':>9}  slot",
+    ]
     for slot, total_ms in coverage.slots[:limit]:
         lines.append(f"{total_ms:9.1f}  {slot}")
     if len(coverage.slots) > limit:
@@ -151,7 +162,11 @@ def _label_body(label: dict) -> tuple:
 
 
 def _where(
-    positions: list[KernelPosition], phase: str, after: str | None, after_name: str | None
+    positions: list[KernelPosition],
+    phase: str,
+    after: str | None,
+    after_name: str | None,
+    before_name: str | None,
 ) -> str:
     """A coordinate carrying one evidence key, plus how many share it."""
     matching = [
@@ -161,6 +176,7 @@ def _where(
         and position.previous_operation == after
         and (None if position.previous_name is None else short_name(position.previous_name))
         == after_name
+        and (None if position.next_name is None else short_name(position.next_name)) == before_name
     ]
     if not matching:
         return "?"
@@ -200,12 +216,13 @@ def check(document: dict) -> list[Finding]:
         # sharing one (phase, predecessor) key means the file states a
         # distinction it does not support, so one of the two is charged time
         # that belongs to the other.
-        evidence_of: dict[str, set[tuple[str, str | None, str | None]]] = {
+        evidence_of: dict[str, set[tuple[str, str | None, str | None, str | None]]] = {
             operation: {
                 (
                     position.phase,
                     position.previous_operation,
                     None if position.previous_name is None else short_name(position.previous_name),
+                    None if position.next_name is None else short_name(position.next_name),
                 )
                 for position in positions
             }
@@ -222,13 +239,16 @@ def check(document: dict) -> list[Finding]:
             for left, right in collisions:
                 shared = sorted(
                     evidence_of[left] & evidence_of[right],
-                    key=lambda key: (key[0], key[1] or "", key[2] or ""),
+                    key=lambda key: (key[0], key[1] or "", key[2] or "", key[3] or ""),
                 )
-                for phase, after, after_name in shared:
+                for phase, after, after_name, before_name in shared:
                     lines.append(
-                        f"  (phase={phase}, after={after}, after_name={after_name})"
-                        f"\n    {left} at {_where(operations[left], phase, after, after_name)}"
-                        f"\n    {right} at {_where(operations[right], phase, after, after_name)}"
+                        f"  (phase={phase}, after={after}, after_name={after_name}, "
+                        f"before_name={before_name})"
+                        f"\n    {left} at "
+                        f"{_where(operations[left], phase, after, after_name, before_name)}"
+                        f"\n    {right} at "
+                        f"{_where(operations[right], phase, after, after_name, before_name)}"
                     )
             findings.append(
                 Finding(

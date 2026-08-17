@@ -1,27 +1,54 @@
 ---
 name: operate-run-alignment
-description: Use when the user wants to run, rerun, resume, or inspect an end-to-end VibeSim-to-vLLM alignment experiment. Covers the explicit phases (instrumented vLLM/NSYS profile, measured-shape timing prediction, analysis split into kernel-align and e2e-align, and simulation), the analyzer-derived GPU duty-cycle multiplier that the simulation auto-injects, and semantic labeling of folded measured kernel positions onto simulated CostTree slots. This skill runs and labels; interpreting the results to judge alignment quality (kernel deviation, duty cycle, TTFT/TPOT) belongs to top-align-with-framework. NOT for implementing alignment infrastructure, running an unrelated deployment simulation, or using timing-predict without measured vLLM alignment.
+description: >-
+  Run, resume, or inspect the shared VibeSim↔framework evidence pipeline for
+  vLLM or SGLang. Its artifacts support both simulator validation through
+  top-align-with-framework and framework optimization through
+  top-compose-real-framework-from-sim.
 ---
 
 # Run Alignment
 
-Operate the existing alignment pipeline to produce a reproducible comparison
-between one VibeSim run and one measured vLLM run. Keep every matching decision
-in the folded labeled kernel-sequence JSON; never create a separate mapping YAML.
+Operate the existing alignment pipeline to produce one reproducible evidence
+exchange between VibeSim and a measured vLLM or SGLang run. Keep every matching
+decision in the labeled kernel-sequence JSON; never create a separate mapping
+YAML.
 
 Read `alignment/README.md` and `alignment/profiler/README.md` first — they own
 the phase configs, artifact roots, and commands. This skill covers only the
-operator judgment those docs leave open. To then judge whether the model is well
-aligned from the produced artifacts, see `top-align-with-framework`.
+operator judgment those docs leave open.
+
+## Choose the consuming direction
+
+Run the same capture, normalization, labeling, and comparison path in both
+directions. Choose the consumer from the user's question before interpreting the
+result:
+
+- **Align VibeSim to framework:** determine whether the simulator faithfully explains
+  the measured framework. Hand the completed artifacts to
+  `top-align-with-framework` for judgment and simulator-side repair routing.
+- **Align framework to VibeSim:** use the simulated target and its measured-only /
+  simulated-only gaps to locate framework implementation opportunities. Hand
+  the same artifacts to `top-compose-real-framework-from-sim`, which owns trial
+  selection, implementation, controlled baseline/trial measurement, and the
+  retain/reject decision.
+
+This operate skill produces and checks evidence. It does not decide which side
+is wrong, select a framework optimization, or edit either implementation.
 
 ## Respect the supported boundary
 
-Alignment v1 supports one `deployment: unified` target, one main group + one
-replica, one vLLM rank (`server.tp_size: 1`), and the `vllm_text` builder with
-`group_assignment: single`. Stop and report an unsupported TP, replica,
-deployment, or input-builder request; never silently reduce it to this boundary.
+The server pipeline supports one `deployment: unified` target, one main group,
+and one replica. The real engine may be `vllm` or `sglang`; its explicit world
+size is `server.tp_size * server.dp_size` and must equal both the visible-device
+population and the simulation topology. Use the shared `engine_text` builder
+(`vllm_text` and `sglang_text` remain accepted adapter spellings):
+`group_assignment: single` for one attention-DP group, or `per_dp_rank` when
+each attention-DP rank schedules its own batch. Stop and report an unsupported
+replica, deployment, topology, or input-builder request; never silently reduce
+it to TP1 or collapse DP batches.
 
-## Run the phases
+## Run the shared phases
 
 From `main/`, run each phase through the launcher (`uv run python -m launcher
 alignment {profile,timing-predict,analyze,sim}`; see README for the configs).
@@ -33,23 +60,35 @@ and the simulation phase injects it automatically. So `analyze` splits into two
 semantic passes and runs on both sides of the simulation. Dry-run profile and sim
 before the real launch.
 
-1. **Profile** — instrumented vLLM/NSYS. Preflight the GPU, port, NSYS, model
-   cache, and fork venv (`fork_python` must import `torch` and `vllm`); use
-   `cuda_profiler_api` + CUDA graph node tracing.
+Require launcher metadata to declare the producer/artifact kind explicitly
+(`framework_capture`, `timing_predict`, or `simulation`). Never infer it from an
+incidental file such as `raw/run_meta.json`. A consumer must reject absent or
+unknown producer kinds rather than choosing semantics from directory contents.
+
+1. **Profile** — instrumented vLLM or SGLang under NSYS. Preflight the GPU,
+   port, NSYS, model cache, and fork venv (`fork_python` must import `torch` and
+   the selected engine); use `cuda_profiler_api` + CUDA graph node tracing.
 2. **Timing prediction** — set the typed input builder. It reads the simulation
    *preset* (`simulation.yaml` via `simulation_preset`) for gpu/arch/backends, so
    it runs before any completed simulation. `measured_phase: forward` only
    reconstructs input shapes, it does not limit later analysis. Inspect the
    emitted CostTree leaf slots before mapping. A cold profile DB may JIT-fill and
    need the matching GPU.
-3. **Label + kernel-align** — copy `profile/kernel_sequences.json` to
-   `kernel_sequences_labeled.json`, label every stored occurrence per the rules
-   below, and reference only that file from
-   `iteration.labeled_kernel_sequences_file`. Validate it before the analyzer run:
+3. **Label + kernel-align** — initialize a labeled inventory with explicit
+   unmapped decisions, label every stored occurrence per the rules below, and
+   reference only that file from `iteration.labeled_kernel_sequences_file`:
 
    ```bash
+   uv run python -m alignment label initialize \
+     logs/<experiment>/profile/kernel_sequences.json \
+     logs/<experiment>/kernel_sequences_labeled.json
    uv run python -c 'from pathlib import Path; from launcher.alignment_config import load_labeled_kernel_sequences; load_labeled_kernel_sequences(Path("logs/<experiment>/kernel_sequences_labeled.json"))'
    ```
+
+   Use `initialize --unfold` only when an implementation-identical repeated
+   layer boundary and one-off model boundary need different labels. It preserves
+   the same kernel-align entry point while making each occurrence addressable as
+   `literal-v1`; use `before_name` to state the distinguishing successor.
 
    Run `analyze` with only `iteration.enabled` (the kernel-align config, no
    `simulation_log_dir`). The strict analyzer expands the folded inventory
@@ -79,10 +118,31 @@ kernels run after the marker closes), and do not subtract an iteration's own bus
 union from its host span and call the remainder idle or CPU overhead — it can be
 queue time occupied by a prior iteration.
 
+## Preserve one raw-evidence layer
+
+Reuse one capture-evidence parser for full serving runs and bounded repetitive
+units reached through the same framework entry point. Keep profiler schema,
+process/device ownership, correlation joins, interval union, ordered events, and
+coarse kernel taxonomy in a shared raw layer. Keep framework scheduling
+interpretation and CostTree semantics in separate consumers. Do not introduce a
+second command-only capture path or an alignment-only fixed-shape input builder
+merely to make a small reproduction convenient. Explicit shapes already belong
+to the existing `operate-run-timing-predict` entry point.
+
+The same evidence must expose both directions:
+
+- measured operations with no simulated owner;
+- simulated work with no measured counterpart.
+
+Do not add labels merely to improve coverage. Every mapped or profiled owner
+must match the measured production operation's backend specialization, layout,
+page contract, numeric contract, and shape. A common operation name does not
+make ragged, paged, calibration, or cache-free paths equivalent.
+
 ## Match measured kernels to simulated slots
 
 Matching is semantic alignment between two decompositions: measured CUDA kernel
-occurrences (grouped by vLLM phase, folded by exact repetition) and named L1 leaf
+occurrences (grouped by engine phase, folded by exact repetition) and named L1 leaf
 slots in the timing-predict CostTree. The join key is a stable model operation,
 not a demangled kernel name. Weigh evidence in this order:
 
@@ -131,6 +191,54 @@ from both inventories and require exact equality of the remaining
 phase/sequence/fold/name/category structure before transferring; otherwise review
 every changed position and never fuzzy-match.
 
+## Reduce logical occurrences, not raw rows
+
+Identify one logical occurrence by phase and operation ordinal across folded
+sequences and devices, never by a raw row ID. Preserve the ordered raw inventory
+for audit, then reduce durations according to synchronization semantics:
+
+- independent replicated compute contributes the critical-rank duration;
+- a synchronizing collective uses arrival-to-completion semantics while keeping
+  arrival wait separate from kernel cost;
+- never sum the same replicated logical occurrence across ranks in a stacked
+  critical path.
+
+`unmapped` and cross-rank synchronization are independent labels. An unmapped
+collective may still require synchronizing reduction.
+
+Produce an auditable unmapped inventory grouped by semantic family and logical
+critical-path contribution. Classify with phase, folded position, ordered
+neighbors, semantics, and tensor/collective ownership — never a remembered
+ordinal or demangled name alone. Alignment reports facts and candidate owners;
+it does not select the next framework optimization.
+
+## Preserve routing and workload equivalence
+
+For MoE baseline reproduction, capture logical routing/popularity outside the
+timed range and inject that same demand into the simulator. Preserve original
+layer and step/request identity, token count, top-k, logical expert counts,
+route-weight mass, and temporal variation. A single model-wide histogram erases
+layer skew and bursts and cannot support per-iteration critical-path alignment.
+
+Keep logical demand separate from framework realization. The reusable input is
+the token-to-expert assignment and route weight before EP placement, padding,
+duplicated sends, local permutation, and collective wait. Use realized rows and
+bytes as validation evidence, not simulator demand; otherwise the framework's
+inefficiency becomes a simulated requirement.
+
+Communication-sensitive analysis also needs joint structure: source/destination
+owner unique-token counts, owner-hit multiplicity, and expert co-occurrence.
+Marginal expert counts size grouped compute but cannot determine dispatch
+duplication or bottleneck message bytes.
+
+Version the routing artifact with model/router/checkpoint revision,
+token/request digest, sampling policy, expert namespace, observation window,
+and schema. Store logical expert IDs independently from placement so target
+exploration can remap experts. Validate end-to-end consumption: assignment and
+weight totals, post-placement per-layer rank distributions, padding/drop policy,
+generated kernel shapes, and simulated message sizes. Reading the artifact or
+setting a config field is not proof that the CostTree consumed it.
+
 ## Verify completion
 
 The experiment is complete only when: `analysis/alignment_manifest.json` uses the
@@ -144,7 +252,8 @@ E2E pairing has no unexplained missing requests.
 
 Report the experiment dir, exact commands, request/iteration counts, captured
 phases, mapping coverage, total iteration error, E2E latency/throughput error,
-unmapped gaps, and links to the labeled inventory, reports, and plots.
+unmapped gaps, intended consuming direction, and links to the labeled inventory,
+reports, and plots.
 
 ## Resume and failure policy
 

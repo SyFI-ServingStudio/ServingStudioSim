@@ -1,14 +1,17 @@
-"""`python -m alignment label <command>` — the four questions a labeling pass asks.
+"""`python -m alignment label <command>` — make the manual alignment step checkable.
 
+    initialize start a labeled copy with explicit decisions
     coverage   where is the unmapped time, on both sides
     walk       what ran around this kernel, in program order
+    slots      which simulated leaves are available under one prefix
     check      does the inventory contain a defect that reaches a number
     apply      run a rule file over the inventory
+    transfer   move reviewed labels onto an identical re-parse
 
 `coverage` needs an analyzer report and so runs after `analyze kernel-align`;
-the other three read only the inventory and the cost manifest, so they run
-before it. That is the loop: check coverage, walk the positions the unmapped
-time sits at, write rules, apply, re-analyze.
+the other commands read only labeling inputs and write only explicit requested
+outputs, so they run before it. That is the loop: initialize, inspect positions
+and slots, apply rules, check coverage, and re-analyze.
 """
 
 from __future__ import annotations
@@ -18,7 +21,14 @@ import sys
 from pathlib import Path
 
 from .diagnose import check, format_coverage, format_findings, read_coverage, short_name
-from .inventory import load_inventory, load_slots, slots_with_prefix, walk_kernels
+from .inventory import (
+    load_inventory,
+    load_slots,
+    save_inventory,
+    slots_with_prefix,
+    unfold_inventory,
+    walk_kernels,
+)
 from .rules import apply_rule_file
 from .transfer import transfer_label_file
 
@@ -46,9 +56,29 @@ def _walk(args: argparse.Namespace) -> int:
         print(
             f"{position.coordinate:>44}{marker}{position.repeat:<4} "
             f"{operation or '-':<38} after={position.previous_operation or '-':<32} "
-            f"{short_name(position.name)[:70]}"
+            f"{short_name(position.name)[:70]} "
+            f"before={short_name(position.next_name or '-')[:40]}"
         )
         shown += 1
+    return 0
+
+
+def _initialize(args: argparse.Namespace) -> int:
+    document = load_inventory(args.source)
+    if args.unfold:
+        unfold_inventory(document)
+    positions = list(walk_kernels(document))
+    labeled = [position.coordinate for position in positions if position.label]
+    if labeled:
+        raise ValueError(
+            "source inventory already contains labels; first labeled positions: "
+            + ", ".join(labeled[:5])
+        )
+    for position in positions:
+        position.label.update({"status": "unmapped", "cross_rank": "independent"})
+    save_inventory(args.output, document)
+    representation = "literal" if args.unfold else "folded"
+    print(f"initialized {len(positions)} {representation} positions as explicit unmapped labels")
     return 0
 
 
@@ -74,9 +104,7 @@ def _apply(args: argparse.Namespace) -> int:
 
 
 def _transfer(args: argparse.Namespace) -> int:
-    report = transfer_label_file(
-        args.source, args.destination, args.output, write=not args.dry_run
-    )
+    report = transfer_label_file(args.source, args.destination, args.output, write=not args.dry_run)
     print(report.format())
     if args.dry_run:
         print("\n(dry run — nothing was written)")
@@ -86,6 +114,18 @@ def _transfer(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m alignment label", description=__doc__)
     subcommands = parser.add_subparsers(dest="command", required=True)
+
+    initialize = subcommands.add_parser(
+        "initialize", help="copy a fresh inventory with explicit unmapped labels"
+    )
+    initialize.add_argument("source", type=Path)
+    initialize.add_argument("output", type=Path)
+    initialize.add_argument(
+        "--unfold",
+        action="store_true",
+        help="expand repeats so occurrence-specific full-model boundaries can be labeled",
+    )
+    initialize.set_defaults(handler=_initialize)
 
     coverage = subcommands.add_parser("coverage", help="unmapped measured kernels and slots")
     coverage.add_argument(
@@ -130,7 +170,10 @@ def main(argv: list[str] | None = None) -> int:
     transfer.set_defaults(handler=_transfer)
 
     args = parser.parse_args(argv)
-    return int(args.handler(args))
+    try:
+        return int(args.handler(args))
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

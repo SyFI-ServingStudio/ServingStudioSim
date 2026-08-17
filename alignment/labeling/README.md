@@ -17,18 +17,31 @@ both ways of getting it wrong are silent:
 This package is the machinery that makes both visible.
 
 ```bash
-python -m alignment label coverage <analysis_kernel/reports/alignment_iteration_report.json>
-python -m alignment label walk     <kernel_sequences_labeled.json> [--phase forward] [--name FRAGMENT] [--unmapped]
-python -m alignment label slots    <timing_predict/raw/cost_manifest/worker_predict_0.json> <slot prefix>
-python -m alignment label check    <kernel_sequences_labeled.json>
-python -m alignment label apply    <kernel_sequences_labeled.json> <cost manifest> <rules.json> [--dry-run]
-python -m alignment label transfer <labeled inventory> <re-parsed inventory> <output> [--dry-run]
+uv run python -m alignment label initialize <kernel_sequences.json> <kernel_sequences_labeled.json> [--unfold]
+uv run python -m alignment label coverage <analysis_kernel/reports/alignment_iteration_report.json>
+uv run python -m alignment label walk     <kernel_sequences_labeled.json> [--phase forward] [--name FRAGMENT] [--unmapped]
+uv run python -m alignment label slots    <timing_predict/raw/cost_manifest/worker_predict_0.json> <slot prefix>
+uv run python -m alignment label check    <kernel_sequences_labeled.json>
+uv run python -m alignment label apply    <kernel_sequences_labeled.json> <cost manifest> <rules.json> [--dry-run]
+uv run python -m alignment label transfer <labeled inventory> <re-parsed inventory> <output> [--dry-run]
 ```
 
 `coverage` needs an analyzer report and so runs after `analyze kernel-align`;
 the rest read only the inventory and the cost manifest. The loop is: read
 coverage, walk the positions the unmapped time sits at, write rules, apply,
 re-analyze.
+
+`initialize` is the only valid way to start a labeled copy from a fresh parser
+inventory. It refuses any source that already contains a label, then writes an
+explicit `{"status": "unmapped", "cross_rank": "independent"}` on every
+folded position. Subsequent rule passes turn reviewed positions into mapped
+labels; the analyzer never has to interpret a missing key as a decision.
+
+Use `initialize --unfold` when a full-model boundary shares the exact kernel
+signature of a repeated layer boundary. The command losslessly expands every
+repeat and records `encoding: literal-v1`, so a rule can distinguish the last
+occurrence with `before_name` instead of assigning one semantic label to all
+repetitions. The compact folded representation remains the default.
 
 ## The four views
 
@@ -37,7 +50,9 @@ but it reports measured kernels one row per folded position, so a kernel that
 runs at 225 positions never shows its total anywhere. Aggregated by name and
 printed beside the unmapped simulated slots, an unlabeled subsystem is obvious:
 its kernels and its slots are both at the top of their lists, describing the
-same work.
+same work. All list values are totals across the report's iterations; the
+headline also prints a per-iteration average so a multi-iteration labeling run
+cannot be mistaken for one measured iteration.
 
 **`walk`** flattens the folded program — phase → sequence → segment → repeat
 body — into program order, carrying each position's folded coordinates and its
@@ -74,11 +89,12 @@ reviewable artifact rather than a script that ran once:
 ]}
 ```
 
-A rule matches on the three evidence keys `operate-run-alignment` allows a name
+A rule matches on the four evidence keys `operate-run-alignment` allows a name
 to be disambiguated by, and no others: `name` (a fragment, always required),
 `after` (the nearest mapped operation before it in the same segment body),
 `after_name` (the immediately preceding kernel's name, for where that neighbour
-is itself unlabeled), and `phase`. Rules are tried in file order and the first
+is itself unlabeled), `before_name` (the immediately following kernel's name,
+for a one-off full-model boundary), and `phase`. Rules are tried in file order and the first
 match wins. A rule never overwrites an existing mapping unless it says
 `overwrite`, so the order of a rule file cannot silently change an earlier
 decision; a position already carrying the rule's own operation is reported as

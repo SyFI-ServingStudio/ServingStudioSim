@@ -1,13 +1,8 @@
 ---
 name: dev-llm-serving
 description: >-
-  Use for implementation work in a real LLM or multimodal serving framework:
-  inference servers, TTFT/TPOT/throughput, KV cache, batching, attention
-  backends, CUDA graphs, speculative decoding, quantization, MoE, prefix
-  caching, multimodal serving, or changes to vLLM, SGLang, TensorRT-LLM,
-  PyTorch, MLX, and AWS Trainium stacks. Provides a routed implementation
-  reference library. When called by a higher-level workflow, implements only
-  its frozen trial brief; it does not choose the optimization or judge results.
+  Implement or review code in a real LLM or multimodal serving framework using
+  the routed reference library. Under a parent workflow, follows its frozen trial.
 ---
 
 # Dev LLM Serving
@@ -28,6 +23,14 @@ truth. Use this library to determine **how** to implement that trial, not to pic
 a different optimization. Do not sweep parameters, substitute a favorite
 backend, call the simulator, or judge the measured result unless the parent
 explicitly assigns that work.
+
+## Kernel, fusion, and collective work
+
+Route real kernel/backend implementation, producer-consumer fusion, and
+collective or payload changes through `dev-compose-kernel`. It owns the six-step
+workflow from measured target through isolated proof, production integration,
+and full-server promotion. Keep this skill focused on the surrounding serving
+system and its routed reference library.
 
 ### Implementation mode — what the code may be made of
 

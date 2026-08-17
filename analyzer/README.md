@@ -139,6 +139,10 @@ sequence-row-to-operation labels. An operation may own one
 or more simulated leaf slots; its measured kernel durations are counted once
 and its folded slot workloads are summed. Reports, payloads, and plots stay in
 the analysis root; the input roots are never used as output directories.
+When schema-v4 folding assigns different sequences to disjoint rank subsets,
+mapped rows with the same phase, semantic operation, and per-device ordinal are
+one logical occurrence and are joined before cross-rank reduction. The original
+rows remain the authority for mapping and unmapped-work audits.
 
 ## Directory map
 

@@ -1,16 +1,8 @@
 ---
 name: dev-present-changes-for-review
 description: >-
-  Use when the user wants help REVIEWING a body of changes themselves — a
-  feature branch, a working diff, or "walk me through what changed so I can
-  review it." Runs as a MULTI-ROUND, user-paced walkthrough: round one presents
-  only the inventory (changes categorized by module) plus the proposed review
-  order, then stops; each later round delivers one unit — isolated changes
-  first, then each large coupled chunk explained top-down from the user's
-  invocation down to the leaf implementation, file by file with line-number
-  anchors — and only advances when the user asks. NOT a correctness/design audit
-  of one file (that is dev-file-design-review) — this ORGANIZES and NARRATES a
-  changeset so the human reads it in the right order, it does not pass judgement.
+  Guide a user-paced review of a branch or diff: inventory first, then one
+  coherent change at a time. Not a correctness or design audit of one file.
 ---
 
 # Present Changes for Review
@@ -58,6 +50,12 @@ defines *how many rounds and when*.
 2. **Pull the file list + churn:** `git diff --stat <base>` (or `<base>...HEAD`).
    If there are logical commits, note them (`git log --oneline <base>..HEAD`) —
    they are a hint, not necessarily the best reading order.
+   Also inspect `git status --short`, the staged diff, untracked generated
+   sources, and nested repositories/submodules. A working tree that passes tests
+   can still produce an incomplete commit when a required file is untracked or
+   lives behind another Git boundary. Check tracked binary handoffs such as
+   `profiling/profile.db` for `skip-worktree`; status silence is not proof that
+   their working copy equals the committed copy.
 3. **Bucket every changed file by module/layer.** For VibeSim map each path to:
    - **Launcher / user entry** (`launcher/`) — CLI flags, schema, sweep,
      validation: the invocation surface the user drives.
@@ -122,6 +120,8 @@ For every isolated item and every step of every chunk, go file by file:
   chunk 2 → … → tests → docs.
 - State the validation already run (which test suites, green/red) so the reviewer
   knows the safety net that exists.
+- Distinguish committed, staged, unstaged, untracked, and nested-repository work;
+  verify the exact staged or archived snapshot before calling it self-contained.
 - Flag open questions / intentional design deviations for explicit sign-off
   (see memory `feedback_surface_design_deviations`).
 

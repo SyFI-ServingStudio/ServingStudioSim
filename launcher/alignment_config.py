@@ -358,7 +358,7 @@ def _labeled_sequence_positions(
 
 
 def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
-    """Validate the self-contained folded inventory before snapshotting it."""
+    """Validate a self-contained compact or occurrence-addressable inventory."""
     path = Path(path)
     if path.suffix.lower() != ".json":
         raise ValueError(f"labeled kernel sequences must be JSON: {path}")
@@ -376,9 +376,13 @@ def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
             "labeled kernel sequence keys mismatch: "
             f"missing={sorted(missing)} extra={sorted(extra)}"
         )
-    if schema_version not in {2, 3, 4} or raw["encoding"] != "folded-v1":
+    if schema_version not in {2, 3, 4} or raw["encoding"] not in {
+        "folded-v1",
+        "literal-v1",
+    }:
         raise ValueError(
-            "labeled kernel sequences require schema_version 2, 3 or 4 encoding folded-v1"
+            "labeled kernel sequences require schema_version 2, 3 or 4 and encoding "
+            "folded-v1 or literal-v1"
         )
     if schema_version in {3, 4}:
         device_ids = raw["device_ids"]
@@ -511,6 +515,8 @@ def _validate_labeled_kernel(
     if label["status"] == "unmapped":
         if mapping_keys != {"status"}:
             raise ValueError(f"{context} unmapped label cannot contain mapping fields")
+        if cross_rank is None:
+            raise ValueError(f"{context} unmapped label must declare cross_rank")
         return
     if label["status"] != "mapped":
         raise ValueError(f"{context}.label.status must be mapped or unmapped")

@@ -24,6 +24,7 @@ from profiling.profilers.measure_context import (
     get_measure_context,
     set_measure_context,
 )
+from profiling.profilers.trend_plot import _plot_rolling_window, _plot_sample_indices
 
 # ── CPU tier: measure context is inert unless explicitly set ─────────────────
 
@@ -44,6 +45,33 @@ def test_measure_context_set_get_clear_roundtrip(tmp_path):
     finally:
         clear_measure_context()
     assert get_measure_context() is None
+
+
+def test_plot_sample_indices_preserve_small_series():
+    assert _plot_sample_indices(4, max_points=4).tolist() == [0, 1, 2, 3]
+    assert _plot_sample_indices(0, max_points=4).tolist() == []
+
+
+def test_plot_sample_indices_bound_large_series_and_preserve_endpoints():
+    indices = _plot_sample_indices(150_604, max_points=20_000)
+
+    assert len(indices) == 20_000
+    assert indices[0] == 0
+    assert indices[-1] == 150_603
+    assert (indices[1:] > indices[:-1]).all()
+
+
+def test_plot_sampling_rejects_invalid_sizes():
+    with pytest.raises(ValueError, match="sample_count"):
+        _plot_sample_indices(-1)
+    with pytest.raises(ValueError, match="max_points"):
+        _plot_sample_indices(1, max_points=0)
+
+
+def test_plot_rolling_window_preserves_approximate_timeline_width():
+    assert _plot_rolling_window(150_604, 20_000) == 27
+    assert _plot_rolling_window(20_000, 20_000) == 201
+    assert _plot_rolling_window(0, 0) == 1
 
 
 # ── CPU tier: pure summaries over synthetic samples ──────────────────────────
@@ -300,6 +328,36 @@ def test_cli_measure_default_output_dir(monkeypatch, tmp_path, capsys):
     assert str(calls["kwargs"]["output_dir"]) == "measure_single_gemm_torch_linear"
 
 
+def test_cli_measure_reports_runner_error_before_missing_gpu_provenance(
+    monkeypatch, tmp_path, capsys
+):
+    def fake_measure(_kernel_kind, _spec, **kwargs):
+        result = _fake_measure_result(kwargs["output_dir"])
+        result.update(observed_gpu_name=None, runner_error="exact worker failure")
+        return result
+
+    monkeypatch.setattr(perf_api, "measure_kernel", fake_measure)
+    exit_code = cli.main(
+        [
+            "measure",
+            "single_gemm",
+            "--backend",
+            "torch_linear",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--spec",
+            '{"m": 8, "n": 8, "k": 8, "dtype": "fp16"}',
+            "--json",
+        ]
+    )
+
+    assert exit_code == 2
+    assert json.loads(capsys.readouterr().err) == {
+        "ok": False,
+        "error": "kernel measurement runner failed: exact worker failure",
+    }
+
+
 def test_cli_measure_rejects_multiple_specs(monkeypatch, capsys):
     monkeypatch.setattr(
         perf_api,
@@ -383,9 +441,7 @@ def test_measure_worker_uses_selected_python_and_composed_pythonpath(
             existing_pythonpath,
         ]
     )
-    assert captured_env["LD_LIBRARY_PATH"] == os.pathsep.join(
-        [str(library_root), "/existing/lib"]
-    )
+    assert captured_env["LD_LIBRARY_PATH"] == os.pathsep.join([str(library_root), "/existing/lib"])
     assert response["measure"]["consumed"] is True
 
 

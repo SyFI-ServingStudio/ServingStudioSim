@@ -2,6 +2,7 @@
 
     python -m alignment parse   --sqlite T.sqlite --metrics M.jsonl \
                                 --iteration-start N --iteration-end M
+    python -m alignment ranges  T.sqlite --range-prefix framework.phase.
     python -m alignment label   {coverage,walk,slots,check,apply} ...
 
 Launching belongs to `python -m launcher alignment
@@ -19,6 +20,7 @@ from __future__ import annotations
 import sys
 
 from .labeling import cli as labeling_cli
+from .nsys import evidence as nsys_evidence
 from .nsys import parse as nsys_parse
 
 
@@ -35,6 +37,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "parse":
         return nsys_parse.main(rest)
+
+    if cmd == "ranges":
+        return nsys_evidence.main(rest)
 
     if cmd == "label":
         return labeling_cli.main(rest)

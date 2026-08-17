@@ -24,6 +24,37 @@ _POWER_COLOR = "#E15759"
 _CLOCK_COLOR = "#4E79A7"
 _UTIL_COLOR = "#59A14F"
 _TEMP_COLOR = "#F28E2B"
+_MAX_PLOT_POINTS = 20_000
+
+
+def _plot_sample_indices(
+    sample_count: int,
+    max_points: int = _MAX_PLOT_POINTS,
+) -> np.ndarray:
+    """Select a uniform, endpoint-preserving sample for rendering only."""
+
+    if sample_count < 0:
+        raise ValueError("sample_count must be nonnegative")
+    if max_points <= 0:
+        raise ValueError("max_points must be positive")
+    if sample_count <= max_points:
+        return np.arange(sample_count, dtype=np.int64)
+    return np.linspace(0, sample_count - 1, num=max_points, dtype=np.int64)
+
+
+def _plot_rolling_window(
+    sample_count: int,
+    plotted_sample_count: int,
+    base_window: int = 201,
+) -> int:
+    """Keep the rolling median's approximate timeline width after sampling."""
+
+    if sample_count <= 0 or plotted_sample_count <= 0:
+        return 1
+    scaled_window = max(1, round(base_window * plotted_sample_count / sample_count))
+    if scaled_window % 2 == 0:
+        scaled_window += 1
+    return min(base_window, scaled_window)
 
 
 def _pyplot() -> Any:
@@ -65,10 +96,23 @@ def plot_runtime_trend(
     axis.set_facecolor("white")
     figure.suptitle(_title(summary), fontsize=16, fontweight="bold")
 
-    axis.scatter(starts, durations, s=4, alpha=0.16, color=_SCATTER_COLOR, label="every launch")
-    centers, medians = rolling_median(durations)
+    plot_indices = _plot_sample_indices(len(starts))
+    plot_starts = starts[plot_indices]
+    plot_durations = durations[plot_indices]
+    axis.scatter(
+        plot_starts,
+        plot_durations,
+        s=4,
+        alpha=0.16,
+        color=_SCATTER_COLOR,
+        label=f"launch sample ({len(plot_indices):,} / {len(starts):,})",
+    )
+    centers, medians = rolling_median(
+        plot_durations,
+        window=_plot_rolling_window(len(durations), len(plot_durations)),
+    )
     axis.plot(
-        starts[centers],
+        plot_starts[centers],
         medians,
         color=_MEDIAN_COLOR,
         linewidth=2.2,
@@ -146,9 +190,26 @@ def plot_runtime_telemetry(
         axis.grid(True, alpha=0.2)
 
     runtime_axis = axes[0]
-    runtime_axis.scatter(runtime_times, runtime_values, s=3, alpha=0.13, color=_SCATTER_COLOR)
-    centers, medians = rolling_median(runtime_values)
-    runtime_axis.plot(runtime_times[centers], medians, color=_MEDIAN_COLOR, linewidth=2.0)
+    plot_indices = _plot_sample_indices(len(runtime_times))
+    plot_runtime_times = runtime_times[plot_indices]
+    plot_runtime_values = runtime_values[plot_indices]
+    runtime_axis.scatter(
+        plot_runtime_times,
+        plot_runtime_values,
+        s=3,
+        alpha=0.13,
+        color=_SCATTER_COLOR,
+    )
+    centers, medians = rolling_median(
+        plot_runtime_values,
+        window=_plot_rolling_window(len(runtime_values), len(plot_runtime_values)),
+    )
+    runtime_axis.plot(
+        plot_runtime_times[centers],
+        medians,
+        color=_MEDIAN_COLOR,
+        linewidth=2.0,
+    )
     runtime_axis.set_ylabel("kernel duration (ms)")
 
     power_axis = axes[1]
@@ -187,13 +248,19 @@ def plot_runtime_telemetry(
 
     state_axis = axes[2]
     state_axis.plot(
-        telemetry_times, _column(aligned, "gpu_util_pct"), color=_UTIL_COLOR, linewidth=1.5,
+        telemetry_times,
+        _column(aligned, "gpu_util_pct"),
+        color=_UTIL_COLOR,
+        linewidth=1.5,
         label="GPU utilization",
     )
     state_axis.set_ylabel("GPU utilization (%)", color=_UTIL_COLOR)
     temperature_axis = state_axis.twinx()
     temperature_axis.plot(
-        telemetry_times, _column(aligned, "temperature_c"), color=_TEMP_COLOR, linewidth=1.5,
+        telemetry_times,
+        _column(aligned, "temperature_c"),
+        color=_TEMP_COLOR,
+        linewidth=1.5,
         label="temperature",
     )
     temperature_axis.set_ylabel("Temperature (°C)", color=_TEMP_COLOR)

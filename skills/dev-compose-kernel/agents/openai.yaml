@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compose a Production Kernel"
+  short_description: "Find, build, integrate, and prove serving kernels"
+  default_prompt: "Use $dev-compose-kernel to find or build a kernel, integrate it into the real serving boundary, and prove correctness and performance in six clear steps."

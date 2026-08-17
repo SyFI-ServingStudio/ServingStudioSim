@@ -393,6 +393,12 @@ def _cmd_measure(args: argparse.Namespace) -> int:
             telemetry=args.telemetry,
             clear_l2=args.clear_l2,
         )
+        runner_error = result.get("runner_error")
+        if runner_error:
+            # Physical-GPU provenance is meaningful only after the runner
+            # succeeds. Preserve the worker's actionable failure instead of
+            # replacing it with a secondary missing-provenance error.
+            raise ValueError(f"kernel measurement runner failed: {runner_error}")
         observed_gpu = result.get("observed_gpu_name")
         if not observed_gpu:
             raise ValueError("kernel measurement did not report an observed physical GPU")
