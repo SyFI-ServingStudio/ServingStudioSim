@@ -1,6 +1,8 @@
 ---
 name: operate-profile-existing-kernel
-description: Use when asked to list, query, count missing rows for, JIT-fill, force-refresh, validate, visualize, or run the `measure` NVML/CUPTI telemetry diagnostic for an existing VibeSim L1 profiler entry through `uv run python -m launcher kernel-profile`. Applies only to registered KernelProfilerSpec table/backend pairs and batched specs.
+description: >-
+  Query, fill, refresh, validate, or measure a registered VibeSim L1 kernel
+  profile, including DB-row provenance and preservation.
 ---
 
 # Profile Run Existing Kernel
@@ -65,6 +67,33 @@ Important semantics:
   or `run_profile_batch` directly for this workflow.
 - A fifth verb, `measure`, is **not** a cache operation — it is a cache-free
   NVML/CUPTI telemetry diagnostic. See "The `measure` diagnostic" below.
+
+### Row provenance and production equivalence
+
+A row is valid for a consumer only when its profiler contract matches the
+production lookup: backend specialization, algorithm, layout and page contract,
+numeric and scale contract, exact shape, GPU key, and profiler revision. A
+shared operation name does not make ragged, paged, calibration, cache-free, or
+different quantization paths interchangeable.
+
+Record these fields with the spec set and verify them before calling a row a DB
+hit for the target experiment. If provenance is unavailable, report the row as
+unverified rather than inferring equivalence from table/backend alone.
+
+### Preserve rows written in a worktree
+
+`profiling/profile.db` is tracked, but a worktree may hide its local changes with
+`skip-worktree`. Check before writing the shared database:
+
+```bash
+git ls-files -v profiling/profile.db
+```
+
+An `S` prefix means new profile rows may not appear in `git status`. Record the
+worktree and database path that receive the rows. If the rows must be preserved,
+explicitly transfer that database to the checkout responsible for keeping it.
+Stage or commit it only when the user requests that action. A clean `git status`
+does not prove the rows were saved.
 
 ### Automatic work submission
 

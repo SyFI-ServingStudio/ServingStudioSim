@@ -1,6 +1,9 @@
 ---
 name: operate-run-alignment
-description: Use when the user wants to run, rerun, resume, or inspect an end-to-end VibeSim-to-vLLM alignment experiment. Covers the explicit phases (instrumented vLLM/NSYS profile, measured-shape timing prediction, analysis split into kernel-align and e2e-align, and simulation), the analyzer-derived GPU duty-cycle multiplier that the simulation auto-injects, and semantic labeling of folded measured kernel positions onto simulated CostTree slots. This skill runs and labels; interpreting the results to judge alignment quality (kernel deviation, duty cycle, TTFT/TPOT) belongs to top-align-with-framework. NOT for implementing alignment infrastructure, running an unrelated deployment simulation, or using timing-predict without measured vLLM alignment.
+description: >-
+  Run, resume, or inspect the VibeSim-to-vLLM alignment pipeline from framework
+  capture through simulation and analysis. Interpretation belongs to
+  top-align-with-framework.
 ---
 
 # Run Alignment
@@ -32,6 +35,11 @@ before the simulation — the analyzer's **kernel-align** pass emits
 and the simulation phase injects it automatically. So `analyze` splits into two
 semantic passes and runs on both sides of the simulation. Dry-run profile and sim
 before the real launch.
+
+Require launcher metadata to declare the producer/artifact kind explicitly
+(`framework_capture`, `timing_predict`, or `simulation`). Never infer it from an
+incidental file such as `raw/run_meta.json`. A consumer must reject absent or
+unknown producer kinds rather than choosing semantics from directory contents.
 
 1. **Profile** — instrumented vLLM/NSYS. Preflight the GPU, port, NSYS, model
    cache, and fork venv (`fork_python` must import `torch` and `vllm`); use
@@ -78,6 +86,24 @@ Do not use the phase NVTX envelope as GPU E2E (host submission ranges; graph
 kernels run after the marker closes), and do not subtract an iteration's own busy
 union from its host span and call the remainder idle or CPU overhead — it can be
 queue time occupied by a prior iteration.
+
+## Preserve one raw-evidence layer
+
+Reuse one launcher lifecycle and capture-evidence parser for bounded commands
+and servers. Keep profiler schema, process/device ownership, correlation joins,
+interval union, ordered events, and coarse kernel taxonomy in a shared raw layer.
+Keep framework scheduling interpretation and CostTree semantics in separate
+consumers.
+
+The same evidence must expose both directions:
+
+- measured operations with no simulated owner;
+- simulated work with no measured counterpart.
+
+Do not add labels merely to improve coverage. Every mapped or profiled owner
+must match the measured production operation's backend specialization, layout,
+page contract, numeric contract, and shape. A common operation name does not
+make ragged, paged, calibration, or cache-free paths equivalent.
 
 ## Match measured kernels to simulated slots
 
@@ -130,6 +156,54 @@ When reusing labels from an earlier capture, strip only `label` and provenance
 from both inventories and require exact equality of the remaining
 phase/sequence/fold/name/category structure before transferring; otherwise review
 every changed position and never fuzzy-match.
+
+## Reduce logical occurrences, not raw rows
+
+Identify one logical occurrence by phase and operation ordinal across folded
+sequences and devices, never by a raw row ID. Preserve the ordered raw inventory
+for audit, then reduce durations according to synchronization semantics:
+
+- independent replicated compute contributes the critical-rank duration;
+- a synchronizing collective uses arrival-to-completion semantics while keeping
+  arrival wait separate from kernel cost;
+- never sum the same replicated logical occurrence across ranks in a stacked
+  critical path.
+
+`unmapped` and cross-rank synchronization are independent labels. An unmapped
+collective may still require synchronizing reduction.
+
+Produce an auditable unmapped inventory grouped by semantic family and logical
+critical-path contribution. Classify with phase, folded position, ordered
+neighbors, semantics, and tensor/collective ownership — never a remembered
+ordinal or demangled name alone. Alignment reports facts and candidate owners;
+it does not select the next framework optimization.
+
+## Preserve routing and workload equivalence
+
+For MoE baseline reproduction, capture logical routing/popularity outside the
+timed range and inject that same demand into the simulator. Preserve original
+layer and step/request identity, token count, top-k, logical expert counts,
+route-weight mass, and temporal variation. A single model-wide histogram erases
+layer skew and bursts and cannot support per-iteration critical-path alignment.
+
+Keep logical demand separate from framework realization. The reusable input is
+the token-to-expert assignment and route weight before EP placement, padding,
+duplicated sends, local permutation, and collective wait. Use realized rows and
+bytes as validation evidence, not simulator demand; otherwise the framework's
+inefficiency becomes a simulated requirement.
+
+Communication-sensitive analysis also needs joint structure: source/destination
+owner unique-token counts, owner-hit multiplicity, and expert co-occurrence.
+Marginal expert counts size grouped compute but cannot determine dispatch
+duplication or bottleneck message bytes.
+
+Version the routing artifact with model/router/checkpoint revision,
+token/request digest, sampling policy, expert namespace, observation window,
+and schema. Store logical expert IDs independently from placement so target
+exploration can remap experts. Validate end-to-end consumption: assignment and
+weight totals, post-placement per-layer rank distributions, padding/drop policy,
+generated kernel shapes, and simulated message sizes. Reading the artifact or
+setting a config field is not proof that the CostTree consumed it.
 
 ## Verify completion
 

@@ -1,6 +1,8 @@
 ---
 name: skill-of-skills
-description: "Use when adding, renaming, reorganizing, or choosing among repo-local VibeSim skills under main/skills. Defines the skill hierarchy, naming conventions, and parent/child relationships between top-level, orchestrator-level, and implement-level skills."
+description: >-
+  Add, rename, organize, or select repo-local VibeSim skills. Defines naming
+  levels, workflow routing, and writing quality.
 ---
 
 # Skill Of Skills
@@ -28,6 +30,28 @@ source of truth.
   as worktrees, tests, file review, or presenting diffs for human review.
 
 Folder name and frontmatter `name` must match exactly.
+
+## Writing Quality
+
+Every skill must be **clear, concise, readable, and actionable**:
+
+- **Clear:** state the task, decision, or rule directly. Define project terms
+  that a capable engineer may not know.
+- **Concise:** keep only information that changes what the agent does. Do not
+  repeat a rule across the description, introduction, and checklist.
+- **Readable:** use short sentences, concrete nouns and verbs, and one purpose
+  per section. Put the plain-language instruction before implementation detail.
+- **Actionable:** tell the agent what to inspect or run, what success looks like,
+  and what to do when the check fails.
+
+Keep the frontmatter description to one or two sentences covering the trigger,
+scope, and nearest exclusion. It is routing metadata, not a table of contents.
+
+Avoid abstract words such as `contract`, `provenance`, `gate`, `handoff`, or
+`boundary` when they merely rename a concrete action. When one is useful, say
+exactly what must be recorded, checked, transferred, or rejected. After editing,
+reread the skill as someone without the author's history: the next action and
+completion condition should be obvious.
 
 ## Current Tree
 
@@ -70,7 +94,10 @@ top-compose-real-framework-from-sim - actively build a real serving framework fr
 ├── operate-run-simulation - produce the comparable serving-workload target and analyzer artifacts
 ├── operate-run-timing-predict - compare exact fixed-shape building-block candidates
 ├── operate-profile-serving-run - capture and attribute a real serving profile (the Probe step)
-└── dev-llm-serving - implement the frozen trial in the real framework using the routed serving reference library
+├── dev-build-serving-repetitive-unit - investigate kernels with a complete reduced model on the production execution path
+├── dev-compose-kernel - find, build, integrate, and promote a real serving kernel or communication boundary
+├── dev-llm-serving - implement the frozen trial in the real framework using the routed serving reference library
+└── operate-compare-serving-performance - compare overall performance against a second real engine, then aggregate coarse device-time regions
 
 operate-run-simulation - run deployment simulations from presets (DES, workload trace)
 operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
@@ -80,6 +107,7 @@ operate-gpu-spec - query or update the GPU spec catalog
 operate-profile-sim-speed - profile simulator wallclock speed
 operate-profile-serving-run - capture a comparable bounded profile of a real serving process and attribute its wall time to named engine phases (NVTX readiness + instrumentation contract, node-level CUDA-graph tracing, nsys SQLite aggregation)
 operate-profile-existing-kernel - query or fill registered profiler rows
+operate-compare-serving-performance - compare two real serving engines under one request/numeric contract, overall metrics first and coarse device-region totals second
 
 dev-create-worktree - create an VibeSim development worktree
 dev-orchestrate-parallel-subagents - isolate concurrent writing subagents
@@ -87,6 +115,8 @@ dev-run-tests - select and run VibeSim test tiers
 dev-compose-worker - plan, estimate, implement, compose, and review production L5 workers against the four-axis ownership rules
 dev-file-design-review - review one file against docs and contracts
 dev-present-changes-for-review - organize a diff for human review
+dev-build-serving-repetitive-unit - kernel/layer-timing development with reduced depth but production model, loader, engine, API, and profiler paths
+dev-compose-kernel - compose a real serving kernel, fused boundary, or collective change through six practical steps
 dev-llm-serving - implement or review real LLM/multimodal serving framework code using the copied models/algorithms/backends/frameworks/hardware/engines/tooling reference library
 ```
 

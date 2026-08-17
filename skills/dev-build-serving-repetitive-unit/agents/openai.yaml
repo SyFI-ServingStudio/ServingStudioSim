@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build a Complete Reduced Serving Model"
+  short_description: "Investigate kernels with a production-path reduced model"
+  default_prompt: "Use $dev-build-serving-repetitive-unit to build a production-path reduced model for kernel and layer-timing work, not scheduler policy or E2E serving conclusions."

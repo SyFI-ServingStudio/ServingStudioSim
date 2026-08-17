@@ -1,17 +1,8 @@
 ---
 name: operate-profile-serving-run
 description: >-
-  Use when capturing or re-capturing a profile of a REAL LLM-serving process
-  (the framework under optimization) so a measured result can be attributed to
-  engine phases — GPU-idleness preflight, warmup exclusion, bounded nsys
-  capture, capture-flag parity between baseline and trial, node-level CUDA-graph
-  tracing (`--cuda-graph-trace=node`) so graph-replay kernels appear at all, the
-  NVTX readiness check and its opt-in default-off instrumentation contract,
-  `nsys export` SQLite aggregation correlating NVTX ranges with CUDA API calls
-  and GPU kernels, process cleanup, and artifact provenance. NOT the VibeSim simulator's
-  own wallclock (that is operate-profile-sim-speed), NOT L1 kernel profile.db
-  rows (that is operate-profile-existing-kernel), and NOT the phased
-  VibeSim-to-vLLM alignment pipeline (that is operate-run-alignment).
+  Capture and attribute a bounded nsys profile of a real LLM-serving process.
+  Not for simulator wallclock, L1 profile DB rows, or the full alignment pipeline.
 ---
 
 # Operate Profile Serving Run
@@ -102,6 +93,12 @@ throughput. Take the score from the unprofiled benchmark run and the
 attribution from the profiled run; do not quote a profiled run's throughput as
 the result.
 
+For small differences, alternate the baseline/trial run order to reduce clock
+and thermal drift. Before comparing two captures, check that both contain the
+expected producer ranges and iteration records, cover a comparable share of
+kernel work, use the same analysis window, and actually ran the intended
+backend and graph mode. An artifact directory only proves that a command ran.
+
 ## Step 3 — Warmup, then a bounded capture
 
 Everything one-time must be outside the window: process start, CUDA context
@@ -165,6 +162,18 @@ is unreadable and slow to export; seconds of steady state answer the question.
 A targeted window is also more *correct*, not merely smaller: a long full-run
 capture can silently stop recording CUDA activity partway through, leaving late
 iterations with NVTX ranges and no kernels.
+
+### Record iteration time in the framework
+
+Have the framework record each iteration directly with monotonic start/end
+timestamps and elapsed time. Include the phase, prefill chunks, decode KV
+lengths, scheduled tokens and requests, batch size, rank, and actual graph and
+backend mode.
+
+Shape-only records can build timing-predict inputs, but do not say how long a
+real iteration took. Do not estimate exact iteration time from client latency
+or low-resolution log timestamps. Report framework elapsed time, kernel busy
+time, collective wait, device gaps, and uncovered host time separately.
 
 ### Trace CUDA graphs at node level, not graph level
 
@@ -342,6 +351,28 @@ A report is one primary class plus:
 2. the artifact paths and the provenance block from Step 1;
 3. what remains unattributed, stated explicitly. Unattributed host time is a
    real finding; silently dropping it makes a partial picture look complete.
+
+## Verify shutdown and generated modules
+
+Record every process started by the run. On success, timeout, or failure, stop
+only that process tree and verify that its ports and GPU resources are released.
+A finished tmux foreground command does not prove that compiler or worker
+children exited.
+
+For custom or JIT-compiled modules:
+
+- record build flags, paths, module identity, and the actual compile/load event;
+- finish every required process-local build before reporting server readiness;
+- in strict-prebuilt mode, fail before model loading when an artifact is absent;
+- record source, dependency, and ABI identity so stale binaries are rejected;
+- reject the sample if a worker fails but its parent survives, or if the run
+  artifact never reaches a terminal state;
+- destroy graph objects that retain collective communicators before destroying
+  distributed process groups.
+
+A cached binary is not proof that this run loaded it. A run is complete only
+after its processes exit, its artifact reaches a terminal state, and its ports
+and GPU resources are released.
 
 ## What invalidates a comparison
 
