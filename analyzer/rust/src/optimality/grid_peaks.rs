@@ -23,7 +23,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::io::{resolve_artifact_path, write_json, SCHEMA_VERSION};
-use crate::kernel_query::{repo_root, run_kernel_query, simulator_binary};
+use crate::kernel_query::{owning_repo_root, run_kernel_query, simulator_binary};
 use crate::trace::manifest::ManifestDoc;
 
 /// Sidecar filename under `raw/` (co-located with the parquet it derives from).
@@ -148,7 +148,9 @@ fn generate(
     if unique.is_empty() {
         anyhow::bail!("no kernel configs found in manifests");
     }
-    let root = repo_root()?;
+    // Peaks are per kernel *kind*, and a run's arch may register kinds that
+    // exist only in the checkout it was launched from — query that simulator.
+    let root = owning_repo_root(log_dir)?;
     let simulator = simulator_binary(&root)?;
     let requests: Vec<Value> = unique
         .iter()

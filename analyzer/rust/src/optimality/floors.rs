@@ -37,7 +37,7 @@ use crate::conservation::workload::{
     collect_iteration_workload, collect_workload_by_worker, collect_workload_shapes_by_worker,
     WeightedWorkload, WorkloadTotals,
 };
-use crate::kernel_query::repo_root;
+use crate::kernel_query::owning_repo_root;
 
 /// One level's two labeler floors, in GPU·seconds. Ordered `fused ≤ segmented`.
 #[derive(Clone, Copy, Default)]
@@ -484,7 +484,11 @@ fn run_labeler_json(log_dir: &Path, levels: &HashMap<String, WorkloadTotals>) ->
 }
 
 fn run_labeler_request(log_dir: &Path, request: Value) -> Result<Value> {
-    let root = repo_root().context("repo root not found for the labeler subprocess")?;
+    // The checkout that produced this run, not the one the analyzer runs from:
+    // `raw/params.json` names its model config repo-relatively, so the labeler
+    // must resolve it against the same tree the run was launched in.
+    let root =
+        owning_repo_root(log_dir).context("repo root not found for the labeler subprocess")?;
     let log_dir_abs: PathBuf = if log_dir.is_absolute() {
         log_dir.to_path_buf()
     } else {

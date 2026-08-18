@@ -836,7 +836,6 @@ async fn get_prediction_optimality_kernel_ladder(
         Err(error) => return prediction_resource_error(error),
     };
     match prediction_kernel_ladder(
-        state.repo_root.as_ref(),
         &prediction.path,
         source.pool_tag(),
         source.worker_id(),
@@ -867,7 +866,6 @@ async fn get_prediction_optimality_waterfall(
         Err(error) => return prediction_resource_error(error),
     };
     match prediction_waterfall(
-        state.repo_root.as_ref(),
         &prediction.path,
         source.pool_tag(),
         source.worker_id(),
@@ -1497,7 +1495,6 @@ async fn get_iteration_optimality_kernel_ladder(
         Err(error) => return worker_resource_error(error),
     };
     match iteration_kernel_ladder(
-        state.repo_root.as_ref(),
         &run.path,
         &pool_tag,
         worker_id,
@@ -1521,7 +1518,6 @@ async fn get_iteration_optimality_waterfall(
         Err(error) => return worker_resource_error(error),
     };
     match iteration_waterfall(
-        state.repo_root.as_ref(),
         &run.path,
         &pool_tag,
         worker_id,

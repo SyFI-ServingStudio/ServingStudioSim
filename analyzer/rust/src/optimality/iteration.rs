@@ -10,6 +10,7 @@ use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
 use crate::io::{read_cost_manifests, read_run_meta, read_worker_gpu_counts, SCHEMA_VERSION};
+use crate::kernel_query::owning_repo_root;
 use crate::session::{build_session, register_cost_log, require_columns, COST_LOG_TABLE};
 
 use super::ladder::{KernelLadder, NecessaryWorkPolicy};
@@ -54,28 +55,18 @@ struct ExactIterationAnalysis {
 /// R0 equals R1 because an iteration has no scheduler holding-span boundary;
 /// imbalance remains the exact R1-R2 aggregate chunk.
 pub(crate) async fn iteration_kernel_ladder(
-    repo_root: &Path,
     log_dir: &Path,
     pool_tag: &str,
     worker_id: u16,
     iter_id: u64,
     lock_batch_size: bool,
 ) -> Result<Value> {
-    iteration_kernel_ladder_with_gpu(
-        repo_root,
-        log_dir,
-        pool_tag,
-        worker_id,
-        iter_id,
-        lock_batch_size,
-        None,
-    )
-    .await
+    iteration_kernel_ladder_with_gpu(log_dir, pool_tag, worker_id, iter_id, lock_batch_size, None)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prediction_kernel_ladder(
-    repo_root: &Path,
     log_dir: &Path,
     pool_tag: &str,
     worker_id: u16,
@@ -86,7 +77,6 @@ pub(crate) async fn prediction_kernel_ladder(
     lock_batch_size: bool,
 ) -> Result<Value> {
     let mut value = iteration_kernel_ladder_with_gpu(
-        repo_root,
         log_dir,
         pool_tag,
         worker_id,
@@ -107,7 +97,6 @@ pub(crate) async fn prediction_kernel_ladder(
 
 #[allow(clippy::too_many_arguments)]
 async fn iteration_kernel_ladder_with_gpu(
-    repo_root: &Path,
     log_dir: &Path,
     pool_tag: &str,
     worker_id: u16,
@@ -116,7 +105,6 @@ async fn iteration_kernel_ladder_with_gpu(
     gpu_override: Option<(&str, usize)>,
 ) -> Result<Value> {
     let mut analysis = analyze_exact_iteration(
-        repo_root,
         log_dir,
         pool_tag,
         worker_id,
@@ -128,7 +116,10 @@ async fn iteration_kernel_ladder_with_gpu(
     let mut caveats = analysis.label_caveats.clone();
     let attribution = match analysis.label.as_ref() {
         Some(label) => {
-            match location::LocationCatalog::load(repo_root, log_dir).and_then(|catalog| {
+            // Location maps belong to the checkout that produced this run.
+            let catalog = owning_repo_root(log_dir)
+                .and_then(|repo_root| location::LocationCatalog::load(&repo_root, log_dir));
+            match catalog.and_then(|catalog| {
                 catalog.attribute_ladder(
                     pool_tag,
                     &analysis.exact.kernel_locations,
@@ -185,28 +176,17 @@ async fn iteration_kernel_ladder_with_gpu(
 /// The scope-fused floor belongs only to this aggregate view; the sibling ladder
 /// may expose the segmented floor because that one is location-attributable.
 pub(crate) async fn iteration_waterfall(
-    repo_root: &Path,
     log_dir: &Path,
     pool_tag: &str,
     worker_id: u16,
     iter_id: u64,
     lock_batch_size: bool,
 ) -> Result<Value> {
-    iteration_waterfall_with_gpu(
-        repo_root,
-        log_dir,
-        pool_tag,
-        worker_id,
-        iter_id,
-        lock_batch_size,
-        None,
-    )
-    .await
+    iteration_waterfall_with_gpu(log_dir, pool_tag, worker_id, iter_id, lock_batch_size, None).await
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prediction_waterfall(
-    repo_root: &Path,
     log_dir: &Path,
     pool_tag: &str,
     worker_id: u16,
@@ -217,7 +197,6 @@ pub(crate) async fn prediction_waterfall(
     lock_batch_size: bool,
 ) -> Result<Value> {
     let mut value = iteration_waterfall_with_gpu(
-        repo_root,
         log_dir,
         pool_tag,
         worker_id,
@@ -245,7 +224,6 @@ pub(crate) async fn prediction_waterfall(
 
 #[allow(clippy::too_many_arguments)]
 async fn iteration_waterfall_with_gpu(
-    repo_root: &Path,
     log_dir: &Path,
     pool_tag: &str,
     worker_id: u16,
@@ -254,7 +232,6 @@ async fn iteration_waterfall_with_gpu(
     gpu_override: Option<(&str, usize)>,
 ) -> Result<Value> {
     let analysis = analyze_exact_iteration(
-        repo_root,
         log_dir,
         pool_tag,
         worker_id,
@@ -295,7 +272,6 @@ async fn iteration_waterfall_with_gpu(
 }
 
 async fn analyze_exact_iteration(
-    repo_root: &Path,
     log_dir: &Path,
     pool_tag: &str,
     worker_id: u16,
@@ -310,7 +286,6 @@ async fn analyze_exact_iteration(
     require_columns(&context, COST_LOG_TABLE, COST_COLS).await?;
     let exact = fold_exact_iteration(
         &context,
-        repo_root,
         log_dir,
         pool_tag,
         worker_id,
@@ -348,7 +323,6 @@ async fn analyze_exact_iteration(
 
 async fn fold_exact_iteration(
     context: &SessionContext,
-    repo_root: &Path,
     log_dir: &Path,
     pool_tag: &str,
     worker_id: u16,
@@ -381,7 +355,10 @@ async fn fold_exact_iteration(
         .map(|(gpu_name, gpu_count)| (gpu_name.to_owned(), gpu_count.max(1)))
         .unwrap_or((discovered_gpu_name, discovered_gpu_count));
     let gpu_count = gpu_count as f64;
-    let (gpu_spec_matched, gpu_spec) = spec::load_gpu_spec(repo_root, &gpu_name)
+    // `gpu/spec.json` is read from the checkout that produced this run.
+    let (gpu_spec_matched, gpu_spec) = owning_repo_root(log_dir)
+        .ok()
+        .and_then(|repo_root| spec::load_gpu_spec(&repo_root, &gpu_name))
         .map(|(name, spec)| (Some(name), spec))
         .unwrap_or((None, GpuSpec::default()));
     let hardware_bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;

@@ -12,7 +12,7 @@ use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
 use crate::io::{read_cost_manifests, read_run_meta, read_worker_gpu_counts, SCHEMA_VERSION};
-use crate::kernel_query::repo_root;
+use crate::kernel_query::owning_repo_root;
 use crate::session::{register_cost_log, require_columns, COST_LOG_TABLE};
 
 use super::ladder::NecessaryWorkPolicy;
@@ -81,7 +81,9 @@ pub async fn run_optimality(
 
     // Hardware rate ceilings (R5) + grid-peak ceilings (R3).
     let (_num_gpus, gpu_name) = read_run_meta(log_dir).unwrap_or((1, String::new()));
-    let repository_root = repo_root().ok();
+    // Model configs, location maps, and `gpu/spec.json` belong to the checkout
+    // that produced this run, which the service's own cwd need not be.
+    let repository_root = owning_repo_root(log_dir).ok();
     let matched_gpu_spec = repository_root
         .as_deref()
         .and_then(|root| spec::load_gpu_spec(root, &gpu_name));
