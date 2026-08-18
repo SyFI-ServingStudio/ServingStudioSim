@@ -68,6 +68,28 @@ pub fn read_run_meta(log_dir: &Path) -> Option<(usize, String)> {
     Some((num_gpus, gpu_name))
 }
 
+/// The GPU facts a *timing prediction* records: `(gpu_count, gpu_name)` from
+/// `prediction.meta.json`.
+///
+/// A prediction never runs the scheduler, so it writes no `run_meta.json` — but
+/// it does name the GPU it was costed against, and its single `gpu_count`
+/// covers the one worker it folds per pool. Callers that need the run's GPU
+/// identity should try [`read_run_meta`] first and fall back here; without the
+/// fallback a prediction has no hardware peaks at all, which silently collapses
+/// the R5 hardware limit onto R4 and leaves the R6/R7 floors unattributed.
+pub fn read_prediction_gpu(log_dir: &Path) -> Option<(usize, String)> {
+    let path = resolve_artifact_path(log_dir, "prediction.meta.json");
+    let text = fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let gpu_name = json.get("gpu")?.as_str()?.to_owned();
+    let gpu_count = json
+        .get("gpu_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
+    Some((gpu_count, gpu_name))
+}
+
 /// Deployment-defined request-stage vocabulary from `run_meta.json` (v5+).
 /// Stage codes in `request_slo` are intentionally opaque to the analyzer until
 /// decoded through this sidecar; keeping that lookup here prevents subjects from
@@ -279,6 +301,24 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A timing prediction carries the GPU identity the batch optimality subject
+    /// needs, and a run directory must not be mistaken for one.
+    #[test]
+    fn prediction_gpu_is_read_only_from_a_prediction_directory() {
+        let log_dir = tempfile::tempdir().expect("temp log dir");
+        assert_eq!(read_prediction_gpu(log_dir.path()), None);
+
+        fs::write(
+            log_dir.path().join("prediction.meta.json"),
+            json!({"gpu": "NVIDIA H200", "gpu_count": 4, "selector": "iter"}).to_string(),
+        )
+        .expect("write prediction meta");
+        assert_eq!(
+            read_prediction_gpu(log_dir.path()),
+            Some((4, "NVIDIA H200".to_string()))
+        );
+    }
 
     #[test]
     fn stage_vocab_parser_preserves_open_category_names() {

@@ -11,7 +11,9 @@ use anyhow::{Context, Result};
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
-use crate::io::{read_cost_manifests, read_run_meta, read_worker_gpu_counts, SCHEMA_VERSION};
+use crate::io::{
+    read_cost_manifests, read_prediction_gpu, read_run_meta, read_worker_gpu_counts, SCHEMA_VERSION,
+};
 use crate::kernel_query::owning_repo_root;
 use crate::session::{register_cost_log, require_columns, COST_LOG_TABLE};
 
@@ -63,12 +65,27 @@ pub async fn run_optimality(
 
     let mut caveats: Vec<String> = Vec::new();
 
+    // A simulation records its GPUs in `run_meta.json`; a timing prediction runs
+    // no scheduler and writes `prediction.meta.json` instead. Read whichever the
+    // producer wrote — a prediction that resolves no GPU has no hardware peaks at
+    // all, which collapses R5 onto R4 and leaves R6/R7 unattributed.
+    let prediction_gpu = read_prediction_gpu(log_dir);
+
     // G_worker from run_meta — READ, never inferred. Absent → single-GPU degrade.
-    let worker_gpu_counts = read_worker_gpu_counts(log_dir);
+    let worker_gpu_counts = read_worker_gpu_counts(log_dir).or_else(|| {
+        // A prediction folds exactly one worker per pool, so its single
+        // `gpu_count` describes every worker the manifest names.
+        prediction_gpu.as_ref().map(|(gpu_count, _)| {
+            manifests_by_worker
+                .keys()
+                .map(|(pool_tag, worker_id)| (pool_tag.clone(), *worker_id, *gpu_count))
+                .collect()
+        })
+    });
     let has_worker_gpu_counts = worker_gpu_counts.is_some();
     if !has_worker_gpu_counts {
         caveats.push(
-            "run_meta worker GPU counts unavailable; treating every worker as 1 GPU \
+            "no run_meta / prediction GPU counts; treating every worker as 1 GPU \
              (worker/pool/cluster GPU·s are not physical)"
                 .to_string(),
         );
@@ -80,7 +97,9 @@ pub async fn run_optimality(
         .collect();
 
     // Hardware rate ceilings (R5) + grid-peak ceilings (R3).
-    let (_num_gpus, gpu_name) = read_run_meta(log_dir).unwrap_or((1, String::new()));
+    let (_num_gpus, gpu_name) = read_run_meta(log_dir)
+        .or(prediction_gpu)
+        .unwrap_or((1, String::new()));
     // Model configs, location maps, and `gpu/spec.json` belong to the checkout
     // that produced this run, which the service's own cwd need not be.
     let repository_root = owning_repo_root(log_dir).ok();
