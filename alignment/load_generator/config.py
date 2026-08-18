@@ -23,12 +23,17 @@ class SessionFrontendConfig:
     """
 
     type: ClassVar[str] = "session"
+    # req-frontend takes one COMPLETE family format and has no separate family
+    # selector, so the wire value belongs to the frontend variant rather than
+    # being derived from `type` at the call site.
+    input_file_format: ClassVar[str] = "text-generation-session-execution-v2"
     path: str
 
 
 @dataclass
 class IndependentFrontendConfig:
     type: ClassVar[str] = "independent"
+    input_file_format: ClassVar[str] = "text-generation-independent"
     path: str
 
 
