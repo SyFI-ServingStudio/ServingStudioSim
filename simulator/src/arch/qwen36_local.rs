@@ -39,8 +39,8 @@ use crate::worklet::{
     Qwen36SharedExpertLocalWorkletInput, Qwen36SharedExpertLocalWorkletResolved,
     VllmFp8MoeExpertComputeLocalWorklet, VllmFp8MoeExpertComputeLocalWorkletConfig,
     VllmFp8MoeExpertComputeLocalWorkletInput, VllmFp8MoeExpertComputeLocalWorkletResolved,
-    uniform_local_ppm,
 };
+use crate::timing::routing::RoutingDistribution;
 
 const CHECKPOINT_LAYERS: u32 = 40;
 const HIDDEN: u32 = 2_048;
@@ -330,18 +330,29 @@ pub struct Qwen36LocalModel {
     n_slots: usize,
 }
 
-fn exact_local_ppm() -> Vec<u32> {
-    let mut ppm = uniform_local_ppm(NUM_EXPERTS, 1);
-    for value in ppm.iter_mut().take(64) {
-        *value += 1;
-    }
-    debug_assert_eq!(ppm.iter().map(|&v| u64::from(v)).sum::<u64>(), 1_000_000);
-    ppm
-}
-
-pub fn build_configs(model: &Qwen36ModelCfg, parallel: &Qwen36LocalParallel) -> Qwen36LocalConfigs {
+/// At EP1 the one rank owns every expert, so the grouped GEMM's local shard IS
+/// the global distribution — no `split_for_ep` slicing, just the whole vector.
+///
+/// Routing matters here even without expert parallelism. Skew does not change
+/// the total token-expert selections, so it leaves total FLOPs alone; what it
+/// changes is how those selections are grouped, and a grouped GEMM pays per
+/// group. Feeding a measured `expert_popularity` profile in is therefore the
+/// difference between costing the routing vLLM actually produced and costing an
+/// idealized balanced one.
+pub fn build_configs(
+    model: &Qwen36ModelCfg,
+    parallel: &Qwen36LocalParallel,
+    routing: &RoutingDistribution,
+) -> Qwen36LocalConfigs {
     let gpu = parallel.gpu_name.clone();
-    let ppm = exact_local_ppm();
+    assert_eq!(
+        routing.num_experts(),
+        model.num_experts.get(),
+        "routing distribution has {} experts, model has {}",
+        routing.num_experts(),
+        model.num_experts.get(),
+    );
+    let ppm = routing.ppm().to_vec();
     Qwen36LocalConfigs {
         embedding: ElementwiseKernelConfig {
             backends: ELEMENTWISE_BACKENDS.to_vec(), gpu_name: gpu.clone(),
@@ -704,7 +715,10 @@ mod tests {
     }
 
     fn model(layers: u32) -> Qwen36ModelCfg { parse_model_json(&fixture(), Some(layers), None).unwrap() }
-    fn cfgs(layers: u32) -> Qwen36LocalConfigs { build_configs(&model(layers), &Qwen36LocalParallel { gpu_name: "NVIDIA H200".into() }) }
+    fn cfgs(layers: u32) -> Qwen36LocalConfigs { cfgs_routed(layers, &RoutingDistribution::uniform(NUM_EXPERTS)) }
+    fn cfgs_routed(layers: u32, routing: &RoutingDistribution) -> Qwen36LocalConfigs {
+        build_configs(&model(layers), &Qwen36LocalParallel { gpu_name: "NVIDIA H200".into() }, routing)
+    }
     fn enumerate_model(layers: u32) -> Qwen36LocalModel {
         let bridge = PerfApiBridge::new_uninit_for_test(); bridge.enable_enumerate();
         build("model".into(), resolve_configs(&cfgs(layers)), &bridge).unwrap()
@@ -732,6 +746,36 @@ mod tests {
             let mut value: serde_json::Value = serde_json::from_str(&fixture()).unwrap(); mutate(&mut value);
             assert!(parse_model_json(&value.to_string(), None, None).is_err());
         }
+    }
+
+    #[test]
+    /// EP1 removes dispatch/combine traffic, not the grouped GEMM's dependence
+    /// on routing: a measured skew must reach `local_ppm` whole, or the cost is
+    /// of an idealized balanced model rather than the one vLLM ran.
+    #[test]
+    fn a_routing_skew_reaches_the_grouped_gemm_whole_at_ep1() {
+        let balanced = cfgs(40);
+        let skewed = cfgs_routed(40, &RoutingDistribution::power_law(NUM_EXPERTS, 1.0));
+
+        // No `split_for_ep` shard: the one rank owns every expert.
+        assert_eq!(skewed.routed_expert.local_ppm.len(), NUM_EXPERTS as usize);
+        assert_ne!(
+            skewed.routed_expert.local_ppm,
+            balanced.routed_expert.local_ppm,
+            "skew must survive into the grouped GEMM config"
+        );
+        // Routed compute and the combine that follows it must see one routing,
+        // not two.
+        assert_eq!(skewed.routed_expert.local_ppm, skewed.finalize.local_ppm);
+        // Skew redistributes selections; it does not create or destroy them.
+        assert_eq!(
+            skewed.routed_expert.local_ppm.iter().map(|&v| u64::from(v)).sum::<u64>(),
+            1_000_000,
+        );
+        assert!(
+            skewed.routed_expert.local_ppm[0] > skewed.routed_expert.local_ppm[255],
+            "power-law routing must leave the head heavier than the tail"
+        );
     }
 
     #[test]

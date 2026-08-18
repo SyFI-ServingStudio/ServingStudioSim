@@ -90,11 +90,23 @@ const fn default_glm52_parallel_size() -> u16 {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IterArchSel {
     /// Exact text-only Qwen3.6-35B-A3B FP8 execution graph on one local H200.
-    /// TP1/EP1 are architectural invariants, so this selector exposes only the
-    /// checkpoint identity and layer-count controls carried by `ModelSpec`.
+    /// TP1/EP1 are architectural invariants, so this selector exposes no
+    /// sharding parameters — but routing is not a sharding parameter. Every
+    /// expert lives on the one GPU, which removes dispatch/combine traffic, not
+    /// the grouped GEMM's dependence on how many tokens each expert draws: skew
+    /// leaves the total token-expert selections unchanged while redistributing
+    /// them into fuller and emptier groups.
     Qwen36Local {
         #[serde(flatten)]
         model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        #[serde(default)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
     },
     Llama3Dense {
         #[serde(flatten)]
@@ -274,7 +286,7 @@ impl IterArchSel {
     /// The model identity/dims this arch operates on (every variant carries it).
     pub fn model(&self) -> &ModelSpec {
         match self {
-            Self::Qwen36Local { model }
+            Self::Qwen36Local { model, .. }
             | Self::Llama3Dense { model }
             | Self::Llama3DenseTp { model, .. }
             | Self::Llama3DpAttnTpFfn { model, .. }
@@ -292,14 +304,24 @@ mod iter_tests {
     use super::*;
 
     #[test]
-    fn qwen36_local_selector_has_the_exact_model_only_surface() {
+    fn qwen36_local_selector_publishes_only_routing_beyond_the_model() {
         let parsed: IterArchSel = serde_json::from_str(
             r#"{"type":"qwen36_local","model_config":"model/config/qwen3_6_35b_a3b_fp8.json","num_layers":40,"sim_num_layers":4,"fp8":true}"#,
         )
         .expect("qwen36_local selector parses");
-        let IterArchSel::Qwen36Local { model } = &parsed else {
+        let IterArchSel::Qwen36Local {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+        } = &parsed
+        else {
             panic!("expected qwen36_local")
         };
+        // Routing is optional on the wire and defaults to balanced, so an
+        // existing preset keeps its meaning.
+        assert_eq!(*routing, RoutingKind::Uniform);
+        assert!(routing_seed.is_none() && expert_popularity_file.is_none());
         assert_eq!(model.model_config, "model/config/qwen3_6_35b_a3b_fp8.json");
         assert_eq!(model.num_layers, Some(40));
         assert_eq!(model.sim_num_layers, Some(4));
@@ -312,8 +334,27 @@ mod iter_tests {
             .expect("qwen36_local provider schema row");
         assert_eq!(*tag, "qwen36_local");
         // Flattened ModelSpec fields are intentionally published once through
-        // schema::dump::arch_common, not duplicated on every provider row.
-        assert!(params.is_empty());
+        // schema::dump::arch_common, not duplicated on every provider row. TP1
+        // and EP1 are architectural invariants, so routing is the ONLY thing
+        // this arch adds: it is a property of the workload's token stream, not
+        // of a sharding choice, and the grouped GEMM costs it either way.
+        let published = serde_json::to_value(params).unwrap();
+        let published: Vec<&str> = published
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|param| param["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(published, ["routing", "routing_seed", "expert_popularity_file"]);
+        let popularity = serde_json::to_value(params).unwrap();
+        let popularity = popularity
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|param| param["name"] == "expert_popularity_file")
+            .expect("expert popularity schema parameter")
+            .clone();
+        assert_eq!(popularity["affects_cache"], true);
         let common = serde_json::to_value(ModelSpec::PARAMS).unwrap();
         let names = common
             .as_array()

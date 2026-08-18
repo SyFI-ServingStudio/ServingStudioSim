@@ -544,16 +544,30 @@ pub fn dense_tp(
 /// `ModelSpec` layer controls.
 pub fn qwen36_local(
     model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
 ) -> Result<Qwen36LocalModel> {
     let model_cfg = Qwen36ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
         .context("loading exact Qwen3.6-35B-A3B FP8 model config")?;
+    // EP1: the single rank owns every expert, so the "local" shard the grouped
+    // GEMM sees is the whole global distribution.
+    let routing = resolve_routing_source(
+        routing_kind,
+        routing_seed,
+        model_cfg.num_experts.get(),
+        1,
+        model_cfg.num_layers,
+        model_cfg.top_k,
+        expert_popularity_file,
+    )?;
     let parallel = Qwen36LocalParallel {
         gpu_name: gpu.to_string(),
     };
-    let configs = qwen36_local::build_configs(&model_cfg, &parallel);
+    let configs = qwen36_local::build_configs(&model_cfg, &parallel, &routing);
     let resolved = qwen36_local::resolve_configs(&configs);
     qwen36_local::build(name.to_string(), resolved, bridge)
         .context("building local Qwen3.6 TP1/EP1 model (often a missing profile.db row)")
@@ -879,9 +893,20 @@ pub fn build_iter_model(
     bridge: &PerfApiBridge,
 ) -> Result<Box<dyn IterwiseUnifiedModel>> {
     Ok(match sel {
-        IterArchSel::Qwen36Local { model } => {
-            Box::new(qwen36_local(model, gpu, name, bridge)?)
-        }
+        IterArchSel::Qwen36Local {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+        } => Box::new(qwen36_local(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::Llama3Dense { model } => Box::new(dense(model, gpu, name, bridge)?),
         IterArchSel::Llama3DenseTp { model, tp_size } => {
             Box::new(dense_tp(model, *tp_size, gpu, name, bridge)?)
@@ -1103,7 +1128,12 @@ mod tests {
             sim_num_layers: None,
             fp8: true,
         };
-        let selector = IterArchSel::Qwen36Local { model };
+        let selector = IterArchSel::Qwen36Local {
+            model,
+            routing: RoutingKind::Uniform,
+            routing_seed: None,
+            expert_popularity_file: None,
+        };
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
         let built = build_iter_model(&selector, "NVIDIA H200", "test", &bridge)

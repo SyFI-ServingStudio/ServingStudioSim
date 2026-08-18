@@ -157,10 +157,21 @@ impl Deployment for UnifiedDeployment {
             // Barebone cadence, hybrid KV: 30 GDN layers of per-request
             // recurrent state and 10 GQA layers of per-token KV live in one
             // attention budget, so only the KV axis differs from the arms below.
-            IterArchSel::Qwen36Local { .. } => {
+            IterArchSel::Qwen36Local {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                ..
+            } => {
                 ensure_barebone(&g.worker)?;
                 let model = Arc::new(arch_build::qwen36_local(
-                    model_spec, &gpu_name, MODEL_NAME, bridge,
+                    model_spec,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
                 )?);
                 Ok(assemble_flow(
                     model,
