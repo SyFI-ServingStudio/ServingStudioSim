@@ -419,57 +419,74 @@ pub fn resolve_configs(cfg: &Qwen36LocalConfigs) -> Qwen36LocalResolved {
     }
 }
 
-fn total_kv_bytes_per_token(resolved: &Qwen36LocalResolved) -> Dim {
+/// One full-attention layer's KV bytes for one token — K and V together. This is
+/// the unit vLLM's hybrid page alignment measures the SSM page against, so it is
+/// factored out rather than inlined into [`total_kv_bytes_per_token`].
+fn attention_page_bytes_per_token_per_layer(resolved: &Qwen36LocalResolved) -> Dim {
     let attn = &resolved.gated_gqa.attention;
     2 * attn.num_kv_heads.clone() * attn.head_dim.clone()
         * Dim::param("kv_bytes", attn.kv_dtype().size_bytes())
+}
+
+fn total_kv_bytes_per_token(resolved: &Qwen36LocalResolved) -> Dim {
+    attention_page_bytes_per_token_per_layer(resolved)
         * Dim::param("num_gqa_layers", resolved.num_gqa_layers)
 }
 
 /// One GDN layer's SSM state: the `(num_value_heads, key_head_dim,
-/// value_head_dim)` recurrent tensor. Kept separate from the conv window because
-/// vLLM sizes its hybrid block from the SSM page ALONE (the conv page is a
-/// separate additive term), so only this half feeds
-/// [`recurrent_checkpoint_interval_tokens`].
+/// value_head_dim)` recurrent tensor.
 fn ssm_state_bytes_per_layer(resolved: &Qwen36LocalResolved) -> Dim {
     let gdn = &resolved.gdn.raw_cfg;
     gdn.num_value_heads.clone() * gdn.key_head_dim.clone() * gdn.value_head_dim.clone()
         * Dim::param("ssm_state_bytes", gdn.ssm_state_dtype.size_bytes())
 }
 
-/// One GDN layer's causal-conv window over the mixed q/k/v channel stack.
-///
-/// Shape and dtype come from the GDN worklet config, so this stays consistent
-/// with what the L1 conv kernels are told to move. vLLM keeps only
-/// `conv_kernel_size - 1` taps (the current token supplies the last one), so
-/// this is ~33% generous — 0.75% of the whole per-request state, not worth
-/// diverging from the configured kernel shape over.
+/// One GDN layer's causal-conv window over the mixed q/k/v channel stack. vLLM
+/// keeps `conv_kernel_size - 1` taps, because the current token supplies the
+/// last one.
 fn conv_state_bytes_per_layer(resolved: &Qwen36LocalResolved) -> Dim {
     let gdn = &resolved.gdn.raw_cfg;
     let channels = 2 * gdn.num_key_heads.clone() * gdn.key_head_dim.clone()
         + gdn.num_value_heads.clone() * gdn.value_head_dim.clone();
-    channels * gdn.conv_kernel_size.clone()
+    channels * (gdn.conv_kernel_size.clone() - 1)
         * Dim::param("conv_state_bytes", gdn.conv_state_dtype.size_bytes())
 }
 
-/// Every GDN layer's SSM state plus its conv window. Both halves are required to
-/// resume a sequence, so a checkpoint that stores one without the other is
-/// unusable — they are always retained and charged together.
+/// One GDN layer's mamba page: SSM state plus conv window. Both halves are
+/// required to resume a sequence, so a checkpoint that stores one without the
+/// other is unusable — they are always retained and charged together.
+fn mamba_page_bytes_per_layer(resolved: &Qwen36LocalResolved) -> Dim {
+    ssm_state_bytes_per_layer(resolved) + conv_state_bytes_per_layer(resolved)
+}
+
+/// Every GDN layer's mamba page **as allocated**.
+///
+/// vLLM's hybrid allocator gives the mamba and attention groups one common page
+/// size: it picks the attention block from the mamba page
+/// ([`recurrent_checkpoint_interval_tokens`]) and then pads the mamba page up to
+/// that attention page, so the charged footprint is the padded one — for this
+/// model 2,162,688 B/layer against a 2,146,304 B true state, the "Padding mamba
+/// page size by 0.76%" the engine logs at startup.
 fn recurrent_state_bytes_per_request(resolved: &Qwen36LocalResolved) -> Dim {
-    (ssm_state_bytes_per_layer(resolved) + conv_state_bytes_per_layer(resolved))
+    recurrent_checkpoint_interval_tokens(resolved)
+        * attention_page_bytes_per_token_per_layer(resolved)
         * Dim::param("num_gdn_layers", resolved.num_gdn_layers)
 }
 
 /// vLLM's hybrid `block_size`: the smallest attention-kernel-aligned token count
-/// whose per-layer attention page covers one per-layer SSM page.
+/// whose per-layer attention page covers one per-layer mamba page.
 ///
-/// `attn_block_size = kernel_block_size * cdiv(ssm_page, kernel_block_size *
-/// single_token_k_page)` — verbatim from vllm-ascend#7393, where
-/// `kernel_block_size` is the attention KV-cache block granularity the worklet
-/// already configures. The divisor counts only K (vLLM's own asymmetry: the
-/// realized page holds K **and** V, so the chosen block is ~2x conservative).
-/// Both operands are per-layer per-rank, so the ratio is TP-invariant; this arch
-/// is TP1 anyway.
+/// `attn_block_size = kernel_block_size * cdiv(mamba_page, kernel_block_size *
+/// attn_page_per_token)`, where `kernel_block_size` is the attention KV-cache
+/// block granularity the worklet already configures. Both operands are per-layer
+/// per-rank, so the ratio is TP-invariant; this arch is TP1 anyway.
+///
+/// The numerator is the whole mamba page (SSM **and** conv) and the denominator
+/// counts K **and** V. An earlier reading of vllm-ascend#7393 had it as SSM-only
+/// over K-only, which lands on 2048 instead; the engine's own startup log for
+/// this checkpoint ("Setting attention block size to 1056 tokens", "Padding
+/// mamba page size by 0.76%") only reconstructs with both terms whole, and each
+/// correction alone misses (2112 and 1024 respectively).
 ///
 /// Returns 0 for a layer prefix with no GDN layer, matching the trait's "no
 /// recurrent state" encoding.
@@ -477,18 +494,15 @@ fn recurrent_checkpoint_interval_tokens(resolved: &Qwen36LocalResolved) -> Dim {
     if resolved.num_gdn_layers == 0 {
         return Dim::param("no_gdn_layers", 0);
     }
-    let attn = &resolved.gated_gqa.attention;
-    let single_token_k_page = attn.num_kv_heads.clone() * attn.head_dim.clone()
-        * Dim::param("kv_bytes", attn.kv_dtype().size_bytes());
     let kernel_block_size = Dim::param(
         "kv_cache_block_size",
         resolved.gated_gqa.raw_cfg.kv_cache_block_size,
     );
-    let quantum = kernel_block_size.clone() * single_token_k_page;
-    let ssm_page = ssm_state_bytes_per_layer(resolved);
+    let quantum = kernel_block_size.clone() * attention_page_bytes_per_token_per_layer(resolved);
+    let mamba_page = mamba_page_bytes_per_layer(resolved);
     // cdiv without a helper: Dim has no ceiling divide, and the "+ quantum - 1"
     // form keeps the whole derivation visible in the rendered expression.
-    kernel_block_size * ((ssm_page + quantum.clone() - 1) / quantum)
+    kernel_block_size * ((mamba_page + quantum.clone() - 1) / quantum)
 }
 
 pub fn build(name: String, resolved: Qwen36LocalResolved, bridge: &PerfApiBridge) -> std::result::Result<Qwen36LocalModel, BuildError> {
@@ -838,42 +852,48 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_state_bytes_count_ssm_plus_conv_on_every_gdn_layer() {
-        const SSM_PER_LAYER: u32 = 32 * 128 * 128 * 4;
-        const CONV_PER_LAYER: u32 = (2 * 16 * 128 + 32 * 128) * 4 * 2;
-        assert_eq!((SSM_PER_LAYER,CONV_PER_LAYER),(2_097_152,65_536));
+    fn recurrent_state_bytes_charge_the_padded_page_on_every_gdn_layer() {
+        const PADDED_PER_LAYER: u32 = 1056 * 2048;
+        assert_eq!(PADDED_PER_LAYER,2_162_688);
         for (layers,gdn_layers) in [(1,1),(3,3),(4,3),(5,4),(39,30),(40,30)] {
             let resolved = resolve_configs(&cfgs(layers));
             assert_eq!(resolved.num_gdn_layers,gdn_layers,"L={layers}");
             assert_eq!(
                 recurrent_state_bytes_per_request(&resolved).get(),
-                (SSM_PER_LAYER + CONV_PER_LAYER) * gdn_layers,
+                PADDED_PER_LAYER * gdn_layers,
                 "L={layers}",
             );
         }
         assert_eq!(recurrent_state_bytes_per_request(&resolve_configs(&cfgs(40))).get(),64_880_640);
     }
 
-    /// vLLM reports `attn_block_size = 512` for this checkpoint family at TP8
-    /// (vllm-project/vllm-ascend#7393). At TP1 both operands of the ratio grow
-    /// 8x, so the same formula must land on the same block for the TP8 shapes
-    /// and on 2048 for ours — the `num_kv_heads` difference (2 replicated to 1
-    /// per rank at TP8, 2 whole at TP1) is what moves it.
+    /// Reconstructs both numbers the engine logs at startup for this checkpoint
+    /// at TP1: "Setting attention block size to 1056 tokens" and "Padding mamba
+    /// page size by 0.76%". Only the whole-mamba-page over K-and-V reading of the
+    /// alignment rule hits both; SSM-only/K-only gives 2048, and either
+    /// correction alone gives 2112 or 1024.
     #[test]
-    fn checkpoint_interval_follows_the_vllm_page_alignment_rule() {
+    fn checkpoint_interval_reproduces_the_measured_vllm_block_size() {
         let resolved = resolve_configs(&cfgs(40));
-        let attn = &resolved.gated_gqa.attention;
         assert_eq!(
-            (attn.num_kv_heads.get() * attn.head_dim.get() * attn.kv_dtype().size_bytes(),
-             ssm_state_bytes_per_layer(&resolved).get()),
-            (1_024, 2_097_152),
-            "single-token K page and per-layer SSM page feeding the rule",
+            (attention_page_bytes_per_token_per_layer(&resolved).get(),
+             ssm_state_bytes_per_layer(&resolved).get(),
+             conv_state_bytes_per_layer(&resolved).get(),
+             mamba_page_bytes_per_layer(&resolved).get()),
+            (2_048, 2_097_152, 49_152, 2_146_304),
+            "per-token attention page and per-layer mamba page feeding the rule",
         );
-        assert_eq!(recurrent_checkpoint_interval_tokens(&resolved).get(),2_048);
+        assert_eq!(recurrent_checkpoint_interval_tokens(&resolved).get(),1_056);
+
+        let padded = recurrent_checkpoint_interval_tokens(&resolved).get()
+            * attention_page_bytes_per_token_per_layer(&resolved).get();
+        let padding_percent = 100.0 * (f64::from(padded)
+            / f64::from(mamba_page_bytes_per_layer(&resolved).get()) - 1.0);
+        assert!((padding_percent - 0.76).abs() < 0.005,"padding {padding_percent}% != logged 0.76%");
 
         // The interval is a property of the layer shapes, not of how many
         // layers the prefix keeps — only "no GDN layer at all" turns it off.
-        for (layers,expected) in [(1,2048),(3,2048),(4,2048),(39,2048),(40,2048)] {
+        for (layers,expected) in [(1,1056),(3,1056),(4,1056),(39,1056),(40,1056)] {
             assert_eq!(recurrent_checkpoint_interval_tokens(&resolve_configs(&cfgs(layers))).get(),expected,"L={layers}");
         }
     }
@@ -882,13 +902,13 @@ mod tests {
     fn built_model_exposes_the_recurrent_state_contract() {
         let model = enumerate_model(40);
         assert_eq!(model.recurrent_state_bytes_per_request(),64_880_640);
-        assert_eq!(model.recurrent_checkpoint_interval_tokens(),2_048);
+        assert_eq!(model.recurrent_checkpoint_interval_tokens(),1_056);
         // One checkpoint costs 3168 tokens of full-attention KV: the alignment
         // rule equalizes PER-LAYER pages, and this model has 30 GDN : 10 GQA
-        // layers, so a checkpoint is ~1.55x the KV of the span it covers.
+        // layers, so a checkpoint is 3x the KV of the span it covers.
         let state_tokens = model.recurrent_state_bytes_per_request().div_ceil(model.total_kv_bytes_per_token());
         assert_eq!(state_tokens,3_168);
-        assert!(state_tokens > u64::from(model.recurrent_checkpoint_interval_tokens()));
+        assert_eq!(state_tokens,3 * u64::from(model.recurrent_checkpoint_interval_tokens()));
     }
 
     #[test]
