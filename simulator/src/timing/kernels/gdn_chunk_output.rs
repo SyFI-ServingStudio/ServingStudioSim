@@ -6,7 +6,7 @@
 //! launch-count interpolation cliff.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
+use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
@@ -56,7 +56,7 @@ impl KernelSpec for GdnChunkOutputSpec {
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
-        CacheKind::Cache2DLinear
+        CacheKind::Cache2DLinear(Extrapolation::Product)
     }
 
     fn cache_coords(_config: &Self::Config, input: &Self::Input) -> Coords {
@@ -104,7 +104,7 @@ mod tests {
 
     use super::{GdnChunkOutputKernelConfig, GdnChunkOutputKernelInput, GdnChunkOutputSpec};
     use crate::timing::bridge::DType;
-    use crate::timing::cache::CacheKind;
+    use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::{SlotInput, SweepCoords};
     use serde_json::Value;
@@ -208,7 +208,7 @@ mod tests {
         for backend in ["torch", "vllm_triton"] {
             assert_eq!(
                 GdnChunkOutputSpec::cache_kind(backend),
-                CacheKind::Cache2DLinear
+                CacheKind::Cache2DLinear(Extrapolation::Product)
             );
             let payloads = GdnChunkOutputSpec::enumerate(&cfg, &grid, backend);
             assert_eq!(payloads.len(), 16);

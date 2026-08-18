@@ -259,7 +259,7 @@ mod tests {
     use super::Cache3DLinear;
     use crate::timing::bridge::KernelMetrics;
     use crate::timing::cache::interp::CoverageFlags;
-    use crate::timing::cache::{build_cache, Cache, CacheKind, OutlierKind};
+    use crate::timing::cache::{build_cache, Cache, CacheKind, Extrapolation, OutlierKind};
     use crate::timing::sweep::SweepGrid;
 
     fn sample(time_ms: f64) -> KernelMetrics {
@@ -455,7 +455,7 @@ mod tests {
                 vec![sample(1.0), sample(2.0)],
             ),
             (
-                CacheKind::Cache2DLinear,
+                CacheKind::Cache2DLinear(Extrapolation::Clamp),
                 SweepGrid::new(vec![vec![1.0], vec![1.0]]),
                 vec![sample(1.0)],
             ),

@@ -10,7 +10,7 @@
 //! not public axes.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
+use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
@@ -62,7 +62,7 @@ impl KernelSpec for GdnChunkRecomputeWUSpec {
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
-        CacheKind::Cache2DLinear
+        CacheKind::Cache2DLinear(Extrapolation::Product)
     }
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
@@ -117,7 +117,7 @@ mod tests {
         MAX_TOKENS,
     };
     use crate::timing::bridge::DType;
-    use crate::timing::cache::CacheKind;
+    use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::{SlotInput, SweepCoords};
     use serde_json::Value;
@@ -334,7 +334,7 @@ mod tests {
         for backend in ["torch", "vllm_triton"] {
             assert_eq!(
                 GdnChunkRecomputeWUSpec::cache_kind(backend),
-                CacheKind::Cache2DLinear
+                CacheKind::Cache2DLinear(Extrapolation::Product)
             );
             let first = &GdnChunkRecomputeWUSpec::enumerate(&cfg, &grid, backend)[0];
             assert_eq!(first.backend(), Some(backend));

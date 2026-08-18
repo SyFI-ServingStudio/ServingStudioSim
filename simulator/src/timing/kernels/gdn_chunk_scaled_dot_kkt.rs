@@ -10,7 +10,7 @@
 //! that linear interpolation between `C=4` and `C=8` cannot represent.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
+use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
@@ -64,7 +64,7 @@ impl KernelSpec for GdnChunkScaledDotKktSpec {
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
-        CacheKind::Cache2DLinear
+        CacheKind::Cache2DLinear(Extrapolation::Product)
     }
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
@@ -118,7 +118,7 @@ mod tests {
         GdnChunkScaledDotKktSpec, MAX_TOKENS,
     };
     use crate::timing::bridge::DType;
-    use crate::timing::cache::CacheKind;
+    use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::sweep::Axis;
     use crate::timing::{SlotInput, SweepCoords};
@@ -290,7 +290,7 @@ mod tests {
         for backend in ["torch", "vllm_triton"] {
             assert_eq!(
                 GdnChunkScaledDotKktSpec::cache_kind(backend),
-                CacheKind::Cache2DLinear
+                CacheKind::Cache2DLinear(Extrapolation::Product)
             );
         }
         assert_eq!(

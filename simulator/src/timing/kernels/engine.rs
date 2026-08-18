@@ -503,7 +503,7 @@ fn ensure_has_backends(
 mod tests {
     use super::{ensure_has_backends, KernelConfig, KernelSpec};
     use crate::timing::bridge::{ArgsPayload, KernelKind};
-    use crate::timing::cache::CacheKind;
+    use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::{BuildError, Coords, SweepCoords, SweepGrid};
 
     #[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize)]
@@ -553,7 +553,7 @@ mod tests {
         }
 
         fn cache_kind(_backend: &'static str) -> CacheKind {
-            CacheKind::Cache2DLinear
+            CacheKind::Cache2DLinear(Extrapolation::Clamp)
         }
 
         fn enumerate(
