@@ -10,6 +10,7 @@ pub mod direct_1d;
 pub mod interp;
 pub mod linear_1d;
 pub mod linear_2d;
+pub mod linear_3d;
 pub mod log_2d;
 
 pub(crate) use backend::BackendCache;
@@ -17,6 +18,7 @@ pub use cliff_2d::Cache2DCliff;
 pub use direct_1d::Cache1DDirect;
 pub use linear_1d::Cache1DLinear;
 pub use linear_2d::Cache2DLinear;
+pub use linear_3d::Cache3DLinear;
 pub use log_2d::Cache2DLog;
 
 pub trait Cache: Send + Sync {
@@ -148,6 +150,7 @@ pub enum CacheKind {
     /// Bilinear over a rectangular grid. The payload is the off-grid policy —
     /// there is no default, so every 2D kernel has to state its asymptote.
     Cache2DLinear(Extrapolation),
+    Cache3DLinear,
     Cache2DLog,
     Cache2DCliff,
 }
@@ -193,6 +196,10 @@ pub fn build_cache(
         }
         CacheKind::Cache2DLinear(extrapolation) => {
             let (cache, warnings) = Cache2DLinear::from_samples_with(grid, samples, extrapolation);
+            Ok((Box::new(cache), warnings))
+        }
+        CacheKind::Cache3DLinear => {
+            let (cache, warnings) = Cache3DLinear::from_samples(grid, samples);
             Ok((Box::new(cache), warnings))
         }
         CacheKind::Cache2DLog | CacheKind::Cache2DCliff => Err(BuildError::FitFailed {

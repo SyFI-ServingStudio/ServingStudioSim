@@ -20,9 +20,14 @@ use crate::timing::kernels::{
     DsaPagedMqaLogitsDecodeKernelInput, DsaPersistentTopkDecodeKernelInput,
     DsaSparseMlaAttentionKernelInput, DsaTopkPrefillKernelInput, ElementwiseKernelInput,
     FlashinferAttnDecodeKernelInput, FlashinferAttnRectKernelInput, Fp8BlockQuantKernelInput,
-    Fp8BlockscaleGroupedGemmKernelInput, Fp8PerTokenGroupQuantKernelInput, GroupedGemmKernelInput,
-    KvCacheAppendKernelInput, MlaCacheAppendKernelInput, MoeAlltoallKernelInput,
-    MoeAlltoallPrepareKernelInput, MoeFinalizeRoutingKernelInput, P2pInterKernelInput,
+    Fp8BlockscaleGroupedGemmKernelInput, Fp8PerTokenGroupQuantKernelInput,
+    GdnCausalConvDecodeKernelInput, GdnCausalConvPrefillKernelInput,
+    GdnChunkLocalCumsumKernelInput, GdnChunkOutputKernelInput, GdnChunkRecomputeWUKernelInput,
+    GdnChunkScaledDotKktKernelInput, GdnChunkSolveTrilKernelInput, GdnChunkStateUpdateKernelInput,
+    GdnGatedRmsNormKernelInput, GdnPrefillPostConvKernelInput, GdnRecurrentDecodeKernelInput,
+    GroupedGemmKernelInput, KvCacheAppendKernelInput, MlaCacheAppendKernelInput,
+    MoeAlignBlockSizeKernelInput, MoeAlltoallKernelInput, MoeAlltoallPrepareKernelInput,
+    MoeFinalizeRoutingKernelInput, MoeFusedTopkKernelInput, P2pInterKernelInput,
     P2pIntraKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput, SingleGemmKernelInput,
     VllmMlaRopeKernelInput,
 };
@@ -33,6 +38,13 @@ use crate::timing::kernels::{
 #[derive(Clone, Serialize)]
 pub struct AttnPrefillLog {
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
+}
+
+/// Gated DeltaNet causal-convolution prefill fan-in: every request-local
+/// sequence length whose metrics were accumulated into the one fixed leaf.
+#[derive(Clone, Serialize)]
+pub struct GdnCausalConvPrefillLog {
+    pub sequence_lengths: Vec<u32>,
 }
 
 /// Sparse-MLA prefill aggregating leaf input: every request-local `(Q, S)` cell
@@ -78,7 +90,21 @@ log_inputs! {
     Fp8BlockQuant => Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemm => Fp8BlockscaleGroupedGemmKernelInput,
     Fp8PerTokenGroupQuant => Fp8PerTokenGroupQuantKernelInput,
+    GdnCausalConvDecode => GdnCausalConvDecodeKernelInput,
+    GdnCausalConvPrefill => GdnCausalConvPrefillKernelInput,
+    GdnCausalConvPrefillFanIn => GdnCausalConvPrefillLog,
+    GdnChunkLocalCumsum => GdnChunkLocalCumsumKernelInput,
+    GdnChunkOutput => GdnChunkOutputKernelInput,
+    GdnChunkRecomputeWU => GdnChunkRecomputeWUKernelInput,
+    GdnChunkScaledDotKkt => GdnChunkScaledDotKktKernelInput,
+    GdnChunkSolveTril => GdnChunkSolveTrilKernelInput,
+    GdnChunkStateUpdate => GdnChunkStateUpdateKernelInput,
+    GdnGatedRmsNorm => GdnGatedRmsNormKernelInput,
+    GdnPrefillPostConv => GdnPrefillPostConvKernelInput,
+    GdnRecurrentDecode => GdnRecurrentDecodeKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
+    MoeFusedTopk => MoeFusedTopkKernelInput,
+    MoeAlignBlockSize => MoeAlignBlockSizeKernelInput,
     MoeAlltoall => MoeAlltoallKernelInput,
     MoeAlltoallPrepare => MoeAlltoallPrepareKernelInput,
     AttnPrefill => AttnPrefillLog,

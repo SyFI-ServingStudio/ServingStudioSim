@@ -2,9 +2,9 @@
 //! `Kernel<S>` provides build/eval + the `Probe` blanket impl.
 //!
 //! Engine knows nothing about specific kernel kinds: it only sees the sweep
-//! grid, the cache kind, the bridge args, and the sweep-coord projection of
-//! the runtime input. Comm / compute / distribution-sensitive kernels are all
-//! the same shape here — variations live in each per-kernel `KernelSpec`.
+//! grid, the cache kind, the bridge args, and the cache-coordinate projection
+//! of the runtime input. Comm / compute / distribution-sensitive kernels are
+//! all the same shape here — variations live in each per-kernel `KernelSpec`.
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -14,7 +14,7 @@ use crate::timing::cache::interp::LeafMetrics;
 use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning, PeakRates};
 use crate::timing::result::CacheProbe;
 use crate::timing::sweep::{SweepCoords, SweepGrid};
-use crate::timing::{BuildError, DType, Probe};
+use crate::timing::{BuildError, Coords, DType, Probe};
 
 /// Per-kernel `*KernelConfig` contract: identity (`Hash + Eq`) + the required
 /// `backends: Vec<&'static str>` field exposed via `backends()`. The proc-macro
@@ -74,9 +74,10 @@ pub trait KernelConfig:
 }
 
 /// One impl per kernel kind. Declares the per-kernel types (Config / Input),
-/// the `KIND` identifier, and the 3 dispatch fns (sweep_grid / cache_kind /
-/// enumerate). Everything else lives in `Kernel<S>`; the `backends` invariant
-/// lives on `KernelConfig`.
+/// the `KIND` identifier, the three required dispatch fns (sweep_grid /
+/// cache_kind / enumerate), and an optional config-aware cache projection.
+/// Everything else lives in `Kernel<S>`; the `backends` invariant lives on
+/// `KernelConfig`.
 ///
 /// `KIND` is the single source of truth for this kernel's name: it doubles as
 /// the error tag and as the Python facade stem. The bridge derives Python fn
@@ -108,9 +109,17 @@ pub trait KernelSpec: 'static {
     /// in separate Spec types, not in this function's body.
     fn cache_kind(backend: &'static str) -> CacheKind;
 
+    /// Project a physical runtime input into this spec's cache coordinates.
+    /// Most kernels cache directly in [`SweepCoords::coords`] space; specs that
+    /// need config-aware axes can override this hook without changing their
+    /// public Input schema or the generic cache implementations.
+    fn cache_coords(_config: &Self::Config, input: &Self::Input) -> Coords {
+        input.coords()
+    }
+
     /// Grid cells (row-major, aligned with `enumerate`) that are physically
-    /// infeasible. Their profiled sample is forced non-finite at build so
-    /// `Cache2DLinear` drops them and renormalizes over the feasible corners,
+    /// infeasible. Their profiled sample is forced non-finite at build so a
+    /// multilinear cache drops them and renormalizes over feasible corners,
     /// instead of caching a fabricated value for a shape that can't occur.
     /// Default: all feasible (empty mask). Used by re-axis variants whose
     /// rectangular cache grid covers a non-rectangular feasible region (e.g. the
@@ -290,7 +299,7 @@ impl<S: KernelSpec> Kernel<S> {
     /// [`LeafMetrics`] from the backend with the smallest non-negative wallclock,
     /// preserving that backend's coverage bits.
     pub fn eval(&self, input: &S::Input) -> LeafMetrics {
-        let coords = input.coords();
+        let coords = S::cache_coords(&self.config, input);
         match self.backend_caches.as_slice() {
             [] => panic!("kernel config validation must create at least one backend cache"),
             [backend_cache] => {
@@ -353,8 +362,9 @@ where
 
     fn eval_json(&self, input: &serde_json::Value) -> anyhow::Result<LeafMetrics> {
         // Deserialize straight into the kernel's own Input struct, then call the
-        // kernel's existing best-of-N `eval` — the real `coords()` projection runs
-        // unchanged. No reimplementation, no slice gymnastics.
+        // kernel's existing best-of-N `eval` — the real config-aware
+        // `cache_coords()` projection runs unchanged. No reimplementation, no
+        // slice gymnastics.
         let input: S::Input = serde_json::from_value(input.clone())
             .map_err(|e| anyhow::anyhow!("query point does not match {} Input: {e}", S::KIND))?;
         Ok(self.eval(&input))
@@ -394,8 +404,8 @@ pub(crate) struct KernelQueryEntry {
     /// rows), box it for interpolation. Needs the bridge.
     pub build: fn(serde_json::Value, &PerfApiBridge) -> anyhow::Result<Box<dyn CacheProbe>>,
     /// `grid` path: deserialize config and report
-    /// `(describe_config, grid_axes, input_field_names)` from `sweep_grid` +
-    /// the Input's `SweepCoords` alone — no bridge, no profiling, no GPU.
+    /// `(describe_config, grid_axes, input_field_names)` from `sweep_grid` plus
+    /// the Input's physical field names — no bridge, no profiling, no GPU.
     pub describe: fn(
         serde_json::Value,
     )
@@ -440,9 +450,9 @@ where
 }
 
 /// Deserialize `config` into `S::Config` and report its one-line summary, the
-/// fitted grid axes from `sweep_grid`, and the Input's field names (axis labels).
-/// The `grid`-path fn pointer — pure metadata, so it needs neither the bridge nor
-/// a built cache.
+/// fitted cache axes from `sweep_grid`, and the Input's physical query-field
+/// names. The `grid`-path fn pointer — pure metadata, so it needs neither the
+/// bridge nor a built cache.
 fn describe_from_json<S>(
     config: serde_json::Value,
 ) -> anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>
@@ -491,8 +501,69 @@ fn ensure_has_backends(
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_has_backends;
-    use crate::timing::BuildError;
+    use super::{ensure_has_backends, KernelConfig, KernelSpec};
+    use crate::timing::bridge::{ArgsPayload, KernelKind};
+    use crate::timing::cache::CacheKind;
+    use crate::timing::{BuildError, Coords, SweepCoords, SweepGrid};
+
+    #[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Serialize)]
+    struct DefaultCoordsConfig {
+        backends: Vec<&'static str>,
+        gpu_name: String,
+    }
+
+    impl KernelConfig for DefaultCoordsConfig {
+        fn backends(&self) -> &[&'static str] {
+            &self.backends
+        }
+
+        fn set_backends(&mut self, backends: Vec<&'static str>) {
+            self.backends = backends;
+        }
+
+        const BACKENDS_FIELD: &'static str = "DefaultCoordsConfig.backends";
+
+        fn gpu_name(&self) -> &str {
+            &self.gpu_name
+        }
+    }
+
+    struct DefaultCoordsInput;
+
+    impl SweepCoords for DefaultCoordsInput {
+        fn coords(&self) -> Coords {
+            Coords::new([3.0, 5.0])
+        }
+
+        fn coord_field_names() -> &'static [&'static str] {
+            &["x", "y"]
+        }
+    }
+
+    struct DefaultCoordsSpec;
+
+    impl KernelSpec for DefaultCoordsSpec {
+        type Config = DefaultCoordsConfig;
+        type Input = DefaultCoordsInput;
+
+        const KIND: KernelKind = "default_coords_test";
+
+        fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+            SweepGrid::new(vec![vec![1.0], vec![1.0]])
+        }
+
+        fn cache_kind(_backend: &'static str) -> CacheKind {
+            CacheKind::Cache2DLinear
+        }
+
+        fn enumerate(
+            _config: &Self::Config,
+            _grid: &SweepGrid,
+            _backend: &'static str,
+        ) -> Vec<ArgsPayload> {
+            Vec::new()
+        }
+    }
 
     #[test]
     fn ensure_has_backends_rejects_empty_backend_lists() {
@@ -500,5 +571,18 @@ mod tests {
             ensure_has_backends("single_gemm", "backends", &[]),
             Err(BuildError::FitFailed { .. })
         ));
+    }
+
+    #[test]
+    fn default_cache_coords_preserve_input_sweep_coords() {
+        let config = DefaultCoordsConfig {
+            backends: vec!["test"],
+            gpu_name: "test-gpu".to_string(),
+        };
+
+        assert_eq!(
+            &*DefaultCoordsSpec::cache_coords(&config, &DefaultCoordsInput),
+            &[3.0, 5.0]
+        );
     }
 }

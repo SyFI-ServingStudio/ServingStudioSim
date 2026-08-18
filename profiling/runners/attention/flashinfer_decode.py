@@ -65,9 +65,7 @@ def _run_cudnn_decode(
 
     def benchmark_fn():
         with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
-            return F.scaled_dot_product_attention(
-                q, k, v, is_causal=False, enable_gqa=enable_gqa
-            )
+            return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
 
     o_elem = torch.tensor([], dtype=_common.to_torch_dtype(o_dtype)).element_size()
     bytes_accessed = int(
@@ -77,8 +75,12 @@ def _run_cudnn_decode(
         + batch_size * num_qo_heads * head_dim * o_elem
     )
     flops = _common.attention_flops(
-        q_len=1, kv_len=seq_len, num_qo_heads=num_qo_heads,
-        head_dim=head_dim, causal=False, batch_size=batch_size,
+        q_len=1,
+        kv_len=seq_len,
+        num_qo_heads=num_qo_heads,
+        head_dim=head_dim,
+        causal=False,
+        batch_size=batch_size,
     )
     return _common.measure(benchmark_fn, flops=flops, bytes_accessed=bytes_accessed)
 
@@ -121,9 +123,14 @@ def _run_decode(
 
     if backend == "cudnn":
         return _run_cudnn_decode(
-            batch_size=batch_size, seq_len=seq_len, num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads, head_dim=head_dim,
-            q_dtype=q_dtype, kv_dtype=kv_dtype, o_dtype=o_dtype,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            o_dtype=o_dtype,
         )
 
     try:
@@ -133,9 +140,15 @@ def _run_decode(
 
     try:
         inp = _common.build_paged_decode_inputs(
-            batch_size=batch_size, seq_len=seq_len, num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads, head_dim=head_dim,
-            q_dtype=q_dtype, kv_dtype=kv_dtype, o_dtype=o_dtype, page_size=_PAGE_SIZE,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            o_dtype=o_dtype,
+            page_size=_PAGE_SIZE,
         )
         wrapper_kwargs = {
             "kv_layout": "NHD",
@@ -184,7 +197,13 @@ def _run_decode(
             def benchmark_fn():
                 return wrapper.run(inp.q, paged_kv_cache)
 
-        if use_cuda_graph_plan:
+        if backend == "fa3":
+            # The first FA3 run launches one-time PyTorch/FlashInfer setup
+            # kernels. Warm it once so CUPTI learns the steady-state attention
+            # launch pattern rather than a cold pattern that changes mid-run.
+            benchmark_fn()
+            torch.cuda.synchronize()
+        elif use_cuda_graph_plan:
             # The graph-enabled wrapper's first run performs one-time internal
             # setup and launches extra helper kernels. Stabilize that launch
             # composition before Timer.cupti learns its callable pattern; the
@@ -193,8 +212,12 @@ def _run_decode(
             torch.cuda.synchronize()
 
         flops = _common.attention_flops(
-            q_len=1, kv_len=seq_len, num_qo_heads=num_qo_heads,
-            head_dim=head_dim, causal=False, batch_size=batch_size,
+            q_len=1,
+            kv_len=seq_len,
+            num_qo_heads=num_qo_heads,
+            head_dim=head_dim,
+            causal=False,
+            batch_size=batch_size,
         )
         return _common.measure(benchmark_fn, flops=flops, bytes_accessed=inp.bytes_accessed)
     except RuntimeError as exc:

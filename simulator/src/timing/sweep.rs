@@ -85,7 +85,7 @@ fn expand_recursive<T>(
 /// Upper bound on a kernel's sweep dimensionality. `Coords` is a fixed inline
 /// buffer of this width so `Input::coords()` projects to sweep space without
 /// heap allocation. Bump this if a kernel ever needs >4 sweep axes (today the
-/// widest are 2D); `Coords::new` asserts the actual arity fits.
+/// widest is 3D); `Coords::new` asserts the actual arity fits.
 pub const MAX_SWEEP_DIMS: usize = 4;
 
 /// Stack-allocated sweep coordinate vector. Holds up to `MAX_SWEEP_DIMS`
