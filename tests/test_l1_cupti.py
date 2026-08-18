@@ -118,3 +118,48 @@ def test_timer_cupti_duration_path_runs_on_real_gpu():
     # Keep the GPU-tier test short while exercising estimate -> formal capture.
     time_ms = Timer.cupti(run_matmul, min_duration_ms=10, max_rep=100_000)
     assert 0 < time_ms < 100
+
+
+def test_cupti_multi_launch_pattern_survives_a_cold_callable():
+    """The per-launch kernel pattern must be learned from a warm callable.
+
+    A cold callable emits one-time JIT / plan / autotune kernels on its first
+    call. If the pattern probe sees those, `callable_count` is inflated and
+    every subsequent multi-launch capture fails the record-count check — which
+    is exactly how FlashInfer attention specs were failing to profile: the first
+    spec each worker process touched was lost, deterministically.
+    """
+    torch = _require_cuda_cupti()
+    from profiling.profilers.cupti_kernel_profiler import profile_kernel_until_converged
+
+    device = torch.device("cuda:0")
+    left = torch.randn((128, 128), device=device, dtype=torch.float16)
+    right = torch.randn((128, 128), device=device, dtype=torch.float16)
+    one_time_work_pending = [True]
+
+    def run_matmul():
+        if one_time_work_pending[0]:
+            one_time_work_pending[0] = False
+            # Stand-in for a lazy plan/compile step: extra kernels on call one.
+            (left + right).sum()
+        return torch.mm(left, right)
+
+    # Deliberately *not* pre-warmed, unlike `_make_matmul_callable`.
+    summary = profile_kernel_until_converged(
+        run_matmul,
+        device=device,
+        batch=10,
+        min_duration_ms=0,
+        min_iter=20,
+        max_iter=500,
+        tol=0.01,
+        launches_per_run=4,
+        clear_l2_bytes=1024 * 1024,
+        clear_l2_before_run=False,
+    )
+
+    assert not one_time_work_pending[0], "the profiler must have called fn"
+    assert summary.mean_ms > 0
+    assert summary.num_iter == len(summary.per_iter_ms)
+    # A steady-state pattern means every logical launch matched the same count.
+    assert len(set(summary.matched_kernel_count_per_run)) == 1

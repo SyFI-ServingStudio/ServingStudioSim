@@ -155,14 +155,20 @@ def _install_fake_ragged_runtime(monkeypatch, events):
     return runner, _common
 
 
-def test_fa3_plans_warms_once_then_synchronizes_before_measurement(monkeypatch):
+def test_fa3_plans_then_hands_off_without_its_own_warmup(monkeypatch):
+    """The runner plans and hands off; warming the callable is the profiler's job.
+
+    FA3 used to warm up here by hand so its learned CUPTI launch pattern was the
+    steady-state one. FA2, on the `_measure_best_split` path, did not — and every
+    FA2 spec that was first in its worker process died on the record-count check.
+    The warm-up now lives in `_prepare_launch_pattern`, which covers all backends,
+    so a per-backend warm-up here would be a redundant timed launch.
+    """
     events = []
     runner, common = _install_fake_ragged_runtime(monkeypatch, events)
     metrics = ComputeMetrics(1.0, 2.0, 3.0, 4.0)
 
     def measure(fn, *, flops, bytes_accessed):
-        # Not invoking fn proves the preceding run is the explicit untimed warmup,
-        # rather than an implementation detail hidden inside measurement.
         events.append(("measure", fn, flops, bytes_accessed))
         return metrics
 
@@ -183,8 +189,6 @@ def test_fa3_plans_warms_once_then_synchronizes_before_measurement(monkeypatch):
     assert [event[0] for event in events] == [
         "wrapper",
         "plan",
-        "run",
-        "synchronize",
         "measure",
     ]
     plan = events[1][1]

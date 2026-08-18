@@ -218,12 +218,9 @@ def _run_ragged(
                 bytes_accessed=inp.bytes_accessed,
             )
         wrapper.plan(**plan_kwargs)
-        if backend == "fa3":
-            # FlashInfer's first FA3 run may emit one-time initialization kernels.
-            # Warm it once outside CUPTI and energy measurement so the callable's
-            # learned launch pattern matches its steady-state launch pattern.
-            benchmark_fn()
-            torch.cuda.synchronize()
+        # FlashInfer's first run may emit one-time initialization kernels. The
+        # CUPTI launch-pattern probe warms the callable itself, for every
+        # backend, so no warm-up is needed here.
         return _common.measure(benchmark_fn, flops=flops, bytes_accessed=inp.bytes_accessed)
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc
