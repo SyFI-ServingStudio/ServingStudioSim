@@ -89,6 +89,13 @@ const fn default_glm52_parallel_size() -> u16 {
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IterArchSel {
+    /// Exact text-only Qwen3.6-35B-A3B FP8 execution graph on one local H200.
+    /// TP1/EP1 are architectural invariants, so this selector exposes only the
+    /// checkpoint identity and layer-count controls carried by `ModelSpec`.
+    Qwen36Local {
+        #[serde(flatten)]
+        model: ModelSpec,
+    },
     Llama3Dense {
         #[serde(flatten)]
         model: ModelSpec,
@@ -267,7 +274,8 @@ impl IterArchSel {
     /// The model identity/dims this arch operates on (every variant carries it).
     pub fn model(&self) -> &ModelSpec {
         match self {
-            Self::Llama3Dense { model }
+            Self::Qwen36Local { model }
+            | Self::Llama3Dense { model }
             | Self::Llama3DenseTp { model, .. }
             | Self::Llama3DpAttnTpFfn { model, .. }
             | Self::Qwen3MoeDpAttnEpFfn { model, .. }
@@ -282,6 +290,42 @@ impl IterArchSel {
 #[cfg(test)]
 mod iter_tests {
     use super::*;
+
+    #[test]
+    fn qwen36_local_selector_has_the_exact_model_only_surface() {
+        let parsed: IterArchSel = serde_json::from_str(
+            r#"{"type":"qwen36_local","model_config":"model/config/qwen3_6_35b_a3b_fp8.json","num_layers":40,"sim_num_layers":4,"fp8":true}"#,
+        )
+        .expect("qwen36_local selector parses");
+        let IterArchSel::Qwen36Local { model } = &parsed else {
+            panic!("expected qwen36_local")
+        };
+        assert_eq!(model.model_config, "model/config/qwen3_6_35b_a3b_fp8.json");
+        assert_eq!(model.num_layers, Some(40));
+        assert_eq!(model.sim_num_layers, Some(4));
+        assert!(model.fp8);
+        assert!(std::ptr::eq(parsed.model(), model));
+
+        let (tag, params) = IterArchSel::SCHEMA
+            .iter()
+            .find(|(tag, _)| *tag == "qwen36_local")
+            .expect("qwen36_local provider schema row");
+        assert_eq!(*tag, "qwen36_local");
+        // Flattened ModelSpec fields are intentionally published once through
+        // schema::dump::arch_common, not duplicated on every provider row.
+        assert!(params.is_empty());
+        let common = serde_json::to_value(ModelSpec::PARAMS).unwrap();
+        let names = common
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|param| param["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["model_config", "num_layers", "sim_num_layers", "fp8"]
+        );
+    }
 
     fn parse_qwen(extra: &str) -> Result<IterArchSel, serde_json::Error> {
         serde_json::from_str(&format!(

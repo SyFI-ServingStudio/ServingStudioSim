@@ -29,6 +29,12 @@ pub mod post_attn_local;
 pub mod post_attn_router_tp;
 pub mod pre_attn_local;
 pub mod pre_attn_proj_tp;
+pub mod qwen36_gated_gqa_local;
+pub mod qwen36_gdn_local;
+pub mod qwen36_head_local;
+pub mod qwen36_moe_finalize_local;
+pub mod qwen36_moe_router_local;
+pub mod qwen36_shared_expert_local;
 pub mod vllm_fp8_attn_block_tp;
 pub mod vllm_fp8_moe_expert_compute_local;
 pub mod vllm_fp8_moe_router_local;
@@ -113,6 +119,30 @@ pub use pre_attn_local::{
 pub use pre_attn_proj_tp::{
     PreAttnProjTpWorklet, PreAttnProjTpWorkletConfig, PreAttnProjTpWorkletInput,
     PreAttnProjTpWorkletResolved,
+};
+pub use qwen36_gated_gqa_local::{
+    Qwen36GatedGqaLocalWorklet, Qwen36GatedGqaLocalWorkletConfig,
+    Qwen36GatedGqaLocalWorkletInput, Qwen36GatedGqaLocalWorkletResolved,
+};
+pub use qwen36_gdn_local::{
+    Qwen36GdnLocalWorklet, Qwen36GdnLocalWorkletConfig, Qwen36GdnLocalWorkletInput,
+    Qwen36GdnLocalWorkletResolved,
+};
+pub use qwen36_head_local::{
+    Qwen36HeadLocalWorklet, Qwen36HeadLocalWorkletConfig, Qwen36HeadLocalWorkletInput,
+    Qwen36HeadLocalWorkletResolved,
+};
+pub use qwen36_moe_finalize_local::{
+    Qwen36MoeFinalizeLocalWorklet, Qwen36MoeFinalizeLocalWorkletConfig,
+    Qwen36MoeFinalizeLocalWorkletInput, Qwen36MoeFinalizeLocalWorkletResolved,
+};
+pub use qwen36_moe_router_local::{
+    Qwen36MoeRouterLocalWorklet, Qwen36MoeRouterLocalWorkletConfig,
+    Qwen36MoeRouterLocalWorkletInput, Qwen36MoeRouterLocalWorkletResolved,
+};
+pub use qwen36_shared_expert_local::{
+    Qwen36SharedExpertLocalWorklet, Qwen36SharedExpertLocalWorkletConfig,
+    Qwen36SharedExpertLocalWorkletInput, Qwen36SharedExpertLocalWorkletResolved,
 };
 pub use vllm_fp8_attn_block_tp::{
     VllmFp8AttnBlockTpWorklet, VllmFp8AttnBlockTpWorkletConfig, VllmFp8AttnBlockTpWorkletInput,

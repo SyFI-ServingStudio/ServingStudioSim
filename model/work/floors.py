@@ -9,7 +9,7 @@ For unlocked analysis, Rust aggregates each level's workload (reusing the
 
     {"levels": {"<level_key>": {matmul_tokens, prefill_tokens, decode_passes,
                                 prefill_pairs, prefill_cached, decode_kv,
-                                prefill_requests}, ...}}
+                                prefill_requests, prefill_stateful_requests}, ...}}
 
 where a public level_key is ``cluster`` | ``<pool_tag>`` | ``<pool_tag>/<worker_id>``
 (exactly the `levels.rs` level keys). The analyzer may include private
@@ -169,6 +169,17 @@ def _aggregate_workload(totals: dict) -> Workload:
     prefill_tokens = int(totals["prefill_tokens"])
     decode_passes = int(totals["decode_passes"])
     prefill_requests = int(totals["prefill_requests"])
+    stateful_raw = totals.get("prefill_stateful_requests", 0)
+    if (
+        isinstance(stateful_raw, bool)
+        or not isinstance(stateful_raw, (int, float))
+        or not float(stateful_raw).is_integer()
+        or stateful_raw < 0
+    ):
+        raise ValueError("prefill_stateful_requests must be a non-negative exact integer")
+    prefill_stateful_requests = int(stateful_raw)
+    if prefill_stateful_requests > prefill_requests:
+        raise ValueError("prefill_stateful_requests cannot exceed prefill_requests")
     return Workload(
         matmul_tokens=matmul_tokens,
         head_positions=sampled,
@@ -182,6 +193,7 @@ def _aggregate_workload(totals: dict) -> Workload:
             "prefill": prefill_tokens,
             "decode": decode_passes,
         },
+        prefill_stateful_requests=prefill_stateful_requests,
     )
 
 
@@ -206,9 +218,7 @@ def _segment_dtypes(model, totals: dict, default_dtype: str) -> dict[str, str]:
     """Segment name -> compute dtype. Independent of workload size, but the set of
     segment names is not, so it is resolved for the same totals as the work."""
     label = model.label(_aggregate_workload(totals))
-    return {
-        segment.name: segment.compute_dtype or default_dtype for segment in label.segments
-    }
+    return {segment.name: segment.compute_dtype or default_dtype for segment in label.segments}
 
 
 def _label_payload(model, totals: dict, spec: dict) -> dict:
@@ -269,10 +279,17 @@ _WORKLOAD_FIELDS = (
     "prefill_cached",
     "decode_kv",
     "prefill_requests",
+    "prefill_stateful_requests",
 )
 _LARGE_GEOMETRY_FIELDS = {"prefill_pairs", "prefill_cached", "decode_kv"}
 _PREFILL_FIELDS = frozenset(
-    {"prefill_tokens", "prefill_pairs", "prefill_cached", "prefill_requests"}
+    {
+        "prefill_tokens",
+        "prefill_pairs",
+        "prefill_cached",
+        "prefill_requests",
+        "prefill_stateful_requests",
+    }
 )
 _DECODE_FIELDS = frozenset({"decode_passes", "decode_kv"})
 _GEOMETRY_PROBE = 1_048_576
@@ -353,7 +370,7 @@ def _workload_basis(
 ) -> dict[str, dict[str, tuple[float, float]] | dict[str, int]]:
     """Affine semantic-work basis, with nonlinear dimensions pinned in the key.
 
-    Current model specs are affine in the seven compressed workload scalars except
+    Current model specs are affine in the eight compressed workload scalars except
     routed-expert weight loading, the embedding-table cap, and sparse attention's
     selected-key cap. Routed token counts are therefore pinned exactly; dense token
     counts use one basis on each side of the vocab cap. The shapes using a basis
@@ -394,11 +411,17 @@ def _workload_basis(
         probe = _GEOMETRY_PROBE if field_name in _LARGE_GEOMETRY_FIELDS else 1
         probe_totals = dict(base_totals)
         probe_totals[field_name] += probe
-        # `_aggregate_workload` materializes prefill attention only when pairs>0,
-        # which used to need a special reference for `prefill_cached`. The origin
-        # now carries every geometry field at the probe scale, so prefill exists
-        # in both the base and every probe and one shared reference suffices.
-        delta = _subtract_segment_work(_segment_work(model, probe_totals), base)
+        if field_name == "prefill_stateful_requests":
+            # Stateful prefill requests are a strict subset of prefill requests.
+            # Hold one parent request in both points to isolate this coefficient.
+            probe_totals["prefill_requests"] = 1
+            reference_totals = dict(base_totals, prefill_requests=1)
+            reference = _segment_work(model, reference_totals)
+        else:
+            # Every large geometry field is already present at the probe scale in
+            # the origin, so all other coefficients share the base reference.
+            reference = base
+        delta = _subtract_segment_work(_segment_work(model, probe_totals), reference)
         coefficients[field_name] = {
             name: (flops / probe, bytes_ / probe) for name, (flops, bytes_) in delta.items()
         }
@@ -415,7 +438,7 @@ def _reconstruct_segment_work(basis: dict, totals: dict) -> dict[str, tuple[floa
         flops, bytes_ = basis["base"].get(name, (0.0, 0.0))
         for field_name, coefficient in coefficients.items():
             coefficient_flops, coefficient_bytes = coefficient.get(name, (0.0, 0.0))
-            field_delta = int(totals[field_name]) - basis["origin"][field_name]
+            field_delta = int(totals.get(field_name, 0)) - basis["origin"][field_name]
             flops += coefficient_flops * field_delta
             bytes_ += coefficient_bytes * field_delta
         segment_work[name] = (flops, bytes_)
@@ -448,14 +471,16 @@ def _validation_shapes(weighted_shapes: list[dict]) -> list[dict]:
     """
     selected = {id(weighted_shapes[0]): weighted_shapes[0]}
     for field_name in _WORKLOAD_FIELDS:
-        axis = lambda shape: int(shape["totals"][field_name])  # noqa: B023 - consumed in-loop
+        # Older analyzer payloads predate optional workload axes such as
+        # `prefill_stateful_requests`; their wire default is zero.
+        axis = lambda shape: int(shape["totals"].get(field_name, 0))  # noqa: B023
         for extreme in (min(weighted_shapes, key=axis), max(weighted_shapes, key=axis)):
             selected.setdefault(id(extreme), extreme)
     return list(selected.values())
 
 
 #: Below this many members, fitting a basis costs more labels than it saves.
-#: Building one is 1 base + up to 6 probes + up to 15 validation shapes (~22
+#: Building one is 1 base + up to 8 probes + up to 17 validation shapes (~26
 #: `model.label` calls) to then evaluate the group as array math; the direct path
 #: is exactly one call per shape. Routed models pin `matmul_tokens` in the basis
 #: key, so prefill groups are near-singletons — on the 8h GLM-5.2 run, 7,441
@@ -533,7 +558,7 @@ def _reduce_affine_group(
     workload_deltas = np.asarray(
         [
             [
-                int(weighted_shape["totals"][field_name]) - basis["origin"][field_name]
+                int(weighted_shape["totals"].get(field_name, 0)) - basis["origin"][field_name]
                 for field_name in field_names
             ]
             for weighted_shape in weighted_shapes
@@ -597,11 +622,11 @@ def _reduce_direct_group(
         occurrences = int(weighted_shape["occurrences"])
         label = model.label(_aggregate_workload(weighted_shape["totals"]))
         payload = _payload_from_segment_work(
-            {segment.name: (segment.flops_total, segment.bytes_total) for segment in label.segments},
             {
-                segment.name: segment.compute_dtype or default_dtype
+                segment.name: (segment.flops_total, segment.bytes_total)
                 for segment in label.segments
             },
+            {segment.name: segment.compute_dtype or default_dtype for segment in label.segments},
             peak,
             bandwidth_gbps,
         )

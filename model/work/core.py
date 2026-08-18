@@ -136,6 +136,15 @@ class Workload:
     attention_step_count: int | None = None
     attention_step_count_by_phase: dict[str, int] | None = None
     attention_tokens_by_phase: dict[str, int] | None = None
+    # Number of prefill requests that already have persistent model state.  Older
+    # analyzer payloads cannot carry this axis, so zero is the conservative legacy
+    # default: never invent a compulsory state read that was not observed.
+    prefill_stateful_requests: int = 0
+
+    def __post_init__(self) -> None:
+        value = self.prefill_stateful_requests
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("prefill_stateful_requests must be a non-negative integer")
 
     @property
     def num_attention_steps(self) -> int:
@@ -193,6 +202,7 @@ class Workload:
                 "prefill": sum(append_len for append_len, _prefix_len in prefill),
                 "decode": len(decode),
             },
+            prefill_stateful_requests=sum(prefix_len > 0 for _append_len, prefix_len in prefill),
         )
 
     def attention_phases(self) -> list[tuple[str | None, Workload]]:
@@ -240,6 +250,9 @@ class Workload:
                         head_positions=0,
                         attn=interactions,
                         attention_step_count=phase_steps,
+                        prefill_stateful_requests=(
+                            self.prefill_stateful_requests if phase == "prefill" else 0
+                        ),
                     ),
                 )
             )
@@ -462,8 +475,7 @@ class WorkLabel:
         peaks = self.segment_peaks(gpu, dtype, num_gpus, spec_path)
         bandwidth = gpu_mem_bandwidth_gbps(gpu, spec_path) * num_gpus
         return sum(
-            seg.time_ms(peak, bandwidth)
-            for seg, peak in zip(self.segments, peaks, strict=True)
+            seg.time_ms(peak, bandwidth) for seg, peak in zip(self.segments, peaks, strict=True)
         )
 
     def segment_rows(
@@ -525,17 +537,22 @@ class LayerStack:
 
 
 @dataclass
-class NormWeightGroup:
-    """Compulsory normalization scale weights with no pinned activation traffic.
+class LearnedWeightGroup:
+    """Compulsory learned weights with no pinned activation FLOPs or traffic.
 
-    The global lower bound permits cross-kernel fusion, so normalization inputs and
-    outputs need not round-trip through HBM. Its learned scale is still a model weight
-    and therefore must be read at least once for every distinct layer instance.
+    The global lower bound permits surrounding activations to remain on-chip, but a
+    learned vector still must be read.  ``breakdown`` assigns its parameter identity;
+    the group intentionally contributes no irreducible activation FLOPs.
     """
 
     name: str
     elements: int
     count: int
+    breakdown: str = "norm"
+
+
+# Existing builders use the more specific historical name.
+NormWeightGroup = LearnedWeightGroup
 
 
 @dataclass
@@ -658,6 +675,24 @@ class Model:
                 total_params += group.total_params * stack.count
                 breakdown[_PARAM_BUCKET[group.bucket]] += group.total_params * stack.count
 
+            for component in (stack.attn, stack.ffn):
+                for weight in getattr(component, "learned_weight_groups", lambda: [])():
+                    segments.append(
+                        Segment(
+                            name=f"{prefix}{weight.name}",
+                            bucket="embedding",
+                            byte_kind="weights",
+                            flops=0.0,
+                            bytes=weight.elements * self.weight_dtype_bytes,
+                            count=stack.count,
+                            compute_dtype=self.master_dtype,
+                        )
+                    )
+                    params = weight.elements * stack.count
+                    activated_params += params
+                    total_params += params
+                    breakdown[weight.breakdown] += params
+
             # Attention semantic phases remain independent of simulator shapes.
             # MLA/DSA exposes several rows (indexer, sparse attention, and two
             # cache writes); older specs retain the historical fused rows.
@@ -735,7 +770,7 @@ class Model:
             norm_params = norm_weight.elements * norm_weight.count
             activated_params += norm_params
             total_params += norm_params
-            breakdown["norm"] += norm_params
+            breakdown[norm_weight.breakdown] += norm_params
 
         # --- embedding gather (whole iteration): reads the needed rows of the table. ---
         # The embedding matrix is a weight, so its read is capped at ONE pass of the

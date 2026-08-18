@@ -25,8 +25,11 @@ class MoE:
     # `shared_experts`; Qwen2-MoE uses `shared_expert`. Only matters for matching a
     # quantized config's modules_to_not_convert.
     shared_module: str = "shared_experts"
+    shared_gate: bool = False
 
     def matmul_groups(self) -> list[MatmulGroup]:
+        if self.shared_gate and self.shared_intermediate <= 0:
+            raise ValueError("shared_gate requires shared_intermediate > 0")
         groups = [
             # `mlp.gate` is the router matrix, and both GLM-5.2-FP8 and
             # Qwen3-235B-FP8 leave it at the master dtype.
@@ -77,4 +80,14 @@ class MoE:
                     module=f"mlp.{self.shared_module}.down_proj",
                 )
             )
+            if self.shared_gate:
+                groups.append(
+                    MatmulGroup(
+                        "shared_gate",
+                        n=1,
+                        k=self.hidden,
+                        bucket="shared_expert",
+                        module="mlp.shared_expert_gate",
+                    )
+                )
         return groups

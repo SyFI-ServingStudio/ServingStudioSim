@@ -150,6 +150,21 @@ impl Deployment for UnifiedDeployment {
         // single-group barebone worker; the DP-attn / MoE archs run on the
         // multi-group hp_unified worker (one KV partition state per DP shard).
         match &g.arch {
+            IterArchSel::Qwen36Local { .. } => {
+                ensure_barebone(&g.worker)?;
+                let model = Arc::new(arch_build::qwen36_local(
+                    model_spec, &gpu_name, MODEL_NAME, bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_barebone_worker,
+                ))
+            }
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
                 let model = Arc::new(arch_build::dense(
@@ -434,7 +449,7 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::Glm52DsaMoeModel;
+    use crate::arch::{Glm52DsaMoeModel, Qwen36LocalModel};
     use crate::common::RequestId;
     use crate::worker::{HpUnifiedWorker, WorkerEventCommon};
 
@@ -473,6 +488,14 @@ mod tests {
     fn glm52_hp_unified_pair_satisfies_the_iter_worker_contract() {
         assert_iter_worker_contract::<HpUnifiedWorker<Glm52DsaMoeModel>>();
         ensure_hp_unified(&hp_worker()).expect("GLM accepts hp_unified");
+    }
+
+    #[test]
+    fn qwen36_local_barebone_pair_satisfies_the_iter_worker_contract() {
+        assert_iter_worker_contract::<crate::worker::BareboneWorker<Qwen36LocalModel>>();
+        ensure_barebone(&barebone_worker()).expect("Qwen3.6 local accepts barebone");
+        let error = ensure_barebone(&hp_worker()).unwrap_err().to_string();
+        assert!(error.contains("requires worker `barebone`"));
     }
 
     #[test]

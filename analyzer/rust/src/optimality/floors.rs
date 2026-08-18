@@ -556,6 +556,7 @@ fn workload_json(totals: WorkloadTotals) -> Value {
         "prefill_cached": totals.prefill_cached,
         "decode_kv": totals.decode_kv,
         "prefill_requests": totals.prefill_requests,
+        "prefill_stateful_requests": totals.prefill_stateful_requests,
     })
 }
 
@@ -564,6 +565,19 @@ mod tests {
     use serde_json::json;
 
     use super::{parse_labels, rollup_locked_floors, Floors, WorkerComposition};
+    use crate::conservation::workload::WorkloadTotals;
+
+    #[test]
+    fn workload_payload_carries_stateful_prefill_requests() {
+        let totals = WorkloadTotals {
+            prefill_requests: 2.0,
+            prefill_stateful_requests: 1.0,
+            ..WorkloadTotals::default()
+        };
+        let payload = super::workload_json(totals);
+        assert_eq!(payload["prefill_requests"], 2.0);
+        assert_eq!(payload["prefill_stateful_requests"], 1.0);
+    }
 
     #[test]
     fn one_level_error_does_not_discard_other_labels() {
