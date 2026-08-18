@@ -70,7 +70,12 @@ const DENSE_FP8_GEMM_BACKENDS: &[&str] = &["deepgemm"];
 const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear"];
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 const GDN_BACKENDS: &[&str] = &["vllm_triton"];
-const GQA_ATTN_BACKENDS: &[&str] = &["fa3"];
+/// Both FA2 and FA3, resolved per lookup by best-of-N wallclock — not a
+/// preference order. FA3 wins the compute-bound prefill; FA2's decode kernel is
+/// the faster of the two by a wide margin at every shape measured so far (FA3
+/// decode never exceeds ~1.3 TB/s anywhere in profile.db, against FA2's ~4.5),
+/// and decode attention dominates this model's long-context iteration cost.
+const GQA_ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];
 const KV_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const ROUTING_BACKENDS: &[&str] = &["vllm_cuda"];
 const ROUTED_QUANT_BACKENDS: &[&str] = &["flashinfer_trtllm"];
@@ -720,7 +725,7 @@ mod tests {
         let c = cfgs(40);
         assert_eq!((c.embedding.input_bytes_per_token.get(),c.embedding.output_bytes_per_token.get()),(4104,4096));
         assert_eq!(c.gdn.gpu_name,"NVIDIA H200"); assert_eq!(c.gdn.chunk_output_backends,["vllm_triton"]);
-        assert_eq!(c.gated_gqa.attention_backends,["fa3"]); assert_eq!(c.gated_gqa.qk_rms_norm_backends,["flashinfer"]);
+        assert_eq!(c.gated_gqa.attention_backends,["fa2","fa3"]); assert_eq!(c.gated_gqa.qk_rms_norm_backends,["flashinfer"]);
         assert_eq!(c.router.bf16_gemm_backends,["torch_linear"]); assert_eq!(c.router.fused_topk_backends,["vllm_cuda"]); assert_eq!(c.routed_expert.fp8_grouped_gemm_backends,["flashinfer_trtllm"]);
         assert_eq!(c.routed_expert.local_ppm,c.finalize.local_ppm); assert_eq!(c.finalize.local_ppm.len(),256);
         assert!(c.finalize.local_ppm[..64].iter().all(|&v| v==3907)); assert!(c.finalize.local_ppm[64..].iter().all(|&v| v==3906));
