@@ -319,6 +319,8 @@ pub struct Qwen36LocalModel {
     pub num_gdn_layers: u32,
     pub num_gqa_layers: u32,
     pub total_kv_bytes_per_token: Dim,
+    pub recurrent_state_bytes_per_request: Dim,
+    pub recurrent_checkpoint_interval_tokens: Dim,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -419,8 +421,75 @@ fn total_kv_bytes_per_token(resolved: &Qwen36LocalResolved) -> Dim {
         * Dim::param("num_gqa_layers", resolved.num_gqa_layers)
 }
 
+/// One GDN layer's SSM state: the `(num_value_heads, key_head_dim,
+/// value_head_dim)` recurrent tensor. Kept separate from the conv window because
+/// vLLM sizes its hybrid block from the SSM page ALONE (the conv page is a
+/// separate additive term), so only this half feeds
+/// [`recurrent_checkpoint_interval_tokens`].
+fn ssm_state_bytes_per_layer(resolved: &Qwen36LocalResolved) -> Dim {
+    let gdn = &resolved.gdn.raw_cfg;
+    gdn.num_value_heads.clone() * gdn.key_head_dim.clone() * gdn.value_head_dim.clone()
+        * Dim::param("ssm_state_bytes", gdn.ssm_state_dtype.size_bytes())
+}
+
+/// One GDN layer's causal-conv window over the mixed q/k/v channel stack.
+///
+/// Shape and dtype come from the GDN worklet config, so this stays consistent
+/// with what the L1 conv kernels are told to move. vLLM keeps only
+/// `conv_kernel_size - 1` taps (the current token supplies the last one), so
+/// this is ~33% generous — 0.75% of the whole per-request state, not worth
+/// diverging from the configured kernel shape over.
+fn conv_state_bytes_per_layer(resolved: &Qwen36LocalResolved) -> Dim {
+    let gdn = &resolved.gdn.raw_cfg;
+    let channels = 2 * gdn.num_key_heads.clone() * gdn.key_head_dim.clone()
+        + gdn.num_value_heads.clone() * gdn.value_head_dim.clone();
+    channels * gdn.conv_kernel_size.clone()
+        * Dim::param("conv_state_bytes", gdn.conv_state_dtype.size_bytes())
+}
+
+/// Every GDN layer's SSM state plus its conv window. Both halves are required to
+/// resume a sequence, so a checkpoint that stores one without the other is
+/// unusable — they are always retained and charged together.
+fn recurrent_state_bytes_per_request(resolved: &Qwen36LocalResolved) -> Dim {
+    (ssm_state_bytes_per_layer(resolved) + conv_state_bytes_per_layer(resolved))
+        * Dim::param("num_gdn_layers", resolved.num_gdn_layers)
+}
+
+/// vLLM's hybrid `block_size`: the smallest attention-kernel-aligned token count
+/// whose per-layer attention page covers one per-layer SSM page.
+///
+/// `attn_block_size = kernel_block_size * cdiv(ssm_page, kernel_block_size *
+/// single_token_k_page)` — verbatim from vllm-ascend#7393, where
+/// `kernel_block_size` is the attention KV-cache block granularity the worklet
+/// already configures. The divisor counts only K (vLLM's own asymmetry: the
+/// realized page holds K **and** V, so the chosen block is ~2x conservative).
+/// Both operands are per-layer per-rank, so the ratio is TP-invariant; this arch
+/// is TP1 anyway.
+///
+/// Returns 0 for a layer prefix with no GDN layer, matching the trait's "no
+/// recurrent state" encoding.
+fn recurrent_checkpoint_interval_tokens(resolved: &Qwen36LocalResolved) -> Dim {
+    if resolved.num_gdn_layers == 0 {
+        return Dim::param("no_gdn_layers", 0);
+    }
+    let attn = &resolved.gated_gqa.attention;
+    let single_token_k_page = attn.num_kv_heads.clone() * attn.head_dim.clone()
+        * Dim::param("kv_bytes", attn.kv_dtype().size_bytes());
+    let kernel_block_size = Dim::param(
+        "kv_cache_block_size",
+        resolved.gated_gqa.raw_cfg.kv_cache_block_size,
+    );
+    let quantum = kernel_block_size.clone() * single_token_k_page;
+    let ssm_page = ssm_state_bytes_per_layer(resolved);
+    // cdiv without a helper: Dim has no ceiling divide, and the "+ quantum - 1"
+    // form keeps the whole derivation visible in the rendered expression.
+    kernel_block_size * ((ssm_page + quantum.clone() - 1) / quantum)
+}
+
 pub fn build(name: String, resolved: Qwen36LocalResolved, bridge: &PerfApiBridge) -> std::result::Result<Qwen36LocalModel, BuildError> {
     let total_kv_bytes_per_token = total_kv_bytes_per_token(&resolved);
+    let recurrent_state_bytes_per_request = recurrent_state_bytes_per_request(&resolved);
+    let recurrent_checkpoint_interval_tokens = recurrent_checkpoint_interval_tokens(&resolved);
     let embedding_name = format!("{name}.embedding");
     let embedding = Op::new(embedding_name.clone(), Arc::new(ElementwiseKernel::build(embedding_name, resolved.embedding, bridge)?));
     let mut model = Qwen36LocalModel {
@@ -434,12 +503,21 @@ pub fn build(name: String, resolved: Qwen36LocalResolved, bridge: &PerfApiBridge
         head: Qwen36HeadLocalWorklet::build(format!("{name}.head"), resolved.head, bridge)?,
         name, logical_num_layers: resolved.logical_num_layers, num_layers: resolved.num_layers,
         num_gdn_layers: resolved.num_gdn_layers, num_gqa_layers: resolved.num_gqa_layers,
-        total_kv_bytes_per_token, cost_flat: Vec::new(), n_slots: 0,
+        total_kv_bytes_per_token, recurrent_state_bytes_per_request,
+        recurrent_checkpoint_interval_tokens, cost_flat: Vec::new(), n_slots: 0,
     };
     let tree = model.cost_tree();
     model.cost_flat = tree.flatten();
     model.n_slots = tree.n_slots();
     tracing::info!("[build] Qwen3.6 local cost tree ({} leaf slots):\n{}", tree.n_slots(), tree.describe());
+    tracing::info!(
+        "[build] Qwen3.6 local recurrent state: {} B/request over {} GDN layer(s), \
+         reusable every {} tokens ({} B/token of full-attention KV)",
+        model.recurrent_state_bytes_per_request.get(),
+        model.num_gdn_layers,
+        model.recurrent_checkpoint_interval_tokens.get(),
+        model.total_kv_bytes_per_token.get(),
+    );
     Ok(model)
 }
 
@@ -575,6 +653,8 @@ impl IterwiseUnifiedModel for Qwen36LocalModel {
 
     fn cost_log_manifest(&self) -> CostManifest { self.cost_tree().manifest() }
     fn total_kv_bytes_per_token(&self) -> u64 { u64::from(self.total_kv_bytes_per_token.get()) }
+    fn recurrent_state_bytes_per_request(&self) -> u64 { u64::from(self.recurrent_state_bytes_per_request.get()) }
+    fn recurrent_checkpoint_interval_tokens(&self) -> u32 { self.recurrent_checkpoint_interval_tokens.get() }
     fn gpus_per_replica(&self) -> u16 { 1 }
 }
 
@@ -750,6 +830,60 @@ mod tests {
         for (layers,expected) in [(1,0),(3,0),(4,2048),(5,2048),(39,18_432),(40,20_480)] {
             assert_eq!(total_kv_bytes_per_token(&resolve_configs(&cfgs(layers))).get(),expected);
         }
+    }
+
+    #[test]
+    fn recurrent_state_bytes_count_ssm_plus_conv_on_every_gdn_layer() {
+        const SSM_PER_LAYER: u32 = 32 * 128 * 128 * 4;
+        const CONV_PER_LAYER: u32 = (2 * 16 * 128 + 32 * 128) * 4 * 2;
+        assert_eq!((SSM_PER_LAYER,CONV_PER_LAYER),(2_097_152,65_536));
+        for (layers,gdn_layers) in [(1,1),(3,3),(4,3),(5,4),(39,30),(40,30)] {
+            let resolved = resolve_configs(&cfgs(layers));
+            assert_eq!(resolved.num_gdn_layers,gdn_layers,"L={layers}");
+            assert_eq!(
+                recurrent_state_bytes_per_request(&resolved).get(),
+                (SSM_PER_LAYER + CONV_PER_LAYER) * gdn_layers,
+                "L={layers}",
+            );
+        }
+        assert_eq!(recurrent_state_bytes_per_request(&resolve_configs(&cfgs(40))).get(),64_880_640);
+    }
+
+    /// vLLM reports `attn_block_size = 512` for this checkpoint family at TP8
+    /// (vllm-project/vllm-ascend#7393). At TP1 both operands of the ratio grow
+    /// 8x, so the same formula must land on the same block for the TP8 shapes
+    /// and on 2048 for ours — the `num_kv_heads` difference (2 replicated to 1
+    /// per rank at TP8, 2 whole at TP1) is what moves it.
+    #[test]
+    fn checkpoint_interval_follows_the_vllm_page_alignment_rule() {
+        let resolved = resolve_configs(&cfgs(40));
+        let attn = &resolved.gated_gqa.attention;
+        assert_eq!(
+            (attn.num_kv_heads.get() * attn.head_dim.get() * attn.kv_dtype().size_bytes(),
+             ssm_state_bytes_per_layer(&resolved).get()),
+            (1_024, 2_097_152),
+            "single-token K page and per-layer SSM page feeding the rule",
+        );
+        assert_eq!(recurrent_checkpoint_interval_tokens(&resolved).get(),2_048);
+
+        // The interval is a property of the layer shapes, not of how many
+        // layers the prefix keeps — only "no GDN layer at all" turns it off.
+        for (layers,expected) in [(1,2048),(3,2048),(4,2048),(39,2048),(40,2048)] {
+            assert_eq!(recurrent_checkpoint_interval_tokens(&resolve_configs(&cfgs(layers))).get(),expected,"L={layers}");
+        }
+    }
+
+    #[test]
+    fn built_model_exposes_the_recurrent_state_contract() {
+        let model = enumerate_model(40);
+        assert_eq!(model.recurrent_state_bytes_per_request(),64_880_640);
+        assert_eq!(model.recurrent_checkpoint_interval_tokens(),2_048);
+        // One checkpoint costs 3168 tokens of full-attention KV: the alignment
+        // rule equalizes PER-LAYER pages, and this model has 30 GDN : 10 GQA
+        // layers, so a checkpoint is ~1.55x the KV of the span it covers.
+        let state_tokens = model.recurrent_state_bytes_per_request().div_ceil(model.total_kv_bytes_per_token());
+        assert_eq!(state_tokens,3_168);
+        assert!(state_tokens > u64::from(model.recurrent_checkpoint_interval_tokens()));
     }
 
     #[test]

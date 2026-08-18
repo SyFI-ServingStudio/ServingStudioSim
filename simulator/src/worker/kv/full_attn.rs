@@ -2,26 +2,37 @@
 //!
 //! `FullAttnKv` owns partition placement, promised/held ledgers, and occupancy
 //! sampling. Each partition's resident decode membership and capacity accounting
-//! live in `FullAttnPartitionState`. Iteration input remains owned by Execution;
-//! borrowed iterators avoid per-iteration membership copies.
-
-use std::collections::HashMap;
+//! live in a [`ResidentPartitionState`]. Iteration input remains owned by
+//! Execution; borrowed iterators avoid per-iteration membership copies.
+//!
+//! Every token of this model's cache is per-token attention KV, so the pieces
+//! from [`super::shared`] are configured with their identity values: no fixed
+//! per-request charge, and a prefix reuse quantum of one token. A model that
+//! also carries recurrent state gets a different store (`hybrid_gdn`) rather
+//! than a flag here.
 
 use crate::common::{RequestId, SessionInput, Time};
 use crate::log::{
     KvSampler, KvSubmit, PrefixCacheActivation, PrefixCacheEvent, PrefixCacheEventKind,
     PrefixCacheEvictionReason, PrefixCacheLogger, PrefixCacheRetentionReason,
 };
+use crate::worker::kv::shared::prefix_cache::{
+    PrefixCache, PrefixCacheMutation, PrefixCacheReturnMetadata,
+};
+use crate::worker::kv::shared::prefix_cache_journal::PrefixCacheJournal;
+use crate::worker::kv::shared::request_ledger::RequestLedger;
+use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
 use crate::worker::kv::{
     HandoffKv, IterWorkerKv, KvStore, PrefixCachePolicy, PrefixCacheTokenConfig, PrefixKv,
     ResolvedPrefillContext, SlotPipelineKv,
 };
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
 
-use super::full_attn_partition::FullAttnPartitionState;
-use super::prefix_cache::{
-    PrefixCache, PrefixCacheMutation, PrefixCacheMutationKind, PrefixCacheReturnMetadata,
-};
+/// No fixed per-request state: a full-attention request occupies exactly its
+/// context tokens.
+const NO_FIXED_CHARGE: u64 = 0;
+/// Any prefix length is resumable, so retained KV is reusable token by token.
+const TOKEN_QUANTUM: u32 = 1;
 
 pub struct FullAttentionKvFootprint {
     post_prefill_context_tokens: u32,
@@ -36,20 +47,12 @@ impl FullAttentionKvFootprint {
 }
 
 pub struct FullAttnKv {
-    partitions: Vec<FullAttnPartitionState>,
-    /// Preserve `HashMap` and its drain order: it feeds prefill/input/event order.
-    promised: HashMap<RequestId, (PartitionId, u64)>,
-    /// Prefilled KV awaiting a decode-side pull acknowledgement.
-    held: HashMap<RequestId, (PartitionId, u64)>,
-    held_tokens_by_partition: Vec<u64>,
-    request_to_partition: HashMap<RequestId, PartitionId>,
-    /// Runtime prefill context stays beside request placement and residency;
-    /// the shared request record carries only the immutable declaration.
-    resolved_prefill_contexts: HashMap<RequestId, ResolvedPrefillContext>,
+    partitions: Vec<ResidentPartitionState>,
+    ledger: RequestLedger,
     /// Evictable completed-session KV, local to each attention partition.
     prefix_caches: Vec<PrefixCache>,
+    journal: PrefixCacheJournal,
     sampler: Option<KvSampler>,
-    prefix_cache_logger: Option<PrefixCacheLogger>,
 }
 
 impl KvStore for FullAttnKv {
@@ -223,14 +226,15 @@ impl PrefixKv for FullAttnKv {
         footprint: Self::Footprint,
         now: Time,
     ) {
-        if let Some(session_id) = resolved_prefill.session_id {
+        if let Some(session_id) = resolved_prefill.session_id() {
             let take_result = self.prefix_caches[partition as usize]
-                .take(session_id, resolved_prefill.declared_prefix_tokens);
+                .take(session_id, resolved_prefill.declared_prefix_tokens());
             debug_assert_eq!(
-                take_result.hit_tokens, resolved_prefill.resident_prefix_tokens,
+                take_result.hit_tokens,
+                resolved_prefill.resident_prefix_tokens(),
                 "prefill context changed between preview and reservation"
             );
-            self.record_prefix_cache_event(PrefixCacheEvent {
+            self.journal.record(PrefixCacheEvent {
                 partition_id: partition,
                 time: now,
                 request_id: request,
@@ -244,21 +248,19 @@ impl PrefixKv for FullAttnKv {
                 entry_tokens_after: 0,
                 cache_used_before: take_result.cache_used_before,
                 cache_used_after: take_result.cache_used_after,
-                requested_tokens: u64::from(resolved_prefill.declared_prefix_tokens),
+                requested_tokens: u64::from(resolved_prefill.declared_prefix_tokens()),
                 hit_tokens: u64::from(take_result.hit_tokens),
             });
             resolved_prefill =
                 resolved_prefill.with_cache_return_metadata(take_result.return_metadata);
         }
-        self.resolved_prefill_contexts
-            .insert(request, resolved_prefill);
+        self.ledger.set_prefill_context(request, resolved_prefill);
         self.reserve(request, partition, footprint, now);
     }
 
     fn resolved_prefill_context(&self, request: RequestId) -> ResolvedPrefillContext {
-        *self
-            .resolved_prefill_contexts
-            .get(&request)
+        self.ledger
+            .prefill_context(request)
             .expect("resolved prefill context must exist for an admitted fresh request")
     }
 
@@ -274,25 +276,22 @@ impl SlotPipelineKv for FullAttnKv {
 
     fn estimated_peak(&self, partition: PartitionId) -> u64 {
         self.partitions[partition as usize].projected_peak_kv()
-            + self.partition_promised(partition)
-            + self.held_tokens_by_partition[partition as usize]
-            + self.prefix_caches[partition as usize].used_tokens()
+            + self.ledger.partition_promised(partition)
+            + self.ledger.partition_held(partition)
+            + self.prefix_caches[partition as usize].used_charge()
     }
 
     fn has_reservation(&self, request: RequestId) -> bool {
-        self.promised.contains_key(&request)
+        self.ledger.has_promise(request)
     }
 
     fn request_kv_weight(&self, request: RequestId) -> u64 {
-        self.promised
-            .get(&request)
-            .map(|(_, tokens)| *tokens)
+        self.ledger
+            .promised_charge(request)
             .or_else(|| {
-                self.request_to_partition
-                    .get(&request)
-                    .and_then(|partition| {
-                        self.partitions[*partition as usize].decode_current_kv(request)
-                    })
+                self.ledger.placement(request).and_then(|partition| {
+                    self.partitions[partition as usize].decode_current_kv(request)
+                })
             })
             .unwrap_or(0)
     }
@@ -325,23 +324,21 @@ impl FullAttnKv {
     ) -> Self {
         Self {
             partitions: (0..num_partitions)
-                .map(|_| FullAttnPartitionState::new(kv_capacity))
+                .map(|_| ResidentPartitionState::new(kv_capacity, NO_FIXED_CHARGE))
                 .collect(),
-            promised: HashMap::new(),
-            held: HashMap::new(),
-            held_tokens_by_partition: vec![0; num_partitions],
-            request_to_partition: HashMap::new(),
-            resolved_prefill_contexts: HashMap::new(),
+            ledger: RequestLedger::new(num_partitions),
             prefix_caches: (0..num_partitions)
                 .map(|_| {
                     PrefixCache::new(
                         prefix_cache.max_retained_tokens.min(kv_capacity),
                         prefix_cache.policy,
+                        TOKEN_QUANTUM,
+                        NO_FIXED_CHARGE,
                     )
                 })
                 .collect(),
+            journal: PrefixCacheJournal::new(prefix_cache_logger),
             sampler,
-            prefix_cache_logger,
         }
     }
 
@@ -370,8 +367,8 @@ impl FullAttnKv {
         footprint: &FullAttentionKvFootprint,
     ) -> bool {
         let partition_state = &self.partitions[partition as usize];
-        let reserved_tokens = self.partition_promised(partition)
-            + self.held_tokens_by_partition[partition as usize]
+        let reserved_tokens = self.ledger.partition_promised(partition)
+            + self.ledger.partition_held(partition)
             + footprint.reserved_tokens();
         partition_state.resident_tokens() + reserved_tokens <= partition_state.capacity_tokens()
             && partition_state.projected_peak_kv() + reserved_tokens
@@ -385,12 +382,11 @@ impl FullAttnKv {
         footprint: FullAttentionKvFootprint,
         now: Time,
     ) {
-        self.promised
-            .insert(request, (partition, footprint.reserved_tokens()));
-        self.request_to_partition.insert(request, partition);
+        self.ledger
+            .promise(request, partition, footprint.reserved_tokens());
         let evictions = self.trim_prefix_cache_to_physical_slack(partition);
         for eviction in evictions {
-            self.record_prefix_cache_mutation(
+            self.journal.record_mutation(
                 request,
                 partition,
                 now,
@@ -401,16 +397,9 @@ impl FullAttnKv {
         }
     }
 
-    /// Local full-attention KV is immediately ready. Preserve the existing
-    /// collect-then-remove choreography and `HashMap` iteration order.
+    /// Local full-attention KV is immediately ready.
     pub(crate) fn drain_ready(&mut self) {
-        let drained: Vec<(PartitionId, RequestId)> = self
-            .promised
-            .iter()
-            .map(|(&request, &(partition, _))| (partition, request))
-            .collect();
-        for (partition, request) in drained {
-            self.promised.remove(&request);
+        for (partition, request) in self.ledger.drain_promised() {
             self.partitions[partition as usize].add_prefill_admit(request);
         }
     }
@@ -425,7 +414,7 @@ impl FullAttnKv {
         // Iter-prefill already drained this reservation; pull-decode commits
         // directly after reserve, so clearing here keeps both lifecycles on the
         // same KV-owned request→partition ledger.
-        self.promised.remove(&request);
+        self.ledger.forget_promise(request);
         self.partitions[partition as usize].begin_decode(
             request,
             post_prefill_context_tokens,
@@ -443,7 +432,10 @@ impl FullAttnKv {
                     partition,
                     request_ids,
                 } => {
-                    self.debug_assert_partition(partition, request_ids);
+                    debug_assert!(
+                        self.ledger.all_placed_on(partition, request_ids),
+                        "advance scope contains a request outside KV partition {partition}"
+                    );
                     self.partitions[partition as usize].advance_subset(request_ids);
                 }
             }
@@ -455,14 +447,14 @@ impl FullAttnKv {
     }
 
     pub(crate) fn release(&mut self, request: RequestId, partition: PartitionId) {
-        self.discard_held(request);
-        self.promised.remove(&request);
+        self.ledger.take_held(request);
+        self.ledger.forget_promise(request);
         let current_kv = self.partitions[partition as usize]
             .decode_current_kv(request)
             .unwrap_or(0);
         self.partitions[partition as usize].release_decode(request, current_kv);
-        self.request_to_partition.remove(&request);
-        self.resolved_prefill_contexts.remove(&request);
+        self.ledger.forget_placement(request);
+        self.ledger.take_prefill_context(request);
     }
 
     pub(crate) fn release_retaining_prefix(
@@ -471,14 +463,14 @@ impl FullAttnKv {
         partition: PartitionId,
         now: Time,
     ) {
-        let resolved_prefill = self.resolved_prefill_contexts.get(&request).copied();
+        let resolved_prefill = self.ledger.prefill_context(request);
         let retained_tokens = self.partitions[partition as usize]
             .decode_current_kv(request)
             .or_else(|| {
                 resolved_prefill.map(|value| u64::from(value.post_prefill_context_tokens()))
             })
             .unwrap_or(0);
-        let session_id = resolved_prefill.and_then(|value| value.session_id);
+        let session_id = resolved_prefill.and_then(ResolvedPrefillContext::session_id);
         let cache_return_metadata =
             resolved_prefill.and_then(ResolvedPrefillContext::cache_return_metadata);
         self.release(request, partition);
@@ -502,45 +494,29 @@ impl FullAttnKv {
         request: RequestId,
         current_kv: u64,
     ) -> Option<PartitionId> {
-        let Some(partition) = self.request_to_partition.remove(&request) else {
-            self.discard_held(request);
-            self.resolved_prefill_contexts.remove(&request);
+        let Some(partition) = self.ledger.forget_placement(request) else {
+            self.ledger.take_held(request);
+            self.ledger.take_prefill_context(request);
             return None;
         };
         let partition_state = &mut self.partitions[partition as usize];
         partition_state.release_decode(request, current_kv);
         partition_state.remove_prefill_admit(request);
-        self.promised.remove(&request);
-        self.resolved_prefill_contexts.remove(&request);
+        self.ledger.forget_promise(request);
+        self.ledger.take_prefill_context(request);
         Some(partition)
     }
 
     pub(crate) fn hold(&mut self, partition: PartitionId, request: RequestId, kv_tokens: u64) {
-        self.request_to_partition.remove(&request);
-        if let Some((previous_partition, previous_tokens)) =
-            self.held.insert(request, (partition, kv_tokens))
-        {
-            let total = &mut self.held_tokens_by_partition[previous_partition as usize];
-            *total = total.saturating_sub(previous_tokens);
-        }
-        self.held_tokens_by_partition[partition as usize] += kv_tokens;
-    }
-
-    fn discard_held(&mut self, request: RequestId) {
-        if let Some((partition, kv_tokens)) = self.held.remove(&request) {
-            let total = &mut self.held_tokens_by_partition[partition as usize];
-            *total = total.saturating_sub(kv_tokens);
-        }
+        self.ledger.hold(request, partition, kv_tokens);
     }
 
     pub(crate) fn complete_handoff(&mut self, request: RequestId, now: Time) {
-        let Some((partition, kv_tokens)) = self.held.remove(&request) else {
+        let Some((partition, kv_tokens)) = self.ledger.take_held(request) else {
             return;
         };
-        let total = &mut self.held_tokens_by_partition[partition as usize];
-        *total = total.saturating_sub(kv_tokens);
-        let resolved_prefill = self.resolved_prefill_contexts.remove(&request);
-        let session_id = resolved_prefill.and_then(|value| value.session_id);
+        let resolved_prefill = self.ledger.take_prefill_context(request);
+        let session_id = resolved_prefill.and_then(ResolvedPrefillContext::session_id);
         let cache_return_metadata =
             resolved_prefill.and_then(ResolvedPrefillContext::cache_return_metadata);
         if let Some(session_id) = session_id {
@@ -564,16 +540,17 @@ impl FullAttnKv {
         if self.sampler.is_none() {
             return;
         }
-        let retained_prefix_kv = self.prefix_caches[partition as usize].used_tokens();
+        let retained_prefix_kv = self.prefix_caches[partition as usize].used_charge();
+        let held = self.ledger.partition_held(partition);
         let submit = KvSubmit {
             active_kv: self.partitions[partition as usize].resident_tokens()
-                + self.held_tokens_by_partition[partition as usize]
+                + held
                 + retained_prefix_kv,
             retained_prefix_kv,
             projected_peak: self.partitions[partition as usize].projected_peak_kv()
-                + self.held_tokens_by_partition[partition as usize]
+                + held
                 + retained_prefix_kv,
-            promised_kv: self.partition_promised(partition),
+            promised_kv: self.ledger.partition_promised(partition),
         };
         self.sampler
             .as_mut()
@@ -599,7 +576,7 @@ impl FullAttnKv {
     #[inline]
     pub(crate) fn status_active(&self, partition: PartitionId) -> u32 {
         self.live_decode_count(partition)
-            + self.partition_promised_count(partition)
+            + self.ledger.partition_promised_count(partition)
             + self.partitions[partition as usize].prefill_admit_count()
     }
 
@@ -619,26 +596,9 @@ impl FullAttnKv {
         self.partitions[partition as usize].decode_members()
     }
 
-    #[inline]
-    fn partition_promised(&self, partition: PartitionId) -> u64 {
-        self.promised
-            .values()
-            .filter(|(reserved_partition, _)| *reserved_partition == partition)
-            .map(|(_, tokens)| *tokens)
-            .sum()
-    }
-
-    #[inline]
-    fn partition_promised_count(&self, partition: PartitionId) -> u32 {
-        self.promised
-            .values()
-            .filter(|(reserved_partition, _)| *reserved_partition == partition)
-            .count() as u32
-    }
-
     fn non_cache_peak(&self, partition: PartitionId) -> u64 {
         let reserved =
-            self.partition_promised(partition) + self.held_tokens_by_partition[partition as usize];
+            self.ledger.partition_promised(partition) + self.ledger.partition_held(partition);
         let partition_state = &self.partitions[partition as usize];
         (partition_state.resident_tokens() + reserved)
             .max(partition_state.projected_peak_kv() + reserved)
@@ -676,25 +636,13 @@ impl FullAttnKv {
             cache_return_metadata,
         );
         for mutation in insert_result.mutations {
-            let event_kind = match mutation.kind {
-                PrefixCacheMutationKind::SameSessionReplacement => {
-                    PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::SameSessionReplacement)
-                }
-                PrefixCacheMutationKind::CapacityEviction => {
-                    PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::RetentionCapacity)
-                }
-                PrefixCacheMutationKind::ReplacementPolicyEviction => {
-                    PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ReplacementPolicy)
-                }
-                PrefixCacheMutationKind::Retain => PrefixCacheEventKind::Retain(retain_reason),
-            };
-            self.record_prefix_cache_mutation(
-                request, partition, now, mutation, event_kind, tokens,
-            );
+            let event_kind = PrefixCacheJournal::retain_event_kind(mutation.kind, retain_reason);
+            self.journal
+                .record_mutation(request, partition, now, mutation, event_kind, tokens);
         }
         if insert_result.retained_tokens == 0 {
-            let cache_used = self.prefix_caches[partition as usize].used_tokens();
-            self.record_prefix_cache_event(PrefixCacheEvent {
+            let cache_used = self.prefix_caches[partition as usize].used_charge();
+            self.journal.record(PrefixCacheEvent {
                 partition_id: partition,
                 time: now,
                 request_id: request,
@@ -708,50 +656,6 @@ impl FullAttnKv {
                 hit_tokens: 0,
             });
         }
-    }
-
-    fn record_prefix_cache_mutation(
-        &mut self,
-        request: RequestId,
-        partition: PartitionId,
-        now: Time,
-        mutation: PrefixCacheMutation,
-        event_kind: PrefixCacheEventKind,
-        retain_requested_tokens: u64,
-    ) {
-        self.record_prefix_cache_event(PrefixCacheEvent {
-            partition_id: partition,
-            time: now,
-            request_id: request,
-            session_id: mutation.session_id,
-            kind: event_kind,
-            entry_tokens_before: mutation.entry_tokens_before,
-            entry_tokens_after: mutation.entry_tokens_after,
-            cache_used_before: mutation.cache_used_before,
-            cache_used_after: mutation.cache_used_after,
-            requested_tokens: if mutation.kind == PrefixCacheMutationKind::Retain {
-                retain_requested_tokens
-            } else {
-                0
-            },
-            hit_tokens: 0,
-        });
-    }
-
-    fn record_prefix_cache_event(&mut self, event: PrefixCacheEvent) {
-        if let Some(logger) = &mut self.prefix_cache_logger {
-            logger.record(event);
-        }
-    }
-
-    #[inline]
-    fn debug_assert_partition(&self, partition: PartitionId, requests: &[RequestId]) {
-        debug_assert!(
-            requests.iter().all(|request| {
-                self.request_to_partition.get(request).copied() == Some(partition)
-            }),
-            "advance scope contains a request outside KV partition {partition}"
-        );
     }
 }
 
@@ -855,7 +759,7 @@ mod tests {
         assert!(kv_store.fits(0, &footprint));
         kv_store.reserve(RequestId(0), 0, footprint, Time::ZERO);
 
-        assert_eq!(kv_store.partition_promised(0), 90);
+        assert_eq!(kv_store.ledger.partition_promised(0), 90);
         assert_eq!(kv_store.prefix_caches[0].used_tokens(), 0);
         assert!(kv_store.non_cache_peak(0) + kv_store.prefix_caches[0].used_tokens() <= 100);
     }

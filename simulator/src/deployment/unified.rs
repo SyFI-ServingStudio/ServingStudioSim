@@ -30,8 +30,8 @@ use crate::orchestrator::{
 };
 use crate::timing::PerfApiBridge;
 use crate::worker::{
-    build_barebone_worker, build_hp_worker, resolve_prefix_cache_config, IterWorker, IterWorkerSel,
-    WorkerConfig,
+    build_barebone_worker, build_hp_worker, build_qwen36_hybrid_worker,
+    resolve_prefix_cache_config, IterWorker, IterWorkerSel, WorkerConfig,
 };
 
 use super::Deployment;
@@ -83,6 +83,9 @@ impl Deployment for UnifiedDeployment {
                 prefix_cache_mode,
                 prefix_cache_policy,
                 prefix_cache_max_gpu_memory_gb,
+                // Hybrid-only; read separately so the two arms keep the same
+                // bindings. See `ssm_checkpoint_interval_tokens` below.
+                ..
             }
             | IterWorkerSel::HpUnified {
                 attn_gpu_memory_gb,
@@ -124,6 +127,7 @@ impl Deployment for UnifiedDeployment {
             max_batch_tokens,
             pending_order,
             prefix_cache,
+            ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
             ..WorkerConfig::default()
         };
 
@@ -150,6 +154,9 @@ impl Deployment for UnifiedDeployment {
         // single-group barebone worker; the DP-attn / MoE archs run on the
         // multi-group hp_unified worker (one KV partition state per DP shard).
         match &g.arch {
+            // Barebone cadence, hybrid KV: 30 GDN layers of per-request
+            // recurrent state and 10 GQA layers of per-token KV live in one
+            // attention budget, so only the KV axis differs from the arms below.
             IterArchSel::Qwen36Local { .. } => {
                 ensure_barebone(&g.worker)?;
                 let model = Arc::new(arch_build::qwen36_local(
@@ -162,7 +169,7 @@ impl Deployment for UnifiedDeployment {
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    build_barebone_worker,
+                    build_qwen36_hybrid_worker,
                 ))
             }
             IterArchSel::Llama3Dense { .. } => {
@@ -400,6 +407,18 @@ fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
     }
 }
 
+/// The hybrid KV recipe's optional snapshot-interval override. Only `barebone`
+/// carries it; every other selector leaves the arch's own alignment in force.
+fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
+    match worker {
+        IterWorkerSel::Barebone {
+            ssm_checkpoint_interval_tokens,
+            ..
+        } => *ssm_checkpoint_interval_tokens,
+        _ => None,
+    }
+}
+
 /// DP-attention and MoE archs run on the multi-group hp_unified worker.
 fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
@@ -474,6 +493,7 @@ mod tests {
             prefix_cache_mode: crate::worker::PrefixCacheMode::Opportunistic,
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
             prefix_cache_max_gpu_memory_gb: None,
+            ssm_checkpoint_interval_tokens: None,
         }
     }
 
@@ -490,12 +510,45 @@ mod tests {
         ensure_hp_unified(&hp_worker()).expect("GLM accepts hp_unified");
     }
 
+    /// Qwen3.6 local keeps the `barebone` preset tag — cadence, admission and
+    /// execution really are barebone — but composes the hybrid KV store, so the
+    /// contract is asserted against `Qwen36HybridWorker`, not `BareboneWorker`.
     #[test]
     fn qwen36_local_barebone_pair_satisfies_the_iter_worker_contract() {
-        assert_iter_worker_contract::<crate::worker::BareboneWorker<Qwen36LocalModel>>();
+        assert_iter_worker_contract::<crate::worker::Qwen36HybridWorker<Qwen36LocalModel>>();
         ensure_barebone(&barebone_worker()).expect("Qwen3.6 local accepts barebone");
         let error = ensure_barebone(&hp_worker()).unwrap_err().to_string();
         assert!(error.contains("requires worker `barebone`"));
+    }
+
+    #[test]
+    fn the_snapshot_interval_override_is_barebone_only_and_defaults_to_the_arch() {
+        assert_eq!(ssm_checkpoint_interval_tokens(&barebone_worker()), None);
+        assert_eq!(ssm_checkpoint_interval_tokens(&hp_worker()), None);
+        let IterWorkerSel::Barebone {
+            attn_gpu_memory_gb,
+            gpu_time_multiplier,
+            max_batch_tokens,
+            pending_order,
+            prefix_cache_mode,
+            prefix_cache_policy,
+            prefix_cache_max_gpu_memory_gb,
+            ..
+        } = barebone_worker()
+        else {
+            unreachable!()
+        };
+        let overridden = IterWorkerSel::Barebone {
+            attn_gpu_memory_gb,
+            gpu_time_multiplier,
+            max_batch_tokens,
+            pending_order,
+            prefix_cache_mode,
+            prefix_cache_policy,
+            prefix_cache_max_gpu_memory_gb,
+            ssm_checkpoint_interval_tokens: Some(528),
+        };
+        assert_eq!(ssm_checkpoint_interval_tokens(&overridden), Some(528));
     }
 
     #[test]

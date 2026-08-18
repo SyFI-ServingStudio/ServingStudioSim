@@ -149,6 +149,36 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// link count to recover per-rank bytes.
     fn total_kv_bytes_per_token(&self) -> u64;
 
+    /// **Total** recurrent-state bytes one *request* occupies — summed over
+    /// **all** recurrent (SSM / linear-attention) layers, **all** heads, **all**
+    /// attention ranks, and including both the SSM state and the causal-conv
+    /// window (neither alone can resume a sequence). Same "total, not per-GPU"
+    /// convention as [`Self::total_kv_bytes_per_token`], so a worker converts it
+    /// to that function's token unit by dividing.
+    ///
+    /// Unlike KV, this is **fixed per request**: it does not grow as the request
+    /// decodes. A pure full-attention model has no such state and returns 0
+    /// (the default), which is what keeps every dense arch untouched.
+    fn recurrent_state_bytes_per_request(&self) -> u64 {
+        0
+    }
+
+    /// Token interval at which a checkpoint of [`Self::recurrent_state_bytes_per_request`]
+    /// can be taken and later resumed from — vLLM's hybrid `block_size`.
+    ///
+    /// A recurrent state is a single rolling snapshot, not per-token entries, so
+    /// it is only reusable at positions where a snapshot was actually written.
+    /// vLLM writes them at multiples of this interval (`mamba_cache_mode`), which
+    /// quantizes every prefix-cache hit to a multiple of it. `0` means the model
+    /// has no recurrent state; `1` would mean "resumable anywhere", which no real
+    /// recurrent layer is.
+    ///
+    /// The arch owns the derivation because only it knows the state and KV page
+    /// shapes; L5 only reads the value (and may override it from a preset).
+    fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
+        0
+    }
+
     /// GPUs one replica of this model spans. The model_arch is the source of truth
     /// for this: it resolved the parallel layout, so it knows the real extent — the
     /// EP span with TP/HP groups nested inside it, *not* a `tp×ep×hp` product. L5/L6

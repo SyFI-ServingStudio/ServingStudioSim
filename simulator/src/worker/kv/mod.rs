@@ -8,15 +8,16 @@
 use crate::common::{RequestId, SessionInput, Time};
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
 
-use self::prefix_cache::PrefixCacheReturnMetadata;
+use self::shared::prefix_cache::PrefixCacheReturnMetadata;
 
 mod full_attn;
-mod full_attn_partition;
-mod prefix_cache;
+mod hybrid_gdn;
+mod shared;
 
 pub use full_attn::FullAttnKv;
-pub(crate) use prefix_cache::PrefixCacheTokenConfig;
-pub use prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
+pub use hybrid_gdn::HybridGdnKv;
+pub(crate) use shared::prefix_cache::PrefixCacheTokenConfig;
+pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,6 +68,11 @@ impl ResolvedPrefillContext {
             post_prefill_context_tokens,
             cache_return_metadata: None,
         }
+    }
+
+    /// `None` for a standalone request — nothing to look up or retain.
+    pub(crate) fn session_id(self) -> Option<u32> {
+        self.session_id
     }
 
     pub fn resident_prefix_tokens(self) -> u32 {

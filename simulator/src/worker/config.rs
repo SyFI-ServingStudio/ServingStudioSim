@@ -95,6 +95,14 @@ pub enum IterWorkerSel {
         /// attention budget. None uses all dynamically available slack.
         #[serde(default)]
         prefix_cache_max_gpu_memory_gb: Option<f64>,
+        /// Hybrid (recurrent + full-attention) archs only: context-token spacing
+        /// of resumable SSM snapshots, i.e. vLLM's aligned hybrid block size.
+        /// None uses the value the arch derives from its own layer geometry.
+        /// Set it to reproduce a specific vLLM deployment's alignment, or sweep
+        /// it to study the reuse-granularity / state-capacity trade-off. Ignored
+        /// by a pure full-attention arch, which has no recurrent state.
+        #[serde(default)]
+        ssm_checkpoint_interval_tokens: Option<u32>,
     },
     /// Multi-group HP/DP worker: maintains one KV partition state per attention
     /// DP shard (count comes from the arch's `num_attn_dp_groups`). Pairs with a
