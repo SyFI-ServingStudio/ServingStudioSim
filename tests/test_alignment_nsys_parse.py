@@ -748,3 +748,110 @@ def test_the_window_follows_the_reference_rank_and_peers_join_by_time():
     kept = window_rows_by_reference_rank(rows, 8, 9)
 
     assert sorted((row[0], row[2].device_id) for row in kept) == [(4, 1), (5, 1), (8, 0), (9, 0)]
+
+
+def _best_repeat_by_definition(tokens, absolute_start):
+    """Literal transcription of the fold's defining triple loop.
+
+    Kept in the tests, not in `sequence.py`, precisely because it is the slow
+    statement of intent the fast implementation must keep agreeing with: it
+    compares whole blocks in `O(width)` where the shipped code derives the same
+    repeat count from one `lcp` diagonal.
+    """
+    best = None
+    for start in range(len(tokens)):
+        for width in range(1, (len(tokens) - start) // 2 + 1):
+            count = 1
+            while (
+                start + (count + 1) * width <= len(tokens)
+                and tokens[start : start + width]
+                == tokens[start + count * width : start + (count + 1) * width]
+            ):
+                count += 1
+            saved_occurrences = (count - 1) * width
+            if saved_occurrences < 2:
+                continue
+            suffix = len(tokens) - start - count * width
+            candidate = (
+                start + width + suffix,
+                0 if (absolute_start + start) % width == 0 else 1,
+                suffix,
+                -count,
+                start,
+                width,
+                count,
+            )
+            if best is None or candidate < best:
+                best = candidate
+    return best
+
+
+@pytest.mark.parametrize("alphabet", [2, 3, 7])
+def test_fast_repeat_search_agrees_with_the_defining_triple_loop(alphabet):
+    import random
+
+    from alignment.nsys.sequence import _best_repeat
+
+    rng = random.Random(20260818 + alphabet)
+    for _ in range(300):
+        length = rng.randint(0, 40)
+        tokens = [rng.randrange(alphabet) for _ in range(length)]
+        # A small alphabet already makes repeats common; splicing a periodic run
+        # in also covers the "one long clean repeat" shape a real layer stack has.
+        if length >= 6 and rng.random() < 0.5:
+            period = tokens[: rng.randint(1, 3)]
+            tokens = tokens[:2] + period * rng.randint(2, 5) + tokens[-2:]
+        for absolute_start in (0, 1, 5):
+            assert _best_repeat(tokens, absolute_start) == _best_repeat_by_definition(
+                tokens, absolute_start
+            ), (tokens, absolute_start)
+
+
+def test_concurrent_streams_fold_the_same_however_they_interleave():
+    """Two streams' kernels may arrive in either order; the fold must not care.
+
+    Both iterations below run the identical work — a two-kernel body repeated
+    three times on stream 7, with one stream-9 kernel overlapping somewhere in
+    the middle. Only where that overlapping kernel lands differs. Ordered by raw
+    start time they are different sequences and neither folds; grouped by stream
+    they are one sequence with a clean repeat.
+    """
+
+    def iteration(index, stream_of_third):
+        names = [1, 2, 1, 2, 1, 2]
+        streams = [7, 7, 7, 7, 7, 7]
+        names.insert(stream_of_third, 3)
+        streams.insert(stream_of_third, 9)
+        return {
+            "iteration": index,
+            "iteration_type": "decode",
+            "ranges": [
+                {
+                    "phase": "forward",
+                    "device_id": 0,
+                    "kernels": [
+                        {"name_id": name, "category": "other", "stream_id": stream}
+                        for name, stream in zip(names, streams, strict=True)
+                    ],
+                }
+            ],
+        }
+
+    catalog = build_kernel_sequences(
+        [iteration(1, 2), iteration(2, 5)],
+        {1: "layer_gemm", 2: "layer_norm", 3: "shared_expert"},
+    )["forward"]["unique_sequences"]
+
+    assert len(catalog) == 1, "interleaving alone must not fork a second sequence"
+    sequence = catalog[0]
+    assert [occurrence["iterations"] for occurrence in sequence["occurrences"]] == [[1, 2]]
+    assert [node["repeat"]["count"] for node in sequence["program"] if "repeat" in node] == [3]
+    assert [kernel["name"] for kernel in expand_program(sequence["program"])] == [
+        "layer_gemm",
+        "layer_norm",
+        "layer_gemm",
+        "layer_norm",
+        "layer_gemm",
+        "layer_norm",
+        "shared_expert",
+    ]

@@ -12,6 +12,8 @@ import json
 from collections import defaultdict
 from typing import Any
 
+import numpy as np
+
 KernelOccurrence = dict[str, str]
 
 
@@ -123,6 +125,7 @@ def _build_device_kernel_sequences(
         for phase, kernels in ranges_by_phase.items():
             if not kernels:
                 continue
+            kernels = _stream_major(kernels)
             name_ids = tuple(int(kernel["name_id"]) for kernel in kernels)
             key = (phase, name_ids)
             categories = tuple(str(kernel["category"]) for kernel in kernels)
@@ -158,6 +161,31 @@ def _build_device_kernel_sequences(
     return catalogs
 
 
+def _stream_major(kernels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group each CUDA stream's kernels contiguously, keeping their launch order.
+
+    The rows arrive sorted by start time across every stream, which reads like an
+    execution order but is not one when streams run concurrently: two independent
+    kernels that overlap can land either way round, and nanoseconds of jitter flip
+    them between otherwise identical iterations. Folding is exact-match, so each
+    flip both breaks a layer repeat and forks a new "unique" sequence. On a
+    Qwen3.6 capture that turned one recurring decode shape into 909 sequences
+    folding to 92% of their expanded size — a labeling surface roughly five times
+    larger than the work it describes, none of the excess meaningful.
+
+    This is the same rule the per-device split above already follows, applied one
+    level down: concurrent tracks are kept apart rather than interleaved, because
+    a single ordered list of concurrent work asserts a serialization that did not
+    happen. Sorting is stable and keyed on the stream alone, so within a stream —
+    where execution really is ordered — the original start order survives intact.
+
+    Position in the folded sequence is a labeling coordinate, not evidence;
+    durations and overlap are read from each kernel's own timestamps, which this
+    does not touch.
+    """
+    return sorted(kernels, key=lambda kernel: int(kernel.get("stream_id", 0)))
+
+
 def expand_program(program: list[dict[str, Any]]) -> list[KernelOccurrence]:
     """Expand folded nodes; shared by validation tests and artifact consumers."""
     expanded: list[KernelOccurrence] = []
@@ -180,35 +208,96 @@ def _fold_program(kernels: list[KernelOccurrence]) -> list[dict[str, Any]]:
     return program
 
 
+def _best_repeat(tokens: list[int], absolute_start: int) -> tuple[int, ...] | None:
+    """Lowest-ranking `(stored, aligned, suffix, -count, start, width, count)`.
+
+    Every `(start, width)` pair with `saved_occurrences >= 2` contributes exactly
+    one candidate, and `start`/`width` are themselves in the tuple, so the
+    minimum is unique and independent of the order pairs are visited in. That is
+    what lets this iterate width-major while the definition reads start-major.
+
+    The definition asks, for each pair, how many consecutive `width`-blocks from
+    `start` are equal. Comparing blocks costs `O(width)` each, which makes the
+    obvious triple loop `O(n^3)` — minutes per iteration on a real capture. But
+    "the first k blocks are equal" is exactly "`tokens[start:]` and
+    `tokens[start + width:]` share a prefix of at least `(k - 1) * width`", so
+
+        count = 1 + lcp(start, start + width) // width
+
+    and for one fixed `width` the whole `lcp` diagonal falls out of a single
+    backward pass. That is `O(n)` per width, `O(n^2)` overall, with no change to
+    which repeat is chosen.
+    """
+    n = len(tokens)
+    if n < 2:
+        return None
+    token_array = np.asarray(tokens, dtype=np.int64)
+    positions = np.arange(n, dtype=np.int64)
+
+    best: tuple[int, ...] | None = None
+    best_saved = 1  # `saved_occurrences < 2` never qualifies, so start just below
+    for width in range(1, n // 2 + 1):
+        # `saved = (count - 1) * width <= n - start - width <= n - width`, and
+        # `n - width` only shrinks as width grows: once the best possible saving
+        # at this width cannot match what is already banked, no wider repeat can
+        # either. On a layer-stack sequence the winner is a narrow body repeated
+        # many times, so this lands early and retires most of the width range.
+        if n - width < best_saved:
+            break
+
+        # lcp(i, i + width) for every i at once: mark each mismatch with its own
+        # index and every match with `span`, then a reverse running minimum turns
+        # that into "index of the next mismatch at or after i".
+        span = n - width
+        matches = token_array[:span] == token_array[width:]
+        marked = np.where(matches, span, positions[:span])
+        next_mismatch = np.minimum.accumulate(marked[::-1])[::-1]
+        last_start = span - width  # from `width <= (n - start) // 2`
+        lcp = next_mismatch[: last_start + 1] - positions[: last_start + 1]
+
+        saved = lcp // width * width
+        # Equality is kept, not dropped: a candidate that only ties the banked
+        # saving can still win on alignment or suffix below.
+        qualifying = np.flatnonzero(saved >= max(2, best_saved))
+        if qualifying.size == 0:
+            continue
+        # The primary key is `n - saved`, so within one width only the starts
+        # achieving its maximum saving can ever win; the rest are dominated.
+        width_saved = int(saved[qualifying].max())
+        starts = qualifying[saved[qualifying] == width_saved]
+        # Remaining tie-break at fixed (width, saved): `aligned` first, then the
+        # smallest suffix — and suffix shrinks as start grows, so that is the
+        # largest start. `start` itself never decides, being determined by suffix.
+        aligned_starts = starts[(absolute_start + starts) % width == 0]
+        start = int((aligned_starts if aligned_starts.size else starts).max())
+
+        count = width_saved // width + 1
+        candidate = (
+            n - width_saved,  # == start + width + suffix
+            0 if (absolute_start + start) % width == 0 else 1,
+            n - start - count * width,
+            -count,
+            start,
+            width,
+            count,
+        )
+        if best is None or candidate < best:
+            best = candidate
+            best_saved = width_saved
+    return best
+
+
 def _fold_segment(kernels: list[KernelOccurrence], *, absolute_start: int) -> list[dict[str, Any]]:
-    best: tuple[int, int, int, int, int, int, int] | None = None
-    tokens = [(kernel["name"], kernel["suggested_category"]) for kernel in kernels]
-    for start in range(len(tokens)):
-        for width in range(1, (len(tokens) - start) // 2 + 1):
-            count = 1
-            while (
-                start + (count + 1) * width <= len(tokens)
-                and tokens[start : start + width]
-                == tokens[start + count * width : start + (count + 1) * width]
-            ):
-                count += 1
-            saved_occurrences = (count - 1) * width
-            if saved_occurrences < 2:
-                continue
-            suffix = len(tokens) - start - count * width
-            stored_occurrences = start + width + suffix
-            aligned = 0 if (absolute_start + start) % width == 0 else 1
-            candidate = (
-                stored_occurrences,
-                aligned,
-                suffix,
-                -count,
-                start,
-                width,
-                count,
-            )
-            if best is None or candidate < best:
-                best = candidate
+    # Intern to ints so the hot equality test is a machine compare rather than a
+    # two-string tuple compare.
+    token_ids: dict[tuple[str, str], int] = {}
+    tokens = [
+        token_ids.setdefault(
+            (kernel["name"], kernel["suggested_category"]), len(token_ids)
+        )
+        for kernel in kernels
+    ]
+    best = _best_repeat(tokens, absolute_start)
 
     if best is None:
         return [{"kernels": kernels}] if kernels else []
