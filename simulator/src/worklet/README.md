@@ -91,7 +91,7 @@ Each module re-exports its `{Worklet, Config, Input, Resolved}` quartet through
 | `llama3_dense_tp`, `llama3_dp_attn_tp_ffn` | `attn_block_tp`, `mlp_block_tp` |
 | `qwen3_moe_dp_attn_ep_ffn` (BF16) | `attn_block_tp`, `native_moe_router_local`, `native_moe_expert_compute_local` |
 | `qwen3_moe_fp8_dp_attn_ep_ffn` | `fp8_attn_block_tp`, `native_fp8_moe_router_local`, `native_moe_expert_compute_local` |
-| `qwen3_vllm_moe_dp_attn_ep_ffn` | `vllm_fp8_attn_block_tp`, `vllm_fp8_moe_router_local`, `vllm_fp8_moe_expert_compute_local` |
+| `qwen3_vllm_moe_dp_attn_ep_ffn` | `vllm_fp8_attn_block_tp`, `vllm_fp8_moe_router_local`, `moe_expert_compute_local` (TRT-LLM blockscale EP path) |
 | AFD `qwen3_attn_layerwise` | `attn_block_tp` |
 | AFD `qwen3_ffn_moe_layerwise` | `pre_attn_proj_tp`, `post_attn_router_tp`, `native_moe_router_local`, `native_moe_expert_compute_local` |
 | AFD `qwen3_fp8_ffn_moe_layerwise` | `fp8_pre_attn_proj_tp`, `fp8_post_attn_router_tp`, `native_fp8_moe_router_local`, `native_moe_expert_compute_local` |
