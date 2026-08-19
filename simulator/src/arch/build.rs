@@ -1140,7 +1140,7 @@ mod tests {
             .expect("build exact local Qwen3.6 model");
         assert_eq!(built.gpus_per_replica(), 1);
         assert_eq!(built.total_kv_bytes_per_token(), 20_480);
-        assert_eq!(built.cost_log_manifest().slots.len(), 75);
+        assert_eq!(built.cost_log_manifest().slots.len(), 72);
     }
 
     #[test]

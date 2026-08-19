@@ -3,9 +3,17 @@
 //! The section consumes already-normalized hidden states and executes one
 //! shared expert sequentially. At the higher composition layer it can run in
 //! parallel with routed-expert compute, but this worklet itself is strictly
-//! gate/up -> activation -> down -> scalar gate -> gate application. It excludes
-//! routing, routed experts, finalize/reduction, routed/shared addition, norms,
-//! TP, EP, collectives, and network work.
+//! gate/up -> activation -> down -> scalar gate -> sigmoid -> gate application.
+//! It excludes routing, routed experts, finalize/reduction, routed/shared
+//! addition, norms, TP, EP, collectives, and network work.
+//!
+//! The gate is three launches, not one. `sigmoid(gate(x)) * shared_out` is
+//! written in eager PyTorch, so the sigmoid is its own `at::native`
+//! elementwise kernel rather than an epilogue on the projection. Folding it
+//! into the projection leaf under-predicted the measured gate operation by
+//! 52.5% against a vLLM Qwen3.6-35B-A3B-FP8 capture (224.5 ms simulated vs
+//! 472.5 ms measured over 966 iterations) — at a one-column projection the
+//! sigmoid's own launch is a comparable cost, not a rounding error.
 
 use std::sync::Arc;
 
@@ -40,7 +48,12 @@ pub struct Qwen36SharedExpertLocalWorkletConfig {
     pub fp8_quant_backends: Vec<&'static str>,
     pub fp8_gemm_backends: Vec<&'static str>,
     pub bf16_gemm_backends: Vec<&'static str>,
+    /// Realization for `silu_and_mul`, which vLLM computes with its own fused
+    /// `act_and_mul_kernel` rather than eager tensor arithmetic.
     pub elementwise_backends: Vec<&'static str>,
+    /// Realization for the gate path (`sigmoid` and its application), which the
+    /// model source writes as plain PyTorch and so runs on TensorIterator.
+    pub gate_elementwise_backends: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +62,7 @@ pub struct Qwen36SharedExpertLocalWorkletResolved {
     pub silu_and_mul: ElementwiseKernelConfig,
     pub down: SingleFp8GemmWithQuantConfig,
     pub shared_gate: SingleGemmKernelConfig,
+    pub shared_gate_sigmoid: ElementwiseKernelConfig,
     pub apply_shared_gate: ElementwiseKernelConfig,
     pub raw_cfg: Qwen36SharedExpertLocalWorkletConfig,
 }
@@ -64,6 +78,7 @@ pub struct Qwen36SharedExpertLocalWorklet {
     pub silu_and_mul: Op<ElementwiseKernel>,
     pub down: SingleFp8GemmWithQuantOp,
     pub shared_gate: Op<SingleGemmKernel>,
+    pub shared_gate_sigmoid: Op<ElementwiseKernel>,
     pub apply_shared_gate: Op<ElementwiseKernel>,
     resolved: Qwen36SharedExpertLocalWorkletResolved,
 }
@@ -72,8 +87,9 @@ impl Qwen36SharedExpertLocalWorklet {
     pub fn resolve_config(
         cfg: &Qwen36SharedExpertLocalWorkletConfig,
     ) -> Qwen36SharedExpertLocalWorkletResolved {
-        validate_config(cfg)
-            .unwrap_or_else(|reason| panic!("invalid Qwen36SharedExpertLocalWorkletConfig: {reason}"));
+        validate_config(cfg).unwrap_or_else(|reason| {
+            panic!("invalid Qwen36SharedExpertLocalWorkletConfig: {reason}")
+        });
 
         let shared_width = checked_product(
             "shared expert width",
@@ -107,6 +123,7 @@ impl Qwen36SharedExpertLocalWorklet {
             &[cfg.hidden.get(), cfg.activation_dtype.size_bytes()],
         )
         .expect("validated gate-application output byte rate must fit u32");
+        let gate_scalar_bytes = cfg.activation_dtype.size_bytes();
         let quant = |hidden_size: Dim| Fp8PerTokenGroupQuantKernelConfig {
             backends: cfg.fp8_quant_backends.clone(),
             gpu_name: cfg.gpu_name.clone(),
@@ -153,8 +170,17 @@ impl Qwen36SharedExpertLocalWorklet {
                 k: cfg.hidden.clone(),
                 dtype: cfg.activation_dtype,
             },
+            // One BF16 scalar in, one out, per token: the projection emits
+            // `n=1`, so this leaf is entirely launch-bound and its byte rate
+            // exists only to keep the elementwise contract honest.
+            shared_gate_sigmoid: ElementwiseKernelConfig {
+                backends: cfg.gate_elementwise_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                input_bytes_per_token: gate_scalar_bytes.into(),
+                output_bytes_per_token: gate_scalar_bytes.into(),
+            },
             apply_shared_gate: ElementwiseKernelConfig {
-                backends: cfg.elementwise_backends.clone(),
+                backends: cfg.gate_elementwise_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 input_bytes_per_token: apply_gate_input_bytes.into(),
                 output_bytes_per_token: apply_gate_output_bytes.into(),
@@ -180,16 +206,20 @@ impl Qwen36SharedExpertLocalWorklet {
             ElementwiseKernel::build,
             bridge,
         )?;
-        let down = SingleFp8GemmWithQuantOp::build(
-            format!("{name}.down"),
-            resolved.down.clone(),
-            bridge,
-        )?;
+        let down =
+            SingleFp8GemmWithQuantOp::build(format!("{name}.down"), resolved.down.clone(), bridge)?;
         let shared_gate = build_atomic(
             &name,
             "shared_gate",
             resolved.shared_gate.clone(),
             SingleGemmKernel::build,
+            bridge,
+        )?;
+        let shared_gate_sigmoid = build_atomic(
+            &name,
+            "shared_gate_sigmoid",
+            resolved.shared_gate_sigmoid.clone(),
+            ElementwiseKernel::build,
             bridge,
         )?;
         let apply_shared_gate = build_atomic(
@@ -205,6 +235,7 @@ impl Qwen36SharedExpertLocalWorklet {
             silu_and_mul,
             down,
             shared_gate,
+            shared_gate_sigmoid,
             apply_shared_gate,
             resolved,
         })
@@ -222,6 +253,7 @@ impl Qwen36SharedExpertLocalWorklet {
                 self.silu_and_mul.compile(builder),
                 self.down.compile(builder),
                 self.shared_gate.compile(builder),
+                self.shared_gate_sigmoid.compile(builder),
                 self.apply_shared_gate.compile(builder),
             ])),
         }
@@ -235,11 +267,12 @@ impl Qwen36SharedExpertLocalWorklet {
         eval_fp8_or_zero(&self.down, work.down, zero, ev);
         eval_atomic_or_zero(&self.shared_gate, work.shared_gate, zero, ev);
         eval_atomic_or_zero(
-            &self.apply_shared_gate,
-            work.apply_shared_gate,
+            &self.shared_gate_sigmoid,
+            work.shared_gate_sigmoid,
             zero,
             ev,
         );
+        eval_atomic_or_zero(&self.apply_shared_gate, work.apply_shared_gate, zero, ev);
     }
 }
 
@@ -248,6 +281,7 @@ struct WorkInputs {
     silu_and_mul: ElementwiseKernelInput,
     down: SingleFp8GemmWithQuantInput,
     shared_gate: SingleGemmKernelInput,
+    shared_gate_sigmoid: ElementwiseKernelInput,
     apply_shared_gate: ElementwiseKernelInput,
 }
 
@@ -263,6 +297,9 @@ fn work_inputs(batch_tokens: u32) -> WorkInputs {
             num_tokens: batch_tokens,
         },
         shared_gate: SingleGemmKernelInput { m: batch_tokens },
+        shared_gate_sigmoid: ElementwiseKernelInput {
+            num_tokens: batch_tokens,
+        },
         apply_shared_gate: ElementwiseKernelInput {
             num_tokens: batch_tokens,
         },
@@ -363,6 +400,7 @@ mod tests {
             fp8_gemm_backends: vec!["deepgemm"],
             bf16_gemm_backends: vec!["torch_linear"],
             elementwise_backends: vec!["triton"],
+            gate_elementwise_backends: vec!["torch"],
         }
     }
 
@@ -431,7 +469,21 @@ mod tests {
         let tree = builder.finish(root);
         assert_eq!(tree.slots[5].name, "model.shared_expert.shared_gate");
         assert_eq!(tree.slots[5].kind, "single_gemm");
-        assert_eq!(tree.slots[6].name, "model.shared_expert.apply_shared_gate");
+        // The eager `sigmoid` is its own launch and must stay its own leaf; see
+        // the module header for what folding it away cost.
+        assert_eq!(
+            tree.slots[6].name,
+            "model.shared_expert.shared_gate_sigmoid"
+        );
+        assert_eq!(tree.slots[6].kind, "elementwise");
+        assert_eq!(
+            (
+                resolved.shared_gate_sigmoid.input_bytes_per_token.get(),
+                resolved.shared_gate_sigmoid.output_bytes_per_token.get(),
+            ),
+            (2, 2)
+        );
+        assert_eq!(tree.slots[7].name, "model.shared_expert.apply_shared_gate");
     }
 
     #[test]
@@ -457,12 +509,12 @@ mod tests {
     }
 
     #[test]
-    fn compile_has_exact_five_children_and_seven_flattened_leaves() {
+    fn compile_has_exact_six_children_and_eight_flattened_leaves() {
         let worklet = enumerate_worklet();
         let mut builder = CostTreeBuilder::new();
         let root = worklet.compile(&mut builder);
         let tree = builder.finish(root);
-        assert_eq!(tree.n_slots(), 7);
+        assert_eq!(tree.n_slots(), 8);
         assert_eq!(
             tree.slots
                 .iter()
@@ -475,6 +527,7 @@ mod tests {
                 "down.input_quant",
                 "down.gemm",
                 "shared_gate",
+                "shared_gate_sigmoid",
                 "apply_shared_gate",
             ]
         );
@@ -491,6 +544,7 @@ mod tests {
                 "single_gemm",
                 "single_gemm",
                 "elementwise",
+                "elementwise",
             ]
         );
         assert!(!tree.slots.iter().any(|slot| {
@@ -505,7 +559,7 @@ mod tests {
         }));
         match tree.root {
             CostNode::Labeled { child, .. } => match *child {
-                CostNode::Sum(children) => assert_eq!(children.len(), 5),
+                CostNode::Sum(children) => assert_eq!(children.len(), 6),
                 _ => panic!("expected Sum"),
             },
             _ => panic!("expected Labeled"),
@@ -513,16 +567,16 @@ mod tests {
     }
 
     #[test]
-    fn zero_batch_emits_seven_typed_zero_slots_without_cache_evaluation() {
+    fn zero_batch_emits_eight_typed_zero_slots_without_cache_evaluation() {
         let worklet = enumerate_worklet();
-        let mut metrics = [LeafMetrics::MISS; 7];
+        let mut metrics = [LeafMetrics::MISS; 8];
         let mut inputs = Vec::new();
         let mut evaluator = Evaluator::with_inputs(&mut metrics, &mut inputs);
         worklet.eval(
             &Qwen36SharedExpertLocalWorkletInput { batch_tokens: 0 },
             &mut evaluator,
         );
-        assert_eq!(evaluator.filled(), 7);
+        assert_eq!(evaluator.filled(), 8);
         assert!(metrics.iter().all(|metric| {
             metric.m.time_ms == 0.0
                 && metric.m.flops == 0.0
@@ -540,6 +594,7 @@ mod tests {
                 {"m": 0},
                 {"m": 0},
                 {"num_tokens": 0},
+                {"num_tokens": 0},
             ])
         );
     }
@@ -551,6 +606,7 @@ mod tests {
         assert_eq!(work.silu_and_mul.num_tokens, 128);
         assert_eq!(work.down.num_tokens, 128);
         assert_eq!(work.shared_gate.m, 128);
+        assert_eq!(work.shared_gate_sigmoid.num_tokens, 128);
         assert_eq!(work.apply_shared_gate.num_tokens, 128);
     }
 
@@ -559,7 +615,13 @@ mod tests {
         let worklet = enumerate_worklet();
         assert_eq!(worklet.silu_and_mul.kernel.config.backends, ["triton"]);
         assert_eq!(worklet.shared_gate.kernel.config.backends, ["torch_linear"]);
-        assert_eq!(worklet.apply_shared_gate.kernel.config.backends, ["triton"]);
+        // The gate path is torch-realized; `silu_and_mul` is not. A single
+        // shared backend list here would silently re-merge them.
+        assert_eq!(
+            worklet.shared_gate_sigmoid.kernel.config.backends,
+            ["torch"]
+        );
+        assert_eq!(worklet.apply_shared_gate.kernel.config.backends, ["torch"]);
         assert_eq!(worklet.shared_gate.kernel.config.dtype, DType::Bf16);
     }
 }

@@ -19,6 +19,7 @@ pub mod fp8_blockscale_grouped_gemm;
 pub mod fp8_per_token_group_quant;
 pub mod gdn_causal_conv_decode;
 pub mod gdn_causal_conv_prefill;
+pub mod gdn_chunk_delta_rule;
 pub mod gdn_chunk_local_cumsum;
 pub mod gdn_chunk_output;
 pub mod gdn_chunk_recompute_w_u;
@@ -41,6 +42,7 @@ pub mod p2p_intra;
 pub mod residual_rms_norm;
 pub mod rms_norm;
 pub mod single_gemm;
+pub mod vllm_fused_moe;
 pub mod vllm_mla_rope;
 
 pub use all_reduce::{AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, AllReduceSpec};
@@ -108,6 +110,10 @@ pub use gdn_causal_conv_decode::{
 pub use gdn_causal_conv_prefill::{
     GdnCausalConvPrefillKernel, GdnCausalConvPrefillKernelConfig, GdnCausalConvPrefillKernelInput,
     GdnCausalConvPrefillSpec,
+};
+pub use gdn_chunk_delta_rule::{
+    GdnChunkDeltaRuleKernel, GdnChunkDeltaRuleKernelConfig, GdnChunkDeltaRuleKernelInput,
+    GdnChunkDeltaRuleSpec,
 };
 pub use gdn_chunk_local_cumsum::{
     GdnChunkLocalCumsumKernel, GdnChunkLocalCumsumKernelConfig, GdnChunkLocalCumsumKernelInput,
@@ -181,6 +187,10 @@ pub use residual_rms_norm::{
 pub use rms_norm::{RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, RmsNormSpec};
 pub use single_gemm::{
     SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput, SingleGemmSpec,
+};
+pub use vllm_fused_moe::{
+    VllmFusedMoeKernel, VllmFusedMoeKernelConfig, VllmFusedMoeKernelInput, VllmFusedMoeSpec,
+    LAUNCH_ROLE_DOWN, LAUNCH_ROLE_GATE_UP,
 };
 pub use vllm_mla_rope::{
     VllmMlaRopeKernel, VllmMlaRopeKernelConfig, VllmMlaRopeKernelInput, VllmMlaRopeSpec,

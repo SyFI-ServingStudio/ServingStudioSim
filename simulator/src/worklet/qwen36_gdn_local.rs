@@ -17,10 +17,7 @@ use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
     Fp8PerTokenGroupQuantKernelConfig, GdnCausalConvDecodeKernelConfig,
-    GdnCausalConvPrefillKernelConfig, GdnChunkLocalCumsumKernelConfig,
-    GdnChunkOutputKernelConfig, GdnChunkRecomputeWUKernelConfig,
-    GdnChunkScaledDotKktKernelConfig, GdnChunkSolveTrilKernelConfig,
-    GdnChunkStateUpdateKernelConfig, GdnGatedRmsNormKernel,
+    GdnCausalConvPrefillKernelConfig, GdnChunkDeltaRuleKernelConfig, GdnGatedRmsNormKernel,
     GdnGatedRmsNormKernelConfig, GdnGatedRmsNormKernelInput,
     GdnPrefillPostConvKernelConfig, GdnRecurrentDecodeKernelConfig,
     ResidualRmsNormKernel, ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput,
@@ -37,7 +34,6 @@ const NUM_VALUE_HEADS: u32 = 32;
 const KEY_HEAD_DIM: u32 = 128;
 const VALUE_HEAD_DIM: u32 = 128;
 const CONV_KERNEL_SIZE: u32 = 4;
-const CHUNK_SIZE: u32 = 64;
 const QKVZ_WIDTH: u32 = 12_288;
 const BA_WIDTH: u32 = 64;
 const CONV_CHANNELS: u32 = 8192;
@@ -71,12 +67,7 @@ pub struct Qwen36GdnLocalWorkletConfig {
     pub elementwise_backends: Vec<&'static str>,
     pub causal_conv_prefill_backends: Vec<&'static str>,
     pub prefill_post_conv_backends: Vec<&'static str>,
-    pub chunk_cumsum_backends: Vec<&'static str>,
-    pub chunk_kkt_backends: Vec<&'static str>,
-    pub chunk_solve_backends: Vec<&'static str>,
-    pub recompute_w_u_backends: Vec<&'static str>,
-    pub chunk_state_update_backends: Vec<&'static str>,
-    pub chunk_output_backends: Vec<&'static str>,
+    pub chunk_delta_rule_backends: Vec<&'static str>,
     pub causal_conv_decode_backends: Vec<&'static str>,
     pub recurrent_decode_backends: Vec<&'static str>,
     pub gated_rms_norm_backends: Vec<&'static str>,
@@ -193,49 +184,8 @@ impl Qwen36GdnLocalWorklet {
                 value_head_dim: cfg.value_head_dim.clone(),
                 dtype: cfg.activation_dtype,
             },
-            cumsum: GdnChunkLocalCumsumKernelConfig {
-                backends: cfg.chunk_cumsum_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                num_heads: cfg.num_value_heads.clone(),
-                // Chunk-local cumsum consumes and produces the FP32 cumulative
-                // gate path even though the surrounding activations are BF16.
-                dtype: cfg.ssm_state_dtype,
-            },
-            kkt: GdnChunkScaledDotKktKernelConfig {
-                backends: cfg.chunk_kkt_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                num_key_heads: cfg.num_key_heads.clone(),
-                num_heads: cfg.num_value_heads.clone(),
-                key_head_dim: cfg.key_head_dim.clone(),
-                dtype: cfg.activation_dtype,
-            },
-            solve: GdnChunkSolveTrilKernelConfig {
-                backends: cfg.chunk_solve_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                max_chunk_tokens: CHUNK_SIZE.into(),
-                num_heads: cfg.num_value_heads.clone(),
-                dtype: cfg.activation_dtype,
-            },
-            recompute_w_u: GdnChunkRecomputeWUKernelConfig {
-                backends: cfg.recompute_w_u_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                num_key_heads: cfg.num_key_heads.clone(),
-                num_heads: cfg.num_value_heads.clone(),
-                key_head_dim: cfg.key_head_dim.clone(),
-                value_head_dim: cfg.value_head_dim.clone(),
-                dtype: cfg.activation_dtype,
-            },
-            state_update: GdnChunkStateUpdateKernelConfig {
-                backends: cfg.chunk_state_update_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                num_key_heads: cfg.num_key_heads.clone(),
-                num_heads: cfg.num_value_heads.clone(),
-                key_head_dim: cfg.key_head_dim.clone(),
-                value_head_dim: cfg.value_head_dim.clone(),
-                dtype: cfg.activation_dtype,
-            },
-            output: GdnChunkOutputKernelConfig {
-                backends: cfg.chunk_output_backends.clone(),
+            chunk_delta_rule: GdnChunkDeltaRuleKernelConfig {
+                backends: cfg.chunk_delta_rule_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_key_heads: cfg.num_key_heads.clone(),
                 num_heads: cfg.num_value_heads.clone(),
@@ -499,9 +449,8 @@ mod tests {
             gpu_name: "NVIDIA H200".into(), residual_rms_norm_backends: vec!["vllm_cuda"],
             fp8_quant_backends: vec!["vllm_cuda"], fp8_gemm_backends: vec!["deepgemm"], bf16_gemm_backends: vec!["torch_linear"],
             elementwise_backends: vec!["triton"], causal_conv_prefill_backends: vec!["vllm_triton"],
-            prefill_post_conv_backends: vec!["vllm_triton"], chunk_cumsum_backends: vec!["vllm_triton"],
-            chunk_kkt_backends: vec!["vllm_triton"], chunk_solve_backends: vec!["vllm_triton"], recompute_w_u_backends: vec!["vllm_triton"],
-            chunk_state_update_backends: vec!["vllm_triton"], chunk_output_backends: vec!["vllm_triton"],
+            prefill_post_conv_backends: vec!["vllm_triton"],
+            chunk_delta_rule_backends: vec!["flashinfer"],
             causal_conv_decode_backends: vec!["vllm_triton"], recurrent_decode_backends: vec!["vllm_triton"], gated_rms_norm_backends: vec!["vllm_triton"],
         }
     }
@@ -532,7 +481,7 @@ mod tests {
         assert_eq!(r.recurrent_state_bytes_per_sequence, 2_097_152); assert_eq!(rates(&r.state_gather), (4096,4096));
         assert_eq!(rates(&r.state_zero), (0,4096)); assert_eq!(rates(&r.state_scatter), (4096,4096)); assert_eq!(rates(&r.core_output_copy), (8192,8192));
         assert_eq!(r.prefill.causal_conv.state_dtype, DType::Bf16); assert_eq!(r.decode.causal_conv.state_dtype, DType::Bf16);
-        assert_eq!(r.prefill.cumsum.dtype, DType::Fp32); assert_eq!(r.prefill.cumsum.backends, ["vllm_triton"]); assert_eq!(r.prefill.cumsum.gpu_name, "NVIDIA H200");
+        assert_eq!(r.prefill.chunk_delta_rule.dtype, DType::Bf16); assert_eq!(r.prefill.chunk_delta_rule.backends, ["flashinfer"]); assert_eq!(r.prefill.chunk_delta_rule.gpu_name, "NVIDIA H200");
         assert_eq!(r.decode.recurrent.state_dtype, DType::Fp32); assert_eq!(r.gated_norm.hidden.get(), 128);
     }
 
@@ -593,14 +542,14 @@ mod tests {
     }
 
     #[test]
-    fn compile_has_exact_fifteen_children_and_twenty_five_flattened_leaves() {
+    fn compile_has_exact_fifteen_children_and_twenty_flattened_leaves() {
         let op = enumerate_op(); let mut builder = CostTreeBuilder::new(); let root = op.compile(&mut builder); let tree = builder.finish(root);
         let expected = [
             "input_add_rms_norm","qkvz.input_quant","qkvz.gemm","ba","split_b","split_a","core_output_zero","state_gather","state_zero",
-            "prefill.causal_conv","prefill.post_conv","prefill.cumsum","prefill.kkt","prefill.solve","prefill.recompute_w_u","prefill.state_update","prefill.output",
+            "prefill.causal_conv","prefill.post_conv","prefill.chunk_delta_rule",
             "state_scatter","decode.causal_conv","decode.recurrent","core_output_copy","gated_norm","out_proj.input_quant","out_proj.gemm","post_attention_add_rms_norm"
         ];
-        assert_eq!(tree.n_slots(), 25);
+        assert_eq!(tree.n_slots(), 20);
         assert_eq!(tree.slots.iter().map(|s| s.name.strip_prefix("model.gdn.").unwrap()).collect::<Vec<_>>(), expected);
         assert_eq!(tree.slots.first().unwrap().kind, "residual_rms_norm"); assert_eq!(tree.slots.last().unwrap().kind, "residual_rms_norm");
         assert!(!tree.slots.iter().any(|slot| matches!(slot.kind.as_str(), "all_reduce" | "all_to_all" | "send_recv")));
@@ -612,7 +561,7 @@ mod tests {
         let op = enumerate_op();
         assert_eq!(op.input_add_rms_norm.kernel.config.backends, ["vllm_cuda"]); assert_eq!(op.ba.kernel.config.backends, ["torch_linear"]);
         assert_eq!(op.split_b.kernel.config.backends, ["triton"]); assert_eq!(op.prefill.causal_conv.config.backends, ["vllm_triton"]);
-        assert_eq!(op.prefill.cumsum.config.dtype, DType::Fp32); assert_eq!(op.prefill.cumsum.config.backends, ["vllm_triton"]); assert_eq!(op.prefill.cumsum.config.gpu_name, "NVIDIA H200");
+        assert_eq!(op.prefill.chunk_delta_rule.config.dtype, DType::Bf16); assert_eq!(op.prefill.chunk_delta_rule.config.backends, ["flashinfer"]); assert_eq!(op.prefill.chunk_delta_rule.config.gpu_name, "NVIDIA H200");
         assert_eq!(op.decode.recurrent.config.backends, ["vllm_triton"]); assert_eq!(op.gated_norm.kernel.config.backends, ["vllm_triton"]);
     }
 

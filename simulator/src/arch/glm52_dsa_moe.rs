@@ -1932,7 +1932,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .gemm
-                .dtype,
+                .dtype(),
             DType::Fp8E4m3
         );
         assert_eq!(
@@ -1941,7 +1941,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .gemm
-                .dtype,
+                .dtype(),
             DType::Fp8E4m3
         );
         assert_eq!(

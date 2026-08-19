@@ -30,6 +30,7 @@ from profiling.kernels import (
     fp8_per_token_group_quant,  # noqa: F401
     gdn_causal_conv_decode,  # noqa: F401
     gdn_causal_conv_prefill,  # noqa: F401
+    gdn_chunk_delta_rule,  # noqa: F401
     gdn_chunk_local_cumsum,  # noqa: F401
     gdn_chunk_output,  # noqa: F401
     gdn_chunk_recompute_w_u,  # noqa: F401
@@ -52,5 +53,6 @@ from profiling.kernels import (
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
     single_gemm,  # noqa: F401
+    vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401
 )

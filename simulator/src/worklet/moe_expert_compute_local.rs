@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use crate::op::moe::{
     GroupedFp8GemmWithQuantConfig, GroupedFp8GemmWithQuantInput, GroupedFp8GemmWithQuantOp,
+    GroupedGemmConfig, GroupedQuantConfig, QuantRows,
 };
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -181,12 +182,19 @@ impl MoeExpertComputeLocalWorklet {
                 "FP8 grouped GEMM requires at least one fp8 quant backend"
             );
         }
-        let quant_config = |hidden_size: Dim| Fp8BlockQuantKernelConfig {
-            backends: cfg.fp8_quant_backends.clone(),
-            gpu_name: cfg.gpu_name.clone(),
-            hidden_size,
-            num_problems: experts_per_gpu.clone(),
-            input_dtype: cfg.activation_dtype,
+        // Unchanged realization: this path pairs FlashInfer's grouped
+        // `scale_1x128_kernel` with the TRT-LLM blockscale grouped GEMM. The
+        // vLLM-mirroring worklet beside this one uses the per-token-group
+        // kernel instead because that is what nsys observed on its EP1 path;
+        // no capture of *this* path exists yet to move it either way.
+        let quant_config = |hidden_size: Dim| {
+            GroupedQuantConfig::Block(Fp8BlockQuantKernelConfig {
+                backends: cfg.fp8_quant_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_size,
+                num_problems: experts_per_gpu.clone(),
+                input_dtype: cfg.activation_dtype,
+            })
         };
         let gate_up_gemm = GroupedGemmKernelConfig {
             backends: cfg.grouped_gemm_backends.clone(),
@@ -217,7 +225,17 @@ impl MoeExpertComputeLocalWorklet {
             gate_up: (!uses_fp8_grouped_gemm).then(|| gate_up_gemm.clone()),
             gate_up_fp8: uses_fp8_grouped_gemm.then(|| GroupedFp8GemmWithQuantConfig {
                 quant: quant_config(cfg.hidden.clone()),
-                gemm: direct_fp8_gemm(2 * cfg.moe_intermediate.clone(), cfg.hidden.clone()),
+                gemm: GroupedGemmConfig::TrtllmBlockscale(direct_fp8_gemm(
+                    2 * cfg.moe_intermediate.clone(),
+                    cfg.hidden.clone(),
+                )),
+                // Unchanged from before this field existed, and deliberately not
+                // switched to PerToken with the vLLM worklet: this realization
+                // permutes tokens into per-expert order before quantizing
+                // (DeepEP into DeepGEMM), so the expanded layout is what the
+                // quantize kernel sees. No nsys capture of this path has been
+                // taken to confirm it; that is the open item, not a known bug.
+                quant_rows: QuantRows::PerSelection,
             }),
             act: ElementwiseKernelConfig {
                 // SwiGLU on the gate_up output: reads 2·moe_intermediate, writes
@@ -230,7 +248,11 @@ impl MoeExpertComputeLocalWorklet {
             down: (!uses_fp8_grouped_gemm).then(|| down_gemm.clone()),
             down_fp8: uses_fp8_grouped_gemm.then(|| GroupedFp8GemmWithQuantConfig {
                 quant: quant_config(cfg.moe_intermediate.clone()),
-                gemm: direct_fp8_gemm(cfg.hidden.clone(), cfg.moe_intermediate.clone()),
+                gemm: GroupedGemmConfig::TrtllmBlockscale(direct_fp8_gemm(
+                    cfg.hidden.clone(),
+                    cfg.moe_intermediate.clone(),
+                )),
+                quant_rows: QuantRows::PerSelection,
             }),
             experts_per_gpu,
             dtype_bytes: activation_dtype_bytes,
@@ -455,20 +477,36 @@ mod tests {
         config.dtype = DType::Fp8E4m3;
         let resolved = MoeExpertComputeLocalWorklet::resolve_config(&config);
 
+        // This worklet keeps the grouped `scale_1x128_kernel` realization; the
+        // assertion is on the variant as much as on the fields, so a silent
+        // switch to the per-token-group kernel fails here rather than in a
+        // downstream timing diff.
         let gate_up = resolved.gate_up_fp8.unwrap();
-        assert_eq!(gate_up.quant.hidden_size, 4096);
-        assert_eq!(gate_up.quant.num_problems, 32);
-        assert_eq!(gate_up.quant.input_dtype, DType::Bf16);
-        assert_eq!(gate_up.quant.backends, vec!["flashinfer_trtllm"]);
-        assert_eq!(gate_up.gemm.n, 2 * 3072);
-        assert_eq!(gate_up.gemm.experts_per_token, 8);
-        assert_eq!(gate_up.gemm.backends, vec!["flashinfer_trtllm"]);
+        let GroupedQuantConfig::Block(gate_up_quant) = &gate_up.quant else {
+            panic!("this realization must use the grouped block quant");
+        };
+        assert_eq!(gate_up_quant.hidden_size, 4096);
+        assert_eq!(gate_up_quant.num_problems, 32);
+        assert_eq!(gate_up_quant.input_dtype, DType::Bf16);
+        assert_eq!(gate_up_quant.backends, vec!["flashinfer_trtllm"]);
+        let GroupedGemmConfig::TrtllmBlockscale(gate_up_gemm) = &gate_up.gemm else {
+            panic!("this realization must use the TRT-LLM grouped GEMM");
+        };
+        assert_eq!(gate_up_gemm.n, 2 * 3072);
+        assert_eq!(gate_up_gemm.experts_per_token, 8);
+        assert_eq!(gate_up_gemm.backends, vec!["flashinfer_trtllm"]);
 
         let down = resolved.down_fp8.unwrap();
-        assert_eq!(down.quant.hidden_size, 3072);
-        assert_eq!(down.quant.num_problems, 32);
-        assert_eq!(down.quant.input_dtype, DType::Bf16);
-        assert_eq!(down.gemm.n, 4096);
+        let GroupedQuantConfig::Block(down_quant) = &down.quant else {
+            panic!("this realization must use the grouped block quant");
+        };
+        assert_eq!(down_quant.hidden_size, 3072);
+        assert_eq!(down_quant.num_problems, 32);
+        assert_eq!(down_quant.input_dtype, DType::Bf16);
+        let GroupedGemmConfig::TrtllmBlockscale(down_gemm) = &down.gemm else {
+            panic!("this realization must use the TRT-LLM grouped GEMM");
+        };
+        assert_eq!(down_gemm.n, 4096);
     }
 
     #[test]
