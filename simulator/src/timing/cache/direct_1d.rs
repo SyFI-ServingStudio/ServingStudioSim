@@ -27,6 +27,14 @@ pub struct Cache1DDirect {
 }
 
 impl Cache for Cache1DDirect {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "axis coordinates are bounded, uniformly-spaced sweep-grid values (e.g. batch/kv \
+                  length capped at ~32k per this cache's own doc comment) and the bucket index i \
+                  is bounded by the bucket count (a few hundred); f32 is this cache's designed \
+                  storage precision for those grid coordinates"
+    )]
     fn from_samples(grid: &SweepGrid, samples: &[KernelMetrics]) -> (Self, Vec<OutlierWarning>) {
         assert_eq!(grid.axes().len(), 1, "Cache1DDirect requires a 1D grid");
         let axis = &grid.axes()[0];
@@ -111,6 +119,11 @@ impl Cache for Cache1DDirect {
         if sweep[0].is_nan() {
             return LeafMetrics::MISS;
         }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "sweep[0] is the cache lookup coordinate (e.g. batch/kv length), bounded within \
+                      this cache's designed grid range; f32 is this cache's designed lookup precision"
+        )]
         let (idx, scale, outside) = self.index(sweep[0] as f32);
         match self.buckets[idx] {
             Some(mut m) => {
@@ -151,6 +164,15 @@ impl Cache1DDirect {
     ///   low-side branch is needed for the index itself. Public callers handle
     ///   NaN before invoking this helper.
     #[inline]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "last is a bucket-array bound for this bounded, small-bucket-count cache (f32 loses \
+                  no meaningful precision there); the f32->usize cast's negative-saturates-to-0 \
+                  behavior is intentional and documented above, and `.min(last)` bounds the upper \
+                  side, so this is by design, not a defect"
+    )]
     fn index(&self, x: f32) -> (usize, f32, bool) {
         let last = self.buckets.len() - 1;
         let x_right = self.start + last as f32 * self.spacing;

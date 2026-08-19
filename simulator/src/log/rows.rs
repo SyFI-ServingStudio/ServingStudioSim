@@ -123,9 +123,20 @@ fn tpot_stats_ms(times_ms: &[f32]) -> (Option<f32>, Option<f32>, Option<f32>, Op
     }
     let mut gaps: Vec<f32> = times_ms.windows(2).map(|w| w[1] - w[0]).collect();
     let n = gaps.len();
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "n is the per-request output token count, far under f32's 24-bit exact integer range"
+    )]
     let mean = gaps.iter().sum::<f32>() / n as f32;
     let max = gaps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let kth = |gaps: &mut [f32], p: f64| -> f32 {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "n is a per-request output token count (far under 2^53); p is a percentile in \
+                      [0, 1] so p * (n - 1) is non-negative and rounds to a valid in-range index"
+        )]
         let idx = ((p * (n - 1) as f64).round() as usize).min(n - 1);
         *gaps.select_nth_unstable_by(idx, f32::total_cmp).1
     };

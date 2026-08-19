@@ -13,7 +13,12 @@ impl LoadBalance {
             Self::Single => 0,
             Self::RoundRobin { next } => {
                 let partition = (*next as usize) % num_partitions;
-                *next = ((*next as usize + 1) % num_partitions) as u16;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "value is taken modulo num_partitions, a small worker partition count, so it always fits in u16"
+                )]
+                let wrapped = ((*next as usize + 1) % num_partitions) as u16;
+                *next = wrapped;
                 partition
             }
         }

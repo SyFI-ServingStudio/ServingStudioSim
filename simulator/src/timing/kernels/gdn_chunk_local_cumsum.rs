@@ -64,7 +64,17 @@ impl KernelSpec for GdnChunkLocalCumsumSpec {
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         grid.expand_2d(|num_chunks, tokens_per_chunk| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_chunks is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let num_chunks = num_chunks.round() as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "tokens_per_chunk is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let tokens_per_chunk = tokens_per_chunk.round() as u64;
             num_chunks
                 .checked_mul(tokens_per_chunk)
@@ -79,7 +89,17 @@ impl KernelSpec for GdnChunkLocalCumsumSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_2d(|num_chunks, tokens_per_chunk| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_chunks is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let num_chunks = num_chunks.round() as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "tokens_per_chunk is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let tokens_per_chunk = tokens_per_chunk.round() as u64;
             let num_tokens = num_chunks
                 .checked_mul(tokens_per_chunk)

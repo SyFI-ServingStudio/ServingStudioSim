@@ -35,6 +35,10 @@ impl Cache for Cache3DLinear {
             order.sort_by(|&a, &b| grid.axes()[axis][a].total_cmp(&grid.axes()[axis][b]));
             order
         });
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "sweep coordinates are deliberately stored as f32 in this interpolation cache; the profiled grid values (token/batch/byte counts) are well within f32's exact-integer range"
+        )]
         let axes: [Vec<f32>; 3] = std::array::from_fn(|axis| {
             orders[axis]
                 .iter()
@@ -93,6 +97,10 @@ impl Cache for Cache3DLinear {
         if sweep.iter().any(|value| value.is_nan()) || !self.any_valid {
             return LeafMetrics::MISS;
         }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "sweep coordinates are deliberately stored as f32 in this interpolation cache; the queried grid values (token/batch/byte counts) are well within f32's exact-integer range"
+        )]
         let query = std::array::from_fn(|axis| sweep[axis] as f32);
         let (metrics, extrapolated) = self.interpolate_cell(query);
         LeafMetrics {

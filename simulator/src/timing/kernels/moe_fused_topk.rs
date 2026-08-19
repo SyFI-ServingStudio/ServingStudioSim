@@ -53,9 +53,17 @@ impl KernelSpec for MoeFusedTopkSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|num_tokens| {
+            // Sweep axis values (explicit landmarks, max 262144) are
+            // non-negative integers well under u32::MAX.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "sweep axis values are non-negative integers far below u32::MAX"
+            )]
+            let num_tokens = num_tokens as u32;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("num_tokens", num_tokens as u32)
+                .with("num_tokens", num_tokens)
                 .with("num_experts", config.num_experts.get())
                 .with("top_k", config.top_k)
                 .with("dtype", config.dtype.as_str())

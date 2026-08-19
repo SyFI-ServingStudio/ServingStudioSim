@@ -103,10 +103,18 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         now: Time,
     ) -> bool {
         let num_partitions = kv_store.num_partitions();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_partitions is a worker's KV partition count, always far below u16::MAX"
+        )]
         let had_decode =
             (0..num_partitions as u16).any(|partition| kv_store.has_live_decode(partition));
 
         self.partition_token_usage.clear();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_partitions is a worker's KV partition count, always far below u16::MAX"
+        )]
         self.partition_token_usage
             .extend(
                 (0..num_partitions as u16).map(|partition| PartitionTokenUsage {
@@ -173,8 +181,14 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         }
 
         kv_store.drain_ready();
-        had_decode
-            || (0..num_partitions as u16).any(|partition| kv_store.has_prefill_admit(partition))
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_partitions is a worker's KV partition count, always far below u16::MAX"
+        )]
+        {
+            had_decode
+                || (0..num_partitions as u16).any(|partition| kv_store.has_prefill_admit(partition))
+        }
     }
 
     /// Retained session KV is a hard worker-local affinity. Round-robin is
@@ -186,6 +200,10 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         session_input: SessionInput,
         num_partitions: usize,
     ) -> u16 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "choose() returns an index bounded by num_partitions, a worker's KV partition count, always far below u16::MAX"
+        )]
         kv_store
             .retained_prefix_partition(session_input)
             .unwrap_or_else(|| self.balance.choose(num_partitions) as u16)
@@ -232,6 +250,10 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
         events: &mut Vec<WorkerEventCommon>,
         now: Time,
     ) {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_partitions is a worker's KV partition count, always far below u16::MAX"
+        )]
         for partition in 0..kv_store.num_partitions() as u16 {
             let mut completed = Vec::new();
 
@@ -301,7 +323,13 @@ impl<P: PendingOrderPolicy> LocalPrefillDecodeAdmission<P> {
 
     #[inline]
     pub(crate) fn queued_requests(&self) -> u32 {
-        self.policy.len() as u32
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "pending admission queue length is bounded by the simulated request count, far below u32::MAX"
+        )]
+        {
+            self.policy.len() as u32
+        }
     }
 
     pub(crate) fn cancel_pending(&mut self, request: RequestId) -> bool {

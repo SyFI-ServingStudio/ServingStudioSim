@@ -183,6 +183,10 @@ impl<M: AttnLayerwiseModel> AfdAttnPoolController<DisaggAttnWorker<M>> {
         cost_log_dir: Option<std::path::PathBuf>,
     ) -> Self {
         assert!(num_workers > 0, "afd attn pool needs at least one worker");
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "model layer counts are LLM decoder depths (tens to low hundreds), far under u16::MAX"
+        )]
         let num_layers = model.num_layers() as u16;
         let workers: Vec<DisaggAttnWorker<M>> = (0..num_workers)
             .map(|i| {
@@ -245,6 +249,10 @@ where
     /// of the fresh-request `Admit` message.
     pub fn admit_msg(&mut self, req: RequestId, msg: W::Msg) {
         let idx = self.least_kv_loaded_worker();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "idx indexes self.workers, a pool with far fewer than u16::MAX shards"
+        )]
         self.req_worker.insert(req, WorkerId(idx as u16));
         self.workers[idx].enqueue(msg);
         self.wake(idx);
@@ -330,6 +338,10 @@ where
         let n = self.workers.len();
         let per_worker = split_by_token_share(out_bytes, &self.slots[slot].scatter_weights, n);
         for (worker_index, bytes) in per_worker.into_iter().enumerate() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "slot < NUM_SLOTS (3), far under u8::MAX"
+            )]
             self.workers[worker_index].enqueue(
                 AttnWorkerMsg::ReadyNotification {
                     slot: slot as u8,
@@ -377,6 +389,10 @@ where
         // requests, so a worker emptied by it wraps to a dormant layer-0 slot.
         let last = self.num_layers - 1;
         for idx in 0..self.workers.len() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "slot < NUM_SLOTS (3), far under u8::MAX"
+            )]
             self.workers[idx].enqueue(
                 AttnWorkerMsg::SlotFlushed {
                     slot: slot as u8,
@@ -549,6 +565,10 @@ where
         // equals a fresh `workload_tokens(reqs)` scan on the ffn side — hand it over
         // so the ffn worker never re-walks the store per layer.
         let total_tokens: u64 = b.reported.iter().map(|&(_, t)| t).sum();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "slot < NUM_SLOTS (3), far under u8::MAX"
+        )]
         tasks.push(FfnTask {
             kind,
             slot: slot as u8,
@@ -565,6 +585,10 @@ where
     /// completes, so this fans `SlotFlushed` to all of them.
     fn flush_slot_layer(&mut self, slot: usize, layer: u16) {
         for idx in 0..self.workers.len() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "slot < NUM_SLOTS (3), far under u8::MAX"
+            )]
             self.workers[idx].enqueue(
                 AttnWorkerMsg::SlotFlushed {
                     slot: slot as u8,
@@ -598,6 +622,10 @@ where
         // Note: `scatter_weights` is NOT reset here — it carries over from the previous
         // iteration's last barrier, so layer 0's scatter (which precedes this iteration's
         // first barrier) still splits by a token share, exact for a steady decode loop.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "slot < NUM_SLOTS (3), far under u8::MAX"
+        )]
         tasks.push(FfnTask {
             kind: FfnTaskKind::Bootstrap,
             slot: slot as u8,

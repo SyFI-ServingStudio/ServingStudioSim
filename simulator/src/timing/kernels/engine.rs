@@ -322,7 +322,12 @@ impl<S: KernelSpec> Kernel<S> {
                     if candidate_time_ms < best_time_ms {
                         best = candidate;
                         best_time_ms = candidate_time_ms;
-                        best_index = (offset + 1) as u8;
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            reason = "offset indexes this kernel's backend candidate list, which the manifest bounds to a handful of entries, far below u8::MAX"
+                        )]
+                        let index = (offset + 1) as u8;
+                        best_index = index;
                     }
                 }
                 // Position-local index into this kernel's ordered candidate list

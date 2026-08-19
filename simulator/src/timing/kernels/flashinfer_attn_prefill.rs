@@ -128,7 +128,17 @@ impl KernelSpec for FlashinferAttnPrefillSpec {
             // append = B, prefix = A - B/2. Feasible cells have A >= B/2 so this
             // is non-negative; the `.max(0.0)` is a guard for the infeasible
             // A < B/2 cells, which `infeasible_mask` strips before profiling.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "rounded sweep-grid token lengths are non-negative and far below u32::MAX"
+            )]
             let append_len = b.round() as u32;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "clamped to >= 0.0 above via .max(0.0); rounded sweep-grid token length is far below u32::MAX"
+            )]
             let prefix_len = (a - b / 2.0).max(0.0).round() as u32;
             ArgsPayload::new()
                 .with("backend", backend)

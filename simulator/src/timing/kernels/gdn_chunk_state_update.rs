@@ -80,6 +80,11 @@ fn feasible_max_chunk_bounds(num_chunks: u64, num_sequences: u64) -> Option<(u64
     Some((minimum, maximum))
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "num_chunks/minimum/maximum/span are kernel cache sweep-grid coordinates (chunk \
+              counts), bounded by the sweep grid (Axis::pow2(0, 6) => <= 64) — far below 2^52"
+)]
 fn normalized_max_chunk_position(num_chunks: u64, num_sequences: u64, max_chunks: u64) -> f64 {
     let Some((minimum, maximum)) = feasible_max_chunk_bounds(num_chunks, num_sequences) else {
         return -1.0;
@@ -184,10 +189,24 @@ impl KernelSpec for GdnChunkStateUpdateSpec {
         ])
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "coordinates are sweep-grid axis values (chunk/sequence counts, always small \
+                  non-negative integers per Axis::pow2/values); .round() before the cast keeps \
+                  them exact and non-negative"
+    )]
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         grid.expand(|coordinates| coordinates[1].round() as u64 > coordinates[0].round() as u64)
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "coordinates are sweep-grid axis values (chunk/sequence counts, always small \
+                  non-negative integers per Axis::pow2/values); .round() before the cast keeps \
+                  them exact and non-negative"
+    )]
     fn enumerate(
         config: &Self::Config,
         grid: &SweepGrid,

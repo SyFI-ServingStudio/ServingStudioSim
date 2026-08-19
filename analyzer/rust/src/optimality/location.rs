@@ -210,6 +210,10 @@ impl LocationCatalog {
         let mut expected_floors = Floors::default();
         for (label, occurrences) in labels {
             validate_mapping(location_map, kernel_locations, &label.segments)?;
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "occurrences counts iteration shapes within one run, far below 2^53, so it converts to f64 exactly"
+            )]
             let occurrence_scale = *occurrences as f64;
             expected_floors.fused += label.floors.fused * occurrence_scale;
             expected_floors.segmented += label.floors.segmented * occurrence_scale;

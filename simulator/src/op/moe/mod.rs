@@ -128,6 +128,11 @@ impl Placement {
     /// owner rotates as `token_idx % ep_size` so the group coverage is uniform
     /// over many tokens (matching ref's average over every owner rank).
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "owner/start/count are rank/count values bounded by ep_size, a realistic \
+                  expert-parallel degree well under u16::MAX"
+    )]
     pub fn residing_group(self, token_idx: u64, ep_size: u32) -> (u16, u16) {
         let ep = ep_size.max(1);
         let owner = (token_idx % u64::from(ep)) as u32;
@@ -227,12 +232,22 @@ impl NvlLayout {
     }
 
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "domain_starts entries are rank ids bounded by ep_size, a realistic cluster size \
+                  well under u16::MAX"
+    )]
     pub fn first_rank(&self, domain: usize) -> u16 {
         self.domain_starts[domain] as u16
     }
 
     /// The contiguous global-rank range of `domain`.
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "domain_starts/domain_sizes entries are rank ids/counts bounded by ep_size, a \
+                  realistic cluster size well under u16::MAX"
+    )]
     pub fn ranks_in(&self, domain: usize) -> std::ops::Range<u16> {
         let start = self.domain_starts[domain] as u16;
         start..(start + self.domain_sizes[domain] as u16)
@@ -253,6 +268,11 @@ impl NvlLayout {
     /// (wrapped to the domain size). Models a NIC link landing on the matching
     /// position in the remote NVL domain (DeepEP-style rail alignment).
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the local-index modulo a domain size is bounded by ep_size, a realistic cluster \
+                  size well under u16::MAX"
+    )]
     pub fn rail_peer(&self, rank: u16, domain: usize) -> u16 {
         let src_dom = self.domain_of(rank);
         let local = u32::from(rank) - self.domain_starts[src_dom];
@@ -326,6 +346,14 @@ impl BottleneckCurve {
     /// (extrapolated by the end segments' slope outside the grid). The curve
     /// `≈ a·T + b·√T` is smooth, so linear interp on a geometric grid is tight.
     #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "tokens is a per-op token count, always far below 2^52 for realistic token grids; \
+                  the interpolated byte result is clamped non-negative via .max(0.0) before the \
+                  final f64->u64 cast, so truncation/sign-loss cannot occur in practice"
+    )]
     pub fn bottleneck(&self, tokens: u64) -> u64 {
         let p = &self.points;
         if p.is_empty() {

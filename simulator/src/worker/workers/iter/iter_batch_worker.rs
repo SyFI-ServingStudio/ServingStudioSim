@@ -173,6 +173,10 @@ where
     }
 
     pub fn status(&self) -> WorkerStatus {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_partitions is a GPU/rank partition count, always small"
+        )]
         let active_requests = (0..self.kv_store.num_partitions() as u16)
             .map(|partition| self.kv_store.status_active(partition))
             .sum();

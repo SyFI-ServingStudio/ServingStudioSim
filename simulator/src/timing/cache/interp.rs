@@ -43,6 +43,11 @@ impl Metrics4 {
 
     /// Narrow a profiled `KernelMetrics` (f64 / u64) into the f32 cache form.
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "the cache intentionally narrows profiled f64/u64 metrics to f32 (see module docs: ~3-4 significant digits suffice and doubles cache-line density)"
+    )]
     pub fn from_sample(sample: &KernelMetrics) -> Self {
         Metrics4 {
             time_ms: sample.time_ms as f32,

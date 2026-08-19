@@ -57,6 +57,11 @@ pub fn read_run_meta(log_dir: &Path) -> Option<(usize, String)> {
     let path = resolve_artifact_path(log_dir, "run_meta.json");
     let text = fs::read_to_string(path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "num_gpus is a physical GPU count in a sim-written run_meta.json, far under usize::MAX \
+                  even on a 32-bit target"
+    )]
     let num_gpus = json.get("num_gpus")?.as_u64()? as usize;
     let gpu_name = json
         .get("gpus")
@@ -82,6 +87,11 @@ pub fn read_prediction_gpu(log_dir: &Path) -> Option<(usize, String)> {
     let text = fs::read_to_string(path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
     let gpu_name = json.get("gpu")?.as_str()?.to_owned();
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "gpu_count is a physical GPU count in a sim-written prediction.meta.json, far under \
+                  usize::MAX even on a 32-bit target"
+    )]
     let gpu_count = json
         .get("gpu_count")
         .and_then(serde_json::Value::as_u64)
@@ -274,7 +284,13 @@ pub fn read_worker_gpu_counts(log_dir: &Path) -> Option<Vec<(String, u16, usize)
             let worker_id = worker.get("worker_id")?.as_u64()?;
             let pool_tag = worker.get("pool_tag").and_then(Value::as_str)?.to_owned();
             let gpus = worker.get("gpu_ids").and_then(Value::as_array)?.len();
-            Some((pool_tag, worker_id as u16, gpus))
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "worker_id is a sim-assigned per-pool ordinal in a sim-written run_meta.json, \
+                          far under u16::MAX for any realistic worker count"
+            )]
+            let worker_id_u16 = worker_id as u16;
+            Some((pool_tag, worker_id_u16, gpus))
         })
         .collect();
     (!rows.is_empty()).then_some(rows)

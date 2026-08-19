@@ -29,11 +29,25 @@ impl Time {
     }
 
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "ms is expected non-negative (a duration/offset); callers pass config-derived \
+                  or already-validated values, never an arbitrary signed float, so this does not \
+                  silently launder a negative input into a huge unsigned Time"
+    )]
     pub fn from_ms(ms: f64) -> Time {
         Time((ms * 1_000_000.0) as u64)
     }
 
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "s is expected non-negative (a duration/offset); callers pass config-derived \
+                  or already-validated values, never an arbitrary signed float, so this does not \
+                  silently launder a negative input into a huge unsigned Time"
+    )]
     pub fn from_s(s: f64) -> Time {
         Time((s * 1_000_000_000.0) as u64)
     }
@@ -44,11 +58,27 @@ impl Time {
     }
 
     #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "f64 exactly represents integer ns up to 2^52 (~52 simulated days); every preset \
+                  in this repo caps duration_ms well under an hour, and each call converts the \
+                  authoritative u64 ns directly (no chained/accumulated float error across ticks), \
+                  so real runs stay far inside exact range — but this is not statically enforced \
+                  and a multi-week simulated run would start losing sub-ns precision here"
+    )]
     pub fn as_ms(self) -> f64 {
         self.0 as f64 / 1_000_000.0
     }
 
     #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "f64 exactly represents integer ns up to 2^52 (~52 simulated days); every preset \
+                  in this repo caps duration_ms well under an hour, and each call converts the \
+                  authoritative u64 ns directly (no chained/accumulated float error across ticks), \
+                  so real runs stay far inside exact range — but this is not statically enforced \
+                  and a multi-week simulated run would start losing sub-ns precision here"
+    )]
     pub fn as_s(self) -> f64 {
         self.0 as f64 / 1_000_000_000.0
     }

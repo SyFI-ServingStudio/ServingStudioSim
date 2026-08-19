@@ -64,6 +64,11 @@ fn fit_axis_slopes(
 
     // Normal equations for the 3-parameter design [1, x0, x1]. Solved by
     // Cramer's rule on the symmetric 3x3 — small, fixed size, no allocation.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "band.len() is bounded by the profiling grid's point count (at most a few hundred), \
+                  far below f64's 2^53 exact-integer limit"
+    )]
     let count = band.len() as f64;
     let (mut sum0, mut sum1) = (0.0, 0.0);
     let (mut sum00, mut sum11, mut sum01) = (0.0, 0.0, 0.0);
@@ -111,6 +116,12 @@ fn fit_axis_slopes(
             for row in 0..3 {
                 substituted[row][column] = rhs[row];
             }
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "the fitted slope is stored in the f32 AxisSlopes cache alongside the rest of \
+                          Metrics4 for density; narrowing to f32 here is the intended precision for \
+                          extrapolation increments, not a bug"
+            )]
             let slope = (determinant_3x3(&substituted) / determinant) as f32;
             let slot = &mut per_axis[axis];
             let field = match metric {
@@ -193,6 +204,11 @@ impl Cache for Cache2DLinear {
         if x0.is_nan() || x1.is_nan() || !self.any_valid {
             return LeafMetrics::MISS;
         }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the cache stores coordinates as f32 (xs0/xs1) for density; narrowing the f64 lookup \
+                      coordinates to f32 here is the intended precision, not a bug"
+        )]
         let (cell, extrapolated) = self.lookup(x0 as f32, x1 as f32);
         LeafMetrics {
             m: cell.clamped(),
@@ -237,7 +253,17 @@ impl Cache2DLinear {
         let mut order1: Vec<usize> = (0..c).collect();
         order1.sort_by(|&a, &b| axis1[a].total_cmp(&axis1[b]));
 
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "xs0 is declared as Vec<f32>: the cache intentionally stores axis coordinates at f32 \
+                      precision for density, so narrowing here is the intended representation, not a bug"
+        )]
         let xs0: Vec<f32> = order0.iter().map(|&i| axis0[i] as f32).collect();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "xs1 is declared as Vec<f32>: the cache intentionally stores axis coordinates at f32 \
+                      precision for density, so narrowing here is the intended representation, not a bug"
+        )]
         let xs1: Vec<f32> = order1.iter().map(|&j| axis1[j] as f32).collect();
 
         let mut cells: Vec<Metrics4> = Vec::with_capacity(r * c);

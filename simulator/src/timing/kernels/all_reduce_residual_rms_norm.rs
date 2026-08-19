@@ -59,7 +59,13 @@ impl AllReduceResidualRmsNormSpec {
     #[must_use]
     pub fn max_fused_tokens(config: &AllReduceResidualRmsNormKernelConfig) -> u32 {
         let bytes_per_token = u64::from(config.hidden_dim) * u64::from(config.dtype.size_bytes());
-        (Self::max_fused_bytes(config.num_gpus) / bytes_per_token) as u32
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "max fused token count for a bounded workspace size and hidden dim, far below u32::MAX"
+        )]
+        {
+            (Self::max_fused_bytes(config.num_gpus) / bytes_per_token) as u32
+        }
     }
 }
 
@@ -89,6 +95,11 @@ impl KernelSpec for AllReduceResidualRmsNormSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "num_tokens is a non-negative sweep-grid token coordinate, far below u32::MAX"
+        )]
         grid.expand_1d(|num_tokens| {
             ArgsPayload::new()
                 .with("backend", backend)

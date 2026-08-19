@@ -97,6 +97,11 @@ impl KernelSpec for DsaPagedMqaLogitsDecodeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "batch_size/context_len are non-negative sweep-grid coordinates, far below u32::MAX"
+        )]
         grid.expand_2d(|batch_size, context_len| {
             ArgsPayload::new()
                 .with("backend", backend)

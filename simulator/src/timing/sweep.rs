@@ -174,7 +174,16 @@ impl Axis {
             min_log2 <= max_log2,
             "Axis::pow2: min_log2 must be <= max_log2"
         );
-        (min_log2..=max_log2).map(|i| (1u64 << i) as f64).collect()
+        (min_log2..=max_log2)
+            .map(|i| {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "pow2 axis points are 1u64 << i with i <= max_log2 (callers stay well under 53), so the f64 conversion is exact"
+                )]
+                let value = (1u64 << i) as f64;
+                value
+            })
+            .collect()
     }
 
     /// Arithmetic progression `start, start+step, ...` up to and including any

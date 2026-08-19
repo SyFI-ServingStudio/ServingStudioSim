@@ -53,6 +53,11 @@ pub(super) async fn read_exact_worker_totals(
         let busy_times = col(batch, "busy")?;
         let wall_starts = col(batch, "w0")?;
         let wall_ends = col(batch, "w1")?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "worker_id is a small nonnegative device index materialized from cost_log; DataFusion returns it as f64 but the value is always a whole small integer"
+        )]
         for row in 0..batch.num_rows() {
             let pool_tag = pool_tags.value(row).to_string();
             let worker_id = value_f64(worker_ids, row)? as u16;
@@ -125,7 +130,14 @@ pub(super) async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
         if first_batch.num_rows() > 0 {
             let max_iter_id = value_f64(col(first_batch, "mx")?, 0)?;
             if max_iter_id.is_finite() {
-                num_iters = max_iter_id as u64 + 1;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "max_iter_id is CAST(MAX(iter_id), BIGINT) - a nonnegative iteration counter far below u64::MAX for any real run"
+                )]
+                {
+                    num_iters = max_iter_id as u64 + 1;
+                }
             }
         }
     }
@@ -236,6 +248,11 @@ async fn accumulate_fold_query(
         let mut cached_plan: Option<CachedPlan> = None;
         for row in 0..batch.num_rows() {
             let pool_tag = pool_tags.value(row);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "worker_id is a small nonnegative device index materialized from cost_log; DataFusion returns it as f64 but the value is always a whole small integer"
+            )]
             let worker_id = value_f64(worker_ids, row)? as u16;
             let section = sections.value(row);
             let resolved_plan = match &cached_plan {
@@ -266,6 +283,10 @@ async fn accumulate_fold_query(
             sampled_rows += 1;
             workers[worker_index].sampled_busy_ms += value_f64(total_times, row)?.max(0.0);
 
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "offsets are Arrow ListArray value_offsets (i32), always nonnegative monotonically increasing element indices"
+            )]
             let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
             let mut row_rungs_ms = [0.0f64; 4];
             for (slot, value_index) in (start..end).enumerate() {

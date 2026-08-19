@@ -55,6 +55,10 @@ struct WorkerUsage {
     bins: Vec<f64>,
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "n_bins is the small FINE_BINS-derived bin count and n_workers is a small per-pool worker-roster size; both stay far below f64's 2^53 exact-integer range"
+)]
 pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     if !register_cost_log(ctx, log_dir).await? {
         let reason = "cost_log/ dir not found";
@@ -138,6 +142,11 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
             "pool_tag": pool.pool_tag,
             "util": util,
         }));
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "n_workers was just computed as `.len().max(1) as f64` from a worker roster size, so converting back to u64 for JSON output is always exact and nonnegative"
+        )]
         totals_per_pool.push(json!({
             "pool": pool.pool_id,
             "pool_tag": pool.pool_tag,
@@ -381,6 +390,10 @@ async fn collect_worker_bins(
          FROM cost_log GROUP BY CAST(pool_tag AS VARCHAR), worker_id, bin"
     );
     let batches = collect(ctx, &sql).await?;
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "n_bins is the small FINE_BINS-derived bin count (at most a few hundred), far below isize::MAX"
+    )]
     let last = n_bins as isize - 1;
     let mut out = Vec::new();
     for batch in &batches {
@@ -389,7 +402,17 @@ async fn collect_worker_bins(
         let bin = column_f64(col(batch, "bin")?)?;
         let busy = column_f64(col(batch, "busy")?)?;
         for row in 0..batch.num_rows() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "bin[row] is a computed bin index (offset from t_min divided by bin_width) that is immediately clamped into [0, last], so the intermediate truncation/sign loss cannot escape that bound"
+            )]
             let bi = (bin[row] as isize).clamp(0, last) as usize;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "worker_id is a small nonnegative device index materialized from cost_log's worker_id column; DataFusion returns it as f64 but the value is always a whole small integer"
+            )]
             out.push(WorkerBin {
                 pool_tag: value_string(pool_tag, row)?,
                 worker_id: w[row] as u64,

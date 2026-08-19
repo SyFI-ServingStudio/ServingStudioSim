@@ -257,9 +257,14 @@ where
                     }
                 })
                 .sum();
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "slot is a loop index bounded by NUM_SLOTS (3), far below u8::MAX"
+            )]
+            let slot_id = slot as u8;
             events.push(AttnWorkerEvent::IterStart {
                 worker: context.id,
-                slot: slot as u8,
+                slot: slot_id,
                 reqs: self.slots[slot].request_ids.clone(),
                 tokens,
             });
@@ -337,9 +342,14 @@ where
         self.build_slot_input(context, slot);
         let tokens = self.slots[slot].input_tokens;
         let bytes = self.execution.attn_to_ffn_bytes_per_token() * tokens;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "slot is a loop index bounded by NUM_SLOTS (3), far below u8::MAX"
+        )]
+        let slot_id = slot as u8;
         events.push(AttnWorkerEvent::AttnLayerOutputsReady {
             worker: context.id,
-            slot: slot as u8,
+            slot: slot_id,
             reqs: self.slots[slot].request_ids.clone(),
             tokens,
             layer,
@@ -432,9 +442,14 @@ where
             return;
         }
         self.build_slot_input(context, slot);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "slot is a loop index bounded by NUM_SLOTS (3), far below u8::MAX"
+        )]
+        let slot_id = slot as u8;
         let duration = self.execution.evaluate_attention_layer(
             self.slots[slot].current_layer,
-            slot as u8,
+            slot_id,
             &self.slot_inputs[slot],
             self.slots[slot].iteration,
             now,
@@ -476,10 +491,16 @@ where
     }
 
     pub(super) fn active_slot_count(&self) -> u32 {
-        self.slots
-            .iter()
-            .filter(|slot| !slot.request_ids.is_empty())
-            .count() as u32
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "active slot count is bounded by NUM_SLOTS (3), far below u32::MAX"
+        )]
+        {
+            self.slots
+                .iter()
+                .filter(|slot| !slot.request_ids.is_empty())
+                .count() as u32
+        }
     }
 
     pub(super) fn estimated_peak_kv(&self) -> u64 {

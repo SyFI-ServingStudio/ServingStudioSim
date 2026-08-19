@@ -274,6 +274,20 @@ pub fn run_sim(
     let wall_s = wall_start.elapsed().as_secs_f64();
     let safe_wall = wall_s.max(1e-9);
     let num_gpus = flow.cluster().borrow().num_gpus();
+    // NOTE: `Time` (common/time.rs) is a nanosecond-precision u64 clock, and f64
+    // only represents integers exactly up to 2^52 (~52 simulated days of ns). The
+    // casts below are NOT clock values, though: `all_tok`/`prefill_tok`/`decode_tok`
+    // are accumulated token counts, `completed` a request count, and `num_gpus` a
+    // cluster GPU count — all several orders of magnitude below 2^52 for any
+    // realistic run. They feed only this end-of-run `RunSummary` (written to
+    // summary.json / tracing lines for reporting), never simulation cost/timing
+    // math, so precision loss here is both unreachable at realistic scale and
+    // display-only even if it somehow occurred.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "token/request/gpu counts, not the ns clock; far below 2^52, and only feed the \
+                  display-only end-of-run summary"
+    )]
     let summary = {
         let s = store.borrow();
         let total = s.len() as u64;
@@ -409,6 +423,13 @@ fn state_agg(store: &RequestStore, now: Time) -> RequestStateEntry {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "these are already-converted Time::as_ms() f64 millisecond values, truncated to f32 \
+              purely for the per-request RequestSloEntry output log (parquet telemetry read by the \
+              analyzer) — not fed back into simulation cost/timing math. f32 only loses sub-ms \
+              precision at these magnitudes, acceptable for reporting"
+)]
 fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
     // Per-token array only when it was logged (empty otherwise) — feeds the
     // `slo-detailed` ITL. The `slo-general` scalars below are computed from the

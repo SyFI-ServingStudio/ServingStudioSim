@@ -101,6 +101,11 @@ impl RoutingDistribution {
     }
 
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "ppm.len() is the model's expert count, a small config-time constant well under \
+                  u32::MAX"
+    )]
     pub fn num_experts(&self) -> u32 {
         self.ppm.len() as u32
     }
@@ -157,6 +162,12 @@ impl RoutingDistribution {
     /// Associated (not `&self`) so the caller passes whatever ppm slice it
     /// wants: `RoutingDistribution::to_per_expert_counts(total, &dist.ppm()[lo..hi])`.
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "`base` (numerator/TOTAL_PPM) and `target` (round(numerator_sum/TOTAL_PPM)) are \
+                  each bounded by global_expert_selections (a u32) by construction, so both fit \
+                  comfortably in u32/u64 respectively"
+    )]
     pub fn to_per_expert_counts(global_expert_selections: u32, ppm: &[u32]) -> Vec<u32> {
         let mut counts = vec![0u32; ppm.len()];
         let mut numerator_sum: u128 = 0;
@@ -244,6 +255,13 @@ impl RoutingDistribution {
     /// results IEEE-754 pins exactly, rather than `powf`, whose last bit is
     /// libm-dependent. This value decides a grouped-GEMM cache key, so it has to
     /// be reproducible across hosts, not merely close.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "expected sums per-expert hit probabilities each in [0,1], so it is non-negative \
+                  and bounded by ppm.len(); the trailing .clamp(1, ppm.len()) also re-bounds the \
+                  cast result"
+    )]
     fn active_set_len(global_expert_selections: u32, ppm: &[u32]) -> usize {
         if ppm.is_empty() || global_expert_selections == 0 {
             return 0;
@@ -261,6 +279,11 @@ impl RoutingDistribution {
         (expected.round() as usize).clamp(1, ppm.len())
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "weights.len() is the model's expert count, a small config-time constant well \
+                  under u32::MAX"
+    )]
     fn from_weights(weights: &[f64]) -> Self {
         let total: f64 = weights.iter().sum();
         if total <= f64::EPSILON {
@@ -272,6 +295,13 @@ impl RoutingDistribution {
         let mut assigned = 0u32;
         for (idx, weight) in weights.iter().copied().enumerate() {
             let raw = weight / total * f64::from(Self::TOTAL_PPM);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "weight is non-negative (ratios/power-law/rng draws are all >= 0) and \
+                          total > f64::EPSILON here, so raw = weight/total*TOTAL_PPM is \
+                          non-negative and bounded by TOTAL_PPM (1_000_000), well under u32::MAX"
+            )]
             let base = raw.floor() as u32;
             ppm.push(base);
             residuals.push((idx, raw - f64::from(base)));
@@ -321,6 +351,11 @@ impl RoutingRng {
         z ^ (z >> 31)
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "next_u64() >> 11 fits in 53 bits and 1u64 << 53 is an exact power of two, so both \
+                  are exactly representable in f64 (standard 53-bit-mantissa uniform-f64 construction)"
+    )]
     fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
     }
@@ -337,6 +372,11 @@ impl RoutingRng {
 /// simulator (`op::moe::sim`) consumes each token's hit set to price all six
 /// dispatch/combine stages' per-GPU bytes, so the sampling stays bit-identical
 /// (splitmix64 + fixed iteration order, only +/*/< on f64).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "e = ppm.len() is the model's expert count, a small config-time constant well under \
+              u32::MAX"
+)]
 pub(crate) fn for_each_routed_token(
     ppm: &[u32],
     top_k: u32,

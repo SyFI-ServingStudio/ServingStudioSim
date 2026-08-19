@@ -208,6 +208,10 @@ impl SectionPlan {
                             })
                             .collect();
                         if !critical.is_empty() {
+                            #[allow(
+                                clippy::cast_precision_loss,
+                                reason = "critical.len() is the number of tied-critical children of one Max manifest node, always a tiny count far below 2^53"
+                            )]
                             let child_weight = weight
                                 / f64::from(*overlap).max(TIME_EPSILON_MS)
                                 / critical.len() as f64;
@@ -395,6 +399,11 @@ async fn plan_worker_scans(ctx: &SessionContext) -> Result<BTreeMap<(String, u16
         let worker_ids = col(batch, "worker_id")?;
         let raw_rows = col(batch, "raw_rows")?;
         let kernel_time_ms = col(batch, "kernel_time_ms")?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "worker_id is a small nonnegative device index and raw_rows is a COUNT(*) aggregate; DataFusion returns both as f64 but they are always small nonnegative whole numbers"
+        )]
         for row in 0..batch.num_rows() {
             counts.push((
                 pools.value(row).to_owned(),
@@ -558,6 +567,11 @@ fn accumulate_batch(
     let (offsets, slot_values) = list_f32(batch, "slot_time_ms")?;
     for row in 0..batch.num_rows() {
         let pool_tag = pools.value(row);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "worker_id is a small nonnegative device index materialized from cost_log; DataFusion returns it as f64 but the value is always a whole small integer"
+        )]
         let worker_id = value_f64(worker_column, row)? as u16;
         let section = sections.value(row);
         let worker_index = worker_ids
@@ -579,11 +593,23 @@ fn accumulate_batch(
                 "cost_log {pool_tag}/{worker_id} section {section:?} has invalid root time {total_time_ms}"
             );
         }
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "offsets are Arrow ListArray value_offsets (i32), always nonnegative monotonically increasing element indices"
+        )]
         let start = offsets[row] as usize;
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "offsets are Arrow ListArray value_offsets (i32), always nonnegative monotonically increasing element indices"
+        )]
         let end = offsets[row + 1] as usize;
         let slot_times = &slot_values.values()[start..end];
         let worker = &mut workers[worker_index];
         worker.sampled_rows += 1;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "worker.stride is a small sampling stride (raw_rows / target_per_worker), bounded well below 2^53"
+        )]
         let weighted_root_ms = total_time_ms * worker.stride as f64;
         worker.totals.kernel_time_ms += weighted_root_ms;
         for &(position_id, share) in plans[plan_index].position_shares(slot_times)? {

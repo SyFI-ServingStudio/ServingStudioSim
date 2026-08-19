@@ -116,6 +116,10 @@ pub(super) fn build_section_fold_plans(
                     *location_id_by_name
                         .entry(leaf.name.clone())
                         .or_insert_with(|| {
+                            #[allow(
+                                clippy::cast_possible_truncation,
+                                reason = "kernel_locations accumulates distinct location names bounded by model architecture, far below u32::MAX"
+                            )]
                             let location_id = kernel_locations.len() as u32;
                             kernel_locations.push(KernelLocation {
                                 name: leaf.name.clone(),

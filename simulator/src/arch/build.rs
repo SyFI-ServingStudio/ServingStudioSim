@@ -65,6 +65,10 @@ pub fn moe_model_cfg(model_spec: &ModelSpec) -> Result<MoeModelCfg> {
 /// are tied to exact layer numbers.
 /// Sparse (`MoE`) decoder layers, read off the checkpoint's own layer schedule
 /// rather than assumed. An expert-popularity profile is keyed by this count.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "decoder layer counts are tens to low hundreds, far under u32::MAX"
+)]
 fn num_sparse_layers(model_cfg: &Glm52ModelCfg) -> u32 {
     model_cfg
         .mlp_layer_types
@@ -226,6 +230,10 @@ fn canonicalize_layerwise_expert_counts(
         }
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "counts feed an f32 routing-weight ratio, not an exact accounting figure"
+    )]
     Ok(canonical_counts
         .into_iter()
         .map(|count| count as f32)
@@ -262,6 +270,10 @@ fn load_expert_popularity(
                                 ratio.is_finite() && ratio >= 0.0,
                                 "expert popularity profile {path} contains invalid probability {ratio}"
                             );
+                            #[allow(
+                                clippy::cast_possible_truncation,
+                                reason = "ratio feeds an f32 routing-weight; a probability in [0,1] loses only mantissa precision"
+                            )]
                             Ok(ratio as f32)
                         })
                         .collect::<Result<Vec<_>>>()?,
@@ -269,6 +281,10 @@ fn load_expert_popularity(
             } else if profile.counts_by_layer.is_empty()
                 && profile.counts_all_layers.len() == expected_num_experts as usize
             {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "counts feed an f32 routing-weight ratio, not an exact accounting figure"
+                )]
                 Some(
                     profile
                         .counts_all_layers
@@ -447,6 +463,10 @@ fn ensure_normalized_probabilities(
         })
     })?;
     for (expert_index, (count, probability)) in counts.iter().zip(probabilities).enumerate() {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "routing counts feed an f64 probability ratio for a tolerance check, not exact accounting"
+        )]
         let expected = if total == 0 {
             0.0
         } else {

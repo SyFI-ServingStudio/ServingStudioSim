@@ -103,7 +103,18 @@ impl KernelSpec for GdnChunkDeltaRuleSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_2d(|max_sequence_length, full_sequences| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "max_sequence_length is a non-negative Axis::pow2 sweep coordinate, always a small \
+                          power of two (see the pow2(6, 14) axis above)"
+            )]
             let max_sequence_length = max_sequence_length.round() as u64;
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "max_sequence_length is capped at 2^14 by the sweep grid, far below f64's 53-bit \
+                          exact-integer range, so this round-trip through token_total is exact"
+            )]
             let num_tokens = token_total(max_sequence_length as f64, full_sequences);
             ArgsPayload::new()
                 .with("backend", backend)
@@ -124,6 +135,12 @@ impl KernelSpec for GdnChunkDeltaRuleSpec {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "max_sequence_length and full_sequences are non-negative sweep coordinates bounded by the \
+              pow2(6, 14) and pow2(0, 4) axes, so rounding to u64 here never truncates or loses sign"
+)]
 fn token_total(max_sequence_length: f64, full_sequences: f64) -> u64 {
     let max_sequence_length = max_sequence_length.round() as u64;
     let full_sequences = full_sequences.round() as u64;

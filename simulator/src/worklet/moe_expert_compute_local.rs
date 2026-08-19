@@ -160,8 +160,13 @@ impl MoeExpertComputeLocalWorklet {
         // survives (folds to the plain count at `.get()`). The grouped GEMM's real
         // expert axis is `local_ppm`, not this count.
         let experts_per_gpu = cfg.num_experts.clone() / Dim::param("ep", ep);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "local_ppm.len() is the local-expert count per GPU, always small"
+        )]
+        let local_ppm_len_u32 = cfg.local_ppm.len() as u32;
         assert_eq!(
-            cfg.local_ppm.len() as u32,
+            local_ppm_len_u32,
             experts_per_gpu.get(),
             "local_ppm len ({}) must equal experts_per_gpu ({})",
             cfg.local_ppm.len(),

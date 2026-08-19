@@ -1710,13 +1710,26 @@ fn destinations_per_token(ep_size: u32, top_k: u32, slot_count: u32) -> f64 {
         if remaining_outside <= 0 {
             return f64::from(ep_size);
         }
-        miss *= remaining_outside as f64 / f64::from(slot_count - i);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "remaining_outside is a slot-count difference (model expert counts, at most \
+                      thousands), far under f64's 52-bit exact integer range"
+        )]
+        let remaining_outside_f64 = remaining_outside as f64;
+        miss *= remaining_outside_f64 / f64::from(slot_count - i);
     }
     f64::from(ep_size) * (1.0 - miss)
 }
 
 /// Wire rows for `tokens` tokens at `rows_per_token`, never rounding a live
 /// transfer down to nothing.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "rows_per_token is a non-negative per-token wire-row multiplier (destinations_per_token, \
+              bounded by ep_size, a small single-digit count); tokens is a per-iteration batch size, \
+              so the product stays far under u32::MAX for any realistic batch"
+)]
 fn rows_from_tokens(tokens: u32, rows_per_token: f64) -> u32 {
     if tokens == 0 {
         return 0;

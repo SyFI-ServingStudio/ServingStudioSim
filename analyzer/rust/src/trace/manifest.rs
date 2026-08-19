@@ -176,7 +176,15 @@ pub(crate) fn node_time(m: &Manifest, idx: usize, slot_ns: &[i64]) -> i64 {
                 .max()
                 .unwrap_or(0);
             let ov = (*overlap as f64).max(1e-9);
-            (maxd as f64 / ov).round() as i64
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                reason = "maxd is a leaf duration in ns (a real trace stays far under 2^52 ns / ~52 \
+                          days), and the f64/f64 divide is rounded back into the same ns range before \
+                          re-truncating to i64"
+            )]
+            let result = (maxd as f64 / ov).round() as i64;
+            result
         }
         FlatCostNode::Scale { n, children } => (*n as i64) * node_time(m, children.start, slot_ns),
     }
@@ -210,6 +218,11 @@ pub(crate) fn fold_mean<F: FnMut(usize, f64)>(
             }
         }
         FlatCostNode::Max { overlap, children } => {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "count is a cost-tree fan-out (a handful of parallel children), far under \
+                          f64's 52-bit exact integer range"
+            )]
             let count = children.len().max(1) as f64;
             let ov = (*overlap as f64).max(1e-9);
             let child_weight = weight / (count * ov);

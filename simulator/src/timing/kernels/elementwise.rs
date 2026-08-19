@@ -59,6 +59,13 @@ impl KernelSpec for ElementwiseSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|num_tokens| {
+            // token_axis() values are non-negative integers, max 65536, far
+            // below u64::MAX.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "sweep axis values are non-negative integers far below u64::MAX"
+            )]
             let tokens = num_tokens as u64;
             ArgsPayload::new()
                 .with("backend", backend)

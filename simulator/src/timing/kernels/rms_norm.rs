@@ -52,9 +52,15 @@ impl KernelSpec for RmsNormSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|m| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "m is a token-count grid point from Axis::token_axis, always a small non-negative integer"
+            )]
+            let m_tokens = m as u32;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("m", m as u32)
+                .with("m", m_tokens)
                 .with("hidden", config.hidden.get())
                 .with("dtype", config.dtype.as_str())
         })

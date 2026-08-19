@@ -221,7 +221,14 @@ async fn scalar_count(ctx: &SessionContext, sql: &str) -> Result<u64> {
     match batches.first() {
         Some(b) if b.num_rows() > 0 => {
             // COUNT(*) is Int64 in DataFusion; read as f64 then cast.
-            Ok(value_f64(col(b, "c")?, 0)? as u64)
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a SQL COUNT(*) is always non-negative and, for any real run's row count, \
+                          far under u64::MAX / f64's exact integer range"
+            )]
+            let count = value_f64(col(b, "c")?, 0)? as u64;
+            Ok(count)
         }
         _ => Ok(0),
     }

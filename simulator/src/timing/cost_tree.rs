@@ -417,7 +417,12 @@ impl CostTree {
                     for c in children.clone() {
                         acc.add(scratch[c]);
                     }
-                    acc.scale(*n as f32);
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "n is a repeat/scale count (e.g. layers, experts) from the cost tree, always small enough to be exact in f32"
+                    )]
+                    let n_f32 = *n as f32;
+                    acc.scale(n_f32);
                     acc
                 }
                 FlatCostNode::Max { overlap, children } => {

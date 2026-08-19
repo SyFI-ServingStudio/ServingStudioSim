@@ -28,6 +28,10 @@ impl<M: FfnLayerwiseModel> FfnTaskExecution for FfnSectionExecutionAdapter<M> {
 
     fn build_task_input(&self, tokens: u64, output: &mut Self::Input) {
         let num_groups = u64::from(self.model.num_dp_groups().max(1));
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "per-group token counts are bounded by the batch size, far below u32::MAX"
+        )]
         let base = (tokens / num_groups) as u32;
         let remainder = tokens % num_groups;
         output.tokens_per_group.clear();
@@ -93,9 +97,14 @@ impl<M: FfnLayerwiseModel> FfnTaskExecution for FfnSectionExecutionAdapter<M> {
                 total += duration;
             }
             FfnTaskKind::Bridge { upstream } => {
+                #[allow(
+                    clippy::cast_possible_wrap,
+                    reason = "layer indices are a handful to low hundreds, far below i16::MAX"
+                )]
+                let upstream_key = upstream as i16;
                 let duration = self.cost.run_section(
                     "post_attn",
-                    upstream as i16,
+                    upstream_key,
                     iteration,
                     batch_id,
                     groups,
@@ -115,9 +124,15 @@ impl<M: FfnLayerwiseModel> FfnTaskExecution for FfnSectionExecutionAdapter<M> {
                 total += duration;
             }
             FfnTaskKind::Terminal => {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_possible_wrap,
+                    reason = "last_layer is the model's final layer index, a handful to low hundreds, far below i16::MAX"
+                )]
+                let last_layer_key = last_layer as i16;
                 let duration = self.cost.run_section(
                     "post_attn_last",
-                    last_layer as i16,
+                    last_layer_key,
                     iteration,
                     batch_id,
                     groups,

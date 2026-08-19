@@ -225,6 +225,10 @@ impl CostBuffers {
         if let Some(ck) = cache_key {
             self.key_scratch.clear();
             let name = section.as_bytes();
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "section is a hardcoded &'static str cost-section name, far shorter than u32::MAX"
+            )]
             self.key_scratch.push(name.len() as u32);
             for chunk in name.chunks(4) {
                 let mut w = 0u32;

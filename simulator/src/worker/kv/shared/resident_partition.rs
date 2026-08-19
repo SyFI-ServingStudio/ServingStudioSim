@@ -191,7 +191,12 @@ impl ResidentPartitionState {
     }
 
     pub(crate) fn live_decode_count(&self) -> u32 {
-        self.iter_decoding().count() as u32
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "live decode count is bounded by this partition's resident request count, far below u32::MAX"
+        )]
+        let count = self.iter_decoding().count() as u32;
+        count
     }
 
     pub(crate) fn add_prefill_admit(&mut self, request: RequestId) {
@@ -219,7 +224,12 @@ impl ResidentPartitionState {
     }
 
     pub(crate) fn prefill_admit_count(&self) -> u32 {
-        self.prefill_admits.len() as u32
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "prefill admit count is bounded by this partition's resident request count, far below u32::MAX"
+        )]
+        let count = self.prefill_admits.len() as u32;
+        count
     }
 
     pub(crate) fn iter_prefill_admits(&self) -> impl Iterator<Item = RequestId> + '_ {

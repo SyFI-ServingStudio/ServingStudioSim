@@ -446,6 +446,11 @@ fn critical_path_ms(measurement: &IterationMeasurement) -> f64 {
     let mut mapped_ms = 0.0;
     let mut unmapped_ms = 0.0;
     for (_, item) in &measurement.kernels {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "occurrence_ns is one kernel's ns duration within one iteration, far below \
+                      2^53 ns"
+        )]
         let duration_ms = occurrence_ns(&item.launches, item.synchronizing) as f64 / 1e6;
         if item.operation.is_some() {
             mapped_ms += duration_ms;
@@ -654,6 +659,11 @@ fn build_iteration(
     used_name_ids: &mut BTreeSet<u64>,
 ) -> Result<BuiltIteration> {
     let simulated_gpu_cycle_ms = sim.total_ms * gpu_time_multiplier;
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "ns is a trace timestamp; realistic trace/run spans are far below i64::MAX ns \
+                  (~292 years), so this never wraps"
+    )]
     let offset = |ns: u64| (ns as i64) - (time_origin_ns as i64);
 
     // ---- measured -----------------------------------------------------------
@@ -663,8 +673,13 @@ fn build_iteration(
     for (_, item) in &measurement.kernels {
         let occurrence = occurrence_ns(&item.launches, item.synchronizing);
         if let Some(operation) = &item.operation {
-            *measured_operation_ms.entry(operation.as_str()).or_default() +=
-                occurrence as f64 / 1e6;
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "occurrence is one kernel's ns duration within one iteration, far below \
+                          2^53 ns"
+            )]
+            let occurrence_ms = occurrence as f64 / 1e6;
+            *measured_operation_ms.entry(operation.as_str()).or_default() += occurrence_ms;
             *measured_operation_rows
                 .entry(operation.as_str())
                 .or_default() += 1;
@@ -718,6 +733,11 @@ fn build_iteration(
         )?;
         match operation {
             Some(rule) => {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "scales[index] is a slot's replay multiplicity (small replication \
+                              factor), far below 2^53"
+                )]
                 let folded_ms = sim.slot_ms[index] * scales[index] as f64;
                 *simulated_operation_ms
                     .entry(rule.operation.as_str())
@@ -745,6 +765,11 @@ fn build_iteration(
             .get(operation)
             .copied()
             .unwrap_or(0);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "measured/simulated occurrence counts are per-operation kernel counts within \
+                      one iteration, far below 2^53"
+        )]
         operation_totals.push(json!({
             "op": operation,
             "measured_ms": measured_ms,
@@ -978,6 +1003,10 @@ impl ReferenceRank {
     /// Computed once and handed to both readers: a picker ordered by idle share
     /// and the report opened next to it must not disagree in the last ulp about
     /// the same iteration.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "both are ns spans/unions within one iteration, far below 2^53 ns"
+    )]
     fn occupancy(&self) -> Occupancy {
         let span_ms = self
             .span
@@ -1020,9 +1049,20 @@ impl ReferenceRank {
                 .into_iter()
                 .take(TOP_GAPS)
                 .map(|gap| {
+                    #[allow(
+                        clippy::cast_possible_wrap,
+                        reason = "gap.start_ns is a trace timestamp; realistic trace/run spans \
+                                  are far below i64::MAX ns (~292 years), so this never wraps"
+                    )]
+                    let start_ns = (gap.start_ns as i64) - (time_origin_ns as i64);
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "gap duration is a ns span within one iteration, far below 2^53 ns"
+                    )]
+                    let duration_us = (gap.end_ns - gap.start_ns) as f64 / 1e3;
                     json!({
-                        "start_ns": (gap.start_ns as i64) - (time_origin_ns as i64),
-                        "duration_us": (gap.end_ns - gap.start_ns) as f64 / 1e3,
+                        "start_ns": start_ns,
+                        "duration_us": duration_us,
                         "after": gap.after.value(),
                         "before": gap.before.value(),
                     })
@@ -1052,6 +1092,10 @@ impl ReferenceRank {
                 .iter()
                 .filter(|summary| summary.device_id == device_id)
                 .map(|summary| {
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "phase span is a ns span within one iteration, far below 2^53 ns"
+                    )]
                     let phase_span_ms = (summary.span_ns.1 - summary.span_ns.0) as f64 / 1e6;
                     json!({
                         "phase": summary.phase,
@@ -1072,12 +1116,25 @@ impl ReferenceRank {
             "largest_inter_phase_gaps": crossing
                 .into_iter()
                 .take(TOP_GAPS)
-                .map(|gap| json!({
-                    "start_ns": (gap.start_ns as i64) - (time_origin_ns as i64),
-                    "duration_us": (gap.end_ns - gap.start_ns) as f64 / 1e3,
-                    "after": gap.after.value(),
-                    "before": gap.before.value(),
-                }))
+                .map(|gap| {
+                    #[allow(
+                        clippy::cast_possible_wrap,
+                        reason = "gap.start_ns is a trace timestamp; realistic trace/run spans \
+                                  are far below i64::MAX ns (~292 years), so this never wraps"
+                    )]
+                    let start_ns = (gap.start_ns as i64) - (time_origin_ns as i64);
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "gap duration is a ns span within one iteration, far below 2^53 ns"
+                    )]
+                    let duration_us = (gap.end_ns - gap.start_ns) as f64 / 1e3;
+                    json!({
+                        "start_ns": start_ns,
+                        "duration_us": duration_us,
+                        "after": gap.after.value(),
+                        "before": gap.before.value(),
+                    })
+                })
                 .collect::<Vec<_>>(),
         })
     }

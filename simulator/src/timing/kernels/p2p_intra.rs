@@ -71,9 +71,15 @@ impl KernelSpec for P2pIntraSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|message_size| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "message_size is a grid point from Axis::pow2, always a small non-negative power of two"
+            )]
+            let message_size_bytes = message_size as u64;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("message_size_bytes", message_size as u64)
+                .with("message_size_bytes", message_size_bytes)
                 // Fixed profiling dtype: comm is size-keyed (see module doc), the
                 // curve is measured once at bf16 for every logical payload dtype.
                 .with("dtype", DType::Bf16.as_str())

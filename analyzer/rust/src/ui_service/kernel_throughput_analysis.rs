@@ -173,9 +173,20 @@ fn expand_query_points(input_fields: &[String], axes: &[Vec<f64>]) -> Result<Vec
 /// physical kernel Input uses integer counts/bytes/tokens. Preserve integral
 /// coordinates as JSON integers so serde can decode the kernel's own `u32`/
 /// `u64` input type; genuinely fractional axes remain JSON floats.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "u64::MAX as f64 is a fixed upper-bound constant for the range check below, not a value \
+              conversion"
+)]
 fn json_coord(value: f64) -> Value {
     if value >= 0.0 && value.fract() == 0.0 && value <= u64::MAX as f64 {
-        Value::from(value as u64)
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "guarded above: value is checked non-negative, integral, and <= u64::MAX before this cast"
+        )]
+        let as_u64 = value as u64;
+        Value::from(as_u64)
     } else {
         Value::from(value)
     }

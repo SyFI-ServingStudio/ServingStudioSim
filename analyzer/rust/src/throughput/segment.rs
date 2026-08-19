@@ -57,6 +57,10 @@ pub async fn run_throughput(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
     // (the honest default for a run predating the sidecar).
     let (num_gpus, gpu_name) = read_run_meta(log_dir).unwrap_or((1, String::new()));
     let num_gpus = num_gpus.max(1);
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "num_gpus is a physical GPU count, far under f64's 52-bit exact integer range"
+    )]
     let g = num_gpus as f64;
 
     let ticks = collect_ticks(ctx).await?;
@@ -77,6 +81,10 @@ pub async fn run_throughput(ctx: &SessionContext, log_dir: &Path) -> Result<(Val
     let t0 = ticks[0].0;
     let tn = ticks.last().unwrap().0;
     let n_bins = MAX_BINS.min(ticks.len() - 1);
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "k and n_bins are bin indices capped at MAX_BINS (10), far under f64's exact integer range"
+    )]
     let bin_edges: Vec<Tick> = (0..=n_bins)
         .map(|k| {
             let tq = t0 + (tn - t0) * (k as f64) / (n_bins as f64);

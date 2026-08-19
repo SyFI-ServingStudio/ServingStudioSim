@@ -31,6 +31,12 @@ pub(crate) fn build_pd_decode_worker<M: IterwiseUnifiedModel>(
     let num_attn_shards = model.num_attn_shards().max(1);
     let kv_bytes_per_token = model.total_kv_bytes_per_token();
     let total_partition_tokens = full_attention_token_capacity(model.as_ref(), &config);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "total_partition_tokens is a KV-cache token capacity bounded by realistic GPU memory, far below 2^52; the fraction is a positive constant so the product stays non-negative and within u64 range"
+    )]
     let pull_budget_tokens = ((total_partition_tokens as f64 * PULL_BUDGET_FRACTION) as u64).max(1);
     let active_kv_capacity = total_partition_tokens
         .saturating_sub(pull_budget_tokens)

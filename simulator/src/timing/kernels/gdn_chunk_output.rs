@@ -72,7 +72,17 @@ impl KernelSpec for GdnChunkOutputSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_2d(|num_chunks, tokens_per_chunk| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "rounded sweep-grid chunk count is non-negative and far below u64::MAX"
+            )]
             let num_chunks = num_chunks.round() as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "rounded sweep-grid token count is non-negative and far below u64::MAX"
+            )]
             let tokens_per_chunk = tokens_per_chunk.round() as u64;
             let num_tokens = num_chunks
                 .checked_mul(tokens_per_chunk)

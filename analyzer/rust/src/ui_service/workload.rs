@@ -20,6 +20,10 @@ struct TraceEntry {
     arrival_time: f64,
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "request/token counts are bounded by the size of one trace file, far under f64's 2^53 exact-integer range"
+)]
 pub(super) fn read_workload(run: &DiscoveredRun, repo_root: &Path) -> Result<Value> {
     let params = read_run_json(&run.path, "raw/params.json")?;
     let source_paths = trace_file_paths(&params)?;
@@ -182,6 +186,10 @@ fn validate_trace(entries: &[TraceEntry]) -> Result<()> {
         bail!("trace files contained no rows");
     }
     for (index, entry) in entries.iter().enumerate() {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "index is a row offset into one trace file, expected to match entry.id (a u32) so it never exceeds u32::MAX in practice"
+        )]
         if entry.id != index as u32 {
             bail!("trace row {index} has non-sequential id {}", entry.id);
         }
@@ -192,6 +200,12 @@ fn validate_trace(entries: &[TraceEntry]) -> Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "MAX_POINTS is a fixed small bucket count and token lengths are bounded by u32 input/output lens, so the width fraction and rounded bucket-center length both stay well inside their target ranges"
+)]
 fn length_distribution(entries: &[TraceEntry]) -> (Vec<u32>, Vec<f64>, Vec<f64>) {
     let min_length = entries
         .iter()
@@ -226,10 +240,19 @@ fn length_distribution(entries: &[TraceEntry]) -> (Vec<u32>, Vec<f64>, Vec<f64>)
     )
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the floored bin fraction is clamped to [0, MAX_POINTS - 1] by the trailing .min(), so it never truncates a value outside usize's positive range"
+)]
 fn log_bin(value: u32, log_min: f64, width: f64) -> usize {
     (((f64::from(value).ln() - log_min) / width).floor() as usize).min(MAX_POINTS - 1)
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "counts are per-bucket occurrences from one trace file, far under f64's 2^53 exact-integer range"
+)]
 fn normalized_counts(counts: &[u64]) -> Vec<f64> {
     let peak = counts.iter().copied().max().unwrap_or(1).max(1) as f64;
     counts
@@ -238,6 +261,12 @@ fn normalized_counts(counts: &[u64]) -> Vec<f64> {
         .collect()
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "bucket_count is clamped to MAX_POINTS and the floored bucket index is clamped to [0, bucket_count - 1] by the trailing .min(), so the truncating cast never sees a negative or out-of-range value; the count/duration-derived f64 casts stay far under f64's 2^53 exact-integer range for one trace file"
+)]
 fn arrival_distribution(
     entries: &[TraceEntry],
     arrival_scale: f64,
@@ -277,6 +306,10 @@ fn arrival_distribution(
     (arrival_seconds, arrivals, arrival_trend, peak_to_mean)
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "sum and window width are bounded by one trace file's bucket counts, far under f64's 2^53 exact-integer range"
+)]
 fn moving_average(values: &[u64], radius: usize) -> Vec<f64> {
     (0..values.len())
         .map(|index| {

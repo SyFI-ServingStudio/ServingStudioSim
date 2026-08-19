@@ -140,6 +140,12 @@ impl PredictGroup {
     /// / `total_kv_len` exactly as the worker does in
     /// `worker/execution/unified_iter_execution.rs::build_input`, so a predicted iteration costs
     /// identically to the same shape inside a real run.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "decode_kv_lens.len() and the summed total_kv (both u32-scale batch/KV token \
+                  counts, mirroring build_input's own downcast) would need billions of entries/tokens \
+                  to overflow u32 — far beyond any realistic case file"
+    )]
     fn into_arch_group(self) -> Result<ArchGroupInput> {
         // decode source: exact list xor uniform shorthand xor neither.
         let decode_kv_lens = match (self.decode_kv_lens.is_empty(), self.decode_count) {
@@ -464,6 +470,11 @@ fn run_ffn_cases(
         // standing for every layer in [0, last). Only when there IS a mid layer.
         if num_layers >= 2 {
             let mid = (num_layers as usize - 1) / 2; // clearly < last for num_layers >= 2
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "mid is a decoder layer index (tens to low hundreds), far under i16::MAX"
+            )]
             let seg = cost.run_section(
                 "post_attn",
                 mid as i16,
@@ -481,6 +492,11 @@ fn run_ffn_cases(
         }
 
         // post_attn terminal (last layer, post-only).
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "last is a decoder layer index (tens to low hundreds), far under i16::MAX"
+        )]
         let seg = cost.run_section(
             "post_attn_last",
             last as i16,

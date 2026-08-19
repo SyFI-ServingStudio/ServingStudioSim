@@ -76,9 +76,15 @@ impl KernelSpec for VllmMlaRopeSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|num_tokens| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_tokens is a grid point from Axis::pow2/token_axis, always a small non-negative integer"
+            )]
+            let num_tokens_u32 = num_tokens as u32;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("num_tokens", num_tokens as u32)
+                .with("num_tokens", num_tokens_u32)
                 .with("num_heads", config.num_heads.get())
                 .with("qk_nope_head_dim", config.qk_nope_head_dim.get())
                 .with("rope_dim", config.rope_dim.get())

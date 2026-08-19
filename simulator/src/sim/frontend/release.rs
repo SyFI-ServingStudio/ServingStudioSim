@@ -435,7 +435,12 @@ fn build_chains(releases: &[ReleaseMetadata]) -> (Vec<Option<u32>>, Vec<bool>) {
             continue;
         };
         if let Some(previous) = latest_round.insert(session_id, index) {
-            successor[previous] = Some(index as u32);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "index is a position within this run's release trace, far below u32::MAX"
+            )]
+            let index_u32 = index as u32;
+            successor[previous] = Some(index_u32);
             has_predecessor[index] = true;
         }
     }

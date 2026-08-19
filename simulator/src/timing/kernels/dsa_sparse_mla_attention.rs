@@ -106,9 +106,16 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
             "causal_tail" => {
                 grid.expand_2d(|num_queries, num_cache_tokens| num_queries > num_cache_tokens)
             }
-            "speculative_pairs" => {
-                grid.expand_2d(|num_queries, _| !(num_queries as u32).is_multiple_of(2))
-            }
+            "speculative_pairs" => grid.expand_2d(|num_queries, _| {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "num_queries is a non-negative Axis::values sweep coordinate from \
+                              SPECULATIVE_QUERY_AXIS, capped at 65,536, far below u32::MAX"
+                )]
+                let num_queries = num_queries as u32;
+                !num_queries.is_multiple_of(2)
+            }),
             pattern => panic!("unsupported valid_counts_pattern {pattern:?}"),
         }
     }
@@ -123,7 +130,19 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
             "softmax_scale_denominator must be positive"
         );
         grid.expand_2d(|num_queries, num_cache_tokens| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_queries is a non-negative Axis::values sweep coordinate, capped at 65,536, \
+                          far below u32::MAX"
+            )]
             let num_queries = num_queries as u32;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_cache_tokens is a non-negative Axis::values sweep coordinate, capped at \
+                          1,048,576, far below u32::MAX"
+            )]
             let num_cache_tokens = num_cache_tokens as u32;
             ArgsPayload::new()
                 .with("backend", backend)

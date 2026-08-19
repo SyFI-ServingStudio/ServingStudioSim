@@ -219,6 +219,11 @@ impl KernelSpec for MoeAlltoallSpec {
             config.top_k,
             config.slot_count
         );
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "max_send_rows/max_recv_rows are non-negative sweep-grid coordinates, far below u32::MAX"
+        )]
         grid.expand_2d(|max_send_rows, max_recv_rows| {
             ArgsPayload::new()
                 .with("backend", backend)

@@ -151,6 +151,10 @@ pub(super) fn worker_kernel_ladders(
                 .iter()
                 .enumerate()
                 .filter_map(|(location_index, _)| {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "location_index is a Vec index over kernel_locations, whose count is a small model-architecture bound, far below u32::MAX"
+                    )]
                     let sampled_rungs = sampled_rungs_by_location_worker
                         .get(&(location_index as u32, worker_index))?;
                     let anchored_rungs =

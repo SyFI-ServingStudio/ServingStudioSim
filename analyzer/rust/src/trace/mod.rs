@@ -179,6 +179,10 @@ pub async fn run(
     // single window covering the whole thing.
     let regions = regions.max(1);
     let region_ms = region_ms.max(0.0);
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "region index and region count are small run-configuration values (regions is a CLI arg), far below 2^53"
+    )]
     let anchors: Vec<f64> = if span <= region_ms || regions == 1 {
         vec![t0]
     } else {
@@ -234,10 +238,19 @@ pub async fn run(
         let gr = col(b, "groups")?;
         let (sf, sb) = (col(b, "slot_flops")?, col(b, "slot_bytes")?);
         for r in 0..b.num_rows() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "per-slot leaf duration in ms rounded to ns; realistic kernel durations stay far below the i64 nanosecond range"
+            )]
             let slot_ns = value_f32_list(st, r)?
                 .iter()
                 .map(|ms| (ms * 1e6).round() as i64)
                 .collect();
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "worker_id/iter_id/batch_id are simulator-internal identifiers from cost_log, bounded by the run's worker/iteration/batch counts"
+            )]
             rows.push(IterRow {
                 pool_tag: value_string(pool_tag, r)?,
                 worker_id: value_f64(wid, r)? as u16,
@@ -285,6 +298,11 @@ pub async fn run(
             let (sc, rc) = (col(b, "send_count")?, col(b, "recv_count")?);
             let se = col(b, "send_end_ms")?;
             for r in 0..b.num_rows() {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "worker_id/gid/link counts and byte totals are simulator-internal identifiers/counts from gpu_cluster, bounded by the run's worker/link counts and model tensor sizes"
+                )]
                 net_rows.push(NetRow {
                     net_start_ms: value_f64(ns, r)?,
                     net_end_ms: value_f64(ne, r)?,
@@ -325,6 +343,11 @@ pub async fn run(
     let mut comm_tracks: BTreeMap<(String, u16), u64> = BTreeMap::new();
     let mut send_tracks: BTreeMap<(String, u16), u64> = BTreeMap::new();
     for (idx, key) in worker_keys.iter().enumerate() {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "pid is a Perfetto process-track id, one per worker; a run has far fewer than i32::MAX workers"
+        )]
         let pid = idx as i32;
         let label = worker_label(key);
         let proc = w.process_track(pid, &label);
@@ -372,6 +395,10 @@ pub async fn run(
 
     'regions: for (i, &pos) in anchors.iter().enumerate() {
         let (lo, hi) = (pos, pos + region_ms);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "i is a region index bounded by the small `regions` CLI arg, far below 2^53"
+        )]
         let offset_ms = (i as f64) * (region_ms + gap_ms);
         let shift_ms = offset_ms - pos;
 
@@ -381,6 +408,11 @@ pub async fn run(
             .collect();
         eligible_iters += region_rows.len();
 
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "region offset in ns stays far below the i64 range for realistic run durations; region_rows.len() (iteration count within one sample window) stays far below i64::MAX"
+        )]
         w.begin(
             region_track,
             (offset_ms * 1e6).round() as i64,
@@ -413,12 +445,20 @@ pub async fn run(
             };
             if placed_pairs + per_iter_pairs > max_slices {
                 truncated = true;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "ms-to-ns conversion of a run/trace timestamp; realistic run wall-clock spans stay far below the i64 nanosecond range"
+                )]
                 w.end(region_track, ((offset_ms + region_ms) * 1e6).round() as i64);
                 break 'regions;
             }
             let track = worker_tracks[&key];
             // Sim-clock begin, snapped forward so it never predates the same track's
             // last end (see `track_cursor`); the shift is ≤1ns rounding noise.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "ms-to-ns conversion of a run/trace timestamp; realistic run wall-clock spans stay far below the i64 nanosecond range"
+            )]
             let base_ns = ((row.wall_start_ms + shift_ms) * 1e6).round() as i64;
             let base_ns = base_ns.max(track_cursor.get(&track).copied().unwrap_or(i64::MIN));
 
@@ -459,6 +499,10 @@ pub async fn run(
 
             // Drift guard: the laid-out tree must reproduce total_time_ms up to
             // per-leaf ns rounding (each of per_iter_pairs rounds at most 1 ns).
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "ms-to-ns conversion of a run/trace duration; realistic per-iteration durations stay far below the i64 nanosecond range"
+            )]
             let expected = (row.total_time_ms * 1e6).round() as i64;
             debug_assert!(
                 (dur - expected).unsigned_abs() <= per_iter_pairs as u64,
@@ -482,8 +526,16 @@ pub async fn run(
                 // cost_log worker). Skip rather than invent a lane.
                 continue;
             };
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "ms-to-ns conversion of a run/trace timestamp; realistic run wall-clock spans stay far below the i64 nanosecond range"
+            )]
             let begin_ns = ((nr.net_start_ms + shift_ms) * 1e6).round() as i64;
             let begin_ns = begin_ns.max(net_track_cursor.get(&track).copied().unwrap_or(i64::MIN));
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "ms-to-ns conversion of a run/trace timestamp; realistic run wall-clock spans stay far below the i64 nanosecond range"
+            )]
             let end_ns = (((nr.net_end_ms + shift_ms) * 1e6).round() as i64).max(begin_ns);
             let mut net_anns = vec![
                 Annotation::str(
@@ -503,10 +555,18 @@ pub async fn run(
             let dur_s = (nr.net_end_ms - nr.net_start_ms) / 1e3;
             if dur_s > 0.0 {
                 if nr.send_count > 0 {
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "transfer byte count and link count are bounded by model tensor sizes and GPU link counts respectively, far below 2^53"
+                    )]
                     let gbps = (nr.bytes as f64 / nr.send_count as f64) / dur_s / 1e9;
                     net_anns.push(Annotation::dbl("send_per_link_gbps", gbps));
                 }
                 if nr.recv_count > 0 {
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "transfer byte count and link count are bounded by model tensor sizes and GPU link counts respectively, far below 2^53"
+                    )]
                     let gbps = (nr.bytes as f64 / nr.recv_count as f64) / dur_s / 1e9;
                     net_anns.push(Annotation::dbl("recv_per_link_gbps", gbps));
                 }
@@ -525,6 +585,10 @@ pub async fn run(
             // on its send lane, joined to the recv slice by `flow`. Ends before the
             // recv window when the sender frees early (the gather α/β overlap).
             if let Some(&send_track) = send_tracks.get(&nr.src_key()) {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "ms-to-ns conversion of a run/trace timestamp; realistic run wall-clock spans stay far below the i64 nanosecond range"
+                )]
                 let s_begin = ((nr.net_start_ms + shift_ms) * 1e6).round() as i64;
                 let s_begin = s_begin.max(
                     send_track_cursor
@@ -532,6 +596,10 @@ pub async fn run(
                         .copied()
                         .unwrap_or(i64::MIN),
                 );
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "ms-to-ns conversion of a run/trace timestamp; realistic run wall-clock spans stay far below the i64 nanosecond range"
+                )]
                 let s_end = (((nr.send_end_ms + shift_ms) * 1e6).round() as i64).max(s_begin);
                 let send_anns = vec![
                     Annotation::str(
@@ -557,6 +625,10 @@ pub async fn run(
             }
         }
 
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "ms-to-ns conversion of a run/trace timestamp; realistic run wall-clock spans stay far below the i64 nanosecond range"
+        )]
         w.end(region_track, ((offset_ms + region_ms) * 1e6).round() as i64);
     }
 

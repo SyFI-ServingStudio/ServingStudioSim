@@ -273,6 +273,11 @@ fn worker_config(
         ),
     };
     Ok(WorkerConfig {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "attn_gpu_memory_gb is a positive, hardware-bounded GB figure; the byte count stays well within u64 range"
+        )]
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
         log_stage_transitions,

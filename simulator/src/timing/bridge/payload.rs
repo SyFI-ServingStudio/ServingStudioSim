@@ -232,7 +232,15 @@ impl KernelMetrics {
         if !finite_non_negative(value) {
             return 0;
         }
-        value as u64
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "finite_non_negative(value) above guarantees value is finite and >= 0.0, so this cast \
+                      only rounds the flop count toward zero, never flips a sign"
+        )]
+        {
+            value as u64
+        }
     }
 
     /// Bytes this leaf moved. Compute rows derive it from the memory-bandwidth
@@ -249,6 +257,12 @@ impl KernelMetrics {
             if !finite_non_negative(value) {
                 return 0;
             }
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "finite_non_negative(value) above guarantees value is finite and >= 0.0, so this \
+                          cast only rounds the byte count toward zero, never flips a sign"
+            )]
             return value as u64;
         }
         if let Some(busbw_gbps) = self.busbw_gbps {
@@ -256,6 +270,12 @@ impl KernelMetrics {
             if !finite_non_negative(value) {
                 return 0;
             }
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "finite_non_negative(value) above guarantees value is finite and >= 0.0, so this \
+                          cast only rounds the byte count toward zero, never flips a sign"
+            )]
             return value as u64;
         }
         0

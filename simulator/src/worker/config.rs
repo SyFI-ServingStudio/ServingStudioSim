@@ -272,7 +272,15 @@ pub(crate) fn resolve_prefix_cache_config(
             }
             Ok(PrefixCacheConfig::Opportunistic {
                 policy,
-                max_retained_bytes: max_gpu_memory_gb.map(|memory_gb| (memory_gb * 1e9) as u64),
+                max_retained_bytes: max_gpu_memory_gb.map(|memory_gb| {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "memory_gb is validated finite, > 0, and <= attn_gpu_memory_gb above, so the byte count fits well within u64"
+                    )]
+                    let bytes = (memory_gb * 1e9) as u64;
+                    bytes
+                }),
             })
         }
     }

@@ -148,6 +148,10 @@ where
     }
 
     fn status(&self) -> WorkerStatus {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_partitions is a worker's KV partition count, always far below u16::MAX"
+        )]
         let active_requests = (0..self.kv_store.num_partitions() as u16)
             .map(|partition| self.kv_store.live_decode_count(partition))
             .sum();
@@ -155,7 +159,15 @@ where
             + self.pull_pipeline.pending_pulls.len()
             + usize::from(self.pull_pipeline.in_flight.is_some());
         WorkerStatus {
-            queued_requests: queued_requests as u32,
+            queued_requests: {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "queued_requests is bounded by the simulated request count, far below u32::MAX"
+                )]
+                {
+                    queued_requests as u32
+                }
+            },
             active_requests,
         }
     }
@@ -309,6 +321,10 @@ where
     /// Admit at most one landed request directly into its chosen decode partition.
     fn form_batch(&mut self, now: Time) -> bool {
         let num_partitions = self.kv_store.num_partitions();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_partitions is a worker's KV partition count, always far below u16::MAX"
+        )]
         let had_decode =
             (0..num_partitions as u16).any(|partition| self.kv_store.has_live_decode(partition));
 
@@ -322,7 +338,17 @@ where
                     .target_output_tokens
                     .saturating_sub(record.progress.output_tokens_emitted)
             };
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "choose() returns an index bounded by num_partitions, a worker's KV partition \
+                          count, always far below u16::MAX"
+            )]
             let partition = self.balance.choose(num_partitions) as u16;
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "prompt_kv is widened from the request's u32 prompt_tokens field via u64::from, \
+                          so narrowing it back to u32 here is always exact"
+            )]
             let footprint = self
                 .kv_store
                 .footprint(request, prompt_kv as u32, remaining);
@@ -344,6 +370,10 @@ where
             }
         }
 
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_partitions is a worker's KV partition count, always far below u16::MAX"
+        )]
         let still_decoding =
             (0..num_partitions as u16).any(|partition| self.kv_store.has_live_decode(partition));
         if !had_decode && !still_decoding {
@@ -389,6 +419,10 @@ where
     }
 
     fn complete_iteration(&mut self, now: Time, events: &mut Vec<PdDecodeEvent>) {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_partitions is a worker's KV partition count, always far below u16::MAX"
+        )]
         for partition in 0..self.kv_store.num_partitions() as u16 {
             let mut completed = Vec::new();
             {

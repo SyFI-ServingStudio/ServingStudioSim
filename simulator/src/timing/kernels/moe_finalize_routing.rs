@@ -71,6 +71,11 @@ impl KernelSpec for MoeFinalizeRoutingSpec {
         let affordable = Axis::token_axis()
             .into_iter()
             .filter(|&token_count| {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "token_count comes from the profiling grid's token axis: a small, non-negative, pre-curated point far below u32::MAX"
+                )]
                 let local_rows = local_routed_token_count(token_count as u32, config);
                 f64::from(local_rows) * row_bytes <= EXPANDED_ROW_BUDGET_BYTES
             })
@@ -93,6 +98,11 @@ impl KernelSpec for MoeFinalizeRoutingSpec {
             "local_ppm must contain one entry per local expert"
         );
         grid.expand_1d(|token_count| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "token_count comes from the profiling grid's token axis: a small, non-negative, pre-curated point far below u32::MAX"
+            )]
             let token_count = token_count as u32;
             let local_routed_token_count = local_routed_token_count(token_count, config);
 

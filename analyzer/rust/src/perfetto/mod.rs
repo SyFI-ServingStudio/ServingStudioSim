@@ -124,6 +124,10 @@ impl TraceWriter {
     /// Declare a process track (a top-level group row). UUID is `pid << 32`,
     /// matching the convention that child tracks reference via `parent_uuid`.
     pub fn process_track(&mut self, pid: i32, name: &str) -> u64 {
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "pid is a small non-negative synthetic process id (a pool index), never negative"
+        )]
         let uuid = (pid as u64) << 32;
         let mut p = self.new_packet();
         p.track_descriptor = Some(TrackDescriptor {
@@ -176,7 +180,12 @@ impl TraceWriter {
 
     pub fn begin(&mut self, track: u64, ts_ns: i64, name: &str, anns: &[Annotation]) {
         let mut p = self.new_packet();
-        p.timestamp = Some(ts_ns as u64);
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "ts_ns is an absolute sim timestamp derived from the unsigned Time clock, never negative"
+        )]
+        let ts_u64 = ts_ns as u64;
+        p.timestamp = Some(ts_u64);
         p.track_event = Some(TrackEvent {
             r#type: Some(EventType::SliceBegin as i32),
             track_uuid: Some(track),
@@ -198,7 +207,12 @@ impl TraceWriter {
         flow_ids: &[u64],
     ) {
         let mut p = self.new_packet();
-        p.timestamp = Some(ts_ns as u64);
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "ts_ns is an absolute sim timestamp derived from the unsigned Time clock, never negative"
+        )]
+        let ts_u64 = ts_ns as u64;
+        p.timestamp = Some(ts_u64);
         p.track_event = Some(TrackEvent {
             r#type: Some(EventType::SliceBegin as i32),
             track_uuid: Some(track),
@@ -211,7 +225,12 @@ impl TraceWriter {
 
     pub fn end(&mut self, track: u64, ts_ns: i64) {
         let mut p = self.new_packet();
-        p.timestamp = Some(ts_ns as u64);
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "ts_ns is an absolute sim timestamp derived from the unsigned Time clock, never negative"
+        )]
+        let ts_u64 = ts_ns as u64;
+        p.timestamp = Some(ts_u64);
         p.track_event = Some(TrackEvent {
             r#type: Some(EventType::SliceEnd as i32),
             track_uuid: Some(track),
@@ -222,7 +241,12 @@ impl TraceWriter {
 
     pub fn instant(&mut self, track: u64, ts_ns: i64, name: &str, anns: &[Annotation]) {
         let mut p = self.new_packet();
-        p.timestamp = Some(ts_ns as u64);
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "ts_ns is an absolute sim timestamp derived from the unsigned Time clock, never negative"
+        )]
+        let ts_u64 = ts_ns as u64;
+        p.timestamp = Some(ts_u64);
         p.track_event = Some(TrackEvent {
             r#type: Some(EventType::Instant as i32),
             track_uuid: Some(track),

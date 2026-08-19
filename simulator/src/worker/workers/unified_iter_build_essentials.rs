@@ -59,6 +59,10 @@ pub(super) fn prepare_unified_iter_build_essentials<M: IterwiseUnifiedModel>(
 
     {
         let mut cluster = cluster.borrow_mut();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_partitions is a GPU/rank partition count, always small"
+        )]
         for partition in 0..num_partitions as u16 {
             cluster.register_kv_capacity(pool_tag, pool.0, id.0, partition, kv_capacity);
         }

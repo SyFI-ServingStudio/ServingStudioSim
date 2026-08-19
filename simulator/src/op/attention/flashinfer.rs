@@ -230,6 +230,10 @@ fn kv_cache_append_input(input: &FlashInferAttentionInput) -> Option<KvCacheAppe
         .iter()
         .map(|&(_, append_len)| append_len)
         .sum();
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "decode batch length is bounded by the request batch size, far below u32::MAX"
+    )]
     let num_tokens = prefill_tokens + input.decode_kv_lens.len() as u32;
     (num_tokens > 0).then_some(KvCacheAppendKernelInput { num_tokens })
 }
@@ -281,8 +285,13 @@ fn decode_input(decode_kv_lens: &[u32]) -> Option<FlashinferAttnDecodeKernelInpu
     if decode_kv_lens.is_empty() {
         return None;
     }
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "decode batch length is bounded by the request batch size, far below u32::MAX"
+    )]
+    let batch_size = decode_kv_lens.len() as u32;
     Some(FlashinferAttnDecodeKernelInput {
-        batch_size: decode_kv_lens.len() as u32,
+        batch_size,
         total_tokens: decode_kv_lens.iter().sum(),
     })
 }

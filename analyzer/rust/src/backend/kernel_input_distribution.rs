@@ -135,6 +135,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                             id
                         }
                         None => {
+                            #[allow(
+                                clippy::cast_possible_truncation,
+                                reason = "positions is the set of distinct manifest leaf names in \
+                                          one run, realistically far below u32::MAX"
+                            )]
                             let id = positions.len() as u32;
                             pos_id.insert(&leaf.name, id);
                             positions.push(Position {
@@ -171,6 +176,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     // Build one payload position + one report position per plottable location that
     // saw ≥1 sampled executed slot with an input. Positions are emitted in name
     // order for a stable payload; points within a position are already sorted.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "positions is the set of distinct manifest leaf names in one run, realistically \
+                  far below u32::MAX"
+    )]
     let mut order: Vec<u32> = (0..positions.len() as u32)
         .filter(|&id| plottable[id as usize] && !scan.points[id as usize].is_empty())
         .collect();
@@ -272,7 +282,17 @@ async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
         if b.num_rows() > 0 {
             let mx = value_f64(col(b, "mx")?, 0)?;
             if mx.is_finite() {
-                num_iters = mx as u64 + 1;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "mx is MAX(iter_id) from this run's own cost_log (a monotone \
+                              nonnegative iteration counter, COALESCEd to 0), realistically far \
+                              below u64::MAX; Rust's float-to-int cast also saturates rather than \
+                              wrapping"
+                )]
+                {
+                    num_iters = mx as u64 + 1;
+                }
             }
         }
     }
@@ -328,6 +348,13 @@ async fn accumulate(
         type CachedSlotLoc<'a> = ((&'a str, u16, &'a str), &'a Vec<u32>);
         let mut cached: Option<CachedSlotLoc> = None;
         for row in 0..batch.num_rows() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "worker_id is this run's own cost_log worker index (a small nonnegative \
+                          shard id well below u16::MAX by construction of the simulated cluster \
+                          topology); Rust's float-to-int cast also saturates rather than wrapping"
+            )]
             let (p, w, s) = (pool.value(row), value_f64(wid, row)? as u16, sec.value(row));
             let ids = match cached {
                 Some((k, ids)) if k == (p, w, s) => ids,
@@ -339,7 +366,17 @@ async fn accumulate(
                     None => continue, // a row whose worker/section has no manifest
                 },
             };
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "Arrow list offsets are always nonnegative by format invariant, and \
+                          usize is at least as wide as the i32 offset type on this target"
+            )]
             let (is, ie) = (in_off[row] as usize, in_off[row + 1] as usize);
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "Arrow list offsets are always nonnegative by format invariant, and \
+                          usize is at least as wide as the i32 offset type on this target"
+            )]
             let (bs, be) = (bk_off[row] as usize, bk_off[row + 1] as usize);
             // Slot-aligned lists must share length; a mismatch means this row logged
             // no inputs (input logging off) — skip it rather than mis-pair slots.
@@ -437,6 +474,11 @@ fn build_position(pos: &Position, points: &[Point]) -> (Value, Value, bool) {
             .cloned()
             .unwrap_or_else(|| format!("candidate_{i}"))
     };
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "c and total are per-position sampled-slot selection counts, bounded by the \
+                  sampled row count of one run and far below 2^53"
+    )]
     let selection_json: Vec<Value> = selection
         .iter()
         .map(|(&b, &c)| {
@@ -628,7 +670,13 @@ fn flatten_value(v: &Value, prefix: &str, out: &mut BTreeMap<String, f64>) {
             }
         }
         Value::Array(arr) => {
-            out.insert(format!("{prefix}.count"), arr.len() as f64);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "arr.len() is the length of one JSON array feature within a single \
+                          sampled kernel input, realistically tiny and far below 2^53"
+            )]
+            let count = arr.len() as f64;
+            out.insert(format!("{prefix}.count"), count);
             if arr.is_empty() {
                 return;
             }
@@ -666,6 +714,11 @@ fn flatten_value(v: &Value, prefix: &str, out: &mut BTreeMap<String, f64>) {
 
 /// Emit `sum`/`mean`/`min`/`max` of `nums` under `prefix` (the caller owns
 /// `.count`). Skips an empty series (no aggregate is defined).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "nums.len() is the length of one JSON array feature within a single sampled kernel \
+              input, realistically tiny and far below 2^53"
+)]
 fn insert_aggregates(out: &mut BTreeMap<String, f64>, prefix: &str, nums: &[f64]) {
     if nums.is_empty() {
         return;

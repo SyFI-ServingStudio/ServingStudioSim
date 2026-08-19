@@ -128,6 +128,10 @@ pub fn simulate_once(
     clippy::too_many_arguments,
     reason = "each arg is a distinct per-token routing/cost input; bundling would just move the same fan-out into a struct"
 )]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "modulo results bounded by residing_count/window_size and NVL domain_size, both rank counts far below u16::MAX"
+)]
 fn price_token(
     token_index: u64,
     hit_rank: &[bool],
@@ -281,6 +285,10 @@ pub fn simulate_moe_comm(
                 ^ u64::from(t).wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 ^ u64::from(trial).wrapping_mul(0xD1B5_4A32_D192_ED03);
             let steps = simulate_once(ppm, top_k, params, placement, t, s);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "bottleneck_bytes is a per-step byte count accumulated for an average; realistic simulated traffic stays far below 2^53"
+            )]
             for (i, a) in acc.iter_mut().enumerate() {
                 *a += steps[i].bottleneck_bytes() as f64;
             }

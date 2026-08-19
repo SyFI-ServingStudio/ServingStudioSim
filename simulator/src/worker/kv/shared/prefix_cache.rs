@@ -239,9 +239,14 @@ impl PrefixCache {
     /// quantized lengths. At quantum one this is the plain `min`.
     pub(crate) fn peek(&self, session_id: u32, requested_tokens: u32) -> u32 {
         self.entries.get(&session_id).map_or(0, |entry| {
-            entry
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "result is min()'d against u64::from(requested_tokens), a u32, so it cannot exceed u32::MAX"
+            )]
+            let hit = entry
                 .tokens
-                .min(self.floor_to_quantum(u64::from(requested_tokens))) as u32
+                .min(self.floor_to_quantum(u64::from(requested_tokens))) as u32;
+            hit
         })
     }
 

@@ -182,6 +182,10 @@ impl NativeMoeExpertComputeLocalWorklet {
             .iter()
             .map(|&x| u64::from(x))
             .sum();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "local_ppm sums a per-million routing share of global_expert_selections (a u32), so the routed subset cannot exceed u32::MAX"
+        )]
         let local_routed_tokens =
             (u64::from(global_expert_selections) * local_ppm_sum).div_ceil(1_000_000) as u32;
         self.act.eval(

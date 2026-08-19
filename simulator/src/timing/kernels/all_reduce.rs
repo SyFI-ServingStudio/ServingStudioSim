@@ -80,10 +80,16 @@ impl KernelSpec for AllReduceSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|message_size| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "message_size comes from the pow2(12, 30) byte-ladder axis: a small, non-negative, pre-curated power of two far below u64::MAX"
+            )]
+            let message_size_bytes = message_size as u64;
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("num_gpus", config.num_gpus)
-                .with("message_size_bytes", message_size as u64)
+                .with("message_size_bytes", message_size_bytes)
                 // Fixed profiling dtype: comm is size-keyed (see module doc), the
                 // curve is measured once at bf16 for every logical payload dtype.
                 .with("dtype", DType::Bf16.as_str())

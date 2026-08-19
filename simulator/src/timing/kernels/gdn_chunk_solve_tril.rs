@@ -89,7 +89,13 @@ fn feasible_token_bounds(max_chunk_tokens: u32, num_chunks: u64) -> (u64, u64) {
 
 fn normalized_position(num_tokens: u64, minimum: u64, maximum: u64) -> f64 {
     if minimum < maximum {
-        (num_tokens as f64 - minimum as f64) / (maximum - minimum) as f64
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "token/chunk counts here are cache-sweep coordinates, far below f64's 2^53 exact-integer bound"
+        )]
+        {
+            (num_tokens as f64 - minimum as f64) / (maximum - minimum) as f64
+        }
     } else if minimum == maximum {
         match num_tokens.cmp(&minimum) {
             std::cmp::Ordering::Less => -1.0,
@@ -152,6 +158,10 @@ impl KernelSpec for GdnChunkSolveTrilSpec {
         let num_chunks = u64::from(input.num_chunks);
         let num_tokens = u64::from(input.num_tokens);
         let (minimum, maximum) = feasible_token_bounds(max_chunk_tokens, num_chunks);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "num_chunks is a GDN chunk count, far below f64's 2^53 exact-integer bound"
+        )]
         Coords::new([
             num_chunks as f64,
             normalized_position(num_tokens, minimum, maximum),
@@ -165,6 +175,11 @@ impl KernelSpec for GdnChunkSolveTrilSpec {
     ) -> Vec<ArgsPayload> {
         let max_chunk_tokens = checked_max_chunk_tokens(config);
         grid.expand_2d(|num_chunks, position| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "rounded sweep-grid chunk coordinate is a non-negative small chunk count, well within u64"
+            )]
             let num_chunks = num_chunks.round() as u64;
             let (minimum, maximum) = feasible_token_bounds(max_chunk_tokens, num_chunks);
             let num_tokens = physical_tokens_at_position(minimum, maximum, position);

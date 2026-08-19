@@ -50,10 +50,16 @@ impl KernelSpec for BatchedGemmSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|m| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "m comes from the profiling grid's token axis: a small, non-negative, pre-curated point far below u32::MAX"
+            )]
+            let m_u32 = m as u32;
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("num_batches", config.num_batches.get())
-                .with("m", m as u32)
+                .with("m", m_u32)
                 .with("n", config.n.get())
                 .with("k", config.k.get())
                 .with("dtype", config.dtype.as_str())

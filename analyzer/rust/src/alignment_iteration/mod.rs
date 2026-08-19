@@ -399,6 +399,10 @@ struct SimCase {
     slot_ms: Vec<f64>,
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "casts here are kernel/iteration counts and ns durations from one profiling run, far under f64's 2^53 exact-integer range"
+)]
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read_kernel_align(log_dir)?;
     let measured: ParsedTrace = read_json(&input.parsed_nsys)?;
@@ -1041,6 +1045,10 @@ fn kernel_name_index(measured: &ParsedTrace) -> Result<BTreeMap<u64, &str>> {
 /// raw interval. It deliberately stops before any comparison — `run` turns these
 /// rows into operation totals, `timeline` turns the same rows into slices, and
 /// neither can drift from the other about what the GPU did.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "casts here are ns interval-union durations from one profiling run, far under f64's 2^53 exact-integer range"
+)]
 fn measure_iteration(
     measured_iter: &MeasuredIteration,
     inventory: &CompiledInventory,
@@ -1396,10 +1404,23 @@ async fn load_sim_cases(
         let totals = col(batch, "total_time_ms")?;
         let slots = col(batch, "slot_time_ms")?;
         for row in 0..batch.num_rows() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "iter_id is a non-negative integer index written by our own timing-predict pipeline, stored as f64 by Arrow/Parquet but never fractional or negative"
+            )]
             let case_index = value_f64(ids, row)? as u64;
             let total_ms = value_f64(totals, row)?;
             let slot_ms = value_f32_list(slots, row)?;
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "slot_time_ms is a millisecond duration from our own predict pipeline; converted to ns it stays far under i64::MAX for any realistic run"
+            )]
             let slot_ns: Vec<i64> = slot_ms.iter().map(|v| (v * 1e6).round() as i64).collect();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "node_time returns a summed ns duration bounded by run length, safely within f64's 2^53 exact-integer range"
+            )]
             let reconstructed_ms = node_time(manifest, 0, &slot_ns) as f64 / 1e6;
             ensure!(
                 (reconstructed_ms - total_ms).abs() <= (total_ms.abs() * 1e-3).max(1e-6),
@@ -2216,7 +2237,12 @@ fn measured_gpu_cycles_ms(iterations: &[MeasuredIteration]) -> Result<BTreeMap<u
             next_start_ns > start_ns,
             "measured iterations {iteration_id} and {next_iteration_id} have non-increasing first-kernel timestamps"
         );
-        cycles.insert(iteration_id, (next_start_ns - start_ns) as f64 / 1e6);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "difference of two first-kernel timestamps within one profiling run, an ns duration far under f64's 2^53 exact-integer range"
+        )]
+        let cycle_ms = (next_start_ns - start_ns) as f64 / 1e6;
+        cycles.insert(iteration_id, cycle_ms);
     }
     Ok(cycles)
 }
@@ -2272,13 +2298,22 @@ fn concurrent_hidden_ms_by_device(track_intervals: &TrackIntervals) -> BTreeMap<
             .sum();
         let combined: Vec<(u64, u64)> = tracks.values().flatten().copied().collect();
         let overlap = per_track.saturating_sub(interval_union_ns(&combined));
-        hidden.insert(*device_id, overlap as f64 / 1e6);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "overlap is an ns duration within one profiling run, far under f64's 2^53 exact-integer range"
+        )]
+        let overlap_ms = overlap as f64 / 1e6;
+        hidden.insert(*device_id, overlap_ms);
     }
     hidden
 }
 
 /// Each track's own busy time, reported per device so a reader can see which
 /// track the hidden time came from rather than only that some of it was hidden.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "busy_union_ms is an ns duration within one profiling run, far under f64's 2^53 exact-integer range"
+)]
 fn track_busy_ms(track_intervals: &TrackIntervals) -> Vec<serde_json::Value> {
     let mut rows = Vec::new();
     for (device_id, tracks) in track_intervals {
@@ -2348,8 +2383,12 @@ fn launches_hidden_ms(launches: &[KernelLaunch], track_intervals: &TrackInterval
             .range(..track_index)
             .flat_map(|(_, values)| values.iter().copied())
             .collect();
-        *per_device.entry(device_id).or_default() +=
-            interval_overlap_ns(&intervals, &earlier) as f64 / 1e6;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "interval_overlap_ns returns an ns duration within one profiling run, far under f64's 2^53 exact-integer range"
+        )]
+        let overlap_ms = interval_overlap_ns(&intervals, &earlier) as f64 / 1e6;
+        *per_device.entry(device_id).or_default() += overlap_ms;
     }
     per_device.values().copied().fold(0.0f64, f64::max)
 }
@@ -2397,6 +2436,10 @@ fn fraction(part: f64, total: f64) -> Option<f64> {
     (total.is_finite() && total > 0.0).then_some(part / total)
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "sorted.len() is a sample count from one profiling run, far under f64's 2^53 exact-integer range"
+)]
 fn signed_stats(samples: &[f64]) -> Value {
     let mut sorted: Vec<_> = samples.iter().copied().filter(|v| v.is_finite()).collect();
     sorted.sort_by(f64::total_cmp);

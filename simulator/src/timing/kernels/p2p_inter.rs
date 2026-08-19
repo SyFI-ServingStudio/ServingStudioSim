@@ -64,9 +64,17 @@ impl KernelSpec for P2pInterSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|message_size| {
+            // Axis::pow2(10, 28) values are non-negative integers, max 2^28,
+            // far below u64::MAX.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "sweep axis values are non-negative integers far below u64::MAX"
+            )]
+            let message_size = message_size as u64;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("message_size_bytes", message_size as u64)
+                .with("message_size_bytes", message_size)
                 // Fixed profiling dtype: comm is size-keyed (see module doc), the
                 // curve is measured once at bf16 for every logical payload dtype.
                 .with("dtype", DType::Bf16.as_str())

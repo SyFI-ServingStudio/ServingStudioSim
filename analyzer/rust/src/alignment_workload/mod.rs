@@ -298,6 +298,10 @@ fn read_measured_points(
         );
         let scheduled_kv_tokens =
             scheduled_kv_tokens(&record.decode_kv_lens, &record.prefill_chunk_pairs);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "ns offset within one alignment run, far below 2^53 ns (~104 days)"
+        )]
         points.push(WorkloadPoint {
             iteration_id: record.iteration_index,
             time_ms: start_ns.saturating_sub(origin_ns) as f64 / 1e6,
@@ -488,13 +492,18 @@ fn fold_by_wall_clock(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasu
         let Some(index) = best else {
             // Inside the reference's span, so not a ragged end: the peer landed
             // in a gap BETWEEN two reference steps, which is a real desync.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "ns span within one alignment run, far below 2^53 ns"
+            )]
+            let span_s = (span_end - span_start) as f64 / 1e9;
             bail!(
                 "full-run metrics rank {:?} iteration {} falls between steps of reference rank \
                  {} (inside its {:.3} s span); the data-parallel ranks are not stepping together",
                 peer.dp_rank,
                 peer.iteration_index,
                 reference_rank,
-                (span_end - span_start) as f64 / 1e9,
+                span_s,
             );
         };
         merge_rank_record(&mut steps[index], peer)?;
@@ -551,6 +560,10 @@ fn read_measured_points_from_nsys(path: &Path) -> Result<Vec<WorkloadPoint>> {
     let Some(origin_ns) = raw.first().map(|row| row.0) else {
         return Ok(Vec::new());
     };
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "ns offset within one alignment run, far below 2^53 ns (~104 days)"
+    )]
     let mut points: Vec<WorkloadPoint> = raw
         .into_iter()
         .map(
@@ -590,8 +603,32 @@ async fn read_simulated_points(ctx: &SessionContext) -> Result<Vec<WorkloadPoint
         let groups = col(batch, "groups")?;
         for row in 0..batch.num_rows() {
             let pool_tag = value_string(pool_tags, row)?;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "worker_id, iter_id, and batch_id come from this run's own cost_log \
+                          (simulator-generated, not external input); all are small nonnegative \
+                          counters by construction and Rust's float-to-int cast saturates rather \
+                          than wrapping"
+            )]
             let worker_id = value_f64(worker_ids, row)? as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "worker_id, iter_id, and batch_id come from this run's own cost_log \
+                          (simulator-generated, not external input); all are small nonnegative \
+                          counters by construction and Rust's float-to-int cast saturates rather \
+                          than wrapping"
+            )]
             let iteration_id = value_f64(iteration_ids, row)? as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "worker_id, iter_id, and batch_id come from this run's own cost_log \
+                          (simulator-generated, not external input); all are small nonnegative \
+                          counters by construction and Rust's float-to-int cast saturates rather \
+                          than wrapping"
+            )]
             let batch_id = value_f64(batch_ids, row)? as u64;
             streams.insert((pool_tag.clone(), worker_id));
             ensure!(
@@ -677,6 +714,11 @@ where
     })
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "select() reads a per-iteration token/batch-size count off a WorkloadPoint, \
+              realistically far below 2^53"
+)]
 fn paired_stats<F>(measured: &[WorkloadPoint], simulated: &[WorkloadPoint], select: F) -> Value
 where
     F: Fn(&WorkloadPoint) -> u64,
