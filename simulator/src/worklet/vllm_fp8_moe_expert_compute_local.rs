@@ -1,6 +1,6 @@
-//! vLLM-aligned local (non-EP) MoE expert compute, mirroring the four launches
-//! nsys observes per MoE layer: per-token-group FP8 quant, Triton
-//! `fused_moe_kernel` gate/up, SwiGLU, quant, Triton `fused_moe_kernel` down.
+//! vLLM-aligned local (non-EP) `MoE` expert compute, mirroring the four launches
+//! nsys observes per `MoE` layer: per-token-group FP8 quant, Triton
+//! `fused_moe_kernel` gate/up, `SwiGLU`, quant, Triton `fused_moe_kernel` down.
 //!
 //! "vLLM-aligned" here means the *local* path specifically. vLLM has a second
 //! expert-compute realization -- TRT-LLM blockscale grouped GEMM over
@@ -45,6 +45,7 @@ pub struct VllmFp8MoeExpertComputeLocalWorkletConfig {
 }
 
 impl VllmFp8MoeExpertComputeLocalWorkletConfig {
+    #[must_use]
     pub fn split_for_ep(mut template: Self, global_ppm: &[u32]) -> Vec<Self> {
         let ep_size = usize::from(template.ep_size);
         assert!(ep_size > 0, "ep_size must be non-zero");
@@ -87,6 +88,7 @@ pub struct VllmFp8MoeExpertComputeLocalWorklet {
 }
 
 impl VllmFp8MoeExpertComputeLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &VllmFp8MoeExpertComputeLocalWorkletConfig,
     ) -> VllmFp8MoeExpertComputeLocalWorkletResolved {

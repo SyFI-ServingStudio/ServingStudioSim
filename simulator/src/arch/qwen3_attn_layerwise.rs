@@ -1,8 +1,8 @@
-//! `qwen3_attn_layerwise` — L4 attn-side model_arch for AFD (attention-FFN
+//! `qwen3_attn_layerwise` — L4 attn-side `model_arch` for AFD (attention-FFN
 //! disaggregation) of a Qwen3-MoE decoder. This is the attn pool's half of the
 //! `qwen3_moe_dp_attn_ep_ffn` split: it owns ONLY the per-layer attention
 //! kernel(s) — the moesim-faithful cut (`ref/moesim-rs`). Everything else
-//! (input_norm / qkv / o_proj / tp_allreduce / router / MoE / embed / lm_head)
+//! (`input_norm` / qkv / `o_proj` / `tp_allreduce` / router / `MoE` / embed / `lm_head`)
 //! lives on the ffn side (`qwen3_ffn_moe_layerwise`).
 //!
 //! **One model instance = one DP shard.** A DP shard is `attn_tp_size` head-
@@ -119,6 +119,7 @@ pub struct Qwen3AttnLayerwiseModel {
     attn_n_slots: usize,
 }
 
+#[must_use]
 pub fn build_configs(
     model: &MoeModelCfg,
     parallel: &Qwen3AttnParallel,
@@ -147,6 +148,7 @@ pub fn build_configs(
     }
 }
 
+#[must_use]
 pub fn resolve_configs(cfgs: &Qwen3AttnLayerwiseConfigs) -> Qwen3AttnLayerwiseResolved {
     Qwen3AttnLayerwiseResolved {
         attn: cfgs.attn.clone(),
@@ -260,14 +262,14 @@ impl AttnLayerwiseModel for Qwen3AttnLayerwiseModel {
     }
 
     fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token.get() as u64
+        u64::from(self.total_kv_bytes_per_token.get())
     }
 
     fn attn_to_ffn_bytes_per_token(&self) -> u64 {
-        self.attn_to_ffn_bytes_per_token.get() as u64
+        u64::from(self.attn_to_ffn_bytes_per_token.get())
     }
 
-    /// One `attn` section — this shard's per-layer attention CostTree. Recompiled
+    /// One `attn` section — this shard's per-layer attention `CostTree`. Recompiled
     /// once here (only at logger open), not on the per-layer cost path.
     fn cost_log_manifest(&self) -> CostManifestDoc {
         CostManifestDoc::single("attn", self.attn_cost_tree().manifest())

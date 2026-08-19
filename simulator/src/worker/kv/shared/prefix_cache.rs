@@ -93,11 +93,10 @@ impl PrefixCacheConfig {
                 max_retained_bytes,
             } => {
                 let max_retained_tokens = max_retained_bytes
-                    .map(|bytes| {
+                    .map_or(total_capacity_tokens, |bytes| {
                         bytes.saturating_mul(u64::from(num_attn_shards.max(1)))
                             / total_kv_bytes_per_token.max(1)
                     })
-                    .unwrap_or(total_capacity_tokens)
                     .min(total_capacity_tokens);
                 PrefixCacheTokenConfig {
                     max_retained_tokens,
@@ -239,14 +238,11 @@ impl PrefixCache {
     /// shares with the retained entry, so the hit is the smaller of the two
     /// quantized lengths. At quantum one this is the plain `min`.
     pub(crate) fn peek(&self, session_id: u32, requested_tokens: u32) -> u32 {
-        self.entries
-            .get(&session_id)
-            .map(|entry| {
-                entry
-                    .tokens
-                    .min(self.floor_to_quantum(u64::from(requested_tokens))) as u32
-            })
-            .unwrap_or(0)
+        self.entries.get(&session_id).map_or(0, |entry| {
+            entry
+                .tokens
+                .min(self.floor_to_quantum(u64::from(requested_tokens))) as u32
+        })
     }
 
     /// Move one retained session into an active request.
@@ -258,7 +254,7 @@ impl PrefixCache {
         let cache_used_before = self.used_tokens;
         let hit_tokens = self.peek(session_id, requested_tokens);
         let removed_entry = self.remove(session_id);
-        let entry_tokens = removed_entry.map(|entry| entry.tokens).unwrap_or(0);
+        let entry_tokens = removed_entry.map_or(0, |entry| entry.tokens);
         let return_metadata = removed_entry.map(|entry| PrefixCacheReturnMetadata {
             insertion_sequence: entry.insertion_sequence,
             frequency: entry.frequency.saturating_add(1),
@@ -313,10 +309,8 @@ impl PrefixCache {
             }
         }
         let sequence = self.take_sequence();
-        let insertion_sequence = return_metadata
-            .map(|value| value.insertion_sequence)
-            .unwrap_or(sequence);
-        let frequency = return_metadata.map(|value| value.frequency).unwrap_or(0);
+        let insertion_sequence = return_metadata.map_or(sequence, |value| value.insertion_sequence);
+        let frequency = return_metadata.map_or(0, |value| value.frequency);
         let cache_used_before = self.used_tokens;
         self.entries.insert(
             session_id,

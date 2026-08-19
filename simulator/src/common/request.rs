@@ -212,6 +212,7 @@ impl<Definition: RequestDefinition> Default for RequestStore<Definition> {
 }
 
 impl<Definition: RequestDefinition> RequestStore<Definition> {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -256,10 +257,12 @@ impl<Definition: RequestDefinition> RequestStore<Definition> {
         self.records.get_mut(id.0 as usize).and_then(Option::as_mut)
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.arrived_ids.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.arrived_ids.is_empty()
     }
@@ -290,6 +293,7 @@ impl<Definition: RequestDefinition> RequestStore<Definition> {
         }
     }
 
+    #[must_use]
     pub fn num_admitted(&self) -> u64 {
         self.admitted_ids.len() as u64
     }
@@ -304,11 +308,13 @@ impl<Definition: RequestDefinition> RequestStore<Definition> {
         })
     }
 
+    #[must_use]
     pub fn all_complete(&self) -> bool {
         self.iter_arrived()
             .all(|(_, record)| record.lifecycle.completed)
     }
 
+    #[must_use]
     pub fn in_flight(&self) -> usize {
         self.iter_arrived()
             .filter(|(_, record)| !record.lifecycle.completed)

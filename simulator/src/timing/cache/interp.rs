@@ -17,7 +17,7 @@ use crate::timing::bridge::KernelMetrics;
 pub(crate) const MONOTONICITY_TOLERANCE: f32 = 0.10;
 
 /// One profiled point's metrics in f32. The 1D cache stores a `Vec<Metrics4>`;
-/// the 2D cache a dense `Vec<Metrics4>` grid. Also the CostTree eval path's
+/// the 2D cache a dense `Vec<Metrics4>` grid. Also the `CostTree` eval path's
 /// per-leaf / per-subtree unit (the `buf[slot]` values
 /// [`CostTree::aggregate`](crate::timing::CostTree) rolls up).
 ///
@@ -42,6 +42,7 @@ impl Metrics4 {
     };
 
     /// Narrow a profiled `KernelMetrics` (f64 / u64) into the f32 cache form.
+    #[must_use]
     pub fn from_sample(sample: &KernelMetrics) -> Self {
         Metrics4 {
             time_ms: sample.time_ms as f32,
@@ -53,6 +54,7 @@ impl Metrics4 {
 
     /// Field-wise linear blend `self*(1-t) + other*t`. `t` outside `[0, 1]`
     /// extrapolates (the 1D two-point path).
+    #[must_use]
     pub fn lerp(self, other: Metrics4, t: f32) -> Metrics4 {
         Metrics4 {
             time_ms: self.time_ms + (other.time_ms - self.time_ms) * t,
@@ -80,6 +82,7 @@ impl Metrics4 {
     /// Field-wise `max(0)` copy. `Cache::eval` uses this before returning
     /// [`LeafMetrics`], so extrapolated metrics cannot go negative on the hot
     /// path.
+    #[must_use]
     pub fn clamped(self) -> Metrics4 {
         Metrics4 {
             time_ms: self.time_ms.max(0.0),
@@ -91,7 +94,7 @@ impl Metrics4 {
 }
 
 /// The per-leaf coverage signal, packed into a `u8` — one bit per coverage
-/// concern. The CostTree eval path's allocation-free coverage carrier: it keeps
+/// concern. The `CostTree` eval path's allocation-free coverage carrier: it keeps
 /// the analytically useful *kind* (did this leaf extrapolate off-grid? was it a
 /// JIT/no-coverage placeholder?) as a bitset. `aggregate` ORs these up the tree,
 /// so a warning anywhere in a subtree surfaces at its root.
@@ -104,15 +107,18 @@ impl CoverageFlags {
     pub const JIT: Self = Self(1 << 1);
     pub const NO_COVERAGE: Self = Self(1 << 2);
 
+    #[must_use]
     pub fn is_empty(self) -> bool {
         self.0 == 0
     }
 
+    #[must_use]
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
     /// Raw bits, for logging the per-slot coverage as a `u8` column.
+    #[must_use]
     pub fn bits(self) -> u8 {
         self.0
     }
@@ -134,7 +140,7 @@ impl std::ops::BitOrAssign for CoverageFlags {
 /// One cost *query* result: the numeric [`Metrics4`] plus the leaf's
 /// [`CoverageFlags`] and the position-local backend that best-of-N selected.
 /// Distinct from the bare `Metrics4` stored/blended inside caches (kept lean for
-/// cache-line density) — this is what `eval`, the CostTree eval buffer, and
+/// cache-line density) — this is what `eval`, the `CostTree` eval buffer, and
 /// `aggregate` carry, so coverage and the chosen backend ride alongside the
 /// numbers without bloating the profiled arrays.
 ///

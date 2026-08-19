@@ -50,7 +50,10 @@ impl Cache for Cache3DLinear {
                 for &k in &orders[2] {
                     let original = (i * dims[1] + j) * dims[2] + k;
                     let sample = &samples[original];
-                    if !sample.is_finite() {
+                    if sample.is_finite() {
+                        cells.push(Metrics4::from_sample(sample));
+                        valid.push(true);
+                    } else {
                         warnings.push(OutlierWarning {
                             kind: OutlierKind::NonFinite,
                             detail: format!(
@@ -60,9 +63,6 @@ impl Cache for Cache3DLinear {
                         });
                         cells.push(Metrics4::ZERO);
                         valid.push(false);
-                    } else {
-                        cells.push(Metrics4::from_sample(sample));
-                        valid.push(true);
                     }
                 }
             }
@@ -190,8 +190,7 @@ impl Cache3DLinear {
                 (self.cells[index], distance)
             })
             .min_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
-            .map(|(cell, _)| cell)
-            .unwrap_or(Metrics4::ZERO);
+            .map_or(Metrics4::ZERO, |(cell, _)| cell);
         (nearest, true)
     }
 }

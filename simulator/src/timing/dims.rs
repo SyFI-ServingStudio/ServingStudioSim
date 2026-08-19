@@ -66,11 +66,13 @@ enum DimOp {
 
 impl Dim {
     /// A named model-config input — the root of a provenance chain.
+    #[must_use]
     pub fn param(name: &'static str, value: u32) -> Dim {
         Dim(Arc::new(DimNode::Param { name, value }))
     }
 
     /// An anonymous literal (config knob or deserialized value).
+    #[must_use]
     pub fn lit(value: u32) -> Dim {
         Dim(Arc::new(DimNode::Const(value)))
     }
@@ -85,6 +87,7 @@ impl From<u32> for Dim {
 impl Dim {
     /// The folded value. O(1): every node memoizes it. THIS is the collapse to a
     /// raw integer — only call it at an external boundary (see module docs).
+    #[must_use]
     pub fn get(&self) -> u32 {
         match &*self.0 {
             DimNode::Param { value, .. } | DimNode::Const(value) => *value,
@@ -94,6 +97,7 @@ impl Dim {
 
     /// The set of model-config input names this dim was derived from — the
     /// "which model dims feed this shape" query.
+    #[must_use]
     pub fn params(&self) -> BTreeSet<&'static str> {
         let mut set = BTreeSet::new();
         self.collect_params(&mut set);
@@ -118,6 +122,7 @@ impl Dim {
     /// to its concrete parts (`{num_qo_heads: 64, attn_tp: 4}`). Powers a UI that
     /// toggles a leaf between its expression and its value. `Const` numbers carry
     /// no name and are not listed (they already read literally in the formula).
+    #[must_use]
     pub fn bindings(&self) -> BTreeMap<&'static str, u32> {
         let mut map = BTreeMap::new();
         self.collect_bindings(&mut map);

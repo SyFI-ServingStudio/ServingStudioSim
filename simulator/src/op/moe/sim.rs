@@ -1,11 +1,11 @@
 //! `op/moe/sim` — the unified "simulate-as-model" core: one per-token routing +
-//! placement realization that prices ALL SIX MoE network stages' per-GPU bytes,
+//! placement realization that prices ALL SIX `MoE` network stages' per-GPU bytes,
 //! sampling each stage's realized bottleneck on a token-count grid into a
 //! [`BottleneckCurve`].
 //!
 //! ## Why one simulator for all six stages
 //!
-//! The pre-unify design split MoE comm two ways: dispatch used an analytic
+//! The pre-unify design split `MoE` comm two ways: dispatch used an analytic
 //! per-rank hit probability `q` (exact, since dispatch bytes are per-rank
 //! independent and linear in `T`), while combine's reduce stages needed a
 //! token-level sim (the reduce volume is non-linear in a token's hit *set*:
@@ -27,15 +27,15 @@
 //! (balanced-EP default: home = `token_idx % ep_size`). For a token homed on rank
 //! `home` (in domain `home_dom`) hitting rank set `H`:
 //!
-//! * **dispatch_inter** (NIC): for each remote hit domain `d`, `home` sends one
+//! * **`dispatch_inter`** (NIC): for each remote hit domain `d`, `home` sends one
 //!   copy to the rail-aligned ingress `gateway(d) = rail_peer(home, d)`.
-//! * **dispatch_intra** (NVLink): inside each hit domain, the gateway fans the
+//! * **`dispatch_intra`** (NVLink): inside each hit domain, the gateway fans the
 //!   token to every hit rank `≠ gateway` (in `home_dom` the gateway is `home`).
-//! * **combine_intra_reduce** (NVLink): the mirror — each hit rank `≠ gateway`
+//! * **`combine_intra_reduce`** (NVLink): the mirror — each hit rank `≠ gateway`
 //!   reduces its partial to the domain gateway.
-//! * **combine_inter_reduce** (NIC): each remote domain's gateway reduces back to
+//! * **`combine_inter_reduce`** (NIC): each remote domain's gateway reduces back to
 //!   `home`.
-//! * **combine_inter_bcast / combine_intra_fanout**: identically zero under a
+//! * **`combine_inter_bcast` / `combine_intra_fanout`**: identically zero under a
 //!   single-home placement (they deliver a *replicated* output to many target
 //!   ranks; round-robin homes have exactly one sink). Kept as stages so the op
 //!   taxonomy and leaf count stay stable for a future replicated placement.
@@ -51,7 +51,7 @@
 use super::{BottleneckCurve, MoeNetParams, MoeStep, NvlLayout, P2pTier, Placement};
 use crate::timing::routing::{for_each_routed_token, RoutingRng};
 
-/// The six MoE network stages in critical-path order, paired with their fabric
+/// The six `MoE` network stages in critical-path order, paired with their fabric
 /// tier. Index layout: `0,1` dispatch (read by [`MoeDispatchOp`]); `2..6` combine
 /// (read by [`MoeCombineOp`]).
 const STAGES: [(&str, P2pTier); 6] = [
@@ -67,6 +67,7 @@ const STAGES: [(&str, P2pTier); 6] = [
 /// `send`/`recv` bytes of all six stages. Deterministic for a fixed `seed`
 /// (splitmix64 + fixed iteration order). `ppm` is the global per-expert
 /// popularity (same layout as [`crate::timing::routing::RoutingDistribution`]).
+#[must_use]
 pub fn simulate_once(
     ppm: &[u32],
     top_k: u32,
@@ -259,6 +260,7 @@ fn price_token(
 /// captures its `T`-dependence: under near-symmetric routing the realized busiest
 /// GPU sits `~√(ep/T)` above the mean-field per-GPU load, a margin a single
 /// coefficient × `T` cannot express.
+#[must_use]
 pub fn simulate_moe_comm(
     ppm: &[u32],
     top_k: u32,

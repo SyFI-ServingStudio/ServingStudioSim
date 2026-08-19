@@ -1,7 +1,7 @@
-//! Qwen3.6 TP1/EP1 local MoE router and token-alignment section.
+//! Qwen3.6 TP1/EP1 local `MoE` router and token-alignment section.
 //!
 //! The preceding attention worklet owns the post-attention residual-add +
-//! RMSNorm boundary, so this section consumes normalized hidden states and has
+//! `RMSNorm` boundary, so this section consumes normalized hidden states and has
 //! no norm leaf. It ends after local token alignment, before expert compute.
 //! There are no dispatch, combine, TP, EP, collective, or network children.
 
@@ -60,6 +60,7 @@ pub struct Qwen36MoeRouterLocalWorklet {
 }
 
 impl Qwen36MoeRouterLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &Qwen36MoeRouterLocalWorkletConfig,
     ) -> Qwen36MoeRouterLocalWorkletResolved {

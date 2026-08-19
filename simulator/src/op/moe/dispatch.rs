@@ -1,4 +1,4 @@
-//! `MoeDispatchOp` — compound L2 op (L2 design §3) for MoE token dispatch. One
+//! `MoeDispatchOp` — compound L2 op (L2 design §3) for `MoE` token dispatch. One
 //! dispatch call prices the two dispatch network stages (`dispatch_inter`,
 //! `dispatch_intra`) against the `p2p_inter` / `p2p_intra` L1 kernels.
 //!
@@ -57,7 +57,7 @@ impl MoeDispatchOp {
         })
     }
 
-    /// CostTree compile: two fixed leaves — `inter` (stage `dispatch_inter`) then
+    /// `CostTree` compile: two fixed leaves — `inter` (stage `dispatch_inter`) then
     /// `intra` (stage `dispatch_intra`) — matching the eval push order.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Sum(vec![
@@ -74,7 +74,7 @@ impl MoeDispatchOp {
         ])
     }
 
-    /// CostTree eval: interpolate each dispatch stage's bottleneck curve at the
+    /// `CostTree` eval: interpolate each dispatch stage's bottleneck curve at the
     /// token count and look it up on the stage's tier kernel.
     pub fn eval(&self, input: &MoeNetInput, ev: &mut Evaluator) {
         for curve in &self.dispatch {

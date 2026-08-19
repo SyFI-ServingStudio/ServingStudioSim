@@ -1,4 +1,4 @@
-//! Qwen MoE token-to-expert block-alignment kernel.
+//! Qwen `MoE` token-to-expert block-alignment kernel.
 //!
 //! Routed-token count is the sole runtime interpolation axis. At the fixed
 //! E256 specialization the first launch has two blocks of fixed work, while

@@ -8,10 +8,10 @@
 //! `enumerate` `dtype` field is a fixed profiling artifact, kept only to stay
 //! aligned with the Python `P2pIntraArgs` wire schema).
 //!
-//! This is the intra-NVL-domain leg of the MoE network model (ref's
+//! This is the intra-NVL-domain leg of the `MoE` network model (ref's
 //! `get_p2p_metrics_batch` curve in `common_timing.rs`). A single send/recv
-//! between two ranks sharing an NVLink domain, measured as time vs message
-//! size. The MoE dispatch/combine L2 ops (`op/moe`) compute each network
+//! between two ranks sharing an `NVLink` domain, measured as time vs message
+//! size. The `MoE` dispatch/combine L2 ops (`op/moe`) compute each network
 //! stage's per-rank `max(send, recv)` byte load and look this curve up per
 //! stage (`P2pTier::IntraDomain`).
 //!
@@ -42,7 +42,7 @@ pub struct P2pIntraKernelConfig {
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
 pub struct P2pIntraKernelInput {
-    /// Bytes moved over the single src→dst link in this transfer. The MoE net
+    /// Bytes moved over the single src→dst link in this transfer. The `MoE` net
     /// model passes the bottleneck rank's `max(send_bytes, recv_bytes)` for a
     /// stage.
     pub message_size_bytes: u64,

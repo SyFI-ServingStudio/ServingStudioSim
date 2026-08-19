@@ -27,7 +27,7 @@ impl<M: FfnLayerwiseModel> FfnTaskExecution for FfnSectionExecutionAdapter<M> {
     }
 
     fn build_task_input(&self, tokens: u64, output: &mut Self::Input) {
-        let num_groups = self.model.num_dp_groups().max(1) as u64;
+        let num_groups = u64::from(self.model.num_dp_groups().max(1));
         let base = (tokens / num_groups) as u32;
         let remainder = tokens % num_groups;
         output.tokens_per_group.clear();
@@ -46,7 +46,7 @@ impl<M: FfnLayerwiseModel> FfnTaskExecution for FfnSectionExecutionAdapter<M> {
     ) -> Time {
         let model = Arc::clone(&self.model);
         let last_layer = model.num_layers().saturating_sub(1) as usize;
-        let batch_id = slot as u64;
+        let batch_id = u64::from(slot);
         let groups = &input.tokens_per_group;
         let cache_key = input.tokens_per_group.as_slice();
         let mut total = Time::ZERO;

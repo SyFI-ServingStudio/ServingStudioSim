@@ -104,7 +104,7 @@ impl KernelSpec for DsaTopkPrefillSpec {
 /// renormalizes over the surviving corners, so the grid stays rectangular.
 const MAX_PROFILE_ALLOCATION_BYTES: f64 = 32.0 * 1024.0 * 1024.0 * 1024.0;
 
-/// DeepGEMM logits pad N to 256 and retain one additional 256-column tile.
+/// `DeepGEMM` logits pad N to 256 and retain one additional 256-column tile.
 fn logits_row_stride(num_keys: u32) -> u32 {
     num_keys.div_ceil(256) * 256 + 256
 }

@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused prefill post-convolution preparation kernel.
+//! Qwen Gated `DeltaNet` fused prefill post-convolution preparation kernel.
 //!
 //! Model head geometry and compute dtype are static config identity. The
 //! physical token count is the sole runtime interpolation axis. The explicit

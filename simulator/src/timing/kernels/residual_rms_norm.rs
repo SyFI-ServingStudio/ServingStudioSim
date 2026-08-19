@@ -1,4 +1,4 @@
-//! Fused residual-add RMSNorm kernel: one cached perf model per
+//! Fused residual-add `RMSNorm` kernel: one cached perf model per
 //! `(hidden, dtype)` config.
 //!
 //! This kind owns a distinct Python profile table and fused launch boundary;

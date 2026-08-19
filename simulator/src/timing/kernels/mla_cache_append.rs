@@ -1,4 +1,4 @@
-//! GLM-5.2 plain MLA cache append: concatenate latent and RoPE rows into one
+//! GLM-5.2 plain MLA cache append: concatenate latent and `RoPE` rows into one
 //! paged-cache entry.
 //!
 //! Static identity captures the latent/RoPE widths, page size, input/cache

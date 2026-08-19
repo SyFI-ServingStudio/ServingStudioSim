@@ -1,10 +1,10 @@
-//! `op/moe` — MoE dispatch/combine compound ops (L2), unified on the
+//! `op/moe` — `MoE` dispatch/combine compound ops (L2), unified on the
 //! **simulate-as-model** design.
 //!
 //! One [`sim::simulate_moe_comm`] realizes per-token routing + placement once at
 //! op build time and prices ALL six network stages' per-GPU bytes, sampling each
 //! stage's realized bottleneck on a token-count grid into a [`BottleneckCurve`]
-//! (the L2 analogue of an L1 1D kernel cache: the op's config — routing, top_k,
+//! (the L2 analogue of an L1 1D kernel cache: the op's config — routing, `top_k`,
 //! placement, shape — is fixed at init, and the single sweep axis `T` is
 //! interpolated at runtime). [`dispatch::MoeDispatchOp`] reads the two dispatch
 //! curves; [`combine::MoeCombineOp`] reads the four combine curves. Both price
@@ -53,7 +53,7 @@ pub struct MoeNetConfig {
 }
 
 impl MoeNetConfig {
-    /// The intra-domain (NVLink) p2p sub-kernel config. Comm is size-keyed, so
+    /// The intra-domain (`NVLink`) p2p sub-kernel config. Comm is size-keyed, so
     /// `self.dtype` does not enter here — it drives only the `hidden_bytes`
     /// message width in `net_params` (fp8 → half the bytes on the same curve).
     pub(crate) fn p2p_intra_config(&self) -> P2pIntraKernelConfig {
@@ -83,7 +83,7 @@ impl MoeNetConfig {
     }
 }
 
-/// One MoE comm op invocation: just the token count `T`. Same shape for both
+/// One `MoE` comm op invocation: just the token count `T`. Same shape for both
 /// dispatch and combine (placement is config-time, so only `T` varies at
 /// runtime — the single curve sweep axis).
 #[derive(Clone, Debug, Default)]
@@ -127,6 +127,7 @@ impl Placement {
     /// The contiguous residing group `(start_rank, count)` of `token_idx`. The
     /// owner rotates as `token_idx % ep_size` so the group coverage is uniform
     /// over many tokens (matching ref's average over every owner rank).
+    #[must_use]
     pub fn residing_group(self, token_idx: u64, ep_size: u32) -> (u16, u16) {
         let ep = ep_size.max(1);
         let owner = (token_idx % u64::from(ep)) as u32;
@@ -142,7 +143,7 @@ impl Placement {
     }
 }
 
-/// Which p2p fabric tier a stage rides — selects the intra (NVLink) vs inter
+/// Which p2p fabric tier a stage rides — selects the intra (`NVLink`) vs inter
 /// (NIC) L1 kernel at lookup time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum P2pTier {
@@ -159,7 +160,7 @@ pub struct MoeNetParams {
     pub hidden_bytes: u32,
 }
 
-/// One MoE network stage's per-rank byte loads (indexed by global rank;
+/// One `MoE` network stage's per-rank byte loads (indexed by global rank;
 /// `len() == ep_size`).
 #[derive(Debug, Clone)]
 pub struct MoeStep {
@@ -170,6 +171,7 @@ pub struct MoeStep {
 }
 
 impl MoeStep {
+    #[must_use]
     pub fn empty(name: &'static str, tier: P2pTier, ep_size: usize) -> Self {
         Self {
             name,
@@ -181,6 +183,7 @@ impl MoeStep {
 
     /// Bottleneck rank's byte load — `max_r max(send[r], recv[r])` — the size fed
     /// to the p2p curve for this stage (ref's `max_gpu`).
+    #[must_use]
     pub fn bottleneck_bytes(&self) -> u64 {
         self.send_bytes
             .iter()
@@ -198,6 +201,7 @@ pub struct NvlLayout {
 }
 
 impl NvlLayout {
+    #[must_use]
     pub fn new(ep_size: u32, nvl_num_gpu: u32) -> Self {
         let sizes = crate::timing::routing::ranks_per_nvl_domain(ep_size, nvl_num_gpu);
         let mut starts = Vec::with_capacity(sizes.len());
@@ -212,24 +216,29 @@ impl NvlLayout {
         }
     }
 
+    #[must_use]
     pub fn num_domains(&self) -> usize {
         self.domain_sizes.len()
     }
 
+    #[must_use]
     pub fn domain_size(&self, domain: usize) -> u32 {
         self.domain_sizes[domain]
     }
 
+    #[must_use]
     pub fn first_rank(&self, domain: usize) -> u16 {
         self.domain_starts[domain] as u16
     }
 
     /// The contiguous global-rank range of `domain`.
+    #[must_use]
     pub fn ranks_in(&self, domain: usize) -> std::ops::Range<u16> {
         let start = self.domain_starts[domain] as u16;
         start..(start + self.domain_sizes[domain] as u16)
     }
 
+    #[must_use]
     pub fn domain_of(&self, rank: u16) -> usize {
         let r = u32::from(rank);
         for (i, &start) in self.domain_starts.iter().enumerate() {
@@ -243,6 +252,7 @@ impl NvlLayout {
     /// Rail-aligned peer of `rank` in `domain`: the rank at the same local index
     /// (wrapped to the domain size). Models a NIC link landing on the matching
     /// position in the remote NVL domain (DeepEP-style rail alignment).
+    #[must_use]
     pub fn rail_peer(&self, rank: u16, domain: usize) -> u16 {
         let src_dom = self.domain_of(rank);
         let local = u32::from(rank) - self.domain_starts[src_dom];
@@ -315,6 +325,7 @@ impl BottleneckCurve {
     /// Bytes at `tokens`, linearly interpolated between bracketing grid points
     /// (extrapolated by the end segments' slope outside the grid). The curve
     /// `≈ a·T + b·√T` is smooth, so linear interp on a geometric grid is tight.
+    #[must_use]
     pub fn bottleneck(&self, tokens: u64) -> u64 {
         let p = &self.points;
         if p.is_empty() {

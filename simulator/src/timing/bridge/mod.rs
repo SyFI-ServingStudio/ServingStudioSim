@@ -1,4 +1,4 @@
-//! Thin Rust/Python bridge for L1 perf_api.
+//! Thin Rust/Python bridge for L1 `perf_api`.
 
 pub mod core;
 pub mod error;

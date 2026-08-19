@@ -1,9 +1,9 @@
 //! GLM-5.2 local dense-FFN worklet for decoder layers 0–2.
 //!
 //! This is one self-completing, single-GPU sync section: fused residual-add
-//! RMSNorm → fused gate/up projection → SiLU-and-multiply → down projection.
+//! `RMSNorm` → fused gate/up projection → SiLU-and-multiply → down projection.
 //! It has no TP partition or collective. The residual addition after the down
-//! projection is owned by the following layer's fused residual RMSNorm, matching
+//! projection is owned by the following layer's fused residual `RMSNorm`, matching
 //! the accepted GLM-5.2 attention-worklet convention.
 
 use std::sync::Arc;
@@ -73,6 +73,7 @@ pub struct Glm52DenseFfnLocalWorklet {
 impl Glm52DenseFfnLocalWorklet {
     /// Resolve the one supported GLM-5.2 dense-FFN identity without touching a
     /// bridge, GPU, cache, or `Arc`.
+    #[must_use]
     pub fn resolve_config(
         cfg: &Glm52DenseFfnLocalWorkletConfig,
     ) -> Glm52DenseFfnLocalWorkletResolved {

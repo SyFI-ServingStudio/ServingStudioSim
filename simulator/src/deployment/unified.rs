@@ -410,7 +410,7 @@ impl Deployment for UnifiedDeployment {
 /// The model's dotted-leaf prefix for this deployment (e.g. `unified.embedding`).
 const MODEL_NAME: &str = "unified";
 
-/// The dense / dense_tp archs run on the single-group barebone worker.
+/// The dense / `dense_tp` archs run on the single-group barebone worker.
 fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
         IterWorkerSel::Barebone { .. } => Ok(()),
@@ -430,7 +430,7 @@ fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
     }
 }
 
-/// DP-attention and MoE archs run on the multi-group hp_unified worker.
+/// DP-attention and `MoE` archs run on the multi-group `hp_unified` worker.
 fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
         IterWorkerSel::HpUnified { .. } => Ok(()),

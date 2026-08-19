@@ -5,7 +5,7 @@
 //! independently replicated over the EP ranks; decoder layers 0--2 execute the
 //! dense FFN and a full DSA indexer; layers 3--5 reuse the layer-2 index; layers
 //! 6--77 repeat a four-layer cadence containing one full-index layer and three
-//! IndexShare layers; shared-expert compute is conservatively serialized with
+//! `IndexShare` layers; shared-expert compute is conservatively serialized with
 //! routed-expert work.
 //!
 //! Sparse-MoE communication is pure EP and is priced by the **profiled**
@@ -20,7 +20,7 @@
 //! therefore moves the transfer as well as the routed grouped GEMMs and
 //! `finalizeMoeRoutingKernel`. What is still priced flat is `moe_alltoall_prepare`,
 //! whose key is the token count alone; a uniformly-drawn benchmark under-reads a
-//! real skewed layer there by ~9%, which is ~3% of the MoE communication budget.
+//! real skewed layer there by ~9%, which is ~3% of the `MoE` communication budget.
 //!
 //! This is a **separate static graph**, not a flag on the native arch -- the same
 //! split Qwen uses (`qwen3_moe_dp_attn_ep_ffn` / `_fp8_` /
@@ -1250,6 +1250,7 @@ pub fn build(
 }
 
 impl Glm52VllmDsaMoeModel {
+    #[must_use]
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let embedding = labeled_max(

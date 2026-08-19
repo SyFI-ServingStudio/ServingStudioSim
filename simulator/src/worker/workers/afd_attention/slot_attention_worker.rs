@@ -91,7 +91,7 @@ where
                 bytes,
             } => self.on_msg_ready_notification(slot as usize, layer, send_gid, bytes),
             AttnWorkerMsg::SlotFlushed { slot, layer } => {
-                self.on_msg_slot_flushed(slot as usize, layer)
+                self.on_msg_slot_flushed(slot as usize, layer);
             }
         }
     }

@@ -1,4 +1,4 @@
-//! FlashInfer prefill (causal) attention kernel: one cached perf model per
+//! `FlashInfer` prefill (causal) attention kernel: one cached perf model per
 //! attention-dims config.
 //!
 //! Everything generic (build / eval / the `Probe` impl / for-backend loops)
@@ -63,8 +63,8 @@ impl SweepCoords for FlashinferAttnPrefillKernelInput {
     fn coords(&self) -> Coords {
         // (k, q) → (k + q/2, q). `A` carries the causal triangle so `A·B` is the
         // full per-iteration work with no quadratic residual for bilinear to miss.
-        let a = self.prefix_len as f64 + self.append_len as f64 / 2.0;
-        Coords::new([a, self.append_len as f64])
+        let a = f64::from(self.prefix_len) + f64::from(self.append_len) / 2.0;
+        Coords::new([a, f64::from(self.append_len)])
     }
     fn coord_field_names() -> &'static [&'static str] {
         // The *query-point* keys (physical, history-append) — what a caller sends.

@@ -28,7 +28,7 @@ impl BackendCache {
         Ok((Self { cache }, warnings))
     }
 
-    /// Metrics fast path for CostTree eval — the caller (`Kernel::eval`)
+    /// Metrics fast path for `CostTree` eval — the caller (`Kernel::eval`)
     /// selects best-of-N itself. See `Cache::eval`.
     pub(crate) fn eval(&self, sweep: &[f64]) -> LeafMetrics {
         self.cache.eval(sweep)

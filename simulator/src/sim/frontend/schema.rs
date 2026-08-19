@@ -1,8 +1,8 @@
-//! Adapt req-frontend's validated input rows into statically typed VibeSim requests.
+//! Adapt req-frontend's validated input rows into statically typed `VibeSim` requests.
 //!
 //! The shared crate owns complete input-file formats, header matching, CSV
 //! decoding, tag decoding, and format-specific structural validation. This
-//! module starts after that boundary: it assigns VibeSim's dense ids and turns
+//! module starts after that boundary: it assigns `VibeSim`'s dense ids and turns
 //! each shared row into one concrete [`RequestDefinition`].
 
 use std::collections::HashMap;
@@ -593,10 +593,12 @@ impl SourceIdentities {
         Ok(dense)
     }
 
+    #[must_use]
     pub fn session_source_ids(&self) -> &[String] {
         &self.session_order
     }
 
+    #[must_use]
     pub fn request_source_ids(&self) -> &[String] {
         &self.requests
     }

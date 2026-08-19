@@ -1,5 +1,5 @@
 //! L4 ↔ L5 data contract: the per-iteration `ArchInput` a worker hands to a
-//! model_arch, plus the iter-wise query trait. See L4 design.md §3.1 / §4.1.
+//! `model_arch`, plus the iter-wise query trait. See L4 design.md §3.1 / §4.1.
 //!
 //! The iter-wise contract ([`IterwiseUnifiedModel`]) is used by co-located
 //! attn+ffn workers: barebone/unified, HP unified, and the PD prefill/decode
@@ -34,7 +34,8 @@ impl ArchGroupInput {
     ///
     /// Each listed prefill chunk and decode KV length owns one request and one
     /// lm-head row. Input modes with different logits semantics must use a
-    /// different ArchInput type instead of adding optional axes here.
+    /// different `ArchInput` type instead of adding optional axes here.
+    #[must_use]
     pub fn request_count(&self) -> u32 {
         u32::try_from(self.prefill_chunk_pairs.len() + self.decode_kv_lens.len())
             .expect("ArchGroupInput request count must fit u32")
@@ -81,22 +82,22 @@ pub struct UnifiedArchInput {
 }
 
 /// Iter-wise query face for co-located workers: one call costs the whole
-/// iteration (embedding → layers → lm_head). `&UnifiedArchInput` is concrete on
+/// iteration (embedding → layers → `lm_head`). `&UnifiedArchInput` is concrete on
 /// the signature (no `dyn`); L5 binds via `<M: IterwiseUnifiedModel>` generic.
 pub trait IterwiseUnifiedModel: Send + Sync + 'static {
-    /// Per-iter cost of the whole iteration (embedding → layers → lm_head) via the
-    /// compiled CostTree path: stream each leaf's [`LeafMetrics`] into `slots`
+    /// Per-iter cost of the whole iteration (embedding → layers → `lm_head`) via the
+    /// compiled `CostTree` path: stream each leaf's [`LeafMetrics`] into `slots`
     /// (the caller's reused buffer — cleared + refilled to the manifest length),
     /// then aggregate the cached structure (the homogeneous-layer fold supplies
     /// `×num_layers`). Returns the aggregate: `.m.time_ms` is the per-iter sim
     /// clock, the rest is rolled-up flops/bytes/energy + coverage. `slots` is left
     /// holding the per-leaf breakdown so a `cost_log` row can carry it — callers
     /// that only want the clock just ignore the buffer (filling it is free: the
-    /// eval pass materializes it either way). Models with no compiled CostTree
+    /// eval pass materializes it either way). Models with no compiled `CostTree`
     /// clear `slots` and return their fixed aggregate. O(slots) flat writes, no
     /// per-tick allocation when the caller reuses the buffer.
     ///
-    /// `scratch` is a second caller-owned buffer the CostTree aggregation reuses
+    /// `scratch` is a second caller-owned buffer the `CostTree` aggregation reuses
     /// for its per-node rollup (one `LeafMetrics` per flat node); threading it in
     /// keeps the per-iter aggregate walk allocation-free. Callers reuse the same
     /// `scratch` across iterations; its contents are not meaningful on return.
@@ -110,7 +111,7 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// Like [`Self::eval_iter`], but also captures each leaf's typed kernel input
     /// into `inputs` (slot-aligned, in visit order) for the `cost_log`
     /// `slot_input` column. The default clears `inputs` and falls back to the
-    /// non-capturing path — models with a compiled CostTree override it to record.
+    /// non-capturing path — models with a compiled `CostTree` override it to record.
     /// The clone per leaf is paid only on this path; `eval_iter` stays untouched.
     fn eval_iter_with_inputs(
         &self,
@@ -126,7 +127,7 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// The `cost_log` manifest: the ordered slots plus the flattened aggregation
     /// nodes, so a consumer can reproduce `total_time_ms` from a row's per-slot
     /// breakdown (the `Scale{n}` fold / `Sum` / `Max` operators, not just names).
-    /// Empty (default) means the model has no compiled CostTree; models with one
+    /// Empty (default) means the model has no compiled `CostTree`; models with one
     /// override it.
     fn cost_log_manifest(&self) -> CostManifest {
         CostManifest {
@@ -179,7 +180,7 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
         0
     }
 
-    /// GPUs one replica of this model spans. The model_arch is the source of truth
+    /// GPUs one replica of this model spans. The `model_arch` is the source of truth
     /// for this: it resolved the parallel layout, so it knows the real extent — the
     /// EP span with TP/HP groups nested inside it, *not* a `tp×ep×hp` product. L5/L6
     /// only read it (to size the run's GPU inventory); they never derive it. A dense
@@ -234,8 +235,8 @@ pub struct AttnArchInput {
 }
 
 /// Ffn-side per-iteration input. The ffn cost depends ONLY on per-DP-shard token
-/// counts — qkv / o_proj fan out per shard (`Max`-ed across shards), and their
-/// pooled total drives router / MoE / lm_head. So this carries just the counts,
+/// counts — qkv / `o_proj` fan out per shard (`Max`-ed across shards), and their
+/// pooled total drives router / `MoE` / `lm_head`. So this carries just the counts,
 /// NOT the attention-shaped [`ArchGroupInput`] (prefill chunks / decode KV lengths)
 /// the attn side needs — the ffn never reads those. Routing distribution is also
 /// not here: it is a build-time `RoutingDistribution` baked into the model at
@@ -252,8 +253,8 @@ pub struct AttnArchInput {
 #[serde(deny_unknown_fields)]
 pub struct FfnArchInput {
     /// Tokens processed by each attention DP shard this forward pass (length =
-    /// `num_dp_groups`). `Max`-fanned across shards for qkv / o_proj / home-reduce;
-    /// summed for the router / MoE / lm_head total.
+    /// `num_dp_groups`). `Max`-fanned across shards for qkv / `o_proj` / home-reduce;
+    /// summed for the router / `MoE` / `lm_head` total.
     pub tokens_per_group: Vec<u32>,
 }
 
@@ -289,7 +290,7 @@ pub trait AttnLayerwiseModel: Send + Sync + 'static {
     /// it never recomputes the size. Only the *outgoing* direction lives here.
     fn attn_to_ffn_bytes_per_token(&self) -> u64;
 
-    /// Per-layer attention cost over the compiled CostTree: stream each leaf's
+    /// Per-layer attention cost over the compiled `CostTree`: stream each leaf's
     /// [`LeafMetrics`] into `slots` (cleared + resized to this group's slot count),
     /// then aggregate. `.m.time_ms` is the attention compute time for `layer_idx`.
     /// Same buffer protocol as [`IterwiseUnifiedModel::eval_iter`].
@@ -318,16 +319,16 @@ pub trait AttnLayerwiseModel: Send + Sync + 'static {
     }
 
     /// The `cost_log` manifest: the attn side has one cost group, so a single
-    /// `attn` section naming this shard's attention CostTree slots. Empty (default)
-    /// means no compiled CostTree; the concrete model overrides it.
+    /// `attn` section naming this shard's attention `CostTree` slots. Empty (default)
+    /// means no compiled `CostTree`; the concrete model overrides it.
     fn cost_log_manifest(&self) -> CostManifestDoc {
         CostManifestDoc::empty()
     }
 }
 
 /// Ffn-side layer-wise query face (AFD ffn worker). Per layer there are two
-/// groups — pre-attn (`qkv`) and post-attn (`o_proj` + router + MoE) — plus an
-/// iteration prologue (embedding) and epilogue (final_norm + lm_head).
+/// groups — pre-attn (`qkv`) and post-attn (`o_proj` + router + `MoE`) — plus an
+/// iteration prologue (embedding) and epilogue (`final_norm` + `lm_head`).
 ///
 /// The Bridge / Bootstrap / Terminal fused-kernel split (L4 §4.1): the ffn side's
 /// physical mid-layer kernel fuses post-attn-of-L with pre-attn-of-(L+1). The
@@ -338,8 +339,8 @@ pub trait AttnLayerwiseModel: Send + Sync + 'static {
 ///   - `post_attn_cost(L < last)` bills post(L) **plus** the fused pre(L+1);
 ///   - `post_attn_cost(last)`     is post-only (Terminal).
 ///
-/// So `Σ_L pre_attn + Σ_L post_attn` totals exactly one qkv + one o_proj + one MoE
-/// per layer — the L4 §4.1 M_form_consistency the cost-consistency test guards.
+/// So `Σ_L pre_attn + Σ_L post_attn` totals exactly one qkv + one `o_proj` + one `MoE`
+/// per layer — the L4 §4.1 `M_form_consistency` the cost-consistency test guards.
 pub trait FfnLayerwiseModel: Send + Sync + 'static {
     fn num_layers(&self) -> u32;
 
@@ -351,7 +352,7 @@ pub trait FfnLayerwiseModel: Send + Sync + 'static {
     /// this as `ep_size / attn_tp_size` (with the `ep_size % attn_tp_size == 0`
     /// assert) and caches it — this accessor just exposes the resolved value. The
     /// ffn worker partitions its workload across this many groups before costing
-    /// (post_norm + router + MoE home-reduce run replicated per shard on its own
+    /// (`post_norm` + router + `MoE` home-reduce run replicated per shard on its own
     /// token slice — the `Max` fan-out that models DP load imbalance). L5 (the
     /// worker) owns the partition; L6 only hands over the total workload.
     fn num_dp_groups(&self) -> u16;
@@ -373,7 +374,7 @@ pub trait FfnLayerwiseModel: Send + Sync + 'static {
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics;
 
-    /// Post-attention cost for `layer_idx` (o_proj + post_norm + router + MoE);
+    /// Post-attention cost for `layer_idx` (`o_proj` + `post_norm` + router + `MoE`);
     /// mid-layers additionally bill the fused pre-attn of `layer_idx + 1`, the last
     /// layer is post-only.
     fn post_attn_cost(
@@ -392,7 +393,7 @@ pub trait FfnLayerwiseModel: Send + Sync + 'static {
         scratch: &mut Vec<LeafMetrics>,
     ) -> LeafMetrics;
 
-    /// Once-per-iteration epilogue after the layer loop (final_norm + lm_head).
+    /// Once-per-iteration epilogue after the layer loop (`final_norm` + `lm_head`).
     fn epilogue_cost(
         &self,
         batch: &FfnArchInput,
@@ -453,10 +454,10 @@ pub trait FfnLayerwiseModel: Send + Sync + 'static {
     }
 
     /// The `cost_log` manifest: the ffn side has several distinct cost groups
-    /// (different CostTrees / slot sets), so one section each — `prologue`,
+    /// (different `CostTrees` / slot sets), so one section each — `prologue`,
     /// `pre_attn`, `post_attn`, `epilogue`. A `cost_log` row's `section` field
     /// selects which section names its slots. Empty (default) means no compiled
-    /// CostTree; the concrete model overrides it.
+    /// `CostTree`; the concrete model overrides it.
     fn cost_log_manifest(&self) -> CostManifestDoc {
         CostManifestDoc::empty()
     }

@@ -1,4 +1,4 @@
-//! Qwen3.6 TP1/EP1 local MoE finalization section.
+//! Qwen3.6 TP1/EP1 local `MoE` finalization section.
 //!
 //! This section consumes local routed-expert rows and the already-gated local
 //! shared-expert output. It first unpermutes, reweights, and reduces routed rows,
@@ -57,6 +57,7 @@ pub struct Qwen36MoeFinalizeLocalWorklet {
 }
 
 impl Qwen36MoeFinalizeLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &Qwen36MoeFinalizeLocalWorkletConfig,
     ) -> Qwen36MoeFinalizeLocalWorkletResolved {

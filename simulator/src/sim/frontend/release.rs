@@ -9,7 +9,7 @@
 //!
 //! Arrival and capacity used to be one axis, which made two of the four
 //! combinations unrepresentable: a timeline replay could not be capped, and a
-//! capped run had to discard the timeline. TraceLab has always composed them —
+//! capped run had to discard the timeline. `TraceLab` has always composed them —
 //! it waits for a session's arrival and *then* acquires a permit — so the weld
 //! was also the reason a measured run and a simulated run could not be said to
 //! release work the same way.
@@ -24,10 +24,10 @@ use crate::common::{RequestId, Time};
 
 pub use req_frontend::release::ArrivalMode;
 
-/// VibeSim's resolved pacing input.
+/// `VibeSim`'s resolved pacing input.
 ///
 /// [`ArrivalMode`] is the shared cross-consumer choice. The rate stays beside
-/// it here because VibeSim stores rate-1-normalized arrivals, while the measured
+/// it here because `VibeSim` stores rate-1-normalized arrivals, while the measured
 /// client rescales a trace from its observed absolute rate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ArrivalSchedule {
@@ -50,6 +50,7 @@ impl ArrivalSchedule {
         Self::parse("trace_timed", request_rate)
     }
 
+    #[must_use]
     pub fn saturated() -> Self {
         Self {
             mode: ArrivalMode::Saturated,
@@ -67,13 +68,14 @@ impl ArrivalSchedule {
 /// session owns its slot from the moment its first round is released until its
 /// last round completes, including across every tool wait in between. A cap of
 /// two therefore means two conversations, not two requests — matching the
-/// permit TraceLab holds for the lifetime of a session task.
+/// permit `TraceLab` holds for the lifetime of a session task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct CapacityLimit {
     max_active_units: Option<usize>,
 }
 
 impl CapacityLimit {
+    #[must_use]
     pub fn unlimited() -> Self {
         Self {
             max_active_units: None,

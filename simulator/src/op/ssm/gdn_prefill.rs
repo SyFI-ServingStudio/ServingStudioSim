@@ -1,12 +1,12 @@
-//! Compound Gated DeltaNet prefill operation.
+//! Compound Gated `DeltaNet` prefill operation.
 //!
 //! One logical prefill owns the causal-convolution fan-in, the post-convolution
 //! projection, and the chunked delta rule. Request-local convolution costs
 //! aggregate into one fixed leaf; the other two launches consume the aggregate
-//! `(T, L)` geometry. This keeps request count out of the CostTree shape.
+//! `(T, L)` geometry. This keeps request count out of the `CostTree` shape.
 //!
 //! The delta rule is ONE leaf, not six. vLLM resolves the GDN prefill backend
-//! to FlashInfer on any SM90 part, and that realization is a single fused
+//! to `FlashInfer` on any SM90 part, and that realization is a single fused
 //! CUTLASS launch; the six-launch FLA Triton decomposition this operation used
 //! to model over-predicted the measured operation by 110% on a
 //! Qwen3.6-35B-A3B-FP8 H200 capture, because it round-trips h/w/u/A through HBM
@@ -162,7 +162,7 @@ fn leaf<K: Probe>(builder: &mut CostTreeBuilder, name: &str, suffix: &str, kerne
 /// `max_sequence_length` is the delta rule's critical path: the inter-chunk
 /// recurrence is sequential inside a sequence and independent across sequences,
 /// so the longest sequence bounds the launch while `num_tokens` sets the
-/// aggregate work. Chunk counts are no longer derived here -- FlashInfer owns
+/// aggregate work. Chunk counts are no longer derived here -- `FlashInfer` owns
 /// its own chunk width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GdnPrefillGeometry {

@@ -1,4 +1,4 @@
-//! Native local MoE expert compute: direct grouped gate-up GEMM, activation,
+//! Native local `MoE` expert compute: direct grouped gate-up GEMM, activation,
 //! then direct grouped down GEMM. BF16 and native FP8 share this exact op graph;
 //! dtype/backend remain ordinary L1 config, not L3 graph selection.
 
@@ -28,6 +28,7 @@ pub struct NativeMoeExpertComputeLocalWorkletConfig {
 }
 
 impl NativeMoeExpertComputeLocalWorkletConfig {
+    #[must_use]
     pub fn split_for_ep(mut template: Self, global_ppm: &[u32]) -> Vec<Self> {
         let ep_size = usize::from(template.ep_size);
         assert!(ep_size > 0, "ep_size must be non-zero");
@@ -71,6 +72,7 @@ pub struct NativeMoeExpertComputeLocalWorklet {
 }
 
 impl NativeMoeExpertComputeLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &NativeMoeExpertComputeLocalWorkletConfig,
     ) -> NativeMoeExpertComputeLocalWorkletResolved {

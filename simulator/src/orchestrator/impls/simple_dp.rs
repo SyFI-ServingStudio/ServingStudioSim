@@ -30,7 +30,7 @@ pub struct SimpleDpPoolConfig {
     pub placement: DpPlacementPolicy,
 }
 
-/// Config for the whole simple_dp deployment.
+/// Config for the whole `simple_dp` deployment.
 pub struct SimpleDpConfig {
     pub dp_pool: SimpleDpPoolConfig,
 }
@@ -129,6 +129,7 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
         idx
     }
 
+    #[must_use]
     pub fn pool(&self) -> PoolId {
         self.pool
     }
@@ -177,7 +178,7 @@ pub struct SimpleDpFlow<W: IterWorker<Event = WorkerEventCommon>> {
     dp_pool: SimpleDpPoolController<W>,
     /// Shared run-level GPU cluster (registry + transfer oracle), built here and
     /// threaded into the pool's construction so workers self-register and (PD
-    /// only) keep a handle for runtime transfers. simple_dp has one pool today,
+    /// only) keep a handle for runtime transfers. `simple_dp` has one pool today,
     /// but the ownership shape generalizes to multi-pool (allocate into the
     /// same cluster, ids continue).
     cluster: SharedGpuCluster,

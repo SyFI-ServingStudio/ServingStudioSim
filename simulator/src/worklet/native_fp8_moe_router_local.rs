@@ -1,4 +1,4 @@
-//! Native FP8 MoE router section: post-attention RMSNorm followed by explicit
+//! Native FP8 `MoE` router section: post-attention `RMSNorm` followed by explicit
 //! per-token-group quantization and the FP8 router GEMM.
 
 use std::sync::Arc;
@@ -45,6 +45,7 @@ pub struct NativeFp8MoeRouterLocalWorklet {
 }
 
 impl NativeFp8MoeRouterLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &NativeFp8MoeRouterLocalWorkletConfig,
     ) -> NativeFp8MoeRouterLocalWorkletResolved {

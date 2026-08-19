@@ -1,5 +1,5 @@
 //! `PreAttnLocalWorklet` — single-GPU pre-attention section of a dense decoder
-//! layer: input RMSNorm → fused QKV projection. `Local` group suffix (L3 §1.5):
+//! layer: input `RMSNorm` → fused QKV projection. `Local` group suffix (L3 §1.5):
 //! one GPU, self-synced, no collective.
 //!
 //! `gpu_name` rides in `*Config` (baked into each sub-kernel cfg at
@@ -53,6 +53,7 @@ pub struct PreAttnLocalWorklet {
 }
 
 impl PreAttnLocalWorklet {
+    #[must_use]
     pub fn resolve_config(cfg: &PreAttnLocalWorkletConfig) -> PreAttnLocalWorkletResolved {
         // Fused QKV output dim: q heads + 2× kv heads (GQA), each `head_dim` wide.
         let qkv_n =
@@ -106,7 +107,7 @@ impl PreAttnLocalWorklet {
         })
     }
 
-    /// CostTree compile: sum over the two atomic ops, wrapped in a `Labeled` node
+    /// `CostTree` compile: sum over the two atomic ops, wrapped in a `Labeled` node
     /// carrying the worklet identity + partition/shape annotation (the old
     /// `Describe` header lines).
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
@@ -123,7 +124,7 @@ impl PreAttnLocalWorklet {
         }
     }
 
-    /// CostTree eval: fill the input_norm then qkv slots in the same child order
+    /// `CostTree` eval: fill the `input_norm` then qkv slots in the same child order
     /// as `compile`, so `cursor` tracks the minted slot indices.
     pub fn eval(&self, input: &PreAttnLocalWorkletInput, ev: &mut Evaluator) {
         let norm_in = RmsNormKernelInput {

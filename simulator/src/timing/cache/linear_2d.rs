@@ -140,7 +140,7 @@ fn determinant_3x3(m: &[[f64; 3]; 3]) -> f64 {
 
 /// Bilinear interpolation over a rectangular 2D profile grid. Both axes are
 /// expected monotonic-in-time (bigger coordinate ⇒ more work ⇒ more time), e.g.
-/// AttnPrefill's `seq_len_q × kv_cache_len`. The grid is the cartesian product
+/// `AttnPrefill`'s `seq_len_q × kv_cache_len`. The grid is the cartesian product
 /// of the two sweep axes; `samples` arrive row-major (`samples[i*C + j]` is the
 /// point at `axis0[i] × axis1[j]`, matching `SweepGrid::expand_2d`).
 #[derive(Clone, Debug)]
@@ -211,6 +211,7 @@ impl Cache for Cache2DLinear {
 }
 
 impl Cache2DLinear {
+    #[must_use]
     pub fn from_samples_with(
         grid: &SweepGrid,
         samples: &[KernelMetrics],
@@ -462,8 +463,7 @@ impl Cache2DLinear {
                 })
             })
             .min_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
-            .map(|(cell, _)| cell)
-            .unwrap_or(Metrics4::ZERO);
+            .map_or(Metrics4::ZERO, |(cell, _)| cell);
         (nearest, true)
     }
 }

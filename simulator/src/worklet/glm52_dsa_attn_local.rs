@@ -3,11 +3,11 @@
 //! This is one self-completing, single-GPU attention section. It deliberately
 //! has no TP partition or collective: the accepted sparse-MLA timing identity
 //! requires all 64 attention heads locally. A full-index layer includes the
-//! complete [`DsaIndexerOp`] subtree, while an IndexShare layer omits that
+//! complete [`DsaIndexerOp`] subtree, while an `IndexShare` layer omits that
 //! subtree structurally; sparse MLA attention executes in both cases.
 //!
-//! Layer 0 reuses the accepted fused residual-add RMSNorm timing as a visible,
-//! conservative surrogate for its separate clone plus plain RMSNorm. Indexer
+//! Layer 0 reuses the accepted fused residual-add `RMSNorm` timing as a visible,
+//! conservative surrogate for its separate clone plus plain `RMSNorm`. Indexer
 //! H32 model semantics versus H64 logits timing are preserved inside the L2 op.
 
 use std::sync::Arc;
@@ -119,7 +119,7 @@ pub struct Glm52DsaAttnLocalWorkletConfig {
     pub quant_block_size: u32,
     pub softmax_scale_denominator: u32,
     pub base_dtype: DType,
-    /// Dtype used only by generic projection SingleGemm leaves. Specialized
+    /// Dtype used only by generic projection `SingleGemm` leaves. Specialized
     /// MLA/indexer kernels retain their explicit dtype fields below.
     pub gemm_dtype: DType,
     pub index_cache_dtype: DType,
@@ -141,7 +141,7 @@ pub struct Glm52DsaAttnLocalWorkletConfig {
 }
 
 /// Pure resolved data: every atomic config is baked, and the optional indexer
-/// config is absent for IndexShare instances.
+/// config is absent for `IndexShare` instances.
 #[derive(Clone, Debug)]
 pub struct Glm52DsaAttnLocalWorkletResolved {
     pub raw_cfg: Glm52DsaAttnLocalWorkletConfig,
@@ -191,6 +191,7 @@ pub struct Glm52DsaAttnLocalWorklet {
 impl Glm52DsaAttnLocalWorklet {
     /// Resolve the one supported GLM-5.2 local identity without touching a
     /// bridge, GPU, cache, or `Arc`.
+    #[must_use]
     pub fn resolve_config(
         cfg: &Glm52DsaAttnLocalWorkletConfig,
     ) -> Glm52DsaAttnLocalWorkletResolved {

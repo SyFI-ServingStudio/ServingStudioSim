@@ -1,4 +1,4 @@
-//! vLLM MLA query RoPE, priced as the inductor fusion actually runs.
+//! vLLM MLA query `RoPE`, priced as the inductor fusion actually runs.
 //!
 //! This leaf is NOT rope-slice sized. vLLM writes `q[..., qk_nope:] = q_pe` and
 //! then hands `q` to the attention op, so the functionalized inductor graph

@@ -96,7 +96,7 @@ impl KvCapacityState {
             let departed =
                 entries.partition_point(|(remaining_decode, _)| *remaining_decode < exit_step);
             let kv_at_exit = self.resident_tokens
-                + (num_decodes - departed) as u64 * exit_step as u64
+                + (num_decodes - departed) as u64 * u64::from(exit_step)
                 - kv_prefix[departed];
             peak = peak.max(kv_at_exit);
         }

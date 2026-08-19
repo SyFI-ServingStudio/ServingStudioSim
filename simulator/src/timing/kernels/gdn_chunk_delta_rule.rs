@@ -1,10 +1,10 @@
-//! Qwen Gated DeltaNet prefill chunked delta rule as ONE fused launch.
+//! Qwen Gated `DeltaNet` prefill chunked delta rule as ONE fused launch.
 //!
 //! Deliberately a separate kind from the six `gdn_chunk_*` kinds. Those model
 //! FLA's Triton realization, which splits the chunked gated delta rule into six
 //! launches (local cumsum, K.Kt, triangular solve, w/u recompute, inter-chunk
 //! state scan, output). This kind models the realization vLLM actually selects
-//! on Hopper: FlashInfer's `chunk_gated_delta_rule`, a single CUTLASS TMA
+//! on Hopper: `FlashInfer`'s `chunk_gated_delta_rule`, a single CUTLASS TMA
 //! warp-specialized kernel (`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`)
 //! that keeps every intermediate on chip. `_resolve_gdn_prefill_backend` picks
 //! it for the default `auto` request on any SM90 part, so an H200 capture never
@@ -63,8 +63,8 @@ pub struct GdnChunkDeltaRuleKernelInput {
 impl SweepCoords for GdnChunkDeltaRuleKernelInput {
     fn coords(&self) -> Coords {
         Coords::new([
-            self.max_sequence_length as f64,
-            self.num_tokens as f64 / self.max_sequence_length as f64,
+            f64::from(self.max_sequence_length),
+            f64::from(self.num_tokens) / f64::from(self.max_sequence_length),
         ])
     }
 

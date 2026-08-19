@@ -77,6 +77,7 @@ impl<M: FfnLayerwiseModel> AfdFfnPoolController<DisaggFfnWorker<M>> {
 impl<W: AfdFfnWorker> AfdFfnPoolController<W> {
     /// Assemble the task router around independently-built FFN workers.  This
     /// keeps L6 coupled to the FFN protocol, not a production concrete type.
+    #[must_use]
     pub fn from_workers(workers: Vec<W>) -> Self {
         assert!(
             !workers.is_empty(),

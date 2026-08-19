@@ -75,6 +75,7 @@ pub struct LongestPrefixMatch {
 }
 
 impl LongestPrefixMatch {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

@@ -1,4 +1,4 @@
-//! FlashInfer rect (non-causal) attention kernel: one cached perf model per
+//! `FlashInfer` rect (non-causal) attention kernel: one cached perf model per
 //! attention-dims config, swept over a 2D `(prefix_len, append_len)` grid.
 //!
 //! Rect is the non-causal sibling of `flashinfer_attn_prefill`. Unlike prefill

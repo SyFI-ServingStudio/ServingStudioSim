@@ -1,6 +1,6 @@
 //! Build an iter-wise arch model from its [`IterArchSel`] selector — the single
 //! home for the per-arch `build_configs → resolve_configs → build` chain, the
-//! `ModelSpec`→cfg layer-count override, and MoE routing resolution.
+//! `ModelSpec`→cfg layer-count override, and `MoE` routing resolution.
 //!
 //! Every caller that needs a built model goes through here: the `unified` and
 //! `pd` deployments call the per-arch [`dense`] / [`dense_tp`] / … builders and
@@ -46,7 +46,7 @@ pub fn dense_model_cfg(model_spec: &ModelSpec) -> Result<ModelCfg> {
     Ok(cfg)
 }
 
-/// `ModelSpec` → [`MoeModelCfg`] (separate from [`dense_model_cfg`]: MoE configs
+/// `ModelSpec` → [`MoeModelCfg`] (separate from [`dense_model_cfg`]: `MoE` configs
 /// add `num_experts` / `num_experts_per_tok` / `moe_intermediate_size`).
 pub fn moe_model_cfg(model_spec: &ModelSpec) -> Result<MoeModelCfg> {
     let mut cfg = MoeModelCfg::from_json(Path::new(&model_spec.model_config))?;
@@ -63,7 +63,7 @@ pub fn moe_model_cfg(model_spec: &ModelSpec) -> Result<MoeModelCfg> {
 /// homogeneous dense/MoE helpers, this architecture cannot truncate or scale a
 /// representative subset of layers: its full-index and dense/sparse schedules
 /// are tied to exact layer numbers.
-/// Sparse (MoE) decoder layers, read off the checkpoint's own layer schedule
+/// Sparse (`MoE`) decoder layers, read off the checkpoint's own layer schedule
 /// rather than assumed. An expert-popularity profile is keyed by this count.
 fn num_sparse_layers(model_cfg: &Glm52ModelCfg) -> u32 {
     model_cfg
@@ -87,10 +87,11 @@ fn ensure_glm52_model_spec(model_spec: &ModelSpec) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the synthetic MoE routing distribution the L2 MoE op samples against from the
+/// Resolve the synthetic `MoE` routing distribution the L2 `MoE` op samples against from the
 /// selector's [`RoutingKind`]: `uniform` spreads load evenly over `num_experts`;
 /// `random` draws a `seed`-seeded deterministic skew (0 when unset). Profile-backed
 /// Qwen builds use [`resolve_routing_source`] below.
+#[must_use]
 pub fn resolve_routing(
     kind: RoutingKind,
     seed: Option<u64>,
@@ -177,10 +178,7 @@ fn canonicalize_layerwise_expert_counts(
     anyhow::ensure!(ep_size > 0, "ep_size must be non-zero");
     anyhow::ensure!(
         expected_num_experts.is_multiple_of(u32::from(ep_size)),
-        "expert popularity profile {} cannot partition {} experts across ep_size {}",
-        path,
-        expected_num_experts,
-        ep_size
+        "expert popularity profile {path} cannot partition {expected_num_experts} experts across ep_size {ep_size}"
     );
     let experts_per_rank = expected_num_experts as usize / usize::from(ep_size);
     let mut canonical_counts = vec![0u64; expected_num_experts as usize];
@@ -202,9 +200,7 @@ fn canonicalize_layerwise_expert_counts(
                 let rank_total = sorted_expert_counts.iter().try_fold(0u64, |total, count| {
                     total.checked_add(*count).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "expert popularity profile {} layer {} rank count overflow",
-                            path,
-                            layer_index
+                            "expert popularity profile {path} layer {layer_index} rank count overflow"
                         )
                     })
                 })?;
@@ -264,9 +260,7 @@ fn load_expert_popularity(
                         .map(|ratio| {
                             anyhow::ensure!(
                                 ratio.is_finite() && ratio >= 0.0,
-                                "expert popularity profile {} contains invalid probability {}",
-                                path,
-                                ratio
+                                "expert popularity profile {path} contains invalid probability {ratio}"
                             );
                             Ok(ratio as f32)
                         })
@@ -301,17 +295,12 @@ fn load_expert_popularity(
             (profile.num_logical_experts, profile.counts_by_layer, None)
         }
         other => bail!(
-            "unsupported expert popularity schema_version {} in {} (supported: 1 legacy, 2)",
-            other,
-            path
+            "unsupported expert popularity schema_version {other} in {path} (supported: 1 legacy, 2)"
         ),
     };
     anyhow::ensure!(
         num_logical_experts == expected_num_experts,
-        "expert popularity profile {} has {} experts, model requires {}",
-        path,
-        num_logical_experts,
-        expected_num_experts
+        "expert popularity profile {path} has {num_logical_experts} experts, model requires {expected_num_experts}"
     );
 
     let ratios: Vec<f32> = if !counts_by_layer.is_empty() {
@@ -320,15 +309,12 @@ fn load_expert_popularity(
         ratios
     } else {
         bail!(
-            "legacy expert popularity profile {} must contain counts_by_layer or {} probabilities_all_layers/counts_all_layers entries",
-            path,
-            expected_num_experts
+            "legacy expert popularity profile {path} must contain counts_by_layer or {expected_num_experts} probabilities_all_layers/counts_all_layers entries"
         );
     };
     anyhow::ensure!(
         ratios.iter().any(|ratio| *ratio > 0.0),
-        "expert popularity profile {} has zero total routing mass",
-        path
+        "expert popularity profile {path} has zero total routing mass"
     );
     Ok(RoutingDistribution::from_profile(&ratios))
 }
@@ -489,8 +475,7 @@ pub fn resolve_routing_source(
     if let Some(path) = expert_popularity_file {
         anyhow::ensure!(
             kind == RoutingKind::Uniform,
-            "expert_popularity_file cannot be combined with routing={:?}; omit the profile or use routing=uniform",
-            kind
+            "expert_popularity_file cannot be combined with routing={kind:?}; omit the profile or use routing=uniform"
         );
         return load_expert_popularity(
             path,
@@ -823,8 +808,8 @@ pub fn qwen3_attn(
         .context("building Qwen3 AFD attn-side model (often a missing profile.db row)")
 }
 
-/// Build the AFD ffn-side (layer-wise) Qwen3-MoE model — qkv / o_proj / router /
-/// EP MoE / embed / lm_head. Reuses the iter-wise arch's `build_configs` +
+/// Build the AFD ffn-side (layer-wise) Qwen3-MoE model — qkv / `o_proj` / router /
+/// EP `MoE` / embed / `lm_head`. Reuses the iter-wise arch's `build_configs` +
 /// `resolve_configs` (so the split conserves every leaf). Pairs with [`qwen3_attn`].
 #[allow(clippy::too_many_arguments)]
 pub fn qwen3_ffn_moe(

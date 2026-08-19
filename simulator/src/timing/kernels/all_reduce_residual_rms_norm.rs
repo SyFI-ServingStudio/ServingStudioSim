@@ -1,5 +1,5 @@
-//! FlashInfer TRT-LLM fused TP boundary:
-//! all-reduce + residual add + RMSNorm in one device kernel.
+//! `FlashInfer` TRT-LLM fused TP boundary:
+//! all-reduce + residual add + `RMSNorm` in one device kernel.
 //!
 //! Unlike byte-keyed pure all-reduce, launch cost depends on the 2-D
 //! `[num_tokens, hidden_dim]` shape. `hidden_dim` is static config and
@@ -54,10 +54,11 @@ impl AllReduceResidualRmsNormSpec {
     /// Largest token count for which vLLM selects the fused SM90 recipe.
     ///
     /// L3 uses the same policy to choose between this fused leaf and the
-    /// unfused all-reduce + RMSNorm fallback. Keeping the threshold here makes
+    /// unfused all-reduce + `RMSNorm` fallback. Keeping the threshold here makes
     /// the runtime branch and this kernel's profiling grid share one owner.
+    #[must_use]
     pub fn max_fused_tokens(config: &AllReduceResidualRmsNormKernelConfig) -> u32 {
-        let bytes_per_token = (config.hidden_dim as u64) * (config.dtype.size_bytes() as u64);
+        let bytes_per_token = u64::from(config.hidden_dim) * u64::from(config.dtype.size_bytes());
         (Self::max_fused_bytes(config.num_gpus) / bytes_per_token) as u32
     }
 }
@@ -71,9 +72,9 @@ impl KernelSpec for AllReduceResidualRmsNormSpec {
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         let max_fused_tokens = Self::max_fused_tokens(config);
         let mut tokens = Axis::chain([Axis::pow2(0, 4), Axis::token_axis()]);
-        tokens.retain(|num_tokens| *num_tokens <= max_fused_tokens as f64);
-        if tokens.last().copied() != Some(max_fused_tokens as f64) {
-            tokens.push(max_fused_tokens as f64);
+        tokens.retain(|num_tokens| *num_tokens <= f64::from(max_fused_tokens));
+        if tokens.last().copied() != Some(f64::from(max_fused_tokens)) {
+            tokens.push(f64::from(max_fused_tokens));
             tokens.sort_by(f64::total_cmp);
         }
         SweepGrid::new(vec![tokens])

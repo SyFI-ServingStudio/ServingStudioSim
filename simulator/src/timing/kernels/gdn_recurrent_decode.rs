@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused recurrent-decode kernel.
+//! Qwen Gated `DeltaNet` fused recurrent-decode kernel.
 //!
 //! The model geometry and dtypes are static config identity. Decode batch size
 //! is the sole physical runtime interpolation axis. `state_dtype` remains an

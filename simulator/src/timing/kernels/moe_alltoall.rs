@@ -1,4 +1,4 @@
-//! FlashInfer MNNVL two-sided MoE all-to-all timing leaf.
+//! `FlashInfer` MNNVL two-sided `MoE` all-to-all timing leaf.
 //!
 //! This is the transfer vLLM runs for expert parallelism under
 //! `--all2all-backend=flashinfer_nvlink_two_sided`. Both legs of the round trip
@@ -92,6 +92,7 @@ pub enum MoeAlltoallDirection {
 }
 
 impl MoeAlltoallDirection {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dispatch => "dispatch",
@@ -116,7 +117,7 @@ pub struct MoeAlltoallKernelConfig {
     /// even when the experts are fp8 (see the arch that builds this config).
     pub hidden_bytes: Dim,
     pub direction: MoeAlltoallDirection,
-    /// Row/cache key only: MNNVL is NVLink by construction.
+    /// Row/cache key only: MNNVL is `NVLink` by construction.
     pub fabric: Fabric,
 }
 

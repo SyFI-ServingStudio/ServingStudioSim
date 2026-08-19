@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet scalar chunk-local cumulative-sum kernel.
+//! Qwen Gated `DeltaNet` scalar chunk-local cumulative-sum kernel.
 //!
 //! Public inputs remain the physical `(num_tokens, num_chunks)` caller shape,
 //! while the cache projects them to `(C, D=T/C)`: launch chunks and average
@@ -36,8 +36,8 @@ pub struct GdnChunkLocalCumsumKernelInput {
 impl SweepCoords for GdnChunkLocalCumsumKernelInput {
     fn coords(&self) -> Coords {
         Coords::new([
-            self.num_chunks as f64,
-            self.num_tokens as f64 / self.num_chunks as f64,
+            f64::from(self.num_chunks),
+            f64::from(self.num_tokens) / f64::from(self.num_chunks),
         ])
     }
 

@@ -1,7 +1,7 @@
 //! GLM-5.2 local DSA attention worklet in **vLLM kernel granularity**.
 //!
 //! Same section as [`super::glm52_dsa_attn_local`]: TP1 MLA attention with the
-//! optional DSA indexer, from the entry residual RMSNorm through o_proj.
+//! optional DSA indexer, from the entry residual `RMSNorm` through `o_proj`.
 //!
 //! The one divergence: vLLM launches a BF16->FP8 block quantisation
 //! (`fp8_blockscale_gemm::scale_1x128_kernel`) before **each** dense FP8 GEMM,
@@ -107,7 +107,7 @@ pub struct VllmGlm52DsaAttnLocalWorkletConfig {
     pub residual_rms_norm_backends: Vec<&'static str>,
     pub rms_norm_backends: Vec<&'static str>,
     pub single_gemm_backends: Vec<&'static str>,
-    /// Backend for the inductor-fused query RoPE -- the worklet's only
+    /// Backend for the inductor-fused query `RoPE` -- the worklet's only
     /// pointwise leaf, and not an `elementwise` one: it is a compiled vLLM
     /// fusion that rewrites all of q, not a streaming kernel over the rope
     /// slice. The indexer and sparse-MLA ops keep their own roles below.
@@ -138,7 +138,7 @@ pub struct VllmGlm52DsaAttnLocalWorkletConfig {
     pub index_head_dim: Dim,
     pub selected_k: u32,
     pub max_model_len: Dim,
-    /// Row count of the RoPE cos/sin table, i.e. the checkpoint's
+    /// Row count of the `RoPE` cos/sin table, i.e. the checkpoint's
     /// `max_position_embeddings` -- NOT the runtime `max_model_len`. vLLM
     /// builds the table from the model config at `deepseek_v2.py:503`, so a
     /// shorter serving context does not shrink it.
@@ -148,7 +148,7 @@ pub struct VllmGlm52DsaAttnLocalWorkletConfig {
     pub quant_block_size: u32,
     pub softmax_scale_denominator: u32,
     pub base_dtype: DType,
-    /// Dtype used only by generic projection SingleGemm leaves. Specialized
+    /// Dtype used only by generic projection `SingleGemm` leaves. Specialized
     /// MLA/indexer kernels retain their explicit dtype fields below.
     pub gemm_dtype: DType,
     pub index_cache_dtype: DType,
@@ -173,7 +173,7 @@ pub struct VllmGlm52DsaAttnLocalWorkletConfig {
 }
 
 /// Pure resolved data: every atomic config is baked, and the optional indexer
-/// config is absent for IndexShare instances.
+/// config is absent for `IndexShare` instances.
 #[derive(Clone, Debug)]
 pub struct VllmGlm52DsaAttnLocalWorkletResolved {
     pub raw_cfg: VllmGlm52DsaAttnLocalWorkletConfig,
@@ -235,6 +235,7 @@ pub struct VllmGlm52DsaAttnLocalWorklet {
 impl VllmGlm52DsaAttnLocalWorklet {
     /// Resolve the one supported GLM-5.2 local identity without touching a
     /// bridge, GPU, cache, or `Arc`.
+    #[must_use]
     pub fn resolve_config(
         cfg: &VllmGlm52DsaAttnLocalWorkletConfig,
     ) -> VllmGlm52DsaAttnLocalWorkletResolved {

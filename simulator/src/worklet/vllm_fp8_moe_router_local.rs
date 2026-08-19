@@ -36,6 +36,7 @@ pub struct VllmFp8MoeRouterLocalWorklet {
 }
 
 impl VllmFp8MoeRouterLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &VllmFp8MoeRouterLocalWorkletConfig,
     ) -> VllmFp8MoeRouterLocalWorkletResolved {

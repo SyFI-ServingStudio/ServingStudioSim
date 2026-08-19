@@ -1,5 +1,5 @@
 //! `orchestrator` (L6) — pool-local orchestration (L6a) + inter-pool deployment
-//! flow (L6b). See doc/detailed_design/L6.md.
+//! flow (L6b). See `doc/detailed_design/L6.md`.
 //!
 //! Module root holds only the `Flow` contract (the single surface L7 needs) and
 //! the module wiring. Shared vocabulary + worker-stamping infra live in

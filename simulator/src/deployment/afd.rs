@@ -417,7 +417,7 @@ where
 /// message bytes, not dtype), so an fp8 handoff is just fewer bytes on the same
 /// curve — the fp8-width byte count is supplied by the arch's handoff size. Lists
 /// nccl + nvshmem for parity with the collective ops (best-of-N picks the faster);
-/// note p2p_inter is an analytical, backend-agnostic curve, so both resolve alike.
+/// note `p2p_inter` is an analytical, backend-agnostic curve, so both resolve alike.
 fn build_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result<CostSource> {
     let kernel = P2pInterKernel::build(
         "afd_qkv_transfer".to_string(),

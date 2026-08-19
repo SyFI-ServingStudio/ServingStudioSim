@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet chunk-local triangular solve kernel.
+//! Qwen Gated `DeltaNet` chunk-local triangular solve kernel.
 //!
 //! `max_chunk_tokens` is deliberately static configuration identity: it changes
 //! which chunk occupancies are valid, while runtime callers still provide only
@@ -36,7 +36,7 @@ pub struct GdnChunkSolveTrilKernelInput {
 
 impl SweepCoords for GdnChunkSolveTrilKernelInput {
     fn coords(&self) -> Coords {
-        Coords::new([self.num_tokens as f64, self.num_chunks as f64])
+        Coords::new([f64::from(self.num_tokens), f64::from(self.num_chunks)])
     }
 
     fn coord_field_names() -> &'static [&'static str] {

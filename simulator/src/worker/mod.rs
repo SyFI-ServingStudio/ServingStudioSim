@@ -1,5 +1,5 @@
 //! `worker` (L5) — per-worker FSM that turns admitted requests into iter cost
-//! queries and drives request lifecycle. See doc/detailed_design/L5.md.
+//! queries and drives request lifecycle. See `doc/detailed_design/L5.md`.
 //!
 //! Production workers are statically composed under `workers/<cadence-family>/`:
 //! whole-iteration barebone/HP/PD-prefill, pull+decode PD-decode, slot-pipelined

@@ -53,7 +53,7 @@ pub struct AllReduceKernelInput {
     /// complete output size. Example: a TP layer's row-parallel projection
     /// produces a full `[tokens × hidden]` partial-sum on every rank, so the
     /// caller passes `tokens × hidden × dtype_bytes` (full hidden, NOT
-    /// hidden/tp_size).
+    /// `hidden/tp_size`).
     pub message_size_bytes: u64,
 }
 

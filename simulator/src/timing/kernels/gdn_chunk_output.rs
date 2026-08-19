@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused chunk-output kernel.
+//! Qwen Gated `DeltaNet` fused chunk-output kernel.
 //!
 //! The public input retains physical `(T, C)`, while the cache projects to
 //! `(C, D=T/C)`. `C` controls the launch count, and `D` captures the measured
@@ -32,7 +32,7 @@ pub struct GdnChunkOutputKernelInput {
 
 impl SweepCoords for GdnChunkOutputKernelInput {
     fn coords(&self) -> Coords {
-        Coords::new([self.num_tokens as f64, self.num_chunks as f64])
+        Coords::new([f64::from(self.num_tokens), f64::from(self.num_chunks)])
     }
 
     fn coord_field_names() -> &'static [&'static str] {
@@ -61,8 +61,8 @@ impl KernelSpec for GdnChunkOutputSpec {
 
     fn cache_coords(_config: &Self::Config, input: &Self::Input) -> Coords {
         Coords::new([
-            input.num_chunks as f64,
-            input.num_tokens as f64 / input.num_chunks as f64,
+            f64::from(input.num_chunks),
+            f64::from(input.num_tokens) / f64::from(input.num_chunks),
         ])
     }
 

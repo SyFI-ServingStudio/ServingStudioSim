@@ -70,7 +70,7 @@ impl Hasher for FlatHasher {
         // its length prefix) route through here, so folding bytes covers the whole key.
         let mut h = self.0;
         for &b in bytes {
-            h ^= b as u64;
+            h ^= u64::from(b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a 64-bit prime
         }
         self.0 = h;
@@ -154,7 +154,7 @@ impl CostBuffers {
         }
     }
 
-    /// Iter-wise convenience constructor: the model exposes one fused CostTree, so
+    /// Iter-wise convenience constructor: the model exposes one fused `CostTree`, so
     /// its manifest is a single `iter` section. Equivalent to [`new`](Self::new)
     /// with `CostManifestDoc::single("iter", model.cost_log_manifest())`.
     pub fn new_iter<M: IterwiseUnifiedModel + ?Sized>(
@@ -229,7 +229,7 @@ impl CostBuffers {
             for chunk in name.chunks(4) {
                 let mut w = 0u32;
                 for (i, &b) in chunk.iter().enumerate() {
-                    w |= (b as u32) << (8 * i);
+                    w |= u32::from(b) << (8 * i);
                 }
                 self.key_scratch.push(w);
             }
@@ -249,8 +249,8 @@ impl CostBuffers {
                         iter_id,
                         batch_id,
                         wall_start_ms: now.as_ms(),
-                        total_time_ms: agg.m.time_ms as f64,
-                        energy_j: agg.m.energy_j as f64,
+                        total_time_ms: f64::from(agg.m.time_ms),
+                        energy_j: f64::from(agg.m.energy_j),
                         section,
                         layer,
                         group_len: 0,
@@ -283,8 +283,8 @@ impl CostBuffers {
                 iter_id,
                 batch_id,
                 wall_start_ms: now.as_ms(),
-                total_time_ms: agg.m.time_ms as f64,
-                energy_j: agg.m.energy_j as f64,
+                total_time_ms: f64::from(agg.m.time_ms),
+                energy_j: f64::from(agg.m.energy_j),
                 section,
                 layer,
                 // Filled by `logger.record` from the slice lengths.
@@ -327,7 +327,7 @@ impl CostBuffers {
     /// clock; `cost_log` rows are written pre-scale (pure kernel) by the callers
     /// above, so folding a row's `slot_time_ms` still reproduces its `total_time_ms`.
     fn wall_time(&self, agg: &LeafMetrics) -> Time {
-        Time::from_ms(agg.m.time_ms as f64 * self.gpu_time_multiplier)
+        Time::from_ms(f64::from(agg.m.time_ms) * self.gpu_time_multiplier)
     }
 
     /// Iter-wise convenience over [`run_section`](Self::run_section): the whole

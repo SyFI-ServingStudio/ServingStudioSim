@@ -74,8 +74,8 @@ pub trait KernelConfig:
 }
 
 /// One impl per kernel kind. Declares the per-kernel types (Config / Input),
-/// the `KIND` identifier, the three required dispatch fns (sweep_grid /
-/// cache_kind / enumerate), and an optional config-aware cache projection.
+/// the `KIND` identifier, the three required dispatch fns (`sweep_grid` /
+/// `cache_kind` / enumerate), and an optional config-aware cache projection.
 /// Everything else lives in `Kernel<S>`; the `backends` invariant lives on
 /// `KernelConfig`.
 ///
@@ -99,6 +99,7 @@ pub trait KernelSpec: 'static {
     /// *variant* (same physical kernel, different cache axes) reuses an existing
     /// kernel's profiled rows: the variant carries its own `KIND` for the
     /// registry/identity but profiles through the base kind's facade + table.
+    #[must_use]
     fn profile_kind() -> KernelKind {
         Self::KIND
     }
@@ -295,7 +296,7 @@ impl<S: KernelSpec> Kernel<S> {
         })
     }
 
-    /// All-four-metrics best-of-N for the CostTree eval path: return the
+    /// All-four-metrics best-of-N for the `CostTree` eval path: return the
     /// [`LeafMetrics`] from the backend with the smallest non-negative wallclock,
     /// preserving that backend's coverage bits.
     pub fn eval(&self, input: &S::Input) -> LeafMetrics {
@@ -380,7 +381,7 @@ impl<S: KernelSpec> Probe for Kernel<S> {
     fn eval(&self, input: &Self::Input) -> LeafMetrics {
         Self::eval(self, input)
     }
-    /// The KIND tag + one-line config summary the CostTree compile captures into
+    /// The KIND tag + one-line config summary the `CostTree` compile captures into
     /// the leaf's manifest entry (the old `Describe` leaf line). One blanket impl
     /// covers every kernel since all are `Kernel<S>`.
     fn kind(&self) -> &'static str {

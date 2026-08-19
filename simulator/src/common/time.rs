@@ -13,34 +13,42 @@ pub struct Time(pub u64);
 impl Time {
     pub const ZERO: Time = Time(0);
 
+    #[must_use]
     pub const fn from_ns(ns: u64) -> Time {
         Time(ns)
     }
 
+    #[must_use]
     pub const fn from_us(us: u64) -> Time {
         Time(us * 1_000)
     }
 
+    #[must_use]
     pub const fn from_ms_u64(ms: u64) -> Time {
         Time(ms * 1_000_000)
     }
 
+    #[must_use]
     pub fn from_ms(ms: f64) -> Time {
         Time((ms * 1_000_000.0) as u64)
     }
 
+    #[must_use]
     pub fn from_s(s: f64) -> Time {
         Time((s * 1_000_000_000.0) as u64)
     }
 
+    #[must_use]
     pub const fn as_ns(self) -> u64 {
         self.0
     }
 
+    #[must_use]
     pub fn as_ms(self) -> f64 {
         self.0 as f64 / 1_000_000.0
     }
 
+    #[must_use]
     pub fn as_s(self) -> f64 {
         self.0 as f64 / 1_000_000_000.0
     }

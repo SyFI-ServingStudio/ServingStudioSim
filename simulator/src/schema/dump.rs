@@ -13,8 +13,8 @@
 //!
 //! This module only *arranges* — every param's defaults / choices / cache-key
 //! flag is *derived from the config types themselves*: `#[derive(ParamStruct)]`
-//! emits a `PARAMS` const (ModelSpec / GroupSpec / PoolSpec / WorkloadSpec /
-//! IoSpec) and `#[derive(ProviderSchema)]` a per-variant `SCHEMA` const on each
+//! emits a `PARAMS` const (`ModelSpec` / `GroupSpec` / `PoolSpec` / `WorkloadSpec` /
+//! `IoSpec`) and `#[derive(ProviderSchema)]` a per-variant `SCHEMA` const on each
 //! arch/worker selector. `GroupSpec` / `PoolSpec` are generic but their params
 //! don't touch the type params, so we read them off a `<(), ()>` instantiation.
 //! Side-effect-free.
@@ -27,7 +27,7 @@ use crate::orchestrator::config::{GroupSpec, PoolSpec};
 use crate::schema::ParamDef;
 use crate::worker::config::{AttnWorkerSel, FfnWorkerSel, IterWorkerSel};
 
-/// Serialize a `const PARAMS` slice to a JSON array of ParamDef objects.
+/// Serialize a `const PARAMS` slice to a JSON array of `ParamDef` objects.
 fn params(p: &[ParamDef]) -> Value {
     serde_json::to_value(p).expect("ParamDef is infallibly Serialize")
 }
@@ -42,6 +42,7 @@ fn providers(schema: &[(&str, &[ParamDef])]) -> Value {
 }
 
 /// Build the full `list-params` registry JSON (new-interface-design §11.1).
+#[must_use]
 pub fn list_params() -> Value {
     json!({
         "deployments": {

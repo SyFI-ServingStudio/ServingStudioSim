@@ -1,4 +1,4 @@
-//! FlashInfer/TensorRT-LLM MoE finalize-routing timing leaf.
+//! FlashInfer/TensorRT-LLM `MoE` finalize-routing timing leaf.
 //!
 //! The physical kernel receives the global token count plus the number of
 //! routed rows resident on this EP rank.  Keep only `token_count` as a runtime

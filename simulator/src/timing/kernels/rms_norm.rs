@@ -1,4 +1,4 @@
-//! RMSNorm kernel: one cached perf model per `(hidden, dtype)` config.
+//! `RMSNorm` kernel: one cached perf model per `(hidden, dtype)` config.
 //!
 //! Everything generic (build / eval / the `Probe` impl /
 //! for-backend loops) lives in `engine::Kernel<S>`. This file declares the

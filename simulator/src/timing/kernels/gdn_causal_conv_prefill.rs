@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused causal-convolution fresh-prefill kernel.
+//! Qwen Gated `DeltaNet` fused causal-convolution fresh-prefill kernel.
 //!
 //! The cache uses the physical `(batch_size, sequence_length)` caller shape.
 //! Power-of-two sequence lengths retain every previously accepted profile row,
@@ -36,7 +36,7 @@ pub struct GdnCausalConvPrefillKernelInput {
 
 impl SweepCoords for GdnCausalConvPrefillKernelInput {
     fn coords(&self) -> Coords {
-        Coords::new([self.batch_size as f64, self.sequence_length as f64])
+        Coords::new([f64::from(self.batch_size), f64::from(self.sequence_length)])
     }
 
     fn coord_field_names() -> &'static [&'static str] {

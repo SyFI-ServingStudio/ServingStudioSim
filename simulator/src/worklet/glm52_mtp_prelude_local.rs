@@ -5,7 +5,7 @@
 //! concatenates both rows, and projects the result back to hidden width. This
 //! TP1 section has no embedding collective. Embedding lookup, masking, and
 //! concatenation use measured elementwise traffic approximations; the two
-//! RMSNorms and the final GEMM remain separate measured leaves.
+//! `RMSNorms` and the final GEMM remain separate measured leaves.
 
 use std::sync::Arc;
 
@@ -83,6 +83,7 @@ pub struct Glm52MtpPreludeLocalWorklet {
 impl Glm52MtpPreludeLocalWorklet {
     /// Resolve the one supported GLM-5.2 MTP-prelude identity without touching
     /// a bridge, GPU, cache, or `Arc`.
+    #[must_use]
     pub fn resolve_config(
         cfg: &Glm52MtpPreludeLocalWorkletConfig,
     ) -> Glm52MtpPreludeLocalWorkletResolved {

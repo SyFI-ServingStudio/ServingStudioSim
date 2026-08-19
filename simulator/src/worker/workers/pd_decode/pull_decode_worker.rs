@@ -171,7 +171,7 @@ where
         let tokens = {
             let store = self.context.requests.borrow();
             let record = &store[request];
-            record.request.definition.prompt_tokens as u64
+            u64::from(record.request.definition.prompt_tokens)
         };
         self.pull_pipeline
             .pending_decodes
@@ -293,11 +293,7 @@ where
     #[inline]
     fn pull_backlog_tokens(&self) -> u64 {
         self.pull_pipeline.pending_decode_tokens
-            + self
-                .pull_pipeline
-                .in_flight
-                .map(|pull| pull.tokens)
-                .unwrap_or(0)
+            + self.pull_pipeline.in_flight.map_or(0, |pull| pull.tokens)
     }
 
     fn tick_idle(&mut self, now: Time) -> bool {
@@ -370,9 +366,11 @@ where
             &self.context.requests,
             &mut self.input,
         );
-        let cost =
-            self.execution
-                .evaluate_iteration(&self.input, self.decode_fsm.iteration as u64, now);
+        let cost = self.execution.evaluate_iteration(
+            &self.input,
+            u64::from(self.decode_fsm.iteration),
+            now,
+        );
         now + cost
     }
 

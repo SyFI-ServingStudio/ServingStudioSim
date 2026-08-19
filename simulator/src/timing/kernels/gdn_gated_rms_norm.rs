@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused gated RMS normalization kernel.
+//! Qwen Gated `DeltaNet` fused gated RMS normalization kernel.
 //!
 //! Hidden width and compute dtype are static config identity. The flattened row
 //! count `m` is the sole physical runtime interpolation axis: Qwen maps it from

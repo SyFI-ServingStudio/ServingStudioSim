@@ -3,7 +3,7 @@
 //! Attention is TP1 and independently replicated over the EP ranks. Decoder
 //! layers 0--2 execute the dense FFN and a full DSA indexer. Layers 3--5 reuse
 //! the layer-2 index, then layers 6--77 repeat a four-layer cadence containing
-//! one full-index layer and three IndexShare layers. Sparse-MoE communication
+//! one full-index layer and three `IndexShare` layers. Sparse-MoE communication
 //! uses pure EP (`Placement::RoundRobin`). Shared-expert compute is conservatively
 //! serialized with routed-expert work; no auxiliary-stream overlap is claimed.
 //!
@@ -1190,6 +1190,7 @@ pub fn build(
 }
 
 impl Glm52DsaMoeModel {
+    #[must_use]
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let embedding = labeled_max(

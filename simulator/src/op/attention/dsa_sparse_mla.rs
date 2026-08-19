@@ -10,8 +10,8 @@
 //! `(Q, S)` cells are evaluated per request and summed into one fixed slot;
 //! decode is one optional cell already collapsed by L3. Mixed batches therefore
 //! sum prefill and decode leaves even when production can combine them in one
-//! FlashMLA launch. This intentionally approximates that shared launch overhead
-//! while preserving a request-count-independent CostTree.
+//! `FlashMLA` launch. This intentionally approximates that shared launch overhead
+//! while preserving a request-count-independent `CostTree`.
 
 use std::sync::Arc;
 

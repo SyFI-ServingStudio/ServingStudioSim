@@ -79,6 +79,7 @@ pub struct FlashInferAttentionInput {
 impl FlashInferAttentionConfig {
     /// KV cache dtype: fp8 in an fp8 run (both prefill and decode read fp8 KV),
     /// else the base dtype. Used by the arch's KV-byte accounting.
+    #[must_use]
     pub fn kv_dtype(&self) -> DType {
         if self.fp8 {
             DType::Fp8E4m3
@@ -124,7 +125,7 @@ impl FlashInferAttentionOp {
         })
     }
 
-    /// CostTree compile: three fixed leaves — append, prefill, decode — regardless
+    /// `CostTree` compile: three fixed leaves — append, prefill, decode — regardless
     /// of request count (INV-1: stable shape). The per-request prefill fan-out is
     /// NOT one slot per request; at eval the `prefill` slot is the aggregating leaf
     /// that sums `prefill.eval(prefix_i, append_i)` over
@@ -150,7 +151,7 @@ impl FlashInferAttentionOp {
         ])
     }
 
-    /// CostTree eval: fill the three fixed slots `compile` minted — append,
+    /// `CostTree` eval: fill the three fixed slots `compile` minted — append,
     /// `prefill`, then `decode`. The prefill slot is the INV-1 aggregating leaf:
     /// sum the per-request `prefill.eval` over `prefill_chunk_pairs` into one slot. The decode
     /// slot collapses all decode requests to one cell (zero metrics when none).

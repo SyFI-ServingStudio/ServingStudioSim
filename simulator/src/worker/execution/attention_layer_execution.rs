@@ -77,7 +77,7 @@ impl<M: AttnLayerwiseModel> AttentionLayerExecution for AttentionLayerExecutionA
                 group.total_kv_len += current_kv;
             }
         }
-        group.batch_tokens as u64
+        u64::from(group.batch_tokens)
     }
 
     fn evaluate_attention_layer(
@@ -89,12 +89,12 @@ impl<M: AttnLayerwiseModel> AttentionLayerExecution for AttentionLayerExecutionA
         now: Time,
     ) -> Time {
         let model = Arc::clone(&self.model);
-        let cache_key = [iteration as u32, (iteration >> 32) as u32, slot as u32];
+        let cache_key = [iteration as u32, (iteration >> 32) as u32, u32::from(slot)];
         self.cost.run_section(
             "attn",
             layer as i16,
             iteration,
-            slot as u64,
+            u64::from(slot),
             &input.groups,
             Some(&cache_key),
             now,

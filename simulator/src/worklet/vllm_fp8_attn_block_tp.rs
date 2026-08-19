@@ -1,14 +1,14 @@
 //! `VllmFp8AttnBlockTpWorklet` — tensor-parallel attention block of a dense decoder
-//! layer: input RMSNorm → column-parallel fused QKV → attention over per-rank
-//! heads → row-parallel o_proj → optional `tp_allreduce`. `TP` group suffix
+//! layer: input `RMSNorm` → column-parallel fused QKV → attention over per-rank
+//! heads → row-parallel `o_proj` → optional `tp_allreduce`. `TP` group suffix
 //! (L3 §1.5): the block is one sync section whose boundary is the all-reduce
-//! that sums the row-parallel o_proj output across the `tp_size` ranks.
+//! that sums the row-parallel `o_proj` output across the `tp_size` ranks.
 //!
 //! Megatron TP distributes the attention heads: QKV is column-parallel (each
 //! rank owns `num_qo_heads / tp` query heads and `num_kv_heads / tp` KV heads),
-//! attention runs on those local heads, and the row-parallel o_proj's full
+//! attention runs on those local heads, and the row-parallel `o_proj`'s full
 //! `[tokens × hidden]` partial-sum is re-synced with the all-reduce. `hidden` is
-//! NOT sharded (qkv input k=hidden, o_proj output n=hidden).
+//! NOT sharded (qkv input k=hidden, `o_proj` output n=hidden).
 //!
 //! `tp_size == 1` degenerates to the single-GPU case: per-rank == full, and the
 //! `tp_ar` slot is `None` (no collective), so the cost matches the `Local` path.
@@ -42,14 +42,14 @@ pub struct VllmFp8AttnBlockTpWorkletConfig {
     pub num_qo_heads: Dim,
     pub num_kv_heads: Dim,
     pub head_dim: Dim,
-    /// Base (16-bit) dtype — RMSNorm + attention output/decode-query keep it.
+    /// Base (16-bit) dtype — `RMSNorm` + attention output/decode-query keep it.
     pub dtype: DType,
     pub tp_size: u16,
     /// Symbol name for `tp_size` in the derivation formula (`attn_tp`/`tp`) — the
     /// arch owns which sharding degree this worklet's `tp` is.
     pub tp_name: &'static str,
     pub allreduce_fabric: Fabric,
-    /// Wire dtype of the row-parallel o_proj partial sum. This is deliberately
+    /// Wire dtype of the row-parallel `o_proj` partial sum. This is deliberately
     /// independent from the GEMM compute dtype: FP8 GEMMs commonly accumulate
     /// and communicate BF16 outputs.
     pub allreduce_dtype: DType,
@@ -64,7 +64,7 @@ pub struct VllmFp8AttnBlockTpWorkletConfig {
     pub kv_scale_granularity: String,
     pub allreduce_backends: Vec<&'static str>,
     /// Optional vLLM production backend for the small-shape fused
-    /// all-reduce + residual + RMSNorm boundary. An empty list keeps the
+    /// all-reduce + residual + `RMSNorm` boundary. An empty list keeps the
     /// traditional pure-all-reduce path for architectures that do not fuse.
     pub fused_allreduce_backends: Vec<&'static str>,
 }
@@ -109,6 +109,7 @@ pub struct VllmFp8AttnBlockTpWorklet {
 impl VllmFp8AttnBlockTpWorkletConfig {
     /// KV cache dtype: fp8 in an fp8 run (both prefill and decode read fp8 KV),
     /// else the base dtype. Used by the arch's KV-byte accounting (`raw_cfg`).
+    #[must_use]
     pub fn kv_dtype(&self) -> DType {
         DType::Fp8E4m3
     }
@@ -118,7 +119,7 @@ impl VllmFp8AttnBlockTpWorklet {
     pub fn resolve_config(
         cfg: &VllmFp8AttnBlockTpWorkletConfig,
     ) -> VllmFp8AttnBlockTpWorkletResolved {
-        let tp = cfg.tp_size as u32;
+        let tp = u32::from(cfg.tp_size);
         // GQA dual-divisibility: both head counts split across the TP ranks.
         // tp <= num_kv_heads (no KV-head replication in v1).
         assert!(
@@ -172,7 +173,7 @@ impl VllmFp8AttnBlockTpWorklet {
                 AllReduceResidualRmsNormKernelConfig {
                     backends: cfg.fused_allreduce_backends.clone(),
                     gpu_name: cfg.gpu_name.clone(),
-                    num_gpus: cfg.tp_size as u32,
+                    num_gpus: u32::from(cfg.tp_size),
                     hidden_dim: cfg.hidden.get(),
                     dtype: cfg.allreduce_dtype,
                     fabric: cfg.allreduce_fabric,
@@ -217,7 +218,7 @@ impl VllmFp8AttnBlockTpWorklet {
                 // message width off a dtype-agnostic curve.
                 backends: cfg.allreduce_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                num_gpus: cfg.tp_size as u32,
+                num_gpus: u32::from(cfg.tp_size),
                 fabric: cfg.allreduce_fabric,
             }),
             // This worklet owns the post-attention norm boundary for every
@@ -301,8 +302,8 @@ impl VllmFp8AttnBlockTpWorklet {
         })
     }
 
-    /// CostTree compile: sum input_norm + qkv + attn (append/prefill/decode leaves)
-    /// + o_proj + optional tp_allreduce, wrapped in a `Labeled` partition header.
+    /// `CostTree` compile: sum `input_norm` + qkv + attn (append/prefill/decode leaves)
+    /// + `o_proj` + optional `tp_allreduce`, wrapped in a `Labeled` partition header.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let r = &self.resolved;
         let label = format!(
@@ -331,7 +332,7 @@ impl VllmFp8AttnBlockTpWorklet {
         }
     }
 
-    /// CostTree eval: fill slots in the exact `compile` child order so the
+    /// `CostTree` eval: fill slots in the exact `compile` child order so the
     /// evaluator cursor stays aligned with the minted slot indices.
     pub fn eval(&self, input: &VllmFp8AttnBlockTpWorkletInput, ev: &mut Evaluator) {
         let m = input.batch_tokens;
@@ -348,9 +349,9 @@ impl VllmFp8AttnBlockTpWorklet {
         self.o_proj
             .eval(&SingleFp8GemmWithQuantInput { num_tokens: m }, ev);
         let use_fused = use_fused_allreduce(m, self.resolved.max_fused_tokens);
-        let message_size_bytes = (m as u64)
-            * (self.resolved.raw_cfg.hidden.get() as u64)
-            * (self.resolved.allreduce_dtype_bytes as u64);
+        let message_size_bytes = u64::from(m)
+            * u64::from(self.resolved.raw_cfg.hidden.get())
+            * u64::from(self.resolved.allreduce_dtype_bytes);
         if let Some(tp_ar) = &self.tp_ar {
             let ar_input = AllReduceKernelInput { message_size_bytes };
             if use_fused || m == 0 {

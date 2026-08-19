@@ -53,6 +53,7 @@ pub struct AttnLocalWorklet {
 }
 
 impl AttnLocalWorklet {
+    #[must_use]
     pub fn resolve_config(cfg: &AttnLocalWorkletConfig) -> AttnLocalWorkletResolved {
         AttnLocalWorkletResolved {
             attn: FlashInferAttentionConfig {
@@ -86,7 +87,7 @@ impl AttnLocalWorklet {
         })
     }
 
-    /// CostTree compile: the attention op's fixed append/prefill/decode leaves,
+    /// `CostTree` compile: the attention op's fixed append/prefill/decode leaves,
     /// wrapped in a `Labeled` node carrying the worklet identity + partition/shape
     /// annotation (the old `Describe` header lines).
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
@@ -103,7 +104,7 @@ impl AttnLocalWorklet {
         }
     }
 
-    /// CostTree eval: delegate to the attn op (append/prefill/decode slots),
+    /// `CostTree` eval: delegate to the attn op (append/prefill/decode slots),
     /// mapping the worklet input to the op input in the same order as `compile`.
     pub fn eval(&self, input: &AttnLocalWorkletInput, ev: &mut Evaluator) {
         let op_in = FlashInferAttentionInput {

@@ -1,4 +1,4 @@
-//! Native FP8 AFD post-attention section: quantized row-parallel o_proj,
+//! Native FP8 AFD post-attention section: quantized row-parallel `o_proj`,
 //! optional pure TP all-reduce, then native FP8 post-norm + router.
 
 use std::sync::Arc;
@@ -60,6 +60,7 @@ pub struct Fp8PostAttnRouterTpWorklet {
 }
 
 impl Fp8PostAttnRouterTpWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &Fp8PostAttnRouterTpWorkletConfig,
     ) -> Fp8PostAttnRouterTpWorkletResolved {

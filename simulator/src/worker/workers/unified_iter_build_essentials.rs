@@ -32,7 +32,7 @@ pub(super) fn full_attention_token_capacity<M: IterwiseUnifiedModel>(
 ) -> u64 {
     let partition_kv_bytes = config
         .attn_kv_bytes
-        .saturating_mul(model.num_attn_shards().max(1) as u64);
+        .saturating_mul(u64::from(model.num_attn_shards().max(1)));
     (partition_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1)
 }
 

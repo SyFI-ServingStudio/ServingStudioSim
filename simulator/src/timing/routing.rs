@@ -25,6 +25,7 @@ fn pow_exact(base: f64, exp: u32) -> f64 {
     result
 }
 
+#[must_use]
 pub fn ranks_per_nvl_domain(ep_size: u32, nvl_num_gpu: u32) -> Vec<u32> {
     if ep_size == 0 {
         return Vec::new();
@@ -45,6 +46,7 @@ pub fn ranks_per_nvl_domain(ep_size: u32, nvl_num_gpu: u32) -> Vec<u32> {
 impl RoutingDistribution {
     pub const TOTAL_PPM: u32 = 1_000_000;
 
+    #[must_use]
     pub fn from_profile(per_expert_ratios: &[f32]) -> Self {
         if per_expert_ratios.is_empty() {
             return Self { ppm: Vec::new() };
@@ -56,6 +58,7 @@ impl RoutingDistribution {
         Self::from_weights(&weights)
     }
 
+    #[must_use]
     pub fn uniform(num_experts: u32) -> Self {
         if num_experts == 0 {
             return Self { ppm: Vec::new() };
@@ -69,6 +72,7 @@ impl RoutingDistribution {
         Self { ppm }
     }
 
+    #[must_use]
     pub fn power_law(num_experts: u32, alpha: f32) -> Self {
         if num_experts == 0 {
             return Self { ppm: Vec::new() };
@@ -86,6 +90,7 @@ impl RoutingDistribution {
     /// ppm across runs and machines — a `routing = random` run stays reproducible
     /// (the throughput golden is bit-identical). Vary `seed` to sample a
     /// different skew.
+    #[must_use]
     pub fn random(num_experts: u32, seed: u64) -> Self {
         if num_experts == 0 {
             return Self { ppm: Vec::new() };
@@ -95,10 +100,12 @@ impl RoutingDistribution {
         Self::from_weights(&weights)
     }
 
+    #[must_use]
     pub fn num_experts(&self) -> u32 {
         self.ppm.len() as u32
     }
 
+    #[must_use]
     pub fn ppm(&self) -> &[u32] {
         &self.ppm
     }
@@ -144,11 +151,12 @@ impl RoutingDistribution {
     /// at least 1 (placed on its top-residual expert) even when its proportional
     /// share rounds to 0. This keeps `per_group_batches` non-empty for the
     /// grouped-GEMM cache; it widens the cross-shard drift at small `global` (Σ
-    /// shards > global), tolerated because the MoE cost path maxes — not sums —
+    /// shards > global), tolerated because the `MoE` cost path maxes — not sums —
     /// across EP ranks. `global == 0` still yields all-zero.
     ///
     /// Associated (not `&self`) so the caller passes whatever ppm slice it
     /// wants: `RoutingDistribution::to_per_expert_counts(total, &dist.ppm()[lo..hi])`.
+    #[must_use]
     pub fn to_per_expert_counts(global_expert_selections: u32, ppm: &[u32]) -> Vec<u32> {
         let mut counts = vec![0u32; ppm.len()];
         let mut numerator_sum: u128 = 0;
@@ -283,6 +291,7 @@ impl RoutingDistribution {
 /// Balanced contiguous split of `num_experts` across `buckets` ranks: the first
 /// `num_experts % buckets` ranks get `⌈E/buckets⌉`, the rest `⌊E/buckets⌋`.
 /// Mirrors ref `balanced_counts`.
+#[must_use]
 pub fn balanced_expert_counts(num_experts: u32, buckets: u32) -> Vec<u32> {
     if buckets == 0 {
         return Vec::new();
@@ -317,14 +326,14 @@ impl RoutingRng {
     }
 }
 
-/// Drive weighted-WITHOUT-replacement top_k routing for `n_tokens` tokens and
+/// Drive weighted-WITHOUT-replacement `top_k` routing for `n_tokens` tokens and
 /// invoke `on_token` once per token with that token's realized hit state:
 /// `hit_rank[r]` / `hit_dom[d]` are the per-rank / per-domain DISTINCT-hit masks
 /// (deduped — a token hitting a rank's experts twice still flags it once).
 /// Experts map to ranks via [`balanced_expert_counts`], ranks to domains via
 /// [`ranks_per_nvl_domain`].
 ///
-/// This is the single source of the per-token routing law: the MoE comm
+/// This is the single source of the per-token routing law: the `MoE` comm
 /// simulator (`op::moe::sim`) consumes each token's hit set to price all six
 /// dispatch/combine stages' per-GPU bytes, so the sampling stays bit-identical
 /// (splitmix64 + fixed iteration order, only +/*/< on f64).

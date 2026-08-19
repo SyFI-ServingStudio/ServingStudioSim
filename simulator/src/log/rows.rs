@@ -136,7 +136,7 @@ fn tpot_stats_ms(times_ms: &[f32]) -> (Option<f32>, Option<f32>, Option<f32>, Op
 
 /// One HP group's input context for a `cost_log` row — the per-iteration
 /// `input_section` (see `simulator/src/log/README.md`), one per `ArchGroupInput` the worker
-/// fed the model_arch. Prefill is kept full (`prefill_chunk_pairs`, moved over
+/// fed the `model_arch`. Prefill is kept full (`prefill_chunk_pairs`, moved over
 /// un-split — the writer thread splits `(prefix, append)` into the two parallel
 /// list columns); decode is aggregated to `decode_request_count` /
 /// `decode_kv_total` (the per-decode KV-length list is the size driver and is
@@ -153,7 +153,7 @@ pub struct GroupInputLog {
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
 }
 
-/// One `cost_log` row — a whole-iteration cost query via the compiled CostTree.
+/// One `cost_log` row — a whole-iteration cost query via the compiled `CostTree`.
 /// `groups` is the per-iteration input context (one entry per HP group);
 /// `slot_time_ms` / `slot_coverage` are the per-slot cost breakdown (positions
 /// named by the matching per-worker `cost_manifest/` sidecar); the scalars are
@@ -195,7 +195,7 @@ pub struct CostLogEntry {
     /// belonging to this row (the per-slot cost breakdown length).
     pub slot_len: usize,
     /// Number of entries in [`CostLogChunk::slot_inputs`] belonging to this row.
-    /// Zero only for models that do not expose a compiled CostTree.
+    /// Zero only for models that do not expose a compiled `CostTree`.
     pub slot_input_len: usize,
 }
 
@@ -206,7 +206,7 @@ pub struct CostLogEntry {
 /// instead of allocating an owned `Vec` per row. The writer walks all four with
 /// cursors keyed by each row's `*_len`.
 pub struct CostLogChunk {
-    /// Stable pool tag for every row in this chunk. A worker owns one CostLogger,
+    /// Stable pool tag for every row in this chunk. A worker owns one `CostLogger`,
     /// so the whole chunk belongs to one `(pool_tag, worker_id)` stream.
     pub pool_tag: &'static str,
     pub entries: Vec<CostLogEntry>,
@@ -227,6 +227,7 @@ pub struct CostLogChunk {
 }
 
 impl CostLogChunk {
+    #[must_use]
     pub fn with_capacity(
         pool_tag: &'static str,
         row_capacity: usize,
@@ -247,10 +248,12 @@ impl CostLogChunk {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }

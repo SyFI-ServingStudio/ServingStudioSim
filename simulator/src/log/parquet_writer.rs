@@ -75,6 +75,7 @@ pub struct StreamingParquetWriter {
 }
 
 impl StreamingParquetWriter {
+    #[must_use]
     pub fn new(path: PathBuf, schema: Arc<Schema>) -> Self {
         Self {
             path,
@@ -90,6 +91,7 @@ impl StreamingParquetWriter {
 
     /// Opt out of parquet dictionary encoding for this stream (see the field docs).
     /// Must be set before the first `write` opens the file.
+    #[must_use]
     pub fn with_dictionary_enabled(mut self, enabled: bool) -> Self {
         self.dictionary_enabled = enabled;
         self
@@ -97,6 +99,7 @@ impl StreamingParquetWriter {
 
     /// Opt out of parquet per-column min/max statistics for this stream (see the
     /// field docs). Must be set before the first `write` opens the file.
+    #[must_use]
     pub fn with_statistics_enabled(mut self, enabled: bool) -> Self {
         self.statistics_enabled = enabled;
         self
@@ -127,6 +130,7 @@ impl StreamingParquetWriter {
     /// with [`ColumnPath::new`], since `ColumnPath::from("a.list.item")` does not
     /// split on `.` and silently matches nothing.
     /// Must be set before the first `write` opens the file.
+    #[must_use]
     pub fn with_column_dictionary_disabled(mut self, columns: Vec<ColumnPath>) -> Self {
         self.no_dictionary_columns = columns;
         self
@@ -143,15 +147,18 @@ impl StreamingParquetWriter {
     ///
     /// Same per-leaf path rule as [`Self::with_column_dictionary_disabled`].
     /// Must be set before the first `write` opens the file.
+    #[must_use]
     pub fn with_column_statistics_disabled(mut self, columns: Vec<ColumnPath>) -> Self {
         self.no_statistics_columns = columns;
         self
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    #[must_use]
     pub fn rows_written(&self) -> usize {
         self.rows_written
     }

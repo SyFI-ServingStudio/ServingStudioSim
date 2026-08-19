@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused chunk-state update kernel.
+//! Qwen Gated `DeltaNet` fused chunk-state update kernel.
 //!
 //! Stable H200 measurements require three cache axes: `C` captures aggregate
 //! chunk work and H snapshots, `N` controls launch programs, and the normalized
@@ -40,10 +40,10 @@ pub struct GdnChunkStateUpdateKernelInput {
 impl SweepCoords for GdnChunkStateUpdateKernelInput {
     fn coords(&self) -> Coords {
         Coords::new([
-            self.num_tokens as f64,
-            self.num_chunks as f64,
-            self.num_sequences as f64,
-            self.max_chunks_per_sequence as f64,
+            f64::from(self.num_tokens),
+            f64::from(self.num_chunks),
+            f64::from(self.num_sequences),
+            f64::from(self.max_chunks_per_sequence),
         ])
     }
 
@@ -174,8 +174,8 @@ impl KernelSpec for GdnChunkStateUpdateSpec {
 
     fn cache_coords(_config: &Self::Config, input: &Self::Input) -> Coords {
         Coords::new([
-            input.num_chunks as f64,
-            input.num_sequences as f64,
+            f64::from(input.num_chunks),
+            f64::from(input.num_sequences),
             normalized_max_chunk_position(
                 input.num_chunks.into(),
                 input.num_sequences.into(),

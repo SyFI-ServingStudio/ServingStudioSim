@@ -46,7 +46,7 @@ pub(super) fn prepare_attention_build_essentials<M: AttnLayerwiseModel>(
     };
     let shard_bytes = config
         .attn_kv_bytes
-        .saturating_mul(model.num_attn_shards().max(1) as u64);
+        .saturating_mul(u64::from(model.num_attn_shards().max(1)));
     let kv_capacity = (shard_bytes / model.total_kv_bytes_per_token().max(1)).max(1);
     let prefix_cache = config.prefix_cache.resolve_tokens(
         kv_capacity,

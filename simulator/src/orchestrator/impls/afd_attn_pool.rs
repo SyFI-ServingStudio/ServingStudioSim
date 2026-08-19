@@ -211,6 +211,7 @@ where
     /// Assemble the AFD aggregator around already-built workers. This is the
     /// construction seam for protocol variants whose worker needs additional
     /// runtime state (for example, an initial PD KV-pull FSM).
+    #[must_use]
     pub fn from_workers(num_layers: u16, workers: Vec<W>) -> Self {
         assert!(
             !workers.is_empty(),

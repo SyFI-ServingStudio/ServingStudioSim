@@ -71,7 +71,7 @@ impl EveryN {
 pub enum TerminationCause {
     /// Every request completed (and, under `run_to_end`, the trace was drained).
     DrainComplete,
-    /// `--duration-ms` reached with work still outstanding (default, no run_to_end).
+    /// `--duration-ms` reached with work still outstanding (default, no `run_to_end`).
     DurationReached,
     /// Trace exhausted but in-flight work made no progress for `stuck_threshold`.
     Stuck,
@@ -138,6 +138,7 @@ impl TickCfg {
     /// ticks also shrink the inter-slice gaps the analyzer trace shows (each
     /// slice end snaps to the tick grid). Clamp 0 → 1 µs: a zero step would make
     /// the derived periodic gates (`ticks()` below) divide by zero.
+    #[must_use]
     pub fn new(duration_ms: f64, run_to_end: bool, tick_dt_us: u64) -> Self {
         let tick_dt = Time::from_us(tick_dt_us.max(1));
         Self {
@@ -282,11 +283,11 @@ pub fn run_sim(
             .count() as u64;
         let prefill_tok: u64 = s
             .iter_arrived()
-            .map(|(_, record)| record.progress.prefill_tokens_processed as u64)
+            .map(|(_, record)| u64::from(record.progress.prefill_tokens_processed))
             .sum();
         let decode_tok: u64 = s
             .iter_arrived()
-            .map(|(_, record)| record.progress.output_tokens_emitted as u64)
+            .map(|(_, record)| u64::from(record.progress.output_tokens_emitted))
             .sum();
         let all_tok = prefill_tok + decode_tok;
         // Throughput is the *modeled* serving rate: tokens / requests per second
@@ -392,8 +393,8 @@ fn state_agg(store: &RequestStore, now: Time) -> RequestStateEntry {
     let mut n_admitted = 0u64;
     let mut n_completed = 0u64;
     for (_id, rec) in store.iter_admitted() {
-        prefill_tokens_cum += rec.progress.prefill_tokens_processed as u64;
-        decode_tokens_cum += rec.progress.output_tokens_emitted as u64;
+        prefill_tokens_cum += u64::from(rec.progress.prefill_tokens_processed);
+        decode_tokens_cum += u64::from(rec.progress.output_tokens_emitted);
         n_admitted += 1;
         if rec.lifecycle.completed {
             n_completed += 1;
@@ -419,15 +420,21 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         .iter()
         .map(|t| t.as_ms() as f32)
         .collect();
-    let first_ms = rec.telemetry.first_output_time.map(|time| time.as_ms());
-    let last_ms = rec.telemetry.last_output_time.map(|time| time.as_ms());
+    let first_ms = rec
+        .telemetry
+        .first_output_time
+        .map(super::super::common::time::Time::as_ms);
+    let last_ms = rec
+        .telemetry
+        .last_output_time
+        .map(super::super::common::time::Time::as_ms);
     let ttft_ms =
         first_ms.map(|first_time| (first_time - rec.request.core.arrival_time.as_ms()) as f32);
     let finish_decode_time_ms = last_ms.map(|l| l as f32);
     // Mean inter-token gap = total decode span / number of gaps (tokens − 1).
     let tpot_mean_ms = match (first_ms, last_ms) {
         (Some(first_time), Some(last_time)) if rec.progress.output_tokens_emitted > 1 => Some(
-            ((last_time - first_time) / (rec.progress.output_tokens_emitted - 1) as f64) as f32,
+            ((last_time - first_time) / f64::from(rec.progress.output_tokens_emitted - 1)) as f32,
         ),
         _ => None,
     };

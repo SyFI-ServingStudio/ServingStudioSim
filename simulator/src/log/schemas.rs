@@ -1,4 +1,4 @@
-//! Arrow schema definitions for the VibeSim parquet streams.
+//! Arrow schema definitions for the `VibeSim` parquet streams.
 //!
 //! Modeled on `ref/moesim-rs/src/logging/schemas.rs` — each stream gets a
 //! `pub fn xxx_schema() -> Arc<Schema>` returning a real
@@ -7,7 +7,7 @@
 //!
 //! Field name / type / nullability follow the local logging contract. `cost_log`
 //! is written as one file per `(pool_tag, worker_id)` stream; variable-length
-//! per-group input and per-slot CostTree data live inside list columns.
+//! per-group input and per-slot `CostTree` data live inside list columns.
 
 use std::sync::Arc;
 
@@ -16,6 +16,7 @@ use arrow_schema::{DataType, Field, Fields, Schema};
 /// Legacy ref-style scalar envelope helper. The current writer uses
 /// [`cost_log_schema`] below; do not infer the live parquet columns from this
 /// compatibility surface.
+#[must_use]
 pub fn cost_log_envelope_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("pool_tag", DataType::Utf8, false),
@@ -36,7 +37,7 @@ pub fn cost_log_envelope_schema() -> Arc<Schema> {
 }
 
 /// The per-group `input_section` struct (see `simulator/src/log/README.md`): one struct per
-/// `ArchGroupInput` the worker fed to the model_arch this iteration. Prefill is
+/// `ArchGroupInput` the worker fed to the `model_arch` this iteration. Prefill is
 /// kept at full per-request fidelity (the two parallel `prefill_*_lens` lists);
 /// decode is aggregated to two scalars (`decode_request_count` / `decode_kv_total`)
 /// — the per-decode-request KV-length list is the size driver (re-logged every
@@ -54,14 +55,15 @@ pub(crate) fn group_input_fields() -> Fields {
     ])
 }
 
-/// `cost_log` (CostTree per-iter form) — the envelope scalars, the per-iteration
+/// `cost_log` (`CostTree` per-iter form) — the envelope scalars, the per-iteration
 /// `input_section` (`groups`: one struct per HP group, see [`group_input_fields`]),
-/// then the compiled CostTree's per-slot breakdown as two parallel lists:
+/// then the compiled `CostTree`'s per-slot breakdown as two parallel lists:
 /// `slot_time_ms` (`List<f32>`) and `slot_coverage` (`List<u8>`, the
 /// `CoverageFlags` bits). Slot *names* are NOT a column (INV-5 — names live at
 /// compile time only); they live once in the matching
 /// `cost_manifest/worker_<pool_tag>_<worker_id>.json` sidecar and label the
 /// list positions.
+#[must_use]
 pub fn cost_log_schema() -> Arc<Schema> {
     let time_item = Arc::new(Field::new("item", DataType::Float32, false));
     let cov_item = Arc::new(Field::new("item", DataType::UInt8, false));
@@ -148,6 +150,7 @@ pub fn cost_log_schema() -> Arc<Schema> {
 /// same reasoning that drops `wall_end_ms` from `cost_log`. `pool_tag` is part of
 /// the key because `worker_id` restarts at 0 per pool (PD's prefill#0 vs
 /// decode#0), exactly as in `cost_log`.
+#[must_use]
 pub fn kv_snapshot_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("pool_tag", DataType::Utf8, false),
@@ -171,6 +174,7 @@ pub fn kv_snapshot_schema() -> Arc<Schema> {
 /// `prefix_cache_event` — an exact per-worker replay of retained-prefix cache
 /// ownership transitions. Unlike the throttled `kv_snapshot`, every row is a
 /// real cache operation and `sequence` totally orders equal-time mutations.
+#[must_use]
 pub fn prefix_cache_event_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("pool_tag", DataType::Utf8, false),
@@ -192,6 +196,7 @@ pub fn prefix_cache_event_schema() -> Arc<Schema> {
 }
 
 /// `network_event` (§5) — one row per cross-worker pull/push (disagg only).
+#[must_use]
 pub fn network_event_schema() -> Arc<Schema> {
     let request_ids_item = Arc::new(Field::new("item", DataType::UInt32, false));
     Arc::new(Schema::new(vec![
@@ -226,6 +231,7 @@ pub fn network_event_schema() -> Arc<Schema> {
 /// are always populated (no ref-style null padding). The `(dst_pool_tag,
 /// dst_worker_id)` pair is the same key `cost_log` uses, so `analyze trace`
 /// overlays a transfer onto the receiving worker's row.
+#[must_use]
 pub fn gpu_cluster_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("net_start_ms", DataType::Float64, false),
@@ -265,6 +271,7 @@ pub fn gpu_cluster_schema() -> Arc<Schema> {
 /// saturated run, where prefill admits the whole trace while decode lags) to one
 /// row per tick. Per-request session columns that fed the analyzer's session-E2E
 /// rollup move to `request_slo` (terminal-per-request).
+#[must_use]
 pub fn request_state_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("logging_time", DataType::Float64, false),
@@ -284,6 +291,7 @@ pub fn request_state_schema() -> Arc<Schema> {
 /// sim-end-flush of a request still in prefill). `finish_decode_time_ms` is the
 /// absolute sim-time ms of the final decoded token; E2E = `finish_decode_time_ms
 /// - arrival_time_ms` (kept as a scalar so E2E survives with the array off).
+#[must_use]
 pub fn request_slo_schema() -> Arc<Schema> {
     let token_times_item = Arc::new(Field::new("item", DataType::Float32, false));
     Arc::new(Schema::new(vec![

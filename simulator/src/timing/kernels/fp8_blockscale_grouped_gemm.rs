@@ -1,4 +1,4 @@
-//! Direct TensorRT-LLM FP8 block-scale GroupedWithOffset GEMM timing leaf.
+//! Direct TensorRT-LLM FP8 block-scale `GroupedWithOffset` GEMM timing leaf.
 //!
 //! This production path keeps the global input-token count and top-k as recipe
 //! axes: TensorRT-LLM sizes routed capacity from

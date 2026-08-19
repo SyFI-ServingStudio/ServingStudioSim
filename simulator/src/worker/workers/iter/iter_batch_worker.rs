@@ -153,7 +153,7 @@ where
         );
         let cost = self.execution.evaluate_iteration(
             &self.input,
-            self.iteration_fsm.iteration as u64,
+            u64::from(self.iteration_fsm.iteration),
             now,
         );
         now + cost

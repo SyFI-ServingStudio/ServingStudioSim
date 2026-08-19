@@ -90,6 +90,7 @@ pub enum CostSource {
 
 impl CostSource {
     /// Analytic source from a per-link bandwidth in GB/s (`1 GB/s = 1e6 bytes/ms`).
+    #[must_use]
     pub fn analytic(gbps: f64) -> Self {
         CostSource::Analytic {
             bytes_per_ms: (gbps * 1e6).max(f64::MIN_POSITIVE),
@@ -101,7 +102,7 @@ impl CostSource {
         match self {
             CostSource::Kernel(k) => {
                 let leaf = k.eval(&P2pInterKernelInput { message_size_bytes });
-                Time::from_ms(leaf.m.time_ms.max(0.0) as f64)
+                Time::from_ms(f64::from(leaf.m.time_ms.max(0.0)))
             }
             CostSource::Analytic { bytes_per_ms } => {
                 Time::from_ms(message_size_bytes as f64 / bytes_per_ms)
@@ -200,6 +201,7 @@ impl GpuCluster {
     /// blocks at construction via [`allocate`](GpuCluster::allocate) and their
     /// comm groups via [`register_comm_group`](GpuCluster::register_comm_group);
     /// the cluster starts with zero GPUs and zero groups.
+    #[must_use]
     pub fn new(cost: CostSource) -> Self {
         Self {
             gpus: Vec::new(),
@@ -294,10 +296,12 @@ impl GpuCluster {
         gid
     }
 
+    #[must_use]
     pub fn num_gpus(&self) -> usize {
         self.gpus.len()
     }
 
+    #[must_use]
     pub fn num_groups(&self) -> usize {
         self.groups.len()
     }
@@ -360,8 +364,8 @@ impl GpuCluster {
         if s.count == 0 || r.count == 0 {
             return now;
         }
-        let send_per_link = (bytes as f64 / s.count as f64).round() as u64;
-        let recv_per_link = (bytes as f64 / r.count as f64).round() as u64;
+        let send_per_link = (bytes as f64 / f64::from(s.count)).round() as u64;
+        let recv_per_link = (bytes as f64 / f64::from(r.count)).round() as u64;
         let send_dur = self.cost.link_time(send_per_link);
         let recv_dur = self.cost.link_time(recv_per_link);
         // Slower side bounds the collective; faster side is held throttled at
@@ -411,7 +415,7 @@ impl GpuCluster {
     ///   - drains the **aggregate** byte total across the receiver's links.
     ///     Duration = `α + max(slowest sender transmission, receiver aggregate drain)`;
     ///     returns the time all bytes are resident at `recv_gid`. A single-source
-    ///     gather has the same arrival as `submit_transfer` (α + max ≡ link_time), but
+    ///     gather has the same arrival as `submit_transfer` (α + max ≡ `link_time`), but
     ///     frees the sender after its own slice rather than the coupled collective.
     ///
     /// `kind`/`tag` are logged per source over the shared `[start, arrival]` window
@@ -451,7 +455,7 @@ impl GpuCluster {
             }
             start = start.max(s.send_free);
             total_bytes += bytes;
-            let per_link = (bytes as f64 / s.count as f64).round() as u64;
+            let per_link = (bytes as f64 / f64::from(s.count)).round() as u64;
             let xfer = Time::from_ms((self.cost.link_time(per_link).as_ms() - alpha_ms).max(0.0));
             live.push((sg, bytes, s.count, xfer));
         }
@@ -465,7 +469,7 @@ impl GpuCluster {
             send_xfer_max = send_xfer_max.max(xfer);
         }
         // The receiver drains the aggregate byte total across its links.
-        let recv_per_link = (total_bytes as f64 / r.count as f64).round() as u64;
+        let recv_per_link = (total_bytes as f64 / f64::from(r.count)).round() as u64;
         let recv_xfer =
             Time::from_ms((self.cost.link_time(recv_per_link).as_ms() - alpha_ms).max(0.0));
         // Latency paid ONCE for the whole gather (overlapped across sources).

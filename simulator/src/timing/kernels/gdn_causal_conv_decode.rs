@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused causal-convolution decode kernel.
+//! Qwen Gated `DeltaNet` fused causal-convolution decode kernel.
 //!
 //! The convolution geometry and dtypes are static config identity. Decode batch
 //! size is the sole physical runtime interpolation axis. `state_dtype` remains

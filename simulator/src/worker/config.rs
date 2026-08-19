@@ -50,7 +50,7 @@ const PREFIX_CACHE_MODE_CHOICES: [&str; 2] = ["disabled", "opportunistic"];
 /// = no inter-kernel overhead (kernel-folded time IS the wall time), so presets
 /// that omit the field keep their prior behavior. A worker scales the wall time
 /// it advances the clock by as `kernel_time * gpu_time_multiplier` (≥ 1.0);
-/// cost_log / manifest stay pre-scale (pure kernel), so the overhead surfaces as
+/// `cost_log` / manifest stay pre-scale (pure kernel), so the overhead surfaces as
 /// a gap between iter/section slices in the trace, never inside a kernel slice.
 fn default_gpu_time_multiplier() -> f64 {
     1.0
@@ -65,7 +65,7 @@ pub enum IterWorkerSel {
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
-        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        /// (see [`default_gpu_time_multiplier`]). `cost_log` stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
@@ -113,7 +113,7 @@ pub enum IterWorkerSel {
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
-        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        /// (see [`default_gpu_time_multiplier`]). `cost_log` stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
@@ -152,7 +152,7 @@ pub enum IterWorkerSel {
         #[param(string, default = "mix", choices = BATCH_POLICY_CHOICES)]
         batch_policy: BatchPolicy,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
-        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        /// (see [`default_gpu_time_multiplier`]). `cost_log` stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
@@ -163,7 +163,7 @@ pub enum IterWorkerSel {
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
-        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        /// (see [`default_gpu_time_multiplier`]). `cost_log` stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
@@ -186,7 +186,7 @@ pub enum IterWorkerSel {
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
-        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        /// (see [`default_gpu_time_multiplier`]). `cost_log` stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
@@ -203,7 +203,7 @@ pub enum AttnWorkerSel {
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
-        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        /// (see [`default_gpu_time_multiplier`]). `cost_log` stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
@@ -227,7 +227,7 @@ pub enum AttnWorkerSel {
 pub enum FfnWorkerSel {
     DisaggFfn {
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
-        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        /// (see [`default_gpu_time_multiplier`]). `cost_log` stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,

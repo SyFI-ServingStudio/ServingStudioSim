@@ -28,7 +28,7 @@
 //! `.optional()`. A `Vec<T>` is a list param that is required UNLESS the field
 //! also carries `#[serde(default)]` — in that case (and for any other type
 //! tagged `#[serde(default)]`) the param is marked `.optional()`, matching
-//! serde's "absent = Default::default()" semantics (e.g. `Vec<f32>` defaults to
+//! serde's "absent = `Default::default()`" semantics (e.g. `Vec<f32>` defaults to
 //! the empty list).
 
 use proc_macro::TokenStream;
@@ -324,7 +324,7 @@ fn generic_inner<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type> {
     }
 }
 
-/// serde `RenameRule::SnakeCase` for a PascalCase variant ident — insert `_`
+/// serde `RenameRule::SnakeCase` for a `PascalCase` variant ident — insert `_`
 /// before each non-leading uppercase, lowercase everything (matches the wire tag
 /// produced by `#[serde(rename_all = "snake_case")]`).
 fn snake_case(ident: &str) -> String {

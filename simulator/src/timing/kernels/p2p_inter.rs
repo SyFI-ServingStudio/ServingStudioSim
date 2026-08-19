@@ -8,15 +8,15 @@
 //! `enumerate` `dtype` field is a fixed profiling artifact, kept only to stay
 //! aligned with the Python `P2pInterArgs` wire schema).
 //!
-//! This is the inter-NVL-domain (cross-node NIC) leg of the MoE network model
+//! This is the inter-NVL-domain (cross-node NIC) leg of the `MoE` network model
 //! (ref's `get_inter_device_p2p_times_batch` curve in `common_timing.rs`). A
-//! single send/recv between two ranks in different NVLink domains, measured as
-//! time vs message size. The MoE dispatch/combine L2 ops (`op/moe`) look this
+//! single send/recv between two ranks in different `NVLink` domains, measured as
+//! time vs message size. The `MoE` dispatch/combine L2 ops (`op/moe`) look this
 //! curve up for stages tagged `P2pTier::InterDomain`.
 //!
 //! Identical shape to `p2p_intra` (no `num_gpus`; p2p is always 2 endpoints);
-//! the separate kernel keeps the NIC bandwidth curve distinct from the NVLink
-//! one, mirroring ref's two perf_api methods. Static config `(fabric, dtype)`;
+//! the separate kernel keeps the NIC bandwidth curve distinct from the `NVLink`
+//! one, mirroring ref's two `perf_api` methods. Static config `(fabric, dtype)`;
 //! runtime sweep axis `message_size_bytes` over a `pow2(10, 28)` ladder
 //! (1 KB .. 256 MB); `Cache1DLinear`.
 

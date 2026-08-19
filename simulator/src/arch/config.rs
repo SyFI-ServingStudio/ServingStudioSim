@@ -48,14 +48,14 @@ pub struct ModelSpec {
     /// Simulate only this many layers with scaled timing (omit = all layers).
     #[serde(default)]
     pub sim_num_layers: Option<u32>,
-    /// Use FP8 precision (DeepGEMM / fp8 prefill, halved transfers).
+    /// Use FP8 precision (`DeepGEMM` / fp8 prefill, halved transfers).
     #[param(cache_key)]
     pub fp8: bool,
 }
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
-/// MoE expert routing distribution kind (the `routing` selector on
+/// `MoE` expert routing distribution kind (the `routing` selector on
 /// [`IterArchSel::Qwen3MoeDpAttnEpFfn`]). v1 exposes `uniform` and a seeded
 /// `random`; the model layer also carries `power_law` / explicit `from_profile`
 /// (see `timing::routing::RoutingDistribution`), while a measured profile is
@@ -142,16 +142,16 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         ep_size: u16,
         /// `ReplicatedHeadParallel` residing-group size on the FFN side
-        /// (drives whether the L2 MoE combine bcast/fanout legs are non-zero).
+        /// (drives whether the L2 `MoE` combine bcast/fanout legs are non-zero).
         #[param(default = 1, cache_key)]
         hp_size: u16,
         /// NVLink-domain size — partitions `ep_size` ranks into NVL domains
-        /// for the intra/inter split of MoE dispatch/combine.
+        /// for the intra/inter split of `MoE` dispatch/combine.
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         /// Expert routing distribution: `uniform` (default) spreads load evenly;
         /// `random` draws a deterministic pseudo-random skew seeded by
-        /// `routing_seed`. Drives the L2 MoE dispatch/combine `BottleneckCurve`
+        /// `routing_seed`. Drives the L2 `MoE` dispatch/combine `BottleneckCurve`
         /// and the L3 grouped-GEMM `local_ppm` shards. Omitted → `uniform`.
         #[serde(default)]
         #[param(string, default = "uniform", choices = ROUTING_KINDS)]
@@ -170,7 +170,7 @@ pub enum IterArchSel {
         expert_popularity_file: Option<String>,
     },
     /// Native FP8 Qwen recipe: per-token/group quantized dense projections,
-    /// DeepGEMM expert kernels, and VibeSim's P2P EP dispatch/combine graph.
+    /// `DeepGEMM` expert kernels, and `VibeSim`'s P2P EP dispatch/combine graph.
     Qwen3MoeFp8DpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -194,7 +194,7 @@ pub enum IterArchSel {
     /// Alignment-only Qwen recipe matching the target vLLM execution path:
     /// FlashInfer/TensorRT-LLM block-scale expert GEMMs plus local finalize and
     /// an EP all-reduce. The generic Qwen tag above intentionally retains
-    /// VibeSim's original DeepGEMM + P2P communication recipe.
+    /// `VibeSim`'s original `DeepGEMM` + P2P communication recipe.
     Qwen3VllmMoeDpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -226,7 +226,7 @@ pub enum IterArchSel {
         #[serde(default = "default_glm52_parallel_size")]
         #[param(default = 8, cache_key)]
         ep_size: u16,
-        /// NVLink-domain size for the MoE dispatch/combine split.
+        /// NVLink-domain size for the `MoE` dispatch/combine split.
         #[serde(default = "default_glm52_parallel_size")]
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
@@ -238,7 +238,7 @@ pub enum IterArchSel {
         #[serde(default)]
         routing_seed: Option<u64>,
         /// Optional MTP proposer work: off, full-index step 0, or a later
-        /// IndexShare step.
+        /// `IndexShare` step.
         #[serde(default)]
         #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
         mtp_mode: Glm52MtpMode,
@@ -258,7 +258,7 @@ pub enum IterArchSel {
         #[serde(default = "default_glm52_parallel_size")]
         #[param(default = 8, cache_key)]
         ep_size: u16,
-        /// NVLink-domain size for the MoE dispatch/combine split.
+        /// NVLink-domain size for the `MoE` dispatch/combine split.
         #[serde(default = "default_glm52_parallel_size")]
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
@@ -270,7 +270,7 @@ pub enum IterArchSel {
         #[serde(default)]
         routing_seed: Option<u64>,
         /// Optional MTP proposer work: off, full-index step 0, or a later
-        /// IndexShare step.
+        /// `IndexShare` step.
         #[serde(default)]
         #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
         mtp_mode: Glm52MtpMode,
@@ -284,6 +284,7 @@ pub enum IterArchSel {
 
 impl IterArchSel {
     /// The model identity/dims this arch operates on (every variant carries it).
+    #[must_use]
     pub fn model(&self) -> &ModelSpec {
         match self {
             Self::Qwen36Local { model, .. }
@@ -653,6 +654,7 @@ pub enum AttnArchSel {
 
 impl AttnArchSel {
     /// The model identity/dims this arch operates on (every variant carries it).
+    #[must_use]
     pub fn model(&self) -> &ModelSpec {
         match self {
             Self::Llama3AttnTp { model, .. } | Self::Qwen3AttnTp { model, .. } => model,
@@ -673,16 +675,16 @@ pub enum FfnArchSel {
         #[param(default = 8, cache_key)]
         ep_size: u16,
     },
-    /// BF16/native Qwen3-MoE FFN side (layer-wise AFD ffn pool): qkv / o_proj (on the attn-TP
-    /// layout) + post_norm + router + EP MoE, plus the iteration embed / final_norm
-    /// / lm_head. Mirrors the FFN-side cost of the unified `qwen3_moe_dp_attn_ep_ffn`;
+    /// BF16/native Qwen3-MoE FFN side (layer-wise AFD ffn pool): qkv / `o_proj` (on the attn-TP
+    /// layout) + `post_norm` + router + EP `MoE`, plus the iteration embed / `final_norm`
+    /// / `lm_head`. Mirrors the FFN-side cost of the unified `qwen3_moe_dp_attn_ep_ffn`;
     /// pairs with a `qwen3_attn` model whose `fp8` field is false.
     Qwen3FfnMoe {
         #[serde(flatten)]
         model: ModelSpec,
-        /// Attention tensor-parallelism size. Drives the qkv / o_proj per-rank
-        /// shape AND the MoE combine residing-group width (a token resides on its
-        /// qkv/o_proj TP group, so combine fans the reduced output back to all
+        /// Attention tensor-parallelism size. Drives the qkv / `o_proj` per-rank
+        /// shape AND the `MoE` combine residing-group width (a token resides on its
+        /// `qkv/o_proj` TP group, so combine fans the reduced output back to all
         /// `attn_tp_size` ranks). Must match the paired attn arch's `attn_tp_size`.
         #[param(default = 4, cache_key)]
         attn_tp_size: u16,
@@ -691,11 +693,11 @@ pub enum FfnArchSel {
         #[param(default = 8, cache_key)]
         ep_size: u16,
         /// NVLink-domain size — partitions `ep_size` ranks into NVL domains for the
-        /// intra/inter split of MoE dispatch/combine.
+        /// intra/inter split of `MoE` dispatch/combine.
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         /// Expert routing distribution: `uniform` (default) or `random` (seeded by
-        /// `routing_seed`). Drives the L2 MoE dispatch/combine simulation.
+        /// `routing_seed`). Drives the L2 `MoE` dispatch/combine simulation.
         #[serde(default)]
         #[param(string, default = "uniform", choices = ROUTING_KINDS)]
         routing: RoutingKind,
@@ -725,6 +727,7 @@ pub enum FfnArchSel {
 
 impl FfnArchSel {
     /// The model identity/dims this arch operates on (every variant carries it).
+    #[must_use]
     pub fn model(&self) -> &ModelSpec {
         match self {
             Self::DeepseekFfnMoe { model, .. }

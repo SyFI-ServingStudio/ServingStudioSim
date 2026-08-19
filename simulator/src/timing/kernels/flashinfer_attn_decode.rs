@@ -1,4 +1,4 @@
-//! FlashInfer decode attention kernel: one cached perf model per attention-dims
+//! `FlashInfer` decode attention kernel: one cached perf model per attention-dims
 //! config, swept over a 2D `(batch_size, avg_len)` grid.
 //!
 //! Decode is batched single-token-query attention against a paged KV cache. The
@@ -8,15 +8,15 @@
 //! `avg_len = max(1, total_tokens / batch_size)`, sets `q_len = 1`,
 //! `kv_len = avg_len`, non-causal.
 //!
-//! Why total_tokens (not avg_len): feasibility is bounded by the PRODUCT
-//! batch_size * avg_len (= total kv tokens / memory / profiling cost), so making
+//! Why `total_tokens` (not `avg_len)`: feasibility is bounded by the PRODUCT
+//! `batch_size` * `avg_len` (= total kv tokens / memory / profiling cost), so making
 //! the product an axis lets a plain rectangular `total_tokens` cap keep every
 //! grid corner affordable (e.g. 1x4M and 256x16384 both = 4M total), instead
 //! of a rectangular `(batch, avg_len)` grid whose `256 x 4M` corner is
 //! unaffordable. Everything generic lives in `engine::Kernel<S>`; the Python
 //! `FlashinferAttnDecodeArgs` dataclass owns the matching schema.
 //!
-//! Axes: batch_size is pow2 (1..=256); total_tokens is pow2 (32..=4194304, i.e.
+//! Axes: `batch_size` is pow2 (1..=256); `total_tokens` is pow2 (32..=4194304, i.e.
 //! up to 4M). Two monotonic axes -> `Cache2DLinear` + `grid.expand_2d`.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};

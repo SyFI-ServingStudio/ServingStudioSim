@@ -11,6 +11,7 @@ pub struct SweepGrid {
 }
 
 impl SweepGrid {
+    #[must_use]
     pub fn new(axes: Vec<Vec<f64>>) -> Self {
         assert!(!axes.is_empty(), "sweep grid must have at least one axis");
         assert!(
@@ -20,6 +21,7 @@ impl SweepGrid {
         Self { axes }
     }
 
+    #[must_use]
     pub fn axes(&self) -> &[Vec<f64>] {
         &self.axes
     }
@@ -101,6 +103,7 @@ pub struct Coords {
 impl Coords {
     /// Build from a fixed-size array of coordinates (the derive emits this).
     /// `N` is the kernel's sweep arity; it must fit `MAX_SWEEP_DIMS`.
+    #[must_use]
     pub fn new<const N: usize>(values: [f64; N]) -> Self {
         assert!(
             N <= MAX_SWEEP_DIMS,
@@ -112,6 +115,7 @@ impl Coords {
     }
 
     /// Build from a slice (for manual `SweepCoords` impls over ragged inputs).
+    #[must_use]
     pub fn from_slice(values: &[f64]) -> Self {
         assert!(
             values.len() <= MAX_SWEEP_DIMS,
@@ -126,6 +130,7 @@ impl Coords {
         }
     }
 
+    #[must_use]
     pub fn as_slice(&self) -> &[f64] {
         &self.buf[..self.len]
     }
@@ -163,6 +168,7 @@ pub struct Axis;
 
 impl Axis {
     /// `[2^min_log2, 2^(min_log2+1), ..., 2^max_log2]`, both endpoints included.
+    #[must_use]
     pub fn pow2(min_log2: u32, max_log2: u32) -> Vec<f64> {
         assert!(
             min_log2 <= max_log2,
@@ -173,13 +179,14 @@ impl Axis {
 
     /// Arithmetic progression `start, start+step, ...` up to and including any
     /// term <= `end`.
+    #[must_use]
     pub fn arithmetic(start: u32, end: u32, step: u32) -> Vec<f64> {
         assert!(step > 0, "Axis::arithmetic: step must be > 0");
         assert!(start <= end, "Axis::arithmetic: start must be <= end");
         let mut out = Vec::new();
         let mut v = start;
         while v <= end {
-            out.push(v as f64);
+            out.push(f64::from(v));
             match v.checked_add(step) {
                 Some(next) => v = next,
                 None => break,
@@ -190,7 +197,7 @@ impl Axis {
 
     /// Hand-picked values; preserves declaration order.
     pub fn values(vs: impl IntoIterator<Item = u32>) -> Vec<f64> {
-        vs.into_iter().map(|v| v as f64).collect()
+        vs.into_iter().map(f64::from).collect()
     }
 
     /// Concatenate segments, deduplicating any value already emitted earlier.
@@ -209,8 +216,8 @@ impl Axis {
         out
     }
 
-    /// Shared "token-axis" curve. Used by GEMM-M, RmsNorm-M, AllReduce
-    /// message_size, attention seq_len, etc.
+    /// Shared "token-axis" curve. Used by GEMM-M, RmsNorm-M, `AllReduce`
+    /// `message_size`, attention `seq_len`, etc.
     ///
     /// Curve shape (63 strictly-increasing points, dedupe-on-seam):
     ///   - `[32, 64, 128, 256]`             pow2 doublings
@@ -225,6 +232,7 @@ impl Axis {
     /// requires the Python profiler to resample, otherwise `Kernel::build` will
     /// fail with `BuildError::MissingEntry`. Build-cache-only paths can
     /// `enable_jit_profiling()` to fill missing rows on demand.
+    #[must_use]
     pub fn token_axis() -> Vec<f64> {
         Self::chain([
             Self::pow2(5, 8),

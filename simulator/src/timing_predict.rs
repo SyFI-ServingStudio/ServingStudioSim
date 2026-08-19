@@ -8,20 +8,20 @@
 //!
 //! Three arch kinds, one tool (the `arch` selector picks):
 //!   - `iter` — ONE [`IterwiseUnifiedModel::eval_iter`] over the whole forward
-//!     pass (embedding → all layers via the `Scale{n}` fold → lm_head). One row
+//!     pass (embedding → all layers via the `Scale{n}` fold → `lm_head`). One row
 //!     per case, `section = "iter"`, `layer = -1`.
 //!   - `attn` — the AFD attn side ([`qwen3_attn`]): one `attn_cost` per case
 //!     (`section = "attn"`). One DP shard = one group.
 //!   - `ffn` — the AFD ffn side ([`qwen3_ffn_moe`]): the per-section building
 //!     blocks of one iteration — `prologue` (embed), `pre_attn` (layer-0 qkv),
-//!     a representative mid-layer `post_attn` (o_proj + router + MoE + fused
+//!     a representative mid-layer `post_attn` (`o_proj` + router + `MoE` + fused
 //!     next-layer qkv), the terminal `post_attn_last`, and `epilogue`
-//!     (final_norm + lm_head). One row per section.
+//!     (`final_norm` + `lm_head`). One row per section.
 //!
 //! **One arch, not a bundle.** AFD is predicted by running this tool TWICE — once
 //! with the attn arch, once with the ffn arch — each independent. The cross-pool
 //! attn↔ffn handoff is a `GpuCluster` transfer (not a cost-tree leaf) and is out
-//! of scope here; the MoE EP dispatch/combine comm, by contrast, IS an in-tree
+//! of scope here; the `MoE` EP dispatch/combine comm, by contrast, IS an in-tree
 //! compute leaf inside the ffn `post_attn` section and is logged automatically.
 //!
 //! The output is not a bespoke format: every case/section is emitted as one row of
@@ -395,7 +395,7 @@ fn run_attn_cases(
 /// iteration, each as one row. The repeating per-mid-layer `post_attn` cost is
 /// homogeneous, so a single representative mid layer stands for all of them; the
 /// terminal layer (`post_attn_last`, post-only) is emitted once. `prologue` and
-/// `epilogue` are the once-per-iteration embed / lm_head, `layer = -1`.
+/// `epilogue` are the once-per-iteration embed / `lm_head`, `layer = -1`.
 ///
 /// The ffn case IS its input: [`FfnArchInput`] deserializes straight from the cases
 /// file (a list of `{ "tokens_per_group": [...] }`), so there is no separate case

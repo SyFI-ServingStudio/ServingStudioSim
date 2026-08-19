@@ -79,7 +79,7 @@ pub struct CostLogger {
     buf: CostLogChunk,
     pool_tag: &'static str,
     /// Per-row flat-buffer sizes, learned from the first recorded row (all rows
-    /// of one worker share the same compiled CostTree, so these are constant).
+    /// of one worker share the same compiled `CostTree`, so these are constant).
     /// Used to size a freshly-rotated chunk's buffers in [`Self::send`].
     groups_per_row: usize,
     slots_per_row: usize,

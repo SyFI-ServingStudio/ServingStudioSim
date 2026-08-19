@@ -1,4 +1,4 @@
-//! Qwen fused MoE softmax/top-k router-selection kernel.
+//! Qwen fused `MoE` softmax/top-k router-selection kernel.
 //!
 //! The number of routed tokens is the sole runtime interpolation axis. Expert
 //! count, top-k, and activation dtype identify the fixed production CUDA
