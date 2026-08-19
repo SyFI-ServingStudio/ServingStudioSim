@@ -65,9 +65,37 @@ Require launcher metadata to declare the producer/artifact kind explicitly
 incidental file such as `raw/run_meta.json`. A consumer must reject absent or
 unknown producer kinds rather than choosing semantics from directory contents.
 
-1. **Profile** — instrumented vLLM or SGLang under NSYS. Preflight the GPU,
-   port, NSYS, model cache, and fork venv (`fork_python` must import `torch` and
-   the selected engine); use `cuda_profiler_api` + CUDA graph node tracing.
+1. **Profile** — instrumented vLLM or SGLang. Preflight the GPU, port, NSYS,
+   model cache, and fork venv (`fork_python` must import `torch` and the
+   selected engine).
+
+   `profile_kind` selects one of three passes, and they are not
+   interchangeable — each buys one kind of evidence at the cost of another, so
+   pick by which check will consume it (see `alignment/README.md` for the
+   config fields):
+
+   | `profile_kind` | NSYS | Buys | Costs |
+   |---|---|---|---|
+   | `nsys` (default) | yes, bounded window | per-kernel/segment truth for Check 1 | a short window, plus capture/flush pauses; must disable popularity logging |
+   | `workload_metrics` | no | the complete scheduler timeline and per-request timing, uncontaminated, for the whole run | no kernel detail |
+   | `expert_popularity` | no | logical expert counts/probabilities by layer, for MoE routing demand | its EPLB sync and D2H logging must never enter timing evidence |
+
+   Use `cuda_profiler_api` + CUDA graph node tracing for the `nsys` pass.
+
+   Judging E2E (Check 3) from the `nsys` pass alone is a common mistake: that
+   window covers a slice of the run and carries profiler pauses, so a TTFT/TPOT
+   distribution read off it is neither the whole population nor an undisturbed
+   one. Run `workload_metrics` for that, with identical model, topology,
+   backend, and workload settings so the two passes are comparable.
+
+   Run `expert_popularity` for **any** MoE model, not only an EP deployment.
+   Expert parallelism is what makes routing skew produce dispatch/combine
+   traffic, but a grouped GEMM is charged per expert group whatever the
+   placement: skew leaves the total token-expert selections unchanged while
+   redistributing them into fuller and emptier groups. A local/TP1 MoE arch
+   that assumes balanced routing will therefore mis-cost its expert GEMM, and
+   the deviation surfaces in Check 1 as an unexplained MoE slot gap that is
+   easy to misattribute to the kernel cost model.
 2. **Timing prediction** — set the typed input builder. It reads the simulation
    *preset* (`simulation.yaml` via `simulation_preset`) for gpu/arch/backends, so
    it runs before any completed simulation. `measured_phase: forward` only
@@ -147,18 +175,30 @@ slots in the timing-predict CostTree. The join key is a stable model operation,
 not a demangled kernel name. Weigh evidence in this order:
 
 1. **Phase** — `preprocess`, `forward`, `postprocess`, or `sample`.
-2. **Folded position** — prefix/repeat-body/suffix; a repeat body matching the
-   layer count is one transformer layer, prefix/suffix is model-level work.
-3. **Ordered neighbors** — the surrounding norm/proj/attn/act/proj pattern.
-4. **Kernel semantics** — what it computes; `suggested_category` is a hint only.
-5. **Slot contract** — the candidate `simulated_slots` jointly own the same work.
-6. **Cross-sequence consistency** — the same position across prefill/mixed/decode
+2. **Track** — one concurrent CUDA stream. A sequence holds `tracks[]`; track 0
+   is the one that opened the range, the rest are side streams the framework
+   overlapped onto the same device (vLLM runs the Qwen3-Next shared expert this
+   way during decode, and inline on the main stream during prefill).
+3. **Folded position** — prefix/repeat-body/suffix *within a track*; a repeat
+   body matching the layer count is one transformer layer, prefix/suffix is
+   model-level work.
+4. **Ordered neighbors** — the surrounding norm/proj/attn/act/proj pattern.
+5. **Kernel semantics** — what it computes; `suggested_category` is a hint only.
+6. **Slot contract** — the candidate `simulated_slots` jointly own the same work.
+7. **Cross-sequence consistency** — the same position across prefill/mixed/decode
    gets compatible labels.
 
 One name may sit at different positions and one operation may launch several
 kernels, so never map a name globally. Before editing, reason one row per folded
-occurrence (phase, folded path, name + category, inferred operation, evidence,
-slots, decision) and resolve every unresolved row.
+occurrence (phase, track, folded path, name + category, inferred operation,
+evidence, slots, decision) and resolve every unresolved row.
+
+Never reason across a track boundary. `after` / `after_name` / `before_name`
+stop there by construction, because two tracks ran at the same time and have no
+"before" between them — the neighbour on the other side of the edge is not
+evidence about anything. Expect the same operation to sit on the main stream in
+one sequence and a side stream in another; that is a scheduling fact about the
+framework, not a reason to label it differently.
 
 ## Make mapping decisions
 
@@ -215,10 +255,17 @@ it does not select the next framework optimization.
 ## Preserve routing and workload equivalence
 
 For MoE baseline reproduction, capture logical routing/popularity outside the
-timed range and inject that same demand into the simulator. Preserve original
-layer and step/request identity, token count, top-k, logical expert counts,
-route-weight mass, and temporal variation. A single model-wide histogram erases
-layer skew and bursts and cannot support per-iteration critical-path alignment.
+timed range — the `profile_kind: expert_popularity` pass above — and inject that
+same demand into the simulator through the arch's `expert_popularity_file`.
+Preserve original layer and step/request identity, token count, top-k, logical
+expert counts, route-weight mass, and temporal variation. A single model-wide
+histogram erases layer skew and bursts and cannot support per-iteration
+critical-path alignment.
+
+If the arch has no `expert_popularity_file` field, it is costing a hardcoded
+balanced assumption. That is a gap to report, not a reason to skip the pass: an
+arch whose grouped GEMM reads a routing distribution can consume a measured one,
+and adding the selector field is a small, patterned change.
 
 Keep logical demand separate from framework realization. The reusable input is
 the token-to-expert assignment and route weight before EP placement, padding,
