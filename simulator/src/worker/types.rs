@@ -440,6 +440,11 @@ pub struct WorkerConfig {
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
+    /// Preset override for a hybrid arch's SSM snapshot interval, in context
+    /// tokens (from the worker selector). `None` uses the arch's own
+    /// `recurrent_checkpoint_interval_tokens`. Only the hybrid KV recipe reads
+    /// it.
+    pub ssm_checkpoint_interval_tokens: Option<u32>,
 }
 
 impl Default for WorkerConfig {
@@ -454,6 +459,7 @@ impl Default for WorkerConfig {
             max_batch_tokens: None,
             pending_order: crate::worker::admission::PendingOrderKind::default(),
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
+            ssm_checkpoint_interval_tokens: None,
         }
     }
 }

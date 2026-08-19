@@ -52,6 +52,19 @@ impl GpuSpec {
     }
 }
 
+#[cfg(test)]
+impl GpuSpec {
+    /// Sibling modules' tests need a spec with real peaks. The fields stay
+    /// private so production code can only obtain one from `gpu/spec.json`.
+    pub(super) fn for_test(bf16_tflops: f64, mem_bandwidth_gbps: f64) -> Self {
+        Self {
+            bf16_tflops,
+            mem_bandwidth_gbps,
+            ..Default::default()
+        }
+    }
+}
+
 /// Resolve the run's `gpu_name` to a `gpu/spec.json` entry via the shared
 /// exact `name`/`aliases` resolver. Returns the matched canonical spec name (for
 /// the report, so the resolution is auditable) + its peaks. `None` when the

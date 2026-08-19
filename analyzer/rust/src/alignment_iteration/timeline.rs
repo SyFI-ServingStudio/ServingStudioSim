@@ -688,6 +688,7 @@ fn build_iteration(
                         offset(launch.start_ns),
                         offset(launch.end_ns),
                         launch.correlation_id,
+                        launch.track_index,
                     ])
                 })
                 .collect::<Vec<_>>(),
@@ -1095,7 +1096,8 @@ fn definitions() -> Value {
         "time_origin_ns": "absolute nsys timestamp every *_ns in this file is measured from; kept as an offset so a JSON number never loses nanosecond precision",
         "anchor_ns": "where the modelled iteration is drawn from: the reference rank's first kernel start. An assumption, not a measurement — see meta.anchor_rule",
         "gpu_span_ns": "reference rank's [first kernel start, last kernel end]. The correlated kernel span, NOT the NVTX range: under CUDA graphs the range can close before its own kernels finish",
-        "measured.kernels[].iv": "one [device_id, start_ns, end_ns, correlation_id] per rank launch of this kernel position, unreduced. Bubbles are the complement of the union of these over the span, and must be computed from these raw intervals rather than from drawn geometry; correlation_id is the NSYS launch identity used to connect the CUDA API lane",
+        "measured.kernels[].iv": "one [device_id, start_ns, end_ns, correlation_id, track_index] per rank launch of this kernel position, unreduced. Bubbles are the complement of the union of these over the span, and must be computed from these raw intervals rather than from drawn geometry; correlation_id is the NSYS launch identity used to connect the CUDA API lane",
+        "measured.kernels[].iv[4]": "the concurrent CUDA stream (track) this launch ran on, 0 being the one that opened the range. Launches on different tracks of one device overlap in wall time, so a single lane per device would draw them as if they had been serial: give each (device, track) its own lane. A single-stream capture has track 0 only and draws exactly as before",
         "measured.kernels[].occ_ns": "this occurrence's cross-rank critical-path contribution (independent = slowest rank's duration; synchronizing collective = max(end) - max(start)). Their sum is measured.critical_path_ms",
         "simulated.slot_ms": "per-slot UNIT time. Feed these to the cost-tree unfold and let Scale{n} repeat them; critical-path-attributed times would render a losing Max branch as a zero-width leaf",
         "slot_multiplicity": "each slot's exact CostTree Scale multiplicity; folded workload = slot_ms x slot_multiplicity. Shared by every iteration because the tree shape is static",

@@ -11,15 +11,19 @@ vocab=128256, bf16 (2 B), lm_head untied.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
 
 from model.work import Workload, load_model
 from model.work import floors as work_floors
-from model.work.core import AttnInteraction
+from model.work.attention.linear import GatedDeltaNet
+from model.work.core import AttnInteraction, LayerStack, Model
+from model.work.ffn.moe import MoE
 from model.work.parameter_counts import compute_parameter_counts
-from model.work.registry import UnknownArchitecture, build_model
+from model.work.quantization import parse_quantization_config
+from model.work.registry import REGISTRY, UnknownArchitecture, build_model
 
 CONFIG = Path(__file__).resolve().parents[1] / "model" / "config" / "llama3_8b.json"
 
@@ -425,6 +429,74 @@ def test_unknown_architecture_errors():
 # --------------------------------------------------------------------------- #
 
 QWEN36 = Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_6_27b.json"
+QWEN36_MOE = Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_6_35b_a3b_fp8.json"
+QWEN36_LOCAL_MAP = (
+    Path(__file__).resolve().parents[1]
+    / "model"
+    / "work"
+    / "location_maps"
+    / "qwen36_local_unified.json"
+)
+QWEN36_LOCAL_LOCATIONS = [
+    "unified.embedding",
+    "unified.gdn.input_add_rms_norm",
+    "unified.gdn.qkvz.input_quant",
+    "unified.gdn.qkvz.gemm",
+    "unified.gdn.ba",
+    "unified.gdn.split_b",
+    "unified.gdn.split_a",
+    "unified.gdn.core_output_zero",
+    "unified.gdn.state_gather",
+    "unified.gdn.state_zero",
+    "unified.gdn.prefill.causal_conv",
+    "unified.gdn.prefill.post_conv",
+    "unified.gdn.prefill.cumsum",
+    "unified.gdn.prefill.kkt",
+    "unified.gdn.prefill.solve",
+    "unified.gdn.prefill.recompute_w_u",
+    "unified.gdn.prefill.state_update",
+    "unified.gdn.prefill.output",
+    "unified.gdn.state_scatter",
+    "unified.gdn.decode.causal_conv",
+    "unified.gdn.decode.recurrent",
+    "unified.gdn.core_output_copy",
+    "unified.gdn.gated_norm",
+    "unified.gdn.out_proj.input_quant",
+    "unified.gdn.out_proj.gemm",
+    "unified.gdn.post_attention_add_rms_norm",
+    "unified.router.router.gemm",
+    "unified.router.topk",
+    "unified.router.align",
+    "unified.routed_expert.gate_up.input_quant",
+    "unified.routed_expert.gate_up.gemm",
+    "unified.routed_expert.activation",
+    "unified.routed_expert.down.input_quant",
+    "unified.routed_expert.down.gemm",
+    "unified.shared_expert.gate_up.input_quant",
+    "unified.shared_expert.gate_up.gemm",
+    "unified.shared_expert.silu_and_mul",
+    "unified.shared_expert.down.input_quant",
+    "unified.shared_expert.down.gemm",
+    "unified.shared_expert.shared_gate",
+    "unified.shared_expert.apply_shared_gate",
+    "unified.finalize.finalize",
+    "unified.finalize.shared_routed_add",
+    "unified.gated_gqa.input_add_rms_norm",
+    "unified.gated_gqa.qkv_gate.input_quant",
+    "unified.gated_gqa.qkv_gate.gemm",
+    "unified.gated_gqa.q_norm",
+    "unified.gated_gqa.k_norm",
+    "unified.gated_gqa.partial_rope",
+    "unified.gated_gqa.attention.kv_cache_append",
+    "unified.gated_gqa.attention.prefill",
+    "unified.gated_gqa.attention.decode",
+    "unified.gated_gqa.output_gate",
+    "unified.gated_gqa.out_proj.input_quant",
+    "unified.gated_gqa.out_proj.gemm",
+    "unified.gated_gqa.post_attention_add_rms_norm",
+    "unified.head.final_add_rms_norm",
+    "unified.head.lm_head",
+]
 
 GLM52 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm52.json"
 
@@ -457,8 +529,7 @@ GLM_ATTN_PARAMS = (
     + GLM_HIDDEN * GLM_HEADS * GLM_V_HEAD
 )
 GLM_INDEX_PARAMS = (
-    GLM_INDEX_HEADS * GLM_INDEX_DIM * GLM_Q_LORA
-    + (GLM_INDEX_DIM + GLM_INDEX_HEADS) * GLM_HIDDEN
+    GLM_INDEX_HEADS * GLM_INDEX_DIM * GLM_Q_LORA + (GLM_INDEX_DIM + GLM_INDEX_HEADS) * GLM_HIDDEN
 )
 GLM_DENSE_FFN_PARAMS = 3 * GLM_DENSE_INTERMEDIATE * GLM_HIDDEN
 GLM_ROUTER_PARAMS = GLM_ROUTED_EXPERTS * GLM_HIDDEN
@@ -522,8 +593,7 @@ def test_glm52_hand_derived_params_and_decode_goldens():
         + 75
         * (
             GLM_ROUTER_PARAMS
-            + GLM_TOPK
-            * (2 * GLM_MOE_INTERMEDIATE * GLM_HIDDEN + GLM_HIDDEN * GLM_MOE_INTERMEDIATE)
+            + GLM_TOPK * (2 * GLM_MOE_INTERMEDIATE * GLM_HIDDEN + GLM_HIDDEN * GLM_MOE_INTERMEDIATE)
             + GLM_SHARED_PARAMS
         )
         + GLM_NORM_PARAMS
@@ -566,9 +636,7 @@ def test_glm52_hand_derived_params_and_decode_goldens():
 
 def test_glm52_segments_holdouts_and_unified_map_are_complete():
     model = load_model(GLM52)
-    label = model.label(
-        Workload.causal_lm(prefill=[(8, 0)], decode=[4096], sampled=2)
-    )
+    label = model.label(Workload.causal_lm(prefill=[(8, 0)], decode=[4096], sampled=2))
     names = {segment.name for segment in label.segments}
     assert {
         "dense_full_index.indexer.prefill",
@@ -592,15 +660,23 @@ def test_glm52_segments_holdouts_and_unified_map_are_complete():
     prefill = model.label(Workload.causal_lm(prefill=[(8, 0)], sampled=1))
     # The empty-prefix causal triangle is 8*9/2 = 36 pairs. The selected-key
     # count is the same short triangle because index_topk is 2048.
-    assert prefill.flops["attn_internal"] == (
-        2 * GLM_INDEX_HEADS * GLM_INDEX_DIM * 36 * 21
-        + 2 * GLM_HEADS * (GLM_KV_LORA + GLM_QK_ROPE + GLM_KV_LORA) * 36 * 78
-    ) == 397_246_464
-    assert prefill.bytes["kv"] == (
-        36 * (GLM_KV_LORA + GLM_QK_ROPE) * GLM_BF16_BYTES * 78
-        + 8 * (GLM_KV_LORA + GLM_QK_ROPE) * GLM_BF16_BYTES * 78
-        + 8 * (GLM_INDEX_DIM + 4) * 21
-    ) == 3_975_840
+    assert (
+        prefill.flops["attn_internal"]
+        == (
+            2 * GLM_INDEX_HEADS * GLM_INDEX_DIM * 36 * 21
+            + 2 * GLM_HEADS * (GLM_KV_LORA + GLM_QK_ROPE + GLM_KV_LORA) * 36 * 78
+        )
+        == 397_246_464
+    )
+    assert (
+        prefill.bytes["kv"]
+        == (
+            36 * (GLM_KV_LORA + GLM_QK_ROPE) * GLM_BF16_BYTES * 78
+            + 8 * (GLM_KV_LORA + GLM_QK_ROPE) * GLM_BF16_BYTES * 78
+            + 8 * (GLM_INDEX_DIM + 4) * 21
+        )
+        == 3_975_840
+    )
 
     map_path = (
         Path(__file__).resolve().parents[1]
@@ -613,15 +689,18 @@ def test_glm52_segments_holdouts_and_unified_map_are_complete():
     mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
     assert location_map["schema_version"] == 1
     assert location_map["arch_types"] == ["glm52_dsa_moe"]
-    assert len(location_map["locations"]) == len(
-        {row["location"] for row in location_map["locations"]}
-    ) == 126
+    assert (
+        len(location_map["locations"])
+        == len({row["location"] for row in location_map["locations"]})
+        == 126
+    )
     assert len(mapped) == len(set(mapped))
     assert set(mapped) == names
     assert all(
         ".dispatch." not in row["location"] and ".combine." not in row["location"]
         for row in location_map["locations"]
     )
+
 
 # Real Qwen3.6-27B text_config: L=64, hidden=5120, intermediate=17408, vocab=248320,
 # head_dim=256, num_qo=24, num_kv=4, attn_output_gate; GDN: v_heads=48, k_heads=16,
@@ -632,7 +711,9 @@ def test_glm52_segments_holdouts_and_unified_map_are_complete():
 #                     + conv 10240*4 + out 5120*6144 = 115_875_840
 #   dense MLP: 3*17408*5120 = 267_386_880 ; embed = lm_head = 248320*5120 = 1_271_398_400
 Q36_FULL_ATTN = 104_857_600
-Q36_LINEAR_ATTN = 115_875_840
+# Packed projections plus the attention-owned A-log and dt-bias. The gated
+# RMSNorm scale is accounted independently in the norm breakdown.
+Q36_LINEAR_ATTN = 115_875_840 + 48 + 48
 Q36_MLP = 267_386_880
 VOCAB_Q36 = 248320
 
@@ -649,12 +730,13 @@ def test_qwen3_6_hybrid_stack():
 
 def test_qwen3_6_params_exact():
     label = load_model(QWEN36).label(Workload.causal_lm(decode=[4096], sampled=1))
-    assert label.params["total"] == 26_895_319_040  # "27B"
+    assert label.params["total"] == 26_895_329_792  # "27B"
     # dense model: every layer param is activated, so activated == total minus embed/head.
-    assert label.params["activated"]["layers"] == 24_352_522_240
+    assert label.params["activated"]["layers"] == 24_352_532_992
     assert label.params["activated"]["with_embed_head"] == label.params["total"]
     breakdown = label.params["breakdown"]
-    assert breakdown["attn"] == 48 * Q36_LINEAR_ATTN + 16 * Q36_FULL_ATTN  # 7_239_761_920
+    assert breakdown["attn"] == 48 * Q36_LINEAR_ATTN + 16 * Q36_FULL_ATTN  # 7_239_766_528
+    assert breakdown["norm"] == 48 * 128
     assert breakdown["ffn"] == 64 * Q36_MLP  # 17_112_760_320
     assert breakdown["experts"] == 0 and breakdown["router"] == 0  # dense, not MoE
     assert breakdown["embedding"] == breakdown["lm_head"] == VOCAB_Q36 * 5120
@@ -679,19 +761,31 @@ def test_collapsed_workload_preserves_linear_attention_state_transactions():
     aggregate = Workload(
         matmul_tokens=reference.matmul_tokens,
         head_positions=reference.head_positions,
-        attn=[AttnInteraction(1, 1, 0, "full")],
+        attn=[
+            AttnInteraction(1, 1, 0, "full", phase="prefill"),
+            AttnInteraction(1, 1, 0, "full", phase="decode"),
+        ],
         attention_step_count=len(reference.attn),
+        attention_step_count_by_phase={"prefill": 2, "decode": 3},
+        attention_tokens_by_phase={"prefill": 12, "decode": 3},
+        prefill_stateful_requests=1,
     )
 
     reference_label = model.label(reference)
     aggregate_label = model.label(aggregate)
-    reference_linear = next(
-        segment for segment in reference_label.segments if segment.name == "linear.attn"
+    state_names = {
+        "linear.recurrent_state.prefill_read",
+        "linear.recurrent_state.prefill_write",
+        "linear.recurrent_state.decode_read",
+        "linear.recurrent_state.decode_write",
+        "linear.conv_state.prefill_read",
+        "linear.conv_state.prefill_write",
+        "linear.conv_state.decode_read",
+        "linear.conv_state.decode_write",
+    }
+    assert sum(s.bytes_total for s in aggregate_label.segments if s.name in state_names) == sum(
+        s.bytes_total for s in reference_label.segments if s.name in state_names
     )
-    aggregate_linear = next(
-        segment for segment in aggregate_label.segments if segment.name == "linear.attn"
-    )
-    assert aggregate_linear.bytes == reference_linear.bytes
 
 
 def test_gdn_state_is_context_independent():
@@ -699,7 +793,10 @@ def test_gdn_state_is_context_independent():
     short = {s.name: s for s in model.label(Workload.causal_lm(decode=[4096], sampled=1)).segments}
     long = {s.name: s for s in model.label(Workload.causal_lm(decode=[131072], sampled=1)).segments}
     # linear-attention recurrent state does NOT grow with context (its whole point)...
-    assert short["linear.attn"].bytes == long["linear.attn"].bytes
+    state_suffixes = ("state.decode_read", "state.decode_write")
+    assert sum(v.bytes for k, v in short.items() if k.endswith(state_suffixes)) == sum(
+        v.bytes for k, v in long.items() if k.endswith(state_suffixes)
+    )
     # ...while the full-attention KV cache does.
     assert long["full.attn.decode"].bytes > 10 * short["full.attn.decode"].bytes
 
@@ -722,9 +819,650 @@ def test_gdn_internal_flops_linear_and_state_scaling():
     # fixed state per sequence (read+write), context-independent, scales with #sequences.
     one_short = Workload.causal_lm(decode=[128], sampled=1)
     one_long = Workload.causal_lm(decode=[1 << 17], sampled=1)
-    assert gdn.kv_bytes(one_short) == gdn.kv_bytes(one_long) == 2 * (48 * 128 * 128 * 4)
+    state_and_conv = 48 * 128 * 128 * 4 + (2 * 16 * 128 + 48 * 128) * 4 * 2
+    assert gdn.kv_bytes(one_short) == gdn.kv_bytes(one_long) == 2 * state_and_conv
     five = Workload.causal_lm(decode=[128] * 5, sampled=5)
     assert gdn.kv_bytes(five) == 5 * gdn.kv_bytes(one_short)
+
+
+def _qwen_gdn() -> GatedDeltaNet:
+    return GatedDeltaNet(
+        hidden=2048,
+        num_v_heads=32,
+        num_k_heads=16,
+        head_k_dim=128,
+        head_v_dim=128,
+        conv_kernel=4,
+        state_dtype_bytes=4,
+        activation_dtype_bytes=2,
+    )
+
+
+def test_workload_tracks_stateful_prefill_requests_and_legacy_default():
+    fresh = Workload.causal_lm(prefill=[(128, 0)])
+    stateful = Workload.causal_lm(prefill=[(64, 64)])
+    decode = Workload.causal_lm(decode=[32, 64])
+    mixed = Workload.causal_lm(prefill=[(3, 0), (4, 8)], decode=[32])
+    assert fresh.prefill_stateful_requests == 0
+    assert stateful.prefill_stateful_requests == 1
+    assert decode.prefill_stateful_requests == 0
+    assert mixed.prefill_stateful_requests == 1
+    assert dict(mixed.attention_phases())["prefill"].prefill_stateful_requests == 1
+    assert Workload(0, 0).prefill_stateful_requests == 0
+    with pytest.raises(ValueError, match="non-negative integer"):
+        Workload(0, 0, prefill_stateful_requests=-1)
+
+
+def test_floors_stateful_prefill_axis_and_legacy_payload_default():
+    totals = {
+        "matmul_tokens": 65,
+        "prefill_tokens": 64,
+        "decode_passes": 1,
+        "prefill_pairs": 64 * 129 - 64 * 63 // 2,
+        "prefill_cached": 64,
+        "decode_kv": 32,
+        "prefill_requests": 1,
+        "prefill_stateful_requests": 1,
+    }
+    assert work_floors._aggregate_workload(totals).prefill_stateful_requests == 1
+    assert (
+        work_floors._aggregate_workload(
+            {k: v for k, v in totals.items() if k != "prefill_stateful_requests"}
+        ).prefill_stateful_requests
+        == 0
+    )
+    with pytest.raises(ValueError, match="cannot exceed"):
+        work_floors._aggregate_workload({**totals, "prefill_stateful_requests": 2})
+    with pytest.raises(ValueError, match="exact integer"):
+        work_floors._aggregate_workload({**totals, "prefill_stateful_requests": 0.5})
+
+
+def test_qwen_gdn_packed_groups_learned_weights_and_state_formula():
+    gdn = _qwen_gdn()
+    groups = {group.name: group for group in gdn.matmul_groups()}
+    assert (groups["qkvz"].n, groups["qkvz"].k, groups["qkvz"].module) == (
+        12288,
+        2048,
+        "linear_attn.in_proj_qkvz",
+    )
+    assert (groups["ba"].n, groups["ba"].k, groups["ba"].module) == (
+        64,
+        2048,
+        "linear_attn.in_proj_ba",
+    )
+    assert (groups["conv1d"].n, groups["conv1d"].k, groups["conv1d"].module) == (
+        8192,
+        4,
+        "linear_attn.conv1d",
+    )
+    assert (groups["out_proj"].n, groups["out_proj"].k) == (2048, 4096)
+    assert [(w.name, w.elements, w.breakdown) for w in gdn.learned_weight_groups()] == [
+        ("a_log", 32, "attn"),
+        ("dt_bias", 32, "attn"),
+        ("gated_norm", 128, "norm"),
+    ]
+    assert gdn.recurrent_state_bytes == 2_097_152
+    assert gdn.convolution_state_bytes == 65_536
+    unit = 2_097_152 + 65_536
+    assert gdn.kv_bytes(Workload.causal_lm(prefill=[(3, 0)])) == unit
+    assert gdn.kv_bytes(Workload.causal_lm(prefill=[(3, 8)])) == 2 * unit
+    assert gdn.kv_bytes(Workload.causal_lm(decode=[32])) == 2 * unit
+    assert gdn.kv_bytes(Workload.causal_lm(prefill=[(3, 0), (4, 8)], decode=[32, 64])) == 7 * unit
+    assert gdn.internal_flops(Workload.causal_lm(decode=[32] * 5)) == 6 * 32 * 128 * 128 * 5
+
+
+def test_gdn_weight_only_groups_add_params_and_bytes_but_no_flops():
+    class EmptyFfn:
+        def matmul_groups(self):
+            return []
+
+    gdn = _qwen_gdn()
+    model = Model(
+        name="test",
+        hidden=2048,
+        vocab=1,
+        weight_dtype_bytes=2,
+        tie_word_embeddings=True,
+        layers=[LayerStack(gdn, EmptyFfn(), 30, "gdn")],
+    )
+    label = model.label(Workload.causal_lm(decode=[32], sampled=0))
+    learned = [
+        s for s in label.segments if s.name in {"gdn.a_log", "gdn.dt_bias", "gdn.gated_norm"}
+    ]
+    assert sum(s.bytes_total for s in learned) == 30 * 2 * (32 + 32 + 128)
+    assert all(s.flops_total == 0 for s in learned)
+    matrix_params = sum(g.total_params for g in gdn.matmul_groups())
+    old_attn_classification = 30 * (matrix_params + 32 + 32 + 128)
+    assert label.params["breakdown"]["attn"] == old_attn_classification - 3_840
+    assert label.params["breakdown"]["norm"] == 3_840
+    assert label.params["activated"]["layers"] == 30 * (matrix_params + 32 + 32 + 128)
+
+
+def test_gdn_packed_quant_scale_is_counted_once():
+    class EmptyFfn:
+        def matmul_groups(self):
+            return []
+
+    raw = json.loads(
+        (Path(__file__).resolve().parents[1] / "model/config/qwen3_6_35b_a3b_fp8.json").read_text()
+    )
+    model = Model(
+        name="test",
+        hidden=2048,
+        vocab=1,
+        weight_dtype_bytes=2,
+        tie_word_embeddings=True,
+        layers=[LayerStack(_qwen_gdn(), EmptyFfn(), 1, "gdn")],
+        quant=parse_quantization_config(raw),
+        master_dtype="bfloat16",
+    )
+    label = model.label(Workload.causal_lm(decode=[32], sampled=0))
+    qkvz = next(segment for segment in label.segments if segment.name == "gdn.qkvz")
+    expected_bytes = 12_288 * 2_048 + 4 * (12_288 // 128) * (2_048 // 128)
+    assert qkvz.bytes_total == expected_bytes
+    assert qkvz.compute_dtype == "fp8"
+    assert not any(segment.name in {"gdn.qkv", "gdn.z"} for segment in label.segments)
+
+
+# Qwen3.6-35B-A3B independent checkpoint arithmetic. Converted matrices carry
+# one FP32 scale per 128x128 block; checkpoint-excluded matrices remain BF16.
+def _qwen36_fp8_matrix_bytes(n: int, k: int) -> int:
+    return n * k + 4 * math.ceil(n / 128) * math.ceil(k / 128)
+
+
+def _qwen36_bf16_matrix_bytes(n: int, k: int) -> int:
+    return 2 * n * k
+
+
+def _qwen36_expected_loaded_experts(tokens: int) -> float:
+    return 256 * (1 - (255 / 256) ** (8 * tokens))
+
+
+def _qwen36_expected_weight_bytes(tokens: int) -> float:
+    # G/F include their mechanism-specific learned vectors and external norms.
+    gdn = 33_898_880
+    gated_gqa = 27_278_848
+    fixed_moe = 4_199_168
+    routed_expert = 3_146_496
+    return (
+        30 * gdn
+        + 10 * gated_gqa
+        + 40 * (fixed_moe + _qwen36_expected_loaded_experts(tokens) * routed_expert)
+        + 4096 * min(tokens, 248_320)
+        + 2 * 2048 * 248_320
+        + 4096
+    )
+
+
+@pytest.fixture(scope="module")
+def qwen36_moe():
+    return load_model(QWEN36_MOE)
+
+
+def test_qwen36_moe_registry_geometry_schedule_and_quantization(qwen36_moe):
+    from model.work.models import qwen3_6, qwen3_6_moe
+
+    assert REGISTRY["Qwen3_5MoeForConditionalGeneration"] is qwen3_6_moe.build
+    assert REGISTRY["Qwen3_5ForConditionalGeneration"] is qwen3_6.build
+    assert qwen36_moe.name == "Qwen3_5MoeForConditionalGeneration"
+    assert qwen36_moe.hidden == 2048
+    assert qwen36_moe.vocab == 248_320
+    assert qwen36_moe.tie_word_embeddings is False
+    assert qwen36_moe.master_dtype == "bf16"
+    assert qwen36_moe.quant.compute_dtype == "fp8"
+    assert qwen36_moe.quant.block_shape == (128, 128)
+    assert [(stack.tag, stack.count) for stack in qwen36_moe.layers] == [
+        ("gdn", 30),
+        ("gated_gqa", 10),
+    ]
+    gdn, gated_gqa = (stack.attn for stack in qwen36_moe.layers)
+    assert (
+        gdn.num_k_heads,
+        gdn.num_v_heads,
+        gdn.head_k_dim,
+        gdn.head_v_dim,
+        gdn.conv_kernel,
+        gdn.state_dtype_bytes,
+    ) == (16, 32, 128, 128, 4, 4)
+    assert (
+        gated_gqa.num_qo_heads,
+        gated_gqa.num_kv_heads,
+        gated_gqa.head_dim,
+        gated_gqa.output_gate,
+        gated_gqa.kv_dtype_bytes,
+    ) == (16, 2, 256, True, 2)
+    for stack in qwen36_moe.layers:
+        assert stack.ffn.moe_intermediate == 512
+        assert stack.ffn.num_experts == 256
+        assert stack.ffn.top_k == 8
+        assert stack.ffn.shared_intermediate == 512
+        assert stack.ffn.shared_module == "shared_expert"
+        assert stack.ffn.shared_gate is True
+    # The nested checkpoint also contains vision and MTP metadata, but this
+    # text-only accountant has exactly the two 40-layer text stacks above.
+    assert qwen36_moe.num_layers == 40
+
+
+def test_qwen36_moe_schedule_is_explicit_and_position_checked():
+    raw = json.loads(QWEN36_MOE.read_text())
+    missing = json.loads(json.dumps(raw))
+    missing["text_config"].pop("layer_types")
+    with pytest.raises(ValueError, match="explicit 40-entry"):
+        build_model(missing)
+
+    short = json.loads(json.dumps(raw))
+    short["text_config"]["layer_types"].pop()
+    with pytest.raises(ValueError, match="explicit 40-entry"):
+        build_model(short)
+
+    misplaced = json.loads(json.dumps(raw))
+    misplaced["text_config"]["layer_types"][2:4] = ["full_attention", "linear_attention"]
+    with pytest.raises(ValueError, match="three linear then one full"):
+        build_model(misplaced)
+
+    wrong_count = json.loads(json.dumps(raw))
+    wrong_count["text_config"]["num_hidden_layers"] = 39
+    with pytest.raises(ValueError, match="num_hidden_layers=40"):
+        build_model(wrong_count)
+
+
+def test_qwen36_moe_exact_parameter_inventory_and_subprocess_contract(qwen36_moe):
+    label = qwen36_moe.label(Workload.causal_lm(decode=[4096], sampled=1))
+    # Literal checkpoint inventory: I/O tables + attention + norm vectors +
+    # all 256 routed experts + shared path + router, over 30/10 layers.
+    embedding = lm_head = 248_320 * 2048
+    gdn_attn = 30 * (12_288 * 2048 + 64 * 2048 + 8192 * 4 + 2048 * 4096 + 32 + 32)
+    gated_gqa_attn = 10 * (9216 * 2048 + 2048 * 4096)
+    norms = 30 * 128 + 30 * 2 * 2048 + 10 * (2 * 2048 + 2 * 256) + 2048
+    expert_matrix = 1024 * 2048 + 2048 * 512
+    experts = 40 * 256 * expert_matrix
+    shared = 40 * (expert_matrix + 2048)
+    router = 40 * 256 * 2048
+    expected_breakdown = {
+        "embedding": embedding,
+        "norm": norms,
+        "attn": gdn_attn + gated_gqa_attn,
+        "ffn": 0,
+        "experts": experts,
+        "shared": shared,
+        "router": router,
+        "lm_head": lm_head,
+    }
+    assert expected_breakdown == {
+        "embedding": 508_559_360,
+        "norm": 174_848,
+        "attn": 1_284_179_840,
+        "ffn": 0,
+        "experts": 32_212_254_720,
+        "shared": 125_911_040,
+        "router": 20_971_520,
+        "lm_head": 508_559_360,
+    }
+    assert label.params["breakdown"] == expected_breakdown
+    assert sum(expected_breakdown.values()) == 34_660_610_688
+    activated_layers = (
+        expected_breakdown["attn"]
+        + expected_breakdown["norm"]
+        + 40 * 8 * expert_matrix
+        + expected_breakdown["shared"]
+        + expected_breakdown["router"]
+    )
+    assert activated_layers == 2_437_870_208
+    assert label.params == {
+        "total": 34_660_610_688,
+        "activated": {
+            "layers": 2_437_870_208,
+            "with_embed_head": 3_454_988_928,
+        },
+        "breakdown": expected_breakdown,
+    }
+    assert compute_parameter_counts(QWEN36_MOE) == {
+        "total": 34_660_610_688,
+        "active": 3_454_988_928,
+        "active_layers": 2_437_870_208,
+        "active_definition": "with_embed_head",
+    }
+
+
+def test_qwen36_moe_prefill_and_decode_work_goldens(qwen36_moe):
+    prefill = qwen36_moe.label(Workload.causal_lm(prefill=[(128, 0)], sampled=1))
+    assert prefill.flops == {
+        "attn_proj": 328_749_547_520,
+        "attn_internal": 13_432_258_560,
+        "ffn": 289_931_264_000,
+        "router": 5_368_709_120,
+        "lm_head": 1_017_118_720,
+    }
+    assert prefill.flops_total == 638_498_897_920
+    assert prefill.bytes["kv"] == 64_880_640 + 2_621_440 == 67_502_080
+    assert prefill.bytes["weights"] == pytest.approx(_qwen36_expected_weight_bytes(128), rel=1e-14)
+    assert prefill.bytes["weights"] == pytest.approx(34_109_960_070.600513, rel=1e-14)
+
+    decode = qwen36_moe.label(Workload.causal_lm(decode=[4096], sampled=1))
+    assert decode.flops == {
+        "attn_proj": 2_568_355_840,
+        "attn_internal": 765_460_480,
+        "ffn": 2_265_088_000,
+        "router": 41_943_040,
+        "lm_head": 1_017_118_720,
+    }
+    assert decode.flops_total == 6_657_966_080
+    assert decode.bytes["kv"] == 129_761_280 + 83_886_080 == 213_647_360
+    assert decode.bytes["weights"] == pytest.approx(_qwen36_expected_weight_bytes(1), rel=1e-14)
+    assert decode.bytes["weights"] == pytest.approx(3_468_068_334.75965, rel=1e-14)
+
+
+def test_qwen36_moe_weight_formulas_and_precision_exclusions(qwen36_moe):
+    assert _qwen36_fp8_matrix_bytes(12_288, 2048) == 25_171_968
+    assert _qwen36_bf16_matrix_bytes(64, 2048) == 262_144
+    # Fixed per-layer byte formulas, independently expanded from checkpoint math.
+    gdn = (
+        _qwen36_fp8_matrix_bytes(12_288, 2048)
+        + _qwen36_bf16_matrix_bytes(64, 2048)
+        + _qwen36_bf16_matrix_bytes(8192, 4)
+        + _qwen36_fp8_matrix_bytes(2048, 4096)
+        + 2 * (32 + 32 + 128 + 2 * 2048)
+    )
+    gated_gqa = (
+        _qwen36_fp8_matrix_bytes(9216, 2048)
+        + _qwen36_fp8_matrix_bytes(2048, 4096)
+        + 2 * (2 * 2048 + 2 * 256)
+    )
+    fixed_moe = (
+        _qwen36_bf16_matrix_bytes(256, 2048)
+        + _qwen36_fp8_matrix_bytes(1024, 2048)
+        + _qwen36_fp8_matrix_bytes(2048, 512)
+        + _qwen36_bf16_matrix_bytes(1, 2048)
+    )
+    routed_expert = _qwen36_fp8_matrix_bytes(1024, 2048) + _qwen36_fp8_matrix_bytes(2048, 512)
+    assert (gdn, gated_gqa, fixed_moe, routed_expert) == (
+        33_898_880,
+        27_278_848,
+        4_199_168,
+        3_146_496,
+    )
+
+    by_tag = {stack.tag: stack for stack in qwen36_moe.layers}
+    gdn_groups = {group.name: group for group in by_tag["gdn"].attn.matmul_groups()}
+    gqa_groups = {group.name: group for group in by_tag["gated_gqa"].attn.matmul_groups()}
+    moe_groups = {group.name: group for group in by_tag["gdn"].ffn.matmul_groups()}
+    assert {
+        name for name, group in gdn_groups.items() if qwen36_moe.quant.is_converted(group.module)
+    } == {
+        "qkvz",
+        "out_proj",
+    }
+    assert {
+        name
+        for name, group in gdn_groups.items()
+        if not qwen36_moe.quant.is_converted(group.module)
+    } == {
+        "ba",
+        "conv1d",
+    }
+    assert all(qwen36_moe.quant.is_converted(group.module) for group in gqa_groups.values())
+    assert {
+        name
+        for name, group in moe_groups.items()
+        if not qwen36_moe.quant.is_converted(group.module)
+    } == {
+        "router",
+        "shared_gate",
+    }
+    assert all(
+        qwen36_moe.quant.is_converted(moe_groups[name].module)
+        for name in ("expert_gate_up", "expert_down", "shared_gate_up", "shared_down")
+    )
+
+
+def test_qwen36_moe_semantic_names_roll_up_and_sampled_head(qwen36_moe):
+    prefill = qwen36_moe.label(Workload.causal_lm(prefill=[(128, 0)], sampled=1))
+    names = {segment.name for segment in prefill.segments}
+    assert names == {
+        "gdn.qkvz",
+        "gdn.ba",
+        "gdn.conv1d",
+        "gdn.out_proj",
+        "gdn.router",
+        "gdn.expert_gate_up",
+        "gdn.expert_down",
+        "gdn.shared_gate_up",
+        "gdn.shared_down",
+        "gdn.shared_gate",
+        "gdn.a_log",
+        "gdn.dt_bias",
+        "gdn.gated_norm",
+        "gdn.attn.prefill",
+        "gdn.attn.decode",
+        "gdn.recurrent_state.prefill_read",
+        "gdn.recurrent_state.prefill_write",
+        "gdn.recurrent_state.decode_read",
+        "gdn.recurrent_state.decode_write",
+        "gdn.conv_state.prefill_read",
+        "gdn.conv_state.prefill_write",
+        "gdn.conv_state.decode_read",
+        "gdn.conv_state.decode_write",
+        "gated_gqa.qkv",
+        "gated_gqa.o",
+        "gated_gqa.router",
+        "gated_gqa.expert_gate_up",
+        "gated_gqa.expert_down",
+        "gated_gqa.shared_gate_up",
+        "gated_gqa.shared_down",
+        "gated_gqa.shared_gate",
+        "gated_gqa.attn.prefill",
+        "gated_gqa.attn.decode",
+        "gated_gqa.kv_cache_append",
+        "gdn.input_norm",
+        "gdn.post_norm",
+        "gated_gqa.input_norm",
+        "gated_gqa.q_norm",
+        "gated_gqa.k_norm",
+        "gated_gqa.post_norm",
+        "final_norm",
+        "embedding",
+        "lm_head",
+    }
+    segment_dtypes = {segment.name: segment.compute_dtype for segment in prefill.segments}
+    assert segment_dtypes["gdn.qkvz"] == "fp8"
+    assert segment_dtypes["gdn.out_proj"] == "fp8"
+    for name in (
+        "gdn.ba",
+        "gdn.conv1d",
+        "gdn.router",
+        "gdn.shared_gate",
+        "gdn.input_norm",
+        "gdn.gated_norm",
+        "final_norm",
+        "embedding",
+        "lm_head",
+    ):
+        assert segment_dtypes[name] == "bf16"
+    assert sum(segment.flops_total for segment in prefill.segments) == prefill.flops_total
+    assert sum(segment.bytes_total for segment in prefill.segments) == pytest.approx(
+        prefill.bytes_total
+    )
+    assert next(segment for segment in prefill.segments if segment.name == "lm_head").flops == (
+        2 * 2048 * 248_320
+    )
+    decode = qwen36_moe.label(Workload.causal_lm(decode=[4096], sampled=1))
+    assert next(segment for segment in decode.segments if segment.name == "lm_head").flops == (
+        2 * 2048 * 248_320
+    )
+    norm = next(segment for segment in decode.segments if segment.name == "final_norm")
+    assert norm.flops_total == 0
+    assert norm.bytes_total == 4096
+
+
+def test_qwen36_local_location_map_identity_order_and_locality():
+    location_map = json.loads(QWEN36_LOCAL_MAP.read_text())
+    locations = [row["location"] for row in location_map["locations"]]
+    assert location_map["schema_version"] == 1
+    assert location_map["mapping_id"] == "qwen36-local-unified-v2"
+    assert location_map["arch_types"] == ["qwen36_local"]
+    assert locations == QWEN36_LOCAL_LOCATIONS
+    assert len(locations) == len(set(locations)) == 58
+    assert not any(
+        component in location
+        for location in locations
+        for component in (
+            "dispatch",
+            "combine",
+            "network",
+            "collective",
+            "all_reduce",
+            "all_to_all",
+        )
+    )
+
+
+def test_qwen36_local_location_map_consumes_mixed_semantics_exactly_once(qwen36_moe):
+    location_map = json.loads(QWEN36_LOCAL_MAP.read_text())
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    mixed = qwen36_moe.label(
+        Workload.causal_lm(
+            prefill=[(64, 64), (64, 0)],
+            decode=[32] * 8,
+            sampled=10,
+        )
+    )
+    segment_names = [segment.name for segment in mixed.segments]
+    assert len(mapped) == len(set(mapped)) == 43
+    assert set(mapped) == set(segment_names)
+    assert len(segment_names) == len(set(segment_names)) == 43
+    assert sum(segment.flops_total for segment in mixed.segments) == mixed.flops_total
+    assert sum(segment.bytes_total for segment in mixed.segments) == pytest.approx(
+        mixed.bytes_total
+    )
+
+
+def test_qwen36_local_location_map_shared_rows_and_scale_multiplicity(qwen36_moe):
+    location_map = json.loads(QWEN36_LOCAL_MAP.read_text())
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    assert semantics["unified.router.router.gemm"] == ["gdn.router", "gated_gqa.router"]
+    assert semantics["unified.routed_expert.gate_up.gemm"] == [
+        "gdn.expert_gate_up",
+        "gated_gqa.expert_gate_up",
+    ]
+    assert semantics["unified.routed_expert.down.gemm"] == [
+        "gdn.expert_down",
+        "gated_gqa.expert_down",
+    ]
+    assert semantics["unified.shared_expert.gate_up.gemm"] == [
+        "gdn.shared_gate_up",
+        "gated_gqa.shared_gate_up",
+    ]
+    assert semantics["unified.shared_expert.down.gemm"] == [
+        "gdn.shared_down",
+        "gated_gqa.shared_down",
+    ]
+    assert semantics["unified.shared_expert.shared_gate"] == [
+        "gdn.shared_gate",
+        "gated_gqa.shared_gate",
+    ]
+    assert [(stack.tag, stack.count) for stack in qwen36_moe.layers] == [
+        ("gdn", 30),
+        ("gated_gqa", 10),
+    ]
+    label = qwen36_moe.label(Workload.causal_lm(decode=[32], sampled=1))
+    segments = {segment.name: segment for segment in label.segments}
+    assert segments["gdn.router"].count == 30
+    assert segments["gated_gqa.router"].count == 10
+    # Scale multiplicity lives on semantic Segment.count, never duplicate map rows.
+    assert (
+        len([row for row in location_map["locations"] if row["location"].endswith("router.gemm")])
+        == 1
+    )
+
+
+def test_qwen36_local_location_map_empty_fusion_placeholders_are_exact():
+    location_map = json.loads(QWEN36_LOCAL_MAP.read_text())
+    empty = {row["location"] for row in location_map["locations"] if not row["semantics"]}
+    assert empty == {
+        "unified.gdn.qkvz.input_quant",
+        "unified.gdn.split_b",
+        "unified.gdn.split_a",
+        "unified.gdn.core_output_zero",
+        "unified.gdn.state_zero",
+        "unified.gdn.prefill.cumsum",
+        "unified.gdn.prefill.kkt",
+        "unified.gdn.prefill.solve",
+        "unified.gdn.prefill.recompute_w_u",
+        "unified.gdn.prefill.output",
+        "unified.gdn.core_output_copy",
+        "unified.gdn.out_proj.input_quant",
+        "unified.router.topk",
+        "unified.router.align",
+        "unified.routed_expert.gate_up.input_quant",
+        "unified.routed_expert.activation",
+        "unified.routed_expert.down.input_quant",
+        "unified.shared_expert.gate_up.input_quant",
+        "unified.shared_expert.silu_and_mul",
+        "unified.shared_expert.down.input_quant",
+        "unified.shared_expert.apply_shared_gate",
+        "unified.finalize.finalize",
+        "unified.finalize.shared_routed_add",
+        "unified.gated_gqa.qkv_gate.input_quant",
+        "unified.gated_gqa.partial_rope",
+        "unified.gated_gqa.output_gate",
+        "unified.gated_gqa.out_proj.input_quant",
+    }
+    assert len(empty) == 27
+
+
+def test_moe_shared_scalar_gate_is_opt_in():
+    base = MoE(2048, 512, 256, 8, shared_intermediate=512, shared_module="shared_expert")
+    assert "shared_gate" not in {g.name for g in base.matmul_groups()}
+    enabled = MoE(
+        2048,
+        512,
+        256,
+        8,
+        shared_intermediate=512,
+        shared_module="shared_expert",
+        shared_gate=True,
+    )
+    gate = next(g for g in enabled.matmul_groups() if g.name == "shared_gate")
+    assert (gate.n, gate.k, gate.module, gate.bucket) == (
+        1,
+        2048,
+        "mlp.shared_expert_gate",
+        "shared_expert",
+    )
+    with pytest.raises(ValueError, match="requires shared_intermediate"):
+        MoE(2048, 512, 256, 8, shared_gate=True).matmul_groups()
+
+
+def test_nested_quantization_paths_preserve_component_boundaries():
+    raw = json.loads(
+        (Path(__file__).resolve().parents[1] / "model/config/qwen3_6_35b_a3b_fp8.json").read_text()
+    )
+    quant = parse_quantization_config(raw)
+    assert quant is not None
+    for module in (
+        "linear_attn.in_proj_ba",
+        "linear_attn.conv1d",
+        "mlp.gate",
+        "mlp.shared_expert_gate",
+        "lm_head",
+        "embed_tokens",
+    ):
+        assert not quant.is_converted(module)
+    assert quant.is_converted("linear_attn.in_proj_qkvz")
+    assert quant.is_converted("linear_attn.out_proj")
+    assert quant.is_converted("mlp.experts.gate_up_proj")
+    # Legacy model.layers paths still normalize, and component matching must not
+    # make `mlp.gate` exclude `mlp.gate_proj`.
+    legacy = parse_quantization_config(
+        {
+            "quantization_config": {
+                "quant_method": "fp8",
+                "modules_to_not_convert": ["model.layers.7.mlp.gate"],
+            }
+        }
+    )
+    assert not legacy.is_converted("mlp.gate")
+    assert legacy.is_converted("mlp.gate_proj")
 
 
 def test_gated_attention_doubles_q_projection():
@@ -754,10 +1492,7 @@ QWEN3_235B = (
     Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b_thinking_2507.json"
 )
 QWEN3_235B_FP8 = (
-    Path(__file__).resolve().parents[1]
-    / "model"
-    / "config"
-    / "qwen3_235b_thinking_2507_fp8.json"
+    Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b_thinking_2507_fp8.json"
 )
 QWEN3_235B_A22B = Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b.json"
 QWEN3_235B_A22B_FP8 = (
@@ -878,9 +1613,7 @@ def test_glm52_fp8_compute_floor_is_mixed_not_globally_fp8():
 
     # The BF16 twin makes no fp8 claim on its matmuls, but the DSA index logits
     # are FP8 by construction of the mechanism, not of the checkpoint.
-    bf16_dtypes = {
-        segment.compute_dtype for segment in load_model(GLM52).label(FULL_LOAD).segments
-    }
+    bf16_dtypes = {segment.compute_dtype for segment in load_model(GLM52).label(FULL_LOAD).segments}
     assert bf16_dtypes == {"bf16", "fp8"}
 
 
@@ -913,15 +1646,11 @@ def test_vllm_location_map_covers_every_non_communication_leaf():
     assert len(mapped) == len(set(mapped))
     assert set(mapped) == names
     # The MoE exchange itself is communication and must not appear as a location.
-    assert not any(
-        location.endswith((".moe.dispatch", ".moe.combine")) for location in locations
-    )
+    assert not any(location.endswith((".moe.dispatch", ".moe.combine")) for location in locations)
     # vLLM splits each routed-expert projection into a quantize and a grouped GEMM;
     # only the GEMM carries the semantic weight work.
     native = json.loads((maps_dir / "glm52_dsa_moe_unified.json").read_text())
-    native_semantics = {
-        row["location"]: row["semantics"] for row in native["locations"]
-    }
+    native_semantics = {row["location"]: row["semantics"] for row in native["locations"]}
     vllm_semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
     for tag in (
         "sparse_initial_index_share",

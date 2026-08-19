@@ -1,0 +1,37 @@
+# Qwen3.6-35B-A3B-FP8 on one H200, hybrid KV.
+#
+# 30 gated-DeltaNet layers hold a fixed per-request recurrent + conv state; the
+# 10 gated-GQA layers hold per-token KV. Both share the one `attn_gpu_memory_gb`
+# budget, so concurrency is set by whichever runs out first. Prefix reuse is
+# quantized to the arch's snapshot interval — a recurrent state can only resume
+# from a boundary it was actually written at.
+#
+# `worker.type` is still `barebone`: cadence, admission and execution are the
+# barebone composition. Only the KV axis differs, and the arch tag selects it.
+
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/smoke.csv
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  session_dependency: independent
+  run_to_end: true
+
+io:
+  log_dir: logs/unified_qwen36_local_hybrid
+  kv_log_stride: 1
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 1
+        arch:
+          type: qwen36_local
+          model_config: model/config/qwen3_6_35b_a3b_fp8.json
+        worker:
+          type: barebone
+          attn_gpu_memory_gb: 40.0
+          pending_order: longest-prefix-match

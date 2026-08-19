@@ -48,25 +48,31 @@ def _program_shape(document: dict) -> list[tuple]:
     shape: list[tuple] = []
     for phase in sorted(document["phases"]):
         for sequence in document["phases"][phase]["unique_sequences"]:
-            for segment_index, segment in enumerate(sequence["program"]):
-                for offset, kernel in enumerate(segment_body(segment)):
-                    shape.append(
-                        (
-                            phase,
-                            sequence["sequence_id"],
-                            segment_index,
-                            segment_repeat(segment),
-                            offset,
-                            kernel["name"],
-                            kernel.get("suggested_category"),
+            for track in sequence["tracks"]:
+                track_index = int(track["track_index"])
+                for segment_index, segment in enumerate(track["program"]):
+                    for offset, kernel in enumerate(segment_body(segment)):
+                        shape.append(
+                            (
+                                phase,
+                                sequence["sequence_id"],
+                                track_index,
+                                segment_index,
+                                segment_repeat(segment),
+                                offset,
+                                kernel["name"],
+                                kernel.get("suggested_category"),
+                            )
                         )
-                    )
     return sorted(shape)
 
 
 def _describe(position: tuple) -> str:
-    phase, sequence_id, segment_index, repeat, offset, name, category = position
-    return f"{phase}/{sequence_id[:12]}/seg{segment_index}(x{repeat})[{offset}] {name} [{category}]"
+    phase, sequence_id, track_index, segment_index, repeat, offset, name, category = position
+    return (
+        f"{phase}/{sequence_id[:12]}/track{track_index}"
+        f"/seg{segment_index}(x{repeat})[{offset}] {name} [{category}]"
+    )
 
 
 def _assert_same_program(source: dict, destination: dict) -> None:
@@ -91,18 +97,25 @@ def _assert_same_program(source: dict, destination: dict) -> None:
         )
 
 
-def _labels_by_position(document: dict) -> dict[tuple[str, str, int, int], dict]:
-    labels: dict[tuple[str, str, int, int], dict] = {}
+def _labels_by_position(document: dict) -> dict[tuple[str, str, int, int, int], dict]:
+    labels: dict[tuple[str, str, int, int, int], dict] = {}
     for phase, block in document["phases"].items():
         for sequence in block["unique_sequences"]:
-            for segment_index, segment in enumerate(sequence["program"]):
-                for offset, kernel in enumerate(segment_body(segment)):
-                    # An empty dict is what `walk_kernels` leaves behind on a
-                    # position nobody labeled, so it carries no decision to move.
-                    if kernel.get("label"):
-                        labels[(phase, sequence["sequence_id"], segment_index, offset)] = kernel[
-                            "label"
-                        ]
+            for track in sequence["tracks"]:
+                track_index = int(track["track_index"])
+                for segment_index, segment in enumerate(track["program"]):
+                    for offset, kernel in enumerate(segment_body(segment)):
+                        # An empty dict is what `walk_kernels` leaves behind on a
+                        # position nobody labeled, so it carries no decision to move.
+                        if kernel.get("label"):
+                            key = (
+                                phase,
+                                sequence["sequence_id"],
+                                track_index,
+                                segment_index,
+                                offset,
+                            )
+                            labels[key] = kernel["label"]
     return labels
 
 
@@ -116,15 +129,25 @@ def transfer_labels(source: dict, destination: dict) -> TransferReport:
     for phase, block in destination["phases"].items():
         for sequence in block["unique_sequences"]:
             sequences += 1
-            for segment_index, segment in enumerate(sequence["program"]):
-                for offset, kernel in enumerate(segment_body(segment)):
-                    positions += 1
-                    label = labels.get((phase, sequence["sequence_id"], segment_index, offset))
-                    if label is None:
-                        kernel.pop("label", None)
-                        continue
-                    kernel["label"] = label
-                    transferred += 1
+            for track in sequence["tracks"]:
+                track_index = int(track["track_index"])
+                for segment_index, segment in enumerate(track["program"]):
+                    for offset, kernel in enumerate(segment_body(segment)):
+                        positions += 1
+                        label = labels.get(
+                            (
+                                phase,
+                                sequence["sequence_id"],
+                                track_index,
+                                segment_index,
+                                offset,
+                            )
+                        )
+                        if label is None:
+                            kernel.pop("label", None)
+                            continue
+                        kernel["label"] = label
+                        transferred += 1
     return TransferReport(
         sequences=sequences,
         positions=positions,

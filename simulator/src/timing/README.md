@@ -99,7 +99,7 @@ cache/            Fit profiled samples → an interpolating cache; eval off-grid
   mod.rs            Cache trait, CacheKind enum, build_cache dispatch, OutlierWarning.
   interp.rs         Metrics4 (f32, SIMD-packed), LeafMetrics, CoverageFlags, the
                     branchless `locate` (the measured hot-path floor).
-  linear_1d.rs · linear_2d.rs · direct_1d.rs · cliff_2d.rs · log_2d.rs · backend.rs
+  linear_1d.rs · linear_2d.rs · linear_3d.rs · direct_1d.rs · cliff_2d.rs · log_2d.rs · backend.rs
 
 sweep.rs          SweepGrid + Axis presets (e.g. token_axis, a profiler↔sim
                   contract curve) + Coords / SweepCoords (Input → coord projection).

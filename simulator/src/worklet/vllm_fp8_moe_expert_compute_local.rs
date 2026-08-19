@@ -1,17 +1,32 @@
-//! vLLM-aligned local MoE expert compute: BF16 activation block quantization +
-//! TRT-LLM blockscale grouped GEMM for gate-up and down, with SwiGLU between.
+//! vLLM-aligned local (non-EP) MoE expert compute, mirroring the four launches
+//! nsys observes per MoE layer: per-token-group FP8 quant, Triton
+//! `fused_moe_kernel` gate/up, SwiGLU, quant, Triton `fused_moe_kernel` down.
+//!
+//! "vLLM-aligned" here means the *local* path specifically. vLLM has a second
+//! expert-compute realization -- TRT-LLM blockscale grouped GEMM over
+//! DeepEP-permuted tokens -- which `moe_expert_compute_local` beside this file
+//! keeps. Choosing between them is a modeling decision about which code path
+//! the target deployment takes, not a tuning knob.
 
 use std::sync::Arc;
 
 use crate::op::moe::{
     GroupedFp8GemmWithQuantConfig, GroupedFp8GemmWithQuantInput, GroupedFp8GemmWithQuantOp,
+    GroupedGemmConfig, GroupedQuantConfig, QuantRows,
 };
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, Fp8BlockQuantKernelConfig,
-    Fp8BlockscaleGroupedGemmKernelConfig,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
+    Fp8PerTokenGroupQuantKernelConfig, VllmFusedMoeKernelConfig, LAUNCH_ROLE_DOWN,
+    LAUNCH_ROLE_GATE_UP,
 };
+
+/// FP8 activation scaling granularity, matching every other vLLM quant leaf in
+/// this model. Duplicated from the shared-expert worklet rather than shared:
+/// each worklet owns the contract of the kernels it launches.
+const FP8_GROUP_SIZE: u32 = 128;
+const SCALE_FORMAT: &str = "ue8m0_column_major";
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 #[derive(Clone, Debug)]
@@ -81,27 +96,53 @@ impl VllmFp8MoeExpertComputeLocalWorklet {
         assert_eq!(cfg.num_experts.get() % ep_size, 0);
         let experts_per_gpu = cfg.num_experts.clone() / Dim::param("ep", ep_size);
         assert_eq!(cfg.local_ppm.len(), experts_per_gpu.get() as usize);
-        let quant_config = |hidden_size: Dim| Fp8BlockQuantKernelConfig {
-            backends: cfg.fp8_quant_backends.clone(),
-            gpu_name: cfg.gpu_name.clone(),
-            hidden_size,
-            num_problems: experts_per_gpu.clone(),
-            input_dtype: cfg.activation_dtype,
+        // vLLM quantizes the routed activation with the very same
+        // `per_token_group_quant_8bit_kernel` it uses for every dense
+        // projection -- nsys shows that exact kernel on both routed quants, not
+        // FlashInfer's grouped `scale_1x128_kernel`. See `GroupedQuantConfig`
+        // for the measured cost of getting this backwards.
+        let quant_config = |hidden_size: Dim| {
+            GroupedQuantConfig::PerTokenGroup(Fp8PerTokenGroupQuantKernelConfig {
+                backends: cfg.fp8_quant_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_size,
+                group_size: FP8_GROUP_SIZE,
+                input_dtype: cfg.activation_dtype,
+                scale_format: SCALE_FORMAT.to_string(),
+            })
         };
-        let gemm_config = |n: Dim, k: Dim| Fp8BlockscaleGroupedGemmKernelConfig {
-            backends: cfg.fp8_grouped_gemm_backends.clone(),
-            gpu_name: cfg.gpu_name.clone(),
-            n,
-            k,
-            dtype: DType::Fp8E4m3,
-            experts_per_token: cfg.top_k,
-            local_ppm: cfg.local_ppm.clone(),
+        // One Triton `fused_moe_kernel` launch per half, matching what nsys sees
+        // on this path -- not the TRT-LLM grouped GEMM, which is the realization
+        // vLLM picks only when an EP prepare/finalize has already permuted
+        // tokens into per-expert order.
+        let gemm_config = |n: Dim, k: Dim, launch_role: &str| {
+            GroupedGemmConfig::VllmFusedMoe(VllmFusedMoeKernelConfig {
+                backends: cfg.fp8_grouped_gemm_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                n,
+                k,
+                dtype: DType::Fp8E4m3,
+                experts_per_token: cfg.top_k,
+                launch_role: launch_role.to_string(),
+                block_size: FP8_GROUP_SIZE,
+                local_ppm: cfg.local_ppm.clone(),
+            })
         };
         let bytes = Dim::param("activation_bytes", cfg.activation_dtype.size_bytes());
         VllmFp8MoeExpertComputeLocalWorkletResolved {
             gate_up: GroupedFp8GemmWithQuantConfig {
                 quant: quant_config(cfg.hidden.clone()),
-                gemm: gemm_config(2 * cfg.moe_intermediate.clone(), cfg.hidden.clone()),
+                gemm: gemm_config(
+                    2 * cfg.moe_intermediate.clone(),
+                    cfg.hidden.clone(),
+                    LAUNCH_ROLE_GATE_UP,
+                ),
+                // vLLM quantizes the hidden states once and lets fused_moe_kernel
+                // gather rows per expert from that buffer, so top-k never
+                // multiplies this launch. Verified against nsys: the measured
+                // gate_up quant is *smaller* than the down quant (218 ms vs
+                // 287 ms), which only holds on the unexpanded layout.
+                quant_rows: QuantRows::PerToken,
             },
             act: ElementwiseKernelConfig {
                 backends: cfg.act_backends.clone(),
@@ -111,7 +152,14 @@ impl VllmFp8MoeExpertComputeLocalWorklet {
             },
             down: GroupedFp8GemmWithQuantConfig {
                 quant: quant_config(cfg.moe_intermediate.clone()),
-                gemm: gemm_config(cfg.hidden.clone(), cfg.moe_intermediate.clone()),
+                gemm: gemm_config(
+                    cfg.hidden.clone(),
+                    cfg.moe_intermediate.clone(),
+                    LAUNCH_ROLE_DOWN,
+                ),
+                // The intermediate activation physically exists once per
+                // (token, selected expert), so this one really is expanded.
+                quant_rows: QuantRows::PerSelection,
             },
             experts_per_gpu,
             raw_cfg: cfg.clone(),
@@ -201,9 +249,8 @@ impl VllmFp8MoeExpertComputeLocalWorklet {
 mod tests {
     use super::*;
 
-    #[test]
-    fn resolves_two_quantized_blockscale_gemms() {
-        let resolved = VllmFp8MoeExpertComputeLocalWorklet::resolve_config(
+    fn resolved() -> VllmFp8MoeExpertComputeLocalWorkletResolved {
+        VllmFp8MoeExpertComputeLocalWorklet::resolve_config(
             &VllmFp8MoeExpertComputeLocalWorkletConfig {
                 hidden: 4096.into(),
                 moe_intermediate: 1536.into(),
@@ -213,12 +260,46 @@ mod tests {
                 activation_dtype: DType::Bf16,
                 gpu_name: "H100".into(),
                 act_backends: vec!["triton"],
-                fp8_quant_backends: vec!["flashinfer_trtllm"],
-                fp8_grouped_gemm_backends: vec!["flashinfer_trtllm"],
+                fp8_quant_backends: vec!["vllm_cuda"],
+                fp8_grouped_gemm_backends: vec!["vllm_triton"],
                 local_ppm: vec![125_000; 4],
             },
-        );
-        assert_eq!(resolved.gate_up.gemm.dtype, DType::Fp8E4m3);
-        assert_eq!(resolved.down.gemm.dtype, DType::Fp8E4m3);
+        )
+    }
+
+    /// Pins the realization, not just the shapes. The two halves are the same
+    /// kernel in different launch roles, and the roles are not interchangeable:
+    /// swapping them silently applies routed weights to the wrong projection.
+    #[test]
+    fn resolves_two_triton_fused_moe_launches_in_opposite_roles() {
+        let resolved = resolved();
+        let GroupedGemmConfig::VllmFusedMoe(gate_up) = &resolved.gate_up.gemm else {
+            panic!("the local vLLM path must use the Triton fused_moe kernel");
+        };
+        let GroupedGemmConfig::VllmFusedMoe(down) = &resolved.down.gemm else {
+            panic!("the local vLLM path must use the Triton fused_moe kernel");
+        };
+        assert_eq!(gate_up.dtype, DType::Fp8E4m3);
+        assert_eq!(down.dtype, DType::Fp8E4m3);
+        assert_eq!(gate_up.launch_role, LAUNCH_ROLE_GATE_UP);
+        assert_eq!(down.launch_role, LAUNCH_ROLE_DOWN);
+        assert_eq!(gate_up.n.get(), 2 * 1536);
+        assert_eq!(gate_up.k.get(), 4096);
+        assert_eq!(down.n.get(), 4096);
+        assert_eq!(down.k.get(), 1536);
+    }
+
+    /// The quant halves differ in row layout, and only the gate_up side is
+    /// unexpanded. Asserted here because the two are configured by one shared
+    /// closure and are easy to make accidentally symmetric.
+    #[test]
+    fn only_the_gate_up_quant_reads_the_unexpanded_layout() {
+        let resolved = resolved();
+        assert_eq!(resolved.gate_up.quant_rows, QuantRows::PerToken);
+        assert_eq!(resolved.down.quant_rows, QuantRows::PerSelection);
+        assert!(matches!(
+            resolved.gate_up.quant,
+            GroupedQuantConfig::PerTokenGroup(_)
+        ));
     }
 }

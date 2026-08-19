@@ -327,7 +327,7 @@ def _labeled_sequence_positions(
     executed it; earlier schemas stored one representative sequence covering
     every device, leaving the iteration as the whole position.
     """
-    if schema_version != 4:
+    if schema_version < 4:
         return {
             (None, iteration)
             for iteration in _validate_iteration_list(
@@ -367,7 +367,7 @@ def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
     required = {"schema_version", "encoding", "source_parsed", "folding_policy", "phases"}
     if schema_version == 3:
         required.update({"device_ids", "representative_device_id"})
-    if schema_version == 4:
+    if schema_version in {4, 5}:
         required.add("device_ids")
     extra = set(raw) - required
     missing = required - set(raw)
@@ -376,15 +376,16 @@ def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
             "labeled kernel sequence keys mismatch: "
             f"missing={sorted(missing)} extra={sorted(extra)}"
         )
-    if schema_version not in {2, 3, 4} or raw["encoding"] not in {
+    if schema_version not in {2, 3, 4, 5} or raw["encoding"] not in {
         "folded-v1",
+        "folded-v2",
         "literal-v1",
     }:
         raise ValueError(
-            "labeled kernel sequences require schema_version 2, 3 or 4 and encoding "
-            "folded-v1 or literal-v1"
+            "labeled kernel sequences require schema_version 2, 3, 4 or 5 and encoding "
+            "folded-v1, folded-v2 or literal-v1"
         )
-    if schema_version in {3, 4}:
+    if schema_version in {3, 4, 5}:
         device_ids = raw["device_ids"]
         if (
             not isinstance(device_ids, list)
@@ -417,15 +418,20 @@ def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
         # single representative sequence applied to every device, so the position
         # was the iteration alone.
         assigned_positions: set[tuple[int | None, int]] = set()
-        position_label = "(device, iteration) pairs" if schema_version == 4 else "iterations"
-        occurrence_key = "occurrences" if schema_version == 4 else "iterations"
+        position_label = (
+            "(device, iteration) pairs" if schema_version >= 4 else "iterations"
+        )
+        occurrence_key = "occurrences" if schema_version >= 4 else "iterations"
         for index, sequence in enumerate(sequences):
             context = f"phases.{phase_name}.unique_sequences[{index}]"
+            # Schema 5 splits a sequence into concurrent tracks. Older documents
+            # carry the single implicit track as a bare `program`.
+            program_key = "tracks" if schema_version >= 5 else "program"
             if not isinstance(sequence, dict) or set(sequence) != {
                 "sequence_id",
                 occurrence_key,
                 "expanded_kernel_count",
-                "program",
+                program_key,
             }:
                 raise ValueError(f"{context} has invalid keys")
             sequence_id = sequence["sequence_id"]
@@ -440,15 +446,61 @@ def load_labeled_kernel_sequences(path: Path) -> dict[str, Any]:
                     f"phase {phase_name!r} assigns {position_label} twice: {sorted(overlap)}"
                 )
             assigned_positions.update(positions)
-            expanded = _validate_labeled_program(
-                sequence["program"], context, operation_signatures, slots
-            )
+            if schema_version >= 5:
+                expanded = _validate_labeled_tracks(
+                    sequence["tracks"], context, operation_signatures, slots
+                )
+            else:
+                expanded = _validate_labeled_program(
+                    sequence["program"], context, operation_signatures, slots
+                )
             if sequence["expanded_kernel_count"] != expanded:
                 raise ValueError(
                     f"{context}.expanded_kernel_count "
                     f"{sequence['expanded_kernel_count']} != {expanded}"
                 )
     return raw
+
+
+def _validate_labeled_tracks(
+    tracks: Any,
+    context: str,
+    operations: dict[str, tuple[tuple[str, ...], str, str]],
+    slots: dict[str, set[str]],
+) -> int:
+    """Validate a schema-5 sequence's concurrent tracks and total its kernels.
+
+    Track indices must be dense and in order: they are the coordinate a labeling
+    decision is addressed by, and a gap would make two inventories of the same
+    capture disagree on where a label belongs.
+    """
+    if not isinstance(tracks, list) or not tracks:
+        raise ValueError(f"{context}.tracks must be a non-empty list")
+    expanded = 0
+    for track_index, track in enumerate(tracks):
+        track_context = f"{context}.tracks[{track_index}]"
+        if not isinstance(track, dict) or set(track) != {
+            "track_index",
+            "stream_role",
+            "kernel_count",
+            "program",
+        }:
+            raise ValueError(f"{track_context} has invalid keys")
+        if track["track_index"] != track_index:
+            raise ValueError(
+                f"{track_context}.track_index {track['track_index']} != {track_index}"
+            )
+        if track["stream_role"] not in {"primary", "concurrent"}:
+            raise ValueError(f"{track_context}.stream_role must be primary or concurrent")
+        track_expanded = _validate_labeled_program(
+            track["program"], track_context, operations, slots
+        )
+        if track["kernel_count"] != track_expanded:
+            raise ValueError(
+                f"{track_context}.kernel_count {track['kernel_count']} != {track_expanded}"
+            )
+        expanded += track_expanded
+    return expanded
 
 
 def _validate_labeled_program(

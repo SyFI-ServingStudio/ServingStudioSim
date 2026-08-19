@@ -51,19 +51,31 @@ class ElementwiseArgs(KernelArgs):
     output_size_bytes: int
 
 
-register(
-    KernelProfilerSpec(
-        kernel_kind=KIND,
-        backend="triton",
-        # Byte-keyed / uint8 — dtype-agnostic.
-        supports=BackendSupport(compute=None),
-        runner_ref=RunnerRef(
-            module_name="profiling.runners.elementwise.triton",
-            function_name="profile_elementwise",
-        ),
-        table_name=KIND,
-        args_schema=ElementwiseArgs,
-        metric_family=MetricFamily.COMPUTE,
-        batch_outlier_policy=BatchOutlierPolicy(),
+
+# Two realizations of the one byte contract, and the choice is load-bearing at
+# small sizes where both kernels are launch-bound: `triton` for a slot the
+# framework hands to a Triton kernel (including torch-compile output), `torch`
+# for a slot whose framework source is eager tensor arithmetic and so lands on
+# TensorIterator. Picking `triton` for a torch-realized slot under-predicted a
+# measured vLLM shared-expert gate application by 71.5%. A fused CUDA op such as
+# vLLM's `act_and_mul_kernel` is neither, and belongs in its own kernel kind.
+for _backend, _runner_module in (
+    ("triton", "profiling.runners.elementwise.triton"),
+    ("torch", "profiling.runners.elementwise.torch"),
+):
+    register(
+        KernelProfilerSpec(
+            kernel_kind=KIND,
+            backend=_backend,
+            # Byte-keyed / uint8 — dtype-agnostic.
+            supports=BackendSupport(compute=None),
+            runner_ref=RunnerRef(
+                module_name=_runner_module,
+                function_name="profile_elementwise",
+            ),
+            table_name=KIND,
+            args_schema=ElementwiseArgs,
+            metric_family=MetricFamily.COMPUTE,
+            batch_outlier_policy=BatchOutlierPolicy(),
+        )
     )
-)

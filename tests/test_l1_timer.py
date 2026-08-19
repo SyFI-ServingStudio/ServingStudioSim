@@ -349,12 +349,21 @@ def test_cupti_multi_launch_unit_splits_target_and_l2_clear_records(
 ):
     from profiling.profilers import cupti_kernel_profiler as cupti
 
-    monkeypatch.setattr(cupti, "_require_torch", lambda: SimpleNamespace())
+    # `_prepare_launch_pattern` warms the callable before probing, so the fake
+    # torch has to model the synchronize that follows that warm-up call.
+    synchronized: list[object] = []
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(synchronize=synchronized.append),
+    )
+    monkeypatch.setattr(cupti, "_require_torch", lambda: fake_torch)
 
-    def target_fn(): ...
+    warm_up_calls: list[int] = []
+
+    def target_fn():
+        warm_up_calls.append(1)
 
     clear_buffer = SimpleNamespace(sum=lambda: None)
-    profiler = SimpleNamespace(clear_l2_bytes=0, _clear_buffer=clear_buffer)
+    profiler = SimpleNamespace(clear_l2_bytes=0, _clear_buffer=clear_buffer, device=0)
 
     def record(name: str, ordinal: int, duration_ns: int) -> cupti.KernelRecord:
         return cupti.KernelRecord(
@@ -403,6 +412,10 @@ def test_cupti_multi_launch_unit_splits_target_and_l2_clear_records(
     assert summary.per_iter_ms == pytest.approx([3.0, 3.0, 3.0])
     assert summary.matched_kernel_count_per_run == [2, 2, 2]
     assert summary.matched_kernel_names == ["target_a", "target_b"]
+    # The pattern probe warmed the callable outside CUPTI first, so the learned
+    # pattern is the steady-state one rather than a cold first call's.
+    assert warm_up_calls == [1]
+    assert synchronized == [0]
 
 
 def test_cupti_duration_path_estimates_count_then_uses_one_formal_window(

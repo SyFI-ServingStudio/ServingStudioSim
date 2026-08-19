@@ -37,7 +37,7 @@ use crate::conservation::workload::{
     collect_iteration_workload, collect_workload_by_worker, collect_workload_shapes_by_worker,
     WeightedWorkload, WorkloadTotals,
 };
-use crate::kernel_query::repo_root;
+use crate::kernel_query::owning_repo_root;
 
 /// One level's two labeler floors, in GPU·seconds. Ordered `fused ≤ segmented`.
 #[derive(Clone, Copy, Default)]
@@ -484,7 +484,11 @@ fn run_labeler_json(log_dir: &Path, levels: &HashMap<String, WorkloadTotals>) ->
 }
 
 fn run_labeler_request(log_dir: &Path, request: Value) -> Result<Value> {
-    let root = repo_root().context("repo root not found for the labeler subprocess")?;
+    // The checkout that produced this run, not the one the analyzer runs from:
+    // `raw/params.json` names its model config repo-relatively, so the labeler
+    // must resolve it against the same tree the run was launched in.
+    let root =
+        owning_repo_root(log_dir).context("repo root not found for the labeler subprocess")?;
     let log_dir_abs: PathBuf = if log_dir.is_absolute() {
         log_dir.to_path_buf()
     } else {
@@ -556,6 +560,7 @@ fn workload_json(totals: WorkloadTotals) -> Value {
         "prefill_cached": totals.prefill_cached,
         "decode_kv": totals.decode_kv,
         "prefill_requests": totals.prefill_requests,
+        "prefill_stateful_requests": totals.prefill_stateful_requests,
     })
 }
 
@@ -564,6 +569,19 @@ mod tests {
     use serde_json::json;
 
     use super::{parse_labels, rollup_locked_floors, Floors, WorkerComposition};
+    use crate::conservation::workload::WorkloadTotals;
+
+    #[test]
+    fn workload_payload_carries_stateful_prefill_requests() {
+        let totals = WorkloadTotals {
+            prefill_requests: 2.0,
+            prefill_stateful_requests: 1.0,
+            ..WorkloadTotals::default()
+        };
+        let payload = super::workload_json(totals);
+        assert_eq!(payload["prefill_requests"], 2.0);
+        assert_eq!(payload["prefill_stateful_requests"], 1.0);
+    }
 
     #[test]
     fn one_level_error_does_not_discard_other_labels() {

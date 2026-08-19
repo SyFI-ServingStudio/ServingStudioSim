@@ -393,6 +393,34 @@ numerator and denominator share the analyzer's per-occurrence cross-rank
 reduction, so the kernel-layer and GPU-cycle-layer gaps stay consistent. Treat
 the factor as experiment-specific, never a GPU-wide constant.
 
+**One outlying iteration can carry the correction.** The multiplier is a single
+constant baked into every simulated iteration, so a one-off host stall inside one
+measured iteration propagates to all of them. On a 966-iteration Qwen3.6 capture,
+one iteration held 1.77 s of GPU idle and supplied 41% of the whole correction.
+The pass therefore screens each iteration's duty-cycle factor
+(`measured_gpu_cycle_ms / measured_ms`) and drops it when the factor both exceeds
+2.0 and is an Iglewicz-Hoaglin outlier (MAD modified z > 3.5) **within its own
+stage**, over a stage of at least 8 iterations. Excluded iterations and their
+evidence are listed in `meta.multiplier_excluded_iterations`; the rows keep their
+own measured and simulated cycle, so the overview plot still shows the stall.
+
+Both halves of that test earn their place. Stratifying by stage is required
+because the factor is genuinely multi-modal: CUDA-graph decode iterations launch
+the whole step at once and idle ~0.5 ms, while eager mixed iterations idle
+~34 ms, so a pooled median makes every mixed iteration an outlier. The absolute
+floor is required because a near-deterministic decode population has a MAD around
+3e-4, which puts ordinary jitter at z in the hundreds.
+
+The cause is deliberately not part of the test. The two iterations this screened
+on its first capture failed for unrelated reasons — Triton JIT compilation, and a
+caching-allocator miss that fell through to a synchronous 162 ms `cudaMalloc` —
+so enumerating causes would have caught only the first. `alignment parse` does
+record one cause as evidence: `jit_stall_ns` per iteration is the GPU idle inside
+the gaps a `cuModuleLoad*` / `cuLibraryLoad*` call landed in, which is what a JIT
+compile actually costs (the load call itself is microseconds and the Python
+compilation before it appears in no CUDA API row). It explains an exclusion; it
+never makes one.
+
 ## Current boundary
 
 - one direct `deployment: unified` simulation target;
@@ -411,3 +439,53 @@ max-rank duration; a synchronizing collective takes `max(end) − max(start)`,
 dropping arrival wait), never by summing GPU durations. The kernel-align
 multiplier is derived from this same per-occurrence measured population, so its
 `measured_ms` numerator matches the breakdown the analyzer reports.
+
+## Concurrent CUDA streams: the track axis
+
+A phase range is **N concurrent tracks**, one per CUDA stream, not one ordered
+kernel list. Frameworks use side streams — vLLM's Qwen3-Next runs the shared
+expert on its own stream during decode while the routed experts run on the main
+one — and a single list of concurrent work asserts a serialization that never
+happened. Three things follow, and schema 5 (`encoding: folded-v2`) makes all
+three explicit.
+
+**Order is decided once, in the parser.** `alignment/nsys/parse.py` serializes
+each range track-major: tracks ordered by their first launch (ties on stream id,
+never by stream id alone, which is an arbitrary driver-assigned integer), and
+launch order preserved inside a track. Every consumer inherits that one order,
+so `parsed.json` and `kernel_sequences.json` cannot drift — the drift is what
+made the analyzer reject the inventory with a bare `name mismatch`. Ordering
+across streams is otherwise jitter-dependent: exact-match folding forks a new
+"unique" sequence on every flip, and one Qwen3.6 decode shape became 909 of them.
+
+**Folding and labeling stop at a track edge.** `sequence.tracks[]` each hold
+their own folded `program`; expansion concatenates them, so
+`sequence_id:expanded_ordinal` still addresses the flat measured order and a
+single-stream capture is one track with unchanged ordinals. `walk_kernels`
+resets `after` / `after_name` / `before_name` at the boundary, because those
+evidence keys mean "in the same execution stream" and there is no *before*
+between two things that ran at once.
+
+**Concurrency is subtracted, not summed.** `measured_concurrent_hidden_ms` is,
+per device, `Σ per-track busy union − union across tracks` — exactly the time
+the GPU was busy on more than one stream, which summing per-occurrence durations
+counts twice. `measured_ms` is `measured_kernel_sum_ms` minus that, and the
+duty-cycle multiplier uses the corrected denominator. With one track the two
+unions are the same and the difference is exactly zero, so every single-stream
+capture's numbers are unchanged bit for bit; the per-occurrence reductions above
+are untouched either way.
+
+Per operation and per measured kernel, `concurrent_hidden_ms` charges that
+overlap to the **later-starting track only** — the side stream that joined a
+device already busy. Splitting it between both sides would make no set of rows
+add up to the iteration total; charging it forward telescopes exactly, so the
+breakdown plot can hatch each operation's hidden share in place and the marks
+still sum to the number in the lane's label.
+
+**This is measurement, not a cost-model instruction.** It must not be turned into
+a `CostNode::Max`: every `Max` in the simulator
+is a cross-rank fan-out of *interchangeable replicas*, the analyzer forwards only
+its critical child, and the optimality ladder's R2 rung folds `Max → mean` and
+labels the gap "imbalance". Two different computations sharing one GPU are none
+of those things — same-device overlap makes wall time ≥ max(children), not ≤ —
+so modelling it would need a new node kind, not a reused one.

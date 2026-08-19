@@ -132,7 +132,11 @@ The dropped arrival wait is not attributed to any kernel; it surfaces only in th
 wall-clock `measured_gpu_cycle_ms`. The kernel-align pass's derived duty-cycle
 multiplier `recommended_gpu_time_multiplier = Σ measured_gpu_cycle_ms / Σ
 measured_ms` spans exactly this gap, so its denominator shares the per-occurrence
-`measured_ms` reduction above. GPU durations from different ranks are never
+`measured_ms` reduction above. The pool excludes iterations whose duty-cycle
+factor is both above 2.0 and an MAD outlier within its own stage — one host stall
+would otherwise reach every simulated iteration through this single constant —
+and reports them in `meta.multiplier_excluded_iterations`; see
+`alignment/README.md` for why both halves of that test are needed. GPU durations from different ranks are never
 summed. `measured_busy_union_ms`
 retains the old cross-rank interval union for audit. The analyzer keeps per-device
 populations so rank skew is auditable, and distinguishes raw `rank_launches` from
@@ -146,6 +150,40 @@ not a logical occurrence. For mapped work, the analyzer joins matching
 `(phase, operation, per-device ordinal)` rows across those subsets before the
 cross-rank reduction. It retains the original rows for mapping and unmapped-work
 audits; unmapped rows are never guessed into a logical occurrence.
+
+### Concurrent CUDA streams
+
+Ranks are not the only axis on which measured work happens at once. Within one
+device a framework may use several CUDA streams — vLLM's Qwen3-Next overlaps the
+shared expert with the routed experts during decode — and the normalized capture
+carries each stream as its own **track**: kernels are serialized track-major
+(tracks ordered by first launch), the folded inventory holds one program per
+track, and both the labeling walk's ordered-neighbour evidence and the analyzer's
+positional validation stop at a track edge.
+
+Adding per-occurrence durations across tracks would count their overlap twice, so
+the analyzer subtracts exactly that overlap: per device,
+`measured_concurrent_hidden_ms = Σ per-track busy union − union across tracks`,
+and `measured_ms = measured_kernel_sum_ms − measured_concurrent_hidden_ms`. Both
+terms are reported, because `measured_kernel_sum_ms` is the like-for-like partner
+of a CostTree that composes those operations with `Sum`. Within one track kernels
+never overlap, so a single-stream capture has zero hidden time and every number
+above is unchanged; the cross-rank reductions are untouched either way.
+
+Per operation and per measured kernel, `concurrent_hidden_ms` says how much of it
+the framework managed to hide. One overlap is one shared stretch of wall clock,
+so it is charged to the later-starting track only — the side stream that joined a
+device already busy. That is what makes these rows sum back to the iteration's
+`measured_concurrent_hidden_ms` instead of twice it, and it is why the breakdown
+plot can hatch the hidden share inside the operations that actually overlapped.
+This is **evidence about the measured schedule, not an instruction to the cost
+model** — and specifically it must not become a `CostNode::Max`. Every
+`Max` in the simulator is a cross-rank fan-out of interchangeable replicas: the
+attribution below forwards only its critical child, and the `optimality` ladder's
+R2 rung folds `Max → mean` and calls the residue *imbalance*. Two different
+computations sharing one GPU are neither interchangeable nor balanceable, and
+same-device contention puts wall time at ≥ max(children) rather than ≤, so
+modelling that overlap needs a new node kind rather than a reused one.
 
 The alignment trio is separate not by deployment but by **source scope** (see
 below): it reads an alignment manifest instead of a plain run directory.

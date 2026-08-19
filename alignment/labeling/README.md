@@ -54,9 +54,17 @@ same work. All list values are totals across the report's iterations; the
 headline also prints a per-iteration average so a multi-iteration labeling run
 cannot be mistaken for one measured iteration.
 
-**`walk`** flattens the folded program — phase → sequence → segment → repeat
-body — into program order, carrying each position's folded coordinates and its
-two neighbours. It is what a labeling decision is actually made against.
+**`walk`** flattens the folded program — phase → sequence → track → segment →
+repeat body — into program order, carrying each position's folded coordinates
+and its two neighbours. It is what a labeling decision is actually made against.
+
+A **track** is one CUDA stream. It is a harder cut than a repeat body: two
+bodies at least ran one after the other, while two tracks ran at the same time
+and have no "before" between them at all. So `after`, `after_name` and
+`before_name` — the whole basis of a rule — stop at a track edge. A rule that
+fired across one would charge a side stream's kernel to whatever the main stream
+happened to be running, which is the mislabeling this package exists to prevent.
+A single-stream capture is one track and nothing changes.
 
 **`slots`** prints one layer's simulated slots in compile order, which is the
 other half of the same read: a decoder layer's measured kernels and its slots

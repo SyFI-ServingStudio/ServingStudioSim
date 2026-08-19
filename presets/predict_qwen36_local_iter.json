@@ -1,0 +1,12 @@
+{
+  "arch": {
+    "iter": {
+      "type": "qwen36_local",
+      "model_config": "model/config/qwen3_6_35b_a3b_fp8.json",
+      "fp8": true
+    }
+  },
+  "gpu": "NVIDIA H200",
+  "log_dir": "logs/predict_qwen36_local_iter",
+  "cases_file": "predict_qwen36_local_iter_cases.json"
+}

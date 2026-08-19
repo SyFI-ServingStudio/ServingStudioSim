@@ -238,7 +238,21 @@ def _prepare_launch_pattern(
     the complete ordered patterns lets the measured burst be split by position,
     rather than guessing from implementation names that may be shared by an
     unrelated target kernel.
+
+    The probe warms `fn` first. This is a *structural* measurement, so it must
+    never observe one-time work: a cold callable emits extra JIT / plan /
+    autotune kernels on its first call, and recording those as part of the
+    steady-state per-launch pattern inflates `callable_kernel_names` so that
+    every later capture fails the record-count check outright. Warming here
+    rather than at each call site is deliberate — three entry points prepare a
+    pattern, and a runner that forgets loses its first spec deterministically
+    (which is exactly what happened to the FlashInfer FA2 attention path, while
+    the FA3 one next to it warmed up by hand and worked).
     """
+
+    torch_mod = _require_torch()
+    fn()
+    torch_mod.cuda.synchronize(profiler.device)
 
     callable_records = _ordered_records(
         profiler.capture_once(
@@ -600,6 +614,9 @@ class CuptiKernelProfiler:
         matched_kernel_count_per_run: list[int] = []
         launch_pattern = None
         if launches_per_run > 1:
+            # `num_warmup` defaults to 0 because convergence absorbs a cold
+            # *timing* sample. It cannot absorb a cold *pattern* — that is
+            # `_prepare_launch_pattern`'s own warm-up, not this loop's job.
             launch_pattern = _prepare_launch_pattern(
                 self,
                 fn,

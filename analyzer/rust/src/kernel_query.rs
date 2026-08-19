@@ -24,6 +24,41 @@ pub(crate) fn repo_root() -> Result<PathBuf> {
     std::env::current_dir().context("resolve analyzer repository root (current dir)")
 }
 
+/// The file that marks a directory as a VibeSim checkout. It is the labeler
+/// module the optimality floors spawn, so a directory holding it also holds the
+/// `model/config`, `model/work/location_maps`, `gpu/spec.json`, and `uv` project
+/// that every checkout-owned asset below is read from.
+const CHECKOUT_MARKER: &str = "model/work/floors.py";
+
+/// The checkout that owns `log_dir` — the working tree whose `model/` and `gpu/`
+/// describe *that* result, which is not necessarily the one the analyzer runs
+/// from.
+///
+/// `analyze serve` resolves results through a workspace registry spanning many
+/// checkouts (`main/`, every `wt-*/` worktree, every managed `w_*/repo`), while
+/// [`repo_root`] is just the service's own cwd. Reading a foreign run's assets
+/// from the service cwd degrades silently: a run whose arch exists only on a
+/// worktree branch loses its R6/R7 necessary-work floors behind a caveat,
+/// because the labeler subprocess cannot open the `model/config/*.json` named
+/// (repo-relatively) in that run's `raw/params.json` and no location map
+/// matches its arch. Walk up from the log directory instead, and fall back to
+/// the service cwd only when `log_dir` sits outside any checkout.
+pub(crate) fn owning_repo_root(log_dir: &Path) -> Result<PathBuf> {
+    let absolute = if log_dir.is_absolute() {
+        log_dir.to_path_buf()
+    } else {
+        repo_root()?.join(log_dir)
+    };
+    // Canonicalize so a registry-relative `../../wt-topic/logs` still has real
+    // ancestors to walk; keep the literal path when the directory is gone.
+    let absolute = absolute.canonicalize().unwrap_or(absolute);
+    absolute
+        .ancestors()
+        .find(|ancestor| ancestor.join(CHECKOUT_MARKER).is_file())
+        .map(Path::to_path_buf)
+        .map_or_else(repo_root, Ok)
+}
+
 /// Locate a built `simulator` binary carrying the same PyO3 ABI as the launcher's
 /// `uv` environment.
 /// Prefers the launcher-built release, then a sibling of the running `analyze`
@@ -93,4 +128,58 @@ pub(crate) fn run_kernel_query(
         );
     }
     serde_json::from_slice(&output.stdout).context("decode kernel-query stdout")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lay out `<root>/model/work/floors.py` plus a nested log directory, the
+    /// shape every checkout shares.
+    fn checkout_with_log_dir(root: &Path, log_dir_suffix: &str) -> PathBuf {
+        std::fs::create_dir_all(root.join("model/work")).expect("create labeler directory");
+        std::fs::write(root.join(CHECKOUT_MARKER), "").expect("write checkout marker");
+        let log_dir = root.join(log_dir_suffix);
+        std::fs::create_dir_all(&log_dir).expect("create log directory");
+        log_dir
+    }
+
+    #[test]
+    fn a_log_dir_resolves_to_the_checkout_that_owns_it_not_the_process_cwd() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let worktree = workspace.path().join("wt-topic");
+        let log_dir = checkout_with_log_dir(&worktree, "logs/run_0");
+        // Nested runs (a sweep member, say) still resolve to the same checkout.
+        let nested = checkout_with_log_dir(&worktree, "logs/sweep_0/member_1");
+
+        let expected = worktree.canonicalize().expect("canonicalize worktree");
+        assert_eq!(owning_repo_root(&log_dir).expect("resolve root"), expected);
+        assert_eq!(
+            owning_repo_root(&nested).expect("resolve nested root"),
+            expected
+        );
+    }
+
+    #[test]
+    fn the_innermost_checkout_wins_over_an_enclosing_one() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let outer = workspace.path().join("main");
+        checkout_with_log_dir(&outer, "logs");
+        let inner = outer.join("agent-workspaces/w_x/repo");
+        let log_dir = checkout_with_log_dir(&inner, "logs/run_0");
+
+        assert_eq!(
+            owning_repo_root(&log_dir).expect("resolve root"),
+            inner.canonicalize().expect("canonicalize inner checkout")
+        );
+    }
+
+    #[test]
+    fn a_log_dir_outside_any_checkout_falls_back_to_the_process_cwd() {
+        let orphan = tempfile::tempdir().expect("temp orphan");
+        assert_eq!(
+            owning_repo_root(orphan.path()).expect("resolve root"),
+            repo_root().expect("process cwd")
+        );
+    }
 }

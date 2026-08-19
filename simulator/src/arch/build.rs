@@ -29,6 +29,7 @@ use crate::arch::{
     Llama3DpAttnTpFfnModel, Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel,
     Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel,
     Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    qwen36_local, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
     Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::timing::routing::RoutingDistribution;
@@ -538,6 +539,40 @@ pub fn dense_tp(
         .context("building Llama3-dense-TP model (often a missing profile.db row)")
 }
 
+/// Build the exact local TP1/EP1 Qwen3.6 heterogeneous model. The nested
+/// checkpoint parser validates the pinned identity before applying the
+/// `ModelSpec` layer controls.
+pub fn qwen36_local(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Qwen36LocalModel> {
+    let model_cfg = Qwen36ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+        .context("loading exact Qwen3.6-35B-A3B FP8 model config")?;
+    // EP1: the single rank owns every expert, so the "local" shard the grouped
+    // GEMM sees is the whole global distribution.
+    let routing = resolve_routing_source(
+        routing_kind,
+        routing_seed,
+        model_cfg.num_experts.get(),
+        1,
+        model_cfg.num_layers,
+        model_cfg.top_k,
+        expert_popularity_file,
+    )?;
+    let parallel = Qwen36LocalParallel {
+        gpu_name: gpu.to_string(),
+    };
+    let configs = qwen36_local::build_configs(&model_cfg, &parallel, &routing);
+    let resolved = qwen36_local::resolve_configs(&configs);
+    qwen36_local::build(name.to_string(), resolved, bridge)
+        .context("building local Qwen3.6 TP1/EP1 model (often a missing profile.db row)")
+}
+
 /// Build the DP-attention + TP-FFN dense Llama3 model.
 pub fn dp_attn_tp_ffn(
     model_spec: &ModelSpec,
@@ -858,6 +893,20 @@ pub fn build_iter_model(
     bridge: &PerfApiBridge,
 ) -> Result<Box<dyn IterwiseUnifiedModel>> {
     Ok(match sel {
+        IterArchSel::Qwen36Local {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+        } => Box::new(qwen36_local(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::Llama3Dense { model } => Box::new(dense(model, gpu, name, bridge)?),
         IterArchSel::Llama3DenseTp { model, tp_size } => {
             Box::new(dense_tp(model, *tp_size, gpu, name, bridge)?)
@@ -1067,6 +1116,32 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    fn qwen36_local_uniform_builder_loads_the_pinned_nested_config() {
+        let model = ModelSpec {
+            model_config: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("model/config/qwen3_6_35b_a3b_fp8.json")
+                .to_string_lossy()
+                .into_owned(),
+            num_layers: None,
+            sim_num_layers: None,
+            fp8: true,
+        };
+        let selector = IterArchSel::Qwen36Local {
+            model,
+            routing: RoutingKind::Uniform,
+            routing_seed: None,
+            expert_popularity_file: None,
+        };
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let built = build_iter_model(&selector, "NVIDIA H200", "test", &bridge)
+            .expect("build exact local Qwen3.6 model");
+        assert_eq!(built.gpus_per_replica(), 1);
+        assert_eq!(built.total_kv_bytes_per_token(), 20_480);
+        assert_eq!(built.cost_log_manifest().slots.len(), 72);
+    }
 
     #[test]
     fn expert_popularity_profile_replaces_uniform_routing_and_preserves_ppm_sum() {

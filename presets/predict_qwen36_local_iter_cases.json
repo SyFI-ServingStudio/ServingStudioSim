@@ -1,0 +1,4 @@
+[
+  { "groups": [ { "prefill_chunk_pairs": [[0, 16384]] } ] },
+  { "groups": [ { "decode_count": 64, "average_decode_length": 16384 } ] }
+]

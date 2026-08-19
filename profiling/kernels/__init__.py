@@ -28,16 +28,31 @@ from profiling.kernels import (
     fp8_block_quant,  # noqa: F401
     fp8_blockscale_grouped_gemm,  # noqa: F401
     fp8_per_token_group_quant,  # noqa: F401
+    gdn_causal_conv_decode,  # noqa: F401
+    gdn_causal_conv_prefill,  # noqa: F401
+    gdn_chunk_delta_rule,  # noqa: F401
+    gdn_chunk_local_cumsum,  # noqa: F401
+    gdn_chunk_output,  # noqa: F401
+    gdn_chunk_recompute_w_u,  # noqa: F401
+    gdn_chunk_scaled_dot_kkt,  # noqa: F401
+    gdn_chunk_solve_tril,  # noqa: F401
+    gdn_chunk_state_update,  # noqa: F401
+    gdn_gated_rms_norm,  # noqa: F401
+    gdn_prefill_post_conv,  # noqa: F401
+    gdn_recurrent_decode,  # noqa: F401
     grouped_gemm,  # noqa: F401
     kv_cache_append,  # noqa: F401
     mla_cache_append,  # noqa: F401
+    moe_align_block_size,  # noqa: F401
     moe_alltoall,  # noqa: F401
     moe_alltoall_prepare,  # noqa: F401
     moe_finalize_routing,  # noqa: F401
+    moe_fused_topk,  # noqa: F401
     p2p_inter,  # noqa: F401
     p2p_intra,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
     single_gemm,  # noqa: F401
+    vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401
 )

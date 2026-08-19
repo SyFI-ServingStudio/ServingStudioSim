@@ -9,7 +9,7 @@ use crate::worker::admission::{
 };
 use crate::worker::execution::{IterModelExecution, UnifiedIterExecution};
 use crate::worker::iter_worker::IterWorker;
-use crate::worker::kv::{FullAttnKv, IterWorkerKv};
+use crate::worker::kv::{FullAttnKv, HybridGdnKv, IterWorkerKv};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{BatchFsmState, IterCursor, WorkerFsmState, WorkerStatus};
 
@@ -56,6 +56,10 @@ pub type BareboneWorker<M> =
     IterBatchWorker<FullAttnKv, LocalPrefillDecodeAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 /// Multi-partition HP/DP recipe uses the same whole-iteration shell.
 pub type HpUnifiedWorker<M> = BareboneWorker<M>;
+/// Barebone on every axis but KV: a hybrid arch's per-request recurrent state
+/// shares the attention capacity with its per-token KV. Only the store differs.
+pub type Qwen36HybridWorker<M> =
+    IterBatchWorker<HybridGdnKv, LocalPrefillDecodeAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 pub type PdPrefillWorker<M> =
     IterBatchWorker<FullAttnKv, PrefillHandoffAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 

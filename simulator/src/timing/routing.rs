@@ -7,6 +7,24 @@ pub struct RoutingDistribution {
 /// ranks each (the last domain may be smaller). `nvl_num_gpu == 0` or
 /// `>= ep_size` collapses to a single domain. Mirrors ref `ranks_per_nvl_domain`
 /// so the L2 NVL layout and the per-token router agree on domain boundaries.
+/// `base^exp` by binary exponentiation over `f64` multiplies only.
+///
+/// IEEE-754 fully specifies multiplication, so this is bit-identical on every
+/// host; `f64::powf` is not, and its result feeds a cache key here.
+fn pow_exact(base: f64, exp: u32) -> f64 {
+    let mut result = 1.0f64;
+    let mut factor = base;
+    let mut remaining = exp;
+    while remaining > 0 {
+        if remaining & 1 == 1 {
+            result *= factor;
+        }
+        factor *= factor;
+        remaining >>= 1;
+    }
+    result
+}
+
 pub fn ranks_per_nvl_domain(ep_size: u32, nvl_num_gpu: u32) -> Vec<u32> {
     if ep_size == 0 {
         return Vec::new();
@@ -102,6 +120,26 @@ impl RoutingDistribution {
     /// summed across all shards the counts match `global_expert_selections` only within
     /// a ±0.5-per-shard drift — acceptable and intended for sharded EP.
     ///
+    /// The apportionment is restricted to an **active set** whose size is the
+    /// expected number of experts that receive at least one assignment; see
+    /// [`Self::active_set_len`]. Spreading the mass over every expert
+    /// instead — giving each its expected count — is what a Hamilton
+    /// apportionment does by construction, and it is wrong here: assigning every
+    /// expert its mean maximizes the number of non-empty cells, while a real
+    /// step's routing leaves a long tail empty. The grouped-GEMM kernels pad per
+    /// expert, so non-empty cells *are* the cost, and the difference is
+    /// measurable rather than cosmetic. Against a vLLM Qwen3.6-35B-A3B-FP8
+    /// decode step (64 tokens, top-8, 256 experts, EP1) the full-spread form put
+    /// 219 experts on the padded-block grid where vLLM used 173, and the same
+    /// `vllm_fused_moe` kernel measured +18.5% (gate/up) and +21.6% (down) on
+    /// that vector versus −3.0% / +2.8% on this one.
+    ///
+    /// The correction shrinks as the shard does, because it only exists when a
+    /// shard holds many more experts than it receives assignments: at EP≥8 on
+    /// that model every local expert is hit with near-certainty and the active
+    /// set is the whole shard, leaving the result within 0.6% of the old
+    /// behavior.
+    ///
     /// v1 low-end floor: a non-empty shard that receives any global mass returns
     /// at least 1 (placed on its top-residual expert) even when its proportional
     /// share rounds to 0. This keeps `per_group_batches` non-empty for the
@@ -112,21 +150,32 @@ impl RoutingDistribution {
     /// Associated (not `&self`) so the caller passes whatever ppm slice it
     /// wants: `RoutingDistribution::to_per_expert_counts(total, &dist.ppm()[lo..hi])`.
     pub fn to_per_expert_counts(global_expert_selections: u32, ppm: &[u32]) -> Vec<u32> {
-        let mut counts = Vec::with_capacity(ppm.len());
-        let mut residuals = Vec::with_capacity(ppm.len());
-        let mut assigned: u64 = 0;
+        let mut counts = vec![0u32; ppm.len()];
         let mut numerator_sum: u128 = 0;
-        for (idx, slot) in ppm.iter().copied().enumerate() {
+        for slot in ppm.iter().copied() {
             debug_assert!(
                 slot <= Self::TOTAL_PPM,
                 "ppm entry {slot} exceeds TOTAL_PPM"
             );
-            let numerator = u64::from(global_expert_selections) * u64::from(slot);
+            numerator_sum += u128::from(u64::from(global_expert_selections) * u64::from(slot));
+        }
+
+        // Rank by ppm so the active set is the shard's heaviest experts; index
+        // breaks ties so a uniform shard still yields a stable, reproducible
+        // vector (it is part of the grouped-GEMM cache key).
+        let mut by_weight: Vec<usize> = (0..ppm.len()).collect();
+        by_weight.sort_by(|&lhs, &rhs| ppm[rhs].cmp(&ppm[lhs]).then_with(|| lhs.cmp(&rhs)));
+        let active_len = Self::active_set_len(global_expert_selections, ppm);
+        let active = &by_weight[..active_len];
+
+        let mut residuals = Vec::with_capacity(active_len);
+        let mut assigned: u64 = 0;
+        for &idx in active {
+            let numerator = u64::from(global_expert_selections) * u64::from(ppm[idx]);
             let base = (numerator / u64::from(Self::TOTAL_PPM)) as u32;
-            counts.push(base);
+            counts[idx] = base;
             residuals.push((idx, numerator % u64::from(Self::TOTAL_PPM)));
             assigned += u64::from(base);
-            numerator_sum += u128::from(numerator);
         }
         // Target = round(Σ exact shares) = round(total × Σppm / TOTAL_PPM). For
         // a shard (Σppm < TOTAL_PPM) this is the shard's proportional count, not
@@ -149,12 +198,59 @@ impl RoutingDistribution {
         if numerator_sum > 0 {
             target = target.max(1);
         }
-        let deficit = target.saturating_sub(assigned);
+        // The target still comes from the WHOLE shard, so the per-shard total is
+        // exactly what it was before this active-set restriction: only the shape
+        // moves, never the sum. That matters because `local_quant_rows` sums
+        // these counts to size the quantize leaf, which must stay
+        // distribution-invariant.
+        //
+        // Cycling (rather than one pass) is therefore required: the mass the
+        // inactive tail would have held has to land somewhere, and it belongs on
+        // the heaviest residuals. With a one-pass take() a shard whose deficit
+        // exceeds its active set would silently lose tokens.
         residuals.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(&rhs.0)));
-        for (idx, _) in residuals.into_iter().take(deficit as usize) {
-            counts[idx] += 1;
+        if !residuals.is_empty() {
+            let mut cursor = 0usize;
+            while assigned < target {
+                counts[residuals[cursor % residuals.len()].0] += 1;
+                assigned += 1;
+                cursor += 1;
+            }
         }
         counts
+    }
+
+    /// Size of the active set: `round(Σ_e P(expert e receives ≥ 1 assignment))`
+    /// under the marginal `Binomial(global_expert_selections, ppm_e / TOTAL_PPM)`
+    /// each expert's count follows.
+    ///
+    /// Deliberately a per-expert quantity — `1 − (1 − p_e)^G` depends only on
+    /// that expert's own global ppm and the global assignment count, never on
+    /// which shard it sits in or who its neighbours are. So slicing `ppm` slices
+    /// this result exactly, and an EP fan-out computed shard by shard sums to
+    /// the same value as the unsharded model at every `ep_size`. Renormalizing
+    /// within a shard would *not* have that property (it drifts upward as the
+    /// shard narrows, ~2% by ep=32).
+    ///
+    /// The power uses binary exponentiation over plain `f64` multiplies, whose
+    /// results IEEE-754 pins exactly, rather than `powf`, whose last bit is
+    /// libm-dependent. This value decides a grouped-GEMM cache key, so it has to
+    /// be reproducible across hosts, not merely close.
+    fn active_set_len(global_expert_selections: u32, ppm: &[u32]) -> usize {
+        if ppm.is_empty() || global_expert_selections == 0 {
+            return 0;
+        }
+        let expected: f64 = ppm
+            .iter()
+            .copied()
+            .map(|slot| {
+                let miss = 1.0 - f64::from(slot) / f64::from(Self::TOTAL_PPM);
+                1.0 - pow_exact(miss, global_expert_selections)
+            })
+            .sum();
+        // At least one: a shard holding any mass must present a non-empty
+        // `per_group_batches`, matching the v1 floor below.
+        (expected.round() as usize).clamp(1, ppm.len())
     }
 
     fn from_weights(weights: &[f64]) -> Self {
@@ -361,7 +457,83 @@ mod tests {
         assert_eq!(counts.iter().sum::<u32>(), 4);
     }
 
+    /// The defect this whole active-set construction exists to fix: with 512
+    /// assignments spread over 256 experts, giving every expert its mean leaves
+    /// almost none empty, but a real step's routing empties a long tail. The
+    /// grouped-GEMM kernels pad per expert, so those empty cells are free and
+    /// the non-empty ones are the cost.
     #[test]
+    fn a_short_batch_over_many_experts_leaves_a_tail_empty() {
+        let uniform = RoutingDistribution::uniform(256);
+        let counts = RoutingDistribution::to_per_expert_counts(512, uniform.ppm());
+
+        // 256 x (1 - (1 - 1/256)^512) = 256 x (1 - e^-2) ~ 221.4.
+        let active = counts.iter().filter(|count| **count > 0).count();
+        assert_eq!(active, 221);
+        assert!(active < 256, "a mean-per-expert spread would fill all 256");
+
+        // Only the SHAPE moves: the total is still the full proportional share,
+        // because `local_quant_rows` sums these to size the quantize leaf.
+        assert_eq!(counts.iter().sum::<u32>(), 512);
+    }
+
+    /// A long batch saturates every expert, so the construction must collapse
+    /// back to the plain proportional spread — this is why prefill iterations
+    /// and high-`ep_size` shards are left alone.
+    #[test]
+    fn a_long_batch_activates_every_expert() {
+        let uniform = RoutingDistribution::uniform(256);
+        let counts = RoutingDistribution::to_per_expert_counts(16_384, uniform.ppm());
+        assert_eq!(counts.iter().filter(|count| **count > 0).count(), 256);
+        assert_eq!(counts.iter().sum::<u32>(), 16_384);
+    }
+
+    /// The active-set size is a sum of per-expert terms in the *global* ppm and
+    /// the *global* assignment count, so slicing the ppm slices the result. An
+    /// EP fan-out computed shard by shard must therefore agree exactly with the
+    /// unsharded model at every `ep_size` — renormalizing inside a shard would
+    /// instead drift upward as the shard narrows.
+    #[test]
+    fn the_active_set_is_identical_however_the_ppm_is_sharded() {
+        let dist = RoutingDistribution::power_law(256, 0.7);
+        let unsharded = RoutingDistribution::active_set_len(512, dist.ppm());
+        for ep_size in [2usize, 4, 8, 16, 32] {
+            let experts_per_rank = 256 / ep_size;
+            let sharded: usize = (0..ep_size)
+                .map(|rank| {
+                    let start = rank * experts_per_rank;
+                    RoutingDistribution::active_set_len(
+                        512,
+                        &dist.ppm()[start..start + experts_per_rank],
+                    )
+                })
+                .sum();
+            // Only per-shard rounding to whole experts separates them.
+            let drift = sharded.abs_diff(unsharded);
+            assert!(
+                drift <= ep_size / 2,
+                "ep={ep_size}: sharded {sharded} vs unsharded {unsharded}"
+            );
+        }
+    }
+
+    #[test]
+    fn pow_exact_is_a_fixed_multiply_tree_not_a_libm_call() {
+        use super::pow_exact;
+        assert_eq!(pow_exact(0.5, 0), 1.0);
+        assert_eq!(pow_exact(0.5, 1), 0.5);
+
+        // The contract is a FIXED squaring tree, so each power is bit-equal to
+        // the tree spelled out by hand. It is deliberately not equal to a naive
+        // n-step loop -- that has a different rounding order and would differ in
+        // the last bit, which is exactly why `powf` cannot be trusted either.
+        let base = 0.996_f64;
+        let squared = base * base;
+        assert_eq!(pow_exact(base, 2), squared);
+        assert_eq!(pow_exact(base, 4), squared * squared);
+        assert_eq!(pow_exact(base, 5), base * (squared * squared));
+    }
+
     fn to_per_expert_counts_floors_tiny_shard_to_one() {
         // ep=32 of 128 experts → 4 local experts, uniform ppm ≈ 7812 each
         // (Σ ≈ 31248 ≈ TOTAL_PPM/32). At low `global` the proportional share

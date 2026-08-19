@@ -78,9 +78,7 @@ def _run_cudnn_attention(
 
     def benchmark_fn():
         with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
-            return F.scaled_dot_product_attention(
-                q, k, v, is_causal=causal, enable_gqa=enable_gqa
-            )
+            return F.scaled_dot_product_attention(q, k, v, is_causal=causal, enable_gqa=enable_gqa)
 
     o_elem = torch.tensor([], dtype=_common.to_torch_dtype(o_dtype)).element_size()
     bytes_accessed = int(
@@ -90,8 +88,11 @@ def _run_cudnn_attention(
         + num_qo_heads * q_len * head_dim * o_elem
     )
     flops = _common.attention_flops(
-        q_len=q_len, kv_len=kv_len, num_qo_heads=num_qo_heads,
-        head_dim=head_dim, causal=causal,
+        q_len=q_len,
+        kv_len=kv_len,
+        num_qo_heads=num_qo_heads,
+        head_dim=head_dim,
+        causal=causal,
     )
     return _common.measure(benchmark_fn, flops=flops, bytes_accessed=bytes_accessed)
 
@@ -139,9 +140,15 @@ def _run_ragged(
 
     if backend == "cudnn":
         return _run_cudnn_attention(
-            q_len=q_len, kv_len=kv_len, num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads, head_dim=head_dim,
-            q_dtype=q_dtype, kv_dtype=kv_dtype, o_dtype=o_dtype, causal=causal,
+            q_len=q_len,
+            kv_len=kv_len,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            o_dtype=o_dtype,
+            causal=causal,
         )
 
     try:
@@ -151,9 +158,14 @@ def _run_ragged(
 
     try:
         inp = _common.build_ragged_inputs(
-            q_len=q_len, kv_len=kv_len, num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads, head_dim=head_dim,
-            q_dtype=q_dtype, kv_dtype=kv_dtype, o_dtype=o_dtype,
+            q_len=q_len,
+            kv_len=kv_len,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            o_dtype=o_dtype,
         )
         wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             _common.make_workspace(),
@@ -190,8 +202,11 @@ def _run_ragged(
                 return wrapper.run(inp.q, inp.k, inp.v)
 
         flops = _common.attention_flops(
-            q_len=q_len, kv_len=kv_len, num_qo_heads=num_qo_heads,
-            head_dim=head_dim, causal=causal,
+            q_len=q_len,
+            kv_len=kv_len,
+            num_qo_heads=num_qo_heads,
+            head_dim=head_dim,
+            causal=causal,
         )
         if backend == "fa2":
             return _measure_best_split(
@@ -203,6 +218,9 @@ def _run_ragged(
                 bytes_accessed=inp.bytes_accessed,
             )
         wrapper.plan(**plan_kwargs)
+        # FlashInfer's first run may emit one-time initialization kernels. The
+        # CUPTI launch-pattern probe warms the callable itself, for every
+        # backend, so no warm-up is needed here.
         return _common.measure(benchmark_fn, flops=flops, bytes_accessed=inp.bytes_accessed)
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc

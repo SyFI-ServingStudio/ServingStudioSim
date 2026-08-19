@@ -501,13 +501,14 @@ async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actu
 /// reproduces the run-wide conservation `actual`, which is the cross-check.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct WorkloadTotals {
-    pub(crate) matmul_tokens: f64,    // Σ batch_tokens
-    pub(crate) prefill_tokens: f64,   // Σ prefill_tokens
-    pub(crate) decode_passes: f64,    // Σ decode_request_count
+    pub(crate) matmul_tokens: f64,             // Σ batch_tokens
+    pub(crate) prefill_tokens: f64,            // Σ prefill_tokens
+    pub(crate) decode_passes: f64,             // Σ decode_request_count
     pub(crate) prefill_pairs: f64, // Σ_chunk [a·prefix + a(a+1)/2]  (causal, = labeler prefill pairs)
     pub(crate) prefill_cached: f64, // Σ prefix                        (prefill KV read)
     pub(crate) decode_kv: f64, // Σ decode_kv_total               (= labeler decode pairs / cached)
-    pub(crate) prefill_requests: f64, // Σ prefill chunk count           (lm_head sampled positions)
+    pub(crate) prefill_requests: f64, // Σ prefill chunk count (lm_head sampled positions)
+    pub(crate) prefill_stateful_requests: f64, // Σ chunks with prefix > 0 (state read)
 }
 
 /// One exact fixed-batch workload and the number of iterations with that shape.
@@ -529,6 +530,7 @@ struct WorkloadShape {
     prefill_cached: u64,
     decode_kv: u64,
     prefill_requests: u64,
+    prefill_stateful_requests: u64,
 }
 
 impl WorkloadShape {
@@ -541,6 +543,10 @@ impl WorkloadShape {
             prefill_cached: exact_count(totals.prefill_cached, "prefill_cached")?,
             decode_kv: exact_count(totals.decode_kv, "decode_kv")?,
             prefill_requests: exact_count(totals.prefill_requests, "prefill_requests")?,
+            prefill_stateful_requests: exact_count(
+                totals.prefill_stateful_requests,
+                "prefill_stateful_requests",
+            )?,
         })
     }
 
@@ -553,6 +559,7 @@ impl WorkloadShape {
             prefill_cached: self.prefill_cached as f64,
             decode_kv: self.decode_kv as f64,
             prefill_requests: self.prefill_requests as f64,
+            prefill_stateful_requests: self.prefill_stateful_requests as f64,
         }
     }
 }
@@ -575,6 +582,7 @@ impl WorkloadTotals {
         self.prefill_cached += other.prefill_cached;
         self.decode_kv += other.decode_kv;
         self.prefill_requests += other.prefill_requests;
+        self.prefill_stateful_requests += other.prefill_stateful_requests;
     }
 
     /// Replicate independent copies of one workload without changing sequence
@@ -588,6 +596,7 @@ impl WorkloadTotals {
         self.prefill_cached *= factor;
         self.decode_kv *= factor;
         self.prefill_requests *= factor;
+        self.prefill_stateful_requests *= factor;
     }
 }
 
@@ -811,7 +820,6 @@ pub(crate) async fn collect_workload_shapes_by_worker(
                 occurrences,
             });
     }
-
     let mut samples_by_worker = HashMap::new();
     for (worker_key, mut shapes) in shapes_by_worker {
         let mut prefill_flags = prefill_flags_by_worker
@@ -826,7 +834,12 @@ pub(crate) async fn collect_workload_shapes_by_worker(
             .get(&worker_key)
             .copied()
             .unwrap_or(0);
-        reweight_decode_stratum(&mut shapes, &prefill_flags, decode_iterations, sampled_decode);
+        reweight_decode_stratum(
+            &mut shapes,
+            &prefill_flags,
+            decode_iterations,
+            sampled_decode,
+        );
         let iterations = iterations_by_worker
             .get(&worker_key)
             .copied()
@@ -867,6 +880,7 @@ fn sort_shapes_with_flags(shapes: &mut [WeightedWorkload], prefill_flags: &mut [
             totals.prefill_pairs as u64,
             totals.prefill_cached as u64,
             totals.prefill_requests as u64,
+            totals.prefill_stateful_requests as u64,
         )
     });
     let sorted_shapes: Vec<WeightedWorkload> = order.iter().map(|&index| shapes[index]).collect();
@@ -904,7 +918,10 @@ fn reweight_decode_stratum(
     }
     // Hand the shortfall to the largest fractional parts; ties break on shape order.
     remainders.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
-    for (_, index) in remainders.iter().take((decode_iterations - assigned) as usize) {
+    for (_, index) in remainders
+        .iter()
+        .take((decode_iterations - assigned) as usize)
+    {
         shapes[*index].occurrences += 1;
     }
 }
@@ -951,13 +968,20 @@ impl<'a> WorkloadGroupColumns<'a> {
             for index in 0..prefix_values.len().min(append_values.len()) {
                 let prefix_length = prefix_values.value(index) as f64;
                 let append_length = append_values.value(index) as f64;
-                totals.prefill_pairs +=
-                    append_length * prefix_length + append_length * (append_length + 1.0) / 2.0;
-                totals.prefill_cached += prefix_length;
-                totals.prefill_requests += 1.0;
+                add_prefill_request(totals, prefix_length, append_length);
             }
         }
         Ok(())
+    }
+}
+
+fn add_prefill_request(totals: &mut WorkloadTotals, prefix_length: f64, append_length: f64) {
+    totals.prefill_pairs +=
+        append_length * prefix_length + append_length * (append_length + 1.0) / 2.0;
+    totals.prefill_cached += prefix_length;
+    totals.prefill_requests += 1.0;
+    if prefix_length > 0.0 {
+        totals.prefill_stateful_requests += 1.0;
     }
 }
 
@@ -1392,10 +1416,22 @@ mod tests {
             prefill_cached: 4.0,
             decode_kv: 16.0,
             prefill_requests: 1.0,
+            prefill_stateful_requests: 1.0,
         };
         totals.scale(1_000.0);
         assert_eq!(totals.matmul_tokens, 3_000.0);
         assert_eq!(totals.prefill_pairs, 7_000.0);
         assert_eq!(totals.decode_kv, 16_000.0);
+        assert_eq!(totals.prefill_stateful_requests, 1_000.0);
+    }
+
+    #[test]
+    fn prefill_request_derives_stateful_count_from_prefix_not_tokens() {
+        let mut totals = WorkloadTotals::default();
+        add_prefill_request(&mut totals, 0.0, 128.0);
+        add_prefill_request(&mut totals, 64.0, 64.0);
+        assert_eq!(totals.prefill_requests, 2.0);
+        assert_eq!(totals.prefill_stateful_requests, 1.0);
+        assert_eq!(totals.prefill_cached, 64.0);
     }
 }

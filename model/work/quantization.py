@@ -29,7 +29,7 @@ import re
 from dataclasses import dataclass
 
 # Strips the two wrappers HF puts in front of a layer-relative module path.
-_LAYER_PREFIX = re.compile(r"^model\.layers\.\d+\.")
+_LAYER_PREFIX = re.compile(r"^model\.(?:language_model\.)?layers\.\d+\.")
 _MODEL_PREFIX = re.compile(r"^model\.")
 
 _SUPPORTED_QUANT_METHODS = ("fp8",)

@@ -1,12 +1,20 @@
 """Read the two artifacts every labeling decision is made against.
 
 The labeled kernel inventory (`kernel_sequences_labeled.json`) is a *folded*
-program: a phase holds unique sequences, a sequence holds segments, and a
-segment is either a flat kernel list or a repeat body. Nothing downstream wants
-that nesting — every question ("what ran right before this kernel", "which
-kernels are still unmapped", "does this name mean two different things") is
-asked in program order — so `walk_kernels` flattens it once, keeping the folded
-coordinates on each position so a finding can be pointed back at the file.
+program: a phase holds unique sequences, a sequence holds concurrent tracks, a
+track holds segments, and a segment is either a flat kernel list or a repeat
+body. Nothing downstream wants that nesting — every question ("what ran right
+before this kernel", "which kernels are still unmapped", "does this name mean
+two different things") is asked in program order — so `walk_kernels` flattens it
+once, keeping the folded coordinates on each position so a finding can be
+pointed back at the file.
+
+A track is one CUDA stream's kernels. It matters here and not only in the
+parser: `previous_name`, `previous_operation` and `next_name` are the "ordered
+neighbours" evidence a rule rests on, and that evidence only means anything
+inside one execution stream. Two concurrent tracks have no order between them,
+so the walk stops predecessors at a track edge exactly as it does at a repeat
+body edge.
 
 The other artifact is the timing-predict cost manifest, which names every
 simulated slot in compile order. That order is the strongest evidence available
@@ -29,7 +37,11 @@ class KernelPosition:
 
     phase: str
     sequence_id: str
+    track_index: int
+    """Which concurrent track this position sits on. Tracks have no order
+    between them, so no evidence key ever crosses this boundary."""
     segment_index: int
+    """Index inside the track's program — NOT across the whole sequence."""
     offset: int
     """Index inside the segment body — NOT the expanded iteration position."""
     repeat: int
@@ -59,7 +71,10 @@ class KernelPosition:
 
     @property
     def coordinate(self) -> str:
-        return f"{self.phase}/{self.sequence_id[:12]}/seg{self.segment_index}[{self.offset}]"
+        return (
+            f"{self.phase}/{self.sequence_id[:12]}"
+            f"/track{self.track_index}/seg{self.segment_index}[{self.offset}]"
+        )
 
 
 def load_inventory(path: Path) -> dict:
@@ -90,28 +105,36 @@ def unfold_inventory(document: dict) -> None:
     """
     for phase in document["phases"].values():
         for sequence in phase["unique_sequences"]:
-            expanded: list[dict] = []
-            for segment in sequence["program"]:
-                body = segment_body(segment)
-                for _ in range(segment_repeat(segment)):
-                    expanded.extend(copy.deepcopy(body))
+            total = 0
+            # Each track keeps its own literal node: unfolding removes repeats,
+            # never the concurrency boundary, which is not a folding artifact.
+            for track in sequence["tracks"]:
+                expanded: list[dict] = []
+                for segment in track["program"]:
+                    body = segment_body(segment)
+                    for _ in range(segment_repeat(segment)):
+                        expanded.extend(copy.deepcopy(body))
+                track["program"] = [{"kernels": expanded}]
+                total += len(expanded)
             expected_count = int(sequence["expanded_kernel_count"])
-            if len(expanded) != expected_count:
+            if total != expected_count:
                 raise ValueError(
-                    f"sequence {sequence['sequence_id']!r} unfolded to {len(expanded)} "
+                    f"sequence {sequence['sequence_id']!r} unfolded to {total} "
                     f"kernels, expected {expected_count}"
                 )
-            sequence["program"] = [{"kernels": expanded}]
     document["encoding"] = "literal-v1"
     document["folding_policy"] = {"kind": "none", "source": "label-initialize-unfold"}
 
 
 def walk_kernels(document: dict) -> Iterator[KernelPosition]:
-    """Every kernel in program order, phase by phase and sequence by sequence.
+    """Every kernel in program order: phase, sequence, track, segment body.
 
     Order matters: the `after` evidence (what ran immediately before) is only
-    meaningful within one segment body, and consumers rely on this walk not
-    stitching two bodies together.
+    meaningful within one segment body of one track, and consumers rely on this
+    walk neither stitching two bodies together nor reaching across a track. A
+    track boundary is a stronger cut than a body boundary — two bodies at least
+    ran one after the other, while two tracks ran at the same time and have no
+    "before" between them at all.
 
     `previous_operation` is read back from the label dict after each position is
     consumed, so a caller that labels a kernel in place is the predecessor of
@@ -120,29 +143,34 @@ def walk_kernels(document: dict) -> Iterator[KernelPosition]:
     """
     for phase, block in document["phases"].items():
         for sequence in block["unique_sequences"]:
-            for segment_index, segment in enumerate(sequence["program"]):
-                repeat = segment_repeat(segment)
-                previous_name: str | None = None
-                previous_operation: str | None = None
-                body = segment_body(segment)
-                for offset, kernel in enumerate(body):
-                    label = kernel.setdefault("label", {})
-                    yield KernelPosition(
-                        phase=phase,
-                        sequence_id=sequence["sequence_id"],
-                        segment_index=segment_index,
-                        offset=offset,
-                        repeat=repeat,
-                        name=kernel["name"],
-                        label=label,
-                        previous_name=previous_name,
-                        previous_operation=previous_operation,
-                        next_name=body[offset + 1]["name"] if offset + 1 < len(body) else None,
-                    )
-                    previous_operation = (
-                        label.get("operation") if label.get("status") == "mapped" else None
-                    )
-                    previous_name = kernel["name"]
+            for track in sequence["tracks"]:
+                track_index = int(track["track_index"])
+                for segment_index, segment in enumerate(track["program"]):
+                    repeat = segment_repeat(segment)
+                    previous_name: str | None = None
+                    previous_operation: str | None = None
+                    body = segment_body(segment)
+                    for offset, kernel in enumerate(body):
+                        label = kernel.setdefault("label", {})
+                        yield KernelPosition(
+                            phase=phase,
+                            sequence_id=sequence["sequence_id"],
+                            track_index=track_index,
+                            segment_index=segment_index,
+                            offset=offset,
+                            repeat=repeat,
+                            name=kernel["name"],
+                            label=label,
+                            previous_name=previous_name,
+                            previous_operation=previous_operation,
+                            next_name=(
+                                body[offset + 1]["name"] if offset + 1 < len(body) else None
+                            ),
+                        )
+                        previous_operation = (
+                            label.get("operation") if label.get("status") == "mapped" else None
+                        )
+                        previous_name = kernel["name"]
 
 
 def load_slots(manifest_path: Path) -> list[tuple[str, str]]:

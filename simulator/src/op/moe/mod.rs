@@ -26,6 +26,7 @@ pub use combine::MoeCombineOp;
 pub use dispatch::MoeDispatchOp;
 pub use grouped_fp8_gemm::{
     GroupedFp8GemmWithQuantConfig, GroupedFp8GemmWithQuantInput, GroupedFp8GemmWithQuantOp,
+    GroupedGemmConfig, GroupedQuantConfig, QuantRows,
 };
 pub use sim::simulate_moe_comm;
 

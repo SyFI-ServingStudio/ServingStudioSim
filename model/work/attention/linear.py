@@ -13,17 +13,17 @@ own :class:`AttentionSpec`, distinct from :class:`GQA`:
   many tokens each has attended. This is the whole point of the hybrid design — the
   linear layers keep long-context memory flat.
 
-Projection layout mirrors HF ``Qwen3_5GatedDeltaNet`` (the split in_proj variant):
-``in_proj_qkv`` (q+k+v mixed), separate ``in_proj_z`` (output gate), tiny ``in_proj_b`` /
-``in_proj_a`` (per-head β / decay scalars), a depthwise ``conv1d`` short convolution over
-the qkv channels, and ``out_proj``.
+Projection layout mirrors HF ``Qwen3_5GatedDeltaNet``: packed ``in_proj_qkvz``, packed
+``in_proj_ba`` (per-head β / decay scalars), a depthwise ``conv1d`` short convolution
+over the qkv channels, and ``out_proj``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..core import MatmulGroup, Workload
+from ..core import LearnedWeightGroup, MatmulGroup, Workload
+from .base import AttentionSemantic
 
 
 @dataclass
@@ -37,6 +37,7 @@ class GatedDeltaNet:
     head_v_dim: int  # linear_value_head_dim
     conv_kernel: int  # linear_conv_kernel_dim
     state_dtype_bytes: float  # recurrent state dtype (mamba_ssm_dtype, usually fp32 -> 4)
+    activation_dtype_bytes: float = 2.0
 
     @property
     def key_dim(self) -> int:
@@ -58,16 +59,40 @@ class GatedDeltaNet:
         # groups=conv_dim depthwise Conv1d exactly.
         return [
             MatmulGroup(
-                "in_proj_qkv",
-                n=self.key_dim * 2 + self.value_dim,
+                "qkvz",
+                n=self.key_dim * 2 + self.value_dim * 2,
                 k=self.hidden,
                 bucket="attn_proj",
+                module="linear_attn.in_proj_qkvz",
             ),
-            MatmulGroup("in_proj_z", n=self.value_dim, k=self.hidden, bucket="attn_proj"),
-            MatmulGroup("in_proj_b", n=self.num_v_heads, k=self.hidden, bucket="attn_proj"),
-            MatmulGroup("in_proj_a", n=self.num_v_heads, k=self.hidden, bucket="attn_proj"),
-            MatmulGroup("conv1d", n=self.conv_dim, k=self.conv_kernel, bucket="attn_proj"),
-            MatmulGroup("out_proj", n=self.hidden, k=self.value_dim, bucket="attn_proj"),
+            MatmulGroup(
+                "ba",
+                n=2 * self.num_v_heads,
+                k=self.hidden,
+                bucket="attn_proj",
+                module="linear_attn.in_proj_ba",
+            ),
+            MatmulGroup(
+                "conv1d",
+                n=self.conv_dim,
+                k=self.conv_kernel,
+                bucket="attn_proj",
+                module="linear_attn.conv1d",
+            ),
+            MatmulGroup(
+                "out_proj",
+                n=self.hidden,
+                k=self.value_dim,
+                bucket="attn_proj",
+                module="linear_attn.out_proj",
+            ),
+        ]
+
+    def learned_weight_groups(self) -> list[LearnedWeightGroup]:
+        return [
+            LearnedWeightGroup("a_log", self.num_v_heads, 1, "attn"),
+            LearnedWeightGroup("dt_bias", self.num_v_heads, 1, "attn"),
+            LearnedWeightGroup("gated_norm", self.head_v_dim, 1, "norm"),
         ]
 
     def internal_flops(self, wl: Workload) -> float:
@@ -90,10 +115,43 @@ class GatedDeltaNet:
         # the number of state transactions (one per original causal_lm interaction),
         # NOT with context length. Analyzer workloads may collapse the geometry of
         # many interactions, so `num_attention_steps` retains their original count.
-        state_elems = self.num_v_heads * self.head_k_dim * self.head_v_dim
-        state_per_sequence = state_elems * self.state_dtype_bytes
-        return 2.0 * wl.num_attention_steps * state_per_sequence
+        return sum(row.bytes for row in self.semantic_segments(wl))
+
+    @property
+    def recurrent_state_bytes(self) -> float:
+        return self.num_v_heads * self.head_k_dim * self.head_v_dim * self.state_dtype_bytes
+
+    @property
+    def convolution_state_bytes(self) -> float:
+        return self.conv_dim * self.conv_kernel * self.activation_dtype_bytes
+
+    def semantic_segments(self, wl: Workload) -> list[AttentionSemantic]:
+        phases = dict(wl.attention_phases())
+        prefill = phases.get("prefill", Workload(0, 0))
+        decode = phases.get("decode", Workload(0, 0))
+        # Legacy/caller-constructed workloads may not tag phases. Preserve their
+        # former read+write-per-transaction behavior by treating them as stateful
+        # recurrent steps, without guessing that any were fresh prefill requests.
+        if None in phases and not prefill.num_attention_steps and not decode.num_attention_steps:
+            decode = phases[None]
+        prefill_requests = prefill.num_attention_steps
+        stateful = prefill.prefill_stateful_requests
+        decode_requests = decode.num_attention_steps
+        recurrent = self.recurrent_state_bytes
+        convolution = self.convolution_state_bytes
+        return [
+            AttentionSemantic("attn.prefill", flops=self.internal_flops(prefill)),
+            AttentionSemantic("attn.decode", flops=self.internal_flops(decode)),
+            AttentionSemantic("recurrent_state.prefill_read", bytes=recurrent * stateful),
+            AttentionSemantic("recurrent_state.prefill_write", bytes=recurrent * prefill_requests),
+            AttentionSemantic("recurrent_state.decode_read", bytes=recurrent * decode_requests),
+            AttentionSemantic("recurrent_state.decode_write", bytes=recurrent * decode_requests),
+            AttentionSemantic("conv_state.prefill_read", bytes=convolution * stateful),
+            AttentionSemantic("conv_state.prefill_write", bytes=convolution * prefill_requests),
+            AttentionSemantic("conv_state.decode_read", bytes=convolution * decode_requests),
+            AttentionSemantic("conv_state.decode_write", bytes=convolution * decode_requests),
+        ]
 
     def cache_write_bytes(self, wl: Workload) -> float:
-        # `kv_bytes` already counts both the recurrent-state read and write.
+        # `kv_bytes` already counts every recurrent/convolution-state transaction.
         return 0.0

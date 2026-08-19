@@ -12,6 +12,8 @@ import json
 from collections import defaultdict
 from typing import Any
 
+import numpy as np
+
 KernelOccurrence = dict[str, str]
 
 
@@ -79,13 +81,13 @@ def build_device_kernel_sequences(
                         "sequence_id": sequence_id,
                         "occurrences": [occurrence],
                         "expanded_kernel_count": sequence["expanded_kernel_count"],
-                        "program": sequence["program"],
+                        "tracks": sequence["tracks"],
                     }
                     continue
                 # Same id means the same ordered (name, category) sequence, so the
                 # folded program is identical by construction; assert rather than
                 # trust, because a mismatch would silently mislabel a device.
-                if existing["program"] != sequence["program"]:
+                if existing["tracks"] != sequence["tracks"]:
                     raise ValueError(
                         f"sequence {sequence_id!r} folds differently on device {device_id}"
                     )
@@ -112,8 +114,15 @@ def build_device_kernel_sequences(
 def _build_device_kernel_sequences(
     iteration_details: list[dict[str, Any]], kernel_names: dict[int, str], device_id: int
 ) -> dict[str, dict[str, Any]]:
-    """Deduplicate and fold exact phase sequences for one physical rank."""
-    grouped: dict[tuple[str, tuple[int, ...]], dict[str, Any]] = {}
+    """Deduplicate and fold exact phase sequences for one physical rank.
+
+    Folding runs per concurrent track, never across one. `parse` already
+    serialized each range track-major, so the tracks are contiguous runs of the
+    phase's kernel list and this only has to cut on the boundary — which keeps
+    the flat expansion, and therefore `sequence_id:expanded_ordinal`, exactly the
+    order the analyzer validates against.
+    """
+    grouped: dict[tuple[str, tuple[tuple[int, ...], ...]], dict[str, Any]] = {}
     for detail in iteration_details:
         ranges_by_phase: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for range_row in detail.get("ranges", []):
@@ -123,30 +132,49 @@ def _build_device_kernel_sequences(
         for phase, kernels in ranges_by_phase.items():
             if not kernels:
                 continue
-            name_ids = tuple(int(kernel["name_id"]) for kernel in kernels)
-            key = (phase, name_ids)
-            categories = tuple(str(kernel["category"]) for kernel in kernels)
+            runs = _track_runs(kernels)
+            track_name_ids = tuple(
+                tuple(int(kernel["name_id"]) for kernel in run) for _, run in runs
+            )
+            key = (phase, track_name_ids)
+            track_categories = tuple(
+                tuple(str(kernel["category"]) for kernel in run) for _, run in runs
+            )
             entry = grouped.get(key)
             if entry is None:
-                occurrences = [
-                    {
-                        "name": kernel_names[name_id],
-                        "suggested_category": category,
-                    }
-                    for name_id, category in zip(name_ids, categories, strict=True)
-                ]
-                sequence_id = _sequence_id(phase, name_ids, kernel_names)
+                tracks = []
+                for track_index, ((range_track, _), name_ids, categories) in enumerate(
+                    zip(runs, track_name_ids, track_categories, strict=True)
+                ):
+                    occurrences = [
+                        {
+                            "name": kernel_names[name_id],
+                            "suggested_category": category,
+                        }
+                        for name_id, category in zip(name_ids, categories, strict=True)
+                    ]
+                    tracks.append(
+                        {
+                            "track_index": track_index,
+                            "stream_role": "primary" if range_track == 0 else "concurrent",
+                            "kernel_count": len(occurrences),
+                            "program": _fold_program(occurrences),
+                        }
+                    )
                 grouped[key] = {
-                    "sequence_id": sequence_id,
+                    "sequence_id": _sequence_id(phase, track_name_ids, kernel_names),
                     "iterations": [int(detail["iteration"])],
-                    "expanded_kernel_count": len(occurrences),
-                    "program": _fold_program(occurrences),
+                    "expanded_kernel_count": sum(len(run) for _, run in runs),
+                    "tracks": tracks,
                 }
             else:
                 existing_categories = tuple(
-                    kernel["suggested_category"] for kernel in expand_program(entry["program"])
+                    tuple(
+                        kernel["suggested_category"] for kernel in expand_program(track["program"])
+                    )
+                    for track in entry["tracks"]
                 )
-                if existing_categories != categories:
+                if existing_categories != track_categories:
                     raise ValueError(f"phase {phase!r} sequence has inconsistent kernel categories")
                 entry["iterations"].append(int(detail["iteration"]))
 
@@ -158,8 +186,51 @@ def _build_device_kernel_sequences(
     return catalogs
 
 
+def _track_runs(kernels: list[dict[str, Any]]) -> list[tuple[int, list[dict[str, Any]]]]:
+    """Cut the phase's serialized kernels into maximal single-track runs.
+
+    Returns `(range track index, kernels)` per run, in order. `parse` emits each
+    range track-major, so a track is already a contiguous run and the cut is just
+    where `track_index` changes. Two ranges of the same phase that both end and
+    begin on the primary track therefore stay one run — which is what folding
+    across a range boundary did before tracks existed, so a single-stream capture
+    is one run and folds exactly as it always has.
+
+    This is the same rule the per-device split already follows, one level down:
+    concurrent work is kept apart rather than interleaved, because a single
+    ordered list of concurrent kernels asserts a serialization that did not
+    happen. Folding is exact-match, so an interleaving that jitter can flip both
+    breaks a layer repeat and forks a new "unique" sequence — on a Qwen3.6
+    capture, one recurring decode shape became 909 sequences that still folded to
+    92% of their expanded size.
+
+    A run is a labeling coordinate, not evidence: durations and overlap are read
+    from each kernel's own timestamps, which this does not touch.
+    """
+    runs: list[tuple[int, list[dict[str, Any]]]] = []
+    for kernel in kernels:
+        track_index = int(kernel.get("track_index", 0))
+        if not runs or runs[-1][0] != track_index:
+            runs.append((track_index, []))
+        runs[-1][1].append(kernel)
+    return runs
+
+
+def expand_sequence(sequence: dict[str, Any]) -> list[KernelOccurrence]:
+    """Expand a whole sequence: its tracks concatenated, in canonical order.
+
+    This is the flat order `parse` serialized and the analyzer validates against,
+    so the position of a kernel here is its `expanded_ordinal`.
+    """
+    return [
+        kernel
+        for track in sequence["tracks"]
+        for kernel in expand_program(track["program"])
+    ]
+
+
 def expand_program(program: list[dict[str, Any]]) -> list[KernelOccurrence]:
-    """Expand folded nodes; shared by validation tests and artifact consumers."""
+    """Expand one track's folded nodes; shared by tests and artifact consumers."""
     expanded: list[KernelOccurrence] = []
     for node in program:
         if "kernels" in node:
@@ -180,35 +251,96 @@ def _fold_program(kernels: list[KernelOccurrence]) -> list[dict[str, Any]]:
     return program
 
 
+def _best_repeat(tokens: list[int], absolute_start: int) -> tuple[int, ...] | None:
+    """Lowest-ranking `(stored, aligned, suffix, -count, start, width, count)`.
+
+    Every `(start, width)` pair with `saved_occurrences >= 2` contributes exactly
+    one candidate, and `start`/`width` are themselves in the tuple, so the
+    minimum is unique and independent of the order pairs are visited in. That is
+    what lets this iterate width-major while the definition reads start-major.
+
+    The definition asks, for each pair, how many consecutive `width`-blocks from
+    `start` are equal. Comparing blocks costs `O(width)` each, which makes the
+    obvious triple loop `O(n^3)` — minutes per iteration on a real capture. But
+    "the first k blocks are equal" is exactly "`tokens[start:]` and
+    `tokens[start + width:]` share a prefix of at least `(k - 1) * width`", so
+
+        count = 1 + lcp(start, start + width) // width
+
+    and for one fixed `width` the whole `lcp` diagonal falls out of a single
+    backward pass. That is `O(n)` per width, `O(n^2)` overall, with no change to
+    which repeat is chosen.
+    """
+    n = len(tokens)
+    if n < 2:
+        return None
+    token_array = np.asarray(tokens, dtype=np.int64)
+    positions = np.arange(n, dtype=np.int64)
+
+    best: tuple[int, ...] | None = None
+    best_saved = 1  # `saved_occurrences < 2` never qualifies, so start just below
+    for width in range(1, n // 2 + 1):
+        # `saved = (count - 1) * width <= n - start - width <= n - width`, and
+        # `n - width` only shrinks as width grows: once the best possible saving
+        # at this width cannot match what is already banked, no wider repeat can
+        # either. On a layer-stack sequence the winner is a narrow body repeated
+        # many times, so this lands early and retires most of the width range.
+        if n - width < best_saved:
+            break
+
+        # lcp(i, i + width) for every i at once: mark each mismatch with its own
+        # index and every match with `span`, then a reverse running minimum turns
+        # that into "index of the next mismatch at or after i".
+        span = n - width
+        matches = token_array[:span] == token_array[width:]
+        marked = np.where(matches, span, positions[:span])
+        next_mismatch = np.minimum.accumulate(marked[::-1])[::-1]
+        last_start = span - width  # from `width <= (n - start) // 2`
+        lcp = next_mismatch[: last_start + 1] - positions[: last_start + 1]
+
+        saved = lcp // width * width
+        # Equality is kept, not dropped: a candidate that only ties the banked
+        # saving can still win on alignment or suffix below.
+        qualifying = np.flatnonzero(saved >= max(2, best_saved))
+        if qualifying.size == 0:
+            continue
+        # The primary key is `n - saved`, so within one width only the starts
+        # achieving its maximum saving can ever win; the rest are dominated.
+        width_saved = int(saved[qualifying].max())
+        starts = qualifying[saved[qualifying] == width_saved]
+        # Remaining tie-break at fixed (width, saved): `aligned` first, then the
+        # smallest suffix — and suffix shrinks as start grows, so that is the
+        # largest start. `start` itself never decides, being determined by suffix.
+        aligned_starts = starts[(absolute_start + starts) % width == 0]
+        start = int((aligned_starts if aligned_starts.size else starts).max())
+
+        count = width_saved // width + 1
+        candidate = (
+            n - width_saved,  # == start + width + suffix
+            0 if (absolute_start + start) % width == 0 else 1,
+            n - start - count * width,
+            -count,
+            start,
+            width,
+            count,
+        )
+        if best is None or candidate < best:
+            best = candidate
+            best_saved = width_saved
+    return best
+
+
 def _fold_segment(kernels: list[KernelOccurrence], *, absolute_start: int) -> list[dict[str, Any]]:
-    best: tuple[int, int, int, int, int, int, int] | None = None
-    tokens = [(kernel["name"], kernel["suggested_category"]) for kernel in kernels]
-    for start in range(len(tokens)):
-        for width in range(1, (len(tokens) - start) // 2 + 1):
-            count = 1
-            while (
-                start + (count + 1) * width <= len(tokens)
-                and tokens[start : start + width]
-                == tokens[start + count * width : start + (count + 1) * width]
-            ):
-                count += 1
-            saved_occurrences = (count - 1) * width
-            if saved_occurrences < 2:
-                continue
-            suffix = len(tokens) - start - count * width
-            stored_occurrences = start + width + suffix
-            aligned = 0 if (absolute_start + start) % width == 0 else 1
-            candidate = (
-                stored_occurrences,
-                aligned,
-                suffix,
-                -count,
-                start,
-                width,
-                count,
-            )
-            if best is None or candidate < best:
-                best = candidate
+    # Intern to ints so the hot equality test is a machine compare rather than a
+    # two-string tuple compare.
+    token_ids: dict[tuple[str, str], int] = {}
+    tokens = [
+        token_ids.setdefault(
+            (kernel["name"], kernel["suggested_category"]), len(token_ids)
+        )
+        for kernel in kernels
+    ]
+    best = _best_repeat(tokens, absolute_start)
 
     if best is None:
         return [{"kernels": kernels}] if kernels else []
@@ -240,12 +372,17 @@ def _merge_literal_nodes(program: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _sequence_id(
     phase: str,
-    name_ids: tuple[int, ...],
+    track_name_ids: tuple[tuple[int, ...], ...],
     kernel_names: dict[int, str],
 ) -> str:
+    # The track split is part of the identity: the same flat kernel names cut
+    # into different concurrent tracks are different programs, and collapsing
+    # them onto one id would hand both the same labeling decision.
     identity = {
         "phase": phase,
-        "kernel_names": [kernel_names[name_id] for name_id in name_ids],
+        "kernel_names": [
+            [kernel_names[name_id] for name_id in name_ids] for name_ids in track_name_ids
+        ],
     }
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()

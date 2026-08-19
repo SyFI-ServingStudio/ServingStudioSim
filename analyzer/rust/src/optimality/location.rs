@@ -5,6 +5,7 @@
 //! all-or-nothing so an arch change cannot silently turn missing necessary work into
 //! zero. Communication leaves are exempt because necessary model work is local work.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -259,10 +260,22 @@ impl LocationCatalog {
                     gpu_count,
                 );
                 weighted_work.scale(occurrence_scale);
-                work_by_location
-                    .entry(rule.location.as_str())
-                    .or_default()
-                    .add_assign_for_policy(&weighted_work, policy);
+                match work_by_location.entry(rule.location.as_str()) {
+                    // Seed the location with this label's own roofline, which the
+                    // fold above kept at per-semantic-row granularity. Folding it
+                    // through the policy instead would re-fuse one label's rows
+                    // into a single location roofline under `Saturated`, silently
+                    // moving R6 toward R7 — and a saturated composition carries
+                    // exactly one label, so that is pure loss.
+                    Entry::Vacant(slot) => {
+                        slot.insert(weighted_work);
+                    }
+                    // Later labels are separate iterations; how work combines
+                    // across an iteration boundary *is* the policy's question.
+                    Entry::Occupied(mut slot) => {
+                        slot.get_mut().add_assign_for_policy(&weighted_work, policy)
+                    }
+                }
             }
         }
         for work in work_by_location.values_mut() {
@@ -432,6 +445,7 @@ fn validate_mapping(
 
 #[cfg(test)]
 mod tests {
+    use super::super::levels::BaseRungs;
     use super::*;
 
     fn location(name: &str) -> KernelLocation {
@@ -484,6 +498,96 @@ mod tests {
             &[segment("gemm")],
         )
         .is_err());
+    }
+
+    /// One semantic row whose two roofline terms are set independently, so a
+    /// test can make a location hold both a compute-bound and a memory-bound row.
+    fn bounded_segment(name: &str, flops: f64, bytes: f64, necessary_gpu_s: f64) -> SemanticWork {
+        SemanticWork {
+            name: name.to_string(),
+            flops,
+            bytes,
+            necessary_gpu_s,
+            compute_dtype: "bf16".to_string(),
+        }
+    }
+
+    /// R6 is per-segment necessary work. A location that maps several semantic
+    /// rows must therefore SUM their rooflines, not re-fuse them into one — the
+    /// difference is exactly the fusion chunk that separates R6 from R7, and
+    /// folding it in here would silently move R6 down toward R7. A saturated
+    /// composition carries a single label, so the policy's cross-iteration
+    /// re-fusion must not reach this seeding step.
+    #[test]
+    fn a_location_holding_both_bounds_keeps_its_per_segment_rooflines() {
+        // 1000 TFLOP/s and 1000 GB/s: compute = flops / 1e15, memory = bytes / 1e12.
+        let gpu_spec = GpuSpec::for_test(1000.0, 1000.0);
+        let label = IterationLabel {
+            floors: Floors {
+                // Σ_seg max(compute, memory) = 2 + 2; one roofline over both = max(3, 3).
+                fused: 3.0,
+                segmented: 4.0,
+            },
+            segments: vec![
+                bounded_segment("gemm", 2e15, 1e12, 2.0),
+                bounded_segment("norm", 1e15, 2e12, 2.0),
+            ],
+        };
+        let catalog = LocationCatalog {
+            maps: vec![LocationMap {
+                schema_version: 1,
+                mapping_id: "test".to_string(),
+                arch_types: vec!["test_arch".to_string()],
+                locations: vec![LocationRule {
+                    location: "unified.fused".to_string(),
+                    semantics: vec!["gemm".to_string(), "norm".to_string()],
+                }],
+            }],
+            pool_specs: BTreeMap::from([(
+                "unified".to_string(),
+                PoolModelSpec {
+                    arch_type: "test_arch".to_string(),
+                },
+            )]),
+        };
+        let rungs_gpu_ms = BaseRungs {
+            real: 10_000.0,
+            busy: 10_000.0,
+            balanced: 10_000.0,
+            per_config_best: 9_000.0,
+            ignore_network: 9_000.0,
+            hardware_limit: 8_000.0,
+        };
+        let mut ladder = KernelLadder::worker(
+            "unified",
+            0,
+            &rungs_gpu_ms,
+            vec![KernelContribution {
+                name: "unified.fused".to_string(),
+                kind: "single_gemm".to_string(),
+                is_comm: false,
+                rungs: KernelRungs::from_gpu_ms([10_000.0, 9_000.0, 9_000.0, 8_000.0]),
+                necessary_work: None,
+            }],
+        );
+
+        catalog
+            .attribute_ladder(
+                "unified",
+                &[location("unified.fused")],
+                &mut ladder,
+                &label,
+                gpu_spec,
+                1.0,
+                NecessaryWorkPolicy::Saturated {
+                    replication_factor: 1,
+                },
+            )
+            .expect("saturated attribution reconciles with the labeler floors");
+
+        assert_eq!(ladder.rungs.segmented_necessary, Some(4.0));
+        assert_eq!(ladder.rungs.scope_fused_necessary, Some(3.0));
+        assert_eq!(ladder.special_chunks.fusion, Some(1.0));
     }
 
     #[test]
