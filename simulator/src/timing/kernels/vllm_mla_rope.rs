@@ -148,7 +148,7 @@ mod tests {
         let axis = &grid.axes()[0];
         assert_eq!(axis[0], 1.0, "the curve must start at a single token");
         assert!(
-            axis.iter().any(|&value| value <= 48.0 && value >= 32.0),
+            axis.iter().any(|&value| (32.0..=48.0).contains(&value)),
             "decode batches land in the tens of rows and need a sample there"
         );
         assert!(

@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(down.k.get(), 1536);
     }
 
-    /// The quant halves differ in row layout, and only the gate_up side is
+    /// The quant halves differ in row layout, and only the `gate_up` side is
     /// unexpanded. Asserted here because the two are configured by one shared
     /// closure and are easy to make accidentally symmetric.
     #[test]

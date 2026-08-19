@@ -436,16 +436,15 @@ mod tests {
         let feasible = payloads
             .iter()
             .zip(&mask)
-            .filter_map(|(payload, &masked)| {
-                (!masked).then(|| {
-                    let fields = payload.fields();
-                    (
-                        fields["num_tokens"].as_u64().unwrap(),
-                        fields["num_chunks"].as_u64().unwrap(),
-                        fields["num_sequences"].as_u64().unwrap(),
-                        fields["max_chunks_per_sequence"].as_u64().unwrap(),
-                    )
-                })
+            .filter(|&(_payload, &masked)| !masked)
+            .map(|(payload, &_masked)| {
+                let fields = payload.fields();
+                (
+                    fields["num_tokens"].as_u64().unwrap(),
+                    fields["num_chunks"].as_u64().unwrap(),
+                    fields["num_sequences"].as_u64().unwrap(),
+                    fields["max_chunks_per_sequence"].as_u64().unwrap(),
+                )
             })
             .collect::<HashSet<_>>();
         assert_eq!(feasible.len(), 73);
@@ -469,7 +468,12 @@ mod tests {
             }
             assert!(geometry_is_feasible(c, n, m));
             let counts = canonical_chunk_counts(c, n, m).unwrap();
-            assert_eq!(counts.len(), n as usize);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "n is a num_sequences value drawn from the test's small enumerated spec grid, far below usize::MAX even on 32-bit targets"
+            )]
+            let n_usize = n as usize;
+            assert_eq!(counts.len(), n_usize);
             assert!(counts.iter().all(|&count| count > 0));
             assert_eq!(counts.iter().sum::<u64>(), c);
             assert_eq!(counts.iter().copied().max(), Some(m));

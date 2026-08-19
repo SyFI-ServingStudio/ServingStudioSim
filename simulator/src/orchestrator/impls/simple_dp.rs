@@ -286,6 +286,10 @@ mod tests {
         }
         let mut completed = Vec::new();
         for step in 0..500u64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             for a in flow.tick(Time::from_ms(step as f64)) {
                 let OrchAction::Complete { req } = a;
                 completed.push(req);
@@ -309,7 +313,12 @@ mod tests {
         }
         let mut n = 0;
         for step in 0..200u64 {
-            n += flow.tick(Time::from_ms(step as f64)).len();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
+            let now = Time::from_ms(step as f64);
+            n += flow.tick(now).len();
         }
         assert_eq!(n, 4);
     }

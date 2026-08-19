@@ -292,6 +292,14 @@ mod tests {
     /// backpressure (`logs/20260810_1_*`: 975,624 rows x 1,271 slots).
     const BENCH_SLOTS_PER_ROW: usize = 1_271;
 
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "row/slot indices and token counts here are bounded by the test's own small \
+                  `rows`/`BENCH_SLOTS_PER_ROW` loop sizes, well inside the lossless range of the \
+                  target int/float types"
+    )]
     fn bench_chunk(rows: usize) -> CostLogChunk {
         use crate::timing::kernels::SingleGemmKernelInput;
         use crate::timing::AttnPrefillLog;
@@ -354,70 +362,74 @@ mod tests {
     /// lower-cardinality than a real run, which biases both size and ZSTD time.
     #[test]
     #[ignore = "internal microbench; run: cargo test --release --lib cost_log_writer_breakdown -- --ignored --nocapture"]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "microbench over a bounded row/cell count (2_048 rows, ~2.6M cells) and file \
+                  sizes in the MB range; casts to f64 for reporting stay far below the point \
+                  where precision loss would matter, and the parquet offset cast is from a \
+                  non-negative list offset"
+    )]
     fn cost_log_writer_breakdown() {
         let rows = 2_048;
         let mut convert_s = f64::NAN;
-        let (batch, cells) = match std::env::var("VIBESIM_COST_LOG_BENCH_PARQUET") {
-            Ok(path) => {
-                let mut reader =
-                    ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap())
-                        .unwrap()
-                        .with_batch_size(rows)
-                        .build()
-                        .unwrap();
-                let batch = reader.next().unwrap().unwrap();
-                let slots = batch
-                    .column_by_name("slot_time_ms")
-                    .expect("slot_time_ms column")
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .unwrap()
-                    .value_offsets()
-                    .last()
-                    .copied()
-                    .unwrap_or(0) as usize;
-                println!("(real batch from {path})");
-                (batch, slots)
+        let (batch, cells) = if let Ok(path) = std::env::var("VIBESIM_COST_LOG_BENCH_PARQUET") {
+            let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap())
+                .unwrap()
+                .with_batch_size(rows)
+                .build()
+                .unwrap();
+            let batch = reader.next().unwrap().unwrap();
+            let slots = batch
+                .column_by_name("slot_time_ms")
+                .expect("slot_time_ms column")
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap()
+                .value_offsets()
+                .last()
+                .copied()
+                .unwrap_or(0) as usize;
+            println!("(real batch from {path})");
+            (batch, slots)
+        } else {
+            let chunk = bench_chunk(rows);
+            let mut batch = cost_to_record_batch(&chunk).unwrap();
+            convert_s = f64::INFINITY;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                batch = cost_to_record_batch(&chunk).unwrap();
+                convert_s = convert_s.min(start.elapsed().as_secs_f64());
             }
-            Err(_) => {
-                let chunk = bench_chunk(rows);
-                let mut batch = cost_to_record_batch(&chunk).unwrap();
-                convert_s = f64::INFINITY;
-                for _ in 0..5 {
-                    let start = std::time::Instant::now();
-                    batch = cost_to_record_batch(&chunk).unwrap();
-                    convert_s = convert_s.min(start.elapsed().as_secs_f64());
-                }
-                // Same chunk with the slot_input column emptied: the difference is
-                // the per-slot serde_json term, the rest is Arrow builder append.
-                let mut no_input = bench_chunk(rows);
-                no_input.slot_inputs.clear();
-                for entry in &mut no_input.entries {
-                    entry.slot_input_len = 0;
-                }
-                let mut no_input_s = f64::INFINITY;
-                for _ in 0..5 {
-                    let start = std::time::Instant::now();
-                    let _ = cost_to_record_batch(&no_input).unwrap();
-                    no_input_s = no_input_s.min(start.elapsed().as_secs_f64());
-                }
-                println!(
-                    "(convert without slot_input: {:.3} s = {:.1} ns/cell -> serde_json share {:.0}%)",
-                    no_input_s,
-                    no_input_s / (rows * BENCH_SLOTS_PER_ROW) as f64 * 1e9,
-                    (1.0 - no_input_s / convert_s) * 100.0
-                );
-                let json_bytes: usize = chunk
-                    .slot_inputs
-                    .iter()
-                    .map(|slot| serde_json::to_vec(slot).map_or(0, |v| v.len()))
-                    .sum();
-                println!(
-                    "(synthetic slot_input mean {:.1} B/cell)",
-                    json_bytes as f64 / chunk.slot_inputs.len() as f64
-                );
-                (batch, rows * BENCH_SLOTS_PER_ROW)
+            // Same chunk with the slot_input column emptied: the difference is
+            // the per-slot serde_json term, the rest is Arrow builder append.
+            let mut no_input = bench_chunk(rows);
+            no_input.slot_inputs.clear();
+            for entry in &mut no_input.entries {
+                entry.slot_input_len = 0;
             }
+            let mut no_input_s = f64::INFINITY;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                let _ = cost_to_record_batch(&no_input).unwrap();
+                no_input_s = no_input_s.min(start.elapsed().as_secs_f64());
+            }
+            println!(
+                "(convert without slot_input: {:.3} s = {:.1} ns/cell -> serde_json share {:.0}%)",
+                no_input_s,
+                no_input_s / (rows * BENCH_SLOTS_PER_ROW) as f64 * 1e9,
+                (1.0 - no_input_s / convert_s) * 100.0
+            );
+            let json_bytes: usize = chunk
+                .slot_inputs
+                .iter()
+                .map(|slot| serde_json::to_vec(slot).map_or(0, |v| v.len()))
+                .sum();
+            println!(
+                "(synthetic slot_input mean {:.1} B/cell)",
+                json_bytes as f64 / chunk.slot_inputs.len() as f64
+            );
+            (batch, rows * BENCH_SLOTS_PER_ROW)
         };
         let rows = batch.num_rows();
 
@@ -452,10 +464,11 @@ mod tests {
             all_slot_columns(false),
         );
         let slot_input_for_stats = slot_input_column.clone();
-        let variants: Vec<(
-            &str,
+        type Variant = (
+            &'static str,
             Box<dyn Fn(WriterPropertiesBuilder) -> WriterPropertiesBuilder>,
-        )> = vec![
+        );
+        let variants: Vec<Variant> = vec![
             ("dict=on  stats=on   (current)", Box::new(|b| b)),
             (
                 "dict=off stats=on",
@@ -575,6 +588,11 @@ mod tests {
     /// file byte-for-byte identical to having set nothing at all. Asserting on the
     /// resulting column metadata is the only way that mistake shows up.
     #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "iter_id ranges over 0..64 in this test, far below the point where u64->f64/f32 \
+                  casts would lose precision"
+    )]
     fn slot_columns_drop_the_encodings_nothing_reads() {
         use crate::timing::kernels::SingleGemmKernelInput;
 

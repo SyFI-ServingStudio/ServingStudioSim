@@ -487,11 +487,11 @@ mod tests {
             assert_eq!(payload.fields()["dtype"], Value::from("bf16"));
         }
 
-        let qwen = &payloads[1 * 4 + 3];
+        let qwen = &payloads[4 + 3];
         assert_eq!(qwen.fields()["num_tokens"], Value::from(128));
         assert_eq!(qwen.fields()["num_chunks"], Value::from(2));
         assert_eq!(
-            payloads[1 * 4..2 * 4]
+            payloads[4..2 * 4]
                 .iter()
                 .map(|payload| payload.fields()["num_tokens"].as_u64().unwrap())
                 .collect::<Vec<_>>(),
@@ -506,10 +506,10 @@ mod tests {
             vec![75, 248, 422, 768]
         );
         assert!(c12_payloads.iter().all(|payload| {
-            payload.fields()["num_chunks"] == Value::from(12)
-                && payload.fields()["max_chunk_tokens"] == Value::from(64)
-                && payload.fields()["num_heads"] == Value::from(32)
-                && payload.fields()["dtype"] == Value::from("bf16")
+            payload.fields()["num_chunks"] == 12
+                && payload.fields()["max_chunk_tokens"] == 64
+                && payload.fields()["num_heads"] == 32
+                && payload.fields()["dtype"] == "bf16"
         }));
         let c17_payloads = &payloads[6 * 4..7 * 4];
         assert_eq!(
@@ -520,10 +520,10 @@ mod tests {
             vec![80, 332, 584, 1088]
         );
         assert!(c17_payloads.iter().all(|payload| {
-            payload.fields()["num_chunks"] == Value::from(17)
-                && payload.fields()["max_chunk_tokens"] == Value::from(64)
-                && payload.fields()["num_heads"] == Value::from(32)
-                && payload.fields()["dtype"] == Value::from("bf16")
+            payload.fields()["num_chunks"] == 17
+                && payload.fields()["max_chunk_tokens"] == 64
+                && payload.fields()["num_heads"] == 32
+                && payload.fields()["dtype"] == "bf16"
         }));
         let maximum = &payloads[19 * 4 + 3];
         assert_eq!(maximum.fields()["num_tokens"], Value::from(262_144));

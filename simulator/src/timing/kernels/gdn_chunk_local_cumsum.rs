@@ -277,7 +277,19 @@ mod tests {
         assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 112);
         for (chunk_index, &num_chunks) in grid.axes()[0].iter().enumerate() {
             for (density_index, &tokens_per_chunk) in grid.axes()[1].iter().enumerate() {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "num_chunks is a non-negative Axis sweep coordinate from config(), \
+                              bounded well under u64 range"
+                )]
                 let num_chunks = num_chunks as u64;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "tokens_per_chunk is a non-negative Axis sweep coordinate from config(), \
+                              bounded well under u64 range"
+                )]
                 let tokens_per_chunk = tokens_per_chunk as u64;
                 let expected = num_chunks.checked_mul(tokens_per_chunk).unwrap() > MAX_TOKENS;
                 assert_eq!(
@@ -342,7 +354,7 @@ mod tests {
 
         assert_eq!(payloads[0].fields()["num_tokens"], Value::from(1_u32));
         assert_eq!(payloads[0].fields()["num_chunks"], Value::from(1_u32));
-        let qwen_index = 1 * 7 + 6;
+        let qwen_index = 7 + 6;
         assert_eq!(
             payloads[qwen_index].fields()["num_tokens"],
             Value::from(128_u32)
@@ -385,13 +397,12 @@ mod tests {
         let new_rows = payloads
             .iter()
             .zip(&mask)
-            .filter_map(|(payload, &masked)| {
-                (!masked).then(|| {
-                    (
-                        payload.fields()["num_tokens"].as_u64().unwrap(),
-                        payload.fields()["num_chunks"].as_u64().unwrap(),
-                    )
-                })
+            .filter(|&(_payload, &masked)| !masked)
+            .map(|(payload, &_masked)| {
+                (
+                    payload.fields()["num_tokens"].as_u64().unwrap(),
+                    payload.fields()["num_chunks"].as_u64().unwrap(),
+                )
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(new_rows.len(), 112);

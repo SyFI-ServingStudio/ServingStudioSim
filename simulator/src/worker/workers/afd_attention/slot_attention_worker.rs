@@ -250,10 +250,18 @@ mod tests {
                 bytes: 64,
             });
             for step in 0..20 {
-                worker.tick(Time::from_ms((layer as u64 * 20 + step) as f64), events);
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "layer/step are small test loop counters, far under f64's exact integer range"
+                )]
+                worker.tick(Time::from_ms((u64::from(layer) * 20 + step) as f64), events);
             }
             worker.enqueue(AttnWorkerMsg::SlotFlushed { slot, layer });
-            worker.tick(Time::from_ms((layer as u64 * 20 + 20) as f64), events);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "layer is a small test loop counter, far under f64's exact integer range"
+            )]
+            worker.tick(Time::from_ms((u64::from(layer) * 20 + 20) as f64), events);
         }
     }
 
@@ -278,6 +286,10 @@ mod tests {
         let mut events = Vec::new();
         worker.tick(Time::ZERO, &mut events);
         assert_eq!(worker.pipeline.current_kv(RequestId(0)), None);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "request_slot is a small attention-pipeline slot index, far under u8::MAX"
+        )]
         let slot = worker.pipeline.request_slot(RequestId(0)).unwrap() as u8;
 
         run_iteration(&mut worker, slot, sender_group_id, &mut events);

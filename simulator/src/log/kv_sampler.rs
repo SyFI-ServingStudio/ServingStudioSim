@@ -333,10 +333,15 @@ mod tests {
                 .iter()
                 .enumerate()
         {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "submit_index enumerates a fixed 5-element test array, far too small for usize->f64 to lose precision"
+            )]
+            let submit_time_ms = submit_index as f64;
             kv.submit(
                 0,
                 sub(*active_kv, *retained_prefix_kv),
-                Time::from_ms(submit_index as f64),
+                Time::from_ms(submit_time_ms),
             );
         }
         kv.flush_all().unwrap();

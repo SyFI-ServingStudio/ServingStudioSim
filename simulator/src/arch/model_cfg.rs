@@ -94,6 +94,7 @@ fn parse_dtype(s: &str) -> Result<DType> {
 #[cfg(test)]
 impl ModelCfg {
     /// Llama3-8B dense preset (bf16).
+    #[must_use]
     pub fn llama3_8b() -> Self {
         Self {
             hidden: Dim::param("hidden", 4096),

@@ -636,7 +636,7 @@ mod tests {
     /// `for_each_routed_token` is the bit-identical routing core every comm
     /// stage prices against. Two runs with the same seed must produce the same
     /// per-token hit sets, and each token must flag exactly its distinct hit
-    /// ranks/domains (≤ top_k ranks, each in its domain).
+    /// ranks/domains (≤ `top_k` ranks, each in its domain).
     #[test]
     fn for_each_routed_token_is_deterministic_and_consistent() {
         let dist = RoutingDistribution::power_law(64, 1.0);

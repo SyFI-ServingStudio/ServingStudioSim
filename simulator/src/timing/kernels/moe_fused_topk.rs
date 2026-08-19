@@ -164,6 +164,10 @@ mod tests {
         assert!(MoeFusedTopkSpec::infeasible_mask(&cfg, &grid).is_empty());
 
         let payloads = MoeFusedTopkSpec::enumerate(&cfg, &grid, "vllm_cuda");
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_tokens values come from the sweep grid capped at 262144, far below u32::MAX"
+        )]
         let tokens: HashSet<u32> = payloads
             .iter()
             .map(|payload| payload.fields()["num_tokens"].as_u64().unwrap() as u32)
@@ -211,7 +215,7 @@ mod tests {
 
         let qwen = MoeFusedTopkSpec::enumerate(&cfg, &grid, "vllm_cuda")
             .into_iter()
-            .find(|payload| payload.fields()["num_tokens"] == Value::from(128_u32))
+            .find(|payload| payload.fields()["num_tokens"] == 128_u32)
             .unwrap();
         assert_eq!(
             qwen.fields(),

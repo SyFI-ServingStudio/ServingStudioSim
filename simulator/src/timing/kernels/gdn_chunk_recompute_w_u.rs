@@ -276,6 +276,12 @@ mod tests {
         assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 112);
         for (chunk_index, &chunks) in grid.axes()[0].iter().enumerate() {
             for (density_index, &density) in grid.axes()[1].iter().enumerate() {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "chunks/density are non-negative sweep-grid axis values bounded by \
+                              MAX_TOKENS (262_144), far under u64::MAX"
+                )]
                 let product = (chunks as u64).checked_mul(density as u64).unwrap();
                 assert_eq!(
                     mask[chunk_index * density_count + density_index],
@@ -337,7 +343,7 @@ mod tests {
         }
         assert_eq!(feasible_rows.len(), 112);
 
-        let qwen = &payloads[1 * 7 + 6];
+        let qwen = &payloads[7 + 6];
         assert_eq!(qwen.fields()["num_tokens"], Value::from(128_u32));
         assert_eq!(qwen.fields()["num_chunks"], Value::from(2_u32));
         assert_eq!(qwen.fields()["num_key_heads"], Value::from(16_u32));

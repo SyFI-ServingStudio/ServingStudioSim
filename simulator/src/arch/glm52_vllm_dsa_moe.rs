@@ -2422,6 +2422,11 @@ mod tests {
             expected_slot_count(8, true, Glm52MtpMode::IndexShare),
             1_368 + 216 + 20 + 4 * 2
         );
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "ep is looped from the fixed array [1,2,4,8,16] converted to usize then back \
+                      to u16; always far under u16::MAX"
+        )]
         for ep in [1_u16, 2, 4, 8, 16] {
             let ep = usize::from(ep);
             // The `+ 15` / `+ 20` are the rank-independent collectives: each
@@ -2516,12 +2521,11 @@ mod tests {
                 .nodes
                 .iter()
                 .zip(&manifest.node_labels)
-                .filter_map(|(node, label)| {
-                    matches!(node, FlatCostNode::Max { .. }).then(|| {
-                        label
-                            .as_deref()
-                            .expect("every GLM L4 Max must have a manifest label")
-                    })
+                .filter(|&(node, _label)| matches!(node, FlatCostNode::Max { .. }))
+                .map(|(_node, label)| {
+                    label
+                        .as_deref()
+                        .expect("every GLM L4 Max must have a manifest label")
                 })
                 .collect();
             assert_eq!(expected_slot_count(8, false, mode), expected_slots);
@@ -2660,6 +2664,10 @@ mod tests {
     }
 
     fn group(prefill_tokens: u32, decode_lens: Vec<u32>, pairs: Vec<(u32, u32)>) -> ArchGroupInput {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "decode_lens is a small hardcoded test-fixture vector, far under u32::MAX entries"
+        )]
         let decode_tokens = decode_lens.len() as u32;
         ArchGroupInput {
             batch_tokens: prefill_tokens + decode_tokens,

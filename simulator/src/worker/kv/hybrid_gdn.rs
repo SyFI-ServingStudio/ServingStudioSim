@@ -703,6 +703,10 @@ mod tests {
         let interval = 2_048u64;
         // Room for exactly two snapshots' worth of both halves, plus change.
         let capacity = 2 * (interval + STATE_TOKENS) + 500;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "interval is a fixed test checkpoint interval (2_048), far under u32::MAX"
+        )]
         let mut kv_store = store(capacity, STATE_TOKENS, interval as u32);
 
         // Ask to retain five intervals; only two fit, and the entry is cut at a
@@ -720,7 +724,12 @@ mod tests {
         kv_store.prefix_caches[0].shrink_to(0);
         assert_eq!(kv_store.prefix_caches[0].used_tokens(), 0);
         assert_eq!(kv_store.prefix_caches[0].used_charge(), 0);
-        assert_eq!(kv_store.prefix_caches[0].peek(7, 5 * interval as u32), 0);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "interval is a fixed test checkpoint interval (2_048); 5 * interval is far under u32::MAX"
+        )]
+        let peeked_len = 5 * interval as u32;
+        assert_eq!(kv_store.prefix_caches[0].peek(7, peeked_len), 0);
     }
 
     #[test]

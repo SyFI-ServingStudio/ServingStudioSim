@@ -419,7 +419,12 @@ mod tests {
 
         fn eval(&self, input: &Self::Input) -> LeafMetrics {
             let mut metrics = LeafMetrics::ZERO;
-            metrics.m.time_ms = input.num_tokens as f32;
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "num_tokens is a test token count (at most 128), far under f32's 24-bit exact integer range"
+            )]
+            let time_ms = input.num_tokens as f32;
+            metrics.m.time_ms = time_ms;
             metrics
         }
 
@@ -448,7 +453,12 @@ mod tests {
             let mut inputs = Vec::new();
             let mut evaluator = Evaluator::with_inputs(&mut metrics, &mut inputs);
             eval_align_or_zero(&align, work.align, work.run_alignment, &mut evaluator);
-            assert_eq!(metrics[0].m.time_ms, tokens as f32);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "tokens is a test token count (9 or 128), far under f32's 24-bit exact integer range"
+            )]
+            let expected_time_ms = tokens as f32;
+            assert_eq!(metrics[0].m.time_ms, expected_time_ms);
             assert_eq!(
                 serde_json::to_value(inputs).unwrap(),
                 serde_json::json!([{"num_tokens": tokens}])

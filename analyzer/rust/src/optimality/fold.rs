@@ -443,6 +443,30 @@ fn current_point_uses_compute_throughput(
     current_arithmetic_intensity_flops_per_byte >= hardware_ridge_flops_per_byte
 }
 
+fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    col(batch, name)?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow!("`{name}` is not a Utf8 array"))
+}
+
+/// Downcast a cost_log `List<f32>` column to `(list_offsets, flat_values)`.
+fn list_f32_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<(&'a [i32], &'a Float32Array)> {
+    let list = col(batch, name)?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("`{name}` is not a List array"))?;
+    let vals = list
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| anyhow!("`{name}` is not List<f32>"))?;
+    Ok((list.value_offsets(), vals))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -478,28 +502,4 @@ mod tests {
             7.0
         );
     }
-}
-
-fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
-    col(batch, name)?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| anyhow!("`{name}` is not a Utf8 array"))
-}
-
-/// Downcast a cost_log `List<f32>` column to `(list_offsets, flat_values)`.
-fn list_f32_column<'a>(
-    batch: &'a RecordBatch,
-    name: &str,
-) -> Result<(&'a [i32], &'a Float32Array)> {
-    let list = col(batch, name)?
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| anyhow!("`{name}` is not a List array"))?;
-    let vals = list
-        .values()
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| anyhow!("`{name}` is not List<f32>"))?;
-    Ok((list.value_offsets(), vals))
 }

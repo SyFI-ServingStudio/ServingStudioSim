@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "VibeSim post-sim analyzer — DataFusion parquet scan → report + plot-payload JSON"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "analyze"
 path = "src/main.rs"

@@ -249,9 +249,16 @@ mod tests {
         assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 144);
         for (batch_index, &batch) in grid.axes()[0].iter().enumerate() {
             for (length_index, &sequence_length) in sequence_axis.iter().enumerate() {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "batch,sequence_length are non-negative Axis sweep coordinates from \
+                              config(), bounded well under u64 range"
+                )]
+                let expected_masked = (batch as u64) * (sequence_length as u64) > MAX_TOTAL_TOKENS;
                 assert_eq!(
                     mask[batch_index * sequence_axis.len() + length_index],
-                    (batch as u64) * (sequence_length as u64) > MAX_TOTAL_TOKENS,
+                    expected_masked,
                     "B={batch} L={sequence_length}"
                 );
             }
@@ -318,8 +325,15 @@ mod tests {
         let grid = GdnCausalConvPrefillSpec::sweep_grid(&cfg);
         let mask = GdnCausalConvPrefillSpec::infeasible_mask(&cfg, &grid);
         let payloads = GdnCausalConvPrefillSpec::enumerate(&cfg, &grid, "vllm_triton");
-        let cache_cells =
-            grid.expand_2d(|batch, sequence_length| (batch as u64, sequence_length as u64));
+        let cache_cells = grid.expand_2d(|batch, sequence_length| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "batch,sequence_length are non-negative Axis sweep coordinates from config(), \
+                          bounded well under u64 range"
+            )]
+            (batch as u64, sequence_length as u64)
+        });
         let mut feasible = BTreeSet::new();
 
         for ((payload, &masked), &(batch, sequence_length)) in

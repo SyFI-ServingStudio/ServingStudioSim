@@ -277,6 +277,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "grid axis values are chunk/token-per-chunk counts (bounded by the sweep grid's \
+                  own pow2 axes), well within u64's exact range and always non-negative"
+    )]
     fn mask_is_exactly_the_checked_checkpoint_token_cap() {
         let grid = GdnChunkScaledDotKktSpec::sweep_grid(&config());
         let mask = GdnChunkScaledDotKktSpec::infeasible_mask(&config(), &grid);
@@ -320,6 +326,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "chunks/density here come from Axis::pow2(0, 18) and Axis::pow2(0, 6), so the \
+                  f64 values are exact powers of two well within u64's exact range and always \
+                  non-negative"
+    )]
     fn enumerate_maps_cache_cells_to_exact_physical_python_payloads() {
         let cfg = config();
         let grid = GdnChunkScaledDotKktSpec::sweep_grid(&cfg);
@@ -399,7 +412,7 @@ mod tests {
             );
         }
 
-        let qwen_index = 1 * 7 + 6;
+        let qwen_index = 7 + 6;
         assert_eq!(
             payloads[qwen_index].fields()["num_tokens"],
             Value::from(128_u32)

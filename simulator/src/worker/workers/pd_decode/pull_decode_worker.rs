@@ -541,6 +541,10 @@ mod tests {
         worker.enqueue(PdDecodeMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..50u64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             worker.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(
@@ -565,6 +569,10 @@ mod tests {
         }
         let mut events = Vec::new();
         for step in 0..200u64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             worker.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(events.len(), 3);
@@ -610,6 +618,10 @@ mod tests {
         worker.enqueue(PdDecodeMsg::Request(RequestId(1)));
         let mut events = Vec::new();
         for step in 0..10u64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             worker.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(
@@ -712,6 +724,10 @@ mod tests {
         }
         let mut events = Vec::new();
         for step in 0..200u64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             worker.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(events.len(), 4);

@@ -1134,10 +1134,10 @@ mod tests {
         for mutate in [
             |v: &mut serde_json::Value| v["text_config"]["hidden_size"] = 4096.into(),
             |v: &mut serde_json::Value| {
-                v["text_config"]["layer_types"][3] = "linear_attention".into()
+                v["text_config"]["layer_types"][3] = "linear_attention".into();
             },
             |v: &mut serde_json::Value| {
-                v["quantization_config"]["weight_block_size"] = serde_json::json!([64, 128])
+                v["quantization_config"]["weight_block_size"] = serde_json::json!([64, 128]);
             },
             |v: &mut serde_json::Value| v["tie_word_embeddings"] = true.into(),
         ] {
@@ -1404,6 +1404,10 @@ mod tests {
 
     fn unified(prefill: Vec<(u32, u32)>, decode: Vec<u32>) -> UnifiedArchInput {
         let prefill_tokens = prefill.iter().map(|x| x.1).sum();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "decode is a test-fixture Vec built from a handful of literal kv lengths, its length is nowhere near u32::MAX"
+        )]
         let decode_tokens = decode.len() as u32;
         // Mirrors UnifiedIterExecution and PredictGroup lowering: total_kv_len
         // is the decode-member aggregate; prefill state stays in the pairs.

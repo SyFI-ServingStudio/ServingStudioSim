@@ -982,8 +982,7 @@ fn prediction_discovery_skips_duplicate_ids_and_ignores_old_logs() {
 fn prediction_discovery_skips_noncanonical_resource_ids() {
     let temporary = TempDir::new().expect("temporary logs root");
     make_prediction(&temporary.path().join("empty"), "p_");
-    let valid = make_prediction(&temporary.path().join("valid"), "p_valid");
-    let _ = valid;
+    make_prediction(&temporary.path().join("valid"), "p_valid");
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
     // A non-canonical id ("p_") is skipped, not fatal; the valid one is kept.

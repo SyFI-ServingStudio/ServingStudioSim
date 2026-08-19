@@ -303,7 +303,7 @@ mod tests {
         }));
         let mut events = Vec::new();
         for step in 0..10 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
         assert_eq!(
             events,
@@ -341,7 +341,7 @@ mod tests {
         }));
         let mut events = Vec::new();
         for step in 0..10 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
         let store = store.borrow();
         assert!(store[RequestId(0)].lifecycle.completed);

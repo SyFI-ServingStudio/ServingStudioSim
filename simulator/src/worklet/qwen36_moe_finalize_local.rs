@@ -238,6 +238,10 @@ mod tests {
         // this complete EP1 fixture has the required exact million total.
         let mut ppm = uniform_local_ppm(NUM_EXPERTS, 1);
         let sum: u32 = ppm.iter().sum();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "TOTAL_PPM is a fixed 1,000,000 constant, well within u32::MAX"
+        )]
         let remainder = (TOTAL_PPM as u32) - sum;
         for expert_ppm in ppm.iter_mut().take(remainder as usize) {
             *expert_ppm += 1;

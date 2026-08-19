@@ -104,7 +104,7 @@ mod tests {
         worker.enqueue(PdPrefillMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..20 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
         assert_eq!(
             events,
@@ -143,7 +143,7 @@ mod tests {
         worker.enqueue(PdPrefillMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..20 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
 
         assert_eq!(
@@ -196,7 +196,7 @@ mod tests {
 
         worker.enqueue(PdPrefillMsg::Request(RequestId(0)));
         for step in 0..20 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
         worker.enqueue(PdPrefillMsg::ReleaseKv {
             req: RequestId(0),
@@ -204,7 +204,7 @@ mod tests {
         });
         worker.enqueue(PdPrefillMsg::Request(RequestId(1)));
         for step in 20..40 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
 
         assert_eq!(
@@ -313,7 +313,7 @@ mod tests {
         worker.enqueue(PdPrefillMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..20 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
         assert_eq!(
             events,

@@ -1244,6 +1244,10 @@ mod tests {
             batch_id,
             operation_id,
             section_id: 0,
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "operation_id in these test fixtures is a small synthetic index, well within i16 range"
+            )]
             layer: operation_id as i16,
             start_ms,
             end_ms,

@@ -445,7 +445,7 @@ mod tests {
         let mut partition = ResidentPartitionState::new(100_000, 0);
         partition.begin_decode(request_id(1), 4_100, 10);
         partition.begin_decode(request_id(2), 2_047, 10);
-        assert_eq!(partition.live_checkpoint_count(2_048), 2 + 0);
+        assert_eq!(partition.live_checkpoint_count(2_048), 2);
         partition.advance_decodes();
         assert_eq!(partition.live_checkpoint_count(2_048), 2 + 1);
         assert_eq!(partition.live_checkpoint_count(0), 0);

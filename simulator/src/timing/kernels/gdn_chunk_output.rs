@@ -242,7 +242,7 @@ mod tests {
                 let chunks = fields["num_chunks"].as_u64().unwrap();
                 assert!(matches!(tokens / chunks, 1 | 64));
                 assert_eq!(tokens % chunks, 0);
-                assert!((tokens + 63) / 64 <= chunks && chunks <= tokens);
+                assert!(tokens.div_ceil(64) <= chunks && chunks <= tokens);
                 assert_eq!(fields["backend"], Value::from(backend));
                 assert_eq!(fields["num_key_heads"], Value::from(16));
                 assert_eq!(fields["num_heads"], Value::from(32));

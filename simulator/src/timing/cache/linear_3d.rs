@@ -371,7 +371,9 @@ mod tests {
     #[test]
     fn dropped_corner_zero_weight_and_convex_renormalization_match_safe_policy() {
         let grid = SweepGrid::new(vec![vec![0.0, 1.0]; 3]);
-        let mut samples = (0..8).map(|index| sample(index as f64)).collect::<Vec<_>>();
+        let mut samples = (0..8)
+            .map(|index| sample(f64::from(index)))
+            .collect::<Vec<_>>();
         samples[7] = nan_sample();
         let (cache, warnings) = Cache3DLinear::from_samples(&grid, &samples);
         let exact = cache.eval(&[0.0; 3]);
@@ -389,7 +391,7 @@ mod tests {
     fn multiple_drops_dropped_face_and_nearest_fallback_are_deterministic() {
         let grid = SweepGrid::new(vec![vec![0.0, 1.0]; 3]);
         let mut samples = (0..8)
-            .map(|index| sample(index as f64 + 1.0))
+            .map(|index| sample(f64::from(index) + 1.0))
             .collect::<Vec<_>>();
         for sample in &mut samples[..4] {
             *sample = nan_sample();

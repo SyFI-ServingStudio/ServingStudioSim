@@ -699,6 +699,10 @@ mod tests {
         let mut tasks = Vec::new();
         for s in 0..40u64 {
             let mut events = Vec::new();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "t0 + s is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             p.tick_collect(Time::from_ms((t0 + s) as f64), &mut events);
             p.aggregate(&events, &mut tasks);
         }
@@ -721,6 +725,10 @@ mod tests {
         assert!(t.pull_sources.is_empty(), "bootstrap input is local");
         assert!(p.slots[0].in_flight);
         for slot in 1..NUM_SLOTS {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "slot is a NUM_SLOTS (3) loop index, far under u8::MAX"
+            )]
             let t = task_for_slot(&tasks, slot as u8);
             assert!(matches!(t.kind, FfnTaskKind::Bootstrap));
             assert!(t.reqs.is_empty(), "empty slot {slot} is a no-op Bootstrap");
@@ -745,10 +753,12 @@ mod tests {
         assert_eq!(got, vec![RequestId(0), RequestId(1)]);
         assert!(p.slots[0].in_flight);
         for slot in 1..NUM_SLOTS {
-            assert!(
-                task_for_slot(&tasks, slot as u8).reqs.is_empty(),
-                "slot {slot} has only empty start reports"
-            );
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "slot is a NUM_SLOTS (3) loop index, far under u8::MAX"
+            )]
+            let is_empty = task_for_slot(&tasks, slot as u8).reqs.is_empty();
+            assert!(is_empty, "slot {slot} has only empty start reports");
         }
     }
 

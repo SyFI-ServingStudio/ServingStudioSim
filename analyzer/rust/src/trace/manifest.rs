@@ -326,6 +326,10 @@ mod tests {
         // Mean-fold value: 0.5·t0 + 0.5·t1 + 3·t2 (mean over the Max pair), whereas
         // node_time takes the Max (straggler) → max(t0,t1) + 3·t2.
         let slot_ns = [10i64, 20, 5];
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "slot_ns is a hardcoded 3-element test fixture with values in the tens, far below f64's exact-integer range"
+        )]
         let mean: f64 = (0..3).map(|i| alpha[i] * slot_ns[i] as f64).sum();
         assert_eq!(mean, 0.5 * 10.0 + 0.5 * 20.0 + 3.0 * 5.0); // 30.0
         assert_eq!(node_time(&m, 0, &slot_ns), 20 + 3 * 5); // 35 (max branch)

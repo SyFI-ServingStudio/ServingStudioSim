@@ -278,7 +278,12 @@ mod tests {
     ) -> Vec<WorkerEventCommon> {
         let mut events = Vec::new();
         for step in 0..max_steps {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a bounded loop counter from a small test-only max_steps bound, far below f64's exact-integer range"
+            )]
+            let step_ms = step as f64;
+            worker.tick(Time::from_ms(step_ms), &mut events);
         }
         events
     }
@@ -393,7 +398,7 @@ mod tests {
 
         worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
         for step in 0..100 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
         assert_eq!(
             store.borrow()[RequestId(0)]
@@ -412,7 +417,7 @@ mod tests {
 
         worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
         for step in 100..200 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
         assert_eq!(
             store.borrow()[RequestId(1)]
@@ -454,11 +459,11 @@ mod tests {
 
         worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
         for step in 0..100 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
         worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
         for step in 100..200 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
 
         assert_eq!(
@@ -563,7 +568,7 @@ mod tests {
         worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
         let mut events = Vec::new();
         for step in 0..20 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
 
         let first_partition = worker.kv_store.decode_members(0).count();
@@ -635,7 +640,7 @@ mod tests {
         let mut completed = Vec::new();
         let mut events = Vec::new();
         for step in 0..500 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
             for event in events.drain(..) {
                 let WorkerEventCommon::RequestComplete { req, .. } = event;
                 completed.push(req);

@@ -124,7 +124,12 @@ mod tests {
         let input = P2pInterKernelInput {
             message_size_bytes: 1 << 20,
         };
-        assert_eq!(&*input.coords(), &[(1u64 << 20) as f64]);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "1u64 << 20 is a fixed test message size, far under f64's exact integer range"
+        )]
+        let expected = (1u64 << 20) as f64;
+        assert_eq!(&*input.coords(), &[expected]);
     }
 
     #[test]
@@ -133,7 +138,12 @@ mod tests {
         assert_eq!(grid.axes().len(), 1);
         assert_eq!(grid.axes()[0].len(), 19);
         assert_eq!(grid.axes()[0].first().copied(), Some(1024.0));
-        assert_eq!(grid.axes()[0].last().copied(), Some((1u64 << 28) as f64));
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "1u64 << 28 is a fixed test message size, far under f64's exact integer range"
+        )]
+        let expected_last = (1u64 << 28) as f64;
+        assert_eq!(grid.axes()[0].last().copied(), Some(expected_last));
         assert!(matches!(
             P2pInterSpec::cache_kind("nccl"),
             CacheKind::Cache1DLinear

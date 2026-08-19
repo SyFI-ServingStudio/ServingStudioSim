@@ -1248,10 +1248,10 @@ mod tests {
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.index_cache_dtype = DType::Bf16,
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.selected_k = 1024,
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| {
-                cfg.sparse_mla_cache_format = "fp8".to_string()
+                cfg.sparse_mla_cache_format = "fp8".to_string();
             },
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| {
-                cfg.sparse_index_distribution = "unknown".to_string()
+                cfg.sparse_index_distribution = "unknown".to_string();
             },
         ] {
             let mut config = cfg(true, 1);

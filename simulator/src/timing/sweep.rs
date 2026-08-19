@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn expand_generic_matches_n_d_cartesian() {
         let grid = SweepGrid::new(vec![vec![1.0, 2.0], vec![10.0, 20.0]]);
-        let out: Vec<Vec<f64>> = grid.expand(|coords| coords.to_vec());
+        let out: Vec<Vec<f64>> = grid.expand(<[f64]>::to_vec);
         assert_eq!(
             out,
             vec![

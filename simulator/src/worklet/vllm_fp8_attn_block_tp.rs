@@ -379,6 +379,10 @@ impl VllmFp8AttnBlockTpWorklet {
     }
 }
 
+fn use_fused_allreduce(num_tokens: u32, max_fused_tokens: Option<u32>) -> bool {
+    max_fused_tokens.is_some_and(|maximum| num_tokens > 0 && num_tokens <= maximum)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,8 +417,4 @@ mod tests {
         assert!(resolved.tp_ar_fallback_norm.is_some());
         assert_eq!(resolved.max_fused_tokens, Some(256));
     }
-}
-
-fn use_fused_allreduce(num_tokens: u32, max_fused_tokens: Option<u32>) -> bool {
-    max_fused_tokens.is_some_and(|maximum| num_tokens > 0 && num_tokens <= maximum)
 }

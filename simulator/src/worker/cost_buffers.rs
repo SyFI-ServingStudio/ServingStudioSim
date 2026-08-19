@@ -437,10 +437,15 @@ mod tests {
 
     /// One decode-only attention group with the given per-request KV lengths.
     fn grp(kv: &[u32]) -> ArchGroupInput {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "kv is a test fixture with a handful of KV lengths, far under u32::MAX"
+        )]
+        let num_tokens = kv.len() as u32;
         ArchGroupInput {
-            batch_tokens: kv.len() as u32,
+            batch_tokens: num_tokens,
             prefill_tokens: 0,
-            decode_tokens: kv.len() as u32,
+            decode_tokens: num_tokens,
             prefill_chunk_pairs: Vec::new(),
             decode_kv_lens: kv.to_vec(),
             total_kv_len: kv.iter().sum(),

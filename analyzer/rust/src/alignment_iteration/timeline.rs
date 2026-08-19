@@ -1220,6 +1220,10 @@ mod tests {
     #[test]
     fn at_most_max_iterations_are_distinguished_however_many_groups_there_are() {
         // One group per iteration, so every one of them is a candidate median.
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "index is a synthetic iteration id bounded by MAX_ITERATIONS+10 (~42), far too small for u64->f64 to lose precision"
+        )]
         let summaries: Vec<_> = (0..MAX_ITERATIONS as u64 + 10)
             .map(|index| {
                 summary(

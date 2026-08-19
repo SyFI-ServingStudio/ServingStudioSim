@@ -436,7 +436,7 @@ impl Drop for BackendOverrideGuard<'_> {
 impl PerfApiBridge {
     /// Test-only constructor that skips the Python `disable_jit_profiling` init
     /// (which imports `profiling.perf_api`). Lets the backend-override unit tests
-    /// exercise pure bridge state with no live perf_api / GIL.
+    /// exercise pure bridge state with no live `perf_api` / GIL.
     pub(crate) fn new_uninit_for_test() -> Self {
         Self {
             dry_run: RefCell::new(None),
@@ -632,7 +632,10 @@ mod tests {
             .map(|(role, backends)| {
                 (
                     role.to_string(),
-                    backends.iter().map(|b| b.to_string()).collect(),
+                    backends
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
                 )
             })
             .collect()

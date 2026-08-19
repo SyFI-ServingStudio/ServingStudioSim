@@ -368,9 +368,18 @@ mod tests {
         assert_contiguous(&causal.axes()[1], &[2047, 2048, 2049]);
 
         let speculative = DsaSparseMlaAttentionSpec::sweep_grid(&config("speculative_pairs"));
-        assert!(speculative.axes()[0]
-            .iter()
-            .all(|query| *query as u32 % 2 == 0));
+        {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "query axis values are token counts up to 65_536 for this pattern, well \
+                          within u32's exact range and always non-negative"
+            )]
+            let is_even_query = speculative.axes()[0]
+                .iter()
+                .all(|query| (*query as u32).is_multiple_of(2));
+            assert!(is_even_query);
+        }
         assert_contiguous(&speculative.axes()[0], &[128, 132, 134]);
         assert_contiguous(&speculative.axes()[0], &[256, 264, 266]);
         assert_contiguous(&speculative.axes()[1], &[16, 23, 32, 45, 63]);
@@ -499,6 +508,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "grid axis values are query/cache token counts (max 1_048_576 for this config), \
+                  well within u32's exact range and always non-negative"
+    )]
     fn enumeration_emits_backend_plus_the_exact_python_schema() {
         for (pattern, expected_payloads) in [
             ("uniform_full", 810),

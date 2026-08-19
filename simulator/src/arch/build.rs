@@ -1356,9 +1356,9 @@ mod tests {
     #[test]
     fn afd_comm_bytes_match_moesim_formulas() {
         let model = MoeModelCfg::qwen3_235b();
-        let bpe = model.dtype.size_bytes() as u64;
-        let q_dim = model.num_qo_heads.get() as u64 * model.head_dim.get() as u64;
-        let kv_dim = model.num_kv_heads.get() as u64 * model.head_dim.get() as u64;
+        let bpe = u64::from(model.dtype.size_bytes());
+        let q_dim = u64::from(model.num_qo_heads.get()) * u64::from(model.head_dim.get());
+        let kv_dim = u64::from(model.num_kv_heads.get()) * u64::from(model.head_dim.get());
 
         let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
             &model,
@@ -1369,16 +1369,16 @@ mod tests {
         );
         // attn→ffn outgoing bytes: the attention output, q_dim·bpe.
         assert_eq!(
-            attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64,
+            u64::from(attn_cfgs.attn_to_ffn_bytes_per_token.get()),
             q_dim * bpe
         );
         // total KV bytes: 2 (k+v) × kv_heads × head_dim × kv_dtype × layers.
         assert_eq!(
-            attn_cfgs.total_kv_bytes_per_token.get() as u64,
-            2 * model.num_kv_heads.get() as u64
-                * model.head_dim.get() as u64
-                * model.kv_dtype.size_bytes() as u64
-                * model.num_layers as u64
+            u64::from(attn_cfgs.total_kv_bytes_per_token.get()),
+            2 * u64::from(model.num_kv_heads.get())
+                * u64::from(model.head_dim.get())
+                * u64::from(model.kv_dtype.size_bytes())
+                * u64::from(model.num_layers)
         );
         // ffn→attn outgoing bytes (QKV projection) is the symmetric `(q+2kv)·bpe`,
         // computed in `qwen3_ffn_moe_layerwise::build` from the same model dims.
@@ -1386,7 +1386,7 @@ mod tests {
     }
 
     /// FP8 AFD end-to-end config wiring: every GEMM/handoff/KV role goes fp8
-    /// (`bpe = 1`, `deepgemm` backend, `compute_dtype = Fp8E4m3`) while the RMSNorm
+    /// (`bpe = 1`, `deepgemm` backend, `compute_dtype = Fp8E4m3`) while the `RMSNorm`
     /// ops and the model's base `dtype` stay bf16 (`bpe = 2`). Mirrors ref's
     /// `bytes_per_element(p.fp8)` — the attn↔ffn handoffs and KV cache are all
     /// 1 byte/elem in fp8.
@@ -1403,8 +1403,8 @@ mod tests {
         assert_eq!(model.single_gemm_backends(), vec!["deepgemm"]);
         assert_eq!(model.grouped_gemm_backends(), vec!["deepgemm"]);
 
-        let q_dim = model.num_qo_heads.get() as u64 * model.head_dim.get() as u64;
-        let kv_dim = model.num_kv_heads.get() as u64 * model.head_dim.get() as u64;
+        let q_dim = u64::from(model.num_qo_heads.get()) * u64::from(model.head_dim.get());
+        let kv_dim = u64::from(model.num_kv_heads.get()) * u64::from(model.head_dim.get());
 
         // --- attn side ---
         let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
@@ -1416,15 +1416,13 @@ mod tests {
         );
         // Handoff + KV at fp8 = 1 byte/elem.
         assert_eq!(
-            attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64,
-            q_dim * 1
+            u64::from(attn_cfgs.attn_to_ffn_bytes_per_token.get()),
+            q_dim
         );
         assert_eq!(
-            attn_cfgs.total_kv_bytes_per_token.get() as u64,
-            2 * model.num_kv_heads.get() as u64
-                * model.head_dim.get() as u64
-                * 1
-                * model.num_layers as u64
+            u64::from(attn_cfgs.total_kv_bytes_per_token.get()),
+            (2 * u64::from(model.num_kv_heads.get()) * u64::from(model.head_dim.get()))
+                * u64::from(model.num_layers)
         );
         assert_eq!(attn_cfgs.attn.dtype, DType::Bf16);
         assert!(attn_cfgs.attn.fp8);
@@ -1445,8 +1443,8 @@ mod tests {
         let ffn_resolved = crate::arch::qwen3_fp8_ffn_moe_layerwise::resolve_configs(&ffn_cfgs);
         // Symmetric QKV-projection handoff at fp8.
         assert_eq!(
-            ffn_cfgs.ffn_to_attn_bytes_per_token.get() as u64,
-            (q_dim + 2 * kv_dim) * 1
+            u64::from(ffn_cfgs.ffn_to_attn_bytes_per_token.get()),
+            (q_dim + 2 * kv_dim)
         );
         // GEMM roles fp8+deepgemm; RMSNorm roles stay bf16.
         assert_eq!(ffn_cfgs.pre_attn.activation_dtype, DType::Bf16);
@@ -1479,7 +1477,7 @@ mod tests {
         assert_eq!(model.single_gemm_backends(), vec!["torch", "torch_linear"]);
         assert_eq!(model.grouped_gemm_backends(), vec!["torch"]);
 
-        let q_dim = model.num_qo_heads.get() as u64 * model.head_dim.get() as u64;
+        let q_dim = u64::from(model.num_qo_heads.get()) * u64::from(model.head_dim.get());
         let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
             &model,
             &Qwen3AttnParallel {
@@ -1488,7 +1486,7 @@ mod tests {
             },
         );
         assert_eq!(
-            attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64,
+            u64::from(attn_cfgs.attn_to_ffn_bytes_per_token.get()),
             q_dim * 2
         );
         assert!(!attn_cfgs.attn.fp8);

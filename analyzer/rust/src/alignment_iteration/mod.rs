@@ -2607,10 +2607,10 @@ mod tests {
         assert_eq!(interval_union_ns(&[(10, 20), (15, 30), (40, 45)]), 25);
     }
 
-    fn tracks(
-        rows: &[(i64, usize, &[(u64, u64)])],
-    ) -> BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>> {
-        let mut out: BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>> = BTreeMap::new();
+    type TrackRow<'a> = (i64, usize, &'a [(u64, u64)]);
+
+    fn tracks(rows: &[TrackRow]) -> TrackIntervals {
+        let mut out: TrackIntervals = BTreeMap::new();
         for (device_id, track_index, intervals) in rows {
             out.entry(*device_id)
                 .or_default()
@@ -3077,6 +3077,10 @@ mod tests {
         let mut samples: Vec<DutyCycleSample> = (0..12)
             .map(|index| {
                 // Vary slightly so the MAD is nonzero, as a real capture's is.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "index % 3 is at most 2, trivially representable as f64 without precision loss"
+                )]
                 let jitter = 1.0 + (index % 3) as f64 * 0.001;
                 duty_sample(first_id + index, stage, steady * jitter, 1.0)
             })

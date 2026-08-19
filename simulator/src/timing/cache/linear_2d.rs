@@ -583,14 +583,13 @@ mod tests {
                 })
             })
             .min_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
-            .map(|(cell, _)| cell)
-            .unwrap_or(super::Metrics4::ZERO);
+            .map_or(super::Metrics4::ZERO, |(cell, _)| cell);
         (nearest, true)
     }
 
     /// Build a `Cache2DLinear` and the parallel `Vec<Option<Metrics4>>` grid the
     /// oracle reads, then assert `interpolate_cell` matches the oracle bit-for-bit
-    /// across a dense probe sweep. `drops` lists (axis0_idx, axis1_idx) cells
+    /// across a dense probe sweep. `drops` lists (`axis0_idx`, `axis1_idx`) cells
     /// fed a non-finite sample (dropped).
     fn assert_matches_oracle(axis0: Vec<f64>, axis1: Vec<f64>, drops: &[(usize, usize)]) {
         let (r, c) = (axis0.len(), axis1.len());
@@ -602,6 +601,11 @@ mod tests {
                     nan_sample()
                 } else {
                     // A non-separable surface so bilinear weights actually matter.
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "i,j are small grid indices from test fixtures (axis lengths well \
+                                  under 2^53), far below f64's exact-integer range"
+                    )]
                     sample(1.0 + i as f64 * 2.0 + j as f64 * 3.0 + (i * j) as f64 * 0.1)
                 }
             })
@@ -708,7 +712,13 @@ mod tests {
         let grid = SweepGrid::new(vec![axis.clone(), axis.clone()]);
         let samples: Vec<KernelMetrics> = (0..r)
             .flat_map(|i| (0..c).map(move |j| (i, j)))
-            .map(|(i, j)| sample(1.0 + i as f64 + j as f64))
+            .map(|(i, j)| {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "i,j are token_axis grid indices (<=63), far below f64's exact-integer range"
+                )]
+                sample(1.0 + i as f64 + j as f64)
+            })
             .collect();
         let (cache, warnings) = Cache2DLinear::from_samples(&grid, &samples);
         assert!(warnings.is_empty());
@@ -733,6 +743,11 @@ mod tests {
                 }
             }
             black_box(acc);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "microbench duration/count converted to f64 for a human-readable ns/op ratio; \
+                          precision loss is irrelevant at these magnitudes"
+            )]
             let ns = start.elapsed().as_nanos() as f64 / (reps * probes.len()) as f64;
             println!("{label:<34} {ns:>7.2} ns");
         };
@@ -745,7 +760,9 @@ mod tests {
         run("interpolate_cell (4 fields)", &|a, b| {
             cache.interpolate_cell(a, b).0.time_ms
         });
-        run("eval", &|a, b| cache.eval(&[a as f64, b as f64]).m.time_ms);
+        run("eval", &|a, b| {
+            cache.eval(&[f64::from(a), f64::from(b)]).m.time_ms
+        });
     }
 
     /// 2x2 grid, axis0 = [1,2], axis1 = [10,20], times row-major:
@@ -911,6 +928,10 @@ mod tests {
         // both must agree with the raw bilinear blend everywhere, on-grid and off.
         let (default, _) = Cache2DLinear::from_samples(&grid, &samples);
         for &(x0, x1) in &[(300.0, 700.0), (1024.0, 1024.0), (4096.0, 4096.0)] {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "x0,x1 are hardcoded small f64 test constants safely representable as f32"
+            )]
             let expected = product.interpolate_cell(x0 as f32, x1 as f32).0.time_ms;
             assert_eq!(product.eval(&[x0, x1]).m.time_ms, expected);
             assert_eq!(default.eval(&[x0, x1]).m.time_ms, expected);

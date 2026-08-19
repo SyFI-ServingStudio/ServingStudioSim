@@ -430,7 +430,7 @@ mod tests {
         path
     }
 
-    /// Write the canonical TraceLab execution trace used by the v2 tests.
+    /// Write the canonical `TraceLab` execution trace used by the v2 tests.
     ///
     /// Session `b` arrives first and has two rounds; session `a` arrives later.
     /// The identifiers are opaque strings whose lexicographic order disagrees
@@ -666,7 +666,7 @@ mod tests {
     fn drain_pairs(fe: &mut TraceFrontend, now_ms: f64) -> Vec<(RequestId, f64)> {
         let mut out = Vec::new();
         fe.drain_due(Time::from_ms(now_ms), |request| {
-            out.push((request.core.id, request.core.arrival_time.as_ms()))
+            out.push((request.core.id, request.core.arrival_time.as_ms()));
         });
         out
     }

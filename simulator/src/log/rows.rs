@@ -859,8 +859,16 @@ mod tests {
     fn slo_entry(id: u32, times: Vec<f32>) -> RequestSloEntry {
         // Mirror `sim::run::slo_entry`: the general scalars are computed from
         // first/last/count, not the array, so they survive the array being off.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "times is a test fixture with a handful of entries, far under u32::MAX"
+        )]
         let num = times.len() as u32;
         let finish = times.last().copied();
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "num is a test fixture length (a handful of entries), far under f32's 24-bit exact integer range"
+        )]
         let tpot_mean = if num > 1 {
             Some((times[num as usize - 1] - times[0]) / (num - 1) as f32)
         } else {

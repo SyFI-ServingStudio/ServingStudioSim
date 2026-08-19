@@ -165,6 +165,7 @@ fn parse_dtype(s: &str) -> Result<DType> {
 impl MoeModelCfg {
     /// Qwen3-235B-A22B preset (bf16). Aligned to ref
     /// `moesim-rs/src/workload/standard_moe.rs::qwen3_235b`.
+    #[must_use]
     pub fn qwen3_235b() -> Self {
         Self {
             hidden: Dim::param("hidden", 4096),
