@@ -3014,7 +3014,12 @@ mod tests {
         );
     }
 
-    fn duty_sample(iteration: u64, stage: &str, cycle_ms: f64, measured_ms: f64) -> DutyCycleSample {
+    fn duty_sample(
+        iteration: u64,
+        stage: &str,
+        cycle_ms: f64,
+        measured_ms: f64,
+    ) -> DutyCycleSample {
         DutyCycleSample {
             iteration,
             stage: stage.into(),
@@ -3026,7 +3031,12 @@ mod tests {
     }
 
     /// A stage of steady iterations plus `factor` on one of them.
-    fn duty_stage(stage: &str, first_id: u64, steady: f64, spike: Option<f64>) -> Vec<DutyCycleSample> {
+    fn duty_stage(
+        stage: &str,
+        first_id: u64,
+        steady: f64,
+        spike: Option<f64>,
+    ) -> Vec<DutyCycleSample> {
         let mut samples: Vec<DutyCycleSample> = (0..12)
             .map(|index| {
                 // Vary slightly so the MAD is nonzero, as a real capture's is.
@@ -3083,7 +3093,10 @@ mod tests {
 
         let (excluded, _, sum_measured) = screen_duty_cycle_outliers(&samples);
 
-        assert!(excluded.is_empty(), "stratified screen must keep both modes");
+        assert!(
+            excluded.is_empty(),
+            "stratified screen must keep both modes"
+        );
         assert_eq!(sum_measured, 24.0);
     }
 

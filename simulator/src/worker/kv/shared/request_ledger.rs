@@ -183,7 +183,10 @@ mod tests {
 
         let mut drained = ledger.drain_promised();
         drained.sort_by_key(|(_, request)| request.0);
-        assert_eq!(drained, [(1, RequestId(0)), (1, RequestId(1)), (0, RequestId(2))]);
+        assert_eq!(
+            drained,
+            [(1, RequestId(0)), (1, RequestId(1)), (0, RequestId(2))]
+        );
         assert_eq!(ledger.partition_promised(1), 0);
         assert_eq!(
             ledger.placement(RequestId(0)),
@@ -202,7 +205,10 @@ mod tests {
 
         // Re-holding on another partition moves the whole total, never doubles it.
         ledger.hold(RequestId(0), 1, 64);
-        assert_eq!((ledger.partition_held(0), ledger.partition_held(1)), (0, 64));
+        assert_eq!(
+            (ledger.partition_held(0), ledger.partition_held(1)),
+            (0, 64)
+        );
 
         assert_eq!(ledger.take_held(RequestId(0)), Some((1, 64)));
         assert_eq!(ledger.partition_held(1), 0);

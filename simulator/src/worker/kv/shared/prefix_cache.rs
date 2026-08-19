@@ -244,8 +244,7 @@ impl PrefixCache {
             .map(|entry| {
                 entry
                     .tokens
-                    .min(self.floor_to_quantum(u64::from(requested_tokens)))
-                    as u32
+                    .min(self.floor_to_quantum(u64::from(requested_tokens))) as u32
             })
             .unwrap_or(0)
     }
@@ -460,7 +459,8 @@ mod tests {
 
     #[test]
     fn take_transfers_ownership_instead_of_sharing() {
-        let mut cache = PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        let mut cache =
+            PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
         cache.insert(7, 80, 100, None);
         assert_eq!(cache.take(7, 50).hit_tokens, 50);
         assert_eq!(cache.peek(7, 50), 0);
@@ -469,7 +469,8 @@ mod tests {
 
     #[test]
     fn lru_evicts_the_oldest_retained_session() {
-        let mut cache = PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        let mut cache =
+            PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
         cache.insert(1, 60, 100, None);
         cache.insert(2, 60, 100, None);
         assert_eq!(cache.peek(1, 60), 0);
@@ -478,7 +479,8 @@ mod tests {
 
     #[test]
     fn physical_slack_can_shrink_below_the_configured_ceiling() {
-        let mut cache = PrefixCache::new(100, PrefixCachePolicy::Fifo, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        let mut cache =
+            PrefixCache::new(100, PrefixCachePolicy::Fifo, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
         cache.insert(1, 40, 100, None);
         cache.insert(2, 40, 100, None);
         cache.shrink_to(40);
@@ -503,7 +505,12 @@ mod tests {
 
     #[test]
     fn largest_first_evicts_the_biggest_retained_session() {
-        let mut cache = PrefixCache::new(100, PrefixCachePolicy::LargestFirst, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        let mut cache = PrefixCache::new(
+            100,
+            PrefixCachePolicy::LargestFirst,
+            TOKEN_QUANTUM,
+            NO_EXTRA_CHARGE,
+        );
         cache.insert(1, 70, 100, None);
         cache.insert(2, 20, 100, None);
         cache.insert(3, 30, 100, None);
@@ -514,7 +521,8 @@ mod tests {
 
     #[test]
     fn mutation_receipts_form_an_exact_occupancy_replay() {
-        let mut cache = PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
+        let mut cache =
+            PrefixCache::new(100, PrefixCachePolicy::Lru, TOKEN_QUANTUM, NO_EXTRA_CHARGE);
         let first_insert = cache.insert(1, 60, 100, None);
         let second_insert = cache.insert(2, 60, 100, None);
         let take = cache.take(2, 40);

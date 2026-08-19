@@ -145,9 +145,8 @@ impl Qwen36MoeRouterLocalWorklet {
     }
 
     pub fn eval(&self, input: &Qwen36MoeRouterLocalWorkletInput, ev: &mut Evaluator) {
-        let work = derive_work(input).unwrap_or_else(|reason| {
-            panic!("invalid Qwen36MoeRouterLocalWorkletInput: {reason}")
-        });
+        let work = derive_work(input)
+            .unwrap_or_else(|reason| panic!("invalid Qwen36MoeRouterLocalWorkletInput: {reason}"));
         self.router.eval(&work.router, ev);
         self.topk.eval(&work.topk, ev);
         eval_align_or_zero(&self.align, work.align, work.run_alignment, ev);
@@ -303,10 +302,10 @@ mod tests {
         }
         let mut bad = cfg();
         bad.activation_dtype = DType::Fp16;
-        assert!(std::panic::catch_unwind(|| {
-            Qwen36MoeRouterLocalWorklet::resolve_config(&bad)
-        })
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| { Qwen36MoeRouterLocalWorklet::resolve_config(&bad) })
+                .is_err()
+        );
     }
 
     #[test]

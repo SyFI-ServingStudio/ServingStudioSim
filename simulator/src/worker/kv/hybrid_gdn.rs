@@ -604,7 +604,10 @@ mod tests {
         kv_store.reserve(RequestId(0), 0, footprint, Time::ZERO);
         kv_store.drain_ready();
         kv_store.commit_resident(RequestId(0), 0, 1_000, 20);
-        assert_eq!(kv_store.partitions[0].resident_tokens(), 1_000 + STATE_TOKENS);
+        assert_eq!(
+            kv_store.partitions[0].resident_tokens(),
+            1_000 + STATE_TOKENS
+        );
 
         kv_store.advance(AdvanceScope::WholePartition(0), 10);
         assert_eq!(

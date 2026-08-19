@@ -14,13 +14,13 @@ pub mod llama3_dense_tp;
 pub mod llama3_dp_attn_tp_ffn;
 pub mod model_cfg;
 pub mod moe_model_cfg;
+pub mod qwen36_local;
 pub mod qwen3_attn_layerwise;
 pub mod qwen3_ffn_moe_layerwise;
 pub mod qwen3_fp8_ffn_moe_layerwise;
 pub mod qwen3_moe_dp_attn_ep_ffn;
 pub mod qwen3_moe_fp8_dp_attn_ep_ffn;
 pub mod qwen3_vllm_moe_dp_attn_ep_ffn;
-pub mod qwen36_local;
 
 pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 pub use contract::{
@@ -39,13 +39,12 @@ pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};
 pub use llama3_dp_attn_tp_ffn::{DpAttnTpFfnParallel, Llama3DpAttnTpFfnModel};
 pub use model_cfg::ModelCfg;
 pub use moe_model_cfg::MoeModelCfg;
+pub use qwen36_local::{
+    Qwen36LocalConfigs, Qwen36LocalModel, Qwen36LocalParallel, Qwen36LocalResolved, Qwen36ModelCfg,
+};
 pub use qwen3_attn_layerwise::{Qwen3AttnLayerwiseModel, Qwen3AttnParallel};
 pub use qwen3_ffn_moe_layerwise::{Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel};
 pub use qwen3_fp8_ffn_moe_layerwise::{Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel};
 pub use qwen3_moe_dp_attn_ep_ffn::{Qwen3MoeDpAttnEpFfnModel, Qwen3MoeParallel};
 pub use qwen3_moe_fp8_dp_attn_ep_ffn::{Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel};
 pub use qwen3_vllm_moe_dp_attn_ep_ffn::{Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel};
-pub use qwen36_local::{
-    Qwen36LocalConfigs, Qwen36LocalModel, Qwen36LocalParallel, Qwen36LocalResolved,
-    Qwen36ModelCfg,
-};
