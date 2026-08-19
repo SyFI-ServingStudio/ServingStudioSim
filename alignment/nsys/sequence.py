@@ -81,13 +81,13 @@ def build_device_kernel_sequences(
                         "sequence_id": sequence_id,
                         "occurrences": [occurrence],
                         "expanded_kernel_count": sequence["expanded_kernel_count"],
-                        "program": sequence["program"],
+                        "tracks": sequence["tracks"],
                     }
                     continue
                 # Same id means the same ordered (name, category) sequence, so the
                 # folded program is identical by construction; assert rather than
                 # trust, because a mismatch would silently mislabel a device.
-                if existing["program"] != sequence["program"]:
+                if existing["tracks"] != sequence["tracks"]:
                     raise ValueError(
                         f"sequence {sequence_id!r} folds differently on device {device_id}"
                     )
@@ -114,8 +114,15 @@ def build_device_kernel_sequences(
 def _build_device_kernel_sequences(
     iteration_details: list[dict[str, Any]], kernel_names: dict[int, str], device_id: int
 ) -> dict[str, dict[str, Any]]:
-    """Deduplicate and fold exact phase sequences for one physical rank."""
-    grouped: dict[tuple[str, tuple[int, ...]], dict[str, Any]] = {}
+    """Deduplicate and fold exact phase sequences for one physical rank.
+
+    Folding runs per concurrent track, never across one. `parse` already
+    serialized each range track-major, so the tracks are contiguous runs of the
+    phase's kernel list and this only has to cut on the boundary — which keeps
+    the flat expansion, and therefore `sequence_id:expanded_ordinal`, exactly the
+    order the analyzer validates against.
+    """
+    grouped: dict[tuple[str, tuple[tuple[int, ...], ...]], dict[str, Any]] = {}
     for detail in iteration_details:
         ranges_by_phase: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for range_row in detail.get("ranges", []):
@@ -125,31 +132,49 @@ def _build_device_kernel_sequences(
         for phase, kernels in ranges_by_phase.items():
             if not kernels:
                 continue
-            kernels = _stream_major(kernels)
-            name_ids = tuple(int(kernel["name_id"]) for kernel in kernels)
-            key = (phase, name_ids)
-            categories = tuple(str(kernel["category"]) for kernel in kernels)
+            runs = _track_runs(kernels)
+            track_name_ids = tuple(
+                tuple(int(kernel["name_id"]) for kernel in run) for _, run in runs
+            )
+            key = (phase, track_name_ids)
+            track_categories = tuple(
+                tuple(str(kernel["category"]) for kernel in run) for _, run in runs
+            )
             entry = grouped.get(key)
             if entry is None:
-                occurrences = [
-                    {
-                        "name": kernel_names[name_id],
-                        "suggested_category": category,
-                    }
-                    for name_id, category in zip(name_ids, categories, strict=True)
-                ]
-                sequence_id = _sequence_id(phase, name_ids, kernel_names)
+                tracks = []
+                for track_index, ((range_track, _), name_ids, categories) in enumerate(
+                    zip(runs, track_name_ids, track_categories, strict=True)
+                ):
+                    occurrences = [
+                        {
+                            "name": kernel_names[name_id],
+                            "suggested_category": category,
+                        }
+                        for name_id, category in zip(name_ids, categories, strict=True)
+                    ]
+                    tracks.append(
+                        {
+                            "track_index": track_index,
+                            "stream_role": "primary" if range_track == 0 else "concurrent",
+                            "kernel_count": len(occurrences),
+                            "program": _fold_program(occurrences),
+                        }
+                    )
                 grouped[key] = {
-                    "sequence_id": sequence_id,
+                    "sequence_id": _sequence_id(phase, track_name_ids, kernel_names),
                     "iterations": [int(detail["iteration"])],
-                    "expanded_kernel_count": len(occurrences),
-                    "program": _fold_program(occurrences),
+                    "expanded_kernel_count": sum(len(run) for _, run in runs),
+                    "tracks": tracks,
                 }
             else:
                 existing_categories = tuple(
-                    kernel["suggested_category"] for kernel in expand_program(entry["program"])
+                    tuple(
+                        kernel["suggested_category"] for kernel in expand_program(track["program"])
+                    )
+                    for track in entry["tracks"]
                 )
-                if existing_categories != categories:
+                if existing_categories != track_categories:
                     raise ValueError(f"phase {phase!r} sequence has inconsistent kernel categories")
                 entry["iterations"].append(int(detail["iteration"]))
 
@@ -161,33 +186,51 @@ def _build_device_kernel_sequences(
     return catalogs
 
 
-def _stream_major(kernels: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group each CUDA stream's kernels contiguously, keeping their launch order.
+def _track_runs(kernels: list[dict[str, Any]]) -> list[tuple[int, list[dict[str, Any]]]]:
+    """Cut the phase's serialized kernels into maximal single-track runs.
 
-    The rows arrive sorted by start time across every stream, which reads like an
-    execution order but is not one when streams run concurrently: two independent
-    kernels that overlap can land either way round, and nanoseconds of jitter flip
-    them between otherwise identical iterations. Folding is exact-match, so each
-    flip both breaks a layer repeat and forks a new "unique" sequence. On a
-    Qwen3.6 capture that turned one recurring decode shape into 909 sequences
-    folding to 92% of their expanded size — a labeling surface roughly five times
-    larger than the work it describes, none of the excess meaningful.
+    Returns `(range track index, kernels)` per run, in order. `parse` emits each
+    range track-major, so a track is already a contiguous run and the cut is just
+    where `track_index` changes. Two ranges of the same phase that both end and
+    begin on the primary track therefore stay one run — which is what folding
+    across a range boundary did before tracks existed, so a single-stream capture
+    is one run and folds exactly as it always has.
 
-    This is the same rule the per-device split above already follows, applied one
-    level down: concurrent tracks are kept apart rather than interleaved, because
-    a single ordered list of concurrent work asserts a serialization that did not
-    happen. Sorting is stable and keyed on the stream alone, so within a stream —
-    where execution really is ordered — the original start order survives intact.
+    This is the same rule the per-device split already follows, one level down:
+    concurrent work is kept apart rather than interleaved, because a single
+    ordered list of concurrent kernels asserts a serialization that did not
+    happen. Folding is exact-match, so an interleaving that jitter can flip both
+    breaks a layer repeat and forks a new "unique" sequence — on a Qwen3.6
+    capture, one recurring decode shape became 909 sequences that still folded to
+    92% of their expanded size.
 
-    Position in the folded sequence is a labeling coordinate, not evidence;
-    durations and overlap are read from each kernel's own timestamps, which this
-    does not touch.
+    A run is a labeling coordinate, not evidence: durations and overlap are read
+    from each kernel's own timestamps, which this does not touch.
     """
-    return sorted(kernels, key=lambda kernel: int(kernel.get("stream_id", 0)))
+    runs: list[tuple[int, list[dict[str, Any]]]] = []
+    for kernel in kernels:
+        track_index = int(kernel.get("track_index", 0))
+        if not runs or runs[-1][0] != track_index:
+            runs.append((track_index, []))
+        runs[-1][1].append(kernel)
+    return runs
+
+
+def expand_sequence(sequence: dict[str, Any]) -> list[KernelOccurrence]:
+    """Expand a whole sequence: its tracks concatenated, in canonical order.
+
+    This is the flat order `parse` serialized and the analyzer validates against,
+    so the position of a kernel here is its `expanded_ordinal`.
+    """
+    return [
+        kernel
+        for track in sequence["tracks"]
+        for kernel in expand_program(track["program"])
+    ]
 
 
 def expand_program(program: list[dict[str, Any]]) -> list[KernelOccurrence]:
-    """Expand folded nodes; shared by validation tests and artifact consumers."""
+    """Expand one track's folded nodes; shared by tests and artifact consumers."""
     expanded: list[KernelOccurrence] = []
     for node in program:
         if "kernels" in node:
@@ -329,12 +372,17 @@ def _merge_literal_nodes(program: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _sequence_id(
     phase: str,
-    name_ids: tuple[int, ...],
+    track_name_ids: tuple[tuple[int, ...], ...],
     kernel_names: dict[int, str],
 ) -> str:
+    # The track split is part of the identity: the same flat kernel names cut
+    # into different concurrent tracks are different programs, and collapsing
+    # them onto one id would hand both the same labeling decision.
     identity = {
         "phase": phase,
-        "kernel_names": [kernel_names[name_id] for name_id in name_ids],
+        "kernel_names": [
+            [kernel_names[name_id] for name_id in name_ids] for name_ids in track_name_ids
+        ],
     }
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()

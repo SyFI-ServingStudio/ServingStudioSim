@@ -11,6 +11,7 @@ from alignment.nsys.parse import (
     RangeStats,
     Worker,
     _parse_label,
+    attribute_jit_stalls,
     build_host_timeline,
     aggregate_metrics_by_iteration,
     build_iteration_details,
@@ -25,7 +26,7 @@ from alignment.nsys.parse import (
     load_metrics,
     resolve_dp_rank_by_device,
 )
-from alignment.nsys.sequence import build_kernel_sequences, expand_program
+from alignment.nsys.sequence import build_kernel_sequences, expand_sequence
 
 
 def test_parse_label_accepts_only_indexed_iteration_markers():
@@ -168,7 +169,20 @@ def test_iteration_details_preserve_complete_kernel_launch_record():
         "end_ns": 180,
         "stream_id": 3,
         "correlation_id": 42,
+        "track_index": 0,
     }
+    # One stream is one track, and it is the primary one whatever id the driver
+    # handed it — track order is first-launch order, never the stream id itself.
+    assert details[0]["ranges"][0]["tracks"] == [
+        {
+            "track_index": 0,
+            "stream_id": 3,
+            "stream_role": "primary",
+            "kernel_count": 1,
+            "first_start_ns": 120,
+            "busy_union_ns": 60,
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -202,8 +216,11 @@ def test_full_sequence_folds_exact_repetition_losslessly():
     catalog = build_kernel_sequences(details, {1: "same_impl", 2: "other_impl"})["forward"]
     sequence = catalog["unique_sequences"][0]
     assert sequence["expanded_kernel_count"] == 6
-    assert sequence["program"][0]["repeat"]["count"] == 3
-    expanded = expand_program(sequence["program"])
+    # A stream-less fixture is one implicit track, so folding is unchanged.
+    assert [track["track_index"] for track in sequence["tracks"]] == [0]
+    assert sequence["tracks"][0]["stream_role"] == "primary"
+    assert sequence["tracks"][0]["program"][0]["repeat"]["count"] == 3
+    expanded = expand_sequence(sequence)
     assert [row["name"] for row in expanded] == [
         "same_impl",
         "other_impl",
@@ -256,12 +273,13 @@ def test_fold_prefers_layer_aligned_repeat_with_final_suffix():
         {1: "first_a", 2: "shared", 3: "first_b", 4: "steady_a", 5: "steady_b"},
     )["forward"]["unique_sequences"][0]
 
+    (track,) = sequence["tracks"]
     assert [
-        len(sequence["program"][0]["kernels"]),
-        sequence["program"][1]["repeat"]["count"],
-        len(sequence["program"][2]["kernels"]),
+        len(track["program"][0]["kernels"]),
+        track["program"][1]["repeat"]["count"],
+        len(track["program"][2]["kernels"]),
     ] == [3, 3, 1]
-    assert [kernel["name"] for kernel in expand_program(sequence["program"])] == [
+    assert [kernel["name"] for kernel in expand_sequence(sequence)] == [
         "first_a",
         "shared",
         "first_b",
@@ -300,7 +318,7 @@ def test_symmetric_ranks_collapse_to_one_labeling_decision():
     assert len(catalog["unique_sequences"]) == 1
     sequence = catalog["unique_sequences"][0]
     assert sequence["expanded_kernel_count"] == 2
-    assert [row["name"] for row in expand_program(sequence["program"])] == [
+    assert [row["name"] for row in expand_sequence(sequence)] == [
         "gemm",
         "nccl",
     ]
@@ -340,7 +358,7 @@ def test_asymmetric_ranks_each_keep_their_own_sequence():
     sequences = catalog["unique_sequences"]
     assert len(sequences) == 2
     assert {
-        expand_program(sequence["program"])[0]["name"]: sequence["occurrences"]
+        expand_sequence(sequence)[0]["name"]: sequence["occurrences"]
         for sequence in sequences
     } == {
         "rank0": [{"device_id": 0, "iterations": [7]}],
@@ -812,41 +830,66 @@ def test_concurrent_streams_fold_the_same_however_they_interleave():
 
     Both iterations below run the identical work — a two-kernel body repeated
     three times on stream 7, with one stream-9 kernel overlapping somewhere in
-    the middle. Only where that overlapping kernel lands differs. Ordered by raw
-    start time they are different sequences and neither folds; grouped by stream
-    they are one sequence with a clean repeat.
+    the middle. Only *when* that overlapping kernel runs differs, which is what
+    jitter varies between otherwise identical iterations. Serialized by raw start
+    time they are two different sequences and neither folds; split into tracks
+    they are one sequence whose primary track folds to a clean repeat.
+
+    This drives the whole chain, because that is where the split now lives: the
+    parser decides the canonical order and the folder only cuts on it.
     """
+    worker = Worker(global_pid=10, pid=20, name="VLLM::Worker", device_id=0)
 
-    def iteration(index, stream_of_third):
-        names = [1, 2, 1, 2, 1, 2]
-        streams = [7, 7, 7, 7, 7, 7]
-        names.insert(stream_of_third, 3)
-        streams.insert(stream_of_third, 9)
-        return {
-            "iteration": index,
-            "iteration_type": "decode",
-            "ranges": [
-                {
-                    "phase": "forward",
-                    "device_id": 0,
-                    "kernels": [
-                        {"name_id": name, "category": "other", "stream_id": stream}
-                        for name, stream in zip(names, streams, strict=True)
-                    ],
-                }
-            ],
-        }
+    def iteration(index, side_start):
+        events = [
+            KernelEvent(
+                start=offset * 10,
+                end=offset * 10 + 10,
+                name="layer_gemm" if offset % 2 == 0 else "layer_norm",
+                category="other",
+                stream_id=7,
+                correlation_id=offset,
+            )
+            for offset in range(6)
+        ]
+        events.append(
+            KernelEvent(
+                start=side_start,
+                end=side_start + 10,
+                name="shared_expert",
+                category="other",
+                stream_id=9,
+                correlation_id=99,
+            )
+        )
+        # What the profiler hands us: one list ordered by start time across both
+        # streams, so the side kernel sits at a different index in each.
+        events.sort(key=lambda event: event.start)
+        return RangeStats(
+            iteration=index,
+            phase="forward",
+            stage="decode",
+            worker=worker,
+            start=0,
+            end=60,
+            intervals=[(event.start, event.end) for event in events],
+            kernel_count=len(events),
+            sum_ns=sum(event.duration_ns for event in events),
+            kernel_events=events,
+        )
 
-    catalog = build_kernel_sequences(
-        [iteration(1, 2), iteration(2, 5)],
-        {1: "layer_gemm", 2: "layer_norm", 3: "shared_expert"},
-    )["forward"]["unique_sequences"]
+    ranges = [iteration(1, 15), iteration(2, 45)]
+    name_ids, kernel_names = build_kernel_name_index(ranges)
+    details = build_iteration_details(ranges, {}, name_ids)
+    catalog = build_kernel_sequences(details, kernel_names)["forward"]["unique_sequences"]
 
     assert len(catalog) == 1, "interleaving alone must not fork a second sequence"
     sequence = catalog[0]
     assert [occurrence["iterations"] for occurrence in sequence["occurrences"]] == [[1, 2]]
-    assert [node["repeat"]["count"] for node in sequence["program"] if "repeat" in node] == [3]
-    assert [kernel["name"] for kernel in expand_program(sequence["program"])] == [
+    primary, concurrent = sequence["tracks"]
+    assert (primary["stream_role"], concurrent["stream_role"]) == ("primary", "concurrent")
+    assert [node["repeat"]["count"] for node in primary["program"] if "repeat" in node] == [3]
+    assert [kernel["name"] for kernel in expand_sequence(sequence)] == [
         "layer_gemm",
         "layer_norm",
         "layer_gemm",
@@ -855,3 +898,103 @@ def test_concurrent_streams_fold_the_same_however_they_interleave():
         "layer_norm",
         "shared_expert",
     ]
+
+
+_JIT_STRING_IDS = {
+    1: "cuModuleLoadData",
+    2: "cudaLaunchKernel_v7000",
+    3: "cuLibraryLoadData",
+}
+
+
+def _jit_capture() -> sqlite3.Connection:
+    """One thread, three module loads, placed to make the three cases distinct."""
+    con = sqlite3.connect(":memory:")
+    con.executescript(
+        f"""
+        CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (
+            globalTid INTEGER, start INTEGER, end INTEGER,
+            nameId INTEGER, correlationId INTEGER
+        );
+        INSERT INTO StringIds VALUES (1, 'cuModuleLoadData');
+        INSERT INTO StringIds VALUES (2, 'cudaLaunchKernel_v7000');
+        INSERT INTO StringIds VALUES (3, 'cuLibraryLoadData');
+
+        -- inside the 900 ns idle gap between the range's two kernels
+        INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES ({WORKER_MAIN_TID}, 500, 510, 1, 1);
+        -- a second load sharing that same gap, which must not be counted twice
+        INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES ({WORKER_MAIN_TID}, 600, 610, 3, 2);
+        -- while the GPU is busy: a real load that stalled nothing
+        INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES ({WORKER_MAIN_TID}, 1500, 1560, 1, 3);
+        -- not a load at all
+        INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES ({WORKER_MAIN_TID}, 300, 310, 2, 4);
+        """
+    )
+    return con
+
+
+def _jit_range(intervals):
+    return RangeStats(
+        iteration=3,
+        phase="forward",
+        stage="mixed",
+        worker=Worker(global_pid=WORKER_GLOBAL_PID, pid=7, name="W", device_id=0),
+        start=0,
+        end=3000,
+        emitting_global_tid=WORKER_MAIN_TID,
+        intervals=list(intervals),
+    )
+
+
+def test_jit_stall_is_the_idle_gap_a_load_lands_in_counted_once_per_gap():
+    """The load CALL is microseconds; the compile before it is invisible to CUPTI.
+
+    What a compile does leave on the device is a hole, so the gap is the cost.
+    Two loads sharing one gap are one stall, and a load issued while the GPU is
+    busy cost nothing at all.
+    """
+    item = _jit_range([(100, 400), (1300, 2000)])
+
+    total = attribute_jit_stalls(_jit_capture(), _JIT_STRING_IDS, [item])
+
+    assert total == 3
+    assert item.jit_module_loads == 3
+    # 400..1300 is the only gap, and it is charged exactly once despite holding
+    # two of the three loads; the third landed inside 1300..2000, which is busy.
+    assert item.jit_stall_ns == 900
+
+
+def test_a_range_with_no_device_code_load_reports_zero_stall():
+    con = sqlite3.connect(":memory:")
+    con.executescript(
+        f"""
+        CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (
+            globalTid INTEGER, start INTEGER, end INTEGER,
+            nameId INTEGER, correlationId INTEGER
+        );
+        INSERT INTO StringIds VALUES (2, 'cudaLaunchKernel_v7000');
+        INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES ({WORKER_MAIN_TID}, 500, 510, 2, 1);
+        """
+    )
+    item = _jit_range([(100, 400), (1300, 2000)])
+
+    assert attribute_jit_stalls(con, {2: "cudaLaunchKernel_v7000"}, [item]) == 0
+    assert (item.jit_module_loads, item.jit_stall_ns) == (0, 0)
+
+
+def test_a_stall_spanning_two_ranges_of_one_device_is_still_measured():
+    """Gaps come from the device's whole timeline, not one range's kernels.
+
+    A compile routinely straddles a phase boundary — the Qwen3.6 capture's
+    warm-up iteration held loads in both `preprocess` and `forward` — and a
+    per-range view would score the straddling gap as zero.
+    """
+    early = _jit_range([(100, 400)])
+    early.phase = "preprocess"
+    late = _jit_range([(1300, 2000)])
+
+    attribute_jit_stalls(_jit_capture(), _JIT_STRING_IDS, [early, late])
+
+    assert early.jit_stall_ns == 900

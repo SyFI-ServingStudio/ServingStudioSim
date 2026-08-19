@@ -870,7 +870,7 @@ def test_req_frontend_invocation_keeps_independent_as_a_typed_frontend(tmp_path,
 
     load_runner.run_replay(config, prepared, base_url="http://localhost:8000", model="m")
     argv = commands[0][0]
-    assert argv[argv.index("--trace-format") + 1] == "independent"
+    assert argv[argv.index("--input-file-format") + 1] == "text-generation-independent"
     assert argv[argv.index("--backend") + 1] == "openai"
     assert argv[argv.index("--base-url") + 1] == "http://localhost:8000/v1"
     assert argv[argv.index("--max-concurrency") + 1] == "64"
@@ -946,7 +946,9 @@ def test_req_frontend_invocation_passes_no_context_policy(tmp_path, monkeypatch)
     )
 
     argv = commands[0][0]
-    assert argv[argv.index("--trace-format") + 1] == "session"
+    assert (
+        argv[argv.index("--input-file-format") + 1] == "text-generation-session-execution-v2"
+    )
     assert "--session-context-policy" not in argv
     assert "session_context_policy" not in result
 

@@ -37,6 +37,7 @@ SQLite tables read: `StringIds`, `PROCESSES`, `NVTX_EVENTS`,
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import re
 import sqlite3
@@ -59,6 +60,20 @@ from .sequence import build_device_kernel_sequences
 ITER_RE = re.compile(r"^(?:vllm|sglang)_iteration\((\d+)\):\s*(.+)$")
 
 _RUNTIME_LOOKUP_INDEX = "vibesim_runtime_gtid_start_idx"
+#: Driver entry points that load freshly compiled device code. Any of them
+#: inside an iteration means that iteration paid a JIT compile. The set is the
+#: whole `cuModuleLoad*` / `cuLibraryLoad*` family rather than the one spelling
+#: a given CUDA version happens to emit, so the signal survives a driver bump.
+_JIT_MODULE_LOAD_APIS = frozenset(
+    {
+        "cuModuleLoad",
+        "cuModuleLoadData",
+        "cuModuleLoadDataEx",
+        "cuModuleLoadFatBinary",
+        "cuLibraryLoadData",
+        "cuLibraryLoadFromFile",
+    }
+)
 _KERNEL_LOOKUP_INDEX = "vibesim_kernel_gpid_corr_start_idx"
 
 
@@ -126,6 +141,19 @@ class RangeStats:
     kernel_name_ns: Counter[str] = field(default_factory=Counter)
     kernel_name_count: Counter[str] = field(default_factory=Counter)
     kernel_events: list[KernelEvent] = field(default_factory=list)
+    #: CUDA module/library load calls the range's emitting thread made. A
+    #: nonzero count marks the iteration as a JIT warm-up: Triton/Inductor
+    #: compiled a kernel variant here, so the iteration's wall clock contains
+    #: hundreds of milliseconds of host-side compilation the steady state never
+    #: pays again.
+    jit_module_loads: int = 0
+    #: GPU idle, on this range's device, inside the gaps those loads landed in.
+    #: This is the compile's actual cost: the load call itself is microseconds
+    #: and the Python compilation before it is invisible to CUPTI. Compare it
+    #: against the iteration's own busy time to decide whether the iteration was
+    #: dominated by warm-up -- a threshold-free test, since both are durations
+    #: of the same iteration.
+    jit_stall_ns: int = 0
 
     @property
     def launch_global_tid(self) -> int:
@@ -552,6 +580,79 @@ def attach_kernels_by_correlation(
     return kernel_rows
 
 
+def attribute_jit_stalls(
+    con: sqlite3.Connection,
+    string_ids: dict[int, str],
+    ranges: list[RangeStats],
+) -> int:
+    """Record, per range, its device-code loads and the GPU idle they sit in.
+
+    Two facts, because one alone decides nothing. The load CALL is trivial --
+    0.05 to 0.16 ms in practice -- while the compilation that precedes it is
+    host-side Python and appears in no CUDA API row at all. What it does leave
+    behind is a hole in the device timeline, so the cost of a JIT compile is
+    recovered as the GPU idle gap the load lands in.
+
+    Ownership of the calls follows `attach_kernels_by_correlation`: a range owns
+    what its emitting thread issued inside `[start, end)`. Idle gaps, by
+    contrast, are computed against the DEVICE's whole attributed timeline, not
+    one range's kernels -- a compile stall routinely spans a phase boundary, and
+    a per-range view would score it as zero.
+
+    Each gap is counted once however many loads share it. Returns the total load
+    count across all ranges.
+    """
+    busy_by_device: dict[int | None, list[tuple[int, int]]] = defaultdict(list)
+    for item in ranges:
+        busy_by_device[item.worker.device_id].extend(item.intervals)
+
+    gaps_by_device: dict[int | None, list[tuple[int, int]]] = {}
+    for device_id, intervals in busy_by_device.items():
+        intervals.sort()
+        gaps: list[tuple[int, int]] = []
+        if intervals:
+            running_end = intervals[0][1]
+            for interval_start, interval_end in intervals[1:]:
+                if interval_start > running_end:
+                    gaps.append((running_end, interval_start))
+                running_end = max(running_end, interval_end)
+        gaps_by_device[device_id] = gaps
+
+    total = 0
+    for item in ranges:
+        load_starts = [
+            int(row_start)
+            for name_id, row_start in con.execute(
+                """
+                SELECT nameId, start
+                FROM CUPTI_ACTIVITY_KIND_RUNTIME
+                WHERE globalTid = ?
+                  AND start >= ?
+                  AND start < ?
+                """,
+                (item.launch_global_tid, item.start, item.end),
+            )
+            if string_ids.get(int(name_id), "") in _JIT_MODULE_LOAD_APIS
+        ]
+        if not load_starts:
+            continue
+        item.jit_module_loads = len(load_starts)
+        total += len(load_starts)
+
+        gaps = gaps_by_device.get(item.worker.device_id, [])
+        gap_starts = [gap[0] for gap in gaps]
+        stalled_gaps: dict[int, int] = {}
+        for load_start in load_starts:
+            index = bisect.bisect_right(gap_starts, load_start) - 1
+            if index < 0:
+                continue
+            gap_start, gap_end = gaps[index]
+            if gap_start <= load_start < gap_end:
+                stalled_gaps[gap_start] = gap_end - gap_start
+        item.jit_stall_ns = sum(stalled_gaps.values())
+    return total
+
+
 def resolve_dp_rank_by_device(
     workers: dict[int, Worker],
     worker_ranks: dict[int, int],
@@ -737,6 +838,42 @@ def align_ranges_into_steps(ranges: list[RangeStats]) -> tuple[list[AlignedStep]
     return steps, unpaired_by_device
 
 
+def partition_kernel_tracks(kernel_events: list[KernelEvent]) -> list[list[KernelEvent]]:
+    """Split one range's kernels into concurrent tracks, in canonical order.
+
+    A range's kernels arrive sorted by start time across every CUDA stream, which
+    reads like an execution order but is not one when streams run concurrently:
+    two independent kernels that overlap can land either way round, and
+    nanoseconds of jitter flip them between otherwise identical iterations. Every
+    consumer that treats the range as one ordered list inherits that
+    nondeterminism — exact-match folding forks a new "unique" sequence per flip,
+    and the `after` / `before` evidence a labeling rule rests on reads a
+    neighbour that never ran next.
+
+    So a range is N concurrent tracks, not one list, and this is the single place
+    that decides their order. Tracks are ordered by their **first launch**, not by
+    stream id: a stream id is an arbitrary driver-assigned integer, not comparable
+    across runs or frameworks, while "which track opened this range" is a stable,
+    framework-neutral fact. Ties break on the stream id only to stay total.
+    Grouping is stable, so within a track — where execution really is ordered —
+    the original launch order survives intact, and a single-stream range returns
+    exactly its input.
+
+    Ordering is a labeling coordinate, not evidence. Durations and overlap are
+    read from each kernel's own timestamps, which this does not touch.
+    """
+    first_start: dict[int, int] = {}
+    for event in kernel_events:
+        previous = first_start.get(event.stream_id)
+        if previous is None or event.start < previous:
+            first_start[event.stream_id] = event.start
+    by_stream: dict[int, list[KernelEvent]] = defaultdict(list)
+    for event in kernel_events:
+        by_stream[event.stream_id].append(event)
+    ordered_streams = sorted(first_start, key=lambda stream: (first_start[stream], stream))
+    return [by_stream[stream] for stream in ordered_streams]
+
+
 def build_iteration_details(
     ranges: list[RangeStats],
     metrics: dict[int, dict],
@@ -796,17 +933,38 @@ def build_iteration_details(
 
         serialized_ranges = []
         for item in items:
+            # Track-major is the canonical serialization of a range's kernels;
+            # `ordinal` numbers that order, so `sequence_id:expanded_ordinal` in
+            # the folded inventory addresses the same position the analyzer
+            # validates against. A single-stream range is one track, and its
+            # ordinals are unchanged.
+            tracks = partition_kernel_tracks(item.kernel_events)
             kernels = []
-            for ordinal, event in enumerate(item.kernel_events, start=1):
-                kernels.append(
+            serialized_tracks = []
+            for track_index, track_events in enumerate(tracks):
+                for event in track_events:
+                    kernels.append(
+                        {
+                            "ordinal": len(kernels) + 1,
+                            "name_id": kernel_name_ids[event.name],
+                            "category": event.category,
+                            "start_ns": event.start,
+                            "end_ns": event.end,
+                            "stream_id": event.stream_id,
+                            "correlation_id": event.correlation_id,
+                            "track_index": track_index,
+                        }
+                    )
+                serialized_tracks.append(
                     {
-                        "ordinal": ordinal,
-                        "name_id": kernel_name_ids[event.name],
-                        "category": event.category,
-                        "start_ns": event.start,
-                        "end_ns": event.end,
-                        "stream_id": event.stream_id,
-                        "correlation_id": event.correlation_id,
+                        "track_index": track_index,
+                        "stream_id": track_events[0].stream_id,
+                        "stream_role": "primary" if track_index == 0 else "concurrent",
+                        "kernel_count": len(track_events),
+                        "first_start_ns": min(event.start for event in track_events),
+                        "busy_union_ns": merge_duration_ns(
+                            [(event.start, event.end) for event in track_events]
+                        ),
                     }
                 )
             range_dp_rank = dp_rank_by_device.get(item.worker.device_id)
@@ -832,6 +990,9 @@ def build_iteration_details(
                     "kernel_count": item.kernel_count,
                     "kernel_sum_duration_ns": item.sum_ns,
                     "kernel_busy_union_ns": merge_duration_ns(item.intervals),
+                    "jit_module_loads": item.jit_module_loads,
+                    "jit_stall_ns": item.jit_stall_ns,
+                    "tracks": serialized_tracks,
                     "kernels": kernels,
                 }
             )
@@ -852,6 +1013,11 @@ def build_iteration_details(
                     device for device in all_devices if device not in present_devices
                 ],
                 "metrics": metric,
+                # Summed, not maxed: a load on any rank stalls the step, and
+                # neither field is a per-rank duration to reduce -- the count is
+                # a marker and the stall is idle time the step actually spent.
+                "jit_module_loads": sum(item.jit_module_loads for item in items),
+                "jit_stall_ns": sum(item.jit_stall_ns for item in items),
                 "metrics_by_dp_rank": {
                     str(dp_rank_by_device[device_id]): rank_metrics[
                         (dp_rank_by_device[device_id], iteration)
@@ -1189,6 +1355,7 @@ def parse_trace(
             default_stage,
         )
         kernel_rows = attach_kernels_by_correlation(con, string_ids, ranges)
+        jit_module_loads = attribute_jit_stalls(con, string_ids, ranges)
     finally:
         con.close()
 
@@ -1231,7 +1398,10 @@ def parse_trace(
     aligned_steps, unpaired_by_device = align_ranges_into_steps(ranges)
     kernel_sequences, device_ids = build_device_kernel_sequences(iteration_details, kernel_names)
     return {
-        "schema_version": 4,
+        # v5 adds per-range and per-iteration `jit_module_loads` /
+        # `jit_stall_ns`. Purely
+        # additive: every other field is byte-identical to v4.
+        "schema_version": 5,
         # How the devices' ranges were grouped into steps. Recorded because the
         # obvious rule — same `iteration_index` — is wrong under data
         # parallelism, and a reader of this file has no way to tell which rule
@@ -1252,6 +1422,9 @@ def parse_trace(
         "range_mode": range_mode,
         "iterations": iterations,
         "scanned_kernel_rows": kernel_rows,
+        # Total device-code loads inside measured iterations. Nonzero means the
+        # capture contains JIT warm-up; see per-iteration `jit_module_loads`.
+        "jit_module_loads": jit_module_loads,
         "stages": stages,
         "phases": phases,
         "kernel_names": kernel_names,
@@ -1312,8 +1485,8 @@ def build_parser() -> argparse.ArgumentParser:
 def write_kernel_sequences(path: Path, parsed: dict, source_parsed: Path | None) -> None:
     """Write the folded, label-ready sequence inventory separately from parsed.json."""
     document = {
-        "schema_version": 4,
-        "encoding": "folded-v1",
+        "schema_version": 5,
+        "encoding": "folded-v2",
         "source_parsed": str(source_parsed) if source_parsed is not None else None,
         "device_ids": parsed["device_ids"],
         "folding_policy": {
@@ -1322,6 +1495,12 @@ def write_kernel_sequences(path: Path, parsed: dict, source_parsed: Path | None)
             "row_identity": "sequence_id:expanded_ordinal",
             "rank_policy": (
                 "union across devices; each sequence lists its (device, iteration) occurrences"
+            ),
+            "track_policy": (
+                "one track per CUDA stream, ordered by first launch (ties on stream id); "
+                "folding and the labeling walk never cross a track boundary; expansion "
+                "concatenates tracks in that order, so a single-stream capture is one track "
+                "and its ordinals are unchanged"
             ),
         },
         "phases": parsed["kernel_sequences"],

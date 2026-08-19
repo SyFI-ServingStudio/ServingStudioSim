@@ -26,6 +26,29 @@ from alignment.labeling import cli as labeling_cli
 from launcher.alignment_config import load_labeled_kernel_sequences
 
 
+def _tracks(*programs: list[dict]) -> list[dict]:
+    """Wrap folded programs as a sequence's concurrent tracks.
+
+    Every fixture here is one execution stream unless it says otherwise, so the
+    common case is one primary track holding what used to be `program`.
+    """
+    return [
+        {
+            "track_index": index,
+            "stream_role": "primary" if index == 0 else "concurrent",
+            "kernel_count": sum(
+                len(segment["kernels"])
+                if "kernels" in segment
+                else segment["repeat"]["count"] * len(segment["repeat"]["body"]["kernels"])
+                for segment in program
+            ),
+            "program": program,
+        }
+        for index, program in enumerate(programs)
+    ]
+
+
+
 def test_initialize_writes_explicit_unmapped_cross_rank_labels(tmp_path):
     source = tmp_path / "source.json"
     output = tmp_path / "labeled.json"
@@ -37,7 +60,7 @@ def test_initialize_writes_explicit_unmapped_cross_rank_labels(tmp_path):
                         "unique_sequences": [
                             {
                                 "sequence_id": "sequence_test",
-                                "program": [
+                                "tracks": _tracks([
                                     {
                                         "kernels": [
                                             {
@@ -46,7 +69,7 @@ def test_initialize_writes_explicit_unmapped_cross_rank_labels(tmp_path):
                                             }
                                         ]
                                     }
-                                ],
+                                ]),
                             }
                         ]
                     }
@@ -76,7 +99,7 @@ def test_initialize_refuses_to_overwrite_existing_label_decisions(tmp_path):
                         "unique_sequences": [
                             {
                                 "sequence_id": "sequence_test",
-                                "program": [
+                                "tracks": _tracks([
                                     {
                                         "kernels": [
                                             {
@@ -89,7 +112,7 @@ def test_initialize_refuses_to_overwrite_existing_label_decisions(tmp_path):
                                             }
                                         ]
                                     }
-                                ],
+                                ]),
                             }
                         ]
                     }
@@ -110,8 +133,8 @@ def test_initialize_unfolds_repeats_for_occurrence_specific_boundaries(tmp_path)
     source.write_text(
         json.dumps(
             {
-                "schema_version": 4,
-                "encoding": "folded-v1",
+                "schema_version": 5,
+                "encoding": "folded-v2",
                 "source_parsed": "profile/parsed.json",
                 "device_ids": [0],
                 "folding_policy": {"kind": "exact_contiguous_repeat"},
@@ -122,7 +145,7 @@ def test_initialize_unfolds_repeats_for_occurrence_specific_boundaries(tmp_path)
                                 "sequence_id": "sequence_test",
                                 "occurrences": [{"device_id": 0, "iterations": [7]}],
                                 "expanded_kernel_count": 4,
-                                "program": [
+                                "tracks": _tracks([
                                     {
                                         "repeat": {
                                             "count": 2,
@@ -140,7 +163,7 @@ def test_initialize_unfolds_repeats_for_occurrence_specific_boundaries(tmp_path)
                                             },
                                         }
                                     }
-                                ],
+                                ]),
                             }
                         ]
                     }
@@ -178,7 +201,7 @@ def test_rule_before_name_distinguishes_last_identical_boundary():
                 "unique_sequences": [
                     {
                         "sequence_id": "sequence_boundary",
-                        "program": [
+                        "tracks": _tracks([
                             {
                                 "kernels": [
                                     kernel("norm"),
@@ -187,7 +210,7 @@ def test_rule_before_name_distinguishes_last_identical_boundary():
                                     kernel("lm_head"),
                                 ]
                             }
-                        ],
+                        ]),
                     }
                 ]
             }
@@ -223,7 +246,7 @@ def document():
                 "unique_sequences": [
                     {
                         "sequence_id": "sequence_aaaa1111",
-                        "program": [
+                        "tracks": _tracks([
                             {"kernels": [kernel("norm_kernel", dict(MAPPED_NORM))]},
                             {
                                 "repeat": {
@@ -237,7 +260,7 @@ def document():
                                     },
                                 }
                             },
-                        ],
+                        ]),
                     }
                 ]
             },
@@ -245,7 +268,7 @@ def document():
                 "unique_sequences": [
                     {
                         "sequence_id": "sequence_bbbb2222",
-                        "program": [{"kernels": [kernel("nvjet_tile_TNT")]}],
+                        "tracks": _tracks([{"kernels": [kernel("nvjet_tile_TNT")]}]),
                     }
                 ]
             },
@@ -277,6 +300,46 @@ def test_walk_yields_program_order_and_stops_predecessors_at_a_body_edge(documen
     assert positions[1].repeat == 18
     # The postprocess sequence likewise starts clean.
     assert positions[4].previous_operation is None
+
+
+def test_walk_stops_predecessors_at_a_track_edge():
+    """A concurrent track's first kernel has no predecessor at all.
+
+    Two bodies at least ran one after the other, so "what ran before" is a
+    weaker but real fact across them. Two tracks ran at the same time: there is
+    no "before" between them, and a rule keyed on `after`/`after_name` that
+    fired across the boundary would charge one stream's kernel to the other
+    stream's neighbour.
+    """
+    document = {
+        "phases": {
+            "forward": {
+                "unique_sequences": [
+                    {
+                        "sequence_id": "sequence_two_tracks",
+                        "tracks": _tracks(
+                            [{"kernels": [kernel("routed_gemm"), kernel("routed_down")]}],
+                            [{"kernels": [kernel("shared_gemm")]}],
+                        ),
+                    }
+                ]
+            }
+        }
+    }
+
+    positions = list(walk_kernels(document))
+    positions[0].label.update(MAPPED_NORM)
+    positions = list(walk_kernels(document))
+
+    assert [position.track_index for position in positions] == [0, 0, 1]
+    # Inside one track the chain still works.
+    assert positions[1].previous_name == "routed_gemm"
+    assert positions[1].previous_operation == MAPPED_NORM["operation"]
+    # Across the track boundary nothing carries over, in either direction.
+    assert positions[2].previous_name is None
+    assert positions[2].previous_operation is None
+    assert positions[1].next_name is None
+    assert "track1" in positions[2].coordinate
 
 
 def test_slots_ending_collects_every_layer_variant_and_rejects_a_stale_suffix():
@@ -505,25 +568,26 @@ def test_transfer_moves_labels_onto_a_re_parsed_inventory_of_the_same_program(do
     for phase in destination["phases"].values():
         for sequence in phase["unique_sequences"]:
             sequence["occurrences"] = [{"device_id": 0, "iterations": [8]}]
-            for segment in sequence["program"]:
-                body = segment.get("kernels") or segment["repeat"]["body"]["kernels"]
-                for kernel_entry in body:
-                    kernel_entry.pop("label", None)
+            for track in sequence["tracks"]:
+                for segment in track["program"]:
+                    body = segment.get("kernels") or segment["repeat"]["body"]["kernels"]
+                    for kernel_entry in body:
+                        kernel_entry.pop("label", None)
 
     report = transfer_labels(document, destination)
 
     assert report.transferred == 1
     assert report.unlabeled == 4
     forward = destination["phases"]["forward"]["unique_sequences"][0]
-    assert forward["program"][0]["kernels"][0]["label"] == MAPPED_NORM
+    assert forward["tracks"][0]["program"][0]["kernels"][0]["label"] == MAPPED_NORM
     assert forward["occurrences"] == [{"device_id": 0, "iterations": [8]}]
 
 
 def test_transfer_refuses_an_inventory_whose_program_differs(document):
     destination = copy.deepcopy(document)
-    destination["phases"]["forward"]["unique_sequences"][0]["program"][0]["kernels"][0]["name"] = (
-        "some_other_kernel"
-    )
+    destination["phases"]["forward"]["unique_sequences"][0]["tracks"][0]["program"][0]["kernels"][
+        0
+    ]["name"] = "some_other_kernel"
 
     with pytest.raises(ValueError, match="not the same program"):
         transfer_labels(document, destination)
