@@ -6,9 +6,9 @@
 //!
 //! Deviation from L7 design §2.4: the `Flow` trait here takes `on_arrival(Request)`
 //! + `tick(now) -> Vec<OrchAction>` against a `SharedRequests` injected at
-//! construction (signed off in the L5/L6 batch), rather than threading
-//! `&mut RequestStore` per tick. The driver holds an `Rc::clone` of that store to
-//! read lifecycle state back for logging.
+//!   construction (signed off in the L5/L6 batch), rather than threading
+//!   `&mut RequestStore` per tick. The driver holds an `Rc::clone` of that store to
+//!   read lifecycle state back for logging.
 
 use std::time::Instant;
 
@@ -252,7 +252,7 @@ pub fn run_sim(
                 prev_progress = progress;
                 idle_for = Time::ZERO;
             } else {
-                idle_for = idle_for + sample_dt;
+                idle_for += sample_dt;
                 if idle_for >= cfg.stuck_threshold {
                     break TerminationCause::Stuck;
                 }
@@ -260,7 +260,7 @@ pub fn run_sim(
         }
 
         // 4. Advance clock.
-        clock = clock + cfg.tick_dt;
+        clock += cfg.tick_dt;
     };
 
     finalize(store, logger, clock, last_state_clock)?;

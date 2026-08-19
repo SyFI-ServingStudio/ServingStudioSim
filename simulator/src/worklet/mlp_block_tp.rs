@@ -77,7 +77,7 @@ impl MlpBlockTpWorklet {
     pub fn resolve_config(cfg: &MlpBlockTpWorkletConfig) -> MlpBlockTpWorkletResolved {
         let tp = cfg.tp_size as u32;
         assert!(
-            cfg.intermediate.get() % tp == 0,
+            cfg.intermediate.get().is_multiple_of(tp),
             "intermediate {} not divisible by tp_size {}",
             cfg.intermediate,
             tp

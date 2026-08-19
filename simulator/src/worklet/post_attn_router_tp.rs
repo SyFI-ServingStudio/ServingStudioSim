@@ -91,7 +91,7 @@ impl PostAttnRouterTpWorklet {
         // o_proj only depends on the query-head split (its input is the attention
         // output, `num_qo_heads/tp · head_dim` per rank).
         assert!(
-            cfg.num_qo_heads.get() % tp == 0,
+            cfg.num_qo_heads.get().is_multiple_of(tp),
             "num_qo_heads {} not divisible by tp_size {}",
             cfg.num_qo_heads,
             tp

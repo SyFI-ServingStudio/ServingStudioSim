@@ -409,10 +409,10 @@ impl GpuCluster {
     ///     for its transmission slice (`transfer_time`, latency-stripped), so a
     ///     sender is free for its next push as soon as its bytes are on the wire;
     ///   - drains the **aggregate** byte total across the receiver's links.
-    /// Duration = `α + max(slowest sender transmission, receiver aggregate drain)`;
-    /// returns the time all bytes are resident at `recv_gid`. A single-source
-    /// gather has the same arrival as `submit_transfer` (α + max ≡ link_time), but
-    /// frees the sender after its own slice rather than the coupled collective.
+    ///     Duration = `α + max(slowest sender transmission, receiver aggregate drain)`;
+    ///     returns the time all bytes are resident at `recv_gid`. A single-source
+    ///     gather has the same arrival as `submit_transfer` (α + max ≡ link_time), but
+    ///     frees the sender after its own slice rather than the coupled collective.
     ///
     /// `kind`/`tag` are logged per source over the shared `[start, arrival]` window
     /// (only when a [`NetworkLogger`] is attached; `tag` is cloned per source then).

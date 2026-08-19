@@ -310,7 +310,7 @@ fn read_server_request_timings(path: &Path) -> Result<ServerRequestTimings> {
             .and_then(Value::as_u64)
             .context("server request timing missing schema_version")?;
         ensure!(
-            matches!(row_schema_version, 1 | 2 | 3),
+            matches!(row_schema_version, 1..=3),
             "unsupported server request timing schema {} at {} line {}",
             row_schema_version,
             path.display(),

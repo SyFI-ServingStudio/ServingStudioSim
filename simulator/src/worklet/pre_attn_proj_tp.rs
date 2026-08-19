@@ -72,13 +72,13 @@ impl PreAttnProjTpWorklet {
         // GQA dual-divisibility, identical to the attention TP front: both head
         // counts split across the ranks, tp <= num_kv_heads (no KV replication).
         assert!(
-            cfg.num_qo_heads.get() % tp == 0,
+            cfg.num_qo_heads.get().is_multiple_of(tp),
             "num_qo_heads {} not divisible by tp_size {}",
             cfg.num_qo_heads,
             tp
         );
         assert!(
-            cfg.num_kv_heads.get() % tp == 0,
+            cfg.num_kv_heads.get().is_multiple_of(tp),
             "num_kv_heads {} not divisible by tp_size {}",
             cfg.num_kv_heads,
             tp

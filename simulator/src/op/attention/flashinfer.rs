@@ -41,7 +41,7 @@ use crate::timing::{
 ///   - prefill / chunked → **fp8816** (q=fp8, kv=fp8, o=bf16) on backend `fa3`.
 ///   - decode → **fp16816** (q=bf16, kv=fp8, o=bf16) on backend `fa2` — decode is
 ///     KV-bandwidth bound, so only the KV cache is fp8, the query stays 16-bit.
-/// Non-fp8 keeps everything at `dtype` on the caller's `backends`. L2 design §3.5-1.
+///     Non-fp8 keeps everything at `dtype` on the caller's `backends`. L2 design §3.5-1.
 #[derive(Clone, Debug)]
 pub struct FlashInferAttentionConfig {
     /// Backends for the non-fp8 path (best-of-N). In fp8 mode the op overrides

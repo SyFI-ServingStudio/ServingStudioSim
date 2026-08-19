@@ -297,8 +297,8 @@ async fn run_subjects(
             (idx, res, started.elapsed().as_secs_f64() * 1e3)
         });
     }
-    let mut results: Vec<Option<(Result<(serde_json::Value, serde_json::Value)>, f64)>> =
-        (0..invocations.len()).map(|_| None).collect();
+    type SubjectResults = Vec<Option<(Result<(serde_json::Value, serde_json::Value)>, f64)>>;
+    let mut results: SubjectResults = (0..invocations.len()).map(|_| None).collect();
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok((idx, res, elapsed_ms)) => results[idx] = Some((res, elapsed_ms)),

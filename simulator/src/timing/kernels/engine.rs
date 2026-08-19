@@ -398,6 +398,11 @@ impl<S: KernelSpec> Probe for Kernel<S> {
 /// `Kernel<S>` builder WITHOUT a central match. Each kernel registers itself via
 /// [`register_kernel!`] (which also emits its `pub type FooKernel = Kernel<FooSpec>`
 /// alias), so adding a kernel touches only that kernel's own file.
+///
+/// `(describe_config, grid_axes, input_field_names)` for the `grid` query path.
+type KernelDescribeResult =
+    anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>;
+
 pub(crate) struct KernelQueryEntry {
     pub kind: &'static str,
     /// `eval` path: deserialize config, build the kernel (profiles missing grid
@@ -406,10 +411,7 @@ pub(crate) struct KernelQueryEntry {
     /// `grid` path: deserialize config and report
     /// `(describe_config, grid_axes, input_field_names)` from `sweep_grid` plus
     /// the Input's physical field names — no bridge, no profiling, no GPU.
-    pub describe: fn(
-        serde_json::Value,
-    )
-        -> anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>,
+    pub describe: fn(serde_json::Value) -> KernelDescribeResult,
 }
 
 inventory::collect!(KernelQueryEntry);
@@ -453,9 +455,7 @@ where
 /// fitted cache axes from `sweep_grid`, and the Input's physical query-field
 /// names. The `grid`-path fn pointer — pure metadata, so it needs neither the
 /// bridge nor a built cache.
-fn describe_from_json<S>(
-    config: serde_json::Value,
-) -> anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>
+fn describe_from_json<S>(config: serde_json::Value) -> KernelDescribeResult
 where
     S: KernelSpec,
     S::Config: serde::de::DeserializeOwned,

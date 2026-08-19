@@ -50,6 +50,10 @@ struct ParsedMetadata {
     decoding: DecodingStrategy,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each arg is a distinct decoded field from the shared row format being adapted into ParsedMetadata"
+)]
 fn parse_independent_metadata(
     source_request_id: &str,
     trace_arrival_time_ms: f64,

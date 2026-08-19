@@ -181,7 +181,7 @@ impl NativeMoeExpertComputeLocalWorklet {
             .map(|&x| u64::from(x))
             .sum();
         let local_routed_tokens =
-            ((u64::from(global_expert_selections) * local_ppm_sum + 999_999) / 1_000_000) as u32;
+            (u64::from(global_expert_selections) * local_ppm_sum).div_ceil(1_000_000) as u32;
         self.act.eval(
             &ElementwiseKernelInput {
                 num_tokens: local_routed_tokens,

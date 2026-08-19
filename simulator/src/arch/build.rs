@@ -176,7 +176,7 @@ fn canonicalize_layerwise_expert_counts(
 ) -> Result<Vec<f32>> {
     anyhow::ensure!(ep_size > 0, "ep_size must be non-zero");
     anyhow::ensure!(
-        expected_num_experts % u32::from(ep_size) == 0,
+        expected_num_experts.is_multiple_of(u32::from(ep_size)),
         "expert popularity profile {} cannot partition {} experts across ep_size {}",
         path,
         expected_num_experts,

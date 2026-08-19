@@ -29,8 +29,8 @@
 //!      pass, so a request incurs `d-1` decode forward passes)
 //!   4. `ffn_token_pass`        Σ batch_tokens              vs Σ [p + max(d-1,0)]
 //!   5. `prefill_causal_attn_work`
-//!         Σ_chunks [a·prefix + a(a+1)/2]
-//!             vs Σ [p·hit + p(p+1)/2]
+//!      Σ_chunks [a·prefix + a(a+1)/2]
+//!      vs Σ [p·hit + p(p+1)/2]
 //!      The causal per-chunk work telescopes to the single-shot value
 //!      `p·hit + p(p+1)/2` regardless of how prefill is chunked (the `Σ aᵢ²`
 //!      terms cancel) — so this is exact even with `ChunkedPrefill`. NOTE: this
@@ -43,7 +43,7 @@
 //!      context-ready request; a sim-end partial prefill uses only its observed
 //!      `hit + p` context so unfinished future work is not invented.
 //!   7. `decode_kv_sum`         Σ decode_kv_total
-//!         vs Σ [m·context + m(m-1)/2], m = max(d-1, 0)
+//!      vs Σ [m·context + m(m-1)/2], m = max(d-1, 0)
 //!      (decode reads the full post-prefill context, independent of how much of
 //!      that context was a cache hit.)
 //!   8. `cost_log_batch_self_consistency`  Σ batch_tokens vs Σ(prefill_tokens +
@@ -435,10 +435,12 @@ fn pct_of(delta: f64, expected: f64) -> f64 {
 /// tens of millions of rows. Each side then sums over the flattened `groups` child
 /// in one typed pass per column (see [`sum_field`] / [`column_f64`]).
 async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actual> {
-    let mut a = Actual::default();
     // `num_iterations` in the report stays the raw cost_log row count (every worker
     // × layer × section row) for continuity — a cheap COUNT(*), not a full scan.
-    a.iters = count_rows(ctx, "SELECT COUNT(*) AS c FROM cost_log").await?;
+    let mut a = Actual {
+        iters: count_rows(ctx, "SELECT COUNT(*) AS c FROM cost_log").await?,
+        ..Default::default()
+    };
 
     match mode {
         WorkloadMode::Iterwise => {

@@ -535,7 +535,7 @@ pub fn build_configs(
     if parallel.ep_size == 0 {
         return Err(fit_failed("ep_size must be positive"));
     }
-    if NUM_EXPERTS % u32::from(parallel.ep_size) != 0 {
+    if !NUM_EXPERTS.is_multiple_of(u32::from(parallel.ep_size)) {
         return Err(fit_failed(format!(
             "num_experts {NUM_EXPERTS} must be divisible by ep_size {}",
             parallel.ep_size
@@ -543,7 +543,7 @@ pub fn build_configs(
     }
     if parallel.nvl_num_gpu == 0
         || parallel.nvl_num_gpu > parallel.ep_size
-        || parallel.ep_size % parallel.nvl_num_gpu != 0
+        || !parallel.ep_size.is_multiple_of(parallel.nvl_num_gpu)
     {
         return Err(fit_failed(format!(
             "nvl_num_gpu {} must be a positive divisor of ep_size {}",

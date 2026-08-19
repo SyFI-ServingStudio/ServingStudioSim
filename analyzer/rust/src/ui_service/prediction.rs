@@ -313,13 +313,13 @@ pub(super) async fn prediction_cases(
     let bounded_limit = limit.clamp(1, MAX_CASE_PAGE);
     let end = offset.saturating_add(bounded_limit).min(cases.len());
     let mut entries = Vec::with_capacity(end.saturating_sub(offset));
-    for case_index in offset.min(end)..end {
+    for (case_index, case) in cases.iter().enumerate().take(end).skip(offset.min(end)) {
         let case_id = u64::try_from(case_index).context("prediction case index exceeds u64")?;
         let mut summary = prediction_case_summary(cache, &source, case_id, request_id).await?;
         summary
             .as_object_mut()
             .context("prediction case summary must be an object")?
-            .insert("input".to_owned(), cases[case_index].clone());
+            .insert("input".to_owned(), case.clone());
         entries.push(summary);
     }
     Ok(json!({

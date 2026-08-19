@@ -427,16 +427,20 @@ async fn plan_worker_scans(ctx: &SessionContext) -> Result<BTreeMap<(String, u16
 type PlanIds = HashMap<String, HashMap<u16, HashMap<String, usize>>>;
 type WorkerIds = HashMap<String, HashMap<u16, usize>>;
 
-fn compile_plans(
-    manifests: &BTreeMap<(String, u16), crate::trace::manifest::ManifestDoc>,
-    worker_scans: &BTreeMap<(String, u16), WorkerScan>,
-) -> Result<(
+/// Return type of [`compile_plans`]: positions, section plans, the two id
+/// lookup tables, and per-worker totals.
+type CompiledPlans = (
     Vec<Position>,
     Vec<SectionPlan>,
     PlanIds,
     WorkerIds,
     Vec<WorkerTotals>,
-)> {
+);
+
+fn compile_plans(
+    manifests: &BTreeMap<(String, u16), crate::trace::manifest::ManifestDoc>,
+    worker_scans: &BTreeMap<(String, u16), WorkerScan>,
+) -> Result<CompiledPlans> {
     let mut positions: Vec<Position> = Vec::new();
     let mut position_ids: HashMap<String, usize> = HashMap::new();
     let mut plans = Vec::new();

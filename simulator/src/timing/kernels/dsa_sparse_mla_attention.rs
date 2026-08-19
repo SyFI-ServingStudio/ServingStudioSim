@@ -106,7 +106,9 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
             "causal_tail" => {
                 grid.expand_2d(|num_queries, num_cache_tokens| num_queries > num_cache_tokens)
             }
-            "speculative_pairs" => grid.expand_2d(|num_queries, _| num_queries as u32 % 2 != 0),
+            "speculative_pairs" => {
+                grid.expand_2d(|num_queries, _| !(num_queries as u32).is_multiple_of(2))
+            }
             pattern => panic!("unsupported valid_counts_pattern {pattern:?}"),
         }
     }
@@ -176,7 +178,7 @@ fn canonical_valid_counts(pattern: &str, q: u32, s: u32, k: u32) -> String {
             }
         }
         "speculative_pairs" => {
-            if q % 2 != 0 {
+            if !q.is_multiple_of(2) {
                 return masked_placeholder(q);
             }
             let first = s.saturating_sub(1).min(k);

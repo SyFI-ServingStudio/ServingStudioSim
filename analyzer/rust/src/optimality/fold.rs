@@ -134,6 +134,10 @@ pub(super) async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
 
 /// Fold the stride-sampled rows: per row `Σ_slot α·value` for R2..R5 into its
 /// worker, and the same per-slot contributions into `(location, worker)`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is an independently-needed fold input (rate config, plan lookups, and the two mutable accumulators); bundling would just move the arity into a struct without reducing it"
+)]
 pub(super) async fn accumulate_fold(
     ctx: &SessionContext,
     stride: u64,
@@ -165,6 +169,10 @@ pub(super) async fn accumulate_fold(
 
 /// Exact R2..R5 fold for one selected iteration. Unlike the run aggregate this
 /// reads every matching row, so its anchor is exactly the worker's GPU count.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors accumulate_fold's parameter set plus the (pool_tag, worker_id, iter_id) row selector; bundling would just move the arity into a struct without reducing it"
+)]
 pub(super) async fn accumulate_iteration_fold(
     ctx: &SessionContext,
     pool_tag: &str,
@@ -198,6 +206,10 @@ pub(super) async fn accumulate_iteration_fold(
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared fold body for both accumulate_fold and accumulate_iteration_fold; it needs the same query-dependent config, plan lookups, and mutable accumulators as its callers"
+)]
 async fn accumulate_fold_query(
     ctx: &SessionContext,
     sql: &str,
@@ -208,7 +220,7 @@ async fn accumulate_fold_query(
     workers: &mut [WorkerFoldAccumulator],
     sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 4]>,
 ) -> Result<u64> {
-    let record_batches = collect(ctx, &sql).await?;
+    let record_batches = collect(ctx, sql).await?;
     let mut sampled_rows = 0u64;
     for batch in &record_batches {
         let pool_tags = string_column(batch, "pool_tag")?;
@@ -220,7 +232,8 @@ async fn accumulate_fold_query(
         let (_, bytes) = list_f32_column(batch, "slot_bytes")?;
         // Cache the resolved (meta, worker index) across the run of rows sharing
         // one (pool, worker, section) — cost_log is worker/iter ordered.
-        let mut cached_plan: Option<((String, u16, String), (&SectionFoldPlan, usize))> = None;
+        type CachedPlan<'a> = ((String, u16, String), (&'a SectionFoldPlan, usize));
+        let mut cached_plan: Option<CachedPlan> = None;
         for row in 0..batch.num_rows() {
             let pool_tag = pool_tags.value(row);
             let worker_id = value_f64(worker_ids, row)? as u16;
@@ -324,8 +337,12 @@ async fn accumulate_fold_query(
                     location_worker_rungs[rung_index] += weighted_rungs_ms[rung_index];
                 }
             }
-            for rung_index in 0..4 {
-                workers[worker_index].sampled_rungs_ms[rung_index] += row_rungs_ms[rung_index];
+            for (worker_rung, row_rung) in workers[worker_index]
+                .sampled_rungs_ms
+                .iter_mut()
+                .zip(row_rungs_ms.iter())
+            {
+                *worker_rung += row_rung;
             }
         }
     }

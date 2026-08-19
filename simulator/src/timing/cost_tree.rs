@@ -372,8 +372,8 @@ impl CostTree {
     ///   - `Scale{n}` — child subtree × `n` (the homogeneous-layer fold);
     ///   - `Max{overlap}` — `time = max(child.time)/overlap`, other fields summed
     ///     (flops/bytes/energy always add — work doesn't overlap away, INV-4).
-    /// Coverage flags always OR up the tree, so a warning anywhere surfaces at
-    /// the root.
+    ///     Coverage flags always OR up the tree, so a warning anywhere surfaces at
+    ///     the root.
     ///
     /// Single reverse pass: BFS layout puts every parent before its children, so
     /// iterating high→low index has each child's subtree result ready when its

@@ -445,10 +445,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let mut duty_cycle_samples: Vec<DutyCycleSample> = Vec::new();
     let mut kernel_inventory: BTreeMap<String, KernelAggregate> = BTreeMap::new();
     let mut operation_stats: BTreeMap<String, OperationAggregate> = BTreeMap::new();
-    let mut unmapped_measured: BTreeMap<
-        (String, String),
-        (String, usize, Vec<(u64, u64)>, BTreeSet<i64>),
-    > = BTreeMap::new();
+    type UnmappedMeasured =
+        BTreeMap<(String, String), (String, usize, Vec<(u64, u64)>, BTreeSet<i64>)>;
+    let mut unmapped_measured: UnmappedMeasured = BTreeMap::new();
     let mut unmapped_simulated: BTreeMap<String, f64> = BTreeMap::new();
     let mut measured_workload_ms = 0.0;
     let mut measured_mapped_ms = 0.0;
@@ -866,8 +865,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         })
         .collect();
     let kernel_report: Vec<_> = kernel_inventory
-        .into_iter()
-        .map(|(_, item)| {
+        .into_values()
+        .map(|item| {
             let device_count = item.device_ids.len().max(1);
             let replica_calls = item.calls as f64 / device_count as f64;
             let total_union_ns = interval_union_ns(&item.intervals) as f64;
@@ -1331,7 +1330,7 @@ fn join_mapped_occurrences(
             let device_ordinal = *next_device_ordinal;
             *next_device_ordinal += 1;
             ensure!(
-                occurrence_ordinal.map_or(true, |ordinal| ordinal == device_ordinal),
+                occurrence_ordinal.is_none_or(|ordinal| ordinal == device_ordinal),
                 "mapped row {:?} has inconsistent per-device occurrence ordinals",
                 item.row_id,
             );
@@ -1719,7 +1718,7 @@ fn load_inventory(path: &Path) -> Result<CompiledInventory> {
 
 fn compile_inventory(doc: FoldedSequenceDoc) -> Result<CompiledInventory> {
     ensure!(
-        matches!(doc.schema_version, 2 | 3 | 4 | 5),
+        matches!(doc.schema_version, 2..=5),
         "labeled kernel sequences schema_version must be 2, 3, 4 or 5"
     );
     ensure!(
@@ -2167,7 +2166,7 @@ fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let middle = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         (sorted[middle - 1] + sorted[middle]) / 2.0
     } else {
         sorted[middle]
@@ -2258,9 +2257,9 @@ fn occurrence_ns(launches: &[KernelLaunch], synchronizing: bool) -> u64 {
 /// per-occurrence durations over-counts the wall time. With one track the two
 /// terms are the same union and the result is exactly zero, which is what keeps
 /// every single-stream capture's numbers unmoved.
-fn concurrent_hidden_ms_by_device(
-    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
-) -> BTreeMap<i64, f64> {
+type TrackIntervals = BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>;
+
+fn concurrent_hidden_ms_by_device(track_intervals: &TrackIntervals) -> BTreeMap<i64, f64> {
     let mut hidden = BTreeMap::new();
     for (device_id, tracks) in track_intervals {
         if tracks.len() < 2 {
@@ -2280,9 +2279,7 @@ fn concurrent_hidden_ms_by_device(
 
 /// Each track's own busy time, reported per device so a reader can see which
 /// track the hidden time came from rather than only that some of it was hidden.
-fn track_busy_ms(
-    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
-) -> Vec<serde_json::Value> {
+fn track_busy_ms(track_intervals: &TrackIntervals) -> Vec<serde_json::Value> {
     let mut rows = Vec::new();
     for (device_id, tracks) in track_intervals {
         for (track_index, intervals) in tracks {
@@ -2304,7 +2301,7 @@ fn track_busy_ms(
 /// yields nothing and the field stays absent.
 fn hidden_ms_by_operation(
     kernels: &[(String, IterationKernelAggregate)],
-    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
+    track_intervals: &TrackIntervals,
 ) -> BTreeMap<String, f64> {
     let mut hidden: BTreeMap<String, f64> = BTreeMap::new();
     if track_intervals.values().all(|tracks| tracks.len() < 2) {
@@ -2334,10 +2331,7 @@ fn hidden_ms_by_operation(
 /// it telescopes to `Σ per-track busy − union`, which is precisely the hidden
 /// time subtracted from the critical path. Devices are reduced with `max`,
 /// matching how every other per-occurrence quantity folds across ranks.
-fn launches_hidden_ms(
-    launches: &[KernelLaunch],
-    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
-) -> f64 {
+fn launches_hidden_ms(launches: &[KernelLaunch], track_intervals: &TrackIntervals) -> f64 {
     let mut by_device: BTreeMap<(i64, usize), Vec<(u64, u64)>> = BTreeMap::new();
     for launch in launches {
         by_device

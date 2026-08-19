@@ -197,6 +197,10 @@ impl CostBuffers {
     /// and it never repeats across iterations anyway); ffn passes its small
     /// `tokens_per_group` (which *does* recur across randomly-assigned tasks). `None`
     /// disables caching (iter-wise callers eval once per iteration — nothing repeats).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each arg is a distinct per-call identity/context piece (section, layer, iter/batch ids, groups, cache key, clock, eval closure) documented above"
+    )]
     pub fn run_section<G, F>(
         &mut self,
         section: &'static str,

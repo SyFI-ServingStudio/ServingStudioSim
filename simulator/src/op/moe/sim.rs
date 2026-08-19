@@ -123,6 +123,10 @@ pub fn simulate_once(
 ///    bcast the result from `primary` to a `result_holder` in each non-root
 ///    target domain, then fan within that domain to the other resident ranks.
 ///    These two stages stay zero whenever `|S| == 1` (single combine sink).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each arg is a distinct per-token routing/cost input; bundling would just move the same fan-out into a struct"
+)]
 fn price_token(
     token_index: u64,
     hit_rank: &[bool],

@@ -233,7 +233,8 @@ async fn accumulate(
         let (_, bytes) = list_f32(batch, "slot_bytes")?;
         // Cache the resolved slot→loc-id vector across the common run of rows that
         // share one (pool, worker, section) — cost_log is worker/iter ordered.
-        let mut cached: Option<((&str, u16, &str), &Vec<u32>)> = None;
+        type CachedSlotLoc<'a> = Option<((&'a str, u16, &'a str), &'a Vec<u32>)>;
+        let mut cached: CachedSlotLoc<'_> = None;
         for row in 0..batch.num_rows() {
             let (p, w, s) = (pool.value(row), value_f64(wid, row)? as u16, sec.value(row));
             let ids = match cached {

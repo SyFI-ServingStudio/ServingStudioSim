@@ -299,7 +299,7 @@ fn mla_cache_append_config(cfg: &DsaSparseMlaAttentionConfig) -> MlaCacheAppendK
 fn index_remap_config(
     cfg: &DsaSparseMlaAttentionConfig,
 ) -> Result<ElementwiseKernelConfig, BuildError> {
-    if cfg.selected_k == 0 || cfg.selected_k % REMAP_TILE_SIZE != 0 {
+    if cfg.selected_k == 0 || !cfg.selected_k.is_multiple_of(REMAP_TILE_SIZE) {
         return Err(fit_failed(format!(
             "selected_k must be positive and divisible by {REMAP_TILE_SIZE}, got {}",
             cfg.selected_k

@@ -173,22 +173,21 @@ impl Cache3DLinear {
 
         let nearest = corners
             .iter()
-            .filter_map(|&(indices, index, _)| {
-                self.valid[index].then(|| {
-                    let distance = (0..3)
-                        .map(|axis| {
-                            let (lo, hi, _, _) = located[axis];
-                            let width = (self.axes[axis][hi] - self.axes[axis][lo]).abs();
-                            if width <= f32::EPSILON {
-                                0.0
-                            } else {
-                                let delta = (query[axis] - self.axes[axis][indices[axis]]) / width;
-                                delta * delta
-                            }
-                        })
-                        .sum::<f32>();
-                    (self.cells[index], distance)
-                })
+            .filter(|&&(_indices, index, _)| self.valid[index])
+            .map(|&(indices, index, _)| {
+                let distance = (0..3)
+                    .map(|axis| {
+                        let (lo, hi, _, _) = located[axis];
+                        let width = (self.axes[axis][hi] - self.axes[axis][lo]).abs();
+                        if width <= f32::EPSILON {
+                            0.0
+                        } else {
+                            let delta = (query[axis] - self.axes[axis][indices[axis]]) / width;
+                            delta * delta
+                        }
+                    })
+                    .sum::<f32>();
+                (self.cells[index], distance)
             })
             .min_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
             .map(|(cell, _)| cell)

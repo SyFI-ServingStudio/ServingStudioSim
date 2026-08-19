@@ -163,8 +163,8 @@ impl ManifestDoc {
 ///
 /// Shared by both consumers of a [`Manifest`]: `breakdown` (critical-path gutter
 /// + `Max` bottleneck-member pick) and `trace::place` (critical-path collapse of
-/// `Max`). `trace::place::tests` / `breakdown::tests` pin that this equals
-/// `place`'s emission fold, so the three stay in lockstep.
+///   `Max`). `trace::place::tests` / `breakdown::tests` pin that this equals
+///   `place`'s emission fold, so the three stay in lockstep.
 pub(crate) fn node_time(m: &Manifest, idx: usize, slot_ns: &[i64]) -> i64 {
     match &m.nodes[idx] {
         FlatCostNode::Leaf(slot) => slot_ns.get(*slot).copied().unwrap_or(0),

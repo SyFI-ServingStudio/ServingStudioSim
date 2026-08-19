@@ -86,7 +86,8 @@ pub async fn run_utilization(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
             ));
         }
     };
-    if !(t_max > t_min) {
+    let span_is_positive = matches!(t_max.partial_cmp(&t_min), Some(std::cmp::Ordering::Greater));
+    if !span_is_positive {
         let reason = "cost_log busy span is zero (no positive iteration durations)";
         return Ok((
             unavailable(log_dir, reason),

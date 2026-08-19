@@ -219,7 +219,9 @@ impl GroupedFp8GemmWithQuantOp {
     pub fn eval(&self, input: &GroupedFp8GemmWithQuantInput, ev: &mut Evaluator) {
         assert!(
             self.experts_per_token > 0
-                && input.global_expert_selections % self.experts_per_token == 0,
+                && input
+                    .global_expert_selections
+                    .is_multiple_of(self.experts_per_token),
             "global expert selections must be divisible by experts_per_token"
         );
         let num_tokens = input.global_expert_selections / self.experts_per_token;

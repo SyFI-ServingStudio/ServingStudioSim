@@ -72,16 +72,20 @@ pub(super) struct SectionFoldPlan {
     pub(super) hardware_peak_tflops_by_slot: Vec<f64>,
 }
 
+/// Return type of [`build_section_fold_plans`]: interned kernel locations plus
+/// each `(pool_tag, worker_id, section)`'s fold plan.
+type SectionFoldPlans = (
+    Vec<KernelLocation>,
+    HashMap<(String, u16, String), SectionFoldPlan>,
+);
+
 /// Intern every manifest leaf into a global location, and precompute each
 /// `(pool_tag, worker_id, section)`'s fold weights + per-slot rate ceilings.
 pub(super) fn build_section_fold_plans(
     manifests_by_worker: &BTreeMap<(String, u16), ManifestDoc>,
     grid_peak_catalog: &GridPeakCatalog,
     gpu_spec: &GpuSpec,
-) -> (
-    Vec<KernelLocation>,
-    HashMap<(String, u16, String), SectionFoldPlan>,
-) {
+) -> SectionFoldPlans {
     let mut location_id_by_name: HashMap<String, u32> = HashMap::new();
     let mut kernel_locations: Vec<KernelLocation> = Vec::new();
     let mut section_fold_plans = HashMap::new();

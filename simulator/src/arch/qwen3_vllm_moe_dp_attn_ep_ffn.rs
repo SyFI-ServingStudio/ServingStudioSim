@@ -248,7 +248,7 @@ pub fn build_configs(
         "attn_tp_size / ep_size must be non-zero"
     );
     assert!(
-        parallel.ep_size % parallel.attn_tp_size == 0,
+        parallel.ep_size.is_multiple_of(parallel.attn_tp_size),
         "ep_size {} must be a multiple of attn_tp_size {} (DP groups = ep / attn_tp)",
         parallel.ep_size,
         parallel.attn_tp_size,
@@ -261,14 +261,17 @@ pub fn build_configs(
         parallel.ep_size,
     );
     assert!(
-        parallel.ep_size % parallel.hp_size == 0,
+        parallel.ep_size.is_multiple_of(parallel.hp_size),
         "ep_size {} must be a multiple of hp_size {}",
         parallel.ep_size,
         parallel.hp_size,
     );
     assert!(parallel.nvl_num_gpu > 0, "nvl_num_gpu must be non-zero");
     assert!(
-        model.num_experts.get() % u32::from(parallel.ep_size) == 0,
+        model
+            .num_experts
+            .get()
+            .is_multiple_of(u32::from(parallel.ep_size)),
         "num_experts {} not divisible by ep_size {}",
         model.num_experts,
         parallel.ep_size,

@@ -493,6 +493,10 @@ impl HybridGdnKv {
         self.prefix_caches[partition as usize].shrink_to(physical_limit)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each arg is a distinct identity/value piece of the prefix-cache retain event; bundling would just move the same fan-out into a struct"
+    )]
     fn retain_prefix(
         &mut self,
         request: RequestId,

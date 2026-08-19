@@ -334,7 +334,7 @@ pub trait AttnLayerwiseModel: Send + Sync + 'static {
 /// split convention impls follow:
 ///   - `pre_attn_cost(0)`       = real qkv cost (layer-0 Bootstrap);
 ///   - `pre_attn_cost(L > 0)`   = [`LeafMetrics::ZERO`] (the fused Bridge bills
-///                                pre(L+1) inside `post_attn_cost(L)`);
+///     pre(L+1) inside `post_attn_cost(L)`);
 ///   - `post_attn_cost(L < last)` bills post(L) **plus** the fused pre(L+1);
 ///   - `post_attn_cost(last)`     is post-only (Terminal).
 ///

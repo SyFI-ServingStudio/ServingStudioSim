@@ -325,7 +325,8 @@ async fn accumulate(
         let (bk_off, bk_vals) = list_u8(batch, "slot_backend")?;
         // Cache the resolved slot→position vector across the run of rows that share
         // one (pool, worker, section) — cost_log is worker/iter ordered.
-        let mut cached: Option<((&str, u16, &str), &Vec<u32>)> = None;
+        type CachedSlotLoc<'a> = ((&'a str, u16, &'a str), &'a Vec<u32>);
+        let mut cached: Option<CachedSlotLoc> = None;
         for row in 0..batch.num_rows() {
             let (p, w, s) = (pool.value(row), value_f64(wid, row)? as u16, sec.value(row));
             let ids = match cached {
@@ -369,10 +370,7 @@ async fn accumulate(
     }
 
     // Per position, bound the deduped observations with a per-backend even stride.
-    let points = dedup
-        .into_iter()
-        .map(|per_pos| bound_points(per_pos))
-        .collect();
+    let points = dedup.into_iter().map(bound_points).collect();
 
     Ok(Scan {
         points,

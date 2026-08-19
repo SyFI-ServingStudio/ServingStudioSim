@@ -121,7 +121,7 @@ pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3
         "attn_tp_size / ffn_tp_size must be non-zero"
     );
     assert!(
-        parallel.ffn_tp_size % parallel.attn_tp_size == 0,
+        parallel.ffn_tp_size.is_multiple_of(parallel.attn_tp_size),
         "ffn_tp_size {} must be a multiple of attn_tp_size {} (DP groups = ffn_tp/attn_tp)",
         parallel.ffn_tp_size,
         parallel.attn_tp_size

@@ -439,7 +439,7 @@ async fn collect_timelines(ctx: &SessionContext) -> Result<Vec<(f64, Vec<Transit
         let code_col = col(batch, "stage_codes")?;
         let pool_col = col(batch, "stage_pool_ids")?;
         let worker_col = col(batch, "stage_worker_ids")?;
-        for row in 0..batch.num_rows() {
+        for (row, &logging_time) in logging_times.iter().enumerate() {
             let times = value_f32_list(time_col, row)?;
             let codes = value_u16_list(code_col, row, "stage_codes")?;
             let pools = value_u16_list(pool_col, row, "stage_pool_ids")?;
@@ -462,7 +462,7 @@ async fn collect_timelines(ctx: &SessionContext) -> Result<Vec<(f64, Vec<Transit
                     worker: worker as u64,
                 })
                 .collect();
-            out.push((logging_times[row], transitions));
+            out.push((logging_time, transitions));
         }
     }
     Ok(out)

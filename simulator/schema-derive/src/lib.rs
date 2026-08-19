@@ -14,13 +14,13 @@
 //! the field's `///` doc comment. Everything serde/clap cannot express rides on
 //! an inert `#[param(...)]` helper:
 //!   - `#[param(skip)]`             → field contributes no param (nested
-//!                                     sub-trees: `groups`, `arch`, `worker`).
+//!     sub-trees: `groups`, `arch`, `worker`).
 //!   - `#[param(default = LIT)]`    → `.default_<kind>(LIT)`.
 //!   - `#[param(cache_key)]`        → `.cache_key()`.
 //!   - `#[param(choices = CONST)]`  → `.choices(&CONST)`.
 //!   - `#[param(string)]`           → treat the field as a `string` param even
-//!                                     though its Rust type is a foreign enum
-//!                                     (`placement`, `log_level`, `batch_policy`).
+//!     though its Rust type is a foreign enum
+//!     (`placement`, `log_level`, `batch_policy`).
 //!
 //! `#[serde(flatten)]` fields are skipped automatically (the flattened struct
 //! contributes its own `PARAMS` block). A `bool` with no explicit default gets an

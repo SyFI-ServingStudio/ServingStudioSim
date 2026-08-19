@@ -151,7 +151,7 @@ impl MoeExpertComputeLocalWorklet {
         let ep = cfg.ep_size as u32;
         assert!(ep > 0, "ep_size must be non-zero");
         assert!(
-            cfg.num_experts.get() % ep == 0,
+            cfg.num_experts.get().is_multiple_of(ep),
             "num_experts {} not divisible by ep_size {}",
             cfg.num_experts,
             ep,
@@ -401,7 +401,7 @@ pub fn uniform_local_ppm(num_experts: u32, ep_size: u16) -> Vec<u32> {
     assert!(ep_size > 0, "ep_size must be non-zero");
     let ep = u32::from(ep_size);
     assert!(
-        num_experts % ep == 0,
+        num_experts.is_multiple_of(ep),
         "num_experts {num_experts} not divisible by ep_size {ep}"
     );
     let experts_per_gpu = (num_experts / ep) as usize;

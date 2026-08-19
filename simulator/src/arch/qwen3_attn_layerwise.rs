@@ -114,7 +114,7 @@ pub struct Qwen3AttnLayerwiseModel {
     pub attn: FlashInferAttentionOp,
     /// This shard's per-layer attention cost tree (a single `attn`), compiled once
     /// + flattened. Layer-homogeneous — every layer sees the same batch within an
-    /// iteration, so one compiled tree serves all layers.
+    ///   iteration, so one compiled tree serves all layers.
     attn_flat: Vec<FlatCostNode>,
     attn_n_slots: usize,
 }

@@ -7,7 +7,7 @@
 //!   - [`Fp8PostAttnRouterTpWorklet`] = o_proj + [tp_allreduce] + post_norm + router
 //!     (post-attn dense tail + MoE gate; the post_norm + router are a composed
 //!     [`NativeFp8MoeRouterLocalWorklet`], shared with the unified native-FP8 arch)
-//! The attention itself is the attn side (`qwen3_attn_layerwise`).
+//!     The attention itself is the attn side (`qwen3_attn_layerwise`).
 //!
 //! Per-layer cost is split at the attn boundary into two groups plus an iteration
 //! prologue/epilogue, with the Bridge/Bootstrap/Terminal fused-kernel convention
@@ -15,7 +15,7 @@
 //!   - `pre_attn_cost(0)`        = `Max{1.0}( pre_attn × num_dp )`  (Bootstrap)
 //!   - `pre_attn_cost(L > 0)`    = ZERO  (the Bridge bills pre(L) inside post(L-1))
 //!   - `post_attn_cost(L)`       = post_attn + MoE, and for `L < last` additionally
-//!                                 the fused pre(L+1) (Bridge); `L == last` is post-only (Terminal)
+//!     the fused pre(L+1) (Bridge); `L == last` is post-only (Terminal)
 //!   - `prologue_cost`           = embed
 //!   - `epilogue_cost`           = Sum(final_norm, lm_head)
 //!
@@ -28,8 +28,8 @@
 //! its OWN token slice (`g.batch_tokens`), so DP load imbalance is modeled exactly
 //! (the section wallclock is the slowest shard, never a pooled average). post_norm
 //! + router run replicated across the shard's `attn_tp_size` ranks after the o_proj
-//! all-reduce — same per-shard token count as o_proj, which is why they live in one
-//! worklet.
+//!   all-reduce — same per-shard token count as o_proj, which is why they live in one
+//!   worklet.
 //!
 //! So `Σ_L pre + Σ_L post + prologue + epilogue` totals exactly one (norm+qkv) +
 //! one (o_proj+ar+post_norm+router) + one MoE (dispatch+expert+reduce+combine) per
@@ -194,7 +194,7 @@ pub fn build_configs(
         "attn_tp_size / ep_size must be non-zero"
     );
     assert!(
-        parallel.ep_size % parallel.attn_tp_size == 0,
+        parallel.ep_size.is_multiple_of(parallel.attn_tp_size),
         "ep_size {} must be a multiple of attn_tp_size {} (DP groups = ep / attn_tp)",
         parallel.ep_size,
         parallel.attn_tp_size,
@@ -203,7 +203,10 @@ pub fn build_configs(
     let num_dp_groups = parallel.ep_size / parallel.attn_tp_size;
     assert!(parallel.nvl_num_gpu > 0, "nvl_num_gpu must be non-zero");
     assert!(
-        model.num_experts.get() % u32::from(parallel.ep_size) == 0,
+        model
+            .num_experts
+            .get()
+            .is_multiple_of(u32::from(parallel.ep_size)),
         "num_experts {} not divisible by ep_size {}",
         model.num_experts,
         parallel.ep_size,
