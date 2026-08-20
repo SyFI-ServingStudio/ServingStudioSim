@@ -18,13 +18,11 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    Fp8PerTokenGroupQuantKernelConfig, ResidualRmsNormKernel,
-    ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, RmsNormKernel,
-    RmsNormKernelConfig, RmsNormKernelInput, SingleGemmKernelConfig,
+    Fp8PerTokenGroupQuantKernelConfig, ResidualRmsNormKernel, ResidualRmsNormKernelConfig,
+    ResidualRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
+    SingleGemmKernelConfig,
 };
-use crate::timing::{
-    BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge,
-};
+use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 const HIDDEN: u32 = 2048;
 const NUM_QO_HEADS: u32 = 16;
@@ -146,10 +144,7 @@ impl Qwen36GatedGqaLocalWorklet {
             },
             q_norm: qk_norm(),
             k_norm: qk_norm(),
-            partial_rope: elementwise(
-                PARTIAL_ROPE_BYTES_PER_TOKEN,
-                PARTIAL_ROPE_BYTES_PER_TOKEN,
-            ),
+            partial_rope: elementwise(PARTIAL_ROPE_BYTES_PER_TOKEN, PARTIAL_ROPE_BYTES_PER_TOKEN),
             attention: FlashInferAttentionConfig {
                 backends: cfg.attention_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -282,9 +277,8 @@ impl Qwen36GatedGqaLocalWorklet {
     }
 
     pub fn eval(&self, input: &Qwen36GatedGqaLocalWorkletInput, ev: &mut Evaluator) {
-        let work = derive_work(input).unwrap_or_else(|reason| {
-            panic!("invalid Qwen36GatedGqaLocalWorkletInput: {reason}")
-        });
+        let work = derive_work(input)
+            .unwrap_or_else(|reason| panic!("invalid Qwen36GatedGqaLocalWorkletInput: {reason}"));
         self.input_add_rms_norm.eval(&work.input_add_rms_norm, ev);
         self.qkv_gate.eval(&work.qkv_gate, ev);
         self.q_norm.eval(&work.q_norm, ev);
@@ -556,16 +550,16 @@ mod tests {
         }
         let mut bad = cfg();
         bad.activation_dtype = DType::Fp16;
-        assert!(std::panic::catch_unwind(|| {
-            Qwen36GatedGqaLocalWorklet::resolve_config(&bad)
-        })
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| { Qwen36GatedGqaLocalWorklet::resolve_config(&bad) })
+                .is_err()
+        );
         let mut bad = cfg();
         bad.kv_cache_block_size = 0;
-        assert!(std::panic::catch_unwind(|| {
-            Qwen36GatedGqaLocalWorklet::resolve_config(&bad)
-        })
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| { Qwen36GatedGqaLocalWorklet::resolve_config(&bad) })
+                .is_err()
+        );
     }
 
     #[test]
@@ -689,7 +683,10 @@ mod tests {
     #[test]
     fn compiled_children_preserve_backend_roles_and_non_fp8_attention() {
         let worklet = enumerate_worklet();
-        assert_eq!(worklet.input_add_rms_norm.kernel.config.backends, ["vllm_cuda"]);
+        assert_eq!(
+            worklet.input_add_rms_norm.kernel.config.backends,
+            ["vllm_cuda"]
+        );
         assert_eq!(worklet.q_norm.kernel.config.backends, ["vllm_cuda"]);
         assert_eq!(worklet.partial_rope.kernel.config.backends, ["triton"]);
         assert_eq!(worklet.attention.prefill.config.backends, ["fa2", "fa3"]);
@@ -723,8 +720,14 @@ mod tests {
             },
         ] {
             let work = derive_work(&input).unwrap();
-            assert_eq!(work.attention.prefill_chunk_pairs.is_empty(), input.prefill_chunk_pairs.is_empty());
-            assert_eq!(work.attention.decode_kv_lens.is_empty(), input.decode_kv_lens.is_empty());
+            assert_eq!(
+                work.attention.prefill_chunk_pairs.is_empty(),
+                input.prefill_chunk_pairs.is_empty()
+            );
+            assert_eq!(
+                work.attention.decode_kv_lens.is_empty(),
+                input.decode_kv_lens.is_empty()
+            );
         }
     }
 }

@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     Fp8BlockQuantKernel, Fp8BlockQuantKernelConfig, Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemmKernel, Fp8BlockscaleGroupedGemmKernelConfig,
@@ -13,7 +14,6 @@ use crate::timing::kernels::{
     Fp8PerTokenGroupQuantKernelConfig, Fp8PerTokenGroupQuantKernelInput, VllmFusedMoeKernel,
     VllmFusedMoeKernelConfig, VllmFusedMoeKernelInput,
 };
-use crate::timing::bridge::DType;
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBridge, Probe};
 

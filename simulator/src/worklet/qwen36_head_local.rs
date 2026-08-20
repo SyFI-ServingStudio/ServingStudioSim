@@ -58,9 +58,7 @@ pub struct Qwen36HeadLocalWorklet {
 }
 
 impl Qwen36HeadLocalWorklet {
-    pub fn resolve_config(
-        cfg: &Qwen36HeadLocalWorkletConfig,
-    ) -> Qwen36HeadLocalWorkletResolved {
+    pub fn resolve_config(cfg: &Qwen36HeadLocalWorkletConfig) -> Qwen36HeadLocalWorkletResolved {
         validate_config(cfg)
             .unwrap_or_else(|reason| panic!("invalid Qwen36HeadLocalWorkletConfig: {reason}"));
 
@@ -131,12 +129,7 @@ impl Qwen36HeadLocalWorklet {
             input.final_norm_tokens == 0,
             ev,
         );
-        eval_atomic_or_zero(
-            &self.lm_head,
-            work.lm_head,
-            input.logits_tokens == 0,
-            ev,
-        );
+        eval_atomic_or_zero(&self.lm_head, work.lm_head, input.logits_tokens == 0, ev);
     }
 }
 
@@ -260,17 +253,16 @@ mod tests {
         ] {
             let mut bad = cfg();
             mutate(&mut bad);
-            assert!(std::panic::catch_unwind(|| {
-                Qwen36HeadLocalWorklet::resolve_config(&bad)
-            })
-            .is_err());
+            assert!(
+                std::panic::catch_unwind(|| { Qwen36HeadLocalWorklet::resolve_config(&bad) })
+                    .is_err()
+            );
         }
         let mut bad = cfg();
         bad.activation_dtype = DType::Fp16;
-        assert!(std::panic::catch_unwind(|| {
-            Qwen36HeadLocalWorklet::resolve_config(&bad)
-        })
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| { Qwen36HeadLocalWorklet::resolve_config(&bad) }).is_err()
+        );
     }
 
     #[test]
@@ -299,7 +291,10 @@ mod tests {
             tree.slots[0].kernel_config,
             resolved.final_add_rms_norm.describe_config()
         );
-        assert_eq!(tree.slots[1].kernel_config, resolved.lm_head.describe_config());
+        assert_eq!(
+            tree.slots[1].kernel_config,
+            resolved.lm_head.describe_config()
+        );
         assert!(!tree.slots.iter().any(|slot| {
             slot.kind.contains("fp8")
                 || slot.kind.contains("quant")
@@ -319,11 +314,9 @@ mod tests {
 
     #[test]
     fn ordinary_generation_rows_map_independently() {
-        for (name, final_norm_tokens, logits_tokens) in [
-            ("prefill", 70, 3),
-            ("decode", 4, 4),
-            ("mixed", 74, 7),
-        ] {
+        for (name, final_norm_tokens, logits_tokens) in
+            [("prefill", 70, 3), ("decode", 4, 4), ("mixed", 74, 7)]
+        {
             let work = derive_work(&Qwen36HeadLocalWorkletInput {
                 final_norm_tokens,
                 logits_tokens,
@@ -350,7 +343,10 @@ mod tests {
             logits_tokens: 0,
         })
         .unwrap();
-        assert_eq!((norm_only.final_add_rms_norm.m, norm_only.lm_head.m), (8, 0));
+        assert_eq!(
+            (norm_only.final_add_rms_norm.m, norm_only.lm_head.m),
+            (8, 0)
+        );
         assert!(derive_work(&Qwen36HeadLocalWorkletInput {
             final_norm_tokens: 0,
             logits_tokens: 1,
@@ -448,12 +444,7 @@ mod tests {
             false,
             &mut evaluator,
         );
-        eval_atomic_or_zero(
-            &head,
-            SingleGemmKernelInput { m: 0 },
-            true,
-            &mut evaluator,
-        );
+        eval_atomic_or_zero(&head, SingleGemmKernelInput { m: 0 }, true, &mut evaluator);
         assert_eq!(metrics[0].m.time_ms, 8.0);
         assert_eq!(metrics[1].m.time_ms, 0.0);
         assert_eq!(metrics[1].m.flops, 0.0);
@@ -479,12 +470,7 @@ mod tests {
             true,
             &mut evaluator,
         );
-        eval_atomic_or_zero(
-            &head,
-            SingleGemmKernelInput { m: 0 },
-            true,
-            &mut evaluator,
-        );
+        eval_atomic_or_zero(&head, SingleGemmKernelInput { m: 0 }, true, &mut evaluator);
         assert!(metrics.iter().all(|metric| metric.m.time_ms == 0.0));
         assert_eq!(
             serde_json::to_value(inputs).unwrap(),

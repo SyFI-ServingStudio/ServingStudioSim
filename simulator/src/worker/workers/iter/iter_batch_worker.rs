@@ -58,8 +58,11 @@ pub type BareboneWorker<M> =
 pub type HpUnifiedWorker<M> = BareboneWorker<M>;
 /// Barebone on every axis but KV: a hybrid arch's per-request recurrent state
 /// shares the attention capacity with its per-token KV. Only the store differs.
-pub type Qwen36HybridWorker<M> =
-    IterBatchWorker<HybridGdnKv, LocalPrefillDecodeAdmission<PendingOrder>, UnifiedIterExecution<M>>;
+pub type Qwen36HybridWorker<M> = IterBatchWorker<
+    HybridGdnKv,
+    LocalPrefillDecodeAdmission<PendingOrder>,
+    UnifiedIterExecution<M>,
+>;
 pub type PdPrefillWorker<M> =
     IterBatchWorker<FullAttnKv, PrefillHandoffAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 

@@ -345,7 +345,10 @@ mod iter_tests {
             .iter()
             .map(|param| param["name"].as_str().unwrap())
             .collect();
-        assert_eq!(published, ["routing", "routing_seed", "expert_popularity_file"]);
+        assert_eq!(
+            published,
+            ["routing", "routing_seed", "expert_popularity_file"]
+        );
         let popularity = serde_json::to_value(params).unwrap();
         let popularity = popularity
             .as_array()

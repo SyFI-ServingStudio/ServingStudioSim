@@ -12,8 +12,8 @@ use std::sync::Arc;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    MoeFinalizeRoutingKernel, MoeFinalizeRoutingKernelConfig, MoeFinalizeRoutingKernelInput,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, MoeFinalizeRoutingKernel,
+    MoeFinalizeRoutingKernelConfig, MoeFinalizeRoutingKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
@@ -60,8 +60,9 @@ impl Qwen36MoeFinalizeLocalWorklet {
     pub fn resolve_config(
         cfg: &Qwen36MoeFinalizeLocalWorkletConfig,
     ) -> Qwen36MoeFinalizeLocalWorkletResolved {
-        validate_config(cfg)
-            .unwrap_or_else(|reason| panic!("invalid Qwen36MoeFinalizeLocalWorkletConfig: {reason}"));
+        validate_config(cfg).unwrap_or_else(|reason| {
+            panic!("invalid Qwen36MoeFinalizeLocalWorkletConfig: {reason}")
+        });
 
         let output_bytes = cfg
             .hidden
@@ -140,12 +141,7 @@ impl Qwen36MoeFinalizeLocalWorklet {
         let work = work_inputs(input.batch_tokens);
         let zero = input.batch_tokens == 0;
         eval_atomic_or_zero(&self.finalize, work.finalize, zero, ev);
-        eval_atomic_or_zero(
-            &self.shared_routed_add,
-            work.shared_routed_add,
-            zero,
-            ev,
-        );
+        eval_atomic_or_zero(&self.shared_routed_add, work.shared_routed_add, zero, ev);
     }
 }
 
@@ -276,7 +272,10 @@ mod tests {
     fn uniform_ep1_distribution_and_resolved_configs_are_exact() {
         let ppm = exact_uniform_ep1_ppm();
         assert_eq!(ppm.len(), 256);
-        assert_eq!(ppm.iter().map(|&value| u64::from(value)).sum::<u64>(), TOTAL_PPM);
+        assert_eq!(
+            ppm.iter().map(|&value| u64::from(value)).sum::<u64>(),
+            TOTAL_PPM
+        );
         assert_eq!(ppm.iter().filter(|&&value| value == 3907).count(), 64);
         assert_eq!(ppm.iter().filter(|&&value| value == 3906).count(), 192);
 
@@ -353,7 +352,10 @@ mod tests {
             ["moe_finalize_routing", "elementwise"]
         );
         let resolved = Qwen36MoeFinalizeLocalWorklet::resolve_config(&cfg());
-        assert_eq!(tree.slots[0].kernel_config, resolved.finalize.describe_config());
+        assert_eq!(
+            tree.slots[0].kernel_config,
+            resolved.finalize.describe_config()
+        );
         assert_eq!(
             tree.slots[1].kernel_config,
             resolved.shared_routed_add.describe_config()

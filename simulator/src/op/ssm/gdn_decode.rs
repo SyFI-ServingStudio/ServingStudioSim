@@ -7,9 +7,8 @@
 use std::sync::Arc;
 
 use crate::timing::kernels::{
-    GdnCausalConvDecodeKernel, GdnCausalConvDecodeKernelConfig,
-    GdnCausalConvDecodeKernelInput, GdnRecurrentDecodeKernel,
-    GdnRecurrentDecodeKernelConfig, GdnRecurrentDecodeKernelInput,
+    GdnCausalConvDecodeKernel, GdnCausalConvDecodeKernelConfig, GdnCausalConvDecodeKernelInput,
+    GdnRecurrentDecodeKernel, GdnRecurrentDecodeKernelConfig, GdnRecurrentDecodeKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Evaluator, LeafMetrics, PerfApiBridge, Probe,

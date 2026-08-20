@@ -383,7 +383,11 @@ mod tests {
     fn fixed_charge_is_paid_once_and_never_advanced() {
         let mut partition = ResidentPartitionState::new(1000, 100);
         partition.begin_decode(request_id(1), 10, 3);
-        assert_eq!(partition.resident_tokens(), 110, "context + one fixed charge");
+        assert_eq!(
+            partition.resident_tokens(),
+            110,
+            "context + one fixed charge"
+        );
 
         partition.advance_decodes();
         assert_eq!(
@@ -398,7 +402,11 @@ mod tests {
         );
 
         partition.release_decode(request_id(1), 11);
-        assert_eq!(partition.resident_tokens(), 0, "release returns both halves");
+        assert_eq!(
+            partition.resident_tokens(),
+            0,
+            "release returns both halves"
+        );
     }
 
     #[test]
