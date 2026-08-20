@@ -1,0 +1,59 @@
+name: 🤗 New model support
+description: Request or propose support for a new model architecture
+title: "[New Model]: "
+labels: ["new model"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Adding a model in VibeSim is not one change. It is a split of the forward pass into
+      kernels, whatever **measured** L1 rows that split turns out to need, the L2-L4
+      composition on top, and an independent `model.work` label. The `top-add-new-arch` skill
+      routes the whole sequence; this issue exists to agree on the target and the shape of the
+      work before that starts.
+- type: textarea
+  attributes:
+    label: The model to consider
+    description: >
+      A Hugging Face URL, and the exact checkpoint commit if the architecture is still moving.
+      Say which config variant you actually want simulated — sizes, quantization, and context
+      length change the answer.
+    placeholder: |
+      https://huggingface.co/<org>/<model>
+      pinned @ <commit sha>
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: The closest architecture VibeSim already supports
+    description: >
+      See `simulator/src/arch/`. Which existing arch is nearest, and where does the new model
+      diverge from it? Reuse is the default; a new file needs a reason.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: What makes it difficult
+    description: >
+      Operations with no existing kernel, fused boundaries a real framework launches
+      differently, a cache/state shape that is not plain KV, a routing or sparsity scheme with
+      no current cost model, a collective VibeSim has never measured. Name the ones you know
+      about — an unmeasured shape must fail as a missing cache identity, never silently borrow
+      a neighbor's timing.
+  validations:
+    required: true
+- type: input
+  attributes:
+    label: Target deployment
+    description: >
+      The hardware and parallelism you want it runnable at, since that is what decides which
+      kernels have to be measured.
+    placeholder: 4x H200, attention DP=4/TP=1, MoE EP=4, unified
+- type: textarea
+  attributes:
+    label: Reference implementation
+    description: >
+      The serving path you intend to mirror — vLLM, SGLang, TensorRT-LLM, or the Transformers
+      reference — and any known divergence between them for this model. VibeSim costs what a
+      framework actually launches, so this choice is part of the specification.

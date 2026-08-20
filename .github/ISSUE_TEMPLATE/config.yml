@@ -1,0 +1,8 @@
+# Blank issues stay enabled on purpose: this is a small internal repo, and forcing a form on
+# a one-line note would cost more than it saves. Use the forms when the issue is one someone
+# else will have to pick up cold.
+blank_issues_enabled: true
+contact_links:
+  - name: Design docs
+    url: https://github.com/SyFI-VibeSim/VibeSim/blob/master/doc/README.md
+    about: The current design record — architecture, invariants, per-layer detailed design, and the analyzer subject catalog. Start here before filing a design question.

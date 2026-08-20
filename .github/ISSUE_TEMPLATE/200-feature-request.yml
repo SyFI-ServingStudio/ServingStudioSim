@@ -1,0 +1,36 @@
+name: 🚀 Feature request
+description: Propose a new VibeSim capability
+title: "[Feature]: "
+labels: ["enhancement"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### For a change large enough to need agreement on the design before anyone writes
+      code — a new layer contract, a new deployment shape, a cross-cutting refactor — open an
+      **[RFC]** instead, so the discussion has somewhere to live.
+- type: textarea
+  attributes:
+    label: The feature, motivation, and pitch
+    description: >
+      What you want, and the concrete problem it solves. "I'm modeling X and cannot express
+      Y" is far more useful than a bare capability name.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Which layer does this touch
+    description: >
+      Your best guess at where it lands — L1 measured kernels, L2 ops, L3 worklets, L4 model
+      arch, L5 worker, L6 flow, L7 sim loop, launcher, or analyzer. A guess is fine; it tells
+      a reader which design doc to open. See `doc/README.md`.
+- type: textarea
+  attributes:
+    label: Alternatives considered
+    description: >
+      Including the option of composing existing pieces. Most requests turn out to be
+      expressible with the current kernels, ops, or subjects, and that is the cheaper answer.
+- type: textarea
+  attributes:
+    label: Additional context

@@ -1,0 +1,44 @@
+name: 💬 Request for comments (RFC)
+description: Ask for feedback on a major architectural change or design choice
+title: "[RFC]: "
+labels: ["RFC"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Use an RFC when the change needs agreement *before* the code exists — a layer
+      contract, a new deployment or worker shape, a cross-cutting refactor, or landing a large
+      body of work from elsewhere. Past RFCs are
+      [here](https://github.com/SyFI-VibeSim/VibeSim/issues?q=label%3ARFC+sort%3Aupdated-desc).
+- type: textarea
+  attributes:
+    label: Motivation.
+    description: >
+      Why this is worth doing, with the evidence behind it. State what exists today and what it
+      cannot express — measured numbers, commit ranges, and file counts beat adjectives.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Proposed Change.
+    description: >
+      What you intend to do, concretely enough to disagree with. Name the layers and files it
+      touches, the invariants it must preserve, and how you will know it worked. If it is not
+      obvious, say what makes the change hard — that is usually the part people have opinions
+      about.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Feedback Period.
+    description: How long before you proceed. Usually about a week.
+- type: textarea
+  attributes:
+    label: CC List.
+- type: textarea
+  attributes:
+    label: Any Other Things.
+    description: >
+      Deliberate limitations, gates that must survive the change, and known gaps this does not
+      close. A reviewer signing off should not be surprised later.
