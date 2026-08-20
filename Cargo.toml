@@ -2,6 +2,14 @@
 name = "simulator"
 version = "0.1.0"
 edition = "2021"
+# Dual community licensing: PolyForm Noncommercial 1.0.0 OR PolyForm Internal Use
+# 1.0.0, plus separately negotiated commercial licenses. This is deliberately
+# `license-file` and not `license`: a `license` value must be a valid SPDX
+# expression, and while `PolyForm-Noncommercial-1.0.0` is on the SPDX license
+# list, `PolyForm-Internal-Use-1.0.0` is not — so the "A OR B" expression this
+# project actually offers cannot be written in SPDX. See LICENSING.md.
+license-file = "LICENSE"
+publish = false
 
 [[bin]]
 name = "simulator"

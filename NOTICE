@@ -1,0 +1,26 @@
+Required Notice: Copyright 2026 <COPYRIGHT HOLDER>
+
+This notice is the plain-text line referred to by the Notices section of the
+PolyForm Noncommercial License 1.0.0. Anyone who receives a copy of any part of
+this software must also receive a copy of that line, together with a copy of the
+license terms or their URL.
+
+(The PolyForm Internal Use License 1.0.0 has no Notices section and does not
+permit distribution at all, so this requirement is operative for noncommercial
+distribution.)
+
+--------------------------------------------------------------------------------
+THIRD-PARTY NOTICES
+
+This repository redistributes third-party source that carries its own notice
+requirements. Those notices are not superseded by the notice above.
+
+vLLM (Apache License 2.0)
+  Files under profiling/runners/attention/dsa_persistent_topk_native/upstream/
+  are copied byte-for-byte from vLLM v0.23.0, commit
+  0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665, and remain licensed under
+  Apache-2.0. A copy of that license is at LICENSES/Apache-2.0.txt.
+  Copyright the vLLM project contributors.
+
+See THIRD_PARTY_NOTICES.md for the full inventory, including submodules and
+components that are referenced rather than vendored.

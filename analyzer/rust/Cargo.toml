@@ -3,6 +3,10 @@ name = "analyzer"
 version = "0.1.0"
 edition = "2021"
 description = "VibeSim post-sim analyzer — DataFusion parquet scan → report + plot-payload JSON"
+# Licensed under the root LICENSE (PolyForm Noncommercial 1.0.0 OR PolyForm
+# Internal Use 1.0.0); not published to crates.io.
+license-file = "../../LICENSE"
+publish = false
 
 [[bin]]
 name = "analyze"
