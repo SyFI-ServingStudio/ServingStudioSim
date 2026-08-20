@@ -3,6 +3,12 @@ name = "vibesim"
 version = "0.1.0"
 description = "VibeSim — discrete-event simulator for ML serving + training workloads"
 requires-python = ">=3.12,<3.13"
+# Source-available, not OSI open source. Dual community licensing: PolyForm
+# Noncommercial 1.0.0 OR PolyForm Internal Use 1.0.0, plus separately negotiated
+# commercial licenses. Referenced by file rather than by SPDX expression because
+# `PolyForm-Internal-Use-1.0.0` is not on the SPDX license list, so the "A OR B"
+# expression this project offers is not expressible. See LICENSING.md.
+license = { file = "LICENSE" }
 dependencies = [
     "transformers>=5.13.0",
 ]

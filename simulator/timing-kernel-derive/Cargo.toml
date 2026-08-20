@@ -2,6 +2,10 @@
 name = "timing-kernel-derive"
 version = "0.1.0"
 edition = "2021"
+# Licensed under the root LICENSE (PolyForm Noncommercial 1.0.0 OR PolyForm
+# Internal Use 1.0.0); not published to crates.io.
+license-file = "../../LICENSE"
+publish = false
 
 [lib]
 proc-macro = true

@@ -105,3 +105,29 @@ built-binary, warm-database, and Agent-runtime checks. Use the repository
 
 For focused changes, format and test only the touched files. Do not run
 workspace-wide formatters over unrelated worktrees or generated artifacts.
+
+## Licensing
+
+This project is source-available under a dual community licensing
+model.
+
+You may use it under whichever of the following licenses applies to
+your use:
+
+- **PolyForm Noncommercial License 1.0.0** — for noncommercial,
+  research, educational, and other uses permitted by that license.
+- **PolyForm Internal Use License 1.0.0** — for internal business use,
+  including internal use and modification by commercial organizations.
+
+The two are alternatives; you do not need to satisfy both.
+
+Uses not permitted by either community license, including external
+commercial productization and redistribution, require a separate
+commercial license.
+
+See [`LICENSING.md`](LICENSING.md) for details and
+[`COMMERCIAL-LICENSING.md`](COMMERCIAL-LICENSING.md) for commercial licensing
+information. Third-party components remain under their own licenses — see
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Contributors keep their
+copyright and grant the rights in [`CLA.md`](CLA.md); see
+[`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.

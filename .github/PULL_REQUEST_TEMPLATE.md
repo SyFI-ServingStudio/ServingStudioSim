@@ -23,6 +23,20 @@
 
 <!-- Paste the output. For anything that changes a modeled number, show before and after. -->
 
+## Contribution licensing
+
+<!-- These are the author's acknowledgements. They are NOT a CLA signature: this repo has
+     no CLA bot and records nothing automatically. A maintainer must confirm recorded CLA
+     acceptance separately before merging outside work. See CONTRIBUTING.md. -->
+
+- [ ] I have read the project's CLA.
+- [ ] I have the right to submit this contribution.
+- [ ] I have disclosed any third-party code or licensing restrictions.
+- [ ] I understand that CLA acceptance must be recorded before this
+      contribution can be merged.
+
+Third-party material included or adapted here (project, URL, version, license — or "none"):
+
 ---
 <details>
 <summary>Checklist</summary>

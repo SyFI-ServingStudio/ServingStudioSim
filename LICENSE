@@ -1,0 +1,30 @@
+PROJECT LICENSING
+
+Except for third-party components identified separately, this software
+is made available under your choice of either:
+
+1. PolyForm Noncommercial License 1.0.0
+   See: LICENSES/PolyForm-Noncommercial-1.0.0.txt
+
+OR
+
+2. PolyForm Internal Use License 1.0.0
+   See: LICENSES/PolyForm-Internal-Use-1.0.0.txt
+
+You may rely on whichever of these licenses covers your use. They are
+alternatives; you do not need to satisfy both at once.
+
+A separate commercial license is available for uses not permitted by
+either license, including external commercial productization,
+distribution, OEM/white-label use, and commercial hosted or managed
+offerings.
+
+See COMMERCIAL-LICENSING.md for details.
+
+This project is source-available. It is not OSI-approved open source.
+
+Third-party components remain subject to their respective licenses.
+See THIRD_PARTY_NOTICES.md for the inventory, and LICENSES/ for the
+license texts they require.
+
+Required Notice: Copyright 2026 <COPYRIGHT HOLDER>
