@@ -1,0 +1,58 @@
+name: 🐛 Bug report
+description: Report something in VibeSim that behaves incorrectly
+title: "[Bug]: "
+labels: ["bug"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before filing, please search [existing issues](https://github.com/SyFI-VibeSim/VibeSim/issues?q=is%3Aissue+sort%3Acreated-desc).
+
+
+      #### A simulator bug and a profiling bug need different evidence. If a modeled number
+      looks wrong, say whether you believe the error is in a **measured L1 row**, in the
+      **L2-L4 composition** on top of it, or in the **L5-L7 scheduling** around it — that is
+      usually the first thing a reader has to guess.
+- type: textarea
+  attributes:
+    label: What happened
+    description: >
+      What you observed, and what you expected instead. Paste the failing command and the
+      relevant output rather than paraphrasing it.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: How to reproduce
+    description: >
+      The exact entry point. For a simulation, the launcher preset and the resulting
+      `log_dir`. For a kernel, the `perf_api` call or the `kernel-query` invocation. For an
+      analyzer result, the subject and the run directory.
+    placeholder: |
+      python -m launcher presets/<preset>.yaml
+      log_dir: logs/<date>_<index>_<name>
+  validations:
+    required: true
+- type: input
+  attributes:
+    label: GPU
+    description: >
+      The GPU type this ran on, as it appears in `gpu/spec.json`. Measured timings are
+      per-GPU, so a row that is right on one part is not evidence about another.
+    placeholder: NVIDIA H200
+  validations:
+    required: true
+- type: input
+  attributes:
+    label: Commit
+    description: The commit you are on, and the branch or worktree if it is not `master`.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Anything else
+    description: >
+      Whether a prebuilt binary is involved (the analyzer serves from one, so an edit does
+      nothing until rebuild **and** restart), whether `profile.db` was modified locally, and
+      anything else that would let a reader reproduce the exact state you are in.
