@@ -47,7 +47,8 @@ submodule's own `LICENSE` after checkout.
 | Path | Upstream | Notes |
 | --- | --- | --- |
 | `alignment/profiler/vllm` | https://github.com/serendipity-zk/vllm (branch `moesim-profile`) | A fork of vLLM, Apache-2.0. Used to capture instrumented traces for alignment. |
-| `alignment/load_generator/req-frontend` | https://github.com/serendipity-zk/req-frontend (branch `main`) | Request-frontend schema/load generator. |
+| `alignment/profiler/sglang` | https://github.com/serendipity-zk/sglang (branch `vibesim-alignment`) | A fork of SGLang, Apache-2.0. Used to capture instrumented traces for alignment. |
+| `alignment/load_generator/req-frontend` | https://github.com/uw-syfi/request-factory (branch `main`) | Request-frontend schema/load generator, Apache-2.0. |
 
 ## Launch-only bindings over third-party kernels
 

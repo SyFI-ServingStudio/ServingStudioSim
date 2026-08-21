@@ -8,5 +8,5 @@
 	branch = vibesim-alignment
 [submodule "alignment/load_generator/req-frontend"]
 	path = alignment/load_generator/req-frontend
-	url = https://github.com/serendipity-zk/req-frontend.git
+	url = https://github.com/uw-syfi/request-factory.git
 	branch = main
