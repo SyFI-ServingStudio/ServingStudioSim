@@ -1,7 +1,24 @@
-# vLLM profiler setup
+# Serving-engine profiler setup
 
-The alignment ground truth comes from the **vLLM submodule in this directory**,
-which adds `vllm_iteration(N): <phase>` NVTX scopes and a versioned
+Alignment ground truth comes from the instrumented **vLLM and SGLang
+submodules in this directory**. Both forks emit indexed per-phase NVTX scopes
+and the same versioned alignment records, so capture parsing and downstream
+analysis stay shared. The parent repository pins the exact fork commits:
+
+```text
+alignment/profiler/vllm    # branch: moesim-profile
+alignment/profiler/sglang  # branch: vibesim-alignment
+```
+
+Initialize both from the VibeSim checkout:
+
+```bash
+git submodule update --init alignment/profiler/vllm alignment/profiler/sglang
+```
+
+## vLLM environment
+
+The vLLM fork adds `vllm_iteration(N): <phase>` NVTX scopes and a versioned
 `VibeSimAlignmentIteration {json}` model-input record. It also emits one
 `VibeSimAlignmentRequestTiming {json}` record when each request completes. The
 MoE popularity pass additionally emits `VibeSimAlignmentExpertLoad {json}` only
@@ -9,11 +26,8 @@ when EPLB balancedness logging is explicitly enabled. Each record contains the
 EP-reduced per-layer token counts mapped back to logical expert ids; the launcher
 aggregates these into `expert_popularity.json`. This pass runs without NSYS and
 must be separate from the timing pass because the reduction and D2H conversion
-are deliberate measurement overhead.
-record contains both first-token and decode-span timing. The fork source is
-already vendored (as a git submodule) at:
-
-    alignment/profiler/vllm      # branch: moesim-profile
+are deliberate measurement overhead. Each request-timing record contains both
+first-token and decode-span timing.
 
 Only its `.venv` is missing — build it once. `runner.py` defaults `fork_python`
 to `alignment/profiler/vllm/.venv/bin/python`; override `fork_python` in
@@ -29,24 +43,45 @@ git status                         # confirm branch moesim-profile, tree present
 
 # 3.12 venv living next to the fork (the path runner.py expects)
 uv venv --python 3.12 .venv
-source .venv/bin/activate
 
 # Install the fork's Python over vLLM's precompiled binaries for the pinned
 # base version (skips the from-source CUDA build). Match the box's CUDA (12.8).
 export VLLM_USE_PRECOMPILED=1
-pip install -e .
+uv pip install --python .venv/bin/python -e .
 
 # VLLM's profiling-only NVTX scopes import this optional package when
 # VLLM_NVTX_SCOPES_FOR_PROFILING=1.
-uv pip install nvtx
+uv pip install --python .venv/bin/python nvtx
 
 # Sanity: the fork imports and exposes the instrumentation env var.
-python -c "import vllm, vllm.envs as e; print(vllm.__version__, hasattr(e, 'VLLM_NVTX_SCOPES_FOR_PROFILING'))"
+uv run --python .venv/bin/python python -c "import vllm, vllm.envs as e; print(vllm.__version__, hasattr(e, 'VLLM_NVTX_SCOPES_FOR_PROFILING'))"
 ```
 
 If `VLLM_USE_PRECOMPILED` cannot resolve a wheel for the pinned version, fall
-back to a from-source build (`pip install -e .` without the flag) — this compiles
-CUDA kernels and takes much longer.
+back to a from-source build (`uv pip install --python .venv/bin/python -e .`
+without the flag) — this compiles CUDA kernels and takes much longer.
+
+## SGLang environment
+
+The SGLang fork emits `sglang_iteration(N): <phase>` and the same iteration,
+request-timing, expert-load, and worker-device records consumed by the shared
+pipeline. Build its environment under the submodule's `python/` directory,
+which is the default path selected when `engine: sglang` and no `fork_python`
+override is supplied:
+
+```bash
+cd alignment/profiler/sglang/python
+uv venv --python 3.12 .venv-sglang
+uv pip install --python .venv-sglang/bin/python -e .
+uv run --python .venv-sglang/bin/python python -c \
+  "import sglang; print(sglang.__version__, sglang.__file__)"
+```
+
+The pinned SGLang version currently uses a CUDA 13 user-space stack. On a host
+whose driver needs NVIDIA forward compatibility, set `driver_compat_lib_dir`
+in `profile.yaml` to an unpacked matching `cuda-compat` library directory. The
+launcher validates `libcuda.so.1` there and records the path in launch metadata.
+Do not modify the global `LD_LIBRARY_PATH` to make one capture work.
 
 Model weights: the align config uses the HF repo id `meta-llama/Meta-Llama-3-8B`,
 resolved from the shared cache at `HF_HOME=/m-coriander/coriander/hf`. Confirm the

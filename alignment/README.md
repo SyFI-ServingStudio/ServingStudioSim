@@ -74,7 +74,7 @@ pools: ...
 
 ### `profile.yaml`
 
-This file owns only the real vLLM/req-frontend/NSYS run:
+This file owns only the real serving-engine/req-frontend/NSYS run:
 
 ```yaml
 schema_version: 1
@@ -82,6 +82,7 @@ name: llama3_8b
 log_dir: ./profile
 gpu: NVIDIA H200
 cuda_visible_devices: "0"
+engine: vllm
 fork_python: ../../alignment/profiler/vllm/.venv/bin/python
 
 server:
@@ -104,6 +105,15 @@ workload:
   tokenizer: meta-llama/Meta-Llama-3-8B
   max_concurrency: 64
 ```
+
+Set `engine: sglang` to use the instrumented SGLang submodule instead. Its
+default environment path is
+`alignment/profiler/sglang/python/.venv-sglang/bin/python`, so
+`fork_python` may be omitted after that environment has been built. Both fork
+commits are pinned by the parent repository; initialize them with
+`git submodule update --init alignment/profiler/vllm
+alignment/profiler/sglang`. See `alignment/profiler/README.md` for the separate
+environment setup commands.
 
 A session frontend selects a canonical `session-execution-v2` trace, whose
 prefix/new-input split per row is already materialized:

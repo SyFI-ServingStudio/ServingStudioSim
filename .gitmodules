@@ -2,6 +2,10 @@
 	path = alignment/profiler/vllm
 	url = https://github.com/serendipity-zk/vllm.git
 	branch = moesim-profile
+[submodule "alignment/profiler/sglang"]
+	path = alignment/profiler/sglang
+	url = https://github.com/serendipity-zk/sglang.git
+	branch = vibesim-alignment
 [submodule "alignment/load_generator/req-frontend"]
 	path = alignment/load_generator/req-frontend
 	url = https://github.com/serendipity-zk/req-frontend.git
