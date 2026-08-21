@@ -25,10 +25,10 @@ _K_SCALE_DTYPE = DType.FP32
 _WEIGHT_DTYPE = DType.FP32
 _OUTPUT_DTYPE = DType.FP32
 _SPAN_MODE = "single_causal_tail"
-_REQUIRED_GPU = "NVIDIA H200"
+_SUPPORTED_GPUS = frozenset({"NVIDIA H200", "NVIDIA B200"})
 _QUERY_TILE = 2
 _KEY_TILE = 256
-_DEEPGEMM_KERNEL_NAME = "sm90_fp8_mqa_logits"
+_DEEPGEMM_KERNEL_NAME = "fp8_mqa_logits"
 
 
 @dataclass(frozen=True)
@@ -128,9 +128,10 @@ def _validate_cuda_device(torch: Any) -> None:
             "CUDA is required for the torch dsa_mqa_logits_prefill backend"
         )
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
+    if gpu_name not in _SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
-            f"torch dsa_mqa_logits_prefill is verified only on {_REQUIRED_GPU}, got {gpu_name}"
+            "torch dsa_mqa_logits_prefill is verified only on "
+            f"{sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 
@@ -140,10 +141,10 @@ def _validate_deepgemm_cuda_device(torch: Any) -> None:
             "CUDA is required for the dsa_mqa_logits_prefill vllm_deepgemm_fp8 backend"
         )
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
+    if gpu_name not in _SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
             "dsa_mqa_logits_prefill vllm_deepgemm_fp8 is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
+            f"{sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 
@@ -178,7 +179,8 @@ def _load_deepgemm_backend() -> tuple[Any, Any]:
 def _mqa_logits_entry_point(deep_gemm: Any) -> Any:
     """The fork renamed `fp8_mqa_logits` to `fp8_fp4_mqa_logits` when it unified
     the FP8 and MXFP4 dispatch behind a tuple-typed `q`. Both names reach the
-    same `sm90_fp8_mqa_logits` kernel on the FP8 path, so accept either and let
+    same architecture-specific `fp8_mqa_logits` kernel on the FP8 path, so
+    accept either and let
     the caller adapt the argument shape."""
     for name in ("fp8_mqa_logits", "fp8_fp4_mqa_logits"):
         entry_point = getattr(deep_gemm, name, None)

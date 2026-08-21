@@ -38,12 +38,13 @@ non-communication location. An empty semantic list means that location has zero
 minimum under the cross-leaf-fusion convention. The mapping never derives
 minimum work from simulator shapes.
 
-One arch type needs one map, and two arch types that model the same model still
-need one each: `glm52_dsa_moe_unified.json` (126 locations) and
-`glm52_vllm_dsa_moe_unified.json` (166) share all 82 semantic rows, because the
-vLLM decomposition only cuts the same work into finer leaves — the 40 extra rows
-are quantize / gather / fill leaves with zero minimum, and its 6 `moe_alltoall`
-leaves are communication and never appear in a map.
+One arch type needs one map, and arch types that model the same model still need
+one each. `glm52_dsa_moe_unified.json` (126 locations),
+`glm52_vllm_dsa_moe_unified.json` (166), and
+`glm52_vllm_nvfp4_dsa_moe_unified.json` (117) share all 82 semantic rows. Their
+different decompositions split the same work into different leaves; quantize,
+gather, and fill leaves have zero minimum, while communication leaves never
+appear in a map.
 
 Learned normalization scales are compulsory model weights and therefore remain
 in the minimum at their norm locations. Only the intermediate norm/activation
@@ -60,6 +61,9 @@ for one model differ by exactly that key — `glm52.json` / `glm52_fp8.json`,
 `fp8: true` while its config says nothing is rejected by `floors.py` — labeling
 FP8 weights at two bytes reports a "minimum" larger than the traffic that moved,
 which silently drives redundancy below 1 and is undetectable downstream.
+The ModelOpt GLM-5.2 NVFP4 config similarly declares routed-expert-only FP4
+weights, group size 16, and an FP8 KV cache; the NVFP4 arch type is checked
+against that declaration while retaining BF16 as the unconverted fallback.
 
 Precision is then per segment, never global, because a real checkpoint is mixed:
 
@@ -72,6 +76,9 @@ Precision is then per segment, never global, because a real checkpoint is mixed:
   *is* listed by both checkpoints and is honored.
 - A converted matrix also reads its FP32 block scale
   (`ceil(n/128)·ceil(k/128)·4` bytes), which is compulsory traffic.
+- GLM-5.2 NVFP4 converts only `mlp.experts`: packed E2M1 weights cost half a
+  byte each and read one FP8 E4M3 scale per 16 weights. Dense layers, attention,
+  router, shared experts, embedding, and head remain BF16.
 - A mechanism can fix its own precision independently of the weights:
   `AttentionSemantic.compute_dtype` pins GLM's DSA index logits to FP8 (the index
   cache is FP8 by construction) and its sparse MLA to BF16 (vLLM's FlashMLA

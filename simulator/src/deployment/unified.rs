@@ -371,6 +371,38 @@ impl Deployment for UnifiedDeployment {
                     build_hp_worker,
                 ))
             }
+            IterArchSel::Glm52VllmNvfp4DsaMoe {
+                ep_size,
+                nvl_num_gpu,
+                routing,
+                routing_seed,
+                mtp_mode,
+                expert_popularity_file,
+                ..
+            } => {
+                ensure_hp_unified(&g.worker)?;
+                let model = Arc::new(arch_build::glm52_vllm_nvfp4_dsa_moe(
+                    model_spec,
+                    *ep_size,
+                    *nvl_num_gpu,
+                    *routing,
+                    *routing_seed,
+                    *mtp_mode,
+                    expert_popularity_file.as_deref(),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_hp_worker,
+                ))
+            }
             IterArchSel::Glm52DsaMoe {
                 ep_size,
                 nvl_num_gpu,

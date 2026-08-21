@@ -104,6 +104,8 @@ pub struct VllmGlm52DsaAttnLocalWorkletConfig {
     /// `gemm_dtype` is BF16.
     pub fp8_quant_backends: Vec<&'static str>,
     pub include_indexer: bool,
+    /// Tensor-parallel rank count. TP1 preserves the original H200 graph.
+    pub tp_size: u16,
     pub residual_rms_norm_backends: Vec<&'static str>,
     pub rms_norm_backends: Vec<&'static str>,
     pub single_gemm_backends: Vec<&'static str>,
@@ -169,6 +171,9 @@ pub struct VllmGlm52DsaAttnLocalWorkletConfig {
     pub sparse_index_distribution: String,
     pub sparse_cache_layout: String,
     pub sparse_mla_cache_format: String,
+    pub sparse_attention_q_dtype: DType,
+    pub sparse_attention_cache_dtype: DType,
+    pub sparse_attention_output_dtype: DType,
     pub decode_next_n: u32,
 }
 
@@ -242,6 +247,9 @@ impl VllmGlm52DsaAttnLocalWorklet {
             panic!("invalid VllmGlm52DsaAttnLocalWorkletConfig: {reason}")
         });
 
+        let tp = Dim::param("attn_tp", u32::from(cfg.tp_size));
+        let attention_heads_per_rank = cfg.num_attention_heads.clone() / tp.clone();
+
         let fused_qkv_a_n =
             cfg.q_lora_rank.clone() + cfg.kv_lora_rank.clone() + cfg.rope_dim.clone();
         let q_b_n =
@@ -258,6 +266,9 @@ impl VllmGlm52DsaAttnLocalWorklet {
             gpu_name: cfg.gpu_name.clone(),
             hidden_dim: cfg.hidden_dim.clone(),
             q_lora_rank: cfg.q_lora_rank.clone(),
+            // The DSA indexer is replicated across TP ranks. The B200 trace's
+            // DeepGEMM kernels retain all 32 model index heads while MLA uses
+            // 16 of 64 attention heads per rank at TP4.
             model_num_index_heads: cfg.model_num_index_heads.clone(),
             profile_num_index_heads: cfg.profile_num_index_heads.clone(),
             index_head_dim: cfg.index_head_dim.clone(),
@@ -329,7 +340,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
             q_b_proj: SingleGemmKernelConfig {
                 backends: cfg.single_gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: q_b_n,
+                n: q_b_n / Dim::param("attn_tp", u32::from(cfg.tp_size)),
                 k: cfg.q_lora_rank.clone(),
                 dtype: cfg.gemm_dtype,
             },
@@ -347,7 +358,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
             main_rope: VllmMlaRopeKernelConfig {
                 backends: cfg.main_rope_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                num_heads: cfg.num_attention_heads.clone(),
+                num_heads: attention_heads_per_rank.clone(),
                 qk_nope_head_dim: cfg.qk_nope_head_dim.clone(),
                 rope_dim: cfg.rope_dim.clone(),
                 max_position: cfg.rope_max_position.clone(),
@@ -362,7 +373,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
             q_absorb: BatchedGemmKernelConfig {
                 backends: cfg.q_absorb_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                num_batches: cfg.num_attention_heads.clone(),
+                num_batches: attention_heads_per_rank.clone(),
                 n: cfg.kv_lora_rank.clone(),
                 k: cfg.qk_nope_head_dim.clone(),
                 dtype: cfg.base_dtype,
@@ -372,7 +383,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
                 mla_cache_append_backends: cfg.sparse_mla_cache_append_backends.clone(),
                 elementwise_backends: cfg.sparse_elementwise_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                num_heads: cfg.num_attention_heads.clone(),
+                num_heads: attention_heads_per_rank.clone(),
                 num_kv_heads: cfg.num_kv_heads.clone(),
                 selected_k: cfg.selected_k,
                 latent_dim: cfg.kv_lora_rank.clone(),
@@ -380,6 +391,9 @@ impl VllmGlm52DsaAttnLocalWorklet {
                 value_dim: cfg.kv_lora_rank.clone(),
                 softmax_scale_denominator: cfg.softmax_scale_denominator,
                 dtype: cfg.base_dtype,
+                attention_q_dtype: cfg.sparse_attention_q_dtype,
+                attention_cache_dtype: cfg.sparse_attention_cache_dtype,
+                attention_output_dtype: cfg.sparse_attention_output_dtype,
                 index_dtype: cfg.index_dtype.clone(),
                 index_distribution: cfg.sparse_index_distribution.clone(),
                 sparse_cache_layout: cfg.sparse_cache_layout.clone(),
@@ -390,19 +404,19 @@ impl VllmGlm52DsaAttnLocalWorklet {
             v_up: BatchedGemmKernelConfig {
                 backends: cfg.v_up_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                num_batches: cfg.num_attention_heads.clone(),
+                num_batches: attention_heads_per_rank.clone(),
                 n: cfg.v_head_dim.clone(),
                 k: cfg.kv_lora_rank.clone(),
                 dtype: cfg.base_dtype,
             },
             o_proj_input_quant: quant_config(
-                cfg.num_attention_heads.clone() * cfg.v_head_dim.clone(),
+                attention_heads_per_rank.clone() * cfg.v_head_dim.clone(),
             ),
             o_proj: SingleGemmKernelConfig {
                 backends: cfg.single_gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.hidden_dim.clone(),
-                k: cfg.num_attention_heads.clone() * cfg.v_head_dim.clone(),
+                k: attention_heads_per_rank * cfg.v_head_dim.clone(),
                 dtype: cfg.gemm_dtype,
             },
             raw_cfg: cfg.clone(),
@@ -734,6 +748,19 @@ struct NormalizedInput {
 }
 
 fn validate_config(cfg: &VllmGlm52DsaAttnLocalWorkletConfig) -> Result<(), String> {
+    if cfg.tp_size == 0 {
+        return Err("tp_size must be positive".to_string());
+    }
+    let tp = u32::from(cfg.tp_size);
+    for (name, value) in [
+        ("num_attention_heads", cfg.num_attention_heads.get()),
+        ("model_num_index_heads", cfg.model_num_index_heads.get()),
+        ("profile_num_index_heads", cfg.profile_num_index_heads.get()),
+    ] {
+        if value % tp != 0 {
+            return Err(format!("{name} {value} must be divisible by tp_size {tp}"));
+        }
+    }
     for (name, actual, required) in [
         ("hidden_dim", cfg.hidden_dim.get(), HIDDEN_DIM),
         (
@@ -844,11 +871,6 @@ fn validate_config(cfg: &VllmGlm52DsaAttnLocalWorkletConfig) -> Result<(), Strin
             "unique_scattered",
         ),
         (
-            "sparse_cache_layout",
-            cfg.sparse_cache_layout.as_str(),
-            "token_major_mqa_bf16_latent_rope",
-        ),
-        (
             "sparse_mla_cache_format",
             cfg.sparse_mla_cache_format.as_str(),
             "plain",
@@ -857,6 +879,25 @@ fn validate_config(cfg: &VllmGlm52DsaAttnLocalWorkletConfig) -> Result<(), Strin
         if actual != required {
             return Err(format!("{name} must be {required}, got {actual:?}"));
         }
+    }
+    let valid_sparse_attention = match (
+        cfg.sparse_attention_q_dtype,
+        cfg.sparse_attention_cache_dtype,
+        cfg.sparse_attention_output_dtype,
+        cfg.sparse_cache_layout.as_str(),
+    ) {
+        (DType::Bf16, DType::Bf16, DType::Bf16, "token_major_mqa_bf16_latent_rope") => true,
+        (DType::Fp8E4m3, DType::Fp8E4m3, DType::Bf16, "hnd_paged_mqa_fp8_latent_rope") => true,
+        _ => false,
+    };
+    if !valid_sparse_attention {
+        return Err(format!(
+            "unsupported sparse attention dtype/layout tuple ({}, {}, {}, {:?})",
+            cfg.sparse_attention_q_dtype.as_str(),
+            cfg.sparse_attention_cache_dtype.as_str(),
+            cfg.sparse_attention_output_dtype.as_str(),
+            cfg.sparse_cache_layout,
+        ));
     }
     if !matches!(
         cfg.sparse_index_distribution.as_str(),
@@ -997,6 +1038,7 @@ mod tests {
         VllmGlm52DsaAttnLocalWorkletConfig {
             fp8_quant_backends: vec!["flashinfer_trtllm"],
             include_indexer,
+            tp_size: 1,
             residual_rms_norm_backends: vec!["vllm_cuda"],
             rms_norm_backends: vec!["flashinfer"],
             single_gemm_backends: vec!["torch"],
@@ -1050,6 +1092,9 @@ mod tests {
             sparse_index_distribution: "recent_contiguous".to_string(),
             sparse_cache_layout: "token_major_mqa_bf16_latent_rope".to_string(),
             sparse_mla_cache_format: "plain".to_string(),
+            sparse_attention_q_dtype: DType::Bf16,
+            sparse_attention_cache_dtype: DType::Bf16,
+            sparse_attention_output_dtype: DType::Bf16,
             decode_next_n,
         }
     }

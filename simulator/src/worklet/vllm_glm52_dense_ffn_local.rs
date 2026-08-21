@@ -50,6 +50,7 @@ pub struct VllmGlm52DenseFfnLocalWorkletConfig {
     pub residual_norm_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    pub tp_size: u16,
     pub gpu_name: String,
     pub hidden_dim: Dim,
     pub intermediate_dim: Dim,
@@ -97,17 +98,20 @@ impl VllmGlm52DenseFfnLocalWorklet {
             panic!("invalid VllmGlm52DenseFfnLocalWorkletConfig: {reason}")
         });
 
+        let intermediate_per_rank =
+            cfg.intermediate_dim.clone() / Dim::param("ffn_tp", u32::from(cfg.tp_size));
+
         let dtype_bytes = cfg.dtype.size_bytes();
-        let gate_up_n = checked_product("gate_up_proj.n", &[2, cfg.intermediate_dim.get()])
+        let gate_up_n = checked_product("gate_up_proj.n", &[2, intermediate_per_rank.get()])
             .expect("validated GLM-5.2 gate/up dimensions must fit u32");
         let silu_input_bytes = checked_product(
             "silu_and_mul.input_bytes_per_token",
-            &[2, cfg.intermediate_dim.get(), dtype_bytes],
+            &[2, intermediate_per_rank.get(), dtype_bytes],
         )
         .expect("validated GLM-5.2 SiLU input byte rate must fit u32");
         let silu_output_bytes = checked_product(
             "silu_and_mul.output_bytes_per_token",
-            &[cfg.intermediate_dim.get(), dtype_bytes],
+            &[intermediate_per_rank.get(), dtype_bytes],
         )
         .expect("validated GLM-5.2 SiLU output byte rate must fit u32");
 
@@ -130,7 +134,7 @@ impl VllmGlm52DenseFfnLocalWorklet {
 
         VllmGlm52DenseFfnLocalWorkletResolved {
             gate_up_input_quant: quant_config(cfg.hidden_dim.clone()),
-            down_input_quant: quant_config(cfg.intermediate_dim.clone()),
+            down_input_quant: quant_config(intermediate_per_rank.clone()),
             post_attn_add_rms_norm: ResidualRmsNormKernelConfig {
                 backends: cfg.residual_norm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -154,7 +158,7 @@ impl VllmGlm52DenseFfnLocalWorklet {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.hidden_dim.clone(),
-                k: cfg.intermediate_dim.clone(),
+                k: intermediate_per_rank,
                 dtype: cfg.gemm_dtype,
             },
             raw_cfg: cfg.clone(),
@@ -289,6 +293,13 @@ struct WorkInputs {
 }
 
 fn validate_config(cfg: &VllmGlm52DenseFfnLocalWorkletConfig) -> Result<(), String> {
+    if cfg.tp_size == 0 || cfg.intermediate_dim.get() % u32::from(cfg.tp_size) != 0 {
+        return Err(format!(
+            "intermediate_dim {} must be divisible by positive tp_size {}",
+            cfg.intermediate_dim.get(),
+            cfg.tp_size
+        ));
+    }
     for (name, actual, required) in [
         ("hidden_dim", cfg.hidden_dim.get(), HIDDEN_DIM),
         (
@@ -389,6 +400,7 @@ mod tests {
             residual_norm_backends: vec!["vllm_cuda"],
             gemm_backends: vec!["torch"],
             elementwise_backends: vec!["triton"],
+            tp_size: 1,
             gpu_name: "NVIDIA H200".to_string(),
             hidden_dim: Dim::param("hidden_dim", HIDDEN_DIM),
             intermediate_dim: Dim::param("intermediate_dim", INTERMEDIATE_DIM),

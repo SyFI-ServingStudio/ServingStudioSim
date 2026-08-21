@@ -101,12 +101,21 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
+        // TRTLLM-gen rejects the 65,536-query launch (all five causal cells at
+        // that row failed on B200). The profiled vLLM server caps one iteration
+        // at 2,048 tokens; retaining measured anchors through 32,768 leaves a
+        // wide extrapolation guard without requiring a non-deployable launch.
+        let trtllm_query_too_large = |num_queries: f64| {
+            config.backends.contains(&"flashinfer_trtllm_fp8") && num_queries > 32_768.0
+        };
         match config.valid_counts_pattern.as_str() {
-            "uniform_full" => vec![false; grid.axes()[0].len() * grid.axes()[1].len()],
-            "causal_tail" => {
-                grid.expand_2d(|num_queries, num_cache_tokens| num_queries > num_cache_tokens)
-            }
-            "speculative_pairs" => grid.expand_2d(|num_queries, _| num_queries as u32 % 2 != 0),
+            "uniform_full" => grid.expand_2d(|num_queries, _| trtllm_query_too_large(num_queries)),
+            "causal_tail" => grid.expand_2d(|num_queries, num_cache_tokens| {
+                num_queries > num_cache_tokens || trtllm_query_too_large(num_queries)
+            }),
+            "speculative_pairs" => grid.expand_2d(|num_queries, _| {
+                num_queries as u32 % 2 != 0 || trtllm_query_too_large(num_queries)
+            }),
             pattern => panic!("unsupported valid_counts_pattern {pattern:?}"),
         }
     }
@@ -386,6 +395,17 @@ mod tests {
         assert!(!masked(&speculative, &speculative_grid, 266, 65536));
         assert!(!masked(&speculative, &speculative_grid, 4096, 131072));
         assert!(!masked(&speculative, &speculative_grid, 65536, 1_048_576));
+    }
+
+    #[test]
+    fn trtllm_fp8_masks_only_the_rejected_65536_query_row() {
+        let mut cfg = config("causal_tail");
+        cfg.backends = vec!["flashinfer_trtllm_fp8"];
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+        let mask = DsaSparseMlaAttentionSpec::infeasible_mask(&cfg, &grid);
+
+        assert!(!masked(&mask, &grid, 32768, 1_048_576));
+        assert!(masked(&mask, &grid, 65536, 1_048_576));
     }
 
     #[test]

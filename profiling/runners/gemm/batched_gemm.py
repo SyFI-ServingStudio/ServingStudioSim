@@ -19,7 +19,7 @@ from profiling.runners.metrics import ComputeMetrics
 
 _SUPPORTED_HEAD_COUNTS = frozenset({16, 32, 64})
 _SUPPORTED_DTYPE = DType.BF16
-_REQUIRED_GPU = "NVIDIA H200"
+_SUPPORTED_GPUS = frozenset({"NVIDIA H200", "NVIDIA B200"})
 _Q_HEAD_WIDTH = 256
 _QK_NOPE_HEAD_DIM = 192
 _KV_LORA_RANK = 512
@@ -90,10 +90,10 @@ def _validate_cuda_device(torch: Any) -> None:
             "CUDA is required for the torch_mla_q_absorb_glm52 backend"
         )
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
+    if gpu_name not in _SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
             "torch_mla_q_absorb_glm52 is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
+            f"{sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 
@@ -139,10 +139,10 @@ def _validate_v_up_cuda_device(torch: Any) -> None:
             "CUDA is required for the torch_mla_v_up_glm52 backend"
         )
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
+    if gpu_name not in _SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
             "torch_mla_v_up_glm52 is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
+            f"{sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 

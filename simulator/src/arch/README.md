@@ -105,7 +105,7 @@ variant's parameters.
 
 | Contract | Wired selectors | Explicitly unsupported selectors |
 |---|---|---|
-| `IterArchSel` | `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `glm52_dsa_moe`, `glm52_vllm_dsa_moe` | none |
+| `IterArchSel` | `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `glm52_dsa_moe`, `glm52_vllm_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe` | none |
 | `AttnArchSel` | `qwen3_attn_tp` | `llama3_attn_tp` |
 | `FfnArchSel` | `qwen3_ffn_moe`, `qwen3_fp8_ffn_moe` | `deepseek_ffn_moe` |
 
@@ -119,7 +119,7 @@ schema; no second hand-maintained config union belongs here.
   - Llama3 dense/TP → `barebone`
   - Llama3 DP-attention/TP-FFN → `hp_unified`
   - Qwen3 MoE DP-attention/EP-FFN (native BF16, native FP8, or vLLM-aligned FP8) → `hp_unified`
-  - GLM-5.2 DSA/MoE (native or vLLM-aligned) → `hp_unified`
+  - GLM-5.2 DSA/MoE (native, vLLM-aligned FP8, or B200 vLLM-aligned NVIDIA NVFP4) → `hp_unified`
 - PD:
   - Llama3 TP prefill → Llama3 TP decode
   - Llama3 TP prefill → Llama3 DP-attention/TP-FFN decode

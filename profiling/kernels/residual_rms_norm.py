@@ -54,7 +54,7 @@ register(
         backend="vllm_cuda",
         supports=BackendSupport(
             compute=frozenset({DType.BF16, DType.FP16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.norm.residual_rms_norm_vllm_cuda",

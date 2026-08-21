@@ -48,6 +48,8 @@ from profiling.kernels import (
     moe_alltoall_prepare,  # noqa: F401
     moe_finalize_routing,  # noqa: F401
     moe_fused_topk,  # noqa: F401
+    nvfp4_moe,  # noqa: F401
+    nvfp4_quant,  # noqa: F401
     p2p_inter,  # noqa: F401
     p2p_intra,  # noqa: F401
     residual_rms_norm,  # noqa: F401

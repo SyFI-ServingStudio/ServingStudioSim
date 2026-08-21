@@ -57,6 +57,10 @@ def _require_schedule(raw_config: dict) -> tuple[int, int, int, int]:
 
 def _attention(raw_config: dict, *, full_index: bool) -> Glm52DsaAttention:
     weight_bytes = dtype_bytes(raw_config.get("dtype") or raw_config.get("torch_dtype", "bfloat16"))
+    quant = raw_config.get("quantization_config", {})
+    kv_cache_is_fp8 = quant.get("kv_cache_dtype") == "fp8_e4m3" or bool(
+        quant.get("kv_cache_scheme")
+    )
     return Glm52DsaAttention(
         hidden=raw_config["hidden_size"],
         num_heads=raw_config["num_attention_heads"],
@@ -70,7 +74,7 @@ def _attention(raw_config: dict, *, full_index: bool) -> Glm52DsaAttention:
         index_topk=raw_config["index_topk"],
         full_index=full_index,
         weight_dtype_bytes=weight_bytes,
-        mla_cache_dtype_bytes=weight_bytes,
+        mla_cache_dtype_bytes=1.0 if kv_cache_is_fp8 else weight_bytes,
     )
 
 

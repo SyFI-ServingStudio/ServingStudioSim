@@ -40,7 +40,7 @@ register(
         backend="torch",
         supports=BackendSupport(
             compute=None,
-            gpus=frozenset({"NVIDIA H200"}),
+            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_sparse_index_remap",

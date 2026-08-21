@@ -23,7 +23,7 @@ _TOP_K = 2048
 _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _SPAN_MODE = "single_causal_tail"
-_REQUIRED_GPU = "NVIDIA H200"
+_SUPPORTED_GPUS = frozenset({"NVIDIA H200", "NVIDIA B200"})
 _VLLM_KERNEL_NAME = "topKPerRowPrefill"
 
 
@@ -93,9 +93,9 @@ def _validate_cuda_device(torch: Any) -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented("CUDA is required for the torch dsa_topk_prefill backend")
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
+    if gpu_name not in _SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
-            f"torch dsa_topk_prefill is verified only on {_REQUIRED_GPU}, got {gpu_name}"
+            f"torch dsa_topk_prefill is verified only on {sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 
@@ -135,9 +135,10 @@ def _validate_vllm_cuda_device(torch: Any) -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented("CUDA is required for the dsa_topk_prefill vllm_cuda backend")
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
+    if gpu_name not in _SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
-            f"dsa_topk_prefill vllm_cuda is verified only on {_REQUIRED_GPU}, got {gpu_name}"
+            "dsa_topk_prefill vllm_cuda is verified only on "
+            f"{sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 

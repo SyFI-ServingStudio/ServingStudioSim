@@ -1,0 +1,16 @@
+{
+  "arch": {
+    "iter": {
+      "type": "glm52_vllm_nvfp4_dsa_moe",
+      "model_config": "model/config/glm52_nvfp4.json",
+      "fp8": false,
+      "ep_size": 4,
+      "nvl_num_gpu": 4,
+      "routing": "uniform",
+      "mtp_mode": "off"
+    }
+  },
+  "gpu": "NVIDIA B200",
+  "log_dir": "logs/predict_glm52_nvfp4_b200_ep4",
+  "cases_file": "predict_glm52_nvfp4_b200_ep4_cases.json"
+}

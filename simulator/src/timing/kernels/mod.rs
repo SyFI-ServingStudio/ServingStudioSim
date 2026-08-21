@@ -37,6 +37,8 @@ pub mod moe_alltoall;
 pub mod moe_alltoall_prepare;
 pub mod moe_finalize_routing;
 pub mod moe_fused_topk;
+pub mod nvfp4_moe;
+pub mod nvfp4_quant;
 pub mod p2p_inter;
 pub mod p2p_intra;
 pub mod residual_rms_norm;
@@ -177,6 +179,10 @@ pub use moe_finalize_routing::{
 };
 pub use moe_fused_topk::{
     MoeFusedTopkKernel, MoeFusedTopkKernelConfig, MoeFusedTopkKernelInput, MoeFusedTopkSpec,
+};
+pub use nvfp4_moe::{Nvfp4MoeKernel, Nvfp4MoeKernelConfig, Nvfp4MoeKernelInput, Nvfp4MoeSpec};
+pub use nvfp4_quant::{
+    Nvfp4QuantKernel, Nvfp4QuantKernelConfig, Nvfp4QuantKernelInput, Nvfp4QuantSpec,
 };
 pub use p2p_inter::{P2pInterKernel, P2pInterKernelConfig, P2pInterKernelInput, P2pInterSpec};
 pub use p2p_intra::{P2pIntraKernel, P2pIntraKernelConfig, P2pIntraKernelInput, P2pIntraSpec};

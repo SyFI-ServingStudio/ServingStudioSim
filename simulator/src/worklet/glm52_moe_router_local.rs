@@ -65,6 +65,8 @@ pub struct Glm52MoeRouterLocalWorkletConfig {
     pub norm_topk_prob: bool,
     pub routed_scaling_numerator: u32,
     pub routed_scaling_denominator: u32,
+    /// False when the selected backend performs routing inside its fused MoE call.
+    pub include_router_select: bool,
 }
 
 /// Pure resolved data with all four measured child configs baked.
@@ -74,7 +76,7 @@ pub struct Glm52MoeRouterLocalWorkletResolved {
     pub post_attn_add_rms_norm: ResidualRmsNormKernelConfig,
     pub router_fp32_cast: ElementwiseKernelConfig,
     pub router_gemm_bf16_proxy: SingleGemmKernelConfig,
-    pub router_select: ElementwiseKernelConfig,
+    pub router_select: Option<ElementwiseKernelConfig>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -87,7 +89,7 @@ pub struct Glm52MoeRouterLocalWorklet {
     pub post_attn_add_rms_norm: Op<ResidualRmsNormKernel>,
     pub router_fp32_cast: Op<ElementwiseKernel>,
     pub router_gemm_bf16_proxy: Op<SingleGemmKernel>,
-    pub router_select: Op<ElementwiseKernel>,
+    pub router_select: Option<Op<ElementwiseKernel>>,
     resolved: Glm52MoeRouterLocalWorkletResolved,
 }
 
@@ -150,12 +152,12 @@ impl Glm52MoeRouterLocalWorklet {
                 k: cfg.hidden_dim.clone(),
                 dtype: cfg.proxy_gemm_dtype,
             },
-            router_select: ElementwiseKernelConfig {
+            router_select: cfg.include_router_select.then(|| ElementwiseKernelConfig {
                 backends: cfg.elementwise_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 input_bytes_per_token: select_input_bytes.into(),
                 output_bytes_per_token: select_output_bytes.into(),
-            },
+            }),
             raw_cfg: cfg.clone(),
         }
     }
@@ -186,13 +188,19 @@ impl Glm52MoeRouterLocalWorklet {
             SingleGemmKernel::build,
             bridge,
         )?;
-        let router_select = build_atomic(
-            &name,
-            "router_select",
-            resolved.router_select.clone(),
-            ElementwiseKernel::build,
-            bridge,
-        )?;
+        let router_select = resolved
+            .router_select
+            .clone()
+            .map(|config| {
+                build_atomic(
+                    &name,
+                    "router_select",
+                    config,
+                    ElementwiseKernel::build,
+                    bridge,
+                )
+            })
+            .transpose()?;
 
         Ok(Self {
             name,
@@ -207,12 +215,16 @@ impl Glm52MoeRouterLocalWorklet {
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         CostNode::Labeled {
             label: worklet_label(&self.name, &self.resolved.raw_cfg),
-            child: Box::new(CostNode::Sum(vec![
-                self.post_attn_add_rms_norm.compile(builder),
-                self.router_fp32_cast.compile(builder),
-                self.router_gemm_bf16_proxy.compile(builder),
-                self.router_select.compile(builder),
-            ])),
+            child: Box::new(CostNode::Sum(
+                [
+                    self.post_attn_add_rms_norm.compile(builder),
+                    self.router_fp32_cast.compile(builder),
+                    self.router_gemm_bf16_proxy.compile(builder),
+                ]
+                .into_iter()
+                .chain(self.router_select.iter().map(|op| op.compile(builder)))
+                .collect(),
+            )),
         }
     }
 
@@ -233,7 +245,9 @@ impl Glm52MoeRouterLocalWorklet {
             zero,
             ev,
         );
-        eval_atomic_or_zero(&self.router_select, work.router_select, zero, ev);
+        if let Some(router_select) = &self.router_select {
+            eval_atomic_or_zero(router_select, work.router_select, zero, ev);
+        }
     }
 }
 
@@ -401,6 +415,7 @@ mod tests {
             norm_topk_prob: true,
             routed_scaling_numerator: ROUTED_SCALING_NUMERATOR,
             routed_scaling_denominator: ROUTED_SCALING_DENOMINATOR,
+            include_router_select: true,
         }
     }
 
@@ -453,8 +468,11 @@ mod tests {
         assert_eq!(r.router_gemm_bf16_proxy.n, 256);
         assert_eq!(r.router_gemm_bf16_proxy.k, 6144);
         assert_eq!(r.router_gemm_bf16_proxy.dtype, DType::Bf16);
-        assert_eq!(r.router_select.input_bytes_per_token, 2048);
-        assert_eq!(r.router_select.output_bytes_per_token, 64);
+        assert_eq!(
+            r.router_select.as_ref().unwrap().input_bytes_per_token,
+            2048
+        );
+        assert_eq!(r.router_select.as_ref().unwrap().output_bytes_per_token, 64);
     }
 
     #[test]
@@ -468,7 +486,7 @@ mod tests {
         assert_eq!(r.raw_cfg.routed_scaling_denominator, 2);
         assert_eq!(r.post_attn_add_rms_norm.backends, vec!["vllm_cuda"]);
         assert_eq!(r.router_fp32_cast.backends, vec!["triton"]);
-        assert_eq!(r.router_select.backends, vec!["triton"]);
+        assert_eq!(r.router_select.as_ref().unwrap().backends, vec!["triton"]);
         assert_eq!(r.router_gemm_bf16_proxy.backends, vec!["torch_linear"]);
         assert_eq!(r.raw_cfg.gpu_name, "NVIDIA H200");
     }

@@ -591,9 +591,9 @@ class Model:
     def weight_bytes_per_instance(self, group: MatmulGroup) -> float:
         """HBM bytes for ONE instance of ``group``'s matrix, at its stored precision.
 
-        A converted FP8 matrix also carries an FP32 scale per quantization block,
-        which is read alongside it — omitting the scale would understate the
-        compulsory traffic of exactly the path that dominates a quantized MoE.
+        A converted matrix also carries a scale per quantization block, which is
+        read alongside it. Omitting scales would understate the compulsory traffic
+        of exactly the path that dominates a quantized MoE.
         """
         elements = float(group.n) * float(group.k)
         if self.quant is None or not self._is_converted(group):
@@ -882,6 +882,7 @@ _TFLOPS_FIELD = {
     "bf16": "bf16_tflops",
     "fp16": "fp16_tflops",
     "fp8": "fp8_tflops",
+    "fp4": "fp4_tflops",
     "fp32": "fp32_tflops",
 }
 

@@ -20,7 +20,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_sparse_index_remap:torch"
-_REQUIRED_GPU = "NVIDIA H200"
+_SUPPORTED_GPUS = frozenset({"NVIDIA H200", "NVIDIA B200"})
 _SELECTED_K = 2048
 _BLOCK_SIZE = 64
 _MAX_BLOCKS_PER_REQUEST = 2048
@@ -350,12 +350,14 @@ def _validate_args(
     )
 
 
-def _require_h200(torch: Any) -> None:
+def _require_supported_gpu(torch: Any) -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"CUDA is required for {_BACKEND}")
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires {_REQUIRED_GPU}, got {gpu_name!r}")
+    if gpu_name not in _SUPPORTED_GPUS:
+        raise ProfilerNotImplemented(
+            f"{_BACKEND} requires {sorted(_SUPPORTED_GPUS)}, got {gpu_name!r}"
+        )
 
 
 def _coprime_stride(size: int, preferred: int) -> int:
@@ -830,7 +832,7 @@ def profile_dsa_sparse_index_remap_torch(
         raise ProfilerNotImplemented(f"{_BACKEND} requires PyTorch") from exc
 
     try:
-        _require_h200(torch)
+        _require_supported_gpu(torch)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, validated, device=device)
         _check_correctness(torch, validated, operands)

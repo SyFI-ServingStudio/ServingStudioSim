@@ -17,7 +17,7 @@ from profiling.runners.metrics import ComputeMetrics
 
 _EPS = 1e-5
 _KERNEL_NAME = "fused_add_rms_norm_kernel"
-_REQUIRED_GPU = "NVIDIA H200"
+_SUPPORTED_GPUS = frozenset({"NVIDIA H200", "NVIDIA B200"})
 _SUPPORTED_DTYPES = frozenset({DType.BF16, DType.FP16})
 
 
@@ -45,10 +45,10 @@ def _validate_cuda_device(torch: Any) -> None:
             "CUDA is required for the residual_rms_norm vllm_cuda backend"
         )
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
+    if gpu_name not in _SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
-            "residual_rms_norm vllm_cuda is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
+            "residual_rms_norm vllm_cuda is verified only on H200/B200, "
+            f"got {gpu_name}"
         )
 
 

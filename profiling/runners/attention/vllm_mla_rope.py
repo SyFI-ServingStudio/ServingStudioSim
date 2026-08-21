@@ -34,7 +34,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_SUPPORTED_GPUS = frozenset({"NVIDIA H100", "NVIDIA H200"})
+_SUPPORTED_GPUS = frozenset({"NVIDIA H100", "NVIDIA H200", "NVIDIA B200"})
 _HOPPER_COMPUTE_CAPABILITY = (9, 0)
 # Substring, not an exact name: inductor suffixes the fusion with a per-graph
 # counter (`..._view_4`, `..._view_7`), so the digits are not stable.

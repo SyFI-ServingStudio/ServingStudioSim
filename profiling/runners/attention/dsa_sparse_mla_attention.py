@@ -36,6 +36,11 @@ _FLASHMLA_KERNEL_NAME = "sparse_attn_fwd_kernel"
 _FLASHMLA_ATOL = 8e-4
 _FLASHMLA_RTOL = 3.01 / 128
 _FLASHMLA_COSINE_LIMIT = 7e-6
+_TRTLLM_FP8_BACKEND = "dsa_sparse_mla_attention:flashinfer_trtllm_fp8"
+_TRTLLM_FP8_CACHE_LAYOUT = "hnd_paged_mqa_fp8_latent_rope"
+_TRTLLM_KERNEL_NAME = "fmhaSm100"
+_TRTLLM_WORKSPACE_BYTES = 128 * 1024 * 1024
+_TRTLLM_PAGE_SIZE = 64
 
 _UINT = r"(?:0|[1-9][0-9]*)"
 _UNIFORM_RE = re.compile(rf"u:({_UINT})x({_UINT})\Z")
@@ -186,6 +191,10 @@ def _validate_args(
     valid_counts: str,
     index_distribution: str,
     cache_layout: str,
+    expected_q_dtype: DType = DType.BF16,
+    expected_cache_dtype: DType = DType.BF16,
+    expected_output_dtype: DType = DType.BF16,
+    expected_cache_layout: str = _CACHE_LAYOUT,
 ) -> _ValidatedArgs:
     integers = {
         "num_queries": num_queries,
@@ -210,13 +219,14 @@ def _validate_args(
     if num_cache_tokens < 1:
         raise ProfilerNotImplemented(f"num_cache_tokens must be >= 1, got {num_cache_tokens}")
     expected = {
-        "num_heads": (num_heads, _NUM_HEADS),
         "num_kv_heads": (num_kv_heads, _NUM_KV_HEADS),
         "selected_k": (selected_k, _SELECTED_K),
         "latent_dim": (latent_dim, _LATENT_DIM),
         "rope_dim": (rope_dim, _ROPE_DIM),
         "value_dim": (value_dim, _VALUE_DIM),
     }
+    if num_heads < 1:
+        raise ProfilerNotImplemented(f"num_heads must be >= 1, got {num_heads}")
     for name, (actual, required) in expected.items():
         if actual != required:
             raise ProfilerNotImplemented(f"{name} must be {required}, got {actual}")
@@ -226,16 +236,16 @@ def _validate_args(
         raise ProfilerNotImplemented(
             f"softmax_scale must be exactly {_SOFTMAX_SCALE}, got {softmax_scale}"
         )
-    if DType.from_value(q_dtype) is not DType.BF16:
-        raise ProfilerNotImplemented("q_dtype must be bf16")
-    if DType.from_value(cache_dtype) is not DType.BF16:
-        raise ProfilerNotImplemented("cache_dtype must be bf16")
+    if DType.from_value(q_dtype) is not expected_q_dtype:
+        raise ProfilerNotImplemented(f"q_dtype must be {expected_q_dtype.value}")
+    if DType.from_value(cache_dtype) is not expected_cache_dtype:
+        raise ProfilerNotImplemented(f"cache_dtype must be {expected_cache_dtype.value}")
     if index_dtype != "int32":
         raise ProfilerNotImplemented("index_dtype must be int32")
-    if DType.from_value(output_dtype) is not DType.BF16:
-        raise ProfilerNotImplemented("output_dtype must be bf16")
-    if cache_layout != _CACHE_LAYOUT:
-        raise ProfilerNotImplemented(f"cache_layout must be {_CACHE_LAYOUT!r}")
+    if DType.from_value(output_dtype) is not expected_output_dtype:
+        raise ProfilerNotImplemented(f"output_dtype must be {expected_output_dtype.value}")
+    if cache_layout != expected_cache_layout:
+        raise ProfilerNotImplemented(f"cache_layout must be {expected_cache_layout!r}")
     if index_distribution not in _INDEX_DISTRIBUTIONS:
         modes = ", ".join(sorted(_INDEX_DISTRIBUTIONS))
         raise ProfilerNotImplemented(f"index_distribution must be one of: {modes}")
@@ -254,12 +264,14 @@ def _validate_args(
     )
 
 
-def _require_h200(torch: Any, *, backend: str = "dsa_sparse_mla_attention:torch") -> None:
+def _require_supported_gpu(
+    torch: Any, *, backend: str = "dsa_sparse_mla_attention:torch"
+) -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"CUDA is required for {backend}")
     gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
-    if gpu_name != "NVIDIA H200":
-        raise ProfilerNotImplemented(f"{backend} requires NVIDIA H200, got {gpu_name!r}")
+    if gpu_name not in {"NVIDIA H200", "NVIDIA B200"}:
+        raise ProfilerNotImplemented(f"{backend} requires H200/B200, got {gpu_name!r}")
 
 
 def _load_flashmla_sparse_fwd() -> Any:
@@ -666,7 +678,7 @@ def profile_dsa_sparse_mla_attention_torch(
         raise ProfilerNotImplemented("PyTorch is unavailable") from exc
 
     try:
-        _require_h200(torch)
+        _require_supported_gpu(torch)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, validated, device=device)
         _check_correctness(torch, operands, softmax_scale=float(softmax_scale))
@@ -748,7 +760,7 @@ def profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(
         raise ProfilerNotImplemented(f"{_FLASHMLA_BACKEND} requires PyTorch in vllm_env") from exc
 
     try:
-        _require_h200(torch, backend=_FLASHMLA_BACKEND)
+        _require_supported_gpu(torch, backend=_FLASHMLA_BACKEND)
         flash_mla_sparse_fwd = _load_flashmla_sparse_fwd()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, validated, device=device)
@@ -787,6 +799,163 @@ def profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(
         raise OOMError(f"{_FLASHMLA_BACKEND} ran out of GPU memory") from exc
     except Exception as exc:
         raise KernelLaunchFailed(f"{_FLASHMLA_BACKEND} native callable failed") from exc
+
+    flops = _logical_flops(num_queries=num_queries, num_heads=num_heads, selected_k=selected_k)
+    logical_bytes = _logical_bytes(
+        num_queries=num_queries,
+        num_heads=num_heads,
+        selected_k=selected_k,
+        valid_counts=validated.valid_counts,
+    )
+    seconds = time_ms / 1000.0
+    return ComputeMetrics(
+        time_ms=time_ms,
+        energy_j=energy_j,
+        tflops=flops / seconds / 1e12,
+        memory_bandwidth_gbps=logical_bytes / seconds / 1e9,
+    )
+
+
+def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
+    *,
+    num_queries: int,
+    num_cache_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    selected_k: int,
+    latent_dim: int,
+    rope_dim: int,
+    value_dim: int,
+    softmax_scale: float,
+    q_dtype: DType | str,
+    cache_dtype: DType | str,
+    index_dtype: str,
+    output_dtype: DType | str,
+    valid_counts: str,
+    index_distribution: str,
+    cache_layout: str,
+) -> ComputeMetrics:
+    """Profile vLLM's B200 FlashInfer TRTLLM-gen FP8 sparse MLA launch."""
+    validated = _validate_args(
+        num_queries=num_queries,
+        num_cache_tokens=num_cache_tokens,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        selected_k=selected_k,
+        latent_dim=latent_dim,
+        rope_dim=rope_dim,
+        value_dim=value_dim,
+        softmax_scale=softmax_scale,
+        q_dtype=q_dtype,
+        cache_dtype=cache_dtype,
+        index_dtype=index_dtype,
+        output_dtype=output_dtype,
+        valid_counts=valid_counts,
+        index_distribution=index_distribution,
+        cache_layout=cache_layout,
+        expected_q_dtype=DType.FP8_E4M3,
+        expected_cache_dtype=DType.FP8_E4M3,
+        expected_output_dtype=DType.BF16,
+        expected_cache_layout=_TRTLLM_FP8_CACHE_LAYOUT,
+    )
+
+    try:
+        import torch
+        from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise ProfilerNotImplemented(
+            f"{_TRTLLM_FP8_BACKEND} requires the repository vllm_env"
+        ) from exc
+
+    try:
+        _require_supported_gpu(torch, backend=_TRTLLM_FP8_BACKEND)
+        gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
+        if gpu_name != "NVIDIA B200":
+            raise ProfilerNotImplemented(
+                f"{_TRTLLM_FP8_BACKEND} requires NVIDIA B200, got {gpu_name!r}"
+            )
+        device = torch.device("cuda", torch.cuda.current_device())
+        fp8 = torch.float8_e4m3fn
+
+        query = torch.empty(
+            (num_queries, 1, num_heads, _SCORE_DIM), dtype=fp8, device=device
+        )
+        query.copy_(
+            torch.linspace(-0.75, 0.75, _SCORE_DIM, device=device)
+            .view(1, 1, 1, _SCORE_DIM)
+            .expand_as(query)
+        )
+
+        num_pages = (num_cache_tokens + _TRTLLM_PAGE_SIZE - 1) // _TRTLLM_PAGE_SIZE
+        cache = torch.empty(
+            (num_pages, _TRTLLM_PAGE_SIZE, _SCORE_DIM), dtype=fp8, device=device
+        )
+        cache_template = torch.linspace(-0.5, 0.5, _SCORE_DIM, device=device)
+        for start in range(0, num_pages, _CACHE_TEMPLATE_ROWS):
+            stop = min(start + _CACHE_TEMPLATE_ROWS, num_pages)
+            cache[start:stop].copy_(
+                cache_template.view(1, 1, _SCORE_DIM).expand(
+                    stop - start, _TRTLLM_PAGE_SIZE, _SCORE_DIM
+                )
+            )
+
+        block_tables = torch.zeros(
+            (num_queries, 1, selected_k), dtype=torch.int32, device=device
+        )
+        for row, count in enumerate(validated.valid_counts):
+            indices = _row_indices(
+                torch,
+                row=row,
+                count=count,
+                num_cache_tokens=num_cache_tokens,
+                distribution=validated.index_distribution,
+                device=device,
+            )
+            block_tables[row, 0, :count].copy_(indices.to(torch.int32))
+        seq_lens = torch.tensor(validated.valid_counts, dtype=torch.int32, device=device)
+        output = torch.empty(
+            (num_queries, 1, num_heads, value_dim), dtype=torch.bfloat16, device=device
+        )
+        workspace = torch.zeros(_TRTLLM_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+
+        def kernel() -> Any:
+            return trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=cache,
+                workspace_buffer=workspace,
+                qk_nope_head_dim=latent_dim,
+                kv_lora_rank=latent_dim,
+                qk_rope_head_dim=rope_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                max_seq_len=selected_k,
+                sparse_mla_top_k=selected_k,
+                out=output,
+                bmm1_scale=float(softmax_scale),
+                bmm2_scale=1.0,
+                backend="trtllm-gen",
+            )
+
+        kernel()
+        torch.cuda.synchronize()
+        if output.dtype is not torch.bfloat16 or tuple(output.shape) != (
+            num_queries,
+            1,
+            num_heads,
+            value_dim,
+        ):
+            raise AssertionError("TRTLLM-gen sparse MLA returned an invalid output")
+        if not torch.isfinite(output).all():
+            raise AssertionError("TRTLLM-gen sparse MLA output must be finite")
+
+        time_ms = Timer.cupti(kernel, kernel_name=_TRTLLM_KERNEL_NAME)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except ProfilerNotImplemented:
+        raise
+    except torch.OutOfMemoryError as exc:
+        raise OOMError(f"{_TRTLLM_FP8_BACKEND} ran out of GPU memory") from exc
+    except Exception as exc:
+        raise KernelLaunchFailed(f"{_TRTLLM_FP8_BACKEND} native callable failed") from exc
 
     flops = _logical_flops(num_queries=num_queries, num_heads=num_heads, selected_k=selected_k)
     logical_bytes = _logical_bytes(
