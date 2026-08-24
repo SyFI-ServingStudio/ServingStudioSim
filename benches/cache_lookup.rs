@@ -10,6 +10,7 @@
 //!   - prefill: chain([0], pow2 7..15) × pow2 7..15   = 10 × 9  = 90 cells
 //!   - decode:  pow2 0..8 × pow2 5..22                 = 9 × 18 = 162 cells
 //!   - rect:    token_axis² (63 × 63)                  = 3969 cells
+//!
 //! Measurement showed lookup time is nearly flat across these sizes (~45ns),
 //! so the cost is compute latency (2× binary search + 4-corner blend), not
 //! cache residency — which is what these benches let us optimize against.
@@ -29,9 +30,16 @@ fn sample(time_ms: f64) -> KernelMetrics {
         memory_bandwidth_gbps: Some(2.0),
         algbw_gbps: None,
         busbw_gbps: None,
-        message_size_bytes: None,
         energy_j: time_ms * 0.1,
     }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "benchmark axis indices are at most a few thousand, far below f64's exact-integer limit"
+)]
+fn index_as_f64(index: usize) -> f64 {
+    index as f64
 }
 
 /// Drive a 1D cache over a fixed probe set, summing results so the optimizer
@@ -65,7 +73,7 @@ fn make_2d(axis0: Vec<f64>, axis1: Vec<f64>) -> Cache2DLinear {
     let grid = SweepGrid::new(vec![axis0, axis1]);
     let samples: Vec<KernelMetrics> = (0..r)
         .flat_map(|i| (0..c).map(move |j| (i, j)))
-        .map(|(i, j)| sample(1.0 + i as f64 + j as f64))
+        .map(|(i, j)| sample(1.0 + index_as_f64(i) + index_as_f64(j)))
         .collect();
     let (cache, warnings) = Cache2DLinear::from_samples(&grid, &samples);
     assert!(warnings.is_empty(), "2D fixture must fit cleanly");
@@ -77,7 +85,7 @@ fn cache_lookup(c: &mut Criterion) {
     let axis = Axis::token_axis();
     let grid_1d = SweepGrid::new(vec![axis.clone()]);
     let samples_1d: Vec<KernelMetrics> = (0..axis.len())
-        .map(|idx| sample(1.0 + idx as f64 * 0.5))
+        .map(|idx| sample(1.0 + index_as_f64(idx) * 0.5))
         .collect();
     let (cache_1d, w) = Cache1DLinear::from_samples(&grid_1d, &samples_1d);
     assert!(w.is_empty());
@@ -88,7 +96,7 @@ fn cache_lookup(c: &mut Criterion) {
     let axis_d = Axis::arithmetic(0, 64 * 511, 64);
     let grid_d = SweepGrid::new(vec![axis_d.clone()]);
     let samples_d: Vec<KernelMetrics> = (0..axis_d.len())
-        .map(|idx| sample(1.0 + idx as f64 * 0.5))
+        .map(|idx| sample(1.0 + index_as_f64(idx) * 0.5))
         .collect();
     let (cache_d, w) = Cache1DDirect::from_samples(&grid_d, &samples_d);
     assert!(w.is_empty());
