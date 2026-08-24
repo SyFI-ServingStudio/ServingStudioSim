@@ -35,6 +35,10 @@ impl Cache for Cache3DLinear {
             order.sort_by(|&a, &b| grid.axes()[axis][a].total_cmp(&grid.axes()[axis][b]));
             order
         });
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "sweep coordinates are deliberately stored as f32 in this interpolation cache; the profiled grid values (token/batch/byte counts) are well within f32's exact-integer range"
+        )]
         let axes: [Vec<f32>; 3] = std::array::from_fn(|axis| {
             orders[axis]
                 .iter()
@@ -50,7 +54,10 @@ impl Cache for Cache3DLinear {
                 for &k in &orders[2] {
                     let original = (i * dims[1] + j) * dims[2] + k;
                     let sample = &samples[original];
-                    if !sample.is_finite() {
+                    if sample.is_finite() {
+                        cells.push(Metrics4::from_sample(sample));
+                        valid.push(true);
+                    } else {
                         warnings.push(OutlierWarning {
                             kind: OutlierKind::NonFinite,
                             detail: format!(
@@ -60,9 +67,6 @@ impl Cache for Cache3DLinear {
                         });
                         cells.push(Metrics4::ZERO);
                         valid.push(false);
-                    } else {
-                        cells.push(Metrics4::from_sample(sample));
-                        valid.push(true);
                     }
                 }
             }
@@ -93,6 +97,10 @@ impl Cache for Cache3DLinear {
         if sweep.iter().any(|value| value.is_nan()) || !self.any_valid {
             return LeafMetrics::MISS;
         }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "sweep coordinates are deliberately stored as f32 in this interpolation cache; the queried grid values (token/batch/byte counts) are well within f32's exact-integer range"
+        )]
         let query = std::array::from_fn(|axis| sweep[axis] as f32);
         let (metrics, extrapolated) = self.interpolate_cell(query);
         LeafMetrics {
@@ -173,26 +181,24 @@ impl Cache3DLinear {
 
         let nearest = corners
             .iter()
-            .filter_map(|&(indices, index, _)| {
-                self.valid[index].then(|| {
-                    let distance = (0..3)
-                        .map(|axis| {
-                            let (lo, hi, _, _) = located[axis];
-                            let width = (self.axes[axis][hi] - self.axes[axis][lo]).abs();
-                            if width <= f32::EPSILON {
-                                0.0
-                            } else {
-                                let delta = (query[axis] - self.axes[axis][indices[axis]]) / width;
-                                delta * delta
-                            }
-                        })
-                        .sum::<f32>();
-                    (self.cells[index], distance)
-                })
+            .filter(|&&(_indices, index, _)| self.valid[index])
+            .map(|&(indices, index, _)| {
+                let distance = (0..3)
+                    .map(|axis| {
+                        let (lo, hi, _, _) = located[axis];
+                        let width = (self.axes[axis][hi] - self.axes[axis][lo]).abs();
+                        if width <= f32::EPSILON {
+                            0.0
+                        } else {
+                            let delta = (query[axis] - self.axes[axis][indices[axis]]) / width;
+                            delta * delta
+                        }
+                    })
+                    .sum::<f32>();
+                (self.cells[index], distance)
             })
             .min_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1))
-            .map(|(cell, _)| cell)
-            .unwrap_or(Metrics4::ZERO);
+            .map_or(Metrics4::ZERO, |(cell, _)| cell);
         (nearest, true)
     }
 }
@@ -365,7 +371,9 @@ mod tests {
     #[test]
     fn dropped_corner_zero_weight_and_convex_renormalization_match_safe_policy() {
         let grid = SweepGrid::new(vec![vec![0.0, 1.0]; 3]);
-        let mut samples = (0..8).map(|index| sample(index as f64)).collect::<Vec<_>>();
+        let mut samples = (0..8)
+            .map(|index| sample(f64::from(index)))
+            .collect::<Vec<_>>();
         samples[7] = nan_sample();
         let (cache, warnings) = Cache3DLinear::from_samples(&grid, &samples);
         let exact = cache.eval(&[0.0; 3]);
@@ -383,7 +391,7 @@ mod tests {
     fn multiple_drops_dropped_face_and_nearest_fallback_are_deterministic() {
         let grid = SweepGrid::new(vec![vec![0.0, 1.0]; 3]);
         let mut samples = (0..8)
-            .map(|index| sample(index as f64 + 1.0))
+            .map(|index| sample(f64::from(index) + 1.0))
             .collect::<Vec<_>>();
         for sample in &mut samples[..4] {
             *sample = nan_sample();

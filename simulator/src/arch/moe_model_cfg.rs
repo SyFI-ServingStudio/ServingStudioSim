@@ -1,12 +1,12 @@
-//! Numeric model dims for MoE archs — the parallelism-agnostic identity of one
-//! MoE model. Mirrors [`ModelCfg`](crate::arch::model_cfg::ModelCfg) but folds in
+//! Numeric model dims for `MoE` archs — the parallelism-agnostic identity of one
+//! `MoE` model. Mirrors [`ModelCfg`](crate::arch::model_cfg::ModelCfg) but folds in
 //! the three MoE-specific fields (`num_experts`, `top_k`, `moe_intermediate`)
 //! that a dense `ModelCfg` does not carry; the result is a single self-contained
-//! struct so a MoE model_arch's `build_configs` takes ONE config object, not a
+//! struct so a `MoE` `model_arch`'s `build_configs` takes ONE config object, not a
 //! dense `ModelCfg` plus an extras struct.
 //!
 //! The launcher schema layer (`schema::ModelCommon`) still surfaces a single
-//! `model_config` JSON path; [`Self::from_json`] parses a HuggingFace
+//! `model_config` JSON path; [`Self::from_json`] parses a `HuggingFace`
 //! MoE-flavored `config.json` (e.g. Qwen3-MoE / Mixtral) — the dense fields read
 //! identically, and the MoE-specific keys (`num_experts`, `num_experts_per_tok`,
 //! `moe_intermediate_size`) are read from the same JSON.
@@ -22,7 +22,7 @@ use serde::Deserialize;
 use crate::timing::bridge::DType;
 use crate::timing::Dim;
 
-/// Raw MoE transformer dims (per-model identity, parallelism-agnostic). Shape
+/// Raw `MoE` transformer dims (per-model identity, parallelism-agnostic). Shape
 /// dims are provenance-carrying [`Dim`]s (see [`ModelCfg`]); `num_layers` /
 /// `top_k` are counts, not shapes, so they stay plain `u32`.
 #[derive(Clone, Debug)]
@@ -34,7 +34,7 @@ pub struct MoeModelCfg {
     pub vocab: Dim,
     pub num_layers: u32,
     /// The model's native dtype (from JSON `torch_dtype`, e.g. bf16). This is the
-    /// dtype for the ops that stay 16-bit in an FP8 run — RMSNorm, the attention
+    /// dtype for the ops that stay 16-bit in an FP8 run — `RMSNorm`, the attention
     /// output, and the decode query. FP8 GEMM/attention inputs use
     /// [`Self::compute_dtype`] instead.
     pub dtype: DType,
@@ -50,14 +50,14 @@ pub struct MoeModelCfg {
     pub num_experts: Dim,
     /// Experts each token selects (without replacement). A count, not a shape.
     pub top_k: u32,
-    /// Per-expert intermediate dim (MoE FFN gate/up/down width).
+    /// Per-expert intermediate dim (`MoE` FFN gate/up/down width).
     pub moe_intermediate: Dim,
 }
 
 impl MoeModelCfg {
-    /// Load from a HuggingFace MoE `config.json`. `head_dim` falls back to
+    /// Load from a `HuggingFace` `MoE` `config.json`. `head_dim` falls back to
     /// `hidden_size / num_attention_heads`; `kv_dtype` mirrors `torch_dtype`.
-    /// MoE keys (`num_experts`, `num_experts_per_tok`, `moe_intermediate_size`)
+    /// `MoE` keys (`num_experts`, `num_experts_per_tok`, `moe_intermediate_size`)
     /// are required.
     pub fn from_json(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -86,6 +86,7 @@ impl MoeModelCfg {
 
     /// The compute dtype for GEMMs and prefill attention q/kv: FP8 in an FP8 run,
     /// else the model's base `dtype`. In a non-FP8 run `compute_dtype() == dtype`.
+    #[must_use]
     pub fn compute_dtype(&self) -> DType {
         if self.fp8 {
             DType::Fp8E4m3
@@ -96,7 +97,8 @@ impl MoeModelCfg {
 
     /// Turn FP8 on/off. FP8 moves the KV cache to FP8; the base `dtype` is left
     /// as the model's native (bf16) dtype — it is what the 16-bit-holdout ops
-    /// (RMSNorm, attention output, decode query) keep using.
+    /// (`RMSNorm`, attention output, decode query) keep using.
+    #[must_use]
     pub fn with_fp8(mut self, fp8: bool) -> Self {
         self.fp8 = fp8;
         if fp8 {
@@ -107,6 +109,7 @@ impl MoeModelCfg {
 
     /// Candidate implementations for dense single GEMMs. BF16/FP16 evaluates
     /// both RHS layouts and keeps the faster cache result per runtime shape.
+    #[must_use]
     pub fn single_gemm_backends(&self) -> Vec<&'static str> {
         if self.fp8 {
             vec!["deepgemm"]
@@ -117,6 +120,7 @@ impl MoeModelCfg {
 
     /// Grouped expert GEMMs have no `F.linear` analogue; keep their dtype-driven
     /// backend separate from the dense single-GEMM candidate set.
+    #[must_use]
     pub fn grouped_gemm_backends(&self) -> Vec<&'static str> {
         if self.fp8 {
             vec!["deepgemm"]
@@ -126,7 +130,7 @@ impl MoeModelCfg {
     }
 }
 
-/// HuggingFace MoE `config.json` shape (only the fields a MoE arch needs).
+/// `HuggingFace` `MoE` `config.json` shape (only the fields a `MoE` arch needs).
 #[derive(Deserialize)]
 struct JsonMoeModelConfig {
     hidden_size: u32,
@@ -161,6 +165,7 @@ fn parse_dtype(s: &str) -> Result<DType> {
 impl MoeModelCfg {
     /// Qwen3-235B-A22B preset (bf16). Aligned to ref
     /// `moesim-rs/src/workload/standard_moe.rs::qwen3_235b`.
+    #[must_use]
     pub fn qwen3_235b() -> Self {
         Self {
             hidden: Dim::param("hidden", 4096),

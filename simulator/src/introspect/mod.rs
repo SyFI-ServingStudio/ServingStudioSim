@@ -11,14 +11,14 @@
 //!     calls this first to place off-grid probes.
 //!   - **`eval`** → best-of-N interpolated metrics at a batch of `query_points`
 //!     (each the kernel's own `Input` fields). Builds the kernel (profiles
-//!     missing grid rows via JIT), so it needs the perf_api bridge.
+//!     missing grid rows via JIT), so it needs the `perf_api` bridge.
 //!   - **`peak`** → the fitted grid's peak achieved compute/BW rates (the
 //!     per-config "best batching" ceiling the optimality analyzer divides work
 //!     by). Builds the kernel like `eval`, then reads the peak straight off the
 //!     cache cells — no query points, no coords remap. Needs the bridge.
 //!
 //! Division of labor: Python (`tools/cache_fidelity.py`) owns the one config and
-//! feeds it to **both** the Rust interpolation (here) and the perf_api ground
+//! feeds it to **both** the Rust interpolation (here) and the `perf_api` ground
 //! truth, so they can't describe different kernels. Rust owns only the
 //! authoritative interpolation + grid metadata; it never profiles ground truth
 //! and never reimplements bilinear. To test a different cache (grid/axes/type)
@@ -85,7 +85,7 @@ struct PointResult {
     flops: f32,
     bytes: f32,
     energy_j: f32,
-    /// `CoverageFlags` bits (EXTRAPOLATED=1, JIT=2, NO_COVERAGE=4).
+    /// `CoverageFlags` bits (EXTRAPOLATED=1, JIT=2, `NO_COVERAGE=4`).
     coverage: u8,
 }
 

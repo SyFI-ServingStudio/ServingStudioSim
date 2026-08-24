@@ -53,6 +53,7 @@ pub enum BuildError {
 }
 
 impl BuildError {
+    #[must_use]
     pub fn from_perf_api(kind: KernelKind, backend: &'static str, error: PerfApiError) -> Self {
         match error {
             PerfApiError::MissingEntry { spec, .. } => Self::MissingEntry {

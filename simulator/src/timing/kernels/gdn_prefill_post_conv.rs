@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused prefill post-convolution preparation kernel.
+//! Qwen Gated `DeltaNet` fused prefill post-convolution preparation kernel.
 //!
 //! Model head geometry and compute dtype are static config identity. The
 //! physical token count is the sole runtime interpolation axis. The explicit
@@ -56,9 +56,17 @@ impl KernelSpec for GdnPrefillPostConvSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|num_tokens| {
+            // Sweep axis values (pow2/values chain, max 262144) are
+            // non-negative integers well under u32::MAX.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "sweep axis values are non-negative integers far below u32::MAX"
+            )]
+            let num_tokens = num_tokens as u32;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("num_tokens", num_tokens as u32)
+                .with("num_tokens", num_tokens)
                 .with("num_qk_heads", config.num_qk_heads.get())
                 .with("num_value_heads", config.num_value_heads.get())
                 .with("key_head_dim", config.key_head_dim.get())

@@ -56,7 +56,7 @@ where
     cluster: SharedGpuCluster,
     /// Reused per-tick event sinks, typed per pool (`PdPrefillEvent` for the
     /// producer side, `PdDecodeEvent` for the consumer). Drained + cleared
-    /// each tick; the typed sinks make "decode never emits PrefillDone" a
+    /// each tick; the typed sinks make "decode never emits `PrefillDone`" a
     /// compile-time fact rather than a silent ignore arm.
     prefill_events: Vec<PdPrefillEvent>,
     decode_events: Vec<PdDecodeEvent>,
@@ -77,6 +77,7 @@ where
     /// both pools (their workers self-register their GPU blocks in the cluster
     /// at construction). `cost` is the cluster's per-link transfer-cost source
     /// (the `p2p_inter` kernel in production, an analytic curve in tests).
+    #[must_use]
     pub fn new(
         prefill_cfg: &SimpleDpPoolConfig,
         prefill_factory: &UnifiedWorkerFactory<MP, WP>,
@@ -257,6 +258,10 @@ mod tests {
         flow.on_arrival(text_request(RequestId(0), 16, 3, Time::ZERO));
         let mut completed = Vec::new();
         for step in 0..500u64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             for a in flow.tick(Time::from_ms(step as f64)) {
                 let OrchAction::Complete { req } = a;
                 completed.push(req);
@@ -278,6 +283,10 @@ mod tests {
         flow.on_arrival(text_request(RequestId(0), 16, 1, Time::ZERO));
         let mut completed = Vec::new();
         for step in 0..100u64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             for a in flow.tick(Time::from_ms(step as f64)) {
                 let OrchAction::Complete { req } = a;
                 completed.push(req);

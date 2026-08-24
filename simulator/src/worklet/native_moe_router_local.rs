@@ -1,4 +1,4 @@
-//! Native BF16 MoE router section: post-attention RMSNorm followed by a direct
+//! Native BF16 `MoE` router section: post-attention `RMSNorm` followed by a direct
 //! router GEMM. The norm is unconditionally owned here because native attention
 //! ends at a pure TP all-reduce and does not fuse the residual/norm boundary.
 
@@ -42,6 +42,7 @@ pub struct NativeMoeRouterLocalWorklet {
 }
 
 impl NativeMoeRouterLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &NativeMoeRouterLocalWorkletConfig,
     ) -> NativeMoeRouterLocalWorkletResolved {

@@ -77,6 +77,7 @@ impl<M: FfnLayerwiseModel> AfdFfnPoolController<DisaggFfnWorker<M>> {
 impl<W: AfdFfnWorker> AfdFfnPoolController<W> {
     /// Assemble the task router around independently-built FFN workers.  This
     /// keeps L6 coupled to the FFN protocol, not a production concrete type.
+    #[must_use]
     pub fn from_workers(workers: Vec<W>) -> Self {
         assert!(
             !workers.is_empty(),
@@ -154,6 +155,10 @@ mod tests {
         });
         let mut events = Vec::new();
         for step in 0..10u64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             p.tick_collect(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(events.len(), 1);
@@ -199,6 +204,10 @@ mod tests {
         });
         let mut events = Vec::new();
         for step in 0..10u64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             p.tick_collect(Time::from_ms(step as f64), &mut events);
         }
         let workers: Vec<u16> = events
@@ -229,6 +238,10 @@ mod tests {
         });
         let mut events = Vec::new();
         for step in 0..10u64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             p.tick_collect(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(

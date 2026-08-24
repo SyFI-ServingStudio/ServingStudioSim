@@ -140,6 +140,11 @@ pub fn value_f64(array: &ArrayRef, row: usize) -> Result<f64> {
         return Ok(a.value(row) as f64);
     }
     if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "cost_log i64 columns (durations/byte counts) feed plotted/statistical f64 \
+                      values; exact only below 2^53 but this is display-scale data, not accounting"
+        )]
         return Ok(a.value(row) as f64);
     }
     if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
@@ -152,6 +157,11 @@ pub fn value_f64(array: &ArrayRef, row: usize) -> Result<f64> {
         return Ok(a.value(row) as f64);
     }
     if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "cost_log u64 columns (durations/byte counts) feed plotted/statistical f64 \
+                      values; exact only below 2^53 but this is display-scale data, not accounting"
+        )]
         return Ok(a.value(row) as f64);
     }
     if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
@@ -171,7 +181,12 @@ pub fn value_f64(array: &ArrayRef, row: usize) -> Result<f64> {
 /// cost_log paths read tens of millions of rows, so paying the downcast once per
 /// column rather than once per element is the difference between seconds and
 /// minutes. Same numeric-type coverage as `value_f64`.
-#[allow(clippy::unnecessary_cast)] // uniform `as f64` across the int/float arms
+#[allow(
+    clippy::unnecessary_cast,
+    clippy::cast_precision_loss,
+    reason = "uniform `as f64` across the int/float arms; the i64/u64 arms (cost_log durations/byte \
+              counts) are exact only below 2^53, but this feeds plotted/statistical values, not accounting"
+)]
 pub fn column_f64(array: &ArrayRef) -> Result<Vec<f64>> {
     macro_rules! collect_as {
         ($ty:ty) => {{

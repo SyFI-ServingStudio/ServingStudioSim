@@ -1,10 +1,10 @@
-//! Qwen Gated DeltaNet prefill chunked delta rule as ONE fused launch.
+//! Qwen Gated `DeltaNet` prefill chunked delta rule as ONE fused launch.
 //!
 //! Deliberately a separate kind from the six `gdn_chunk_*` kinds. Those model
 //! FLA's Triton realization, which splits the chunked gated delta rule into six
 //! launches (local cumsum, K.Kt, triangular solve, w/u recompute, inter-chunk
 //! state scan, output). This kind models the realization vLLM actually selects
-//! on Hopper: FlashInfer's `chunk_gated_delta_rule`, a single CUTLASS TMA
+//! on Hopper: `FlashInfer`'s `chunk_gated_delta_rule`, a single CUTLASS TMA
 //! warp-specialized kernel (`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`)
 //! that keeps every intermediate on chip. `_resolve_gdn_prefill_backend` picks
 //! it for the default `auto` request on any SM90 part, so an H200 capture never
@@ -63,8 +63,8 @@ pub struct GdnChunkDeltaRuleKernelInput {
 impl SweepCoords for GdnChunkDeltaRuleKernelInput {
     fn coords(&self) -> Coords {
         Coords::new([
-            self.max_sequence_length as f64,
-            self.num_tokens as f64 / self.max_sequence_length as f64,
+            f64::from(self.max_sequence_length),
+            f64::from(self.num_tokens) / f64::from(self.max_sequence_length),
         ])
     }
 
@@ -103,7 +103,18 @@ impl KernelSpec for GdnChunkDeltaRuleSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_2d(|max_sequence_length, full_sequences| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "max_sequence_length is a non-negative Axis::pow2 sweep coordinate, always a small \
+                          power of two (see the pow2(6, 14) axis above)"
+            )]
             let max_sequence_length = max_sequence_length.round() as u64;
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "max_sequence_length is capped at 2^14 by the sweep grid, far below f64's 53-bit \
+                          exact-integer range, so this round-trip through token_total is exact"
+            )]
             let num_tokens = token_total(max_sequence_length as f64, full_sequences);
             ArgsPayload::new()
                 .with("backend", backend)
@@ -124,6 +135,12 @@ impl KernelSpec for GdnChunkDeltaRuleSpec {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "max_sequence_length and full_sequences are non-negative sweep coordinates bounded by the \
+              pow2(6, 14) and pow2(0, 4) axes, so rounding to u64 here never truncates or loses sign"
+)]
 fn token_total(max_sequence_length: f64, full_sequences: f64) -> u64 {
     let max_sequence_length = max_sequence_length.round() as u64;
     let full_sequences = full_sequences.round() as u64;

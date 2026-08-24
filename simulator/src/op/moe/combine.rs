@@ -1,4 +1,4 @@
-//! `MoeCombineOp` — compound L2 op (L2 design §3) for MoE token combine. One
+//! `MoeCombineOp` — compound L2 op (L2 design §3) for `MoE` token combine. One
 //! combine call prices the four combine network stages (`combine_intra_reduce`,
 //! `combine_inter_reduce`, `combine_inter_bcast`, `combine_intra_fanout`) against
 //! the `p2p_intra` / `p2p_inter` L1 kernels.
@@ -71,8 +71,8 @@ impl MoeCombineOp {
         })
     }
 
-    /// CostTree compile: four leaves in stage order (intra_reduce, inter_reduce,
-    /// inter_bcast, intra_fanout), matching the eval push order.
+    /// `CostTree` compile: four leaves in stage order (`intra_reduce`, `inter_reduce`,
+    /// `inter_bcast`, `intra_fanout`), matching the eval push order.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let intra_kind = self.p2p_intra.kind();
         let intra_cfg = self.p2p_intra.describe_config();
@@ -102,7 +102,7 @@ impl MoeCombineOp {
         ])
     }
 
-    /// CostTree eval: interpolate each combine stage's bottleneck curve at the
+    /// `CostTree` eval: interpolate each combine stage's bottleneck curve at the
     /// token count and look it up on the stage's tier kernel.
     pub fn eval(&self, input: &MoeNetInput, ev: &mut Evaluator) {
         for curve in &self.combine {

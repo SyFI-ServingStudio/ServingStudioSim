@@ -3,7 +3,7 @@
 //! This single-GPU section preserves the checkpoint's FP32 router semantics:
 //! base-dtype activations are cast to FP32 before the router GEMM, then
 //! sigmoid, correction bias, grouped top-8 selection, normalization, and 5/2
-//! scaling produce routed weights and expert indices. VibeSim has no measured
+//! scaling produce routed weights and expert indices. `VibeSim` has no measured
 //! FP32 `single_gemm` backend for this shape, so `router_gemm_bf16_proxy` is an
 //! explicitly labeled timing proxy: BF16 by default and FP8 in the bounded
 //! GLM FP8 selector. It is not production-exact in either mode.
@@ -94,6 +94,7 @@ pub struct Glm52MoeRouterLocalWorklet {
 impl Glm52MoeRouterLocalWorklet {
     /// Resolve the one supported GLM-5.2 router identity without touching a
     /// bridge, GPU, cache, or `Arc`.
+    #[must_use]
     pub fn resolve_config(
         cfg: &Glm52MoeRouterLocalWorkletConfig,
     ) -> Glm52MoeRouterLocalWorkletResolved {

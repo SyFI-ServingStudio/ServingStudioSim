@@ -68,6 +68,10 @@ struct BinnedSeries {
     mean: f64,
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "n_bins is the small FINE_BINS-derived bin count and n_workers is a small per-pool worker-roster size; both stay far below f64's 2^53 exact-integer range"
+)]
 pub async fn run_request_state(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let slo_path = resolve_artifact_path(log_dir, "request_slo.parquet");
     if !register_if_exists(ctx, "slo", slo_path).await? {
@@ -366,6 +370,11 @@ fn build_event_set(timelines: &[(f64, Vec<Transition>)], names: &[String]) -> Re
     Ok(out)
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "n_bins is a small bin count; `current` is the running stage-population counter, which this function already validates stays nonnegative (`bail!` above) and realistically stays far below 2^53/u64::MAX for any real run"
+)]
 fn bin_deltas(events: &[TimedDelta], span_ms: f64, n_bins: usize) -> Result<BinnedSeries> {
     if span_ms <= 0.0 || n_bins == 0 {
         bail!("request-state binning requires a positive span and bin count");
@@ -439,7 +448,7 @@ async fn collect_timelines(ctx: &SessionContext) -> Result<Vec<(f64, Vec<Transit
         let code_col = col(batch, "stage_codes")?;
         let pool_col = col(batch, "stage_pool_ids")?;
         let worker_col = col(batch, "stage_worker_ids")?;
-        for row in 0..batch.num_rows() {
+        for (row, &logging_time) in logging_times.iter().enumerate() {
             let times = value_f32_list(time_col, row)?;
             let codes = value_u16_list(code_col, row, "stage_codes")?;
             let pools = value_u16_list(pool_col, row, "stage_pool_ids")?;
@@ -462,7 +471,7 @@ async fn collect_timelines(ctx: &SessionContext) -> Result<Vec<(f64, Vec<Transit
                     worker: worker as u64,
                 })
                 .collect();
-            out.push((logging_times[row], transitions));
+            out.push((logging_time, transitions));
         }
     }
     Ok(out)

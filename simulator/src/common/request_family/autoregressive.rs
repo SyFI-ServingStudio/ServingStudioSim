@@ -19,6 +19,7 @@ pub enum SessionInput {
 }
 
 impl SessionInput {
+    #[must_use]
     pub const fn session_id(self) -> Option<u32> {
         match self {
             Self::Standalone => None,
@@ -26,6 +27,7 @@ impl SessionInput {
         }
     }
 
+    #[must_use]
     pub const fn session_start_time(self) -> Option<Time> {
         match self {
             Self::Standalone => None,
@@ -37,6 +39,7 @@ impl SessionInput {
 
     /// Oldest-session-first key, with a standalone request treated as its own
     /// one-request conversation.
+    #[must_use]
     pub const fn session_start_or(self, standalone_arrival_time: Time) -> Time {
         match self {
             Self::Standalone => standalone_arrival_time,
@@ -46,6 +49,7 @@ impl SessionInput {
         }
     }
 
+    #[must_use]
     pub const fn declared_prefix_tokens(self) -> u32 {
         match self {
             Self::Standalone => 0,

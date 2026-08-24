@@ -10,8 +10,8 @@
 //! `(Q, S)` cells are evaluated per request and summed into one fixed slot;
 //! decode is one optional cell already collapsed by L3. Mixed batches therefore
 //! sum prefill and decode leaves even when production can combine them in one
-//! FlashMLA launch. This intentionally approximates that shared launch overhead
-//! while preserving a request-count-independent CostTree.
+//! `FlashMLA` launch. This intentionally approximates that shared launch overhead
+//! while preserving a request-count-independent `CostTree`.
 
 use std::sync::Arc;
 
@@ -299,7 +299,7 @@ fn mla_cache_append_config(cfg: &DsaSparseMlaAttentionConfig) -> MlaCacheAppendK
 fn index_remap_config(
     cfg: &DsaSparseMlaAttentionConfig,
 ) -> Result<ElementwiseKernelConfig, BuildError> {
-    if cfg.selected_k == 0 || cfg.selected_k % REMAP_TILE_SIZE != 0 {
+    if cfg.selected_k == 0 || !cfg.selected_k.is_multiple_of(REMAP_TILE_SIZE) {
         return Err(fit_failed(format!(
             "selected_k must be positive and divisible by {REMAP_TILE_SIZE}, got {}",
             cfg.selected_k

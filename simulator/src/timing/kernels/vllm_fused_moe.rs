@@ -79,8 +79,17 @@ impl KernelSpec for VllmFusedMoeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "local expert count per EP rank is small, far below u32::MAX"
+        )]
         let num_local_experts = config.local_ppm.len() as u32;
         grid.expand_1d(|num_tokens| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_tokens comes from the profiling grid's token axis: a small, non-negative, pre-curated point far below u32::MAX"
+            )]
             let num_tokens = num_tokens as u32;
             let global_expert_selections = num_tokens
                 .checked_mul(config.experts_per_token)

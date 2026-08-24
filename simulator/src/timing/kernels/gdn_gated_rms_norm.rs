@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused gated RMS normalization kernel.
+//! Qwen Gated `DeltaNet` fused gated RMS normalization kernel.
 //!
 //! Hidden width and compute dtype are static config identity. The flattened row
 //! count `m` is the sole physical runtime interpolation axis: Qwen maps it from
@@ -48,9 +48,17 @@ impl KernelSpec for GdnGatedRmsNormSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|m| {
+            // Axis::pow2(5, 18) values are non-negative integers, max 262144,
+            // far below u32::MAX.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "sweep axis values are non-negative integers far below u32::MAX"
+            )]
+            let m = m as u32;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("m", m as u32)
+                .with("m", m)
                 .with("hidden", config.hidden.get())
                 .with("dtype", config.dtype.as_str())
         })

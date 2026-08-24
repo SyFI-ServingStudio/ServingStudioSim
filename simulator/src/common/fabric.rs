@@ -1,8 +1,8 @@
 //! Network fabric kinds used by L1 comm runners + L5 transport layer.
 //!
-//! Variant names follow Rust UpperCamelCase; the serde wire form is fixed via
+//! Variant names follow Rust `UpperCamelCase`; the serde wire form is fixed via
 //! per-variant `rename` so acronym-ish variants land on the conventional
-//! lowercase tokens (`nvlink`, not the snake_case `nv_link`).
+//! lowercase tokens (`nvlink`, not the `snake_case` `nv_link`).
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +26,7 @@ impl Fabric {
     /// The serde wire token, for emitting into an L1 `ArgsPayload` field (the
     /// comm-kernel cache key) or any other string sink. Kept in lockstep with
     /// the per-variant `#[serde(rename = ...)]` above.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Fabric::Nvlink => "nvlink",

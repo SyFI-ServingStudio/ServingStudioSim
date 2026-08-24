@@ -85,6 +85,10 @@ pub async fn run_slo_goodput(ctx: &SessionContext, log_dir: &Path) -> Result<(Va
         .mean
         .expect("non-empty cleaned TPOT population has a mean");
     let duration_s = workload.duration_ms / 1000.0;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "total_emitted_output_tokens is a per-run token count far below 2^53, so the f64 conversion is exact"
+    )]
     let output_throughput_tok_s = aggregate.total_emitted_output_tokens as f64 / duration_s;
     let transport_errors = 0_u64;
     let passed = aggregate.total_requests > 0
@@ -160,6 +164,11 @@ fn read_workload(log_dir: &Path) -> std::result::Result<WorkloadDoc, String> {
     Ok(params.workload)
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "all five fields are COUNT(*)/SUM(CASE...) results over this run's rows; DataFusion returns them as f64 but the aggregate is always a nonnegative whole number within u64 range for any run this analyzer processes"
+)]
 async fn collect_request_aggregate(ctx: &SessionContext) -> Result<RequestAggregate> {
     let batches = collect(
         ctx,

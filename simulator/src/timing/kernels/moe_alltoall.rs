@@ -1,4 +1,4 @@
-//! FlashInfer MNNVL two-sided MoE all-to-all timing leaf.
+//! `FlashInfer` MNNVL two-sided `MoE` all-to-all timing leaf.
 //!
 //! This is the transfer vLLM runs for expert parallelism under
 //! `--all2all-backend=flashinfer_nvlink_two_sided`. Both legs of the round trip
@@ -92,6 +92,7 @@ pub enum MoeAlltoallDirection {
 }
 
 impl MoeAlltoallDirection {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dispatch => "dispatch",
@@ -116,7 +117,7 @@ pub struct MoeAlltoallKernelConfig {
     /// even when the experts are fp8 (see the arch that builds this config).
     pub hidden_bytes: Dim,
     pub direction: MoeAlltoallDirection,
-    /// Row/cache key only: MNNVL is NVLink by construction.
+    /// Row/cache key only: MNNVL is `NVLink` by construction.
     pub fabric: Fabric,
 }
 
@@ -143,11 +144,11 @@ pub struct MoeAlltoallKernelInput {
 /// reason is geometric rather than statistical: the cost tracks `max(send, recv)
 /// * hidden_bytes / bandwidth`, and `max` has a KINK along `send == recv` that a
 /// bilinear patch cannot represent. Interpolating `max` itself over the
-/// 32768..65536 square gives 58031 rows at (43374, 54441) against a true 54441 —
-/// +6.6%, and +16.7% dead in the middle of that cell. The GLM-5.2 DP8 prefill
-/// point lands there in BOTH axes at once, which is why 8k-token steps read
-/// +13.8% (dispatch) / +18.5% (combine) against vLLM while decode, whose cells
-/// are only ~1.1x wide, was already within a few percent.
+///   32768..65536 square gives 58031 rows at (43374, 54441) against a true 54441 —
+///   +6.6%, and +16.7% dead in the middle of that cell. The GLM-5.2 DP8 prefill
+///   point lands there in BOTH axes at once, which is why 8k-token steps read
+///   +13.8% (dispatch) / +18.5% (combine) against vLLM while decode, whose cells
+///   are only ~1.1x wide, was already within a few percent.
 ///
 /// A cell spanning `lo..hi` overshoots by `0.5 * (r - 1) / (r + 1)` at its
 /// centre, where `r = hi / lo` — so the budget is set by the RATIO, and a fixed
@@ -218,6 +219,11 @@ impl KernelSpec for MoeAlltoallSpec {
             config.top_k,
             config.slot_count
         );
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "max_send_rows/max_recv_rows are non-negative sweep-grid coordinates, far below u32::MAX"
+        )]
         grid.expand_2d(|max_send_rows, max_recv_rows| {
             ArgsPayload::new()
                 .with("backend", backend)

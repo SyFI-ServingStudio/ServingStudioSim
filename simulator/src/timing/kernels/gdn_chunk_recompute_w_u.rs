@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet chunk-local WY recomputation kernel.
+//! Qwen Gated `DeltaNet` chunk-local WY recomputation kernel.
 //!
 //! Public inputs remain the physical `(num_tokens, num_chunks)` caller shape,
 //! while the cache projects them to `(C, D=T/C)`: launched chunks and average
@@ -39,8 +39,8 @@ pub struct GdnChunkRecomputeWUKernelInput {
 impl SweepCoords for GdnChunkRecomputeWUKernelInput {
     fn coords(&self) -> Coords {
         Coords::new([
-            self.num_chunks as f64,
-            self.num_tokens as f64 / self.num_chunks as f64,
+            f64::from(self.num_chunks),
+            f64::from(self.num_tokens) / f64::from(self.num_chunks),
         ])
     }
 
@@ -67,7 +67,17 @@ impl KernelSpec for GdnChunkRecomputeWUSpec {
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         grid.expand_2d(|num_chunks, tokens_per_chunk| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_chunks is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let num_chunks = num_chunks.round() as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "tokens_per_chunk is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let tokens_per_chunk = tokens_per_chunk.round() as u64;
             num_chunks
                 .checked_mul(tokens_per_chunk)
@@ -82,7 +92,17 @@ impl KernelSpec for GdnChunkRecomputeWUSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_2d(|num_chunks, tokens_per_chunk| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_chunks is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let num_chunks = num_chunks.round() as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "tokens_per_chunk is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let tokens_per_chunk = tokens_per_chunk.round() as u64;
             let num_tokens = num_chunks
                 .checked_mul(tokens_per_chunk)
@@ -256,6 +276,12 @@ mod tests {
         assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 112);
         for (chunk_index, &chunks) in grid.axes()[0].iter().enumerate() {
             for (density_index, &density) in grid.axes()[1].iter().enumerate() {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "chunks/density are non-negative sweep-grid axis values bounded by \
+                              MAX_TOKENS (262_144), far under u64::MAX"
+                )]
                 let product = (chunks as u64).checked_mul(density as u64).unwrap();
                 assert_eq!(
                     mask[chunk_index * density_count + density_index],
@@ -317,7 +343,7 @@ mod tests {
         }
         assert_eq!(feasible_rows.len(), 112);
 
-        let qwen = &payloads[1 * 7 + 6];
+        let qwen = &payloads[7 + 6];
         assert_eq!(qwen.fields()["num_tokens"], Value::from(128_u32));
         assert_eq!(qwen.fields()["num_chunks"], Value::from(2_u32));
         assert_eq!(qwen.fields()["num_key_heads"], Value::from(16_u32));

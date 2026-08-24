@@ -1,7 +1,7 @@
-//! Compound Gated DeltaNet decode operation.
+//! Compound Gated `DeltaNet` decode operation.
 //!
 //! Causal convolution updates each request's convolution state before the
-//! recurrent DeltaNet launch consumes and updates its recurrent state. The
+//! recurrent `DeltaNet` launch consumes and updates its recurrent state. The
 //! shared request-local state makes this a strict, zero-overlap sum boundary.
 
 use std::sync::Arc;

@@ -32,7 +32,7 @@ pub(super) fn full_attention_token_capacity<M: IterwiseUnifiedModel>(
 ) -> u64 {
     let partition_kv_bytes = config
         .attn_kv_bytes
-        .saturating_mul(model.num_attn_shards().max(1) as u64);
+        .saturating_mul(u64::from(model.num_attn_shards().max(1)));
     (partition_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1)
 }
 
@@ -59,6 +59,10 @@ pub(super) fn prepare_unified_iter_build_essentials<M: IterwiseUnifiedModel>(
 
     {
         let mut cluster = cluster.borrow_mut();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_partitions is a GPU/rank partition count, always small"
+        )]
         for partition in 0..num_partitions as u16 {
             cluster.register_kv_capacity(pool_tag, pool.0, id.0, partition, kv_capacity);
         }

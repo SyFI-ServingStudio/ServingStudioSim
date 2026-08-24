@@ -346,6 +346,11 @@ fn worker_config(
     kv_log_stride: u32,
 ) -> WorkerConfig {
     WorkerConfig {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "attn_gpu_memory_gb is a positive, hardware-bounded GB figure; the byte count stays well within u64 range"
+        )]
         attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times,
         log_stage_transitions,
@@ -417,7 +422,7 @@ where
 /// message bytes, not dtype), so an fp8 handoff is just fewer bytes on the same
 /// curve — the fp8-width byte count is supplied by the arch's handoff size. Lists
 /// nccl + nvshmem for parity with the collective ops (best-of-N picks the faster);
-/// note p2p_inter is an analytical, backend-agnostic curve, so both resolve alike.
+/// note `p2p_inter` is an analytical, backend-agnostic curve, so both resolve alike.
 fn build_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result<CostSource> {
     let kernel = P2pInterKernel::build(
         "afd_qkv_transfer".to_string(),

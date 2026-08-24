@@ -84,6 +84,10 @@ impl<E: FfnTaskExecution> IterWorker for BufferedFfnWorker<E> {
 
     fn status(&self) -> WorkerStatus {
         let queued = self.incoming.len() + usize::from(self.pulling_task.is_some());
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "queued request count is bounded by the simulated request population, far under u32::MAX"
+        )]
         WorkerStatus {
             queued_requests: queued as u32,
             active_requests: u32::from(self.computing_task.is_some()),
@@ -299,7 +303,7 @@ mod tests {
         }));
         let mut events = Vec::new();
         for step in 0..10 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
         assert_eq!(
             events,
@@ -337,7 +341,7 @@ mod tests {
         }));
         let mut events = Vec::new();
         for step in 0..10 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
+            worker.tick(Time::from_ms(f64::from(step)), &mut events);
         }
         let store = store.borrow();
         assert!(store[RequestId(0)].lifecycle.completed);

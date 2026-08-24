@@ -1,8 +1,8 @@
 //! Qwen3.6 TP1 gated-GQA attention section in vLLM launch granularity.
 //!
 //! This local, self-synchronizing section starts at the decoder's delayed
-//! residual-add + input RMSNorm boundary and ends at the post-attention
-//! residual-add + RMSNorm boundary. The following MoE router consumes the
+//! residual-add + input `RMSNorm` boundary and ends at the post-attention
+//! residual-add + `RMSNorm` boundary. The following `MoE` router consumes the
 //! normalized hidden states and therefore owns no norm. There are no TP, EP,
 //! collective, or network children.
 
@@ -97,6 +97,7 @@ pub struct Qwen36GatedGqaLocalWorklet {
 }
 
 impl Qwen36GatedGqaLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &Qwen36GatedGqaLocalWorkletConfig,
     ) -> Qwen36GatedGqaLocalWorkletResolved {

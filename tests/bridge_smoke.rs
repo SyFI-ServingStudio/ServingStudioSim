@@ -1,4 +1,4 @@
-//! PyO3 bridge smoke test — the only end-to-end exercise of the Rust↔Python
+//! `PyO3` bridge smoke test — the only end-to-end exercise of the Rust↔Python
 //! `perf_api` boundary (unit tests cover pure-Rust helpers only).
 //!
 //! `#[ignore]` by default: it needs the project venv interpreter, not the
@@ -26,7 +26,7 @@ use simulator::timing::PerfApiBridge;
 const KIND: &str = "single_gemm";
 const GPU: &str = "TestGPU";
 
-/// A single_gemm wire payload matching the Python `SingleGemmArgs` schema.
+/// A `single_gemm` wire payload matching the Python `SingleGemmArgs` schema.
 fn payload(m: u32) -> ArgsPayload {
     ArgsPayload::new()
         .with("backend", "torch")
@@ -36,7 +36,7 @@ fn payload(m: u32) -> ArgsPayload {
         .with("dtype", DType::Fp16.as_str())
 }
 
-/// Point `perf_api.DB_PATH` at `db_path` and seed one single_gemm/torch row, so
+/// Point `perf_api.DB_PATH` at `db_path` and seed one `single_gemm/torch` row, so
 /// the `m == 16` lookups below hit. The Table/ProfileRow schema lives in Python,
 /// so seeding is done there.
 fn seed_db(db_path: &str) {

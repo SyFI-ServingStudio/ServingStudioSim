@@ -75,6 +75,7 @@ pub struct StreamingParquetWriter {
 }
 
 impl StreamingParquetWriter {
+    #[must_use]
     pub fn new(path: PathBuf, schema: Arc<Schema>) -> Self {
         Self {
             path,
@@ -90,6 +91,7 @@ impl StreamingParquetWriter {
 
     /// Opt out of parquet dictionary encoding for this stream (see the field docs).
     /// Must be set before the first `write` opens the file.
+    #[must_use]
     pub fn with_dictionary_enabled(mut self, enabled: bool) -> Self {
         self.dictionary_enabled = enabled;
         self
@@ -97,6 +99,7 @@ impl StreamingParquetWriter {
 
     /// Opt out of parquet per-column min/max statistics for this stream (see the
     /// field docs). Must be set before the first `write` opens the file.
+    #[must_use]
     pub fn with_statistics_enabled(mut self, enabled: bool) -> Self {
         self.statistics_enabled = enabled;
         self
@@ -127,6 +130,7 @@ impl StreamingParquetWriter {
     /// with [`ColumnPath::new`], since `ColumnPath::from("a.list.item")` does not
     /// split on `.` and silently matches nothing.
     /// Must be set before the first `write` opens the file.
+    #[must_use]
     pub fn with_column_dictionary_disabled(mut self, columns: Vec<ColumnPath>) -> Self {
         self.no_dictionary_columns = columns;
         self
@@ -143,15 +147,18 @@ impl StreamingParquetWriter {
     ///
     /// Same per-leaf path rule as [`Self::with_column_dictionary_disabled`].
     /// Must be set before the first `write` opens the file.
+    #[must_use]
     pub fn with_column_statistics_disabled(mut self, columns: Vec<ColumnPath>) -> Self {
         self.no_statistics_columns = columns;
         self
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    #[must_use]
     pub fn rows_written(&self) -> usize {
         self.rows_written
     }
@@ -197,7 +204,7 @@ impl StreamingParquetWriter {
 
 #[cfg(test)]
 mod tests {
-    //! Round-trip diagnostics for the cost_log corruption. Each test writes
+    //! Round-trip diagnostics for the `cost_log` corruption. Each test writes
     //! multiple batches through `StreamingParquetWriter` exactly the way
     //! `cost_logger.rs` does, then reads them back with the public parquet
     //! reader — so we exercise the real on-disk encode/decode path, not just
@@ -209,7 +216,7 @@ mod tests {
     use std::fs::File;
     use tempfile::tempdir;
 
-    /// One synthetic cost_log row in the flat layout: every variable-length
+    /// One synthetic `cost_log` row in the flat layout: every variable-length
     /// field gets pushed into the chunk's flat buffer; the entry carries only
     /// the per-row lengths. Mirrors the worker's `start_iter` path.
     fn push_row(chunk: &mut CostLogChunk, worker_id: u16, iter_id: u64, slot_count: usize) {
@@ -222,17 +229,45 @@ mod tests {
         };
         chunk.group_logs.push(g);
         for s in 0..slot_count {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "s is a small loop counter bounded by slot_count in this test fixture, \
+                          far below f32's exact-integer range"
+            )]
             chunk.slot_times.push(0.1 + s as f32 * 0.01);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "masked with & 0xFF just above, so the u8 cast is always in range"
+            )]
             chunk.slot_covs.push((s & 0xFF) as u8);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "s is a small loop counter bounded by slot_count in this test fixture, \
+                          far below f32's exact-integer range"
+            )]
             chunk.slot_flops.push(s as f32 * 1e9);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "s is a small loop counter bounded by slot_count in this test fixture, \
+                          far below f32's exact-integer range"
+            )]
             chunk.slot_bytes.push(s as f32 * 1e6);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "masked with & 0xFF just above, so the u8 cast is always in range"
+            )]
             chunk.slot_backends.push((s & 0xFF) as u8);
         }
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "iter_id is a small test-fixture loop counter, far below f64's exact-integer range"
+        )]
+        let wall_start_ms = iter_id as f64 * 0.1;
         chunk.entries.push(CostLogEntry {
             worker_id,
             iter_id,
             batch_id: 0,
-            wall_start_ms: iter_id as f64 * 0.1,
+            wall_start_ms,
             total_time_ms: 0.5,
             energy_j: 0.1,
             section: "iter",

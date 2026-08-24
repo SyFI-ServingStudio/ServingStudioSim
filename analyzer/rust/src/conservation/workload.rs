@@ -29,8 +29,8 @@
 //!      pass, so a request incurs `d-1` decode forward passes)
 //!   4. `ffn_token_pass`        Σ batch_tokens              vs Σ [p + max(d-1,0)]
 //!   5. `prefill_causal_attn_work`
-//!         Σ_chunks [a·prefix + a(a+1)/2]
-//!             vs Σ [p·hit + p(p+1)/2]
+//!      Σ_chunks [a·prefix + a(a+1)/2]
+//!      vs Σ [p·hit + p(p+1)/2]
 //!      The causal per-chunk work telescopes to the single-shot value
 //!      `p·hit + p(p+1)/2` regardless of how prefill is chunked (the `Σ aᵢ²`
 //!      terms cancel) — so this is exact even with `ChunkedPrefill`. NOTE: this
@@ -43,7 +43,7 @@
 //!      context-ready request; a sim-end partial prefill uses only its observed
 //!      `hit + p` context so unfinished future work is not invented.
 //!   7. `decode_kv_sum`         Σ decode_kv_total
-//!         vs Σ [m·context + m(m-1)/2], m = max(d-1, 0)
+//!      vs Σ [m·context + m(m-1)/2], m = max(d-1, 0)
 //!      (decode reads the full post-prefill context, independent of how much of
 //!      that context was a cache hit.)
 //!   8. `cost_log_batch_self_consistency`  Σ batch_tokens vs Σ(prefill_tokens +
@@ -224,6 +224,10 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
     Ok((report, payload))
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "layer counts and per-run request/violation counts are small integers, far below 2^53, so the f64 conversion is exact"
+)]
 fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> Vec<Value> {
     let layer_multiplier = match mode {
         WorkloadMode::Iterwise => 1.0,
@@ -435,10 +439,12 @@ fn pct_of(delta: f64, expected: f64) -> f64 {
 /// tens of millions of rows. Each side then sums over the flattened `groups` child
 /// in one typed pass per column (see [`sum_field`] / [`column_f64`]).
 async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actual> {
-    let mut a = Actual::default();
     // `num_iterations` in the report stays the raw cost_log row count (every worker
     // × layer × section row) for continuity — a cheap COUNT(*), not a full scan.
-    a.iters = count_rows(ctx, "SELECT COUNT(*) AS c FROM cost_log").await?;
+    let mut a = Actual {
+        iters: count_rows(ctx, "SELECT COUNT(*) AS c FROM cost_log").await?,
+        ..Default::default()
+    };
 
     match mode {
         WorkloadMode::Iterwise => {
@@ -467,6 +473,10 @@ async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actu
             for batch in &attn {
                 for l in column_f64(col(batch, "layer")?)? {
                     if l.is_finite() && l >= 0.0 {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            reason = "layer index from cost_log, bounded by the model's layer count (well under i16::MAX) and already checked finite/non-negative above"
+                        )]
                         layers.insert(l as i16);
                     }
                 }
@@ -550,6 +560,10 @@ impl WorkloadShape {
         })
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "these u64 fields were produced by exact_count from workload token/request counts on a realistic run (well under 2^53), so converting back to f64 is exact"
+    )]
     fn totals(self) -> WorkloadTotals {
         WorkloadTotals {
             matmul_tokens: self.matmul_tokens as f64,
@@ -564,6 +578,12 @@ impl WorkloadShape {
     }
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "u64::MAX as f64 is only an upper-bound comparison so its rounding doesn't affect validity; value is checked finite, non-negative, integral and <= u64::MAX immediately above, so the f64 -> u64 conversion below is exact"
+)]
 fn exact_count(value: f64, field_name: &str) -> Result<u64> {
     if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
         return Err(anyhow!(
@@ -645,6 +665,10 @@ pub(crate) async fn collect_workload_by_worker(
                 current = Some(((pool.to_string(), worker_id), WorkloadTotals::default()));
             }
             let totals = &mut current.as_mut().expect("current set above").1;
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "Arrow list offsets are always non-negative"
+            )]
             workload_columns
                 .add_range((offsets[row] as usize)..(offsets[row + 1] as usize), totals)?;
         }
@@ -748,6 +772,10 @@ pub(crate) async fn collect_workload_shapes_by_worker(
             let pool_index = match index_by_pool_tag.get(pool_tag) {
                 Some(index) => *index,
                 None => {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "number of distinct pool tags in a run is tiny (a handful of pools), far under u16::MAX"
+                    )]
                     let index = pool_tag_by_index.len() as u16;
                     pool_tag_by_index.push(pool_tag.to_owned());
                     index_by_pool_tag.insert(pool_tag.to_owned(), index);
@@ -757,6 +785,10 @@ pub(crate) async fn collect_workload_shapes_by_worker(
             let totals = totals_by_iteration
                 .entry((pool_index, worker_ids.value(row_index), iteration_id))
                 .or_default();
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "Arrow list offsets are always non-negative"
+            )]
             workload_columns.add_range(
                 (offsets[row_index] as usize)..(offsets[row_index + 1] as usize),
                 totals,
@@ -868,6 +900,11 @@ fn carries_prefill(totals: &WorkloadTotals) -> bool {
 
 /// Sort shapes into the stable order the labeler request uses, carrying each
 /// shape's prefill flag along so the two stay index-aligned.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "these totals were produced by WorkloadShape::from_totals/exact_count as exact non-negative u64 counts, so converting back to u64 here for a stable sort key is exact"
+)]
 fn sort_shapes_with_flags(shapes: &mut [WeightedWorkload], prefill_flags: &mut [bool]) {
     let mut order: Vec<usize> = (0..shapes.len()).collect();
     order.sort_by_key(|&index| {
@@ -918,6 +955,10 @@ fn reweight_decode_stratum(
     }
     // Hand the shortfall to the largest fractional parts; ties break on shape order.
     remainders.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the remaining shortfall is bounded by decode_indices.len(), the number of distinct decode shapes for one worker, far under usize::MAX on any real run"
+    )]
     for (_, index) in remainders
         .iter()
         .take((decode_iterations - assigned) as usize)
@@ -1020,6 +1061,11 @@ fn sum_field(gs: &StructArray, field: &str) -> Result<f64> {
 }
 
 /// Read a single-row `COUNT(*)` result as `usize`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "COUNT(*) result is a non-negative row count bounded by the table's row count, well under usize::MAX"
+)]
 async fn count_rows(ctx: &SessionContext, sql: &str) -> Result<usize> {
     let batches = collect(ctx, sql).await?;
     match batches.first() {
@@ -1077,6 +1123,10 @@ struct RequestSloWorkInput {
 }
 
 impl Expected {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "num_layers is the model's layer count, a small integer far below 2^53, so the f64 conversion is exact"
+    )]
     fn add_request(&mut self, mode: WorkloadMode, num_layers: usize, input: RequestSloWorkInput) {
         self.requests += 1;
         if !input.completed {

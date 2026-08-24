@@ -1,8 +1,8 @@
-//! Adapt req-frontend's validated input rows into statically typed VibeSim requests.
+//! Adapt req-frontend's validated input rows into statically typed `VibeSim` requests.
 //!
 //! The shared crate owns complete input-file formats, header matching, CSV
 //! decoding, tag decoding, and format-specific structural validation. This
-//! module starts after that boundary: it assigns VibeSim's dense ids and turns
+//! module starts after that boundary: it assigns `VibeSim`'s dense ids and turns
 //! each shared row into one concrete [`RequestDefinition`].
 
 use std::collections::HashMap;
@@ -50,6 +50,10 @@ struct ParsedMetadata {
     decoding: DecodingStrategy,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each arg is a distinct decoded field from the shared row format being adapted into ParsedMetadata"
+)]
 fn parse_independent_metadata(
     source_request_id: &str,
     trace_arrival_time_ms: f64,
@@ -547,12 +551,21 @@ fn audio_extent(duration_seconds: f64, sample_rate_hz: u32) -> Result<AudioExten
 
 fn resolve_count(duration: f64, rate: f64, duration_name: &str, rate_name: &str) -> Result<u64> {
     let count = (duration * rate).round();
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "u64::MAX as f64 is an intentional coarse upper-bound comparison, not a value that round-trips exactly"
+    )]
     if !count.is_finite() || count < 1.0 || count > u64::MAX as f64 {
         bail!(
             "{duration_name}={duration} * {rate_name}={rate} resolves to {count} units \
              (must be in 1..=u64::MAX)"
         );
     }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "just validated above as finite and in [1.0, u64::MAX as f64]"
+    )]
     Ok(count as u64)
 }
 
@@ -573,6 +586,10 @@ impl SourceIdentities {
         if let Some(dense) = self.sessions.get(source_id) {
             return *dense;
         }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "dense session id is a count of interned sessions from the input file, far below u32::MAX"
+        )]
         let dense = self.session_order.len() as u32;
         self.sessions.insert(source_id.to_string(), dense);
         self.session_order.push(source_id.to_string());
@@ -583,16 +600,22 @@ impl SourceIdentities {
         if self.request_ids.contains_key(source_id) {
             bail!("duplicate request id {source_id:?} across input files");
         }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "dense request id is a count of interned requests from the input file, far below u32::MAX"
+        )]
         let dense = RequestId(self.requests.len() as u32);
         self.request_ids.insert(source_id.to_string(), dense);
         self.requests.push(source_id.to_string());
         Ok(dense)
     }
 
+    #[must_use]
     pub fn session_source_ids(&self) -> &[String] {
         &self.session_order
     }
 
+    #[must_use]
     pub fn request_source_ids(&self) -> &[String] {
         &self.requests
     }

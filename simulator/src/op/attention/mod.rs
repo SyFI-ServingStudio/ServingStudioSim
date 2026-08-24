@@ -1,4 +1,4 @@
-//! `op/attention` — compound attention ops. See doc/detailed_design/L2.md.
+//! `op/attention` — compound attention ops. See `doc/detailed_design/L2.md`.
 
 pub mod dsa_indexer;
 pub mod dsa_sparse_mla;

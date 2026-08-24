@@ -31,6 +31,7 @@ pub enum DType {
 }
 
 impl DType {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             DType::Fp16 => "fp16",
@@ -46,6 +47,7 @@ impl DType {
     /// Bytes per element. Used by L3 worklets to size byte-keyed kernels (e.g.
     /// the elementwise activation's per-token I/O footprint). Int4 is sub-byte;
     /// it rounds up to 1 (no current model uses Int4 on a byte-keyed path).
+    #[must_use]
     pub fn size_bytes(self) -> u32 {
         match self {
             DType::Fp32 => 4,
@@ -54,9 +56,10 @@ impl DType {
         }
     }
 
-    /// Inverse of [`DType::as_str`]: parse the snake_case wire literal back to a
+    /// Inverse of [`DType::as_str`]: parse the `snake_case` wire literal back to a
     /// variant. The single source of the wire→variant mapping (paired with
     /// `as_str` for variant→wire); used by the hand-written `Deserialize`.
+    #[must_use]
     pub fn from_wire(s: &str) -> Option<DType> {
         Some(match s {
             "fp16" => DType::Fp16,
@@ -133,6 +136,7 @@ pub struct ArgsPayload {
 }
 
 impl ArgsPayload {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -150,6 +154,7 @@ impl ArgsPayload {
         self
     }
 
+    #[must_use]
     pub fn fields(&self) -> &BTreeMap<String, Value> {
         &self.fields
     }
@@ -176,6 +181,7 @@ impl KernelMetrics {
     /// corners instead of trusting fabricated data. Used to slot placeholders
     /// back into a sample vector after the infeasible cells were excluded from
     /// profiling — see `KernelSpec::infeasible_mask`.
+    #[must_use]
     pub fn non_finite() -> Self {
         Self {
             time_ms: f64::NAN,
@@ -191,6 +197,7 @@ impl KernelMetrics {
     /// non-negative finite f64. Cache `from_samples` scans this to emit
     /// `OutlierKind::NonFinite` instead of swallowing NaN/Inf into 0 via the
     /// `f64 as u64` cast in `flops()` / `bytes()`.
+    #[must_use]
     pub fn is_finite(&self) -> bool {
         if !finite_non_negative(self.time_ms) || !finite_non_negative(self.energy_j) {
             return false;
@@ -216,6 +223,7 @@ impl KernelMetrics {
     /// a `tflops` rate; callers reading `flops == 0` on a comm row must not
     /// interpret it as a failure) or if the computed value is NaN/Inf via
     /// the [`finite_non_negative`] guard.
+    #[must_use]
     pub fn flops(&self) -> u64 {
         let Some(tflops) = self.tflops else {
             return 0;
@@ -224,7 +232,15 @@ impl KernelMetrics {
         if !finite_non_negative(value) {
             return 0;
         }
-        value as u64
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "finite_non_negative(value) above guarantees value is finite and >= 0.0, so this cast \
+                      only rounds the flop count toward zero, never flips a sign"
+        )]
+        {
+            value as u64
+        }
     }
 
     /// Bytes this leaf moved. Compute rows derive it from the memory-bandwidth
@@ -234,12 +250,19 @@ impl KernelMetrics {
     /// `busbw × time` since `busbw = algbw · 2(N-1)/N`). So `bytes / time`
     /// recovers the true link bandwidth either way. A row with neither rate
     /// (e.g. a non-finite placeholder) yields 0.
+    #[must_use]
     pub fn bytes(&self) -> u64 {
         if let Some(memory_bandwidth_gbps) = self.memory_bandwidth_gbps {
             let value = memory_bandwidth_gbps * (self.time_ms / 1000.0) * 1e9;
             if !finite_non_negative(value) {
                 return 0;
             }
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "finite_non_negative(value) above guarantees value is finite and >= 0.0, so this \
+                          cast only rounds the byte count toward zero, never flips a sign"
+            )]
             return value as u64;
         }
         if let Some(busbw_gbps) = self.busbw_gbps {
@@ -247,6 +270,12 @@ impl KernelMetrics {
             if !finite_non_negative(value) {
                 return 0;
             }
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "finite_non_negative(value) above guarantees value is finite and >= 0.0, so this \
+                          cast only rounds the byte count toward zero, never flips a sign"
+            )]
             return value as u64;
         }
         0

@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet chunk-local triangular solve kernel.
+//! Qwen Gated `DeltaNet` chunk-local triangular solve kernel.
 //!
 //! `max_chunk_tokens` is deliberately static configuration identity: it changes
 //! which chunk occupancies are valid, while runtime callers still provide only
@@ -36,7 +36,7 @@ pub struct GdnChunkSolveTrilKernelInput {
 
 impl SweepCoords for GdnChunkSolveTrilKernelInput {
     fn coords(&self) -> Coords {
-        Coords::new([self.num_tokens as f64, self.num_chunks as f64])
+        Coords::new([f64::from(self.num_tokens), f64::from(self.num_chunks)])
     }
 
     fn coord_field_names() -> &'static [&'static str] {
@@ -89,7 +89,13 @@ fn feasible_token_bounds(max_chunk_tokens: u32, num_chunks: u64) -> (u64, u64) {
 
 fn normalized_position(num_tokens: u64, minimum: u64, maximum: u64) -> f64 {
     if minimum < maximum {
-        (num_tokens as f64 - minimum as f64) / (maximum - minimum) as f64
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "token/chunk counts here are cache-sweep coordinates, far below f64's 2^53 exact-integer bound"
+        )]
+        {
+            (num_tokens as f64 - minimum as f64) / (maximum - minimum) as f64
+        }
     } else if minimum == maximum {
         match num_tokens.cmp(&minimum) {
             std::cmp::Ordering::Less => -1.0,
@@ -152,6 +158,10 @@ impl KernelSpec for GdnChunkSolveTrilSpec {
         let num_chunks = u64::from(input.num_chunks);
         let num_tokens = u64::from(input.num_tokens);
         let (minimum, maximum) = feasible_token_bounds(max_chunk_tokens, num_chunks);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "num_chunks is a GDN chunk count, far below f64's 2^53 exact-integer bound"
+        )]
         Coords::new([
             num_chunks as f64,
             normalized_position(num_tokens, minimum, maximum),
@@ -165,6 +175,11 @@ impl KernelSpec for GdnChunkSolveTrilSpec {
     ) -> Vec<ArgsPayload> {
         let max_chunk_tokens = checked_max_chunk_tokens(config);
         grid.expand_2d(|num_chunks, position| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "rounded sweep-grid chunk coordinate is a non-negative small chunk count, well within u64"
+            )]
             let num_chunks = num_chunks.round() as u64;
             let (minimum, maximum) = feasible_token_bounds(max_chunk_tokens, num_chunks);
             let num_tokens = physical_tokens_at_position(minimum, maximum, position);
@@ -472,11 +487,11 @@ mod tests {
             assert_eq!(payload.fields()["dtype"], Value::from("bf16"));
         }
 
-        let qwen = &payloads[1 * 4 + 3];
+        let qwen = &payloads[4 + 3];
         assert_eq!(qwen.fields()["num_tokens"], Value::from(128));
         assert_eq!(qwen.fields()["num_chunks"], Value::from(2));
         assert_eq!(
-            payloads[1 * 4..2 * 4]
+            payloads[4..2 * 4]
                 .iter()
                 .map(|payload| payload.fields()["num_tokens"].as_u64().unwrap())
                 .collect::<Vec<_>>(),
@@ -491,10 +506,10 @@ mod tests {
             vec![75, 248, 422, 768]
         );
         assert!(c12_payloads.iter().all(|payload| {
-            payload.fields()["num_chunks"] == Value::from(12)
-                && payload.fields()["max_chunk_tokens"] == Value::from(64)
-                && payload.fields()["num_heads"] == Value::from(32)
-                && payload.fields()["dtype"] == Value::from("bf16")
+            payload.fields()["num_chunks"] == 12
+                && payload.fields()["max_chunk_tokens"] == 64
+                && payload.fields()["num_heads"] == 32
+                && payload.fields()["dtype"] == "bf16"
         }));
         let c17_payloads = &payloads[6 * 4..7 * 4];
         assert_eq!(
@@ -505,10 +520,10 @@ mod tests {
             vec![80, 332, 584, 1088]
         );
         assert!(c17_payloads.iter().all(|payload| {
-            payload.fields()["num_chunks"] == Value::from(17)
-                && payload.fields()["max_chunk_tokens"] == Value::from(64)
-                && payload.fields()["num_heads"] == Value::from(32)
-                && payload.fields()["dtype"] == Value::from("bf16")
+            payload.fields()["num_chunks"] == 17
+                && payload.fields()["max_chunk_tokens"] == 64
+                && payload.fields()["num_heads"] == 32
+                && payload.fields()["dtype"] == "bf16"
         }));
         let maximum = &payloads[19 * 4 + 3];
         assert_eq!(maximum.fields()["num_tokens"], Value::from(262_144));

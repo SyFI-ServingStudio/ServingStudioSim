@@ -1,4 +1,4 @@
-//! vLLM MLA query RoPE, priced as the inductor fusion actually runs.
+//! vLLM MLA query `RoPE`, priced as the inductor fusion actually runs.
 //!
 //! This leaf is NOT rope-slice sized. vLLM writes `q[..., qk_nope:] = q_pe` and
 //! then hands `q` to the attention op, so the functionalized inductor graph
@@ -76,9 +76,15 @@ impl KernelSpec for VllmMlaRopeSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|num_tokens| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_tokens is a grid point from Axis::pow2/token_axis, always a small non-negative integer"
+            )]
+            let num_tokens_u32 = num_tokens as u32;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("num_tokens", num_tokens as u32)
+                .with("num_tokens", num_tokens_u32)
                 .with("num_heads", config.num_heads.get())
                 .with("qk_nope_head_dim", config.qk_nope_head_dim.get())
                 .with("rope_dim", config.rope_dim.get())
@@ -142,7 +148,7 @@ mod tests {
         let axis = &grid.axes()[0];
         assert_eq!(axis[0], 1.0, "the curve must start at a single token");
         assert!(
-            axis.iter().any(|&value| value <= 48.0 && value >= 32.0),
+            axis.iter().any(|&value| (32.0..=48.0).contains(&value)),
             "decode batches land in the tens of rows and need a sample there"
         );
         assert!(

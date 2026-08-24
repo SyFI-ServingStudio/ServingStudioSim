@@ -503,6 +503,10 @@ pub(super) fn read_alignment_iteration_detail(
     let mut handle = fs::File::open(&index.shard_path)
         .with_context(|| format!("open alignment shard {}", index.shard_path.display()))?;
     handle.seek(SeekFrom::Start(offset))?;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "length is a byte-range length from this process's own alignment shard index; it fits in usize on the 64-bit targets this service runs on"
+    )]
     let mut buffer = vec![0u8; length as usize];
     handle.read_exact(&mut buffer)?;
     Ok(buffer)

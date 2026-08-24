@@ -1,4 +1,4 @@
-//! Numeric model dims (`ModelCfg`) consumed by model_arch `build_configs`
+//! Numeric model dims (`ModelCfg`) consumed by `model_arch` `build_configs`
 //! (L4 design.md §1.1). The parallel/sharding degrees are NOT here: each arch
 //! owns its own numeric parallel struct (`DenseParallel`, `DenseTpParallel`, …)
 //! co-located with the arch, per new-interface-design §13 (the retired shared
@@ -6,7 +6,7 @@
 //!
 //! These are the *resolved numeric* dims, distinct from the CLI parameter layer
 //! (`schema::ModelCommon`, where `model_config` is a JSON path). `from_json` loads
-//! a HuggingFace `config.json` and is the only runtime source of dims; the
+//! a `HuggingFace` `config.json` and is the only runtime source of dims; the
 //! `llama3_8b()` preset is a `#[cfg(test)]` fixture, not API.
 
 use std::path::Path;
@@ -36,7 +36,7 @@ pub struct ModelCfg {
 }
 
 impl ModelCfg {
-    /// Load from a HuggingFace `config.json`. `head_dim` falls back to
+    /// Load from a `HuggingFace` `config.json`. `head_dim` falls back to
     /// `hidden_size / num_attention_heads` when absent; `kv_dtype` mirrors
     /// `torch_dtype`.
     pub fn from_json(path: &Path) -> Result<Self> {
@@ -62,7 +62,7 @@ impl ModelCfg {
     }
 }
 
-/// HuggingFace `config.json` shape (only the fields model_arch needs).
+/// `HuggingFace` `config.json` shape (only the fields `model_arch` needs).
 #[derive(Deserialize)]
 struct JsonModelConfig {
     hidden_size: u32,
@@ -94,6 +94,7 @@ fn parse_dtype(s: &str) -> Result<DType> {
 #[cfg(test)]
 impl ModelCfg {
     /// Llama3-8B dense preset (bf16).
+    #[must_use]
     pub fn llama3_8b() -> Self {
         Self {
             hidden: Dim::param("hidden", 4096),

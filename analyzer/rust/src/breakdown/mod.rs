@@ -83,6 +83,11 @@ struct BreakRow {
     groups: Vec<GroupInput>,
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "worker_id/iter_id/batch_id/layer/slot_ns are small non-negative integer ids/durations written by our own simulator, widened to f64 only by the Arrow/Parquet cost_log schema, so the cast back is exact and in range"
+)]
 pub async fn run(
     ctx: &SessionContext,
     log_dir: &Path,
@@ -247,6 +252,11 @@ async fn plan_window(
     );
     let batches = collect(ctx, &sql).await?;
     let mut max_iter_id = 0u64;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "iter_id is a non-negative sequential id written by our own simulator, widened to f64 only by the Arrow/Parquet cost_log schema, so the cast back is exact and in range"
+    )]
     for b in &batches {
         for id in column_f64(col(b, "iter_id")?)? {
             max_iter_id = max_iter_id.max(id as u64);
@@ -261,6 +271,11 @@ async fn plan_window(
 async fn scalar_count(ctx: &SessionContext, where_clause: &str) -> Result<usize> {
     let sql = format!("SELECT COUNT(*) AS n FROM cost_log {where_clause}");
     let batches = collect(ctx, &sql).await?;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "n is a SQL COUNT(*), a non-negative row count bounded by the table size, widened to f64 only by the query result type"
+    )]
     match batches.first() {
         Some(b) if b.num_rows() > 0 => Ok(value_f64(col(b, "n")?, 0)? as usize),
         _ => Ok(0),
@@ -312,13 +327,23 @@ fn node_label(m: &Manifest, idx: usize) -> Option<&str> {
 
 fn fmt_overlap(o: f32) -> String {
     if (o - o.round()).abs() < 1e-6 {
-        format!("{}", o.round() as i64)
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "o is a small repeat-group overlap count/multiplier, far under i64::MAX"
+        )]
+        let rounded = o.round() as i64;
+        format!("{rounded}")
     } else {
         format!("{o}")
     }
 }
 
 /// us from ns, rounded.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "ns is one iteration's kernel duration, far under both f64's 2^53 exact-integer range and i64::MAX after dividing to us"
+)]
 fn us(ns: i64) -> i64 {
     (ns as f64 / 1000.0).round() as i64
 }
@@ -460,6 +485,10 @@ impl<'a> Renderer<'a> {
         out: &mut Vec<Line>,
     ) {
         let disp = node_time(self.m, idx, self.slot_ns).saturating_mul(scale);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "disp/root_ns are one iteration's ns durations, far under f64's 2^53 exact-integer range"
+        )]
         let pct = if self.root_ns > 0 {
             disp as f64 / self.root_ns as f64 * 100.0
         } else {
@@ -553,7 +582,12 @@ impl<'a> Renderer<'a> {
             .iter()
             .map(|&c| node_time(self.m, c, self.slot_ns).saturating_mul(scale))
             .collect();
-        times.iter().sum::<i64>() / times.len() as i64
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "times.len() is a small repeat-group member count, far under i64::MAX"
+        )]
+        let count = times.len() as i64;
+        times.iter().sum::<i64>() / count
     }
 }
 
@@ -675,10 +709,12 @@ fn render_header(row: &BreakRow, m: &Manifest, color: bool) -> String {
         }
     }
 
-    s.push_str(&format!(
-        "total: {} us\n",
-        us((row.total_time_ms * 1e6).round() as i64)
-    ));
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "total_time_ms is one iteration's total in ms; converted to ns it stays far under i64::MAX"
+    )]
+    let total_ns = (row.total_time_ms * 1e6).round() as i64;
+    s.push_str(&format!("total: {} us\n", us(total_ns)));
     s
 }
 

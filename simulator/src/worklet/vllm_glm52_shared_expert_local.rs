@@ -91,6 +91,7 @@ pub struct VllmGlm52SharedExpertLocalWorklet {
 impl VllmGlm52SharedExpertLocalWorklet {
     /// Resolve the one supported GLM-5.2 shared-expert identity without
     /// touching a bridge, GPU, cache, or `Arc`.
+    #[must_use]
     pub fn resolve_config(
         cfg: &VllmGlm52SharedExpertLocalWorkletConfig,
     ) -> VllmGlm52SharedExpertLocalWorkletResolved {

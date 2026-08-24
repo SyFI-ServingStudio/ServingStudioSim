@@ -101,6 +101,10 @@ pub async fn run_kernel_throughput(ctx: &SessionContext, log_dir: &Path) -> Resu
                 .map(|leaf| match loc_id.get(leaf.name.as_str()) {
                     Some(&id) => id,
                     None => {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            reason = "locs.len() is the number of distinct manifest leaf names, always a tiny count far below u32::MAX"
+                        )]
                         let id = locs.len() as u32;
                         loc_id.insert(&leaf.name, id);
                         locs.push(Loc {
@@ -195,7 +199,14 @@ async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
         if b.num_rows() > 0 {
             let mx = value_f64(col(b, "mx")?, 0)?;
             if mx.is_finite() {
-                num_iters = mx as u64 + 1;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "mx is CAST(MAX(iter_id), BIGINT) - a nonnegative iteration counter far below u64::MAX for any real run"
+                )]
+                {
+                    num_iters = mx as u64 + 1;
+                }
             }
         }
     }
@@ -233,8 +244,14 @@ async fn accumulate(
         let (_, bytes) = list_f32(batch, "slot_bytes")?;
         // Cache the resolved slot→loc-id vector across the common run of rows that
         // share one (pool, worker, section) — cost_log is worker/iter ordered.
-        let mut cached: Option<((&str, u16, &str), &Vec<u32>)> = None;
+        type CachedSlotLoc<'a> = Option<((&'a str, u16, &'a str), &'a Vec<u32>)>;
+        let mut cached: CachedSlotLoc<'_> = None;
         for row in 0..batch.num_rows() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "wid is the worker_id column value; DataFusion returns it as f64 but the value is always a small nonnegative device index"
+            )]
             let (p, w, s) = (pool.value(row), value_f64(wid, row)? as u16, sec.value(row));
             let ids = match cached {
                 Some((k, ids)) if k == (p, w, s) => ids,
@@ -247,6 +264,10 @@ async fn accumulate(
                 },
             };
             sampled_rows += 1;
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "offsets are Arrow ListArray value_offsets (i32), always nonnegative monotonically increasing element indices"
+            )]
             let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
             for (leaf_idx, j) in (start..end).enumerate() {
                 let Some(&id) = ids.get(leaf_idx) else { break }; // list longer than manifest → drift

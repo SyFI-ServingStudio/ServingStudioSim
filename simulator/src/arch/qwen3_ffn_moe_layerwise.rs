@@ -1,39 +1,39 @@
-//! `qwen3_ffn_moe_layerwise` — L4 ffn-side model_arch for AFD (attention-FFN
+//! `qwen3_ffn_moe_layerwise` — L4 ffn-side `model_arch` for AFD (attention-FFN
 //! disaggregation) of a Qwen3-MoE decoder. The ffn pool's half of the
 //! `qwen3_moe_dp_attn_ep_ffn` split: it owns everything EXCEPT the attention
 //! kernel. Composed of two TP worklets plus the EP-MoE ops and the iteration
-//! embed / final_norm / lm_head:
-//!   - [`PreAttnProjTpWorklet`]  = input_norm + qkv          (pre-attn)
-//!   - [`PostAttnRouterTpWorklet`] = o_proj + [tp_allreduce] + post_norm + router
-//!     (post-attn dense tail + MoE gate; the post_norm + router are a composed
+//! embed / `final_norm` / `lm_head`:
+//!   - [`PreAttnProjTpWorklet`]  = `input_norm` + qkv          (pre-attn)
+//!   - [`PostAttnRouterTpWorklet`] = `o_proj` + [`tp_allreduce`] + `post_norm` + router
+//!     (post-attn dense tail + `MoE` gate; the `post_norm` + router are a composed
 //!     [`NativeMoeRouterLocalWorklet`], shared with the unified native arch)
-//! The attention itself is the attn side (`qwen3_attn_layerwise`).
+//!     The attention itself is the attn side (`qwen3_attn_layerwise`).
 //!
 //! Per-layer cost is split at the attn boundary into two groups plus an iteration
 //! prologue/epilogue, with the Bridge/Bootstrap/Terminal fused-kernel convention
 //! (L4 design.md §4.1):
 //!   - `pre_attn_cost(0)`        = `Max{1.0}( pre_attn × num_dp )`  (Bootstrap)
 //!   - `pre_attn_cost(L > 0)`    = ZERO  (the Bridge bills pre(L) inside post(L-1))
-//!   - `post_attn_cost(L)`       = post_attn + MoE, and for `L < last` additionally
-//!                                 the fused pre(L+1) (Bridge); `L == last` is post-only (Terminal)
+//!   - `post_attn_cost(L)`       = `post_attn` + `MoE`, and for `L < last` additionally
+//!     the fused pre(L+1) (Bridge); `L == last` is post-only (Terminal)
 //!   - `prologue_cost`           = embed
-//!   - `epilogue_cost`           = Sum(final_norm, lm_head)
+//!   - `epilogue_cost`           = `Sum(final_norm`, `lm_head`)
 //!
 //! where
-//!   post_attn = `Max{1.0}( PostAttnRouterTpWorklet × num_dp )`,
-//!   MoE       = `Sum( dispatch, Max{1.0}(expert × ep), Max{1.0}(local_reduce × num_dp), combine )`.
+//!   `post_attn` = `Max{1.0}( PostAttnRouterTpWorklet × num_dp )`,
+//!   `MoE`       = `Sum( dispatch, Max{1.0}(expert × ep), Max{1.0}(local_reduce × num_dp), combine )`.
 //!
-//! The `× num_dp_groups` MAX nodes (pre_attn, post_attn, local_reduce) are the
+//! The `× num_dp_groups` MAX nodes (`pre_attn`, `post_attn`, `local_reduce`) are the
 //! DP-attention fan-out: each shard runs the dense + routing + home-reduce path on
 //! its OWN token slice (`g.batch_tokens`), so DP load imbalance is modeled exactly
-//! (the section wallclock is the slowest shard, never a pooled average). post_norm
-//! + router run replicated across the shard's `attn_tp_size` ranks after the o_proj
-//! all-reduce — same per-shard token count as o_proj, which is why they live in one
-//! worklet.
+//! (the section wallclock is the slowest shard, never a pooled average). `post_norm`
+//! + router run replicated across the shard's `attn_tp_size` ranks after the `o_proj`
+//!   all-reduce — same per-shard token count as `o_proj`, which is why they live in one
+//!   worklet.
 //!
 //! So `Σ_L pre + Σ_L post + prologue + epilogue` totals exactly one (norm+qkv) +
-//! one (o_proj+ar+post_norm+router) + one MoE (dispatch+expert+reduce+combine) per
-//! layer + embed + final_norm + lm_head — i.e. the full iteration minus the
+//! one (`o_proj+ar+post_norm+router`) + one `MoE` (dispatch+expert+reduce+combine) per
+//! layer + embed + `final_norm` + `lm_head` — i.e. the full iteration minus the
 //! attention kernel (which the attn side carries). This arch is self-contained: it
 //! builds its own configs from the model dims (its own `build_configs` /
 //! `resolve_configs`), independent of the unified `qwen3_moe_dp_attn_ep_ffn` arch.
@@ -121,9 +121,9 @@ const TP_FABRIC: Fabric = Fabric::Nvlink;
 const MOE_INTRA_FABRIC: Fabric = Fabric::Nvlink;
 const MOE_INTER_FABRIC: Fabric = Fabric::Infiniband;
 
-/// FFN-side numeric parallel input. `attn_tp_size` drives the dense qkv / o_proj
-/// per-rank shape (must match the paired attn arch) AND the MoE combine residing-
-/// group width — a token resides on its qkv/o_proj TP group (post-allreduce every
+/// FFN-side numeric parallel input. `attn_tp_size` drives the dense qkv / `o_proj`
+/// per-rank shape (must match the paired attn arch) AND the `MoE` combine residing-
+/// group width — a token resides on its `qkv/o_proj` TP group (post-allreduce every
 /// `attn_tp_size` rank holds it), so combine fans the reduced output back to all of
 /// them; `ep_size` is the expert-parallel width; `nvl_num_gpu` partitions the EP
 /// ranks into NVL domains.
@@ -136,7 +136,7 @@ pub struct Qwen3FfnMoeParallel {
 }
 
 /// Raw worklet/op configs for the ffn side. `num_dp_groups = ep_size / attn_tp_size`
-/// is carried for the per-DP-shard fan-out (pre_attn / post_attn / local_reduce).
+/// is carried for the per-DP-shard fan-out (`pre_attn` / `post_attn` / `local_reduce`).
 pub struct Qwen3FfnMoeConfigs {
     pub pre_attn: PreAttnProjTpWorkletConfig,
     pub post_attn: PostAttnRouterTpWorkletConfig,
@@ -154,8 +154,8 @@ pub struct Qwen3FfnMoeConfigs {
     pub ffn_to_attn_bytes_per_token: Dim,
 }
 
-/// Post-resolve aggregate; the atomic ops (embed / final_norm / lm_head /
-/// moe_local_reduce) carry their kernel config through unchanged (only the
+/// Post-resolve aggregate; the atomic ops (embed / `final_norm` / `lm_head` /
+/// `moe_local_reduce`) carry their kernel config through unchanged (only the
 /// worklets have a resolve step).
 pub struct Qwen3FfnMoeResolved {
     pub pre_attn: PreAttnProjTpWorkletResolved,
@@ -174,6 +174,7 @@ pub struct Qwen3FfnMoeResolved {
     pub ffn_to_attn_bytes_per_token: Dim,
 }
 
+#[must_use]
 pub fn build_configs(
     model: &MoeModelCfg,
     parallel: &Qwen3FfnMoeParallel,
@@ -191,7 +192,7 @@ pub fn build_configs(
         "attn_tp_size / ep_size must be non-zero"
     );
     assert!(
-        parallel.ep_size % parallel.attn_tp_size == 0,
+        parallel.ep_size.is_multiple_of(parallel.attn_tp_size),
         "ep_size {} must be a multiple of attn_tp_size {} (DP groups = ep / attn_tp)",
         parallel.ep_size,
         parallel.attn_tp_size,
@@ -200,7 +201,10 @@ pub fn build_configs(
     let num_dp_groups = parallel.ep_size / parallel.attn_tp_size;
     assert!(parallel.nvl_num_gpu > 0, "nvl_num_gpu must be non-zero");
     assert!(
-        model.num_experts.get() % u32::from(parallel.ep_size) == 0,
+        model
+            .num_experts
+            .get()
+            .is_multiple_of(u32::from(parallel.ep_size)),
         "num_experts {} not divisible by ep_size {}",
         model.num_experts,
         parallel.ep_size,
@@ -320,6 +324,7 @@ pub fn build_configs(
     }
 }
 
+#[must_use]
 pub fn resolve_configs(cfgs: &Qwen3FfnMoeConfigs) -> Qwen3FfnMoeResolved {
     Qwen3FfnMoeResolved {
         pre_attn: PreAttnProjTpWorklet::resolve_config(&cfgs.pre_attn),
@@ -342,7 +347,7 @@ pub fn resolve_configs(cfgs: &Qwen3FfnMoeConfigs) -> Qwen3FfnMoeResolved {
 }
 
 /// Build the ffn-side model from its own resolved configs ([`resolve_configs`]):
-/// the pre/post-attn worklets supply the dense projections + routing, and the MoE
+/// the pre/post-attn worklets supply the dense projections + routing, and the `MoE`
 /// / iteration ops are built from their per-rank configs. Self-contained — no
 /// dependency on the unified `qwen3_moe_dp_attn_ep_ffn` arch.
 pub fn build(
@@ -487,7 +492,7 @@ pub fn build(
 impl Qwen3FfnMoeLayerwiseModel {
     // ── compile: each node mints slots in the order its eval helper fills them ──
 
-    /// Pre-attn section: `Max{1.0}( pre_attn × num_dp_groups )` — one input_norm +
+    /// Pre-attn section: `Max{1.0}( pre_attn × num_dp_groups )` — one `input_norm` +
     /// qkv per DP shard, on the shard's own tokens.
     fn compile_pre_node(&self, b: &mut CostTreeBuilder) -> CostNode {
         let groups: Vec<CostNode> = (0..self.num_dp_groups)
@@ -499,8 +504,8 @@ impl Qwen3FfnMoeLayerwiseModel {
         }
     }
 
-    /// Post-attn section: `Max{1.0}( post_attn × num_dp_groups )` — o_proj +
-    /// [tp_allreduce] + post_norm + router per DP shard, on the shard's own tokens.
+    /// Post-attn section: `Max{1.0}( post_attn × num_dp_groups )` — `o_proj` +
+    /// [`tp_allreduce`] + `post_norm` + router per DP shard, on the shard's own tokens.
     fn compile_post_attn_node(&self, b: &mut CostTreeBuilder) -> CostNode {
         let groups: Vec<CostNode> = (0..self.num_dp_groups)
             .map(|_| self.post_attn.compile(b))
@@ -511,7 +516,7 @@ impl Qwen3FfnMoeLayerwiseModel {
         }
     }
 
-    /// MoE section: `Sum( dispatch, Max{1.0}(expert × ep_size),
+    /// `MoE` section: `Sum( dispatch, Max{1.0}(expert × ep_size),
     /// Max{1.0}(local_reduce × num_dp_groups), combine )`. The router has moved
     /// into `post_attn`; the home reduce is per DP shard (combine returns each
     /// token to its home shard).
@@ -814,7 +819,7 @@ impl FfnLayerwiseModel for Qwen3FfnMoeLayerwiseModel {
     }
 
     fn ffn_to_attn_bytes_per_token(&self) -> u64 {
-        self.ffn_to_attn_bytes_per_token.get() as u64
+        u64::from(self.ffn_to_attn_bytes_per_token.get())
     }
 
     fn pre_attn_cost(
@@ -897,7 +902,7 @@ impl FfnLayerwiseModel for Qwen3FfnMoeLayerwiseModel {
         self.epilogue_eval(batch, slots, scratch, Some(inputs))
     }
 
-    /// One section per distinct CostTree. `post_attn` (the mid-layer Bridge, with
+    /// One section per distinct `CostTree`. `post_attn` (the mid-layer Bridge, with
     /// the fused pre of the next layer) and `post_attn_last` (the Terminal, post
     /// only) are separate sections because they have different slot sets — a
     /// `cost_log` row tags itself with whichever it cost. Recompiled here (only at

@@ -96,7 +96,7 @@ impl KvCapacityState {
             let departed =
                 entries.partition_point(|(remaining_decode, _)| *remaining_decode < exit_step);
             let kv_at_exit = self.resident_tokens
-                + (num_decodes - departed) as u64 * exit_step as u64
+                + (num_decodes - departed) as u64 * u64::from(exit_step)
                 - kv_prefix[departed];
             peak = peak.max(kv_at_exit);
         }
@@ -191,7 +191,12 @@ impl ResidentPartitionState {
     }
 
     pub(crate) fn live_decode_count(&self) -> u32 {
-        self.iter_decoding().count() as u32
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "live decode count is bounded by this partition's resident request count, far below u32::MAX"
+        )]
+        let count = self.iter_decoding().count() as u32;
+        count
     }
 
     pub(crate) fn add_prefill_admit(&mut self, request: RequestId) {
@@ -219,7 +224,12 @@ impl ResidentPartitionState {
     }
 
     pub(crate) fn prefill_admit_count(&self) -> u32 {
-        self.prefill_admits.len() as u32
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "prefill admit count is bounded by this partition's resident request count, far below u32::MAX"
+        )]
+        let count = self.prefill_admits.len() as u32;
+        count
     }
 
     pub(crate) fn iter_prefill_admits(&self) -> impl Iterator<Item = RequestId> + '_ {
@@ -435,7 +445,7 @@ mod tests {
         let mut partition = ResidentPartitionState::new(100_000, 0);
         partition.begin_decode(request_id(1), 4_100, 10);
         partition.begin_decode(request_id(2), 2_047, 10);
-        assert_eq!(partition.live_checkpoint_count(2_048), 2 + 0);
+        assert_eq!(partition.live_checkpoint_count(2_048), 2);
         partition.advance_decodes();
         assert_eq!(partition.live_checkpoint_count(2_048), 2 + 1);
         assert_eq!(partition.live_checkpoint_count(0), 0);

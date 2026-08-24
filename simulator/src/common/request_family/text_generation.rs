@@ -27,6 +27,7 @@ impl RequestDefinition for TextGenerationDefinition {
 pub type TextGenerationRequest = Request<TextGenerationDefinition>;
 
 impl ActiveRequest<TextGenerationDefinition> {
+    #[must_use]
     pub fn is_prefill(&self) -> bool {
         self.progress.prefill_tokens_processed < self.request.definition.prompt_tokens
     }

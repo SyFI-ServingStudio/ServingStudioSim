@@ -195,6 +195,11 @@ mod tests {
         WF: AfdFfnWorker,
     {
         let mut completed = Vec::new();
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "step is a small test-loop counter (bounded by `steps`, at most a few thousand \
+                      in these tests), far below f64's exact-integer range"
+        )]
         for step in 0..steps {
             for a in flow.tick(Time::from_ms(step as f64)) {
                 let OrchAction::Complete { req } = a;
@@ -266,7 +271,7 @@ mod tests {
         flow.on_arrival(first);
         let mut completed = Vec::new();
         for step in 0..3_000 {
-            for action in flow.tick(Time::from_ms(step as f64)) {
+            for action in flow.tick(Time::from_ms(f64::from(step))) {
                 let OrchAction::Complete { req } = action;
                 completed.push(req);
             }
@@ -293,7 +298,7 @@ mod tests {
         };
         flow.on_arrival(second);
         for step in 3_000..6_000 {
-            for action in flow.tick(Time::from_ms(step as f64)) {
+            for action in flow.tick(Time::from_ms(f64::from(step))) {
                 let OrchAction::Complete { req } = action;
                 completed.push(req);
             }
@@ -322,6 +327,12 @@ mod tests {
         let mut f = flow(2, std::rc::Rc::clone(&store));
         // Stagger arrivals over the first ticks so slots fill while others are mid-flight.
         let mut completed = Vec::new();
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            reason = "step ranges over 0..6000, exactly representable in f64; the u32 cast for `id` \
+                      only fires when step<6 (checked just above), well within u32 range"
+        )]
         for step in 0..6000u64 {
             if step < 6 {
                 let id = step as u32;

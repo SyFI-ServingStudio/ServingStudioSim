@@ -8,7 +8,7 @@
 //! addition, norms, TP, EP, collectives, and network work.
 //!
 //! The gate is three launches, not one. `sigmoid(gate(x)) * shared_out` is
-//! written in eager PyTorch, so the sigmoid is its own `at::native`
+//! written in eager `PyTorch`, so the sigmoid is its own `at::native`
 //! elementwise kernel rather than an epilogue on the projection. Folding it
 //! into the projection leaf under-predicted the measured gate operation by
 //! 52.5% against a vLLM Qwen3.6-35B-A3B-FP8 capture (224.5 ms simulated vs
@@ -52,7 +52,7 @@ pub struct Qwen36SharedExpertLocalWorkletConfig {
     /// `act_and_mul_kernel` rather than eager tensor arithmetic.
     pub elementwise_backends: Vec<&'static str>,
     /// Realization for the gate path (`sigmoid` and its application), which the
-    /// model source writes as plain PyTorch and so runs on TensorIterator.
+    /// model source writes as plain `PyTorch` and so runs on `TensorIterator`.
     pub gate_elementwise_backends: Vec<&'static str>,
 }
 
@@ -84,6 +84,7 @@ pub struct Qwen36SharedExpertLocalWorklet {
 }
 
 impl Qwen36SharedExpertLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &Qwen36SharedExpertLocalWorkletConfig,
     ) -> Qwen36SharedExpertLocalWorkletResolved {

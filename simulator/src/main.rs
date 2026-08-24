@@ -71,7 +71,7 @@ enum Cmd {
     KernelQuery,
     /// Predict per-building-block timing offline for a batch of explicit batch
     /// shapes — NO sim/scheduler/trace. Reads a minimal config (one arch selector
-    /// `{iter|attn|ffn}` + gpu + a cases_file) and writes the standard
+    /// `{iter|attn|ffn}` + gpu + a `cases_file`) and writes the standard
     /// `raw/cost_log` + `cost_manifest` artifacts (one row per case/section, tagged
     /// with `section`/`layer`), which `analyze trace` / `analyze run` consume.
     TimingPredict(RunArgs),

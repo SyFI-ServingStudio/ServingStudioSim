@@ -1,7 +1,7 @@
 //! GLM-5.2 local dense-FFN worklet in **vLLM kernel granularity**.
 //!
 //! Same section as [`super::glm52_dense_ffn_local`]: post-attention residual
-//! RMSNorm -> fused gate/up projection -> SiLU-and-multiply -> down projection.
+//! `RMSNorm` -> fused gate/up projection -> SiLU-and-multiply -> down projection.
 //!
 //! The one divergence: vLLM launches a BF16->FP8 block quantisation
 //! (`fp8_blockscale_gemm::scale_1x128_kernel`) before **each** dense FP8 GEMM,
@@ -90,6 +90,7 @@ pub struct VllmGlm52DenseFfnLocalWorklet {
 impl VllmGlm52DenseFfnLocalWorklet {
     /// Resolve the one supported GLM-5.2 dense-FFN identity without touching a
     /// bridge, GPU, cache, or `Arc`.
+    #[must_use]
     pub fn resolve_config(
         cfg: &VllmGlm52DenseFfnLocalWorkletConfig,
     ) -> VllmGlm52DenseFfnLocalWorkletResolved {

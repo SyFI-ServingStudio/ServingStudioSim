@@ -46,6 +46,7 @@ pub struct ShortestJobFirst {
 }
 
 impl ShortestJobFirst {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

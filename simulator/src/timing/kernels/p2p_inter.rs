@@ -8,15 +8,15 @@
 //! `enumerate` `dtype` field is a fixed profiling artifact, kept only to stay
 //! aligned with the Python `P2pInterArgs` wire schema).
 //!
-//! This is the inter-NVL-domain (cross-node NIC) leg of the MoE network model
+//! This is the inter-NVL-domain (cross-node NIC) leg of the `MoE` network model
 //! (ref's `get_inter_device_p2p_times_batch` curve in `common_timing.rs`). A
-//! single send/recv between two ranks in different NVLink domains, measured as
-//! time vs message size. The MoE dispatch/combine L2 ops (`op/moe`) look this
+//! single send/recv between two ranks in different `NVLink` domains, measured as
+//! time vs message size. The `MoE` dispatch/combine L2 ops (`op/moe`) look this
 //! curve up for stages tagged `P2pTier::InterDomain`.
 //!
 //! Identical shape to `p2p_intra` (no `num_gpus`; p2p is always 2 endpoints);
-//! the separate kernel keeps the NIC bandwidth curve distinct from the NVLink
-//! one, mirroring ref's two perf_api methods. Static config `(fabric, dtype)`;
+//! the separate kernel keeps the NIC bandwidth curve distinct from the `NVLink`
+//! one, mirroring ref's two `perf_api` methods. Static config `(fabric, dtype)`;
 //! runtime sweep axis `message_size_bytes` over a `pow2(10, 28)` ladder
 //! (1 KB .. 256 MB); `Cache1DLinear`.
 
@@ -64,9 +64,17 @@ impl KernelSpec for P2pInterSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|message_size| {
+            // Axis::pow2(10, 28) values are non-negative integers, max 2^28,
+            // far below u64::MAX.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "sweep axis values are non-negative integers far below u64::MAX"
+            )]
+            let message_size = message_size as u64;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("message_size_bytes", message_size as u64)
+                .with("message_size_bytes", message_size)
                 // Fixed profiling dtype: comm is size-keyed (see module doc), the
                 // curve is measured once at bf16 for every logical payload dtype.
                 .with("dtype", DType::Bf16.as_str())
@@ -116,7 +124,12 @@ mod tests {
         let input = P2pInterKernelInput {
             message_size_bytes: 1 << 20,
         };
-        assert_eq!(&*input.coords(), &[(1u64 << 20) as f64]);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "1u64 << 20 is a fixed test message size, far under f64's exact integer range"
+        )]
+        let expected = (1u64 << 20) as f64;
+        assert_eq!(&*input.coords(), &[expected]);
     }
 
     #[test]
@@ -125,7 +138,12 @@ mod tests {
         assert_eq!(grid.axes().len(), 1);
         assert_eq!(grid.axes()[0].len(), 19);
         assert_eq!(grid.axes()[0].first().copied(), Some(1024.0));
-        assert_eq!(grid.axes()[0].last().copied(), Some((1u64 << 28) as f64));
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "1u64 << 28 is a fixed test message size, far under f64's exact integer range"
+        )]
+        let expected_last = (1u64 << 28) as f64;
+        assert_eq!(grid.axes()[0].last().copied(), Some(expected_last));
         assert!(matches!(
             P2pInterSpec::cache_kind("nccl"),
             CacheKind::Cache1DLinear

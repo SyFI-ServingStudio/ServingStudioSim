@@ -74,8 +74,8 @@ pub trait KernelConfig:
 }
 
 /// One impl per kernel kind. Declares the per-kernel types (Config / Input),
-/// the `KIND` identifier, the three required dispatch fns (sweep_grid /
-/// cache_kind / enumerate), and an optional config-aware cache projection.
+/// the `KIND` identifier, the three required dispatch fns (`sweep_grid` /
+/// `cache_kind` / enumerate), and an optional config-aware cache projection.
 /// Everything else lives in `Kernel<S>`; the `backends` invariant lives on
 /// `KernelConfig`.
 ///
@@ -99,6 +99,7 @@ pub trait KernelSpec: 'static {
     /// *variant* (same physical kernel, different cache axes) reuses an existing
     /// kernel's profiled rows: the variant carries its own `KIND` for the
     /// registry/identity but profiles through the base kind's facade + table.
+    #[must_use]
     fn profile_kind() -> KernelKind {
         Self::KIND
     }
@@ -295,7 +296,7 @@ impl<S: KernelSpec> Kernel<S> {
         })
     }
 
-    /// All-four-metrics best-of-N for the CostTree eval path: return the
+    /// All-four-metrics best-of-N for the `CostTree` eval path: return the
     /// [`LeafMetrics`] from the backend with the smallest non-negative wallclock,
     /// preserving that backend's coverage bits.
     pub fn eval(&self, input: &S::Input) -> LeafMetrics {
@@ -321,7 +322,12 @@ impl<S: KernelSpec> Kernel<S> {
                     if candidate_time_ms < best_time_ms {
                         best = candidate;
                         best_time_ms = candidate_time_ms;
-                        best_index = (offset + 1) as u8;
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            reason = "offset indexes this kernel's backend candidate list, which the manifest bounds to a handful of entries, far below u8::MAX"
+                        )]
+                        let index = (offset + 1) as u8;
+                        best_index = index;
                     }
                 }
                 // Position-local index into this kernel's ordered candidate list
@@ -380,7 +386,7 @@ impl<S: KernelSpec> Probe for Kernel<S> {
     fn eval(&self, input: &Self::Input) -> LeafMetrics {
         Self::eval(self, input)
     }
-    /// The KIND tag + one-line config summary the CostTree compile captures into
+    /// The KIND tag + one-line config summary the `CostTree` compile captures into
     /// the leaf's manifest entry (the old `Describe` leaf line). One blanket impl
     /// covers every kernel since all are `Kernel<S>`.
     fn kind(&self) -> &'static str {
@@ -398,6 +404,11 @@ impl<S: KernelSpec> Probe for Kernel<S> {
 /// `Kernel<S>` builder WITHOUT a central match. Each kernel registers itself via
 /// [`register_kernel!`] (which also emits its `pub type FooKernel = Kernel<FooSpec>`
 /// alias), so adding a kernel touches only that kernel's own file.
+///
+/// `(describe_config, grid_axes, input_field_names)` for the `grid` query path.
+type KernelDescribeResult =
+    anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>;
+
 pub(crate) struct KernelQueryEntry {
     pub kind: &'static str,
     /// `eval` path: deserialize config, build the kernel (profiles missing grid
@@ -406,10 +417,7 @@ pub(crate) struct KernelQueryEntry {
     /// `grid` path: deserialize config and report
     /// `(describe_config, grid_axes, input_field_names)` from `sweep_grid` plus
     /// the Input's physical field names — no bridge, no profiling, no GPU.
-    pub describe: fn(
-        serde_json::Value,
-    )
-        -> anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>,
+    pub describe: fn(serde_json::Value) -> KernelDescribeResult,
 }
 
 inventory::collect!(KernelQueryEntry);
@@ -453,9 +461,7 @@ where
 /// fitted cache axes from `sweep_grid`, and the Input's physical query-field
 /// names. The `grid`-path fn pointer — pure metadata, so it needs neither the
 /// bridge nor a built cache.
-fn describe_from_json<S>(
-    config: serde_json::Value,
-) -> anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>
+fn describe_from_json<S>(config: serde_json::Value) -> KernelDescribeResult
 where
     S: KernelSpec,
     S::Config: serde::de::DeserializeOwned,

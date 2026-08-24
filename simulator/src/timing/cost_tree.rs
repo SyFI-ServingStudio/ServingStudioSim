@@ -1,4 +1,4 @@
-//! CostTree — compile the cost-model *structure* once, separate from the
+//! `CostTree` — compile the cost-model *structure* once, separate from the
 //! per-iter numbers. See `COST_TREE.md`.
 //!
 //! The structure of a cost query (which primitives, how they compose, the
@@ -111,7 +111,7 @@ pub struct CostManifest {
 /// a single `iter` section (the whole fused iteration); the AFD layer-wise path
 /// writes one section per cost group (`attn` on the attn side; `prologue` /
 /// `pre_attn` / `post_attn` / `epilogue` on the ffn side), because those are
-/// distinct compiled CostTrees with different slot sets. A `cost_log` row's
+/// distinct compiled `CostTrees` with different slot sets. A `cost_log` row's
 /// `section` field selects which section's `slots`/`nodes` interpret that row's
 /// `slot_*` lists — so different-shaped sections coexist in one per-worker stream
 /// (the `slot_time_ms` list is already variable-length per row).
@@ -132,7 +132,7 @@ pub struct CostManifestSection {
 
 impl CostManifestDoc {
     /// A single-section doc — the iter-wise form (`section = "iter"`), and the
-    /// back-compat wrapper for any model exposing one CostTree.
+    /// back-compat wrapper for any model exposing one `CostTree`.
     pub fn single(section: impl Into<String>, manifest: CostManifest) -> Self {
         Self {
             sections: vec![CostManifestSection {
@@ -142,7 +142,8 @@ impl CostManifestDoc {
         }
     }
 
-    /// An empty doc — a model with no compiled CostTree (cost_log disabled).
+    /// An empty doc — a model with no compiled `CostTree` (`cost_log` disabled).
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             sections: Vec::new(),
@@ -177,6 +178,7 @@ pub struct CostTreeBuilder {
 }
 
 impl CostTreeBuilder {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -201,6 +203,7 @@ impl CostTreeBuilder {
     }
 
     /// Close the build: pair the assembled `root` with the slots minted along the way.
+    #[must_use]
     pub fn finish(self, root: CostNode) -> CostTree {
         CostTree {
             root,
@@ -258,6 +261,7 @@ impl<'a> Evaluator<'a> {
     }
 
     /// Slots filled so far — used to assert the eval walk covered every slot.
+    #[must_use]
     pub fn filled(&self) -> usize {
         self.cursor
     }
@@ -266,6 +270,7 @@ impl<'a> Evaluator<'a> {
 impl CostTree {
     /// Number of materialized leaf slots = the per-iter `buf` length. A folded
     /// (`Scale`) subtree is counted once, not `×n`.
+    #[must_use]
     pub fn n_slots(&self) -> usize {
         self.slots.len()
     }
@@ -273,6 +278,7 @@ impl CostTree {
     /// Serializable manifest for the `cost_log` sidecar: the ordered slots plus
     /// the flattened aggregation nodes. Lets a consumer reproduce `total_time_ms`
     /// from a row's per-slot `slot_time_ms` by re-running [`Self::aggregate`].
+    #[must_use]
     pub fn manifest(&self) -> CostManifest {
         let (nodes, node_labels) = self.flatten_labeled();
         CostManifest {
@@ -287,6 +293,7 @@ impl CostTree {
     /// so `children` is a valid `Range` and every parent index precedes its
     /// children's — making the aggregate a reverse linear pass. Labels are dropped
     /// (this is the form the hot-path aggregate consumes — no `String`, INV-5).
+    #[must_use]
     pub fn flatten(&self) -> Vec<FlatCostNode> {
         self.flatten_labeled().0
     }
@@ -372,8 +379,8 @@ impl CostTree {
     ///   - `Scale{n}` — child subtree × `n` (the homogeneous-layer fold);
     ///   - `Max{overlap}` — `time = max(child.time)/overlap`, other fields summed
     ///     (flops/bytes/energy always add — work doesn't overlap away, INV-4).
-    /// Coverage flags always OR up the tree, so a warning anywhere surfaces at
-    /// the root.
+    ///     Coverage flags always OR up the tree, so a warning anywhere surfaces at
+    ///     the root.
     ///
     /// Single reverse pass: BFS layout puts every parent before its children, so
     /// iterating high→low index has each child's subtree result ready when its
@@ -410,7 +417,12 @@ impl CostTree {
                     for c in children.clone() {
                         acc.add(scratch[c]);
                     }
-                    acc.scale(*n as f32);
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "n is a repeat/scale count (e.g. layers, experts) from the cost tree, always small enough to be exact in f32"
+                    )]
+                    let n_f32 = *n as f32;
+                    acc.scale(n_f32);
                     acc
                 }
                 FlatCostNode::Max { overlap, children } => {
@@ -431,6 +443,7 @@ impl CostTree {
 
     /// Indented render of the compiled structure for inspection ("print after
     /// build"). Leaves show `Leaf#<slot> <name>`; composites show their op.
+    #[must_use]
     pub fn describe(&self) -> String {
         let mut out = String::new();
         self.write_node(&self.root, 0, &mut out);
@@ -447,7 +460,7 @@ impl CostTree {
                     "{ind}Leaf#{slot} {} ({}) {}",
                     d.name, d.kind, d.kernel_config
                 )
-                .unwrap()
+                .unwrap();
             }
             CostNode::Sum(children) => {
                 writeln!(out, "{ind}Sum").unwrap();

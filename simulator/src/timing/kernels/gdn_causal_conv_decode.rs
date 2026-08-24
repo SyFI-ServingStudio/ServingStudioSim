@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused causal-convolution decode kernel.
+//! Qwen Gated `DeltaNet` fused causal-convolution decode kernel.
 //!
 //! The convolution geometry and dtypes are static config identity. Decode batch
 //! size is the sole physical runtime interpolation axis. `state_dtype` remains
@@ -49,9 +49,17 @@ impl KernelSpec for GdnCausalConvDecodeSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|batch_size| {
+            // Axis::pow2(0, 8) values are non-negative integers, max 256, far
+            // below u32::MAX.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "sweep axis values are non-negative integers far below u32::MAX"
+            )]
+            let batch_size = batch_size as u32;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("batch_size", batch_size as u32)
+                .with("batch_size", batch_size)
                 .with("channels", config.channels.get())
                 .with("kernel_size", config.kernel_size.get())
                 .with("dtype", config.dtype.as_str())

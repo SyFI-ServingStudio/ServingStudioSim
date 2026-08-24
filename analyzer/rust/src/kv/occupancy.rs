@@ -114,10 +114,22 @@ pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(V
     // degenerate span to 1ms so bin math stays finite.
     let span_ms = (t_max - t_min).max(1.0);
     let n_bins = FINE_BINS;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "n_bins is the FINE_BINS constant (200), far below 2^53"
+    )]
     let bin_width = span_ms / n_bins as f64;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "bin_index is bounded by n_bins == FINE_BINS (200), far below 2^53"
+    )]
     let t_start: Vec<f64> = (0..n_bins)
         .map(|bin_index| t_min + bin_index as f64 * bin_width)
         .collect();
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "bin_index is bounded by n_bins == FINE_BINS (200), far below 2^53"
+    )]
     let t_end: Vec<f64> = (0..n_bins)
         .map(|bin_index| t_min + (bin_index + 1) as f64 * bin_width)
         .collect();
@@ -198,6 +210,10 @@ pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(V
         let peak_projected_max = peak(&projected.max);
         let peak_promised_max = peak(&promised.max);
         let active_bin_count: usize = active.mean.iter().filter(|value| **value > 0.0).count();
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "active_bin_count is bounded by n_bins == FINE_BINS (200), far below 2^53"
+        )]
         let mean_active = if active_bin_count > 0 {
             active.mean.iter().sum::<f64>() / active_bin_count as f64
         } else {
@@ -210,6 +226,11 @@ pub async fn run_kv_occupancy(ctx: &SessionContext, log_dir: &Path) -> Result<(V
         } else {
             pool_tag.clone()
         };
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "capacity is a per-shard KV token capacity derived from realistic GPU memory \
+                      sizes, far below 2^53 tokens"
+        )]
         let percentage = |tokens: f64| {
             capacity.map(|capacity| {
                 if capacity > 0 {
@@ -304,6 +325,11 @@ fn agg_across(per_worker: &[Vec<f64>], n_bins: usize) -> Agg {
     let mut mean = vec![0.0f64; n_bins];
     let mut min = vec![0.0f64; n_bins];
     let mut max = vec![0.0f64; n_bins];
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "per_worker.len() is the shard count for one KV pool, bounded by a realistic \
+                  cluster topology and far below 2^53"
+    )]
     let worker_count = per_worker.len().max(1) as f64;
     for bin_index in 0..n_bins {
         let mut minimum = f64::INFINITY;
@@ -334,8 +360,18 @@ fn bin_mean(
 ) -> Vec<f64> {
     let mut sum = vec![0.0f64; n_bins];
     let mut count = vec![0u32; n_bins];
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "n_bins is FINE_BINS (200) at every call site, far below isize::MAX"
+    )]
     let last = n_bins as isize - 1;
     for row in rows {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "Rust's float-to-int cast saturates rather than wrapping, and .clamp(0, last) \
+                      forces the value into [0, n_bins) before the final usize cast"
+        )]
         let bin = (((row.time_ms - t_min) / bin_width).floor() as isize).clamp(0, last) as usize;
         sum[bin] += value_of(row);
         count[bin] += 1;
@@ -389,6 +425,14 @@ async fn collect_rows(
             } else {
                 tags.value(row)
             };
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "group_id and worker_id come from this run's own kv_snapshot log \
+                          (simulator-generated, not external input); both are small nonnegative \
+                          indices by construction and Rust's float-to-int cast saturates rather \
+                          than wrapping"
+            )]
             out.push(Row {
                 pool_tag: tag.to_string(),
                 group_id: group_ids[row] as u64,

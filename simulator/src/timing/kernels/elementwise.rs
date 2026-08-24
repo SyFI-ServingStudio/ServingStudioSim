@@ -13,7 +13,7 @@
 //! byte footprint scales linearly with the token count, so the static identity
 //! is the per-token byte rate (`input_bytes_per_token`, `output_bytes_per_token`
 //! — the fan-in ratio is therefore config-stable), and the runtime sweep axis is
-//! `num_tokens`. `enumerate` folds rate × num_tokens into the total-byte wire
+//! `num_tokens`. `enumerate` folds rate × `num_tokens` into the total-byte wire
 //! payload, so the Python runner side stays keyed by total bytes (matching the
 //! reference) while the Rust cache interpolates over tokens (`Cache1DLinear`).
 
@@ -59,16 +59,23 @@ impl KernelSpec for ElementwiseSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|num_tokens| {
+            // token_axis() values are non-negative integers, max 65536, far
+            // below u64::MAX.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "sweep axis values are non-negative integers far below u64::MAX"
+            )]
             let tokens = num_tokens as u64;
             ArgsPayload::new()
                 .with("backend", backend)
                 .with(
                     "input_size_bytes",
-                    config.input_bytes_per_token.get() as u64 * tokens,
+                    u64::from(config.input_bytes_per_token.get()) * tokens,
                 )
                 .with(
                     "output_size_bytes",
-                    config.output_bytes_per_token.get() as u64 * tokens,
+                    u64::from(config.output_bytes_per_token.get()) * tokens,
                 )
         })
     }

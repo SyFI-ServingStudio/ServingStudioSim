@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet scalar chunk-local cumulative-sum kernel.
+//! Qwen Gated `DeltaNet` scalar chunk-local cumulative-sum kernel.
 //!
 //! Public inputs remain the physical `(num_tokens, num_chunks)` caller shape,
 //! while the cache projects them to `(C, D=T/C)`: launch chunks and average
@@ -36,8 +36,8 @@ pub struct GdnChunkLocalCumsumKernelInput {
 impl SweepCoords for GdnChunkLocalCumsumKernelInput {
     fn coords(&self) -> Coords {
         Coords::new([
-            self.num_chunks as f64,
-            self.num_tokens as f64 / self.num_chunks as f64,
+            f64::from(self.num_chunks),
+            f64::from(self.num_tokens) / f64::from(self.num_chunks),
         ])
     }
 
@@ -64,7 +64,17 @@ impl KernelSpec for GdnChunkLocalCumsumSpec {
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         grid.expand_2d(|num_chunks, tokens_per_chunk| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_chunks is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let num_chunks = num_chunks.round() as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "tokens_per_chunk is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let tokens_per_chunk = tokens_per_chunk.round() as u64;
             num_chunks
                 .checked_mul(tokens_per_chunk)
@@ -79,7 +89,17 @@ impl KernelSpec for GdnChunkLocalCumsumSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_2d(|num_chunks, tokens_per_chunk| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_chunks is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let num_chunks = num_chunks.round() as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "tokens_per_chunk is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let tokens_per_chunk = tokens_per_chunk.round() as u64;
             let num_tokens = num_chunks
                 .checked_mul(tokens_per_chunk)
@@ -257,7 +277,19 @@ mod tests {
         assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 112);
         for (chunk_index, &num_chunks) in grid.axes()[0].iter().enumerate() {
             for (density_index, &tokens_per_chunk) in grid.axes()[1].iter().enumerate() {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "num_chunks is a non-negative Axis sweep coordinate from config(), \
+                              bounded well under u64 range"
+                )]
                 let num_chunks = num_chunks as u64;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "tokens_per_chunk is a non-negative Axis sweep coordinate from config(), \
+                              bounded well under u64 range"
+                )]
                 let tokens_per_chunk = tokens_per_chunk as u64;
                 let expected = num_chunks.checked_mul(tokens_per_chunk).unwrap() > MAX_TOKENS;
                 assert_eq!(
@@ -322,7 +354,7 @@ mod tests {
 
         assert_eq!(payloads[0].fields()["num_tokens"], Value::from(1_u32));
         assert_eq!(payloads[0].fields()["num_chunks"], Value::from(1_u32));
-        let qwen_index = 1 * 7 + 6;
+        let qwen_index = 7 + 6;
         assert_eq!(
             payloads[qwen_index].fields()["num_tokens"],
             Value::from(128_u32)
@@ -365,13 +397,12 @@ mod tests {
         let new_rows = payloads
             .iter()
             .zip(&mask)
-            .filter_map(|(payload, &masked)| {
-                (!masked).then(|| {
-                    (
-                        payload.fields()["num_tokens"].as_u64().unwrap(),
-                        payload.fields()["num_chunks"].as_u64().unwrap(),
-                    )
-                })
+            .filter(|&(_payload, &masked)| !masked)
+            .map(|(payload, &_masked)| {
+                (
+                    payload.fields()["num_tokens"].as_u64().unwrap(),
+                    payload.fields()["num_chunks"].as_u64().unwrap(),
+                )
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(new_rows.len(), 112);

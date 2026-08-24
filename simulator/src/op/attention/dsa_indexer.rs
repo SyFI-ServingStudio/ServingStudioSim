@@ -3,7 +3,7 @@
 //! This op is one complete full-index invocation. Its fifteen fixed serial
 //! leaves share the indexer projection/quantization/cache state, while phase
 //! normalization folds request-local prefill calls into fixed fan-in slots and
-//! one optional decode cell. IndexShare scheduling belongs above L2: a full-
+//! one optional decode cell. `IndexShare` scheduling belongs above L2: a full-
 //! index layer evaluates this whole op and a shared-index layer omits it.
 //! Request-local/global index remap remains in `DsaSparseMlaAttentionOp`, and
 //! communication remains outside both attention compound ops.

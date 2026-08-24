@@ -1,8 +1,8 @@
 //! Qwen3.6-35B-A3B-FP8 text decoder on one local H200 (TP1/EP1).
 //!
-//! The checkpoint is heterogeneous: three Gated DeltaNet layers followed by one
+//! The checkpoint is heterogeneous: three Gated `DeltaNet` layers followed by one
 //! gated-GQA layer, repeated ten times. Both layer variants end at the same
-//! normalized-hidden boundary and are followed by the same local MoE sequence.
+//! normalized-hidden boundary and are followed by the same local `MoE` sequence.
 //! Routed and shared experts may use concurrent CUDA streams in production, but
 //! they share one H200's compute and memory resources. Their isolated leaf costs
 //! therefore compose conservatively as a local sum until a measured compound
@@ -68,7 +68,7 @@ const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear"];
 /// Slots vLLM hands to a Triton kernel, torch-compile output included.
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 /// Slots whose vLLM source is eager tensor arithmetic and therefore land on
-/// torch's TensorIterator. Not interchangeable with the Triton curve: at these
+/// torch's `TensorIterator`. Not interchangeable with the Triton curve: at these
 /// byte rates both kernels are launch-bound and torch's is the heavier one, so
 /// costing the shared-expert gate path on `triton` under-predicted it by 52-72%.
 const TORCH_ELEMENTWISE_BACKENDS: &[&str] = &["torch"];
@@ -426,6 +426,7 @@ pub struct Qwen36LocalModel {
 /// group. Feeding a measured `expert_popularity` profile in is therefore the
 /// difference between costing the routing vLLM actually produced and costing an
 /// idealized balanced one.
+#[must_use]
 pub fn build_configs(
     model: &Qwen36ModelCfg,
     parallel: &Qwen36LocalParallel,
@@ -550,6 +551,7 @@ pub fn build_configs(
     }
 }
 
+#[must_use]
 pub fn resolve_configs(cfg: &Qwen36LocalConfigs) -> Qwen36LocalResolved {
     Qwen36LocalResolved {
         embedding: cfg.embedding.clone(),
@@ -859,6 +861,7 @@ impl Qwen36LocalModel {
         }
     }
 
+    #[must_use]
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let embedding = CostNode::Labeled {
@@ -1131,10 +1134,10 @@ mod tests {
         for mutate in [
             |v: &mut serde_json::Value| v["text_config"]["hidden_size"] = 4096.into(),
             |v: &mut serde_json::Value| {
-                v["text_config"]["layer_types"][3] = "linear_attention".into()
+                v["text_config"]["layer_types"][3] = "linear_attention".into();
             },
             |v: &mut serde_json::Value| {
-                v["quantization_config"]["weight_block_size"] = serde_json::json!([64, 128])
+                v["quantization_config"]["weight_block_size"] = serde_json::json!([64, 128]);
             },
             |v: &mut serde_json::Value| v["tie_word_embeddings"] = true.into(),
         ] {
@@ -1401,6 +1404,10 @@ mod tests {
 
     fn unified(prefill: Vec<(u32, u32)>, decode: Vec<u32>) -> UnifiedArchInput {
         let prefill_tokens = prefill.iter().map(|x| x.1).sum();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "decode is a test-fixture Vec built from a handful of literal kv lengths, its length is nowhere near u32::MAX"
+        )]
         let decode_tokens = decode.len() as u32;
         // Mirrors UnifiedIterExecution and PredictGroup lowering: total_kv_len
         // is the decode-member aggregate; prefill state stays in the pairs.

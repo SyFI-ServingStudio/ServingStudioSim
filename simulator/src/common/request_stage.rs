@@ -46,6 +46,7 @@ impl StageEvent {
     /// sentinel pool/worker never equal a real `(code, pool, worker)`, so the
     /// first [`crate::common::RequestRecord::record_stage`] always registers a
     /// move.
+    #[must_use]
     pub fn unset(time: Time) -> Self {
         Self {
             time,

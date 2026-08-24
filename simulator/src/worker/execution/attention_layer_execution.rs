@@ -24,7 +24,13 @@ impl<M: AttnLayerwiseModel> AttentionLayerExecution for AttentionLayerExecutionA
     type Input = AttnArchInput;
 
     fn num_layers(&self) -> u16 {
-        self.model.num_layers() as u16
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "model layer counts are a handful to low hundreds, far below u16::MAX"
+        )]
+        {
+            self.model.num_layers() as u16
+        }
     }
 
     fn model_kv_layout(&self) -> ModelKvLayout {
@@ -70,6 +76,10 @@ impl<M: AttnLayerwiseModel> AttentionLayerExecution for AttentionLayerExecutionA
                 group.prefill_tokens += resolved_prefill.prefill_tokens_to_compute();
                 group.batch_tokens += resolved_prefill.prefill_tokens_to_compute();
             } else {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "KV length is a token count within one request's context window, far below u32::MAX"
+                )]
                 let current_kv = kv_store.current_kv(0, request).unwrap_or(0) as u32;
                 group.decode_kv_lens.push(current_kv);
                 group.decode_tokens += 1;
@@ -77,7 +87,7 @@ impl<M: AttnLayerwiseModel> AttentionLayerExecution for AttentionLayerExecutionA
                 group.total_kv_len += current_kv;
             }
         }
-        group.batch_tokens as u64
+        u64::from(group.batch_tokens)
     }
 
     fn evaluate_attention_layer(
@@ -89,12 +99,21 @@ impl<M: AttnLayerwiseModel> AttentionLayerExecution for AttentionLayerExecutionA
         now: Time,
     ) -> Time {
         let model = Arc::clone(&self.model);
-        let cache_key = [iteration as u32, (iteration >> 32) as u32, slot as u32];
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "deliberate split of the u64 iteration counter into its low/high u32 halves for a fixed-width cache key, not a value-range truncation"
+        )]
+        let cache_key = [iteration as u32, (iteration >> 32) as u32, u32::from(slot)];
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "layer indices are a handful to low hundreds, far below i16::MAX"
+        )]
+        let layer_key = layer as i16;
         self.cost.run_section(
             "attn",
-            layer as i16,
+            layer_key,
             iteration,
-            slot as u64,
+            u64::from(slot),
             &input.groups,
             Some(&cache_key),
             now,

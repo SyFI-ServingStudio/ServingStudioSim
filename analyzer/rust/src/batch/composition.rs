@@ -235,6 +235,11 @@ async fn collect_invocation_counts(ctx: &SessionContext) -> Result<InvocationCou
             .ok_or_else(|| anyhow!("`pool_tag` is not a Utf8 array"))?;
         let c = column_f64(col(batch, "c")?)?;
         let worker_ids = column_f64(col(batch, "worker_id")?)?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "`c` is a COUNT(*) aggregate and `worker_ids` is the worker_id column; DataFusion returns both as f64 but they are always small nonnegative whole numbers"
+        )]
         for i in 0..batch.num_rows() {
             let pool_tag = pool_arr.value(i).to_string();
             let count = c[i] as usize;
@@ -260,7 +265,14 @@ async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
         if b.num_rows() > 0 {
             let mx = value_f64(col(b, "mx")?, 0)?;
             if mx.is_finite() {
-                num_iters = mx as u64 + 1;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "mx is CAST(MAX(iter_id), BIGINT) - a nonnegative iteration counter far below u64::MAX for any real run"
+                )]
+                {
+                    num_iters = mx as u64 + 1;
+                }
             }
         }
     }
@@ -310,6 +322,10 @@ async fn collect_sampled_batches(ctx: &SessionContext, stride: u64) -> Result<Sa
         );
         // Sum each field over a row's groups (`offsets[i]..offsets[i+1]`) — the DP
         // shards the one invocation is split across.
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "`offsets` are Arrow ListArray value_offsets (i32), which are always nonnegative monotonically increasing element indices"
+        )]
         let row_sum = |v: &[f64], i: usize| -> f64 {
             v[offsets[i] as usize..offsets[i + 1] as usize].iter().sum()
         };
@@ -317,6 +333,11 @@ async fn collect_sampled_batches(ctx: &SessionContext, stride: u64) -> Result<Sa
             let pool_tag = pool_arr.value(i).to_string();
             let row = (ws[i], row_sum(&bt, i), row_sum(&pt, i), row_sum(&dc, i));
             by_pool.entry(pool_tag.clone()).or_default().push(row);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "worker_ids[i] is the worker_id column value; DataFusion returns it as f64 but the value is always a small nonnegative device index"
+            )]
             by_worker
                 .entry((pool_tag, worker_ids[i] as u64))
                 .or_default()

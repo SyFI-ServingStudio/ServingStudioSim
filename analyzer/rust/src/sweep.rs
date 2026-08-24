@@ -236,7 +236,7 @@ fn collect_run_scalars(
     run_dir: &Path,
     require_current_subject_timing: bool,
 ) -> Result<(Value, Map<String, Value>)> {
-    let lifecycle = lifecycle(&run_dir);
+    let lifecycle = lifecycle(run_dir);
     let summary = read_optional_json(&run_dir.join("summary.json"))?;
     let timing = read_optional_json(&run_dir.join("reports/analyzer_timing.json"))?;
     let slo = (!require_current_subject_timing || subject_ok(timing.as_ref(), "slo-general"))

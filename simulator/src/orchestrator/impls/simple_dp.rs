@@ -30,7 +30,7 @@ pub struct SimpleDpPoolConfig {
     pub placement: DpPlacementPolicy,
 }
 
-/// Config for the whole simple_dp deployment.
+/// Config for the whole `simple_dp` deployment.
 pub struct SimpleDpConfig {
     pub dp_pool: SimpleDpPoolConfig,
 }
@@ -129,6 +129,7 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
         idx
     }
 
+    #[must_use]
     pub fn pool(&self) -> PoolId {
         self.pool
     }
@@ -177,7 +178,7 @@ pub struct SimpleDpFlow<W: IterWorker<Event = WorkerEventCommon>> {
     dp_pool: SimpleDpPoolController<W>,
     /// Shared run-level GPU cluster (registry + transfer oracle), built here and
     /// threaded into the pool's construction so workers self-register and (PD
-    /// only) keep a handle for runtime transfers. simple_dp has one pool today,
+    /// only) keep a handle for runtime transfers. `simple_dp` has one pool today,
     /// but the ownership shape generalizes to multi-pool (allocate into the
     /// same cluster, ids continue).
     cluster: SharedGpuCluster,
@@ -285,6 +286,10 @@ mod tests {
         }
         let mut completed = Vec::new();
         for step in 0..500u64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
             for a in flow.tick(Time::from_ms(step as f64)) {
                 let OrchAction::Complete { req } = a;
                 completed.push(req);
@@ -308,7 +313,12 @@ mod tests {
         }
         let mut n = 0;
         for step in 0..200u64 {
-            n += flow.tick(Time::from_ms(step as f64)).len();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "step is a tick counter bounded by the loop range, far under f64's exact integer range"
+            )]
+            let now = Time::from_ms(step as f64);
+            n += flow.tick(now).len();
         }
         assert_eq!(n, 4);
     }

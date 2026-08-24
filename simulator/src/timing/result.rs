@@ -1,8 +1,8 @@
-//! `Probe` — the per-leaf cost-query trait for the CostTree eval walk.
+//! `Probe` — the per-leaf cost-query trait for the `CostTree` eval walk.
 //!
 //! Agent note: keep this independent of any concrete kernel/cache. Upper layers
 //! import it through `crate::timing::Probe`. The old `LookupResult` tree +
-//! `lookup`/`lookup_time` and the `Describe` trait were retired once the CostTree
+//! `lookup`/`lookup_time` and the `Describe` trait were retired once the `CostTree`
 //! became the single cost path: leaves are evaluated via `eval` and the
 //! shape print is rendered by [`CostTree::describe`](crate::timing::CostTree) from
 //! the kernel `kind`/`config` captured at compile.
@@ -13,7 +13,7 @@ pub trait Probe {
     type Input;
 
     /// Metrics + coverage for one leaf — the per-leaf `buf[slot]` value the
-    /// CostTree eval walk streams in (then [`CostTree::aggregate`] rolls up). For
+    /// `CostTree` eval walk streams in (then [`CostTree::aggregate`] rolls up). For
     /// `Kernel` this is the alloc-free best-of-N over the backend caches.
     fn eval(&self, input: &Self::Input) -> LeafMetrics;
 

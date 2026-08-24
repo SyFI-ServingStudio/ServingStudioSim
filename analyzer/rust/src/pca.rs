@@ -30,6 +30,11 @@ pub struct Projection2D {
 ///
 /// Returns `None` when a 2-D projection is undefined: fewer than 2 samples, no
 /// features, or ragged rows. The caller then treats the position as unprojectable.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "n is the sample-row count for a plotted feature matrix, far under f64's 52-bit exact \
+              integer range"
+)]
 pub fn pca_project_2d(rows: &[Vec<f64>]) -> Option<Projection2D> {
     let n = rows.len();
     if n < 2 {

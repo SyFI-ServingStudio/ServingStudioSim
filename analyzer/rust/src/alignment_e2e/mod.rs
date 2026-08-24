@@ -286,8 +286,14 @@ fn read_server_gpu_span(path: &Path) -> Result<ServerGpuSpan> {
         last_end_ns > first_start_ns,
         "parsed NSYS server GPU span must be positive"
     );
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "ns span from one nsys trace; a realistic profiling run is far below 2^53 ns \
+                  (~104 days), so the ms conversion stays exact"
+    )]
+    let span_ms = (last_end_ns - first_start_ns) as f64 / 1e6;
     Ok(ServerGpuSpan {
-        span_ms: (last_end_ns - first_start_ns) as f64 / 1e6,
+        span_ms,
         iterations_with_kernels,
         kernels,
     })
@@ -310,7 +316,7 @@ fn read_server_request_timings(path: &Path) -> Result<ServerRequestTimings> {
             .and_then(Value::as_u64)
             .context("server request timing missing schema_version")?;
         ensure!(
-            matches!(row_schema_version, 1 | 2 | 3),
+            matches!(row_schema_version, 1..=3),
             "unsupported server request timing schema {} at {} line {}",
             row_schema_version,
             path.display(),
@@ -376,6 +382,11 @@ fn read_server_request_timings(path: &Path) -> Result<ServerRequestTimings> {
                     sample.is_finite() && sample >= 0.0,
                     "server engine_core_tpot_ms must be finite and nonnegative"
                 );
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "num_output_tokens is a per-request output token count from measured \
+                              server telemetry, realistically orders of magnitude below 2^53"
+                )]
                 let expected = decode_ms / (num_output_tokens - 1) as f64;
                 ensure!(
                     (sample - expected).abs() <= 1e-6,
@@ -453,6 +464,11 @@ fn read_measured_requests(path: &Path) -> Result<BTreeMap<String, RequestMetrics
             .and_then(Value::as_f64)
             .or(text_ttft);
         let e2e = outcome.get("total_duration_ms").and_then(Value::as_f64);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "output_tokens is a per-request output token count from a replay outcome, \
+                      realistically orders of magnitude below 2^53"
+        )]
         let tpot = if schema_version >= 3 {
             outcome
                 .get("token_delivery_tpot_ms")
@@ -513,6 +529,14 @@ async fn read_sim_requests(
         for row in 0..batch.num_rows() {
             let arrival = value_f64(arrivals, row)?;
             origin_ms = origin_ms.min(arrival);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "request_id and num_output_tokens come from this run's own \
+                          request_slo.parquet (simulator-generated, not external input); both are \
+                          small nonnegative integers by construction and Rust's float-to-int cast \
+                          saturates rather than wrapping"
+            )]
             rows.push((
                 value_f64(ids, row)? as u64,
                 arrival,
@@ -575,6 +599,11 @@ fn latency_cdf_comparison(
     })
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "bin index/count is bounded by the configured throughput_bins (small), and token \
+              totals are per-run output token counts, both realistically far below 2^53"
+)]
 fn throughput_series(
     measured: &BTreeMap<String, RequestMetrics>,
     simulated: &BTreeMap<String, RequestMetrics>,
@@ -637,6 +666,13 @@ fn bin_completions(requests: &BTreeMap<String, RequestMetrics>, width_ms: f64, b
         if !request.completion_ms.is_finite() || request.completion_ms < 0.0 {
             continue;
         }
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "completion_ms is checked finite and nonnegative above; Rust's float-to-int \
+                      cast saturates rather than wrapping, and the trailing .min() clamps the \
+                      result into range regardless"
+        )]
         let index = ((request.completion_ms / width_ms).floor() as usize).min(bins.len() - 1);
         bins[index] += request.output_tokens;
     }

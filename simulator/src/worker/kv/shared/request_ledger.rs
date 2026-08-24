@@ -94,10 +94,16 @@ impl RequestLedger {
 
     #[inline]
     pub(crate) fn partition_promised_count(&self, partition: PartitionId) -> u32 {
-        self.promised
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "counts promised requests on one partition, bounded by the simulated request population, far under u32::MAX"
+        )]
+        let count = self
+            .promised
             .values()
             .filter(|(promised_partition, _)| *promised_partition == partition)
-            .count() as u32
+            .count() as u32;
+        count
     }
 
     /// Empty `promised` and report `(partition, request)` in iteration order.

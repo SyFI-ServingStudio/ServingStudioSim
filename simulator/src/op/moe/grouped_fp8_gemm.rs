@@ -21,15 +21,15 @@ use crate::timing::{BuildError, CostNode, CostTreeBuilder, Evaluator, PerfApiBri
 /// row per (token, selected expert).
 ///
 /// The grouped GEMM always reads an expanded layout, but the *quantize* before
-/// it does not always produce one. vLLM quantizes the gate_up input straight
+/// it does not always produce one. vLLM quantizes the `gate_up` input straight
 /// off the hidden states — one row per token — and lets `fused_moe_kernel`
 /// gather rows per expert from that; only the intermediate activation, which
 /// physically exists once per selection, is quantized expanded. Realizations
-/// that permute tokens into per-expert order *before* quantizing (DeepEP into
-/// DeepGEMM) quantize the expanded layout on both sides.
+/// that permute tokens into per-expert order *before* quantizing (`DeepEP` into
+/// `DeepGEMM`) quantize the expanded layout on both sides.
 ///
 /// Getting this wrong is a silent top-k-fold error, not a small one: measured
-/// against vLLM the expanded reading over-predicted the gate_up quant by 8.9x
+/// against vLLM the expanded reading over-predicted the `gate_up` quant by 8.9x
 /// (1937 ms vs 218 ms over 966 iterations), and it showed up as the largest
 /// single term in the whole comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,7 +53,7 @@ pub enum QuantRows {
 ///
 /// Picking the wrong one is not a small error: against a measured vLLM
 /// Qwen3.6-35B-A3B-FP8 run the `Block` reading over-predicted the routed
-/// gate_up quant by 58% and the down quant by 105%, while the identical
+/// `gate_up` quant by 58% and the down quant by 105%, while the identical
 /// `PerTokenGroup` kernel modeling the shared expert's quant sat within 20%.
 #[derive(Clone, Debug)]
 pub enum GroupedQuantConfig {
@@ -89,6 +89,7 @@ impl GroupedGemmConfig {
     /// Compute dtype, which both realizations agree on. Exposed so callers that
     /// only care about the numeric contract need not match on the variant;
     /// callers that care *which* kernel runs should match instead.
+    #[must_use]
     pub fn dtype(&self) -> DType {
         match self {
             Self::TrtllmBlockscale(config) => config.dtype,
@@ -219,7 +220,9 @@ impl GroupedFp8GemmWithQuantOp {
     pub fn eval(&self, input: &GroupedFp8GemmWithQuantInput, ev: &mut Evaluator) {
         assert!(
             self.experts_per_token > 0
-                && input.global_expert_selections % self.experts_per_token == 0,
+                && input
+                    .global_expert_selections
+                    .is_multiple_of(self.experts_per_token),
             "global expert selections must be divisible by experts_per_token"
         );
         let num_tokens = input.global_expert_selections / self.experts_per_token;

@@ -1,5 +1,5 @@
 //! `PreAttnProjTpWorklet` — the pre-attention dense projections of a TP decoder
-//! layer: input RMSNorm → column-parallel fused QKV. `TP` group suffix (L3
+//! layer: input `RMSNorm` → column-parallel fused QKV. `TP` group suffix (L3
 //! §1.5): one sync section, no collective inside (the all-reduce that closes the
 //! attention block lives downstream, in the post-attention section).
 //!
@@ -8,7 +8,7 @@
 //! to the attn pool (which owns the attention kernel + KV cache). It is the same
 //! Megatron column-parallel partition as the front of [`AttnBlockTpWorklet`]
 //! (each rank owns `num_qo_heads / tp` query heads and `num_kv_heads / tp` KV
-//! heads; `hidden` is NOT sharded), minus the attention / o_proj / all-reduce.
+//! heads; `hidden` is NOT sharded), minus the attention / `o_proj` / all-reduce.
 //!
 //! `tp_size == 1` degenerates to the single-GPU case (per-rank == full shapes).
 //!
@@ -32,7 +32,7 @@ pub struct PreAttnProjTpWorkletConfig {
     pub num_qo_heads: Dim,
     pub num_kv_heads: Dim,
     pub head_dim: Dim,
-    /// Base (16-bit) dtype — the input RMSNorm keeps it.
+    /// Base (16-bit) dtype — the input `RMSNorm` keeps it.
     pub dtype: DType,
     pub tp_size: u16,
     /// Symbol name for `tp_size` in the derivation formula (`attn_tp`/`ffn_tp`/
@@ -67,18 +67,19 @@ pub struct PreAttnProjTpWorklet {
 }
 
 impl PreAttnProjTpWorklet {
+    #[must_use]
     pub fn resolve_config(cfg: &PreAttnProjTpWorkletConfig) -> PreAttnProjTpWorkletResolved {
-        let tp = cfg.tp_size as u32;
+        let tp = u32::from(cfg.tp_size);
         // GQA dual-divisibility, identical to the attention TP front: both head
         // counts split across the ranks, tp <= num_kv_heads (no KV replication).
         assert!(
-            cfg.num_qo_heads.get() % tp == 0,
+            cfg.num_qo_heads.get().is_multiple_of(tp),
             "num_qo_heads {} not divisible by tp_size {}",
             cfg.num_qo_heads,
             tp
         );
         assert!(
-            cfg.num_kv_heads.get() % tp == 0,
+            cfg.num_kv_heads.get().is_multiple_of(tp),
             "num_kv_heads {} not divisible by tp_size {}",
             cfg.num_kv_heads,
             tp
@@ -144,7 +145,7 @@ impl PreAttnProjTpWorklet {
         })
     }
 
-    /// CostTree compile: `Sum(input_norm, qkv)` under a `Labeled` partition header.
+    /// `CostTree` compile: `Sum(input_norm, qkv)` under a `Labeled` partition header.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let r = &self.resolved;
         let label = format!(
@@ -164,7 +165,7 @@ impl PreAttnProjTpWorklet {
         }
     }
 
-    /// CostTree eval: fill slots in the exact `compile` child order — norm, qkv.
+    /// `CostTree` eval: fill slots in the exact `compile` child order — norm, qkv.
     pub fn eval(&self, input: &PreAttnProjTpWorkletInput, ev: &mut Evaluator) {
         let m = input.batch_tokens;
         self.input_norm.eval(&RmsNormKernelInput { m }, ev);

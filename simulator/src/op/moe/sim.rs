@@ -1,11 +1,11 @@
 //! `op/moe/sim` — the unified "simulate-as-model" core: one per-token routing +
-//! placement realization that prices ALL SIX MoE network stages' per-GPU bytes,
+//! placement realization that prices ALL SIX `MoE` network stages' per-GPU bytes,
 //! sampling each stage's realized bottleneck on a token-count grid into a
 //! [`BottleneckCurve`].
 //!
 //! ## Why one simulator for all six stages
 //!
-//! The pre-unify design split MoE comm two ways: dispatch used an analytic
+//! The pre-unify design split `MoE` comm two ways: dispatch used an analytic
 //! per-rank hit probability `q` (exact, since dispatch bytes are per-rank
 //! independent and linear in `T`), while combine's reduce stages needed a
 //! token-level sim (the reduce volume is non-linear in a token's hit *set*:
@@ -27,15 +27,15 @@
 //! (balanced-EP default: home = `token_idx % ep_size`). For a token homed on rank
 //! `home` (in domain `home_dom`) hitting rank set `H`:
 //!
-//! * **dispatch_inter** (NIC): for each remote hit domain `d`, `home` sends one
+//! * **`dispatch_inter`** (NIC): for each remote hit domain `d`, `home` sends one
 //!   copy to the rail-aligned ingress `gateway(d) = rail_peer(home, d)`.
-//! * **dispatch_intra** (NVLink): inside each hit domain, the gateway fans the
+//! * **`dispatch_intra`** (NVLink): inside each hit domain, the gateway fans the
 //!   token to every hit rank `≠ gateway` (in `home_dom` the gateway is `home`).
-//! * **combine_intra_reduce** (NVLink): the mirror — each hit rank `≠ gateway`
+//! * **`combine_intra_reduce`** (NVLink): the mirror — each hit rank `≠ gateway`
 //!   reduces its partial to the domain gateway.
-//! * **combine_inter_reduce** (NIC): each remote domain's gateway reduces back to
+//! * **`combine_inter_reduce`** (NIC): each remote domain's gateway reduces back to
 //!   `home`.
-//! * **combine_inter_bcast / combine_intra_fanout**: identically zero under a
+//! * **`combine_inter_bcast` / `combine_intra_fanout`**: identically zero under a
 //!   single-home placement (they deliver a *replicated* output to many target
 //!   ranks; round-robin homes have exactly one sink). Kept as stages so the op
 //!   taxonomy and leaf count stay stable for a future replicated placement.
@@ -51,7 +51,7 @@
 use super::{BottleneckCurve, MoeNetParams, MoeStep, NvlLayout, P2pTier, Placement};
 use crate::timing::routing::{for_each_routed_token, RoutingRng};
 
-/// The six MoE network stages in critical-path order, paired with their fabric
+/// The six `MoE` network stages in critical-path order, paired with their fabric
 /// tier. Index layout: `0,1` dispatch (read by [`MoeDispatchOp`]); `2..6` combine
 /// (read by [`MoeCombineOp`]).
 const STAGES: [(&str, P2pTier); 6] = [
@@ -67,6 +67,7 @@ const STAGES: [(&str, P2pTier); 6] = [
 /// `send`/`recv` bytes of all six stages. Deterministic for a fixed `seed`
 /// (splitmix64 + fixed iteration order). `ppm` is the global per-expert
 /// popularity (same layout as [`crate::timing::routing::RoutingDistribution`]).
+#[must_use]
 pub fn simulate_once(
     ppm: &[u32],
     top_k: u32,
@@ -123,6 +124,14 @@ pub fn simulate_once(
 ///    bcast the result from `primary` to a `result_holder` in each non-root
 ///    target domain, then fan within that domain to the other resident ranks.
 ///    These two stages stay zero whenever `|S| == 1` (single combine sink).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each arg is a distinct per-token routing/cost input; bundling would just move the same fan-out into a struct"
+)]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "modulo results bounded by residing_count/window_size and NVL domain_size, both rank counts far below u16::MAX"
+)]
 fn price_token(
     token_index: u64,
     hit_rank: &[bool],
@@ -255,6 +264,7 @@ fn price_token(
 /// captures its `T`-dependence: under near-symmetric routing the realized busiest
 /// GPU sits `~√(ep/T)` above the mean-field per-GPU load, a margin a single
 /// coefficient × `T` cannot express.
+#[must_use]
 pub fn simulate_moe_comm(
     ppm: &[u32],
     top_k: u32,
@@ -275,6 +285,10 @@ pub fn simulate_moe_comm(
                 ^ u64::from(t).wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 ^ u64::from(trial).wrapping_mul(0xD1B5_4A32_D192_ED03);
             let steps = simulate_once(ppm, top_k, params, placement, t, s);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "bottleneck_bytes is a per-step byte count accumulated for an average; realistic simulated traffic stays far below 2^53"
+            )]
             for (i, a) in acc.iter_mut().enumerate() {
                 *a += steps[i].bottleneck_bytes() as f64;
             }
@@ -303,6 +317,11 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "coefficient-of-variation helper over small test byte-count samples, far below \
+                  the range where u64/usize->f64 casts would lose precision"
+    )]
     fn cv(xs: &[u64]) -> f64 {
         let n = xs.len() as f64;
         let mean = xs.iter().map(|&x| x as f64).sum::<f64>() / n;
@@ -408,9 +427,9 @@ mod tests {
 
     /// Fast regression: on a few pinned configs, sim's per-stage system
     /// copies/token must match ref's analytic baseline on the EXACT-class
-    /// stages (dispatch_inter, inter_bcast, intra_fanout, and inter_reduce when
+    /// stages (`dispatch_inter`, `inter_bcast`, `intra_fanout`, and `inter_reduce` when
     /// the HP group sits in one domain), and exceed it on the rail-gap stages
-    /// (dispatch_intra, combine_intra_reduce) by the expected DeepEP rail-
+    /// (`dispatch_intra`, `combine_intra_reduce`) by the expected `DeepEP` rail-
     /// alignment surplus. Guards every refactor that touches `price_token`,
     /// `Placement`, or the ref baseline math.
     #[test]
@@ -440,6 +459,11 @@ mod tests {
             };
             let steps = simulate_once(dist.ppm(), k, &params, placement, n_tokens, 0xA110_C0DE);
             let hidden_f = f64::from(hidden_bytes);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "summed send_bytes here is bounded by n_tokens (30_000) * hidden_bytes, \
+                          far below f64's 52-bit exact-integer range"
+            )]
             let sim_copies: [f64; 6] = std::array::from_fn(|i| {
                 steps[i].send_bytes.iter().sum::<u64>() as f64 / hidden_f / f64::from(n_tokens)
             });
@@ -494,9 +518,9 @@ mod tests {
     /// * half the tokens (`home==rank 0`) already host the only hit rank →
     ///   nothing crosses the wire.
     /// * the other half (`home==rank 1`) need one NIC hop home→rank 0 for
-    ///   dispatch and the mirror hop rank 0→home for combine. dispatch_inter
+    ///   dispatch and the mirror hop rank 0→home for combine. `dispatch_inter`
     ///   lands on the rail-aligned gateway (= rank 0, which is itself the hit
-    ///   rank in its singleton domain), so dispatch_intra is zero.
+    ///   rank in its singleton domain), so `dispatch_intra` is zero.
     ///
     /// Expected per-rank bytes for `n=1000`, `hidden=100`:
     /// `dispatch_inter.send = [0, 50_000]`, `recv = [50_000, 0]`;
@@ -551,7 +575,7 @@ mod tests {
     /// domain holding both ranks; `top_k=1`; PPM = `[0, 0, 1.0, 0]` so EVERY
     /// token picks expert 2, owned by rank 1. `RoundRobin` again:
     /// * `home==rank 0`: hit (rank 1) is in the same NVL domain but not the
-    ///   home; one intra (NVLink) hop home→hit for dispatch and the mirror for
+    ///   home; one intra (`NVLink`) hop home→hit for dispatch and the mirror for
     ///   combine reduce.
     /// * `home==rank 1`: home is the only hit; nothing moves.
     ///
@@ -827,6 +851,11 @@ mod tests {
             // Our realized system copies/token per stage.
             let steps = simulate_once(dist.ppm(), k, &p, Placement::RoundRobin, n_tokens, 0xBA1A);
             let b = f64::from(hidden_bytes);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "summed send_bytes here is bounded by n_tokens (200_000) * hidden_bytes, \
+                          far below f64's 52-bit exact-integer range"
+            )]
             let sim_cpt = |s: &MoeStep| -> f64 {
                 s.send_bytes.iter().sum::<u64>() as f64 / b / f64::from(n_tokens)
             };
@@ -987,6 +1016,12 @@ mod tests {
     /// the [`STAGES`] order: `[dispatch_inter, dispatch_intra,
     /// combine_intra_reduce, combine_inter_reduce, combine_inter_bcast,
     /// combine_intra_fanout]`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "rank/group indices and counts here are bounded by `ep` (<=32 in these tests), \
+                  well inside u32's and f64's exact-integer range"
+    )]
     fn ref_hp_copies(e: u32, ep: u32, nvl: u32, k: u32, hp: u32) -> [f64; 6] {
         let experts_per_rank = crate::timing::routing::balanced_expert_counts(e, ep);
         let ranks_per_domain = crate::timing::routing::ranks_per_nvl_domain(ep, nvl);
@@ -1074,7 +1109,7 @@ mod tests {
                 0.0
             };
             copies_per_stage[3] += expected_hit_domains - q_target_domain_overlap;
-            copies_per_stage[4] += target_domain_count.saturating_sub(1) as f64;
+            copies_per_stage[4] += f64::from(target_domain_count.saturating_sub(1));
         }
         for stage in &mut copies_per_stage {
             *stage /= f64::from(ep);
@@ -1108,6 +1143,11 @@ mod tests {
             let placement = Placement::ReplicatedHeadParallel { hp_size: hp };
             let steps = simulate_once(dist.ppm(), k, &params, placement, n_tokens, 0x4850_5F56);
             let hidden_f = f64::from(hidden_bytes);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "summed send_bytes here is bounded by n_tokens (200_000) * hidden_bytes, \
+                          far below f64's 52-bit exact-integer range"
+            )]
             let sim_copies: [f64; 6] = std::array::from_fn(|i| {
                 steps[i].send_bytes.iter().sum::<u64>() as f64 / hidden_f / f64::from(n_tokens)
             });
@@ -1162,8 +1202,14 @@ mod tests {
 
     #[test]
     #[ignore = "eval: run explicitly with --ignored --nocapture"]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "bottleneck byte counts here are bounded by the test's own token grid (max \
+                  32_768) and hidden_bytes, far below f64's 52-bit exact-integer range"
+    )]
     fn eval_moe_comm_sim_vs_truth() {
-        let dists: Vec<(&str, Box<dyn Fn(u32) -> RoutingDistribution>)> = vec![
+        type DistCase = (&'static str, Box<dyn Fn(u32) -> RoutingDistribution>);
+        let dists: Vec<DistCase> = vec![
             ("uniform", Box::new(RoutingDistribution::uniform)),
             (
                 "powerlaw_a0.5",
@@ -1225,7 +1271,7 @@ mod tests {
                     let mut truth = [0.0f64; 6];
                     for trial in 0..trials {
                         let seed = 0x5151_2727u64
-                            .wrapping_mul(t as u64 + 1)
+                            .wrapping_mul(u64::from(t) + 1)
                             .wrapping_add(u64::from(trial));
                         let steps =
                             simulate_once(dist.ppm(), k, &p, Placement::RoundRobin, t, seed);

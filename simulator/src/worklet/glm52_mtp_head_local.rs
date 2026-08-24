@@ -1,7 +1,7 @@
 //! GLM-5.2 local MTP output head after the layer-78 decoder block.
 //!
 //! Pinned serving adds the decoder's hidden and residual outputs, applies the
-//! shared-head RMSNorm, and evaluates the full TP1 vocabulary projection. The
+//! shared-head `RMSNorm`, and evaluates the full TP1 vocabulary projection. The
 //! residual add uses a measured elementwise traffic approximation. Logits
 //! processing, candidate sampling, and scheduler work remain outside this
 //! local model-architecture boundary.
@@ -65,6 +65,7 @@ pub struct Glm52MtpHeadLocalWorklet {
 impl Glm52MtpHeadLocalWorklet {
     /// Resolve the one supported GLM-5.2 MTP-head identity without touching a
     /// bridge, GPU, cache, or `Arc`.
+    #[must_use]
     pub fn resolve_config(
         cfg: &Glm52MtpHeadLocalWorkletConfig,
     ) -> Glm52MtpHeadLocalWorkletResolved {

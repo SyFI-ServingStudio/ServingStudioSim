@@ -63,6 +63,7 @@ pub enum PendingOrder {
 }
 
 impl PendingOrder {
+    #[must_use]
     pub fn new(kind: PendingOrderKind) -> Self {
         match kind {
             PendingOrderKind::SessionStart => Self::SessionStart(SessionStartOrder::new()),
@@ -94,12 +95,12 @@ impl PendingOrderPolicy for PendingOrder {
 
     #[inline]
     fn push(&mut self, candidate: AdmissionCandidate, context: &mut Self::Context) {
-        dispatch!(self, inner => inner.push(candidate, context))
+        dispatch!(self, inner => inner.push(candidate, context));
     }
 
     #[inline]
     fn refresh_head(&mut self, resident_prefix_tokens: &mut dyn FnMut(AdmissionCandidate) -> u32) {
-        dispatch!(self, inner => inner.refresh_head(resident_prefix_tokens))
+        dispatch!(self, inner => inner.refresh_head(resident_prefix_tokens));
     }
 
     #[inline]
@@ -160,6 +161,7 @@ pub struct AdmissionCandidate {
 
 impl AdmissionCandidate {
     #[inline]
+    #[must_use]
     pub fn queued_kv_tokens(self) -> u64 {
         u64::from(self.fresh_prompt_tokens)
             + u64::from(self.session_input.declared_prefix_tokens())

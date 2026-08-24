@@ -6,9 +6,9 @@
 //!
 //! Deviation from L7 design §2.4: the `Flow` trait here takes `on_arrival(Request)`
 //! + `tick(now) -> Vec<OrchAction>` against a `SharedRequests` injected at
-//! construction (signed off in the L5/L6 batch), rather than threading
-//! `&mut RequestStore` per tick. The driver holds an `Rc::clone` of that store to
-//! read lifecycle state back for logging.
+//!   construction (signed off in the L5/L6 batch), rather than threading
+//!   `&mut RequestStore` per tick. The driver holds an `Rc::clone` of that store to
+//!   read lifecycle state back for logging.
 
 use std::time::Instant;
 
@@ -71,7 +71,7 @@ impl EveryN {
 pub enum TerminationCause {
     /// Every request completed (and, under `run_to_end`, the trace was drained).
     DrainComplete,
-    /// `--duration-ms` reached with work still outstanding (default, no run_to_end).
+    /// `--duration-ms` reached with work still outstanding (default, no `run_to_end`).
     DurationReached,
     /// Trace exhausted but in-flight work made no progress for `stuck_threshold`.
     Stuck,
@@ -138,6 +138,7 @@ impl TickCfg {
     /// ticks also shrink the inter-slice gaps the analyzer trace shows (each
     /// slice end snaps to the tick grid). Clamp 0 → 1 µs: a zero step would make
     /// the derived periodic gates (`ticks()` below) divide by zero.
+    #[must_use]
     pub fn new(duration_ms: f64, run_to_end: bool, tick_dt_us: u64) -> Self {
         let tick_dt = Time::from_us(tick_dt_us.max(1));
         Self {
@@ -252,7 +253,7 @@ pub fn run_sim(
                 prev_progress = progress;
                 idle_for = Time::ZERO;
             } else {
-                idle_for = idle_for + sample_dt;
+                idle_for += sample_dt;
                 if idle_for >= cfg.stuck_threshold {
                     break TerminationCause::Stuck;
                 }
@@ -260,7 +261,7 @@ pub fn run_sim(
         }
 
         // 4. Advance clock.
-        clock = clock + cfg.tick_dt;
+        clock += cfg.tick_dt;
     };
 
     finalize(store, logger, clock, last_state_clock)?;
@@ -273,6 +274,20 @@ pub fn run_sim(
     let wall_s = wall_start.elapsed().as_secs_f64();
     let safe_wall = wall_s.max(1e-9);
     let num_gpus = flow.cluster().borrow().num_gpus();
+    // NOTE: `Time` (common/time.rs) is a nanosecond-precision u64 clock, and f64
+    // only represents integers exactly up to 2^52 (~52 simulated days of ns). The
+    // casts below are NOT clock values, though: `all_tok`/`prefill_tok`/`decode_tok`
+    // are accumulated token counts, `completed` a request count, and `num_gpus` a
+    // cluster GPU count — all several orders of magnitude below 2^52 for any
+    // realistic run. They feed only this end-of-run `RunSummary` (written to
+    // summary.json / tracing lines for reporting), never simulation cost/timing
+    // math, so precision loss here is both unreachable at realistic scale and
+    // display-only even if it somehow occurred.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "token/request/gpu counts, not the ns clock; far below 2^52, and only feed the \
+                  display-only end-of-run summary"
+    )]
     let summary = {
         let s = store.borrow();
         let total = s.len() as u64;
@@ -282,11 +297,11 @@ pub fn run_sim(
             .count() as u64;
         let prefill_tok: u64 = s
             .iter_arrived()
-            .map(|(_, record)| record.progress.prefill_tokens_processed as u64)
+            .map(|(_, record)| u64::from(record.progress.prefill_tokens_processed))
             .sum();
         let decode_tok: u64 = s
             .iter_arrived()
-            .map(|(_, record)| record.progress.output_tokens_emitted as u64)
+            .map(|(_, record)| u64::from(record.progress.output_tokens_emitted))
             .sum();
         let all_tok = prefill_tok + decode_tok;
         // Throughput is the *modeled* serving rate: tokens / requests per second
@@ -392,8 +407,8 @@ fn state_agg(store: &RequestStore, now: Time) -> RequestStateEntry {
     let mut n_admitted = 0u64;
     let mut n_completed = 0u64;
     for (_id, rec) in store.iter_admitted() {
-        prefill_tokens_cum += rec.progress.prefill_tokens_processed as u64;
-        decode_tokens_cum += rec.progress.output_tokens_emitted as u64;
+        prefill_tokens_cum += u64::from(rec.progress.prefill_tokens_processed);
+        decode_tokens_cum += u64::from(rec.progress.output_tokens_emitted);
         n_admitted += 1;
         if rec.lifecycle.completed {
             n_completed += 1;
@@ -408,6 +423,13 @@ fn state_agg(store: &RequestStore, now: Time) -> RequestStateEntry {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "these are already-converted Time::as_ms() f64 millisecond values, truncated to f32 \
+              purely for the per-request RequestSloEntry output log (parquet telemetry read by the \
+              analyzer) — not fed back into simulation cost/timing math. f32 only loses sub-ms \
+              precision at these magnitudes, acceptable for reporting"
+)]
 fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
     // Per-token array only when it was logged (empty otherwise) — feeds the
     // `slo-detailed` ITL. The `slo-general` scalars below are computed from the
@@ -419,15 +441,21 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         .iter()
         .map(|t| t.as_ms() as f32)
         .collect();
-    let first_ms = rec.telemetry.first_output_time.map(|time| time.as_ms());
-    let last_ms = rec.telemetry.last_output_time.map(|time| time.as_ms());
+    let first_ms = rec
+        .telemetry
+        .first_output_time
+        .map(super::super::common::time::Time::as_ms);
+    let last_ms = rec
+        .telemetry
+        .last_output_time
+        .map(super::super::common::time::Time::as_ms);
     let ttft_ms =
         first_ms.map(|first_time| (first_time - rec.request.core.arrival_time.as_ms()) as f32);
     let finish_decode_time_ms = last_ms.map(|l| l as f32);
     // Mean inter-token gap = total decode span / number of gaps (tokens − 1).
     let tpot_mean_ms = match (first_ms, last_ms) {
         (Some(first_time), Some(last_time)) if rec.progress.output_tokens_emitted > 1 => Some(
-            ((last_time - first_time) / (rec.progress.output_tokens_emitted - 1) as f64) as f32,
+            ((last_time - first_time) / f64::from(rec.progress.output_tokens_emitted - 1)) as f32,
         ),
         _ => None,
     };

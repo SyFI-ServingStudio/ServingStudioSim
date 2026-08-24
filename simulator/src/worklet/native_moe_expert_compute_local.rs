@@ -1,4 +1,4 @@
-//! Native local MoE expert compute: direct grouped gate-up GEMM, activation,
+//! Native local `MoE` expert compute: direct grouped gate-up GEMM, activation,
 //! then direct grouped down GEMM. BF16 and native FP8 share this exact op graph;
 //! dtype/backend remain ordinary L1 config, not L3 graph selection.
 
@@ -28,6 +28,7 @@ pub struct NativeMoeExpertComputeLocalWorkletConfig {
 }
 
 impl NativeMoeExpertComputeLocalWorkletConfig {
+    #[must_use]
     pub fn split_for_ep(mut template: Self, global_ppm: &[u32]) -> Vec<Self> {
         let ep_size = usize::from(template.ep_size);
         assert!(ep_size > 0, "ep_size must be non-zero");
@@ -71,6 +72,7 @@ pub struct NativeMoeExpertComputeLocalWorklet {
 }
 
 impl NativeMoeExpertComputeLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &NativeMoeExpertComputeLocalWorkletConfig,
     ) -> NativeMoeExpertComputeLocalWorkletResolved {
@@ -180,8 +182,12 @@ impl NativeMoeExpertComputeLocalWorklet {
             .iter()
             .map(|&x| u64::from(x))
             .sum();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "local_ppm sums a per-million routing share of global_expert_selections (a u32), so the routed subset cannot exceed u32::MAX"
+        )]
         let local_routed_tokens =
-            ((u64::from(global_expert_selections) * local_ppm_sum + 999_999) / 1_000_000) as u32;
+            (u64::from(global_expert_selections) * local_ppm_sum).div_ceil(1_000_000) as u32;
         self.act.eval(
             &ElementwiseKernelInput {
                 num_tokens: local_routed_tokens,

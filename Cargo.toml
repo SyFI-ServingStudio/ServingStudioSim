@@ -11,6 +11,9 @@ edition = "2021"
 license-file = "LICENSE"
 publish = false
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "simulator"
 path = "simulator/src/main.rs"
@@ -136,3 +139,19 @@ members = ["simulator/timing-kernel-derive", "simulator/schema-derive", "analyze
 # Nested workspace roots are an error unless the outer one excludes them; the
 # path dependency above still resolves.
 exclude = ["alignment/load_generator/req-frontend"]
+
+# Declared here (rather than only as a CI flag) so the gate travels with the
+# repo and shows up in any local `cargo clippy`. `clippy::all` is exactly the
+# default lint tier (correctness+suspicious+style+complexity+perf). The four
+# cast lints are pedantic-tier but promoted to a standing gate here because
+# this codebase's entire output is numeric performance predictions: a silent
+# truncation/precision-loss bug produces a wrong-but-plausible number, not a
+# crash. Every existing site was triaged (see git history) with either a
+# scoped `#[allow(reason = "...")]` documenting the value's real bound, or a
+# checked conversion.
+[workspace.lints.clippy]
+all = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_precision_loss = "deny"
+cast_possible_wrap = "deny"

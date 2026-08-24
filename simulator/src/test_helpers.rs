@@ -21,9 +21,14 @@ use crate::worker::gpu_cluster::{CostSource, GpuCluster, SharedGpuCluster};
 /// Fixed-cost [`LeafMetrics`] (`time_ms = ms`, no real cost-tree leaves). The
 /// shared building block for the fake L4 models below.
 pub(crate) fn lm(ms: f64) -> LeafMetrics {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "ms is a test fixture cost value; f64 -> f32 narrowing is inconsequential for these hardcoded timings"
+    )]
+    let time_ms = ms as f32;
     LeafMetrics {
         m: Metrics4 {
-            time_ms: ms as f32,
+            time_ms,
             flops: 0.0,
             bytes: 0.0,
             energy_j: 0.0,
@@ -93,9 +98,14 @@ impl IterwiseUnifiedModel for FakeModel {
     ) -> LeafMetrics {
         slots.clear();
         assert_eq!(batch.groups.len(), self.dp_groups as usize);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "self.ms is a test fixture cost value; f64 -> f32 narrowing is inconsequential for these hardcoded timings"
+        )]
+        let time_ms = self.ms as f32;
         LeafMetrics {
             m: Metrics4 {
-                time_ms: self.ms as f32,
+                time_ms,
                 flops: 0.0,
                 bytes: 0.0,
                 energy_j: 0.0,
@@ -211,7 +221,7 @@ impl crate::arch::contract::FfnLayerwiseModel for FakeFfn {
 }
 
 /// Build a `SharedRequests` from `(id, prompt, decode)` tuples. Used by
-/// prefill / unified / hp_unified tests that drive prefill themselves.
+/// prefill / unified / `hp_unified` tests that drive prefill themselves.
 pub(crate) fn shared_with(reqs: &[(u32, u32, u32)]) -> SharedRequests {
     let store = Rc::new(RefCell::new(RequestStore::new()));
     for &(id, prompt, decode) in reqs {

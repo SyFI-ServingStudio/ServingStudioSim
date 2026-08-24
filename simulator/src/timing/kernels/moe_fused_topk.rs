@@ -1,4 +1,4 @@
-//! Qwen fused MoE softmax/top-k router-selection kernel.
+//! Qwen fused `MoE` softmax/top-k router-selection kernel.
 //!
 //! The number of routed tokens is the sole runtime interpolation axis. Expert
 //! count, top-k, and activation dtype identify the fixed production CUDA
@@ -53,9 +53,17 @@ impl KernelSpec for MoeFusedTopkSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|num_tokens| {
+            // Sweep axis values (explicit landmarks, max 262144) are
+            // non-negative integers well under u32::MAX.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "sweep axis values are non-negative integers far below u32::MAX"
+            )]
+            let num_tokens = num_tokens as u32;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("num_tokens", num_tokens as u32)
+                .with("num_tokens", num_tokens)
                 .with("num_experts", config.num_experts.get())
                 .with("top_k", config.top_k)
                 .with("dtype", config.dtype.as_str())
@@ -156,6 +164,10 @@ mod tests {
         assert!(MoeFusedTopkSpec::infeasible_mask(&cfg, &grid).is_empty());
 
         let payloads = MoeFusedTopkSpec::enumerate(&cfg, &grid, "vllm_cuda");
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "num_tokens values come from the sweep grid capped at 262144, far below u32::MAX"
+        )]
         let tokens: HashSet<u32> = payloads
             .iter()
             .map(|payload| payload.fields()["num_tokens"].as_u64().unwrap() as u32)
@@ -203,7 +215,7 @@ mod tests {
 
         let qwen = MoeFusedTopkSpec::enumerate(&cfg, &grid, "vllm_cuda")
             .into_iter()
-            .find(|payload| payload.fields()["num_tokens"] == Value::from(128_u32))
+            .find(|payload| payload.fields()["num_tokens"] == 128_u32)
             .unwrap();
         assert_eq!(
             qwen.fields(),

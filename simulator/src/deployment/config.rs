@@ -70,10 +70,10 @@ pub struct WorkloadSpec {
     #[serde(default)]
     #[param(choices = simulator::sim::TraceTag::CHOICES)]
     pub input_file_tags: Vec<String>,
-    /// Simulation duration (ms); minimum window when run_to_end is set.
+    /// Simulation duration (ms); minimum window when `run_to_end` is set.
     #[param(default = 5000.0)]
     pub duration_ms: f64,
-    /// Keep ticking past duration_ms until every request completes.
+    /// Keep ticking past `duration_ms` until every request completes.
     pub run_to_end: bool,
     /// Request arrival rate (requests/s). Read by `open_loop`; ignored by
     /// `closed_loop`.
@@ -137,14 +137,14 @@ pub struct IoSpec {
     pub log_level: LogLevel,
     /// Suppress per-tick progress chatter on stdout.
     pub quiet: bool,
-    /// Force-refresh perf_api rows while building startup caches.
+    /// Force-refresh `perf_api` rows while building startup caches.
     pub force_cache_build: bool,
     /// Record + persist the full per-token `output_token_times` array on each
     /// `request_slo` row (enables the analyzer's `slo-detailed` ITL metric). OFF
     /// by default: building that per-token array on the sim hot path is the
     /// single largest cost on high-throughput runs (a scattered write per token
     /// per request), and the per-request scalars feeding `slo-general` (ttft,
-    /// tpot mean, last_token_time → E2E) are derived without it. When off, the
+    /// tpot mean, `last_token_time` → E2E) are derived without it. When off, the
     /// worker neither allocates nor appends the array. Turn on only when
     /// per-token granularity (ITL) is actually needed.
     pub log_output_token_times: bool,
@@ -179,6 +179,7 @@ pub enum RunConfig {
 }
 
 impl RunConfig {
+    #[must_use]
     pub fn workload(&self) -> &WorkloadSpec {
         match self {
             RunConfig::Unified(c) => &c.workload,
@@ -187,6 +188,7 @@ impl RunConfig {
         }
     }
 
+    #[must_use]
     pub fn io(&self) -> &IoSpec {
         match self {
             RunConfig::Unified(c) => &c.io,
@@ -198,6 +200,7 @@ impl RunConfig {
     /// The per-deployment stage vocabulary (`code → "category:detail"` names) written
     /// into `run_meta.json` so the analyzer can decode the `request_slo`
     /// stage-transition codes. Barebone and HP unified share `UnifiedStage`.
+    #[must_use]
     pub fn stage_vocab(&self) -> crate::common::StageVocab {
         match self {
             RunConfig::Unified(_) => crate::common::UnifiedStage::VOCAB,

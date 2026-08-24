@@ -1,11 +1,11 @@
-//! `llama3_dp_attn_tp_ffn` — L4 model_arch for Llama3-8B with **split attention /
+//! `llama3_dp_attn_tp_ffn` — L4 `model_arch` for Llama3-8B with **split attention /
 //! FFN parallelism**: attention is sharded over `attn_tp_size` head-parallel ranks
 //! and replicated as `num_dp_groups` independent data-parallel shards; the dense
 //! FFN is sharded over a larger `ffn_tp_size` TP group. DeepSeek-V3-style DP
 //! attention, applied to a dense decoder.
 //!
 //! The DP degree is derived, not configured: `num_dp_groups = ffn_tp_size /
-//! attn_tp_size` (e.g. attn_tp=4, ffn_tp=8 → 2 DP shards of 4 head-parallel ranks
+//! attn_tp_size` (e.g. `attn_tp=4`, `ffn_tp=8` → 2 DP shards of 4 head-parallel ranks
 //! each, all 8 GPUs forming the FFN TP group). One replica spans `ffn_tp_size`
 //! GPUs.
 //!
@@ -17,11 +17,11 @@
 //!     pooled token total (L4 §3.5, TP collective is intra-group symmetric);
 //!   - `attn_block` is fed `attn_tp_size`, `mlp_block` is fed `ffn_tp_size`; the
 //!     two TP worklets are reused unchanged (each takes one `tp_size`);
-//!   - embed / final_norm / lm_head stay replicated (full shapes) over the pooled
+//!   - embed / `final_norm` / `lm_head` stay replicated (full shapes) over the pooled
 //!     token total — a v1 simplification, not per-rank.
 //!
 //! v1 deviation: the attention→FFN **resharding** (an all-to-all moving the
-//! (dp×attn_tp) attention output layout into the ffn_tp layout) is NOT modeled —
+//! (`dp×attn_tp`) attention output layout into the `ffn_tp` layout) is NOT modeled —
 //! deferred. The per-layer cost is attention fan-out + FFN only.
 
 use std::sync::Arc;
@@ -68,7 +68,7 @@ pub struct Llama3DpAttnTpFfnConfigs {
     pub num_dp_groups: u16,
 }
 
-/// Post-resolve aggregate; atomic ops (embed / final_norm / lm_head) carry their
+/// Post-resolve aggregate; atomic ops (embed / `final_norm` / `lm_head`) carry their
 /// kernel config straight through (replicated, no partition).
 pub struct Llama3DpAttnTpFfnResolved {
     pub attn_block: AttnBlockTpWorkletResolved,
@@ -94,7 +94,7 @@ pub struct Llama3DpAttnTpFfnModel {
     pub embed: Op<ElementwiseKernel>,
     pub final_norm: Op<RmsNormKernel>,
     pub lm_head: Op<SingleGemmKernel>,
-    /// CostTree structure compiled once at build (flattened) + its slot count,
+    /// `CostTree` structure compiled once at build (flattened) + its slot count,
     /// so per-iter `eval_iter` only evals leaves + aggregates.
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
@@ -112,6 +112,7 @@ pub struct DpAttnTpFfnParallel {
     pub gpu_name: String,
 }
 
+#[must_use]
 pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3DpAttnTpFfnConfigs {
     let gpu = &parallel.gpu_name;
     let dtype_bytes = model.dtype.size_bytes();
@@ -121,7 +122,7 @@ pub fn build_configs(model: &ModelCfg, parallel: &DpAttnTpFfnParallel) -> Llama3
         "attn_tp_size / ffn_tp_size must be non-zero"
     );
     assert!(
-        parallel.ffn_tp_size % parallel.attn_tp_size == 0,
+        parallel.ffn_tp_size.is_multiple_of(parallel.attn_tp_size),
         "ffn_tp_size {} must be a multiple of attn_tp_size {} (DP groups = ffn_tp/attn_tp)",
         parallel.ffn_tp_size,
         parallel.attn_tp_size
@@ -201,6 +202,7 @@ fn total_kv_bytes_per_token(resolved: &Llama3DpAttnTpFfnResolved) -> Dim {
         * Dim::param("num_layers", resolved.num_layers)
 }
 
+#[must_use]
 pub fn resolve_configs(cfgs: &Llama3DpAttnTpFfnConfigs) -> Llama3DpAttnTpFfnResolved {
     Llama3DpAttnTpFfnResolved {
         attn_block: AttnBlockTpWorklet::resolve_config(&cfgs.attn_block),
@@ -302,8 +304,9 @@ impl Llama3DpAttnTpFfnModel {
     /// Compile the per-iteration cost *structure* once:
     /// `Sum( embed, Scale{num_layers}( Sum( Max{1.0}(attn_block × num_dp_groups),
     /// mlp_block ) ), final_norm, lm_head )`. The `Max` is the DP fan-out — one
-    /// attn_block subtree (own slots) per DP shard; the `Scale` folds the
+    /// `attn_block` subtree (own slots) per DP shard; the `Scale` folds the
     /// homogeneous layers, so the per-layer leaves are minted once.
+    #[must_use]
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let embed = self.embed.compile(&mut b);
@@ -341,15 +344,19 @@ impl Llama3DpAttnTpFfnModel {
         b.finish(root)
     }
 
-    /// CostTree eval: stream this iteration's per-leaf [`LeafMetrics`] through `ev`
+    /// `CostTree` eval: stream this iteration's per-leaf [`LeafMetrics`] through `ev`
     /// in the exact order [`cost_tree`](Self::cost_tree) minted slots: embed (pooled
-    /// tokens), then ONE layer's `num_dp_groups` attn_block evals (one per DP shard,
+    /// tokens), then ONE layer's `num_dp_groups` `attn_block` evals (one per DP shard,
     /// each with that shard's batch) followed by the FFN (pooled tokens) — the
-    /// `Scale{num_layers}` fold multiplies it — then final_norm on pooled tokens
-    /// and lm_head on pooled requests.
+    /// `Scale{num_layers}` fold multiplies it — then `final_norm` on pooled tokens
+    /// and `lm_head` on pooled requests.
     fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
         let m_total: u32 = batch.groups.iter().map(|g| g.batch_tokens).sum();
-        let request_count: u32 = batch.groups.iter().map(|g| g.request_count()).sum();
+        let request_count: u32 = batch
+            .groups
+            .iter()
+            .map(super::contract::ArchGroupInput::request_count)
+            .sum();
         self.embed.eval(
             &ElementwiseKernelInput {
                 num_tokens: m_total,
@@ -380,7 +387,7 @@ impl Llama3DpAttnTpFfnModel {
 
 impl IterwiseUnifiedModel for Llama3DpAttnTpFfnModel {
     fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token.get() as u64
+        u64::from(self.total_kv_bytes_per_token.get())
     }
 
     /// One replica spans the FFN TP group — `ffn_tp_size` GPUs, with the DP

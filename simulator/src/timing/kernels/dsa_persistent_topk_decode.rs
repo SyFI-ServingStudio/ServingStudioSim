@@ -1,8 +1,8 @@
 //! GLM-5.2 DSA persistent decode top-k kernel.
 //!
 //! The cache stays on physical `(batch_size, context_len)` coordinates. Measured
-//! next_n=2 R.4 failures added B23/B24/B39 and C256/C2050/C2897/C5792 to repair
-//! speculative interpolation while retaining all prior next_n=1 and production-
+//! `next_n=2` R.4 failures added B23/B24/B39 and C256/C2050/C2897/C5792 to repair
+//! speculative interpolation while retaining all prior `next_n=1` and production-
 //! boundary samples. This changes neither the cache algorithm nor the public
 //! physical query contract.
 
@@ -91,6 +91,11 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "batch_size/context_len are non-negative sweep-grid coordinates, far below u32::MAX"
+        )]
         grid.expand_2d(|batch_size, context_len| {
             ArgsPayload::new()
                 .with("backend", backend)

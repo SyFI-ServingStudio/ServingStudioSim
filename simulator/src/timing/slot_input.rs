@@ -40,7 +40,7 @@ pub struct AttnPrefillLog {
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
 }
 
-/// Gated DeltaNet causal-convolution prefill fan-in: every request-local
+/// Gated `DeltaNet` causal-convolution prefill fan-in: every request-local
 /// sequence length whose metrics were accumulated into the one fixed leaf.
 #[derive(Clone, Serialize)]
 pub struct GdnCausalConvPrefillLog {

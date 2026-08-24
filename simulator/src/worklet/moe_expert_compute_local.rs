@@ -1,6 +1,6 @@
-//! `MoeExpertComputeLocalWorklet` — per-EP-rank MoE expert compute (the work
-//! between MoE dispatch and MoE combine): optional FP8 input quant →
-//! grouped-up_gate → SwiGLU activation → optional FP8 input quant →
+//! `MoeExpertComputeLocalWorklet` — per-EP-rank `MoE` expert compute (the work
+//! between `MoE` dispatch and `MoE` combine): optional FP8 input quant →
+//! grouped-up_gate → `SwiGLU` activation → optional FP8 input quant →
 //! grouped-down. `Local` group suffix (L3 §1.5): one sync section on ONE GPU,
 //! no collective inside. The arch wraps `ep_size` independent instances of this
 //! worklet under a `Max{1.0}` so the slowest EP rank's expert compute is the
@@ -15,14 +15,14 @@
 //! degenerates, but the same worklet contract handles skewed rank shards.
 //!
 //! Shape per leaf (`moe_intermediate = m_inter`, full-hidden = `h`):
-//!   - gate_up : `(2·m_inter) × h` GEMM, one row per routed (token,expert) pair
+//!   - `gate_up` : `(2·m_inter) × h` GEMM, one row per routed (token,expert) pair
 //!     in this rank's experts; the runtime input is `global_expert_selections =
 //!     num_tokens × top_k` and the kernel splits it across the local experts by
 //!     `local_ppm`.
-//!   - activation : SwiGLU elementwise on this rank's routed-pair count,
+//!   - activation : `SwiGLU` elementwise on this rank's routed-pair count,
 //!     apportioned from `global_expert_selections` by this rank's `local_ppm`
 //!     (on `2·m_inter`-wide partials).
-//!   - gate_up_input_quant / down_input_quant: BF16 → FP8 E4M3 1x128
+//!   - `gate_up_input_quant` / `down_input_quant`: BF16 → FP8 E4M3 1x128
 //!     block quantization over the same final per-rank routed rows. These leaves
 //!     exist only when the grouped GEMMs consume FP8.
 //!   - down : `h × m_inter` GEMM, same global routed-pair input.
@@ -54,7 +54,7 @@ pub struct MoeExpertComputeLocalWorkletConfig {
     pub top_k: u32,
     /// Dtype of the grouped gate/up/down GEMMs.
     pub dtype: DType,
-    /// Dtype of the SwiGLU activation traffic between the GEMMs.
+    /// Dtype of the `SwiGLU` activation traffic between the GEMMs.
     pub activation_dtype: DType,
     pub gpu_name: String,
     pub act_backends: Vec<&'static str>,
@@ -63,7 +63,7 @@ pub struct MoeExpertComputeLocalWorkletConfig {
     pub fp8_grouped_gemm_backends: Vec<&'static str>,
     /// Select the production FlashInfer/TensorRT-LLM block-scale recipe for
     /// FP8 expert GEMMs. When false, FP8 follows the original generic
-    /// `grouped_gemm` backend contract (currently DeepGEMM).
+    /// `grouped_gemm` backend contract (currently `DeepGEMM`).
     pub use_fp8_blockscale_grouped_gemm: bool,
     /// This rank's slice of the global routing distribution — one ppm value per
     /// local expert. `Σ(local_ppm) < TOTAL_PPM` (it is a shard). Uniform callers
@@ -78,6 +78,7 @@ impl MoeExpertComputeLocalWorkletConfig {
     /// the raw shard is deliberately not renormalized: its sum is that rank's
     /// absolute share of global routing mass and therefore part of the grouped
     /// GEMM cache identity.
+    #[must_use]
     pub fn split_for_ep(
         mut template: Self,
         global_ppm: &[u32],
@@ -95,9 +96,7 @@ impl MoeExpertComputeLocalWorkletConfig {
         assert_eq!(
             num_experts % ep,
             0,
-            "num_experts {} must be divisible by ep_size {}",
-            num_experts,
-            ep
+            "num_experts {num_experts} must be divisible by ep_size {ep}"
         );
         let experts_per_rank = num_experts / ep;
         template.local_ppm.clear();
@@ -145,13 +144,14 @@ pub struct MoeExpertComputeLocalWorklet {
 }
 
 impl MoeExpertComputeLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &MoeExpertComputeLocalWorkletConfig,
     ) -> MoeExpertComputeLocalWorkletResolved {
-        let ep = cfg.ep_size as u32;
+        let ep = u32::from(cfg.ep_size);
         assert!(ep > 0, "ep_size must be non-zero");
         assert!(
-            cfg.num_experts.get() % ep == 0,
+            cfg.num_experts.get().is_multiple_of(ep),
             "num_experts {} not divisible by ep_size {}",
             cfg.num_experts,
             ep,
@@ -160,8 +160,13 @@ impl MoeExpertComputeLocalWorklet {
         // survives (folds to the plain count at `.get()`). The grouped GEMM's real
         // expert axis is `local_ppm`, not this count.
         let experts_per_gpu = cfg.num_experts.clone() / Dim::param("ep", ep);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "local_ppm.len() is the local-expert count per GPU, always small"
+        )]
+        let local_ppm_len_u32 = cfg.local_ppm.len() as u32;
         assert_eq!(
-            cfg.local_ppm.len() as u32,
+            local_ppm_len_u32,
             experts_per_gpu.get(),
             "local_ppm len ({}) must equal experts_per_gpu ({})",
             cfg.local_ppm.len(),
@@ -313,7 +318,7 @@ impl MoeExpertComputeLocalWorklet {
         })
     }
 
-    /// CostTree compile: `Sum([gate_up_quant], gate_up, activation,
+    /// `CostTree` compile: `Sum([gate_up_quant], gate_up, activation,
     /// [down_quant], down)`; bracketed slots exist only for FP8 GEMMs.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let r = &self.resolved;
@@ -341,7 +346,7 @@ impl MoeExpertComputeLocalWorklet {
         }
     }
 
-    /// CostTree eval: fill slots in the same optional-quant order as `compile`.
+    /// `CostTree` eval: fill slots in the same optional-quant order as `compile`.
     /// `global_expert_selections` flows straight into the grouped GEMMs (their
     /// caches split it by `local_ppm`); the activation gets this rank's share
     /// from `local_ppm`, matching the grouped-GEMM per-group apportionment.
@@ -397,11 +402,12 @@ impl MoeExpertComputeLocalWorklet {
 /// expert weight). Bake-time helper used by the L4 arch's `build_configs`; not
 /// part of the worklet contract, but co-located so the v1 shape stays in one
 /// file.
+#[must_use]
 pub fn uniform_local_ppm(num_experts: u32, ep_size: u16) -> Vec<u32> {
     assert!(ep_size > 0, "ep_size must be non-zero");
     let ep = u32::from(ep_size);
     assert!(
-        num_experts % ep == 0,
+        num_experts.is_multiple_of(ep),
         "num_experts {num_experts} not divisible by ep_size {ep}"
     );
     let experts_per_gpu = (num_experts / ep) as usize;

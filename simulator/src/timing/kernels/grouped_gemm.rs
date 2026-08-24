@@ -1,8 +1,8 @@
-//! Grouped GEMM kernel: a per-GPU MoE expert-compute cost model, one cached
+//! Grouped GEMM kernel: a per-GPU `MoE` expert-compute cost model, one cached
 //! curve per `(n, k, dtype, local_ppm)` config. Distribution-sensitive op
 //! (L1 design §2.8): the routing distribution shard `local_ppm` is baked into
 //! the Config identity, while the runtime sweep is the scalar
-//! `global_expert_selections` (= num_tokens × top_k, the global token-expert
+//! `global_expert_selections` (= `num_tokens` × `top_k`, the global token-expert
 //! assignment count). The cache stays 1D in `global_expert_selections`.
 //!
 //! `enumerate` is the distribution-sensitive twist: each swept
@@ -69,8 +69,17 @@ impl KernelSpec for GroupedGemmSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "local expert count per EP rank is small, far below u32::MAX"
+        )]
         let num_local_experts = config.local_ppm.len() as u32;
         grid.expand_1d(|global_expert_selections| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "global_expert_selections comes from the profiling grid's token axis: a small, non-negative, pre-curated point far below u32::MAX"
+            )]
             let global_expert_selections = global_expert_selections as u32;
             let per_group_batches = RoutingDistribution::to_per_expert_counts(
                 global_expert_selections,

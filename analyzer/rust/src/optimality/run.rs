@@ -93,7 +93,14 @@ pub async fn run_optimality(
     let gpu_count_by_worker: HashMap<(String, u16), f64> = worker_gpu_counts
         .unwrap_or_default()
         .into_iter()
-        .map(|(pool_tag, worker_id, gpu_count)| ((pool_tag, worker_id), gpu_count.max(1) as f64))
+        .map(|(pool_tag, worker_id, gpu_count)| {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "gpu_count is a physical per-worker GPU count, far below 2^53, so it converts to f64 exactly"
+            )]
+            let gpu_count = gpu_count.max(1) as f64;
+            ((pool_tag, worker_id), gpu_count)
+        })
         .collect();
 
     // Hardware rate ceilings (R5) + grid-peak ceilings (R3).

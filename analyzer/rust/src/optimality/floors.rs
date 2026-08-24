@@ -144,7 +144,7 @@ pub(super) async fn compute_saturated_run_labels(
     let mut levels = rollup_levels(&by_worker);
     let normalization = f64::from(replication_factor);
     for ((pool_tag, worker_id), totals) in &by_worker {
-        let mut saturated_totals = totals.clone();
+        let mut saturated_totals = *totals;
         saturated_totals.scale(normalization);
         levels.insert(saturated_worker_key(pool_tag, *worker_id), saturated_totals);
     }

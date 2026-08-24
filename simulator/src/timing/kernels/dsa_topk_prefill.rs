@@ -64,6 +64,12 @@ impl KernelSpec for DsaTopkPrefillSpec {
         // The production backend requires 0 < num_queries <= num_keys. Keep the
         // rectangular interpolation grid, but never profile its invalid M>N corner.
         grid.expand_2d(|num_queries, num_keys| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_keys is a non-negative Axis::values sweep coordinate, capped at 1,048,576, \
+                          far below u32::MAX"
+            )]
             let padded_logits_bytes = num_queries
                 * f64::from(logits_row_stride(num_keys as u32))
                 * f64::from(DType::Fp32.size_bytes());
@@ -77,10 +83,27 @@ impl KernelSpec for DsaTopkPrefillSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_2d(|num_queries, num_keys| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_keys is a non-negative Axis::values sweep coordinate, capped at 1,048,576, \
+                          far below u32::MAX"
+            )]
             let num_keys = num_keys as u32;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("num_queries", num_queries as u32)
+                .with(
+                    "num_queries",
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "num_queries is a non-negative Axis::values sweep coordinate, capped at \
+                                  65,536, far below u32::MAX"
+                    )]
+                    {
+                        num_queries as u32
+                    },
+                )
                 .with("num_keys", num_keys)
                 .with("num_sequences", config.num_sequences)
                 .with("top_k", config.top_k)
@@ -104,7 +127,7 @@ impl KernelSpec for DsaTopkPrefillSpec {
 /// renormalizes over the surviving corners, so the grid stays rectangular.
 const MAX_PROFILE_ALLOCATION_BYTES: f64 = 32.0 * 1024.0 * 1024.0 * 1024.0;
 
-/// DeepGEMM logits pad N to 256 and retain one additional 256-column tile.
+/// `DeepGEMM` logits pad N to 256 and retain one additional 256-column tile.
 fn logits_row_stride(num_keys: u32) -> u32 {
     num_keys.div_ceil(256) * 256 + 256
 }

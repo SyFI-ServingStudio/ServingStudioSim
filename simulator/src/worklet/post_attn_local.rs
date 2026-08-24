@@ -1,10 +1,10 @@
 //! `PostAttnLocalWorklet` — single-GPU post-attention section of a dense decoder
-//! layer: o_proj → post-attn RMSNorm → MLP (fused up_gate GEMM → SwiGLU
+//! layer: `o_proj` → post-attn `RMSNorm` → MLP (fused `up_gate` GEMM → `SwiGLU`
 //! activation → down GEMM). `Local` group suffix (L3 §1.5): 1 GPU, no
 //! collective.
 //!
-//! SwiGLU activation is modeled with the byte-keyed `ElementwiseKernel`: the
-//! fused up_gate GEMM emits `2·intermediate` elements/token (gate‖up concat),
+//! `SwiGLU` activation is modeled with the byte-keyed `ElementwiseKernel`: the
+//! fused `up_gate` GEMM emits `2·intermediate` elements/token (gate‖up concat),
 //! the activation reads those and writes `intermediate` elements/token. So
 //! `input_bytes_per_token = 2·intermediate·dtype_bytes`,
 //! `output_bytes_per_token = intermediate·dtype_bytes`.
@@ -61,6 +61,7 @@ pub struct PostAttnLocalWorklet {
 }
 
 impl PostAttnLocalWorklet {
+    #[must_use]
     pub fn resolve_config(cfg: &PostAttnLocalWorkletConfig) -> PostAttnLocalWorkletResolved {
         let dtype_bytes = cfg.dtype.size_bytes();
         let bytes = Dim::param("bytes", dtype_bytes);
@@ -164,8 +165,8 @@ impl PostAttnLocalWorklet {
         })
     }
 
-    /// CostTree compile: sum over the five atomic ops (o_proj, post_norm,
-    /// up_gate, act, down), wrapped in a `Labeled` node with the worklet identity
+    /// `CostTree` compile: sum over the five atomic ops (`o_proj`, `post_norm`,
+    /// `up_gate`, act, down), wrapped in a `Labeled` node with the worklet identity
     /// + partition/shape annotation (the old `Describe` header lines).
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let label = format!(
@@ -184,7 +185,7 @@ impl PostAttnLocalWorklet {
         }
     }
 
-    /// CostTree eval: fill o_proj, post_norm, up_gate, act, down slots in that
+    /// `CostTree` eval: fill `o_proj`, `post_norm`, `up_gate`, act, down slots in that
     /// order, matching `compile` so `cursor` tracks the minted slots.
     pub fn eval(&self, input: &PostAttnLocalWorkletInput, ev: &mut Evaluator) {
         let m = input.batch_tokens;

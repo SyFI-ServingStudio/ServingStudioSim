@@ -197,6 +197,10 @@ mod tests {
     use std::fs::File;
 
     fn slo_entry(id: u32, times: Vec<f32>) -> RequestSloEntry {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "times is a small test-fixture Vec of sample timestamps, its length is far below u32::MAX"
+        )]
         let num = times.len() as u32;
         let finish = times.last().copied();
         RequestSloEntry {

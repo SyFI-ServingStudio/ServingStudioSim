@@ -123,9 +123,20 @@ fn tpot_stats_ms(times_ms: &[f32]) -> (Option<f32>, Option<f32>, Option<f32>, Op
     }
     let mut gaps: Vec<f32> = times_ms.windows(2).map(|w| w[1] - w[0]).collect();
     let n = gaps.len();
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "n is the per-request output token count, far under f32's 24-bit exact integer range"
+    )]
     let mean = gaps.iter().sum::<f32>() / n as f32;
     let max = gaps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let kth = |gaps: &mut [f32], p: f64| -> f32 {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "n is a per-request output token count (far under 2^53); p is a percentile in \
+                      [0, 1] so p * (n - 1) is non-negative and rounds to a valid in-range index"
+        )]
         let idx = ((p * (n - 1) as f64).round() as usize).min(n - 1);
         *gaps.select_nth_unstable_by(idx, f32::total_cmp).1
     };
@@ -136,7 +147,7 @@ fn tpot_stats_ms(times_ms: &[f32]) -> (Option<f32>, Option<f32>, Option<f32>, Op
 
 /// One HP group's input context for a `cost_log` row — the per-iteration
 /// `input_section` (see `simulator/src/log/README.md`), one per `ArchGroupInput` the worker
-/// fed the model_arch. Prefill is kept full (`prefill_chunk_pairs`, moved over
+/// fed the `model_arch`. Prefill is kept full (`prefill_chunk_pairs`, moved over
 /// un-split — the writer thread splits `(prefix, append)` into the two parallel
 /// list columns); decode is aggregated to `decode_request_count` /
 /// `decode_kv_total` (the per-decode KV-length list is the size driver and is
@@ -153,7 +164,7 @@ pub struct GroupInputLog {
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
 }
 
-/// One `cost_log` row — a whole-iteration cost query via the compiled CostTree.
+/// One `cost_log` row — a whole-iteration cost query via the compiled `CostTree`.
 /// `groups` is the per-iteration input context (one entry per HP group);
 /// `slot_time_ms` / `slot_coverage` are the per-slot cost breakdown (positions
 /// named by the matching per-worker `cost_manifest/` sidecar); the scalars are
@@ -195,7 +206,7 @@ pub struct CostLogEntry {
     /// belonging to this row (the per-slot cost breakdown length).
     pub slot_len: usize,
     /// Number of entries in [`CostLogChunk::slot_inputs`] belonging to this row.
-    /// Zero only for models that do not expose a compiled CostTree.
+    /// Zero only for models that do not expose a compiled `CostTree`.
     pub slot_input_len: usize,
 }
 
@@ -206,7 +217,7 @@ pub struct CostLogEntry {
 /// instead of allocating an owned `Vec` per row. The writer walks all four with
 /// cursors keyed by each row's `*_len`.
 pub struct CostLogChunk {
-    /// Stable pool tag for every row in this chunk. A worker owns one CostLogger,
+    /// Stable pool tag for every row in this chunk. A worker owns one `CostLogger`,
     /// so the whole chunk belongs to one `(pool_tag, worker_id)` stream.
     pub pool_tag: &'static str,
     pub entries: Vec<CostLogEntry>,
@@ -227,6 +238,7 @@ pub struct CostLogChunk {
 }
 
 impl CostLogChunk {
+    #[must_use]
     pub fn with_capacity(
         pool_tag: &'static str,
         row_capacity: usize,
@@ -247,10 +259,12 @@ impl CostLogChunk {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -845,8 +859,16 @@ mod tests {
     fn slo_entry(id: u32, times: Vec<f32>) -> RequestSloEntry {
         // Mirror `sim::run::slo_entry`: the general scalars are computed from
         // first/last/count, not the array, so they survive the array being off.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "times is a test fixture with a handful of entries, far under u32::MAX"
+        )]
         let num = times.len() as u32;
         let finish = times.last().copied();
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "num is a test fixture length (a handful of entries), far under f32's 24-bit exact integer range"
+        )]
         let tpot_mean = if num > 1 {
             Some((times[num as usize - 1] - times[0]) / (num - 1) as f32)
         } else {

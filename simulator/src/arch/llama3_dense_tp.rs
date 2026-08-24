@@ -1,8 +1,8 @@
-//! `llama3_dense_tp` — L4 model_arch for Llama3-8B dense under Megatron tensor
+//! `llama3_dense_tp` — L4 `model_arch` for Llama3-8B dense under Megatron tensor
 //! parallelism (`tp_size` ranks).
 //!
 //! Wires the two `TP` worklets (attn-block / mlp-block) per layer, plus an
-//! embedding placeholder + final-norm + lm_head, into an iter-wise unified model.
+//! embedding placeholder + final-norm + `lm_head`, into an iter-wise unified model.
 //! Mirrors `llama3_dense`'s build shape (`build_configs` / `resolve_configs` /
 //! `build`) and `IterwiseUnifiedModel`, but each layer is two sync sections
 //! (attn-block all-reduce, then mlp-block all-reduce) instead of three local
@@ -11,7 +11,7 @@
 //! Deviations from L4 design.md for this v1 TP vertical (see plan):
 //!   - only TP is sharded (head-split lives inside the attn-block worklet); HP
 //!     (`num_hp_groups`) stays 1, EP/MoE deferred;
-//!   - embed / final_norm / lm_head are kept **replicated (full shapes)** — no
+//!   - embed / `final_norm` / `lm_head` are kept **replicated (full shapes)** — no
 //!     vocab-parallel split yet;
 //!   - one worklet instance per type, reused across `num_layers` via the
 //!     `Scale{num_layers}` fold (not per-layer `build`);
@@ -60,7 +60,7 @@ pub struct Llama3DenseTpConfigs {
     pub tp_size: u16,
 }
 
-/// Post-resolve aggregate; atomic ops (embed / final_norm / lm_head) carry their
+/// Post-resolve aggregate; atomic ops (embed / `final_norm` / `lm_head`) carry their
 /// kernel config straight through (replicated, no partition).
 pub struct Llama3DenseTpResolved {
     pub attn_block: AttnBlockTpWorkletResolved,
@@ -84,7 +84,7 @@ pub struct Llama3DenseTpModel {
     pub embed: Op<ElementwiseKernel>,
     pub final_norm: Op<RmsNormKernel>,
     pub lm_head: Op<SingleGemmKernel>,
-    /// CostTree structure compiled once at build (flattened) + its slot count,
+    /// `CostTree` structure compiled once at build (flattened) + its slot count,
     /// so per-iter `eval_iter` only evals leaves + aggregates.
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
@@ -100,6 +100,7 @@ pub struct DenseTpParallel {
     pub gpu_name: String,
 }
 
+#[must_use]
 pub fn build_configs(model: &ModelCfg, parallel: &DenseTpParallel) -> Llama3DenseTpConfigs {
     let gpu = &parallel.gpu_name;
     let dtype_bytes = model.dtype.size_bytes();
@@ -177,6 +178,7 @@ fn total_kv_bytes_per_token(resolved: &Llama3DenseTpResolved) -> Dim {
         * Dim::param("num_layers", resolved.num_layers)
 }
 
+#[must_use]
 pub fn resolve_configs(cfgs: &Llama3DenseTpConfigs) -> Llama3DenseTpResolved {
     Llama3DenseTpResolved {
         attn_block: AttnBlockTpWorklet::resolve_config(&cfgs.attn_block),
@@ -273,6 +275,7 @@ impl Llama3DenseTpModel {
     /// `Sum( embed, Scale{num_layers}( Sum(attn_block, mlp_block) ),
     /// final_norm, lm_head )`. The `Scale` folds the homogeneous layers — the
     /// per-layer leaves are minted once, matching the `eval_iter` fold.
+    #[must_use]
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let embed = self.embed.compile(&mut b);
@@ -301,10 +304,10 @@ impl Llama3DenseTpModel {
         b.finish(root)
     }
 
-    /// CostTree eval: stream this iteration's per-leaf [`LeafMetrics`] through
+    /// `CostTree` eval: stream this iteration's per-leaf [`LeafMetrics`] through
     /// `ev` in the exact order [`cost_tree`](Self::cost_tree) minted slots
-    /// (embed, then ONE layer's attn_block/mlp_block — the `Scale{num_layers}`
-    /// fold multiplies it — then final_norm, lm_head).
+    /// (embed, then ONE layer's `attn_block/mlp_block` — the `Scale{num_layers}`
+    /// fold multiplies it — then `final_norm`, `lm_head`).
     fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
         let g = &batch.groups[0];
         let batch_tokens = g.batch_tokens;
@@ -334,7 +337,7 @@ impl Llama3DenseTpModel {
 
 impl IterwiseUnifiedModel for Llama3DenseTpModel {
     fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token.get() as u64
+        u64::from(self.total_kv_bytes_per_token.get())
     }
 
     /// One replica spans the `tp_size` ranks of the TP group (no HP/EP nesting in

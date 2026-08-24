@@ -32,7 +32,12 @@ impl Cache for Cache1DLinear {
                 });
                 continue;
             }
-            rows.push((x as f32, Metrics4::from_sample(sample)));
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "sweep coordinates are deliberately stored as f32 in this interpolation cache; the profiled grid values (token/batch/byte counts) are well within f32's exact-integer range"
+            )]
+            let x_f32 = x as f32;
+            rows.push((x_f32, Metrics4::from_sample(sample)));
         }
         rows.sort_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0));
 
@@ -74,7 +79,12 @@ impl Cache for Cache1DLinear {
             // 0-time result can't pass silently as a real measurement downstream.
             return LeafMetrics::MISS;
         }
-        let (m, extrapolated) = self.interpolate(x as f32);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "sweep coordinates are deliberately stored as f32 in this interpolation cache; the queried grid values (token/batch/byte counts) are well within f32's exact-integer range"
+        )]
+        let x_f32 = x as f32;
+        let (m, extrapolated) = self.interpolate(x_f32);
         LeafMetrics {
             m: m.clamped(),
             coverage: if extrapolated {

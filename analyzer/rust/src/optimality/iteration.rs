@@ -354,6 +354,10 @@ async fn fold_exact_iteration(
     let (gpu_name, gpu_count) = gpu_override
         .map(|(gpu_name, gpu_count)| (gpu_name.to_owned(), gpu_count.max(1)))
         .unwrap_or((discovered_gpu_name, discovered_gpu_count));
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "gpu_count is a physical per-worker GPU count, far below 2^53, so it converts to f64 exactly"
+    )]
     let gpu_count = gpu_count as f64;
     // `gpu/spec.json` is read from the checkout that produced this run.
     let (gpu_spec_matched, gpu_spec) = owning_repo_root(log_dir)

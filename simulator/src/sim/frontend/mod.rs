@@ -43,6 +43,7 @@ pub struct TraceFrontend<Definition: RequestDefinition = TextGenerationDefinitio
 }
 
 impl<Definition: RequestDefinition> TraceFrontend<Definition> {
+    #[must_use]
     pub fn source_identities(&self) -> &SourceIdentities {
         &self.source_identities
     }
@@ -50,7 +51,7 @@ impl<Definition: RequestDefinition> TraceFrontend<Definition> {
 
 /// One row of the normalized plan, in the source's own identifiers.
 ///
-/// This is the artifact a differential test compares against TraceLab's export.
+/// This is the artifact a differential test compares against `TraceLab`'s export.
 /// It is deliberately stated in source ids and resolved causal links rather than
 /// in dense storage ordinals: dense ids are this simulator's private choice,
 /// while the plan is the thing both systems must agree on.
@@ -73,6 +74,7 @@ impl TraceFrontend<TextGenerationDefinition> {
     /// Round indices and predecessors are recovered from session membership in
     /// row order rather than read back from a column, so the plan reflects the
     /// chain this simulator will actually execute.
+    #[must_use]
     pub fn plan_rows(&self) -> Vec<PlanRow> {
         let mut rounds_seen: std::collections::HashMap<u32, usize> =
             std::collections::HashMap::new();
@@ -83,8 +85,7 @@ impl TraceFrontend<TextGenerationDefinition> {
             let release = &request.release;
             let session_id = release
                 .session
-                .map(|session| session.session_id)
-                .unwrap_or(u32::MAX);
+                .map_or(u32::MAX, |session| session.session_id);
             let round_idx = *rounds_seen
                 .entry(session_id)
                 .and_modify(|count| *count += 1)
@@ -116,8 +117,7 @@ impl TraceFrontend<TextGenerationDefinition> {
                     "{:.6}",
                     release
                         .session
-                        .map(|session| session.tool_wait_after.as_ms())
-                        .unwrap_or(0.0)
+                        .map_or(0.0, |session| session.tool_wait_after.as_ms())
                 ),
             });
         }
@@ -145,10 +145,12 @@ impl TraceFrontend<TextGenerationDefinition> {
 }
 
 impl<Definition: RequestDefinition> TraceFrontend<Definition> {
+    #[must_use]
     pub fn expected_count(&self) -> usize {
         self.scheduled_requests.len()
     }
 
+    #[must_use]
     pub fn exhausted(&self) -> bool {
         self.emitted >= self.scheduled_requests.len()
     }
@@ -173,14 +175,17 @@ impl<Definition: RequestDefinition> TraceFrontend<Definition> {
             .on_completion(&self.releases, request, now);
     }
 
+    #[must_use]
     pub fn in_flight(&self) -> u64 {
         self.emitted as u64 - self.completed
     }
 
+    #[must_use]
     pub fn submitted(&self) -> u64 {
         self.emitted as u64
     }
 
+    #[must_use]
     pub fn num_completed(&self) -> u64 {
         self.completed
     }
@@ -425,7 +430,7 @@ mod tests {
         path
     }
 
-    /// Write the canonical TraceLab execution trace used by the v2 tests.
+    /// Write the canonical `TraceLab` execution trace used by the v2 tests.
     ///
     /// Session `b` arrives first and has two rounds; session `a` arrives later.
     /// The identifiers are opaque strings whose lexicographic order disagrees
@@ -661,7 +666,7 @@ mod tests {
     fn drain_pairs(fe: &mut TraceFrontend, now_ms: f64) -> Vec<(RequestId, f64)> {
         let mut out = Vec::new();
         fe.drain_due(Time::from_ms(now_ms), |request| {
-            out.push((request.core.id, request.core.arrival_time.as_ms()))
+            out.push((request.core.id, request.core.arrival_time.as_ms()));
         });
         out
     }

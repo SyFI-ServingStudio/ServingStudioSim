@@ -53,6 +53,11 @@ pub(super) async fn read_exact_worker_totals(
         let busy_times = col(batch, "busy")?;
         let wall_starts = col(batch, "w0")?;
         let wall_ends = col(batch, "w1")?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "worker_id is a small nonnegative device index materialized from cost_log; DataFusion returns it as f64 but the value is always a whole small integer"
+        )]
         for row in 0..batch.num_rows() {
             let pool_tag = pool_tags.value(row).to_string();
             let worker_id = value_f64(worker_ids, row)? as u16;
@@ -125,7 +130,14 @@ pub(super) async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
         if first_batch.num_rows() > 0 {
             let max_iter_id = value_f64(col(first_batch, "mx")?, 0)?;
             if max_iter_id.is_finite() {
-                num_iters = max_iter_id as u64 + 1;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "max_iter_id is CAST(MAX(iter_id), BIGINT) - a nonnegative iteration counter far below u64::MAX for any real run"
+                )]
+                {
+                    num_iters = max_iter_id as u64 + 1;
+                }
             }
         }
     }
@@ -134,6 +146,10 @@ pub(super) async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
 
 /// Fold the stride-sampled rows: per row `Σ_slot α·value` for R2..R5 into its
 /// worker, and the same per-slot contributions into `(location, worker)`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is an independently-needed fold input (rate config, plan lookups, and the two mutable accumulators); bundling would just move the arity into a struct without reducing it"
+)]
 pub(super) async fn accumulate_fold(
     ctx: &SessionContext,
     stride: u64,
@@ -165,6 +181,10 @@ pub(super) async fn accumulate_fold(
 
 /// Exact R2..R5 fold for one selected iteration. Unlike the run aggregate this
 /// reads every matching row, so its anchor is exactly the worker's GPU count.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors accumulate_fold's parameter set plus the (pool_tag, worker_id, iter_id) row selector; bundling would just move the arity into a struct without reducing it"
+)]
 pub(super) async fn accumulate_iteration_fold(
     ctx: &SessionContext,
     pool_tag: &str,
@@ -198,6 +218,10 @@ pub(super) async fn accumulate_iteration_fold(
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared fold body for both accumulate_fold and accumulate_iteration_fold; it needs the same query-dependent config, plan lookups, and mutable accumulators as its callers"
+)]
 async fn accumulate_fold_query(
     ctx: &SessionContext,
     sql: &str,
@@ -208,7 +232,7 @@ async fn accumulate_fold_query(
     workers: &mut [WorkerFoldAccumulator],
     sampled_rungs_by_location_worker: &mut HashMap<(u32, usize), [f64; 4]>,
 ) -> Result<u64> {
-    let record_batches = collect(ctx, &sql).await?;
+    let record_batches = collect(ctx, sql).await?;
     let mut sampled_rows = 0u64;
     for batch in &record_batches {
         let pool_tags = string_column(batch, "pool_tag")?;
@@ -220,9 +244,15 @@ async fn accumulate_fold_query(
         let (_, bytes) = list_f32_column(batch, "slot_bytes")?;
         // Cache the resolved (meta, worker index) across the run of rows sharing
         // one (pool, worker, section) — cost_log is worker/iter ordered.
-        let mut cached_plan: Option<((String, u16, String), (&SectionFoldPlan, usize))> = None;
+        type CachedPlan<'a> = ((String, u16, String), (&'a SectionFoldPlan, usize));
+        let mut cached_plan: Option<CachedPlan> = None;
         for row in 0..batch.num_rows() {
             let pool_tag = pool_tags.value(row);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "worker_id is a small nonnegative device index materialized from cost_log; DataFusion returns it as f64 but the value is always a whole small integer"
+            )]
             let worker_id = value_f64(worker_ids, row)? as u16;
             let section = sections.value(row);
             let resolved_plan = match &cached_plan {
@@ -253,6 +283,10 @@ async fn accumulate_fold_query(
             sampled_rows += 1;
             workers[worker_index].sampled_busy_ms += value_f64(total_times, row)?.max(0.0);
 
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "offsets are Arrow ListArray value_offsets (i32), always nonnegative monotonically increasing element indices"
+            )]
             let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
             let mut row_rungs_ms = [0.0f64; 4];
             for (slot, value_index) in (start..end).enumerate() {
@@ -324,8 +358,12 @@ async fn accumulate_fold_query(
                     location_worker_rungs[rung_index] += weighted_rungs_ms[rung_index];
                 }
             }
-            for rung_index in 0..4 {
-                workers[worker_index].sampled_rungs_ms[rung_index] += row_rungs_ms[rung_index];
+            for (worker_rung, row_rung) in workers[worker_index]
+                .sampled_rungs_ms
+                .iter_mut()
+                .zip(row_rungs_ms.iter())
+            {
+                *worker_rung += row_rung;
             }
         }
     }
@@ -405,6 +443,30 @@ fn current_point_uses_compute_throughput(
     current_arithmetic_intensity_flops_per_byte >= hardware_ridge_flops_per_byte
 }
 
+fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    col(batch, name)?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow!("`{name}` is not a Utf8 array"))
+}
+
+/// Downcast a cost_log `List<f32>` column to `(list_offsets, flat_values)`.
+fn list_f32_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<(&'a [i32], &'a Float32Array)> {
+    let list = col(batch, name)?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("`{name}` is not a List array"))?;
+    let vals = list
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| anyhow!("`{name}` is not List<f32>"))?;
+    Ok((list.value_offsets(), vals))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -440,28 +502,4 @@ mod tests {
             7.0
         );
     }
-}
-
-fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
-    col(batch, name)?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| anyhow!("`{name}` is not a Utf8 array"))
-}
-
-/// Downcast a cost_log `List<f32>` column to `(list_offsets, flat_values)`.
-fn list_f32_column<'a>(
-    batch: &'a RecordBatch,
-    name: &str,
-) -> Result<(&'a [i32], &'a Float32Array)> {
-    let list = col(batch, name)?
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| anyhow!("`{name}` is not a List array"))?;
-    let vals = list
-        .values()
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| anyhow!("`{name}` is not List<f32>"))?;
-    Ok((list.value_offsets(), vals))
 }

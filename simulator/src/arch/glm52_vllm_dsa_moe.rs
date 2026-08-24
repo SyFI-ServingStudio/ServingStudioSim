@@ -5,7 +5,7 @@
 //! independently replicated over the EP ranks; decoder layers 0--2 execute the
 //! dense FFN and a full DSA indexer; layers 3--5 reuse the layer-2 index; layers
 //! 6--77 repeat a four-layer cadence containing one full-index layer and three
-//! IndexShare layers; shared-expert compute is conservatively serialized with
+//! `IndexShare` layers; shared-expert compute is conservatively serialized with
 //! routed-expert work.
 //!
 //! Sparse-MoE communication is pure EP and is priced by the **profiled**
@@ -20,7 +20,7 @@
 //! therefore moves the transfer as well as the routed grouped GEMMs and
 //! `finalizeMoeRoutingKernel`. What is still priced flat is `moe_alltoall_prepare`,
 //! whose key is the token count alone; a uniformly-drawn benchmark under-reads a
-//! real skewed layer there by ~9%, which is ~3% of the MoE communication budget.
+//! real skewed layer there by ~9%, which is ~3% of the `MoE` communication budget.
 //!
 //! This is a **separate static graph**, not a flag on the native arch -- the same
 //! split Qwen uses (`qwen3_moe_dp_attn_ep_ffn` / `_fp8_` /
@@ -362,7 +362,7 @@ pub fn build_configs(
     if parallel.ep_size == 0 {
         return Err(fit_failed("ep_size must be positive"));
     }
-    if NUM_EXPERTS % u32::from(parallel.ep_size) != 0 {
+    if !NUM_EXPERTS.is_multiple_of(u32::from(parallel.ep_size)) {
         return Err(fit_failed(format!(
             "num_experts {NUM_EXPERTS} must be divisible by ep_size {}",
             parallel.ep_size
@@ -370,7 +370,7 @@ pub fn build_configs(
     }
     if parallel.nvl_num_gpu == 0
         || parallel.nvl_num_gpu > parallel.ep_size
-        || parallel.ep_size % parallel.nvl_num_gpu != 0
+        || !parallel.ep_size.is_multiple_of(parallel.nvl_num_gpu)
     {
         return Err(fit_failed(format!(
             "nvl_num_gpu {} must be a positive divisor of ep_size {}",
@@ -1250,6 +1250,7 @@ pub fn build(
 }
 
 impl Glm52VllmDsaMoeModel {
+    #[must_use]
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let embedding = labeled_max(
@@ -1709,13 +1710,26 @@ fn destinations_per_token(ep_size: u32, top_k: u32, slot_count: u32) -> f64 {
         if remaining_outside <= 0 {
             return f64::from(ep_size);
         }
-        miss *= remaining_outside as f64 / f64::from(slot_count - i);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "remaining_outside is a slot-count difference (model expert counts, at most \
+                      thousands), far under f64's 52-bit exact integer range"
+        )]
+        let remaining_outside_f64 = remaining_outside as f64;
+        miss *= remaining_outside_f64 / f64::from(slot_count - i);
     }
     f64::from(ep_size) * (1.0 - miss)
 }
 
 /// Wire rows for `tokens` tokens at `rows_per_token`, never rounding a live
 /// transfer down to nothing.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "rows_per_token is a non-negative per-token wire-row multiplier (destinations_per_token, \
+              bounded by ep_size, a small single-digit count); tokens is a per-iteration batch size, \
+              so the product stays far under u32::MAX for any realistic batch"
+)]
 fn rows_from_tokens(tokens: u32, rows_per_token: f64) -> u32 {
     if tokens == 0 {
         return 0;
@@ -2408,6 +2422,11 @@ mod tests {
             expected_slot_count(8, true, Glm52MtpMode::IndexShare),
             1_368 + 216 + 20 + 4 * 2
         );
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "ep is looped from the fixed array [1,2,4,8,16] converted to usize then back \
+                      to u16; always far under u16::MAX"
+        )]
         for ep in [1_u16, 2, 4, 8, 16] {
             let ep = usize::from(ep);
             // The `+ 15` / `+ 20` are the rank-independent collectives: each
@@ -2502,12 +2521,11 @@ mod tests {
                 .nodes
                 .iter()
                 .zip(&manifest.node_labels)
-                .filter_map(|(node, label)| {
-                    matches!(node, FlatCostNode::Max { .. }).then(|| {
-                        label
-                            .as_deref()
-                            .expect("every GLM L4 Max must have a manifest label")
-                    })
+                .filter(|&(node, _label)| matches!(node, FlatCostNode::Max { .. }))
+                .map(|(_node, label)| {
+                    label
+                        .as_deref()
+                        .expect("every GLM L4 Max must have a manifest label")
                 })
                 .collect();
             assert_eq!(expected_slot_count(8, false, mode), expected_slots);
@@ -2646,6 +2664,10 @@ mod tests {
     }
 
     fn group(prefill_tokens: u32, decode_lens: Vec<u32>, pairs: Vec<(u32, u32)>) -> ArchGroupInput {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "decode_lens is a small hardcoded test-fixture vector, far under u32::MAX entries"
+        )]
         let decode_tokens = decode_lens.len() as u32;
         ArchGroupInput {
             batch_tokens: prefill_tokens + decode_tokens,

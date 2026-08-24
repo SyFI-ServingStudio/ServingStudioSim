@@ -119,6 +119,11 @@ impl Deployment for UnifiedDeployment {
             attn_gpu_memory_gb,
         )?;
         let worker_config = WorkerConfig {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "attn_gpu_memory_gb is a positive, hardware-bounded GB figure; the byte count stays well within u64 range"
+            )]
             attn_kv_bytes: (attn_gpu_memory_gb * 1e9) as u64,
             log_output_token_times: cfg.io.log_output_token_times,
             log_stage_transitions: cfg.io.log_stage_transitions,
@@ -410,7 +415,7 @@ impl Deployment for UnifiedDeployment {
 /// The model's dotted-leaf prefix for this deployment (e.g. `unified.embedding`).
 const MODEL_NAME: &str = "unified";
 
-/// The dense / dense_tp archs run on the single-group barebone worker.
+/// The dense / `dense_tp` archs run on the single-group barebone worker.
 fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
         IterWorkerSel::Barebone { .. } => Ok(()),
@@ -430,7 +435,7 @@ fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
     }
 }
 
-/// DP-attention and MoE archs run on the multi-group hp_unified worker.
+/// DP-attention and `MoE` archs run on the multi-group `hp_unified` worker.
 fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
         IterWorkerSel::HpUnified { .. } => Ok(()),

@@ -1,6 +1,6 @@
-//! vLLM-aligned local (non-EP) MoE expert compute, mirroring the four launches
-//! nsys observes per MoE layer: per-token-group FP8 quant, Triton
-//! `fused_moe_kernel` gate/up, SwiGLU, quant, Triton `fused_moe_kernel` down.
+//! vLLM-aligned local (non-EP) `MoE` expert compute, mirroring the four launches
+//! nsys observes per `MoE` layer: per-token-group FP8 quant, Triton
+//! `fused_moe_kernel` gate/up, `SwiGLU`, quant, Triton `fused_moe_kernel` down.
 //!
 //! "vLLM-aligned" here means the *local* path specifically. vLLM has a second
 //! expert-compute realization -- TRT-LLM blockscale grouped GEMM over
@@ -45,6 +45,7 @@ pub struct VllmFp8MoeExpertComputeLocalWorkletConfig {
 }
 
 impl VllmFp8MoeExpertComputeLocalWorkletConfig {
+    #[must_use]
     pub fn split_for_ep(mut template: Self, global_ppm: &[u32]) -> Vec<Self> {
         let ep_size = usize::from(template.ep_size);
         assert!(ep_size > 0, "ep_size must be non-zero");
@@ -87,6 +88,7 @@ pub struct VllmFp8MoeExpertComputeLocalWorklet {
 }
 
 impl VllmFp8MoeExpertComputeLocalWorklet {
+    #[must_use]
     pub fn resolve_config(
         cfg: &VllmFp8MoeExpertComputeLocalWorkletConfig,
     ) -> VllmFp8MoeExpertComputeLocalWorkletResolved {
@@ -228,8 +230,12 @@ impl VllmFp8MoeExpertComputeLocalWorklet {
             .iter()
             .map(|&x| u64::from(x))
             .sum();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "local_ppm sums a per-million routing share of global_expert_selections (a u32), so the routed subset cannot exceed u32::MAX"
+        )]
         let local_routed_tokens =
-            ((u64::from(global_expert_selections) * local_ppm_sum + 999_999) / 1_000_000) as u32;
+            (u64::from(global_expert_selections) * local_ppm_sum).div_ceil(1_000_000) as u32;
         self.act.eval(
             &ElementwiseKernelInput {
                 num_tokens: local_routed_tokens,
@@ -289,7 +295,7 @@ mod tests {
         assert_eq!(down.k.get(), 1536);
     }
 
-    /// The quant halves differ in row layout, and only the gate_up side is
+    /// The quant halves differ in row layout, and only the `gate_up` side is
     /// unexpanded. Asserted here because the two are configured by one shared
     /// closure and are easy to make accidentally symmetric.
     #[test]

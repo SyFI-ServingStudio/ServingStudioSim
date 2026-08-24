@@ -947,6 +947,10 @@ async fn read_exact_rows(
         for row in 0..batch.num_rows() {
             rows.push(ExactRow {
                 section: value_string(col(batch, "section")?, row)?,
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "layer is a transformer layer index bounded by realistic model depths, far below i16::MAX"
+                )]
                 layer: value_f64(col(batch, "layer")?, row)? as i16,
                 wall_start_ms: value_f64(col(batch, "wall_start_ms")?, row)?,
                 total_time_ms: value_f64(col(batch, "total_time_ms")?, row)?,
@@ -1240,6 +1244,10 @@ mod tests {
             batch_id,
             operation_id,
             section_id: 0,
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "operation_id in these test fixtures is a small synthetic index, well within i16 range"
+            )]
             layer: operation_id as i16,
             start_ms,
             end_ms,

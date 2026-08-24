@@ -1,6 +1,6 @@
 //! Build an iter-wise arch model from its [`IterArchSel`] selector — the single
 //! home for the per-arch `build_configs → resolve_configs → build` chain, the
-//! `ModelSpec`→cfg layer-count override, and MoE routing resolution.
+//! `ModelSpec`→cfg layer-count override, and `MoE` routing resolution.
 //!
 //! Every caller that needs a built model goes through here: the `unified` and
 //! `pd` deployments call the per-arch [`dense`] / [`dense_tp`] / … builders and
@@ -46,7 +46,7 @@ pub fn dense_model_cfg(model_spec: &ModelSpec) -> Result<ModelCfg> {
     Ok(cfg)
 }
 
-/// `ModelSpec` → [`MoeModelCfg`] (separate from [`dense_model_cfg`]: MoE configs
+/// `ModelSpec` → [`MoeModelCfg`] (separate from [`dense_model_cfg`]: `MoE` configs
 /// add `num_experts` / `num_experts_per_tok` / `moe_intermediate_size`).
 pub fn moe_model_cfg(model_spec: &ModelSpec) -> Result<MoeModelCfg> {
     let mut cfg = MoeModelCfg::from_json(Path::new(&model_spec.model_config))?;
@@ -63,8 +63,12 @@ pub fn moe_model_cfg(model_spec: &ModelSpec) -> Result<MoeModelCfg> {
 /// homogeneous dense/MoE helpers, this architecture cannot truncate or scale a
 /// representative subset of layers: its full-index and dense/sparse schedules
 /// are tied to exact layer numbers.
-/// Sparse (MoE) decoder layers, read off the checkpoint's own layer schedule
+/// Sparse (`MoE`) decoder layers, read off the checkpoint's own layer schedule
 /// rather than assumed. An expert-popularity profile is keyed by this count.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "decoder layer counts are tens to low hundreds, far under u32::MAX"
+)]
 fn num_sparse_layers(model_cfg: &Glm52ModelCfg) -> u32 {
     model_cfg
         .mlp_layer_types
@@ -87,10 +91,11 @@ fn ensure_glm52_model_spec(model_spec: &ModelSpec) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the synthetic MoE routing distribution the L2 MoE op samples against from the
+/// Resolve the synthetic `MoE` routing distribution the L2 `MoE` op samples against from the
 /// selector's [`RoutingKind`]: `uniform` spreads load evenly over `num_experts`;
 /// `random` draws a `seed`-seeded deterministic skew (0 when unset). Profile-backed
 /// Qwen builds use [`resolve_routing_source`] below.
+#[must_use]
 pub fn resolve_routing(
     kind: RoutingKind,
     seed: Option<u64>,
@@ -176,11 +181,8 @@ fn canonicalize_layerwise_expert_counts(
 ) -> Result<Vec<f32>> {
     anyhow::ensure!(ep_size > 0, "ep_size must be non-zero");
     anyhow::ensure!(
-        expected_num_experts % u32::from(ep_size) == 0,
-        "expert popularity profile {} cannot partition {} experts across ep_size {}",
-        path,
-        expected_num_experts,
-        ep_size
+        expected_num_experts.is_multiple_of(u32::from(ep_size)),
+        "expert popularity profile {path} cannot partition {expected_num_experts} experts across ep_size {ep_size}"
     );
     let experts_per_rank = expected_num_experts as usize / usize::from(ep_size);
     let mut canonical_counts = vec![0u64; expected_num_experts as usize];
@@ -202,9 +204,7 @@ fn canonicalize_layerwise_expert_counts(
                 let rank_total = sorted_expert_counts.iter().try_fold(0u64, |total, count| {
                     total.checked_add(*count).ok_or_else(|| {
                         anyhow::anyhow!(
-                            "expert popularity profile {} layer {} rank count overflow",
-                            path,
-                            layer_index
+                            "expert popularity profile {path} layer {layer_index} rank count overflow"
                         )
                     })
                 })?;
@@ -230,6 +230,10 @@ fn canonicalize_layerwise_expert_counts(
         }
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "counts feed an f32 routing-weight ratio, not an exact accounting figure"
+    )]
     Ok(canonical_counts
         .into_iter()
         .map(|count| count as f32)
@@ -264,10 +268,12 @@ fn load_expert_popularity(
                         .map(|ratio| {
                             anyhow::ensure!(
                                 ratio.is_finite() && ratio >= 0.0,
-                                "expert popularity profile {} contains invalid probability {}",
-                                path,
-                                ratio
+                                "expert popularity profile {path} contains invalid probability {ratio}"
                             );
+                            #[allow(
+                                clippy::cast_possible_truncation,
+                                reason = "ratio feeds an f32 routing-weight; a probability in [0,1] loses only mantissa precision"
+                            )]
                             Ok(ratio as f32)
                         })
                         .collect::<Result<Vec<_>>>()?,
@@ -275,6 +281,10 @@ fn load_expert_popularity(
             } else if profile.counts_by_layer.is_empty()
                 && profile.counts_all_layers.len() == expected_num_experts as usize
             {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "counts feed an f32 routing-weight ratio, not an exact accounting figure"
+                )]
                 Some(
                     profile
                         .counts_all_layers
@@ -301,17 +311,12 @@ fn load_expert_popularity(
             (profile.num_logical_experts, profile.counts_by_layer, None)
         }
         other => bail!(
-            "unsupported expert popularity schema_version {} in {} (supported: 1 legacy, 2)",
-            other,
-            path
+            "unsupported expert popularity schema_version {other} in {path} (supported: 1 legacy, 2)"
         ),
     };
     anyhow::ensure!(
         num_logical_experts == expected_num_experts,
-        "expert popularity profile {} has {} experts, model requires {}",
-        path,
-        num_logical_experts,
-        expected_num_experts
+        "expert popularity profile {path} has {num_logical_experts} experts, model requires {expected_num_experts}"
     );
 
     let ratios: Vec<f32> = if !counts_by_layer.is_empty() {
@@ -320,15 +325,12 @@ fn load_expert_popularity(
         ratios
     } else {
         bail!(
-            "legacy expert popularity profile {} must contain counts_by_layer or {} probabilities_all_layers/counts_all_layers entries",
-            path,
-            expected_num_experts
+            "legacy expert popularity profile {path} must contain counts_by_layer or {expected_num_experts} probabilities_all_layers/counts_all_layers entries"
         );
     };
     anyhow::ensure!(
         ratios.iter().any(|ratio| *ratio > 0.0),
-        "expert popularity profile {} has zero total routing mass",
-        path
+        "expert popularity profile {path} has zero total routing mass"
     );
     Ok(RoutingDistribution::from_profile(&ratios))
 }
@@ -461,6 +463,10 @@ fn ensure_normalized_probabilities(
         })
     })?;
     for (expert_index, (count, probability)) in counts.iter().zip(probabilities).enumerate() {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "routing counts feed an f64 probability ratio for a tolerance check, not exact accounting"
+        )]
         let expected = if total == 0 {
             0.0
         } else {
@@ -489,8 +495,7 @@ pub fn resolve_routing_source(
     if let Some(path) = expert_popularity_file {
         anyhow::ensure!(
             kind == RoutingKind::Uniform,
-            "expert_popularity_file cannot be combined with routing={:?}; omit the profile or use routing=uniform",
-            kind
+            "expert_popularity_file cannot be combined with routing={kind:?}; omit the profile or use routing=uniform"
         );
         return load_expert_popularity(
             path,
@@ -823,8 +828,8 @@ pub fn qwen3_attn(
         .context("building Qwen3 AFD attn-side model (often a missing profile.db row)")
 }
 
-/// Build the AFD ffn-side (layer-wise) Qwen3-MoE model — qkv / o_proj / router /
-/// EP MoE / embed / lm_head. Reuses the iter-wise arch's `build_configs` +
+/// Build the AFD ffn-side (layer-wise) Qwen3-MoE model — qkv / `o_proj` / router /
+/// EP `MoE` / embed / `lm_head`. Reuses the iter-wise arch's `build_configs` +
 /// `resolve_configs` (so the split conserves every leaf). Pairs with [`qwen3_attn`].
 #[allow(clippy::too_many_arguments)]
 pub fn qwen3_ffn_moe(
@@ -1351,9 +1356,9 @@ mod tests {
     #[test]
     fn afd_comm_bytes_match_moesim_formulas() {
         let model = MoeModelCfg::qwen3_235b();
-        let bpe = model.dtype.size_bytes() as u64;
-        let q_dim = model.num_qo_heads.get() as u64 * model.head_dim.get() as u64;
-        let kv_dim = model.num_kv_heads.get() as u64 * model.head_dim.get() as u64;
+        let bpe = u64::from(model.dtype.size_bytes());
+        let q_dim = u64::from(model.num_qo_heads.get()) * u64::from(model.head_dim.get());
+        let kv_dim = u64::from(model.num_kv_heads.get()) * u64::from(model.head_dim.get());
 
         let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
             &model,
@@ -1364,16 +1369,16 @@ mod tests {
         );
         // attn→ffn outgoing bytes: the attention output, q_dim·bpe.
         assert_eq!(
-            attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64,
+            u64::from(attn_cfgs.attn_to_ffn_bytes_per_token.get()),
             q_dim * bpe
         );
         // total KV bytes: 2 (k+v) × kv_heads × head_dim × kv_dtype × layers.
         assert_eq!(
-            attn_cfgs.total_kv_bytes_per_token.get() as u64,
-            2 * model.num_kv_heads.get() as u64
-                * model.head_dim.get() as u64
-                * model.kv_dtype.size_bytes() as u64
-                * model.num_layers as u64
+            u64::from(attn_cfgs.total_kv_bytes_per_token.get()),
+            2 * u64::from(model.num_kv_heads.get())
+                * u64::from(model.head_dim.get())
+                * u64::from(model.kv_dtype.size_bytes())
+                * u64::from(model.num_layers)
         );
         // ffn→attn outgoing bytes (QKV projection) is the symmetric `(q+2kv)·bpe`,
         // computed in `qwen3_ffn_moe_layerwise::build` from the same model dims.
@@ -1381,7 +1386,7 @@ mod tests {
     }
 
     /// FP8 AFD end-to-end config wiring: every GEMM/handoff/KV role goes fp8
-    /// (`bpe = 1`, `deepgemm` backend, `compute_dtype = Fp8E4m3`) while the RMSNorm
+    /// (`bpe = 1`, `deepgemm` backend, `compute_dtype = Fp8E4m3`) while the `RMSNorm`
     /// ops and the model's base `dtype` stay bf16 (`bpe = 2`). Mirrors ref's
     /// `bytes_per_element(p.fp8)` — the attn↔ffn handoffs and KV cache are all
     /// 1 byte/elem in fp8.
@@ -1398,8 +1403,8 @@ mod tests {
         assert_eq!(model.single_gemm_backends(), vec!["deepgemm"]);
         assert_eq!(model.grouped_gemm_backends(), vec!["deepgemm"]);
 
-        let q_dim = model.num_qo_heads.get() as u64 * model.head_dim.get() as u64;
-        let kv_dim = model.num_kv_heads.get() as u64 * model.head_dim.get() as u64;
+        let q_dim = u64::from(model.num_qo_heads.get()) * u64::from(model.head_dim.get());
+        let kv_dim = u64::from(model.num_kv_heads.get()) * u64::from(model.head_dim.get());
 
         // --- attn side ---
         let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
@@ -1411,15 +1416,13 @@ mod tests {
         );
         // Handoff + KV at fp8 = 1 byte/elem.
         assert_eq!(
-            attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64,
-            q_dim * 1
+            u64::from(attn_cfgs.attn_to_ffn_bytes_per_token.get()),
+            q_dim
         );
         assert_eq!(
-            attn_cfgs.total_kv_bytes_per_token.get() as u64,
-            2 * model.num_kv_heads.get() as u64
-                * model.head_dim.get() as u64
-                * 1
-                * model.num_layers as u64
+            u64::from(attn_cfgs.total_kv_bytes_per_token.get()),
+            (2 * u64::from(model.num_kv_heads.get()) * u64::from(model.head_dim.get()))
+                * u64::from(model.num_layers)
         );
         assert_eq!(attn_cfgs.attn.dtype, DType::Bf16);
         assert!(attn_cfgs.attn.fp8);
@@ -1440,8 +1443,8 @@ mod tests {
         let ffn_resolved = crate::arch::qwen3_fp8_ffn_moe_layerwise::resolve_configs(&ffn_cfgs);
         // Symmetric QKV-projection handoff at fp8.
         assert_eq!(
-            ffn_cfgs.ffn_to_attn_bytes_per_token.get() as u64,
-            (q_dim + 2 * kv_dim) * 1
+            u64::from(ffn_cfgs.ffn_to_attn_bytes_per_token.get()),
+            (q_dim + 2 * kv_dim)
         );
         // GEMM roles fp8+deepgemm; RMSNorm roles stay bf16.
         assert_eq!(ffn_cfgs.pre_attn.activation_dtype, DType::Bf16);
@@ -1474,7 +1477,7 @@ mod tests {
         assert_eq!(model.single_gemm_backends(), vec!["torch", "torch_linear"]);
         assert_eq!(model.grouped_gemm_backends(), vec!["torch"]);
 
-        let q_dim = model.num_qo_heads.get() as u64 * model.head_dim.get() as u64;
+        let q_dim = u64::from(model.num_qo_heads.get()) * u64::from(model.head_dim.get());
         let attn_cfgs = crate::arch::qwen3_attn_layerwise::build_configs(
             &model,
             &Qwen3AttnParallel {
@@ -1483,7 +1486,7 @@ mod tests {
             },
         );
         assert_eq!(
-            attn_cfgs.attn_to_ffn_bytes_per_token.get() as u64,
+            u64::from(attn_cfgs.attn_to_ffn_bytes_per_token.get()),
             q_dim * 2
         );
         assert!(!attn_cfgs.attn.fp8);

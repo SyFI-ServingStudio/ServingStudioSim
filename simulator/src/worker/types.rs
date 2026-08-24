@@ -265,7 +265,7 @@ pub enum AttnWorkerEvent {
     /// new iteration. `reqs` may be empty; empty reports are how shards with no local
     /// tokens participate in the all-worker Bootstrap barrier. The controller
     /// aggregates same-slot `IterStart`s across workers into one ffn prolog
-    /// (PRE_ATTN), whose layer-0 QKV returns as `ReadyNotification { slot, 0 }`.
+    /// (`PRE_ATTN`), whose layer-0 QKV returns as `ReadyNotification { slot, 0 }`.
     /// Emitted exactly once per iteration (guarded by the worker's `iter_announced`).
     /// `worker` attributes it (events from all workers share one sink).
     IterStart {
@@ -304,11 +304,11 @@ pub enum AttnWorkerEvent {
 /// `Bootstrap → 0`, `Bridge{upstream} → upstream + 1`, `Terminal → none`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FfnTaskKind {
-    /// embed + pre_attn(0); feeds attn layer 0. Input is local (no pull).
+    /// embed + `pre_attn(0)`; feeds attn layer 0. Input is local (no pull).
     Bootstrap,
-    /// post_attn(upstream) + fused pre_attn(upstream+1); feeds attn layer upstream+1.
+    /// `post_attn(upstream)` + fused `pre_attn(upstream+1)`; feeds attn layer upstream+1.
     Bridge { upstream: u16 },
-    /// post_attn(last) + epilogue; emits the iteration's output token.
+    /// `post_attn(last)` + epilogue; emits the iteration's output token.
     Terminal,
 }
 
@@ -423,7 +423,7 @@ pub struct WorkerConfig {
     /// `kernel_time * gpu_time_multiplier`, modeling inter-kernel overhead not
     /// attributed to any single kernel. 1.0 = no overhead. From the worker
     /// selector; passed to `CostBuffers`, applied where a segment's wall time is
-    /// returned (cost_log stays pre-scale).
+    /// returned (`cost_log` stays pre-scale).
     pub gpu_time_multiplier: f64,
     /// Optional per-iteration prefill token budget (from the worker selector).
     /// `Some(n)`: admission reserves the budget for live decodes (1 tok/req)

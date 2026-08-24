@@ -1061,16 +1061,19 @@ struct SweepCatalogQuery {
 }
 
 impl SweepCatalogQuery {
-    fn filter(self) -> std::result::Result<SweepCatalogFilter, Response> {
+    // `Response` is large (axum wraps a full `http::Response<Body>`), so the
+    // error side is boxed to keep this `Result` cheap to move on the `Ok` path;
+    // the single call site below unboxes it.
+    fn filter(self) -> std::result::Result<SweepCatalogFilter, Box<Response>> {
         if self
             .limit
             .is_some_and(|limit| limit == 0 || limit > MAX_SWEEP_CATALOG_LIMIT)
         {
-            return Err(problem(
+            return Err(Box::new(problem(
                 StatusCode::BAD_REQUEST,
                 "invalid_sweep_catalog_limit",
                 "Sweep catalog limit must be between 1 and 100.",
-            ));
+            )));
         }
         Ok(SweepCatalogFilter {
             status: self.status,
@@ -1085,7 +1088,7 @@ async fn list_sweeps(
 ) -> Response {
     let filter = match query.filter() {
         Ok(filter) => filter,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     sweep_catalog_response(state, filter).await
 }

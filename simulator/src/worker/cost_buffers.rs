@@ -70,7 +70,7 @@ impl Hasher for FlatHasher {
         // its length prefix) route through here, so folding bytes covers the whole key.
         let mut h = self.0;
         for &b in bytes {
-            h ^= b as u64;
+            h ^= u64::from(b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a 64-bit prime
         }
         self.0 = h;
@@ -154,7 +154,7 @@ impl CostBuffers {
         }
     }
 
-    /// Iter-wise convenience constructor: the model exposes one fused CostTree, so
+    /// Iter-wise convenience constructor: the model exposes one fused `CostTree`, so
     /// its manifest is a single `iter` section. Equivalent to [`new`](Self::new)
     /// with `CostManifestDoc::single("iter", model.cost_log_manifest())`.
     pub fn new_iter<M: IterwiseUnifiedModel + ?Sized>(
@@ -197,6 +197,10 @@ impl CostBuffers {
     /// and it never repeats across iterations anyway); ffn passes its small
     /// `tokens_per_group` (which *does* recur across randomly-assigned tasks). `None`
     /// disables caching (iter-wise callers eval once per iteration — nothing repeats).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each arg is a distinct per-call identity/context piece (section, layer, iter/batch ids, groups, cache key, clock, eval closure) documented above"
+    )]
     pub fn run_section<G, F>(
         &mut self,
         section: &'static str,
@@ -221,11 +225,15 @@ impl CostBuffers {
         if let Some(ck) = cache_key {
             self.key_scratch.clear();
             let name = section.as_bytes();
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "section is a hardcoded &'static str cost-section name, far shorter than u32::MAX"
+            )]
             self.key_scratch.push(name.len() as u32);
             for chunk in name.chunks(4) {
                 let mut w = 0u32;
                 for (i, &b) in chunk.iter().enumerate() {
-                    w |= (b as u32) << (8 * i);
+                    w |= u32::from(b) << (8 * i);
                 }
                 self.key_scratch.push(w);
             }
@@ -245,8 +253,8 @@ impl CostBuffers {
                         iter_id,
                         batch_id,
                         wall_start_ms: now.as_ms(),
-                        total_time_ms: agg.m.time_ms as f64,
-                        energy_j: agg.m.energy_j as f64,
+                        total_time_ms: f64::from(agg.m.time_ms),
+                        energy_j: f64::from(agg.m.energy_j),
                         section,
                         layer,
                         group_len: 0,
@@ -279,8 +287,8 @@ impl CostBuffers {
                 iter_id,
                 batch_id,
                 wall_start_ms: now.as_ms(),
-                total_time_ms: agg.m.time_ms as f64,
-                energy_j: agg.m.energy_j as f64,
+                total_time_ms: f64::from(agg.m.time_ms),
+                energy_j: f64::from(agg.m.energy_j),
                 section,
                 layer,
                 // Filled by `logger.record` from the slice lengths.
@@ -323,7 +331,7 @@ impl CostBuffers {
     /// clock; `cost_log` rows are written pre-scale (pure kernel) by the callers
     /// above, so folding a row's `slot_time_ms` still reproduces its `total_time_ms`.
     fn wall_time(&self, agg: &LeafMetrics) -> Time {
-        Time::from_ms(agg.m.time_ms as f64 * self.gpu_time_multiplier)
+        Time::from_ms(f64::from(agg.m.time_ms) * self.gpu_time_multiplier)
     }
 
     /// Iter-wise convenience over [`run_section`](Self::run_section): the whole
@@ -429,10 +437,15 @@ mod tests {
 
     /// One decode-only attention group with the given per-request KV lengths.
     fn grp(kv: &[u32]) -> ArchGroupInput {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "kv is a test fixture with a handful of KV lengths, far under u32::MAX"
+        )]
+        let num_tokens = kv.len() as u32;
         ArchGroupInput {
-            batch_tokens: kv.len() as u32,
+            batch_tokens: num_tokens,
             prefill_tokens: 0,
-            decode_tokens: kv.len() as u32,
+            decode_tokens: num_tokens,
             prefill_chunk_pairs: Vec::new(),
             decode_kv_lens: kv.to_vec(),
             total_kv_len: kv.iter().sum(),

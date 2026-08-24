@@ -399,6 +399,10 @@ struct SimCase {
     slot_ms: Vec<f64>,
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "casts here are kernel/iteration counts and ns durations from one profiling run, far under f64's 2^53 exact-integer range"
+)]
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read_kernel_align(log_dir)?;
     let measured: ParsedTrace = read_json(&input.parsed_nsys)?;
@@ -445,10 +449,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let mut duty_cycle_samples: Vec<DutyCycleSample> = Vec::new();
     let mut kernel_inventory: BTreeMap<String, KernelAggregate> = BTreeMap::new();
     let mut operation_stats: BTreeMap<String, OperationAggregate> = BTreeMap::new();
-    let mut unmapped_measured: BTreeMap<
-        (String, String),
-        (String, usize, Vec<(u64, u64)>, BTreeSet<i64>),
-    > = BTreeMap::new();
+    type UnmappedMeasured =
+        BTreeMap<(String, String), (String, usize, Vec<(u64, u64)>, BTreeSet<i64>)>;
+    let mut unmapped_measured: UnmappedMeasured = BTreeMap::new();
     let mut unmapped_simulated: BTreeMap<String, f64> = BTreeMap::new();
     let mut measured_workload_ms = 0.0;
     let mut measured_mapped_ms = 0.0;
@@ -866,8 +869,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         })
         .collect();
     let kernel_report: Vec<_> = kernel_inventory
-        .into_iter()
-        .map(|(_, item)| {
+        .into_values()
+        .map(|item| {
             let device_count = item.device_ids.len().max(1);
             let replica_calls = item.calls as f64 / device_count as f64;
             let total_union_ns = interval_union_ns(&item.intervals) as f64;
@@ -1042,6 +1045,10 @@ fn kernel_name_index(measured: &ParsedTrace) -> Result<BTreeMap<u64, &str>> {
 /// raw interval. It deliberately stops before any comparison — `run` turns these
 /// rows into operation totals, `timeline` turns the same rows into slices, and
 /// neither can drift from the other about what the GPU did.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "casts here are ns interval-union durations from one profiling run, far under f64's 2^53 exact-integer range"
+)]
 fn measure_iteration(
     measured_iter: &MeasuredIteration,
     inventory: &CompiledInventory,
@@ -1331,7 +1338,7 @@ fn join_mapped_occurrences(
             let device_ordinal = *next_device_ordinal;
             *next_device_ordinal += 1;
             ensure!(
-                occurrence_ordinal.map_or(true, |ordinal| ordinal == device_ordinal),
+                occurrence_ordinal.is_none_or(|ordinal| ordinal == device_ordinal),
                 "mapped row {:?} has inconsistent per-device occurrence ordinals",
                 item.row_id,
             );
@@ -1397,10 +1404,23 @@ async fn load_sim_cases(
         let totals = col(batch, "total_time_ms")?;
         let slots = col(batch, "slot_time_ms")?;
         for row in 0..batch.num_rows() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "iter_id is a non-negative integer index written by our own timing-predict pipeline, stored as f64 by Arrow/Parquet but never fractional or negative"
+            )]
             let case_index = value_f64(ids, row)? as u64;
             let total_ms = value_f64(totals, row)?;
             let slot_ms = value_f32_list(slots, row)?;
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "slot_time_ms is a millisecond duration from our own predict pipeline; converted to ns it stays far under i64::MAX for any realistic run"
+            )]
             let slot_ns: Vec<i64> = slot_ms.iter().map(|v| (v * 1e6).round() as i64).collect();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "node_time returns a summed ns duration bounded by run length, safely within f64's 2^53 exact-integer range"
+            )]
             let reconstructed_ms = node_time(manifest, 0, &slot_ns) as f64 / 1e6;
             ensure!(
                 (reconstructed_ms - total_ms).abs() <= (total_ms.abs() * 1e-3).max(1e-6),
@@ -1719,7 +1739,7 @@ fn load_inventory(path: &Path) -> Result<CompiledInventory> {
 
 fn compile_inventory(doc: FoldedSequenceDoc) -> Result<CompiledInventory> {
     ensure!(
-        matches!(doc.schema_version, 2 | 3 | 4 | 5),
+        matches!(doc.schema_version, 2..=5),
         "labeled kernel sequences schema_version must be 2, 3, 4 or 5"
     );
     ensure!(
@@ -2167,7 +2187,7 @@ fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let middle = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         (sorted[middle - 1] + sorted[middle]) / 2.0
     } else {
         sorted[middle]
@@ -2217,7 +2237,12 @@ fn measured_gpu_cycles_ms(iterations: &[MeasuredIteration]) -> Result<BTreeMap<u
             next_start_ns > start_ns,
             "measured iterations {iteration_id} and {next_iteration_id} have non-increasing first-kernel timestamps"
         );
-        cycles.insert(iteration_id, (next_start_ns - start_ns) as f64 / 1e6);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "difference of two first-kernel timestamps within one profiling run, an ns duration far under f64's 2^53 exact-integer range"
+        )]
+        let cycle_ms = (next_start_ns - start_ns) as f64 / 1e6;
+        cycles.insert(iteration_id, cycle_ms);
     }
     Ok(cycles)
 }
@@ -2258,9 +2283,9 @@ fn occurrence_ns(launches: &[KernelLaunch], synchronizing: bool) -> u64 {
 /// per-occurrence durations over-counts the wall time. With one track the two
 /// terms are the same union and the result is exactly zero, which is what keeps
 /// every single-stream capture's numbers unmoved.
-fn concurrent_hidden_ms_by_device(
-    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
-) -> BTreeMap<i64, f64> {
+type TrackIntervals = BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>;
+
+fn concurrent_hidden_ms_by_device(track_intervals: &TrackIntervals) -> BTreeMap<i64, f64> {
     let mut hidden = BTreeMap::new();
     for (device_id, tracks) in track_intervals {
         if tracks.len() < 2 {
@@ -2273,16 +2298,23 @@ fn concurrent_hidden_ms_by_device(
             .sum();
         let combined: Vec<(u64, u64)> = tracks.values().flatten().copied().collect();
         let overlap = per_track.saturating_sub(interval_union_ns(&combined));
-        hidden.insert(*device_id, overlap as f64 / 1e6);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "overlap is an ns duration within one profiling run, far under f64's 2^53 exact-integer range"
+        )]
+        let overlap_ms = overlap as f64 / 1e6;
+        hidden.insert(*device_id, overlap_ms);
     }
     hidden
 }
 
 /// Each track's own busy time, reported per device so a reader can see which
 /// track the hidden time came from rather than only that some of it was hidden.
-fn track_busy_ms(
-    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
-) -> Vec<serde_json::Value> {
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "busy_union_ms is an ns duration within one profiling run, far under f64's 2^53 exact-integer range"
+)]
+fn track_busy_ms(track_intervals: &TrackIntervals) -> Vec<serde_json::Value> {
     let mut rows = Vec::new();
     for (device_id, tracks) in track_intervals {
         for (track_index, intervals) in tracks {
@@ -2304,7 +2336,7 @@ fn track_busy_ms(
 /// yields nothing and the field stays absent.
 fn hidden_ms_by_operation(
     kernels: &[(String, IterationKernelAggregate)],
-    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
+    track_intervals: &TrackIntervals,
 ) -> BTreeMap<String, f64> {
     let mut hidden: BTreeMap<String, f64> = BTreeMap::new();
     if track_intervals.values().all(|tracks| tracks.len() < 2) {
@@ -2334,10 +2366,7 @@ fn hidden_ms_by_operation(
 /// it telescopes to `Σ per-track busy − union`, which is precisely the hidden
 /// time subtracted from the critical path. Devices are reduced with `max`,
 /// matching how every other per-occurrence quantity folds across ranks.
-fn launches_hidden_ms(
-    launches: &[KernelLaunch],
-    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
-) -> f64 {
+fn launches_hidden_ms(launches: &[KernelLaunch], track_intervals: &TrackIntervals) -> f64 {
     let mut by_device: BTreeMap<(i64, usize), Vec<(u64, u64)>> = BTreeMap::new();
     for launch in launches {
         by_device
@@ -2354,8 +2383,12 @@ fn launches_hidden_ms(
             .range(..track_index)
             .flat_map(|(_, values)| values.iter().copied())
             .collect();
-        *per_device.entry(device_id).or_default() +=
-            interval_overlap_ns(&intervals, &earlier) as f64 / 1e6;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "interval_overlap_ns returns an ns duration within one profiling run, far under f64's 2^53 exact-integer range"
+        )]
+        let overlap_ms = interval_overlap_ns(&intervals, &earlier) as f64 / 1e6;
+        *per_device.entry(device_id).or_default() += overlap_ms;
     }
     per_device.values().copied().fold(0.0f64, f64::max)
 }
@@ -2403,6 +2436,10 @@ fn fraction(part: f64, total: f64) -> Option<f64> {
     (total.is_finite() && total > 0.0).then_some(part / total)
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "sorted.len() is a sample count from one profiling run, far under f64's 2^53 exact-integer range"
+)]
 fn signed_stats(samples: &[f64]) -> Value {
     let mut sorted: Vec<_> = samples.iter().copied().filter(|v| v.is_finite()).collect();
     sorted.sort_by(f64::total_cmp);
@@ -2570,10 +2607,10 @@ mod tests {
         assert_eq!(interval_union_ns(&[(10, 20), (15, 30), (40, 45)]), 25);
     }
 
-    fn tracks(
-        rows: &[(i64, usize, &[(u64, u64)])],
-    ) -> BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>> {
-        let mut out: BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>> = BTreeMap::new();
+    type TrackRow<'a> = (i64, usize, &'a [(u64, u64)]);
+
+    fn tracks(rows: &[TrackRow]) -> TrackIntervals {
+        let mut out: TrackIntervals = BTreeMap::new();
         for (device_id, track_index, intervals) in rows {
             out.entry(*device_id)
                 .or_default()
@@ -3040,6 +3077,10 @@ mod tests {
         let mut samples: Vec<DutyCycleSample> = (0..12)
             .map(|index| {
                 // Vary slightly so the MAD is nonzero, as a real capture's is.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "index % 3 is at most 2, trivially representable as f64 without precision loss"
+                )]
                 let jitter = 1.0 + (index % 3) as f64 * 0.001;
                 duty_sample(first_id + index, stage, steady * jitter, 1.0)
             })

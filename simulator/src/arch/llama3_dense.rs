@@ -1,7 +1,7 @@
-//! `llama3_dense` — L4 model_arch for Llama3-8B dense, local single GPU.
+//! `llama3_dense` — L4 `model_arch` for Llama3-8B dense, local single GPU.
 //!
 //! Wires the three `Local` worklets (pre-attn / attn / post-attn) per layer,
-//! plus an embedding placeholder + final-norm + lm_head, into an iter-wise
+//! plus an embedding placeholder + final-norm + `lm_head`, into an iter-wise
 //! unified model. Follows the L4 build shape (`build_configs` /
 //! `resolve_configs` / `build`) and exposes `IterwiseUnifiedModel`. Dry-run
 //! coverage is no longer a separate traversal: `build` against a dry-run
@@ -10,7 +10,7 @@
 //! Deviations from L4 design.md for this v1 dense vertical (see plan):
 //!   - all worklets are `Local` (tp/ep/hp = 1, no collective);
 //!   - one worklet instance per type, reused across `num_layers` by the
-//!     CostTree `Scale{num_layers}` fold (not per-layer `build`);
+//!     `CostTree` `Scale{num_layers}` fold (not per-layer `build`);
 //!   - embedding modeled as an `ElementwiseKernel` gather placeholder.
 
 use std::sync::Arc;
@@ -43,7 +43,7 @@ const ACT_BACKENDS: &[&str] = &["triton"];
 // kernel engine picks whichever the GPU/profile.db actually has.
 const ATTN_BACKENDS: &[&str] = &["fa2", "fa3"];
 
-/// Raw worklet/op configs (parallelism-agnostic except for the baked gpu_name).
+/// Raw worklet/op configs (parallelism-agnostic except for the baked `gpu_name`).
 pub struct Llama3DenseConfigs {
     pub pre_attn: PreAttnLocalWorkletConfig,
     pub attn: AttnLocalWorkletConfig,
@@ -54,7 +54,7 @@ pub struct Llama3DenseConfigs {
     pub num_layers: u32,
 }
 
-/// Post-resolve aggregate; atomic ops (embed / final_norm / lm_head) carry their
+/// Post-resolve aggregate; atomic ops (embed / `final_norm` / `lm_head`) carry their
 /// kernel config straight through (no partition).
 pub struct Llama3DenseResolved {
     pub pre_attn: PreAttnLocalWorkletResolved,
@@ -79,7 +79,7 @@ pub struct Llama3DenseModel {
     pub embed: Op<ElementwiseKernel>,
     pub final_norm: Op<RmsNormKernel>,
     pub lm_head: Op<SingleGemmKernel>,
-    /// CostTree structure compiled once at build (flattened form) + its slot
+    /// `CostTree` structure compiled once at build (flattened form) + its slot
     /// count, so the per-iter `eval_iter` path only evals leaves +
     /// aggregates — no per-tick recompile/`String` minting.
     cost_flat: Vec<FlatCostNode>,
@@ -95,6 +95,7 @@ pub struct DenseParallel {
     pub gpu_name: String,
 }
 
+#[must_use]
 pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseConfigs {
     let gpu = &parallel.gpu_name;
     let dtype_bytes = model.dtype.size_bytes();
@@ -164,7 +165,7 @@ pub fn build_configs(model: &ModelCfg, parallel: &DenseParallel) -> Llama3DenseC
 /// architecture: `2` (K and V) × `num_kv_heads` × `head_dim` × `kv_dtype` bytes ×
 /// `num_layers`, read off the resolved attention config. Arch-specific (MLA's
 /// compressed latent KV, cross-layer KV sharing, … would compute it differently),
-/// so it lives in the model_arch, not on the parallelism-agnostic `ModelCfg`.
+/// so it lives in the `model_arch`, not on the parallelism-agnostic `ModelCfg`.
 fn total_kv_bytes_per_token(resolved: &Llama3DenseResolved) -> Dim {
     let attn = &resolved.attn.attn;
     2 * attn.num_kv_heads.clone()
@@ -173,6 +174,7 @@ fn total_kv_bytes_per_token(resolved: &Llama3DenseResolved) -> Dim {
         * Dim::param("num_layers", resolved.num_layers)
 }
 
+#[must_use]
 pub fn resolve_configs(cfgs: &Llama3DenseConfigs) -> Llama3DenseResolved {
     Llama3DenseResolved {
         pre_attn: PreAttnLocalWorklet::resolve_config(&cfgs.pre_attn),
@@ -273,6 +275,7 @@ impl Llama3DenseModel {
     /// final_norm, lm_head )`. The `Scale` folds the homogeneous layers — the
     /// per-layer leaves are minted once (not `×num_layers`), matching the
     /// `eval_iter` fold.
+    #[must_use]
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let embed = self.embed.compile(&mut b);
@@ -302,10 +305,10 @@ impl Llama3DenseModel {
         b.finish(root)
     }
 
-    /// CostTree eval: stream this iteration's per-leaf [`LeafMetrics`]
+    /// `CostTree` eval: stream this iteration's per-leaf [`LeafMetrics`]
     /// through `ev` in the exact order [`cost_tree`](Self::cost_tree) minted slots
     /// (embed, then ONE layer's pre/attn/post — the `Scale{num_layers}` fold
-    /// multiplies it, INV-3 — then final_norm, lm_head). Takes a prepared
+    /// multiplies it, INV-3 — then `final_norm`, `lm_head`). Takes a prepared
     /// [`Evaluator`] so the caller picks plain ([`Evaluator::new`]) vs input-
     /// capturing ([`Evaluator::with_inputs`]) — the one eval body backs both
     /// `eval_iter` and `eval_iter_with_inputs`. The cursor must end at `n_slots`.
@@ -341,7 +344,7 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
     fn total_kv_bytes_per_token(&self) -> u64 {
         // Seam B: collapse the symbolic KV footprint to bytes for the worker's
         // KV partition-capacity sizing.
-        self.total_kv_bytes_per_token.get() as u64
+        u64::from(self.total_kv_bytes_per_token.get())
     }
 
     /// Dense *local* arch: one replica runs the whole model on a single GPU (no
@@ -351,14 +354,14 @@ impl IterwiseUnifiedModel for Llama3DenseModel {
         1
     }
 
-    /// The compiled CostTree's serializable manifest (slots + flat aggregation
+    /// The compiled `CostTree`'s serializable manifest (slots + flat aggregation
     /// nodes). Recompiled once at logger setup (off the hot path), so a consumer
     /// can reproduce `total_time_ms` from a `cost_log` row's per-slot breakdown.
     fn cost_log_manifest(&self) -> CostManifest {
         self.cost_tree().manifest()
     }
 
-    /// Per-iter cost via the cached compiled CostTree: fill `slots` with the
+    /// Per-iter cost via the cached compiled `CostTree`: fill `slots` with the
     /// per-leaf [`LeafMetrics`] for this iter (reusing the caller's `Vec`
     /// capacity), then roll up `cost_flat` (the `Scale` fold supplies the
     /// `×num_layers`). One eval pass feeds both the `cost_log` row and the clock.

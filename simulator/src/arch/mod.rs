@@ -1,8 +1,8 @@
-//! `arch` (L4) — per-worker-type model_arch wire files + the L4↔L5 data
-//! contract. Each model_arch picks an L3 worklet set, forwards `ModelCfg` + its
+//! `arch` (L4) — per-worker-type `model_arch` wire files + the L4↔L5 data
+//! contract. Each `model_arch` picks an L3 worklet set, forwards `ModelCfg` + its
 //! own numeric parallel struct (`DenseParallel` / `DenseTpParallel` /
 //! `DpAttnTpFfnParallel` / …) 1:1 into worklet configs, and assembles a
-//! build/cost model. See doc/detailed_design/L4.md.
+//! build/cost model. See `doc/detailed_design/L4.md`.
 
 pub mod build;
 pub mod config;

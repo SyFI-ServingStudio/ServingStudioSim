@@ -232,6 +232,10 @@ impl HostTimeline {
         let lows: Vec<u64> = ordered.iter().map(|window| window.start_ns).collect();
         let highs: Vec<u64> = ordered.iter().map(|window| window.end_ns).collect();
 
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "start_ns/end_ns/anchor_ns are nsys capture-relative ns timestamps, far under i64::MAX (~292 years of ns)"
+        )]
         let mut by_iteration: BTreeMap<u64, IterationHost> = ordered
             .iter()
             .map(|window| {
@@ -264,12 +268,22 @@ impl HostTimeline {
         };
 
         for [thread_index, start, end, string_id] in &sidecar.nvtx_ranges {
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "nsys nvtx timestamps are absolute non-negative nanoseconds, though the sidecar schema stores them as i64"
+            )]
             let (start, end) = (*start as u64, *end as u64);
             for slot in overlapping(start, end) {
                 let window = ordered[slot];
                 let entry = by_iteration
                     .get_mut(&window.iteration_id)
                     .expect("every window has an entry");
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_wrap,
+                    reason = "thread_index is a small non-negative index into the sidecar's own thread table, and the ns offsets are within one iteration window; both are far inside usize/i64 bounds"
+                )]
                 entry
                     .nvtx
                     .entry(*thread_index as usize)
@@ -286,13 +300,29 @@ impl HostTimeline {
 
         for call in &sidecar.api_calls {
             let (thread_index, start, end, string_id, correlation_id) = call.fields()?;
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "nsys api-call timestamps are absolute non-negative nanoseconds, though the sidecar schema stores them as i64"
+            )]
             let (start, end) = (start as u64, end as u64);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                clippy::cast_sign_loss,
+                reason = "string_id indexes the sidecar's own string pool and is non-negative by construction of the host-timeline extractor (a bad index panics on the indexing rather than miscomputing); api_class_index returns a tiny index into the fixed CLASS_ORDER table, well inside i64 range"
+            )]
             let class = api_class_index(&sidecar.strings[string_id as usize]) as i64;
             for slot in overlapping(start, end) {
                 let window = ordered[slot];
                 let entry = by_iteration
                     .get_mut(&window.iteration_id)
                     .expect("every window has an entry");
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_wrap,
+                    reason = "thread_index is a small non-negative index into the sidecar's own thread table, and the ns offsets are within one iteration window; both are far inside usize/i64 bounds"
+                )]
                 entry
                     .api
                     .entry(thread_index as usize)
@@ -376,7 +406,13 @@ fn assign_depth(rows: &mut [[i64; 4]]) {
         while open_ends.last().is_some_and(|last| *last < end) {
             open_ends.pop();
         }
-        row[3] = open_ends.len() as i64;
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "open_ends is a nesting-depth stack bounded by realistic NVTX range nesting, far under i64::MAX"
+        )]
+        {
+            row[3] = open_ends.len() as i64;
+        }
         open_ends.push(end);
     }
 }

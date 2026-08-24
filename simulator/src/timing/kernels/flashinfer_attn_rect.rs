@@ -1,4 +1,4 @@
-//! FlashInfer rect (non-causal) attention kernel: one cached perf model per
+//! `FlashInfer` rect (non-causal) attention kernel: one cached perf model per
 //! attention-dims config, swept over a 2D `(prefix_len, append_len)` grid.
 //!
 //! Rect is the non-causal sibling of `flashinfer_attn_prefill`. Unlike prefill
@@ -64,6 +64,11 @@ impl KernelSpec for FlashinferAttnRectSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "q_len/kv_len are non-negative sweep-grid coordinates, far below u32::MAX"
+        )]
         grid.expand_2d(|q_len, kv_len| {
             ArgsPayload::new()
                 .with("backend", backend)

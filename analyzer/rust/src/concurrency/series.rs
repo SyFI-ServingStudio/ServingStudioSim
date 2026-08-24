@@ -110,6 +110,12 @@ async fn collect_events(ctx: &SessionContext) -> Result<Vec<Event>> {
             if !delta_value.is_finite() || delta_value.fract() != 0.0 {
                 bail!("request_slo produced non-integral concurrency delta {delta_value}");
             }
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "delta_value is checked finite and integral (fract() == 0.0) above, and \
+                          concurrency deltas are +-1 sums over realistic request counts, far below \
+                          i64::MAX"
+            )]
             events.push(Event {
                 time_ms,
                 delta: delta_value as i64,
@@ -135,6 +141,10 @@ fn build_series(events: &[Event], max_points: usize) -> Result<Option<Concurrenc
 
     let n_bins = max_points.min(events.len().max(1));
     let span_ms = last.time_ms;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "n_bins is capped at MAX_POINTS (512), far below 2^53"
+    )]
     let bin_width = span_ms / n_bins as f64;
     let mut active_area = vec![0.0; n_bins];
     let mut active = 0i64;
@@ -144,6 +154,11 @@ fn build_series(events: &[Event], max_points: usize) -> Result<Option<Concurrenc
 
     for event in events {
         if event.time_ms > previous_ms {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "active is a concurrent in-flight request count, bounded by realistic \
+                          request concurrency and far below 2^53"
+            )]
             add_interval_area(
                 &mut active_area,
                 bin_width,
@@ -153,8 +168,13 @@ fn build_series(events: &[Event], max_points: usize) -> Result<Option<Concurrenc
             );
         }
         if event.delta > 0 {
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "guarded by the preceding `event.delta > 0` check"
+            )]
+            let delta_u64 = event.delta as u64;
             request_count = request_count
-                .checked_add(event.delta as u64)
+                .checked_add(delta_u64)
                 .context("concurrency request count overflow")?;
         }
         active = active
@@ -166,13 +186,23 @@ fn build_series(events: &[Event], max_points: usize) -> Result<Option<Concurrenc
                 event.time_ms
             );
         }
-        peak = peak.max(active as u64);
+        #[allow(
+            clippy::cast_sign_loss,
+            reason = "guarded by the preceding `active < 0` bail above"
+        )]
+        {
+            peak = peak.max(active as u64);
+        }
         previous_ms = event.time_ms;
     }
     if active != 0 {
         bail!("concurrency event sweep ended with {active} active requests");
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "index is capped at n_bins <= MAX_POINTS (512), far below 2^53"
+    )]
     let t_ms = (1..=n_bins)
         .map(|index| {
             // Preserve the source span exactly: the UI uses the final point as
@@ -184,6 +214,11 @@ fn build_series(events: &[Event], max_points: usize) -> Result<Option<Concurrenc
             }
         })
         .collect::<Vec<_>>();
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "peak is the exact event-sweep peak concurrent request count, bounded by \
+                  realistic request concurrency and far below 2^53"
+    )]
     let peak_as_float = peak as f64;
     let active = active_area
         .iter()
@@ -210,8 +245,25 @@ pub(crate) fn add_interval_area(
     end_ms: f64,
     active: f64,
 ) {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Rust's float-to-int cast saturates rather than wrapping, and the trailing \
+                  .min()/.saturating_sub() clamp both indices into bins' range regardless"
+    )]
     let first_bin = ((start_ms / bin_width).floor() as usize).min(bins.len() - 1);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Rust's float-to-int cast saturates rather than wrapping, and the trailing \
+                  .min()/.saturating_sub() clamp both indices into bins' range regardless"
+    )]
     let last_bin = (((end_ms / bin_width).ceil() as usize).saturating_sub(1)).min(bins.len() - 1);
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "bin is an index bounded by bins.len(), which is n_bins <= MAX_POINTS (512), far \
+                  below 2^53"
+    )]
     for (bin, area) in bins
         .iter_mut()
         .enumerate()

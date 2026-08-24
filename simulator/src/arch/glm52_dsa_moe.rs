@@ -3,7 +3,7 @@
 //! Attention is TP1 and independently replicated over the EP ranks. Decoder
 //! layers 0--2 execute the dense FFN and a full DSA indexer. Layers 3--5 reuse
 //! the layer-2 index, then layers 6--77 repeat a four-layer cadence containing
-//! one full-index layer and three IndexShare layers. Sparse-MoE communication
+//! one full-index layer and three `IndexShare` layers. Sparse-MoE communication
 //! uses pure EP (`Placement::RoundRobin`). Shared-expert compute is conservatively
 //! serialized with routed-expert work; no auxiliary-stream overlap is claimed.
 //!
@@ -535,7 +535,7 @@ pub fn build_configs(
     if parallel.ep_size == 0 {
         return Err(fit_failed("ep_size must be positive"));
     }
-    if NUM_EXPERTS % u32::from(parallel.ep_size) != 0 {
+    if !NUM_EXPERTS.is_multiple_of(u32::from(parallel.ep_size)) {
         return Err(fit_failed(format!(
             "num_experts {NUM_EXPERTS} must be divisible by ep_size {}",
             parallel.ep_size
@@ -543,7 +543,7 @@ pub fn build_configs(
     }
     if parallel.nvl_num_gpu == 0
         || parallel.nvl_num_gpu > parallel.ep_size
-        || parallel.ep_size % parallel.nvl_num_gpu != 0
+        || !parallel.ep_size.is_multiple_of(parallel.nvl_num_gpu)
     {
         return Err(fit_failed(format!(
             "nvl_num_gpu {} must be a positive divisor of ep_size {}",
@@ -1190,6 +1190,7 @@ pub fn build(
 }
 
 impl Glm52DsaMoeModel {
+    #[must_use]
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let embedding = labeled_max(
@@ -2128,6 +2129,11 @@ mod tests {
             expected_slot_count(8, true, Glm52MtpMode::IndexShare),
             1_368
         );
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "ep is looped from the fixed array [1,2,4,8,16] converted to usize then back \
+                      to u16; always far under u16::MAX"
+        )]
         for ep in [1_u16, 2, 4, 8, 16] {
             let ep = usize::from(ep);
             assert_eq!(
@@ -2219,12 +2225,11 @@ mod tests {
                 .nodes
                 .iter()
                 .zip(&manifest.node_labels)
-                .filter_map(|(node, label)| {
-                    matches!(node, FlatCostNode::Max { .. }).then(|| {
-                        label
-                            .as_deref()
-                            .expect("every GLM L4 Max must have a manifest label")
-                    })
+                .filter(|&(node, _label)| matches!(node, FlatCostNode::Max { .. }))
+                .map(|(_node, label)| {
+                    label
+                        .as_deref()
+                        .expect("every GLM L4 Max must have a manifest label")
                 })
                 .collect();
             assert_eq!(expected_slot_count(8, false, mode), expected_slots);
@@ -2363,6 +2368,10 @@ mod tests {
     }
 
     fn group(prefill_tokens: u32, decode_lens: Vec<u32>, pairs: Vec<(u32, u32)>) -> ArchGroupInput {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "decode_lens is a small hardcoded test-fixture vector, far under u32::MAX entries"
+        )]
         let decode_tokens = decode_lens.len() as u32;
         ArchGroupInput {
             batch_tokens: prefill_tokens + decode_tokens,

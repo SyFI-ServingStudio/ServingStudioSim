@@ -26,7 +26,7 @@ pub trait Cache: Send + Sync {
     where
         Self: Sized;
 
-    /// All four metrics + coverage flags, allocation-free — the CostTree eval
+    /// All four metrics + coverage flags, allocation-free — the `CostTree` eval
     /// path's per-leaf value (streamed into `buf[slot]`, then rolled up by
     /// [`CostTree::aggregate`](crate::timing::CostTree)). NaN/empty → zero, fields
     /// clamped non-negative; off-grid lookups set `EXTRAPOLATED`/`NO_COVERAGE`.
@@ -58,6 +58,7 @@ pub struct PeakRates {
 impl PeakRates {
     /// Element-wise max — the best over a kernel's several backend caches
     /// (best-of-N applies to peaks too).
+    #[must_use]
     pub fn merge(self, other: PeakRates) -> PeakRates {
         PeakRates {
             tflops: self.tflops.max(other.tflops),
@@ -77,16 +78,16 @@ impl PeakRates {
 pub(crate) fn peak_over_cells(cells: impl IntoIterator<Item = Metrics4>) -> PeakRates {
     let mut peak = PeakRates::default();
     for c in cells {
-        let time_ms = c.time_ms as f64;
+        let time_ms = f64::from(c.time_ms);
         if !(time_ms.is_finite() && time_ms > 0.0) {
             continue;
         }
         let secs = time_ms / 1e3;
-        let flops = c.flops as f64;
+        let flops = f64::from(c.flops);
         if flops.is_finite() && flops > 0.0 {
             peak.tflops = peak.tflops.max(flops / secs / 1e12);
         }
-        let bytes = c.bytes as f64;
+        let bytes = f64::from(c.bytes);
         if bytes.is_finite() && bytes > 0.0 {
             peak.gbps = peak.gbps.max(bytes / secs / 1e9);
             if flops.is_finite() && flops > 0.0 {
@@ -176,7 +177,7 @@ pub struct OutlierWarning {
     pub detail: String,
 }
 
-/// Build the cache for one (kernel_kind, cache_kind) pair. `kernel_kind` only
+/// Build the cache for one (`kernel_kind`, `cache_kind`) pair. `kernel_kind` only
 /// flows in so `BuildError::FitFailed` can carry it on the "not yet
 /// implemented" / "fit failed" paths; the cache impl itself never sees it.
 pub fn build_cache(

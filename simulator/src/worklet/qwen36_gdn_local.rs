@@ -1,8 +1,8 @@
-//! Qwen3.6 TP1 Gated DeltaNet attention section in vLLM launch granularity.
+//! Qwen3.6 TP1 Gated `DeltaNet` attention section in vLLM launch granularity.
 //!
 //! This local, self-synchronizing section starts at the decoder's delayed
-//! residual-add + input RMSNorm boundary and ends at the post-attention
-//! residual-add + RMSNorm boundary. The following MoE router therefore consumes
+//! residual-add + input `RMSNorm` boundary and ends at the post-attention
+//! residual-add + `RMSNorm` boundary. The following `MoE` router therefore consumes
 //! normalized hidden states and owns no norm. There are no TP, EP, collective,
 //! or network children.
 
@@ -124,6 +124,7 @@ pub struct Qwen36GdnLocalWorklet {
 }
 
 impl Qwen36GdnLocalWorklet {
+    #[must_use]
     pub fn resolve_config(cfg: &Qwen36GdnLocalWorkletConfig) -> Qwen36GdnLocalWorkletResolved {
         validate_config(cfg)
             .unwrap_or_else(|reason| panic!("invalid Qwen36GdnLocalWorkletConfig: {reason}"));

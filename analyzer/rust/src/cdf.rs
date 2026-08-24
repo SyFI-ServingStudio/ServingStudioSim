@@ -44,6 +44,12 @@ pub struct CdfMarkers {
 pub const MAX_CDF_POINTS: usize = 1000;
 
 /// Linear-interpolated percentile of an already-sorted ascending slice.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "sorted.len() is this metric's sample count, realistically far below 2^53; rank is derived from pct in [0, 100] times that bounded length, so its floor/ceil indices always land within [0, len-1] (nonnegative) and the length-to-f64 conversions used to compute/interpolate rank lose no precision"
+)]
 pub fn percentile_sorted(sorted: &[f64], pct: f64) -> Option<f64> {
     if sorted.is_empty() {
         return None;
@@ -73,6 +79,10 @@ pub fn clean_nonnegative_sorted(samples: &[f64]) -> Vec<f64> {
     v
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "sorted.len() is this metric's sample count, realistically far below 2^53, so the mean's divisor conversion to f64 is exact"
+)]
 pub fn stats(sorted: &[f64]) -> MetricStats {
     if sorted.is_empty() {
         return MetricStats {
@@ -97,6 +107,10 @@ pub fn stats(sorted: &[f64]) -> MetricStats {
 
 /// Evenly-spaced downsample of a sorted slice into `(x, y_pct)` CDF points,
 /// `y_pct` rising to 100 at the last sample (ref's even-index method).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "idx+1 and n are CDF sample indices/counts bounded by the population size, realistically far below 2^53"
+)]
 fn downsample(sorted: &[f64]) -> (Vec<f64>, Vec<f64>) {
     let n = sorted.len();
     let count = n.min(MAX_CDF_POINTS);

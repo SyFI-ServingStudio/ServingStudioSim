@@ -46,7 +46,7 @@
 use serde::ser::{SerializeMap, Serializer};
 use serde::Serialize;
 
-/// Logical type of a `ParamDef`. Serde-serialized as snake_case
+/// Logical type of a `ParamDef`. Serde-serialized as `snake_case`
 /// (`int` / `int_list` / `path_list` / ...).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -143,67 +143,82 @@ impl ParamDef {
         }
     }
 
+    #[must_use]
     pub const fn int(name: &'static str) -> Self {
         Self::bare(name, ParamType::Int)
     }
 
+    #[must_use]
     pub const fn float(name: &'static str) -> Self {
         Self::bare(name, ParamType::Float)
     }
 
+    #[must_use]
     pub const fn bool(name: &'static str) -> Self {
         Self::bare(name, ParamType::Bool)
     }
 
+    #[must_use]
     pub const fn string(name: &'static str) -> Self {
         Self::bare(name, ParamType::String)
     }
 
+    #[must_use]
     pub const fn path(name: &'static str) -> Self {
         Self::bare(name, ParamType::Path)
     }
 
+    #[must_use]
     pub const fn int_list(name: &'static str) -> Self {
         Self::bare(name, ParamType::IntList)
     }
 
+    #[must_use]
     pub const fn float_list(name: &'static str) -> Self {
         Self::bare(name, ParamType::FloatList)
     }
 
+    #[must_use]
     pub const fn string_list(name: &'static str) -> Self {
         Self::bare(name, ParamType::StringList)
     }
 
+    #[must_use]
     pub const fn path_list(name: &'static str) -> Self {
         Self::bare(name, ParamType::PathList)
     }
 
+    #[must_use]
     pub const fn default_int(mut self, v: i64) -> Self {
         self.default = Some(DefaultValue::Int(v));
         self
     }
 
+    #[must_use]
     pub const fn default_float(mut self, v: f64) -> Self {
         self.default = Some(DefaultValue::Float(v));
         self
     }
 
+    #[must_use]
     pub const fn default_bool(mut self, v: bool) -> Self {
         self.default = Some(DefaultValue::Bool(v));
         self
     }
 
+    #[must_use]
     pub const fn default_string(mut self, v: &'static str) -> Self {
         self.default = Some(DefaultValue::String(v));
         self
     }
 
+    #[must_use]
     pub const fn default_path(mut self, v: &'static str) -> Self {
         self.default = Some(DefaultValue::Path(v));
         self
     }
 
+    #[must_use]
     pub const fn desc(mut self, description: &'static str) -> Self {
         self.description = description;
         self
@@ -211,6 +226,7 @@ impl ParamDef {
 
     /// Mark a defaultless clap `Option<T>` flag as omittable. Has no effect when
     /// a default is set (default already implies not-required).
+    #[must_use]
     pub const fn optional(mut self) -> Self {
         self.optional = true;
         self
@@ -220,6 +236,7 @@ impl ParamDef {
     /// (design §1.2.2). Tag a param when changing it changes which kernel/comm
     /// configs must be profiled. See module docs for the safe-direction rule
     /// (when unsure, tag it).
+    #[must_use]
     pub const fn cache_key(mut self) -> Self {
         self.affects_cache = true;
         self
@@ -228,6 +245,7 @@ impl ParamDef {
     /// Attach Rust-authoritative allowed values for a string-like param. The
     /// launcher consumes this as generic schema metadata rather than carrying
     /// deployment-specific enum tables in Python.
+    #[must_use]
     pub const fn choices(mut self, choices: &'static [&'static str]) -> Self {
         self.choices = choices;
         self
@@ -235,6 +253,7 @@ impl ParamDef {
 
     /// Whether this param is required: no default AND not `.optional()`.
     /// Mirrors the `"required": true` field on the JSON wire form.
+    #[must_use]
     pub const fn is_required(&self) -> bool {
         self.default.is_none() && !self.optional
     }

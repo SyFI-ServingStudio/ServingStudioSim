@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused causal-convolution fresh-prefill kernel.
+//! Qwen Gated `DeltaNet` fused causal-convolution fresh-prefill kernel.
 //!
 //! The cache uses the physical `(batch_size, sequence_length)` caller shape.
 //! Power-of-two sequence lengths retain every previously accepted profile row,
@@ -36,7 +36,7 @@ pub struct GdnCausalConvPrefillKernelInput {
 
 impl SweepCoords for GdnCausalConvPrefillKernelInput {
     fn coords(&self) -> Coords {
-        Coords::new([self.batch_size as f64, self.sequence_length as f64])
+        Coords::new([f64::from(self.batch_size), f64::from(self.sequence_length)])
     }
 
     fn coord_field_names() -> &'static [&'static str] {
@@ -64,7 +64,17 @@ impl KernelSpec for GdnCausalConvPrefillSpec {
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         grid.expand_2d(|batch_size, sequence_length| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "batch_size is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let batch_size = batch_size.round() as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "sequence_length is a non-negative Axis sweep coordinate bounded by MAX_TOTAL_TOKENS below"
+            )]
             let sequence_length = sequence_length.round() as u64;
             batch_size
                 .checked_mul(sequence_length)
@@ -83,12 +93,30 @@ impl KernelSpec for GdnCausalConvPrefillSpec {
                 .with("backend", backend)
                 .with(
                     "batch_size",
-                    u32::try_from(batch_size.round() as u64).expect("batch sweep must fit u32"),
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "batch_size is a non-negative sweep coordinate capped under MAX_TOTAL_TOKENS \
+                                  by infeasible_mask's checked_mul, so rounding to u64 is always in range \
+                                  ahead of the checked try_from into u32"
+                    )]
+                    {
+                        u32::try_from(batch_size.round() as u64).expect("batch sweep must fit u32")
+                    },
                 )
                 .with(
                     "sequence_length",
-                    u32::try_from(sequence_length.round() as u64)
-                        .expect("sequence-length sweep must fit u32"),
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "sequence_length is a non-negative sweep coordinate capped under MAX_TOTAL_TOKENS \
+                                  by infeasible_mask's checked_mul, so rounding to u64 is always in range \
+                                  ahead of the checked try_from into u32"
+                    )]
+                    {
+                        u32::try_from(sequence_length.round() as u64)
+                            .expect("sequence-length sweep must fit u32")
+                    },
                 )
                 .with("channels", config.channels.get())
                 .with("kernel_size", config.kernel_size.get())
@@ -221,9 +249,16 @@ mod tests {
         assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 144);
         for (batch_index, &batch) in grid.axes()[0].iter().enumerate() {
             for (length_index, &sequence_length) in sequence_axis.iter().enumerate() {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "batch,sequence_length are non-negative Axis sweep coordinates from \
+                              config(), bounded well under u64 range"
+                )]
+                let expected_masked = (batch as u64) * (sequence_length as u64) > MAX_TOTAL_TOKENS;
                 assert_eq!(
                     mask[batch_index * sequence_axis.len() + length_index],
-                    (batch as u64) * (sequence_length as u64) > MAX_TOTAL_TOKENS,
+                    expected_masked,
                     "B={batch} L={sequence_length}"
                 );
             }
@@ -290,8 +325,15 @@ mod tests {
         let grid = GdnCausalConvPrefillSpec::sweep_grid(&cfg);
         let mask = GdnCausalConvPrefillSpec::infeasible_mask(&cfg, &grid);
         let payloads = GdnCausalConvPrefillSpec::enumerate(&cfg, &grid, "vllm_triton");
-        let cache_cells =
-            grid.expand_2d(|batch, sequence_length| (batch as u64, sequence_length as u64));
+        let cache_cells = grid.expand_2d(|batch, sequence_length| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "batch,sequence_length are non-negative Axis sweep coordinates from config(), \
+                          bounded well under u64 range"
+            )]
+            (batch as u64, sequence_length as u64)
+        });
         let mut feasible = BTreeSet::new();
 
         for ((payload, &masked), &(batch, sequence_length)) in

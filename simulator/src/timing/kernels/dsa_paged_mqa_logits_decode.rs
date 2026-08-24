@@ -1,7 +1,7 @@
 //! GLM-5.2 DSA paged decode MQA-logits kernel.
 //!
 //! The first cache stays on the physical `(batch_size, context_len)` coordinates.
-//! Its boundary points bracket the block-64 page seams, the 256-token DeepGEMM
+//! Its boundary points bracket the block-64 page seams, the 256-token `DeepGEMM`
 //! scheduler segments, and the H200's 132-SM batch wave. Measured R.4 misses add
 //! batches 130/185 for interior interpolation, context 5793 for the diagonal
 //! interaction, and batches 384/512 to bound the tested extrapolation domain.
@@ -80,7 +80,7 @@ impl KernelSpec for DsaPagedMqaLogitsDecodeSpec {
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
-        let max_model_len = config.max_model_len.get() as f64;
+        let max_model_len = f64::from(config.max_model_len.get());
         // The paged index cache is one page set per sequence, so its size grows
         // with batch x context. At a 1M context the far corner would ask for
         // tens of terabytes; bound it rather than hand the profiler a shape no
@@ -97,6 +97,11 @@ impl KernelSpec for DsaPagedMqaLogitsDecodeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "batch_size/context_len are non-negative sweep-grid coordinates, far below u32::MAX"
+        )]
         grid.expand_2d(|batch_size, context_len| {
             ArgsPayload::new()
                 .with("backend", backend)

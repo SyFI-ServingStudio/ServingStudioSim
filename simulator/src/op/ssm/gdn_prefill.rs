@@ -1,12 +1,12 @@
-//! Compound Gated DeltaNet prefill operation.
+//! Compound Gated `DeltaNet` prefill operation.
 //!
 //! One logical prefill owns the causal-convolution fan-in, the post-convolution
 //! projection, and the chunked delta rule. Request-local convolution costs
 //! aggregate into one fixed leaf; the other two launches consume the aggregate
-//! `(T, L)` geometry. This keeps request count out of the CostTree shape.
+//! `(T, L)` geometry. This keeps request count out of the `CostTree` shape.
 //!
 //! The delta rule is ONE leaf, not six. vLLM resolves the GDN prefill backend
-//! to FlashInfer on any SM90 part, and that realization is a single fused
+//! to `FlashInfer` on any SM90 part, and that realization is a single fused
 //! CUTLASS launch; the six-launch FLA Triton decomposition this operation used
 //! to model over-predicted the measured operation by 110% on a
 //! Qwen3.6-35B-A3B-FP8 H200 capture, because it round-trips h/w/u/A through HBM
@@ -162,7 +162,7 @@ fn leaf<K: Probe>(builder: &mut CostTreeBuilder, name: &str, suffix: &str, kerne
 /// `max_sequence_length` is the delta rule's critical path: the inter-chunk
 /// recurrence is sequential inside a sequence and independent across sequences,
 /// so the longest sequence bounds the launch while `num_tokens` sets the
-/// aggregate work. Chunk counts are no longer derived here -- FlashInfer owns
+/// aggregate work. Chunk counts are no longer derived here -- `FlashInfer` owns
 /// its own chunk width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GdnPrefillGeometry {
@@ -299,6 +299,10 @@ mod tests {
 
     impl GdnPrefillEval for FakeEval {
         fn causal_conv(&self, input: &GdnCausalConvPrefillKernelInput) -> LeafMetrics {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "sequence_length is a test sequence length (hundreds of tokens), far under f32's 24-bit exact integer range"
+            )]
             self.metric("causal_conv", input.sequence_length as f32)
         }
 
@@ -427,7 +431,12 @@ mod tests {
             );
 
             assert_eq!(evaluator.filled(), 3);
-            assert_eq!(buf[0].m.time_ms, num_tokens as f32);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "num_tokens is a test token count (at most 128), far under f32's 24-bit exact integer range"
+            )]
+            let expected_time_ms = num_tokens as f32;
+            assert_eq!(buf[0].m.time_ms, expected_time_ms);
             assert_eq!(
                 &buf[1..].iter().map(|m| m.m.time_ms).collect::<Vec<_>>(),
                 &[2.0, 3.0]
@@ -454,9 +463,14 @@ mod tests {
         let mut seen = Vec::new();
         let metrics = aggregate_causal_conv(&[3, 65, 2], |shape| {
             seen.push((shape.batch_size, shape.sequence_length));
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "sequence_length is a test sequence length (at most 65), far under f32's 24-bit exact integer range"
+            )]
+            let time_ms = shape.sequence_length as f32;
             LeafMetrics {
                 m: Metrics4 {
-                    time_ms: shape.sequence_length as f32,
+                    time_ms,
                     flops: 1.0,
                     bytes: 2.0,
                     energy_j: 3.0,

@@ -47,7 +47,7 @@ pub struct KernelEnum {
 }
 
 /// Convert `Result<T, pyo3::PyErr>` to `Result<T, PerfApiError>` by flattening
-/// the PyO3 exception into `PerfApiError::Python(message)`. Defined as a
+/// the `PyO3` exception into `PerfApiError::Python(message)`. Defined as a
 /// trait so the PyO3-heavy code below reads as `.py_err()?` instead of
 /// `.py_err()?` at every step.
 /// Loss of structural Python exception type is intentional at this boundary —
@@ -242,7 +242,10 @@ impl PerfApiBridge {
                 compute_dtype,
                 kv_dtype,
                 config,
-                backends: backends.iter().map(|b| b.to_string()).collect(),
+                backends: backends
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect(),
             });
         }
     }
@@ -256,7 +259,7 @@ impl PerfApiBridge {
         }
     }
 
-    /// Lock the perf_api into "sim-runtime-safe" mode: any spec that's not
+    /// Lock the `perf_api` into "sim-runtime-safe" mode: any spec that's not
     /// already cached in the profile DB will raise `MissingEntry` rather than
     /// kicking off a JIT profile. Called from `new()`; the Python side is
     /// idempotent so repeated calls are safe.
@@ -339,7 +342,7 @@ impl PerfApiBridge {
             perf_api
                 .getattr(fn_name.as_str())
                 .and_then(|func| func.call((py_specs,), Some(kwargs)))
-                .and_then(|value| value.extract::<usize>())
+                .and_then(pyo3::PyAny::extract::<usize>)
                 .py_err()
         })
     }
@@ -354,7 +357,7 @@ impl PerfApiBridge {
             perf_api
                 .getattr("get_current_gpu_name")
                 .and_then(|func| func.call0())
-                .and_then(|value| value.extract::<String>())
+                .and_then(pyo3::PyAny::extract::<String>)
                 .py_err()
         })
     }
@@ -369,11 +372,11 @@ impl PerfApiBridge {
             Ok(DbMetadata {
                 schema_version: value
                     .getattr("schema_version")
-                    .and_then(|attr| attr.extract::<u32>())
+                    .and_then(pyo3::PyAny::extract::<u32>)
                     .py_err()?,
                 schema_hash: value
                     .getattr("schema_hash")
-                    .and_then(|attr| attr.extract::<String>())
+                    .and_then(pyo3::PyAny::extract::<String>)
                     .py_err()?,
                 created_at: optional_string(value, "created_at")?,
                 last_migrated_at: optional_string(value, "last_migrated_at")?,
@@ -398,11 +401,11 @@ impl PerfApiBridge {
                 versions.push(ProfilerVersion {
                     op_family: item
                         .getattr("op_family")
-                        .and_then(|attr| attr.extract::<String>())
+                        .and_then(pyo3::PyAny::extract::<String>)
                         .py_err()?,
                     profiler_git_hash: item
                         .getattr("profiler_git_hash")
-                        .and_then(|attr| attr.extract::<String>())
+                        .and_then(pyo3::PyAny::extract::<String>)
                         .py_err()?,
                 });
             }
@@ -433,7 +436,7 @@ impl Drop for BackendOverrideGuard<'_> {
 impl PerfApiBridge {
     /// Test-only constructor that skips the Python `disable_jit_profiling` init
     /// (which imports `profiling.perf_api`). Lets the backend-override unit tests
-    /// exercise pure bridge state with no live perf_api / GIL.
+    /// exercise pure bridge state with no live `perf_api` / GIL.
     pub(crate) fn new_uninit_for_test() -> Self {
         Self {
             dry_run: RefCell::new(None),
@@ -510,7 +513,7 @@ fn py_results_to_metrics(
         let class_name = item
             .getattr("__class__")
             .and_then(|class| class.getattr("__name__"))
-            .and_then(|name| name.extract::<String>())
+            .and_then(pyo3::PyAny::extract::<String>)
             .py_err()?;
         if class_name == "MissingEntry" {
             return Err(PerfApiError::MissingEntry {
@@ -586,7 +589,7 @@ fn ensure_payload_backends_match(
 
 fn extract_f64(item: &PyAny, field: &str) -> Result<f64, PerfApiError> {
     item.getattr(field)
-        .and_then(|attr| attr.extract::<f64>())
+        .and_then(pyo3::PyAny::extract::<f64>)
         .py_err()
 }
 
@@ -629,7 +632,10 @@ mod tests {
             .map(|(role, backends)| {
                 (
                     role.to_string(),
-                    backends.iter().map(|b| b.to_string()).collect(),
+                    backends
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect(),
                 )
             })
             .collect()

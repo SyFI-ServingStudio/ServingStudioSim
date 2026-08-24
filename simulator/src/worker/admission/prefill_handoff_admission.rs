@@ -186,7 +186,12 @@ where
     }
 
     fn queued_requests(&self) -> u32 {
-        self.policy.len() as u32
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "queued request count is bounded by this worker's admission queue capacity, far below u32::MAX"
+        )]
+        let count = self.policy.len() as u32;
+        count
     }
 
     fn cancel_pending(&mut self, request: RequestId) -> bool {

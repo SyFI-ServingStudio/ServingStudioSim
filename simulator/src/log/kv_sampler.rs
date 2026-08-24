@@ -274,6 +274,10 @@ impl KvSampler {
             .filter(|(_, slot)| slot.pending)
             .map(|(gid, slot)| KvSnapshotEntry {
                 worker_id: self.worker_id.0,
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "gid indexes self.slots, sized from num_groups which is itself u16-domain (submit()'s group_id parameter), so it round-trips within u16"
+                )]
                 group_id: gid as u16,
                 time_ms: slot.last_time_ms,
                 active_kv: slot.peak_active,
@@ -329,10 +333,15 @@ mod tests {
                 .iter()
                 .enumerate()
         {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "submit_index enumerates a fixed 5-element test array, far too small for usize->f64 to lose precision"
+            )]
+            let submit_time_ms = submit_index as f64;
             kv.submit(
                 0,
                 sub(*active_kv, *retained_prefix_kv),
-                Time::from_ms(submit_index as f64),
+                Time::from_ms(submit_time_ms),
             );
         }
         kv.flush_all().unwrap();

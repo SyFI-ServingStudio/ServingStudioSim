@@ -1,4 +1,4 @@
-//! FlashInfer prefill (causal) attention kernel: one cached perf model per
+//! `FlashInfer` prefill (causal) attention kernel: one cached perf model per
 //! attention-dims config.
 //!
 //! Everything generic (build / eval / the `Probe` impl / for-backend loops)
@@ -63,8 +63,8 @@ impl SweepCoords for FlashinferAttnPrefillKernelInput {
     fn coords(&self) -> Coords {
         // (k, q) → (k + q/2, q). `A` carries the causal triangle so `A·B` is the
         // full per-iteration work with no quadratic residual for bilinear to miss.
-        let a = self.prefix_len as f64 + self.append_len as f64 / 2.0;
-        Coords::new([a, self.append_len as f64])
+        let a = f64::from(self.prefix_len) + f64::from(self.append_len) / 2.0;
+        Coords::new([a, f64::from(self.append_len)])
     }
     fn coord_field_names() -> &'static [&'static str] {
         // The *query-point* keys (physical, history-append) — what a caller sends.
@@ -128,7 +128,17 @@ impl KernelSpec for FlashinferAttnPrefillSpec {
             // append = B, prefix = A - B/2. Feasible cells have A >= B/2 so this
             // is non-negative; the `.max(0.0)` is a guard for the infeasible
             // A < B/2 cells, which `infeasible_mask` strips before profiling.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "rounded sweep-grid token lengths are non-negative and far below u32::MAX"
+            )]
             let append_len = b.round() as u32;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "clamped to >= 0.0 above via .max(0.0); rounded sweep-grid token length is far below u32::MAX"
+            )]
             let prefix_len = (a - b / 2.0).max(0.0).round() as u32;
             ArgsPayload::new()
                 .with("backend", backend)

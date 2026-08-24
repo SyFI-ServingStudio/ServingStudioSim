@@ -1,7 +1,7 @@
 //! Qwen3.6 TP1 local final decoder head.
 //!
 //! The final decoder layer leaves its MLP output and delayed residual separate.
-//! This section owns their fused residual add plus final RMSNorm exactly once,
+//! This section owns their fused residual add plus final `RMSNorm` exactly once,
 //! then applies the untied vocabulary head only to the rows selected for logits.
 //! Intermediate delayed residuals instead belong to the following attention
 //! worklet's entry norm. Token embedding remains a future L4 atomic leaf.
@@ -58,6 +58,7 @@ pub struct Qwen36HeadLocalWorklet {
 }
 
 impl Qwen36HeadLocalWorklet {
+    #[must_use]
     pub fn resolve_config(cfg: &Qwen36HeadLocalWorkletConfig) -> Qwen36HeadLocalWorkletResolved {
         validate_config(cfg)
             .unwrap_or_else(|reason| panic!("invalid Qwen36HeadLocalWorkletConfig: {reason}"));
@@ -382,7 +383,12 @@ mod tests {
 
         fn eval(&self, input: &Self::Input) -> LeafMetrics {
             let mut metrics = LeafMetrics::ZERO;
-            metrics.m.time_ms = input.m as f32;
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "input.m is a test probe's dimension value, small enough that u32->f32 doesn't lose precision in this fixture"
+            )]
+            let m_f32 = input.m as f32;
+            metrics.m.time_ms = m_f32;
             metrics
         }
 

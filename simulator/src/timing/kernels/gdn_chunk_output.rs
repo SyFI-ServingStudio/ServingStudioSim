@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused chunk-output kernel.
+//! Qwen Gated `DeltaNet` fused chunk-output kernel.
 //!
 //! The public input retains physical `(T, C)`, while the cache projects to
 //! `(C, D=T/C)`. `C` controls the launch count, and `D` captures the measured
@@ -32,7 +32,7 @@ pub struct GdnChunkOutputKernelInput {
 
 impl SweepCoords for GdnChunkOutputKernelInput {
     fn coords(&self) -> Coords {
-        Coords::new([self.num_tokens as f64, self.num_chunks as f64])
+        Coords::new([f64::from(self.num_tokens), f64::from(self.num_chunks)])
     }
 
     fn coord_field_names() -> &'static [&'static str] {
@@ -61,8 +61,8 @@ impl KernelSpec for GdnChunkOutputSpec {
 
     fn cache_coords(_config: &Self::Config, input: &Self::Input) -> Coords {
         Coords::new([
-            input.num_chunks as f64,
-            input.num_tokens as f64 / input.num_chunks as f64,
+            f64::from(input.num_chunks),
+            f64::from(input.num_tokens) / f64::from(input.num_chunks),
         ])
     }
 
@@ -72,7 +72,17 @@ impl KernelSpec for GdnChunkOutputSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_2d(|num_chunks, tokens_per_chunk| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "rounded sweep-grid chunk count is non-negative and far below u64::MAX"
+            )]
             let num_chunks = num_chunks.round() as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "rounded sweep-grid token count is non-negative and far below u64::MAX"
+            )]
             let tokens_per_chunk = tokens_per_chunk.round() as u64;
             let num_tokens = num_chunks
                 .checked_mul(tokens_per_chunk)
@@ -232,7 +242,7 @@ mod tests {
                 let chunks = fields["num_chunks"].as_u64().unwrap();
                 assert!(matches!(tokens / chunks, 1 | 64));
                 assert_eq!(tokens % chunks, 0);
-                assert!((tokens + 63) / 64 <= chunks && chunks <= tokens);
+                assert!(tokens.div_ceil(64) <= chunks && chunks <= tokens);
                 assert_eq!(fields["backend"], Value::from(backend));
                 assert_eq!(fields["num_key_heads"], Value::from(16));
                 assert_eq!(fields["num_heads"], Value::from(32));

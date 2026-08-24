@@ -8,20 +8,20 @@
 //!
 //! Three arch kinds, one tool (the `arch` selector picks):
 //!   - `iter` — ONE [`IterwiseUnifiedModel::eval_iter`] over the whole forward
-//!     pass (embedding → all layers via the `Scale{n}` fold → lm_head). One row
+//!     pass (embedding → all layers via the `Scale{n}` fold → `lm_head`). One row
 //!     per case, `section = "iter"`, `layer = -1`.
 //!   - `attn` — the AFD attn side ([`qwen3_attn`]): one `attn_cost` per case
 //!     (`section = "attn"`). One DP shard = one group.
 //!   - `ffn` — the AFD ffn side ([`qwen3_ffn_moe`]): the per-section building
 //!     blocks of one iteration — `prologue` (embed), `pre_attn` (layer-0 qkv),
-//!     a representative mid-layer `post_attn` (o_proj + router + MoE + fused
+//!     a representative mid-layer `post_attn` (`o_proj` + router + `MoE` + fused
 //!     next-layer qkv), the terminal `post_attn_last`, and `epilogue`
-//!     (final_norm + lm_head). One row per section.
+//!     (`final_norm` + `lm_head`). One row per section.
 //!
 //! **One arch, not a bundle.** AFD is predicted by running this tool TWICE — once
 //! with the attn arch, once with the ffn arch — each independent. The cross-pool
 //! attn↔ffn handoff is a `GpuCluster` transfer (not a cost-tree leaf) and is out
-//! of scope here; the MoE EP dispatch/combine comm, by contrast, IS an in-tree
+//! of scope here; the `MoE` EP dispatch/combine comm, by contrast, IS an in-tree
 //! compute leaf inside the ffn `post_attn` section and is logged automatically.
 //!
 //! The output is not a bespoke format: every case/section is emitted as one row of
@@ -140,6 +140,12 @@ impl PredictGroup {
     /// / `total_kv_len` exactly as the worker does in
     /// `worker/execution/unified_iter_execution.rs::build_input`, so a predicted iteration costs
     /// identically to the same shape inside a real run.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "decode_kv_lens.len() and the summed total_kv (both u32-scale batch/KV token \
+                  counts, mirroring build_input's own downcast) would need billions of entries/tokens \
+                  to overflow u32 — far beyond any realistic case file"
+    )]
     fn into_arch_group(self) -> Result<ArchGroupInput> {
         // decode source: exact list xor uniform shorthand xor neither.
         let decode_kv_lens = match (self.decode_kv_lens.is_empty(), self.decode_count) {
@@ -395,7 +401,7 @@ fn run_attn_cases(
 /// iteration, each as one row. The repeating per-mid-layer `post_attn` cost is
 /// homogeneous, so a single representative mid layer stands for all of them; the
 /// terminal layer (`post_attn_last`, post-only) is emitted once. `prologue` and
-/// `epilogue` are the once-per-iteration embed / lm_head, `layer = -1`.
+/// `epilogue` are the once-per-iteration embed / `lm_head`, `layer = -1`.
 ///
 /// The ffn case IS its input: [`FfnArchInput`] deserializes straight from the cases
 /// file (a list of `{ "tokens_per_group": [...] }`), so there is no separate case
@@ -464,6 +470,11 @@ fn run_ffn_cases(
         // standing for every layer in [0, last). Only when there IS a mid layer.
         if num_layers >= 2 {
             let mid = (num_layers as usize - 1) / 2; // clearly < last for num_layers >= 2
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "mid is a decoder layer index (tens to low hundreds), far under i16::MAX"
+            )]
             let seg = cost.run_section(
                 "post_attn",
                 mid as i16,
@@ -481,6 +492,11 @@ fn run_ffn_cases(
         }
 
         // post_attn terminal (last layer, post-only).
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "last is a decoder layer index (tens to low hundreds), far under i16::MAX"
+        )]
         let seg = cost.run_section(
             "post_attn_last",
             last as i16,

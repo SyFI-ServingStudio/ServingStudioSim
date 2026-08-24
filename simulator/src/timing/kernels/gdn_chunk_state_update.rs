@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused chunk-state update kernel.
+//! Qwen Gated `DeltaNet` fused chunk-state update kernel.
 //!
 //! Stable H200 measurements require three cache axes: `C` captures aggregate
 //! chunk work and H snapshots, `N` controls launch programs, and the normalized
@@ -40,10 +40,10 @@ pub struct GdnChunkStateUpdateKernelInput {
 impl SweepCoords for GdnChunkStateUpdateKernelInput {
     fn coords(&self) -> Coords {
         Coords::new([
-            self.num_tokens as f64,
-            self.num_chunks as f64,
-            self.num_sequences as f64,
-            self.max_chunks_per_sequence as f64,
+            f64::from(self.num_tokens),
+            f64::from(self.num_chunks),
+            f64::from(self.num_sequences),
+            f64::from(self.max_chunks_per_sequence),
         ])
     }
 
@@ -80,6 +80,11 @@ fn feasible_max_chunk_bounds(num_chunks: u64, num_sequences: u64) -> Option<(u64
     Some((minimum, maximum))
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "num_chunks/minimum/maximum/span are kernel cache sweep-grid coordinates (chunk \
+              counts), bounded by the sweep grid (Axis::pow2(0, 6) => <= 64) — far below 2^52"
+)]
 fn normalized_max_chunk_position(num_chunks: u64, num_sequences: u64, max_chunks: u64) -> f64 {
     let Some((minimum, maximum)) = feasible_max_chunk_bounds(num_chunks, num_sequences) else {
         return -1.0;
@@ -174,8 +179,8 @@ impl KernelSpec for GdnChunkStateUpdateSpec {
 
     fn cache_coords(_config: &Self::Config, input: &Self::Input) -> Coords {
         Coords::new([
-            input.num_chunks as f64,
-            input.num_sequences as f64,
+            f64::from(input.num_chunks),
+            f64::from(input.num_sequences),
             normalized_max_chunk_position(
                 input.num_chunks.into(),
                 input.num_sequences.into(),
@@ -184,10 +189,24 @@ impl KernelSpec for GdnChunkStateUpdateSpec {
         ])
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "coordinates are sweep-grid axis values (chunk/sequence counts, always small \
+                  non-negative integers per Axis::pow2/values); .round() before the cast keeps \
+                  them exact and non-negative"
+    )]
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         grid.expand(|coordinates| coordinates[1].round() as u64 > coordinates[0].round() as u64)
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "coordinates are sweep-grid axis values (chunk/sequence counts, always small \
+                  non-negative integers per Axis::pow2/values); .round() before the cast keeps \
+                  them exact and non-negative"
+    )]
     fn enumerate(
         config: &Self::Config,
         grid: &SweepGrid,
@@ -417,16 +436,15 @@ mod tests {
         let feasible = payloads
             .iter()
             .zip(&mask)
-            .filter_map(|(payload, &masked)| {
-                (!masked).then(|| {
-                    let fields = payload.fields();
-                    (
-                        fields["num_tokens"].as_u64().unwrap(),
-                        fields["num_chunks"].as_u64().unwrap(),
-                        fields["num_sequences"].as_u64().unwrap(),
-                        fields["max_chunks_per_sequence"].as_u64().unwrap(),
-                    )
-                })
+            .filter(|&(_payload, &masked)| !masked)
+            .map(|(payload, &_masked)| {
+                let fields = payload.fields();
+                (
+                    fields["num_tokens"].as_u64().unwrap(),
+                    fields["num_chunks"].as_u64().unwrap(),
+                    fields["num_sequences"].as_u64().unwrap(),
+                    fields["max_chunks_per_sequence"].as_u64().unwrap(),
+                )
             })
             .collect::<HashSet<_>>();
         assert_eq!(feasible.len(), 73);
@@ -450,7 +468,12 @@ mod tests {
             }
             assert!(geometry_is_feasible(c, n, m));
             let counts = canonical_chunk_counts(c, n, m).unwrap();
-            assert_eq!(counts.len(), n as usize);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "n is a num_sequences value drawn from the test's small enumerated spec grid, far below usize::MAX even on 32-bit targets"
+            )]
+            let n_usize = n as usize;
+            assert_eq!(counts.len(), n_usize);
             assert!(counts.iter().all(|&count| count > 0));
             assert_eq!(counts.iter().sum::<u64>(), c);
             assert_eq!(counts.iter().copied().max(), Some(m));

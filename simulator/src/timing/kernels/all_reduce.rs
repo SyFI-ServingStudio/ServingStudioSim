@@ -53,7 +53,7 @@ pub struct AllReduceKernelInput {
     /// complete output size. Example: a TP layer's row-parallel projection
     /// produces a full `[tokens × hidden]` partial-sum on every rank, so the
     /// caller passes `tokens × hidden × dtype_bytes` (full hidden, NOT
-    /// hidden/tp_size).
+    /// `hidden/tp_size`).
     pub message_size_bytes: u64,
 }
 
@@ -80,10 +80,16 @@ impl KernelSpec for AllReduceSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|message_size| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "message_size comes from the pow2(12, 30) byte-ladder axis: a small, non-negative, pre-curated power of two far below u64::MAX"
+            )]
+            let message_size_bytes = message_size as u64;
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("num_gpus", config.num_gpus)
-                .with("message_size_bytes", message_size as u64)
+                .with("message_size_bytes", message_size_bytes)
                 // Fixed profiling dtype: comm is size-keyed (see module doc), the
                 // curve is measured once at bf16 for every logical payload dtype.
                 .with("dtype", DType::Bf16.as_str())
@@ -136,7 +142,12 @@ mod tests {
         let input = AllReduceKernelInput {
             message_size_bytes: 1 << 20,
         };
-        assert_eq!(&*input.coords(), &[(1u64 << 20) as f64]);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "1u64 << 20 is a fixed test message size, far under f64's exact integer range"
+        )]
+        let expected = (1u64 << 20) as f64;
+        assert_eq!(&*input.coords(), &[expected]);
     }
 
     #[test]
@@ -146,7 +157,12 @@ mod tests {
         // 2^12 .. 2^30 inclusive = 19 points.
         assert_eq!(grid.axes()[0].len(), 19);
         assert_eq!(grid.axes()[0].first().copied(), Some(4096.0));
-        assert_eq!(grid.axes()[0].last().copied(), Some((1u64 << 30) as f64));
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "1u64 << 30 is a fixed test message size, far under f64's exact integer range"
+        )]
+        let expected_last = (1u64 << 30) as f64;
+        assert_eq!(grid.axes()[0].last().copied(), Some(expected_last));
         assert!(matches!(
             AllReduceSpec::cache_kind("nccl"),
             CacheKind::Cache1DLinear

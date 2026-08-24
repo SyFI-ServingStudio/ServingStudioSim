@@ -1,4 +1,4 @@
-//! FlashInfer MNNVL MoE all-to-all metadata-preparation timing leaf.
+//! `FlashInfer` MNNVL `MoE` all-to-all metadata-preparation timing leaf.
 //!
 //! One `mnnvl_moe_alltoallv_prepare_without_allgather` call decides, from the
 //! router's expert ids alone, which rows go where: it counts them
@@ -34,7 +34,7 @@ pub struct MoeAlltoallPrepareKernelConfig {
     pub ep_size: u32,
     pub top_k: u32,
     pub slot_count: u32,
-    /// Row/cache key only: MNNVL is NVLink by construction.
+    /// Row/cache key only: MNNVL is `NVLink` by construction.
     pub fabric: Fabric,
 }
 
@@ -78,10 +78,18 @@ impl KernelSpec for MoeAlltoallPrepareSpec {
             config.slot_count
         );
         grid.expand_1d(|tokens_per_rank| {
+            // Sweep axis values (values/token_axis chain, max 65536) are
+            // non-negative integers well under u32::MAX.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "sweep axis values are non-negative integers far below u32::MAX"
+            )]
+            let tokens_per_rank = tokens_per_rank as u32;
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("ep_size", config.ep_size)
-                .with("tokens_per_rank", tokens_per_rank as u32)
+                .with("tokens_per_rank", tokens_per_rank)
                 .with("top_k", config.top_k)
                 .with("slot_count", config.slot_count)
                 .with("fabric", config.fabric.as_str())

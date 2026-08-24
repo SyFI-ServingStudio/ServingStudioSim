@@ -8,6 +8,9 @@ description = "VibeSim post-sim analyzer — DataFusion parquet scan → report 
 license-file = "../../LICENSE"
 publish = false
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "analyze"
 path = "src/main.rs"

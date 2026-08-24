@@ -3,9 +3,9 @@
 //! The sim's own record of the GPUs a run modeled (id / name / pool / owning
 //! worker), so the analyzer can normalize throughput per-GPU and label plots with
 //! the GPU name. Distinct from the launcher-written `params.json` (run inputs)
-//! and the per-worker `cost_manifest/` sidecars (CostTree structure). Written
+//! and the per-worker `cost_manifest/` sidecars (`CostTree` structure). Written
 //! once after the flow is built; mirrors `cost_logger`'s manifest write
-//! (serde_json → fs).
+//! (`serde_json` → fs).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -31,7 +31,7 @@ const SCHEMA_VERSION: u32 = 5;
 /// registry. Emits the flat per-GPU list, a derived worker→gpu grouping (each
 /// worker also carrying its `kv_pools` = per-group KV token capacity, via
 /// [`GpuCluster::kv_capacities`]), the total count, and the comm-group registry
-/// (gid → base/count/gpu_ids, via [`GpuCluster::comm_groups`]). (The cluster's
+/// (gid → `base/count/gpu_ids`, via [`GpuCluster::comm_groups`]). (The cluster's
 /// runtime state — `cost` / `logger` / `kv_caps` — is `#[serde(skip)]` and never
 /// reaches disk via the derived `Serialize`; only the reads above export it.)
 pub fn write_run_meta(log_dir: &Path, cluster: &GpuCluster, stage_vocab: StageVocab) -> Result<()> {

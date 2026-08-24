@@ -1,4 +1,4 @@
-//! Hot-path microbenchmark for cache lookups — the dominant cost in the CostTree
+//! Hot-path microbenchmark for cache lookups — the dominant cost in the `CostTree`
 //! eval path (`Cache::eval`: bilinear/linear interpolation).
 //!
 //! Dependency-free (no criterion) and `#[ignore]`d so it never runs in the
@@ -51,6 +51,11 @@ fn bench<F: Fn(f64, f64) -> f64>(label: &str, probes: &[(f64, f64)], lookup: F) 
     }
     black_box(acc);
     let elapsed = start.elapsed();
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "elapsed ns and total iters converted to f64 for a human-readable ns/op ratio; \
+                  precision loss is irrelevant at benchmark magnitudes"
+    )]
     let ns_per = elapsed.as_nanos() as f64 / total as f64;
     println!("{label:<30} {ns_per:>7.2} ns/op  ({total} iters, {elapsed:?})");
 }
@@ -64,7 +69,13 @@ fn cache_lookup_throughput() {
     let samples_1d: Vec<KernelMetrics> = axis
         .iter()
         .enumerate()
-        .map(|(idx, _)| compute_sample(1.0 + idx as f64 * 0.5))
+        .map(|(idx, _)| {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "idx is a small axis index (<=63), far below f64's exact-integer range"
+            )]
+            compute_sample(1.0 + idx as f64 * 0.5)
+        })
         .collect();
     let (cache_1d, warnings) = Cache1DLinear::from_samples(&grid_1d, &samples_1d);
     assert!(warnings.is_empty(), "1D fixture must fit cleanly");
@@ -78,7 +89,7 @@ fn cache_lookup_throughput() {
     // overhead, so the cache numbers below can be read net of it.
     bench("baseline (a + b)", &probes_1d, |a, b| a + b);
     bench("Cache1DLinear::eval", &probes_1d, |x, _| {
-        cache_1d.eval(&[x]).m.time_ms as f64
+        f64::from(cache_1d.eval(&[x]).m.time_ms)
     });
 
     // 1D direct-indexed: 512 buckets, spacing 64, range [0, 32704] — the bounded
@@ -88,7 +99,14 @@ fn cache_lookup_throughput() {
     assert_eq!(axis_direct.len(), 512);
     let grid_direct = SweepGrid::new(vec![axis_direct.clone()]);
     let samples_direct: Vec<KernelMetrics> = (0..axis_direct.len())
-        .map(|idx| compute_sample(1.0 + idx as f64 * 0.5))
+        .map(|idx| {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "idx is a small direct-cache bucket index (<=512), far below f64's \
+                          exact-integer range"
+            )]
+            compute_sample(1.0 + idx as f64 * 0.5)
+        })
         .collect();
     let (cache_direct, warnings) = Cache1DDirect::from_samples(&grid_direct, &samples_direct);
     assert!(warnings.is_empty(), "direct fixture must fit cleanly");
@@ -98,7 +116,7 @@ fn cache_lookup_throughput() {
         .map(|x| (x, 0.0))
         .collect();
     bench("Cache1DDirect::eval", &probes_direct, |x, _| {
-        cache_direct.eval(&[x]).m.time_ms as f64
+        f64::from(cache_direct.eval(&[x]).m.time_ms)
     });
 
     // 2D: the three real attention grids, smallest-to-largest. The hot question
@@ -111,12 +129,19 @@ fn cache_lookup_throughput() {
         let grid = SweepGrid::new(vec![axis0, axis1]);
         let samples: Vec<KernelMetrics> = (0..r)
             .flat_map(|i| (0..c).map(move |j| (i, j)))
-            .map(|(i, j)| compute_sample(1.0 + i as f64 + j as f64))
+            .map(|(i, j)| {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "i,j are small 2D grid indices from test fixtures, far below f64's \
+                              exact-integer range"
+                )]
+                compute_sample(1.0 + i as f64 + j as f64)
+            })
             .collect();
         let (cache, warnings) = Cache2DLinear::from_samples(&grid, &samples);
         assert!(warnings.is_empty(), "2D fixture {label} must fit cleanly");
         bench(label, probes, move |x0, x1| {
-            cache.eval(&[x0, x1]).m.time_ms as f64
+            f64::from(cache.eval(&[x0, x1]).m.time_ms)
         });
     };
 

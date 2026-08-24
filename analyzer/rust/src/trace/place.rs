@@ -78,8 +78,17 @@ impl<'a> Placer<'a> {
         match &self.manifest.nodes[idx] {
             FlatCostNode::Leaf(slot) => {
                 let leaf_ns = self.slot_ns.get(*slot).copied().unwrap_or(0);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_precision_loss,
+                    reason = "leaf_ns is a per-kernel duration in nanoseconds, well below 2^53ns / i64::MAX for any real simulated run, so the f64 round-trip through `scale` and back to rounded i64 ns is exact for realistic durations"
+                )]
                 let dur = ((leaf_ns as f64) * scale).round() as i64;
                 let desc = &self.manifest.slots[*slot];
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "dur is a rounded nanosecond duration bounded well below 2^53, so converting to f64 for the ms annotation is exact"
+                )]
                 let mut anns = vec![
                     Annotation::str("kind", desc.kind.clone()),
                     Annotation::str("kernel_config", desc.kernel_config.to_string()),
@@ -89,6 +98,10 @@ impl<'a> Placer<'a> {
                 // the `scale`-compressed display `dur`): a kernel's physical rate
                 // is independent of how the critical-path view squeezes the slice.
                 // `0` flops/bytes (profile row had no rate) or `0` time → skip.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "leaf_ns is a per-kernel duration in nanoseconds, well below 2^53ns for any real simulated run"
+                )]
                 let leaf_s = leaf_ns as f64 / 1e9;
                 if leaf_s > 0.0 {
                     if let Some(&flops) = self.slot_flops.get(*slot) {
@@ -161,7 +174,14 @@ impl<'a> Placer<'a> {
                         let lane = w.child_track(track, &format!("lane {i}"), i as u64);
                         maxd = maxd.max(self.place(w, lane, c, t0, scale));
                     }
-                    ((maxd as f64) / (*overlap as f64)).round() as i64
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_precision_loss,
+                        reason = "maxd is a nanosecond duration bounded well below i64::MAX/2^53 for any real simulated run, so the f64 divide-and-round back to i64 ns is exact for realistic durations"
+                    )]
+                    {
+                        ((maxd as f64) / (*overlap as f64)).round() as i64
+                    }
                 } else {
                     // Critical-path collapse: place ONLY the bottleneck branch
                     // (largest `node_time`) inline on this same track — no lanes,
@@ -176,7 +196,16 @@ impl<'a> Placer<'a> {
                         .max_by_key(|&c| node_time(self.manifest, c, self.slot_ns))
                         .expect("Max node has at least one child");
                     let crit_nat = node_time(self.manifest, crit, self.slot_ns).max(1);
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_precision_loss,
+                        reason = "crit_nat is a nanosecond duration bounded well below i64::MAX/2^53 for any real simulated run, so the f64 divide-and-round back to i64 ns is exact for realistic durations"
+                    )]
                     let eff_nat = ((crit_nat as f64) / (*overlap as f64)).round() as i64;
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "eff_nat and crit_nat are nanosecond durations bounded well below 2^53 for any real simulated run"
+                    )]
                     let child_scale = scale * (eff_nat as f64) / (crit_nat as f64);
                     self.place(w, track, crit, t0, child_scale)
                 };

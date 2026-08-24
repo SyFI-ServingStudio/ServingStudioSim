@@ -1,8 +1,8 @@
 //! L2 (Operation) — names one or more L1 kernels into an op with `compile` /
-//! `eval` entry points (CostTree). See `doc/detailed_design/L2.md`.
+//! `eval` entry points (`CostTree`). See `doc/detailed_design/L2.md`.
 //!
 //! This module holds the generic single-kernel wrapper `Op<K>` (L2 design §2.2).
-//! Atomic ops (qkv / o_proj / gate_up / down / lm_head / rms_norm …) are all
+//! Atomic ops (qkv / `o_proj` / `gate_up` / down / `lm_head` / `rms_norm` …) are all
 //! `Op<SomeKernel>` and so occupy *no file* — L4 wiring instantiates them with
 //! `Op::new(name, kernel)`. Only compound ops (multi-kernel + custom cost math,
 //! e.g. attention / moe) get their own files under `op/<family>/`.
@@ -31,7 +31,7 @@ impl<K: Probe> Op<K> {
         Self { name, kernel }
     }
 
-    /// CostTree compile: an atomic op is one leaf, named by its dotted path and
+    /// `CostTree` compile: an atomic op is one leaf, named by its dotted path and
     /// carrying the kernel's `kind`/`config` for the shape render (the old
     /// `Describe` leaf line).
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
@@ -42,7 +42,7 @@ impl<K: Probe> Op<K> {
         )
     }
 
-    /// CostTree eval: push this op's one leaf into the [`Evaluator`] — the inverse
+    /// `CostTree` eval: push this op's one leaf into the [`Evaluator`] — the inverse
     /// of `compile`'s single `leaf()`. Walking `eval` in the same child order
     /// `compile` minted slots keeps the evaluator's cursor aligned with the slot
     /// index (INV-2). The leaf metric is the kernel's best-of-N `LeafMetrics`.

@@ -1,4 +1,4 @@
-//! Native FP8 AFD pre-attention projection: BF16 input RMSNorm followed by
+//! Native FP8 AFD pre-attention projection: BF16 input `RMSNorm` followed by
 //! per-token-group quantization and a column-parallel FP8 fused-QKV GEMM.
 
 use std::sync::Arc;
@@ -51,6 +51,7 @@ pub struct Fp8PreAttnProjTpWorklet {
 }
 
 impl Fp8PreAttnProjTpWorklet {
+    #[must_use]
     pub fn resolve_config(cfg: &Fp8PreAttnProjTpWorkletConfig) -> Fp8PreAttnProjTpWorkletResolved {
         let tp_size = u32::from(cfg.tp_size);
         assert!(tp_size > 0);

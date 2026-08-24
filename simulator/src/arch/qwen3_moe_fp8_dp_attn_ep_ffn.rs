@@ -1,12 +1,12 @@
-//! `qwen3_moe_fp8_dp_attn_ep_ffn` — L4 model_arch for Qwen3-MoE-style decoders with
+//! `qwen3_moe_fp8_dp_attn_ep_ffn` — L4 `model_arch` for Qwen3-MoE-style decoders with
 //! **DP-attention + EP-FFN**: attention is sharded over `attn_tp_size` head-
 //! parallel ranks and replicated as `num_dp_groups = ep_size / attn_tp_size`
 //! independent DP shards (mirroring `llama3_dp_attn_tp_ffn`); the FFN is a
 //! sparse mixture-of-experts whose experts are distributed across all `ep_size`
-//! ranks of the replica via the L2 MoE dispatch / combine ops.
+//! ranks of the replica via the L2 `MoE` dispatch / combine ops.
 //!
 //! Cost shape (iter-wise, mirrors `llama3_dp_attn_tp_ffn` but with the FFN
-//! exploded into MoE sub-sections per L3 design.md §「sync-section invariant」):
+//! exploded into `MoE` sub-sections per L3 design.md §「sync-section invariant」):
 //!
 //! ```text
 //! Sum(
@@ -24,28 +24,28 @@
 //! )
 //! ```
 //!
-//! The `× num_dp_groups` MAX nodes (attn_block, moe_router, moe_local_reduce)
+//! The `× num_dp_groups` MAX nodes (`attn_block`, `moe_router`, `moe_local_reduce`)
 //! are the DP-attention fan-out: distinct DP shards process distinct token
 //! slices on the dense path, so their wallclocks are independent and each sync
 //! section's wallclock is the slowest shard — DP load imbalance is modeled
 //! exactly, every child eats its own shard's `batch_tokens` (never a pooled
-//! average). post_norm + router and the post-combine home reduce run
+//! average). `post_norm` + router and the post-combine home reduce run
 //! *replicated* on every rank of a shard (the full hidden is replicated across
-//! the shard's `attn_tp_size` ranks after the o_proj all-reduce), so each
+//! the shard's `attn_tp_size` ranks after the `o_proj` all-reduce), so each
 //! shard's cost is its own token slice — NOT `m_total / ep_size`. The
 //! `× ep_size` MAX on `expert_compute` is the EP fan-out: each EP rank owns one
 //! `local_ppm` shard, so a measured or synthetic skew yields a distinct
 //! grouped-GEMM kernel cache (L1 grouped GEMM is distribution-sensitive). The
 //! uniform baseline still produces identical children, but the rank fan-out is
-//! kept explicit so the same CostTree shape handles a profile without a second
+//! kept explicit so the same `CostTree` shape handles a profile without a second
 //! arch implementation.
 //!
 //! v1 deviations (carried over from `llama3_dp_attn_tp_ffn`, plus MoE-specific):
-//!   - embed / final_norm / lm_head are replicated full shapes on the pooled
+//!   - embed / `final_norm` / `lm_head` are replicated full shapes on the pooled
 //!     token total (no vocab-parallel split);
-//!   - one routing snapshot is used for all homogeneous MoE layers. A profile
+//!   - one routing snapshot is used for all homogeneous `MoE` layers. A profile
 //!     JSON is therefore reduced to its all-layer expert totals at the L4 build
-//!     seam; layer-by-layer CostTree materialisation is intentionally deferred.
+//!     seam; layer-by-layer `CostTree` materialisation is intentionally deferred.
 
 use std::sync::Arc;
 
@@ -95,10 +95,10 @@ const TP_FABRIC: Fabric = Fabric::Nvlink;
 const MOE_INTRA_FABRIC: Fabric = Fabric::Nvlink;
 const MOE_INTER_FABRIC: Fabric = Fabric::Infiniband;
 
-/// This arch's numeric parallel input. attention TP × num_dp_groups together
-/// span the replica (= ep_size GPUs); `hp_size` controls the MoE
+/// This arch's numeric parallel input. attention TP × `num_dp_groups` together
+/// span the replica (= `ep_size` GPUs); `hp_size` controls the `MoE`
 /// `ReplicatedHeadParallel` placement (the residing-set width on the FFN side);
-/// `nvl_num_gpu` partitions the `ep_size` ranks into NVL domains for the MoE
+/// `nvl_num_gpu` partitions the `ep_size` ranks into NVL domains for the `MoE`
 /// dispatch/combine intra/inter split.
 #[derive(Clone, Debug)]
 pub struct Qwen3MoeFp8Parallel {
@@ -109,7 +109,7 @@ pub struct Qwen3MoeFp8Parallel {
     pub gpu_name: String,
 }
 
-/// Raw worklet/op configs. `attn_block` bakes `attn_tp_size`; the MoE
+/// Raw worklet/op configs. `attn_block` bakes `attn_tp_size`; the `MoE`
 /// worklets / ops bake their per-rank shape. The DP degree
 /// (`num_dp_groups = ep_size / attn_tp_size`) is carried separately for the
 /// L4 cost fan-out loop.
@@ -138,8 +138,8 @@ pub struct Qwen3MoeFp8DpAttnEpFfnConfigs {
     pub num_experts: u32,
 }
 
-/// Post-resolve aggregate; atomic ops (embed / final_norm / lm_head /
-/// moe_local_reduce) carry their kernel config through unchanged.
+/// Post-resolve aggregate; atomic ops (embed / `final_norm` / `lm_head` /
+/// `moe_local_reduce`) carry their kernel config through unchanged.
 pub struct Qwen3MoeFp8DpAttnEpFfnResolved {
     pub attn_block: Fp8AttnBlockTpWorkletResolved,
     pub moe_router: NativeFp8MoeRouterLocalWorkletResolved,
@@ -182,14 +182,14 @@ pub struct Qwen3MoeFp8DpAttnEpFfnModel {
     pub embed: Op<ElementwiseKernel>,
     pub final_norm: Op<RmsNormKernel>,
     pub lm_head: SingleFp8GemmWithQuantOp,
-    /// CostTree structure compiled once at build (flattened) + its slot count,
+    /// `CostTree` structure compiled once at build (flattened) + its slot count,
     /// so per-iter `eval_iter` only evals leaves + aggregates.
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
 
 /// The attention-block config for this arch, depending only on `attn_tp_size` +
-/// model dims (input_norm / qkv / attention / o_proj / tp_allreduce partition).
+/// model dims (`input_norm` / qkv / attention / `o_proj` / `tp_allreduce` partition).
 fn attn_block_config(
     model: &MoeModelCfg,
     attn_tp_size: u16,
@@ -218,6 +218,7 @@ fn attn_block_config(
     }
 }
 
+#[must_use]
 pub fn build_configs(
     model: &MoeModelCfg,
     parallel: &Qwen3MoeFp8Parallel,
@@ -234,7 +235,7 @@ pub fn build_configs(
         "attn_tp_size / ep_size must be non-zero"
     );
     assert!(
-        parallel.ep_size % parallel.attn_tp_size == 0,
+        parallel.ep_size.is_multiple_of(parallel.attn_tp_size),
         "ep_size {} must be a multiple of attn_tp_size {} (DP groups = ep / attn_tp)",
         parallel.ep_size,
         parallel.attn_tp_size,
@@ -247,14 +248,17 @@ pub fn build_configs(
         parallel.ep_size,
     );
     assert!(
-        parallel.ep_size % parallel.hp_size == 0,
+        parallel.ep_size.is_multiple_of(parallel.hp_size),
         "ep_size {} must be a multiple of hp_size {}",
         parallel.ep_size,
         parallel.hp_size,
     );
     assert!(parallel.nvl_num_gpu > 0, "nvl_num_gpu must be non-zero");
     assert!(
-        model.num_experts.get() % u32::from(parallel.ep_size) == 0,
+        model
+            .num_experts
+            .get()
+            .is_multiple_of(u32::from(parallel.ep_size)),
         "num_experts {} not divisible by ep_size {}",
         model.num_experts,
         parallel.ep_size,
@@ -541,12 +545,13 @@ pub fn build(
 
 impl Qwen3MoeFp8DpAttnEpFfnModel {
     /// Compile the per-iteration cost STRUCTURE once: Sum(embed,
-    /// Scale{num_layers}(Sum(attn_max, moe_router, dispatch, expert_max,
-    /// local_reduce, combine)), final_norm, lm_head). The DP `Max` children
+    /// `Scale{num_layers}(Sum(attn_max`, `moe_router`, dispatch, `expert_max`,
+    /// `local_reduce`, combine)), `final_norm`, `lm_head`). The DP `Max` children
     /// reuse one worklet because their shapes are identical; the EP `Max`
     /// children use the rank-specific worklets because their `local_ppm` cache
     /// identities may differ. Every compile call mints fresh slots, so
     /// `eval_into` fills them in the same order.
+    #[must_use]
     pub fn cost_tree(&self) -> CostTree {
         let mut b = CostTreeBuilder::new();
         let embed = self.embed.compile(&mut b);
@@ -637,21 +642,25 @@ impl Qwen3MoeFp8DpAttnEpFfnModel {
         b.finish(root)
     }
 
-    /// CostTree eval: stream this iteration's per-leaf [`LeafMetrics`] through
+    /// `CostTree` eval: stream this iteration's per-leaf [`LeafMetrics`] through
     /// `ev` in the EXACT slot order [`cost_tree`](Self::cost_tree) minted them:
-    /// embed (pooled), then ONE layer's `num_dp_groups` attn_block evals (one
-    /// per DP shard, each with its own batch_tokens), then `num_dp_groups`
-    /// moe_router evals (post_norm + router, replicated per DP shard on the
-    /// shard's own batch_tokens), then moe_dispatch (2 leaves on global token
-    /// count), then `ep_size` moe_expert_compute evals (one per EP rank, each
-    /// with its own local routing shard), then `num_dp_groups` moe_local_reduce
+    /// embed (pooled), then ONE layer's `num_dp_groups` `attn_block` evals (one
+    /// per DP shard, each with its own `batch_tokens`), then `num_dp_groups`
+    /// `moe_router` evals (`post_norm` + router, replicated per DP shard on the
+    /// shard's own `batch_tokens`), then `moe_dispatch` (2 leaves on global token
+    /// count), then `ep_size` `moe_expert_compute` evals (one per EP rank, each
+    /// with its own local routing shard), then `num_dp_groups` `moe_local_reduce`
     /// evals (home
-    /// reduce, per DP shard), then moe_combine (4 leaves on global token count).
+    /// reduce, per DP shard), then `moe_combine` (4 leaves on global token count).
     /// The `Scale{num_layers}` fold multiplies one layer body. Finally,
-    /// final_norm runs on pooled tokens and lm_head on pooled requests.
+    /// `final_norm` runs on pooled tokens and `lm_head` on pooled requests.
     fn eval_into(&self, batch: &UnifiedArchInput, ev: &mut Evaluator) {
         let m_total: u32 = batch.groups.iter().map(|g| g.batch_tokens).sum();
-        let request_count: u32 = batch.groups.iter().map(|g| g.request_count()).sum();
+        let request_count: u32 = batch
+            .groups
+            .iter()
+            .map(super::contract::ArchGroupInput::request_count)
+            .sum();
         let global_expert_selections = m_total * self.top_k;
         let tokens_for_comm = u64::from(m_total);
 
@@ -729,7 +738,7 @@ impl Qwen3MoeFp8DpAttnEpFfnModel {
 
 impl IterwiseUnifiedModel for Qwen3MoeFp8DpAttnEpFfnModel {
     fn total_kv_bytes_per_token(&self) -> u64 {
-        self.total_kv_bytes_per_token.get() as u64
+        u64::from(self.total_kv_bytes_per_token.get())
     }
 
     /// One replica spans the EP group — `ep_size` GPUs, with the DP-attention

@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet chunk-local scaled-dot KKT kernel.
+//! Qwen Gated `DeltaNet` chunk-local scaled-dot KKT kernel.
 //!
 //! Public inputs remain the physical `(num_tokens, num_chunks)` caller shape,
 //! while the cache projects them to `(C, D=T/C)`: launch chunks and average
@@ -38,8 +38,8 @@ pub struct GdnChunkScaledDotKktKernelInput {
 impl SweepCoords for GdnChunkScaledDotKktKernelInput {
     fn coords(&self) -> Coords {
         Coords::new([
-            self.num_chunks as f64,
-            self.num_tokens as f64 / self.num_chunks as f64,
+            f64::from(self.num_chunks),
+            f64::from(self.num_tokens) / f64::from(self.num_chunks),
         ])
     }
 
@@ -69,7 +69,17 @@ impl KernelSpec for GdnChunkScaledDotKktSpec {
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         grid.expand_2d(|num_chunks, tokens_per_chunk| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_chunks is a non-negative Axis sweep coordinate, always a small integer (see the chained axis above)"
+            )]
             let num_chunks = num_chunks.round() as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "tokens_per_chunk is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let tokens_per_chunk = tokens_per_chunk.round() as u64;
             num_chunks
                 .checked_mul(tokens_per_chunk)
@@ -84,7 +94,17 @@ impl KernelSpec for GdnChunkScaledDotKktSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_2d(|num_chunks, tokens_per_chunk| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "num_chunks is a non-negative Axis sweep coordinate, always a small integer (see the chained axis above)"
+            )]
             let num_chunks = num_chunks.round() as u64;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "tokens_per_chunk is a non-negative Axis::pow2 sweep coordinate, always a small power of two"
+            )]
             let tokens_per_chunk = tokens_per_chunk.round() as u64;
             let num_tokens = num_chunks
                 .checked_mul(tokens_per_chunk)
@@ -257,6 +277,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "grid axis values are chunk/token-per-chunk counts (bounded by the sweep grid's \
+                  own pow2 axes), well within u64's exact range and always non-negative"
+    )]
     fn mask_is_exactly_the_checked_checkpoint_token_cap() {
         let grid = GdnChunkScaledDotKktSpec::sweep_grid(&config());
         let mask = GdnChunkScaledDotKktSpec::infeasible_mask(&config(), &grid);
@@ -300,6 +326,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "chunks/density here come from Axis::pow2(0, 18) and Axis::pow2(0, 6), so the \
+                  f64 values are exact powers of two well within u64's exact range and always \
+                  non-negative"
+    )]
     fn enumerate_maps_cache_cells_to_exact_physical_python_payloads() {
         let cfg = config();
         let grid = GdnChunkScaledDotKktSpec::sweep_grid(&cfg);
@@ -379,7 +412,7 @@ mod tests {
             );
         }
 
-        let qwen_index = 1 * 7 + 6;
+        let qwen_index = 7 + 6;
         assert_eq!(
             payloads[qwen_index].fields()["num_tokens"],
             Value::from(128_u32)

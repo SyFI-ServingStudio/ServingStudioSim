@@ -96,6 +96,11 @@ impl KernelSpec for DsaMqaLogitsPrefillSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "num_queries/num_keys are non-negative sweep-grid coordinates, far below u32::MAX"
+        )]
         grid.expand_2d(|num_queries, num_keys| {
             ArgsPayload::new()
                 .with("backend", backend)

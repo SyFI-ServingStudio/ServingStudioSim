@@ -8,10 +8,10 @@
 //! `enumerate` `dtype` field is a fixed profiling artifact, kept only to stay
 //! aligned with the Python `P2pIntraArgs` wire schema).
 //!
-//! This is the intra-NVL-domain leg of the MoE network model (ref's
+//! This is the intra-NVL-domain leg of the `MoE` network model (ref's
 //! `get_p2p_metrics_batch` curve in `common_timing.rs`). A single send/recv
-//! between two ranks sharing an NVLink domain, measured as time vs message
-//! size. The MoE dispatch/combine L2 ops (`op/moe`) compute each network
+//! between two ranks sharing an `NVLink` domain, measured as time vs message
+//! size. The `MoE` dispatch/combine L2 ops (`op/moe`) compute each network
 //! stage's per-rank `max(send, recv)` byte load and look this curve up per
 //! stage (`P2pTier::IntraDomain`).
 //!
@@ -42,7 +42,7 @@ pub struct P2pIntraKernelConfig {
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
 pub struct P2pIntraKernelInput {
-    /// Bytes moved over the single src→dst link in this transfer. The MoE net
+    /// Bytes moved over the single src→dst link in this transfer. The `MoE` net
     /// model passes the bottleneck rank's `max(send_bytes, recv_bytes)` for a
     /// stage.
     pub message_size_bytes: u64,
@@ -71,9 +71,15 @@ impl KernelSpec for P2pIntraSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         grid.expand_1d(|message_size| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "message_size is a grid point from Axis::pow2, always a small non-negative power of two"
+            )]
+            let message_size_bytes = message_size as u64;
             ArgsPayload::new()
                 .with("backend", backend)
-                .with("message_size_bytes", message_size as u64)
+                .with("message_size_bytes", message_size_bytes)
                 // Fixed profiling dtype: comm is size-keyed (see module doc), the
                 // curve is measured once at bf16 for every logical payload dtype.
                 .with("dtype", DType::Bf16.as_str())
@@ -123,7 +129,12 @@ mod tests {
         let input = P2pIntraKernelInput {
             message_size_bytes: 1 << 20,
         };
-        assert_eq!(&*input.coords(), &[(1u64 << 20) as f64]);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "1u64 << 20 is a fixed test message size, far under f64's exact integer range"
+        )]
+        let expected = (1u64 << 20) as f64;
+        assert_eq!(&*input.coords(), &[expected]);
     }
 
     #[test]
@@ -133,7 +144,12 @@ mod tests {
         // 2^10 .. 2^28 inclusive = 19 points.
         assert_eq!(grid.axes()[0].len(), 19);
         assert_eq!(grid.axes()[0].first().copied(), Some(1024.0));
-        assert_eq!(grid.axes()[0].last().copied(), Some((1u64 << 28) as f64));
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "1u64 << 28 is a fixed test message size, far under f64's exact integer range"
+        )]
+        let expected_last = (1u64 << 28) as f64;
+        assert_eq!(grid.axes()[0].last().copied(), Some(expected_last));
         assert!(matches!(
             P2pIntraSpec::cache_kind("nccl"),
             CacheKind::Cache1DLinear

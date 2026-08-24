@@ -33,6 +33,10 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
             .resize_with(num_partitions, ArchGroupInput::default);
         out.groups.truncate(num_partitions);
 
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "partition count is a small DP/TP shard count, far below u16::MAX"
+        )]
         for partition in 0..num_partitions as u16 {
             let group = &mut out.groups[partition as usize];
             group.clear();
@@ -44,11 +48,21 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
                 ));
                 group.prefill_tokens += resolved_prefill.prefill_tokens_to_compute();
             });
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "KV length is a token count within one request's context window, far below u32::MAX"
+            )]
             kv_store.visit_decode_members(partition, |_, current_kv| {
                 group.decode_kv_lens.push(current_kv as u32);
                 group.total_kv_len += current_kv as u32;
             });
-            group.decode_tokens = group.decode_kv_lens.len() as u32;
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "decode member count per partition is bounded by the batch size, far below u32::MAX"
+            )]
+            {
+                group.decode_tokens = group.decode_kv_lens.len() as u32;
+            }
             group.batch_tokens = group.prefill_tokens + group.decode_tokens;
         }
         out.tokens_per_source_rank.clear();

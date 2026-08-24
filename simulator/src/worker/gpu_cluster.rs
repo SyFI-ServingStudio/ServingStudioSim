@@ -90,6 +90,7 @@ pub enum CostSource {
 
 impl CostSource {
     /// Analytic source from a per-link bandwidth in GB/s (`1 GB/s = 1e6 bytes/ms`).
+    #[must_use]
     pub fn analytic(gbps: f64) -> Self {
         CostSource::Analytic {
             bytes_per_ms: (gbps * 1e6).max(f64::MIN_POSITIVE),
@@ -97,11 +98,16 @@ impl CostSource {
     }
 
     /// Time for one link to carry `message_size_bytes`.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "message_size_bytes is a per-link transfer byte count; always far below 2^52 \
+                  (f64's exact-integer range) for realistic transfer sizes"
+    )]
     fn link_time(&self, message_size_bytes: u64) -> Time {
         match self {
             CostSource::Kernel(k) => {
                 let leaf = k.eval(&P2pInterKernelInput { message_size_bytes });
-                Time::from_ms(leaf.m.time_ms.max(0.0) as f64)
+                Time::from_ms(f64::from(leaf.m.time_ms.max(0.0)))
             }
             CostSource::Analytic { bytes_per_ms } => {
                 Time::from_ms(message_size_bytes as f64 / bytes_per_ms)
@@ -200,6 +206,7 @@ impl GpuCluster {
     /// blocks at construction via [`allocate`](GpuCluster::allocate) and their
     /// comm groups via [`register_comm_group`](GpuCluster::register_comm_group);
     /// the cluster starts with zero GPUs and zero groups.
+    #[must_use]
     pub fn new(cost: CostSource) -> Self {
         Self {
             gpus: Vec::new(),
@@ -237,6 +244,11 @@ impl GpuCluster {
         name: &str,
         pool_tag: &str,
     ) -> u16 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "gpus.len() is the run's total GPU count, bounded by realistic cluster sizes \
+                      well under u16::MAX"
+        )]
         let base = self.gpus.len() as u16;
         for offset in 0..n {
             self.gpus.push(GpuInfo {
@@ -282,6 +294,11 @@ impl GpuCluster {
         pool_tag: &'static str,
         worker_id: u16,
     ) -> u16 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "groups.len() is the run's comm-group count, bounded by realistic cluster/worker \
+                      counts well under u16::MAX"
+        )]
         let gid = self.groups.len() as u16;
         self.groups.push(CommGroup {
             base,
@@ -294,10 +311,12 @@ impl GpuCluster {
         gid
     }
 
+    #[must_use]
     pub fn num_gpus(&self) -> usize {
         self.gpus.len()
     }
 
+    #[must_use]
     pub fn num_groups(&self) -> usize {
         self.groups.len()
     }
@@ -308,6 +327,11 @@ impl GpuCluster {
     /// gid→gpu-set mapping into `run_meta.json` — the internal `groups` table is
     /// `#[serde(skip)]`, so this accessor is how the otherwise-private group
     /// identity leaves the cluster.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "gid is the enumerate index over the run's comm-group list, bounded by realistic \
+                  cluster sizes well under u16::MAX"
+    )]
     pub fn comm_groups(&self) -> impl Iterator<Item = (u16, u16, u16, &'static str, u16)> + '_ {
         self.groups.iter().enumerate().map(|(gid, g)| {
             (
@@ -346,6 +370,13 @@ impl GpuCluster {
     /// the `gpu_cluster` log alongside the resolved `start`/`end` window and both
     /// endpoints' worker identity — but only when a [`NetworkLogger`] is attached;
     /// otherwise they are ignored and `tag` is never cloned.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "per-link byte counts (bytes / link-count, non-negative) rounded back to u64; \
+                  always non-negative and far below 2^52 for realistic transfer sizes"
+    )]
     pub fn submit_transfer(
         &mut self,
         now: Time,
@@ -360,8 +391,8 @@ impl GpuCluster {
         if s.count == 0 || r.count == 0 {
             return now;
         }
-        let send_per_link = (bytes as f64 / s.count as f64).round() as u64;
-        let recv_per_link = (bytes as f64 / r.count as f64).round() as u64;
+        let send_per_link = (bytes as f64 / f64::from(s.count)).round() as u64;
+        let recv_per_link = (bytes as f64 / f64::from(r.count)).round() as u64;
         let send_dur = self.cost.link_time(send_per_link);
         let recv_dur = self.cost.link_time(recv_per_link);
         // Slower side bounds the collective; faster side is held throttled at
@@ -409,13 +440,20 @@ impl GpuCluster {
     ///     for its transmission slice (`transfer_time`, latency-stripped), so a
     ///     sender is free for its next push as soon as its bytes are on the wire;
     ///   - drains the **aggregate** byte total across the receiver's links.
-    /// Duration = `α + max(slowest sender transmission, receiver aggregate drain)`;
-    /// returns the time all bytes are resident at `recv_gid`. A single-source
-    /// gather has the same arrival as `submit_transfer` (α + max ≡ link_time), but
-    /// frees the sender after its own slice rather than the coupled collective.
+    ///     Duration = `α + max(slowest sender transmission, receiver aggregate drain)`;
+    ///     returns the time all bytes are resident at `recv_gid`. A single-source
+    ///     gather has the same arrival as `submit_transfer` (α + max ≡ `link_time`), but
+    ///     frees the sender after its own slice rather than the coupled collective.
     ///
     /// `kind`/`tag` are logged per source over the shared `[start, arrival]` window
     /// (only when a [`NetworkLogger`] is attached; `tag` is cloned per source then).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "per-link byte counts (bytes / link-count, non-negative) rounded back to u64; \
+                  always non-negative and far below 2^52 for realistic transfer sizes"
+    )]
     pub fn submit_gather(
         &mut self,
         now: Time,
@@ -451,7 +489,7 @@ impl GpuCluster {
             }
             start = start.max(s.send_free);
             total_bytes += bytes;
-            let per_link = (bytes as f64 / s.count as f64).round() as u64;
+            let per_link = (bytes as f64 / f64::from(s.count)).round() as u64;
             let xfer = Time::from_ms((self.cost.link_time(per_link).as_ms() - alpha_ms).max(0.0));
             live.push((sg, bytes, s.count, xfer));
         }
@@ -465,7 +503,7 @@ impl GpuCluster {
             send_xfer_max = send_xfer_max.max(xfer);
         }
         // The receiver drains the aggregate byte total across its links.
-        let recv_per_link = (total_bytes as f64 / r.count as f64).round() as u64;
+        let recv_per_link = (total_bytes as f64 / f64::from(r.count)).round() as u64;
         let recv_xfer =
             Time::from_ms((self.cost.link_time(recv_per_link).as_ms() - alpha_ms).max(0.0));
         // Latency paid ONCE for the whole gather (overlapped across sources).

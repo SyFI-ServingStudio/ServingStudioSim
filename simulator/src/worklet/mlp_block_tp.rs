@@ -1,14 +1,14 @@
 //! `MlpBlockTpWorklet` — tensor-parallel MLP block of a dense decoder layer:
-//! post-attn RMSNorm → column-parallel fused up_gate → SwiGLU activation →
+//! post-attn `RMSNorm` → column-parallel fused `up_gate` → `SwiGLU` activation →
 //! row-parallel down → optional `tp_allreduce`. `TP` group suffix (L3 §1.5): the
 //! block is one sync section whose boundary is the all-reduce that sums the
 //! row-parallel down output across the `tp_size` ranks.
 //!
-//! Megatron TP shards the FFN intermediate: up_gate is column-parallel (each
-//! rank owns `intermediate / tp` of the gate‖up concat), the SwiGLU activation
+//! Megatron TP shards the FFN intermediate: `up_gate` is column-parallel (each
+//! rank owns `intermediate / tp` of the gate‖up concat), the `SwiGLU` activation
 //! runs on those local `intermediate / tp` elements, and the row-parallel down's
 //! full `[tokens × hidden]` partial-sum is re-synced with the all-reduce.
-//! `hidden` is NOT sharded (up_gate input k=hidden, down output n=hidden).
+//! `hidden` is NOT sharded (`up_gate` input k=hidden, down output n=hidden).
 //!
 //! `tp_size == 1` degenerates to the single-GPU case: per-rank == full, and the
 //! `tp_ar` slot is `None` (no collective), so the cost matches the `Local` path.
@@ -74,10 +74,11 @@ pub struct MlpBlockTpWorklet {
 }
 
 impl MlpBlockTpWorklet {
+    #[must_use]
     pub fn resolve_config(cfg: &MlpBlockTpWorkletConfig) -> MlpBlockTpWorkletResolved {
-        let tp = cfg.tp_size as u32;
+        let tp = u32::from(cfg.tp_size);
         assert!(
-            cfg.intermediate.get() % tp == 0,
+            cfg.intermediate.get().is_multiple_of(tp),
             "intermediate {} not divisible by tp_size {}",
             cfg.intermediate,
             tp
@@ -121,7 +122,7 @@ impl MlpBlockTpWorklet {
                 // (`dtype_bytes` below) off a dtype-agnostic curve.
                 backends: cfg.allreduce_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                num_gpus: cfg.tp_size as u32,
+                num_gpus: u32::from(cfg.tp_size),
                 fabric: cfg.allreduce_fabric,
             }),
             intermediate_per_rank: inter_pr,
@@ -193,8 +194,8 @@ impl MlpBlockTpWorklet {
         })
     }
 
-    /// CostTree compile: sum post_norm + up_gate + act + down + optional
-    /// tp_allreduce, wrapped in a `Labeled` partition header.
+    /// `CostTree` compile: sum `post_norm` + `up_gate` + act + down + optional
+    /// `tp_allreduce`, wrapped in a `Labeled` partition header.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let r = &self.resolved;
         let label = format!(
@@ -216,7 +217,7 @@ impl MlpBlockTpWorklet {
         }
     }
 
-    /// CostTree eval: fill slots in the exact `compile` child order so the
+    /// `CostTree` eval: fill slots in the exact `compile` child order so the
     /// evaluator cursor stays aligned with the minted slot indices.
     pub fn eval(&self, input: &MlpBlockTpWorkletInput, ev: &mut Evaluator) {
         let m = input.batch_tokens;
@@ -228,9 +229,9 @@ impl MlpBlockTpWorklet {
         if let Some(tp_ar) = &self.tp_ar {
             // All-reduce the FULL [tokens × hidden] down partial-sum (see
             // AllReduceKernelInput: message is the complete output, not hidden/tp).
-            let message_size_bytes = (m as u64)
-                * (self.resolved.raw_cfg.hidden.get() as u64)
-                * (self.resolved.dtype_bytes as u64);
+            let message_size_bytes = u64::from(m)
+                * u64::from(self.resolved.raw_cfg.hidden.get())
+                * u64::from(self.resolved.dtype_bytes);
             tp_ar.eval(&AllReduceKernelInput { message_size_bytes }, ev);
         }
     }
