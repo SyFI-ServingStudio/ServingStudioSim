@@ -3,7 +3,9 @@
 //!
 //! The simulator remains the sole owner of kernel config decoding, sweep grids,
 //! cache construction and interpolation. This module only selects the exact leaf,
-//! expands the declared grid, and packages the two query responses for viz-ui.
+//! expands the declared cache grid, and packages the two query responses for
+//! viz-ui. Grid evaluation stays in cache-coordinate space; it must not invent
+//! physical Inputs for ragged or re-axis kernels.
 
 use std::path::Path;
 
@@ -63,27 +65,35 @@ pub(super) fn analyze_kernel_throughput(
             grid.kind
         );
     }
-    let query_points = expand_query_points(&grid.input_fields, &grid.grid_axes)?;
+    let (display_points, coordinate_points) =
+        expand_grid_points(&grid.input_fields, &grid.grid_axes)?;
     let eval = run_kernel_query(
         repo_root,
         &simulator,
         json!({
-            "op": "eval",
+            "op": "eval_coords",
             "kind": kind,
             "config": config,
-            "query_points": query_points,
+            "query_points": coordinate_points,
         }),
     )?;
-    let results = eval
+    let mut results = eval
         .get("results")
         .and_then(Value::as_array)
-        .context("kernel-query eval response has no results array")?;
-    if results.len() != query_points.len() {
+        .cloned()
+        .context("kernel-query eval_coords response has no results array")?;
+    if results.len() != display_points.len() {
         bail!(
-            "kernel-query eval returned {} points for a {}-point grid",
+            "kernel-query eval_coords returned {} points for a {}-point grid",
             results.len(),
-            query_points.len()
+            display_points.len()
         );
+    }
+    for (result, display_input) in results.iter_mut().zip(display_points) {
+        result
+            .as_object_mut()
+            .context("kernel-query eval_coords result is not an object")?
+            .insert("input".into(), display_input);
     }
 
     Ok(json!({
@@ -122,7 +132,10 @@ fn find_preorder_node(node: &Value, target: usize) -> Option<&Value> {
     walk(node, target, &mut 0)
 }
 
-fn expand_query_points(input_fields: &[String], axes: &[Vec<f64>]) -> Result<Vec<Value>> {
+fn expand_grid_points(
+    input_fields: &[String],
+    axes: &[Vec<f64>],
+) -> Result<(Vec<Value>, Vec<Vec<f64>>)> {
     if input_fields.is_empty() || input_fields.len() != axes.len() {
         bail!(
             "kernel grid has {} input fields for {} axes",
@@ -142,14 +155,16 @@ fn expand_query_points(input_fields: &[String], axes: &[Vec<f64>]) -> Result<Vec
         bail!("kernel grid has {point_count} points; limit is {MAX_GRID_POINTS}");
     }
 
-    let mut points = Vec::with_capacity(point_count);
+    let mut display_points = Vec::with_capacity(point_count);
+    let mut coordinate_points = Vec::with_capacity(point_count);
     let mut values = vec![0.0; axes.len()];
     fn expand(
         fields: &[String],
         axes: &[Vec<f64>],
         depth: usize,
         values: &mut [f64],
-        points: &mut Vec<Value>,
+        display_points: &mut Vec<Value>,
+        coordinate_points: &mut Vec<Vec<f64>>,
     ) {
         if depth == axes.len() {
             let object: Map<String, Value> = fields
@@ -157,16 +172,31 @@ fn expand_query_points(input_fields: &[String], axes: &[Vec<f64>]) -> Result<Vec
                 .cloned()
                 .zip(values.iter().copied().map(json_coord))
                 .collect();
-            points.push(Value::Object(object));
+            display_points.push(Value::Object(object));
+            coordinate_points.push(values.to_vec());
             return;
         }
         for &value in &axes[depth] {
             values[depth] = value;
-            expand(fields, axes, depth + 1, values, points);
+            expand(
+                fields,
+                axes,
+                depth + 1,
+                values,
+                display_points,
+                coordinate_points,
+            );
         }
     }
-    expand(input_fields, axes, 0, &mut values, &mut points);
-    Ok(points)
+    expand(
+        input_fields,
+        axes,
+        0,
+        &mut values,
+        &mut display_points,
+        &mut coordinate_points,
+    );
+    Ok((display_points, coordinate_points))
 }
 
 /// Sweep axes use `f64` internally for interpolation, while every current
@@ -187,18 +217,27 @@ mod tests {
 
     #[test]
     fn expands_grid_in_row_major_order() {
-        let points = expand_query_points(
+        let (display_points, coordinate_points) = expand_grid_points(
             &["m".into(), "n".into()],
             &[vec![1.0, 2.0], vec![8.0, 16.0]],
         )
         .unwrap();
         assert_eq!(
-            points,
+            display_points,
             vec![
                 json!({"m": 1, "n": 8}),
                 json!({"m": 1, "n": 16}),
                 json!({"m": 2, "n": 8}),
                 json!({"m": 2, "n": 16}),
+            ]
+        );
+        assert_eq!(
+            coordinate_points,
+            vec![
+                vec![1.0, 8.0],
+                vec![1.0, 16.0],
+                vec![2.0, 8.0],
+                vec![2.0, 16.0],
             ]
         );
     }

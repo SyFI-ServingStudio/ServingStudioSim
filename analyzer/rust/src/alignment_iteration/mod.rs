@@ -347,6 +347,14 @@ struct IterationKernelAggregate {
     row_id: String,
     name: String,
     name_id: u64,
+    /// Exact tuned kernel names represented by this logical occurrence.
+    ///
+    /// Uneven rank-local shapes may select different physical specializations
+    /// for one semantic operation. `inventory_kernels` retains each source row;
+    /// this set keeps that provenance visible after the logical cross-rank join.
+    physical_kernel_names: BTreeSet<String>,
+    /// Exact folded row IDs represented by this logical occurrence.
+    source_row_ids: BTreeSet<String>,
     category: String,
     operation: Option<String>,
     synchronizing: bool,
@@ -387,6 +395,19 @@ struct IterationMeasurement {
     /// of one track ran while another was busy is the difference between the
     /// per-track unions and the union across them.
     track_intervals: BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
+}
+
+/// One complete physical-device path after logical occurrences have been
+/// reduced across ranks. Keeping the selected device makes every consumer use
+/// the same path instead of independently combining maxima from several ranks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MeasuredCriticalPath {
+    device_id: Option<i64>,
+    mapped_ms: f64,
+    unmapped_ms: f64,
+    kernel_sum_ms: f64,
+    concurrent_hidden_ms: f64,
+    critical_path_ms: f64,
 }
 
 #[derive(Default)]
@@ -553,8 +574,6 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         // back to each participating rank. `measure_iteration` has already
         // joined mapped rows that schema-v4 folding split by rank sequence.
         let mut device_ops: BTreeMap<i64, BTreeMap<String, f64>> = BTreeMap::new();
-        let mut device_mapped_ms: BTreeMap<i64, f64> = BTreeMap::new();
-        let mut device_unmapped_ms: BTreeMap<i64, f64> = BTreeMap::new();
         let mut measured_kernel_rows = Vec::with_capacity(measurement.kernels.len());
         for (_, item) in &measurement.kernels {
             let device_count = item.device_ids.len().max(1);
@@ -567,9 +586,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                             .or_default()
                             .entry(operation.clone())
                             .or_default() += duration_ms;
-                        *device_mapped_ms.entry(*device_id).or_default() += duration_ms;
                     }
-                    None => *device_unmapped_ms.entry(*device_id).or_default() += duration_ms,
+                    None => {}
                 }
             }
             let track_indices: BTreeSet<usize> =
@@ -579,6 +597,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "sequence_id": item.sequence_id,
                 "row_id": item.row_id,
                 "name": item.name,
+                "physical_kernel_names": item.physical_kernel_names,
+                "source_row_ids": item.source_row_ids,
                 "category": item.category,
                 "operation": item.operation,
                 "synchronizing": item.synchronizing,
@@ -599,33 +619,25 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "device_ids": item.device_ids,
             }));
         }
-        let mut measured_ops: BTreeMap<String, f64> = BTreeMap::new();
-        for operations in device_ops.values() {
-            for (operation, device_ms) in operations {
-                let slowest = measured_ops.entry(operation.clone()).or_default();
-                *slowest = slowest.max(*device_ms);
-            }
-        }
+        let measured_reduction = measured_critical_path(&measurement);
+        let measured_ops = measured_reduction
+            .device_id
+            .and_then(|device_id| device_ops.remove(&device_id))
+            .unwrap_or_default();
         // How much of each operation ran while another track was busy. This is
         // the evidence a cost-model decision needs: an operation that is almost
         // entirely hidden is not on the critical path even though its kernels
         // are real work, and one that is never hidden is fully serial.
-        let measured_hidden_ops =
-            hidden_ms_by_operation(&measurement.kernels, &measurement.track_intervals);
-        let iteration_mapped_ms = device_mapped_ms.values().copied().fold(0.0f64, f64::max);
-        let iteration_unmapped_measured_ms =
-            device_unmapped_ms.values().copied().fold(0.0f64, f64::max);
-        let measured_kernel_sum_ms = iteration_mapped_ms + iteration_unmapped_measured_ms;
-        // Concurrent tracks run at the same time, so adding their durations
-        // counts the overlap twice. Subtract exactly that overlap rather than
-        // recomputing the whole reduction from raw intervals: the per-occurrence
-        // reductions above (slowest rank for independent work, arrival-to-
-        // completion for a synchronizing collective) stay untouched, and a
-        // single-track capture has no overlap and so is unchanged bit for bit.
-        let device_hidden = concurrent_hidden_ms_by_device(&measurement.track_intervals);
-        let measured_concurrent_hidden_ms = device_hidden.values().copied().fold(0.0f64, f64::max);
-        let measured_critical_path_ms =
-            (measured_kernel_sum_ms - measured_concurrent_hidden_ms).max(0.0);
+        let measured_hidden_ops = hidden_ms_by_operation(
+            &measurement.kernels,
+            &measurement.track_intervals,
+            measured_reduction.device_id,
+        );
+        let iteration_mapped_ms = measured_reduction.mapped_ms;
+        let iteration_unmapped_measured_ms = measured_reduction.unmapped_ms;
+        let measured_kernel_sum_ms = measured_reduction.kernel_sum_ms;
+        let measured_concurrent_hidden_ms = measured_reduction.concurrent_hidden_ms;
+        let measured_critical_path_ms = measured_reduction.critical_path_ms;
         let measured_track_busy_ms = track_busy_ms(&measurement.track_intervals);
         // Feed the pooled duty-cycle multiplier. Only iterations that have a
         // measured GPU cycle contribute, so the ratio's numerator and denominator
@@ -757,6 +769,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "measured_ms": measured_critical_path_ms,
             "measured_kernel_sum_ms": measured_kernel_sum_ms,
             "measured_concurrent_hidden_ms": measured_concurrent_hidden_ms,
+            "critical_device_id": measured_reduction.device_id,
             "measured_busy_union_ms": measured_busy_union_ms,
             "simulated_ms": sim.total_ms,
             "delta_ms": delta_ms,
@@ -774,6 +787,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "operation_summary": operation_rows,
             "measured_kernel_sum_ms": measured_kernel_sum_ms,
             "measured_concurrent_hidden_ms": measured_concurrent_hidden_ms,
+            "critical_device_id": measured_reduction.device_id,
             "measured_track_busy": measured_track_busy_ms,
             "simulated_leaf_workload_ms": simulated_leaf_workload_ms,
             "simulated_critical_path_ms": simulated_critical_path_ms,
@@ -1385,6 +1399,8 @@ fn measure_iteration(
             item.row_id = sequence_row.row_id.clone();
             item.name = sequence_row.name.clone();
             item.name_id = kernel.name_id;
+            item.physical_kernel_names.insert(sequence_row.name.clone());
+            item.source_row_ids.insert(sequence_row.row_id.clone());
             item.category = kernel.category.clone();
             item.synchronizing = sequence_row.synchronizing;
             item.launches.push(KernelLaunch {
@@ -1419,14 +1435,17 @@ fn measure_iteration(
 /// Reassemble mapped logical occurrences split across schema-v4 rank sequences.
 ///
 /// A folded row identifies a sequence shape, not a communicator. Within each
-/// `(device, phase, operation)` timeline, the zero-based ordinal identifies the
-/// logical occurrence shared by other rank sequences. Unmapped rows remain raw
-/// because they have no semantic identity that can justify a join.
+/// `(device, phase, operation, physical category)` timeline, the zero-based
+/// ordinal identifies the logical occurrence shared by other rank sequences.
+/// The category boundary prevents a rank that skips an auxiliary kernel from
+/// shifting every later position onto a different kind of physical work.
+/// Unmapped rows remain raw because they have no semantic identity that can
+/// justify a join.
 fn join_mapped_occurrences(
     inventory_kernels: &[(String, IterationKernelAggregate)],
 ) -> Result<Vec<(String, IterationKernelAggregate)>> {
-    let mut next_ordinal: BTreeMap<(i64, String, String), usize> = BTreeMap::new();
-    let mut joined_index: BTreeMap<(String, String, usize), usize> = BTreeMap::new();
+    let mut next_ordinal: BTreeMap<(i64, String, String, String), usize> = BTreeMap::new();
+    let mut joined_index: BTreeMap<(String, String, String, usize), usize> = BTreeMap::new();
     let mut joined = Vec::with_capacity(inventory_kernels.len());
 
     for (aggregate_key, item) in inventory_kernels {
@@ -1445,7 +1464,12 @@ fn join_mapped_occurrences(
                 launch.device_id,
             );
             let next_device_ordinal = next_ordinal
-                .entry((launch.device_id, item.phase.clone(), operation.clone()))
+                .entry((
+                    launch.device_id,
+                    item.phase.clone(),
+                    operation.clone(),
+                    item.category.clone(),
+                ))
                 .or_default();
             let device_ordinal = *next_device_ordinal;
             *next_device_ordinal += 1;
@@ -1457,16 +1481,19 @@ fn join_mapped_occurrences(
             occurrence_ordinal = Some(device_ordinal);
         }
         let occurrence_ordinal = occurrence_ordinal.context("mapped row has no launches")?;
-        let occurrence_key = (item.phase.clone(), operation.clone(), occurrence_ordinal);
+        let occurrence_key = (
+            item.phase.clone(),
+            operation.clone(),
+            item.category.clone(),
+            occurrence_ordinal,
+        );
 
         if let Some(index) = joined_index.get(&occurrence_key).copied() {
             let existing: &mut IterationKernelAggregate = &mut joined[index].1;
             ensure!(
-                existing.name_id == item.name_id
-                    && existing.name == item.name
-                    && existing.category == item.category
-                    && existing.synchronizing == item.synchronizing,
-                "operation {operation:?} occurrence {occurrence_ordinal} maps different kernels across rank sequences",
+                existing.synchronizing == item.synchronizing,
+                "operation {operation:?} category {:?} occurrence {occurrence_ordinal} has incompatible cross-rank semantics across rank sequences",
+                item.category,
             );
             ensure!(
                 existing.device_ids.is_disjoint(&item.device_ids),
@@ -1474,6 +1501,21 @@ fn join_mapped_occurrences(
             );
             existing.launches.extend(item.launches.iter().copied());
             existing.device_ids.extend(item.device_ids.iter().copied());
+            existing
+                .physical_kernel_names
+                .extend(item.physical_kernel_names.iter().cloned());
+            existing
+                .source_row_ids
+                .extend(item.source_row_ids.iter().cloned());
+            existing.sequence_id = "joined-rank-sequences".into();
+            existing.row_id = format!(
+                "logical/{}/{operation}/{}/{occurrence_ordinal}",
+                item.phase, item.category
+            );
+            if existing.physical_kernel_names.len() > 1 {
+                existing.name = format!("{operation} [rank-specific physical kernels]");
+                existing.name_id = u64::MAX;
+            }
             existing.first_start_ns = match (existing.first_start_ns, item.first_start_ns) {
                 (Some(left), Some(right)) => Some(left.min(right)),
                 (left, right) => left.or(right),
@@ -2369,6 +2411,71 @@ fn occurrence_ns(launches: &[KernelLaunch], synchronizing: bool) -> u64 {
     }
 }
 
+/// Reduce an iteration on each physical device, then select the longest whole
+/// path. This order matters for DP-divergent runs: taking the largest mapped,
+/// unmapped, and overlap components independently can splice together a path
+/// that no device executed.
+fn measured_critical_path(measurement: &IterationMeasurement) -> MeasuredCriticalPath {
+    let mut mapped_by_device: BTreeMap<i64, f64> = BTreeMap::new();
+    let mut unmapped_by_device: BTreeMap<i64, f64> = BTreeMap::new();
+    for (_, kernel) in &measurement.kernels {
+        let duration_ms = occurrence_ns(&kernel.launches, kernel.synchronizing) as f64 / 1e6;
+        let totals = if kernel.operation.is_some() {
+            &mut mapped_by_device
+        } else {
+            &mut unmapped_by_device
+        };
+        for device_id in &kernel.device_ids {
+            *totals.entry(*device_id).or_default() += duration_ms;
+        }
+    }
+
+    let hidden_by_device = concurrent_hidden_ms_by_device(&measurement.track_intervals);
+    let device_ids: BTreeSet<i64> = measurement
+        .device_ids
+        .iter()
+        .chain(mapped_by_device.keys())
+        .chain(unmapped_by_device.keys())
+        .chain(hidden_by_device.keys())
+        .copied()
+        .collect();
+
+    let mut selected: Option<MeasuredCriticalPath> = None;
+    for device_id in device_ids {
+        let mapped_ms = mapped_by_device.get(&device_id).copied().unwrap_or(0.0);
+        let unmapped_ms = unmapped_by_device.get(&device_id).copied().unwrap_or(0.0);
+        let kernel_sum_ms = mapped_ms + unmapped_ms;
+        let concurrent_hidden_ms = hidden_by_device
+            .get(&device_id)
+            .copied()
+            .unwrap_or(0.0)
+            .min(kernel_sum_ms);
+        let candidate = MeasuredCriticalPath {
+            device_id: Some(device_id),
+            mapped_ms,
+            unmapped_ms,
+            kernel_sum_ms,
+            concurrent_hidden_ms,
+            critical_path_ms: kernel_sum_ms - concurrent_hidden_ms,
+        };
+        // `device_ids` is ordered, so an exact tie keeps the lower device id.
+        if selected.as_ref().map_or(true, |current| {
+            candidate.critical_path_ms > current.critical_path_ms
+        }) {
+            selected = Some(candidate);
+        }
+    }
+
+    selected.unwrap_or(MeasuredCriticalPath {
+        device_id: None,
+        mapped_ms: 0.0,
+        unmapped_ms: 0.0,
+        kernel_sum_ms: 0.0,
+        concurrent_hidden_ms: 0.0,
+        critical_path_ms: 0.0,
+    })
+}
+
 /// Per device, how much busy time two or more concurrent tracks shared.
 ///
 /// `Σ per-track union − union across tracks`. Within one track kernels never
@@ -2418,12 +2525,13 @@ fn track_busy_ms(
 
 /// Per operation, how much of its measured busy time ran behind an earlier track.
 ///
-/// Charged per device and reduced with `max`, matching how every other
-/// per-operation quantity here folds across ranks. A single-track capture
+/// Only the selected critical device is charged, so operation rows add back to
+/// the same whole-device path as the iteration headline. A single-track capture
 /// yields nothing and the field stays absent.
 fn hidden_ms_by_operation(
     kernels: &[(String, IterationKernelAggregate)],
     track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
+    selected_device_id: Option<i64>,
 ) -> BTreeMap<String, f64> {
     let mut hidden: BTreeMap<String, f64> = BTreeMap::new();
     if track_intervals.values().all(|tracks| tracks.len() < 2) {
@@ -2434,7 +2542,9 @@ fn hidden_ms_by_operation(
             continue;
         };
         let entry = hidden.entry(operation.clone()).or_default();
-        *entry += launches_hidden_ms(&item.launches, track_intervals);
+        *entry += selected_device_id.map_or(0.0, |device_id| {
+            launches_hidden_ms_on_device(&item.launches, track_intervals, device_id)
+        });
     }
     hidden
 }
@@ -2451,8 +2561,8 @@ fn hidden_ms_by_operation(
 ///
 /// That choice is exact, not a convention: summed over every launch on a device
 /// it telescopes to `Σ per-track busy − union`, which is precisely the hidden
-/// time subtracted from the critical path. Devices are reduced with `max`,
-/// matching how every other per-occurrence quantity folds across ranks.
+/// time subtracted from the critical path. This audit-only helper reduces
+/// devices with `max`; the headline uses the selected-device helper below.
 fn launches_hidden_ms(
     launches: &[KernelLaunch],
     track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
@@ -2477,6 +2587,30 @@ fn launches_hidden_ms(
             interval_overlap_ns(&intervals, &earlier) as f64 / 1e6;
     }
     per_device.values().copied().fold(0.0f64, f64::max)
+}
+
+fn launches_hidden_ms_on_device(
+    launches: &[KernelLaunch],
+    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
+    device_id: i64,
+) -> f64 {
+    let Some(tracks) = track_intervals.get(&device_id) else {
+        return 0.0;
+    };
+    let mut hidden_ms = 0.0;
+    for track_index in tracks.keys() {
+        let intervals: Vec<(u64, u64)> = launches
+            .iter()
+            .filter(|launch| launch.device_id == device_id && launch.track_index == *track_index)
+            .map(|launch| (launch.start_ns, launch.end_ns))
+            .collect();
+        let earlier: Vec<(u64, u64)> = tracks
+            .range(..*track_index)
+            .flat_map(|(_, values)| values.iter().copied())
+            .collect();
+        hidden_ms += interval_overlap_ns(&intervals, &earlier) as f64 / 1e6;
+    }
+    hidden_ms
 }
 
 /// Length of the intersection of two interval sets, in nanoseconds.
@@ -2541,9 +2675,10 @@ fn signed_stats(samples: &[f64]) -> Value {
 
 fn definitions() -> Value {
     json!({
-        "measured_ms": "replica critical-path sum: every measured occurrence reduced across ranks (independent op = slowest rank duration; synchronizing collective = max(end) - max(start), i.e. last-arrival to done) then summed, minus measured_concurrent_hidden_ms. This is the baseline compared to the sim cost tree",
-        "measured_kernel_sum_ms": "the same per-occurrence reduction summed WITHOUT subtracting concurrency, i.e. measured_ms + measured_concurrent_hidden_ms. This is the like-for-like partner of a CostTree that composes those operations with Sum",
-        "measured_concurrent_hidden_ms": "time this device was busy on more than one CUDA stream at once, computed per device as (sum of per-track busy unions) - (busy union across tracks) and reduced across devices with max. Summing per-occurrence durations counts that overlap twice, so it is subtracted from measured_ms. Exactly 0 for a single-stream capture, which is why those numbers are unchanged",
+        "measured_ms": "replica critical path: reduce every occurrence across ranks, combine mapped work, unmapped work, and stream overlap on each device, then select the longest complete device path. This is the baseline compared to the sim cost tree",
+        "measured_kernel_sum_ms": "mapped plus unmapped occurrence costs on the selected critical device, before subtracting that device's stream overlap",
+        "measured_concurrent_hidden_ms": "overlap on the selected critical device = sum of per-track busy unions minus their combined union. Components from different devices are never mixed; a single-stream capture is unchanged",
+        "critical_device_id": "the physical device whose complete reduced path supplies measured_ms and all measured headline components",
         "measured_track_busy": "per device and concurrent track, that track own busy union and launch count. Which track the hidden time came from, not only that some was hidden",
         "operation_measured_concurrent_hidden_ms": "how much of this operation measured time ran while an EARLIER track on the same device was already busy. The overlap of two tracks is one shared stretch of wall clock, so it is charged only to the later-starting side; that is what makes these rows sum to the iteration measured_concurrent_hidden_ms instead of twice it, and it puts the hidden time on the side stream that joined a busy device. An operation that is almost entirely hidden is not on the critical path even though its kernels are real work. This is measurement evidence about the framework schedule; it is NOT a CostTree instruction, and in particular must not become a CostNode::Max, whose children are interchangeable cross-rank replicas (optimality R2 reads Max as load imbalance)",
         "measured_busy_union_ms": "audit only: union of CUDA kernel intervals across every NSYS phase and TP rank; it removes cross-op rank-skew overlap that the critical-path sum keeps, so it reads below measured_ms",
@@ -2834,6 +2969,8 @@ mod tests {
                 row_id: row_id.into(),
                 name: "mapped_kernel".into(),
                 name_id: 7,
+                physical_kernel_names: BTreeSet::from(["mapped_kernel".into()]),
+                source_row_ids: BTreeSet::from([row_id.into()]),
                 category: "test".into(),
                 operation: Some("moe.combine".into()),
                 synchronizing,
@@ -2843,6 +2980,45 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn measured_path_never_splices_cost_and_overlap_from_different_devices() {
+        let shared = mapped_row("shared/0", &[(0, 0, 20_000_000), (1, 0, 20_000_000)], false);
+        let rank_zero = mapped_row("rank-zero/0", &[(0, 20_000_000, 25_000_000)], false);
+        let mut rank_one_side = mapped_row("rank-one-side/0", &[(1, 5_000_000, 15_000_000)], false);
+        rank_one_side.1.launches[0].track_index = 1;
+        let mut unmapped = mapped_row("unmapped/0", &[(0, 25_000_000, 27_000_000)], false);
+        unmapped.1.operation = None;
+
+        let measurement = IterationMeasurement {
+            kernels: vec![shared, rank_zero, rank_one_side, unmapped],
+            inventory_kernels: Vec::new(),
+            phase_summaries: Vec::new(),
+            device_ids: BTreeSet::from([0, 1]),
+            busy_union_ms: 0.0,
+            track_intervals: tracks(&[
+                (
+                    0,
+                    0,
+                    &[
+                        (0, 20_000_000),
+                        (20_000_000, 25_000_000),
+                        (25_000_000, 27_000_000),
+                    ],
+                ),
+                (1, 0, &[(0, 20_000_000)]),
+                (1, 1, &[(5_000_000, 15_000_000)]),
+            ]),
+        };
+
+        let reduced = measured_critical_path(&measurement);
+
+        assert_eq!(reduced.device_id, Some(0));
+        assert_eq!(reduced.mapped_ms, 25.0);
+        assert_eq!(reduced.unmapped_ms, 2.0);
+        assert_eq!(reduced.concurrent_hidden_ms, 0.0);
+        assert_eq!(reduced.critical_path_ms, 27.0);
     }
 
     #[test]
@@ -2871,6 +3047,81 @@ mod tests {
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].1.device_ids, BTreeSet::from([0, 1, 2, 3]));
         assert_eq!(occurrence_ns(&joined[0].1.launches, false), 12);
+    }
+
+    #[test]
+    fn occurrence_joins_rank_specific_physical_kernel_specializations() {
+        let mut rank_13 = mapped_row("sequence-a/0", &[(1, 0, 10), (3, 0, 12)], false);
+        rank_13.1.name = "tuned_kernel_for_large_rank_shape".into();
+        rank_13.1.name_id = 11;
+        rank_13.1.physical_kernel_names =
+            BTreeSet::from(["tuned_kernel_for_large_rank_shape".into()]);
+        let mut rank_02 = mapped_row("sequence-b/0", &[(0, 0, 9), (2, 0, 11)], false);
+        rank_02.1.name = "tuned_kernel_for_small_rank_shape".into();
+        rank_02.1.name_id = 12;
+        rank_02.1.physical_kernel_names =
+            BTreeSet::from(["tuned_kernel_for_small_rank_shape".into()]);
+
+        let joined = join_mapped_occurrences(&[rank_13, rank_02]).unwrap();
+
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].1.row_id, "logical/forward/moe.combine/test/0");
+        assert_eq!(joined[0].1.sequence_id, "joined-rank-sequences");
+        assert_eq!(
+            joined[0].1.physical_kernel_names,
+            BTreeSet::from([
+                "tuned_kernel_for_large_rank_shape".into(),
+                "tuned_kernel_for_small_rank_shape".into(),
+            ])
+        );
+        assert_eq!(
+            joined[0].1.source_row_ids,
+            BTreeSet::from(["sequence-a/0".into(), "sequence-b/0".into()])
+        );
+        assert_eq!(occurrence_ns(&joined[0].1.launches, false), 12);
+    }
+
+    #[test]
+    fn category_local_ordinals_do_not_shift_after_rank_specific_auxiliary_work() {
+        let mut rank_0_main_0 = mapped_row("sequence-a/0", &[(0, 0, 5)], false);
+        rank_0_main_0.1.category = "main".into();
+        let mut rank_1_main_0 = mapped_row("sequence-b/0", &[(1, 0, 6)], false);
+        rank_1_main_0.1.category = "main".into();
+        let mut rank_0_aux = mapped_row("sequence-a/1", &[(0, 6, 8)], false);
+        rank_0_aux.1.category = "auxiliary".into();
+        let mut rank_0_main_1 = mapped_row("sequence-a/2", &[(0, 9, 14)], false);
+        rank_0_main_1.1.category = "main".into();
+        let mut rank_1_main_1 = mapped_row("sequence-b/1", &[(1, 9, 15)], false);
+        rank_1_main_1.1.category = "main".into();
+
+        let joined = join_mapped_occurrences(&[
+            rank_0_main_0,
+            rank_1_main_0,
+            rank_0_aux,
+            rank_0_main_1,
+            rank_1_main_1,
+        ])
+        .unwrap();
+
+        assert_eq!(joined.len(), 3);
+        assert_eq!(joined[0].1.device_ids, BTreeSet::from([0, 1]));
+        assert_eq!(joined[1].1.device_ids, BTreeSet::from([0]));
+        assert_eq!(joined[2].1.device_ids, BTreeSet::from([0, 1]));
+    }
+
+    #[test]
+    fn occurrence_rejects_incompatible_cross_rank_semantics() {
+        let first = mapped_row("sequence-a/0", &[(1, 0, 10)], false);
+        let incompatible = mapped_row("sequence-b/0", &[(0, 0, 9)], true);
+
+        let error = match join_mapped_occurrences(&[first, incompatible]) {
+            Ok(_) => panic!("incompatible mapped rows should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("incompatible cross-rank semantics"));
     }
 
     #[test]

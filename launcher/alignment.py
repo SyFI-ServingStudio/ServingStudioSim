@@ -9,6 +9,7 @@ NSYS normalization, and timing-predict input conversion.
 from __future__ import annotations
 
 import argparse
+import filecmp
 import json
 import shutil
 import sys
@@ -212,6 +213,22 @@ def _optional_profile_artifact(result: dict[str, Any], key: str) -> Path | None:
     return _profile_artifact(result, key)
 
 
+def _same_trace_source(left: Any, right: Any) -> bool:
+    """Accept copied trace artifacts only when their bytes are identical."""
+    if not isinstance(left, str) or not isinstance(right, str):
+        return left == right
+    left_path = Path(left).resolve()
+    right_path = Path(right).resolve()
+    if left_path == right_path:
+        return True
+    try:
+        return left_path.is_file() and right_path.is_file() and filecmp.cmp(
+            left_path, right_path, shallow=False
+        )
+    except OSError:
+        return False
+
+
 def _validate_e2e_profile_pair(
     nsys_result: dict[str, Any], workload_result: dict[str, Any]
 ) -> None:
@@ -241,7 +258,12 @@ def _validate_e2e_profile_pair(
     workload_drive = workload_result.get("drive_summary")
     if isinstance(nsys_drive, dict) and isinstance(workload_drive, dict):
         for field in ("source_trace", "frontend_type"):
-            if nsys_drive.get(field) != workload_drive.get(field):
+            matches = (
+                _same_trace_source(nsys_drive.get(field), workload_drive.get(field))
+                if field == "source_trace"
+                else nsys_drive.get(field) == workload_drive.get(field)
+            )
+            if not matches:
                 raise ValueError(
                     f"E2E profile provenance mismatch for drive_summary.{field}: "
                     f"{nsys_drive.get(field)!r} != {workload_drive.get(field)!r}"
@@ -262,7 +284,7 @@ def _warn_if_trace_mismatch(params: dict[str, Any], profile_result: dict[str, An
     aligned = (
         len(resolved_simulation) == 1
         and isinstance(profile_trace, str)
-        and resolved_simulation[0] == Path(profile_trace).resolve()
+        and _same_trace_source(str(resolved_simulation[0]), profile_trace)
     )
     if not aligned:
         print(

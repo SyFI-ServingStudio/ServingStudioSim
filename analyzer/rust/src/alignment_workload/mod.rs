@@ -235,8 +235,11 @@ fn read_measured_points(
 
     // Prefix-cache preflight requests run before the measured replay and use
     // the same logger. Their iteration ids form short, disjoint runs (for
-    // example 0 and 3). Select the unique contiguous run containing the NSYS
-    // window, which is guaranteed to sit inside the actual replay.
+    // example 0 and 3). NSYS and workload metrics are separate serving runs,
+    // so their absolute counters need not share an origin; warmup deliberately
+    // advances only the latter. Select the unique contiguous run whose
+    // relative span can contain the captured NSYS window, while preserving the
+    // engine's original ids on the selected records.
     let mut contiguous_runs: Vec<Vec<FullMeasuredMetrics>> = Vec::new();
     for record in records {
         let continues_last = contiguous_runs
@@ -248,19 +251,34 @@ fn read_measured_points(
         }
         contiguous_runs.last_mut().unwrap().push(record);
     }
+    let captured_origin = captured_iteration_ids
+        .iter()
+        .copied()
+        .min()
+        .context("NSYS parse contains no captured iterations")?;
+    let captured_relative_ids: HashSet<u64> = captured_iteration_ids
+        .iter()
+        .map(|iteration_id| iteration_id - captured_origin)
+        .collect();
     let mut matching_runs = contiguous_runs.into_iter().filter(|run| {
-        let run_ids: HashSet<u64> = run.iter().map(|record| record.iteration_index).collect();
-        !captured_iteration_ids.is_empty() && captured_iteration_ids.is_subset(&run_ids)
+        let Some(run_origin) = run.first().map(|record| record.iteration_index) else {
+            return false;
+        };
+        let run_relative_ids: HashSet<u64> = run
+            .iter()
+            .map(|record| record.iteration_index - run_origin)
+            .collect();
+        captured_relative_ids.is_subset(&run_relative_ids)
     });
     let selected = matching_runs.next().with_context(|| {
         format!(
-            "no contiguous full-run metrics segment contains all {} NSYS iterations",
+            "no contiguous full-run metrics segment spans all {} relative NSYS iterations",
             captured_iteration_ids.len()
         )
     })?;
     ensure!(
         matching_runs.next().is_none(),
-        "multiple full-run metrics segments contain the NSYS iteration window"
+        "multiple full-run metrics segments span the relative NSYS iteration window"
     );
 
     if selected.iter().any(|record| record.schema_version == 1) {
@@ -813,6 +831,74 @@ mod tests {
                 Some(observed),
             )
         }
+    }
+
+    #[test]
+    fn workload_metrics_run_may_have_a_shifted_iteration_origin() {
+        let directory = tempfile::tempdir().unwrap();
+        let parsed_nsys_path = directory.path().join("parsed_nsys.json");
+        let metrics_path = directory.path().join("metrics.jsonl");
+        fs::write(
+            &parsed_nsys_path,
+            r#"{"iteration_details":[{"iteration":0,"metrics":null,"ranges":[]},{"iteration":1,"metrics":null,"ranges":[]}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"schema_version\":2,\"input_adapter\":\"vllm_text\",\"iteration_index\":1200,\"prefill_tokens\":8,\"decode_kv_lens\":[],\"prefill_chunk_pairs\":[[0,8]],\"observed_start_monotonic_ns\":100,\"observed_end_monotonic_ns\":200,\"observed_elapsed_ms\":0.0001}\n",
+                "{\"schema_version\":2,\"input_adapter\":\"vllm_text\",\"iteration_index\":1201,\"prefill_tokens\":0,\"decode_kv_lens\":[8],\"prefill_chunk_pairs\":[],\"observed_start_monotonic_ns\":300,\"observed_end_monotonic_ns\":400,\"observed_elapsed_ms\":0.0001}\n",
+            ),
+        )
+        .unwrap();
+
+        let points = read_measured_points(&metrics_path, &parsed_nsys_path).unwrap();
+
+        assert_eq!(
+            points
+                .iter()
+                .map(|point| point.iteration_id)
+                .collect::<Vec<_>>(),
+            vec![1200, 1201]
+        );
+    }
+
+    #[test]
+    fn two_shifted_full_replay_segments_remain_ambiguous() {
+        let directory = tempfile::tempdir().unwrap();
+        let parsed_nsys_path = directory.path().join("parsed_nsys.json");
+        let metrics_path = directory.path().join("metrics.jsonl");
+        fs::write(
+            &parsed_nsys_path,
+            r#"{"iteration_details":[{"iteration":0,"metrics":null,"ranges":[]},{"iteration":1,"metrics":null,"ranges":[]}]}"#,
+        )
+        .unwrap();
+        let record = |iteration_index: u64, start_ns: u64| {
+            format!(
+                "{{\"schema_version\":2,\"input_adapter\":\"vllm_text\",\"iteration_index\":{iteration_index},\"prefill_tokens\":8,\"decode_kv_lens\":[],\"prefill_chunk_pairs\":[[0,8]],\"observed_start_monotonic_ns\":{start_ns},\"observed_end_monotonic_ns\":{},\"observed_elapsed_ms\":0.0001}}\n",
+                start_ns + 100
+            )
+        };
+        fs::write(
+            &metrics_path,
+            [
+                record(1200, 100),
+                record(1201, 300),
+                record(1300, 500),
+                record(1301, 700),
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+        let error = read_measured_points(&metrics_path, &parsed_nsys_path).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("multiple full-run metrics segments span"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
