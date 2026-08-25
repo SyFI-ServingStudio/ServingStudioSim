@@ -93,6 +93,17 @@ No-skip floor: any op too small to earn a bespoke kernel still gets verdict 3,
 never dropped. `elementwise` is both the floor (nothing lost) and the guard
 against minting N tiny kernels for cheap memory-bound ops.
 
+Separate semantic slots from physical repetition. One inseparable public
+operation is one slot even when it launches a fixed sequence of kernels or owns
+a runtime chunk loop. Do not expand runtime chunks, ranks, layers, or capacity
+into permanent `chunk_00...N`-style slots. Conversely, two independently issued
+production operations remain two slots even when they are adjacent or share an
+implementation library.
+
+Before verdict 2, record why verdict 1 cannot preserve the operation semantics,
+args meaning, dtype/layout, public callable, and logical launch boundary. A
+backend is not a license to reinterpret an existing kind's args.
+
 ## Output
 
 A per-op decision table for one decoder layer, plus the outside-loop ops (embed,

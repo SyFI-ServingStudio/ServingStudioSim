@@ -167,6 +167,14 @@ must match the measured production operation's backend specialization, layout,
 page contract, numeric contract, and shape. A common operation name does not
 make ragged, paged, calibration, or cache-free paths equivalent.
 
+Treat trace-derived workload as evidence, not scheduler policy. Request lengths,
+arrival times, and physical kernel inputs may be replayed. Observed DP placement,
+equal-shaped adjacency, and profiler-created synthetic chunks must not become
+predictive worker constraints. Implement chunked prefill as a generic lifecycle
+over the original requests. If an analysis conditions on observed placement or
+another realized decision, report that counterfactual separately from the
+predictive alignment.
+
 ## Match measured kernels to simulated slots
 
 Matching is semantic alignment between two decompositions: measured CUDA kernel
@@ -251,6 +259,18 @@ critical-path contribution. Classify with phase, folded position, ordered
 neighbors, semantics, and tensor/collective ownership — never a remembered
 ordinal or demangled name alone. Alignment reports facts and candidate owners;
 it does not select the next framework optimization.
+
+For multi-device, multi-stream timing, construct one complete reduced path per
+device first: mapped work, unmapped work, and stream overlap must share the same
+device timeline. Select the critical device only after that composition. Never
+take separate maxima for mapped, unmapped, and overlap components and splice
+them into a path that no device executed. Collective residency or arrival wait
+is timeline evidence, not kernel duration.
+
+Stream plots use the same reduced logical work as the numerical report, not raw
+residency intervals. Show material streams separately and aggregate small
+streams into a lossless remainder whose total is explicit; aggregation must not
+drop work or inflate the critical path.
 
 ## Preserve routing and workload equivalence
 

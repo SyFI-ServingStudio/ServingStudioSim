@@ -31,6 +31,13 @@ completion.
 
 ## Steps
 
+Before choosing either path, require a reuse verdict. Compare the nearest
+existing kind's operation semantics, `KernelArgs` meaning, dtype and storage
+layout, production callable, and logical launch boundary. A new backend may
+change the implementation but not those meanings. Create a new kind only when
+this comparison proves that reuse would change the contract; when source review
+is inconclusive, require a matched-shape A/B with identical logical I/O.
+
 1. Coordinate the Python profiling orchestrator.
 
 Use `orchestrator-add-kernel-to-python-profile` to define and validate the
@@ -38,7 +45,8 @@ Python profiling side:
 
 - decide whether this is a brand-new kernel kind or a new backend;
 - ground the operation and dtype/shape contract;
-- build or verify the Torch reference when needed;
+- identify the production public callable and build an independent Torch
+  correctness oracle when needed;
 - register Python profiling backends and verify `python -m profiling` smoke;
 - produce the Python-to-Rust handoff for the Rust orchestrator.
 

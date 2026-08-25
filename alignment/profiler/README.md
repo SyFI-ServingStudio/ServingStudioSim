@@ -35,19 +35,47 @@ the align config to point elsewhere.
 
 The instrumentation on `moesim-profile` is Python-only (NVTX scopes + iteration
 metrics logging), so the **precompiled fast path** works — no multi-hour CUDA
-compile:
+compile. The submodule is detached at the parent gitlink, so explicitly select
+the last upstream commit before the `feat(alignment):` patches. Without this,
+vLLM's setup cannot resolve the branch and silently falls back to the latest
+nightly wheel, which can be binary-incompatible with the pinned fork:
 
 ```bash
 cd alignment/profiler/vllm
-git status                         # confirm branch moesim-profile, tree present
+git status --short                 # confirm the pinned checkout is clean
+git rev-parse HEAD                 # record the exact detached gitlink
 
 # 3.12 venv living next to the fork (the path runner.py expects)
+# Archive any adopted environment first: installing over it does not prune
+# stale dependencies from a different nightly/CUDA generation.
+if [ -e .venv ]; then
+  ENVIRONMENT_ARCHIVE=$(mktemp -d "$TMPDIR/vllm-venv-archive-XXXXXXXX")
+  rmdir "$ENVIRONMENT_ARCHIVE"
+  mv .venv "$ENVIRONMENT_ARCHIVE"
+  echo "archived old vLLM environment at $ENVIRONMENT_ARCHIVE"
+fi
 uv venv --python 3.12 .venv
 
-# Install the fork's Python over vLLM's precompiled binaries for the pinned
-# base version (skips the from-source CUDA build). Match the box's CUDA (12.8).
-export VLLM_USE_PRECOMPILED=1
-uv pip install --python .venv/bin/python -e .
+# Resolve the binary base and verify every checkout-local change remains Python.
+FIRST_ALIGNMENT_COMMIT=$(git log --reverse --format=%H --fixed-strings \
+  --grep='feat(alignment):' HEAD | sed -n '1p')
+if [ -z "$FIRST_ALIGNMENT_COMMIT" ]; then
+  echo "cannot resolve the first alignment commit" >&2
+  exit 1
+fi
+PRECOMPILED_BASE_COMMIT=$(git rev-parse "$FIRST_ALIGNMENT_COMMIT^")
+if git diff --name-only "$PRECOMPILED_BASE_COMMIT"..HEAD | \
+  rg '\.(c|cc|cpp|cu|cuh|h|hpp|rs)$'; then
+  echo "alignment fork has native changes; build vLLM from source" >&2
+  exit 1
+fi
+
+# Install the fork's Python over that base's precompiled CUDA-12 wheel. The
+# hosted CUDA-12 variant is cu129; its PTX still needs a compatible driver.
+VLLM_USE_PRECOMPILED=1 \
+  VLLM_PRECOMPILED_WHEEL_COMMIT="$PRECOMPILED_BASE_COMMIT" \
+  VLLM_PRECOMPILED_WHEEL_VARIANT=cu129 \
+  uv pip install --python .venv/bin/python -e .
 
 # VLLM's profiling-only NVTX scopes import this optional package when
 # VLLM_NVTX_SCOPES_FOR_PROFILING=1.
@@ -57,9 +85,33 @@ uv pip install --python .venv/bin/python nvtx
 uv run --python .venv/bin/python python -c "import vllm, vllm.envs as e; print(vllm.__version__, hasattr(e, 'VLLM_NVTX_SCOPES_FOR_PROFILING'))"
 ```
 
-If `VLLM_USE_PRECOMPILED` cannot resolve a wheel for the pinned version, fall
-back to a from-source build (`uv pip install --python .venv/bin/python -e .`
-without the flag) — this compiles CUDA kernels and takes much longer.
+Import success is not a CUDA-runtime qualification: an older driver can load the
+cu129 extensions and still fail at their first PTX kernel with
+`cudaErrorUnsupportedPtxVersion`. Verify that `vllm` and every required native
+extension resolve under this checkout, run `uv pip check`, and execute a small
+production kernel from each CUDA toolchain used by the target model. If the host
+driver is too old, set the profile's top-level `driver_compat_lib_dir` to an
+unpacked matching NVIDIA `cuda-compat` directory containing `libcuda.so.1`; the
+launcher scopes that library to the vLLM server and records it in launch
+metadata. A local source build against the host CUDA toolkit is the other clean
+option.
+Before the probe, inspect `uv pip tree --python .venv/bin/python` for CUDA and
+CUTLASS packages and run `uv pip check --python .venv/bin/python`. Recent vLLM
+can intentionally resolve Torch cu12 together with CUDA-13 CUTLASS DSL/JIT
+packages, so mixed CUDA generations alone do not prove a stale environment.
+Recreate the environment when the consistency check fails, a distribution is
+present at multiple versions, or a package is not reachable from the current
+resolution. Select `driver_compat_lib_dir` for the highest CUDA/PTX generation
+exercised by the actual model path. Record the resolved module paths and loaded
+`libcuda.so.1` path with the alignment artifact; an import-only or tensor-only
+probe is insufficient.
+
+If the diff from `PRECOMPILED_BASE_COMMIT` contains native source, or if
+`VLLM_USE_PRECOMPILED` cannot resolve a wheel for that commit, fall back to a
+from-source build (`uv pip install --python .venv/bin/python -e .` without the
+flag) — this compiles CUDA kernels and takes much longer. Never use the latest
+nightly, another checkout's `.so` files, or model-specific compatibility
+switches as a fallback.
 
 ## SGLang environment
 

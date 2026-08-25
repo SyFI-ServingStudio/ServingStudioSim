@@ -14,7 +14,8 @@ use tower::ServiceExt;
 
 use super::alignment::{
     alignment_descriptor, alignment_iteration_detail, alignment_payload, alignment_report,
-    build_alignment_catalog, discover_alignments, resolve_alignment,
+    alignment_sequence_index, build_alignment_catalog, discover_alignments,
+    read_alignment_sequence, resolve_alignment,
 };
 use super::batch::{read_batch_payload, read_batch_report};
 use super::catalog::build_catalog;
@@ -440,6 +441,9 @@ fn prediction_test_router(logs_root: &Path) -> Router {
         operation_indexes: Arc::new(OperationIndexCache::default()),
         alignment_discovery: Arc::new(std::sync::Mutex::new(None)),
         alignment_detail_indexes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        alignment_sequence_indexes: Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     })
 }
 
@@ -2860,6 +2864,11 @@ fn write_alignment_bundle(root: &Path) -> (Vec<u8>, [usize; 2]) {
         json!({"iterations": [{"iteration_id": 8}]}).to_string(),
     )
     .expect("timeline report");
+    fs::write(
+        kernel.join("reports/alignment_iteration_report.json"),
+        json!({"schema_version": 2, "available": true}).to_string(),
+    )
+    .expect("iteration report");
 
     let first = json!({"iteration_id": 8, "measured": "eight"}).to_string();
     let second = json!({"iteration_id": 9, "measured": "nine"}).to_string();
@@ -2888,6 +2897,37 @@ fn write_alignment_bundle(root: &Path) -> (Vec<u8>, [usize; 2]) {
         .to_string(),
     )
     .expect("timeline payload");
+
+    let sequence = json!({
+        "phase": "forward",
+        "sequence_id": "sequence_a",
+        "expanded_kernel_count": 1,
+        "iterations": [8],
+        "tracks": [{
+            "track_index": 0,
+            "stream_role": "primary",
+            "kernel_count": 1,
+            "program": [{"kernels": [{"name": "kernel_a"}]}],
+        }],
+    })
+    .to_string();
+    fs::write(
+        kernel.join("payloads/alignment_sequence_programs.jsonl"),
+        format!("{sequence}\n"),
+    )
+    .expect("sequence shard");
+    fs::write(
+        kernel.join("payloads/alignment_iteration_series.json"),
+        json!({
+            "schema_version": 2,
+            "sequence_detail": {
+                "file": "alignment_sequence_programs.jsonl",
+                "byte_ranges": {"forward": {"sequence_a": [0, sequence.len()]}},
+            },
+        })
+        .to_string(),
+    )
+    .expect("iteration payload");
 
     // Configured but never run: manifest present, no report.
     let e2e = bundle.join("analysis_e2e");
@@ -3053,6 +3093,26 @@ fn one_iteration_is_read_by_byte_range_not_by_parsing_the_shard() {
     // The second record really starts after the first, so the range is a seek
     // and not a full scan that happened to work.
     assert!(offsets[1] > offsets[0]);
+}
+
+#[test]
+fn one_sequence_is_read_by_phase_and_id_from_its_shard() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let alignment = &discover_alignments(&roots).expect("discover")[0];
+    let index = alignment_sequence_index(alignment).expect("sequence index");
+
+    let sequence =
+        read_alignment_sequence(&index, "forward", "sequence_a").expect("selected sequence");
+
+    assert_eq!(
+        serde_json::from_slice::<Value>(&sequence).expect("sequence json")["tracks"][0]["program"]
+            [0]["kernels"][0]["name"],
+        "kernel_a"
+    );
+    assert!(read_alignment_sequence(&index, "forward", "../../etc/passwd").is_err());
 }
 
 #[test]

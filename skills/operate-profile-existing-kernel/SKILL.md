@@ -80,6 +80,20 @@ Record these fields with the spec set and verify them before calling a row a DB
 hit for the target experiment. If provenance is unavailable, report the row as
 unverified rather than inferring equivalence from table/backend alone.
 
+For framework and specialized compute rows, verify that the timed boundary is
+the production public callable and that `Timer.cupti` sums one logical
+invocation: a stable single kernel may use a name filter, while a compound
+callable must include its full launch sequence with `kernel_name=None`. Preserve
+the documented `Timer.do_bench` path for simple Torch GEMM. CUDA-event timing is
+diagnostic, not DB evidence. Allocation, compile, correctness, and
+synchronization must be outside the timed closure.
+
+Inspect input generation before trusting a row for a data-sensitive algorithm.
+The synthetic workload must exercise the same planner, histogram/radix path, or
+memory-locality regime as production, with deterministic construction outside
+timing and an independent correctness oracle. Do not refresh a row merely to
+bless a pathological input or a relaxed tolerance.
+
 ### Preserve rows written in a worktree
 
 `profiling/profile.db` is tracked, but a worktree may hide its local changes with
@@ -179,6 +193,8 @@ only after doing the exact action, or write `N/A: reason`.
   `<table>` and `--backend` exist.
 - [] Record the listed `kernel_kind`, `args`, `metric_family`,
   `subprocess_env`, generated `get_fn`, and generated `count_fn`.
+- [] For compute profiling, verify the public callable, CUPTI filter/sum
+  boundary, untimed setup/correctness, and representative input distribution.
 - [] Build the complete intended spec set. Confirm every spec has exactly the
   listed `args` fields and no routing-only fields such as `backend`.
 - [] For a homogeneous multi-spec profiling request, write the complete set to
@@ -186,7 +202,7 @@ only after doing the exact action, or write `N/A: reason`.
   `run` calls.
 - [] For a single spec, use `--spec`; for a multi-spec set, choose JSON list,
   `{"specs": [...]}`, or JSONL as the one `--specs` input.
-- [] Decide DB path. Use a task-scoped DB under `<workspace>/tmp/` for
+- [] Decide DB path. Use a task-scoped DB under `$TMPDIR` for
   validation-only runs; use the
   default/shared DB only when the user explicitly wants to update it.
 - [] Decide whether `--gpu-name` is needed. Use it for a known DB key or to
@@ -296,7 +312,7 @@ Single-spec run:
 
 ```bash
 uv run python -m launcher kernel-profile run single_gemm --backend torch --force \
-  --db tmp/single-gemm/profile.db \
+  --db "$TMPDIR/single-gemm/profile.db" \
   --output-dir logs/20260731_0_single_gemm_profile --json \
   --spec '{"m":128,"n":8192,"k":8192,"dtype":"bf16"}'
 ```
@@ -304,7 +320,7 @@ uv run python -m launcher kernel-profile run single_gemm --backend torch --force
 Complete JSON/JSONL spec set:
 
 ```bash
-uv run python -m launcher kernel-profile run single_gemm --backend torch --gpu-name "H100" --specs specs.json --db tmp/single-gemm/profile.db --output-dir logs/20260731_0_single_gemm_profile --json
-uv run python -m launcher kernel-profile count-missing single_gemm --backend torch --gpu-name "H100" --specs specs.json --db tmp/single-gemm/profile.db --json
-uv run python -m launcher kernel-profile query single_gemm --backend torch --gpu-name "H100" --specs specs.jsonl --db tmp/single-gemm/profile.db --json
+uv run python -m launcher kernel-profile run single_gemm --backend torch --gpu-name "H100" --specs specs.json --db "$TMPDIR/single-gemm/profile.db" --output-dir logs/20260731_0_single_gemm_profile --json
+uv run python -m launcher kernel-profile count-missing single_gemm --backend torch --gpu-name "H100" --specs specs.json --db "$TMPDIR/single-gemm/profile.db" --json
+uv run python -m launcher kernel-profile query single_gemm --backend torch --gpu-name "H100" --specs specs.jsonl --db "$TMPDIR/single-gemm/profile.db" --json
 ```

@@ -427,6 +427,14 @@ pub(super) struct AlignmentDetailIndex {
     pub(super) reference_host_thread_ids: HashSet<String>,
 }
 
+/// Byte ranges for folded sequence programs. The iteration series keeps only
+/// browse metadata; opening the mapping board fetches the selected programs.
+#[derive(Clone)]
+pub(super) struct AlignmentSequenceIndex {
+    pub(super) shard_path: PathBuf,
+    pub(super) byte_ranges: HashMap<(String, String), (u64, u64)>,
+}
+
 pub(super) fn alignment_detail_index(
     alignment: &DiscoveredAlignment,
     subject: &str,
@@ -502,6 +510,68 @@ pub(super) fn read_alignment_iteration_detail(
         .ok_or(ArtifactNotFound)?;
     let mut handle = fs::File::open(&index.shard_path)
         .with_context(|| format!("open alignment shard {}", index.shard_path.display()))?;
+    handle.seek(SeekFrom::Start(offset))?;
+    let mut buffer = vec![0u8; length as usize];
+    handle.read_exact(&mut buffer)?;
+    Ok(buffer)
+}
+
+pub(super) fn alignment_sequence_index(
+    alignment: &DiscoveredAlignment,
+) -> Result<AlignmentSequenceIndex> {
+    let payload_path = artifact_path(alignment, "iteration", true)?;
+    let payload: Value = read_json(&payload_path)?;
+    let detail = payload.get("sequence_detail").ok_or(ArtifactNotFound)?;
+    let file = detail
+        .get("file")
+        .and_then(Value::as_str)
+        .ok_or(ArtifactNotFound)?;
+    let phase_ranges = detail
+        .get("byte_ranges")
+        .and_then(Value::as_object)
+        .ok_or(ArtifactNotFound)?;
+    let mut byte_ranges = HashMap::new();
+    for (phase, sequences) in phase_ranges {
+        let sequences = sequences.as_object().ok_or(ArtifactNotFound)?;
+        for (sequence_id, range) in sequences {
+            let range = range.as_array().ok_or(ArtifactNotFound)?;
+            let offset = range
+                .first()
+                .and_then(Value::as_u64)
+                .ok_or(ArtifactNotFound)?;
+            let length = range
+                .get(1)
+                .and_then(Value::as_u64)
+                .ok_or(ArtifactNotFound)?;
+            byte_ranges.insert((phase.clone(), sequence_id.clone()), (offset, length));
+        }
+    }
+    let shard_path = payload_path
+        .parent()
+        .ok_or(ArtifactNotFound)?
+        .join(Path::new(file).file_name().ok_or(ArtifactNotFound)?);
+    Ok(AlignmentSequenceIndex {
+        shard_path,
+        byte_ranges,
+    })
+}
+
+pub(super) fn read_alignment_sequence(
+    index: &AlignmentSequenceIndex,
+    phase: &str,
+    sequence_id: &str,
+) -> Result<Vec<u8>> {
+    let (offset, length) = index
+        .byte_ranges
+        .get(&(phase.to_owned(), sequence_id.to_owned()))
+        .copied()
+        .ok_or(ArtifactNotFound)?;
+    let mut handle = fs::File::open(&index.shard_path).with_context(|| {
+        format!(
+            "open alignment sequence shard {}",
+            index.shard_path.display()
+        )
+    })?;
     handle.seek(SeekFrom::Start(offset))?;
     let mut buffer = vec![0u8; length as usize];
     handle.read_exact(&mut buffer)?;

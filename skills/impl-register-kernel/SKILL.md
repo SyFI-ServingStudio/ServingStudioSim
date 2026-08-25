@@ -62,6 +62,13 @@ Keep these invariants:
 - `perf_api.py` gets no hand-written `get_<kind>_times` or
   `count_missing_<kind>` wrappers.
 
+Keep the schema physical and minimal. Add a field only when it can change the
+production execution path or materially improve cache fidelity enough to
+justify grid growth and DB migration. Preserve exact ragged topology when an
+aggregate count cannot determine planner, page lookup, or branching behavior;
+do not propagate an upstream popularity distribution into unrelated helpers.
+Distinguish runtime allocation capacity from checkpoint capability.
+
 ## Runner Contract
 
 Runner files allocate tensors, invoke/profile kernels, and return metrics. They
@@ -92,12 +99,35 @@ Heavy framework imports belong inside the runner function or worker-only path.
 Importing `profiling.kernels.<kind>` must not import torch, CUDA libraries, or
 the runner module.
 
+Time the production public callable, not a Torch rewrite that merely computes
+similar math. Torch should independently check numerical semantics outside the
+timed boundary unless Torch itself is the production callable. Do not copy
+specialized CUDA, Marlin, CUTLASS, FlashMLA, Triton, or CuTeDSL implementation
+source into the runner.
+
+Build synthetic inputs that exercise the production algorithm, including
+planner, histogram, radix, or locality-sensitive paths when present. Prefer the
+framework's correctness distribution or the real producer's contract, use a
+fixed seed, and construct inputs outside timing. Do not weaken the oracle to
+accommodate a pathological synthetic workload. For packed storage, derive data
+and scale planes from the production writer and reader; validate within-page
+layout separately from page alignment and cover relevant partial-window,
+ratio-boundary, multi-request, padding, inactive-row, and poison-sentinel cases.
+
 ## Timing And Metrics
 
-Choose the timing method by mirroring the closest current runner family. Current
-compute runners generally use `Timer.cupti` for kernel-only timing and
-`Energy.perf(..., per_iter_time_ms=time_ms)` for energy. Use another timer only
-when a nearby current runner or an explicit task requirement justifies it.
+For framework and specialized GPU callables, compute profile rows use the sum
+of CUPTI kernel durations for one logical invocation. A proven single-launch
+callable may filter by a stable kernel name; a compound callable uses
+`kernel_name=None` so every launch in its fixed sequence is counted. Keep the
+documented `Timer.do_bench` path for simple Torch GEMM; do not replace an
+established runner family's timing method without evidence. CUDA-event elapsed
+time is diagnostic only. Allocation, input construction, compilation, warmup,
+correctness, and synchronization stay outside the timed closure.
+
+Use `Energy.perf(..., per_iter_time_ms=time_ms)` for energy. A different timing
+boundary requires an explicit operation contract and orchestrator approval, not
+merely a nearby runner that happens to use another timer.
 
 Return `ComputeMetrics` for `MetricFamily.COMPUTE` and `CommMetrics` for
 `MetricFamily.COMM`. Keep metric formulas close to the existing family runner,
@@ -105,16 +135,14 @@ and state any approximation in the task report.
 
 ## Tests And Smoke
 
-Add focused tests matching existing `tests/test_<kind>.py` style:
-
-- import the per-kernel module directly;
-- check args field order and dtype coercion where relevant;
-- check `KIND` and registry spec shape;
-- check lazy import behavior in a subprocess;
-- for new backends, check the backend appears in registry metadata and shares
-  the existing args schema/table;
-- for list-native comm, check `list_native`, `gpu_count_fn`, and batch function
-  routing.
+Add only focused tests that protect observable behavior or a real integration
+boundary: an independent numerical result, actual argument forwarding, invalid
+input rejection, a stable logical launch boundary, or a kernel-specific schema
+coercion that can fail. Generic registry metadata, facade generation, lazy
+loading, and list-native plumbing belong in shared registry/infra tests, not a
+copied checklist in every kernel file. Ordinary unit tests must not build a DB
+or invoke a GPU; use the public smoke below for that evidence. Every new test
+should name the real defect it would catch.
 
 Verify generated metadata without hand-written facades:
 
@@ -127,7 +155,7 @@ Then run a real public-entry smoke through the profiling CLI on a representative
 spec:
 
 ```bash
-uv run python -m profiling run <kind> --backend <backend> --db /tmp/<kind>_<backend>_smoke.db --spec '<json spec>' --json
+uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke.db" --spec '<json spec>' --json
 ```
 
 This must invoke the registered runner through `profiling.perf_api`, the table

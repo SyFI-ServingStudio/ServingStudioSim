@@ -73,6 +73,11 @@ identity, successful execution, and explicit output-evidence provenance. This
 is an eligibility check, not a claim that simulator output establishes
 downstream task accuracy.
 
+Trace equivalence does not authorize replaying framework scheduler decisions as
+simulator policy. Reject alignments that force observed DP ranks, equal-shaped
+adjacent requests, or synthetic chunks to manufacture iteration agreement;
+report observed-conditioning experiments separately.
+
 For every material unmapped semantic family, make one explicit disposition:
 
 - label an existing simulated owner;
@@ -112,6 +117,12 @@ measured_ms` — the same per-occurrence `measured_ms` reduction the breakdown
 reports, so numerator and denominator are one consistent metric. Judge whether
 that correction is reasonable:
 
+- multi-device evidence was reduced as complete per-device paths before the
+  critical device was selected; mapped, unmapped, and overlap maxima were not
+  chosen independently;
+- collective residency/wait remains timeline evidence rather than being counted
+  as CUDA kernel duration, and stream plots preserve reduced work totals even
+  when small streams are aggregated;
 - its inverse (the pooled kernel/GPU busy fraction) is plausible for the workload
   (a well-batched run spends most of the GPU cycle in kernels, so the multiplier
   is near 1; a large multiplier means big host bubbles that deserve an

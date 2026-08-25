@@ -39,6 +39,11 @@ not just the framework name or high-level docs. Record the exact
 module/function/class path and the version/commit assumption. If the
 implementation code is not accessible, return that as a blocker.
 
+Prefer the production framework's public callable. Do not propose copying CUDA,
+Marlin, CUTLASS, FlashMLA, Triton, or CuTeDSL source into a profiler. Torch is an
+independent numerical oracle unless the production path itself is a public
+Torch callable; it is not a substitute timed implementation.
+
 ## What To Report
 
 For each found implementation:
@@ -51,6 +56,10 @@ For each found implementation:
 - fit to the existing or proposed args schema, and any schema-sensitive fields;
 - dtype / GPU / architecture / shape constraints, and unsupported cases;
 - the package or `profiling.exec.env` the implementation needs.
+
+For packed or quantized storage, derive the contract from both the production
+writer and reader. Report data and scale planes, within-page layout, and page
+alignment separately; a matching tensor shape is not layout evidence.
 
 If no implementation is found, say so plainly — that absence is itself a finding
 the boundary decision uses (it usually points to an `elementwise` placeholder).
@@ -69,7 +78,11 @@ plan must be concrete enough for `impl-register-kernel`:
 - unsupported cases and how the runner should fail them;
 - suggested timing method by mirroring the closest current runner family;
 - a representative smoke spec for
-  `uv run python -m profiling run <kind> --backend <backend> --db /tmp/<kind>_<backend>_smoke.db --spec '<json spec>' --json`.
+  `uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke.db" --spec '<json spec>' --json`.
+
+If reuse versus a new kind remains ambiguous after source review, specify a
+matched-shape A/B that holds logical inputs, outputs, layout, and timing boundary
+constant. Do not settle it from names or approximate FLOP/byte formulas.
 
 If the source needs a changed args schema, say so and return for a kind/schema
 decision. Do not hide backend-specific fields inside a runner.

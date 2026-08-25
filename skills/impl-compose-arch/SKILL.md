@@ -77,6 +77,11 @@ backends/algorithms = different arch files (no in-file if/match polymorphism).
 - `gpu_name` is the single source of truth threaded into every kernel lookup.
 - Multi-rank fan-out uses `CostNode::Max` / `LeafMetrics` with overlap_factor `1.0`
   at L4 — real <1.0 overlap only lives inside an L3 worklet.
+- Preserve each worklet's source barriers and common spine. L4 may fold
+  homogeneous layer repetition with `Scale`, but must not clone phase-specific
+  trees, expand ranks/chunks into slots, or move children across a join. A
+  serial-stream architecture variant changes composition only; it keeps the
+  same worklets, leaves, inputs, and operation boundaries.
 
 ## Tests And Smoke
 

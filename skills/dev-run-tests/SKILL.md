@@ -86,6 +86,15 @@ example is `tests/test_throughput_regression.py`.
 
 ## Adding a tiered test
 
+First state the observable behavior and the real defect the test prevents. Keep
+independent numerical expectations, actual argument forwarding, invalid-input
+rejection, stable logical launch boundaries, and cache interpolation checks.
+Do not add per-kernel copies of registry/facade metadata tests or tests that
+merely repeat the implementation formula. Keep DB/GPU integration out of the
+default CPU tier: mark genuine integration tests with the tier below, and use
+the public profiling smoke workflow for per-kernel DB/GPU evidence. Put generic
+registry behavior in shared infra tests.
+
 - Pure logic → no marker (cpu). Keep it deterministic and mock the GPU.
 - Needs the binary / a CUDA device / warm db → add `@pytest.mark.needs_binary` /
   `gpu` / `needs_db` (module-level `pytestmark` if the whole file is one tier).

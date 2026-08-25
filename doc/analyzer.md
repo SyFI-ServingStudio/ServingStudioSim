@@ -229,6 +229,11 @@ any specific constant:
   millions of rows into Rust to loop.
 - **Downsample distributions.** Emit a CDF as a bounded, evenly-spaced curve, not a
   per-sample array — visually identical, tiny JSON.
+- **Shard interactive detail.** A page bootstrap artifact contains bounded
+  summaries and byte-range indexes. Per-iteration rows and folded alignment
+  programs live in JSONL shards and are fetched only after the user selects
+  them; HTTP compression is supplementary and never a substitute for avoiding
+  a hundreds-of-megabytes browser parse.
 - **Stride-sample slot-scale data.** When even the aggregation spans hundreds of
   millions of slots, sample a subset of iterations (a temporal stride) and compute
   the distribution exactly over that sample; log what was sampled, never silently
