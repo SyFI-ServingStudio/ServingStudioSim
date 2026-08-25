@@ -379,7 +379,13 @@ def _render_stream_breakdown(
     if device_id is None:
         device_id = timeline_iteration["measured"].get("critical_device_id")
     if device_id is None:
-        raise ValueError("multi-stream breakdown is missing critical_device_id")
+        work_by_device: dict[int, int] = defaultdict(int)
+        for kernel in timeline_iteration["measured"]["kernels"]:
+            for interval in kernel["iv"]:
+                work_by_device[int(interval[0])] += max(0, int(interval[2]) - int(interval[1]))
+        if not work_by_device:
+            raise ValueError("multi-stream breakdown has no measured device work")
+        device_id = min(work_by_device, key=lambda item: (-work_by_device[item], item))
     device_id = int(device_id)
 
     stream_rows = _stream_operation_rows(timeline_iteration, device_id)

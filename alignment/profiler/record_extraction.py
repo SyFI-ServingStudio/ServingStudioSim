@@ -33,6 +33,58 @@ _ALIGNMENT_ITERATION_RE = re.compile(r"VibeSimAlignmentIteration\s+(\{.*\})\s*$"
 _ALIGNMENT_REQUEST_TIMING_RE = re.compile(r"VibeSimAlignmentRequestTiming\s+(\{.*\})\s*$")
 _ALIGNMENT_API_REQUEST_TIMING_RE = re.compile(r"VibeSimAlignmentApiRequestTiming\s+(\{.*\})\s*$")
 _ALIGNMENT_EXPERT_LOAD_RE = re.compile(r"VibeSimAlignmentExpertLoad\s+(\{.*\})\s*$")
+_VLLM_ENGINE_CORE_PREFIX_RE = re.compile(r"\(EngineCore(?:_DP(\d+))?\s+pid=(\d+)\)")
+_VLLM_ENGINE_CORE_BODY_RE = re.compile(
+    r"(?:INFO|WARNING|ERROR)\s+\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\[core\.py:\d+\]"
+)
+_VLLM_HUMAN_ITERATION_RE = re.compile(
+    r"\[core\.py:434\]\s+Iteration\((\d+)\):.*"
+    r"iteration elapsed time:\s+([0-9]+(?:\.[0-9]+)?)\s+ms\s*$"
+)
+
+
+def _vllm_engine_core_prefixes(line: str) -> list[int]:
+    """Read all rank prefixes from one multiprocessing-coalesced log line."""
+    ranks: list[int] = []
+    cursor = 0
+    while matched := _VLLM_ENGINE_CORE_PREFIX_RE.match(line, cursor):
+        if matched.group(1) is not None:
+            ranks.append(int(matched.group(1)))
+        cursor = matched.end()
+        while cursor < len(line) and line[cursor].isspace():
+            cursor += 1
+    return ranks
+
+
+def _vllm_framed_rank_candidates(
+    lines: list[str],
+) -> tuple[dict[int, frozenset[int]], dict[int, int]]:
+    """Pair coalesced rank prefixes with their consecutive EngineCore bodies."""
+    candidates_by_line: dict[int, frozenset[int]] = {}
+    framed_rank_by_line: dict[int, int] = {}
+    pending_ranks: list[int] = []
+    pending_body_lines: list[int] = []
+    for line_index, line in enumerate(lines):
+        ranks = _vllm_engine_core_prefixes(line)
+        if _VLLM_ENGINE_CORE_BODY_RE.search(line) is None:
+            pending_ranks.clear()
+            pending_body_lines.clear()
+            continue
+        pending_ranks.extend(ranks)
+        if ranks or pending_ranks:
+            pending_body_lines.append(line_index)
+        if len(pending_body_lines) > len(pending_ranks):
+            raise ValueError("EngineCore log framing has more bodies than rank prefixes")
+        if pending_ranks and len(pending_body_lines) == len(pending_ranks):
+            candidates = frozenset(pending_ranks)
+            for body_line, rank in zip(pending_body_lines, pending_ranks, strict=True):
+                candidates_by_line[body_line] = candidates
+                framed_rank_by_line[body_line] = rank
+            pending_ranks.clear()
+            pending_body_lines.clear()
+    if pending_ranks or pending_body_lines:
+        raise ValueError("EngineCore log framing ends with incomplete rank-prefix ownership")
+    return candidates_by_line, framed_rank_by_line
 
 
 def extract_metrics_jsonl(
@@ -65,14 +117,86 @@ def extract_metrics_jsonl(
         "prefill_chunk_pairs",
         "decode_kv_lens",
     }
+    lines = Path(server_log).read_text(errors="replace").splitlines()
+    candidates_by_line: dict[int, frozenset[int]] = {}
+    framed_rank_by_line: dict[int, int] = {}
+    human_iterations: list[tuple[int, float, frozenset[int]]] = []
+    if records is VLLM_RECORDS and dp_size > 1:
+        candidates_by_line, framed_rank_by_line = _vllm_framed_rank_candidates(lines)
+        for line_index, line in enumerate(lines):
+            matched = _VLLM_HUMAN_ITERATION_RE.search(line)
+            if matched is not None:
+                human_iterations.append(
+                    (
+                        int(matched.group(1)),
+                        float(matched.group(2)),
+                        candidates_by_line.get(line_index, frozenset()),
+                    )
+                )
+
+    used_human_iterations: set[int] = set()
+    seen_rank_iterations: set[tuple[int, int]] = set()
+    last_iteration_by_rank = [-1] * dp_size
     n = 0
     with Path(out_jsonl).open("w") as out:
-        for line in Path(server_log).read_text(errors="replace").splitlines():
+        for line_index, line in enumerate(lines):
             m = _ALIGNMENT_ITERATION_RE.search(line)
             if not m:
                 continue
-            dp_rank = records.rank_of(line, dp_size=dp_size)
             row = json.loads(m.group(1))
+            if records is VLLM_RECORDS and dp_size > 1:
+                iteration_index = int(row["iteration_index"])
+                observed_elapsed_ms = row.get("observed_elapsed_ms")
+                matching_human = [
+                    human_index
+                    for human_index, (human_iteration, elapsed_ms, candidates) in enumerate(
+                        human_iterations
+                    )
+                    if human_index not in used_human_iterations
+                    and human_iteration == iteration_index
+                    and observed_elapsed_ms is not None
+                    and abs(elapsed_ms - observed_elapsed_ms) <= 0.005001
+                    and candidates & candidates_by_line.get(line_index, frozenset())
+                ]
+                if len(matching_human) > 1:
+                    raise ValueError(
+                        "alignment iteration record matches multiple framed human records, "
+                        f"so its DP rank is ambiguous: iteration={iteration_index} "
+                        f"elapsed_ms={observed_elapsed_ms}"
+                    )
+                if matching_human:
+                    human_index = matching_human[0]
+                    used_human_iterations.add(human_index)
+                    candidate_ranks = set(human_iterations[human_index][2])
+                    candidate_ranks &= set(candidates_by_line.get(line_index, frozenset()))
+                else:
+                    candidate_ranks = set(candidates_by_line.get(line_index, frozenset()))
+                    direct_ranks = _vllm_engine_core_prefixes(line)
+                    if not candidate_ranks and len(direct_ranks) == 1:
+                        candidate_ranks = {direct_ranks[0]}
+
+                valid_ranks = {
+                    rank
+                    for rank in candidate_ranks
+                    if 0 <= rank < dp_size
+                    and (rank, iteration_index) not in seen_rank_iterations
+                    and iteration_index > last_iteration_by_rank[rank]
+                }
+                preferred_rank = framed_rank_by_line.get(line_index)
+                if preferred_rank in valid_ranks:
+                    dp_rank = preferred_rank
+                elif len(valid_ranks) == 1:
+                    dp_rank = valid_ranks.pop()
+                else:
+                    raise ValueError(
+                        "alignment iteration record carries no EngineCore_DP<k> log prefix, "
+                        f"so its DP rank cannot be established in a dp_size={dp_size} "
+                        f"capture: {line[:120]!r}"
+                    )
+                seen_rank_iterations.add((dp_rank, iteration_index))
+                last_iteration_by_rank[dp_rank] = iteration_index
+            else:
+                dp_rank = records.rank_of(line, dp_size=dp_size)
             if row.get("dp_rank", dp_rank) != dp_rank:
                 raise ValueError(
                     f"alignment iteration record claims dp_rank {row['dp_rank']} but was "

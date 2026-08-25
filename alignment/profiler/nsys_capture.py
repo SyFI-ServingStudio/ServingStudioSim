@@ -37,6 +37,7 @@ class ResolvedNsysExecutable:
 
     path: Path
     version: str
+    supports_cuda_event_trace: bool
 
     def provenance(self) -> dict[str, str]:
         return {"executable": str(self.path), "version": self.version}
@@ -68,7 +69,18 @@ def resolve_nsys_executable(configured_path: str | None) -> ResolvedNsysExecutab
     version = (version_result.stdout or version_result.stderr).strip()
     if not version:
         raise RuntimeError(f"NSYS returned an empty version string: {executable_path}")
-    return ResolvedNsysExecutable(path=executable_path, version=version)
+    profile_help_result = subprocess.run(
+        [str(executable_path), "profile", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    profile_help = profile_help_result.stdout + profile_help_result.stderr
+    return ResolvedNsysExecutable(
+        path=executable_path,
+        version=version,
+        supports_cuda_event_trace="--cuda-event-trace" in profile_help,
+    )
 
 
 def build_nsys_prefix(
@@ -77,6 +89,12 @@ def build_nsys_prefix(
     report_stem: Path,
 ) -> list[str]:
     """The `nsys profile ...` argv that prefixes the server command."""
+    if config.cuda_event_trace and not executable.supports_cuda_event_trace:
+        raise ValueError(
+            f"NSYS executable {executable.path} ({executable.version}) does not support "
+            "--cuda-event-trace; cannot enable nsys.cuda_event_trace"
+        )
+
     prefix = [
         str(executable.path),
         "profile",
@@ -88,11 +106,12 @@ def build_nsys_prefix(
         f"--sample={config.sample}",
         f"--cpuctxsw={config.cpuctxsw}",
         f"--cuda-graph-trace={config.cuda_graph_trace}",
-        f"--cuda-event-trace={str(config.cuda_event_trace).lower()}",
-        "--force-overwrite=true",
-        "-o",
-        str(report_stem),
     ]
+    if executable.supports_cuda_event_trace:
+        prefix.append(f"--cuda-event-trace={str(config.cuda_event_trace).lower()}")
+    if config.cuda_flush_interval_ms is not None:
+        prefix.append(f"--cuda-flush-interval={config.cuda_flush_interval_ms}")
+    prefix += ["--force-overwrite=true", "-o", str(report_stem)]
     if config.capture_mode == "nvtx":
         prefix += [
             "--capture-range=nvtx",

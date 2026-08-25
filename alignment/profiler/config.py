@@ -90,6 +90,8 @@ class NsysConfig:
     sample: str = "none"
     cpuctxsw: str = "none"
     cuda_graph_trace: str = "node"
+    # Periodically persist buffered CUDA records during long captures.
+    cuda_flush_interval_ms: int | None = None
     # Nsight 2025.1 device-side event tracing caused Xid 32 with FlashInfer's
     # multi-GPU NVLink all-to-all. Keep the safe default explicit and configurable.
     cuda_event_trace: bool = False
@@ -107,6 +109,8 @@ class NsysConfig:
                 )
             if self.capture_duration_seconds <= 0:
                 raise ValueError("nsys.capture_duration_seconds must be positive")
+        if self.cuda_flush_interval_ms is not None and self.cuda_flush_interval_ms <= 0:
+            raise ValueError("nsys.cuda_flush_interval_ms must be positive")
 
 
 @dataclass
