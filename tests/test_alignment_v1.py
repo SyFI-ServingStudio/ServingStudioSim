@@ -18,22 +18,82 @@ from launcher.alignment_config import load_labeled_kernel_sequences
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _write_fake_nsys(path: Path, *, supports_cuda_event_trace: bool) -> None:
+    event_option = "  --cuda-event-trace=<true|false>" if supports_cuda_event_trace else ""
+    path.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then\n'
+        "  printf 'Nsight Systems 2025.1\\n'\n"
+        'elif [ "$1" = "profile" ] && [ "$2" = "--help" ]; then\n'
+        f"  printf '%s\\n' 'Usage: nsys profile' '{event_option}'\n"
+        "else\n"
+        "  exit 2\n"
+        "fi\n"
+    )
+    path.chmod(0o755)
+
+
 def test_cuda_profiler_api_nsys_prefix_targets_spawned_worker(tmp_path):
     executable = nsys_capture.ResolvedNsysExecutable(
         path=tmp_path / "nsys",
         version="NVIDIA Nsight Systems version 2025.1",
+        supports_cuda_event_trace=True,
     )
     prefix = nsys_capture.build_nsys_prefix(
         executable,
-        NsysConfig(capture_mode="cuda_profiler_api"),
+        NsysConfig(
+            capture_mode="cuda_profiler_api",
+            cuda_flush_interval_ms=10_000,
+        ),
         tmp_path / "profile",
     )
 
     assert prefix[0] == str(executable.path)
     assert "--trace-fork-before-exec=true" in prefix
     assert "--cuda-event-trace=false" in prefix
+    assert "--cuda-flush-interval=10000" in prefix
     assert "--capture-range=cudaProfilerApi" in prefix
     assert "--capture-range-end=stop" in prefix
+
+
+@pytest.mark.parametrize(
+    ("supports_cuda_event_trace", "requested", "expected_option"),
+    [
+        (True, False, "--cuda-event-trace=false"),
+        (False, False, None),
+        (True, True, "--cuda-event-trace=true"),
+    ],
+)
+def test_nsys_prefix_matches_cuda_event_trace_capability(
+    tmp_path, supports_cuda_event_trace, requested, expected_option
+):
+    executable_path = tmp_path / "nsys"
+    _write_fake_nsys(executable_path, supports_cuda_event_trace=supports_cuda_event_trace)
+    executable = nsys_capture.resolve_nsys_executable(str(executable_path))
+
+    prefix = nsys_capture.build_nsys_prefix(
+        executable,
+        NsysConfig(cuda_event_trace=requested),
+        tmp_path / "profile",
+    )
+
+    event_options = [arg for arg in prefix if arg.startswith("--cuda-event-trace=")]
+    assert event_options == ([] if expected_option is None else [expected_option])
+    assert "--cuda-graph-trace=node" in prefix
+    assert "--capture-range=cudaProfilerApi" in prefix
+
+
+def test_nsys_prefix_rejects_unsupported_cuda_event_trace_request(tmp_path):
+    executable_path = tmp_path / "nsys"
+    _write_fake_nsys(executable_path, supports_cuda_event_trace=False)
+    executable = nsys_capture.resolve_nsys_executable(str(executable_path))
+
+    with pytest.raises(ValueError, match="does not support --cuda-event-trace"):
+        nsys_capture.build_nsys_prefix(
+            executable,
+            NsysConfig(cuda_event_trace=True),
+            tmp_path / "profile",
+        )
 
 
 def test_nsys_executable_requires_explicit_absolute_path(monkeypatch):
@@ -46,8 +106,7 @@ def test_nsys_executable_requires_explicit_absolute_path(monkeypatch):
 
 def test_nsys_executable_records_resolved_path_and_version(tmp_path, monkeypatch):
     executable_path = tmp_path / "nsys"
-    executable_path.write_text("#!/bin/sh\nprintf 'Nsight Systems 2025.1\\n'\n")
-    executable_path.chmod(0o755)
+    _write_fake_nsys(executable_path, supports_cuda_event_trace=False)
     monkeypatch.setenv("NSYS_BIN", str(executable_path))
 
     executable = nsys_capture.resolve_nsys_executable(None)
@@ -56,6 +115,7 @@ def test_nsys_executable_records_resolved_path_and_version(tmp_path, monkeypatch
         "executable": str(executable_path.resolve()),
         "version": "Nsight Systems 2025.1",
     }
+    assert executable.supports_cuda_event_trace is False
 
 
 def test_bounded_nsys_capture_requires_positive_cuda_profiler_window():
@@ -65,6 +125,13 @@ def test_bounded_nsys_capture_requires_positive_cuda_profiler_window():
         NsysConfig(capture_duration_seconds=0.0).validate()
     with pytest.raises(ValueError, match="requires capture_mode=cuda_profiler_api"):
         NsysConfig(capture_mode="full", capture_duration_seconds=30.0).validate()
+
+
+def test_nsys_cuda_flush_interval_must_be_positive():
+    NsysConfig(cuda_flush_interval_ms=10_000).validate()
+
+    with pytest.raises(ValueError, match="cuda_flush_interval_ms must be positive"):
+        NsysConfig(cuda_flush_interval_ms=0).validate()
 
 
 def test_structured_vllm_iteration_record_is_the_only_metrics_contract(tmp_path):
@@ -127,6 +194,17 @@ def _dp_iteration_record(iteration: int, prefill_tokens: int) -> dict:
     }
 
 
+def _dp_iteration_record_v2(iteration: int, elapsed_ms: float) -> dict:
+    record = _dp_iteration_record(iteration, prefill_tokens=4096)
+    return {
+        **record,
+        "schema_version": 2,
+        "observed_start_monotonic_ns": 1_000_000,
+        "observed_end_monotonic_ns": 1_000_000 + round(elapsed_ms * 1_000_000),
+        "observed_elapsed_ms": elapsed_ms,
+    }
+
+
 def test_data_parallel_iteration_records_are_stamped_with_their_engine_rank(tmp_path):
     """Two ranks reuse one iteration index; only the rank tag keeps them apart."""
     rank0 = _dp_iteration_record(4, prefill_tokens=8)
@@ -143,6 +221,108 @@ def test_data_parallel_iteration_records_are_stamped_with_their_engine_rank(tmp_
     assert rows == [{**rank0, "dp_rank": 0}, {**rank1, "dp_rank": 1}]
 
 
+def test_data_parallel_iteration_records_recover_coalesced_prefix_framing(tmp_path):
+    """A trailing prefix owns only the immediately following unprefixed record."""
+    rank2 = _dp_iteration_record_v2(26, 493.569473)
+    rank3 = _dp_iteration_record_v2(25, 493.815327)
+    rank1 = _dp_iteration_record_v2(26, 493.591074)
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "(EngineCore_DP2 pid=22) (EngineCore_DP3 pid=23) "
+        "INFO 08-11 07:18:41 [core.py:434] Iteration(26): iteration elapsed time: 493.57 ms\n"
+        "INFO 08-11 07:18:41 [core.py:434] Iteration(25): iteration elapsed time: 493.82 ms\n"
+        "(EngineCore_DP1 pid=21) "
+        "INFO 08-11 07:18:41 [core.py:434] Iteration(26): iteration elapsed time: 493.59 ms\n"
+        "(EngineCore_DP2 pid=22) (EngineCore_DP3 pid=23) "
+        f"INFO 08-11 07:18:41 [core.py:496] VibeSimAlignmentIteration {json.dumps(rank2)}\n"
+        f"INFO 08-11 07:18:41 [core.py:496] VibeSimAlignmentIteration {json.dumps(rank3)}\n"
+        "(EngineCore_DP1 pid=21) "
+        f"INFO 08-11 07:18:41 [core.py:496] VibeSimAlignmentIteration {json.dumps(rank1)}\n"
+    )
+    output = tmp_path / "metrics.jsonl"
+
+    assert record_extraction.extract_metrics_jsonl(server_log, output, dp_size=4) == 3
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert rows == [
+        {**rank2, "dp_rank": 2},
+        {**rank3, "dp_rank": 3},
+        {**rank1, "dp_rank": 1},
+    ]
+
+
+def test_data_parallel_iteration_record_recovers_after_coalesced_human_record(tmp_path):
+    rank3 = _dp_iteration_record_v2(31, 494.981252)
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "(EngineCore_DP3 pid=23) "
+        "INFO 08-11 07:18:44 [core.py:434] Iteration(31): "
+        "iteration elapsed time: 494.98 ms\n"
+        "(EngineCore_DP1 pid=21) (EngineCore_DP3 pid=23) "
+        "INFO 08-11 07:18:44 [core.py:434] Iteration(32): "
+        "iteration elapsed time: 494.67 ms\n"
+        f"INFO 08-11 07:18:44 [core.py:496] VibeSimAlignmentIteration {json.dumps(rank3)}\n"
+    )
+    output = tmp_path / "metrics.jsonl"
+
+    assert record_extraction.extract_metrics_jsonl(server_log, output, dp_size=4) == 1
+    assert json.loads(output.read_text()) == {**rank3, "dp_rank": 3}
+
+
+def test_data_parallel_iteration_records_recover_three_way_coalescing(tmp_path):
+    records = [
+        _dp_iteration_record_v2(13, 493.871095),
+        _dp_iteration_record_v2(14, 494.744194),
+        _dp_iteration_record_v2(14, 494.583565),
+    ]
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "(EngineCore_DP3 pid=23) (EngineCore_DP2 pid=22) (EngineCore_DP1 pid=21) "
+        "INFO 08-11 07:18:35 [core.py:434] Iteration(13): iteration elapsed time: 493.87 ms\n"
+        "INFO 08-11 07:18:35 [core.py:434] Iteration(14): iteration elapsed time: 494.74 ms\n"
+        "INFO 08-11 07:18:35 [core.py:434] Iteration(14): iteration elapsed time: 494.58 ms\n"
+        "(EngineCore_DP3 pid=23) (EngineCore_DP2 pid=22) (EngineCore_DP1 pid=21) "
+        f"INFO 08-11 07:18:35 [core.py:496] VibeSimAlignmentIteration {json.dumps(records[0])}\n"
+        f"INFO 08-11 07:18:35 [core.py:496] VibeSimAlignmentIteration {json.dumps(records[1])}\n"
+        f"INFO 08-11 07:18:35 [core.py:496] VibeSimAlignmentIteration {json.dumps(records[2])}\n"
+    )
+    output = tmp_path / "metrics.jsonl"
+
+    assert record_extraction.extract_metrics_jsonl(server_log, output, dp_size=4) == 3
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert rows == [
+        {**records[0], "dp_rank": 3},
+        {**records[1], "dp_rank": 2},
+        {**records[2], "dp_rank": 1},
+    ]
+
+
+def test_data_parallel_iteration_framing_survives_an_explicit_interposed_rank(tmp_path):
+    rank1 = _dp_iteration_record_v2(25, 497.520939)
+    rank2 = _dp_iteration_record_v2(24, 495.916893)
+    rank3 = _dp_iteration_record_v2(25, 497.362183)
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "(EngineCore_DP1 pid=21) (EngineCore_DP3 pid=23) (EngineCore_DP2 pid=22) "
+        "INFO 08-11 07:18:41 [core.py:434] Iteration(25): iteration elapsed time: 497.52 ms\n"
+        "INFO 08-11 07:18:41 [core.py:434] Iteration(25): iteration elapsed time: 497.36 ms\n"
+        "INFO 08-11 07:18:41 [core.py:434] Iteration(24): iteration elapsed time: 495.92 ms\n"
+        "(EngineCore_DP1 pid=21) (EngineCore_DP3 pid=23) "
+        f"INFO 08-11 07:18:41 [core.py:496] VibeSimAlignmentIteration {json.dumps(rank1)}\n"
+        "(EngineCore_DP2 pid=22) "
+        f"INFO 08-11 07:18:41 [core.py:496] VibeSimAlignmentIteration {json.dumps(rank2)}\n"
+        f"INFO 08-11 07:18:41 [core.py:496] VibeSimAlignmentIteration {json.dumps(rank3)}\n"
+    )
+    output = tmp_path / "metrics.jsonl"
+
+    assert record_extraction.extract_metrics_jsonl(server_log, output, dp_size=4) == 3
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert rows == [
+        {**rank1, "dp_rank": 1},
+        {**rank2, "dp_rank": 3},
+        {**rank3, "dp_rank": 2},
+    ]
+
+
 def test_data_parallel_capture_rejects_untagged_iteration_records(tmp_path):
     """Silently folding every rank onto rank 0 would destroy dp_size-1 of the data."""
     server_log = tmp_path / "server.log"
@@ -152,6 +332,44 @@ def test_data_parallel_capture_rejects_untagged_iteration_records(tmp_path):
 
     with pytest.raises(ValueError, match="no EngineCore_DP<k> log prefix"):
         record_extraction.extract_metrics_jsonl(server_log, tmp_path / "metrics.jsonl", dp_size=2)
+
+
+def test_data_parallel_capture_rejects_delayed_or_unframed_prefixless_records(tmp_path):
+    record = _dp_iteration_record(4, 8)
+    delayed = tmp_path / "delayed.log"
+    delayed.write_text(
+        "(EngineCore_DP0 pid=11) (EngineCore_DP1 pid=12) "
+        "INFO 08-11 07:18:41 [core.py:434] Iteration(4): 1 context request\n"
+        "WARNING unrelated intervening line\n"
+        f"INFO 08-11 07:18:41 [core.py:496] VibeSimAlignmentIteration {json.dumps(record)}\n"
+    )
+    unframed = tmp_path / "unframed.log"
+    unframed.write_text(
+        "(EngineCore_DP0 pid=11) (EngineCore_DP1 pid=12) WARNING unrelated body\n"
+        f"INFO 08-11 07:18:41 [core.py:496] VibeSimAlignmentIteration {json.dumps(record)}\n"
+    )
+
+    for server_log in (delayed, unframed):
+        with pytest.raises(ValueError, match="no EngineCore_DP<k> log prefix"):
+            record_extraction.extract_metrics_jsonl(
+                server_log, tmp_path / f"{server_log.stem}.jsonl", dp_size=4
+            )
+
+
+def test_data_parallel_capture_rejects_ambiguous_human_record_match(tmp_path):
+    record = _dp_iteration_record_v2(14, 494.736342)
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "(EngineCore_DP1 pid=21) (EngineCore_DP2 pid=22) "
+        "INFO 08-11 07:18:35 [core.py:434] Iteration(14): iteration elapsed time: 494.74 ms\n"
+        "INFO 08-11 07:18:35 [core.py:434] Iteration(14): iteration elapsed time: 494.74 ms\n"
+        "(EngineCore_DP1 pid=21) (EngineCore_DP2 pid=22) "
+        f"INFO 08-11 07:18:35 [core.py:496] VibeSimAlignmentIteration {json.dumps(record)}\n"
+        f"INFO 08-11 07:18:35 [core.py:496] VibeSimAlignmentIteration {json.dumps(record)}\n"
+    )
+
+    with pytest.raises(ValueError, match="multiple framed human records"):
+        record_extraction.extract_metrics_jsonl(server_log, tmp_path / "metrics.jsonl", dp_size=4)
 
 
 def test_worker_rank_banner_supplies_the_pid_to_rank_join(tmp_path):

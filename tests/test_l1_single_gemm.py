@@ -1454,23 +1454,19 @@ def test_documented_profile_env_registry_complete():
         == ENV_REGISTRY["default_env"].python_executable
     )
     vllm_env = ENV_REGISTRY["vllm_env"]
-    assert vllm_env.python_executable == ENV_REGISTRY["default_env"].python_executable
+    vllm_root = Path(__file__).parents[1] / "alignment" / "profiler" / "vllm"
+    assert vllm_env.python_executable == vllm_root / ".venv" / "bin" / "python"
     worker_python_dir = f"python{sys.version_info.major}.{sys.version_info.minor}"
     vllm_site_packages = (
-        Path(__file__).parents[1]
-        / "alignment"
-        / "profiler"
-        / "vllm"
+        vllm_root
         / ".venv"
         / "lib"
         / worker_python_dir
         / "site-packages"
     )
-    assert vllm_env.additional_python_paths == (
-        vllm_site_packages,
-        Path(__file__).parents[1] / "alignment" / "profiler" / "vllm",
-    )
+    assert vllm_env.additional_python_paths == (vllm_root,)
     assert vllm_env.additional_library_paths == (
+        vllm_root / ".venv" / "lib" / "cuda-compat",
         vllm_site_packages / "torch" / "lib",
     )
     vllm_env.validate()

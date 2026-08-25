@@ -4,6 +4,7 @@ use crate::common::{RequestId, Time};
 use crate::worker::kv::KvStore;
 use crate::worker::shared::context::WorkerContext;
 
+mod chunked_prefill_admission;
 mod fresh_request_slot_admission;
 mod local_prefill_decode_admission;
 mod placement;
@@ -51,3 +52,4 @@ pub trait SlotPipelineAdmission<K: KvStore> {
     fn queued_kv_tokens(&self) -> u64;
     fn queued_requests(&self) -> u32;
 }
+pub use chunked_prefill_admission::ChunkedPrefillAdmission;

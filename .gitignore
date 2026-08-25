@@ -34,6 +34,10 @@ trace/tracelab_*
 .claude/settings.local.json
 .codex/*.local.*
 
+# Task-local agent notes are working state, not repository documentation.
+/progress.md
+/update_plan_for_skils.md
+
 # Generated docs / sample output — regenerable, not source of truth
 .code-lessons/
 model/work/examples/

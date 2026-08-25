@@ -5,7 +5,8 @@
 
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::{
-    IterAdmission, LocalPrefillDecodeAdmission, PendingOrder, PrefillHandoffAdmission,
+    ChunkedPrefillAdmission, IterAdmission, LocalPrefillDecodeAdmission, PendingOrder,
+    PrefillHandoffAdmission,
 };
 use crate::worker::execution::{IterModelExecution, UnifiedIterExecution};
 use crate::worker::iter_worker::IterWorker;
@@ -56,6 +57,8 @@ pub type BareboneWorker<M> =
     IterBatchWorker<FullAttnKv, LocalPrefillDecodeAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 /// Multi-partition HP/DP recipe uses the same whole-iteration shell.
 pub type HpUnifiedWorker<M> = BareboneWorker<M>;
+pub type ChunkedPrefillWorker<M> =
+    IterBatchWorker<FullAttnKv, ChunkedPrefillAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 /// Barebone on every axis but KV: a hybrid arch's per-request recurrent state
 /// shares the attention capacity with its per-token KV. Only the store differs.
 pub type Qwen36HybridWorker<M> = IterBatchWorker<
@@ -232,7 +235,9 @@ mod tests {
     use crate::worker::admission::{FifoOrder, ShortestJobFirst};
     use crate::worker::kv::{PrefixCacheConfig, PrefixKv};
     use crate::worker::types::{WorkerConfig, WorkerEventCommon, WorkerMsgCommon};
-    use crate::worker::workers::iter::{build_barebone_worker, build_hp_worker};
+    use crate::worker::workers::iter::{
+        build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
+    };
 
     fn assert_iter_worker<W: IterWorker>() {}
 
@@ -543,6 +548,76 @@ mod tests {
             "test-gpu",
             test_cluster(),
         )
+    }
+
+    #[test]
+    fn chunked_prefill_exposes_two_real_8192_token_iterations() {
+        let store = shared_with(&[(0, 16_384, 2)]);
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(8_192),
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+
+        assert!(worker.form_batch(Time::ZERO));
+        let mut first_input = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &mut first_input,
+        );
+        assert_eq!(first_input.groups[0].prefill_chunk_pairs, [(0, 8_192)]);
+        worker.admission.complete_iteration(
+            &mut worker.kv_store,
+            &worker.context,
+            &mut Vec::new(),
+            Time::from_ms(1.0),
+        );
+        assert_eq!(
+            store.borrow()[RequestId(0)]
+                .progress
+                .prefill_tokens_processed,
+            8_192
+        );
+        assert!(store.borrow()[RequestId(0)]
+            .telemetry
+            .first_output_time
+            .is_none());
+
+        assert!(worker.form_batch(Time::from_ms(1.0)));
+        let mut second_input = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &mut second_input,
+        );
+        assert_eq!(second_input.groups[0].prefill_chunk_pairs, [(8_192, 8_192)]);
+        worker.admission.complete_iteration(
+            &mut worker.kv_store,
+            &worker.context,
+            &mut Vec::new(),
+            Time::from_ms(2.0),
+        );
+        assert_eq!(
+            store.borrow()[RequestId(0)]
+                .progress
+                .prefill_tokens_processed,
+            16_384
+        );
+        assert!(store.borrow()[RequestId(0)]
+            .telemetry
+            .first_output_time
+            .is_some());
     }
 
     #[test]

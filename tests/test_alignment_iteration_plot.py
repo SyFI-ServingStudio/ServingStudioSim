@@ -9,14 +9,16 @@ import pytest
 ANALYZER_PYTHON = Path(__file__).resolve().parents[1] / "analyzer" / "python"
 sys.path.insert(0, str(ANALYZER_PYTHON))
 
-from common.layout import read_sharded_records  # noqa: E402
 from alignment_iteration.series_plot import (  # noqa: E402
+    _display_stream_rows,
     _evenly_sample_iteration_ids,
     _mapping_center_pairs,
     _output_is_current,
     _remove_stale_breakdown_outputs,
     _simulated_width_cumulative_error_steps,
+    _stream_operation_rows,
 )
+from common.layout import read_sharded_records  # noqa: E402
 
 
 def test_evenly_sample_iteration_ids_caps_and_keeps_raw_endpoints() -> None:
@@ -140,3 +142,38 @@ def test_remove_stale_breakdowns_keeps_selected_jpg_fallback(tmp_path: Path) -> 
     assert selected_jpg.is_file()
     assert not stale_jpg.exists()
     assert not stale_dir.exists()
+
+
+def test_stream_breakdown_uses_reduced_work_and_aggregates_small_streams() -> None:
+    kernels = [
+        {
+            "ph": "forward",
+            "op": "main",
+            "occ_ns": 100_000_000,
+            "iv": [[0, 0, 100_000_000, 0, 0]],
+        }
+    ]
+    for track_index in range(1, 10):
+        kernels.append(
+            {
+                "ph": "forward",
+                "op": "side",
+                # Use reduced work, not the collective's long raw residency.
+                "occ_ns": 100_000,
+                "iv": [[0, 0, 28_000_000_000, track_index, track_index]],
+            }
+        )
+
+    rows = _stream_operation_rows({"measured": {"kernels": kernels}}, device_id=0)
+    displayed = _display_stream_rows(rows)
+
+    assert sum(row["duration_ms"] for stream in rows.values() for row in stream) == pytest.approx(
+        100.9
+    )
+    assert [label for label, _stream in displayed] == [
+        "stream 0",
+        "other 9 streams (aggregated)",
+    ]
+    assert sum(
+        row["duration_ms"] for _label, stream in displayed for row in stream
+    ) == pytest.approx(100.9)

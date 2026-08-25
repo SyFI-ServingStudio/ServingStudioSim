@@ -1,0 +1,18 @@
+[
+  {
+    "groups": [
+      {"prefill_chunk_pairs": [[0, 8192]]},
+      {"prefill_chunk_pairs": [[0, 4096]]},
+      {"prefill_chunk_pairs": [[0, 2048]]},
+      {"prefill_chunk_pairs": [[0, 1024]]}
+    ]
+  },
+  {
+    "groups": [
+      {"decode_count": 64, "average_decode_length": 16384},
+      {"decode_count": 48, "average_decode_length": 12288},
+      {"decode_count": 32, "average_decode_length": 8192},
+      {"decode_count": 16, "average_decode_length": 4096}
+    ]
+  }
+]

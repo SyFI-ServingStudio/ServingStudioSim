@@ -11,6 +11,10 @@
 
 pub mod attn_block_tp;
 pub mod attn_local;
+pub mod deepseek_v4_attention_local;
+pub mod deepseek_v4_moe_expert_compute_local;
+pub mod deepseek_v4_moe_router_local;
+pub mod deepseek_v4_shared_expert_local;
 pub mod fp8_attn_block_tp;
 pub mod fp8_post_attn_router_tp;
 pub mod fp8_pre_attn_proj_tp;
@@ -48,6 +52,23 @@ pub use attn_block_tp::{
 };
 pub use attn_local::{
     AttnLocalWorklet, AttnLocalWorkletConfig, AttnLocalWorkletInput, AttnLocalWorkletResolved,
+};
+pub use deepseek_v4_attention_local::{
+    DeepseekV4AttentionEntry, DeepseekV4AttentionLocalWorklet,
+    DeepseekV4AttentionLocalWorkletConfig, DeepseekV4AttentionLocalWorkletInput,
+    DeepseekV4AttentionLocalWorkletResolved,
+};
+pub use deepseek_v4_moe_expert_compute_local::{
+    DeepseekV4MoeExpertComputeLocalWorklet, DeepseekV4MoeExpertComputeLocalWorkletConfig,
+    DeepseekV4MoeExpertComputeLocalWorkletInput, DeepseekV4MoeExpertComputeLocalWorkletResolved,
+};
+pub use deepseek_v4_moe_router_local::{
+    DeepseekV4MoeRouterLocalWorklet, DeepseekV4MoeRouterLocalWorkletConfig,
+    DeepseekV4MoeRouterLocalWorkletInput, DeepseekV4MoeRouterLocalWorkletResolved,
+};
+pub use deepseek_v4_shared_expert_local::{
+    DeepseekV4SharedExpertLocalWorklet, DeepseekV4SharedExpertLocalWorkletConfig,
+    DeepseekV4SharedExpertLocalWorkletInput, DeepseekV4SharedExpertLocalWorkletResolved,
 };
 pub use fp8_attn_block_tp::{
     Fp8AttnBlockTpWorklet, Fp8AttnBlockTpWorkletConfig, Fp8AttnBlockTpWorkletInput,

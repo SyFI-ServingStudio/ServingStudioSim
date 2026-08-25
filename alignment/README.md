@@ -320,7 +320,9 @@ the e2e-align phase. `profile_log_dir` supplies the bounded NSYS kernel/GPU
 anchor. `workload_profile_log_dir` optionally supplies a separate
 `profile_kind: workload_metrics` run for full scheduler and request timelines;
 it defaults to `profile_log_dir` for older captures. E2E analysis does not
-consume timing-predict output. Workload
+consume timing-predict output. The NSYS and workload-metrics passes must name
+the same source trace; a copied trace at another path is accepted only when the
+two files are byte-identical. Workload
 analysis plots each side against its recorded iteration ids and emits fine-grained
 prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle
 series. It also plots decode batch size against each side's independently

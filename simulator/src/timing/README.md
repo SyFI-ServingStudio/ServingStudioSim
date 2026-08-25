@@ -26,6 +26,9 @@ layers (L2 ops, L3 worklets, the cost-tree compile) consume these:
 - **Metric / coverage types:** `LeafMetrics`, `Metrics4`, `CoverageFlags`.
 - **cost_log capture:** `SlotInput`, `AttnPrefillLog`.
 - **Sweep grid:** `SweepGrid`, `Axis`, `Coords`, the `SweepCoords` trait + derive.
+- **Cache introspection:** `kernel-query eval` accepts physical Input JSON;
+  `eval_coords` evaluates declared cache coordinates directly for Analyzer grid
+  views, including ragged and re-axis kernels.
 - **The bridge:** `PerfApiBridge`, `BuildError`, `KernelMissing`.
 - **Derives:** `KernelConfig`, `SweepCoords` (re-exported under the trait names).
 

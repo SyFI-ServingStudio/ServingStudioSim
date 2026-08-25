@@ -300,6 +300,10 @@ impl<S: KernelSpec> Kernel<S> {
     /// preserving that backend's coverage bits.
     pub fn eval(&self, input: &S::Input) -> LeafMetrics {
         let coords = S::cache_coords(&self.config, input);
+        self.eval_cache_coords(&coords)
+    }
+
+    fn eval_cache_coords(&self, coords: &Coords) -> LeafMetrics {
         match self.backend_caches.as_slice() {
             [] => panic!("kernel config validation must create at least one backend cache"),
             [backend_cache] => {
@@ -368,6 +372,23 @@ where
         let input: S::Input = serde_json::from_value(input.clone())
             .map_err(|e| anyhow::anyhow!("query point does not match {} Input: {e}", S::KIND))?;
         Ok(self.eval(&input))
+    }
+
+    fn eval_coords(&self, coords: &[f64]) -> anyhow::Result<LeafMetrics> {
+        let expected_dims = S::sweep_grid(&self.config).axes().len();
+        anyhow::ensure!(
+            coords.len() == expected_dims,
+            "query point has {} cache coordinates for {}D {} grid",
+            coords.len(),
+            expected_dims,
+            S::KIND,
+        );
+        anyhow::ensure!(
+            coords.iter().all(|coordinate| coordinate.is_finite()),
+            "query point for {} contains a non-finite cache coordinate",
+            S::KIND,
+        );
+        Ok(self.eval_cache_coords(&Coords::from_slice(coords)))
     }
 
     fn peak_rates(&self) -> PeakRates {

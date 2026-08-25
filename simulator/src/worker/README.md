@@ -181,6 +181,9 @@ complete `FfnTask`.
 Execution owns the model, reusable input buffer shape, and `CostBuffers`:
 
 - `UnifiedIterExecution` builds one `UnifiedArchInput` group per KV partition.
+  Multi-partition workers also retain the exact per-partition token vector for
+  ragged EP communication; the execution adapter derives it from those same
+  groups without changing placement.
 - `AttentionLayerExecutionAdapter` builds one slot's `AttnArchInput` and costs
   one attention layer.
 - `FfnSectionExecutionAdapter` splits token counts across FFN DP groups and
@@ -247,10 +250,17 @@ KV, admission, execution, and shell.
 
 Deployments and pool controllers only call those recipes:
 
-- unified → `build_barebone_worker` / `build_hp_worker`
+- unified → `build_barebone_worker` / `build_hp_worker` /
+  `build_chunked_prefill_worker`
 - PD → `build_pd_prefill_worker` / `build_pd_decode_worker`
 - AFD attention → `build_afd_attention_worker`
 - AFD FFN → `build_afd_ffn_worker`
 
 Message/event enums, pool behavior, and flow barriers remain L6 contracts; the
 composition refactor does not create a second deployment layer.
+
+`chunked_prefill` is a generic whole-iteration recipe, not a model-specific
+scheduler. It uses the ordinary pending-order and partition-placement
+contracts, reserves the complete request KV footprint once, and exposes prompt
+chunks bounded by `max_batch_tokens`. It does not replay an observed DP rank or
+rewrite request shapes.

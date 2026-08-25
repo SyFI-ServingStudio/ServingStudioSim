@@ -19,8 +19,11 @@ from common.style import ACCENT, CURVE, MARKER, plt, save_plot
 from matplotlib.patches import ConnectionPatch, Patch
 
 PAYLOAD = "alignment_iteration_series.json"
+TIMELINE_PAYLOAD = "alignment_timeline.json"
 MAX_BREAKDOWN_PLOTS = 128
 BREAKDOWN_PLOTS_PER_DIR = 32
+MAX_STREAM_ROWS = 8
+MIN_STREAM_SHARE = 0.01
 # An 18-inch diagnostic canvas is 2700 px wide at 150 DPI. That fixed width
 # contains the two-column legend without an expensive tight-bbox redraw. The
 # subject-level overview keeps the shared 300-DPI PNG default.
@@ -57,10 +60,24 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
     # shard precisely so that rendering 128 of 2,040 iterations does not have to
     # parse the other 1,912.
     sampled_ids = _evenly_sample_iteration_ids(iterations)
-    sampled_breakdowns = read_sharded_records(
-        log_dir, payload["breakdown_detail"], sampled_ids
-    )
-    breakdown_specs: list[tuple[dict, Path]] = []
+    sampled_breakdowns = read_sharded_records(log_dir, payload["breakdown_detail"], sampled_ids)
+    timeline_path = resolve_artifact(log_dir, TIMELINE_PAYLOAD)
+    timeline_by_iteration: dict[int, dict] = {}
+    render_sources = [payload_path, Path(__file__)]
+    if timeline_path.is_file():
+        timeline_payload = load_payload(log_dir, TIMELINE_PAYLOAD)
+        timeline_rows = read_sharded_records(
+            log_dir, timeline_payload["iteration_detail"], sampled_ids
+        )
+        timeline_by_iteration = {int(row["iteration_id"]): row for row in timeline_rows}
+        render_sources.extend(
+            [
+                timeline_path,
+                resolve_artifact(log_dir, timeline_payload["iteration_detail"]["file"]),
+            ]
+        )
+
+    breakdown_specs: list[tuple[dict, dict | None, Path]] = []
     for offset in range(0, len(sampled_breakdowns), BREAKDOWN_PLOTS_PER_DIR):
         breakdown_group = sampled_breakdowns[offset : offset + BREAKDOWN_PLOTS_PER_DIR]
         first_iteration_id = breakdown_group[0]["iteration_id"]
@@ -72,24 +89,31 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
                 log_dir,
                 f"{group_dir}/iter_{iteration_id}_breakdown.png",
             )
-            breakdown_specs.append((breakdown, out_path))
+            breakdown_specs.append(
+                (breakdown, timeline_by_iteration.get(int(iteration_id)), out_path)
+            )
 
-    desired_outputs = {out_path for _, out_path in breakdown_specs}
+    desired_outputs = {out_path for _, _, out_path in breakdown_specs}
     _remove_stale_breakdown_outputs(log_dir, desired_outputs)
-    for breakdown, out_path in breakdown_specs:
+    for breakdown, timeline_iteration, out_path in breakdown_specs:
         # Rendering sampled diagnostics is intentionally resumable. A newer
         # payload or renderer invalidates the image; otherwise an interrupted
         # rerun keeps the completed work.
-        if _output_is_current(out_path, payload_path, Path(__file__)):
+        if _output_is_current(out_path, *render_sources):
             continue
-        jobs.append(
-            partial(
-                _render_breakdown,
-                breakdown,
-                out_path,
-                run_label=log_dir.name,
+        renderer = _render_stream_breakdown if timeline_iteration is not None else _render_breakdown
+        if timeline_iteration is None:
+            jobs.append(partial(renderer, breakdown, out_path, run_label=log_dir.name))
+        else:
+            jobs.append(
+                partial(
+                    renderer,
+                    breakdown,
+                    timeline_iteration,
+                    out_path,
+                    run_label=log_dir.name,
+                )
             )
-        )
     return jobs
 
 
@@ -249,6 +273,201 @@ def _render_overview(
     )
     fig.tight_layout()
     save_plot(fig, out_path)
+    return out_path
+
+
+def _stream_operation_rows(timeline_iteration: dict, device_id: int) -> dict[int, list[dict]]:
+    """Assign each reduced occurrence to the selected device's real streams."""
+    totals: dict[tuple[int, str, str | None], float] = defaultdict(float)
+    order: list[tuple[int, str, str | None]] = []
+    for kernel in timeline_iteration["measured"]["kernels"]:
+        intervals = [item for item in kernel["iv"] if int(item[0]) == device_id]
+        if not intervals:
+            continue
+        weights = [max(0, int(item[2]) - int(item[1])) for item in intervals]
+        weight_sum = sum(weights)
+        if weight_sum == 0:
+            weights = [1] * len(intervals)
+            weight_sum = len(intervals)
+        occurrence_ms = float(kernel["occ_ns"]) / 1.0e6
+        for interval, weight in zip(intervals, weights, strict=True):
+            key = (int(interval[4]), kernel["ph"], kernel.get("op"))
+            if key not in totals:
+                order.append(key)
+            totals[key] += occurrence_ms * weight / weight_sum
+
+    rows_by_stream: dict[int, list[dict]] = defaultdict(list)
+    for track_index, phase, operation in order:
+        rows_by_stream[track_index].append(
+            {
+                "phase": phase,
+                "operation": operation,
+                "duration_ms": totals[(track_index, phase, operation)],
+            }
+        )
+    return dict(rows_by_stream)
+
+
+def _display_stream_rows(rows_by_stream: dict[int, list[dict]]) -> list[tuple[str, list[dict]]]:
+    """Bound plot height while preserving every stream's additive work."""
+    stream_ms = {
+        track_index: sum(float(row["duration_ms"]) for row in rows)
+        for track_index, rows in rows_by_stream.items()
+    }
+    total_ms = sum(stream_ms.values())
+    ranked = sorted(stream_ms, key=lambda track_index: (-stream_ms[track_index], track_index))
+    kept = {
+        track_index
+        for track_index in ranked[:MAX_STREAM_ROWS]
+        if total_ms == 0.0 or stream_ms[track_index] / total_ms >= MIN_STREAM_SHARE
+    }
+    if ranked and not kept:
+        kept.add(ranked[0])
+
+    displayed = [
+        (f"stream {track_index}", rows_by_stream[track_index])
+        for track_index in sorted(kept)
+    ]
+    omitted = [track_index for track_index in ranked if track_index not in kept]
+    if omitted:
+        aggregate: dict[tuple[str, str | None], float] = defaultdict(float)
+        for track_index in omitted:
+            for row in rows_by_stream[track_index]:
+                aggregate[(row["phase"], row.get("operation"))] += float(row["duration_ms"])
+        displayed.append(
+            (
+                f"other {len(omitted)} streams (aggregated)",
+                [
+                    {"phase": phase, "operation": operation, "duration_ms": duration_ms}
+                    for (phase, operation), duration_ms in aggregate.items()
+                ],
+            )
+        )
+    return displayed
+
+
+def _compact_path_rows(rows: list[dict], target_ms: float) -> list[dict]:
+    """Aggregate semantic work and scale only to remove measured stream overlap."""
+    totals: dict[tuple[str | None, str | None], float] = defaultdict(float)
+    order: list[tuple[str | None, str | None]] = []
+    for row in rows:
+        key = (row.get("phase"), row.get("operation"))
+        if key not in totals:
+            order.append(key)
+        totals[key] += float(row["duration_ms"])
+    additive_ms = sum(totals.values())
+    scale = target_ms / additive_ms if additive_ms > 0.0 else 0.0
+    return [
+        {
+            "phase": phase,
+            "operation": operation,
+            "duration_ms": totals[(phase, operation)] * scale,
+        }
+        for phase, operation in order
+    ]
+
+
+def _render_stream_breakdown(
+    breakdown: dict,
+    timeline_iteration: dict,
+    out_path: Path,
+    *,
+    run_label: str,
+) -> Path:
+    """Draw compact real streams plus one measured and one simulated path."""
+    device_id = breakdown.get("critical_device_id")
+    if device_id is None:
+        device_id = timeline_iteration["measured"].get("critical_device_id")
+    if device_id is None:
+        work_by_device: dict[int, int] = defaultdict(int)
+        for kernel in timeline_iteration["measured"]["kernels"]:
+            for interval in kernel["iv"]:
+                work_by_device[int(interval[0])] += max(0, int(interval[2]) - int(interval[1]))
+        if not work_by_device:
+            raise ValueError("multi-stream breakdown has no measured device work")
+        device_id = min(work_by_device, key=lambda item: (-work_by_device[item], item))
+    device_id = int(device_id)
+
+    stream_rows = _stream_operation_rows(timeline_iteration, device_id)
+    displayed_streams = _display_stream_rows(stream_rows)
+    additive_rows = [row for rows in stream_rows.values() for row in rows]
+    measured_ms = float(breakdown["measured_kernel_sum_ms"]) - float(
+        breakdown.get("measured_concurrent_hidden_ms", 0.0) or 0.0
+    )
+    measured_path = _compact_path_rows(additive_rows, measured_ms)
+
+    simulated_path = [
+        {
+            "phase": None,
+            "operation": row.get("operation") or row["name"],
+            "duration_ms": float(row["critical_path_ms"]),
+        }
+        for row in breakdown["simulated_kernels"]
+        if float(row["critical_path_ms"]) > 1.0e-12
+    ]
+    semantic_names = list(
+        dict.fromkeys(
+            (row.get("operation") or "unmapped")
+            for _label, rows in displayed_streams
+            for row in rows
+        )
+    )
+    semantic_names.extend(
+        name
+        for name in (row["operation"] for row in simulated_path)
+        if name not in semantic_names
+    )
+    palette = plt.get_cmap("tab20")
+    colors = {name: palette(index % palette.N) for index, name in enumerate(semantic_names)}
+
+    labels = [f"GPU {device_id} {label}" for label, _rows in displayed_streams]
+    labels.extend(["Nsight reduced critical path", "Timing-predict critical path"])
+    rows_to_draw = [rows for _label, rows in displayed_streams] + [measured_path, simulated_path]
+    fig, axis = plt.subplots(figsize=(13.5, max(4.8, 0.62 * len(labels) + 2.7)))
+    for y_position, rows in enumerate(rows_to_draw):
+        left_ms = 0.0
+        for row in rows:
+            duration_ms = float(row["duration_ms"])
+            semantic_name = row.get("operation") or "unmapped"
+            axis.barh(
+                y_position,
+                duration_ms,
+                left=left_ms,
+                height=0.72,
+                color=colors[semantic_name],
+                edgecolor="white",
+                linewidth=0.35,
+            )
+            left_ms += duration_ms
+
+    axis.set_yticks(range(len(labels)), labels)
+    axis.invert_yaxis()
+    axis.set_xlabel("aggregated kernel duration (ms; each row compacted independently)")
+    axis.grid(True, axis="x", alpha=0.3)
+    simulated_ms = sum(float(row["duration_ms"]) for row in simulated_path)
+    delta_ms = simulated_ms - measured_ms
+    relative_pct = delta_ms / measured_ms * 100.0 if measured_ms > 0.0 else math.nan
+    axis.set_title(
+        f"{run_label}\nIteration {breakdown['iteration_id']} · {breakdown['stage']} · "
+        f"critical device {device_id}\n"
+        f"Nsight {measured_ms:.3f} ms · Timing-predict {simulated_ms:.3f} ms · "
+        f"delta {delta_ms:+.3f} ms ({relative_pct:+.2f}%)",
+        fontweight="bold",
+    )
+    axis.legend(
+        handles=[Patch(facecolor=colors[name], label=name) for name in semantic_names],
+        loc="upper center",
+        frameon=False,
+        ncol=min(5, max(1, len(semantic_names))),
+    )
+    fig.tight_layout()
+    save_plot(
+        fig,
+        out_path,
+        dpi=BREAKDOWN_DPI,
+        tight=False,
+        pil_kwargs=BREAKDOWN_PNG_OPTIONS,
+    )
     return out_path
 
 

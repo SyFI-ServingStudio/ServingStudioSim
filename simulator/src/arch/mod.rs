@@ -7,6 +7,7 @@
 pub mod build;
 pub mod config;
 pub mod contract;
+pub mod deepseek_v4_vllm;
 pub mod glm52_dsa_moe;
 pub mod glm52_vllm_dsa_moe;
 pub mod llama3_dense;
@@ -26,6 +27,10 @@ pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 pub use contract::{
     ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
     IterwiseUnifiedModel, UnifiedArchInput,
+};
+pub use deepseek_v4_vllm::{
+    DeepseekV4ModelCfg, DeepseekV4VllmConfigs, DeepseekV4VllmModel, DeepseekV4VllmParallel,
+    DeepseekV4VllmResolved,
 };
 pub use glm52_dsa_moe::{
     Glm52DsaMoeConfigs, Glm52DsaMoeModel, Glm52DsaMoeParallel, Glm52DsaMoeResolved, Glm52ModelCfg,

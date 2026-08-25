@@ -140,9 +140,14 @@ or more simulated leaf slots; its measured kernel durations are counted once
 and its folded slot workloads are summed. Reports, payloads, and plots stay in
 the analysis root; the input roots are never used as output directories.
 When schema-v4 folding assigns different sequences to disjoint rank subsets,
-mapped rows with the same phase, semantic operation, and per-device ordinal are
-one logical occurrence and are joined before cross-rank reduction. The original
-rows remain the authority for mapping and unmapped-work audits.
+mapped rows with the same phase, semantic operation, physical category, and
+per-device category-local ordinal are one logical occurrence and are joined
+before cross-rank reduction. Category-local ordinals keep a rank-specific
+auxiliary kernel from shifting later work onto the wrong occurrence. The original
+rows remain the authority for mapping and unmapped-work audits. Uneven rank-local
+shapes may select different tuned physical kernel names for that occurrence;
+the joined row records every physical name and source row ID while still
+requiring one `cross_rank` semantic.
 
 ## Directory map
 
@@ -248,7 +253,7 @@ Current catalog:
 | `workload-conservation` | conservation | `cost_log` actuals + `request_slo.parquet` immutable fresh/declared input and runtime hit/computed/output observations | run-wide prefix token balance, cache-aware causal-prefill/cold-equivalent/decode-KV, and prefill/decode/FFN accounting, pass/fail / `workload_conservation_checks` |
 | `kv-occupancy` | kv | `kv_snapshot` stream + `run_meta.json` capacity | per-pool KV occupancy (active total / retained-prefix component / projected-peak / promised tokens, and as a fraction of capacity) over time; old streams remain readable with the missing prefix breakdown marked unavailable / `kv_occupancy_series` |
 | `alignment-timeline` | alignment-iteration | the same inputs as `alignment-iteration`, but keeping every rank's per-kernel `(start_ns, end_ns)`, plus the optional host sidecar (`host_timeline` in the alignment manifest) | EVERY iteration, as an index plus a byte-range-addressed `alignment_timeline_iterations.jsonl`: raw measured intervals, per-slot UNIT sim times, the cost manifest verbatim, and — when the sidecar is present — per-thread NVTX and CUDA-runtime host lanes, so a client can draw the GPU, the sim and the CPU on ONE time axis. At most 32 iterations carry a distinguishing `selected_as`; the report writes up those. / reference-rank per-phase span/busy/idle + largest gaps named by the operations either side |
-| `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping (no simulation) | kernel/mapping error stats + self-derived `recommended_gpu_time_multiplier` (`Σ measured_gpu_cycle_ms / Σ measured_ms`) / separate kernel-busy and measured first-kernel-to-next-first-kernel GPU-cycle overviews + per-iteration mapped stacks |
+| `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping (no simulation) | kernel/mapping error stats + self-derived `recommended_gpu_time_multiplier` (`Σ measured_gpu_cycle_ms / Σ measured_ms`) / separate kernel-busy and GPU-cycle overviews + sampled per-iteration critical-device stream stacks |
 | `alignment-e2e` | alignment-e2e | req-frontend replay JSONL + parsed NSYS GPU timeline + optional vLLM engine-core request timing JSONL + sim `request_slo.parquet` | independent client-TTFT/sim, optional server-TTFT/sim, client-TPOT/sim, optional server-TPOT/sim, E2E stats, client-completion throughput, and server GPU-span throughput / available raw latency CDF overlays + client/sim completion series annotated with all aggregate rates |
 | `alignment-workload` | alignment-workload | normalized NSYS iteration metrics + sim `cost_log.groups`/`wall_start_ms` | per-side workload summaries / fine prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle series by iteration id, plus decode batch size by elapsed time |
 
@@ -280,8 +285,11 @@ It keeps the overview and other subject-level plots directly under `plots/`,
 then groups breakdowns in batches of 32 under raw-id ranges such as
 `plots/iter_6_to_305/iter_6_breakdown.png`. Sampling therefore bounds rendering
 cost without changing any computed statistic or discarding payload rows.
-Breakdowns use a pre-sized 18-inch, 150-DPI canvas (2700 pixels wide), skip the
-tight-bounding-box redraw, and use lossless PNG compression level 1. The smaller
+Each breakdown selects the same complete critical device as its headline, shows
+its material CUDA streams separately, and folds the small tail into one explicit
+`other streams` row. It reads only the sampled timeline byte ranges. Breakdowns
+use a pre-sized 150-DPI canvas, skip the tight-bounding-box redraw, and use
+lossless PNG compression level 1. The smaller
 set of overview/CDF figures keeps the shared 300-DPI PNG default. A breakdown
 PNG newer than both its payload and renderer source is skipped, so an interrupted render resumes missing/stale figures
 instead of regenerating all 128. Stale generated rows and replaced PNG

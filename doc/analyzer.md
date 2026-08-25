@@ -147,9 +147,16 @@ kernel sequence is identical across all participating devices.
 Schema-v4 inventories may instead assign different folded sequences to disjoint
 rank subsets in the same iteration. A row ID then identifies a sequence shape,
 not a logical occurrence. For mapped work, the analyzer joins matching
-`(phase, operation, per-device ordinal)` rows across those subsets before the
-cross-rank reduction. It retains the original rows for mapping and unmapped-work
-audits; unmapped rows are never guessed into a logical occurrence.
+`(phase, operation, physical category, per-device category-local ordinal)` rows
+across those subsets before the cross-rank reduction. The category-local ordinal
+prevents a rank-specific auxiliary kernel from shifting all later work onto the
+wrong occurrence. It retains the original rows for mapping and unmapped-work
+audits; unmapped rows are never guessed into a logical occurrence. The joined
+rows may carry different tuned physical kernel names when uneven rank-local
+shapes select different specializations. Their `cross_rank` semantics must still
+agree. The joined breakdown exposes all source row IDs and
+physical kernel names instead of treating one rank's specialization as the
+logical identity.
 
 ### Concurrent CUDA streams
 
@@ -164,13 +171,19 @@ positional validation stop at a track edge.
 Adding per-occurrence durations across tracks would count their overlap twice, so
 the analyzer subtracts exactly that overlap: per device,
 `measured_concurrent_hidden_ms = Σ per-track busy union − union across tracks`,
-and `measured_ms = measured_kernel_sum_ms − measured_concurrent_hidden_ms`. Both
+and `measured_ms = measured_kernel_sum_ms − measured_concurrent_hidden_ms`. It
+combines mapped work, unmapped work, and overlap on each device before selecting
+the longest complete device path; it never splices three maxima from different
+devices. Both
 terms are reported, because `measured_kernel_sum_ms` is the like-for-like partner
 of a CostTree that composes those operations with `Sum`. Within one track kernels
 never overlap, so a single-stream capture has zero hidden time and every number
 above is unchanged; the cross-rank reductions are untouched either way.
 
-Per operation and per measured kernel, `concurrent_hidden_ms` says how much of it
+The sampled breakdown shows only that selected device. Material tracks get their
+own compact row; small tracks are preserved in one explicit aggregate row rather
+than creating hundreds of mostly empty labels. Per operation and per measured
+kernel, `concurrent_hidden_ms` says how much of it
 the framework managed to hide. One overlap is one shared stretch of wall clock,
 so it is charged to the later-starting track only — the side stream that joined a
 device already busy. That is what makes these rows sum back to the iteration's
@@ -184,6 +197,12 @@ R2 rung folds `Max → mean` and calls the residue *imbalance*. Two different
 computations sharing one GPU are neither interchangeable nor balanceable, and
 same-device contention puts wall time at ≥ max(children) rather than ≤, so
 modelling that overlap needs a new node kind rather than a reused one.
+
+Until that node exists, `deepseek_v4_vllm_serial_streams` is the
+Optimality-safe DeepSeek-V4 provider: it keeps the same leaves and cross-rank
+DP4/EP4 `Max` nodes as `deepseek_v4_vllm`, but lowers every same-device source
+fan-out to `Sum`. The base provider remains useful for timing comparison, but
+its R1→R2 residue must not be interpreted as pure rank imbalance.
 
 The alignment trio is separate not by deployment but by **source scope** (see
 below): it reads an alignment manifest instead of a plain run directory.

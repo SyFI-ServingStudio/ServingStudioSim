@@ -45,8 +45,9 @@ use std::path::Path;
 use super::host::{self, HostWindow};
 use super::{
     interval_union_ns, kernel_name_index, leaf_scales, load_inventory, load_sim_cases,
-    measure_iteration, measured_gpu_cycles_ms, occurrence_ns, read_json, single_iter_manifest,
-    CaseMapDoc, CompiledInventory, IterationMeasurement, MeasuredIteration, ParsedTrace, SimCase,
+    measure_iteration, measured_critical_path, measured_gpu_cycles_ms, occurrence_ns, read_json,
+    single_iter_manifest, CaseMapDoc, CompiledInventory, IterationMeasurement, MeasuredIteration,
+    ParsedTrace, SimCase,
 };
 use crate::alignment_input;
 use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
@@ -89,6 +90,7 @@ struct IterationSummary {
     stage: String,
     iteration_type: String,
     identity_sequence: String,
+    critical_device_id: Option<i64>,
     measured_ms: f64,
     simulated_ms: f64,
     relative_diff_pct: f64,
@@ -187,7 +189,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             )
         })?;
         let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
-        let measured_ms = critical_path_ms(&measurement);
+        let measured_reduction = measured_critical_path(&measurement);
         summaries.push(IterationSummary {
             case_index: joined.case_index,
             iteration_id: measured_iter.iteration,
@@ -197,9 +199,13 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 .sequence_id(IDENTITY_PHASE, measured_iter.iteration)
                 .unwrap_or("")
                 .to_string(),
-            measured_ms,
+            critical_device_id: measured_reduction.device_id,
+            measured_ms: measured_reduction.critical_path_ms,
             simulated_ms: sim.total_ms,
-            relative_diff_pct: relative_pct(sim.total_ms - measured_ms, measured_ms),
+            relative_diff_pct: relative_pct(
+                sim.total_ms - measured_reduction.critical_path_ms,
+                measured_reduction.critical_path_ms,
+            ),
         });
     }
     ensure!(!summaries.is_empty(), "alignment case map is empty");
@@ -435,25 +441,6 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "definitions": definitions,
     });
     Ok((report, payload))
-}
-
-/// The headline measured duration: every occurrence reduced across its ranks,
-/// then summed. Identical to `alignment-iteration`'s `measured_ms` — including
-/// the float summation ORDER, which is why the mapped and unmapped halves are
-/// accumulated separately and added at the end. Two subjects that disagree in the
-/// last ulp about the same quantity are a bug report waiting to happen.
-fn critical_path_ms(measurement: &IterationMeasurement) -> f64 {
-    let mut mapped_ms = 0.0;
-    let mut unmapped_ms = 0.0;
-    for (_, item) in &measurement.kernels {
-        let duration_ms = occurrence_ns(&item.launches, item.synchronizing) as f64 / 1e6;
-        if item.operation.is_some() {
-            mapped_ms += duration_ms;
-        } else {
-            unmapped_ms += duration_ms;
-        }
-    }
-    mapped_ms + unmapped_ms
 }
 
 /// Label every iteration, distinguishing the ones worth opening first.
@@ -790,6 +777,7 @@ fn build_iteration(
         "simulated_gpu_cycle_ms": simulated_gpu_cycle_ms,
         "measured": {
             "critical_path_ms": summary.measured_ms,
+            "critical_device_id": summary.critical_device_id,
             "busy_union_ms": measurement.busy_union_ms,
             "kernels": kernel_rows,
         },
@@ -812,6 +800,7 @@ fn build_iteration(
         "identity_sequence": summary.identity_sequence,
         "selected_as": reason.label(),
         "measured_ms": summary.measured_ms,
+        "critical_device_id": summary.critical_device_id,
         "simulated_ms": summary.simulated_ms,
         "delta_ms": summary.simulated_ms - summary.measured_ms,
         "relative_diff_pct": summary.relative_diff_pct,
@@ -839,6 +828,7 @@ fn build_iteration(
         "selected_as": reason.label(),
         "anchor_ns": anchor_ns.map(offset),
         "measured_ms": summary.measured_ms,
+        "critical_device_id": summary.critical_device_id,
         "simulated_ms": summary.simulated_ms,
         "relative_diff_pct": summary.relative_diff_pct,
         "measured_gpu_cycle_ms": measured_gpu_cycle_ms,
@@ -1123,6 +1113,7 @@ mod tests {
             stage: kind.to_string(),
             iteration_type: kind.to_string(),
             identity_sequence: sequence.to_string(),
+            critical_device_id: None,
             measured_ms: 1.0,
             simulated_ms: 1.0 + relative / 100.0,
             relative_diff_pct: relative,

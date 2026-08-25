@@ -27,6 +27,8 @@ pub struct ResolvedPrefillContext {
     resident_prefix_tokens: u32,
     prefill_tokens_to_compute: u32,
     post_prefill_context_tokens: u32,
+    processed_prefill_tokens: u32,
+    active_chunk_tokens: u32,
     cache_return_metadata: Option<PrefixCacheReturnMetadata>,
 }
 
@@ -66,6 +68,8 @@ impl ResolvedPrefillContext {
             resident_prefix_tokens,
             prefill_tokens_to_compute,
             post_prefill_context_tokens,
+            processed_prefill_tokens: 0,
+            active_chunk_tokens: prefill_tokens_to_compute,
             cache_return_metadata: None,
         }
     }
@@ -89,6 +93,32 @@ impl ResolvedPrefillContext {
 
     pub fn post_prefill_context_tokens(self) -> u32 {
         self.post_prefill_context_tokens
+    }
+
+    /// Context and append length exposed to the model in this iteration.
+    pub fn active_chunk(self) -> (u32, u32) {
+        (
+            self.resident_prefix_tokens + self.processed_prefill_tokens,
+            self.active_chunk_tokens,
+        )
+    }
+
+    pub fn remaining_prefill_tokens(self) -> u32 {
+        self.prefill_tokens_to_compute
+            .saturating_sub(self.processed_prefill_tokens)
+    }
+
+    fn schedule_chunk(&mut self, chunk_tokens: u32) {
+        debug_assert!(chunk_tokens <= self.remaining_prefill_tokens());
+        self.active_chunk_tokens = chunk_tokens;
+    }
+
+    fn complete_chunk(&mut self) {
+        self.processed_prefill_tokens = self
+            .processed_prefill_tokens
+            .checked_add(self.active_chunk_tokens)
+            .expect("processed prefill token count overflow");
+        self.active_chunk_tokens = 0;
     }
 
     fn with_cache_return_metadata(
@@ -186,6 +216,34 @@ pub trait PrefixKv: KvStore {
                 .post_prefill_context_tokens(),
         )
     }
+}
+
+/// Partial-prefill refinement for the whole-iteration worker family.
+///
+/// The store reserves the complete request footprint once, while admission
+/// exposes one hard-capped chunk at a time to the execution component.
+pub trait ChunkedPrefillKv: PrefixKv + IterWorkerKv {
+    fn reserve_chunked_prefill_context(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        resolved_prefill: ResolvedPrefillContext,
+        footprint: Self::Footprint,
+        now: Time,
+    );
+    fn schedule_prefill_chunk(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        chunk_tokens: u32,
+    );
+    fn complete_prefill_chunk(&mut self, request: RequestId);
+    fn finish_chunked_prefill(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        remaining_output_tokens: u32,
+    );
 }
 
 pub trait IterWorkerKv: KvStore {

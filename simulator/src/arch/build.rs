@@ -20,10 +20,11 @@ use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, Routi
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    glm52_dsa_moe, glm52_vllm_dsa_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
-    qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
-    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
-    AttnLayerwiseModel, DenseParallel, DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel,
+    deepseek_v4_vllm, glm52_dsa_moe, glm52_vllm_dsa_moe, llama3_dense, llama3_dense_tp,
+    llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise,
+    qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn,
+    qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel, DeepseekV4ModelCfg, DeepseekV4VllmModel,
+    DeepseekV4VllmParallel, DenseParallel, DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel,
     Glm52DsaMoeModel, Glm52DsaMoeParallel, Glm52ModelCfg, Glm52MtpMode, Glm52VllmDsaMoeModel,
     Glm52VllmDsaMoeParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
     Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
@@ -712,6 +713,44 @@ pub fn qwen3_vllm_moe(
         .context("building vLLM-aligned FP8 Qwen3-MoE model")
 }
 
+/// Build DeepSeek V4 through the same routing-profile loader used by Qwen and
+/// GLM. `serialize_streams` changes only CostTree composition; kernel inputs and
+/// profile identities remain identical.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v4_vllm(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    serialize_streams: bool,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<DeepseekV4VllmModel> {
+    let model_cfg = DeepseekV4ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+        .context("loading exact DeepSeek V4 model config")?;
+    let routing = resolve_routing_source(
+        routing_kind,
+        routing_seed,
+        model_cfg.num_experts.get(),
+        4,
+        model_cfg.num_layers,
+        model_cfg.top_k,
+        expert_popularity_file,
+    )?;
+    let parallel = DeepseekV4VllmParallel {
+        ep_size: 4,
+        nvl_num_gpu: 4,
+        gpu_name: gpu.to_string(),
+        serialize_streams,
+    };
+    let configs = deepseek_v4_vllm::build_configs(&model_cfg, &parallel, &routing)
+        .context("expanding DeepSeek V4 architecture configs")?;
+    let resolved = deepseek_v4_vllm::resolve_configs(&configs);
+    deepseek_v4_vllm::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek V4 vLLM model (often a missing profile.db row)")
+}
+
 /// Build the GLM-5.2 local-attention + EP-MoE model. Both offline timing
 /// prediction and the unified `hp_unified` deployment consume this concrete
 /// path.
@@ -985,6 +1024,36 @@ pub fn build_iter_model(
             *routing,
             *routing_seed,
             expert_popularity_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::DeepseekV4Vllm {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+        } => Box::new(deepseek_v4_vllm(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            false,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::DeepseekV4VllmSerialStreams {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+        } => Box::new(deepseek_v4_vllm(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            true,
             gpu,
             name,
             bridge,

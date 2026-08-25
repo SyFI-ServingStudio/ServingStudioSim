@@ -54,6 +54,12 @@ This is why `KernelKind` strings must match exactly across the boundary (below).
 - The `profilers/` timing primitives (`Timer.cupti`, `Energy.perf`, the CUPTI
   C++ extension).
 
+The pinned `vllm_env` also owns a `lib/cuda-compat` link beside its virtual
+environment. Point that link at the unpacked NVIDIA forward-compatibility
+library used by the matching alignment run. Environment validation fails before
+acquiring a GPU when the link is absent; the execution layer prepends it to
+`LD_LIBRARY_PATH` before Torch's libraries.
+
 `Timer.cupti`'s duration path is a two-pass GPU-active-time measurement. It
 first records 10 real callable launches, computes
 `ceil(min_duration_ms / estimate_mean_ms)`, then records exactly that many

@@ -689,6 +689,12 @@ def test_analyze_e2e_uses_distinct_full_run_workload_profile(tmp_path, monkeypat
         "metrics_jsonl": str(metrics),
         "replay_result": str(replay),
     }
+    copied_trace = tmp_path / "trace" / "copied-shared.csv"
+    copied_trace.write_bytes((tmp_path / "trace" / "shared.csv").read_bytes())
+    workload_result["drive_summary"] = {
+        **base_profile["drive_summary"],
+        "source_trace": str(copied_trace),
+    }
     (workload_profile / "profile_result.json").write_text(json.dumps(workload_result))
     analyze_raw = yaml.safe_load(paths["analyze_e2e"].read_text())
     analyze_raw["workload_profile_log_dir"] = "./workload_profile_run"

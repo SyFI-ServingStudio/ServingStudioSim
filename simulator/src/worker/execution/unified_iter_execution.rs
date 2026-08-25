@@ -38,11 +38,11 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
             group.clear();
             kv_store.visit_prefill_admits(partition, |request| {
                 let resolved_prefill = kv_store.resolved_prefill_context(request);
-                group.prefill_chunk_pairs.push((
-                    resolved_prefill.resident_prefix_tokens(),
-                    resolved_prefill.prefill_tokens_to_compute(),
-                ));
-                group.prefill_tokens += resolved_prefill.prefill_tokens_to_compute();
+                let (prefix_tokens, chunk_tokens) = resolved_prefill.active_chunk();
+                group
+                    .prefill_chunk_pairs
+                    .push((prefix_tokens, chunk_tokens));
+                group.prefill_tokens += chunk_tokens;
             });
             kv_store.visit_decode_members(partition, |_, current_kv| {
                 group.decode_kv_lens.push(current_kv as u32);
@@ -51,7 +51,13 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
             group.decode_tokens = group.decode_kv_lens.len() as u32;
             group.batch_tokens = group.prefill_tokens + group.decode_tokens;
         }
-        out.tokens_per_source_rank.clear();
+        if num_partitions > 1 {
+            out.tokens_per_source_rank.clear();
+            out.tokens_per_source_rank
+                .extend(out.groups.iter().map(|group| group.batch_tokens));
+        } else {
+            out.tokens_per_source_rank.clear();
+        }
     }
 
     pub(crate) fn evaluate_iteration(
