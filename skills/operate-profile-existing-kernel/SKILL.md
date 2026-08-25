@@ -80,12 +80,13 @@ Record these fields with the spec set and verify them before calling a row a DB
 hit for the target experiment. If provenance is unavailable, report the row as
 unverified rather than inferring equivalence from table/backend alone.
 
-For compute rows, verify that the runner's timed boundary is the production
-public callable and that `Timer.cupti` sums one logical invocation: a stable
-single kernel may use a name filter, while a compound callable must include its
-full launch sequence with `kernel_name=None`. CUDA-event timing is diagnostic,
-not DB evidence. Allocation, compile, correctness, and synchronization must be
-outside the timed closure.
+For framework and specialized compute rows, verify that the timed boundary is
+the production public callable and that `Timer.cupti` sums one logical
+invocation: a stable single kernel may use a name filter, while a compound
+callable must include its full launch sequence with `kernel_name=None`. Preserve
+the documented `Timer.do_bench` path for simple Torch GEMM. CUDA-event timing is
+diagnostic, not DB evidence. Allocation, compile, correctness, and
+synchronization must be outside the timed closure.
 
 Inspect input generation before trusting a row for a data-sensitive algorithm.
 The synthetic workload must exercise the same planner, histogram/radix path, or

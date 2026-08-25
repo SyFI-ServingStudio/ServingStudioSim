@@ -116,12 +116,14 @@ ratio-boundary, multi-request, padding, inactive-row, and poison-sentinel cases.
 
 ## Timing And Metrics
 
-Compute profile rows use the sum of CUPTI kernel durations for one logical
-callable invocation. A proven single-launch callable may filter by a stable
-kernel name; a compound callable uses `kernel_name=None` so every launch in its
-fixed sequence is counted. CUDA-event elapsed time is diagnostic only and must
-not populate compute profile rows. Allocation, input construction, compilation,
-warmup, correctness, and synchronization stay outside `Timer.cupti`.
+For framework and specialized GPU callables, compute profile rows use the sum
+of CUPTI kernel durations for one logical invocation. A proven single-launch
+callable may filter by a stable kernel name; a compound callable uses
+`kernel_name=None` so every launch in its fixed sequence is counted. Keep the
+documented `Timer.do_bench` path for simple Torch GEMM; do not replace an
+established runner family's timing method without evidence. CUDA-event elapsed
+time is diagnostic only. Allocation, input construction, compilation, warmup,
+correctness, and synchronization stay outside the timed closure.
 
 Use `Energy.perf(..., per_iter_time_ms=time_ms)` for energy. A different timing
 boundary requires an explicit operation contract and orchestrator approval, not
