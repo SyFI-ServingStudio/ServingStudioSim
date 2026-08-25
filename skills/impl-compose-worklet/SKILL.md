@@ -71,11 +71,29 @@ the mandatory sync grain: `local` / `tp` / `hp` / `ep` / `hptp` / `eptp`.
 - No op-slot polymorphism — slot fields are concrete `Op<K>` / `*Op` / `Option<...>`,
   never `enum` / `Box<dyn>` (V7). Backends pass through as config strings.
 
+Reconstruct the production dependency graph before choosing `Sum` or `Max`.
+Mixed prefill/decode inputs share one common projection spine when production
+does; do not concatenate two complete phase worklets and double-charge common
+work. A `Max` may contain only children launched from the same source fanout and
+must close at the real join/barrier before later work begins. A compound L1 slot
+retains every fixed prologue/tail launch inside its public boundary.
+
+Do not mint slots for runtime chunks, ranks, layer repetition, or capacity. If
+the L1 callable owns a loop or fixed multi-launch sequence, it remains one
+semantic slot. A serial-stream counterfactual changes only `Max` versus ordered
+`Sum`; it preserves the same leaves, inputs, and source barriers.
+
+Profile DB compatibility must not determine worklet semantics. When a
+source-backed workload derivation changes, propagate the new physical input and
+re-profile rather than adding a model-specific conversion solely to hit old
+keys.
+
 ## Tests And Smoke
 
-- Unit-test `resolve_config` partition math with **no bridge** (as
-  `attn_block_tp.rs`): a degenerate `size == 1` case, a real-partition case, an fp8
-  case, and a `#[should_panic]` indivisible case.
+- Unit-test only behavior-bearing boundaries with **no bridge**: partition
+  invariants, invalid divisibility, and one observable CostTree/input-order test
+  when fanout/barrier structure is non-trivial. Do not duplicate field lists or
+  implementation formulas in tests.
 - `just test-cpu`, or `uv run cargo test -p simulator worklet::`.
 - Full leaf smoke happens through the arch dry-run (`impl-compose-arch`).
 

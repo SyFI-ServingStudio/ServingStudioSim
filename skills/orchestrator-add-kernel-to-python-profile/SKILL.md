@@ -55,8 +55,15 @@ Classify the request before doing anything else:
   changes the operation contract.
 
 If the user asks for both, split it into ordered tasks. The new kind lands first
-with a Torch backend, then additional backends reuse that established kind and
-args schema.
+with its production backend and an independent Torch correctness oracle, then
+additional backends reuse that established kind and args schema. Register a
+Torch backend only when the production operation is itself a public Torch
+callable worth timing.
+
+Before accepting “brand-new kind”, compare the nearest existing contract across
+operation semantics, args meaning, dtype/layout, production callable, and
+logical launch boundary. Source ambiguity requires a matched-shape A/B with
+identical logical I/O. A backend may change implementation, never field meaning.
 
 ## Path A: Brand-New Kernel Kind
 
@@ -108,10 +115,11 @@ Things to verify:
 - numerical expectations and tolerance are stated;
 - edge cases and unsupported cases are explicit.
 
-**Task A.3 — Torch profiling backend.** Ask the implementer to turn the Torch
-reference into the first profiling backend by using `impl-register-kernel`.
-The brief should name the kernel kind, backend `torch`, args fields, closest
-existing kernel/runner to mirror, and the Torch reference from Task A.2.
+**Task A.3 — Production profiling backend.** Ask the implementer to wrap the
+production public callable by using `dev-explore-kernel` and
+`impl-register-kernel`. The brief should name the kernel kind, backend, args
+fields, closest existing runner to mirror, and the Torch oracle from Task A.2.
+Do not vendor specialized kernel source into the profiler.
 
 Things to verify:
 
@@ -122,16 +130,15 @@ Things to verify:
   `uv run python -c "from profiling import perf_api; assert hasattr(perf_api, 'get_<kind>_times')"`;
 - a real profiling smoke succeeds through the public CLI on a representative
   spec, writing only a temporary DB, e.g.
-  `uv run python -m profiling run <kind> --backend torch --db /tmp/<kind>_torch_smoke.db --spec '<json spec>' --json`;
-- the reference semantics from Task A.2 are what the runner measures;
+  `uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke.db" --spec '<json spec>' --json`;
+- the production callable is what the runner measures, while the Task A.2
+  reference checks it outside timing;
 - the implementer produced tests and smoke evidence, without writing shared
   `profiling/profile.db` unless the user explicitly authorized it.
 
-Once the Torch backend is in place, ask the user whether they need additional
-backends before continuing. If the user originally pointed to a custom or
-framework implementation, do not stop here; continue directly to Path B and make
-Task B.1 explore that specific implementation rather than doing an open-ended
-framework search.
+Once the production backend is in place, ask whether additional implementations
+are needed. Use Path B for each added backend; do not repeat Path A or change the
+kind's established semantics.
 
 ## Path B: New Backend For An Existing Kind
 
@@ -192,7 +199,7 @@ Things to verify:
 - the existing generated perf API symbol still resolves for that kind;
 - a real profiling smoke succeeds through the public CLI on a representative
   spec for that backend, writing only a temporary DB, e.g.
-  `uv run python -m profiling run <kind> --backend <backend> --db /tmp/<kind>_<backend>_smoke.db --spec '<json spec>' --json`;
+  `uv run python -m profiling run <kind> --backend <backend> --db "$TMPDIR/<kind>_<backend>_smoke.db" --spec '<json spec>' --json`;
 - focused tests and smoke evidence cover the new backend. If no compatible
   GPU/environment is available, treat the task as not fully verified and return
   the exact blocker instead of accepting it as done.

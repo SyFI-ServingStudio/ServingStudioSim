@@ -174,6 +174,13 @@ partially processed `active_chunk` per partition in lifecycle state. Never pop
 and push an active chunk through the policy: that rotates order and changes the
 scheduling semantics.
 
+Do not turn alignment observations into worker policy. A trace may supply
+request lengths and arrivals, but observed DP rank, equal-shaped adjacency, or
+profiler-created chunks are realized outcomes, not admission constraints.
+Implement generic chunk lifecycle over the original request stream; keep any
+observed-placement replay as an explicitly conditioned experiment outside the
+predictive worker.
+
 ### Execution
 
 Keep model/input ownership in the matching sibling trait:

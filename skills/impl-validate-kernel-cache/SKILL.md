@@ -137,6 +137,18 @@ profiling cost with a denser grid, adding a new cache/fitting mechanism, or
 changing the public query/input contract. After any remediation, rerun fidelity
 and report the new final CSV/log summary.
 
+Do not add an axis merely because an upstream artifact exposes it. First compare
+the absolute timing effect at matched shapes, the fidelity gain, feasible-grid
+growth, and DB migration cost. Aggregate coordinates are invalid when they hide
+planner, page-lookup, or branch topology; in that case retain exact ragged input
+for identity/provenance and define a source-backed cache projection. Keep
+runtime allocation capacity distinct from checkpoint capability.
+
+When workload derivation or the physical input contract changes, treat old rows
+as belonging to the old contract and re-profile. Cache compatibility is never a
+reason to preserve a model-specific legacy transformation that production no
+longer uses.
+
 ## Gotchas (hard-won)
 
 - **`gpu_name` is the exact `profile.db` key** — `"NVIDIA H200"`, not `"H200"`.
