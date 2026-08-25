@@ -38,8 +38,11 @@ pub use workers::afd_attention::DisaggAttnWorker;
 pub(crate) use workers::afd_ffn::build_afd_ffn_worker;
 pub use workers::afd_ffn::DisaggFfnWorker;
 pub(crate) use workers::iter::{
-    build_barebone_worker, build_hp_worker, build_pd_prefill_worker, build_qwen36_hybrid_worker,
+    build_barebone_worker, build_chunked_prefill_worker, build_hp_worker, build_pd_prefill_worker,
+    build_qwen36_hybrid_worker,
 };
-pub use workers::iter::{BareboneWorker, HpUnifiedWorker, PdPrefillWorker, Qwen36HybridWorker};
+pub use workers::iter::{
+    BareboneWorker, ChunkedPrefillWorker, HpUnifiedWorker, PdPrefillWorker, Qwen36HybridWorker,
+};
 pub(crate) use workers::pd_decode::build_pd_decode_worker;
 pub use workers::pd_decode::PdDecodeWorker;

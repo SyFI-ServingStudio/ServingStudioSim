@@ -27,6 +27,8 @@ use crate::worker::shared::advance_scope::PartitionId;
 pub(crate) struct RequestLedger {
     /// Reserved-but-not-yet-resident footprints, as `(partition, charge)`.
     promised: HashMap<RequestId, (PartitionId, u64)>,
+    /// Full-footprint reservations held across partial-prefill iterations.
+    chunked_prefill: HashMap<RequestId, (PartitionId, u64)>,
     /// Prefilled KV awaiting a decode-side pull acknowledgement.
     held: HashMap<RequestId, (PartitionId, u64)>,
     held_by_partition: Vec<u64>,
@@ -41,6 +43,7 @@ impl RequestLedger {
     pub(crate) fn new(num_partitions: usize) -> Self {
         Self {
             promised: HashMap::new(),
+            chunked_prefill: HashMap::new(),
             held: HashMap::new(),
             held_by_partition: vec![0; num_partitions],
             placement: HashMap::new(),
@@ -76,28 +79,63 @@ impl RequestLedger {
     }
 
     pub(crate) fn has_promise(&self, request: RequestId) -> bool {
-        self.promised.contains_key(&request)
+        self.promised.contains_key(&request) || self.chunked_prefill.contains_key(&request)
     }
 
     pub(crate) fn promised_charge(&self, request: RequestId) -> Option<u64> {
-        self.promised.get(&request).map(|(_, charge)| *charge)
+        self.promised
+            .get(&request)
+            .or_else(|| self.chunked_prefill.get(&request))
+            .map(|(_, charge)| *charge)
     }
 
     #[inline]
     pub(crate) fn partition_promised(&self, partition: PartitionId) -> u64 {
-        self.promised
+        let newly_promised: u64 = self
+            .promised
             .values()
             .filter(|(promised_partition, _)| *promised_partition == partition)
             .map(|(_, charge)| *charge)
-            .sum()
+            .sum();
+        let chunked_prefill: u64 = self
+            .chunked_prefill
+            .values()
+            .filter(|(reserved_partition, _)| *reserved_partition == partition)
+            .map(|(_, charge)| *charge)
+            .sum();
+        newly_promised + chunked_prefill
     }
 
     #[inline]
     pub(crate) fn partition_promised_count(&self, partition: PartitionId) -> u32 {
-        self.promised
+        let newly_promised = self
+            .promised
             .values()
             .filter(|(promised_partition, _)| *promised_partition == partition)
-            .count() as u32
+            .count();
+        let chunked_prefill = self
+            .chunked_prefill
+            .values()
+            .filter(|(reserved_partition, _)| *reserved_partition == partition)
+            .count();
+        u32::try_from(newly_promised + chunked_prefill)
+            .expect("partition reservation count exceeds u32")
+    }
+
+    pub(crate) fn promote_promise_to_chunked_prefill(&mut self, request: RequestId) {
+        let reservation = self
+            .promised
+            .remove(&request)
+            .expect("chunked prefill must promote an existing promise");
+        self.chunked_prefill.insert(request, reservation);
+    }
+
+    pub(crate) fn forget_chunked_prefill(&mut self, request: RequestId) {
+        self.chunked_prefill.remove(&request);
+    }
+
+    pub(crate) fn has_chunked_prefill(&self, request: RequestId) -> bool {
+        self.chunked_prefill.contains_key(&request)
     }
 
     /// Empty `promised` and report `(partition, request)` in iteration order.
@@ -153,6 +191,20 @@ impl RequestLedger {
     ) {
         self.resolved_prefill_contexts
             .insert(request, resolved_prefill);
+    }
+
+    pub(crate) fn schedule_prefill_chunk(&mut self, request: RequestId, chunk_tokens: u32) {
+        self.resolved_prefill_contexts
+            .get_mut(&request)
+            .expect("chunked prefill context must exist")
+            .schedule_chunk(chunk_tokens);
+    }
+
+    pub(crate) fn complete_prefill_chunk(&mut self, request: RequestId) {
+        self.resolved_prefill_contexts
+            .get_mut(&request)
+            .expect("chunked prefill context must exist")
+            .complete_chunk();
     }
 
     pub(crate) fn prefill_context(&self, request: RequestId) -> Option<ResolvedPrefillContext> {

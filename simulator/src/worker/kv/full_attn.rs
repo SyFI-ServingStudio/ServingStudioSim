@@ -23,8 +23,8 @@ use crate::worker::kv::shared::prefix_cache_journal::PrefixCacheJournal;
 use crate::worker::kv::shared::request_ledger::RequestLedger;
 use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
 use crate::worker::kv::{
-    HandoffKv, IterWorkerKv, KvStore, PrefixCachePolicy, PrefixCacheTokenConfig, PrefixKv,
-    ResolvedPrefillContext, SlotPipelineKv,
+    ChunkedPrefillKv, HandoffKv, IterWorkerKv, KvStore, PrefixCachePolicy, PrefixCacheTokenConfig,
+    PrefixKv, ResolvedPrefillContext, SlotPipelineKv,
 };
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
 
@@ -172,6 +172,55 @@ impl HandoffKv for FullAttnKv {
 
     fn complete_handoff(&mut self, request: RequestId, now: Time) {
         FullAttnKv::complete_handoff(self, request, now);
+    }
+}
+
+impl ChunkedPrefillKv for FullAttnKv {
+    fn reserve_chunked_prefill_context(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        resolved_prefill: ResolvedPrefillContext,
+        footprint: Self::Footprint,
+        now: Time,
+    ) {
+        self.reserve_prefill_context(request, partition, resolved_prefill, footprint, now);
+        self.ledger.promote_promise_to_chunked_prefill(request);
+    }
+
+    fn schedule_prefill_chunk(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        chunk_tokens: u32,
+    ) {
+        debug_assert!(self.ledger.has_chunked_prefill(request));
+        self.ledger.schedule_prefill_chunk(request, chunk_tokens);
+        self.partitions[partition as usize].add_prefill_admit(request);
+    }
+
+    fn complete_prefill_chunk(&mut self, request: RequestId) {
+        self.ledger.complete_prefill_chunk(request);
+    }
+
+    fn finish_chunked_prefill(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        remaining_output_tokens: u32,
+    ) {
+        let context_tokens = self
+            .ledger
+            .prefill_context(request)
+            .expect("chunked prefill context must exist")
+            .post_prefill_context_tokens();
+        self.ledger.forget_chunked_prefill(request);
+        self.commit_resident(
+            request,
+            partition,
+            u64::from(context_tokens),
+            remaining_output_tokens,
+        );
     }
 }
 
@@ -449,6 +498,7 @@ impl FullAttnKv {
     pub(crate) fn release(&mut self, request: RequestId, partition: PartitionId) {
         self.ledger.take_held(request);
         self.ledger.forget_promise(request);
+        self.ledger.forget_chunked_prefill(request);
         let current_kv = self.partitions[partition as usize]
             .decode_current_kv(request)
             .unwrap_or(0);
@@ -496,6 +546,7 @@ impl FullAttnKv {
     ) -> Option<PartitionId> {
         let Some(partition) = self.ledger.forget_placement(request) else {
             self.ledger.take_held(request);
+            self.ledger.forget_chunked_prefill(request);
             self.ledger.take_prefill_context(request);
             return None;
         };
@@ -503,6 +554,7 @@ impl FullAttnKv {
         partition_state.release_decode(request, current_kv);
         partition_state.remove_prefill_admit(request);
         self.ledger.forget_promise(request);
+        self.ledger.forget_chunked_prefill(request);
         self.ledger.take_prefill_context(request);
         Some(partition)
     }
@@ -575,9 +627,14 @@ impl FullAttnKv {
 
     #[inline]
     pub(crate) fn status_active(&self, partition: PartitionId) -> u32 {
+        let scheduled_chunked_prefills = self.partitions[partition as usize]
+            .iter_prefill_admits()
+            .filter(|request| self.ledger.has_chunked_prefill(*request))
+            .count() as u32;
         self.live_decode_count(partition)
             + self.ledger.partition_promised_count(partition)
             + self.partitions[partition as usize].prefill_admit_count()
+            - scheduled_chunked_prefills
     }
 
     /// Borrowed views keep input construction and completion bookkeeping

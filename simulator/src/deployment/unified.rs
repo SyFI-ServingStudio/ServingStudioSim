@@ -30,8 +30,9 @@ use crate::orchestrator::{
 };
 use crate::timing::PerfApiBridge;
 use crate::worker::{
-    build_barebone_worker, build_hp_worker, build_qwen36_hybrid_worker,
-    resolve_prefix_cache_config, IterWorker, IterWorkerSel, WorkerConfig,
+    build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
+    build_qwen36_hybrid_worker, resolve_prefix_cache_config, BatchPolicy, IterWorker,
+    IterWorkerSel, PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -65,7 +66,6 @@ impl Deployment for UnifiedDeployment {
         // L5 worker env: `attn_kv_bytes` sizes the worker's KV partitions, and
         // `log_output_token_times` controls request_slo detail logging. The
         // worker *type* is matched against the arch in the arms below.
-        // chunked_prefill is not wired yet.
         let (
             attn_gpu_memory_gb,
             gpu_time_multiplier,
@@ -104,8 +104,25 @@ impl Deployment for UnifiedDeployment {
                 *prefix_cache_policy,
                 *prefix_cache_max_gpu_memory_gb,
             ),
-            IterWorkerSel::ChunkedPrefill { .. } => {
-                bail!("unified: chunked_prefill worker not wired yet")
+            IterWorkerSel::ChunkedPrefill {
+                attn_gpu_memory_gb,
+                max_batch_tokens,
+                batch_policy,
+                gpu_time_multiplier,
+            } => {
+                ensure!(
+                    *batch_policy == BatchPolicy::Mix,
+                    "unified: chunked_prefill currently supports batch_policy=mix"
+                );
+                (
+                    *attn_gpu_memory_gb,
+                    *gpu_time_multiplier,
+                    Some(*max_batch_tokens),
+                    PendingOrderKind::Fifo,
+                    PrefixCacheMode::Opportunistic,
+                    PrefixCachePolicy::Lru,
+                    None,
+                )
             }
             IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => {
                 bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
@@ -339,6 +356,41 @@ impl Deployment for UnifiedDeployment {
                     build_hp_worker,
                 ))
             }
+            arch @ (IterArchSel::DeepseekV4Vllm {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                ..
+            }
+            | IterArchSel::DeepseekV4VllmSerialStreams {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                ..
+            }) => {
+                ensure_deepseek_unified_worker(&g.worker)?;
+                let serialize_streams =
+                    matches!(arch, IterArchSel::DeepseekV4VllmSerialStreams { .. });
+                let model = Arc::new(arch_build::deepseek_v4_vllm(
+                    model_spec,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    serialize_streams,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_deepseek_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             IterArchSel::Glm52VllmDsaMoe {
                 ep_size,
                 nvl_num_gpu,
@@ -437,6 +489,50 @@ fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
         other => {
             bail!("unified: this DP-attention/MoE arch requires worker `hp_unified`, got {other:?}")
         }
+    }
+}
+
+fn ensure_deepseek_unified_worker(worker: &IterWorkerSel) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::HpUnified { .. } | IterWorkerSel::ChunkedPrefill { .. } => Ok(()),
+        other => bail!(
+            "unified: DeepSeek-V4 requires worker `hp_unified` or `chunked_prefill`, got {other:?}"
+        ),
+    }
+}
+
+fn assemble_deepseek_flow<M>(
+    model: Arc<M>,
+    store: SharedRequests,
+    worker_config: WorkerConfig,
+    log_dir: Option<PathBuf>,
+    gpu_name: String,
+    dp_cfg: SimpleDpConfig,
+    worker: &IterWorkerSel,
+) -> anyhow::Result<Box<dyn Flow>>
+where
+    M: IterwiseUnifiedModel,
+{
+    match worker {
+        IterWorkerSel::HpUnified { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_hp_worker,
+        )),
+        IterWorkerSel::ChunkedPrefill { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_chunked_prefill_worker,
+        )),
+        other => bail!("unified: unsupported DeepSeek-V4 worker {other:?}"),
     }
 }
 

@@ -123,8 +123,8 @@ pub(super) struct ReplayScheduler {
     capacity: CapacityLimit,
     dependency: SessionDependencyState,
     active: ActiveUnits,
-    /// Whether the previous call turned away a unit that had already arrived,
-    /// purely for lack of a slot.
+    /// Whether the trace cursor is inside a run of units that were already due
+    /// but could not enter purely for lack of a slot.
     ///
     /// It decides which instant a head is stamped with. Normally that is the
     /// unit's own trace arrival, deliberately, so the tick granularity of the
@@ -133,7 +133,12 @@ pub(super) struct ReplayScheduler {
     /// permit *after* waiting for the arrival and only then sends, so its clock
     /// starts at the permit. Stamping the trace time instead would charge the
     /// simulated request for a wait the measured one never reports.
-    capacity_deferred: bool,
+    ///
+    /// This remains set while one drain call consumes several newly opened
+    /// slots. Clearing it after the first admission would stamp only that
+    /// request with the permit time and incorrectly charge its deferred peers
+    /// from their original trace arrival.
+    capacity_backlogged: bool,
 }
 
 /// Which top-level units currently hold a capacity slot.
@@ -278,7 +283,7 @@ impl ReplayScheduler {
             capacity,
             dependency,
             active,
-            capacity_deferred: false,
+            capacity_backlogged: false,
         }
     }
 
@@ -301,9 +306,12 @@ impl ReplayScheduler {
         let (index, mut release_time) = match &mut self.dependency {
             SessionDependencyState::Independent { cursor } => {
                 let release = releases.get(*cursor)?;
-                let release_time = release_time(self.arrival, release, now)?;
+                let Some(release_time) = release_time(self.arrival, release, now) else {
+                    self.capacity_backlogged = false;
+                    return None;
+                };
                 if !admits_new_unit {
-                    self.capacity_deferred = true;
+                    self.capacity_backlogged = true;
                     return None;
                 }
                 (take(cursor), release_time)
@@ -342,9 +350,12 @@ impl ReplayScheduler {
                     }
                     // Arrival is checked before capacity so that a unit that has
                     // not arrived yet is never recorded as capacity-deferred.
-                    let release_time = release_time(self.arrival, release, now)?;
+                    let Some(release_time) = release_time(self.arrival, release, now) else {
+                        self.capacity_backlogged = false;
+                        return None;
+                    };
                     if !admits_new_unit {
-                        self.capacity_deferred = true;
+                        self.capacity_backlogged = true;
                         return None;
                     }
                     head = Some((take(cursor), release_time));
@@ -353,7 +364,7 @@ impl ReplayScheduler {
                 head?
             }
         };
-        if std::mem::take(&mut self.capacity_deferred) {
+        if self.capacity_backlogged {
             release_time = release_time.max(now);
         }
         self.admit(releases, index, release_time)

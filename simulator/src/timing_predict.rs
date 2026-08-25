@@ -330,15 +330,19 @@ fn run_iter_cases(
     );
     let mut now = Time::from_ms(0.0);
     for (idx, case) in cases.into_iter().enumerate() {
-        // The iter driver owns its input construction: wrap the shared attention
-        // groups in a `UnifiedArchInput`. `tokens_per_source_rank` stays empty (same
-        // as the workers; its L4/L5 ownership is unsettled — see memory
-        // `tokens_per_source_rank_layer_conflict`).
+        // Mirror `UnifiedIterExecution`: exact ragged EP source sizes are a
+        // model-declared input capability, derived from the same DP groups.
+        let groups = case
+            .into_groups(expected_groups)
+            .with_context(|| format!("case {idx}"))?;
+        let tokens_per_source_rank = if groups.len() > 1 {
+            groups.iter().map(|group| group.batch_tokens).collect()
+        } else {
+            Vec::new()
+        };
         let arch_input = UnifiedArchInput {
-            groups: case
-                .into_groups(expected_groups)
-                .with_context(|| format!("case {idx}"))?,
-            tokens_per_source_rank: Vec::new(),
+            groups,
+            tokens_per_source_rank,
         };
         now += cost.run_iter(model, &arch_input, idx as u64, now);
     }

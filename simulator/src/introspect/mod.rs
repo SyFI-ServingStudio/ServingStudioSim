@@ -9,9 +9,10 @@
 //!   - **`grid`** → the fitted `grid_axes` + resolved config, straight from
 //!     `sweep_grid`. Pure metadata: no bridge, no profiling, no GPU. The driver
 //!     calls this first to place off-grid probes.
-//!   - **`eval`** → best-of-N interpolated metrics at a batch of `query_points`
-//!     (each the kernel's own `Input` fields). Builds the kernel (profiles
-//!     missing grid rows via JIT), so it needs the perf_api bridge.
+//!   - **`eval`** → best-of-N interpolated metrics at physical `Input` values.
+//!   - **`eval_coords`** → the same cache evaluated directly in coordinate
+//!     space. Analyzer uses this for declared-grid inspection because ragged or
+//!     re-axis kernels do not have one scalar Input field per cache axis.
 //!   - **`peak`** → the fitted grid's peak achieved compute/BW rates (the
 //!     per-config "best batching" ceiling the optimality analyzer divides work
 //!     by). Builds the kernel like `eval`, then reads the peak straight off the
@@ -49,6 +50,12 @@ enum KernelQueryRequest {
         /// (e.g. `{"prefix_len":0,"append_len":192}`).
         query_points: Vec<Value>,
     },
+    /// Interpolate directly in the fitted cache's coordinate space.
+    EvalCoords {
+        kind: String,
+        config: Value,
+        query_points: Vec<Vec<f64>>,
+    },
     /// Report each config's fitted-grid peak achieved compute/BW rates (the
     /// per-config batching ceiling). A **batch** so the optimality sidecar amortizes
     /// the one-time PyO3/bridge import across every unique run config in a single
@@ -69,8 +76,9 @@ struct GridResponse {
     kind: String,
     /// Structured resolved config; rich Dim objects retain formula provenance.
     describe_config: Value,
-    /// The Input field names a query point must carry, in `grid_axes` order:
-    /// `input_fields[i]` labels `grid_axes[i]` (e.g. `["prefix_len","append_len"]`).
+    /// Coordinate labels in `grid_axes` order. For a direct-axis scalar kernel
+    /// these are also Input field names; ragged/re-axis kernels expose derived
+    /// work labels instead.
     input_fields: &'static [&'static str],
     /// The fitted grid, in coords space, one ascending axis per dim.
     grid_axes: Vec<Vec<f64>>,
@@ -184,6 +192,36 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
                     bytes: lm.m.bytes,
                     energy_j: lm.m.energy_j,
                     coverage: lm.coverage.bits(),
+                });
+            }
+            serde_json::to_string_pretty(&EvalResponse {
+                kind: probe.kind().to_string(),
+                results,
+            })?
+        }
+        KernelQueryRequest::EvalCoords {
+            kind,
+            config,
+            query_points,
+        } => {
+            let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+            bridge
+                .enable_jit_profiling()
+                .context("enabling JIT profiling for the fidelity grid build")?;
+            let probe = (lookup(&kind)?.build)(config, &bridge).with_context(|| {
+                format!("building '{kind}' kernel (often a missing profile.db row)")
+            })?;
+
+            let mut results = Vec::with_capacity(query_points.len());
+            for coordinates in &query_points {
+                let metrics = probe.eval_coords(coordinates)?;
+                results.push(PointResult {
+                    input: serde_json::json!(coordinates),
+                    time_ms: metrics.m.time_ms,
+                    flops: metrics.m.flops,
+                    bytes: metrics.m.bytes,
+                    energy_j: metrics.m.energy_j,
+                    coverage: metrics.coverage.bits(),
                 });
             }
             serde_json::to_string_pretty(&EvalResponse {

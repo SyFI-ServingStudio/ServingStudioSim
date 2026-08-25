@@ -215,6 +215,35 @@ pub enum IterArchSel {
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
     },
+    /// DeepSeek-V4-Flash-0731 at vLLM's physical kernel boundaries. EP4 and
+    /// local attention DP4 are checkpoint/deployment invariants.
+    DeepseekV4Vllm {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        #[serde(default)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+    },
+    /// The same physical DeepSeek kernels with each source-level parallel
+    /// region serialized. This is an explicit alignment counterfactual, not a
+    /// hidden runtime knob on the production selector.
+    DeepseekV4VllmSerialStreams {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        #[serde(default)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+    },
     /// The same GLM-5.2 schedule as `glm52_dsa_moe`, expressed in vLLM's kernel
     /// granularity for framework alignment. Same parameters, same topology; the
     /// graphs differ only in how leaves are cut. See
@@ -293,6 +322,8 @@ impl IterArchSel {
             | Self::Qwen3MoeDpAttnEpFfn { model, .. }
             | Self::Qwen3MoeFp8DpAttnEpFfn { model, .. }
             | Self::Qwen3VllmMoeDpAttnEpFfn { model, .. }
+            | Self::DeepseekV4Vllm { model, .. }
+            | Self::DeepseekV4VllmSerialStreams { model, .. }
             | Self::Glm52DsaMoe { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. } => model,
         }

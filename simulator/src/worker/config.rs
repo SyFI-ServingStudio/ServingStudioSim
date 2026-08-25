@@ -4,8 +4,8 @@
 //! Each selector is a serde tagged enum (`#[serde(tag = "type")]`), the symmetric
 //! sibling of the arch selector. `barebone` / `hp_unified` are wired for
 //! `unified`; `pd_prefill` / `pd_decode` are wired for `pd`; the AFD selectors
-//! are wired for `afd`. `chunked_prefill` parses + is advertised, but its
-//! deployment still bails until that lifecycle is implemented.
+//! are wired for `afd`. `chunked_prefill` is the hard-capped whole-iteration
+//! lifecycle used when long prompts must be split across iterations.
 //!
 //! `#[derive(ProviderSchema)]` emits each selector's `SCHEMA` of `(tag, params)`
 //! rows for the launcher; `schema::dump::list_params` aggregates them.

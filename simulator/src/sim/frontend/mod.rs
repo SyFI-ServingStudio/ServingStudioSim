@@ -1061,6 +1061,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trace_timed_capacity_stamps_every_slot_opened_in_one_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_csv(
+            dir.path(),
+            "timed-capped-multiple-slots.csv",
+            "id,input_len,output_len,arrival_time\n\
+             0,8,2,0.0\n\
+             1,8,2,0.0\n\
+             2,8,2,0.0\n\
+             3,8,2,0.0\n",
+        );
+        let mut frontend = TraceFrontend::load(
+            &[path],
+            &InputFileSchema::text_generation_independent(),
+            open_loop(1.0),
+            capped(2),
+            SessionDependency::Independent,
+        )
+        .unwrap();
+
+        assert_eq!(
+            drain_pairs(&mut frontend, 0.0),
+            vec![(RequestId(0), 0.0), (RequestId(1), 0.0)]
+        );
+        assert_eq!(drain_pairs(&mut frontend, 10.0), vec![]);
+
+        frontend.record_completion(RequestId(0), Time::from_ms(20.0));
+        frontend.record_completion(RequestId(1), Time::from_ms(20.0));
+        assert_eq!(
+            drain_pairs(&mut frontend, 20.0),
+            vec![(RequestId(2), 20.0), (RequestId(3), 20.0)]
+        );
+    }
+
     /// A trace that declares sessions but whose rows all opt out is *data* with
     /// no conversations, not a misconfiguration: every row is a head, so
     /// chaining degenerates to open-loop replay exactly.

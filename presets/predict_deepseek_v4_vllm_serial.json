@@ -1,0 +1,12 @@
+{
+  "arch": {
+    "iter": {
+      "type": "deepseek_v4_vllm_serial_streams",
+      "model_config": "model/config/deepseek_v4_flash_0731.json",
+      "fp8": true
+    }
+  },
+  "gpu": "NVIDIA H200",
+  "log_dir": "logs/predict_deepseek_v4_vllm_serial",
+  "cases_file": "predict_deepseek_v4_vllm_cases.json"
+}
