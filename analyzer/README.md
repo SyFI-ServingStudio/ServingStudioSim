@@ -264,6 +264,16 @@ On the reference capture that is 544 MB -> 2.96 MB for
 `alignment_iteration_series.json` and 2.0 MB of index beside a 249 MB seekable
 shard for `alignment_timeline.json`.
 
+Alignment-iteration schema v2 also shards the two run-wide inventories that can
+grow with sequence diversity. `alignment_kernel_inventory.jsonl` retains every
+per-position audit row without putting them in the report, and
+`alignment_sequence_programs.jsonl` retains every folded per-stream program.
+The series carries only sequence identity, occurrences, track summaries, and
+whole-capture cost plus byte ranges into the program shard. The UI therefore
+loads one selected program at a time; it never downloads every rank-local
+multi-stream variant to draw one mapping board. Schema-v1 artifacts remain
+readable through their embedded bare `program` or explicit `tracks` shape.
+
 The alignment-iteration payload and report retain every paired iteration, but
 the Python renderer evenly samples at most 128 per-iteration breakdown PNGs.
 It keeps the overview and other subject-level plots directly under `plots/`,

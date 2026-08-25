@@ -56,9 +56,11 @@ use crate::optimality::{
 };
 use alignment::{
     alignment_artifact_bytes, alignment_descriptor,
-    alignment_detail_index as build_alignment_detail_index, build_alignment_catalog,
+    alignment_detail_index as build_alignment_detail_index,
+    alignment_sequence_index as build_alignment_sequence_index, build_alignment_catalog,
     discover_alignments, operation_split_projection, read_alignment_iteration_detail,
-    reference_lane_projection, AlignmentDetailIndex, DiscoveredAlignment,
+    read_alignment_sequence, reference_lane_projection, AlignmentDetailIndex,
+    AlignmentSequenceIndex, DiscoveredAlignment,
 };
 use artifact::read_json;
 use batch::{read_batch_payload, read_batch_report};
@@ -125,6 +127,7 @@ struct ServiceState {
     operation_indexes: Arc<OperationIndexCache>,
     alignment_discovery: Arc<Mutex<Option<CachedAlignmentDiscovery>>>,
     alignment_detail_indexes: Arc<Mutex<HashMap<(String, String), CachedAlignmentDetailIndex>>>,
+    alignment_sequence_indexes: Arc<Mutex<HashMap<String, CachedAlignmentSequenceIndex>>>,
 }
 
 struct CachedAlignmentDiscovery {
@@ -135,6 +138,11 @@ struct CachedAlignmentDiscovery {
 struct CachedAlignmentDetailIndex {
     loaded_at: Instant,
     index: Arc<AlignmentDetailIndex>,
+}
+
+struct CachedAlignmentSequenceIndex {
+    loaded_at: Instant,
+    index: Arc<AlignmentSequenceIndex>,
 }
 
 #[derive(Clone)]
@@ -233,6 +241,31 @@ impl ServiceState {
         Ok(index)
     }
 
+    fn alignment_sequence_index(
+        &self,
+        alignment_id: &str,
+        alignment: &DiscoveredAlignment,
+    ) -> Result<Arc<AlignmentSequenceIndex>> {
+        let mut cache = self
+            .alignment_sequence_indexes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.get(alignment_id) {
+            if cached.loaded_at.elapsed() < ALIGNMENT_DISCOVERY_CACHE_TTL {
+                return Ok(Arc::clone(&cached.index));
+            }
+        }
+        let index = Arc::new(build_alignment_sequence_index(alignment)?);
+        cache.insert(
+            alignment_id.to_owned(),
+            CachedAlignmentSequenceIndex {
+                loaded_at: Instant::now(),
+                index: Arc::clone(&index),
+            },
+        );
+        Ok(index)
+    }
+
     fn resolve_kernel_profile(
         &self,
         profile_id: &str,
@@ -267,6 +300,7 @@ pub(crate) async fn serve(
         operation_indexes: Arc::new(OperationIndexCache::default()),
         alignment_discovery: Arc::new(Mutex::new(None)),
         alignment_detail_indexes: Arc::new(Mutex::new(HashMap::new())),
+        alignment_sequence_indexes: Arc::new(Mutex::new(HashMap::new())),
     };
     let app = service_router(state);
     let listener = tokio::net::TcpListener::bind(bind)
@@ -303,6 +337,10 @@ fn service_router(state: ServiceState) -> Router {
         .route(
             "/api/v1/alignments/{alignment_id}/subjects/{subject}/iterations/{iteration_id}",
             get(get_alignment_iteration),
+        )
+        .route(
+            "/api/v1/alignments/{alignment_id}/subjects/iteration/sequences/{phase}/{sequence_id}",
+            get(get_alignment_sequence),
         )
         .route("/api/v1/predictions", get(list_predictions))
         .route(
@@ -634,6 +672,24 @@ async fn get_alignment_iteration(
             } else {
                 Ok(bytes)
             }
+        });
+    match detail {
+        Ok(bytes) => alignment_json_bytes_response(bytes, Some(&headers)),
+        Err(error) => alignment_resource_error(error),
+    }
+}
+
+/// One folded multi-stream program selected by the mapping board.
+async fn get_alignment_sequence(
+    RoutePath((alignment_id, phase, sequence_id)): RoutePath<(String, String, String)>,
+    headers: HeaderMap,
+    State(state): State<ServiceState>,
+) -> Response {
+    let detail = state
+        .resolve_alignment(&alignment_id)
+        .and_then(|alignment| {
+            let index = state.alignment_sequence_index(&alignment_id, &alignment)?;
+            read_alignment_sequence(&index, &phase, &sequence_id)
         });
     match detail {
         Ok(bytes) => alignment_json_bytes_response(bytes, Some(&headers)),

@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::alignment_input;
 use crate::cdf::{clean_nonnegative_sorted, percentile_sorted, stats};
-use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
+use crate::io::{read_cost_manifests, resolve_artifact_path};
 use crate::session::{
     col, collect, register_if_exists, require_columns, value_f32_list, value_f64,
 };
@@ -33,6 +33,12 @@ use crate::trace::manifest::{node_time, FlatCostNode, Manifest, ManifestDoc};
 
 /// Sibling of the payload holding one iteration's kernel breakdown per line.
 const BREAKDOWN_DETAIL_FILE: &str = "alignment_iteration_breakdowns.jsonl";
+/// Run-wide per-position rows are audit data, not a page bootstrap resource.
+const KERNEL_INVENTORY_FILE: &str = "alignment_kernel_inventory.jsonl";
+/// Full folded programs are selected one at a time by the mapping board.
+const SEQUENCE_DETAIL_FILE: &str = "alignment_sequence_programs.jsonl";
+/// Version 2 moves both high-cardinality collections out of the report/index.
+const ALIGNMENT_ITERATION_SCHEMA_VERSION: u32 = 2;
 
 const PREDICT_TABLE: &str = "alignment_predict_cost";
 const PREDICT_COLUMNS: &[&str] = &["iter_id", "total_time_ms", "slot_time_ms", "section"];
@@ -865,13 +871,22 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             })
         })
         .collect();
-    let kernel_report: Vec<_> = kernel_inventory
-        .into_iter()
-        .map(|(_, item)| {
-            let device_count = item.device_ids.len().max(1);
-            let replica_calls = item.calls as f64 / device_count as f64;
-            let total_union_ns = interval_union_ns(&item.intervals) as f64;
-            json!({
+    let mut kernel_inventory_bytes = Vec::new();
+    let mut sequence_total_ms: BTreeMap<(String, String), f64> = BTreeMap::new();
+    let kernel_inventory_rows = kernel_inventory.len();
+    for (_, item) in kernel_inventory {
+        let device_count = item.device_ids.len().max(1);
+        let replica_calls = item.calls as f64 / device_count as f64;
+        let total_union_ns = interval_union_ns(&item.intervals) as f64;
+        let total_ms = total_union_ns / 1e6;
+        if let Some((sequence_id, _ordinal)) = item.row_id.rsplit_once(':') {
+            *sequence_total_ms
+                .entry((item.phase.clone(), sequence_id.to_owned()))
+                .or_default() += total_ms;
+        }
+        serde_json::to_writer(
+            &mut kernel_inventory_bytes,
+            &json!({
                 "phase": item.phase,
                 "row_id": item.row_id,
                 "name": item.name,
@@ -884,12 +899,20 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "calls_per_iteration": item.calls as f64 / item.iterations.len().max(1) as f64,
                 "replica_calls_per_iteration": replica_calls
                     / item.iterations.len().max(1) as f64,
-                "total_ms": total_union_ns / 1e6,
+                "total_ms": total_ms,
                 "mean_call_us": total_union_ns / replica_calls.max(1.0) / 1e3,
                 "device_ids": item.device_ids,
-            })
-        })
-        .collect();
+            }),
+        )?;
+        kernel_inventory_bytes.push(b'\n');
+    }
+    let kernel_inventory_path = crate::io::report_path(log_dir, KERNEL_INVENTORY_FILE);
+    if let Some(parent) = kernel_inventory_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&kernel_inventory_path, kernel_inventory_bytes)
+        .with_context(|| format!("write {}", kernel_inventory_path.display()))?;
+    println!("wrote {}", kernel_inventory_path.display());
     let mapping_operations: Vec<_> = inventory
         .operations
         .values()
@@ -905,8 +928,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .collect();
 
     let definitions = definitions();
+    let unmapped_measured_kernel_count = unmapped_measured.len();
     let report = json!({
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": ALIGNMENT_ITERATION_SCHEMA_VERSION,
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
@@ -935,20 +959,19 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "simulated_mapped_ms": simulated_mapped_ms,
                 "simulated_total_leaf_workload_ms": simulated_workload_ms,
             },
-            "unmapped_measured_kernels": unmapped_measured.into_iter().map(|((phase, row_id), (name, calls, intervals, device_ids))| json!({
-                "phase": phase,
-                "row_id": row_id,
-                "name": name,
-                "calls": calls,
-                "total_ms": interval_union_ns(&intervals) as f64 / 1e6,
-                "device_ids": device_ids,
-            })).collect::<Vec<_>>(),
+            "unmapped_measured_kernel_count": unmapped_measured_kernel_count,
+            "unmapped_measured_kernels": [],
             "unmapped_simulated_slots": unmapped_simulated.into_iter().map(|(slot, total_ms)| json!({
                 "slot": slot, "total_ms": total_ms
             })).collect::<Vec<_>>(),
         },
         "operations": operation_report,
-        "kernels": kernel_report,
+        "kernel_detail": {
+            "file": KERNEL_INVENTORY_FILE,
+            "encoding": "one JSON object per line, ordered by phase and row_id",
+            "rows": kernel_inventory_rows,
+        },
+        "kernels": [],
         "iterations": iteration_rows,
         "definitions": definitions,
     });
@@ -962,8 +985,15 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .with_context(|| format!("write {}", breakdown_path.display()))?;
     println!("wrote {}", breakdown_path.display());
 
+    let (sequences, sequence_detail, sequence_detail_bytes) =
+        sequence_catalog(&input.labeled_kernel_sequences, &sequence_total_ms)?;
+    let sequence_detail_path = crate::io::payload_path(log_dir, SEQUENCE_DETAIL_FILE);
+    std::fs::write(&sequence_detail_path, sequence_detail_bytes)
+        .with_context(|| format!("write {}", sequence_detail_path.display()))?;
+    println!("wrote {}", sequence_detail_path.display());
+
     let payload = json!({
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": ALIGNMENT_ITERATION_SCHEMA_VERSION,
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
@@ -972,10 +1002,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "multiplier_excluded_iterations": multiplier_excluded_iterations,
         },
         "iterations": report["iterations"],
-        // The labelled kernel programs, verbatim. Carried here so a client
-        // reads one artifact family instead of also opening the labeler's input
-        // file, which is not a payload and has its own lifecycle.
-        "sequences": sequence_document(&input.labeled_kernel_sequences)?,
+        "sequences": sequences,
+        "sequence_detail": sequence_detail,
         "breakdown_detail": {
             "file": BREAKDOWN_DETAIL_FILE,
             "encoding": "one JSON object per line, in the order of `iterations`",
@@ -986,20 +1014,111 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     Ok((report, payload))
 }
 
-/// The labeled sequence inventory as written, minus its provenance envelope.
-///
-/// Read again rather than reconstructed from [`CompiledInventory`]: that struct
-/// expands the folded program, and the folding is exactly what a reader wants to
-/// draw — one `repeat{32}` band, not 32 identical rows.
-fn sequence_document(path: &Path) -> Result<Value> {
-    let document: Value = read_json(path)?;
-    Ok(json!({
-        "encoding": document.get("encoding"),
-        "folding_policy": document.get("folding_policy"),
-        "device_ids": document.get("device_ids"),
-        "representative_device_id": document.get("representative_device_id"),
-        "phases": document.get("phases"),
-    }))
+/// Split the labeler's folded inventory into a small browse catalog and a
+/// seekable program shard. The mapping board ranks every sequence from the
+/// catalog, but only needs the selected sequence's kernels.
+fn sequence_catalog(
+    path: &Path,
+    sequence_total_ms: &BTreeMap<(String, String), f64>,
+) -> Result<(Value, Value, Vec<u8>)> {
+    let mut document: Value = read_json(path)?;
+    let document_object = document
+        .as_object_mut()
+        .context("labeled sequence document must be an object")?;
+    let phases = document_object
+        .remove("phases")
+        .and_then(|value| value.as_object().cloned())
+        .context("labeled sequence document phases must be an object")?;
+    let mut catalog_phases = serde_json::Map::new();
+    let mut byte_ranges = serde_json::Map::new();
+    let mut detail_bytes = Vec::new();
+
+    for (phase, phase_value) in phases {
+        let mut phase_object = phase_value
+            .as_object()
+            .cloned()
+            .with_context(|| format!("sequence phase {phase:?} must be an object"))?;
+        let sequences = phase_object
+            .remove("unique_sequences")
+            .and_then(|value| value.as_array().cloned())
+            .with_context(|| format!("sequence phase {phase:?} must carry unique_sequences"))?;
+        let mut summaries = Vec::with_capacity(sequences.len());
+        let mut phase_ranges = serde_json::Map::new();
+        for mut sequence in sequences {
+            let sequence_object = sequence
+                .as_object_mut()
+                .with_context(|| format!("sequence in phase {phase:?} must be an object"))?;
+            let sequence_id = sequence_object
+                .get("sequence_id")
+                .and_then(Value::as_str)
+                .context("sequence_id must be a string")?
+                .to_owned();
+            let expanded_kernel_count = sequence_object
+                .get("expanded_kernel_count")
+                .and_then(Value::as_u64)
+                .context("expanded_kernel_count must be an integer")?;
+            let tracks = sequence_object.get("tracks").and_then(Value::as_array);
+            let track_summaries = match tracks {
+                Some(tracks) => tracks
+                    .iter()
+                    .map(|track| {
+                        json!({
+                            "track_index": track.get("track_index"),
+                            "stream_role": track.get("stream_role"),
+                            "kernel_count": track.get("kernel_count"),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                None => vec![json!({
+                    "track_index": 0,
+                    "stream_role": "primary",
+                    "kernel_count": expanded_kernel_count,
+                })],
+            };
+            let mut summary = json!({
+                "sequence_id": sequence_id,
+                "expanded_kernel_count": expanded_kernel_count,
+                "total_ms": sequence_total_ms
+                    .get(&(phase.clone(), sequence_id.clone()))
+                    .copied()
+                    .unwrap_or(0.0),
+                "tracks": track_summaries,
+            });
+            let summary_object = summary
+                .as_object_mut()
+                .expect("sequence summary is an object");
+            for assignment in ["iterations", "occurrences"] {
+                if let Some(value) = sequence_object.get(assignment) {
+                    summary_object.insert(assignment.to_owned(), value.clone());
+                }
+            }
+            summaries.push(summary);
+
+            sequence_object.insert("phase".into(), Value::String(phase.clone()));
+            let offset = detail_bytes.len() as u64;
+            serde_json::to_writer(&mut detail_bytes, &sequence)?;
+            let length = detail_bytes.len() as u64 - offset;
+            detail_bytes.push(b'\n');
+            phase_ranges.insert(sequence_id, json!([offset, length]));
+        }
+        phase_object.insert("unique_sequences".into(), Value::Array(summaries));
+        catalog_phases.insert(phase.clone(), Value::Object(phase_object));
+        byte_ranges.insert(phase, Value::Object(phase_ranges));
+    }
+
+    let catalog = json!({
+        "encoding": document_object.get("encoding"),
+        "folding_policy": document_object.get("folding_policy"),
+        "device_ids": document_object.get("device_ids"),
+        "representative_device_id": document_object.get("representative_device_id"),
+        "phases": catalog_phases,
+    });
+    let detail = json!({
+        "file": SEQUENCE_DETAIL_FILE,
+        "encoding": "one JSON object per line, addressed by phase and sequence_id",
+        "byte_ranges": byte_ranges,
+    });
+    Ok((catalog, detail, detail_bytes))
 }
 
 /// The one predict worker whose `iter` cost tree the alignment compares against.
@@ -2905,6 +3024,55 @@ mod tests {
             object.insert(key.clone(), value.clone());
         }
         serde_json::from_value(doc).unwrap()
+    }
+
+    #[test]
+    fn sequence_catalog_keeps_programs_only_in_the_seekable_shard() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sequences.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schema_version": 5,
+                "encoding": "folded-v2",
+                "folding_policy": {"kind": "exact_contiguous_repeat"},
+                "device_ids": [0],
+                "representative_device_id": 0,
+                "phases": {"forward": {"unique_sequences": [{
+                    "sequence_id": "sequence_a",
+                    "expanded_kernel_count": 2,
+                    "occurrences": [{"device_id": 0, "iterations": [7]}],
+                    "tracks": [
+                        {"track_index": 0, "stream_role": "primary", "kernel_count": 1,
+                         "program": [{"kernels": [{"name": "main"}]}]},
+                        {"track_index": 1, "stream_role": "concurrent", "kernel_count": 1,
+                         "program": [{"kernels": [{"name": "side"}]}]},
+                    ],
+                }]}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let totals = BTreeMap::from([(("forward".into(), "sequence_a".into()), 12.5)]);
+
+        let (catalog, detail, shard) = sequence_catalog(&path, &totals).unwrap();
+
+        let summary = &catalog["phases"]["forward"]["unique_sequences"][0];
+        assert_eq!(summary["total_ms"], 12.5);
+        assert_eq!(summary["tracks"].as_array().unwrap().len(), 2);
+        assert!(summary.get("program").is_none());
+        assert!(summary["tracks"][0].get("program").is_none());
+        let range = detail["byte_ranges"]["forward"]["sequence_a"]
+            .as_array()
+            .unwrap();
+        let offset = range[0].as_u64().unwrap() as usize;
+        let length = range[1].as_u64().unwrap() as usize;
+        let selected: Value = serde_json::from_slice(&shard[offset..offset + length]).unwrap();
+        assert_eq!(selected["phase"], "forward");
+        assert_eq!(
+            selected["tracks"][1]["program"][0]["kernels"][0]["name"],
+            "side"
+        );
     }
 
     #[test]
