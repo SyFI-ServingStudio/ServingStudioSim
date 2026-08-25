@@ -27,9 +27,9 @@ pub trait Probe {
 }
 
 /// Object-safe sibling of [`Probe`] for cost-model *introspection* (the
-/// `kernel-query` subcommand): query a built kernel's cache by a **physical /
-/// natural** shape and read back the interpolated metrics per backend, plus the
-/// grid the cache was fitted on.
+/// `kernel-query` subcommand): query a built kernel's cache by either a
+/// **physical / natural** shape or its cache coordinates, and read back the
+/// interpolated metrics per backend plus the fitted grid.
 ///
 /// Unlike `Probe` (whose `eval` takes the typed `Self::Input`), this is `dyn`-able
 /// — `eval_json` takes the kernel's Input as JSON, **deserializes it straight into
@@ -54,6 +54,12 @@ pub trait CacheProbe {
     /// own fields, e.g. `{"prefix_len":0,"append_len":192}`). Errors if the JSON
     /// doesn't match the kernel's Input schema.
     fn eval_json(&self, input: &serde_json::Value) -> anyhow::Result<LeafMetrics>;
+
+    /// Best-of-N interpolated metrics at an explicit point in cache-coordinate
+    /// space. This is the authoritative path for inspecting a declared grid:
+    /// cache axes need not be physical scalar Input fields (ragged and re-axis
+    /// kernels are the common counterexamples).
+    fn eval_coords(&self, coords: &[f64]) -> anyhow::Result<LeafMetrics>;
 
     /// Peak achieved compute / BW rates over the kernel's fitted grid — the
     /// per-config "best batching" ceiling. Reads the built cache cells directly

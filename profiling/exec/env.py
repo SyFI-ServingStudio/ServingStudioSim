@@ -72,8 +72,10 @@ _PROFILE_ENVS_ROOT = Path.home() / "profile_envs"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROJECT_UV_PYTHON = _PROJECT_ROOT / ".venv" / "bin" / "python"
 _VLLM_ROOT = _PROJECT_ROOT / "alignment" / "profiler" / "vllm"
+_VLLM_PYTHON = _VLLM_ROOT / ".venv" / "bin" / "python"
 _WORKER_PYTHON_DIR = f"python{sys.version_info.major}.{sys.version_info.minor}"
 _VLLM_SITE_PACKAGES = _VLLM_ROOT / ".venv" / "lib" / _WORKER_PYTHON_DIR / "site-packages"
+_VLLM_CUDA_COMPAT_LIB = _VLLM_ROOT / ".venv" / "lib" / "cuda-compat"
 _VLLM_TORCH_LIB = _VLLM_SITE_PACKAGES / "torch" / "lib"
 
 
@@ -104,15 +106,18 @@ ENV_REGISTRY: dict[str, ProfileEnv] = {
         "flashinfer_local",
         _profile_env_python("flashinfer_local"),
     ),
-    # The exact vLLM CUDA runners must use the same instrumented fork and wheel
-    # stack as alignment profiling. The checkout is intentionally read-only and
-    # its venv interpreter symlink is not portable, so use the working project
-    # interpreter while importing the intact vLLM environment explicitly.
+    # Run the vLLM interpreter itself: its site initialization executes the
+    # editable wheel's extension finder. Merely adding site-packages to
+    # PYTHONPATH does not execute .pth files and leaves vllm._C unresolved.
+    # `_VLLM_ROOT` remains ahead of the installed package so Python source comes
+    # from this pinned checkout while native extensions come from its wheel.
+    # The environment-owned cuda-compat link is the same forward-compatible
+    # driver boundary used by alignment; it must precede Torch's CUDA libraries.
     "vllm_env": ProfileEnv(
         "vllm_env",
-        _default_python(),
-        (_VLLM_SITE_PACKAGES, _VLLM_ROOT),
-        (_VLLM_TORCH_LIB,),
+        _VLLM_PYTHON,
+        (_VLLM_ROOT,),
+        (_VLLM_CUDA_COMPAT_LIB, _VLLM_TORCH_LIB),
     ),
 }
 

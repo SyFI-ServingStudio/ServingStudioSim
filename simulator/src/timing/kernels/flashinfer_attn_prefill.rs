@@ -67,10 +67,7 @@ impl SweepCoords for FlashinferAttnPrefillKernelInput {
         Coords::new([a, self.append_len as f64])
     }
     fn coord_field_names() -> &'static [&'static str] {
-        // The *query-point* keys (physical, history-append) — what a caller sends.
-        // NOTE: these are NOT the cache's (A,B) axis labels; the grid's
-        // `grid_axes` are in (A,B) space, not (prefix,append).
-        &["prefix_len", "append_len"]
+        &["effective_kv_tokens", "append_len"]
     }
 }
 
@@ -208,12 +205,10 @@ mod tests {
     }
 
     #[test]
-    fn coord_field_names_are_the_physical_query_keys() {
-        // The `grid` op pairs `grid_axes` (A,B) with these query-point keys; the
-        // keys stay physical (history-append) even though the axes are (A,B).
+    fn coord_field_names_label_the_cache_axes() {
         assert_eq!(
             FlashinferAttnPrefillKernelInput::coord_field_names(),
-            ["prefix_len", "append_len"]
+            ["effective_kv_tokens", "append_len"]
         );
     }
 

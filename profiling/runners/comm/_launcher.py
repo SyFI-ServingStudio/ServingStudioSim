@@ -134,11 +134,57 @@ class NvshmemLauncher(MultiGpuLauncher):
 
 
 class VllmLauncher(MultiGpuLauncher):
-    """Placeholder boundary for vLLM-specific multi-GPU runner setup."""
+    """Gloo-control launcher for vLLM's direct PyNCCL communicator."""
+
+    def __init__(
+        self,
+        num_gpus: int,
+        *,
+        required_gpu_name: str,
+        master_addr: str = "127.0.0.1",
+        master_port: int | None = None,
+    ):
+        super().__init__(num_gpus)
+        self.required_gpu_name = required_gpu_name
+        self.master_addr = master_addr
+        self.master_port = master_port or _find_free_port()
 
     def run(self, per_rank_fn: Callable[..., Any], **kwargs) -> Any:
-        del per_rank_fn, kwargs
-        raise ProfilerNotImplemented("VllmLauncher bootstrap is not implemented yet")
+        try:
+            import torch.multiprocessing as mp
+        except ImportError as exc:
+            raise ProfilerNotImplemented("torch.multiprocessing is unavailable") from exc
+
+        context = mp.get_context("spawn")
+        result_queue = context.SimpleQueue()
+        try:
+            mp.spawn(
+                _vllm_mp_entry,
+                args=(
+                    self.num_gpus,
+                    self.required_gpu_name,
+                    self.master_addr,
+                    self.master_port,
+                    per_rank_fn,
+                    kwargs,
+                    result_queue,
+                ),
+                nprocs=self.num_gpus,
+                join=True,
+            )
+        except Exception as exc:
+            if not result_queue.empty():
+                ok, error_kind, payload = result_queue.get()
+                if not ok:
+                    _raise_remote_error(error_kind, payload)
+            raise KernelLaunchFailed(str(exc)) from exc
+
+        if result_queue.empty():
+            raise KernelLaunchFailed("vLLM rank group returned no result")
+        ok, error_kind, payload = result_queue.get()
+        if not ok:
+            _raise_remote_error(error_kind, payload)
+        return payload
 
 
 def _torch_mp_entry(
@@ -231,6 +277,81 @@ def _nvshmem_mp_entry(
         raise
     if rank == 0:
         result_queue.put((True, result))
+
+
+def _vllm_mp_entry(
+    rank: int,
+    world_size: int,
+    required_gpu_name: str,
+    master_addr: str,
+    master_port: int,
+    per_rank_fn: Callable[..., Any],
+    fn_kwargs: dict[str, Any],
+    result_queue,
+) -> None:
+    os.environ.update(
+        {
+            "MASTER_ADDR": master_addr,
+            "MASTER_PORT": str(master_port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_RANK": str(rank),
+        }
+    )
+    communicator = None
+    try:
+        import torch
+        import torch.distributed as dist
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+        if not torch.cuda.is_available():
+            raise ProfilerNotImplemented("CUDA is required for vLLM PyNCCL")
+        torch.cuda.set_device(rank)
+        gpu_name = str(torch.cuda.get_device_name(rank))
+        if gpu_name != required_gpu_name:
+            raise ProfilerNotImplemented(
+                f"vLLM PyNCCL is verified only on {required_gpu_name}, got {gpu_name}"
+            )
+
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        communicator = PyNcclCommunicator(dist.group.WORLD, torch.device(f"cuda:{rank}"))
+        if not communicator.available or communicator.disabled:
+            raise ProfilerNotImplemented("vLLM PyNcclCommunicator is unavailable")
+        result = per_rank_fn(
+            rank=rank,
+            world_size=world_size,
+            communicator=communicator,
+            **fn_kwargs,
+        )
+        dist.barrier()
+    except Exception as exc:
+        error_kind = "OOMError" if type(exc).__name__ == "OutOfMemoryError" else type(exc).__name__
+        result_queue.put((False, error_kind, str(exc)))
+        raise
+    finally:
+        if communicator is not None:
+            communicator.destroy()
+        try:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
+    if rank == 0:
+        result_queue.put((True, "", result))
+
+
+def _raise_remote_error(error_kind: str, message: str) -> None:
+    from profiling.runners.exceptions import OOMError
+
+    if error_kind == "ProfilerNotImplemented":
+        raise ProfilerNotImplemented(message)
+    if error_kind == "OOMError":
+        raise OOMError(message)
+    if error_kind == "ValueError":
+        raise ValueError(message)
+    raise KernelLaunchFailed(message)
 
 
 def _find_free_port() -> int:
