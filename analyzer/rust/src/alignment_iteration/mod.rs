@@ -340,6 +340,16 @@ struct KernelLaunch {
     track_index: usize,
 }
 
+/// One physical inventory row represented by a semantic occurrence.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PhysicalKernelIdentity {
+    sequence_id: String,
+    row_id: String,
+    name: String,
+    name_id: u64,
+    category: String,
+}
+
 #[derive(Clone, Default)]
 struct IterationKernelAggregate {
     phase: String,
@@ -357,10 +367,28 @@ struct IterationKernelAggregate {
     source_row_ids: BTreeSet<String>,
     category: String,
     operation: Option<String>,
+    operation_ordinal: Option<usize>,
     synchronizing: bool,
     launches: Vec<KernelLaunch>,
     first_start_ns: Option<u64>,
     device_ids: BTreeSet<i64>,
+    physical_kernels: BTreeMap<PhysicalKernelIdentity, BTreeSet<i64>>,
+}
+
+fn physical_kernel_rows(item: &IterationKernelAggregate) -> Vec<Value> {
+    item.physical_kernels
+        .iter()
+        .map(|(identity, device_ids)| {
+            json!({
+                "sequence_id": identity.sequence_id,
+                "row_id": identity.row_id,
+                "name": identity.name,
+                "name_id": identity.name_id,
+                "category": identity.category,
+                "device_ids": device_ids,
+            })
+        })
+        .collect()
 }
 
 /// One `(device, phase)` group's GPU occupancy, per measured iteration.
@@ -601,6 +629,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "source_row_ids": item.source_row_ids,
                 "category": item.category,
                 "operation": item.operation,
+                "operation_ordinal": item.operation_ordinal,
+                "physical_kernels": physical_kernel_rows(item),
                 "synchronizing": item.synchronizing,
                 "calls": item.launches.len(),
                 "rank_launches": item.launches.len(),
@@ -1396,6 +1426,7 @@ fn measure_iteration(
                 .entry(format!("{phase}/{}", sequence_row.row_id))
                 .or_default();
             item.phase = phase.to_string();
+            item.sequence_id = sequence.sequence_id.clone();
             item.row_id = sequence_row.row_id.clone();
             item.name = sequence_row.name.clone();
             item.name_id = kernel.name_id;
@@ -1411,6 +1442,16 @@ fn measure_iteration(
                 track_index: kernel.track_index,
             });
             item.device_ids.insert(device_id);
+            item.physical_kernels
+                .entry(PhysicalKernelIdentity {
+                    sequence_id: sequence.sequence_id.clone(),
+                    row_id: sequence_row.row_id.clone(),
+                    name: sequence_row.name.clone(),
+                    name_id: kernel.name_id,
+                    category: kernel.category.clone(),
+                })
+                .or_default()
+                .insert(device_id);
             item.first_start_ns = Some(
                 item.first_start_ns
                     .map_or(kernel.start_ns, |old| old.min(kernel.start_ns)),
@@ -1507,6 +1548,13 @@ fn join_mapped_occurrences(
             existing
                 .source_row_ids
                 .extend(item.source_row_ids.iter().cloned());
+            for (identity, device_ids) in &item.physical_kernels {
+                existing
+                    .physical_kernels
+                    .entry(identity.clone())
+                    .or_default()
+                    .extend(device_ids.iter().copied());
+            }
             existing.sequence_id = "joined-rank-sequences".into();
             existing.row_id = format!(
                 "logical/{}/{operation}/{}/{occurrence_ordinal}",
@@ -1522,7 +1570,12 @@ fn join_mapped_occurrences(
             };
         } else {
             joined_index.insert(occurrence_key, joined.len());
-            joined.push((aggregate_key.clone(), item.clone()));
+            let mut joined_item = item.clone();
+            joined_item.operation_ordinal = Some(occurrence_ordinal);
+            joined.push((
+                format!("{}/{operation}:{occurrence_ordinal}", item.phase),
+                joined_item,
+            ));
         }
     }
 
@@ -2693,6 +2746,8 @@ fn definitions() -> Value {
         "operation_simulated_ms": "mapped sim leaf contribution after exact CostTree Sum/Scale/Max/overlap attribution; operation contributions plus unmapped critical-path leaves add to total_simulated_ms",
         "measured_kernel_duration_ms": "one occurrence's cross-rank critical-path contribution per the cross_rank class: independent = max over ranks of (end-start); synchronizing collective = max(end) - max(start). rank_launches counts raw launches; replica_calls divides symmetric launches by captured device count",
         "cross_rank": "the mapping table's per-kernel reduction class: synchronizing (a collective barrier) or independent; the analyzer applies min/max from this, never from a category or name",
+        "operation_ordinal": "zero-based occurrence of one semantic operation within a phase and device timeline. Rank-specific folded sequences join only when phase, operation, physical category, and this ordinal agree",
+        "physical_kernels": "all physical inventory rows represented by one semantic occurrence, including each row's identity and the devices that launched it. Singular row and name fields remain for backward compatibility",
         "simulated_kernel_folded_ms": "one L1 leaf slot time multiplied by its exact CostTree Scale multiplicity",
         "simulated_kernel_context": "present only when a slot name is not unique, and then it is the shallowest CostTree label that separates this occurrence from its namesakes (for Qwen3.6, `GDN layer` vs `gated-GQA layer`). One worklet built once and compiled into several tree positions gives its slots identical names by design -- ownership resolves by name, so both nodes get the same operation -- and this is what a reader needs to tell two identical rows apart. It is display context, never a join key",
         "simulated_kernel_critical_path_ms": "the leaf's contribution to timing-predict total_time_ms after exact CostTree Sum/Scale/Max/overlap attribution; an exact Max tie selects the first child",
@@ -2957,26 +3012,45 @@ mod tests {
         kernel_launches: &[(i64, u64, u64)],
         synchronizing: bool,
     ) -> (String, IterationKernelAggregate) {
+        mapped_named_row(row_id, "mapped_kernel", 7, kernel_launches, synchronizing)
+    }
+
+    fn mapped_named_row(
+        row_id: &str,
+        name: &str,
+        name_id: u64,
+        kernel_launches: &[(i64, u64, u64)],
+        synchronizing: bool,
+    ) -> (String, IterationKernelAggregate) {
         let kernel_launches = launches(kernel_launches);
         let device_ids = kernel_launches
             .iter()
             .map(|launch| launch.device_id)
-            .collect();
+            .collect::<BTreeSet<_>>();
+        let physical_identity = PhysicalKernelIdentity {
+            sequence_id: row_id.split('/').next().unwrap_or(row_id).into(),
+            row_id: row_id.into(),
+            name: name.into(),
+            name_id,
+            category: "test".into(),
+        };
         (
             format!("forward/{row_id}"),
             IterationKernelAggregate {
                 phase: "forward".into(),
+                sequence_id: physical_identity.sequence_id.clone(),
                 row_id: row_id.into(),
-                name: "mapped_kernel".into(),
-                name_id: 7,
-                physical_kernel_names: BTreeSet::from(["mapped_kernel".into()]),
+                name: name.into(),
+                name_id,
+                physical_kernel_names: BTreeSet::from([name.into()]),
                 source_row_ids: BTreeSet::from([row_id.into()]),
                 category: "test".into(),
                 operation: Some("moe.combine".into()),
                 synchronizing,
                 first_start_ns: kernel_launches.iter().map(|launch| launch.start_ns).min(),
                 launches: kernel_launches,
-                device_ids,
+                device_ids: device_ids.clone(),
+                physical_kernels: BTreeMap::from([(physical_identity, device_ids)]),
                 ..Default::default()
             },
         )
@@ -3050,23 +3124,45 @@ mod tests {
     }
 
     #[test]
-    fn occurrence_joins_rank_specific_physical_kernel_specializations() {
-        let mut rank_13 = mapped_row("sequence-a/0", &[(1, 0, 10), (3, 0, 12)], false);
-        rank_13.1.name = "tuned_kernel_for_large_rank_shape".into();
-        rank_13.1.name_id = 11;
-        rank_13.1.physical_kernel_names =
-            BTreeSet::from(["tuned_kernel_for_large_rank_shape".into()]);
-        let mut rank_02 = mapped_row("sequence-b/0", &[(0, 0, 9), (2, 0, 11)], false);
-        rank_02.1.name = "tuned_kernel_for_small_rank_shape".into();
-        rank_02.1.name_id = 12;
-        rank_02.1.physical_kernel_names =
-            BTreeSet::from(["tuned_kernel_for_small_rank_shape".into()]);
+    fn occurrence_keeps_source_identity_and_adds_semantic_ordinal() {
+        let joined = join_mapped_occurrences(&[mapped_row(
+            "sequence-a/0",
+            &[(0, 0, 10), (1, 0, 12)],
+            false,
+        )])
+        .unwrap();
 
-        let joined = join_mapped_occurrences(&[rank_13, rank_02]).unwrap();
+        assert_eq!(joined[0].0, "forward/moe.combine:0");
+        assert_eq!(joined[0].1.sequence_id, "sequence-a");
+        assert_eq!(joined[0].1.row_id, "sequence-a/0");
+        assert_eq!(joined[0].1.operation_ordinal, Some(0));
+    }
+
+    #[test]
+    fn occurrence_preserves_rank_specialized_physical_kernels() {
+        let rows = vec![
+            mapped_named_row(
+                "sequence-a/0",
+                "tuned_kernel_for_large_rank_shape",
+                11,
+                &[(1, 0, 10), (3, 0, 12)],
+                false,
+            ),
+            mapped_named_row(
+                "sequence-b/0",
+                "tuned_kernel_for_small_rank_shape",
+                12,
+                &[(0, 0, 9), (2, 0, 11)],
+                false,
+            ),
+        ];
+
+        let joined = join_mapped_occurrences(&rows).unwrap();
 
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].1.row_id, "logical/forward/moe.combine/test/0");
         assert_eq!(joined[0].1.sequence_id, "joined-rank-sequences");
+        assert_eq!(joined[0].1.operation_ordinal, Some(0));
         assert_eq!(
             joined[0].1.physical_kernel_names,
             BTreeSet::from([
@@ -3077,6 +3173,27 @@ mod tests {
         assert_eq!(
             joined[0].1.source_row_ids,
             BTreeSet::from(["sequence-a/0".into(), "sequence-b/0".into()])
+        );
+        assert_eq!(
+            physical_kernel_rows(&joined[0].1),
+            vec![
+                json!({
+                    "sequence_id": "sequence-a",
+                    "row_id": "sequence-a/0",
+                    "name": "tuned_kernel_for_large_rank_shape",
+                    "name_id": 11,
+                    "category": "test",
+                    "device_ids": [1, 3],
+                }),
+                json!({
+                    "sequence_id": "sequence-b",
+                    "row_id": "sequence-b/0",
+                    "name": "tuned_kernel_for_small_rank_shape",
+                    "name_id": 12,
+                    "category": "test",
+                    "device_ids": [0, 2],
+                }),
+            ]
         );
         assert_eq!(occurrence_ns(&joined[0].1.launches, false), 12);
     }

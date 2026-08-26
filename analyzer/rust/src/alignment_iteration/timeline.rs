@@ -45,9 +45,9 @@ use std::path::Path;
 use super::host::{self, HostWindow};
 use super::{
     interval_union_ns, kernel_name_index, leaf_scales, load_inventory, load_sim_cases,
-    measure_iteration, measured_critical_path, measured_gpu_cycles_ms, occurrence_ns, read_json,
-    single_iter_manifest, CaseMapDoc, CompiledInventory, IterationMeasurement, MeasuredIteration,
-    ParsedTrace, SimCase,
+    measure_iteration, measured_critical_path, measured_gpu_cycles_ms, occurrence_ns,
+    physical_kernel_rows, read_json, single_iter_manifest, CaseMapDoc, CompiledInventory,
+    IterationMeasurement, MeasuredIteration, ParsedTrace, SimCase,
 };
 use crate::alignment_input;
 use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
@@ -656,7 +656,11 @@ fn build_iteration(
                 .entry(operation.as_str())
                 .or_default() += 1;
         }
-        used_name_ids.insert(item.name_id);
+        used_name_ids.extend(
+            item.physical_kernels
+                .keys()
+                .map(|identity| identity.name_id),
+        );
         let mut launches: Vec<_> = item.launches.clone();
         launches.sort_by_key(|launch| (launch.device_id, launch.start_ns));
         kernel_rows.push(json!({
@@ -665,6 +669,8 @@ fn build_iteration(
             "name_id": item.name_id,
             "cat": item.category,
             "op": item.operation,
+            "operation_ordinal": item.operation_ordinal,
+            "physical_kernels": physical_kernel_rows(item),
             "sync": item.synchronizing,
             "occ_ns": occurrence,
             "iv": launches
