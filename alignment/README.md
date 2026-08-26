@@ -383,6 +383,40 @@ uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml \
 uv run python -m launcher alignment analyze logs/<experiment>/analyze_e2e.yaml
 ```
 
+Kernel-align writes two complementary comparison views. The existing
+`total_iteration` distributions retain the unweighted mean and percentiles of
+per-iteration relative error. The `comparison` object adds duration-weighted
+totals for `all` and each observed stage:
+
+- signed error: `Σ(simulated_ms - measured_ms) / Σmeasured_ms`;
+- absolute error: `Σ|simulated_ms - measured_ms| / Σmeasured_ms`.
+
+`operations` uses the same totals and is ordered by descending absolute-error
+milliseconds. These rows join by semantic operation because measured CUDA
+kernels and simulated L1 slots are not generally one-to-one. The detailed
+physical rows remain in `payloads/alignment_iteration_breakdowns.jsonl`.
+
+Compare two completed kernel-align results without reopening either capture:
+
+```bash
+uv run python -m launcher alignment compare \
+  logs/<baseline>/analysis_kernel logs/<candidate>/analysis_kernel
+```
+
+Add `--json` for the complete machine-readable comparison or `--limit N` to
+control the displayed operation rows. The command subtracts the aggregates
+already emitted by Analyzer; it does not maintain a second metric formula.
+
+Analyzer also serves one iteration directly, using the payload's byte-range
+index rather than scanning the detail shard:
+
+```text
+/api/v1/alignments/{alignment_id}/subjects/iteration/iterations/{iteration_id}
+```
+
+That resource contains the iteration total, measured kernels, simulated slots,
+and semantic-operation summary.
+
 `--gpu-time-multiplier-from <kernel-align-dir>` makes the simulation read that
 pass's `recommended_gpu_time_multiplier` and inject it as
 `--override pools.main.groups.0.worker.gpu_time_multiplier=<v>` — no manual copy.

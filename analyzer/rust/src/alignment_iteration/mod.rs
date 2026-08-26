@@ -452,6 +452,42 @@ struct OperationAggregate {
     abs_relative_pct: Vec<f64>,
     missing_measured: usize,
     missing_simulated: usize,
+    comparison: ComparisonAggregate,
+    comparison_by_stage: BTreeMap<String, ComparisonAggregate>,
+}
+
+/// Additive error totals. Unlike a mean of per-iteration percentages, these
+/// preserve the amount of time each iteration or operation contributes.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ComparisonAggregate {
+    n: usize,
+    measured_ms: f64,
+    simulated_ms: f64,
+    signed_error_ms: f64,
+    absolute_error_ms: f64,
+}
+
+impl ComparisonAggregate {
+    fn record(&mut self, measured_ms: f64, simulated_ms: f64) {
+        let delta_ms = simulated_ms - measured_ms;
+        self.n += 1;
+        self.measured_ms += measured_ms;
+        self.simulated_ms += simulated_ms;
+        self.signed_error_ms += delta_ms;
+        self.absolute_error_ms += delta_ms.abs();
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "n": self.n,
+            "measured_ms": self.measured_ms,
+            "simulated_ms": self.simulated_ms,
+            "signed_error_ms": self.signed_error_ms,
+            "signed_error_pct": ratio_pct(self.signed_error_ms, self.measured_ms),
+            "absolute_error_ms": self.absolute_error_ms,
+            "absolute_error_pct": ratio_pct(self.absolute_error_ms, self.measured_ms),
+        })
+    }
 }
 
 struct SimCase {
@@ -495,6 +531,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let mut total_delta = Vec::new();
     let mut total_relative = Vec::new();
     let mut total_abs_relative = Vec::new();
+    let mut comparison = ComparisonAggregate::default();
+    let mut comparison_by_stage: BTreeMap<String, ComparisonAggregate> = BTreeMap::new();
     let mut cumulative_measured = 0.0;
     let mut cumulative_simulated = 0.0;
     // The GPU-cycle columns depend on the pooled duty-cycle multiplier
@@ -735,6 +773,12 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                     aggregate.measured_ms.push(m);
                     aggregate.simulated_ms.push(s);
                     aggregate.delta_ms.push(s - m);
+                    aggregate.comparison.record(m, s);
+                    aggregate
+                        .comparison_by_stage
+                        .entry(joined.stage.clone())
+                        .or_default()
+                        .record(m, s);
                     if let Some(rel) = ratio_pct(s - m, m) {
                         aggregate.relative_pct.push(rel);
                         aggregate.abs_relative_pct.push(rel.abs());
@@ -779,6 +823,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         let cumulative_delta_ms = cumulative_simulated - cumulative_measured;
         let cumulative_relative_pct = ratio_pct(cumulative_delta_ms, cumulative_measured);
         total_delta.push(delta_ms);
+        comparison.record(measured_critical_path_ms, sim.total_ms);
+        comparison_by_stage
+            .entry(joined.stage.clone())
+            .or_default()
+            .record(measured_critical_path_ms, sim.total_ms);
         if let Some(value) = relative_pct {
             total_relative.push(value);
             total_abs_relative.push(value.abs());
@@ -895,14 +944,31 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         }
     }
 
+    let mut operation_stats: Vec<_> = operation_stats.into_iter().collect();
+    operation_stats.sort_by(|(left_name, left), (right_name, right)| {
+        right
+            .comparison
+            .absolute_error_ms
+            .total_cmp(&left.comparison.absolute_error_ms)
+            .then_with(|| left_name.cmp(right_name))
+    });
     let operation_report: Vec<_> = operation_stats
         .into_iter()
-        .map(|(operation, samples)| {
+        .enumerate()
+        .map(|(index, (operation, samples))| {
+            let comparison_by_stage: BTreeMap<_, _> = samples
+                .comparison_by_stage
+                .iter()
+                .map(|(stage, aggregate)| (stage, aggregate.to_json()))
+                .collect();
             json!({
                 "operation": operation,
+                "impact_rank": index + 1,
                 "n_paired": samples.delta_ms.len(),
                 "missing_measured": samples.missing_measured,
                 "missing_simulated": samples.missing_simulated,
+                "comparison": samples.comparison.to_json(),
+                "comparison_by_stage": comparison_by_stage,
                 "measured_ms": signed_stats(&samples.measured_ms),
                 "simulated_ms": signed_stats(&samples.simulated_ms),
                 "delta_ms": signed_stats(&samples.delta_ms),
@@ -910,6 +976,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "abs_relative_error_pct": stats(&clean_nonnegative_sorted(&samples.abs_relative_pct)),
             })
         })
+        .collect();
+    let comparison_by_stage: BTreeMap<_, _> = comparison_by_stage
+        .iter()
+        .map(|(stage, aggregate)| (stage, aggregate.to_json()))
         .collect();
     let mut kernel_inventory_bytes = Vec::new();
     let mut sequence_total_ms: BTreeMap<(String, String), f64> = BTreeMap::new();
@@ -990,6 +1060,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "delta_ms": signed_stats(&total_delta),
             "relative_diff_pct": signed_stats(&total_relative),
             "abs_relative_error_pct": stats(&clean_nonnegative_sorted(&total_abs_relative)),
+        },
+        "comparison": {
+            "all": comparison.to_json(),
+            "by_stage": comparison_by_stage,
         },
         "mapping": {
             "configured": true,
@@ -2800,6 +2874,9 @@ fn definitions() -> Value {
         "measured_busy_union_ms": "physical union of CUDA kernel intervals across every NSYS phase and rank. This is the duty-cycle denominator; it is independent of the selected-device measured_ms path",
         "total_simulated_ms": "timing-predict cost-tree total_time_ms (Sum/Max/Scale semantics preserved)",
         "relative_diff_pct": "(simulated - measured) / measured * 100; positive means overprediction",
+        "comparison.signed_error_pct": "aggregate signed error = sum(simulated_ms - measured_ms) / sum(measured_ms) * 100. This is duration-weighted and is not the mean of per-iteration relative_diff_pct",
+        "comparison.absolute_error_pct": "aggregate absolute error = sum(abs(simulated_ms - measured_ms)) / sum(measured_ms) * 100. This is duration-weighted and differs from the unweighted abs_relative_error_pct mean",
+        "operation_impact_rank": "semantic operations ordered by descending aggregate absolute_error_ms, then operation name. Physical kernels and simulated slots are not forced into a false one-to-one join",
         "measured_gpu_cycle_ms": "CUPTI first-kernel start of the next valid measured iteration minus first-kernel start of this iteration; the final valid iteration has no cycle. Collective arrival-wait and launch gaps live here, not in measured_ms; the recommended_gpu_time_multiplier is the correction that spans them",
         "multiplier_excluded_iterations": "one entry per iteration left out of the pooled duty-cycle multiplier, with the evidence that excluded it. An iteration is excluded when measured_gpu_cycle_ms / measured_busy_union_ms both exceeds 2.0 and is an Iglewicz-Hoaglin outlier within its own stage",
         "recommended_gpu_time_multiplier": "validated physical duty-cycle correction = Σ measured_gpu_cycle_ms / Σ measured_busy_union_ms after the per-stage outlier screen. Null when the raw ratio is non-finite or below one",
@@ -2832,6 +2909,18 @@ mod tests {
             kind: "test".into(),
             kernel_config: json!({"backends": []}),
         }
+    }
+
+    #[test]
+    fn aggregate_error_keeps_cancellation_visible() {
+        let mut aggregate = ComparisonAggregate::default();
+        aggregate.record(10.0, 12.0);
+        aggregate.record(10.0, 8.0);
+
+        assert_eq!(aggregate.signed_error_ms, 0.0);
+        assert_eq!(aggregate.absolute_error_ms, 4.0);
+        assert_eq!(aggregate.to_json()["signed_error_pct"], json!(0.0));
+        assert_eq!(aggregate.to_json()["absolute_error_pct"], json!(20.0));
     }
 
     #[test]
