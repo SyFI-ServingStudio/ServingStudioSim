@@ -84,6 +84,7 @@ top-split-model-into-kernels - break a model forward into the VibeSim kernel seq
 
 top-align-with-framework - consume the Align VibeSim to framework side of shared evidence to evaluate simulator fidelity (kernel-only deviation + missing-chunk coverage, GPU duty cycle, TTFT/TPOT)
 ├── operate-run-alignment - produce the shared labeled evidence (Step 0, below)
+├── operate-align-moe-kernel - diagnose one fused MoE kernel from exact input through full-run popularity
 ├── impl-validate-kernel-cache - fix a wrong-shape kernel cost surfaced by Check 1
 └── top-add-kernel - add/repair a kernel whose backend the sim mismodels
 
@@ -104,6 +105,7 @@ operate-run-simulation - run deployment simulations from presets (DES, workload 
 operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
 operate-use-analyzer - select, read, interpret, and cite Analyzer-owned simulation, prediction, profile, and measurement results
 operate-run-alignment - produce one shared VibeSim↔framework comparison for vLLM or SGLang; Align VibeSim to framework through top-align-with-framework, or Align framework to VibeSim through top-compose-real-framework-from-sim
+operate-align-moe-kernel - diagnose one existing fused MoE kernel with exact-input, iteration-popularity, and full-run comparisons
 operate-gpu-spec - query or update the GPU spec catalog
 operate-profile-sim-speed - profile simulator wallclock speed
 operate-profile-serving-run - capture a comparable bounded profile of a real serving process and attribute its wall time to named engine phases (NVTX readiness + instrumentation contract, node-level CUDA-graph tracing, nsys SQLite aggregation)

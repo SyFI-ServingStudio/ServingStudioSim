@@ -48,6 +48,12 @@ the simulated CostTree slot time per mapped operation, per iteration, on
 **kernel-only** time (pure compute, *before* the `gpu_time_multiplier` wall
 inflation).
 
+When the discrepant operation is one fused MoE kernel and the question is
+whether the error comes from isolated execution, compressed routing input, or
+full-run popularity aggregation, route the focused diagnosis through
+`operate-align-moe-kernel`. Keep that evidence separate from whole-model MoE
+attribution.
+
 **First, coverage — is a large chunk missing?** Before scoring deviations, scan
 for a big **measured** kernel with no simulated counterpart (an unmapped measured
 kernel), or a large **simulated** slot with no measured kernel. A genuinely
@@ -171,6 +177,8 @@ per-kernel/collective deviation + cause → duty-cycle ratio → iteration wall 
 TTFT/TPOT/throughput. Then route the fix:
 
 - rerun, resume, or re-label a capture → `operate-run-alignment`;
+- one fused MoE kernel with uncertain routing-input fidelity →
+  `operate-align-moe-kernel`;
 - a wrong-shape or missing kernel cost → `impl-validate-kernel-cache` /
   `top-add-kernel`;
 - a mis-mapped or missing simulated slot → `operate-run-alignment`'s labeling.
