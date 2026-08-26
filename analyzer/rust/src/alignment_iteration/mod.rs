@@ -498,7 +498,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let mut cumulative_measured = 0.0;
     let mut cumulative_simulated = 0.0;
     // The GPU-cycle columns depend on the pooled duty-cycle multiplier
-    // (Σ measured GPU cycle / Σ measured_ms), which is only known after the loop
+    // (Σ measured GPU cycle / Σ measured busy union), known after the loop
     // has seen every iteration. Collect the per-iteration inputs here and fill
     // those columns in a second pass below.
     let mut gpu_cycle_inputs: Vec<(Option<f64>, f64)> = Vec::new();
@@ -679,7 +679,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             iteration: measured_iter.iteration,
             stage: joined.stage.clone(),
             measured_gpu_cycle_ms,
-            measured_ms: measured_critical_path_ms,
+            measured_busy_union_ms,
             jit_stall_ms: measured_iter.jit_stall_ns as f64 / 1.0e6,
             jit_module_loads: measured_iter.jit_module_loads,
         });
@@ -833,29 +833,25 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         breakdown_bytes.push(b'\n');
     }
 
-    // Pooled duty-cycle correction, derived from the measured side only:
-    // Σ measured GPU cycle / Σ measured_ms over iterations that have a cycle.
-    // Applying it as simulated_gpu_cycle = simulated_ms × recommended makes the
-    // pooled GPU-cycle gap equal the pooled kernel gap by construction, so the
-    // kernel-align and duty-cycle levels can never disagree. This value is what
-    // the aligned simulation worker should bake into its clock.
+    // Physical duty-cycle correction, derived from the measured side only:
+    // Σ measured GPU cycle / Σ measured busy union over iterations with a cycle.
+    // It is intentionally independent of Check 1's selected-device kernel path.
     //
     // Screened first: see `screen_duty_cycle_outliers`.
-    let (multiplier_excluded_iterations, sum_measured_gpu_cycle, sum_measured_ms_with_cycle) =
+    let (multiplier_excluded_iterations, sum_measured_gpu_cycle, sum_measured_busy_union) =
         screen_duty_cycle_outliers(&duty_cycle_samples);
-    let recommended_gpu_time_multiplier =
-        pooled_gpu_time_multiplier(sum_measured_gpu_cycle, sum_measured_ms_with_cycle);
-    ensure!(
-        recommended_gpu_time_multiplier.is_finite() && recommended_gpu_time_multiplier >= 1.0,
-        "recommended_gpu_time_multiplier must be finite and >= 1.0; found {recommended_gpu_time_multiplier}"
-    );
+    let raw_gpu_time_multiplier =
+        pooled_gpu_time_multiplier(sum_measured_gpu_cycle, sum_measured_busy_union);
+    let (recommended_gpu_time_multiplier, duty_cycle_unavailable_reason) =
+        duty_cycle_recommendation(raw_gpu_time_multiplier);
     let mut cumulative_measured_gpu_cycle = 0.0;
     let mut cumulative_simulated_gpu_cycle = 0.0;
     for (row, &(measured_gpu_cycle_ms, sim_total_ms)) in
         iteration_rows.iter_mut().zip(&gpu_cycle_inputs)
     {
-        let simulated_gpu_cycle_ms =
-            measured_gpu_cycle_ms.map(|_| sim_total_ms * recommended_gpu_time_multiplier);
+        let simulated_gpu_cycle_ms = measured_gpu_cycle_ms.and_then(|_| {
+            recommended_gpu_time_multiplier.map(|multiplier| sim_total_ms * multiplier)
+        });
         let (
             gpu_cycle_delta_ms,
             gpu_cycle_relative_diff_pct,
@@ -983,7 +979,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "measured_device_ids": inventory.device_ids,
             "representative_device_id": inventory.representative_device_id,
             "iterations": iteration_rows.len(),
+            "raw_gpu_time_multiplier": raw_gpu_time_multiplier,
             "recommended_gpu_time_multiplier": recommended_gpu_time_multiplier,
+            "duty_cycle_available": recommended_gpu_time_multiplier.is_some(),
+            "duty_cycle_unavailable_reason": duty_cycle_unavailable_reason,
             "multiplier_excluded_iterations": multiplier_excluded_iterations,
         },
         "available": true,
@@ -1042,7 +1041,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "analysis_log_dir": log_dir.display().to_string(),
             "profile_log_dir": input.profile_log_dir.display().to_string(),
             "measured_phases": inventory.phases.keys().collect::<Vec<_>>(),
+            "raw_gpu_time_multiplier": raw_gpu_time_multiplier,
             "recommended_gpu_time_multiplier": recommended_gpu_time_multiplier,
+            "duty_cycle_available": recommended_gpu_time_multiplier.is_some(),
+            "duty_cycle_unavailable_reason": duty_cycle_unavailable_reason,
             "multiplier_excluded_iterations": multiplier_excluded_iterations,
         },
         "iterations": report["iterations"],
@@ -2241,15 +2243,9 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }
 
-/// Pooled duty-cycle correction: Σ measured GPU cycle / Σ measured_ms over the
-/// iterations that have a measured cycle. This is what scales kernel-only
-/// timing-predict totals up to wall-clock; by construction, applying it makes the
-/// pooled GPU-cycle gap equal the pooled kernel gap, so the kernel-align and
-/// duty-cycle alignment levels agree. Derived from the measured side alone, it is
-/// independent of any simulation run and supersedes the old
-/// `gpu_cycle / global_kernel_busy` factor (whose denominator kept collective
 /// One iteration's contribution to the duty-cycle pool, plus the evidence the
-/// outlier screen and its report need.
+/// outlier screen and its report need. The denominator is physical GPU busy
+/// time, independently of Check 1's selected-device kernel-cost path.
 struct DutyCycleSample {
     iteration: u64,
     stage: String,
@@ -2257,7 +2253,7 @@ struct DutyCycleSample {
     /// first-kernel boundary. Such a sample never contributes and is never
     /// screened.
     measured_gpu_cycle_ms: Option<f64>,
-    measured_ms: f64,
+    measured_busy_union_ms: f64,
     /// GPU idle inside the gaps a CUDA module/library load landed in. Reported
     /// as an EXPLANATION for an exclusion, never as its criterion -- on a
     /// Qwen3.6 capture the two excluded iterations had wildly different causes
@@ -2298,16 +2294,16 @@ const DUTY_CYCLE_FACTOR_FLOOR: f64 = 2.0;
 /// compilation and a caching-allocator miss that fell through to a synchronous
 /// `cudaMalloc` -- and enumerating causes would have caught only the first.
 ///
-/// Returns `(excluded_report_rows, Σ measured_gpu_cycle_ms, Σ measured_ms)`.
+/// Returns `(excluded_report_rows, Σ measured_gpu_cycle_ms, Σ measured_busy_union_ms)`.
 fn screen_duty_cycle_outliers(samples: &[DutyCycleSample]) -> (Vec<serde_json::Value>, f64, f64) {
     let mut factors_by_stage: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
     for sample in samples {
         if let Some(cycle) = sample.measured_gpu_cycle_ms {
-            if sample.measured_ms > 0.0 {
+            if sample.measured_busy_union_ms > 0.0 {
                 factors_by_stage
                     .entry(sample.stage.as_str())
                     .or_default()
-                    .push(cycle / sample.measured_ms);
+                    .push(cycle / sample.measured_busy_union_ms);
             }
         }
     }
@@ -2326,15 +2322,15 @@ fn screen_duty_cycle_outliers(samples: &[DutyCycleSample]) -> (Vec<serde_json::V
 
     let mut excluded = Vec::new();
     let mut sum_cycle = 0.0;
-    let mut sum_measured = 0.0;
+    let mut sum_busy_union = 0.0;
     for sample in samples {
         let Some(cycle) = sample.measured_gpu_cycle_ms else {
             continue;
         };
-        if sample.measured_ms <= 0.0 {
+        if sample.measured_busy_union_ms <= 0.0 {
             continue;
         }
-        let factor = cycle / sample.measured_ms;
+        let factor = cycle / sample.measured_busy_union_ms;
         let (centre, deviation, population) = statistics
             .get(sample.stage.as_str())
             .copied()
@@ -2360,16 +2356,16 @@ fn screen_duty_cycle_outliers(samples: &[DutyCycleSample]) -> (Vec<serde_json::V
                 "stage_median_factor": centre,
                 "modified_z_score": modified_z,
                 "measured_gpu_cycle_ms": cycle,
-                "measured_ms": sample.measured_ms,
+                "measured_busy_union_ms": sample.measured_busy_union_ms,
                 "jit_stall_ms": sample.jit_stall_ms,
                 "jit_module_loads": sample.jit_module_loads,
             }));
         } else {
             sum_cycle += cycle;
-            sum_measured += sample.measured_ms;
+            sum_busy_union += sample.measured_busy_union_ms;
         }
     }
-    (excluded, sum_cycle, sum_measured)
+    (excluded, sum_cycle, sum_busy_union)
 }
 
 /// Median of an unsorted slice; 0.0 for an empty one. Even lengths average the
@@ -2388,15 +2384,32 @@ fn median(values: &[f64]) -> f64 {
     }
 }
 
-/// arrival-wait that `measured_ms` deliberately drops).
+/// Pooled duty-cycle correction: Σ measured GPU cycle / Σ measured busy union.
 ///
 /// With no measured cycle at all (e.g. a single-iteration capture) it degrades to
 /// the identity 1.0.
-fn pooled_gpu_time_multiplier(sum_measured_gpu_cycle_ms: f64, sum_measured_ms: f64) -> f64 {
-    if sum_measured_ms > 0.0 {
-        sum_measured_gpu_cycle_ms / sum_measured_ms
+fn pooled_gpu_time_multiplier(
+    sum_measured_gpu_cycle_ms: f64,
+    sum_measured_busy_union_ms: f64,
+) -> f64 {
+    if sum_measured_busy_union_ms > 0.0 {
+        sum_measured_gpu_cycle_ms / sum_measured_busy_union_ms
     } else {
         1.0
+    }
+}
+
+/// Publish only a finite multiplier that can scale kernel time up to wall time.
+fn duty_cycle_recommendation(raw: f64) -> (Option<f64>, Option<String>) {
+    if raw.is_finite() && raw >= 1.0 {
+        (Some(raw), None)
+    } else {
+        (
+            None,
+            Some(format!(
+                "raw GPU-time multiplier must be finite and >= 1.0; found {raw}"
+            )),
+        )
     }
 }
 
@@ -2784,12 +2797,13 @@ fn definitions() -> Value {
         "critical_device_id": "the physical device whose complete reduced path supplies measured_ms and all measured headline components",
         "measured_track_busy": "per device and concurrent track, that track own busy union and launch count. Which track the hidden time came from, not only that some was hidden",
         "operation_measured_concurrent_hidden_ms": "how much of this operation measured time ran while an EARLIER track on the same device was already busy. The overlap of two tracks is one shared stretch of wall clock, so it is charged only to the later-starting side; that is what makes these rows sum to the iteration measured_concurrent_hidden_ms instead of twice it, and it puts the hidden time on the side stream that joined a busy device. An operation that is almost entirely hidden is not on the critical path even though its kernels are real work. This is measurement evidence about the framework schedule; it is NOT a CostTree instruction, and in particular must not become a CostNode::Max, whose children are interchangeable cross-rank replicas (optimality R2 reads Max as load imbalance)",
-        "measured_busy_union_ms": "audit only: union of CUDA kernel intervals across every NSYS phase and TP rank; it removes cross-op rank-skew overlap that the critical-path sum keeps, so it reads below measured_ms",
+        "measured_busy_union_ms": "physical union of CUDA kernel intervals across every NSYS phase and rank. This is the duty-cycle denominator; it is independent of the selected-device measured_ms path",
         "total_simulated_ms": "timing-predict cost-tree total_time_ms (Sum/Max/Scale semantics preserved)",
         "relative_diff_pct": "(simulated - measured) / measured * 100; positive means overprediction",
         "measured_gpu_cycle_ms": "CUPTI first-kernel start of the next valid measured iteration minus first-kernel start of this iteration; the final valid iteration has no cycle. Collective arrival-wait and launch gaps live here, not in measured_ms; the recommended_gpu_time_multiplier is the correction that spans them",
-        "multiplier_excluded_iterations": "one entry per iteration left out of the pooled duty-cycle multiplier, with the evidence that excluded it. An iteration is excluded when its duty-cycle factor (measured_gpu_cycle_ms / measured_ms) both exceeds 2.0 and is an Iglewicz-Hoaglin outlier (MAD modified z > 3.5) within its own stage, over a stage of at least 8 iterations. Stratified because the factor is genuinely multi-modal — CUDA-graph decode iterations idle ~0.5 ms while eager mixed iterations idle ~34 ms — and the factor floor is required because a near-deterministic decode population reaches z in the hundreds on ordinary jitter. The cause is not part of the test: `jit_stall_ms` and `jit_module_loads` are reported to explain an exclusion, not to make it. Their GPU cycle is real measured time, but a one-off host stall inside one measured iteration would otherwise propagate into every simulated iteration through this single constant. The rows keep their own measured and simulated cycle; only the pooling drops them",
-        "recommended_gpu_time_multiplier": "pooled duty-cycle correction = Σ measured_gpu_cycle_ms / Σ measured_ms over iterations that have a measured cycle and survive the per-stage outlier screen (see multiplier_excluded_iterations). Applying it as simulated_gpu_cycle = simulated_ms × this makes the pooled GPU-cycle gap equal the pooled kernel gap by construction. Derived from the measured side only (no simulation input); the aligned simulation worker should bake this value into its clock",
+        "multiplier_excluded_iterations": "one entry per iteration left out of the pooled duty-cycle multiplier, with the evidence that excluded it. An iteration is excluded when measured_gpu_cycle_ms / measured_busy_union_ms both exceeds 2.0 and is an Iglewicz-Hoaglin outlier within its own stage",
+        "recommended_gpu_time_multiplier": "validated physical duty-cycle correction = Σ measured_gpu_cycle_ms / Σ measured_busy_union_ms after the per-stage outlier screen. Null when the raw ratio is non-finite or below one",
+        "raw_gpu_time_multiplier": "the physical duty-cycle ratio before validation; retained when no recommendation can safely be injected into simulation",
         "simulated_gpu_cycle_ms": "timing-predict total_time_ms multiplied by recommended_gpu_time_multiplier (the measured pooled duty-cycle correction), i.e. the kernel-only prediction scaled up to wall-clock",
         "gpu_cycle_relative_diff_pct": "(scaled timing-predict GPU cycle - measured GPU cycle) / measured GPU cycle * 100; positive means overprediction",
         "operation_measured_ms": "each occurrence is first reduced across the ranks that raised it (independent = slowest rank duration; synchronizing = max(end) - max(start)); arrival wait is dropped, not attributed to the collective. Those reduced durations are then summed along each rank's own timeline and the slowest rank is taken, so ranks that ran different kernel sequences (data parallelism) combine concurrently rather than serially. When every rank runs one sequence this is exactly the flat sum over occurrences",
@@ -3385,7 +3399,7 @@ mod tests {
     }
 
     #[test]
-    fn pooled_multiplier_is_cycle_over_measured() {
+    fn pooled_multiplier_is_cycle_over_busy_union() {
         // Wall-clock cycle exceeds critical-path work by the duty-cycle factor.
         assert_eq!(pooled_gpu_time_multiplier(1200.0, 1000.0), 1.2);
         // No measured cycle (single-iteration capture) → identity, not a NaN.
@@ -3681,13 +3695,13 @@ mod tests {
         iteration: u64,
         stage: &str,
         cycle_ms: f64,
-        measured_ms: f64,
+        measured_busy_union_ms: f64,
     ) -> DutyCycleSample {
         DutyCycleSample {
             iteration,
             stage: stage.into(),
             measured_gpu_cycle_ms: Some(cycle_ms),
-            measured_ms,
+            measured_busy_union_ms,
             jit_stall_ms: 0.0,
             jit_module_loads: 0,
         }
@@ -3784,7 +3798,7 @@ mod tests {
             iteration: 64,
             stage: "mixed".into(),
             measured_gpu_cycle_ms: Some(1813.8),
-            measured_ms: 45.21,
+            measured_busy_union_ms: 45.21,
             jit_stall_ms: 1589.57,
             jit_module_loads: 6,
         });
@@ -3808,7 +3822,7 @@ mod tests {
             iteration: 999,
             stage: "decode".into(),
             measured_gpu_cycle_ms: None,
-            measured_ms: 7.0,
+            measured_busy_union_ms: 7.0,
             jit_stall_ms: 0.0,
             jit_module_loads: 0,
         });
@@ -3817,5 +3831,21 @@ mod tests {
 
         assert!(excluded.is_empty());
         assert_eq!(sum_measured, 12.0);
+    }
+
+    #[test]
+    fn invalid_duty_cycle_ratio_does_not_become_a_recommendation() {
+        let (recommended, reason) = duty_cycle_recommendation(0.9812);
+
+        assert_eq!(recommended, None);
+        assert!(reason.unwrap().contains("0.9812"));
+    }
+
+    #[test]
+    fn valid_duty_cycle_ratio_is_recommended_unchanged() {
+        let (recommended, reason) = duty_cycle_recommendation(1.2);
+
+        assert_eq!(recommended, Some(1.2));
+        assert_eq!(reason, None);
     }
 }

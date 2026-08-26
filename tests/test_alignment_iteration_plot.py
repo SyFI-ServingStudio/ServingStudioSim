@@ -14,6 +14,7 @@ from alignment_iteration.series_plot import (  # noqa: E402
     _evenly_sample_iteration_ids,
     _mapping_center_pairs,
     _output_is_current,
+    _recommended_gpu_time_multiplier,
     _remove_stale_breakdown_outputs,
     _simulated_width_cumulative_error_steps,
     _stream_operation_rows,
@@ -38,6 +39,19 @@ def test_evenly_sample_iteration_ids_sorts_and_keeps_small_inputs() -> None:
     rows = [{"iteration_id": 9}, {"iteration_id": 3}, {"iteration_id": 7}]
 
     assert _evenly_sample_iteration_ids(rows) == [3, 7, 9]
+
+
+@pytest.mark.parametrize("value", [None, 0.9812, float("nan"), True, "1.2"])
+def test_invalid_duty_cycle_multiplier_does_not_block_kernel_plots(value) -> None:
+    payload = {"meta": {"recommended_gpu_time_multiplier": value}}
+
+    assert _recommended_gpu_time_multiplier(payload) is None
+
+
+def test_valid_duty_cycle_multiplier_enables_gpu_cycle_plot() -> None:
+    payload = {"meta": {"recommended_gpu_time_multiplier": 1.2}}
+
+    assert _recommended_gpu_time_multiplier(payload) == 1.2
 
 
 def test_sharded_records_are_read_by_byte_range_in_the_order_asked_for(tmp_path) -> None:

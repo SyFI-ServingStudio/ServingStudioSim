@@ -47,15 +47,19 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
             iterations,
             plot_output_path(log_dir, "alignment_iteration_overview.png"),
             run_label=log_dir.name,
-        ),
-        partial(
-            _render_gpu_cycle_overall,
-            iterations,
-            plot_output_path(log_dir, "alignment_iteration_gpu_cycle_overview.png"),
-            run_label=log_dir.name,
-            gpu_time_multiplier=float(payload["meta"]["recommended_gpu_time_multiplier"]),
-        ),
+        )
     ]
+    gpu_time_multiplier = _recommended_gpu_time_multiplier(payload)
+    if gpu_time_multiplier is not None:
+        jobs.append(
+            partial(
+                _render_gpu_cycle_overall,
+                iterations,
+                plot_output_path(log_dir, "alignment_iteration_gpu_cycle_overview.png"),
+                run_label=log_dir.name,
+                gpu_time_multiplier=gpu_time_multiplier,
+            )
+        )
     # Sample first, read second. The breakdowns live in a byte-range-addressed
     # shard precisely so that rendering 128 of 2,040 iterations does not have to
     # parse the other 1,912.
@@ -115,6 +119,14 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
                 )
             )
     return jobs
+
+
+def _recommended_gpu_time_multiplier(payload: dict) -> float | None:
+    value = (payload.get("meta") or {}).get("recommended_gpu_time_multiplier")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and value >= 1.0 else None
 
 
 def _evenly_sample_iteration_ids(

@@ -397,20 +397,20 @@ uv run python -m alignment parse --sqlite capture.sqlite --metrics metrics.jsonl
 ```
 
 The duty-cycle correction is derived by the analyzer's kernel-align pass, not a
-standalone command. It pools `Σ measured_gpu_cycle_ms / Σ measured_ms` over
+standalone command. It pools `Σ measured_gpu_cycle_ms / Σ measured_busy_union_ms` over
 iterations that have a next-iteration GPU cycle (a GPU cycle is one iteration's
 first attributed kernel start to the next kernel-bearing iteration's first kernel
 start on the same device; the terminal iteration per device is excluded). The
-numerator and denominator share the analyzer's per-occurrence cross-rank
-reduction, so the kernel-layer and GPU-cycle-layer gaps stay consistent. Treat
-the factor as experiment-specific, never a GPU-wide constant.
+denominator is the physical per-iteration kernel busy union, independent of
+Check 1's selected-device kernel-cost path. Treat the factor as
+experiment-specific, never a GPU-wide constant.
 
 **One outlying iteration can carry the correction.** The multiplier is a single
 constant baked into every simulated iteration, so a one-off host stall inside one
 measured iteration propagates to all of them. On a 966-iteration Qwen3.6 capture,
 one iteration held 1.77 s of GPU idle and supplied 41% of the whole correction.
 The pass therefore screens each iteration's duty-cycle factor
-(`measured_gpu_cycle_ms / measured_ms`) and drops it when the factor both exceeds
+(`measured_gpu_cycle_ms / measured_busy_union_ms`) and drops it when the factor both exceeds
 2.0 and is an Iglewicz-Hoaglin outlier (MAD modified z > 3.5) **within its own
 stage**, over a stage of at least 8 iterations. Excluded iterations and their
 evidence are listed in `meta.multiplier_excluded_iterations`; the rows keep their
@@ -454,9 +454,8 @@ inventory remain explicitly unpaired. Analysis applies labels independently to
 each rank, then builds one interval-union path per physical device. A
 synchronizing collective is capped by `max(end) - max(start)` to remove arrival
 wait; independent work keeps the selected device's own contribution. The
-longest complete device path supplies the headline. The kernel-align
-multiplier is derived from this same per-occurrence measured population, so its
-`measured_ms` numerator matches the breakdown the analyzer reports.
+longest complete device path supplies the headline. Duty-cycle accounting stays
+separate and uses the physical all-device busy union described above.
 
 ## Concurrent CUDA streams: the track axis
 
