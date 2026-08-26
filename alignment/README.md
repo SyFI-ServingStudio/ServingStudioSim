@@ -445,9 +445,14 @@ never makes one.
 For tensor parallelism, every rank keeps its own normalized ranges. The folded
 labeling inventory stores one representative sequence only after proving that
 the ordered `(name, suggested_category)` sequence is identical on every device
-for every phase/iteration. Analysis applies those labels independently to each
-rank and reduces per occurrence across ranks (an independent op takes the
-max-rank duration; a synchronizing collective takes `max(end) − max(start)`,
+for every phase/iteration. Ranks driven by one scheduler are paired by exact
+iteration index and identical phase inventory; asynchronous host NVTX spans are
+not a join key. Independent data-parallel schedulers can have diverging counters,
+so the parser instead pairs only mutual, unique overlaps of attributed GPU-kernel
+envelopes. Missing kernel evidence, ambiguous overlap, and incomplete phase
+inventory remain explicitly unpaired. Analysis applies labels independently to
+each rank and reduces per occurrence across ranks (an independent op takes the
+max-rank duration; a synchronizing collective takes `max(end) - max(start)`,
 dropping arrival wait), never by summing GPU durations. The kernel-align
 multiplier is derived from this same per-occurrence measured population, so its
 `measured_ms` numerator matches the breakdown the analyzer reports.

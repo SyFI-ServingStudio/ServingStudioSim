@@ -11,19 +11,19 @@ from alignment.nsys.parse import (
     RangeStats,
     Worker,
     _parse_label,
+    aggregate_metrics_by_iteration,
     attribute_jit_stalls,
     build_host_timeline,
-    aggregate_metrics_by_iteration,
     build_iteration_details,
     build_kernel_name_index,
     build_parser,
     ensure_query_indexes,
     iteration_kind,
     load_host_threads,
+    load_metrics,
     load_ranges,
     owning_global_pid,
     parsed_window_ns,
-    load_metrics,
     resolve_dp_rank_by_device,
 )
 from alignment.nsys.sequence import build_kernel_sequences, expand_sequence
@@ -446,7 +446,9 @@ def host_capture() -> sqlite3.Connection:
         -- Only the worker process ever put a kernel on a device.
         INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES ({WORKER_GLOBAL_PID}, 3, 1, 1000);
 
-        INSERT INTO NVTX_EVENTS VALUES (1000, 2000, {WORKER_MAIN_TID}, 'vllm_iteration(7): forward', NULL);
+        INSERT INTO NVTX_EVENTS VALUES (
+            1000, 2000, {WORKER_MAIN_TID}, 'vllm_iteration(7): forward', NULL
+        );
         INSERT INTO NVTX_EVENTS VALUES (1100, 1500, {WORKER_MAIN_TID}, 'execute_context_0', NULL);
         INSERT INTO NVTX_EVENTS VALUES (900, 2100, {SCHEDULER_TID}, 'schedule', NULL);
         -- A mark the capture never closed.
@@ -641,7 +643,7 @@ def test_dp_rank_by_device_rejects_a_device_with_no_rank_banner():
         resolve_dp_rank_by_device(workers, {999: 0}, tp_size=1)
 
 
-# ---- wall-clock step alignment --------------------------------------------
+# ---- logical step alignment -----------------------------------------------
 #
 # A data-parallel rank numbers its OWN scheduled steps. When one rank runs a
 # prefill chunk alone its peers run dummy batches that join the expert-parallel
@@ -681,6 +683,81 @@ def test_steps_group_by_measured_time_not_by_iteration_index():
     assert [step.iteration for step in steps] == [5, 6, 7]
     assert [step.index_by_device for step in steps] == [{0: 5, 1: 3}, {0: 6, 1: 4}, {0: 7, 1: 5}]
     assert unpaired == {}
+
+
+def test_single_engine_tp_steps_group_by_index_when_host_ranges_do_not_overlap():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    ranges = [
+        _window(0, 130, 100, 110),
+        _window(0, 131, 110, 120),
+        _window(1, 130, 80, 90),
+        _window(1, 131, 101, 111),
+        _window(1, 132, 112, 113, phase="preprocess"),
+    ]
+
+    steps, unpaired = align_ranges_into_steps(ranges, {0: 0, 1: 0})
+
+    assert [step.index_by_device for step in steps] == [
+        {0: 130, 1: 130},
+        {0: 131, 1: 131},
+    ]
+    assert unpaired == {1: 1}
+
+
+def test_single_engine_tp_requires_the_same_phase_identity():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    reference = _window(0, 5, 100, 110, phase="forward")
+    peer = _window(1, 5, 100, 110, phase="preprocess")
+
+    steps, unpaired = align_ranges_into_steps([reference, peer], {0: 0, 1: 0})
+
+    assert [step.index_by_device for step in steps] == [{0: 5}]
+    assert unpaired == {1: 1}
+
+
+def test_multi_engine_steps_use_kernel_time_instead_of_host_submission_time():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    reference = _window(0, 5, 100, 110)
+    peer = _window(1, 3, 200, 210)
+    reference.intervals = [(1_000, 1_010)]
+    peer.intervals = [(1_001, 1_011)]
+
+    steps, unpaired = align_ranges_into_steps([reference, peer], {0: 0, 1: 1})
+
+    assert [step.index_by_device for step in steps] == [{0: 5, 1: 3}]
+    assert unpaired == {}
+
+
+def test_multi_engine_step_without_kernel_evidence_stays_unpaired():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    reference = _window(0, 5, 100, 110)
+    peer = _window(1, 3, 101, 109)
+    peer.intervals = []
+
+    steps, unpaired = align_ranges_into_steps([reference, peer], {0: 0, 1: 1})
+
+    assert [step.index_by_device for step in steps] == [{0: 5}]
+    assert unpaired == {1: 1}
+
+
+def test_multi_engine_ambiguous_kernel_overlap_stays_unpaired():
+    from alignment.nsys.parse import align_ranges_into_steps
+
+    first = _window(0, 5, 100, 110)
+    second = _window(0, 6, 110, 120)
+    peer = _window(1, 3, 100, 120)
+    first.intervals = [(1_000, 1_010)]
+    second.intervals = [(1_010, 1_020)]
+    peer.intervals = [(1_005, 1_015)]
+
+    steps, unpaired = align_ranges_into_steps([first, second, peer], {0: 0, 1: 1})
+
+    assert [step.index_by_device for step in steps] == [{0: 5}, {0: 6}]
+    assert unpaired == {1: 1}
 
 
 def test_a_step_only_one_rank_ran_keeps_that_rank_and_names_the_absent_ones():

@@ -697,17 +697,17 @@ class DeviceStepWindow:
     start: int
     end: int
     items: list[RangeStats]
+    matchable: bool = True
 
 
 @dataclass
 class AlignedStep:
-    """One wall-clock step, and which of each device's own iterations it is.
+    """One logical serving step and each device's local iteration identity.
 
     `iteration` is the reference device's index and remains the step's identity
     downstream — a case index, a labeled sequence occurrence and an analyzer row
     all address a step by it. `index_by_device` is the provenance that makes the
-    identity honest: under data parallelism the same step is iteration 153 on
-    device 0 and 149 on device 1.
+    identity honest when independent scheduler counters diverge.
     """
 
     iteration: int
@@ -719,20 +719,37 @@ class AlignedStep:
         return {window.device_id: window.iteration for window in self.windows}
 
 
-def _device_step_windows(ranges: list[RangeStats]) -> dict[int | None, list[DeviceStepWindow]]:
-    """Each device's own iterations, in time order, phases folded into one span."""
+def _device_step_windows(
+    ranges: list[RangeStats], *, use_kernel_time: bool
+) -> dict[int | None, list[DeviceStepWindow]]:
+    """Build each device's steps from the evidence used to match them.
+
+    Independent schedulers are paired by attributed GPU work, not asynchronous
+    host submission ranges. A step without a correlated kernel remains in the
+    reference timeline but is not eligible for a time-based match.
+    """
     grouped: dict[tuple[int | None, int], list[RangeStats]] = defaultdict(list)
     for item in ranges:
         grouped[(item.worker.device_id, item.iteration)].append(item)
     by_device: dict[int | None, list[DeviceStepWindow]] = defaultdict(list)
     for (device_id, iteration), items in grouped.items():
+        kernel_intervals = [interval for item in items for interval in item.intervals]
+        if use_kernel_time and kernel_intervals:
+            start = min(start for start, _ in kernel_intervals)
+            end = max(end for _, end in kernel_intervals)
+            matchable = True
+        else:
+            start = min(item.start for item in items)
+            end = max(item.end for item in items)
+            matchable = not use_kernel_time
         by_device[device_id].append(
             DeviceStepWindow(
                 device_id=device_id,
                 iteration=iteration,
-                start=min(item.start for item in items),
-                end=max(item.end for item in items),
+                start=start,
+                end=end,
                 items=sorted(items, key=lambda item: (item.start, item.phase)),
+                matchable=matchable,
             )
         )
     for windows in by_device.values():
@@ -743,68 +760,77 @@ def _device_step_windows(ranges: list[RangeStats]) -> dict[int | None, list[Devi
 def _pair_by_overlap(
     reference: list[DeviceStepWindow], peer: list[DeviceStepWindow]
 ) -> tuple[dict[int, DeviceStepWindow], list[DeviceStepWindow]]:
-    """Match a peer device's steps to the reference's, one to one, by overlap.
-
-    A merge join rather than nearest-index: the two lists are each in time order
-    and internally non-overlapping, so one forward pass assigns every peer window
-    to the reference window it shares the most time with. Peer windows that match
-    nothing are returned rather than dropped — they are steps the reference was
-    not running, which is a fact about the capture, not noise to swallow.
-    """
-    matched: dict[int, DeviceStepWindow] = {}
-    unpaired: list[DeviceStepWindow] = []
-    reference_index = 0
-    peer_index = 0
+    """Match only mutual, unique best overlaps between two GPU timelines."""
+    matchable_reference = [window for window in reference if window.matchable]
+    matchable_peer = [window for window in peer if window.matchable]
 
     def overlap(left: DeviceStepWindow, right: DeviceStepWindow) -> int:
-        return min(left.end, right.end) - max(left.start, right.start)
+        return max(0, min(left.end, right.end) - max(left.start, right.start))
 
-    while reference_index < len(reference) and peer_index < len(peer):
-        reference_window = reference[reference_index]
-        peer_window = peer[peer_index]
-        if peer_window.end <= reference_window.start:
-            unpaired.append(peer_window)
-            peer_index += 1
-            continue
-        if reference_window.end <= peer_window.start:
-            reference_index += 1
-            continue
-        # They overlap. Take the next peer instead when it overlaps this
-        # reference step more, so a peer step straddling two reference steps
-        # lands on the one it actually shares its time with.
-        if peer_index + 1 < len(peer) and overlap(reference_window, peer[peer_index + 1]) > overlap(
-            reference_window, peer_window
-        ):
-            unpaired.append(peer_window)
-            peer_index += 1
+    def unique_best(
+        window: DeviceStepWindow, candidates: list[DeviceStepWindow]
+    ) -> DeviceStepWindow | None:
+        scored = [(overlap(window, candidate), candidate) for candidate in candidates]
+        best_score = max((score for score, _ in scored), default=0)
+        if best_score <= 0:
+            return None
+        best = [candidate for score, candidate in scored if score == best_score]
+        return best[0] if len(best) == 1 else None
+
+    reference_best = {
+        window.iteration: unique_best(window, matchable_peer) for window in matchable_reference
+    }
+    peer_best = {
+        window.iteration: unique_best(window, matchable_reference) for window in matchable_peer
+    }
+    matched: dict[int, DeviceStepWindow] = {}
+    matched_peer_iterations: set[int] = set()
+    for reference_window in matchable_reference:
+        peer_window = reference_best[reference_window.iteration]
+        if peer_window is None or peer_best[peer_window.iteration] is not reference_window:
             continue
         matched[reference_window.iteration] = peer_window
-        reference_index += 1
-        peer_index += 1
-    unpaired.extend(peer[peer_index:])
+        matched_peer_iterations.add(peer_window.iteration)
+    unpaired = [window for window in peer if window.iteration not in matched_peer_iterations]
     return matched, unpaired
 
 
-def align_ranges_into_steps(ranges: list[RangeStats]) -> tuple[list[AlignedStep], dict[int, int]]:
-    """Group the devices' ranges into wall-clock steps, NOT by iteration index.
+def _pair_by_iteration_index(
+    reference: list[DeviceStepWindow], peer: list[DeviceStepWindow]
+) -> tuple[dict[int, DeviceStepWindow], list[DeviceStepWindow]]:
+    """Pair TP ranks by their shared indexed marker and phase identity."""
+    reference_by_iteration = {window.iteration: window for window in reference}
+    matched: dict[int, DeviceStepWindow] = {}
+    unpaired: list[DeviceStepWindow] = []
+    for peer_window in peer:
+        reference_window = reference_by_iteration.get(peer_window.iteration)
+        if reference_window is None:
+            unpaired.append(peer_window)
+            continue
+        reference_phases = Counter(item.phase for item in reference_window.items)
+        peer_phases = Counter(item.phase for item in peer_window.items)
+        if peer_phases != reference_phases:
+            unpaired.append(peer_window)
+            continue
+        matched[reference_window.iteration] = peer_window
+    return matched, unpaired
 
-    Every rank's `iteration_index` counts that rank's own scheduled steps. Under
-    data parallelism the counters diverge and stay diverged: in the GLM-5.2 DP8
-    capture device 0 ran four prefill chunks alone at the head of the window
-    while its peers ran dummy batches that participate in the expert-parallel
-    collectives but are not scheduled iterations, so from then on device 0 was
-    permanently four to five ahead. Index 9 is a 1,927 ms prefill on device 0 and
-    a 20 ms decode on device 1, six seconds later.
 
-    Grouping by index therefore reduces kernels from different steps together —
-    a per-position `max` across ranks over events that never coexisted. This
-    groups by measured time instead: the lowest device is the reference clock and
-    each peer's step joins the reference step it overlaps most.
+def _uses_shared_iteration_index(dp_rank_by_device: dict[int, int] | None) -> bool:
+    return bool(dp_rank_by_device) and len(set(dp_rank_by_device.values())) == 1
 
-    Returns the steps plus, per device, how many of its steps found no reference
-    step to join (reported in provenance; never silently dropped).
+
+def align_ranges_into_steps(
+    ranges: list[RangeStats], dp_rank_by_device: dict[int, int] | None = None
+) -> tuple[list[AlignedStep], dict[int, int]]:
+    """Group device ranges into logical serving steps.
+
+    TP ranks behind one scheduler share an authoritative indexed marker.
+    Independent DP schedulers can diverge, so their steps join only on
+    unambiguous attributed-kernel overlap. Unmatched evidence remains explicit.
     """
-    by_device = _device_step_windows(ranges)
+    shared_iteration_index = _uses_shared_iteration_index(dp_rank_by_device)
+    by_device = _device_step_windows(ranges, use_kernel_time=not shared_iteration_index)
     if not by_device:
         return [], {}
     reference_device_id = sorted(by_device, key=lambda device: (device is None, device))[0]
@@ -815,7 +841,10 @@ def align_ranges_into_steps(ranges: list[RangeStats]) -> tuple[list[AlignedStep]
     for device_id, windows in by_device.items():
         if device_id == reference_device_id:
             continue
-        matched, unpaired = _pair_by_overlap(reference, windows)
+        if shared_iteration_index:
+            matched, unpaired = _pair_by_iteration_index(reference, windows)
+        else:
+            matched, unpaired = _pair_by_overlap(reference, windows)
         for iteration, window in matched.items():
             joined[iteration].append(window)
         if unpaired:
@@ -881,19 +910,14 @@ def build_iteration_details(
     rank_metrics: dict[tuple[int, int], dict] | None = None,
     dp_rank_by_device: dict[int, int] | None = None,
 ) -> list[dict]:
-    """Serialize every owned kernel in launch order, grouped by wall-clock step.
+    """Serialize every owned kernel in launch order, grouped by logical step.
 
     Summary categories are convenient analyzer inputs, but this list is the
     lossless ground-truth artifact. Kernel names are never truncated here.
 
-    A step is the set of per-device ranges that overlap in measured time, not
-    the set that shares an `iteration_index` — see `align_ranges_into_steps` for
-    why those are different things under data parallelism. Each serialized range
-    therefore carries `iteration_index`: the id its OWN rank gave the step, which
-    is the key its metrics row is under. A rank that scheduled nothing emits no
-    record, so its range metrics are `None` — an expected dummy step, never an
-    error — and a rank with no overlapping range at all is named in
-    `devices_absent` rather than left to be inferred from a short `ranges` list.
+    TP ranks join by exact indexed phase identity. Independent DP ranks join
+    only on unambiguous attributed-kernel overlap. Each range retains its own
+    `iteration_index`; missing or untrusted matches remain explicit.
 
     `metrics` is the index-keyed replica aggregate, used only as the fallback for
     a capture with no per-rank rows; when those rows exist the step's shape is
@@ -901,7 +925,7 @@ def build_iteration_details(
     """
     rank_metrics = rank_metrics or {}
     dp_rank_by_device = dp_rank_by_device or {}
-    steps, _ = align_ranges_into_steps(ranges)
+    steps, _ = align_ranges_into_steps(ranges, dp_rank_by_device)
     all_devices = sorted(
         {item.worker.device_id for item in ranges if item.worker.device_id is not None}
     )
@@ -1372,7 +1396,6 @@ def parse_trace(
                 f"claims; stated devices are {sorted(dp_rank_by_device)}"
             )
 
-    iterations = sorted({r.iteration for r in ranges})
     stages = sorted({r.stage for r in ranges})
     kernel_name_ids, kernel_names = build_kernel_name_index(ranges)
     by_stage = {
@@ -1395,19 +1418,22 @@ def parse_trace(
     iteration_details = build_iteration_details(
         ranges, metrics, kernel_name_ids, rank_metrics, dp_rank_by_device
     )
-    aligned_steps, unpaired_by_device = align_ranges_into_steps(ranges)
+    aligned_steps, unpaired_by_device = align_ranges_into_steps(ranges, dp_rank_by_device)
+    iterations = [step.iteration for step in aligned_steps]
     kernel_sequences, device_ids = build_device_kernel_sequences(iteration_details, kernel_names)
     return {
         # v5 adds per-range and per-iteration `jit_module_loads` /
         # `jit_stall_ns`. Purely
         # additive: every other field is byte-identical to v4.
         "schema_version": 5,
-        # How the devices' ranges were grouped into steps. Recorded because the
-        # obvious rule — same `iteration_index` — is wrong under data
-        # parallelism, and a reader of this file has no way to tell which rule
-        # produced it otherwise.
+        # Record the authoritative join rule; downstream consumers cannot infer
+        # scheduler ownership from the flattened ranges alone.
         "step_alignment": {
-            "rule": "wall_clock_overlap",
+            "rule": (
+                "iteration_index"
+                if _uses_shared_iteration_index(dp_rank_by_device)
+                else "kernel_time_overlap"
+            ),
             "reference_device_id": (
                 aligned_steps[0].reference_device_id if aligned_steps else None
             ),
