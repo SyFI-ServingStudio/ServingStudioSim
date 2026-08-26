@@ -181,20 +181,20 @@ struct ExpertPopularityVersion {
     schema_version: u32,
 }
 
-/// Canonicalize layerwise EP load before the L4 `Scale{num_layers}` fold.
+/// Canonicalize each layer's EP load while retaining the layer boundary.
 ///
 /// Expert ids and EP rank ids are irrelevant to local expert-compute cost. For
 /// every layer, sort experts within each physical rank by descending load, then
-/// sort ranks by descending total load. Adding equal canonical slots across
-/// layers makes canonical rank 0 carry `sum(layer-wise max rank)` instead of the
-/// biased `max(rank-wise sum over layers)`. Ties use the sorted expert vector,
-/// keeping the transformation deterministic without restoring physical ids.
+/// sort ranks by descending total load. A later routing sampler can then realize
+/// every layer independently before folding equal canonical slots. Ties use the
+/// sorted expert vector, keeping the transformation deterministic without
+/// restoring physical ids.
 fn canonicalize_layerwise_expert_counts(
     counts_by_layer: &[Vec<u64>],
     expected_num_experts: u32,
     ep_size: u16,
     path: &str,
-) -> Result<Vec<f32>> {
+) -> Result<Vec<Vec<f32>>> {
     anyhow::ensure!(ep_size > 0, "ep_size must be non-zero");
     anyhow::ensure!(
         expected_num_experts % u32::from(ep_size) == 0,
@@ -204,7 +204,7 @@ fn canonicalize_layerwise_expert_counts(
         ep_size
     );
     let experts_per_rank = expected_num_experts as usize / usize::from(ep_size);
-    let mut canonical_counts = vec![0u64; expected_num_experts as usize];
+    let mut canonical_layers = Vec::with_capacity(counts_by_layer.len());
 
     for (layer_index, layer_counts) in counts_by_layer.iter().enumerate() {
         anyhow::ensure!(
@@ -236,25 +236,22 @@ fn canonicalize_layerwise_expert_counts(
             right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1))
         });
 
+        let mut canonical_counts = vec![0u64; expected_num_experts as usize];
         for (canonical_rank, (_, sorted_expert_counts)) in rank_counts.iter().enumerate() {
             let canonical_start = canonical_rank * experts_per_rank;
             for (expert_slot, count) in sorted_expert_counts.iter().enumerate() {
                 let canonical_slot = canonical_start + expert_slot;
-                canonical_counts[canonical_slot] = canonical_counts[canonical_slot]
-                    .checked_add(*count)
-                    .with_context(|| {
-                        format!(
-                            "expert popularity profile {path} canonical count overflow at slot {canonical_slot}"
-                        )
-                    })?;
+                canonical_counts[canonical_slot] = *count;
             }
         }
+        canonical_layers.push(
+            canonical_counts
+                .into_iter()
+                .map(|count| count as f32)
+                .collect(),
+        );
     }
-
-    Ok(canonical_counts
-        .into_iter()
-        .map(|count| count as f32)
-        .collect())
+    Ok(canonical_layers)
 }
 
 fn load_expert_popularity(
@@ -340,10 +337,26 @@ fn load_expert_popularity(
         expected_num_experts
     );
 
-    let ratios: Vec<f32> = if !counts_by_layer.is_empty() {
-        canonicalize_layerwise_expert_counts(&counts_by_layer, expected_num_experts, ep_size, path)?
+    let routing = if !counts_by_layer.is_empty() {
+        let layers = canonicalize_layerwise_expert_counts(
+            &counts_by_layer,
+            expected_num_experts,
+            ep_size,
+            path,
+        )?;
+        anyhow::ensure!(
+            layers.iter().flatten().any(|ratio| *ratio > 0.0),
+            "expert popularity profile {} has zero total routing mass",
+            path
+        );
+        RoutingDistribution::from_layer_profiles(&layers)
     } else if let Some(ratios) = legacy_ratios {
-        ratios
+        anyhow::ensure!(
+            ratios.iter().any(|ratio| *ratio > 0.0),
+            "expert popularity profile {} has zero total routing mass",
+            path
+        );
+        RoutingDistribution::from_profile(&ratios)
     } else {
         bail!(
             "legacy expert popularity profile {} must contain counts_by_layer or {} probabilities_all_layers/counts_all_layers entries",
@@ -351,12 +364,7 @@ fn load_expert_popularity(
             expected_num_experts
         );
     };
-    anyhow::ensure!(
-        ratios.iter().any(|ratio| *ratio > 0.0),
-        "expert popularity profile {} has zero total routing mass",
-        path
-    );
-    Ok(RoutingDistribution::from_profile(&ratios))
+    Ok(routing)
 }
 
 fn validate_expert_popularity(
@@ -470,6 +478,25 @@ fn validate_expert_popularity(
             path,
             &format!("layer {layer_index}"),
         )?;
+        let layer_total = counts.iter().try_fold(0u64, |sum, count| {
+            sum.checked_add(*count).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "expert popularity profile {path} layer {layer_index} count overflow"
+                )
+            })
+        })?;
+        anyhow::ensure!(
+            expected_experts_per_token > 0
+                && layer_total % u64::from(expected_experts_per_token) == 0,
+            "expert popularity profile {path} layer {layer_index} assignment count is not divisible by top_k"
+        );
+        anyhow::ensure!(
+            counts.iter().all(|count| {
+                u128::from(*count) * u128::from(expected_experts_per_token)
+                    <= u128::from(layer_total)
+            }),
+            "expert popularity profile {path} layer {layer_index} has infeasible distinct top-k marginals"
+        );
         for (expert_index, count) in counts.iter().enumerate() {
             derived_all_layer_counts[expert_index] = derived_all_layer_counts[expert_index]
                 .checked_add(*count)
@@ -1323,6 +1350,9 @@ mod tests {
         // canonical rank therefore carries sum(layer-wise max rank) = 19.
         assert_eq!(routing.ppm(), &[515_152, 60_606, 212_121, 212_121]);
         assert_eq!(routing.ppm()[..2].iter().sum::<u32>(), 575_758);
+        assert_eq!(routing.layer_ppm().len(), 2);
+        assert_eq!(routing.layer_ppm()[0], [428_572, 95_238, 238_095, 238_095]);
+        assert_eq!(routing.layer_ppm()[1], [666_666, 0, 166_667, 166_667]);
     }
 
     #[test]
@@ -1346,13 +1376,13 @@ mod tests {
                 "kind": "contiguous_logical_expert_ids",
                 "layout": "rank_major"
             },
-            "counts_by_layer": [[9, 2, 5, 5], [2, 2, 0, 8]],
+            "counts_by_layer": [[6, 2, 5, 3], [2, 2, 6, 6]],
             "probabilities_by_layer": [
-                [9.0 / 21.0, 2.0 / 21.0, 5.0 / 21.0, 5.0 / 21.0],
-                [2.0 / 12.0, 2.0 / 12.0, 0.0, 8.0 / 12.0]
+                [6.0 / 16.0, 2.0 / 16.0, 5.0 / 16.0, 3.0 / 16.0],
+                [2.0 / 16.0, 2.0 / 16.0, 6.0 / 16.0, 6.0 / 16.0]
             ],
-            "counts_all_layers": [11, 4, 5, 13],
-            "probabilities_all_layers": [11.0 / 33.0, 4.0 / 33.0, 5.0 / 33.0, 13.0 / 33.0]
+            "counts_all_layers": [8, 4, 11, 9],
+            "probabilities_all_layers": [8.0 / 32.0, 4.0 / 32.0, 11.0 / 32.0, 9.0 / 32.0]
         });
         let mut profile_file = tempfile::NamedTempFile::new().unwrap();
         write!(profile_file, "{profile}").unwrap();
@@ -1361,7 +1391,29 @@ mod tests {
         let routing =
             resolve_routing_source(RoutingKind::Uniform, None, 4, 2, 2, 2, Some(profile_path))
                 .unwrap();
-        assert_eq!(routing.ppm(), &[515_152, 60_606, 212_121, 212_121]);
+        assert_eq!(routing.ppm(), &[375_000, 250_000, 218_750, 156_250]);
+        assert_eq!(routing.layer_ppm().len(), 2);
+
+        let mut infeasible_profile = profile.clone();
+        infeasible_profile["counts_by_layer"][0] = serde_json::json!([9, 2, 3, 2]);
+        infeasible_profile["probabilities_by_layer"][0] =
+            serde_json::json!([9.0 / 16.0, 2.0 / 16.0, 3.0 / 16.0, 2.0 / 16.0]);
+        infeasible_profile["counts_all_layers"] = serde_json::json!([11, 4, 9, 8]);
+        infeasible_profile["probabilities_all_layers"] =
+            serde_json::json!([11.0 / 32.0, 4.0 / 32.0, 9.0 / 32.0, 8.0 / 32.0]);
+        let mut infeasible_file = tempfile::NamedTempFile::new().unwrap();
+        write!(infeasible_file, "{infeasible_profile}").unwrap();
+        let error = resolve_routing_source(
+            RoutingKind::Uniform,
+            None,
+            4,
+            2,
+            2,
+            2,
+            infeasible_file.path().to_str(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("infeasible distinct top-k marginals"));
 
         let mut v3_profile = profile.clone();
         v3_profile["schema_version"] = serde_json::json!(3);
