@@ -62,6 +62,8 @@ def chunk_result_from_payload(result_payload: dict[str, Any]) -> ChunkResult:
     return ChunkResult(
         metrics=metrics,
         observed_gpu_name=result_payload.get("gpu_name"),
+        cuda_version=result_payload.get("cuda_version"),
+        backend_version=result_payload.get("backend_version"),
     )
 
 

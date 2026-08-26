@@ -28,6 +28,10 @@ sync:
     uv sync --inexact --no-install-package deep-gemm
     uv sync
 
+# Reproducible CUDA-13 environment for vLLM-backed L1 kernels.
+profile-container-build:
+    profiling/container/build.sh
+
 # cpu tier — Rust unit tests + deterministic mocked pytest. No GPU/binary.
 # `workers` is the xdist worker count. Not `auto`: that means one worker per core,
 # and each worker pays ~9 s importing torch + flashinfer, so a big host spends

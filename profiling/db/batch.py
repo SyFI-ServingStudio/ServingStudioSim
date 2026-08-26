@@ -160,7 +160,9 @@ def execute_profile_batch(
 
     results: list[Metrics | None] = [None] * len(specs)
     observed_names: list[str] = []
-    pending_groups: list[tuple[KernelProfilerSpec, list[tuple[_PreparedProfileSpec, Metrics]]]] = []
+    pending_groups: list[
+        tuple[KernelProfilerSpec, list[tuple[_PreparedProfileSpec, ChunkResult]]]
+    ] = []
     largest_gpu_count = 0
 
     # Run every group first, collecting rows plus every successful worker observation.
@@ -177,7 +179,7 @@ def execute_profile_batch(
             raise RuntimeError(f"pool returned no chunks for {backend} with {gpu_count} GPU(s)")
 
         largest_gpu_count = max(largest_gpu_count, gpu_count)
-        successful_profiles: list[tuple[_PreparedProfileSpec, Metrics]] = []
+        successful_profiles: list[tuple[_PreparedProfileSpec, ChunkResult]] = []
         for prepared_spec, chunk_result in _run_specs_across_chunks(
             kernel_kind,
             classified_specs,
@@ -194,7 +196,7 @@ def execute_profile_batch(
                 )
             if observed not in observed_names:
                 observed_names.append(observed)
-            successful_profiles.append((prepared_spec, metrics))
+            successful_profiles.append((prepared_spec, chunk_result))
         if successful_profiles:
             pending_groups.append((profiler_spec, successful_profiles))
 
@@ -207,11 +209,14 @@ def execute_profile_batch(
                 profile_rows = [
                     ProfileRow(
                         args=prepared_spec.kernel_args,
-                        metrics=metrics,
+                        metrics=chunk_result.metrics,
                         gpu_name=effective_cache_key,
                         backend=prepared_spec.backend,
+                        cuda_version=chunk_result.cuda_version,
+                        backend_version=chunk_result.backend_version,
                     )
-                    for prepared_spec, metrics in successful_profiles
+                    for prepared_spec, chunk_result in successful_profiles
+                    if chunk_result.metrics is not None
                 ]
                 Table(profiler_spec, db_path).insert(profile_rows)
     else:

@@ -17,6 +17,8 @@ class ChunkResult:
     # Every successful execution must provide this provenance. It becomes the DB
     # key only when the controller did not request an explicit key.
     observed_gpu_name: str | None = None
+    cuda_version: str | None = None
+    backend_version: str | None = None
     error: str | None = None
 
 

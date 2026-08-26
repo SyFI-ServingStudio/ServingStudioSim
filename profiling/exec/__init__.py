@@ -6,6 +6,7 @@ import os
 
 from profiling.exec.env import (
     ENV_REGISTRY,
+    ContainerProfileEnv,
     ProfileEnv,
     register_profile_env,
     resolve_profile_env,
@@ -43,6 +44,7 @@ def get_default_pool() -> GpuPool:
 
 __all__ = [
     "ChunkResult",
+    "ContainerProfileEnv",
     "ENV_REGISTRY",
     "GpuChunk",
     "GpuPool",

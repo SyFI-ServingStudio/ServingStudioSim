@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -68,15 +69,23 @@ class ProfileEnv:
         self.validate()
 
 
+@dataclass(frozen=True)
+class ContainerProfileEnv:
+    """Immutable image used to execute one profiling worker chunk."""
+
+    name: str
+    image: str
+
+    def validate(self) -> None:
+        if not self.image:
+            raise ValueError(f"profiling env {self.name!r} has no container image")
+        if shutil.which("docker") is None:
+            raise FileNotFoundError("docker is required for container profiling")
+
+
 _PROFILE_ENVS_ROOT = Path.home() / "profile_envs"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROJECT_UV_PYTHON = _PROJECT_ROOT / ".venv" / "bin" / "python"
-_VLLM_ROOT = _PROJECT_ROOT / "alignment" / "profiler" / "vllm"
-_VLLM_PYTHON = _VLLM_ROOT / ".venv" / "bin" / "python"
-_WORKER_PYTHON_DIR = f"python{sys.version_info.major}.{sys.version_info.minor}"
-_VLLM_SITE_PACKAGES = _VLLM_ROOT / ".venv" / "lib" / _WORKER_PYTHON_DIR / "site-packages"
-_VLLM_CUDA_COMPAT_LIB = _VLLM_ROOT / ".venv" / "lib" / "cuda-compat"
-_VLLM_TORCH_LIB = _VLLM_SITE_PACKAGES / "torch" / "lib"
 
 
 def _profile_env_python(name: str) -> Path:
@@ -93,7 +102,7 @@ def _default_python() -> Path:
     return configured if configured.exists() else Path(sys.executable)
 
 
-ENV_REGISTRY: dict[str, ProfileEnv] = {
+ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
     "default_env": ProfileEnv("default_env", _default_python()),
     # Most profilers should stay on default_env via subprocess_env=None. In this
     # repo, default_env is the uv-managed project .venv when it exists.
@@ -106,18 +115,11 @@ ENV_REGISTRY: dict[str, ProfileEnv] = {
         "flashinfer_local",
         _profile_env_python("flashinfer_local"),
     ),
-    # Run the vLLM interpreter itself: its site initialization executes the
-    # editable wheel's extension finder. Merely adding site-packages to
-    # PYTHONPATH does not execute .pth files and leaves vllm._C unresolved.
-    # `_VLLM_ROOT` remains ahead of the installed package so Python source comes
-    # from this pinned checkout while native extensions come from its wheel.
-    # The environment-owned cuda-compat link is the same forward-compatible
-    # driver boundary used by alignment; it must precede Torch's CUDA libraries.
-    "vllm_env": ProfileEnv(
+    # vLLM runners execute in the pinned image; host source and Python packages
+    # are deliberately outside this environment boundary.
+    "vllm_env": ContainerProfileEnv(
         "vllm_env",
-        _VLLM_PYTHON,
-        (_VLLM_ROOT,),
-        (_VLLM_CUDA_COMPAT_LIB, _VLLM_TORCH_LIB),
+        os.environ.get("VIBESIM_VLLM_PROFILE_IMAGE", "vibesim-profiler-vllm:cu130"),
     ),
 }
 
@@ -161,7 +163,7 @@ def compose_library_path(profile_env: ProfileEnv, existing: str | None) -> str:
     return os.pathsep.join(entries)
 
 
-def resolve_profile_env(name: str | None) -> ProfileEnv:
+def resolve_profile_env(name: str | None) -> ProfileEnv | ContainerProfileEnv:
     env_name = name or "default_env"
     try:
         return ENV_REGISTRY[env_name]
@@ -172,6 +174,7 @@ def resolve_profile_env(name: str | None) -> ProfileEnv:
 
 __all__ = [
     "ENV_REGISTRY",
+    "ContainerProfileEnv",
     "ProfileEnv",
     "compose_library_path",
     "compose_pythonpath",

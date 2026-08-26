@@ -11,6 +11,7 @@ Agent note:
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import sys
 from pathlib import Path
@@ -63,7 +64,8 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
         if measure_context is not None:
             clear_measure_context()
     gpu_name = _current_gpu_name()
-    worker_results = [_to_payload(result, gpu_name) for result in results]
+    runtime_versions = _runtime_versions(backend)
+    worker_results = [_to_payload(result, gpu_name, runtime_versions) for result in results]
 
     output: dict = {"results": worker_results}
     if measure_context is not None:
@@ -101,7 +103,11 @@ def _strip_backend(chunk_spec: dict) -> dict:
     return {key: value for key, value in chunk_spec.items() if key != "backend"}
 
 
-def _to_payload(result: RunnerResult, gpu_name: str | None) -> dict:
+def _to_payload(
+    result: RunnerResult,
+    gpu_name: str | None,
+    runtime_versions: dict[str, str | None] | None = None,
+) -> dict:
     """Render one ``RunnerResult`` into the worker's on-disk JSON shape that
     ``chunk_result_from_payload`` consumes (unchanged from the single-spec loop)."""
     if result.error is not None or result.metrics is None:
@@ -110,6 +116,7 @@ def _to_payload(result: RunnerResult, gpu_name: str | None) -> dict:
         "ok": True,
         "metrics": metrics_to_payload(result.metrics),
         "gpu_name": gpu_name,
+        **(runtime_versions or {}),
     }
 
 
@@ -122,6 +129,23 @@ def _current_gpu_name() -> str | None:
     except ImportError:
         pass
     return None
+
+
+def _runtime_versions(backend: str) -> dict[str, str | None]:
+    try:
+        import torch
+    except ImportError:
+        return {"cuda_version": None, "backend_version": None}
+
+    package = "vllm" if backend.startswith("vllm") else backend
+    try:
+        backend_version = importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        backend_version = None
+    return {
+        "cuda_version": str(torch.version.cuda) if torch.version.cuda else None,
+        "backend_version": backend_version,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
