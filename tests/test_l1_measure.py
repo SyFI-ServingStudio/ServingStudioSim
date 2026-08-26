@@ -158,6 +158,18 @@ def _record(name: str, start_ns: int, duration_ns: int, correlation_id: int):
     )
 
 
+def test_interval_union_duration_merges_overlap_but_preserves_gaps():
+    from profiling.profilers.cupti_kernel_profiler import interval_union_duration_ns
+
+    records = [
+        _record("producer", 100, 200, 0),
+        _record("reduction", 250, 100, 1),
+        _record("next", 500, 150, 2),
+    ]
+
+    assert interval_union_duration_ns(records) == 400
+
+
 def test_split_launch_series_warm_layout():
     from profiling.profilers.cupti_kernel_profiler import _LaunchPattern, split_launch_series
 
