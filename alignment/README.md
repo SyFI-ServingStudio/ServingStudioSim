@@ -181,8 +181,8 @@ has timing-predict or analysis fields.
 
 ### Expert-popularity artifact contract
 
-New captures write schema v2, formally described by
-[`alignment/schema/expert_popularity_v2.schema.json`](schema/expert_popularity_v2.schema.json).
+New captures write schema v3, formally described by
+[`alignment/schema/expert_popularity_v3.schema.json`](schema/expert_popularity_v3.schema.json).
 The authoritative tensor is `counts_by_layer[layer][logical_expert]`; each value
 is a nonnegative count of routed token-expert assignments, so one input token
 normally contributes `experts_per_token` assignments per MoE layer. Derived
@@ -196,9 +196,16 @@ ids `[rank * experts_per_rank, (rank + 1) * experts_per_rank)` form one EP-rank
 shard before rank/expert identities are canonicalized. It is a modeling
 partition, not a claim about a potentially rearranged physical EPLB placement.
 
-The Rust consumer treats v2 as a closed contract and rejects unknown fields or
-cross-field inconsistencies. Schema v1 remains read-only compatibility for
-existing run directories; the profiler no longer generates it.
+The raw JSONL retains every emitted record. The aggregate admits only records
+whose per-layer assignment count is within
+`max_tokens_per_step * expert_parallel_size * experts_per_token`; this excludes
+an initial EPLB record that flushes accumulated server warmup work. The summary
+records the raw, accepted, and discarded record counts and the discarded EPLB
+steps, so this filtering is auditable rather than implicit.
+
+The Rust consumer treats v2 and v3 as closed contracts and rejects unknown
+fields or cross-field inconsistencies. Schemas v1 and v2 remain read-only
+compatibility for existing run directories; the profiler generates v3.
 The instrumented vLLM raw record is also version 2 and supplies
 `expert_parallel_size` and `experts_per_token` from the running EPLB state;
 the summary extractor verifies that these values remain constant across the

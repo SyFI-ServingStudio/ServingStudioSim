@@ -332,6 +332,10 @@ def _finalize_profile(
             expert_load_jsonl,
             expert_popularity_json,
             expert_parallel_size=expert_parallel_size,
+            max_tokens_per_step=max(
+                cfg.server.chunk_size,
+                cfg.server.max_cudagraph_capture_size or 0,
+            ),
             records=records,
         )
         result = {

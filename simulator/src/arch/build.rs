@@ -118,12 +118,12 @@ struct ExpertPopularityProfileV1 {
     counts_all_layers: Vec<u64>,
 }
 
-/// Schema v2 is deliberately closed: producer and consumer must change the
-/// version when adding or reinterpreting fields. Cross-field dimensions are
-/// validated after serde because JSON Schema cannot express them all.
+/// Schemas v2 and v3 share the measured tensors but have distinct closed
+/// aggregation metadata. Cross-field dimensions are validated after serde
+/// because JSON Schema cannot express them all.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ExpertPopularityProfileV2 {
+struct ExpertPopularityProfile {
     schema_version: u32,
     model: String,
     num_moe_layers: u32,
@@ -132,8 +132,8 @@ struct ExpertPopularityProfileV2 {
     experts_per_rank: u32,
     experts_per_token: u32,
     count_semantics: String,
-    aggregation: ExpertPopularityAggregationV2,
-    expert_partitioning: ExpertPopularityPartitioningV2,
+    aggregation: ExpertPopularityAggregation,
+    expert_partitioning: ExpertPopularityPartitioning,
     counts_by_layer: Vec<Vec<u64>>,
     probabilities_by_layer: Vec<Vec<f64>>,
     counts_all_layers: Vec<u64>,
@@ -151,7 +151,27 @@ struct ExpertPopularityAggregationV2 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ExpertPopularityPartitioningV2 {
+struct ExpertPopularityAggregationV3 {
+    scope: String,
+    observed_eplb_step_min: u64,
+    observed_eplb_step_max: u64,
+    record_count: u64,
+    raw_record_count: u64,
+    discarded_oversized_record_count: u64,
+    discarded_oversized_eplb_steps: Vec<u64>,
+    max_tokens_per_step: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ExpertPopularityAggregation {
+    V2(ExpertPopularityAggregationV2),
+    V3(ExpertPopularityAggregationV3),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpertPopularityPartitioning {
     kind: String,
     layout: String,
 }
@@ -288,10 +308,15 @@ fn load_expert_popularity(
             };
             (profile.num_logical_experts, profile.counts_by_layer, ratios)
         }
-        2 => {
-            let profile: ExpertPopularityProfileV2 = serde_json::from_value(profile_value)
-                .with_context(|| format!("parsing strict expert popularity v2 profile {path}"))?;
-            validate_expert_popularity_v2(
+        2 | 3 => {
+            let profile: ExpertPopularityProfile = serde_json::from_value(profile_value)
+                .with_context(|| {
+                    format!(
+                        "parsing strict expert popularity v{} profile {path}",
+                        version.schema_version
+                    )
+                })?;
+            validate_expert_popularity(
                 &profile,
                 expected_num_experts,
                 ep_size,
@@ -302,7 +327,7 @@ fn load_expert_popularity(
             (profile.num_logical_experts, profile.counts_by_layer, None)
         }
         other => bail!(
-            "unsupported expert popularity schema_version {} in {} (supported: 1 legacy, 2)",
+            "unsupported expert popularity schema_version {} in {} (supported: 1 legacy, 2, 3)",
             other,
             path
         ),
@@ -334,15 +359,18 @@ fn load_expert_popularity(
     Ok(RoutingDistribution::from_profile(&ratios))
 }
 
-fn validate_expert_popularity_v2(
-    profile: &ExpertPopularityProfileV2,
+fn validate_expert_popularity(
+    profile: &ExpertPopularityProfile,
     expected_num_experts: u32,
     expected_ep_size: u16,
     expected_num_moe_layers: u32,
     expected_experts_per_token: u32,
     path: &str,
 ) -> Result<()> {
-    anyhow::ensure!(profile.schema_version == 2, "internal v2 version mismatch");
+    anyhow::ensure!(
+        matches!(profile.schema_version, 2 | 3),
+        "internal expert popularity version mismatch"
+    );
     anyhow::ensure!(
         !profile.model.is_empty(),
         "expert popularity profile {path} has empty model"
@@ -377,13 +405,28 @@ fn validate_expert_popularity_v2(
         "expert popularity profile {path} has unsupported count_semantics {:?}",
         profile.count_semantics
     );
-    anyhow::ensure!(
-        profile.aggregation.scope == "all_captured_eplb_steps"
-            && profile.aggregation.record_count > 0
-            && profile.aggregation.observed_eplb_step_min
-                <= profile.aggregation.observed_eplb_step_max,
-        "expert popularity profile {path} has invalid aggregation metadata"
-    );
+    match (&profile.aggregation, profile.schema_version) {
+        (ExpertPopularityAggregation::V2(aggregation), 2) => anyhow::ensure!(
+            aggregation.scope == "all_captured_eplb_steps"
+                && aggregation.record_count > 0
+                && aggregation.observed_eplb_step_min <= aggregation.observed_eplb_step_max,
+            "expert popularity profile {path} has invalid v2 aggregation metadata"
+        ),
+        (ExpertPopularityAggregation::V3(aggregation), 3) => anyhow::ensure!(
+            aggregation.scope == "captured_eplb_steps_within_token_ceiling"
+                && aggregation.record_count > 0
+                && aggregation.observed_eplb_step_min <= aggregation.observed_eplb_step_max
+                && aggregation.max_tokens_per_step > 0
+                && aggregation.raw_record_count
+                    == aggregation.record_count + aggregation.discarded_oversized_record_count
+                && aggregation.discarded_oversized_record_count
+                    == aggregation.discarded_oversized_eplb_steps.len() as u64,
+            "expert popularity profile {path} has invalid v3 aggregation metadata"
+        ),
+        _ => bail!(
+            "expert popularity profile {path} schema_version does not match its aggregation shape"
+        ),
+    }
     anyhow::ensure!(
         profile.expert_partitioning.kind == "contiguous_logical_expert_ids"
             && profile.expert_partitioning.layout == "rank_major",
@@ -1283,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn expert_popularity_v2_validates_full_model_and_partition_contract() {
+    fn expert_popularity_v2_and_v3_validate_full_model_and_partition_contract() {
         let profile = serde_json::json!({
             "schema_version": 2,
             "model": "Qwen/test",
@@ -1319,6 +1362,46 @@ mod tests {
             resolve_routing_source(RoutingKind::Uniform, None, 4, 2, 2, 2, Some(profile_path))
                 .unwrap();
         assert_eq!(routing.ppm(), &[515_152, 60_606, 212_121, 212_121]);
+
+        let mut v3_profile = profile.clone();
+        v3_profile["schema_version"] = serde_json::json!(3);
+        v3_profile["aggregation"] = serde_json::json!({
+            "scope": "captured_eplb_steps_within_token_ceiling",
+            "observed_eplb_step_min": 10,
+            "observed_eplb_step_max": 11,
+            "record_count": 2,
+            "raw_record_count": 3,
+            "discarded_oversized_record_count": 1,
+            "discarded_oversized_eplb_steps": [9],
+            "max_tokens_per_step": 32
+        });
+        let mut v3_file = tempfile::NamedTempFile::new().unwrap();
+        write!(v3_file, "{v3_profile}").unwrap();
+        assert!(resolve_routing_source(
+            RoutingKind::Uniform,
+            None,
+            4,
+            2,
+            2,
+            2,
+            v3_file.path().to_str(),
+        )
+        .is_ok());
+
+        v3_profile["aggregation"]["raw_record_count"] = serde_json::json!(4);
+        let mut invalid_v3_file = tempfile::NamedTempFile::new().unwrap();
+        write!(invalid_v3_file, "{v3_profile}").unwrap();
+        let error = resolve_routing_source(
+            RoutingKind::Uniform,
+            None,
+            4,
+            2,
+            2,
+            2,
+            invalid_v3_file.path().to_str(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid v3 aggregation metadata"));
 
         let mut unknown_field_profile = profile;
         unknown_field_profile["unregulated"] = serde_json::json!(true);

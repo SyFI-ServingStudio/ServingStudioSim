@@ -472,9 +472,10 @@ def test_extract_expert_popularity_aggregates_logical_counts(tmp_path):
         raw_path,
         summary_path,
         expert_parallel_size=2,
+        max_tokens_per_step=2,
     )
     summary = json.loads(summary_path.read_text())
-    schema_path = Path(__file__).parents[1] / "alignment/schema/expert_popularity_v2.schema.json"
+    schema_path = Path(__file__).parents[1] / "alignment/schema/expert_popularity_v3.schema.json"
     schema = json.loads(schema_path.read_text())
 
     assert count == 2
@@ -483,16 +484,20 @@ def test_extract_expert_popularity_aggregates_logical_counts(tmp_path):
     assert set(summary["expert_partitioning"]) == set(
         schema["properties"]["expert_partitioning"]["required"]
     )
-    assert summary["schema_version"] == 2
+    assert summary["schema_version"] == 3
     assert summary["expert_parallel_size"] == 2
     assert summary["experts_per_rank"] == 1
     assert summary["experts_per_token"] == 2
     assert summary["count_semantics"] == "logical_routed_token_assignments"
     assert summary["aggregation"] == {
-        "scope": "all_captured_eplb_steps",
+        "scope": "captured_eplb_steps_within_token_ceiling",
         "observed_eplb_step_min": 10,
         "observed_eplb_step_max": 11,
         "record_count": 2,
+        "raw_record_count": 2,
+        "discarded_oversized_record_count": 0,
+        "discarded_oversized_eplb_steps": [],
+        "max_tokens_per_step": 2,
     }
     assert summary["expert_partitioning"] == {
         "kind": "contiguous_logical_expert_ids",
@@ -501,6 +506,56 @@ def test_extract_expert_popularity_aggregates_logical_counts(tmp_path):
     assert summary["counts_by_layer"] == [[5, 3], [3, 5]]
     assert summary["counts_all_layers"] == [8, 8]
     assert summary["probabilities_all_layers"] == [0.5, 0.5]
+
+
+def test_extract_expert_popularity_excludes_oversized_warmup_flush(tmp_path):
+    server_log = tmp_path / "server.log"
+    records = [
+        {
+            "schema_version": 2,
+            "model": "moe/model",
+            "eplb_step": 20,
+            "expert_parallel_size": 2,
+            "experts_per_token": 2,
+            "logical_expert_counts": [[12, 0], [12, 0]],
+        },
+        {
+            "schema_version": 2,
+            "model": "moe/model",
+            "eplb_step": 21,
+            "expert_parallel_size": 2,
+            "experts_per_token": 2,
+            "logical_expert_counts": [[2, 2], [1, 3]],
+        },
+    ]
+    server_log.write_text(
+        "\n".join(f"INFO VibeSimAlignmentExpertLoad {json.dumps(record)}" for record in records)
+    )
+    raw_path = tmp_path / "expert_load.jsonl"
+    summary_path = tmp_path / "expert_popularity.json"
+
+    count = record_extraction.extract_expert_popularity(
+        server_log,
+        raw_path,
+        summary_path,
+        expert_parallel_size=2,
+        max_tokens_per_step=1,
+    )
+    summary = json.loads(summary_path.read_text())
+
+    assert count == 1
+    assert len(raw_path.read_text().splitlines()) == 2
+    assert summary["aggregation"] == {
+        "scope": "captured_eplb_steps_within_token_ceiling",
+        "observed_eplb_step_min": 21,
+        "observed_eplb_step_max": 21,
+        "record_count": 1,
+        "raw_record_count": 2,
+        "discarded_oversized_record_count": 1,
+        "discarded_oversized_eplb_steps": [20],
+        "max_tokens_per_step": 1,
+    }
+    assert summary["counts_by_layer"] == [[2, 2], [1, 3]]
 
 
 def test_extract_expert_popularity_rejects_partition_mismatch(tmp_path):
@@ -518,6 +573,7 @@ def test_extract_expert_popularity_rejects_partition_mismatch(tmp_path):
             server_log,
             tmp_path / "raw.jsonl",
             tmp_path / "summary.json",
+            max_tokens_per_step=1,
             expert_parallel_size=2,
             experts_per_token=2,
         )

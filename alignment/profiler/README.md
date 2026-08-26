@@ -253,10 +253,15 @@ The separate `expert_popularity` pass sets
 request-timing artifact. Its only model-side ground truth is the expert-load
 record stream described above; timing evidence always comes from the NSYS pass.
 The resulting summary follows
-[`alignment/schema/expert_popularity_v2.schema.json`](../schema/expert_popularity_v2.schema.json):
+[`alignment/schema/expert_popularity_v3.schema.json`](../schema/expert_popularity_v3.schema.json):
 `counts_by_layer[layer][logical_expert]` is authoritative, while EP degree,
 top-k, aggregation scope, and the simulator's rank-major logical partition are
 explicit provenance rather than implicit loader assumptions.
+The raw expert-load JSONL preserves every emitted EPLB record. The aggregate
+uses the configured maximum scheduler/CUDA-graph token count as a conservation
+ceiling and excludes oversized records that flush work accumulated before the
+replay. `aggregation` records the ceiling, raw and accepted counts, and every
+discarded EPLB step.
 
 For long multi-GPU workloads, set `nsys.capture_duration_seconds` with
 `capture_mode: cuda_profiler_api`. The launcher stops CUPTI at that deadline but
