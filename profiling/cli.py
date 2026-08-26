@@ -1,8 +1,9 @@
-"""Command line facade for existing L1 profiling entries.
+"""Command line facade for L1 profiling and profile database maintenance.
 
-This module is intentionally thin: it parses human/agent inputs, then calls the
-generated public functions on ``profiling.perf_api``. It must not call runners
-or ``run_profile_batch`` directly, preserving the L1 entry-point invariant.
+This module is intentionally thin: profile execution and queries call the
+generated public functions on ``profiling.perf_api``; database maintenance
+delegates to ``profiling.db``. It must not call runners or ``run_profile_batch``
+directly, preserving the L1 entry-point invariant.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ def main(
 def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="Run/query existing VibeSim L1 profile entries through profiling.perf_api.",
+        description="Run, query, or maintain VibeSim L1 profile data.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -122,6 +123,21 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
         help="Warm continuous window (no per-launch L2 displacement); reveals power/clock drift.",
     )
     measure_parser.set_defaults(command_fn=_cmd_measure, clear_l2=True, telemetry=True)
+
+    merge_parser = subparsers.add_parser(
+        "merge-db",
+        help="Merge profile databases by semantic row identity.",
+    )
+    merge_parser.add_argument("left", type=Path, help="First input profile.db.")
+    merge_parser.add_argument("right", type=Path, help="Second input profile.db.")
+    merge_parser.add_argument("--output", type=Path, required=True, help="New merged profile.db.")
+    merge_parser.add_argument(
+        "--report",
+        type=Path,
+        help="JSON report path. Defaults to <output>.merge-report.json.",
+    )
+    merge_parser.add_argument("--json", action="store_true", help="Emit the report as JSON.")
+    merge_parser.set_defaults(command_fn=_cmd_merge_db)
     return parser
 
 
@@ -146,6 +162,38 @@ def _add_common_profile_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--gpu-name", help="DB gpu_name key. Defaults to CUDA device 0 name.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+
+def _cmd_merge_db(args: argparse.Namespace) -> int:
+    from profiling.db.merge import merge_profile_databases
+
+    report = merge_profile_databases(
+        args.left,
+        args.right,
+        args.output,
+        report_path=args.report,
+    )
+    payload = report.to_dict()
+    if args.json:
+        print(json.dumps({"ok": report.published, **payload}, indent=2, sort_keys=True))
+    else:
+        summary = payload["summary"]
+        status = "published" if report.published else "not published: conflicts require review"
+        report_path = (
+            args.report.resolve()
+            if args.report is not None
+            else args.output.resolve().with_name(f"{args.output.name}.merge-report.json")
+        )
+        print(f"Profile DB merge {status}")
+        print(f"Output: {payload['output']['path']}")
+        print(f"Report: {report_path}")
+        print(
+            "Rows: "
+            f"{summary['inserted_rows']} inserted, "
+            f"{summary['duplicate_rows']} duplicates, "
+            f"{summary['conflict_rows']} conflicts"
+        )
+    return 0 if report.published else 1
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
