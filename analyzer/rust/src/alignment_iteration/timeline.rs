@@ -644,14 +644,15 @@ fn build_iteration(
     let offset = |ns: u64| (ns as i64) - (time_origin_ns as i64);
 
     // ---- measured -----------------------------------------------------------
+    let measured_reduction = measured_critical_path(measurement);
     let mut measured_operation_ms: BTreeMap<&str, f64> = BTreeMap::new();
     let mut measured_operation_rows: BTreeMap<&str, usize> = BTreeMap::new();
     let mut kernel_rows = Vec::with_capacity(measurement.kernels.len());
-    for (_, item) in &measurement.kernels {
+    for (kernel_index, (_, item)) in measurement.kernels.iter().enumerate() {
         let occurrence = occurrence_ns(&item.launches, item.synchronizing);
         if let Some(operation) = &item.operation {
             *measured_operation_ms.entry(operation.as_str()).or_default() +=
-                occurrence as f64 / 1e6;
+                measured_reduction.kernel_critical_ms[kernel_index];
             *measured_operation_rows
                 .entry(operation.as_str())
                 .or_default() += 1;
@@ -673,6 +674,9 @@ fn build_iteration(
             "physical_kernels": physical_kernel_rows(item),
             "sync": item.synchronizing,
             "occ_ns": occurrence,
+            "selected_raw_ms": measured_reduction.kernel_raw_ms[kernel_index],
+            "selected_effective_ms": measured_reduction.kernel_effective_ms[kernel_index],
+            "selected_critical_ms": measured_reduction.kernel_critical_ms[kernel_index],
             "iv": launches
                 .iter()
                 .map(|launch| {

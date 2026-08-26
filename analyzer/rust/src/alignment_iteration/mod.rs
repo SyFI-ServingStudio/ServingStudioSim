@@ -425,17 +425,22 @@ struct IterationMeasurement {
     track_intervals: BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
 }
 
-/// One complete physical-device path after logical occurrences have been
-/// reduced across ranks. Keeping the selected device makes every consumer use
-/// the same path instead of independently combining maxima from several ranks.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// One complete physical-device path attributed from that device's intervals.
+#[derive(Clone, Debug, PartialEq)]
 struct MeasuredCriticalPath {
     device_id: Option<i64>,
     mapped_ms: f64,
     unmapped_ms: f64,
+    mapped_kernel_sum_ms: f64,
     kernel_sum_ms: f64,
     concurrent_hidden_ms: f64,
+    excluded_overlap_ms: f64,
+    collective_arrival_wait_ms: f64,
+    physical_path_ms: f64,
     critical_path_ms: f64,
+    kernel_raw_ms: Vec<f64>,
+    kernel_effective_ms: Vec<f64>,
+    kernel_critical_ms: Vec<f64>,
 }
 
 #[derive(Default)]
@@ -598,25 +603,18 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             aggregate.operation = item.operation.clone();
         }
 
-        // Reduce every measured logical occurrence across ranks, then charge it
-        // back to each participating rank. `measure_iteration` has already
-        // joined mapped rows that schema-v4 folding split by rank sequence.
-        let mut device_ops: BTreeMap<i64, BTreeMap<String, f64>> = BTreeMap::new();
+        let measured_reduction = measured_critical_path(&measurement);
+        let mut measured_ops: BTreeMap<String, f64> = BTreeMap::new();
         let mut measured_kernel_rows = Vec::with_capacity(measurement.kernels.len());
-        for (_, item) in &measurement.kernels {
+        for (kernel_index, (_, item)) in measurement.kernels.iter().enumerate() {
             let device_count = item.device_ids.len().max(1);
-            let duration_ms = occurrence_ns(&item.launches, item.synchronizing) as f64 / 1e6;
-            for device_id in &item.device_ids {
-                match &item.operation {
-                    Some(operation) => {
-                        *device_ops
-                            .entry(*device_id)
-                            .or_default()
-                            .entry(operation.clone())
-                            .or_default() += duration_ms;
-                    }
-                    None => {}
-                }
+            let reduced_duration_ms =
+                occurrence_ns(&item.launches, item.synchronizing) as f64 / 1e6;
+            let raw_duration_ms = measured_reduction.kernel_raw_ms[kernel_index];
+            let effective_duration_ms = measured_reduction.kernel_effective_ms[kernel_index];
+            let duration_ms = measured_reduction.kernel_critical_ms[kernel_index];
+            if let Some(operation) = &item.operation {
+                *measured_ops.entry(operation.clone()).or_default() += duration_ms;
             }
             let track_indices: BTreeSet<usize> =
                 item.launches.iter().map(|l| l.track_index).collect();
@@ -636,6 +634,12 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "rank_launches": item.launches.len(),
                 "replica_calls": item.launches.len() as f64 / device_count as f64,
                 "duration_ms": duration_ms,
+                "raw_duration_ms": raw_duration_ms,
+                "effective_duration_ms": effective_duration_ms,
+                "reduced_duration_ms": reduced_duration_ms,
+                "excluded_overlap_ms": (raw_duration_ms - effective_duration_ms).max(0.0),
+                "collective_arrival_wait_ms":
+                    (effective_duration_ms - duration_ms).max(0.0),
                 // Which concurrent track this position ran on, and how much of
                 // its own duration overlapped another track. A consumer drawing
                 // the measured lane can then mark the overlap where it actually
@@ -649,11 +653,6 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 "device_ids": item.device_ids,
             }));
         }
-        let measured_reduction = measured_critical_path(&measurement);
-        let measured_ops = measured_reduction
-            .device_id
-            .and_then(|device_id| device_ops.remove(&device_id))
-            .unwrap_or_default();
         // How much of each operation ran while another track was busy. This is
         // the evidence a cost-model decision needs: an operation that is almost
         // entirely hidden is not on the critical path even though its kernels
@@ -663,10 +662,12 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             &measurement.track_intervals,
             measured_reduction.device_id,
         );
-        let iteration_mapped_ms = measured_reduction.mapped_ms;
         let iteration_unmapped_measured_ms = measured_reduction.unmapped_ms;
         let measured_kernel_sum_ms = measured_reduction.kernel_sum_ms;
         let measured_concurrent_hidden_ms = measured_reduction.concurrent_hidden_ms;
+        let measured_excluded_overlap_ms = measured_reduction.excluded_overlap_ms;
+        let collective_arrival_wait_ms = measured_reduction.collective_arrival_wait_ms;
+        let measured_physical_path_ms = measured_reduction.physical_path_ms;
         let measured_critical_path_ms = measured_reduction.critical_path_ms;
         let measured_track_busy_ms = track_busy_ms(&measurement.track_intervals);
         // Feed the pooled duty-cycle multiplier. Only iterations that have a
@@ -767,18 +768,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             .filter_map(|row| row["critical_path_ms"].as_f64())
             .sum::<f64>();
 
-        // Headline totals use the critical-path sum, so per-operation rows and
-        // per-kernel segments add up to it. The busy union is kept for audit.
-        //
-        // Mapping coverage is deliberately NOT that number. It asks "which
-        // measured kernels did a label claim", so numerator and denominator must
-        // both be un-deducted per-occurrence sums: `iteration_mapped_ms` has no
-        // concurrency subtraction, and pairing it with the critical path lets a
-        // fully-labeled capture report over 100% coverage and a negative
-        // unmapped remainder. On a single-track capture the two are equal, so
-        // this distinction only becomes visible under stream concurrency.
+        // Coverage compares selected-device raw durations. Headline rows use
+        // interval-union contributions after collective arrival-wait removal.
         measured_workload_ms += measured_kernel_sum_ms;
-        measured_mapped_ms += iteration_mapped_ms;
+        measured_mapped_ms += measured_reduction.mapped_kernel_sum_ms;
         let delta_ms = sim.total_ms - measured_critical_path_ms;
         let relative_pct = ratio_pct(delta_ms, measured_critical_path_ms);
         cumulative_measured += measured_critical_path_ms;
@@ -797,8 +790,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "stage": joined.stage,
             "iteration_type": measured_iter.iteration_type,
             "measured_ms": measured_critical_path_ms,
+            "measured_physical_path_ms": measured_physical_path_ms,
             "measured_kernel_sum_ms": measured_kernel_sum_ms,
             "measured_concurrent_hidden_ms": measured_concurrent_hidden_ms,
+            "measured_excluded_overlap_ms": measured_excluded_overlap_ms,
+            "collective_arrival_wait_ms": collective_arrival_wait_ms,
             "critical_device_id": measured_reduction.device_id,
             "measured_busy_union_ms": measured_busy_union_ms,
             "simulated_ms": sim.total_ms,
@@ -815,8 +811,12 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "simulated_kernels": simulated_kernels,
             "phase_summary": phase_summaries,
             "operation_summary": operation_rows,
+            "measured_ms": measured_critical_path_ms,
+            "measured_physical_path_ms": measured_physical_path_ms,
             "measured_kernel_sum_ms": measured_kernel_sum_ms,
             "measured_concurrent_hidden_ms": measured_concurrent_hidden_ms,
+            "measured_excluded_overlap_ms": measured_excluded_overlap_ms,
+            "collective_arrival_wait_ms": collective_arrival_wait_ms,
             "critical_device_id": measured_reduction.device_id,
             "measured_track_busy": measured_track_busy_ms,
             "simulated_leaf_workload_ms": simulated_leaf_workload_ms,
@@ -2464,52 +2464,92 @@ fn occurrence_ns(launches: &[KernelLaunch], synchronizing: bool) -> u64 {
     }
 }
 
-/// Reduce an iteration on each physical device, then select the longest whole
-/// path. This order matters for DP-divergent runs: taking the largest mapped,
-/// unmapped, and overlap components independently can splice together a path
-/// that no device executed.
+/// Build each physical device's interval-union path, then select the longest.
+///
+/// Attribution assigns shared time to the earlier launch, making every kernel's
+/// contribution explicit while keeping their sum equal to the device busy
+/// union. Synchronizing occurrences are capped by their cross-rank reduced
+/// duration so collective arrival wait remains wall-clock evidence.
 fn measured_critical_path(measurement: &IterationMeasurement) -> MeasuredCriticalPath {
-    let mut mapped_by_device: BTreeMap<i64, f64> = BTreeMap::new();
-    let mut unmapped_by_device: BTreeMap<i64, f64> = BTreeMap::new();
-    for (_, kernel) in &measurement.kernels {
-        let duration_ms = occurrence_ns(&kernel.launches, kernel.synchronizing) as f64 / 1e6;
-        let totals = if kernel.operation.is_some() {
-            &mut mapped_by_device
-        } else {
-            &mut unmapped_by_device
-        };
-        for device_id in &kernel.device_ids {
-            *totals.entry(*device_id).or_default() += duration_ms;
-        }
-    }
-
     let hidden_by_device = concurrent_hidden_ms_by_device(&measurement.track_intervals);
-    let device_ids: BTreeSet<i64> = measurement
-        .device_ids
-        .iter()
-        .chain(mapped_by_device.keys())
-        .chain(unmapped_by_device.keys())
-        .chain(hidden_by_device.keys())
-        .copied()
-        .collect();
-
     let mut selected: Option<MeasuredCriticalPath> = None;
-    for device_id in device_ids {
-        let mapped_ms = mapped_by_device.get(&device_id).copied().unwrap_or(0.0);
-        let unmapped_ms = unmapped_by_device.get(&device_id).copied().unwrap_or(0.0);
-        let kernel_sum_ms = mapped_ms + unmapped_ms;
-        let concurrent_hidden_ms = hidden_by_device
-            .get(&device_id)
-            .copied()
-            .unwrap_or(0.0)
-            .min(kernel_sum_ms);
+    for device_id in &measurement.device_ids {
+        let mut launches = Vec::new();
+        let mut kernel_raw_ns = vec![0u64; measurement.kernels.len()];
+        for (kernel_index, (_, kernel)) in measurement.kernels.iter().enumerate() {
+            for launch in &kernel.launches {
+                if launch.device_id == *device_id {
+                    launches.push((
+                        launch.start_ns,
+                        launch.end_ns,
+                        kernel_index,
+                        launch.track_index,
+                    ));
+                    kernel_raw_ns[kernel_index] += launch.end_ns.saturating_sub(launch.start_ns);
+                }
+            }
+        }
+        // Wider intervals win equal-start ties, so attribution is independent
+        // of physical inventory-row insertion order.
+        launches.sort_unstable_by_key(|(start, end, kernel_index, track_index)| {
+            (*start, std::cmp::Reverse(*end), *track_index, *kernel_index)
+        });
+        let mut kernel_effective_ns = vec![0u64; measurement.kernels.len()];
+        let mut covered_end = None;
+        for (start_ns, end_ns, kernel_index, _) in launches {
+            let uncovered_start = covered_end.map_or(start_ns, |end: u64| end.max(start_ns));
+            if end_ns > uncovered_start {
+                kernel_effective_ns[kernel_index] += end_ns - uncovered_start;
+            }
+            covered_end = Some(covered_end.map_or(end_ns, |end| end.max(end_ns)));
+        }
+
+        let mut kernel_critical_ns = kernel_effective_ns.clone();
+        for (kernel_index, (_, kernel)) in measurement.kernels.iter().enumerate() {
+            if kernel.synchronizing {
+                kernel_critical_ns[kernel_index] =
+                    kernel_critical_ns[kernel_index].min(occurrence_ns(&kernel.launches, true));
+            }
+        }
+
+        let mut mapped_ns = 0u64;
+        let mut unmapped_ns = 0u64;
+        let mut mapped_kernel_sum_ns = 0u64;
+        for (kernel_index, (_, kernel)) in measurement.kernels.iter().enumerate() {
+            if kernel.operation.is_some() {
+                mapped_ns += kernel_critical_ns[kernel_index];
+                mapped_kernel_sum_ns += kernel_raw_ns[kernel_index];
+            } else {
+                unmapped_ns += kernel_critical_ns[kernel_index];
+            }
+        }
+        let kernel_sum_ns = kernel_raw_ns.iter().sum::<u64>();
+        let physical_path_ns = kernel_effective_ns.iter().sum::<u64>();
+        let critical_path_ns = mapped_ns + unmapped_ns;
         let candidate = MeasuredCriticalPath {
-            device_id: Some(device_id),
-            mapped_ms,
-            unmapped_ms,
-            kernel_sum_ms,
-            concurrent_hidden_ms,
-            critical_path_ms: kernel_sum_ms - concurrent_hidden_ms,
+            device_id: Some(*device_id),
+            mapped_ms: mapped_ns as f64 / 1e6,
+            unmapped_ms: unmapped_ns as f64 / 1e6,
+            mapped_kernel_sum_ms: mapped_kernel_sum_ns as f64 / 1e6,
+            kernel_sum_ms: kernel_sum_ns as f64 / 1e6,
+            concurrent_hidden_ms: hidden_by_device.get(device_id).copied().unwrap_or(0.0),
+            excluded_overlap_ms: kernel_sum_ns.saturating_sub(physical_path_ns) as f64 / 1e6,
+            collective_arrival_wait_ms: physical_path_ns.saturating_sub(critical_path_ns) as f64
+                / 1e6,
+            physical_path_ms: physical_path_ns as f64 / 1e6,
+            critical_path_ms: critical_path_ns as f64 / 1e6,
+            kernel_raw_ms: kernel_raw_ns
+                .into_iter()
+                .map(|ns| ns as f64 / 1e6)
+                .collect(),
+            kernel_effective_ms: kernel_effective_ns
+                .into_iter()
+                .map(|ns| ns as f64 / 1e6)
+                .collect(),
+            kernel_critical_ms: kernel_critical_ns
+                .into_iter()
+                .map(|ns| ns as f64 / 1e6)
+                .collect(),
         };
         // `device_ids` is ordered, so an exact tie keeps the lower device id.
         if selected.as_ref().map_or(true, |current| {
@@ -2523,9 +2563,16 @@ fn measured_critical_path(measurement: &IterationMeasurement) -> MeasuredCritica
         device_id: None,
         mapped_ms: 0.0,
         unmapped_ms: 0.0,
+        mapped_kernel_sum_ms: 0.0,
         kernel_sum_ms: 0.0,
         concurrent_hidden_ms: 0.0,
+        excluded_overlap_ms: 0.0,
+        collective_arrival_wait_ms: 0.0,
+        physical_path_ms: 0.0,
         critical_path_ms: 0.0,
+        kernel_raw_ms: vec![0.0; measurement.kernels.len()],
+        kernel_effective_ms: vec![0.0; measurement.kernels.len()],
+        kernel_critical_ms: vec![0.0; measurement.kernels.len()],
     })
 }
 
@@ -2728,9 +2775,12 @@ fn signed_stats(samples: &[f64]) -> Value {
 
 fn definitions() -> Value {
     json!({
-        "measured_ms": "replica critical path: reduce every occurrence across ranks, combine mapped work, unmapped work, and stream overlap on each device, then select the longest complete device path. This is the baseline compared to the sim cost tree",
-        "measured_kernel_sum_ms": "mapped plus unmapped occurrence costs on the selected critical device, before subtracting that device's stream overlap",
-        "measured_concurrent_hidden_ms": "overlap on the selected critical device = sum of per-track busy unions minus their combined union. Components from different devices are never mixed; a single-stream capture is unchanged",
+        "measured_ms": "selected physical-device interval-union path after removing synchronizing collective arrival wait. Every kernel and operation contribution comes from this same device and adds to this baseline",
+        "measured_physical_path_ms": "selected device's physical kernel busy union before collective arrival-wait removal",
+        "measured_kernel_sum_ms": "literal sum of selected-device kernel durations before removing any same-track or cross-track overlap",
+        "measured_concurrent_hidden_ms": "cross-track overlap subset on the selected device = sum of per-track busy unions minus their combined union",
+        "measured_excluded_overlap_ms": "all overlap removed from the selected path = measured_kernel_sum_ms - measured_physical_path_ms; includes same-track PDL and cross-track overlap",
+        "collective_arrival_wait_ms": "selected-device physical path time removed by synchronizing cross-rank reduction",
         "critical_device_id": "the physical device whose complete reduced path supplies measured_ms and all measured headline components",
         "measured_track_busy": "per device and concurrent track, that track own busy union and launch count. Which track the hidden time came from, not only that some was hidden",
         "operation_measured_concurrent_hidden_ms": "how much of this operation measured time ran while an EARLIER track on the same device was already busy. The overlap of two tracks is one shared stretch of wall clock, so it is charged only to the later-starting side; that is what makes these rows sum to the iteration measured_concurrent_hidden_ms instead of twice it, and it puts the hidden time on the side stream that joined a busy device. An operation that is almost entirely hidden is not on the critical path even though its kernels are real work. This is measurement evidence about the framework schedule; it is NOT a CostTree instruction, and in particular must not become a CostNode::Max, whose children are interchangeable cross-rank replicas (optimality R2 reads Max as load imbalance)",
@@ -3093,6 +3143,83 @@ mod tests {
         assert_eq!(reduced.unmapped_ms, 2.0);
         assert_eq!(reduced.concurrent_hidden_ms, 0.0);
         assert_eq!(reduced.critical_path_ms, 27.0);
+    }
+
+    #[test]
+    fn measured_path_does_not_copy_cross_rank_maxima_onto_every_device() {
+        let first = mapped_row("first/0", &[(0, 0, 10_000_000), (1, 0, 20_000_000)], false);
+        let second = mapped_row(
+            "second/0",
+            &[(0, 10_000_000, 30_000_000), (1, 20_000_000, 30_000_000)],
+            false,
+        );
+        let measurement = IterationMeasurement {
+            kernels: vec![first, second],
+            inventory_kernels: Vec::new(),
+            phase_summaries: Vec::new(),
+            device_ids: BTreeSet::from([0, 1]),
+            busy_union_ms: 30.0,
+            track_intervals: tracks(&[
+                (0, 0, &[(0, 10_000_000), (10_000_000, 30_000_000)]),
+                (1, 0, &[(0, 20_000_000), (20_000_000, 30_000_000)]),
+            ]),
+        };
+
+        let reduced = measured_critical_path(&measurement);
+
+        assert_eq!(reduced.device_id, Some(0));
+        assert_eq!(reduced.kernel_sum_ms, 30.0);
+        assert_eq!(reduced.physical_path_ms, 30.0);
+        assert_eq!(reduced.critical_path_ms, 30.0);
+    }
+
+    #[test]
+    fn measured_path_unions_same_track_pdl_overlap() {
+        let first = mapped_row("first/0", &[(0, 0, 10_000_000)], false);
+        let second = mapped_row("second/0", &[(0, 5_000_000, 15_000_000)], false);
+        let measurement = IterationMeasurement {
+            kernels: vec![first, second],
+            inventory_kernels: Vec::new(),
+            phase_summaries: Vec::new(),
+            device_ids: BTreeSet::from([0]),
+            busy_union_ms: 15.0,
+            track_intervals: tracks(&[(0, 0, &[(0, 10_000_000), (5_000_000, 15_000_000)])]),
+        };
+
+        let reduced = measured_critical_path(&measurement);
+
+        assert_eq!(reduced.kernel_sum_ms, 20.0);
+        assert_eq!(reduced.concurrent_hidden_ms, 0.0);
+        assert_eq!(reduced.excluded_overlap_ms, 5.0);
+        assert_eq!(reduced.physical_path_ms, 15.0);
+        assert_eq!(reduced.critical_path_ms, 15.0);
+    }
+
+    #[test]
+    fn measured_path_removes_collective_arrival_wait_after_overlap() {
+        let collective = mapped_row(
+            "collective/0",
+            &[(0, 0, 10_000_000), (1, 4_000_000, 10_000_000)],
+            true,
+        );
+        let measurement = IterationMeasurement {
+            kernels: vec![collective],
+            inventory_kernels: Vec::new(),
+            phase_summaries: Vec::new(),
+            device_ids: BTreeSet::from([0, 1]),
+            busy_union_ms: 10.0,
+            track_intervals: tracks(&[
+                (0, 0, &[(0, 10_000_000)]),
+                (1, 0, &[(4_000_000, 10_000_000)]),
+            ]),
+        };
+
+        let reduced = measured_critical_path(&measurement);
+
+        assert_eq!(reduced.device_id, Some(0));
+        assert_eq!(reduced.physical_path_ms, 10.0);
+        assert_eq!(reduced.collective_arrival_wait_ms, 4.0);
+        assert_eq!(reduced.critical_path_ms, 6.0);
     }
 
     #[test]

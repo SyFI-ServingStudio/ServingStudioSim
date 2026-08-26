@@ -451,9 +451,10 @@ not a join key. Independent data-parallel schedulers can have diverging counters
 so the parser instead pairs only mutual, unique overlaps of attributed GPU-kernel
 envelopes. Missing kernel evidence, ambiguous overlap, and incomplete phase
 inventory remain explicitly unpaired. Analysis applies labels independently to
-each rank and reduces per occurrence across ranks (an independent op takes the
-max-rank duration; a synchronizing collective takes `max(end) - max(start)`,
-dropping arrival wait), never by summing GPU durations. The kernel-align
+each rank, then builds one interval-union path per physical device. A
+synchronizing collective is capped by `max(end) - max(start)` to remove arrival
+wait; independent work keeps the selected device's own contribution. The
+longest complete device path supplies the headline. The kernel-align
 multiplier is derived from this same per-occurrence measured population, so its
 `measured_ms` numerator matches the breakdown the analyzer reports.
 
@@ -483,14 +484,11 @@ resets `after` / `after_name` / `before_name` at the boundary, because those
 evidence keys mean "in the same execution stream" and there is no *before*
 between two things that ran at once.
 
-**Concurrency is subtracted, not summed.** `measured_concurrent_hidden_ms` is,
-per device, `Σ per-track busy union − union across tracks` — exactly the time
-the GPU was busy on more than one stream, which summing per-occurrence durations
-counts twice. `measured_ms` is `measured_kernel_sum_ms` minus that, and the
-duty-cycle multiplier uses the corrected denominator. With one track the two
-unions are the same and the difference is exactly zero, so every single-stream
-capture's numbers are unchanged bit for bit; the per-occurrence reductions above
-are untouched either way.
+**Concurrency is unioned, not summed.** The selected device's physical kernel
+intervals are unioned before collective arrival wait is removed. This counts
+both same-stream PDL and multi-stream overlap once. `measured_excluded_overlap_ms`
+reports the full deduction; `measured_concurrent_hidden_ms` retains the narrower
+cross-stream subset as audit evidence.
 
 Per operation and per measured kernel, `concurrent_hidden_ms` charges that
 overlap to the **later-starting track only** — the side stream that joined a
