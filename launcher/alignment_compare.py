@@ -79,9 +79,7 @@ def _operations(report: dict[str, Any], context: str) -> dict[str, dict[str, flo
         operation = row["operation"]
         if operation in operations:
             raise ValueError(f"{context}.operations repeats {operation!r}")
-        aggregate = _aggregate(
-            row.get("comparison"), f"{context}.operations[{index}].comparison"
-        )
+        aggregate = _aggregate(row.get("comparison"), f"{context}.operations[{index}].comparison")
         for field in ("missing_measured", "missing_simulated"):
             count = row.get(field)
             if not isinstance(count, int) or isinstance(count, bool) or count < 0:
@@ -108,9 +106,9 @@ def _paired_change(
     for metric in change_metrics:
         before = baseline.get(metric) if baseline else None
         after = candidate.get(metric) if candidate else None
-        row[f"change_{metric}"] = float(after) - float(before) if (
-            before is not None and after is not None
-        ) else None
+        row[f"change_{metric}"] = (
+            float(after) - float(before) if (before is not None and after is not None) else None
+        )
     return row
 
 

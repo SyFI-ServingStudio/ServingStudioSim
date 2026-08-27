@@ -882,6 +882,7 @@ _TFLOPS_FIELD = {
     "bf16": "bf16_tflops",
     "fp16": "fp16_tflops",
     "fp8": "fp8_tflops",
+    "fp4": "fp4_tflops",
     "fp32": "fp32_tflops",
 }
 

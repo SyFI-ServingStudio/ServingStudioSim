@@ -36,8 +36,9 @@ def test_registry_contract_and_capability_gate():
     assert spec.gpu_count_fn is not None
     assert spec.gpu_count_fn({"num_gpus": 4}) == 4
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
+    assert not spec.supports.allows(DType.FP16, gpu="NVIDIA B200")
 
 
 def test_kernel_import_is_lazy():

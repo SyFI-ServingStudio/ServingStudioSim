@@ -79,14 +79,14 @@ def test_v_up_registration_reuses_kind_table_args_and_facade():
 
 
 @pytest.mark.parametrize("backend", [_Q_BACKEND, _V_UP_BACKEND])
-def test_backend_support_is_bf16_h200_only(backend):
+def test_backend_support_is_bf16_h200_and_b200(backend):
     support = find_kernel_profiler_spec(KIND, backend).supports
 
     assert support.allows(DType.BF16, gpu="NVIDIA H200")
     assert not support.allows(DType.FP16, gpu="NVIDIA H200")
     assert not support.allows(DType.FP32, gpu="NVIDIA H200")
     assert not support.allows(DType.BF16, gpu="NVIDIA H100")
-    assert not support.allows(DType.BF16, gpu="NVIDIA B200")
+    assert support.allows(DType.BF16, gpu="NVIDIA B200")
 
 
 def test_registry_barrel_import_is_lazy():
@@ -200,7 +200,7 @@ def test_runner_rejects_missing_cuda_and_unverified_gpu():
     )
     with pytest.raises(
         ProfilerNotImplemented,
-        match="verified only on NVIDIA H200, got NVIDIA H100",
+        match=r"verified only on \['NVIDIA B200', 'NVIDIA H200'\], got NVIDIA H100",
     ):
         _validate_cuda_device(h100)
 
@@ -266,7 +266,7 @@ def test_v_up_rejects_missing_cuda_and_unverified_gpu():
     )
     with pytest.raises(
         ProfilerNotImplemented,
-        match="verified only on NVIDIA H200, got NVIDIA H100",
+        match=r"verified only on \['NVIDIA B200', 'NVIDIA H200'\], got NVIDIA H100",
     ):
         _validate_v_up_cuda_device(h100)
 

@@ -33,3 +33,23 @@ def test_container_worker_mounts_only_exchange_and_cache(tmp_path: Path, monkeyp
         "--worker-output",
         "/io/output.json",
     ]
+
+
+def test_container_worker_mounts_explicit_additional_volume(tmp_path: Path, monkeypatch) -> None:
+    exchange_dir = tmp_path / "exchange"
+    cache_dir = tmp_path / "cache"
+    measurement_dir = tmp_path / "measurement"
+    exchange_dir.mkdir()
+    measurement_dir.mkdir()
+    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(cache_dir))
+
+    command, _env = _container_worker_command(
+        ContainerProfileEnv("vllm_env", "profiler:test"),
+        [4],
+        exchange_dir,
+        additional_volumes=((measurement_dir, measurement_dir.resolve()),),
+    )
+
+    measurement_mount = f"{measurement_dir.resolve()}:{measurement_dir.resolve()}"
+    assert measurement_mount in command
+    assert command.index(measurement_mount) < command.index("profiler:test")

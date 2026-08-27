@@ -963,9 +963,7 @@ def test_req_frontend_invocation_selects_vllm_tokens_backend(tmp_path, monkeypat
         load_runner.subprocess, "run", lambda argv, **kwargs: commands.append((argv, kwargs))
     )
 
-    result = load_runner.run_replay(
-        config, prepared, base_url="http://localhost:8000", model="m"
-    )
+    result = load_runner.run_replay(config, prepared, base_url="http://localhost:8000", model="m")
 
     argv = commands[0][0]
     assert argv[argv.index("--backend") + 1] == "vllm-tokens"
@@ -1003,14 +1001,10 @@ def test_req_frontend_invocation_passes_no_context_policy(tmp_path, monkeypatch)
         load_runner.subprocess, "run", lambda argv, **kwargs: commands.append((argv, kwargs))
     )
 
-    result = load_runner.run_replay(
-        config, prepared, base_url="http://localhost:8000", model="m"
-    )
+    result = load_runner.run_replay(config, prepared, base_url="http://localhost:8000", model="m")
 
     argv = commands[0][0]
-    assert (
-        argv[argv.index("--input-file-format") + 1] == "text-generation-session-execution-v2"
-    )
+    assert argv[argv.index("--input-file-format") + 1] == "text-generation-session-execution-v2"
     assert "--session-context-policy" not in argv
     assert "session_context_policy" not in result
 
@@ -1169,8 +1163,7 @@ def test_profile_resume_flag_reaches_the_runner(tmp_path, monkeypatch):
         alignment_launcher,
         "run_profile",
         lambda config, *, resume=False: (
-            resumed.append(resume)
-            or {"parsed_nsys": str(tmp_path / "profile_run" / "parsed.json")}
+            resumed.append(resume) or {"parsed_nsys": str(tmp_path / "profile_run" / "parsed.json")}
         ),
     )
 

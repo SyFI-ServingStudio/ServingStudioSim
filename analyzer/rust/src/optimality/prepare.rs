@@ -205,6 +205,8 @@ fn is_communication_kind(kind: &str) -> bool {
     matches!(
         kind,
         "all_reduce"
+            | "all_reduce_fusion"
+            | "all_reduce_residual_rms_norm"
             | "all_gather"
             | "reduce_scatter"
             | "all_to_all"
@@ -227,6 +229,12 @@ mod tests {
     fn moe_exchange_is_communication_but_its_local_prepare_is_not() {
         assert!(is_communication_kind("moe_alltoall"));
         assert!(!is_communication_kind("moe_alltoall_prepare"));
+    }
+
+    #[test]
+    fn fused_all_reduce_kinds_remain_communication() {
+        assert!(is_communication_kind("all_reduce_fusion"));
+        assert!(is_communication_kind("all_reduce_residual_rms_norm"));
     }
 
     #[test]

@@ -122,6 +122,11 @@ def test_registration_support_and_facades():
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA H100",
     )
+    assert not spec.supports.allows(
+        DType.FP8_E4M3,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
+    )
     assert hasattr(perf_api, "get_dsa_paged_mqa_logits_decode_times")
     assert hasattr(perf_api, "count_missing_dsa_paged_mqa_logits_decode")
 
@@ -142,7 +147,16 @@ def test_deepgemm_registration_reuses_kind_table_args_family_and_facades():
     assert deepgemm_spec.runner_ref.function_name == (
         "profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8"
     )
-    assert deepgemm_spec.supports == torch_spec.supports
+    assert deepgemm_spec.supports.allows(
+        DType.FP8_E4M3,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA H200",
+    )
+    assert deepgemm_spec.supports.allows(
+        DType.FP8_E4M3,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
+    )
     assert hasattr(perf_api, "get_dsa_paged_mqa_logits_decode_times")
     assert hasattr(perf_api, "count_missing_dsa_paged_mqa_logits_decode")
 
@@ -312,7 +326,10 @@ def test_deepgemm_rejects_cuda_gpu_and_sm_count_mismatches():
             get_device_name=lambda _device: "NVIDIA H100",
         )
     )
-    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
+    with pytest.raises(
+        ProfilerNotImplemented,
+        match="verified only on NVIDIA H200 or NVIDIA B200",
+    ):
         _validate_deepgemm_cuda_device(h100)
 
     wrong_sm_count = SimpleNamespace(
@@ -323,8 +340,26 @@ def test_deepgemm_rejects_cuda_gpu_and_sm_count_mismatches():
             get_device_properties=lambda _device: SimpleNamespace(multi_processor_count=130),
         )
     )
-    with pytest.raises(ProfilerNotImplemented, match="132-SM H200"):
+    with pytest.raises(ProfilerNotImplemented, match="132-SM NVIDIA H200"):
         _validate_deepgemm_cuda_device(wrong_sm_count)
+
+    b200 = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: "NVIDIA B200",
+            get_device_properties=lambda _device: SimpleNamespace(multi_processor_count=148),
+        )
+    )
+    assert _validate_deepgemm_cuda_device(b200) == 148
+
+
+def test_deepgemm_cupti_filter_is_architecture_agnostic():
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+        _DEEPGEMM_KERNEL_NAME,
+    )
+
+    assert _DEEPGEMM_KERNEL_NAME == "fp8_paged_mqa_logits"
 
 
 def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatch):

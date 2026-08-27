@@ -168,9 +168,11 @@ How it differs from the cache verbs:
 - **Exactly one spec.** `measure` rejects a multi-spec batch.
 - Runs a single CUPTI window of `--duration-s` (default 10 s), records **every**
   per-launch kernel duration, samples NVML telemetry on a background thread at
-  `--telemetry-hz` (default 20 Hz), and writes `runtimes.csv`, `telemetry.csv`,
-  `summary.json`, and two `.png` plots to `--output-dir` (default
-  `./measure_<table>_<backend>`).
+  `--telemetry-hz` (default 20 Hz), and always writes `runtimes.csv`,
+  `telemetry.csv`, and `summary.json` to `--output-dir` (default
+  `./measure_<table>_<backend>`). It also writes two `.png` plots when matplotlib
+  is installed in the selected profiling environment; otherwise the summary
+  records them as skipped and the measurement still succeeds.
 - `--no-clear-l2` switches from the default cold per-launch L2 displacement
   (which matches the `profile.db` measurement) to a warm continuous window that
   surfaces sustained power/clock drift.

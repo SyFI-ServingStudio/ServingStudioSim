@@ -12,6 +12,7 @@ kernel kind owns its Python wire format and registry presence.
 
 from profiling.kernels import (
     all_reduce,  # noqa: F401
+    all_reduce_fusion,  # noqa: F401
     all_reduce_residual_rms_norm,  # noqa: F401
     batched_gemm,  # noqa: F401
     clamped_swiglu,  # noqa: F401
@@ -34,6 +35,7 @@ from profiling.kernels import (
     dsa_persistent_topk_decode,  # noqa: F401
     dsa_sparse_index_remap,  # noqa: F401
     dsa_sparse_mla_attention,  # noqa: F401
+    dsa_sparse_mla_prefill,  # noqa: F401
     dsa_topk_prefill,  # noqa: F401
     elementwise,  # noqa: F401
     flashinfer_attn_decode,  # noqa: F401

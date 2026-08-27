@@ -27,6 +27,7 @@ _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _CONTEXT_MODE = "uniform"
 _REQUIRED_GPU = "NVIDIA H200"
+_VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _WORKSPACE_BYTES = 1024 * 1024
 
 
@@ -129,17 +130,19 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any, *, backend: str = "torch") -> None:
+def _validate_cuda_device(torch: Any, *, backend: str = "torch") -> str:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(
             f"CUDA is required for the {backend} dsa_persistent_topk_decode backend"
         )
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
+    supported_gpus = _VLLM_SUPPORTED_GPUS if backend == "vllm_cuda" else (_REQUIRED_GPU,)
+    if gpu_name not in supported_gpus:
         raise ProfilerNotImplemented(
             f"{backend} dsa_persistent_topk_decode is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
+            f"{' or '.join(supported_gpus)}, got {gpu_name}"
         )
+    return gpu_name
 
 
 def _build_common_operands(
@@ -370,6 +373,7 @@ def _validate_native_semantics(
     *,
     top_k: int,
     max_seq_len: int,
+    strict_reference: bool = True,
 ) -> None:
     """Compare corrected native output with the committed semantic reference."""
     from profiling.runners.attention.dsa_persistent_topk_decode_reference import (
@@ -409,7 +413,13 @@ def _validate_native_semantics(
     if long_rows.numel():
         actual_long = operands.out.index_select(0, long_rows).to(torch.int64)
         expected_long = expected.index_select(0, long_rows).to(torch.int64)
-        if not torch.equal(
+        if bool((actual_long < 0).any()) or bool(
+            (actual_long >= operands.flat_lengths.index_select(0, long_rows).unsqueeze(1)).any()
+        ):
+            raise RuntimeError("persistent CUDA returned an out-of-range long-row index")
+        if bool((actual_long.sort(dim=1).values.diff(dim=1) == 0).any()):
+            raise RuntimeError("persistent CUDA returned duplicate long-row indices")
+        if strict_reference and not torch.equal(
             actual_long.sort(dim=1).values,
             expected_long.sort(dim=1).values,
         ):
@@ -417,7 +427,7 @@ def _validate_native_semantics(
         long_logits = operands.logits.index_select(0, long_rows)
         actual_values = long_logits.gather(1, actual_long)
         expected_values = long_logits.gather(1, expected_long)
-        if not torch.equal(
+        if strict_reference and not torch.equal(
             actual_values.sort(dim=1).values,
             expected_values.sort(dim=1).values,
         ):
@@ -545,6 +555,16 @@ def profile_dsa_persistent_topk_decode_torch(
 
 
 def _load_native_op(torch: Any) -> Any:
+    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
+    if gpu_name == "NVIDIA B200":
+        try:
+            from vllm import _custom_ops  # noqa: F401
+        except ImportError as exc:
+            raise ProfilerNotImplemented(
+                "the instrumented vLLM extension is required for B200 persistent top-k"
+            ) from exc
+        return torch.ops._C.persistent_topk
+
     from profiling.runners.attention.dsa_persistent_topk_native import (
         NativeExtensionBuildError,
         NativeExtensionLoadError,
@@ -600,7 +620,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             "torch is required for the vllm_cuda dsa_persistent_topk_decode backend"
         ) from exc
 
-    _validate_cuda_device(torch, backend="vllm_cuda")
+    gpu_name = _validate_cuda_device(torch, backend="vllm_cuda")
     op = _load_native_op(torch)
 
     try:
@@ -620,6 +640,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             operands,
             top_k=top_k,
             max_seq_len=context_len,
+            strict_reference=gpu_name != "NVIDIA B200",
         )
 
         def kernel() -> None:

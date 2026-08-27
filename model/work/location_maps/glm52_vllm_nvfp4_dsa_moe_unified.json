@@ -1,0 +1,624 @@
+{
+  "schema_version": 1,
+  "mapping_id": "glm52-vllm-nvfp4-dsa-moe-unified-v1",
+  "arch_types": [
+    "glm52_vllm_nvfp4_dsa_moe"
+  ],
+  "locations": [
+    {
+      "location": "unified.body.dense_full_index.attention.fused_qkv_a_proj",
+      "semantics": [
+        "dense_full_index.fused_qkv_a_proj"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.decode_logits",
+      "semantics": [
+        "dense_full_index.indexer.decode"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.decode_pack",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.decode_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.decode_unpack",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.index_cache_append",
+      "semantics": [
+        "dense_full_index.index_cache_append"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.k_layernorm",
+      "semantics": [
+        "dense_full_index.indexer_k_norm"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.prefill_cache_gather",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.prefill_logits",
+      "semantics": [
+        "dense_full_index.indexer.prefill"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.prefill_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.q_proj",
+      "semantics": [
+        "dense_full_index.indexer.q_proj"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.q_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.rope",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.topk_buffer_fill",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.weight_scale",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.indexer.wk_weights_proj",
+      "semantics": [
+        "dense_full_index.indexer.wk",
+        "dense_full_index.indexer.weights_proj"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.input_add_rms_norm",
+      "semantics": [
+        "dense_full_index.input_norm"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.kv_a_rms_norm",
+      "semantics": [
+        "dense_full_index.kv_a_norm"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.main_rope",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.o_proj",
+      "semantics": [
+        "dense_full_index.o_proj"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.q_a_rms_norm",
+      "semantics": [
+        "dense_full_index.q_a_norm"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.q_absorb",
+      "semantics": [
+        "dense_full_index.q_absorb"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.q_b_proj",
+      "semantics": [
+        "dense_full_index.q_b_proj"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.sparse_mla.decode",
+      "semantics": [
+        "dense_full_index.attn.decode"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.sparse_mla.index_remap",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.sparse_mla.mla_cache_append",
+      "semantics": [
+        "dense_full_index.mla_cache_append"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.sparse_mla.prefill",
+      "semantics": [
+        "dense_full_index.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.sparse_mla.query_concat",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.dense_full_index.attention.v_up",
+      "semantics": [
+        "dense_full_index.v_up"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.ffn.down_proj",
+      "semantics": [
+        "dense_full_index.down"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.ffn.gate_up_proj",
+      "semantics": [
+        "dense_full_index.gate_up"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.ffn.post_attn_add_rms_norm",
+      "semantics": [
+        "dense_full_index.post_norm"
+      ]
+    },
+    {
+      "location": "unified.body.dense_full_index.ffn.silu_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+      "semantics": [
+        "sparse_cycle_full_index.fused_qkv_a_proj"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.decode_logits",
+      "semantics": [
+        "sparse_cycle_full_index.indexer.decode"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.decode_pack",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.decode_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.decode_unpack",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.index_cache_append",
+      "semantics": [
+        "sparse_cycle_full_index.index_cache_append"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.k_layernorm",
+      "semantics": [
+        "sparse_cycle_full_index.indexer_k_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.prefill_cache_gather",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.prefill_logits",
+      "semantics": [
+        "sparse_cycle_full_index.indexer.prefill"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.prefill_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.q_proj",
+      "semantics": [
+        "sparse_cycle_full_index.indexer.q_proj"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.q_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.rope",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.topk_buffer_fill",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.weight_scale",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.indexer.wk_weights_proj",
+      "semantics": [
+        "sparse_cycle_full_index.indexer.wk",
+        "sparse_cycle_full_index.indexer.weights_proj"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.input_add_rms_norm",
+      "semantics": [
+        "sparse_cycle_full_index.input_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.kv_a_rms_norm",
+      "semantics": [
+        "sparse_cycle_full_index.kv_a_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.main_rope",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.o_proj",
+      "semantics": [
+        "sparse_cycle_full_index.o_proj"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.q_a_rms_norm",
+      "semantics": [
+        "sparse_cycle_full_index.q_a_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.q_absorb",
+      "semantics": [
+        "sparse_cycle_full_index.q_absorb"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.q_b_proj",
+      "semantics": [
+        "sparse_cycle_full_index.q_b_proj"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.sparse_mla.decode",
+      "semantics": [
+        "sparse_cycle_full_index.attn.decode"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.sparse_mla.mla_cache_append",
+      "semantics": [
+        "sparse_cycle_full_index.mla_cache_append"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.sparse_mla.prefill",
+      "semantics": [
+        "sparse_cycle_full_index.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.sparse_mla.query_concat",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.attention.v_up",
+      "semantics": [
+        "sparse_cycle_full_index.v_up"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.moe.routed_experts.fused_moe",
+      "semantics": [
+        "sparse_cycle_full_index.expert_gate_up",
+        "sparse_cycle_full_index.expert_down"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.moe.routed_experts.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.moe.router.post_attn_add_rms_norm",
+      "semantics": [
+        "sparse_cycle_full_index.post_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+      "semantics": [
+        "sparse_cycle_full_index.router"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.moe.shared_expert.down_proj",
+      "semantics": [
+        "sparse_cycle_full_index.shared_down"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+      "semantics": [
+        "sparse_cycle_full_index.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_full_index.moe.shared_expert.silu_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+      "semantics": [
+        "sparse_cycle_index_share.fused_qkv_a_proj"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.input_add_rms_norm",
+      "semantics": [
+        "sparse_cycle_index_share.input_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.kv_a_rms_norm",
+      "semantics": [
+        "sparse_cycle_index_share.kv_a_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.main_rope",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.o_proj",
+      "semantics": [
+        "sparse_cycle_index_share.o_proj"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.q_a_rms_norm",
+      "semantics": [
+        "sparse_cycle_index_share.q_a_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.q_absorb",
+      "semantics": [
+        "sparse_cycle_index_share.q_absorb"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.q_b_proj",
+      "semantics": [
+        "sparse_cycle_index_share.q_b_proj"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.sparse_mla.decode",
+      "semantics": [
+        "sparse_cycle_index_share.attn.decode"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.sparse_mla.mla_cache_append",
+      "semantics": [
+        "sparse_cycle_index_share.mla_cache_append"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.sparse_mla.prefill",
+      "semantics": [
+        "sparse_cycle_index_share.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.sparse_mla.query_concat",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.attention.v_up",
+      "semantics": [
+        "sparse_cycle_index_share.v_up"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.moe.routed_experts.fused_moe",
+      "semantics": [
+        "sparse_cycle_index_share.expert_gate_up",
+        "sparse_cycle_index_share.expert_down"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.moe.routed_experts.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.moe.router.post_attn_add_rms_norm",
+      "semantics": [
+        "sparse_cycle_index_share.post_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+      "semantics": [
+        "sparse_cycle_index_share.router"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.moe.shared_expert.down_proj",
+      "semantics": [
+        "sparse_cycle_index_share.shared_down"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+      "semantics": [
+        "sparse_cycle_index_share.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_cycle_index_share.moe.shared_expert.silu_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.fused_qkv_a_proj",
+      "semantics": [
+        "sparse_initial_index_share.fused_qkv_a_proj"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.input_add_rms_norm",
+      "semantics": [
+        "sparse_initial_index_share.input_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.kv_a_rms_norm",
+      "semantics": [
+        "sparse_initial_index_share.kv_a_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.main_rope",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.o_proj",
+      "semantics": [
+        "sparse_initial_index_share.o_proj"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.q_a_rms_norm",
+      "semantics": [
+        "sparse_initial_index_share.q_a_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.q_absorb",
+      "semantics": [
+        "sparse_initial_index_share.q_absorb"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.q_b_proj",
+      "semantics": [
+        "sparse_initial_index_share.q_b_proj"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.sparse_mla.decode",
+      "semantics": [
+        "sparse_initial_index_share.attn.decode"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.sparse_mla.index_remap",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.sparse_mla.mla_cache_append",
+      "semantics": [
+        "sparse_initial_index_share.mla_cache_append"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.sparse_mla.prefill",
+      "semantics": [
+        "sparse_initial_index_share.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.sparse_mla.query_concat",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.attention.v_up",
+      "semantics": [
+        "sparse_initial_index_share.v_up"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.moe.routed_experts.fused_moe",
+      "semantics": [
+        "sparse_initial_index_share.expert_gate_up",
+        "sparse_initial_index_share.expert_down"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.moe.routed_experts.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.moe.router.post_attn_add_rms_norm",
+      "semantics": [
+        "sparse_initial_index_share.post_norm"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy",
+      "semantics": [
+        "sparse_initial_index_share.router"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.moe.shared_expert.down_proj",
+      "semantics": [
+        "sparse_initial_index_share.shared_down"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+      "semantics": [
+        "sparse_initial_index_share.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.body.sparse_initial_index_share.moe.shared_expert.silu_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.main.embedding",
+      "semantics": [
+        "embedding"
+      ]
+    },
+    {
+      "location": "unified.main.final_residual_rms_norm",
+      "semantics": [
+        "final_norm"
+      ]
+    },
+    {
+      "location": "unified.main.lm_head",
+      "semantics": [
+        "lm_head"
+      ]
+    }
+  ]
+}

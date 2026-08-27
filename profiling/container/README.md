@@ -30,8 +30,11 @@ uv run python -m profiling run nvfp4_quant \
 ```
 
 The host remains responsible for GPU selection, profile DB writes, and artifact
-creation. Each worker container receives only a temporary JSON exchange
-directory and a persistent JIT cache mounted at `/cache`. Set
+creation. Ordinary worker containers receive only a temporary JSON exchange
+directory and a persistent JIT cache mounted at `/cache`; the cache-free
+`kernel-profile measure` diagnostic additionally mounts its explicit output
+directory so the container-owned CUPTI/NVML artifacts survive the worker. Plot
+rendering remains optional and never controls measurement success. Set
 `VIBESIM_PROFILE_GPUS` only to GPUs reserved for the profiling job; otherwise
 the existing idle-GPU selection remains active.
 

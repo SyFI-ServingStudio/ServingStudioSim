@@ -35,17 +35,13 @@ class LocalGpuPool(GpuPool):
             raise ValueError(f"max_concurrent must be >= 1, got {max_concurrent}")
         available_gpus = self.gpus if self.gpus is not None else find_idle_gpus()
         if len(available_gpus) < gpus_per_chunk:
-            raise RuntimeError(
-                f"need {gpus_per_chunk} idle GPU(s), found {len(available_gpus)}"
-            )
+            raise RuntimeError(f"need {gpus_per_chunk} idle GPU(s), found {len(available_gpus)}")
         # Yield non-overlapping chunks. run_profile_batch decides how to split
         # specs across them; this pool only owns local GPU slot selection.
         chunk_count = min(max_concurrent, len(available_gpus) // gpus_per_chunk)
         for chunk_index in range(chunk_count):
             start_gpu_index = chunk_index * gpus_per_chunk
-            yield LocalGpuChunk(
-                available_gpus[start_gpu_index : start_gpu_index + gpus_per_chunk]
-            )
+            yield LocalGpuChunk(available_gpus[start_gpu_index : start_gpu_index + gpus_per_chunk])
 
 
 class LocalGpuChunk(GpuChunk):
@@ -80,9 +76,7 @@ class LocalGpuChunk(GpuChunk):
             completed = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
             if completed.returncode != 0:
                 error = (
-                    completed.stderr.strip()
-                    or completed.stdout.strip()
-                    or "local profile failed"
+                    completed.stderr.strip() or completed.stdout.strip() or "local profile failed"
                 )
                 return [ChunkResult(metrics=None, error=error) for _ in chunk_specs]
 
@@ -122,6 +116,7 @@ def _container_worker_command(
     profiler_env: ContainerProfileEnv,
     gpus: list[int],
     exchange_dir: Path,
+    additional_volumes: tuple[tuple[Path, Path], ...] = (),
 ) -> tuple[list[str], dict[str, str]]:
     cache_dir = Path(
         os.environ.get(
@@ -131,6 +126,11 @@ def _container_worker_command(
     ).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     gpu_request = f'"device={",".join(str(gpu) for gpu in gpus)}"'
+    volume_args = [
+        argument
+        for host_path, container_path in additional_volumes
+        for argument in ("--volume", f"{host_path.resolve()}:{container_path}")
+    ]
     return (
         [
             "docker",
@@ -154,6 +154,7 @@ def _container_worker_command(
             f"{exchange_dir.resolve()}:/io",
             "--volume",
             f"{cache_dir}:/cache",
+            *volume_args,
             profiler_env.image,
             "--worker-input",
             "/io/input.json",
@@ -196,11 +197,7 @@ def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10
 def _cuda_visible_gpu_order(root: ET.Element, raw_visible_devices: str | None) -> list[int] | None:
     if raw_visible_devices is None:
         return None
-    visible_tokens = [
-        token.strip()
-        for token in raw_visible_devices.split(",")
-        if token.strip()
-    ]
+    visible_tokens = [token.strip() for token in raw_visible_devices.split(",") if token.strip()]
     if not visible_tokens:
         return []
 

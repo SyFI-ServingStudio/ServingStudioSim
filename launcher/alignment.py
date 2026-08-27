@@ -232,8 +232,10 @@ def _same_trace_source(left: Any, right: Any) -> bool:
     if left_path == right_path:
         return True
     try:
-        return left_path.is_file() and right_path.is_file() and filecmp.cmp(
-            left_path, right_path, shallow=False
+        return (
+            left_path.is_file()
+            and right_path.is_file()
+            and filecmp.cmp(left_path, right_path, shallow=False)
         )
     except OSError:
         return False

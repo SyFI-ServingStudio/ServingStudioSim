@@ -51,9 +51,10 @@ def profile_single_gemm(
         def kernel():
             return torch.mm(a, b)
 
-        # Timer.cupti read-displaces L2 before each logical launch and excludes
-        # the reduction kernel from the returned GEMM-only duration.
-        time_ms = Timer.cupti(kernel)
+        # A logical GEMM can be an overlapping split-K producer/reduction
+        # assembly on Blackwell. Price its GPU-active union, not the sum of
+        # concurrent physical launches.
+        time_ms = Timer.cupti(kernel, interval_union=True)
         energy_j = Energy.perf(
             kernel,
             warmup=5,
@@ -106,8 +107,8 @@ def profile_single_gemm_linear(
         def kernel():
             return functional.linear(activations, weight)
 
-        # Time the canonical model-weight layout through the shared CUPTI timer.
-        time_ms = Timer.cupti(kernel)
+        # Match alignment's effective-duration boundary for split-K assemblies.
+        time_ms = Timer.cupti(kernel, interval_union=True)
         energy_j = Energy.perf(
             kernel,
             warmup=5,

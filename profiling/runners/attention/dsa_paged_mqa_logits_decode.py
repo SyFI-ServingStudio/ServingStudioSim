@@ -31,8 +31,8 @@ _CONTEXT_MODE = "uniform"
 _PAGE_MAPPING = "unique_scattered"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
 _REQUIRED_GPU = "NVIDIA H200"
-_REQUIRED_H200_SMS = 132
-_DEEPGEMM_KERNEL_NAME = "sm90_fp8_paged_mqa_logits"
+_DEEPGEMM_EXPECTED_SMS = {"NVIDIA H200": 132, "NVIDIA B200": 148}
+_DEEPGEMM_KERNEL_NAME = "fp8_paged_mqa_logits"
 
 
 @dataclass(frozen=True)
@@ -185,23 +185,24 @@ def _validate_cuda_device(torch: Any) -> None:
 
 
 def _validate_deepgemm_cuda_device(torch: Any) -> int:
-    """Validate the exact H200 deployment identity and return its SM count."""
+    """Validate a profiled deployment identity and return its SM schedule."""
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(
             "CUDA is required for the dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 backend"
         )
     device = torch.cuda.current_device()
     gpu_name = str(torch.cuda.get_device_name(device))
-    if gpu_name != _REQUIRED_GPU:
+    if gpu_name not in _DEEPGEMM_EXPECTED_SMS:
         raise ProfilerNotImplemented(
             "dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
+            f"{' or '.join(_DEEPGEMM_EXPECTED_SMS)}, got {gpu_name}"
         )
     num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
-    if num_sms != _REQUIRED_H200_SMS:
+    expected_sms = _DEEPGEMM_EXPECTED_SMS[gpu_name]
+    if num_sms != expected_sms:
         raise ProfilerNotImplemented(
             "dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 requires the verified "
-            f"{_REQUIRED_H200_SMS}-SM H200 schedule, got {num_sms} SMs"
+            f"{expected_sms}-SM {gpu_name} schedule, got {num_sms} SMs"
         )
     return num_sms
 
@@ -238,8 +239,7 @@ def _load_deepgemm_backend() -> tuple[Any, Any]:
         )
     if _paged_mqa_logits_entry_point(deep_gemm) is None:
         raise ProfilerNotImplemented(
-            "vllm.utils.deep_gemm exposes neither fp8_paged_mqa_logits nor "
-            "fp8_fp4_paged_mqa_logits"
+            "vllm.utils.deep_gemm exposes neither fp8_paged_mqa_logits nor fp8_fp4_paged_mqa_logits"
         )
     return torch, deep_gemm
 
@@ -505,9 +505,7 @@ def _prepare_deepgemm_call(
     # calling both this and the metadata builder. The older entry point took the
     # flat (B,) view. Feed each the layout it was built for.
     runnable_context_lens = (
-        operands.context_lens.contiguous()
-        if unified
-        else operands.context_lens[:, 0].contiguous()
+        operands.context_lens.contiguous() if unified else operands.context_lens[:, 0].contiguous()
     )
     schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
         runnable_context_lens,

@@ -8,10 +8,10 @@ write its FP8-plus-scale cache; index-share layers reuse those indices.
 
 The FP8 index cache is an attention implementation detail of the mechanism, not
 of the checkpoint: it is FP8 (and its logits run on the FP8 tensor cores) even
-when the weights are BF16. The MLA latent/rope cache and the FlashMLA kernel
-that reads it stay BF16 under every checkpoint precision. Whether the learned
-weights themselves are FP8 comes from the config's ``quantization_config`` and is
-matched per ``MatmulGroup.module``. Index scale values are FP32 semantics, so
+when the weights are BF16. The MLA latent/rope cache storage follows the
+checkpoint's explicit cache scheme; the NVFP4 checkpoint uses FP8 E4M3 while
+the BF16/FP8-weight checkpoints use BF16. Learned-weight precision is matched
+separately per ``MatmulGroup.module``. Index scale values are FP32 semantics, so
 their bytes are accounted in the index-cache rows rather than silently treated as
 BF16.
 """
@@ -151,15 +151,16 @@ class Glm52DsaAttention:
         total = 0.0
         for interaction in workload.attn:
             if interaction.mask == "causal":
-                total += sum(
-                    min(self.index_topk, interaction.num_cached_key + query + 1)
-                    for query in range(interaction.num_query)
-                ) * per_selected
+                total += (
+                    sum(
+                        min(self.index_topk, interaction.num_cached_key + query + 1)
+                        for query in range(interaction.num_query)
+                    )
+                    * per_selected
+                )
             elif interaction.mask in ("full", "cross"):
                 total += (
-                    interaction.num_query
-                    * min(self.index_topk, interaction.num_key)
-                    * per_selected
+                    interaction.num_query * min(self.index_topk, interaction.num_key) * per_selected
                 )
             else:
                 raise ValueError(f"unknown attention mask {interaction.mask!r}")
@@ -183,10 +184,7 @@ class Glm52DsaAttention:
                 rows.append(
                     AttentionSemantic(
                         name=f"indexer{suffix}",
-                        flops=2.0
-                        * self.index_n_heads
-                        * self.index_head_dim
-                        * index_pairs,
+                        flops=2.0 * self.index_n_heads * self.index_head_dim * index_pairs,
                         bytes=index_cache_bytes,
                         # The index cache is FP8 by construction (see
                         # index_cache_dtype_bytes), so the logits run on the FP8
@@ -204,9 +202,9 @@ class Glm52DsaAttention:
                     * (self.kv_lora_rank + self.qk_rope_head_dim + self.kv_lora_rank)
                     * selected_pairs,
                     bytes=self._mla_cache_read_bytes(phase_workload),
-                    # The MLA latent/rope cache is BF16, and so is the FlashMLA
-                    # kernel that reads it — an FP8 checkpoint does not move this
-                    # row onto the FP8 tensor cores.
+                    # This semantic compute floor remains BF16 even when the
+                    # checkpoint stores the MLA cache in FP8; cache storage bytes
+                    # are controlled independently by mla_cache_dtype_bytes.
                     compute_dtype="bf16",
                 )
             )

@@ -75,6 +75,10 @@ class BackendSupport:
       ``fa3``. Keeping ``compute`` and ``kv`` separate is what lets ``fa2`` stay
       valid for fp8-KV while ``cudnn`` (bf16-kv only) is correctly excluded.
     - ``gpus`` — ``None`` = any GPU; a set restricts to those ``gpu_name`` values.
+    - ``compute_gpu_pairs`` — optional non-Cartesian refinement for backends
+      whose verified dtype set differs by GPU. When both dtype and GPU are
+      known, the pair must be present in this set in addition to passing the
+      independent axes.
 
     The profile.db cache still keys on the full dtype tuple; this type only gates
     *which backends are legal*. Fine, per-request shape constraints (e.g. cudnn
@@ -85,6 +89,7 @@ class BackendSupport:
     compute: frozenset[DType] | None
     kv: frozenset[DType] | None = None
     gpus: frozenset[str] | None = None
+    compute_gpu_pairs: frozenset[tuple[DType, str]] | None = None
 
     def allows(
         self,
@@ -97,6 +102,12 @@ class BackendSupport:
         if self.kv is not None and kv_dtype is not None and kv_dtype not in self.kv:
             return False
         if self.gpus is not None and gpu is not None and gpu not in self.gpus:
+            return False
+        if (
+            self.compute_gpu_pairs is not None
+            and gpu is not None
+            and (compute_dtype, gpu) not in self.compute_gpu_pairs
+        ):
             return False
         return True
 
@@ -214,8 +225,7 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
         key = (profiler_spec.kernel_kind, profiler_spec.backend)
         if key in registered_keys:
             raise ValueError(
-                f"duplicate profiler spec for {profiler_spec.kernel_kind}:"
-                f"{profiler_spec.backend}"
+                f"duplicate profiler spec for {profiler_spec.kernel_kind}:{profiler_spec.backend}"
             )
         registered_keys.add(key)
 
@@ -227,6 +237,26 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
                 raise ValueError(
                     f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares an "
                     f"empty {axis} dtype set; use None for a {axis}-agnostic axis"
+                )
+        if supports.compute_gpu_pairs is not None:
+            if not supports.compute_gpu_pairs:
+                raise ValueError(
+                    f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares an "
+                    "empty compute_gpu_pairs set; use None when no pair refinement is needed"
+                )
+            if supports.compute is not None and any(
+                dtype not in supports.compute for dtype, _gpu in supports.compute_gpu_pairs
+            ):
+                raise ValueError(
+                    f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares a "
+                    "compute_gpu_pairs dtype outside its compute axis"
+                )
+            if supports.gpus is not None and any(
+                gpu not in supports.gpus for _dtype, gpu in supports.compute_gpu_pairs
+            ):
+                raise ValueError(
+                    f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares a "
+                    "compute_gpu_pairs GPU outside its gpus axis"
                 )
 
         expected_contract = table_contracts.get(profiler_spec.table_name)

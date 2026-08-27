@@ -659,6 +659,8 @@ pub fn build_configs(
             norm_topk_prob: true,
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
+            include_router_input_cast: true,
+            include_router_select: true,
         },
         moe_dispatch: moe_net.clone(),
         // `split_for_ep` hands rank *r* the contiguous expert range

@@ -6,9 +6,11 @@
 //! dispatch — provider-first, new-interface-design §4). Wired arms are
 //! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
 //! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
-//! `hp_unified`, and `glm52_dsa_moe` + `hp_unified`. GLM's TP1 local attention
-//! uses one independent KV/input partition per EP rank; the existing HP shell
-//! and mutable request/KV lifecycle are unchanged. Each wired arm
+//! `hp_unified`, `glm52_dsa_moe` + `hp_unified`, and
+//! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or the existing dedicated
+//! `chunked_prefill` worker. GLM's TP1 local attention uses one independent
+//! KV/input partition per EP rank; the worker shells and mutable request/KV
+//! lifecycle are unchanged. Each wired arm
 //! monomorphizes its concrete model/worker pair and
 //! erases to `Box<dyn Flow>` — the single `dyn` point (the cost path is
 //! `dyn`-free, L4 §4.1).
@@ -368,7 +370,7 @@ impl Deployment for UnifiedDeployment {
                 expert_popularity_file,
                 ..
             }) => {
-                ensure_deepseek_unified_worker(&g.worker)?;
+                ensure_hp_or_chunked_worker("DeepSeek-V4", &g.worker)?;
                 let serialize_streams =
                     matches!(arch, IterArchSel::DeepseekV4VllmSerialStreams { .. });
                 let model = Arc::new(arch_build::deepseek_v4_vllm(
@@ -381,7 +383,8 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                assemble_deepseek_flow(
+                assemble_hp_or_chunked_flow(
+                    "DeepSeek-V4",
                     model,
                     store,
                     worker_config,
@@ -422,6 +425,41 @@ impl Deployment for UnifiedDeployment {
                     dp_cfg,
                     build_hp_worker,
                 ))
+            }
+            IterArchSel::Glm52VllmNvfp4DsaMoe {
+                ep_size,
+                nvl_num_gpu,
+                max_model_len,
+                routing,
+                routing_seed,
+                mtp_mode,
+                expert_popularity_file,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("GLM-4.5 NVFP4", &g.worker)?;
+                let model = Arc::new(arch_build::glm52_vllm_nvfp4_dsa_moe(
+                    model_spec,
+                    *ep_size,
+                    *nvl_num_gpu,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    *mtp_mode,
+                    expert_popularity_file.as_deref(),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "GLM-4.5 NVFP4",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
             }
             IterArchSel::Glm52DsaMoe {
                 ep_size,
@@ -492,16 +530,19 @@ fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     }
 }
 
-fn ensure_deepseek_unified_worker(worker: &IterWorkerSel) -> anyhow::Result<()> {
+/// Whole-iteration arches with a captured chunked-prefill runtime may use the
+/// ordinary HP admission recipe or the dedicated hard-cap/chunking recipe.
+fn ensure_hp_or_chunked_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
         IterWorkerSel::HpUnified { .. } | IterWorkerSel::ChunkedPrefill { .. } => Ok(()),
         other => bail!(
-            "unified: DeepSeek-V4 requires worker `hp_unified` or `chunked_prefill`, got {other:?}"
+            "unified: {arch_name} requires worker `hp_unified` or `chunked_prefill`, got {other:?}"
         ),
     }
 }
 
-fn assemble_deepseek_flow<M>(
+fn assemble_hp_or_chunked_flow<M>(
+    arch_name: &str,
     model: Arc<M>,
     store: SharedRequests,
     worker_config: WorkerConfig,
@@ -532,7 +573,7 @@ where
             dp_cfg,
             build_chunked_prefill_worker,
         )),
-        other => bail!("unified: unsupported DeepSeek-V4 worker {other:?}"),
+        other => bail!("unified: unsupported {arch_name} worker {other:?}"),
     }
 }
 
@@ -575,9 +616,9 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::{Glm52DsaMoeModel, Qwen36LocalModel};
+    use crate::arch::{Glm52DsaMoeModel, Glm52VllmNvfp4DsaMoeModel, Qwen36LocalModel};
     use crate::common::RequestId;
-    use crate::worker::{HpUnifiedWorker, WorkerEventCommon};
+    use crate::worker::{ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon};
 
     fn hp_worker() -> IterWorkerSel {
         IterWorkerSel::HpUnified {
@@ -604,6 +645,15 @@ mod tests {
         }
     }
 
+    fn chunked_prefill_worker() -> IterWorkerSel {
+        IterWorkerSel::ChunkedPrefill {
+            attn_gpu_memory_gb: 120.0,
+            max_batch_tokens: 2048,
+            batch_policy: BatchPolicy::Mix,
+            gpu_time_multiplier: 1.0,
+        }
+    }
+
     fn assert_iter_worker_contract<W>()
     where
         W: IterWorker<Event = WorkerEventCommon> + 'static,
@@ -615,6 +665,13 @@ mod tests {
     fn glm52_hp_unified_pair_satisfies_the_iter_worker_contract() {
         assert_iter_worker_contract::<HpUnifiedWorker<Glm52DsaMoeModel>>();
         ensure_hp_unified(&hp_worker()).expect("GLM accepts hp_unified");
+    }
+
+    #[test]
+    fn glm52_nvfp4_chunked_prefill_pair_satisfies_the_iter_worker_contract() {
+        assert_iter_worker_contract::<ChunkedPrefillWorker<Glm52VllmNvfp4DsaMoeModel>>();
+        ensure_hp_or_chunked_worker("GLM-4.5 NVFP4", &chunked_prefill_worker())
+            .expect("GLM NVFP4 accepts the dedicated chunked-prefill worker");
     }
 
     /// Qwen3.6 local keeps the `barebone` preset tag — cadence, admission and

@@ -56,7 +56,7 @@ register(
         backend="vllm_cuda",
         supports=BackendSupport(
             compute=frozenset({DType.FP32}),
-            gpus=frozenset({"NVIDIA H200"}),
+            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_persistent_topk_decode",

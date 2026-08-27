@@ -292,6 +292,7 @@ fn attention_config(
     VllmGlm52DsaAttnLocalWorkletConfig {
         fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
         include_indexer,
+        tp_size: 1,
         residual_rms_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
         rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
         single_gemm_backends: gemm_backends.to_vec(),
@@ -347,6 +348,10 @@ fn attention_config(
         sparse_index_distribution: "recent_contiguous".to_string(),
         sparse_cache_layout: "token_major_mqa_bf16_latent_rope".to_string(),
         sparse_mla_cache_format: "plain".to_string(),
+        sparse_attention_q_dtype: DType::Bf16,
+        sparse_attention_cache_dtype: DType::Bf16,
+        sparse_attention_output_dtype: DType::Bf16,
+        sparse_exact_varlen: None,
         decode_next_n: 1,
     }
 }
@@ -506,6 +511,7 @@ pub fn build_configs(
             residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
             gemm_backends: gemm_backends.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            tp_size: 1,
             gpu_name: gpu.clone(),
             hidden_dim: model.hidden_dim.clone(),
             intermediate_dim: model.dense_intermediate_dim.clone(),
@@ -534,6 +540,8 @@ pub fn build_configs(
             norm_topk_prob: true,
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
+            include_router_input_cast: true,
+            include_router_select: true,
         },
         moe_dispatch_prepare: MoeAlltoallPrepareKernelConfig {
             backends: MOE_ALLTOALL_BACKENDS.to_vec(),
@@ -573,6 +581,7 @@ pub fn build_configs(
             gemm_backends: gemm_backends.to_vec(),
             fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            tp_size: 1,
             gpu_name: gpu.clone(),
             hidden_dim: model.hidden_dim.clone(),
             moe_intermediate_dim: model.moe_intermediate_dim.clone(),
@@ -1530,6 +1539,7 @@ impl NormalizedBatch {
                         VllmGlm52DsaAttnLocalDecodeInput {
                             batch_size: group.decode_tokens,
                             context_len,
+                            context_lens: None,
                             requires_padding: false,
                         }
                     }),
@@ -1632,6 +1642,7 @@ fn normalize_input(
                 decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
                     batch_size: decode_tokens,
                     context_len,
+                    context_lens: None,
                     requires_padding: false,
                 }),
             },

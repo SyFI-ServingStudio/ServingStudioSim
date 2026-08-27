@@ -73,6 +73,7 @@ def test_registration_support_and_facades() -> None:
     assert spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+    assert not spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
     assert spec.runner_ref.module_name == ("profiling.runners.attention.dsa_topk_prefill")
     assert spec.runner_ref.function_name == "profile_dsa_topk_prefill_torch"
     assert hasattr(perf_api, "get_dsa_topk_prefill_times")
@@ -93,6 +94,7 @@ def test_vllm_registration_reuses_schema_table_family_support_and_facades() -> N
     assert vllm_spec.subprocess_env == "vllm_env"
     assert vllm_spec.supports.kv is None
     assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
+    assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
     assert not vllm_spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
     assert not vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
     assert vllm_spec.runner_ref.module_name == ("profiling.runners.attention.dsa_topk_prefill")
@@ -218,6 +220,15 @@ def test_vllm_rejects_missing_cuda_and_unverified_gpu() -> None:
     )
     with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
         _validate_vllm_cuda_device(h100)
+
+    b200 = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: "NVIDIA B200",
+        )
+    )
+    _validate_vllm_cuda_device(b200)
 
 
 def test_vllm_rejects_common_and_backend_specific_args_before_loading(

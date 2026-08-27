@@ -20,6 +20,7 @@ _CACHE_DTYPE = DType.FP8_E4M3
 _SCALE_FORMAT = "ue8m0"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
 _REQUIRED_GPU = "NVIDIA H200"
+_VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _VLLM_KERNEL_NAME = "indexer_k_quant_and_cache_kernel"
 _FP8_E4M3_MAX = 448.0
 _AMAX_FLOOR = 1e-4
@@ -116,9 +117,10 @@ def _validate_vllm_cuda_device(torch: Any) -> None:
             "CUDA is required for the dsa_index_cache_append vllm_cuda backend"
         )
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
+    if gpu_name not in _VLLM_SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
-            f"dsa_index_cache_append vllm_cuda is verified only on {_REQUIRED_GPU}, got {gpu_name}"
+            "dsa_index_cache_append vllm_cuda is verified only on "
+            f"{' or '.join(_VLLM_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 

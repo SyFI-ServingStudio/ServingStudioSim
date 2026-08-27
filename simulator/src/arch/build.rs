@@ -20,18 +20,19 @@ use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, Routi
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    deepseek_v4_vllm, glm52_dsa_moe, glm52_vllm_dsa_moe, llama3_dense, llama3_dense_tp,
-    llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise,
-    qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn,
-    qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel, DeepseekV4ModelCfg, DeepseekV4VllmModel,
-    DeepseekV4VllmParallel, DenseParallel, DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel,
-    Glm52DsaMoeModel, Glm52DsaMoeParallel, Glm52ModelCfg, Glm52MtpMode, Glm52VllmDsaMoeModel,
-    Glm52VllmDsaMoeParallel, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
-    Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
-    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
-    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
-    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
-    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    deepseek_v4_vllm, glm52_dsa_moe, glm52_vllm_dsa_moe, glm52_vllm_nvfp4_dsa_moe, llama3_dense,
+    llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
+    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
+    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
+    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
+    DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52DsaMoeModel, Glm52DsaMoeParallel,
+    Glm52ModelCfg, Glm52MtpMode, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
+    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, IterwiseUnifiedModel,
+    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
+    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
+    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
+    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
+    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::PerfApiBridge;
@@ -910,6 +911,52 @@ pub fn glm52_vllm_dsa_moe(
         .context("building vLLM-granularity GLM-5.2 model (often a missing profile.db row)")
 }
 
+/// Build the B200 GLM-5.2 NVFP4 graph. `ep_size` is also the tensor-parallel
+/// degree; the architecture derives each rank-local workload from one global
+/// routing sample.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_vllm_nvfp4_dsa_moe(
+    model_spec: &ModelSpec,
+    ep_size: u16,
+    nvl_num_gpu: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    mtp_mode: Glm52MtpMode,
+    expert_popularity_file: Option<&str>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmNvfp4DsaMoeModel> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 NVFP4 config")?;
+    let routing = resolve_routing_source(
+        routing_kind,
+        routing_seed,
+        model_cfg.num_experts.get(),
+        ep_size,
+        num_sparse_layers(&model_cfg),
+        model_cfg.router_top_k,
+        expert_popularity_file,
+    )?;
+    let parallel = Glm52VllmNvfp4DsaMoeParallel {
+        ep_size,
+        nvl_num_gpu,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+    };
+    let configs = glm52_vllm_nvfp4_dsa_moe::build_configs(
+        &model_cfg,
+        &parallel,
+        &routing,
+        model_spec.fp8,
+        mtp_mode,
+    )
+    .context("expanding B200 GLM-5.2 NVFP4 architecture configs")?;
+    let resolved = glm52_vllm_nvfp4_dsa_moe::resolve_configs(&configs);
+    glm52_vllm_nvfp4_dsa_moe::build(name.to_string(), resolved, bridge)
+        .context("building B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
+}
+
 /// Build the AFD attn-side (layer-wise) Qwen3-MoE model — attention only, for ONE
 /// DP shard (`attn_tp_size` head-parallel ranks). The attn pool runs one of these
 /// per DP shard (its `replicas`). Pairs with [`qwen3_ffn_moe`].
@@ -1160,6 +1207,28 @@ pub fn build_iter_model(
             model,
             *ep_size,
             *nvl_num_gpu,
+            *routing,
+            *routing_seed,
+            *mtp_mode,
+            expert_popularity_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Glm52VllmNvfp4DsaMoe {
+            model,
+            ep_size,
+            nvl_num_gpu,
+            max_model_len,
+            routing,
+            routing_seed,
+            mtp_mode,
+            expert_popularity_file,
+        } => Box::new(glm52_vllm_nvfp4_dsa_moe(
+            model,
+            *ep_size,
+            *nvl_num_gpu,
+            *max_model_len,
             *routing,
             *routing_seed,
             *mtp_mode,
@@ -1482,6 +1551,36 @@ mod tests {
             sim_num_layers: None,
             fp8: false,
         }
+    }
+
+    #[test]
+    fn glm52_nvfp4_selector_builds_through_the_shared_iter_dispatch() {
+        let selector = IterArchSel::Glm52VllmNvfp4DsaMoe {
+            model: ModelSpec {
+                model_config: Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("model/config/glm52_nvfp4.json")
+                    .to_string_lossy()
+                    .into_owned(),
+                num_layers: None,
+                sim_num_layers: None,
+                fp8: false,
+            },
+            ep_size: 4,
+            nvl_num_gpu: 4,
+            max_model_len: 8_192,
+            routing: RoutingKind::Uniform,
+            routing_seed: None,
+            mtp_mode: Glm52MtpMode::Off,
+            expert_popularity_file: None,
+        };
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let built = build_iter_model(&selector, "NVIDIA B200", "test", &bridge)
+            .expect("build NVFP4 GLM through shared iter dispatch");
+        assert_eq!(built.gpus_per_replica(), 4);
+        assert_eq!(built.num_attn_dp_groups(), 1);
+        assert_eq!(built.num_attn_shards(), 4);
+        assert_eq!(built.cost_log_manifest().slots.len(), 474);
     }
 
     #[test]

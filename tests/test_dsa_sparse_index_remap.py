@@ -113,9 +113,10 @@ def test_args_order_types_and_coercion() -> None:
 
 def test_registration_support_family_environment_runner_ref_and_facades() -> None:
     spec = find_kernel_profiler_spec(KIND, "torch")
+    vllm_spec = find_kernel_profiler_spec(KIND, "vllm_triton")
 
     assert KIND == "dsa_sparse_index_remap"
-    assert known_backends(KIND) == ["torch"]
+    assert known_backends(KIND) == ["torch", "vllm_triton"]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.args_schema is DsaSparseIndexRemapArgs
     assert spec.metric_family is MetricFamily.COMPUTE
@@ -129,6 +130,10 @@ def test_registration_support_family_environment_runner_ref_and_facades() -> Non
     assert spec.subprocess_env is None
     assert spec.runner_ref.module_name == ("profiling.runners.attention.dsa_sparse_index_remap")
     assert spec.runner_ref.function_name == "profile_dsa_sparse_index_remap_torch"
+    assert vllm_spec.supports.compute is None
+    assert vllm_spec.supports.gpus == frozenset({"NVIDIA B200"})
+    assert vllm_spec.subprocess_env == "vllm_env"
+    assert vllm_spec.runner_ref.function_name == ("profile_dsa_sparse_index_remap_vllm_triton")
     assert hasattr(perf_api, "get_dsa_sparse_index_remap_times")
     assert hasattr(perf_api, "count_missing_dsa_sparse_index_remap")
 
@@ -466,14 +471,14 @@ def test_workspace_ids_and_starts_follow_suffix_chunks_and_request_maxima() -> N
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"num_queries": 0}, "1..4096"),
-        ({"num_queries": 4097}, "1..4096"),
+        ({"num_queries": 0}, "1..8192"),
+        ({"num_queries": 8193}, "1..8192"),
         ({"num_requests": 0}, "1..min"),
         ({"num_requests": 5}, "1..min"),
         ({"num_requests": 257}, "1..min"),
         ({"selected_k": 1024}, "selected_k must be 2048"),
         ({"block_size": 128}, "block_size must be 64"),
-        ({"max_blocks_per_request": 1024}, "max_blocks_per_request must be 2048"),
+        ({"max_blocks_per_request": 16385}, "max_blocks_per_request must be in 1..16384"),
         ({"index_dtype": "int64"}, "index_dtype must be int32"),
         ({"index_distribution": "random"}, "index_distribution"),
         ({"page_table_mapping": "random"}, "page_table_mapping"),
@@ -499,6 +504,27 @@ def test_unsupported_domain_fails_before_allocation(
     with pytest.raises(ProfilerNotImplemented, match=match):
         runner.profile_dsa_sparse_index_remap_torch(**spec)
     assert not allocated
+
+
+def test_glm_full_context_block_table_width_is_supported() -> None:
+    from profiling.runners.attention import dsa_sparse_index_remap as runner
+
+    validated = runner._validate_args(
+        **(
+            _BASE_SPEC
+            | {
+                "num_queries": 1,
+                "num_requests": 1,
+                "max_blocks_per_request": 16384,
+                "request_row_counts": "u:1x1",
+                "local_span_lengths": "u:1048576x1",
+                "valid_counts": "u:2048x1",
+            }
+        )
+    )
+
+    assert validated.max_blocks_per_request == 16384
+    assert validated.local_span_lengths == (1048576,)
 
 
 @pytest.mark.parametrize(
@@ -530,7 +556,10 @@ def test_malformed_types_fail_before_allocation(
 
 
 def test_cuda_and_gpu_support_failures_are_typed() -> None:
-    from profiling.runners.attention.dsa_sparse_index_remap import _require_h200
+    from profiling.runners.attention.dsa_sparse_index_remap import (
+        _require_b200,
+        _require_h200,
+    )
 
     no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
     with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
@@ -545,6 +574,8 @@ def test_cuda_and_gpu_support_failures_are_typed() -> None:
     )
     with pytest.raises(ProfilerNotImplemented, match="requires NVIDIA H200"):
         _require_h200(h100)
+    with pytest.raises(ProfilerNotImplemented, match="requires NVIDIA B200"):
+        _require_b200(h100)
 
 
 @pytest.mark.parametrize(
@@ -891,6 +922,41 @@ def test_nominal_flops_are_zero() -> None:
     from profiling.runners.attention.dsa_sparse_index_remap import _logical_flops
 
     assert _logical_flops() == 0
+
+
+def test_vllm_triton_launch_forwards_the_production_wrapper_contract() -> None:
+    from profiling.runners.attention import dsa_sparse_index_remap as runner
+
+    validated = _small_validated(runner, selected_k=8, block_size=4)
+    operands = runner._Operands(
+        req_id=object(),
+        block_table=object(),
+        token_indices=object(),
+        prefill_workspace_request_ids=None,
+        prefill_workspace_starts=None,
+        output=object(),
+        counts=None,
+    )
+    calls = []
+
+    def callable_(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "output"
+
+    assert runner._launch_vllm_triton(callable_, operands, validated) == "output"
+    assert calls == [
+        (
+            (operands.req_id, operands.block_table, operands.token_indices),
+            {
+                "BLOCK_SIZE": 4,
+                "NUM_TOPK_TOKENS": 8,
+                "HAS_PREFILL_WORKSPACE": False,
+                "prefill_workspace_request_ids": None,
+                "prefill_workspace_starts": None,
+                "return_valid_counts": False,
+            },
+        )
+    ]
 
 
 def test_profile_times_complete_composite_and_returns_live_zero_flop_metrics(

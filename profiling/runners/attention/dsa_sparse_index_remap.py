@@ -20,11 +20,13 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_sparse_index_remap:torch"
+_VLLM_BACKEND = "dsa_sparse_index_remap:vllm_triton"
 _REQUIRED_GPU = "NVIDIA H200"
 _SELECTED_K = 2048
 _BLOCK_SIZE = 64
-_MAX_BLOCKS_PER_REQUEST = 2048
+_MAX_BLOCKS_PER_REQUEST = 16384
 _MAX_LOCAL_SPAN = _BLOCK_SIZE * _MAX_BLOCKS_PER_REQUEST
+_MAX_QUERIES = 8192
 _INDEX_DTYPE = "int32"
 _SOURCE_BLOCK_N = 128
 _ROW_CHUNK_SIZE = 64
@@ -273,17 +275,21 @@ def _validate_args(
     if type(return_valid_counts) is not bool:
         raise TypeError("return_valid_counts must be a Python bool")
 
-    if not 1 <= num_queries <= 4096:
-        raise ProfilerNotImplemented("num_queries must be in 1..4096")
+    if not 1 <= num_queries <= _MAX_QUERIES:
+        raise ProfilerNotImplemented(f"num_queries must be in 1..{_MAX_QUERIES}")
     if not 1 <= num_requests <= min(num_queries, 256):
         raise ProfilerNotImplemented("num_requests must be in 1..min(num_queries, 256)")
     for name, actual, required in (
         ("selected_k", selected_k, _SELECTED_K),
         ("block_size", block_size, _BLOCK_SIZE),
-        ("max_blocks_per_request", max_blocks_per_request, _MAX_BLOCKS_PER_REQUEST),
     ):
         if actual != required:
             raise ProfilerNotImplemented(f"{name} must be {required}, got {actual}")
+    if not 1 <= max_blocks_per_request <= _MAX_BLOCKS_PER_REQUEST:
+        raise ProfilerNotImplemented(
+            f"max_blocks_per_request must be in 1..{_MAX_BLOCKS_PER_REQUEST}, "
+            f"got {max_blocks_per_request}"
+        )
     if index_dtype != _INDEX_DTYPE:
         raise ProfilerNotImplemented(f"index_dtype must be {_INDEX_DTYPE}")
     if index_distribution not in _INDEX_DISTRIBUTIONS:
@@ -356,6 +362,14 @@ def _require_h200(torch: Any) -> None:
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
     if gpu_name != _REQUIRED_GPU:
         raise ProfilerNotImplemented(f"{_BACKEND} requires {_REQUIRED_GPU}, got {gpu_name!r}")
+
+
+def _require_b200(torch: Any) -> None:
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented(f"CUDA is required for {_VLLM_BACKEND}")
+    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
+    if gpu_name != "NVIDIA B200":
+        raise ProfilerNotImplemented(f"{_VLLM_BACKEND} requires NVIDIA B200, got {gpu_name!r}")
 
 
 def _coprime_stride(size: int, preferred: int) -> int:
@@ -869,6 +883,139 @@ def profile_dsa_sparse_index_remap_torch(
     return ComputeMetrics(
         time_ms=time_ms,
         energy_j=energy_j,
+        tflops=0.0,
+        memory_bandwidth_gbps=logical_bytes / seconds / 1e9,
+    )
+
+
+def _launch_vllm_triton(
+    callable_: Any,
+    operands: _Operands,
+    validated: _ValidatedArgs,
+) -> Any:
+    has_prefill_workspace = operands.prefill_workspace_request_ids is not None
+    return callable_(
+        operands.req_id,
+        operands.block_table,
+        operands.token_indices,
+        BLOCK_SIZE=validated.block_size,
+        NUM_TOPK_TOKENS=validated.selected_k,
+        HAS_PREFILL_WORKSPACE=has_prefill_workspace,
+        prefill_workspace_request_ids=operands.prefill_workspace_request_ids,
+        prefill_workspace_starts=operands.prefill_workspace_starts,
+        return_valid_counts=validated.return_valid_counts,
+    )
+
+
+def _check_vllm_triton_correctness(
+    torch: Any,
+    callable_: Any,
+    operands: _Operands,
+    validated: _ValidatedArgs,
+) -> None:
+    from profiling.runners.attention.dsa_sparse_index_remap_reference import (
+        dsa_sparse_index_remap_reference,
+    )
+
+    actual = _launch_vllm_triton(callable_, operands, validated)
+    expected = dsa_sparse_index_remap_reference(
+        operands.req_id,
+        operands.block_table,
+        operands.token_indices,
+        block_size=validated.block_size,
+        prefill_workspace_request_ids=operands.prefill_workspace_request_ids,
+        prefill_workspace_starts=operands.prefill_workspace_starts,
+        return_valid_counts=validated.return_valid_counts,
+    )
+    torch.cuda.synchronize(operands.req_id.device)
+    actual_values = actual if isinstance(actual, tuple) else (actual,)
+    expected_values = expected if isinstance(expected, tuple) else (expected,)
+    if len(actual_values) != len(expected_values):
+        raise KernelLaunchFailed(f"{_VLLM_BACKEND} returned the wrong output variant")
+    for actual_value, expected_value in zip(actual_values, expected_values, strict=True):
+        if not torch.equal(actual_value, expected_value):
+            raise KernelLaunchFailed(f"{_VLLM_BACKEND} disagrees with the reference")
+
+
+def profile_dsa_sparse_index_remap_vllm_triton(
+    *,
+    num_queries: int,
+    num_requests: int,
+    selected_k: int,
+    block_size: int,
+    max_blocks_per_request: int,
+    request_row_counts: str,
+    local_span_lengths: str,
+    valid_counts: str,
+    index_distribution: str,
+    page_table_mapping: str,
+    workspace_partition: str,
+    return_valid_counts: bool,
+    index_dtype: str,
+) -> ComputeMetrics:
+    """Profile vLLM's production sparse-index Triton wrapper on B200."""
+    validated = _validate_args(
+        num_queries=num_queries,
+        num_requests=num_requests,
+        selected_k=selected_k,
+        block_size=block_size,
+        max_blocks_per_request=max_blocks_per_request,
+        request_row_counts=request_row_counts,
+        local_span_lengths=local_span_lengths,
+        valid_counts=valid_counts,
+        index_distribution=index_distribution,
+        page_table_mapping=page_table_mapping,
+        workspace_partition=workspace_partition,
+        return_valid_counts=return_valid_counts,
+        index_dtype=index_dtype,
+    )
+    try:
+        import torch
+        from vllm.v1.attention.backends.mla.sparse_utils import (
+            triton_convert_req_index_to_global_index,
+        )
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise ProfilerNotImplemented(f"{_VLLM_BACKEND} requires the repository vllm_env") from exc
+
+    try:
+        _require_b200(torch)
+        device = torch.device("cuda", torch.cuda.current_device())
+        operands = _build_operands(torch, validated, device=device)
+        _check_vllm_triton_correctness(
+            torch,
+            triton_convert_req_index_to_global_index,
+            operands,
+            validated,
+        )
+
+        def kernel() -> Any:
+            return _launch_vllm_triton(
+                triton_convert_req_index_to_global_index,
+                operands,
+                validated,
+            )
+
+        time_ms = Timer.cupti(kernel, interval_union=True)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except (KernelLaunchFailed, ProfilerNotImplemented):
+        raise
+    except torch.OutOfMemoryError as exc:
+        raise OOMError(f"{_VLLM_BACKEND} ran out of GPU memory") from exc
+    except Exception as exc:
+        raise KernelLaunchFailed(f"{_VLLM_BACKEND} native callable failed") from exc
+
+    workspace_values, _ = _derive_workspace_metadata(validated)
+    logical_bytes = _logical_bytes(
+        num_queries=validated.num_queries,
+        selected_k=validated.selected_k,
+        valid_counts=validated.valid_counts,
+        workspace_ids=workspace_values,
+        return_valid_counts=validated.return_valid_counts,
+    )
+    seconds = time_ms / 1000.0
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        energy_j=float(energy_j),
         tflops=0.0,
         memory_bandwidth_gbps=logical_bytes / seconds / 1e9,
     )

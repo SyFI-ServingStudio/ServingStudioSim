@@ -349,8 +349,7 @@ def extract_request_timings_jsonl(
                     )
             elif first_output_wait_components_ms > api_row["api_first_output_wait_ms"] + 1e-6:
                 raise ValueError(
-                    "alignment API dispatch phases do not fit inside "
-                    "api_first_output_wait_ms"
+                    "alignment API dispatch phases do not fit inside api_first_output_wait_ms"
                 )
         if {"api_engine_output_wait_ms", "api_output_fanout_ms"} <= present:
             collector_wait_components_ms = (
@@ -498,9 +497,7 @@ def extract_request_timings_jsonl(
                 carried = records.api_required_fields(api_row["schema_version"])
                 if "token_events" in carried:
                     row["api_token_events"] = api_row["token_events"]
-                    row["api_first_token_event_tokens"] = api_row[
-                        "first_token_event_tokens"
-                    ]
+                    row["api_first_token_event_tokens"] = api_row["first_token_event_tokens"]
                 for field in sorted(carried):
                     if field.endswith("_ms"):
                         row[field] = api_row[field]
@@ -752,9 +749,7 @@ def extract_dp_rank_by_device(
         if missing:
             raise ValueError(f"alignment worker record missing fields {sorted(missing)}")
         if row["schema_version"] != 1:
-            raise ValueError(
-                f"unsupported alignment worker schema {row['schema_version']!r}"
-            )
+            raise ValueError(f"unsupported alignment worker schema {row['schema_version']!r}")
         if row["input_adapter"] != records.adapter:
             raise ValueError(
                 f"alignment worker record adapter {row['input_adapter']!r} is not "
@@ -787,9 +782,7 @@ def extract_dp_rank_by_device(
         device_id, dp_rank = row["device_id"], row["dp_rank"]
         existing = dp_rank_by_device.setdefault(device_id, dp_rank)
         if existing != dp_rank:
-            raise ValueError(
-                f"device {device_id} is claimed by DP ranks {existing} and {dp_rank}"
-            )
+            raise ValueError(f"device {device_id} is claimed by DP ranks {existing} and {dp_rank}")
     observed_dp_size = {row["dp_size"] for row in rows}
     if len(observed_dp_size) != 1:
         raise ValueError(f"alignment workers disagree on dp_size: {sorted(observed_dp_size)}")
