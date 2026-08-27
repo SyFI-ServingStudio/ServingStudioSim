@@ -14,7 +14,7 @@ from alignment_iteration.series_plot import (  # noqa: E402
     _display_stream_rows,
     _evenly_sample_iteration_ids,
     _mapping_center_pairs,
-    _operation_comparison_labels,
+    _operation_comparison_rows,
     _output_is_current,
     _recommended_gpu_time_multiplier,
     _remove_stale_breakdown_outputs,
@@ -125,8 +125,8 @@ def test_simulated_width_cumulative_error_steps_use_critical_path_widths() -> No
     assert cumulative_errors_ms[-1] == pytest.approx(1.3 - 1.7)
 
 
-def test_operation_comparison_labels_use_human_units_and_safe_percentages() -> None:
-    labels = _operation_comparison_labels(
+def test_operation_comparison_rows_format_cells_and_rank_absolute_error() -> None:
+    rows = _operation_comparison_rows(
         ["attention", "sim-only"],
         [{"operation": "attention", "duration_ms": 0.5}],
         [
@@ -135,10 +135,24 @@ def test_operation_comparison_labels_use_human_units_and_safe_percentages() -> N
         ],
     )
 
-    assert labels == {
-        "attention": "attention | 500 µs | 750 µs | +50.0%",
-        "sim-only": "sim-only | 0 µs | 200 µs | n/a",
-    }
+    assert rows == [
+        {
+            "operation": "attention",
+            "measured": "500 µs",
+            "simulated": "750 µs",
+            "relative": "+50.0%",
+            "absolute_error_ms": 0.25,
+            "is_top_error": True,
+        },
+        {
+            "operation": "sim-only",
+            "measured": "0 µs",
+            "simulated": "200 µs",
+            "relative": "n/a",
+            "absolute_error_ms": 0.2,
+            "is_top_error": True,
+        },
+    ]
 
 
 def test_output_is_current_tracks_every_render_input(tmp_path: Path) -> None:
@@ -214,7 +228,7 @@ def test_stream_breakdown_uses_reduced_work_and_aggregates_small_streams() -> No
     ) == pytest.approx(100.9)
 
 
-def test_stream_breakdown_reserves_a_non_overlapping_legend_band(
+def test_stream_breakdown_reserves_aligned_non_overlapping_table_blocks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     operation_names = [f"attention.indexer.long_semantic_operation_{index}" for index in range(30)]
@@ -254,18 +268,29 @@ def test_stream_breakdown_reserves_a_non_overlapping_legend_band(
     figure = captured["figure"]
     figure.canvas.draw()
     axis = figure.axes[0]
-    legend = figure.legends[0]
-    legend_bounds = legend.get_window_extent(figure.canvas.get_renderer()).transformed(
-        figure.transFigure.inverted()
-    )
     xlabel_bounds = axis.xaxis.label.get_window_extent(figure.canvas.get_renderer()).transformed(
         figure.transFigure.inverted()
     )
 
     assert axis.get_legend() is None
-    assert legend.get_title().get_text() == "operation | measured | simulated | Δ"
-    assert 0.0 <= legend_bounds.x0 < legend_bounds.x1 <= 1.0
-    assert (legend_bounds.x0 + legend_bounds.x1) / 2.0 == pytest.approx(0.5, abs=0.01)
-    assert 0.0 <= legend_bounds.y0 < legend_bounds.y1 < xlabel_bounds.y0
+    assert not figure.legends
+    table_axes = figure.axes[1:]
+    assert len(table_axes) == 3
+    assert all(table_axis.get_position().y1 < xlabel_bounds.y0 for table_axis in table_axes)
+    first_table = table_axes[0].tables[0]
+    assert [first_table[0, column].get_text().get_text() for column in range(5)] == [
+        "",
+        "operation",
+        "measured",
+        "simulated",
+        "Δ",
+    ]
+    operation_cells = [
+        table_axis.tables[0][row_index, 1]
+        for table_axis in table_axes
+        for row_index in range(1, len(table_axis.tables[0].get_celld()) // 5)
+    ]
+    assert all(cell.get_text().get_ha() == "left" for cell in operation_cells)
+    assert sum(cell.get_text().get_weight() == "bold" for cell in operation_cells) == 5
     assert xlabel_bounds.y1 < axis.get_position().y0
     series_plot.plt.close(figure)
