@@ -155,6 +155,19 @@ def test_operation_comparison_rows_format_cells_and_rank_absolute_error() -> Non
     ]
 
 
+def test_operation_comparison_rows_separate_directional_mapping_gaps() -> None:
+    rows = _operation_comparison_rows(
+        ["unmapped (measured)", "unmapped (simulated)"],
+        [{"operation": None, "duration_ms": 0.4}],
+        [{"operation": None, "duration_ms": 0.2}],
+    )
+
+    assert [(row["operation"], row["measured"], row["simulated"]) for row in rows] == [
+        ("unmapped (measured)", "400 µs", "0 µs"),
+        ("unmapped (simulated)", "0 µs", "200 µs"),
+    ]
+
+
 def test_output_is_current_tracks_every_render_input(tmp_path: Path) -> None:
     payload = tmp_path / "payload.json"
     renderer = tmp_path / "renderer.py"

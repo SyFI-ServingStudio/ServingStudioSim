@@ -381,6 +381,11 @@ def _compact_path_rows(rows: list[dict], target_ms: float) -> list[dict]:
     ]
 
 
+def _directional_operation(operation: str | None, source: str) -> str:
+    """Keep measured-only and simulated-only mapping gaps visibly separate."""
+    return operation if operation and operation != "unmapped" else f"unmapped ({source})"
+
+
 def _operation_comparison_rows(
     semantic_names: list[str], measured_path: list[dict], simulated_path: list[dict]
 ) -> list[dict]:
@@ -388,9 +393,11 @@ def _operation_comparison_rows(
     measured_by_operation: dict[str, float] = defaultdict(float)
     simulated_by_operation: dict[str, float] = defaultdict(float)
     for row in measured_path:
-        measured_by_operation[row.get("operation") or "unmapped"] += float(row["duration_ms"])
+        operation = _directional_operation(row.get("operation"), "measured")
+        measured_by_operation[operation] += float(row["duration_ms"])
     for row in simulated_path:
-        simulated_by_operation[row.get("operation") or "unmapped"] += float(row["duration_ms"])
+        operation = _directional_operation(row.get("operation"), "simulated")
+        simulated_by_operation[operation] += float(row["duration_ms"])
 
     rows = []
     for name in semantic_names:
@@ -514,7 +521,7 @@ def _render_stream_breakdown(
     simulated_path = [
         {
             "phase": None,
-            "operation": row.get("operation") or row["name"],
+            "operation": _directional_operation(row.get("operation"), "simulated"),
             "duration_ms": float(row["critical_path_ms"]),
         }
         for row in breakdown["simulated_kernels"]
@@ -522,7 +529,7 @@ def _render_stream_breakdown(
     ]
     semantic_names = list(
         dict.fromkeys(
-            (row.get("operation") or "unmapped")
+            _directional_operation(row.get("operation"), "measured")
             for _label, rows in displayed_streams
             for row in rows
         )
@@ -547,7 +554,7 @@ def _render_stream_breakdown(
         left_ms = 0.0
         for row in rows:
             duration_ms = float(row["duration_ms"])
-            semantic_name = row.get("operation") or "unmapped"
+            semantic_name = _directional_operation(row.get("operation"), "measured")
             axis.barh(
                 y_position,
                 duration_ms,
