@@ -9,13 +9,16 @@ import pytest
 ANALYZER_PYTHON = Path(__file__).resolve().parents[1] / "analyzer" / "python"
 sys.path.insert(0, str(ANALYZER_PYTHON))
 
+from alignment_iteration import series_plot  # noqa: E402
 from alignment_iteration.series_plot import (  # noqa: E402
     _display_stream_rows,
     _evenly_sample_iteration_ids,
     _mapping_center_pairs,
+    _operation_comparison_labels,
     _output_is_current,
     _recommended_gpu_time_multiplier,
     _remove_stale_breakdown_outputs,
+    _render_stream_breakdown,
     _simulated_width_cumulative_error_steps,
     _stream_operation_rows,
 )
@@ -60,8 +63,10 @@ def test_sharded_records_are_read_by_byte_range_in_the_order_asked_for(tmp_path)
 
     payloads = tmp_path / "payloads"
     payloads.mkdir()
-    records = [{"iteration_id": iteration_id, "payload": "x" * iteration_id}
-               for iteration_id in (3, 7, 9, 11)]
+    records = [
+        {"iteration_id": iteration_id, "payload": "x" * iteration_id}
+        for iteration_id in (3, 7, 9, 11)
+    ]
     byte_ranges, blob = {}, b""
     for record in records:
         line = json.dumps(record).encode()
@@ -118,6 +123,22 @@ def test_simulated_width_cumulative_error_steps_use_critical_path_widths() -> No
     assert edges_ms == [0.0, 0.4, 1.0, 1.3]
     assert cumulative_errors_ms == pytest.approx([-0.4, -0.7, -0.4])
     assert cumulative_errors_ms[-1] == pytest.approx(1.3 - 1.7)
+
+
+def test_operation_comparison_labels_use_human_units_and_safe_percentages() -> None:
+    labels = _operation_comparison_labels(
+        ["attention", "sim-only"],
+        [{"operation": "attention", "duration_ms": 0.5}],
+        [
+            {"operation": "attention", "duration_ms": 0.75},
+            {"operation": "sim-only", "duration_ms": 0.2},
+        ],
+    )
+
+    assert labels == {
+        "attention": "attention | 500 µs | 750 µs | +50.0%",
+        "sim-only": "sim-only | 0 µs | 200 µs | n/a",
+    }
 
 
 def test_output_is_current_tracks_every_render_input(tmp_path: Path) -> None:
@@ -191,3 +212,60 @@ def test_stream_breakdown_uses_reduced_work_and_aggregates_small_streams() -> No
     assert sum(
         row["duration_ms"] for _label, stream in displayed for row in stream
     ) == pytest.approx(100.9)
+
+
+def test_stream_breakdown_reserves_a_non_overlapping_legend_band(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operation_names = [f"attention.indexer.long_semantic_operation_{index}" for index in range(30)]
+    kernels = [
+        {
+            "ph": "forward",
+            "op": operation,
+            "occ_ns": 1_000_000,
+            "iv": [[0, index * 1_000_000, (index + 1) * 1_000_000, 0, 0]],
+        }
+        for index, operation in enumerate(operation_names)
+    ]
+    breakdown = {
+        "iteration_id": 203,
+        "stage": "decode",
+        "critical_device_id": 0,
+        "measured_kernel_sum_ms": 30.0,
+        "measured_concurrent_hidden_ms": 0.0,
+        "simulated_kernels": [
+            {"name": operation, "operation": operation, "critical_path_ms": 1.0}
+            for operation in operation_names
+        ],
+    }
+    captured: dict[str, object] = {}
+
+    def capture_plot(fig, _path, **_kwargs) -> None:
+        captured["figure"] = fig
+
+    monkeypatch.setattr(series_plot, "save_plot", capture_plot)
+    _render_stream_breakdown(
+        breakdown,
+        {"measured": {"kernels": kernels}},
+        tmp_path / "breakdown.png",
+        run_label="layout-regression",
+    )
+
+    figure = captured["figure"]
+    figure.canvas.draw()
+    axis = figure.axes[0]
+    legend = figure.legends[0]
+    legend_bounds = legend.get_window_extent(figure.canvas.get_renderer()).transformed(
+        figure.transFigure.inverted()
+    )
+    xlabel_bounds = axis.xaxis.label.get_window_extent(figure.canvas.get_renderer()).transformed(
+        figure.transFigure.inverted()
+    )
+
+    assert axis.get_legend() is None
+    assert legend.get_title().get_text() == "operation | measured | simulated | Δ"
+    assert 0.0 <= legend_bounds.x0 < legend_bounds.x1 <= 1.0
+    assert (legend_bounds.x0 + legend_bounds.x1) / 2.0 == pytest.approx(0.5, abs=0.01)
+    assert 0.0 <= legend_bounds.y0 < legend_bounds.y1 < xlabel_bounds.y0
+    assert xlabel_bounds.y1 < axis.get_position().y0
+    series_plot.plt.close(figure)

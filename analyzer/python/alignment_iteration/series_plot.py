@@ -8,7 +8,7 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
-from common.figure import add_legend
+from common.figure import add_legend, fmt_ms
 from common.layout import (
     load_payload,
     plot_output_path,
@@ -29,6 +29,8 @@ MIN_STREAM_SHARE = 0.01
 # subject-level overview keeps the shared 300-DPI PNG default.
 BREAKDOWN_DPI = 150
 BREAKDOWN_PNG_OPTIONS = {"compress_level": 1}
+BREAKDOWN_WIDTH_INCHES = 18.0
+BREAKDOWN_LEGEND_COLUMNS = 4
 
 
 def render(log_dir: Path) -> list[Callable[[], Path]]:
@@ -337,8 +339,7 @@ def _display_stream_rows(rows_by_stream: dict[int, list[dict]]) -> list[tuple[st
         kept.add(ranked[0])
 
     displayed = [
-        (f"stream {track_index}", rows_by_stream[track_index])
-        for track_index in sorted(kept)
+        (f"stream {track_index}", rows_by_stream[track_index]) for track_index in sorted(kept)
     ]
     omitted = [track_index for track_index in ranked if track_index not in kept]
     if omitted:
@@ -377,6 +378,31 @@ def _compact_path_rows(rows: list[dict], target_ms: float) -> list[dict]:
         }
         for phase, operation in order
     ]
+
+
+def _operation_comparison_labels(
+    semantic_names: list[str], measured_path: list[dict], simulated_path: list[dict]
+) -> dict[str, str]:
+    """Format one measured-vs-simulated summary for each timeline color."""
+    measured_by_operation: dict[str, float] = defaultdict(float)
+    simulated_by_operation: dict[str, float] = defaultdict(float)
+    for row in measured_path:
+        measured_by_operation[row.get("operation") or "unmapped"] += float(row["duration_ms"])
+    for row in simulated_path:
+        simulated_by_operation[row.get("operation") or "unmapped"] += float(row["duration_ms"])
+
+    labels = {}
+    for name in semantic_names:
+        measured_ms = measured_by_operation[name]
+        simulated_ms = simulated_by_operation[name]
+        relative_pct = (
+            (simulated_ms - measured_ms) / measured_ms * 100.0
+            if measured_ms > 1.0e-12
+            else math.nan
+        )
+        relative_label = f"{relative_pct:+.1f}%" if math.isfinite(relative_pct) else "n/a"
+        labels[name] = f"{name} | {fmt_ms(measured_ms)} | {fmt_ms(simulated_ms)} | {relative_label}"
+    return labels
 
 
 def _render_stream_breakdown(
@@ -425,17 +451,20 @@ def _render_stream_breakdown(
         )
     )
     semantic_names.extend(
-        name
-        for name in (row["operation"] for row in simulated_path)
-        if name not in semantic_names
+        name for name in (row["operation"] for row in simulated_path) if name not in semantic_names
     )
     palette = plt.get_cmap("tab20")
     colors = {name: palette(index % palette.N) for index, name in enumerate(semantic_names)}
+    comparison_labels = _operation_comparison_labels(semantic_names, measured_path, simulated_path)
 
     labels = [f"GPU {device_id} {label}" for label, _rows in displayed_streams]
     labels.extend(["Nsight reduced critical path", "Timing-predict critical path"])
     rows_to_draw = [rows for _label, rows in displayed_streams] + [measured_path, simulated_path]
-    fig, axis = plt.subplots(figsize=(13.5, max(4.8, 0.62 * len(labels) + 2.7)))
+    legend_rows = math.ceil(len(semantic_names) / BREAKDOWN_LEGEND_COLUMNS)
+    legend_height_inches = 0.18 * legend_rows + 0.22
+    plot_height_inches = max(3.0, 0.62 * len(labels))
+    figure_height_inches = plot_height_inches + legend_height_inches + 1.30
+    fig, axis = plt.subplots(figsize=(BREAKDOWN_WIDTH_INCHES, figure_height_inches))
     for y_position, rows in enumerate(rows_to_draw):
         left_ms = 0.0
         for row in rows:
@@ -466,13 +495,32 @@ def _render_stream_breakdown(
         f"delta {delta_ms:+.3f} ms ({relative_pct:+.2f}%)",
         fontweight="bold",
     )
-    axis.legend(
-        handles=[Patch(facecolor=colors[name], label=name) for name in semantic_names],
-        loc="upper center",
-        frameon=False,
-        ncol=min(5, max(1, len(semantic_names))),
+    if semantic_names:
+        fig.legend(
+            handles=[
+                Patch(facecolor=colors[name], label=comparison_labels[name])
+                for name in semantic_names
+            ],
+            loc="lower left",
+            bbox_to_anchor=(0.02, 0.015, 0.96, 0.01),
+            mode="expand",
+            frameon=False,
+            ncol=BREAKDOWN_LEGEND_COLUMNS,
+            fontsize=8,
+            handlelength=1.2,
+            columnspacing=1.4,
+            title="operation | measured | simulated | Δ",
+            title_fontsize=8,
+        )
+    # The legend owns a figure-level band below the axes. Size that band in
+    # physical inches so long operation inventories cannot cover the stream
+    # rows, while retaining the pre-sized single-draw rendering contract.
+    fig.subplots_adjust(
+        left=0.17,
+        right=0.98,
+        top=1.0 - 0.85 / figure_height_inches,
+        bottom=(legend_height_inches + 0.60) / figure_height_inches,
     )
-    fig.tight_layout()
     save_plot(
         fig,
         out_path,
@@ -500,7 +548,7 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
     fig, (ax, cumulative_ax) = plt.subplots(
         2,
         1,
-        figsize=(18.0, fig_height),
+        figsize=(BREAKDOWN_WIDTH_INCHES, fig_height),
         gridspec_kw={"height_ratios": [3.5, 1.6]},
     )
 
