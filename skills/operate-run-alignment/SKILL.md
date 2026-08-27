@@ -147,6 +147,35 @@ kernels run after the marker closes), and do not subtract an iteration's own bus
 union from its host span and call the remainder idle or CPU overhead — it can be
 queue time occupied by a prior iteration.
 
+## Inspect emitted artifacts
+
+Use the artifact that owns the requested granularity; do not infer a
+per-physical-kernel error from rows that are joined many-to-one by semantic
+operation.
+
+| Question | Artifact and field |
+|---|---|
+| Per-iteration total error | `payloads/alignment_iteration_series.json` → `iterations[].delta_ms` / `relative_diff_pct` |
+| Per-iteration, per-operation error | `payloads/alignment_iteration_breakdowns.jsonl` → one iteration record's `operation_summary[]` |
+| Measured physical-kernel detail | The same breakdown record's `measured_kernels[]` |
+| Simulated CostTree-leaf detail | The same breakdown record's `simulated_kernels[]` |
+| Directional mapping gaps | The same breakdown record's `unmapped_measured_ms` / `unmapped_simulated_ms` |
+| Per-stream intervals and reduced occurrences | `payloads/alignment_timeline_iterations.jsonl` |
+| Mapping decisions and unresolved measured rows | `kernel_sequences_labeled.json` |
+| Whole-analysis aggregates and recommended multiplier | `reports/alignment_iteration_report.json` |
+
+`operation_summary[]` is the direct measured-versus-simulated comparison: it
+contains `measured_ms`, `simulated_ms`, `delta_ms`, and `relative_diff_pct` for
+each semantic operation in that iteration. Use `measured_kernels[]` and
+`simulated_kernels[]` to explain that row, but keep their different
+decompositions visible rather than manufacturing a one-to-one kernel join.
+
+The render step may sample iterations for PNG output; the JSON/JSONL payloads
+remain the machine-readable authority for every emitted iteration. When an
+Analyzer resource for the result is ready, user-visible numerical reporting
+must instead follow `operate-use-analyzer` and its typed-resource citation
+contract.
+
 ## Preserve one raw-evidence layer
 
 Reuse one capture-evidence parser for full serving runs and bounded repetitive
