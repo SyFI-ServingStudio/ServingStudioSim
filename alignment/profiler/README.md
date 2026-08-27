@@ -70,11 +70,12 @@ if git diff --name-only "$PRECOMPILED_BASE_COMMIT"..HEAD | \
   exit 1
 fi
 
-# Install the fork's Python over that base's precompiled CUDA-12 wheel. The
-# hosted CUDA-12 variant is cu129; its PTX still needs a compatible driver.
+# Install the fork's Python over that base's precompiled CUDA-13 wheel. This
+# checkout pins Torch 2.11 and CUDA-13 CUTLASS dependencies, so its native vLLM
+# extension must use the matching hosted cu130 variant.
 VLLM_USE_PRECOMPILED=1 \
   VLLM_PRECOMPILED_WHEEL_COMMIT="$PRECOMPILED_BASE_COMMIT" \
-  VLLM_PRECOMPILED_WHEEL_VARIANT=cu129 \
+  VLLM_PRECOMPILED_WHEEL_VARIANT=cu130 \
   uv pip install --python .venv/bin/python -e .
 
 # VLLM's profiling-only NVTX scopes import this optional package when
@@ -86,7 +87,7 @@ uv run --python .venv/bin/python python -c "import vllm, vllm.envs as e; print(v
 ```
 
 Import success is not a CUDA-runtime qualification: an older driver can load the
-cu129 extensions and still fail at their first PTX kernel with
+cu130 extensions and still fail at their first PTX kernel with
 `cudaErrorUnsupportedPtxVersion`. Verify that `vllm` and every required native
 extension resolve under this checkout, run `uv pip check`, and execute a small
 production kernel from each CUDA toolchain used by the target model. If the host
@@ -252,10 +253,15 @@ The separate `expert_popularity` pass sets
 request-timing artifact. Its only model-side ground truth is the expert-load
 record stream described above; timing evidence always comes from the NSYS pass.
 The resulting summary follows
-[`alignment/schema/expert_popularity_v2.schema.json`](../schema/expert_popularity_v2.schema.json):
+[`alignment/schema/expert_popularity_v3.schema.json`](../schema/expert_popularity_v3.schema.json):
 `counts_by_layer[layer][logical_expert]` is authoritative, while EP degree,
 top-k, aggregation scope, and the simulator's rank-major logical partition are
 explicit provenance rather than implicit loader assumptions.
+The raw expert-load JSONL preserves every emitted EPLB record. The aggregate
+uses the configured maximum scheduler/CUDA-graph token count as a conservation
+ceiling and excludes oversized records that flush work accumulated before the
+replay. `aggregation` records the ceiling, raw and accepted counts, and every
+discarded EPLB step.
 
 For long multi-GPU workloads, set `nsys.capture_duration_seconds` with
 `capture_mode: cuda_profiler_api`. The launcher stops CUPTI at that deadline but

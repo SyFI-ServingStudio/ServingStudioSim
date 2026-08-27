@@ -1,4 +1,4 @@
-"""Four explicit alignment phases under ``python -m launcher alignment``.
+"""Four explicit alignment phases plus report comparison under ``launcher alignment``.
 
 Each command accepts exactly its own YAML/JSON contract. Cross-stage commands
 consume completed artifact directories, never earlier config files. Launcher
@@ -94,6 +94,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("config", type=Path, help="Analyze phase YAML/JSON")
     analyze.add_argument("--build-type", default="release", help="Cargo profile.")
+
+    compare = commands.add_parser(
+        "compare", help="Compare aggregate errors from two completed kernel-align reports."
+    )
+    compare.add_argument("baseline", type=Path, help="Baseline analysis dir or report JSON")
+    compare.add_argument("candidate", type=Path, help="Candidate analysis dir or report JSON")
+    compare.add_argument(
+        "--limit", type=int, default=20, help="Maximum operation rows to print (default: 20)."
+    )
+    compare.add_argument("--json", action="store_true", help="Emit the complete comparison JSON.")
     return parser
 
 
@@ -547,6 +557,19 @@ def _run_analyze(args: argparse.Namespace) -> int:
     )
 
 
+def _run_compare(args: argparse.Namespace) -> int:
+    from .alignment_compare import compare_reports, render_comparison
+
+    if args.limit < 0:
+        raise ValueError("compare --limit must be nonnegative")
+    comparison = compare_reports(args.baseline, args.candidate)
+    if args.json:
+        print(json.dumps(comparison, indent=2))
+    else:
+        print(render_comparison(comparison, args.limit))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
@@ -558,6 +581,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_timing_predict(args)
         if args.command == "analyze":
             return _run_analyze(args)
+        if args.command == "compare":
+            return _run_compare(args)
         raise AssertionError(f"unhandled alignment command {args.command!r}")
     except (KeyError, OSError, ValueError) as exc:
         print(f"[invalid] alignment {args.command}: {exc}", file=sys.stderr)

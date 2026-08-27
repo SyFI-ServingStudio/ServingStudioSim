@@ -251,19 +251,31 @@ side): skill `top-add-kernel`; the Python registration alone is skill
 
 ## CLI
 
-`python -m profiling` is a thin wrapper over the `perf_api` facades (it never
-calls runners or `run_profile_batch` directly):
+The supported operator surface is `python -m launcher kernel-profile`. Its
+profiling commands remain thin wrappers over the `perf_api` facades and never
+call runners or `run_profile_batch` directly:
 
 ```
-python -m profiling list [--json]
-python -m profiling query         <table> --backend <b> [--spec '{...}'] [--specs file] [--gpu-name N] [--db path]
-python -m profiling count-missing <table> --backend <b> ...
-python -m profiling run           <table> --backend <b> [--force] ...    # JIT-fills (or force-refreshes) then reports
-python -m profiling measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2]
+python -m launcher kernel-profile list [--json]
+python -m launcher kernel-profile query         <table> --backend <b> [--spec '{...}'] [--specs file] [--gpu-name N] [--db path]
+python -m launcher kernel-profile count-missing <table> --backend <b> ...
+python -m launcher kernel-profile run           <table> --backend <b> [--force] ...
+python -m launcher kernel-profile measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2]
+python -m launcher kernel-profile merge-db LEFT.db RIGHT.db --output MERGED.db [--report REPORT.json]
 ```
 
 `run` enables JIT for the call (or uses `force=True`), so it is the one CLI verb
 that can launch real GPU work; `query`/`count-missing` are read-only.
+`python -m profiling` remains a developer-compatible alias for these subcommands.
+
+`merge-db` reads both inputs without modifying them. It copies rows and whole
+tables found on only one side and deduplicates rows whose declared
+`UNIQUE(gpu_name, backend, <args...>)` identity and payload agree. If the same
+identity has different measurement, provenance, or outlier state, no output DB
+is published: the command returns `1` and writes both versions to
+`<output>.merge-report.json` for explicit resolution. Surrogate `id` and
+insertion-only `created_at` do not create conflicts. Existing outputs are never
+overwritten, and there is deliberately no broad `--force` policy.
 
 Artifact-producing `run --output-dir` and `measure --output-dir` publish
 `artifact.meta.json` as `kernel_profile` and `kernel_measurement`, respectively,

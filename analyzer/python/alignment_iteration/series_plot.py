@@ -8,7 +8,7 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
-from common.figure import add_legend
+from common.figure import add_legend, fmt_ms
 from common.layout import (
     load_payload,
     plot_output_path,
@@ -25,10 +25,13 @@ BREAKDOWN_PLOTS_PER_DIR = 32
 MAX_STREAM_ROWS = 8
 MIN_STREAM_SHARE = 0.01
 # An 18-inch diagnostic canvas is 2700 px wide at 150 DPI. That fixed width
-# contains the two-column legend without an expensive tight-bbox redraw. The
+# contains the comparison table without an expensive tight-bbox redraw. The
 # subject-level overview keeps the shared 300-DPI PNG default.
 BREAKDOWN_DPI = 150
 BREAKDOWN_PNG_OPTIONS = {"compress_level": 1}
+BREAKDOWN_WIDTH_INCHES = 18.0
+BREAKDOWN_TABLE_BLOCKS = 3
+BREAKDOWN_TABLE_ROW_HEIGHT_INCHES = 0.20
 
 
 def render(log_dir: Path) -> list[Callable[[], Path]]:
@@ -47,15 +50,19 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
             iterations,
             plot_output_path(log_dir, "alignment_iteration_overview.png"),
             run_label=log_dir.name,
-        ),
-        partial(
-            _render_gpu_cycle_overall,
-            iterations,
-            plot_output_path(log_dir, "alignment_iteration_gpu_cycle_overview.png"),
-            run_label=log_dir.name,
-            gpu_time_multiplier=float(payload["meta"]["recommended_gpu_time_multiplier"]),
-        ),
+        )
     ]
+    gpu_time_multiplier = _recommended_gpu_time_multiplier(payload)
+    if gpu_time_multiplier is not None:
+        jobs.append(
+            partial(
+                _render_gpu_cycle_overall,
+                iterations,
+                plot_output_path(log_dir, "alignment_iteration_gpu_cycle_overview.png"),
+                run_label=log_dir.name,
+                gpu_time_multiplier=gpu_time_multiplier,
+            )
+        )
     # Sample first, read second. The breakdowns live in a byte-range-addressed
     # shard precisely so that rendering 128 of 2,040 iterations does not have to
     # parse the other 1,912.
@@ -115,6 +122,14 @@ def render(log_dir: Path) -> list[Callable[[], Path]]:
                 )
             )
     return jobs
+
+
+def _recommended_gpu_time_multiplier(payload: dict) -> float | None:
+    value = (payload.get("meta") or {}).get("recommended_gpu_time_multiplier")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and value >= 1.0 else None
 
 
 def _evenly_sample_iteration_ids(
@@ -325,8 +340,7 @@ def _display_stream_rows(rows_by_stream: dict[int, list[dict]]) -> list[tuple[st
         kept.add(ranked[0])
 
     displayed = [
-        (f"stream {track_index}", rows_by_stream[track_index])
-        for track_index in sorted(kept)
+        (f"stream {track_index}", rows_by_stream[track_index]) for track_index in sorted(kept)
     ]
     omitted = [track_index for track_index in ranked if track_index not in kept]
     if omitted:
@@ -367,6 +381,114 @@ def _compact_path_rows(rows: list[dict], target_ms: float) -> list[dict]:
     ]
 
 
+def _directional_operation(operation: str | None, source: str) -> str:
+    """Keep measured-only and simulated-only mapping gaps visibly separate."""
+    return operation if operation and operation != "unmapped" else f"unmapped ({source})"
+
+
+def _operation_comparison_rows(
+    semantic_names: list[str], measured_path: list[dict], simulated_path: list[dict]
+) -> list[dict]:
+    """Format aligned cells and mark the five largest absolute timing errors."""
+    measured_by_operation: dict[str, float] = defaultdict(float)
+    simulated_by_operation: dict[str, float] = defaultdict(float)
+    for row in measured_path:
+        operation = _directional_operation(row.get("operation"), "measured")
+        measured_by_operation[operation] += float(row["duration_ms"])
+    for row in simulated_path:
+        operation = _directional_operation(row.get("operation"), "simulated")
+        simulated_by_operation[operation] += float(row["duration_ms"])
+
+    rows = []
+    for name in semantic_names:
+        measured_ms = measured_by_operation[name]
+        simulated_ms = simulated_by_operation[name]
+        relative_pct = (
+            (simulated_ms - measured_ms) / measured_ms * 100.0
+            if measured_ms > 1.0e-12
+            else math.nan
+        )
+        relative_label = f"{relative_pct:+.1f}%" if math.isfinite(relative_pct) else "n/a"
+        rows.append(
+            {
+                "operation": name,
+                "measured": fmt_ms(measured_ms),
+                "simulated": fmt_ms(simulated_ms),
+                "relative": relative_label,
+                "absolute_error_ms": abs(simulated_ms - measured_ms),
+                "is_top_error": False,
+            }
+        )
+
+    top_error_indices = sorted(
+        range(len(rows)),
+        key=lambda index: (-rows[index]["absolute_error_ms"], index),
+    )[:5]
+    for index in top_error_indices:
+        rows[index]["is_top_error"] = True
+    return rows
+
+
+def _add_operation_comparison_tables(
+    fig,
+    comparison_rows: list[dict],
+    colors: dict[str, object],
+    *,
+    figure_height_inches: float,
+) -> None:
+    """Add side-by-side table blocks with truly aligned value columns."""
+    if not comparison_rows:
+        return
+
+    block_count = min(BREAKDOWN_TABLE_BLOCKS, len(comparison_rows))
+    rows_per_block = math.ceil(len(comparison_rows) / block_count)
+    blocks = [
+        comparison_rows[offset : offset + rows_per_block]
+        for offset in range(0, len(comparison_rows), rows_per_block)
+    ]
+    gap = 0.012
+    left = 0.02
+    total_width = 0.96
+    block_width = (total_width - gap * (block_count - 1)) / block_count
+    table_height_inches = BREAKDOWN_TABLE_ROW_HEIGHT_INCHES * (rows_per_block + 1)
+    table_height = table_height_inches / figure_height_inches
+
+    for block_index, block in enumerate(blocks):
+        table_axis = fig.add_axes(
+            [left + block_index * (block_width + gap), 0.015, block_width, table_height],
+            label=f"operation comparison table {block_index}",
+        )
+        table_axis.axis("off")
+        table = table_axis.table(
+            cellText=[
+                ["", row["operation"], row["measured"], row["simulated"], row["relative"]]
+                for row in block
+            ],
+            colLabels=["", "operation", "measured", "simulated", "Δ"],
+            colWidths=[0.025, 0.58, 0.14, 0.14, 0.115],
+            cellLoc="right",
+            bbox=[0.0, 0.0, 1.0, 1.0],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(7.5)
+        for (row_index, column_index), cell in table.get_celld().items():
+            cell.set_edgecolor("#D0D5DD")
+            cell.set_linewidth(0.35)
+            cell.PAD = 0.025
+            text = cell.get_text()
+            text.set_ha("left" if column_index == 1 else "right")
+            if row_index == 0:
+                cell.set_facecolor("#F2F4F7")
+                text.set_weight("bold")
+            else:
+                comparison_row = block[row_index - 1]
+                if column_index == 0:
+                    cell.set_facecolor(colors[comparison_row["operation"]])
+                    text.set_text("")
+                if comparison_row["is_top_error"]:
+                    text.set_weight("bold")
+
+
 def _render_stream_breakdown(
     breakdown: dict,
     timeline_iteration: dict,
@@ -399,7 +521,7 @@ def _render_stream_breakdown(
     simulated_path = [
         {
             "phase": None,
-            "operation": row.get("operation") or row["name"],
+            "operation": _directional_operation(row.get("operation"), "simulated"),
             "duration_ms": float(row["critical_path_ms"]),
         }
         for row in breakdown["simulated_kernels"]
@@ -407,28 +529,32 @@ def _render_stream_breakdown(
     ]
     semantic_names = list(
         dict.fromkeys(
-            (row.get("operation") or "unmapped")
+            _directional_operation(row.get("operation"), "measured")
             for _label, rows in displayed_streams
             for row in rows
         )
     )
     semantic_names.extend(
-        name
-        for name in (row["operation"] for row in simulated_path)
-        if name not in semantic_names
+        name for name in (row["operation"] for row in simulated_path) if name not in semantic_names
     )
     palette = plt.get_cmap("tab20")
     colors = {name: palette(index % palette.N) for index, name in enumerate(semantic_names)}
+    comparison_rows = _operation_comparison_rows(semantic_names, measured_path, simulated_path)
 
     labels = [f"GPU {device_id} {label}" for label, _rows in displayed_streams]
     labels.extend(["Nsight reduced critical path", "Timing-predict critical path"])
     rows_to_draw = [rows for _label, rows in displayed_streams] + [measured_path, simulated_path]
-    fig, axis = plt.subplots(figsize=(13.5, max(4.8, 0.62 * len(labels) + 2.7)))
+    table_blocks = min(BREAKDOWN_TABLE_BLOCKS, max(1, len(semantic_names)))
+    table_rows = math.ceil(len(semantic_names) / table_blocks)
+    table_height_inches = BREAKDOWN_TABLE_ROW_HEIGHT_INCHES * (table_rows + 1)
+    plot_height_inches = max(3.0, 0.62 * len(labels))
+    figure_height_inches = plot_height_inches + table_height_inches + 1.30
+    fig, axis = plt.subplots(figsize=(BREAKDOWN_WIDTH_INCHES, figure_height_inches))
     for y_position, rows in enumerate(rows_to_draw):
         left_ms = 0.0
         for row in rows:
             duration_ms = float(row["duration_ms"])
-            semantic_name = row.get("operation") or "unmapped"
+            semantic_name = _directional_operation(row.get("operation"), "measured")
             axis.barh(
                 y_position,
                 duration_ms,
@@ -454,13 +580,21 @@ def _render_stream_breakdown(
         f"delta {delta_ms:+.3f} ms ({relative_pct:+.2f}%)",
         fontweight="bold",
     )
-    axis.legend(
-        handles=[Patch(facecolor=colors[name], label=name) for name in semantic_names],
-        loc="upper center",
-        frameon=False,
-        ncol=min(5, max(1, len(semantic_names))),
+    _add_operation_comparison_tables(
+        fig,
+        comparison_rows,
+        colors,
+        figure_height_inches=figure_height_inches,
     )
-    fig.tight_layout()
+    # The tables own a figure-level band below the axes. Size that band in
+    # physical inches so long operation inventories cannot cover the stream
+    # rows, while retaining the pre-sized single-draw rendering contract.
+    fig.subplots_adjust(
+        left=0.17,
+        right=0.98,
+        top=1.0 - 0.85 / figure_height_inches,
+        bottom=(table_height_inches + 0.60) / figure_height_inches,
+    )
     save_plot(
         fig,
         out_path,
@@ -488,7 +622,7 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
     fig, (ax, cumulative_ax) = plt.subplots(
         2,
         1,
-        figsize=(18.0, fig_height),
+        figsize=(BREAKDOWN_WIDTH_INCHES, fig_height),
         gridspec_kw={"height_ratios": [3.5, 1.6]},
     )
 

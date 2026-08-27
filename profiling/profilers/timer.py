@@ -195,11 +195,15 @@ class Timer:
         max_rep: int | None = None,
         kernel_name: str | None = None,
         clear_l2: bool = True,
+        interval_union: bool = False,
     ) -> float:
         """Return average kernel-only runtime in milliseconds using CUPTI.
 
         Unlike the wall-clock timers, CUPTI records each launch's true kernel
-        duration. The default path measures ten launches, computes
+        duration. With ``interval_union=True``, overlapping physical kernels
+        count once, so a multi-stream fused callable is priced by GPU-active
+        union instead of summed residency. The default path measures ten
+        launches, computes
         ``ceil(min_duration_ms / estimate_ms)``, and records that many launches
         in one uninterrupted formal capture. With ``clear_l2=True`` (default),
         a read-only 64 MiB reduction displaces L2 before every logical launch;
@@ -230,6 +234,7 @@ class Timer:
                 "Timer.cupti: rep is mutually exclusive with min_duration_ms / min_rep / max_rep"
             )
         cupti = _load_cupti_module()
+        duration_kwargs = {"interval_union": True} if interval_union else {}
 
         if rep is not None:
             if rep <= 0:
@@ -243,6 +248,7 @@ class Timer:
                     clear_l2_before_run=clear_l2,
                     clear_l2_between_launches=clear_l2,
                     kernel_name_contains=kernel_name,
+                    **duration_kwargs,
                 )
                 return float(summary.mean_ms)
 
@@ -262,6 +268,7 @@ class Timer:
             clear_l2_before_run=clear_l2,
             clear_l2_between_launches=clear_l2,
             kernel_name_contains=kernel_name,
+            **duration_kwargs,
         )
         return float(summary.mean_ms)
 

@@ -40,6 +40,8 @@ class KernelPosition:
     track_index: int
     """Which concurrent track this position sits on. Tracks have no order
     between them, so no evidence key ever crosses this boundary."""
+    stream_role: str
+    """Whether this is the sequence's primary stream or a concurrent stream."""
     segment_index: int
     """Index inside the track's program — NOT across the whole sequence."""
     offset: int
@@ -64,6 +66,8 @@ class KernelPosition:
     """The immediately following kernel in the same body. This distinguishes
     an implementation-identical repeated layer boundary from a one-off model
     boundary such as the final norm."""
+    next_operation: str | None = None
+    """The immediately following kernel's mapped operation, when known."""
 
     @property
     def operation(self) -> str | None:
@@ -145,6 +149,7 @@ def walk_kernels(document: dict) -> Iterator[KernelPosition]:
         for sequence in block["unique_sequences"]:
             for track in sequence["tracks"]:
                 track_index = int(track["track_index"])
+                stream_role = str(track["stream_role"])
                 for segment_index, segment in enumerate(track["program"]):
                     repeat = segment_repeat(segment)
                     previous_name: str | None = None
@@ -156,6 +161,7 @@ def walk_kernels(document: dict) -> Iterator[KernelPosition]:
                             phase=phase,
                             sequence_id=sequence["sequence_id"],
                             track_index=track_index,
+                            stream_role=stream_role,
                             segment_index=segment_index,
                             offset=offset,
                             repeat=repeat,
@@ -165,6 +171,12 @@ def walk_kernels(document: dict) -> Iterator[KernelPosition]:
                             previous_operation=previous_operation,
                             next_name=(
                                 body[offset + 1]["name"] if offset + 1 < len(body) else None
+                            ),
+                            next_operation=(
+                                body[offset + 1].get("label", {}).get("operation")
+                                if offset + 1 < len(body)
+                                and body[offset + 1].get("label", {}).get("status") == "mapped"
+                                else None
                             ),
                         )
                         previous_operation = (

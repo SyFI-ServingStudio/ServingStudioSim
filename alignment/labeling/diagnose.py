@@ -164,8 +164,10 @@ def _label_body(label: dict) -> tuple:
 def _where(
     positions: list[KernelPosition],
     phase: str,
+    stream_role: str,
     after: str | None,
     after_name: str | None,
+    before: str | None,
     before_name: str | None,
 ) -> str:
     """A coordinate carrying one evidence key, plus how many share it."""
@@ -173,9 +175,11 @@ def _where(
         position
         for position in positions
         if position.phase == phase
+        and position.stream_role == stream_role
         and position.previous_operation == after
         and (None if position.previous_name is None else short_name(position.previous_name))
         == after_name
+        and position.next_operation == before
         and (None if position.next_name is None else short_name(position.next_name)) == before_name
     ]
     if not matching:
@@ -216,12 +220,16 @@ def check(document: dict) -> list[Finding]:
         # sharing one (phase, predecessor) key means the file states a
         # distinction it does not support, so one of the two is charged time
         # that belongs to the other.
-        evidence_of: dict[str, set[tuple[str, str | None, str | None, str | None]]] = {
+        evidence_of: dict[
+            str, set[tuple[str, str, str | None, str | None, str | None, str | None]]
+        ] = {
             operation: {
                 (
                     position.phase,
+                    position.stream_role,
                     position.previous_operation,
                     None if position.previous_name is None else short_name(position.previous_name),
+                    position.next_operation,
                     None if position.next_name is None else short_name(position.next_name),
                 )
                 for position in positions
@@ -239,16 +247,32 @@ def check(document: dict) -> list[Finding]:
             for left, right in collisions:
                 shared = sorted(
                     evidence_of[left] & evidence_of[right],
-                    key=lambda key: (key[0], key[1] or "", key[2] or "", key[3] or ""),
+                    key=lambda key: tuple(part or "" for part in key),
                 )
-                for phase, after, after_name, before_name in shared:
+                for phase, stream_role, after, after_name, before, before_name in shared:
+                    left_where = _where(
+                        operations[left],
+                        phase,
+                        stream_role,
+                        after,
+                        after_name,
+                        before,
+                        before_name,
+                    )
+                    right_where = _where(
+                        operations[right],
+                        phase,
+                        stream_role,
+                        after,
+                        after_name,
+                        before,
+                        before_name,
+                    )
                     lines.append(
-                        f"  (phase={phase}, after={after}, after_name={after_name}, "
-                        f"before_name={before_name})"
-                        f"\n    {left} at "
-                        f"{_where(operations[left], phase, after, after_name, before_name)}"
-                        f"\n    {right} at "
-                        f"{_where(operations[right], phase, after, after_name, before_name)}"
+                        f"  (phase={phase}, stream_role={stream_role}, after={after}, "
+                        f"after_name={after_name}, before={before}, before_name={before_name})"
+                        f"\n    {left} at {left_where}"
+                        f"\n    {right} at {right_where}"
                     )
             findings.append(
                 Finding(
@@ -258,7 +282,8 @@ def check(document: dict) -> list[Finding]:
                         f"position: {short_name(name)}"
                     ),
                     detail=(
-                        "Neither the phase nor either neighbour separates these, so the only "
+                        "Neither the phase, stream role, nor either neighbour separates these, "
+                        "so the only "
                         "thing behind the distinction is which folded segment the kernel sits "
                         "in — legitimate evidence (a full-index layer runs an indexer chain "
                         "that an index-share layer does not) but not something a rule can "

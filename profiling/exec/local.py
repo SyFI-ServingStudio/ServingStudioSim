@@ -12,7 +12,13 @@ from pathlib import Path
 
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec
-from profiling.exec.env import compose_library_path, compose_pythonpath, resolve_profile_env
+from profiling.exec.env import (
+    ContainerProfileEnv,
+    ProfileEnv,
+    compose_library_path,
+    compose_pythonpath,
+    resolve_profile_env,
+)
 from profiling.exec.payload import chunk_result_from_payload, resolve_chunk_backend
 from profiling.exec.pool import ChunkResult, GpuChunk, GpuPool
 
@@ -67,30 +73,10 @@ class LocalGpuChunk(GpuChunk):
                 ),
                 encoding="utf-8",
             )
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in self.gpus)
-            env["PYTHONPATH"] = compose_pythonpath(
-                profiler_env,
-                env.get("PYTHONPATH"),
-            )
-            if profiler_env.additional_library_paths:
-                env["LD_LIBRARY_PATH"] = compose_library_path(
-                    profiler_env,
-                    env.get("LD_LIBRARY_PATH"),
-                )
-
-            # One worker process handles the whole chunk payload, so Python,
-            # imports, CUDA context, and runner JIT setup are amortized per
-            # chunk instead of paid once per spec.
-            cmd = [
-                str(profiler_env.python_executable),
-                "-m",
-                "profiling.exec.local_worker",
-                "--worker-input",
-                str(input_path),
-                "--worker-output",
-                str(output_path),
-            ]
+            if isinstance(profiler_env, ContainerProfileEnv):
+                cmd, env = _container_worker_command(profiler_env, self.gpus, Path(tmp))
+            else:
+                cmd, env = _host_worker_command(profiler_env, self.gpus, input_path, output_path)
             completed = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
             if completed.returncode != 0:
                 error = (
@@ -105,6 +91,77 @@ class LocalGpuChunk(GpuChunk):
                 chunk_result_from_payload(result_payload)
                 for result_payload in worker_response["results"]
             ]
+
+
+def _host_worker_command(
+    profiler_env: ProfileEnv,
+    gpus: list[int],
+    input_path: Path,
+    output_path: Path,
+) -> tuple[list[str], dict[str, str]]:
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in gpus)
+    env["PYTHONPATH"] = compose_pythonpath(profiler_env, env.get("PYTHONPATH"))
+    if profiler_env.additional_library_paths:
+        env["LD_LIBRARY_PATH"] = compose_library_path(profiler_env, env.get("LD_LIBRARY_PATH"))
+    return (
+        [
+            str(profiler_env.python_executable),
+            "-m",
+            "profiling.exec.local_worker",
+            "--worker-input",
+            str(input_path),
+            "--worker-output",
+            str(output_path),
+        ],
+        env,
+    )
+
+
+def _container_worker_command(
+    profiler_env: ContainerProfileEnv,
+    gpus: list[int],
+    exchange_dir: Path,
+) -> tuple[list[str], dict[str, str]]:
+    cache_dir = Path(
+        os.environ.get(
+            "VIBESIM_PROFILE_CACHE_DIR",
+            Path.home() / ".cache" / "vibesim-profiler",
+        )
+    ).resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    gpu_request = f'"device={",".join(str(gpu) for gpu in gpus)}"'
+    return (
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--ipc",
+            "host",
+            "--gpus",
+            gpu_request,
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "--env",
+            "HOME=/cache/home",
+            "--env",
+            "USER=vibesim",
+            "--env",
+            "LOGNAME=vibesim",
+            "--volume",
+            f"{exchange_dir.resolve()}:/io",
+            "--volume",
+            f"{cache_dir}:/cache",
+            profiler_env.image,
+            "--worker-input",
+            "/io/input.json",
+            "--worker-output",
+            "/io/output.json",
+        ],
+        os.environ.copy(),
+    )
 
 
 def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10) -> list[int]:

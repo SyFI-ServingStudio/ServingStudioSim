@@ -1,6 +1,7 @@
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct RoutingDistribution {
     ppm: Vec<u32>,
+    layer_ppm: Vec<Vec<u32>>,
 }
 
 /// Split `ep_size` ranks into contiguous NVL domains of at most `nvl_num_gpu`
@@ -47,7 +48,10 @@ impl RoutingDistribution {
 
     pub fn from_profile(per_expert_ratios: &[f32]) -> Self {
         if per_expert_ratios.is_empty() {
-            return Self { ppm: Vec::new() };
+            return Self {
+                ppm: Vec::new(),
+                layer_ppm: Vec::new(),
+            };
         }
         let weights: Vec<f64> = per_expert_ratios
             .iter()
@@ -58,7 +62,10 @@ impl RoutingDistribution {
 
     pub fn uniform(num_experts: u32) -> Self {
         if num_experts == 0 {
-            return Self { ppm: Vec::new() };
+            return Self {
+                ppm: Vec::new(),
+                layer_ppm: Vec::new(),
+            };
         }
         let base = Self::TOTAL_PPM / num_experts;
         let remainder = Self::TOTAL_PPM % num_experts;
@@ -66,12 +73,18 @@ impl RoutingDistribution {
         for ppm_slot in ppm.iter_mut().take(remainder as usize) {
             *ppm_slot += 1;
         }
-        Self { ppm }
+        Self {
+            ppm,
+            layer_ppm: Vec::new(),
+        }
     }
 
     pub fn power_law(num_experts: u32, alpha: f32) -> Self {
         if num_experts == 0 {
-            return Self { ppm: Vec::new() };
+            return Self {
+                ppm: Vec::new(),
+                layer_ppm: Vec::new(),
+            };
         }
         let weights: Vec<f64> = (0..num_experts)
             .map(|rank| 1.0 / f64::from(rank + 1).powf(f64::from(alpha.max(0.0))))
@@ -88,7 +101,10 @@ impl RoutingDistribution {
     /// different skew.
     pub fn random(num_experts: u32, seed: u64) -> Self {
         if num_experts == 0 {
-            return Self { ppm: Vec::new() };
+            return Self {
+                ppm: Vec::new(),
+                layer_ppm: Vec::new(),
+            };
         }
         let mut rng = RoutingRng::new(seed);
         let weights: Vec<f64> = (0..num_experts).map(|_| rng.next_f64()).collect();
@@ -101,6 +117,51 @@ impl RoutingDistribution {
 
     pub fn ppm(&self) -> &[u32] {
         &self.ppm
+    }
+
+    pub fn layer_ppm(&self) -> &[Vec<u32>] {
+        &self.layer_ppm
+    }
+
+    pub fn from_layer_profiles(per_layer_ratios: &[Vec<f32>]) -> Self {
+        if per_layer_ratios.is_empty() {
+            return Self {
+                ppm: Vec::new(),
+                layer_ppm: Vec::new(),
+            };
+        }
+        let num_experts = per_layer_ratios[0].len();
+        assert!(
+            per_layer_ratios
+                .iter()
+                .all(|layer| layer.len() == num_experts),
+            "all routing layers must have the same expert count"
+        );
+        let layer_ppm: Vec<Vec<u32>> = per_layer_ratios
+            .iter()
+            .map(|layer| Self::from_profile(layer).ppm)
+            .collect();
+        let mut aggregate = vec![0.0_f64; num_experts];
+        for layer in per_layer_ratios {
+            for (total, ratio) in aggregate.iter_mut().zip(layer) {
+                *total += f64::from((*ratio).max(0.0));
+            }
+        }
+        let ppm = Self::from_weights(&aggregate).ppm;
+        Self { ppm, layer_ppm }
+    }
+
+    pub fn layerwise_ppm(&self, num_layers: u32) -> Vec<Vec<u32>> {
+        if self.layer_ppm.is_empty() {
+            vec![self.ppm.clone(); num_layers as usize]
+        } else {
+            assert_eq!(
+                self.layer_ppm.len(),
+                num_layers as usize,
+                "profile layer count must match the architecture"
+            );
+            self.layer_ppm.clone()
+        }
     }
 
     /// Largest-remainder (Hamilton) apportionment of `global_expert_selections` across
@@ -276,7 +337,10 @@ impl RoutingDistribution {
         {
             ppm[idx] += 1;
         }
-        Self { ppm }
+        Self {
+            ppm,
+            layer_ppm: Vec::new(),
+        }
     }
 }
 
@@ -315,19 +379,265 @@ impl RoutingRng {
     fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
     }
+
+    fn below(&mut self, bound: u32) -> u32 {
+        assert!(bound > 0, "random bound must be non-zero");
+        let bound = u64::from(bound);
+        let threshold = bound.wrapping_neg() % bound;
+        loop {
+            let value = self.next_u64();
+            if value >= threshold {
+                return (value % bound) as u32;
+            }
+        }
+    }
 }
 
-/// Drive weighted-WITHOUT-replacement top_k routing for `n_tokens` tokens and
-/// invoke `on_token` once per token with that token's realized hit state:
+#[derive(Debug)]
+struct SystematicCell {
+    upper_offset: u32,
+    experts: Vec<usize>,
+}
+
+/// One shuffled-systematic dependent-rounding law for a fixed expert
+/// distribution. Assignment shares `p[e]` become inclusion marginals
+/// `q[e] = top_k * p[e]`; each offset cell contains exactly `top_k` distinct
+/// experts, and its integer width is its exact probability mass in ppm units.
+#[derive(Debug)]
+struct SystematicCells {
+    cells: Vec<SystematicCell>,
+    num_experts: usize,
+}
+
+impl SystematicCells {
+    fn new(ppm: &[u32], top_k: u32, rng: &mut RoutingRng) -> Self {
+        let num_experts = ppm.len();
+        assert!(
+            top_k as usize <= num_experts,
+            "top_k {top_k} exceeds expert count {num_experts}"
+        );
+        assert_eq!(
+            ppm.iter().map(|&mass| u64::from(mass)).sum::<u64>(),
+            u64::from(RoutingDistribution::TOTAL_PPM),
+            "systematic routing requires a normalized global ppm distribution"
+        );
+
+        let total = u64::from(RoutingDistribution::TOTAL_PPM);
+        let mut order: Vec<usize> = (0..num_experts).collect();
+        for end in (1..order.len()).rev() {
+            let other = rng.below((end + 1) as u32) as usize;
+            order.swap(end, other);
+        }
+
+        let mut cumulative = 0u64;
+        let mut ends = Vec::with_capacity(num_experts);
+        let mut boundaries = vec![0u32];
+        for &expert in &order {
+            let inclusion_mass = u64::from(ppm[expert]) * u64::from(top_k);
+            assert!(
+                inclusion_mass <= total,
+                "infeasible distinct top-k marginals: top_k * ppm[{expert}] = {inclusion_mass} exceeds {}",
+                RoutingDistribution::TOTAL_PPM
+            );
+            cumulative += inclusion_mass;
+            ends.push(cumulative);
+            let residue = (cumulative % total) as u32;
+            if residue != 0 {
+                boundaries.push(residue);
+            }
+        }
+        assert_eq!(cumulative, u64::from(top_k) * total);
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries.push(RoutingDistribution::TOTAL_PPM);
+
+        let mut cells = Vec::with_capacity(boundaries.len().saturating_sub(1));
+        for bounds in boundaries.windows(2) {
+            let lower = bounds[0];
+            let upper = bounds[1];
+            if lower == upper {
+                continue;
+            }
+            let mut experts = Vec::with_capacity(top_k as usize);
+            for copy in 0..top_k {
+                let point = u64::from(lower) + u64::from(copy) * total;
+                let interval = ends.partition_point(|&end| end <= point);
+                experts.push(order[interval]);
+            }
+            debug_assert_eq!(experts.len(), top_k as usize);
+            debug_assert!({
+                let mut unique = experts.clone();
+                unique.sort_unstable();
+                unique.dedup();
+                unique.len() == experts.len()
+            });
+            cells.push(SystematicCell {
+                upper_offset: upper,
+                experts,
+            });
+        }
+        assert_eq!(
+            cells.last().map(|cell| cell.upper_offset),
+            Some(RoutingDistribution::TOTAL_PPM)
+        );
+        Self { cells, num_experts }
+    }
+
+    fn draw<'a>(&'a self, rng: &mut RoutingRng) -> &'a [usize] {
+        let offset = rng.below(RoutingDistribution::TOTAL_PPM);
+        let cell = self
+            .cells
+            .partition_point(|cell| cell.upper_offset <= offset);
+        &self.cells[cell].experts
+    }
+
+    fn sample_counts(&self, n_tokens: u32, rng: &mut RoutingRng) -> Vec<u32> {
+        let mut occupancy = vec![0u32; self.cells.len()];
+        for _ in 0..n_tokens {
+            let offset = rng.below(RoutingDistribution::TOTAL_PPM);
+            let cell = self
+                .cells
+                .partition_point(|cell| cell.upper_offset <= offset);
+            occupancy[cell] += 1;
+        }
+        let mut counts = vec![0u32; self.num_experts];
+        for (cell, count) in self.cells.iter().zip(occupancy) {
+            if count == 0 {
+                continue;
+            }
+            for &expert in &cell.experts {
+                counts[expert] += count;
+            }
+        }
+        counts
+    }
+}
+
+/// Sample one complete global expert-count histogram without materializing
+/// token-by-expert rows. Consumers must shard this returned realization rather
+/// than sampling each EP rank independently.
+pub fn sample_topk_expert_counts(ppm: &[u32], top_k: u32, n_tokens: u32, seed: u64) -> Vec<u32> {
+    let mut rng = RoutingRng::new(seed);
+    let cells = SystematicCells::new(ppm, top_k, &mut rng);
+    cells.sample_counts(n_tokens, &mut rng)
+}
+
+/// Sample every layer into a complete global histogram before any rank-local
+/// projection or cross-layer fold. The single RNG stream makes the synthetic
+/// iteration reproducible while keeping each layer draw independent.
+pub fn sample_layerwise_topk_expert_counts(
+    layer_ppm: &[Vec<u32>],
+    top_k: u32,
+    n_tokens: u32,
+    seed: u64,
+) -> Vec<Vec<u32>> {
+    let mut rng = RoutingRng::new(seed);
+    layer_ppm
+        .iter()
+        .map(|ppm| {
+            let cells = SystematicCells::new(ppm, top_k, &mut rng);
+            cells.sample_counts(n_tokens, &mut rng)
+        })
+        .collect()
+}
+
+/// Canonicalize complete per-layer global histograms and average them into one
+/// representative global histogram. Expert identities are sorted within each
+/// EP rank, then rank histograms are sorted by active experts, total rows, and
+/// shape. Only after every layer has that complete form are equal canonical
+/// cells accumulated and Hamilton-rounded as one vector.
+pub fn fold_layerwise_expert_counts(
+    layer_counts: &[Vec<u32>],
+    experts_per_rank: usize,
+) -> Vec<u32> {
+    assert!(!layer_counts.is_empty(), "cannot fold zero routing layers");
+    assert!(experts_per_rank > 0, "experts_per_rank must be non-zero");
+    let num_experts = layer_counts[0].len();
+    assert!(num_experts > 0, "cannot fold empty expert histograms");
+    assert_eq!(
+        num_experts % experts_per_rank,
+        0,
+        "expert count must divide evenly into EP ranks"
+    );
+    assert!(
+        layer_counts
+            .iter()
+            .all(|counts| counts.len() == num_experts),
+        "all routing layers must have the same expert count"
+    );
+
+    let mut sums = vec![0u64; num_experts];
+    let mut layer_total = None;
+    for counts in layer_counts {
+        let total = counts.iter().map(|&count| u64::from(count)).sum::<u64>();
+        assert_eq!(
+            *layer_total.get_or_insert(total),
+            total,
+            "all routing layers must contain the same assignment count"
+        );
+        let mut ranks: Vec<Vec<u32>> = counts
+            .chunks_exact(experts_per_rank)
+            .map(|rank| {
+                let mut rank = rank.to_vec();
+                rank.sort_unstable_by(|left, right| right.cmp(left));
+                rank
+            })
+            .collect();
+        ranks.sort_unstable_by(|left, right| {
+            let left_active = left.iter().filter(|&&count| count > 0).count();
+            let right_active = right.iter().filter(|&&count| count > 0).count();
+            let left_total = left.iter().map(|&count| u64::from(count)).sum::<u64>();
+            let right_total = right.iter().map(|&count| u64::from(count)).sum::<u64>();
+            right_active
+                .cmp(&left_active)
+                .then_with(|| right_total.cmp(&left_total))
+                .then_with(|| right.cmp(left))
+        });
+        for (sum, count) in sums.iter_mut().zip(ranks.into_iter().flatten()) {
+            *sum += u64::from(count);
+        }
+    }
+
+    let divisor = layer_counts.len() as u64;
+    let mut folded: Vec<u32> = sums.iter().map(|sum| (sum / divisor) as u32).collect();
+    let target = layer_total.expect("non-empty layers");
+    let assigned = folded.iter().map(|&count| u64::from(count)).sum::<u64>();
+    let mut residuals: Vec<usize> = (0..num_experts).collect();
+    residuals.sort_unstable_by(|&left, &right| {
+        (sums[right] % divisor)
+            .cmp(&(sums[left] % divisor))
+            .then_with(|| left.cmp(&right))
+    });
+    for &expert in residuals.iter().take((target - assigned) as usize) {
+        folded[expert] += 1;
+    }
+    folded
+}
+
+/// Sample complete global layer histograms, then fold them. This is the only
+/// combined entry point: it cannot sample or fold an EP rank in isolation.
+pub fn sample_and_fold_layerwise_topk_expert_counts(
+    layer_ppm: &[Vec<u32>],
+    top_k: u32,
+    n_tokens: u32,
+    experts_per_rank: usize,
+    seed: u64,
+) -> Vec<u32> {
+    let layers = sample_layerwise_topk_expert_counts(layer_ppm, top_k, n_tokens, seed);
+    fold_layerwise_expert_counts(&layers, experts_per_rank)
+}
+
+/// Drive shuffled-systematic top-k routing for `n_tokens` tokens and invoke
+/// `on_token` once per token with that token's realized hit state:
 /// `hit_rank[r]` / `hit_dom[d]` are the per-rank / per-domain DISTINCT-hit masks
 /// (deduped — a token hitting a rank's experts twice still flags it once).
 /// Experts map to ranks via [`balanced_expert_counts`], ranks to domains via
 /// [`ranks_per_nvl_domain`].
 ///
-/// This is the single source of the per-token routing law: the MoE comm
-/// simulator (`op::moe::sim`) consumes each token's hit set to price all six
-/// dispatch/combine stages' per-GPU bytes, so the sampling stays bit-identical
-/// (splitmix64 + fixed iteration order, only +/*/< on f64).
+/// [`SystematicCells`] is the single routing law. Expert compute consumes its
+/// compressed cell occupancy through [`sample_topk_expert_counts`]; communication
+/// consumes cell identities one token at a time because home placement is part
+/// of its cost. Neither path implements a second selection algorithm.
 pub(crate) fn for_each_routed_token(
     ppm: &[u32],
     top_k: u32,
@@ -356,35 +666,16 @@ pub(crate) fn for_each_routed_token(
             rr += 1;
         }
     }
-    let base_w: Vec<f64> = ppm.iter().map(|&p| f64::from(p)).collect();
-    let k = top_k.min(e as u32);
-    let mut w = base_w.clone();
+    let cells = SystematicCells::new(ppm, top_k, rng);
     let mut hit_rank = vec![false; ep_size as usize];
     let mut hit_dom = vec![false; ranks_per_domain.len()];
     for _ in 0..n_tokens {
-        w.clone_from(&base_w); // reuse allocation across tokens
         hit_rank.iter_mut().for_each(|h| *h = false);
         hit_dom.iter_mut().for_each(|h| *h = false);
-        let mut total: f64 = w.iter().sum();
-        for _ in 0..k {
-            if total <= 0.0 {
-                break;
-            }
-            let u = rng.next_f64() * total;
-            let mut acc = 0.0;
-            let mut chosen = e - 1;
-            for (i, &wi) in w.iter().enumerate() {
-                acc += wi;
-                if u < acc {
-                    chosen = i;
-                    break;
-                }
-            }
-            let rank = expert_rank[chosen];
+        for &expert in cells.draw(rng) {
+            let rank = expert_rank[expert];
             hit_rank[rank] = true;
             hit_dom[rank_domain[rank]] = true;
-            total -= w[chosen];
-            w[chosen] = 0.0;
         }
         on_token(&hit_rank, &hit_dom);
     }
@@ -393,8 +684,10 @@ pub(crate) fn for_each_routed_token(
 #[cfg(test)]
 mod tests {
     use crate::timing::routing::{
-        balanced_expert_counts, for_each_routed_token, ranks_per_nvl_domain, RoutingDistribution,
-        RoutingRng,
+        balanced_expert_counts, fold_layerwise_expert_counts, for_each_routed_token,
+        ranks_per_nvl_domain, sample_and_fold_layerwise_topk_expert_counts,
+        sample_layerwise_topk_expert_counts, sample_topk_expert_counts, RoutingDistribution,
+        RoutingRng, SystematicCells,
     };
 
     #[test]
@@ -534,6 +827,7 @@ mod tests {
         assert_eq!(pow_exact(base, 5), base * (squared * squared));
     }
 
+    #[test]
     fn to_per_expert_counts_floors_tiny_shard_to_one() {
         // ep=32 of 128 experts → 4 local experts, uniform ppm ≈ 7812 each
         // (Σ ≈ 31248 ≈ TOTAL_PPM/32). At low `global` the proportional share
@@ -627,5 +921,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn systematic_cells_exactly_preserve_inclusion_marginals() {
+        let dist = RoutingDistribution::from_profile(&[0.30, 0.25, 0.20, 0.15, 0.10]);
+        let top_k = 3u32;
+        let mut rng = RoutingRng::new(0x51_57_EA);
+        let plan = SystematicCells::new(dist.ppm(), top_k, &mut rng);
+        let mut marginal_mass = vec![0u64; dist.num_experts() as usize];
+        let mut lower = 0u32;
+        for cell in &plan.cells {
+            let width = u64::from(cell.upper_offset - lower);
+            let mut unique = cell.experts.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), top_k as usize);
+            for &expert in &cell.experts {
+                marginal_mass[expert] += width;
+            }
+            lower = cell.upper_offset;
+        }
+        assert_eq!(lower, RoutingDistribution::TOTAL_PPM);
+        for (expert, &mass) in marginal_mass.iter().enumerate() {
+            assert_eq!(mass, u64::from(top_k) * u64::from(dist.ppm()[expert]));
+        }
+    }
+
+    #[test]
+    fn compressed_counts_match_the_token_projection_bit_for_bit() {
+        let dist = RoutingDistribution::uniform(16);
+        let (top_k, n_tokens, seed) = (4u32, 2_000u32, 0xC0_11_A9_E5u64);
+        let compressed = sample_topk_expert_counts(dist.ppm(), top_k, n_tokens, seed);
+
+        let mut projected = vec![0u32; dist.num_experts() as usize];
+        let mut rng = RoutingRng::new(seed);
+        for_each_routed_token(
+            dist.ppm(),
+            top_k,
+            dist.num_experts(),
+            dist.num_experts(),
+            n_tokens,
+            &mut rng,
+            |hit_rank, _| {
+                assert_eq!(hit_rank.iter().filter(|&&hit| hit).count(), top_k as usize);
+                for (expert, &hit) in hit_rank.iter().enumerate() {
+                    projected[expert] += u32::from(hit);
+                }
+            },
+        );
+        assert_eq!(compressed, projected);
+        assert_eq!(compressed.iter().sum::<u32>(), n_tokens * top_k);
+    }
+
+    #[test]
+    fn layerwise_sampling_returns_complete_global_histograms() {
+        let layers = vec![
+            RoutingDistribution::uniform(8).ppm().to_vec(),
+            RoutingDistribution::from_profile(&[0.20, 0.18, 0.16, 0.14, 0.12, 0.08, 0.07, 0.05])
+                .ppm()
+                .to_vec(),
+        ];
+        let sampled = sample_layerwise_topk_expert_counts(&layers, 4, 1_024, 0x1A_FE_12);
+        assert_eq!(sampled.len(), layers.len());
+        assert!(sampled.iter().all(|counts| counts.len() == 8));
+        assert!(sampled
+            .iter()
+            .all(|counts| counts.iter().sum::<u32>() == 4_096));
+        assert_eq!(
+            sampled,
+            sample_layerwise_topk_expert_counts(&layers, 4, 1_024, 0x1A_FE_12)
+        );
+
+        let folded = sample_and_fold_layerwise_topk_expert_counts(&layers, 4, 1_024, 4, 0x1A_FE_12);
+        assert_eq!(folded.iter().sum::<u32>(), 4_096);
+        assert!(folded.iter().all(|&count| count <= 1_024));
+    }
+
+    #[test]
+    fn layerwise_fold_is_invariant_to_layer_and_expert_labels() {
+        let layers = vec![
+            vec![4, 1, 0, 3, 2, 0, 1, 1],
+            vec![1, 3, 2, 2, 0, 4, 0, 0],
+            vec![2, 0, 4, 2, 1, 1, 2, 0],
+        ];
+        let folded = fold_layerwise_expert_counts(&layers, 2);
+
+        let mut relabeled = layers.clone();
+        relabeled.reverse();
+        for layer in &mut relabeled {
+            for rank in layer.chunks_exact_mut(2) {
+                rank.swap(0, 1);
+            }
+            layer.rotate_left(2);
+        }
+        assert_eq!(folded, fold_layerwise_expert_counts(&relabeled, 2));
+        assert_eq!(folded.iter().sum::<u32>(), 12);
+    }
+
+    #[test]
+    #[should_panic(expected = "infeasible distinct top-k marginals")]
+    fn systematic_sampling_rejects_infeasible_inclusion_marginals() {
+        let dist = RoutingDistribution::from_profile(&[0.6, 0.2, 0.1, 0.1]);
+        let _ = sample_topk_expert_counts(dist.ppm(), 2, 32, 7);
     }
 }

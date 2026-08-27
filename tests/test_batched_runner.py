@@ -56,7 +56,11 @@ def test_batched_empty_list_returns_empty():
 
 def test_to_payload_success_round_trips_through_chunk_result():
     metrics = _compute(5)
-    payload = _to_payload(RunnerResult(metrics=metrics), gpu_name="NVIDIA H100")
+    payload = _to_payload(
+        RunnerResult(metrics=metrics),
+        gpu_name="NVIDIA H100",
+        runtime_versions={"cuda_version": "13.0", "backend_version": "0.23.0"},
+    )
 
     assert payload == {
         "ok": True,
@@ -68,11 +72,15 @@ def test_to_payload_success_round_trips_through_chunk_result():
             "energy_j": 0.0,
         },
         "gpu_name": "NVIDIA H100",
+        "cuda_version": "13.0",
+        "backend_version": "0.23.0",
     }
     chunk = chunk_result_from_payload(payload)
     assert chunk.metrics == metrics
     # The worker's reported name is physical-GPU provenance, not the DB cache key.
     assert chunk.observed_gpu_name == "NVIDIA H100"
+    assert chunk.cuda_version == "13.0"
+    assert chunk.backend_version == "0.23.0"
     assert chunk.error is None
 
 

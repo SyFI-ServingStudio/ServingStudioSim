@@ -532,6 +532,7 @@ def extract_expert_popularity(
     out_jsonl: Path,
     out_json: Path,
     *,
+    max_tokens_per_step: int,
     expert_parallel_size: int | None = None,
     experts_per_token: int | None = None,
     records: EngineRecords = VLLM_RECORDS,
@@ -546,8 +547,12 @@ def extract_expert_popularity(
         raise ValueError("expert_parallel_size must be positive")
     if experts_per_token is not None and experts_per_token <= 0:
         raise ValueError("experts_per_token must be positive")
+    if max_tokens_per_step <= 0:
+        raise ValueError("max_tokens_per_step must be positive")
 
-    records: list[dict] = []
+    raw_records: list[dict] = []
+    accepted_records: list[dict] = []
+    discarded_oversized_steps: list[int] = []
     expected_shape: tuple[int, int] | None = None
     expected_model: str | None = None
     aggregate_counts: list[list[int]] | None = None
@@ -618,33 +623,51 @@ def extract_expert_popularity(
             if expected_shape is None:
                 expected_shape = shape
                 aggregate_counts = [[0] * shape[1] for _ in range(shape[0])]
+                if expert_parallel_size is None or experts_per_token is None:
+                    raise ValueError(
+                        "schema-v1 expert-load records require explicit expert_parallel_size "
+                        "and experts_per_token fallbacks"
+                    )
+                if shape[1] % expert_parallel_size != 0:
+                    raise ValueError(
+                        f"num_logical_experts {shape[1]} must be divisible by "
+                        f"expert_parallel_size {expert_parallel_size}"
+                    )
+                if experts_per_token > shape[1]:
+                    raise ValueError(
+                        f"experts_per_token {experts_per_token} exceeds "
+                        f"num_logical_experts {shape[1]}"
+                    )
             elif shape != expected_shape:
                 raise ValueError(f"expert-load shape changed from {expected_shape} to {shape}")
+            layer_totals: list[int] = []
+            for layer_counts in counts:
+                layer_total = 0
+                for count in layer_counts:
+                    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                        raise ValueError("expert-load counts must be nonnegative integers")
+                    layer_total += count
+                layer_totals.append(layer_total)
+            output_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+            raw_records.append(record)
+
+            assert expert_parallel_size is not None and experts_per_token is not None
+            assignment_ceiling = max_tokens_per_step * expert_parallel_size * experts_per_token
+            if any(total > assignment_ceiling for total in layer_totals):
+                discarded_oversized_steps.append(eplb_step)
+                continue
+
             assert aggregate_counts is not None
             for layer_index, layer_counts in enumerate(counts):
                 for expert_index, count in enumerate(layer_counts):
-                    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-                        raise ValueError("expert-load counts must be nonnegative integers")
                     aggregate_counts[layer_index][expert_index] += count
-            output_file.write(json.dumps(record, separators=(",", ":")) + "\n")
-            records.append(record)
+            accepted_records.append(record)
 
-    if not records or expected_shape is None or aggregate_counts is None:
+    if not raw_records or expected_shape is None or aggregate_counts is None:
         raise ValueError("no VibeSimAlignmentExpertLoad records found in server log")
-    if expert_parallel_size is None or experts_per_token is None:
-        raise ValueError(
-            "schema-v1 expert-load records require explicit expert_parallel_size "
-            "and experts_per_token fallbacks"
-        )
-    if expected_shape[1] % expert_parallel_size != 0:
-        raise ValueError(
-            f"num_logical_experts {expected_shape[1]} must be divisible by "
-            f"expert_parallel_size {expert_parallel_size}"
-        )
-    if experts_per_token > expected_shape[1]:
-        raise ValueError(
-            f"experts_per_token {experts_per_token} exceeds num_logical_experts {expected_shape[1]}"
-        )
+    if not accepted_records:
+        raise ValueError("no expert-load records remain within the configured token ceiling")
+    assert expert_parallel_size is not None and experts_per_token is not None
 
     def normalize(counts: list[int]) -> list[float]:
         total = sum(counts)
@@ -654,7 +677,7 @@ def extract_expert_popularity(
         sum(layer[expert] for layer in aggregate_counts) for expert in range(expected_shape[1])
     ]
     summary = {
-        "schema_version": 2,
+        "schema_version": 3,
         "model": expected_model,
         "num_moe_layers": expected_shape[0],
         "num_logical_experts": expected_shape[1],
@@ -663,10 +686,14 @@ def extract_expert_popularity(
         "experts_per_token": experts_per_token,
         "count_semantics": "logical_routed_token_assignments",
         "aggregation": {
-            "scope": "all_captured_eplb_steps",
-            "observed_eplb_step_min": min(record["eplb_step"] for record in records),
-            "observed_eplb_step_max": max(record["eplb_step"] for record in records),
-            "record_count": len(records),
+            "scope": "captured_eplb_steps_within_token_ceiling",
+            "observed_eplb_step_min": min(record["eplb_step"] for record in accepted_records),
+            "observed_eplb_step_max": max(record["eplb_step"] for record in accepted_records),
+            "record_count": len(accepted_records),
+            "raw_record_count": len(raw_records),
+            "discarded_oversized_record_count": len(discarded_oversized_steps),
+            "discarded_oversized_eplb_steps": discarded_oversized_steps,
+            "max_tokens_per_step": max_tokens_per_step,
         },
         # The current simulator projects logical expert ids onto contiguous EP
         # rank shards before removing rank/expert identity. Name that modeling
@@ -682,7 +709,7 @@ def extract_expert_popularity(
         "probabilities_all_layers": normalize(all_layer_counts),
     }
     Path(out_json).write_text(json.dumps(summary, indent=2))
-    return len(records)
+    return len(accepted_records)
 
 
 def extract_dp_rank_by_device(

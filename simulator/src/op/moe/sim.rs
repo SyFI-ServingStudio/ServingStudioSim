@@ -664,18 +664,25 @@ mod tests {
 
     #[test]
     fn balanced_routing_spreads_load_evenly() {
-        // Uniform popularity + round-robin homes → per-rank dispatch_intra load is
-        // nearly flat (small cv): the regime where skew-blind models would agree.
+        // A systematic trial fixes one shuffled expert order, so its conditional
+        // co-occurrence pattern need not be rank-symmetric. Uniform routing is
+        // symmetric over independent shuffles, matching simulate_moe_comm's
+        // trial average.
         let dist = RoutingDistribution::uniform(64);
-        let steps = simulate_once(
-            dist.ppm(),
-            8,
-            &params(),
-            Placement::RoundRobin,
-            40_000,
-            0x1234,
-        );
-        let loads: Vec<u64> = (0..8).map(|r| load(&steps[1], r)).collect();
+        let mut loads = vec![0u64; 8];
+        for trial in 0..32u64 {
+            let steps = simulate_once(
+                dist.ppm(),
+                8,
+                &params(),
+                Placement::RoundRobin,
+                4_096,
+                0x1234 + trial,
+            );
+            for (rank, total) in loads.iter_mut().enumerate() {
+                *total += load(&steps[1], rank);
+            }
+        }
         assert!(
             cv(&loads) < 0.05,
             "uniform load not flat: cv={}",

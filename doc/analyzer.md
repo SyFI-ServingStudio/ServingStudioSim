@@ -112,33 +112,32 @@ categories:
 | `alignment-workload` | one scheduler iteration by recorded iteration id | full-run vLLM structured iteration metrics (NSYS window anchors the replay segment) + sim `cost_log` |
 
 For a symmetric tensor-parallel alignment, one measured iteration contains one
-range set per rank. The analyzer reduces each measured occurrence across its
-ranks into one replica critical-path contribution, then sums those — so the
-per-kernel segments and per-operation rows add up to the headline `measured_ms`,
-which is compared to the simulator's Sum/Max cost tree. The reduction depends on
-the mapping table's per-kernel `cross_rank` class, never on a category or name:
+range set per rank. The analyzer constructs a complete path independently on
+every physical device from that device's own NSYS intervals, then selects the
+longest arrival-reduced path. It never copies an occurrence maximum onto every
+device. Per-kernel and per-operation rows are interval-union contributions on
+the selected device, so they add up to the headline `measured_ms`.
 
-- **independent** (compute, point-to-point): the occurrence costs `max` over
-  ranks of `(end - start)`. Cross-rank compute imbalance stays real work on the
-  path — exactly what the single-rank sim cost under-models if it assumes balance.
+- **independent** (compute, point-to-point): the selected device contributes its
+  own interval-union duration. Rank imbalance remains visible in the per-device
+  candidates rather than being spliced operation-by-operation across ranks.
 - **synchronizing** (all-reduce / all-gather / all-to-all / fused all-reduce+norm):
   a barrier whose per-rank kernel duration includes waiting for the slowest rank
-  to arrive. The occurrence costs `max(end) - max(start)` — from "last rank
-  arrived" to "collective done" — which drops the arrival wait while keeping a
-  self-imbalanced collective's bottleneck rank. For a symmetric all-reduce this
-  equals `min(duration)`; for an imbalanced all-to-all it does not.
+  to arrive. After physical overlap attribution, the selected-device
+  contribution is capped at `max(end) - max(start)`, dropping arrival wait
+  without copying another rank's duration onto this device.
 
 The dropped arrival wait is not attributed to any kernel; it surfaces only in the
 wall-clock `measured_gpu_cycle_ms`. The kernel-align pass's derived duty-cycle
 multiplier `recommended_gpu_time_multiplier = Σ measured_gpu_cycle_ms / Σ
-measured_ms` spans exactly this gap, so its denominator shares the per-occurrence
-`measured_ms` reduction above. The pool excludes iterations whose duty-cycle
+measured_busy_union_ms` uses the physical per-iteration GPU busy union,
+independently of the selected-device `measured_ms` path. The pool excludes iterations whose duty-cycle
 factor is both above 2.0 and an MAD outlier within its own stage — one host stall
 would otherwise reach every simulated iteration through this single constant —
 and reports them in `meta.multiplier_excluded_iterations`; see
 `alignment/README.md` for why both halves of that test are needed. GPU durations from different ranks are never
-summed. `measured_busy_union_ms`
-retains the old cross-rank interval union for audit. The analyzer keeps per-device
+summed. `measured_busy_union_ms` is both physical audit evidence and the
+duty-cycle denominator. The analyzer keeps per-device
 populations so rank skew is auditable, and distinguishes raw `rank_launches` from
 `replica_calls` (symmetric launches divided by the captured device count). A shared
 folded label program is valid only when the parser has proved the exact ordered
@@ -168,17 +167,12 @@ carries each stream as its own **track**: kernels are serialized track-major
 track, and both the labeling walk's ordered-neighbour evidence and the analyzer's
 positional validation stop at a track edge.
 
-Adding per-occurrence durations across tracks would count their overlap twice, so
-the analyzer subtracts exactly that overlap: per device,
-`measured_concurrent_hidden_ms = Σ per-track busy union − union across tracks`,
-and `measured_ms = measured_kernel_sum_ms − measured_concurrent_hidden_ms`. It
-combines mapped work, unmapped work, and overlap on each device before selecting
-the longest complete device path; it never splices three maxima from different
-devices. Both
-terms are reported, because `measured_kernel_sum_ms` is the like-for-like partner
-of a CostTree that composes those operations with `Sum`. Within one track kernels
-never overlap, so a single-stream capture has zero hidden time and every number
-above is unchanged; the cross-rank reductions are untouched either way.
+Adding literal kernel durations would count overlap twice. The analyzer unions
+every selected-device interval before removing collective arrival wait. This
+covers cross-stream concurrency and same-track PDL;
+`measured_excluded_overlap_ms = measured_kernel_sum_ms -
+measured_physical_path_ms` reports the full deduction. The narrower
+`measured_concurrent_hidden_ms` remains an audit of the cross-track subset.
 
 The sampled breakdown shows only that selected device. Material tracks get their
 own compact row; small tracks are preserved in one explicit aggregate row rather

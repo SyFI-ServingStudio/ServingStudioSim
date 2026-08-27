@@ -9,12 +9,16 @@ import pytest
 ANALYZER_PYTHON = Path(__file__).resolve().parents[1] / "analyzer" / "python"
 sys.path.insert(0, str(ANALYZER_PYTHON))
 
+from alignment_iteration import series_plot  # noqa: E402
 from alignment_iteration.series_plot import (  # noqa: E402
     _display_stream_rows,
     _evenly_sample_iteration_ids,
     _mapping_center_pairs,
+    _operation_comparison_rows,
     _output_is_current,
+    _recommended_gpu_time_multiplier,
     _remove_stale_breakdown_outputs,
+    _render_stream_breakdown,
     _simulated_width_cumulative_error_steps,
     _stream_operation_rows,
 )
@@ -40,14 +44,29 @@ def test_evenly_sample_iteration_ids_sorts_and_keeps_small_inputs() -> None:
     assert _evenly_sample_iteration_ids(rows) == [3, 7, 9]
 
 
+@pytest.mark.parametrize("value", [None, 0.9812, float("nan"), True, "1.2"])
+def test_invalid_duty_cycle_multiplier_does_not_block_kernel_plots(value) -> None:
+    payload = {"meta": {"recommended_gpu_time_multiplier": value}}
+
+    assert _recommended_gpu_time_multiplier(payload) is None
+
+
+def test_valid_duty_cycle_multiplier_enables_gpu_cycle_plot() -> None:
+    payload = {"meta": {"recommended_gpu_time_multiplier": 1.2}}
+
+    assert _recommended_gpu_time_multiplier(payload) == 1.2
+
+
 def test_sharded_records_are_read_by_byte_range_in_the_order_asked_for(tmp_path) -> None:
     """A renderer sampling 2 of 4 iterations must not parse the other 2."""
     import json
 
     payloads = tmp_path / "payloads"
     payloads.mkdir()
-    records = [{"iteration_id": iteration_id, "payload": "x" * iteration_id}
-               for iteration_id in (3, 7, 9, 11)]
+    records = [
+        {"iteration_id": iteration_id, "payload": "x" * iteration_id}
+        for iteration_id in (3, 7, 9, 11)
+    ]
     byte_ranges, blob = {}, b""
     for record in records:
         line = json.dumps(record).encode()
@@ -104,6 +123,49 @@ def test_simulated_width_cumulative_error_steps_use_critical_path_widths() -> No
     assert edges_ms == [0.0, 0.4, 1.0, 1.3]
     assert cumulative_errors_ms == pytest.approx([-0.4, -0.7, -0.4])
     assert cumulative_errors_ms[-1] == pytest.approx(1.3 - 1.7)
+
+
+def test_operation_comparison_rows_format_cells_and_rank_absolute_error() -> None:
+    rows = _operation_comparison_rows(
+        ["attention", "sim-only"],
+        [{"operation": "attention", "duration_ms": 0.5}],
+        [
+            {"operation": "attention", "duration_ms": 0.75},
+            {"operation": "sim-only", "duration_ms": 0.2},
+        ],
+    )
+
+    assert rows == [
+        {
+            "operation": "attention",
+            "measured": "500 µs",
+            "simulated": "750 µs",
+            "relative": "+50.0%",
+            "absolute_error_ms": 0.25,
+            "is_top_error": True,
+        },
+        {
+            "operation": "sim-only",
+            "measured": "0 µs",
+            "simulated": "200 µs",
+            "relative": "n/a",
+            "absolute_error_ms": 0.2,
+            "is_top_error": True,
+        },
+    ]
+
+
+def test_operation_comparison_rows_separate_directional_mapping_gaps() -> None:
+    rows = _operation_comparison_rows(
+        ["unmapped (measured)", "unmapped (simulated)"],
+        [{"operation": None, "duration_ms": 0.4}],
+        [{"operation": None, "duration_ms": 0.2}],
+    )
+
+    assert [(row["operation"], row["measured"], row["simulated"]) for row in rows] == [
+        ("unmapped (measured)", "400 µs", "0 µs"),
+        ("unmapped (simulated)", "0 µs", "200 µs"),
+    ]
 
 
 def test_output_is_current_tracks_every_render_input(tmp_path: Path) -> None:
@@ -177,3 +239,71 @@ def test_stream_breakdown_uses_reduced_work_and_aggregates_small_streams() -> No
     assert sum(
         row["duration_ms"] for _label, stream in displayed for row in stream
     ) == pytest.approx(100.9)
+
+
+def test_stream_breakdown_reserves_aligned_non_overlapping_table_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operation_names = [f"attention.indexer.long_semantic_operation_{index}" for index in range(30)]
+    kernels = [
+        {
+            "ph": "forward",
+            "op": operation,
+            "occ_ns": 1_000_000,
+            "iv": [[0, index * 1_000_000, (index + 1) * 1_000_000, 0, 0]],
+        }
+        for index, operation in enumerate(operation_names)
+    ]
+    breakdown = {
+        "iteration_id": 203,
+        "stage": "decode",
+        "critical_device_id": 0,
+        "measured_kernel_sum_ms": 30.0,
+        "measured_concurrent_hidden_ms": 0.0,
+        "simulated_kernels": [
+            {"name": operation, "operation": operation, "critical_path_ms": 1.0}
+            for operation in operation_names
+        ],
+    }
+    captured: dict[str, object] = {}
+
+    def capture_plot(fig, _path, **_kwargs) -> None:
+        captured["figure"] = fig
+
+    monkeypatch.setattr(series_plot, "save_plot", capture_plot)
+    _render_stream_breakdown(
+        breakdown,
+        {"measured": {"kernels": kernels}},
+        tmp_path / "breakdown.png",
+        run_label="layout-regression",
+    )
+
+    figure = captured["figure"]
+    figure.canvas.draw()
+    axis = figure.axes[0]
+    xlabel_bounds = axis.xaxis.label.get_window_extent(figure.canvas.get_renderer()).transformed(
+        figure.transFigure.inverted()
+    )
+
+    assert axis.get_legend() is None
+    assert not figure.legends
+    table_axes = figure.axes[1:]
+    assert len(table_axes) == 3
+    assert all(table_axis.get_position().y1 < xlabel_bounds.y0 for table_axis in table_axes)
+    first_table = table_axes[0].tables[0]
+    assert [first_table[0, column].get_text().get_text() for column in range(5)] == [
+        "",
+        "operation",
+        "measured",
+        "simulated",
+        "Δ",
+    ]
+    operation_cells = [
+        table_axis.tables[0][row_index, 1]
+        for table_axis in table_axes
+        for row_index in range(1, len(table_axis.tables[0].get_celld()) // 5)
+    ]
+    assert all(cell.get_text().get_ha() == "left" for cell in operation_cells)
+    assert sum(cell.get_text().get_weight() == "bold" for cell in operation_cells) == 5
+    assert xlabel_bounds.y1 < axis.get_position().y0
+    series_plot.plt.close(figure)

@@ -44,10 +44,11 @@ use std::path::Path;
 
 use super::host::{self, HostWindow};
 use super::{
-    interval_union_ns, kernel_name_index, leaf_scales, load_inventory, load_sim_cases,
-    measure_iteration, measured_critical_path, measured_gpu_cycles_ms, occurrence_ns, read_json,
-    single_iter_manifest, CaseMapDoc, CompiledInventory, IterationMeasurement, MeasuredIteration,
-    ParsedTrace, SimCase,
+    duty_cycle_recommendation, interval_union_ns, kernel_name_index, leaf_scales, load_inventory,
+    load_sim_cases, measure_iteration, measured_critical_path, measured_gpu_cycles_ms,
+    occurrence_ns, physical_kernel_rows, pooled_gpu_time_multiplier, read_json,
+    screen_duty_cycle_outliers, single_iter_manifest, CaseMapDoc, CompiledInventory,
+    DutyCycleSample, IterationMeasurement, MeasuredIteration, ParsedTrace, SimCase,
 };
 use crate::alignment_input;
 use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
@@ -79,7 +80,7 @@ const SELECTION_RULE: &str = "every iteration in the capture, in iteration order
 
 const ANCHOR_RULE: &str = "min kernel start over the reference rank. Deliberately the same \
      expression `measured_gpu_cycle_ms` uses to bound a GPU iteration, so the sim \
-     lane's left edge and the duty-cycle denominator agree by construction. It is \
+     lane's left edge and the measured cycle boundary agree by construction. It is \
      an assumption about where a modelled iteration begins, not a measurement.";
 
 /// One iteration reduced to the scalars the selection rule needs. Cheap enough to
@@ -92,6 +93,8 @@ struct IterationSummary {
     identity_sequence: String,
     critical_device_id: Option<i64>,
     measured_ms: f64,
+    measured_physical_path_ms: f64,
+    measured_kernel_sum_ms: f64,
     simulated_ms: f64,
     relative_diff_pct: f64,
 }
@@ -173,6 +176,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     // `alignment-iteration`'s measured reduction rather than reading its report,
     // because a subject may not depend on another subject's output.
     let mut summaries = Vec::with_capacity(case_map.cases.len());
+    let mut duty_cycle_samples = Vec::with_capacity(case_map.cases.len());
     for joined in &case_map.cases {
         let measured_iter = measured_by_id
             .get(&joined.measured_iteration)
@@ -190,6 +194,14 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         })?;
         let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
         let measured_reduction = measured_critical_path(&measurement);
+        duty_cycle_samples.push(DutyCycleSample {
+            iteration: measured_iter.iteration,
+            stage: joined.stage.clone(),
+            measured_gpu_cycle_ms: gpu_cycles_ms.get(&measured_iter.iteration).copied(),
+            measured_busy_union_ms: measurement.busy_union_ms,
+            jit_stall_ms: measured_iter.jit_stall_ns as f64 / 1.0e6,
+            jit_module_loads: measured_iter.jit_module_loads,
+        });
         summaries.push(IterationSummary {
             case_index: joined.case_index,
             iteration_id: measured_iter.iteration,
@@ -201,6 +213,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 .to_string(),
             critical_device_id: measured_reduction.device_id,
             measured_ms: measured_reduction.critical_path_ms,
+            measured_physical_path_ms: measured_reduction.physical_path_ms,
+            measured_kernel_sum_ms: measured_reduction.kernel_sum_ms,
             simulated_ms: sim.total_ms,
             relative_diff_pct: relative_pct(
                 sim.total_ms - measured_reduction.critical_path_ms,
@@ -215,19 +229,12 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     // rather than read from its report, because a subject may not depend on
     // another subject's output; the sim lane's `x duty` bar is meaningless if the
     // two disagree.
-    let mut sum_measured_gpu_cycle_ms = 0.0;
-    let mut sum_measured_ms_with_cycle = 0.0;
-    for summary in &summaries {
-        if let Some(cycle_ms) = gpu_cycles_ms.get(&summary.iteration_id) {
-            sum_measured_gpu_cycle_ms += cycle_ms;
-            sum_measured_ms_with_cycle += summary.measured_ms;
-        }
-    }
-    let gpu_time_multiplier = if sum_measured_ms_with_cycle > 0.0 {
-        sum_measured_gpu_cycle_ms / sum_measured_ms_with_cycle
-    } else {
-        1.0
-    };
+    let (multiplier_excluded_iterations, sum_measured_gpu_cycle_ms, sum_measured_busy_union_ms) =
+        screen_duty_cycle_outliers(&duty_cycle_samples);
+    let raw_gpu_time_multiplier =
+        pooled_gpu_time_multiplier(sum_measured_gpu_cycle_ms, sum_measured_busy_union_ms);
+    let (gpu_time_multiplier, duty_cycle_unavailable_reason) =
+        duty_cycle_recommendation(raw_gpu_time_multiplier);
 
     let selected = select_iterations(&summaries, input.timeline_iterations.as_deref())?;
     eprintln!(
@@ -384,7 +391,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "reference_device_id": reported_reference_device_id,
         // Kernel-only sim time scaled by this is wall-clock GPU time, which is
         // what the sim lane's `x duty` bar draws against the measured GPU cycle.
+        "raw_gpu_time_multiplier": raw_gpu_time_multiplier,
         "recommended_gpu_time_multiplier": gpu_time_multiplier,
+        "duty_cycle_available": gpu_time_multiplier.is_some(),
+        "duty_cycle_unavailable_reason": duty_cycle_unavailable_reason,
+        "multiplier_excluded_iterations": multiplier_excluded_iterations,
         "iterations_available": summaries.len(),
         // Two different counts on purpose: the payload indexes every iteration,
         // the report writes up the distinguished ones.
@@ -636,27 +647,32 @@ fn build_iteration(
     reference_device_id: i64,
     time_origin_ns: u64,
     measured_gpu_cycle_ms: Option<f64>,
-    gpu_time_multiplier: f64,
+    gpu_time_multiplier: Option<f64>,
     host_context: Option<HostContext<'_>>,
     used_name_ids: &mut BTreeSet<u64>,
 ) -> Result<BuiltIteration> {
-    let simulated_gpu_cycle_ms = sim.total_ms * gpu_time_multiplier;
+    let simulated_gpu_cycle_ms = gpu_time_multiplier.map(|multiplier| sim.total_ms * multiplier);
     let offset = |ns: u64| (ns as i64) - (time_origin_ns as i64);
 
     // ---- measured -----------------------------------------------------------
+    let measured_reduction = measured_critical_path(measurement);
     let mut measured_operation_ms: BTreeMap<&str, f64> = BTreeMap::new();
     let mut measured_operation_rows: BTreeMap<&str, usize> = BTreeMap::new();
     let mut kernel_rows = Vec::with_capacity(measurement.kernels.len());
-    for (_, item) in &measurement.kernels {
+    for (kernel_index, (_, item)) in measurement.kernels.iter().enumerate() {
         let occurrence = occurrence_ns(&item.launches, item.synchronizing);
         if let Some(operation) = &item.operation {
             *measured_operation_ms.entry(operation.as_str()).or_default() +=
-                occurrence as f64 / 1e6;
+                measured_reduction.kernel_critical_ms[kernel_index];
             *measured_operation_rows
                 .entry(operation.as_str())
                 .or_default() += 1;
         }
-        used_name_ids.insert(item.name_id);
+        used_name_ids.extend(
+            item.physical_kernels
+                .keys()
+                .map(|identity| identity.name_id),
+        );
         let mut launches: Vec<_> = item.launches.clone();
         launches.sort_by_key(|launch| (launch.device_id, launch.start_ns));
         kernel_rows.push(json!({
@@ -665,8 +681,13 @@ fn build_iteration(
             "name_id": item.name_id,
             "cat": item.category,
             "op": item.operation,
+            "operation_ordinal": item.operation_ordinal,
+            "physical_kernels": physical_kernel_rows(item),
             "sync": item.synchronizing,
             "occ_ns": occurrence,
+            "selected_raw_ms": measured_reduction.kernel_raw_ms[kernel_index],
+            "selected_effective_ms": measured_reduction.kernel_effective_ms[kernel_index],
+            "selected_critical_ms": measured_reduction.kernel_critical_ms[kernel_index],
             "iv": launches
                 .iter()
                 .map(|launch| {
@@ -777,6 +798,8 @@ fn build_iteration(
         "simulated_gpu_cycle_ms": simulated_gpu_cycle_ms,
         "measured": {
             "critical_path_ms": summary.measured_ms,
+            "physical_path_ms": summary.measured_physical_path_ms,
+            "kernel_sum_ms": summary.measured_kernel_sum_ms,
             "critical_device_id": summary.critical_device_id,
             "busy_union_ms": measurement.busy_union_ms,
             "kernels": kernel_rows,
@@ -800,13 +823,17 @@ fn build_iteration(
         "identity_sequence": summary.identity_sequence,
         "selected_as": reason.label(),
         "measured_ms": summary.measured_ms,
+        "measured_physical_path_ms": summary.measured_physical_path_ms,
+        "measured_kernel_sum_ms": summary.measured_kernel_sum_ms,
         "critical_device_id": summary.critical_device_id,
         "simulated_ms": summary.simulated_ms,
         "delta_ms": summary.simulated_ms - summary.measured_ms,
         "relative_diff_pct": summary.relative_diff_pct,
         "measured_gpu_cycle_ms": measured_gpu_cycle_ms,
-        "simulated_gpu_cycle_ms": measured_gpu_cycle_ms.map(|_| simulated_gpu_cycle_ms),
-        "gpu_cycle_delta_ms": measured_gpu_cycle_ms.map(|cycle| simulated_gpu_cycle_ms - cycle),
+        "simulated_gpu_cycle_ms": measured_gpu_cycle_ms.and(simulated_gpu_cycle_ms),
+        "gpu_cycle_delta_ms": measured_gpu_cycle_ms
+            .zip(simulated_gpu_cycle_ms)
+            .map(|(cycle, simulated_cycle)| simulated_cycle - cycle),
         "measured_busy_union_ms": measurement.busy_union_ms,
         "measured_rows": measurement.kernels.len(),
         "reference_rank": reference.report(
@@ -1088,7 +1115,7 @@ fn definitions() -> Value {
         "gpu_span_ns": "reference rank's [first kernel start, last kernel end]. The correlated kernel span, NOT the NVTX range: under CUDA graphs the range can close before its own kernels finish",
         "measured.kernels[].iv": "one [device_id, start_ns, end_ns, correlation_id, track_index] per rank launch of this kernel position, unreduced. Bubbles are the complement of the union of these over the span, and must be computed from these raw intervals rather than from drawn geometry; correlation_id is the NSYS launch identity used to connect the CUDA API lane",
         "measured.kernels[].iv[4]": "the concurrent CUDA stream (track) this launch ran on, 0 being the one that opened the range. Launches on different tracks of one device overlap in wall time, so a single lane per device would draw them as if they had been serial: give each (device, track) its own lane. A single-stream capture has track 0 only and draws exactly as before",
-        "measured.kernels[].occ_ns": "this occurrence's cross-rank critical-path contribution (independent = slowest rank's duration; synchronizing collective = max(end) - max(start)). Their sum is measured.critical_path_ms",
+        "measured.kernels[].occ_ns": "this occurrence's cross-rank reduction retained for audit. selected_raw_ms, selected_effective_ms, and selected_critical_ms show the selected device's literal duration, interval-union contribution, and post-collective-arrival contribution; selected_critical_ms sums to measured.critical_path_ms",
         "simulated.slot_ms": "per-slot UNIT time. Feed these to the cost-tree unfold and let Scale{n} repeat them; critical-path-attributed times would render a losing Max branch as a zero-width leaf",
         "slot_multiplicity": "each slot's exact CostTree Scale multiplicity; folded workload = slot_ms x slot_multiplicity. Shared by every iteration because the tree shape is static",
         "operation_totals": "the ONLY sound join between the two lanes. occurrence_ratio is a counting ratio (3 measured kernels priced as 1 modelled leaf), never a per-kernel correspondence",
@@ -1115,6 +1142,8 @@ mod tests {
             identity_sequence: sequence.to_string(),
             critical_device_id: None,
             measured_ms: 1.0,
+            measured_physical_path_ms: 1.0,
+            measured_kernel_sum_ms: 1.0,
             simulated_ms: 1.0 + relative / 100.0,
             relative_diff_pct: relative,
         }

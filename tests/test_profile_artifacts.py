@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from launcher.artifact_kind import ARTIFACT_METADATA_FILENAME
 from profiling import cli
 from profiling.artifacts import (
     PROFILE_CURVE_FILENAME,
@@ -113,6 +114,7 @@ def test_profile_run_writes_immutable_snapshot(monkeypatch, tmp_path: Path) -> N
     assert cli._cmd_run(args) == 0
 
     assert {path.name for path in output_dir.iterdir()} == {
+        ARTIFACT_METADATA_FILENAME,
         PROFILE_REQUEST_FILENAME,
         PROFILE_RESULTS_FILENAME,
         PROFILE_CURVE_FILENAME,

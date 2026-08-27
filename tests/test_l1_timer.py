@@ -499,11 +499,21 @@ def test_timer_cupti_rep_uses_fixed_path(monkeypatch: pytest.MonkeyPatch):
         sys.modules, "profiling.profilers.cupti_kernel_profiler", _fake_cupti_module(calls)
     )
 
-    assert Timer.cupti(lambda: None, warmup=2, rep=7, kernel_name="g") == 3.0
+    assert (
+        Timer.cupti(
+            lambda: None,
+            warmup=2,
+            rep=7,
+            kernel_name="g",
+            interval_union=True,
+        )
+        == 3.0
+    )
     assert len(calls) == 3  # median of 3 aggregate runs
     assert all(c["_kind"] == "fixed" and c["num_iter"] == 7 for c in calls)
     assert all(c["clear_l2_before_run"] is True for c in calls)
     assert all(c["clear_l2_between_launches"] is True for c in calls)
+    assert all(c["interval_union"] is True for c in calls)
 
 
 def test_cupti_l2_displacement_reads_buffer_then_synchronizes(

@@ -7,7 +7,7 @@ keep. The decisions are the reviewable part — a rule states which evidence it
 rests on (`name`, `after`, `phase`) and which simulated slots it claims — while
 the 40 MB of labeled inventory it produces is derived.
 
-The three evidence keys are exactly the ones `operate-run-alignment` allows a
+The evidence keys are exactly the ones `operate-run-alignment` allows a
 name to be disambiguated by, and no others:
 
   * `name` — a fragment of the measured kernel name, always required;
@@ -22,8 +22,12 @@ name to be disambiguated by, and no others:
   * `before_name` — a fragment of the immediately following kernel's name. It
     distinguishes identical kernels at repeated layer and one-off model
     boundaries;
+  * `before` — the immediately following kernel's mapped operation, populated
+    by an earlier fixed-point pass;
   * `phase` — `forward` / `postprocess` / …, which is what separates the
     q_absorb batched GEMM from the lm_head that reuses the same tile.
+  * `stream_role` — `primary` / `concurrent`, for kernels reused on streams with
+    different execution roles.
 
 A rule claims simulated slots by suffix rather than by full name because one
 logical slot exists once per layer variant (dense, initial-shared, cycle-full-
@@ -42,6 +46,7 @@ from pathlib import Path
 from .inventory import load_slots, slots_ending, walk_kernels
 
 CROSS_RANK_VALUES = ("independent", "synchronizing")
+STREAM_ROLE_VALUES = ("primary", "concurrent")
 
 
 @dataclass(frozen=True)
@@ -57,8 +62,10 @@ class Rule:
     """Suffixes of the simulated slots this operation is compared against."""
     after: str | None = None
     after_name: str | None = None
+    before: str | None = None
     before_name: str | None = None
     phase: str | None = None
+    stream_role: str | None = None
     cross_rank: str = "independent"
     overwrite: bool = False
     """Replace an already-mapped label. Off by default: a pass that silently
@@ -77,8 +84,10 @@ class Rule:
             "slot_suffixes",
             "after",
             "after_name",
+            "before",
             "before_name",
             "phase",
+            "stream_role",
             "cross_rank",
             "overwrite",
             "note",
@@ -91,6 +100,11 @@ class Rule:
         cross_rank = record.get("cross_rank", "independent")
         if cross_rank not in CROSS_RANK_VALUES:
             raise ValueError(f"cross_rank must be one of {CROSS_RANK_VALUES}, got {cross_rank!r}")
+        stream_role = record.get("stream_role")
+        if stream_role is not None and stream_role not in STREAM_ROLE_VALUES:
+            raise ValueError(
+                f"stream_role must be one of {STREAM_ROLE_VALUES}, got {stream_role!r}"
+            )
         return Rule(
             name=record["name"],
             operation=record["operation"],
@@ -99,8 +113,10 @@ class Rule:
             slot_suffixes=tuple(record["slot_suffixes"]),
             after=record.get("after"),
             after_name=record.get("after_name"),
+            before=record.get("before"),
             before_name=record.get("before_name"),
             phase=record.get("phase"),
+            stream_role=stream_role,
             cross_rank=cross_rank,
             overwrite=bool(record.get("overwrite", False)),
             note=record.get("note", ""),
@@ -111,11 +127,15 @@ class Rule:
             return False
         if self.phase is not None and position.phase != self.phase:
             return False
+        if self.stream_role is not None and position.stream_role != self.stream_role:
+            return False
         if self.after is not None and position.previous_operation != self.after:
             return False
         if self.after_name is not None and (
             position.previous_name is None or self.after_name not in position.previous_name
         ):
+            return False
+        if self.before is not None and position.next_operation != self.before:
             return False
         if self.before_name is not None and (
             position.next_name is None or self.before_name not in position.next_name

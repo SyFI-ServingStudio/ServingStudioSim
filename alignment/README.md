@@ -181,8 +181,8 @@ has timing-predict or analysis fields.
 
 ### Expert-popularity artifact contract
 
-New captures write schema v2, formally described by
-[`alignment/schema/expert_popularity_v2.schema.json`](schema/expert_popularity_v2.schema.json).
+New captures write schema v3, formally described by
+[`alignment/schema/expert_popularity_v3.schema.json`](schema/expert_popularity_v3.schema.json).
 The authoritative tensor is `counts_by_layer[layer][logical_expert]`; each value
 is a nonnegative count of routed token-expert assignments, so one input token
 normally contributes `experts_per_token` assignments per MoE layer. Derived
@@ -196,9 +196,16 @@ ids `[rank * experts_per_rank, (rank + 1) * experts_per_rank)` form one EP-rank
 shard before rank/expert identities are canonicalized. It is a modeling
 partition, not a claim about a potentially rearranged physical EPLB placement.
 
-The Rust consumer treats v2 as a closed contract and rejects unknown fields or
-cross-field inconsistencies. Schema v1 remains read-only compatibility for
-existing run directories; the profiler no longer generates it.
+The raw JSONL retains every emitted record. The aggregate admits only records
+whose per-layer assignment count is within
+`max_tokens_per_step * expert_parallel_size * experts_per_token`; this excludes
+an initial EPLB record that flushes accumulated server warmup work. The summary
+records the raw, accepted, and discarded record counts and the discarded EPLB
+steps, so this filtering is auditable rather than implicit.
+
+The Rust consumer treats v2 and v3 as closed contracts and rejects unknown
+fields or cross-field inconsistencies. Schemas v1 and v2 remain read-only
+compatibility for existing run directories; the profiler generates v3.
 The instrumented vLLM raw record is also version 2 and supplies
 `expert_parallel_size` and `experts_per_token` from the running EPLB state;
 the summary extractor verifies that these values remain constant across the
@@ -383,6 +390,40 @@ uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml \
 uv run python -m launcher alignment analyze logs/<experiment>/analyze_e2e.yaml
 ```
 
+Kernel-align writes two complementary comparison views. The existing
+`total_iteration` distributions retain the unweighted mean and percentiles of
+per-iteration relative error. The `comparison` object adds duration-weighted
+totals for `all` and each observed stage:
+
+- signed error: `Σ(simulated_ms - measured_ms) / Σmeasured_ms`;
+- absolute error: `Σ|simulated_ms - measured_ms| / Σmeasured_ms`.
+
+`operations` uses the same totals and is ordered by descending absolute-error
+milliseconds. These rows join by semantic operation because measured CUDA
+kernels and simulated L1 slots are not generally one-to-one. The detailed
+physical rows remain in `payloads/alignment_iteration_breakdowns.jsonl`.
+
+Compare two completed kernel-align results without reopening either capture:
+
+```bash
+uv run python -m launcher alignment compare \
+  logs/<baseline>/analysis_kernel logs/<candidate>/analysis_kernel
+```
+
+Add `--json` for the complete machine-readable comparison or `--limit N` to
+control the displayed operation rows. The command subtracts the aggregates
+already emitted by Analyzer; it does not maintain a second metric formula.
+
+Analyzer also serves one iteration directly, using the payload's byte-range
+index rather than scanning the detail shard:
+
+```text
+/api/v1/alignments/{alignment_id}/subjects/iteration/iterations/{iteration_id}
+```
+
+That resource contains the iteration total, measured kernels, simulated slots,
+and semantic-operation summary.
+
 `--gpu-time-multiplier-from <kernel-align-dir>` makes the simulation read that
 pass's `recommended_gpu_time_multiplier` and inject it as
 `--override pools.main.groups.0.worker.gpu_time_multiplier=<v>` — no manual copy.
@@ -397,20 +438,20 @@ uv run python -m alignment parse --sqlite capture.sqlite --metrics metrics.jsonl
 ```
 
 The duty-cycle correction is derived by the analyzer's kernel-align pass, not a
-standalone command. It pools `Σ measured_gpu_cycle_ms / Σ measured_ms` over
+standalone command. It pools `Σ measured_gpu_cycle_ms / Σ measured_busy_union_ms` over
 iterations that have a next-iteration GPU cycle (a GPU cycle is one iteration's
 first attributed kernel start to the next kernel-bearing iteration's first kernel
 start on the same device; the terminal iteration per device is excluded). The
-numerator and denominator share the analyzer's per-occurrence cross-rank
-reduction, so the kernel-layer and GPU-cycle-layer gaps stay consistent. Treat
-the factor as experiment-specific, never a GPU-wide constant.
+denominator is the physical per-iteration kernel busy union, independent of
+Check 1's selected-device kernel-cost path. Treat the factor as
+experiment-specific, never a GPU-wide constant.
 
 **One outlying iteration can carry the correction.** The multiplier is a single
 constant baked into every simulated iteration, so a one-off host stall inside one
 measured iteration propagates to all of them. On a 966-iteration Qwen3.6 capture,
 one iteration held 1.77 s of GPU idle and supplied 41% of the whole correction.
 The pass therefore screens each iteration's duty-cycle factor
-(`measured_gpu_cycle_ms / measured_ms`) and drops it when the factor both exceeds
+(`measured_gpu_cycle_ms / measured_busy_union_ms`) and drops it when the factor both exceeds
 2.0 and is an Iglewicz-Hoaglin outlier (MAD modified z > 3.5) **within its own
 stage**, over a stage of at least 8 iterations. Excluded iterations and their
 evidence are listed in `meta.multiplier_excluded_iterations`; the rows keep their
@@ -445,12 +486,17 @@ never makes one.
 For tensor parallelism, every rank keeps its own normalized ranges. The folded
 labeling inventory stores one representative sequence only after proving that
 the ordered `(name, suggested_category)` sequence is identical on every device
-for every phase/iteration. Analysis applies those labels independently to each
-rank and reduces per occurrence across ranks (an independent op takes the
-max-rank duration; a synchronizing collective takes `max(end) − max(start)`,
-dropping arrival wait), never by summing GPU durations. The kernel-align
-multiplier is derived from this same per-occurrence measured population, so its
-`measured_ms` numerator matches the breakdown the analyzer reports.
+for every phase/iteration. Ranks driven by one scheduler are paired by exact
+iteration index and identical phase inventory; asynchronous host NVTX spans are
+not a join key. Independent data-parallel schedulers can have diverging counters,
+so the parser instead pairs only mutual, unique overlaps of attributed GPU-kernel
+envelopes. Missing kernel evidence, ambiguous overlap, and incomplete phase
+inventory remain explicitly unpaired. Analysis applies labels independently to
+each rank, then builds one interval-union path per physical device. A
+synchronizing collective is capped by `max(end) - max(start)` to remove arrival
+wait; independent work keeps the selected device's own contribution. The
+longest complete device path supplies the headline. Duty-cycle accounting stays
+separate and uses the physical all-device busy union described above.
 
 ## Concurrent CUDA streams: the track axis
 
@@ -478,14 +524,11 @@ resets `after` / `after_name` / `before_name` at the boundary, because those
 evidence keys mean "in the same execution stream" and there is no *before*
 between two things that ran at once.
 
-**Concurrency is subtracted, not summed.** `measured_concurrent_hidden_ms` is,
-per device, `Σ per-track busy union − union across tracks` — exactly the time
-the GPU was busy on more than one stream, which summing per-occurrence durations
-counts twice. `measured_ms` is `measured_kernel_sum_ms` minus that, and the
-duty-cycle multiplier uses the corrected denominator. With one track the two
-unions are the same and the difference is exactly zero, so every single-stream
-capture's numbers are unchanged bit for bit; the per-occurrence reductions above
-are untouched either way.
+**Concurrency is unioned, not summed.** The selected device's physical kernel
+intervals are unioned before collective arrival wait is removed. This counts
+both same-stream PDL and multi-stream overlap once. `measured_excluded_overlap_ms`
+reports the full deduction; `measured_concurrent_hidden_ms` retains the narrower
+cross-stream subset as audit evidence.
 
 Per operation and per measured kernel, `concurrent_hidden_ms` charges that
 overlap to the **later-starting track only** — the side stream that joined a

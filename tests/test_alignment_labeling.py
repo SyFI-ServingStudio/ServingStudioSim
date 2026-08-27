@@ -409,6 +409,67 @@ def test_a_phase_rule_separates_the_lm_head_from_the_decoder_tile(document):
     assert check(document) == []
 
 
+def test_a_stream_role_rule_separates_reused_kernels_on_concurrent_tracks():
+    document = {
+        "phases": {
+            "forward": {
+                "unique_sequences": [
+                    {
+                        "sequence_id": "sequence_two_roles",
+                        "tracks": _tracks(
+                            [{"kernels": [kernel("reused_tile")]}],
+                            [{"kernels": [kernel("reused_tile")]}],
+                        ),
+                    }
+                ]
+            }
+        }
+    }
+    rules = [
+        Rule(
+            name="reused_tile",
+            operation="moe.shared_expert.gate_up_proj",
+            type="model",
+            role="concurrent projection",
+            slot_suffixes=("router.router_gemm_bf16_proxy",),
+            stream_role="concurrent",
+        )
+    ]
+
+    report = apply_rules(document, rules, SLOTS)
+    positions = list(walk_kernels(document))
+    assert report.applied == {"moe.shared_expert.gate_up_proj": 1}
+    assert positions[0].operation is None
+    assert positions[1].operation == "moe.shared_expert.gate_up_proj"
+    assert check(document) == []
+
+
+def test_a_before_rule_uses_a_mapped_successor_from_an_earlier_pass(document):
+    reduction = Rule(
+        name="splitKreduce_kernel",
+        operation="moe.router.router_gemm",
+        type="model",
+        role="router reduction",
+        slot_suffixes=("router.router_gemm_bf16_proxy",),
+    )
+    producer = Rule(
+        name="nvjet_tile_TNT",
+        operation="moe.router.router_gemm",
+        type="model",
+        role="router producer",
+        slot_suffixes=("router.router_gemm_bf16_proxy",),
+        before="moe.router.router_gemm",
+    )
+
+    assert apply_rules(document, [reduction], SLOTS).applied == {
+        "moe.router.router_gemm": 1
+    }
+    assert apply_rules(document, [producer], SLOTS).applied == {"moe.router.router_gemm": 1}
+    positions = list(walk_kernels(document))
+    assert positions[1].operation == "moe.router.router_gemm"
+    assert positions[1].next_operation == "moe.router.router_gemm"
+
+
 def test_an_already_mapped_position_is_kept_and_reported_rather_than_overwritten(document):
     rules = [
         Rule(
@@ -516,6 +577,18 @@ def test_rules_load_from_a_file_and_reject_an_unknown_key(tmp_path):
 
     path.write_text(json.dumps([{"name": "x", "operation": "y", "typo_key": 1}]))
     with pytest.raises(ValueError, match="unknown keys"):
+        load_rules(path)
+
+    invalid_stream_role = {
+        "name": "x",
+        "operation": "y",
+        "type": "model",
+        "role": "test",
+        "slot_suffixes": ["lm_head"],
+        "stream_role": "side",
+    }
+    path.write_text(json.dumps([invalid_stream_role]))
+    with pytest.raises(ValueError, match="stream_role must be one of"):
         load_rules(path)
 
 

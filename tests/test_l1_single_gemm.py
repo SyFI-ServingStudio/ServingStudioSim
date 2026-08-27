@@ -33,6 +33,7 @@ from profiling.db.table import MissingEntry
 from profiling.exec import (
     ENV_REGISTRY,
     ChunkResult,
+    ContainerProfileEnv,
     GpuChunk,
     GpuPool,
     LocalGpuPool,
@@ -1454,21 +1455,8 @@ def test_documented_profile_env_registry_complete():
         == ENV_REGISTRY["default_env"].python_executable
     )
     vllm_env = ENV_REGISTRY["vllm_env"]
-    vllm_root = Path(__file__).parents[1] / "alignment" / "profiler" / "vllm"
-    assert vllm_env.python_executable == vllm_root / ".venv" / "bin" / "python"
-    worker_python_dir = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    vllm_site_packages = (
-        vllm_root
-        / ".venv"
-        / "lib"
-        / worker_python_dir
-        / "site-packages"
-    )
-    assert vllm_env.additional_python_paths == (vllm_root,)
-    assert vllm_env.additional_library_paths == (
-        vllm_root / ".venv" / "lib" / "cuda-compat",
-        vllm_site_packages / "torch" / "lib",
-    )
+    assert isinstance(vllm_env, ContainerProfileEnv)
+    assert vllm_env.image == "vibesim-profiler-vllm:cu130"
     vllm_env.validate()
 
 

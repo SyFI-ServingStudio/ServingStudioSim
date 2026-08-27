@@ -588,7 +588,7 @@ python -m launcher <preset.yaml|json> [<preset2.yaml|json> ...]
                    [--no-analyze] [--emit-backends [FILE]]
 python -m launcher timing-predict <config.yaml|json> [<config2.yaml|json> ...]
                    [--build-type <cargo-profile>] [--no-analyze]
-python -m launcher kernel-profile {list,query,count-missing,run,measure} ...
+python -m launcher kernel-profile {list,query,count-missing,run,measure,merge-db} ...
 python -m launcher list-params [--human] [--build-type ...]
 python -m launcher alignment sim <simulation.yaml|json> [simulation options]
 python -m launcher alignment profile <profile.yaml|json> [--dry-run]
