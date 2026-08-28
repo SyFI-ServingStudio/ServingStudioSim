@@ -61,8 +61,10 @@ pub(super) struct SemanticWork {
     pub(super) necessary_gpu_s: f64,
     /// Precision this row's math runs at. The labeler decides it per row because a
     /// checkpoint is mixed — an FP8 MoE still keeps its router and its BF16
-    /// FlashMLA kernel off the FP8 tensor cores.
-    pub(super) compute_dtype: String,
+    /// FlashMLA kernel off the FP8 tensor cores. None when the run's owning
+    /// checkout ships a labeler that predates per-row dtype; consumers fall
+    /// back to that pool's model dtype, which was the implicit rule then.
+    pub(super) compute_dtype: Option<String>,
 }
 
 pub(super) struct IterationLabel {
@@ -408,8 +410,7 @@ fn parse_labels(response: &Value) -> Result<ParsedLabels> {
                     compute_dtype: segment
                         .get("compute_dtype")
                         .and_then(Value::as_str)
-                        .context("semantic segment missing compute_dtype")?
-                        .to_string(),
+                        .map(str::to_owned),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -613,7 +614,10 @@ mod tests {
         assert_eq!(parsed.labels["main/0"].floors.fused, 2.0);
         assert_eq!(parsed.labels["main/0"].segments[0].name, "gemm");
         assert_eq!(parsed.labels["main/0"].segments[0].necessary_gpu_s, 0.5);
-        assert_eq!(parsed.labels["main/0"].segments[0].compute_dtype, "fp8");
+        assert_eq!(
+            parsed.labels["main/0"].segments[0].compute_dtype.as_deref(),
+            Some("fp8")
+        );
         let stats = parsed.composition_stats["main/0"];
         assert_eq!(stats.unique_shapes, 3);
         assert_eq!(stats.iterations, 9);

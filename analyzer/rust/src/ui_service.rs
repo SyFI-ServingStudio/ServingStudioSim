@@ -52,8 +52,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::optimality::{
-    iteration_kernel_ladder, iteration_waterfall, prediction_kernel_ladder, prediction_waterfall,
+    compute_scoped, iteration_kernel_ladder, iteration_waterfall, prediction_kernel_ladder,
+    prediction_waterfall,
 };
+use crate::session::build_session;
 use alignment::{
     alignment_artifact_bytes, alignment_descriptor,
     alignment_detail_index as build_alignment_detail_index,
@@ -398,6 +400,10 @@ fn service_router(state: ServiceState) -> Router {
         .route("/api/v1/sweeps", get(list_sweeps))
         .route("/api/v1/sweeps/latest", get(get_latest_sweep))
         .route("/api/v1/sweeps/{sweep_id}/payload", get(get_sweep_payload))
+        .route(
+            "/api/v1/runs/{run_id}/optimality-scoped",
+            get(get_run_optimality_scoped),
+        )
         .route("/api/v1/runs/{run_id}/descriptor", get(get_descriptor))
         .route("/api/v1/runs/{run_id}/summary", get(get_summary))
         .route("/api/v1/runs/{run_id}/topology", get(get_topology))
@@ -1225,6 +1231,92 @@ async fn get_summary(
     State(state): State<ServiceState>,
 ) -> Response {
     read_run_resource(state, run_id, |run| read_summary(&run)).await
+}
+
+#[derive(Deserialize)]
+struct ScopedOptimalityQuery {
+    path: Option<String>,
+    label: Option<String>,
+}
+
+/// Compute scoped optimality for one CostTree node on demand. Read-only: the
+/// CLI variant persists a report file, but a browser request must never write
+/// into the run directory.
+async fn get_run_optimality_scoped(
+    RoutePath(run_id): RoutePath<String>,
+    Query(query): Query<ScopedOptimalityQuery>,
+    State(state): State<ServiceState>,
+) -> Response {
+    if query.path.is_none() && query.label.is_none() {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "scope_selector_missing",
+            "Provide a `path` or `label` query parameter naming a CostTree node.",
+        );
+    }
+    let root_source = Arc::clone(&state.root_source);
+    let run = match tokio::task::spawn_blocking(move || {
+        let roots = root_source.load()?;
+        resolve_run(&roots, &run_id)
+    })
+    .await
+    {
+        Ok(Ok(run)) => run,
+        Ok(Err(error)) if error.downcast_ref::<RunNotFound>().is_some() => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "run_not_found",
+                "The requested run is not present below the configured logs roots.",
+            )
+        }
+        Ok(Err(error)) => {
+            eprintln!("[analyze] scoped optimality discovery failed: {error:#}");
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "The requested run resource could not be read.",
+            );
+        }
+        Err(error) => {
+            eprintln!("[analyze] scoped optimality worker failed: {error}");
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "The requested run resource could not be read.",
+            );
+        }
+    };
+    let ctx = build_session();
+    match compute_scoped(
+        &ctx,
+        &run.path,
+        query.path.as_deref(),
+        query.label.as_deref(),
+    )
+    .await
+    {
+        Ok((report, _slug)) => match serde_json::to_value(&report) {
+            Ok(value) => Json(value).into_response(),
+            Err(error) => {
+                eprintln!("[analyze] scoped optimality serialization failed: {error:#}");
+                problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "artifact_read_failed",
+                    "The scoped optimality report could not be serialized.",
+                )
+            }
+        },
+        // Selector mistakes and missing run artifacts both land here; the error
+        // chain names the exact cause, so pass it through for the UI to show.
+        Err(error) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "code": "scoped_optimality_failed",
+                "detail": format!("{error:#}"),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn get_topology(
