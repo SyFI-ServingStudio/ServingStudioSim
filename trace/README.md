@@ -18,6 +18,41 @@ uv run python trace/generate_fixed_shape.py "$TMPDIR/fixed.csv" \
 Zero interarrival time is an intentional burst. Use a positive spacing when the
 experiment needs a controlled offered rate rather than immediate saturation.
 
+## `diverse_100.csv` — the default alignment workload
+
+A fixed-shape trace answers "what is capacity at this shape"; alignment asks
+whether the model tracks measurement *across* shapes, and a workload that only
+visits one corner cannot tell a shape-independent error from a shape-dependent
+one. This is the spread-out counterpart: 100 requests, 100 distinct shapes.
+
+| | |
+|---|---|
+| `input_len` | 256 – 131,070, log-uniform, sum 2,061,718 |
+| `output_len` | 1 – 8,192, log-uniform, sum 135,244 |
+| `input_len + output_len` | at most 131,071, so **`max_model_len: 131072` is enough** |
+| arrivals | Poisson, mean 1 req/s, last at 114.9 s |
+
+Both axes are sampled in log space, so every decade is populated rather than the
+top one swamping the rest: 23 / 35 / 23 / 19 requests in the 256-1k, 1k-8k,
+8k-32k and 32k-128k prefill bands.
+
+Two properties are deliberate and worth not "tidying up":
+
+- **The lengths are not round numbers.** 20,233 and 45,282 rather than 16,384 and
+  32,768. Powers of two coincide with tile, page and CUDA-graph capture
+  boundaries, so a trace built from them measures the aligned case and hides the
+  padding behaviour of everything in between. Only the four pinned corners are
+  round, and only because they define the range.
+- **The four corners are pinned** — `(256, 1)`, `(256, 8192)`, `(131070, 1)`,
+  `(122879, 8192)` — so the file spans the stated range instead of merely
+  sampling near it. The two large ones sit just under the context limit, which is
+  also why the longest prefill is not paired with the longest generation: the sum
+  is capped so the whole trace fits a 128k context.
+
+Generated once and committed as data; there is no generator script, so the table
+above is the file's only description. Regenerate it by hand if the ranges need to
+move, and update these numbers with it.
+
 ## Session-wise traces
 
 Multi-round coding-agent traces carry a wider schema, one row per round:
