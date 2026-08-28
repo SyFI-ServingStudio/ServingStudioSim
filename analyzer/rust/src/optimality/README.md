@@ -115,6 +115,34 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   complete coverage, computes per-location `max(FLOPs/TFLOPS, bytes/BW)`, and
   attaches R6 plus redundant/under-accounted diagnostics atomically.
 
+## Offline scoped analysis
+
+`analyze optimality-scoped <run_dir> --path <path>` (or `--label <label>`) is a
+separate, CPU-only report path for one CostTree subtree. The path grammar is
+`[section/]child/child/...`, where `section` is the manifest section name and
+each child is a zero-based ordinal among that node's children. `root` may be
+used after the section name, so `iter`, `iter/root`, and `iter/1` select the
+`iter` root, the same root explicitly, and its second root child respectively.
+When the section is omitted it must resolve unambiguously. `--label` matches
+the node label exactly; `section::label` qualifies a label whose text occurs in
+more than one section. Supplying both flags is allowed only when they resolve
+to the same node. No-match and ambiguous selectors are errors.
+
+The command recursively includes every descendant leaf, including leaves below
+`Scale` nodes, and writes only
+`reports/optimality_scoped_<slug>.json`. The report contains `selection`,
+`rungs`, `omitted_rungs`, and `provenance`. `rungs` can contain only the
+subtree-defined values `r0_measured`, `r5_hardware_limit`,
+`r6_segmented_necessary`, and `r7_scope_fused_necessary`, all in GPU·seconds.
+`r0_measured` is the CostTree wall fold of the selected node times its
+physical-GPU count. R5 is the balanced leaf fold of
+`max(FLOPs / hardware TFLOP/s, bytes / HBM GB/s)`; communication leaves make
+R5 undefined. R6 and R7 require an exact semantic location map plus a
+reconciling `model.work` label for every selected worker. Cluster-level values
+such as idle, imbalance, communication, balanced, busy, and ignore-network are
+omitted with machine-readable `{rung, reason}` entries rather than being
+reported under a subtree label.
+
 ## Cost model notes
 
 - `G_worker` is **read** from `run_meta` (`workers[].gpu_ids.len()`), never inferred
