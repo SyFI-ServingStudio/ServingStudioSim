@@ -1,10 +1,20 @@
 # vLLM profiler container
 
-This image is the reproducibility boundary for VibeSim kernels registered with
+This image is the dependency boundary for VibeSim kernels registered with
 `subprocess_env="vllm_env"`. It pins CUDA 13.0, the instrumented vLLM checkout,
 the matching cu130 native wheel, Torch, FlashInfer, and the CUPTI build tools.
-The image contains the profiling source snapshot; it never imports Python or
-native extensions from the mounted host worktree.
+
+By default, profiling workers overlay the current worktree's `profiling/`,
+`launcher/`, and `gpu/` directories read-only. This development mode lets newly
+registered profilers run immediately while keeping vLLM, its virtual
+environment, and native extensions frozen inside the image.
+
+For a release measurement whose source must also be frozen, use the source
+snapshot baked into a clean image:
+
+```bash
+VIBESIM_PROFILE_SOURCE_MODE=image uv run python -m profiling run ...
+```
 
 Build from a clean checkout:
 
@@ -30,7 +40,8 @@ uv run python -m profiling run nvfp4_quant \
 ```
 
 The host remains responsible for GPU selection, profile DB writes, and artifact
-creation. Ordinary worker containers receive only a temporary JSON exchange
+creation. Development workers additionally receive the three read-only source
+overlays described above. All workers receive a temporary JSON exchange
 directory and a persistent JIT cache mounted at `/cache`; the cache-free
 `kernel-profile measure` diagnostic additionally mounts its explicit output
 directory so the container-owned CUPTI/NVML artifacts survive the worker. Plot
@@ -38,8 +49,9 @@ rendering remains optional and never controls measurement success. Set
 `VIBESIM_PROFILE_GPUS` only to GPUs reserved for the profiling job; otherwise
 the existing idle-GPU selection remains active.
 
-Release measurements require an image built from a clean tree. Record both the
-immutable image digest and the labels reported by:
+Release measurements require `VIBESIM_PROFILE_SOURCE_MODE=image` and an image
+built from a clean tree. Record both the immutable image digest and the labels
+reported by:
 
 ```bash
 docker image inspect vibesim-profiler-vllm:cu130

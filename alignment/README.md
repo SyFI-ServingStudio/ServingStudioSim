@@ -319,6 +319,13 @@ e2e:
   throughput_bins: 20
 ```
 
+When the full workload-metrics run and the bounded NSYS kernel capture use
+different trace populations, run the request-level E2E subject without the
+workload subject and set `e2e.server_gpu_throughput: false`. The report still
+uses the full real serving replay for client throughput and request latencies;
+it omits only the secondary first-to-last-NSYS-kernel throughput diagnostic.
+This mode never combines the bounded NSYS span with the full trace's tokens.
+
 One analyze config is exactly one phase: enable `iteration` (kernel-align) or
 `workload`/`e2e` (e2e-align), never both — the two write distinct typed manifests
 and mixing them is rejected. Every subject defaults to disabled, so a phase is

@@ -22,6 +22,10 @@ from profiling.exec.env import (
 from profiling.exec.payload import chunk_result_from_payload, resolve_chunk_backend
 from profiling.exec.pool import ChunkResult, GpuChunk, GpuPool
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_CONTAINER_SOURCE_MODE_ENV = "VIBESIM_PROFILE_SOURCE_MODE"
+_CONTAINER_SOURCE_DIRS = ("profiling", "launcher", "gpu")
+
 
 class LocalGpuPool(GpuPool):
     def __init__(self, gpus: list[int] | None = None):
@@ -126,6 +130,7 @@ def _container_worker_command(
     ).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     gpu_request = f'"device={",".join(str(gpu) for gpu in gpus)}"'
+    source_volume_args = _container_source_volume_args()
     volume_args = [
         argument
         for host_path, container_path in additional_volumes
@@ -154,6 +159,7 @@ def _container_worker_command(
             f"{exchange_dir.resolve()}:/io",
             "--volume",
             f"{cache_dir}:/cache",
+            *source_volume_args,
             *volume_args,
             profiler_env.image,
             "--worker-input",
@@ -163,6 +169,34 @@ def _container_worker_command(
         ],
         os.environ.copy(),
     )
+
+
+def _container_source_volume_args() -> list[str]:
+    """Select current-worktree code for development or the baked image snapshot.
+
+    The image owns the dependency boundary, including the instrumented vLLM
+    checkout, its virtual environment, and native extensions. Development mode
+    overlays only VibeSim's pure-Python worker code and GPU catalog read-only so
+    newly registered profilers run without rebuilding that dependency image.
+    Release measurements can request the fully frozen source snapshot with
+    ``VIBESIM_PROFILE_SOURCE_MODE=image``.
+    """
+
+    source_mode = os.environ.get(_CONTAINER_SOURCE_MODE_ENV, "worktree")
+    if source_mode == "image":
+        return []
+    if source_mode != "worktree":
+        raise ValueError(
+            f"{_CONTAINER_SOURCE_MODE_ENV} must be 'worktree' or 'image', got {source_mode!r}"
+        )
+
+    volume_args: list[str] = []
+    for directory in _CONTAINER_SOURCE_DIRS:
+        host_path = (_PROJECT_ROOT / directory).resolve()
+        if not host_path.is_dir():
+            raise FileNotFoundError(f"container source directory does not exist: {host_path}")
+        volume_args.extend(("--volume", f"{host_path}:/opt/vibesim/{directory}:ro"))
+    return volume_args
 
 
 def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10) -> list[int]:

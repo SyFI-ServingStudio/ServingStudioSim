@@ -768,6 +768,55 @@ def test_analyze_e2e_uses_distinct_full_run_workload_profile(tmp_path, monkeypat
     assert manifest["replay_result"] == str(replay)
 
 
+def test_analyze_e2e_can_omit_mismatched_nsys_server_throughput(tmp_path, monkeypatch):
+    paths = _phase_configs(tmp_path)
+    _write_timing_artifacts(tmp_path)
+    workload_profile = tmp_path / "workload_profile_run"
+    workload_profile.mkdir()
+    metrics = workload_profile / "metrics.jsonl"
+    replay = workload_profile / "replay.jsonl"
+    metrics.write_text("{}\n")
+    replay.write_text("")
+    base_profile = json.loads((tmp_path / "profile_run" / "profile_result.json").read_text())
+    full_trace = tmp_path / "trace" / "full.csv"
+    full_trace.write_text("id,input_len,output_len,arrival_time\n1,8,8,0\n")
+    workload_result = {
+        **base_profile,
+        "profile_kind": "workload_metrics",
+        "log_dir": str(workload_profile),
+        "metrics_jsonl": str(metrics),
+        "replay_result": str(replay),
+        "drive_summary": {
+            **base_profile["drive_summary"],
+            "source_trace": str(full_trace),
+        },
+    }
+    (workload_profile / "profile_result.json").write_text(json.dumps(workload_result))
+    analyze_raw = yaml.safe_load(paths["analyze_e2e"].read_text())
+    analyze_raw["workload_profile_log_dir"] = "./workload_profile_run"
+    analyze_raw["workload"] = {"enabled": False}
+    analyze_raw["e2e"]["server_gpu_throughput"] = False
+    paths["analyze_e2e"].write_text(yaml.safe_dump(analyze_raw))
+    calls = []
+    monkeypatch.setattr(
+        alignment_launcher,
+        "_launch_alignment_analysis",
+        lambda log_dir, **kwargs: calls.append((log_dir, kwargs)) or True,
+    )
+
+    assert alignment_launcher.main(["analyze", str(paths["analyze_e2e"])]) == 0
+
+    manifest = json.loads((tmp_path / "analysis_e2e_run" / "alignment_manifest.json").read_text())
+    assert manifest["parsed_nsys"] is None
+    assert manifest["replay_result"] == str(replay)
+    assert calls == [
+        (
+            (tmp_path / "analysis_e2e_run").resolve(),
+            {"build_type": "release", "subjects": ["alignment-e2e"]},
+        )
+    ]
+
+
 def test_analyze_rejects_all_subjects_disabled(tmp_path, capsys):
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["analyze_kernel"].read_text())

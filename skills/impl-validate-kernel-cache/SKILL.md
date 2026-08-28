@@ -137,6 +137,13 @@ profiling cost with a denser grid, adding a new cache/fitting mechanism, or
 changing the public query/input contract. After any remediation, rerun fidelity
 and report the new final CSV/log summary.
 
+Grid refinement must preserve the 500-feasible-coordinate design ceiling from
+`orchestrator-wire-kernel-to-rust`. If a denser candidate would exceed it, do
+not split the profiling work across calls. Remove non-independent axes or
+unreachable shapes, improve the physical projection or cache policy, or narrow
+the supported domain. Then validate the smaller grid against representative
+off-grid physical demand.
+
 Do not add an axis merely because an upstream artifact exposes it. First compare
 the absolute timing effect at matched shapes, the fidelity gain, feasible-grid
 growth, and DB migration cost. Aggregate coordinates are invalid when they hide

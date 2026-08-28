@@ -53,6 +53,13 @@ class IterationAnalysisPolicy:
 class E2EAnalysisPolicy:
     enabled: bool = False
     throughput_bins: int = 20
+    server_gpu_throughput: bool = True
+    """Whether to derive the secondary server-GPU throughput from NSYS.
+
+    Disable this for a full workload-metrics run paired with a bounded NSYS
+    kernel capture. Client throughput and request latency still come from the
+    full real serving run; no bounded GPU span is mixed into those results.
+    """
 
 
 @dataclass(frozen=True)

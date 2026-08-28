@@ -107,7 +107,11 @@ struct WorkloadPoint {
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read_e2e_align(log_dir)?;
     let simulation_log_dir = input.simulation_log_dir.as_path();
-    let measured = read_measured_points(&input.metrics_jsonl, &input.parsed_nsys)?;
+    let parsed_nsys = input
+        .parsed_nsys
+        .as_deref()
+        .context("alignment-workload requires a matching parsed NSYS anchor")?;
+    let measured = read_measured_points(&input.metrics_jsonl, parsed_nsys)?;
     ensure!(
         !measured.is_empty(),
         "full-run vLLM metrics contain no workload iterations"

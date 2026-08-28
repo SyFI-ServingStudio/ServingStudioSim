@@ -218,7 +218,9 @@ def _get(url: str, timeout: float = 5.0):
         return None, None
 
 
-def set_cuda_profile(base_url: str, *, active: bool, timeout: float = 120.0) -> None:
+def set_cuda_profile(
+    base_url: str, *, active: bool, timeout: float | None = None
+) -> None:
     """Arm or disarm the worker-owned CUDA profiler through SGLang's HTTP API.
 
     `activities=["CUDA_PROFILER"]` selects the `cudaProfilerStart/Stop` profiler
@@ -226,6 +228,11 @@ def set_cuda_profile(base_url: str, *, active: bool, timeout: float = 120.0) -> 
     waiting on -- instead of the torch profiler that would write its own trace.
     """
     action = "start_profile" if active else "stop_profile"
+    # Starting only arms CUPTI and should return promptly. Stopping also makes
+    # NSYS finalize the report in the worker, which can take several minutes
+    # for CUDA-graph-node traces with tens of millions of events.
+    if timeout is None:
+        timeout = 120.0 if active else 600.0
     payload = json.dumps({"activities": ["CUDA_PROFILER"]}).encode() if active else b"{}"
     request = urllib.request.Request(
         f"{base_url}/{action}",

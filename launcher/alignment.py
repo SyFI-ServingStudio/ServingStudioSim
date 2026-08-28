@@ -242,7 +242,10 @@ def _same_trace_source(left: Any, right: Any) -> bool:
 
 
 def _validate_e2e_profile_pair(
-    nsys_result: dict[str, Any], workload_result: dict[str, Any]
+    nsys_result: dict[str, Any],
+    workload_result: dict[str, Any],
+    *,
+    require_same_trace: bool = True,
 ) -> None:
     """Reject an E2E profile pair that cannot describe the same serving run.
 
@@ -269,7 +272,8 @@ def _validate_e2e_profile_pair(
     nsys_drive = nsys_result.get("drive_summary")
     workload_drive = workload_result.get("drive_summary")
     if isinstance(nsys_drive, dict) and isinstance(workload_drive, dict):
-        for field in ("source_trace", "frontend_type"):
+        fields = ("source_trace", "frontend_type") if require_same_trace else ("frontend_type",)
+        for field in fields:
             matches = (
                 _same_trace_source(nsys_drive.get(field), workload_drive.get(field))
                 if field == "source_trace"
@@ -389,14 +393,21 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
         workload_profile_result = _load_profile_result(config.workload_profile_log_dir)
         if config.workload_profile_log_dir.resolve() == config.profile_log_dir.resolve():
             workload_profile_result = profile_result
-        _validate_e2e_profile_pair(profile_result, workload_profile_result)
+        uses_nsys = config.workload.enabled or config.e2e.server_gpu_throughput
+        _validate_e2e_profile_pair(
+            profile_result,
+            workload_profile_result,
+            require_same_trace=uses_nsys,
+        )
         request_timings_result = _optional_profile_artifact(
             workload_profile_result, "request_timings_jsonl"
         )
         manifest = {
             **common,
             "workload_profile_log_dir": str(config.workload_profile_log_dir),
-            "parsed_nsys": str(_profile_artifact(profile_result, "parsed_nsys")),
+            "parsed_nsys": (
+                str(_profile_artifact(profile_result, "parsed_nsys")) if uses_nsys else None
+            ),
             "simulation_log_dir": str(config.simulation_log_dir),
             "metrics_jsonl": str(_profile_artifact(workload_profile_result, "metrics_jsonl")),
             "replay_result": str(_profile_artifact(workload_profile_result, "replay_result")),

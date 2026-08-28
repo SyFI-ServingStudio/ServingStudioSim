@@ -1045,7 +1045,7 @@ pub fn build(
         }
     };
 
-    let total_state_bytes_per_token = state_bytes_per_token(mtp_mode)?;
+    let total_state_bytes_per_token = state_bytes_per_token(ep_size, mtp_mode)?;
     let mut model = Glm52VllmNvfp4DsaMoeModel {
         name,
         mtp_mode,
@@ -1608,26 +1608,44 @@ fn expected_slot_count(ep_size: u16, mtp_mode: Glm52MtpMode) -> usize {
     }
 }
 
-fn state_bytes_per_token(mtp_mode: Glm52MtpMode) -> std::result::Result<u64, BuildError> {
-    let main_mla = u64::from(NUM_LAYERS)
+fn state_bytes_per_token(
+    ep_size: u16,
+    mtp_mode: Glm52MtpMode,
+) -> std::result::Result<u64, BuildError> {
+    // vLLM keeps both caches replicated on every TP rank. MLA stores one FP8
+    // (kv_lora_rank + rope_dim) vector. Every decoder layer also allocates its
+    // FP8 index key plus one FP32 scale, even when that layer reuses a previous
+    // layer's top-k result and skips the indexer compute.
+    let main_mla_per_rank = u64::from(NUM_LAYERS)
         .checked_mul(u64::from(KV_LORA_RANK + ROPE_DIM))
-        .and_then(|value| value.checked_mul(u64::from(DType::Bf16.size_bytes())))
+        .and_then(|value| value.checked_mul(u64::from(DType::Fp8E4m3.size_bytes())))
         .ok_or_else(|| fit_failed("main MLA state bytes overflow u64"))?;
-    let index = u64::try_from(FULL_INDEX_LAYERS.len())
-        .expect("full-index count fits u64")
+    let index_per_rank = u64::from(NUM_LAYERS)
         .checked_mul(u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes()))
         .ok_or_else(|| fit_failed("index state bytes overflow u64"))?;
-    let main = main_mla
-        .checked_add(index)
+    let main_per_rank = main_mla_per_rank
+        .checked_add(index_per_rank)
         .ok_or_else(|| fit_failed("main state bytes overflow u64"))?;
-    let mtp_mla = u64::from(KV_LORA_RANK + ROPE_DIM)
-        .checked_mul(u64::from(DType::Bf16.size_bytes()))
+    let mtp_mla_per_rank = u64::from(KV_LORA_RANK + ROPE_DIM)
+        .checked_mul(u64::from(DType::Fp8E4m3.size_bytes()))
         .ok_or_else(|| fit_failed("MTP MLA state bytes overflow u64"))?;
-    Ok(match mtp_mode {
-        Glm52MtpMode::Off => main,
-        Glm52MtpMode::FullIndex => main + mtp_mla + u64::from(INDEX_HEAD_DIM + 4),
-        Glm52MtpMode::IndexShare => main + mtp_mla,
-    })
+    let per_rank = match mtp_mode {
+        Glm52MtpMode::Off => Some(main_per_rank),
+        Glm52MtpMode::FullIndex => main_per_rank
+            .checked_add(mtp_mla_per_rank)
+            .and_then(|value| {
+                value.checked_add(u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes()))
+            }),
+        Glm52MtpMode::IndexShare => main_per_rank.checked_add(mtp_mla_per_rank),
+    }
+    .ok_or_else(|| fit_failed("per-rank state bytes overflow u64"))?;
+
+    // IterwiseUnifiedModel's KV contract is the physical total across all
+    // attention ranks. Multiplying the replicated per-rank allocation by TP
+    // keeps both worker capacity and PD wire-size accounting consistent.
+    per_rank
+        .checked_mul(u64::from(ep_size))
+        .ok_or_else(|| fit_failed("replicated state bytes overflow u64"))
 }
 
 #[cfg(test)]
@@ -1943,15 +1961,34 @@ mod tests {
 
     #[test]
     fn state_and_topology_contracts_are_exact() {
-        assert_eq!(state_bytes_per_token(Glm52MtpMode::Off).unwrap(), 92_628);
         assert_eq!(
-            state_bytes_per_token(Glm52MtpMode::FullIndex).unwrap(),
-            93_912
+            state_bytes_per_token(4, Glm52MtpMode::Off).unwrap(),
+            220_896
         );
         assert_eq!(
-            state_bytes_per_token(Glm52MtpMode::IndexShare).unwrap(),
-            93_780
+            state_bytes_per_token(4, Glm52MtpMode::FullIndex).unwrap(),
+            223_728
         );
+        assert_eq!(
+            state_bytes_per_token(4, Glm52MtpMode::IndexShare).unwrap(),
+            223_200
+        );
+    }
+
+    #[test]
+    fn replicated_fp8_cache_matches_the_profiled_vllm_capacity() {
+        // B200 vLLM startup evidence at gpu_memory_utilization=0.75 reported
+        // 17.55 GiB available per rank and exactly 341,120 cache tokens. The
+        // byte value below is independently recovered from that token count
+        // and vLLM's per-rank cache allocation, avoiding rounded GiB math.
+        const PROFILED_BYTES_PER_RANK: u64 = 18_838_010_880;
+        const PROFILED_TOKENS: u64 = 341_120;
+        const TP_SIZE: u16 = 4;
+
+        let total_bytes = PROFILED_BYTES_PER_RANK * u64::from(TP_SIZE);
+        let bytes_per_token = state_bytes_per_token(TP_SIZE, Glm52MtpMode::Off).unwrap();
+        assert_eq!(total_bytes / bytes_per_token, PROFILED_TOKENS);
+        assert_eq!(total_bytes % bytes_per_token, 0);
     }
 
     fn group(prefill_tokens: u32, decode_lens: Vec<u32>, pairs: Vec<(u32, u32)>) -> ArchGroupInput {

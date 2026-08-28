@@ -83,11 +83,22 @@ Ask the implementer to propose the Rust `KernelSpec` shape before writing code:
 - `cache_kind`;
 - `infeasible_mask()` if some grid cells cannot correspond to real shapes.
 
+A deliberately designed cache grid may contain at most **500 feasible
+coordinates** for one resolved `KernelConfig`, counted after
+`infeasible_mask()` and before multiplying by candidate backends. This is a
+design ceiling, not a profiling-batch limit. Do not split a larger grid across
+calls to evade it. If a proposal exceeds 500, reject it and inspect whether it
+cross-products axes that do not independently affect timing, retains
+unreachable shapes, or compensates for an inadequate cache or extrapolation
+policy. Redesign the axes, projection, cache policy, or supported domain before
+implementation.
+
 Things to verify:
 
 - the proposed `enumerate` emits exactly Python args fields plus `backend`;
 - Config fields and Input fields explain the model/kernel shape in stable terms;
 - cache axes are not confused with public query fields when a re-axis is used;
+- the proposal reports its feasible-coordinate count and it is at most 500;
 - `CacheKind` is one currently built in `timing/cache/mod.rs`, unless the user
   explicitly approved adding a new cache variant;
 - if multiple cache/grid choices are plausible, summarize tradeoffs and ask the

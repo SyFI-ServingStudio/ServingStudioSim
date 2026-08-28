@@ -111,6 +111,12 @@ does not prove the rows were saved.
 
 ### Automatic work submission
 
+When shapes originate from an alignment or simulation workload, do not replace
+that demand with a hand-authored fill sweep. Let timing-predict or simulation
+JIT-fill the exact requested shapes; use this skill only for read-only coverage
+inspection, a diagnosed missing/error-only retry, or explicit cache-fidelity
+work requested by the user.
+
 For one homogeneous table/backend/GPU-count request, generate the complete
 intended spec set and submit it in one public `profiling run --specs ...` call.
 Do not manually split that set across CLI calls for concurrency, GPU selection,
@@ -199,6 +205,8 @@ only after doing the exact action, or write `N/A: reason`.
   boundary, untimed setup/correctness, and representative input distribution.
 - [] Build the complete intended spec set. Confirm every spec has exactly the
   listed `args` fields and no routing-only fields such as `backend`.
+- [] If the shapes come from alignment or simulation, confirm timing-predict or
+  simulation produced the demand. Do not substitute a manual pre-fill sweep.
 - [] For a homogeneous multi-spec profiling request, write the complete set to
   one `--specs` input and record its count. Do not pre-shard it into multiple
   `run` calls.

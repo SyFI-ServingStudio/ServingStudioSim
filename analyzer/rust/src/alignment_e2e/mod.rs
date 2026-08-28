@@ -88,7 +88,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
 
     let simulation_log_dir = input.simulation_log_dir.as_path();
     let measured = read_measured_requests(&input.replay_result)?;
-    let server_gpu_span = read_server_gpu_span(&input.parsed_nsys)?;
+    let server_gpu_span = input
+        .parsed_nsys
+        .as_deref()
+        .map(read_server_gpu_span)
+        .transpose()?;
     let server_timings = input
         .request_timings_result
         .as_deref()
@@ -578,7 +582,7 @@ fn latency_cdf_comparison(
 fn throughput_series(
     measured: &BTreeMap<String, RequestMetrics>,
     simulated: &BTreeMap<String, RequestMetrics>,
-    server_gpu_span: ServerGpuSpan,
+    server_gpu_span: Option<ServerGpuSpan>,
     bins: usize,
 ) -> Value {
     let measured_end = max_completion(measured);
@@ -603,11 +607,8 @@ fn throughput_series(
     let measured_total: u64 = measured.values().map(|r| r.output_tokens).sum();
     let simulated_total: u64 = simulated.values().map(|r| r.output_tokens).sum();
     let measured_client_completion_tps = measured_total as f64 / (measured_end / 1000.0).max(1e-9);
-    let measured_server_gpu_span_tps =
-        measured_total as f64 / (server_gpu_span.span_ms / 1000.0).max(1e-9);
     let simulated_completion_tps = simulated_total as f64 / (simulated_end / 1000.0).max(1e-9);
-    json!({
-        "summary": {
+    let mut summary = json!({
             "bins": bins,
             "common_span_ms": end_ms,
             "measured_output_tokens": measured_total,
@@ -615,14 +616,41 @@ fn throughput_series(
             // Backward-compatible alias for the pre-server-throughput field.
             "measured_completion_tps": measured_client_completion_tps,
             "measured_client_completion_tps": measured_client_completion_tps,
-            "measured_server_gpu_span_tps": measured_server_gpu_span_tps,
             "simulated_completion_tps": simulated_completion_tps,
             "measured_client_completion_span_ms": measured_end,
-            "measured_server_gpu_span_ms": server_gpu_span.span_ms,
             "simulated_completion_span_ms": simulated_end,
-            "measured_server_gpu_iterations": server_gpu_span.iterations_with_kernels,
-            "measured_server_gpu_kernels": server_gpu_span.kernels,
-        },
+            "measured_server_gpu_span_available": server_gpu_span.is_some(),
+    });
+    if let Some(server_gpu_span) = server_gpu_span {
+        let measured_server_gpu_span_tps =
+            measured_total as f64 / (server_gpu_span.span_ms / 1000.0).max(1e-9);
+        let object = summary
+            .as_object_mut()
+            .expect("throughput summary is an object");
+        object.insert(
+            "measured_server_gpu_span_tps".into(),
+            json!(measured_server_gpu_span_tps),
+        );
+        object.insert(
+            "measured_server_gpu_span_ms".into(),
+            json!(server_gpu_span.span_ms),
+        );
+        object.insert(
+            "measured_server_gpu_iterations".into(),
+            json!(server_gpu_span.iterations_with_kernels),
+        );
+        object.insert(
+            "measured_server_gpu_kernels".into(),
+            json!(server_gpu_span.kernels),
+        );
+    } else {
+        summary.as_object_mut().expect("throughput summary is an object").insert(
+            "measured_server_gpu_span_unavailable_reason".into(),
+            json!("analysis omitted parsed NSYS because its request trace differs from the full workload run"),
+        );
+    }
+    json!({
+        "summary": summary,
         "series": {
             "t_start_ms": t_start_ms,
             "t_end_ms": t_end_ms,
@@ -699,11 +727,11 @@ mod tests {
         let value = throughput_series(
             &measured,
             &simulated,
-            ServerGpuSpan {
+            Some(ServerGpuSpan {
                 span_ms: 16.0,
                 iterations_with_kernels: 2,
                 kernels: 8,
-            },
+            }),
             2,
         );
         assert_eq!(value["series"]["measured_output_tps"][1], 1000.0);
@@ -711,6 +739,31 @@ mod tests {
         assert_eq!(value["summary"]["measured_client_completion_tps"], 1000.0);
         assert_eq!(value["summary"]["measured_server_gpu_span_tps"], 625.0);
         assert_eq!(value["summary"]["simulated_completion_tps"], 500.0);
+    }
+
+    #[test]
+    fn completion_throughput_omits_server_gpu_fields_without_nsys() {
+        let requests = BTreeMap::from([(
+            "1".into(),
+            RequestMetrics {
+                output_tokens: 10,
+                completion_ms: 10.0,
+                ttft_ms: None,
+                tpot_ms: None,
+                e2e_ms: None,
+            },
+        )]);
+
+        let value = throughput_series(&requests, &requests, None, 2);
+
+        assert_eq!(
+            value["summary"]["measured_server_gpu_span_available"],
+            false
+        );
+        assert!(value["summary"]
+            .get("measured_server_gpu_span_tps")
+            .is_none());
+        assert_eq!(value["summary"]["measured_client_completion_tps"], 1000.0);
     }
 
     #[test]

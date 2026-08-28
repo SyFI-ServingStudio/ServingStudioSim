@@ -66,6 +66,15 @@ Require launcher metadata to declare the producer/artifact kind explicitly
 incidental file such as `raw/run_meta.json`. A consumer must reject absent or
 unknown producer kinds rather than choosing semantics from directory contents.
 
+When several cases have independent artifact roots, run the same phase for all
+ready cases concurrently. Complete shared prerequisites once (build, profile DB,
+labels or common configuration), then fan out the cases and collect their exit
+statuses separately. Do not serialize independent experiments merely to make
+failure attribution easier: their disjoint output roots already provide that
+attribution. Respect real resource conflicts, such as a bounded GPU pool or an
+exclusive launcher lease, but let the repository's resource manager schedule
+those constraints instead of serializing the whole campaign in advance.
+
 1. **Profile** — instrumented vLLM or SGLang. Preflight the GPU, port, NSYS,
    model cache, and fork venv (`fork_python` must import `torch` and the
    selected engine).
@@ -103,6 +112,15 @@ unknown producer kinds rather than choosing semantics from directory contents.
    reconstructs input shapes, it does not limit later analysis. Inspect the
    emitted CostTree leaf slots before mapping. A cold profile DB may JIT-fill and
    need the matching GPU.
+
+   **Do not manually pre-fill the cache for an alignment campaign.** Run
+   timing-predict or simulation on the real case inputs and let their ordinary
+   `perf_api` lookups JIT-fill the exact demanded shapes. Never invent a broad
+   Cartesian profiling sweep as a prerequisite. If demand-driven execution
+   leaves misses, use `operate-profile-existing-kernel` only to diagnose or
+   retry those exact missing shapes, then rerun the owning timing-predict or
+   simulation stage. This keeps cache population tied to production demand and
+   prevents speculative axes from dominating the experiment.
 3. **Label + kernel-align** — initialize a labeled inventory with explicit
    unmapped decisions, label every stored occurrence per the rules below, and
    reference only that file from `iteration.labeled_kernel_sequences_file`:
@@ -141,6 +159,18 @@ unknown producer kinds rather than choosing semantics from directory contents.
 5. **e2e-align, render** — run `analyze` again with `workload`/`e2e` enabled (the
    e2e-align config, pointing `simulation_log_dir` at the completed sim) and then
    render. These subjects consume the sim that already baked in the multiplier.
+
+   The complete `workload_metrics` run is the authority for real serving
+   throughput and request latency. Report its
+   `measured_client_completion_tps`; never divide its completed tokens by a
+   bounded NSYS GPU span. When the `nsys` and `workload_metrics` passes replayed
+   the same request trace, keep the normal configuration and use the NSYS span
+   as a secondary server-GPU diagnostic. When their request traces differ, set
+   `workload.enabled: false` and `e2e.server_gpu_throughput: false`. This still
+   compares the complete measured request population with the complete
+   simulation, while explicitly omitting the inapplicable NSYS diagnostic.
+   Never run `alignment-workload` across different traces or present an omitted
+   server-GPU metric as zero.
 
 Do not use the phase NVTX envelope as GPU E2E (host submission ranges; graph
 kernels run after the marker closes), and do not subtract an iteration's own busy

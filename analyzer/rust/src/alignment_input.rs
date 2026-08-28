@@ -10,9 +10,11 @@
 //!   `alignment-e2e`) compares the measured run against a completed DES
 //!   simulation, so the simulation and client replay are mandatory.
 //!
-//! The two share the bounded NSYS anchor (`profile_log_dir`, `parsed_nsys`) and
-//! the envelope bookkeeping. E2E additionally names the full-run workload
-//! profile so bounded CUPTI capture cannot truncate scheduler/client metrics.
+//! Kernel alignment always owns a bounded NSYS anchor. E2E may omit
+//! `parsed_nsys` when it compares a full workload-metrics run against a full
+//! simulation and the available NSYS capture used a different bounded trace;
+//! in that mode the secondary server-GPU throughput is unavailable rather than
+//! being computed from mismatched request populations.
 //! Path/schema parsing lives here;
 //! metric formulas stay in the category modules.
 
@@ -60,7 +62,8 @@ pub struct E2eAlignManifest {
     pub analysis_log_dir: PathBuf,
     pub profile_log_dir: PathBuf,
     pub workload_profile_log_dir: PathBuf,
-    pub parsed_nsys: PathBuf,
+    #[serde(default)]
+    pub parsed_nsys: Option<PathBuf>,
     /// Full-run structured EngineCore iteration records. Unlike parsed NSYS,
     /// this stream continues after the bounded CUPTI window closes.
     pub metrics_jsonl: PathBuf,
