@@ -1502,6 +1502,7 @@ mod tests {
             flops: 1e9,
             bytes: 2e9,
             necessary_gpu_s: 0.0,
+            compute_dtype: "bf16".to_owned(),
         }];
         let selected = BTreeSet::from(["q_norm".to_owned()]);
         let spec = test_spec();
