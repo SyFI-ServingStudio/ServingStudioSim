@@ -162,15 +162,13 @@ those constraints instead of serializing the whole campaign in advance.
 
    The complete `workload_metrics` run is the authority for real serving
    throughput and request latency. Report its
-   `measured_client_completion_tps`; never divide its completed tokens by a
-   bounded NSYS GPU span. When the `nsys` and `workload_metrics` passes replayed
-   the same request trace, keep the normal configuration and use the NSYS span
-   as a secondary server-GPU diagnostic. When their request traces differ, set
-   `workload.enabled: false` and `e2e.server_gpu_throughput: false`. This still
-   compares the complete measured request population with the complete
-   simulation, while explicitly omitting the inapplicable NSYS diagnostic.
-   Never run `alignment-workload` across different traces or present an omitted
-   server-GPU metric as zero.
+   `measured_client_completion_tps`. Both `alignment-workload` and
+   `alignment-e2e` consume this full run directly and must not name or inspect
+   the bounded NSYS capture. The profile records req-frontend's host-monotonic
+   replay window so workload analysis can exclude startup/preflight iterations
+   independently. NSYS belongs only to the earlier kernel-align phase; never
+   divide full-run tokens by an NSYS span or disable workload analysis merely
+   because the kernel capture used a smaller representative trace.
 
 Do not use the phase NVTX envelope as GPU E2E (host submission ranges; graph
 kernels run after the marker closes), and do not subtract an iteration's own busy

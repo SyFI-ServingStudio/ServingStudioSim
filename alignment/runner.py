@@ -254,9 +254,16 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
                     )
                     capture_timer.start()
             print("[profile] server ready; driving workload")
+            replay_start_monotonic_ns = time.monotonic_ns()
             drive_summary = load_generator.run_replay(
                 cfg.workload, prepared_replay, base_url=base_url, model=model
             )
+            replay_end_monotonic_ns = time.monotonic_ns()
+            # EngineCore metrics use the same host CLOCK_MONOTONIC domain. The
+            # explicit window lets workload alignment exclude server-startup
+            # and prefix-cache preflight iterations without consulting NSYS.
+            drive_summary["replay_start_monotonic_ns"] = replay_start_monotonic_ns
+            drive_summary["replay_end_monotonic_ns"] = replay_end_monotonic_ns
             capture_timer_cancelled.set()
             if capture_timer is not None:
                 capture_timer.join()

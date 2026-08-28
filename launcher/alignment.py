@@ -36,7 +36,7 @@ CONFIG_SUFFIXES = frozenset({".json", ".yaml", ".yml"})
 ALIGNMENT_MANIFEST_NAME = "alignment_manifest.json"
 # Bumped when either typed manifest shape changes; must match the analyzer's
 # SCHEMA_VERSION in analyzer/rust/src/alignment_input.rs.
-ALIGNMENT_MANIFEST_SCHEMA_VERSION = 8
+ALIGNMENT_MANIFEST_SCHEMA_VERSION = 9
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -241,51 +241,6 @@ def _same_trace_source(left: Any, right: Any) -> bool:
         return False
 
 
-def _validate_e2e_profile_pair(
-    nsys_result: dict[str, Any],
-    workload_result: dict[str, Any],
-    *,
-    require_same_trace: bool = True,
-) -> None:
-    """Reject an E2E profile pair that cannot describe the same serving run.
-
-    Device ordinals may differ between captures, but the logical topology and
-    replay source are part of the comparison identity and must remain equal.
-    """
-    nsys_kind = nsys_result.get("profile_kind")
-    if nsys_kind not in {None, "nsys"}:
-        raise ValueError(f"profile_log_dir must contain an nsys profile, got {nsys_kind!r}")
-    workload_kind = workload_result.get("profile_kind")
-    if workload_result is not nsys_result and workload_kind != "workload_metrics":
-        raise ValueError(
-            "workload_profile_log_dir must contain a workload_metrics profile, "
-            f"got {workload_kind!r}"
-        )
-
-    identity_fields = ("gpu", "server_tp_size", "server_dp_size")
-    for field in identity_fields:
-        if nsys_result.get(field) != workload_result.get(field):
-            raise ValueError(
-                f"E2E profile provenance mismatch for {field}: "
-                f"{nsys_result.get(field)!r} != {workload_result.get(field)!r}"
-            )
-    nsys_drive = nsys_result.get("drive_summary")
-    workload_drive = workload_result.get("drive_summary")
-    if isinstance(nsys_drive, dict) and isinstance(workload_drive, dict):
-        fields = ("source_trace", "frontend_type") if require_same_trace else ("frontend_type",)
-        for field in fields:
-            matches = (
-                _same_trace_source(nsys_drive.get(field), workload_drive.get(field))
-                if field == "source_trace"
-                else nsys_drive.get(field) == workload_drive.get(field)
-            )
-            if not matches:
-                raise ValueError(
-                    f"E2E profile provenance mismatch for drive_summary.{field}: "
-                    f"{nsys_drive.get(field)!r} != {workload_drive.get(field)!r}"
-                )
-
-
 def _warn_if_trace_mismatch(params: dict[str, Any], profile_result: dict[str, Any]) -> None:
     workload = params.get("workload")
     traces = workload.get("trace_files") if isinstance(workload, dict) else None
@@ -347,19 +302,19 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
     An analyze config is exactly one phase (enforced by load_analyze_config):
     kernel-align (iteration) writes a kernel-only manifest with no simulation;
     e2e-align (workload/e2e) writes a simulation-consuming manifest. The two
-    shapes share only the measured-profile anchor.
+    shapes are deliberately disjoint: NSYS belongs only to kernel alignment,
+    while request/workload alignment reads only the full workload-metrics run.
     """
-    profile_result = _load_profile_result(config.profile_log_dir)
-
     config.log_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = config.log_dir / ALIGNMENT_MANIFEST_NAME
     common = {
         "schema_version": ALIGNMENT_MANIFEST_SCHEMA_VERSION,
         "analysis_log_dir": str(config.log_dir),
-        "profile_log_dir": str(config.profile_log_dir),
     }
 
     if config.iteration.enabled:
+        assert config.profile_log_dir is not None  # config validation
+        profile_result = _load_profile_result(config.profile_log_dir)
         assert config.timing_predict_log_dir is not None  # config validation
         input_manifest = _read_input_manifest(config.timing_predict_log_dir)
         _require_manifest_dir(input_manifest, "profile_log_dir", config.profile_log_dir)
@@ -379,6 +334,7 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
         host_timeline = _optional_profile_artifact(profile_result, "host_timeline")
         manifest = {
             **common,
+            "profile_log_dir": str(config.profile_log_dir),
             "parsed_nsys": str(_manifest_path(input_manifest, "parsed_nsys")),
             "predict_log_dir": str(config.timing_predict_log_dir),
             "timing_predict_case_map": str(
@@ -389,31 +345,31 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
         }
     else:
         assert config.simulation_log_dir is not None  # enforced by load_analyze_config
+        assert config.workload_profile_log_dir is not None  # config validation
         _simulation_target(_load_simulation_params(config.simulation_log_dir))
         workload_profile_result = _load_profile_result(config.workload_profile_log_dir)
-        if config.workload_profile_log_dir.resolve() == config.profile_log_dir.resolve():
-            workload_profile_result = profile_result
-        uses_nsys = config.workload.enabled or config.e2e.server_gpu_throughput
-        _validate_e2e_profile_pair(
-            profile_result,
-            workload_profile_result,
-            require_same_trace=uses_nsys,
-        )
+        if workload_profile_result.get("profile_kind") != "workload_metrics":
+            raise ValueError(
+                "workload_profile_log_dir must contain a workload_metrics profile, "
+                f"got {workload_profile_result.get('profile_kind')!r}"
+            )
         request_timings_result = _optional_profile_artifact(
             workload_profile_result, "request_timings_jsonl"
         )
+        drive_summary = workload_profile_result.get("drive_summary")
+        if not isinstance(drive_summary, dict):
+            drive_summary = {}
         manifest = {
             **common,
             "workload_profile_log_dir": str(config.workload_profile_log_dir),
-            "parsed_nsys": (
-                str(_profile_artifact(profile_result, "parsed_nsys")) if uses_nsys else None
-            ),
             "simulation_log_dir": str(config.simulation_log_dir),
             "metrics_jsonl": str(_profile_artifact(workload_profile_result, "metrics_jsonl")),
             "replay_result": str(_profile_artifact(workload_profile_result, "replay_result")),
             "request_timings_result": (
                 str(request_timings_result) if request_timings_result else None
             ),
+            "replay_start_monotonic_ns": drive_summary.get("replay_start_monotonic_ns"),
+            "replay_end_monotonic_ns": drive_summary.get("replay_end_monotonic_ns"),
             "throughput_bins": config.e2e.throughput_bins,
         }
 
