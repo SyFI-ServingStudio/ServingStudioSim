@@ -85,7 +85,7 @@ pub(crate) use iteration::{
     iteration_kernel_ladder, iteration_waterfall, prediction_kernel_ladder, prediction_waterfall,
 };
 pub use run::run_optimality;
-pub(crate) use scoped::run_scoped;
+pub(crate) use scoped::{compute_scoped, run_scoped};
 
 /// Waterfall segment order (top of the Real bar → the irreducible floor).
 pub(crate) const BUCKET_KEYS: [&str; 6] = [

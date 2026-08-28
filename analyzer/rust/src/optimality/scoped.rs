@@ -191,7 +191,7 @@ struct SemanticFloors {
 }
 
 #[derive(Debug, Serialize)]
-struct ScopedReport {
+pub(crate) struct ScopedReport {
     schema_version: u32,
     report_type: &'static str,
     log_dir: String,
@@ -239,6 +239,22 @@ pub(crate) async fn run_scoped(
     path: Option<&str>,
     label: Option<&str>,
 ) -> Result<()> {
+    let (report, slug) = compute_scoped(ctx, log_dir, path, label).await?;
+    write_json(
+        &report_path(log_dir, &format!("optimality_scoped_{slug}.json")),
+        &report,
+    )
+}
+
+/// Compute the scoped report without writing any file. Shared by the CLI
+/// (which persists it under `reports/`) and the analyzer service endpoint
+/// (which must stay read-only against the run directory).
+pub(crate) async fn compute_scoped(
+    ctx: &SessionContext,
+    log_dir: &Path,
+    path: Option<&str>,
+    label: Option<&str>,
+) -> Result<(ScopedReport, String)> {
     let selector = Selector::parse(path, label)?;
     let registered = crate::session::register_cost_log(ctx, log_dir).await?;
     if !registered {
@@ -371,10 +387,7 @@ pub(crate) async fn run_scoped(
     };
 
     let slug = report_slug(&selector, signature);
-    write_json(
-        &report_path(log_dir, &format!("optimality_scoped_{slug}.json")),
-        &report,
-    )
+    Ok((report, slug))
 }
 
 fn parse_path(raw: &str) -> Result<ParsedPath> {
@@ -1502,7 +1515,7 @@ mod tests {
             flops: 1e9,
             bytes: 2e9,
             necessary_gpu_s: 0.0,
-            compute_dtype: "bf16".to_owned(),
+            compute_dtype: Some("bf16".to_owned()),
         }];
         let selected = BTreeSet::from(["q_norm".to_owned()]);
         let spec = test_spec();
