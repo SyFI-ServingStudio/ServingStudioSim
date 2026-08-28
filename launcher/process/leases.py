@@ -26,11 +26,23 @@ _LEASE_POLL_SECONDS = 0.1
 
 
 def launcher_lock_root(repository_root: Path) -> Path:
-    """Return the stable cross-process lock root for one checkout."""
+    """Return the stable cross-process lock root for one checkout and one user.
+
+    The uid belongs in the *first* component below ``TMPDIR``, not in a
+    subdirectory of a shared one.  A shared parent is precisely what breaks on a
+    multi-user machine: whoever runs the launcher first creates it under their
+    own umask, and every later user fails with ``EACCES`` trying to mkdir their
+    checkout's directory inside it.  ``TMPDIR`` is world-writable and sticky, so
+    a per-uid root is creatable by anyone and removable by no one else.
+
+    Two users sharing one checkout therefore stop excluding each other.  That is
+    a trade rather than a regression: cross-user exclusion only ever worked when
+    the two also shared a group, and crashed the second launcher otherwise.
+    """
 
     identity = hashlib.sha256(str(repository_root.resolve()).encode()).hexdigest()[:16]
     temporary_root = Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
-    return temporary_root / "vibesim-launcher-locks" / identity
+    return temporary_root / f"vibesim-launcher-locks-{os.getuid()}" / identity
 
 
 @dataclass(slots=True)
