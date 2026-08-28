@@ -19,10 +19,12 @@ from alignment.labeling import (
     load_rules,
     read_coverage,
     slots_ending,
+    subsumptions,
     transfer_labels,
     walk_kernels,
 )
 from alignment.labeling import cli as labeling_cli
+from alignment.labeling.rules import NO_NEIGHBOUR
 from launcher.alignment_config import load_labeled_kernel_sequences
 
 
@@ -671,3 +673,72 @@ def test_transfer_refuses_an_inventory_whose_program_differs(document):
 
     with pytest.raises(ValueError, match="not the same program"):
         transfer_labels(document, destination)
+
+
+def _rule(operation: str, **keys) -> Rule:
+    return Rule.from_mapping(
+        {
+            "operation": operation,
+            "type": "ffn",
+            "role": "gemm",
+            "slot_suffixes": ["gate_up_proj"],
+            **keys,
+        }
+    )
+
+
+def test_subsumptions_proves_the_wider_matcher_decides_nothing_on_its_own():
+    """The real defect this was written for: a later file's wider matcher was
+    survived rather than corrected, so the label came from the file order.
+
+    `nvjet_sm100_tst_` is a family prefix — every position the narrow rule can
+    ever see, the wide one sees too, and they disagree about the operation.
+    """
+    wide = _rule("ffn.gate_up_proj", name="nvjet_sm100_tst_", phase="forward")
+    narrow = _rule(
+        "moe.shared_expert.gate_up_proj",
+        name="nvjet_sm100_tst_64x32_64x16",
+        phase="forward",
+    )
+
+    (finding,) = subsumptions([wide, narrow])
+    assert "ffn.gate_up_proj" in finding and "moe.shared_expert.gate_up_proj" in finding
+    # Order-independent itself: swapping the two reports the same pair.
+    assert subsumptions([narrow, wide]) == [finding]
+    # Same matcher, same answer, no ambiguity to report.
+    assert subsumptions([wide, _rule("ffn.gate_up_proj", name="nvjet", phase="forward")]) == []
+
+
+def test_subsumptions_is_silent_when_a_key_can_separate_the_two_rules():
+    """An omitted key is no constraint, an exact key must agree, and the empty
+    slot is structural — it subsumes only itself. Each is enough to separate."""
+    base = {"name": "cublasLt::splitKreduce_kernel", "phase": "forward"}
+    wide = _rule("attention.q_b_proj", **base)
+
+    # Distinguished by an exact key both constrain, to different values. Both
+    # must constrain it: omitting a key widens a rule, so `wide` without a
+    # `stream_role` still claims everything a rule that pins one claims.
+    assert subsumptions(
+        [
+            _rule("attention.q_b_proj", **base, stream_role="primary"),
+            _rule("moe.router", **base, stream_role="concurrent"),
+        ]
+    ) == []
+    assert len(subsumptions([wide, _rule("moe.router", **base, stream_role="concurrent")])) == 1
+    # Distinguished by the neighbour sentinel: "no predecessor" is not "any".
+    assert subsumptions(
+        [
+            _rule("attention.q_b_proj", **base, after=NO_NEIGHBOUR),
+            _rule("moe.router", **base, after="moe.router"),
+        ]
+    ) == []
+    # Narrow on different axes: each constrains a key the other leaves open, so
+    # neither claims everything the other does and the file order settles
+    # nothing. They may still overlap on some position — that is `disagreements`
+    # to find against a capture, not something the rule text can decide.
+    assert subsumptions(
+        [
+            _rule("attention.q_b_proj", **base, after="attention.q_b_proj"),
+            _rule("moe.router", **base, stream_role="concurrent"),
+        ]
+    ) == []
