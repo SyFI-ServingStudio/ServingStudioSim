@@ -34,6 +34,14 @@ trace/tracelab_*
 .claude/settings.local.json
 .codex/*.local.*
 
+# Alignment host profiles are local. A real one is nothing but absolute paths --
+# an HF cache, a 1 GB corpus, an nsys install -- so it names whoever's directory
+# it happens to sit in, and no tracked preset in this repo carries a host
+# absolute path. Only the template is tracked; what is reproducible about a
+# machine that produced accepted numbers goes in that pack's `recorded_on`.
+presets/alignment/hosts/*.yaml
+!presets/alignment/hosts/example.yaml
+
 # Task-local agent notes are working state, not repository documentation.
 /progress.md
 /update_plan_for_skils.md
