@@ -219,7 +219,9 @@ def _get(url: str, timeout: float = 5.0):
         return None, None
 
 
-def set_cuda_profile(base_url: str, *, active: bool, timeout: float = 120.0) -> None:
+def set_cuda_profile(
+    base_url: str, *, active: bool, timeout: float | None = None
+) -> None:
     """Start or stop vLLM's worker-owned CUDA profiler through its HTTP API.
 
     Stopping can block while Nsight finalizes a large report inside the worker;
@@ -227,6 +229,11 @@ def set_cuda_profile(base_url: str, *, active: bool, timeout: float = 120.0) -> 
     timeout. The launcher still owns process shutdown if this bound is exceeded.
     """
     action = "start_profile" if active else "stop_profile"
+    # Starting only arms CUPTI and should return promptly. Stopping also makes
+    # NSYS finalize the report in the worker, which can take several minutes
+    # for CUDA-graph-node traces with tens of millions of events.
+    if timeout is None:
+        timeout = 120.0 if active else 600.0
     request = urllib.request.Request(f"{base_url}/{action}", data=b"", method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:

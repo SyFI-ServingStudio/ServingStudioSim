@@ -61,6 +61,13 @@ The new kernel file should follow the closest existing kind and define:
 - optional `infeasible_mask()` for physically unreachable grid cells;
 - `register_kernel!(<Name>Kernel, <Name>Spec)`.
 
+Before implementing or profiling the grid, calculate its feasible-coordinate
+count for a representative resolved `KernelConfig`: expand the Cartesian grid,
+remove cells selected by `infeasible_mask()`, and do not multiply by the number
+of backends. The count must be at most **500**. If it is larger, stop and return
+the proposed axes, count, and likely cause to the orchestrator; splitting the
+same grid across profiling calls does not satisfy the ceiling.
+
 ## Field And Dtype Contract
 
 `enumerate` must emit one `ArgsPayload` per profiled grid point and backend:
@@ -142,5 +149,5 @@ not require GPU profiling.
 
 Return files changed, Config fields, Input fields, emitted ArgsPayload field
 list, dtype tags, selected cache kind, sweep grid summary, infeasible-mask
-decision, `slot_input` decision, commands run, and any blocker for cache
-fidelity or upper-layer consumers.
+decision, feasible-coordinate count, `slot_input` decision, commands run, and
+any blocker for cache fidelity or upper-layer consumers.

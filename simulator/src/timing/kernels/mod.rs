@@ -1,6 +1,7 @@
 //! Per-kind L1 kernel structs.
 
 pub mod all_reduce;
+pub mod all_reduce_fusion;
 pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
 pub mod clamped_swiglu;
@@ -21,7 +22,9 @@ pub mod dsa_index_cache_append;
 pub mod dsa_mqa_logits_prefill;
 pub mod dsa_paged_mqa_logits_decode;
 pub mod dsa_persistent_topk_decode;
+pub mod dsa_sparse_index_remap;
 pub mod dsa_sparse_mla_attention;
+pub mod dsa_sparse_mla_prefill;
 pub mod dsa_topk_prefill;
 pub mod elementwise;
 pub mod engine;
@@ -59,6 +62,8 @@ pub mod moe_fused_topk;
 pub mod moe_sum;
 pub mod moe_topk_softplus_sqrt;
 pub mod mxfp4_marlin_moe_gemm;
+pub mod nvfp4_fused_moe;
+pub mod nvfp4_quant;
 pub mod p2p_inter;
 pub mod p2p_intra;
 pub mod residual_rms_norm;
@@ -68,6 +73,10 @@ pub mod vllm_fused_moe;
 pub mod vllm_mla_rope;
 
 pub use all_reduce::{AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput, AllReduceSpec};
+pub use all_reduce_fusion::{
+    AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
+    AllReduceFusionSpec,
+};
 pub use all_reduce_residual_rms_norm::{
     AllReduceResidualRmsNormKernel, AllReduceResidualRmsNormKernelConfig,
     AllReduceResidualRmsNormKernelInput, AllReduceResidualRmsNormSpec,
@@ -146,9 +155,17 @@ pub use dsa_persistent_topk_decode::{
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
     DsaPersistentTopkDecodeKernelInput, DsaPersistentTopkDecodeSpec,
 };
+pub use dsa_sparse_index_remap::{
+    DsaSparseIndexRemapKernel, DsaSparseIndexRemapKernelConfig, DsaSparseIndexRemapKernelInput,
+    DsaSparseIndexRemapSpec, DsaSparseIndexRemapWorkspacePartition,
+};
 pub use dsa_sparse_mla_attention::{
     DsaSparseMlaAttentionKernel, DsaSparseMlaAttentionKernelConfig,
     DsaSparseMlaAttentionKernelInput, DsaSparseMlaAttentionSpec,
+};
+pub use dsa_sparse_mla_prefill::{
+    DsaSparseMlaPrefillKernel, DsaSparseMlaPrefillKernelConfig, DsaSparseMlaPrefillKernelInput,
+    DsaSparseMlaPrefillSpec,
 };
 pub use dsa_topk_prefill::{
     DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig, DsaTopkPrefillKernelInput, DsaTopkPrefillSpec,
@@ -277,6 +294,12 @@ pub use moe_topk_softplus_sqrt::{
 pub use mxfp4_marlin_moe_gemm::{
     Mxfp4MarlinMoeFcRole, Mxfp4MarlinMoeGemmKernel, Mxfp4MarlinMoeGemmKernelConfig,
     Mxfp4MarlinMoeGemmKernelInput, Mxfp4MarlinMoeGemmSpec,
+};
+pub use nvfp4_fused_moe::{
+    Nvfp4FusedMoeKernel, Nvfp4FusedMoeKernelConfig, Nvfp4FusedMoeKernelInput, Nvfp4FusedMoeSpec,
+};
+pub use nvfp4_quant::{
+    Nvfp4QuantKernel, Nvfp4QuantKernelConfig, Nvfp4QuantKernelInput, Nvfp4QuantSpec,
 };
 pub use p2p_inter::{P2pInterKernel, P2pInterKernelConfig, P2pInterKernelInput, P2pInterSpec};
 pub use p2p_intra::{P2pIntraKernel, P2pIntraKernelConfig, P2pIntraKernelInput, P2pIntraSpec};

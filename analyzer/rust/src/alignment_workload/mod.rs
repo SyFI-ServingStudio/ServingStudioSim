@@ -38,11 +38,6 @@ const COST_COLUMNS: &[&str] = &[
     "layer",
 ];
 
-#[derive(Debug, Deserialize)]
-struct ParsedNsys {
-    iteration_details: Vec<MeasuredIteration>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct FullMeasuredMetrics {
     schema_version: u32,
@@ -63,32 +58,6 @@ struct FullMeasuredMetrics {
     observed_elapsed_ms: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct MeasuredIteration {
-    iteration: u64,
-    metrics: Option<MeasuredMetrics>,
-    ranges: Vec<MeasuredRange>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MeasuredMetrics {
-    prefill_tokens: u64,
-    #[serde(default)]
-    decode_kv_lens: Vec<u64>,
-    #[serde(default)]
-    prefill_chunk_pairs: Vec<(u64, u64)>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MeasuredRange {
-    kernels: Vec<MeasuredKernel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MeasuredKernel {
-    start_ns: u64,
-}
-
 #[derive(Debug, Clone)]
 struct WorkloadPoint {
     iteration_id: u64,
@@ -107,7 +76,11 @@ struct WorkloadPoint {
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read_e2e_align(log_dir)?;
     let simulation_log_dir = input.simulation_log_dir.as_path();
-    let measured = read_measured_points(&input.metrics_jsonl, &input.parsed_nsys)?;
+    let measured = read_measured_points(
+        &input.metrics_jsonl,
+        input.replay_start_monotonic_ns,
+        input.replay_end_monotonic_ns,
+    )?;
     ensure!(
         !measured.is_empty(),
         "full-run vLLM metrics contain no workload iterations"
@@ -131,7 +104,6 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "schema_version": SCHEMA_VERSION,
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
-            "profile_log_dir": input.profile_log_dir.display().to_string(),
             "workload_profile_log_dir": input.workload_profile_log_dir.display().to_string(),
             "simulation_log_dir": simulation_log_dir.display().to_string(),
             "measured_timeline_source": "full_run_engine_observation",
@@ -167,7 +139,6 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "schema_version": SCHEMA_VERSION,
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
-            "profile_log_dir": input.profile_log_dir.display().to_string(),
             "workload_profile_log_dir": input.workload_profile_log_dir.display().to_string(),
             "simulation_log_dir": simulation_log_dir.display().to_string(),
             "measured_timeline_source": "full_run_engine_observation",
@@ -182,17 +153,16 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
 
 fn read_measured_points(
     metrics_path: &Path,
-    parsed_nsys_path: &Path,
+    replay_start_monotonic_ns: Option<u64>,
+    replay_end_monotonic_ns: Option<u64>,
 ) -> Result<Vec<WorkloadPoint>> {
-    let parsed_text = fs::read_to_string(parsed_nsys_path)
-        .with_context(|| format!("read {}", parsed_nsys_path.display()))?;
-    let parsed: ParsedNsys = serde_json::from_str(&parsed_text)
-        .with_context(|| format!("parse {}", parsed_nsys_path.display()))?;
-    let captured_iteration_ids: HashSet<u64> = parsed
-        .iteration_details
-        .iter()
-        .map(|detail| detail.iteration)
-        .collect();
+    ensure!(
+        replay_start_monotonic_ns.is_some() == replay_end_monotonic_ns.is_some(),
+        "workload replay window must provide both start and end monotonic timestamps"
+    );
+    if let (Some(start), Some(end)) = (replay_start_monotonic_ns, replay_end_monotonic_ns) {
+        ensure!(end >= start, "workload replay window ends before it starts");
+    }
 
     let metrics_text = fs::read_to_string(metrics_path)
         .with_context(|| format!("read {}", metrics_path.display()))?;
@@ -213,8 +183,8 @@ fn read_measured_points(
             record.iteration_index
         );
         ensure!(
-            matches!(record.schema_version, 1 | 2),
-            "unsupported full-run metrics schema_version {} at iteration {}",
+            record.schema_version == 2,
+            "alignment-workload requires schema-v2 full-run metrics with host-monotonic timestamps; got schema_version {} at iteration {}",
             record.schema_version,
             record.iteration_index
         );
@@ -227,67 +197,31 @@ fn read_measured_points(
     );
 
     // Data-parallel ranks each log the same step, so one step appears as several
-    // records. Fold them into the replica's batch shape (the union of the ranks'
-    // local batches) before anything reads a step's workload, and before the
-    // contiguity scan below — several ranks' records are the same step, not a
-    // break in the sequence.
+    // records. Fold them into the replica's batch shape before reading workload.
     let records = fold_data_parallel_ranks(records)?;
 
-    // Prefix-cache preflight requests run before the measured replay and use
-    // the same logger. Their iteration ids form short, disjoint runs (for
-    // example 0 and 3). NSYS and workload metrics are separate serving runs,
-    // so their absolute counters need not share an origin; warmup deliberately
-    // advances only the latter. Select the unique contiguous run whose
-    // relative span can contain the captured NSYS window, while preserving the
-    // engine's original ids on the selected records.
-    let mut contiguous_runs: Vec<Vec<FullMeasuredMetrics>> = Vec::new();
-    for record in records {
-        let continues_last = contiguous_runs
-            .last()
-            .and_then(|run| run.last())
-            .is_some_and(|previous| previous.iteration_index + 1 == record.iteration_index);
-        if !continues_last {
-            contiguous_runs.push(Vec::new());
-        }
-        contiguous_runs.last_mut().unwrap().push(record);
-    }
-    let captured_origin = captured_iteration_ids
-        .iter()
-        .copied()
-        .min()
-        .context("NSYS parse contains no captured iterations")?;
-    let captured_relative_ids: HashSet<u64> = captured_iteration_ids
-        .iter()
-        .map(|iteration_id| iteration_id - captured_origin)
-        .collect();
-    let mut matching_runs = contiguous_runs.into_iter().filter(|run| {
-        let Some(run_origin) = run.first().map(|record| record.iteration_index) else {
-            return false;
-        };
-        let run_relative_ids: HashSet<u64> = run
-            .iter()
-            .map(|record| record.iteration_index - run_origin)
-            .collect();
-        captured_relative_ids.is_subset(&run_relative_ids)
-    });
-    let selected = matching_runs.next().with_context(|| {
-        format!(
-            "no contiguous full-run metrics segment spans all {} relative NSYS iterations",
-            captured_iteration_ids.len()
+    // New captures record req-frontend's replay window in the same host
+    // CLOCK_MONOTONIC domain as EngineCore. Filter by that window to exclude
+    // startup/preflight work directly. Older schema-v2 captures lack this pair;
+    // retain their complete extracted stream instead of consulting NSYS.
+    let selected: Vec<_> = records
+        .into_iter()
+        .filter(
+            |record| match (replay_start_monotonic_ns, replay_end_monotonic_ns) {
+                (Some(window_start), Some(window_end)) => {
+                    let start = record.observed_start_monotonic_ns.unwrap_or(0);
+                    let end = record.observed_end_monotonic_ns.unwrap_or(start);
+                    end >= window_start && start <= window_end
+                }
+                (None, None) => true,
+                _ => unreachable!("window pair was validated above"),
+            },
         )
-    })?;
+        .collect();
     ensure!(
-        matching_runs.next().is_none(),
-        "multiple full-run metrics segments span the relative NSYS iteration window"
+        !selected.is_empty(),
+        "full-run metrics contain no iterations inside the recorded replay window"
     );
-
-    if selected.iter().any(|record| record.schema_version == 1) {
-        ensure!(
-            selected.iter().all(|record| record.schema_version == 1),
-            "full-run metrics segment mixes schema-v1 and schema-v2 records"
-        );
-        return read_measured_points_from_nsys(parsed_nsys_path);
-    }
 
     let origin_ns = selected[0]
         .observed_start_monotonic_ns
@@ -345,10 +279,8 @@ fn read_measured_points(
 /// wall-clock overlap against a reference rank, exactly as `alignment/nsys/
 /// parse.py` does for the kernel side.
 ///
-/// Schema-1 records have no timestamps, so there is nothing to pair on and the
-/// index fold is kept — its result only feeds the preflight-vs-replay segment
-/// scan, after which schema-1 captures fall back to the NSYS timeline entirely.
-/// A single-rank capture passes through unchanged either way.
+/// A single-rank capture passes through unchanged. Schema-v1 is rejected by
+/// the caller because workload alignment no longer borrows an NSYS timeline.
 fn fold_data_parallel_ranks(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasuredMetrics>> {
     let observed = records
         .iter()
@@ -530,61 +462,6 @@ fn fold_by_wall_clock(records: Vec<FullMeasuredMetrics>) -> Result<Vec<FullMeasu
         );
     }
     Ok(steps)
-}
-
-fn read_measured_points_from_nsys(path: &Path) -> Result<Vec<WorkloadPoint>> {
-    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let parsed: ParsedNsys =
-        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-
-    // The first kernel launch is the iteration's GPU boundary.  Empty trailing
-    // marker ranges are ignored because they have no observable GPU iteration.
-    let mut raw = Vec::new();
-    for detail in parsed.iteration_details {
-        let first_kernel_ns = detail
-            .ranges
-            .iter()
-            .flat_map(|range| range.kernels.iter())
-            .map(|kernel| kernel.start_ns)
-            .min();
-        let Some(first_kernel_ns) = first_kernel_ns else {
-            continue;
-        };
-        let metrics = detail.metrics.with_context(|| {
-            format!(
-                "NSYS iteration {} has kernels but no scheduler metrics",
-                detail.iteration
-            )
-        })?;
-        let scheduled_kv_tokens =
-            scheduled_kv_tokens(&metrics.decode_kv_lens, &metrics.prefill_chunk_pairs);
-        raw.push((
-            first_kernel_ns,
-            detail.iteration,
-            metrics,
-            scheduled_kv_tokens,
-        ));
-    }
-    raw.sort_by_key(|row| row.0);
-    let Some(origin_ns) = raw.first().map(|row| row.0) else {
-        return Ok(Vec::new());
-    };
-    let mut points: Vec<WorkloadPoint> = raw
-        .into_iter()
-        .map(
-            |(start_ns, iteration_id, metrics, scheduled_kv_tokens)| WorkloadPoint {
-                iteration_id,
-                time_ms: start_ns.saturating_sub(origin_ns) as f64 / 1e6,
-                iteration_cycle_ms: None,
-                prefill_tokens: metrics.prefill_tokens,
-                decode_batch_size: metrics.decode_kv_lens.len() as u64,
-                scheduled_kv_tokens,
-                observed_elapsed_ms: None,
-            },
-        )
-        .collect();
-    assign_iteration_cycles(&mut points);
-    Ok(points)
 }
 
 async fn read_simulated_points(ctx: &SessionContext) -> Result<Vec<WorkloadPoint>> {
@@ -836,13 +713,7 @@ mod tests {
     #[test]
     fn workload_metrics_run_may_have_a_shifted_iteration_origin() {
         let directory = tempfile::tempdir().unwrap();
-        let parsed_nsys_path = directory.path().join("parsed_nsys.json");
         let metrics_path = directory.path().join("metrics.jsonl");
-        fs::write(
-            &parsed_nsys_path,
-            r#"{"iteration_details":[{"iteration":0,"metrics":null,"ranges":[]},{"iteration":1,"metrics":null,"ranges":[]}]}"#,
-        )
-        .unwrap();
         fs::write(
             &metrics_path,
             concat!(
@@ -852,7 +723,7 @@ mod tests {
         )
         .unwrap();
 
-        let points = read_measured_points(&metrics_path, &parsed_nsys_path).unwrap();
+        let points = read_measured_points(&metrics_path, None, None).unwrap();
 
         assert_eq!(
             points
@@ -864,15 +735,9 @@ mod tests {
     }
 
     #[test]
-    fn two_shifted_full_replay_segments_remain_ambiguous() {
+    fn replay_window_selects_full_run_without_nsys() {
         let directory = tempfile::tempdir().unwrap();
-        let parsed_nsys_path = directory.path().join("parsed_nsys.json");
         let metrics_path = directory.path().join("metrics.jsonl");
-        fs::write(
-            &parsed_nsys_path,
-            r#"{"iteration_details":[{"iteration":0,"metrics":null,"ranges":[]},{"iteration":1,"metrics":null,"ranges":[]}]}"#,
-        )
-        .unwrap();
         let record = |iteration_index: u64, start_ns: u64| {
             format!(
                 "{{\"schema_version\":2,\"input_adapter\":\"vllm_text\",\"iteration_index\":{iteration_index},\"prefill_tokens\":8,\"decode_kv_lens\":[],\"prefill_chunk_pairs\":[[0,8]],\"observed_start_monotonic_ns\":{start_ns},\"observed_end_monotonic_ns\":{},\"observed_elapsed_ms\":0.0001}}\n",
@@ -891,13 +756,14 @@ mod tests {
         )
         .unwrap();
 
-        let error = read_measured_points(&metrics_path, &parsed_nsys_path).unwrap_err();
+        let points = read_measured_points(&metrics_path, Some(450), Some(850)).unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("multiple full-run metrics segments span"),
-            "unexpected error: {error}"
+        assert_eq!(
+            points
+                .iter()
+                .map(|point| point.iteration_id)
+                .collect::<Vec<_>>(),
+            vec![1300, 1301]
         );
     }
 

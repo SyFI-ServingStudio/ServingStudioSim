@@ -61,6 +61,28 @@ register(
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
+        backend="flashinfer_trtllm_fp8",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            kv=frozenset({DType.FP8_E4M3}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_sparse_mla_attention",
+            function_name="profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8",
+        ),
+        table_name=KIND,
+        args_schema=DsaSparseMlaAttentionArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+    )
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
         backend="vllm_flashmla_bf16",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),

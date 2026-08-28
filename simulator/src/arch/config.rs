@@ -83,6 +83,14 @@ const fn default_glm52_parallel_size() -> u16 {
     8
 }
 
+const fn default_glm52_nvfp4_parallel_size() -> u16 {
+    4
+}
+
+const fn default_glm52_nvfp4_max_model_len() -> u32 {
+    1_048_576
+}
+
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own
 /// params).
@@ -277,6 +285,34 @@ pub enum IterArchSel {
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
     },
+    /// B200 execution graph for NVIDIA's GLM-5.2 NVFP4 checkpoint. Tensor and
+    /// expert parallelism share one rank group, as observed in vLLM.
+    Glm52VllmNvfp4DsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Shared tensor/expert-parallel rank count.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        nvl_num_gpu: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        #[serde(default)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
+        mtp_mode: Glm52MtpMode,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+    },
     /// GLM-5.2's exact heterogeneous 78-layer DSA/MoE schedule. Attention is
     /// local (TP1) on every EP rank and pairs with `hp_unified`, whose KV/input
     /// partitions correspond one-for-one with the EP ranks.
@@ -325,7 +361,8 @@ impl IterArchSel {
             | Self::DeepseekV4Vllm { model, .. }
             | Self::DeepseekV4VllmSerialStreams { model, .. }
             | Self::Glm52DsaMoe { model, .. }
-            | Self::Glm52VllmDsaMoe { model, .. } => model,
+            | Self::Glm52VllmDsaMoe { model, .. }
+            | Self::Glm52VllmNvfp4DsaMoe { model, .. } => model,
         }
     }
 }
@@ -530,6 +567,39 @@ mod iter_tests {
             .map(|(tag, _)| *tag)
             .collect::<Vec<_>>();
         assert!(tags.contains(&"glm52_vllm_dsa_moe"));
+    }
+
+    #[test]
+    fn glm52_nvfp4_selector_defaults_to_tp4_ep4() {
+        let parsed: IterArchSel = serde_json::from_str(
+            r#"{"type":"glm52_vllm_nvfp4_dsa_moe","model_config":"model/config/glm52_nvfp4.json","fp8":false}"#,
+        )
+        .expect("B200 NVFP4 GLM selector parses");
+        let IterArchSel::Glm52VllmNvfp4DsaMoe {
+            model,
+            ep_size,
+            nvl_num_gpu,
+            max_model_len,
+            routing,
+            routing_seed,
+            mtp_mode,
+            expert_popularity_file,
+        } = &parsed
+        else {
+            panic!("expected glm52_vllm_nvfp4_dsa_moe")
+        };
+        assert_eq!(model.model_config, "model/config/glm52_nvfp4.json");
+        assert!(!model.fp8);
+        assert_eq!((*ep_size, *nvl_num_gpu), (4, 4));
+        assert_eq!(*max_model_len, 1_048_576);
+        assert_eq!(*routing, RoutingKind::Uniform);
+        assert_eq!(*routing_seed, None);
+        assert_eq!(*mtp_mode, Glm52MtpMode::Off);
+        assert_eq!(*expert_popularity_file, None);
+        assert!(std::ptr::eq(parsed.model(), model));
+        assert!(IterArchSel::SCHEMA
+            .iter()
+            .any(|(tag, _)| *tag == "glm52_vllm_nvfp4_dsa_moe"));
     }
 
     #[test]

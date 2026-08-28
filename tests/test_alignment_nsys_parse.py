@@ -70,12 +70,8 @@ def test_parse_persists_correlation_lookup_indexes_idempotently():
     ensure_query_indexes(con)
     ensure_query_indexes(con)
 
-    runtime_indexes = con.execute(
-        "PRAGMA index_list('CUPTI_ACTIVITY_KIND_RUNTIME')"
-    ).fetchall()
-    kernel_indexes = con.execute(
-        "PRAGMA index_list('CUPTI_ACTIVITY_KIND_KERNEL')"
-    ).fetchall()
+    runtime_indexes = con.execute("PRAGMA index_list('CUPTI_ACTIVITY_KIND_RUNTIME')").fetchall()
+    kernel_indexes = con.execute("PRAGMA index_list('CUPTI_ACTIVITY_KIND_KERNEL')").fetchall()
     assert [row[1] for row in runtime_indexes] == ["vibesim_runtime_gtid_start_idx"]
     assert [row[1] for row in kernel_indexes] == ["vibesim_kernel_gpid_corr_start_idx"]
     assert not con.in_transaction
@@ -248,9 +244,7 @@ def test_sequence_unique_ignores_iteration_semantic_labels():
     catalog = build_kernel_sequences(details, {1: "kernel"})["forward"]
 
     assert len(catalog["unique_sequences"]) == 1
-    assert catalog["unique_sequences"][0]["occurrences"] == [
-        {"device_id": 0, "iterations": [1, 2]}
-    ]
+    assert catalog["unique_sequences"][0]["occurrences"] == [{"device_id": 0, "iterations": [1, 2]}]
 
 
 def test_fold_prefers_layer_aligned_repeat_with_final_suffix():
@@ -358,14 +352,11 @@ def test_asymmetric_ranks_each_keep_their_own_sequence():
     sequences = catalog["unique_sequences"]
     assert len(sequences) == 2
     assert {
-        expand_sequence(sequence)[0]["name"]: sequence["occurrences"]
-        for sequence in sequences
+        expand_sequence(sequence)[0]["name"]: sequence["occurrences"] for sequence in sequences
     } == {
         "rank0": [{"device_id": 0, "iterations": [7]}],
         "rank1": [{"device_id": 1, "iterations": [7]}],
     }
-
-
 
 
 def test_idle_is_measured_against_the_kernel_span_not_the_nvtx_range():
@@ -534,10 +525,7 @@ def test_host_timeline_excludes_events_outside_the_parsed_window():
     host = build_host_timeline(host_capture(), Path("trace.sqlite"), 1000, 2000)
 
     assert all(end >= 1000 for _index, _start, end, _name in host["nvtx_ranges"])
-    assert all(
-        start < 2000
-        for _index, start, _end, _name, _correlation_id in host["api_calls"]
-    )
+    assert all(start < 2000 for _index, start, _end, _name, _correlation_id in host["api_calls"])
     assert "warmup" not in host["strings"]
 
 
@@ -554,6 +542,7 @@ def test_parsed_window_spans_every_serialized_range():
 
 def test_parsed_window_of_an_empty_parse_is_empty():
     assert parsed_window_ns({"iteration_details": []}) == (0, 0)
+
 
 def _metrics_line(dp_rank: int, iteration: int, prefill_tokens: int, decode_kv_lens: list[int]):
     return json.dumps(
@@ -594,9 +583,7 @@ def test_metrics_are_keyed_by_rank_and_iteration(tmp_path):
 
 def test_metrics_reject_a_repeated_rank_iteration_pair(tmp_path):
     path = tmp_path / "metrics.jsonl"
-    path.write_text(
-        _metrics_line(0, 4, 8, [10]) + "\n" + _metrics_line(0, 4, 8, [10]) + "\n"
-    )
+    path.write_text(_metrics_line(0, 4, 8, [10]) + "\n" + _metrics_line(0, 4, 8, [10]) + "\n")
 
     with pytest.raises(ValueError, match="duplicate metrics record"):
         load_metrics(path)

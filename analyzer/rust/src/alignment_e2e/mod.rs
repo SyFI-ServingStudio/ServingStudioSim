@@ -7,10 +7,8 @@
 //! are not equivalent. Completion throughput is intentionally named: req-frontend
 //! does not log every token timestamp, so both sides assign a request's output
 //! tokens to its completion bin rather than pretending to have an instantaneous
-//! token-production trace. The report also carries a server GPU-span aggregate:
-//! all measured output tokens divided by the first-observed-kernel to
-//! last-observed-kernel span, including inter-iteration gaps and the terminal
-//! iteration that first-kernel-to-next-first-kernel cycles cannot represent.
+//! token-production trace. NSYS is deliberately absent from this subject;
+//! device timelines belong to kernel alignment, not request-level E2E evidence.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -54,41 +52,12 @@ struct ServerRequestTimings {
     tpot_ms: Option<Vec<f64>>,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct ParsedNsysGpuTimeline {
-    iteration_details: Vec<ServerGpuIteration>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ServerGpuIteration {
-    ranges: Vec<ServerGpuRange>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ServerGpuRange {
-    kernels: Vec<ServerGpuKernel>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ServerGpuKernel {
-    start_ns: u64,
-    end_ns: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ServerGpuSpan {
-    span_ms: f64,
-    iterations_with_kernels: usize,
-    kernels: usize,
-}
-
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read_e2e_align(log_dir)?;
     ensure!(input.throughput_bins > 0, "throughput_bins must be > 0");
 
     let simulation_log_dir = input.simulation_log_dir.as_path();
     let measured = read_measured_requests(&input.replay_result)?;
-    let server_gpu_span = read_server_gpu_span(&input.parsed_nsys)?;
     let server_timings = input
         .request_timings_result
         .as_deref()
@@ -124,12 +93,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .filter(|request_id| simulated.contains_key(*request_id))
         .count();
 
-    let throughput = throughput_series(
-        &measured,
-        &simulated,
-        server_gpu_span,
-        input.throughput_bins,
-    );
+    let throughput = throughput_series(&measured, &simulated, input.throughput_bins);
     let mut latency_cdf_comparisons = vec![latency_cdf_comparison(
         "client_ttft",
         "Client-observed TTFT",
@@ -206,7 +170,6 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "schema_version": SCHEMA_VERSION,
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
-            "profile_log_dir": input.profile_log_dir.display().to_string(),
             "workload_profile_log_dir": input.workload_profile_log_dir.display().to_string(),
             "simulation_log_dir": simulation_log_dir.display().to_string(),
             "measured_successful_requests": measured.len(),
@@ -237,7 +200,6 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "schema_version": SCHEMA_VERSION,
         "meta": {
             "analysis_log_dir": log_dir.display().to_string(),
-            "profile_log_dir": input.profile_log_dir.display().to_string(),
             "workload_profile_log_dir": input.workload_profile_log_dir.display().to_string(),
             "throughput_bins": input.throughput_bins,
         },
@@ -247,50 +209,6 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "definitions": definitions,
     });
     Ok((report, payload))
-}
-
-/// Return the complete captured GPU workload span, including the final
-/// iteration. This is deliberately not the GPU-cycle sum: first-kernel(i) to
-/// first-kernel(i+1) has no terminal boundary, whereas throughput owns every
-/// measured output token and therefore needs the last observed kernel end.
-fn read_server_gpu_span(path: &Path) -> Result<ServerGpuSpan> {
-    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let parsed: ParsedNsysGpuTimeline = serde_json::from_str(&text)
-        .with_context(|| format!("parse server GPU timeline from {}", path.display()))?;
-
-    let mut first_start_ns = u64::MAX;
-    let mut last_end_ns = 0u64;
-    let mut iterations_with_kernels = 0usize;
-    let mut kernels = 0usize;
-    for iteration in parsed.iteration_details {
-        let mut iteration_has_kernel = false;
-        for kernel in iteration.ranges.into_iter().flat_map(|range| range.kernels) {
-            ensure!(
-                kernel.end_ns >= kernel.start_ns,
-                "parsed NSYS kernel has end_ns {} before start_ns {}",
-                kernel.end_ns,
-                kernel.start_ns
-            );
-            first_start_ns = first_start_ns.min(kernel.start_ns);
-            last_end_ns = last_end_ns.max(kernel.end_ns);
-            iteration_has_kernel = true;
-            kernels += 1;
-        }
-        iterations_with_kernels += usize::from(iteration_has_kernel);
-    }
-    ensure!(
-        kernels > 0,
-        "parsed NSYS contains no kernels for server GPU throughput"
-    );
-    ensure!(
-        last_end_ns > first_start_ns,
-        "parsed NSYS server GPU span must be positive"
-    );
-    Ok(ServerGpuSpan {
-        span_ms: (last_end_ns - first_start_ns) as f64 / 1e6,
-        iterations_with_kernels,
-        kernels,
-    })
 }
 
 fn read_server_request_timings(path: &Path) -> Result<ServerRequestTimings> {
@@ -578,7 +496,6 @@ fn latency_cdf_comparison(
 fn throughput_series(
     measured: &BTreeMap<String, RequestMetrics>,
     simulated: &BTreeMap<String, RequestMetrics>,
-    server_gpu_span: ServerGpuSpan,
     bins: usize,
 ) -> Value {
     let measured_end = max_completion(measured);
@@ -603,11 +520,8 @@ fn throughput_series(
     let measured_total: u64 = measured.values().map(|r| r.output_tokens).sum();
     let simulated_total: u64 = simulated.values().map(|r| r.output_tokens).sum();
     let measured_client_completion_tps = measured_total as f64 / (measured_end / 1000.0).max(1e-9);
-    let measured_server_gpu_span_tps =
-        measured_total as f64 / (server_gpu_span.span_ms / 1000.0).max(1e-9);
     let simulated_completion_tps = simulated_total as f64 / (simulated_end / 1000.0).max(1e-9);
-    json!({
-        "summary": {
+    let summary = json!({
             "bins": bins,
             "common_span_ms": end_ms,
             "measured_output_tokens": measured_total,
@@ -615,14 +529,12 @@ fn throughput_series(
             // Backward-compatible alias for the pre-server-throughput field.
             "measured_completion_tps": measured_client_completion_tps,
             "measured_client_completion_tps": measured_client_completion_tps,
-            "measured_server_gpu_span_tps": measured_server_gpu_span_tps,
             "simulated_completion_tps": simulated_completion_tps,
             "measured_client_completion_span_ms": measured_end,
-            "measured_server_gpu_span_ms": server_gpu_span.span_ms,
             "simulated_completion_span_ms": simulated_end,
-            "measured_server_gpu_iterations": server_gpu_span.iterations_with_kernels,
-            "measured_server_gpu_kernels": server_gpu_span.kernels,
-        },
+    });
+    json!({
+        "summary": summary,
         "series": {
             "t_start_ms": t_start_ms,
             "t_end_ms": t_end_ms,
@@ -665,7 +577,6 @@ fn definitions() -> Value {
         "e2e": "measured total_duration_ms distribution vs simulator finish_decode_time_ms-arrival_time_ms distribution",
         "completion_throughput": "client-measured and simulated output tokens assigned to each request completion bin; not instantaneous token-production throughput",
         "client_completion_throughput": "all measured output tokens divided by req-frontend's earliest post/submit to latest client completion span; includes response and client completion overhead",
-        "server_gpu_span_throughput": "all measured output tokens divided by parsed NSYS first-kernel-start to last-kernel-end span; includes inter-iteration no-kernel gaps and the final iteration, but excludes queue time before the first GPU kernel and client completion overhead",
         "simulated_completion_throughput": "all simulated output tokens divided by earliest arrival to latest finish_decode_time span",
     })
 }
@@ -696,41 +607,11 @@ mod tests {
                 e2e_ms: None,
             },
         )]);
-        let value = throughput_series(
-            &measured,
-            &simulated,
-            ServerGpuSpan {
-                span_ms: 16.0,
-                iterations_with_kernels: 2,
-                kernels: 8,
-            },
-            2,
-        );
+        let value = throughput_series(&measured, &simulated, 2);
         assert_eq!(value["series"]["measured_output_tps"][1], 1000.0);
         assert_eq!(value["series"]["simulated_output_tps"][1], 1000.0);
         assert_eq!(value["summary"]["measured_client_completion_tps"], 1000.0);
-        assert_eq!(value["summary"]["measured_server_gpu_span_tps"], 625.0);
         assert_eq!(value["summary"]["simulated_completion_tps"], 500.0);
-    }
-
-    #[test]
-    fn server_gpu_span_includes_terminal_iteration_and_inter_iteration_gap() {
-        let path = std::env::temp_dir().join(format!(
-            "vibesim_alignment_server_gpu_span_{}.json",
-            std::process::id()
-        ));
-        fs::write(
-            &path,
-            r#"{"iteration_details":[{"ranges":[{"kernels":[{"start_ns":1000000,"end_ns":2000000}]}]},{"ranges":[{"kernels":[{"start_ns":10000000,"end_ns":13000000}]}]}]}"#,
-        )
-        .unwrap();
-
-        let span = read_server_gpu_span(&path).unwrap();
-        let _ = fs::remove_file(path);
-
-        assert_eq!(span.span_ms, 12.0);
-        assert_eq!(span.iterations_with_kernels, 2);
-        assert_eq!(span.kernels, 2);
     }
 
     #[test]

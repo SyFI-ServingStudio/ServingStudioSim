@@ -39,11 +39,9 @@ const ROPE_DIM: u32 = 64;
 const HIDDEN_DIM: u32 = 6144;
 const Q_LORA_RANK: u32 = 2048;
 const TOP_K: u32 = 2048;
-/// The v1 DSA indexer is frozen to one measured shape family, so the accepted
-/// context is an equality check rather than a bound. It must move together with
-/// `TIMING_MAX_MODEL_LEN` in the GLM-5.2 arch files and with the same constants
-/// in the L3 DSA attention worklets — three deliberate copies, one domain.
+#[cfg(test)]
 const MAX_MODEL_LEN: u32 = 1_048_576;
+#[cfg(test)]
 const LOGITS_ROW_STRIDE: u32 = 1_048_576;
 const CACHE_BLOCK_SIZE: u32 = 64;
 const QUANT_BLOCK_SIZE: u32 = 128;
@@ -518,13 +516,7 @@ fn validate_config(cfg: &DsaIndexerConfig) -> Result<(), BuildError> {
         ),
         ("index_head_dim", cfg.index_head_dim.get(), INDEX_HEAD_DIM),
         ("rope_dim", cfg.rope_dim.get(), ROPE_DIM),
-        ("max_model_len", cfg.max_model_len.get(), MAX_MODEL_LEN),
         ("top_k", cfg.top_k, TOP_K),
-        (
-            "logits_row_stride",
-            cfg.logits_row_stride.get(),
-            LOGITS_ROW_STRIDE,
-        ),
         ("cache_block_size", cfg.cache_block_size, CACHE_BLOCK_SIZE),
         ("quant_block_size", cfg.quant_block_size, QUANT_BLOCK_SIZE),
     ] {
@@ -533,6 +525,16 @@ fn validate_config(cfg: &DsaIndexerConfig) -> Result<(), BuildError> {
                 "{name} must be {required}, got {actual}"
             )));
         }
+    }
+    let max_model_len = cfg.max_model_len.get();
+    let logits_row_stride = cfg.logits_row_stride.get();
+    if max_model_len == 0 {
+        return Err(fit_failed("max_model_len must be positive"));
+    }
+    if logits_row_stride < max_model_len {
+        return Err(fit_failed(format!(
+            "logits_row_stride {logits_row_stride} must be at least max_model_len {max_model_len}"
+        )));
     }
     if !matches!(cfg.next_n, 1 | 2) {
         return Err(fit_failed(format!(
@@ -938,6 +940,24 @@ mod tests {
             assert_eq!(configs.decode_topk.context_mode, "uniform");
             assert_eq!(configs.decode_logits.page_mapping, "unique_scattered");
         }
+    }
+
+    #[test]
+    fn configured_context_size_is_preserved_in_decode_kernels() {
+        let mut config = cfg(1);
+        config.max_model_len = Dim::param("max_model_len", 8192);
+        config.logits_row_stride = Dim::param("logits_row_stride", 8192);
+
+        let configs = subkernel_configs(&config).unwrap();
+        assert_eq!(configs.decode_logits.max_model_len, 8192);
+        assert_eq!(configs.decode_topk.max_model_len, 8192);
+        assert_eq!(configs.decode_topk.logits_row_stride, 8192);
+
+        config.logits_row_stride = Dim::param("logits_row_stride", 4096);
+        assert!(matches!(
+            validate_config(&config),
+            Err(BuildError::FitFailed { reason, .. }) if reason.contains("at least max_model_len")
+        ));
     }
 
     #[test]

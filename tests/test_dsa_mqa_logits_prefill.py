@@ -107,6 +107,11 @@ def test_registration_support_and_facades():
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA H100",
     )
+    assert not spec.supports.allows(
+        DType.FP8_E4M3,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
+    )
     assert hasattr(perf_api, "get_dsa_mqa_logits_prefill_times")
     assert hasattr(perf_api, "count_missing_dsa_mqa_logits_prefill")
 
@@ -131,13 +136,18 @@ def test_deepgemm_registration_reuses_kind_table_args_family_and_facades():
     assert hasattr(perf_api, "count_missing_dsa_mqa_logits_prefill")
 
 
-def test_deepgemm_support_is_fp8_e4m3_h200_only():
+def test_deepgemm_support_is_fp8_e4m3_on_h200_and_b200():
     support = find_kernel_profiler_spec(KIND, _DEEPGEMM_BACKEND).supports
 
     assert support.allows(
         DType.FP8_E4M3,
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA H200",
+    )
+    assert support.allows(
+        DType.FP8_E4M3,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
     )
     assert not support.allows(
         DType.BF16,
@@ -304,6 +314,23 @@ def test_deepgemm_rejects_missing_cuda_and_unverified_gpu():
     )
     with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
         _validate_deepgemm_cuda_device(h100)
+
+    b200 = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: "NVIDIA B200",
+        )
+    )
+    _validate_deepgemm_cuda_device(b200)
+
+
+def test_deepgemm_cupti_filter_is_architecture_agnostic():
+    from profiling.runners.attention.dsa_mqa_logits_prefill import (
+        _DEEPGEMM_KERNEL_NAME,
+    )
+
+    assert _DEEPGEMM_KERNEL_NAME == "fp8_mqa_logits"
 
 
 def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatch):

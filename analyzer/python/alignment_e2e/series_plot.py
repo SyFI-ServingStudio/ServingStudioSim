@@ -80,7 +80,6 @@ def _render_throughput(
     ax.set_ylim(bottom=0.0)
     summary_fields = (
         ("measured_client_completion_tps", "client avg"),
-        ("measured_server_gpu_span_tps", "server GPU avg"),
         ("simulated_completion_tps", "sim avg"),
     )
     summary_lines = [

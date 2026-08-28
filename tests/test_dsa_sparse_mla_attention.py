@@ -87,10 +87,15 @@ def test_args_field_order_and_coercion() -> None:
 
 def test_registration_support_family_environment_and_facades() -> None:
     torch_spec = find_kernel_profiler_spec(KIND, "torch")
+    trtllm_spec = find_kernel_profiler_spec(KIND, "flashinfer_trtllm_fp8")
     flashmla_spec = find_kernel_profiler_spec(KIND, "vllm_flashmla_bf16")
 
     assert KIND == "dsa_sparse_mla_attention"
-    assert known_backends(KIND) == ["torch", "vllm_flashmla_bf16"]
+    assert known_backends(KIND) == [
+        "torch",
+        "flashinfer_trtllm_fp8",
+        "vllm_flashmla_bf16",
+    ]
     for spec in (torch_spec, flashmla_spec):
         assert spec.kernel_kind == spec.table_name == KIND
         assert spec.args_schema is DsaSparseMlaAttentionArgs
@@ -103,6 +108,13 @@ def test_registration_support_family_environment_and_facades() -> None:
         assert spec.runner_ref.module_name == (
             "profiling.runners.attention.dsa_sparse_mla_attention"
         )
+        assert not spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA B200")
+    assert trtllm_spec.supports.allows(DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA B200")
+    assert not trtllm_spec.supports.allows(DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200")
+    assert trtllm_spec.subprocess_env == "vllm_env"
+    assert trtllm_spec.runner_ref.function_name == (
+        "profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8"
+    )
     assert torch_spec.subprocess_env is None
     assert torch_spec.runner_ref.function_name == "profile_dsa_sparse_mla_attention_torch"
     assert flashmla_spec.subprocess_env == "vllm_env"
@@ -318,8 +330,33 @@ def test_validation_rejects_boolean_integer_and_scale() -> None:
         _validate_args(**(_BASE_SPEC | {"softmax_scale": True}))
 
 
+def test_trtllm_fp8_validation_accepts_tp4_local_heads_and_fp8_storage() -> None:
+    from profiling.runners.attention.dsa_sparse_mla_attention import _validate_args
+
+    validated = _validate_args(
+        **(
+            _BASE_SPEC
+            | {
+                "num_heads": 16,
+                "q_dtype": "fp8_e4m3",
+                "cache_dtype": "fp8_e4m3",
+                "cache_layout": "hnd_paged_mqa_fp8_latent_rope",
+            }
+        ),
+        expected_num_heads=16,
+        expected_q_dtype=DType.FP8_E4M3,
+        expected_cache_dtype=DType.FP8_E4M3,
+        expected_cache_layout="hnd_paged_mqa_fp8_latent_rope",
+    )
+    assert validated.num_queries == 1
+    assert validated.valid_counts == (2048,)
+
+
 def test_cuda_and_gpu_support_failures_are_typed() -> None:
-    from profiling.runners.attention.dsa_sparse_mla_attention import _require_h200
+    from profiling.runners.attention.dsa_sparse_mla_attention import (
+        _require_b200,
+        _require_h200,
+    )
 
     no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
     with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
@@ -334,6 +371,8 @@ def test_cuda_and_gpu_support_failures_are_typed() -> None:
     )
     with pytest.raises(ProfilerNotImplemented, match="requires NVIDIA H200"):
         _require_h200(h100)
+    with pytest.raises(ProfilerNotImplemented, match="requires NVIDIA B200"):
+        _require_b200(h100)
 
 
 def test_flashmla_loader_is_lazy_and_typed(monkeypatch) -> None:
@@ -610,6 +649,68 @@ def test_operand_sources_do_not_scale_an_arange_with_cache_size(monkeypatch) -> 
     )
     runner._build_operands(torch, validated, device=torch.device("cpu"))
     assert max(seen) <= 64
+
+
+def test_trtllm_fp8_operands_use_production_hnd_page_layout(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    monkeypatch.setattr(runner, "_SELECTED_K", 4)
+    monkeypatch.setattr(runner, "_TRTLLM_WORKSPACE_BYTES", 16)
+    validated = runner._ValidatedArgs(
+        num_queries=2,
+        num_cache_tokens=65,
+        valid_counts=(2, 4),
+        index_distribution="recent_contiguous",
+    )
+    operands = runner._build_trtllm_fp8_operands(
+        torch,
+        validated,
+        num_heads=16,
+        device=torch.device("cpu"),
+    )
+
+    assert operands.query.shape == (2, 1, 16, 576)
+    assert operands.query.dtype is torch.float8_e4m3fn
+    assert operands.cache.shape == (2, 1, 64, 576)
+    assert operands.cache.dtype is torch.float8_e4m3fn
+    assert operands.block_tables.shape == (2, 1, 4)
+    assert operands.seq_lens.tolist() == [2, 4]
+    assert operands.workspace.numel() == 16
+
+
+def test_trtllm_fp8_launch_matches_vllm_flashinfer_call() -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    operands = runner._TrtllmFp8Operands(
+        query=object(),
+        cache=object(),
+        block_tables=object(),
+        seq_lens=object(),
+        workspace=object(),
+    )
+    calls = []
+
+    def callable_(**kwargs):
+        calls.append(kwargs)
+        return "output"
+
+    assert runner._launch_trtllm_fp8(callable_, operands, softmax_scale=0.0625) == "output"
+    assert calls == [
+        {
+            "query": operands.query,
+            "kv_cache": operands.cache,
+            "workspace_buffer": operands.workspace,
+            "qk_nope_head_dim": 512,
+            "kv_lora_rank": 512,
+            "qk_rope_head_dim": 64,
+            "block_tables": operands.block_tables,
+            "seq_lens": operands.seq_lens,
+            "max_seq_len": 2048,
+            "bmm1_scale": 0.0625,
+            "bmm2_scale": 1.0,
+            "sparse_mla_top_k": 2048,
+        }
+    ]
 
 
 def test_vectorized_composite_matches_reference_for_empty_short_and_full_rows(

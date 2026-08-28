@@ -92,11 +92,16 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
     for pool_tag, pool in params.get("pools", {}).items():
         group = pool["groups"][0]
         arch = group["arch"]
+        arch_type = arch.get("type", "")
+        arch_quant_dtype = "fp4" if arch_type == "glm52_vllm_nvfp4_dsa_moe" else None
+        if arch.get("fp8"):
+            arch_quant_dtype = "fp8"
         specs[pool_tag] = {
             "config": arch["model_config"],
             # `gpu` is a group-level field (the arch block carries model/tp/fp8).
             "gpu": group["gpu"],
             "arch_fp8": bool(arch.get("fp8")),
+            "arch_quant_dtype": arch_quant_dtype,
             "dtype": "fp8" if arch.get("fp8") else "bf16",
         }
     return specs
@@ -110,16 +115,28 @@ def _check_precision(model, spec: dict) -> None:
     larger than the measured value, which silently turns redundancy into a number
     below 1. It is not detectable downstream, so it is rejected here.
     """
-    config_is_quantized = model.quant is not None
-    if spec["arch_fp8"] and not config_is_quantized:
+    config_quant_dtype = model.quant.compute_dtype if model.quant is not None else None
+    arch_quant_dtype = spec.get("arch_quant_dtype", "fp8" if spec["arch_fp8"] else None)
+    if arch_quant_dtype is not None and config_quant_dtype is None:
         raise ValueError(
-            f"arch declares fp8 but {spec['config']} has no quantization_config; "
-            "point `model_config` at the checkpoint's FP8 config (e.g. glm52_fp8.json)"
+            f"arch declares {arch_quant_dtype} but {spec['config']} has no "
+            "quantization_config; point `model_config` at the matching quantized checkpoint"
         )
-    if config_is_quantized and not spec["arch_fp8"]:
+    if config_quant_dtype is not None and arch_quant_dtype is None:
+        declaration = (
+            "does not set fp8"
+            if config_quant_dtype == "fp8"
+            else "does not declare a matching quantized path"
+        )
         raise ValueError(
             f"{spec['config']} declares a {model.quant.compute_dtype} quantization_config "
-            "but the arch does not set fp8; the run and the accountant disagree on precision"
+            f"but the arch {declaration}; "
+            "the run and the accountant disagree on precision"
+        )
+    if config_quant_dtype != arch_quant_dtype:
+        raise ValueError(
+            f"{spec['config']} declares {config_quant_dtype} quantized compute but the arch "
+            f"declares {arch_quant_dtype}; the run and the accountant disagree on precision"
         )
 
 
@@ -473,7 +490,7 @@ def _validation_shapes(weighted_shapes: list[dict]) -> list[dict]:
     for field_name in _WORKLOAD_FIELDS:
         # Older analyzer payloads predate optional workload axes such as
         # `prefill_stateful_requests`; their wire default is zero.
-        axis = lambda shape: int(shape["totals"].get(field_name, 0))  # noqa: B023
+        axis = lambda shape: int(shape["totals"].get(field_name, 0))  # noqa: B023,E731
         for extreme in (min(weighted_shapes, key=axis), max(weighted_shapes, key=axis)):
             selected.setdefault(id(extreme), extreme)
     return list(selected.values())

@@ -1,0 +1,32 @@
+# GLM-5.2 NVFP4 on one four-GPU B200 NVLink domain. Tensor and expert
+# parallelism use the same rank group, matching the profiled vLLM deployment.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/smoke.csv
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  session_dependency: independent
+  run_to_end: true
+
+io:
+  log_dir: logs/glm52_nvfp4_b200_ep4
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: glm52_vllm_nvfp4_dsa_moe
+          model_config: model/config/glm52_nvfp4.json
+          fp8: false
+          ep_size: 4
+          nvl_num_gpu: 4
+          max_model_len: 8192
+          routing: uniform
+          mtp_mode: "off"
+        worker:
+          type: hp_unified
+          attn_gpu_memory_gb: 120.0

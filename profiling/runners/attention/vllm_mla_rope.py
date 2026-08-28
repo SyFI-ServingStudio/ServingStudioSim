@@ -34,7 +34,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_SUPPORTED_GPUS = frozenset({"NVIDIA H100", "NVIDIA H200"})
+_SUPPORTED_GPUS = frozenset({"NVIDIA H100", "NVIDIA H200", "NVIDIA B200"})
 _HOPPER_COMPUTE_CAPABILITY = (9, 0)
 # Substring, not an exact name: inductor suffixes the fusion with a per-graph
 # counter (`..._view_4`, `..._view_7`), so the digits are not stable.
@@ -249,9 +249,7 @@ def profile_vllm_mla_rope_vllm_inductor(
         is_neox_style=is_neox_style,
         torch_dtype=torch_dtype,
     )
-    compiled_block = torch.compile(
-        _build_block(torch, rotary_emb, qk_nope_head_dim), dynamic=False
-    )
+    compiled_block = torch.compile(_build_block(torch, rotary_emb, qk_nope_head_dim), dynamic=False)
     operands = _allocate_operands(
         torch,
         num_tokens=num_tokens,

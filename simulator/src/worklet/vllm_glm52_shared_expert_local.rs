@@ -44,8 +44,8 @@ const SOURCE_ORDER: [&str; 5] = [
     "down_proj",
 ];
 
-/// Raw GLM-5.2 one-shared-expert identity. There is no parallelism or
-/// collective configuration inside this local section.
+/// Raw GLM-5.2 one-shared-expert identity. This worklet owns one rank-local
+/// compute segment; the architecture owns the following collective boundary.
 #[derive(Clone, Debug)]
 pub struct VllmGlm52SharedExpertLocalWorkletConfig {
     pub gemm_backends: Vec<&'static str>,
@@ -53,6 +53,7 @@ pub struct VllmGlm52SharedExpertLocalWorkletConfig {
     /// `gemm_dtype` is BF16.
     pub fp8_quant_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    pub tp_size: u16,
     pub gpu_name: String,
     pub hidden_dim: Dim,
     pub moe_intermediate_dim: Dim,
@@ -102,7 +103,8 @@ impl VllmGlm52SharedExpertLocalWorklet {
             "shared expert width",
             &[cfg.n_shared_experts, cfg.moe_intermediate_dim.get()],
         )
-        .expect("validated GLM-5.2 shared-expert width must fit u32");
+        .expect("validated GLM-5.2 shared-expert width must fit u32")
+            / u32::from(cfg.tp_size);
         let gate_up_n = checked_product("gate_up_proj.n", &[2, shared_width])
             .expect("validated GLM-5.2 shared gate/up dimension must fit u32");
         let silu_input_bytes = checked_product(
@@ -274,6 +276,16 @@ struct WorkInputs {
 }
 
 fn validate_config(cfg: &VllmGlm52SharedExpertLocalWorkletConfig) -> Result<(), String> {
+    let shared_width = cfg
+        .n_shared_experts
+        .checked_mul(cfg.moe_intermediate_dim.get())
+        .ok_or_else(|| "shared expert width overflows u32".to_string())?;
+    if cfg.tp_size == 0 || shared_width % u32::from(cfg.tp_size) != 0 {
+        return Err(format!(
+            "shared expert width {shared_width} must be divisible by positive tp_size {}",
+            cfg.tp_size
+        ));
+    }
     for (name, actual, required) in [
         ("hidden_dim", cfg.hidden_dim.get(), HIDDEN_DIM),
         (
@@ -333,8 +345,10 @@ fn worklet_label(name: &str, cfg: &VllmGlm52SharedExpertLocalWorkletConfig) -> S
     )
     .expect("validated GLM-5.2 shared-expert label width must fit u32");
     format!(
-        "{name} (VllmGlm52SharedExpertLocalWorklet) [local (1 GPU); shared_experts={}; shared_width={}]",
-        cfg.n_shared_experts, shared_width
+        "{name} (VllmGlm52SharedExpertLocalWorklet) [local rank; tp={}; shared_experts={}; shared_width/rank={}]",
+        cfg.tp_size,
+        cfg.n_shared_experts,
+        shared_width / u32::from(cfg.tp_size)
     )
 }
 
@@ -378,6 +392,7 @@ mod tests {
             fp8_quant_backends: vec!["flashinfer_trtllm"],
             gemm_backends: vec!["torch_linear"],
             elementwise_backends: vec!["triton"],
+            tp_size: 1,
             gpu_name: "NVIDIA H200".to_string(),
             hidden_dim: Dim::param("hidden_dim", HIDDEN_DIM),
             moe_intermediate_dim: Dim::param("moe_intermediate_dim", MOE_INTERMEDIATE_DIM),
@@ -440,6 +455,20 @@ mod tests {
     }
 
     #[test]
+    fn tp4_partitions_only_the_shared_expert_width() {
+        let mut config = cfg();
+        config.tp_size = 4;
+        let r = VllmGlm52SharedExpertLocalWorklet::resolve_config(&config);
+
+        assert_eq!(r.gate_up_proj.n, 1024);
+        assert_eq!(r.gate_up_proj.k, 6144);
+        assert_eq!(r.silu_and_mul.input_bytes_per_token, 2048);
+        assert_eq!(r.silu_and_mul.output_bytes_per_token, 1024);
+        assert_eq!(r.down_proj.n, 6144);
+        assert_eq!(r.down_proj.k, 512);
+    }
+
+    #[test]
     fn input_and_zero_case_feed_all_three_leaves_faithfully() {
         let work = work_inputs(73);
         assert_eq!(work.gate_up_proj.m, 73);
@@ -495,13 +524,14 @@ mod tests {
     }
 
     #[test]
-    fn label_documents_local_one_shared_expert_boundary() {
+    fn label_documents_rank_local_shared_expert_partition() {
         let label = worklet_label("layer.shared_expert", &cfg());
         assert!(label.contains("VllmGlm52SharedExpertLocalWorklet"));
-        assert!(label.contains("local (1 GPU)"));
+        assert!(label.contains("local rank"));
+        assert!(label.contains("tp=1"));
         assert!(label.contains("shared_experts=1"));
-        assert!(label.contains("shared_width=2048"));
-        for forbidden in ["tp=", "allreduce", "collective"] {
+        assert!(label.contains("shared_width/rank=2048"));
+        for forbidden in ["allreduce", "collective"] {
             assert!(!label.contains(forbidden));
         }
     }

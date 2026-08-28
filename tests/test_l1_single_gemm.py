@@ -131,7 +131,12 @@ def test_deepgemm_backend_registered_sharing_table_and_args():
 
 
 def test_single_gemm_known_backends_include_both_torch_layouts_and_deepgemm():
-    assert set(known_backends("single_gemm")) == {"torch", "torch_linear", "deepgemm"}
+    assert set(known_backends("single_gemm")) == {
+        "torch",
+        "torch_linear",
+        "torch_linear_vllm",
+        "deepgemm",
+    }
 
 
 def test_torch_linear_backend_registered_sharing_table_and_args():
@@ -141,6 +146,18 @@ def test_torch_linear_backend_registered_sharing_table_and_args():
     assert spec.metric_family is MetricFamily.COMPUTE
     assert spec.runner_ref.module_name == "profiling.runners.gemm.torch"
     assert spec.runner_ref.function_name == "profile_single_gemm_linear"
+
+
+def test_vllm_torch_linear_backend_registered_sharing_table_and_args():
+    spec = find_kernel_profiler_spec("single_gemm", "torch_linear_vllm")
+    assert spec.table_name == "single_gemm"
+    assert spec.args_schema is SingleGemmArgs
+    assert spec.metric_family is MetricFamily.COMPUTE
+    assert spec.runner_ref.module_name == "profiling.runners.gemm.torch"
+    assert spec.runner_ref.function_name == "profile_single_gemm_linear"
+    assert spec.subprocess_env == "vllm_env"
+    assert spec.supports.compute == frozenset({DType.BF16})
+    assert spec.supports.gpus == frozenset({"NVIDIA B200"})
 
 
 def test_dtype_from_value_accepts_runner_aliases():
@@ -746,10 +763,17 @@ def test_torch_linear_single_gemm_uses_model_weight_layout(
     monkeypatch.setitem(sys.modules, "torch", torch_module)
     monkeypatch.setitem(sys.modules, "torch.nn", nn_module)
     monkeypatch.setitem(sys.modules, "torch.nn.functional", functional)
+    captured_timer_kwargs = {}
     monkeypatch.setattr(
         torch_gemm_runner.Timer,
         "cupti",
-        staticmethod(lambda fn, **kwargs: (fn(), 2.0)[1]),
+        staticmethod(
+            lambda fn, **kwargs: (
+                fn(),
+                captured_timer_kwargs.update(kwargs),
+                2.0,
+            )[2]
+        ),
     )
     monkeypatch.setattr(
         torch_gemm_runner.Energy,
@@ -762,6 +786,7 @@ def test_torch_linear_single_gemm_uses_model_weight_layout(
     assert captured_shapes == [((2, 4), (3, 4)), ((2, 4), (3, 4))]
     assert metrics.time_ms == 2.0
     assert metrics.energy_j == 0.2
+    assert captured_timer_kwargs == {"interval_union": True}
 
 
 def test_single_gemm_perf_api_query_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1426,9 +1451,7 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
             existing_pythonpath,
         ]
     )
-    assert captured_env["LD_LIBRARY_PATH"] == os.pathsep.join(
-        [str(library_root), "/existing/lib"]
-    )
+    assert captured_env["LD_LIBRARY_PATH"] == os.pathsep.join([str(library_root), "/existing/lib"])
     assert isinstance(results[0].metrics, ComputeMetrics)
 
 

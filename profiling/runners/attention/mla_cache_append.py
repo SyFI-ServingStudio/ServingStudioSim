@@ -22,8 +22,8 @@ _ROPE_DIM = 64
 _BLOCK_SIZE = 64
 _CACHE_FORMAT = "plain"
 _REQUIRED_GPU = "NVIDIA H200"
+_VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _VLLM_KERNEL_NAME = "concat_and_cache_mla_kernel"
-_VLLM_CACHE_DTYPE = "auto"
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,8 @@ def _validate_args(
     input_dtype: DType | str,
     kv_dtype: DType | str,
     cache_format: str,
+    *,
+    allow_fp8_cache: bool = False,
 ) -> tuple[int, int, int, int, DType, DType, str]:
     num_tokens = int(num_tokens)
     kv_lora_rank = int(kv_lora_rank)
@@ -54,12 +56,7 @@ def _validate_args(
     kv_dtype = DType.from_value(kv_dtype)
     cache_format = str(cache_format)
 
-    if (
-        num_tokens <= 0
-        or kv_lora_rank <= 0
-        or rope_dim <= 0
-        or block_size <= 0
-    ):
+    if num_tokens <= 0 or kv_lora_rank <= 0 or rope_dim <= 0 or block_size <= 0:
         raise ValueError(
             "num_tokens, kv_lora_rank, rope_dim, and block_size must be > 0, "
             f"got {num_tokens}, {kv_lora_rank}, {rope_dim}, and {block_size}"
@@ -74,15 +71,16 @@ def _validate_args(
             "(kv_lora_rank, rope_dim, block_size) == (512, 64, 64), "
             f"got ({kv_lora_rank}, {rope_dim}, {block_size})"
         )
-    if input_dtype is not DType.BF16 or kv_dtype is not DType.BF16:
+    supported_kv_dtypes = {DType.BF16, DType.FP8_E4M3} if allow_fp8_cache else {DType.BF16}
+    if input_dtype is not DType.BF16 or kv_dtype not in supported_kv_dtypes:
         raise ValueError(
-            "torch mla_cache_append requires input_dtype=kv_dtype=bf16, "
+            "mla_cache_append requires BF16 input and "
+            f"{'BF16 or FP8 E4M3' if allow_fp8_cache else 'BF16'} cache, "
             f"got {input_dtype.value} and {kv_dtype.value}"
         )
     if cache_format != _CACHE_FORMAT:
         raise ValueError(
-            "torch mla_cache_append requires cache_format='plain', "
-            f"got {cache_format!r}"
+            f"torch mla_cache_append requires cache_format='plain', got {cache_format!r}"
         )
     return (
         num_tokens,
@@ -97,27 +95,22 @@ def _validate_args(
 
 def _validate_cuda_device(torch: Any) -> None:
     if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the torch mla_cache_append backend"
-        )
+        raise ProfilerNotImplemented("CUDA is required for the torch mla_cache_append backend")
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
     if gpu_name != _REQUIRED_GPU:
         raise ProfilerNotImplemented(
-            "torch mla_cache_append is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
+            f"torch mla_cache_append is verified only on {_REQUIRED_GPU}, got {gpu_name}"
         )
 
 
 def _validate_vllm_cuda_device(torch: Any) -> None:
     if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the mla_cache_append vllm_cuda backend"
-        )
+        raise ProfilerNotImplemented("CUDA is required for the mla_cache_append vllm_cuda backend")
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
+    if gpu_name not in _VLLM_SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
             "mla_cache_append vllm_cuda is verified only on "
-            f"{_REQUIRED_GPU}, got {gpu_name}"
+            f"{' or '.join(_VLLM_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 
@@ -129,6 +122,7 @@ def _build_operands(
     rope_dim: int,
     block_size: int,
     torch_dtype: Any,
+    cache_torch_dtype: Any,
     device: str,
 ) -> _MlaCacheAppendOperands:
     """Allocate exact plain-cache operands and deterministic scattered slots."""
@@ -163,7 +157,7 @@ def _build_operands(
     cache = torch.full(
         (num_blocks, block_size, kv_lora_rank + rope_dim),
         -1,
-        dtype=torch_dtype,
+        dtype=cache_torch_dtype,
         device=device,
     )
     return _MlaCacheAppendOperands(
@@ -203,9 +197,7 @@ def _logical_bytes(
     """Return logical read/write traffic, excluding allocation/initialization."""
     row_width = kv_lora_rank + rope_dim
     return num_tokens * (
-        row_width * input_dtype.size_bytes()
-        + row_width * kv_dtype.size_bytes()
-        + 8
+        row_width * input_dtype.size_bytes() + row_width * kv_dtype.size_bytes() + 8
     )
 
 
@@ -253,6 +245,7 @@ def profile_mla_cache_append_torch(
             rope_dim=rope_dim,
             block_size=block_size,
             torch_dtype=input_dtype.torch(),
+            cache_torch_dtype=kv_dtype.torch(),
             device="cuda",
         )
 
@@ -282,9 +275,7 @@ def profile_mla_cache_append_torch(
             input_dtype=input_dtype,
             kv_dtype=kv_dtype,
         )
-        bandwidth_gbps = (
-            logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
-        )
+        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=0.0,
@@ -321,6 +312,7 @@ def profile_mla_cache_append_vllm_cuda(
         input_dtype,
         kv_dtype,
         cache_format,
+        allow_fp8_cache=True,
     )
     try:
         import torch
@@ -341,6 +333,9 @@ def profile_mla_cache_append_vllm_cuda(
             rope_dim=rope_dim,
             block_size=block_size,
             torch_dtype=input_dtype.torch(),
+            cache_torch_dtype=(
+                torch.float8_e4m3fn if kv_dtype is DType.FP8_E4M3 else kv_dtype.torch()
+            ),
             device="cuda",
         )
         scale = torch.ones((), dtype=torch.float32, device="cuda")
@@ -351,7 +346,7 @@ def profile_mla_cache_append_vllm_cuda(
                 operands.k_pe,
                 operands.cache,
                 operands.slot_mapping,
-                _VLLM_CACHE_DTYPE,
+                "auto" if kv_dtype is DType.BF16 else "fp8_e4m3",
                 scale,
             )
 
@@ -373,9 +368,7 @@ def profile_mla_cache_append_vllm_cuda(
             input_dtype=input_dtype,
             kv_dtype=kv_dtype,
         )
-        bandwidth_gbps = (
-            logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
-        )
+        bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
         return ComputeMetrics(
             time_ms=float(time_ms),
             tflops=0.0,

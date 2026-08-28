@@ -48,7 +48,6 @@ def _tracks(*programs: list[dict]) -> list[dict]:
     ]
 
 
-
 def test_initialize_writes_explicit_unmapped_cross_rank_labels(tmp_path):
     source = tmp_path / "source.json"
     output = tmp_path / "labeled.json"
@@ -60,16 +59,18 @@ def test_initialize_writes_explicit_unmapped_cross_rank_labels(tmp_path):
                         "unique_sequences": [
                             {
                                 "sequence_id": "sequence_test",
-                                "tracks": _tracks([
-                                    {
-                                        "kernels": [
-                                            {
-                                                "name": "kernel",
-                                                "suggested_category": "other",
-                                            }
-                                        ]
-                                    }
-                                ]),
+                                "tracks": _tracks(
+                                    [
+                                        {
+                                            "kernels": [
+                                                {
+                                                    "name": "kernel",
+                                                    "suggested_category": "other",
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                ),
                             }
                         ]
                     }
@@ -99,20 +100,22 @@ def test_initialize_refuses_to_overwrite_existing_label_decisions(tmp_path):
                         "unique_sequences": [
                             {
                                 "sequence_id": "sequence_test",
-                                "tracks": _tracks([
-                                    {
-                                        "kernels": [
-                                            {
-                                                "name": "kernel",
-                                                "suggested_category": "other",
-                                                "label": {
-                                                    "status": "unmapped",
-                                                    "cross_rank": "independent",
-                                                },
-                                            }
-                                        ]
-                                    }
-                                ]),
+                                "tracks": _tracks(
+                                    [
+                                        {
+                                            "kernels": [
+                                                {
+                                                    "name": "kernel",
+                                                    "suggested_category": "other",
+                                                    "label": {
+                                                        "status": "unmapped",
+                                                        "cross_rank": "independent",
+                                                    },
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                ),
                             }
                         ]
                     }
@@ -145,25 +148,27 @@ def test_initialize_unfolds_repeats_for_occurrence_specific_boundaries(tmp_path)
                                 "sequence_id": "sequence_test",
                                 "occurrences": [{"device_id": 0, "iterations": [7]}],
                                 "expanded_kernel_count": 4,
-                                "tracks": _tracks([
-                                    {
-                                        "repeat": {
-                                            "count": 2,
-                                            "body": {
-                                                "kernels": [
-                                                    {
-                                                        "name": "norm",
-                                                        "suggested_category": "other",
-                                                    },
-                                                    {
-                                                        "name": "projection",
-                                                        "suggested_category": "other",
-                                                    },
-                                                ]
-                                            },
+                                "tracks": _tracks(
+                                    [
+                                        {
+                                            "repeat": {
+                                                "count": 2,
+                                                "body": {
+                                                    "kernels": [
+                                                        {
+                                                            "name": "norm",
+                                                            "suggested_category": "other",
+                                                        },
+                                                        {
+                                                            "name": "projection",
+                                                            "suggested_category": "other",
+                                                        },
+                                                    ]
+                                                },
+                                            }
                                         }
-                                    }
-                                ]),
+                                    ]
+                                ),
                             }
                         ]
                     }
@@ -201,16 +206,18 @@ def test_rule_before_name_distinguishes_last_identical_boundary():
                 "unique_sequences": [
                     {
                         "sequence_id": "sequence_boundary",
-                        "tracks": _tracks([
-                            {
-                                "kernels": [
-                                    kernel("norm"),
-                                    kernel("qkv"),
-                                    kernel("norm"),
-                                    kernel("lm_head"),
-                                ]
-                            }
-                        ]),
+                        "tracks": _tracks(
+                            [
+                                {
+                                    "kernels": [
+                                        kernel("norm"),
+                                        kernel("qkv"),
+                                        kernel("norm"),
+                                        kernel("lm_head"),
+                                    ]
+                                }
+                            ]
+                        ),
                     }
                 ]
             }
@@ -246,21 +253,23 @@ def document():
                 "unique_sequences": [
                     {
                         "sequence_id": "sequence_aaaa1111",
-                        "tracks": _tracks([
-                            {"kernels": [kernel("norm_kernel", dict(MAPPED_NORM))]},
-                            {
-                                "repeat": {
-                                    "count": 18,
-                                    "body": {
-                                        "kernels": [
-                                            kernel("nvjet_tile_TNT"),
-                                            kernel("splitKreduce_kernel"),
-                                            kernel("cudaMemsetAsync_filler"),
-                                        ]
-                                    },
-                                }
-                            },
-                        ]),
+                        "tracks": _tracks(
+                            [
+                                {"kernels": [kernel("norm_kernel", dict(MAPPED_NORM))]},
+                                {
+                                    "repeat": {
+                                        "count": 18,
+                                        "body": {
+                                            "kernels": [
+                                                kernel("nvjet_tile_TNT"),
+                                                kernel("splitKreduce_kernel"),
+                                                kernel("cudaMemsetAsync_filler"),
+                                            ]
+                                        },
+                                    }
+                                },
+                            ]
+                        ),
                     }
                 ]
             },
@@ -461,9 +470,7 @@ def test_a_before_rule_uses_a_mapped_successor_from_an_earlier_pass(document):
         before="moe.router.router_gemm",
     )
 
-    assert apply_rules(document, [reduction], SLOTS).applied == {
-        "moe.router.router_gemm": 1
-    }
+    assert apply_rules(document, [reduction], SLOTS).applied == {"moe.router.router_gemm": 1}
     assert apply_rules(document, [producer], SLOTS).applied == {"moe.router.router_gemm": 1}
     positions = list(walk_kernels(document))
     assert positions[1].operation == "moe.router.router_gemm"

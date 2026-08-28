@@ -309,7 +309,6 @@ iteration:
 # analyze_e2e.yaml — e2e-align; consumes the completed sim
 schema_version: 1
 simulation_log_dir: ./simulation
-profile_log_dir: ./profile_nsys
 workload_profile_log_dir: ./profile_workload_metrics
 log_dir: ./analysis_e2e
 workload:
@@ -323,23 +322,20 @@ One analyze config is exactly one phase: enable `iteration` (kernel-align) or
 `workload`/`e2e` (e2e-align), never both — the two write distinct typed manifests
 and mixing them is rejected. Every subject defaults to disabled, so a phase is
 opted into by naming only its block; `simulation_log_dir` is required only for
-the e2e-align phase. `profile_log_dir` supplies the bounded NSYS kernel/GPU
-anchor. `workload_profile_log_dir` optionally supplies a separate
-`profile_kind: workload_metrics` run for full scheduler and request timelines;
-it defaults to `profile_log_dir` for older captures. E2E analysis does not
-consume timing-predict output. The NSYS and workload-metrics passes must name
-the same source trace; a copied trace at another path is accepted only when the
-two files are byte-identical. Workload
+the e2e-align phase. Kernel alignment requires `profile_log_dir` pointing at
+the NSYS capture. Workload/E2E alignment instead requires
+`workload_profile_log_dir` pointing at the full `profile_kind:
+workload_metrics` run; it consumes neither NSYS nor timing-predict output.
+Workload
 analysis plots each side against its recorded iteration ids and emits fine-grained
 prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle
 series. It also plots decode batch size against each side's independently
 normalized elapsed time. The workload subject reads the complete structured
-metrics stream, not the bounded NSYS intersection. It selects the unique
-contiguous iteration-id segment containing the NSYS window, which excludes
-prefix-cache preflight steps without guessing a numeric cutoff. Schema-v2 vLLM
-records carry monotonic observation start/end timestamps: adjacent starts define
-the full EngineCore cadence, while start-to-end retains the historical observed
-result-wait/sampling duration. Simulation cycle time is one actual
+metrics stream. New captures record req-frontend's start/end in the same host
+monotonic clock as schema-v2 EngineCore records, so startup and prefix-cache
+preflight iterations are filtered without an NSYS anchor. Adjacent EngineCore
+starts define the full cadence, while start-to-end retains the historical
+observed result-wait/sampling duration. Simulation cycle time is one actual
 `wall_start_ms` to the next, so it already includes the worker's
 `gpu_time_multiplier`, tick quantization, and scheduler gaps. The kernel-align
 GPU cycle remains the separate NSYS first-kernel-to-next-first-kernel quantity.
@@ -364,14 +360,11 @@ measured/simulated pair is compared as independent distributions; no per-request
 latency ratio is computed. Request ids only audit whether either side lost
 requests, which matters when the two schedulers execute simultaneous arrivals in
 different orders.
-Throughput reports both client completion time and server GPU time. The client
-rate uses req-frontend's earliest post/submit through latest completion. The server
-GPU rate uses parsed NSYS's first observed kernel start through last observed
-kernel end, so it includes inter-iteration gaps and the terminal iteration that
-first-kernel-to-next-first-kernel cycle sums omit. The per-bin plot remains a
-client-completion versus simulation comparison because NSYS does not attribute
-completed output tokens to individual server timestamps; its summary box shows
-all three aggregate rates without inventing a server token-production series.
+Throughput compares the real client-completion rate with simulated completion
+rate. The measured span runs from req-frontend's earliest post/submit through
+its latest completion; the simulated span runs from earliest arrival through
+latest simulated completion. Neither rate consults NSYS or invents a
+per-token server timeline.
 An older profile captured before engine-core request timing instrumentation can
 still provide client TTFT, TPOT, E2E, and throughput analysis: its manifest
 records `request_timings_result: null`, the report marks server TTFT/TPOT

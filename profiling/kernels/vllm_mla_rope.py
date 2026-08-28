@@ -65,7 +65,7 @@ register(
         backend="vllm_inductor",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H100", "NVIDIA H200"}),
+            gpus=frozenset({"NVIDIA H100", "NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.vllm_mla_rope",

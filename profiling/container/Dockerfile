@@ -56,6 +56,13 @@ RUN UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     && uv pip check --python .venv/bin/python \
     && mkdir -p .venv/lib/cuda-compat
 
+# Prepare FlashInfer's package-local MoE link and its runtime lock while root;
+# profiler workers keep the package immutable and write JIT artifacts to /cache.
+RUN FLASHINFER_CUDA_ARCH_LIST=10.0 python -c \
+       "from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module; gen_trtllm_gen_fused_moe_sm100_module()" \
+    && python -c \
+       "from flashinfer.jit import env; p = env.FLASHINFER_CUBIN_DIR / 'flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export.lock'; p.touch(); p.chmod(0o666)"
+
 COPY profiling /opt/vibesim/profiling
 COPY launcher /opt/vibesim/launcher
 COPY gpu /opt/vibesim/gpu

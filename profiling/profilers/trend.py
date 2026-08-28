@@ -10,13 +10,16 @@ representative kernel time so the runner still completes normally.
 
 ``torch`` and the CUPTI extension are imported lazily inside
 ``run_measure_capture`` so this module stays importable on a CPU-only host;
-``numpy`` (CPU-only) is used at module scope for the runtime summary.
+``numpy`` (CPU-only) is used at module scope for the runtime summary. PNG
+rendering is optional because minimal pinned runner containers need not carry
+matplotlib; missing any other dependency still fails the capture.
 """
 
 from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -88,23 +91,60 @@ def run_measure_capture(fn: Callable[[], object], context: MeasureContext) -> fl
         _write_aligned_csv(output_dir / "telemetry.csv", aligned)
         artifacts.append(output_dir / "telemetry.csv")
 
-    (output_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    artifacts.append(output_dir / "summary.json")
+    summary_path = output_dir / "summary.json"
+    artifacts.append(summary_path)
 
-    trend_plot.plot_runtime_trend(output_dir / "runtime_trend.png", series, summary)
-    artifacts.append(output_dir / "runtime_trend.png")
+    plotting: dict[str, dict[str, str]] = {}
+    runtime_plot = output_dir / "runtime_trend.png"
+    created, skipped_reason = _render_optional_plot(
+        lambda: trend_plot.plot_runtime_trend(runtime_plot, series, summary)
+    )
+    plotting["runtime_trend"] = _plot_status(runtime_plot, created, skipped_reason)
+    if created:
+        artifacts.append(runtime_plot)
     if aligned is not None:
-        trend_plot.plot_runtime_telemetry(
-            output_dir / "runtime_telemetry.png", series, aligned, summary
+        telemetry_plot = output_dir / "runtime_telemetry.png"
+        created, skipped_reason = _render_optional_plot(
+            lambda: trend_plot.plot_runtime_telemetry(
+                telemetry_plot,
+                series,
+                aligned,
+                summary,
+            )
         )
-        artifacts.append(output_dir / "runtime_telemetry.png")
+        plotting["runtime_telemetry"] = _plot_status(telemetry_plot, created, skipped_reason)
+        if created:
+            artifacts.append(telemetry_plot)
+    else:
+        plotting["runtime_telemetry"] = {"status": "not_applicable"}
+
+    summary["plotting"] = plotting
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     median_ms = float(summary["runtime_ms"]["median"])  # type: ignore[index]
     context.time_ms = median_ms
     context.artifacts = [str(path) for path in artifacts]
     return median_ms
+
+
+def _render_optional_plot(render: Callable[[], None]) -> tuple[bool, str | None]:
+    """Render a plot, skipping only a missing optional matplotlib dependency."""
+
+    try:
+        render()
+    except ModuleNotFoundError as exc:
+        missing_root = (exc.name or "").split(".", maxsplit=1)[0]
+        if missing_root != "matplotlib":
+            raise
+        return False, "matplotlib is not installed in the profiling environment"
+    return True, None
+
+
+def _plot_status(path: Path, created: bool, skipped_reason: str | None) -> dict[str, str]:
+    if created:
+        return {"status": "created", "path": str(path)}
+    assert skipped_reason is not None
+    return {"status": "skipped", "reason": skipped_reason}
 
 
 def summarize(
@@ -118,11 +158,13 @@ def summarize(
 
     first_mask = starts < 1.0
     last_mask = starts >= max(float(starts[-1]) - 1.0, 0.0)
-    first_1s_mean = float(np.mean(durations[first_mask])) if first_mask.any() else float(np.mean(durations))
-    last_1s_mean = float(np.mean(durations[last_mask])) if last_mask.any() else float(np.mean(durations))
-    slope_ms_per_s = (
-        float(np.polyfit(starts, durations, deg=1)[0]) if np.std(starts) > 0 else 0.0
+    first_1s_mean = (
+        float(np.mean(durations[first_mask])) if first_mask.any() else float(np.mean(durations))
     )
+    last_1s_mean = (
+        float(np.mean(durations[last_mask])) if last_mask.any() else float(np.mean(durations))
+    )
+    slope_ms_per_s = float(np.polyfit(starts, durations, deg=1)[0]) if np.std(starts) > 0 else 0.0
 
     one_second_bins = []
     for second in range(int(np.ceil(starts[-1])) if starts[-1] > 0 else 1):
@@ -163,7 +205,10 @@ def summarize(
     }
 
 
-def rolling_median(values: np.ndarray, window: int = _ROLLING_WINDOW) -> tuple[np.ndarray, np.ndarray]:
+def rolling_median(
+    values: np.ndarray,
+    window: int = _ROLLING_WINDOW,
+) -> tuple[np.ndarray, np.ndarray]:
     """Centered rolling median; window is clamped odd and to len(values)."""
 
     resolved = min(window, len(values))

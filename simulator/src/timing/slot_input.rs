@@ -15,15 +15,16 @@
 use serde::Serialize;
 
 use crate::timing::kernels::{
-    AllReduceKernelInput, AllReduceResidualRmsNormKernelInput, BatchedGemmKernelInput,
-    ClampedSwigluKernelInput, DeepseekV4FusedInvRopeFp8QuantKernelInput,
+    AllReduceFusionKernelInput, AllReduceKernelInput, AllReduceResidualRmsNormKernelInput,
+    BatchedGemmKernelInput, ClampedSwigluKernelInput, DeepseekV4FusedInvRopeFp8QuantKernelInput,
     DeepseekV4FusedQKvRmsnormKernelInput, DeepseekV4IndexerPrefillKernelInput,
     DeepseekV4IndexerQRopeQuantKernelInput, DeepseekV4PackedCacheGatherKernelInput,
     DeepseekV4QnormRopeKvInsertKernelInput, DeepseekV4SparseAttnCompressStoreKernelInput,
     DeepseekV4SparseMlaDecodeKernelInput, DeepseekV4SparseMlaPrefillKernelInput,
     DsaIndexCacheAppendKernelInput, DsaMqaLogitsPrefillKernelInput,
     DsaPagedMqaLogitsDecodeKernelInput, DsaPersistentTopkDecodeKernelInput,
-    DsaSparseMlaAttentionKernelInput, DsaTopkPrefillKernelInput, ElementwiseKernelInput,
+    DsaSparseIndexRemapKernelInput, DsaSparseMlaAttentionKernelInput,
+    DsaSparseMlaPrefillKernelInput, DsaTopkPrefillKernelInput, ElementwiseKernelInput,
     FlashinferAttnDecodeKernelInput, FlashinferAttnRectKernelInput, Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemmKernelInput, Fp8PerTokenGroupQuantKernelInput,
     GdnCausalConvDecodeKernelInput, GdnCausalConvPrefillKernelInput, GdnChunkDeltaRuleKernelInput,
@@ -34,9 +35,9 @@ use crate::timing::kernels::{
     MhcRmsNormKernelInput, MlaCacheAppendKernelInput, MoeAlignBlockSizeKernelInput,
     MoeAlltoallKernelInput, MoeAlltoallPrepareKernelInput, MoeEpCollectiveKernelInput,
     MoeFinalizeRoutingKernelInput, MoeFusedTopkKernelInput, MoeSumKernelInput,
-    MoeTopkSoftplusSqrtKernelInput, Mxfp4MarlinMoeGemmKernelInput, P2pInterKernelInput,
-    P2pIntraKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput, SingleGemmKernelInput,
-    VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
+    MoeTopkSoftplusSqrtKernelInput, Mxfp4MarlinMoeGemmKernelInput, Nvfp4FusedMoeKernelInput,
+    Nvfp4QuantKernelInput, P2pInterKernelInput, P2pIntraKernelInput, ResidualRmsNormKernelInput,
+    RmsNormKernelInput, SingleGemmKernelInput, VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
 };
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -59,6 +60,16 @@ pub struct GdnCausalConvPrefillLog {
 #[derive(Clone, Serialize)]
 pub struct DsaSparseMlaPrefillLog {
     pub prefill_query_cache_pairs: Vec<(u32, u32)>,
+}
+
+/// Sparse-MLA decode cache input. Preserve the exact request-local lengths in
+/// the trace even though the low-dimensional cache evaluates their rounded
+/// uniform-equivalent context.
+#[derive(Clone, Serialize)]
+pub struct DsaSparseMlaDecodeLog {
+    pub context_lens: Vec<u32>,
+    pub decode_next_n: u32,
+    pub projected_context: u32,
 }
 
 /// DSA indexer prefill fan-in: every request-local `(Q, N)` cell aggregated by
@@ -97,6 +108,8 @@ log_inputs! {
     Fp8BlockQuant => Fp8BlockQuantKernelInput,
     Fp8BlockscaleGroupedGemm => Fp8BlockscaleGroupedGemmKernelInput,
     Fp8PerTokenGroupQuant => Fp8PerTokenGroupQuantKernelInput,
+    Nvfp4FusedMoe => Nvfp4FusedMoeKernelInput,
+    Nvfp4Quant => Nvfp4QuantKernelInput,
     GdnCausalConvDecode => GdnCausalConvDecodeKernelInput,
     GdnCausalConvPrefill => GdnCausalConvPrefillKernelInput,
     GdnCausalConvPrefillFanIn => GdnCausalConvPrefillLog,
@@ -134,6 +147,7 @@ log_inputs! {
     AttnPrefill => AttnPrefillLog,
     DsaIndexerPrefill => DsaIndexerPrefillLog,
     DsaSparseMlaPrefill => DsaSparseMlaPrefillLog,
+    DsaSparseMlaDecode => DsaSparseMlaDecodeLog,
     AttnDecode  => FlashinferAttnDecodeKernelInput,
     AttnRect    => FlashinferAttnRectKernelInput,
     KvCacheAppend => KvCacheAppendKernelInput,
@@ -142,11 +156,14 @@ log_inputs! {
     DsaMqaLogitsPrefill => DsaMqaLogitsPrefillKernelInput,
     DsaPagedMqaLogitsDecode => DsaPagedMqaLogitsDecodeKernelInput,
     DsaPersistentTopkDecode => DsaPersistentTopkDecodeKernelInput,
+    DsaSparseIndexRemap => DsaSparseIndexRemapKernelInput,
+    DsaSparseMlaPrefillKernel => DsaSparseMlaPrefillKernelInput,
     DsaSparseMlaAttention => DsaSparseMlaAttentionKernelInput,
     DsaTopkPrefill => DsaTopkPrefillKernelInput,
     VllmFusedMoe => VllmFusedMoeKernelInput,
     VllmMlaRope => VllmMlaRopeKernelInput,
     AllReduce   => AllReduceKernelInput,
+    AllReduceFusion => AllReduceFusionKernelInput,
     AllReduceResidualRmsNorm => AllReduceResidualRmsNormKernelInput,
     P2pIntra    => P2pIntraKernelInput,
     P2pInter    => P2pInterKernelInput,

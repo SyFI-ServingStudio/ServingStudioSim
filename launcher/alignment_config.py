@@ -72,8 +72,8 @@ class AnalyzePhaseConfig:
     """
 
     simulation_log_dir: Path | None
-    profile_log_dir: Path
-    workload_profile_log_dir: Path
+    profile_log_dir: Path | None
+    workload_profile_log_dir: Path | None
     timing_predict_log_dir: Path | None
     log_dir: Path
     iteration: IterationAnalysisPolicy
@@ -263,12 +263,29 @@ def load_analyze_config(path: Path) -> AnalyzePhaseConfig:
             if simulation_raw is not None
             else None
         )
-        profile_log_dir = _config_path(base, raw.pop("profile_log_dir"), "profile_log_dir")
+        profile_raw = raw.pop("profile_log_dir", None)
         workload_profile_raw = raw.pop("workload_profile_log_dir", None)
+        if iteration.enabled and profile_raw is None:
+            raise ValueError("profile_log_dir is required for kernel alignment")
+        if (workload.enabled or e2e.enabled) and workload_profile_raw is None:
+            raise ValueError(
+                "workload_profile_log_dir is required for workload or e2e alignment"
+            )
+        if iteration.enabled and workload_profile_raw is not None:
+            raise ValueError(
+                "workload_profile_log_dir does not belong to kernel alignment"
+            )
+        if (workload.enabled or e2e.enabled) and profile_raw is not None:
+            raise ValueError("profile_log_dir does not belong to workload/e2e alignment")
+        profile_log_dir = (
+            _config_path(base, profile_raw, "profile_log_dir")
+            if profile_raw is not None
+            else None
+        )
         workload_profile_log_dir = (
             _config_path(base, workload_profile_raw, "workload_profile_log_dir")
             if workload_profile_raw is not None
-            else profile_log_dir
+            else None
         )
         timing_predict_raw = raw.pop("timing_predict_log_dir", None)
         if iteration.enabled and timing_predict_raw is None:
@@ -294,11 +311,10 @@ def load_analyze_config(path: Path) -> AnalyzePhaseConfig:
         raise ValueError(f"invalid analyze config: {exc}") from exc
     if not config.subjects:
         raise ValueError("invalid analyze config: at least one analysis subject must be enabled")
-    distinct = {
-        "profile_log_dir": config.profile_log_dir,
-        "log_dir": config.log_dir,
-    }
-    if config.workload_profile_log_dir != config.profile_log_dir:
+    distinct = {"log_dir": config.log_dir}
+    if config.profile_log_dir is not None:
+        distinct["profile_log_dir"] = config.profile_log_dir
+    if config.workload_profile_log_dir is not None:
         distinct["workload_profile_log_dir"] = config.workload_profile_log_dir
     if config.timing_predict_log_dir is not None:
         distinct["timing_predict_log_dir"] = config.timing_predict_log_dir

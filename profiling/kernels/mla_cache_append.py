@@ -59,8 +59,8 @@ register(
         backend="vllm_cuda",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            kv=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            kv=frozenset({DType.BF16, DType.FP8_E4M3}),
+            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.mla_cache_append",

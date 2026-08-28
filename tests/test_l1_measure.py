@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from profiling import cli, perf_api
-from profiling.exec.env import ProfileEnv
+from profiling.exec.env import ContainerProfileEnv, ProfileEnv
 from profiling.measure import _run_worker
 from profiling.profilers import trend
 from profiling.profilers.measure_context import (
@@ -102,6 +102,22 @@ def test_trend_summarize_shape():
         assert key in runtime
     assert summary["one_second_bins"]
     assert summary["metadata"]["label"] == "single_gemm:torch"
+
+
+def test_optional_plot_skips_only_missing_matplotlib():
+    def missing_matplotlib() -> None:
+        raise ModuleNotFoundError(name="matplotlib")
+
+    assert trend._render_optional_plot(missing_matplotlib) == (
+        False,
+        "matplotlib is not installed in the profiling environment",
+    )
+
+    def missing_required_dependency() -> None:
+        raise ModuleNotFoundError(name="required_dependency")
+
+    with pytest.raises(ModuleNotFoundError):
+        trend._render_optional_plot(missing_required_dependency)
 
 
 def test_align_telemetry_bins_runtimes_onto_samples():
@@ -454,6 +470,56 @@ def test_measure_worker_uses_selected_python_and_composed_pythonpath(
         ]
     )
     assert captured_env["LD_LIBRARY_PATH"] == os.pathsep.join([str(library_root), "/existing/lib"])
+    assert response["measure"]["consumed"] is True
+
+
+def test_measure_worker_uses_container_and_mounts_output(tmp_path, monkeypatch):
+    measurement_dir = tmp_path / "measurement"
+    measurement_dir.mkdir()
+    captured = {}
+
+    def fake_container_command(profiler_env, gpus, exchange_dir, additional_volumes=()):
+        captured["profiler_env"] = profiler_env
+        captured["gpus"] = gpus
+        captured["additional_volumes"] = additional_volumes
+        return (
+            [
+                "fake-docker",
+                "--worker-output",
+                str(exchange_dir / "output.json"),
+            ],
+            {"EXACT_ENV": "1"},
+        )
+
+    def fake_subprocess_run(cmd, *, env, capture_output, text, check):
+        del capture_output, text, check
+        captured["cmd"] = cmd
+        captured["env"] = env
+        output_path = Path(cmd[cmd.index("--worker-output") + 1])
+        output_path.write_text(
+            '{"results": [], "measure": {"consumed": true}}',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("profiling.measure._container_worker_command", fake_container_command)
+    monkeypatch.setattr("profiling.measure.subprocess.run", fake_subprocess_run)
+    profiler_env = ContainerProfileEnv("vllm_env", "profiler:test")
+
+    response = _run_worker(
+        kernel_kind="single_gemm",
+        spec={"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"},
+        gpu_index=4,
+        profiler_env=profiler_env,
+        measure_block={"output_dir": str(measurement_dir)},
+    )
+
+    assert captured["profiler_env"] is profiler_env
+    assert captured["gpus"] == [4]
+    assert captured["additional_volumes"] == (
+        (measurement_dir.resolve(), measurement_dir.resolve()),
+    )
+    assert captured["env"] == {"EXACT_ENV": "1"}
     assert response["measure"]["consumed"] is True
 
 

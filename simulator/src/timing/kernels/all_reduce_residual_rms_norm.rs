@@ -3,9 +3,9 @@
 //!
 //! Unlike byte-keyed pure all-reduce, launch cost depends on the 2-D
 //! `[num_tokens, hidden_dim]` shape. `hidden_dim` is static config and
-//! `num_tokens` is the runtime/sweep axis. The grid is capped at vLLM's H200
-//! fusion-size threshold for the TP degree; callers must use the unfused path
-//! above that threshold.
+//! `num_tokens` is the runtime/sweep axis. The grid is capped at vLLM's
+//! GPU-architecture-specific fusion-size threshold for the TP degree; callers
+//! must use the unfused path above that threshold.
 
 use crate::common::Fabric;
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
@@ -37,18 +37,18 @@ pub struct AllReduceResidualRmsNormKernelInput {
 pub struct AllReduceResidualRmsNormSpec;
 
 impl AllReduceResidualRmsNormSpec {
-    /// Effective vLLM H200 fusion boundary for the compiled shape ranges used
-    /// by the alignment target. The TP4 workspace itself can hold 4 MiB, but
-    /// vLLM compiles ranges `(1, 256)` and `(257, 8192)` and only fuses a range
-    /// when its end fits the workspace; therefore the observable TP4 boundary
-    /// is 256 BF16 x 4096 tokens (2 MiB), not the raw 512-token capacity.
-    fn max_fused_bytes(num_gpus: u32) -> u64 {
-        match num_gpus {
-            2 => 64 * 1024 * 1024,
-            4 => 2 * 1024 * 1024,
-            8 => 512 * 1024,
-            _ => panic!("FlashInfer fused all-reduce supports TP 2/4/8"),
-        }
+    /// vLLM's default FlashInfer fusion workspace by CUDA architecture and TP.
+    /// SM100 raises TP4 from 2 MiB to 32 MiB; this is why B200 continues using
+    /// the fused kernel for 2,048-token GLM-5.2 mixed iterations.
+    fn max_fused_bytes(gpu_name: &str, num_gpus: u32) -> u64 {
+        let mib = match (gpu_name.contains("B200"), num_gpus) {
+            (_, 2) => 64,
+            (true, 4) => 32,
+            (false, 4) => 2,
+            (_, 8) => 1,
+            (_, _) => panic!("FlashInfer fused all-reduce supports TP 2/4/8"),
+        };
+        mib * 1024 * 1024
     }
 
     /// Largest token count for which vLLM selects the fused SM90 recipe.
@@ -58,7 +58,7 @@ impl AllReduceResidualRmsNormSpec {
     /// the runtime branch and this kernel's profiling grid share one owner.
     pub fn max_fused_tokens(config: &AllReduceResidualRmsNormKernelConfig) -> u32 {
         let bytes_per_token = (config.hidden_dim as u64) * (config.dtype.size_bytes() as u64);
-        (Self::max_fused_bytes(config.num_gpus) / bytes_per_token) as u32
+        (Self::max_fused_bytes(&config.gpu_name, config.num_gpus) / bytes_per_token) as u32
     }
 }
 
@@ -113,10 +113,10 @@ mod tests {
     use crate::timing::SweepCoords;
     use serde_json::Value;
 
-    fn config(num_gpus: u32) -> AllReduceResidualRmsNormKernelConfig {
+    fn config(gpu_name: &str, num_gpus: u32) -> AllReduceResidualRmsNormKernelConfig {
         AllReduceResidualRmsNormKernelConfig {
             backends: vec!["flashinfer_trtllm"],
-            gpu_name: "NVIDIA H200".to_string(),
+            gpu_name: gpu_name.to_string(),
             num_gpus,
             hidden_dim: 4096,
             dtype: DType::Bf16,
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn config_identity_and_dtype_are_explicit() {
-        let config = config(2);
+        let config = config("NVIDIA H200", 2);
         assert_eq!(config.compute_dtype(), Some(DType::Bf16));
         assert_eq!(config.backends(), &["flashinfer_trtllm"]);
         assert_eq!(config.describe_config()["hidden_dim"], 4096);
@@ -147,11 +147,15 @@ mod tests {
     }
 
     #[test]
-    fn sweep_is_capped_by_vllm_h200_fusion_policy() {
-        let tp2 = AllReduceResidualRmsNormSpec::sweep_grid(&config(2));
-        let tp4 = AllReduceResidualRmsNormSpec::sweep_grid(&config(4));
+    fn sweep_is_capped_by_vllm_gpu_fusion_policy() {
+        let tp2 = AllReduceResidualRmsNormSpec::sweep_grid(&config("NVIDIA H200", 2));
+        let h200_tp4 = AllReduceResidualRmsNormSpec::sweep_grid(&config("NVIDIA H200", 4));
+        let mut b200 = config("NVIDIA B200", 4);
+        b200.hidden_dim = 6144;
+        let b200_tp4 = AllReduceResidualRmsNormSpec::sweep_grid(&b200);
         assert_eq!(tp2.axes()[0].last(), Some(&8192.0));
-        assert_eq!(tp4.axes()[0].last(), Some(&256.0));
+        assert_eq!(h200_tp4.axes()[0].last(), Some(&256.0));
+        assert_eq!(b200_tp4.axes()[0].last(), Some(&2730.0));
         assert!(matches!(
             AllReduceResidualRmsNormSpec::cache_kind("flashinfer_trtllm"),
             CacheKind::Cache1DLinear
@@ -160,7 +164,7 @@ mod tests {
 
     #[test]
     fn enumerate_matches_python_args_exactly() {
-        let config = config(4);
+        let config = config("NVIDIA H200", 4);
         let grid = AllReduceResidualRmsNormSpec::sweep_grid(&config);
         let first =
             &AllReduceResidualRmsNormSpec::enumerate(&config, &grid, "flashinfer_trtllm")[0];

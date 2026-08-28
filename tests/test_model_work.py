@@ -19,7 +19,7 @@ import pytest
 from model.work import Workload, load_model
 from model.work import floors as work_floors
 from model.work.attention.linear import GatedDeltaNet
-from model.work.core import AttnInteraction, LayerStack, Model
+from model.work.core import AttnInteraction, LayerStack, Model, gpu_peak_tflops
 from model.work.ffn.moe import MoE
 from model.work.parameter_counts import compute_parameter_counts
 from model.work.quantization import parse_quantization_config
@@ -213,6 +213,7 @@ def test_qwen3_235b_fp8_prefills_precision_is_fp8():
     must be labeled at the FP8 tensor-core peak; decode QK stays BF16. A bf16
     pin here re-inflates R6 above R5 and hides every quant/norm excess."""
     from pathlib import Path
+
     qwen = load_model(str(Path("model/config/qwen3_235b_thinking_2507_fp8.json")))
     label = qwen.label(Workload.causal_lm(prefill=[(16384, 0)], sampled=1))
     dtype = {s.name: s.compute_dtype for s in label.segments}
@@ -1488,6 +1489,7 @@ def test_gated_attention_doubles_q_projection():
 # --------------------------------------------------------------------------- #
 
 GLM52_FP8 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm52_fp8.json"
+GLM52_NVFP4 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm52_nvfp4.json"
 QWEN3_235B = (
     Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b_thinking_2507.json"
 )
@@ -1582,6 +1584,87 @@ def test_glm52_fp8_leaves_router_and_indexer_weights_at_the_master_dtype():
     assert not model.quant.is_converted("mlp.gate.e_score_correction_bias")
 
 
+def test_glm52_nvfp4_hand_derived_weight_and_work_goldens():
+    """NVFP4 changes routed-expert storage, not model math or parameters."""
+    nvfp4 = load_model(GLM52_NVFP4)
+    bf16 = load_model(GLM52)
+    nvfp4_label = nvfp4.label(FULL_LOAD)
+    bf16_label = bf16.label(FULL_LOAD)
+
+    routed_elements = 75 * GLM_EXPERT_PARAMS
+    expected_weights = (
+        bf16_label.bytes["weights"]
+        - routed_elements * GLM_BF16_BYTES
+        + routed_elements * (0.5 + 1 / 16)
+    )
+    assert nvfp4_label.bytes["weights"] == pytest.approx(expected_weights)
+    assert nvfp4_label.bytes["weights"] == pytest.approx(444_888_882_432.0)
+    assert nvfp4_label.params == bf16_label.params
+    assert nvfp4_label.flops == bf16_label.flops
+    assert gpu_peak_tflops("B200", "fp4") == 9000
+
+
+def test_glm52_nvfp4_quantizes_only_routed_experts_and_uses_fp8_mla_cache():
+    model = load_model(GLM52_NVFP4)
+    assert model.quant.compute_dtype == "fp4"
+    assert model.quant.bytes_per_weight == 0.5
+    assert model.quant.block_shape == (1, 16)
+    assert model.quant.scale_dtype_bytes == 1.0
+
+    converted = {
+        group.name
+        for stack in model.layers
+        for group in (*stack.attn.matmul_groups(), *stack.ffn.matmul_groups())
+        if model.quant.is_converted(group.module)
+    }
+    assert converted == {"expert_gate_up", "expert_down"}
+    assert all(stack.attn.mla_cache_dtype_bytes == 1.0 for stack in model.layers)
+
+    sparse = next(stack for stack in model.layers if stack.tag == "sparse_cycle_full_index")
+    gate_up = next(group for group in sparse.ffn.matmul_groups() if group.name == "expert_gate_up")
+    elements = gate_up.n * gate_up.k
+    assert model.weight_bytes_per_instance(gate_up) == elements * (0.5 + 1 / 16)
+
+
+def test_glm52_nvfp4_location_map_consumes_every_semantic_once():
+    names = {
+        segment.name
+        for segment in load_model(GLM52_NVFP4)
+        .label(Workload.causal_lm(prefill=[(8, 0)], decode=[4096], sampled=2))
+        .segments
+    }
+    map_path = (
+        Path(__file__).resolve().parents[1]
+        / "model"
+        / "work"
+        / "location_maps"
+        / "glm52_vllm_nvfp4_dsa_moe_unified.json"
+    )
+    location_map = json.loads(map_path.read_text())
+    locations = [row["location"] for row in location_map["locations"]]
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+
+    assert location_map["schema_version"] == 1
+    assert location_map["arch_types"] == ["glm52_vllm_nvfp4_dsa_moe"]
+    assert len(locations) == len(set(locations)) == 114
+    assert len(mapped) == len(set(mapped))
+    assert set(mapped) == names
+    assert not any(location.endswith(".tp_allreduce") for location in locations)
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    for tag in (
+        "sparse_initial_index_share",
+        "sparse_cycle_full_index",
+        "sparse_cycle_index_share",
+    ):
+        base = f"unified.body.{tag}.moe.routed_experts"
+        assert f"{base}.input_quant" in locations
+        assert not semantics[f"{base}.input_quant"]
+        assert semantics[f"{base}.fused_moe"] == [
+            f"{tag}.expert_gate_up",
+            f"{tag}.expert_down",
+        ]
+
+
 def test_glm52_fp8_compute_floor_is_mixed_not_globally_fp8():
     """~20% of the FLOPs stay on the BF16 tensor cores, so one global peak is wrong.
 
@@ -1626,6 +1709,19 @@ def test_floors_refuses_a_run_whose_arch_precision_contradicts_its_config():
         work_floors._check_precision(load_model(GLM52), {**bf16_spec, "arch_fp8": True})
     with pytest.raises(ValueError, match="does not set fp8"):
         work_floors._check_precision(load_model(GLM52_FP8), {**fp8_spec, "arch_fp8": False})
+
+    nvfp4_spec = {
+        "config": str(GLM52_NVFP4),
+        "gpu": "B200",
+        "dtype": "bf16",
+        "arch_fp8": False,
+        "arch_quant_dtype": "fp4",
+    }
+    work_floors._check_precision(load_model(GLM52_NVFP4), nvfp4_spec)
+    with pytest.raises(ValueError, match="declares fp4"):
+        work_floors._check_precision(
+            load_model(GLM52_NVFP4), {**nvfp4_spec, "arch_quant_dtype": "fp8"}
+        )
 
 
 def test_vllm_location_map_covers_every_non_communication_leaf():

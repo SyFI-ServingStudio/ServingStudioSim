@@ -292,8 +292,11 @@ first `[32,64]` segment. Other token-shaped kernels retain the shared axis.
 CUPTI-timed compute spec it runs a sustained ~`duration_s` capture in a single
 CUPTI window, records **every** per-launch kernel duration, samples NVML telemetry
 (power / SM-clock / mem-clock / util / temp / throttle) on a background thread, and
-writes `runtimes.csv`, `telemetry.csv`, `summary.json`, `runtime_trend.png`, and
-`runtime_telemetry.png` into `--output-dir`. It reaches the kernel's callable
+writes `runtimes.csv`, `telemetry.csv`, and `summary.json` into `--output-dir`.
+When matplotlib is installed in the selected profiling environment it also
+writes `runtime_trend.png` and `runtime_telemetry.png`; otherwise the summary
+records each plot as skipped without invalidating the CUPTI/NVML measurement.
+It reaches the kernel's callable
 through the shared `Timer.cupti` seam via a process-wide `MeasureContext` set only
 for this verb (see `profilers/measure_context.py`, `profilers/trend.py`) — **no
 runner changes**, and the guard is inert for every other call. `--no-clear-l2`

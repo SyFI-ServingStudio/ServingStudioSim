@@ -70,7 +70,11 @@ def test_comm_and_elementwise_are_dtype_agnostic():
 def test_supported_backends_filters_options_by_dtype():
     # The dry-run `options` column: filter registered backends to a dtype.
     assert supported_backends("single_gemm", DType.FP8_E4M3) == ["deepgemm"]
-    assert supported_backends("single_gemm", DType.BF16) == ["torch", "torch_linear"]
+    assert supported_backends("single_gemm", DType.BF16) == [
+        "torch",
+        "torch_linear_vllm",
+        "torch_linear",
+    ]
     assert set(supported_backends("flashinfer_attn_prefill", DType.FP8_E4M3)) == {
         "fa3",
         "trt",
@@ -103,6 +107,21 @@ def test_trt_attention_is_blackwell_gated():
         }
 
 
+def test_vllm_mla_rope_supports_b200_bf16_only():
+    assert backend_supports(
+        "vllm_mla_rope",
+        "vllm_inductor",
+        DType.BF16,
+        gpu="NVIDIA B200",
+    )
+    assert not backend_supports(
+        "vllm_mla_rope",
+        "vllm_inductor",
+        DType.FP16,
+        gpu="NVIDIA B200",
+    )
+
+
 def test_backend_support_allows_gpu_restriction():
     only_b200 = BackendSupport(compute=frozenset({DType.FP8_E4M3}), gpus=frozenset({"NVIDIA B200"}))
     assert only_b200.allows(DType.FP8_E4M3, gpu="NVIDIA B200")
@@ -110,6 +129,25 @@ def test_backend_support_allows_gpu_restriction():
     assert not only_b200.allows(DType.BF16, gpu="NVIDIA B200")
     # gpu=None means "don't check the gpu axis".
     assert only_b200.allows(DType.FP8_E4M3, gpu=None)
+
+
+def test_backend_support_can_express_non_cartesian_dtype_gpu_pairs():
+    support = BackendSupport(
+        compute=frozenset({DType.BF16, DType.FP16}),
+        gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
+        compute_gpu_pairs=frozenset(
+            {
+                (DType.BF16, "NVIDIA H200"),
+                (DType.FP16, "NVIDIA H200"),
+                (DType.BF16, "NVIDIA B200"),
+            }
+        ),
+    )
+    assert support.allows(DType.FP16, gpu="NVIDIA H200")
+    assert support.allows(DType.BF16, gpu="NVIDIA B200")
+    assert not support.allows(DType.FP16, gpu="NVIDIA B200")
+    # Unknown GPU deliberately skips GPU gating, matching the existing axes.
+    assert support.allows(DType.FP16, gpu=None)
 
 
 def test_validate_registry_rejects_empty_dtype_set():

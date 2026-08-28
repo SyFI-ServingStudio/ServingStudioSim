@@ -71,13 +71,11 @@ def test_vllm_cuda_registration_reuses_kind_table_and_args():
     assert spec.args_schema is ResidualRmsNormArgs
     assert spec.metric_family is MetricFamily.COMPUTE
     assert spec.subprocess_env == "vllm_env"
-    assert spec.runner_ref.module_name == (
-        "profiling.runners.norm.residual_rms_norm_vllm_cuda"
-    )
+    assert spec.runner_ref.module_name == ("profiling.runners.norm.residual_rms_norm_vllm_cuda")
     assert spec.runner_ref.function_name == "profile_residual_rms_norm_vllm_cuda"
 
 
-def test_vllm_cuda_support_is_16_bit_h200_only():
+def test_vllm_cuda_support_preserves_h200_dtypes_and_adds_only_b200_bf16():
     support = find_kernel_profiler_spec(KIND, "vllm_cuda").supports
 
     assert support.allows(DType.BF16, gpu="NVIDIA H200")
@@ -85,7 +83,8 @@ def test_vllm_cuda_support_is_16_bit_h200_only():
     assert not support.allows(DType.FP32, gpu="NVIDIA H200")
     assert not support.allows(DType.FP8_E4M3, gpu="NVIDIA H200")
     assert not support.allows(DType.BF16, gpu="NVIDIA H100")
-    assert not support.allows(DType.BF16, gpu="NVIDIA B200")
+    assert support.allows(DType.BF16, gpu="NVIDIA B200")
+    assert not support.allows(DType.FP16, gpu="NVIDIA B200")
 
 
 def test_registry_barrel_does_not_import_frameworks_or_runners():
@@ -193,7 +192,7 @@ def test_vllm_cuda_runner_rejects_missing_cuda_and_unverified_gpu():
         cuda=SimpleNamespace(is_available=lambda: False),
     )
     with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
+        _validate_cuda_device(no_cuda, DType.BF16)
 
     h100 = SimpleNamespace(
         cuda=SimpleNamespace(
@@ -204,9 +203,22 @@ def test_vllm_cuda_runner_rejects_missing_cuda_and_unverified_gpu():
     )
     with pytest.raises(
         ProfilerNotImplemented,
-        match="verified only on NVIDIA H200, got NVIDIA H100",
+        match="no verified bf16/NVIDIA H100 implementation",
     ):
-        _validate_cuda_device(h100)
+        _validate_cuda_device(h100, DType.BF16)
+
+    b200 = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: "NVIDIA B200",
+        ),
+    )
+    with pytest.raises(
+        ProfilerNotImplemented,
+        match="no verified fp16/NVIDIA B200 implementation",
+    ):
+        _validate_cuda_device(b200, DType.FP16)
 
 
 def test_generated_facades_are_available():

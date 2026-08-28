@@ -40,11 +40,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_trtllm",
-        # The alignment target is the validated H200 BF16 vLLM path. Broaden
-        # this declaration only after a real smoke on each added dtype/GPU.
+        # The H200 and B200 BF16 paths use the same FlashInfer TRT-LLM fusion
+        # contract; each GPU keeps independent measured rows in profile.db.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.comm.flashinfer_trtllm",

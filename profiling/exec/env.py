@@ -44,19 +44,16 @@ class ProfileEnv:
         for path in self.additional_python_paths:
             if not path.exists():
                 raise FileNotFoundError(
-                    f"profiling env {self.name!r} additional Python path does not exist: "
-                    f"{path}"
+                    f"profiling env {self.name!r} additional Python path does not exist: {path}"
                 )
             if not path.is_dir():
                 raise NotADirectoryError(
-                    f"profiling env {self.name!r} additional Python path is not a directory: "
-                    f"{path}"
+                    f"profiling env {self.name!r} additional Python path is not a directory: {path}"
                 )
         for path in self.additional_library_paths:
             if not path.exists():
                 raise FileNotFoundError(
-                    f"profiling env {self.name!r} additional library path does not exist: "
-                    f"{path}"
+                    f"profiling env {self.name!r} additional library path does not exist: {path}"
                 )
             if not path.is_dir():
                 raise NotADirectoryError(

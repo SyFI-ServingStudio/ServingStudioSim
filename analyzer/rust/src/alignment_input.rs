@@ -10,9 +10,8 @@
 //!   `alignment-e2e`) compares the measured run against a completed DES
 //!   simulation, so the simulation and client replay are mandatory.
 //!
-//! The two share the bounded NSYS anchor (`profile_log_dir`, `parsed_nsys`) and
-//! the envelope bookkeeping. E2E additionally names the full-run workload
-//! profile so bounded CUPTI capture cannot truncate scheduler/client metrics.
+//! Kernel alignment alone owns a bounded NSYS anchor. Request and scheduler
+//! alignment consume only the full workload-metrics run and full simulation.
 //! Path/schema parsing lives here;
 //! metric formulas stay in the category modules.
 
@@ -24,7 +23,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 /// Manifest schema the launcher writes and every subject expects.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// kernel-align inputs: measured kernels vs timing-predict totals. No
 /// simulation is involved, so every field is mandatory once the phase runs.
@@ -58,9 +57,7 @@ pub struct KernelAlignManifest {
 pub struct E2eAlignManifest {
     pub schema_version: u32,
     pub analysis_log_dir: PathBuf,
-    pub profile_log_dir: PathBuf,
     pub workload_profile_log_dir: PathBuf,
-    pub parsed_nsys: PathBuf,
     /// Full-run structured EngineCore iteration records. Unlike parsed NSYS,
     /// this stream continues after the bounded CUPTI window closes.
     pub metrics_jsonl: PathBuf,
@@ -73,6 +70,13 @@ pub struct E2eAlignManifest {
     /// data-availability reason — not to paper over a phase distinction.
     #[serde(default)]
     pub request_timings_result: Option<PathBuf>,
+    /// Host-monotonic boundaries recorded immediately around req-frontend.
+    /// Older workload captures omit them; those captures use their complete
+    /// metrics stream, which was the historical behavior after segment choice.
+    #[serde(default)]
+    pub replay_start_monotonic_ns: Option<u64>,
+    #[serde(default)]
+    pub replay_end_monotonic_ns: Option<u64>,
     pub throughput_bins: usize,
 }
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import fields
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -69,9 +69,7 @@ def test_kind_table_backend_runner_and_support_contract():
     assert spec.metric_family is MetricFamily.COMPUTE
     assert spec.batch_outlier_policy == BatchOutlierPolicy()
     assert spec.subprocess_env is None
-    assert spec.runner_ref.module_name == (
-        "profiling.runners.attention.mla_cache_append"
-    )
+    assert spec.runner_ref.module_name == ("profiling.runners.attention.mla_cache_append")
     assert spec.runner_ref.function_name == "profile_mla_cache_append_torch"
 
     assert spec.supports.allows(
@@ -94,6 +92,11 @@ def test_kind_table_backend_runner_and_support_contract():
         kv_dtype=DType.BF16,
         gpu="NVIDIA H100",
     )
+    assert not spec.supports.allows(
+        DType.BF16,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
+    )
 
 
 def test_vllm_cuda_registration_reuses_kind_table_args_and_facades():
@@ -106,22 +109,27 @@ def test_vllm_cuda_registration_reuses_kind_table_args_and_facades():
     assert vllm_spec.metric_family is torch_spec.metric_family is MetricFamily.COMPUTE
     assert vllm_spec.batch_outlier_policy == BatchOutlierPolicy()
     assert vllm_spec.subprocess_env == "vllm_env"
-    assert vllm_spec.runner_ref.module_name == (
-        "profiling.runners.attention.mla_cache_append"
-    )
-    assert (
-        vllm_spec.runner_ref.function_name
-        == "profile_mla_cache_append_vllm_cuda"
-    )
+    assert vllm_spec.runner_ref.module_name == ("profiling.runners.attention.mla_cache_append")
+    assert vllm_spec.runner_ref.function_name == "profile_mla_cache_append_vllm_cuda"
 
 
-def test_vllm_cuda_support_is_bf16_h200_only():
+def test_vllm_cuda_supports_bf16_and_fp8_cache_on_h200_and_b200():
     support = find_kernel_profiler_spec(KIND, _VLLM_BACKEND).supports
 
     assert support.allows(
         DType.BF16,
         kv_dtype=DType.BF16,
         gpu="NVIDIA H200",
+    )
+    assert support.allows(
+        DType.BF16,
+        kv_dtype=DType.BF16,
+        gpu="NVIDIA B200",
+    )
+    assert support.allows(
+        DType.BF16,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
     )
     assert not support.allows(
         DType.FP16,
@@ -271,7 +279,7 @@ def test_runner_rejects_unsupported_dtypes_before_cuda(
 ):
     from profiling.runners.attention.mla_cache_append import _validate_args
 
-    with pytest.raises(ValueError, match="input_dtype=kv_dtype=bf16"):
+    with pytest.raises(ValueError, match="requires BF16 input and BF16 cache"):
         _validate_args(
             1,
             512,
@@ -281,6 +289,22 @@ def test_runner_rejects_unsupported_dtypes_before_cuda(
             kv_dtype,
             "plain",
         )
+
+
+def test_vllm_validation_accepts_fp8_cache():
+    from profiling.runners.attention.mla_cache_append import _validate_args
+
+    validated = _validate_args(
+        1,
+        512,
+        64,
+        64,
+        DType.BF16,
+        DType.FP8_E4M3,
+        "plain",
+        allow_fp8_cache=True,
+    )
+    assert validated[4:6] == (DType.BF16, DType.FP8_E4M3)
 
 
 @pytest.mark.parametrize("cache_format", ["fp8_ds_mla", "Plain", ""])
@@ -341,8 +365,8 @@ def test_vllm_runner_rejects_invalid_args_before_framework_imports():
         ({"kv_lora_rank": 256}, r"== \(512, 64, 64\)"),
         ({"rope_dim": 128}, r"== \(512, 64, 64\)"),
         ({"block_size": 32}, r"== \(512, 64, 64\)"),
-        ({"input_dtype": DType.FP16}, "input_dtype=kv_dtype=bf16"),
-        ({"kv_dtype": DType.FP16}, "input_dtype=kv_dtype=bf16"),
+        ({"input_dtype": DType.FP16}, "requires BF16 input"),
+        ({"kv_dtype": DType.FP16}, "requires BF16 input"),
         ({"cache_format": "fp8_ds_mla"}, "cache_format='plain'"),
     ]
     for overrides, match in invalid_cases:
@@ -368,9 +392,66 @@ def test_vllm_runner_rejects_missing_cuda_and_unverified_gpu():
     )
     with pytest.raises(
         ProfilerNotImplemented,
-        match="verified only on NVIDIA H200, got NVIDIA H100",
+        match="verified only on NVIDIA H200 or NVIDIA B200, got NVIDIA H100",
     ):
         _validate_vllm_cuda_device(h100)
+
+    b200 = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: "NVIDIA B200",
+        )
+    )
+    _validate_vllm_cuda_device(b200)
+
+
+def test_vllm_runner_maps_fp8_cache_to_torch_storage_dtype(monkeypatch):
+    from profiling.runners.attention import mla_cache_append as runner
+
+    captured = {}
+
+    def build_operands(_torch, **kwargs):
+        captured["cache_torch_dtype"] = kwargs["cache_torch_dtype"]
+        return SimpleNamespace(
+            kv_c=object(),
+            k_pe=object(),
+            cache=object(),
+            slot_mapping=object(),
+        )
+
+    class Ops:
+        @staticmethod
+        def concat_and_cache_mla(_kv_c, _k_pe, _cache, _slots, cache_dtype, _scale):
+            captured["cache_dtype"] = cache_dtype
+
+    fake_vllm = ModuleType("vllm")
+    fake_vllm._custom_ops = Ops
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setattr(runner, "_validate_vllm_cuda_device", lambda _torch: None)
+    monkeypatch.setattr(runner, "_build_operands", build_operands)
+    monkeypatch.setattr(torch, "ones", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        runner.Timer,
+        "cupti",
+        lambda kernel, **_kwargs: (kernel(), 1.0)[1],
+    )
+    monkeypatch.setattr(runner.Energy, "perf", lambda *_args, **_kwargs: 0.0)
+
+    runner.profile_mla_cache_append_vllm_cuda(
+        num_tokens=1,
+        kv_lora_rank=512,
+        rope_dim=64,
+        block_size=64,
+        input_dtype=DType.BF16,
+        kv_dtype=DType.FP8_E4M3,
+        cache_format="plain",
+    )
+
+    assert captured == {
+        "cache_torch_dtype": torch.float8_e4m3fn,
+        "cache_dtype": "fp8_e4m3",
+    }
 
 
 def test_operand_constructor_matches_plain_glm_layout():
@@ -383,6 +464,7 @@ def test_operand_constructor_matches_plain_glm_layout():
         rope_dim=64,
         block_size=64,
         torch_dtype=torch.bfloat16,
+        cache_torch_dtype=torch.bfloat16,
         device="cpu",
     )
 
@@ -422,6 +504,7 @@ def test_operand_constructor_uses_spare_block_for_long_prefill():
         rope_dim=64,
         block_size=64,
         torch_dtype=torch.bfloat16,
+        cache_torch_dtype=torch.bfloat16,
         device="cpu",
     )
     assert operands.cache.shape == (257, 64, 576)
@@ -442,6 +525,7 @@ def test_write_helper_matches_reference_and_mutates_only_cache():
         rope_dim=64,
         block_size=64,
         torch_dtype=torch.bfloat16,
+        cache_torch_dtype=torch.bfloat16,
         device="cpu",
     )
     kv_before = operands.kv_c.clone()

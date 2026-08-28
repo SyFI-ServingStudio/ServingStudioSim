@@ -22,6 +22,10 @@ from profiling.exec.env import (
 from profiling.exec.payload import chunk_result_from_payload, resolve_chunk_backend
 from profiling.exec.pool import ChunkResult, GpuChunk, GpuPool
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_CONTAINER_SOURCE_MODE_ENV = "VIBESIM_PROFILE_SOURCE_MODE"
+_CONTAINER_SOURCE_DIRS = ("profiling", "launcher", "gpu")
+
 
 class LocalGpuPool(GpuPool):
     def __init__(self, gpus: list[int] | None = None):
@@ -35,17 +39,13 @@ class LocalGpuPool(GpuPool):
             raise ValueError(f"max_concurrent must be >= 1, got {max_concurrent}")
         available_gpus = self.gpus if self.gpus is not None else find_idle_gpus()
         if len(available_gpus) < gpus_per_chunk:
-            raise RuntimeError(
-                f"need {gpus_per_chunk} idle GPU(s), found {len(available_gpus)}"
-            )
+            raise RuntimeError(f"need {gpus_per_chunk} idle GPU(s), found {len(available_gpus)}")
         # Yield non-overlapping chunks. run_profile_batch decides how to split
         # specs across them; this pool only owns local GPU slot selection.
         chunk_count = min(max_concurrent, len(available_gpus) // gpus_per_chunk)
         for chunk_index in range(chunk_count):
             start_gpu_index = chunk_index * gpus_per_chunk
-            yield LocalGpuChunk(
-                available_gpus[start_gpu_index : start_gpu_index + gpus_per_chunk]
-            )
+            yield LocalGpuChunk(available_gpus[start_gpu_index : start_gpu_index + gpus_per_chunk])
 
 
 class LocalGpuChunk(GpuChunk):
@@ -80,9 +80,7 @@ class LocalGpuChunk(GpuChunk):
             completed = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
             if completed.returncode != 0:
                 error = (
-                    completed.stderr.strip()
-                    or completed.stdout.strip()
-                    or "local profile failed"
+                    completed.stderr.strip() or completed.stdout.strip() or "local profile failed"
                 )
                 return [ChunkResult(metrics=None, error=error) for _ in chunk_specs]
 
@@ -122,6 +120,7 @@ def _container_worker_command(
     profiler_env: ContainerProfileEnv,
     gpus: list[int],
     exchange_dir: Path,
+    additional_volumes: tuple[tuple[Path, Path], ...] = (),
 ) -> tuple[list[str], dict[str, str]]:
     cache_dir = Path(
         os.environ.get(
@@ -131,6 +130,12 @@ def _container_worker_command(
     ).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     gpu_request = f'"device={",".join(str(gpu) for gpu in gpus)}"'
+    source_volume_args = _container_source_volume_args()
+    volume_args = [
+        argument
+        for host_path, container_path in additional_volumes
+        for argument in ("--volume", f"{host_path.resolve()}:{container_path}")
+    ]
     return (
         [
             "docker",
@@ -154,6 +159,8 @@ def _container_worker_command(
             f"{exchange_dir.resolve()}:/io",
             "--volume",
             f"{cache_dir}:/cache",
+            *source_volume_args,
+            *volume_args,
             profiler_env.image,
             "--worker-input",
             "/io/input.json",
@@ -162,6 +169,34 @@ def _container_worker_command(
         ],
         os.environ.copy(),
     )
+
+
+def _container_source_volume_args() -> list[str]:
+    """Select current-worktree code for development or the baked image snapshot.
+
+    The image owns the dependency boundary, including the instrumented vLLM
+    checkout, its virtual environment, and native extensions. Development mode
+    overlays only VibeSim's pure-Python worker code and GPU catalog read-only so
+    newly registered profilers run without rebuilding that dependency image.
+    Release measurements can request the fully frozen source snapshot with
+    ``VIBESIM_PROFILE_SOURCE_MODE=image``.
+    """
+
+    source_mode = os.environ.get(_CONTAINER_SOURCE_MODE_ENV, "worktree")
+    if source_mode == "image":
+        return []
+    if source_mode != "worktree":
+        raise ValueError(
+            f"{_CONTAINER_SOURCE_MODE_ENV} must be 'worktree' or 'image', got {source_mode!r}"
+        )
+
+    volume_args: list[str] = []
+    for directory in _CONTAINER_SOURCE_DIRS:
+        host_path = (_PROJECT_ROOT / directory).resolve()
+        if not host_path.is_dir():
+            raise FileNotFoundError(f"container source directory does not exist: {host_path}")
+        volume_args.extend(("--volume", f"{host_path}:/opt/vibesim/{directory}:ro"))
+    return volume_args
 
 
 def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10) -> list[int]:
@@ -196,11 +231,7 @@ def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10
 def _cuda_visible_gpu_order(root: ET.Element, raw_visible_devices: str | None) -> list[int] | None:
     if raw_visible_devices is None:
         return None
-    visible_tokens = [
-        token.strip()
-        for token in raw_visible_devices.split(",")
-        if token.strip()
-    ]
+    visible_tokens = [token.strip() for token in raw_visible_devices.split(",") if token.strip()]
     if not visible_tokens:
         return []
 

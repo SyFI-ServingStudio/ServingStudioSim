@@ -98,6 +98,11 @@ def test_kind_table_backend_runner_and_support_contract():
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA H100",
     )
+    assert not spec.supports.allows(
+        DType.BF16,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
+    )
 
 
 def test_vllm_cuda_registration_reuses_kind_table_args_and_facades():
@@ -116,13 +121,18 @@ def test_vllm_cuda_registration_reuses_kind_table_args_and_facades():
     assert vllm_spec.runner_ref.function_name == "profile_dsa_index_cache_append_vllm_cuda"
 
 
-def test_vllm_cuda_support_is_bf16_fp8_e4m3_h200_only():
+def test_vllm_cuda_support_is_bf16_fp8_e4m3_on_h200_and_b200():
     support = find_kernel_profiler_spec(KIND, _VLLM_BACKEND).supports
 
     assert support.allows(
         DType.BF16,
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA H200",
+    )
+    assert support.allows(
+        DType.BF16,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
     )
     assert not support.allows(
         DType.FP16,
@@ -424,9 +434,18 @@ def test_vllm_runner_rejects_missing_cuda_and_unverified_gpu():
     )
     with pytest.raises(
         ProfilerNotImplemented,
-        match="verified only on NVIDIA H200, got NVIDIA H100",
+        match="verified only on NVIDIA H200 or NVIDIA B200, got NVIDIA H100",
     ):
         _validate_vllm_cuda_device(h100)
+
+    b200 = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: "NVIDIA B200",
+        )
+    )
+    _validate_vllm_cuda_device(b200)
 
 
 def test_operand_constructor_matches_glm_page_planar_layout():

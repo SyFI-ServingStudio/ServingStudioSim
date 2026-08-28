@@ -114,8 +114,7 @@ def _phase_configs(tmp_path: Path, suffix: str = ".yaml") -> dict[str, Path]:
         {
             "schema_version": 1,
             "simulation_log_dir": "./simulation_run",
-            "profile_log_dir": "./profile_run",
-            "timing_predict_log_dir": "./timing_predict_run",
+            "workload_profile_log_dir": "./profile_run",
             "log_dir": "./analysis_e2e_run",
             "workload": {"enabled": True},
             "e2e": {"enabled": True, "throughput_bins": 20},
@@ -216,6 +215,7 @@ def _write_completed_inputs(tmp_path: Path) -> tuple[Path, Path, dict]:
     )
     replay.write_text("")
     result = {
+        "profile_kind": "workload_metrics",
         "log_dir": str(profile),
         "parsed_nsys": str(parsed),
         "metrics_jsonl": str(metrics),
@@ -224,6 +224,8 @@ def _write_completed_inputs(tmp_path: Path) -> tuple[Path, Path, dict]:
         "drive_summary": {
             "source_trace": str((tmp_path / "trace" / "shared.csv").resolve()),
             "log_path": str(replay),
+            "replay_start_monotonic_ns": 900_000,
+            "replay_end_monotonic_ns": 2_100_000,
         },
     }
     (profile / "profile_result.json").write_text(json.dumps(result))
@@ -676,7 +678,7 @@ def test_analyze_kernel_align_writes_kernel_only_manifest(tmp_path, monkeypatch)
     assert alignment_launcher.main(["analyze", str(paths["analyze_kernel"])]) == 0
     analysis = tmp_path / "analysis_kernel_run"
     manifest = json.loads((analysis / "alignment_manifest.json").read_text())
-    assert manifest["schema_version"] == 8
+    assert manifest["schema_version"] == 9
     assert manifest["labeled_kernel_sequences"] == str(analysis / "kernel_sequences_labeled.json")
     assert manifest["predict_log_dir"] == str(tmp_path / "timing_predict_run")
     # kernel-align names no simulation, replay, or subject-enabled bookkeeping.
@@ -712,10 +714,14 @@ def test_analyze_e2e_align_writes_simulation_manifest_without_labels(tmp_path, m
     assert alignment_launcher.main(["analyze", str(paths["analyze_e2e"])]) == 0
     analysis = tmp_path / "analysis_e2e_run"
     manifest = json.loads((analysis / "alignment_manifest.json").read_text())
-    assert manifest["schema_version"] == 8
+    assert manifest["schema_version"] == 9
     assert manifest["simulation_log_dir"] == str(tmp_path / "simulation_run")
     assert manifest["workload_profile_log_dir"] == str(tmp_path / "profile_run")
     assert manifest["metrics_jsonl"] == str(tmp_path / "profile_run" / "metrics.jsonl")
+    assert manifest["replay_start_monotonic_ns"] == 900_000
+    assert manifest["replay_end_monotonic_ns"] == 2_100_000
+    assert "profile_log_dir" not in manifest
+    assert "parsed_nsys" not in manifest
     assert manifest["throughput_bins"] == 20
     # e2e-align names no timing-predict labels or per-subject flags.
     assert "labeled_kernel_sequences" not in manifest
@@ -754,7 +760,6 @@ def test_analyze_e2e_uses_distinct_full_run_workload_profile(tmp_path, monkeypat
     (workload_profile / "profile_result.json").write_text(json.dumps(workload_result))
     analyze_raw = yaml.safe_load(paths["analyze_e2e"].read_text())
     analyze_raw["workload_profile_log_dir"] = "./workload_profile_run"
-    analyze_raw.pop("timing_predict_log_dir")
     paths["analyze_e2e"].write_text(yaml.safe_dump(analyze_raw))
     monkeypatch.setattr(
         alignment_launcher, "_launch_alignment_analysis", lambda *args, **kwargs: True
@@ -766,6 +771,17 @@ def test_analyze_e2e_uses_distinct_full_run_workload_profile(tmp_path, monkeypat
     assert manifest["workload_profile_log_dir"] == str(workload_profile)
     assert manifest["metrics_jsonl"] == str(metrics)
     assert manifest["replay_result"] == str(replay)
+
+
+def test_analyze_e2e_rejects_nsys_profile_field(tmp_path, capsys):
+    paths = _phase_configs(tmp_path)
+    _write_timing_artifacts(tmp_path)
+    analyze_raw = yaml.safe_load(paths["analyze_e2e"].read_text())
+    analyze_raw["profile_log_dir"] = "./profile_run"
+    paths["analyze_e2e"].write_text(yaml.safe_dump(analyze_raw))
+
+    assert alignment_launcher.main(["analyze", str(paths["analyze_e2e"])]) == 2
+    assert "profile_log_dir does not belong to workload/e2e alignment" in capsys.readouterr().err
 
 
 def test_analyze_rejects_all_subjects_disabled(tmp_path, capsys):
@@ -963,9 +979,7 @@ def test_req_frontend_invocation_selects_vllm_tokens_backend(tmp_path, monkeypat
         load_runner.subprocess, "run", lambda argv, **kwargs: commands.append((argv, kwargs))
     )
 
-    result = load_runner.run_replay(
-        config, prepared, base_url="http://localhost:8000", model="m"
-    )
+    result = load_runner.run_replay(config, prepared, base_url="http://localhost:8000", model="m")
 
     argv = commands[0][0]
     assert argv[argv.index("--backend") + 1] == "vllm-tokens"
@@ -1003,14 +1017,10 @@ def test_req_frontend_invocation_passes_no_context_policy(tmp_path, monkeypatch)
         load_runner.subprocess, "run", lambda argv, **kwargs: commands.append((argv, kwargs))
     )
 
-    result = load_runner.run_replay(
-        config, prepared, base_url="http://localhost:8000", model="m"
-    )
+    result = load_runner.run_replay(config, prepared, base_url="http://localhost:8000", model="m")
 
     argv = commands[0][0]
-    assert (
-        argv[argv.index("--input-file-format") + 1] == "text-generation-session-execution-v2"
-    )
+    assert argv[argv.index("--input-file-format") + 1] == "text-generation-session-execution-v2"
     assert "--session-context-policy" not in argv
     assert "session_context_policy" not in result
 
@@ -1169,8 +1179,7 @@ def test_profile_resume_flag_reaches_the_runner(tmp_path, monkeypatch):
         alignment_launcher,
         "run_profile",
         lambda config, *, resume=False: (
-            resumed.append(resume)
-            or {"parsed_nsys": str(tmp_path / "profile_run" / "parsed.json")}
+            resumed.append(resume) or {"parsed_nsys": str(tmp_path / "profile_run" / "parsed.json")}
         ),
     )
 
