@@ -24,11 +24,21 @@ use super::PROTOCOL_VERSION;
 
 pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     let params = read_run_json(&run.path, "raw/params.json")?;
-    let deployment = params
-        .get("deployment")
-        .and_then(Value::as_str)
-        .filter(|value| matches!(*value, "unified" | "pd" | "afd"))
-        .context("raw/params.json has no supported deployment")?;
+    let deployment = match params.get("deployment").and_then(Value::as_str) {
+        Some(value) if matches!(value, "unified" | "pd" | "afd") => value,
+        // Params from checkouts that predate the top-level `deployment` field
+        // (including prediction-produced run dirs) always described exactly
+        // one pool with unified semantics; more than one pool would be a
+        // genuinely ambiguous legacy artifact, so it still fails loudly.
+        None if params
+            .get("pools")
+            .and_then(Value::as_object)
+            .is_some_and(|pools| pools.len() == 1) =>
+        {
+            "unified"
+        }
+        _ => anyhow::bail!("raw/params.json has no supported deployment"),
+    };
     let mut descriptor = json!({
         "protocol_version": PROTOCOL_VERSION,
         "workspace_id": run.workspace_id,
