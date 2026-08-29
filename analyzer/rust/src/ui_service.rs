@@ -366,6 +366,10 @@ fn service_router(state: ServiceState) -> Router {
             get(get_prediction_kernel_throughput_analysis),
         )
         .route(
+            "/api/v1/predictions/{prediction_id}/optimality-scoped",
+            get(get_prediction_optimality_scoped),
+        )
+        .route(
             "/api/v1/predictions/{prediction_id}/cases/{case_id}/optimality-kernel-ladder",
             get(get_prediction_optimality_kernel_ladder),
         )
@@ -1239,6 +1243,57 @@ struct ScopedOptimalityQuery {
     label: Option<String>,
 }
 
+/// Prediction twin of [`get_run_optimality_scoped`]: the artifact layout under
+/// `raw/` is identical, only the catalog that names the directory differs.
+async fn get_prediction_optimality_scoped(
+    RoutePath(prediction_id): RoutePath<String>,
+    Query(query): Query<ScopedOptimalityQuery>,
+    State(state): State<ServiceState>,
+) -> Response {
+    if query.path.is_none() && query.label.is_none() {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "scope_selector_missing",
+            "Provide a `path` or `label` query parameter naming a CostTree node.",
+        );
+    }
+    let prediction = match state.resolve_prediction(&prediction_id) {
+        Ok(prediction) => prediction,
+        Err(error) => return prediction_resource_error(error),
+    };
+    scoped_optimality_response(&prediction.path, &query).await
+}
+
+async fn scoped_optimality_response(
+    log_dir: &std::path::Path,
+    query: &ScopedOptimalityQuery,
+) -> Response {
+    let ctx = build_session();
+    match compute_scoped(&ctx, log_dir, query.path.as_deref(), query.label.as_deref()).await {
+        Ok((report, _slug)) => match serde_json::to_value(&report) {
+            Ok(value) => Json(value).into_response(),
+            Err(error) => {
+                eprintln!("[analyze] scoped optimality serialization failed: {error:#}");
+                problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "artifact_read_failed",
+                    "The scoped optimality report could not be serialized.",
+                )
+            }
+        },
+        // Selector mistakes and missing artifacts both land here; the error
+        // chain names the exact cause, so pass it through for the UI to show.
+        Err(error) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "code": "scoped_optimality_failed",
+                "detail": format!("{error:#}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Compute scoped optimality for one CostTree node on demand. Read-only: the
 /// CLI variant persists a report file, but a browser request must never write
 /// into the run directory.
@@ -1286,37 +1341,7 @@ async fn get_run_optimality_scoped(
             );
         }
     };
-    let ctx = build_session();
-    match compute_scoped(
-        &ctx,
-        &run.path,
-        query.path.as_deref(),
-        query.label.as_deref(),
-    )
-    .await
-    {
-        Ok((report, _slug)) => match serde_json::to_value(&report) {
-            Ok(value) => Json(value).into_response(),
-            Err(error) => {
-                eprintln!("[analyze] scoped optimality serialization failed: {error:#}");
-                problem(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "artifact_read_failed",
-                    "The scoped optimality report could not be serialized.",
-                )
-            }
-        },
-        // Selector mistakes and missing run artifacts both land here; the error
-        // chain names the exact cause, so pass it through for the UI to show.
-        Err(error) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({
-                "code": "scoped_optimality_failed",
-                "detail": format!("{error:#}"),
-            })),
-        )
-            .into_response(),
-    }
+    scoped_optimality_response(&run.path, &query).await
 }
 
 async fn get_topology(
