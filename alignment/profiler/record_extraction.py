@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .engine_records import (
     API_DISPATCH_DURATION_FIELDS,
@@ -33,6 +33,7 @@ _ALIGNMENT_ITERATION_RE = re.compile(r"VibeSimAlignmentIteration\s+(\{.*\})\s*$"
 _ALIGNMENT_REQUEST_TIMING_RE = re.compile(r"VibeSimAlignmentRequestTiming\s+(\{.*\})\s*$")
 _ALIGNMENT_API_REQUEST_TIMING_RE = re.compile(r"VibeSimAlignmentApiRequestTiming\s+(\{.*\})\s*$")
 _ALIGNMENT_EXPERT_LOAD_RE = re.compile(r"VibeSimAlignmentExpertLoad\s+(\{.*\})\s*$")
+_HF_HUB_MODEL_DIR_RE = re.compile(r"^models--(?P<organization>.+?)--(?P<name>.+)$")
 _VLLM_ENGINE_CORE_PREFIX_RE = re.compile(r"\(EngineCore(?:_DP(\d+))?\s+pid=(\d+)\)")
 _VLLM_ENGINE_CORE_BODY_RE = re.compile(
     r"(?:INFO|WARNING|ERROR)\s+\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\[core\.py:\d+\]"
@@ -524,6 +525,23 @@ def extract_request_timings_jsonl(
     return n
 
 
+def normalize_model_id(model: str) -> str:
+    """Turn an absolute served-model path into a portable checkpoint identity."""
+    path = PurePosixPath(model)
+    if not path.is_absolute():
+        return model
+
+    parts = [part for part in path.parts if part != "/"]
+    for part in reversed(parts):
+        matched = _HF_HUB_MODEL_DIR_RE.fullmatch(part)
+        if matched is not None:
+            return f"{matched['organization']}/{matched['name']}"
+
+    if len(parts) >= 2 and parts[-2] == "snapshots":
+        parts = parts[:-2]
+    return parts[-1] if parts else model
+
+
 def extract_expert_popularity(
     server_log: Path,
     out_jsonl: Path,
@@ -680,7 +698,11 @@ def extract_expert_popularity(
         raise ValueError("no VibeSimAlignmentExpertLoad records found in server log")
     if not accepted_records:
         raise ValueError("no expert-load records remain within the configured token ceiling")
-    assert expert_parallel_size is not None and experts_per_token is not None
+    assert (
+        expected_model is not None
+        and expert_parallel_size is not None
+        and experts_per_token is not None
+    )
 
     def normalize(counts: list[int]) -> list[float]:
         total = sum(counts)
@@ -691,7 +713,9 @@ def extract_expert_popularity(
     ]
     summary = {
         "schema_version": 3,
-        "model": expected_model,
+        # The raw JSONL retains the engine's exact path. The portable summary
+        # records checkpoint identity rather than one capture host's location.
+        "model": normalize_model_id(expected_model),
         "num_moe_layers": expected_shape[0],
         "num_logical_experts": expected_shape[1],
         "expert_parallel_size": expert_parallel_size,

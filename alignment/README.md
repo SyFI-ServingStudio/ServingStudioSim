@@ -196,6 +196,9 @@ EPLB-step range. `expert_partitioning.kind = contiguous_logical_expert_ids` with
 ids `[rank * experts_per_rank, (rank + 1) * experts_per_rank)` form one EP-rank
 shard before rank/expert identities are canonicalized. It is a modeling
 partition, not a claim about a potentially rearranged physical EPLB placement.
+The summary's `model` is a portable checkpoint identity: Hugging Face cache
+paths are recovered as `organization/name`, while other absolute paths use the
+model directory name. The raw expert-load JSONL retains the exact engine path.
 
 The raw JSONL retains every emitted record. The aggregate admits only records
 whose per-layer assignment count is within

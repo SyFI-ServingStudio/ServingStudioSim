@@ -632,6 +632,54 @@ def test_extract_expert_popularity_rejects_partition_mismatch(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("nvidia/GLM-5.2-NVFP4", "nvidia/GLM-5.2-NVFP4"),
+        ("./checkpoints/GLM-5.2-NVFP4", "./checkpoints/GLM-5.2-NVFP4"),
+        (
+            "/cache/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/deadbeef",
+            "nvidia/GLM-5.2-NVFP4",
+        ),
+        (
+            "/raid/checkpoints/GLM-5.2-NVFP4/snapshots/deadbeef",
+            "GLM-5.2-NVFP4",
+        ),
+        ("/raid/checkpoints/GLM-5.2-NVFP4", "GLM-5.2-NVFP4"),
+        ("/", "/"),
+    ],
+)
+def test_normalize_model_id(model, expected):
+    assert record_extraction.normalize_model_id(model) == expected
+
+
+def test_expert_popularity_normalizes_only_the_summary_model_identity(tmp_path):
+    model_path = "/cache/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/deadbeef"
+    record = {
+        "schema_version": 2,
+        "model": model_path,
+        "eplb_step": 1,
+        "expert_parallel_size": 1,
+        "experts_per_token": 1,
+        "logical_expert_counts": [[1]],
+    }
+    server_log = tmp_path / "server.log"
+    raw_path = tmp_path / "expert_load.jsonl"
+    summary_path = tmp_path / "expert_popularity.json"
+    server_log.write_text(f"INFO VibeSimAlignmentExpertLoad {json.dumps(record)}\n")
+
+    record_extraction.extract_expert_popularity(
+        server_log,
+        raw_path,
+        summary_path,
+        expert_parallel_size=1,
+        max_tokens_per_step=1,
+    )
+
+    assert json.loads(raw_path.read_text())["model"] == model_path
+    assert json.loads(summary_path.read_text())["model"] == "nvidia/GLM-5.2-NVFP4"
+
+
 def test_expert_popularity_ceiling_uses_the_count_reduction_group(tmp_path):
     record = {
         "schema_version": 2,
