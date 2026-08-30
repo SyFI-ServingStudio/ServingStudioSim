@@ -146,8 +146,14 @@ class Table:
             ON CONFLICT(gpu_name, backend, {", ".join(self.args_columns)})
             DO UPDATE SET {updates}, is_outlier=0, retry_count=0, outlier_reason=NULL
         """
+        default_git_hash = (
+            _current_git_hash() if any(not row.profiler_git_hash for row in rows) else ""
+        )
         with self._write_transaction() as conn:
-            conn.executemany(sql, [self._row_values(row, metric_columns) for row in rows])
+            conn.executemany(
+                sql,
+                [self._row_values(row, metric_columns, default_git_hash) for row in rows],
+            )
 
     def query(
         self,
@@ -357,14 +363,19 @@ class Table:
         values = [gpu_name, backend, *(arg_values[column] for column in self.args_columns)]
         return " AND ".join(where), values
 
-    def _row_values(self, row: ProfileRow, metric_columns: list[str]) -> list[Any]:
+    def _row_values(
+        self,
+        row: ProfileRow,
+        metric_columns: list[str],
+        default_git_hash: str,
+    ) -> list[Any]:
         arg_values = _args_to_db(row.args)
         metric_values = _metrics_to_db(row.metrics)
         return [
             row.gpu_name,
             row.backend,
             *(arg_values[column] for column in self.args_columns),
-            row.profiler_git_hash or _current_git_hash(),
+            row.profiler_git_hash or default_git_hash,
             row.profiler_run_at or _utc_now(),
             row.cuda_version or _cuda_version(),
             row.driver_version or _driver_version(),
@@ -455,9 +466,18 @@ def _utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
-@lru_cache(maxsize=1)
 def _current_git_hash() -> str:
-    repo_root = Path(__file__).resolve().parents[2]
+    return _git_tree_stamp(Path(__file__).resolve().parents[2])
+
+
+def _git_tree_stamp(repo_root: Path) -> str:
+    """Stamp HEAD, marking measurements made from edited profiling code.
+
+    A bare commit is reproducibility evidence only when the code that can alter
+    a profile number is clean. Staged, unstaged, and untracked files under
+    ``profiling/`` therefore add ``-dirty``. Unrelated simulator or docs edits
+    do not weaken this profiling-specific stamp.
+    """
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -468,7 +488,30 @@ def _current_git_hash() -> str:
         )
     except (FileNotFoundError, subprocess.CalledProcessError):
         return "unknown"
-    return result.stdout.strip() or "unknown"
+    head = result.stdout.strip()
+    if not head:
+        return "unknown"
+    try:
+        status = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                "profiling",
+                ":(exclude,glob)profiling/**/*.db",
+                ":(exclude,glob)profiling/**/*.db-*",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # HEAD alone cannot prove that the profiling tree was clean.
+        return f"{head}-dirty"
+    return f"{head}-dirty" if status.stdout.strip() else head
 
 
 @lru_cache(maxsize=1)
