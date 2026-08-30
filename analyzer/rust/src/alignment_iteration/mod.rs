@@ -14,15 +14,17 @@
 pub(crate) mod host;
 pub(crate) mod timeline;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{ensure, Context, Result};
 use datafusion::prelude::SessionContext;
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -45,6 +47,10 @@ const SEQUENCE_DETAIL_FILE: &str = "alignment_sequence_programs.jsonl";
 const ALIGNMENT_ITERATION_SCHEMA_VERSION: u32 = 2;
 
 static SHARD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum independent iterations built before the serial fold writes them.
+/// This is a live-memory bound; it still supplies enough work for large hosts.
+const MEASURE_CHUNK: usize = 256;
 
 /// Stream a JSONL shard into an unpublished temp file and content-address it.
 ///
@@ -623,7 +629,7 @@ struct SimCase {
 
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read_kernel_align(log_dir)?;
-    let measured: ParsedTrace = read_json(&input.parsed_nsys)?;
+    let measured = parsed_trace(&input.parsed_nsys)?;
     let case_map: CaseMapDoc = read_json(&input.timing_predict_case_map)?;
     ensure!(
         case_map.schema_version == 1,
@@ -681,329 +687,173 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let mut simulated_workload_ms = 0.0;
     let mut simulated_mapped_ms = 0.0;
 
-    for joined in &case_map.cases {
-        let measured_iter = measured_by_id
-            .get(&joined.measured_iteration)
-            .with_context(|| {
-                format!(
-                    "case {} points to missing measured iteration {}",
-                    joined.case_index, joined.measured_iteration
-                )
-            })?;
-        let sim = sim_cases.get(&joined.case_index).with_context(|| {
-            format!(
-                "missing timing-predict cost row for case {}",
-                joined.case_index
-            )
-        })?;
-        ensure!(
-            sim.slot_ms.len() == manifest.slots.len(),
-            "case {} slot_time_ms length {} != manifest slot count {}",
-            joined.case_index,
-            sim.slot_ms.len(),
-            manifest.slots.len()
-        );
-
-        let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
-        // Built once and shared by every position of this iteration: see
-        // `TrackPrefixUnions` for why per-position construction does not scale.
-        let prefix_unions = TrackPrefixUnions::build(&measurement.track_intervals);
-        let measured_busy_union_ms = measurement.busy_union_ms;
-        let measured_gpu_cycle_ms = measured_gpu_cycles_ms
-            .get(&measured_iter.iteration)
-            .copied();
-
-        let mut sim_ops: BTreeMap<String, f64> = BTreeMap::new();
-        let mut simulated_kernels = Vec::new();
-        let mut iteration_unmapped_simulated_ms = 0.0;
-        // Keep folded workload for mapping coverage, but attribute visible
-        // simulated time through the CostTree's Sum/Max/Scale semantics. An
-        // EP Max branch must contribute only its winning leaf to the UI path.
-        let critical_path_ms_by_slot = critical_path_leaf_ms(manifest, &sim.slot_ms)?;
-        let attributed_simulated_ms: f64 = critical_path_ms_by_slot.iter().sum();
-        ensure!(
-            (attributed_simulated_ms - sim.total_ms).abs() <= (sim.total_ms.abs() * 1e-3).max(1e-6),
-            "case {}: attributed critical path {:.6} ms != row total {:.6} ms",
-            joined.case_index,
-            attributed_simulated_ms,
-            sim.total_ms,
-        );
-
-        let phase_summaries: Vec<_> = measurement
-            .phase_summaries
-            .iter()
-            .map(|summary| {
-                json!({
-                    "device_id": summary.device_id,
-                    "phase": summary.phase,
-                    "busy_union_ms": summary.busy_union_ms,
-                    "kernel_sum_ms": summary.kernel_sum_ms,
-                    "kernel_count": summary.kernel_count,
-                })
-            })
-            .collect();
-
-        // Fold this iteration's rows into the run-wide inventory and the
-        // unmapped-kernel audit. Both are order-insensitive (their durations go
-        // through `interval_union_ns`, which sorts), so folding per row here is
-        // equivalent to folding per launch during the scan.
-        for (aggregate_key, item) in &measurement.inventory_kernels {
-            if item.operation.is_none() {
-                let entry = unmapped_measured
-                    .entry((item.phase.clone(), item.row_id.clone()))
-                    .or_insert_with(|| (item.name.clone(), 0, Vec::new(), BTreeSet::new()));
-                entry.1 += item.launches.len();
-                entry
-                    .2
-                    .extend(item.launches.iter().map(|l| (l.start_ns, l.end_ns)));
-                entry.3.extend(item.device_ids.iter().copied());
-            }
-            let aggregate = kernel_inventory.entry(aggregate_key.clone()).or_default();
-            aggregate.phase = item.phase.clone();
-            aggregate.row_id = item.row_id.clone();
-            aggregate.name = item.name.clone();
-            aggregate.category = item.category.clone();
-            aggregate.calls += item.launches.len();
-            aggregate
-                .intervals
-                .extend(item.launches.iter().map(|l| (l.start_ns, l.end_ns)));
-            aggregate.iterations.insert(measured_iter.iteration);
-            aggregate.device_ids.extend(item.device_ids.iter().copied());
-            aggregate.operation = item.operation.clone();
-        }
-
-        let measured_reduction = measured_critical_path(&measurement);
-        let mut measured_ops: BTreeMap<String, f64> = BTreeMap::new();
-        let mut measured_kernel_rows = Vec::with_capacity(measurement.kernels.len());
-        for (kernel_index, (_, item)) in measurement.kernels.iter().enumerate() {
-            let device_count = item.device_ids.len().max(1);
-            let reduced_duration_ms =
-                occurrence_ns(&item.launches, item.synchronizing) as f64 / 1e6;
-            let raw_duration_ms = measured_reduction.kernel_raw_ms[kernel_index];
-            let effective_duration_ms = measured_reduction.kernel_effective_ms[kernel_index];
-            let duration_ms = measured_reduction.kernel_critical_ms[kernel_index];
-            if let Some(operation) = &item.operation {
-                *measured_ops.entry(operation.clone()).or_default() += duration_ms;
-            }
-            let track_indices: BTreeSet<usize> =
-                item.launches.iter().map(|l| l.track_index).collect();
-            measured_kernel_rows.push(json!({
-                "phase": item.phase,
-                "sequence_id": item.sequence_id,
-                "row_id": item.row_id,
-                "name": item.name,
-                "physical_kernel_names": item.physical_kernel_names,
-                "source_row_ids": item.source_row_ids,
-                "category": item.category,
-                "operation": item.operation,
-                "operation_ordinal": item.operation_ordinal,
-                "physical_kernels": physical_kernel_rows(item),
-                "synchronizing": item.synchronizing,
-                "calls": item.launches.len(),
-                "rank_launches": item.launches.len(),
-                "replica_calls": item.launches.len() as f64 / device_count as f64,
-                "duration_ms": duration_ms,
-                "raw_duration_ms": raw_duration_ms,
-                "effective_duration_ms": effective_duration_ms,
-                "reduced_duration_ms": reduced_duration_ms,
-                "excluded_overlap_ms": (raw_duration_ms - effective_duration_ms).max(0.0),
-                "collective_arrival_wait_ms":
-                    (effective_duration_ms - duration_ms).max(0.0),
-                // Which concurrent track this position ran on, and how much of
-                // its own duration overlapped another track. A consumer drawing
-                // the measured lane can then mark the overlap where it actually
-                // happened instead of as a lump at the end of the bar.
-                "track_indices": track_indices,
-                "concurrent_hidden_ms": prefix_unions.hidden_ms_max(&item.launches),
-                "first_start_ns": item.first_start_ns,
-                "device_ids": item.device_ids,
-            }));
-        }
-        // How much of each operation ran while another track was busy. This is
-        // the evidence a cost-model decision needs: an operation that is almost
-        // entirely hidden is not on the critical path even though its kernels
-        // are real work, and one that is never hidden is fully serial.
-        let measured_hidden_ops = hidden_ms_by_operation(
-            &measurement.kernels,
-            &prefix_unions,
-            measured_reduction.device_id,
-        );
-        let iteration_unmapped_measured_ms = measured_reduction.unmapped_ms;
-        let measured_kernel_sum_ms = measured_reduction.kernel_sum_ms;
-        let measured_concurrent_hidden_ms = measured_reduction.concurrent_hidden_ms;
-        let measured_excluded_overlap_ms = measured_reduction.excluded_overlap_ms;
-        let collective_arrival_wait_ms = measured_reduction.collective_arrival_wait_ms;
-        let measured_physical_path_ms = measured_reduction.physical_path_ms;
-        let measured_critical_path_ms = measured_reduction.critical_path_ms;
-        let measured_track_busy_ms = track_busy_ms(&measurement.track_intervals);
-        // Feed the pooled duty-cycle multiplier. Only iterations that have a
-        // measured GPU cycle contribute, so the ratio's numerator and denominator
-        // span exactly the same iterations (the final iteration has no cycle).
-        // The pooling itself waits until every iteration is seen, because the
-        // outlier screen below needs the whole per-stage distribution.
-        duty_cycle_samples.push(DutyCycleSample {
-            iteration: measured_iter.iteration,
-            stage: joined.stage.clone(),
-            measured_gpu_cycle_ms,
-            measured_busy_union_ms,
-            jit_stall_ms: measured_iter.jit_stall_ns as f64 / 1.0e6,
-            jit_module_loads: measured_iter.jit_module_loads,
-        });
-        gpu_cycle_inputs.push((measured_gpu_cycle_ms, sim.total_ms));
-
-        // Operations that actually appear in this iteration's measured kernels.
-        // A sim slot declared by several operations (fused aggregate vs unfused
-        // split) resolves to whichever of them is present this iteration.
-        let present_operations: BTreeSet<&str> = measured_ops.keys().map(String::as_str).collect();
-        for (index, (slot, time_ms)) in manifest.slots.iter().zip(&sim.slot_ms).enumerate() {
-            let folded_ms = *time_ms * scales[index] as f64;
-            let critical_path_ms = critical_path_ms_by_slot[index];
-            simulated_workload_ms += folded_ms;
-            let operation = inventory.resolve_slot_operation(
-                &slot.name,
-                &present_operations,
-                measured_iter.iteration,
-            )?;
-            if let Some(operation) = operation {
-                *sim_ops.entry(operation.operation.clone()).or_default() += critical_path_ms;
-                simulated_mapped_ms += folded_ms;
-            } else {
-                iteration_unmapped_simulated_ms += folded_ms;
-                *unmapped_simulated
-                    .entry(format!("{} ({})", slot.name, slot.kind))
-                    .or_default() += folded_ms;
-            }
-            simulated_kernels.push(json!({
-                "slot_index": index,
-                "name": slot.name,
-                "context": slot_contexts[index],
-                "kind": slot.kind,
-                "operation": operation.map(|value| value.operation.as_str()),
-                "multiplicity": scales[index],
-                "unit_ms": time_ms,
-                "folded_ms": folded_ms,
-                "critical_path_ms": critical_path_ms,
-            }));
-        }
-
-        let operations: BTreeSet<_> = measured_ops.keys().chain(sim_ops.keys()).cloned().collect();
-        let mut operation_rows = Vec::new();
-        for operation in operations {
-            let measured_ms = measured_ops.get(&operation).copied();
-            let simulated_ms = sim_ops.get(&operation).copied();
-            let (op_delta, op_relative) = match (measured_ms, simulated_ms) {
-                (Some(m), Some(s)) => (Some(s - m), ratio_pct(s - m, m)),
-                _ => (None, None),
-            };
-            let aggregate = operation_stats.entry(operation.clone()).or_default();
-            match (measured_ms, simulated_ms) {
-                (Some(m), Some(s)) => {
-                    aggregate.measured_ms.push(m);
-                    aggregate.simulated_ms.push(s);
-                    aggregate.delta_ms.push(s - m);
-                    aggregate.comparison.record(m, s);
-                    aggregate
-                        .comparison_by_stage
-                        .entry(joined.stage.clone())
-                        .or_default()
-                        .record(m, s);
-                    if let Some(rel) = ratio_pct(s - m, m) {
-                        aggregate.relative_pct.push(rel);
-                        aggregate.abs_relative_pct.push(rel.abs());
-                    }
-                }
-                (None, Some(_)) => aggregate.missing_measured += 1,
-                (Some(_), None) => aggregate.missing_simulated += 1,
-                (None, None) => unreachable!(),
-            }
-            let hidden_ms = measured_hidden_ops.get(&operation).copied();
-            operation_rows.push(json!({
-                "operation": operation,
-                "measured_ms": measured_ms,
-                "measured_concurrent_hidden_ms": hidden_ms,
-                "measured_hidden_fraction": match (measured_ms, hidden_ms) {
-                    (Some(m), Some(h)) if m > 0.0 => Some(h / m),
-                    _ => None,
+    // `measure_iteration` is the analyzer's hot path -- 629 s of a 10,707-iteration
+    // capture, on a host with 224 idle cores -- and it is a pure function of one
+    // case. It runs in parallel here; everything after it stays serial and in
+    // case-map order, because the accumulators below (`kernel_inventory`,
+    // `unmapped_measured`, the running f64 sums) are order-dependent and the
+    // pooled duty-cycle multiplier is compared against `alignment-timeline`'s.
+    //
+    // Chunked rather than one `par_iter` over every case: an `IterationMeasurement`
+    // holds every launch of its iteration, and this subject already peaks near
+    // 68 GB. A chunk bounds the extra live set to `MEASURE_CHUNK` of them.
+    for chunk in case_map.cases.chunks(MEASURE_CHUNK) {
+        let chunk_outputs = chunk
+            .par_iter()
+            .map(
+                |joined| -> Result<(IterationMeasurement, BreakdownOutput)> {
+                    let measured_iter = measured_by_id
+                        .get(&joined.measured_iteration)
+                        .with_context(|| {
+                            format!(
+                                "case {} points to missing measured iteration {}",
+                                joined.case_index, joined.measured_iteration
+                            )
+                        })?;
+                    let sim = sim_cases.get(&joined.case_index).with_context(|| {
+                        format!(
+                            "missing timing-predict cost row for case {}",
+                            joined.case_index
+                        )
+                    })?;
+                    let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
+                    let output = build_breakdown(
+                        joined,
+                        measured_iter,
+                        sim,
+                        &measurement,
+                        &inventory,
+                        manifest,
+                        &scales,
+                        &slot_contexts,
+                        measured_gpu_cycles_ms
+                            .get(&measured_iter.iteration)
+                            .copied(),
+                    )?;
+                    Ok((measurement, output))
                 },
+            )
+            // Indexed collect preserves case order. Resolve the Results only
+            // after the parallel map so invalid input still reports the first
+            // case error, as the former serial loop did.
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+
+        for (joined, (measurement, output)) in chunk.iter().zip(chunk_outputs) {
+            let measured_iter = measured_by_id[&joined.measured_iteration];
+            // Fold this iteration's rows into the run-wide inventory and the
+            // unmapped-kernel audit. Both are order-insensitive (their durations go
+            // through `interval_union_ns`, which sorts), so folding per row here is
+            // equivalent to folding per launch during the scan.
+            for (aggregate_key, item) in &measurement.inventory_kernels {
+                if item.operation.is_none() {
+                    let entry = unmapped_measured
+                        .entry((item.phase.clone(), item.row_id.clone()))
+                        .or_insert_with(|| (item.name.clone(), 0, Vec::new(), BTreeSet::new()));
+                    entry.1 += item.launches.len();
+                    entry
+                        .2
+                        .extend(item.launches.iter().map(|l| (l.start_ns, l.end_ns)));
+                    entry.3.extend(item.device_ids.iter().copied());
+                }
+                let aggregate = kernel_inventory.entry(aggregate_key.clone()).or_default();
+                aggregate.phase = item.phase.clone();
+                aggregate.row_id = item.row_id.clone();
+                aggregate.name = item.name.clone();
+                aggregate.category = item.category.clone();
+                aggregate.calls += item.launches.len();
+                aggregate
+                    .intervals
+                    .extend(item.launches.iter().map(|l| (l.start_ns, l.end_ns)));
+                aggregate.iterations.insert(measured_iter.iteration);
+                aggregate.device_ids.extend(item.device_ids.iter().copied());
+                aggregate.operation = item.operation.clone();
+            }
+
+            duty_cycle_samples.push(output.duty_cycle_sample);
+            gpu_cycle_inputs.push((output.measured_gpu_cycle_ms, output.simulated_total_ms));
+            // Folded in slot order, exactly as the single serial loop did: a
+            // per-iteration pre-sum would reassociate these and move the
+            // reported mapping coverage in the last bits.
+            for (folded_ms, mapped) in &output.slot_folded_ms {
+                simulated_workload_ms += folded_ms;
+                if *mapped {
+                    simulated_mapped_ms += folded_ms;
+                }
+            }
+            for (slot, folded_ms) in output.unmapped_simulated {
+                *unmapped_simulated.entry(slot).or_default() += folded_ms;
+            }
+            for (operation, measured_ms, simulated_ms) in output.operation_stat_inputs {
+                let aggregate = operation_stats.entry(operation).or_default();
+                match (measured_ms, simulated_ms) {
+                    (Some(m), Some(s)) => {
+                        aggregate.measured_ms.push(m);
+                        aggregate.simulated_ms.push(s);
+                        aggregate.delta_ms.push(s - m);
+                        aggregate.comparison.record(m, s);
+                        aggregate
+                            .comparison_by_stage
+                            .entry(joined.stage.clone())
+                            .or_default()
+                            .record(m, s);
+                        if let Some(rel) = ratio_pct(s - m, m) {
+                            aggregate.relative_pct.push(rel);
+                            aggregate.abs_relative_pct.push(rel.abs());
+                        }
+                    }
+                    (None, Some(_)) => aggregate.missing_measured += 1,
+                    (Some(_), None) => aggregate.missing_simulated += 1,
+                    (None, None) => unreachable!(),
+                }
+            }
+
+            // Coverage compares selected-device raw durations. Headline rows use
+            // interval-union contributions after collective arrival-wait removal.
+            measured_workload_ms += output.measured_kernel_sum_ms;
+            measured_mapped_ms += output.measured_mapped_kernel_sum_ms;
+            let measured_critical_path_ms = output.measured_critical_path_ms;
+            let simulated_ms = output.simulated_total_ms;
+            let delta_ms = simulated_ms - measured_critical_path_ms;
+            let relative_pct = ratio_pct(delta_ms, measured_critical_path_ms);
+            cumulative_measured += measured_critical_path_ms;
+            cumulative_simulated += simulated_ms;
+            let cumulative_delta_ms = cumulative_simulated - cumulative_measured;
+            let cumulative_relative_pct = ratio_pct(cumulative_delta_ms, cumulative_measured);
+            total_delta.push(delta_ms);
+            comparison.record(measured_critical_path_ms, simulated_ms);
+            comparison_by_stage
+                .entry(joined.stage.clone())
+                .or_default()
+                .record(measured_critical_path_ms, simulated_ms);
+            if let Some(value) = relative_pct {
+                total_relative.push(value);
+                total_abs_relative.push(value.abs());
+            }
+
+            iteration_rows.push(json!({
+                "case_index": joined.case_index,
+                "iteration_id": measured_iter.iteration,
+                "stage": joined.stage,
+                "iteration_type": measured_iter.iteration_type,
+                "measured_ms": measured_critical_path_ms,
+                "measured_physical_path_ms": output.measured_physical_path_ms,
+                "measured_kernel_sum_ms": output.measured_kernel_sum_ms,
+                "measured_concurrent_hidden_ms": output.measured_concurrent_hidden_ms,
+                "measured_excluded_overlap_ms": output.measured_excluded_overlap_ms,
+                "collective_arrival_wait_ms": output.collective_arrival_wait_ms,
+                "critical_device_id": output.critical_device_id,
+                "measured_busy_union_ms": output.measured_busy_union_ms,
                 "simulated_ms": simulated_ms,
-                "delta_ms": op_delta,
-                "relative_diff_pct": op_relative,
+                "delta_ms": delta_ms,
+                "relative_diff_pct": relative_pct,
+                "cumulative_delta_ms": cumulative_delta_ms,
+                "cumulative_relative_diff_pct": cumulative_relative_pct,
             }));
+            let (offset, length) = breakdown_writer.write_line(&output.line)?;
+            breakdown_ranges.insert(measured_iter.iteration.to_string(), json!([offset, length]));
         }
-
-        let simulated_leaf_workload_ms = simulated_kernels
-            .iter()
-            .filter_map(|row| row["folded_ms"].as_f64())
-            .sum::<f64>();
-        let simulated_critical_path_ms = simulated_kernels
-            .iter()
-            .filter_map(|row| row["critical_path_ms"].as_f64())
-            .sum::<f64>();
-
-        // Coverage compares selected-device raw durations. Headline rows use
-        // interval-union contributions after collective arrival-wait removal.
-        measured_workload_ms += measured_kernel_sum_ms;
-        measured_mapped_ms += measured_reduction.mapped_kernel_sum_ms;
-        let delta_ms = sim.total_ms - measured_critical_path_ms;
-        let relative_pct = ratio_pct(delta_ms, measured_critical_path_ms);
-        cumulative_measured += measured_critical_path_ms;
-        cumulative_simulated += sim.total_ms;
-        let cumulative_delta_ms = cumulative_simulated - cumulative_measured;
-        let cumulative_relative_pct = ratio_pct(cumulative_delta_ms, cumulative_measured);
-        total_delta.push(delta_ms);
-        comparison.record(measured_critical_path_ms, sim.total_ms);
-        comparison_by_stage
-            .entry(joined.stage.clone())
-            .or_default()
-            .record(measured_critical_path_ms, sim.total_ms);
-        if let Some(value) = relative_pct {
-            total_relative.push(value);
-            total_abs_relative.push(value.abs());
-        }
-
-        iteration_rows.push(json!({
-            "case_index": joined.case_index,
-            "iteration_id": measured_iter.iteration,
-            "stage": joined.stage,
-            "iteration_type": measured_iter.iteration_type,
-            "measured_ms": measured_critical_path_ms,
-            "measured_physical_path_ms": measured_physical_path_ms,
-            "measured_kernel_sum_ms": measured_kernel_sum_ms,
-            "measured_concurrent_hidden_ms": measured_concurrent_hidden_ms,
-            "measured_excluded_overlap_ms": measured_excluded_overlap_ms,
-            "collective_arrival_wait_ms": collective_arrival_wait_ms,
-            "critical_device_id": measured_reduction.device_id,
-            "measured_busy_union_ms": measured_busy_union_ms,
-            "simulated_ms": sim.total_ms,
-            "delta_ms": delta_ms,
-            "relative_diff_pct": relative_pct,
-            "cumulative_delta_ms": cumulative_delta_ms,
-            "cumulative_relative_diff_pct": cumulative_relative_pct,
-        }));
-        let breakdown = json!({
-            "case_index": joined.case_index,
-            "iteration_id": measured_iter.iteration,
-            "stage": joined.stage,
-            "measured_kernels": measured_kernel_rows,
-            "simulated_kernels": simulated_kernels,
-            "phase_summary": phase_summaries,
-            "operation_summary": operation_rows,
-            "measured_ms": measured_critical_path_ms,
-            "measured_physical_path_ms": measured_physical_path_ms,
-            "measured_kernel_sum_ms": measured_kernel_sum_ms,
-            "measured_concurrent_hidden_ms": measured_concurrent_hidden_ms,
-            "measured_excluded_overlap_ms": measured_excluded_overlap_ms,
-            "collective_arrival_wait_ms": collective_arrival_wait_ms,
-            "critical_device_id": measured_reduction.device_id,
-            "measured_track_busy": measured_track_busy_ms,
-            "simulated_leaf_workload_ms": simulated_leaf_workload_ms,
-            "simulated_critical_path_ms": simulated_critical_path_ms,
-            "unmapped_measured_ms": iteration_unmapped_measured_ms,
-            "unmapped_simulated_ms": iteration_unmapped_simulated_ms,
-        });
-        let line = serde_json::to_vec(&breakdown)?;
-        let (offset, length) = breakdown_writer.write_line(&line)?;
-        breakdown_ranges.insert(measured_iter.iteration.to_string(), json!([offset, length]));
     }
 
     // Physical duty-cycle correction, derived from the measured side only:
@@ -1358,6 +1208,281 @@ fn sequence_catalog(
         "byte_ranges": byte_ranges,
     });
     Ok((catalog, detail, detail_bytes))
+}
+
+/// One iteration's finished detail line, plus the values the run-wide
+/// accumulators and the series row still need from it.
+///
+/// A full capture's detail shard is ~27 GB of `serde_json::Value`, and building
+/// those trees is the bulk of this subject's wall time -- not writing them, which
+/// the shard's disk sustains at 1.5 GB/s. All of it is a pure function of one
+/// case, so it runs on a rayon worker; only the order-dependent folds in `run`
+/// stay serial.
+struct BreakdownOutput {
+    /// The serialized detail line, without its trailing newline.
+    line: Vec<u8>,
+    duty_cycle_sample: DutyCycleSample,
+    measured_gpu_cycle_ms: Option<f64>,
+    simulated_total_ms: f64,
+    /// `(folded ms, mapped)` per simulated slot, in manifest slot order, so the
+    /// caller's run-wide sums keep the serial loop's addition order.
+    slot_folded_ms: Vec<(f64, bool)>,
+    /// `"{slot} ({kind})" -> folded ms` for slots no operation claimed.
+    unmapped_simulated: Vec<(String, f64)>,
+    /// `(operation, measured ms, simulated ms)` folded into `operation_stats`.
+    operation_stat_inputs: Vec<(String, Option<f64>, Option<f64>)>,
+    measured_kernel_sum_ms: f64,
+    measured_mapped_kernel_sum_ms: f64,
+    measured_critical_path_ms: f64,
+    measured_physical_path_ms: f64,
+    measured_concurrent_hidden_ms: f64,
+    measured_excluded_overlap_ms: f64,
+    collective_arrival_wait_ms: f64,
+    measured_busy_union_ms: f64,
+    critical_device_id: Option<i64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_breakdown(
+    joined: &CaseMap,
+    measured_iter: &MeasuredIteration,
+    sim: &SimCase,
+    measurement: &IterationMeasurement,
+    inventory: &CompiledInventory,
+    manifest: &Manifest,
+    scales: &[u64],
+    slot_contexts: &[Option<String>],
+    measured_gpu_cycle_ms: Option<f64>,
+) -> Result<BreakdownOutput> {
+    ensure!(
+        sim.slot_ms.len() == manifest.slots.len(),
+        "case {} slot_time_ms length {} != manifest slot count {}",
+        joined.case_index,
+        sim.slot_ms.len(),
+        manifest.slots.len()
+    );
+
+    // Built once and shared by every position of this iteration: see
+    // `TrackPrefixUnions` for why per-position construction does not scale.
+    let prefix_unions = TrackPrefixUnions::build(&measurement.track_intervals);
+    let measured_busy_union_ms = measurement.busy_union_ms;
+
+    let mut sim_ops: BTreeMap<String, f64> = BTreeMap::new();
+    let mut simulated_kernels = Vec::new();
+    let mut iteration_unmapped_simulated_ms = 0.0;
+    // Keep folded workload for mapping coverage, but attribute visible
+    // simulated time through the CostTree's Sum/Max/Scale semantics. An
+    // EP Max branch must contribute only its winning leaf to the UI path.
+    let critical_path_ms_by_slot = critical_path_leaf_ms(manifest, &sim.slot_ms)?;
+    let attributed_simulated_ms: f64 = critical_path_ms_by_slot.iter().sum();
+    ensure!(
+        (attributed_simulated_ms - sim.total_ms).abs() <= (sim.total_ms.abs() * 1e-3).max(1e-6),
+        "case {}: attributed critical path {:.6} ms != row total {:.6} ms",
+        joined.case_index,
+        attributed_simulated_ms,
+        sim.total_ms,
+    );
+
+    let phase_summaries: Vec<_> = measurement
+        .phase_summaries
+        .iter()
+        .map(|summary| {
+            json!({
+                "device_id": summary.device_id,
+                "phase": summary.phase,
+                "busy_union_ms": summary.busy_union_ms,
+                "kernel_sum_ms": summary.kernel_sum_ms,
+                "kernel_count": summary.kernel_count,
+            })
+        })
+        .collect();
+
+    let measured_reduction = measured_critical_path(measurement);
+    let mut measured_ops: BTreeMap<String, f64> = BTreeMap::new();
+    let mut measured_kernel_rows = Vec::with_capacity(measurement.kernels.len());
+    for (kernel_index, (_, item)) in measurement.kernels.iter().enumerate() {
+        let device_count = item.device_ids.len().max(1);
+        let reduced_duration_ms = occurrence_ns(&item.launches, item.synchronizing) as f64 / 1e6;
+        let raw_duration_ms = measured_reduction.kernel_raw_ms[kernel_index];
+        let effective_duration_ms = measured_reduction.kernel_effective_ms[kernel_index];
+        let duration_ms = measured_reduction.kernel_critical_ms[kernel_index];
+        if let Some(operation) = &item.operation {
+            *measured_ops.entry(operation.clone()).or_default() += duration_ms;
+        }
+        let track_indices: BTreeSet<usize> = item.launches.iter().map(|l| l.track_index).collect();
+        measured_kernel_rows.push(json!({
+            "phase": item.phase,
+            "sequence_id": item.sequence_id,
+            "row_id": item.row_id,
+            "name": item.name,
+            "physical_kernel_names": item.physical_kernel_names,
+            "source_row_ids": item.source_row_ids,
+            "category": item.category,
+            "operation": item.operation,
+            "operation_ordinal": item.operation_ordinal,
+            "physical_kernels": physical_kernel_rows(item),
+            "synchronizing": item.synchronizing,
+            "calls": item.launches.len(),
+            "rank_launches": item.launches.len(),
+            "replica_calls": item.launches.len() as f64 / device_count as f64,
+            "duration_ms": duration_ms,
+            "raw_duration_ms": raw_duration_ms,
+            "effective_duration_ms": effective_duration_ms,
+            "reduced_duration_ms": reduced_duration_ms,
+            "excluded_overlap_ms": (raw_duration_ms - effective_duration_ms).max(0.0),
+            "collective_arrival_wait_ms":
+                (effective_duration_ms - duration_ms).max(0.0),
+            // Which concurrent track this position ran on, and how much of
+            // its own duration overlapped another track. A consumer drawing
+            // the measured lane can then mark the overlap where it actually
+            // happened instead of as a lump at the end of the bar.
+            "track_indices": track_indices,
+            "concurrent_hidden_ms": prefix_unions.hidden_ms_max(&item.launches),
+            "first_start_ns": item.first_start_ns,
+            "device_ids": item.device_ids,
+        }));
+    }
+    // How much of each operation ran while another track was busy. This is
+    // the evidence a cost-model decision needs: an operation that is almost
+    // entirely hidden is not on the critical path even though its kernels
+    // are real work, and one that is never hidden is fully serial.
+    let measured_hidden_ops = hidden_ms_by_operation(
+        &measurement.kernels,
+        &prefix_unions,
+        measured_reduction.device_id,
+    );
+    let iteration_unmapped_measured_ms = measured_reduction.unmapped_ms;
+    let measured_kernel_sum_ms = measured_reduction.kernel_sum_ms;
+    let measured_concurrent_hidden_ms = measured_reduction.concurrent_hidden_ms;
+    let measured_excluded_overlap_ms = measured_reduction.excluded_overlap_ms;
+    let collective_arrival_wait_ms = measured_reduction.collective_arrival_wait_ms;
+    let measured_physical_path_ms = measured_reduction.physical_path_ms;
+    let measured_critical_path_ms = measured_reduction.critical_path_ms;
+    let measured_track_busy_ms = track_busy_ms(&measurement.track_intervals);
+
+    // Feed the pooled duty-cycle multiplier. Only iterations that have a
+    // measured GPU cycle contribute, so the ratio's numerator and denominator
+    // span exactly the same iterations (the final iteration has no cycle).
+    // The pooling itself waits until every iteration is seen, because the
+    // outlier screen in `run` needs the whole per-stage distribution.
+    let duty_cycle_sample = DutyCycleSample {
+        iteration: measured_iter.iteration,
+        stage: joined.stage.clone(),
+        measured_gpu_cycle_ms,
+        measured_busy_union_ms,
+        jit_stall_ms: measured_iter.jit_stall_ns as f64 / 1.0e6,
+        jit_module_loads: measured_iter.jit_module_loads,
+    };
+
+    // Operations that actually appear in this iteration's measured kernels.
+    // A sim slot declared by several operations (fused aggregate vs unfused
+    // split) resolves to whichever of them is present this iteration.
+    let present_operations: BTreeSet<&str> = measured_ops.keys().map(String::as_str).collect();
+    let mut slot_folded_ms = Vec::with_capacity(manifest.slots.len());
+    let mut unmapped_simulated: Vec<(String, f64)> = Vec::new();
+    for (index, (slot, time_ms)) in manifest.slots.iter().zip(&sim.slot_ms).enumerate() {
+        let folded_ms = *time_ms * scales[index] as f64;
+        let critical_path_ms = critical_path_ms_by_slot[index];
+        let operation = inventory.resolve_slot_operation(
+            &slot.name,
+            &present_operations,
+            measured_iter.iteration,
+        )?;
+        if let Some(operation) = operation {
+            *sim_ops.entry(operation.operation.clone()).or_default() += critical_path_ms;
+        } else {
+            iteration_unmapped_simulated_ms += folded_ms;
+            unmapped_simulated.push((format!("{} ({})", slot.name, slot.kind), folded_ms));
+        }
+        slot_folded_ms.push((folded_ms, operation.is_some()));
+        simulated_kernels.push(json!({
+            "slot_index": index,
+            "name": slot.name,
+            "context": slot_contexts[index],
+            "kind": slot.kind,
+            "operation": operation.map(|value| value.operation.as_str()),
+            "multiplicity": scales[index],
+            "unit_ms": time_ms,
+            "folded_ms": folded_ms,
+            "critical_path_ms": critical_path_ms,
+        }));
+    }
+
+    let operations: BTreeSet<_> = measured_ops.keys().chain(sim_ops.keys()).cloned().collect();
+    let mut operation_rows = Vec::new();
+    let mut operation_stat_inputs = Vec::new();
+    for operation in operations {
+        let measured_ms = measured_ops.get(&operation).copied();
+        let simulated_ms = sim_ops.get(&operation).copied();
+        let (op_delta, op_relative) = match (measured_ms, simulated_ms) {
+            (Some(m), Some(s)) => (Some(s - m), ratio_pct(s - m, m)),
+            _ => (None, None),
+        };
+        operation_stat_inputs.push((operation.clone(), measured_ms, simulated_ms));
+        let hidden_ms = measured_hidden_ops.get(&operation).copied();
+        operation_rows.push(json!({
+            "operation": operation,
+            "measured_ms": measured_ms,
+            "measured_concurrent_hidden_ms": hidden_ms,
+            "measured_hidden_fraction": match (measured_ms, hidden_ms) {
+                (Some(m), Some(h)) if m > 0.0 => Some(h / m),
+                _ => None,
+            },
+            "simulated_ms": simulated_ms,
+            "delta_ms": op_delta,
+            "relative_diff_pct": op_relative,
+        }));
+    }
+
+    let simulated_leaf_workload_ms = simulated_kernels
+        .iter()
+        .filter_map(|row| row["folded_ms"].as_f64())
+        .sum::<f64>();
+    let simulated_critical_path_ms = simulated_kernels
+        .iter()
+        .filter_map(|row| row["critical_path_ms"].as_f64())
+        .sum::<f64>();
+
+    let breakdown = json!({
+        "case_index": joined.case_index,
+        "iteration_id": measured_iter.iteration,
+        "stage": joined.stage,
+        "measured_kernels": measured_kernel_rows,
+        "simulated_kernels": simulated_kernels,
+        "phase_summary": phase_summaries,
+        "operation_summary": operation_rows,
+        "measured_ms": measured_critical_path_ms,
+        "measured_physical_path_ms": measured_physical_path_ms,
+        "measured_kernel_sum_ms": measured_kernel_sum_ms,
+        "measured_concurrent_hidden_ms": measured_concurrent_hidden_ms,
+        "measured_excluded_overlap_ms": measured_excluded_overlap_ms,
+        "collective_arrival_wait_ms": collective_arrival_wait_ms,
+        "critical_device_id": measured_reduction.device_id,
+        "measured_track_busy": measured_track_busy_ms,
+        "simulated_leaf_workload_ms": simulated_leaf_workload_ms,
+        "simulated_critical_path_ms": simulated_critical_path_ms,
+        "unmapped_measured_ms": iteration_unmapped_measured_ms,
+        "unmapped_simulated_ms": iteration_unmapped_simulated_ms,
+    });
+
+    Ok(BreakdownOutput {
+        line: serde_json::to_vec(&breakdown)?,
+        duty_cycle_sample,
+        measured_gpu_cycle_ms,
+        simulated_total_ms: sim.total_ms,
+        slot_folded_ms,
+        unmapped_simulated,
+        operation_stat_inputs,
+        measured_kernel_sum_ms,
+        measured_mapped_kernel_sum_ms: measured_reduction.mapped_kernel_sum_ms,
+        measured_critical_path_ms,
+        measured_physical_path_ms,
+        measured_concurrent_hidden_ms,
+        measured_excluded_overlap_ms,
+        collective_arrival_wait_ms,
+        measured_busy_union_ms,
+        critical_device_id: measured_reduction.device_id,
+    })
 }
 
 /// The one predict worker whose `iter` cost tree the alignment compares against.
@@ -2432,8 +2557,29 @@ fn compile_label(
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+    // Parse bytes directly: validating a multi-gigabyte trace into a String is
+    // a redundant second pass before serde sees the same UTF-8 JSON.
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+}
+
+/// Parse one normalized NSYS trace once per process.
+///
+/// `alignment-iteration` and `alignment-timeline` run concurrently and both
+/// consume the same multi-gigabyte document. The mutex intentionally covers the
+/// parse: this is a single-flight cache, so the second subject waits instead of
+/// doubling peak memory and repeating the parse. Paths keep independent runs
+/// independent.
+fn parsed_trace(path: &Path) -> Result<Arc<ParsedTrace>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<ParsedTrace>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().expect("parsed-trace cache poisoned");
+    if let Some(hit) = guard.get(path) {
+        return Ok(Arc::clone(hit));
+    }
+    let trace = Arc::new(read_json(path)?);
+    guard.insert(path.to_path_buf(), Arc::clone(&trace));
+    Ok(trace)
 }
 
 /// One iteration's contribution to the duty-cycle pool, plus the evidence the
@@ -3135,6 +3281,20 @@ mod tests {
 
         assert_eq!(fs::read(published_path).unwrap(), b"old generation\n");
         assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn parsed_trace_cache_reuses_success_and_does_not_cache_failure() {
+        let log_dir = tempfile::tempdir().unwrap();
+        let path = log_dir.path().join("parsed.json");
+
+        fs::write(&path, b"not json").unwrap();
+        assert!(parsed_trace(&path).is_err());
+
+        fs::write(&path, br#"{"kernel_names":{},"iteration_details":[]}"#).unwrap();
+        let first = parsed_trace(&path).unwrap();
+        let second = parsed_trace(&path).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     fn test_leaf(name: &str) -> LeafDesc {

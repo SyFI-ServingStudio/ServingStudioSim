@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{ensure, Context, Result};
 use datafusion::prelude::SessionContext;
+use rayon::prelude::*;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -46,10 +47,9 @@ use super::host::{self, HostWindow};
 use super::{
     duty_cycle_recommendation, interval_union_ns, kernel_name_index, leaf_scales, load_inventory,
     load_sim_cases, measure_iteration, measured_critical_path, measured_gpu_cycles_ms,
-    occurrence_ns, physical_kernel_rows, pooled_gpu_time_multiplier, read_json,
+    occurrence_ns, parsed_trace, physical_kernel_rows, pooled_gpu_time_multiplier, read_json,
     screen_duty_cycle_outliers, single_iter_manifest, CaseMapDoc, CompiledInventory,
-    DutyCycleSample, IterationMeasurement, JsonlShardWriter, MeasuredIteration, ParsedTrace,
-    SimCase,
+    DutyCycleSample, IterationMeasurement, JsonlShardWriter, MeasuredIteration, SimCase,
 };
 use crate::alignment_input;
 use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
@@ -134,7 +134,7 @@ impl Selection {
 
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read_kernel_align(log_dir)?;
-    let measured: ParsedTrace = read_json(&input.parsed_nsys)?;
+    let measured = parsed_trace(&input.parsed_nsys)?;
     let case_map: CaseMapDoc = read_json(&input.timing_predict_case_map)?;
     ensure!(
         case_map.schema_version == 1,
@@ -176,53 +176,65 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     // Pass one: the scalars the selection needs, for every case. This repeats
     // `alignment-iteration`'s measured reduction rather than reading its report,
     // because a subject may not depend on another subject's output.
-    let mut summaries = Vec::with_capacity(case_map.cases.len());
-    let mut duty_cycle_samples = Vec::with_capacity(case_map.cases.len());
-    for joined in &case_map.cases {
-        let measured_iter = measured_by_id
-            .get(&joined.measured_iteration)
-            .with_context(|| {
+    //
+    // The body is a pure function of one case, so it runs in parallel. `map` +
+    // ordered `collect` rather than a shared accumulator: the two vectors stay
+    // in case-map order, which is what `screen_duty_cycle_outliers` sums over,
+    // so the pooled multiplier is bit-identical to the serial version. On a
+    // 10,707-iteration capture this is the whole subject's cost.
+    let pass_one: Vec<(DutyCycleSample, IterationSummary)> = case_map
+        .cases
+        .par_iter()
+        .map(|joined| {
+            let measured_iter = measured_by_id
+                .get(&joined.measured_iteration)
+                .with_context(|| {
+                    format!(
+                        "case {} points to missing measured iteration {}",
+                        joined.case_index, joined.measured_iteration
+                    )
+                })?;
+            let sim = sim_cases.get(&joined.case_index).with_context(|| {
                 format!(
-                    "case {} points to missing measured iteration {}",
-                    joined.case_index, joined.measured_iteration
+                    "missing timing-predict cost row for case {}",
+                    joined.case_index
                 )
             })?;
-        let sim = sim_cases.get(&joined.case_index).with_context(|| {
-            format!(
-                "missing timing-predict cost row for case {}",
-                joined.case_index
-            )
-        })?;
-        let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
-        let measured_reduction = measured_critical_path(&measurement);
-        duty_cycle_samples.push(DutyCycleSample {
-            iteration: measured_iter.iteration,
-            stage: joined.stage.clone(),
-            measured_gpu_cycle_ms: gpu_cycles_ms.get(&measured_iter.iteration).copied(),
-            measured_busy_union_ms: measurement.busy_union_ms,
-            jit_stall_ms: measured_iter.jit_stall_ns as f64 / 1.0e6,
-            jit_module_loads: measured_iter.jit_module_loads,
-        });
-        summaries.push(IterationSummary {
-            case_index: joined.case_index,
-            iteration_id: measured_iter.iteration,
-            stage: joined.stage.clone(),
-            iteration_type: measured_iter.iteration_type.clone(),
-            identity_sequence: inventory
-                .sequence_id(IDENTITY_PHASE, measured_iter.iteration)
-                .unwrap_or("")
-                .to_string(),
-            critical_device_id: measured_reduction.device_id,
-            measured_ms: measured_reduction.critical_path_ms,
-            measured_physical_path_ms: measured_reduction.physical_path_ms,
-            measured_kernel_sum_ms: measured_reduction.kernel_sum_ms,
-            simulated_ms: sim.total_ms,
-            relative_diff_pct: relative_pct(
-                sim.total_ms - measured_reduction.critical_path_ms,
-                measured_reduction.critical_path_ms,
-            ),
-        });
-    }
+            let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
+            let measured_reduction = measured_critical_path(&measurement);
+            let sample = DutyCycleSample {
+                iteration: measured_iter.iteration,
+                stage: joined.stage.clone(),
+                measured_gpu_cycle_ms: gpu_cycles_ms.get(&measured_iter.iteration).copied(),
+                measured_busy_union_ms: measurement.busy_union_ms,
+                jit_stall_ms: measured_iter.jit_stall_ns as f64 / 1.0e6,
+                jit_module_loads: measured_iter.jit_module_loads,
+            };
+            let summary = IterationSummary {
+                case_index: joined.case_index,
+                iteration_id: measured_iter.iteration,
+                stage: joined.stage.clone(),
+                iteration_type: measured_iter.iteration_type.clone(),
+                identity_sequence: inventory
+                    .sequence_id(IDENTITY_PHASE, measured_iter.iteration)
+                    .unwrap_or("")
+                    .to_string(),
+                critical_device_id: measured_reduction.device_id,
+                measured_ms: measured_reduction.critical_path_ms,
+                measured_physical_path_ms: measured_reduction.physical_path_ms,
+                measured_kernel_sum_ms: measured_reduction.kernel_sum_ms,
+                simulated_ms: sim.total_ms,
+                relative_diff_pct: relative_pct(
+                    sim.total_ms - measured_reduction.critical_path_ms,
+                    measured_reduction.critical_path_ms,
+                ),
+            };
+            Ok((sample, summary))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    let (duty_cycle_samples, summaries): (Vec<_>, Vec<_>) = pass_one.into_iter().unzip();
     ensure!(!summaries.is_empty(), "alignment case map is empty");
 
     // The pooled duty-cycle correction, over EVERY iteration — not just the ones
@@ -295,55 +307,64 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .map(|window| (window.iteration_id, window.anchor_ns))
         .collect();
 
-    // Pass two: the full detail. Each iteration's detail is serialized straight
-    // to the shard file rather than collected, so peak memory is one iteration
-    // and not the whole capture — a 400-iteration window alone is 688 MB of
-    // detail, and a buffer of it is memory the process never reads back.
+    // Pass two: build independent selected iterations in bounded parallel
+    // chunks, then write their already-serialized lines in selection order.
     let mut detail_writer = JsonlShardWriter::create(log_dir, ITERATION_DETAIL_FILE)?;
     let mut index_iterations = Vec::with_capacity(selected.len());
     let mut report_iterations = Vec::with_capacity(selected.len());
     let mut byte_ranges = serde_json::Map::new();
     let mut used_name_ids = BTreeSet::new();
-    for (index, reason) in &selected {
-        let summary = &summaries[*index];
-        let measured_iter = measured_by_id[&summary.iteration_id];
-        let sim = &sim_cases[&summary.case_index];
-        let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
-        let reference = reference_device_id
-            .or_else(|| measurement.device_ids.first().copied())
-            .context("measured iteration has no device ids")?;
-
-        let built = build_iteration(
-            summary,
-            *reason,
-            &measurement,
-            sim,
-            &inventory,
-            manifest,
-            &scales,
-            reference,
-            time_origin_ns,
-            gpu_cycles_ms.get(&summary.iteration_id).copied(),
-            gpu_time_multiplier,
-            host_anchors
-                .get(&summary.iteration_id)
-                .map(|anchor_ns| HostContext {
-                    anchor_ns: *anchor_ns,
-                    rows: host_timeline
-                        .as_ref()
-                        .and_then(|timeline| timeline.iteration(summary.iteration_id)),
-                }),
-            &mut used_name_ids,
-        )?;
-        let line = serde_json::to_vec(&built.detail)?;
-        let (offset, length) = detail_writer.write_line(&line)?;
-        byte_ranges.insert(summary.iteration_id.to_string(), json!([offset, length]));
-        index_iterations.push(built.index);
-        // The report is the read-by-a-person half, and a person cannot read two
-        // thousand iterations. It keeps the ones the selection distinguished;
-        // the payload keeps everything, seekable.
-        if *reason != Selection::FullCapture {
-            report_iterations.push(built.report);
+    for chunk in selected.chunks(super::MEASURE_CHUNK) {
+        let outputs = chunk
+            .par_iter()
+            .map(|(index, reason)| -> Result<TimelineOutput> {
+                let summary = &summaries[*index];
+                let measured_iter = measured_by_id[&summary.iteration_id];
+                let sim = &sim_cases[&summary.case_index];
+                let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
+                let reference = reference_device_id
+                    .or_else(|| measurement.device_ids.first().copied())
+                    .context("measured iteration has no device ids")?;
+                let built = build_iteration(
+                    summary,
+                    *reason,
+                    &measurement,
+                    sim,
+                    &inventory,
+                    manifest,
+                    &scales,
+                    reference,
+                    time_origin_ns,
+                    gpu_cycles_ms.get(&summary.iteration_id).copied(),
+                    gpu_time_multiplier,
+                    host_anchors
+                        .get(&summary.iteration_id)
+                        .map(|anchor_ns| HostContext {
+                            anchor_ns: *anchor_ns,
+                            rows: host_timeline
+                                .as_ref()
+                                .and_then(|timeline| timeline.iteration(summary.iteration_id)),
+                        }),
+                )?;
+                Ok(TimelineOutput {
+                    iteration_id: summary.iteration_id,
+                    line: serde_json::to_vec(&built.detail)?,
+                    index: built.index,
+                    report: (*reason != Selection::FullCapture).then_some(built.report),
+                    used_name_ids: built.used_name_ids,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        for output in outputs {
+            let (offset, length) = detail_writer.write_line(&output.line)?;
+            byte_ranges.insert(output.iteration_id.to_string(), json!([offset, length]));
+            index_iterations.push(output.index);
+            if let Some(report) = output.report {
+                report_iterations.push(report);
+            }
+            used_name_ids.extend(output.used_name_ids);
         }
     }
 
@@ -588,7 +609,17 @@ struct HostContext<'a> {
     rows: Option<&'a host::IterationHost>,
 }
 
-/// One iteration, in the three shapes it is read in.
+/// One iteration's finished output, carried back from the parallel build to the
+/// serial writer. Holds the already-serialized detail line rather than the
+/// `Value` it came from, so the tree is dropped on the worker that built it.
+struct TimelineOutput {
+    iteration_id: u64,
+    line: Vec<u8>,
+    index: Value,
+    report: Option<Value>,
+    used_name_ids: BTreeSet<u64>,
+}
+
 struct BuiltIteration {
     /// Everything, one line of the detail shard.
     detail: Value,
@@ -596,6 +627,10 @@ struct BuiltIteration {
     report: Value,
     /// The scalars a picker needs before it fetches anything.
     index: Value,
+    /// Physical kernel-name ids this iteration referenced. Returned rather than
+    /// pushed into a caller-owned set so the build can run off the serial path;
+    /// the caller unions them, and a `BTreeSet` union is order-insensitive.
+    used_name_ids: BTreeSet<u64>,
 }
 
 /// The reference rank's kernel span, straight from the parsed ranges.
@@ -642,8 +677,8 @@ fn build_iteration(
     measured_gpu_cycle_ms: Option<f64>,
     gpu_time_multiplier: Option<f64>,
     host_context: Option<HostContext<'_>>,
-    used_name_ids: &mut BTreeSet<u64>,
 ) -> Result<BuiltIteration> {
+    let mut used_name_ids: BTreeSet<u64> = BTreeSet::new();
     let simulated_gpu_cycle_ms = gpu_time_multiplier.map(|multiplier| sim.total_ms * multiplier);
     let offset = |ns: u64| (ns as i64) - (time_origin_ns as i64);
 
@@ -864,6 +899,7 @@ fn build_iteration(
         detail,
         report,
         index,
+        used_name_ids,
     })
 }
 

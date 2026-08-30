@@ -19,6 +19,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 csv = "1"
+# Per-iteration reduction and detail serialization are independent pure maps.
+# Rayon keeps those CPU-heavy maps off the serial, order-sensitive fold.
+rayon = "1"
 # DataFusion drives the parquet scan / filter / grouped aggregation. arrow-array
 # is pinned to the version DataFusion 45 re-exports so downcasts on its
 # RecordBatches resolve to the same arrow types (matches ref/moesim-rs analyze-rust).
