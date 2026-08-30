@@ -192,8 +192,10 @@ Everything flows through `perf_api`. There are exactly two internal paths.
    `RunnerRef`, executes each spec, and writes JSON results back.
 5. Require every successful worker result to report its observed physical GPU,
    validate all observations against the requested cache key, then persist the
-   rows through `Table.insert`. Cached-only provenance is produced only by a DB
-   hit for which no worker ran.
+   rows through `Table.insert`. Failed specs retain their worker error in one
+   grouped log per backend (warning for a partial batch, error when all specs
+   fail), rather than resurfacing later as anonymous cache misses. With no
+   successful worker observation, returned provenance remains cache-key-only.
 
 The main/simulator process therefore **never imports torch or a runner**: the
 registry holds lazy `RunnerRef`s, and the heavy import only happens in the worker
