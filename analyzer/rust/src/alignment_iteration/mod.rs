@@ -16,12 +16,16 @@ pub(crate) mod timeline;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{ensure, Context, Result};
 use datafusion::prelude::SessionContext;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::alignment_input;
 use crate::cdf::{clean_nonnegative_sorted, percentile_sorted, stats};
@@ -39,6 +43,128 @@ const KERNEL_INVENTORY_FILE: &str = "alignment_kernel_inventory.jsonl";
 const SEQUENCE_DETAIL_FILE: &str = "alignment_sequence_programs.jsonl";
 /// Version 2 moves both high-cardinality collections out of the report/index.
 const ALIGNMENT_ITERATION_SCHEMA_VERSION: u32 = 2;
+
+static SHARD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Stream a JSONL shard into an unpublished temp file and content-address it.
+///
+/// A subject builds its large shard before `main` publishes the returned payload.
+/// Truncating a deterministic file would make an old or cached payload unreadable
+/// for the whole run, and permanently so if the run failed. The final filename
+/// includes the SHA-256 of the exact bytes: every published generation is
+/// immutable, identical reruns reuse it, and concurrent analyzers cannot make an
+/// index from one generation address another generation's offsets.
+struct JsonlShardWriter {
+    base_file: &'static str,
+    temp_path: PathBuf,
+    writer: Option<BufWriter<std::fs::File>>,
+    digest: Sha256,
+    offset: usize,
+}
+
+impl JsonlShardWriter {
+    fn create(log_dir: &Path, base_file: &'static str) -> Result<Self> {
+        let base_path = crate::io::payload_path(log_dir, base_file);
+        let parent = base_path
+            .parent()
+            .with_context(|| format!("shard path has no parent: {}", base_path.display()))?;
+        fs::create_dir_all(parent)?;
+        let file_name = base_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("invalid shard filename: {}", base_path.display()))?;
+        let (temp_path, file) = loop {
+            let sequence = SHARD_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{file_name}.{}.{}.tmp",
+                std::process::id(),
+                sequence
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("create {}", candidate.display()))
+                }
+            }
+        };
+        Ok(Self {
+            base_file,
+            temp_path,
+            writer: Some(BufWriter::new(file)),
+            digest: Sha256::new(),
+            offset: 0,
+        })
+    }
+
+    fn write_line(&mut self, line: &[u8]) -> Result<(usize, usize)> {
+        let offset = self.offset;
+        let writer = self
+            .writer
+            .as_mut()
+            .context("JSONL shard already finished")?;
+        writer.write_all(line)?;
+        writer.write_all(b"\n")?;
+        self.digest.update(line);
+        self.digest.update(b"\n");
+        self.offset += line.len() + 1;
+        Ok((offset, line.len()))
+    }
+
+    fn finish(mut self, log_dir: &Path) -> Result<(String, PathBuf)> {
+        let mut writer = self.writer.take().context("JSONL shard already finished")?;
+        writer
+            .flush()
+            .with_context(|| format!("write {}", self.temp_path.display()))?;
+        drop(writer);
+
+        let base = Path::new(self.base_file);
+        let stem = base
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("JSONL shard base has no UTF-8 stem")?;
+        let extension = base
+            .extension()
+            .and_then(|value| value.to_str())
+            .context("JSONL shard base has no UTF-8 extension")?;
+        let hash = format!("{:x}", self.digest.clone().finalize());
+        let file_name = format!("{stem}.{hash}.{extension}");
+        let final_path = crate::io::payload_path(log_dir, &file_name);
+        if final_path.exists() {
+            let existing_len = fs::metadata(&final_path)?.len();
+            ensure!(
+                existing_len == self.offset as u64,
+                "content-addressed shard {} has {} bytes, expected {}",
+                final_path.display(),
+                existing_len,
+                self.offset
+            );
+            fs::remove_file(&self.temp_path)
+                .with_context(|| format!("remove {}", self.temp_path.display()))?;
+        } else {
+            fs::rename(&self.temp_path, &final_path).with_context(|| {
+                format!(
+                    "publish {} as {}",
+                    self.temp_path.display(),
+                    final_path.display()
+                )
+            })?;
+        }
+        Ok((file_name, final_path))
+    }
+}
+
+impl Drop for JsonlShardWriter {
+    fn drop(&mut self) {
+        if self.temp_path.exists() {
+            let _ = fs::remove_file(&self.temp_path);
+        }
+    }
+}
 
 const PREDICT_TABLE: &str = "alignment_predict_cost";
 const PREDICT_COLUMNS: &[&str] = &["iter_id", "total_time_ms", "slot_time_ms", "section"];
@@ -524,9 +650,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let mut iteration_rows = Vec::new();
     // Per-iteration kernel breakdowns are the bulk of this subject — 550 MB of
     // the old single-document payload, for a view that opens one iteration at a
-    // time. They are serialized straight into a shard buffer as they are built,
-    // so neither this process nor a reader ever holds all of them.
-    let mut breakdown_bytes: Vec<u8> = Vec::new();
+    // time. They are streamed to the shard file as they are built, so neither
+    // this process nor a reader ever holds all of them: a full GLM-5.2 capture
+    // is 10 k iterations of ~8 k positions, which as one buffer is over a
+    // gigabyte of resident JSON for rows nothing reads twice.
+    let mut breakdown_writer = JsonlShardWriter::create(log_dir, BREAKDOWN_DETAIL_FILE)?;
     let mut breakdown_ranges = serde_json::Map::new();
     let mut total_delta = Vec::new();
     let mut total_relative = Vec::new();
@@ -577,6 +705,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         );
 
         let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
+        // Built once and shared by every position of this iteration: see
+        // `TrackPrefixUnions` for why per-position construction does not scale.
+        let prefix_unions = TrackPrefixUnions::build(&measurement.track_intervals);
         let measured_busy_union_ms = measurement.busy_union_ms;
         let measured_gpu_cycle_ms = measured_gpu_cycles_ms
             .get(&measured_iter.iteration)
@@ -683,10 +814,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 // the measured lane can then mark the overlap where it actually
                 // happened instead of as a lump at the end of the bar.
                 "track_indices": track_indices,
-                "concurrent_hidden_ms": launches_hidden_ms(
-                    &item.launches,
-                    &measurement.track_intervals,
-                ),
+                "concurrent_hidden_ms": prefix_unions.hidden_ms_max(&item.launches),
                 "first_start_ns": item.first_start_ns,
                 "device_ids": item.device_ids,
             }));
@@ -697,7 +825,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         // are real work, and one that is never hidden is fully serial.
         let measured_hidden_ops = hidden_ms_by_operation(
             &measurement.kernels,
-            &measurement.track_intervals,
+            &prefix_unions,
             measured_reduction.device_id,
         );
         let iteration_unmapped_measured_ms = measured_reduction.unmapped_ms;
@@ -874,12 +1002,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "unmapped_simulated_ms": iteration_unmapped_simulated_ms,
         });
         let line = serde_json::to_vec(&breakdown)?;
-        breakdown_ranges.insert(
-            measured_iter.iteration.to_string(),
-            json!([breakdown_bytes.len(), line.len()]),
-        );
-        breakdown_bytes.extend_from_slice(&line);
-        breakdown_bytes.push(b'\n');
+        let (offset, length) = breakdown_writer.write_line(&line)?;
+        breakdown_ranges.insert(measured_iter.iteration.to_string(), json!([offset, length]));
     }
 
     // Physical duty-cycle correction, derived from the measured side only:
@@ -1092,14 +1216,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "iterations": iteration_rows,
         "definitions": definitions,
     });
-    // Written before the payload is returned, so an index can never name a shard
-    // the caller failed to write.
-    let breakdown_path = crate::io::payload_path(log_dir, BREAKDOWN_DETAIL_FILE);
-    if let Some(parent) = breakdown_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&breakdown_path, &breakdown_bytes)
-        .with_context(|| format!("write {}", breakdown_path.display()))?;
+    // Flushed before the payload is returned, so an index can never name a shard
+    // whose tail is still in a buffer.
+    let (breakdown_file, breakdown_path) = breakdown_writer.finish(log_dir)?;
     println!("wrote {}", breakdown_path.display());
 
     let (sequences, sequence_detail, sequence_detail_bytes) =
@@ -1125,7 +1244,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "sequences": sequences,
         "sequence_detail": sequence_detail,
         "breakdown_detail": {
-            "file": BREAKDOWN_DETAIL_FILE,
+            "file": breakdown_file,
             "encoding": "one JSON object per line, in the order of `iterations`",
             "byte_ranges": breakdown_ranges,
         },
@@ -2717,11 +2836,11 @@ fn track_busy_ms(
 /// yields nothing and the field stays absent.
 fn hidden_ms_by_operation(
     kernels: &[(String, IterationKernelAggregate)],
-    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
+    prefix_unions: &TrackPrefixUnions,
     selected_device_id: Option<i64>,
 ) -> BTreeMap<String, f64> {
     let mut hidden: BTreeMap<String, f64> = BTreeMap::new();
-    if track_intervals.values().all(|tracks| tracks.len() < 2) {
+    if !prefix_unions.has_concurrency {
         return hidden;
     }
     for (_, item) in kernels {
@@ -2730,109 +2849,166 @@ fn hidden_ms_by_operation(
         };
         let entry = hidden.entry(operation.clone()).or_default();
         *entry += selected_device_id.map_or(0.0, |device_id| {
-            launches_hidden_ms_on_device(&item.launches, track_intervals, device_id)
+            prefix_unions.hidden_ms_on_device(&item.launches, device_id)
         });
     }
     hidden
 }
 
-/// How much of one position's launches ran behind an earlier-starting track.
+/// Per device and track, the busy union of every *lower-indexed* track.
 ///
-/// The overlap of two tracks is one shared stretch of wall clock, so charging it
-/// to both sides would count it twice and no set of per-occurrence rows could
-/// then add up to the iteration's `measured_concurrent_hidden_ms`. Each launch is
-/// therefore compared only against the tracks *before* its own — track order is
-/// first-launch order, so this charges the side stream that joined a device
-/// already busy, which is also the physical reading (vLLM's shared expert hides
-/// behind the main stream, not the other way round).
-///
-/// That choice is exact, not a convention: summed over every launch on a device
-/// it telescopes to `Σ per-track busy − union`, which is precisely the hidden
-/// time subtracted from the critical path. This audit-only helper reduces
-/// devices with `max`; the headline uses the selected-device helper below.
-fn launches_hidden_ms(
+/// This is the "tracks before mine" set that the hidden-time rule needs, and the
+/// rule is applied once per position. Rebuilding and re-sorting the set inside
+/// each call made the pass quadratic in an iteration's positions: a GLM-5.2
+/// forward is ~2 k positions spread over as many as 80 tracks, so the old form
+/// did ~80 collect-and-sort passes over ~2 k intervals for every one of them.
+/// The set depends only on the iteration's tracks, so it is built once here and
+/// probed by binary search.
+struct TrackPrefixUnions {
+    /// `device -> track -> merged busy intervals of all lower tracks`. Empty for
+    /// the lowest track on each device, which by construction hides nothing.
+    by_device: BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
+    /// Whether any device ran more than one track. A single-stream capture has
+    /// no hidden time at all, and the per-operation audit skips itself.
+    has_concurrency: bool,
+}
+
+impl TrackPrefixUnions {
+    fn build(track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>) -> Self {
+        let mut by_device = BTreeMap::new();
+        for (device_id, tracks) in track_intervals {
+            let mut prefixes: BTreeMap<usize, Vec<(u64, u64)>> = BTreeMap::new();
+            let mut running: Vec<(u64, u64)> = Vec::new();
+            for (track_index, intervals) in tracks {
+                // Record before folding this track in, so the entry keeps the
+                // strict `..track_index` semantics the rule is stated in.
+                prefixes.insert(*track_index, running.clone());
+                running.extend(intervals.iter().copied());
+                running = merge_intervals(&running);
+            }
+            by_device.insert(*device_id, prefixes);
+        }
+        Self {
+            has_concurrency: track_intervals.values().any(|tracks| tracks.len() >= 2),
+            by_device,
+        }
+    }
+
+    /// How much of one position's launches ran behind an earlier-starting track.
+    ///
+    /// The overlap of two tracks is one shared stretch of wall clock, so charging
+    /// it to both sides would count it twice and no set of per-occurrence rows
+    /// could then add up to the iteration's `measured_concurrent_hidden_ms`. Each
+    /// launch is therefore compared only against the tracks *before* its own —
+    /// track order is first-launch order, so this charges the side stream that
+    /// joined a device already busy, which is also the physical reading (vLLM's
+    /// shared expert hides behind the main stream, not the other way round).
+    ///
+    /// That choice is exact, not a convention: summed over every launch on a
+    /// device it telescopes to `Σ per-track busy − union`, which is precisely the
+    /// hidden time subtracted from the critical path.
+    fn hidden_ms_on_device(&self, launches: &[KernelLaunch], device_id: i64) -> f64 {
+        let Some(prefixes) = self.by_device.get(&device_id) else {
+            return 0.0;
+        };
+        let mut hidden_ms = 0.0;
+        for ((_, track_index), intervals) in group_launches_by_track(launches, Some(device_id)) {
+            // `track_intervals` is built from these very launches, so a probed
+            // track always has an entry; a missing one can only mean the caller
+            // paired launches with another iteration's tracks.
+            if let Some(earlier) = prefixes.get(&track_index) {
+                // Preserve the old accumulation boundary exactly: each track
+                // converted integer nanoseconds to f64 milliseconds before the
+                // per-device sum.
+                hidden_ms += overlap_with_merged_ns(&intervals, earlier) as f64 / 1e6;
+            }
+        }
+        hidden_ms
+    }
+
+    /// The same charge, reduced over devices with `max` — audit-only; the
+    /// headline path uses the selected critical device above.
+    fn hidden_ms_max(&self, launches: &[KernelLaunch]) -> f64 {
+        let mut per_device: BTreeMap<i64, f64> = BTreeMap::new();
+        for ((device_id, track_index), intervals) in group_launches_by_track(launches, None) {
+            let Some(earlier) = self
+                .by_device
+                .get(&device_id)
+                .and_then(|prefixes| prefixes.get(&track_index))
+            else {
+                continue;
+            };
+            *per_device.entry(device_id).or_default() +=
+                overlap_with_merged_ns(&intervals, earlier) as f64 / 1e6;
+        }
+        per_device.into_values().fold(0.0f64, f64::max)
+    }
+}
+
+/// One position's launches bucketed by the `(device, track)` they ran on,
+/// optionally restricted to a single device.
+fn group_launches_by_track(
     launches: &[KernelLaunch],
-    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
-) -> f64 {
-    let mut by_device: BTreeMap<(i64, usize), Vec<(u64, u64)>> = BTreeMap::new();
+    only_device: Option<i64>,
+) -> BTreeMap<(i64, usize), Vec<(u64, u64)>> {
+    let mut by_track: BTreeMap<(i64, usize), Vec<(u64, u64)>> = BTreeMap::new();
     for launch in launches {
-        by_device
+        if only_device.is_some_and(|device_id| launch.device_id != device_id) {
+            continue;
+        }
+        by_track
             .entry((launch.device_id, launch.track_index))
             .or_default()
             .push((launch.start_ns, launch.end_ns));
     }
-    let mut per_device: BTreeMap<i64, f64> = BTreeMap::new();
-    for ((device_id, track_index), intervals) in by_device {
-        let Some(tracks) = track_intervals.get(&device_id) else {
-            continue;
-        };
-        let earlier: Vec<(u64, u64)> = tracks
-            .range(..track_index)
-            .flat_map(|(_, values)| values.iter().copied())
-            .collect();
-        *per_device.entry(device_id).or_default() +=
-            interval_overlap_ns(&intervals, &earlier) as f64 / 1e6;
-    }
-    per_device.values().copied().fold(0.0f64, f64::max)
+    by_track
 }
 
-fn launches_hidden_ms_on_device(
-    launches: &[KernelLaunch],
-    track_intervals: &BTreeMap<i64, BTreeMap<usize, Vec<(u64, u64)>>>,
-    device_id: i64,
-) -> f64 {
-    let Some(tracks) = track_intervals.get(&device_id) else {
-        return 0.0;
-    };
-    let mut hidden_ms = 0.0;
-    for track_index in tracks.keys() {
-        let intervals: Vec<(u64, u64)> = launches
-            .iter()
-            .filter(|launch| launch.device_id == device_id && launch.track_index == *track_index)
-            .map(|launch| (launch.start_ns, launch.end_ns))
-            .collect();
-        let earlier: Vec<(u64, u64)> = tracks
-            .range(..*track_index)
-            .flat_map(|(_, values)| values.iter().copied())
-            .collect();
-        hidden_ms += interval_overlap_ns(&intervals, &earlier) as f64 / 1e6;
-    }
-    hidden_ms
-}
-
-/// Length of the intersection of two interval sets, in nanoseconds.
-fn interval_overlap_ns(left: &[(u64, u64)], right: &[(u64, u64)]) -> u64 {
-    if left.is_empty() || right.is_empty() {
+/// Length of the intersection of `probe` with an already-merged interval set.
+///
+/// `merged` must be start-sorted and disjoint, which lets each piece of `probe`
+/// jump straight to the first interval it can touch instead of re-sweeping the
+/// whole set. `probe` is coalesced first because a position whose launches
+/// overlap each other would otherwise have the shared stretch counted twice.
+fn overlap_with_merged_ns(probe: &[(u64, u64)], merged: &[(u64, u64)]) -> u64 {
+    if probe.is_empty() || merged.is_empty() {
         return 0;
     }
-    // |A| + |B| - |A ∪ B| = |A ∩ B|, which reuses the union already proven here
-    // instead of adding a second sweep with its own edge cases.
-    let combined: Vec<(u64, u64)> = left.iter().chain(right.iter()).copied().collect();
-    (interval_union_ns(left) + interval_union_ns(right))
-        .saturating_sub(interval_union_ns(&combined))
+    let mut total = 0;
+    for (start, end) in merge_intervals(probe) {
+        let mut index = merged.partition_point(|(_, other_end)| *other_end <= start);
+        while index < merged.len() && merged[index].0 < end {
+            let (other_start, other_end) = merged[index];
+            total += other_end.min(end).saturating_sub(other_start.max(start));
+            index += 1;
+        }
+    }
+    total
 }
 
-fn interval_union_ns(intervals: &[(u64, u64)]) -> u64 {
+/// Sort and coalesce, dropping reversed intervals rather than trusting them.
+fn merge_intervals(intervals: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut sorted: Vec<_> = intervals
         .iter()
         .copied()
         .filter(|(start, end)| end >= start)
         .collect();
     sorted.sort_unstable_by_key(|(start, end)| (*start, *end));
-    let Some((mut start, mut end)) = sorted.first().copied() else {
-        return 0;
-    };
-    let mut total = 0;
-    for (next_start, next_end) in sorted.into_iter().skip(1) {
-        if next_start <= end {
-            end = end.max(next_end);
-        } else {
-            total += end - start;
-            start = next_start;
-            end = next_end;
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
         }
     }
-    total + end - start
+    merged
+}
+
+fn interval_union_ns(intervals: &[(u64, u64)]) -> u64 {
+    merge_intervals(intervals)
+        .into_iter()
+        .map(|(start, end)| end - start)
+        .sum()
 }
 
 fn ratio_pct(delta: f64, reference: f64) -> Option<f64> {
@@ -2902,6 +3078,64 @@ fn definitions() -> Value {
 mod tests {
     use super::*;
     use crate::trace::manifest::LeafDesc;
+
+    #[test]
+    fn jsonl_shard_writer_records_seekable_ranges() {
+        let log_dir = tempfile::tempdir().unwrap();
+        let mut writer = JsonlShardWriter::create(log_dir.path(), "rows.jsonl").unwrap();
+        let first = serde_json::to_vec(&json!({"row": 1})).unwrap();
+        let second = serde_json::to_vec(&json!({"row": 2, "wide": true})).unwrap();
+        let first_range = writer.write_line(&first).unwrap();
+        let second_range = writer.write_line(&second).unwrap();
+        let (file_name, path) = writer.finish(log_dir.path()).unwrap();
+
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(
+            bytes,
+            [first.as_slice(), b"\n", second.as_slice(), b"\n"].concat()
+        );
+        assert_eq!(&bytes[first_range.0..first_range.0 + first_range.1], first);
+        assert_eq!(
+            &bytes[second_range.0..second_range.0 + second_range.1],
+            second
+        );
+        assert!(file_name.starts_with("rows."));
+        assert!(file_name.ends_with(".jsonl"));
+
+        // Re-emitting byte-identical content reuses the immutable generation.
+        let mut same = JsonlShardWriter::create(log_dir.path(), "rows.jsonl").unwrap();
+        same.write_line(&first).unwrap();
+        same.write_line(&second).unwrap();
+        let (same_file_name, _) = same.finish(log_dir.path()).unwrap();
+        assert_eq!(same_file_name, file_name);
+
+        // Different content cannot overwrite the generation an old index names.
+        let mut different = JsonlShardWriter::create(log_dir.path(), "rows.jsonl").unwrap();
+        different.write_line(br#"{"row":3}"#).unwrap();
+        let (different_file_name, _) = different.finish(log_dir.path()).unwrap();
+        assert_ne!(different_file_name, file_name);
+        assert_eq!(
+            fs::read(log_dir.path().join("payloads").join(file_name)).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn failed_shard_generation_keeps_published_content_and_removes_its_temp() {
+        let log_dir = tempfile::tempdir().unwrap();
+        let payload_dir = log_dir.path().join("payloads");
+        fs::create_dir_all(&payload_dir).unwrap();
+        let published_path = payload_dir.join("rows.published.jsonl");
+        fs::write(&published_path, b"old generation\n").unwrap();
+
+        let mut failed = JsonlShardWriter::create(log_dir.path(), "rows.jsonl").unwrap();
+        let temp_path = failed.temp_path.clone();
+        failed.write_line(br#"{"partial":true}"#).unwrap();
+        drop(failed);
+
+        assert_eq!(fs::read(published_path).unwrap(), b"old generation\n");
+        assert!(!temp_path.exists());
+    }
 
     fn test_leaf(name: &str) -> LeafDesc {
         LeafDesc {
@@ -3098,8 +3332,9 @@ mod tests {
             track_index,
         };
 
-        let primary = launches_hidden_ms(&[on_track(0, 0, 30_000_000)], &intervals);
-        let side = launches_hidden_ms(&[on_track(1, 10_000_000, 20_000_000)], &intervals);
+        let prefix_unions = TrackPrefixUnions::build(&intervals);
+        let primary = prefix_unions.hidden_ms_max(&[on_track(0, 0, 30_000_000)]);
+        let side = prefix_unions.hidden_ms_max(&[on_track(1, 10_000_000, 20_000_000)]);
 
         assert_eq!(primary, 0.0);
         assert_eq!(side, 10.0);
@@ -3110,11 +3345,60 @@ mod tests {
     }
 
     #[test]
+    fn per_launch_hidden_time_maxes_devices_instead_of_summing_them() {
+        let intervals = tracks(&[
+            (0, 0, &[(0, 30_000_000)]),
+            (0, 1, &[(10_000_000, 20_000_000)]),
+            (1, 0, &[(0, 30_000_000)]),
+            (1, 1, &[(25_000_000, 30_000_000)]),
+        ]);
+        let launches = [
+            KernelLaunch {
+                device_id: 0,
+                start_ns: 10_000_000,
+                end_ns: 20_000_000,
+                correlation_id: None,
+                track_index: 1,
+            },
+            KernelLaunch {
+                device_id: 1,
+                start_ns: 25_000_000,
+                end_ns: 30_000_000,
+                correlation_id: None,
+                track_index: 1,
+            },
+        ];
+        let prefix_unions = TrackPrefixUnions::build(&intervals);
+
+        assert_eq!(prefix_unions.hidden_ms_on_device(&launches, 0), 10.0);
+        assert_eq!(prefix_unions.hidden_ms_on_device(&launches, 1), 5.0);
+        assert_eq!(prefix_unions.hidden_ms_max(&launches), 10.0);
+    }
+
+    #[test]
     fn interval_overlap_is_the_intersection_length() {
-        assert_eq!(interval_overlap_ns(&[(0, 30)], &[(10, 20)]), 10);
-        assert_eq!(interval_overlap_ns(&[(0, 10), (20, 30)], &[(5, 25)]), 10);
-        assert_eq!(interval_overlap_ns(&[(0, 10)], &[(10, 20)]), 0);
-        assert_eq!(interval_overlap_ns(&[], &[(10, 20)]), 0);
+        assert_eq!(overlap_with_merged_ns(&[(0, 30)], &[(10, 20)]), 10);
+        assert_eq!(overlap_with_merged_ns(&[(0, 10), (20, 30)], &[(5, 25)]), 10);
+        assert_eq!(overlap_with_merged_ns(&[(0, 10)], &[(10, 20)]), 0);
+        assert_eq!(overlap_with_merged_ns(&[], &[(10, 20)]), 0);
+        // A probe whose own pieces overlap must not have the shared stretch
+        // charged twice: [0,20) ∪ [10,30) is [0,30), which meets [5,25) in 20.
+        assert_eq!(overlap_with_merged_ns(&[(0, 20), (10, 30)], &[(5, 25)]), 20);
+    }
+
+    #[test]
+    fn prefix_unions_hold_only_the_tracks_below_each_track() {
+        let prefix_unions = TrackPrefixUnions::build(&tracks(&[
+            (0, 0, &[(0, 10), (20, 30)]),
+            (0, 1, &[(5, 25)]),
+            (0, 2, &[(100, 110)]),
+        ]));
+        let prefixes = &prefix_unions.by_device[&0];
+        assert_eq!(prefixes[&0], vec![]);
+        assert_eq!(prefixes[&1], vec![(0, 10), (20, 30)]);
+        // Track 0 and track 1 coalesce into one stretch once merged.
+        assert_eq!(prefixes[&2], vec![(0, 30)]);
+        assert!(prefix_unions.has_concurrency);
     }
 
     /// Two ranks of one kernel position, given as `(device, start, end)`.

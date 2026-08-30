@@ -269,6 +269,16 @@ On the reference capture that is 544 MB -> 2.96 MB for
 `alignment_iteration_series.json` and 2.0 MB of index beside a 249 MB seekable
 shard for `alignment_timeline.json`.
 
+The two per-iteration shards are published as immutable, content-addressed
+generations (the SHA-256 is part of the filename), and the payload names the
+exact generation whose byte ranges it indexes. This keeps a cached payload
+readable while another analyzer rerun is in progress and makes identical reruns
+reuse the same shard. Distinct and orphaned generations are deliberately not
+deleted in the publication path: a retention tool must first exclude every
+generation referenced by a current payload and allow for the UI cache grace
+period. Long-lived run directories therefore need an explicit retention pass;
+eagerly deleting the previous generation is unsafe.
+
 Alignment-iteration schema v2 also shards the two run-wide inventories that can
 grow with sequence diversity. `alignment_kernel_inventory.jsonl` retains every
 per-position audit row without putting them in the report, and

@@ -48,7 +48,8 @@ use super::{
     load_sim_cases, measure_iteration, measured_critical_path, measured_gpu_cycles_ms,
     occurrence_ns, physical_kernel_rows, pooled_gpu_time_multiplier, read_json,
     screen_duty_cycle_outliers, single_iter_manifest, CaseMapDoc, CompiledInventory,
-    DutyCycleSample, IterationMeasurement, MeasuredIteration, ParsedTrace, SimCase,
+    DutyCycleSample, IterationMeasurement, JsonlShardWriter, MeasuredIteration, ParsedTrace,
+    SimCase,
 };
 use crate::alignment_input;
 use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
@@ -295,11 +296,12 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .collect();
 
     // Pass two: the full detail. Each iteration's detail is serialized straight
-    // into the shard buffer rather than collected, so peak memory is one
-    // iteration and not the whole capture.
+    // to the shard file rather than collected, so peak memory is one iteration
+    // and not the whole capture — a 400-iteration window alone is 688 MB of
+    // detail, and a buffer of it is memory the process never reads back.
+    let mut detail_writer = JsonlShardWriter::create(log_dir, ITERATION_DETAIL_FILE)?;
     let mut index_iterations = Vec::with_capacity(selected.len());
     let mut report_iterations = Vec::with_capacity(selected.len());
-    let mut detail_bytes: Vec<u8> = Vec::new();
     let mut byte_ranges = serde_json::Map::new();
     let mut used_name_ids = BTreeSet::new();
     for (index, reason) in &selected {
@@ -334,12 +336,8 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             &mut used_name_ids,
         )?;
         let line = serde_json::to_vec(&built.detail)?;
-        byte_ranges.insert(
-            summary.iteration_id.to_string(),
-            json!([detail_bytes.len(), line.len()]),
-        );
-        detail_bytes.extend_from_slice(&line);
-        detail_bytes.push(b'\n');
+        let (offset, length) = detail_writer.write_line(&line)?;
+        byte_ranges.insert(summary.iteration_id.to_string(), json!([offset, length]));
         index_iterations.push(built.index);
         // The report is the read-by-a-person half, and a person cannot read two
         // thousand iterations. It keeps the ones the selection distinguished;
@@ -424,16 +422,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "iterations": report_iterations,
         "definitions": definitions,
     });
-    // The detail shard is written here rather than returned, because the
-    // subject contract is one report and one payload. Doing it before the
-    // payload is returned means an index can never name a shard that the caller
-    // failed to write.
-    let detail_path = crate::io::payload_path(log_dir, ITERATION_DETAIL_FILE);
-    if let Some(parent) = detail_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&detail_path, &detail_bytes)
-        .with_context(|| format!("write {}", detail_path.display()))?;
+    // The detail shard is flushed here rather than returned, because the subject
+    // contract is one report and one payload. Doing it before the payload is
+    // returned means an index can never name a shard whose tail is still in a
+    // buffer.
+    let (detail_file, detail_path) = detail_writer.finish(log_dir)?;
     println!("wrote {}", detail_path.display());
 
     let payload = json!({
@@ -445,7 +438,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "slot_multiplicity": scales,
         "iterations": index_iterations,
         "iteration_detail": {
-            "file": ITERATION_DETAIL_FILE,
+            "file": detail_file,
             "encoding": "one JSON object per line, in the order of `iterations`",
             "byte_ranges": byte_ranges,
         },
