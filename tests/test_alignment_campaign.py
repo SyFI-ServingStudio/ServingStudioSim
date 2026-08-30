@@ -42,9 +42,12 @@ from launcher.alignment_campaign.metrics import (
 from launcher.alignment_campaign.pack import PackError, load_host, load_pack
 from launcher.alignment_campaign.render import (
     ANALYSIS_KERNEL_PHASE,
+    CONTEXT_LIMIT_FLAG,
     PHASE_CONFIG_STEMS,
     SIMULATION_PHASE,
     TIMING_PREDICT_PHASE,
+    _extra_args,
+    case_documents,
     phase_names,
     render_case,
 )
@@ -244,6 +247,73 @@ def test_render_rejects_a_variant_that_sets_a_per_case_field(pack, tmp_path):
         from launcher.alignment_campaign.render import case_documents
 
         case_documents(patched, case, host, tmp_path, REPO_ROOT)
+
+
+@pytest.mark.parametrize(
+    ("engine", "expected_flag"),
+    sorted(CONTEXT_LIMIT_FLAG.items()),
+)
+def test_context_limit_uses_the_target_engine_cli(pack, engine, expected_flag):
+    case = pack.cases[0]
+    original = pack.variant_of(case)
+    variant = dataclasses.replace(
+        original,
+        engine=engine,
+        server={**original.server, "extra_args": ["--unrelated-flag"]},
+    )
+
+    assert _extra_args(variant, case) == [
+        "--unrelated-flag",
+        expected_flag,
+        str(case.max_model_len),
+    ]
+
+
+@pytest.mark.parametrize("engine", sorted(CONTEXT_LIMIT_FLAG))
+def test_context_limit_rejects_authored_limits_in_either_engine_spelling(pack, engine):
+    case = pack.cases[0]
+    original = pack.variant_of(case)
+    for reserved in CONTEXT_LIMIT_FLAG.values():
+        underscore_alias = f"--{reserved[2:].replace('-', '_')}"
+        for argument in (
+            reserved,
+            f"{reserved}=999",
+            underscore_alias,
+            f"{underscore_alias}=999",
+        ):
+            variant = dataclasses.replace(
+                original,
+                engine=engine,
+                server={**original.server, "extra_args": [argument]},
+            )
+            with pytest.raises(PackError, match="must not set"):
+                _extra_args(variant, case)
+
+
+def test_unknown_engine_has_no_implicit_context_limit_spelling(pack):
+    case = pack.cases[0]
+    variant = dataclasses.replace(pack.variant_of(case), engine="unknown-engine")
+
+    with pytest.raises(PackError, match="no known context-limit flag"):
+        _extra_args(variant, case)
+
+
+def test_cross_phase_check_uses_the_same_sglang_context_limit_flag(pack, tmp_path):
+    case = pack.cases[0]
+    original = pack.variant_of(case)
+    variant = dataclasses.replace(original, engine="sglang")
+    patched = dataclasses.replace(
+        pack,
+        variants={**pack.variants, variant.name: variant},
+    )
+    host = check_module.host_for(patched, None)
+    documents = case_documents(patched, case, host, tmp_path, REPO_ROOT)
+
+    assert not check_module._check_cross_phase(patched, case, documents)
+    profile = documents[f"{variant.profile_passes[0].name}.yaml"]
+    profile["server"]["extra_args"][-2] = "--max-model-len"
+    findings = check_module._check_cross_phase(patched, case, documents)
+    assert any("--context-length does not match" in item.message for item in findings)
 
 
 # ── readiness and planning (pure; no subprocess) ─────────────────────────────
