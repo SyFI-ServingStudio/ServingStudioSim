@@ -1494,7 +1494,20 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     )
     e2e_report = json.loads((analysis / "reports" / "alignment_e2e_report.json").read_text())
     assert iteration_report["mapping"]["coverage"]["measured_duration_fraction"] == 1.0
-    assert len(iteration_report["kernels"]) == 3
+    # Schema 2 streams run-wide audit rows into the sibling JSONL named by the
+    # report. Follow that contract instead of the deliberately empty bootstrap
+    # array retained for compatibility.
+    assert iteration_report["schema_version"] == 2
+    assert iteration_report["kernels"] == []
+    kernel_detail = iteration_report["kernel_detail"]
+    assert kernel_detail["rows"] == 3
+    inventory = (analysis / "reports" / kernel_detail["file"]).read_text().splitlines()
+    assert len(inventory) == 3
+    assert {json.loads(row)["operation"] for row in inventory} == {
+        "attention",
+        "dense_gemm",
+        "model.lm_head",
+    }
     assert iteration_report["iterations"][0]["measured_ms"] == 3.5
     # The iteration pass self-computes the duty-cycle multiplier from measured
     # quantities alone: Σ measured_gpu_cycle_ms / Σ measured_ms over iterations
