@@ -10,7 +10,8 @@ import yaml
 
 from alignment import runner as alignment_runner
 from alignment.load_generator import runner as load_runner
-from alignment.profiler import engine_records, record_extraction, vllm_server
+from alignment.profiler import engine_records, record_extraction, sglang_server, vllm_server
+from alignment.profiler.config import ServerConfig
 from alignment.timing_predict_input import BuildRequest, build_inputs
 from launcher import alignment as alignment_launcher
 from launcher import exec as launcher_exec
@@ -492,6 +493,29 @@ def test_profile_server_argv_enables_prompt_token_details_once():
 
     assert server_argv.count("--enable-prompt-tokens-details") == 1
     assert "--trust-remote-code" in server_argv
+
+
+def test_sglang_server_argv_refuses_the_vllm_token_cudagraph_ceiling():
+    base = dict(model_path="model", tp_size=4, chunk_size=2048)
+    argv = sglang_server.build_server_argv("fork-python", ServerConfig(**base))
+    assert argv[argv.index("--chunked-prefill-size") + 1] == "2048"
+    assert not any(flag.startswith("--cuda-graph-max-bs") for flag in argv)
+    eager_argv = sglang_server.build_server_argv(
+        "fork-python", ServerConfig(**base, enforce_eager=True)
+    )
+    assert "--disable-cuda-graph" in eager_argv
+    assert not any(flag.startswith("--cuda-graph-max-bs") for flag in eager_argv)
+
+    with pytest.raises(ValueError, match="counts requests, not tokens"):
+        sglang_server.build_server_argv(
+            "fork-python", ServerConfig(**base, max_cudagraph_capture_size=2048)
+        )
+
+    argv = sglang_server.build_server_argv(
+        "fork-python",
+        ServerConfig(**base, extra_args=["--cuda-graph-max-bs-decode", "160"]),
+    )
+    assert argv[argv.index("--cuda-graph-max-bs-decode") + 1] == "160"
 
 
 def test_extract_expert_popularity_aggregates_logical_counts(tmp_path):
