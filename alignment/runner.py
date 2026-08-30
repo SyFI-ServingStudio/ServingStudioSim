@@ -359,6 +359,7 @@ def _finalize_profile(
                 cfg.server.chunk_size,
                 cfg.server.max_cudagraph_capture_size or 0,
             ),
+            dp_size=cfg.server.dp_size,
             records=records,
         )
         result = {

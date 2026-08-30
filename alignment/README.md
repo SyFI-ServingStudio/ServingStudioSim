@@ -200,8 +200,9 @@ The summary's `model` is a portable checkpoint identity: Hugging Face cache
 paths are recovered as `organization/name`, while other absolute paths use the
 model directory name. The raw expert-load JSONL retains the exact engine path.
 
-The raw JSONL retains every emitted record. The aggregate admits only records
-whose per-layer assignment count is within
+The raw JSONL retains every canonical record: for engines that repeat one
+scheduler event on every TP rank, that is TP0's copy in each DP group. The
+aggregate admits only records whose per-layer assignment count is within
 `max_tokens_per_step * reduction_group_size * experts_per_token`; this excludes
 an initial record that flushes accumulated server warmup work. The reduction
 population is distinct from expert sharding: vLLM's EPLB record is reduced over

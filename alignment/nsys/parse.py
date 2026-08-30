@@ -240,10 +240,9 @@ def load_metrics(path: Path | None) -> dict[tuple[int, int], dict]:
 def fold_rank_metrics(rows: list[dict], iteration_index: int) -> dict:
     """One replica batch shape out of the per-rank rows of ONE wall-clock step.
 
-    The rows must already be the ranks of the same step. Which rows those are is
-    not a question this function can answer: ranks number their own iterations
-    (see `align_ranges_into_steps`), so the answer comes from the measured
-    timeline, not from the index.
+    Rows must be unique by data-parallel rank. This function concatenates
+    independently scheduled batches; repeating one row per TP device would
+    multiply every token-proportional input by ``tp_size``.
     """
     adapters = {row.get("input_adapter") for row in rows}
     if len(adapters) > 1:
@@ -903,6 +902,37 @@ def partition_kernel_tracks(kernel_events: list[KernelEvent]) -> list[list[Kerne
     return [by_stream[stream] for stream in ordered_streams]
 
 
+def step_rows_by_dp_rank(
+    index_by_device: dict[int | None, int],
+    rank_metrics: dict[tuple[int, int], dict],
+    dp_rank_by_device: dict[int, int],
+) -> dict[int, dict]:
+    """Resolve one scheduler batch row per DP rank in a measured step.
+
+    Tensor-parallel devices share a scheduler batch, while distinct DP ranks
+    own independent batches that must be concatenated. All TP devices mapped to
+    one DP rank must therefore name the same local iteration.
+    """
+    rows_by_dp_rank: dict[int, dict] = {}
+    iteration_by_dp_rank: dict[int, int] = {}
+    for device_id, iteration in sorted(
+        (device, index) for device, index in index_by_device.items() if device is not None
+    ):
+        dp_rank = dp_rank_by_device.get(device_id)
+        if dp_rank is None:
+            continue
+        previous_iteration = iteration_by_dp_rank.get(dp_rank)
+        if previous_iteration is not None and previous_iteration != iteration:
+            raise ValueError(
+                f"dp_rank {dp_rank} maps to iterations {previous_iteration} and "
+                f"{iteration} in one measured step"
+            )
+        iteration_by_dp_rank[dp_rank] = iteration
+        if (dp_rank, iteration) in rank_metrics:
+            rows_by_dp_rank[dp_rank] = rank_metrics[(dp_rank, iteration)]
+    return rows_by_dp_rank
+
+
 def build_iteration_details(
     ranges: list[RangeStats],
     metrics: dict[int, dict],
@@ -941,13 +971,12 @@ def build_iteration_details(
             )
         )
         index_by_device = step.index_by_device
-        step_rows = [
-            rank_metrics[(dp_rank_by_device[device_id], iteration)]
-            for device_id, iteration in sorted(
-                ((device, index) for device, index in index_by_device.items() if device is not None)
-            )
-            if (dp_rank_by_device.get(device_id), iteration) in rank_metrics
-        ]
+        rows_by_dp_rank = step_rows_by_dp_rank(
+            index_by_device,
+            rank_metrics,
+            dp_rank_by_device,
+        )
+        step_rows = [rows_by_dp_rank[dp_rank] for dp_rank in sorted(rows_by_dp_rank)]
         metric = (
             fold_rank_metrics(step_rows, step.iteration)
             if step_rows
@@ -1043,15 +1072,7 @@ def build_iteration_details(
                 "jit_module_loads": sum(item.jit_module_loads for item in items),
                 "jit_stall_ns": sum(item.jit_stall_ns for item in items),
                 "metrics_by_dp_rank": {
-                    str(dp_rank_by_device[device_id]): rank_metrics[
-                        (dp_rank_by_device[device_id], iteration)
-                    ]
-                    for device_id, iteration in sorted(
-                        (device, index)
-                        for device, index in index_by_device.items()
-                        if device is not None
-                    )
-                    if (dp_rank_by_device.get(device_id), iteration) in rank_metrics
+                    str(dp_rank): row for dp_rank, row in sorted(rows_by_dp_rank.items())
                 },
                 "ranges": serialized_ranges,
             }

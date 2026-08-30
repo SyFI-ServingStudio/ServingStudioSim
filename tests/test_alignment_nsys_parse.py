@@ -792,6 +792,75 @@ def test_each_range_carries_its_own_index_and_its_own_ranks_metrics():
     assert detail["iteration_type"] == "mixed"
 
 
+def test_tensor_parallel_devices_state_one_shared_scheduler_batch():
+    ranges = [_window(device_id, 5, 0, 10) for device_id in range(4)]
+    rank_metrics = {
+        (0, 5): json.loads(_metrics_line(0, 5, prefill_tokens=2048, decode_kv_lens=[7]))
+    }
+    name_ids, _ = build_kernel_name_index(ranges)
+
+    (detail,) = build_iteration_details(
+        ranges,
+        {},
+        name_ids,
+        rank_metrics,
+        {0: 0, 1: 0, 2: 0, 3: 0},
+    )
+
+    assert detail["iteration_index_by_device"] == {"0": 5, "1": 5, "2": 5, "3": 5}
+    assert detail["metrics"]["prefill_tokens"] == 2048
+    assert detail["metrics"]["prefill_chunk_pairs"] == [[0, 2048]]
+    assert detail["metrics"]["decode_kv_lens"] == [7]
+    assert detail["metrics"]["dp_ranks"] == [0]
+    assert list(detail["metrics_by_dp_rank"]) == ["0"]
+
+
+def test_dp_batches_fold_once_each_even_when_each_has_multiple_tp_devices():
+    ranges = [_window(device_id, 5 if device_id < 2 else 3, 0, 10) for device_id in range(4)]
+    rank_metrics = {
+        (0, 5): json.loads(_metrics_line(0, 5, prefill_tokens=100, decode_kv_lens=[])),
+        (1, 3): json.loads(_metrics_line(1, 3, prefill_tokens=0, decode_kv_lens=[9, 11])),
+    }
+    name_ids, _ = build_kernel_name_index(ranges)
+
+    (detail,) = build_iteration_details(
+        ranges,
+        {},
+        name_ids,
+        rank_metrics,
+        {0: 0, 1: 0, 2: 1, 3: 1},
+    )
+
+    assert detail["metrics"]["prefill_tokens"] == 100
+    assert detail["metrics"]["decode_requests"] == 2
+    assert detail["metrics"]["decode_kv_lens"] == [9, 11]
+    assert detail["metrics"]["dp_ranks"] == [0, 1]
+    assert list(detail["metrics_by_dp_rank"]) == ["0", "1"]
+
+
+def test_one_dp_rank_cannot_name_two_iterations_in_one_measured_step():
+    from alignment.nsys.parse import step_rows_by_dp_rank
+
+    rank_metrics = {
+        (0, 5): {"iteration_index": 5},
+        (0, 6): {"iteration_index": 6},
+    }
+
+    with pytest.raises(ValueError, match="dp_rank 0 maps to iterations 5 and 6"):
+        step_rows_by_dp_rank({0: 5, 1: 6}, rank_metrics, {0: 0, 1: 0})
+
+
+def test_tp_iteration_disagreement_is_rejected_even_when_one_metric_row_is_missing():
+    from alignment.nsys.parse import step_rows_by_dp_rank
+
+    with pytest.raises(ValueError, match="dp_rank 0 maps to iterations 5 and 6"):
+        step_rows_by_dp_rank(
+            {0: 5, 1: 6},
+            {(0, 5): {"iteration_index": 5}},
+            {0: 0, 1: 0},
+        )
+
+
 def test_a_peer_step_with_no_reference_counterpart_is_counted_not_dropped():
     from alignment.nsys.parse import align_ranges_into_steps
 

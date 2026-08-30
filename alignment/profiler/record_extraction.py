@@ -107,6 +107,9 @@ def extract_metrics_jsonl(
     alone — is the identity of one measured batch shape. A `dp_size > 1` capture
     therefore *requires* the rank tag and fails without it, while a single
     EngineCore needs no prefix and lands on rank 0.
+
+    When an engine repeats scheduler records on every TP rank, its descriptor
+    selects one owner inside each DP group before identities are validated.
     """
     required = {
         "schema_version",
@@ -144,7 +147,12 @@ def extract_metrics_jsonl(
             m = _ALIGNMENT_ITERATION_RE.search(line)
             if not m:
                 continue
+            if not records.owns_scheduler_record(line):
+                continue
             row = json.loads(m.group(1))
+            missing = required - set(row)
+            if missing:
+                raise ValueError(f"alignment iteration record missing fields {sorted(missing)}")
             if records is VLLM_RECORDS and dp_size > 1:
                 iteration_index = int(row["iteration_index"])
                 observed_elapsed_ms = row.get("observed_elapsed_ms")
@@ -198,15 +206,19 @@ def extract_metrics_jsonl(
                 last_iteration_by_rank[dp_rank] = iteration_index
             else:
                 dp_rank = records.rank_of(line, dp_size=dp_size)
+                identity = (dp_rank, int(row["iteration_index"]))
+                if identity in seen_rank_iterations:
+                    raise ValueError(
+                        "duplicate alignment iteration record for "
+                        f"dp_rank={identity[0]} iteration={identity[1]}"
+                    )
+                seen_rank_iterations.add(identity)
             if row.get("dp_rank", dp_rank) != dp_rank:
                 raise ValueError(
                     f"alignment iteration record claims dp_rank {row['dp_rank']} but was "
-                    f"emitted by EngineCore_DP{dp_rank}"
+                    f"emitted by {records.rank_prefix_label} rank {dp_rank}"
                 )
             row["dp_rank"] = dp_rank
-            missing = required - set(row)
-            if missing:
-                raise ValueError(f"alignment iteration record missing fields {sorted(missing)}")
             if row["schema_version"] not in {1, 2} or row["input_adapter"] != records.adapter:
                 raise ValueError(
                     "unsupported alignment iteration record "
@@ -369,6 +381,8 @@ def extract_request_timings_jsonl(
         for line in log_lines:
             match = _ALIGNMENT_REQUEST_TIMING_RE.search(line)
             if not match:
+                continue
+            if not records.owns_scheduler_record(line):
                 continue
             row = json.loads(match.group(1))
             missing = required - set(row)
@@ -551,6 +565,7 @@ def extract_expert_popularity(
     expert_parallel_size: int | None = None,
     experts_per_token: int | None = None,
     reduction_group_size: int | None = None,
+    dp_size: int = 1,
     records: EngineRecords = VLLM_RECORDS,
 ) -> int:
     """Extract and aggregate rank-synchronized logical-expert token counts.
@@ -584,10 +599,13 @@ def extract_expert_popularity(
     expected_shape: tuple[int, int] | None = None
     expected_model: str | None = None
     aggregate_counts: list[list[int]] | None = None
+    seen_owner_steps: set[tuple[int, int]] = set()
     with Path(out_jsonl).open("w") as output_file:
         for line in Path(server_log).read_text(errors="replace").splitlines():
             match = _ALIGNMENT_EXPERT_LOAD_RE.search(line)
             if match is None:
+                continue
+            if not records.owns_scheduler_record(line):
                 continue
             record = json.loads(match.group(1))
             required = {
@@ -636,6 +654,15 @@ def extract_expert_popularity(
             eplb_step = record["eplb_step"]
             if isinstance(eplb_step, bool) or not isinstance(eplb_step, int) or eplb_step < 0:
                 raise ValueError("alignment expert-load eplb_step must be a nonnegative integer")
+            if records.scheduler_record_rank_re is not None:
+                dp_rank = records.rank_of(line, dp_size=dp_size)
+                identity = (dp_rank, eplb_step)
+                if identity in seen_owner_steps:
+                    raise ValueError(
+                        "duplicate alignment expert-load record for "
+                        f"dp_rank={dp_rank} eplb_step={eplb_step}"
+                    )
+                seen_owner_steps.add(identity)
             counts = record["logical_expert_counts"]
             if (
                 not isinstance(counts, list)

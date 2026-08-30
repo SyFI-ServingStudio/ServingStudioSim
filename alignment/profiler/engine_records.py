@@ -9,6 +9,12 @@ can only report the phases it actually has.
 So the parsers take an `EngineRecords` and stay otherwise identical. Adding an
 engine means adding a descriptor, not another copy of the extraction code.
 
+The descriptor also owns scheduler-record multiplicity. Some engines emit one
+copy per replica; others run one scheduler per tensor-parallel rank and repeat
+the same iteration, request completion, and reduced expert counts on every TP
+rank. The extractor must keep one owner per DP group or it multiplies scheduler
+evidence by ``tp_size``.
+
 The field sets are the interesting part. `API_CORE_DURATION_FIELDS` is the split
 every engine can produce -- prepare, wait for first output, receive span, tail --
 and is required of all of them. Everything else is one engine's internal
@@ -76,6 +82,9 @@ class EngineRecords:
     rank_prefix_re: re.Pattern | None
     #: How the prefix is spelled, for the error when a line is missing one.
     rank_prefix_label: str = "rank"
+    #: Captures the local rank among processes that repeat one scheduler event.
+    #: Rank 0 owns the canonical copy. ``None`` means records are already unique.
+    scheduler_record_rank_re: re.Pattern | None = None
     #: Unwraps the engine's request-id envelope back to the id the client sent.
     #: Tried in order; the first full match wins, otherwise the id is used as-is.
     request_id_unwrappers: tuple[re.Pattern, ...] = ()
@@ -125,6 +134,16 @@ class EngineRecords:
                 return matched.group(1)
         return request_id
 
+    def owns_scheduler_record(self, line: str) -> bool:
+        """Whether this emitter owns the one scheduler-side record to retain."""
+        if self.scheduler_record_rank_re is None:
+            return True
+        matched = self.scheduler_record_rank_re.match(line)
+        if matched is None or matched.group(1) is None:
+            # A tp_size=1 run writes no TP tag, so its sole scheduler owns it.
+            return True
+        return int(matched.group(1)) == 0
+
     def rank_of(self, line: str, *, dp_size: int) -> int:
         if self.rank_prefix_re is None:
             if dp_size > 1:
@@ -169,6 +188,9 @@ SGLANG_RECORDS = EngineRecords(
     # lands on rank 0 -- the same shape as vLLM's unnumbered `(EngineCore ...)`.
     rank_prefix_re=re.compile(r"^\[[^\]]*\sDP(\d+)\b[^\]]*\]"),
     rank_prefix_label="[... DP<k>]",
+    # SGLang prefixes scheduler processes with their rank inside each TP group.
+    # All ranks repeat the same scheduler records, so TP0 owns the retained copy.
+    scheduler_record_rank_re=re.compile(r"^\[[^\]]*\sTP(\d+)\b[^\]]*\]"),
     # SGLang passes the caller's request id through unwrapped.
     request_id_unwrappers=(),
     extra_api_duration_fields=frozenset(),

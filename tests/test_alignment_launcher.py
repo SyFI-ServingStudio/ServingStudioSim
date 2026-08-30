@@ -715,6 +715,107 @@ def test_expert_popularity_ceiling_uses_the_count_reduction_group(tmp_path):
     assert count == 1
 
 
+def test_sglang_tensor_parallel_expert_copies_are_not_multiplied(tmp_path):
+    record = {
+        "schema_version": 2,
+        "model": "moe/model",
+        "eplb_step": 1,
+        "expert_parallel_size": 1,
+        "experts_per_token": 2,
+        "logical_expert_counts": [[4, 4]],
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            f"[2026-08-11 16:18:16 TP{tp_rank}] INFO "
+            f"VibeSimAlignmentExpertLoad {json.dumps(record)}"
+            for tp_rank in range(4)
+        )
+    )
+    raw_path = tmp_path / "expert_load.jsonl"
+    summary_path = tmp_path / "expert_popularity.json"
+
+    count = record_extraction.extract_expert_popularity(
+        server_log,
+        raw_path,
+        summary_path,
+        records=engine_records.SGLANG_RECORDS,
+        expert_parallel_size=1,
+        reduction_group_size=4,
+        max_tokens_per_step=1,
+    )
+
+    assert count == 1
+    assert len(raw_path.read_text().splitlines()) == 1
+    assert json.loads(summary_path.read_text())["counts_by_layer"] == [[4, 4]]
+
+
+def test_sglang_expert_records_keep_one_owner_per_dp_group(tmp_path):
+    records = [
+        {
+            "schema_version": 2,
+            "model": "moe/model",
+            "eplb_step": 1,
+            "expert_parallel_size": 1,
+            "experts_per_token": 2,
+            "logical_expert_counts": [counts],
+        }
+        for counts in ([2, 2], [3, 1])
+    ]
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            f"[2026-08-11 16:18:16 DP{dp_rank} TP{tp_rank}] INFO "
+            f"VibeSimAlignmentExpertLoad {json.dumps(records[dp_rank])}"
+            for dp_rank in range(2)
+            for tp_rank in range(2)
+        )
+    )
+    raw_path = tmp_path / "expert_load.jsonl"
+    summary_path = tmp_path / "expert_popularity.json"
+
+    count = record_extraction.extract_expert_popularity(
+        server_log,
+        raw_path,
+        summary_path,
+        records=engine_records.SGLANG_RECORDS,
+        expert_parallel_size=1,
+        reduction_group_size=2,
+        max_tokens_per_step=1,
+        dp_size=2,
+    )
+
+    assert count == 2
+    assert len(raw_path.read_text().splitlines()) == 2
+    assert json.loads(summary_path.read_text())["counts_by_layer"] == [[5, 3]]
+
+
+def test_sglang_duplicate_expert_record_from_one_dp_owner_is_rejected(tmp_path):
+    record = {
+        "schema_version": 2,
+        "model": "moe/model",
+        "eplb_step": 1,
+        "expert_parallel_size": 1,
+        "experts_per_token": 2,
+        "logical_expert_counts": [[2, 2]],
+    }
+    line = f"[2026-08-11 16:18:16 DP0 TP0] INFO VibeSimAlignmentExpertLoad {json.dumps(record)}"
+    server_log = tmp_path / "server.log"
+    server_log.write_text(f"{line}\n{line}\n")
+
+    with pytest.raises(ValueError, match="duplicate alignment expert-load record"):
+        record_extraction.extract_expert_popularity(
+            server_log,
+            tmp_path / "expert_load.jsonl",
+            tmp_path / "expert_popularity.json",
+            records=engine_records.SGLANG_RECORDS,
+            expert_parallel_size=1,
+            reduction_group_size=2,
+            max_tokens_per_step=1,
+            dp_size=2,
+        )
+
+
 def test_engines_state_their_expert_count_reduction_population():
     args = {"tensor_parallel_size": 4, "expert_parallel_size": 1}
 

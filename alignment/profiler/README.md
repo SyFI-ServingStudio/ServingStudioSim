@@ -261,11 +261,13 @@ The resulting summary follows
 `counts_by_layer[layer][logical_expert]` is authoritative, while EP degree,
 top-k, aggregation scope, and the simulator's rank-major logical partition are
 explicit provenance rather than implicit loader assumptions.
-The raw expert-load JSONL preserves every emitted EPLB record. The aggregate
-uses the configured maximum scheduler/CUDA-graph token count as a conservation
-ceiling and excludes oversized records that flush work accumulated before the
-replay. `aggregation` records the ceiling, raw and accepted counts, and every
-discarded EPLB step.
+The raw expert-load JSONL preserves every canonical EPLB record. When an engine
+repeats scheduler evidence on every TP rank, only TP0's copy in each DP group
+is canonical; repeated owner records are rejected. The aggregate uses the
+configured maximum scheduler/CUDA-graph token count as a conservation ceiling
+and excludes oversized records that flush work accumulated before the replay.
+`aggregation` records the ceiling, raw and accepted counts, and every discarded
+EPLB step.
 
 For long multi-GPU workloads, set `nsys.capture_duration_seconds` with
 `capture_mode: cuda_profiler_api`. The launcher stops CUPTI at that deadline but
