@@ -116,6 +116,22 @@ def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> N
             server_argv.append(argument)
 
 
+def _preflight_capture_environment(
+    driver,
+    fork_python: str | None,
+    env: dict[str, str],
+    *,
+    profile_kind: str,
+    resume: bool,
+) -> None:
+    """Validate dependencies only when a new NSYS capture will be launched."""
+    if profile_kind != "nsys" or resume:
+        return
+    if fork_python is None:
+        raise ValueError("a new NSYS capture requires a serving-engine Python")
+    driver.validate_nsys_capture_environment(fork_python, env=env, cwd=REPO_ROOT)
+
+
 def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     """Run one explicit measured pass: NSYS, workload timing, or popularity.
 
@@ -169,6 +185,13 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         # and NSYS are disabled so its deliberate EPLB all-reduce/D2H logging
         # overhead cannot be confused with the timing pass.
         env.update(driver.TIMING_INSTRUMENTATION_OFF_ENV)
+    _preflight_capture_environment(
+        driver,
+        fork_python,
+        env,
+        profile_kind=cfg.profile_kind,
+        resume=resume,
+    )
     # Only the timing pass runs under NSYS. The other passes launch the same
     # server argv bare so profiler lifecycle work cannot enter their evidence.
     out_rep = nsys_dir / cfg.name

@@ -483,6 +483,74 @@ def test_profile_server_env_drops_inherited_vllm_api_key(tmp_path, monkeypatch):
     assert server_env["PATH"] == f"{fork_python.parent}:/ambient/bin"
 
 
+def test_sglang_nsys_preflight_rejects_a_venv_without_nvtx(tmp_path):
+    fork_python = tmp_path / "python"
+    fork_python.write_text("#!/bin/sh\necho missing-nvtx >&2\nexit 1\n")
+    fork_python.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="cannot import `nvtx`") as error:
+        sglang_server.validate_nsys_capture_environment(
+            str(fork_python), env={"PATH": "/usr/bin"}, cwd=tmp_path
+        )
+
+    assert "missing-nvtx" in str(error.value)
+    assert "uv pip install" in str(error.value)
+
+
+def test_sglang_nsys_preflight_uses_the_server_environment(tmp_path, monkeypatch):
+    server_env = {"PATH": "/server/venv/bin", "LD_LIBRARY_PATH": "/server/libs"}
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(argv=argv, **kwargs)
+        return sglang_server.subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sglang_server.subprocess, "run", fake_run)
+    sglang_server.validate_nsys_capture_environment(
+        "/server/venv/bin/python",
+        env=server_env,
+        cwd=tmp_path,
+    )
+
+    assert seen["env"] is server_env
+    assert seen["cwd"] == tmp_path
+    assert seen["timeout"] == 30
+
+
+def test_nsys_preflight_is_scoped_to_new_captures():
+    calls = []
+
+    class Driver:
+        @staticmethod
+        def validate_nsys_capture_environment(fork_python, *, env, cwd):
+            calls.append((fork_python, env, cwd))
+
+    for profile_kind, resume in (
+        ("workload_metrics", False),
+        ("expert_popularity", False),
+        ("nsys", True),
+    ):
+        alignment_runner._preflight_capture_environment(
+            Driver,
+            None if resume else "fork-python",
+            {},
+            profile_kind=profile_kind,
+            resume=resume,
+        )
+    assert calls == []
+
+    alignment_runner._preflight_capture_environment(
+        Driver,
+        "fork-python",
+        {"sentinel": "server-env"},
+        profile_kind="nsys",
+        resume=False,
+    )
+    assert calls == [
+        ("fork-python", {"sentinel": "server-env"}, alignment_runner.REPO_ROOT)
+    ]
+
+
 def test_profile_server_argv_enables_prompt_token_details_once():
     server_config = vllm_server.ServerConfig(
         model_path="model",

@@ -74,6 +74,38 @@ NSYS_CAPTURE_SERVER_ARGS: tuple[str, ...] = ()
 TIMING_INSTRUMENTATION_OFF_ENV = {"SGLANG_ENABLE_NVTX_SCHEDULER": "0"}
 
 
+def validate_nsys_capture_environment(
+    fork_python: str,
+    *,
+    env: dict[str, str],
+    cwd: Path,
+) -> None:
+    """Require the optional package that emits SGLang's iteration ranges.
+
+    SGLang only warns when ``nvtx`` is unavailable and then continues serving.
+    An NSYS run would therefore finish with millions of kernels but no
+    ``sglang_iteration(N): forward`` ranges to attribute them to. Refuse that
+    expensive unusable capture before launching the server.
+    """
+    probe = subprocess.run(
+        [fork_python, "-c", "import nvtx"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=cwd,
+        timeout=30,
+    )
+    if probe.returncode != 0:
+        detail = probe.stderr.strip() or probe.stdout.strip() or "import failed"
+        raise RuntimeError(
+            f"the SGLang fork venv cannot import `nvtx`: {fork_python}\n"
+            "SGLang would serve without iteration markers, leaving captured "
+            "kernels unattributed. Install it with:\n"
+            f"  uv pip install --python {fork_python} nvtx\n"
+            f"Import error: {detail}"
+        )
+
+
 def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
     """The `python -m sglang.launch_server ...` argv."""
     argv = [

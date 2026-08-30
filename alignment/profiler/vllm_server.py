@@ -49,6 +49,16 @@ NSYS_CAPTURE_SERVER_ARGS: tuple[str, ...] = ()
 # timing records, so a pass launched with it produces neither.
 TIMING_INSTRUMENTATION_OFF_ENV = {"VLLM_NVTX_SCOPES_FOR_PROFILING": "0"}
 
+
+def validate_nsys_capture_environment(
+    _fork_python: str,
+    *,
+    env: dict[str, str],
+    cwd: Path,
+) -> None:
+    """vLLM's instrumented fork has no optional NSYS marker dependency."""
+
+
 # vLLM's parallel-state banner, emitted once per worker process at startup. It
 # is the only place the worker pid ↔ global rank identity is stated; nsys knows
 # pid ↔ CUDA device, so the two together give rank ↔ device.
