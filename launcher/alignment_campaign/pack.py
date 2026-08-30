@@ -173,9 +173,8 @@ class Case:
     capture_seconds: float
     device_role: str
     #: `[start, end]` over the per-worker forward index that kernel alignment
-    #: analyzes, when the profiler's default window is wrong for this workload.
-    #: `None` keeps the default. Case 02 needs it: its subject is the small-batch
-    #: and CUDA-graph boundary region, which the default window starts after.
+    #: analyzes when a stable numbered excerpt, rather than the full capture,
+    #: is the intended evidence population. `None` keeps the whole capture.
     analyze_iterations: tuple[int, int] | None
     workload_trace: TraceSpec
     kernel_trace: TraceSpec | None

@@ -85,9 +85,11 @@ class NsysConfig:
     # Exact NVTX range whose push starts the capture. Stock vLLM commonly uses
     # "gpu_model_runner: forward"; indexed fork ranges can be supplied directly.
     nvtx_trigger: str = "gpu_model_runner: forward"
-    # Analysis window [start, end] over the (sequential, per-worker) forward index.
-    analyze_iteration_start: int = 24
-    analyze_iteration_end: int = 48
+    # Analysis window [start, end] over the (sequential, per-worker) forward
+    # index. Open bounds analyze the entire capture; set them only when an
+    # intentional numbered excerpt is wanted.
+    analyze_iteration_start: int | None = None
+    analyze_iteration_end: int | None = None
     # Stop CUPTI after a bounded serving window while the replay continues.
     # Long graph-node captures can perturb or deadlock multi-rank collectives;
     # request TTFT/TPOT logging remains active after capture stops.
@@ -116,6 +118,15 @@ class NsysConfig:
                 raise ValueError("nsys.capture_duration_seconds must be positive")
         if self.cuda_flush_interval_ms is not None and self.cuda_flush_interval_ms <= 0:
             raise ValueError("nsys.cuda_flush_interval_ms must be positive")
+        if (
+            self.analyze_iteration_start is not None
+            and self.analyze_iteration_end is not None
+            and self.analyze_iteration_start > self.analyze_iteration_end
+        ):
+            raise ValueError(
+                "nsys.analyze_iteration_start must not exceed analyze_iteration_end; "
+                "omit both to analyze the whole capture"
+            )
 
 
 @dataclass

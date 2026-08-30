@@ -375,7 +375,9 @@ def worker_for_global_tid(workers_by_gtid: dict[int, Worker], global_tid: int) -
 
 
 def window_rows_by_reference_rank(
-    parsed_rows: list[list], iteration_start: int, iteration_end: int
+    parsed_rows: list[list],
+    iteration_start: int | None,
+    iteration_end: int | None,
 ) -> list[list]:
     """Keep the reference rank's numbered window, and its peers by overlap.
 
@@ -383,15 +385,22 @@ def window_rows_by_reference_rank(
     reference rank is the lowest device id present — the same choice
     `align_ranges_into_steps` makes, so the two agree on whose clock the capture
     is described in.
+
+    A ``None`` bound is open. Capture duration already defines the measured
+    window, so the default analysis keeps all of that evidence.
     """
+
+    def in_window(iteration: int) -> bool:
+        return (iteration_start is None or iteration >= iteration_start) and (
+            iteration_end is None or iteration <= iteration_end
+        )
+
     devices = {row[2].device_id for row in parsed_rows if row[2].device_id is not None}
     if not devices:
-        return [row for row in parsed_rows if iteration_start <= row[0] <= iteration_end]
+        return [row for row in parsed_rows if in_window(row[0])]
     reference_device_id = min(devices)
     reference_rows = [
-        row
-        for row in parsed_rows
-        if row[2].device_id == reference_device_id and iteration_start <= row[0] <= iteration_end
+        row for row in parsed_rows if row[2].device_id == reference_device_id and in_window(row[0])
     ]
     if not reference_rows:
         return []
@@ -414,12 +423,15 @@ def load_ranges(
     con: sqlite3.Connection,
     workers_by_gtid: dict[int, Worker],
     metrics: dict[int, dict],
-    iteration_start: int,
-    iteration_end: int,
+    iteration_start: int | None,
+    iteration_end: int | None,
     range_mode: str,
     default_stage: str = "all",
 ) -> list[RangeStats]:
-    """Extract the NVTX iteration ranges of the window `[iteration_start, iteration_end]`.
+    """Extract the NVTX iteration ranges of the requested iteration window.
+
+    Either bound may be open; both are open by default to analyze the complete
+    capture.
 
     Only inline, indexed `vllm_iteration(N): <phase>` and
     `sglang_iteration(N): <phase>` markers are valid inputs. A trace without
@@ -1356,8 +1368,8 @@ def parse_host_timeline(sqlite_path: Path, window_start_ns: int, window_end_ns: 
 def parse_trace(
     sqlite_path: Path,
     metrics_jsonl: Path | None,
-    iteration_start: int,
-    iteration_end: int,
+    iteration_start: int | None = None,
+    iteration_end: int | None = None,
     *,
     range_mode: str = "phases",
     default_stage: str = "all",
@@ -1383,6 +1395,12 @@ def parse_trace(
     the capture actually shows — a mapping that does not cover them describes a
     different run.
     """
+    if (
+        iteration_start is not None
+        and iteration_end is not None
+        and iteration_start > iteration_end
+    ):
+        raise ValueError("iteration_start must not exceed iteration_end")
     con = sqlite3.connect(str(sqlite_path))
     try:
         ensure_query_indexes(con)
@@ -1492,8 +1510,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Parse nsys sqlite → per-op busy time")
     parser.add_argument("--sqlite", type=Path, required=True, help="Exported nsys SQLite database")
     parser.add_argument("--metrics", type=Path, default=None, help="vLLM iteration metrics JSONL")
-    parser.add_argument("--iteration-start", type=int, required=True)
-    parser.add_argument("--iteration-end", type=int, required=True)
+    parser.add_argument(
+        "--iteration-start",
+        type=int,
+        default=None,
+        help="first reference-rank iteration (default: start of capture)",
+    )
+    parser.add_argument(
+        "--iteration-end",
+        type=int,
+        default=None,
+        help="last reference-rank iteration (default: end of capture)",
+    )
     parser.add_argument("--range-mode", choices=["forward", "envelope", "phases"], default="phases")
     parser.add_argument(
         "--default-stage",

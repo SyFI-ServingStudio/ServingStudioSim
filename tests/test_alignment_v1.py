@@ -134,6 +134,18 @@ def test_nsys_cuda_flush_interval_must_be_positive():
         NsysConfig(cuda_flush_interval_ms=0).validate()
 
 
+def test_nsys_analysis_defaults_to_the_whole_capture_and_validates_excerpts():
+    config = NsysConfig()
+    assert config.analyze_iteration_start is None
+    assert config.analyze_iteration_end is None
+    config.validate()
+    NsysConfig(analyze_iteration_start=24).validate()
+    NsysConfig(analyze_iteration_end=48).validate()
+
+    with pytest.raises(ValueError, match="must not exceed"):
+        NsysConfig(analyze_iteration_start=49, analyze_iteration_end=48).validate()
+
+
 def test_structured_vllm_iteration_record_is_the_only_metrics_contract(tmp_path):
     record = {
         "schema_version": 1,

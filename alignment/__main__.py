@@ -1,7 +1,7 @@
 """Alignment-local artifact utilities — `python -m alignment <command>`.
 
     python -m alignment parse   --sqlite T.sqlite --metrics M.jsonl \
-                                --iteration-start N --iteration-end M
+                                [--iteration-start N --iteration-end M]
     python -m alignment overlap --sqlite T.sqlite --metrics M.jsonl \
                                 --iteration-start N --iteration-end M
     python -m alignment ranges  T.sqlite --range-prefix framework.phase.
