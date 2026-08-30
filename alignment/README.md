@@ -438,6 +438,26 @@ uv run python -m alignment parse --sqlite capture.sqlite --metrics metrics.jsonl
   --iteration-start 24 --iteration-end 48 --output parsed.json
 ```
 
+For concurrency diagnosis, parse only a bounded iteration window directly from
+the SQLite export and decompose raw kernel residency into same-stream PDL
+evidence, multi-stream overlap, and the exposed device busy union:
+
+```bash
+uv run python -m alignment overlap --sqlite capture.sqlite --metrics metrics.jsonl \
+  --iteration-start 5354 --iteration-end 5354 --tp-size 4 --device 0 \
+  --output overlap_diagnostics.json
+```
+
+The report includes overall, per-stage and per-iteration/device totals plus the
+top 50 PDL kernel pairs (`--top-pairs 0` retains all). Every duplicate same-stream
+nanosecond is attributed once, so the complete pair attribution sums exactly to
+the same-stream reduction and `raw = busy_union + PDL + multistream` has a zero
+residual. The checks state both returned and omitted pair totals when the display
+is truncated. These are trace-union reductions, not predicted savings: a PDL
+consumer can be resident while waiting in `griddepcontrol.wait`. Reclaimable time
+requires an otherwise-identical PDL on/off measurement; do not copy these
+reductions into the CostTree as discounts.
+
 The duty-cycle correction is derived by the analyzer's kernel-align pass, not a
 standalone command. It pools `Σ measured_gpu_cycle_ms / Σ measured_busy_union_ms` over
 iterations that have a next-iteration GPU cycle (a GPU cycle is one iteration's
