@@ -467,6 +467,59 @@ compile actually costs (the load call itself is microseconds and the Python
 compilation before it appears in no CUDA API row). It explains an exclusion; it
 never makes one.
 
+## Campaigns: one phase across many cases
+
+A single alignment run is one workload. Validating a model means running a
+*matrix* of them — enough operating points that a passing aggregate cannot hide a
+broken regime. `launcher alignment-campaign` is the layer above the five phase
+commands that drives such a matrix. It generates no evidence of its own: every
+phase it invokes is one of the commands above, unchanged.
+
+```bash
+uv run python -m launcher alignment-campaign check   --pack presets/alignment/<pack>
+uv run python -m launcher alignment-campaign render  --pack <> --host <> --out-root <>
+uv run python -m launcher alignment-campaign run     --pack <> --out-root <> --phase <P>
+uv run python -m launcher alignment-campaign label   --pack <> --run-dir <>
+uv run python -m launcher alignment-campaign extract [--pack <>] --runs <dirs> --out <>
+uv run python -m launcher alignment-campaign compare [--pack <>] --measured <>
+```
+
+**The batch axis is one phase across N cases, never one case across N phases.**
+`run` takes `--phase P` and there is no `--all`. This is the same invariant as
+"no phase implicitly launches the next one", read at matrix scale: fanning a
+single phase out over fifteen cases automates keystrokes, while chaining phases
+would remove the inspection point between them. Each case×phase carries its own
+`.complete` marker, so a failure in labeling or analysis never costs a repeat of
+the expensive capture that preceded it; re-running a completed phase requires an
+explicit `--refresh`.
+
+`--phase` names the artifact directory, and the four names below are fixed while
+the profile passes come from the pack's `variants.<v>.profile_passes[].name` — a
+model needing one pass, or three, adds no enum anywhere:
+
+| `--phase` | config | artifacts | underlying command |
+|---|---|---|---|
+| *(per profile pass)* | `<name>.yaml` | `<name>/` | `alignment profile` |
+| `timing_predict` | `timing_predict.yaml` | `timing_predict/` | `alignment timing-predict` |
+| `analysis_kernel` | `analyze_kernel.yaml` | `analysis_kernel/` | `alignment analyze` |
+| `simulation` | `simulation.yaml` | `simulation/` | `alignment sim --gpu-time-multiplier-from …/analysis_kernel` |
+| `analysis_e2e` | `analyze_e2e.yaml` | `analysis_e2e/` | `alignment analyze` |
+
+A **pack** is the matrix as data: `campaign.yaml` (cases and topology variants),
+`acceptance.yaml` (tolerances, each exception carrying a written rationale),
+`traces/`, `label_rules/`, and any measured routing input. Packs live in
+`presets/alignment/<pack>/` because they are run inputs, not test data. Anything
+that is true of a machine rather than of a workload — checkpoint snapshot, nsys
+path, device roles, corpus — lives in `presets/alignment/hosts/*.yaml`, so the
+same pack renders on a second box by swapping one file. See
+`launcher/alignment_campaign/README.md` for the schemas.
+
+Metric *formulas* belong to the engine (`launcher/alignment_campaign/metrics.py`,
+branched by report `schema_version`) and metric *tolerances* belong to the pack.
+`extract` therefore works without a pack at all: point `--runs` at a one-off run
+directory to read its numbers by the same formulas. `--pack` adds the tolerance
+policy, the recorded baseline, and `compare --record`.
+
 ## Current boundary
 
 - one direct `deployment: unified` simulation target;

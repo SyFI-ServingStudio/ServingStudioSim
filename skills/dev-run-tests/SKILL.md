@@ -84,6 +84,42 @@ validation step: it runs the sim several times and warns on >10% drift of the
 `tests/fixtures/gen_throughput_trace.py` invalidates it (re-record). The worked
 example is `tests/test_throughput_regression.py`.
 
+### Alignment goldens: recorded by the launcher, not by pytest
+
+`tests/golden/alignment_<pack>/<gpu_name>.json` has the same shape as the store
+above (flat `{key: float}`, keys `<variant>/<case>@<metric>`), but **`pytest
+--update-golden` does not write it.** Its values come from a completed GPU
+alignment matrix, which no test can run, so the recorder is the launcher:
+
+```bash
+uv run python -m launcher alignment-campaign extract \
+  --pack presets/alignment/<pack> --runs <case_root>[:<case_root>] --out /tmp/metrics.json
+uv run python -m launcher alignment-campaign compare \
+  --pack presets/alignment/<pack> --measured /tmp/metrics.json --record
+# or: just alignment-record <pack> out=/tmp/metrics.json
+```
+
+Both paths share one storage implementation (`launcher/golden.py`), which is why
+a production command writes under `tests/` — a second store would drift from the
+first.
+
+`--record` refuses to write when any case is unavailable, when the reports'
+`schema_version` disagrees with the pack's declared `analyzer_schema`, or when a
+recorded case depends on a `provisional` calibrated input. That last one is
+overridable with `--accept-provisional`, and the provisional field names are then
+written into the `.provenance.json` sidecar next to the golden, so a baseline can
+never quietly depend on an uncalibrated value.
+
+Tolerances are **not** in the golden store. Re-recording measured values is
+routine; moving the standard they are judged against belongs in a reviewed edit
+to the pack's `acceptance.yaml`. Sharing one store would let `--record` change
+the goalposts along with the numbers.
+
+The CPU-tier `tests/test_alignment_campaign.py` guards the *inputs* to that
+recording — pack structure, byte-identical trace regeneration, tolerance
+coverage, and that every golden key still names a live variant×case×metric, so a
+rename surfaces as a zombie key rather than a silently orphaned number.
+
 ## Adding a tiered test
 
 First state the observable behavior and the real defect the test prevents. Keep

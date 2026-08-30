@@ -61,3 +61,25 @@ test-all: test-cpu test-gpu
 # (Re)record per-GPU goldens for throughput + sim-speed on this device.
 update-golden: sync
     uv run --no-sync pytest -m "gpu or bench" --update-golden
+
+# ── alignment campaigns (skill: operate-run-alignment) ───────────────────────
+# The campaign layer drives the five alignment phases across a whole case matrix.
+# `check` is pure CPU and is also what `just test-cpu` runs; the rest are the
+# daily commands. `run` is deliberately absent here: it takes a --phase and a
+# --out-root that only the operator knows, and there is no --all.
+
+# Validate every pack under presets/alignment/ (no GPU, no build). Pass extra
+# flags through, e.g. `just alignment-check --pack presets/alignment/<name>`.
+alignment-check *flags:
+    uv run --no-sync python -m launcher alignment-campaign check {{flags}}
+
+# Read a completed campaign's Analyzer reports into a metrics document, then
+# judge it against the pack's tolerances. `runs` is colon-separated.
+alignment-compare pack runs out="/tmp/alignment_metrics.json":
+    uv run --no-sync python -m launcher alignment-campaign extract --pack {{pack}} --runs {{runs}} --out {{out}}
+    uv run --no-sync python -m launcher alignment-campaign compare --pack {{pack}} --measured {{out}}
+
+# Accept the current numbers as the new baseline. Review the compare output
+# first: this is the only writer of tests/golden/alignment_<pack>/.
+alignment-record pack out="/tmp/alignment_metrics.json" *flags:
+    uv run --no-sync python -m launcher alignment-campaign compare --pack {{pack}} --measured {{out}} --record {{flags}}

@@ -20,15 +20,14 @@ Run under ``uv`` so torch / the venv interpreter resolve (see
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import sys
 from pathlib import Path
 
 import pytest
 
 from launcher.exec import binary_path
+from launcher.golden import GOLDEN_ROOT, Golden
 
 #: Intra-op threads the CPU reference kernels are allowed. Torch otherwise sizes
 #: its pool from the core count, and on a many-core host the fan-out/join cost
@@ -64,7 +63,11 @@ _TIER_MARKERS = {
     "bench": "perf/timing, non-deterministic (opt-in: -m bench)",
 }
 
-GOLDEN_ROOT = Path(__file__).resolve().parent / "golden"
+# `GOLDEN_ROOT` / `Golden` are imported from `launcher.golden` (re-exported here
+# for tests that read the store directly): `alignment-campaign compare --record`
+# writes the same files from a production command, so the storage implementation
+# is shared rather than duplicated on either side.
+assert GOLDEN_ROOT == Path(__file__).resolve().parent / "golden"
 
 
 # ── registration + CLI options ───────────────────────────────────────────────
@@ -147,32 +150,6 @@ def sim_bin() -> Path:
     if not path.is_file():
         pytest.skip("release simulator not built")
     return path
-
-
-class Golden:
-    """Per-GPU golden file (`tests/golden/<metric>/<gpu_name>.json`). Reader by
-    default; under `--update-golden` it records and persists. The test owns the
-    skip/assert/record policy so the store stays metric-agnostic."""
-
-    def __init__(self, metric: str, gpu_name: str, update: bool) -> None:
-        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", gpu_name)
-        self.path = GOLDEN_ROOT / metric / f"{safe}.json"
-        self.gpu_name = gpu_name
-        self.update_enabled = update
-        self.data: dict[str, float] = (
-            json.loads(self.path.read_text()) if self.path.is_file() else {}
-        )
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.data
-
-    def get(self, key: str) -> float | None:
-        return self.data.get(key)
-
-    def record(self, key: str, value: float) -> None:
-        self.data[key] = value
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n")
 
 
 @pytest.fixture

@@ -75,6 +75,30 @@ attribution. Respect real resource conflicts, such as a bounded GPU pool or an
 exclusive launcher lease, but let the repository's resource manager schedule
 those constraints instead of serializing the whole campaign in advance.
 
+**Do not hand-drive a multi-case matrix, and do not write a generator script for
+one.** `launcher alignment-campaign` already implements the paragraph above:
+declare the matrix in a pack under `presets/alignment/<pack>/`, then
+
+```bash
+uv run python -m launcher alignment-campaign check  --pack <pack>
+uv run python -m launcher alignment-campaign render --pack <pack> --host <host> --out-root <root>
+uv run python -m launcher alignment-campaign run    --pack <pack> --out-root <root> --phase <P>
+```
+
+One `run` invocation is **one phase across every ready case**, scheduled through
+the repository's resource manager, with each case's exit status journaled
+separately. Completed case×phase pairs are skipped, so a labeling or analysis
+failure never costs a repeated capture; `--refresh` re-runs one deliberately.
+Preview the plan and each excluded case's reason with `--dry-run`.
+
+There is no `--all` and you must not build one. The batch axis is one phase over
+many cases; chaining phases would delete the explicit checkpoint between them.
+Advance the pipeline by issuing the next `--phase` yourself after inspecting the
+previous one, exactly as for a single case.
+
+`launcher/alignment_campaign/README.md` owns the pack schema. Reach for the
+single-config path below when there is one workload and no matrix.
+
 1. **Profile** — instrumented vLLM or SGLang. Preflight the GPU, port, NSYS,
    model cache, and fork venv (`fork_python` must import `torch` and the
    selected engine).
@@ -136,6 +160,22 @@ those constraints instead of serializing the whole campaign in advance.
    layer boundary and one-off model boundary need different labels. It preserves
    the same kernel-align entry point while making each occurrence addressable as
    `literal-v1`; use `before_name` to state the distinguishing successor.
+
+   With a pack, `alignment-campaign label --pack <pack> --run-dir <case>` does
+   the initialize-apply-check loop against the pack's stored rules. It applies
+   them until the label **state** stops changing rather than a fixed number of
+   passes — `apply_rules` counts an overwrite as applied even when the label is
+   unchanged, so a fired-count loop would never terminate. Read the reported
+   `unfired` rules: one that matches nothing in any case is dead weight from an
+   older inventory.
+
+   The rules are a set, not a sequence: every file the manifest names is loaded
+   and the union applied, so no label may depend on which rule is tried first.
+   When you add a rule, narrow its matchers until nothing else claims the same
+   positions — do not rely on placing it before or after another rule.
+   `subsumptions` (in `check`) proves an order-dependent pair from the rule text
+   alone; `disagreements` (here, at the fixpoint) catches the overlaps it cannot
+   prove but a real capture exhibits.
 
    Run `analyze` with only `iteration.enabled` (the kernel-align config, no
    `simulation_log_dir`). The strict analyzer expands the folded inventory
@@ -374,6 +414,21 @@ model-level suffix work, not just the repeated body; coverage keeps both unmappe
 measured kernels and unmapped simulated slots; at least one prefill/mixed and one
 decode plot are visually checked for phase boundaries and operation arrows; and
 E2E pairing has no unexplained missing requests.
+
+`alignment-campaign extract` enforces the mechanizable half of that list and
+refuses to emit metrics for a case that fails it, so run it before reporting.
+It also reads every number below out of the reports by a fixed formula table —
+**never transcribe a metric by hand**, in a report or a results table. `--pack`
+is optional here: `--runs <one-off run dir>` works with no pack at all.
+
+```bash
+uv run python -m launcher alignment-campaign extract --runs <dir> --out /tmp/metrics.json
+uv run python -m launcher alignment-campaign compare --measured /tmp/metrics.json
+```
+
+With `--pack`, `compare` additionally judges each metric against that pack's
+declared tolerances (non-zero exit on FAIL) and warns on drift from the recorded
+golden; `--markdown` writes the human-readable matrix.
 
 Report the experiment dir, exact commands, request/iteration counts, captured
 phases, mapping coverage, total iteration error, E2E latency/throughput error,

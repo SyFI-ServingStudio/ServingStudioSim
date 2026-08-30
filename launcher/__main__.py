@@ -6,6 +6,7 @@ Modes:
     python -m launcher timing-predict CONFIG.{yaml,yml,json} [MORE_CONFIGS ...]
     python -m launcher kernel-profile {list,query,count-missing,run,measure,merge-db} ...
     python -m launcher alignment {sim,profile,timing-predict,analyze} ...
+    python -m launcher alignment-campaign {check,render,run,label,extract,compare} ...
     python -m launcher list-params [--human] [--build-type PROFILE]
 
 The default mode runs or sweeps deployment simulations. Its run options also
@@ -429,6 +430,15 @@ def main(argv: list[str] | None = None) -> int:
             argv[1:],
             prog="python -m launcher kernel-profile",
         )
+
+    # `alignment-campaign` drives the stages `alignment` runs — it renders case
+    # directories, fans ONE phase across them, and reads the resulting reports.
+    # Top-level rather than nested under `alignment`, whose parser owns "one
+    # explicit stage"; see `launcher/alignment_campaign/cli.py`.
+    if argv and argv[0] == "alignment-campaign":
+        from .alignment_campaign import main as run_alignment_campaign
+
+        return run_alignment_campaign(argv[1:])
 
     if argv and argv[0] == "migrate-artifact-kinds":
         from .migrate_artifact_kinds import main as migrate_artifact_kinds

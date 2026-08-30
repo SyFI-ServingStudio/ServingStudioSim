@@ -12,3 +12,13 @@ experiment trees remain untracked.
 
 The figures were copied without modification from
 `logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/`.
+
+`alignment_matrix.md` holds the full fifteen-case table those figures are drawn
+from. It is generated, not transcribed — regenerate it with:
+
+```bash
+uv run python -m launcher alignment-campaign extract \
+  --pack presets/alignment/glm52_nvfp4_b200 --runs <case_roots> --out /tmp/metrics.json
+uv run python -m launcher alignment-campaign compare \
+  --pack presets/alignment/glm52_nvfp4_b200 --measured /tmp/metrics.json --markdown
+```

@@ -1,0 +1,46 @@
+# GLM-5.2 NVFP4 on one four-GPU B200 NVLink domain, driven by the 100-request
+# diverse workload instead of a single shape. Same deployment as
+# glm52_nvfp4_b200_ep4.yaml; the context limit and the KV budget are what differ,
+# and both follow from the trace.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/diverse_100.csv
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  session_dependency: independent
+  run_to_end: true
+
+io:
+  log_dir: logs/glm52_nvfp4_b200_ep4_diverse
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: glm52_vllm_nvfp4_dsa_moe
+          model_config: model/config/glm52_nvfp4.json
+          fp8: false
+          ep_size: 4
+          nvl_num_gpu: 4
+          # The trace's largest request is 131,071 tokens of context, which is
+          # what this limit is sized to admit.
+          max_model_len: 131072
+          routing: uniform
+          mtp_mode: "off"
+        worker:
+          type: hp_unified
+          # Measured KV capacity at this context limit and gpu_memory_utilization
+          # 0.85, taken from alignment case 13, which runs the same deployment at
+          # the same limit (`GPU KV cache size: C tokens` in the workload-only
+          # server log, C * 55_224 / 1e9). The 8192-context preset's 120.0 does
+          # not carry over: raising the context limit costs KV capacity.
+          #
+          # That leaves 676,160 tokens of KV against a trace carrying 2,196,962,
+          # so the run is admission-bound rather than compute-bound at full
+          # arrival. That is the intended shape of this workload, not a budget to
+          # widen until the queue disappears.
+          attn_gpu_memory_gb: 37.34025984

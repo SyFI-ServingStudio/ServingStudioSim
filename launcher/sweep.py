@@ -15,11 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 from pathlib import Path
 
 from . import metadata
@@ -40,14 +37,15 @@ from .process import ProcessSpec
 from .process.artifacts import ArtifactValidationError, validate_simulation_artifacts
 from .process.journal import RunJournal, StageState
 from .process.leases import LauncherLeases
+from .process.markers import COMPLETE_MARKER, has_marker, mark_complete
 from .schema import build_cli_command, log_dir_of, validate_unique_log_dirs
 from .schema.loader import Registry
 from .workflow import ResourceScheduler, StageKind, simulation_workflow
 
-# Resume marker (INV-5): the launcher writes this into a run's log_dir only
-# after a zero-exit run. On the default resume path a run whose log_dir already
-# carries it is skipped; `--refresh` ignores it and re-runs.
-COMPLETE_MARKER = ".complete"
+# Resume marker (INV-5) — `COMPLETE_MARKER` / `has_marker` / `mark_complete` now
+# live in `process/markers.py` so `alignment-campaign run` skips completed phases
+# by the same rule. Re-exported here: this module is where the marker's contract
+# was written down, and callers already import it from `launcher.sweep`.
 _LAUNCHER_LEASES = LauncherLeases(Path(__file__).resolve().parents[1])
 
 
@@ -55,7 +53,9 @@ _LAUNCHER_LEASES = LauncherLeases(Path(__file__).resolve().parents[1])
 
 
 def _is_complete(log_dir: Path) -> bool:
-    if not (log_dir / COMPLETE_MARKER).is_file():
+    """The marker is a claim about the exit status; the artifact validator is
+    what makes it a claim about the run. Both must hold to skip."""
+    if not has_marker(log_dir):
         return False
     try:
         validate_simulation_artifacts(log_dir)
@@ -64,20 +64,7 @@ def _is_complete(log_dir: Path) -> bool:
     return True
 
 
-def _mark_complete(log_dir: Path) -> None:
-    marker = log_dir / COMPLETE_MARKER
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{COMPLETE_MARKER}.", suffix=".tmp", dir=log_dir
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(datetime.now(UTC).isoformat() + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, marker)
-    finally:
-        temporary_path.unlink(missing_ok=True)
+_mark_complete = mark_complete
 
 
 @asynccontextmanager

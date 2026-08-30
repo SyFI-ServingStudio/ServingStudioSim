@@ -1,0 +1,40 @@
+# Template for a new alignment host. This is the ONLY tracked profile: copy it
+# to `<yourhost>.yaml` or `<yourhost>.local.yaml`, both gitignored. A real
+# profile is all absolute paths -- an HF cache, a 1 GB corpus -- so it names
+# whoever's directory it sits in and cannot be committed. A pack records what is
+# reproducible about its recording machine in `campaign.yaml: recorded_on`.
+#
+# Relative paths resolve against the repository root; absolute paths are taken
+# as-is. Nothing here is validated at load time except its shape: the profile
+# loader stats `fork_python` only when it is non-empty and never stats the nsys
+# binary, so a profile with placeholder paths still renders and validates.
+schema_version: 1
+host: example
+
+# Root of the local HuggingFace hub cache; checkpoint entries below are relative
+# to it unless they are absolute.
+hf_hub_root: /path/to/hf/hub
+checkpoints:
+  # The key is what a pack's `variants.<v>.checkpoint` names. Pin the snapshot
+  # hash rather than a branch: a different snapshot is a different model.
+  glm52_nvfp4: models--nvidia--GLM-5.2-NVFP4/snapshots/<snapshot-hash>
+
+# Corpus the load generator draws synthetic prompt text from (enwik9).
+text_corpus: /path/to/corpus/enwik9
+
+# Exact nsys path. The profiler version is part of the run's provenance, so this
+# is never resolved from PATH.
+nsys_executable: /opt/nvidia/nsight-systems/<version>/target-linux-x64/nsys
+
+# Interpreter of the instrumented engine fork's venv. Leave empty to render a
+# config that loads but cannot profile — which is what the CPU test tier uses.
+fork_python: alignment/profiler/vllm/.venv/bin/python
+
+# A case names a role, not a device string, so moving a matrix to a differently
+# populated box is one edit here. Each role must list exactly tp_size * dp_size
+# devices for the variants that use it.
+device_roles:
+  primary: "0,1,2,3"
+
+port: 8000
+startup_timeout: 1800.0

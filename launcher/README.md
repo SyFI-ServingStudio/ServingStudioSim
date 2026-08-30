@@ -44,6 +44,12 @@ __main__.py    CLI entry. Thin dispatch only: parse argv, apply --override,
                run_single | run_sweep). No sim logic.
 alignment.py   Explicit alignment stage entry: sim, profile, timing-predict, and
                analyze. No stage implicitly starts the next one.
+alignment_campaign/
+               The layer above those stages: drive a whole matrix of alignment
+               cases from a declarative pack. Fans ONE phase out over N cases;
+               never chains phases. See its own README.
+golden.py      The per-GPU golden store (`tests/golden/<metric>/<gpu>.json`),
+               shared by `pytest --update-golden` and campaign `--record`.
 timing_predict.py
                Offline per-building-block timing prediction from a minimal
                YAML/JSON config; bypasses deployment schema expansion and DES.
@@ -78,6 +84,9 @@ process/       The only child-process lifecycle implementation.
   leases.py      Cross-launcher shared/exclusive resource leases (`flock`).
   journal.py     Atomic `.launcher/` stage state and process identity records.
   artifacts.py   JSON/parquet/render/trace completion contracts.
+  markers.py     The `.complete` marker (INV-5): written only after a zero exit,
+                 replaced atomically. A claim about exit status, not artifacts —
+                 each caller pairs it with its own artifact validator.
 
 workflow/      Explicit stage topology and in-process resource scheduling.
   plan.py        Stage DAG; `--no-analyze` removes optional analysis nodes.
@@ -594,6 +603,7 @@ python -m launcher alignment sim <simulation.yaml|json> [simulation options]
 python -m launcher alignment profile <profile.yaml|json> [--dry-run]
 python -m launcher alignment timing-predict <timing_predict.yaml|json> [--build-type ...]
 python -m launcher alignment analyze <analyze.yaml|json> [--build-type ...]
+python -m launcher alignment-campaign {check,render,run,label,extract,compare} ...
 python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
 ```
 
@@ -702,6 +712,20 @@ uv run python -m launcher alignment profile logs/<experiment>/profile.yaml
 uv run python -m launcher alignment timing-predict logs/<experiment>/timing_predict.yaml
 uv run python -m launcher alignment analyze logs/<experiment>/analyze.yaml
 ```
+
+### Alignment campaigns
+
+`alignment-campaign` sits above those stages and drives a whole matrix of cases
+from a declarative pack in `presets/alignment/<pack>/` — rendering every phase
+config, running one phase across all ready cases, labeling to a fixpoint,
+extracting metrics by a fixed formula table, and judging them against declared
+tolerances and a recorded golden.
+
+It adds no stage and no evidence: it invokes the four commands above unchanged.
+The batch axis is deliberately **one phase across N cases**, so `run` requires
+`--phase` and offers no `--all` — the inspection point between phases stays.
+
+See `launcher/alignment_campaign/README.md` for the pack schema and the verbs.
 
 See skill `operate-run-simulation` for preset/sweep authoring conventions and dated log
 dirs.

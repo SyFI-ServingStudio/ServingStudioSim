@@ -75,8 +75,17 @@ class KernelPosition:
 
     @property
     def coordinate(self) -> str:
+        """Where to find this position again — unique across the document.
+
+        The sequence id is spelled in full. Abbreviating it to twelve characters
+        kept only three of its hash digits, because `sequence_` already spends
+        nine, and that is short enough to collide: one 75k-position capture had
+        1630 coordinates naming two positions each. A locator that names two
+        places is worse than a long one, and anything that keys a dict on it
+        silently drops the duplicates.
+        """
         return (
-            f"{self.phase}/{self.sequence_id[:12]}"
+            f"{self.phase}/{self.sequence_id}"
             f"/track{self.track_index}/seg{self.segment_index}[{self.offset}]"
         )
 
