@@ -10,7 +10,7 @@ import yaml
 
 from alignment import runner as alignment_runner
 from alignment.load_generator import runner as load_runner
-from alignment.profiler import record_extraction, vllm_server
+from alignment.profiler import engine_records, record_extraction, vllm_server
 from alignment.timing_predict_input import BuildRequest, build_inputs
 from launcher import alignment as alignment_launcher
 from launcher import exec as launcher_exec
@@ -417,6 +417,57 @@ def test_profile_config_counts_tp_times_dp_visible_devices(tmp_path):
     assert config.server.dp_size == 2
 
 
+def test_profile_config_accepts_an_explicit_pure_tp_expert_degree(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["cuda_visible_devices"] = "0,1,2,3"
+    raw["server"]["tp_size"] = 4
+    raw["server"]["dp_size"] = 1
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    assert load_profile_config(paths["profile"]).server.expert_parallel_size is None
+
+    raw["server"]["expert_parallel_size"] = 1
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    assert load_profile_config(paths["profile"]).server.expert_parallel_size == 1
+
+
+def test_sglang_popularity_requires_and_validates_its_per_replica_expert_degree(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["engine"] = "sglang"
+    raw["profile_kind"] = "expert_popularity"
+    raw["cuda_visible_devices"] = "0,1,2,3"
+    raw["server"]["tp_size"] = 2
+    raw["server"]["dp_size"] = 2
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="SGLang expert_popularity requires"):
+        load_profile_config(paths["profile"])
+
+    raw["server"]["expert_parallel_size"] = 4
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="must divide tp_size=2"):
+        load_profile_config(paths["profile"])
+
+    raw["server"]["expert_parallel_size"] = 1
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    assert load_profile_config(paths["profile"]).server.expert_parallel_size == 1
+
+
+@pytest.mark.parametrize("expert_parallel_size", [0, True, 3])
+def test_profile_config_rejects_an_invalid_expert_degree(tmp_path, expert_parallel_size):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["cuda_visible_devices"] = "0,1,2,3"
+    raw["server"]["tp_size"] = 4
+    raw["server"]["expert_parallel_size"] = expert_parallel_size
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="expert_parallel_size"):
+        load_profile_config(paths["profile"])
+
+
 def test_profile_server_env_drops_inherited_vllm_api_key(tmp_path, monkeypatch):
     fork_python = tmp_path / "venv" / "bin" / "python"
     fork_python.parent.mkdir(parents=True)
@@ -578,6 +629,85 @@ def test_extract_expert_popularity_rejects_partition_mismatch(tmp_path):
             max_tokens_per_step=1,
             expert_parallel_size=2,
             experts_per_token=2,
+        )
+
+
+def test_expert_popularity_ceiling_uses_the_count_reduction_group(tmp_path):
+    record = {
+        "schema_version": 2,
+        "model": "moe/model",
+        "eplb_step": 1,
+        "expert_parallel_size": 1,
+        "experts_per_token": 2,
+        # One token routed top-2 on four TP replicas. The synchronized record
+        # therefore carries eight assignments although experts are not sharded.
+        "logical_expert_counts": [[4, 4]],
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(f"INFO VibeSimAlignmentExpertLoad {json.dumps(record)}\n")
+
+    with pytest.raises(ValueError, match="within the configured token ceiling"):
+        record_extraction.extract_expert_popularity(
+            server_log,
+            tmp_path / "raw-with-ep-ceiling.jsonl",
+            tmp_path / "summary-with-ep-ceiling.json",
+            expert_parallel_size=1,
+            max_tokens_per_step=1,
+        )
+
+    count = record_extraction.extract_expert_popularity(
+        server_log,
+        tmp_path / "raw-with-reduction-ceiling.jsonl",
+        tmp_path / "summary-with-reduction-ceiling.json",
+        expert_parallel_size=1,
+        reduction_group_size=4,
+        max_tokens_per_step=1,
+    )
+
+    assert count == 1
+
+
+def test_engines_state_their_expert_count_reduction_population():
+    args = {"tensor_parallel_size": 4, "expert_parallel_size": 1}
+
+    assert engine_records.VLLM_RECORDS.expert_count_reduction_group_size(**args) == 1
+    assert engine_records.SGLANG_RECORDS.expert_count_reduction_group_size(**args) == 4
+
+
+def test_runner_passes_engine_specific_expert_popularity_group_sizes(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["profile_kind"] = "expert_popularity"
+    raw["cuda_visible_devices"] = "0,1,2,3,4,5,6,7"
+    raw["server"]["tp_size"] = 4
+    raw["server"]["dp_size"] = 2
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    vllm_config = load_profile_config(paths["profile"])
+    assert alignment_runner._expert_popularity_group_sizes(
+        vllm_config, engine_records.VLLM_RECORDS
+    ) == (8, 8)
+
+    raw["engine"] = "sglang"
+    raw["server"]["expert_parallel_size"] = 1
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    sglang_config = load_profile_config(paths["profile"])
+    assert alignment_runner._expert_popularity_group_sizes(
+        sglang_config, engine_records.SGLANG_RECORDS
+    ) == (1, 4)
+
+
+@pytest.mark.parametrize("reduction_group_size", [0, -1, True, 1.5])
+def test_expert_popularity_rejects_invalid_reduction_group_size(tmp_path, reduction_group_size):
+    with pytest.raises(ValueError, match="reduction_group_size must be a positive integer"):
+        record_extraction.extract_expert_popularity(
+            tmp_path / "server.log",
+            tmp_path / "raw.jsonl",
+            tmp_path / "summary.json",
+            expert_parallel_size=1,
+            experts_per_token=1,
+            reduction_group_size=reduction_group_size,
+            max_tokens_per_step=1,
         )
 
 

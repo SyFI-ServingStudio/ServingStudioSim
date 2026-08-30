@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Literal
+
+ExpertCountReductionScope = Literal["expert_parallel", "tensor_parallel"]
 
 #: Phases of the API-server span that any engine can time, because each is
 #: bounded by two events every OpenAI-compatible frontend necessarily has.
@@ -83,6 +86,24 @@ class EngineRecords:
     #: mapping is recovered by joining a pid<->rank banner with the profiler's
     #: pid<->device knowledge.
     emits_worker_records: bool = False
+    #: Group whose already-summed counts one expert-load record represents.
+    #: This is independent of expert sharding: SGLang's recorder reduces on
+    #: the default process group of one TP replica, while vLLM's EPLB recorder
+    #: reduces on its EP group. The plausibility ceiling uses this population.
+    expert_count_reduction_scope: ExpertCountReductionScope = "expert_parallel"
+    #: Whether popularity profiling must state the actual expert sharding
+    #: degree instead of using vLLM's historical full-world default.
+    requires_explicit_expert_parallel_size: bool = False
+
+    def expert_count_reduction_group_size(
+        self,
+        *,
+        tensor_parallel_size: int,
+        expert_parallel_size: int,
+    ) -> int:
+        if self.expert_count_reduction_scope == "tensor_parallel":
+            return tensor_parallel_size
+        return expert_parallel_size
 
     def api_required_fields(self, schema_version: int) -> frozenset[str]:
         required = {
@@ -152,6 +173,8 @@ SGLANG_RECORDS = EngineRecords(
     request_id_unwrappers=(),
     extra_api_duration_fields=frozenset(),
     emits_worker_records=True,
+    expert_count_reduction_scope="tensor_parallel",
+    requires_explicit_expert_parallel_size=True,
 )
 
 RECORDS_BY_ADAPTER = {

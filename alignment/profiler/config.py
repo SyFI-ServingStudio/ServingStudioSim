@@ -35,6 +35,11 @@ class ServerConfig:
     # explicit instead of hiding it in ``extra_args`` because it determines the
     # visible-device and normalized-profile population contracts.
     dp_size: int = 1
+    # Number of ranks across which the expert axis is sharded. ``None`` keeps
+    # the historical EP deployment default of tp_size * dp_size. Pure tensor
+    # parallelism must state 1: every rank then owns every expert even though
+    # routing statistics may still be reduced across several workers.
+    expert_parallel_size: int | None = None
     served_model_name: str | None = None
     startup_timeout: float = 900.0
     # `--enforce-eager`: disable CUDA graphs so every kernel is a normal launch.

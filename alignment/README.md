@@ -149,10 +149,11 @@ prefix-cache number matters.
 For MoE alignment, profiling may use three explicit passes with identical model,
 topology, backend, and workload settings:
 
-- `profile_kind: expert_popularity` runs vLLM without NSYS, enables EPLB load
-  accounting, and writes `expert_popularity.json` containing aggregated logical
-  expert counts/probabilities by layer. Its synchronization and D2H logging
-  overhead is intentionally excluded from timing evidence.
+- `profile_kind: expert_popularity` runs the selected engine without NSYS and
+  writes `expert_popularity.json` containing aggregated logical expert
+  counts/probabilities by layer. Its synchronization and D2H logging overhead
+  is intentionally excluded from timing evidence. SGLang configs must state
+  `server.expert_parallel_size`; its EP group lives inside each TP replica.
 - `profile_kind: nsys` (default) is the ordinary timing/segment capture consumed
   by timing-predict and alignment analysis. It must disable popularity logging.
 - `profile_kind: workload_metrics` runs the instrumented vLLM server without
@@ -198,10 +199,14 @@ partition, not a claim about a potentially rearranged physical EPLB placement.
 
 The raw JSONL retains every emitted record. The aggregate admits only records
 whose per-layer assignment count is within
-`max_tokens_per_step * expert_parallel_size * experts_per_token`; this excludes
-an initial EPLB record that flushes accumulated server warmup work. The summary
-records the raw, accepted, and discarded record counts and the discarded EPLB
-steps, so this filtering is auditable rather than implicit.
+`max_tokens_per_step * reduction_group_size * experts_per_token`; this excludes
+an initial record that flushes accumulated server warmup work. The reduction
+population is distinct from expert sharding: vLLM's EPLB record is reduced over
+its EP group, while SGLang's recorder is reduced over one replica's TP process
+group. They are equal under ordinary EP, but under pure TP the expert degree is
+1 while the count reduction still covers all TP ranks. The summary records the
+raw, accepted, and discarded record counts and the discarded EPLB steps, so
+this filtering is auditable rather than implicit.
 
 The Rust consumer treats v2 and v3 as closed contracts and rejects unknown
 fields or cross-field inconsistencies. Schemas v1 and v2 remain read-only

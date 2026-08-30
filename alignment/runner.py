@@ -29,7 +29,7 @@ from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
 from .profiler import nsys_capture, record_extraction, sglang_server, vllm_server
 from .profiler.config import ProfileConfig
-from .profiler.engine_records import SGLANG_RECORDS, VLLM_RECORDS
+from .profiler.engine_records import SGLANG_RECORDS, VLLM_RECORDS, EngineRecords
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -91,6 +91,22 @@ def _resolve_fork_python(cfg: ProfileConfig) -> str:
             "see alignment/profiler/README.md."
         )
     return str(fork)
+
+
+def _expert_popularity_group_sizes(cfg: ProfileConfig, records: EngineRecords) -> tuple[int, int]:
+    """Resolve expert sharding and count-reduction populations independently."""
+    expert_parallel_size = cfg.server.expert_parallel_size
+    if expert_parallel_size is None:
+        if records.requires_explicit_expert_parallel_size:
+            raise ValueError(
+                f"{cfg.engine} expert_popularity requires an explicit server.expert_parallel_size"
+            )
+        expert_parallel_size = cfg.server.tp_size * cfg.server.dp_size
+    reduction_group_size = records.expert_count_reduction_group_size(
+        tensor_parallel_size=cfg.server.tp_size,
+        expert_parallel_size=expert_parallel_size,
+    )
+    return expert_parallel_size, reduction_group_size
 
 
 def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> None:
@@ -327,18 +343,18 @@ def _finalize_profile(
     )
 
     if is_expert_popularity:
-        # This pass deliberately disables VLLM_NVTX_SCOPES_FOR_PROFILING, which
-        # gates both NVTX ranges and EngineCore request timing records in the
-        # instrumented fork. Request timing belongs to the clean NSYS pass;
-        # requiring it here would reject an otherwise valid popularity capture.
+        # This pass deliberately disables the engine's timing instrumentation.
+        # Request timing belongs to the clean NSYS pass; requiring it here
+        # would reject an otherwise valid popularity capture.
         expert_load_jsonl = engine_dir / f"{cfg.name}_expert_load.jsonl"
         expert_popularity_json = log_dir / "expert_popularity.json"
-        expert_parallel_size = cfg.server.tp_size * cfg.server.dp_size
+        expert_parallel_size, reduction_group_size = _expert_popularity_group_sizes(cfg, records)
         expert_record_count = record_extraction.extract_expert_popularity(
             server_log,
             expert_load_jsonl,
             expert_popularity_json,
             expert_parallel_size=expert_parallel_size,
+            reduction_group_size=reduction_group_size,
             max_tokens_per_step=max(
                 cfg.server.chunk_size,
                 cfg.server.max_cudagraph_capture_size or 0,

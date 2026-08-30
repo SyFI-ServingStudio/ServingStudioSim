@@ -532,18 +532,31 @@ def extract_expert_popularity(
     max_tokens_per_step: int,
     expert_parallel_size: int | None = None,
     experts_per_token: int | None = None,
+    reduction_group_size: int | None = None,
     records: EngineRecords = VLLM_RECORDS,
 ) -> int:
     """Extract and aggregate rank-synchronized logical-expert token counts.
 
     The vLLM fork emits one record per model step only when EPLB balancedness
-    logging is explicitly enabled.  Counts are already reduced across the EP
-    group and mapped from physical replicas back to logical expert ids.
+    logging is explicitly enabled. Counts are already reduced and mapped from
+    physical replicas back to logical expert ids.
+
+    ``reduction_group_size`` is the number of ranks represented by those
+    already-summed counts. It is not necessarily ``expert_parallel_size``:
+    SGLang's recorder reduces across the TP process group, so pure TP has EP
+    size 1 but a reduction group larger than 1. The old EP behavior remains
+    the default for direct callers.
     """
     if expert_parallel_size is not None and expert_parallel_size <= 0:
         raise ValueError("expert_parallel_size must be positive")
     if experts_per_token is not None and experts_per_token <= 0:
         raise ValueError("experts_per_token must be positive")
+    if reduction_group_size is not None and (
+        isinstance(reduction_group_size, bool)
+        or not isinstance(reduction_group_size, int)
+        or reduction_group_size <= 0
+    ):
+        raise ValueError("reduction_group_size must be a positive integer")
     if max_tokens_per_step <= 0:
         raise ValueError("max_tokens_per_step must be positive")
 
@@ -649,7 +662,10 @@ def extract_expert_popularity(
             raw_records.append(record)
 
             assert expert_parallel_size is not None and experts_per_token is not None
-            assignment_ceiling = max_tokens_per_step * expert_parallel_size * experts_per_token
+            count_replication = (
+                reduction_group_size if reduction_group_size is not None else expert_parallel_size
+            )
+            assignment_ceiling = max_tokens_per_step * count_replication * experts_per_token
             if any(total > assignment_ceiling for total in layer_totals):
                 discarded_oversized_steps.append(eplb_step)
                 continue

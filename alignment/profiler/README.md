@@ -122,6 +122,10 @@ pipeline. Build its environment under the submodule's `python/` directory,
 which is the default path selected when `engine: sglang` and no `fork_python`
 override is supplied:
 
+SGLang's expert-load counts are reduced over the default TP process group of
+one replica, independently of its expert-sharding degree. An SGLang popularity
+config therefore must state `server.expert_parallel_size` explicitly.
+
 ```bash
 cd alignment/profiler/sglang/python
 uv venv --python 3.12 .venv-sglang
@@ -248,10 +252,10 @@ EngineCore-output wait plus output fan-out. The extractor compares durations
 within their originating clock domains and never subtracts EngineCore and API
 absolute timestamps across processes.
 
-The separate `expert_popularity` pass sets
-`VLLM_NVTX_SCOPES_FOR_PROFILING=0`, so it neither emits nor requires this
-request-timing artifact. Its only model-side ground truth is the expert-load
-record stream described above; timing evidence always comes from the NSYS pass.
+The separate `expert_popularity` pass disables the selected engine's timing
+instrumentation, so it neither emits nor requires this request-timing artifact.
+Its only model-side ground truth is the expert-load record stream described
+above; timing evidence always comes from the NSYS pass.
 The resulting summary follows
 [`alignment/schema/expert_popularity_v3.schema.json`](../schema/expert_popularity_v3.schema.json):
 `counts_by_layer[layer][logical_expert]` is authoritative, while EP degree,

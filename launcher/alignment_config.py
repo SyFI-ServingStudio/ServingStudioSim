@@ -158,6 +158,34 @@ def load_profile_config(path: Path) -> ProfileConfig:
         device.strip() for device in config.cuda_visible_devices.split(",") if device.strip()
     ]
     world_size = config.server.tp_size * config.server.dp_size
+    expert_parallel_size = config.server.expert_parallel_size
+    if (
+        config.engine == "sglang"
+        and config.profile_kind == "expert_popularity"
+        and expert_parallel_size is None
+    ):
+        raise ValueError(
+            "invalid profile config: SGLang expert_popularity requires "
+            "server.expert_parallel_size to state the actual MoE sharding degree"
+        )
+    if expert_parallel_size is not None:
+        if (
+            isinstance(expert_parallel_size, bool)
+            or not isinstance(expert_parallel_size, int)
+            or expert_parallel_size <= 0
+        ):
+            raise ValueError(
+                "invalid profile config: server.expert_parallel_size must be a positive integer"
+            )
+        expert_parallel_population = (
+            config.server.tp_size if config.engine == "sglang" else world_size
+        )
+        if expert_parallel_population % expert_parallel_size != 0:
+            population_label = "tp_size" if config.engine == "sglang" else "tp_size * dp_size"
+            raise ValueError(
+                "invalid profile config: server.expert_parallel_size must divide "
+                f"{population_label}={expert_parallel_population} for engine={config.engine}"
+            )
     if len(visible_devices) != world_size:
         raise ValueError(
             "invalid profile config: cuda_visible_devices must contain exactly "
