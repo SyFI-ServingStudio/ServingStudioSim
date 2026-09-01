@@ -29,6 +29,127 @@ pub enum BatchPolicy {
 
 const BATCH_POLICY_CHOICES: [&str; 2] = ["mix", "separate-prefill-priority"];
 
+/// KV-capacity rule paired with chunked prefill. `FullFootprint` preserves the
+/// historical no-retraction lifecycle. `BoundedFuture` uses an explicit
+/// future-token estimate and therefore requires decode retraction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvAdmissionPolicy {
+    #[default]
+    FullFootprint,
+    BoundedFuture,
+}
+
+const KV_ADMISSION_POLICY_CHOICES: [&str; 2] = ["full-footprint", "bounded-future"];
+
+/// Ordering used when the next physical decode allocation does not fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DecodeRetractionPolicy {
+    Length,
+}
+
+const DECODE_RETRACTION_POLICY_CHOICES: [&str; 1] = ["length"];
+
+/// Fully resolved bounded-future scheduler constants. These are mechanics, not
+/// calibrated performance values; the SGLang preset states its captured values
+/// explicitly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoundedFutureKvAdmissionConfig {
+    pub page_size: u32,
+    pub max_future_tokens: u32,
+    pub initial_new_token_ratio: f64,
+    pub minimum_new_token_ratio: f64,
+    pub new_token_ratio_decay_steps: u32,
+    pub retract_decode_steps: u32,
+    pub retraction_policy: DecodeRetractionPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum KvAdmissionConfig {
+    #[default]
+    FullFootprint,
+    BoundedFuture(BoundedFutureKvAdmissionConfig),
+}
+
+impl KvAdmissionConfig {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve(
+        policy: KvAdmissionPolicy,
+        page_size: Option<u32>,
+        max_future_tokens: Option<u32>,
+        initial_new_token_ratio: Option<f64>,
+        minimum_new_token_ratio: Option<f64>,
+        new_token_ratio_decay_steps: Option<u32>,
+        retract_decode_steps: Option<u32>,
+        retraction_policy: Option<DecodeRetractionPolicy>,
+    ) -> Result<Self> {
+        let knobs_are_absent = page_size.is_none()
+            && max_future_tokens.is_none()
+            && initial_new_token_ratio.is_none()
+            && minimum_new_token_ratio.is_none()
+            && new_token_ratio_decay_steps.is_none()
+            && retract_decode_steps.is_none()
+            && retraction_policy.is_none();
+        if policy == KvAdmissionPolicy::FullFootprint {
+            ensure!(
+                knobs_are_absent,
+                "full-footprint KV admission does not accept bounded-future knobs"
+            );
+            return Ok(Self::FullFootprint);
+        }
+
+        let config = BoundedFutureKvAdmissionConfig {
+            page_size: page_size
+                .ok_or_else(|| anyhow::anyhow!("bounded-future requires kv_page_size"))?,
+            max_future_tokens: max_future_tokens
+                .ok_or_else(|| anyhow::anyhow!("bounded-future requires kv_max_future_tokens"))?,
+            initial_new_token_ratio: initial_new_token_ratio.ok_or_else(|| {
+                anyhow::anyhow!("bounded-future requires kv_initial_new_token_ratio")
+            })?,
+            minimum_new_token_ratio: minimum_new_token_ratio.ok_or_else(|| {
+                anyhow::anyhow!("bounded-future requires kv_minimum_new_token_ratio")
+            })?,
+            new_token_ratio_decay_steps: new_token_ratio_decay_steps.ok_or_else(|| {
+                anyhow::anyhow!("bounded-future requires kv_new_token_ratio_decay_steps")
+            })?,
+            retract_decode_steps: retract_decode_steps.ok_or_else(|| {
+                anyhow::anyhow!("bounded-future requires kv_retract_decode_steps")
+            })?,
+            retraction_policy: retraction_policy.ok_or_else(|| {
+                anyhow::anyhow!("bounded-future requires decode_retraction_policy")
+            })?,
+        };
+        ensure!(
+            config.page_size == 1,
+            "bounded-future currently requires kv_page_size=1; larger pages need persistent allocated-length accounting"
+        );
+        ensure!(
+            config.max_future_tokens > 0,
+            "kv_max_future_tokens must be positive"
+        );
+        ensure!(
+            config.initial_new_token_ratio.is_finite()
+                && (0.0..=1.0).contains(&config.initial_new_token_ratio),
+            "kv_initial_new_token_ratio must be finite and in [0, 1]"
+        );
+        ensure!(
+            config.minimum_new_token_ratio.is_finite()
+                && (0.0..=config.initial_new_token_ratio).contains(&config.minimum_new_token_ratio),
+            "kv_minimum_new_token_ratio must be finite and in [0, initial]"
+        );
+        ensure!(
+            config.new_token_ratio_decay_steps > 0,
+            "kv_new_token_ratio_decay_steps must be positive"
+        );
+        ensure!(
+            config.retract_decode_steps > 0,
+            "kv_retract_decode_steps must be positive"
+        );
+        Ok(Self::BoundedFuture(config))
+    }
+}
+
 const PENDING_ORDER_CHOICES: [&str; 4] = [
     "session-start",
     "fifo",
@@ -150,6 +271,33 @@ pub enum IterWorkerSel {
         /// prefill batch can run.
         #[param(string, default = "mix", choices = BATCH_POLICY_CHOICES)]
         batch_policy: BatchPolicy,
+        /// Capacity policy for waiting and running requests. Historical
+        /// deployments omit it and retain full-footprint reservation.
+        #[serde(default)]
+        #[param(string, default = "full-footprint", choices = KV_ADMISSION_POLICY_CHOICES)]
+        kv_admission_policy: KvAdmissionPolicy,
+        /// Bounded-future only: physical KV allocation page size in tokens.
+        #[serde(default)]
+        kv_page_size: Option<u32>,
+        /// Bounded-future only: cap on future output tokens charged per request.
+        #[serde(default)]
+        kv_max_future_tokens: Option<u32>,
+        /// Bounded-future only: new-token ratio at scheduler start/reset.
+        #[serde(default)]
+        kv_initial_new_token_ratio: Option<f64>,
+        /// Bounded-future only: floor reached after successful decode steps.
+        #[serde(default)]
+        kv_minimum_new_token_ratio: Option<f64>,
+        /// Bounded-future only: successful decode steps from initial to floor.
+        #[serde(default)]
+        kv_new_token_ratio_decay_steps: Option<u32>,
+        /// Bounded-future only: output-token horizon used after retraction.
+        #[serde(default)]
+        kv_retract_decode_steps: Option<u32>,
+        /// Bounded-future only: which resident decode is retracted first.
+        #[serde(default)]
+        #[param(string, choices = DECODE_RETRACTION_POLICY_CHOICES)]
+        decode_retraction_policy: Option<DecodeRetractionPolicy>,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]
@@ -352,6 +500,71 @@ mod tests {
             PrefixCachePolicy::Lru,
             Some(81.0),
             80.0,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn full_footprint_rejects_bounded_future_knobs() {
+        assert!(KvAdmissionConfig::resolve(
+            KvAdmissionPolicy::FullFootprint,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bounded_future_requires_and_preserves_every_source_constant() {
+        let resolved = KvAdmissionConfig::resolve(
+            KvAdmissionPolicy::BoundedFuture,
+            Some(1),
+            Some(4_096),
+            Some(0.7),
+            Some(0.098),
+            Some(600),
+            Some(20),
+            Some(DecodeRetractionPolicy::Length),
+        )
+        .expect("complete bounded-future policy should resolve");
+
+        assert_eq!(
+            resolved,
+            KvAdmissionConfig::BoundedFuture(BoundedFutureKvAdmissionConfig {
+                page_size: 1,
+                max_future_tokens: 4_096,
+                initial_new_token_ratio: 0.7,
+                minimum_new_token_ratio: 0.098,
+                new_token_ratio_decay_steps: 600,
+                retract_decode_steps: 20,
+                retraction_policy: DecodeRetractionPolicy::Length,
+            })
+        );
+        assert!(KvAdmissionConfig::resolve(
+            KvAdmissionPolicy::BoundedFuture,
+            Some(1),
+            Some(4_096),
+            Some(0.7),
+            Some(0.098),
+            Some(600),
+            None,
+            Some(DecodeRetractionPolicy::Length),
+        )
+        .is_err());
+        assert!(KvAdmissionConfig::resolve(
+            KvAdmissionPolicy::BoundedFuture,
+            Some(16),
+            Some(4_096),
+            Some(0.7),
+            Some(0.098),
+            Some(600),
+            Some(20),
+            Some(DecodeRetractionPolicy::Length),
         )
         .is_err());
     }

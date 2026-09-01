@@ -22,7 +22,10 @@ pub use admission::{
     PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
 pub(crate) use config::resolve_prefix_cache_config;
-pub use config::{AttnWorkerSel, BatchPolicy, FfnWorkerSel, IterWorkerSel};
+pub use config::{
+    AttnWorkerSel, BatchPolicy, DecodeRetractionPolicy, FfnWorkerSel, IterWorkerSel,
+    KvAdmissionConfig, KvAdmissionPolicy,
+};
 pub use cost_buffers::CostBuffers;
 pub use gpu_cluster::{CostSource, GpuCluster, GpuInfo, SharedGpuCluster};
 pub use iter_worker::{AfdAttnWorker, AfdFfnWorker, IterWorker};

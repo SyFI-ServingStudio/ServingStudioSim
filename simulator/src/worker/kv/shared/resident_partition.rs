@@ -186,6 +186,29 @@ impl ResidentPartitionState {
             .map(|(request, state)| (request, state.current_kv))
     }
 
+    pub(crate) fn decode_states(&self) -> impl Iterator<Item = (RequestId, u64, u32)> + '_ {
+        self.iter_decoding()
+            .map(|(request, state)| (request, state.current_kv, state.remaining_decode))
+    }
+
+    pub(crate) fn bounded_future_decode_tokens(&self, max_future_tokens: u32, ratio: f64) -> f64 {
+        self.iter_decoding()
+            .map(|(_, state)| f64::from(state.remaining_decode.min(max_future_tokens)) * ratio)
+            .sum()
+    }
+
+    pub(crate) fn next_decode_allocation_tokens(&self, page_size: u32) -> u64 {
+        let page_size = u64::from(page_size);
+        self.iter_decoding()
+            .filter(|(_, state)| state.current_kv % page_size == 0)
+            .count() as u64
+            * page_size
+    }
+
+    pub(crate) fn first_decode_request(&self) -> Option<RequestId> {
+        self.iter_decoding().next().map(|(request, _)| request)
+    }
+
     pub(crate) fn has_live_decode(&self) -> bool {
         self.iter_decoding().next().is_some()
     }

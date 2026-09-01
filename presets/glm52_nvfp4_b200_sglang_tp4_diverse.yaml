@@ -41,6 +41,17 @@ pools:
           # iteration, and resident decode resumes afterward.
           max_batch_tokens: 2048
           batch_policy: separate-prefill-priority
+          # Source-defined SGLang KV admission/retraction mechanics. These are
+          # server defaults from the pinned capture, not fitted simulator
+          # parameters.
+          kv_admission_policy: bounded-future
+          kv_page_size: 1
+          kv_max_future_tokens: 4096
+          kv_initial_new_token_ratio: 0.7
+          kv_minimum_new_token_ratio: 0.098
+          kv_new_token_ratio_decay_steps: 600
+          kv_retract_decode_steps: 20
+          decode_retraction_policy: length
           # Kernel timing remains unscaled in this scheduler baseline. A
           # measured duty-cycle multiplier belongs to an alignment result, not
           # to the scheduler mechanism itself.

@@ -126,6 +126,7 @@ mod tests {
             session_input: SessionInput::Standalone,
             conversation_start_time: Time::ZERO,
             resident_prefix_tokens: 0,
+            retracted: false,
         }
     }
 

@@ -70,6 +70,7 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
             .collect(),
         max_batch_tokens,
         config.batch_policy,
+        config.kv_admission,
         balance,
     );
 

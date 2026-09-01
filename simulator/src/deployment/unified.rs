@@ -34,7 +34,8 @@ use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     build_qwen36_hybrid_worker, resolve_prefix_cache_config, BatchPolicy, IterWorker,
-    IterWorkerSel, PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    IterWorkerSel, KvAdmissionConfig, PendingOrderKind, PrefixCacheMode, PrefixCachePolicy,
+    WorkerConfig,
 };
 
 use super::Deployment;
@@ -77,6 +78,7 @@ impl Deployment for UnifiedDeployment {
             prefix_cache_policy,
             prefix_cache_max_gpu_memory_gb,
             batch_policy,
+            kv_admission,
         ) = match &g.worker {
             IterWorkerSel::Barebone {
                 attn_gpu_memory_gb,
@@ -107,22 +109,50 @@ impl Deployment for UnifiedDeployment {
                 *prefix_cache_policy,
                 *prefix_cache_max_gpu_memory_gb,
                 BatchPolicy::Mix,
+                KvAdmissionConfig::FullFootprint,
             ),
             IterWorkerSel::ChunkedPrefill {
                 attn_gpu_memory_gb,
                 max_batch_tokens,
                 batch_policy,
+                kv_admission_policy,
+                kv_page_size,
+                kv_max_future_tokens,
+                kv_initial_new_token_ratio,
+                kv_minimum_new_token_ratio,
+                kv_new_token_ratio_decay_steps,
+                kv_retract_decode_steps,
+                decode_retraction_policy,
                 gpu_time_multiplier,
-            } => (
-                *attn_gpu_memory_gb,
-                *gpu_time_multiplier,
-                Some(*max_batch_tokens),
-                PendingOrderKind::Fifo,
-                PrefixCacheMode::Opportunistic,
-                PrefixCachePolicy::Lru,
-                None,
-                *batch_policy,
-            ),
+            } => {
+                let kv_admission = KvAdmissionConfig::resolve(
+                    *kv_admission_policy,
+                    *kv_page_size,
+                    *kv_max_future_tokens,
+                    *kv_initial_new_token_ratio,
+                    *kv_minimum_new_token_ratio,
+                    *kv_new_token_ratio_decay_steps,
+                    *kv_retract_decode_steps,
+                    *decode_retraction_policy,
+                )?;
+                ensure!(
+                    !matches!(kv_admission, KvAdmissionConfig::BoundedFuture(_))
+                        || *batch_policy == BatchPolicy::SeparatePrefillPriority,
+                    "bounded-future KV admission currently requires \
+                     batch_policy=separate-prefill-priority"
+                );
+                (
+                    *attn_gpu_memory_gb,
+                    *gpu_time_multiplier,
+                    Some(*max_batch_tokens),
+                    PendingOrderKind::Fifo,
+                    PrefixCacheMode::Opportunistic,
+                    PrefixCachePolicy::Lru,
+                    None,
+                    *batch_policy,
+                    kv_admission,
+                )
+            }
             IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => {
                 bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
             }
@@ -143,6 +173,7 @@ impl Deployment for UnifiedDeployment {
             max_batch_tokens,
             pending_order,
             batch_policy,
+            kv_admission,
             prefix_cache,
             ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
             ..WorkerConfig::default()
@@ -681,6 +712,14 @@ mod tests {
             attn_gpu_memory_gb: 120.0,
             max_batch_tokens: 2048,
             batch_policy: BatchPolicy::Mix,
+            kv_admission_policy: crate::worker::KvAdmissionPolicy::FullFootprint,
+            kv_page_size: None,
+            kv_max_future_tokens: None,
+            kv_initial_new_token_ratio: None,
+            kv_minimum_new_token_ratio: None,
+            kv_new_token_ratio_decay_steps: None,
+            kv_retract_decode_steps: None,
+            decode_retraction_policy: None,
             gpu_time_multiplier: 1.0,
         }
     }

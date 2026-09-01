@@ -1,8 +1,11 @@
 //! Hard-capped chunked-prefill lifecycle for the whole-iteration shell.
 //!
-//! Pending policies own fresh requests. Once a request starts, its complete KV
-//! footprint stays reserved and at most one continuation is retained per
-//! attention partition; partial requests never rotate through the policy again.
+//! Pending policies own fresh and retracted requests. Once a prompt starts, at
+//! most one continuation is retained per attention partition; partial requests
+//! never rotate through the policy again. KV ownership is policy-defined:
+//! historical deployments reserve the complete request footprint, whereas a
+//! bounded-future deployment pairs a waiting-request estimate with decode-time
+//! physical allocation checks and retraction.
 //!
 //! Batch composition is independent of KV membership. `Mix` lets resident
 //! decode share the remaining chunk budget. `SeparatePrefillPriority` emits a
@@ -11,8 +14,13 @@
 //! mechanism selected by SGLang when `enable_mixed_chunk` is false; admission
 //! capacity estimation and decode retraction are separate policies.
 
+use std::cmp::Reverse;
+use std::collections::HashMap;
+
 use crate::common::{RequestId, SessionInput, Time, UnifiedStage};
-use crate::worker::config::BatchPolicy;
+use crate::worker::config::{
+    BatchPolicy, BoundedFutureKvAdmissionConfig, DecodeRetractionPolicy, KvAdmissionConfig,
+};
 use crate::worker::kv::ChunkedPrefillKv;
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
@@ -25,8 +33,11 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy> {
     enqueue_sequence: EnqueueSequence,
     max_batch_tokens: u32,
     batch_policy: BatchPolicy,
+    kv_admission: KvAdmissionConfig,
+    current_new_token_ratio: f64,
     balance: LoadBalance,
     active_chunks: Vec<Option<AdmissionCandidate>>,
+    prefill_episodes: HashMap<RequestId, bool>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P> {
@@ -34,6 +45,7 @@ impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P> {
         partition_policies: Vec<(P, P::Context)>,
         max_batch_tokens: u32,
         batch_policy: BatchPolicy,
+        kv_admission: KvAdmissionConfig,
         balance: LoadBalance,
     ) -> Self {
         assert!(max_batch_tokens > 0, "chunked prefill cap must be positive");
@@ -41,13 +53,32 @@ impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P> {
             !partition_policies.is_empty(),
             "chunked prefill requires at least one partition"
         );
+        assert!(
+            !matches!(kv_admission, KvAdmissionConfig::BoundedFuture(_))
+                || partition_policies.len() == 1,
+            "bounded-future KV admission is validated only for one attention partition"
+        );
+        assert!(
+            !matches!(
+                kv_admission,
+                KvAdmissionConfig::BoundedFuture(config) if config.page_size != 1
+            ),
+            "bounded-future currently requires page_size=1; larger pages need allocated-length state"
+        );
+        let current_new_token_ratio = match kv_admission {
+            KvAdmissionConfig::FullFootprint => 1.0,
+            KvAdmissionConfig::BoundedFuture(config) => config.initial_new_token_ratio,
+        };
         Self {
             partition_policies,
             enqueue_sequence: EnqueueSequence::default(),
             max_batch_tokens,
             batch_policy,
+            kv_admission,
+            current_new_token_ratio,
             balance,
             active_chunks: Vec::new(),
+            prefill_episodes: HashMap::new(),
         }
     }
 
@@ -60,6 +91,165 @@ impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P> {
             .retained_prefix_partition(session_input)
             .map(usize::from)
             .unwrap_or_else(|| self.balance.choose(self.partition_policies.len()))
+    }
+
+    fn bounded_config(&self) -> Option<BoundedFutureKvAdmissionConfig> {
+        match self.kv_admission {
+            KvAdmissionConfig::FullFootprint => None,
+            KvAdmissionConfig::BoundedFuture(config) => Some(config),
+        }
+    }
+
+    fn decay_new_token_ratio(&mut self, config: BoundedFutureKvAdmissionConfig) {
+        let decay = (config.initial_new_token_ratio - config.minimum_new_token_ratio)
+            / f64::from(config.new_token_ratio_decay_steps);
+        self.current_new_token_ratio =
+            (self.current_new_token_ratio - decay).max(config.minimum_new_token_ratio);
+    }
+
+    fn update_ratio_after_retraction<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &K,
+        context: &WorkerContext,
+        config: BoundedFutureKvAdmissionConfig,
+    ) {
+        let store = context.requests.borrow();
+        let mut decoded_tokens = 0u64;
+        let mut max_new_tokens = 0u64;
+        let mut requests = 0u64;
+        for partition in 0..kv_store.num_partitions() as u16 {
+            kv_store.visit_decode_states(partition, |request, _, _| {
+                let record = &store[request];
+                decoded_tokens += u64::from(record.progress.output_tokens_emitted);
+                max_new_tokens += u64::from(record.request.definition.target_output_tokens);
+                requests += 1;
+            });
+        }
+        let numerator = decoded_tokens
+            .checked_add(u64::from(config.retract_decode_steps) * requests)
+            .expect("post-retraction ratio numerator overflow");
+        self.current_new_token_ratio = (numerator as f64 / (max_new_tokens + 1) as f64).min(1.0);
+    }
+
+    fn select_length_retraction<K: ChunkedPrefillKv>(
+        &self,
+        kv_store: &K,
+        context: &WorkerContext,
+        partition: u16,
+    ) -> Option<RequestId> {
+        let mut candidates = Vec::new();
+        kv_store.visit_decode_states(partition, |request, _, _| candidates.push(request));
+        let store = context.requests.borrow();
+        candidates
+            .into_iter()
+            .enumerate()
+            .min_by_key(|(index, request)| {
+                let record = &store[*request];
+                let input_tokens = record
+                    .request
+                    .definition
+                    .prompt_tokens
+                    .checked_add(record.request.definition.session.declared_prefix_tokens())
+                    .expect("retraction input length overflow");
+                (
+                    record.progress.output_tokens_emitted,
+                    Reverse(input_tokens),
+                    Reverse(*index),
+                )
+            })
+            .map(|(_, request)| request)
+    }
+
+    fn requeue_retracted<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &K,
+        context: &WorkerContext,
+        partition: u16,
+        request: RequestId,
+        now: Time,
+    ) {
+        let (
+            reprocessed_input_tokens,
+            remaining_output_tokens,
+            session_input,
+            conversation_start_time,
+        ) = {
+            let mut store = context.requests.borrow_mut();
+            let record = &mut store[request];
+            record.record_retraction();
+            context.stamp_stage(record, now, UnifiedStage::Pending as u16);
+            (
+                record
+                    .request
+                    .definition
+                    .prompt_tokens
+                    .checked_add(record.progress.output_tokens_emitted)
+                    .expect("reprocessed input length overflow"),
+                record
+                    .request
+                    .definition
+                    .target_output_tokens
+                    .saturating_sub(record.progress.output_tokens_emitted),
+                record.request.definition.session,
+                record
+                    .request
+                    .definition
+                    .session
+                    .session_start_or(record.request.core.arrival_time),
+            )
+        };
+        let resident_prefix_tokens =
+            kv_store.resident_prefix_tokens(reprocessed_input_tokens, session_input);
+        let candidate = self.enqueue_sequence.freeze_retracted(
+            request,
+            reprocessed_input_tokens,
+            remaining_output_tokens,
+            session_input,
+            conversation_start_time,
+            resident_prefix_tokens,
+        );
+        let (policy, policy_context) = &mut self.partition_policies[partition as usize];
+        policy.push(candidate, policy_context);
+    }
+
+    fn prepare_decode<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        now: Time,
+        config: BoundedFutureKvAdmissionConfig,
+    ) -> bool {
+        let mut retracted_any = false;
+        for partition in 0..kv_store.num_partitions() as u16 {
+            while kv_store.has_live_decode(partition)
+                && kv_store.prepare_next_decode(partition, config.page_size, now) > 0
+            {
+                let live_count = kv_store.live_decode_count(partition);
+                assert!(
+                    live_count > 1,
+                    "bounded-future decode cannot fit its last request; abort lifecycle is required"
+                );
+                let request = match config.retraction_policy {
+                    DecodeRetractionPolicy::Length => self
+                        .select_length_retraction(kv_store, context, partition)
+                        .expect("decode shortfall requires a retraction candidate"),
+                };
+                kv_store.release(request, partition);
+                self.requeue_retracted(kv_store, context, partition, request, now);
+                retracted_any = true;
+            }
+        }
+        if retracted_any {
+            self.update_ratio_after_retraction(kv_store, context, config);
+        } else {
+            self.decay_new_token_ratio(config);
+        }
+        (0..kv_store.num_partitions() as u16).any(|partition| kv_store.has_live_decode(partition))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_new_token_ratio(&self) -> f64 {
+        self.current_new_token_ratio
     }
 }
 
@@ -121,6 +311,8 @@ where
         let had_decode =
             (0..num_partitions as u16).any(|partition| kv_store.has_live_decode(partition));
         let mixes_prefill_with_decode = self.batch_policy == BatchPolicy::Mix;
+        let bounded_config = self.bounded_config();
+        let current_new_token_ratio = self.current_new_token_ratio;
         let mut remaining_budgets: Vec<u32> = (0..num_partitions as u16)
             .map(|partition| {
                 if mixes_prefill_with_decode {
@@ -176,12 +368,30 @@ where
                     candidate.fresh_prompt_tokens,
                     candidate.session_input,
                 );
-                let footprint = kv_store.footprint(
-                    candidate.request_id,
-                    resolved_prefill.post_prefill_context_tokens(),
-                    candidate.remaining_output_tokens,
-                );
-                if !kv_store.fits(partition, &footprint) {
+                let footprint = match bounded_config {
+                    None => kv_store.footprint(
+                        candidate.request_id,
+                        resolved_prefill.post_prefill_context_tokens(),
+                        candidate.remaining_output_tokens,
+                    ),
+                    Some(config) => kv_store.bounded_future_footprint(
+                        candidate.request_id,
+                        resolved_prefill.post_prefill_context_tokens(),
+                        candidate.remaining_output_tokens,
+                        config.max_future_tokens,
+                        config.page_size,
+                    ),
+                };
+                let fits = match bounded_config {
+                    None => kv_store.fits(partition, &footprint),
+                    Some(config) => kv_store.fits_bounded_future(
+                        partition,
+                        &footprint,
+                        config.max_future_tokens,
+                        current_new_token_ratio,
+                    ),
+                };
+                if !fits {
                     break;
                 }
                 let popped = policy.pop(policy_context);
@@ -197,10 +407,21 @@ where
                     let mut store = context.requests.borrow_mut();
                     store.mark_admitted(candidate.request_id);
                     let record = &mut store[candidate.request_id];
-                    record
-                        .record_prefix_cache_hit_tokens(resolved_prefill.resident_prefix_tokens());
+                    if candidate.retracted {
+                        record.begin_reprocessed_prefill(resolved_prefill.resident_prefix_tokens());
+                    } else {
+                        record.record_prefix_cache_hit_tokens(
+                            resolved_prefill.resident_prefix_tokens(),
+                        );
+                    }
                     context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
                 }
+                assert!(
+                    self.prefill_episodes
+                        .insert(candidate.request_id, candidate.retracted)
+                        .is_none(),
+                    "request entered two simultaneous prefill episodes"
+                );
                 let remaining = resolved_prefill.remaining_prefill_tokens();
                 let chunk_tokens = remaining.min(remaining_budgets[partition_index]);
                 kv_store.schedule_prefill_chunk(candidate.request_id, partition, chunk_tokens);
@@ -220,7 +441,31 @@ where
             }
         }
 
-        had_decode || had_prefill
+        let had_decode = if !had_prefill && had_decode {
+            match bounded_config {
+                None => true,
+                Some(config) => self.prepare_decode(kv_store, context, now, config),
+            }
+        } else {
+            had_decode
+        };
+
+        let has_batch = had_decode || had_prefill;
+        if !has_batch
+            && self
+                .partition_policies
+                .iter()
+                .all(|(policy, _)| policy.len() == 0)
+            && self.active_chunks.iter().all(Option::is_none)
+        {
+            // SGLang resets its tracker only after running, chunked, and
+            // waiting queues are all empty (`Scheduler::on_idle`). A blocked
+            // waiting request is therefore deliberately not a reset boundary.
+            if let Some(config) = bounded_config {
+                self.current_new_token_ratio = config.initial_new_token_ratio;
+            }
+        }
+        has_batch
     }
 
     fn complete_iteration(
@@ -251,6 +496,10 @@ where
             let mut prefills = Vec::new();
             kv_store.visit_prefill_admits(partition, |request| prefills.push(request));
             for request in prefills {
+                let reprocessed = *self
+                    .prefill_episodes
+                    .get(&request)
+                    .expect("scheduled prefill requires episode metadata");
                 let chunk_tokens = kv_store.resolved_prefill_context(request).active_chunk().1;
                 kv_store.complete_prefill_chunk(request);
                 let finished = kv_store
@@ -260,13 +509,22 @@ where
                 {
                     let mut store = context.requests.borrow_mut();
                     let record = &mut store[request];
-                    record.progress.prefill_tokens_processed = record
-                        .progress
-                        .prefill_tokens_processed
-                        .checked_add(chunk_tokens)
-                        .expect("prefill progress overflows u32");
+                    if reprocessed {
+                        record.record_reprocessed_prefill_tokens(chunk_tokens);
+                    } else {
+                        record.progress.prefill_tokens_processed = record
+                            .progress
+                            .prefill_tokens_processed
+                            .checked_add(chunk_tokens)
+                            .expect("prefill progress overflows u32");
+                    }
                     if finished {
-                        record.record_first_token(now, context.log_tokens());
+                        if reprocessed {
+                            record.complete_reprocessed_prefill();
+                            record.record_token(now, context.log_tokens());
+                        } else {
+                            record.record_first_token(now, context.log_tokens());
+                        }
                         context.stamp_stage(
                             record,
                             now,
@@ -279,6 +537,7 @@ where
                     }
                 }
                 if finished {
+                    self.prefill_episodes.remove(&request);
                     let remaining_output_tokens = {
                         let store = context.requests.borrow();
                         let record = &store[request];
@@ -323,6 +582,7 @@ where
         for active_chunk in &mut self.active_chunks {
             if active_chunk.is_some_and(|candidate| candidate.request_id == request) {
                 *active_chunk = None;
+                self.prefill_episodes.remove(&request);
             }
         }
         false

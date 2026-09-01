@@ -475,6 +475,9 @@ pub struct WorkerConfig {
     /// Only `ChunkedPrefillAdmission` reads this; other lifecycles state their
     /// fixed composition directly in the per-iteration batch plan.
     pub batch_policy: crate::worker::config::BatchPolicy,
+    /// KV admission/retraction mechanics for chunked prefill. Other worker
+    /// recipes retain the full-footprint default.
+    pub kv_admission: crate::worker::config::KvAdmissionConfig,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -497,6 +500,7 @@ impl Default for WorkerConfig {
             max_batch_tokens: None,
             pending_order: crate::worker::admission::PendingOrderKind::default(),
             batch_policy: crate::worker::config::BatchPolicy::Mix,
+            kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             ssm_checkpoint_interval_tokens: None,
         }

@@ -220,9 +220,29 @@ pub trait PrefixKv: KvStore {
 
 /// Partial-prefill refinement for the whole-iteration worker family.
 ///
-/// The store reserves the complete request footprint once, while admission
-/// exposes one hard-capped chunk at a time to the execution component.
+/// Admission reserves one policy-defined waiting-request footprint, while it
+/// exposes one hard-capped chunk at a time to execution. Historical workers use
+/// the full request footprint. A bounded-future scheduler instead reserves the
+/// source-defined waiting-request estimate and checks physical allocation again
+/// immediately before every decode step.
 pub trait ChunkedPrefillKv: PrefixKv + IterWorkerKv {
+    fn bounded_future_footprint(
+        &self,
+        request: RequestId,
+        post_prefill_context_tokens: u32,
+        remaining_output_tokens: u32,
+        max_future_tokens: u32,
+        page_size: u32,
+    ) -> Self::Footprint;
+    fn fits_bounded_future(
+        &self,
+        partition: PartitionId,
+        footprint: &Self::Footprint,
+        max_future_tokens: u32,
+        new_token_ratio: f64,
+    ) -> bool;
+    fn prepare_next_decode(&mut self, partition: PartitionId, page_size: u32, now: Time) -> u64;
+    fn visit_decode_states(&self, partition: PartitionId, visitor: impl FnMut(RequestId, u64, u32));
     fn reserve_chunked_prefill_context(
         &mut self,
         request: RequestId,
