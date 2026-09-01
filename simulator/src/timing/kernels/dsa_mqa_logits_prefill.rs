@@ -129,7 +129,7 @@ mod tests {
     use serde_json::Value;
 
     const TORCH_BACKEND: &str = "torch";
-    const DEEPGEMM_BACKEND: &str = "vllm_deepgemm_fp8";
+    const DEEPGEMM_BACKEND: &str = "deepgemm_fp8";
     const QUERY_AXIS: &[f64] = &[
         1.0, 2.0, 3.0, 4.0, 8.0, 16.0, 32.0, 64.0, 127.0, 128.0, 129.0, 255.0, 256.0, 257.0, 363.0,
         512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0,

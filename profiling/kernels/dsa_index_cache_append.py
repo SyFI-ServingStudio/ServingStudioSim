@@ -69,3 +69,24 @@ register(
         subprocess_env="vllm_env",
     )
 )
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="sglang_fused_norm_rope_store",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.FP8_E4M3}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_index_cache_append",
+            function_name="profile_dsa_index_cache_append_sglang_fused_norm_rope_store",
+        ),
+        table_name=KIND,
+        args_schema=DsaIndexCacheAppendArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="sglang_env",
+    )
+)

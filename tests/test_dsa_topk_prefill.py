@@ -23,6 +23,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 
 _BACKEND = "torch"
 _VLLM_BACKEND = "vllm_cuda"
+_SGLANG_BACKEND = "sglang_cuda"
 _BASE_SPEC = {
     "num_queries": 128,
     "num_keys": 8192,
@@ -33,6 +34,33 @@ _BASE_SPEC = {
     "index_dtype": "int32",
     "span_mode": "single_causal_tail",
 }
+
+
+def test_sglang_public_wrapper_receives_the_serving_arguments() -> None:
+    from profiling.runners.attention.dsa_topk_prefill import _launch_sglang_topk
+
+    recorded = {}
+
+    def callable_(**kwargs):
+        recorded.update(kwargs)
+        return "output"
+
+    operands = SimpleNamespace(logits="logits", row_starts="row_starts")
+    extras = SimpleNamespace(
+        lengths="lengths",
+        src_page_table="page_table",
+        cu_seqlens_q="cu_seqlens_q",
+    )
+
+    assert _launch_sglang_topk(callable_, operands, extras, top_k=2048) == "output"
+    assert recorded == {
+        "score": "logits",
+        "lengths": "lengths",
+        "page_table_size_1": "page_table",
+        "cu_seqlens_q": "cu_seqlens_q",
+        "topk": 2048,
+        "row_starts": "row_starts",
+    }
 
 
 def test_args_field_order_and_dtype_coercion() -> None:
@@ -63,7 +91,7 @@ def test_registration_support_and_facades() -> None:
     spec = find_kernel_profiler_spec(KIND, _BACKEND)
 
     assert KIND == "dsa_topk_prefill"
-    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND]
+    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND, _SGLANG_BACKEND]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.args_schema is DsaTopkPrefillArgs
     assert spec.metric_family is MetricFamily.COMPUTE

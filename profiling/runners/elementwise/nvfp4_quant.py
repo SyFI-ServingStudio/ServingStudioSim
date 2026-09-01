@@ -1,4 +1,4 @@
-"""Runner for vLLM's SM100 NVFP4 activation quantization kernel."""
+"""Production SM100 NVFP4 activation-quantization runners."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ _SCALE_FORMAT = "linear_e4m3"
 # CUPTI reports this stable implementation stem for vLLM's unswizzled
 # ``scaled_fp4_quant`` path on SM100.
 _KERNEL_NAME = "cvt_fp16_to_fp4_sf_major"
+_FLASHINFER_KERNEL_NAME = "nvfp4_quantize"
+_E4M3_MAX = 448.0
 
 
 def _validate_args(
@@ -83,7 +85,54 @@ def profile_nvfp4_quant_vllm_cuda(
         except RuntimeError as exc:
             raise KernelLaunchFailed(f"NVFP4 activation quantization failed: {exc}") from exc
 
-    time_ms = Timer.cupti(run_once, kernel_name=_KERNEL_NAME)
+    return _measure(run_once, num_tokens, hidden_size, _KERNEL_NAME)
+
+
+def profile_nvfp4_quant_flashinfer_cutedsl(
+    num_tokens: int,
+    hidden_size: int,
+    group_size: int,
+    input_dtype: DType | str,
+    scale_format: str,
+) -> ComputeMetrics:
+    num_tokens, hidden_size = _validate_args(
+        num_tokens, hidden_size, group_size, input_dtype, scale_format
+    )
+    try:
+        import torch
+        from flashinfer import SfLayout, nvfp4_quantize
+    except ImportError as exc:
+        raise ProfilerNotImplemented("the SGLang environment is required") from exc
+
+    _validate_cuda_device(torch)
+    source = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
+    global_scale = torch.full((1,), 1.0 / (_E4M3_MAX * 6.0), dtype=torch.float32, device="cuda")
+
+    def run_once() -> None:
+        try:
+            nvfp4_quantize(
+                source,
+                global_scale,
+                sfLayout=SfLayout.layout_linear,
+                per_token_activation=True,
+                backend="cute-dsl",
+            )
+        except RuntimeError as exc:
+            raise KernelLaunchFailed(f"NVFP4 activation quantization failed: {exc}") from exc
+
+    # FlashInfer lazily builds this CuTe-DSL kernel on its first invocation.
+    run_once()
+    torch.cuda.synchronize()
+    return _measure(run_once, num_tokens, hidden_size, _FLASHINFER_KERNEL_NAME)
+
+
+def _measure(
+    run_once: Any,
+    num_tokens: int,
+    hidden_size: int,
+    kernel_name: str,
+) -> ComputeMetrics:
+    time_ms = Timer.cupti(run_once, kernel_name=kernel_name)
     energy_j = Energy.perf(run_once, per_iter_time_ms=time_ms)
     logical_bytes = num_tokens * hidden_size * 2
     logical_bytes += num_tokens * hidden_size // 2

@@ -19,6 +19,7 @@ pub mod deepseek_v4_sparse_mla_decode;
 pub mod deepseek_v4_sparse_mla_prefill;
 pub mod deepseek_v4_terminal_mhc_head;
 pub mod dsa_index_cache_append;
+pub mod dsa_indexer_q_rope_quant;
 pub mod dsa_mqa_logits_prefill;
 pub mod dsa_paged_mqa_logits_decode;
 pub mod dsa_persistent_topk_decode;
@@ -52,11 +53,13 @@ pub mod kv_cache_append;
 pub mod mhc_fused_post_pre_rms_norm;
 pub mod mhc_pre_rms_norm;
 pub mod mla_cache_append;
+pub mod mla_rope_quantize_fp8;
 pub mod moe_align_block_size;
 pub mod moe_alltoall;
 pub mod moe_alltoall_prepare;
 pub mod moe_ep_all_gather;
 pub mod moe_ep_reduce_scatter;
+pub mod moe_finalize_fuse_shared;
 pub mod moe_finalize_routing;
 pub mod moe_fused_topk;
 pub mod moe_sum;
@@ -142,6 +145,10 @@ pub use deepseek_v4_terminal_mhc_head::{
 pub use dsa_index_cache_append::{
     DsaIndexCacheAppendKernel, DsaIndexCacheAppendKernelConfig, DsaIndexCacheAppendKernelInput,
     DsaIndexCacheAppendSpec,
+};
+pub use dsa_indexer_q_rope_quant::{
+    DsaIndexerQRopeQuantKernel, DsaIndexerQRopeQuantKernelConfig, DsaIndexerQRopeQuantKernelInput,
+    DsaIndexerQRopeQuantSpec,
 };
 pub use dsa_mqa_logits_prefill::{
     DsaMqaLogitsPrefillKernel, DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput,
@@ -260,6 +267,10 @@ pub use mhc_pre_rms_norm::{
 pub use mla_cache_append::{
     MlaCacheAppendKernel, MlaCacheAppendKernelConfig, MlaCacheAppendKernelInput, MlaCacheAppendSpec,
 };
+pub use mla_rope_quantize_fp8::{
+    MlaRopeQuantizeFp8Kernel, MlaRopeQuantizeFp8KernelConfig, MlaRopeQuantizeFp8KernelInput,
+    MlaRopeQuantizeFp8Spec,
+};
 pub use moe_align_block_size::{
     MoeAlignBlockSizeKernel, MoeAlignBlockSizeKernelConfig, MoeAlignBlockSizeKernelInput,
     MoeAlignBlockSizeSpec,
@@ -278,6 +289,10 @@ pub use moe_ep_all_gather::{
 };
 pub use moe_ep_reduce_scatter::{
     MoeEpReduceScatterKernel, MoeEpReduceScatterKernelConfig, MoeEpReduceScatterSpec,
+};
+pub use moe_finalize_fuse_shared::{
+    MoeFinalizeFuseSharedKernel, MoeFinalizeFuseSharedKernelConfig,
+    MoeFinalizeFuseSharedKernelInput, MoeFinalizeFuseSharedSpec,
 };
 pub use moe_finalize_routing::{
     MoeFinalizeRoutingKernel, MoeFinalizeRoutingKernelConfig, MoeFinalizeRoutingKernelInput,

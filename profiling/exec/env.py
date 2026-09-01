@@ -83,6 +83,9 @@ class ContainerProfileEnv:
 _PROFILE_ENVS_ROOT = Path.home() / "profile_envs"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROJECT_UV_PYTHON = _PROJECT_ROOT / ".venv" / "bin" / "python"
+_SGLANG_CHECKOUT = _PROJECT_ROOT / "alignment" / "profiler" / "sglang"
+_SGLANG_PYTHON_ROOT = _SGLANG_CHECKOUT / "python"
+_SGLANG_PYTHON = _SGLANG_PYTHON_ROOT / ".venv-sglang" / "bin" / "python"
 
 
 def _profile_env_python(name: str) -> Path:
@@ -111,6 +114,14 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
     "flashinfer_local": ProfileEnv(
         "flashinfer_local",
         _profile_env_python("flashinfer_local"),
+    ),
+    # SGLang's CUDA extensions are built against the checkout-local Torch and
+    # FlashInfer stack. Keep the interpreter and source tree from the same
+    # checkout so profiling cannot silently import a globally installed build.
+    "sglang_env": ProfileEnv(
+        "sglang_env",
+        _SGLANG_PYTHON,
+        additional_python_paths=(_SGLANG_PYTHON_ROOT,),
     ),
     # vLLM runners execute in the pinned image; host source and Python packages
     # are deliberately outside this environment boundary.

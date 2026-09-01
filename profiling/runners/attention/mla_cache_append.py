@@ -24,6 +24,7 @@ _CACHE_FORMAT = "plain"
 _REQUIRED_GPU = "NVIDIA H200"
 _VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _VLLM_KERNEL_NAME = "concat_and_cache_mla_kernel"
+_SGLANG_SUPPORTED_GPUS = ("NVIDIA B200",)
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ def _validate_args(
     cache_format: str,
     *,
     allow_fp8_cache: bool = False,
+    allow_fp8_input: bool = False,
 ) -> tuple[int, int, int, int, DType, DType, str]:
     num_tokens = int(num_tokens)
     kv_lora_rank = int(kv_lora_rank)
@@ -72,9 +74,11 @@ def _validate_args(
             f"got ({kv_lora_rank}, {rope_dim}, {block_size})"
         )
     supported_kv_dtypes = {DType.BF16, DType.FP8_E4M3} if allow_fp8_cache else {DType.BF16}
-    if input_dtype is not DType.BF16 or kv_dtype not in supported_kv_dtypes:
+    supported_input_dtypes = {DType.BF16, DType.FP8_E4M3} if allow_fp8_input else {DType.BF16}
+    if input_dtype not in supported_input_dtypes or kv_dtype not in supported_kv_dtypes:
         raise ValueError(
-            "mla_cache_append requires BF16 input and "
+            f"mla_cache_append requires {'BF16 or FP8 E4M3' if allow_fp8_input else 'BF16'} "
+            "input and "
             f"{'BF16 or FP8 E4M3' if allow_fp8_cache else 'BF16'} cache, "
             f"got {input_dtype.value} and {kv_dtype.value}"
         )
@@ -284,6 +288,116 @@ def profile_mla_cache_append_torch(
         )
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc
+
+
+def _validate_sglang_cuda_device(torch: Any) -> None:
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented("CUDA is required for mla_cache_append:sglang_cuda")
+    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
+    if gpu_name not in _SGLANG_SUPPORTED_GPUS:
+        raise ProfilerNotImplemented(
+            "mla_cache_append:sglang_cuda is verified only on "
+            f"{' or '.join(_SGLANG_SUPPORTED_GPUS)}, got {gpu_name}"
+        )
+
+
+def profile_mla_cache_append_sglang_cuda(
+    num_tokens: int,
+    kv_lora_rank: int,
+    rope_dim: int,
+    block_size: int,
+    input_dtype: DType | str,
+    kv_dtype: DType | str,
+    cache_format: str,
+) -> ComputeMetrics:
+    """Profile SGLang's scatter of already-quantized FP8 MLA cache rows."""
+    (
+        num_tokens,
+        kv_lora_rank,
+        rope_dim,
+        block_size,
+        input_dtype,
+        kv_dtype,
+        _cache_format,
+    ) = _validate_args(
+        num_tokens,
+        kv_lora_rank,
+        rope_dim,
+        block_size,
+        input_dtype,
+        kv_dtype,
+        cache_format,
+        allow_fp8_cache=True,
+        allow_fp8_input=True,
+    )
+    if input_dtype is not DType.FP8_E4M3 or kv_dtype is not DType.FP8_E4M3:
+        raise ProfilerNotImplemented(
+            "mla_cache_append:sglang_cuda requires pre-quantized FP8 input and FP8 cache"
+        )
+    try:
+        import torch
+        from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_triton
+    except (ImportError, OSError) as exc:
+        raise ProfilerNotImplemented(
+            "mla_cache_append:sglang_cuda requires the SGLang environment"
+        ) from exc
+
+    _validate_sglang_cuda_device(torch)
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        generator = torch.Generator(device=device).manual_seed(42)
+        num_slots = max(256, math.ceil(num_tokens / block_size) + 1) * block_size
+        kv_buffer = torch.zeros(
+            (num_slots, 1, kv_lora_rank + rope_dim),
+            dtype=torch.uint8,
+            device=device,
+        )
+        cache_k_nope = torch.randint(
+            0,
+            255,
+            (num_tokens, 1, kv_lora_rank),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+        cache_k_rope = torch.randint(
+            0,
+            255,
+            (num_tokens, 1, rope_dim),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+        locations = torch.randperm(
+            num_slots,
+            device=device,
+            generator=generator,
+        )[:num_tokens].to(torch.int64)
+
+        def kernel() -> None:
+            set_mla_kv_buffer_triton(kv_buffer, locations, cache_k_nope, cache_k_rope)
+
+        kernel()
+        torch.cuda.synchronize()
+        time_ms = Timer.cupti(kernel, warmup=5)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+    logical_bytes = _logical_bytes(
+        num_tokens=num_tokens,
+        kv_lora_rank=kv_lora_rank,
+        rope_dim=rope_dim,
+        input_dtype=input_dtype,
+        kv_dtype=kv_dtype,
+    )
+    bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        tflops=0.0,
+        memory_bandwidth_gbps=float(bandwidth_gbps),
+        energy_j=float(energy_j),
+    )
 
 
 def profile_mla_cache_append_vllm_cuda(

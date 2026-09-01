@@ -43,4 +43,24 @@ register(
     )
 )
 
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="sglang_router_auto",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.gemm_fp32_output_sglang_router",
+            function_name="profile_gemm_fp32_output_sglang_router",
+        ),
+        table_name=KIND,
+        args_schema=GemmFp32OutputArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        subprocess_env="sglang_env",
+    )
+)
+
 __all__ = ["KIND"]

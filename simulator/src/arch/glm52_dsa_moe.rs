@@ -102,7 +102,7 @@ const FP8_QUANT_BACKENDS: &[&str] = &["flashinfer_trtllm"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm52"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm52"];
 const INDEX_CACHE_AND_TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
-const INDEX_LOGITS_BACKENDS: &[&str] = &["vllm_deepgemm_fp8"];
+const INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["vllm_flashmla_bf16"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const P2P_BACKENDS: &[&str] = &["nccl"];
@@ -1848,7 +1848,7 @@ mod tests {
         );
         assert_eq!(
             cfg.dense_full_index_attention.index_prefill_logits_backends,
-            vec!["vllm_deepgemm_fp8"]
+            vec!["deepgemm_fp8"]
         );
         assert_eq!(cfg.moe_expert_compute[0].dtype, DType::Bf16);
         assert_eq!(

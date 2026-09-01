@@ -61,3 +61,23 @@ register(
         subprocess_env="vllm_env",
     )
 )
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_trtllm_sm100_deferred_finalize",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.nvfp4_fused_moe",
+            function_name="profile_nvfp4_fused_moe_deferred_finalize_sm100",
+        ),
+        table_name=KIND,
+        args_schema=Nvfp4FusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="sglang_env",
+    )
+)

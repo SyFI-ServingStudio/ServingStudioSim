@@ -60,7 +60,7 @@ register(
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
-        backend="vllm_deepgemm_fp8",
+        backend="deepgemm_fp8",
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
@@ -68,7 +68,7 @@ register(
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_paged_mqa_logits_decode",
-            function_name=("profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8"),
+            function_name="profile_dsa_paged_mqa_logits_decode_deepgemm_fp8",
         ),
         table_name=KIND,
         args_schema=DsaPagedMqaLogitsDecodeArgs,
