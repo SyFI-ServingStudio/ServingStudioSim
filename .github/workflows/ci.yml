@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# One run per ref at a time; a newer push cancels the older in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt-clippy-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `req-frontend` (main/Cargo.toml's path dependency, needed for
+          # every build) is a private repo under the serendipity-zk org.
+          # `SUBMODULE_TOKEN` must be a PAT (or deploy key exchanged for a
+          # token) with read access to it, added as a repo secret — plain
+          # `GITHUB_TOKEN` cannot reach another private repo.
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Install mold
+        run: sudo apt-get update && sudo apt-get install -y mold
+        # main/.cargo/config.toml hardcodes the mold linker for ~5-10x faster
+        # links; installing it here matches local dev instead of overriding
+        # RUSTFLAGS to bypass it.
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.9.24"
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            main/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('main/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache uv env
+        uses: actions/cache@v4
+        with:
+          path: main/.venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('main/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-
+
+      - name: cargo fmt --check
+        working-directory: main
+        run: cargo fmt --check
+
+      - name: cargo clippy (workspace + tests)
+        working-directory: main
+        # No extra -D/-W flags needed: Cargo.toml's [lints.clippy] table
+        # already denies the default tier plus the four cast-safety lints.
+        # --tests is required to also cover the in-file `mod tests` blocks
+        # and integration tests — plain `cargo clippy` skips #[cfg(test)]
+        # code entirely (see the lint-fix PR for how this was discovered).
+        run: cargo clippy --workspace --tests --message-format=short
+
+      - name: uv sync (excluding deep-gemm)
+        working-directory: main
+        # `just sync` (the documented bootstrap) runs a bare `uv sync`,
+        # which tries to build the `deep-gemm` git dependency and fails
+        # with "CUDA_HOME environment variable is not set" on a GPU-less
+        # runner like this one — confirmed by hand. deep-gemm is a Python
+        # runtime backend only; it's not needed to build or test the Rust
+        # side. Excluding it here is *not* wired into the justfile itself,
+        # since local/GPU dev environments should still get the real
+        # `just sync`.  A GPU-having runner tier (`just test-gpu`) would be
+        # a separate follow-up, not this job.
+        run: uv sync --inexact --no-install-package deep-gemm
+
+      - name: cargo test (simulator lib)
+        working-directory: main
+        run: |
+          LIBDIR=$(uv run --no-sync python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+          LD_LIBRARY_PATH="$LIBDIR:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib
+
+      - name: pytest (cpu tier)
+        working-directory: main
+        run: uv run --no-sync pytest -m "not gpu and not agent and not bench" -n 8
