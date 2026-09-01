@@ -461,6 +461,39 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            IterArchSel::Glm52SglangNvfp4TpDsaMoe {
+                tp_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                mtp_mode,
+                expert_popularity_file,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("GLM-5.2 SGLang NVFP4 pure TP", &g.worker)?;
+                let model = Arc::new(arch_build::glm52_sglang_nvfp4_tp_dsa_moe(
+                    model_spec,
+                    *tp_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    *mtp_mode,
+                    expert_popularity_file.as_deref(),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "GLM-5.2 SGLang NVFP4 pure TP",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             IterArchSel::Glm52DsaMoe {
                 ep_size,
                 nvl_num_gpu,

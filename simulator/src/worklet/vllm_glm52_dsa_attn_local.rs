@@ -21,10 +21,14 @@
 
 use std::sync::Arc;
 
+use super::glm52_dsa_attn_common::{
+    normalize_glm52_dsa_attn_input as normalize_input, resolve_glm52_dsa_attn_tp_partition,
+    Glm52DsaAttnLocalDecodeInput, Glm52DsaAttnLocalInput,
+};
 use crate::op::attention::{
-    DsaIndexerConfig, DsaIndexerDecodeInput, DsaIndexerInput, DsaIndexerOp,
+    DsaIndexerConfig, DsaIndexerInput, DsaIndexerLaunchGraph, DsaIndexerOp,
     DsaSparseMlaAttentionConfig, DsaSparseMlaAttentionInput, DsaSparseMlaAttentionOp,
-    DsaSparseMlaExactVarlenConfig,
+    DsaSparseMlaExactVarlenConfig, DsaSparseMlaLaunchGraph,
 };
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -130,6 +134,7 @@ pub struct VllmGlm52DsaAttnLocalWorkletConfig {
     pub sparse_attention_backends: Vec<&'static str>,
     pub sparse_mla_cache_append_backends: Vec<&'static str>,
     pub sparse_elementwise_backends: Vec<&'static str>,
+    pub sparse_index_remap_backends: Vec<&'static str>,
     pub gpu_name: String,
     pub hidden_dim: Dim,
     pub num_attention_heads: Dim,
@@ -211,22 +216,8 @@ pub struct VllmGlm52DsaAttnLocalWorkletResolved {
     pub attention_heads_per_rank: Dim,
 }
 
-#[derive(Clone, Debug)]
-pub struct VllmGlm52DsaAttnLocalDecodeInput {
-    pub batch_size: u32,
-    pub context_len: u32,
-    /// Exact per-request KV lengths when the caller has production varlen
-    /// metadata. `None` preserves the accepted uniform-context fallback.
-    pub context_lens: Option<Vec<u32>>,
-    pub requires_padding: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct VllmGlm52DsaAttnLocalWorkletInput {
-    pub num_new_tokens: u32,
-    pub prefill_query_cache_pairs: Vec<(u32, u32)>,
-    pub decode: Option<VllmGlm52DsaAttnLocalDecodeInput>,
-}
+pub type VllmGlm52DsaAttnLocalDecodeInput = Glm52DsaAttnLocalDecodeInput;
+pub type VllmGlm52DsaAttnLocalWorkletInput = Glm52DsaAttnLocalInput;
 
 pub struct VllmGlm52DsaAttnLocalWorklet {
     pub name: String,
@@ -258,17 +249,22 @@ impl VllmGlm52DsaAttnLocalWorklet {
             panic!("invalid VllmGlm52DsaAttnLocalWorkletConfig: {reason}")
         });
 
-        let tp = Dim::param("attn_tp", u32::from(cfg.tp_size));
-        let attention_heads_per_rank = cfg.num_attention_heads.clone() / tp.clone();
-
-        let fused_qkv_a_n =
-            cfg.q_lora_rank.clone() + cfg.kv_lora_rank.clone() + cfg.rope_dim.clone();
-        let q_b_n = attention_heads_per_rank.clone()
-            * (cfg.qk_nope_head_dim.clone() + cfg.rope_dim.clone());
+        let partition = resolve_glm52_dsa_attn_tp_partition(
+            &cfg.num_attention_heads,
+            &cfg.q_lora_rank,
+            &cfg.kv_lora_rank,
+            &cfg.qk_nope_head_dim,
+            &cfg.rope_dim,
+            &cfg.v_head_dim,
+            cfg.tp_size,
+        )
+        .expect("validated GLM-5.2 TP partition");
+        let attention_heads_per_rank = partition.attention_heads_per_rank.clone();
 
         let indexer = cfg.include_indexer.then(|| DsaIndexerConfig {
             gemm_backends: cfg.indexer_gemm_backends.clone(),
             elementwise_backends: cfg.indexer_elementwise_backends.clone(),
+            q_rope_backends: Vec::new(),
             index_cache_append_backends: cfg.index_cache_append_backends.clone(),
             prefill_logits_backends: cfg.index_prefill_logits_backends.clone(),
             prefill_topk_backends: cfg.index_prefill_topk_backends.clone(),
@@ -301,6 +297,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
             decode_context_mode: cfg.index_decode_context_mode.clone(),
             decode_page_mapping: cfg.index_decode_page_mapping.clone(),
             clean_logits: cfg.index_clean_logits,
+            launch_graph: DsaIndexerLaunchGraph::Separate,
         });
 
         // One activation quantisation per dense FP8 GEMM, keyed by that GEMM's
@@ -334,7 +331,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
             fused_qkv_a_proj: SingleGemmKernelConfig {
                 backends: cfg.single_gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: fused_qkv_a_n,
+                n: partition.fused_qkv_a_n,
                 k: cfg.hidden_dim.clone(),
                 dtype: cfg.gemm_dtype,
             },
@@ -348,7 +345,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
             q_b_proj: SingleGemmKernelConfig {
                 backends: cfg.single_gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                n: q_b_n,
+                n: partition.q_b_n,
                 k: cfg.q_lora_rank.clone(),
                 dtype: cfg.gemm_dtype,
             },
@@ -408,6 +405,9 @@ impl VllmGlm52DsaAttnLocalWorklet {
                 mla_cache_block_size: cfg.cache_block_size,
                 mla_cache_format: cfg.sparse_mla_cache_format.clone(),
                 decode_next_n: cfg.decode_next_n,
+                launch_graph: DsaSparseMlaLaunchGraph::Separate {
+                    index_remap_backends: cfg.sparse_index_remap_backends.clone(),
+                },
                 exact_varlen: cfg.sparse_exact_varlen.clone(),
             },
             v_up: BatchedGemmKernelConfig {
@@ -425,7 +425,7 @@ impl VllmGlm52DsaAttnLocalWorklet {
                 backends: cfg.single_gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.hidden_dim.clone(),
-                k: attention_heads_per_rank.clone() * cfg.v_head_dim.clone(),
+                k: partition.o_proj_k,
                 dtype: cfg.gemm_dtype,
             },
             attention_heads_per_rank,
@@ -751,14 +751,6 @@ impl VllmGlm52DsaAttnLocalWorklet {
     }
 }
 
-#[derive(Debug)]
-struct NormalizedInput {
-    active_rows: u32,
-    indexer_decode: Option<DsaIndexerDecodeInput>,
-    sparse_decode: Option<(u32, u32)>,
-    sparse_decode_context_lens: Option<Vec<u32>>,
-}
-
 fn validate_config(cfg: &VllmGlm52DsaAttnLocalWorkletConfig) -> Result<(), String> {
     if cfg.tp_size == 0 {
         return Err("tp_size must be positive".to_string());
@@ -937,99 +929,6 @@ fn validate_config(cfg: &VllmGlm52DsaAttnLocalWorkletConfig) -> Result<(), Strin
     Ok(())
 }
 
-fn normalize_input(
-    input: &VllmGlm52DsaAttnLocalWorkletInput,
-    decode_next_n: u32,
-    max_model_len: u32,
-) -> Result<NormalizedInput, String> {
-    if !matches!(decode_next_n, 1 | 2) {
-        return Err(format!("decode_next_n must be 1 or 2, got {decode_next_n}"));
-    }
-
-    let mut active_rows = 0_u32;
-    for (index, &(num_queries, num_cache_tokens)) in
-        input.prefill_query_cache_pairs.iter().enumerate()
-    {
-        if num_queries == 0 || num_cache_tokens == 0 {
-            return Err(format!(
-                "prefill pair {index} must have nonzero Q and S, got ({num_queries}, {num_cache_tokens})"
-            ));
-        }
-        if num_queries > num_cache_tokens {
-            return Err(format!(
-                "prefill pair {index} requires Q<=S, got ({num_queries}, {num_cache_tokens})"
-            ));
-        }
-        active_rows = active_rows
-            .checked_add(num_queries)
-            .ok_or_else(|| "active-row sum overflows u32".to_string())?;
-    }
-
-    let (indexer_decode, sparse_decode, sparse_decode_context_lens) = match &input.decode {
-        Some(decode) => {
-            if decode.batch_size == 0 || decode.context_len == 0 {
-                return Err(format!(
-                    "decode requires positive batch_size and context_len, got ({}, {})",
-                    decode.batch_size, decode.context_len
-                ));
-            }
-            if decode.context_len > max_model_len {
-                return Err(format!(
-                    "decode context_len {} exceeds max_model_len {max_model_len}",
-                    decode.context_len
-                ));
-            }
-            if let Some(context_lens) = &decode.context_lens {
-                if context_lens.len() != decode.batch_size as usize {
-                    return Err(format!(
-                        "decode context_lens has {} entries, expected batch_size {}",
-                        context_lens.len(),
-                        decode.batch_size
-                    ));
-                }
-                for (request, &context) in context_lens.iter().enumerate() {
-                    if context == 0 || context > max_model_len {
-                        return Err(format!(
-                            "decode request {request} context {context} must be in 1..={max_model_len}"
-                        ));
-                    }
-                }
-            }
-            let decode_rows = decode
-                .batch_size
-                .checked_mul(decode_next_n)
-                .ok_or_else(|| "decode row count overflows u32".to_string())?;
-            active_rows = active_rows
-                .checked_add(decode_rows)
-                .ok_or_else(|| "active-row sum overflows u32".to_string())?;
-            (
-                Some(DsaIndexerDecodeInput {
-                    batch_size: decode.batch_size,
-                    context_len: decode.context_len,
-                    requires_padding: decode.requires_padding,
-                }),
-                Some((decode_rows, decode.context_len)),
-                decode.context_lens.clone(),
-            )
-        }
-        None => (None, None, None),
-    };
-
-    if input.num_new_tokens != active_rows {
-        return Err(format!(
-            "num_new_tokens {} must equal active query rows {active_rows}",
-            input.num_new_tokens
-        ));
-    }
-
-    Ok(NormalizedInput {
-        active_rows,
-        indexer_decode,
-        sparse_decode,
-        sparse_decode_context_lens,
-    })
-}
-
 fn worklet_label(name: &str, cfg: &VllmGlm52DsaAttnLocalWorkletConfig) -> String {
     format!(
         "{name} (VllmGlm52DsaAttnLocalWorklet) [local (1 GPU); indexer={}; heads={}; next_n={}]",
@@ -1099,6 +998,7 @@ mod tests {
             sparse_attention_backends: vec!["vllm_flashmla_bf16"],
             sparse_mla_cache_append_backends: vec!["vllm_cuda"],
             sparse_elementwise_backends: vec!["triton_sparse"],
+            sparse_index_remap_backends: Vec::new(),
             gpu_name: "NVIDIA H200".to_string(),
             hidden_dim: Dim::param("hidden_dim", 6144),
             num_attention_heads: Dim::param("num_attention_heads", 64),
@@ -1156,11 +1056,12 @@ mod tests {
         config.sparse_attention_q_dtype = DType::Fp8E4m3;
         config.sparse_attention_cache_dtype = DType::Fp8E4m3;
         config.sparse_attention_output_dtype = DType::Bf16;
+        config.sparse_index_remap_backends = vec!["vllm_triton"];
         config.sparse_exact_varlen = Some(DsaSparseMlaExactVarlenConfig {
-            index_remap_backends: vec!["vllm_triton"],
             prefill_backends: vec!["flashinfer_trtllm_fp8"],
             max_model_len: 8192,
-            page_table_mapping: "request_contiguous".to_string(),
+            prefill_index_distribution: "recent_contiguous".to_string(),
+            page_table_mapping: Some("request_contiguous".to_string()),
         });
         config
     }
@@ -1223,7 +1124,8 @@ mod tests {
 
     #[test]
     fn b200_tp4_shards_only_attention_heads_and_uses_exact_sparse_recipe() {
-        let r = VllmGlm52DsaAttnLocalWorklet::resolve_config(&b200_tp4_cfg(true));
+        let config = b200_tp4_cfg(true);
+        let r = VllmGlm52DsaAttnLocalWorklet::resolve_config(&config);
 
         assert_eq!(r.attention_heads_per_rank, 16);
         assert_eq!(r.q_b_proj.n, 4096);
@@ -1245,7 +1147,7 @@ mod tests {
             .sparse_mla
             .exact_varlen
             .expect("B200 FP8 sparse attention requires exact varlen");
-        assert_eq!(exact.index_remap_backends, vec!["vllm_triton"]);
+        assert_eq!(config.sparse_index_remap_backends, vec!["vllm_triton"]);
         assert_eq!(exact.prefill_backends, vec!["flashinfer_trtllm_fp8"]);
         assert_eq!(exact.max_model_len, 8192);
     }

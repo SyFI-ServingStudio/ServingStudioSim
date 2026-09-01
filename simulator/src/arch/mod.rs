@@ -9,6 +9,7 @@ pub mod config;
 pub mod contract;
 pub mod deepseek_v4_vllm;
 pub mod glm52_dsa_moe;
+pub mod glm52_sglang_nvfp4_tp_dsa_moe;
 pub mod glm52_vllm_dsa_moe;
 pub mod glm52_vllm_nvfp4_dsa_moe;
 pub mod llama3_dense;
@@ -36,6 +37,10 @@ pub use deepseek_v4_vllm::{
 pub use glm52_dsa_moe::{
     Glm52DsaMoeConfigs, Glm52DsaMoeModel, Glm52DsaMoeParallel, Glm52DsaMoeResolved, Glm52ModelCfg,
     Glm52MtpMode,
+};
+pub use glm52_sglang_nvfp4_tp_dsa_moe::{
+    Glm52SglangNvfp4TpDsaMoeConfigs, Glm52SglangNvfp4TpDsaMoeModel,
+    Glm52SglangNvfp4TpDsaMoeParallel, Glm52SglangNvfp4TpDsaMoeResolved,
 };
 pub use glm52_vllm_dsa_moe::{
     Glm52VllmDsaMoeConfigs, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmDsaMoeResolved,

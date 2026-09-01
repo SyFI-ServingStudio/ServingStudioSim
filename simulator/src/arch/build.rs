@@ -20,13 +20,14 @@ use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, Routi
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    deepseek_v4_vllm, glm52_dsa_moe, glm52_vllm_dsa_moe, glm52_vllm_nvfp4_dsa_moe, llama3_dense,
-    llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
-    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
-    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
-    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
-    DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52DsaMoeModel, Glm52DsaMoeParallel,
-    Glm52ModelCfg, Glm52MtpMode, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
+    deepseek_v4_vllm, glm52_dsa_moe, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
+    glm52_vllm_nvfp4_dsa_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local,
+    qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
+    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
+    AttnLayerwiseModel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
+    DenseParallel, DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52DsaMoeModel,
+    Glm52DsaMoeParallel, Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel,
+    Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
     Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, IterwiseUnifiedModel,
     Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
     Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
@@ -156,11 +157,20 @@ struct ExpertPopularityAggregationV3 {
     scope: String,
     observed_eplb_step_min: u64,
     observed_eplb_step_max: u64,
+    /// Optional provenance added by newer recorders. It does not change the
+    /// routed counts; older v3 artifacts remain valid without it.
+    #[serde(default, rename = "observed_forward_pass_count")]
+    _observed_forward_pass_count: Option<u64>,
     record_count: u64,
     raw_record_count: u64,
     discarded_oversized_record_count: u64,
     discarded_oversized_eplb_steps: Vec<u64>,
     max_tokens_per_step: u64,
+    /// Number of leading dense layers removed by a recorder that reports every
+    /// model layer. Optional because older v3 artifacts already stored only MoE
+    /// layers and therefore had nothing to declare.
+    #[serde(default, rename = "dense_prefix_layers")]
+    _dense_prefix_layers: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -957,6 +967,49 @@ pub fn glm52_vllm_nvfp4_dsa_moe(
         .context("building B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
+/// Build SGLang's B200 GLM-5.2 NVFP4 graph under pure tensor parallelism.
+/// Routing is resolved at EP1 because every TP rank owns all experts.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_sglang_nvfp4_tp_dsa_moe(
+    model_spec: &ModelSpec,
+    tp_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    mtp_mode: Glm52MtpMode,
+    expert_popularity_file: Option<&str>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52SglangNvfp4TpDsaMoeModel> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 NVFP4 config")?;
+    let routing = resolve_routing_source(
+        routing_kind,
+        routing_seed,
+        model_cfg.num_experts.get(),
+        1,
+        num_sparse_layers(&model_cfg),
+        model_cfg.router_top_k,
+        expert_popularity_file,
+    )?;
+    let parallel = Glm52SglangNvfp4TpDsaMoeParallel {
+        tp_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+    };
+    let configs = glm52_sglang_nvfp4_tp_dsa_moe::build_configs(
+        &model_cfg,
+        &parallel,
+        &routing,
+        model_spec.fp8,
+        mtp_mode,
+    )
+    .context("expanding B200 GLM-5.2 NVFP4 pure-TP architecture configs")?;
+    let resolved = glm52_sglang_nvfp4_tp_dsa_moe::resolve_configs(&configs);
+    glm52_sglang_nvfp4_tp_dsa_moe::build(name.to_string(), resolved, bridge)
+        .context("building B200 GLM-5.2 NVFP4 pure-TP model (often a missing profile.db row)")
+}
+
 /// Build the AFD attn-side (layer-wise) Qwen3-MoE model — attention only, for ONE
 /// DP shard (`attn_tp_size` head-parallel ranks). The attn pool runs one of these
 /// per DP shard (its `replicas`). Pairs with [`qwen3_ffn_moe`].
@@ -1228,6 +1281,26 @@ pub fn build_iter_model(
             model,
             *ep_size,
             *nvl_num_gpu,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            *mtp_mode,
+            expert_popularity_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Glm52SglangNvfp4TpDsaMoe {
+            model,
+            tp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            mtp_mode,
+            expert_popularity_file,
+        } => Box::new(glm52_sglang_nvfp4_tp_dsa_moe(
+            model,
+            *tp_size,
             *max_model_len,
             *routing,
             *routing_seed,

@@ -9,15 +9,16 @@
 //! communication remains outside both attention compound ops.
 //!
 //! GLM-5.2 has 32 semantic index heads. Projection and elementwise byte shapes
-//! therefore always use H32. The accepted prefill/decode logits caches are H64-
-//! only, so those two leaves deliberately use a separate H64 timing surrogate.
-//! That conservative surrogate changes timing identity, not model semantics.
+//! therefore always use H32. Logits may be billed at the physical H32 launch
+//! (SGLang) or the padded H64 launch (vLLM); the caller fixes that measured
+//! identity without changing model semantics.
 
 use std::sync::Arc;
 
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     DsaIndexCacheAppendKernel, DsaIndexCacheAppendKernelConfig, DsaIndexCacheAppendKernelInput,
+    DsaIndexerQRopeQuantKernel, DsaIndexerQRopeQuantKernelConfig, DsaIndexerQRopeQuantKernelInput,
     DsaMqaLogitsPrefillKernel, DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput,
     DsaPagedMqaLogitsDecodeKernel, DsaPagedMqaLogitsDecodeKernelConfig,
     DsaPagedMqaLogitsDecodeKernelInput, DsaPersistentTopkDecodeKernel,
@@ -34,6 +35,7 @@ use crate::timing::{
 const OP_KIND: &str = "dsa_indexer";
 const MODEL_INDEX_HEADS: u32 = 32;
 const PROFILE_INDEX_HEADS: u32 = 64;
+const PROFILE_INDEX_HEAD_CHOICES: [u32; 2] = [MODEL_INDEX_HEADS, PROFILE_INDEX_HEADS];
 const INDEX_HEAD_DIM: u32 = 128;
 const ROPE_DIM: u32 = 64;
 const HIDDEN_DIM: u32 = 6144;
@@ -45,6 +47,8 @@ const MAX_MODEL_LEN: u32 = 1_048_576;
 const LOGITS_ROW_STRIDE: u32 = 1_048_576;
 const CACHE_BLOCK_SIZE: u32 = 64;
 const QUANT_BLOCK_SIZE: u32 = 128;
+const Q_ROPE_LAYOUT: &str = "rope_first";
+const Q_ROPE_HADAMARD: bool = false;
 
 const SLOT_SUFFIXES: [&str; 15] = [
     "q_proj",
@@ -69,6 +73,7 @@ const SLOT_SUFFIXES: [&str; 15] = [
 pub struct DsaIndexerConfig {
     pub gemm_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    pub q_rope_backends: Vec<&'static str>,
     pub index_cache_append_backends: Vec<&'static str>,
     pub prefill_logits_backends: Vec<&'static str>,
     pub prefill_topk_backends: Vec<&'static str>,
@@ -103,6 +108,18 @@ pub struct DsaIndexerConfig {
     pub decode_context_mode: String,
     pub decode_page_mapping: String,
     pub clean_logits: bool,
+    pub launch_graph: DsaIndexerLaunchGraph,
+}
+
+/// Measured launch boundary for the indexer prologue. This is an L2 graph
+/// identity fixed by a provider-specific worklet, not a user runtime mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DsaIndexerLaunchGraph {
+    /// Key layernorm, query RoPE, and query quantization are separate leaves.
+    Separate,
+    /// SGLang folds key norm into its key-store launch and query quantization
+    /// into its query-RoPE launch.
+    FusedQueryRopeAndKeyStore,
 }
 
 #[derive(Clone, Debug)]
@@ -123,10 +140,10 @@ pub struct DsaIndexerOp {
     pub name: String,
     pub q_proj: Arc<SingleGemmKernel>,
     pub wk_weights_proj: Arc<SingleGemmKernel>,
-    pub k_layernorm: Arc<ElementwiseKernel>,
-    pub rope: Arc<ElementwiseKernel>,
-    pub q_quant: Arc<ElementwiseKernel>,
-    pub weight_scale: Arc<ElementwiseKernel>,
+    pub k_layernorm: Option<Arc<ElementwiseKernel>>,
+    rope: IndexerQRopeLeaf,
+    pub q_quant: Option<Arc<ElementwiseKernel>>,
+    pub weight_scale: Option<Arc<ElementwiseKernel>>,
     pub index_cache_append: Arc<DsaIndexCacheAppendKernel>,
     pub topk_buffer_fill: Arc<ElementwiseKernel>,
     pub prefill_cache_gather: Arc<ElementwiseKernel>,
@@ -157,26 +174,32 @@ impl DsaIndexerOp {
             subcfg.wk_weights_proj,
             bridge,
         )?);
-        let k_layernorm = Arc::new(ElementwiseKernel::build(
-            slot_name(&name, 2),
-            subcfg.k_layernorm,
-            bridge,
-        )?);
-        let rope = Arc::new(ElementwiseKernel::build(
-            slot_name(&name, 3),
-            subcfg.rope,
-            bridge,
-        )?);
-        let q_quant = Arc::new(ElementwiseKernel::build(
-            slot_name(&name, 4),
-            subcfg.q_quant,
-            bridge,
-        )?);
-        let weight_scale = Arc::new(ElementwiseKernel::build(
-            slot_name(&name, 5),
-            subcfg.weight_scale,
-            bridge,
-        )?);
+        let k_layernorm = subcfg
+            .k_layernorm
+            .map(|config| {
+                ElementwiseKernel::build(slot_name(&name, 2), config, bridge).map(Arc::new)
+            })
+            .transpose()?;
+        let rope = match subcfg.rope {
+            IndexerQRopeConfig::Elementwise(config) => IndexerQRopeLeaf::Elementwise(Arc::new(
+                ElementwiseKernel::build(slot_name(&name, 3), config, bridge)?,
+            )),
+            IndexerQRopeConfig::FusedQuant(config) => IndexerQRopeLeaf::FusedQuant(Arc::new(
+                DsaIndexerQRopeQuantKernel::build(slot_name(&name, 3), config, bridge)?,
+            )),
+        };
+        let q_quant = subcfg
+            .q_quant
+            .map(|config| {
+                ElementwiseKernel::build(slot_name(&name, 4), config, bridge).map(Arc::new)
+            })
+            .transpose()?;
+        let weight_scale = subcfg
+            .weight_scale
+            .map(|config| {
+                ElementwiseKernel::build(slot_name(&name, 5), config, bridge).map(Arc::new)
+            })
+            .transpose()?;
         let index_cache_append = Arc::new(DsaIndexCacheAppendKernel::build(
             slot_name(&name, 6),
             subcfg.index_cache_append,
@@ -245,15 +268,27 @@ impl DsaIndexerOp {
         })
     }
 
-    /// Fifteen fixed serial leaves, independent of request count and phase.
+    /// Fixed serial leaves, independent of request count and phase. A fused
+    /// provider graph omits launches that do not exist instead of emitting
+    /// synthetic zero-cost slots.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        CostNode::Sum(vec![
-            leaf(builder, &self.name, 0, &*self.q_proj),
-            leaf(builder, &self.name, 1, &*self.wk_weights_proj),
-            leaf(builder, &self.name, 2, &*self.k_layernorm),
-            leaf(builder, &self.name, 3, &*self.rope),
-            leaf(builder, &self.name, 4, &*self.q_quant),
-            leaf(builder, &self.name, 5, &*self.weight_scale),
+        let mut slots = Vec::with_capacity(15);
+        slots.push(leaf(builder, &self.name, 0, &*self.q_proj));
+        slots.push(leaf(builder, &self.name, 1, &*self.wk_weights_proj));
+        if let Some(k_layernorm) = &self.k_layernorm {
+            slots.push(leaf(builder, &self.name, 2, &**k_layernorm));
+        }
+        slots.push(match &self.rope {
+            IndexerQRopeLeaf::Elementwise(kernel) => leaf(builder, &self.name, 3, &**kernel),
+            IndexerQRopeLeaf::FusedQuant(kernel) => leaf(builder, &self.name, 3, &**kernel),
+        });
+        if let Some(q_quant) = &self.q_quant {
+            slots.push(leaf(builder, &self.name, 4, &**q_quant));
+        }
+        if let Some(weight_scale) = &self.weight_scale {
+            slots.push(leaf(builder, &self.name, 5, &**weight_scale));
+        }
+        slots.extend([
             leaf(builder, &self.name, 6, &*self.index_cache_append),
             leaf(builder, &self.name, 7, &*self.topk_buffer_fill),
             leaf(builder, &self.name, 8, &*self.prefill_cache_gather),
@@ -263,10 +298,11 @@ impl DsaIndexerOp {
             leaf(builder, &self.name, 12, &*self.decode_logits),
             leaf(builder, &self.name, 13, &*self.decode_topk),
             leaf(builder, &self.name, 14, &*self.decode_unpack),
-        ])
+        ]);
+        CostNode::Sum(slots)
     }
 
-    /// Push exactly the fifteen compile slots in the same order (INV-2).
+    /// Push the same provider-specific slots emitted by `compile`, in order.
     pub fn eval(&self, input: &DsaIndexerInput, ev: &mut Evaluator) {
         let normalized = normalize_input(input, self.next_n, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid DsaIndexerInput: {reason}"));
@@ -282,10 +318,31 @@ impl DsaIndexerOp {
             || active_gemm.clone().into(),
         );
 
-        push_elementwise(&self.k_layernorm, normalized.active_query_rows, ev);
-        push_elementwise(&self.rope, normalized.active_query_rows, ev);
-        push_elementwise(&self.q_quant, normalized.active_query_rows, ev);
-        push_elementwise(&self.weight_scale, normalized.active_query_rows, ev);
+        if let Some(k_layernorm) = &self.k_layernorm {
+            push_elementwise(k_layernorm, normalized.active_query_rows, ev);
+        }
+        match &self.rope {
+            IndexerQRopeLeaf::Elementwise(kernel) => {
+                push_elementwise(kernel, normalized.active_query_rows, ev)
+            }
+            IndexerQRopeLeaf::FusedQuant(kernel) => {
+                let shape = DsaIndexerQRopeQuantKernelInput {
+                    num_tokens: normalized.active_query_rows,
+                };
+                let metrics = if normalized.active_query_rows == 0 {
+                    LeafMetrics::ZERO
+                } else {
+                    kernel.eval(&shape)
+                };
+                ev.push(metrics, || shape.clone().into());
+            }
+        }
+        if let Some(q_quant) = &self.q_quant {
+            push_elementwise(q_quant, normalized.active_query_rows, ev);
+        }
+        if let Some(weight_scale) = &self.weight_scale {
+            push_elementwise(weight_scale, normalized.active_query_rows, ev);
+        }
 
         let cache_append = DsaIndexCacheAppendKernelInput {
             num_tokens: input.num_new_tokens,
@@ -366,10 +423,10 @@ impl DsaIndexerOp {
 struct SubkernelConfigs {
     q_proj: SingleGemmKernelConfig,
     wk_weights_proj: SingleGemmKernelConfig,
-    k_layernorm: ElementwiseKernelConfig,
-    rope: ElementwiseKernelConfig,
-    q_quant: ElementwiseKernelConfig,
-    weight_scale: ElementwiseKernelConfig,
+    k_layernorm: Option<ElementwiseKernelConfig>,
+    rope: IndexerQRopeConfig,
+    q_quant: Option<ElementwiseKernelConfig>,
+    weight_scale: Option<ElementwiseKernelConfig>,
     index_cache_append: DsaIndexCacheAppendKernelConfig,
     topk_buffer_fill: ElementwiseKernelConfig,
     prefill_cache_gather: ElementwiseKernelConfig,
@@ -379,6 +436,16 @@ struct SubkernelConfigs {
     decode_logits: DsaPagedMqaLogitsDecodeKernelConfig,
     decode_topk: DsaPersistentTopkDecodeKernelConfig,
     decode_unpack: ElementwiseKernelConfig,
+}
+
+enum IndexerQRopeConfig {
+    Elementwise(ElementwiseKernelConfig),
+    FusedQuant(DsaIndexerQRopeQuantKernelConfig),
+}
+
+enum IndexerQRopeLeaf {
+    Elementwise(Arc<ElementwiseKernel>),
+    FusedQuant(Arc<DsaIndexerQRopeQuantKernel>),
 }
 
 struct NormalizedInput {
@@ -426,10 +493,29 @@ fn subkernel_configs(cfg: &DsaIndexerConfig) -> Result<SubkernelConfigs, BuildEr
             k: cfg.hidden_dim.clone(),
             dtype: cfg.gemm_dtype,
         },
-        k_layernorm: elementwise.k_layernorm,
-        rope: elementwise.rope,
-        q_quant: elementwise.q_quant,
-        weight_scale: elementwise.weight_scale,
+        k_layernorm: (cfg.launch_graph == DsaIndexerLaunchGraph::Separate)
+            .then_some(elementwise.k_layernorm),
+        rope: match cfg.launch_graph {
+            DsaIndexerLaunchGraph::Separate => IndexerQRopeConfig::Elementwise(elementwise.rope),
+            DsaIndexerLaunchGraph::FusedQueryRopeAndKeyStore => {
+                IndexerQRopeConfig::FusedQuant(DsaIndexerQRopeQuantKernelConfig {
+                    backends: cfg.q_rope_backends.clone(),
+                    gpu_name: cfg.gpu_name.clone(),
+                    num_heads: cfg.model_num_index_heads.clone(),
+                    head_dim: cfg.index_head_dim.clone(),
+                    rope_dim: cfg.rope_dim.clone(),
+                    rope_layout: Q_ROPE_LAYOUT.to_string(),
+                    hadamard: Q_ROPE_HADAMARD,
+                    input_dtype: cfg.input_dtype,
+                    q_output_dtype: cfg.q_dtype,
+                    weight_output_dtype: cfg.weight_dtype,
+                })
+            }
+        },
+        q_quant: (cfg.launch_graph == DsaIndexerLaunchGraph::Separate)
+            .then_some(elementwise.q_quant),
+        weight_scale: (cfg.launch_graph == DsaIndexerLaunchGraph::Separate)
+            .then_some(elementwise.weight_scale),
         index_cache_append: DsaIndexCacheAppendKernelConfig {
             backends: cfg.index_cache_append_backends.clone(),
             gpu_name: cfg.gpu_name.clone(),
@@ -509,11 +595,6 @@ fn validate_config(cfg: &DsaIndexerConfig) -> Result<(), BuildError> {
             cfg.model_num_index_heads.get(),
             MODEL_INDEX_HEADS,
         ),
-        (
-            "profile_num_index_heads",
-            cfg.profile_num_index_heads.get(),
-            PROFILE_INDEX_HEADS,
-        ),
         ("index_head_dim", cfg.index_head_dim.get(), INDEX_HEAD_DIM),
         ("rope_dim", cfg.rope_dim.get(), ROPE_DIM),
         ("top_k", cfg.top_k, TOP_K),
@@ -525,6 +606,19 @@ fn validate_config(cfg: &DsaIndexerConfig) -> Result<(), BuildError> {
                 "{name} must be {required}, got {actual}"
             )));
         }
+    }
+    let profile_heads = cfg.profile_num_index_heads.get();
+    if !PROFILE_INDEX_HEAD_CHOICES.contains(&profile_heads) {
+        return Err(fit_failed(format!(
+            "profile_num_index_heads must be one of {PROFILE_INDEX_HEAD_CHOICES:?}, got {profile_heads}"
+        )));
+    }
+    if cfg.launch_graph == DsaIndexerLaunchGraph::FusedQueryRopeAndKeyStore
+        && cfg.q_rope_backends.is_empty()
+    {
+        return Err(fit_failed(
+            "fused query-RoPE graph requires at least one q_rope backend",
+        ));
     }
     let max_model_len = cfg.max_model_len.get();
     let logits_row_stride = cfg.logits_row_stride.get();
@@ -783,7 +877,8 @@ fn push_prefill_log(ev: &mut Evaluator, metrics: LeafMetrics, pairs: &[(u32, u32
 mod tests {
     use super::{
         elementwise_configs, normalize_input, subkernel_configs, validate_config, DsaIndexerConfig,
-        DsaIndexerDecodeInput, DsaIndexerInput, LOGITS_ROW_STRIDE, MAX_MODEL_LEN, SLOT_SUFFIXES,
+        DsaIndexerDecodeInput, DsaIndexerInput, DsaIndexerLaunchGraph, IndexerQRopeConfig,
+        LOGITS_ROW_STRIDE, MAX_MODEL_LEN, SLOT_SUFFIXES,
     };
     use crate::timing::bridge::DType;
     use crate::timing::slot_input::DsaIndexerPrefillLog;
@@ -793,6 +888,7 @@ mod tests {
         DsaIndexerConfig {
             gemm_backends: vec!["torch"],
             elementwise_backends: vec!["triton"],
+            q_rope_backends: Vec::new(),
             index_cache_append_backends: vec!["vllm_cuda"],
             prefill_logits_backends: vec!["deepgemm_fp8"],
             prefill_topk_backends: vec!["vllm_cuda"],
@@ -825,6 +921,7 @@ mod tests {
             decode_context_mode: "uniform".to_string(),
             decode_page_mapping: "unique_scattered".to_string(),
             clean_logits: false,
+            launch_graph: DsaIndexerLaunchGraph::Separate,
         }
     }
 
@@ -910,6 +1007,40 @@ mod tests {
     }
 
     #[test]
+    fn logits_profile_accepts_physical_h32_and_vllm_padded_h64() {
+        for num_heads in [32, 64] {
+            let mut config = cfg(1);
+            config.profile_num_index_heads = Dim::param("profile_num_index_heads", num_heads);
+            let configs = subkernel_configs(&config).unwrap();
+            assert_eq!(configs.prefill_logits.num_heads, num_heads);
+            assert_eq!(configs.decode_logits.num_heads, num_heads);
+        }
+    }
+
+    #[test]
+    fn fused_sglang_prologue_uses_one_measured_q_rope_leaf() {
+        let mut config = cfg(1);
+        config.launch_graph = DsaIndexerLaunchGraph::FusedQueryRopeAndKeyStore;
+        config.q_rope_backends = vec!["sglang_cuda"];
+
+        let configs = subkernel_configs(&config).unwrap();
+        assert!(configs.k_layernorm.is_none());
+        assert!(configs.q_quant.is_none());
+        assert!(configs.weight_scale.is_none());
+        match configs.rope {
+            IndexerQRopeConfig::FusedQuant(rope) => {
+                assert_eq!(rope.backends, vec!["sglang_cuda"]);
+                assert_eq!(rope.num_heads, 32);
+                assert_eq!(rope.head_dim, 128);
+                assert_eq!(rope.rope_dim, 64);
+                assert_eq!(rope.rope_layout, "rope_first");
+                assert!(!rope.hadamard);
+            }
+            IndexerQRopeConfig::Elementwise(_) => panic!("expected fused q-RoPE config"),
+        }
+    }
+
+    #[test]
     fn all_elementwise_byte_formulas_use_model_h32() {
         let e = elementwise_configs(&cfg(1)).unwrap();
         let bytes = |config: &crate::timing::kernels::ElementwiseKernelConfig| {
@@ -964,7 +1095,7 @@ mod tests {
     fn invalid_glm_specific_config_fails_before_kernel_builds() {
         for mutate in [
             |cfg: &mut DsaIndexerConfig| cfg.model_num_index_heads = 64.into(),
-            |cfg: &mut DsaIndexerConfig| cfg.profile_num_index_heads = 32.into(),
+            |cfg: &mut DsaIndexerConfig| cfg.profile_num_index_heads = 48.into(),
             |cfg: &mut DsaIndexerConfig| cfg.hidden_dim = 4096.into(),
             |cfg: &mut DsaIndexerConfig| cfg.index_head_dim = 64.into(),
             |cfg: &mut DsaIndexerConfig| cfg.top_k = 1024,

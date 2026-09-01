@@ -1,0 +1,17 @@
+arch:
+  iter:
+    type: glm52_sglang_nvfp4_tp_dsa_moe
+    model_config: model/config/glm52_nvfp4.json
+    num_layers: null
+    sim_num_layers: null
+    fp8: false
+    tp_size: 4
+    max_model_len: 8192
+    routing: uniform
+    routing_seed: null
+    mtp_mode: off
+    expert_popularity_file: presets/alignment/glm52_nvfp4_b200_sglang_tp4/expert_popularity.json
+gpu: "NVIDIA B200"
+backends: {}
+log_dir: logs/predict_glm52_nvfp4_b200_sglang_tp4
+cases_file: predict_glm52_nvfp4_b200_sglang_tp4_cases.yaml

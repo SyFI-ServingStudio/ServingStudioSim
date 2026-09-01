@@ -19,6 +19,7 @@ pub mod fp8_attn_block_tp;
 pub mod fp8_post_attn_router_tp;
 pub mod fp8_pre_attn_proj_tp;
 pub mod glm52_dense_ffn_local;
+mod glm52_dsa_attn_common;
 pub mod glm52_dsa_attn_local;
 pub mod glm52_moe_router_local;
 pub mod glm52_mtp_head_local;
@@ -29,6 +30,7 @@ pub mod moe_expert_compute_local;
 pub mod native_fp8_moe_router_local;
 pub mod native_moe_expert_compute_local;
 pub mod native_moe_router_local;
+pub mod nvfp4_moe_local;
 pub mod post_attn_local;
 pub mod post_attn_router_tp;
 pub mod pre_attn_local;
@@ -39,13 +41,15 @@ pub mod qwen36_head_local;
 pub mod qwen36_moe_finalize_local;
 pub mod qwen36_moe_router_local;
 pub mod qwen36_shared_expert_local;
+pub mod sglang_glm52_dsa_attn_local;
+pub mod sglang_glm52_moe_router_local;
+pub mod sglang_moe_finalize_local;
 pub mod vllm_fp8_attn_block_tp;
 pub mod vllm_fp8_moe_expert_compute_local;
 pub mod vllm_fp8_moe_router_local;
 pub mod vllm_glm52_dense_ffn_local;
 pub mod vllm_glm52_dsa_attn_local;
 pub mod vllm_glm52_shared_expert_local;
-pub mod vllm_nvfp4_moe_local;
 
 pub use attn_block_tp::{
     AttnBlockTpWorklet, AttnBlockTpWorkletConfig, AttnBlockTpWorkletInput,
@@ -126,6 +130,10 @@ pub use native_moe_router_local::{
     NativeMoeRouterLocalWorklet, NativeMoeRouterLocalWorkletConfig,
     NativeMoeRouterLocalWorkletInput, NativeMoeRouterLocalWorkletResolved,
 };
+pub use nvfp4_moe_local::{
+    Nvfp4MoeLocalWorklet, Nvfp4MoeLocalWorkletConfig, Nvfp4MoeLocalWorkletInput,
+    Nvfp4MoeLocalWorkletResolved,
+};
 pub use post_attn_local::{
     PostAttnLocalWorklet, PostAttnLocalWorkletConfig, PostAttnLocalWorkletInput,
     PostAttnLocalWorkletResolved,
@@ -166,6 +174,19 @@ pub use qwen36_shared_expert_local::{
     Qwen36SharedExpertLocalWorklet, Qwen36SharedExpertLocalWorkletConfig,
     Qwen36SharedExpertLocalWorkletInput, Qwen36SharedExpertLocalWorkletResolved,
 };
+pub use sglang_glm52_dsa_attn_local::{
+    SglangGlm52DsaAttnLocalDecodeInput, SglangGlm52DsaAttnLocalWorklet,
+    SglangGlm52DsaAttnLocalWorkletConfig, SglangGlm52DsaAttnLocalWorkletInput,
+    SglangGlm52DsaAttnLocalWorkletResolved,
+};
+pub use sglang_glm52_moe_router_local::{
+    SglangGlm52MoeRouterLocalWorklet, SglangGlm52MoeRouterLocalWorkletConfig,
+    SglangGlm52MoeRouterLocalWorkletInput, SglangGlm52MoeRouterLocalWorkletResolved,
+};
+pub use sglang_moe_finalize_local::{
+    SglangMoeFinalizeLocalWorklet, SglangMoeFinalizeLocalWorkletConfig,
+    SglangMoeFinalizeLocalWorkletInput, SglangMoeFinalizeLocalWorkletResolved,
+};
 pub use vllm_fp8_attn_block_tp::{
     VllmFp8AttnBlockTpWorklet, VllmFp8AttnBlockTpWorkletConfig, VllmFp8AttnBlockTpWorkletInput,
     VllmFp8AttnBlockTpWorkletResolved,
@@ -190,8 +211,4 @@ pub use vllm_glm52_dsa_attn_local::{
 pub use vllm_glm52_shared_expert_local::{
     VllmGlm52SharedExpertLocalWorklet, VllmGlm52SharedExpertLocalWorkletConfig,
     VllmGlm52SharedExpertLocalWorkletInput, VllmGlm52SharedExpertLocalWorkletResolved,
-};
-pub use vllm_nvfp4_moe_local::{
-    VllmNvfp4MoeLocalWorklet, VllmNvfp4MoeLocalWorkletConfig, VllmNvfp4MoeLocalWorkletInput,
-    VllmNvfp4MoeLocalWorkletResolved,
 };

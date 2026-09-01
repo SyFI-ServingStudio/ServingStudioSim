@@ -631,6 +631,7 @@ pub fn build_configs(
             residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
             gemm_backends: gemm_backends.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            tp_size: 1,
             gpu_name: gpu.clone(),
             hidden_dim: model.hidden_dim.clone(),
             intermediate_dim: model.dense_intermediate_dim.clone(),
@@ -690,6 +691,7 @@ pub fn build_configs(
         shared_expert: Glm52SharedExpertLocalWorkletConfig {
             gemm_backends: gemm_backends.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            tp_size: 1,
             gpu_name: gpu.clone(),
             hidden_dim: model.hidden_dim.clone(),
             moe_intermediate_dim: model.moe_intermediate_dim.clone(),

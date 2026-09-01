@@ -13,8 +13,9 @@
 use std::sync::Arc;
 
 use crate::op::attention::{
-    DsaIndexerConfig, DsaIndexerDecodeInput, DsaIndexerInput, DsaIndexerOp,
+    DsaIndexerConfig, DsaIndexerDecodeInput, DsaIndexerInput, DsaIndexerLaunchGraph, DsaIndexerOp,
     DsaSparseMlaAttentionConfig, DsaSparseMlaAttentionInput, DsaSparseMlaAttentionOp,
+    DsaSparseMlaLaunchGraph,
 };
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -208,6 +209,7 @@ impl Glm52DsaAttnLocalWorklet {
         let indexer = cfg.include_indexer.then(|| DsaIndexerConfig {
             gemm_backends: cfg.indexer_gemm_backends.clone(),
             elementwise_backends: cfg.indexer_elementwise_backends.clone(),
+            q_rope_backends: Vec::new(),
             index_cache_append_backends: cfg.index_cache_append_backends.clone(),
             prefill_logits_backends: cfg.index_prefill_logits_backends.clone(),
             prefill_topk_backends: cfg.index_prefill_topk_backends.clone(),
@@ -240,6 +242,7 @@ impl Glm52DsaAttnLocalWorklet {
             decode_context_mode: cfg.index_decode_context_mode.clone(),
             decode_page_mapping: cfg.index_decode_page_mapping.clone(),
             clean_logits: cfg.index_clean_logits,
+            launch_graph: DsaIndexerLaunchGraph::Separate,
         });
 
         Glm52DsaAttnLocalWorkletResolved {
@@ -312,6 +315,9 @@ impl Glm52DsaAttnLocalWorklet {
                 mla_cache_block_size: cfg.cache_block_size,
                 mla_cache_format: cfg.sparse_mla_cache_format.clone(),
                 decode_next_n: cfg.decode_next_n,
+                launch_graph: DsaSparseMlaLaunchGraph::Separate {
+                    index_remap_backends: Vec::new(),
+                },
                 exact_varlen: None,
             },
             v_up: BatchedGemmKernelConfig {

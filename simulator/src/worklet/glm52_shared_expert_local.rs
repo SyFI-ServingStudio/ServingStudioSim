@@ -32,6 +32,7 @@ const SOURCE_ORDER: [&str; 3] = ["gate_up_proj", "silu_and_mul", "down_proj"];
 pub struct Glm52SharedExpertLocalWorkletConfig {
     pub gemm_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    pub tp_size: u16,
     pub gpu_name: String,
     pub hidden_dim: Dim,
     pub moe_intermediate_dim: Dim,
@@ -76,7 +77,8 @@ impl Glm52SharedExpertLocalWorklet {
             "shared expert width",
             &[cfg.n_shared_experts, cfg.moe_intermediate_dim.get()],
         )
-        .expect("validated GLM-5.2 shared-expert width must fit u32");
+        .expect("validated GLM-5.2 shared-expert width must fit u32")
+            / u32::from(cfg.tp_size);
         let gate_up_n = checked_product("gate_up_proj.n", &[2, shared_width])
             .expect("validated GLM-5.2 shared gate/up dimension must fit u32");
         let silu_input_bytes = checked_product(
@@ -207,6 +209,16 @@ fn validate_config(cfg: &Glm52SharedExpertLocalWorkletConfig) -> Result<(), Stri
             cfg.gemm_dtype.as_str()
         ));
     }
+    let shared_width = checked_product(
+        "shared expert width",
+        &[cfg.n_shared_experts, cfg.moe_intermediate_dim.get()],
+    )?;
+    if cfg.tp_size == 0 || shared_width % u32::from(cfg.tp_size) != 0 {
+        return Err(format!(
+            "shared expert width {shared_width} must be divisible by positive tp_size {}",
+            cfg.tp_size
+        ));
+    }
     Ok(())
 }
 
@@ -235,8 +247,10 @@ fn worklet_label(name: &str, cfg: &Glm52SharedExpertLocalWorkletConfig) -> Strin
     )
     .expect("validated GLM-5.2 shared-expert label width must fit u32");
     format!(
-        "{name} (Glm52SharedExpertLocalWorklet) [local (1 GPU); shared_experts={}; shared_width={}]",
-        cfg.n_shared_experts, shared_width
+        "{name} (Glm52SharedExpertLocalWorklet) [rank-local; tp={}; shared_experts={}; shared_width/rank={}]",
+        cfg.tp_size,
+        cfg.n_shared_experts,
+        shared_width / u32::from(cfg.tp_size)
     )
 }
 
@@ -279,6 +293,7 @@ mod tests {
         Glm52SharedExpertLocalWorkletConfig {
             gemm_backends: vec!["torch_linear"],
             elementwise_backends: vec!["triton"],
+            tp_size: 1,
             gpu_name: "NVIDIA H200".to_string(),
             hidden_dim: Dim::param("hidden_dim", HIDDEN_DIM),
             moe_intermediate_dim: Dim::param("moe_intermediate_dim", MOE_INTERMEDIATE_DIM),
@@ -328,6 +343,20 @@ mod tests {
         assert_eq!(r.down_proj.dtype, DType::Bf16);
         assert_eq!(r.down_proj.backends, vec!["torch_linear"]);
         assert_eq!(r.raw_cfg.gpu_name, "NVIDIA H200");
+    }
+
+    #[test]
+    fn tp4_partitions_only_the_shared_expert_width() {
+        let mut config = cfg();
+        config.tp_size = 4;
+        let r = Glm52SharedExpertLocalWorklet::resolve_config(&config);
+
+        assert_eq!(r.gate_up_proj.n, 1024);
+        assert_eq!(r.gate_up_proj.k, 6144);
+        assert_eq!(r.silu_and_mul.input_bytes_per_token, 2048);
+        assert_eq!(r.silu_and_mul.output_bytes_per_token, 1024);
+        assert_eq!(r.down_proj.n, 6144);
+        assert_eq!(r.down_proj.k, 512);
     }
 
     #[test]
@@ -386,13 +415,14 @@ mod tests {
     }
 
     #[test]
-    fn label_documents_local_one_shared_expert_boundary() {
+    fn label_documents_rank_local_shared_expert_partition() {
         let label = worklet_label("layer.shared_expert", &cfg());
         assert!(label.contains("Glm52SharedExpertLocalWorklet"));
-        assert!(label.contains("local (1 GPU)"));
+        assert!(label.contains("rank-local"));
+        assert!(label.contains("tp=1"));
         assert!(label.contains("shared_experts=1"));
-        assert!(label.contains("shared_width=2048"));
-        for forbidden in ["tp=", "allreduce", "collective"] {
+        assert!(label.contains("shared_width/rank=2048"));
+        for forbidden in ["allreduce", "collective"] {
             assert!(!label.contains(forbidden));
         }
     }

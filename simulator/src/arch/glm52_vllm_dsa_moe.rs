@@ -309,6 +309,7 @@ fn attention_config(
         sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
         sparse_mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
         sparse_elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+        sparse_index_remap_backends: Vec::new(),
         gpu_name: parallel.gpu_name.clone(),
         hidden_dim: model.hidden_dim.clone(),
         num_attention_heads: model.num_attention_heads.clone(),

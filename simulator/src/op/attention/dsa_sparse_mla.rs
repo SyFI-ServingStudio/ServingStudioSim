@@ -1,14 +1,15 @@
 //! GLM-5.2 sparse MLA attention compound op.
 //!
-//! One logical attention call is a fixed sequential pipeline:
-//! query concat, MLA cache append, request-local index remap, sparse prefill,
-//! then sparse decode. The production B200 variant uses the dedicated index
-//! remap and one exact varlen sparse-prefill launch; the inherited H200 variant
-//! keeps its accepted elementwise-remap and per-request prefill fallback.
+//! One logical attention call contains MLA cache append, sparse prefill, and
+//! sparse decode. Providers with separate launch boundaries additionally emit
+//! query concat and request-local index remap; SGLang fuses those operations
+//! into adjacent launches and therefore has no synthetic slots for them. The
+//! production B200 variant uses one exact-varlen sparse-prefill launch; the
+//! inherited H200 variant keeps its accepted per-request prefill fallback.
 //!
-//! Both variants retain the same five fixed CostTree slots. Backend-specific
-//! L1 selection is build-time config; runtime request topology remains inside
-//! this compound op and never leaks into L3.
+//! Backend-specific L1 selection and launch-graph identity are build-time
+//! config; runtime request topology remains inside this compound op and never
+//! leaks into L3.
 
 use std::sync::Arc;
 
@@ -60,18 +61,38 @@ pub struct DsaSparseMlaAttentionConfig {
     pub mla_cache_block_size: u32,
     pub mla_cache_format: String,
     pub decode_next_n: u32,
+    pub launch_graph: DsaSparseMlaLaunchGraph,
     /// `Some` selects the production B200 remap + exact-varlen prefill leaves.
     /// `None` retains the accepted H200 fallback without changing its profile
     /// identities or request aggregation.
     pub exact_varlen: Option<DsaSparseMlaExactVarlenConfig>,
 }
 
+/// Measured launch boundary around sparse MLA. Provider worklets select one
+/// graph; this is not a runtime/user tuning mode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DsaSparseMlaLaunchGraph {
+    Separate {
+        index_remap_backends: Vec<&'static str>,
+    },
+    /// SGLang's upstream fused RoPE produces the concatenated FP8 query and
+    /// its sparse-attention preparation consumes local indices directly.
+    FusedQueryConcatAndIndexRemap,
+}
+
 #[derive(Clone, Debug)]
 pub struct DsaSparseMlaExactVarlenConfig {
-    pub index_remap_backends: Vec<&'static str>,
     pub prefill_backends: Vec<&'static str>,
     pub max_model_len: u32,
-    pub page_table_mapping: String,
+    /// Production prefill indices are request-local and have a different
+    /// locality identity from decode's page selection. Keep the two cache axes
+    /// explicit instead of leaking `DsaSparseMlaAttentionConfig`'s decode
+    /// distribution into the prefill lookup.
+    pub prefill_index_distribution: String,
+    /// Required only by a separate production index-remap launch. A fused
+    /// provider graph must leave it absent rather than carrying an ignored
+    /// remap identity.
+    pub page_table_mapping: Option<String>,
 }
 
 /// Per-rank inputs for one logical sparse MLA attention call.
@@ -93,9 +114,9 @@ pub struct DsaSparseMlaAttentionInput {
 
 pub struct DsaSparseMlaAttentionOp {
     pub name: String,
-    pub query_concat: Arc<ElementwiseKernel>,
+    pub query_concat: Option<Arc<ElementwiseKernel>>,
     pub mla_cache_append: Arc<MlaCacheAppendKernel>,
-    index_remap: IndexRemapLeaf,
+    index_remap: Option<IndexRemapLeaf>,
     prefill: PrefillLeaf,
     pub decode: Arc<DsaSparseMlaAttentionKernel>,
     decode_next_n: u32,
@@ -151,27 +172,30 @@ impl DsaSparseMlaAttentionOp {
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
         let subcfg = subkernel_configs(&cfg)?;
-        let query_concat = Arc::new(ElementwiseKernel::build(
-            format!("{name}.{}", SLOT_SUFFIXES[0]),
-            subcfg.query_concat,
-            bridge,
-        )?);
+        let query_concat = subcfg
+            .query_concat
+            .map(|config| {
+                ElementwiseKernel::build(format!("{name}.{}", SLOT_SUFFIXES[0]), config, bridge)
+                    .map(Arc::new)
+            })
+            .transpose()?;
         let mla_cache_append = Arc::new(MlaCacheAppendKernel::build(
             format!("{name}.{}", SLOT_SUFFIXES[1]),
             subcfg.mla_cache_append,
             bridge,
         )?);
         let index_remap = match subcfg.index_remap {
-            IndexRemapConfig::Legacy(config) => IndexRemapLeaf::Legacy(Arc::new(
+            Some(IndexRemapConfig::Legacy(config)) => Some(IndexRemapLeaf::Legacy(Arc::new(
                 ElementwiseKernel::build(format!("{name}.{}", SLOT_SUFFIXES[2]), config, bridge)?,
-            )),
-            IndexRemapConfig::Production(config) => {
-                IndexRemapLeaf::Production(Arc::new(DsaSparseIndexRemapKernel::build(
+            ))),
+            Some(IndexRemapConfig::Production(config)) => Some(IndexRemapLeaf::Production(
+                Arc::new(DsaSparseIndexRemapKernel::build(
                     format!("{name}.{}", SLOT_SUFFIXES[2]),
                     config,
                     bridge,
-                )?))
-            }
+                )?),
+            )),
+            None => None,
         };
         let prefill = match subcfg.prefill {
             PrefillConfig::Legacy(config) => {
@@ -206,24 +230,29 @@ impl DsaSparseMlaAttentionOp {
         })
     }
 
-    /// Five fixed serial leaves, independent of request count (INV-1).
+    /// Emit only physical provider launches, independent of request count.
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        CostNode::Sum(vec![
-            builder.leaf(
+        let mut slots = Vec::with_capacity(5);
+        if let Some(query_concat) = &self.query_concat {
+            slots.push(builder.leaf(
                 format!("{}.{}", self.name, SLOT_SUFFIXES[0]),
-                self.query_concat.kind(),
-                self.query_concat.describe_config(),
-            ),
-            builder.leaf(
-                format!("{}.{}", self.name, SLOT_SUFFIXES[1]),
-                self.mla_cache_append.kind(),
-                self.mla_cache_append.describe_config(),
-            ),
-            builder.leaf(
+                query_concat.kind(),
+                query_concat.describe_config(),
+            ));
+        }
+        slots.push(builder.leaf(
+            format!("{}.{}", self.name, SLOT_SUFFIXES[1]),
+            self.mla_cache_append.kind(),
+            self.mla_cache_append.describe_config(),
+        ));
+        if let Some(index_remap) = &self.index_remap {
+            slots.push(builder.leaf(
                 format!("{}.{}", self.name, SLOT_SUFFIXES[2]),
-                self.index_remap.kind(),
-                self.index_remap.describe_config(),
-            ),
+                index_remap.kind(),
+                index_remap.describe_config(),
+            ));
+        }
+        slots.extend([
             builder.leaf(
                 format!("{}.{}", self.name, SLOT_SUFFIXES[3]),
                 self.prefill.kind(),
@@ -234,19 +263,22 @@ impl DsaSparseMlaAttentionOp {
                 self.decode.kind(),
                 self.decode.describe_config(),
             ),
-        ])
+        ]);
+        CostNode::Sum(slots)
     }
 
-    /// Push the same five slots in compile order (INV-2).
+    /// Push the same provider-specific slots in compile order (INV-2).
     pub fn eval(&self, input: &DsaSparseMlaAttentionInput, ev: &mut Evaluator) {
         let normalized = normalize_input(input, self.decode_next_n)
             .unwrap_or_else(|reason| panic!("invalid DsaSparseMlaAttentionInput: {reason}"));
 
-        let query_concat = ElementwiseKernelInput {
-            num_tokens: normalized.query_rows,
-        };
-        let query_concat_metrics = eval_or_zero(&self.query_concat, &query_concat);
-        ev.push(query_concat_metrics, || query_concat.clone().into());
+        if let Some(query_concat_kernel) = &self.query_concat {
+            let query_concat = ElementwiseKernelInput {
+                num_tokens: normalized.query_rows,
+            };
+            let query_concat_metrics = eval_or_zero(query_concat_kernel, &query_concat);
+            ev.push(query_concat_metrics, || query_concat.clone().into());
+        }
 
         let cache_append = MlaCacheAppendKernelInput {
             num_tokens: input.num_new_tokens,
@@ -259,14 +291,15 @@ impl DsaSparseMlaAttentionOp {
         ev.push(cache_append_metrics, || cache_append.clone().into());
 
         match &self.index_remap {
-            IndexRemapLeaf::Legacy(kernel) => {
+            None => {}
+            Some(IndexRemapLeaf::Legacy(kernel)) => {
                 let shape = ElementwiseKernelInput {
                     num_tokens: normalized.query_rows,
                 };
                 let metrics = eval_or_zero(kernel, &shape);
                 ev.push(metrics, || shape.clone().into());
             }
-            IndexRemapLeaf::Production(kernel) => {
+            Some(IndexRemapLeaf::Production(kernel)) => {
                 let shape =
                     production_index_remap_input(input, self.decode_next_n, self.selected_k)
                         .unwrap_or_else(|reason| {
@@ -342,9 +375,9 @@ impl DsaSparseMlaAttentionOp {
 }
 
 struct SubkernelConfigs {
-    query_concat: ElementwiseKernelConfig,
+    query_concat: Option<ElementwiseKernelConfig>,
     mla_cache_append: MlaCacheAppendKernelConfig,
-    index_remap: IndexRemapConfig,
+    index_remap: Option<IndexRemapConfig>,
     prefill: PrefillConfig,
     decode: DsaSparseMlaAttentionKernelConfig,
 }
@@ -386,9 +419,9 @@ fn subkernel_configs(cfg: &DsaSparseMlaAttentionConfig) -> Result<SubkernelConfi
         return Err(fit_failed("softmax_scale_denominator must be positive"));
     }
 
-    let (index_remap, prefill) = match &cfg.exact_varlen {
+    let (max_blocks_per_request, prefill) = match &cfg.exact_varlen {
         None => (
-            IndexRemapConfig::Legacy(legacy_index_remap_config(cfg)?),
+            None,
             PrefillConfig::Legacy(sparse_attention_config(cfg, "causal_tail")),
         ),
         Some(exact) => {
@@ -414,18 +447,73 @@ fn subkernel_configs(cfg: &DsaSparseMlaAttentionConfig) -> Result<SubkernelConfi
                 )));
             }
             (
-                IndexRemapConfig::Production(production_index_remap_config(
-                    cfg,
-                    exact,
-                    max_blocks_per_request,
-                )),
+                Some(max_blocks_per_request),
                 PrefillConfig::Production(production_prefill_config(cfg, exact)),
             )
         }
     };
 
+    let (query_concat, index_remap) = match &cfg.launch_graph {
+        DsaSparseMlaLaunchGraph::Separate {
+            index_remap_backends,
+        } => {
+            let remap = match (&cfg.exact_varlen, max_blocks_per_request) {
+                (Some(exact), Some(max_blocks)) => {
+                    if index_remap_backends.is_empty() {
+                        return Err(fit_failed(
+                            "exact-varlen separate graph requires an index-remap backend",
+                        ));
+                    }
+                    if exact.page_table_mapping.is_none() {
+                        return Err(fit_failed(
+                            "exact-varlen separate graph requires page-table mapping",
+                        ));
+                    }
+                    IndexRemapConfig::Production(production_index_remap_config(
+                        cfg,
+                        exact,
+                        max_blocks,
+                        index_remap_backends,
+                    ))
+                }
+                (None, None) => {
+                    if !index_remap_backends.is_empty() {
+                        return Err(fit_failed(
+                            "legacy separate graph must not configure a production index-remap backend",
+                        ));
+                    }
+                    IndexRemapConfig::Legacy(legacy_index_remap_config(cfg)?)
+                }
+                _ => unreachable!("exact-varlen validation returns paired state"),
+            };
+            (Some(query_concat_config(cfg)?), Some(remap))
+        }
+        DsaSparseMlaLaunchGraph::FusedQueryConcatAndIndexRemap => {
+            if cfg.exact_varlen.is_none() {
+                return Err(fit_failed(
+                    "fused sparse graph requires the production exact-varlen prefill",
+                ));
+            }
+            if !cfg.elementwise_backends.is_empty() {
+                return Err(fit_failed(
+                    "fused sparse graph must not configure elementwise concat/remap backends",
+                ));
+            }
+            if cfg
+                .exact_varlen
+                .as_ref()
+                .is_some_and(|exact| exact.page_table_mapping.is_some())
+            {
+                return Err(fit_failed(
+                    "fused sparse graph must not configure page-table remapping",
+                ));
+            }
+            (None, None)
+        }
+    };
+
     Ok(SubkernelConfigs {
-        query_concat: query_concat_config(cfg)?,
+        query_concat,
         mla_cache_append: mla_cache_append_config(cfg),
         index_remap,
         prefill,
@@ -467,7 +555,10 @@ fn mla_cache_append_config(cfg: &DsaSparseMlaAttentionConfig) -> MlaCacheAppendK
         kv_lora_rank: cfg.latent_dim.clone(),
         rope_dim: cfg.rope_dim.clone(),
         block_size: cfg.mla_cache_block_size,
-        input_dtype: cfg.dtype,
+        input_dtype: match &cfg.launch_graph {
+            DsaSparseMlaLaunchGraph::Separate { .. } => cfg.dtype,
+            DsaSparseMlaLaunchGraph::FusedQueryConcatAndIndexRemap => cfg.attention_cache_dtype,
+        },
         kv_dtype: cfg.attention_cache_dtype,
         cache_format: cfg.mla_cache_format.clone(),
     }
@@ -505,6 +596,7 @@ fn production_index_remap_config(
     cfg: &DsaSparseMlaAttentionConfig,
     exact: &DsaSparseMlaExactVarlenConfig,
     max_blocks_per_request: u32,
+    backends: &[&'static str],
 ) -> DsaSparseIndexRemapKernelConfig {
     let index_distribution = match cfg.index_distribution.as_str() {
         "unique_scattered_pages" => "unique_scattered_blocks",
@@ -512,13 +604,16 @@ fn production_index_remap_config(
         other => other,
     };
     DsaSparseIndexRemapKernelConfig {
-        backends: exact.index_remap_backends.clone(),
+        backends: backends.to_vec(),
         gpu_name: cfg.gpu_name.clone(),
         selected_k: cfg.selected_k,
         block_size: cfg.mla_cache_block_size,
         max_blocks_per_request,
         index_distribution: index_distribution.to_string(),
-        page_table_mapping: exact.page_table_mapping.clone(),
+        page_table_mapping: exact
+            .page_table_mapping
+            .clone()
+            .expect("separate exact-varlen graph validates page-table mapping"),
         return_valid_counts: true,
         index_dtype: cfg.index_dtype.clone(),
     }
@@ -543,7 +638,7 @@ fn production_prefill_config(
         cache_dtype: cfg.attention_cache_dtype,
         index_dtype: cfg.index_dtype.clone(),
         output_dtype: cfg.attention_output_dtype,
-        index_distribution: cfg.index_distribution.clone(),
+        index_distribution: exact.prefill_index_distribution.clone(),
         cache_layout: cfg.sparse_cache_layout.clone(),
     }
 }
@@ -761,8 +856,8 @@ mod tests {
     use super::{
         legacy_index_remap_config, normalize_input, production_index_remap_input,
         query_concat_config, subkernel_configs, DsaSparseMlaAttentionConfig,
-        DsaSparseMlaAttentionInput, DsaSparseMlaExactVarlenConfig, IndexRemapConfig, PrefillConfig,
-        SLOT_SUFFIXES,
+        DsaSparseMlaAttentionInput, DsaSparseMlaExactVarlenConfig, DsaSparseMlaLaunchGraph,
+        IndexRemapConfig, PrefillConfig, SLOT_SUFFIXES,
     };
     use crate::timing::bridge::DType;
     use crate::timing::slot_input::DsaSparseMlaPrefillLog;
@@ -791,6 +886,9 @@ mod tests {
             mla_cache_block_size: 64,
             mla_cache_format: "plain".to_string(),
             decode_next_n,
+            launch_graph: DsaSparseMlaLaunchGraph::Separate {
+                index_remap_backends: Vec::new(),
+            },
             exact_varlen: None,
         }
     }
@@ -806,11 +904,14 @@ mod tests {
         config.index_distribution = "unique_scattered_pages".to_string();
         config.sparse_cache_layout = "hnd_paged_mqa_fp8_latent_rope".to_string();
         config.mla_cache_format = "plain".to_string();
-        config.exact_varlen = Some(DsaSparseMlaExactVarlenConfig {
+        config.launch_graph = DsaSparseMlaLaunchGraph::Separate {
             index_remap_backends: vec!["vllm_triton"],
+        };
+        config.exact_varlen = Some(DsaSparseMlaExactVarlenConfig {
             prefill_backends: vec!["flashinfer_trtllm_fp8"],
             max_model_len: 8192,
-            page_table_mapping: "request_contiguous".to_string(),
+            prefill_index_distribution: "recent_contiguous".to_string(),
+            page_table_mapping: Some("request_contiguous".to_string()),
         });
         config
     }
@@ -819,9 +920,10 @@ mod tests {
     fn config_expands_into_the_frozen_five_subkernel_identities() {
         let configs = subkernel_configs(&cfg(1)).unwrap();
 
-        assert_eq!(configs.query_concat.backends, vec!["triton"]);
-        assert_eq!(configs.query_concat.input_bytes_per_token, 73_728);
-        assert_eq!(configs.query_concat.output_bytes_per_token, 73_728);
+        let query_concat = configs.query_concat.as_ref().unwrap();
+        assert_eq!(query_concat.backends, vec!["triton"]);
+        assert_eq!(query_concat.input_bytes_per_token, 73_728);
+        assert_eq!(query_concat.output_bytes_per_token, 73_728);
 
         assert_eq!(configs.mla_cache_append.backends, vec!["vllm_cuda"]);
         assert_eq!(configs.mla_cache_append.kv_lora_rank, 512);
@@ -831,7 +933,7 @@ mod tests {
         assert_eq!(configs.mla_cache_append.kv_dtype, DType::Bf16);
         assert_eq!(configs.mla_cache_append.cache_format, "plain");
 
-        let IndexRemapConfig::Legacy(index_remap) = &configs.index_remap else {
+        let Some(IndexRemapConfig::Legacy(index_remap)) = &configs.index_remap else {
             panic!("legacy config must retain the elementwise remap")
         };
         assert_eq!(index_remap.backends, vec!["triton"]);
@@ -876,7 +978,7 @@ mod tests {
     fn exact_varlen_expands_into_production_remap_and_prefill_configs() {
         let configs = subkernel_configs(&exact_cfg(1)).unwrap();
 
-        let IndexRemapConfig::Production(remap) = &configs.index_remap else {
+        let Some(IndexRemapConfig::Production(remap)) = &configs.index_remap else {
             panic!("exact varlen config must select the dedicated remap")
         };
         assert_eq!(remap.backends, vec!["vllm_triton"]);
@@ -895,6 +997,7 @@ mod tests {
         assert_eq!(prefill.q_dtype, DType::Fp8E4m3);
         assert_eq!(prefill.cache_dtype, DType::Fp8E4m3);
         assert_eq!(prefill.output_dtype, DType::Bf16);
+        assert_eq!(prefill.index_distribution, "recent_contiguous");
         assert_eq!(prefill.cache_layout, "hnd_paged_mqa_fp8_latent_rope");
 
         assert_eq!(configs.mla_cache_append.kv_dtype, DType::Fp8E4m3);
@@ -903,6 +1006,39 @@ mod tests {
         assert_eq!(configs.decode.q_dtype, DType::Fp8E4m3);
         assert_eq!(configs.decode.cache_dtype, DType::Fp8E4m3);
         assert_eq!(configs.decode.output_dtype, DType::Bf16);
+        assert_eq!(configs.decode.index_distribution, "unique_scattered_pages");
+    }
+
+    #[test]
+    fn fused_sglang_graph_omits_concat_and_remap_and_appends_fp8_input() {
+        let mut config = exact_cfg(1);
+        config.launch_graph = DsaSparseMlaLaunchGraph::FusedQueryConcatAndIndexRemap;
+        config.elementwise_backends.clear();
+        config.exact_varlen.as_mut().unwrap().page_table_mapping = None;
+
+        let configs = subkernel_configs(&config).unwrap();
+        assert!(configs.query_concat.is_none());
+        assert!(configs.index_remap.is_none());
+        assert_eq!(configs.mla_cache_append.input_dtype, DType::Fp8E4m3);
+        assert!(matches!(configs.prefill, PrefillConfig::Production(_)));
+    }
+
+    #[test]
+    fn fused_graph_rejects_ignored_separate_launch_identity() {
+        let mut missing_exact = cfg(1);
+        missing_exact.launch_graph = DsaSparseMlaLaunchGraph::FusedQueryConcatAndIndexRemap;
+        missing_exact.elementwise_backends.clear();
+        assert!(subkernel_configs(&missing_exact).is_err());
+
+        let mut config = exact_cfg(1);
+        config.launch_graph = DsaSparseMlaLaunchGraph::FusedQueryConcatAndIndexRemap;
+        assert!(subkernel_configs(&config).is_err());
+
+        config.elementwise_backends.clear();
+        assert!(subkernel_configs(&config).is_err());
+
+        config.exact_varlen.as_mut().unwrap().page_table_mapping = None;
+        assert!(subkernel_configs(&config).is_ok());
     }
 
     #[test]
