@@ -158,33 +158,29 @@ def load_profile_config(path: Path) -> ProfileConfig:
         device.strip() for device in config.cuda_visible_devices.split(",") if device.strip()
     ]
     world_size = config.server.tp_size * config.server.dp_size
-    expert_parallel_size = config.server.expert_parallel_size
-    if (
-        config.engine == "sglang"
-        and config.profile_kind == "expert_popularity"
-        and expert_parallel_size is None
+    expert_topology = {
+        "expert_parallel_size": config.server.expert_parallel_size,
+        "expert_count_reduction_group_size": (config.server.expert_count_reduction_group_size),
+    }
+    if config.profile_kind == "expert_popularity" and any(
+        value is None for value in expert_topology.values()
     ):
         raise ValueError(
-            "invalid profile config: SGLang expert_popularity requires "
-            "server.expert_parallel_size to state the actual MoE sharding degree"
+            "invalid profile config: expert_popularity requires explicit "
+            "server.expert_parallel_size and "
+            "server.expert_count_reduction_group_size"
         )
-    if expert_parallel_size is not None:
-        if (
-            isinstance(expert_parallel_size, bool)
-            or not isinstance(expert_parallel_size, int)
-            or expert_parallel_size <= 0
-        ):
+    for field_name, value in expert_topology.items():
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(
-                "invalid profile config: server.expert_parallel_size must be a positive integer"
+                f"invalid profile config: server.{field_name} must be a positive integer"
             )
-        expert_parallel_population = (
-            config.server.tp_size if config.engine == "sglang" else world_size
-        )
-        if expert_parallel_population % expert_parallel_size != 0:
-            population_label = "tp_size" if config.engine == "sglang" else "tp_size * dp_size"
+        if world_size % value != 0:
             raise ValueError(
-                "invalid profile config: server.expert_parallel_size must divide "
-                f"{population_label}={expert_parallel_population} for engine={config.engine}"
+                f"invalid profile config: server.{field_name} must divide "
+                f"tp_size * dp_size={world_size}"
             )
     if len(visible_devices) != world_size:
         raise ValueError(

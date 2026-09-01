@@ -106,6 +106,22 @@ workload:
   max_concurrency: 64
 ```
 
+An expert-popularity pass must add both independent topology facts to that
+YAML. For example, pure TP with four ranks and unsharded experts is:
+
+```yaml
+profile_kind: expert_popularity
+server:
+  model_path: nvidia/GLM-5.2-NVFP4
+  tp_size: 4
+  dp_size: 1
+  expert_parallel_size: 1
+  expert_count_reduction_group_size: 4
+```
+
+Do not copy these numbers by engine name: state the actual sharding and
+expert-count synchronization groups of the deployment being captured.
+
 Set `engine: sglang` to use the instrumented SGLang submodule instead. Its
 default environment path is
 `alignment/profiler/sglang/python/.venv-sglang/bin/python`, so
@@ -152,8 +168,10 @@ topology, backend, and workload settings:
 - `profile_kind: expert_popularity` runs the selected engine without NSYS and
   writes `expert_popularity.json` containing aggregated logical expert
   counts/probabilities by layer. Its synchronization and D2H logging overhead
-  is intentionally excluded from timing evidence. SGLang configs must state
-  `server.expert_parallel_size`; its EP group lives inside each TP replica.
+  is intentionally excluded from timing evidence. Every such YAML must state
+  `server.expert_parallel_size` and
+  `server.expert_count_reduction_group_size`; neither value is inferred from
+  `engine`, `tp_size`, or `dp_size`.
 - `profile_kind: nsys` (default) is the ordinary timing/segment capture consumed
   by timing-predict and alignment analysis. It must disable popularity logging.
 - `profile_kind: workload_metrics` runs the instrumented vLLM server without
@@ -205,10 +223,10 @@ scheduler event on every TP rank, that is TP0's copy in each DP group. The
 aggregate admits only records whose per-layer assignment count is within
 `max_tokens_per_step * reduction_group_size * experts_per_token`; this excludes
 an initial record that flushes accumulated server warmup work. The reduction
-population is distinct from expert sharding: vLLM's EPLB record is reduced over
-its EP group, while SGLang's recorder is reduced over one replica's TP process
-group. They are equal under ordinary EP, but under pure TP the expert degree is
-1 while the count reduction still covers all TP ranks. The summary records the
+population is distinct from expert sharding. The YAML is authoritative for
+both: a typical vLLM EP run states the same size for both fields, while an
+SGLang pure-TP run states expert degree 1 and a count-reduction group equal to
+its TP group. These are examples, not engine defaults. The summary records the
 raw, accepted, and discarded record counts and the discarded EPLB steps, so
 this filtering is auditable rather than implicit.
 
@@ -217,8 +235,9 @@ fields or cross-field inconsistencies. Schemas v1 and v2 remain read-only
 compatibility for existing run directories; the profiler generates v3.
 The instrumented vLLM raw record is also version 2 and supplies
 `expert_parallel_size` and `experts_per_token` from the running EPLB state;
-the summary extractor verifies that these values remain constant across the
-capture rather than inferring them from a local checkpoint path.
+the summary extractor verifies the recorded expert degree against YAML and
+checks that these values remain constant across the capture. The count-reduction
+group exists only in YAML because the raw record does not report it.
 
 ### `timing_predict.yaml`
 

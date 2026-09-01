@@ -29,7 +29,7 @@ from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
 from .profiler import nsys_capture, record_extraction, sglang_server, vllm_server
 from .profiler.config import ProfileConfig
-from .profiler.engine_records import SGLANG_RECORDS, VLLM_RECORDS, EngineRecords
+from .profiler.engine_records import SGLANG_RECORDS, VLLM_RECORDS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -93,19 +93,15 @@ def _resolve_fork_python(cfg: ProfileConfig) -> str:
     return str(fork)
 
 
-def _expert_popularity_group_sizes(cfg: ProfileConfig, records: EngineRecords) -> tuple[int, int]:
-    """Resolve expert sharding and count-reduction populations independently."""
+def _expert_popularity_group_sizes(cfg: ProfileConfig) -> tuple[int, int]:
+    """Read both independent expert-popularity populations from the config."""
     expert_parallel_size = cfg.server.expert_parallel_size
-    if expert_parallel_size is None:
-        if records.requires_explicit_expert_parallel_size:
-            raise ValueError(
-                f"{cfg.engine} expert_popularity requires an explicit server.expert_parallel_size"
-            )
-        expert_parallel_size = cfg.server.tp_size * cfg.server.dp_size
-    reduction_group_size = records.expert_count_reduction_group_size(
-        tensor_parallel_size=cfg.server.tp_size,
-        expert_parallel_size=expert_parallel_size,
-    )
+    reduction_group_size = cfg.server.expert_count_reduction_group_size
+    if expert_parallel_size is None or reduction_group_size is None:
+        raise ValueError(
+            "expert_popularity requires explicit server.expert_parallel_size and "
+            "server.expert_count_reduction_group_size"
+        )
     return expert_parallel_size, reduction_group_size
 
 
@@ -371,7 +367,7 @@ def _finalize_profile(
         # would reject an otherwise valid popularity capture.
         expert_load_jsonl = engine_dir / f"{cfg.name}_expert_load.jsonl"
         expert_popularity_json = log_dir / "expert_popularity.json"
-        expert_parallel_size, reduction_group_size = _expert_popularity_group_sizes(cfg, records)
+        expert_parallel_size, reduction_group_size = _expert_popularity_group_sizes(cfg)
         expert_record_count = record_extraction.extract_expert_popularity(
             server_log,
             expert_load_jsonl,

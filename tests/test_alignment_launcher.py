@@ -418,7 +418,7 @@ def test_profile_config_counts_tp_times_dp_visible_devices(tmp_path):
     assert config.server.dp_size == 2
 
 
-def test_profile_config_accepts_an_explicit_pure_tp_expert_degree(tmp_path):
+def test_non_popularity_profile_does_not_require_expert_topology(tmp_path):
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["profile"].read_text())
     raw["cuda_visible_devices"] = "0,1,2,3"
@@ -427,33 +427,37 @@ def test_profile_config_accepts_an_explicit_pure_tp_expert_degree(tmp_path):
     paths["profile"].write_text(yaml.safe_dump(raw))
 
     assert load_profile_config(paths["profile"]).server.expert_parallel_size is None
+    assert load_profile_config(paths["profile"]).server.expert_count_reduction_group_size is None
 
     raw["server"]["expert_parallel_size"] = 1
     paths["profile"].write_text(yaml.safe_dump(raw))
     assert load_profile_config(paths["profile"]).server.expert_parallel_size == 1
 
 
-def test_sglang_popularity_requires_and_validates_its_per_replica_expert_degree(tmp_path):
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+def test_expert_popularity_requires_explicit_engine_neutral_topology(tmp_path, engine):
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["profile"].read_text())
-    raw["engine"] = "sglang"
+    raw["engine"] = engine
     raw["profile_kind"] = "expert_popularity"
     raw["cuda_visible_devices"] = "0,1,2,3"
     raw["server"]["tp_size"] = 2
     raw["server"]["dp_size"] = 2
     paths["profile"].write_text(yaml.safe_dump(raw))
 
-    with pytest.raises(ValueError, match="SGLang expert_popularity requires"):
-        load_profile_config(paths["profile"])
-
-    raw["server"]["expert_parallel_size"] = 4
-    paths["profile"].write_text(yaml.safe_dump(raw))
-    with pytest.raises(ValueError, match="must divide tp_size=2"):
+    with pytest.raises(ValueError, match="expert_popularity requires explicit"):
         load_profile_config(paths["profile"])
 
     raw["server"]["expert_parallel_size"] = 1
     paths["profile"].write_text(yaml.safe_dump(raw))
-    assert load_profile_config(paths["profile"]).server.expert_parallel_size == 1
+    with pytest.raises(ValueError, match="expert_popularity requires explicit"):
+        load_profile_config(paths["profile"])
+
+    raw["server"]["expert_count_reduction_group_size"] = 2
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    server = load_profile_config(paths["profile"]).server
+    assert server.expert_parallel_size == 1
+    assert server.expert_count_reduction_group_size == 2
 
 
 @pytest.mark.parametrize("expert_parallel_size", [0, True, 3])
@@ -466,6 +470,21 @@ def test_profile_config_rejects_an_invalid_expert_degree(tmp_path, expert_parall
     paths["profile"].write_text(yaml.safe_dump(raw))
 
     with pytest.raises(ValueError, match="expert_parallel_size"):
+        load_profile_config(paths["profile"])
+
+
+@pytest.mark.parametrize("reduction_group_size", [0, True, 3])
+def test_profile_config_rejects_an_invalid_expert_count_reduction_group(
+    tmp_path, reduction_group_size
+):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["cuda_visible_devices"] = "0,1,2,3"
+    raw["server"]["tp_size"] = 4
+    raw["server"]["expert_count_reduction_group_size"] = reduction_group_size
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="expert_count_reduction_group_size"):
         load_profile_config(paths["profile"])
 
 
@@ -617,6 +636,7 @@ def test_extract_expert_popularity_aggregates_logical_counts(tmp_path):
         raw_path,
         summary_path,
         expert_parallel_size=2,
+        reduction_group_size=2,
         max_tokens_per_step=2,
     )
     summary = json.loads(summary_path.read_text())
@@ -684,6 +704,7 @@ def test_extract_expert_popularity_excludes_oversized_warmup_flush(tmp_path):
         raw_path,
         summary_path,
         expert_parallel_size=2,
+        reduction_group_size=2,
         max_tokens_per_step=1,
     )
     summary = json.loads(summary_path.read_text())
@@ -720,6 +741,7 @@ def test_extract_expert_popularity_rejects_partition_mismatch(tmp_path):
             tmp_path / "summary.json",
             max_tokens_per_step=1,
             expert_parallel_size=2,
+            reduction_group_size=2,
             experts_per_token=2,
         )
 
@@ -765,6 +787,7 @@ def test_expert_popularity_normalizes_only_the_summary_model_identity(tmp_path):
         raw_path,
         summary_path,
         expert_parallel_size=1,
+        reduction_group_size=1,
         max_tokens_per_step=1,
     )
 
@@ -792,6 +815,7 @@ def test_expert_popularity_ceiling_uses_the_count_reduction_group(tmp_path):
             tmp_path / "raw-with-ep-ceiling.jsonl",
             tmp_path / "summary-with-ep-ceiling.json",
             expert_parallel_size=1,
+            reduction_group_size=1,
             max_tokens_per_step=1,
         )
 
@@ -908,34 +932,24 @@ def test_sglang_duplicate_expert_record_from_one_dp_owner_is_rejected(tmp_path):
         )
 
 
-def test_engines_state_their_expert_count_reduction_population():
-    args = {"tensor_parallel_size": 4, "expert_parallel_size": 1}
-
-    assert engine_records.VLLM_RECORDS.expert_count_reduction_group_size(**args) == 1
-    assert engine_records.SGLANG_RECORDS.expert_count_reduction_group_size(**args) == 4
-
-
-def test_runner_passes_engine_specific_expert_popularity_group_sizes(tmp_path):
+def test_runner_passes_yaml_expert_popularity_group_sizes_for_every_engine(tmp_path):
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["profile"].read_text())
     raw["profile_kind"] = "expert_popularity"
     raw["cuda_visible_devices"] = "0,1,2,3,4,5,6,7"
     raw["server"]["tp_size"] = 4
     raw["server"]["dp_size"] = 2
+    raw["server"]["expert_parallel_size"] = 2
+    raw["server"]["expert_count_reduction_group_size"] = 4
     paths["profile"].write_text(yaml.safe_dump(raw))
 
     vllm_config = load_profile_config(paths["profile"])
-    assert alignment_runner._expert_popularity_group_sizes(
-        vllm_config, engine_records.VLLM_RECORDS
-    ) == (8, 8)
+    assert alignment_runner._expert_popularity_group_sizes(vllm_config) == (2, 4)
 
     raw["engine"] = "sglang"
-    raw["server"]["expert_parallel_size"] = 1
     paths["profile"].write_text(yaml.safe_dump(raw))
     sglang_config = load_profile_config(paths["profile"])
-    assert alignment_runner._expert_popularity_group_sizes(
-        sglang_config, engine_records.SGLANG_RECORDS
-    ) == (1, 4)
+    assert alignment_runner._expert_popularity_group_sizes(sglang_config) == (2, 4)
 
 
 @pytest.mark.parametrize("reduction_group_size", [0, -1, True, 1.5])

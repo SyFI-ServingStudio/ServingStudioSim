@@ -122,9 +122,13 @@ pipeline. Build its environment under the submodule's `python/` directory,
 which is the default path selected when `engine: sglang` and no `fork_python`
 override is supplied:
 
-SGLang's expert-load counts are reduced over the default TP process group of
-one replica, independently of its expert-sharding degree. An SGLang popularity
-config therefore must state `server.expert_parallel_size` explicitly.
+Expert-popularity topology is a YAML-only contract for every engine. A profile
+must state both `server.expert_parallel_size` (the expert-sharding degree) and
+`server.expert_count_reduction_group_size` (the rank population already summed
+into one expert-count record). The profiler never derives either value from the
+engine name. For example, a current SGLang pure-TP run commonly states 1 and
+`tp_size`, respectively; a current vLLM EP run commonly states its EP size for
+both. Those are deployment facts to encode, not defaults in the parser.
 
 ```bash
 cd alignment/profiler/sglang/python
@@ -264,8 +268,9 @@ explicit provenance rather than implicit loader assumptions.
 The raw expert-load JSONL preserves every canonical EPLB record. When an engine
 repeats scheduler evidence on every TP rank, only TP0's copy in each DP group
 is canonical; repeated owner records are rejected. The aggregate uses the
-configured maximum scheduler/CUDA-graph token count as a conservation ceiling
-and excludes oversized records that flush work accumulated before the replay.
+configured maximum scheduler/CUDA-graph token count and the YAML-provided
+expert count-reduction group size as a conservation ceiling, and excludes
+oversized records that flush work accumulated before the replay.
 `aggregation` records the ceiling, raw and accepted counts, and every discarded
 EPLB step.
 

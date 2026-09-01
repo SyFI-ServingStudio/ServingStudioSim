@@ -562,9 +562,9 @@ def extract_expert_popularity(
     out_json: Path,
     *,
     max_tokens_per_step: int,
-    expert_parallel_size: int | None = None,
+    expert_parallel_size: int,
+    reduction_group_size: int,
     experts_per_token: int | None = None,
-    reduction_group_size: int | None = None,
     dp_size: int = 1,
     records: EngineRecords = VLLM_RECORDS,
 ) -> int:
@@ -575,16 +575,18 @@ def extract_expert_popularity(
     physical replicas back to logical expert ids.
 
     ``reduction_group_size`` is the number of ranks represented by those
-    already-summed counts. It is not necessarily ``expert_parallel_size``:
-    SGLang's recorder reduces across the TP process group, so pure TP has EP
-    size 1 but a reduction group larger than 1. The old EP behavior remains
-    the default for direct callers.
+    already-summed counts. It is independent of ``expert_parallel_size`` and
+    both values are required rather than inferred from the selected engine.
     """
-    if expert_parallel_size is not None and expert_parallel_size <= 0:
-        raise ValueError("expert_parallel_size must be positive")
+    if (
+        isinstance(expert_parallel_size, bool)
+        or not isinstance(expert_parallel_size, int)
+        or expert_parallel_size <= 0
+    ):
+        raise ValueError("expert_parallel_size must be a positive integer")
     if experts_per_token is not None and experts_per_token <= 0:
         raise ValueError("experts_per_token must be positive")
-    if reduction_group_size is not None and (
+    if (
         isinstance(reduction_group_size, bool)
         or not isinstance(reduction_group_size, int)
         or reduction_group_size <= 0
@@ -630,9 +632,7 @@ def extract_expert_popularity(
                         )
                 record_ep_size = record["expert_parallel_size"]
                 record_top_k = record["experts_per_token"]
-                if expert_parallel_size is None:
-                    expert_parallel_size = record_ep_size
-                elif record_ep_size != expert_parallel_size:
+                if record_ep_size != expert_parallel_size:
                     raise ValueError(
                         "expert-load expert_parallel_size changed from "
                         f"{expert_parallel_size} to {record_ep_size}"
@@ -678,10 +678,10 @@ def extract_expert_popularity(
             if expected_shape is None:
                 expected_shape = shape
                 aggregate_counts = [[0] * shape[1] for _ in range(shape[0])]
-                if expert_parallel_size is None or experts_per_token is None:
+                if experts_per_token is None:
                     raise ValueError(
-                        "schema-v1 expert-load records require explicit expert_parallel_size "
-                        "and experts_per_token fallbacks"
+                        "schema-v1 expert-load records require an explicit "
+                        "experts_per_token fallback"
                     )
                 if shape[1] % expert_parallel_size != 0:
                     raise ValueError(
@@ -706,11 +706,8 @@ def extract_expert_popularity(
             output_file.write(json.dumps(record, separators=(",", ":")) + "\n")
             raw_records.append(record)
 
-            assert expert_parallel_size is not None and experts_per_token is not None
-            count_replication = (
-                reduction_group_size if reduction_group_size is not None else expert_parallel_size
-            )
-            assignment_ceiling = max_tokens_per_step * count_replication * experts_per_token
+            assert experts_per_token is not None
+            assignment_ceiling = max_tokens_per_step * reduction_group_size * experts_per_token
             if any(total > assignment_ceiling for total in layer_totals):
                 discarded_oversized_steps.append(eplb_step)
                 continue
@@ -725,11 +722,7 @@ def extract_expert_popularity(
         raise ValueError("no VibeSimAlignmentExpertLoad records found in server log")
     if not accepted_records:
         raise ValueError("no expert-load records remain within the configured token ceiling")
-    assert (
-        expected_model is not None
-        and expert_parallel_size is not None
-        and experts_per_token is not None
-    )
+    assert expected_model is not None and experts_per_token is not None
 
     def normalize(counts: list[int]) -> list[float]:
         total = sum(counts)
