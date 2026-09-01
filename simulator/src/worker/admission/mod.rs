@@ -3,6 +3,7 @@
 use crate::common::{RequestId, Time};
 use crate::worker::kv::KvStore;
 use crate::worker::shared::context::WorkerContext;
+use crate::worker::types::IterBatchPlan;
 
 mod chunked_prefill_admission;
 mod fresh_request_slot_admission;
@@ -28,11 +29,18 @@ pub trait IterAdmission<K: KvStore> {
     type Event;
 
     fn accept_message(&mut self, kv_store: &mut K, msg: Self::Msg, context: &WorkerContext);
-    fn form_batch(&mut self, kv_store: &mut K, context: &WorkerContext, now: Time) -> bool;
+    fn form_batch(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        batch_plan: &mut IterBatchPlan,
+        now: Time,
+    ) -> bool;
     fn complete_iteration(
         &mut self,
         kv_store: &mut K,
         context: &WorkerContext,
+        batch_plan: &IterBatchPlan,
         events: &mut Vec<Self::Event>,
         now: Time,
     );

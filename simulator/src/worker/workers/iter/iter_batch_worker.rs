@@ -12,7 +12,9 @@ use crate::worker::execution::{IterModelExecution, UnifiedIterExecution};
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::kv::{FullAttnKv, HybridGdnKv, IterWorkerKv};
 use crate::worker::shared::context::WorkerContext;
-use crate::worker::types::{BatchFsmState, IterCursor, WorkerFsmState, WorkerStatus};
+use crate::worker::types::{
+    BatchFsmState, IterBatchPlan, IterCursor, WorkerFsmState, WorkerStatus,
+};
 
 struct IterationFsm {
     worker_state: WorkerFsmState,
@@ -44,6 +46,7 @@ where
     admission: A,
     execution: E,
     input: E::Input,
+    batch_plan: IterBatchPlan,
     iteration_fsm: IterationFsm,
 }
 
@@ -87,6 +90,7 @@ where
             admission,
             execution,
             input: Default::default(),
+            batch_plan: IterBatchPlan::default(),
             iteration_fsm: IterationFsm::new(),
         }
     }
@@ -125,6 +129,7 @@ where
                         self.admission.complete_iteration(
                             &mut self.kv_store,
                             &self.context,
+                            &self.batch_plan,
                             events,
                             now,
                         );
@@ -140,7 +145,7 @@ where
     fn form_batch(&mut self, now: Time) -> bool {
         if !self
             .admission
-            .form_batch(&mut self.kv_store, &self.context, now)
+            .form_batch(&mut self.kv_store, &self.context, &mut self.batch_plan, now)
         {
             return false;
         }
@@ -152,6 +157,7 @@ where
         self.execution.build_iteration_input(
             &self.kv_store,
             &self.context.requests,
+            &self.batch_plan,
             &mut self.input,
         );
         let cost = self.execution.evaluate_iteration(
@@ -238,6 +244,7 @@ mod tests {
     use crate::worker::workers::iter::{
         build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     };
+    use crate::worker::BatchPolicy;
 
     fn assert_iter_worker<W: IterWorker>() {}
 
@@ -574,12 +581,14 @@ mod tests {
         worker.execution.build_iteration_input(
             &worker.kv_store,
             &worker.context.requests,
+            &worker.batch_plan,
             &mut first_input,
         );
         assert_eq!(first_input.groups[0].prefill_chunk_pairs, [(0, 8_192)]);
         worker.admission.complete_iteration(
             &mut worker.kv_store,
             &worker.context,
+            &worker.batch_plan,
             &mut Vec::new(),
             Time::from_ms(1.0),
         );
@@ -599,12 +608,14 @@ mod tests {
         worker.execution.build_iteration_input(
             &worker.kv_store,
             &worker.context.requests,
+            &worker.batch_plan,
             &mut second_input,
         );
         assert_eq!(second_input.groups[0].prefill_chunk_pairs, [(8_192, 8_192)]);
         worker.admission.complete_iteration(
             &mut worker.kv_store,
             &worker.context,
+            &worker.batch_plan,
             &mut Vec::new(),
             Time::from_ms(2.0),
         );
@@ -618,6 +629,116 @@ mod tests {
             .telemetry
             .first_output_time
             .is_some());
+    }
+
+    fn chunked_worker(
+        store: SharedRequests,
+        batch_policy: BatchPolicy,
+        max_batch_tokens: u32,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(max_batch_tokens),
+                batch_policy,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    fn form_chunked_input(
+        worker: &mut ChunkedPrefillWorker<FakeModel>,
+        now: Time,
+    ) -> crate::arch::UnifiedArchInput {
+        assert!(worker.form_batch(now));
+        let mut input = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &worker.batch_plan,
+            &mut input,
+        );
+        input
+    }
+
+    fn complete_chunked_iteration(worker: &mut ChunkedPrefillWorker<FakeModel>, now: Time) {
+        worker.admission.complete_iteration(
+            &mut worker.kv_store,
+            &worker.context,
+            &worker.batch_plan,
+            &mut Vec::new(),
+            now,
+        );
+    }
+
+    #[test]
+    fn separate_prefill_priority_suspends_and_then_resumes_resident_decode() {
+        let store = shared_with(&[(0, 4, 5), (1, 16, 1)]);
+        let mut worker = chunked_worker(Rc::clone(&store), BatchPolicy::SeparatePrefillPriority, 8);
+
+        // Establish request 0 as a resident decode before request 1 arrives.
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        let first = form_chunked_input(&mut worker, Time::ZERO);
+        assert_eq!(first.groups[0].prefill_chunk_pairs, [(0, 4)]);
+        assert_eq!(first.groups[0].decode_tokens, 0);
+        complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+        let output_before_prefill = store.borrow()[RequestId(0)].progress.output_tokens_emitted;
+        assert_eq!(output_before_prefill, 1);
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        for (step, prefix) in [(2, 0), (3, 8)] {
+            let input = form_chunked_input(&mut worker, Time::from_ms(step as f64));
+            assert_eq!(input.groups[0].prefill_chunk_pairs, [(prefix, 8)]);
+            assert_eq!(
+                input.groups[0].decode_tokens, 0,
+                "a SGLang-style prefill iteration excludes resident decode"
+            );
+            complete_chunked_iteration(&mut worker, Time::from_ms((step + 1) as f64));
+            assert_eq!(
+                store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+                output_before_prefill,
+                "excluded decode emits no token while retaining its lifecycle state"
+            );
+        }
+
+        let decode = form_chunked_input(&mut worker, Time::from_ms(4.0));
+        assert!(decode.groups[0].prefill_chunk_pairs.is_empty());
+        assert_eq!(decode.groups[0].decode_tokens, 1);
+        complete_chunked_iteration(&mut worker, Time::from_ms(5.0));
+        assert_eq!(
+            store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+            output_before_prefill + 1,
+            "resident decode resumes when no prefill batch can run"
+        );
+    }
+
+    #[test]
+    fn mix_preserves_shared_prefill_decode_budget_and_progress() {
+        let store = shared_with(&[(0, 4, 5), (1, 16, 1)]);
+        let mut worker = chunked_worker(Rc::clone(&store), BatchPolicy::Mix, 8);
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        let _ = form_chunked_input(&mut worker, Time::ZERO);
+        complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+        let output_before_mix = store.borrow()[RequestId(0)].progress.output_tokens_emitted;
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        let mixed = form_chunked_input(&mut worker, Time::from_ms(2.0));
+        assert_eq!(mixed.groups[0].prefill_chunk_pairs, [(0, 7)]);
+        assert_eq!(mixed.groups[0].decode_tokens, 1);
+        assert_eq!(mixed.groups[0].batch_tokens, 8);
+        complete_chunked_iteration(&mut worker, Time::from_ms(3.0));
+        assert_eq!(
+            store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+            output_before_mix + 1
+        );
     }
 
     #[test]
@@ -686,10 +807,13 @@ mod tests {
     #[test]
     fn hp_input_has_one_group_per_partition() {
         let worker = hp_worker(shared_with(&[]), 3, WorkerConfig::default());
+        let mut batch_plan = IterBatchPlan::default();
+        batch_plan.reset_decode_participation(3, true);
         let mut input = Default::default();
         worker.execution.build_iteration_input(
             &worker.kv_store,
             &worker.context.requests,
+            &batch_plan,
             &mut input,
         );
         assert_eq!(input.groups.len(), 3);

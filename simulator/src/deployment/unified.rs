@@ -7,10 +7,10 @@
 //! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
 //! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
 //! `hp_unified`, `glm52_dsa_moe` + `hp_unified`, and
-//! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or the existing dedicated
-//! `chunked_prefill` worker. GLM's TP1 local attention uses one independent
-//! KV/input partition per EP rank; the worker shells and mutable request/KV
-//! lifecycle are unchanged. Each wired arm
+//! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or `chunked_prefill`, and
+//! `glm52_sglang_nvfp4_tp_dsa_moe` + `chunked_prefill`. GLM's TP1 local
+//! attention uses one independent KV/input partition per EP rank; the worker
+//! shells and mutable request/KV lifecycle are unchanged. Each wired arm
 //! monomorphizes its concrete model/worker pair and
 //! erases to `Box<dyn Flow>` — the single `dyn` point (the cost path is
 //! `dyn`-free, L4 §4.1).
@@ -76,6 +76,7 @@ impl Deployment for UnifiedDeployment {
             prefix_cache_mode,
             prefix_cache_policy,
             prefix_cache_max_gpu_memory_gb,
+            batch_policy,
         ) = match &g.worker {
             IterWorkerSel::Barebone {
                 attn_gpu_memory_gb,
@@ -105,27 +106,23 @@ impl Deployment for UnifiedDeployment {
                 *prefix_cache_mode,
                 *prefix_cache_policy,
                 *prefix_cache_max_gpu_memory_gb,
+                BatchPolicy::Mix,
             ),
             IterWorkerSel::ChunkedPrefill {
                 attn_gpu_memory_gb,
                 max_batch_tokens,
                 batch_policy,
                 gpu_time_multiplier,
-            } => {
-                ensure!(
-                    *batch_policy == BatchPolicy::Mix,
-                    "unified: chunked_prefill currently supports batch_policy=mix"
-                );
-                (
-                    *attn_gpu_memory_gb,
-                    *gpu_time_multiplier,
-                    Some(*max_batch_tokens),
-                    PendingOrderKind::Fifo,
-                    PrefixCacheMode::Opportunistic,
-                    PrefixCachePolicy::Lru,
-                    None,
-                )
-            }
+            } => (
+                *attn_gpu_memory_gb,
+                *gpu_time_multiplier,
+                Some(*max_batch_tokens),
+                PendingOrderKind::Fifo,
+                PrefixCacheMode::Opportunistic,
+                PrefixCachePolicy::Lru,
+                None,
+                *batch_policy,
+            ),
             IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => {
                 bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
             }
@@ -145,6 +142,7 @@ impl Deployment for UnifiedDeployment {
             gpu_time_multiplier,
             max_batch_tokens,
             pending_order,
+            batch_policy,
             prefix_cache,
             ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
             ..WorkerConfig::default()

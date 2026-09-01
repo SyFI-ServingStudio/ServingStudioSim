@@ -25,14 +25,9 @@ use super::kv::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub enum BatchPolicy {
     Mix,
     SeparatePrefillPriority,
-    SeparatePrefillPriorityNoInterleave,
 }
 
-const BATCH_POLICY_CHOICES: [&str; 3] = [
-    "mix",
-    "separate-prefill-priority",
-    "separate-prefill-priority-no-interleave",
-];
+const BATCH_POLICY_CHOICES: [&str; 2] = ["mix", "separate-prefill-priority"];
 
 const PENDING_ORDER_CHOICES: [&str; 4] = [
     "session-start",
@@ -148,7 +143,11 @@ pub enum IterWorkerSel {
         attn_gpu_memory_gb: f64,
         /// Chunked-prefill cap: max tokens per batch.
         max_batch_tokens: u32,
-        /// How returning decode mixes with pending prefill.
+        /// How resident decode shares an iteration with chunked prefill.
+        /// `mix` charges both to the same token budget. Under
+        /// `separate-prefill-priority`, any runnable prefill makes that
+        /// partition's iteration prefill-only; resident decode resumes when no
+        /// prefill batch can run.
         #[param(string, default = "mix", choices = BATCH_POLICY_CHOICES)]
         batch_policy: BatchPolicy,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead

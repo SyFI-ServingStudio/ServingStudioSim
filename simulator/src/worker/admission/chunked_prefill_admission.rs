@@ -3,12 +3,20 @@
 //! Pending policies own fresh requests. Once a request starts, its complete KV
 //! footprint stays reserved and at most one continuation is retained per
 //! attention partition; partial requests never rotate through the policy again.
+//!
+//! Batch composition is independent of KV membership. `Mix` lets resident
+//! decode share the remaining chunk budget. `SeparatePrefillPriority` emits a
+//! prefill-only iteration whenever a prompt chunk can run, leaving decode
+//! resident and unadvanced until a later decode-only iteration. This is the
+//! mechanism selected by SGLang when `enable_mixed_chunk` is false; admission
+//! capacity estimation and decode retraction are separate policies.
 
 use crate::common::{RequestId, SessionInput, Time, UnifiedStage};
+use crate::worker::config::BatchPolicy;
 use crate::worker::kv::ChunkedPrefillKv;
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
-use crate::worker::types::{WorkerEventCommon, WorkerMsgCommon};
+use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
 use super::{AdmissionCandidate, EnqueueSequence, IterAdmission, LoadBalance, PendingOrderPolicy};
 
@@ -16,6 +24,7 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy> {
     partition_policies: Vec<(P, P::Context)>,
     enqueue_sequence: EnqueueSequence,
     max_batch_tokens: u32,
+    batch_policy: BatchPolicy,
     balance: LoadBalance,
     active_chunks: Vec<Option<AdmissionCandidate>>,
 }
@@ -24,6 +33,7 @@ impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P> {
     pub(crate) fn new(
         partition_policies: Vec<(P, P::Context)>,
         max_batch_tokens: u32,
+        batch_policy: BatchPolicy,
         balance: LoadBalance,
     ) -> Self {
         assert!(max_batch_tokens > 0, "chunked prefill cap must be positive");
@@ -35,6 +45,7 @@ impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P> {
             partition_policies,
             enqueue_sequence: EnqueueSequence::default(),
             max_batch_tokens,
+            batch_policy,
             balance,
             active_chunks: Vec::new(),
         }
@@ -96,16 +107,28 @@ where
         policy.push(candidate, policy_context);
     }
 
-    fn form_batch(&mut self, kv_store: &mut K, context: &WorkerContext, now: Time) -> bool {
+    fn form_batch(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        batch_plan: &mut IterBatchPlan,
+        now: Time,
+    ) -> bool {
         let num_partitions = kv_store.num_partitions();
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
         self.active_chunks.resize(num_partitions, None);
+        batch_plan.reset_decode_participation(num_partitions, true);
         let had_decode =
             (0..num_partitions as u16).any(|partition| kv_store.has_live_decode(partition));
+        let mixes_prefill_with_decode = self.batch_policy == BatchPolicy::Mix;
         let mut remaining_budgets: Vec<u32> = (0..num_partitions as u16)
             .map(|partition| {
-                self.max_batch_tokens
-                    .saturating_sub(kv_store.live_decode_count(partition))
+                if mixes_prefill_with_decode {
+                    self.max_batch_tokens
+                        .saturating_sub(kv_store.live_decode_count(partition))
+                } else {
+                    self.max_batch_tokens
+                }
             })
             .collect();
 
@@ -188,31 +211,42 @@ where
             }
         }
 
-        had_decode
-            || (0..num_partitions as u16).any(|partition| kv_store.has_prefill_admit(partition))
+        let mut had_prefill = false;
+        for partition in 0..num_partitions as u16 {
+            let partition_has_prefill = kv_store.has_prefill_admit(partition);
+            had_prefill |= partition_has_prefill;
+            if !mixes_prefill_with_decode && partition_has_prefill {
+                batch_plan.set_partition_runs_decode(partition, false);
+            }
+        }
+
+        had_decode || had_prefill
     }
 
     fn complete_iteration(
         &mut self,
         kv_store: &mut K,
         context: &WorkerContext,
+        batch_plan: &IterBatchPlan,
         events: &mut Vec<Self::Event>,
         now: Time,
     ) {
         for partition in 0..kv_store.num_partitions() as u16 {
             let mut completed = Vec::new();
-            {
-                let mut store = context.requests.borrow_mut();
-                kv_store.visit_decode_members(partition, |request, _| {
-                    let record = &mut store[request];
-                    record.record_token(now, context.log_tokens());
-                    if record.is_complete() {
-                        context.stamp_stage(record, now, UnifiedStage::Done as u16);
-                        completed.push(request);
-                    }
-                });
+            if batch_plan.partition_runs_decode(partition) {
+                {
+                    let mut store = context.requests.borrow_mut();
+                    kv_store.visit_decode_members(partition, |request, _| {
+                        let record = &mut store[request];
+                        record.record_token(now, context.log_tokens());
+                        if record.is_complete() {
+                            context.stamp_stage(record, now, UnifiedStage::Done as u16);
+                            completed.push(request);
+                        }
+                    });
+                }
+                kv_store.advance(AdvanceScope::WholePartition(partition), 1);
             }
-            kv_store.advance(AdvanceScope::WholePartition(partition), 1);
 
             let mut prefills = Vec::new();
             kv_store.visit_prefill_admits(partition, |request| prefills.push(request));

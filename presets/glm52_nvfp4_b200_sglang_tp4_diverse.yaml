@@ -1,0 +1,51 @@
+# GLM-5.2 NVFP4 pure TP4 under the SGLang scheduler contract captured by the
+# alignment run. This preset keeps the framework-facing scheduler decisions
+# explicit instead of relying on simulator defaults.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/diverse_100.csv
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  # Trace timestamps are already the captured absolute millisecond schedule.
+  # VibeSim scales trace_timed timestamps by request_rate, so 1.0 is required
+  # to preserve them exactly.
+  request_rate: 1.0
+  session_dependency: independent
+  run_to_end: true
+
+io:
+  log_dir: logs/glm52_nvfp4_b200_sglang_tp4_diverse
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: glm52_sglang_nvfp4_tp_dsa_moe
+          model_config: model/config/glm52_nvfp4.json
+          fp8: false
+          tp_size: 4
+          max_model_len: 131072
+          routing: uniform
+          routing_seed: null
+          expert_popularity_file: presets/alignment/glm52_nvfp4_b200_sglang_tp4/expert_popularity.json
+          mtp_mode: "off"
+        worker:
+          type: chunked_prefill
+          # Captured SGLang: chunked_prefill_size=2048 and
+          # enable_mixed_chunk=False. This selects the mechanism, not a fitted
+          # throughput target: a runnable prefill produces a prefill-only
+          # iteration, and resident decode resumes afterward.
+          max_batch_tokens: 2048
+          batch_policy: separate-prefill-priority
+          # Kernel timing remains unscaled in this scheduler baseline. A
+          # measured duty-cycle multiplier belongs to an alignment result, not
+          # to the scheduler mechanism itself.
+          gpu_time_multiplier: 1.0
+          # max_total_num_tokens=817408 in the captured SGLang deployment at
+          # mem_fraction_static=0.85. With 220896 whole-model KV bytes/token and
+          # TP4 replication accounting: 817408 * 220896 / 4 bytes.
+          attn_gpu_memory_gb: 45.140539392

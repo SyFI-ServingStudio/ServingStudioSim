@@ -12,7 +12,7 @@ use crate::worker::admission::{
 use crate::worker::kv::{IterWorkerKv, PrefixKv, ResolvedPrefillContext};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
-use crate::worker::types::{WorkerEventCommon, WorkerMsgCommon};
+use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
 /// Resolved prefill context and its matching full-context KV footprint must be
 /// reserved together; keeping them paired prevents admission from mixing facts
@@ -321,7 +321,14 @@ where
         LocalPrefillDecodeAdmission::accept_message(self, &*kv_store, msg, context);
     }
 
-    fn form_batch(&mut self, kv_store: &mut K, context: &WorkerContext, now: Time) -> bool {
+    fn form_batch(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        batch_plan: &mut IterBatchPlan,
+        now: Time,
+    ) -> bool {
+        batch_plan.reset_decode_participation(kv_store.num_partitions(), true);
         LocalPrefillDecodeAdmission::form_batch(self, kv_store, context, now)
     }
 
@@ -329,6 +336,7 @@ where
         &mut self,
         kv_store: &mut K,
         context: &WorkerContext,
+        _batch_plan: &IterBatchPlan,
         events: &mut Vec<Self::Event>,
         now: Time,
     ) {

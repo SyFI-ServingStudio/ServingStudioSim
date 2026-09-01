@@ -31,6 +31,40 @@ pub struct BatchFsmState {
     pub compute_end: Time,
 }
 
+/// Shell-owned composition of one whole-model iteration.
+///
+/// KV membership remains authoritative in the KV axis. This plan only states
+/// whether each partition's resident decode requests participate in the
+/// current iteration, so a prefill-only scheduler can leave those requests
+/// resident without charging or advancing them.
+#[derive(Clone, Debug, Default)]
+pub struct IterBatchPlan {
+    decode_participation: Vec<bool>,
+}
+
+impl IterBatchPlan {
+    pub(crate) fn reset_decode_participation(&mut self, num_partitions: usize, participates: bool) {
+        self.decode_participation.clear();
+        self.decode_participation
+            .resize(num_partitions, participates);
+    }
+
+    pub(crate) fn set_partition_runs_decode(&mut self, partition: u16, runs_decode: bool) {
+        let entry = self
+            .decode_participation
+            .get_mut(usize::from(partition))
+            .expect("batch plan partition must exist");
+        *entry = runs_decode;
+    }
+
+    pub(crate) fn partition_runs_decode(&self, partition: u16) -> bool {
+        self.decode_participation
+            .get(usize::from(partition))
+            .copied()
+            .expect("batch plan partition must exist")
+    }
+}
+
 // ── Messages / events (L6 interface) ──────────────────────────────────────────
 //
 // Each worker carries its own `type Msg` / `type Event` (associated types on
@@ -437,6 +471,10 @@ pub struct WorkerConfig {
     /// (from the worker selector). Only the iter-wise local-prefill/decode and
     /// prefill-handoff lifecycles read it today.
     pub pending_order: crate::worker::admission::PendingOrderKind,
+    /// Whether chunked prefill may share an iteration with resident decode.
+    /// Only `ChunkedPrefillAdmission` reads this; other lifecycles state their
+    /// fixed composition directly in the per-iteration batch plan.
+    pub batch_policy: crate::worker::config::BatchPolicy,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -458,6 +496,7 @@ impl Default for WorkerConfig {
             gpu_time_multiplier: 1.0,
             max_batch_tokens: None,
             pending_order: crate::worker::admission::PendingOrderKind::default(),
+            batch_policy: crate::worker::config::BatchPolicy::Mix,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             ssm_checkpoint_interval_tokens: None,
         }

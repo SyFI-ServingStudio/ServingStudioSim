@@ -69,6 +69,7 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
             .map(|_| (PendingOrder::new(config.pending_order), ()))
             .collect(),
         max_batch_tokens,
+        config.batch_policy,
         balance,
     );
 
