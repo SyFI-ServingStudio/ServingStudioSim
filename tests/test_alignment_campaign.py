@@ -18,6 +18,7 @@ Two tiers:
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import re
@@ -41,14 +42,19 @@ from launcher.alignment_campaign.metrics import (
 from launcher.alignment_campaign.pack import PackError, load_host, load_pack
 from launcher.alignment_campaign.render import (
     ANALYSIS_KERNEL_PHASE,
+    CONTEXT_LIMIT_FLAG,
     PHASE_CONFIG_STEMS,
     SIMULATION_PHASE,
     TIMING_PREDICT_PHASE,
+    _extra_args,
+    case_documents,
     phase_names,
     render_case,
 )
 from launcher.golden import GOLDEN_ROOT
-from launcher.process.markers import mark_complete
+from launcher.process import ProcessResult, ProcessSpec
+from launcher.process.journal import RunJournal, StageState
+from launcher.process.markers import has_marker, mark_complete
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACK_ROOT = REPO_ROOT / "presets" / "alignment"
@@ -243,6 +249,73 @@ def test_render_rejects_a_variant_that_sets_a_per_case_field(pack, tmp_path):
         case_documents(patched, case, host, tmp_path, REPO_ROOT)
 
 
+@pytest.mark.parametrize(
+    ("engine", "expected_flag"),
+    sorted(CONTEXT_LIMIT_FLAG.items()),
+)
+def test_context_limit_uses_the_target_engine_cli(pack, engine, expected_flag):
+    case = pack.cases[0]
+    original = pack.variant_of(case)
+    variant = dataclasses.replace(
+        original,
+        engine=engine,
+        server={**original.server, "extra_args": ["--unrelated-flag"]},
+    )
+
+    assert _extra_args(variant, case) == [
+        "--unrelated-flag",
+        expected_flag,
+        str(case.max_model_len),
+    ]
+
+
+@pytest.mark.parametrize("engine", sorted(CONTEXT_LIMIT_FLAG))
+def test_context_limit_rejects_authored_limits_in_either_engine_spelling(pack, engine):
+    case = pack.cases[0]
+    original = pack.variant_of(case)
+    for reserved in CONTEXT_LIMIT_FLAG.values():
+        underscore_alias = f"--{reserved[2:].replace('-', '_')}"
+        for argument in (
+            reserved,
+            f"{reserved}=999",
+            underscore_alias,
+            f"{underscore_alias}=999",
+        ):
+            variant = dataclasses.replace(
+                original,
+                engine=engine,
+                server={**original.server, "extra_args": [argument]},
+            )
+            with pytest.raises(PackError, match="must not set"):
+                _extra_args(variant, case)
+
+
+def test_unknown_engine_has_no_implicit_context_limit_spelling(pack):
+    case = pack.cases[0]
+    variant = dataclasses.replace(pack.variant_of(case), engine="unknown-engine")
+
+    with pytest.raises(PackError, match="no known context-limit flag"):
+        _extra_args(variant, case)
+
+
+def test_cross_phase_check_uses_the_same_sglang_context_limit_flag(pack, tmp_path):
+    case = pack.cases[0]
+    original = pack.variant_of(case)
+    variant = dataclasses.replace(original, engine="sglang")
+    patched = dataclasses.replace(
+        pack,
+        variants={**pack.variants, variant.name: variant},
+    )
+    host = check_module.host_for(patched, None)
+    documents = case_documents(patched, case, host, tmp_path, REPO_ROOT)
+
+    assert not check_module._check_cross_phase(patched, case, documents)
+    profile = documents[f"{variant.profile_passes[0].name}.yaml"]
+    profile["server"]["extra_args"][-2] = "--max-model-len"
+    findings = check_module._check_cross_phase(patched, case, documents)
+    assert any("--context-length does not match" in item.message for item in findings)
+
+
 # ── readiness and planning (pure; no subprocess) ─────────────────────────────
 
 def test_plan_reports_missing_run_directory(pack, tmp_path):
@@ -335,7 +408,408 @@ def test_unknown_phase_is_rejected_with_the_available_list(pack, tmp_path):
     assert TIMING_PREDICT_PHASE in " ".join(plan.reasons)
 
 
+class _ImmediateAsyncContext:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+
+class _ImmediateScheduler:
+    simulation_slot = analysis_slot = staticmethod(_ImmediateAsyncContext)
+
+
+class _ImmediateLeases:
+    @staticmethod
+    def run_directory(_):
+        return _ImmediateAsyncContext()
+
+
+def _ready_execution_plan(pack, tmp_path, case_index=0):
+    case = pack.cases[case_index]
+    variant = pack.variant_of(case)
+    case_dir = tmp_path / case.slug
+    phase_dir = case_dir / ANALYSIS_KERNEL_PHASE
+    phase_dir.mkdir(parents=True)
+    plan = execute.PhasePlan(
+        case.slug,
+        ANALYSIS_KERNEL_PHASE,
+        case_dir,
+        "ready",
+        (),
+        ("fake-command", "--case", case.slug),
+    )
+    return variant, plan, phase_dir
+
+
+def _process_result(
+    plan,
+    *,
+    exit_code=0,
+    leaked_descendants=False,
+    termination_reason=None,
+    pid=123,
+):
+    return ProcessResult(
+        argv=plan.command,
+        pid=pid,
+        process_group_id=pid,
+        exit_code=exit_code,
+        elapsed_seconds=1.25,
+        leaked_descendants=leaked_descendants,
+        termination_reason=termination_reason,
+    )
+
+
+def _read_stage_journal(plan):
+    return json.loads(
+        (plan.directory / ".launcher/stages" / f"{plan.phase}.json").read_text()
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "exit_code",
+        "leaked_descendants",
+        "termination_reason",
+        "expected_state",
+        "effective_code",
+    ),
+    [
+        (0, False, None, "SUCCEEDED", 0),
+        (7, False, None, "FAILED", 7),
+        (0, True, None, "FAILED", 1),
+        (0, False, "timeout", "FAILED", 1),
+    ],
+)
+def test_run_one_journals_the_supervised_process_outcome(
+    pack,
+    tmp_path,
+    monkeypatch,
+    exit_code,
+    leaked_descendants,
+    termination_reason,
+    expected_state,
+    effective_code,
+):
+    variant, plan, phase_dir = _ready_execution_plan(pack, tmp_path)
+    process_result = _process_result(
+        plan,
+        exit_code=exit_code,
+        leaked_descendants=leaked_descendants,
+        termination_reason=termination_reason,
+    )
+
+    async def run_process(spec):
+        assert tuple(spec.argv) == plan.command
+        assert spec.cwd == REPO_ROOT
+        return process_result
+
+    monkeypatch.setattr(execute._PROCESS_SUPERVISOR, "run", run_process)
+    phase_result = asyncio.run(
+        execute._run_one(
+            plan,
+            variant,
+            _ImmediateScheduler(),
+            _ImmediateLeases(),
+            refresh=False,
+        )
+    )
+
+    journal = _read_stage_journal(plan)
+    assert phase_result.returncode == effective_code
+    assert journal["state"] == expected_state
+    assert journal["argv"] == list(plan.command)
+    assert journal["child_pid"] == 123
+    assert journal["process_group_id"] == 123
+    assert journal["exit_code"] == exit_code
+    assert journal["elapsed_seconds"] == 1.25
+    assert journal["termination_reason"] == termination_reason
+    assert has_marker(phase_dir) is (expected_state == "SUCCEEDED")
+
+
+@pytest.mark.parametrize("cancel_at", ["slot", "lease", "process", "lease_exit"])
+def test_run_one_journals_cancellation_while_waiting_or_running(
+    pack, tmp_path, monkeypatch, cancel_at
+):
+    class CancelledContext(_ImmediateAsyncContext):
+        async def __aenter__(self):
+            raise asyncio.CancelledError
+
+    class WaitingScheduler:
+        simulation_slot = analysis_slot = staticmethod(CancelledContext)
+
+    class WaitingLeases:
+        @staticmethod
+        def run_directory(_):
+            return CancelledContext()
+
+    class CancelledExitContext(_ImmediateAsyncContext):
+        async def __aexit__(self, *_):
+            raise asyncio.CancelledError
+
+    class ExitCancelledLeases:
+        @staticmethod
+        def run_directory(_):
+            return CancelledExitContext()
+
+    variant, plan, phase_dir = _ready_execution_plan(pack, tmp_path)
+
+    async def cancel_process(_):
+        if cancel_at == "process":
+            raise asyncio.CancelledError
+        return _process_result(plan)
+
+    monkeypatch.setattr(execute._PROCESS_SUPERVISOR, "run", cancel_process)
+    scheduler = WaitingScheduler() if cancel_at == "slot" else _ImmediateScheduler()
+    if cancel_at == "lease":
+        leases = WaitingLeases()
+    elif cancel_at == "lease_exit":
+        leases = ExitCancelledLeases()
+    else:
+        leases = _ImmediateLeases()
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            execute._run_one(
+                plan,
+                variant,
+                scheduler,
+                leases,
+                refresh=False,
+            )
+        )
+
+    journal = _read_stage_journal(plan)
+    assert journal["state"] == "CANCELLED"
+    assert journal["argv"] == list(plan.command)
+    assert journal["resources"] == ["analysis-slot", "run-directory-lease"]
+    if cancel_at == "lease_exit":
+        assert journal["child_pid"] == 123
+    assert not has_marker(phase_dir)
+
+
+def test_run_one_contains_spawn_failure_so_other_cases_finish(pack, tmp_path, monkeypatch):
+    first_variant, first_plan, first_phase_dir = _ready_execution_plan(pack, tmp_path, 0)
+    second_directory = tmp_path / "synthetic_second_case"
+    second_phase_dir = second_directory / ANALYSIS_KERNEL_PHASE
+    second_phase_dir.mkdir(parents=True)
+    second_variant = first_variant
+    second_plan = dataclasses.replace(
+        first_plan,
+        case_slug="synthetic_second_case",
+        directory=second_directory,
+        command=("fake-command", "--case", "synthetic_second_case"),
+    )
+
+    async def run_process(spec):
+        if first_plan.case_slug in spec.argv:
+            raise OSError("spawn failed")
+        return _process_result(second_plan, pid=456)
+
+    monkeypatch.setattr(execute._PROCESS_SUPERVISOR, "run", run_process)
+
+    async def run_both():
+        return await asyncio.gather(
+            execute._run_one(
+                first_plan,
+                first_variant,
+                _ImmediateScheduler(),
+                _ImmediateLeases(),
+                refresh=False,
+            ),
+            execute._run_one(
+                second_plan,
+                second_variant,
+                _ImmediateScheduler(),
+                _ImmediateLeases(),
+                refresh=False,
+            ),
+        )
+
+    first_result, second_result = asyncio.run(run_both())
+    first_journal = _read_stage_journal(first_plan)
+    second_journal = _read_stage_journal(second_plan)
+    assert first_result.returncode == 1
+    assert first_journal["state"] == "FAILED"
+    assert first_journal["error"] == "OSError: spawn failed"
+    assert not has_marker(first_phase_dir)
+    assert second_result.returncode == 0
+    assert second_journal["state"] == "SUCCEEDED"
+    assert has_marker(second_phase_dir)
+
+
+def test_run_one_starts_a_fresh_attempt_after_an_interrupted_exit(
+    pack, tmp_path, monkeypatch
+):
+    variant, plan, phase_dir = _ready_execution_plan(pack, tmp_path)
+    old_spec = ProcessSpec(argv=("old-command",), cwd=REPO_ROOT, name="old-attempt")
+    old_result = ProcessResult(
+        argv=("old-command",),
+        pid=999,
+        process_group_id=999,
+        exit_code=0,
+        elapsed_seconds=9.0,
+    )
+    journal = RunJournal(plan.directory)
+    journal.update(plan.phase, StageState.RUNNING, spec=old_spec)
+    journal.update(plan.phase, StageState.EXITED, spec=old_spec, result=old_result)
+
+    async def fail_spawn(_):
+        raise OSError("new spawn failed")
+
+    monkeypatch.setattr(execute._PROCESS_SUPERVISOR, "run", fail_spawn)
+    phase_result = asyncio.run(
+        execute._run_one(
+            plan,
+            variant,
+            _ImmediateScheduler(),
+            _ImmediateLeases(),
+            refresh=False,
+        )
+    )
+
+    new_record = _read_stage_journal(plan)
+    assert phase_result.returncode == 1
+    assert new_record["attempt"] == 2
+    assert new_record["state"] == "FAILED"
+    assert new_record["argv"] == list(plan.command)
+    assert new_record["child_pid"] is None
+    assert new_record["process_group_id"] is None
+    assert new_record["exit_code"] is None
+    assert new_record["error"] == "OSError: new spawn failed"
+    assert not has_marker(phase_dir)
+
+
+def test_run_one_does_not_downgrade_programmer_errors(pack, tmp_path, monkeypatch):
+    variant, plan, phase_dir = _ready_execution_plan(pack, tmp_path)
+
+    async def broken_supervisor_contract(_):
+        raise AssertionError("programmer error")
+
+    monkeypatch.setattr(
+        execute._PROCESS_SUPERVISOR,
+        "run",
+        broken_supervisor_contract,
+    )
+    with pytest.raises(AssertionError, match="programmer error"):
+        asyncio.run(
+            execute._run_one(
+                plan,
+                variant,
+                _ImmediateScheduler(),
+                _ImmediateLeases(),
+                refresh=False,
+            )
+        )
+    assert _read_stage_journal(plan)["state"] == "RUNNING"
+    assert not has_marker(phase_dir)
+
+
+def test_run_one_records_marker_publication_failure(pack, tmp_path, monkeypatch):
+    variant, plan, phase_dir = _ready_execution_plan(pack, tmp_path)
+
+    async def run_process(_):
+        return _process_result(plan)
+
+    def fail_marker(_):
+        raise OSError("marker write failed")
+
+    monkeypatch.setattr(execute._PROCESS_SUPERVISOR, "run", run_process)
+    monkeypatch.setattr(execute, "mark_complete", fail_marker)
+    phase_result = asyncio.run(
+        execute._run_one(
+            plan,
+            variant,
+            _ImmediateScheduler(),
+            _ImmediateLeases(),
+            refresh=False,
+        )
+    )
+
+    journal = _read_stage_journal(plan)
+    assert phase_result.returncode == 1
+    assert journal["state"] == "FAILED"
+    assert journal["exit_code"] == 0
+    assert journal["error"] == "OSError: marker write failed"
+    assert not has_marker(phase_dir)
+
+
+def test_run_one_releases_resources_before_publishing_success(
+    pack, tmp_path, monkeypatch
+):
+    class ExitFailureContext(_ImmediateAsyncContext):
+        async def __aexit__(self, *_):
+            raise OSError("lease release failed")
+
+    class ExitFailureLeases:
+        @staticmethod
+        def run_directory(_):
+            return ExitFailureContext()
+
+    variant, plan, phase_dir = _ready_execution_plan(pack, tmp_path)
+
+    async def run_process(_):
+        return _process_result(plan)
+
+    monkeypatch.setattr(execute._PROCESS_SUPERVISOR, "run", run_process)
+    phase_result = asyncio.run(
+        execute._run_one(
+            plan,
+            variant,
+            _ImmediateScheduler(),
+            ExitFailureLeases(),
+            refresh=False,
+        )
+    )
+
+    journal = _read_stage_journal(plan)
+    assert phase_result.returncode == 1
+    assert journal["state"] == "FAILED"
+    assert journal["child_pid"] == 123
+    assert journal["exit_code"] == 0
+    assert journal["error"] == "OSError: lease release failed"
+    assert not has_marker(phase_dir)
+
+
+def test_run_one_leaves_simulation_marker_to_the_simulation_owner(
+    pack, tmp_path, monkeypatch
+):
+    case = pack.cases[0]
+    variant = pack.variant_of(case)
+    case_dir = tmp_path / case.slug
+    phase_dir = case_dir / SIMULATION_PHASE
+    phase_dir.mkdir(parents=True)
+    plan = execute.PhasePlan(
+        case.slug,
+        SIMULATION_PHASE,
+        case_dir,
+        "ready",
+        (),
+        ("fake-command", "--case", case.slug),
+    )
+
+    async def run_process(_):
+        return _process_result(plan)
+
+    monkeypatch.setattr(execute._PROCESS_SUPERVISOR, "run", run_process)
+    phase_result = asyncio.run(
+        execute._run_one(
+            plan,
+            variant,
+            _ImmediateScheduler(),
+            _ImmediateLeases(),
+            refresh=False,
+        )
+    )
+
+    assert phase_result.returncode == 0
+    assert _read_stage_journal(plan)["state"] == "SUCCEEDED"
+    assert not has_marker(phase_dir)
+
+
 # ── host profiles ────────────────────────────────────────────────────────────
+
 
 @pytest.mark.parametrize(
     "host_path", sorted(HOST_ROOT.glob("*.yaml")), ids=lambda path: path.stem

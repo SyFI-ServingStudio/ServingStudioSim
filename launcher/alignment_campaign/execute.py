@@ -39,6 +39,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..process import ProcessResult, ProcessSpec, ProcessSupervisor
 from ..process.journal import RunJournal, StageState
 from ..process.leases import LauncherLeases
 from ..process.markers import clear_marker, has_marker, mark_complete
@@ -53,6 +54,7 @@ from .render import (
 )
 
 LABELED_SEQUENCES_NAME = "kernel_sequences_labeled.json"
+_PROCESS_SUPERVISOR = ProcessSupervisor()
 
 #: Which concurrency budget a phase draws from. GPU-exclusive work takes the
 #: simulation slot even when it is a profile rather than a simulation: the
@@ -290,31 +292,79 @@ async def _run_one(
     refresh: bool,
 ) -> PhaseResult:
     directory = plan.directory / plan.phase
-    journal = RunJournal(plan.directory)
-    journal.update(plan.phase, StageState.WAITING_RESOURCE)
-    slot = (
-        scheduler.simulation_slot()
-        if plan.phase in GPU_PHASES or variant.pass_named(plan.phase) is not None
-        else scheduler.analysis_slot()
+    uses_simulation_slot = (
+        plan.phase in GPU_PHASES or variant.pass_named(plan.phase) is not None
     )
-    async with slot:
-        async with leases.run_directory(plan.directory):
-            if refresh and directory.is_dir():
-                clear_marker(directory)
-            journal.update(plan.phase, StageState.RUNNING)
-            process = await asyncio.create_subprocess_exec(
-                *plan.command, cwd=str(REPO_ROOT)
+    spec = ProcessSpec(
+        argv=plan.command,
+        cwd=REPO_ROOT,
+        name=f"alignment_campaign_{plan.phase}",
+    )
+    journal = RunJournal(plan.directory)
+    journal.begin_attempts([plan.phase])
+    journal.update(
+        plan.phase,
+        StageState.WAITING_RESOURCE,
+        spec=spec,
+        resources=[
+            "simulation-slot" if uses_simulation_slot else "analysis-slot",
+            "run-directory-lease",
+        ],
+    )
+    result: ProcessResult | None = None
+    try:
+        slot = (
+            scheduler.simulation_slot()
+            if uses_simulation_slot
+            else scheduler.analysis_slot()
+        )
+        async with slot:
+            async with leases.run_directory(plan.directory):
+                if refresh and directory.is_dir():
+                    clear_marker(directory)
+                journal.update(plan.phase, StageState.RUNNING, spec=spec)
+                result = await _PROCESS_SUPERVISOR.run(spec)
+                journal.update(plan.phase, StageState.EXITED, spec=spec, result=result)
+
+        # Resource release is part of the attempt. Publish no terminal state or
+        # marker until both the slot and cross-process lease exited cleanly.
+        if not result.succeeded:
+            journal.update(
+                plan.phase,
+                StageState.FAILED,
+                spec=spec,
+                result=result,
+                error="process failed or left process-group descendants",
             )
-            returncode = await process.wait()
-            journal.update(plan.phase, StageState.EXITED, exit_code=returncode)
-            if returncode == 0:
-                # INV-5: the marker is written only after a zero exit. The
-                # simulation phase already carries one written by the ordinary
-                # launcher, so re-writing it here would claim ownership twice.
-                if plan.phase != SIMULATION_PHASE and directory.is_dir():
-                    mark_complete(directory)
-                journal.update(plan.phase, StageState.SUCCEEDED)
-            return PhaseResult(plan=plan, returncode=returncode)
+            effective_returncode = result.exit_code if result.exit_code != 0 else 1
+            return PhaseResult(plan=plan, returncode=effective_returncode)
+
+        # INV-5: the marker is written only after a successful process. The
+        # simulation phase already carries one written by the ordinary
+        # launcher, so re-writing it here would claim ownership twice.
+        if plan.phase != SIMULATION_PHASE and directory.is_dir():
+            mark_complete(directory)
+        journal.update(plan.phase, StageState.SUCCEEDED, spec=spec, result=result)
+        return PhaseResult(plan=plan, returncode=0)
+    except asyncio.CancelledError:
+        journal.update(
+            plan.phase,
+            StageState.CANCELLED,
+            spec=spec,
+            result=result,
+        )
+        raise
+    except OSError as error:
+        # One case failing to acquire resources, spawn, or publish its marker
+        # must not cancel the other cases in this phase's fanout.
+        journal.update(
+            plan.phase,
+            StageState.FAILED,
+            spec=spec,
+            result=result,
+            error=f"{type(error).__name__}: {error}",
+        )
+        return PhaseResult(plan=plan, returncode=1)
 
 
 async def _run_all(

@@ -106,6 +106,22 @@ workload:
   max_concurrency: 64
 ```
 
+An expert-popularity pass must add both independent topology facts to that
+YAML. For example, pure TP with four ranks and unsharded experts is:
+
+```yaml
+profile_kind: expert_popularity
+server:
+  model_path: nvidia/GLM-5.2-NVFP4
+  tp_size: 4
+  dp_size: 1
+  expert_parallel_size: 1
+  expert_count_reduction_group_size: 4
+```
+
+Do not copy these numbers by engine name: state the actual sharding and
+expert-count synchronization groups of the deployment being captured.
+
 Set `engine: sglang` to use the instrumented SGLang submodule instead. Its
 default environment path is
 `alignment/profiler/sglang/python/.venv-sglang/bin/python`, so
@@ -149,10 +165,13 @@ prefix-cache number matters.
 For MoE alignment, profiling may use three explicit passes with identical model,
 topology, backend, and workload settings:
 
-- `profile_kind: expert_popularity` runs vLLM without NSYS, enables EPLB load
-  accounting, and writes `expert_popularity.json` containing aggregated logical
-  expert counts/probabilities by layer. Its synchronization and D2H logging
-  overhead is intentionally excluded from timing evidence.
+- `profile_kind: expert_popularity` runs the selected engine without NSYS and
+  writes `expert_popularity.json` containing aggregated logical expert
+  counts/probabilities by layer. Its synchronization and D2H logging overhead
+  is intentionally excluded from timing evidence. Every such YAML must state
+  `server.expert_parallel_size` and
+  `server.expert_count_reduction_group_size`; neither value is inferred from
+  `engine`, `tp_size`, or `dp_size`.
 - `profile_kind: nsys` (default) is the ordinary timing/segment capture consumed
   by timing-predict and alignment analysis. It must disable popularity logging.
 - `profile_kind: workload_metrics` runs the instrumented vLLM server without
@@ -195,21 +214,30 @@ EPLB-step range. `expert_partitioning.kind = contiguous_logical_expert_ids` with
 ids `[rank * experts_per_rank, (rank + 1) * experts_per_rank)` form one EP-rank
 shard before rank/expert identities are canonicalized. It is a modeling
 partition, not a claim about a potentially rearranged physical EPLB placement.
+The summary's `model` is a portable checkpoint identity: Hugging Face cache
+paths are recovered as `organization/name`, while other absolute paths use the
+model directory name. The raw expert-load JSONL retains the exact engine path.
 
-The raw JSONL retains every emitted record. The aggregate admits only records
-whose per-layer assignment count is within
-`max_tokens_per_step * expert_parallel_size * experts_per_token`; this excludes
-an initial EPLB record that flushes accumulated server warmup work. The summary
-records the raw, accepted, and discarded record counts and the discarded EPLB
-steps, so this filtering is auditable rather than implicit.
+The raw JSONL retains every canonical record: for engines that repeat one
+scheduler event on every TP rank, that is TP0's copy in each DP group. The
+aggregate admits only records whose per-layer assignment count is within
+`max_tokens_per_step * reduction_group_size * experts_per_token`; this excludes
+an initial record that flushes accumulated server warmup work. The reduction
+population is distinct from expert sharding. The YAML is authoritative for
+both: a typical vLLM EP run states the same size for both fields, while an
+SGLang pure-TP run states expert degree 1 and a count-reduction group equal to
+its TP group. These are examples, not engine defaults. The summary records the
+raw, accepted, and discarded record counts and the discarded EPLB steps, so
+this filtering is auditable rather than implicit.
 
 The Rust consumer treats v2 and v3 as closed contracts and rejects unknown
 fields or cross-field inconsistencies. Schemas v1 and v2 remain read-only
 compatibility for existing run directories; the profiler generates v3.
 The instrumented vLLM raw record is also version 2 and supplies
 `expert_parallel_size` and `experts_per_token` from the running EPLB state;
-the summary extractor verifies that these values remain constant across the
-capture rather than inferring them from a local checkpoint path.
+the summary extractor verifies the recorded expert degree against YAML and
+checks that these values remain constant across the capture. The count-reduction
+group exists only in YAML because the raw record does not report it.
 
 ### `timing_predict.yaml`
 
@@ -429,6 +457,26 @@ Standalone NSYS normalization remains available as:
 uv run python -m alignment parse --sqlite capture.sqlite --metrics metrics.jsonl \
   --iteration-start 24 --iteration-end 48 --output parsed.json
 ```
+
+For concurrency diagnosis, parse only a bounded iteration window directly from
+the SQLite export and decompose raw kernel residency into same-stream PDL
+evidence, multi-stream overlap, and the exposed device busy union:
+
+```bash
+uv run python -m alignment overlap --sqlite capture.sqlite --metrics metrics.jsonl \
+  --iteration-start 5354 --iteration-end 5354 --tp-size 4 --device 0 \
+  --output overlap_diagnostics.json
+```
+
+The report includes overall, per-stage and per-iteration/device totals plus the
+top 50 PDL kernel pairs (`--top-pairs 0` retains all). Every duplicate same-stream
+nanosecond is attributed once, so the complete pair attribution sums exactly to
+the same-stream reduction and `raw = busy_union + PDL + multistream` has a zero
+residual. The checks state both returned and omitted pair totals when the display
+is truncated. These are trace-union reductions, not predicted savings: a PDL
+consumer can be resident while waiting in `griddepcontrol.wait`. Reclaimable time
+requires an otherwise-identical PDL on/off measurement; do not copy these
+reductions into the CostTree as discounts.
 
 The duty-cycle correction is derived by the analyzer's kernel-align pass, not a
 standalone command. It pools `Σ measured_gpu_cycle_ms / Σ measured_busy_union_ms` over

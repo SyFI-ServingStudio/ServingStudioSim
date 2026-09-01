@@ -240,10 +240,9 @@ def load_metrics(path: Path | None) -> dict[tuple[int, int], dict]:
 def fold_rank_metrics(rows: list[dict], iteration_index: int) -> dict:
     """One replica batch shape out of the per-rank rows of ONE wall-clock step.
 
-    The rows must already be the ranks of the same step. Which rows those are is
-    not a question this function can answer: ranks number their own iterations
-    (see `align_ranges_into_steps`), so the answer comes from the measured
-    timeline, not from the index.
+    Rows must be unique by data-parallel rank. This function concatenates
+    independently scheduled batches; repeating one row per TP device would
+    multiply every token-proportional input by ``tp_size``.
     """
     adapters = {row.get("input_adapter") for row in rows}
     if len(adapters) > 1:
@@ -376,7 +375,9 @@ def worker_for_global_tid(workers_by_gtid: dict[int, Worker], global_tid: int) -
 
 
 def window_rows_by_reference_rank(
-    parsed_rows: list[list], iteration_start: int, iteration_end: int
+    parsed_rows: list[list],
+    iteration_start: int | None,
+    iteration_end: int | None,
 ) -> list[list]:
     """Keep the reference rank's numbered window, and its peers by overlap.
 
@@ -384,15 +385,22 @@ def window_rows_by_reference_rank(
     reference rank is the lowest device id present — the same choice
     `align_ranges_into_steps` makes, so the two agree on whose clock the capture
     is described in.
+
+    A ``None`` bound is open. Capture duration already defines the measured
+    window, so the default analysis keeps all of that evidence.
     """
+
+    def in_window(iteration: int) -> bool:
+        return (iteration_start is None or iteration >= iteration_start) and (
+            iteration_end is None or iteration <= iteration_end
+        )
+
     devices = {row[2].device_id for row in parsed_rows if row[2].device_id is not None}
     if not devices:
-        return [row for row in parsed_rows if iteration_start <= row[0] <= iteration_end]
+        return [row for row in parsed_rows if in_window(row[0])]
     reference_device_id = min(devices)
     reference_rows = [
-        row
-        for row in parsed_rows
-        if row[2].device_id == reference_device_id and iteration_start <= row[0] <= iteration_end
+        row for row in parsed_rows if row[2].device_id == reference_device_id and in_window(row[0])
     ]
     if not reference_rows:
         return []
@@ -415,12 +423,15 @@ def load_ranges(
     con: sqlite3.Connection,
     workers_by_gtid: dict[int, Worker],
     metrics: dict[int, dict],
-    iteration_start: int,
-    iteration_end: int,
+    iteration_start: int | None,
+    iteration_end: int | None,
     range_mode: str,
     default_stage: str = "all",
 ) -> list[RangeStats]:
-    """Extract the NVTX iteration ranges of the window `[iteration_start, iteration_end]`.
+    """Extract the NVTX iteration ranges of the requested iteration window.
+
+    Either bound may be open; both are open by default to analyze the complete
+    capture.
 
     Only inline, indexed `vllm_iteration(N): <phase>` and
     `sglang_iteration(N): <phase>` markers are valid inputs. A trace without
@@ -903,6 +914,37 @@ def partition_kernel_tracks(kernel_events: list[KernelEvent]) -> list[list[Kerne
     return [by_stream[stream] for stream in ordered_streams]
 
 
+def step_rows_by_dp_rank(
+    index_by_device: dict[int | None, int],
+    rank_metrics: dict[tuple[int, int], dict],
+    dp_rank_by_device: dict[int, int],
+) -> dict[int, dict]:
+    """Resolve one scheduler batch row per DP rank in a measured step.
+
+    Tensor-parallel devices share a scheduler batch, while distinct DP ranks
+    own independent batches that must be concatenated. All TP devices mapped to
+    one DP rank must therefore name the same local iteration.
+    """
+    rows_by_dp_rank: dict[int, dict] = {}
+    iteration_by_dp_rank: dict[int, int] = {}
+    for device_id, iteration in sorted(
+        (device, index) for device, index in index_by_device.items() if device is not None
+    ):
+        dp_rank = dp_rank_by_device.get(device_id)
+        if dp_rank is None:
+            continue
+        previous_iteration = iteration_by_dp_rank.get(dp_rank)
+        if previous_iteration is not None and previous_iteration != iteration:
+            raise ValueError(
+                f"dp_rank {dp_rank} maps to iterations {previous_iteration} and "
+                f"{iteration} in one measured step"
+            )
+        iteration_by_dp_rank[dp_rank] = iteration
+        if (dp_rank, iteration) in rank_metrics:
+            rows_by_dp_rank[dp_rank] = rank_metrics[(dp_rank, iteration)]
+    return rows_by_dp_rank
+
+
 def build_iteration_details(
     ranges: list[RangeStats],
     metrics: dict[int, dict],
@@ -941,13 +983,12 @@ def build_iteration_details(
             )
         )
         index_by_device = step.index_by_device
-        step_rows = [
-            rank_metrics[(dp_rank_by_device[device_id], iteration)]
-            for device_id, iteration in sorted(
-                ((device, index) for device, index in index_by_device.items() if device is not None)
-            )
-            if (dp_rank_by_device.get(device_id), iteration) in rank_metrics
-        ]
+        rows_by_dp_rank = step_rows_by_dp_rank(
+            index_by_device,
+            rank_metrics,
+            dp_rank_by_device,
+        )
+        step_rows = [rows_by_dp_rank[dp_rank] for dp_rank in sorted(rows_by_dp_rank)]
         metric = (
             fold_rank_metrics(step_rows, step.iteration)
             if step_rows
@@ -1043,15 +1084,7 @@ def build_iteration_details(
                 "jit_module_loads": sum(item.jit_module_loads for item in items),
                 "jit_stall_ns": sum(item.jit_stall_ns for item in items),
                 "metrics_by_dp_rank": {
-                    str(dp_rank_by_device[device_id]): rank_metrics[
-                        (dp_rank_by_device[device_id], iteration)
-                    ]
-                    for device_id, iteration in sorted(
-                        (device, index)
-                        for device, index in index_by_device.items()
-                        if device is not None
-                    )
-                    if (dp_rank_by_device.get(device_id), iteration) in rank_metrics
+                    str(dp_rank): row for dp_rank, row in sorted(rows_by_dp_rank.items())
                 },
                 "ranges": serialized_ranges,
             }
@@ -1335,8 +1368,8 @@ def parse_host_timeline(sqlite_path: Path, window_start_ns: int, window_end_ns: 
 def parse_trace(
     sqlite_path: Path,
     metrics_jsonl: Path | None,
-    iteration_start: int,
-    iteration_end: int,
+    iteration_start: int | None = None,
+    iteration_end: int | None = None,
     *,
     range_mode: str = "phases",
     default_stage: str = "all",
@@ -1362,6 +1395,12 @@ def parse_trace(
     the capture actually shows — a mapping that does not cover them describes a
     different run.
     """
+    if (
+        iteration_start is not None
+        and iteration_end is not None
+        and iteration_start > iteration_end
+    ):
+        raise ValueError("iteration_start must not exceed iteration_end")
     con = sqlite3.connect(str(sqlite_path))
     try:
         ensure_query_indexes(con)
@@ -1471,8 +1510,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Parse nsys sqlite → per-op busy time")
     parser.add_argument("--sqlite", type=Path, required=True, help="Exported nsys SQLite database")
     parser.add_argument("--metrics", type=Path, default=None, help="vLLM iteration metrics JSONL")
-    parser.add_argument("--iteration-start", type=int, required=True)
-    parser.add_argument("--iteration-end", type=int, required=True)
+    parser.add_argument(
+        "--iteration-start",
+        type=int,
+        default=None,
+        help="first reference-rank iteration (default: start of capture)",
+    )
+    parser.add_argument(
+        "--iteration-end",
+        type=int,
+        default=None,
+        help="last reference-rank iteration (default: end of capture)",
+    )
     parser.add_argument("--range-mode", choices=["forward", "envelope", "phases"], default="phases")
     parser.add_argument(
         "--default-stage",

@@ -52,6 +52,7 @@ from .pack import Case, Finding, HostProfile, Pack, PackError
 from .render import (
     ANALYSIS_E2E_PHASE,
     ANALYSIS_KERNEL_PHASE,
+    CONTEXT_LIMIT_FLAG,
     KERNEL_TRACE_NAME,
     PHASE_CONFIG_STEMS,
     SIMULATION_PHASE,
@@ -584,10 +585,16 @@ def _check_cross_phase(pack: Pack, case: Case, documents: dict[str, Any]) -> lis
                 Finding("error", f"{where}.{profile_pass.name}", "workload.max_model_len drifted")
             )
         flags = document["server"]["extra_args"]
-        if flags[-2:] != ["--max-model-len", str(case.max_model_len)]:
+        limit_flag = CONTEXT_LIMIT_FLAG.get(variant.engine)
+        if limit_flag is None:
             findings.append(
                 Finding("error", f"{where}.{profile_pass.name}",
-                        "server --max-model-len does not match the case")
+                        f"engine {variant.engine!r} has no known context-limit flag")
+            )
+        elif flags[-2:] != [limit_flag, str(case.max_model_len)]:
+            findings.append(
+                Finding("error", f"{where}.{profile_pass.name}",
+                        f"server {limit_flag} does not match the case")
             )
         devices = [item for item in document["cuda_visible_devices"].split(",") if item]
         world = int(variant.server.get("tp_size", 1)) * int(variant.server.get("dp_size", 1))

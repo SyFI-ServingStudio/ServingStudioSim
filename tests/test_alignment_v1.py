@@ -134,6 +134,18 @@ def test_nsys_cuda_flush_interval_must_be_positive():
         NsysConfig(cuda_flush_interval_ms=0).validate()
 
 
+def test_nsys_analysis_defaults_to_the_whole_capture_and_validates_excerpts():
+    config = NsysConfig()
+    assert config.analyze_iteration_start is None
+    assert config.analyze_iteration_end is None
+    config.validate()
+    NsysConfig(analyze_iteration_start=24).validate()
+    NsysConfig(analyze_iteration_end=48).validate()
+
+    with pytest.raises(ValueError, match="must not exceed"):
+        NsysConfig(analyze_iteration_start=49, analyze_iteration_end=48).validate()
+
+
 def test_structured_vllm_iteration_record_is_the_only_metrics_contract(tmp_path):
     record = {
         "schema_version": 1,
@@ -203,6 +215,108 @@ def _dp_iteration_record_v2(iteration: int, elapsed_ms: float) -> dict:
         "observed_end_monotonic_ns": 1_000_000 + round(elapsed_ms * 1_000_000),
         "observed_elapsed_ms": elapsed_ms,
     }
+
+
+def _sglang_iteration_record(iteration: int, prefill_tokens: int = 0) -> dict:
+    return {
+        **_dp_iteration_record(iteration, prefill_tokens),
+        "input_adapter": "sglang_text",
+    }
+
+
+def _sglang_prefixed(record_kind: str, record: dict, *, dp_rank=None, tp_rank=None) -> str:
+    rank_tags = "".join(
+        tag
+        for tag in (
+            f" DP{dp_rank}" if dp_rank is not None else "",
+            f" TP{tp_rank}" if tp_rank is not None else "",
+        )
+    )
+    return f"[2026-08-11 16:18:16{rank_tags}] INFO {record_kind} {json.dumps(record)}"
+
+
+def test_sglang_tensor_parallel_iteration_copies_keep_only_tp0(tmp_path):
+    record = _sglang_iteration_record(7, prefill_tokens=8)
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            _sglang_prefixed("VibeSimAlignmentIteration", record, tp_rank=tp_rank)
+            for tp_rank in range(4)
+        )
+    )
+    output = tmp_path / "metrics.jsonl"
+
+    assert (
+        record_extraction.extract_metrics_jsonl(
+            server_log, output, records=engine_records.SGLANG_RECORDS
+        )
+        == 1
+    )
+    assert json.loads(output.read_text()) == {**record, "dp_rank": 0}
+
+
+def test_sglang_dp_tp_iteration_copies_keep_one_record_per_dp_rank(tmp_path):
+    records = [
+        _sglang_iteration_record(4, prefill_tokens=8),
+        _sglang_iteration_record(4, prefill_tokens=0),
+    ]
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            _sglang_prefixed(
+                "VibeSimAlignmentIteration",
+                records[dp_rank],
+                dp_rank=dp_rank,
+                tp_rank=tp_rank,
+            )
+            for dp_rank in range(2)
+            for tp_rank in range(2)
+        )
+    )
+    output = tmp_path / "metrics.jsonl"
+
+    assert (
+        record_extraction.extract_metrics_jsonl(
+            server_log,
+            output,
+            dp_size=2,
+            records=engine_records.SGLANG_RECORDS,
+        )
+        == 2
+    )
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert rows == [
+        {**records[0], "dp_rank": 0},
+        {**records[1], "dp_rank": 1},
+    ]
+
+
+def test_sglang_duplicate_iteration_from_the_owner_is_rejected(tmp_path):
+    record = _sglang_iteration_record(7)
+    line = _sglang_prefixed("VibeSimAlignmentIteration", record, tp_rank=0)
+    server_log = tmp_path / "server.log"
+    server_log.write_text(f"{line}\n{line}\n")
+
+    with pytest.raises(ValueError, match="duplicate alignment iteration record"):
+        record_extraction.extract_metrics_jsonl(
+            server_log,
+            tmp_path / "metrics.jsonl",
+            records=engine_records.SGLANG_RECORDS,
+        )
+
+
+def test_sglang_single_scheduler_without_a_tp_tag_is_retained(tmp_path):
+    record = _sglang_iteration_record(7)
+    server_log = tmp_path / "server.log"
+    server_log.write_text(_sglang_prefixed("VibeSimAlignmentIteration", record) + "\n")
+    output = tmp_path / "metrics.jsonl"
+
+    assert (
+        record_extraction.extract_metrics_jsonl(
+            server_log, output, records=engine_records.SGLANG_RECORDS
+        )
+        == 1
+    )
 
 
 def test_data_parallel_iteration_records_are_stamped_with_their_engine_rank(tmp_path):
@@ -679,6 +793,71 @@ def test_sglang_request_timing_v3_accepts_a_partially_split_first_output_wait(tm
     assert row["api_first_output_wait_ms"] == 13.0
     # vLLM-only plumbing must not be invented for an engine that has none.
     assert "api_collector_wait_ms" not in row
+
+
+def test_sglang_tensor_parallel_request_copies_join_one_api_record(tmp_path):
+    engine_record, api_record = _sglang_v3_records()
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            [
+                *(
+                    _sglang_prefixed(
+                        "VibeSimAlignmentRequestTiming",
+                        engine_record,
+                        tp_rank=tp_rank,
+                    )
+                    for tp_rank in range(4)
+                ),
+                f"INFO VibeSimAlignmentApiRequestTiming {json.dumps(api_record)}",
+            ]
+        )
+    )
+    output = tmp_path / "request_timings.jsonl"
+
+    assert (
+        record_extraction.extract_request_timings_jsonl(
+            server_log, output, records=engine_records.SGLANG_RECORDS
+        )
+        == 1
+    )
+    assert json.loads(output.read_text())["request_id"] == "vibesim_7"
+
+
+def test_sglang_request_copies_keep_one_request_per_dp_group(tmp_path):
+    def request_record(request_id: str) -> dict:
+        return {
+            "schema_version": 1,
+            "engine_request_id": request_id,
+            "engine_core_ttft_ms": 12.5,
+            "engine_queue_wait_ms": 3.0,
+            "engine_first_schedule_to_first_token_ms": 9.5,
+        }
+
+    records = [request_record("vibesim_0"), request_record("vibesim_1")]
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            _sglang_prefixed(
+                "VibeSimAlignmentRequestTiming",
+                records[dp_rank],
+                dp_rank=dp_rank,
+                tp_rank=tp_rank,
+            )
+            for dp_rank in range(2)
+            for tp_rank in range(2)
+        )
+    )
+    output = tmp_path / "request_timings.jsonl"
+
+    assert (
+        record_extraction.extract_request_timings_jsonl(
+            server_log, output, records=engine_records.SGLANG_RECORDS
+        )
+        == 2
+    )
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [row["request_id"] for row in rows] == ["vibesim_0", "vibesim_1"]
 
 
 def test_sglang_request_timing_v3_rejects_dispatch_phases_exceeding_the_wait(tmp_path):
@@ -1315,7 +1494,20 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     )
     e2e_report = json.loads((analysis / "reports" / "alignment_e2e_report.json").read_text())
     assert iteration_report["mapping"]["coverage"]["measured_duration_fraction"] == 1.0
-    assert len(iteration_report["kernels"]) == 3
+    # Schema 2 streams run-wide audit rows into the sibling JSONL named by the
+    # report. Follow that contract instead of the deliberately empty bootstrap
+    # array retained for compatibility.
+    assert iteration_report["schema_version"] == 2
+    assert iteration_report["kernels"] == []
+    kernel_detail = iteration_report["kernel_detail"]
+    assert kernel_detail["rows"] == 3
+    inventory = (analysis / "reports" / kernel_detail["file"]).read_text().splitlines()
+    assert len(inventory) == 3
+    assert {json.loads(row)["operation"] for row in inventory} == {
+        "attention",
+        "dense_gemm",
+        "model.lm_head",
+    }
     assert iteration_report["iterations"][0]["measured_ms"] == 3.5
     # The iteration pass self-computes the duty-cycle multiplier from measured
     # quantities alone: Σ measured_gpu_cycle_ms / Σ measured_ms over iterations

@@ -192,8 +192,10 @@ Everything flows through `perf_api`. There are exactly two internal paths.
    `RunnerRef`, executes each spec, and writes JSON results back.
 5. Require every successful worker result to report its observed physical GPU,
    validate all observations against the requested cache key, then persist the
-   rows through `Table.insert`. Cached-only provenance is produced only by a DB
-   hit for which no worker ran.
+   rows through `Table.insert`. Failed specs retain their worker error in one
+   grouped log per backend (warning for a partial batch, error when all specs
+   fail), rather than resurfacing later as anonymous cache misses. With no
+   successful worker observation, returned provenance remains cache-key-only.
 
 The main/simulator process therefore **never imports torch or a runner**: the
 registry holds lazy `RunnerRef`s, and the heavy import only happens in the worker
@@ -262,6 +264,7 @@ python -m launcher kernel-profile count-missing <table> --backend <b> ...
 python -m launcher kernel-profile run           <table> --backend <b> [--force] ...
 python -m launcher kernel-profile measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2]
 python -m launcher kernel-profile merge-db LEFT.db RIGHT.db --output MERGED.db [--report REPORT.json]
+python -m launcher kernel-profile audit-provenance [--db profile.db] [--json]
 ```
 
 `run` enables JIT for the call (or uses `force=True`), so it is the one CLI verb
@@ -276,6 +279,16 @@ is published: the command returns `1` and writes both versions to
 `<output>.merge-report.json` for explicit resolution. Surrogate `id` and
 insertion-only `created_at` do not create conflicts. Existing outputs are never
 overwritten, and there is deliberately no broad `--force` policy.
+
+New measurements stamp a bare profiler commit only when `profiling/` is clean;
+staged, unstaged, or untracked profiler code produces `<sha>-dirty` instead.
+`audit-provenance` conservatively checks historical rows against the kernel
+registrations present at their stamped commit. It is always read-only: arbitrary
+Python imports/helpers can register backends as side effects, so static absence
+is a diagnostic candidate rather than proof that is safe to write back. Foreign
+commits and missing, unparseable, or indirect/dynamic historical registrations
+remain explicitly unverifiable. The source-side dirty stamp prevents new rows
+from repeating the historical problem.
 
 Artifact-producing `run --output-dir` and `measure --output-dir` publish
 `artifact.meta.json` as `kernel_profile` and `kernel_measurement`, respectively,

@@ -2941,6 +2941,18 @@ fn write_alignment_bundle(root: &Path) -> (Vec<u8>, [usize; 2]) {
     (first.into_bytes(), [ranges[0][0], ranges[1][0]])
 }
 
+fn kernel_analysis_config(log_dir: &str) -> String {
+    format!(
+        "schema_version: 1\n\
+         profile_log_dir: ./profile\n\
+         timing_predict_log_dir: ./timing_predict\n\
+         log_dir: {log_dir}\n\
+         iteration:\n\
+           enabled: true\n\
+           labeled_kernel_sequences_file: ./kernel_sequences_labeled.json\n"
+    )
+}
+
 #[test]
 fn alignment_catalog_reports_each_analysis_half_separately() {
     let temporary = TempDir::new().expect("temp dir");
@@ -2964,6 +2976,149 @@ fn alignment_catalog_reports_each_analysis_half_separately() {
     assert!(entries[0]["alignment_id"]
         .as_str()
         .is_some_and(|id| id.starts_with("al_")));
+}
+
+#[test]
+fn analyze_kernel_yaml_selects_the_kernel_analysis_served_by_the_ui() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let bundle = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    let selected = bundle.join("analysis_kernel_mine");
+    fs::create_dir_all(selected.join("reports")).expect("selected reports");
+    fs::create_dir_all(selected.join("payloads")).expect("selected payloads");
+    fs::write(
+        selected.join("alignment_manifest.json"),
+        json!({"predict_log_dir": bundle.join("timing_predict_second_pass")}).to_string(),
+    )
+    .expect("selected manifest");
+    fs::write(
+        selected.join("reports/alignment_iteration_report.json"),
+        json!({"source": "mine"}).to_string(),
+    )
+    .expect("selected report");
+    fs::write(
+        selected.join("payloads/alignment_iteration_series.json"),
+        json!({"source": "mine"}).to_string(),
+    )
+    .expect("selected payload");
+    fs::write(
+        bundle.join("analyze_kernel.yaml"),
+        kernel_analysis_config("./analysis_kernel_mine"),
+    )
+    .expect("selection config");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+
+    let discovered = discover_alignments(&roots).expect("discover");
+    assert_eq!(discovered.len(), 1);
+    assert_eq!(
+        alignment_report(&discovered[0], "iteration").expect("selected report")["source"],
+        "mine"
+    );
+    assert_eq!(
+        alignment_payload(&discovered[0], "iteration").expect("selected payload")["source"],
+        "mine"
+    );
+    let descriptor = alignment_descriptor(&discovered[0], &roots);
+    assert_eq!(descriptor["prediction"]["prediction_id"], "p_unused");
+}
+
+#[test]
+fn configured_missing_kernel_analysis_never_falls_back_to_stale_legacy_results() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let bundle = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    fs::write(
+        bundle.join("analyze_kernel.yaml"),
+        kernel_analysis_config("./analysis_kernel_not_started"),
+    )
+    .expect("selection config");
+    fs::remove_file(bundle.join("analysis_e2e/alignment_manifest.json"))
+        .expect("remove unrelated e2e half");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+
+    let discovered = discover_alignments(&roots).expect("discover");
+    assert_eq!(
+        discovered.len(),
+        1,
+        "the kernel config itself owns the bundle"
+    );
+    let descriptor = alignment_descriptor(&discovered[0], &roots);
+    assert_eq!(descriptor["lifecycle"]["kernel_analysis"], "not_started");
+    assert_eq!(descriptor["lifecycle"]["e2e_analysis"], "not_started");
+    assert_eq!(
+        descriptor["subjects"]["iteration"]["status"],
+        "not_generated"
+    );
+    assert!(alignment_report(&discovered[0], "iteration").is_err());
+}
+
+#[test]
+fn invalid_or_external_kernel_selection_never_exposes_legacy_results() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let bundle = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    let parent_escape = kernel_analysis_config("../outside_the_bundle");
+    let absolute_escape = kernel_analysis_config("/absolute/outside_the_bundle");
+    for config in [
+        "not: [valid yaml",
+        parent_escape.as_str(),
+        absolute_escape.as_str(),
+    ] {
+        fs::write(bundle.join("analyze_kernel.yaml"), config).expect("selection config");
+        let roots = configure_logs_roots(vec![temporary.path().to_path_buf()])
+            .expect("configure logs root");
+        let discovered = discover_alignments(&roots).expect("discover");
+        assert_eq!(discovered.len(), 1);
+        assert!(alignment_report(&discovered[0], "iteration").is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_regular_config_and_symlink_escape_never_expose_kernel_results() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let bundle = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32");
+    let config_path = bundle.join("analyze_kernel.yaml");
+    let real_config = bundle.join("real_analyze_kernel.yaml");
+    fs::write(&real_config, kernel_analysis_config("./analysis_kernel")).expect("real config");
+    symlink(&real_config, &config_path).expect("symlink config");
+
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let discovered = discover_alignments(&roots).expect("discover symlink config");
+    assert_eq!(discovered.len(), 1);
+    assert!(alignment_report(&discovered[0], "iteration").is_err());
+
+    fs::remove_file(&config_path).expect("remove config symlink");
+    let outside = temporary.path().join("outside_analysis");
+    fs::create_dir_all(outside.join("reports")).expect("outside reports");
+    fs::write(outside.join("alignment_manifest.json"), "{}").expect("outside manifest");
+    fs::write(
+        outside.join("reports/alignment_iteration_report.json"),
+        json!({"source": "outside"}).to_string(),
+    )
+    .expect("outside report");
+    symlink(&outside, bundle.join("linked_analysis")).expect("analysis symlink");
+    fs::write(&config_path, kernel_analysis_config("./linked_analysis")).expect("selection config");
+
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let discovered = discover_alignments(&roots).expect("discover escaped selection");
+    assert_eq!(discovered.len(), 1);
+    assert!(alignment_report(&discovered[0], "iteration").is_err());
 }
 
 #[test]

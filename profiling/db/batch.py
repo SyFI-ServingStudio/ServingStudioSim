@@ -7,7 +7,8 @@ chunks to ``GpuPool``; execution backends run workers, and ``Table`` owns SQL.
 
 from __future__ import annotations
 
-from collections import defaultdict
+import logging
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
@@ -26,6 +27,12 @@ if TYPE_CHECKING:
     from profiling.exec.pool import ChunkResult, GpuChunk, GpuPool
 
 GpuCountFn = Callable[[dict[str, Any]], int]
+
+logger = logging.getLogger(__name__)
+
+_MAX_REPORTED_FAILURE_REASONS = 3
+_MAX_FAILURE_REASON_CHARS = 240
+_MISSING_FAILURE_REASON = "runner returned no metrics and no error"
 
 
 @dataclass(frozen=True)
@@ -163,6 +170,8 @@ def execute_profile_batch(
     pending_groups: list[
         tuple[KernelProfilerSpec, list[tuple[_PreparedProfileSpec, ChunkResult]]]
     ] = []
+    attempts_by_backend: Counter[str] = Counter()
+    failures_by_backend: dict[str, Counter[str]] = defaultdict(Counter)
     largest_gpu_count = 0
 
     # Run every group first, collecting rows plus every successful worker observation.
@@ -179,6 +188,7 @@ def execute_profile_batch(
             raise RuntimeError(f"pool returned no chunks for {backend} with {gpu_count} GPU(s)")
 
         largest_gpu_count = max(largest_gpu_count, gpu_count)
+        attempts_by_backend[backend] += len(classified_specs)
         successful_profiles: list[tuple[_PreparedProfileSpec, ChunkResult]] = []
         for prepared_spec, chunk_result in _run_specs_across_chunks(
             kernel_kind,
@@ -188,6 +198,7 @@ def execute_profile_batch(
             metrics = chunk_result.metrics
             results[prepared_spec.input_index] = metrics
             if metrics is None:
+                failures_by_backend[backend][_normalize_failure_reason(chunk_result.error)] += 1
                 continue
             observed = chunk_result.observed_gpu_name
             if not observed:
@@ -199,6 +210,9 @@ def execute_profile_batch(
             successful_profiles.append((prepared_spec, chunk_result))
         if successful_profiles:
             pending_groups.append((profiler_spec, successful_profiles))
+
+    for backend, failures in failures_by_backend.items():
+        _log_batch_failures(kernel_kind, backend, attempts_by_backend[backend], failures)
 
     if pending_groups:
         effective_cache_key, observed_after_validation = _validated_gpu_identity(
@@ -239,6 +253,46 @@ def execute_profile_batch(
             gpu_count=largest_gpu_count,
         ),
     )
+
+
+def _log_batch_failures(
+    kernel_kind: KernelKind,
+    backend: str,
+    attempted: int,
+    failures: Counter[str],
+) -> None:
+    """Surface runner errors that would otherwise become anonymous cache misses."""
+    failed = sum(failures.values())
+    level = logging.ERROR if failed == attempted else logging.WARNING
+    reasons = [
+        f"{count}x {_display_failure_reason(reason)}"
+        for reason, count in failures.most_common(_MAX_REPORTED_FAILURE_REASONS)
+    ]
+    omitted = len(failures) - len(reasons)
+    if omitted:
+        reasons.append(f"{omitted} additional reason(s)")
+    logger.log(
+        level,
+        "%s:%s profiled %d/%d specs; %d failed and were not inserted (%s)",
+        kernel_kind,
+        backend,
+        attempted - failed,
+        attempted,
+        failed,
+        "; ".join(reasons),
+    )
+
+
+def _display_failure_reason(reason: str) -> str:
+    """Keep one grouped reason readable without flooding operator logs."""
+    if len(reason) <= _MAX_FAILURE_REASON_CHARS:
+        return reason
+    return f"{reason[: _MAX_FAILURE_REASON_CHARS - 3]}..."
+
+
+def _normalize_failure_reason(reason: str | None) -> str:
+    """Canonicalize worker text before grouping equivalent failures."""
+    return " ".join((reason or "").split()) or _MISSING_FAILURE_REASON
 
 
 def _validated_gpu_identity(

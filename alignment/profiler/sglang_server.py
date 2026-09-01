@@ -11,6 +11,10 @@ file exists rather than a flag on the vLLM one:
 * **Flag spellings.** `--model-path`, `--tp-size`, `--chunked-prefill-size`,
   `--mem-fraction-static` where vLLM says `--model`, `--tensor-parallel-size`,
   `--max-num-batched-tokens`, `--gpu-memory-utilization`.
+* **One knob that is not a spelling difference.** `max_cudagraph_capture_size`
+  counts tokens for vLLM and has no SGLang counterpart in the same unit, so
+  `build_server_argv` rejects it instead of forwarding it to a request-count
+  flag.
 * **Targeted capture.** vLLM has a dedicated `--profiler-config.profiler=cuda`
   launch flag; SGLang instead takes the activity per request, so the capture is
   armed with `{"activities": ["CUDA_PROFILER"]}` on `/start_profile` and needs no
@@ -70,6 +74,38 @@ NSYS_CAPTURE_SERVER_ARGS: tuple[str, ...] = ()
 TIMING_INSTRUMENTATION_OFF_ENV = {"SGLANG_ENABLE_NVTX_SCHEDULER": "0"}
 
 
+def validate_nsys_capture_environment(
+    fork_python: str,
+    *,
+    env: dict[str, str],
+    cwd: Path,
+) -> None:
+    """Require the optional package that emits SGLang's iteration ranges.
+
+    SGLang only warns when ``nvtx`` is unavailable and then continues serving.
+    An NSYS run would therefore finish with millions of kernels but no
+    ``sglang_iteration(N): forward`` ranges to attribute them to. Refuse that
+    expensive unusable capture before launching the server.
+    """
+    probe = subprocess.run(
+        [fork_python, "-c", "import nvtx"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=cwd,
+        timeout=30,
+    )
+    if probe.returncode != 0:
+        detail = probe.stderr.strip() or probe.stdout.strip() or "import failed"
+        raise RuntimeError(
+            f"the SGLang fork venv cannot import `nvtx`: {fork_python}\n"
+            "SGLang would serve without iteration markers, leaving captured "
+            "kernels unattributed. Install it with:\n"
+            f"  uv pip install --python {fork_python} nvtx\n"
+            f"Import error: {detail}"
+        )
+
+
 def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
     """The `python -m sglang.launch_server ...` argv."""
     argv = [
@@ -100,7 +136,17 @@ def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
     if cfg.enforce_eager:
         argv.append("--disable-cuda-graph")  # every kernel is a normal launch
     if cfg.max_cudagraph_capture_size is not None:
-        argv += ["--cuda-graph-max-bs", str(cfg.max_cudagraph_capture_size)]
+        # vLLM's field is a token ceiling. SGLang's nearest flag,
+        # --cuda-graph-max-bs-decode, counts concurrent decode requests. There
+        # is no conversion between those independent quantities; forwarding a
+        # 2,048-token chunk budget would ask SGLang to capture graphs for 2,048
+        # requests and can make startup appear hung.
+        raise ValueError(
+            "server.max_cudagraph_capture_size is a vLLM token ceiling and has no "
+            "SGLang equivalent: --cuda-graph-max-bs-decode counts requests, not "
+            "tokens. Drop the field for engine: sglang and, if a decode-graph "
+            "ceiling is wanted, pass --cuda-graph-max-bs-decode in server.extra_args."
+        )
     if cfg.served_model_name:
         argv += ["--served-model-name", cfg.served_model_name]
     argv += list(cfg.extra_args)

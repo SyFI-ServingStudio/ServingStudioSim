@@ -23,12 +23,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -45,6 +45,7 @@ use super::{ArtifactNotFound, PROTOCOL_VERSION};
 /// The manifest each analysis half writes. Its presence is what makes a
 /// directory an analysis, and its parent a bundle.
 const MANIFEST_FILE: &str = "alignment_manifest.json";
+const KERNEL_ANALYSIS_CONFIG: &str = "analyze_kernel.yaml";
 const KERNEL_ANALYSIS_DIR: &str = "analysis_kernel";
 const E2E_ANALYSIS_DIR: &str = "analysis_e2e";
 
@@ -88,18 +89,26 @@ pub(super) struct DiscoveredAlignment {
     pub(super) alignment_id: String,
     pub(super) display_name: String,
     pub(super) path: PathBuf,
+    kernel_analysis_dir: Option<PathBuf>,
     pub(super) updated_time: SystemTime,
 }
 
 impl DiscoveredAlignment {
-    fn analysis_dir(&self, name: &str) -> PathBuf {
-        self.path.join(name)
+    fn analysis_dir(&self, name: &str) -> Option<PathBuf> {
+        if name == KERNEL_ANALYSIS_DIR {
+            self.kernel_analysis_dir.clone()
+        } else {
+            Some(self.path.join(name))
+        }
     }
 
     /// A half is complete when its manifest and at least one of its reports are
     /// both on disk; a manifest alone means it was configured, not run.
     fn half_status(&self, directory: &str) -> &'static str {
-        if !regular_file(&self.analysis_dir(directory).join(MANIFEST_FILE)) {
+        let Some(analysis_dir) = self.analysis_dir(directory) else {
+            return "not_started";
+        };
+        if !regular_file(&analysis_dir.join(MANIFEST_FILE)) {
             return "not_started";
         }
         let has_report =
@@ -107,7 +116,8 @@ impl DiscoveredAlignment {
                 .iter()
                 .filter(|(_, dir, _)| *dir == directory)
                 .any(|(_, dir, report)| {
-                    regular_file(&self.analysis_dir(dir).join("reports").join(report))
+                    self.analysis_dir(dir)
+                        .is_some_and(|path| regular_file(&path.join("reports").join(report)))
                 });
         if has_report {
             "complete"
@@ -134,7 +144,7 @@ impl DiscoveredAlignment {
     /// would resolve against the wrong root.
     fn paired_prediction(&self, roots: &[ConfiguredRoot]) -> Option<DiscoveredPrediction> {
         let manifest =
-            read_json(&self.analysis_dir(KERNEL_ANALYSIS_DIR).join(MANIFEST_FILE)).ok()?;
+            read_json(&self.analysis_dir(KERNEL_ANALYSIS_DIR)?.join(MANIFEST_FILE)).ok()?;
         let predict_log_dir = manifest.get("predict_log_dir")?.as_str()?;
         prediction_at(roots, Path::new(predict_log_dir))
             .filter(|prediction| prediction.workspace_id == self.workspace_id)
@@ -210,7 +220,8 @@ pub(super) fn discover_alignments(roots: &[ConfiguredRoot]) -> Result<Vec<Discov
                 }
             };
             if artifact_kind == Some(ArtifactKind::AlignmentBundle) {
-                if !alignment_has_analysis_half(&directory) {
+                let kernel_analysis_dir = selected_kernel_analysis_dir(&directory);
+                if !alignment_has_analysis_half(&directory, kernel_analysis_dir.as_deref()) {
                     continue;
                 }
                 let relative = directory
@@ -222,8 +233,12 @@ pub(super) fn discover_alignments(roots: &[ConfiguredRoot]) -> Result<Vec<Discov
                         workspace_id: root.workspace_id().to_owned(),
                         alignment_id,
                         display_name: display_name(root.path(), relative),
-                        updated_time: alignment_updated_at(&directory),
+                        updated_time: alignment_updated_at(
+                            &directory,
+                            kernel_analysis_dir.as_deref(),
+                        ),
                         path: directory,
+                        kernel_analysis_dir,
                     });
                 }
                 continue;
@@ -253,22 +268,72 @@ pub(super) fn discover_alignments(roots: &[ConfiguredRoot]) -> Result<Vec<Discov
     Ok(alignments)
 }
 
-fn alignment_has_analysis_half(directory: &Path) -> bool {
-    [KERNEL_ANALYSIS_DIR, E2E_ANALYSIS_DIR]
-        .iter()
-        .any(|half| regular_file(&directory.join(half).join(MANIFEST_FILE)))
+#[derive(Deserialize)]
+struct KernelAnalysisConfig {
+    schema_version: u32,
+    log_dir: PathBuf,
 }
 
-fn alignment_updated_at(bundle: &Path) -> SystemTime {
-    [KERNEL_ANALYSIS_DIR, E2E_ANALYSIS_DIR]
-        .iter()
+/// Return the kernel analysis selected by the bundle's analyzer config.
+///
+/// Analysis generation already treats `analyze_kernel.yaml` as the authority;
+/// discovery must not independently hardcode `analysis_kernel`. The legacy
+/// directory applies only when no config exists. Once configured, a missing
+/// output remains not-started and an invalid or external selection is withheld;
+/// neither condition may silently publish stale legacy results.
+fn selected_kernel_analysis_dir(bundle: &Path) -> Option<PathBuf> {
+    let fallback = bundle.join(KERNEL_ANALYSIS_DIR);
+    let config_path = bundle.join(KERNEL_ANALYSIS_CONFIG);
+    let config_metadata = match fs::symlink_metadata(&config_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Some(fallback),
+        Err(_) => return None,
+    };
+    if !config_metadata.file_type().is_file() {
+        return None;
+    }
+
+    let config = fs::read(&config_path)
+        .ok()
+        .and_then(|bytes| serde_yaml::from_slice::<KernelAnalysisConfig>(&bytes).ok())
+        .filter(|config| config.schema_version == 1)?;
+    if config.log_dir.is_absolute()
+        || config
+            .log_dir
+            .components()
+            .any(|component| !matches!(component, Component::CurDir | Component::Normal(_)))
+    {
+        return None;
+    }
+
+    let selected = bundle.join(config.log_dir);
+    if !selected.exists() {
+        // A configured analysis may not have started yet. Relative paths with
+        // no parent traversal remain within the bundle even before creation.
+        return Some(selected);
+    }
+    let canonical_bundle = bundle.canonicalize().ok()?;
+    let canonical_selected = selected.canonicalize().ok()?;
+    canonical_selected
+        .starts_with(canonical_bundle)
+        .then_some(canonical_selected)
+}
+
+fn alignment_has_analysis_half(directory: &Path, kernel_analysis_dir: Option<&Path>) -> bool {
+    regular_file(&directory.join(KERNEL_ANALYSIS_CONFIG))
+        || kernel_analysis_dir.is_some_and(|path| regular_file(&path.join(MANIFEST_FILE)))
+        || regular_file(&directory.join(E2E_ANALYSIS_DIR).join(MANIFEST_FILE))
+}
+
+fn alignment_updated_at(bundle: &Path, kernel_analysis_dir: Option<&Path>) -> SystemTime {
+    kernel_analysis_dir
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain([bundle.join(E2E_ANALYSIS_DIR)])
         .flat_map(|half| {
             [
-                bundle
-                    .join(half)
-                    .join("reports")
-                    .join("analyzer_timing.json"),
-                bundle.join(half).join(MANIFEST_FILE),
+                half.join("reports").join("analyzer_timing.json"),
+                half.join(MANIFEST_FILE),
             ]
         })
         .filter_map(|path| fs::metadata(path).ok())
@@ -304,12 +369,9 @@ pub(super) fn alignment_descriptor(
     let subjects: serde_json::Map<String, Value> = SUBJECTS
         .iter()
         .map(|(subject, directory, report)| {
-            let available = regular_file(
-                &alignment
-                    .analysis_dir(directory)
-                    .join("reports")
-                    .join(report),
-            );
+            let available = alignment
+                .analysis_dir(directory)
+                .is_some_and(|path| regular_file(&path.join("reports").join(report)));
             (
                 (*subject).to_owned(),
                 json!({
@@ -361,21 +423,16 @@ fn detail_section(subject: &str) -> Option<&'static str> {
 /// table above, so a request never contributes a path component.
 fn artifact_path(alignment: &DiscoveredAlignment, subject: &str, payload: bool) -> Result<PathBuf> {
     let (_, directory, report) = subject_entry(subject).ok_or(ArtifactNotFound)?;
+    let analysis_dir = alignment.analysis_dir(directory).ok_or(ArtifactNotFound)?;
     let path = if payload {
         let name = PAYLOAD_NAMES
             .iter()
             .find(|(name, _)| *name == subject)
             .map(|(_, file)| *file)
             .ok_or(ArtifactNotFound)?;
-        alignment
-            .analysis_dir(directory)
-            .join("payloads")
-            .join(name)
+        analysis_dir.join("payloads").join(name)
     } else {
-        alignment
-            .analysis_dir(directory)
-            .join("reports")
-            .join(report)
+        analysis_dir.join("reports").join(report)
     };
     if regular_file(&path) {
         Ok(path)

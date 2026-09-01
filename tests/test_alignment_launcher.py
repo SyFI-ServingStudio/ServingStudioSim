@@ -10,7 +10,8 @@ import yaml
 
 from alignment import runner as alignment_runner
 from alignment.load_generator import runner as load_runner
-from alignment.profiler import record_extraction, vllm_server
+from alignment.profiler import engine_records, record_extraction, sglang_server, vllm_server
+from alignment.profiler.config import ServerConfig
 from alignment.timing_predict_input import BuildRequest, build_inputs
 from launcher import alignment as alignment_launcher
 from launcher import exec as launcher_exec
@@ -417,6 +418,76 @@ def test_profile_config_counts_tp_times_dp_visible_devices(tmp_path):
     assert config.server.dp_size == 2
 
 
+def test_non_popularity_profile_does_not_require_expert_topology(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["cuda_visible_devices"] = "0,1,2,3"
+    raw["server"]["tp_size"] = 4
+    raw["server"]["dp_size"] = 1
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    assert load_profile_config(paths["profile"]).server.expert_parallel_size is None
+    assert load_profile_config(paths["profile"]).server.expert_count_reduction_group_size is None
+
+    raw["server"]["expert_parallel_size"] = 1
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    assert load_profile_config(paths["profile"]).server.expert_parallel_size == 1
+
+
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+def test_expert_popularity_requires_explicit_engine_neutral_topology(tmp_path, engine):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["engine"] = engine
+    raw["profile_kind"] = "expert_popularity"
+    raw["cuda_visible_devices"] = "0,1,2,3"
+    raw["server"]["tp_size"] = 2
+    raw["server"]["dp_size"] = 2
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="expert_popularity requires explicit"):
+        load_profile_config(paths["profile"])
+
+    raw["server"]["expert_parallel_size"] = 1
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="expert_popularity requires explicit"):
+        load_profile_config(paths["profile"])
+
+    raw["server"]["expert_count_reduction_group_size"] = 2
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    server = load_profile_config(paths["profile"]).server
+    assert server.expert_parallel_size == 1
+    assert server.expert_count_reduction_group_size == 2
+
+
+@pytest.mark.parametrize("expert_parallel_size", [0, True, 3])
+def test_profile_config_rejects_an_invalid_expert_degree(tmp_path, expert_parallel_size):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["cuda_visible_devices"] = "0,1,2,3"
+    raw["server"]["tp_size"] = 4
+    raw["server"]["expert_parallel_size"] = expert_parallel_size
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="expert_parallel_size"):
+        load_profile_config(paths["profile"])
+
+
+@pytest.mark.parametrize("reduction_group_size", [0, True, 3])
+def test_profile_config_rejects_an_invalid_expert_count_reduction_group(
+    tmp_path, reduction_group_size
+):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["cuda_visible_devices"] = "0,1,2,3"
+    raw["server"]["tp_size"] = 4
+    raw["server"]["expert_count_reduction_group_size"] = reduction_group_size
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="expert_count_reduction_group_size"):
+        load_profile_config(paths["profile"])
+
+
 def test_profile_server_env_drops_inherited_vllm_api_key(tmp_path, monkeypatch):
     fork_python = tmp_path / "venv" / "bin" / "python"
     fork_python.parent.mkdir(parents=True)
@@ -431,6 +502,74 @@ def test_profile_server_env_drops_inherited_vllm_api_key(tmp_path, monkeypatch):
     assert server_env["PATH"] == f"{fork_python.parent}:/ambient/bin"
 
 
+def test_sglang_nsys_preflight_rejects_a_venv_without_nvtx(tmp_path):
+    fork_python = tmp_path / "python"
+    fork_python.write_text("#!/bin/sh\necho missing-nvtx >&2\nexit 1\n")
+    fork_python.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="cannot import `nvtx`") as error:
+        sglang_server.validate_nsys_capture_environment(
+            str(fork_python), env={"PATH": "/usr/bin"}, cwd=tmp_path
+        )
+
+    assert "missing-nvtx" in str(error.value)
+    assert "uv pip install" in str(error.value)
+
+
+def test_sglang_nsys_preflight_uses_the_server_environment(tmp_path, monkeypatch):
+    server_env = {"PATH": "/server/venv/bin", "LD_LIBRARY_PATH": "/server/libs"}
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(argv=argv, **kwargs)
+        return sglang_server.subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sglang_server.subprocess, "run", fake_run)
+    sglang_server.validate_nsys_capture_environment(
+        "/server/venv/bin/python",
+        env=server_env,
+        cwd=tmp_path,
+    )
+
+    assert seen["env"] is server_env
+    assert seen["cwd"] == tmp_path
+    assert seen["timeout"] == 30
+
+
+def test_nsys_preflight_is_scoped_to_new_captures():
+    calls = []
+
+    class Driver:
+        @staticmethod
+        def validate_nsys_capture_environment(fork_python, *, env, cwd):
+            calls.append((fork_python, env, cwd))
+
+    for profile_kind, resume in (
+        ("workload_metrics", False),
+        ("expert_popularity", False),
+        ("nsys", True),
+    ):
+        alignment_runner._preflight_capture_environment(
+            Driver,
+            None if resume else "fork-python",
+            {},
+            profile_kind=profile_kind,
+            resume=resume,
+        )
+    assert calls == []
+
+    alignment_runner._preflight_capture_environment(
+        Driver,
+        "fork-python",
+        {"sentinel": "server-env"},
+        profile_kind="nsys",
+        resume=False,
+    )
+    assert calls == [
+        ("fork-python", {"sentinel": "server-env"}, alignment_runner.REPO_ROOT)
+    ]
+
+
 def test_profile_server_argv_enables_prompt_token_details_once():
     server_config = vllm_server.ServerConfig(
         model_path="model",
@@ -441,6 +580,29 @@ def test_profile_server_argv_enables_prompt_token_details_once():
 
     assert server_argv.count("--enable-prompt-tokens-details") == 1
     assert "--trust-remote-code" in server_argv
+
+
+def test_sglang_server_argv_refuses_the_vllm_token_cudagraph_ceiling():
+    base = dict(model_path="model", tp_size=4, chunk_size=2048)
+    argv = sglang_server.build_server_argv("fork-python", ServerConfig(**base))
+    assert argv[argv.index("--chunked-prefill-size") + 1] == "2048"
+    assert not any(flag.startswith("--cuda-graph-max-bs") for flag in argv)
+    eager_argv = sglang_server.build_server_argv(
+        "fork-python", ServerConfig(**base, enforce_eager=True)
+    )
+    assert "--disable-cuda-graph" in eager_argv
+    assert not any(flag.startswith("--cuda-graph-max-bs") for flag in eager_argv)
+
+    with pytest.raises(ValueError, match="counts requests, not tokens"):
+        sglang_server.build_server_argv(
+            "fork-python", ServerConfig(**base, max_cudagraph_capture_size=2048)
+        )
+
+    argv = sglang_server.build_server_argv(
+        "fork-python",
+        ServerConfig(**base, extra_args=["--cuda-graph-max-bs-decode", "160"]),
+    )
+    assert argv[argv.index("--cuda-graph-max-bs-decode") + 1] == "160"
 
 
 def test_extract_expert_popularity_aggregates_logical_counts(tmp_path):
@@ -474,6 +636,7 @@ def test_extract_expert_popularity_aggregates_logical_counts(tmp_path):
         raw_path,
         summary_path,
         expert_parallel_size=2,
+        reduction_group_size=2,
         max_tokens_per_step=2,
     )
     summary = json.loads(summary_path.read_text())
@@ -541,6 +704,7 @@ def test_extract_expert_popularity_excludes_oversized_warmup_flush(tmp_path):
         raw_path,
         summary_path,
         expert_parallel_size=2,
+        reduction_group_size=2,
         max_tokens_per_step=1,
     )
     summary = json.loads(summary_path.read_text())
@@ -577,7 +741,228 @@ def test_extract_expert_popularity_rejects_partition_mismatch(tmp_path):
             tmp_path / "summary.json",
             max_tokens_per_step=1,
             expert_parallel_size=2,
+            reduction_group_size=2,
             experts_per_token=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("nvidia/GLM-5.2-NVFP4", "nvidia/GLM-5.2-NVFP4"),
+        ("./checkpoints/GLM-5.2-NVFP4", "./checkpoints/GLM-5.2-NVFP4"),
+        (
+            "/cache/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/deadbeef",
+            "nvidia/GLM-5.2-NVFP4",
+        ),
+        (
+            "/raid/checkpoints/GLM-5.2-NVFP4/snapshots/deadbeef",
+            "GLM-5.2-NVFP4",
+        ),
+        ("/raid/checkpoints/GLM-5.2-NVFP4", "GLM-5.2-NVFP4"),
+        ("/", "/"),
+    ],
+)
+def test_normalize_model_id(model, expected):
+    assert record_extraction.normalize_model_id(model) == expected
+
+
+def test_expert_popularity_normalizes_only_the_summary_model_identity(tmp_path):
+    model_path = "/cache/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/deadbeef"
+    record = {
+        "schema_version": 2,
+        "model": model_path,
+        "eplb_step": 1,
+        "expert_parallel_size": 1,
+        "experts_per_token": 1,
+        "logical_expert_counts": [[1]],
+    }
+    server_log = tmp_path / "server.log"
+    raw_path = tmp_path / "expert_load.jsonl"
+    summary_path = tmp_path / "expert_popularity.json"
+    server_log.write_text(f"INFO VibeSimAlignmentExpertLoad {json.dumps(record)}\n")
+
+    record_extraction.extract_expert_popularity(
+        server_log,
+        raw_path,
+        summary_path,
+        expert_parallel_size=1,
+        reduction_group_size=1,
+        max_tokens_per_step=1,
+    )
+
+    assert json.loads(raw_path.read_text())["model"] == model_path
+    assert json.loads(summary_path.read_text())["model"] == "nvidia/GLM-5.2-NVFP4"
+
+
+def test_expert_popularity_ceiling_uses_the_count_reduction_group(tmp_path):
+    record = {
+        "schema_version": 2,
+        "model": "moe/model",
+        "eplb_step": 1,
+        "expert_parallel_size": 1,
+        "experts_per_token": 2,
+        # One token routed top-2 on four TP replicas. The synchronized record
+        # therefore carries eight assignments although experts are not sharded.
+        "logical_expert_counts": [[4, 4]],
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(f"INFO VibeSimAlignmentExpertLoad {json.dumps(record)}\n")
+
+    with pytest.raises(ValueError, match="within the configured token ceiling"):
+        record_extraction.extract_expert_popularity(
+            server_log,
+            tmp_path / "raw-with-ep-ceiling.jsonl",
+            tmp_path / "summary-with-ep-ceiling.json",
+            expert_parallel_size=1,
+            reduction_group_size=1,
+            max_tokens_per_step=1,
+        )
+
+    count = record_extraction.extract_expert_popularity(
+        server_log,
+        tmp_path / "raw-with-reduction-ceiling.jsonl",
+        tmp_path / "summary-with-reduction-ceiling.json",
+        expert_parallel_size=1,
+        reduction_group_size=4,
+        max_tokens_per_step=1,
+    )
+
+    assert count == 1
+
+
+def test_sglang_tensor_parallel_expert_copies_are_not_multiplied(tmp_path):
+    record = {
+        "schema_version": 2,
+        "model": "moe/model",
+        "eplb_step": 1,
+        "expert_parallel_size": 1,
+        "experts_per_token": 2,
+        "logical_expert_counts": [[4, 4]],
+    }
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            f"[2026-08-11 16:18:16 TP{tp_rank}] INFO "
+            f"VibeSimAlignmentExpertLoad {json.dumps(record)}"
+            for tp_rank in range(4)
+        )
+    )
+    raw_path = tmp_path / "expert_load.jsonl"
+    summary_path = tmp_path / "expert_popularity.json"
+
+    count = record_extraction.extract_expert_popularity(
+        server_log,
+        raw_path,
+        summary_path,
+        records=engine_records.SGLANG_RECORDS,
+        expert_parallel_size=1,
+        reduction_group_size=4,
+        max_tokens_per_step=1,
+    )
+
+    assert count == 1
+    assert len(raw_path.read_text().splitlines()) == 1
+    assert json.loads(summary_path.read_text())["counts_by_layer"] == [[4, 4]]
+
+
+def test_sglang_expert_records_keep_one_owner_per_dp_group(tmp_path):
+    records = [
+        {
+            "schema_version": 2,
+            "model": "moe/model",
+            "eplb_step": 1,
+            "expert_parallel_size": 1,
+            "experts_per_token": 2,
+            "logical_expert_counts": [counts],
+        }
+        for counts in ([2, 2], [3, 1])
+    ]
+    server_log = tmp_path / "server.log"
+    server_log.write_text(
+        "\n".join(
+            f"[2026-08-11 16:18:16 DP{dp_rank} TP{tp_rank}] INFO "
+            f"VibeSimAlignmentExpertLoad {json.dumps(records[dp_rank])}"
+            for dp_rank in range(2)
+            for tp_rank in range(2)
+        )
+    )
+    raw_path = tmp_path / "expert_load.jsonl"
+    summary_path = tmp_path / "expert_popularity.json"
+
+    count = record_extraction.extract_expert_popularity(
+        server_log,
+        raw_path,
+        summary_path,
+        records=engine_records.SGLANG_RECORDS,
+        expert_parallel_size=1,
+        reduction_group_size=2,
+        max_tokens_per_step=1,
+        dp_size=2,
+    )
+
+    assert count == 2
+    assert len(raw_path.read_text().splitlines()) == 2
+    assert json.loads(summary_path.read_text())["counts_by_layer"] == [[5, 3]]
+
+
+def test_sglang_duplicate_expert_record_from_one_dp_owner_is_rejected(tmp_path):
+    record = {
+        "schema_version": 2,
+        "model": "moe/model",
+        "eplb_step": 1,
+        "expert_parallel_size": 1,
+        "experts_per_token": 2,
+        "logical_expert_counts": [[2, 2]],
+    }
+    line = f"[2026-08-11 16:18:16 DP0 TP0] INFO VibeSimAlignmentExpertLoad {json.dumps(record)}"
+    server_log = tmp_path / "server.log"
+    server_log.write_text(f"{line}\n{line}\n")
+
+    with pytest.raises(ValueError, match="duplicate alignment expert-load record"):
+        record_extraction.extract_expert_popularity(
+            server_log,
+            tmp_path / "expert_load.jsonl",
+            tmp_path / "expert_popularity.json",
+            records=engine_records.SGLANG_RECORDS,
+            expert_parallel_size=1,
+            reduction_group_size=2,
+            max_tokens_per_step=1,
+            dp_size=2,
+        )
+
+
+def test_runner_passes_yaml_expert_popularity_group_sizes_for_every_engine(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["profile_kind"] = "expert_popularity"
+    raw["cuda_visible_devices"] = "0,1,2,3,4,5,6,7"
+    raw["server"]["tp_size"] = 4
+    raw["server"]["dp_size"] = 2
+    raw["server"]["expert_parallel_size"] = 2
+    raw["server"]["expert_count_reduction_group_size"] = 4
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    vllm_config = load_profile_config(paths["profile"])
+    assert alignment_runner._expert_popularity_group_sizes(vllm_config) == (2, 4)
+
+    raw["engine"] = "sglang"
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    sglang_config = load_profile_config(paths["profile"])
+    assert alignment_runner._expert_popularity_group_sizes(sglang_config) == (2, 4)
+
+
+@pytest.mark.parametrize("reduction_group_size", [0, -1, True, 1.5])
+def test_expert_popularity_rejects_invalid_reduction_group_size(tmp_path, reduction_group_size):
+    with pytest.raises(ValueError, match="reduction_group_size must be a positive integer"):
+        record_extraction.extract_expert_popularity(
+            tmp_path / "server.log",
+            tmp_path / "raw.jsonl",
+            tmp_path / "summary.json",
+            expert_parallel_size=1,
+            experts_per_token=1,
+            reduction_group_size=reduction_group_size,
+            max_tokens_per_step=1,
         )
 
 

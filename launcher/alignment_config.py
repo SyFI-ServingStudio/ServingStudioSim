@@ -158,6 +158,30 @@ def load_profile_config(path: Path) -> ProfileConfig:
         device.strip() for device in config.cuda_visible_devices.split(",") if device.strip()
     ]
     world_size = config.server.tp_size * config.server.dp_size
+    expert_topology = {
+        "expert_parallel_size": config.server.expert_parallel_size,
+        "expert_count_reduction_group_size": (config.server.expert_count_reduction_group_size),
+    }
+    if config.profile_kind == "expert_popularity" and any(
+        value is None for value in expert_topology.values()
+    ):
+        raise ValueError(
+            "invalid profile config: expert_popularity requires explicit "
+            "server.expert_parallel_size and "
+            "server.expert_count_reduction_group_size"
+        )
+    for field_name, value in expert_topology.items():
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"invalid profile config: server.{field_name} must be a positive integer"
+            )
+        if world_size % value != 0:
+            raise ValueError(
+                f"invalid profile config: server.{field_name} must divide "
+                f"tp_size * dp_size={world_size}"
+            )
     if len(visible_devices) != world_size:
         raise ValueError(
             "invalid profile config: cuda_visible_devices must contain exactly "

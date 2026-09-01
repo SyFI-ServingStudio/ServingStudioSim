@@ -156,11 +156,10 @@ Two case fields carry more weight than their size suggests:
   --record` refuses to write a golden that depends on one unless
   `--accept-provisional` is passed, and then names the provisional fields in the
   provenance sidecar.
-- **`analyze_iterations`** overrides the profiler's default analysis window. Case
-  02's subject *is* the small-batch/CUDA-graph region that the default 24-48
-  window starts after, so the accepted run widened it to the whole capture.
-  Without the field the pack would re-run that case against a different iteration
-  population than the recorded numbers describe.
+- **`analyze_iterations`** overrides the profiler's whole-capture default with a
+  stable numbered excerpt. Use it when the accepted evidence population is a
+  particular iteration interval that must remain fixed even if capture duration
+  later changes.
 
 `raw_overrides` is the escape hatch for a field this schema has not learned yet.
 `check` warns when a pack uses it — it is a place to record a gap, not a place

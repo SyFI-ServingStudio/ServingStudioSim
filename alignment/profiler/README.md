@@ -122,6 +122,14 @@ pipeline. Build its environment under the submodule's `python/` directory,
 which is the default path selected when `engine: sglang` and no `fork_python`
 override is supplied:
 
+Expert-popularity topology is a YAML-only contract for every engine. A profile
+must state both `server.expert_parallel_size` (the expert-sharding degree) and
+`server.expert_count_reduction_group_size` (the rank population already summed
+into one expert-count record). The profiler never derives either value from the
+engine name. For example, a current SGLang pure-TP run commonly states 1 and
+`tp_size`, respectively; a current vLLM EP run commonly states its EP size for
+both. Those are deployment facts to encode, not defaults in the parser.
+
 ```bash
 cd alignment/profiler/sglang/python
 uv venv --python 3.12 .venv-sglang
@@ -248,20 +256,23 @@ EngineCore-output wait plus output fan-out. The extractor compares durations
 within their originating clock domains and never subtracts EngineCore and API
 absolute timestamps across processes.
 
-The separate `expert_popularity` pass sets
-`VLLM_NVTX_SCOPES_FOR_PROFILING=0`, so it neither emits nor requires this
-request-timing artifact. Its only model-side ground truth is the expert-load
-record stream described above; timing evidence always comes from the NSYS pass.
+The separate `expert_popularity` pass disables the selected engine's timing
+instrumentation, so it neither emits nor requires this request-timing artifact.
+Its only model-side ground truth is the expert-load record stream described
+above; timing evidence always comes from the NSYS pass.
 The resulting summary follows
 [`alignment/schema/expert_popularity_v3.schema.json`](../schema/expert_popularity_v3.schema.json):
 `counts_by_layer[layer][logical_expert]` is authoritative, while EP degree,
 top-k, aggregation scope, and the simulator's rank-major logical partition are
 explicit provenance rather than implicit loader assumptions.
-The raw expert-load JSONL preserves every emitted EPLB record. The aggregate
-uses the configured maximum scheduler/CUDA-graph token count as a conservation
-ceiling and excludes oversized records that flush work accumulated before the
-replay. `aggregation` records the ceiling, raw and accepted counts, and every
-discarded EPLB step.
+The raw expert-load JSONL preserves every canonical EPLB record. When an engine
+repeats scheduler evidence on every TP rank, only TP0's copy in each DP group
+is canonical; repeated owner records are rejected. The aggregate uses the
+configured maximum scheduler/CUDA-graph token count and the YAML-provided
+expert count-reduction group size as a conservation ceiling, and excludes
+oversized records that flush work accumulated before the replay.
+`aggregation` records the ceiling, raw and accepted counts, and every discarded
+EPLB step.
 
 For long multi-GPU workloads, set `nsys.capture_duration_seconds` with
 `capture_mode: cuda_profiler_api`. The launcher stops CUPTI at that deadline but

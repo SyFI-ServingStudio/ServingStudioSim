@@ -76,6 +76,16 @@ PHASE_CONFIG_STEMS = {
     ANALYSIS_E2E_PHASE: "analyze_e2e",
 }
 
+#: Engine CLI spelling for the per-case context limit.
+#:
+#: Most server fields use the launcher's vLLM-shaped ``ServerConfig`` and are
+#: translated by each driver. This value is derived by the campaign and appended
+#: directly to ``extra_args``, so it must already use the target engine's CLI.
+CONTEXT_LIMIT_FLAG = {
+    "vllm": "--max-model-len",
+    "sglang": "--context-length",
+}
+
 #: Fixed pipeline order after the profile passes. Used for `--phase` validation
 #: and for the readiness graph; it is never used to chain phases automatically.
 PIPELINE_PHASES = (
@@ -141,16 +151,29 @@ def trace_text(case: Case, spec: TraceSpec) -> str:
 # ── config bodies ────────────────────────────────────────────────────────────
 
 def _extra_args(variant: Variant, case: Case) -> list[str]:
-    """Variant flags plus the case's context limit. `--max-model-len` is derived
-    rather than authored so it cannot disagree with `arch.max_model_len` or with
-    `workload.max_model_len`, which are the same decision spelled three ways."""
-    args = [str(item) for item in variant.server.get("extra_args", [])]
-    if "--max-model-len" in args:
+    """Variant flags plus the context limit in the target engine's spelling.
+
+    Both known spellings are reserved, including ``--flag=value`` and vLLM's
+    underscore aliases, so a variant cannot introduce a second static limit
+    beside the per-case value.
+    """
+    try:
+        flag = CONTEXT_LIMIT_FLAG[variant.engine]
+    except KeyError:
         raise PackError(
-            f"variants.{variant.name}.server.extra_args must not set --max-model-len; "
-            "it is derived from each case's max_model_len"
-        )
-    return args + ["--max-model-len", str(case.max_model_len)]
+            f"variants.{variant.name}.engine {variant.engine!r} has no known context-limit "
+            f"flag; known engines: {sorted(CONTEXT_LIMIT_FLAG)}"
+        ) from None
+    args = [str(item) for item in variant.server.get("extra_args", [])]
+    for argument in args:
+        argument_name = argument.partition("=")[0].replace("_", "-")
+        if argument_name in CONTEXT_LIMIT_FLAG.values():
+            raise PackError(
+                f"variants.{variant.name}.server.extra_args must not set {argument_name}; "
+                f"the context limit is derived from each case's max_model_len and "
+                f"rendered as {flag} for engine {variant.engine!r}"
+            )
+    return args + [flag, str(case.max_model_len)]
 
 
 def _server_block(pack: Pack, variant: Variant, case: Case, host: HostProfile) -> dict[str, Any]:

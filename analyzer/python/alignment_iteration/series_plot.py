@@ -291,8 +291,14 @@ def _render_overview(
     return out_path
 
 
-def _stream_operation_rows(timeline_iteration: dict, device_id: int) -> dict[int, list[dict]]:
-    """Assign each reduced occurrence to the selected device's real streams."""
+def _stream_operation_rows(
+    timeline_iteration: dict,
+    device_id: int,
+    *,
+    duration_field: str = "occ_ns",
+    duration_divisor: float = 1.0e6,
+) -> dict[int, list[dict]]:
+    """Assign one additive kernel measure to the selected device's real streams."""
     totals: dict[tuple[int, str, str | None], float] = defaultdict(float)
     order: list[tuple[int, str, str | None]] = []
     for kernel in timeline_iteration["measured"]["kernels"]:
@@ -304,7 +310,7 @@ def _stream_operation_rows(timeline_iteration: dict, device_id: int) -> dict[int
         if weight_sum == 0:
             weights = [1] * len(intervals)
             weight_sum = len(intervals)
-        occurrence_ms = float(kernel["occ_ns"]) / 1.0e6
+        occurrence_ms = float(kernel[duration_field]) / duration_divisor
         for interval, weight in zip(intervals, weights, strict=True):
             key = (int(interval[4]), kernel["ph"], kernel.get("op"))
             if key not in totals:
@@ -512,11 +518,54 @@ def _render_stream_breakdown(
 
     stream_rows = _stream_operation_rows(timeline_iteration, device_id)
     displayed_streams = _display_stream_rows(stream_rows)
-    additive_rows = [row for rows in stream_rows.values() for row in rows]
-    measured_ms = float(breakdown["measured_kernel_sum_ms"]) - float(
-        breakdown.get("measured_concurrent_hidden_ms", 0.0) or 0.0
+    # This is the exact reduced path used by the acceptance comparison. Its
+    # measured-kernel rows already carry each operation's reduced share and sum
+    # to measured_ms; rebuilding it from stream rows and the audit-only hidden
+    # maximum can leave overlap in the lane and even invert the delta's sign.
+    measured_ms = float(breakdown["measured_ms"])
+    measured_path = _compact_path_rows(
+        [
+            {
+                "phase": row.get("phase"),
+                "operation": row.get("operation"),
+                "duration_ms": float(row["duration_ms"]),
+            }
+            for row in breakdown["measured_kernels"]
+        ],
+        measured_ms,
     )
-    measured_path = _compact_path_rows(additive_rows, measured_ms)
+
+    # Newer schema-v2 artifacts carry the selected device's interval-union
+    # attribution. Older v2 artifacts predate these fields, so omit this audit
+    # lane instead of making an otherwise valid result impossible to redraw.
+    measured_timeline_kernels = timeline_iteration["measured"]["kernels"]
+    device_timeline_kernels = [
+        kernel
+        for kernel in measured_timeline_kernels
+        if any(int(interval[0]) == device_id for interval in kernel["iv"])
+    ]
+    busy_union_value = breakdown.get("measured_physical_path_ms")
+    show_busy_union = busy_union_value is not None and all(
+        "selected_effective_ms" in kernel for kernel in device_timeline_kernels
+    )
+    busy_union_ms = float(busy_union_value) if show_busy_union else None
+    busy_path = (
+        _compact_path_rows(
+            [
+                row
+                for rows in _stream_operation_rows(
+                    timeline_iteration,
+                    device_id,
+                    duration_field="selected_effective_ms",
+                    duration_divisor=1.0,
+                ).values()
+                for row in rows
+            ],
+            busy_union_ms,
+        )
+        if busy_union_ms is not None
+        else []
+    )
 
     simulated_path = [
         {
@@ -535,6 +584,13 @@ def _render_stream_breakdown(
         )
     )
     semantic_names.extend(
+        name
+        for name in (
+            _directional_operation(row.get("operation"), "measured") for row in measured_path
+        )
+        if name not in semantic_names
+    )
+    semantic_names.extend(
         name for name in (row["operation"] for row in simulated_path) if name not in semantic_names
     )
     palette = plt.get_cmap("tab20")
@@ -542,8 +598,13 @@ def _render_stream_breakdown(
     comparison_rows = _operation_comparison_rows(semantic_names, measured_path, simulated_path)
 
     labels = [f"GPU {device_id} {label}" for label, _rows in displayed_streams]
+    if busy_union_ms is not None:
+        labels.append(f"GPU {device_id} busy (union)")
     labels.extend(["Nsight reduced critical path", "Timing-predict critical path"])
-    rows_to_draw = [rows for _label, rows in displayed_streams] + [measured_path, simulated_path]
+    rows_to_draw = [rows for _label, rows in displayed_streams]
+    if busy_union_ms is not None:
+        rows_to_draw.append(busy_path)
+    rows_to_draw.extend([measured_path, simulated_path])
     table_blocks = min(BREAKDOWN_TABLE_BLOCKS, max(1, len(semantic_names)))
     table_rows = math.ceil(len(semantic_names) / table_blocks)
     table_height_inches = BREAKDOWN_TABLE_ROW_HEIGHT_INCHES * (table_rows + 1)
@@ -573,10 +634,12 @@ def _render_stream_breakdown(
     simulated_ms = sum(float(row["duration_ms"]) for row in simulated_path)
     delta_ms = simulated_ms - measured_ms
     relative_pct = delta_ms / measured_ms * 100.0 if measured_ms > 0.0 else math.nan
+    busy_union_title = f" (busy union {busy_union_ms:.3f} ms)" if busy_union_ms is not None else ""
     axis.set_title(
         f"{run_label}\nIteration {breakdown['iteration_id']} · {breakdown['stage']} · "
         f"critical device {device_id}\n"
-        f"Nsight {measured_ms:.3f} ms · Timing-predict {simulated_ms:.3f} ms · "
+        f"Nsight {measured_ms:.3f} ms{busy_union_title} · "
+        f"Timing-predict {simulated_ms:.3f} ms · "
         f"delta {delta_ms:+.3f} ms ({relative_pct:+.2f}%)",
         fontweight="bold",
     )

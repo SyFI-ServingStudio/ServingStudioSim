@@ -93,11 +93,39 @@ def _resolve_fork_python(cfg: ProfileConfig) -> str:
     return str(fork)
 
 
+def _expert_popularity_group_sizes(cfg: ProfileConfig) -> tuple[int, int]:
+    """Read both independent expert-popularity populations from the config."""
+    expert_parallel_size = cfg.server.expert_parallel_size
+    reduction_group_size = cfg.server.expert_count_reduction_group_size
+    if expert_parallel_size is None or reduction_group_size is None:
+        raise ValueError(
+            "expert_popularity requires explicit server.expert_parallel_size and "
+            "server.expert_count_reduction_group_size"
+        )
+    return expert_parallel_size, reduction_group_size
+
+
 def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> None:
     """Add backend-required server flags exactly once to the persisted launch argv."""
     for argument in cfg.workload.backend.required_server_args:
         if argument not in server_argv:
             server_argv.append(argument)
+
+
+def _preflight_capture_environment(
+    driver,
+    fork_python: str | None,
+    env: dict[str, str],
+    *,
+    profile_kind: str,
+    resume: bool,
+) -> None:
+    """Validate dependencies only when a new NSYS capture will be launched."""
+    if profile_kind != "nsys" or resume:
+        return
+    if fork_python is None:
+        raise ValueError("a new NSYS capture requires a serving-engine Python")
+    driver.validate_nsys_capture_environment(fork_python, env=env, cwd=REPO_ROOT)
 
 
 def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
@@ -153,6 +181,13 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         # and NSYS are disabled so its deliberate EPLB all-reduce/D2H logging
         # overhead cannot be confused with the timing pass.
         env.update(driver.TIMING_INSTRUMENTATION_OFF_ENV)
+    _preflight_capture_environment(
+        driver,
+        fork_python,
+        env,
+        profile_kind=cfg.profile_kind,
+        resume=resume,
+    )
     # Only the timing pass runs under NSYS. The other passes launch the same
     # server argv bare so profiler lifecycle work cannot enter their evidence.
     out_rep = nsys_dir / cfg.name
@@ -327,22 +362,23 @@ def _finalize_profile(
     )
 
     if is_expert_popularity:
-        # This pass deliberately disables VLLM_NVTX_SCOPES_FOR_PROFILING, which
-        # gates both NVTX ranges and EngineCore request timing records in the
-        # instrumented fork. Request timing belongs to the clean NSYS pass;
-        # requiring it here would reject an otherwise valid popularity capture.
+        # This pass deliberately disables the engine's timing instrumentation.
+        # Request timing belongs to the clean NSYS pass; requiring it here
+        # would reject an otherwise valid popularity capture.
         expert_load_jsonl = engine_dir / f"{cfg.name}_expert_load.jsonl"
         expert_popularity_json = log_dir / "expert_popularity.json"
-        expert_parallel_size = cfg.server.tp_size * cfg.server.dp_size
+        expert_parallel_size, reduction_group_size = _expert_popularity_group_sizes(cfg)
         expert_record_count = record_extraction.extract_expert_popularity(
             server_log,
             expert_load_jsonl,
             expert_popularity_json,
             expert_parallel_size=expert_parallel_size,
+            reduction_group_size=reduction_group_size,
             max_tokens_per_step=max(
                 cfg.server.chunk_size,
                 cfg.server.max_cudagraph_capture_size or 0,
             ),
+            dp_size=cfg.server.dp_size,
             records=records,
         )
         result = {

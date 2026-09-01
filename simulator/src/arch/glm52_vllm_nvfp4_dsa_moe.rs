@@ -384,6 +384,9 @@ pub fn build_configs(
             moe_intermediate: model.moe_intermediate_dim.clone(),
             num_experts: model.num_experts.clone(),
             ep_size: parallel.ep_size,
+            // This arch shards experts and leaves each expert's intermediate
+            // width whole. A pure-TP consumer sets its real TP degree instead.
+            tp_size: 1,
             top_k: model.router_top_k,
             activation_dtype: DType::Bf16,
             gpu_name: gpu.clone(),

@@ -138,6 +138,18 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
     )
     merge_parser.add_argument("--json", action="store_true", help="Emit the report as JSON.")
     merge_parser.set_defaults(command_fn=_cmd_merge_db)
+
+    provenance_parser = subparsers.add_parser(
+        "audit-provenance",
+        help="Find rows whose backend lacks a direct literal registration at its stamp.",
+    )
+    provenance_parser.add_argument(
+        "--db",
+        type=Path,
+        help="profile.db path. Defaults to profiling.perf_api.DB_PATH.",
+    )
+    provenance_parser.add_argument("--json", action="store_true", help="Emit the report as JSON.")
+    provenance_parser.set_defaults(command_fn=_cmd_audit_provenance)
     return parser
 
 
@@ -194,6 +206,38 @@ def _cmd_merge_db(args: argparse.Namespace) -> int:
             f"{summary['conflict_rows']} conflicts"
         )
     return 0 if report.published else 1
+
+
+def _cmd_audit_provenance(args: argparse.Namespace) -> int:
+    from profiling.db.provenance import audit_profile_provenance
+
+    db_path = Path(args.db if args.db is not None else perf_api.DB_PATH)
+    repo_root = Path(__file__).resolve().parents[1]
+    report = audit_profile_provenance(db_path, repo_root)
+    payload = report.to_dict()
+    if args.json:
+        print(json.dumps({"ok": True, **payload}, indent=2, sort_keys=True))
+        return 0
+
+    share = 100.0 * report.candidate_rows / report.total_rows if report.total_rows else 0.0
+    print(f"Provenance audit: {db_path}")
+    print(f"Stamped rows: {report.total_rows}")
+    print(
+        "Backend not directly registered at stamped commit: "
+        f"{report.candidate_rows} ({share:.1f}%; diagnostic candidates only)"
+    )
+    if report.unverifiable_rows:
+        print(f"Unverifiable and unchanged: {report.unverifiable_rows}")
+    for finding in report.findings[:15]:
+        print(
+            f"  {finding.rows:7d}  {finding.table} / {finding.backend} / "
+            f"{finding.profiler_git_hash[:12]}  [{finding.verdict}]"
+        )
+    if len(report.findings) > 15:
+        print(f"  ... and {len(report.findings) - 15} more groups")
+    if report.candidate_rows:
+        print("Read-only audit: static Python inspection is not evidence for automatic rewrites.")
+    return 0
 
 
 def _cmd_list(args: argparse.Namespace) -> int:

@@ -4,7 +4,8 @@ Modes:
 
     python -m launcher PRESET.{yaml,yml,json} [MORE_PRESETS ...] [run options]
     python -m launcher timing-predict CONFIG.{yaml,yml,json} [MORE_CONFIGS ...]
-    python -m launcher kernel-profile {list,query,count-missing,run,measure,merge-db} ...
+    python -m launcher kernel-profile
+        {list,query,count-missing,run,measure,merge-db,audit-provenance} ...
     python -m launcher alignment {sim,profile,timing-predict,analyze} ...
     python -m launcher alignment-campaign {check,render,run,label,extract,compare} ...
     python -m launcher list-params [--human] [--build-type PROFILE]
@@ -60,7 +61,8 @@ def _build_argparse():
         epilog=(
             "Other modes:\n"
             "  python -m launcher timing-predict CONFIG.yaml|json [...]\n"
-            "  python -m launcher kernel-profile {list,query,count-missing,run,measure} ...\n"
+            "  python -m launcher kernel-profile "
+            "{list,query,count-missing,run,measure,merge-db,audit-provenance} ...\n"
             "  python -m launcher alignment {sim,profile,timing-predict,analyze} ...\n"
             "  python -m launcher list-params [--human]"
         ),

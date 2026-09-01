@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .engine_records import (
     API_DISPATCH_DURATION_FIELDS,
@@ -33,6 +33,7 @@ _ALIGNMENT_ITERATION_RE = re.compile(r"VibeSimAlignmentIteration\s+(\{.*\})\s*$"
 _ALIGNMENT_REQUEST_TIMING_RE = re.compile(r"VibeSimAlignmentRequestTiming\s+(\{.*\})\s*$")
 _ALIGNMENT_API_REQUEST_TIMING_RE = re.compile(r"VibeSimAlignmentApiRequestTiming\s+(\{.*\})\s*$")
 _ALIGNMENT_EXPERT_LOAD_RE = re.compile(r"VibeSimAlignmentExpertLoad\s+(\{.*\})\s*$")
+_HF_HUB_MODEL_DIR_RE = re.compile(r"^models--(?P<organization>.+?)--(?P<name>.+)$")
 _VLLM_ENGINE_CORE_PREFIX_RE = re.compile(r"\(EngineCore(?:_DP(\d+))?\s+pid=(\d+)\)")
 _VLLM_ENGINE_CORE_BODY_RE = re.compile(
     r"(?:INFO|WARNING|ERROR)\s+\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\[core\.py:\d+\]"
@@ -106,6 +107,9 @@ def extract_metrics_jsonl(
     alone — is the identity of one measured batch shape. A `dp_size > 1` capture
     therefore *requires* the rank tag and fails without it, while a single
     EngineCore needs no prefix and lands on rank 0.
+
+    When an engine repeats scheduler records on every TP rank, its descriptor
+    selects one owner inside each DP group before identities are validated.
     """
     required = {
         "schema_version",
@@ -143,7 +147,12 @@ def extract_metrics_jsonl(
             m = _ALIGNMENT_ITERATION_RE.search(line)
             if not m:
                 continue
+            if not records.owns_scheduler_record(line):
+                continue
             row = json.loads(m.group(1))
+            missing = required - set(row)
+            if missing:
+                raise ValueError(f"alignment iteration record missing fields {sorted(missing)}")
             if records is VLLM_RECORDS and dp_size > 1:
                 iteration_index = int(row["iteration_index"])
                 observed_elapsed_ms = row.get("observed_elapsed_ms")
@@ -197,15 +206,19 @@ def extract_metrics_jsonl(
                 last_iteration_by_rank[dp_rank] = iteration_index
             else:
                 dp_rank = records.rank_of(line, dp_size=dp_size)
+                identity = (dp_rank, int(row["iteration_index"]))
+                if identity in seen_rank_iterations:
+                    raise ValueError(
+                        "duplicate alignment iteration record for "
+                        f"dp_rank={identity[0]} iteration={identity[1]}"
+                    )
+                seen_rank_iterations.add(identity)
             if row.get("dp_rank", dp_rank) != dp_rank:
                 raise ValueError(
                     f"alignment iteration record claims dp_rank {row['dp_rank']} but was "
-                    f"emitted by EngineCore_DP{dp_rank}"
+                    f"emitted by {records.rank_prefix_label} rank {dp_rank}"
                 )
             row["dp_rank"] = dp_rank
-            missing = required - set(row)
-            if missing:
-                raise ValueError(f"alignment iteration record missing fields {sorted(missing)}")
             if row["schema_version"] not in {1, 2} or row["input_adapter"] != records.adapter:
                 raise ValueError(
                     "unsupported alignment iteration record "
@@ -369,6 +382,8 @@ def extract_request_timings_jsonl(
             match = _ALIGNMENT_REQUEST_TIMING_RE.search(line)
             if not match:
                 continue
+            if not records.owns_scheduler_record(line):
+                continue
             row = json.loads(match.group(1))
             missing = required - set(row)
             if missing:
@@ -524,26 +539,59 @@ def extract_request_timings_jsonl(
     return n
 
 
+def normalize_model_id(model: str) -> str:
+    """Turn an absolute served-model path into a portable checkpoint identity."""
+    path = PurePosixPath(model)
+    if not path.is_absolute():
+        return model
+
+    parts = [part for part in path.parts if part != "/"]
+    for part in reversed(parts):
+        matched = _HF_HUB_MODEL_DIR_RE.fullmatch(part)
+        if matched is not None:
+            return f"{matched['organization']}/{matched['name']}"
+
+    if len(parts) >= 2 and parts[-2] == "snapshots":
+        parts = parts[:-2]
+    return parts[-1] if parts else model
+
+
 def extract_expert_popularity(
     server_log: Path,
     out_jsonl: Path,
     out_json: Path,
     *,
     max_tokens_per_step: int,
-    expert_parallel_size: int | None = None,
+    expert_parallel_size: int,
+    reduction_group_size: int,
     experts_per_token: int | None = None,
+    dp_size: int = 1,
     records: EngineRecords = VLLM_RECORDS,
 ) -> int:
     """Extract and aggregate rank-synchronized logical-expert token counts.
 
     The vLLM fork emits one record per model step only when EPLB balancedness
-    logging is explicitly enabled.  Counts are already reduced across the EP
-    group and mapped from physical replicas back to logical expert ids.
+    logging is explicitly enabled. Counts are already reduced and mapped from
+    physical replicas back to logical expert ids.
+
+    ``reduction_group_size`` is the number of ranks represented by those
+    already-summed counts. It is independent of ``expert_parallel_size`` and
+    both values are required rather than inferred from the selected engine.
     """
-    if expert_parallel_size is not None and expert_parallel_size <= 0:
-        raise ValueError("expert_parallel_size must be positive")
+    if (
+        isinstance(expert_parallel_size, bool)
+        or not isinstance(expert_parallel_size, int)
+        or expert_parallel_size <= 0
+    ):
+        raise ValueError("expert_parallel_size must be a positive integer")
     if experts_per_token is not None and experts_per_token <= 0:
         raise ValueError("experts_per_token must be positive")
+    if (
+        isinstance(reduction_group_size, bool)
+        or not isinstance(reduction_group_size, int)
+        or reduction_group_size <= 0
+    ):
+        raise ValueError("reduction_group_size must be a positive integer")
     if max_tokens_per_step <= 0:
         raise ValueError("max_tokens_per_step must be positive")
 
@@ -553,10 +601,13 @@ def extract_expert_popularity(
     expected_shape: tuple[int, int] | None = None
     expected_model: str | None = None
     aggregate_counts: list[list[int]] | None = None
+    seen_owner_steps: set[tuple[int, int]] = set()
     with Path(out_jsonl).open("w") as output_file:
         for line in Path(server_log).read_text(errors="replace").splitlines():
             match = _ALIGNMENT_EXPERT_LOAD_RE.search(line)
             if match is None:
+                continue
+            if not records.owns_scheduler_record(line):
                 continue
             record = json.loads(match.group(1))
             required = {
@@ -581,9 +632,7 @@ def extract_expert_popularity(
                         )
                 record_ep_size = record["expert_parallel_size"]
                 record_top_k = record["experts_per_token"]
-                if expert_parallel_size is None:
-                    expert_parallel_size = record_ep_size
-                elif record_ep_size != expert_parallel_size:
+                if record_ep_size != expert_parallel_size:
                     raise ValueError(
                         "expert-load expert_parallel_size changed from "
                         f"{expert_parallel_size} to {record_ep_size}"
@@ -605,6 +654,15 @@ def extract_expert_popularity(
             eplb_step = record["eplb_step"]
             if isinstance(eplb_step, bool) or not isinstance(eplb_step, int) or eplb_step < 0:
                 raise ValueError("alignment expert-load eplb_step must be a nonnegative integer")
+            if records.scheduler_record_rank_re is not None:
+                dp_rank = records.rank_of(line, dp_size=dp_size)
+                identity = (dp_rank, eplb_step)
+                if identity in seen_owner_steps:
+                    raise ValueError(
+                        "duplicate alignment expert-load record for "
+                        f"dp_rank={dp_rank} eplb_step={eplb_step}"
+                    )
+                seen_owner_steps.add(identity)
             counts = record["logical_expert_counts"]
             if (
                 not isinstance(counts, list)
@@ -620,10 +678,10 @@ def extract_expert_popularity(
             if expected_shape is None:
                 expected_shape = shape
                 aggregate_counts = [[0] * shape[1] for _ in range(shape[0])]
-                if expert_parallel_size is None or experts_per_token is None:
+                if experts_per_token is None:
                     raise ValueError(
-                        "schema-v1 expert-load records require explicit expert_parallel_size "
-                        "and experts_per_token fallbacks"
+                        "schema-v1 expert-load records require an explicit "
+                        "experts_per_token fallback"
                     )
                 if shape[1] % expert_parallel_size != 0:
                     raise ValueError(
@@ -648,8 +706,8 @@ def extract_expert_popularity(
             output_file.write(json.dumps(record, separators=(",", ":")) + "\n")
             raw_records.append(record)
 
-            assert expert_parallel_size is not None and experts_per_token is not None
-            assignment_ceiling = max_tokens_per_step * expert_parallel_size * experts_per_token
+            assert experts_per_token is not None
+            assignment_ceiling = max_tokens_per_step * reduction_group_size * experts_per_token
             if any(total > assignment_ceiling for total in layer_totals):
                 discarded_oversized_steps.append(eplb_step)
                 continue
@@ -664,7 +722,7 @@ def extract_expert_popularity(
         raise ValueError("no VibeSimAlignmentExpertLoad records found in server log")
     if not accepted_records:
         raise ValueError("no expert-load records remain within the configured token ceiling")
-    assert expert_parallel_size is not None and experts_per_token is not None
+    assert expected_model is not None and experts_per_token is not None
 
     def normalize(counts: list[int]) -> list[float]:
         total = sum(counts)
@@ -675,7 +733,9 @@ def extract_expert_popularity(
     ]
     summary = {
         "schema_version": 3,
-        "model": expected_model,
+        # The raw JSONL retains the engine's exact path. The portable summary
+        # records checkpoint identity rather than one capture host's location.
+        "model": normalize_model_id(expected_model),
         "num_moe_layers": expected_shape[0],
         "num_logical_experts": expected_shape[1],
         "expert_parallel_size": expert_parallel_size,

@@ -258,8 +258,12 @@ def test_stream_breakdown_reserves_aligned_non_overlapping_table_blocks(
         "iteration_id": 203,
         "stage": "decode",
         "critical_device_id": 0,
-        "measured_kernel_sum_ms": 30.0,
-        "measured_concurrent_hidden_ms": 0.0,
+        "measured_ms": 30.0,
+        "measured_physical_path_ms": 30.0,
+        "measured_kernels": [
+            {"phase": "forward", "operation": operation, "duration_ms": 1.0}
+            for operation in operation_names
+        ],
         "simulated_kernels": [
             {"name": operation, "operation": operation, "critical_path_ms": 1.0}
             for operation in operation_names
@@ -306,4 +310,145 @@ def test_stream_breakdown_reserves_aligned_non_overlapping_table_blocks(
     assert all(cell.get_text().get_ha() == "left" for cell in operation_cells)
     assert sum(cell.get_text().get_weight() == "bold" for cell in operation_cells) == 5
     assert xlabel_bounds.y1 < axis.get_position().y0
+    series_plot.plt.close(figure)
+
+
+def test_stream_breakdown_draws_the_reported_path_and_busy_union(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    breakdown = {
+        "iteration_id": 8684,
+        "stage": "decode",
+        "critical_device_id": 0,
+        "measured_ms": 10.0,
+        "measured_physical_path_ms": 10.5,
+        # The old renderer used 14.0 - 1.5 = 12.5, which would put measured
+        # above simulated and reverse the sign of the reported delta.
+        "measured_kernel_sum_ms": 14.0,
+        "measured_concurrent_hidden_ms": 1.5,
+        "measured_kernels": [
+            {"phase": "forward", "operation": "attention.o_proj", "duration_ms": 6.0},
+            {
+                "phase": "forward",
+                "operation": "moe.routed_experts.fused_moe",
+                "duration_ms": 4.0,
+            },
+        ],
+        "simulated_kernels": [
+            {"name": "o", "operation": "attention.o_proj", "critical_path_ms": 7.0},
+            {
+                "name": "m",
+                "operation": "moe.routed_experts.fused_moe",
+                "critical_path_ms": 5.0,
+            },
+        ],
+    }
+    kernels = [
+        {
+            "ph": "forward",
+            "op": "attention.o_proj",
+            "occ_ns": 9_000_000,
+            "selected_effective_ms": 5.5,
+            "iv": [[0, 0, 6_000_000, 0, 0]],
+        },
+        {
+            "ph": "forward",
+            "op": "moe.routed_experts.fused_moe",
+            "occ_ns": 7_000_000,
+            "selected_effective_ms": 5.0,
+            "iv": [[0, 6_000_000, 10_000_000, 0, 0]],
+        },
+    ]
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        series_plot,
+        "save_plot",
+        lambda figure, _path, **_kwargs: captured.setdefault("figure", figure),
+    )
+
+    _render_stream_breakdown(
+        breakdown,
+        {"measured": {"kernels": kernels}},
+        tmp_path / "breakdown.png",
+        run_label="sign-regression",
+    )
+
+    figure = captured["figure"]
+    axis = figure.axes[0]
+    title = axis.get_title()
+    assert "Nsight 10.000 ms (busy union 10.500 ms)" in title
+    assert "Timing-predict 12.000 ms" in title
+    assert "delta +2.000 ms (+20.00%)" in title
+    assert [label.get_text() for label in axis.get_yticklabels()][-3:] == [
+        "GPU 0 busy (union)",
+        "Nsight reduced critical path",
+        "Timing-predict critical path",
+    ]
+
+    tick_by_label = {
+        label.get_text(): tick for label, tick in zip(axis.get_yticklabels(), axis.get_yticks())
+    }
+
+    def row_widths(label: str) -> list[float]:
+        tick = tick_by_label[label]
+        return [
+            patch.get_width()
+            for patch in axis.patches
+            if patch.get_y() + patch.get_height() / 2 == pytest.approx(tick)
+        ]
+
+    assert sum(row_widths("Timing-predict critical path")) == pytest.approx(12.0)
+    assert sum(row_widths("Nsight reduced critical path")) == pytest.approx(10.0)
+    busy_widths = row_widths("GPU 0 busy (union)")
+    assert sum(busy_widths) == pytest.approx(10.5)
+    assert sorted(busy_widths) == pytest.approx([5.0, 5.5])
+    series_plot.plt.close(figure)
+
+
+def test_stream_breakdown_redraws_older_schema_v2_without_busy_union(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    breakdown = {
+        "iteration_id": 7,
+        "stage": "decode",
+        "critical_device_id": 0,
+        "measured_ms": 2.0,
+        "measured_kernels": [
+            {"phase": "forward", "operation": "attention.o_proj", "duration_ms": 2.0}
+        ],
+        "simulated_kernels": [
+            {"name": "o", "operation": "attention.o_proj", "critical_path_ms": 2.0}
+        ],
+    }
+    timeline = {
+        "measured": {
+            "kernels": [
+                {
+                    "ph": "forward",
+                    "op": "attention.o_proj",
+                    "occ_ns": 2_000_000,
+                    "iv": [[0, 0, 2_000_000, 0, 0]],
+                }
+            ]
+        }
+    }
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        series_plot,
+        "save_plot",
+        lambda figure, _path, **_kwargs: captured.setdefault("figure", figure),
+    )
+
+    _render_stream_breakdown(
+        breakdown,
+        timeline,
+        tmp_path / "breakdown.png",
+        run_label="old-v2",
+    )
+
+    figure = captured["figure"]
+    axis = figure.axes[0]
+    labels = [label.get_text() for label in axis.get_yticklabels()]
+    assert "busy (union)" not in " ".join(labels)
+    assert "busy union" not in axis.get_title()
     series_plot.plt.close(figure)

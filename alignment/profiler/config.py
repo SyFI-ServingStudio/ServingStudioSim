@@ -35,6 +35,14 @@ class ServerConfig:
     # explicit instead of hiding it in ``extra_args`` because it determines the
     # visible-device and normalized-profile population contracts.
     dp_size: int = 1
+    # Number of ranks across which the expert axis is sharded. Every
+    # expert-popularity profile must state this in YAML; other profile kinds do
+    # not consume it.
+    expert_parallel_size: int | None = None
+    # Number of ranks already represented by each synchronized expert-count
+    # record. This is independent of expert sharding and must also be stated in
+    # every expert-popularity YAML.
+    expert_count_reduction_group_size: int | None = None
     served_model_name: str | None = None
     startup_timeout: float = 900.0
     # `--enforce-eager`: disable CUDA graphs so every kernel is a normal launch.
@@ -80,9 +88,11 @@ class NsysConfig:
     # Exact NVTX range whose push starts the capture. Stock vLLM commonly uses
     # "gpu_model_runner: forward"; indexed fork ranges can be supplied directly.
     nvtx_trigger: str = "gpu_model_runner: forward"
-    # Analysis window [start, end] over the (sequential, per-worker) forward index.
-    analyze_iteration_start: int = 24
-    analyze_iteration_end: int = 48
+    # Analysis window [start, end] over the (sequential, per-worker) forward
+    # index. Open bounds analyze the entire capture; set them only when an
+    # intentional numbered excerpt is wanted.
+    analyze_iteration_start: int | None = None
+    analyze_iteration_end: int | None = None
     # Stop CUPTI after a bounded serving window while the replay continues.
     # Long graph-node captures can perturb or deadlock multi-rank collectives;
     # request TTFT/TPOT logging remains active after capture stops.
@@ -111,6 +121,15 @@ class NsysConfig:
                 raise ValueError("nsys.capture_duration_seconds must be positive")
         if self.cuda_flush_interval_ms is not None and self.cuda_flush_interval_ms <= 0:
             raise ValueError("nsys.cuda_flush_interval_ms must be positive")
+        if (
+            self.analyze_iteration_start is not None
+            and self.analyze_iteration_end is not None
+            and self.analyze_iteration_start > self.analyze_iteration_end
+        ):
+            raise ValueError(
+                "nsys.analyze_iteration_start must not exceed analyze_iteration_end; "
+                "omit both to analyze the whole capture"
+            )
 
 
 @dataclass
