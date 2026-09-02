@@ -27,7 +27,13 @@ from pathlib import Path
 
 from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
-from .profiler import nsys_capture, record_extraction, sglang_server, vllm_server
+from .profiler import (
+    nsys_capture,
+    record_extraction,
+    runtime_artifacts,
+    sglang_server,
+    vllm_server,
+)
 from .profiler.config import ProfileConfig
 from .profiler.engine_records import SGLANG_RECORDS, VLLM_RECORDS
 
@@ -137,6 +143,14 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     pipeline; a failure in extraction or parsing must never cost a re-capture.
     """
     driver, _, _ = _engine(cfg)
+    if not resume and cfg.engine == "sglang" and (
+        cfg.python_runtime is None
+        or cfg.python_runtime.environment.get("FLASHINFER_DISABLE_JIT") != "1"
+    ):
+        raise ValueError(
+            "a new SGLang profile requires an explicit python_runtime "
+            "prebuilt-artifact contract with FLASHINFER_DISABLE_JIT=1"
+        )
     log_dir = Path(cfg.log_dir)
     if not log_dir.is_absolute():
         log_dir = REPO_ROOT / log_dir
@@ -167,6 +181,14 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         server_argv += list(driver.NSYS_CAPTURE_SERVER_ARGS)
     if is_nsys and cfg.nsys.capture_mode == "cuda_profiler_api" and not resume:
         server_argv += list(driver.CUDA_PROFILER_SERVER_ARGS)
+    runtime_provenance = (
+        None
+        if resume
+        else runtime_artifacts.prepare_python_runtime(
+            fork_python,
+            cfg.python_runtime,
+        )
+    )
     env = (
         {}
         if resume
@@ -176,6 +198,8 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
             driver_compat_lib_dir=cfg.driver_compat_lib_dir,
         )
     )
+    if not resume and cfg.python_runtime is not None:
+        env.update(cfg.python_runtime.environment)
     if is_expert_popularity and not resume:
         # This pass measures routing counts, not phase timing.  NVTX construction
         # and NSYS are disabled so its deliberate EPLB all-reduce/D2H logging
@@ -239,6 +263,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         cfg,
         fork_python,
         nsys_executable.provenance() if nsys_executable is not None else None,
+        runtime_provenance,
     )
 
     base_url = f"http://{cfg.server.host}:{cfg.server.port}"

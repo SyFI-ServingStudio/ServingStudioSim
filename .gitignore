@@ -51,3 +51,4 @@ presets/alignment/hosts/*.yaml
 model/work/examples/
 
 /tmp/
+.cache/

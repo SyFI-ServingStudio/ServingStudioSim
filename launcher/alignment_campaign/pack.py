@@ -143,6 +143,7 @@ class Variant:
     profile_passes: tuple[ProfilePass, ...]
     input_builder: dict[str, Any]
     label_rules: str
+    python_runtime: dict[str, Any] | None = None
     replicas: int = 1
     #: Stem of each rendered profile config's `name:`. Purely an identity label,
     #: but pinning it lets a migrated pack reproduce an accepted config byte-wise.
@@ -404,6 +405,11 @@ def _variant(name: str, raw: Any) -> Variant:
             _typed(_require(body, "input_builder", where), dict, f"{where}.input_builder")
         ),
         label_rules=_typed(_require(body, "label_rules", where), str, f"{where}.label_rules"),
+        python_runtime=(
+            None
+            if (python_runtime := body.pop("python_runtime", None)) is None
+            else dict(_typed(python_runtime, dict, f"{where}.python_runtime"))
+        ),
         replicas=_typed(body.pop("replicas", 1), int, f"{where}.replicas"),
         run_name_prefix=_typed(body.pop("run_name_prefix", ""), str, f"{where}.run_name_prefix"),
         raw_overrides=dict(body.pop("raw_overrides", {}) or {}),

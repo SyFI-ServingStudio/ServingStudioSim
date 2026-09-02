@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -10,10 +13,22 @@ import yaml
 
 from alignment import runner as alignment_runner
 from alignment.load_generator import runner as load_runner
-from alignment.profiler import engine_records, record_extraction, sglang_server, vllm_server
-from alignment.profiler.config import ServerConfig
+from alignment.profiler import (
+    engine_records,
+    record_extraction,
+    runtime_artifacts,
+    sglang_server,
+    vllm_server,
+)
+from alignment.profiler.config import (
+    ProfileConfig,
+    PythonPackageArtifact,
+    PythonRuntimeConfig,
+    ServerConfig,
+)
 from alignment.timing_predict_input import BuildRequest, build_inputs
 from launcher import alignment as alignment_launcher
+from launcher import alignment_config as alignment_config_module
 from launcher import exec as launcher_exec
 from launcher import timing_predict as timing_predict_launcher
 from launcher.alignment_config import load_analyze_config, load_profile_config
@@ -21,6 +36,25 @@ from launcher.alignment_config import load_analyze_config, load_profile_config
 
 def _write_config(path: Path, config: dict) -> None:
     path.write_text(json.dumps(config) if path.suffix == ".json" else yaml.safe_dump(config))
+
+
+def _python_runtime_document() -> dict:
+    return {
+        "packages": [
+            {
+                "name": "flashinfer-jit-cache",
+                "version": "0.6.15.post1",
+                "local_version": "cu130",
+                "index_url": "https://flashinfer.ai/whl/cu130",
+                "required_files": [
+                    "flashinfer_jit_cache/jit_cache/fused_moe_trtllm_sm100/"
+                    "fused_moe_trtllm_sm100.so"
+                ],
+            }
+        ],
+        "environment": {"FLASHINFER_DISABLE_JIT": "1"},
+        "lock_timeout_seconds": 60.0,
+    }
 
 
 def _phase_configs(tmp_path: Path, suffix: str = ".yaml") -> dict[str, Path]:
@@ -439,6 +473,8 @@ def test_expert_popularity_requires_explicit_engine_neutral_topology(tmp_path, e
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["profile"].read_text())
     raw["engine"] = engine
+    if engine == "sglang":
+        raw["python_runtime"] = _python_runtime_document()
     raw["profile_kind"] = "expert_popularity"
     raw["cuda_visible_devices"] = "0,1,2,3"
     raw["server"]["tp_size"] = 2
@@ -534,6 +570,407 @@ def test_sglang_nsys_preflight_uses_the_server_environment(tmp_path, monkeypatch
     assert seen["env"] is server_env
     assert seen["cwd"] == tmp_path
     assert seen["timeout"] == 30
+
+
+def test_sglang_profile_requires_an_explicit_prebuilt_runtime(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["engine"] = "sglang"
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="explicit python_runtime"):
+        load_profile_config(paths["profile"])
+    resumed = load_profile_config(paths["profile"], require_python_runtime=False)
+    assert resumed.engine == "sglang"
+    assert resumed.python_runtime is None
+
+    raw["python_runtime"] = _python_runtime_document()
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    config = load_profile_config(paths["profile"])
+    assert config.python_runtime is not None
+    assert config.python_runtime.environment == {"FLASHINFER_DISABLE_JIT": "1"}
+
+
+@pytest.mark.parametrize(
+    "python_runtime",
+    [None, PythonRuntimeConfig(packages=[], environment={})],
+)
+def test_direct_sglang_profile_fails_before_replay_without_strict_jit_policy(
+    tmp_path, monkeypatch, python_runtime
+):
+    monkeypatch.setattr(
+        load_runner,
+        "prepare_replay",
+        lambda *_args, **_kwargs: pytest.fail("runtime policy must fail before replay setup"),
+    )
+    config = ProfileConfig(
+        name="direct-sglang",
+        log_dir=str(tmp_path / "profile"),
+        gpu="NVIDIA B200",
+        engine="sglang",
+        server=ServerConfig(model_path="model"),
+        python_runtime=python_runtime,
+    )
+
+    with pytest.raises(ValueError, match="FLASHINFER_DISABLE_JIT=1"):
+        alignment_runner.run_profile(config)
+
+
+def test_python_runtime_cannot_override_launcher_owned_environment(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["python_runtime"] = _python_runtime_document()
+    raw["python_runtime"]["environment"]["CUDA_VISIBLE_DEVICES"] = "7"
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="launcher-owned variables"):
+        load_profile_config(paths["profile"])
+
+
+def test_python_runtime_required_files_must_be_exact_wheel_paths(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["python_runtime"] = _python_runtime_document()
+    raw["python_runtime"]["packages"][0]["required_files"] = ["module.so"]
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="exact wheel-relative path"):
+        load_profile_config(paths["profile"])
+
+
+@pytest.mark.parametrize("timeout", [True, float("nan"), 0.0, "60"])
+def test_python_runtime_timeouts_are_finite_positive_numbers(timeout):
+    config = PythonRuntimeConfig(
+        packages=[],
+        lock_timeout_seconds=timeout,
+    )
+
+    with pytest.raises(ValueError, match="finite number > 0"):
+        alignment_config_module._validate_python_runtime(config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("environment", [], "environment must map"),
+        (
+            "required_files",
+            "artifact/module.so",
+            "required_files must be a list",
+        ),
+    ],
+)
+def test_python_runtime_collection_fields_reject_wrong_container_types(field, value, message):
+    package = PythonPackageArtifact(
+        name="artifact",
+        version="1.0",
+        index_url="https://packages.invalid/simple",
+    )
+    if field == "required_files":
+        package = PythonPackageArtifact(
+            name=package.name,
+            version=package.version,
+            index_url=package.index_url,
+            required_files=value,
+        )
+        config = PythonRuntimeConfig(packages=[package])
+    else:
+        config = PythonRuntimeConfig(packages=[package], environment=value)
+
+    with pytest.raises(ValueError, match=message):
+        alignment_config_module._validate_python_runtime(config)
+
+
+def test_runtime_artifacts_do_not_install_or_refresh_a_satisfied_venv(tmp_path, monkeypatch):
+    fork_python = tmp_path / "venv" / "bin" / "python"
+    fork_python.parent.mkdir(parents=True)
+    fork_python.write_text("")
+    package = PythonPackageArtifact(
+        name="flashinfer-jit-cache",
+        version="0.6.15.post1",
+        local_version="cu130",
+        index_url="https://flashinfer.ai/whl/cu130",
+        required_files=["artifact/module.so"],
+    )
+    state = {
+        package.name: {
+            "installed_version": "0.6.15.post1+cu130",
+            "required_files": {
+                "artifact/module.so": [{"path": "/wheel/artifact/module.so", "size_bytes": 123}]
+            },
+        }
+    }
+    monkeypatch.setattr(runtime_artifacts, "_inspect", lambda *_: state)
+    monkeypatch.setattr(
+        runtime_artifacts,
+        "_install_missing",
+        lambda *_: pytest.fail("a satisfied runtime must not invoke the installer"),
+    )
+
+    provenance = runtime_artifacts.prepare_python_runtime(
+        str(fork_python),
+        PythonRuntimeConfig(packages=[package], lock_timeout_seconds=1.0),
+    )
+
+    assert provenance is not None
+    assert provenance["packages"][0]["installed_version"] == "0.6.15.post1+cu130"
+    assert (tmp_path / "venv" / ".vibesim-python-runtime.lock").is_file()
+
+
+def test_runtime_artifact_probe_does_not_inherit_another_python_environment(
+    monkeypatch,
+):
+    package = PythonPackageArtifact(
+        name="artifact",
+        version="1.0",
+        index_url="https://packages.invalid/simple",
+    )
+    monkeypatch.setenv("PYTHONPATH", "/wrong/site-packages")
+    monkeypatch.setenv("PYTHONHOME", "/wrong/python")
+    monkeypatch.setenv("VIRTUAL_ENV", "/wrong/venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/wrong/uv-venv")
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen.update(argv=argv, **kwargs)
+        return runtime_artifacts.subprocess.CompletedProcess(
+            argv, 0, json.dumps({"artifact": None}), ""
+        )
+
+    monkeypatch.setattr(runtime_artifacts.subprocess, "run", fake_run)
+    assert runtime_artifacts._inspect("/target/venv/bin/python", [package]) == {"artifact": None}
+
+    for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"):
+        assert key not in seen["env"]
+    assert seen["env"]["PYTHONNOUSERSITE"] == "1"
+
+
+def test_runtime_artifact_probe_requires_the_exact_wheel_relative_path(tmp_path):
+    site = tmp_path / "site"
+    dist_info = site / "artifact-1.0.dist-info"
+    dist_info.mkdir(parents=True)
+    (dist_info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: artifact\nVersion: 1.0\n"
+    )
+    (dist_info / "RECORD").write_text("wrong/module.so,,\nexpected/module.so,,\n")
+    wrong = site / "wrong" / "module.so"
+    wrong.parent.mkdir()
+    wrong.write_bytes(b"wrong artifact with the same basename")
+
+    fork_python = tmp_path / "venv" / "bin" / "python"
+    fork_python.parent.mkdir(parents=True)
+    fork_python.write_text(
+        "#!/bin/sh\n"
+        f"PYTHONPATH='{site}' exec '{sys.executable}' \"$@\"\n"
+    )
+    fork_python.chmod(0o755)
+    package = PythonPackageArtifact(
+        name="artifact",
+        version="1.0",
+        index_url="https://packages.invalid/simple",
+        required_files=["expected/module.so"],
+    )
+
+    state = runtime_artifacts._inspect(str(fork_python), [package])
+
+    assert state["artifact"] == {
+        "distribution_count": 1,
+        "installed_version": "1.0",
+        "required_files": {"expected/module.so": []},
+    }
+
+
+def test_runtime_artifact_installer_accepts_wheels_only(monkeypatch):
+    package = PythonPackageArtifact(
+        name="artifact",
+        version="1.0",
+        index_url="https://packages.invalid/simple",
+    )
+    seen = {}
+    monkeypatch.setattr(runtime_artifacts.shutil, "which", lambda _name: "/usr/bin/uv")
+
+    def fake_run(argv, **kwargs):
+        seen.update(argv=argv, **kwargs)
+        return runtime_artifacts.subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(runtime_artifacts.subprocess, "run", fake_run)
+    runtime_artifacts._install_missing("/target/venv/bin/python", [package], 123.0)
+
+    only_binary = seen["argv"].index("--only-binary")
+    assert seen["argv"][only_binary + 1] == ":all:"
+    assert seen["timeout"] == 123.0
+
+
+def test_runtime_artifact_installer_has_a_bounded_timeout(monkeypatch):
+    package = PythonPackageArtifact(
+        name="artifact",
+        version="1.0",
+        index_url="https://packages.invalid/simple",
+    )
+    monkeypatch.setattr(runtime_artifacts.shutil, "which", lambda _name: "/usr/bin/uv")
+
+    def timeout(argv, **kwargs):
+        raise runtime_artifacts.subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(runtime_artifacts.subprocess, "run", timeout)
+    with pytest.raises(RuntimeError, match="timed out after 7.0s"):
+        runtime_artifacts._install_missing("/target/venv/bin/python", [package], 7.0)
+
+
+def test_runtime_artifacts_install_only_missing_packages_under_the_lock(tmp_path, monkeypatch):
+    fork_python = tmp_path / "venv" / "bin" / "python"
+    fork_python.parent.mkdir(parents=True)
+    fork_python.write_text("")
+    package = PythonPackageArtifact(
+        name="artifact",
+        version="1.2.3",
+        index_url="https://packages.invalid/simple",
+        required_files=["artifact/artifact.so"],
+    )
+    states = iter(
+        [
+            {package.name: None},
+            {
+                package.name: {
+                    "installed_version": "1.2.3",
+                    "required_files": {
+                        "artifact/artifact.so": [
+                            {"path": "/wheel/artifact/artifact.so", "size_bytes": 7}
+                        ]
+                    },
+                }
+            },
+        ]
+    )
+    installs = []
+    monkeypatch.setattr(runtime_artifacts, "_inspect", lambda *_: next(states))
+    monkeypatch.setattr(
+        runtime_artifacts,
+        "_install_missing",
+        lambda python, packages, timeout: installs.append((python, packages, timeout)),
+    )
+
+    runtime_artifacts.prepare_python_runtime(
+        str(fork_python), PythonRuntimeConfig(packages=[package])
+    )
+
+    assert installs == [(str(fork_python), [package], 1800.0)]
+
+
+def test_runtime_artifact_lock_prevents_two_profiles_from_installing_together(
+    tmp_path, monkeypatch
+):
+    fork_python = tmp_path / "venv" / "bin" / "python"
+    fork_python.parent.mkdir(parents=True)
+    fork_python.write_text("")
+    package = PythonPackageArtifact(
+        name="artifact",
+        version="1.2.3",
+        index_url="https://packages.invalid/simple",
+    )
+    installed = False
+    install_started = threading.Event()
+    release_install = threading.Event()
+    installs = []
+
+    def inspect(*_args):
+        return {
+            package.name: (
+                {"installed_version": "1.2.3", "required_files": {}} if installed else None
+            )
+        }
+
+    def install(*_args):
+        nonlocal installed
+        installs.append(threading.get_ident())
+        install_started.set()
+        assert release_install.wait(timeout=2)
+        installed = True
+
+    monkeypatch.setattr(runtime_artifacts, "_inspect", inspect)
+    monkeypatch.setattr(runtime_artifacts, "_install_missing", install)
+    config = PythonRuntimeConfig(packages=[package], lock_timeout_seconds=2.0)
+    errors = []
+
+    def prepare():
+        try:
+            runtime_artifacts.prepare_python_runtime(str(fork_python), config)
+        except BaseException as exc:  # surfaced in the parent after both joins
+            errors.append(exc)
+
+    first = threading.Thread(target=prepare)
+    second = threading.Thread(target=prepare)
+    first.start()
+    assert install_started.wait(timeout=2)
+    second.start()
+    time.sleep(0.15)
+    assert second.is_alive(), "the second profile must wait for the venv preparation lock"
+    release_install.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not errors
+    assert len(installs) == 1
+
+
+def test_runtime_artifacts_refuse_to_replace_an_existing_version(tmp_path, monkeypatch):
+    fork_python = tmp_path / "venv" / "bin" / "python"
+    fork_python.parent.mkdir(parents=True)
+    fork_python.write_text("")
+    package = PythonPackageArtifact(
+        name="artifact",
+        version="2.0",
+        index_url="https://packages.invalid/simple",
+    )
+    monkeypatch.setattr(
+        runtime_artifacts,
+        "_inspect",
+        lambda *_: {package.name: {"installed_version": "1.0", "required_files": {}}},
+    )
+    monkeypatch.setattr(
+        runtime_artifacts,
+        "_install_missing",
+        lambda *_: pytest.fail("a version conflict must not refresh the venv"),
+    )
+
+    with pytest.raises(RuntimeError, match="Refusing to mutate"):
+        runtime_artifacts.prepare_python_runtime(
+            str(fork_python), PythonRuntimeConfig(packages=[package])
+        )
+
+
+def test_runtime_artifacts_refuse_duplicate_installed_distributions(tmp_path, monkeypatch):
+    fork_python = tmp_path / "venv" / "bin" / "python"
+    fork_python.parent.mkdir(parents=True)
+    fork_python.write_text("")
+    package = PythonPackageArtifact(
+        name="artifact",
+        version="2.0",
+        index_url="https://packages.invalid/simple",
+    )
+    monkeypatch.setattr(
+        runtime_artifacts,
+        "_inspect",
+        lambda *_: {
+            package.name: {
+                "distribution_count": 2,
+                "installed_versions": ["1.0", "2.0"],
+                "required_files": {},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        runtime_artifacts,
+        "_install_missing",
+        lambda *_: pytest.fail("an ambiguous environment must not invoke the installer"),
+    )
+
+    with pytest.raises(RuntimeError, match="2 installed distributions"):
+        runtime_artifacts.prepare_python_runtime(
+            str(fork_python), PythonRuntimeConfig(packages=[package])
+        )
 
 
 def test_nsys_preflight_is_scoped_to_new_captures():
@@ -947,6 +1384,7 @@ def test_runner_passes_yaml_expert_popularity_group_sizes_for_every_engine(tmp_p
     assert alignment_runner._expert_popularity_group_sizes(vllm_config) == (2, 4)
 
     raw["engine"] = "sglang"
+    raw["python_runtime"] = _python_runtime_document()
     paths["profile"].write_text(yaml.safe_dump(raw))
     sglang_config = load_profile_config(paths["profile"])
     assert alignment_runner._expert_popularity_group_sizes(sglang_config) == (2, 4)
