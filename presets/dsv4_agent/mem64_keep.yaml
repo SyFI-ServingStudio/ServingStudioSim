@@ -22,8 +22,6 @@ pools:
           type: deepseek_v4_vllm
           model_config: model/config/deepseek_v4_flash_0731.json
           fp8: true
-          ep_size: 4
-          nvl_num_gpu: 4
           routing: uniform
         worker:
           type: hp_unified
