@@ -17,7 +17,10 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_SUPPORTED_HEAD_COUNTS = frozenset({16, 32, 64})
+# Per-rank head counts of GLM's 64 q heads at validated TP degrees
+# (TP1/2/4/8). The timed op is a plain torch.bmm over the head axis, so a
+# new degree only needs its per-rank count added here.
+_SUPPORTED_HEAD_COUNTS = frozenset({8, 16, 32, 64})
 _SUPPORTED_DTYPE = DType.BF16
 _SUPPORTED_GPUS = frozenset({"NVIDIA H200", "NVIDIA B200"})
 _Q_HEAD_WIDTH = 256
@@ -68,7 +71,7 @@ def _validate_args(
         )
     if num_batches not in _SUPPORTED_HEAD_COUNTS:
         raise ValueError(
-            f"torch_mla_q_absorb_glm52 supports num_batches in {{16, 32, 64}}, got {num_batches}"
+            f"torch_mla_q_absorb_glm52 supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, got {num_batches}"
         )
     if (k, n) != (_QK_NOPE_HEAD_DIM, _KV_LORA_RANK):
         raise ValueError(f"torch_mla_q_absorb_glm52 requires (k, n) == (192, 512), got ({k}, {n})")
@@ -108,7 +111,7 @@ def _validate_v_up_args(
         )
     if num_batches not in _SUPPORTED_HEAD_COUNTS:
         raise ValueError(
-            f"torch_mla_v_up_glm52 supports num_batches in {{16, 32, 64}}, got {num_batches}"
+            f"torch_mla_v_up_glm52 supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, got {num_batches}"
         )
     if (k, n) != (_KV_LORA_RANK, _V_HEAD_DIM):
         raise ValueError(f"torch_mla_v_up_glm52 requires (k, n) == (512, 256), got ({k}, {n})")
