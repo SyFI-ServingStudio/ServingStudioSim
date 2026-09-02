@@ -1,0 +1,32 @@
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/dsv4_idle_64x8.csv
+  input_file_format: text-generation-session-execution-v2
+  arrival_mode: trace_timed
+  session_dependency: chained
+  run_to_end: true
+  request_rate: 1.0
+
+io:
+  log_dir: logs/dsv4_agent/mem64_keep
+
+pools:
+  main:
+    placement: round-robin
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 2
+        arch:
+          type: deepseek_v4_vllm
+          model_config: model/config/deepseek_v4_flash_0731.json
+          fp8: true
+          ep_size: 4
+          nvl_num_gpu: 4
+          routing: uniform
+        worker:
+          type: hp_unified
+          attn_gpu_memory_gb: 35.0
+          prefix_cache_mode: opportunistic
+          prefix_cache_policy: lru
