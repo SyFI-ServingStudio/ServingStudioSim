@@ -206,6 +206,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 iteration: measured_iter.iteration,
                 stage: joined.stage.clone(),
                 measured_gpu_cycle_ms: gpu_cycles_ms.get(&measured_iter.iteration).copied(),
+                measured_ms: measured_reduction.critical_path_ms,
                 measured_busy_union_ms: measurement.busy_union_ms,
                 jit_stall_ms: measured_iter.jit_stall_ns as f64 / 1.0e6,
                 jit_module_loads: measured_iter.jit_module_loads,
@@ -242,10 +243,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     // rather than read from its report, because a subject may not depend on
     // another subject's output; the sim lane's `x duty` bar is meaningless if the
     // two disagree.
-    let (multiplier_excluded_iterations, sum_measured_gpu_cycle_ms, sum_measured_busy_union_ms) =
+    let (multiplier_excluded_iterations, sum_measured_gpu_cycle_ms, sum_measured_ms) =
         screen_duty_cycle_outliers(&duty_cycle_samples);
     let raw_gpu_time_multiplier =
-        pooled_gpu_time_multiplier(sum_measured_gpu_cycle_ms, sum_measured_busy_union_ms);
+        pooled_gpu_time_multiplier(sum_measured_gpu_cycle_ms, sum_measured_ms);
     let (gpu_time_multiplier, duty_cycle_unavailable_reason) =
         duty_cycle_recommendation(raw_gpu_time_multiplier);
 
